@@ -601,6 +601,10 @@ type
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
+    function FormatUsing(const FormatStr: string; Value: Double;
+      IsInt: Boolean; IntValue: Int64): string;   // picks the dialect's rules
+    function FormatUsingFB(const FormatStr: string; Value: Double;
+      IsInt: Boolean; IntValue: Int64): string;   // MODERN: FreeBASIC's rules
     function FormatUsingString(const FormatStr: string; Value: Double;
       IsInt: Boolean = False; IntValue: Int64 = 0): string;
     function FormatUsingRuntime(const FormatStr: string): string;   // walk a runtime format over FPUStage
@@ -1391,6 +1395,258 @@ begin
   SetLength(FArrays, 0);
 end;
 
+function TBytecodeVM.FormatUsing(const FormatStr: string; Value: Double;
+  IsInt: Boolean; IntValue: Int64): string;
+{ ⭐ ONE PLACE decides which dialect's PRINT USING rules apply, so the two
+  formatters cannot drift apart at some call site that forgot to ask. }
+begin
+  if Assigned(FProgram) and FProgram.ModernMode then
+    Result := FormatUsingFB(FormatStr, Value, IsInt, IntValue)
+  else
+    Result := FormatUsingString(FormatStr, Value, IsInt, IntValue);
+end;
+
+function TBytecodeVM.FormatUsingFB(const FormatStr: string; Value: Double;
+  IsInt: Boolean; IntValue: Int64): string;
+{ PRINT USING for the MODERN dialect, i.e. FreeBASIC's rules - which are NOT the
+  ones below. Three directives were simply ignored by the shared formatter and
+  are implemented here, each measured against fbc rather than read off a manual:
+
+    +  leading   the sign is ALWAYS printed and occupies a position ("+12.5",
+                 " -4.5"); trailing, it follows the digits ("12.5+", "12.5-").
+    -  trailing  '-' for a negative, a SPACE for a positive ("12.5 "), and the
+                 digits are the absolute value.
+    $$ floating  the '$' sits immediately before the first digit rather than at
+                 the field's left edge, and a minus sign goes BEFORE it
+                 (" -$12.50"). A single '$' stays fixed, which the old code
+                 already had right.
+    ^^^^ exponent ⭐ the rule that is not guessable: the mantissa carries
+                 (number of '#' before the point) MINUS ONE significant integer
+                 digits, because the first position belongs to the sign. So
+                 "#.##^^^^" gives 0.12E+04, "##.##^^^^" gives 1.23E+03 and
+                 "###.#^^^^" gives 12.3E+02 - all the same number. Four carets
+                 print a two-digit exponent, five print three.
+
+  ⛔ CLASSIC keeps the formatter below unchanged. Commodore v7 documents these
+  same directives, so they are missing there too, but there is no C128 here to
+  say what its exact output is and inventing it would be worse than recording
+  the gap. }
+var
+  i, j, IntDigits, DecDigits, Caret, ExpDigits, Sh, CommaCount: Integer;
+  LeadSign, TrailSign, TrailMinus, FixedDollar, FloatDollar, HasCommas: Boolean;
+  Neg, Overflow: Boolean;
+  AbsValue, Mant: Double;
+  Body, Digits, IntPart, DecPart, Grouped, ExpStr: string;
+  Ex, Width: Integer;
+begin
+  IntDigits := 0; DecDigits := 0; Caret := 0; CommaCount := 0;
+  LeadSign := False; TrailSign := False; TrailMinus := False;
+  FixedDollar := False; FloatDollar := False; HasCommas := False;
+
+  i := 1;
+  while i <= Length(FormatStr) do
+  begin
+    case FormatStr[i] of
+      '#': Inc(IntDigits);
+      ',': begin
+             HasCommas := True;
+             Inc(CommaCount);      // ⚠️ each ',' OCCUPIES a field position
+           end;
+      '$': if (i < Length(FormatStr)) and (FormatStr[i + 1] = '$') then
+           begin
+             FloatDollar := True;
+             Inc(i);                       // "$$" is one directive, two chars
+           end
+           else
+             FixedDollar := True;
+      '+': if i = 1 then LeadSign := True else TrailSign := True;
+      '-': if i > 1 then TrailMinus := True;
+      '.': begin
+             j := i + 1;
+             while (j <= Length(FormatStr)) and (FormatStr[j] = '#') do
+             begin
+               Inc(DecDigits);
+               Inc(j);
+             end;
+             i := j - 1;
+           end;
+      '^': begin
+             j := i;
+             while (j <= Length(FormatStr)) and (FormatStr[j] = '^') do
+             begin
+               Inc(Caret);
+               Inc(j);
+             end;
+             i := j - 1;
+           end;
+    end;
+    Inc(i);
+  end;
+
+  if IsInt then
+  begin
+    Neg := IntValue < 0;
+    AbsValue := Abs(Double(IntValue));
+  end
+  else
+  begin
+    Neg := Value < 0;
+    AbsValue := Abs(Value);
+  end;
+
+  { ---- exponential ---- }
+  if Caret >= 4 then
+  begin
+    ExpDigits := Caret - 2;                 // ^^^^ -> 2, ^^^^^ -> 3
+    { ⭐ The mantissa carries one FEWER significant integer digit than the field
+      has '#', because the first position belongs to the sign - so "#.##^^^^"
+      gives 0.12E+04 and "##.##^^^^" gives 1.23E+03 for the same number.
+      ⚠️ Unless there is no decimal point at all: "#^^^^" prints 5E+00, i.e. the
+      single position IS a digit. }
+    if DecDigits > 0 then Sh := IntDigits - 1 else Sh := IntDigits;
+    if Sh < 0 then Sh := 0;
+    Ex := 0;
+    Mant := AbsValue;
+    if Mant <> 0 then
+    begin
+      // bring the mantissa into [10^(Sh-1), 10^Sh) - or [0.1, 1) when Sh = 0
+      while Mant >= Power(10, Sh) do begin Mant := Mant / 10; Inc(Ex); end;
+      while Mant < Power(10, Sh - 1) do begin Mant := Mant * 10; Dec(Ex); end;
+    end;
+    Body := Format('%.*f', [DecDigits, Mant]);
+    { ⚠️ Rounding can push the mantissa back OUT of its window - 9.99 asked for
+      two decimals becomes 10.00, and with Sh = 0 it becomes 1.00 where a
+      leading zero was required. Either way the answer is to shift once more. }
+    j := Pos('.', Body);
+    if j = 0 then j := Length(Body) + 1;
+    if ((Sh = 0) and (Copy(Body, 1, 1) <> '0')) or ((Sh > 0) and (j - 1 > Sh)) then
+    begin
+      Mant := Mant / 10; Inc(Ex);
+      Body := Format('%.*f', [DecDigits, Mant]);
+    end;
+    // left-pad the mantissa so its integer digits fill the field's positions
+    j := Pos('.', Body);
+    if j = 0 then j := Length(Body) + 1;
+    while (j - 1) < Sh do
+    begin
+      Body := ' ' + Body;
+      Inc(j);
+    end;
+    if Sh = 0 then
+    begin
+      // "0.dd" - and a minus sign REPLACES the leading zero, giving "-.dd"
+      if Neg then
+      begin
+        if (Length(Body) > 0) and (Body[1] = '0') then Delete(Body, 1, 1);
+        Body := '-' + Body;
+      end;
+    end
+    else if DecDigits > 0 then
+      // one position was held back for the sign: a space when there is none
+      if Neg then Body := '-' + Body else Body := ' ' + Body
+    else
+    begin
+      { ⚠️ No decimal point means NO position was held back - "#^^^^" prints
+        5E+00 with nothing in front. So a negative value simply does not fit,
+        and fbc says so with the overflow marker: "%-5E+00". }
+      if Neg then Body := '%-' + Body;
+    end;
+    if Ex < 0 then ExpStr := '-' else ExpStr := '+';
+    ExpStr := 'E' + ExpStr + Format('%.*d', [ExpDigits, Abs(Ex)]);
+    Result := Body + ExpStr;
+    Exit;
+  end;
+
+  { ---- plain numeric field ---- }
+  if IsInt then
+  begin
+    Digits := IntToStr(IntValue);
+    if (Digits <> '') and (Digits[1] = '-') then Delete(Digits, 1, 1);
+    if DecDigits > 0 then Digits := Digits + '.' + StringOfChar('0', DecDigits);
+  end
+  else
+    Digits := Format('%.*f', [DecDigits, AbsValue]);
+
+  j := Pos('.', Digits);
+  if j > 0 then
+  begin
+    IntPart := Copy(Digits, 1, j - 1);
+    DecPart := Copy(Digits, j + 1, MaxInt);
+  end
+  else
+  begin
+    IntPart := Digits;
+    DecPart := '';
+  end;
+
+  if HasCommas then
+  begin
+    Grouped := '';
+    j := 0;
+    for i := Length(IntPart) downto 1 do
+    begin
+      if (j > 0) and (j mod 3 = 0) then Grouped := ',' + Grouped;
+      Grouped := IntPart[i] + Grouped;
+      Inc(j);
+    end;
+  end
+  else
+    Grouped := IntPart;
+
+  if DecDigits > 0 then Body := Grouped + '.' + DecPart else Body := Grouped;
+
+  // the '$' of "$$" hugs the first digit, so it is part of the body
+  if FloatDollar then Body := '$' + Body;
+
+  // sign placement
+  if LeadSign then
+  begin
+    if Neg then Body := '-' + Body else Body := '+' + Body;
+  end
+  else if Neg and not (TrailSign or TrailMinus) then
+    Body := '-' + Body;
+
+  { ⭐ THE OVERFLOW MARKER IS A CAPACITY TEST ON THE INTEGER POSITIONS, and the
+    parts that COMPETE for them are the digits, the '$' of "$$", and a sign that
+    is printed in FRONT. Measured, not assumed:
+      "##.#" with -12.5   -> "%-12.5"   the minus takes a position, 3 > 2
+      "##.#" with  -1.5   -> "-1.5"     1 digit + sign fits exactly
+      "$$###.##" with 1234.5  -> fits   4 digits + '$' = 5 positions
+      "$$###.##" with -1234.5 -> "%"    the sign makes it 6
+    ⚠️ A TRAILING sign does not compete: it has its own position at the end. }
+  Width := IntDigits;
+  if FloatDollar then Inc(Width, 2);          // "$$" is TWO field positions
+  if LeadSign then Inc(Width);
+  Sh := Length(IntPart);
+  if FloatDollar then Inc(Sh);
+  if LeadSign or (Neg and not (TrailSign or TrailMinus)) then Inc(Sh);
+  Overflow := Sh > Width;
+
+  if TrailSign then
+    if Neg then Body := Body + '-' else Body := Body + '+'
+  else if TrailMinus then
+    if Neg then Body := Body + '-' else Body := Body + ' ';
+
+  // pad to the field width: the same integer positions counted above, plus the
+  // fractional part and whatever owns a position of its own
+  if DecDigits > 0 then Inc(Width, DecDigits + 1);
+  if TrailSign or TrailMinus then Inc(Width);
+  Inc(Width, CommaCount);
+  { ⚠️ A fixed '$' OCCUPIES one of the field's positions rather than adding one,
+    so the padding is computed WITHOUT it and the '$' is put in front after. }
+  if Length(Body) < Width then
+    Body := StringOfChar(' ', Width - Length(Body)) + Body;
+
+  { A single '$' sits at the field's LEFT EDGE - ahead of the padding, not next
+    to the digits: "$###.##" with 4.5 is "$  4.50". That is what makes it the
+    fixed dollar, as against "$$" which hugs the number.
+    ⚠️ And it goes ahead of the OVERFLOW marker too: fbc prints "$%1234.50", not
+    "%$1234.50". Measured; there is no reasoning that would have produced it. }
+  if Overflow then Body := '%' + Body;
+  if FixedDollar then Body := '$' + Body;
+  Result := Body;
+end;
+
 function TBytecodeVM.FormatUsingString(const FormatStr: string; Value: Double;
   IsInt: Boolean = False; IntValue: Int64 = 0): string;
 // When IsInt is set the value is an EXACT 64-bit integer (IntValue), not the Double: a LongInt beyond
@@ -1634,7 +1890,7 @@ begin
         begin
           Val(Trim(FPUStage[vi]), dv, vcode);   // locale-independent ('.' decimal); 0 on bad input
           if vcode <> 0 then dv := 0;
-          Result := Result + FormatUsingString(FieldStr, dv);
+          Result := Result + FormatUsing(FieldStr, dv, False, 0);
           Inc(vi);
         end;
       end
@@ -7274,14 +7530,14 @@ begin
         // Src1 = format string register, Src2 = value register
         if Assigned(FOutputDevice) then
           // Src2 is a FLOAT value here; the exact-integer form is bcPrintUsingInt (below).
-          FOutputDevice.Print(FormatUsingString(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]));
+          FOutputDevice.Print(FormatUsing(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2], False, 0));
       end;
     bcPrintUsingInt:
       // PRINT USING with an EXACT integer value: Src1 = format string, Src2 = int value. A LongInt beyond
       // 2^53 keeps every digit instead of being rounded through a Double (Pell's 2469645423824185801).
       begin
         if Assigned(FOutputDevice) then
-          FOutputDevice.Print(FormatUsingString(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]));
+          FOutputDevice.Print(FormatUsing(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]));
       end;
     bcPrintUsingStage:
       // Stage one already-stringified value for a runtime-format PRINT USING (Src1 = string register).
