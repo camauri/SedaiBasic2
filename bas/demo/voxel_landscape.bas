@@ -54,16 +54,42 @@
 '' the colour bands and the sun shadows cost NOTHING per frame - both fold into a colormap
 '' that was already being built - and the fog costs about 1 ms of the 640x480 frame, which is
 '' the only part of the three that depends on where the camera is.
-#define VIDEO 0
+'' The mode is chosen at RUN TIME, from the command line, so one build does both:
+''
+''   voxel_landscape            real time on screen, 640x480   (the default)
+''   voxel_landscape video      raw rgb24 frames to a file, 1920x1080, no screen
+''
+'' ⭐ In WebAssembly the offline mode excludes ITSELF, with no special case: a module has
+'' no command line, so COMMAND$ answers the empty string and the default branch is taken.
+'' Writing a 3.7 GB file from a browser tab was never going to be the point.
+''
+'' ⚠️ SCRW and SCRH were Const until the mode became a run-time choice, and constants are
+'' worth something here: the compiler folds them into the renderer's arithmetic. They are
+'' now variables, and that trade was measured rather than assumed - see the note by the
+'' frame-time report.
+Dim Shared As Integer VIDEO
+Dim Shared As Integer SCRW, SCRH
 
-#if VIDEO
-    Const SCRW  = 1920
-    Const SCRH  = 1080
+VIDEO = 0
+#if __SB_WASM__
+    '' ⛔ The offline mode is compiled OUT for WebAssembly, and a run-time test would not
+    '' have been enough: the backend refuses an uncovered opcode for being PRESENT in the
+    '' program, not for being reached, so the file-writing branch has to be absent from
+    '' the source the backend sees. A browser tab has no file to write anyway.
 #else
-    Const SCRW  = 640          '' the crossover point, measured: at this size the traversal
-    Const SCRH  = 480          ''   and the span filling cost about the same (52% / 48%)
+    If Len(Command$(1)) > 0 Then
+        If LCase(Command$(1)) = "video" Then VIDEO = 1
+    End If
 #endif
-Const HORIZON   = SCRH * 2 \ 5 '' screen row of the eye line. Below centre, so more of the
+
+If VIDEO Then
+    SCRW = 1920 : SCRH = 1080
+Else
+    SCRW = 640                 '' the crossover point, measured: at this size the traversal
+    SCRH = 480                 ''   and the span filling cost about the same (52% / 48%)
+End If
+Dim Shared As Integer HORIZON
+HORIZON = SCRH * 2 \ 5 '' screen row of the eye line. Below centre, so more of the
                                ''   picture is ground than sky - the ground is the subject.
 Const MAPSZ     = 256          '' power of two so wrapping is an AND, not a modulo. Small
 Const MAPMASK   = MAPSZ - 1    ''   enough that world generation takes well under a second
@@ -97,7 +123,8 @@ Const NEARROWS  = 5.0          '' row budget for the APPROACH, where the far rul
 Const ZTABMAX   = 1024         '' ceiling on the sample count; the table comes out at ~350 at
                                ''   1080p and ~175 at 640x480.
 Const FOGRES    = 4.0          '' fog table entries per unit of distance - see BuildFog.
-Const VSCALE    = 0.75 * SCRH   '' vertical exaggeration, as a fraction of the screen height
+Dim Shared As Double VSCALE
+VSCALE = 0.75 * SCRH   '' vertical exaggeration, as a fraction of the screen height
                                ''   so the framing does not change with the resolution.
                                ''   Empirical at 200 rows: 100 looked like a pancake, 250
                                ''   turned every slope into a cliff; 150 = 0.75 * 200.
@@ -147,11 +174,11 @@ Dim Shared As Single   hmap(MAPSZ * MAPSZ - 1)   '' altitude, 0..255, fractional
 Dim Shared As UByte    cmR(MAPSZ * MAPSZ - 1)
 Dim Shared As UByte    cmG(MAPSZ * MAPSZ - 1)
 Dim Shared As UByte    cmB(MAPSZ * MAPSZ - 1)
-#if VIDEO
-    '' One frame, rgb24, exactly the bytes ffmpeg is told to expect.
-    Dim Shared As UByte fbuf(SCRW * SCRH * 3 - 1)
-#endif
-Dim Shared As Integer  ybuf(SCRW - 1)            '' the occlusion state, one row per column
+'' One frame, rgb24, exactly the bytes ffmpeg is told to expect. ⚠️ Allocated ONLY in the
+'' offline mode: at 1080p it is 6.2 MB, which a real-time run has no use for.
+ReDim Shared As UByte fbuf(0)
+If VIDEO Then ReDim fbuf(SCRW * SCRH * 3 - 1)
+ReDim Shared As Integer ybuf(SCRW - 1)           '' the occlusion state, one row per column
 
 '' Insertion sort, in place. Used by both the on-screen window and the end-of-run report, so
 '' there is one ordering of the samples rather than two that could drift apart. O(n^2), which
@@ -627,7 +654,7 @@ Sub PaintSpan(ByVal x As Integer, ByVal y0 As Integer, ByVal y1 As Integer, _
     Dim As Integer r = cr + ((HORR - cr) * fw) \ 256
     Dim As Integer g = cg + ((HORG - cg) * fw) \ 256
     Dim As Integer b = cb + ((HORB - cb) * fw) \ 256
-#if VIDEO
+If VIDEO Then
     Dim As Integer i, o
     For i = y0 To y1
         o = (i * SCRW + x) * 3
@@ -635,9 +662,9 @@ Sub PaintSpan(ByVal x As Integer, ByVal y0 As Integer, ByVal y1 As Integer, _
         fbuf(o + 1) = g
         fbuf(o + 2) = b
     Next
-#else
+Else
     Line (x, y0)-(x, y1), RGB(r, g, b)
-#endif
+End If
 End Sub
 
 '' -------------------------------------------------------------------------------------
@@ -663,13 +690,13 @@ Sub RenderFrame(ByVal camx As Double, ByVal camy As Double, ByVal ang As Double,
 
     '' Sky first, over the whole frame. Cheaper than leaving the sky to the column loop, and
     '' it means a column that hits nothing needs no special case.
-#if VIDEO
-    For i = 0 To SCRW * SCRH * 3 - 1 Step 3
-        fbuf(i) = HORR : fbuf(i + 1) = HORG : fbuf(i + 2) = HORB
-    Next
-#else
-    Line (0, 0)-(SCRW - 1, SCRH - 1), RGB(HORR, HORG, HORB), BF
-#endif
+If VIDEO Then
+        For i = 0 To SCRW * SCRH * 3 - 1 Step 3
+            fbuf(i) = HORR : fbuf(i + 1) = HORG : fbuf(i + 2) = HORB
+        Next
+    Else
+        Line (0, 0)-(SCRW - 1, SCRH - 1), RGB(HORR, HORG, HORB), BF
+    End If
 
     For x = 0 To SCRW - 1
         camc = (x / (SCRW / 2.0)) - 1.0
@@ -742,12 +769,17 @@ Dim As Integer f, i, j
 Dim As Double a, head, ghgt, camx, camy, camh
 Dim As Double allft(FRAMES - 1)      '' every frame, for the report at the end
 
-#if VIDEO
-    '' No ScreenRes: the video build never draws on a screen, so it does not need one.
-    Dim As Integer fh = FreeFile
-    Open "frames.raw" For Binary Access Write As #fh
-#else
+#if __SB_WASM__
     ScreenRes SCRW, SCRH, 32
+#else
+    Dim As Integer fh
+    If VIDEO Then
+        '' No ScreenRes: the offline mode never draws on a screen, so it does not need one.
+        fh = FreeFile
+        Open "frames.raw" For Binary Access Write As #fh
+    Else
+        ScreenRes SCRW, SCRH, 32
+    End If
 #endif
 BuildWorld()
 CastShadows()
@@ -791,11 +823,20 @@ For f = 0 To FRAMES - 1
     camh += (ghgt + EYECLEAR - camh) * EYELAG
     If camh < ghgt + EYECLEAR * 0.5 Then camh = ghgt + EYECLEAR * 0.5
 
-#if VIDEO
+#if __SB_WASM__
+    ScreenLock
+    RenderFrame(camx, camy, head, camh)
+    If fcount > 0 Then
+        Locate 1, 1
+        Print Using "fps ###.# | med ####.# ms | worst ####.# ms"; fps; med; worst
+    End If
+    ScreenUnlock
+#else
+    If VIDEO Then
     RenderFrame(camx, camy, head, camh)
     Put #fh, , fbuf()                       '' one frame, rgb24, straight out
     If (f Mod 60) = 0 Then Print "frame "; f; " / "; FRAMES
-#else
+Else
     ScreenLock
     RenderFrame(camx, camy, head, camh)   '' facing along the flight
     '' The counter is drawn AFTER the terrain, and that is not a style choice: PRINT
@@ -806,6 +847,7 @@ For f = 0 To FRAMES - 1
         Print Using "fps ###.# | med ####.# ms | worst ####.# ms"; fps; med; worst
     End If
     ScreenUnlock
+    End If
 #endif
 
     t1 = Timer
@@ -841,9 +883,11 @@ Print Using "median          : ####.### ms"; rep(n \ 2)
 Print Using "p99             : ####.### ms"; rep(Int(n * 0.99))
 Print Using "worst           : ####.### ms"; rep(n - 1)
 Print Using "p99 / median    : ##.###";    rep(Int(n * 0.99)) / rep(n \ 2)
-#if VIDEO
-    Close #fh
-    Print
-    Print "wrote frames.raw -- "; FRAMES; " frames, rgb24, "; SCRW; "x"; SCRH
-    Print "ffmpeg -f rawvideo -pix_fmt rgb24 -s "; SCRW; "x"; SCRH; " -r 30 -i frames.raw out.mp4"
+#if not __SB_WASM__
+    If VIDEO Then
+        Close #fh
+        Print
+        Print "wrote frames.raw -- "; FRAMES; " frames, rgb24, "; SCRW; "x"; SCRH
+        Print "ffmpeg -f rawvideo -pix_fmt rgb24 -s "; SCRW; "x"; SCRH; " -r 30 -i frames.raw out.mp4"
+    End If
 #endif

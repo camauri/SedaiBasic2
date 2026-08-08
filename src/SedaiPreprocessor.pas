@@ -27,6 +27,14 @@ type
   // diagnostic and abort the build (there is no meaningful program to run).
   EPreprocessorError = class(Exception);
 
+{ ⭐ Set by sbc when --target wasm is given, so a program can ASK which machine
+  it is being compiled for. That question has to be answerable at COMPILE time,
+  not at run time: the backend refuses an uncovered opcode because it is PRESENT,
+  not because it executes, so a run-time "If" around a file-writing branch does
+  not keep that branch out of the module. A #if does. }
+var
+  GTargetIsWasm: Boolean = False;
+
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 function DetectQBLang(const Src: string): Boolean;
 
@@ -1094,6 +1102,13 @@ begin
   // fbc defines this while compiling the module that holds the program's entry point. There is exactly
   // one module here - sb compiles and runs a single source - so it is always the main one.
   Defs.Values['__FB_MAIN__']    := '-1';
+  { Which machine the program is being compiled FOR. SedaiBasic's own, with no
+    FreeBASIC counterpart - fbc has no WebAssembly target - so it does not
+    pretend to be an __FB_ macro. }
+  if GTargetIsWasm then
+    Defs.Values['__SB_WASM__'] := '-1'
+  else
+    Defs.Values['__SB_WASM__'] := '0';
   // __FB_ARGC__ / __FB_ARGV__ are the parameters of fbc's implicit main, so their VALUE is only known
   // when the program runs - a preprocessor constant cannot carry it. They expand instead to the
   // expression that fetches it, through two index selectors of COMMAND$ that no user spelling can

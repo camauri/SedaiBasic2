@@ -206,6 +206,11 @@ begin
       // (FB zone width + TRAILING space after numerics, fbc-verified; fblite does NOT). Detected
       // on the RAW text: the preprocessor strips both directive forms before the old site ran.
       QBLangDetected := DetectQBLang(Source.Text);
+      { The target has to reach the PREPROCESSOR, because a program that offers a
+        file-writing mode must be able to keep that branch out of a WASM module
+        entirely - the backend refuses an uncovered opcode for being PRESENT, and
+        a run-time If does not remove it. }
+      GTargetIsWasm := OptTargetWasm;
       Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
     except
       on E: EPreprocessorError do
