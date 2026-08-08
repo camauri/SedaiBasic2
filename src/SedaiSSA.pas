@@ -626,6 +626,7 @@ type
     // True if the expression is unsigned 64-bit (UInteger/ULongInt), selecting the QWord compare/
     // div/mod forms. Propagates through +/-/*/\/Mod/bitwise, parentheses and unary.
     function IsUnsigned64Expr(Node: TASTNode): Boolean;
+    function PrintsUnsigned64Expr(Node: TASTNode): Boolean;   // ...the PRINT form, which differs on a negation
     // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
     function ObjectTypeName(ObjNode: TASTNode): string;
     // UDT element type of an array-of-UDT by name, scope-aware (per-proc array param, then global).
@@ -7715,7 +7716,7 @@ begin
     end;
     // A non-identifier unsigned 64-bit expression (an unsigned literal or arithmetic over unsigned
     // operands) also prints unsigned, so a result above Int64.Max is not shown as negative.
-    if (ExprValue.RegType = srtInt) and IsUnsigned64Expr(Child) then
+    if (ExprValue.RegType = srtInt) and PrintsUnsigned64Expr(Child) then
     begin
       EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), ExprValue,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -24643,6 +24644,59 @@ begin
     if FArrayRecordType.IndexOfName(mangled) >= 0 then Exit(FArrayRecordType.Values[mangled]);
   end;
   if FArrayRecordType.IndexOfName(nameU) >= 0 then Result := FArrayRecordType.Values[nameU];
+end;
+
+function TSSAGenerator.PrintsUnsigned64Expr(Node: TASTNode): Boolean;
+{ Does this expression PRINT unsigned? ⛔ That is NOT the same question as
+  IsUnsigned64Expr, which says whether its comparisons, divisions and mods need
+  the unsigned opcodes - and the two part company on exactly one node.
+
+  A NEGATED unsigned prints SIGNED in FreeBASIC while still computing unsigned:
+      Dim As ULongInt u = 42
+      Print -u          fbc: -42                  (we printed 18446744073709551574)
+      Print -u + 0      fbc: -42
+      Print (-u) \ 2    fbc: 9223372036854775787  (the UNSIGNED quotient)
+  So the negation cannot simply be typed signed - that would make the division
+  answer -21. It is the RENDERING that changes, and it survives through +, - and
+  *, which is why this walks those three and defers to IsUnsigned64Expr for
+  everything else. Every row above was measured against fbc 1.10.1; the whole
+  table is in bug_unsigned_negate_print.bas.
+
+  ⚠️ What this does NOT fix, and it is a VALUE rather than a rendering:
+  "Print (-u) / 2" is -21 here and 9.223372036854776e+018 in fbc, because the
+  int-to-FLOAT conversion on that path reads the bits as signed. Different site,
+  recorded in NEXT_SESSION, deliberately not touched here. }
+begin
+  Result := False;
+  if not Assigned(Node) then Exit;
+  case Node.NodeType of
+    antUnaryOp:
+      if (Node.ChildCount >= 1) and Assigned(Node.Token) and
+         (Node.Token.TokenType = ttOpSub) then
+        Result := False                       // the negation is what turns it signed
+      else if Node.ChildCount >= 1 then
+        Result := PrintsUnsigned64Expr(Node.GetChild(0));
+    antParentheses:
+      if Node.ChildCount >= 1 then Result := PrintsUnsigned64Expr(Node.GetChild(0));
+    antBinaryOp:
+      { The signed rendering travels through EVERY operator unsignedness travels
+        through, not just the additive ones. Measured: "(-u) \ 2", "(-u) Mod 5"
+        and "-u And 255" all print with the sign column occupied in fbc, while
+        their VALUES are the unsigned ones. ⚠️ The first version of this walked
+        only + - * because the probe that derived the rule compared the two
+        outputs with the leading space TRIMMED - and the sign space is exactly
+        what the question is about. The guardian, which compares bytes, said so
+        immediately. }
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and
+         (Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpIntDiv, ttOpMod,
+                                   ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR]) then
+        Result := PrintsUnsigned64Expr(Node.GetChild(0)) or
+                  PrintsUnsigned64Expr(Node.GetChild(1))
+      else
+        Result := IsUnsigned64Expr(Node);
+  else
+    Result := IsUnsigned64Expr(Node);
+  end;
 end;
 
 function TSSAGenerator.IsUnsigned64Expr(Node: TASTNode): Boolean;
