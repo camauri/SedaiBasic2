@@ -171,6 +171,7 @@ type
     FAllocFunc, FStrNewFunc, FStrCatFunc, FStrSubFunc, FStrCmpFunc,
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
     FPrintStrFunc, FStrFromIntFunc: LongWord;
+    FStrFillFunc, FStrCaseFunc, FStrInstrFunc: LongWord;
 
     // --- arrays ---------------------------------------------------------
     FUsesArr: Boolean;
@@ -400,6 +401,7 @@ begin
           FUsesGfx := True;
         ssaLoadConstString, ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight,
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
+        ssaStrSpace, ssaStrString, ssaStrUCase, ssaStrLCase, ssaStrInstr,
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
@@ -715,7 +717,7 @@ procedure TWasmBackend.EmitStringHelpers;
 var
   B: TWasmBuf;
   TNewStr, TCat, TSub, TCmp, TAsc, TChr, TRight, TMid, TPrint,
-  TFromInt: LongWord;
+  TFromInt, TFill, TCase, TInstr: LongWord;
 begin
   TNewStr := FModule.TypeIndex([wvtI32], [wvtI32]);
   TCat    := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
@@ -727,6 +729,9 @@ begin
   TMid    := FModule.TypeIndex([wvtI32, wvtI64, wvtI64], [wvtI32]);
   TPrint  := FModule.TypeIndex([wvtI32], []);
   TFromInt := FModule.TypeIndex([wvtI64], [wvtI32]);
+  TFill   := FModule.TypeIndex([wvtI64, wvtI64], [wvtI32]);
+  TCase   := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
+  TInstr  := FModule.TypeIndex([wvtI32, wvtI32, wvtI64], [wvtI64]);
 
   { strNew(len: i32) -> i32: an uninitialised header of that length, or the
     canonical empty string when the length is zero. }
@@ -1017,6 +1022,150 @@ begin
     B.MemoryCopy;
     B.LocalGet(5);
     FModule.AddFunction(TFromInt, [wvtI32, wvtI64, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strFill(n: i64, ch: i64) -> a string of n copies of the character.
+    SPACE$(n) is this with ch = 32, STRING$(n, c) is this with ch = c AND $FF -
+    the same helper, because they are the same operation and the interpreter
+    implements both with StringOfChar. A negative count is 0, not an error. }
+  B := TWasmBuf.Create;
+  try
+    // locals: 2 = count/cursor (i32), 3 = handle (i32), 4 = end (i32)
+    B.LocalGet(0); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.LocalSet(0);
+    B.EndOp;
+    B.LocalGet(0); B.Op(wopI32WrapI64); B.LocalTee(2);
+    B.Call(FStrNewFunc); B.LocalSet(3);
+    B.LocalGet(3); B.I32Const(4); B.Op(wopI32Add); B.LocalTee(4);
+    B.LocalGet(2); B.Op(wopI32Add); B.LocalSet(2);          // 2 = one past the end
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.LocalGet(2); B.Op(wopI32GeU); B.BrIf(1);
+        B.LocalGet(4);
+        B.LocalGet(1); B.Op(wopI32WrapI64); B.I32Const(255); B.Op(wopI32And);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(3);
+    FModule.AddFunction(TFill, [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strCase(s, up) -> a new string with the ASCII letters folded.
+    ⚠️ ASCII ONLY, and deliberately so: this mirrors FPC's UpperCase/LowerCase,
+    which the interpreter calls and which are themselves ASCII-only. Folding
+    Latin-1 or UTF-8 here would make the module DISAGREE with sb, and agreeing
+    with sb is the whole contract. }
+  B := TWasmBuf.Create;
+  try
+    // locals: 2 = src cursor, 3 = handle, 4 = dst cursor, 5 = end, 6 = byte
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalTee(5);
+    B.Call(FStrNewFunc); B.LocalSet(3);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(2);
+    B.LocalGet(3); B.I32Const(4); B.Op(wopI32Add); B.LocalTee(4);
+    B.LocalGet(5); B.Op(wopI32Add); B.LocalSet(5);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.LocalGet(5); B.Op(wopI32GeU); B.BrIf(1);
+        B.LocalGet(2); B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(6);
+        B.LocalGet(4);
+        B.LocalGet(1);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          // 'a'..'z' -> upper
+          B.LocalGet(6); B.I32Const(Ord('a')); B.Op(wopI32GeU);
+          B.LocalGet(6); B.I32Const(Ord('z')); B.Op(wopI32LeU);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(6); B.I32Const(32); B.Op(wopI32Sub);
+          B.Op(wopElse);
+            B.LocalGet(6);
+          B.EndOp;
+        B.Op(wopElse);
+          // 'A'..'Z' -> lower
+          B.LocalGet(6); B.I32Const(Ord('A')); B.Op(wopI32GeU);
+          B.LocalGet(6); B.I32Const(Ord('Z')); B.Op(wopI32LeU);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(6); B.I32Const(32); B.Op(wopI32Add);
+          B.Op(wopElse);
+            B.LocalGet(6);
+          B.EndOp;
+        B.EndOp;
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(2); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(2);
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(3);
+    FModule.AddFunction(TCase, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strInstr(hay, needle, start) -> 1-based position, 0 if absent.
+    Mirrors bcStrInstr: a start below 1 clamps to 1, and the result is an
+    absolute position in the haystack (the interpreter searches a Copy from
+    start and adds the offset back, which comes to the same thing).
+    ⭐ The EMPTY needle is not an edge case to shrug at: Pascal's Pos returns 0
+    for it, so an empty needle finds nothing - and a loop written around
+    "Instr(...) > 0" would spin forever if this answered 1. }
+  B := TWasmBuf.Create;
+  try
+    // locals: 3 = hay len, 4 = needle len, 5 = i, 6 = j, 7 = hay base, 8 = needle base
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.LocalGet(1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(7);
+    B.LocalGet(1); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(8);
+    B.LocalGet(2); B.I64Const(1); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(1); B.LocalSet(2);
+    B.EndOp;
+    // an empty needle never matches, and neither does a start past the end
+    B.LocalGet(4); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(2); B.Op(wopI32WrapI64); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(5);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);         // A: not found
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);        // L: for each start i
+        // no room left for the needle: done
+        B.LocalGet(5); B.LocalGet(4); B.Op(wopI32Add);
+        B.LocalGet(3); B.Op(wopI32GtS); B.BrIf(1);        // -> A
+        B.I32Const(0); B.LocalSet(6);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);     // M: mismatch lands here
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);    // K: compare byte by byte
+            // every byte matched: the answer is this i, 1-based
+            B.LocalGet(6); B.LocalGet(4); B.Op(wopI32GeS);
+            B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.Op(wopI64ExtendI32S);
+              B.Op(wopReturn);
+            B.EndOp;
+            B.LocalGet(7); B.LocalGet(5); B.Op(wopI32Add); B.LocalGet(6); B.Op(wopI32Add);
+            B.OpMem(wopI32Load8U, 0, 0);
+            B.LocalGet(8); B.LocalGet(6); B.Op(wopI32Add);
+            B.OpMem(wopI32Load8U, 0, 0);
+            B.Op(wopI32Ne); B.BrIf(1);                    // -> M, i.e. try the next i
+            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+            B.Br(0);                                      // -> K
+          B.EndOp;                                        // K
+        B.EndOp;                                          // M
+        { ⛔ The mismatch exit MUST land here, past the inner loop, so that i is
+          advanced before the next attempt. Branching straight back to L instead
+          would retry the same i for ever - and a hang is the one failure a
+          differential net cannot report, because it never gets to compare. }
+        B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(5);
+        B.Br(0);                                          // -> L
+      B.EndOp;                                            // L
+    B.EndOp;                                              // A
+    B.I64Const(0);
+    FModule.AddFunction(TInstr, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
   finally
     B.Free;
   end;
@@ -2684,6 +2833,44 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    ssaStrSpace:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I64Const(Ord(' '));
+        B.Call(FStrFillFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrString:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);      // the CODE, masked to a byte by the helper
+        B.Call(FStrFillFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrUCase, ssaStrLCase:
+      begin
+        LoadReg(B, Instr.Src1);
+        if Instr.OpCode = ssaStrUCase then B.I32Const(1) else B.I32Const(0);
+        B.Call(FStrCaseFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { INSTR's start position rides in a THIRD register (Src3), not as a value:
+      the two-argument form materialises a constant 1 so there is always a real
+      register to read (SedaiSSA). ⚠️ The BYTECODE puts that register NUMBER in
+      the immediate, which is a different thing entirely - reading the immediate
+      here would search from position <register number>. }
+    ssaStrInstr:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        LoadReg(B, Instr.Src3);
+        B.Call(FStrInstrFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
       begin
         LoadReg(B, Instr.Src1);
@@ -3805,8 +3992,11 @@ begin
       calling the wrong function with the right types VALIDATES. The conditional
       one stays last. }
     FStrFromIntFunc := Next + 8;
-    FPrintStrFunc   := Next + 9;
-    Inc(Next, 10);
+    FStrFillFunc    := Next + 9;    // SPACE$ and STRING$: one helper, the char differs
+    FStrCaseFunc    := Next + 10;   // UCASE / LCASE: one helper, the direction is a flag
+    FStrInstrFunc   := Next + 11;
+    FPrintStrFunc   := Next + 12;
+    Inc(Next, 13);
   end;
   if FUsesArr then
   begin
