@@ -24,8 +24,18 @@
 ''  RUNNING IT
 ''    fbc voxel_landscape.bas && ./voxel_landscape      '' native
 ''    sb --window voxel_landscape.bas                   '' SedaiBasic, needs a -Window build
+''    sb voxel_landscape.bas video                      '' 1920x1080 raw frames for ffmpeg
 ''  It walks one full camera circle, prints a frame-time report, and exits. There is no
 ''  user input on purpose: a fixed path makes two runs comparable.
+''
+''  IN A BROWSER
+''    voxel_landscape.html beside this file is the demo compiled to WebAssembly, with the
+''    module embedded, so it is ONE file that runs from anywhere - no server, no fetch, no
+''    configuration. The page calls StepFrame once per animation tick.
+''    ⚠️ IT IS GENERATED, and it embeds a COPY of the module: change this source and the page
+''    is stale until it is rebuilt.
+''        sbc voxel_landscape.bas --target wasm
+''        node <tools>/wasm_demo_page.js voxel_landscape.wasm voxel_landscape.html
 
 '' ---- THE TWO MODES -------------------------------------------------------------------
 '' VIDEO 0 : draw on screen, in real time. VIDEO 1 : write raw rgb24 frames to a file for
