@@ -119,6 +119,7 @@ type
     FResultTmp: array[TSSARegisterType] of LongWord;
     FSlotBase: array[TSSARegisterType] of LongWord;
     FRawTmp: LongWord;            // i64: a raw pointer being decoded
+    FFltTmp: LongWord;            // f64 scratch (TIMER's Frac, and whoever needs one next)
     FGfxP, FGfxN: LongWord;       // i32: the ScreenRes fill cursor and counter
 
     { ⛔ END INSIDE A PROCEDURE ENDS THE PROGRAM, NOT THE FUNCTION. In WASM a
@@ -207,8 +208,11 @@ type
     procedure EmitReturnValues(B: TWasmBuf; R: Integer);
   private
     FUsesPrint: Boolean;
+    FUsesClock: Boolean;          // NOW / TIMER: an import, there is no time in WASM
+    FUsesTrig: Boolean;           // SIN / COS: an import, WASM has no transcendentals
     FImportCount: LongWord;
     FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
+    FNowFunc, FSinFunc, FCosFunc: LongWord;
     procedure ScanForPrint;
     function ConstAddrOf(const V: TSSAValue): LongWord;
     function ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
@@ -377,6 +381,8 @@ var
 
 begin
   FUsesPrint := False;
+  FUsesClock := False;
+  FUsesTrig := False;
   FUsesGfx := False;
   FUsesStr := False;
   FUsesArr := False;
@@ -414,6 +420,10 @@ begin
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
         ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim:
           FUsesArr := True;
+        ssaDateNow:
+          FUsesClock := True;
+        ssaMathSin, ssaMathCos:
+          FUsesTrig := True;
         ssaRecordNew:
           FUsesRec := True;
         ssaRecordLoadString, ssaRecordStoreString:
@@ -3761,6 +3771,54 @@ begin
 
     ssaMathSqr: Un(wopF64Sqrt);
     ssaMathAbs: Un(wopF64Abs);
+
+    { ⚠️ ONE ULP AWAY FROM THE INTERPRETER, sometimes. WASM has no sin/cos, so
+      these are the host's, and the host's are not FPC's: measured over 24
+      values, 23 agree to 17 digits and Sin(2.0) differs in the last bit. In a
+      program where the value only reaches the output that divergence is
+      invisible; in one that feeds it back - a raycaster's camera angle - it
+      spreads over the whole frame. Declared, not hidden. }
+    ssaMathSin:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FSinFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaMathCos:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FCosFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { NOW is the serial date the host hands back; TIMER is the seconds elapsed
+      in the current day, which is its fractional part scaled - the arithmetic
+      the interpreter does, kept on this side so the two cannot drift apart on
+      anything except the clock reading itself. }
+    ssaDateNow:
+      begin
+        B.Call(FNowFunc);
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then
+        begin
+          // TIMER: Frac(v) * 86400, and Frac is v - Trunc(v) as FPC computes it
+          B.LocalTee(FFltTmp);
+          B.LocalGet(FFltTmp);
+          B.Op(wopF64Trunc);
+          B.Op(wopF64Sub);
+          B.F64Const(86400);
+          B.Op(wopF64Mul);
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { ⚠️ LOCATE IS A NO-OP HERE, and it is a FAITHFUL one rather than a gap:
+      headless sb emits not one byte for it (checked - "Locate 5,10" between two
+      PRINTs leaves the output exactly "AAA\r\nBBB\r\n"). It moves a text cursor
+      that stdout does not reflect, and stdout is what the oracle compares.
+      ⛔ The day the module gets a real console - a canvas with a text grid -
+      this stops being faithful and has to move that cursor. }
+    ssaConLocate: ;
     ssaMathInt: Un(wopF64Floor);
     { ⭐ Fix(-0.0) is +0, not -0 - ASKED of fbc rather than reasoned about, and
       sb agrees with it. The interpreter loses the sign because its Fix goes
@@ -3904,15 +3962,17 @@ begin
   FGfxN := LongWord(P + 6);
   FArrTmp := LongWord(P + 7);
   FRecTmp := LongWord(P + 8);
-  SetLength(Locals, 9);
+  FFltTmp := LongWord(P + 9);
+  SetLength(Locals, 10);
   Locals[0] := wvtI32;                       // dispatch state
   Locals[1] := wvtI64; Locals[2] := wvtF64; Locals[3] := wvtI32;
   Locals[4] := wvtI64;                       // raw pointer being decoded
   Locals[5] := wvtI32; Locals[6] := wvtI32;  // ScreenRes fill cursor + counter
   Locals[7] := wvtI32;                       // DIM's running element product
   Locals[8] := wvtI32;                       // a record handle being addressed
+  Locals[9] := wvtF64;                       // f64 scratch
   // one local per transfer slot this region mentions
-  k := P + 9;
+  k := P + 10;
   for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
   begin
     FSlotBase[RT] := LongWord(k);
@@ -4124,7 +4184,31 @@ begin
   begin
     FWriteFunc := FModule.ImportFunc('env', 'write',
                                      FModule.TypeIndex([wvtI32, wvtI32], []));
-    FImportCount := 1;
+    Inc(FImportCount);
+  end;
+  { ⚠️ THE CLOCK CANNOT COME FROM INSIDE. There is no time in WebAssembly, so
+    NOW/TIMER are an import or nothing. The host hands back a serial date in the
+    interpreter's own convention - days since 1899-12-30, LOCAL time - so that
+    the arithmetic on this side is identical to the interpreter's.
+    ⛔ And a program that reads the clock CANNOT match a previous run, natively
+    or here: that is a property of the program, not a defect of the backend. }
+  if FUsesClock then
+  begin
+    FNowFunc := FModule.ImportFunc('env', 'now', FModule.TypeIndex([], [wvtF64]));
+    Inc(FImportCount);
+  end;
+  { ⚠️ WASM HAS NO TRANSCENDENTALS. Measured 8 Aug 2026 over 24 values: FPC and
+    the host's Math.sin/cos agree to 17 digits on 23 of them and differ by ONE
+    ULP on Sin(2.0). ⇒ a program using them can come out one ulp away from the
+    native run, which is DECLARED here rather than discovered later.
+    🎯 The ideal remains our own implementation used natively TOO, so both sides
+    agree by construction - the move that settled float printing - but only if
+    it does not cost native performance, which has to be measured first. }
+  if FUsesTrig then
+  begin
+    FSinFunc := FModule.ImportFunc('env', 'sin', FModule.TypeIndex([wvtF64], [wvtF64]));
+    FCosFunc := FModule.ImportFunc('env', 'cos', FModule.TypeIndex([wvtF64], [wvtF64]));
+    Inc(FImportCount, 2);
   end;
 
   ScanForHalt;
