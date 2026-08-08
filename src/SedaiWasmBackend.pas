@@ -349,6 +349,12 @@ const
   VAL_SIG      = 8192;    // significant digits, MOST significant first (800)
   VAL_LIMB     = 9216;    // the integer part in 30-bit limbs, low first (200)
   VAL_NLIMB    = 10240;   // i32: how many limbs VAL_LIMB holds
+  { ⚠️ The DECIMAL saturation width valInt was asked for, 32 or 0. It travels in
+    memory rather than as a second parameter for one reason only: valInt's body
+    was written against locals 1..9, and appending a parameter renumbers every
+    one of them. Both callers are in this file, ten lines apart, and each stores
+    it immediately before the call. }
+  VAL_DECW     = 10244;   // i32: valInt's decimal saturation width
   VAL_DIGCAP   = 800;
   VAL_MAXDIG   = 1500;    // ⛔ must stay under PU_NINT - FLT_DEC = 2048
   VAL_MAXLIMB  = 200;
@@ -2238,18 +2244,46 @@ begin
         B.EndOp;
       B.EndOp;
     B.Op(wopElse);
+      { The DECIMAL magnitude SATURATES - it does not wrap - at 2^64-1, and at
+        2^32-1 when the caller asked for a 32-bit spelling. ⛔ The base-prefix
+        branch above deliberately keeps wrapping: fbc scans &H/&O/&B itself and
+        reads a decimal through the C library, and the two disagree. We
+        reproduce the coherent half. Same rule as ParseLeadingInt64. }
+      B.I32Const(0); B.LocalSet(10);              // overflow flag
       B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
         B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
           B.LocalGet(3); B.LocalGet(1); B.Op(wopI32GeS); B.BrIf(1);
           B.LocalGet(2); B.LocalGet(3); B.Op(wopI32Add); B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(6);
           B.LocalGet(6); B.I32Const(48); B.Op(wopI32LtS); B.BrIf(1);
           B.LocalGet(6); B.I32Const(57); B.Op(wopI32GtS); B.BrIf(1);
-          B.LocalGet(9); B.I64Const(10); B.Op(wopI64Mul);
-            B.LocalGet(6); B.I32Const(48); B.Op(wopI32Sub); B.Op(wopI64ExtendI32S);
-            B.Op(wopI64Add); B.LocalSet(9);
+          // would res*10 + d pass 2^64-1?  res >u (2^64-1 - d) / 10
+          B.LocalGet(9);
+          B.I64Const(-1);
+            B.LocalGet(6); B.I32Const(48); B.Op(wopI32Sub); B.Op(wopI64ExtendI32U);
+            B.Op(wopI64Sub);
+          B.I64Const(10); B.Op(wopI64DivU);
+          B.Op(wopI64GtU);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(1); B.LocalSet(10);
+          B.Op(wopElse);
+            B.LocalGet(9); B.I64Const(10); B.Op(wopI64Mul);
+              B.LocalGet(6); B.I32Const(48); B.Op(wopI32Sub); B.Op(wopI64ExtendI32U);
+              B.Op(wopI64Add); B.LocalSet(9);
+          B.EndOp;
           B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(3);
           B.Br(0);
         B.EndOp;
+      B.EndOp;
+      B.LocalGet(10);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I64Const(-1); B.LocalSet(9);
+      B.EndOp;
+      // the 32-bit spellings saturate at THEIR maximum
+      B.I32Const(VAL_DECW); B.OpMem(wopI32Load, 2, 0); B.I32Const(32); B.Op(wopI32Eq);
+      B.LocalGet(9); B.I64Const($FFFFFFFF); B.Op(wopI64GtU);
+      B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I64Const($FFFFFFFF); B.LocalSet(9);
       B.EndOp;
     B.EndOp;
 
@@ -2258,8 +2292,9 @@ begin
       B.I64Const(0); B.LocalGet(9); B.Op(wopI64Sub); B.LocalSet(9);
     B.EndOp;
     B.LocalGet(9);
+    // 1..8 i32, 9 the accumulator (i64), 10 the decimal overflow flag (i32)
     FModule.AddFunction(TValInt, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
-                                  wvtI32, wvtI32, wvtI64], B);
+                                  wvtI32, wvtI32, wvtI64, wvtI32], B);
   finally
     B.Free;
   end;
@@ -2320,6 +2355,7 @@ begin
       B.LocalGet(2); B.LocalGet(3); B.Op(wopI32Add); B.OpMem(wopI32Load8U, 0, 0);
         B.I32Const(38); B.Op(wopI32Eq);
       B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(VAL_DECW); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
         B.LocalGet(0); B.Call(FStrValIntFunc); B.Op(wopF64ConvertI64S); B.Op(wopReturn);
       B.EndOp;
     B.EndOp;
@@ -4496,6 +4532,14 @@ begin
       end;
     ssaStrValInt:
       begin
+        { Src3 is the DECIMAL saturation width - 32 for the Long/ULong spellings -
+          and it is a compile-time constant, so it is stored once right before
+          the call. ⚠️ Here it is Src3 and not Immediate: this backend reads the
+          SSA, where the bytecode compiler has not yet moved one into the other. }
+        B.I32Const(VAL_DECW);
+        if Instr.Src3.Kind = svkConstInt then B.I32Const(LongInt(Instr.Src3.ConstInt))
+                                         else B.I32Const(0);
+        B.OpMem(wopI32Store, 2, 0);
         LoadReg(B, Instr.Src1);
         B.Call(FStrValIntFunc);
         StoreReg(B, Instr.Dest);

@@ -4017,7 +4017,20 @@ begin
           ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          EmitInstruction(ssaStrValInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // ⭐ Src3 carries the DECIMAL SATURATION WIDTH, and it has to reach the PARSE rather
+          // than the narrowing below, because by the time the value arrives there the two cases
+          // are indistinguishable: ValInt("4294967296") and ValInt("&H100000000") are the same
+          // 64-bit number, and fbc answers -1 for the first and 0 for the second. A decimal
+          // saturates at the target type's unsigned maximum; a base prefix wraps.
+          // ⛔ We stop at the coherent half of fbc's behaviour ON PURPOSE. Its base-prefix
+          // overflow is its own two scanners disagreeing - ValUInt("&H200000000") saturates to
+          // 4294967295 while ValULng("&H10000000000000000") wraps to 0, same class of input,
+          // different answer - so reproducing it would encode a seam, not a rule. Measured
+          // against fbc 1.10.1; the evidence is in bug_val_overflow_saturation.bas.
+          if (FuncName = 'VALINT') or (FuncName = 'VALUINT') then
+            EmitInstruction(ssaStrValInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(32))
+          else
+            EmitInstruction(ssaStrValInt, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           // ⭐ FOUR SPELLINGS, FOUR TYPES - and they used to collapse into one signed 64-bit value.
           // FreeBASIC declares them Long / ULong / LongInt / ULongInt, so the two 32-bit forms have to
           // be NARROWED at the call, not merely printed differently:

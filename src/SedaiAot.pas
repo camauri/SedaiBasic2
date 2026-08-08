@@ -2667,13 +2667,18 @@ var
     StrCallEpilogue;       // reloads volatile xmm2..5 from the banks; xmm0 (the result) survives
     FStore(d, XMM0);
   end;
-  procedure EmitStrValInt; // IntRegs[dest] := ParseLeadingInt64(StringRegs[src])
+  procedure EmitStrValInt; // IntRegs[dest] := ParseLeadingInt64(StringRegs[src], Immediate)
   var d, s: Integer;
   begin
     d := IReg(Cur.Dest); s := SReg(Cur.Src1); if not OK then Exit;
     SpillVolatiles;
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
     E.MemOp([$48, $8B], ABI_ARG0, RAX, LongWord(s) * 8);  // arg0 = value
+    // arg1 = the DECIMAL saturation width the opcode carries. ⚠️ The AOT works on
+    // the SSA, where it is Src3, not on the bytecode's Immediate - the bytecode
+    // compiler is what moves one into the other.
+    if Cur.Src3.Kind = svkConstInt then MovImm64(ABI_ARG1, Cur.Src3.ConstInt)
+                                   else MovImm64(ABI_ARG1, 0);
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRVALINT);
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;

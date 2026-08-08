@@ -9425,7 +9425,7 @@ end;
   dialect-independent one-liners over these library parsers (defined further down;
   forward-declared here so the primitives can sit with their C5 siblings). Float Str()
   stays on the runtime helper: its handler needs the console-behavior object. }
-function ParseLeadingInt64(const S: string): Int64; forward;
+function ParseLeadingInt64(const S: string; DecWidth: Integer): Int64; forward;
 
 // REGEXREPL: 1 = build the replacement in one measured allocation (the default), 0 = the library's
 // own quadratic Replace. -1 = the environment has not been read yet. Read once, on the first
@@ -9672,9 +9672,12 @@ begin
   Result := ParseLeadingFloat(AnsiString(sVal));
 end;
 
-function AotStrValInt(sVal: Pointer): Int64; cdecl;
+function AotStrValInt(sVal: Pointer; DecWidth: PtrInt): Int64; cdecl;
 begin
-  Result := ParseLeadingInt64(AnsiString(sVal));
+  // DecWidth is the opcode's Immediate: 32 for the Long/ULong spellings of VAL,
+  // 0 for the 64-bit ones. Passed rather than assumed, so the compiled path and
+  // the interpreted one saturate at the same place.
+  Result := ParseLeadingInt64(AnsiString(sVal), Integer(DecWidth));
 end;
 
 { Resolve what a compiled AOT function returned (C3). Normally that is just the resume PC and
@@ -9864,7 +9867,7 @@ procedure TBytecodeVM.RunDebug;
 // first non-numeric character - matches FreeBASIC VALINT/VALLNG/VALUINT/VALULNG.
 // A "&H"/"&O"/"&B" prefix selects hexadecimal/octal/binary parsing. Returns 0 when
 // no digits are present.
-function ParseLeadingInt64(const S: string): Int64;
+function ParseLeadingInt64(const S: string; DecWidth: Integer): Int64;
 var
   I, Len, Base, D: Integer;
   Neg, Signed: Boolean;
@@ -9914,11 +9917,33 @@ begin
       Exit;
     end;
   end;
+  // ⭐ The DECIMAL magnitude SATURATES; it does not wrap. fbc reads a decimal
+  // through the C library, which stops at the type's unsigned maximum, and then
+  // applies the sign by two's-complement negation in the target width. Measured
+  // against fbc 1.10.1, and it is what makes every one of these agree:
+  //     ValLng ("18446744073709551616")   -1   (saturated, read signed)
+  //     ValULng("18446744073709551616")   18446744073709551615
+  //     ValInt ("-99999999999999999999999")  1   (-(2^64-1) narrowed to 32 bits)
+  // ⛔ The BASE-PREFIX branch above deliberately keeps WRAPPING: fbc scans &H/&O/&B
+  // itself rather than through the C library, so ValInt("&H100000000") is 0 in both
+  // and saturating there would break a case that already agrees.
+  U := 0;
+  D := 0;                                   // reused as the overflow flag
   while (I <= Len) and (S[I] >= '0') and (S[I] <= '9') do
   begin
-    Result := Result * 10 + (Ord(S[I]) - Ord('0'));
+    if U > (QWord($FFFFFFFFFFFFFFFF) - QWord(Ord(S[I]) - Ord('0'))) div 10 then
+      D := 1
+    else
+      U := U * 10 + QWord(Ord(S[I]) - Ord('0'));
     Inc(I);
   end;
+  if D <> 0 then U := QWord($FFFFFFFFFFFFFFFF);
+  // The 32-bit spellings saturate at THEIR maximum, not at the 64-bit one:
+  // ValInt("4294967296") is -1 in fbc (0xFFFFFFFF read signed) and not 0, and
+  // ValInt("-4294967296") is 1, because the sign is applied to the saturated
+  // magnitude and then narrowed.
+  if (DecWidth = 32) and (U > QWord($FFFFFFFF)) then U := QWord($FFFFFFFF);
+  Result := Int64(U);
   if Neg then Result := -Result;
 end;
 
@@ -9955,7 +9980,7 @@ begin
   // FreeBASIC does not accept a sign before one, so this deliberately looks BEFORE the sign scan.
   if (I <= Len) and (S[I] = '&') then
   begin
-    Result := ParseLeadingInt64(Copy(S, I, Len - I + 1));
+    Result := ParseLeadingInt64(Copy(S, I, Len - I + 1), 0);
     Exit;
   end;
   // [sign] digits [. digits]
@@ -10557,8 +10582,10 @@ begin
       Ctx.StringRegs[Instr.Dest] := FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 8), Ctx.IntRegs[Instr.Src2]);
     20: // bcStrBin - BIN(n[, digits]) - binary string, full INT64 range. Src2 = digits width (0 = natural).
       Ctx.StringRegs[Instr.Dest] := FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 2), Ctx.IntRegs[Instr.Src2]);
-    21: // bcStrValInt - VALINT/VALLNG/VALUINT(s) - parse leading integer (0 if none)
-      Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Ctx.StringRegs[Instr.Src1]);
+    21: // bcStrValInt - VALINT/VALLNG/VALUINT(s) - parse leading integer (0 if none).
+       // Immediate carries the DECIMAL saturation width: 32 for the Long/ULong
+       // spellings, 0 for the 64-bit ones. A base prefix always wraps.
+      Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Ctx.StringRegs[Instr.Src1], Integer(Instr.Immediate));
     49: // bcRegexCount - REGEXCOUNT(s, pattern): non-overlapping matches
       Ctx.IntRegs[Instr.Dest] := RegexCountMatches(Ctx.StringRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2]);
     50: // bcRegexReplace - REGEXREPLACE(s, pattern, repl): every match replaced (repl in the Immediate string reg)
