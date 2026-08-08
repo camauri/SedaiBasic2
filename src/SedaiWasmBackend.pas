@@ -2208,12 +2208,18 @@ begin
   for i := 0 to FProg.Blocks.Count - 1 do
   begin
     Blk := FProg.Blocks[i];
-    { ⚠️ The window is the REGION, not the block. A call and the load that reads
-      its result - or its byref writeback - are routinely in DIFFERENT blocks,
+    { ⚠️ The window is WIDER than a block. A call and the load that reads its
+      result - or its byref writeback - are routinely in DIFFERENT blocks,
       because the SSA splits at the call; resetting per block saw neither, and
-      the byref detection below found nothing at all until this changed.
-      Resetting per REGION keeps the attribution inside one procedure, which is
-      as far as a call's effects reach here. }
+      the byref detection below found nothing at all until this changed. It is
+      also bounded by the REGION, which is as far as a call's effects reach.
+      ⛔ But the region alone is TOO WIDE, and that was a real defect: SUB
+      inlining flattens a leaf callee into its caller and leaves the callee's OWN
+      transfer traffic behind, so a load belonging to inlined code was credited
+      to whatever call happened to come before it. A method returning Integer
+      came out declared as returning a STRING - with a phantom byref result on
+      top - because a string-returning leaf function was inlined ten instructions
+      later. The closing bracket is below: a STORE ends the window. }
     if FRegionOf[i] <> TR then
     begin
       TR := FRegionOf[i];
@@ -2257,7 +2263,18 @@ begin
           region returns this bank. It is the CALLER that knows - a forwarding
           thunk never stores the result slot itself, so nothing inside it says
           what it returns. }
-        FResultBank[Target] := Ord(RT);
+        FResultBank[Target] := Ord(RT)
+      else if OpIn(Instr.OpCode, [ssaXferStoreInt, ssaXferStoreFloat, ssaXferStoreString]) then
+        { ⭐ A STORE CLOSES THE WINDOW, and that is the whole fix. A call's
+          effects are read out BEFORE anything else is written into the transfer
+          bank - the result load and any byref writeback come first, then the
+          caller stages its next call. So a store means the previous call has
+          been read to the end, and anything after it belongs to somebody else:
+          in practice, to a leaf procedure that SUB inlining flattened in here.
+          ⚠️ Deliberately ANY store, result slot included: inlined code writes
+          slot 255 too, and a region that has just written its own result is not
+          reading a call's either. }
+        Target := -1;
     end;
   end;
 
