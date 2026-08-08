@@ -447,6 +447,7 @@ begin
         ssaLoadConstString, ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight,
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
         ssaStrSpace, ssaStrString, ssaStrUCase, ssaStrLCase, ssaStrInstr,
+        ssaCommand,
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
@@ -3751,6 +3752,20 @@ begin
         end;
         B.Call(FPuFmtFunc);
         B.Call(FPrintStrFunc);
+      end;
+
+    { COMMAND$(n) - the command line, which a WASM module does not have.
+      ⭐ The EMPTY STRING is the honest answer and not a stub: a module was not
+      launched from a shell, so it genuinely received no arguments. A program
+      that switches on an argument therefore takes its default branch, which is
+      what "run it in a browser" should mean.
+      📌 The day the page wants to pass something, the natural mapping is the
+      query string - a decision about MEANING, to be taken then and declared,
+      not smuggled in now. }
+    ssaCommand:
+      begin
+        B.I32Const(EMPTY_STR);
+        StoreReg(B, Instr.Dest);
       end;
 
     ssaStrSpace:
