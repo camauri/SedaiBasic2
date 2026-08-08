@@ -148,7 +148,7 @@ type
     FConstBytes: AnsiString;      // the data segment, already laid out
     FAllocFunc, FStrNewFunc, FStrCatFunc, FStrSubFunc, FStrCmpFunc,
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
-    FPrintStrFunc: LongWord;
+    FPrintStrFunc, FStrFromIntFunc: LongWord;
 
     // --- arrays ---------------------------------------------------------
     FUsesArr: Boolean;
@@ -377,7 +377,7 @@ begin
         ssaRawLoadInt, ssaRawStoreInt:
           FUsesGfx := True;
         ssaLoadConstString, ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight,
-        ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr,
+        ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
@@ -691,7 +691,8 @@ end;
 procedure TWasmBackend.EmitStringHelpers;
 var
   B: TWasmBuf;
-  TNewStr, TCat, TSub, TCmp, TAsc, TChr, TRight, TMid, TPrint: LongWord;
+  TNewStr, TCat, TSub, TCmp, TAsc, TChr, TRight, TMid, TPrint,
+  TFromInt: LongWord;
 begin
   TNewStr := FModule.TypeIndex([wvtI32], [wvtI32]);
   TCat    := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
@@ -702,6 +703,7 @@ begin
   TRight  := FModule.TypeIndex([wvtI32, wvtI64], [wvtI32]);
   TMid    := FModule.TypeIndex([wvtI32, wvtI64, wvtI64], [wvtI32]);
   TPrint  := FModule.TypeIndex([wvtI32], []);
+  TFromInt := FModule.TypeIndex([wvtI64], [wvtI32]);
 
   { strNew(len: i32) -> i32: an uninitialised header of that length, or the
     canonical empty string when the length is zero. }
@@ -935,6 +937,63 @@ begin
     B.LocalGet(0); B.LocalGet(1); B.LocalGet(2);
     B.Call(FStrSubFunc);
     FModule.AddFunction(TMid, [], B);
+  finally
+    B.Free;
+  end;
+
+  { strFromInt(v: i64) -> a fresh string holding v in decimal.
+    ⚠️ NOT the same text PRINT produces, and the difference is the whole point:
+    PRINT pads the sign column with a space, Str does NOT ("-7" is two
+    characters, "42" is two). The digits are generated exactly as printInt does -
+    backwards into the scratch, unsigned so that Low(Int64) negates to the right
+    magnitude - and then copied into a string instead of the sink. }
+  B := TWasmBuf.Create;
+  try
+    // locals: 1 = p (i32), 2 = u (i64), 3 = neg (i32), 4 = len (i32), 5 = h (i32)
+    B.I32Const(SCRATCH_END); B.LocalSet(1);
+    B.LocalGet(0); B.I64Const(0); B.Op(wopI64LtS); B.LocalSet(3);
+
+    B.LocalGet(3);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.LocalGet(0); B.Op(wopI64Sub); B.LocalSet(2);
+    B.Op(wopElse);
+      B.LocalGet(0); B.LocalSet(2);
+    B.EndOp;
+
+    B.LocalGet(2); B.Op(wopI64Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+      B.LocalGet(1); B.I32Const(Ord('0')); B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(2); B.Op(wopI64Eqz); B.BrIf(1);
+          B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+          B.LocalGet(1);
+          B.LocalGet(2); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+          B.I32Const(Ord('0')); B.Op(wopI32Add);
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(2); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(2);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+
+    // the minus sign, and ONLY when negative - no space pad
+    B.LocalGet(3);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+      B.LocalGet(1); B.I32Const(Ord('-')); B.OpMem(wopI32Store8, 0, 0);
+    B.EndOp;
+
+    B.I32Const(SCRATCH_END); B.LocalGet(1); B.Op(wopI32Sub); B.LocalSet(4);
+    B.LocalGet(4); B.Call(FStrNewFunc); B.LocalSet(5);
+    B.LocalGet(5); B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(1);
+    B.LocalGet(4);
+    B.MemoryCopy;
+    B.LocalGet(5);
+    FModule.AddFunction(TFromInt, [wvtI32, wvtI64, wvtI32, wvtI32, wvtI32], B);
   finally
     B.Free;
   end;
@@ -2594,6 +2653,13 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    ssaIntToString:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FStrFromIntFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
       begin
         LoadReg(B, Instr.Src1);
@@ -3566,8 +3632,14 @@ begin
     FStrChrFunc   := Next + 5;
     FStrRightFunc := Next + 6;
     FStrMidFunc   := Next + 7;
-    FPrintStrFunc := Next + 8;
-    Inc(Next, 9);
+    { ⛔ strFromInt goes BEFORE printStr, and the order is not cosmetic: printStr
+      is emitted only when the program PRINTS, so anything numbered after it
+      would slide by one in a program that uses Str() without printing - and
+      calling the wrong function with the right types VALIDATES. The conditional
+      one stays last. }
+    FStrFromIntFunc := Next + 8;
+    FPrintStrFunc   := Next + 9;
+    Inc(Next, 10);
   end;
   if FUsesArr then
   begin
