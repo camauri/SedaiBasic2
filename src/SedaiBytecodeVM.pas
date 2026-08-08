@@ -9943,7 +9943,7 @@ end;
 
 function ParseLeadingFloat(const S: string): Double;
 var
-  I, J, K, Len, Code, DPos: Integer;
+  I, J, K, Len, DPos: Integer;
   T: string;
   HasDigit, HasDot, Neg: Boolean;
 begin
@@ -10024,8 +10024,14 @@ begin
   // character that is almost never there. The scan above already located it, so this is one byte
   // store on the rare call that needs it.
   if (DPos > 0) and (DPos <= Length(T)) then T[DPos] := 'E';
-  Val(T, Result, Code);
-  if Code <> 0 then Result := 0.0;
+  // ⛔ NOT FPC's Val, which was wrong twice and silently: it gives up entirely on a
+  // string longer than 255 characters (fpc_Val_Real_AnsiStr sets code 256, and the
+  // caller here turned that into 0.0), and it parses through the 80-bit Extended
+  // and rounds a second time into the Double. Both measured against fbc, which is
+  // right on both counts. ExactStrToDouble rounds ONCE, half to even, from the
+  // exact decimal - and it is written without floating point so the WebAssembly
+  // backend can run the same algorithm and agree by construction.
+  Result := ExactStrToDouble(T);
 end;
 
 // Render an Int64 in an arbitrary base (2..16) as an unsigned bit pattern, no

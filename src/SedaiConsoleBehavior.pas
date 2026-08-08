@@ -265,6 +265,12 @@ type
     class function CreateTRS80: TConsoleBehavior;
   end;
 
+{ The correctly rounded double of a decimal string - VAL()'s tail end. Exported
+  because the VM's ParseLeadingFloat is what calls it, and because it is the
+  mirror of the exact digit generator that lives beside it: the two have to be
+  read together. }
+function ExactStrToDouble(const S: string): Double;
+
 implementation
 
 uses Math;
@@ -446,6 +452,316 @@ begin
       Inc(Ex);
     end;
   end;
+end;
+
+function ExactStrToDouble(const S: string): Double;
+{ The CORRECTLY ROUNDED double of a decimal string - the exact mirror of
+  ExactRoundedDigits above, and written in the same idiom so that both can be
+  ported to a target with no floating-point runtime of its own.
+
+  ⭐ WHY THIS EXISTS, and it is two separate defects, both SILENT.
+  VAL() used to end in FPC's Val(), and that route is wrong twice:
+
+  1. THE 255-CHARACTER CLIFF. Val() on an AnsiString is fpc_Val_Real_AnsiStr,
+     which reads "if length(S) > 255 then code := 256" and gives up - and our
+     caller turns a non-zero code into 0.0. So VAL of a 256-character number
+     answered ZERO. Measured: every length up to 255 worked, 256 and beyond
+     returned 0, with nothing said. fbc gets these right.
+  2. THE DOUBLE ROUNDING. FPC's val_real parses into ValReal, which on this
+     target is the 80-bit Extended, and the result is then rounded again into
+     the Double. Two roundings disagree with one on the values that land on a
+     tie: measured 69 of 974 on a corpus built around exact midpoints, and
+     about one in five thousand random long decimals. fbc is correctly rounded
+     on all of them.
+  ⛔ Note how this differs from the PRINT direction: there fbc double-rounds and
+  WE are right, deliberately (see PIANO_FLOAT_PRINT.md). Here fbc and IEEE 754
+  agree and we were the odd one out, so there is nothing to declare - this is
+  simply a correction.
+
+  THE METHOD, and it uses no floating point and no division of one big number by
+  another. The value is a decimal integer P times a power of ten:
+      V = P x 10^-j
+  Multiplying P by 2^Sh (which the digit buffer can do) turns it into
+      V = (P x 2^Sh) x 10^-j x 2^-Sh
+  and dividing a DECIMAL number by 10^j is just reading the digits above index j
+  - no division at all. So once the buffer has been grown until it holds at least
+  21 digits above the point, the integer part I is exact and known to carry more
+  than 64 bits, and everything below the point is folded into one sticky flag.
+  I is then taken to binary the only way a decimal number goes to binary without
+  a big divide: repeated division by 2^30, whose remainders ARE the 30-bit limbs.
+  Rounding half-to-even on I plus the sticky bit is then ordinary integer work.
+
+  The parse accepts what ParseLeadingFloat's scan produces and nothing more:
+  [sign] digits [. digits] [ (e|E) [sign] digits ]. Anything else answers 0, the
+  same as the non-zero Code it replaces. }
+const
+  MAXDIG   = 1500;    { worst case measured at ~1230; the slack is free }
+  DIGCAP   = 800;     { significant digits KEPT. ⭐ Not an approximation: a
+                        double's exact tie needs at most 767 significant
+                        decimal digits, so beyond this a sticky flag carries
+                        every bit of information the rest can hold. }
+  P2CHUNK  = 30;
+  P10CHUNK = 17;      { ⛔ not 18: the running carry can reach F, so the product
+                        reaches 10F, and 10 x 10^18 overflows an Int64. }
+  MAXLIMB  = 200;
+var
+  Buf: array[0..MAXDIG - 1] of Byte;      { little-endian decimal digits }
+  Sig: array[0..DIGCAP - 1] of Byte;      { significant digits, most significant first }
+  Limb: array[0..MAXLIMB - 1] of LongWord;
+  Len, NLimb, SigCount, Exp10, DecExp, Prec, E, L, Drop: Integer;
+  i, j, k, b, p, n, d, q, ev, esign, lo, hi, off: Integer;
+  Neg, Sticky, Rest, SawDot, SawDigit: Boolean;
+  Carry, T, Mul, Rem: Int64;
+  Mant, Bits: QWord;
+  c: Char;
+
+  procedure MulBy(F: Int64);
+  var
+    x: Integer;
+  begin
+    Carry := 0;
+    for x := 0 to Len - 1 do
+    begin
+      T := Int64(Buf[x]) * F + Carry;
+      Buf[x] := Byte(T mod 10);
+      Carry := T div 10;
+    end;
+    while (Carry > 0) and (Len < MAXDIG) do
+    begin
+      Buf[Len] := Byte(Carry mod 10);
+      Carry := Carry div 10;
+      Inc(Len);
+    end;
+  end;
+
+  function GetBit(Pos: Integer): Integer;
+  begin
+    if (Pos < 0) or ((Pos div P2CHUNK) >= NLimb) then
+      Result := 0
+    else
+      Result := Integer((Limb[Pos div P2CHUNK] shr (Pos mod P2CHUNK)) and 1);
+  end;
+
+begin
+  Result := 0.0;
+  n := Length(S);
+  p := 1;
+  Neg := False;
+  if (p <= n) and ((S[p] = '+') or (S[p] = '-')) then
+  begin
+    Neg := (S[p] = '-');
+    Inc(p);
+  end;
+
+  { The value is built as Sig (an integer of SigCount digits) x 10^Exp10. A digit
+    before the point is part of that integer; one after it moves Exp10 down; a
+    leading zero after the point moves Exp10 down without being stored. }
+  SigCount := 0; Exp10 := 0; SawDot := False; SawDigit := False; Sticky := False;
+  while p <= n do
+  begin
+    c := S[p];
+    if (c >= '0') and (c <= '9') then
+    begin
+      SawDigit := True;
+      d := Ord(c) - Ord('0');
+      if (SigCount = 0) and (d = 0) then
+      begin
+        if SawDot then Dec(Exp10);
+      end
+      else if SigCount < DIGCAP then
+      begin
+        Sig[SigCount] := Byte(d);
+        Inc(SigCount);
+        if SawDot then Dec(Exp10);
+      end
+      else
+      begin
+        { past the cap: the digit cannot change the answer, only whether an exact
+          tie is a tie }
+        if d <> 0 then Sticky := True;
+        if not SawDot then Inc(Exp10);
+      end;
+      Inc(p);
+    end
+    else if (c = '.') and (not SawDot) then
+    begin
+      SawDot := True;
+      Inc(p);
+    end
+    else
+      Break;
+  end;
+  if not SawDigit then Exit;
+
+  if (p <= n) and ((S[p] = 'e') or (S[p] = 'E')) then
+  begin
+    q := p + 1;
+    esign := 1;
+    if (q <= n) and ((S[q] = '+') or (S[q] = '-')) then
+    begin
+      if S[q] = '-' then esign := -1;
+      Inc(q);
+    end;
+    if (q <= n) and (S[q] >= '0') and (S[q] <= '9') then
+    begin
+      ev := 0;
+      while (q <= n) and (S[q] >= '0') and (S[q] <= '9') do
+      begin
+        { clamped, not wrapped: a wild exponent still has to answer infinity or
+          zero, and it must not overflow on the way there }
+        if ev < 1000000 then ev := ev * 10 + (Ord(S[q]) - Ord('0'));
+        Inc(q);
+      end;
+      Inc(Exp10, esign * ev);
+      p := q;
+    end;
+  end;
+
+  if SigCount = 0 then
+  begin
+    { ±0. The sign is kept: "-0" and "-0.0e5" answer negative zero, as fbc does. }
+    if Neg then PInt64(@Result)^ := Int64($8000000000000000);
+    Exit;
+  end;
+
+  { The decimal exponent of the leading digit. These two guards exist to BOUND
+    THE BUFFER, not to decide anything: the ordinary path below still has to
+    produce infinity for 1e309 and zero for 1e-324, and it does. }
+  DecExp := (SigCount - 1) + Exp10;
+  if DecExp > 330 then
+  begin
+    Bits := QWord($7FF0000000000000);
+    if Neg then Bits := Bits or QWord($8000000000000000);
+    Move(Bits, Result, SizeOf(Result));
+    Exit;
+  end;
+  if DecExp < -400 then
+  begin
+    if Neg then PInt64(@Result)^ := Int64($8000000000000000);
+    Exit;
+  end;
+
+  Len := SigCount;
+  for i := 0 to SigCount - 1 do
+    Buf[i] := Sig[SigCount - 1 - i];
+
+  if Exp10 > 0 then
+  begin
+    i := Exp10;
+    while i > 0 do
+    begin
+      k := i; if k > P10CHUNK then k := P10CHUNK;
+      Mul := 1; for d := 1 to k do Mul := Mul * 10;
+      MulBy(Mul);
+      Dec(i, k);
+    end;
+    j := 0;
+  end
+  else
+    j := -Exp10;
+
+  { Grow until at least 21 digits sit ABOVE the point: 10^20 is past 2^66, so the
+    integer part is guaranteed to carry more bits than the rounding needs. }
+  k := 0;
+  while ((Len - j) < 21) and (Len < MAXDIG - 12) do
+  begin
+    MulBy(Int64(1) shl P2CHUNK);
+    Inc(k, P2CHUNK);
+  end;
+
+  { Everything below the point is one bit of information }
+  if not Sticky then
+    for i := 0 to j - 1 do
+      if Buf[i] <> 0 then begin Sticky := True; Break; end;
+
+  { The integer part to binary: divide by 2^30 and keep the remainders, which
+    ARE the limbs. Dividing a decimal buffer from the top by F keeps every
+    partial remainder below F, so each quotient digit stays below ten. }
+  NLimb := 0;
+  lo := j; hi := Len;
+  while (hi > lo) and (NLimb < MAXLIMB) do
+  begin
+    Rem := 0;
+    for i := hi - 1 downto lo do
+    begin
+      T := Rem * 10 + Int64(Buf[i]);
+      Buf[i] := Byte(T shr P2CHUNK);
+      Rem := T and ((Int64(1) shl P2CHUNK) - 1);
+    end;
+    Limb[NLimb] := LongWord(Rem);
+    Inc(NLimb);
+    while (hi > lo) and (Buf[hi - 1] = 0) do Dec(hi);
+  end;
+
+  { Unreachable by the bounds above (the grow loop guarantees digits above the
+    point), but an empty limb array would index Limb[-1] rather than say so. }
+  if NLimb = 0 then
+  begin
+    if Neg then PInt64(@Result)^ := Int64($8000000000000000);
+    Exit;
+  end;
+
+  { The bit length of the integer part }
+  L := (NLimb - 1) * P2CHUNK;
+  b := P2CHUNK - 1;
+  while (b >= 0) and (((Limb[NLimb - 1] shr b) and 1) = 0) do Dec(b);
+  Inc(L, b + 1);
+
+  E := (L - 1) - k;               { binary exponent of the leading bit }
+
+  Prec := 53;
+  if E < -1022 then Prec := 53 + (E + 1022);
+  if Prec < 0 then
+  begin
+    { below half of the smallest subnormal: zero, with its sign }
+    if Neg then PInt64(@Result)^ := Int64($8000000000000000);
+    Exit;
+  end;
+
+  Drop := L - Prec;
+  Mant := 0;
+  for b := Prec - 1 downto 0 do
+    Mant := (Mant shl 1) or QWord(GetBit(Drop + b));
+
+  { Round half to EVEN, and the tie test looks at every bit below - the whole
+    reason this function exists. }
+  Rest := Sticky;
+  if (not Rest) and (Drop >= 2) then
+  begin
+    q := (Drop - 1) div P2CHUNK;
+    for i := 0 to q - 1 do
+      if Limb[i] <> 0 then begin Rest := True; Break; end;
+    if not Rest then
+    begin
+      off := (Drop - 1) mod P2CHUNK;
+      if (off > 0) and (q < NLimb) then
+        if (Limb[q] and ((LongWord(1) shl off) - 1)) <> 0 then Rest := True;
+    end;
+  end;
+  if (Drop > 0) and (GetBit(Drop - 1) = 1) and (Rest or ((Mant and 1) <> 0)) then
+    Inc(Mant);
+
+  if E >= -1022 then
+  begin
+    { the carry can push the mantissa into the next binade }
+    if Mant = (QWord(1) shl 53) then
+    begin
+      Mant := QWord(1) shl 52;
+      Inc(E);
+    end;
+    if E > 1023 then
+      Bits := QWord($7FF0000000000000)
+    else
+      Bits := (QWord(E + 1023) shl 52) or (Mant and QWord($000FFFFFFFFFFFFF));
+  end
+  else
+    { Subnormal: the value is Mant x 2^-1074 by construction, which IS the bit
+      pattern. ⭐ And when the rounding carried it up to 2^52 the same formula
+      gives the smallest NORMAL number, which is exactly right. }
+    Bits := Mant;
+
+  if Neg then Bits := Bits or QWord($8000000000000000);
+  Move(Bits, Result, SizeOf(Result));
 end;
 
 procedure TConsoleBehavior.SetFloatDigits(V: Integer);
