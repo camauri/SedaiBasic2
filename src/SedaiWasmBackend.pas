@@ -397,7 +397,14 @@ begin
         ssaPrint, ssaPrintLn:
           begin FUsesPrint := True; FUsesFlt := True; end;
         ssaGfxScreenRes, ssaGfxScreenPtr, ssaGfxScreenInfo,
-        ssaRawLoadInt, ssaRawStoreInt:
+        ssaRawLoadInt, ssaRawStoreInt, ssaRawLoadFloat, ssaRawStoreFloat,
+        ssaRawClear, ssaRawMemCopy, ssaRawMemMove:
+          FUsesGfx := True;
+        { ⚠️ Gfx here means "raw memory exists", not "the program draws": the
+          raw pointer decoder needs the framebuffer base to select a region, and
+          FUsesHeap is derived from this below - which is what actually gives
+          the module its memory and its allocator. }
+        ssaRawAlloc, ssaRawRealloc:
           FUsesGfx := True;
         ssaLoadConstString, ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight,
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
@@ -3368,6 +3375,142 @@ begin
         else
           B.OpMem(wopI64Store, 3, 0);
         end;
+      end;
+
+    ssaRawLoadFloat:
+      begin
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = RTC_SINGLE) then
+        begin
+          B.OpMem(wopF32Load, 2, 0);
+          B.Op(wopF64PromoteF32);      // a Single Ptr deref widens, as it does natively
+        end
+        else
+          B.OpMem(wopF64Load, 3, 0);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaRawStoreFloat:
+      begin
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        LoadReg(B, Instr.Src2);
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = RTC_SINGLE) then
+        begin
+          B.Op(wopF32DemoteF64);
+          B.OpMem(wopF32Store, 2, 0);
+        end
+        else
+          B.OpMem(wopF64Store, 3, 0);
+      end;
+
+    { ⭐ RawAlloc is the bump allocator plus a HEADER, and the header buys two
+      things that are not optional:
+        - REALLOC needs the old size, and there is nowhere else to keep it;
+        - the interpreter reserves offset 0 as NULL. Here the first payload
+          lands at offset 8 for free, because the header sits in front of it -
+          so a perfectly good pointer can never read as NULL.
+      ⭐ Zeroing the payload is free and not an omission: the bump allocator
+      never reuses, linear memory starts zeroed and memory.grow hands out zeroed
+      pages. ⛔ The day it learns to free, this stops being true. }
+    ssaRawAlloc:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.LocalTee(FRawTmp);
+        B.I64Const(1); B.Op(wopI64LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I64Const(1); B.LocalSet(FRawTmp);      // 0 bytes means 1, as the VM does
+        B.EndOp;
+        // round the payload up to 8, exactly as RawAlloc does
+        B.LocalGet(FRawTmp); B.I64Const(7); B.Op(wopI64Add);
+        B.I64Const(-8); B.Op(wopI64And); B.LocalSet(FRawTmp);
+        B.LocalGet(FRawTmp); B.Op(wopI32WrapI64); B.I32Const(8); B.Op(wopI32Add);
+        B.Call(FAllocFunc); B.LocalTee(FGfxP);
+        B.LocalGet(FRawTmp); B.Op(wopI32WrapI64);
+        B.OpMem(wopI32Store, 2, 0);                // the size header
+        B.LocalGet(FGfxP); B.I32Const(8); B.Op(wopI32Add);
+        B.I32Const(LongInt(FHeapBase)); B.Op(wopI32Sub);
+        B.Op(wopI64ExtendI32U);
+        B.I64Const(RAWPTR_TAG); B.Op(wopI64Or);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { ⚠️ FREE IS A NO-OP, and that is the v1 limit stated out loud rather than
+      hidden: the allocator is a bump pointer and never reclaims. A program that
+      allocates in a loop runs until the memory traps. Silently doing nothing is
+      correct here in the sense that nothing breaks - what would be wrong is not
+      saying so. }
+    ssaRawFree: ;
+
+    ssaRawRealloc:
+      begin
+        // new block, copy across the SMALLER of the two sizes, old block leaks
+        LoadReg(B, Instr.Src2);
+        B.LocalTee(FRawTmp);
+        B.I64Const(1); B.Op(wopI64LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I64Const(1); B.LocalSet(FRawTmp);
+        B.EndOp;
+        B.LocalGet(FRawTmp); B.I64Const(7); B.Op(wopI64Add);
+        B.I64Const(-8); B.Op(wopI64And); B.LocalSet(FRawTmp);
+        B.LocalGet(FRawTmp); B.Op(wopI32WrapI64); B.I32Const(8); B.Op(wopI32Add);
+        B.Call(FAllocFunc); B.LocalTee(FGfxP);
+        B.LocalGet(FRawTmp); B.Op(wopI32WrapI64);
+        B.OpMem(wopI32Store, 2, 0);
+        { ⛔ BOTH sizes are read back out of their HEADERS, and that is not
+          style: EmitRawAddr uses FRawTmp as its own scratch, so the new size
+          cannot be kept there across the call - it held the right value, the
+          decode overwrote it, and realloc copied four bytes instead of
+          sixty-four. The headers cannot be clobbered by anything. }
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        B.LocalSet(FGfxN);                         // old payload address
+        B.LocalGet(FGfxP); B.I32Const(8); B.Op(wopI32Add);
+        B.LocalGet(FGfxN);
+        B.LocalGet(FGfxN); B.I32Const(8); B.Op(wopI32Sub);
+        B.OpMem(wopI32Load, 2, 0);                 // old size, from its header
+        B.LocalTee(FArrTmp);
+        B.LocalGet(FGfxP); B.OpMem(wopI32Load, 2, 0);   // new size, from its header
+        B.Op(wopI32GtU);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.LocalGet(FGfxP); B.OpMem(wopI32Load, 2, 0);
+        B.Op(wopElse);
+          B.LocalGet(FArrTmp);
+        B.EndOp;
+        B.MemoryCopy;
+        B.LocalGet(FGfxP); B.I32Const(8); B.Op(wopI32Add);
+        B.I32Const(LongInt(FHeapBase)); B.Op(wopI32Sub);
+        B.Op(wopI64ExtendI32U);
+        B.I64Const(RAWPTR_TAG); B.Op(wopI64Or);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaRawClear:
+      begin
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        LoadReg(B, Instr.Src2); B.Op(wopI32WrapI64);
+        B.I32Const(255); B.Op(wopI32And);          // CLEAR takes a BYTE value
+        LoadReg(B, Instr.Src3); B.Op(wopI32WrapI64);
+        B.MemoryFill;
+      end;
+
+    { ⭐ ONE arm for both, and it is not laziness - it is what the interpreter
+      does: bcRawMemCopy and bcRawMemMove both call RawMemCopy. WASM's
+      memory.copy is specified to behave as if through a temporary buffer, so it
+      is overlap-safe and MEMMOVE is satisfied by construction. Both hand back
+      the DESTINATION, which is what FreeBASIC returns. }
+    ssaRawMemCopy, ssaRawMemMove:
+      begin
+        LoadReg(B, Instr.Src1);
+        EmitRawAddr(B);
+        LoadReg(B, Instr.Src2);
+        EmitRawAddr(B);
+        LoadReg(B, Instr.Src3); B.Op(wopI32WrapI64);
+        B.MemoryCopy;
+        LoadReg(B, Instr.Src1);
+        StoreReg(B, Instr.Dest);
       end;
 
     ssaNarrowInt:
