@@ -2,11 +2,17 @@
 
 Future directions and project goals for SedaiBasic.
 
-> **In flight (6 Aug 2026): voxel-landscape demo, phase 1.** Public material. The plan, and the
-> measured budget it rests on, are in `job/docs/PIANO_DEMO_VOXEL.md`. The English in-source comments
-> are a primary deliverable, not documentation added at the end — that is what readers of the previous
-> demos singled out. Implemented from first principles: no existing voxel source is ported or adapted,
-> and every constant is chosen experimentally here.
+> **In flight (8 Aug 2026): the WebAssembly backend.** SedaiBasic emits WASM on its own, from its own
+> SSA — no external toolchain, no port of the VM into the browser, no third-party runtime. What it
+> covers today is in the README; what it does not cover it *refuses by name*, because in a browser
+> there is no interpreter to fall back into. The runtime that WASM needs is written in BASIC and
+> compiled by this same backend, which means it also runs natively and is covered by the ordinary
+> regression net.
+>
+> **Delivered:** the voxel-landscape demo and the lattice-Boltzmann fluid demo, both in `bas/demo/`.
+> Their English in-source comments are a primary deliverable rather than documentation added at the
+> end — that is what readers singled out — and both are implemented from first principles, with no
+> existing source ported or adapted and every constant chosen experimentally here.
 
 ---
 

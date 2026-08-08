@@ -21,10 +21,9 @@ bytecode VM. Of the
 > ⚠️ **This table is a hand-kept census and it drifts — in both directions.** Four ticks were withdrawn
 > on 5 Aug 2026 (`DRAW STRING`, `OPEN PIPE`, `OPEN COM`, `OPEN LPT`) after the FreeBASIC-examples sweep
 > stopped skipping the examples that prove them; `DRAW STRING` earned its back the same day, by being
-> implemented. The machine-checked inventory is
-> `job/tests/tools/kwcheck.ps1` (recognition) plus `job/tests/regress/sweep_fbexamples.sh` (behaviour
-> against fbc); where they disagree with this page, they are right. A tick here means "we believe it
-> works", not "something checked".
+> implemented. The authority is the project's machine-checked inventory — a keyword-recognition pass
+> and a sweep that runs the FreeBASIC examples against fbc; where those disagree with this page, they
+> are right. A tick here means "we believe it works", not "something checked".
 
 > 📌 Rows marked **SedaiBasic extension** (`REGEXCOUNT`, `OPTION DIGITS`, the `SPR*` sprite commands…)
 > are full members of the MODERN dialect, and deliberately absent from the FreeBASIC totals above.
@@ -187,8 +186,8 @@ required by **IEEE 754-2019 §5.12.2**.
 > rounding on **4.75%** of doubles. `Print 1e-283` is `9.999999999999999e-284` here and `1e-283` in
 > fbc; the exact value is `0.999999999999999946852…e-283`, whose 17th digit is a 4, so rounding down
 > is the correct answer. Measured over 20 706 bit patterns; no example in the FreeBASIC corpus is
-> affected. The reasoning is in `job/docs/PIANO_FLOAT_PRINT.md` — **read it before "fixing" a float
-> difference against fbc.**
+> affected. ⛔ This is a deliberate, measured departure — **a float difference against fbc is not a
+> bug to be "fixed" here.**
 
 ### `OPTION DIGITS n` / `OPTION DIGITS EXACT`
 
@@ -412,9 +411,8 @@ hold.
 > it **greedily**: `RegexReplace("<a><b>", "<.+?>", "#")` returned `#` where every other regex
 > implementation returns `##`. Refusing the pattern is what keeps the two engines interchangeable.
 
-**How compatible, measured rather than claimed.** A differential harness
-(`job/tests/tools/regex_diff.py`) puts every answer next to PCRE2's, on 342 real patterns lifted from
-CPython's standard library and on generated ones:
+**How compatible, measured rather than claimed.** A differential harness puts every answer next to
+PCRE2's, on 342 real patterns lifted from CPython's standard library and on generated ones:
 
 | | |
 |---|---|
@@ -1437,8 +1435,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 # FreeBASIC Keyword Reference & Implementation Status
 
 > **Scope.** This section is a **compatibility map against FreeBASIC**, not a to-do list for
-> SedaiBasic. MODERN is SedaiBasic's own dialect (see `job/docs/SEDAIBASIC_EVOLUTION.md`); FreeBASIC
-> is the reference it grew from and the yardstick its interoperability is measured against, which
+> SedaiBasic. MODERN is SedaiBasic's own dialect; FreeBASIC is the reference it grew from and the
+> yardstick its interoperability is measured against, which
 > matters because it means unmodified FreeBASIC programs run here. A -- below means "FreeBASIC code
 > using this will not run", not "SedaiBasic is missing something it owes anyone" -- and several
 > entries are marked N/A precisely because they are artefacts of being a native compiler rather than

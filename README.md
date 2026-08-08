@@ -27,14 +27,15 @@
 > - [BASIC.md](BASIC.md) - Complete list of BASIC commands with implementation status
 > - [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed compilation pipeline and VM architecture
 > - [CONSOLE.md](CONSOLE.md) - Keyboard shortcuts and graphics mode reference
+> - [BENCHMARK.md](BENCHMARK.md) - Benchmark results against the reference implementations
+> - [WEB_BASIC.md](WEB_BASIC.md) - Web BASIC (`sbw`), the stand-alone HTTP server
 > - [ROADMAP.md](ROADMAP.md) - Future directions and project architecture
-> - [README_AI.md](README_AI.md) - Entry point for AI coding agents (rules + architecture)
 
 ## What is SedaiBasic2?
 
 SedaiBasic2 began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
 
-- **CLASSIC** — line-numbered, from Commodore BASIC v7 (**201 / 209** core commands, 96%). It keeps
+- **CLASSIC** — line-numbered, from Commodore BASIC v7 (**202 / 210** core commands, 96%). It keeps
   v7's *language*, not v7's machine: this does not run on a C64/C128 and has none of its peripherals,
   so the palette is 256 RGBA entries where v7 had sixteen fixed colours, sprites go to 256×256 and
   full colour against the C128's fixed 24×21, there are twelve video modes plus a dynamic one, and
@@ -64,7 +65,54 @@ Source → Lexer → Parser (Packrat + Pratt) → AST → SSA IR
        → 16 SSA optimization passes → Bytecode → 6 bytecode passes → Register VM
 ```
 
-The register-based VM uses three separate typed register banks (int / float / string) and 2-byte grouped opcodes. A differential regression net runs every corpus program (270+ tests) both optimized and with `--no-opt` and requires identical output, guarding the optimizer.
+The register-based VM uses three separate typed register banks (int / float / string) and 2-byte grouped opcodes. A differential regression net runs every corpus program both optimized and with `--no-opt` and requires identical output, guarding the optimizer.
+
+### Native compilation
+
+Two optional engines compile to machine code instead of interpreting, both off by default:
+
+```bash
+sb --jit program.bas     # compile eligible hot loops to native code
+sb --aot program.bas     # compile eligible whole functions from the SSA, before running
+```
+
+They are checked the same way everything else is: a differential net compiles the corpus both ways and
+requires identical output, so a function the AOT takes over has to agree with the interpreter **bit
+for bit** — which is also the constraint that decides what it may do. Where a loop's shape allows it
+the AOT emits two-lane SSE2, and that stays inside the constraint because the two lanes accumulate
+independently and are combined in the same order the scalar code would have used.
+
+### WebAssembly
+
+`sbc --target wasm` emits a **WebAssembly module** from the same SSA the bytecode compiler uses. The
+generated `.wasm` runs in a browser or under Node with no interpreter, no runtime library and no
+toolchain: procedures become WASM functions (so recursion runs on the engine's own stack), registers
+become locals, and the only import is a byte sink for output — the formatting of numbers is the
+language's own, so a module prints exactly what `sb` prints.
+
+```bash
+sbc program.bas --target wasm     # -> program.wasm
+```
+
+Covered today: integer and floating-point arithmetic, comparisons, bitwise and shifts, control flow,
+calls and recursion, `PRINT` (including correctly-rounded floats), strings, arrays including array
+parameters, user-defined types, `DIM SHARED` globals, and graphics through `SCREENPTR` — a program
+that draws produces the same framebuffer natively and in the browser, and the page paints it by
+reading linear memory directly, without a single extra import.
+
+> **There is no deopt, and that shapes the whole design.** In a browser there is no interpreter to
+> fall back into, so an opcode the backend does not cover makes the *compilation* fail with a message
+> naming it and the line. The one thing it must never do is emit code that runs and lies. The target
+> accepts the MODERN dialect only, and refuses CLASSIC up front rather than somewhere inside a
+> formatter.
+
+### A regular-expression engine of its own
+
+Pattern matching does not link a third-party library: `SedaiRegexEngine` compiles a pattern to a DFA
+(`SedaiAutomaton`) with an SSE2 prefix pre-filter. The target is the accepted subset behaving exactly
+as PCRE2 does and everything outside it being declined cleanly — which is why the number that matters
+is not one but two, the second being the acceptance rate. On the Benchmarks Game's `regex-redux` this
+puts the engine level with CPython driving PCRE2.
 
 ### Numeric output follows the standard, not the reference
 
@@ -85,8 +133,7 @@ no floating point and no approximation anywhere — and are rounded once, half-t
 
 Real programs are unaffected: the divergence needs the extreme exponents that random bit patterns
 produce. The regression corpus did not move a single baseline, and the FreeBASIC example sweep
-returned exactly the counts it had before the change. Details, measurements and the reasoning are in
-[`job/docs/PIANO_FLOAT_PRINT.md`](job/docs/PIANO_FLOAT_PRINT.md).
+returned exactly the counts it had before the change.
 
 `OPTION DIGITS n` sets how many significant digits `PRINT` shows for a float (default: the dialect's
 16 for a `Double`, 7 for a `Single`). Because the digits come from the exact value and are rounded
@@ -181,9 +228,14 @@ SedaiBasic2 includes cross-platform build scripts for compiling all targets.
 | Target | Description | Output |
 |--------|-------------|--------|
 | sb | SedaiBasic VM (interpreter) | sb.exe |
-| sbc | SedaiBasic Compiler | sbc.exe |
+| sbc | SedaiBasic Compiler (bytecode, or WebAssembly with `--target wasm`) | sbc.exe |
 | sbd | SedaiBasic Disassembler | sbd.exe |
 | sbv | SedaiVision (SDL2 graphical) | sbv.exe |
+| sbw | Web BASIC HTTP server (see [WEB_BASIC.md](WEB_BASIC.md)) | sbw.exe |
+
+`build.ps1 -Target sb -Window` adds an opt-in SDL2 window to the command-line VM, so FreeBASIC/C128
+graphics are visible without `sbv`. Note that a later `build.ps1 -Target sb` **without** `-Window`
+overwrites it with the headless build, where `--window` is accepted and silently ignored.
 
 #### Windows (PowerShell)
 
@@ -252,12 +304,24 @@ Options:
   --help              Show this help message
   --verbose           Show loading, lexing, parsing, and VM execution info
   --dump-ast          Show AST structure after parsing
-  --disasm            Show bytecode disassembly
+  --disasm            Show bytecode disassembly (after superinstruction fusion)
+  --disasm-pre        Show bytecode BEFORE superinstruction fusion
   --no-exec           Compile only, do not execute (useful with --disasm)
   --stats             Show execution statistics
   --no-opt            Skip the SSA/bytecode optimization passes (differential testing)
+  --jit               Compile eligible hot loops to native code
+  --aot               Compile eligible whole functions to native code before running
   --bounds-check      Hard-error on out-of-bounds array access (like FreeBASIC's -exx)
+  --true-value=N      TRUE for comparisons: -1 (Commodore, default) or 1
+  --date-locale       Month/day names and date parsing follow the system locale, as fbc does
+                      (the default is deterministic: English names, the same on every machine)
   --window            Show FreeBASIC/C128 graphics in an SDL2 window (needs a -Window build)
+```
+
+A program can also be given arguments, which reach it through `COMMAND$`:
+
+```bash
+sb program.bas arg1 arg2
 ```
 
 **Examples:**
@@ -277,21 +341,28 @@ sb --stats program.bas
 Compiles BASIC source code to bytecode without executing. Useful for syntax checking and pre-compilation.
 
 ```bash
-sbc [options] <program.bas>
+sbc <source.bas> [output.basc] [options]
 
 Options:
-  --help              Show this help message
-  --output, -o        Output bytecode file (default: program.basc)
-  --verbose           Show compilation details
+  --help, -h          Show this help message
+  --verbose, -v       Show compilation details
+  --quiet, -q         Suppress all output except errors
+  --target wasm       Emit a WebAssembly module (.wasm) instead of bytecode.
+                      An opcode the backend does not cover is REFUSED with a message
+                      naming it and the line: in the browser there is no interpreter
+                      to fall back into, so it must never emit code that runs and lies.
 ```
 
 **Examples:**
 ```bash
-# Compile a program
+# Compile a program to bytecode
 sbc program.bas
 
 # Compile with custom output name
-sbc -o compiled.basc program.bas
+sbc program.bas compiled.basc
+
+# Emit a WebAssembly module
+sbc program.bas --target wasm
 ```
 
 ### SedaiBasic Disassembler
@@ -398,11 +469,14 @@ Run the benchmark suite to measure interpreter performance:
 # Run 3 times in this session (results accumulate)
 .\benchmarks\benchmark.ps1 -Runs 3
 
+# Run only some of them
+.\benchmarks\benchmark.ps1 -Only n-body,spectral-norm
+
+# Run only one language's implementation (sedai, python, lua)
+.\benchmarks\benchmark.ps1 -Runtime sedai
+
 # Force re-run, ignoring cached session results
 .\benchmarks\benchmark.ps1 -Force
-
-# Clear all accumulated history and start fresh
-.\benchmarks\benchmark.ps1 -ClearHistory
 
 # Generate report from existing history (no benchmark run)
 .\benchmarks\benchmark.ps1 -Report
@@ -414,13 +488,24 @@ Run the benchmark suite to measure interpreter performance:
 .\benchmarks\benchmark.ps1 -Help
 ```
 
-The benchmark suite runs programs from [The Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/):
+The suite is the whole of [The Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/), run at the **official N** and compared against the reference Python and Lua implementations of the same programs:
 
 | Benchmark | Description | N (standard) |
 |-----------|-------------|--------------|
-| fannkuch-redux | Indexed-access to tiny integer-sequence | 12 |
+| binary-trees | Allocate and traverse many binary trees | 21 |
+| fannkuch-redux | Indexed access to a tiny integer sequence | 12 |
+| fasta | Generate and write DNA sequences | 25,000,000 |
+| k-nucleotide | Hashtable update and k-nucleotide strings | 25,000,000 (stdin) |
+| mandelbrot | Generate a Mandelbrot set bitmap | 16,000 |
 | n-body | Double-precision N-body simulation | 50,000,000 |
+| pidigits | Streaming arbitrary-precision arithmetic | 10,000 |
+| regex-redux | Match DNA 8-mers and substitute magic patterns | 5,000,000 (stdin) |
+| reverse-complement | Read DNA sequences and write their reverse-complement | 25,000,000 (stdin) |
 | spectral-norm | Eigenvalue using the power method | 5,500 |
+
+Measured results are in [BENCHMARK.md](BENCHMARK.md). Two of these have no runnable reference on a
+stock Windows box, and `k-nucleotide`'s Python version needs a working `multiprocessing` fork, so Lua
+answers for it instead — the runner says which reference it used rather than quietly dropping one.
 
 #### Cumulative Statistics
 
