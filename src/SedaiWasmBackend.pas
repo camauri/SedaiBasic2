@@ -412,7 +412,7 @@ begin
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
-        ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind:
+        ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim:
           FUsesArr := True;
         ssaRecordNew:
           FUsesRec := True;
@@ -3214,16 +3214,33 @@ begin
           shared data, and copying unconditionally is WRONG: in deep recursion
           the argument slot may have been rebound at an outer level, and an
           unconditional copy corrupts it. Exactly what the interpreter does.
-          ⛔ AND NOTHING EXERCISES IT YET: the only way to reallocate a bound
-          parameter is REDIM, and ssaArrayRedim is still refused - so this arm
-          is the interpreter's rule transcribed, not a tested one. Whoever
-          covers REDIM tests this at the same time. }
+          ✅ EXERCISED since REDIM was covered: a SUB doing "ReDim Preserve a(0
+          To n)" on its array parameter reallocates, so the base no longer
+          matches the snapshot and the caller sees the new array - guardian
+          array_params.bas. Before that this arm was the interpreter's rule
+          transcribed and untested, which is why covering REDIM was the thing
+          that closed it. }
         if n <> d then
         begin
-          B.I32Const(LongInt(FArrDescOf[d]));
-          B.OpMem(wopI32Load, 2, 0);
-          B.LocalGet(FBindStack[FBindTop].SnapLocal);
-          B.Op(wopI32Ne);
+          { ⛔ THE TEST IS "THE DESCRIPTOR CHANGED", NOT "THE BASE CHANGED", and
+            the difference is a real defect that got this far: alloc(0) does not
+            advance the bump cursor, so an EMPTY array and the first block
+            allocated after it have the SAME base. A callee doing
+            "ReDim d(1 To n)" on a parameter that arrived empty therefore came
+            back looking untouched, and the caller kept its empty array while
+            the callee had happily filled a new one.
+            ⇒ Compare every word: if the callee rewrote the descriptor at all,
+            the caller has to see it. Writes to the ELEMENTS still change
+            nothing here, which is right - those are already shared. }
+          B.I32Const(0);
+          for k := 0 to FBindStack[FBindTop].Words - 1 do
+          begin
+            B.I32Const(LongInt(FArrDescOf[d] + LongWord(4 * k)));
+            B.OpMem(wopI32Load, 2, 0);
+            B.LocalGet(FBindStack[FBindTop].SnapLocal + LongWord(k));
+            B.Op(wopI32Ne);
+            B.Op(wopI32Or);
+          end;
           B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
             for k := 0 to FBindStack[FBindTop].Words - 1 do
             begin
@@ -3240,6 +3257,72 @@ begin
           B.LocalGet(FBindStack[FBindTop].SavedLocal + LongWord(k));
           B.OpMem(wopI32Store, 2, 0);
         end;
+      end;
+
+    { REDIM [PRESERVE] a([lb TO] ub): a NEW block, and the descriptor retargeted
+      at it. ⚠️ It COLLAPSES the array to ONE dimension, which is not a
+      simplification here but what RedimArray does - the interpreter rewrites
+      DimCount, Dimensions[0] and LowerBounds[0] and leaves nothing else.
+      ⭐ Not preserving costs NOTHING: a fresh block from the bump allocator is
+      already zero, so "clear it" and "allocate it" are the same act. }
+    ssaArrayRedim:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayRedim without an array reference'));
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('ssaArrayRedim without constant flags'));
+        { ⚠️ A REDIM whose LOWER bound is a run-time value arrives as a preceding
+          ssaArrayRedimPush, and the interpreter lets that one win over the
+          flags. It cannot reach here: RedimPush is still uncovered, so such a
+          program is refused on THAT opcode first. ⛔ Whoever covers RedimPush
+          has to handle it - the flags alone would silently use the OLD lower
+          bound and put every element at the wrong index. }
+        Desc := FArrDescOf[Instr.Src1.ArrayIndex];
+        n := Integer(Instr.Src3.ConstInt);
+        // the lower bound: the explicit one, or the array's current one
+        if (n and 2) <> 0 then
+          B.I32Const(n shr 8)
+        else
+        begin
+          B.I32Const(LongInt(Desc + 16));
+          B.OpMem(wopI32Load, 2, 0);
+        end;
+        B.LocalSet(FRecTmp);
+        // the new element count, clamped at zero exactly as RedimArray clamps it
+        LoadReg(B, Instr.Src2); B.Op(wopI32WrapI64);
+        B.LocalGet(FRecTmp); B.Op(wopI32Sub);
+        B.I32Const(1); B.Op(wopI32Add);
+        B.LocalTee(FArrTmp);
+        B.I32Const(0); B.Op(wopI32LtS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(0); B.LocalSet(FArrTmp);
+        B.EndOp;
+        B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
+        B.Call(FAllocFunc); B.LocalSet(FGfxP);
+        if (n and 1) <> 0 then
+        begin
+          { PRESERVE keeps the flat element order up to the SMALLER of the two
+            sizes - SetLength's own rule, which is what the interpreter leans on.
+            Anything past that is already zero in the new block. }
+          B.LocalGet(FGfxP);
+          B.I32Const(LongInt(Desc)); B.OpMem(wopI32Load, 2, 0);
+          B.I32Const(LongInt(Desc + 4)); B.OpMem(wopI32Load, 2, 0);
+          B.LocalTee(FGfxN);
+          B.LocalGet(FArrTmp);
+          B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(FArrTmp);
+          B.Op(wopElse);
+            B.LocalGet(FGfxN);
+          B.EndOp;
+          B.I32Const(8); B.Op(wopI32Mul);
+          B.MemoryCopy;
+        end;
+        B.I32Const(LongInt(Desc));      B.LocalGet(FGfxP);  B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 4));  B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 8));  B.I32Const(1);       B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 16)); B.LocalGet(FRecTmp); B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 20)); B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
       end;
 
     ssaArrayLBound, ssaArrayUBound:
