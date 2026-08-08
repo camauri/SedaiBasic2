@@ -173,7 +173,7 @@ type
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
     FPrintStrFunc, FStrFromIntFunc: LongWord;
     FStrFillFunc, FStrCaseFunc, FStrInstrFunc: LongWord;
-    FPuDigFunc: LongWord;          // PRINT USING: the rounded digits
+    FPuDigFunc, FPuFmtFunc: LongWord;   // PRINT USING: digits, then the field
     FUsesPU: Boolean;              // the program has a PRINT USING
 
     // --- arrays ---------------------------------------------------------
@@ -214,7 +214,11 @@ type
     FUsesTrig: Boolean;           // SIN / COS: an import, WASM has no transcendentals
     FImportCount: LongWord;
     FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
-    FNowFunc, FSinFunc, FCosFunc: LongWord;
+    FNowFunc: LongWord;
+    { The transcendentals, all imported for the same reason: WASM has none of
+      them. They are the host's, and the host's are not FPC's - one ulp apart on
+      some arguments, measured. }
+    FTrigFunc: array[0..11] of LongWord;
     procedure ScanForPrint;
     function ConstAddrOf(const V: TSSAValue): LongWord;
     function ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
@@ -265,6 +269,11 @@ const
     carrying arguments and starts carrying module-global SHARED scalars, the
     by-value UDT result handle (254) and the result (255). }
   WASM_SHARED_SLOT_BASE = 128;
+
+  { The transcendentals the host provides, in the order they are imported. }
+  TRIG_NAME: array[0..11] of AnsiString =
+    ('sin', 'cos', 'tan', 'atn', 'exp', 'log', 'log10', 'log2',
+     'asin', 'acos', 'sinh', 'cosh');
 
 implementation
 
@@ -435,12 +444,14 @@ begin
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
         ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim:
           FUsesArr := True;
-        ssaPrintUsing:
+        ssaPrintUsing, ssaPrintUsingInt:
           begin FUsesPU := True; FUsesStr := True; FUsesPrint := True;
                 FUsesFlt := True; end;   // puDigits leans on the float digits
         ssaDateNow:
           FUsesClock := True;
-        ssaMathSin, ssaMathCos:
+        ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
+        ssaMathLog, ssaMathLog10, ssaMathLog2, ssaMathAsin, ssaMathAcos,
+        ssaMathSinh, ssaMathCosh:
           FUsesTrig := True;
         ssaRecordNew:
           FUsesRec := True;
@@ -752,7 +763,7 @@ procedure TWasmBackend.EmitStringHelpers;
 var
   B: TWasmBuf;
   TNewStr, TCat, TSub, TCmp, TAsc, TChr, TRight, TMid, TPrint,
-  TFromInt, TFill, TCase, TInstr, TPuDig: LongWord;
+  TFromInt, TFill, TCase, TInstr, TPuDig, TPuFmt: LongWord;
 begin
   TNewStr := FModule.TypeIndex([wvtI32], [wvtI32]);
   TCat    := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
@@ -768,6 +779,7 @@ begin
   TCase   := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
   TInstr  := FModule.TypeIndex([wvtI32, wvtI32, wvtI64], [wvtI64]);
   TPuDig  := FModule.TypeIndex([wvtF64, wvtI32, wvtI64, wvtI32], []);
+  TPuFmt  := FModule.TypeIndex([wvtI32, wvtF64, wvtI32, wvtI64], [wvtI32]);
 
   { strNew(len: i32) -> i32: an uninitialised header of that length, or the
     canonical empty string when the length is zero. }
@@ -1352,6 +1364,514 @@ begin
     B.I32Const(PU_NDEC); B.LocalGet(3); B.OpMem(wopI32Store, 2, 0);
     FModule.AddFunction(TPuDig, [wvtI32, wvtI32, wvtI32, wvtI32,
                                  wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+  end;
+
+  { puFmt(fmt, v, isInt, iv) -> the rendered field as a string.
+    The rules are FreeBASIC's and every one of them was measured against fbc
+    natively before being written here (198 format/value pairs), so this is a
+    transcription of a known semantics rather than a second guess at it.
+
+    ⭐ The field is built from a cursor in the MIDDLE: digits grow forwards, and
+    the things that attach in front - the floating '$', the sign, the padding,
+    the overflow marker, the fixed '$' - grow backwards. Prefixing then costs
+    nothing, where composing left to right would mean shifting the whole field
+    every time something new turned out to belong in front of it. }
+  if FUsesPU then
+  begin
+  B := TWasmBuf.Create;
+  try
+    { locals: 4=p 5=flen 6=c 7=intDig 8=decDig 9=caret 10=commas 11=flags
+              12=neg 13=h 14=t 15=i 16=nint 17=ndec 18=width 19=sh 20=ex
+              21=tmp 22=digits 23=mant(f64) }
+    B.I32Const(0); B.LocalSet(7);  B.I32Const(0); B.LocalSet(8);
+    B.I32Const(0); B.LocalSet(9);  B.I32Const(0); B.LocalSet(10);
+    B.I32Const(0); B.LocalSet(11);
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(5);
+    B.I32Const(0); B.LocalSet(4);
+
+    // ---- parse the picture ----
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.LocalGet(5); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalGet(4); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(6);
+
+        B.LocalGet(6); B.I32Const(Ord('#')); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(7); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(7);
+        B.EndOp;
+        B.LocalGet(6); B.I32Const(Ord(',')); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(10); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(10);
+          B.LocalGet(11); B.I32Const(32); B.Op(wopI32Or); B.LocalSet(11);
+        B.EndOp;
+        // '$' - two of them is the FLOATING dollar and eats both characters
+        B.LocalGet(6); B.I32Const(Ord('$')); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalGet(5); B.Op(wopI32LtS);
+          B.LocalGet(0); B.I32Const(5); B.Op(wopI32Add); B.LocalGet(4); B.Op(wopI32Add);
+          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('$')); B.Op(wopI32Eq);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(11); B.I32Const(16); B.Op(wopI32Or); B.LocalSet(11);
+            B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+          B.Op(wopElse);
+            B.LocalGet(11); B.I32Const(8); B.Op(wopI32Or); B.LocalSet(11);
+          B.EndOp;
+        B.EndOp;
+        // a '+' in FIRST position leads, anywhere else it trails
+        B.LocalGet(6); B.I32Const(Ord('+')); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(4); B.Op(wopI32Eqz);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(11); B.I32Const(1); B.Op(wopI32Or); B.LocalSet(11);
+          B.Op(wopElse);
+            B.LocalGet(11); B.I32Const(2); B.Op(wopI32Or); B.LocalSet(11);
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(6); B.I32Const(Ord('-')); B.Op(wopI32Eq);
+        B.LocalGet(4); B.I32Const(0); B.Op(wopI32GtS); B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(11); B.I32Const(4); B.Op(wopI32Or); B.LocalSet(11);
+        B.EndOp;
+        // '.' then a run of '#'
+        B.LocalGet(6); B.I32Const(Ord('.')); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(11); B.I32Const(64); B.Op(wopI32Or); B.LocalSet(11);
+          B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalGet(5); B.Op(wopI32GeS);
+              B.BrIf(1);
+              B.LocalGet(0); B.I32Const(5); B.Op(wopI32Add); B.LocalGet(4); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('#')); B.Op(wopI32Ne); B.BrIf(1);
+              B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+              B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+        B.EndOp;
+        { '^' - FIVE is the ceiling, and past it a caret is literal text.
+          ⛔ Only skip what was CONSUMED: once the cap is reached the inner loop
+          takes nothing, and moving the cursor back would spin for ever. That
+          exact hang was written and removed on the native side. }
+        B.LocalGet(6); B.I32Const(Ord('^')); B.Op(wopI32Eq);
+        B.LocalGet(9); B.I32Const(5); B.Op(wopI32LtS); B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(9); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(9);
+        B.EndOp;
+
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+
+    // ---- the sign of the value ----
+    B.I32Const(0); B.LocalSet(12);
+    B.LocalGet(2);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(3); B.I64Const(0); B.Op(wopI64LtS); B.LocalSet(12);
+    B.Op(wopElse);
+      B.LocalGet(1); B.F64Const(0); B.Op(wopF64Lt); B.LocalSet(12);
+    B.EndOp;
+
+    { ---- exponential ----
+      ⭐ The mantissa carries one FEWER significant integer digit than the field
+      has '#', because the first position belongs to the sign - so "#.##^^^^"
+      and "##.##^^^^" print the same number as 0.12E+04 and 1.23E+03.
+      ⚠️ With no decimal point nothing is held back and at least one digit must
+      remain: "#^^^^" prints 5E+00. }
+    B.LocalGet(9); B.I32Const(4); B.Op(wopI32GeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(7); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(19);
+      B.LocalGet(8); B.Op(wopI32Eqz);
+      B.LocalGet(11); B.I32Const(64); B.Op(wopI32And); B.Op(wopI32Eqz); B.Op(wopI32And);
+      B.LocalGet(19); B.I32Const(1); B.Op(wopI32LtS); B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(1); B.LocalSet(19);
+      B.EndOp;
+      B.LocalGet(19); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.LocalSet(19);
+      B.EndOp;
+      // |v| as an f64, and the exponent found by shifting it into its window
+      B.LocalGet(2);
+      B.BlockStart(wopIf, WASM_TYPE_F64);
+        B.LocalGet(3); B.Op(wopF64ConvertI64S);
+      B.Op(wopElse);
+        B.LocalGet(1);
+      B.EndOp;
+      B.Op(wopF64Abs); B.LocalSet(23);
+      B.I32Const(0); B.LocalSet(20);
+      B.LocalGet(23); B.F64Const(0); B.Op(wopF64Ne);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        // hi = 10^sh, lo = 10^(sh-1), both built by multiplication
+        B.F64Const(1); B.LocalSet(1);
+        B.I32Const(0); B.LocalSet(15);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(15); B.LocalGet(19); B.Op(wopI32GeS); B.BrIf(1);
+            B.LocalGet(1); B.F64Const(10); B.Op(wopF64Mul); B.LocalSet(1);
+            B.LocalGet(15); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(15);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(23); B.LocalGet(1); B.Op(wopF64Lt); B.BrIf(1);
+            B.LocalGet(23); B.F64Const(10); B.Op(wopF64Div); B.LocalSet(23);
+            B.LocalGet(20); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(20);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(1); B.F64Const(10); B.Op(wopF64Div); B.LocalSet(1);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(23); B.LocalGet(1); B.Op(wopF64Ge); B.BrIf(1);
+            B.LocalGet(23); B.F64Const(10); B.Op(wopF64Mul); B.LocalSet(23);
+            B.LocalGet(20); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(20);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(23); B.I32Const(0); B.I64Const(0); B.LocalGet(8);
+      B.Call(FPuDigFunc);
+      { rounding can push the mantissa back out of its window: 9.99 asked for
+        two decimals becomes 10.00, and with sh = 0 it becomes 1.00 where a
+        leading zero was required }
+      B.I32Const(PU_NINT); B.OpMem(wopI32Load, 2, 0); B.LocalSet(16);
+      B.LocalGet(19); B.Op(wopI32Eqz);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.I32Const(PU_DIG); B.OpMem(wopI32Load8U, 0, 0); B.I32Const(0); B.Op(wopI32Ne);
+      B.Op(wopElse);
+        B.LocalGet(16); B.LocalGet(19); B.Op(wopI32GtS);
+      B.EndOp;
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(23); B.F64Const(10); B.Op(wopF64Div); B.LocalSet(23);
+        B.LocalGet(20); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(20);
+        B.LocalGet(23); B.I32Const(0); B.I64Const(0); B.LocalGet(8);
+        B.Call(FPuDigFunc);
+      B.EndOp;
+      B.I32Const(PU_NINT); B.OpMem(wopI32Load, 2, 0); B.LocalSet(16);
+      B.I32Const(PU_NDEC); B.OpMem(wopI32Load, 2, 0); B.LocalSet(17);
+
+      B.I32Const(PU_OUT + 128); B.LocalSet(13);
+      B.LocalGet(13); B.LocalSet(14);
+      { ⚠️ Pad the mantissa so its integer digits FILL the field's positions:
+        "###.#^^^^" on zero is "  0.0E+00", where one space is the sign's and
+        the other is the integer position the single '0' does not use. }
+      B.LocalGet(16); B.LocalSet(15);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(15); B.LocalGet(19); B.Op(wopI32GeS); B.BrIf(1);
+          B.LocalGet(14); B.I32Const(Ord(' ')); B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+          B.LocalGet(15); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(15);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      // mantissa digits, then the point, then the decimals
+      B.I32Const(0); B.LocalSet(15);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(15); B.LocalGet(16); B.Op(wopI32GeS); B.BrIf(1);
+          { with sh = 0 the single integer digit is a written zero, and a MINUS
+            replaces it: "-.45E+01", not "-0.45E+01" }
+          B.LocalGet(19); B.Op(wopI32Eqz); B.LocalGet(12); B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.Op(wopElse);
+            B.LocalGet(14);
+            B.I32Const(PU_DIG); B.LocalGet(15); B.Op(wopI32Add);
+            B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('0')); B.Op(wopI32Add);
+            B.OpMem(wopI32Store8, 0, 0);
+            B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+          B.EndOp;
+          B.LocalGet(15); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(15);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(17); B.I32Const(0); B.Op(wopI32GtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(14); B.I32Const(Ord('.')); B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+        B.I32Const(0); B.LocalSet(15);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(15); B.LocalGet(17); B.Op(wopI32GeS); B.BrIf(1);
+            B.LocalGet(14);
+            B.I32Const(PU_DIG); B.LocalGet(16); B.Op(wopI32Add);
+              B.LocalGet(15); B.Op(wopI32Add);
+            B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('0')); B.Op(wopI32Add);
+            B.OpMem(wopI32Store8, 0, 0);
+            B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+            B.LocalGet(15); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(15);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+      B.EndOp;
+      // E, its sign, and (caret - 2) digits of exponent
+      B.LocalGet(14); B.I32Const(Ord('E')); B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+      B.LocalGet(14);
+      B.LocalGet(20); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.I32Const(Ord('-'));
+      B.Op(wopElse);
+        B.I32Const(Ord('+'));
+      B.EndOp;
+      B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+      B.LocalGet(20); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.LocalGet(20); B.Op(wopI32Sub); B.LocalSet(20);
+      B.EndOp;
+      B.LocalGet(9); B.I32Const(2); B.Op(wopI32Sub); B.LocalSet(21);
+      B.LocalGet(14); B.LocalGet(21); B.Op(wopI32Add); B.LocalSet(15);
+      B.LocalGet(15); B.LocalSet(18);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(15); B.LocalGet(14); B.Op(wopI32LeS); B.BrIf(1);
+          B.LocalGet(15); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(15);
+          B.LocalGet(15);
+          B.LocalGet(20); B.I32Const(10); B.Op(wopI32RemU);
+            B.I32Const(Ord('0')); B.Op(wopI32Add);
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(20); B.I32Const(10); B.Op(wopI32DivU); B.LocalSet(20);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(18); B.LocalSet(14);
+      { The sign in front: a space when a position was held back and the value is
+        positive. ⚠️ EXCEPT with sh = 0, where the held-back position is already
+        occupied by the written zero of "0.45" - there a positive value gets
+        NOTHING, and a negative one gets the minus that REPLACES that zero. }
+      B.LocalGet(19); B.LocalGet(7); B.Op(wopI32LtS);
+      B.LocalGet(19); B.I32Const(0); B.Op(wopI32GtS);
+      B.LocalGet(12); B.Op(wopI32Or); B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+        B.LocalGet(13);
+        B.LocalGet(12);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.I32Const(Ord('-'));
+        B.Op(wopElse);
+          B.I32Const(Ord(' '));
+        B.EndOp;
+        B.OpMem(wopI32Store8, 0, 0);
+      B.Op(wopElse);
+        // every position is a digit: a negative simply does not fit
+        B.LocalGet(12);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+          B.LocalGet(13); B.I32Const(Ord('-')); B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+          B.LocalGet(13); B.I32Const(Ord('%')); B.OpMem(wopI32Store8, 0, 0);
+        B.EndOp;
+      B.EndOp;
+      // hand back the field
+      B.LocalGet(14); B.LocalGet(13); B.Op(wopI32Sub); B.LocalTee(21);
+      B.Call(FStrNewFunc); B.LocalTee(22);
+      B.I32Const(4); B.Op(wopI32Add);
+      B.LocalGet(13); B.LocalGet(21);
+      B.MemoryCopy;
+      B.LocalGet(22); B.Op(wopReturn);
+    B.EndOp;
+
+    // ---- the plain numeric field ----
+    B.LocalGet(1); B.LocalGet(2); B.LocalGet(3); B.LocalGet(8);
+    B.Call(FPuDigFunc);
+    B.I32Const(PU_NINT); B.OpMem(wopI32Load, 2, 0); B.LocalSet(16);
+    B.I32Const(PU_NDEC); B.OpMem(wopI32Load, 2, 0); B.LocalSet(17);
+
+    B.I32Const(PU_OUT + 128); B.LocalSet(13);
+    B.LocalGet(13); B.LocalSet(14);
+    // integer digits, with a comma every three counting from the right
+    B.I32Const(0); B.LocalSet(15);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(15); B.LocalGet(16); B.Op(wopI32GeS); B.BrIf(1);
+        { ⛔ i32.and is BITWISE, so a flag has to be normalised to 0/1 before it
+          is combined with a comparison: "1 and 32" is ZERO, and the condition
+          was never true - the commas simply never appeared. The other flag
+          tests here survive only because an Eqz or an Or happens to sit between
+          them and the combination. }
+        B.LocalGet(15); B.I32Const(0); B.Op(wopI32GtS);
+        B.LocalGet(11); B.I32Const(32); B.Op(wopI32And);
+          B.I32Const(0); B.Op(wopI32Ne); B.Op(wopI32And);
+        B.LocalGet(16); B.LocalGet(15); B.Op(wopI32Sub);
+          B.I32Const(3); B.Op(wopI32RemU); B.Op(wopI32Eqz); B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(14); B.I32Const(Ord(',')); B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+        B.EndOp;
+        B.LocalGet(14);
+        B.I32Const(PU_DIG); B.LocalGet(15); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('0')); B.Op(wopI32Add);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+        B.LocalGet(15); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(15);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    { the point prints even with no '#' after it - "#." on 0.5 gives "1." - so
+      it follows the PICTURE, not the presence of decimals }
+    B.LocalGet(17); B.I32Const(0); B.Op(wopI32GtS);
+    B.LocalGet(11); B.I32Const(64); B.Op(wopI32And); B.Op(wopI32Or);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(14); B.I32Const(Ord('.')); B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+    B.EndOp;
+    B.I32Const(0); B.LocalSet(15);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(15); B.LocalGet(17); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(14);
+        B.I32Const(PU_DIG); B.LocalGet(16); B.Op(wopI32Add);
+          B.LocalGet(15); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.I32Const(Ord('0')); B.Op(wopI32Add);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+        B.LocalGet(15); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(15);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    // the floating '$' hugs the first digit
+    B.LocalGet(11); B.I32Const(16); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+      B.LocalGet(13); B.I32Const(Ord('$')); B.OpMem(wopI32Store8, 0, 0);
+    B.EndOp;
+    // a leading sign always prints; otherwise a minus prints unless it trails
+    B.LocalGet(11); B.I32Const(1); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+      B.LocalGet(13);
+      B.LocalGet(12);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.I32Const(Ord('-'));
+      B.Op(wopElse);
+        B.I32Const(Ord('+'));
+      B.EndOp;
+      B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.LocalGet(12);
+      B.LocalGet(11); B.I32Const(6); B.Op(wopI32And); B.Op(wopI32Eqz); B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+        B.LocalGet(13); B.I32Const(Ord('-')); B.OpMem(wopI32Store8, 0, 0);
+      B.EndOp;
+    B.EndOp;
+    { The overflow test is a CAPACITY test on the integer positions, where the
+      digits, the '$' of "$$" and a FRONT sign all compete. A trailing sign does
+      not: it has its own position at the end. }
+    B.LocalGet(7); B.LocalSet(18);
+    B.LocalGet(11); B.I32Const(16); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(18); B.I32Const(2); B.Op(wopI32Add); B.LocalSet(18);
+    B.EndOp;
+    B.LocalGet(11); B.I32Const(1); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(18); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(18);
+    B.EndOp;
+    B.LocalGet(16); B.LocalSet(21);
+    B.LocalGet(11); B.I32Const(16); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(21); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(21);
+    B.EndOp;
+    B.LocalGet(11); B.I32Const(1); B.Op(wopI32And);
+    B.LocalGet(12); B.LocalGet(11); B.I32Const(6); B.Op(wopI32And);
+      B.Op(wopI32Eqz); B.Op(wopI32And);
+    B.Op(wopI32Or);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(21); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(21);
+    B.EndOp;
+    B.LocalGet(21); B.LocalGet(18); B.Op(wopI32GtS); B.LocalSet(21);   // overflow?
+
+    // a trailing sign, and a trailing '-' that prints a SPACE when positive
+    B.LocalGet(11); B.I32Const(2); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(14);
+      B.LocalGet(12);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.I32Const(Ord('-'));
+      B.Op(wopElse);
+        B.I32Const(Ord('+'));
+      B.EndOp;
+      B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+    B.Op(wopElse);
+      B.LocalGet(11); B.I32Const(4); B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(14);
+        B.LocalGet(12);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.I32Const(Ord('-'));
+        B.Op(wopElse);
+          B.I32Const(Ord(' '));
+        B.EndOp;
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(14); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(14);
+      B.EndOp;
+    B.EndOp;
+
+    // pad on the left to the field width
+    B.LocalGet(7); B.LocalSet(18);
+    B.LocalGet(17); B.I32Const(0); B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(18); B.LocalGet(17); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Add);
+      B.LocalSet(18);
+    B.Op(wopElse);
+      B.LocalGet(11); B.I32Const(64); B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(18); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(18);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(11); B.I32Const(16); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(18); B.I32Const(2); B.Op(wopI32Add); B.LocalSet(18);
+    B.EndOp;
+    B.LocalGet(11); B.I32Const(1); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(18); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(18);
+    B.EndOp;
+    B.LocalGet(11); B.I32Const(6); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(18); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(18);
+    B.EndOp;
+    B.LocalGet(18); B.LocalGet(10); B.Op(wopI32Add); B.LocalSet(18);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(14); B.LocalGet(13); B.Op(wopI32Sub);
+        B.LocalGet(18); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+        B.LocalGet(13); B.I32Const(Ord(' ')); B.OpMem(wopI32Store8, 0, 0);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    // the marker, then the fixed '$' - which goes AHEAD of it ("$%1234.50")
+    B.LocalGet(21);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+      B.LocalGet(13); B.I32Const(Ord('%')); B.OpMem(wopI32Store8, 0, 0);
+    B.EndOp;
+    B.LocalGet(11); B.I32Const(8); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(13); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(13);
+      B.LocalGet(13); B.I32Const(Ord('$')); B.OpMem(wopI32Store8, 0, 0);
+    B.EndOp;
+
+    B.LocalGet(14); B.LocalGet(13); B.Op(wopI32Sub); B.LocalTee(21);
+    B.Call(FStrNewFunc); B.LocalTee(22);
+    B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(13); B.LocalGet(21);
+    B.MemoryCopy;
+    B.LocalGet(22);
+    FModule.AddFunction(TPuFmt, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                                 wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                                 wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                                 wvtI32, wvtF64], B);
   finally
     B.Free;
   end;
@@ -3020,6 +3540,29 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { PRINT USING: format the field, then hand the bytes to the sink. Two
+      opcodes because the value's TYPE matters - an exact integer past 2^53 has
+      to keep every digit instead of being rounded through a Double, which is
+      why the interpreter separates them too. }
+    ssaPrintUsing, ssaPrintUsingInt:
+      begin
+        LoadReg(B, Instr.Src1);                    // the format string
+        if Instr.OpCode = ssaPrintUsingInt then
+        begin
+          B.F64Const(0);
+          B.I32Const(1);
+          LoadReg(B, Instr.Src2);
+        end
+        else
+        begin
+          LoadReg(B, Instr.Src2);
+          B.I32Const(0);
+          B.I64Const(0);
+        end;
+        B.Call(FPuFmtFunc);
+        B.Call(FPrintStrFunc);
+      end;
+
     ssaStrSpace:
       begin
         LoadReg(B, Instr.Src1);
@@ -3942,23 +4485,32 @@ begin
     ssaMathSqr: Un(wopF64Sqrt);
     ssaMathAbs: Un(wopF64Abs);
 
-    { ⚠️ ONE ULP AWAY FROM THE INTERPRETER, sometimes. WASM has no sin/cos, so
-      these are the host's, and the host's are not FPC's: measured over 24
-      values, 23 agree to 17 digits and Sin(2.0) differs in the last bit. In a
-      program where the value only reaches the output that divergence is
-      invisible; in one that feeds it back - a raycaster's camera angle - it
-      spreads over the whole frame. Declared, not hidden. }
-    ssaMathSin:
+    { ⚠️ ONE ULP AWAY FROM THE INTERPRETER, sometimes. WASM has no transcendental
+      instructions, so these are the host's, and the host's are not FPC's:
+      measured over 24 values, 23 agree to 17 digits and Sin(2.0) differs in the
+      last bit. Where the value only reaches the output that is invisible; where
+      it feeds back into a program's own geometry - a raycaster's camera angle -
+      it spreads over the whole frame. Declared, not hidden. }
+    ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
+    ssaMathLog, ssaMathLog10, ssaMathLog2, ssaMathAsin, ssaMathAcos,
+    ssaMathSinh, ssaMathCosh:
       begin
         LoadReg(B, Instr.Src1);
-        B.Call(FSinFunc);
-        StoreReg(B, Instr.Dest);
-      end;
-
-    ssaMathCos:
-      begin
-        LoadReg(B, Instr.Src1);
-        B.Call(FCosFunc);
+        case Instr.OpCode of
+          ssaMathSin:   B.Call(FTrigFunc[0]);
+          ssaMathCos:   B.Call(FTrigFunc[1]);
+          ssaMathTan:   B.Call(FTrigFunc[2]);
+          ssaMathAtn:   B.Call(FTrigFunc[3]);
+          ssaMathExp:   B.Call(FTrigFunc[4]);
+          ssaMathLog:   B.Call(FTrigFunc[5]);
+          ssaMathLog10: B.Call(FTrigFunc[6]);
+          ssaMathLog2:  B.Call(FTrigFunc[7]);
+          ssaMathAsin:  B.Call(FTrigFunc[8]);
+          ssaMathAcos:  B.Call(FTrigFunc[9]);
+          ssaMathSinh:  B.Call(FTrigFunc[10]);
+        else
+          B.Call(FTrigFunc[11]);                   // cosh
+        end;
         StoreReg(B, Instr.Dest);
       end;
 
@@ -4316,7 +4868,7 @@ end;
 
 function TWasmBackend.Compile: Boolean;
 var
-  r: Integer;
+  r, i: Integer;
   RT: TSSARegisterType;
   Next: LongWord;
   Init: TWasmBuf;
@@ -4376,9 +4928,15 @@ begin
     it does not cost native performance, which has to be measured first. }
   if FUsesTrig then
   begin
-    FSinFunc := FModule.ImportFunc('env', 'sin', FModule.TypeIndex([wvtF64], [wvtF64]));
-    FCosFunc := FModule.ImportFunc('env', 'cos', FModule.TypeIndex([wvtF64], [wvtF64]));
-    Inc(FImportCount, 2);
+    { ⛔ The ORDER here is the order TRIG_NAME lists them, and the lowering
+      indexes that same table - so a name added in one place and not the other
+      calls the wrong function with the right type, which validates. }
+    for i := 0 to High(TRIG_NAME) do
+    begin
+      FTrigFunc[i] := FModule.ImportFunc('env', TRIG_NAME[i],
+                                         FModule.TypeIndex([wvtF64], [wvtF64]));
+      Inc(FImportCount);
+    end;
   end;
 
   ScanForHalt;
@@ -4480,7 +5038,8 @@ begin
     if FUsesPU then
     begin
       FPuDigFunc := Next;
-      Inc(Next);
+      FPuFmtFunc := Next + 1;
+      Inc(Next, 2);
     end;
     if FUsesPrint then
     begin
