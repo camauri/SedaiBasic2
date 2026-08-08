@@ -759,6 +759,43 @@ If VIDEO Then
 End Sub
 
 '' -------------------------------------------------------------------------------------
+''  ONE FRAME, ON ITS OWN
+'' -------------------------------------------------------------------------------------
+'' ⭐ The frame is a SUB rather than the body of a loop, and that is what lets a browser
+'' animate it: the page calls PROC_STEPFRAME once per requestAnimationFrame and the control
+'' returns to it between frames. No worker, no SharedArrayBuffer, and therefore none of the
+'' cross-origin headers a static host cannot set.
+''
+'' ⚠️ camSpring is SHARED because it is the one piece of state that survives a frame - the eye
+'' rides the ground on a spring, so this frame's height depends on the last one's. Everything
+'' else is derived from the frame NUMBER, which is what keeps the run repeatable.
+Dim Shared As Double camSpring
+
+Sub StepFrame(ByVal f As Integer)
+    Dim As Double a, head, ghgt, camx, camy
+
+    '' A closed circular path, the camera always facing along it: one circle, one lap, sixty
+    '' seconds - 6 degrees a second of yaw at a constant 0.35 cells a frame, so the view opens
+    '' rather than sweeps. Closed because the run has to be repeatable: the same frame number
+    '' always sees the same view, so two engines can be compared frame by frame.
+    a = f * 6.283185307179586 / FRAMES
+    camx = MAPSZ / 2.0 + Cos(a) * CAMR
+    camy = MAPSZ / 2.0 + Sin(a) * CAMR
+    head = a + 1.5707963267948966          '' facing along the flight
+
+    '' The eye rides the ground on a SPRING, not glued to it: following the terrain exactly makes
+    '' every hillock a vertical movement of the whole picture, which a viewer reads as the world
+    '' moving rather than themselves. EYELAG closes 6% of the gap each frame. ⛔ And it must not
+    '' lag INTO the ground on a steep climb, hence the floor.
+    ghgt = HeightAt(camx, camy)
+    If f = 0 Then camSpring = ghgt + EYECLEAR
+    camSpring += (ghgt + EYECLEAR - camSpring) * EYELAG
+    If camSpring < ghgt + EYECLEAR * 0.5 Then camSpring = ghgt + EYECLEAR * 0.5
+
+    RenderFrame(camx, camy, head, camSpring)
+End Sub
+
+'' -------------------------------------------------------------------------------------
 ''  MAIN LOOP, TIMING AND THE ON-SCREEN COUNTER
 '' -------------------------------------------------------------------------------------
 Dim As Double ft(STATN - 1)          '' circular buffer of the last STATN frame times, ms
@@ -787,68 +824,34 @@ PaintWorld()
 BuildFog()
 BuildSteps()
 
+#if __SB_WASM__
+    '' ⛔ NO LOOP HERE. A module that ran 1799 frames without returning would freeze the tab for
+    '' half a minute and then show the LAST one - which is what it did before this. The page
+    '' drives the animation instead, calling PROC_STEPFRAME once per frame; main() just builds
+    '' the world and hands back. One frame is drawn so the canvas is never blank.
+    StepFrame(0)
+#else
 For f = 0 To FRAMES - 1
     t0 = Timer
 
-    '' A closed circular path, the camera always facing along it. Closed because the run
-    '' has to be repeatable: the same frame number always sees the same view, so two
-    '' engines can be compared frame by frame and not just on an average.
-    '' THE CAMERA PATH, and this is the third one. The first was a plain circle in 20 seconds.
-    '' The second put a circle on a circle - three fast laps carried round by a slow one - to stop
-    '' a minute of film repeating itself. It did stop repeating, and it was unwatchable: the
-    '' interesting number is not the SHAPE of the path but the TURN RATE it implies, and three
-    '' laps in a minute is 18 degrees a second of continuous yaw. Nothing in the picture is wrong;
-    '' it is simply exhausting to look at. ⭐ A camera is judged in degrees per second and cells
-    '' per second, not in how clever its curve is.
-    ''
-    '' So: one circle, one lap, sixty seconds. 6 degrees a second of yaw and a constant speed -
-    '' 0.35 cells a frame, about ten a second, so the view opens rather than sweeps. It closes on
-    '' its own first frame exactly, and a large radius means the ground under it is never the same
-    '' ground twice, which is what the epicycle was for in the first place.
-    a = f * 6.283185307179586 / FRAMES
-    camx = MAPSZ / 2.0 + Cos(a) * CAMR
-    camy = MAPSZ / 2.0 + Sin(a) * CAMR
-    head = a + 1.5707963267948966          '' facing along the flight
-
-    '' The eye rides the ground rather than sitting at a fixed altitude - see EYECLEAR - but it
-    '' rides it on a SPRING, not glued to it. Following the terrain exactly means every hillock
-    '' the camera passes over becomes a vertical movement of the entire picture, and a viewer
-    '' reads that as the world moving rather than themselves. EYELAG = 0.06 means the eye closes
-    '' 6% of the gap each frame - a time constant of about half a second, long enough to ignore
-    '' single hills and short enough that it does not sail over a ridge and leave the ground.
-    '' ⛔ And it must not be allowed to lag INTO the ground on a steep climb, hence the floor:
-    '' a smooth ride is not worth flying through a mountain.
-    ghgt = HeightAt(camx, camy)
-    If f = 0 Then camh = ghgt + EYECLEAR
-    camh += (ghgt + EYECLEAR - camh) * EYELAG
-    If camh < ghgt + EYECLEAR * 0.5 Then camh = ghgt + EYECLEAR * 0.5
-
-#if __SB_WASM__
-    ScreenLock
-    RenderFrame(camx, camy, head, camh)
-    If fcount > 0 Then
-        Locate 1, 1
-        Print Using "fps ###.# | med ####.# ms | worst ####.# ms"; fps; med; worst
-    End If
-    ScreenUnlock
-#else
+    '' (the camera path and the eye spring live in StepFrame, so this loop and the browser
+    ''  page cannot drift apart - there is one description of where the camera is)
     If VIDEO Then
-    RenderFrame(camx, camy, head, camh)
-    Put #fh, , fbuf()                       '' one frame, rgb24, straight out
-    If (f Mod 60) = 0 Then Print "frame "; f; " / "; FRAMES
-Else
-    ScreenLock
-    RenderFrame(camx, camy, head, camh)   '' facing along the flight
-    '' The counter is drawn AFTER the terrain, and that is not a style choice: PRINT
-    '' inside a graphics mode paints its own background, so anything drawn under it is
-    '' gone. Drawn first, it would be overwritten by the landscape instead.
-    If fcount > 0 Then
-        Locate 1, 1
-        Print Using "fps ###.# | med ####.# ms | worst ####.# ms"; fps; med; worst
+        StepFrame(f)
+        Put #fh, , fbuf()                       '' one frame, rgb24, straight out
+        If (f Mod 60) = 0 Then Print "frame "; f; " / "; FRAMES
+    Else
+        ScreenLock
+        StepFrame(f)
+        '' The counter is drawn AFTER the terrain, and that is not a style choice: PRINT
+        '' inside a graphics mode paints its own background, so anything drawn under it is
+        '' gone. Drawn first, it would be overwritten by the landscape instead.
+        If fcount > 0 Then
+            Locate 1, 1
+            Print Using "fps ###.# | med ####.# ms | worst ####.# ms"; fps; med; worst
+        End If
+        ScreenUnlock
     End If
-    ScreenUnlock
-    End If
-#endif
 
     t1 = Timer
     ms = (t1 - t0) * 1000.0
@@ -883,11 +886,10 @@ Print Using "median          : ####.### ms"; rep(n \ 2)
 Print Using "p99             : ####.### ms"; rep(Int(n * 0.99))
 Print Using "worst           : ####.### ms"; rep(n - 1)
 Print Using "p99 / median    : ##.###";    rep(Int(n * 0.99)) / rep(n \ 2)
-#if not __SB_WASM__
-    If VIDEO Then
-        Close #fh
-        Print
-        Print "wrote frames.raw -- "; FRAMES; " frames, rgb24, "; SCRW; "x"; SCRH
-        Print "ffmpeg -f rawvideo -pix_fmt rgb24 -s "; SCRW; "x"; SCRH; " -r 30 -i frames.raw out.mp4"
-    End If
+If VIDEO Then
+    Close #fh
+    Print
+    Print "wrote frames.raw -- "; FRAMES; " frames, rgb24, "; SCRW; "x"; SCRH
+    Print "ffmpeg -f rawvideo -pix_fmt rgb24 -s "; SCRW; "x"; SCRH; " -r 30 -i frames.raw out.mp4"
+End If
 #endif
