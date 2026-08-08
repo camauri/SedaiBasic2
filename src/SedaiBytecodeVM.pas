@@ -1434,6 +1434,7 @@ function TBytecodeVM.FormatUsingFB(const FormatStr: string; Value: Double;
 var
   i, j, IntDigits, DecDigits, Caret, ExpDigits, Sh, CommaCount: Integer;
   LeadSign, TrailSign, TrailMinus, FixedDollar, FloatDollar, HasCommas: Boolean;
+  HasDot: Boolean;              // a '.' in the field prints even with no decimals
   Neg, Overflow: Boolean;
   AbsValue, Mant: Double;
   Body, Digits, IntPart, DecPart, Grouped, ExpStr: string;
@@ -1442,6 +1443,7 @@ begin
   IntDigits := 0; DecDigits := 0; Caret := 0; CommaCount := 0;
   LeadSign := False; TrailSign := False; TrailMinus := False;
   FixedDollar := False; FloatDollar := False; HasCommas := False;
+  HasDot := False;
 
   i := 1;
   while i <= Length(FormatStr) do
@@ -1462,6 +1464,7 @@ begin
       '+': if i = 1 then LeadSign := True else TrailSign := True;
       '-': if i > 1 then TrailMinus := True;
       '.': begin
+             HasDot := True;
              j := i + 1;
              while (j <= Length(FormatStr)) and (FormatStr[j] = '#') do
              begin
@@ -1471,13 +1474,22 @@ begin
              i := j - 1;
            end;
       '^': begin
+             { ⚠️ FIVE carets is the ceiling: fbc prints a three-digit exponent
+               for "^^^^^" and leaves any further caret as LITERAL text
+               ("##.#^^^^^^" gives " 1.2E+003^"). Counting them all would have
+               produced a four-digit exponent nobody asked for. }
              j := i;
-             while (j <= Length(FormatStr)) and (FormatStr[j] = '^') do
+             while (j <= Length(FormatStr)) and (FormatStr[j] = '^') and (Caret < 5) do
              begin
                Inc(Caret);
                Inc(j);
              end;
-             i := j - 1;
+             { ⛔ Only skip what was actually CONSUMED. Once the cap is reached
+               the loop consumes nothing, and "i := j - 1" would then move the
+               cursor BACKWARDS - the enclosing Inc(i) puts it right back, and
+               the parse spins for ever. A hang, on a caret nobody would think
+               to test. }
+             if j > i then i := j - 1;
            end;
     end;
     Inc(i);
@@ -1503,7 +1515,12 @@ begin
       gives 0.12E+04 and "##.##^^^^" gives 1.23E+03 for the same number.
       ⚠️ Unless there is no decimal point at all: "#^^^^" prints 5E+00, i.e. the
       single position IS a digit. }
-    if DecDigits > 0 then Sh := IntDigits - 1 else Sh := IntDigits;
+    { One position always belongs to the sign, so the mantissa carries
+      IntDigits-1 significant integer digits. ⚠️ With NO decimal point there has
+      to be at least one digit left: "#^^^^" prints 5E+00, while "###^^^^"
+      prints 12E+02 - measured, both. }
+    Sh := IntDigits - 1;
+    if (DecDigits = 0) and not HasDot and (Sh < 1) then Sh := 1;
     if Sh < 0 then Sh := 0;
     Ex := 0;
     Mant := AbsValue;
@@ -1541,14 +1558,16 @@ begin
         Body := '-' + Body;
       end;
     end
-    else if DecDigits > 0 then
-      // one position was held back for the sign: a space when there is none
+    else if Sh < IntDigits then
+      // a position WAS held back for the sign: a space when there is none
       if Neg then Body := '-' + Body else Body := ' ' + Body
     else
     begin
-      { ⚠️ No decimal point means NO position was held back - "#^^^^" prints
-        5E+00 with nothing in front. So a negative value simply does not fit,
-        and fbc says so with the overflow marker: "%-5E+00". }
+      { ⚠️ Sh = IntDigits means every position is a DIGIT and none was held back
+        - "#^^^^" prints 5E+00 with nothing in front. A negative value then does
+        not fit at all, and fbc says so with the overflow marker: "%-5E+00".
+        ⭐ The test is on the POSITIONS, not on whether there is a decimal
+        point: "###^^^^" holds one back and prints " 12E+02". }
       if Neg then Body := '%-' + Body;
     end;
     if Ex < 0 then ExpStr := '-' else ExpStr := '+';
@@ -1593,7 +1612,12 @@ begin
   else
     Grouped := IntPart;
 
-  if DecDigits > 0 then Body := Grouped + '.' + DecPart else Body := Grouped;
+  { ⚠️ A '.' in the field prints even when NO '#' follows it: "#." on 0.5 gives
+    "1." in fbc. The point is part of the picture, not a consequence of having
+    decimals. }
+  if DecDigits > 0 then Body := Grouped + '.' + DecPart
+  else if HasDot then Body := Grouped + '.'
+  else Body := Grouped;
 
   // the '$' of "$$" hugs the first digit, so it is part of the body
   if FloatDollar then Body := '$' + Body;
@@ -1629,7 +1653,8 @@ begin
 
   // pad to the field width: the same integer positions counted above, plus the
   // fractional part and whatever owns a position of its own
-  if DecDigits > 0 then Inc(Width, DecDigits + 1);
+  if DecDigits > 0 then Inc(Width, DecDigits + 1)
+  else if HasDot then Inc(Width);
   if TrailSign or TrailMinus then Inc(Width);
   Inc(Width, CommaCount);
   { ⚠️ A fixed '$' OCCUPIES one of the field's positions rather than adding one,
