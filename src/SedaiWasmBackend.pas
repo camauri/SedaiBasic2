@@ -173,6 +173,8 @@ type
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
     FPrintStrFunc, FStrFromIntFunc: LongWord;
     FStrFillFunc, FStrCaseFunc, FStrInstrFunc: LongWord;
+    FPuDigFunc: LongWord;          // PRINT USING: the rounded digits
+    FUsesPU: Boolean;              // the program has a PRINT USING
 
     // --- arrays ---------------------------------------------------------
     FUsesArr: Boolean;
@@ -301,7 +303,19 @@ const
   FLT_DIG      = 128;     // the kept, ROUNDED digits, most significant first
   FLT_OUT      = 1024;    // the rendered text
   FLT_DEC      = 2048;    // the EXACT digits, least significant first
-  STR_CONST_BASE = 4096;  // the first string literal
+  { PRINT USING's workspace. PU_DIG holds the value's digits MOST significant
+    first, already rounded to the field's decimals; PU_OUT the rendered field.
+    ⭐ Both are bounded by the type rather than by the program - so, like the
+    float formatter's workspace above, none of this is allocated.
+    ⛔ It sits ABOVE 4096 and not below: FLT_DEC starts at 2048 and an exact
+    expansion runs to over a thousand digits (a subnormal has 1074 fractional
+    ones), so anything placed at 3072 would be overwritten by the very digits it
+    was about to read. }
+  PU_NINT      = 4096;    // i32: how many of the digits are integer digits
+  PU_NDEC      = 4100;    // i32: and how many are fractional
+  PU_DIG       = 4224;    // the rounded digits, most significant first
+  PU_OUT       = 6144;    // the rendered field
+  STR_CONST_BASE = 8192;  // the first string literal
 
   { The two REGIONS a tagged raw pointer can name (SedaiSSATypes): region 0 is
     the byte heap Allocate returns, region 1 the framebuffer SCREENPTR returns.
@@ -381,6 +395,7 @@ var
 
 begin
   FUsesPrint := False;
+  FUsesPU := False;
   FUsesClock := False;
   FUsesTrig := False;
   FUsesGfx := False;
@@ -420,6 +435,9 @@ begin
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
         ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim:
           FUsesArr := True;
+        ssaPrintUsing:
+          begin FUsesPU := True; FUsesStr := True; FUsesPrint := True;
+                FUsesFlt := True; end;   // puDigits leans on the float digits
         ssaDateNow:
           FUsesClock := True;
         ssaMathSin, ssaMathCos:
@@ -734,7 +752,7 @@ procedure TWasmBackend.EmitStringHelpers;
 var
   B: TWasmBuf;
   TNewStr, TCat, TSub, TCmp, TAsc, TChr, TRight, TMid, TPrint,
-  TFromInt, TFill, TCase, TInstr: LongWord;
+  TFromInt, TFill, TCase, TInstr, TPuDig: LongWord;
 begin
   TNewStr := FModule.TypeIndex([wvtI32], [wvtI32]);
   TCat    := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
@@ -749,6 +767,7 @@ begin
   TFill   := FModule.TypeIndex([wvtI64, wvtI64], [wvtI32]);
   TCase   := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
   TInstr  := FModule.TypeIndex([wvtI32, wvtI32, wvtI64], [wvtI64]);
+  TPuDig  := FModule.TypeIndex([wvtF64, wvtI32, wvtI64, wvtI32], []);
 
   { strNew(len: i32) -> i32: an uninitialised header of that length, or the
     canonical empty string when the length is zero. }
@@ -1185,6 +1204,157 @@ begin
     FModule.AddFunction(TInstr, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
   finally
     B.Free;
+  end;
+
+  { puDigits(v: f64, isInt: i32, iv: i64, decDigits: i32): the value's digits,
+    MOST significant first, into PU_DIG - already rounded to decDigits places -
+    with PU_NINT and PU_NDEC saying how they split.
+
+    ⭐ It reuses fltDec, which produces the EXACT decimal expansion of a double
+    (the value is M x 2^E, so its digits are an integer's), and that is what
+    makes this tractable: rounding to a fixed number of decimals becomes
+    arithmetic on DIGITS, with no floating point anywhere and nothing to drift.
+    ⚠️ Half-AWAY-from-zero, which is what FPC's Format('%.*f') does and NOT what
+    PRINT does - measured: 0.125 -> 0.13, 0.25 -> 0.3, 2.5 -> 3. Half-to-even
+    would answer 0.12, 0.2 and 2 and be wrong three times out of three. }
+  if FUsesPU then
+  begin
+  B := TWasmBuf.Create;
+  try
+    // locals: 4 = len, 5 = frac, 6 = i, 7 = n, 8 = carry, 9 = keep, 10 = t (i64)
+    B.LocalGet(1);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      { the exact integer path: its digits are its own, and a fractional field
+        is padded with zeros - a LongInt past 2^53 must print every digit, not
+        the digits of the double nearest to it }
+      B.LocalGet(2); B.I64Const(0); B.Op(wopI64LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I64Const(0); B.LocalGet(2); B.Op(wopI64Sub); B.LocalSet(2);
+      B.EndOp;
+      B.I32Const(0); B.LocalSet(6);
+      B.LocalGet(2); B.Op(wopI64Eqz);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(FLT_DEC); B.I32Const(0); B.OpMem(wopI32Store8, 0, 0);
+        B.I32Const(1); B.LocalSet(6);
+      B.Op(wopElse);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(2); B.Op(wopI64Eqz); B.BrIf(1);
+            B.I32Const(FLT_DEC); B.LocalGet(6); B.Op(wopI32Add);
+            B.LocalGet(2); B.I64Const(10); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+            B.OpMem(wopI32Store8, 0, 0);
+            B.LocalGet(2); B.I64Const(10); B.Op(wopI64DivU); B.LocalSet(2);
+            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+            B.Br(0);
+          B.EndOp;
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(6); B.LocalSet(4);
+      B.I32Const(0); B.LocalSet(5);
+    B.Op(wopElse);
+      B.LocalGet(0); B.Call(FFltDecFunc);
+      B.I32Const(FLT_LEN); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+      B.I32Const(FLT_FRAC); B.OpMem(wopI32Load, 2, 0); B.LocalSet(5);
+    B.EndOp;
+
+    { Round to decDigits fractional places. FLT_DEC is least-significant-first,
+      so the digits to drop are the LOW ones: keep = len - (frac - want). }
+    B.LocalGet(5); B.LocalGet(3); B.Op(wopI32Sub); B.LocalSet(7);   // to drop
+    B.LocalGet(7); B.I32Const(0); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.LocalSet(7);
+    B.EndOp;
+    B.I32Const(0); B.LocalSet(8);
+    B.LocalGet(7); B.I32Const(0); B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      // the first dropped digit decides, and 5 rounds AWAY from zero
+      B.LocalGet(7); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(6);
+      B.LocalGet(6); B.LocalGet(4); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(FLT_DEC); B.LocalGet(6); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0);
+        B.I32Const(5); B.Op(wopI32GeS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(1); B.LocalSet(8);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(4); B.LocalGet(7); B.Op(wopI32Sub); B.LocalSet(9);   // kept
+    B.LocalGet(9); B.I32Const(0); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.LocalSet(9);
+    B.EndOp;
+
+    { Copy the kept digits out, MOST significant first, applying the carry as we
+      go. ⚠️ The carry can run off the top (999.95 -> 1000.0), and then there is
+      one more digit than was kept - which the integer count has to see. }
+    B.I32Const(0); B.LocalSet(6);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(6); B.LocalGet(9); B.Op(wopI32GeS); B.BrIf(1);
+        B.I32Const(FLT_DEC); B.LocalGet(7); B.Op(wopI32Add);
+          B.LocalGet(6); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0);
+        B.LocalGet(8); B.Op(wopI32Add); B.LocalSet(10);
+        B.LocalGet(10); B.I32Const(10); B.Op(wopI32GeS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(10); B.I32Const(10); B.Op(wopI32Sub); B.LocalSet(10);
+          B.I32Const(1); B.LocalSet(8);
+        B.Op(wopElse);
+          B.I32Const(0); B.LocalSet(8);
+        B.EndOp;
+        B.I32Const(FLT_DEC + 1024); B.LocalGet(6); B.Op(wopI32Add);
+        B.LocalGet(10); B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(8);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(FLT_DEC + 1024); B.LocalGet(9); B.Op(wopI32Add);
+      B.I32Const(1); B.OpMem(wopI32Store8, 0, 0);
+      B.LocalGet(9); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(9);
+    B.EndOp;
+
+    // reverse into PU_DIG, most significant first
+    B.I32Const(0); B.LocalSet(6);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(6); B.LocalGet(9); B.Op(wopI32GeS); B.BrIf(1);
+        B.I32Const(PU_DIG); B.LocalGet(6); B.Op(wopI32Add);
+        B.I32Const(FLT_DEC + 1024); B.LocalGet(9); B.Op(wopI32Add);
+          B.LocalGet(6); B.Op(wopI32Sub); B.I32Const(1); B.Op(wopI32Sub);
+        B.OpMem(wopI32Load8U, 0, 0);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    { The split. A value below 1 has NO integer digits of its own, so the
+      integer part is a written zero and the fraction is padded on the left -
+      0.001 with three decimals is "0" and "001", not one digit and two. }
+    B.LocalGet(9); B.LocalGet(3); B.Op(wopI32Sub); B.LocalSet(6);   // int digits
+    B.LocalGet(6); B.I32Const(0); B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(PU_NINT); B.LocalGet(6); B.OpMem(wopI32Store, 2, 0);
+    B.Op(wopElse);
+      // shift right to make room for the leading zero and any padding zeros
+      B.I32Const(0); B.LocalGet(6); B.Op(wopI32Sub); B.I32Const(1); B.Op(wopI32Add);
+      B.LocalSet(7);
+      B.I32Const(PU_DIG); B.LocalGet(7); B.Op(wopI32Add);
+      B.I32Const(PU_DIG);
+      B.LocalGet(9);
+      B.MemoryCopy;
+      B.I32Const(PU_DIG); B.I32Const(0); B.LocalGet(7); B.MemoryFill;
+      B.LocalGet(9); B.LocalGet(7); B.Op(wopI32Add); B.LocalSet(9);
+      B.I32Const(PU_NINT); B.I32Const(1); B.OpMem(wopI32Store, 2, 0);
+    B.EndOp;
+    B.I32Const(PU_NDEC); B.LocalGet(3); B.OpMem(wopI32Store, 2, 0);
+    FModule.AddFunction(TPuDig, [wvtI32, wvtI32, wvtI32, wvtI32,
+                                 wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
   end;
 
   { printStr(s): the bytes straight into the sink. No formatting - there is
@@ -4296,17 +4466,27 @@ begin
     FStrChrFunc   := Next + 5;
     FStrRightFunc := Next + 6;
     FStrMidFunc   := Next + 7;
-    { ⛔ strFromInt goes BEFORE printStr, and the order is not cosmetic: printStr
-      is emitted only when the program PRINTS, so anything numbered after it
-      would slide by one in a program that uses Str() without printing - and
-      calling the wrong function with the right types VALIDATES. The conditional
-      one stays last. }
     FStrFromIntFunc := Next + 8;
     FStrFillFunc    := Next + 9;    // SPACE$ and STRING$: one helper, the char differs
     FStrCaseFunc    := Next + 10;   // UCASE / LCASE: one helper, the direction is a flag
     FStrInstrFunc   := Next + 11;
-    FPrintStrFunc   := Next + 12;
-    Inc(Next, 13);
+    Inc(Next, 12);
+    { ⛔ FROM HERE THE NUMBERING IS SEQUENTIAL, not fixed offsets, because these
+      are CONDITIONAL: printStr exists only if the program prints, puDigits only
+      if it uses PRINT USING. With offsets, a program that had one but not the
+      other would slide every later index by one - and calling the wrong
+      function with the right types VALIDATES, so nothing would catch it.
+      ⚠️ The order here must match the order EmitStringHelpers adds them in. }
+    if FUsesPU then
+    begin
+      FPuDigFunc := Next;
+      Inc(Next);
+    end;
+    if FUsesPrint then
+    begin
+      FPrintStrFunc := Next;
+      Inc(Next);
+    end;
   end;
   if FUsesArr then
   begin
