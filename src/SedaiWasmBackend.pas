@@ -97,6 +97,22 @@ type
       callee's own nested calls, exactly what the VM avoids by saving the
       transfer bank per frame. }
     FOutSlot: array of array[TSSARegisterType] of array of Boolean;
+    { ⭐ THE HIGH SLOTS ARE NOT ARGUMENTS AND NOT PER FUNCTION. Slots from
+      SHARED_SLOT_BASE up carry module-global SHARED scalars, the reserved
+      END-in-procedure destructor handles (growing down from 253) and the
+      caller-allocated handle of a FUNCTION returning a UDT by value (254). All
+      three name ONE storage location for the whole program - which is exactly
+      what the VM's transfer bank IS: FCtx.XferInt/Float/Str are sized once, to
+      256 (SedaiBytecodeVM.pas), and a call never saves or restores them. So a
+      WASM GLOBAL is the FAITHFUL mapping and not an approximation, one per
+      (bank, slot); a slot LOCAL would give every procedure its own copy of a
+      module global and compute the wrong thing in silence.
+      ⚠️ The LOW slots stay locals, and that is the optimisation rather than the
+      rule: an argument is written by the caller immediately before the call and
+      read by the callee immediately after, so nothing can observe the
+      difference - byref copy-out included, which leaves as extra results. }
+    FXferGlobal: array[TSSARegisterType] of array of LongWord;
+    FXferIsGlobal: array[TSSARegisterType] of array of Boolean;
 
     // --- emission state -------------------------------------------------
     FStateLocal: LongWord;
@@ -104,6 +120,18 @@ type
     FSlotBase: array[TSSARegisterType] of LongWord;
     FRawTmp: LongWord;            // i64: a raw pointer being decoded
     FGfxP, FGfxN: LongWord;       // i32: the ScreenRes fill cursor and counter
+
+    { ⛔ END INSIDE A PROCEDURE ENDS THE PROGRAM, NOT THE FUNCTION. In WASM a
+      return only unwinds one frame, so the plain return this used to emit let
+      the caller carry on: m12_endinproc printed its destructors correctly and
+      then went on to print the "NEVER" that proves the halt was ignored. There
+      is no deopt here, so the choice is between refusing the shape and modelling
+      it - and it is modelled with a flag global that every call site tests,
+      which unwinds the whole chain one frame at a time.
+      ⚠️ Emitted ONLY when a procedure actually halts (FUsesHalt), so a program
+      whose END sits in main pays nothing - which is nearly all of them. }
+    FUsesHalt: Boolean;
+    FHaltFlag: LongWord;
 
     // --- graphics -------------------------------------------------------
     FUsesGfx: Boolean;
@@ -150,6 +178,10 @@ type
     function ClassifyRegisters: Boolean;
     function BuildSignatures: Boolean;
     function DetectRecursion: Boolean;
+    function IsSharedSlot(ASlot: Integer): Boolean;
+    procedure NoteXferGlobal(Bank: TSSARegisterType; ASlot: Integer);
+    procedure ScanForHalt;
+    procedure EmitReturnValues(B: TWasmBuf; R: Integer);
   private
     FUsesPrint: Boolean;
     FImportCount: LongWord;
@@ -1961,6 +1993,82 @@ begin
   Result := True;
 end;
 
+function TWasmBackend.IsSharedSlot(ASlot: Integer): Boolean;
+{ Every slot at or above the base EXCEPT the result. 255 is a different animal:
+  it is produced and consumed across ONE call boundary, so a per-region local
+  plus the function's WASM result already models it, and turning it into a
+  global would serialise what multi-value returns keep separate. }
+begin
+  Result := (ASlot >= WASM_SHARED_SLOT_BASE) and (ASlot <> WASM_XFER_RESULT_SLOT);
+end;
+
+procedure TWasmBackend.NoteXferGlobal(Bank: TSSARegisterType; ASlot: Integer);
+{ One mutable WASM global per (bank, slot), defined the first time the slot is
+  seen. Zero is the right initial value in all three banks: the VM's transfer
+  bank starts cleared, an unwritten float reads 0.0, and string handle 0 IS the
+  empty string (memory is zeroed, so it reads as length 0). }
+var
+  n: Integer;
+  Init: TWasmBuf;
+begin
+  n := Length(FXferIsGlobal[Bank]);
+  if n <= ASlot then
+  begin
+    SetLength(FXferIsGlobal[Bank], ASlot + 1);
+    SetLength(FXferGlobal[Bank], ASlot + 1);
+    while n <= ASlot do
+    begin
+      FXferIsGlobal[Bank][n] := False;
+      FXferGlobal[Bank][n] := 0;
+      Inc(n);
+    end;
+  end;
+  if FXferIsGlobal[Bank][ASlot] then Exit;
+  Init := TWasmBuf.Create;
+  try
+    case Bank of
+      srtFloat:  Init.F64Const(0);
+      srtString: Init.I32Const(0);
+    else
+      Init.I64Const(0);
+    end;
+    FXferGlobal[Bank][ASlot] := FModule.DefineGlobal(BankType[Bank], True, Init);
+    FXferIsGlobal[Bank][ASlot] := True;
+  finally
+    Init.Free;
+  end;
+end;
+
+procedure TWasmBackend.ScanForHalt;
+{ Does any region OTHER than main halt the program? Main's END is already a
+  return that ends the run, so the flag is worth nothing there. }
+var
+  i, j: Integer;
+  Blk: TSSABasicBlock;
+begin
+  FUsesHalt := False;
+  for i := 0 to FProg.Blocks.Count - 1 do
+  begin
+    if FRegionOf[i] = 0 then Continue;
+    Blk := FProg.Blocks[i];
+    for j := 0 to Blk.Instructions.Count - 1 do
+      if OpIn(TSSAInstruction(Blk.Instructions[j]).OpCode, [ssaEnd, ssaStop]) then
+      begin
+        FUsesHalt := True;
+        Exit;
+      end;
+  end;
+end;
+
+procedure TWasmBackend.EmitReturnValues(B: TWasmBuf; R: Integer);
+{ What this region has to leave on the stack to return: its own value first,
+  then the byref slots it copies back. }
+begin
+  if FResultBank[R] >= 0 then
+    B.LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
+  PushOutSlots(B, R);
+end;
+
 { ---------------- 3. signatures, read off the transfer slots ---------------- }
 
 function TWasmBackend.BuildSignatures: Boolean;
@@ -2039,13 +2147,15 @@ begin
           ⚠️ And the honest fix is not to renumber them: a SHARED slot must
           SURVIVE a call, so it belongs in a WASM global, while a slot local is
           per function - every procedure would get its own copy of a module
-          global and the program would quietly compute the wrong thing. Until
-          that is built, refuse and say which. }
-        if (Slot >= WASM_SHARED_SLOT_BASE) and (Slot <> WASM_XFER_RESULT_SLOT) then
-          Exit(Fail(Format('transfer slot %d is a module-global SHARED scalar or a ' +
-                           'by-value UDT result handle, not an argument; the WASM backend ' +
-                           'has no storage for one that survives a call yet (block "%s")',
-                           [Slot, Blk.LabelName])));
+          global and the program would quietly compute the wrong thing.
+          ⇒ That is what NoteXferGlobal builds, and it takes those slots OUT of
+          the arity question entirely: a high slot is neither a parameter of the
+          region that mentions it nor a local of it. }
+        if IsSharedSlot(Slot) then
+        begin
+          NoteXferGlobal(RT, Slot);
+          Continue;
+        end;
         NoteSlot(r, RT, Slot);      // this region needs a local for that slot
         if Instr.OpCode in [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString] then
         begin
@@ -2116,9 +2226,15 @@ begin
         Target := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)]
       else if OpIn(Instr.OpCode, [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString]) and
               XferBank(Instr.OpCode, RT) and SlotOf(Instr, Slot) and
-              (Slot <> WASM_XFER_RESULT_SLOT) and (Target >= 0) then
+              (Slot <> WASM_XFER_RESULT_SLOT) and (not IsSharedSlot(Slot)) and
+              (Target >= 0) then
       begin
-        { ⭐ The CALLER re-reading an ARGUMENT slot after a call is BYREF
+        { ⚠️ A HIGH slot is excluded above, and it is not a detail: re-reading a
+          SHARED global after a call looks exactly like byref copy-out to this
+          criterion, and buying it back as an extra RESULT would have given the
+          callee a phantom parameter for a variable it never received. The
+          global is already visible on both sides - there is nothing to copy.
+          ⭐ The CALLER re-reading an ARGUMENT slot after a call is BYREF
           copy-out, and it is the only unambiguous witness of it. A store to an
           argument slot inside a procedure cannot tell copy-out from the
           procedure staging its OWN call - that ambiguity already produced one
@@ -3050,7 +3166,8 @@ begin
         Slot := Integer(Instr.Src3.ConstInt);
         LoadReg(B, Instr.Src1);
         if Slot = WASM_XFER_RESULT_SLOT then B.LocalSet(FResultTmp[RT])
-                                         else B.LocalSet(FSlotBase[RT] + LongWord(Slot));
+        else if IsSharedSlot(Slot) then B.GlobalSet(FXferGlobal[RT][Slot])
+        else B.LocalSet(FSlotBase[RT] + LongWord(Slot));
       end;
 
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString:
@@ -3064,6 +3181,8 @@ begin
         Slot := Integer(Instr.Src3.ConstInt);
         if Slot = WASM_XFER_RESULT_SLOT then
           B.LocalGet(FResultTmp[RT])          // the callee's result, parked after the call
+        else if IsSharedSlot(Slot) then
+          B.GlobalGet(FXferGlobal[RT][Slot])  // module-global storage, survives every call
         else
           B.LocalGet(FSlotBase[RT] + LongWord(Slot));
         StoreReg(B, Instr.Dest);
@@ -3243,20 +3362,34 @@ begin
               PopOutSlots(B, CalleeRegion);
               if FResultBank[CalleeRegion] >= 0 then
                 B.LocalSet(FResultTmp[TSSARegisterType(FResultBank[CalleeRegion])]);
+              { The callee may have ENDed the program. Unwind this frame too -
+                and the results pushed here are whatever the locals hold, which
+                nobody will read: the caller above is about to do the same. }
+              if FUsesHalt then
+              begin
+                B.GlobalGet(FHaltFlag);
+                B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                  EmitReturnValues(B, R);
+                  B.Op(wopReturn);
+                B.EndOp;
+              end;
             end;
           ssaReturnSub:
             begin
-              if FResultBank[R] >= 0 then
-                B.LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
-              PushOutSlots(B, R);
+              EmitReturnValues(B, R);
               B.Op(wopReturn);
               Terminated := True;
             end;
           ssaEnd, ssaStop:
             begin
-              if FResultBank[R] >= 0 then
-                B.LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
-              PushOutSlots(B, R);
+              // In main this return IS the halt; in a procedure it is only the
+              // first frame of one, and the flag carries it the rest of the way.
+              if FUsesHalt and (R <> 0) then
+              begin
+                B.I32Const(1);
+                B.GlobalSet(FHaltFlag);
+              end;
+              EmitReturnValues(B, R);
               B.Op(wopReturn);
               Terminated := True;
             end;
@@ -3270,9 +3403,7 @@ begin
         if i + 1 < N then D.EmitGotoTerminal(i, i + 1)
         else
         begin
-          if FResultBank[R] >= 0 then
-            D.Body(i).LocalGet(FResultTmp[TSSARegisterType(FResultBank[R])]);
-          PushOutSlots(D.Body(i), R);
+          EmitReturnValues(D.Body(i), R);
           D.Body(i).Op(wopReturn);
         end;
       end;
@@ -3333,6 +3464,7 @@ begin
     FImportCount := 1;
   end;
 
+  ScanForHalt;
   SetLength(FLocalIdx, FProg.Blocks.Count);   // sized by region below
   if not ClassifyRegisters then Exit(False);
   SetLength(FLocalIdx, FRegionCount);
@@ -3353,6 +3485,12 @@ begin
   end;
   Init := TWasmBuf.Create;
   try
+    if FUsesHalt then
+    begin
+      Init.I32Const(0);
+      FHaltFlag := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+    end;
     if FUsesHeap then
     begin
       Init.I32Const(LongInt(FHeapBase));
