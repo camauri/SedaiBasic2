@@ -95,10 +95,18 @@ sbc program.bas --target wasm     # -> program.wasm
 ```
 
 Covered today: integer and floating-point arithmetic, comparisons, bitwise and shifts, control flow,
-calls and recursion, `PRINT` (including correctly-rounded floats), strings, arrays including array
-parameters, user-defined types, `DIM SHARED` globals, and graphics through `SCREENPTR` — a program
-that draws produces the same framebuffer natively and in the browser, and the page paints it by
-reading linear memory directly, without a single extra import.
+calls and recursion, `PRINT` (including correctly-rounded floats and `PRINT USING`), strings, arrays
+including array parameters and `REDIM`, user-defined types, raw memory, `DIM SHARED` globals, the
+transcendental functions, and 2D graphics — both the drawing primitives (`LINE`, `PSET`, `POINT`) and
+direct framebuffer access through `SCREENPTR`. A program that draws produces the same framebuffer
+natively and in the browser, and the page paints it by reading linear memory directly, without a
+single extra import. The voxel-landscape demo in `bas/demo/` compiles and runs this way.
+
+A program can ask which machine it is being compiled *for* with `#if __SB_WASM__`, and that question
+has to be answered at compile time: the backend refuses an uncovered opcode for being **present** in
+the program rather than for being reached, so a run-time test around a branch that writes files does
+not keep those opcodes out of the module. The demo uses it to compile its offline video mode out of
+the browser build entirely.
 
 > **There is no deopt, and that shapes the whole design.** In a browser there is no interpreter to
 > fall back into, so an opcode the backend does not cover makes the *compilation* fail with a message

@@ -1965,6 +1965,27 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 ##### Platform Information
 
+> **SedaiBasic extension — `__SB_WASM__`.** `-1` when compiling with `sbc --target wasm`, `0`
+> otherwise, so a program can ask which machine it is being compiled *for*.
+>
+> It has to be answered at compile time rather than at run time, and that is the whole reason it
+> exists: the WebAssembly backend refuses an opcode it does not cover because that opcode is
+> **present in the program**, not because it is reached. A run-time `If` around a branch that opens
+> files therefore leaves those opcodes in the module and the whole program is refused; conditional
+> compilation removes them.
+>
+> ```basic
+> #if __SB_WASM__
+>     ' the parts that make no sense in a browser simply do not exist
+> #else
+>     If Len(Command$(1)) > 0 Then OpenTheOutputFile()
+> #endif
+> ```
+>
+> It is deliberately not spelled `__FB_something`: FreeBASIC has no WebAssembly target, so claiming
+> an `__FB_` macro would claim a compatibility that does not exist. `bas/demo/voxel_landscape.bas`
+> uses it to compile its offline video branch out of the browser build.
+
 | Keyword | Status | Description |
 |---|---|---|
 | `__FB_WIN32__` | ✓ | Defined if compiling for Windows. |
