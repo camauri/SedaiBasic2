@@ -29,13 +29,22 @@
 ''  user input on purpose: a fixed path makes two runs comparable.
 ''
 ''  IN A BROWSER
-''    voxel_landscape.html beside this file is the demo compiled to WebAssembly, with the
+''    voxel_landscape.html beside this file is this demo compiled to WebAssembly, with the
 ''    module embedded, so it is ONE file that runs from anywhere - no server, no fetch, no
-''    configuration. The page calls StepFrame once per animation tick.
-''    ⚠️ IT IS GENERATED, and it embeds a COPY of the module: change this source and the page
-''    is stale until it is rebuilt.
-''        sbc voxel_landscape.bas --target wasm
-''        node <tools>/wasm_demo_page.js voxel_landscape.wasm voxel_landscape.html
+''    configuration.
+''
+''    The page drives the animation: it calls StepFrame once per animation tick, so the module
+''    RETURNS to the browser between frames. That is what keeps the tab responsive without a
+''    Web Worker - and a worker would have needed SharedArrayBuffer, which needs cross-origin
+''    isolation, which a static host cannot configure.
+''
+''    ⚠️ BOTH voxel_landscape.wasm AND the page are BUILD ARTEFACTS, and the page embeds a COPY
+''    of the module: change this source and both go stale in silence. Rebuild the module with
+''        sbc voxel_landscape.bas --target wasm -o voxel_landscape.wasm
+''    and then wrap it in a page that supplies the module's imports - a byte sink for output,
+''    a clock, and the transcendental functions - and blits the framebuffer onto a canvas.
+''    ⛔ That blit must SWAP RED AND BLUE: a framebuffer word is ARGB, so its bytes run B,G,R,A,
+''    while canvas ImageData wants R,G,B,A. Copying straight through renders a blue sky orange.
 
 '' ---- THE TWO MODES -------------------------------------------------------------------
 '' VIDEO 0 : draw on screen, in real time. VIDEO 1 : write raw rgb24 frames to a file for
