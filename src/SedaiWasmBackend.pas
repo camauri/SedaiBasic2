@@ -270,12 +270,20 @@ type
     FUsesTrig: Boolean;           // SIN / COS: an import, WASM has no transcendentals
     FImportCount: LongWord;
     FWriteFunc, FPrintIntFunc, FPrintUIntFunc, FPrintNlFunc: LongWord;
+    { PRINT's comma tabs to a column, so the module has to know which column it
+      is on - the one piece of screen state a byte sink does not give you.
+      ⚠️ Paid for ONLY by a program that has a comma: without one, every write
+      still goes straight to the import and no counter exists. }
+    FUsesCol: Boolean;
+    FColG: LongWord;              // i32 global: the cursor column
+    FEmitFunc: LongWord;          // write, and advance the column
     FNowFunc: LongWord;
     { The transcendentals, all imported for the same reason: WASM has none of
       them. They are the host's, and the host's are not FPC's - one ulp apart on
       some arguments, measured. }
     FTrigFunc: array[0..11] of LongWord;
     procedure ScanForPrint;
+    function WriteTarget: LongWord;
     function ConstAddrOf(const V: TSSAValue): LongWord;
     function ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
     procedure EmitArrayHelpers;
@@ -434,6 +442,14 @@ const
     initial buffer has to happen before the first character is printed. }
   FB_CLEAR     = 255;          // $000000FF
 
+  { PRINT's comma zone, and the line it wraps on. Both are the FreeBASIC values
+    the interpreter sets for MODERN (SedaiBytecodeVM: "A comma indicates
+    printing should take place at the next 14 column boundary" - the FB manual's
+    Print page - on an 80-column console). ⛔ The Commodore pair is 10 and 40,
+    and it is not reachable here: the target is MODERN-only. }
+  COMMA_TAB    = 14;
+  SCREEN_COLS  = 80;
+
 { ---------------- PRINT ----------------
 
   The host import is a BYTE SINK - write(ptr, len) - and nothing else. The
@@ -493,6 +509,7 @@ var
 
 begin
   FUsesPrint := False;
+  FUsesCol := False;
   FUsesPU := False;
   FUsesGfxPrim := False;
   FUsesClock := False;
@@ -518,6 +535,10 @@ begin
     begin
       Ins := TSSAInstruction(Blk.Instructions[j]);
       case Ins.OpCode of
+        { PRINT's comma TABS, so it is the one print opcode that needs to know
+          which column the cursor is on. Everything else is a byte sink. }
+        ssaPrintComma:
+          begin FUsesPrint := True; FUsesCol := True; end;
         ssaPrintInt, ssaPrintIntLn, ssaPrintNewLine, ssaPrintUInt:
           FUsesPrint := True;
         ssaPrintString, ssaPrintStringLn:
@@ -792,7 +813,7 @@ begin
 
     B.LocalGet(1);
     B.I32Const(SCRATCH_END); B.LocalGet(1); B.Op(wopI32Sub);
-    B.Call(FWriteFunc);
+    B.Call(WriteTarget);
 
     if (not FModern) or FQBLang then
     begin
@@ -801,7 +822,7 @@ begin
         integer, while a Single or a Double keeps just the sign pad. That is why
         this reads (not Modern) OR QBLang rather than folding the two, and why
         the float printer below does NOT get the same test. }
-      B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(FWriteFunc);
+      B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(WriteTarget);
     end;
 
     FModule.AddFunction(TVoidI64, [wvtI32, wvtI64, wvtI32], B);
@@ -849,10 +870,10 @@ begin
 
     B.LocalGet(1);
     B.I32Const(SCRATCH_END); B.LocalGet(1); B.Op(wopI32Sub);
-    B.Call(FWriteFunc);
+    B.Call(WriteTarget);
     if not FModern then
     begin
-      B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(FWriteFunc);
+      B.I32Const(CONST_SPACE); B.I32Const(1); B.Call(WriteTarget);
     end;
 
     FModule.AddFunction(TVoidI64, [wvtI32, wvtI64, wvtI32], B);
@@ -860,13 +881,50 @@ begin
     B.Free;
   end;
 
+  { printNl. ⛔ It writes DIRECTLY and then zeroes the column rather than going
+    through emit: a newline does not advance the cursor by one character, it
+    starts the line over, and that is the one place where "bytes written" and
+    "columns moved" part company. }
   B := TWasmBuf.Create;
   try
     B.I32Const(CONST_NL); B.I32Const(1); B.Call(FWriteFunc);
+    if FUsesCol then
+    begin
+      B.I32Const(0); B.GlobalSet(FColG);
+    end;
     FModule.AddFunction(TVoid, [], B);
   finally
     B.Free;
   end;
+
+  { emit(ptr, len): the byte sink, plus the column. ⭐ The rule is the
+    interpreter's AdvancePrintCol and nothing more - add the characters, wrap at
+    the line width - and the wrap is not cosmetic: the counter that never wrapped
+    made a comma compute a zone from a column no screen has and break the record
+    in half. An embedded newline inside a printed STRING does NOT reset it here,
+    for the same reason it does not there: only a print NEWLINE does. }
+  if FUsesCol then
+  begin
+    B := TWasmBuf.Create;
+    try
+      B.LocalGet(0); B.LocalGet(1); B.Call(FWriteFunc);
+      B.GlobalGet(FColG); B.LocalGet(1); B.Op(wopI32Add);
+      B.I32Const(SCREEN_COLS); B.Op(wopI32RemS);
+      B.GlobalSet(FColG);
+      FModule.AddFunction(FModule.TypeIndex([wvtI32, wvtI32], []), [], B);
+    finally
+      B.Free;
+    end;
+  end;
+end;
+
+function TWasmBackend.WriteTarget: LongWord;
+{ Where a print helper sends its bytes: straight to the host, or through the
+  column counter. ⭐ A program with no comma in a PRINT never pays for the
+  counter - and there is no third answer, so the choice is made here once
+  instead of at every call site. }
+begin
+  if FUsesCol then Result := FEmitFunc else Result := FWriteFunc;
 end;
 
 { ---------------- the heap ----------------
@@ -2205,7 +2263,7 @@ begin
     try
       B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add);
       B.LocalGet(0); B.OpMem(wopI32Load, 2, 0);
-      B.Call(FWriteFunc);
+      B.Call(WriteTarget);
       FModule.AddFunction(TPrint, [], B);
     finally
       B.Free;
@@ -3538,7 +3596,7 @@ begin
     begin
       B.I32Const(FLT_CAP); B.OpMem(wopI32Load, 2, 0); B.Op(wopI32Eqz);
       B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
-        B.I32Const(FLT_OUT); B.LocalGet(0); B.Call(FWriteFunc);
+        B.I32Const(FLT_OUT); B.LocalGet(0); B.Call(WriteTarget);
       B.EndOp;
     end;
     FFltOutFunc := FModule.AddFunction(FModule.TypeIndex([wvtI32], []), [], B);
@@ -5012,6 +5070,51 @@ begin
       place that has to grow one. }
     ssaPrintSemicolon: ;
 
+    { ⚠️ TAB(n) AND SPC(n) EMIT NOTHING HERE, and that is the interpreter's rule
+      read rather than a shortcut: in MODERN they are cursor MOVEMENTS that only
+      happen onto a VISIBLE screen, and to a redirected stream FreeBASIC writes
+      nothing at all (SedaiBytecodeVM, bcPrintTab: the MODERN arm is skipped
+      unless FOutputDevice.IsScreenVisible). The host here is a byte sink, so
+      there is never a visible screen and the answer is always "nothing" - the
+      column does not move either, exactly as in the skipped arm.
+      ⛔ CLASSIC always emits the spaces, and that arm is unreachable: the target
+      is MODERN-only. ⚠️ NO differential can tell this apart from a defect,
+      because headless sb prints nothing either - it is right by CONSTRUCTION,
+      not by measurement, and the day the module gets a real screen it is the
+      first thing to revisit. }
+    ssaPrintTab, ssaPrintSpc: ;
+
+    { PRINT's comma: tab to the next zone, or start a new line when that zone
+      would fall off the end. The rule is GetNextTabPosition + the caTabZone arm
+      of the interpreter, with the MODERN numbers - and NOT a reading of what
+      FreeBASIC "should" do: the pair (14, 80) is written down in
+      SedaiBytecodeVM and was measured against sb before this was written.
+      ⭐ The pad goes out as ONE write, built in the digit scratch. That area is
+      only live inside printInt, and a comma is never inside one - so it is free
+      space rather than a place to be careful about. }
+    ssaPrintComma:
+      begin
+        // 0 = the next zone: ((col / 14) + 1) * 14, or 0 when it leaves the line
+        B.GlobalGet(FColG); B.I32Const(COMMA_TAB); B.Op(wopI32DivS);
+        B.I32Const(1); B.Op(wopI32Add);
+        B.I32Const(COMMA_TAB); B.Op(wopI32Mul);
+        B.LocalTee(FGfxN);
+        B.I32Const(SCREEN_COLS); B.Op(wopI32GeS);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.Call(FPrintNlFunc);              // ... and printNl zeroes the column
+        B.Op(wopElse);
+          // fill (next - col) spaces in the scratch, write them in one go
+          B.I32Const(4);
+          B.I32Const(Ord(' '));
+          B.LocalGet(FGfxN); B.GlobalGet(FColG); B.Op(wopI32Sub);
+          B.MemoryFill;
+          B.I32Const(4);
+          B.LocalGet(FGfxN); B.GlobalGet(FColG); B.Op(wopI32Sub);
+          B.Call(FWriteFunc);
+          B.LocalGet(FGfxN); B.GlobalSet(FColG);
+        B.EndOp;
+      end;
+
     { ---- strings ------------------------------------------------------ }
 
     { STR$(x) / Str(x) of a float. ⭐ It is the PRINT rendering with the spacing
@@ -6344,9 +6447,20 @@ begin
           B.I32Const(4); B.Op(wopI32Mul);
           B.Op(wopI32Add);
           B.OpMem(wopI32Load, 2, 0);
-          B.Op(wopI64ExtendI32S);
+          { ⛔ UNSIGNED, and it was signed until 9 Aug: a pixel is a 32-bit
+            COLOUR, and the interpreter widens it as one (GetPixel returns a
+            UInt32, which Int64() zero-extends). Sign-extending made
+            POINT(1,1) on an opaque red - $FF0000FF - come back as -16776961
+            where sb says 4278190335. Every colour with the alpha byte set, so
+            every ordinary one, and nothing in the corpus was reading a pixel
+            back until m162_rgb was measured. }
+          B.Op(wopI64ExtendI32U);
         B.Op(wopElse);
-          B.I64Const(-1);
+          { And out of bounds is ZERO, not -1: TGraphicsMemory.GetPixel returns 0
+            when ValidateCoordinates fails, so -1 was a value no interpreter run
+            can produce. Silent, because a guardian that reads a pixel outside
+            the screen is exactly what nobody writes. }
+          B.I64Const(0);
         B.EndOp;
         StoreReg(B, Instr.Dest);
       end;
@@ -6893,6 +7007,12 @@ begin
       FHaltFlag := FModule.DefineGlobal(wvtI32, True, Init);
       Init.Clear;
     end;
+    if FUsesCol then
+    begin
+      Init.I32Const(0);
+      FColG := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+    end;
     { One per bank a pointer call can return in. This IS the transfer bank's
       result slot, and it is a global for the same reason the shared slots are:
       the storage is the program's, not a frame's. A callee's own nested calls
@@ -6970,6 +7090,11 @@ begin
     FPrintUIntFunc := Next + 1;
     FPrintNlFunc := Next + 2;
     Inc(Next, 3);
+    if FUsesCol then           // conditional, so sequential and last in the block
+    begin
+      FEmitFunc := Next;
+      Inc(Next);
+    end;
   end;
   if FUsesHeap then
   begin
