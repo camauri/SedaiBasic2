@@ -156,6 +156,32 @@ type
     FBindLocal: array of LongWord;       // per bind, in emission order: saved base
     FBindWords: array of Integer;
 
+    { --- the multi-dimensional REDIM ---------------------------------------
+      "ReDim a(l0 TO u0, l1 TO u1)" lowers to one PUSH per bound and a commit,
+      and the interpreter accumulates the VALUES in a pending list.
+      ⛔ Reading the pushed REGISTERS back at the commit does not work, and the
+      failure is silent: a bound register is dead after its push, so the
+      allocator is free to give the next bound the same one. The value has to be
+      captured WHERE IT IS PUSHED.
+      ⭐ So each push gets its own LOCAL, pre-counted like the array binds - and
+      being per-activation it also makes a REDIM inside a recursive procedure
+      safe, which a shared pending area would not be. }
+    FRedimLocal: array of LongWord;      // per push, in emission order
+    FRedimSeq: Integer;                  // which push of this region is next
+    FRedimPend: array of record          // pushes seen and not yet committed
+      Local: LongWord;
+      IsLb: Boolean;
+    end;
+    { --- the runtime multi-dimensional INDEX --------------------------------
+      "a(i, j)" on an array whose shape is only known at run time pushes each
+      (already lower-bound-adjusted) index and resolves them against the array's
+      CURRENT dimensions. Same pairing and the same reason as the REDIM bounds:
+      captured at the push, into a local of its own. }
+    FIdxLocal: array of LongWord;        // per index push, in emission order
+    FIdxScratch: LongWord;               // i64: the running stride
+    FIdxSeq: Integer;
+    FIdxPend: array of LongWord;
+
     // --- graphics -------------------------------------------------------
     FUsesGfx: Boolean;
     FScrW, FScrH: LongWord;       // WASM globals holding the screen geometry
@@ -564,7 +590,9 @@ begin
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
           FUsesStr := True;
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
-        ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim:
+        ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim,
+        ssaArrayRedimPush, ssaArrayRedimN,
+        ssaArrayIdxPush, ssaArrayIdxResolve:
           FUsesArr := True;
         ssaPrintUsing, ssaPrintUsingInt:
           begin FUsesPU := True; FUsesStr := True; FUsesPrint := True;
@@ -5769,22 +5797,47 @@ begin
       DimCount, Dimensions[0] and LowerBounds[0] and leaves nothing else.
       ⭐ Not preserving costs NOTHING: a fresh block from the bump allocator is
       already zero, so "clear it" and "allocate it" are the same act. }
+    { One bound of a REDIM, captured into its own local. ⛔ Captured HERE and
+      not read back at the commit: after this instruction the bound's register
+      is dead, so the allocator may hand the next bound the same one - and the
+      commit would then reshape the array with one bound repeated, silently. }
+    ssaArrayRedimPush:
+      begin
+        if not BankIs(Instr.Src1, srtInt, 'ssaArrayRedimPush') then Exit(False);
+        if FRedimSeq > High(FRedimLocal) then
+          Exit(Fail('more REDIM bound pushes emitted than the pre-pass counted'));
+        LoadReg(B, Instr.Src1);
+        B.Op(wopI32WrapI64);
+        B.LocalSet(FRedimLocal[FRedimSeq]);
+        SetLength(FRedimPend, Length(FRedimPend) + 1);
+        FRedimPend[High(FRedimPend)].Local := FRedimLocal[FRedimSeq];
+        FRedimPend[High(FRedimPend)].IsLb :=
+          (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1);
+        Inc(FRedimSeq);
+      end;
+
     ssaArrayRedim:
       begin
         if Instr.Src1.Kind <> svkArrayRef then
           Exit(Fail('ssaArrayRedim without an array reference'));
         if Instr.Src3.Kind <> svkConstInt then
           Exit(Fail('ssaArrayRedim without constant flags'));
-        { ⚠️ A REDIM whose LOWER bound is a run-time value arrives as a preceding
-          ssaArrayRedimPush, and the interpreter lets that one win over the
-          flags. It cannot reach here: RedimPush is still uncovered, so such a
-          program is refused on THAT opcode first. ⛔ Whoever covers RedimPush
-          has to handle it - the flags alone would silently use the OLD lower
-          bound and put every element at the wrong index. }
         Desc := FArrDescOf[Instr.Src1.ArrayIndex];
         n := Integer(Instr.Src3.ConstInt);
+        { ⛔ A RUNTIME lower bound arrives as a preceding push, and it WINS over
+          the flags - the interpreter's rule, and the one thing that makes this
+          arm reachable now that pushes are covered. Reading the flags instead
+          would keep the OLD lower bound and put every element at the wrong
+          index, in silence. }
+        if Length(FRedimPend) > 0 then
+        begin
+          if (Length(FRedimPend) <> 1) or (not FRedimPend[0].IsLb) then
+            Exit(Fail('a single-dimension REDIM with bounds pushed for a different shape'));
+          B.LocalGet(FRedimPend[0].Local);
+          SetLength(FRedimPend, 0);
+        end
         // the lower bound: the explicit one, or the array's current one
-        if (n and 2) <> 0 then
+        else if (n and 2) <> 0 then
           B.I32Const(n shr 8)
         else
         begin
@@ -5888,6 +5941,153 @@ begin
         B.I64Const(RECPTR_TAG or Instr.Src3.ConstInt);
         B.Op(wopI64Or);
         StoreReg(B, Instr.Dest);
+      end;
+
+    { The multi-dimensional commit. The bounds arrived as pushes - all the LOWER
+      ones first when every dimension was written "lb TO ub", then all the
+      uppers - which is the order SedaiSSA lays them down, and the reason a mix
+      of "lb TO ub" and bare "ub" pushes NO lowers at all: a partial list would
+      be misaligned, so the old lower bounds are kept instead.
+      ⛔ The descriptor is 16 + 8*dim bytes and its size was fixed when the
+      module was laid out, so a REDIM that GROWS the dimension count would write
+      past it and into the next array's descriptor. It is decidable right here -
+      both counts are compile-time - so it is refused rather than discovered. }
+    ssaArrayRedimN:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayRedimN without an array reference'));
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('ssaArrayRedimN without constant flags'));
+        Desc := FArrDescOf[Instr.Src1.ArrayIndex];
+        Info := FProg.GetArray(Instr.Src1.ArrayIndex);
+        n := Integer(Instr.Src3.ConstInt);
+        // split the pending pushes into the lowers and the uppers
+        NStr := 0;                                   // how many are lower bounds
+        for k := 0 to High(FRedimPend) do
+          if FRedimPend[k].IsLb then Inc(NStr);
+        d := Length(FRedimPend) - NStr;              // and how many are uppers
+        if d = 0 then
+          Exit(Fail('ssaArrayRedimN with no upper bound pushed for it'));
+        if (NStr <> 0) and (NStr <> d) then
+          Exit(Fail('ssaArrayRedimN got a partial list of lower bounds'));
+        for k := 0 to NStr - 1 do
+          if not FRedimPend[k].IsLb then
+            Exit(Fail('ssaArrayRedimN got its lower bounds out of order'));
+        if d > Info.DimCount then
+          Exit(Fail(Format('"ReDim %s(...)" asks for %d dimensions where the array was ' +
+                           'declared with %d, and the descriptor was sized for that',
+                           [Info.Name, d, Info.DimCount])));
+
+        B.I32Const(1); B.LocalSet(FArrTmp);
+        for k := 0 to d - 1 do
+        begin
+          // the lower bound: the pushed one, or the dimension's current one
+          if NStr > 0 then
+            B.LocalGet(FRedimPend[k].Local)
+          else
+          begin
+            B.I32Const(LongInt(Desc + LongWord(16 + 8 * k)));
+            B.OpMem(wopI32Load, 2, 0);
+          end;
+          B.LocalSet(FRecTmp);
+          B.I32Const(LongInt(Desc + LongWord(16 + 8 * k)));
+          B.LocalGet(FRecTmp);
+          B.OpMem(wopI32Store, 2, 0);
+          // the size: ub - lb + 1, clamped at zero exactly as RedimArrayN clamps
+          B.LocalGet(FRedimPend[NStr + k].Local);
+          B.LocalGet(FRecTmp); B.Op(wopI32Sub);
+          B.I32Const(1); B.Op(wopI32Add);
+          B.LocalTee(FGfxN);
+          B.I32Const(0); B.Op(wopI32LtS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(0); B.LocalSet(FGfxN);
+          B.EndOp;
+          B.I32Const(LongInt(Desc + LongWord(20 + 8 * k)));
+          B.LocalGet(FGfxN);
+          B.OpMem(wopI32Store, 2, 0);
+          B.LocalGet(FArrTmp); B.LocalGet(FGfxN); B.Op(wopI32Mul);
+          B.LocalSet(FArrTmp);
+        end;
+
+        B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
+        B.Call(FAllocFunc); B.LocalSet(FGfxP);
+        if (n and 1) <> 0 then
+        begin
+          { PRESERVE keeps the flat element order up to the SMALLER of the two
+            sizes - SetLength's own rule, which is what the interpreter leans
+            on. ⚠️ The OLD total is still in the descriptor: nothing above has
+            touched +4, and it must be read before the store below. }
+          B.LocalGet(FGfxP);
+          B.I32Const(LongInt(Desc)); B.OpMem(wopI32Load, 2, 0);
+          B.I32Const(LongInt(Desc + 4)); B.OpMem(wopI32Load, 2, 0);
+          B.LocalTee(FGfxN);
+          B.LocalGet(FArrTmp);
+          B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(FArrTmp);
+          B.Op(wopElse);
+            B.LocalGet(FGfxN);
+          B.EndOp;
+          B.I32Const(8); B.Op(wopI32Mul);
+          B.MemoryCopy;
+        end;
+        B.I32Const(LongInt(Desc));      B.LocalGet(FGfxP);   B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 4));  B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
+        B.I32Const(LongInt(Desc + 8));  B.I32Const(d);       B.OpMem(wopI32Store, 2, 0);
+        SetLength(FRedimPend, 0);
+      end;
+
+    ssaArrayIdxPush:
+      begin
+        if not BankIs(Instr.Src1, srtInt, 'ssaArrayIdxPush') then Exit(False);
+        if FIdxSeq > High(FIdxLocal) then
+          Exit(Fail('more array index pushes emitted than the pre-pass counted'));
+        LoadReg(B, Instr.Src1);
+        B.LocalSet(FIdxLocal[FIdxSeq]);
+        SetLength(FIdxPend, Length(FIdxPend) + 1);
+        FIdxPend[High(FIdxPend)] := FIdxLocal[FIdxSeq];
+        Inc(FIdxSeq);
+      end;
+
+    { The row-major linear index, from the array's CURRENT dimensions - which is
+      the whole reason this exists rather than a compile-time formula: after a
+      REDIM the shape is not the declared one.
+      ⚠️ The inner product runs to the array's RUNTIME dimension count, not to
+      the number of indices pushed. That is the interpreter's loop transcribed,
+      and the two differ only for a program that indexes with the wrong arity -
+      where transcribing is the only way to agree with it. }
+    ssaArrayIdxResolve:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayIdxResolve without an array reference'));
+        if Length(FIdxPend) = 0 then
+          Exit(Fail('ssaArrayIdxResolve with no index pushed for it'));
+        Desc := FArrDescOf[Instr.Src1.ArrayIndex];
+        B.I64Const(0);                                  // the accumulator, on the stack
+        for k := 0 to High(FIdxPend) do
+        begin
+          B.I64Const(1); B.LocalSet(FIdxScratch);
+          B.I32Const(k + 1); B.LocalSet(FArrTmp);       // d = i + 1
+          B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(FArrTmp);
+              B.I32Const(LongInt(Desc + 8)); B.OpMem(wopI32Load, 2, 0);
+              B.Op(wopI32GeS); B.BrIf(1);
+              B.LocalGet(FIdxScratch);
+              B.I32Const(LongInt(Desc + 20));
+              B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
+              B.Op(wopI32Add);
+              B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+              B.Op(wopI64Mul); B.LocalSet(FIdxScratch);
+              B.LocalGet(FArrTmp); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(FArrTmp);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+          B.LocalGet(FIdxPend[k]); B.LocalGet(FIdxScratch); B.Op(wopI64Mul);
+          B.Op(wopI64Add);
+        end;
+        StoreReg(B, Instr.Dest);
+        SetLength(FIdxPend, 0);
       end;
 
     ssaArrayLBound, ssaArrayUBound:
@@ -6713,12 +6913,38 @@ begin
     the first byte of the body is written. }
   SetLength(FBindLocal, 0);
   SetLength(FBindWords, 0);
+  SetLength(FRedimLocal, 0);
+  SetLength(FIdxLocal, 0);
   for i := First to Last do
   begin
     Blk := FProg.Blocks[i];
     for j := 0 to Blk.Instructions.Count - 1 do
     begin
       Instr := TSSAInstruction(Blk.Instructions[j]);
+      { One i32 per REDIM bound push, same pre-pass and same reason: the local
+        list has to be complete before the first byte of the body. }
+      if Instr.OpCode = ssaArrayRedimPush then
+      begin
+        SetLength(FRedimLocal, Length(FRedimLocal) + 1);
+        FRedimLocal[High(FRedimLocal)] := LongWord(k);
+        SetLength(Locals, Length(Locals) + 1);
+        Locals[High(Locals)] := wvtI32;
+        Inc(k);
+        Continue;
+      end;
+      { And one i64 per runtime index push. i64 because an index IS one: the
+        array helpers take it that way, and the row-major product is computed at
+        that width so a large array cannot overflow the arithmetic that finds
+        its element. }
+      if Instr.OpCode = ssaArrayIdxPush then
+      begin
+        SetLength(FIdxLocal, Length(FIdxLocal) + 1);
+        FIdxLocal[High(FIdxLocal)] := LongWord(k);
+        SetLength(Locals, Length(Locals) + 1);
+        Locals[High(Locals)] := wvtI64;
+        Inc(k);
+        Continue;
+      end;
       if Instr.OpCode <> ssaArrayBind then Continue;
       if (Instr.Src1.Kind <> svkArrayRef) or (Instr.Src1.ArrayIndex < 0) or
          (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then
@@ -6735,6 +6961,18 @@ begin
         Inc(k);
       end;
     end;
+  end;
+  { The row-major stride, and ONLY when this region resolves a runtime index.
+    ⚠️ Allocated unconditionally at first, which silently changed every module in
+    the corpus - including a published demo artifact - for a local that nearly
+    nothing uses. A local costs a byte in the table and a shifted index for
+    everything after it: "always" is not free. }
+  if Length(FIdxLocal) > 0 then
+  begin
+    FIdxScratch := LongWord(k);
+    SetLength(Locals, Length(Locals) + 1);
+    Locals[High(Locals)] := wvtI64;
+    Inc(k);
   end;
   N := Last - First + 1;                       // restored: the pre-pass reused it
 
@@ -6758,6 +6996,10 @@ begin
   FBindTop := 0;
   FBindSeq := 0;
   SetLength(FBindStack, 0);
+  FRedimSeq := 0;
+  SetLength(FRedimPend, 0);
+  FIdxSeq := 0;
+  SetLength(FIdxPend, 0);
 
   D := TWasmDispatch.Create(N, FStateLocal);
   Body := TWasmBuf.Create;
@@ -6892,6 +7134,16 @@ begin
     end;
 
     D.Emit(Body, 0);
+    { ⛔ A bound pushed and never committed means the pairing this rests on does
+      not hold for this program - a push and its commit landed in different
+      regions, or control flow got between them. Refuse: the alternative is a
+      REDIM built from whichever bounds happened to be pending. }
+    if Length(FRedimPend) > 0 then
+      Exit(Fail(Format('region "%s" pushes a REDIM bound that no commit consumes',
+                       [FRegionName[R]])));
+    if Length(FIdxPend) > 0 then
+      Exit(Fail(Format('region "%s" pushes an array index that no resolve consumes',
+                       [FRegionName[R]])));
     // The region is left only by an explicit return, so anything after it is
     // unreachable - but the validator still wants the function to type-check.
     Body.Op(wopUnreachable);
