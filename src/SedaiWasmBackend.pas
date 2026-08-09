@@ -6827,6 +6827,8 @@ var
   Locals: TWasmValTypeArray;
   Terminated: Boolean;
   CalleeRegion: Integer;
+  FalseTarget: Integer;
+  NextInstr: TSSAInstruction;
 
   procedure PushArgs(Callee: Integer);
   // The arguments are already in this region's slot locals, put there by the
@@ -7032,15 +7034,42 @@ begin
           ssaJumpIfZero, ssaJumpIfNotZero:
             begin
               Target := BlockOfLabel(Instr.Dest.LabelName) - First;
-              if i + 1 >= N then
-                Exit(Fail(Format('a conditional jump in block "%s" has no following block',
-                                 [Blk.LabelName])));
+              { ⛔⛔ THE FALSE SIDE IS NOT ALWAYS THE NEXT BLOCK. It used to be
+                hard-coded to i + 1, and that is a MISCOMPILATION whenever a
+                block ends with a conditional jump AND an unconditional one
+                after it - which is how the SSA writes "if the test fails, go
+                somewhere that is not next". Taking the conditional and dropping
+                the jump sent the false path to whatever block happened to be
+                laid out next, and when that block was the TRUE target both
+                sides went there: the test was emitted, evaluated, and had no
+                effect at all.
+                ⚠️ MEASURED, not imagined: "ReDim Preserve" on an array of UDT
+                re-ran the per-element construction guarded by exactly this
+                shape, so every element was rebuilt and its data lost - while
+                the probe it branched on was read correctly. The guard was
+                right, the branch went both ways.
+                ⇒ An ssaJump immediately after the conditional NAMES the false
+                target; only without one does the block fall through. }
+              FalseTarget := -1;
+              if j + 1 < Blk.Instructions.Count then
+              begin
+                NextInstr := TSSAInstruction(Blk.Instructions[j + 1]);
+                if (NextInstr.OpCode = ssaJump) and (NextInstr.Dest.Kind = svkLabel) then
+                  FalseTarget := BlockOfLabel(NextInstr.Dest.LabelName) - First;
+              end;
+              if FalseTarget < 0 then
+              begin
+                if i + 1 >= N then
+                  Exit(Fail(Format('a conditional jump in block "%s" has no following block',
+                                   [Blk.LabelName])));
+                FalseTarget := i + 1;
+              end;
               LoadReg(B, Instr.Src1);
               B.Op(wopI64Eqz);               // i32: "the value is zero"
               if Instr.OpCode = ssaJumpIfZero then
-                D.EmitBranch(i, Target, i + 1)
+                D.EmitBranch(i, Target, FalseTarget)
               else
-                D.EmitBranch(i, i + 1, Target);
+                D.EmitBranch(i, FalseTarget, Target);
               Terminated := True;
             end;
           ssaCallSub:
