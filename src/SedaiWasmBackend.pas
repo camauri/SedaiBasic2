@@ -214,6 +214,29 @@ type
     FArrTabBytes: AnsiString;
     FRefLoad, FRefStore: array[TSSARegisterType] of LongWord;
 
+    { --- FUNCTION POINTERS ------------------------------------------------
+      ⛔ THE TABLE WAS NEVER THE HARD PART - THE SIGNATURE IS. Natively an
+      indirect call jumps to an entry PC and the arguments travel through the
+      transfer bank, so no two procedures need to agree on anything. WASM checks
+      the type at every call_indirect, so the callee's signature has to be known
+      where the CALLER stands - and there the target is a value.
+      ⇒ Every procedure whose address is taken is given ONE signature: the union
+      of what the indirect call sites stage and of what those procedures already
+      take. They then share a type index, and a call through any of them
+      matches. Where that union cannot be built - two of them returning
+      different banks - the program is REFUSED, because the alternative is a
+      module that traps on a call that was perfectly well defined natively.
+      ⭐ A function pointer's VALUE is the region index (its slot in the table),
+      not an entry PC: the two are equally opaque to a program, and this one is
+      the only one WASM can call. }
+    FIndirect: Boolean;
+    FAddrTaken: array of Boolean;
+    FIndParam: array[TSSARegisterType] of Integer;
+    FIndTypeIdx: LongWord;
+    FIndResUsed: array[TSSARegisterType] of Boolean;
+    FIndResGlobal: array[TSSARegisterType] of LongWord;
+    FThunkIdx: array of LongWord;         // region -> its table entry
+
     // --- float printing -------------------------------------------------
     FUsesFlt: Boolean;
     FFltDigits: Integer;             // "OPTION DIGITS n"; 16 unless the source said otherwise
@@ -256,6 +279,7 @@ type
     procedure EmitArrayHelpers;
     procedure EmitRecordHelpers;
     procedure EmitRefHelpers;
+    procedure EmitThunks;
     procedure EmitFloatHelpers;
     procedure EmitFloatPrint;
     procedure PushOutSlots(B: TWasmBuf; R: Integer);
@@ -468,6 +492,9 @@ begin
   FUsesArr := False;
   FUsesRecArr := False;
   FUsesPtr := False;
+  FIndirect := False;
+  SetLength(FAddrTaken, FRegionCount);
+  for i := 0 to FRegionCount - 1 do FAddrTaken[i] := False;
   FUsesFlt := False;
   FUsesVal := False;
   FUsesValInt := False;
@@ -546,6 +573,22 @@ begin
           begin FUsesPtr := True; FUsesArr := True; FUsesStr := True; end;
         ssaRefAddrField:
           begin FUsesPtr := True; FUsesArr := True; FUsesRec := True; end;
+        { A procedure whose address is taken goes into the function table, and
+          both halves of the pair raise the flag: a program can take an address
+          it never calls, and it can call through a pointer that arrived in a
+          UDT field or an array element without an ssaLoadProcAddr in sight. }
+        ssaLoadProcAddr:
+          begin
+            FIndirect := True;
+            if Ins.Src1.Kind = svkLabel then
+            begin
+              k := BlockOfLabel(Ins.Src1.LabelName);
+              if (k >= 0) and (k < Length(FRegionOf)) then
+                FAddrTaken[FRegionOf[k]] := True;
+            end;
+          end;
+        ssaCallSubIndirect:
+          FIndirect := True;
       end;
       NoteConst(Ins.Src1); NoteConst(Ins.Src2); NoteConst(Ins.Src3);
     end;
@@ -3057,6 +3100,56 @@ begin
   end;
 end;
 
+{ ---------------- the function table ----------------
+
+  One thunk per address-taken procedure, all of them sharing the type a
+  call_indirect names. A thunk takes the UNION of the parameters, hands its
+  callee the ones that callee declares - slots are positional per bank, so the
+  first n of each bank are exactly its own - and moves the result into the
+  global for its bank.
+
+  ⭐ Why a thunk instead of putting the procedures in the table directly: their
+  signatures genuinely differ, and a real program proves it rather than a worry
+  about one (m217_funcptr composes Integer, Double and String pointers in the
+  same file). The uniform half is the parameters, which pad; the result is what
+  cannot, so it leaves the type and travels the way the interpreter already
+  carries it - through the transfer bank, which is global storage. }
+
+procedure TWasmBackend.EmitThunks;
+var
+  B: TWasmBuf;
+  r, n: Integer;
+  RT: TSSARegisterType;
+  Base: LongWord;
+begin
+  for r := 1 to FRegionCount - 1 do
+  begin
+    if not FAddrTaken[r] then Continue;
+    B := TWasmBuf.Create;
+    try
+      Base := 0;
+      for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+      begin
+        for n := 0 to FParamCount[r][RT] - 1 do
+          B.LocalGet(Base + LongWord(n));
+        Inc(Base, LongWord(FIndParam[RT]));
+      end;
+      B.Call(FFuncIdx[r]);
+      // a SUB carries nothing back, and its caller reads nothing
+      if FResultBank[r] >= 0 then
+        B.GlobalSet(FIndResGlobal[TSSARegisterType(FResultBank[r])]);
+      { ⛔ The index is the one RESERVED in Compile, not the one AddFunction
+        hands back: the table's elem segment is written before a single function
+        body exists, so the two have to be agreed in advance. They are the same
+        number as long as the reservation and this loop walk the regions in the
+        same order - which is the rule the whole helper numbering follows. }
+      FModule.AddFunction(FIndTypeIdx, [], B);
+    finally
+      B.Free;
+    end;
+  end;
+end;
+
 { ---------------- FreeBASIC pointers ----------------
 
   Two kinds of pointer share these six helpers, told apart by bit 63 exactly as
@@ -3849,9 +3942,20 @@ begin
                            [Instr.Dest.LabelName])));
         IsEntry[B] := True;
       end
-      else if Instr.OpCode = ssaCallSubIndirect then
-        Exit(Fail('ssaCallSubIndirect (a function pointer call) is not covered yet: ' +
-                  'it needs the function table and a signature for the callee'));
+      { ⛔ A procedure whose address is TAKEN is an entry too, and forgetting it
+        is not a missing feature but a miscompilation: a SUB that is only ever
+        called through a pointer has no ssaCallSub naming it, so without this it
+        would be folded into whatever region its blocks happen to follow - and
+        the table would then hold a function that is the wrong half of somebody
+        else's body. }
+      else if (Instr.OpCode = ssaLoadProcAddr) and (Instr.Src1.Kind = svkLabel) then
+      begin
+        B := BlockOfLabel(Instr.Src1.LabelName);
+        if B < 0 then
+          Exit(Fail(Format('the address of "%s" is taken, but it is not a block in this program',
+                           [Instr.Src1.LabelName])));
+        IsEntry[B] := True;
+      end;
     end;
   end;
   IsEntry[0] := True;                       // region 0 is the module
@@ -4267,6 +4371,8 @@ var
   Params: TWasmValTypeArray;
   Res: TWasmValTypeArray;
   n, p: Integer;
+  TargetInd: Boolean;
+  IndParams, IndRes: TWasmValTypeArray;
 
   procedure Widen(Region: Integer; Bank: TSSARegisterType; ASlot: Integer);
   begin
@@ -4299,6 +4405,7 @@ var
   end;
 
 begin
+  for RT := Low(TSSARegisterType) to High(TSSARegisterType) do FIndParam[RT] := 0;
   // The callee's loads and the caller's stores both name (bank, slot), so the
   // signature is the union of the two - a parameter the body never reads still
   // has to be in the type, or the call site would not match.
@@ -4307,16 +4414,28 @@ begin
     Blk := FProg.Blocks[i];
     r := FRegionOf[i];
     Target := -1;
+    TargetInd := False;
     for j := Blk.Instructions.Count - 1 downto 0 do
     begin
       Instr := TSSAInstruction(Blk.Instructions[j]);
       if (Instr.OpCode = ssaCallSub) and (Instr.Dest.Kind = svkLabel) then
       begin
         Target := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)];
+        TargetInd := False;
         // record the call-graph edge while we are here
         n := Length(FCalls[r]);
         SetLength(FCalls[r], n + 1);
         FCalls[r][n] := Target;
+      end
+      else if Instr.OpCode = ssaCallSubIndirect then
+      begin
+        { ⛔ Target MUST be cleared here. Walking backwards, a store sees the
+          call BELOW it - and without this an argument staged for an indirect
+          call would have been credited to whatever direct call happened to
+          follow, widening a signature that has nothing to do with it. The
+          slots go to the shared indirect signature instead. }
+        Target := -1;
+        TargetInd := True;
       end
       else if XferBank(Instr.OpCode, RT) then
       begin
@@ -4362,6 +4481,10 @@ begin
         begin
           if Slot = WASM_XFER_RESULT_SLOT then
             FResultBank[r] := Ord(RT)              // the callee writes its result
+          else if TargetInd then
+          begin
+            if Slot + 1 > FIndParam[RT] then FIndParam[RT] := Slot + 1;
+          end
           else if Target >= 0 then
             Widen(Target, RT, Slot);               // staged for the call below
           { A non-result store with no call after it IN THIS BLOCK. Two very
@@ -4416,7 +4539,25 @@ begin
     begin
       Instr := TSSAInstruction(Blk.Instructions[j]);
       if (Instr.OpCode = ssaCallSub) and (Instr.Dest.Kind = svkLabel) then
-        Target := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)]
+      begin
+        Target := FRegionOf[BlockOfLabel(Instr.Dest.LabelName)];
+        TargetInd := False;
+      end
+      else if Instr.OpCode = ssaCallSubIndirect then
+      begin
+        // the result read after THIS call belongs to the shared signature, and
+        // to no direct callee - the same clearing as in the backward pass
+        Target := -1;
+        TargetInd := True;
+      end
+      else if TargetInd and
+              OpIn(Instr.OpCode, [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString]) and
+              SlotOf(Instr, Slot) and (Slot = WASM_XFER_RESULT_SLOT) then
+        { ⛔ SWALLOWED ON PURPOSE, and the branch has to exist even though it
+          does nothing: the result of an INDIRECT call belongs to no region, and
+          without this arm it would fall through to the ones below and be
+          credited to whichever direct callee came before. The bank it arrives
+          in is decided per call site, by the load itself, not by a signature. }
       else if OpIn(Instr.OpCode, [ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString]) and
               XferBank(Instr.OpCode, RT) and SlotOf(Instr, Slot) and
               (Slot <> WASM_XFER_RESULT_SLOT) and (not IsSharedSlot(Slot)) and
@@ -4461,8 +4602,61 @@ begin
           ⚠️ Deliberately ANY store, result slot included: inlined code writes
           slot 255 too, and a region that has just written its own result is not
           reading a call's either. }
+      begin
         Target := -1;
+        TargetInd := False;
+      end;
     end;
+  end;
+
+  { ---- ONE type for everything the table can hold ---------------------------
+
+    A call_indirect names a TYPE, so every entry the table can reach has to have
+    the same one - and the first attempt, "give every address-taken procedure
+    one signature", DIED ON A REAL PROGRAM: m217_funcptr composes an
+    Integer->Integer, a (Double,Double)->Double and a String->String through
+    pointers in the same file. There is no single WASM signature for those.
+
+    ⭐ The way out was already in the design: the RESULT does not have to be a
+    WASM result. The interpreter's transfer bank is global storage, slot 255
+    included, so a callee writing its result into a GLOBAL is the faithful
+    model and not a workaround. That takes the return type out of the signature
+    entirely, and what is left - the parameters - CAN be unified by padding,
+    because slots are positional per bank and an extra one is simply ignored.
+
+    ⇒ Every address-taken procedure gets the union of the parameter counts, and
+    a THUNK (emitted later) with the shared type: it passes on the parameters
+    its own callee declares and moves the result into the bank's global. The
+    caller reads the global of the bank IT expects, which is the bank the BASIC
+    type system already agreed on.
+
+    ⛔ BYREF copy-out is still refused: it leaves as extra RESULTS, so it is part
+    of the type, and an indirect call site cannot know which slots to pop. }
+  if FIndirect then
+  begin
+    for r := 0 to FRegionCount - 1 do
+      if FAddrTaken[r] then
+      begin
+        for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+          if FParamCount[r][RT] > FIndParam[RT] then FIndParam[RT] := FParamCount[r][RT];
+        for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+          for n := 0 to Length(FOutSlot[r][RT]) - 1 do
+            if FOutSlot[r][RT][n] then
+              Exit(Fail(Format('procedure "%s" is used as a function pointer and writes a ' +
+                               'parameter back to its caller; a BYREF result cannot travel ' +
+                               'through an indirect call here', [FRegionName[r]])));
+      end;
+    { ⛔ The union is applied to the PROCEDURES too, and it is not cosmetic: a
+      procedure called ONLY through a pointer has no ssaCallSub naming it, so
+      Widen never saw it and its arity would be ZERO - the thunk would pass
+      nothing and the body would read its parameters as zeros, in silence. }
+    for r := 1 to FRegionCount - 1 do
+      if FAddrTaken[r] then
+        for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+        begin
+          FParamCount[r][RT] := FIndParam[RT];
+          if FIndParam[RT] > FSlotCount[r][RT] then FSlotCount[r][RT] := FIndParam[RT];
+        end;
   end;
 
   for r := 0 to FRegionCount - 1 do
@@ -4522,6 +4716,27 @@ begin
           if FOutSlot[r][RT][n] then
             WriteLn(ErrOutput, Format('WASMDIAG    byref out: bank %d slot %d', [Ord(RT), n]));
     end;
+  end;
+
+  { The shared type: the union of the parameters, in the same bank order every
+    signature uses, and NO result - the result travels in a global. }
+  if FIndirect then
+  begin
+    SetLength(IndParams, 0);
+    p := 0;
+    for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+      for n := 0 to FIndParam[RT] - 1 do
+      begin
+        SetLength(IndParams, p + 1);
+        IndParams[p] := BankType[RT];
+        Inc(p);
+      end;
+    SetLength(IndRes, 0);
+    FIndTypeIdx := FModule.TypeIndex(IndParams, IndRes);
+    // which banks a pointer call can bring a result back in
+    for r := 1 to FRegionCount - 1 do
+      if FAddrTaken[r] and (FResultBank[r] >= 0) then
+        FIndResUsed[TSSARegisterType(FResultBank[r])] := True;
   end;
   Result := True;
 end;
@@ -5401,6 +5616,22 @@ begin
         B.I32Const(LongInt(Desc + 20)); B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
       end;
 
+    { A procedure's address IS its slot in the function table, which is its
+      region index. Natively the same value is a bytecode entry PC: both are
+      opaque numbers a program can only pass around and call through, and this
+      one is the only one an engine can dispatch on. }
+    ssaLoadProcAddr:
+      begin
+        if Instr.Src1.Kind <> svkLabel then
+          Exit(Fail('ssaLoadProcAddr without a procedure label'));
+        n := BlockOfLabel(Instr.Src1.LabelName);
+        if (n < 0) or (n >= Length(FRegionOf)) then
+          Exit(Fail(Format('ssaLoadProcAddr names "%s", which is not a procedure in this module',
+                           [Instr.Src1.LabelName])));
+        B.I64Const(FRegionOf[n]);
+        StoreReg(B, Instr.Dest);
+      end;
+
     { ---- FreeBASIC pointers -------------------------------------------
 
       The ADDRESS side needs no opcode at all and that is worth saying: "@x"
@@ -5752,6 +5983,22 @@ begin
 
     ssaLoadConstInt:
       begin
+        { ⛔ "@Sin" and its family are not procedure addresses at all: the SSA
+          folds them into a CONSTANT carrying BUILTIN_FP_TAG, and the
+          interpreter's indirect call recognises the tag and computes the
+          operation without jumping anywhere. There is no function to put in the
+          table, so this is refused - and refused where the value is BUILT,
+          which names the line, rather than at the call that would trap.
+          ⚠️ Gated on the program having an indirect call: the same bit pattern
+          is a perfectly ordinary integer for a program that never calls
+          through it. }
+        if FIndirect and (Instr.Src1.Kind = svkConstInt) and
+           ((Instr.Src1.ConstInt and BUILTIN_FP_TAG) <> 0) and
+           ((Instr.Src1.ConstInt and not (BUILTIN_FP_TAG or $FF)) = 0) then
+          Exit(Fail(Format('the address of a math builtin ("@Sin" and its family) is a ' +
+                           'tagged sentinel the interpreter interprets, not a procedure ' +
+                           'this backend can put in a function table (line %d)',
+                           [Instr.SourceLine])));
         if Instr.Src1.Kind = svkConstInt then B.I64Const(Instr.Src1.ConstInt)
         else Exit(Fail('ssaLoadConstInt without an integer constant'));
         if not BankIs(Instr.Dest, srtInt, 'ssaLoadConstInt') then Exit(False);
@@ -6178,6 +6425,26 @@ var
           end;
   end;
 
+  procedure PushArgsInd;
+  // The same, against the SHARED signature: an indirect call has no callee to
+  // ask, which is the whole reason that signature exists.
+  var
+    Bank: TSSARegisterType;
+    s: Integer;
+  begin
+    for Bank := Low(TSSARegisterType) to High(TSSARegisterType) do
+      for s := 0 to FIndParam[Bank] - 1 do
+        if s < FSlotCount[R][Bank] then
+          B.LocalGet(FSlotBase[Bank] + LongWord(s))
+        else
+          case Bank of
+            srtFloat:  B.F64Const(0);
+            srtString: B.I32Const(0);
+          else
+            B.I64Const(0);
+          end;
+  end;
+
 begin
   First := FRegionFirst[R];
   Last := FRegionLast[R];
@@ -6330,6 +6597,41 @@ begin
                 B.EndOp;
               end;
             end;
+          { The same call, with the callee arriving as a VALUE. The arguments go
+            up the same way - they are already in this region's slot locals -
+            and the table index goes last, which is where call_indirect wants
+            it. The type is the shared one every table entry was given.
+            ⚠️ No PopOutSlots: an address-taken procedure with byref copy-out was
+            refused in BuildSignatures, so there is nothing to pop and nothing
+            here has to guess which slots it would have been. }
+          ssaCallSubIndirect:
+            begin
+              if not BankIs(Instr.Src1, srtInt, 'ssaCallSubIndirect target') then
+                Exit(False);
+              PushArgsInd;
+              LoadReg(B, Instr.Src1);
+              B.Op(wopI32WrapI64);
+              B.CallIndirect(FIndTypeIdx);
+              { Every bank a pointer call can answer in, moved from its global
+                into the result temporary the ssaXferLoad after this call will
+                read. Which one that is belongs to the CALLER, and it already
+                knows: the load names its own bank. Copying all of them costs at
+                most three instructions and removes the question. }
+              for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+                if FIndResUsed[RT] then
+                begin
+                  B.GlobalGet(FIndResGlobal[RT]);
+                  B.LocalSet(FResultTmp[RT]);
+                end;
+              if FUsesHalt then
+              begin
+                B.GlobalGet(FHaltFlag);
+                B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                  EmitReturnValues(B, R);
+                  B.Op(wopReturn);
+                B.EndOp;
+              end;
+            end;
           ssaReturnSub:
             begin
               EmitReturnValues(B, R);
@@ -6383,6 +6685,7 @@ var
   RT: TSSARegisterType;
   Next: LongWord;
   Init: TWasmBuf;
+  TabFuncs: array of LongWord;
 begin
   FError := '';
   { ⛔ THE WASM TARGET IS MODERN-ONLY. A project rule, decided 7 Aug 2026, and it
@@ -6480,6 +6783,23 @@ begin
       FHaltFlag := FModule.DefineGlobal(wvtI32, True, Init);
       Init.Clear;
     end;
+    { One per bank a pointer call can return in. This IS the transfer bank's
+      result slot, and it is a global for the same reason the shared slots are:
+      the storage is the program's, not a frame's. A callee's own nested calls
+      cannot clobber it, because the caller reads it immediately on return -
+      before anything else can be staged. }
+    for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+      if FIndResUsed[RT] then
+      begin
+        case RT of
+          srtFloat:  Init.F64Const(0);
+          srtString: Init.I32Const(0);
+        else
+          Init.I64Const(0);
+        end;
+        FIndResGlobal[RT] := FModule.DefineGlobal(BankType[RT], True, Init);
+        Init.Clear;
+      end;
     if FUsesHeap then
     begin
       Init.I32Const(LongInt(FHeapBase));
@@ -6523,6 +6843,17 @@ begin
   // nothing checks it: getting it wrong calls the wrong function with the right
   // types, which validates.
   Next := FImportCount + LongWord(FRegionCount);
+  { ⛔ FIRST, because EmitThunks runs immediately after the regions and before
+    every helper. Reserved rather than read back from AddFunction: the table's
+    elem segment is written before any body exists. }
+  SetLength(FThunkIdx, FRegionCount);
+  if FIndirect then
+    for r := 1 to FRegionCount - 1 do
+      if FAddrTaken[r] then
+      begin
+        FThunkIdx[r] := Next;
+        Inc(Next);
+      end;
   if FUsesPrint then
   begin
     FPrintIntFunc := Next;
@@ -6637,8 +6968,27 @@ begin
     Inc(Next, 2);
   end;
 
+  { The function table. ⭐ It holds EVERY region rather than only the
+    address-taken ones, and the reason is a defect avoided rather than laziness:
+    with a compacted table the value of a function pointer would depend on which
+    OTHER procedures had their address taken, so adding a "@f" anywhere would
+    renumber pointers everywhere. With the region index as the slot, a pointer
+    means the same thing wherever it is built - and the cost is one funcref per
+    procedure. Region 0 (main) sits at index 0 and nothing can reach it: its
+    address cannot be taken. }
+  if FIndirect then
+  begin
+    SetLength(TabFuncs, FRegionCount);
+    for r := 0 to FRegionCount - 1 do
+      if FAddrTaken[r] and (r <> 0) then TabFuncs[r] := FThunkIdx[r]
+      else TabFuncs[r] := FFuncIdx[r];   // reachable only by a wrong index, and it TRAPS
+    FModule.DefineTable(LongWord(FRegionCount), LongWord(FRegionCount));
+    FModule.ElemFuncs(0, TabFuncs);
+  end;
+
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
+  if FIndirect then EmitThunks;
   if FUsesPrint then EmitPrintHelpers;
   if FUsesHeap then EmitHeapHelpers;
   if FUsesStr then EmitStringHelpers;
