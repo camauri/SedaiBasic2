@@ -613,7 +613,8 @@ begin
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
         ssaStrSpace, ssaStrString, ssaStrUCase, ssaStrLCase, ssaStrInstr,
         ssaCommand,
-        ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+        ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
+        ssaStrMidAssign:
           FUsesStr := True;
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
         ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim,
@@ -5543,7 +5544,67 @@ begin
       are incompatible with handles that alias, which is what ssaCopyString
       makes. Covering them wants either a copy on write or a real ownership
       model, and until then a refusal is the only honest answer. }
-    ssaStrAppendMapped, ssaStrMidAssign, ssaStrConcatCharAt:
+    { The MID STATEMENT: overwrite Len(Src2) bytes of the string at Src3, in
+      place, never changing its length. In place is exactly what this backend
+      cannot do - a handle can be shared by several registers, and ssaCopyString
+      copies the handle - so the string is COPIED first and the copy is what
+      gets written. That is copy-on-write done at the write site: correct
+      however the handles alias, and it needs no ownership bookkeeping at all.
+      ⚠️ THE PRICE IS DECLARED, not hidden: one allocation per assignment, where
+      the interpreter writes into the buffer it already has. A loop filling a
+      long string one character at a time therefore allocates quadratically, and
+      the allocator never frees - the v1 limit this whole subsystem already
+      carries. ⭐ The way out, when it is worth it, is a SHARED bit in the string
+      header: strNew makes an owned string, ssaCopyString marks it shared, and
+      only a shared one has to be copied here.
+      ⛔ The clamps are the interpreter's, and both matter: a start outside
+      1..Len writes NOTHING (fbc leaves the string untouched there, where the
+      old rebuild used to prepend and grow it), and the replacement is cut to
+      the room that remains. }
+    ssaStrMidAssign:
+      begin
+        if not BankIs(Instr.Dest, srtString, 'ssaStrMidAssign target') then Exit(False);
+        if not BankIs(Instr.Src1, srtString, 'ssaStrMidAssign source') then Exit(False);
+        if not BankIs(Instr.Src2, srtString, 'ssaStrMidAssign replacement') then Exit(False);
+        if not FHasDescTmp then
+          Exit(Fail('ssaStrMidAssign with no scratch local reserved for this region'));
+        // the copy: new = strNew(len(src)), bytes moved over
+        LoadReg(B, Instr.Src1); B.LocalTee(FRecTmp);
+        B.OpMem(wopI32Load, 2, 0); B.LocalTee(FGfxN);
+        B.Call(FStrNewFunc); B.LocalSet(FGfxP);
+        B.LocalGet(FGfxP); B.I32Const(4); B.Op(wopI32Add);
+        B.LocalGet(FRecTmp); B.I32Const(4); B.Op(wopI32Add);
+        B.LocalGet(FGfxN);
+        B.MemoryCopy;
+        // the start position, 1-based
+        LoadReg(B, Instr.Src3); B.Op(wopI32WrapI64); B.LocalSet(FArrTmp);
+        B.LocalGet(FArrTmp); B.I32Const(1); B.Op(wopI32GeS);
+        B.LocalGet(FArrTmp); B.LocalGet(FGfxN); B.Op(wopI32LeS);
+        B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          // avail = len - pos + 1, and the replacement is cut to it
+          B.LocalGet(FGfxN); B.LocalGet(FArrTmp); B.Op(wopI32Sub);
+          B.I32Const(1); B.Op(wopI32Add); B.LocalSet(FGfxN);
+          LoadReg(B, Instr.Src2); B.LocalTee(FRecTmp);
+          B.OpMem(wopI32Load, 2, 0); B.LocalTee(FDescTmp);
+          B.LocalGet(FGfxN); B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(FGfxN); B.LocalSet(FDescTmp);
+          B.EndOp;
+          B.LocalGet(FDescTmp); B.I32Const(0); B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(FGfxP); B.I32Const(4); B.Op(wopI32Add);
+            B.LocalGet(FArrTmp); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Sub);
+            B.LocalGet(FRecTmp); B.I32Const(4); B.Op(wopI32Add);
+            B.LocalGet(FDescTmp);
+            B.MemoryCopy;
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(FGfxP);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrAppendMapped, ssaStrConcatCharAt:
       Exit(Fail(Format('%s mutates a string in place, and in this backend a ' +
                        'string handle can be shared by several registers - ' +
                        'covering it needs copy-on-write first (line %d)',
@@ -7222,7 +7283,8 @@ begin
               [ssaArrayRedimN, ssaMemberArrayRedim, ssaRecordNewArrayInd,
                ssaArrayLoadIndInt, ssaArrayLoadIndFloat, ssaArrayLoadIndString,
                ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
-               ssaArrayLBoundInd, ssaArrayUBoundInd, ssaArrayIdxResolveInd]) then
+               ssaArrayLBoundInd, ssaArrayUBoundInd, ssaArrayIdxResolveInd,
+               ssaStrMidAssign]) then
       begin
         FHasDescTmp := True;
         Break;
