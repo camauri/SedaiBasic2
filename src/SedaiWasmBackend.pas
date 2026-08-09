@@ -181,6 +181,18 @@ type
     FIdxScratch: LongWord;               // i64: the running stride
     FIdxSeq: Integer;
     FIdxPend: array of LongWord;
+    { --- an array that is a MEMBER of a UDT ---------------------------------
+      ⭐ The reduction that makes this family small: in this backend a
+      descriptor is ALREADY an i32 address that every array helper takes as a
+      parameter. A member array is therefore the same code with the descriptor
+      coming from a REGISTER instead of a compile-time constant - the
+      descriptor lives on the heap, one per record instance, and the record's
+      field holds its address.
+      ⚠️ Natively that field holds an INDEX into the VM's array table. Same
+      trade as a record-field pointer: the number differs, and nothing but
+      printing it could tell. }
+    FDescTmp: LongWord;                  // i32: the descriptor being reshaped
+    FHasDescTmp: Boolean;
 
     // --- graphics -------------------------------------------------------
     FUsesGfx: Boolean;
@@ -316,6 +328,9 @@ type
     procedure EmitRecordHelpers;
     procedure EmitRefHelpers;
     procedure EmitThunks;
+    procedure EmitRedimShape(B: TWasmBuf; Preserve: Boolean; NLower, NUpper: Integer);
+    procedure LoadMemberDesc(B: TWasmBuf; const Handle: TSSAValue; Enc: Integer;
+                             Allocate: Boolean);
     procedure EmitFloatHelpers;
     procedure EmitFloatPrint;
     procedure PushOutSlots(B: TWasmBuf; R: Integer);
@@ -375,6 +390,10 @@ implementation
 
 const
   BankType: array[TSSARegisterType] of TWasmValType = (wvtI64, wvtF64, wvtI32);
+  { The same three banks as a BLOCK type, for an if/else that has to leave a
+    value of the bank's width on the stack. }
+  BlockTypeOf: array[TSSARegisterType] of Byte =
+    (WASM_TYPE_I64, WASM_TYPE_F64, WASM_TYPE_I32);
 
   { ---- the linear memory map ----------------------------------------------
 
@@ -475,6 +494,13 @@ const
     and it is not reachable here: the target is MODERN-only. }
   COMMA_TAB    = 14;
   SCREEN_COLS  = 80;
+
+  { How many dimensions a UDT member array's descriptor is sized for. A declared
+    array's descriptor is sized from its own DimCount because that is written in
+    the program; a member's is allocated at the first REDIM, and nothing there
+    bounds what a LATER one will ask for - so it is allocated at a maximum, and
+    a REDIM past it is refused by name rather than writing past the block. }
+  WASM_MEMBER_MAX_DIMS = 8;
 
 { ---------------- PRINT ----------------
 
@@ -592,8 +618,19 @@ begin
         ssaArrayDim, ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound,
         ssaArrayBind, ssaArrayBindApply, ssaArrayUnbind, ssaArrayRedim,
         ssaArrayRedimPush, ssaArrayRedimN,
-        ssaArrayIdxPush, ssaArrayIdxResolve:
+        ssaArrayIdxPush, ssaArrayIdxResolve,
+        ssaArrayLoadIndInt, ssaArrayLoadIndFloat,
+        ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+        ssaArrayLBoundInd, ssaArrayUBoundInd, ssaArrayIdxResolveInd:
           FUsesArr := True;
+        ssaArrayLoadIndString, ssaArrayStoreIndString:
+          begin FUsesArr := True; FUsesStr := True; end;
+        { A member array's descriptor lives on the heap, one per record, so this
+          needs the record heap as much as the array machinery. }
+        ssaMemberArrayRedim:
+          begin FUsesArr := True; FUsesRec := True; end;
+        ssaRecordNewArrayInd:
+          begin FUsesArr := True; FUsesRec := True; FUsesRecArr := True; end;
         ssaPrintUsing, ssaPrintUsingInt:
           begin FUsesPU := True; FUsesStr := True; FUsesPrint := True;
                 FUsesFlt := True; end;   // puDigits leans on the float digits
@@ -3249,6 +3286,104 @@ begin
     finally
       B.Free;
     end;
+  end;
+end;
+
+{ The shape half of a REDIM, against the descriptor in FDescTmp. ⭐ ONE body for
+  both spellings: "ReDim a(...)" knows its descriptor at compile time and
+  "ReDim obj.f(...)" only at run time, and that is the ONLY difference - writing
+  it twice would be two implementations of one rule, which is how a plain array
+  and a member array come to disagree about PRESERVE six months from now.
+  The bounds come from FRedimPend: the lowers first (all of them or none), then
+  the uppers, which is the order SedaiSSA lays them down. }
+procedure TWasmBackend.EmitRedimShape(B: TWasmBuf; Preserve: Boolean;
+  NLower, NUpper: Integer);
+var
+  k: Integer;
+begin
+  B.I32Const(1); B.LocalSet(FArrTmp);
+  for k := 0 to NUpper - 1 do
+  begin
+    // the lower bound: the pushed one, or the dimension's current one
+    if NLower > 0 then
+      B.LocalGet(FRedimPend[k].Local)
+    else
+    begin
+      B.LocalGet(FDescTmp); B.OpMem(wopI32Load, 2, LongWord(16 + 8 * k));
+    end;
+    B.LocalSet(FRecTmp);
+    B.LocalGet(FDescTmp); B.LocalGet(FRecTmp);
+    B.OpMem(wopI32Store, 2, LongWord(16 + 8 * k));
+    // the size: ub - lb + 1, clamped at zero exactly as RedimArrayN clamps it
+    B.LocalGet(FRedimPend[NLower + k].Local);
+    B.LocalGet(FRecTmp); B.Op(wopI32Sub);
+    B.I32Const(1); B.Op(wopI32Add);
+    B.LocalTee(FGfxN);
+    B.I32Const(0); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.LocalSet(FGfxN);
+    B.EndOp;
+    B.LocalGet(FDescTmp); B.LocalGet(FGfxN);
+    B.OpMem(wopI32Store, 2, LongWord(20 + 8 * k));
+    B.LocalGet(FArrTmp); B.LocalGet(FGfxN); B.Op(wopI32Mul);
+    B.LocalSet(FArrTmp);
+  end;
+
+  B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
+  B.Call(FAllocFunc); B.LocalSet(FGfxP);
+  if Preserve then
+  begin
+    { PRESERVE keeps the flat element order up to the SMALLER of the two sizes -
+      SetLength's own rule, which is what the interpreter leans on. ⚠️ The OLD
+      total is still in the descriptor: nothing above has touched +4, and it has
+      to be read before the store below. }
+    B.LocalGet(FGfxP);
+    B.LocalGet(FDescTmp); B.OpMem(wopI32Load, 2, 0);
+    B.LocalGet(FDescTmp); B.OpMem(wopI32Load, 2, 4);
+    B.LocalTee(FGfxN);
+    B.LocalGet(FArrTmp);
+    B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.LocalGet(FArrTmp);
+    B.Op(wopElse);
+      B.LocalGet(FGfxN);
+    B.EndOp;
+    B.I32Const(8); B.Op(wopI32Mul);
+    B.MemoryCopy;
+  end;
+  B.LocalGet(FDescTmp); B.LocalGet(FGfxP);   B.OpMem(wopI32Store, 2, 0);
+  B.LocalGet(FDescTmp); B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 4);
+  B.LocalGet(FDescTmp); B.I32Const(NUpper);  B.OpMem(wopI32Store, 2, 8);
+end;
+
+procedure TWasmBackend.LoadMemberDesc(B: TWasmBuf; const Handle: TSSAValue;
+  Enc: Integer; Allocate: Boolean);
+{ FDescTmp := the descriptor of the array member at field encoding Enc of the
+  record whose handle is in Handle. With Allocate, a member that has none yet
+  gets one - lazily, exactly like the interpreter's FArrays entry, and only at
+  the REDIM that first sizes it.
+  ⚠️ The descriptor is allocated at its MAXIMUM size rather than at the size the
+  first REDIM needs: a later REDIM with more dimensions would otherwise write
+  past it, and unlike a declared array there is nothing at compile time that
+  bounds the count for the whole program. }
+begin
+  LoadReg(B, Handle);
+  B.Op(wopI32WrapI64);
+  B.LocalTee(FGfxP);
+  B.OpMem(wopI64Load, 0, LongWord(8 + (Enc shr 4)));
+  B.Op(wopI32WrapI64);
+  B.LocalSet(FDescTmp);
+  if Allocate then
+  begin
+    B.LocalGet(FDescTmp); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(16 + 8 * WASM_MEMBER_MAX_DIMS);
+      B.Call(FAllocFunc);
+      B.LocalSet(FDescTmp);
+      B.LocalGet(FGfxP);
+      B.LocalGet(FDescTmp); B.Op(wopI64ExtendI32U);
+      B.OpMem(wopI64Store, 0, LongWord(8 + (Enc shr 4)));
+    B.EndOp;
   end;
 end;
 
@@ -5977,64 +6112,163 @@ begin
           Exit(Fail(Format('"ReDim %s(...)" asks for %d dimensions where the array was ' +
                            'declared with %d, and the descriptor was sized for that',
                            [Info.Name, d, Info.DimCount])));
-
-        B.I32Const(1); B.LocalSet(FArrTmp);
-        for k := 0 to d - 1 do
-        begin
-          // the lower bound: the pushed one, or the dimension's current one
-          if NStr > 0 then
-            B.LocalGet(FRedimPend[k].Local)
-          else
-          begin
-            B.I32Const(LongInt(Desc + LongWord(16 + 8 * k)));
-            B.OpMem(wopI32Load, 2, 0);
-          end;
-          B.LocalSet(FRecTmp);
-          B.I32Const(LongInt(Desc + LongWord(16 + 8 * k)));
-          B.LocalGet(FRecTmp);
-          B.OpMem(wopI32Store, 2, 0);
-          // the size: ub - lb + 1, clamped at zero exactly as RedimArrayN clamps
-          B.LocalGet(FRedimPend[NStr + k].Local);
-          B.LocalGet(FRecTmp); B.Op(wopI32Sub);
-          B.I32Const(1); B.Op(wopI32Add);
-          B.LocalTee(FGfxN);
-          B.I32Const(0); B.Op(wopI32LtS);
-          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
-            B.I32Const(0); B.LocalSet(FGfxN);
-          B.EndOp;
-          B.I32Const(LongInt(Desc + LongWord(20 + 8 * k)));
-          B.LocalGet(FGfxN);
-          B.OpMem(wopI32Store, 2, 0);
-          B.LocalGet(FArrTmp); B.LocalGet(FGfxN); B.Op(wopI32Mul);
-          B.LocalSet(FArrTmp);
-        end;
-
-        B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
-        B.Call(FAllocFunc); B.LocalSet(FGfxP);
-        if (n and 1) <> 0 then
-        begin
-          { PRESERVE keeps the flat element order up to the SMALLER of the two
-            sizes - SetLength's own rule, which is what the interpreter leans
-            on. ⚠️ The OLD total is still in the descriptor: nothing above has
-            touched +4, and it must be read before the store below. }
-          B.LocalGet(FGfxP);
-          B.I32Const(LongInt(Desc)); B.OpMem(wopI32Load, 2, 0);
-          B.I32Const(LongInt(Desc + 4)); B.OpMem(wopI32Load, 2, 0);
-          B.LocalTee(FGfxN);
-          B.LocalGet(FArrTmp);
-          B.Op(wopI32GtS);
-          B.BlockStart(wopIf, WASM_TYPE_I32);
-            B.LocalGet(FArrTmp);
-          B.Op(wopElse);
-            B.LocalGet(FGfxN);
-          B.EndOp;
-          B.I32Const(8); B.Op(wopI32Mul);
-          B.MemoryCopy;
-        end;
-        B.I32Const(LongInt(Desc));      B.LocalGet(FGfxP);   B.OpMem(wopI32Store, 2, 0);
-        B.I32Const(LongInt(Desc + 4));  B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
-        B.I32Const(LongInt(Desc + 8));  B.I32Const(d);       B.OpMem(wopI32Store, 2, 0);
+        if not FHasDescTmp then
+          Exit(Fail('ssaArrayRedimN with no descriptor local reserved for this region'));
+        B.I32Const(LongInt(Desc)); B.LocalSet(FDescTmp);
+        EmitRedimShape(B, (n and 1) <> 0, NStr, d);
         SetLength(FRedimPend, 0);
+      end;
+
+    { REDIM of an array that is a MEMBER of a record. Same shape code, and the
+      only difference is where the descriptor comes from: a member's is on the
+      heap, one per record instance, allocated at the first REDIM that sizes it
+      - which is exactly when the interpreter first makes its FArrays entry. }
+    ssaMemberArrayRedim:
+      begin
+        if not BankIs(Instr.Src1, srtInt, 'ssaMemberArrayRedim handle') then Exit(False);
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('ssaMemberArrayRedim without its constant field encoding'));
+        if not FHasDescTmp then
+          Exit(Fail('ssaMemberArrayRedim with no descriptor local reserved for this region'));
+        n := Integer(Instr.Src3.ConstInt);
+        k := (n shr 8) and $FFFF;                    // the field's encoding
+        if (k and $F) <> 0 then
+          Exit(Fail('a UDT array member held in a narrowed field is not covered'));
+        NStr := 0;
+        for d := 0 to High(FRedimPend) do
+          if FRedimPend[d].IsLb then Inc(NStr);
+        d := Length(FRedimPend) - NStr;
+        if d = 0 then
+          Exit(Fail('ssaMemberArrayRedim with no upper bound pushed for it'));
+        if (NStr <> 0) and (NStr <> d) then
+          Exit(Fail('ssaMemberArrayRedim got a partial list of lower bounds'));
+        if d > WASM_MEMBER_MAX_DIMS then
+          Exit(Fail(Format('a UDT array member is redimensioned to %d dimensions; this ' +
+                           'backend sizes a member descriptor for %d',
+                           [d, WASM_MEMBER_MAX_DIMS])));
+        LoadMemberDesc(B, Instr.Src1, k, True);
+        EmitRedimShape(B, (n and 1) <> 0, NStr, d);
+        SetLength(FRedimPend, 0);
+      end;
+
+    { ---- the same array operations, on a member's runtime descriptor -------
+
+      ⭐ Every one of these is the direct opcode with the descriptor coming from
+      a REGISTER, because the helpers already take it as a parameter. What they
+      all have to add is the guard the direct forms cannot need: a member that
+      has never been REDIMmed has handle 0, and the interpreter answers a read
+      with the default and drops a store. Without the test, "total" would be
+      read from address 4 - the PRINT scratch - and the bounds check would be
+      decided by whatever digits were last formatted. }
+
+    ssaArrayLoadIndInt, ssaArrayLoadIndFloat, ssaArrayLoadIndString:
+      begin
+        if not BankIs(Instr.Src1, srtInt, OpName(Instr.OpCode) + ' handle') then Exit(False);
+        if not FHasDescTmp then
+          Exit(Fail(OpName(Instr.OpCode) + ' with no descriptor local reserved'));
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalTee(FDescTmp);
+        B.BlockStart(wopIf, BlockTypeOf[Instr.Dest.RegType]);
+          B.LocalGet(FDescTmp);
+          LoadReg(B, Instr.Src2);
+          B.Call(FArrLoad[Instr.Dest.RegType]);
+        B.Op(wopElse);
+          case Instr.Dest.RegType of
+            srtFloat:  B.F64Const(0);
+            srtString: B.I32Const(EMPTY_STR);
+          else
+            B.I64Const(0);
+          end;
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString:
+      begin
+        if not BankIs(Instr.Src1, srtInt, OpName(Instr.OpCode) + ' handle') then Exit(False);
+        if not FHasDescTmp then
+          Exit(Fail(OpName(Instr.OpCode) + ' with no descriptor local reserved'));
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalTee(FDescTmp);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(FDescTmp);
+          LoadReg(B, Instr.Src2);
+          LoadReg(B, Instr.Dest);
+          B.Call(FArrStore[Instr.Dest.RegType]);
+        B.EndOp;
+      end;
+
+    ssaArrayLBoundInd, ssaArrayUBoundInd:
+      begin
+        if not BankIs(Instr.Src1, srtInt, OpName(Instr.OpCode) + ' handle') then Exit(False);
+        if not FHasDescTmp then
+          Exit(Fail(OpName(Instr.OpCode) + ' with no descriptor local reserved'));
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalTee(FDescTmp);
+        B.BlockStart(wopIf, WASM_TYPE_I64);
+          B.LocalGet(FDescTmp);
+          LoadReg(B, Instr.Src2);
+          if Instr.OpCode = ssaArrayLBoundInd then B.Call(FArrLBoundFunc)
+                                               else B.Call(FArrUBoundFunc);
+        B.Op(wopElse);
+          // an unallocated member: LBOUND 0 and UBOUND -1, the empty array
+          if Instr.OpCode = ssaArrayLBoundInd then B.I64Const(0) else B.I64Const(-1);
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaArrayIdxResolveInd:
+      begin
+        if not BankIs(Instr.Src1, srtInt, 'ssaArrayIdxResolveInd handle') then Exit(False);
+        if Length(FIdxPend) = 0 then
+          Exit(Fail('ssaArrayIdxResolveInd with no index pushed for it'));
+        if not FHasDescTmp then
+          Exit(Fail('ssaArrayIdxResolveInd with no descriptor local reserved'));
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalSet(FDescTmp);
+        B.I64Const(0);
+        for k := 0 to High(FIdxPend) do
+        begin
+          B.I64Const(1); B.LocalSet(FIdxScratch);
+          B.I32Const(k + 1); B.LocalSet(FArrTmp);
+          B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(FArrTmp);
+              B.LocalGet(FDescTmp); B.OpMem(wopI32Load, 2, 8);
+              B.Op(wopI32GeS); B.BrIf(1);
+              B.LocalGet(FIdxScratch);
+              B.LocalGet(FDescTmp);
+              B.LocalGet(FArrTmp); B.I32Const(8); B.Op(wopI32Mul);
+              B.Op(wopI32Add);
+              B.OpMem(wopI32Load, 2, 20); B.Op(wopI64ExtendI32S);
+              B.Op(wopI64Mul); B.LocalSet(FIdxScratch);
+              B.LocalGet(FArrTmp); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(FArrTmp);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+          B.LocalGet(FIdxPend[k]); B.LocalGet(FIdxScratch); B.Op(wopI64Mul);
+          B.Op(wopI64Add);
+        end;
+        StoreReg(B, Instr.Dest);
+        SetLength(FIdxPend, 0);
+      end;
+
+    { An array-of-UDT that is a member: the same eager fill, with the descriptor
+      read from the field instead of named by an index. }
+    ssaRecordNewArrayInd:
+      begin
+        if not BankIs(Instr.Src1, srtInt, 'ssaRecordNewArrayInd handle') then Exit(False);
+        if Instr.Src2.Kind <> svkConstInt then
+          Exit(Fail('ssaRecordNewArrayInd without its compile-time sizes'));
+        if not FHasDescTmp then
+          Exit(Fail('ssaRecordNewArrayInd with no descriptor local reserved'));
+        Bytes := Integer(Instr.Src2.ConstInt and $FFFF);
+        NStr := Integer((Instr.Src2.ConstInt shr 32) and $FFFF);
+        StrBase := 8 + ((Bytes + 7) div 8) * 8;
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalTee(FDescTmp);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(FDescTmp);
+          B.I32Const(StrBase + 4 * NStr);
+          B.I32Const(StrBase);
+          B.I32Const(Integer((Instr.Src2.ConstInt shr 48) and $FFFF));
+          B.Call(FRecNewArrFunc);
+        B.EndOp;
       end;
 
     ssaArrayIdxPush:
@@ -6974,6 +7208,32 @@ begin
     FIdxScratch := LongWord(k);
     SetLength(Locals, Length(Locals) + 1);
     Locals[High(Locals)] := wvtI64;
+    Inc(k);
+  end;
+  { The descriptor being worked on: needed by a REDIM (either spelling) and by
+    every member-array access. Conditional for the same reason as the one above
+    - a local that "always" exists changes every module in the corpus. }
+  FHasDescTmp := False;
+  for i := First to Last do
+  begin
+    Blk := FProg.Blocks[i];
+    for j := 0 to Blk.Instructions.Count - 1 do
+      if OpIn(TSSAInstruction(Blk.Instructions[j]).OpCode,
+              [ssaArrayRedimN, ssaMemberArrayRedim, ssaRecordNewArrayInd,
+               ssaArrayLoadIndInt, ssaArrayLoadIndFloat, ssaArrayLoadIndString,
+               ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
+               ssaArrayLBoundInd, ssaArrayUBoundInd, ssaArrayIdxResolveInd]) then
+      begin
+        FHasDescTmp := True;
+        Break;
+      end;
+    if FHasDescTmp then Break;
+  end;
+  if FHasDescTmp then
+  begin
+    FDescTmp := LongWord(k);
+    SetLength(Locals, Length(Locals) + 1);
+    Locals[High(Locals)] := wvtI32;
     Inc(k);
   end;
   N := Last - First + 1;                       // restored: the pre-pass reused it
