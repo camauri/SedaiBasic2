@@ -242,6 +242,8 @@ type
     FFltDigits: Integer;             // "OPTION DIGITS n"; 16 unless the source said otherwise
     FQBLang: Boolean;                // the source declared -lang qb
     FFltMulFunc, FFltDecFunc, FFltPrintFunc: LongWord;
+    FFltOutFunc, FFltStrFunc: LongWord;   // where the rendered text goes, and STR$
+    FUsesStrStr: Boolean;                 // the program calls Str() on a float
 
     FBankBase: array[TSSARegisterType] of Integer;
     FFlatCount: Integer;
@@ -369,6 +371,14 @@ const
     bounded by the type, not by the program. }
   FLT_LEN      = 96;      // i32: how many digits FLT_DEC holds
   FLT_FRAC     = 100;     // i32: how many of them are after the point
+  { ⭐ STR$ AND PRINT ARE THE SAME RENDERING, and these two cells are the whole
+    difference. fltPrint always leaves its text at FLT_OUT; FLT_CAP says whether
+    to hand it to the host or leave it there, and FLT_OLEN says how long it is.
+    ⛔ Two memory cells rather than two parameters for the reason VAL_DECW gives:
+    fltPrint's body is written against locals 2..11, and appending a parameter
+    renumbers every one of them. }
+  FLT_CAP      = 104;     // i32: 1 = do not write, the caller wants the text
+  FLT_OLEN     = 108;     // i32: how long the text at FLT_OUT is
   FLT_DIG      = 128;     // the kept, ROUNDED digits, most significant first
   FLT_OUT      = 1024;    // the rendered text
   FLT_DEC      = 2048;    // the EXACT digits, least significant first
@@ -492,6 +502,7 @@ begin
   FUsesArr := False;
   FUsesRecArr := False;
   FUsesPtr := False;
+  FUsesStrStr := False;
   FIndirect := False;
   SetLength(FAddrTaken, FRegionCount);
   for i := 0 to FRegionCount - 1 do FAddrTaken[i] := False;
@@ -537,6 +548,11 @@ begin
         ssaPrintUsing, ssaPrintUsingInt:
           begin FUsesPU := True; FUsesStr := True; FUsesPrint := True;
                 FUsesFlt := True; end;   // puDigits leans on the float digits
+        { STR$ of a float is the PRINT rendering minus the spacing, so it needs
+          the float formatter as much as a PRINT does - and a string to put the
+          answer in. It does NOT need the print import: fltOut knows. }
+        ssaStrStr, ssaFloatToString:
+          begin FUsesStrStr := True; FUsesStr := True; FUsesFlt := True; end;
         ssaStrVal:
           begin FUsesVal := True; FUsesStr := True;
                 FUsesFlt := True; end;   // valFlt leans on the float digit buffer
@@ -3508,6 +3524,75 @@ begin
   end;
 
   EmitFloatPrint;
+
+  { fltOut(len): where the rendered text goes. It always records the length, and
+    it writes only when the caller did not ask to keep it.
+    ⛔ The write arm is emitted only when the program PRINTS: a program that
+    calls Str() on a float and never prints has no "write" import at all, and a
+    call to a function the module does not have is not a runtime surprise - it
+    is a module that fails to load. }
+  B := TWasmBuf.Create;
+  try
+    B.I32Const(FLT_OLEN); B.LocalGet(0); B.OpMem(wopI32Store, 2, 0);
+    if FUsesPrint then
+    begin
+      B.I32Const(FLT_CAP); B.OpMem(wopI32Load, 2, 0); B.Op(wopI32Eqz);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(FLT_OUT); B.LocalGet(0); B.Call(FWriteFunc);
+      B.EndOp;
+    end;
+    FFltOutFunc := FModule.AddFunction(FModule.TypeIndex([wvtI32], []), [], B);
+  finally
+    B.Free;
+  end;
+
+  { fltStr() -> handle: the text fltPrint just left at FLT_OUT, with the spaces
+    PRINT puts around a number taken off, copied into a string.
+    ⭐ Str is not a second formatter - it is this one minus the spacing, which is
+    exactly what the interpreter does (Trim of FormatNumber). Writing it any
+    other way would give a program two renderings of the same double that agree
+    until they do not.
+    ⚠️ MODERN only, and the target is MODERN only: Commodore's STR$ keeps the
+    leading sign-space and drops just the trailing one. }
+  if FUsesStrStr then
+  begin
+    B := TWasmBuf.Create;
+    try
+      // 0 = p, 1 = e, 2 = h, 3 = n
+      B.I32Const(FLT_OUT); B.LocalSet(0);
+      B.I32Const(FLT_OUT); B.I32Const(FLT_OLEN); B.OpMem(wopI32Load, 2, 0);
+      B.Op(wopI32Add); B.LocalSet(1);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(0); B.LocalGet(1); B.Op(wopI32GeU); B.BrIf(1);
+          B.LocalGet(0); B.OpMem(wopI32Load8U, 0, 0);
+          B.I32Const(Ord(' ')); B.Op(wopI32Ne); B.BrIf(1);
+          B.LocalGet(0); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(0);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(1); B.LocalGet(0); B.Op(wopI32LeU); B.BrIf(1);
+          B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub);
+          B.OpMem(wopI32Load8U, 0, 0);
+          B.I32Const(Ord(' ')); B.Op(wopI32Ne); B.BrIf(1);
+          B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(1);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(1); B.LocalGet(0); B.Op(wopI32Sub); B.LocalTee(3);
+      B.Call(FStrNewFunc); B.LocalTee(2);
+      B.I32Const(4); B.Op(wopI32Add);
+      B.LocalGet(0); B.LocalGet(3);
+      B.MemoryCopy;
+      B.LocalGet(2);
+      FFltStrFunc := FModule.AddFunction(FModule.TypeIndex([], [wvtI32]),
+                                         [wvtI32, wvtI32, wvtI32, wvtI32], B);
+    finally
+      B.Free;
+    end;
+  end;
 end;
 
 
@@ -3613,9 +3698,8 @@ begin
       B.EndOp;
       B.LocalGet(8); B.LocalGet(9); B.LocalGet(11); B.MemoryCopy;
       B.LocalGet(8); B.LocalGet(11); B.Op(wopI32Add); B.LocalSet(8);
-      B.I32Const(FLT_OUT);
       B.LocalGet(8); B.I32Const(FLT_OUT); B.Op(wopI32Sub);
-      B.Call(FWriteFunc);
+      B.Call(FFltOutFunc);
       B.Op(wopReturn);
     B.EndOp;
 
@@ -3628,9 +3712,8 @@ begin
       B.LocalGet(8); B.LocalGet(11); B.OpMem(wopI32Store8, 0, 0);
       B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
       Emit(Ord('0'));
-      B.I32Const(FLT_OUT);
       B.LocalGet(8); B.I32Const(FLT_OUT); B.Op(wopI32Sub);
-      B.Call(FWriteFunc);
+      B.Call(FFltOutFunc);
       B.Op(wopReturn);
     B.EndOp;
 
@@ -3828,9 +3911,8 @@ begin
       B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
     B.EndOp;
 
-    B.I32Const(FLT_OUT);
     B.LocalGet(8); B.I32Const(FLT_OUT); B.Op(wopI32Sub);
-    B.Call(FWriteFunc);
+    B.Call(FFltOutFunc);
     FFltPrintFunc := FModule.AddFunction(TPrint,
       [wvtI64, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
   finally
@@ -4931,6 +5013,34 @@ begin
     ssaPrintSemicolon: ;
 
     { ---- strings ------------------------------------------------------ }
+
+    { STR$(x) / Str(x) of a float. ⭐ It is the PRINT rendering with the spacing
+      taken off, and it is written that way ON PURPOSE: two formatters for the
+      same double would agree until the day they did not, and the interpreter
+      makes the same choice (Trim of FormatNumber).
+      ⚠️ The SINGLE flag rides Src3 exactly as it does on ssaPrint, and it means
+      the same thing - 7 significant digits unless OPTION DIGITS said otherwise. }
+    { ⭐ ssaFloatToString is HERE and not in a case of its own because it is the
+      same thing: the interpreter runs the identical line for both
+      (Trim of FormatNumber), one reached by writing Str(x) and the other by
+      letting a float meet a string in a concatenation. Splitting them would be
+      two implementations of one rule, which is how two renderings of the same
+      double come to agree until they do not. }
+    ssaStrStr, ssaFloatToString:
+      begin
+        if not BankIs(Instr.Src1, srtFloat, OpName(Instr.OpCode)) then Exit(False);
+        B.I32Const(FLT_CAP); B.I32Const(1); B.OpMem(wopI32Store, 2, 0);
+        LoadReg(B, Instr.Src1);
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) and
+           (FFltDigits = 16) then
+          B.I32Const(7)
+        else
+          B.I32Const(FFltDigits);
+        B.Call(FFltPrintFunc);
+        B.I32Const(FLT_CAP); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+        B.Call(FFltStrFunc);
+        StoreReg(B, Instr.Dest);
+      end;
 
     ssaLoadConstString:
       begin
@@ -6951,7 +7061,13 @@ begin
     FFltMulFunc := Next;
     FFltDecFunc := Next + 1;
     FFltPrintFunc := Next + 2;
-    Inc(Next, 3);
+    FFltOutFunc := Next + 3;      // EmitFloatHelpers adds these two after fltPrint
+    Inc(Next, 4);
+    if FUsesStrStr then           // conditional, so sequential and last
+    begin
+      FFltStrFunc := Next;
+      Inc(Next);
+    end;
   end;
   { ⛔⛔ LAST, because EmitGfxHelpers runs last. Numbering these before the array
     and float helpers - while emitting them after - made every call land two
