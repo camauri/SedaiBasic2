@@ -189,11 +189,30 @@ type
     // --- arrays ---------------------------------------------------------
     FUsesArr: Boolean;
     FUsesRec: Boolean;              // the program builds UDT records
+    FUsesRecArr: Boolean;           // ... one per element of an ARRAY of them
     FArrDescOf: array of LongWord;   // array index -> its descriptor's address
     FArrTmp: LongWord;               // i32 scratch: the running element product
     FRecTmp: LongWord;               // i32 scratch: a record handle being addressed
     FArrLoad, FArrStore: array[TSSARegisterType] of LongWord;
     FArrLBoundFunc, FArrUBoundFunc: LongWord;
+    FRecNewArrFunc: LongWord;        // fill an array of UDT with fresh records
+
+    { --- FreeBASIC POINTERS -----------------------------------------------
+      A pointer VALUE is the interpreter's, bit for bit: the high 32 bits hold
+      (backingArrayId + 1) so 0 stays NULL, the low 32 an element offset, and a
+      record-field pointer sets bit 63 instead. Reproducing the encoding rather
+      than inventing a linear address is what keeps "p + 1" advancing by one
+      ELEMENT on both sides, and what makes a pointer survive a REDIM: the
+      deref reads the descriptor at run time, so it follows the array to its new
+      block exactly as the interpreter does.
+      ⇒ the one thing the encoding needs that the interpreter gets for free is
+      a way to turn an array id into a descriptor at RUN TIME - the id is a
+      compile-time number everywhere else, so nothing else ever needed it. That
+      is FArrTab: one i32 per declared array, emitted as data. }
+    FUsesPtr: Boolean;
+    FArrTabAddr: LongWord;
+    FArrTabBytes: AnsiString;
+    FRefLoad, FRefStore: array[TSSARegisterType] of LongWord;
 
     // --- float printing -------------------------------------------------
     FUsesFlt: Boolean;
@@ -235,6 +254,8 @@ type
     function ConstAddrOf(const V: TSSAValue): LongWord;
     function ExtraOperands(Instr: TSSAInstruction): TSSAValueArray;
     procedure EmitArrayHelpers;
+    procedure EmitRecordHelpers;
+    procedure EmitRefHelpers;
     procedure EmitFloatHelpers;
     procedure EmitFloatPrint;
     procedure PushOutSlots(B: TWasmBuf; R: Integer);
@@ -445,6 +466,8 @@ begin
   FUsesGfx := False;
   FUsesStr := False;
   FUsesArr := False;
+  FUsesRecArr := False;
+  FUsesPtr := False;
   FUsesFlt := False;
   FUsesVal := False;
   FUsesValInt := False;
@@ -500,8 +523,29 @@ begin
           FUsesTrig := True;
         ssaRecordNew:
           FUsesRec := True;
+        { An ARRAY of UDT is an int-handle array whose elements are filled with
+          fresh records, so it needs both the record heap AND the array
+          descriptor - the helper reads the element count and the data base out
+          of it. FUsesArr is set here rather than relied on: the DIM that would
+          set it is a different opcode, and a helper that reads a descriptor
+          that was never laid out reads whatever sits at that address. }
+        ssaRecordNewArray:
+          begin FUsesRec := True; FUsesRecArr := True; FUsesArr := True; end;
         ssaRecordLoadString, ssaRecordStoreString:
           begin FUsesRec := True; FUsesStr := True; end;
+        { ⚠️ FUsesArr is forced along with the pointers, and not because a
+          pointer program is bound to have an array: it is because the DEREF
+          reads an array descriptor, and a descriptor that was never laid out is
+          an address in the middle of something else. A program whose only
+          pointers are "@obj.field" never reaches that arm - but nothing in the
+          module can prove it, so the descriptors exist either way. }
+        ssaRefLoadInt, ssaRefLoadFloat,
+        ssaRefStoreInt, ssaRefStoreFloat:
+          begin FUsesPtr := True; FUsesArr := True; end;
+        ssaRefLoadString, ssaRefStoreString:
+          begin FUsesPtr := True; FUsesArr := True; FUsesStr := True; end;
+        ssaRefAddrField:
+          begin FUsesPtr := True; FUsesArr := True; FUsesRec := True; end;
       end;
       NoteConst(Ins.Src1); NoteConst(Ins.Src2); NoteConst(Ins.Src3);
     end;
@@ -547,6 +591,22 @@ begin
       Inc(Addr, LongWord(16 + 8 * FProg.GetArray(k).DimCount));
       while (Addr and 3) <> 0 do Inc(Addr);
     end;
+
+  { And after them the ARRAY ID TABLE, which exists only for pointers. Every
+    other operand names an array by a compile-time index, so its descriptor is a
+    constant; a pointer carries the id as a VALUE, and dereferencing it has to
+    reach the descriptor at run time. The descriptors are not evenly spaced -
+    their size follows the dimension count - so this cannot be an arithmetic
+    step, it has to be a table. }
+  FArrTabBytes := '';
+  if FUsesPtr then
+  begin
+    FArrTabAddr := Addr;
+    SetLength(FArrTabBytes, 4 * FProg.GetArrayCount);
+    for k := 0 to FProg.GetArrayCount - 1 do
+      PLongWord(@FArrTabBytes[1 + 4 * k])^ := FArrDescOf[k];
+    Inc(Addr, LongWord(4 * FProg.GetArrayCount));
+  end;
   FHeapBase := Addr;
 end;
 
@@ -2939,6 +2999,258 @@ begin
   end;
 end;
 
+{ ---------------- an ARRAY of UDT ----------------
+
+  "Dim p(1 To 8) As Point" is an array of HANDLES, and every element gets its own
+  record eagerly at DIM time - which is what makes "p(i).x = 3" work without the
+  array ever having to know it holds records. The interpreter does exactly this
+  (RecordNewArrayInit), and the reason it is a loop rather than one big block is
+  that the elements are independent objects: a later REDIM PRESERVE has to be
+  able to keep the ones that already exist.
+
+  ⭐ THAT IS WHY THE TEST IS "handle = 0" AND NOT "the array is fresh". After a
+  plain DIM every slot is zero, so all of them are filled; after a REDIM the old
+  slots still hold their records and only the grown ones are zero. Filling
+  unconditionally would leak the old records AND lose their contents, which is
+  the whole difference between REDIM and REDIM PRESERVE.
+  ⛔ It relies on a record address never being 0, which holds because the bump
+  allocator starts above the literals - the same reason handle 0 can mean "the
+  empty string" for the string bank. }
+
+procedure TWasmBackend.EmitRecordHelpers;
+var
+  B: TWasmBuf;
+  T: LongWord;
+begin
+  // (desc, allocSize, strBase, typeId) -> (); locals 4=i, 5=n, 6=addr, 7=rec
+  T := FModule.TypeIndex([wvtI32, wvtI32, wvtI32, wvtI32], []);
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 4); B.LocalSet(5);   // the element count
+    B.I32Const(0); B.LocalSet(4);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.LocalGet(5); B.Op(wopI32GeS); B.BrIf(1);
+        { The data base is re-read every iteration on purpose: alloc can grow the
+          memory, and while growing never MOVES a block, reading it once would be
+          a fact about the allocator rather than about the descriptor. }
+        B.LocalGet(0); B.OpMem(wopI32Load, 2, 0);
+        B.LocalGet(4); B.I32Const(8); B.Op(wopI32Mul);
+        B.Op(wopI32Add);
+        B.LocalTee(6);
+        B.OpMem(wopI64Load, 3, 0);
+        B.Op(wopI64Eqz);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(1); B.Call(FAllocFunc); B.LocalSet(7);
+          B.LocalGet(7); B.LocalGet(3); B.OpMem(wopI32Store, 2, 0);   // typeId
+          B.LocalGet(7); B.LocalGet(2); B.OpMem(wopI32Store, 2, 4);   // string area
+          B.LocalGet(6); B.LocalGet(7); B.Op(wopI64ExtendI32U);
+          B.OpMem(wopI64Store, 3, 0);
+        B.EndOp;
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    FRecNewArrFunc := FModule.AddFunction(T, [wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+end;
+
+{ ---------------- FreeBASIC pointers ----------------
+
+  Two kinds of pointer share these six helpers, told apart by bit 63 exactly as
+  the interpreter tells them apart:
+
+    a MANAGED pointer names an element of a backing array - (arrayId+1) in the
+    high 32 bits, the element offset in the low 32. A scalar whose address is
+    taken gets a one-element backing array, so "@x" and "@a(i)" are the same
+    shape and "p + 1" is a plain integer add on both sides;
+
+    a RECORD-FIELD pointer (@obj.field) sets bit 63, and packs the record in
+    bits 24..55 with the field's encoding in the low 24. Natively those bits
+    hold a record INDEX; here they hold the record's linear ADDRESS, which is
+    what a handle is in this backend - the only place the two encodings differ,
+    and it is invisible to a program that does not print a pointer.
+
+  ⭐ The deref reads the DESCRIPTOR, not a remembered address, which is what
+  makes a pointer survive a REDIM: the array moves and the pointer still names
+  the same element. Getting that for free is the reason the interpreter's
+  encoding was reproduced rather than replaced by a linear address.
+
+  ⚠️ A bad pointer TRAPS here where the interpreter raises "Null or invalid
+  pointer dereference". Both are loud, the diagnostics differ - the same
+  arrangement as division by zero and an out-of-range subscript in CLASSIC. }
+
+procedure TWasmBackend.EmitRefHelpers;
+var
+  B: TWasmBuf;
+  RT: TSSARegisterType;
+  T: LongWord;
+
+  procedure Trap;
+  begin
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.Op(wopUnreachable);
+    B.EndOp;
+  end;
+
+  procedure ArrayPath(PtrL, AddrL: LongWord);
+  { The managed arm: AddrL := the element's byte address. AddrL doubles as the
+    scratch for the id and the descriptor on the way there. }
+  begin
+    // AddrL := arrayId + 1, which is 0 for NULL
+    B.LocalGet(PtrL); B.I64Const(POINTER_ARRAY_SHIFT); B.Op(wopI64ShrU);
+    B.Op(wopI32WrapI64); B.LocalTee(AddrL);
+    B.Op(wopI32Eqz); Trap;
+    B.LocalGet(AddrL); B.I32Const(FProg.GetArrayCount); B.Op(wopI32GtU); Trap;
+    // the descriptor, from the table: base - 4 + 4*(id+1)
+    B.LocalGet(AddrL); B.I32Const(4); B.Op(wopI32Mul);
+    B.I32Const(LongInt(FArrTabAddr) - 4); B.Op(wopI32Add);
+    B.OpMem(wopI32Load, 2, 0);
+    B.LocalSet(AddrL);
+    // the offset against the element count, unsigned so a negative one is out too
+    B.LocalGet(PtrL); B.Op(wopI32WrapI64);
+    B.LocalGet(AddrL); B.OpMem(wopI32Load, 2, 4);
+    B.Op(wopI32GeU); Trap;
+    B.LocalGet(AddrL); B.OpMem(wopI32Load, 2, 0);
+    B.LocalGet(PtrL); B.Op(wopI32WrapI64); B.I32Const(8); B.Op(wopI32Mul);
+    B.Op(wopI32Add);
+    B.LocalSet(AddrL);
+  end;
+
+  procedure Decode(PtrL, AddrL, EncL: LongWord; Str: Boolean);
+  { AddrL := where the value lives, EncL := the field's width code (0 for the
+    managed arm, which is always a full eight bytes). For the STRING bank the
+    record arm addresses the string AREA the header points at, because a handle
+    cannot live in the byte image - the same split as ssaRecordLoadString. }
+  begin
+    B.LocalGet(PtrL); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(PtrL); B.Op(wopI32WrapI64);
+      B.I32Const(LongInt(RECPTR_SLOT_MASK)); B.Op(wopI32And);
+      B.LocalSet(EncL);
+      B.LocalGet(PtrL); B.I64Const(RECPTR_SLOT_BITS); B.Op(wopI64ShrU);
+      B.Op(wopI32WrapI64);
+      if Str then
+      begin
+        B.LocalTee(AddrL);
+        B.LocalGet(AddrL); B.OpMem(wopI32Load, 2, 4);   // where the strings start
+        B.Op(wopI32Add);
+        B.LocalGet(EncL); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+        B.LocalSet(AddrL);
+        B.I32Const(0); B.LocalSet(EncL);
+      end
+      else
+      begin
+        B.I32Const(8); B.Op(wopI32Add);                 // past the header
+        B.LocalGet(EncL); B.I32Const(4); B.Op(wopI32ShrU); B.Op(wopI32Add);
+        B.LocalSet(AddrL);
+        B.LocalGet(EncL); B.I32Const($F); B.Op(wopI32And); B.LocalSet(EncL);
+      end;
+    B.Op(wopElse);
+      ArrayPath(PtrL, AddrL);
+      B.I32Const(0); B.LocalSet(EncL);
+    B.EndOp;
+  end;
+
+  procedure WidthCase(AddrL, EncL: LongWord; Code: Integer; MemOp: Byte;
+                      ValL: Integer);
+  { One arm of the width switch: "if enc = Code then <the narrow access>". A
+    chain rather than a br_table because the widths are six and the shape stays
+    readable - and because nothing outside SedaiWasmControl computes a branch
+    depth by hand. }
+  begin
+    B.LocalGet(EncL); B.I32Const(Code); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(AddrL);
+      if ValL >= 0 then B.LocalGet(LongWord(ValL));
+      B.OpMem(MemOp, 0, 0);
+      B.Op(wopReturn);
+    B.EndOp;
+  end;
+
+begin
+  for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+  begin
+    { ---- load: (ptr) -> value.  locals 1 = addr, 2 = enc ---- }
+    T := FModule.TypeIndex([wvtI64], [BankType[RT]]);
+    B := TWasmBuf.Create;
+    try
+      Decode(0, 1, 2, RT = srtString);
+      case RT of
+        srtString:
+          B.LocalGet(1);
+        srtFloat:
+          begin
+            // width 7 is a SINGLE, and it really is four bytes
+            B.LocalGet(2); B.I32Const(7); B.Op(wopI32Eq);
+            B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(1); B.OpMem(wopF32Load, 0, 0);
+              B.Op(wopF64PromoteF32); B.Op(wopReturn);
+            B.EndOp;
+            B.LocalGet(1);
+          end;
+      else
+        begin
+          WidthCase(1, 2, 1, wopI64Load8S,  -1);
+          WidthCase(1, 2, 2, wopI64Load8U,  -1);
+          WidthCase(1, 2, 3, wopI64Load16S, -1);
+          WidthCase(1, 2, 4, wopI64Load16U, -1);
+          WidthCase(1, 2, 5, wopI64Load32S, -1);
+          WidthCase(1, 2, 6, wopI64Load32U, -1);
+          B.LocalGet(1);
+        end;
+      end;
+      case RT of
+        srtFloat:  B.OpMem(wopF64Load, 0, 0);
+        srtString: B.OpMem(wopI32Load, 0, 0);
+      else
+        B.OpMem(wopI64Load, 0, 0);
+      end;
+      FRefLoad[RT] := FModule.AddFunction(T, [wvtI32, wvtI32], B);
+    finally
+      B.Free;
+    end;
+
+    { ---- store: (ptr, value) -> ().  locals 2 = addr, 3 = enc ---- }
+    T := FModule.TypeIndex([wvtI64, BankType[RT]], []);
+    B := TWasmBuf.Create;
+    try
+      Decode(0, 2, 3, RT = srtString);
+      case RT of
+        srtString:
+          begin
+            B.LocalGet(2); B.LocalGet(1); B.OpMem(wopI32Store, 0, 0);
+          end;
+        srtFloat:
+          begin
+            B.LocalGet(3); B.I32Const(7); B.Op(wopI32Eq);
+            B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(2); B.LocalGet(1); B.Op(wopF32DemoteF64);
+              B.OpMem(wopF32Store, 0, 0);
+              B.Op(wopReturn);
+            B.EndOp;
+            B.LocalGet(2); B.LocalGet(1); B.OpMem(wopF64Store, 0, 0);
+          end;
+      else
+        begin
+          WidthCase(2, 3, 1, wopI64Store8,  1);
+          WidthCase(2, 3, 2, wopI64Store8,  1);
+          WidthCase(2, 3, 3, wopI64Store16, 1);
+          WidthCase(2, 3, 4, wopI64Store16, 1);
+          WidthCase(2, 3, 5, wopI64Store32, 1);
+          WidthCase(2, 3, 6, wopI64Store32, 1);
+          B.LocalGet(2); B.LocalGet(1); B.OpMem(wopI64Store, 0, 0);
+        end;
+      end;
+      FRefStore[RT] := FModule.AddFunction(T, [wvtI32, wvtI32], B);
+    finally
+      B.Free;
+    end;
+  end;
+end;
+
 { ---------------- PRINT of a float ----------------
 
   The same algorithm the interpreter runs, and it ports because of what that
@@ -4684,6 +4996,28 @@ begin
           string, which is what an unassigned one has to be. }
       end;
 
+    { DIM of an array of UDT. ⚠️ The packed counts arrive in ONE constant here
+      (Src2) where ssaRecordNew splits them over Src1 and Src3 - the bytecode
+      compiler folds this one into an immediate, and the fields are the same
+      three: byte size, string count, type id. }
+    ssaRecordNewArray:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaRecordNewArray without an array reference'));
+        if (Instr.Src1.ArrayIndex < 0) or (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then
+          Exit(Fail('ssaRecordNewArray names an array that was never declared'));
+        if Instr.Src2.Kind <> svkConstInt then
+          Exit(Fail('ssaRecordNewArray without its compile-time sizes'));
+        Bytes := Integer(Instr.Src2.ConstInt and $FFFF);
+        NStr := Integer((Instr.Src2.ConstInt shr 32) and $FFFF);
+        StrBase := 8 + ((Bytes + 7) div 8) * 8;
+        B.I32Const(LongInt(FArrDescOf[Instr.Src1.ArrayIndex]));
+        B.I32Const(StrBase + 4 * NStr);
+        B.I32Const(StrBase);
+        B.I32Const(Integer((Instr.Src2.ConstInt shr 48) and $FFFF));
+        B.Call(FRecNewArrFunc);
+      end;
+
     ssaRecordTypeId:
       begin
         LoadReg(B, Instr.Src1);
@@ -5065,6 +5399,51 @@ begin
         B.I32Const(LongInt(Desc + 8));  B.I32Const(1);       B.OpMem(wopI32Store, 2, 0);
         B.I32Const(LongInt(Desc + 16)); B.LocalGet(FRecTmp); B.OpMem(wopI32Store, 2, 0);
         B.I32Const(LongInt(Desc + 20)); B.LocalGet(FArrTmp); B.OpMem(wopI32Store, 2, 0);
+      end;
+
+    { ---- FreeBASIC pointers -------------------------------------------
+
+      The ADDRESS side needs no opcode at all and that is worth saying: "@x"
+      lowers to the constant (backingArrayId+1) shl 32 and "@a(i)" to that
+      constant plus the index, so taking an address is ordinary integer
+      arithmetic that this backend already emitted. Only the DEREF and the
+      record-field pack are opcodes, which is why covering pointers is these
+      seven cases and no more. }
+
+    ssaRefLoadInt, ssaRefLoadFloat, ssaRefLoadString:
+      begin
+        if not BankIs(Instr.Src1, srtInt, OpName(Instr.OpCode) + ' address') then
+          Exit(False);
+        LoadReg(B, Instr.Src1);
+        B.Call(FRefLoad[Instr.Dest.RegType]);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString:
+      begin
+        if not BankIs(Instr.Src1, srtInt, OpName(Instr.OpCode) + ' address') then
+          Exit(False);
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FRefStore[Instr.Src2.RegType]);
+      end;
+
+    { @obj.field. ⚠️ The record's HANDLE is its linear address here, where
+      natively it is an index into a record table - so this pointer's numeric
+      value differs from the interpreter's while the managed one does not. It
+      is the deliberate half of the encoding: nothing but a print of the
+      pointer itself can tell, and the alternative was a second table. }
+    ssaRefAddrField:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('ssaRefAddrField without a constant field encoding'));
+        if (Instr.Src3.ConstInt < 0) or (Instr.Src3.ConstInt > RECPTR_SLOT_MASK) then
+          Exit(Fail('ssaRefAddrField with a field encoding too wide to pack'));
+        LoadReg(B, Instr.Src1);
+        B.I64Const(RECPTR_SLOT_BITS); B.Op(wopI64Shl);
+        B.I64Const(RECPTR_TAG or Instr.Src3.ConstInt);
+        B.Op(wopI64Or);
+        StoreReg(B, Instr.Dest);
       end;
 
     ssaArrayLBound, ssaArrayUBound:
@@ -6088,6 +6467,9 @@ begin
     if Length(FConstBytes) > 0 then
       FModule.DataSegment(STR_CONST_BASE, PByte(PAnsiChar(FConstBytes)),
                           Length(FConstBytes));
+    if Length(FArrTabBytes) > 0 then
+      FModule.DataSegment(FArrTabAddr, PByte(PAnsiChar(FArrTabBytes)),
+                          Length(FArrTabBytes));
     FModule.ExportMemory('memory');
   end;
   Init := TWasmBuf.Create;
@@ -6214,6 +6596,24 @@ begin
     FArrLBoundFunc := Next; FArrUBoundFunc := Next + 1;
     Inc(Next, 2);
   end;
+  { ⚠️ Conditional, so it is numbered sequentially and OUTSIDE the array block -
+    the same rule the string block's tail follows. It sits here because
+    EmitRecordHelpers runs right after EmitArrayHelpers and before the float
+    ones; move one and the other has to move with it. }
+  if FUsesRecArr then
+  begin
+    FRecNewArrFunc := Next;
+    Inc(Next);
+  end;
+  { Load then store for each bank, in bank order - the order EmitRefHelpers adds
+    them in. Conditional like the two above, and numbered sequentially for the
+    same reason. }
+  if FUsesPtr then
+    for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
+    begin
+      FRefLoad[RT] := Next; FRefStore[RT] := Next + 1;
+      Inc(Next, 2);
+    end;
 
   if FUsesFlt then
   begin
@@ -6243,6 +6643,8 @@ begin
   if FUsesHeap then EmitHeapHelpers;
   if FUsesStr then EmitStringHelpers;
   if FUsesArr then EmitArrayHelpers;
+  if FUsesRecArr then EmitRecordHelpers;
+  if FUsesPtr then EmitRefHelpers;
   if FUsesFlt then EmitFloatHelpers;
   if FUsesGfxPrim then EmitGfxHelpers;
 
