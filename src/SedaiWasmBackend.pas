@@ -271,6 +271,8 @@ type
     FAddrTaken: array of Boolean;
     FIndParam: array[TSSARegisterType] of Integer;
     FIndTypeIdx: LongWord;
+    FUsesPow: Boolean;
+    FPowFunc: LongWord;
     FIndResUsed: array[TSSARegisterType] of Boolean;
     FIndResGlobal: array[TSSARegisterType] of LongWord;
     FThunkIdx: array of LongWord;         // region -> its table entry
@@ -328,6 +330,7 @@ type
     procedure EmitRecordHelpers;
     procedure EmitRefHelpers;
     procedure EmitThunks;
+    procedure EmitPowHelper;
     procedure EmitRedimShape(B: TWasmBuf; Preserve: Boolean; NLower, NUpper: Integer);
     procedure LoadMemberDesc(B: TWasmBuf; const Handle: TSSAValue; Enc: Integer;
                              Allocate: Boolean);
@@ -566,6 +569,7 @@ begin
   FUsesGfxPrim := False;
   FUsesClock := False;
   FUsesTrig := False;
+  FUsesPow := False;
   FUsesGfx := False;
   FUsesStr := False;
   FUsesArr := False;
@@ -647,6 +651,11 @@ begin
           begin FUsesValInt := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
+        { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
+          una funzione che chiama un helper che il modulo non ha non è una
+          sorpresa a runtime - è un modulo che non carica. }
+        ssaPowFloat:
+          begin FUsesPow := True; FUsesTrig := True; end;
         ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
         ssaMathLog, ssaMathLog10, ssaMathLog2, ssaMathAsin, ssaMathAcos,
         ssaMathSinh, ssaMathCosh:
@@ -3240,6 +3249,93 @@ begin
   end;
 end;
 
+{ ---------------- "^" on floats ----------------
+
+  ⛔ NOT exp(y * ln x). That is only the LAST arm of what the interpreter runs,
+  and taking it for the whole thing would make "x ^ 2" differ from the native
+  answer in the last bits for no reason at all. The native side is FPC's
+  Math.Power, and this is its STRUCTURE, transcribed:
+
+    exponent = 0                         -> 1
+    base = 0 and exponent > 0            -> 0
+    |exponent| <= maxint, no fraction    -> intpower, binary exponentiation
+    otherwise                            -> exp(exponent * ln base)
+
+  ⭐ The third arm is the one that matters and the one that comes out BIT
+  IDENTICAL: it is nothing but f64 multiplications, and IEEE multiplication is
+  the same everywhere. It also covers what "^" is actually written for - a
+  square, a cube, an inverse square - so the common case does not depend on
+  anybody's library.
+  ⚠️ intpower inverts the BASE and not the result when the exponent is negative,
+  and the order is not cosmetic: 1/b then squaring rounds differently from
+  squaring then 1/result. Transcribed in FPC's order.
+  ⚠️ The last arm inherits the transcendentals' caveat this backend already
+  carries: exp and ln are the HOST's, and the host's are not FPC's - measured a
+  ulp apart on some arguments. A non-integer exponent is therefore as faithful
+  as SIN and COS are, and no more. }
+
+procedure TWasmBackend.EmitPowHelper;
+var
+  B: TWasmBuf;
+begin
+  B := TWasmBuf.Create;
+  try
+    // params 0 = base, 1 = exponent; locals 2 = i (i32), 3 = res, 4 = b
+    B.LocalGet(1); B.F64Const(0); B.Op(wopF64Eq);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.F64Const(1); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0); B.F64Const(0); B.Op(wopF64Eq);
+    B.LocalGet(1); B.F64Const(0); B.Op(wopF64Gt);
+    B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.F64Const(0); B.Op(wopReturn);
+    B.EndOp;
+
+    // an INTEGER exponent that fits a LongInt: binary exponentiation
+    B.LocalGet(1); B.Op(wopF64Abs); B.F64Const(2147483647); B.Op(wopF64Le);
+    B.LocalGet(1); B.LocalGet(1); B.Op(wopF64Trunc); B.Op(wopF64Sub);
+      B.F64Const(0); B.Op(wopF64Eq);
+    B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.TruncSat(wopfcI32TruncSatF64S); B.LocalSet(2);
+      B.LocalGet(0); B.LocalSet(4);
+      B.LocalGet(2); B.I32Const(0); B.Op(wopI32LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.F64Const(1); B.LocalGet(4); B.Op(wopF64Div); B.LocalSet(4);
+        B.I32Const(0); B.LocalGet(2); B.Op(wopI32Sub); B.LocalSet(2);   // i := abs(e)
+      B.EndOp;
+      B.F64Const(1); B.LocalSet(3);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(2); B.I32Const(0); B.Op(wopI32LeS); B.BrIf(1);
+          B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(2); B.I32Const(1); B.Op(wopI32And); B.BrIf(1);
+              B.LocalGet(2); B.I32Const(1); B.Op(wopI32ShrS); B.LocalSet(2);
+              B.LocalGet(4); B.LocalGet(4); B.Op(wopF64Mul); B.LocalSet(4);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+          B.LocalGet(2); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(2);
+          B.LocalGet(3); B.LocalGet(4); B.Op(wopF64Mul); B.LocalSet(3);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      B.LocalGet(3); B.Op(wopReturn);
+    B.EndOp;
+
+    B.LocalGet(1);
+    B.LocalGet(0); B.Call(FTrigFunc[5]);        // ln
+    B.Op(wopF64Mul);
+    B.Call(FTrigFunc[4]);                       // exp
+    FModule.AddFunction(FModule.TypeIndex([wvtF64, wvtF64], [wvtF64]),
+                        [wvtI32, wvtF64, wvtF64], B);
+  finally
+    B.Free;
+  end;
+end;
+
 { ---------------- the function table ----------------
 
   One thunk per address-taken procedure, all of them sharing the type a
@@ -5561,6 +5657,16 @@ begin
       1..Len writes NOTHING (fbc leaves the string untouched there, where the
       old rebuild used to prepend and grow it), and the replacement is cut to
       the room that remains. }
+    ssaPowFloat:
+      begin
+        if not BankIs(Instr.Src1, srtFloat, 'ssaPowFloat base') then Exit(False);
+        if not BankIs(Instr.Src2, srtFloat, 'ssaPowFloat exponent') then Exit(False);
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FPowFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaStrMidAssign:
       begin
         if not BankIs(Instr.Dest, srtString, 'ssaStrMidAssign target') then Exit(False);
@@ -7687,6 +7793,11 @@ begin
         FThunkIdx[r] := Next;
         Inc(Next);
       end;
+  if FUsesPow then
+  begin
+    FPowFunc := Next;
+    Inc(Next);
+  end;
   if FUsesPrint then
   begin
     FPrintIntFunc := Next;
@@ -7833,6 +7944,7 @@ begin
   for r := 0 to FRegionCount - 1 do
     if not EmitRegion(r) then Exit(False);
   if FIndirect then EmitThunks;
+  if FUsesPow then EmitPowHelper;
   if FUsesPrint then EmitPrintHelpers;
   if FUsesHeap then EmitHeapHelpers;
   if FUsesStr then EmitStringHelpers;
