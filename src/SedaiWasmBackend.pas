@@ -7057,7 +7057,11 @@ begin
     ssaCmpLeFloat: Cmp(wopF64Le);
     ssaCmpGeFloat: Cmp(wopF64Ge);
 
-    ssaIntToFloat: Un(wopF64ConvertI64S);
+    // Src3 = 1 says the source was UNSIGNED, and WASM has the instruction for it - the one case
+    // where the distinction costs nothing at all.
+    ssaIntToFloat:
+      if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then Un(wopF64ConvertI64U)
+      else Un(wopF64ConvertI64S);
     ssaFloatToInt:
       begin
         // The IMPLICIT conversion is dialect-dependent: FreeBASIC rounds half to

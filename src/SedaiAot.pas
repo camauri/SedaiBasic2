@@ -1000,6 +1000,16 @@ begin
   Result := IsB1Op(Ins.OpCode);
   if not Result then Exit;
   case Ins.OpCode of
+    // ⛔ An UNSIGNED int->float conversion (Src3 = 1) has no one-instruction form on x86-64 before
+    // AVX-512, and cvtsi2sd would read the magnitude as a signed number - a SILENT miscompile, not a
+    // slow path. Refused HERE, in the ONE gate the emitter and the prescan both consult, so it takes
+    // the helper road and the interpreter's own arm answers.
+    // ⛔⛔ Refusing it from inside the emitter's case arm instead left the destination unwritten and
+    // every such conversion printed 0; refusing it in AotStringNativeOK was simply inert, because
+    // that predicate is the STRING family's, not the general one. Two wrong hooks before the right
+    // one, and aot_validate found both - which is the whole reason that net exists.
+    ssaIntToFloat:
+      Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt = 1));
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:

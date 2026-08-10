@@ -596,6 +596,7 @@ type
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
     function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
+    procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
@@ -900,6 +901,13 @@ type
   end;
 
 implementation
+
+// Is this SSA value already a floating-point one? (A constant float, or a float-bank register.)
+function IsFloatOperand(const V: TSSAValue): Boolean;
+begin
+  Result := (V.Kind = svkConstFloat) or ((V.Kind = svkRegister) and (V.RegType = srtFloat));
+end;
+
 
 {$IFDEF DEBUG_SSA}
 uses SedaiDebug;
@@ -3008,7 +3016,15 @@ begin
 
       // Case 2: One operand is constant with algebraic identity
       // Mul by 0 = 0, Mul by 1 = other, Add 0 = other, etc.
-      if (Left.Kind = svkConstFloat) or (Right.Kind = svkConstFloat) then
+      //
+      // ⛔ Only when the operand that SURVIVES is already a float. "x * 1.0" handing back x unchanged
+      // is not an identity when x is an INTEGER: it drops the conversion the operation performs, so
+      // the expression comes out Integer where the language says Double. It showed as
+      // "ULongInt(max) * 1.0" printing the integer exactly instead of the double, and it took the
+      // unsigned conversion with it. A float operand keeps the identity; an integer one falls through
+      // to the ordinary lowering, which converts.
+      if ((Left.Kind = svkConstFloat) or (Right.Kind = svkConstFloat)) and
+         IsFloatOperand(Left) and IsFloatOperand(Right) then
       begin
         case Node.Token.TokenType of
           ttOpMul:
@@ -3132,14 +3148,14 @@ begin
       begin
         TempReg := FProgram.AllocRegister(srtFloat);
         TempVal := MakeSSARegister(srtFloat, TempReg);
-        EmitInstruction(ssaIntToFloat, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitIntToFloat(TempVal, Right, Node.GetChild(1));
         Right := TempVal;
       end
       else if (Left.RegType = srtInt) and (Right.RegType = srtFloat) then
       begin
         TempReg := FProgram.AllocRegister(srtFloat);
         TempVal := MakeSSARegister(srtFloat, TempReg);
-        EmitInstruction(ssaIntToFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitIntToFloat(TempVal, Left, Node.GetChild(0));
         Left := TempVal;
       end;
 
@@ -3312,14 +3328,14 @@ begin
           begin
             TempReg := FProgram.AllocRegister(srtFloat);
             TempVal := MakeSSARegister(srtFloat, TempReg);
-            EmitInstruction(ssaIntToFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitIntToFloat(TempVal, Left, Node.GetChild(0));
             Left := TempVal;
           end;
           if Right.RegType = srtInt then
           begin
             TempReg := FProgram.AllocRegister(srtFloat);
             TempVal := MakeSSARegister(srtFloat, TempReg);
-            EmitInstruction(ssaIntToFloat, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitIntToFloat(TempVal, Right, Node.GetChild(1));
             Right := TempVal;
           end;
 
@@ -3336,14 +3352,14 @@ begin
           begin
             TempReg := FProgram.AllocRegister(srtFloat);
             TempVal := MakeSSARegister(srtFloat, TempReg);
-            EmitInstruction(ssaIntToFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitIntToFloat(TempVal, Left, Node.GetChild(0));
             Left := TempVal;
           end;
           if Right.RegType = srtInt then
           begin
             TempReg := FProgram.AllocRegister(srtFloat);
             TempVal := MakeSSARegister(srtFloat, TempReg);
-            EmitInstruction(ssaIntToFloat, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitIntToFloat(TempVal, Right, Node.GetChild(1));
             Right := TempVal;
           end;
           DestReg := FProgram.AllocRegister(srtFloat);
@@ -3375,14 +3391,14 @@ begin
             begin
               TempReg := FProgram.AllocRegister(srtFloat);
               TempVal := MakeSSARegister(srtFloat, TempReg);
-              EmitInstruction(ssaIntToFloat, TempVal, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              EmitIntToFloat(TempVal, Left, Node.GetChild(0));
               Left := TempVal;
             end;
             if Right.RegType = srtInt then
             begin
               TempReg := FProgram.AllocRegister(srtFloat);
               TempVal := MakeSSARegister(srtFloat, TempReg);
-              EmitInstruction(ssaIntToFloat, TempVal, Right, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              EmitIntToFloat(TempVal, Right, Node.GetChild(1));
               Right := TempVal;
             end;
             DestReg := FProgram.AllocRegister(srtFloat);
@@ -19283,6 +19299,20 @@ begin
   Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
   if Idx < 0 then Exit(Value);
   Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value);
+end;
+
+// Convert an INT value to float, remembering whether the source was UNSIGNED. The distinction is
+// invisible in the register - both are 64 bits - and it is the whole answer: with u = ULongInt 42,
+// "(-u) / 2" is 9.223372036854776e+018 because the negation's bit pattern is a huge POSITIVE number,
+// and reading it as signed gives -21 instead. The flag rides in Src3, which the bytecode compiler maps
+// to the Immediate, so this stays ONE opcode with the signedness in an operand rather than two opcodes
+// a build can cover one of and forget the other.
+procedure TSSAGenerator.EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
+var Flag: TSSAValue;
+begin
+  if (SrcNode <> nil) and IsUnsigned64Expr(SrcNode) then Flag := MakeSSAConstInt(1)
+  else Flag := MakeSSAValue(svkNone);
+  EmitInstruction(ssaIntToFloat, Dest, Src, MakeSSAValue(svkNone), Flag);
 end;
 
 function TSSAGenerator.ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;

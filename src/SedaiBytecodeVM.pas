@@ -6885,7 +6885,13 @@ begin
       end;
     bcPowFloat: Ctx.FloatRegs[Instr.Dest] := Power(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
     bcNegFloat: Ctx.FloatRegs[Instr.Dest] := -Ctx.FloatRegs[Instr.Src1];
-    bcIntToFloat: Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+    // Immediate = 1: the source was UNSIGNED, so its bits are a magnitude. ⛔ This arm and the dense
+    // dispatch's are TWO implementations of one opcode, and the AOT's helper road reaches THIS one:
+    // correcting only the other left --aot answering -21 while the interpreter answered the right
+    // number, with the AOT's refusal working perfectly all along.
+    bcIntToFloat:
+      if Instr.Immediate = 1 then Ctx.FloatRegs[Instr.Dest] := QWord(Ctx.IntRegs[Instr.Src1])
+      else Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
     // The IMPLICIT float -> int conversion: FreeBASIC ROUNDS (to nearest, ties to even), it does not
     // truncate. It rounds everywhere the conversion is implicit -- assignment, argument passing, an array
     // store, an array INDEX, a FOR bound, a FUNCTION result -- so "Dim As Integer i : i = 1.5" is 2, and

@@ -679,7 +679,15 @@ begin
         bcNegFloat: begin FloatRegs[Instr.Dest] := -FloatRegs[Instr.Src1]; Inc(CurPC); end;
 
         // Type conversions
-        bcIntToFloat: begin FloatRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
+        // Immediate = 1: the SOURCE was UNSIGNED, so its bit pattern is a magnitude, not a signed
+        // number. Reading it signed turns (-u) into a small negative instead of the huge positive
+        // it is. One opcode, the signedness in the operand.
+        bcIntToFloat:
+          begin
+            if Instr.Immediate = 1 then FloatRegs[Instr.Dest] := QWord(IntRegs[Instr.Src1])
+            else FloatRegs[Instr.Dest] := IntRegs[Instr.Src1];
+            Inc(CurPC);
+          end;
         // Implicit float -> int: MODERN rounds (to nearest, ties to even), CLASSIC truncates. See the
         // ExecuteInstruction copy for why.
         bcFloatToInt: begin IntRegs[Instr.Dest] := FloatToIntConv(FloatRegs[Instr.Src1], ModernConv); Inc(CurPC); end;
