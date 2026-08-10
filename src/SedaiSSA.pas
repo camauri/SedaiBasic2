@@ -18990,6 +18990,21 @@ var
 
   // "f(x)" on one of the intrinsics above. Only reached when the name is not a user overload, so a program
   // that defines its own "Abs" for a UDT keeps its own return type.
+  // Does this literal node own the token it points at? Compared as NUMBERS, with the SOURCE's decimal
+  // point whatever the machine's locale says - a literal is written with '.' and nothing here may
+  // depend on where the program is compiled.
+  function LiteralOwnsToken(Node: TASTNode): Boolean;
+  var FS: TFormatSettings; D: Double;
+  begin
+    Result := False;
+    if not (Assigned(Node.Token) and VarIsNumeric(Node.Value)) then Exit;
+    FS := DefaultFormatSettings;
+    FS.DecimalSeparator := '.';
+    FS.ThousandSeparator := #0;
+    if not TryStrToFloat(Trim(VarToStr(Node.Token.Value)), D, FS) then Exit;
+    Result := D = Double(Node.Value);
+  end;
+
   function IntrinsicCallIsSingle(const Name: string; ArgsNode: TASTNode): Boolean;
   begin
     Result := IsSingleReturningIntrinsic(Name);
@@ -19098,9 +19113,16 @@ begin
       // "1.5f" / "1.5!" is a SINGLE literal. The suffix is dropped while lexing, so the token's
       // SingleSuffixed mark is all that survives to say so. Guarded like the ULong literal rule below: a
       // SYNTHESIZED literal borrows a neighbouring node's token, whose suffix says nothing about it.
+      //
+      // ⛔ That ownership test used to compare the two as TEXT, and that is a different question from
+      // the one it means to ask. The token carries the SOURCE SPELLING ("3.0"); the node carries the
+      // PARSED NUMBER, which renders as "3". So an ordinary "3.0f" failed to own its own token, and
+      // "3.0f * 16777217" was typed Double while the identical expression through a variable was
+      // Single. Comparing the NUMBERS asks the ownership question directly and does not care how
+      // either side is spelled.
       Result := Assigned(Node.Token) and Node.Token.SingleSuffixed and
                 (Node.Token.TokenType = ttNumber) and
-                (Trim(VarToStr(Node.Token.Value)) = Trim(VarToStr(Node.Value)));
+                LiteralOwnsToken(Node);
     antParentheses, antUnaryOp:
       if Node.ChildCount >= 1 then Result := IsSingleExpr(Node.GetChild(0));
     antBinaryOp:
