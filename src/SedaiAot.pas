@@ -387,6 +387,7 @@ var
   GArrStrNative: Boolean = False;
   GDivConstState: Integer = -1;    // C7 division by a constant: -1 unread, 0 off, 1 on
   GMathIntState: Integer = -1;     // INT()/FLOOR as roundsd: -1 unread, 0 off, 1 on
+  GBitOpState: Integer = -1;       // the MODERN bit intrinsics natively: -1 unread, 0 off, 1 on
   // Diagnostics: how many div/mod sites took the magic path and how many stayed on idiv, and why.
   GDivConstHit: Integer = 0;
   GDivConstMiss: Integer = 0;
@@ -423,6 +424,32 @@ begin
     else GMathIntState := 0;
   end;
   Result := GMathIntState = 1;
+end;
+
+// The MODERN bit intrinsics natively. Four of the five are BASELINE x86-64 - rol/ror, and bsr/bsf
+// for the two counts - so they need no feature test at all; only POPCNT is an extension (SSE4.2/ABM).
+//
+// ⚡ Why it is worth doing, priced rather than assumed: a helper call is not a call, it is a flush of
+// every allocated VM register plus the re-entry into ExecuteInstruction plus the reload. Measured on
+// a 20M-iteration loop, ONE intrinsic per iteration cost ~62 ns through the helper - and the same
+// loop without it runs in 16 ms under --aot against 1430 ms interpreted. So the intrinsic was 99% of
+// the compiled loop and --aot fell from 95x to 1.7x. Exactly the shape of the INT() story above.
+// ⚠️ The 62 ns is the ROUTE, not the arithmetic: ROTATELEFT (three shifts, no loop) and
+// COUNTLEADINGZEROS cost the same, and only COUNTONEBITS added ~25 ns for its software loop.
+//
+// ⭐ Unlike AotMathIntNative, the feature test here is EXACT: the RTL's Cpu unit does expose
+// POPCNTSupport, so there is no need for the conservative AVX proxy that one has to use.
+// AOT_BITOPS=0 forces all five back onto the helper, which is the A/B on one binary.
+function AotBitOpNative(Op: TSSAOpCode): Boolean;
+begin
+  if GBitOpState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_BITOPS') = '0' then GBitOpState := 0 else GBitOpState := 1;
+  end;
+  if GBitOpState <> 1 then Exit(False);
+  // Only popcnt needs the CPU to have it; without it that ONE opcode keeps the helper and the other
+  // four stay native, which is why the test is per-opcode and not per-family.
+  if Op = ssaBitPopcnt then Result := POPCNTSupport else Result := True;
 end;
 
 // Native record field access, gated so the two arrangements are A/B-able on ONE binary:
@@ -786,6 +813,10 @@ begin
     ssaIntToString, ssaStrVal, ssaStrValInt,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
+    // The MODERN bit intrinsics. Whether each is REALLY native is decided in AotIsNative
+    // (AotBitOpNative for the CPU feature, plus the constant width the lowering bakes in), the
+    // same predicate the prescan and the emitter read - they cannot disagree.
+    ssaBitClz, ssaBitCtz, ssaBitPopcnt, ssaBitRotl, ssaBitRotr,
     ssaMathSqr, ssaMathInt,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
@@ -971,6 +1002,12 @@ begin
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
     ssaMathInt:
       Result := AotMathIntNative;
+    // The width is baked into the lowering (a 32-bit form is a different instruction, not a mask),
+    // so a non-constant width falls back to the helper instead of guessing. The SSA always emits a
+    // constant there; this is the same defence the WASM backend keeps.
+    ssaBitClz, ssaBitCtz, ssaBitPopcnt, ssaBitRotl, ssaBitRotr:
+      Result := AotBitOpNative(Ins.OpCode) and (Ins.Src3.Kind = svkConstInt) and
+                ((Ins.Src3.ConstInt = 32) or (Ins.Src3.ConstInt = 64));
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
     ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -5579,6 +5616,99 @@ var
       end;
       ssaShr: ShrSat({Arith=} Modern);   // MODERN arithmetic, CLASSIC logical (both saturating)
       ssaShrUInt: ShrSat(False);
+
+      { The MODERN bit intrinsics. Width from the constant Src3 - AotIsNative already refused
+        anything else, so `w` is 32 or 64 here.
+        ⭐ A 32-bit form needs NO masking: a 32-bit operand-size instruction reads only eax and
+        writes it zero-extended, so `rol eax, cl` and `popcnt eax, eax` see exactly the low half
+        of whatever the register holds. Only the ROTATES then sign-extend, because their result is
+        the value a Long holds; the counts are 0..32 and cannot tell the two apart.
+        ⭐ And the rotate needs no guard at all, unlike the shifts right above: x86 masks the count
+        in cl by 63 (or 31), which IS the interpreter's rule, because the interpreter's rule was
+        chosen to be WebAssembly's. One instruction against ShrSat's two branches. }
+      ssaBitRotl, ssaBitRotr:
+      begin
+        w := CInt(Cur.Src3); if not OK then Exit;
+        ILoad(RAX, IReg(Cur.Src1));
+        ILoad(RCX, IReg(Cur.Src2));
+        if w = 32 then
+        begin
+          if Cur.OpCode = ssaBitRotl then E.EmitBytes([$D3, $C0])        // rol eax, cl
+          else                             E.EmitBytes([$D3, $C8]);      // ror eax, cl
+          E.EmitBytes([$48, $63, $C0]);                                  // movsxd rax, eax
+        end
+        else
+        begin
+          if Cur.OpCode = ssaBitRotl then E.EmitBytes([$48, $D3, $C0])   // rol rax, cl
+          else                             E.EmitBytes([$48, $D3, $C8]); // ror rax, cl
+        end;
+        IStore(IReg(Cur.Dest), RAX);
+      end;
+
+      { ⛔ bsr/bsf leave the DESTINATION undefined when the source is zero - which is precisely the
+        case these intrinsics define (the answer is the width). Hence the cmov, and hence the order:
+        `sub` clobbers the flags bsr set, so the zero test is redone with `test` AFTER it. Branch-free,
+        so nothing here depends on how often zero shows up. }
+      ssaBitClz:
+      begin
+        w := CInt(Cur.Src3); if not OK then Exit;
+        ILoad(RAX, IReg(Cur.Src1));
+        if w = 32 then
+        begin
+          E.EmitBytes([$0F, $BD, $D0]);                                  // bsr edx, eax
+          E.EmitBytes([$B9, $1F, $00, $00, $00]);                        // mov ecx, 31
+          E.EmitBytes([$29, $D1]);                                       // sub ecx, edx  (31 - msb)
+          E.EmitBytes([$BA, $20, $00, $00, $00]);                        // mov edx, 32
+          E.EmitBytes([$85, $C0]);                                       // test eax, eax
+          E.EmitBytes([$0F, $44, $CA]);                                  // cmovz ecx, edx
+          E.EmitBytes([$89, $C8]);                                       // mov eax, ecx (zero-extends)
+        end
+        else
+        begin
+          E.EmitBytes([$48, $0F, $BD, $D0]);                             // bsr rdx, rax
+          E.EmitBytes([$B9, $3F, $00, $00, $00]);                        // mov ecx, 63
+          E.EmitBytes([$48, $29, $D1]);                                  // sub rcx, rdx  (63 - msb)
+          E.EmitBytes([$BA, $40, $00, $00, $00]);                        // mov edx, 64
+          E.EmitBytes([$48, $85, $C0]);                                  // test rax, rax
+          E.EmitBytes([$48, $0F, $44, $CA]);                             // cmovz rcx, rdx
+          E.EmitBytes([$48, $89, $C8]);                                  // mov rax, rcx
+        end;
+        IStore(IReg(Cur.Dest), RAX);
+      end;
+
+      ssaBitCtz:
+      begin
+        w := CInt(Cur.Src3); if not OK then Exit;
+        ILoad(RAX, IReg(Cur.Src1));
+        if w = 32 then
+        begin
+          E.EmitBytes([$0F, $BC, $C8]);                                  // bsf ecx, eax
+          E.EmitBytes([$BA, $20, $00, $00, $00]);                        // mov edx, 32
+          E.EmitBytes([$85, $C0]);                                       // test eax, eax
+          E.EmitBytes([$0F, $44, $CA]);                                  // cmovz ecx, edx
+          E.EmitBytes([$89, $C8]);                                       // mov eax, ecx
+        end
+        else
+        begin
+          E.EmitBytes([$48, $0F, $BC, $C8]);                             // bsf rcx, rax
+          E.EmitBytes([$BA, $40, $00, $00, $00]);                        // mov edx, 64
+          E.EmitBytes([$48, $85, $C0]);                                  // test rax, rax
+          E.EmitBytes([$48, $0F, $44, $CA]);                             // cmovz rcx, rdx
+          E.EmitBytes([$48, $89, $C8]);                                  // mov rax, rcx
+        end;
+        IStore(IReg(Cur.Dest), RAX);
+      end;
+
+      // The only one that is not baseline: AotIsNative already checked POPCNTSupport, so reaching
+      // here means the CPU has it. Without it this opcode alone keeps the helper.
+      ssaBitPopcnt:
+      begin
+        w := CInt(Cur.Src3); if not OK then Exit;
+        ILoad(RAX, IReg(Cur.Src1));
+        if w = 32 then E.EmitBytes([$F3, $0F, $B8, $C0])                 // popcnt eax, eax
+        else           E.EmitBytes([$F3, $48, $0F, $B8, $C0]);           // popcnt rax, rax
+        IStore(IReg(Cur.Dest), RAX);
+      end;
 
       ssaCmpEqInt: IntCmp($94); ssaCmpNeInt: IntCmp($95);
       ssaCmpLtInt: IntCmp($9C); ssaCmpGtInt: IntCmp($9F);
