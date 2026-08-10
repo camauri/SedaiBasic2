@@ -818,6 +818,12 @@ begin
     // same predicate the prescan and the emitter read - they cannot disagree.
     ssaBitClz, ssaBitCtz, ssaBitPopcnt, ssaBitRotl, ssaBitRotr,
     ssaMathSqr, ssaMathInt,
+    // ABS is one instruction and SGN is a pair of compares; both were going through the helper at
+    // ~76 ns a call, which on a float loop is 34x the whole compiled body. ⛔ FIX/FRAC are NOT here
+    // on purpose: their negative-zero rule in the interpreter is self-inconsistent (Fix(-0.5) = -0
+    // but Fix(-0.0) = +0, while Int(-0.0) = -0), and a lowering must not cement that before it is
+    // decided. The transcendentals need the leaf-call table, which is a block of its own.
+    ssaMathAbs, ssaMathSgn,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
@@ -5562,6 +5568,39 @@ var
         d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
         FLoad(XMM0, s1v);
         E.EmitBytes([$66, $0F, $3A, $0B, $C0, $01]);   // roundsd xmm0, xmm0, 1  (round toward -inf)
+        FStore(d, XMM0);
+      end;
+
+      // ABS is the sign BIT cleared - MEASURED, not assumed: the interpreter's Abs gives +QNaN for
+      // both NaN signs and +0 for -0, which is exactly what andpd does and is NOT what a
+      // compare-and-negate would do.
+      ssaMathAbs:
+      begin
+        d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
+        FLoad(XMM0, s1v);
+        MovImm64(RAX, Int64($7FFFFFFFFFFFFFFF));
+        E.EmitBytes([$66, $48, $0F, $6E, $C8]);        // movq xmm1, rax   (mask)
+        E.EmitBytes([$66, $0F, $54, $C1]);             // andpd xmm0, xmm1
+        FStore(d, XMM0);
+      end;
+
+      // SGN as (x > 0) - (0 > x), which is the interpreter's three-way test including its two edges:
+      // ⚠️ the comparison is written so an UNORDERED operand answers false BOTH times, giving 0 - and
+      // Sgn(NaN) is 0 in the interpreter (its chain falls through to the else). Testing "x < 0" with
+      // setb instead would be true when unordered and answer -1.
+      ssaMathSgn:
+      begin
+        d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
+        FLoad(XMM0, s1v);
+        E.EmitBytes([$66, $0F, $57, $C9]);             // xorpd xmm1, xmm1     (0.0)
+        E.EmitBytes([$66, $0F, $2E, $C1]);             // ucomisd xmm0, xmm1   (x vs 0)
+        E.EmitBytes([$0F, $97, $C0]);                  // seta al   -> x > 0
+        E.EmitBytes([$66, $0F, $2E, $C8]);             // ucomisd xmm1, xmm0   (0 vs x)
+        E.EmitBytes([$0F, $97, $C1]);                  // seta cl   -> x < 0
+        E.EmitBytes([$0F, $B6, $C0]);                  // movzx eax, al
+        E.EmitBytes([$0F, $B6, $C9]);                  // movzx ecx, cl
+        E.EmitBytes([$29, $C8]);                       // sub eax, ecx         (1 / -1 / 0)
+        E.EmitBytes([$F2, $0F, $2A, $C0]);             // cvtsi2sd xmm0, eax
         FStore(d, XMM0);
       end;
 

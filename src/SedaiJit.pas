@@ -26,7 +26,8 @@ unit SedaiJit;
 interface
 
 uses
-  SysUtils, SedaiBytecodeTypes, SedaiX86Emitter;
+  SysUtils, SedaiBytecodeTypes, SedaiX86Emitter,
+  Cpu;   // AVXSupport / POPCNTSupport: the two runtime feature tests the lowerings below are gated on
 
 type
   // Re-exported so existing clients (SedaiBytecodeVM) keep compiling against this unit;
@@ -396,6 +397,116 @@ var
     else IStore(I^.Dest, RAX);                    // div -> quotient
   end;
 
+  // UNSIGNED div/mod. Shorter than the signed form above because there is no overflow case: only a
+  // zero divisor, which the interpreter raises on, so it deopts. Same lowering as the AOT's.
+  procedure DivModUnsigned(apc: Integer; WantRemainder: Boolean);
+  var p1: Integer;
+  begin
+    ILoad(RAX, I^.Src1);                          // rax = dividend
+    ILoad(RCX, I^.Src2);                          // rcx = divisor
+    E.EmitBytes([$48, $85, $C9]);                 // test rcx, rcx
+    E.EmitBytes([$75, $00]); p1 := E.Len - 1;     // jnz over-deopt
+    DeoptTo(apc);                                  // divisor == 0 -> interpreter raises
+    E.PatchByte(p1, Byte(E.Len - (p1 + 1)));
+    E.EmitBytes([$31, $D2]);                      // xor edx, edx  (zero the high half)
+    E.EmitBytes([$48, $F7, $F1]);                 // div rcx
+    if WantRemainder then IStore(I^.Dest, RDX)
+    else IStore(I^.Dest, RAX);
+  end;
+
+  // SHR with the interpreter's SATURATING rule, not the hardware's masked shift: a count at or past
+  // the width gives the sign (arithmetic) or zero (logical), and a count <= 0 leaves the value alone.
+  // ⛔ `shr rax, cl` alone would be WRONG here - x86 masks the count by 63, so "v Shr 64" would be v.
+  // Transcribed from the AOT's ShrSat, which aot_validate exercises; the two must not drift.
+  procedure ShrSat(Arith: Boolean);
+  var pKeep, pDo, pDone: Integer;
+  begin
+    ILoad(RAX, I^.Src1);
+    ILoad(RCX, I^.Src2);
+    E.EmitBytes([$48, $85, $C9]);                 // test rcx, rcx
+    E.EmitBytes([$7E, $00]); pKeep := E.Len - 1;  // jle @done   (count <= 0 -> value unchanged)
+    E.EmitBytes([$48, $83, $F9, $40]);            // cmp rcx, 64
+    E.EmitBytes([$7C, $00]); pDo := E.Len - 1;    // jl @shift
+    if Arith then E.EmitBytes([$48, $C1, $F8, $3F])   // sar rax, 63  (saturate to the sign)
+    else          E.EmitBytes([$31, $C0]);            // xor eax, eax (saturate to 0)
+    E.EmitBytes([$EB, $00]); pDone := E.Len - 1;  // jmp @done
+    E.PatchByte(pDo, Byte(E.Len - (pDo + 1)));
+    if Arith then E.EmitBytes([$48, $D3, $F8])        // sar rax, cl
+    else          E.EmitBytes([$48, $D3, $E8]);       // shr rax, cl
+    E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
+    E.PatchByte(pKeep, Byte(E.Len - (pKeep + 1)));
+    IStore(I^.Dest, RAX);
+  end;
+
+  // The MODERN bit intrinsics, width (32 or 64) in the Immediate. Same lowering as the AOT's:
+  // rol/ror need no guard at all (x86 masks the count to exactly the modulo the language defines),
+  // while bsr/bsf leave their destination UNDEFINED at zero - which is the case these intrinsics
+  // define - hence the cmov, and hence redoing the zero test with `test` AFTER the `sub` that
+  // clobbers the flags bsr set. A 32-bit form needs no masking: a 32-bit operand-size instruction
+  // reads only eax; only the rotates sign-extend, because their result is what a Long holds.
+  procedure BitIntrinsic;
+  var w32: Boolean;
+  begin
+    w32 := I^.Immediate = 32;
+    ILoad(RAX, I^.Src1);
+    case I^.OpCode of
+      bcBitRotl, bcBitRotr:
+        begin
+          ILoad(RCX, I^.Src2);
+          if w32 then
+          begin
+            if I^.OpCode = bcBitRotl then E.EmitBytes([$D3, $C0])        // rol eax, cl
+            else                           E.EmitBytes([$D3, $C8]);      // ror eax, cl
+            E.EmitBytes([$48, $63, $C0]);                                // movsxd rax, eax
+          end
+          else if I^.OpCode = bcBitRotl then E.EmitBytes([$48, $D3, $C0])   // rol rax, cl
+          else                                E.EmitBytes([$48, $D3, $C8]); // ror rax, cl
+        end;
+      bcBitClz:
+        if w32 then
+        begin
+          E.EmitBytes([$0F, $BD, $D0]);                                  // bsr edx, eax
+          E.EmitBytes([$B9, $1F, $00, $00, $00]);                        // mov ecx, 31
+          E.EmitBytes([$29, $D1]);                                       // sub ecx, edx
+          E.EmitBytes([$BA, $20, $00, $00, $00]);                        // mov edx, 32
+          E.EmitBytes([$85, $C0]);                                       // test eax, eax
+          E.EmitBytes([$0F, $44, $CA]);                                  // cmovz ecx, edx
+          E.EmitBytes([$89, $C8]);                                       // mov eax, ecx
+        end
+        else
+        begin
+          E.EmitBytes([$48, $0F, $BD, $D0]);                             // bsr rdx, rax
+          E.EmitBytes([$B9, $3F, $00, $00, $00]);                        // mov ecx, 63
+          E.EmitBytes([$48, $29, $D1]);                                  // sub rcx, rdx
+          E.EmitBytes([$BA, $40, $00, $00, $00]);                        // mov edx, 64
+          E.EmitBytes([$48, $85, $C0]);                                  // test rax, rax
+          E.EmitBytes([$48, $0F, $44, $CA]);                             // cmovz rcx, rdx
+          E.EmitBytes([$48, $89, $C8]);                                  // mov rax, rcx
+        end;
+      bcBitCtz:
+        if w32 then
+        begin
+          E.EmitBytes([$0F, $BC, $C8]);                                  // bsf ecx, eax
+          E.EmitBytes([$BA, $20, $00, $00, $00]);                        // mov edx, 32
+          E.EmitBytes([$85, $C0]);                                       // test eax, eax
+          E.EmitBytes([$0F, $44, $CA]);                                  // cmovz ecx, edx
+          E.EmitBytes([$89, $C8]);                                       // mov eax, ecx
+        end
+        else
+        begin
+          E.EmitBytes([$48, $0F, $BC, $C8]);                             // bsf rcx, rax
+          E.EmitBytes([$BA, $40, $00, $00, $00]);                        // mov edx, 64
+          E.EmitBytes([$48, $85, $C0]);                                  // test rax, rax
+          E.EmitBytes([$48, $0F, $44, $CA]);                             // cmovz rcx, rdx
+          E.EmitBytes([$48, $89, $C8]);                                  // mov rax, rcx
+        end;
+      bcBitPopcnt:
+        if w32 then E.EmitBytes([$F3, $0F, $B8, $C0])                    // popcnt eax, eax
+        else        E.EmitBytes([$F3, $48, $0F, $B8, $C0]);              // popcnt rax, rax
+    end;
+    IStore(I^.Dest, RAX);
+  end;
+
   // mov <reg>, [r8 + disp32]   (REX.W + REX.B; r8 = array descriptor base)
   // mov <reg (rax/rcx/rdx, <8)>, [r8+disp]   (REX.W + REX.B for r8 base)
   procedure R8Load(RegField: Byte; Disp: LongWord);
@@ -761,6 +872,9 @@ var
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
         bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
+        bcFloatRound: T(J^.Src1);                    // CINT: float input, int Dest (-> ScanI)
+        bcNegFloat, bcNarrowSingle, bcMathInt, bcMathAbs, bcMathSgn:
+          begin T(J^.Dest); T(J^.Src1); end;
       end;
     end;
   end;
@@ -798,8 +912,19 @@ var
         bcRecordLoadFloat, bcRecordStoreFloat: T(J^.Src1);       // Src1=handle (int); value is a float reg
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
-        bcFloatToInt: T(J^.Dest);                    // float->int writes an int result reg
+        bcFloatToInt, bcFloatRound: T(J^.Dest);      // float->int writes an int result reg
         bcJumpIfZero, bcJumpIfNotZero: T(J^.Src1);
+        // ⛔ EVERY opcode the emitter lowers must appear in this scanner, and the failure mode is not
+        // a missed optimisation: ILoc is sized to IMaxReg+2 from the pass below, and IAlloc indexes it
+        // WITHOUT a bounds check - so a register mentioned only by a forgotten opcode reads past the
+        // array and can come back as a plausible GPR number. Silent miscompile, not a bail.
+        bcNegInt, bcBitwiseNot, bcBitClz, bcBitCtz, bcBitPopcnt:
+          begin T(J^.Dest); T(J^.Src1); end;
+        bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor,
+        bcShl, bcShr, bcShrUInt, bcDivUInt, bcModUInt,
+        bcBitRotl, bcBitRotr,
+        bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt:
+          begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
       end;
     end;
   end;
@@ -1088,8 +1213,122 @@ var
           end;
           IStore(I^.Dest, RAX);
         end;
+      // Unsigned div/mod: same deopt-on-zero shape as the signed pair, so the same restriction -
+      // a deopt inside an inlined callee would lose its native frame.
+      bcDivUInt: if InCallee or InGosub then Exit else DivModUnsigned(apc, False);
+      bcModUInt: if InCallee or InGosub then Exit else DivModUnsigned(apc, True);
+      bcNegInt:
+        begin
+          ILoad(RAX, I^.Src1);
+          E.EmitBytes([$48, $F7, $D8]);             // neg rax
+          IStore(I^.Dest, RAX);
+        end;
+      // The bitwise family. Nothing here can trap or depend on the dialect, which is why it took
+      // three lines each and had been missing anyway - one AND in a loop bailed the whole JIT.
+      bcBitwiseAnd:
+        begin
+          ILoad(RAX, I^.Src1);
+          IOp([$48, $23], RAX, I^.Src2);            // and rax, src2
+          IStore(I^.Dest, RAX);
+        end;
+      bcBitwiseOr:
+        begin
+          ILoad(RAX, I^.Src1);
+          IOp([$48, $0B], RAX, I^.Src2);            // or rax, src2
+          IStore(I^.Dest, RAX);
+        end;
+      bcBitwiseXor:
+        begin
+          ILoad(RAX, I^.Src1);
+          IOp([$48, $33], RAX, I^.Src2);            // xor rax, src2
+          IStore(I^.Dest, RAX);
+        end;
+      bcBitwiseNot:
+        begin
+          ILoad(RAX, I^.Src1);
+          E.EmitBytes([$48, $F7, $D0]);             // not rax
+          IStore(I^.Dest, RAX);
+        end;
+      // ⚠️ SHL masks (that is what FPC does, and the interpreter leaves it to FPC) but SHR
+      // SATURATES - the asymmetry is the interpreter's and is mirrored, not tidied away.
+      bcShl:
+        begin
+          ILoad(RAX, I^.Src1);
+          ILoad(RCX, I^.Src2);
+          E.EmitBytes([$48, $D3, $E0]);             // shl rax, cl
+          IStore(I^.Dest, RAX);
+        end;
+      bcShr:     ShrSat({Arith=} Modern);           // MODERN arithmetic, CLASSIC logical
+      bcShrUInt: ShrSat(False);
+      bcBitClz, bcBitCtz, bcBitRotl, bcBitRotr: BitIntrinsic;
+      // popcnt is the only one of the five that is not baseline x86-64. Without the feature the loop
+      // bails, which is the JIT's contract: bit-identical or nothing.
+      bcBitPopcnt: if not POPCNTSupport then Exit else BitIntrinsic;
       bcArrayLBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, False);
       bcArrayUBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, True);
+      bcNegFloat:
+        begin
+          // Flip the sign BIT, which is what unary minus on a double is - not "0 - x", which would
+          // turn -0.0 into +0.0 and change what the interpreter prints.
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$48, $B8]); E.Emit64(QWord($8000000000000000));  // mov rax, sign mask
+          E.EmitBytes([$66, $48, $0F, $6E, $C8]);   // movq xmm1, rax
+          E.EmitBytes([$66, $0F, $57, $C1]);        // xorpd xmm0, xmm1
+          FStore(I^.Dest, XMM0);
+        end;
+      bcNarrowSingle:
+        begin
+          // A demote followed by a promote: the value stays a Double that has lost the bits a Single
+          // cannot carry, and that loss is observable, so it is not a no-op.
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$F2, $0F, $5A, $C0]);        // cvtsd2ss xmm0, xmm0
+          E.EmitBytes([$F3, $0F, $5A, $C0]);        // cvtss2sd xmm0, xmm0
+          FStore(I^.Dest, XMM0);
+        end;
+      bcFloatRound:
+        begin
+          // CINT: FPC's Round is round-half-to-EVEN, which is cvtsd2si under the default mode.
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$F2, $48, $0F, $2D, $C0]);   // cvtsd2si rax, xmm0
+          IStore(I^.Dest, RAX);
+        end;
+      // INT()/FLOOR is one instruction - roundsd toward -inf - on any CPU with SSE4.1. The RTL
+      // exposes no SSE4.1 test, so this uses AVX as the AOT does: conservative in the safe
+      // direction, since AVX implies SSE4.1 and a machine without it just keeps bailing as before.
+      bcMathInt:
+        if not AVXSupport then Exit
+        else
+        begin
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$66, $0F, $3A, $0B, $C0, $01]);   // roundsd xmm0, xmm0, 1
+          FStore(I^.Dest, XMM0);
+        end;
+      // ABS = clear the sign BIT. Measured against the interpreter, not assumed: its Abs gives
+      // +QNaN for either NaN sign and +0 for -0, which is andpd and not a compare-and-negate.
+      bcMathAbs:
+        begin
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$48, $B8]); E.Emit64(QWord($7FFFFFFFFFFFFFFF));
+          E.EmitBytes([$66, $48, $0F, $6E, $C8]);   // movq xmm1, rax
+          E.EmitBytes([$66, $0F, $54, $C1]);        // andpd xmm0, xmm1
+          FStore(I^.Dest, XMM0);
+        end;
+      // SGN = (x > 0) - (0 > x). ⚠️ Both tests use seta so an UNORDERED operand answers false twice
+      // and the result is 0, which is what the interpreter's if/else-if chain gives for a NaN.
+      bcMathSgn:
+        begin
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$66, $0F, $57, $C9]);        // xorpd xmm1, xmm1
+          E.EmitBytes([$66, $0F, $2E, $C1]);        // ucomisd xmm0, xmm1
+          E.EmitBytes([$0F, $97, $C0]);             // seta al
+          E.EmitBytes([$66, $0F, $2E, $C8]);        // ucomisd xmm1, xmm0
+          E.EmitBytes([$0F, $97, $C1]);             // seta cl
+          E.EmitBytes([$0F, $B6, $C0]);             // movzx eax, al
+          E.EmitBytes([$0F, $B6, $C9]);             // movzx ecx, cl
+          E.EmitBytes([$29, $C8]);                  // sub eax, ecx
+          E.EmitBytes([$F2, $0F, $2A, $C0]);        // cvtsi2sd xmm0, eax
+          FStore(I^.Dest, XMM0);
+        end;
       bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
       bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
       bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
@@ -1195,6 +1434,12 @@ var
       bcCmpGeInt: IntCmp($9D);                      // setge
       bcCmpEqInt: IntCmp($94);                      // sete
       bcCmpNeInt: IntCmp($95);                      // setne
+      // The UNSIGNED comparisons a UInteger/ULongInt operand selects: the same shape with the
+      // below/above condition codes. Eq/Ne need no unsigned form - equality does not read the sign.
+      bcCmpLtUInt: IntCmp($92);                     // setb
+      bcCmpLeUInt: IntCmp($96);                     // setbe
+      bcCmpGtUInt: IntCmp($97);                     // seta
+      bcCmpGeUInt: IntCmp($93);                     // setae
       bcCmpLtFloat: FloatCmp(0);
       bcCmpLeFloat: FloatCmp(1);
       bcCmpGtFloat: FloatCmp(2);
