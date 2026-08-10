@@ -1018,6 +1018,10 @@ var
         bcStrChr, bcIntToString: T(J^.Src1);                             // Src1 = the int operand
         bcStrMid: begin T(J^.Src2); T(Word(J^.Immediate and $FFFF)); end;   // start + length REGISTER
         bcStrInstr: begin T(J^.Dest); T(Word(J^.Immediate and $FFFF)); end; // result + start REGISTER
+        bcStrAscMid: begin T(J^.Dest); T(J^.Src2); T(Word(J^.Immediate and $FFFF)); end;
+        bcStrConcatCharAt, bcStrAppendMapped: T(Word(J^.Immediate and $FFFF));  // the index REGISTER
+        bcRecordNew: T(J^.Dest);            // Src1/Src2/Immediate are slot COUNTS, not registers
+        bcRecordFree: T(J^.Src1);           // the handle
       end;
     end;
   end;
@@ -1562,6 +1566,70 @@ var
     CmpBoolToDest;                                               // al (0/1) -> Dest := TrueVal/0
   end;
 
+  // Dest(int) := ASC(MID$(src, start, len)) without building the substring.
+  // ⚠️ The primitive's second and FOURTH parameters are start and length; the third is a filler that
+  // exists only so the argument shape matches the family. Read from the DECLARATION, not from the
+  // ctx comment, which lists them in a different order.
+  procedure EmitStrAscMidJ(dReg, sSlot, stReg, lnReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG1, stReg);
+    ILoadTo(ABI_ARG3, lnReg);                                    // r9 on Win64: last of the pooled reads
+    StrBaseRax;
+    MovLoadR(ABI_ARG0, RAX, LongWord(sSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRASCMID));
+    LeafRestore;
+    IStore(dReg, RAX);
+  end;
+  // ⛔ The two fused ACCUMULATOR forms - bcStrConcatCharAt and bcStrAppendMapped - are NOT lowered
+  // here, and the reason is not effort: NOTHING IN THE PIPELINE PRODUCES THEM TODAY. The SSA fusion
+  // that made ssaStrConcatCharAt is switched off because it miscompiled (five values, four operand
+  // slots), and the bytecode fusion that made bcStrAppendMapped is closed by measurement - see the
+  // long note in SedaiSuperinstructions.pas, where it came out FOUR TIMES slower under the AOT.
+  // Writing an emitter for them would be twenty machine instructions apiece that no program can
+  // reach, and unexercised codegen is worse than none: the helper route already carries them,
+  // correctly, on the day the fusion comes back. (Their INT operands stay declared in ScanI, which
+  // costs nothing and is the side to be wrong on.)
+  // rdst := [rsp+CtxDisp] - the executing context object, which the record primitives take directly
+  // (unlike the string ones, which want the bank base inside it).
+  procedure CtxObjTo(dst: Integer);
+  var rex: Byte;
+  begin
+    rex := $48; if dst >= 8 then rex := rex or $04;
+    E.Emit8(rex); E.Emit8($8B);
+    E.Emit8($80 or ((dst and 7) shl 3) or RSP); E.Emit8($24);
+    E.Emit32(LongWord(CtxDisp));
+  end;
+  // C6 in the JIT: Dest(int) := AotRecordNew(VMSelf, CtxObj, intSlots|floatSlots<<32, Immediate).
+  // The three slot counts are not registers - the bytecode compiler puts them in Src1/Src2/Immediate -
+  // so they are baked and the call reads no bank at all.
+  procedure EmitRecordNewJ(dReg: Integer; src1, src2: Word; imm: Int64);
+  begin
+    SpillVol; LeafSaveBases;
+    MovImm64(ABI_ARG0, PtrInt(VMSelf));
+    CtxObjTo(ABI_ARG1);
+    MovImm64(ABI_ARG2, Int64(LongWord(src1)) or (Int64(LongWord(src2)) shl 32));
+    MovImm64(ABI_ARG3, imm);
+    LeafCall(Prim(AOTCTX_RECNEW));
+    LeafRestore;
+    IStore(dReg, RAX);
+  end;
+  procedure EmitRecordFreeJ(hReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG1, hReg);                                     // the handle, read while the pool is intact
+    MovImm64(ABI_ARG0, PtrInt(VMSelf));
+    LeafCall(Prim(AOTCTX_RECFREE));
+    LeafRestore;
+  end;
+  procedure EmitRecMarkJ(IsPush: Boolean);
+  begin
+    SpillVol; LeafSaveBases;
+    CtxObjTo(ABI_ARG0);
+    if IsPush then LeafCall(Prim(AOTCTX_RECMARKPUSH)) else LeafCall(Prim(AOTCTX_RECMARKPOP));
+    LeafRestore;
+  end;
+
   // Return the call-site index for a bcCallSub at absolute PC apc (populated by BuildCallSites), or -1
   // if that call was found non-inlinable (then the op stays unsupported and the loop bails).
   function FindCallSite(apc: Integer): Integer;
@@ -1938,7 +2006,7 @@ var
         if RoutesRecords then
         begin
           if InCallee or InGosub then Exit;
-          EmitHelperCall(apc);
+          if UseLeaf then EmitRecMarkJ(I^.OpCode = bcRecMarkPush) else EmitHelperCall(apc);
         end;
       // Inlined SUB call (J6): FramePush (native bank save) + inline callee body (all-memory) + FramePop.
       bcCallSub:
@@ -2084,6 +2152,17 @@ var
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcStrValInt:
         if UseLeaf and not (InCallee or InGosub) then EmitStrValIntJ(I^.Dest, I^.Src1, I^.Immediate)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrAscMid:
+        if UseLeaf and not (InCallee or InGosub) then
+          EmitStrAscMidJ(I^.Dest, I^.Src1, I^.Src2, Integer(I^.Immediate and $FFFF))
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcRecordNew:
+        if UseLeaf and not (InCallee or InGosub) then
+          EmitRecordNewJ(I^.Dest, I^.Src1, I^.Src2, I^.Immediate)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcRecordFree:
+        if UseLeaf and not (InCallee or InGosub) then EmitRecordFreeJ(I^.Src1)
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString:
         if UseLeaf and not (InCallee or InGosub) then
