@@ -3464,6 +3464,20 @@ begin
           end;
         end;
 
+        // IEEE 754 again, on the other side of the operation: an operation on binary32 takes binary32
+        // OPERANDS, so anything entering a SINGLE-typed operation is converted first. Narrowing a value
+        // that is already binary32 is a no-op, so both operands can go through it unconditionally and
+        // the rule needs no per-operand type test. What it buys is not theory: "3.0! * 16777217" is
+        // 50331648 in fbc and was 50331652 here, because the integer reached the multiply with bits
+        // binary32 cannot hold.
+        // ⛔ Only on a FLOAT operation. This tail is shared with the INTEGER branch, and narrowing
+        // there converted the operands of "s Mod 3" into float registers feeding an integer opcode -
+        // caught by the corpus as an OPTDIFF, which is what that check is for.
+        if (Result.Kind = svkRegister) and (Result.RegType = srtFloat) and IsSingleExpr(Node) then
+        begin
+          Left := ApplyNarrowCode(7, Left);
+          Right := ApplyNarrowCode(7, Right);
+        end;
         EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
         // IEEE 754: an operation on binary32 produces a binary32. A SINGLE-typed arithmetic operation
         // is therefore rounded to 32 bits HERE, not merely on the way into a variable - carrying wide
@@ -19241,14 +19255,29 @@ begin
   Result := Value;
   if W = 7 then
   begin
-    // SINGLE: round a float value to single precision.
+    // SINGLE: round a value to what binary32 can carry.
+    // ⛔ An INTEGER value has to come through here too, and it used to fall straight past: the two
+    // arms below only knew about floats, so "Dim As Single t : t = 16777217" stored 16777217 - a
+    // number binary32 cannot represent at all - where fbc stores 16777216. SINGLE is an arithmetic
+    // TYPE, not just a storage format, and everything entering it is converted.
     if Value.Kind = svkConstFloat then
       Result := MakeSSAConstFloat(Single(Value.ConstFloat))
+    else if Value.Kind = svkConstInt then
+      Result := MakeSSAConstFloat(Single(Double(Value.ConstInt)))
     else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
     begin
       NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
       EmitInstruction(ssaNarrowSingle, NarrowReg, Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Result := NarrowReg;
+    end
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtInt) then
+    begin
+      // int register -> float, then round: the conversion to binary32 is the point, and an integer
+      // above 2^24 loses bits exactly as it does in fbc.
+      NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaIntToFloat, NarrowReg, Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaNarrowSingle, Result, NarrowReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
   end
   else if (W >= 1) and (W <= 6) then
