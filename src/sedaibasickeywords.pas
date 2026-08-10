@@ -278,6 +278,10 @@ const
   kMINF     = 'MIN';       // IEEE minimum(x, y)
   kMAXF     = 'MAX';       // IEEE maximum(x, y)
   kCOPYSIGN = 'COPYSIGN';  // magnitude of x with the sign of y
+  // The bit pattern of a 32-bit float, and back. Not a conversion: the BITS are reinterpreted, which
+  // is the one thing arithmetic cannot express and WASM has an instruction for.
+  kSINGLEBITS   = 'SINGLEBITS';    // the 32 bits of a SINGLE, as an integer
+  kBITSTOSINGLE = 'BITSTOSINGLE';  // the SINGLE those 32 bits spell
   kFIX     = 'FIX';       // FreeBASIC: truncate toward zero
   kFRAC    = 'FRAC';      // FreeBASIC: fractional part
   kSINH    = 'SINH';      // hyperbolic sine

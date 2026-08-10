@@ -579,7 +579,7 @@ begin
       // === Delegated families (each a contiguous dense range) ===
       DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 51:
         begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 40:
+      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 42:
         begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
       // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.
@@ -684,8 +684,11 @@ begin
         // it is. One opcode, the signedness in the operand.
         bcIntToFloat:
           begin
-            if Instr.Immediate = 1 then FloatRegs[Instr.Dest] := QWord(IntRegs[Instr.Src1])
+            case Instr.Immediate of
+              1: FloatRegs[Instr.Dest] := QWord(IntRegs[Instr.Src1]);       // unsigned -> double
+              2: FloatRegs[Instr.Dest] := Single(IntRegs[Instr.Src1]);      // straight to binary32
             else FloatRegs[Instr.Dest] := IntRegs[Instr.Src1];
+            end;
             Inc(CurPC);
           end;
         // Implicit float -> int: MODERN rounds (to nearest, ties to even), CLASSIC truncates. See the

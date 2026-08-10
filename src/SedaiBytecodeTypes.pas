@@ -458,6 +458,8 @@ const
   bcMathMin         = bcGroupMath + 38;  // MIN(x, y) - IEEE minimum, a NaN propagates
   bcMathMax         = bcGroupMath + 39;  // MAX(x, y) - IEEE maximum, a NaN propagates
   bcMathCopySign    = bcGroupMath + 40;  // COPYSIGN(x, y) - magnitude of x, sign of y
+  bcSingleBits      = bcGroupMath + 41;  // SINGLEBITS(x) - the 32 bits of a SINGLE, as an integer
+  bcBitsToSingle    = bcGroupMath + 42;  // BITSTOSINGLE(n) - the SINGLE those 32 bits spell
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
   // B4 bounds-check elimination: on bcArrayLoad*/bcArrayStore* the Immediate field is

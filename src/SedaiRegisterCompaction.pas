@@ -211,6 +211,7 @@ begin
     // Conversions to int
     bcFloatToInt, bcStringToInt, bcFloatRound,
     bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
+    bcSingleBits,  // SINGLEBITS(x): the 32 bits of a binary32, in an INT register
     // === GROUP 1: String operations ===
     bcStrLen,      // String length returns int
     bcStrLenW,     // LEN(wstring) returns int codepoint count
@@ -345,6 +346,7 @@ begin
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,  // hyperbolic
     bcMathCeil, bcMathRound, bcMathMin, bcMathMax, bcMathCopySign,               // IEEE extras
+    bcBitsToSingle,   // ⛔ the bit-casts are MIXED: this one writes a float, SINGLEBITS writes an INT
     // Date/time -> float (date serial = Double)
     bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue, bcDateAdd,
     bcFileDateTime,  // FILEDATETIME(path): last-modified date serial (float Dest, string Src1)
@@ -420,7 +422,7 @@ begin
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
     bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     // Conversion from int
-    bcIntToFloat, bcIntToString,
+    bcIntToFloat, bcBitsToSingle, bcIntToString,
     bcNarrowInt,   // B1.5: integer width narrowing (Src1=int)
     // Branch on int (comparison result)
     bcJumpIfZero, bcJumpIfNotZero,
@@ -559,6 +561,7 @@ begin
     bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
     bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,  // hyperbolic
     bcMathCeil, bcMathRound, bcMathMin, bcMathMax, bcMathCopySign,               // IEEE extras
+    bcSingleBits,     // ...and this one READS a float; BITSTOSINGLE reads an int
     bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY: Src1 = float serial
     // === GROUP 1: String operations with float param ===
     bcStrStr,      // STR$(n) - reads float, produces string

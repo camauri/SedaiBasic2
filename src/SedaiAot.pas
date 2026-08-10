@@ -1009,7 +1009,7 @@ begin
     // that predicate is the STRING family's, not the general one. Two wrong hooks before the right
     // one, and aot_validate found both - which is the whole reason that net exists.
     ssaIntToFloat:
-      Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt = 1));
+      Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:

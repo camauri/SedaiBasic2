@@ -1967,6 +1967,8 @@ begin
  RegisterKeyword(kMINF, ttMathFunction, 'IEEE minimum MIN(x, y) - a NaN propagates',                  kcMathFunctions);
  RegisterKeyword(kMAXF, ttMathFunction, 'IEEE maximum MAX(x, y) - a NaN propagates',                  kcMathFunctions);
  RegisterKeyword(kCOPYSIGN, ttMathFunction, 'Magnitude of x with the sign of y COPYSIGN(x, y)',       kcMathFunctions);
+ RegisterKeyword(kSINGLEBITS, ttMathFunction, 'The 32 bits of a SINGLE as an integer SINGLEBITS(x)',  kcMathFunctions);
+ RegisterKeyword(kBITSTOSINGLE, ttMathFunction, 'The SINGLE spelled by 32 bits BITSTOSINGLE(n)',      kcMathFunctions);
  RegisterKeyword(kFIX,   ttMathFunction, 'Truncate toward zero',                                     kcMathFunctions);
  RegisterKeyword(kFRAC,  ttMathFunction, 'Return the fractional part (keeps sign)',                  kcMathFunctions);
  RegisterKeyword(kSINH,  ttMathFunction, 'Return the hyperbolic sine of x',                          kcMathFunctions);

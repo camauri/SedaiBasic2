@@ -5752,6 +5752,20 @@ begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
 
+        // BitsToSingle: float Dest, int Src1 - the same shape as IntToFloat, and it has to be here
+        // for the same reason: a bank counted short is an index past the end of an array.
+        bcBitsToSingle:
+        begin
+          if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        // SingleBits: int Dest, float Src1 - the other direction.
+        bcSingleBits:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+        end;
+
         // StringToFloat: float Dest, string Src1
         bcStringToFloat:
         begin
@@ -6891,8 +6905,11 @@ begin
     // correcting only the other left --aot answering -21 while the interpreter answered the right
     // number, with the AOT's refusal working perfectly all along.
     bcIntToFloat:
-      if Instr.Immediate = 1 then Ctx.FloatRegs[Instr.Dest] := QWord(Ctx.IntRegs[Instr.Src1])
+      case Instr.Immediate of
+        1: Ctx.FloatRegs[Instr.Dest] := QWord(Ctx.IntRegs[Instr.Src1]);     // unsigned -> double
+        2: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.IntRegs[Instr.Src1]);    // ONE rounding, to binary32
       else Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+      end;
     // The IMPLICIT float -> int conversion: FreeBASIC ROUNDS (to nearest, ties to even), it does not
     // truncate. It rounds everywhere the conversion is implicit -- assignment, argument passing, an array
     // store, an array INDEX, a FOR bound, a FUNCTION result -- so "Dim As Integer i : i = 1.5" is 2, and
@@ -10839,6 +10856,7 @@ var
   iv, n: Integer;
   FloatTmpB: Double;   // the second operand of MIN/MAX
   PackInt: Int64;      // COPYSIGN assembles its answer from bits
+  SngTmp: Single;      // the bit-casts work on the binary32 value, not on the double
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -10994,6 +11012,17 @@ begin
         PackInt := (PInt64(@Ctx.FloatRegs[Instr.Src1])^ and $7FFFFFFFFFFFFFFF) or
                    (PInt64(@Ctx.FloatRegs[Instr.Src2])^ and Int64($8000000000000000));
         Ctx.FloatRegs[Instr.Dest] := PDouble(@PackInt)^;
+      end;
+    41: // bcSingleBits - the 32 bits of a SINGLE, as an integer. The value is a double that a
+        // SINGLE can hold, so narrowing it first is what makes the answer well defined.
+      begin
+        SngTmp := Ctx.FloatRegs[Instr.Src1];   // narrows to binary32, which is the value in question
+        Ctx.IntRegs[Instr.Dest] := Int64(PLongWord(@SngTmp)^);
+      end;
+    42: // bcBitsToSingle - the SINGLE those 32 bits spell, widened to the float bank.
+      begin
+        PackInt := Ctx.IntRegs[Instr.Src1] and $FFFFFFFF;
+        Ctx.FloatRegs[Instr.Dest] := PSingle(@PackInt)^;
       end;
     20: // bcDateNow - Immediate 0=NOW (date+time serial), 1=TIMER (seconds since midnight)
       begin

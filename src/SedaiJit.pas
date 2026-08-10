@@ -1940,7 +1940,7 @@ var
       // ⛔ Immediate = 1 is an UNSIGNED source, which cvtsi2sd gets wrong - and wrong here is a
       // SILENT miscompile, not a slow loop. Bail: the interpreter's arm is the one that knows.
       bcIntToFloat:
-        if I^.Immediate = 1 then Exit
+        if I^.Immediate <> 0 then Exit
         else
         begin
           if IAlloc(I^.Src1) >= 0 then

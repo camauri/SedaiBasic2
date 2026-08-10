@@ -4445,6 +4445,33 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
+        // The bit-casts. Not conversions: SINGLEBITS answers the 32 bits a SINGLE IS, and
+        // BITSTOSINGLE reads 32 bits as one - the only thing arithmetic cannot express, and one WASM
+        // instruction each. The argument of SINGLEBITS is narrowed first, so "the 32 bits" is a
+        // well-defined question about a value the float bank keeps as a double.
+        else if (FuncName = kSINGLEBITS) or (FuncName = kBITSTOSINGLE) then
+        begin
+          if (ArgListNode <> nil) then
+          begin
+            if (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount > 0) then
+              ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            else
+              ProcessExpression(ArgListNode, ArgValue);
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+          if FuncName = kSINGLEBITS then
+          begin
+            ArgReg := ApplyNarrowCode(7, EnsureFloatRegister(ArgValue));
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaSingleBits, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          else
+          begin
+            ArgReg := EnsureIntRegister(ArgValue);
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaBitsToSingle, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+        end
         // MIN/MAX/COPYSIGN: two float arguments, one result. Same shape as ATAN2 - and the same
         // reason they are opcodes rather than a composition: each is ONE machine instruction, and
         // writing MIN as a comparison would fix the NaN behaviour to the wrong thing.
@@ -19371,7 +19398,9 @@ begin
     if Value.Kind = svkConstFloat then
       Result := MakeSSAConstFloat(Single(Value.ConstFloat))
     else if Value.Kind = svkConstInt then
-      Result := MakeSSAConstFloat(Single(Double(Value.ConstInt)))
+      // ⛔ Single(Double(x)), which this used to be, rounds TWICE. IEEE converts an integer to
+      // binary32 with ONE rounding, and past 2^24 the two answers differ.
+      Result := MakeSSAConstFloat(Single(Value.ConstInt))
     else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
     begin
       NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -19380,12 +19409,11 @@ begin
     end
     else if (Value.Kind = svkRegister) and (Value.RegType = srtInt) then
     begin
-      // int register -> float, then round: the conversion to binary32 is the point, and an integer
-      // above 2^24 loses bits exactly as it does in fbc.
-      NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-      EmitInstruction(ssaIntToFloat, NarrowReg, Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // int register -> binary32, in ONE step. Going through a double and narrowing rounds twice,
+      // and beyond 2^53 the two answers differ; WASM has f32.convert_i64_s for exactly this, and it
+      // is what the flag in Src3 selects (2 = straight to binary32).
       Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-      EmitInstruction(ssaNarrowSingle, Result, NarrowReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaIntToFloat, Result, Value, MakeSSAValue(svkNone), MakeSSAConstInt(2));
     end;
   end
   else if (W >= 1) and (W <= 6) then

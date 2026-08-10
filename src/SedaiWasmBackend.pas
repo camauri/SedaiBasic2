@@ -6955,6 +6955,25 @@ begin
     ssaMathMin:      Bin(wopF64Min);
     ssaMathMax:      Bin(wopF64Max);
     ssaMathCopySign: Bin(wopF64Copysign);
+    { The bit-casts, and the one place a 32-bit REINTERPRET is the whole point: the value in the float
+      bank is a double that a binary32 can hold, so demoting is exact and the bits it then has ARE the
+      answer. The other direction reads 32 bits as a binary32 and widens. }
+    ssaSingleBits:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Op(wopF32DemoteF64);
+        B.Op(wopI32ReinterpretF32);
+        B.Op(wopI64ExtendI32U);
+        StoreReg(B, Instr.Dest);
+      end;
+    ssaBitsToSingle:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Op(wopI32WrapI64);
+        B.Op(wopF32ReinterpretI32);
+        B.Op(wopF64PromoteF32);
+        StoreReg(B, Instr.Dest);
+      end;
     ssaAddFloat: Bin(wopF64Add);
     ssaSubFloat: Bin(wopF64Sub);
     ssaMulFloat: Bin(wopF64Mul);
@@ -7090,6 +7109,14 @@ begin
     // where the distinction costs nothing at all.
     ssaIntToFloat:
       if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then Un(wopF64ConvertI64U)
+      else if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 2) then
+      begin
+        // straight to binary32 - one rounding, one instruction - then widened back into the bank
+        LoadReg(B, Instr.Src1);
+        B.Op(wopF32ConvertI64S);
+        B.Op(wopF64PromoteF32);
+        StoreReg(B, Instr.Dest);
+      end
       else Un(wopF64ConvertI64S);
     ssaFloatToInt:
       begin

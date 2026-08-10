@@ -268,6 +268,8 @@ begin
     ssaMathMin: Result := bcMathMin;
     ssaMathMax: Result := bcMathMax;
     ssaMathCopySign: Result := bcMathCopySign;
+    ssaSingleBits: Result := bcSingleBits;
+    ssaBitsToSingle: Result := bcBitsToSingle;
     ssaStrDec: Result := bcStrDec;
     ssaPrint: Result := bcPrint;
     ssaPrintLn: Result := bcPrintLn;
