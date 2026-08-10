@@ -3418,8 +3418,11 @@ begin
         // Determine result type and allocate register (use hint if compatible)
         else if (Left.RegType = srtFloat) or (Right.RegType = srtFloat) then
         begin
-          // Check if we can use the destination hint
-          UseHint := (DestHint.Kind = svkRegister) and (DestHint.RegType = srtFloat);
+          // Check if we can use the destination hint. ⛔ Not for a SINGLE-typed operation: its result
+          // is rounded to 32 bits right after the emit below, into a register of its own, so writing
+          // the hint here would leave the caller holding the UNROUNDED value.
+          UseHint := (DestHint.Kind = svkRegister) and (DestHint.RegType = srtFloat)
+                     and not IsSingleExpr(Node);
           if UseHint then
           begin
             Result := DestHint;  // Use the suggested destination
@@ -3462,6 +3465,19 @@ begin
         end;
 
         EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
+        // IEEE 754: an operation on binary32 produces a binary32. A SINGLE-typed arithmetic operation
+        // is therefore rounded to 32 bits HERE, not merely on the way into a variable - carrying wide
+        // intermediates and rounding once at the end is the "excess precision" deviation (§10.4), and
+        // it is measurably not what anyone else does: on 90 000 compound expressions fbc gave the same
+        // answer with and without a forced 32-bit intermediate in every single case, and we differed in
+        // 14 541 of them. IsSingleExpr already knew which expressions these are - it was built to
+        // decide how a SINGLE PRINTS, and nobody had connected it to how one COMPUTES.
+        // ⭐ The rounding costs nothing in accuracy: computing in double and rounding after EVERY
+        // operation was measured bit-identical to true 32-bit arithmetic over ~16 M constructed cases,
+        // including ~1.8 M whose result lands in the subnormal range, where the textbook 2p+2 argument
+        // stops applying (job/tests/tools/f32_edge.pas). SQRT cannot even reach that range.
+        if (Result.Kind = svkRegister) and (Result.RegType = srtFloat) and IsSingleExpr(Node) then
+          Result := ApplyNarrowCode(7, Result);
       end;
     end;
 
@@ -4612,7 +4628,17 @@ begin
             OpCode := ssaNop;
 
           if OpCode <> ssaNop then
+          begin
             EmitInstruction(OpCode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // Same IEEE rule as the arithmetic above: a SINGLE-typed intrinsic answers in binary32.
+            // IsSingleExpr already carries the taxonomy - which intrinsics RETURN a single and which
+            // PRESERVE their argument's width - so this asks it rather than repeating the list.
+            // ⭐ Found by the wide battery against fbc, not by reasoning: after the binary operations
+            // were rounded, the five remaining divergences out of 680 lines were all the same
+            // construct, Sqr(a * b + c) - the argument was rounded and the RESULT was not.
+            if (Result.Kind = svkRegister) and (Result.RegType = srtFloat) and IsSingleExpr(Node) then
+              Result := ApplyNarrowCode(7, Result);
+          end;
         end;
       end
       else
