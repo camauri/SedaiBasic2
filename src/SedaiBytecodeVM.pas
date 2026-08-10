@@ -254,6 +254,10 @@ type
     // such a PC, calls the native function which runs the whole loop and returns the exit PC.
     FJitEnabled: Boolean;
     FNativeLoops: array of TExecMem;
+    // J15: the leaf-primitive table handed to CompileLoop. Filled once per BuildJitLoops by
+    // SetAotPrimitives; a compiled loop reads the addresses out of it AT COMPILE TIME and bakes
+    // them, so nothing here is consulted at run time and the per-context fields stay unset.
+    FJitPrimCtx: TAotCtx;
     // AOT (plan B): whole SSA functions compiled to native, registered under their ENTRY PC.
     // The dispatch check fires on the iteration after bcCallSub has already done FramePush,
     // so the native function needs no frame handling; it returns the resume PC (bcReturnSub
@@ -481,6 +485,7 @@ type
     // EnsureDenseOps when FJitEnabled). Loops with an unsupported opcode are left to the interpreter.
     procedure BuildJitLoops;
     // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
+    procedure SetAotPrimitives(var C: TAotCtx);
     procedure RebuildJitArrDesc;
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
@@ -8436,6 +8441,7 @@ end;
 { BuildJitLoops - compile every eligible hot loop of the current program to native (JIT J2/J3). A loop
   header is the target of a backward branch; its body runs to the LAST branch that jumps back to it.
   CompileLoop returns nil for any loop with an unsupported opcode, so those stay interpreted. }
+
 // The one-instruction interpreter helper, defined further down next to the rest of the AOT runtime.
 // Declared here because the loop JIT is handed its address (the J14 helper route) and is compiled
 // before it.
@@ -8465,6 +8471,10 @@ begin
   SetLength(FNativeLoops, n);   // all nil
   if n = 0 then Exit;
   Ins := PBcInstr(FProgram.GetInstructionsPtr);
+  // The leaf primitives a compiled loop may bake. Filled here rather than per Run because a loop is
+  // compiled once: everything in it is fixed for the loaded program, dialect variants included.
+  FillChar(FJitPrimCtx, SizeOf(FJitPrimCtx), 0);
+  SetAotPrimitives(FJitPrimCtx);
 
   SetLength(HeaderEnd, n);
   for i := 0 to n - 1 do HeaderEnd[i] := -1;
@@ -8514,7 +8524,12 @@ begin
                          // no native form is now run by AotExecOne - the same helper the AOT uses -
                          // instead of costing the whole loop. Self is the VM that owns this code, so
                          // baking it is safe; the per-thread half (the context) is a call argument.
-                         @AotExecOne, Pointer(Self));
+                         @AotExecOne, Pointer(Self),
+                         // J15: the string family as leaf calls. The primitive addresses are baked
+                         // from this table at compile time; the string BANK is per-context, so its
+                         // field offset is passed instead and read at run time - a worker uses its own.
+                         @FJitPrimCtx,
+                         Integer(PtrUInt(@FCtx.StringRegs) - PtrUInt(Pointer(FCtx))));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin
@@ -9809,6 +9824,67 @@ begin
   end
   else
     Mem.Free;
+end;
+
+{ The AOT/JIT primitive table, filled in ONE place. Everything here is fixed for the life of a
+  loaded program - static function addresses, with the dialect-variant ones resolved from the program
+  that is loaded - so a compiled loop may bake them, while the per-CONTEXT fields (CtxObj, StrRegs,
+  the Xfer bases, ArrDesc) are supplied by whoever is about to run. Shared by RunTemplate's per-Run
+  ctx and by BuildJitLoops: two hand-maintained copies of this list is exactly how the two backends
+  would begin calling different functions for the same opcode. }
+procedure TBytecodeVM.SetAotPrimitives(var C: TAotCtx);
+begin
+  // C3: the runtime-helper pair. Compiled code calls back into the interpreter for an op with no
+  // native form. Both are stable: the helper is a static function and VMSelf is the instance that
+  // owns the compiled code. The per-WORKER half of the triple is CtxObj, which is not set here.
+  C.ExecOne := @AotExecOne;
+  C.VMSelf := Self;
+  // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
+  // string ops. (The bank base itself is per-context and is set by the caller.)
+  C.StrCmp := @AotStrCmp;
+  C.StrAssign := @AotStrAssign;
+  C.StrLoadConst := @AotStrLoadConst;
+  C.StrConcat := @AotStrConcat;
+  C.StrLen := @AotStrLen;
+  // B3: native call site primitive. The FAST one specialises the case worth specialising - a
+  // callee whose frame is a pointer slide - and falls back to the general one for everything
+  // else, so it is correct for any program. AOT_FASTCALL=0 restores the general one always.
+  if (GAotFastCall = 1) and FAllCalleesFast then C.CallSub := @AotCallSubFast
+  else C.CallSub := @AotCallSub;
+  // C5 residuals. StrMid is dialect-variant: install the flavor once per run.
+  C.StrLeft := @AotStrLeft;
+  C.StrRight := @AotStrRight;
+  if Assigned(FProgram) and FProgram.ModernMode then
+    C.StrMid := @AotStrMidModern
+  else
+    C.StrMid := @AotStrMidClassic;
+  C.StrAsc := @AotStrAsc;
+  C.StrChr := @AotStrChr;
+  C.StrInstr := @AotStrInstr;
+  C.StrIntToStr := @AotIntToString;
+  C.StrVal := @AotStrVal;
+  C.StrValInt := @AotStrValInt;
+  // Managed STRING array element: reached through a primitive because the array descriptor has no
+  // StringData slot (see TAotCtx). Only ever called where an out-of-range index cannot raise.
+  C.ArrLoadStr := @AotArrLoadStr;
+  C.ArrStoreStr := @AotArrStoreStr;
+  if Assigned(FProgram) and FProgram.ModernMode then
+    C.StrAscMid := @AotStrAscMidModern
+  else
+    C.StrAscMid := @AotStrAscMidClassic;
+  if Assigned(FProgram) and FProgram.ModernMode then
+    C.StrConcatCharAt := @AotStrConcatCharAtModern
+  else
+    C.StrConcatCharAt := @AotStrConcatCharAtClassic;
+  if Assigned(FProgram) and FProgram.ModernMode then
+    C.StrAppendMapped := @AotStrAppendMappedModern
+  else
+    C.StrAppendMapped := @AotStrAppendMappedClassic;
+  // C6: the record family. Dialect-blind (allocation has no dialect), so one flavor each.
+  C.RecNew := @AotRecordNew;
+  C.RecFree := @AotRecordFree;
+  C.RecMarkPush := @AotRecMarkPush;
+  C.RecMarkPop := @AotRecMarkPop;
 end;
 
 procedure TBytecodeVM.RebuildJitArrDesc;

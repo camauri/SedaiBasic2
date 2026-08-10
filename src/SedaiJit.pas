@@ -36,6 +36,10 @@ interface
 
 uses
   SysUtils, SedaiBytecodeTypes, SedaiX86Emitter,
+  // SedaiAot for the AOTCTX_* offsets ONLY: the string/record leaf primitives live in one table that
+  // the VM fills once and both backends read, which is what keeps them from drifting apart. The
+  // dependency is one-way - SedaiAot does not use this unit.
+  SedaiAot,
   Cpu;   // AVXSupport / POPCNTSupport: the two runtime feature tests the lowerings below are gated on
 
 type
@@ -69,10 +73,15 @@ type
 // value the route needs is the context object, and that is already in the frame slot the Xfer/record
 // accessors read. Pass nil for either and the route is off: every routable opcode bails the loop
 // again, which is the pre-J14 behaviour.
+// PrimCtx/StringRegsOff are the string family as native LEAF calls (J15): the VM's filled TAotCtx,
+// whose primitive addresses are read at COMPILE time and baked, and the byte offset of the StringRegs
+// field inside TExecutionContext, read at RUN time so a worker uses its own bank. nil puts the whole
+// string family back on the helper route - slower, but correct.
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
                      RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
-                     HelperFn, VMSelf: Pointer): TExecMem;
+                     HelperFn, VMSelf: Pointer;
+                     PrimCtx: Pointer; StringRegsOff: Integer): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -147,7 +156,8 @@ end;
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
                      RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
-                     HelperFn, VMSelf: Pointer): TExecMem;
+                     HelperFn, VMSelf: Pointer;
+                     PrimCtx: Pointer; StringRegsOff: Integer): TExecMem;
 var
   E: TX86Emitter;
   NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
@@ -224,6 +234,7 @@ var
   RoutesRecords: Boolean;            // ...and at least one of them ALLOCATES a record (see bcRecMarkPush)
   ArrDescDisp, FltSaveDisp: Integer;
   HelperAdjust: Integer;             // bytes subtracted from rsp around a call (shadow space + pad)
+  UseLeaf: Boolean;                  // J15: the string family goes to leaf calls, not the helper route
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -946,6 +957,8 @@ var
         bcFloatRound: T(J^.Src1);                    // CINT: float input, int Dest (-> ScanI)
         bcNegFloat, bcNarrowSingle, bcMathInt, bcMathAbs, bcMathSgn, bcMathFix:
           begin T(J^.Dest); T(J^.Src1); end;
+        // J15: VAL is the only leaf-called string primitive that answers in the FLOAT bank.
+        bcStrVal: T(J^.Dest);
       end;
     end;
   end;
@@ -996,6 +1009,15 @@ var
         bcBitRotl, bcBitRotr,
         bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt:
           begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
+        // J15, and this is the ⛔ above applied: the string family is lowered to leaf calls now, so
+        // every INT register it reads or writes has to be declared here. A string op is not exempt
+        // from the scanner just because its other operands live in a bank this JIT never allocates.
+        bcStrLen, bcStrAsc, bcStrValInt: T(J^.Dest);                     // Dest = int result
+        bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString: T(J^.Dest);
+        bcStrLeft, bcStrRight: T(J^.Src2);                               // Src2 = the length
+        bcStrChr, bcIntToString: T(J^.Src1);                             // Src1 = the int operand
+        bcStrMid: begin T(J^.Src2); T(Word(J^.Immediate and $FFFF)); end;   // start + length REGISTER
+        bcStrInstr: begin T(J^.Dest); T(Word(J^.Immediate and $FFFF)); end; // result + start REGISTER
       end;
     end;
   end;
@@ -1277,6 +1299,267 @@ var
     // 6. Continue natively only if the interpreter landed exactly where this code expects.
     E.EmitBytes([$48, $3D]); E.Emit32(LongWord(apc + 1));                 // cmp rax, apc+1
     JccRel($85, -1);                                                      // jne epilogue
+  end;
+
+  { ---------------- J15: the STRING family as native LEAF calls ----------------
+
+    Why this exists, measured rather than assumed: routing a string op through EmitHelperCall above
+    costs ~46 ns - a flush of EVERY allocated register, a re-entry into the interpreter's dispatch,
+    and a full reload - and on a loop that is mostly strings that is a 28% LOSS against not compiling
+    it at all. The AOT is 15% FASTER than the interpreter on the very same loop, doing the identical
+    string work, because it reaches the primitives as leaf calls: only the ABI-VOLATILE registers are
+    spilled and the interpreter's dispatch is never re-entered. It is not the strings; it is the route.
+    (The AOT's own C6 comment records the same lesson from the record family: the flush around each
+    allocation cost more than the allocation.)
+
+    So the primitives are the AOT's, unchanged - the same Pascal functions, called with the same
+    arguments. Two things had to be answered for the JIT rather than copied:
+      * WHERE the string bank is. The AOT keeps it in its ctx record; here it is per-CONTEXT, so it is
+        read at run time from the context object's StringRegs field through the frame slot the Xfer
+        and record accessors already use. Nothing context-specific is baked, so a worker is safe.
+      * WHERE the primitives are. They are static functions, fixed for the life of the compiled code,
+        and the dialect-variant ones (MID$ and the fused pair) are already resolved by the time a loop
+        is compiled - so their addresses are read out of the VM's primitive table AT COMPILE TIME and
+        baked as imm64. One instruction, no indirection, and the table is the same one the AOT fills,
+        which is what stops the two backends from drifting apart. }
+
+  // mov <dst>, [<base> + disp32]   (any base including rsp/r12, any dst; REX computed)
+  procedure MovLoadR(dst, base: Integer; disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $48;
+    if dst >= 8 then rex := rex or $04;                       // REX.R
+    if base >= 8 then rex := rex or $01;                      // REX.B
+    E.Emit8(rex); E.Emit8($8B);
+    E.Emit8($80 or ((dst and 7) shl 3) or (base and 7));
+    if (base and 7) = 4 then E.Emit8($24);                    // rsp/r12 addressing needs a SIB byte
+    E.Emit32(disp);
+  end;
+  // lea <dst>, [<base> + disp32]
+  procedure LeaR(dst, base: Integer; disp: LongWord);
+  var rex: Byte;
+  begin
+    rex := $48;
+    if dst >= 8 then rex := rex or $04;
+    if base >= 8 then rex := rex or $01;
+    E.Emit8(rex); E.Emit8($8D);
+    E.Emit8($80 or ((dst and 7) shl 3) or (base and 7));
+    if (base and 7) = 4 then E.Emit8($24);
+    E.Emit32(disp);
+  end;
+  // Read VM int register vmreg into ANY native register (unlike ILoad, whose scratch must be < 8).
+  // Called BEFORE the call, while every pooled register still holds what the allocator says: the
+  // spill below only STORES, it does not clobber.
+  procedure ILoadTo(dst, vmreg: Integer);
+  var n: Integer;
+  begin
+    n := IAlloc(vmreg);
+    if n >= 0 then MovRR(dst, n) else MovLoadR(dst, RBX, LongWord(vmreg) * 8);
+  end;
+
+  // Is this native register preserved across a call by the ABI? r12..r15 and rbx are on both; the
+  // xmm answer differs - Win64 preserves xmm6/xmm7, System V preserves none.
+  function GprSurvives(n: Integer): Boolean;
+  begin Result := (n = RBX) or (n >= R12); end;
+  function XmmSurvives(n: Integer): Boolean;
+  begin
+    {$IFDEF WINDOWS} Result := n >= 6; {$ELSE} Result := False; {$ENDIF}
+  end;
+
+  // Caller-saved spill around a leaf call: ONLY the volatile allocated registers, which is the whole
+  // difference from EmitHelperCall's flush of everything. Their bank slot is their canonical home.
+  procedure SpillVol;
+  var k: Integer;
+  begin
+    for k := 0 to IMaxReg do
+      if (ILoc[k] >= 0) and not GprSurvives(ILoc[k]) then StoreRegMem(ILoc[k], LongWord(k) * 8);
+    for k := 0 to FMaxReg do
+      if (FLoc[k] >= 0) and not XmmSurvives(FLoc[k]) then
+        E.MemOp([$F2, $0F, $11], FLoc[k], RSI, LongWord(k) * 8);
+  end;
+  // Park the two base registers a call destroys and that have no bank slot: r8 (the array descriptor
+  // table) and rsi (the float bank base - callee-saved on Win64, VOLATILE on System V, where it is
+  // also an argument register). Must run BEFORE any argument setup.
+  procedure LeafSaveBases;
+  begin
+    E.EmitBytes([$4C, $89, $84, $24]); E.Emit32(LongWord(ArrDescDisp));   // mov [rsp+ArrDescDisp], r8
+    E.EmitBytes([$48, $89, $B4, $24]); E.Emit32(LongWord(FltSaveDisp));   // mov [rsp+FltSaveDisp], rsi
+  end;
+  // rax := the string bank base of the EXECUTING context. Read through the ctx slot, never baked.
+  // ⚠️ Uses an rsp-relative displacement, so it must be emitted BEFORE the stack adjustment.
+  procedure StrBaseRax;
+  begin
+    E.EmitBytes([$48, $8B, $84, $24]); E.Emit32(LongWord(CtxDisp));       // mov rax, [rsp+CtxDisp]
+    E.EmitBytes([$48, $8B, $80]); E.Emit32(LongWord(StringRegsOff));      // mov rax, [rax+StringRegsOff]
+  end;
+  // The call itself: the target goes in rax (never an argument register on either ABI), so it is
+  // staged LAST, after every argument - including the ones read through rax as the bank base.
+  procedure LeafCall(prim: Pointer);
+  begin
+    MovImm64(RAX, PtrInt(prim));
+    if HelperAdjust > 0 then
+    begin
+      E.EmitBytes([$48, $83, $EC]); E.Emit8(Byte(HelperAdjust));          // sub rsp, shadow+pad
+    end;
+    E.EmitBytes([$FF, $D0]);                                              // call rax
+    if HelperAdjust > 0 then
+    begin
+      E.EmitBytes([$48, $83, $C4]); E.Emit8(Byte(HelperAdjust));          // add rsp, shadow+pad
+    end;
+  end;
+  // After the call: the base registers, then the volatile allocated ones, then the array base/count
+  // cache - which no bank reload covers, because it lives in the caller-saved end of the GPR pool and
+  // has no bank slot at all. Reloading it is idempotent and emits nothing when there is no cache.
+  procedure LeafRestore;
+  var k: Integer;
+  begin
+    E.EmitBytes([$4C, $8B, $84, $24]); E.Emit32(LongWord(ArrDescDisp));   // mov r8,  [rsp+ArrDescDisp]
+    E.EmitBytes([$48, $8B, $B4, $24]); E.Emit32(LongWord(FltSaveDisp));   // mov rsi, [rsp+FltSaveDisp]
+    for k := 0 to IMaxReg do
+      if (ILoc[k] >= 0) and not GprSurvives(ILoc[k]) then LoadRegMem(ILoc[k], LongWord(k) * 8);
+    for k := 0 to FMaxReg do
+      if (FLoc[k] >= 0) and not XmmSurvives(FLoc[k]) then
+        E.MemOp([$F2, $0F, $10], FLoc[k], RSI, LongWord(k) * 8);
+    for k := 0 to NCArr - 1 do
+    begin
+      if CArrBase[k]  >= 0 then R8LoadR(CArrBase[k],  LongWord(CArrId[k]) * 32 + LongWord(CArrOff[k]));
+      if CArrCount[k] >= 0 then R8LoadR(CArrCount[k], LongWord(CArrId[k]) * 32 + 16);
+    end;
+  end;
+  // The primitive's address, read from the VM's table at COMPILE time (see the header above).
+  function Prim(CtxOff: Integer): Pointer;
+  begin Result := PPointer(PtrUInt(PrimCtx) + PtrUInt(CtxOff))^; end;
+
+  { The emitters. Argument order is the AOT's, and it is not stylistic: on Win64 arg2 IS r8 (already
+    parked) and arg3 IS r9, which lives in the allocation pool - so every operand that may be read
+    out of a pooled register is read BEFORE arg3 is written. }
+
+  // dst := StringRegs[src]  /  dst := StringConstants[imm]  /  dst := IntRegs[src] as text
+  procedure EmitStrOneSlot(CtxOff, dSlot, sSlot: Integer);       // (dstSlot, srcVal)
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);                    // arg0 = &StringRegs[dest]
+    MovLoadR(ABI_ARG1, RAX, LongWord(sSlot) * 8);                // arg1 = StringRegs[src] (value)
+    LeafCall(Prim(CtxOff));
+    LeafRestore;
+  end;
+  procedure EmitStrLoadConstJ(dSlot: Integer; imm: Int64);       // (dstSlot, VMSelf, imm)
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);
+    MovImm64(ABI_ARG1, PtrInt(VMSelf));
+    MovImm64(ABI_ARG2, imm);
+    LeafCall(Prim(AOTCTX_STRLOADCONST));
+    LeafRestore;
+  end;
+  procedure EmitIntToStringJ(dSlot, vReg: Integer);              // (dstSlot, v)
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG1, vReg);                                     // read the pooled operand FIRST
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRINTTOSTR));
+    LeafRestore;
+  end;
+  procedure EmitStrConcatJ(dSlot, aSlot, bSlot: Integer);        // (dstSlot, aVal, bVal)
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);
+    MovLoadR(ABI_ARG1, RAX, LongWord(aSlot) * 8);
+    MovLoadR(ABI_ARG2, RAX, LongWord(bSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRCONCAT));
+    LeafRestore;
+  end;
+  // Dest(int) := primitive(StringRegs[src]) - LEN$ and ASC.
+  procedure EmitStrToInt(CtxOff, dReg, sSlot: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    MovLoadR(ABI_ARG0, RAX, LongWord(sSlot) * 8);
+    LeafCall(Prim(CtxOff));
+    LeafRestore;
+    IStore(dReg, RAX);
+  end;
+  // dst := LEFT$/RIGHT$(src, n)   (dstSlot, sVal, n)
+  procedure EmitStrSliceJ(CtxOff, dSlot, sSlot, nReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG2, nReg);                                     // pooled operand before arg3/rax use
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);
+    MovLoadR(ABI_ARG1, RAX, LongWord(sSlot) * 8);
+    LeafCall(Prim(CtxOff));
+    LeafRestore;
+  end;
+  // dst := MID$(src, start, len)   (dstSlot, sVal, start, cnt)
+  procedure EmitStrMidJ(dSlot, sSlot, stReg, lnReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG2, stReg);
+    ILoadTo(ABI_ARG3, lnReg);                                    // r9 on Win64: written LAST of the two
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);
+    MovLoadR(ABI_ARG1, RAX, LongWord(sSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRMID));
+    LeafRestore;
+  end;
+  // Dest(int) := INSTR(start, hay, needle)   (hayVal, needleVal, start)
+  procedure EmitStrInstrJ(dReg, haySlot, needleSlot, stReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG2, stReg);
+    StrBaseRax;
+    MovLoadR(ABI_ARG0, RAX, LongWord(haySlot) * 8);
+    MovLoadR(ABI_ARG1, RAX, LongWord(needleSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRINSTR));
+    LeafRestore;
+    IStore(dReg, RAX);
+  end;
+  // dst := CHR$(code)   (dstSlot, code)
+  procedure EmitStrChrJ(dSlot, cReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG1, cReg);
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRCHR));
+    LeafRestore;
+  end;
+  // Dest(float) := VAL(src) - the only one of the family that answers in xmm0.
+  procedure EmitStrValJ(dReg, sSlot: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    MovLoadR(ABI_ARG0, RAX, LongWord(sSlot) * 8);
+    LeafCall(Prim(AOTCTX_STRVAL));
+    LeafRestore;
+    FStore(dReg, XMM0);
+  end;
+  // Dest(int) := VALINT(src, decWidth) - the width is an IMMEDIATE, not a register.
+  procedure EmitStrValIntJ(dReg, sSlot: Integer; width: Int64);
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    MovLoadR(ABI_ARG0, RAX, LongWord(sSlot) * 8);
+    MovImm64(ABI_ARG1, width);
+    LeafCall(Prim(AOTCTX_STRVALINT));
+    LeafRestore;
+    IStore(dReg, RAX);
+  end;
+  // Dest(int) := (a <cmp> b) ? TrueVal : 0. Kind 0=Eq 1=Ne 2=Lt 3=Gt, the AOT primitive's own coding.
+  procedure EmitStrCmpJ(Kind, aSlot, bSlot: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    StrBaseRax;
+    MovLoadR(ABI_ARG0, RAX, LongWord(aSlot) * 8);
+    MovLoadR(ABI_ARG1, RAX, LongWord(bSlot) * 8);
+    MovImm64(ABI_ARG2, Kind);
+    LeafCall(Prim(AOTCTX_STRCMP));
+    LeafRestore;
+    CmpBoolToDest;                                               // al (0/1) -> Dest := TrueVal/0
   end;
 
   // Return the call-site index for a bcCallSub at absolute PC apc (populated by BuildCallSites), or -1
@@ -1757,6 +2040,62 @@ var
       // whole loop. Not valid inside an inlined body, same as every other deopt.
       bcEnd, bcStop:
         if InCallee or InGosub then Exit else DeoptTo(apc);
+      // ---- J15: the STRING family as native leaf calls (see the block above EmitStrOneSlot) ----
+      // Each is guarded on UseLeaf and on not being inside an inlined body, exactly like the helper
+      // route: a leaf call spills the caller's volatile registers to their BANK slots, and inside an
+      // inlined callee those slots are not where the caller's values live.
+      bcCopyString:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrOneSlot(AOTCTX_STRASSIGN, I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcLoadConstString:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrLoadConstJ(I^.Dest, I^.Immediate)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcIntToString:
+        if UseLeaf and not (InCallee or InGosub) then EmitIntToStringJ(I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrConcat:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrConcatJ(I^.Dest, I^.Src1, I^.Src2)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrLen:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrToInt(AOTCTX_STRLEN, I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrAsc:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrToInt(AOTCTX_STRASC, I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrLeft:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrSliceJ(AOTCTX_STRLEFT, I^.Dest, I^.Src1, I^.Src2)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrRight:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrSliceJ(AOTCTX_STRRIGHT, I^.Dest, I^.Src1, I^.Src2)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrMid:
+        if UseLeaf and not (InCallee or InGosub) then
+          EmitStrMidJ(I^.Dest, I^.Src1, I^.Src2, Integer(I^.Immediate and $FFFF))
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrInstr:
+        if UseLeaf and not (InCallee or InGosub) then
+          EmitStrInstrJ(I^.Dest, I^.Src1, I^.Src2, Integer(I^.Immediate and $FFFF))
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrChr:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrChrJ(I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrVal:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrValJ(I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrValInt:
+        if UseLeaf and not (InCallee or InGosub) then EmitStrValIntJ(I^.Dest, I^.Src1, I^.Immediate)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString:
+        if UseLeaf and not (InCallee or InGosub) then
+        begin
+          case I^.OpCode of
+            bcCmpEqString: EmitStrCmpJ(0, I^.Src1, I^.Src2);
+            bcCmpNeString: EmitStrCmpJ(1, I^.Src1, I^.Src2);
+            bcCmpLtString: EmitStrCmpJ(2, I^.Src1, I^.Src2);
+          else               EmitStrCmpJ(3, I^.Src1, I^.Src2);
+          end;
+        end
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
     else
       // The helper route (J14): an instruction with no native form is run by the INTERPRETER and
       // native execution carries on after it, instead of the whole loop being given up. Only for
@@ -2001,6 +2340,10 @@ begin
   // never use them. Sixteen bytes of stack is not worth a second emission pass to reclaim.
   UseHelper := False;
   RoutesRecords := False;
+  // ⚠️ Gated on the SAME switch as the helper route, and that is the point: JIT_HELPER=0 has to mean
+  // "this JIT does not call out at all", or the A/B stops separating anything. It measured +2% once
+  // when it only disabled the route - both sides were taking the leaf calls and the knob was inert.
+  UseLeaf := (PrimCtx <> nil) and (StringRegsOff > 0) and HelperRouteEnabled;
   if (HelperFn <> nil) and (VMSelf <> nil) and HelperRouteEnabled then
     for ii := HeaderPC to EndPC do
     begin

@@ -135,60 +135,14 @@ begin
     AotFuncs := @FNativeFuncs[0];
     LocalAotCtx.XferInt := @Ctx.XferInt[0];
     LocalAotCtx.XferFloat := @Ctx.XferFloat[0];
-    // C3: the runtime-helper triple. Compiled code calls back into the interpreter for ops
-    // with no native form, and must reach THIS run's VM/context pair - hence per-Run here
-    // rather than baked into the code (a worker executes the same bytes on its own context).
-    LocalAotCtx.ExecOne := @AotExecOne;
-    LocalAotCtx.VMSelf := Self;
+    // C3/C5/C6: the helper triple and every leaf primitive. Filled by ONE method, shared with
+    // BuildJitLoops - the loop JIT calls the same primitives now (J15), and two lists of twenty-odd
+    // function pointers maintained side by side is how the two backends start calling different
+    // things for the same opcode. Only what is per-CONTEXT stays here.
+    SetAotPrimitives(LocalAotCtx);
     LocalAotCtx.CtxObj := Ctx;
-    // C5: native string lowering. The string bank base (stable for the run) and the leaf
-    // primitives the compiled code calls directly for the hot string ops.
     if Length(Ctx.StringRegs) > 0 then LocalAotCtx.StrRegs := @Ctx.StringRegs[0]
     else LocalAotCtx.StrRegs := nil;
-    LocalAotCtx.StrCmp := @AotStrCmp;
-    LocalAotCtx.StrAssign := @AotStrAssign;
-    LocalAotCtx.StrLoadConst := @AotStrLoadConst;
-    LocalAotCtx.StrConcat := @AotStrConcat;
-    LocalAotCtx.StrLen := @AotStrLen;
-    // B3: native call site primitive. The FAST one specialises the case worth specialising - a
-    // callee whose frame is a pointer slide - and falls back to the general one for everything
-    // else, so it is correct for any program. AOT_FASTCALL=0 restores the general one always.
-    if (GAotFastCall = 1) and FAllCalleesFast then LocalAotCtx.CallSub := @AotCallSubFast
-    else LocalAotCtx.CallSub := @AotCallSub;
-    // C5 residuals. StrMid is dialect-variant: install the flavor once per run.
-    LocalAotCtx.StrLeft := @AotStrLeft;
-    LocalAotCtx.StrRight := @AotStrRight;
-    if Assigned(FProgram) and FProgram.ModernMode then
-      LocalAotCtx.StrMid := @AotStrMidModern
-    else
-      LocalAotCtx.StrMid := @AotStrMidClassic;
-    LocalAotCtx.StrAsc := @AotStrAsc;
-    LocalAotCtx.StrChr := @AotStrChr;
-    LocalAotCtx.StrInstr := @AotStrInstr;
-    LocalAotCtx.StrIntToStr := @AotIntToString;
-    LocalAotCtx.StrVal := @AotStrVal;
-    LocalAotCtx.StrValInt := @AotStrValInt;
-    // Managed STRING array element: reached through a primitive because the array descriptor has no
-    // StringData slot (see TAotCtx). Only ever called where an out-of-range index cannot raise.
-    LocalAotCtx.ArrLoadStr := @AotArrLoadStr;
-    LocalAotCtx.ArrStoreStr := @AotArrStoreStr;
-    if Assigned(FProgram) and FProgram.ModernMode then
-      LocalAotCtx.StrAscMid := @AotStrAscMidModern
-    else
-      LocalAotCtx.StrAscMid := @AotStrAscMidClassic;
-    if Assigned(FProgram) and FProgram.ModernMode then
-      LocalAotCtx.StrConcatCharAt := @AotStrConcatCharAtModern
-    else
-      LocalAotCtx.StrConcatCharAt := @AotStrConcatCharAtClassic;
-    if Assigned(FProgram) and FProgram.ModernMode then
-      LocalAotCtx.StrAppendMapped := @AotStrAppendMappedModern
-    else
-      LocalAotCtx.StrAppendMapped := @AotStrAppendMappedClassic;
-    // C6: the record family. Dialect-blind (allocation has no dialect), so one flavor each.
-    LocalAotCtx.RecNew := @AotRecordNew;
-    LocalAotCtx.RecFree := @AotRecordFree;
-    LocalAotCtx.RecMarkPush := @AotRecMarkPush;
-    LocalAotCtx.RecMarkPop := @AotRecMarkPop;
   end
   else
     AotFuncs := nil;
