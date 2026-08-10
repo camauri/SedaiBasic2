@@ -3511,7 +3511,16 @@ begin
           Left := ApplyNarrowCode(7, Left);
           Right := ApplyNarrowCode(7, Right);
         end;
-        EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
+        // A float COMPARISON of two binary32 values is a binary32 comparison. It answers the same as
+        // the 64-bit one - which is why nothing has to change in the interpreter, the AOT or the JIT,
+        // and why they may ignore this flag - but a backend that has the instruction should use it.
+        if (OpCode in [ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat,
+                       ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat]) and
+           (Node.ChildCount >= 2) and
+           IsSingleExpr(Node.GetChild(0)) and IsSingleExpr(Node.GetChild(1)) then
+          EmitInstruction(OpCode, Result, Left, Right, MakeSSAConstInt(1))
+        else
+          EmitInstruction(OpCode, Result, Left, Right, MakeSSAValue(svkNone));
         // IEEE 754: an operation on binary32 produces a binary32. A SINGLE-typed arithmetic operation
         // is therefore rounded to 32 bits HERE, not merely on the way into a variable - carrying wide
         // intermediates and rounding once at the end is the "excess precision" deviation (§10.4), and
@@ -4436,6 +4445,28 @@ begin
           end
           else begin Result := MakeSSAValue(svkNone); Exit; end;
         end
+        // MIN/MAX/COPYSIGN: two float arguments, one result. Same shape as ATAN2 - and the same
+        // reason they are opcodes rather than a composition: each is ONE machine instruction, and
+        // writing MIN as a comparison would fix the NaN behaviour to the wrong thing.
+        else if (FuncName = kMINF) or (FuncName = kMAXF) or (FuncName = kCOPYSIGN) then
+        begin
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            ProcessExpression(ArgListNode.GetChild(1), Arg2Value);
+            ArgReg := EnsureFloatRegister(ArgValue);
+            Arg2Reg := EnsureFloatRegister(Arg2Value);
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
+            if FuncName = kMINF then OpCode := ssaMathMin
+            else if FuncName = kMAXF then OpCode := ssaMathMax
+            else OpCode := ssaMathCopySign;
+            EmitInstruction(OpCode, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+            // A 32-bit result when both operands are 32-bit, exactly like the arithmetic above.
+            if IsSingleExpr(Node) then Result := ApplyNarrowCode(7, Result);
+          end
+          else begin Result := MakeSSAValue(svkNone); Exit; end;
+        end
         else if (FuncName = 'ATAN2') then
         begin
           // ATAN2(y, x) - two-argument arctangent; Src1 = y, Src2 = x.
@@ -4669,6 +4700,10 @@ begin
             OpCode := ssaMathAcosh
           else if FuncName = 'ATANH' then
             OpCode := ssaMathAtanh
+          else if FuncName = kCEIL then
+            OpCode := ssaMathCeil
+          else if FuncName = kROUNDF then
+            OpCode := ssaMathRound
           else if FuncName = 'RND' then
             OpCode := ssaMathRnd
           else
@@ -18994,7 +19029,11 @@ var
     if not Result then
       Result := (Name = 'INT') or (Name = 'FIX') or (Name = 'SQR') or (Name = 'SIN') or (Name = 'COS') or
                 (Name = 'TAN') or (Name = 'ATN') or (Name = 'ASIN') or (Name = 'ACOS') or
-                (Name = 'EXP') or (Name = 'LOG');
+                (Name = 'EXP') or (Name = 'LOG') or
+                // The IEEE extras keep their operands' width: rounding or selecting a binary32 value
+                // yields a binary32 value, which is what lets the backend emit the f32 instruction.
+                (Name = kCEIL) or (Name = kROUNDF) or (Name = kMINF) or (Name = kMAXF) or
+                (Name = kCOPYSIGN);
   end;
 
   // The intrinsics that return a SINGLE whatever they are given: the conversion CSNG, and CVS (declared

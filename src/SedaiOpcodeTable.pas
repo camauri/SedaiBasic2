@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 535 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1: bcGfxDrawString; +5: the bit intrinsics
+  OPCODE_LIST_COUNT = 540 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1: bcGfxDrawString; +5 bit intrinsics; +5 CEIL/ROUND/MIN/MAX/COPYSIGN
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -85,6 +85,7 @@ const
     bcMathFix, bcMathFrac, bcDateNow, bcDateDecode, bcDateSerial, bcTimeSerial,
     bcDateValue, bcIsDate, bcDateAdd, bcDateDiff, bcDatePart, bcSetClock,
     bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,
+    bcMathCeil, bcMathRound, bcMathMin, bcMathMax, bcMathCopySign,
     bcArrayLoad, bcArrayStore, bcArrayDim, bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString, bcArrayLBound, bcArrayUBound, bcArrayErase,
     bcArrayRedim, bcRefLoadInt, bcRefLoadFloat, bcRefLoadString, bcRefStoreInt, bcRefStoreFloat,
@@ -150,27 +151,28 @@ const
   // `sb --verify-opcodes` is what says so.
   DENSE_CORE_BASE     = 0;    // group 0  (168 opcodes) -> dense 0..167
   DENSE_STRING_BASE   = 168;  // group 1  (50)          -> 168..217 (bcStrAscMid = sub 51)
-  DENSE_MATH_BASE     = 220;  // group 2  (36)          -> 218..253
-  DENSE_ARRAY_BASE    = 256;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
-  DENSE_IO_BASE       = 308;  // group 4  (23)          -> 306..328
-  DENSE_SPECIAL_BASE  = 331;  // group 5  (17)          -> 329..345
-  DENSE_FILEIO_BASE   = 348;  // group 6  (37)          -> 346..382 (bcDirAttr = sub 36)
-  DENSE_SPRITE_BASE   = 385;  // group 7  (17)          -> 383..399
+  DENSE_MATH_BASE     = 220;  // group 2  (41)          -> 220..260  ⚠️ CEIL/ROUND/MIN/MAX/
+                              // COPYSIGN took it from 36 to 41, which moved every base below by 5.
+  DENSE_ARRAY_BASE    = 261;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_BASE       = 313;  // group 4  (23)          -> 306..328
+  DENSE_SPECIAL_BASE  = 336;  // group 5  (17)          -> 329..345
+  DENSE_FILEIO_BASE   = 353;  // group 6  (37)          -> 346..382 (bcDirAttr = sub 36)
+  DENSE_SPRITE_BASE   = 390;  // group 7  (17)          -> 383..399
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 402;  // 400..412 (12 used, slot 0 a hole)
+  DENSE_WEB_BASE      = 407;  // 400..412 (12 used, slot 0 a hole)
   // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
   // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
   // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
-  DENSE_GRAPHICS_BASE = 415;  // group 10 (66)          -> 413..478
-  DENSE_SOUND_BASE    = 481;  // group 11 (6)           -> 479..484
-  DENSE_SUPER_BASE    = 487;  // group 200 (256 slots)  -> 485..740
-  DENSE_TOTAL         = 743;  // N (with web)
+  DENSE_GRAPHICS_BASE = 420;  // group 10 (66)          -> 413..478
+  DENSE_SOUND_BASE    = 486;  // group 11 (6)           -> 479..484
+  DENSE_SUPER_BASE    = 492;  // group 200 (256 slots)  -> 485..740
+  DENSE_TOTAL         = 748;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 402;  // group 10 (66)          -> 400..465
-  DENSE_SOUND_BASE    = 468;  // group 11 (6)           -> 466..471
-  DENSE_SUPER_BASE    = 474;  // group 200 (256 slots)  -> 472..727 (58 used, 198 holes)
-  DENSE_TOTAL         = 730;  // N
+  DENSE_GRAPHICS_BASE = 407;  // group 10 (66)          -> 400..465
+  DENSE_SOUND_BASE    = 473;  // group 11 (6)           -> 466..471
+  DENSE_SUPER_BASE    = 479;  // group 200 (256 slots)  -> 472..727 (58 used, 198 holes)
+  DENSE_TOTAL         = 735;  // N
   {$ENDIF}
 
 var

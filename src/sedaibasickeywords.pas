@@ -270,6 +270,14 @@ const
   kACOS    = 'ACOS';      // FreeBASIC: arccosine
   kASIN    = 'ASIN';      // FreeBASIC: arcsine
   kATAN2   = 'ATAN2';     // FreeBASIC: two-argument arctangent
+  // MODERN extensions, declared: the four IEEE 754 operations WASM has an instruction for and no
+  // BASIC has a name for. NaN handling is IEEE's `minimum`/`maximum` - a NaN operand PROPAGATES, and
+  // -0 compares below +0 - because that is the semantics a single machine instruction implements.
+  kCEIL     = 'CEIL';      // round toward +infinity
+  kROUNDF   = 'ROUND';     // round to nearest, ties to EVEN (IEEE roundTiesToEven)
+  kMINF     = 'MIN';       // IEEE minimum(x, y)
+  kMAXF     = 'MAX';       // IEEE maximum(x, y)
+  kCOPYSIGN = 'COPYSIGN';  // magnitude of x with the sign of y
   kFIX     = 'FIX';       // FreeBASIC: truncate toward zero
   kFRAC    = 'FRAC';      // FreeBASIC: fractional part
   kSINH    = 'SINH';      // hyperbolic sine

@@ -230,6 +230,9 @@ type
     ssaMathLog10, ssaMathLog2, ssaMathLogN,  // Additional log functions
     ssaMathAcos, ssaMathAsin, ssaMathAtan2, ssaMathFix, ssaMathFrac,  // FreeBASIC math
     ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh, ssaMathAcosh, ssaMathAtanh,  // hyperbolic
+    // MODERN extensions with an IEEE definition and one WASM instruction each: NaN PROPAGATES through
+    // MIN/MAX (IEEE minimum/maximum), ROUND is ties-to-even. See sedaibasickeywords for the why.
+    ssaMathCeil, ssaMathRound, ssaMathMin, ssaMathMax, ssaMathCopySign,
     // FreeBASIC date/time (date serial = Double, FPC TDateTime epoch 1899-12-30 = VB/FB serial).
     // Each carries an Immediate selector that picks the concrete function (see SedaiBytecodeTypes).
     ssaDateNow,     // NOW / TIMER -> float (Dest=float; Imm selects)

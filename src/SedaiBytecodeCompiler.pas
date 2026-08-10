@@ -263,6 +263,11 @@ begin
     ssaMathAsinh: Result := bcMathAsinh;
     ssaMathAcosh: Result := bcMathAcosh;
     ssaMathAtanh: Result := bcMathAtanh;
+    ssaMathCeil: Result := bcMathCeil;
+    ssaMathRound: Result := bcMathRound;
+    ssaMathMin: Result := bcMathMin;
+    ssaMathMax: Result := bcMathMax;
+    ssaMathCopySign: Result := bcMathCopySign;
     ssaStrDec: Result := bcStrDec;
     ssaPrint: Result := bcPrint;
     ssaPrintLn: Result := bcPrintLn;

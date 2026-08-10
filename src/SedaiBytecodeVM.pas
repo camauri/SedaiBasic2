@@ -5632,7 +5632,8 @@ begin
         bcMathAbs, bcMathSgn, bcMathInt, bcMathSqr, bcMathSin, bcMathCos, bcMathTan,
         bcMathExp, bcMathLog, bcMathAtn, bcMathRnd,
         bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,
-        bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh:
+        bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,
+        bcMathCeil, bcMathRound, bcMathMin, bcMathMax, bcMathCopySign:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
@@ -10836,6 +10837,8 @@ var
   dtVal, dt2: TDateTime;
   dY, dMo, dD, dH, dMi, dS, dMs: Word;
   iv, n: Integer;
+  FloatTmpB: Double;   // the second operand of MIN/MAX
+  PackInt: Int64;      // COPYSIGN assembles its answer from bits
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -10933,6 +10936,65 @@ begin
         Ctx.FloatRegs[Instr.Dest] := Math.ArcTanh(Ctx.FloatRegs[Instr.Src1])
       else
         raise Exception.Create('?ILLEGAL QUANTITY ERROR: ATANH argument out of (-1,1)');
+    36: // bcMathCeil - CEIL(x): toward +infinity. Written as -floor(-x) so the whole double range
+        // works; Math.Ceil answers an integer and would clamp.
+      Ctx.FloatRegs[Instr.Dest] := -FloorDouble(-Ctx.FloatRegs[Instr.Src1]);
+    37: // bcMathRound - ROUND(x): nearest, ties to EVEN (IEEE roundTiesToEven, and WASM's f64.nearest).
+        // Beyond 2^52 every double is already an integer, so the value is its own answer - and that is
+        // also the range where the trip through Int64 would stop being exact.
+      if Abs(Ctx.FloatRegs[Instr.Src1]) >= 4503599627370496.0 then
+        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1]
+      else
+      begin
+        Ctx.FloatRegs[Instr.Dest] := Double(Round(Ctx.FloatRegs[Instr.Src1]));
+        // ⛔ Rounding to an integral value KEEPS the sign of a zero (IEEE 754
+        // roundToIntegralTiesToEven), so Round(-0.3) is -0 and not +0. The trip through Int64
+        // loses that - Round gives 0 and Double(0) is +0 - and it showed as the module answering
+        // -0 where we answered 0. The module was right; same family as FIX(-0.0).
+        if (Ctx.FloatRegs[Instr.Dest] = 0.0) and
+           (PInt64(@Ctx.FloatRegs[Instr.Src1])^ < 0) then
+          Ctx.FloatRegs[Instr.Dest] := -0.0;
+      end;
+    38, 39: // bcMathMin / bcMathMax - IEEE minimum / maximum.
+        // ⛔ A NaN PROPAGATES and -0 ranks below +0. That is not the obvious "if a < b" reading, and it
+        // is the reading chosen on purpose: it is what one machine instruction does (WASM's f64.min /
+        // f64.max), so the semantics is decided where it can still be decided rather than transcribed
+        // afterwards from whatever the interpreter happened to do.
+      begin
+        dtVal := Ctx.FloatRegs[Instr.Src1]; FloatTmpB := Ctx.FloatRegs[Instr.Src2];
+        if IsNan(dtVal) or IsNan(FloatTmpB) then
+          Ctx.FloatRegs[Instr.Dest] := dtVal / 0.0 * 0.0                      // a quiet NaN
+        else if (dtVal = 0.0) and (FloatTmpB = 0.0) then
+        begin
+          // both zeros: the sign decides, and only the bits can tell them apart
+          if SubOp = 38 then
+          begin
+            if (PInt64(@dtVal)^ < 0) then Ctx.FloatRegs[Instr.Dest] := dtVal
+            else Ctx.FloatRegs[Instr.Dest] := FloatTmpB;
+          end
+          else
+          begin
+            if (PInt64(@dtVal)^ < 0) then Ctx.FloatRegs[Instr.Dest] := FloatTmpB
+            else Ctx.FloatRegs[Instr.Dest] := dtVal;
+          end;
+        end
+        else if SubOp = 38 then
+        begin
+          if dtVal < FloatTmpB then Ctx.FloatRegs[Instr.Dest] := dtVal
+          else Ctx.FloatRegs[Instr.Dest] := FloatTmpB;
+        end
+        else
+        begin
+          if dtVal > FloatTmpB then Ctx.FloatRegs[Instr.Dest] := dtVal
+          else Ctx.FloatRegs[Instr.Dest] := FloatTmpB;
+        end;
+      end;
+    40: // bcMathCopySign - the magnitude of x with the sign of y, bit for bit (WASM's f64.copysign).
+      begin
+        PackInt := (PInt64(@Ctx.FloatRegs[Instr.Src1])^ and $7FFFFFFFFFFFFFFF) or
+                   (PInt64(@Ctx.FloatRegs[Instr.Src2])^ and Int64($8000000000000000));
+        Ctx.FloatRegs[Instr.Dest] := PDouble(@PackInt)^;
+      end;
     20: // bcDateNow - Immediate 0=NOW (date+time serial), 1=TIMER (seconds since midnight)
       begin
         dtVal := Now + FClockOffsetDays;

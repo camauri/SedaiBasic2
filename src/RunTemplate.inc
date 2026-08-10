@@ -579,7 +579,7 @@ begin
       // === Delegated families (each a contiguous dense range) ===
       DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 51:
         begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
-      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 35:
+      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 40:
         begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
       // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.

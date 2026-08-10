@@ -1962,6 +1962,11 @@ begin
  RegisterKeyword(kACOS,  ttMathFunction, 'Return arccosine (radians) of x in [-1,1]',                kcMathFunctions);
  RegisterKeyword(kASIN,  ttMathFunction, 'Return arcsine (radians) of x in [-1,1]',                  kcMathFunctions);
  RegisterKeyword(kATAN2, ttMathFunction, 'Return two-argument arctangent ATAN2(y, x)',               kcMathFunctions);
+ RegisterKeyword(kCEIL, ttMathFunction, 'Round toward +infinity CEIL(x)',                            kcMathFunctions);
+ RegisterKeyword(kROUNDF, ttMathFunction, 'Round to nearest, ties to even ROUND(x)',                  kcMathFunctions);
+ RegisterKeyword(kMINF, ttMathFunction, 'IEEE minimum MIN(x, y) - a NaN propagates',                  kcMathFunctions);
+ RegisterKeyword(kMAXF, ttMathFunction, 'IEEE maximum MAX(x, y) - a NaN propagates',                  kcMathFunctions);
+ RegisterKeyword(kCOPYSIGN, ttMathFunction, 'Magnitude of x with the sign of y COPYSIGN(x, y)',       kcMathFunctions);
  RegisterKeyword(kFIX,   ttMathFunction, 'Truncate toward zero',                                     kcMathFunctions);
  RegisterKeyword(kFRAC,  ttMathFunction, 'Return the fractional part (keeps sign)',                  kcMathFunctions);
  RegisterKeyword(kSINH,  ttMathFunction, 'Return the hyperbolic sine of x',                          kcMathFunctions);

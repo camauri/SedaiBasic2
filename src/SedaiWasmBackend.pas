@@ -5286,6 +5286,11 @@ begin
     ssaMulFloat: Result := wopF32Mul;
     ssaDivFloat: Result := wopF32Div;
     ssaMathSqr:  begin Result := wopF32Sqrt; Un := True; end;
+    ssaMathCeil:     begin Result := wopF32Ceil;    Un := True; end;
+    ssaMathRound:    begin Result := wopF32Nearest; Un := True; end;
+    ssaMathMin:      Result := wopF32Min;
+    ssaMathMax:      Result := wopF32Max;
+    ssaMathCopySign: Result := wopF32Copysign;
     ssaNegFloat: begin Result := wopF32Neg;  Un := True; end;
     ssaMathAbs:  begin Result := wopF32Abs;  Un := True; end;
     // INT is floor and FIX is truncate-toward-zero, which is what these two f32 forms are. Rounding
@@ -5316,6 +5321,21 @@ function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer)
     StoreReg(B, Instr.Dest);
   end;
 
+  // A comparison whose operands are both binary32 (Src3 = 1, set by the generator). Demoting them is
+  // the identity - they ARE binary32 already - so this answers exactly what the f64 form answers, and
+  // a consumer that ignores the flag stays correct. That is why the flag is safe to ignore here and
+  // was not safe to ignore on the int->float conversion: there, ignoring it changed the answer.
+  procedure Cmp32(Opcode: Byte);
+  begin
+    LoadReg(B, Instr.Src1); B.Op(wopF32DemoteF64);
+    LoadReg(B, Instr.Src2); B.Op(wopF32DemoteF64);
+    B.Op(Opcode);
+    BoolToBasic(B);
+    StoreReg(B, Instr.Dest);
+  end;
+  function CmpIs32: Boolean;
+  begin Result := (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1); end;
+
   procedure Un(Opcode: Byte);
   begin
     LoadReg(B, Instr.Src1);
@@ -5335,7 +5355,8 @@ var
 begin
   Result := True;
   case Instr.OpCode of
-    ssaLabel, ssaNop: ;                     // no code of their own
+    ssaLabel: ;                             // a label is a position, not code
+    ssaNop: B.Op(wopNop);                   // and a no-op is exactly what WASM's nop is
     ssaPrintEnd: ;                          // resets C128 reverse mode; nothing to do here
 
     { ⛔ The three PRINT families each read ONE bank, and a front-end coercion
@@ -6926,6 +6947,14 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    // The IEEE extras: one instruction each, which is the whole reason they are opcodes. The f32
+    // forms come from the same fusion the arithmetic uses - operation plus the narrowing that
+    // consumes it - so nothing extra is needed for them here.
+    ssaMathCeil:     Un(wopF64Ceil);
+    ssaMathRound:    Un(wopF64Nearest);
+    ssaMathMin:      Bin(wopF64Min);
+    ssaMathMax:      Bin(wopF64Max);
+    ssaMathCopySign: Bin(wopF64Copysign);
     ssaAddFloat: Bin(wopF64Add);
     ssaSubFloat: Bin(wopF64Sub);
     ssaMulFloat: Bin(wopF64Mul);
@@ -7050,12 +7079,12 @@ begin
     ssaCmpGtUInt: Cmp(wopI64GtU);
     ssaCmpLeUInt: Cmp(wopI64LeU);
     ssaCmpGeUInt: Cmp(wopI64GeU);
-    ssaCmpEqFloat: Cmp(wopF64Eq);
-    ssaCmpNeFloat: Cmp(wopF64Ne);
-    ssaCmpLtFloat: Cmp(wopF64Lt);
-    ssaCmpGtFloat: Cmp(wopF64Gt);
-    ssaCmpLeFloat: Cmp(wopF64Le);
-    ssaCmpGeFloat: Cmp(wopF64Ge);
+    ssaCmpEqFloat: if CmpIs32 then Cmp32(wopF32Eq) else Cmp(wopF64Eq);
+    ssaCmpNeFloat: if CmpIs32 then Cmp32(wopF32Ne) else Cmp(wopF64Ne);
+    ssaCmpLtFloat: if CmpIs32 then Cmp32(wopF32Lt) else Cmp(wopF64Lt);
+    ssaCmpGtFloat: if CmpIs32 then Cmp32(wopF32Gt) else Cmp(wopF64Gt);
+    ssaCmpLeFloat: if CmpIs32 then Cmp32(wopF32Le) else Cmp(wopF64Le);
+    ssaCmpGeFloat: if CmpIs32 then Cmp32(wopF32Ge) else Cmp(wopF64Ge);
 
     // Src3 = 1 says the source was UNSIGNED, and WASM has the instruction for it - the one case
     // where the distinction costs nothing at all.

@@ -451,6 +451,13 @@ const
   bcMathAsinh       = bcGroupMath + 33;  // ASINH(x) - inverse hyperbolic sine
   bcMathAcosh       = bcGroupMath + 34;  // ACOSH(x) - inverse hyperbolic cosine (x >= 1)
   bcMathAtanh       = bcGroupMath + 35;  // ATANH(x) - inverse hyperbolic tangent (|x| < 1)
+  // MODERN extensions: IEEE operations WASM has one instruction for. ⚠️ Growing this group past 36
+  // moves every DENSE_*_BASE after it - see SedaiOpcodeTable, and `sb --verify-opcodes` is what says so.
+  bcMathCeil        = bcGroupMath + 36;  // CEIL(x) - toward +infinity
+  bcMathRound       = bcGroupMath + 37;  // ROUND(x) - nearest, ties to EVEN
+  bcMathMin         = bcGroupMath + 38;  // MIN(x, y) - IEEE minimum, a NaN propagates
+  bcMathMax         = bcGroupMath + 39;  // MAX(x, y) - IEEE maximum, a NaN propagates
+  bcMathCopySign    = bcGroupMath + 40;  // COPYSIGN(x, y) - magnitude of x, sign of y
 
   // === GROUP 3: ARRAY OPERATIONS (0x03xx) ===
   // B4 bounds-check elimination: on bcArrayLoad*/bcArrayStore* the Immediate field is
