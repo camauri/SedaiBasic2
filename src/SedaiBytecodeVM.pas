@@ -8436,6 +8436,11 @@ end;
 { BuildJitLoops - compile every eligible hot loop of the current program to native (JIT J2/J3). A loop
   header is the target of a backward branch; its body runs to the LAST branch that jumps back to it.
   CompileLoop returns nil for any loop with an unsupported opcode, so those stay interpreted. }
+// The one-instruction interpreter helper, defined further down next to the rest of the AOT runtime.
+// Declared here because the loop JIT is handed its address (the J14 helper route) and is compiled
+// before it.
+function AotExecOne(VMSelf, CtxObj: Pointer; PC: PtrInt; AotCtx: PAotCtx): PtrInt; cdecl; forward;
+
 procedure TBytecodeVM.BuildJitLoops;
 type
   PBcInstr = ^TBytecodeInstruction;
@@ -8504,7 +8509,12 @@ begin
                          Integer(PtrUInt(@FCtx.XferInt) - PtrUInt(Pointer(FCtx))),
                          Integer(PtrUInt(@FCtx.XferFloat) - PtrUInt(Pointer(FCtx))),
                          Integer(PtrUInt(@FCtx.Records) - PtrUInt(Pointer(FCtx))),
-                         RecSz, RIntOff, RFloatOff);
+                         RecSz, RIntOff, RFloatOff,
+                         // J14: the channel to the interpreter the JIT never had. An instruction with
+                         // no native form is now run by AotExecOne - the same helper the AOT uses -
+                         // instead of costing the whole loop. Self is the VM that owns this code, so
+                         // baking it is safe; the per-thread half (the context) is a call argument.
+                         @AotExecOne, Pointer(Self));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin

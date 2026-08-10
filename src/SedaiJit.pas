@@ -17,6 +17,15 @@ unit SedaiJit;
   stays in the range or is a clean exit. Anything else -> the loop is left to the
   interpreter. The supported set is grown as milestones land (arrays, sqrt, div...).
 
+  ...except that "anything else" no longer has to mean the WHOLE loop (J14, the helper
+  route). An instruction with no native form can now be RUN BY THE INTERPRETER, one
+  instruction at a time, with native execution continuing after it - which is what the
+  AOT has always done. The two engines never differed by philosophy, only by what they
+  were handed: the AOT gets ExecOne in its context record, the JIT was given no channel
+  to the interpreter at all, so its only fallback was to give up the loop. It is given
+  one now (HelperFn/VMSelf below), and one unsupported instruction costs a call instead
+  of the whole loop. See EmitHelperCall for the five parts and what may NOT be routed.
+
   Register file (Win64 non-volatile saved in the prologue): rbx = IntRegs base,
   rsi = FloatRegs base. rax/rcx scratch (integer), xmm0/xmm1 scratch (float).
   ============================================================================ }
@@ -55,9 +64,15 @@ type
 // RecSize/RecIntOff/RecFloatOff are SizeOf(TRecordStorage) and the byte offsets of its IntData/FloatData
 // fields, so record field access (J13) needs no hardcoded layout. Returns a TExecMem whose Ptr is a
 // TNativeLoopFn, or nil if the loop is not compilable.
+// HelperFn/VMSelf are the helper route (J14): @AotExecOne and the VM instance that owns the compiled
+// loop. Both are fixed for the life of the code, so they are baked as imm64 - the only per-CONTEXT
+// value the route needs is the context object, and that is already in the frame slot the Xfer/record
+// accessors read. Pass nil for either and the route is off: every routable opcode bails the loop
+// again, which is the pre-J14 behaviour.
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
-                     RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
+                     RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
+                     HelperFn, VMSelf: Pointer): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -81,9 +96,58 @@ type
     TargetPC: Integer;    // bytecode PC to jump to (or -1 = epilogue)
   end;
 
+// JIT_HELPER=0 puts every routable opcode back on "bail the whole loop", which is the A/B for the
+// helper route on ONE binary (the same shape as AOT_BITOPS). Read once, cached.
+var
+  GJitHelperState: Integer = -1;
+
+function HelperRouteEnabled: Boolean;
+begin
+  if GJitHelperState < 0 then
+  begin
+    if GetEnvironmentVariable('JIT_HELPER') = '0' then GJitHelperState := 0 else GJitHelperState := 1;
+  end;
+  Result := GJitHelperState = 1;
+end;
+
+// The opcodes the helper route may carry (J14) - a WHITELIST, and every exclusion is a reason, not a
+// to-do item. Two properties make an opcode routable, and BOTH were read out of the interpreter
+// rather than assumed:
+//   * it must not touch the ARRAY descriptor table. ExecuteArrayOp sets FArraysDirty on every
+//     operation and a REDIM inside it can move the element storage, while this code holds the
+//     descriptor pointer in r8 and element bases in the GPR pool for the whole invocation, with no
+//     ctx record for the helper to refresh (see EmitHelperCall). Group 3 is therefore out - and
+//     ExecuteStringOp / ExecuteMathOp / ExecuteIOOp were CHECKED: none of them names FArrays.
+//   * it must not move the PC. The guard after the call is correct either way, but an instruction
+//     that jumps would leave the native loop EVERY time it is taken, which is slower than never
+//     compiling the loop at all. The same three handlers were checked for `Ctx.PC :=`: none.
+// Groups 1/2/4 (string, math, I/O) are in wholesale on that reading - which is what puts a PRINT, a
+// SIN or a `^` inside a hot loop, each of them enough to cost the whole loop until now. Out for the
+// same "buys nothing" reason: calls, returns and branches, which have their own arms above.
+function IsRoutableOp(Op: Word): Boolean;
+begin
+  case Op and $FF00 of
+    bcGroupString, bcGroupMath, bcGroupIO:
+      Result := True;
+  else
+    // The core-group and superinstruction stragglers, by name: the string bank the JIT does not
+    // have, and record allocation, which needs the VM's allocator.
+    case Op of
+      bcLoadConstString, bcCopyString, bcIntToString,
+      bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
+      bcRecordNew, bcRecordFree,
+      bcStrAppendMapped, bcStrConcatCharAt:
+        Result := True;
+    else
+      Result := False;
+    end;
+  end;
+end;
+
 function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: Int64;
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
-                     RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer): TExecMem;
+                     RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
+                     HelperFn, VMSelf: Pointer): TExecMem;
 var
   E: TX86Emitter;
   NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
@@ -153,6 +217,13 @@ var
   InGosub: Boolean;
   GEntry, GRet, GCallPC: array of Integer;   // one entry per inlinable GOSUB site
   NGosub: Integer;
+  // Helper route (J14): scratch slots for the two base registers a call destroys but that have no bank
+  // slot of their own (r8 = the array descriptor table, rsi = the float bank base, volatile on SysV),
+  // and the statically-known pad that puts rsp back on a 16-byte boundary at the call.
+  UseHelper: Boolean;                // this loop routes at least one instruction (allocates the slots)
+  RoutesRecords: Boolean;            // ...and at least one of them ALLOCATES a record (see bcRecMarkPush)
+  ArrDescDisp, FltSaveDisp: Integer;
+  HelperAdjust: Integer;             // bytes subtracted from rsp around a call (shadow space + pad)
 
   procedure AddFixup(AOff, ATarget: Integer);
   begin
@@ -1118,6 +1189,96 @@ var
     end;
   end;
 
+  { ---------------- J14: the helper route ----------------
+
+    An instruction with no native form is handed to the INTERPRETER, one instruction at a time,
+    and native execution resumes after it. This is EmitHelperCall from the AOT (SedaiAot.pas),
+    transcribed: the JIT lacked it only because nobody had passed it a channel to the interpreter.
+
+    What may be routed, and what may NOT (the case labels are the authority; this is the reason):
+      * NOT the array family. ExecuteArrayOp sets FArraysDirty on EVERY operation, and the
+        descriptor table it may rebuild is held in r8 for the whole invocation, with element base
+        pointers cached in the GPR pool. The AOT survives that because AotExecOne refreshes ArrDesc
+        in its ctx record; the JIT has no such record and passes nil as the 4th argument, which
+        SKIPS that refresh - correct only as long as nothing routed can dirty the table.
+      * NOT inside an inlined callee or GOSUB body. Their caller registers are parked on the stack
+        (not in the banks), so the flush below would write the wrong values back - the same reason
+        DeoptTo is refused there.
+    Everything else is safe by construction, because of two things that are NOT obvious:
+      * The flush/reload is COMPLETE, so the routed opcodes need no entry in ScanI/ScanF: no
+        ILoad/IStore is emitted for them, so ILoc/FLoc are never indexed with a register that only
+        they mention - which is the one way this JIT miscompiles in silence.
+      * The PC guard at the end makes a static list of "opcodes that move the PC" unnecessary. The
+        helper reports where the interpreter would go next; native code continues ONLY if that is
+        exactly apc+1. Anything else - a moved PC, or one of AotExecOne's negative sentinels for a
+        raised exception / a cleared Running - leaves through the epilogue with that value in rax,
+        which is already the epilogue's contract (and the run loop now resolves it with AotSettle,
+        exactly as it does for the AOT). }
+  procedure EmitHelperCall(apc: Integer);
+  var k: Integer;
+  begin
+    // 1. Flush every allocated VM register to its bank slot - the same stores the epilogue emits.
+    //    The helper runs an interpreter handler that reads and WRITES the banks, so no value may
+    //    stay in a machine register across the call. (rbx, the int bank base, is callee-saved on
+    //    both ABIs and survives; r8 and rsi do not, hence the two scratch slots below.)
+    for k := 0 to IMaxReg do
+      if ILoc[k] >= 0 then StoreRegMem(ILoc[k], LongWord(k) * 8);
+    for k := 0 to FMaxReg do
+      if FLoc[k] >= 0 then E.MemOp([$F2, $0F, $11], FLoc[k], RSI, LongWord(k) * 8);
+    // 2. Park the two base registers that have no bank slot, BEFORE the argument setup clobbers
+    //    them (r8 is arg2 on Win64; rsi is arg1 on System V and the float bank base here).
+    E.EmitBytes([$4C, $89, $84, $24]); E.Emit32(LongWord(ArrDescDisp));   // mov [rsp+ArrDescDisp], r8
+    E.EmitBytes([$48, $89, $B4, $24]); E.Emit32(LongWord(FltSaveDisp));   // mov [rsp+FltSaveDisp], rsi
+    // 3. Arguments: AotExecOne(VMSelf, CtxObj, apc, nil). VMSelf and the helper address are baked -
+    //    both are fixed for the life of this code - while the CONTEXT is read from its frame slot,
+    //    so a worker thread running this same loop hands the helper its own state. The 4th argument
+    //    is nil on purpose: see the array note above.
+    {$IFDEF WINDOWS}
+    MovImm64(RCX, PtrInt(VMSelf));                                        // arg0 = VMSelf
+    E.EmitBytes([$48, $8B, $94, $24]); E.Emit32(LongWord(CtxDisp));       // arg1 = rdx = ctx object
+    MovImm64(R8, apc);                                                    // arg2 = the bytecode PC
+    E.EmitBytes([$45, $31, $C9]);                                         // arg3 = xor r9d, r9d (nil)
+    {$ELSE}
+    MovImm64(RDI, PtrInt(VMSelf));                                        // arg0 = VMSelf
+    E.EmitBytes([$48, $8B, $B4, $24]); E.Emit32(LongWord(CtxDisp));       // arg1 = rsi = ctx object
+    MovImm64(RDX, apc);                                                   // arg2 = the bytecode PC
+    E.EmitBytes([$31, $C9]);                                              // arg3 = xor ecx, ecx (nil)
+    {$ENDIF}
+    MovImm64(RAX, PtrInt(HelperFn));                                      // rax = @AotExecOne
+    // 4. The first call inside JIT-generated code: Win64 wants 32 bytes of shadow space and both
+    //    ABIs want rsp 16-aligned AT the call. Both are static - the whole frame displacement is
+    //    known at emission - so the adjustment is a constant computed once (HelperAdjust). The
+    //    scratch reads above happen BEFORE it, so their fixed offsets stay valid.
+    if HelperAdjust > 0 then
+    begin
+      E.EmitBytes([$48, $83, $EC]); E.Emit8(Byte(HelperAdjust));          // sub rsp, HelperAdjust
+    end;
+    E.EmitBytes([$FF, $D0]);                                              // call rax
+    if HelperAdjust > 0 then
+    begin
+      E.EmitBytes([$48, $83, $C4]); E.Emit8(Byte(HelperAdjust));          // add rsp, HelperAdjust
+    end;
+    // 5. Rebuild everything the call destroyed: the two base registers, then the banks (the helper
+    //    may have written any of them), then the array base/count cache - which is NOT covered by
+    //    the bank reload, because it lives in the GPR pool whose first three entries (r9/r10/r11)
+    //    are caller-saved. A cached base has no bank slot; only a re-read from the descriptor
+    //    rebuilds it. (Reloading is idempotent, and emits nothing in a loop with no cache.)
+    E.EmitBytes([$4C, $8B, $84, $24]); E.Emit32(LongWord(ArrDescDisp));   // mov r8,  [rsp+ArrDescDisp]
+    E.EmitBytes([$48, $8B, $B4, $24]); E.Emit32(LongWord(FltSaveDisp));   // mov rsi, [rsp+FltSaveDisp]
+    for k := 0 to IMaxReg do
+      if ILoc[k] >= 0 then LoadRegMem(ILoc[k], LongWord(k) * 8);
+    for k := 0 to FMaxReg do
+      if FLoc[k] >= 0 then E.MemOp([$F2, $0F, $10], FLoc[k], RSI, LongWord(k) * 8);
+    for k := 0 to NCArr - 1 do
+    begin
+      if CArrBase[k]  >= 0 then R8LoadR(CArrBase[k],  LongWord(CArrId[k]) * 32 + LongWord(CArrOff[k]));
+      if CArrCount[k] >= 0 then R8LoadR(CArrCount[k], LongWord(CArrId[k]) * 32 + 16);
+    end;
+    // 6. Continue natively only if the interpreter landed exactly where this code expects.
+    E.EmitBytes([$48, $3D]); E.Emit32(LongWord(apc + 1));                 // cmp rax, apc+1
+    JccRel($85, -1);                                                      // jne epilogue
+  end;
+
   // Return the call-site index for a bcCallSub at absolute PC apc (populated by BuildCallSites), or -1
   // if that call was found non-inlinable (then the op stays unsupported and the loop bails).
   function FindCallSite(apc: Integer): Integer;
@@ -1484,9 +1645,18 @@ var
           E.MemOp([$F2, $0F, $10], XMM0, RDX, LongWord(I^.Immediate) * 8);  // movsd xmm0, [rdx+slot*8]
           FStore(I^.Dest, XMM0);
         end;
-      // Block-scoped record marks: a no-op here -- a loop we compile allocates no records (bcRecordNew is
-      // unsupported and bails), so RecordCount is invariant across the mark and reclaiming to it is exact.
-      bcRecMarkPush, bcRecMarkPop: ;
+      // Block-scoped record marks. They were a no-op here on a premise the helper route has just
+      // REVOKED: "a loop we compile allocates no records, so RecordCount is invariant across the mark
+      // and reclaiming to it is exact". A routed bcRecordNew allocates inside the loop, and then a
+      // no-op push followed by a real pop would reclaim to a mark taken OUTSIDE the loop - so the
+      // pair follows the allocation: routed when this loop allocates, free when it does not. ⛔ Both
+      // read the SAME flag: a routed pop against a skipped push is the corruption, not either alone.
+      bcRecMarkPush, bcRecMarkPop:
+        if RoutesRecords then
+        begin
+          if InCallee or InGosub then Exit;
+          EmitHelperCall(apc);
+        end;
       // Inlined SUB call (J6): FramePush (native bank save) + inline callee body (all-memory) + FramePop.
       bcCallSub:
         begin
@@ -1551,7 +1721,10 @@ var
           if InRange[target] then JmpRel(target)
           else
           begin
-            if InGosub then Exit;                              // a deopt out of an inlined GOSUB is unsafe
+            // A deopt out of an inlined body is unsafe for BOTH kinds - its native frame would be
+            // lost, and the interpreter would resume mid-callee with no frame pushed. BuildCallSites
+            // already refuses such a site; this is the backstop that makes the rule local.
+            if InGosub or InCallee then Exit;
             E.EmitBytes([$B8]); E.Emit32(LongWord(target));   // mov eax, target (exit PC)
             JmpRel(-1);                                        // jmp epilogue
           end;
@@ -1568,7 +1741,7 @@ var
           end
           else
           begin
-            if InGosub then Exit;                    // a conditional deopt out of an inlined GOSUB is unsafe
+            if InGosub or InCallee then Exit;        // a conditional deopt out of an inlined body is unsafe
             // Conditional EXIT: skip over the exit sequence when the branch is NOT taken.
             if I^.OpCode = bcJumpIfZero then E.EmitBytes([$75, $00])   // jnz short +len(exit)
             else E.EmitBytes([$74, $00]);                             // jz  short +len(exit)
@@ -1578,9 +1751,22 @@ var
             E.PatchByte(d - 1, Byte(E.Len - d));               // patch the skip displacement
           end;
         end;
+      // END / STOP: a native loop cannot end the program - but it can LEAVE, and the interpreter then
+      // executes the very instruction we stopped at, which is what a deopt already means. Cheaper than
+      // routing it (no call at all), and it is what stops a single `IF ... THEN END` from costing the
+      // whole loop. Not valid inside an inlined body, same as every other deopt.
+      bcEnd, bcStop:
+        if InCallee or InGosub then Exit else DeoptTo(apc);
     else
-      // Unsupported opcode -> bail: the whole loop stays interpreted.
-      Exit;
+      // The helper route (J14): an instruction with no native form is run by the INTERPRETER and
+      // native execution carries on after it, instead of the whole loop being given up. Only for
+      // what IsRoutableOp allows, and never inside an inlined callee or GOSUB body - their caller
+      // registers are parked on the stack rather than in the banks, so EmitHelperCall's flush would
+      // write the wrong values back (the same reason DeoptTo is refused there).
+      if UseHelper and (not InCallee) and (not InGosub) and IsRoutableOp(I^.OpCode) then
+        EmitHelperCall(apc)
+      else
+        Exit;      // still unsupported -> bail: the whole loop stays interpreted
     end;
     Result := True;
   end;
@@ -1611,6 +1797,25 @@ var
         if J^.Dest > md then md := J^.Dest;
         Inc(r);
       end;
+      // ⛔ Every jump in the body must STAY in the body. `rp` is the FIRST bcReturnSub, which for a
+      // callee with an early `Return` is the early one - so the real body sits AFTER rp, out of
+      // range, and the conditional jump that reaches it would be emitted as a loop EXIT from inside
+      // an inlined callee. That is precisely what DeoptTo refuses to do (the native frame is lost):
+      // the program resumed mid-callee with no frame pushed and died on an access violation.
+      // Rejecting the site turns a silent miscompile into a bail, which is this compiler's contract.
+      // 🐛 It was invisible until J14: every witness had a PRINT in the loop, so the loop bailed
+      // before reaching the call. Covering an opcode is how a latent defect gets found.
+      if ok and (rp >= 0) then
+        for r := ep to rp do
+        begin
+          J := @Prog[r];
+          if (J^.OpCode = bcJump) or (J^.OpCode = bcJumpIfZero) or (J^.OpCode = bcJumpIfNotZero) then
+            if (Integer(J^.Immediate) < ep) or (Integer(J^.Immediate) > rp) then
+            begin
+              ok := False;
+              Break;
+            end;
+        end;
       if (rp < 0) or (not ok) then Continue;
       Inc(NCall);
       SetLength(CallPC, NCall); SetLength(CallEntry, NCall);
@@ -1788,12 +1993,46 @@ begin
   // Sparse frame-save lists (J6e) were built during allocation (the overflow branches): SaveIntRegs /
   // SaveFloatRegs hold exactly the USED caller regs that got no native register. For n-body's fully-allocated
   // main loop both are empty -> no per-call bank copy at all.
+  // --- helper route (J14): does this loop need it at all? ---
+  // Decided BEFORE the frame is laid out, because the route costs two more scratch slots and a
+  // different rsp adjustment, and a loop that routes nothing keeps the frame it had before this
+  // existed. Deliberately CONSERVATIVE: an opcode that IsRoutableOp accepts may still be lowered
+  // natively by the case below (bcMathSqr is in the math group), so a loop can reserve the slots and
+  // never use them. Sixteen bytes of stack is not worth a second emission pass to reclaim.
+  UseHelper := False;
+  RoutesRecords := False;
+  if (HelperFn <> nil) and (VMSelf <> nil) and HelperRouteEnabled then
+    for ii := HeaderPC to EndPC do
+    begin
+      if IsRoutableOp(Prog[ii].OpCode) then UseHelper := True;
+      if (Prog[ii].OpCode = bcRecordNew) or (Prog[ii].OpCode = bcRecordFree) then RoutesRecords := True;
+    end;
   // Scratch layout: [0, (NSaveInt+NSaveFloat)*8) sparse bank save, then [GprSaveDisp, +NCallerGpr*8)
   // GPR save, then the 8-byte ctx slot at CtxDisp (always present: the Xfer/record accessors read the
-  // Ctx object pointer from it; rsp is stable through the body so the offset is fixed).
+  // Ctx object pointer from it; rsp is stable through the body so the offset is fixed), and finally -
+  // only when this loop routes - the two slots for the base registers a call destroys.
   GprSaveDisp := (NSaveInt + NSaveFloat) * 8;
   CtxDisp := GprSaveDisp + NCallerGpr * 8;
   ScratchBytes := CtxDisp + 8;
+  ArrDescDisp := -1; FltSaveDisp := -1; HelperAdjust := 0;
+  if UseHelper then
+  begin
+    ArrDescDisp := ScratchBytes;
+    FltSaveDisp := ScratchBytes + 8;
+    ScratchBytes := ScratchBytes + 16;
+    // rsp at a call site, computed statically: the return address, the two unconditional pushes, the
+    // callee-saved GPRs the allocator claimed, the optional xmm6/7 area, and the scratch. Win64 also
+    // wants 32 bytes of shadow space; System V wants only the alignment.
+    ci := 8 + 16;
+    for gpr := 12 to 15 do if SaveGpr[gpr] then Inc(ci, 8);
+    if SaveX6 or SaveX7 then Inc(ci, 16);
+    Inc(ci, ScratchBytes);
+    {$IFDEF WINDOWS}
+    HelperAdjust := 32 + ((16 - (ci mod 16)) mod 16);
+    {$ELSE}
+    HelperAdjust := (16 - (ci mod 16)) mod 16;
+    {$ENDIF}
+  end;
 
   try
     // --- prologue ---  (Win64: rcx=IntRegs, rdx=FloatRegs; SysV: rdi/rsi)

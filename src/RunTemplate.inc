@@ -95,6 +95,15 @@ begin
   // the GActiveCtx threadvar (set by WorkerThreadEntry before calling RunFast); the main thread
   // leaves it nil and uses FCtx. A single read per Run keeps per-instruction access register-direct.
   if GActiveCtx <> nil then Ctx := GActiveCtx else Ctx := FCtx;
+  {$IFDEF DEBUG_MODE}
+  // ⛔ TRON and a compiled loop are mutually exclusive BY NATURE: the trace line is printed by THIS
+  // dispatch loop, and a native loop runs no dispatch - so a traced FOR would silently lose its line
+  // numbers. A traced run gives up its compiled loops, and the untraced path pays NOTHING for the
+  // rule: TRON switches the whole run over to this (DEBUG_MODE) copy of the template, and TROFF
+  // switches back. Found when J14 first let a loop with a PRINT in it compile - until then every
+  // TRON witness bailed on the PRINT, so the conflict could not show.
+  if Ctx.TraceActive then begin JitOn := False; JitLoops := nil; end;
+  {$ENDIF}
   // The main context starts at the program EntryPoint (StartPC = -1); a worker starts at the entry
   // PC of the SUB it runs (StartPC set in RunWorker), with a synthetic call frame already primed.
   // A pending TRON/TROFF mode switch overrides both: the other run loop handed control over
@@ -212,8 +221,14 @@ begin
     if JitOn and (JitLoops[CurPC] <> nil) then
     begin
       if FArraysDirty then RebuildJitArrDesc;
-      CurPC := TNativeLoopFn(TExecMem(JitLoops[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @FJitArrDesc[0],
-                                                            Pointer(Ctx));
+      // AotSettle, not a bare assignment: since J14 a compiled loop can route one instruction through
+      // the interpreter, and that helper reports a raised exception or a cleared Running as a NEGATIVE
+      // sentinel in the same channel as the exit PC. Resolving it here is what makes ON ERROR / TRAP /
+      // CTRL+C behave inside a native loop exactly as they do inside a native AOT function - the arm
+      // below has always done this, and the two now share the one place that knows the contract.
+      CurPC := AotSettle(Ctx,
+        TNativeLoopFn(TExecMem(JitLoops[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @FJitArrDesc[0],
+                                                     Pointer(Ctx)));
       System.Continue;
     end;
 
