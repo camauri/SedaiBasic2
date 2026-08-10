@@ -1570,8 +1570,46 @@ var
   // ⚠️ The primitive's second and FOURTH parameters are start and length; the third is a filler that
   // exists only so the argument shape matches the family. Read from the DECLARATION, not from the
   // ctx comment, which lists them in a different order.
+  //
+  // FAST PATH, transcribed from the AOT's and gated on the SAME predicate (AotAscMidInline), which is
+  // exported for exactly that reason: it answers "may emitted code step into a string header on this
+  // runtime?", and two engines answering it separately is how one of them ends up reading garbage as
+  // a length. Reading one byte out of a string is three machine instructions - load the data pointer,
+  // check the bound, movzx - and paying a whole call for them was measured at 25% of this loop.
+  // The inline covers the ONE shape that is dialect-blind: length exactly 1 with 1 <= start <= Len(s).
+  // Everything else - any other length, a start outside the string, an empty (nil) buffer - falls
+  // through to the call below, which keeps all the rules and stays the single place they are written.
+  //
+  // rax/rcx/rdx are safe scratch: the allocation pool is r9..r15, so it never hands them out, and the
+  // fast path runs BEFORE SpillVol while every pooled value is still where ILoad expects it. Both arms
+  // converge on "result in rax" with the pool untouched, so the join needs no fixing up.
   procedure EmitStrAscMidJ(dReg, sSlot, stReg, lnReg: Integer);
+  var pLen, pNil, pLo, pHi, pDone: Integer;
   begin
+    pDone := -1;
+    if AotAscMidInline then
+    begin
+      StrBaseRax;                                                // rax = string bank base
+      MovLoadR(RAX, RAX, LongWord(sSlot) * 8);                   // rax = StringRegs[src] (data pointer)
+      ILoad(RCX, stReg);                                         // rcx = start  (pre-spill: pool intact)
+      ILoad(RDX, lnReg);                                         // rdx = length
+      E.EmitBytes([$48, $83, $FA, $01]);                         // cmp rdx, 1
+      E.EmitBytes([$75, $00]); pLen := E.Len - 1;                // jne slow  (only length 1 is blind)
+      E.EmitBytes([$48, $85, $C0]);                              // test rax, rax
+      E.EmitBytes([$74, $00]); pNil := E.Len - 1;                // jz  slow  (empty string -> 0)
+      E.EmitBytes([$48, $83, $F9, $01]);                         // cmp rcx, 1
+      E.EmitBytes([$7C, $00]); pLo := E.Len - 1;                 // jl  slow  (start < 1: dialects differ)
+      E.EmitBytes([$48, $3B, $48, $F8]);                         // cmp rcx, [rax-8]  (the length field)
+      E.EmitBytes([$7F, $00]); pHi := E.Len - 1;                 // jg  slow  (start > Len -> 0)
+      E.EmitBytes([$0F, $B6, $44, $08, $FF]);                    // movzx eax, byte [rax+rcx-1]
+      // rel32, not a short jump: what it skips is the spill, the call and the reload, which is well
+      // past 127 bytes once the pool is full.
+      E.Emit8($E9); pDone := E.Len; E.Emit32(0);                 // jmp done
+      E.PatchByte(pLen, Byte(E.Len - (pLen + 1)));
+      E.PatchByte(pNil, Byte(E.Len - (pNil + 1)));
+      E.PatchByte(pLo,  Byte(E.Len - (pLo + 1)));
+      E.PatchByte(pHi,  Byte(E.Len - (pHi + 1)));
+    end;
     SpillVol; LeafSaveBases;
     ILoadTo(ABI_ARG1, stReg);
     ILoadTo(ABI_ARG3, lnReg);                                    // r9 on Win64: last of the pooled reads
@@ -1579,6 +1617,7 @@ var
     MovLoadR(ABI_ARG0, RAX, LongWord(sSlot) * 8);
     LeafCall(Prim(AOTCTX_STRASCMID));
     LeafRestore;
+    if pDone >= 0 then E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));   // @done
     IStore(dReg, RAX);
   end;
   // ⛔ The two fused ACCUMULATOR forms - bcStrConcatCharAt and bcStrAppendMapped - are NOT lowered

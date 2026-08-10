@@ -361,6 +361,12 @@ function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
 // record field access costs about twenty memory operations. job/tests/bench/intrec_fb.bas takes
 // FOUR of them per iteration (three field reads and one write) in a loop body of ~25 instructions -
 // which is why --aot is only 1.8x the interpreter on that program against 27x on n-body.
+// Is the inline fast path for ASC(MID$(s,i,1)) allowed? Needs the runtime-confirmed string header
+// layout AND the gate at its default. Exported because the loop JIT emits the same fast path and must
+// answer the same question the same way - two copies of this test is how one engine starts stepping
+// into a string header the other has decided it may not touch.
+function AotAscMidInline: Boolean;
+
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 
 implementation
