@@ -2323,6 +2323,7 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
     bcXferStoreInt, bcXferLoadInt,
     bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop, bcCallSub, bcReturnSub:
       Result := True;
@@ -2356,6 +2357,7 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
     bcXferLoadInt,
     // Opcodes whose OTHER operands live in the float or string bank but whose Dest is an integer.
     // A comparison is the shape that matters here: it reads two floats and writes a truth value
@@ -2455,6 +2457,7 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
     bcXferStoreInt, bcXferLoadInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop,
     bcCallSub, bcReturnSub,
     bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpGtFloat, bcCmpLeFloat, bcCmpGeFloat,
@@ -2489,6 +2492,7 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr,
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
     bcXferStoreInt, bcXferLoadInt, bcJump, bcJumpIfZero, bcJumpIfNotZero, bcNop,
     bcCallSub, bcReturnSub,
     // The float family, which is the point of this function: none of it touches a string.
@@ -2553,7 +2557,9 @@ begin
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString, bcRecordTypeId,
     bcRecordStoreFloat, bcRecordStoreString, bcRecordFree, bcRecordNewBlock,
     // ...and PRINT of an integer value, or a TAB/SPC count, reads it from Src1.
-    bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt, bcPrintTab, bcPrintSpc:
+    bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt, bcPrintTab, bcPrintSpc,
+    // The counting bit intrinsics take one operand; the WIDTH is an immediate, not a register.
+    bcBitClz, bcBitCtz, bcBitPopcnt:
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
@@ -2567,6 +2573,7 @@ begin
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
+    bcBitRotl, bcBitRotr,   // Src1 = value, Src2 = rotate count (the width is an immediate)
     bcRecordStoreInt:   // Src1 = handle, Src2 = the integer value being stored
       Result := US_SRC1 or US_SRC2;
   else
@@ -5518,6 +5525,9 @@ begin
         bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
         bcDivUInt, bcModUInt, bcCmpLtUInt, bcCmpGtUInt, bcCmpLeUInt, bcCmpGeUInt,
         bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
+        // Bit intrinsics: all three operands are integer registers (Src2 unused = 0 for the counts,
+        // which register 0 already covers).
+        bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
         bcRandomize:  // RANDOMIZE: Src1 = seed reg (Dest unused = 0)
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
@@ -6918,6 +6928,14 @@ begin
                else
                  Ctx.IntRegs[Instr.Dest] := LogicalShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
     bcShrUInt: Ctx.IntRegs[Instr.Dest] := LogicalShr64(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);
+    // MODERN bit intrinsics. Immediate carries the WIDTH (32 or 64); the helpers are shared with the
+    // WASM backend's reference semantics, so the two sides cannot drift on clz(0) or on the rotate's
+    // modulo - the two places where an "obvious" implementation would differ.
+    bcBitClz:    Ctx.IntRegs[Instr.Dest] := BitClz(Ctx.IntRegs[Instr.Src1], Instr.Immediate);
+    bcBitCtz:    Ctx.IntRegs[Instr.Dest] := BitCtz(Ctx.IntRegs[Instr.Src1], Instr.Immediate);
+    bcBitPopcnt: Ctx.IntRegs[Instr.Dest] := BitPopcnt(Ctx.IntRegs[Instr.Src1], Instr.Immediate);
+    bcBitRotl:   Ctx.IntRegs[Instr.Dest] := BitRotl(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
+    bcBitRotr:   Ctx.IntRegs[Instr.Dest] := BitRotr(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
     bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
       if Instr.Immediate <> 0 then RandSeed := Cardinal(Ctx.IntRegs[Instr.Src1]) else Randomize;
     // Control flow

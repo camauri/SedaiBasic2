@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 530 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1: bcGfxDrawString
+  OPCODE_LIST_COUNT = 535 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1: bcGfxDrawString; +5: the bit intrinsics
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -66,6 +66,7 @@ const
     bcRecordStoreString, bcRecordNewArray, bcRecordTypeId, bcRecordFree, bcRecMarkPush, bcRecMarkPop,
     bcLoadProcAddr, bcThreadCreate, bcThreadWait, bcThreadSelf, bcThreadDetach, bcFloatRound,
     bcNarrowInt, bcNarrowSingle, bcShl, bcShr, bcShrUInt, bcPrintUsingInt,
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
     bcVarArgCtl, bcVarArgPushInt, bcVarArgPushFloat, bcVarArgPushStr,
     bcVarArgBase, bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr,
     bcRandomize, bcMutexCreate, bcMutexLock, bcMutexUnlock, bcMutexDestroy, bcCondCreate,
@@ -144,29 +145,32 @@ const
   // that grows a group (or enabling WEB_MODE) fails the self-check LOUDLY instead of miscompiling.
   // Values below are for the default (no-WEB_MODE) build: web opcodes are gated out, so group 8 takes
   // no dense range and graphics/sound/super sit where they do here.
-  DENSE_CORE_BASE     = 0;    // group 0  (163 opcodes) -> dense 0..162
-  DENSE_STRING_BASE   = 163;  // group 1  (50)          -> 163..212 (bcStrAscMid = sub 51)
-  DENSE_MATH_BASE     = 215;  // group 2  (36)          -> 213..248
-  DENSE_ARRAY_BASE    = 251;  // group 3  (52)          -> 249..300 (bcRawLoad/StoreZStr = subs 50/51)
-  DENSE_IO_BASE       = 303;  // group 4  (23)          -> 301..323
-  DENSE_SPECIAL_BASE  = 326;  // group 5  (17)          -> 324..340
-  DENSE_FILEIO_BASE   = 343;  // group 6  (37)          -> 341..377 (bcDirAttr = sub 36)
-  DENSE_SPRITE_BASE   = 380;  // group 7  (17)          -> 378..394
+  // ⚠️ The five bit intrinsics (core subs 163..167) made group 0 five wider, which shifts EVERY base
+  // below and DENSE_TOTAL by 5, in both branches. Nothing checks these at compile time -
+  // `sb --verify-opcodes` is what says so.
+  DENSE_CORE_BASE     = 0;    // group 0  (168 opcodes) -> dense 0..167
+  DENSE_STRING_BASE   = 168;  // group 1  (50)          -> 168..217 (bcStrAscMid = sub 51)
+  DENSE_MATH_BASE     = 220;  // group 2  (36)          -> 218..253
+  DENSE_ARRAY_BASE    = 256;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_BASE       = 308;  // group 4  (23)          -> 306..328
+  DENSE_SPECIAL_BASE  = 331;  // group 5  (17)          -> 329..345
+  DENSE_FILEIO_BASE   = 348;  // group 6  (37)          -> 346..382 (bcDirAttr = sub 36)
+  DENSE_SPRITE_BASE   = 385;  // group 7  (17)          -> 383..399
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 397;  // 395..407 (12 used, slot 0 a hole)
+  DENSE_WEB_BASE      = 402;  // 400..412 (12 used, slot 0 a hole)
   // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
   // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
   // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
-  DENSE_GRAPHICS_BASE = 410;  // group 10 (66)          -> 408..473
-  DENSE_SOUND_BASE    = 476;  // group 11 (6)           -> 474..479
-  DENSE_SUPER_BASE    = 482;  // group 200 (256 slots)  -> 480..735
-  DENSE_TOTAL         = 738;  // N (with web)
+  DENSE_GRAPHICS_BASE = 415;  // group 10 (66)          -> 413..478
+  DENSE_SOUND_BASE    = 481;  // group 11 (6)           -> 479..484
+  DENSE_SUPER_BASE    = 487;  // group 200 (256 slots)  -> 485..740
+  DENSE_TOTAL         = 743;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 397;  // group 10 (66)          -> 395..460
-  DENSE_SOUND_BASE    = 463;  // group 11 (6)           -> 461..466
-  DENSE_SUPER_BASE    = 469;  // group 200 (256 slots)  -> 467..722 (58 used, 198 holes)
-  DENSE_TOTAL         = 725;  // N
+  DENSE_GRAPHICS_BASE = 402;  // group 10 (66)          -> 400..465
+  DENSE_SOUND_BASE    = 468;  // group 11 (6)           -> 466..471
+  DENSE_SUPER_BASE    = 474;  // group 200 (256 slots)  -> 472..727 (58 used, 198 holes)
+  DENSE_TOTAL         = 730;  // N
   {$ENDIF}
 
 var

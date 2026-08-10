@@ -6920,6 +6920,65 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { ⭐ THE MODERN BIT INTRINSICS, AND THE REASON THEY EXIST. These five opcodes are the only way
+      the ten WebAssembly instructions i32/i64.{clz,ctz,popcnt,rotl,rotr} become reachable: the
+      emitter has always known how to encode them, and no BASIC construct named them.
+      One case per operation, the width read from the constant Src3 - so no build can cover the
+      64-bit form and quietly leave the 32-bit one out.
+
+      ⚠️ Our registers are i64, so a 32-bit form wraps its operands and extends the result back.
+      The extension is SIGNED for the rotates, because a 32-bit value here is what a "Dim As Long"
+      holds; the counting forms return 0..32 and cannot tell the two apart.
+      ⚠️ A rotate count wrapped to i32 keeps its low 5 bits, which is all that "mod 32" reads, so
+      wrapping the count is not an approximation of the interpreter - it is the same number.
+      ⭐ And unlike the SHIFTS just above, nothing has to be corrected here: the interpreter's
+      BitRotl/BitRotr were written to WebAssembly's rule (count modulo the width), so these lower to
+      one instruction instead of a guard. That was the point of choosing that rule. }
+    ssaBitClz, ssaBitCtz, ssaBitPopcnt, ssaBitRotl, ssaBitRotr:
+      begin
+        if Instr.Src3.Kind <> svkConstInt then
+          Exit(Fail('a bit intrinsic without a constant width'));
+        if (Instr.Src3.ConstInt <> 32) and (Instr.Src3.ConstInt <> 64) then
+          Exit(Fail('a bit intrinsic with a width that is neither 32 nor 64'));
+        // ⛔ LoadReg assumes a REGISTER and reads an unrelated local when handed a constant, in
+        // silence. The SSA always materializes both operands into registers here, so this guard
+        // costs nothing today - it is here so that a pass which one day folds a constant into Src1
+        // or Src2 stops the compilation instead of emitting a module that runs and is wrong.
+        if (Instr.Src1.Kind <> svkRegister) or
+           (OpIn(Instr.OpCode, [ssaBitRotl, ssaBitRotr]) and (Instr.Src2.Kind <> svkRegister)) then
+          Exit(Fail('a bit intrinsic with a non-register operand'));
+        LoadReg(B, Instr.Src1);
+        if Instr.Src3.ConstInt = 32 then
+        begin
+          B.Op(wopI32WrapI64);
+          if OpIn(Instr.OpCode, [ssaBitRotl, ssaBitRotr]) then
+          begin
+            LoadReg(B, Instr.Src2);
+            B.Op(wopI32WrapI64);
+          end;
+          case Instr.OpCode of
+            ssaBitClz:    B.Op(wopI32Clz);
+            ssaBitCtz:    B.Op(wopI32Ctz);
+            ssaBitPopcnt: B.Op(wopI32Popcnt);
+            ssaBitRotl:   B.Op(wopI32Rotl);
+            ssaBitRotr:   B.Op(wopI32Rotr);
+          end;
+          B.Op(wopI64ExtendI32S);
+        end
+        else
+        begin
+          if OpIn(Instr.OpCode, [ssaBitRotl, ssaBitRotr]) then LoadReg(B, Instr.Src2);
+          case Instr.OpCode of
+            ssaBitClz:    B.Op(wopI64Clz);
+            ssaBitCtz:    B.Op(wopI64Ctz);
+            ssaBitPopcnt: B.Op(wopI64Popcnt);
+            ssaBitRotl:   B.Op(wopI64Rotl);
+            ssaBitRotr:   B.Op(wopI64Rotr);
+          end;
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaCmpEqInt: Cmp(wopI64Eq);
     ssaCmpNeInt: Cmp(wopI64Ne);
     ssaCmpLtInt: Cmp(wopI64LtS);

@@ -354,6 +354,22 @@ const
   kBITSET  = 'BITSET';    // FreeBASIC: x with bit b set (x OR (1 SHL b))
   kBITRESET= 'BITRESET';  // FreeBASIC: x with bit b cleared (x AND NOT (1 SHL b))
   kCBOOL   = 'CBOOL';     // FreeBASIC: convert to boolean (-1 if nonzero, else 0)
+  // MODERN bit intrinsics. ⛔ These are a DECLARED EXTENSION: FreeBASIC has none of them, so there is
+  // no oracle to copy and the semantics below are ours (see the comment on EmitBitIntrinsic). They
+  // exist so that a MODERN program can NAME the ten WebAssembly instructions
+  // i32/i64.{clz,ctz,popcnt,rotl,rotr}, which no BASIC construct could otherwise reach. Every one of
+  // them also works natively, or it would leave the regression net. Intercepted as array-access, so
+  // a user array or variable of the same name still wins.
+  kCOUNTLEADINGZEROS    = 'COUNTLEADINGZEROS';    // leading zero bits of a 64-bit value; 64 when 0
+  kCOUNTTRAILINGZEROS   = 'COUNTTRAILINGZEROS';   // trailing zero bits of a 64-bit value; 64 when 0
+  kCOUNTONEBITS         = 'COUNTONEBITS';         // population count of a 64-bit value (0..64)
+  kROTATELEFT           = 'ROTATELEFT';           // rotate a 64-bit value left by n mod 64
+  kROTATERIGHT          = 'ROTATERIGHT';          // rotate a 64-bit value right by n mod 64
+  kCOUNTLEADINGZEROS32  = 'COUNTLEADINGZEROS32';  // same on the low 32 bits; 32 when they are 0
+  kCOUNTTRAILINGZEROS32 = 'COUNTTRAILINGZEROS32'; // same on the low 32 bits; 32 when they are 0
+  kCOUNTONEBITS32       = 'COUNTONEBITS32';       // population count of the low 32 bits (0..32)
+  kROTATELEFT32         = 'ROTATELEFT32';         // rotate the low 32 bits left by n mod 32
+  kROTATERIGHT32        = 'ROTATERIGHT32';        // rotate the low 32 bits right by n mod 32
   kARRAYLEN = 'ARRAYLEN'; // FreeBASIC: total number of elements in an array (intercepted as array-access)
   kARRAYSIZE = 'ARRAYSIZE'; // FreeBASIC: total size in bytes of an array (element count * element size)
   kFILEEXISTS = 'FILEEXISTS'; // FreeBASIC: -1 if a file exists, else 0 (intercepted as array-access)
@@ -659,7 +675,27 @@ const
 var
   kLogicalOperatorsArray: array[1..4] of String = (kAND, kOR, kNOT, kXOR);
 
+// True for the ten MODERN bit-intrinsic names. NAME must already be uppercase. Kept here, next to
+// the constants, so the SSA interception and any future consumer ask the same list one question
+// instead of each spelling out ten comparisons.
+function IsBitIntrinsicName(const Name: string): Boolean;
+// The 32-bit width of a name is its "32" suffix, and BitIntrinsicWidth is the only place that reads it.
+function BitIntrinsicWidth(const Name: string): Integer;
+
 implementation
+
+function IsBitIntrinsicName(const Name: string): Boolean;
+begin
+  Result := (Name = kCOUNTLEADINGZEROS)  or (Name = kCOUNTTRAILINGZEROS)  or (Name = kCOUNTONEBITS)  or
+            (Name = kROTATELEFT)         or (Name = kROTATERIGHT)         or
+            (Name = kCOUNTLEADINGZEROS32) or (Name = kCOUNTTRAILINGZEROS32) or (Name = kCOUNTONEBITS32) or
+            (Name = kROTATELEFT32)        or (Name = kROTATERIGHT32);
+end;
+
+function BitIntrinsicWidth(const Name: string): Integer;
+begin
+  if (Length(Name) > 2) and (Copy(Name, Length(Name) - 1, 2) = '32') then Result := 32 else Result := 64;
+end;
 
 end.
 

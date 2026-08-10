@@ -205,6 +205,9 @@ begin
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // Bitwise operations (result is int)
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
+    // MODERN bit intrinsics (result is int). Their Immediate is the WIDTH, a plain constant, so they
+    // deliberately stay out of the ImmediateIsXxxReg lists.
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
     // Conversions to int
     bcFloatToInt, bcStringToInt, bcFloatRound,
     bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
@@ -426,6 +429,7 @@ begin
     bcRaiseError,
     // Bitwise operations
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
+    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,   // Src1 = the value operated on
     // === GROUP 3: Pointer deref (FreeBASIC): Src1 = address register (always int) ===
     bcRefLoadInt, bcRefLoadFloat, bcRefLoadString,
     bcRefStoreInt, bcRefStoreFloat, bcRefStoreString,
@@ -608,6 +612,7 @@ begin
     bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
     // Bitwise operations (second operand); shifts: Src2 = shift count
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr, bcShrUInt,
+    bcBitRotl, bcBitRotr,   // rotates: Src2 = the rotate count (the counting forms have no Src2)
     // HEX$/OCT/BIN(n, digits): Src2 = the digits width (int; 0 = natural length)
     bcStrHex, bcStrOct, bcStrBin,
     // === GROUP 5: Memory operations ===

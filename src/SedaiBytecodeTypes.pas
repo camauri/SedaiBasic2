@@ -306,6 +306,14 @@ const
   bcShl              = bcGroupCore + 131;  // SHL: shift left
   bcShr              = bcGroupCore + 132;  // SHR: arithmetic (sign-propagating) shift right
   bcShrUInt          = bcGroupCore + 153;  // SHR on an unsigned operand: logical (zero-filling) shift right
+  // MODERN bit intrinsics: Dest = the operation applied to Src1, at the width in Immediate (32 or 64).
+  // The rotates read their count from Src2. One opcode per operation, not per width, so no build can
+  // implement one width and forget the other. Semantics live in BitClz/... (SedaiSSATypes).
+  bcBitClz           = bcGroupCore + 163;  // COUNTLEADINGZEROS[32]
+  bcBitCtz           = bcGroupCore + 164;  // COUNTTRAILINGZEROS[32]
+  bcBitPopcnt        = bcGroupCore + 165;  // COUNTONEBITS[32]
+  bcBitRotl          = bcGroupCore + 166;  // ROTATELEFT[32]  (Src2 = count)
+  bcBitRotr          = bcGroupCore + 167;  // ROTATERIGHT[32] (Src2 = count)
   bcPrintUsingInt    = bcGroupCore + 154;  // PRINT USING with an EXACT integer value (Src1=format string, Src2=int value)
   // FreeBASIC variadic arguments (CVA_*). A variadic call stages its SURPLUS arguments into a stack of
   // tagged slots, one FRAME per call, and the callee walks that frame with an ordinary integer cursor -
@@ -1934,6 +1942,11 @@ begin
         160: Result := 'VarArgGetInt';
         161: Result := 'VarArgGetFloat';
         162: Result := 'VarArgGetStr';
+        163: Result := 'BitClz';
+        164: Result := 'BitCtz';
+        165: Result := 'BitPopcnt';
+        166: Result := 'BitRotl';
+        167: Result := 'BitRotr';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

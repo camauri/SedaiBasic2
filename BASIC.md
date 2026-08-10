@@ -2272,6 +2272,45 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `BITRESET` | ✓ | `x` with bit `b` cleared: `x AND NOT (1 SHL b)`. |
 | `BITSET` | ✓ | `x` with bit `b` set: `x OR (1 SHL b)`. |
 
+#### Bit Counting and Rotation (SedaiBasic extension)
+
+**No FreeBASIC equivalent** — FreeBASIC has no operator or function for any of these. They are
+**MODERN only**, and each maps to exactly one machine-level bit operation, which is why the names
+say what they do rather than abbreviating it. The `32` forms read the **low 32 bits**; the plain
+forms read all 64.
+
+| Keyword | Status | Description |
+|---|---|---|
+| `COUNTLEADINGZEROS` / `COUNTLEADINGZEROS32` | ✓ | Number of zero bits above the highest set bit. **Zero gives the full width** (64, or 32), not an undefined result. |
+| `COUNTTRAILINGZEROS` / `COUNTTRAILINGZEROS32` | ✓ | Number of zero bits below the lowest set bit; zero gives the full width. |
+| `COUNTONEBITS` / `COUNTONEBITS32` | ✓ | Population count: how many bits are set (0..64, or 0..32). |
+| `ROTATELEFT(x, n)` / `ROTATELEFT32(x, n)` | ✓ | Rotate left: bits leaving the top re-enter at the bottom. |
+| `ROTATERIGHT(x, n)` / `ROTATERIGHT32(x, n)` | ✓ | Rotate right. |
+
+Two rules are worth stating because they are decisions, not conveniences:
+
+- **A rotate count is taken modulo the width, as an unsigned amount.** `ROTATELEFT(x, 64)` is `x`,
+  `ROTATELEFT(x, 65)` rotates by 1, and `ROTATELEFT(x, -1)` rotates by 63 — the same as
+  `ROTATERIGHT(x, 1)`. ⚠️ This is deliberately **not** the rule `SHL`/`SHR` follow: a shift past the
+  width *saturates*, because a shift past the width has no natural answer while a rotation does.
+- **A 32-bit rotate sign-extends its result**, so that it is the value a `Long` holds:
+  `ROTATELEFT32(1, 31)` is `-2147483648`. The counting forms return small non-negative numbers and
+  are unaffected.
+
+```basic
+Dim As LongInt x = &H0000FF00
+Print COUNTLEADINGZEROS(x)      ' 48
+Print COUNTLEADINGZEROS32(x)    ' 16 — the same value read as 32 bits
+Print COUNTONEBITS(x)           ' 8
+Print ROTATELEFT(x, 8)          ' 16711680
+
+' What a leading-zero count is usually for: the number of bits a value needs.
+Function BitWidth(ByVal n As LongInt) As LongInt
+  If n = 0 Then Return 0
+  Return 64 - COUNTLEADINGZEROS(n)
+End Function
+```
+
 ### Console Functions
 
 #### Configuring the Console

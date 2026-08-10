@@ -688,7 +688,10 @@ begin
       Result := True;
 
     // Bitwise - safe
-    ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot:
+    ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
+    // MODERN bit intrinsics - pure functions of their operands, and total: every input has a
+    // defined result (that is what BitClz's zero case is for), so nothing here can trap.
+    ssaBitClz, ssaBitCtz, ssaBitPopcnt, ssaBitRotl, ssaBitRotr:
       Result := True;
 
     // Math functions - safe

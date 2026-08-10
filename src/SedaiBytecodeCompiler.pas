@@ -326,6 +326,11 @@ begin
     ssaShl: Result := bcShl;                     // FreeBASIC bit shifts
     ssaShr: Result := bcShr;
     ssaShrUInt: Result := bcShrUInt;
+    ssaBitClz: Result := bcBitClz;               // MODERN bit intrinsics (width in the immediate)
+    ssaBitCtz: Result := bcBitCtz;
+    ssaBitPopcnt: Result := bcBitPopcnt;
+    ssaBitRotl: Result := bcBitRotl;
+    ssaBitRotr: Result := bcBitRotr;
     ssaMutexCreate: Result := bcMutexCreate;    // M5.4: mutex primitives
     ssaMutexLock: Result := bcMutexLock;
     ssaMutexUnlock: Result := bcMutexUnlock;

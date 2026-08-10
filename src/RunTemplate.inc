@@ -647,7 +647,7 @@ begin
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
-      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 162:
+      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 167:
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
@@ -1366,6 +1366,9 @@ begin
         // stay out of it and go through the slow path like the file and system operations above.
         bcVarArgCtl, bcVarArgPushInt, bcVarArgPushFloat, bcVarArgPushStr, bcVarArgBase,
         bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr,
+        // MODERN bit intrinsics: same reasoning as the variadics - a handful of programs use them,
+        // every program pays for the run loop, so they take the slow path and keep ONE arm.
+        bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
         bcRaiseError:
           begin
             Ctx.PC := CurPC;

@@ -171,6 +171,14 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'BitwiseXor', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcBitwiseNot:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'BitwiseNot', Instr.Dest, Instr.Src1]);
+    // MODERN bit intrinsics: the width rides the Immediate, so print it - reading "BitClz R2, R1"
+    // without it would hide exactly the operand that distinguishes the 32- from the 64-bit form.
+    bcBitClz, bcBitCtz, bcBitPopcnt:
+      Line := Format('%4d: %-20s R%d, R%d, w%d',
+                     [Index, BytecodeOpToString(TBytecodeOp(Instr.OpCode)), Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcBitRotl, bcBitRotr:
+      Line := Format('%4d: %-20s R%d, R%d, R%d, w%d',
+                     [Index, BytecodeOpToString(TBytecodeOp(Instr.OpCode)), Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
     bcJump:
       Line := Format('%4d: %-20s %d', [Index, 'Jump', Instr.Immediate]);
     bcJumpIfZero:

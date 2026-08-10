@@ -706,6 +706,9 @@ type
     // FreeBASIC bit/byte macros (LOBYTE/HIBYTE/LOWORD/HIWORD/BIT/BITSET/BITRESET) and CBOOL,
     // lowered to existing integer bitwise/shift/compare SSA ops (no new opcodes).
     procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
+    // MODERN bit intrinsics (COUNTLEADINGZEROS/.../ROTATERIGHT32): a DECLARED EXTENSION, not
+    // FreeBASIC. One SSA opcode per operation, the width in the immediate.
+    procedure EmitBitIntrinsic(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);  // ARRAYSIZE = ARRAYLEN * element bytes
@@ -5616,6 +5619,16 @@ begin
           Exit;
         end;
 
+        // MODERN bit intrinsics. Same interception shape as the macros above (array-access form, and
+        // only when no array of that name is declared), but they lower to opcodes of their own
+        // because no composition of shifts computes a leading-zero count in constant time -- and
+        // because the point of having them is that the WASM backend can emit the single instruction.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and IsBitIntrinsicName(UpperCase(ArrName)) then
+        begin
+          EmitBitIntrinsic(UpperCase(ArrName), Node.GetChild(1), Result);
+          Exit;
+        end;
+
         // FreeBASIC ARRAYLEN(arr): total element count. Not a registered keyword; intercept in MODERN
         // when ARRAYLEN itself is not a declared array. (Its argument names the array to measure.)
         if FModernMode and (UpperCase(ArrName) = kARRAYLEN) and (ArrayIndexOf(ArrName) < 0) then
@@ -9614,6 +9627,66 @@ begin
       EmitInstruction(ssaBitwiseAnd, Result, A0, NotShl, MakeSSAValue(svkNone));  // x AND NOT (1 SHL b)
     end;
   end;
+end;
+
+procedure TSSAGenerator.EmitBitIntrinsic(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
+// MODERN bit intrinsics — a DECLARED EXTENSION of the dialect, with no FreeBASIC original to copy.
+// They exist so a MODERN program can NAME the ten WebAssembly instructions i32/i64.{clz,ctz,popcnt,
+// rotl,rotr}: no BASIC construct reaches them, and without a name for them the backend could never
+// emit them, whatever it knew how to encode.
+//
+// ⭐ ONE opcode per operation, the WIDTH in the immediate. The alternative — ten opcodes — was
+// rejected because it lets a build implement i64 and forget i32, silently: here the two widths are
+// the same case in every consumer and cannot drift apart.
+//
+// The semantics are WebAssembly's, and two of them are NOT what a careless implementation gives:
+//   • clz(0) = ctz(0) = the WIDTH (64 or 32). FPC's BsrQWord/BsfQWord are UNDEFINED there.
+//   • a rotate count is taken MODULO the width as an UNSIGNED amount, so ROTATELEFT(x, -1) rotates
+//     by 63. ⚠️ This is deliberately NOT the SATURATING rule our shifts follow: a rotation past the
+//     width has an obvious meaning (it comes back round) and a shift past it does not.
+// Both live in BitClz/BitCtz/BitRotl/... (SedaiSSATypes), which the interpreter calls and the WASM
+// backend reproduces, so there is a single statement of them.
+//
+// The 32-bit forms read the LOW 32 bits and sign-extend a rotate's result, which is the value a
+// "Dim As Long" holds — anything else and ROTATELEFT32 would disagree with an assignment of its
+// own result.
+var
+  V0, V1, A0, A1: TSSAValue;
+  Op: TSSAOpCode;
+  W: Integer;
+  NeedsCount: Boolean;
+begin
+  Result := MakeSSAValue(svkNone);
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+
+  W := BitIntrinsicWidth(FuncName);
+  NeedsCount := False;
+  if (FuncName = kCOUNTLEADINGZEROS) or (FuncName = kCOUNTLEADINGZEROS32) then Op := ssaBitClz
+  else if (FuncName = kCOUNTTRAILINGZEROS) or (FuncName = kCOUNTTRAILINGZEROS32) then Op := ssaBitCtz
+  else if (FuncName = kCOUNTONEBITS) or (FuncName = kCOUNTONEBITS32) then Op := ssaBitPopcnt
+  else if (FuncName = kROTATELEFT) or (FuncName = kROTATELEFT32) then begin Op := ssaBitRotl; NeedsCount := True; end
+  else if (FuncName = kROTATERIGHT) or (FuncName = kROTATERIGHT32) then begin Op := ssaBitRotr; NeedsCount := True; end
+  else Exit;   // not one of ours: the caller filtered on the same list, so this is unreachable
+
+  ProcessExpression(ArgsNode.GetChild(0), V0);
+  A0 := EnsureIntRegister(V0);
+
+  A1 := MakeSSAValue(svkNone);
+  if NeedsCount then
+  begin
+    // A rotate with no count is a call the program got wrong. Rotating by zero is the reading that
+    // loses nothing and needs no error path, and it keeps the operand shape uniform for the backends.
+    if ArgsNode.ChildCount < 2 then
+      A1 := EnsureIntRegister(MakeSSAConstInt(0))
+    else
+    begin
+      ProcessExpression(ArgsNode.GetChild(1), V1);
+      A1 := EnsureIntRegister(V1);
+    end;
+  end;
+
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(Op, Result, A0, A1, MakeSSAConstInt(W));
 end;
 
 procedure TSSAGenerator.EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);

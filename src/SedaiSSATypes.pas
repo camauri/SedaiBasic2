@@ -270,6 +270,15 @@ type
     ssaNarrowSingle, // B1.5: round Double -> single precision (Dest/Src1 float)
     ssaShl, ssaShr,  // FreeBASIC bit shifts (integer); ssaShr is ARITHMETIC (sign-propagating)
     ssaShrUInt,      // SHR on an unsigned operand (UInteger/ULongInt): zero-filling, like bcDivUInt
+    // MODERN bit intrinsics, one opcode per OPERATION with the WIDTH in the immediate (32 or 64):
+    // the two widths are the same computation on a different mask, and a single opcode keeps the
+    // interpreter, the AOT gate and the WASM backend from ever disagreeing about one of them.
+    //   Clz/Ctz/Popcnt: Dest=int, Src1=int, Src3=width.  Rotl/Rotr: + Src2=int rotate count.
+    // ⛔ THE WIDTH IS PART OF THE VALUE. They are therefore left OUT of the GVN/CSE purity lists on
+    // purpose: those number a value by (opcode, Src1, Src2) and would make COUNTONEBITS(x) and
+    // COUNTONEBITS32(x) the same expression. Whoever adds them there must key on Src3 first.
+    // (LICM is safe and does list them: hoisting MOVES an instruction whole, immediate included.)
+    ssaBitClz, ssaBitCtz, ssaBitPopcnt, ssaBitRotl, ssaBitRotr,
     ssaRandomize,    // RANDOMIZE: seed the RNG (Src1=seed reg, Immediate=1; or Immediate=0 = time-based)
     // Mutexes (M5.4, FB API): MutexCreate (Dest=int handle, no operands); Lock/Unlock/Destroy (Src1=handle reg).
     ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
@@ -722,6 +731,13 @@ function OpIn(const Op: TSSAOpCode; const Ops: array of TSSAOpCode): Boolean;
 // An UNSIGNED operand (UInteger/ULongInt) does shift logically, hence the second helper.
 function ArithShr64(V, Shift: Int64): Int64;
 function LogicalShr64(V, Shift: Int64): Int64;
+// MODERN bit intrinsics (COUNTLEADINGZEROS/.../ROTATERIGHT32). Width is 32 or 64; the zero case and
+// the rotate's modulo follow WebAssembly, which is the point of having them. See the implementation.
+function BitClz(V: Int64; Width: Int64): Int64;
+function BitCtz(V: Int64; Width: Int64): Int64;
+function BitPopcnt(V: Int64; Width: Int64): Int64;
+function BitRotl(V, Count: Int64; Width: Int64): Int64;
+function BitRotr(V, Count: Int64; Width: Int64): Int64;
 
 implementation
 
@@ -3148,6 +3164,107 @@ begin
   if Shift <= 0 then Exit(V);
   if Shift > 63 then Exit(0);
   Result := Int64(QWord(V) shr QWord(Shift));
+end;
+
+{ MODERN bit intrinsics — the ONE implementation of each, shared by the interpreter and read as the
+  specification by the WebAssembly backend. Written in plain Pascal on purpose:
+  ⛔ FPC's BsfQWord/BsrQWord are UNDEFINED at zero, and WASM defines clz(0)=ctz(0)=64 (or 32). That
+     boundary is the whole reason these are functions and not one-liners at the call sites.
+  ⛔ PopCnt needs a CPU feature to be fast and gives nothing here: these are not hot paths, and a
+     portable loop keeps win64 and linux bit-identical without a gate.
+  ⚠️ Width is 32 or 64. The 32-bit forms look at the LOW 32 bits and, for the rotates, SIGN-EXTEND
+     the result, because that is the value a "Dim As Long" holds — the same rule NarrowInt64 applies
+     to every other 32-bit destination. Any other choice would make ROTATELEFT32 disagree with an
+     assignment of its own result. }
+
+function BitClz(V: Int64; Width: Int64): Int64;
+var
+  U, Mask: QWord;
+begin
+  if Width = 32 then U := QWord(V) and $FFFFFFFF else U := QWord(V);
+  if U = 0 then Exit(Width);                       // WASM: clz(0) = the width, not undefined
+  Result := 0;
+  Mask := QWord(1) shl QWord(Width - 1);
+  while (U and Mask) = 0 do
+  begin
+    Inc(Result);
+    Mask := Mask shr 1;
+  end;
+end;
+
+function BitCtz(V: Int64; Width: Int64): Int64;
+var
+  U: QWord;
+begin
+  if Width = 32 then U := QWord(V) and $FFFFFFFF else U := QWord(V);
+  if U = 0 then Exit(Width);                       // WASM: ctz(0) = the width, not undefined
+  Result := 0;
+  while (U and 1) = 0 do
+  begin
+    Inc(Result);
+    U := U shr 1;
+  end;
+end;
+
+function BitPopcnt(V: Int64; Width: Int64): Int64;
+var
+  U: QWord;
+begin
+  if Width = 32 then U := QWord(V) and $FFFFFFFF else U := QWord(V);
+  Result := 0;
+  while U <> 0 do
+  begin
+    U := U and (U - 1);                            // clear the lowest set bit
+    Inc(Result);
+  end;
+end;
+
+function BitRotl(V, Count: Int64; Width: Int64): Int64;
+// WASM semantics: the count is taken MODULO the width, as an UNSIGNED amount, so a negative count
+// wraps instead of being clamped. ⚠️ This is deliberately NOT the saturating rule our shifts use:
+// a rotation past the width has an obvious meaning (it comes back round), while a shift past it
+// does not, which is why the interpreter defines that one and mirrors this one.
+var
+  U, R: QWord;
+  N: Integer;
+begin
+  N := Integer(QWord(Count) mod QWord(Width));
+  if Width = 32 then
+  begin
+    U := QWord(V) and $FFFFFFFF;
+    if N = 0 then R := U
+    else R := ((U shl QWord(N)) or (U shr QWord(32 - N))) and $FFFFFFFF;
+    Result := Int64(LongInt(Cardinal(R)));         // sign-extend: the value a Long holds
+  end
+  else
+  begin
+    U := QWord(V);
+    if N = 0 then R := U
+    else R := (U shl QWord(N)) or (U shr QWord(64 - N));
+    Result := Int64(R);
+  end;
+end;
+
+function BitRotr(V, Count: Int64; Width: Int64): Int64;
+var
+  U, R: QWord;
+  N: Integer;
+begin
+  N := Integer(QWord(Count) mod QWord(Width));
+  if Width = 32 then
+  begin
+    U := QWord(V) and $FFFFFFFF;
+    if N = 0 then R := U
+    else R := ((U shr QWord(N)) or (U shl QWord(32 - N))) and $FFFFFFFF;
+    Result := Int64(LongInt(Cardinal(R)));
+  end
+  else
+  begin
+    U := QWord(V);
+    if N = 0 then R := U
+    else R := (U shr QWord(N)) or (U shl QWord(64 - N));
+    Result := Int64(R);
+  end;
 end;
 
 { SSA string pool: open-addressing hash (FNV-1a, linear probing, grow at 60% load) over an
