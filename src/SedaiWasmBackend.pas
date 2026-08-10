@@ -345,6 +345,7 @@ type
     procedure EmitStringHelpers;
     procedure EmitValHelpers;
     function EmitRegion(R: Integer): Boolean;
+    function FloatRegUses(First, N, RegIdx: Integer): Integer;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
     procedure LoadReg(B: TWasmBuf; const V: TSSAValue);
     function LoadInt32(B: TWasmBuf; const V: TSSAValue): Boolean;
@@ -5236,6 +5237,66 @@ begin
   B.Op(wopI64Mul);
 end;
 
+{ ---- true f32 arithmetic (the largest missing family in the module's instruction coverage) ----
+
+  A SINGLE-typed operation reaches the backend as four instructions: narrow each operand, operate,
+  narrow the result. Emitted literally that is f64 arithmetic wrapped in demote/promote pairs -
+  correct, but it never emits one f32 instruction.
+
+  So the operation and the narrowing that follows it become ONE f32 instruction, between a demote of
+  each operand and a promote of the result. That equals the unfused form exactly when the operands
+  are already binary32 - demoting them is then the identity - and the SSA generator guarantees
+  precisely that: it converts both operands of a SINGLE-typed operation, and folds a constant one
+  through Single() while it is still a constant. This is not an assumption about values; it is the
+  contract the generator keeps.
+
+  ⛔ Guarded on the operation's result having exactly ONE use. Fusing consumes it - the f64 value is
+  never materialised - so a second reader would find a stale register. The generator makes it a fresh
+  single-use temporary, but an optimisation is free to change that, and counting is cheaper than
+  finding out from a wrong answer. }
+function TWasmBackend.FloatRegUses(First, N, RegIdx: Integer): Integer;
+var i, j, k, Acc: Integer; Blk: TSSABasicBlock; Ins: TSSAInstruction;
+  procedure Count(const V: TSSAValue);
+  begin
+    if (V.Kind = svkRegister) and (V.RegType = srtFloat) and (V.RegIndex = RegIdx) then Inc(Acc);
+  end;
+begin
+  Acc := 0;
+  for i := First to First + N - 1 do
+  begin
+    Blk := FProg.Blocks[i];
+    for j := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[j]);
+      Count(Ins.Src1); Count(Ins.Src2); Count(Ins.Src3);
+      for k := 0 to High(Ins.PhiSources) do Count(Ins.PhiSources[k].Value);
+    end;
+  end;
+  Result := Acc;
+end;
+
+// The f32 form of a float opcode, or 0 when there is none. Binary ones read two operands, the unary
+// ones (Un = True) read one.
+function F32FormOf(Op: TSSAOpCode; out Un: Boolean): Byte;
+begin
+  Un := False;
+  case Op of
+    ssaAddFloat: Result := wopF32Add;
+    ssaSubFloat: Result := wopF32Sub;
+    ssaMulFloat: Result := wopF32Mul;
+    ssaDivFloat: Result := wopF32Div;
+    ssaMathSqr:  begin Result := wopF32Sqrt; Un := True; end;
+    ssaNegFloat: begin Result := wopF32Neg;  Un := True; end;
+    ssaMathAbs:  begin Result := wopF32Abs;  Un := True; end;
+    // INT is floor and FIX is truncate-toward-zero, which is what these two f32 forms are. Rounding
+    // an exact binary32 leaves it exact, so the fused and unfused forms agree here for free.
+    ssaMathInt:  begin Result := wopF32Floor; Un := True; end;
+    ssaMathFix:  begin Result := wopF32Trunc; Un := True; end;
+  else
+    Result := 0;
+  end;
+end;
+
 function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
 
   procedure Bin(Opcode: Byte);
@@ -7286,6 +7347,9 @@ var
   RT: TSSARegisterType;
   Locals: TWasmValTypeArray;
   Terminated: Boolean;
+  SkipNext, F32Un: Boolean;
+  F32Op: Byte;
+  NextI: TSSAInstruction;
   CalleeRegion: Integer;
   FalseTarget: Integer;
   NextInstr: TSSAInstruction;
@@ -7508,9 +7572,39 @@ begin
       Blk := FProg.Blocks[First + i];
       B := D.Body(i);
       Terminated := False;
+      SkipNext := False;
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
+        if SkipNext then begin SkipNext := False; Continue; end;
         Instr := TSSAInstruction(Blk.Instructions[j]);
+        // f32: this operation and the narrowing that consumes it are ONE f32 instruction. See the
+        // block above FloatRegUses for why the operands may be demoted without proving anything.
+        F32Op := 0;
+        if j + 1 < Blk.Instructions.Count then
+        begin
+          NextI := TSSAInstruction(Blk.Instructions[j + 1]);
+          if (NextI.OpCode = ssaNarrowSingle) and
+             (Instr.Dest.Kind = svkRegister) and (Instr.Dest.RegType = srtFloat) and
+             (NextI.Src1.Kind = svkRegister) and (NextI.Src1.RegType = srtFloat) and
+             (NextI.Src1.RegIndex = Instr.Dest.RegIndex) then
+            F32Op := F32FormOf(Instr.OpCode, F32Un);
+          if (F32Op <> 0) and (FloatRegUses(First, N, Instr.Dest.RegIndex) <> 1) then F32Op := 0;
+        end;
+        if F32Op <> 0 then
+        begin
+          LoadReg(B, Instr.Src1);
+          B.Op(wopF32DemoteF64);
+          if not F32Un then
+          begin
+            LoadReg(B, Instr.Src2);
+            B.Op(wopF32DemoteF64);
+          end;
+          B.Op(F32Op);
+          B.Op(wopF64PromoteF32);
+          StoreReg(B, NextI.Dest);
+          SkipNext := True;                 // the narrowing was just emitted as part of this
+          Continue;
+        end;
         case Instr.OpCode of
           ssaJump:
             begin

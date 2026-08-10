@@ -2912,6 +2912,19 @@ begin
       // This is not an "optimization" but correct code generation - we shouldn't generate
       // instructions for operations that can be resolved at compile time
 
+      // ⛔ A SINGLE-typed operation folds in binary32, not in double. The folding below runs BEFORE
+      // the lowering that converts operands and result, so without this "3.0f * 16777217" folded wide
+      // and answered 50331651 where fbc says 50331648 - the same defect as the runtime one, in the one
+      // path that never reaches the runtime. Converting an integer constant to its binary32 value here
+      // also routes the pair into the FLOAT fold, which is what a float operation wants.
+      if (Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpDiv]) and IsSingleExpr(Node) then
+      begin
+        if Left.Kind = svkConstFloat then Left := MakeSSAConstFloat(Single(Left.ConstFloat))
+        else if Left.Kind = svkConstInt then Left := MakeSSAConstFloat(Single(Double(Left.ConstInt)));
+        if Right.Kind = svkConstFloat then Right := MakeSSAConstFloat(Single(Right.ConstFloat))
+        else if Right.Kind = svkConstInt then Right := MakeSSAConstFloat(Single(Double(Right.ConstInt)));
+      end;
+
       // Case 1: Both operands are constants - fold completely
       if (Left.Kind = svkConstFloat) and (Right.Kind = svkConstFloat) then
       begin
@@ -2928,6 +2941,10 @@ begin
           Result := MakeSSAValue(svkNone);
         end;
 
+        // ...and the folded RESULT is a binary32 value when the operation was one.
+        if (Result.Kind = svkConstFloat) and
+           (Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpDiv]) and IsSingleExpr(Node) then
+          Result := MakeSSAConstFloat(Single(Result.ConstFloat));
         if Result.Kind <> svkNone then
           Exit;  // Done - constant folded!
       end
