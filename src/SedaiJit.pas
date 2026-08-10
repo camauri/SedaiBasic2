@@ -873,7 +873,7 @@ var
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
         bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
         bcFloatRound: T(J^.Src1);                    // CINT: float input, int Dest (-> ScanI)
-        bcNegFloat, bcNarrowSingle, bcMathInt, bcMathAbs, bcMathSgn:
+        bcNegFloat, bcNarrowSingle, bcMathInt, bcMathAbs, bcMathSgn, bcMathFix:
           begin T(J^.Dest); T(J^.Src1); end;
       end;
     end;
@@ -1301,6 +1301,18 @@ var
         begin
           FLoad(XMM0, I^.Src1);
           E.EmitBytes([$66, $0F, $3A, $0B, $C0, $01]);   // roundsd xmm0, xmm0, 1
+          FStore(I^.Dest, XMM0);
+        end;
+      // FIX = truncate toward zero. One instruction and nothing else, because FixDouble now gives a
+      // zero result the sign of its operand (IEEE 754 §5.9) - which is what roundsd mode 3 does.
+      // ⛔ FRAC is NOT here: it reads System.Int, which returns a POSITIVE zero, so Frac(-0.0) is
+      // -0.0 and reproducing that needs a third live xmm - xmm2 upwards is the allocation pool.
+      bcMathFix:
+        if not AVXSupport then Exit
+        else
+        begin
+          FLoad(XMM0, I^.Src1);
+          E.EmitBytes([$66, $0F, $3A, $0B, $C0, $03]);   // roundsd xmm0, xmm0, 3 (toward zero)
           FStore(I^.Dest, XMM0);
         end;
       // ABS = clear the sign BIT. Measured against the interpreter, not assumed: its Abs gives

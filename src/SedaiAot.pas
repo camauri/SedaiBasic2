@@ -823,7 +823,7 @@ begin
     // on purpose: their negative-zero rule in the interpreter is self-inconsistent (Fix(-0.5) = -0
     // but Fix(-0.0) = +0, while Int(-0.0) = -0), and a lowering must not cement that before it is
     // decided. The transcendentals need the leaf-call table, which is a block of its own.
-    ssaMathAbs, ssaMathSgn,
+    ssaMathAbs, ssaMathSgn, ssaMathFix,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
@@ -1006,7 +1006,8 @@ begin
       Result := AotRecAllocNative and (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     ssaRecordFree:
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
-    ssaMathInt:
+    // roundsd is SSE4.1, so these three share MathInt's gate.
+    ssaMathInt, ssaMathFix:
       Result := AotMathIntNative;
     // The width is baked into the lowering (a 32-bit form is a different instruction, not a mask),
     // so a non-constant width falls back to the helper instead of guessing. The SSA always emits a
@@ -5570,6 +5571,24 @@ var
         E.EmitBytes([$66, $0F, $3A, $0B, $C0, $01]);   // roundsd xmm0, xmm0, 1  (round toward -inf)
         FStore(d, XMM0);
       end;
+
+      // FIX is truncation toward zero, and since FixDouble was made sign-consistent it is roundsd
+      // mode 3 with NOTHING else: that instruction already gives a zero result the sign of the
+      // operand, which is the IEEE rule the interpreter now follows.
+      ssaMathFix:
+      begin
+        d := FReg(Cur.Dest); s1v := FReg(Cur.Src1); if not OK then Exit;
+        FLoad(XMM0, s1v);
+        E.EmitBytes([$66, $0F, $3A, $0B, $C0, $03]);   // roundsd xmm0, xmm0, 3  (toward zero)
+        FStore(d, XMM0);
+      end;
+
+      // ⛔ FRAC is deliberately NOT here. It is x - System.Int(x), and FPC's Int() hands back a
+      // POSITIVE zero when the truncation is zero - so Frac(-0.0) is -0.0, while roundsd's -0.0
+      // subtracted from -0.0 gives +0.0. Reproducing that needs THREE live values (x, the
+      // truncation, and a zero or a mask) and only xmm0/xmm1 are scratch here: xmm2 upwards is the
+      // float allocation POOL. It stays on the helper until it is worth a spill slot.
+      // ⚠️ My FixDouble change does not touch Frac: Frac reads System.Int directly, not FixDouble.
 
       // ABS is the sign BIT cleared - MEASURED, not assumed: the interpreter's Abs gives +QNaN for
       // both NaN signs and +0 for -0, which is exactly what andpd does and is NOT what a

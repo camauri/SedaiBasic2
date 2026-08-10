@@ -3673,7 +3673,16 @@ end;
 function FixDouble(const X: Double): Double; inline;
 begin
   Result := System.Int(X);
-  if (Result = 0) and (X <> 0) and (PInt64(@X)^ < 0) then Result := -Result;
+  // ⚠️ NEGATIVE ZERO, and this is a DELIBERATE divergence from fbc (user decision, 10 Aug 2026).
+  // IEEE 754-2019 §5.9 roundToIntegralTowardZero gives the result the sign of the OPERAND, so
+  // Fix(-0.0) is -0.0. fbc answers +0 there while answering -0 for Fix(-0.5), and -0 for
+  // Int(-0.0) - i.e. it is inconsistent with itself, and we followed it. The guard used to carry
+  // an extra `(X <> 0)` that reproduced exactly that hole; removing it makes this the same rule
+  // FloorDouble already applies, and makes the whole family agree.
+  // ⭐ It also makes the native lowering ONE instruction: roundsd toward zero already preserves
+  // the sign of a zero, so the AOT and the JIT need no fix-up at all. Same class of decision as
+  // the correctly-rounded PRINT of a float: conform to the standard, declare the divergence.
+  if (Result = 0) and (PInt64(@X)^ < 0) then Result := -Result;
 end;
 
 function FloorDouble(const X: Double): Double; inline;
