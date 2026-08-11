@@ -23549,6 +23549,21 @@ begin
       if (FindUDT(NameU) >= 0) and TypeNameIsAScope(NameU) then
         raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a TYPE that has ' +
                                   'member procedures, and BASIC does not tell the two apart', [NameU]);
+      { ⛔⛔⛔ AND THE SAME NAME AS A PROCEDURE, which is the one that used to MISCOMPILE IN SILENCE.
+        "Dim As Double s" next to "Function S()" made Print S("x") answer 0: the call resolved to the
+        VARIABLE, so the lowering emitted a generic Print of a register nothing had written, and the
+        bank it read decided which flavour of nothing came out - 0 for a numeric variable, empty for a
+        string one. Interpreter, AOT and JIT all agreed, because the BYTECODE was already wrong, which
+        is exactly the shape no differential between engines can see.
+        ⛔ fbc refuses the program outright ("error 4: Duplicated definition"), so the fix is a
+        DIAGNOSTIC and not a cleverer resolution. Measured on six variants: it holds in either
+        declaration order, for FUNCTION and for SUB, at module level and inside another procedure, and
+        without regard to case - which is the whole reason it bites, since "s" and "S" are one name.
+        ⚠️ Either order is caught here because the offending declaration is a DIM either way, and this
+        pass runs after PreCollectProcedures has seen every procedure in the file. }
+      if FProcedureNames.IndexOf(NameU) >= 0 then
+        raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a SUB or ' +
+                                  'FUNCTION, and BASIC does not tell the two apart', [NameU]);
     end;
   for i := 0 to Node.ChildCount - 1 do
     CheckTypeNameShadowedByVar(Node.GetChild(i));
