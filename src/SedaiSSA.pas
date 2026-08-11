@@ -593,6 +593,8 @@ type
     function FixedLenVarSizeBytes(const Name: string): Int64;   // SizeOf of a "* n" string var, else -1         // Len(numeric var) = declared type size; -1 = keep the string path
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
     procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
+    // ...and its declared narrowing width, same key shape (a PARAMETER's, so a store to it wraps).
+    procedure SetVarWidthScoped(const ProcName, VarName, TypeName: string);
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
@@ -600,7 +602,7 @@ type
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
-    function ApplyUnsigned64Dest(const VarName: string; Value: TSSAValue): TSSAValue; // ...only the unsigned-64 conversion
+    function ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue; // ...on a FUNCTION result
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
@@ -6889,7 +6891,7 @@ begin
     else
       // The "fname = expr" spelling of a result reaches the same declared type as "Return expr".
       EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT,
-                    ApplyUnsigned64Dest(FCurrentProcName, ExprValue));
+                    ApplyResultNarrow(FCurrentProcName, ExprValue));
     Exit;
   end;
 
@@ -19019,6 +19021,25 @@ begin
     FVarPrintKind.AddObject(Key, TObject(PtrInt(PK)));
 end;
 
+procedure TSSAGenerator.SetVarWidthScoped(const ProcName, VarName, TypeName: string);
+// Record a name's declared narrowing WIDTH under "PROC|NAME", the same shape and precedence
+// SetPrintKindScoped uses for the print form, and for the same reason: FVarWidthCode answers by BARE
+// NAME, so a width recorded under a plain name answers for every same-named variable in the program.
+// Used for PARAMETERS, so that a store to a narrow parameter inside the body wraps to the declared
+// type - the prologue's entry narrowing only covers the value coming IN.
+var
+  W, Idx: Integer;
+  Key: string;
+begin
+  W := TypeNameWidthCode(TypeName);
+  Key := UpperCase(ProcName) + '|' + UpperCase(VarName);
+  Idx := FVarWidthCode.IndexOf(Key);
+  if Idx >= 0 then
+    FVarWidthCode.Objects[Idx] := TObject(PtrInt(W))
+  else
+    FVarWidthCode.AddObject(Key, TObject(PtrInt(W)));
+end;
+
 procedure TSSAGenerator.RecordSharedScalarType(const VarName, TypeName: string);
 // A SHARED scalar is backed by a 1-element global array, and its DIM branch exits before the typed-
 // scalar bookkeeping ever runs -- so it never recorded its declared type at all. "Dim Shared As
@@ -19397,30 +19418,41 @@ end;
 
 function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
 // On store to a narrow-typed scalar, narrow the value to the declared width. No-op for untracked vars.
+//
+// A procedure-scoped entry ("PROC|NAME") wins over the bare-name one, the same precedence PrintKindOf
+// has and for the same reason: FVarWidthCode is keyed by BARE NAME, so a width recorded for a name in
+// one procedure would otherwise answer for every same-named variable in the program. Only PARAMETERS
+// are recorded scoped today - which is additive, since nothing that resolves by bare name now
+// resolves differently - and it is what makes an assignment to a narrow parameter wrap: "Sub s(ByRef
+// b As UByte) : b = 300" leaves 44 in the caller's variable, as fbc does, where the parameter used to
+// be unknown to this registry and the store kept the full width.
 var
   Idx: Integer;
 begin
-  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  Idx := -1;
+  if FInProcedure and (FCurrentProcName <> '') then
+    Idx := FVarWidthCode.IndexOf(FCurrentProcName + '|' + UpperCase(VarName));
+  if Idx < 0 then Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
   if Idx < 0 then Exit(Value);
   Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value);
 end;
 
-function TSSAGenerator.ApplyUnsigned64Dest(const VarName: string; Value: TSSAValue): TSSAValue;
-// ApplyScalarNarrow restricted to width code 8: apply the UNSIGNED float->int conversion when the
-// name is declared UInteger/ULongInt, and do nothing at all otherwise.
+function TSSAGenerator.ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
+// A FUNCTION result is a store to a name of the declared type, so it narrows exactly as an assignment
+// to a variable of that type does. VarName is the function's own name: its declared return type lives
+// in the same width registry, recorded so that a CALL also prints like that type.
 //
-// It exists for the FUNCTION RESULT, where the name in the registry is the function's own (its
-// declared return type is recorded there so that a CALL prints like a variable of that type would).
-// ⚠️ Restricted on purpose: whether a "Function f() As Byte : Return 300" should also WRAP its result
-// to the declared width is a separate fidelity question with its own measurement, and answering it
-// here by calling ApplyScalarNarrow would change results this change never measured.
-var
-  Idx: Integer;
+// MEASURED against fbc, which narrows every one of them: "Function f() As Byte : Return 300" gives
+// 44, an UByte returning -5 gives 251, a Short returning 70000 gives 4464, a Long returning 5e9 gives
+// 705032704 - and the "fname = expr" spelling of a result gives the same answers as "Return expr".
+// We kept the full width in all of them; an UByte returning -5 printed 18446744073709551611, the
+// unsigned rendering of a value that should never have been wider than a byte.
+//
+// ⛔ This deliberately does NOT reach the FOR counter, where the same narrowing would be faithful and
+// USELESS: "For i As UByte = 253 To 255" wraps the counter past 255 and never terminates - measured,
+// fbc spins there while we finish in three iterations. Reproducing an infinite loop is not fidelity.
 begin
-  Result := Value;
-  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
-  if (Idx >= 0) and (PtrInt(FVarWidthCode.Objects[Idx]) = 8) then
-    Result := ApplyNarrowCode(8, Value);
+  Result := ApplyScalarNarrow(VarName, Value);
 end;
 
 // Convert an INT value to float, remembering whether the source was UNSIGNED. The distinction is
@@ -20958,7 +20990,11 @@ begin
       // that type would: unsigned-64 (recognised by IsUnsigned64Expr), narrow unsigned (no sign space),
       // or BOOLEAN. The last one is why "Print isOverlapping(a, b)" on a "... As Boolean" function used
       // to print -1/0 instead of true/false -- only unsigned returns were ever recorded.
-      if PrintKindOfType(TypeName) <> 0 then
+      // ⚠️ The WIDTH matters here too, and a SIGNED narrow return type has no print form at all, so the
+      // old test skipped exactly the cases that needed it: "Function f() As Byte : Return 300" never
+      // reached the registry, and its result kept 300 where fbc keeps 44 (measured). The result is a
+      // store to a name of the declared type like any other, and this is the entry that says so.
+      if (PrintKindOfType(TypeName) <> 0) or (TypeNameWidthCode(TypeName) <> 0) then
         RecordVarWidth(VarName, TypeName);
     end;
     // Record-typed (or explicit-typed) parameters: "param AS type" (M3.1). The parameter
@@ -21017,7 +21053,17 @@ begin
             // as much as an unsigned one: it is what stops the bare-name lookup from picking up an
             // unsigned parameter of the same name declared in some OTHER procedure.
             if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+            begin
               SetPrintKindScoped(UpperCase(VarToStr(Node.GetChild(0).Value)), VarName, TypeName);
+              // ...and its declared WIDTH, so that a STORE to a narrow parameter inside the body wraps
+              // to the declared type. The BYVAL entry narrowing (ssaNarrowInt at the prologue) only
+              // covers the value coming IN; "b = 300" on an UByte parameter kept 300, and through a
+              // BYREF parameter that full-width value went back out to the caller's variable.
+              // ⛔ Scoped and not bare: this registry answers by BARE NAME, so recording a parameter's
+              // width under its plain name would make every same-named variable in the program narrow.
+              if TypeNameWidthCode(TypeName) <> 0 then
+                SetVarWidthScoped(UpperCase(VarToStr(Node.GetChild(0).Value)), VarName, TypeName);
+            end;
           end;
         end;
       end;
@@ -27794,7 +27840,7 @@ begin
               // A FUNCTION declared As UInteger/ULongInt returning a float takes the UNSIGNED
               // conversion, like any other store to a name of that type.
               EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT,
-                            ApplyUnsigned64Dest(FCurrentProcName, RetVal));
+                            ApplyResultNarrow(FCurrentProcName, RetVal));
           end;
         end;
         EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit
