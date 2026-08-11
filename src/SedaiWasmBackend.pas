@@ -251,6 +251,7 @@ type
     FDtIvalFunc, FDtIncMoFunc, FDtDoyFunc, FDtWoyFunc, FDtYMFunc: LongWord;
     FUsesDateStr: Boolean;              // DATE$ / TIME$: the rendering, on top of the calendar
     FDtStrFunc: LongWord;
+    FUsesBool: Boolean;                 // PRINT of a BOOLEAN: two words in a data segment
     FUsesDateParse: Boolean;            // DATEVALUE / TIMEVALUE / ISDATE
     FDtFindFunc, FDtFieldsFunc, FDtDatePartFunc, FDtTimePartFunc, FDtParseFunc: LongWord;
     FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
@@ -562,6 +563,11 @@ const
     is the one the project already declared when it made the deterministic path
     the default (a parse that changes with the machine's regional settings is not
     diffable and its baselines are not reproducible). }
+  { A BOOLEAN prints as the word, so the module carries the two words. They sit
+    in the gap under the calendar's cells and cost nine bytes of data segment
+    only when a program actually prints a boolean. }
+  BOOL_TRUE    = 10432;   // 'true'
+  BOOL_FALSE   = 10436;   // 'false'
   DT_BAD       = -999999; // the "this field was not a number" sentinel, as SplitInts uses
   DT_PARSE     = 10472;   // f64: the parsed serial
   DT_F0        = 10480;   // the three integer fields a split leaves behind
@@ -697,6 +703,7 @@ begin
   FUsesDateName := False;
   FUsesDateStr := False;
   FUsesDateParse := False;
+  FUsesBool := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -796,6 +803,10 @@ begin
         ssaDateStr:
           begin FUsesDateStr := True; FUsesDate := True;
                 FUsesClock := True; FUsesStr := True; end;
+        ssaPrintBool:
+          begin FUsesBool := True; FUsesPrint := True; end;
+        ssaArrayErase:
+          FUsesArr := True;
         ssaDateValue, ssaIsDate:
           begin FUsesDateParse := True; FUsesDate := True; FUsesStr := True; end;
         ssaDateNow:
@@ -7592,6 +7603,7 @@ function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer)
 
 var
   Loaded32, Stored32: Boolean;   // a narrow field went straight to/from an i32 (see ssaRecordLoadInt)
+  IsDyn: Boolean;                // ERASE: does this array get freed, or only cleared
   Slot, d, Bytes, NStr, StrBase: Integer;
   n, k: Integer;                  // the array-bind bookkeeping
   Extras: TSSAValueArray;         // operands past Src1..Src3 (graphics carries them there)
@@ -8101,10 +8113,89 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
-    { MONTHNAME(n) / WEEKDAYNAME(n): one i32.load of the handle table, and an
-      index outside the range answers the EMPTY string - handle 0, which reads
-      as length 0 because linear memory starts zeroed. Not an error: that is
-      what bcDateName returns. }
+    { A BOOLEAN prints as the WORD, not as a number, so the two words live in a
+      data segment and this is a pointer and a length straight to the sink. The
+      condition is read twice - it is a register, so that is free - rather than
+      parked in a local. }
+    ssaPrintBool:
+      begin
+        LoadReg(B, Instr.Src1); B.Op(wopI64Eqz);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.I32Const(BOOL_FALSE);
+        B.Op(wopElse);
+          B.I32Const(BOOL_TRUE);
+        B.EndOp;
+        LoadReg(B, Instr.Src1); B.Op(wopI64Eqz);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.I32Const(5);
+        B.Op(wopElse);
+          B.I32Const(4);
+        B.EndOp;
+        B.Call(WriteTarget);
+      end;
+
+    { ERASE. ⭐ Two different operations under one name, and the immediate says
+      which: a DYNAMIC array is freed - no block, no elements, no dimensions,
+      which is what leaves LBound 0 and UBound -1 behind - while a STATIC one
+      KEEPS its bounds and only zeroes its elements.
+      ⚠️ Zero is the right empty value for all three banks at once: an integer
+      reads 0, a double reads +0.0, and a string handle of 0 reads as the empty
+      string because linear memory starts zeroed. That is why one memory.fill
+      serves an array of any type. }
+    ssaArrayErase:
+      begin
+        if Instr.Src1.Kind <> svkArrayRef then
+          Exit(Fail('ssaArrayErase without an array reference'));
+        if (Instr.Src1.ArrayIndex < 0) or (Instr.Src1.ArrayIndex >= FProg.GetArrayCount) then
+          Exit(Fail('ssaArrayErase names an array that was never declared'));
+        Info := FProg.GetArray(Instr.Src1.ArrayIndex);
+        Desc := FArrDescOf[Instr.Src1.ArrayIndex];
+        { ⛔ "IS THIS ARRAY DYNAMIC" IS ASKED OF THE ARRAY, not of the
+          instruction. The flag the front end packs into Src3 arrives here as
+          zero - the bytecode's immediate carries it, but by the time this
+          backend sees the SSA it does not - and reading it gave a dynamic ERASE
+          that silently behaved like a static one: the elements were cleared and
+          the bounds survived, so LBound/UBound answered 1 and 4 where the
+          interpreter answers 0 and -1.
+          ⭐ The array's own declaration settles it and cannot go stale: a
+          dimension of size 0 is what "runtime-sized" means here, and that is
+          exactly the shape ERASE frees. A property of the array belongs to the
+          array. }
+        IsDyn := (Info.DimCount = 0) or (Instr.Src3.ConstInt <> 0);
+        for d := 0 to Info.DimCount - 1 do
+          if (d > High(Info.Dimensions)) or (Info.Dimensions[d] = 0) then IsDyn := True;
+        if IsDyn then
+        begin
+          B.I32Const(LongInt(Desc));      B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+          B.I32Const(LongInt(Desc + 4));  B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+          B.I32Const(LongInt(Desc + 8));  B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+          { ⛔ AND THE PER-DIMENSION BOUNDS, which is what LBOUND and UBOUND
+            actually read - clearing the block, the count and the dimension
+            number leaves them untouched, so a freed array still answered its
+            old 1 and 4 instead of the 0 and -1 an empty one gives. UBOUND is
+            lb + size - 1, so a lower bound of 0 and a size of 0 produce the -1
+            by arithmetic rather than by a special case. }
+          for d := 0 to Info.DimCount - 1 do
+          begin
+            B.I32Const(LongInt(Desc + LongWord(16 + 8 * d)));
+            B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+            B.I32Const(LongInt(Desc + LongWord(20 + 8 * d)));
+            B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+          end;
+        end
+        else
+        begin
+          B.I32Const(LongInt(Desc)); B.OpMem(wopI32Load, 2, 0); B.LocalTee(FArrTmp);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);   // nothing to clear before DIM
+            B.LocalGet(FArrTmp);
+            B.I32Const(0);
+            B.I32Const(LongInt(Desc + 4)); B.OpMem(wopI32Load, 2, 0);
+            B.I32Const(8); B.Op(wopI32Mul);
+            B.MemoryFill;
+          B.EndOp;
+        end;
+      end;
+
     { DATE$ / TIME$: read the clock, split it once, render a fixed-width field. }
     ssaDateStr:
       begin
@@ -8115,6 +8206,10 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { MONTHNAME(n) / WEEKDAYNAME(n): one i32.load of the handle table, and an
+      index outside the range answers the EMPTY string - handle 0, which reads
+      as length 0 because linear memory starts zeroed. Not an error: that is
+      what bcDateName returns. }
     ssaDateName:
       begin
         LoadReg(B, Instr.Src1);
@@ -10875,6 +10970,8 @@ begin
     if FUsesDateName then
       FModule.DataSegment(DT_NAMES, PByte(PAnsiChar(BuildDateNameBlob)),
                           Length(BuildDateNameBlob));
+    if FUsesBool then
+      FModule.DataSegment(BOOL_TRUE, PByte(PAnsiChar('true' + 'false')), 9);
     FModule.ExportMemory('memory');
   end;
   Init := TWasmBuf.Create;
