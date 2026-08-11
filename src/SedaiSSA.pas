@@ -11806,6 +11806,19 @@ begin
   LabelNode := Node.GetChild(0);
   LabelName := JumpLabelName(LabelNode);
 
+  { ⛔ GOSUB IS NOT PART OF THE MODERN DIALECT, and fbc says so with an error of
+    its own: "error 146: Only valid in -lang fblite or qb". The reason is not
+    taste, and fbc's SECOND error on the same program spells it out - in a BASIC
+    with procedures RETURN is already taken, it means "leave this function", so
+    GOSUB would make one keyword mean two things depending on whether a jump is
+    pending. That is dynamic state deciding a keyword's semantics.
+    ⚠️ CLASSIC keeps it, and must: Commodore BASIC is built on it (38 programs in
+    this tree). The refusal is MODERN-only for that reason. }
+  if FModernMode then
+    raise Exception.Create('GOSUB is not available in the MODERN (FreeBASIC) dialect: ' +
+                           'RETURN already means "return from a procedure" there. ' +
+                           'Use a SUB, or the CLASSIC dialect.');
+
   // PHASE 3 TIER 3: Save current block before call
   SourceBlock := FCurrentBlock;
 
@@ -11954,6 +11967,12 @@ begin
                    CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
     // Call subroutine
+    { ON ... GOSUB is the computed form of the same statement, and out of MODERN
+      for the same reason - see the note at the plain GOSUB. }
+    if FModernMode then
+      raise Exception.Create('ON ... GOSUB is not available in the MODERN (FreeBASIC) dialect: ' +
+                             'RETURN already means "return from a procedure" there. ' +
+                             'Use a SUB, or the CLASSIC dialect.');
     EmitInstruction(ssaCall, MakeSSALabel(LabelName), MakeSSAValue(svkNone),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
@@ -28232,6 +28251,13 @@ begin
       end
       else
       begin
+        { A RETURN that is NOT inside a procedure is a GOSUB return, and in MODERN
+          there is no GOSUB to return from - which is fbc's own second complaint,
+          "error 53: Illegal outside a CONSTRUCTOR, DESTRUCTOR, FUNCTION,
+          OPERATOR, PROPERTY or SUB block". }
+        if FModernMode then
+          raise Exception.Create('RETURN outside a SUB or FUNCTION is a GOSUB return, ' +
+                                 'which the MODERN (FreeBASIC) dialect does not have.');
         // Normal RETURN statement (GOSUB return)
         EmitInstruction(ssaReturn, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
