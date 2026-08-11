@@ -39,7 +39,8 @@ unit SedaiWasmBackend;
 interface
 
 uses
-  SysUtils, Classes, TypInfo, SedaiSSATypes, SedaiWasmEmitter, SedaiWasmControl;
+  SysUtils, Classes, TypInfo, SedaiSSATypes, SedaiWasmEmitter, SedaiWasmControl,
+  SedaiExecutorErrors;   // ERR$ builds its table by asking the interpreter's own function
 
 type
   { Where a register lives in the emitted function. }
@@ -260,6 +261,7 @@ type
     FUsesRnd: Boolean;
     FMtBaseG: LongWord;                 // i32 global: where the 624-word state lives
     FMtSeedFunc, FMtNextFunc: LongWord;
+    FUsesErrName: Boolean;              // ERR$(n): the message table, as a data segment
     FUsesBool: Boolean;                 // PRINT of a BOOLEAN: two words in a data segment
     FUsesDateParse: Boolean;            // DATEVALUE / TIMEVALUE / ISDATE
     FDtFindFunc, FDtFieldsFunc, FDtDatePartFunc, FDtTimePartFunc, FDtParseFunc: LongWord;
@@ -399,6 +401,7 @@ type
     procedure EmitWideHelpers;
     procedure EmitDateHelpers;
     function BuildDateNameBlob: AnsiString;
+    function BuildErrNameBlob: AnsiString;
     procedure EmitTwoDigits(B: TWasmBuf; Base, Val: LongWord; Off: LongWord);
     procedure EmitRndHelpers;
     procedure EmitDateParseHelpers;
@@ -585,6 +588,20 @@ const
   DT_F2        = 10488;
   DT_PD        = 10496;   // f64: the date half, once it has parsed
   DT_PT        = 10504;   // f64: and the time half
+  { ERR$(n). The messages go in as ordinary string headers with a table of
+    already-resolved handles in front, exactly as the month names do - and the
+    TABLE IS BUILT BY CALLING THE INTERPRETER'S OWN GetErrorCodeDescription, so
+    the two cannot drift apart by a word. Codes with no message of their own
+    hold 0 here and are rendered at run time as "ERROR n". }
+  { ⭐ The codes are TWO ranges, not one - 0..41 from Commodore BASIC and
+    100..113 added by this project - so the table is 56 compact slots instead of
+    114, which is what makes it fit at all. Slot 56 holds the word the fallback
+    needs. }
+  ERR_LO_MAX   = 41;
+  ERR_HI_LO    = 100;
+  ERR_HI_MAX   = 113;
+  ERR_SLOTS    = (ERR_LO_MAX + 1) + (ERR_HI_MAX - ERR_HI_LO + 1) + 1;
+  ERR_NAMES    = 10864;   // the handles, then the strings
   DT_NAMES     = 10560;   // the table of 19 handles, then the strings
   DT_NAME_COUNT = 19;
   VAL_DIGCAP   = 800;
@@ -714,6 +731,7 @@ begin
   FUsesDateStr := False;
   FUsesDateParse := False;
   FUsesBool := False;
+  FUsesErrName := False;
   FUsesRnd := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
@@ -816,6 +834,8 @@ begin
                 FUsesClock := True; FUsesStr := True; end;
         ssaPrintBool:
           begin FUsesBool := True; FUsesPrint := True; end;
+        ssaStrErr:
+          begin FUsesErrName := True; FUsesStr := True; end;
         ssaMathRnd:
           begin FUsesRnd := True; FUsesHeap := True; end;
         { ⚠️ RANDOMIZE without a seed is time-based, so it needs the clock the
@@ -4276,6 +4296,60 @@ begin
     end;
   end;
   Result := Result + Body;
+end;
+
+{ ERR$(n)'s message table: the handles first, then the strings, laid out exactly
+  as the month names are.
+
+  ⭐⭐ THE MESSAGES ARE NOT TRANSCRIBED - the table is built by CALLING the
+  interpreter's own GetErrorCodeDescription, so the two cannot drift apart by a
+  word, an apostrophe or a code. A copied table would be right on the day it was
+  written and wrong the first time somebody adds an error.
+  ⛔ It sits in a FIXED region under the string literals, and the fit is tight -
+  so it is CHECKED. Silently running past STR_CONST_BASE would overwrite the
+  program's own literals, which is a defect nothing downstream could explain. }
+function TWasmBackend.BuildErrNameBlob: AnsiString;
+var
+  k, Slot, Head: Integer;
+  Addr: LongWord;
+  Body, M: AnsiString;
+
+  procedure Put(ASlot: Integer; const S: AnsiString);
+  begin
+    PLongWord(@Result[1 + ASlot * 4])^ := Addr;
+    SetLength(Body, Length(Body) + 4 + Length(S));
+    PLongWord(@Body[Length(Body) - 3 - Length(S)])^ := LongWord(Length(S));
+    if Length(S) > 0 then
+      Move(S[1], Body[Length(Body) - Length(S) + 1], Length(S));
+    Inc(Addr, LongWord(4 + Length(S)));
+    while (Addr and 3) <> 0 do
+    begin
+      Body := Body + #0;
+      Inc(Addr);
+    end;
+  end;
+
+begin
+  Head := ERR_SLOTS * 4;
+  SetLength(Result, Head);
+  FillChar(Result[1], Head, 0);
+  Body := '';
+  Addr := ERR_NAMES + LongWord(Head);
+  for k := 0 to ERR_LO_MAX do
+    Put(k, AnsiString(SedaiExecutorErrors.GetErrorCodeDescription(k)));
+  for k := ERR_HI_LO to ERR_HI_MAX do
+  begin
+    Slot := (ERR_LO_MAX + 1) + (k - ERR_HI_LO);
+    M := AnsiString(SedaiExecutorErrors.GetErrorCodeDescription(k));
+    Put(Slot, M);
+  end;
+  { The last slot is the word the fallback prefixes to a code with no message of
+    its own - "ERROR 42" - which is what the interpreter's else branch formats. }
+  Put(ERR_SLOTS - 1, 'ERROR ');
+  Result := Result + Body;
+  if LongWord(Length(Result)) + ERR_NAMES > STR_CONST_BASE then
+    raise Exception.CreateFmt('the ERR$ message table no longer fits below the string ' +
+      'literals: %d bytes at %d runs past %d', [Length(Result), ERR_NAMES, STR_CONST_BASE]);
 end;
 
 { DT_DAYS as an i64, which every arm below starts from. }
@@ -8268,6 +8342,48 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { ERR$(n): one load from the handle table, and a code with no message of its
+      own is rendered "ERROR n" at run time - which is what the interpreter's
+      else branch formats. ⭐ The codes are two ranges, so the slot is computed
+      rather than being the code itself. }
+    ssaStrErr:
+      begin
+        LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalTee(FArrTmp);
+        B.I32Const(0); B.Op(wopI32GeS);
+        B.LocalGet(FArrTmp); B.I32Const(ERR_LO_MAX); B.Op(wopI32LeS);
+        B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.LocalGet(FArrTmp);
+        B.Op(wopElse);
+          B.LocalGet(FArrTmp); B.I32Const(ERR_HI_LO); B.Op(wopI32GeS);
+          B.LocalGet(FArrTmp); B.I32Const(ERR_HI_MAX); B.Op(wopI32LeS);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(FArrTmp); B.I32Const(ERR_HI_LO - (ERR_LO_MAX + 1)); B.Op(wopI32Sub);
+          B.Op(wopElse);
+            B.I32Const(-1);
+          B.EndOp;
+        B.EndOp;
+        B.LocalTee(FRecTmp);
+        B.I32Const(0); B.Op(wopI32GeS);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.LocalGet(FRecTmp); B.I32Const(4); B.Op(wopI32Mul);
+          B.OpMem(wopI32Load, 2, ERR_NAMES);
+        B.Op(wopElse);
+          B.I32Const(0);
+        B.EndOp;
+        B.LocalTee(FGfxP);
+        B.Op(wopI32Eqz);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.I32Const((ERR_SLOTS - 1) * 4); B.OpMem(wopI32Load, 2, ERR_NAMES);
+          B.LocalGet(FArrTmp); B.Op(wopI64ExtendI32S); B.Call(FStrFromIntFunc);
+          B.Call(FStrCatFunc);
+        B.Op(wopElse);
+          B.LocalGet(FGfxP);
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
     { RND -> genrand_int32 / 2^32, which is what FPC's Random is. }
     ssaMathRnd:
       begin
@@ -11152,6 +11268,9 @@ begin
                           Length(BuildDateNameBlob));
     if FUsesBool then
       FModule.DataSegment(BOOL_TRUE, PByte(PAnsiChar('true' + 'false')), 9);
+    if FUsesErrName then
+      FModule.DataSegment(ERR_NAMES, PByte(PAnsiChar(BuildErrNameBlob)),
+                          Length(BuildErrNameBlob));
     FModule.ExportMemory('memory');
   end;
   Init := TWasmBuf.Create;
