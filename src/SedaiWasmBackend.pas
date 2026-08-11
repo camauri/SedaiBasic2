@@ -244,6 +244,10 @@ type
       this needs a second storage, only a second way of COUNTING. }
     FUsesWide: Boolean;
     FWLenFunc, FWSubFunc, FWEncFunc, FWB2CPFunc, FWRepFunc: LongWord;
+    { DATESERIAL / DATEPART / DATEADD / DATEDIFF and the field accessors. }
+    FUsesDate: Boolean;
+    FDtSplitFunc, FDtCivilFunc, FDtDaysFunc: LongWord;
+    FDtIvalFunc, FDtIncMoFunc, FDtDoyFunc, FDtWoyFunc, FDtYMFunc: LongWord;
     FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
     FGfxPsetFunc, FGfxLineFunc: LongWord;
     FPenX, FPenY: LongWord;             // globals: the current graphics point
@@ -378,6 +382,12 @@ type
     procedure EmitTrimSetHelper;
     procedure EmitPackHelpers;
     procedure EmitWideHelpers;
+    procedure EmitDateHelpers;
+    procedure EmitDatePartSwitch(B: TWasmBuf);
+    procedure EmitDateAddSwitch(B: TWasmBuf; Instr: TSSAInstruction);
+    procedure EmitDateDiffSwitch(B: TWasmBuf; Instr: TSSAInstruction);
+    procedure EmitDtDays(B: TWasmBuf);
+    procedure EmitDtWeekday(B: TWasmBuf);
     function EmitRegion(R: Integer): Boolean;
     function FloatRegUses(First, N, RegIdx: Integer): Integer;
     function IntRegUses(First, N, RegIdx: Integer): Integer;
@@ -520,6 +530,13 @@ const
     common one. }
   BASE_SCR_END = 10432;
   BASE_SCR     = BASE_SCR_END - 64;
+  { The date/time split. ⭐ ONE rounded millisecond count is the whole of it -
+    see EmitDateHelpers - so these five cells are everything the family needs. }
+  DT_DAYS      = 10448;   // i32: whole days since 1899-12-30
+  DT_MS        = 10452;   // i32: milliseconds into the day, always non-negative
+  DT_Y         = 10456;
+  DT_MO        = 10460;
+  DT_D         = 10464;
   VAL_DIGCAP   = 800;
   VAL_MAXDIG   = 1500;    // ⛔ must stay under PU_NINT - FLT_DEC = 2048
   VAL_MAXLIMB  = 200;
@@ -642,6 +659,7 @@ begin
   FUsesTrimSet := False;
   FUsesPack := False;
   FUsesWide := False;
+  FUsesDate := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -724,6 +742,13 @@ begin
         ssaStrLenW, ssaStrLeftW, ssaStrRightW, ssaStrMidW,
         ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN:
           begin FUsesWide := True; FUsesStr := True; end;
+        { ⚠️ DATEPART, DATEADD and DATEDIFF name their interval with a STRING, so
+          the calendar family needs the string bank even where no program text
+          says so. }
+        ssaDateDecode, ssaDateSerial, ssaTimeSerial:
+          FUsesDate := True;
+        ssaDatePart, ssaDateAdd, ssaDateDiff:
+          begin FUsesDate := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
         { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
@@ -3177,6 +3202,523 @@ begin
   finally
     B.Free;
   end;
+end;
+
+{ The calendar. A TDateTime here is FPC's: days since 1899-12-30, with the time
+  of day in the fraction - measured, not assumed (serial 0 decodes as 1899-12-30
+  and 25569 as 1970-01-01), and it is a plain proleptic Gregorian count with no
+  Lotus 1900 leap-day quirk (serial 60 is the 28th of February, not the 29th).
+
+  ⭐⭐⭐ THE SPLIT IS ONE ROUNDED MILLISECOND COUNT, and finding that is what made
+  this tractable. FPC's DateTimeToTimeStamp does not decode the date and the time
+  separately: it multiplies the WHOLE value by the milliseconds in a day, rounds
+  ONCE away from zero, and then divides and remainders. Every edge falls out of
+  that single expression instead of needing a rule of its own -
+  46245.99999999999 rolls to the NEXT DAY at midnight (which decoding the two
+  halves independently would never produce), and a negative serial takes its date
+  from a truncating division and its time from the magnitude. Reproducing the
+  arithmetic reproduces the edges; reproducing the edges one at a time would have
+  been a list with no end.
+  ⚠️ And IncMonth does NOT use that split for the time: it keeps Abs(Frac()) of
+  the original. The two therefore disagree at the far end of a day, ON PURPOSE -
+  it is what sb does. }
+procedure TWasmBackend.EmitDateHelpers;
+const
+  MS_DAY = 86400000;
+  { The interval names of DATEPART/DATEADD/DATEDIFF, in code order.
+    ⛔ Anything else is code 4, a whole DAY - not an error. Measured:
+    DatePart("zz", s) answers the day of the month. }
+  IVAL_NAME: array[0..9] of AnsiString =
+    ('yyyy', 'q', 'm', 'y', 'd', 'w', 'ww', 'h', 'n', 's');
+var
+  B: TWasmBuf;
+  TSplit, TCivil, TDays, TIval, TIncMo, TDoy, TWoy: LongWord;
+  k, c: Integer;
+begin
+  TSplit := FModule.TypeIndex([wvtF64], []);
+  TCivil := FModule.TypeIndex([wvtI64], []);
+  TDays  := FModule.TypeIndex([wvtI64, wvtI64, wvtI64], [wvtI64]);
+  TIval  := FModule.TypeIndex([wvtI32], [wvtI32]);
+  TIncMo := FModule.TypeIndex([wvtF64, wvtI64], [wvtF64]);
+  TDoy   := FModule.TypeIndex([wvtI64], [wvtI64]);
+  TWoy   := FModule.TypeIndex([wvtI64], [wvtI64]);
+
+  { dtSplit(serial): DT_DAYS and DT_MS, by the one expression above. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = serial; locals 1 = ms (i64)
+    B.LocalGet(0); B.F64Const(MS_DAY); B.Op(wopF64Mul);
+    B.LocalTee(0);
+    B.F64Const(0); B.Op(wopF64Lt);
+    B.BlockStart(wopIf, WASM_TYPE_F64);
+      B.LocalGet(0); B.F64Const(0.5); B.Op(wopF64Sub);
+    B.Op(wopElse);
+      B.LocalGet(0); B.F64Const(0.5); B.Op(wopF64Add);
+    B.EndOp;
+    { ⛔ trunc_sat and not trunc: a serial far outside any calendar would TRAP
+      the module where the interpreter merely answers nonsense. Saturating keeps
+      a bad date a bad date instead of killing the program. }
+    B.TruncSat(wopfcI64TruncSatF64S);
+    B.LocalSet(1);
+    B.I32Const(DT_DAYS);
+    B.LocalGet(1); B.I64Const(MS_DAY); B.Op(wopI64DivS); B.Op(wopI32WrapI64);
+    B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(DT_MS);
+    // the magnitude first: Pascal's mod takes the sign of the dividend
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.I64Const(0); B.LocalGet(1); B.Op(wopI64Sub);
+    B.Op(wopElse);
+      B.LocalGet(1);
+    B.EndOp;
+    B.I64Const(MS_DAY); B.Op(wopI64RemS); B.Op(wopI32WrapI64);
+    B.OpMem(wopI32Store, 2, 0);
+    FModule.AddFunction(TSplit, [wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { dtCivil(days): DT_Y, DT_MO, DT_D. The civil-from-days algorithm, with the
+    era shifted so that March starts the year - which is what removes every
+    special case for February and the leap day. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = days; locals 1 = z, 2 = era, 3 = doe, 4 = yoe, 5 = doy, 6 = mp, 7 = y
+    B.LocalGet(0); B.I64Const(25569); B.Op(wopI64Sub);   // -> days since 1970-01-01
+    B.I64Const(719468); B.Op(wopI64Add);                 // -> days since 0000-03-01
+    B.LocalSet(1);
+    // era = (z >= 0 ? z : z - 146096) / 146097   -- a floor division
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64GeS);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.LocalGet(1);
+    B.Op(wopElse);
+      B.LocalGet(1); B.I64Const(146096); B.Op(wopI64Sub);
+    B.EndOp;
+    B.I64Const(146097); B.Op(wopI64DivS); B.LocalSet(2);
+    B.LocalGet(1); B.LocalGet(2); B.I64Const(146097); B.Op(wopI64Mul); B.Op(wopI64Sub);
+    B.LocalSet(3);                                       // doe in [0, 146096]
+    B.LocalGet(3);
+    B.LocalGet(3); B.I64Const(1460); B.Op(wopI64DivS); B.Op(wopI64Sub);
+    B.LocalGet(3); B.I64Const(36524); B.Op(wopI64DivS); B.Op(wopI64Add);
+    B.LocalGet(3); B.I64Const(146096); B.Op(wopI64DivS); B.Op(wopI64Sub);
+    B.I64Const(365); B.Op(wopI64DivS); B.LocalSet(4);    // yoe in [0, 399]
+    B.LocalGet(3);
+    B.LocalGet(4); B.I64Const(365); B.Op(wopI64Mul);
+    B.LocalGet(4); B.I64Const(4); B.Op(wopI64DivS); B.Op(wopI64Add);
+    B.LocalGet(4); B.I64Const(100); B.Op(wopI64DivS); B.Op(wopI64Sub);
+    B.Op(wopI64Sub); B.LocalSet(5);                      // doy in [0, 365]
+    B.LocalGet(5); B.I64Const(5); B.Op(wopI64Mul); B.I64Const(2); B.Op(wopI64Add);
+    B.I64Const(153); B.Op(wopI64DivS); B.LocalSet(6);    // mp in [0, 11]
+    B.LocalGet(4); B.LocalGet(2); B.I64Const(400); B.Op(wopI64Mul); B.Op(wopI64Add);
+    B.LocalSet(7);
+    // d = doy - (153*mp + 2)/5 + 1 ; m = mp < 10 ? mp + 3 : mp - 9 ; y += m <= 2
+    B.I32Const(DT_D);
+    B.LocalGet(5);
+    B.LocalGet(6); B.I64Const(153); B.Op(wopI64Mul); B.I64Const(2); B.Op(wopI64Add);
+    B.I64Const(5); B.Op(wopI64DivS); B.Op(wopI64Sub);
+    B.I64Const(1); B.Op(wopI64Add); B.Op(wopI32WrapI64);
+    B.OpMem(wopI32Store, 2, 0);
+    B.LocalGet(6); B.I64Const(10); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.LocalGet(6); B.I64Const(3); B.Op(wopI64Add);
+    B.Op(wopElse);
+      B.LocalGet(6); B.I64Const(9); B.Op(wopI64Sub);
+    B.EndOp;
+    B.LocalSet(6);
+    B.I32Const(DT_MO); B.LocalGet(6); B.Op(wopI32WrapI64); B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(DT_Y);
+    B.LocalGet(7);
+    B.LocalGet(6); B.I64Const(2); B.Op(wopI64LeS); B.Op(wopI64ExtendI32U);
+    B.Op(wopI64Add); B.Op(wopI32WrapI64);
+    B.OpMem(wopI32Store, 2, 0);
+    FModule.AddFunction(TCivil, [wvtI64, wvtI64, wvtI64, wvtI64, wvtI64, wvtI64, wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { dtDays(y, m, d) -> the serial day. The exact inverse of dtCivil. }
+  B := TWasmBuf.Create;
+  try
+    // params 0=y 1=m 2=d; locals 3 = yy, 4 = era, 5 = yoe, 6 = doy, 7 = doe
+    B.LocalGet(0);
+    B.LocalGet(1); B.I64Const(2); B.Op(wopI64LeS); B.Op(wopI64ExtendI32U);
+    B.Op(wopI64Sub); B.LocalSet(3);
+    B.LocalGet(3); B.I64Const(0); B.Op(wopI64GeS);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.LocalGet(3);
+    B.Op(wopElse);
+      B.LocalGet(3); B.I64Const(399); B.Op(wopI64Sub);
+    B.EndOp;
+    B.I64Const(400); B.Op(wopI64DivS); B.LocalSet(4);
+    B.LocalGet(3); B.LocalGet(4); B.I64Const(400); B.Op(wopI64Mul); B.Op(wopI64Sub);
+    B.LocalSet(5);
+    // doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d - 1
+    B.LocalGet(1);
+    B.LocalGet(1); B.I64Const(2); B.Op(wopI64GtS);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.I64Const(-3);
+    B.Op(wopElse);
+      B.I64Const(9);
+    B.EndOp;
+    B.Op(wopI64Add);
+    B.I64Const(153); B.Op(wopI64Mul); B.I64Const(2); B.Op(wopI64Add);
+    B.I64Const(5); B.Op(wopI64DivS);
+    B.LocalGet(2); B.Op(wopI64Add); B.I64Const(1); B.Op(wopI64Sub);
+    B.LocalSet(6);
+    B.LocalGet(5); B.I64Const(365); B.Op(wopI64Mul);
+    B.LocalGet(5); B.I64Const(4); B.Op(wopI64DivS); B.Op(wopI64Add);
+    B.LocalGet(5); B.I64Const(100); B.Op(wopI64DivS); B.Op(wopI64Sub);
+    B.LocalGet(6); B.Op(wopI64Add); B.LocalSet(7);
+    B.LocalGet(4); B.I64Const(146097); B.Op(wopI64Mul);
+    B.LocalGet(7); B.Op(wopI64Add);
+    B.I64Const(719468); B.Op(wopI64Sub);
+    B.I64Const(25569); B.Op(wopI64Add);
+    FModule.AddFunction(TDays, [wvtI64, wvtI64, wvtI64, wvtI64, wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { dtIval(s) -> the interval code. Trimmed and case-folded, exactly as
+    IntervalCode does, and anything unrecognised is a DAY. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = s; locals 1 = len, 2 = base, 3 = i
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(1);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(2);
+    { The names are 1, 2 or 4 characters and there are ten of them, so the whole
+      table is a spelled-out comparison rather than a loop over literals: it is
+      shorter in bytes than a data segment plus the loop that would read it. }
+    for k := 0 to High(IVAL_NAME) do
+    begin
+      { ⛔ One BLOCK per name, and it has to be a block rather than the `if` this
+        was first written as: a branch out of an `if` at depth 1 leaves the
+        FUNCTION, which here means returning with nothing on the stack. The
+        block gives the "try the next name" exit somewhere to land. }
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(1); B.I32Const(Length(IVAL_NAME[k])); B.Op(wopI32Ne);
+        B.BrIf(0);
+        for c := 1 to Length(IVAL_NAME[k]) do
+        begin
+          B.LocalGet(2); B.OpMem(wopI32Load8U, 0, LongWord(c - 1));
+          B.I32Const($DF); B.Op(wopI32And);            // fold to upper case
+          B.I32Const(Ord(UpCase(IVAL_NAME[k][c]))); B.Op(wopI32Ne);
+          B.BrIf(0);                                   // a byte differs: next name
+        end;
+        B.I32Const(k); B.Op(wopReturn);
+      B.EndOp;
+    end;
+    B.I32Const(4);
+    FModule.AddFunction(TIval, [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { dtIncMonth(serial, n) -> the serial n months later, with the day CLAMPED to
+    the length of the month it lands in (31 January plus one month is 28
+    February, measured). ⚠️ The time comes back as Abs(Frac(serial)) and not
+    from dtSplit's rounded milliseconds - see the note at the top. }
+  B := TWasmBuf.Create;
+  try
+    // params 0 = serial, 1 = n; locals 2 = y, 3 = m, 4 = d, 5 = dim, 6 = tm
+    B.LocalGet(0); B.Call(FDtSplitFunc);
+    B.I32Const(DT_DAYS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.Call(FDtCivilFunc);
+    B.I32Const(DT_Y);  B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S); B.LocalSet(2);
+    B.I32Const(DT_MO); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S); B.LocalSet(3);
+    B.I32Const(DT_D);  B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S); B.LocalSet(4);
+    { Months counted from zero make the carry a division instead of a loop, and
+      a FLOOR division so that going backwards over January works. }
+    B.LocalGet(2); B.I64Const(12); B.Op(wopI64Mul);
+    B.LocalGet(3); B.Op(wopI64Add); B.I64Const(1); B.Op(wopI64Sub);
+    B.LocalGet(1); B.Op(wopI64Add); B.LocalSet(6);
+    B.LocalGet(6); B.I64Const(0); B.Op(wopI64GeS);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.LocalGet(6);
+    B.Op(wopElse);
+      B.LocalGet(6); B.I64Const(11); B.Op(wopI64Sub);
+    B.EndOp;
+    B.I64Const(12); B.Op(wopI64DivS); B.LocalSet(2);
+    B.LocalGet(6); B.LocalGet(2); B.I64Const(12); B.Op(wopI64Mul); B.Op(wopI64Sub);
+    B.I64Const(1); B.Op(wopI64Add); B.LocalSet(3);
+    { The length of the target month, as the difference between the first of it
+      and the first of the next - no table, and the leap rule comes for free
+      from dtDays. }
+    B.LocalGet(2);
+    B.LocalGet(3); B.I64Const(12); B.Op(wopI64Eq); B.Op(wopI64ExtendI32U);
+    B.Op(wopI64Add);
+    B.LocalGet(3); B.I64Const(12); B.Op(wopI64Eq);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.I64Const(1);
+    B.Op(wopElse);
+      B.LocalGet(3); B.I64Const(1); B.Op(wopI64Add);
+    B.EndOp;
+    B.I64Const(1); B.Call(FDtDaysFunc);
+    B.LocalGet(2); B.LocalGet(3); B.I64Const(1); B.Call(FDtDaysFunc);
+    B.Op(wopI64Sub); B.LocalSet(5);
+    B.LocalGet(4); B.LocalGet(5); B.Op(wopI64GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(5); B.LocalSet(4);
+    B.EndOp;
+    B.LocalGet(2); B.LocalGet(3); B.LocalGet(4); B.Call(FDtDaysFunc);
+    B.Op(wopF64ConvertI64S);
+    // + Abs(Frac(serial)), and BELOW zero the fraction is subtracted
+    B.LocalGet(0); B.LocalGet(0); B.Op(wopF64Trunc); B.Op(wopF64Sub);
+    B.Op(wopF64Abs);
+    B.Op(wopF64Add);
+    FModule.AddFunction(TIncMo, [wvtI64, wvtI64, wvtI64, wvtI64, wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { dtDayOfYear(days) -> 1..366. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = days; local 1 = jan1
+    B.LocalGet(0); B.Call(FDtCivilFunc);
+    B.I32Const(DT_Y); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.I64Const(1); B.I64Const(1); B.Call(FDtDaysFunc);
+    B.LocalSet(1);
+    B.LocalGet(0); B.LocalGet(1); B.Op(wopI64Sub); B.I64Const(1); B.Op(wopI64Add);
+    FModule.AddFunction(TDoy, [wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { dtWeekOfYear(days) -> the ISO 8601 week, which is what FPC's WeekOfTheYear
+    returns. ⭐ The identity that removes every special case: the week number of
+    a day is ((the Thursday of its week) - (the 1st of THAT Thursday's January))
+    div 7 + 1. A year straddled at either end lands in the right year because
+    the Thursday decides it, not the day. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = days; locals 1 = dow, 2 = thursday, 3 = jan1
+    { The day of the week, Monday = 0. Serial 0 is a Saturday, so the shift that
+      turns the serial into a Monday-based index is +5 under a floor modulo. }
+    B.LocalGet(0); B.I64Const(5); B.Op(wopI64Add);
+    B.I64Const(7); B.Op(wopI64RemS);
+    B.LocalTee(1); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.I64Const(7); B.Op(wopI64Add); B.LocalSet(1);
+    B.EndOp;
+    B.LocalGet(0); B.LocalGet(1); B.Op(wopI64Sub); B.I64Const(3); B.Op(wopI64Add);
+    B.LocalSet(2);
+    B.LocalGet(2); B.Call(FDtCivilFunc);
+    B.I32Const(DT_Y); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.I64Const(1); B.I64Const(1); B.Call(FDtDaysFunc);
+    B.LocalSet(3);
+    B.LocalGet(2); B.LocalGet(3); B.Op(wopI64Sub); B.I64Const(7); B.Op(wopI64DivS);
+    B.I64Const(1); B.Op(wopI64Add);
+    FModule.AddFunction(TWoy, [wvtI64, wvtI64, wvtI64], B);
+  finally
+    B.Free;
+  end;
+
+  { dtYM(serial) -> year * 12 + (month - 1), the two calendar fields DATEDIFF
+    needs in ONE value. ⭐ It exists so that the year, quarter and month
+    differences can be plain arithmetic on a single number instead of two
+    decodes fighting over the same memory cells - DT_Y and DT_MO belong to
+    whoever decoded LAST, and DATEDIFF decodes twice. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = serial
+    B.LocalGet(0); B.Call(FDtSplitFunc);
+    B.I32Const(DT_DAYS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.Call(FDtCivilFunc);
+    B.I32Const(DT_Y); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.I64Const(12); B.Op(wopI64Mul);
+    B.I32Const(DT_MO); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.Op(wopI64Add); B.I64Const(1); B.Op(wopI64Sub);
+    FModule.AddFunction(FModule.TypeIndex([wvtF64], [wvtI64]), [], B);
+  finally
+    B.Free;
+  end;
+end;
+
+{ DT_DAYS as an i64, which every arm below starts from. }
+procedure TWasmBackend.EmitDtDays(B: TWasmBuf);
+begin
+  B.I32Const(DT_DAYS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+end;
+
+{ The weekday of DT_DAYS, 1 = Sunday .. 7 = Saturday. Serial 0 is a Saturday
+  (measured), so serial + 6 is a Sunday-based count - and the remainder is taken
+  twice because Pascal's mod, and WASM's, keep the sign of the dividend and a
+  serial before 1899 is negative. }
+procedure TWasmBackend.EmitDtWeekday(B: TWasmBuf);
+begin
+  EmitDtDays(B);
+  B.I64Const(6); B.Op(wopI64Add);
+  B.I64Const(7); B.Op(wopI64RemS);
+  B.I64Const(7); B.Op(wopI64Add);
+  B.I64Const(7); B.Op(wopI64RemS);
+  B.I64Const(1); B.Op(wopI64Add);
+end;
+
+{ DATEPART. The interval code is on the stack; DT_DAYS and DT_MS are already set.
+  ⛔ The chain is built by a LOOP rather than written out: ten arms spelled by
+  hand is ten chances to put an arm under the wrong code, and the codes are the
+  same list dtIval answers with. }
+procedure TWasmBackend.EmitDatePartSwitch(B: TWasmBuf);
+var
+  k: Integer;
+
+  procedure Field(Cell: LongWord);
+  begin
+    EmitDtDays(B);
+    B.Call(FDtCivilFunc);
+    B.I32Const(LongInt(Cell)); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+  end;
+
+  procedure MsPart(Div1, Mod1: Int64);
+  begin
+    B.I32Const(DT_MS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+    B.I64Const(Div1); B.Op(wopI64DivS);
+    if Mod1 > 0 then begin B.I64Const(Mod1); B.Op(wopI64RemS); end;
+  end;
+
+begin
+  B.LocalSet(FArrTmp);
+  for k := 0 to 9 do
+  begin
+    B.LocalGet(FArrTmp); B.I32Const(k); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      case k of
+        0: Field(DT_Y);
+        1: begin                                  // the quarter
+             Field(DT_MO);
+             B.I64Const(1); B.Op(wopI64Sub);
+             B.I64Const(3); B.Op(wopI64DivS);
+             B.I64Const(1); B.Op(wopI64Add);
+           end;
+        2: Field(DT_MO);
+        3: begin EmitDtDays(B); B.Call(FDtDoyFunc); end;
+        4: Field(DT_D);
+        5: EmitDtWeekday(B);
+        6: begin EmitDtDays(B); B.Call(FDtWoyFunc); end;
+        7: MsPart(3600000, 0);
+        8: MsPart(60000, 60);
+      else MsPart(1000, 60);
+      end;
+    B.Op(wopElse);
+  end;
+  B.I64Const(0);
+  for k := 0 to 9 do B.EndOp;
+end;
+
+{ DATEADD. The interval code is on the stack; Src2 is the count and Src3 the
+  serial. ⚠️ Codes 3, 4 and 5 - day of year, day, weekday - all add whole DAYS,
+  which is why they fall through to the default rather than having arms. }
+procedure TWasmBackend.EmitDateAddSwitch(B: TWasmBuf; Instr: TSSAInstruction);
+var
+  k: Integer;
+
+  procedure Months(Factor: Int64);
+  begin
+    LoadReg(B, Instr.Src3);
+    LoadReg(B, Instr.Src2);
+    if Factor <> 1 then begin B.I64Const(Factor); B.Op(wopI64Mul); end;
+    B.Call(FDtIncMoFunc);
+  end;
+
+  procedure Fraction(Per: Double);
+  begin
+    LoadReg(B, Instr.Src3);
+    LoadReg(B, Instr.Src2); B.Op(wopF64ConvertI64S);
+    B.F64Const(Per); B.Op(wopF64Div);
+    B.Op(wopF64Add);
+  end;
+
+begin
+  B.LocalSet(FArrTmp);
+  for k := 0 to 9 do
+  begin
+    if k in [3, 4, 5] then Continue;      // whole days: the default answers
+    B.LocalGet(FArrTmp); B.I32Const(k); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_TYPE_F64);
+      case k of
+        0: Months(12);
+        1: Months(3);
+        2: Months(1);
+        6: begin                          // whole weeks
+             LoadReg(B, Instr.Src3);
+             LoadReg(B, Instr.Src2); B.I64Const(7); B.Op(wopI64Mul);
+             B.Op(wopF64ConvertI64S); B.Op(wopF64Add);
+           end;
+        7: Fraction(24.0);
+        8: Fraction(1440.0);
+      else Fraction(86400.0);
+      end;
+    B.Op(wopElse);
+  end;
+  LoadReg(B, Instr.Src3);
+  LoadReg(B, Instr.Src2); B.Op(wopF64ConvertI64S); B.Op(wopF64Add);
+  for k := 0 to 6 do B.EndOp;             // seven arms were emitted
+end;
+
+{ DATEDIFF. Src2 is the earlier serial and Src3 the later one.
+  ⚠️ The hour/minute/second differences ROUND, and FPC's Round is
+  half-to-EVEN - which is exactly what f64.nearest does, so the two agree
+  without a correction. Round-half-away would differ on every exact half. }
+procedure TWasmBackend.EmitDateDiffSwitch(B: TWasmBuf; Instr: TSSAInstruction);
+var
+  k: Integer;
+
+  procedure WholeDays(Which: TSSAValue);
+  begin
+    LoadReg(B, Which); B.Op(wopF64Trunc); B.TruncSat(wopfcI64TruncSatF64S);
+  end;
+
+  procedure Scaled(Per: Double);
+  begin
+    LoadReg(B, Instr.Src3);
+    LoadReg(B, Instr.Src2); B.Op(wopF64Sub);
+    B.F64Const(Per); B.Op(wopF64Mul);
+    B.Op(wopF64Nearest); B.TruncSat(wopfcI64TruncSatF64S);
+  end;
+
+  { The quarter index of a packed year*12 + month-1. }
+  procedure QuarterOf(Which: TSSAValue);
+  begin
+    LoadReg(B, Which); B.Call(FDtYMFunc); B.LocalTee(FRawTmp);
+    B.I64Const(12); B.Op(wopI64DivS); B.I64Const(4); B.Op(wopI64Mul);
+    B.LocalGet(FRawTmp); B.I64Const(12); B.Op(wopI64RemS);
+    B.I64Const(3); B.Op(wopI64DivS);
+    B.Op(wopI64Add);
+  end;
+
+begin
+  B.LocalSet(FArrTmp);
+  for k := 0 to 9 do
+  begin
+    if k in [3, 4, 5] then Continue;      // whole days: the default answers
+    B.LocalGet(FArrTmp); B.I32Const(k); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      case k of
+        0: begin                          // whole years
+             LoadReg(B, Instr.Src3); B.Call(FDtYMFunc);
+             B.I64Const(12); B.Op(wopI64DivS);
+             LoadReg(B, Instr.Src2); B.Call(FDtYMFunc);
+             B.I64Const(12); B.Op(wopI64DivS);
+             B.Op(wopI64Sub);
+           end;
+        1: begin QuarterOf(Instr.Src3); QuarterOf(Instr.Src2); B.Op(wopI64Sub); end;
+        2: begin                          // whole months: the packed difference IS it
+             LoadReg(B, Instr.Src3); B.Call(FDtYMFunc);
+             LoadReg(B, Instr.Src2); B.Call(FDtYMFunc);
+             B.Op(wopI64Sub);
+           end;
+        6: begin                          // whole weeks
+             WholeDays(Instr.Src3); WholeDays(Instr.Src2); B.Op(wopI64Sub);
+             B.I64Const(7); B.Op(wopI64DivS);
+           end;
+        7: Scaled(24.0);
+        8: Scaled(1440.0);
+      else Scaled(86400.0);
+      end;
+    B.Op(wopElse);
+  end;
+  WholeDays(Instr.Src3); WholeDays(Instr.Src2); B.Op(wopI64Sub);
+  for k := 0 to 6 do B.EndOp;
 end;
 
 procedure TWasmBackend.EmitValHelpers;
@@ -6904,6 +7446,109 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { ---- the calendar ---- }
+
+    { YEAR / MONTH / DAY / HOUR / MINUTE / SECOND / WEEKDAY, the immediate
+      choosing the field - the same immediate bcDateDecode reads. }
+    ssaDateDecode:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FDtSplitFunc);
+        case Instr.Src3.ConstInt of
+          0, 1, 2:                     // year, month, day
+            begin
+              B.I32Const(DT_DAYS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+              B.Call(FDtCivilFunc);
+              case Instr.Src3.ConstInt of
+                0: B.I32Const(DT_Y);
+                1: B.I32Const(DT_MO);
+              else B.I32Const(DT_D);
+              end;
+              B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+            end;
+          3, 4, 5:                     // hour, minute, second
+            begin
+              B.I32Const(DT_MS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+              case Instr.Src3.ConstInt of
+                3: begin B.I64Const(3600000); B.Op(wopI64DivS); end;
+                4: begin B.I64Const(60000); B.Op(wopI64DivS);
+                         B.I64Const(60); B.Op(wopI64RemS); end;
+              else     begin B.I64Const(1000); B.Op(wopI64DivS);
+                         B.I64Const(60); B.Op(wopI64RemS); end;
+              end;
+            end;
+          6:                           // WEEKDAY, 1 = Sunday .. 7 = Saturday
+            begin
+              { Serial 0 is a Saturday (measured), so serial + 6 is a Sunday-based
+                count - and the remainder needs the floor form, because a serial
+                before 1899 is negative and Pascal's mod is not. }
+              B.I32Const(DT_DAYS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+              B.I64Const(6); B.Op(wopI64Add);
+              B.I64Const(7); B.Op(wopI64RemS);
+              B.I64Const(7); B.Op(wopI64Add);
+              B.I64Const(7); B.Op(wopI64RemS);
+              B.I64Const(1); B.Op(wopI64Add);
+            end;
+        else
+          B.I64Const(0);
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { DATESERIAL(y, m, d), with the rollover the interpreter gets from IncMonth:
+      the year's 1st of January, then m-1 months, then d-1 days. ⚠️ NOT
+      dtDays(y, m, d) - that would reject month 13 instead of rolling it into
+      the next year, and DateSerial(2026, 13, 1) is measured as 2027-01-01. }
+    ssaDateSerial:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I64Const(1); B.I64Const(1);
+        B.Call(FDtDaysFunc);
+        B.Op(wopF64ConvertI64S);
+        LoadReg(B, Instr.Src2); B.I64Const(1); B.Op(wopI64Sub);
+        B.Call(FDtIncMoFunc);
+        LoadReg(B, Instr.Src3); B.I64Const(1); B.Op(wopI64Sub);
+        B.Op(wopF64ConvertI64S); B.Op(wopF64Add);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaTimeSerial:
+      begin
+        LoadReg(B, Instr.Src1); B.Op(wopF64ConvertI64S);
+        B.F64Const(3600.0); B.Op(wopF64Mul);
+        LoadReg(B, Instr.Src2); B.Op(wopF64ConvertI64S);
+        B.F64Const(60.0); B.Op(wopF64Mul); B.Op(wopF64Add);
+        LoadReg(B, Instr.Src3); B.Op(wopF64ConvertI64S); B.Op(wopF64Add);
+        B.F64Const(86400.0); B.Op(wopF64Div);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaDatePart:
+      begin
+        LoadReg(B, Instr.Src2);
+        B.Call(FDtSplitFunc);
+        LoadReg(B, Instr.Src1);
+        B.Call(FDtIvalFunc);
+        EmitDatePartSwitch(B);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaDateAdd:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FDtIvalFunc);
+        EmitDateAddSwitch(B, Instr);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaDateDiff:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FDtIvalFunc);
+        EmitDateDiffSwitch(B, Instr);
+        StoreReg(B, Instr.Dest);
+      end;
+
     { ---- WSTRING: the same operations counted in CODEPOINTS ---- }
     ssaStrLenW:
       begin
@@ -9826,6 +10471,19 @@ begin
     FGfxLineFunc := Next + 1;
     Inc(Next, 2);
   end;
+  { The calendar, last and conditional - EmitDateHelpers runs last too. }
+  if FUsesDate then
+  begin
+    FDtSplitFunc := Next;
+    FDtCivilFunc := Next + 1;
+    FDtDaysFunc  := Next + 2;
+    FDtIvalFunc  := Next + 3;
+    FDtIncMoFunc := Next + 4;
+    FDtDoyFunc   := Next + 5;
+    FDtWoyFunc   := Next + 6;
+    FDtYMFunc    := Next + 7;
+    Inc(Next, 8);
+  end;
 
   { The function table. ⭐ It holds EVERY region rather than only the
     address-taken ones, and the reason is a defect avoided rather than laziness:
@@ -9857,6 +10515,7 @@ begin
   if FUsesPtr then EmitRefHelpers;
   if FUsesFlt then EmitFloatHelpers;
   if FUsesGfxPrim then EmitGfxHelpers;
+  if FUsesDate then EmitDateHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do

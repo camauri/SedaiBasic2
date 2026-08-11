@@ -11117,8 +11117,35 @@ begin
         Ctx.FloatRegs[Instr.Dest] := dtVal;
       end;
     23: // bcTimeSerial - TIMESERIAL(h,m,s) -> serial fraction (Src1=h, Src2=m, Immediate=s reg)
+      { ⛔⛔ THE Double() CASTS ARE LOad-BEARING, and leaving them off cost this
+        function eight digits of precision in silence. FPC types an unsuffixed
+        real constant by BEST FIT, so 3600.0, 60.0 and 86400.0 are all SINGLE -
+        and an Int64 times a Single is a SINGLE multiplication, so the whole
+        expression was evaluated in 24 bits and only then widened into the Double
+        register. TimeSerial(0,0,1) answered exactly Single(1/86400) - measured
+        on the bits, 3EE845C8A0000000 against 3EE845C8A0CE5129 - where fbc gives
+        the Double. Found by porting this to WebAssembly, where the module was
+        RIGHT and sb was wrong.
+        ⚠️ The trap needs an INTEGER on the other side: Double * Single promotes
+        to Double, which is why the neighbouring DATEDIFF arms are unaffected. }
+      { ⛔ And it is written as FOUR STATEMENTS, not one expression, for a second
+        reason on top of the first: FPC carries an Int64-times-real intermediate
+        in EXTENDED and rounds once at the store, which is more accurate than
+        double arithmetic and therefore DIFFERENT - one ulp away from what fbc
+        answers. Landing each step in a Double variable rounds where fbc rounds.
+        Measured on the bits: 3FEFFFE7BA375F31 as one expression against
+        ...F32 both here and in fbc. }
+      { ⭐ THE NUMERATOR IS AN INTEGER, so it is computed as one - no real
+        arithmetic before the single division that ends it. That removes the
+        second trap as well as the first: FPC carries a real intermediate in
+        EXTENDED and rounds again at the store, and rounding twice lands one ulp
+        away from rounding once. With an Int64 numerator there is exactly one
+        rounding, which is what fbc does and what a WebAssembly module - which
+        has no extended precision to fall into - does by construction.
+        Measured on the bits: 3FEFFFE7BA375F32 on all three. }
       Ctx.FloatRegs[Instr.Dest] :=
-        (Ctx.IntRegs[Instr.Src1] * 3600.0 + Ctx.IntRegs[Instr.Src2] * 60.0 + Ctx.IntRegs[Instr.Immediate]) / 86400.0;
+        (Ctx.IntRegs[Instr.Src1] * 3600 + Ctx.IntRegs[Instr.Src2] * 60 +
+         Ctx.IntRegs[Instr.Immediate]) / Double(86400.0);
     24: // bcDateValue - DATEVALUE/TIMEVALUE(str) -> serial. Immediate 0=date part, 1=time part. 0 on failure.
       begin
         if ParseDateSerial(Ctx.StringRegs[Instr.Src1], dtVal) then
@@ -11144,9 +11171,12 @@ begin
           1: dtVal := IncMonth(dtVal, n * 3);     // q (quarter)
           2: dtVal := IncMonth(dtVal, n);         // m
           6: dtVal := dtVal + n * 7;              // ww (week)
-          7: dtVal := dtVal + n / 24.0;           // h
-          8: dtVal := dtVal + n / 1440.0;         // n (minute)
-          9: dtVal := dtVal + n / 86400.0;        // s
+          { ⛔ Double() for the reason spelled out at bcTimeSerial: n is an
+            INTEGER, so without the cast the division is done in SINGLE and only
+            then added to a Double. DateAdd("s", 30, x) was one ulp out. }
+          7: dtVal := dtVal + n / Double(24.0);           // h
+          8: dtVal := dtVal + n / Double(1440.0);         // n (minute)
+          9: dtVal := dtVal + n / Double(86400.0);        // s
         else
           dtVal := dtVal + n;                     // y / d / w (whole days)
         end;
