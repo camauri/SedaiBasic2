@@ -289,6 +289,7 @@ type
     FRawPtrRetFuncs: TStringList;        // FUNCTION returning a raw "<scalar> PTR": func name (UPPER) -> scalar pointee type
     FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
+    FMultiDimArrays: TStringList;        // array names (UPPER) ever given >1 dimension (rank is immutable in FB)
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
     // RESTORE targets: label name / line number (UPPER) -> the DATA-pool INDEX at which the items after
@@ -601,6 +602,8 @@ type
     function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
+    procedure ScanMultiDimArrays(Node: TASTNode);            // names ever given >1 dimension
+    function ArrayRank1Flag(ArrayIdx: Integer): TSSAValue;   // Src3 of ssaArrayUBound: array is 1-D
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
     function ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue; // ...on a FUNCTION result
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
@@ -1108,6 +1111,8 @@ begin
   FByrefRetRaw.CaseSensitive := False;
   FRawPtrRetFuncs := TStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
+  FMultiDimArrays := TStringList.Create;
+  FMultiDimArrays.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
   FVarWidthCode.CaseSensitive := False;
   FVarPrintKind := TStringList.Create;
@@ -1189,6 +1194,7 @@ begin
   FByrefRetValue.Free;
   FByrefRetRaw.Free;
   FRawPtrRetFuncs.Free;
+  FMultiDimArrays.Free;
   FVarWidthCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
@@ -4181,7 +4187,7 @@ begin
           if FuncName = 'LBOUND' then
             EmitInstruction(ssaArrayLBound, Result, ArrayRef, ArgReg, MakeSSAValue(svkNone))
           else
-            EmitInstruction(ssaArrayUBound, Result, ArrayRef, ArgReg, MakeSSAValue(svkNone));
+            EmitInstruction(ssaArrayUBound, Result, ArrayRef, ArgReg, ArrayRank1Flag(ArrayIdx));
         end
         else if (FuncName = 'INSTRREV') then
         begin
@@ -9900,7 +9906,7 @@ begin
     DimReg := EnsureIntRegister(MakeSSAConstInt(d));  // 0-based dimension index
     Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, ArrayRank1Flag(ArrayIdx));
     EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
     Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));   // ub - lb
@@ -19416,6 +19422,67 @@ begin
   if Idx >= 0 then Result := PtrInt(FVarPrintKind.Objects[Idx]);
 end;
 
+procedure TSSAGenerator.ScanMultiDimArrays(Node: TASTNode);
+// Record every array name that is ever given MORE THAN ONE dimension, anywhere in the program - by a
+// DIM or by a REDIM, in any order, inside any procedure.
+//
+// ⭐ It can be a single flat scan because in FreeBASIC an array's RANK IS IMMUTABLE, which was
+// measured rather than assumed: "Dim a(10) : ReDim a(2,3)" is refused outright (error 4, a fixed array
+// cannot be re-dimensioned) and "ReDim b(2,3) : ReDim b(5)" is error 36, "Wrong number of dimensions".
+// So a name that is multi-dimensional ANYWHERE is multi-dimensional EVERYWHERE, and no ordering
+// question arises.
+// ⛔ And the ordering question is the whole reason this is a pre-pass instead of a note taken at the
+// REDIM: the SSA is lowered in source order, so "Dim dyn()" followed later by "ReDim dyn(1 To 3, 4 To 9)"
+// left DimCount at 1 for every UBOUND already emitted - and for one emitted inside a SUB declared
+// earlier but CALLED afterwards, no amount of care at the REDIM site would have helped.
+var
+  i: Integer;
+  Dims: TASTNode;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    Dims := Node.GetChild(1);
+    if (Dims <> nil) and (Dims.NodeType = antDimensions) and (Dims.ChildCount > 1) then
+      if FMultiDimArrays.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0 then
+        FMultiDimArrays.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    ScanMultiDimArrays(Node.GetChild(i));
+end;
+
+function TSSAGenerator.ArrayRank1Flag(ArrayIdx: Integer): TSSAValue;
+// Src3 of ssaArrayUBound -> the bytecode Immediate (BC_ARRAY_RANK1_FLAG): 1 when this array is
+// provably ONE-DIMENSIONAL, absent otherwise.
+//
+// A compiled backend's array descriptor carries the element COUNT, not per-dimension extents, so the
+// only bound it can compute natively is LBound + Count - 1 — the true UBound of a vector, and nonsense
+// for a matrix: "Dim a(5 To 7, 100 To 104)" answered 19 instead of 7 under --jit.
+// ⭐ The predicate is the AOT's own (AotArrayNativeOK: "DimCount <> 1 then Exit"), which had already
+// found and fixed this on its side and left the warning that "the same will be true of the next ones".
+// It was: the JIT has no way to ask, working on bytecode rather than SSA, so the answer is computed
+// here — once — and travels in the operand. Re-deriving it in the second engine is exactly how two
+// backends start to disagree.
+// ⚠️ LBOUND needs no such flag: dimension 0's lower bound is what the descriptor holds, whatever the
+// rank, so its native lowering is right for a matrix too.
+begin
+  Result := MakeSSAValue(svkNone);
+  if (ArrayIdx < 0) or (ArrayIdx >= FProgram.GetArrayCount) then Exit;
+  // ⚠️ "> 1", not "<> 1": DimCount is ZERO for a one-dimensional array whose size is only known at
+  // run time, which is why every other reader of it says "if DimCount < 1 then DimCount := 1". Asking
+  // for exactly 1 silently refused the flag to EVERY array - the fix was correct and bought nothing,
+  // and only the disassembly said so (Imm=0 where 1 was expected). The multi-dim answer comes from the
+  // pre-pass below, which is the reliable half.
+  if FProgram.GetArray(ArrayIdx).DimCount > 1 then Exit;
+  // ⛔ DimCount alone is NOT the rank, and trusting it is what left the AOT wrong on this for as long
+  // as the JIT: a bare "Dim dyn()" registers ONE dimension and a later "ReDim dyn(1 To 3, 4 To 9)"
+  // never revisits it, so both engines answered 18 for UBound(dyn,1) where fbc says 3. The pre-pass
+  // is the second half of the question.
+  if FMultiDimArrays.IndexOf(UpperCase(FProgram.GetArray(ArrayIdx).Name)) >= 0 then Exit;
+  Result := MakeSSAConstInt(1);
+end;
+
 function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
 // On store to a narrow-typed scalar, narrow the value to the declared width. No-op for untracked vars.
 //
@@ -21464,7 +21531,7 @@ begin
     DimReg := EnsureIntRegister(MakeSSAConstInt(d));
     Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, ArrayRank1Flag(ArrayIdx));
     EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
     Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));
@@ -21565,7 +21632,7 @@ begin
     DimReg := EnsureIntRegister(MakeSSAConstInt(d));
     Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, ArrayRank1Flag(ArrayIdx));
     EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
     Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));
@@ -28229,6 +28296,7 @@ function TSSAGenerator.Generate(AST: TASTNode): TSSAProgram;
 var
   LastBlock: TSSABasicBlock;
   LastInstr: TSSAInstruction;
+  LastArr: Integer;
   DefCh: Char;
   {$IFDEF DEBUG_SSAPROF}
   ProfT0, ProfFreq: Int64;
@@ -28261,6 +28329,12 @@ begin
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
   FlattenNamespaces(AST);
+
+  // Which arrays are multi-dimensional, ANYWHERE in the program. Must precede lowering: the rank
+  // decides whether a compiled backend may compute UBound natively, and it is asked at the first
+  // UBOUND emitted - which can be lexically BEFORE the REDIM that establishes it.
+  FMultiDimArrays.Clear;
+  ScanMultiDimArrays(AST);
 
   // FreeBASIC STATIC locals: rewrite each proc-level STATIC into a hoisted, uniquely-named DIM SHARED
   // global (persistent across calls, initialised once). No-op without STATIC declarations.
@@ -28526,6 +28600,14 @@ begin
             ' ms over ', ProfExprN, ' top-level exprs');
   end;
   {$ENDIF}
+
+  // Publish the pre-pass's answer onto the arrays themselves, for the consumers that read the SSA
+  // AFTER generation rather than during it - the AOT's AotArrayNativeOK is the one that matters, and
+  // it had the same defect as the JIT for exactly the same reason: it trusted DimCount, which a bare
+  // "Dim dyn()" leaves at 1 however the REDIM later shapes the array.
+  for LastArr := 0 to FProgram.GetArrayCount - 1 do
+    if FMultiDimArrays.IndexOf(UpperCase(FProgram.GetArray(LastArr).Name)) >= 0 then
+      FProgram.SetArrayMultiDim(LastArr);
 
   Result := FProgram;
 end;

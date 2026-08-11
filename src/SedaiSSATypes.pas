@@ -615,6 +615,13 @@ type
     LowerBounds: array of Integer;      // FreeBASIC "lb TO ub": constant lower bound per dim (0 if none)
     LowerBoundRegisters: array of Integer; // SSA int reg holding a RUNTIME lower bound per dim (-1 = constant)
     ArrayIndex: Integer;                 // Index in VM array table
+    // The declared rank is NOT always DimCount: a bare "Dim dyn()" registers ONE dimension and the
+    // "ReDim dyn(1 To 3, 4 To 9)" that establishes the real rank never revisits it. This says the name
+    // is given more than one dimension SOMEWHERE in the program, which settles it - FreeBASIC refuses
+    // to change an array's rank once it has one (measured: error 4 / error 36), so anywhere is
+    // everywhere. A compiled backend must not compute UBound natively for such an array: its
+    // descriptor carries the total element COUNT, not per-dimension extents.
+    MultiDimEver: Boolean;
   end;
 
   TSSAProgram = class
@@ -654,6 +661,7 @@ type
     procedure SetArrayLowerBounds(ArrayIdx: Integer; const LowerBounds: array of Integer);
     procedure SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
     function FindArray(const ArrName: string): Integer;
+    procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
     procedure BuildDominatorTree;  // PHASE 3 TIER 2: Build dominator tree for optimizations
@@ -1302,6 +1310,11 @@ begin
   SetLength(FArrays[ArrayIdx].LowerBounds, Length(LowerBounds));
   for i := 0 to High(LowerBounds) do
     FArrays[ArrayIdx].LowerBounds[i] := LowerBounds[i];
+end;
+
+procedure TSSAProgram.SetArrayMultiDim(ArrayIdx: Integer);
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then FArrays[ArrayIdx].MultiDimEver := True;
 end;
 
 procedure TSSAProgram.SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);

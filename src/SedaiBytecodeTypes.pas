@@ -479,6 +479,16 @@ const
   // FreeBASIC array bound queries (B1.4). Dest=int result, Src1=array id, Src2=0-based dim index reg.
   bcArrayLBound     = bcGroupArray + 9;   // LBOUND(arr[, dim]) - lower bound of a dimension
   bcArrayUBound     = bcGroupArray + 10;  // UBOUND(arr[, dim]) - upper bound of a dimension
+  // On bcArrayUBound the Immediate is otherwise unused: bit 0 set means the SSA PROVED the array is
+  // ONE-DIMENSIONAL. It exists because the JIT/AOT array descriptor carries the element COUNT, not
+  // per-dimension extents, so a native lowering can only compute UBound = LBound + Count - 1 - true
+  // for a vector, nonsense for a matrix. The interpreter ignores the flag (it reads the real
+  // per-dimension extents); a compiled backend must DECLINE the native form without it.
+  // ⭐ The decision is computed ONCE, in the SSA, where the rank is known - the same predicate the AOT
+  // applies through AotArrayNativeOK. The JIT works on bytecode and cannot call that, so it reads the
+  // answer here instead of re-deriving it: two engines answering from two copies of one test is how
+  // they start to disagree.
+  BC_ARRAY_RANK1_FLAG = 1;
   // FreeBASIC array statements (B1.4). Src1 = array id.
   bcArrayErase      = bcGroupArray + 11;  // ERASE arr - reset elements to default (keep size)
   bcArrayRedim      = bcGroupArray + 12;  // REDIM [PRESERVE] arr(ub): Src2=ub reg, Immediate bit0=preserve

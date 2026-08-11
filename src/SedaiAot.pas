@@ -943,6 +943,13 @@ begin
   // never fire while every region holding a multi-dim array bailed for some other reason.
   // Widening the compiled set is what exposed it, and the same will be true of the next ones.
   if SSAProg.GetArray(Ins.Src1.ArrayIndex).DimCount <> 1 then Exit;
+  // ⛔ ...and DimCount alone was not enough, which this guard did not know until the JIT was measured
+  // on the same shape: a bare "Dim dyn()" registers ONE dimension, and the "ReDim dyn(1 To 3, 4 To 9)"
+  // that gives it its real rank never revisits it. So DimCount said 1, this gate said yes, and
+  // UBound(dyn,1) answered 18 under --aot where fbc says 3 - the very bug the comment above describes,
+  // surviving in the case the comment did not cover. MultiDimEver is settled by a pre-pass over the
+  // whole AST, which is sound because FreeBASIC will not let an array change rank (error 4 / error 36).
+  if SSAProg.GetArray(Ins.Src1.ArrayIndex).MultiDimEver then Exit;
   Result := True;
 end;
 

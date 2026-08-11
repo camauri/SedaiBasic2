@@ -612,9 +612,27 @@ var
   // LBOUND / UBOUND of a 1-D array (dim 0). Src1 = array id (constant), Src2 = the dim register. The
   // interpreter special-cases dim<0 (rank query) and reads per-dim bounds for dim>0; only dim==0 is handled
   // natively (LBOUND = descriptor LBound; UBOUND = LBound + Count - 1), anything else deopts to `apc`.
-  procedure ArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
+  //
+  // ⛔⛔ Rank1 is NOT optional on the UPPER bound, and the guard that was here checked the wrong thing:
+  // it tested WHICH DIMENSION was asked for and never HOW MANY the array has. `Count` in the descriptor
+  // is the TOTAL element count, so LBound + Count - 1 is the upper bound only of a VECTOR:
+  // "Dim a(5 To 7, 100 To 104) : UBound(a, 1)" answered 19 where every other engine — and fbc — says 7.
+  // Right in intent, wrong in SCOPE, which is the shape this codebase has now hit four times.
+  // ⭐ The AOT had already found it on its side (AotArrayNativeOK, "DimCount <> 1 then Exit") and left
+  // the note that widening the compiled set would expose the same thing again. It did — the moment the
+  // nondeterminism filter stopped dropping this feature's own guardian from jit_validate.
+  // The rank cannot be read at run time: the descriptor is 4 Int64 (IntData, FloatData, Count, LBound)
+  // and carries no rank. It arrives as BC_ARRAY_RANK1_FLAG in the Immediate, decided in the SSA.
+  // ⚠️ The LOWER bound needs none of this: dimension 0's lower bound is exactly what the descriptor
+  // holds, whatever the rank.
+  procedure ArrBound(apc, ArrayId: Integer; WantUpper, Rank1: Boolean);
   var p1: Integer;
   begin
+    if WantUpper and (not Rank1) then
+    begin
+      DeoptTo(apc);      // rank > 1, or not provable: only the interpreter knows the per-dim extents
+      Exit;
+    end;
     ILoad(RCX, I^.Src2);                          // rcx = dim
     E.EmitBytes([$48, $85, $C9]);                 // test rcx, rcx
     E.EmitBytes([$74, $00]); p1 := E.Len - 1;     // jz dim0  (dim == 0 -> native)
@@ -1815,8 +1833,9 @@ var
       // popcnt is the only one of the five that is not baseline x86-64. Without the feature the loop
       // bails, which is the JIT's contract: bit-identical or nothing.
       bcBitPopcnt: if not POPCNTSupport then Exit else BitIntrinsic;
-      bcArrayLBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, False);
-      bcArrayUBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, True);
+      bcArrayLBound: if InCallee or InGosub then Exit else ArrBound(apc, I^.Src1, False, True);
+      bcArrayUBound: if InCallee or InGosub then Exit
+                     else ArrBound(apc, I^.Src1, True, (I^.Immediate and BC_ARRAY_RANK1_FLAG) <> 0);
       bcNegFloat:
         begin
           // Flip the sign BIT, which is what unary minus on a double is - not "0 - x", which would
