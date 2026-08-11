@@ -1455,16 +1455,34 @@ The following PETSCII codes are silently ignored because they require full-scree
 > (managed + raw `Allocate`/`SADD`), WString/unicode (UTF-8, codepoint-aware) and FB-syntax file I/O
 > are implemented. This is a forward-looking gap map, not a claim of FreeBASIC compatibility.
 >
-> **Coverage (how much FreeBASIC runs here):** **566 / 645 (88%)**, plus 5 partial (~).
-> Of the 79 not-implemented, 69 are classified **N/A** (compiler-internal `__FB_*` defines, native
-> linkage/ABI directives, variadic C ABI, hardware ports, build directives) → **566 / 576 ≈ 98% of the
-> applicable keywords**.
+> **Coverage (how much FreeBASIC runs here):** of the 634 keywords in the FreeBASIC manual's index, 63
+> are **not applicable** (they describe the compiler itself, its command line, or a machine this is not)
+> and 4 are punctuation that only an example can speak for. Of the **567 that remain, 567 are
+> implemented — 100%**.
+>
+> ⚠️ **Implemented is not the same as verified, and the difference is the number worth quoting.** Each
+> keyword is also checked by running its own example from the FreeBASIC manual and comparing the output
+> with `fbc`:
+>
+> | | |
+> |---|---:|
+> | the example matches `fbc` | **306** |
+> | **no example has ever exercised it** | **197** |
+> | the example does **not** match (a defect, or a divergence this project declared) | **59** |
+> | the name is not recognised, but the example passes without touching it | 5 |
+>
+> So the honest reading is: the language surface is complete, a little over half of it is *proven*
+> against the oracle, and the rest is unproven rather than known-good. Closing that gap — writing the
+> missing examples, and triaging the 59 into defects and declared divergences — is the current work.
+> ⛔ Some of the 59 will stay: `MONTHNAME` answers in English where a localised `fbc` answers in the
+> host's language, and `FRE` reports this runtime's memory rather than fbc's. Those are choices, made
+> so that a program's output does not change with the machine it runs on.
 > Highlights: structured control flow, SUB/FUNCTION, full OOP `TYPE` (methods, EXTENDS, virtual
 > dispatch, CONSTRUCTOR/DESTRUCTOR, PROPERTY, OPERATOR), multithreading, value semantics/RAII,
 > compound & bitwise operators, string/conversion/array functions, namespaces, pointers (managed + raw
 > memory `Allocate`/`SizeOf`/`CAST`/`SADD`), WString/unicode, function-like macros, FB-syntax file I/O,
-> and the wide-string helpers (WCHR/WHEX/WBIN/WOCT/WSPACE). The FreeBASIC language surface is now
-> substantially complete; remaining gaps are mostly niche keywords and standard-library breadth.
+> and the wide-string helpers (WCHR/WHEX/WBIN/WOCT/WSPACE). The FreeBASIC language surface is complete by
+> name; what remains is proving it, keyword by keyword, against the oracle.
 
 ## Language Documentation
 
