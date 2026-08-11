@@ -1960,8 +1960,10 @@ var
           E.EmitBytes([$F2, $0F, $51, $C0]);             // sqrtsd xmm0, xmm0
           FStore(I^.Dest, XMM0);
         end;
-      // ⛔ Immediate = 1 is an UNSIGNED source, which cvtsi2sd gets wrong - and wrong here is a
-      // SILENT miscompile, not a slow loop. Bail: the interpreter's arm is the one that knows.
+      // ⛔ ANY non-zero flag bails, and the "<> 0" is doing more work than the original "= 1": Src3 is
+      // a set of BITS - bit 0 an UNSIGNED source, which cvtsi2sd gets wrong, bit 1 a result that must
+      // land in binary32 with ONE rounding, which this arm does not do either. Wrong here is a SILENT
+      // miscompile, not a slow loop. The interpreter's arm is the one that knows.
       bcIntToFloat:
         if I^.Immediate <> 0 then Exit
         else

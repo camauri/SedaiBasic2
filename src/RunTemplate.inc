@@ -684,11 +684,21 @@ begin
         // it is. One opcode, the signedness in the operand.
         bcIntToFloat:
           begin
-            case Instr.Immediate of
-              1: FloatRegs[Instr.Dest] := QWord(IntRegs[Instr.Src1]);       // unsigned -> double
-              2: FloatRegs[Instr.Dest] := Single(IntRegs[Instr.Src1]);      // straight to binary32
-            else FloatRegs[Instr.Dest] := IntRegs[Instr.Src1];
-            end;
+        // ⚠️ BITS, not a choice of three values: bit 0 = the source is UNSIGNED, bit 1 = the result goes
+        // straight to binary32 (ONE rounding). They are independent, and the combination is real:
+        // "Dim As Single s = u" on an unsigned u needs both, and used to take the binary32 arm alone -
+        // reading the magnitude as a signed number and answering -1 where fbc answers 1.844674e+019.
+        if (Instr.Immediate and 2) <> 0 then
+        begin
+          if (Instr.Immediate and 1) <> 0 then
+            FloatRegs[Instr.Dest] := Single(QWord(IntRegs[Instr.Src1]))
+          else
+            FloatRegs[Instr.Dest] := Single(IntRegs[Instr.Src1]);
+        end
+        else if (Instr.Immediate and 1) <> 0 then
+          FloatRegs[Instr.Dest] := QWord(IntRegs[Instr.Src1])
+        else
+          FloatRegs[Instr.Dest] := IntRegs[Instr.Src1];
             Inc(CurPC);
           end;
         // Implicit float -> int: MODERN rounds (to nearest, ties to even), CLASSIC truncates. See the

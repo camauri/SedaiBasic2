@@ -599,12 +599,16 @@ type
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
+    function Narrow32Code(Node: TASTNode): Integer;  // 9 or 10: which 32-bit wrap this expression takes
+    function Is32BitExpr(Node: TASTNode): Boolean;   // computes at 32 bits (INT32/UINT32)
+    function Declared32Code(Node: TASTNode): Integer; // declared width code of a named operand
     function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
-    procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
-    function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
+    procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode;
+                             ToSingle: Boolean = False);   // Src3 bits: 1=unsigned src, 2=to binary32
+    function ApplyNarrowCode(W: Integer; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow by an explicit width code
     procedure ScanMultiDimArrays(Node: TASTNode);            // names ever given >1 dimension
     function ArrayRank1Flag(ArrayIdx: Integer): TSSAValue;   // Src3 of ssaArrayUBound: array is 1-D
-    function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
+    function ApplyScalarNarrow(const VarName: string; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow on scalar store
     function ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue; // ...on a FUNCTION result
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
@@ -1482,7 +1486,7 @@ function PrintKindOfType(const TypeU: string): Integer;
 begin
   if TypeU = 'BOOLEAN' then Result := 1
   else if (TypeU = 'UINTEGER') or (TypeU = 'ULONGINT') then Result := 2
-  else if (TypeU = 'UBYTE') or (TypeU = 'USHORT') or (TypeU = 'ULONG') then Result := 3
+  else if (TypeU = 'UBYTE') or (TypeU = 'USHORT') or (TypeU = 'ULONG') or (TypeU = 'UINT32') then Result := 3
   else if TypeU = 'SINGLE' then Result := 4
   else Result := 0;
 end;
@@ -3521,6 +3525,20 @@ begin
           Left := ApplyNarrowCode(7, Left);
           Right := ApplyNarrowCode(7, Right);
         end;
+        // ⭐ The INTEGER twin of the rule above, and the whole content of INT32 / UINT32: an operation
+        // on 32-bit values takes 32-bit OPERANDS and produces a 32-bit RESULT. Carrying a wide
+        // intermediate and wrapping only at the store is what LONG does - true to FreeBASIC, and
+        // exactly what fixed-point code cannot use: "(a*b) Shr 16" needs the product wrapped BEFORE
+        // the shift. MEASURED on two ULongs holding 3e9 and 7: 320434 with a wide intermediate,
+        // 58290 with a wrapped one.
+        // ⛔ Note what this does NOT need: a new opcode, a width operand, or one line in any of the
+        // four engines. ssaNarrowInt already exists and every engine already implements it - the
+        // semantics IS the narrowing, so the executors are correct the moment this emits.
+        if (Result.Kind = svkRegister) and (Result.RegType = srtInt) and Is32BitExpr(Node) then
+        begin
+          Left := ApplyNarrowCode(Narrow32Code(Node), Left);
+          Right := ApplyNarrowCode(Narrow32Code(Node), Right);
+        end;
         // A float COMPARISON of two binary32 values is a binary32 comparison. It answers the same as
         // the 64-bit one - which is why nothing has to change in the interpreter, the AOT or the JIT,
         // and why they may ignore this flag - but a backend that has the instruction should use it.
@@ -3544,6 +3562,9 @@ begin
         // stops applying (job/tests/tools/f32_edge.pas). SQRT cannot even reach that range.
         if (Result.Kind = svkRegister) and (Result.RegType = srtFloat) and IsSingleExpr(Node) then
           Result := ApplyNarrowCode(7, Result);
+        // ...and the result, for the same reason the operands were.
+        if (Result.Kind = svkRegister) and (Result.RegType = srtInt) and Is32BitExpr(Node) then
+          Result := ApplyNarrowCode(Narrow32Code(Node), Result);
       end;
     end;
 
@@ -4644,6 +4665,18 @@ begin
             // String operand: parse as a number (VAL semantics), e.g. CDBL("3.14").
             Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
             EmitInstruction(ssaStrVal, Result, EnsureStringRegister(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
+          // ⛔ An INT operand converts through EmitIntToFloat, not EnsureFloatRegister: the latter has
+          // no expression node and so cannot know the source is UNSIGNED, and signed-by-omission is
+          // what made CDbl(u) answer -1 on a ULongInt holding its maximum.
+          else if (ArgValue.Kind = svkRegister) and (ArgValue.RegType = srtInt) then
+          begin
+            Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+               (ArgListNode.ChildCount >= 1) then
+              EmitIntToFloat(Result, ArgValue, ArgListNode.GetChild(0))
+            else
+              EmitIntToFloat(Result, ArgValue, ArgListNode);
           end
           else
             Result := EnsureFloatRegister(ArgValue);
@@ -6985,7 +7018,7 @@ begin
   // B1.5 phase 2: if VarName was DIM'd with a sub-64-bit integer type or SINGLE, wrap/round the
   // value to that width before storing (FreeBASIC narrows at the store). No-op for wide/untracked
   // vars. Emitting into a fresh register forces the store below to copy the narrowed value.
-  ExprValue := ApplyScalarNarrow(VarName, ExprValue);
+  ExprValue := ApplyScalarNarrow(VarName, ExprValue, ExprNode);
 
   // If expression result is a constant, load it directly to variable register
   if ExprValue.Kind in [svkConstInt, svkConstFloat, svkConstString] then
@@ -7030,8 +7063,12 @@ begin
     // Type conversion takes priority over same-type copy
     if (ExprValue.RegType = srtInt) and (VarReg.RegType = srtFloat) then
     begin
-      // Convert INT register to FLOAT
-      EmitInstruction(ssaIntToFloat, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // Convert INT register to FLOAT. ⛔ Through EmitIntToFloat, which reads the SOURCE's signedness
+      // off the expression node - a raw emission here was signed by omission, and that is what made
+      // "Dim As Double d = u" answer -1 on an unsigned u while "u / 2" (which goes through the
+      // expression path, and through this helper) answered correctly. The 10 Aug fix covered the
+      // operators and left every STORE behind.
+      EmitIntToFloat(VarReg, ExprValue, ExprNode);
     end
     else if (ExprValue.RegType = srtFloat) and (VarReg.RegType = srtInt) then
     begin
@@ -18500,8 +18537,8 @@ begin
     2: Result := Value and $FF;
     3: Result := Int64(SmallInt(Value and $FFFF));
     4: Result := Value and $FFFF;
-    5: Result := Int64(LongInt(Value and $FFFFFFFF));
-    6: Result := Value and $FFFFFFFF;
+    5, 9:  Result := Int64(LongInt(Value and $FFFFFFFF));   // 9 = INT32: same storage as LONG
+    6, 10: Result := Value and $FFFFFFFF;                    // 10 = UINT32: same storage as ULONG
   else
     Result := Value;
   end;
@@ -18541,6 +18578,15 @@ begin
   // 1.6499...), which is exactly the trap this feature was held back to avoid.
   else if (T = 'SINGLE') and FModernMode then Result := 7
   else if (T = 'UINTEGER') or (T = 'ULONGINT') then Result := 8
+  // ⭐ INT32 / UINT32 - a MODERN extension, and the ONLY thing that distinguishes them from LONG /
+  // ULONG is that their ARITHMETIC happens at 32 bits: the operands and the result of an operation
+  // are wrapped, not just the value on its way into a variable. Storage, printing and byte width are
+  // identical to LONG/ULONG, which is why 9 and 10 behave exactly as 5 and 6 everywhere except in
+  // Is32BitExpr - the one place that asks "does this COMPUTE at 32 bits?".
+  // ⛔ They are separate types rather than a change to LONG/ULONG on purpose: LONG already has a
+  // declared semantics and programs that rely on it. Nothing existing moves.
+  else if (T = 'INT32') and FModernMode then Result := 9
+  else if (T = 'UINT32') and FModernMode then Result := 10
   else Result := 0;
 end;
 
@@ -18647,6 +18693,9 @@ begin
       end;
     end;
   end;
+  // INT32 / UINT32 are 32 bits wide like LONG / ULONG: for a question about WIDTH they are the same.
+  if Result = 9 then Result := 5
+  else if Result = 10 then Result := 6;
   // SINGLE (code 7) is not an integer width -- CSIGN/CUNSG do not apply to it.
   if (Result < 1) or (Result > 6) then Result := 0;
 end;
@@ -18737,7 +18786,7 @@ begin
   case W of
     1, 2: Result := 1;
     3, 4: Result := 2;
-    5, 6, 7: Result := 4;
+    5, 6, 7, 9, 10: Result := 4;
   else   Result := 8;
   end;
 end;
@@ -18956,6 +19005,7 @@ begin
       1, 2: Exit(1);       // Byte / UByte
       3, 4: Exit(2);       // Short / UShort
       5, 6: Exit(4);       // Long / ULong
+      9, 10: Exit(4);      // Int32 / UInt32 - same storage, different arithmetic
       7:    Exit(4);       // Single
       8:    Exit(8);       // UInteger / ULongInt - a full slot, as the fallthrough below also says
     end;
@@ -19082,6 +19132,121 @@ begin
     FVarPrintKind.AddObject(Nm, TObject(PtrInt(PK)));
   if (PK = 2) and (FUnsigned64Arrays.IndexOf(Nm) < 0) then
     FUnsigned64Arrays.Add(Nm);
+end;
+
+function TSSAGenerator.Narrow32Code(Node: TASTNode): Integer;
+// 9 (INT32) or 10 (UINT32) for a 32-bit expression: the SIGNEDNESS decides how the wrap reads back, and
+// it is contagious the way FreeBASIC makes unsignedness contagious - if either side is UINT32 the
+// operation is unsigned. ApplyNarrowCode maps both onto the wire codes 5 / 6.
+begin
+  Result := 9;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Declared32Code(Node) = 10 then Exit(10);
+  if (Node.ChildCount >= 2) and
+     ((Narrow32Code(Node.GetChild(0)) = 10) or (Narrow32Code(Node.GetChild(1)) = 10)) then
+    Result := 10
+  else if (Node.ChildCount = 1) and (Narrow32Code(Node.GetChild(0)) = 10) then
+    Result := 10;
+end;
+
+function TSSAGenerator.Is32BitExpr(Node: TASTNode): Boolean;
+// True when this expression's value is an INT32 / UINT32, so the operation producing it computes at
+// 32 bits: its operands enter wrapped and its result comes out wrapped.
+//
+// ⭐ This is the integer twin of IsSingleExpr, and deliberately the same SHAPE: the widening rule
+// decides it. An operation is 32-bit when ONE side is 32-bit and NEITHER side is wider - a 64-bit
+// integer or a float promotes the pair, exactly as a Double promotes a Single. An integer LITERAL is
+// neutral: "a * 3" on an Int32 stays Int32, which is the whole point of having the type.
+//
+// ⛔ What it does NOT cover, on purpose: LONG and ULONG. They are 32 bits WIDE and compute at 64,
+// which is FreeBASIC's rule and what every existing program relies on - "Print a + b" on two Longs
+// holding 2e9 gives 4000000000, measured on both sides. INT32 is the type that says "wrap the
+// intermediates too", and it is a MODERN extension precisely because no dialect we mirror has it.
+var
+  W: Integer;
+
+  // Wider than 32 bits, and therefore able to promote the pair. A literal is NOT wider: it has no
+  // declared type of its own and takes the one the expression gives it.
+  function IsWider(N: TASTNode): Boolean;
+  var WN: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+    if N.NodeType = antLiteral then Exit;                 // neutral: takes the expression's type
+    // ⛔ The DECLARED code is asked FIRST, and InferExprBank only as a fallback. It has to be that
+    // way round: InferExprBank answers srtFloat for a UDT field declared UINT32 - it resolves the
+    // field by NAME and lands on BASIC's default type for a suffix-less name - so asking it first
+    // made every field operand look like a float, i.e. "wider", and "(p.b * 7) Shr 16" quietly kept
+    // the wide intermediate. The probe said width=10 and bank=1 on the same node, which is what
+    // pointed at the right one to trust.
+    WN := Declared32Code(N);
+    if (WN >= 1) and (WN <= 6) then Exit;                 // a declared narrow integer is not wider
+    if (WN = 9) or (WN = 10) then Exit;                   // 32-bit: not wider
+    if WN = 7 then Exit(True);                            // SINGLE is a float, and promotes
+    if InferExprBank(N) = srtFloat then Exit(True);       // a float promotes, as a Double does
+    if Is32BitExpr(N) then Exit;                          // a 32-bit sub-expression is not wider
+    Result := True;                                       // 64-bit by declaration or by default
+  end;
+
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  W := Declared32Code(Node);
+  if (W = 9) or (W = 10) then Exit(True);
+  // A binary operation inherits it, unless something wider promotes the pair.
+  // A binary operation inherits it, unless something wider promotes the pair.
+  if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
+  begin
+    if IsWider(Node.GetChild(0)) or IsWider(Node.GetChild(1)) then Exit(False);
+    Result := Is32BitExpr(Node.GetChild(0)) or Is32BitExpr(Node.GetChild(1));
+  end
+  else if (Node.NodeType = antUnaryOp) and (Node.ChildCount >= 1) then
+    Result := Is32BitExpr(Node.GetChild(0));
+end;
+
+function TSSAGenerator.Declared32Code(Node: TASTNode): Integer;
+// The DECLARED width code of a named operand (variable, array element, UDT field, function result,
+// explicit cast). 0 when the operand has no declared narrow type - which is the 64-bit default.
+var
+  idx: Integer;
+  MNode: TASTNode;
+begin
+  Result := 0;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  case Node.NodeType of
+    antIdentifier, antFunctionCall:
+    begin
+      if FInProcedure and (FCurrentProcName <> '') then
+      begin
+        idx := FVarWidthCode.IndexOf(FCurrentProcName + '|' + UpperCase(VarToStr(Node.Value)));
+        if idx >= 0 then Exit(PtrInt(FVarWidthCode.Objects[idx]));
+      end;
+      idx := FVarWidthCode.IndexOf(UpperCase(VarToStr(Node.Value)));
+      if idx >= 0 then Result := PtrInt(FVarWidthCode.Objects[idx]);
+    end;
+    antArrayAccess:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        idx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+        if idx >= 0 then Result := PtrInt(FArrayElemWidth.Objects[idx]);
+      end
+      else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
+      begin
+        MNode := Node.GetChild(0);
+        Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
+      end;
+    antMemberAccess:
+      if Node.ChildCount >= 1 then
+      begin
+        Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
+      end;
+    antCast:
+      Result := TypeNameWidthCode(UpperCase(VarToStr(Node.Value)));
+  end;
 end;
 
 function TSSAGenerator.IsSingleExpr(Node: TASTNode): Boolean;
@@ -19483,7 +19648,7 @@ begin
   Result := MakeSSAConstInt(1);
 end;
 
-function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
+function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue; SrcNode: TASTNode): TSSAValue;
 // On store to a narrow-typed scalar, narrow the value to the declared width. No-op for untracked vars.
 //
 // A procedure-scoped entry ("PROC|NAME") wins over the bare-name one, the same precedence PrintKindOf
@@ -19501,7 +19666,7 @@ begin
     Idx := FVarWidthCode.IndexOf(FCurrentProcName + '|' + UpperCase(VarName));
   if Idx < 0 then Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
   if Idx < 0 then Exit(Value);
-  Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value);
+  Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value, SrcNode);
 end;
 
 function TSSAGenerator.ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
@@ -19528,20 +19693,37 @@ end;
 // and reading it as signed gives -21 instead. The flag rides in Src3, which the bytecode compiler maps
 // to the Immediate, so this stays ONE opcode with the signedness in an operand rather than two opcodes
 // a build can cover one of and forget the other.
-procedure TSSAGenerator.EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
-var Flag: TSSAValue;
+procedure TSSAGenerator.EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode;
+                                       ToSingle: Boolean);
+// ⚠️ Src3 is a set of BITS, not a choice of three values: bit 0 = the source is UNSIGNED, bit 1 = the
+// result goes straight to binary32 (one rounding). It used to be a `case` over 1 and 2, which made the
+// combination inexpressible - and that was not academic: "Dim As Single s = u" on an unsigned u took
+// the to-binary32 arm, which read the bits as SIGNED, and answered -1 where fbc answers 1.844674e+019.
+var
+  Flag: Int64;
 begin
-  if (SrcNode <> nil) and IsUnsigned64Expr(SrcNode) then Flag := MakeSSAConstInt(1)
-  else Flag := MakeSSAValue(svkNone);
-  EmitInstruction(ssaIntToFloat, Dest, Src, MakeSSAValue(svkNone), Flag);
+  Flag := 0;
+  if (SrcNode <> nil) and IsUnsigned64Expr(SrcNode) then Flag := Flag or 1;
+  if ToSingle then Flag := Flag or 2;
+  if Flag = 0 then
+    EmitInstruction(ssaIntToFloat, Dest, Src, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaIntToFloat, Dest, Src, MakeSSAValue(svkNone), MakeSSAConstInt(Flag));
 end;
 
-function TSSAGenerator.ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;
+function TSSAGenerator.ApplyNarrowCode(W: Integer; Value: TSSAValue; SrcNode: TASTNode): TSSAValue;
 // Wrap/sign-extend (int widths 1..6) or round to single (7) a value before a store to a narrow-typed
 // destination. Folds constants; otherwise emits bcNarrowInt / bcNarrowSingle. W=0 -> no-op.
 var
   NarrowReg, IntTmp: TSSAValue;
 begin
+  // ⛔ INT32 / UINT32 (9 / 10) are COMPILE-TIME facts about the type: on the wire they ARE 5 and 6.
+  // Translated here, at the single door every narrowing goes through, so no backend ever meets a code
+  // it has no arm for - NarrowInt64's `case` ends in "else Result := Value", which would have meant
+  // NOT NARROWING AT ALL, in silence. The same judgement as width code 8 and for the same reason.
+  if W = 9 then W := 5
+  else if W = 10 then W := 6;
+
   Result := Value;
   if W = 7 then
   begin
@@ -19566,9 +19748,12 @@ begin
     begin
       // int register -> binary32, in ONE step. Going through a double and narrowing rounds twice,
       // and beyond 2^53 the two answers differ; WASM has f32.convert_i64_s for exactly this, and it
-      // is what the flag in Src3 selects (2 = straight to binary32).
+      // is what bit 1 of the flag in Src3 selects.
+      // ⛔ And bit 0 has to travel with it: an UNSIGNED source read as signed answered -1 for
+      // "Dim As Single s = u" where fbc answers 1.844674e+019. The two facts are independent, which
+      // is why the flag is a set of bits and not a choice of three values.
       Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-      EmitInstruction(ssaIntToFloat, Result, Value, MakeSSAValue(svkNone), MakeSSAConstInt(2));
+      EmitIntToFloat(Result, Value, SrcNode, True);
     end;
   end
   else if (W >= 1) and (W <= 6) then
@@ -19640,7 +19825,8 @@ begin
   if T = kCVALIST then Exit(srtInt);
   if (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
      (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
-     (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') then
+     (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+     (T = 'INT32') or (T = 'UINT32') then
     Result := srtInt
   else if (T = 'SINGLE') or (T = 'DOUBLE') then
     Result := srtFloat
@@ -20289,7 +20475,9 @@ begin
     if FUDTs[UDTIdx].Fields[i].Bank <> srtString then
     begin
       WireW := FUDTs[UDTIdx].Fields[i].WidthCode;
-      if WireW = 8 then WireW := 0;
+      if WireW = 8 then WireW := 0
+      else if WireW = 9 then WireW := 5
+      else if WireW = 10 then WireW := 6;
       FUDTs[UDTIdx].Fields[i].Slot :=
         (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (WireW and $F);
     end;

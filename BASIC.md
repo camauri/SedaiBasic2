@@ -2311,6 +2311,50 @@ Function BitWidth(ByVal n As LongInt) As LongInt
 End Function
 ```
 
+### 32-bit integer arithmetic: `INT32` and `UINT32`
+
+**MODERN only**, and a declared extension: no dialect we mirror has these types.
+
+`LONG` and `ULONG` are 32 bits **wide** and compute at 64: an operation on them produces a full 64-bit
+result, and the value is only wrapped on its way into a variable. That is FreeBASIC's rule and nothing
+about it changes. `INT32` and `UINT32` are 32 bits wide **and compute at 32 bits**: the operands enter
+an operation wrapped and the result comes out wrapped, so an intermediate never carries more than 32
+bits into the next operation.
+
+| Keyword | Status | Description |
+|---|---|---|
+| `INT32` | ✓ | 32-bit signed integer. Storage and printing as `LONG`; arithmetic wraps to 32 bits at every step. |
+| `UINT32` | ✓ | 32-bit unsigned integer. Storage and printing as `ULONG`; arithmetic wraps to 32 bits at every step. |
+
+For `+`, `-`, `*` and the bitwise operators the two families agree, because those operations are
+congruent modulo 2^32 — wrapping once at the end is the same as wrapping at every step. They differ
+exactly where the operation is **not** congruent: a shift, a division, a `MOD`, a comparison.
+
+```basic
+Dim As ULong  la = 3000000000, lb = 7
+Dim As UInt32 a  = 3000000000, b  = 7
+Print (la * lb) Shr 16      ' 320434 — the product kept all 64 bits, then shifted
+Print (a  * b)  Shr 16      '  58290 — the product wrapped to 32 bits first
+```
+
+Two rules follow the language's existing ones rather than inventing new ones:
+
+- **Something wider promotes the pair.** Mixing with a 64-bit integer or a floating-point value gives
+  the wider type, exactly as mixing a `SINGLE` with a `DOUBLE` gives a `DOUBLE`. An integer **literal**
+  is neutral and takes the type of the expression, so `x * 3` on an `INT32` stays 32-bit.
+- **Unsignedness is contagious.** An operation with a `UINT32` on either side wraps unsigned.
+
+```basic
+' What the type is for: an algorithm that needs 32-bit truncation partway through.
+Function Fnv1a(ByVal s As String) As UInt32
+  Dim As UInt32 h = 2166136261
+  For i As Integer = 1 To Len(s)
+    h = (h Xor Asc(Mid(s, i, 1))) * 16777619
+  Next i
+  Return h
+End Function
+```
+
 ### Console Functions
 
 #### Configuring the Console

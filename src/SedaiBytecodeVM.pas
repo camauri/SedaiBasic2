@@ -6939,11 +6939,23 @@ begin
     // correcting only the other left --aot answering -21 while the interpreter answered the right
     // number, with the AOT's refusal working perfectly all along.
     bcIntToFloat:
-      case Instr.Immediate of
-        1: Ctx.FloatRegs[Instr.Dest] := QWord(Ctx.IntRegs[Instr.Src1]);     // unsigned -> double
-        2: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.IntRegs[Instr.Src1]);    // ONE rounding, to binary32
-      else Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
-      end;
+    begin
+      // ⚠️ BITS, not a choice of three values: bit 0 = the source is UNSIGNED, bit 1 = the result goes
+      // straight to binary32 (ONE rounding). They are independent, and the combination is real:
+      // "Dim As Single s = u" on an unsigned u needs both, and used to take the binary32 arm alone -
+      // reading the magnitude as a signed number and answering -1 where fbc answers 1.844674e+019.
+      if (Instr.Immediate and 2) <> 0 then
+      begin
+        if (Instr.Immediate and 1) <> 0 then
+          Ctx.FloatRegs[Instr.Dest] := Single(QWord(Ctx.IntRegs[Instr.Src1]))
+        else
+          Ctx.FloatRegs[Instr.Dest] := Single(Ctx.IntRegs[Instr.Src1]);
+      end
+      else if (Instr.Immediate and 1) <> 0 then
+        Ctx.FloatRegs[Instr.Dest] := QWord(Ctx.IntRegs[Instr.Src1])
+      else
+        Ctx.FloatRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+    end;
     // The IMPLICIT float -> int conversion: FreeBASIC ROUNDS (to nearest, ties to even), it does not
     // truncate. It rounds everywhere the conversion is implicit -- assignment, argument passing, an array
     // store, an array INDEX, a FOR bound, a FUNCTION result -- so "Dim As Integer i : i = 1.5" is 2, and
