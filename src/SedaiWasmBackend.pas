@@ -221,7 +221,7 @@ type
     FAllocFunc, FStrNewFunc, FStrCatFunc, FStrSubFunc, FStrCmpFunc,
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
     FPrintStrFunc, FStrFromIntFunc: LongWord;
-    FStrFillFunc, FStrCaseFunc, FStrInstrFunc: LongWord;
+    FStrFillFunc, FStrCaseFunc, FStrInstrFunc, FStrTrimFunc: LongWord;
     FPuDigFunc, FPuFmtFunc: LongWord;   // PRINT USING: digits, then the field
     { VAL. ⛔ TWO flags, not one: VALINT needs only the integer scanner, while
       VAL needs the decimal-to-double conversion - and that one leans on fltMul,
@@ -334,6 +334,10 @@ type
       them. They are the host's, and the host's are not FPC's - one ulp apart on
       some arguments, measured. }
     FTrigFunc: array[0..11] of LongWord;
+    FXTrigFunc: array[0..3] of LongWord;   // tanh/asinh/acosh/atanh, imported only if used
+    FAtan2Func: LongWord;                  // atan2: TWO arguments, so its own import
+    FUsesAtan2: Boolean;
+    FUsesXTrig: array[0..3] of Boolean;
     procedure ScanForPrint;
     function WriteTarget: LongWord;
     function ConstAddrOf(const V: TSSAValue): LongWord;
@@ -407,6 +411,11 @@ const
   TRIG_NAME: array[0..11] of AnsiString =
     ('sin', 'cos', 'tan', 'atn', 'exp', 'log', 'log10', 'log2',
      'asin', 'acos', 'sinh', 'cosh');
+  { ⛔ The twelve above are imported TOGETHER the moment a program uses any of them, so adding a name
+    to that array would make every existing module ask its host for a function it never asked for
+    before - including the PUBLISHED demo page, whose imports are fixed. These are imported one at a
+    time, only when used, which is why they are a separate table. }
+  XTRIG_NAME: array[0..3] of AnsiString = ('tanh', 'asinh', 'acosh', 'atanh');
 
 implementation
 
@@ -588,6 +597,8 @@ begin
   FUsesGfxPrim := False;
   FUsesClock := False;
   FUsesTrig := False;
+  for i := 0 to High(FUsesXTrig) do FUsesXTrig[i] := False;
+  FUsesAtan2 := False;
   FUsesPow := False;
   FUsesGfx := False;
   FUsesStr := False;
@@ -635,6 +646,7 @@ begin
         ssaLoadConstString, ssaStrConcat, ssaStrLen, ssaStrLeft, ssaStrRight,
         ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrChr, ssaIntToString,
         ssaStrSpace, ssaStrString, ssaStrUCase, ssaStrLCase, ssaStrInstr,
+        ssaStrLTrim, ssaStrRTrim, ssaStrTrim,
         ssaCommand,
         ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
         ssaStrMidAssign:
@@ -679,6 +691,11 @@ begin
         ssaMathLog, ssaMathLog10, ssaMathLog2, ssaMathAsin, ssaMathAcos,
         ssaMathSinh, ssaMathCosh:
           FUsesTrig := True;
+        ssaMathAtan2: FUsesAtan2 := True;
+        ssaMathTanh:  FUsesXTrig[0] := True;
+        ssaMathAsinh: FUsesXTrig[1] := True;
+        ssaMathAcosh: FUsesXTrig[2] := True;
+        ssaMathAtanh: FUsesXTrig[3] := True;
         ssaRecordNew:
           FUsesRec := True;
         { An ARRAY of UDT is an int-handle array whose elements are filled with
@@ -1624,6 +1641,66 @@ begin
     B.EndOp;
     B.LocalGet(3);
     FModule.AddFunction(TCase, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { strTrim(s, mode) -> a new string with the padding removed. mode bit 0 trims the LEFT, bit 1 the
+    RIGHT, so one helper serves LTRIM, RTRIM and TRIM - the same arrangement UCASE and LCASE share.
+    ⚠️ It removes every byte <= 32, not just the space, because that is what FPC's Trim/TrimLeft/
+    TrimRight do and the interpreter calls those. Trimming only #32 would make the module disagree
+    with sb on a string holding a tab or a newline, which is exactly the kind of quiet difference this
+    backend exists to avoid. }
+  B := TWasmBuf.Create;
+  try
+    // locals: 2 = len, 3 = first, 4 = last (exclusive), 5 = base, 6 = handle, 7 = dst
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(2);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(5);
+    B.I32Const(0); B.LocalSet(3);
+    B.LocalGet(2); B.LocalSet(4);
+    // left: advance while the byte is padding and there is any left
+    B.LocalGet(1); B.I32Const(1); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(3); B.LocalGet(4); B.Op(wopI32GeU); B.BrIf(1);
+          B.LocalGet(5); B.LocalGet(3); B.Op(wopI32Add);
+          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32GtU); B.BrIf(1);
+          B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(3);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+    // right: retreat while the byte before the end is padding
+    B.LocalGet(1); B.I32Const(2); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(4); B.LocalGet(3); B.Op(wopI32LeU); B.BrIf(1);
+          B.LocalGet(5); B.LocalGet(4); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Sub);
+          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32GtU); B.BrIf(1);
+          B.LocalGet(4); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(4);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+    // copy what is left
+    B.LocalGet(4); B.LocalGet(3); B.Op(wopI32Sub); B.LocalTee(2);
+    B.Call(FStrNewFunc); B.LocalTee(6);
+    B.I32Const(4); B.Op(wopI32Add); B.LocalSet(7);
+    B.LocalGet(5); B.LocalGet(3); B.Op(wopI32Add); B.LocalSet(5);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(2); B.Op(wopI32Eqz); B.BrIf(1);
+        B.LocalGet(7); B.LocalGet(5); B.OpMem(wopI32Load8U, 0, 0); B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(7); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(7);
+        B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(5);
+        B.LocalGet(2); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(2);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(6);
+    FModule.AddFunction(TCase, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
   finally
     B.Free;
   end;
@@ -5344,6 +5421,31 @@ begin
   StoreReg(B, Instr.Dest);
 end;
 
+function PlatformRefusal(Op: TSSAOpCode): string;
+{ Why WebAssembly will NEVER have this, as opposed to why we have not written it yet. The distinction
+  is the whole point: a module runs in a sandbox that deliberately has no filesystem, no environment
+  and no clock to set, and no threads without shared memory. Those are not gaps in this backend - they
+  are the platform, and saying "not covered YET" about them promises something that will not come.
+  ⛔ Nothing here is ever to be EMULATED. A virtual filesystem would be a different language that
+  happens to compile, which is exactly what the goal of this backend excludes. }
+begin
+  case Op of
+    ssaOpenFunc, ssaFileQuery, ssaFileExists, ssaFileLen, ssaFileDateTime,
+    ssaChdir, ssaMkdir, ssaRmdir, ssaScratch, ssaCopyFile, ssaRenameFile, ssaCurDir:
+      Result := 'WebAssembly has no filesystem: a module cannot open, inspect or change files';
+    ssaEnviron, ssaExePath, ssaShell:
+      Result := 'WebAssembly has no operating system underneath: no environment, no path, no shell';
+    ssaSetClock:
+      Result := 'a WebAssembly module cannot set the host clock';
+    ssaThreadCreate, ssaThreadWait, ssaThreadDetach, ssaThreadSelf,
+    ssaMutexCreate, ssaMutexLock, ssaMutexUnlock, ssaMutexDestroy,
+    ssaCondCreate, ssaCondWait, ssaCondSignal, ssaCondBroadcast, ssaCondDestroy:
+      Result := 'WebAssembly has no threads without shared memory, which this module does not use';
+  else
+    Result := '';
+  end;
+end;
+
 function TWasmBackend.RegionNeedsF32Tmp(R: Integer): Boolean;
 { Does any block in this region hold the shape the trunc_f32 fusion consumes - a narrowing to binary32
   immediately converted to an integer? Asked BEFORE the locals are laid out, because a scratch local
@@ -5968,6 +6070,19 @@ begin
         LoadReg(B, Instr.Src1);
         LoadReg(B, Instr.Src2);      // the CODE, masked to a byte by the helper
         B.Call(FStrFillFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { LTRIM / RTRIM / TRIM: one helper, the sides in a flag - as UCASE and LCASE share theirs. }
+    ssaStrLTrim, ssaStrRTrim, ssaStrTrim:
+      begin
+        LoadReg(B, Instr.Src1);
+        case Instr.OpCode of
+          ssaStrLTrim: B.I32Const(1);
+          ssaStrRTrim: B.I32Const(2);
+        else           B.I32Const(3);
+        end;
+        B.Call(FStrTrimFunc);
         StoreReg(B, Instr.Dest);
       end;
 
@@ -7718,6 +7833,75 @@ begin
       last bit. Where the value only reaches the output that is invisible; where
       it feeds back into a program's own geometry - a raycaster's camera angle -
       it spreads over the whole frame. Declared, not hidden. }
+    { The hyperbolics the host also provides. Separate from the twelve below only in HOW they are
+      imported - one at a time, when used - never in what they mean. }
+    { ATAN2 takes two arguments, which is why it cannot ride the unary import table. }
+    ssaMathAtan2:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FAtan2Func);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaMathTanh, ssaMathAsinh, ssaMathAcosh, ssaMathAtanh:
+      begin
+        LoadReg(B, Instr.Src1);
+        case Instr.OpCode of
+          ssaMathTanh:  B.Call(FXTrigFunc[0]);
+          ssaMathAsinh: B.Call(FXTrigFunc[1]);
+          ssaMathAcosh: B.Call(FXTrigFunc[2]);
+        else            B.Call(FXTrigFunc[3]);
+        end;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { SGN is three comparisons and no call: 1 above zero, -1 below, 0 otherwise - which is also what
+      the interpreter answers for a NaN (neither comparison holds) and for a negative zero. }
+    ssaMathSgn:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.LocalTee(FFltTmp);
+        B.F64Const(0.0);
+        B.Op(wopF64Gt);
+        B.BlockStart(wopIf, WASM_TYPE_F64);
+          B.F64Const(1.0);
+        B.Op(wopElse);
+          B.LocalGet(FFltTmp);
+          B.F64Const(0.0);
+          B.Op(wopF64Lt);
+          B.BlockStart(wopIf, WASM_TYPE_F64);
+            B.F64Const(-1.0);
+          B.Op(wopElse);
+            B.F64Const(0.0);
+          B.EndOp;
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { FRAC is x - Int(x), and the sign of a zero result is NOT simply x's - MEASURED against the
+      interpreter, which is the oracle here:
+          Frac(-0.0) = -0      but      Frac(-5.0) = +0
+      ⭐ One rule produces both, and it is the one the memory of this project had already written down
+      without anyone being able to spend a register on it: System.Int returns PLUS zero for -0.0. So
+      Frac(-0.0) is -0.0 - (+0.0) = -0.0, while Frac(-5.0) is -5.0 - (-5.0) = +0.0.
+      ⛔ f64.trunc does NOT do that - IEEE keeps the sign, so trunc(-0.0) is -0.0 - which is why the
+      truncation is nudged with "+ 0.0": that turns a negative zero into a positive one and leaves
+      every other value exactly as it was.
+      ⚠️ An earlier version used copysign to give the result x's sign in every case. It is the obvious
+      rule, it is wrong, and only Frac(-5.0) shows it. }
+    ssaMathFrac:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.LocalTee(FFltTmp);
+        B.LocalGet(FFltTmp);
+        B.Op(wopF64Trunc);
+        B.F64Const(0.0);
+        B.Op(wopF64Add);          // Int(x): the truncation, with a negative zero made positive
+        B.Op(wopF64Sub);          // x - Int(x)
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
     ssaMathLog, ssaMathLog10, ssaMathLog2, ssaMathAsin, ssaMathAcos,
     ssaMathSinh, ssaMathCosh:
@@ -7824,8 +8008,14 @@ begin
         StoreReg(B, Instr.Dest);
       end;
   else
-    Exit(Fail(Format('%s is not covered by the WASM backend yet (line %d)',
-                     [OpName(Instr.OpCode), Instr.SourceLine])));
+    // ⛔ Two different refusals, and they must not read the same. "yet" is a promise, and it is the
+    // wrong one for something the platform does not have.
+    if PlatformRefusal(Instr.OpCode) <> '' then
+      Exit(Fail(Format('%s cannot be compiled to WebAssembly (line %d): %s',
+                       [OpName(Instr.OpCode), Instr.SourceLine, PlatformRefusal(Instr.OpCode)])))
+    else
+      Exit(Fail(Format('%s is not covered by the WASM backend yet (line %d)',
+                       [OpName(Instr.OpCode), Instr.SourceLine])));
   end;
 end;
 
@@ -8423,6 +8613,19 @@ begin
       Inc(FImportCount);
     end;
   end;
+  for i := 0 to High(XTRIG_NAME) do
+    if FUsesXTrig[i] then
+    begin
+      FXTrigFunc[i] := FModule.ImportFunc('env', XTRIG_NAME[i],
+                                          FModule.TypeIndex([wvtF64], [wvtF64]));
+      Inc(FImportCount);
+    end;
+  if FUsesAtan2 then
+  begin
+    FAtan2Func := FModule.ImportFunc('env', 'atan2',
+                                     FModule.TypeIndex([wvtF64, wvtF64], [wvtF64]));
+    Inc(FImportCount);
+  end;
 
   ScanForHalt;
   SetLength(FLocalIdx, FProg.Blocks.Count);   // sized by region below
@@ -8567,8 +8770,13 @@ begin
     FStrFromIntFunc := Next + 8;
     FStrFillFunc    := Next + 9;    // SPACE$ and STRING$: one helper, the char differs
     FStrCaseFunc    := Next + 10;   // UCASE / LCASE: one helper, the direction is a flag
-    FStrInstrFunc   := Next + 11;
-    Inc(Next, 12);
+    { ⛔ THE ORDER HERE IS THE ORDER EmitStringHelpers ADDS THEM IN, and nothing checks it: numbering
+      trim after instr while emitting it before made every call land one function off - and it was
+      caught by the VALIDATOR, not by a wrong answer, only because the signatures happened to differ.
+      See the note above about conditional helpers, which is the same hazard. }
+    FStrTrimFunc    := Next + 11;   // LTRIM/RTRIM/TRIM: one helper, the sides in a flag
+    FStrInstrFunc   := Next + 12;
+    Inc(Next, 13);
     { ⛔ FROM HERE THE NUMBERING IS SEQUENTIAL, not fixed offsets, because these
       are CONDITIONAL: printStr exists only if the program prints, puDigits only
       if it uses PRINT USING. With offsets, a program that had one but not the
