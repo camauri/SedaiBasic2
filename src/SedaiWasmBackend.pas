@@ -251,6 +251,15 @@ type
     FDtIvalFunc, FDtIncMoFunc, FDtDoyFunc, FDtWoyFunc, FDtYMFunc: LongWord;
     FUsesDateStr: Boolean;              // DATE$ / TIME$: the rendering, on top of the calendar
     FDtStrFunc: LongWord;
+    { RND / RANDOMIZE. ⭐ The interpreter's generator is FPC's, which is
+      MT19937 seeded with init_genrand and read as genrand_int32 / 2^32 -
+      IDENTIFIED by measurement, not by reading the RTL: seed 42 gives
+      1608637542 and 0.37454011430963874, both to the last digit. Porting it is
+      what makes a SEEDED sequence reproduce between sb and the module; a host
+      import could not, whatever else it offered. }
+    FUsesRnd: Boolean;
+    FMtBaseG: LongWord;                 // i32 global: where the 624-word state lives
+    FMtSeedFunc, FMtNextFunc: LongWord;
     FUsesBool: Boolean;                 // PRINT of a BOOLEAN: two words in a data segment
     FUsesDateParse: Boolean;            // DATEVALUE / TIMEVALUE / ISDATE
     FDtFindFunc, FDtFieldsFunc, FDtDatePartFunc, FDtTimePartFunc, FDtParseFunc: LongWord;
@@ -391,6 +400,7 @@ type
     procedure EmitDateHelpers;
     function BuildDateNameBlob: AnsiString;
     procedure EmitTwoDigits(B: TWasmBuf; Base, Val: LongWord; Off: LongWord);
+    procedure EmitRndHelpers;
     procedure EmitDateParseHelpers;
     procedure EmitFlushField(B: TWasmBuf);
     procedure EmitTrimRange(B: TWasmBuf; Base, Lo, Hi, Tmp: LongWord);
@@ -704,6 +714,7 @@ begin
   FUsesDateStr := False;
   FUsesDateParse := False;
   FUsesBool := False;
+  FUsesRnd := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -805,6 +816,17 @@ begin
                 FUsesClock := True; FUsesStr := True; end;
         ssaPrintBool:
           begin FUsesBool := True; FUsesPrint := True; end;
+        ssaMathRnd:
+          begin FUsesRnd := True; FUsesHeap := True; end;
+        { ⚠️ RANDOMIZE without a seed is time-based, so it needs the clock the
+          same way TIMER does - and it is nondeterministic on both sides, which
+          is exactly why the guard seeds explicitly. }
+        ssaRandomize:
+          begin
+            FUsesRnd := True; FUsesHeap := True;
+            if not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0)) then
+              FUsesClock := True;
+          end;
         ssaArrayErase:
           FUsesArr := True;
         ssaDateValue, ssaIsDate:
@@ -3643,6 +3665,139 @@ begin
     finally
       B.Free;
     end;
+  end;
+end;
+
+{ RND and RANDOMIZE: MT19937, transcribed.
+
+  ⭐ WHICH generator was MEASURED rather than read out of the RTL: seeding 42 and
+  asking for numbers gives 1608637542 and 0.37454011430963874, which is
+  init_genrand(42) followed by genrand_int32 divided by 2^32, to the last digit.
+  ⚠️ Dividing by 2^32 is the one division by a literal that is safe, and for a
+  reason worth stating after the day this file has had: the reciprocal of a power
+  of two is EXACT, so the rewrite an optimiser might apply cannot move a bit.
+
+  ⛔ Only a SEEDED sequence reproduces. Unseeded, sb takes its seed from the
+  clock, so the two sides were never going to agree - which is why the guard
+  calls RANDOMIZE with a number, and why a host import was never an option: it
+  could not reproduce a seeded sequence at all. }
+procedure TWasmBackend.EmitRndHelpers;
+const
+  MT_N = 624;
+  MT_IDX = MT_N * 4;          // the read cursor sits just past the state
+var
+  B: TWasmBuf;
+begin
+  if not FUsesRnd then Exit;
+
+  { mtSeed(s): allocate on first use, then init_genrand. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = seed; locals 1 = base, 2 = i, 3 = prev
+    B.GlobalGet(FMtBaseG); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(MT_IDX + 4); B.Call(FAllocFunc); B.GlobalSet(FMtBaseG);
+    B.EndOp;
+    B.GlobalGet(FMtBaseG); B.LocalSet(1);
+    B.LocalGet(1); B.LocalGet(0); B.Op(wopI32WrapI64); B.LocalTee(3);
+    B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(1); B.LocalSet(2);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(2); B.I32Const(MT_N); B.Op(wopI32GeU); B.BrIf(1);
+        // mt[i] = 1812433253 * (mt[i-1] xor (mt[i-1] >>> 30)) + i
+        B.LocalGet(1); B.LocalGet(2); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+        B.LocalGet(3);
+        B.LocalGet(3); B.I32Const(30); B.Op(wopI32ShrU); B.Op(wopI32Xor);
+        B.I32Const(1812433253); B.Op(wopI32Mul);
+        B.LocalGet(2); B.Op(wopI32Add);
+        B.LocalTee(3);
+        B.OpMem(wopI32Store, 2, 0);
+        B.LocalGet(2); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(2);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    // the cursor past the end, so the first read twists
+    B.LocalGet(1); B.I32Const(MT_N); B.OpMem(wopI32Store, 2, MT_IDX);
+    FModule.AddFunction(FModule.TypeIndex([wvtI64], []),
+                        [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { mtNext() -> the next 32 bits, zero-extended. }
+  B := TWasmBuf.Create;
+  try
+    // locals 0 = base, 1 = i, 2 = y, 3 = k
+    B.GlobalGet(FMtBaseG); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      { ⛔ Unseeded, the module seeds ITSELF with a fixed number rather than
+        asking anything: a module that answers the same on every run is the
+        honest behaviour for a sandbox, and it cannot match sb's clock-derived
+        seed whatever it does. RANDOMIZE overrides it. }
+      B.I64Const(1); B.Call(FMtSeedFunc);
+    B.EndOp;
+    B.GlobalGet(FMtBaseG); B.LocalSet(0);
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, MT_IDX); B.LocalTee(1);
+    B.I32Const(MT_N); B.Op(wopI32GeU);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      // the twist, in one pass with the wrap done by a modulo of the index
+      B.I32Const(0); B.LocalSet(3);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(3); B.I32Const(MT_N); B.Op(wopI32GeU); B.BrIf(1);
+          // y = (mt[k] and $80000000) + (mt[(k+1) mod N] and $7FFFFFFF)
+          B.LocalGet(0); B.LocalGet(3); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+          B.OpMem(wopI32Load, 2, 0);
+          B.I32Const(Integer($80000000)); B.Op(wopI32And);
+          B.LocalGet(0);
+          B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add);
+          B.I32Const(MT_N); B.Op(wopI32RemU);
+          B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+          B.OpMem(wopI32Load, 2, 0);
+          B.I32Const($7FFFFFFF); B.Op(wopI32And);
+          B.Op(wopI32Add); B.LocalSet(2);
+          // mt[k] = mt[(k+397) mod N] xor (y >>> 1) xor (y and 1 ? 2567483615 : 0)
+          B.LocalGet(0); B.LocalGet(3); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+          B.LocalGet(0);
+          B.LocalGet(3); B.I32Const(397); B.Op(wopI32Add);
+          B.I32Const(MT_N); B.Op(wopI32RemU);
+          B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+          B.OpMem(wopI32Load, 2, 0);
+          B.LocalGet(2); B.I32Const(1); B.Op(wopI32ShrU); B.Op(wopI32Xor);
+          B.LocalGet(2); B.I32Const(1); B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.I32Const(Integer(2567483615));
+          B.Op(wopElse);
+            B.I32Const(0);
+          B.EndOp;
+          B.Op(wopI32Xor);
+          B.OpMem(wopI32Store, 2, 0);
+          B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(3);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+      B.I32Const(0); B.LocalSet(1);
+    B.EndOp;
+    B.LocalGet(0); B.LocalGet(1); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+    B.OpMem(wopI32Load, 2, 0); B.LocalSet(2);
+    B.LocalGet(0); B.LocalGet(1); B.I32Const(1); B.Op(wopI32Add);
+    B.OpMem(wopI32Store, 2, MT_IDX);
+    // the tempering
+    B.LocalGet(2); B.LocalGet(2); B.I32Const(11); B.Op(wopI32ShrU); B.Op(wopI32Xor);
+    B.LocalTee(2);
+    B.LocalGet(2); B.I32Const(7); B.Op(wopI32Shl);
+    B.I32Const(Integer(2636928640)); B.Op(wopI32And); B.Op(wopI32Xor);
+    B.LocalTee(2);
+    B.LocalGet(2); B.I32Const(15); B.Op(wopI32Shl);
+    B.I32Const(Integer(4022730752)); B.Op(wopI32And); B.Op(wopI32Xor);
+    B.LocalTee(2);
+    B.LocalGet(2); B.I32Const(18); B.Op(wopI32ShrU); B.Op(wopI32Xor);
+    B.Op(wopI64ExtendI32U);
+    FModule.AddFunction(FModule.TypeIndex([], [wvtI64]),
+                        [wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
   end;
 end;
 
@@ -8113,6 +8268,31 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { RND -> genrand_int32 / 2^32, which is what FPC's Random is. }
+    ssaMathRnd:
+      begin
+        B.Call(FMtNextFunc);
+        B.Op(wopF64ConvertI64U);
+        B.F64Const(4294967296.0); B.Op(wopF64Div);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { RANDOMIZE. With a seed it is init_genrand; without one the interpreter
+      goes to the clock, so the module does too - and neither side is
+      reproducible then, which is the point of seeding in a guard. }
+    ssaRandomize:
+      begin
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt <> 0) then
+          LoadReg(B, Instr.Src1)
+        else
+        begin
+          B.Call(FNowFunc);
+          B.F64Const(86400000.0); B.Op(wopF64Mul);
+          B.TruncSat(wopfcI64TruncSatF64S);
+        end;
+        B.Call(FMtSeedFunc);
+      end;
+
     { A BOOLEAN prints as the WORD, not as a number, so the two words live in a
       data segment and this is a pointer and a length straight to the sink. The
       condition is read twice - it is a register, so that is free - rather than
@@ -10988,6 +11168,17 @@ begin
       FColG := FModule.DefineGlobal(wvtI32, True, Init);
       Init.Clear;
     end;
+    { ⭐ The generator's state is ALLOCATED, not carved out of the fixed low
+      memory: 624 words is 2496 bytes and there is no gap that size below the
+      literals - and moving the literals would change the address of every
+      string in every module, the published demo included. A global holds the
+      block's address and doubles as the "not seeded yet" flag. }
+    if FUsesRnd then
+    begin
+      Init.I32Const(0);
+      FMtBaseG := FModule.DefineGlobal(wvtI32, True, Init);
+      Init.Clear;
+    end;
     { One per bank a pointer call can return in. This IS the transfer bank's
       result slot, and it is a global for the same reason the shared slots are:
       the storage is the program's, not a frame's. A callee's own nested calls
@@ -11250,6 +11441,20 @@ begin
       Inc(Next, 5);
     end;
   end;
+  { ⛔⛔ OUTSIDE the calendar's block, and that is exactly the bug this comment
+    exists for: numbered INSIDE it, a program that used RND without a single
+    date got an index that was never assigned, so the call landed on whatever
+    function happened to sit there. It did not validate, which was the lucky
+    half - a wrong index whose signature happens to match draws into the wrong
+    function in silence.
+    ⚠️ RND needs no calendar, so its numbering cannot live under a calendar
+    test. And the ORDER here is the order the driver emits them in. }
+  if FUsesRnd then
+  begin
+    FMtSeedFunc := Next;
+    FMtNextFunc := Next + 1;
+    Inc(Next, 2);
+  end;
 
   { The function table. ⭐ It holds EVERY region rather than only the
     address-taken ones, and the reason is a defect avoided rather than laziness:
@@ -11283,6 +11488,7 @@ begin
   if FUsesGfxPrim then EmitGfxHelpers;
   if FUsesDate then EmitDateHelpers;
   if FUsesDateParse then EmitDateParseHelpers;
+  if FUsesRnd then EmitRndHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do
