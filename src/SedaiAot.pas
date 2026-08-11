@@ -1010,6 +1010,13 @@ begin
     // one, and aot_validate found both - which is the whole reason that net exists.
     ssaIntToFloat:
       Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
+    // ⛔ The mirror image, and refused for the mirror reason: with Src3 = 1 the DESTINATION is
+    // unsigned 64-bit, and cvttsd2si answers the "integer indefinite" for everything at or above
+    // 2^63 instead of the value fbc produces there. Reproducing it natively is a compare and a
+    // second conversion around a biased operand, not one instruction - so it takes the helper road
+    // and the interpreter's own arm answers, which is where the measured semantics lives.
+    ssaFloatToInt, ssaFloatRound:
+      Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:

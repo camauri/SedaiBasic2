@@ -7138,18 +7138,65 @@ begin
         LoadReg(B, Instr.Src1);
         if FModern or (Instr.OpCode = ssaFloatRound) then B.Op(wopF64Nearest);
         B.LocalTee(FFltTmp);
-        B.F64Const(-9223372036854775808.0);
-        B.Op(wopF64Ge);
-        B.LocalGet(FFltTmp);
-        B.F64Const(9223372036854775808.0);
-        B.Op(wopF64Lt);
-        B.Op(wopI32And);
-        B.BlockStart(wopIf, WASM_TYPE_I64);   // an `if` that yields an i64
+        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then
+        begin
+          // Src3 = 1: the DESTINATION is unsigned 64-bit, and [2^63, 2^64) is exactly the range the
+          // signed truncation cannot answer. ⛔ i64.trunc_f64_u is NOT the instruction for this: it
+          // traps on a negative input, where the interpreter answers the wrapped magnitude (-5 gives
+          // 18446744073709551611). What is reproduced here is the interpreter's own rule, which is
+          // fbc's measured one - a biased signed truncation for the high half:
+          //     d >= 2^63 : trunc_s(d - 2^63) + 2^63     (the add wraps)
+          //     otherwise : trunc_s(d)
+          // with the "integer indefinite" wherever the truncation cannot answer. Every trap is
+          // excluded by the comparison that sits in front of it, so none of them can fire.
+          B.F64Const(9223372036854775808.0);
+          B.Op(wopF64Ge);
+          B.BlockStart(wopIf, WASM_TYPE_I64);
+            // High half. The subtraction is exact, and lands in [0, ...): in range unless d was at
+            // or above 2^64, which is the second test.
+            B.LocalGet(FFltTmp);
+            B.F64Const(9223372036854775808.0);
+            B.Op(wopF64Sub);
+            B.LocalTee(FFltTmp);
+            B.F64Const(9223372036854775808.0);
+            B.Op(wopF64Lt);
+            B.BlockStart(wopIf, WASM_TYPE_I64);
+              B.LocalGet(FFltTmp);
+              B.Op(wopI64TruncF64S);
+            B.Op(wopElse);
+              B.I64Const(Int64($8000000000000000));
+            B.EndOp;
+            B.I64Const(Int64($8000000000000000));   // + 2^63, the same bit pattern
+            B.Op(wopI64Add);
+          B.Op(wopElse);
+            // Low half - and a NaN reaches here too, both of its comparisons being false, which is
+            // how it arrives at the indefinite without a single explicit NaN test.
+            B.LocalGet(FFltTmp);
+            B.F64Const(-9223372036854775808.0);
+            B.Op(wopF64Ge);
+            B.BlockStart(wopIf, WASM_TYPE_I64);
+              B.LocalGet(FFltTmp);
+              B.Op(wopI64TruncF64S);
+            B.Op(wopElse);
+              B.I64Const(Int64($8000000000000000));
+            B.EndOp;
+          B.EndOp;
+        end
+        else
+        begin
+          B.F64Const(-9223372036854775808.0);
+          B.Op(wopF64Ge);
           B.LocalGet(FFltTmp);
-          B.Op(wopI64TruncF64S);           // in range: the trap here cannot fire
-        B.Op(wopElse);
-          B.I64Const(Int64($8000000000000000));   // cvttsd2si's answer for everything else
-        B.EndOp;
+          B.F64Const(9223372036854775808.0);
+          B.Op(wopF64Lt);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_TYPE_I64);   // an `if` that yields an i64
+            B.LocalGet(FFltTmp);
+            B.Op(wopI64TruncF64S);           // in range: the trap here cannot fire
+          B.Op(wopElse);
+            B.I64Const(Int64($8000000000000000));   // cvttsd2si's answer for everything else
+          B.EndOp;
+        end;
         StoreReg(B, Instr.Dest);
       end;
 

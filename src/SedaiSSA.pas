@@ -394,6 +394,7 @@ type
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
     function EnsureStringRegisterOf(const Val: TSSAValue; SrcNode: TASTNode): TSSAValue;  // SINGLE-aware
     function ConstFloatToInt(V: Double): Int64;                 // implicit float->int of a CONSTANT
+    function ConstFloatToUInt(V: Double): Int64;                // ... to an UNSIGNED-64 destination
     function ToIntValue(const V: TSSAValue): TSSAValue;         // ...of any value (const folded or emitted)
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
@@ -599,6 +600,7 @@ type
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode);
     function ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;  // narrow by an explicit width code
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue): TSSAValue;  // narrow on scalar store
+    function ApplyUnsigned64Dest(const VarName: string; Value: TSSAValue): TSSAValue; // ...only the unsigned-64 conversion
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
@@ -4567,26 +4569,42 @@ begin
               // CSIGN -> signed code base+1 (1/3/5); CUNSG -> unsigned code base+2 (2/4/6).
               if FuncName = kCSIGN then ConvW := ((ConvW - 1) div 2) * 2 + 1
               else ConvW := ((ConvW - 1) div 2) * 2 + 2;
+            // A 64-bit / unknown-width operand under CUNSG: the result IS unsigned-64, which is width
+            // code 8 - so a FLOAT operand takes the unsigned conversion instead of the signed one.
+            if ConvW = 0 then ConvW := 8;
           end
+          // CUINT/CULNGINT name an unsigned 64-bit destination, and above 2^63 that is a different
+          // conversion, not a reinterpretation: CULngInt(1e19) is 10000000000000000000, where the
+          // signed truncation can only answer 9223372036854775808.
+          else if (FuncName = kCULNGINT) or (FuncName = 'CUINT') then ConvW := 8
           else ConvW := 0;
 
           if ArgValue.Kind = svkConstFloat then
-            Result := MakeSSAConstInt(Round(ArgValue.ConstFloat))
+          begin
+            if ConvW = 8 then Result := MakeSSAConstInt(ConstFloatToUInt(ArgValue.ConstFloat))
+            else Result := MakeSSAConstInt(Round(ArgValue.ConstFloat));
+          end
           else if ArgValue.Kind = svkConstInt then
             Result := MakeSSAConstInt(ArgValue.ConstInt)
           else if (ArgValue.Kind = svkRegister) and (ArgValue.RegType = srtFloat) then
           begin
             // Round-to-even (banker's): bcFloatRound, distinct from truncating ssaFloatToInt.
+            // Src3 = 1 selects the unsigned-64 destination, exactly as it does on ssaFloatToInt.
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            EmitInstruction(ssaFloatRound, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            if ConvW = 8 then
+              EmitInstruction(ssaFloatRound, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAConstInt(1))
+            else
+              EmitInstruction(ssaFloatRound, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end
           else
             // Already an integer value (register or string-coerced) - pass through.
             Result := EnsureIntRegister(ArgValue);
 
           // Narrow to the declared width: fold constants, else emit bcNarrowInt.
-          if ConvW <> 0 then
+          // ⛔ Code 8 narrows nothing - it named the CONVERSION above, and the value already fills
+          // the slot - so it must not reach ssaNarrowInt, which has no arm for it.
+          if (ConvW <> 0) and (ConvW <> 8) then
           begin
             if Result.Kind = svkConstInt then
               Result := MakeSSAConstInt(NarrowConstInt(Result.ConstInt, ConvW))
@@ -6869,7 +6887,9 @@ begin
     if FCurrentProcRetRecType <> '' then
       EmitRecordCopy(FCurrentResultHandle, ExprValue, FindUDT(FCurrentProcRetRecType))
     else
-      EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, ExprValue);
+      // The "fname = expr" spelling of a result reaches the same declared type as "Return expr".
+      EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT,
+                    ApplyUnsigned64Dest(FCurrentProcName, ExprValue));
     Exit;
   end;
 
@@ -18481,8 +18501,18 @@ end;
 
 function TSSAGenerator.TypeNameWidthCode(const TypeName: string): Integer;
 // Map a declared type name to a narrowing width code for STORE narrowing (B1.5). 0 = no narrowing.
-// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB), 7=single precision.
-// INTEGER/LONGINT (=64-bit here), UINTEGER/ULONGINT and DOUBLE need no bit narrowing.
+// 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB), 7=single precision,
+// 8=unsigned 64-bit (UINTEGER/ULONGINT).
+// INTEGER/LONGINT (=64-bit here) and DOUBLE need no bit narrowing.
+//
+// ⭐ Code 8 narrows NOTHING - a ULongInt already occupies the whole slot - and it is here anyway
+// because this registry is the one place that knows a destination's DECLARED type at the moment a
+// value is stored into it, which is exactly what the float->int conversion needs: converting to a
+// SIGNED Int64 and reinterpreting squashes everything at or above 2^63 to that one value, so
+// "Dim As ULongInt u = 1e19" answered 9223372036854775808 instead of 10000000000000000000.
+// ⛔ It is a COMPILE-TIME fact about the declared type, not a storage width: on storage it is worth
+// exactly what 0 is worth, and it is mapped back to 0 before it can reach any wire format
+// (ComputeUDTLiveLayout's packed slot). BinaryElemBytesOfWidthCode already answers 8 bytes for it.
 // SINGLE narrowing was held back until PRINT could show a single-typed value with a SINGLE's precision
 // -- rounding the storage without that made the representation error visible (1.65 came out as
 // 1.6499...). PRINT now formats a single-typed value with 7 significant digits, so the storage can be
@@ -18502,6 +18532,7 @@ begin
   // preset. Narrowing a v7 program's SINGLE without it would put the rounding error on screen (1.65 as
   // 1.6499...), which is exactly the trap this feature was held back to avoid.
   else if (T = 'SINGLE') and FModernMode then Result := 7
+  else if (T = 'UINTEGER') or (T = 'ULONGINT') then Result := 8
   else Result := 0;
 end;
 
@@ -18918,6 +18949,7 @@ begin
       3, 4: Exit(2);       // Short / UShort
       5, 6: Exit(4);       // Long / ULong
       7:    Exit(4);       // Single
+      8:    Exit(8);       // UInteger / ULongInt - a full slot, as the fallthrough below also says
     end;
   idx := FVarPrintKind.IndexOf(Nm);
   if (idx >= 0) and (PtrInt(FVarPrintKind.Objects[idx]) = 1) then Exit(1);   // Boolean
@@ -19301,7 +19333,13 @@ begin
       if FModernMode and (Node.ChildCount >= 1) then
       begin
         AwCode := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
-        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        // A UInteger/ULongInt FIELD is unsigned-SIXTY-FOUR, so kind 2 and not 3: it must reach the
+        // unsigned compare/divide/mod opcodes, exactly as the scalar of that type does. Only the
+        // narrow unsigned widths were recognised here, so "rec.u = 1e19" printed the right bits as a
+        // NEGATIVE number - the conversion was already correct by then, which is what made it look
+        // like a conversion bug rather than a print one.
+        else if AwCode = 8 then Result := 2;
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
@@ -19367,6 +19405,24 @@ begin
   Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value);
 end;
 
+function TSSAGenerator.ApplyUnsigned64Dest(const VarName: string; Value: TSSAValue): TSSAValue;
+// ApplyScalarNarrow restricted to width code 8: apply the UNSIGNED float->int conversion when the
+// name is declared UInteger/ULongInt, and do nothing at all otherwise.
+//
+// It exists for the FUNCTION RESULT, where the name in the registry is the function's own (its
+// declared return type is recorded there so that a CALL prints like a variable of that type would).
+// ⚠️ Restricted on purpose: whether a "Function f() As Byte : Return 300" should also WRAP its result
+// to the declared width is a separate fidelity question with its own measurement, and answering it
+// here by calling ApplyScalarNarrow would change results this change never measured.
+var
+  Idx: Integer;
+begin
+  Result := Value;
+  Idx := FVarWidthCode.IndexOf(UpperCase(VarName));
+  if (Idx >= 0) and (PtrInt(FVarWidthCode.Objects[Idx]) = 8) then
+    Result := ApplyNarrowCode(8, Value);
+end;
+
 // Convert an INT value to float, remembering whether the source was UNSIGNED. The distinction is
 // invisible in the register - both are 64 bits - and it is the whole answer: with u = ULongInt 42,
 // "(-u) / 2" is 9.223372036854776e+018 because the negation's bit pattern is a huge POSITIVE number,
@@ -19385,7 +19441,7 @@ function TSSAGenerator.ApplyNarrowCode(W: Integer; Value: TSSAValue): TSSAValue;
 // Wrap/sign-extend (int widths 1..6) or round to single (7) a value before a store to a narrow-typed
 // destination. Folds constants; otherwise emits bcNarrowInt / bcNarrowSingle. W=0 -> no-op.
 var
-  NarrowReg: TSSAValue;
+  NarrowReg, IntTmp: TSSAValue;
 begin
   Result := Value;
   if W = 7 then
@@ -19429,9 +19485,42 @@ begin
       NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaNarrowInt, NarrowReg, Value, MakeSSAValue(svkNone), MakeSSAConstInt(W));
       Result := NarrowReg;
+    end
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
+    begin
+      // ⛔ This arm used to be a DECLARED DEFERRAL - "a float register is handled by the existing
+      // store conversion (float->int), so narrowing it would require an extra int temp" - and the
+      // premise was simply false: that conversion produces a 64-bit int and nothing narrows it
+      // afterwards. So a runtime float into a narrow scalar kept its FULL width, silently:
+      // "Dim As UByte b = f(300.0)" stored 300 where fbc stores 44, and a Short took 70000.
+      // The constant path folded correctly and an int source narrowed correctly, so the same
+      // declaration answered differently depending only on where the value came from.
+      // The extra temp the note was avoiding is one register: convert, then narrow.
+      IntTmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaFloatToInt, IntTmp, Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaNarrowInt, NarrowReg, IntTmp, MakeSSAValue(svkNone), MakeSSAConstInt(W));
+      Result := NarrowReg;
     end;
-    // A float register reaching here is handled by the existing store conversion (float->int), so
-    // narrowing it would require an extra int temp; deferred (rare: DIM b AS BYTE = floatExpr).
+  end
+  else if W = 8 then
+  begin
+    // UNSIGNED 64-bit destination. Nothing to narrow - the value already fills the slot - but the
+    // conversion FROM A FLOAT is a different conversion, and that is the whole content of this arm:
+    // an Int64 cannot hold [2^63, 2^64), so converting there and reinterpreting the bits squashed
+    // every such value onto the one that x86's truncation returns when it cannot answer.
+    // The flag rides in Src3, as it does for ssaIntToFloat, so this stays ONE opcode with the
+    // signedness in an operand. ⚠️ And for the same reason as there, it is a flag a consumer that
+    // ignores it gets SILENTLY wrong - in the signed direction - so every consumer is visited and
+    // the ones that cannot do it natively refuse (the AOT routes, the JIT bails).
+    if Value.Kind = svkConstFloat then
+      Result := MakeSSAConstInt(ConstFloatToUInt(Value.ConstFloat))
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaFloatToInt, Result, Value, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+    end;
+    // An INT value passes through untouched: its bits are already the destination's.
   end;
 end;
 
@@ -20056,7 +20145,7 @@ procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
   record with an array member still cannot be PUT to a file byte-faithfully, and closing that is
   its own piece of work. }
 var
-  i, n: Integer;
+  i, n, WireW: Integer;
   Sz, Al, MaxAl, Ofs: Int64;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
@@ -20093,9 +20182,18 @@ begin
     //   bits 4..31 : byte offset (records up to 256 MB)
     //   bits 0..3  : the B1.5 width code - 0 full, 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 7=single
     // A STRING field keeps its plain slot index: its characters are still in the side vector.
+    // ⛔ Width code 8 (UInteger/ULongInt) is deliberately NOT on this wire: it says something about
+    // the declared TYPE, not about the storage, and on storage it is worth exactly what 0 is worth.
+    // Sending it would hand a value three decoders have never seen (the interpreter, the AOT and the
+    // disassembler) for no gain - their "anything else" arms already read a full Int64, which is the
+    // right answer, but agreeing by fallthrough is not the same as agreeing.
     if FUDTs[UDTIdx].Fields[i].Bank <> srtString then
+    begin
+      WireW := FUDTs[UDTIdx].Fields[i].WidthCode;
+      if WireW = 8 then WireW := 0;
       FUDTs[UDTIdx].Fields[i].Slot :=
-        (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (FUDTs[UDTIdx].Fields[i].WidthCode and $F);
+        (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (WireW and $F);
+    end;
   end;
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   FUDTs[UDTIdx].LiveBytes := Ofs;
@@ -20284,6 +20382,42 @@ function TSSAGenerator.ConstFloatToInt(V: Double): Int64;
 // even (fbc 1.10.1: 1.5 and 2.5 both give 2, -1.5 and -2.5 both give -2); Commodore v7 truncates.
 begin
   if FModernMode then Result := Round(V) else Result := Trunc(V);
+end;
+
+function TSSAGenerator.ConstFloatToUInt(V: Double): Int64;
+// Compile-time half of the implicit float -> UNSIGNED-64 conversion; must agree bit for bit with the
+// VM's FloatToUIntConv, or a folded constant and a computed value would convert differently -- which
+// is not hypothetical here, since "Dim As ULongInt u = 1e19" folds and "u = d" does not.
+//
+// MEASURED against fbc 1.10.1, and its constant folding and its runtime sequence agree with each
+// other, so there is one semantics to reproduce, not two:
+//     d >= 2^63 :  UInt64(trunc(d - 2^63)) + 2^63      (the add wraps)
+//     otherwise :  UInt64(trunc(d))
+// with an out-of-range or NaN truncation giving x86's "integer indefinite", $8000000000000000. That
+// one rule reproduces every edge that was measured: 1e19 -> 10000000000000000000, 2^64 and 1e20 and
+// 1e30 and +inf -> 0, -inf and a NaN and -1e30 -> 2^63, -5 -> 18446744073709551611.
+// ⛔ The range is GUARDED rather than left to the host's truncation: FPC's Round/Trunc reach
+// cvttsd2si here and would answer the same, but that is a property of one target, and a compile-time
+// fold that depends on the host CPU is the kind of thing that diverges on the day nobody is looking.
+const
+  TWO63 = 9223372036854775808.0;   // 2^63, exactly representable
+  INDEFINITE = Int64($8000000000000000);
+var
+  Q: QWord;
+begin
+  if V <> V then Exit(INDEFINITE);                 // NaN: no ordered comparison holds
+  if V < -TWO63 then Exit(INDEFINITE);             // below Int64: -inf lands here
+  if V >= TWO63 then
+  begin
+    // The high half. Subtracting 2^63 is exact (both are powers of two in the same binade or wider),
+    // so this rounds nothing away; what it does is move the value into the range the signed
+    // truncation can answer for -- unless it overflows there too, which is the >= test.
+    if V - TWO63 >= TWO63 then Q := QWord(INDEFINITE)
+    else Q := QWord(ConstFloatToInt(V - TWO63));
+    Result := Int64(Q + QWord(INDEFINITE));
+  end
+  else
+    Result := ConstFloatToInt(V);
 end;
 
 function TSSAGenerator.ToIntValue(const V: TSSAValue): TSSAValue;
@@ -20874,7 +21008,8 @@ begin
             // An unsigned 64-bit parameter (UInteger/ULongInt) prints unsigned and selects the unsigned
             // compare/div/mod forms (IsUnsigned64Expr reads FVarPrintKind=2). Only these two 64-bit types
             // need it — narrower unsigned params are stored as positive Int64 and behave correctly as
-            // signed. Recording just these avoids adding any store-narrowing (their width code is 0).
+            // signed. ⚠️ Their width code is no longer 0 but 8, which narrows nothing either: it is what
+            // makes a store of a FLOAT into such a parameter take the unsigned conversion.
             if (TypeName = 'UINTEGER') or (TypeName = 'ULONGINT') then
               RecordVarWidth(VarName, TypeName);
             // EVERY typed parameter also gets a procedure-scoped entry (this pre-pass runs with no
@@ -25968,7 +26103,11 @@ begin
                  Op := ssaRecordStoreString;
                end;
   else
-    begin ExprVal := EnsureIntRegister(ExprVal); ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); Op := ssaRecordStoreInt; end;
+    // ⚠️ The narrowing runs BEFORE EnsureIntRegister, and the order is the whole point for an
+    // UNSIGNED-64 field: EnsureIntRegister converts a float with no idea what it is converting FOR,
+    // so going through it first would settle the conversion as signed and leave ApplyNarrowCode an
+    // integer it can only pass through. For widths 1..6 either order gives the same answer.
+    begin ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); ExprVal := EnsureIntRegister(ExprVal); Op := ssaRecordStoreInt; end;
   end;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;
@@ -26477,7 +26616,20 @@ begin
     case RT of
       srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
       srtString: ArgVal := EnsureStringRegister(ArgVal);
-    else         ArgVal := EnsureIntRegister(ArgVal);
+    else
+      begin
+        // A parameter declared UInteger/ULongInt takes the UNSIGNED float->int conversion, and it has
+        // to happen HERE, on the CALLER's side: the callee narrows its incoming argument at entry
+        // (ssaNarrowInt, one site for every caller), but narrowing cannot undo a conversion the
+        // caller already settled as SIGNED - by then everything at or above 2^63 is one value.
+        // ⚠️ Only width code 8 is applied on this side, deliberately: the narrow widths 1..6 are
+        // still the callee's job, and doing them here too would emit the wrap twice.
+        if (ParamList.GetChild(i).ChildCount >= 1) and
+           (ParamList.GetChild(i).GetChild(0).NodeType = antIdentifier) and
+           (TypeNameWidthCode(VarToStr(ParamList.GetChild(i).GetChild(0).Value)) = 8) then
+          ArgVal := ApplyNarrowCode(8, ArgVal);
+        ArgVal := EnsureIntRegister(ArgVal);
+      end;
     end;
     StageSlots[NStage] := Slot; StageRTs[NStage] := RT; StageVals[NStage] := ArgVal;
     Inc(NStage);
@@ -27639,7 +27791,10 @@ begin
             if FCurrentProcRetRecType <> '' then
               EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
             else
-              EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RetVal);
+              // A FUNCTION declared As UInteger/ULongInt returning a float takes the UNSIGNED
+              // conversion, like any other store to a name of that type.
+              EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT,
+                            ApplyUnsigned64Dest(FCurrentProcName, RetVal));
           end;
         end;
         EmitAllBlockScopesCleanup;   // M8: unwind active loop block scopes before the frame exit

@@ -1836,7 +1836,11 @@ var
           E.EmitBytes([$F3, $0F, $5A, $C0]);        // cvtss2sd xmm0, xmm0
           FStore(I^.Dest, XMM0);
         end;
+      // ⛔ Immediate = 1 is an unsigned-64 destination, which cvtsd2si cannot answer above 2^63. Bail,
+      // as bcFloatToInt does: the interpreter's arm is the one that knows.
       bcFloatRound:
+        if I^.Immediate = 1 then Exit
+        else
         begin
           // CINT: FPC's Round is round-half-to-EVEN, which is cvtsd2si under the default mode.
           FLoad(XMM0, I^.Src1);
@@ -1961,7 +1965,12 @@ var
       // Implicit float->int (assignment/index/FOR bound/arg). MODERN rounds half-to-even = cvtsd2si under
       // the default MXCSR round-to-nearest mode (the same mode FPC's Round reads). CLASSIC truncates toward
       // zero = cvttsd2si (matches FPC's Trunc). Depends only on the dialect, not on bounds-checking.
+      // ⛔ Immediate = 1 is an UNSIGNED-64 DESTINATION, and neither cvtsd2si nor cvttsd2si answers
+      // that above 2^63 - they give the "integer indefinite" where fbc gives the value. Wrong here is
+      // a SILENT miscompile, not a slow loop. Bail: the interpreter's arm is the one that knows.
       bcFloatToInt:
+        if I^.Immediate = 1 then Exit
+        else
         begin
           FLoad(XMM0, I^.Src1);                        // xmm0 = V
           if Modern then E.EmitBytes([$F2, $48, $0F, $2D, $C0])   // cvtsd2si rax, xmm0   (round)

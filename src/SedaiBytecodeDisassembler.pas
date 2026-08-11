@@ -143,10 +143,21 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'PowFloat', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcNegFloat:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'NegFloat', Instr.Dest, Instr.Src1]);
+    // The Immediate carries the SIGNEDNESS of the conversion, and it is the difference between two
+    // different answers above 2^63 - so it has to be visible here: a dump that hides it makes the
+    // two conversions look like the same instruction.
     bcIntToFloat:
-      Line := Format('%4d: %-20s R%d, R%d', [Index, 'IntToFloat', Instr.Dest, Instr.Src1]);
+      if Instr.Immediate = 1 then
+        Line := Format('%4d: %-20s R%d, R%d   ; unsigned source', [Index, 'IntToFloat', Instr.Dest, Instr.Src1])
+      else if Instr.Immediate = 2 then
+        Line := Format('%4d: %-20s R%d, R%d   ; -> single', [Index, 'IntToFloat', Instr.Dest, Instr.Src1])
+      else
+        Line := Format('%4d: %-20s R%d, R%d', [Index, 'IntToFloat', Instr.Dest, Instr.Src1]);
     bcFloatToInt:
-      Line := Format('%4d: %-20s R%d, R%d', [Index, 'FloatToInt', Instr.Dest, Instr.Src1]);
+      if Instr.Immediate = 1 then
+        Line := Format('%4d: %-20s R%d, R%d   ; unsigned destination', [Index, 'FloatToInt', Instr.Dest, Instr.Src1])
+      else
+        Line := Format('%4d: %-20s R%d, R%d', [Index, 'FloatToInt', Instr.Dest, Instr.Src1]);
     bcIntToString:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'IntToString', Instr.Dest, Instr.Src1]);
     bcFloatToString:

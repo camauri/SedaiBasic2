@@ -693,7 +693,15 @@ begin
           end;
         // Implicit float -> int: MODERN rounds (to nearest, ties to even), CLASSIC truncates. See the
         // ExecuteInstruction copy for why.
-        bcFloatToInt: begin IntRegs[Instr.Dest] := FloatToIntConv(FloatRegs[Instr.Src1], ModernConv); Inc(CurPC); end;
+        // Immediate = 1: the DESTINATION is unsigned 64-bit. See the ExecuteInstruction copy.
+        bcFloatToInt:
+          begin
+            if Instr.Immediate = 1 then
+              IntRegs[Instr.Dest] := FloatToUIntConv(FloatRegs[Instr.Src1], ModernConv)
+            else
+              IntRegs[Instr.Dest] := FloatToIntConv(FloatRegs[Instr.Src1], ModernConv);
+            Inc(CurPC);
+          end;
         // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
         bcIntToString: begin Ctx.StringRegs[Instr.Dest] := IntToStr(IntRegs[Instr.Src1]); Inc(CurPC); end;
         bcFloatToString:
@@ -705,7 +713,15 @@ begin
                                                                              Instr.Immediate = 1));
             Inc(CurPC);
           end;
-        bcFloatRound: begin IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // CINT (round-to-even)
+        // CINT (round-to-even); Immediate = 1 = unsigned-64 destination. See the ExecuteInstruction copy.
+        bcFloatRound:
+          begin
+            if Instr.Immediate = 1 then
+              IntRegs[Instr.Dest] := FloatToUIntConv(FloatRegs[Instr.Src1], True)
+            else
+              IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]);
+            Inc(CurPC);
+          end;
         bcNarrowInt: begin IntRegs[Instr.Dest] := NarrowInt64(IntRegs[Instr.Src1], Instr.Immediate); Inc(CurPC); end;  // B1.5
         bcNarrowSingle: begin FloatRegs[Instr.Dest] := Single(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // B1.5
 

@@ -861,6 +861,40 @@ begin
     Result := Trunc(V);
 end;
 
+function FloatToUIntConv(V: Double; Modern: Boolean): Int64;
+// The implicit float -> int conversion when the DESTINATION is UNSIGNED 64-bit (UInteger/ULongInt).
+// It is a genuinely different conversion, not a reinterpretation: an Int64 cannot hold [2^63, 2^64),
+// so converting there and reading the bits back squashed every value in that range onto the single
+// value the signed truncation returns when it cannot answer -- "Dim As ULongInt u = 1e19" gave
+// 9223372036854775808 where fbc gives 10000000000000000000.
+//
+// MEASURED against fbc 1.10.1 (its constant folding and its runtime sequence agree):
+//     d >= 2^63 :  UInt64(trunc(d - 2^63)) + 2^63      (the add wraps)
+//     otherwise :  UInt64(trunc(d))
+// with an out-of-range or NaN truncation giving x86's "integer indefinite", $8000000000000000.
+// Every measured edge follows from that one rule: 2^64, 1e20, 1e30 and +inf give 0; -inf, a NaN and
+// -1e30 give 2^63; -5 gives 18446744073709551611; and the rounding is the dialect's own, so 2.5
+// still gives 2 and 3.5 gives 4.
+// ⛔ Must stay bit-identical to the SSA generator's ConstFloatToUInt: a folded constant and a
+// computed value pass through different code and must not answer differently.
+const
+  TWO63 = 9223372036854775808.0;
+  INDEFINITE = Int64($8000000000000000);
+var
+  Q: QWord;
+begin
+  if V <> V then Exit(INDEFINITE);
+  if V < -TWO63 then Exit(INDEFINITE);
+  if V >= TWO63 then
+  begin
+    if V - TWO63 >= TWO63 then Q := QWord(INDEFINITE)
+    else Q := QWord(FloatToIntConv(V - TWO63, Modern));
+    Result := Int64(Q + QWord(INDEFINITE));
+  end
+  else
+    Result := FloatToIntConv(V, Modern);
+end;
+
 const
   // Ceiling on simultaneously-live THREADCREATE workers. Sized far above any legitimate FreeBASIC
   // program on a desktop core count, and far below what it takes to wedge the host. It exists so that a
@@ -6915,8 +6949,16 @@ begin
     // store, an array INDEX, a FOR bound, a FUNCTION result -- so "Dim As Integer i : i = 1.5" is 2, and
     // "a(1.5)" is element 2. Truncation is what Int() and Fix() are for, and they have their own opcodes.
     // CLASSIC keeps truncating: Commodore v7 assigns 1.7 to an integer variable as 1.
-    bcFloatToInt: Ctx.IntRegs[Instr.Dest] := FloatToIntConv(Ctx.FloatRegs[Instr.Src1],
-                                                            Assigned(FProgram) and FProgram.ModernMode);
+    // ⛔ Immediate = 1: the DESTINATION is unsigned 64-bit, which is a different conversion above 2^63.
+    // This arm and the dense dispatch's are TWO implementations of one opcode, and the AOT's helper
+    // road reaches THIS one - correcting only the other is how the same bug survived a green run once.
+    bcFloatToInt:
+      if Instr.Immediate = 1 then
+        Ctx.IntRegs[Instr.Dest] := FloatToUIntConv(Ctx.FloatRegs[Instr.Src1],
+                                                   Assigned(FProgram) and FProgram.ModernMode)
+      else
+        Ctx.IntRegs[Instr.Dest] := FloatToIntConv(Ctx.FloatRegs[Instr.Src1],
+                                                  Assigned(FProgram) and FProgram.ModernMode);
     // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
     bcIntToString: Ctx.StringRegs[Instr.Dest] := IntToStr(Ctx.IntRegs[Instr.Src1]);
     bcFloatToString:
@@ -6925,7 +6967,13 @@ begin
       // SINGLE-typed: 7 significant digits, as PRINT gives it.
       Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Src1],
                                                                        Instr.Immediate = 1));
-    bcFloatRound: Ctx.IntRegs[Instr.Dest] := Round(Ctx.FloatRegs[Instr.Src1]);  // CINT (round-to-even)
+    // CINT (round-to-even). Immediate = 1: the destination is unsigned 64-bit (CUINT/CULNGINT/CUNSG),
+    // the same distinction bcFloatToInt carries - this opcode differs only in rounding in BOTH dialects.
+    bcFloatRound:
+      if Instr.Immediate = 1 then
+        Ctx.IntRegs[Instr.Dest] := FloatToUIntConv(Ctx.FloatRegs[Instr.Src1], True)
+      else
+        Ctx.IntRegs[Instr.Dest] := Round(Ctx.FloatRegs[Instr.Src1]);
     bcNarrowInt: Ctx.IntRegs[Instr.Dest] := NarrowInt64(Ctx.IntRegs[Instr.Src1], Instr.Immediate);  // B1.5
     bcNarrowSingle: Ctx.FloatRegs[Instr.Dest] := Single(Ctx.FloatRegs[Instr.Src1]);                  // B1.5
     // Comparison operators - Int (use FTrueValue for TRUE, 0 for FALSE)
