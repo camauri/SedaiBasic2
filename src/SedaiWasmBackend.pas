@@ -7118,21 +7118,38 @@ begin
         StoreReg(B, Instr.Dest);
       end
       else Un(wopF64ConvertI64S);
-    ssaFloatToInt:
+    { The IMPLICIT conversion is dialect-dependent: FreeBASIC rounds half to even (which is exactly
+      f64.nearest), Commodore v7 truncates.
+
+      ⛔ And what it does with a value an Int64 cannot hold is NOT saturation, which is what this used
+      to emit. The interpreter reaches FPC's Round/Trunc, which on x86-64 is cvttsd2si, and that gives
+      the "integer indefinite" - Int64.MinValue - for a NaN and for anything out of range. Saturating
+      answered Int64.MAX for +1e30 and 0 for a NaN, so the module and the interpreter disagreed on
+      every one of those inputs. Nothing caught it because no corpus program converts a float that far
+      out, which is exactly how a silent divergence survives.
+
+      ⭐ Reproducing the interpreter needs a GUARD - is the value in range? - and once the guard is
+      there the TRAPPING truncation is the right instruction, because the guard has already excluded
+      every input that could trap. The trap is unreachable by construction, which is the only honest
+      way to use it: the reason it was avoided was that it would kill the module, and a trap that
+      cannot be reached kills nothing. NaN fails both comparisons and takes the same road. }
+    ssaFloatToInt, ssaFloatRound:
       begin
-        // The IMPLICIT conversion is dialect-dependent: FreeBASIC rounds half to
-        // even (which is exactly f64.nearest), Commodore v7 truncates. Saturating
-        // truncation, because the trapping form would kill the module over a NaN.
         LoadReg(B, Instr.Src1);
-        if FModern then B.Op(wopF64Nearest);
-        B.TruncSat(wopfcI64TruncSatF64S);
-        StoreReg(B, Instr.Dest);
-      end;
-    ssaFloatRound:
-      begin
-        LoadReg(B, Instr.Src1);
-        B.Op(wopF64Nearest);
-        B.TruncSat(wopfcI64TruncSatF64S);
+        if FModern or (Instr.OpCode = ssaFloatRound) then B.Op(wopF64Nearest);
+        B.LocalTee(FFltTmp);
+        B.F64Const(-9223372036854775808.0);
+        B.Op(wopF64Ge);
+        B.LocalGet(FFltTmp);
+        B.F64Const(9223372036854775808.0);
+        B.Op(wopF64Lt);
+        B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_TYPE_I64);   // an `if` that yields an i64
+          B.LocalGet(FFltTmp);
+          B.Op(wopI64TruncF64S);           // in range: the trap here cannot fire
+        B.Op(wopElse);
+          B.I64Const(Int64($8000000000000000));   // cvttsd2si's answer for everything else
+        B.EndOp;
         StoreReg(B, Instr.Dest);
       end;
 
