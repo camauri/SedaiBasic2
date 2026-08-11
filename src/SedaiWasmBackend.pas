@@ -239,6 +239,11 @@ type
       the other and a float only differs by a reinterpretation at the edge. }
     FUsesPack: Boolean;
     FStrPackFunc, FStrUnpackFunc: LongWord;
+    { The WSTRING family. ⭐ A wide string here is UTF-8 bytes in the ORDINARY
+      string bank - the decision is [[wstring-encoding-decision]] - so none of
+      this needs a second storage, only a second way of COUNTING. }
+    FUsesWide: Boolean;
+    FWLenFunc, FWSubFunc, FWEncFunc, FWB2CPFunc, FWRepFunc: LongWord;
     FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
     FGfxPsetFunc, FGfxLineFunc: LongWord;
     FPenX, FPenY: LongWord;             // globals: the current graphics point
@@ -372,6 +377,7 @@ type
     procedure EmitBaseHelper;
     procedure EmitTrimSetHelper;
     procedure EmitPackHelpers;
+    procedure EmitWideHelpers;
     function EmitRegion(R: Integer): Boolean;
     function FloatRegUses(First, N, RegIdx: Integer): Integer;
     function IntRegUses(First, N, RegIdx: Integer): Integer;
@@ -635,6 +641,7 @@ begin
   FUsesBase := False;
   FUsesTrimSet := False;
   FUsesPack := False;
+  FUsesWide := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -711,6 +718,12 @@ begin
           begin FUsesTrimSet := True; FUsesStr := True; end;
         ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat:
           begin FUsesPack := True; FUsesStr := True; end;
+        { ⚠️ The two WSTRING searches lean on strFind, so they need the ordinary
+          string helpers as well as the wide ones - and FUsesStr already brings
+          strFind in, since it is unconditional in that block. }
+        ssaStrLenW, ssaStrLeftW, ssaStrRightW, ssaStrMidW,
+        ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN:
+          begin FUsesWide := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
         { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
@@ -2530,6 +2543,286 @@ begin
   EmitBaseHelper;
   EmitTrimSetHelper;
   EmitPackHelpers;
+  EmitWideHelpers;
+end;
+
+{ The WSTRING family, as five functions that all say the same thing in different
+  words: a CODEPOINT is any byte that is not a UTF-8 continuation byte.
+
+  ⭐ A wide string is stored as UTF-8 in the ordinary string bank, which is the
+  project's decision and not an accident of this backend - so LEN, LEFT$, MID$
+  and the rest need no second storage, only a second way of COUNTING. Everything
+  below is that one test, `(b and $C0) <> $80`, applied five ways.
+  ⭐⭐ And the two searches need nothing new at all: INSTR of a wide string is
+  the ORDINARY byte search followed by a byte-to-codepoint conversion, because a
+  UTF-8 substring can only match at a codepoint boundary. INSTRREV is the same
+  with strFind's direction bit set - which is why the interpreter can get away
+  with scanning bytes there too. }
+procedure TWasmBackend.EmitWideHelpers;
+var
+  B: TWasmBuf;
+  TLen, TSub, TEnc, TB2CP, TRep: LongWord;
+
+  { The continuation test, on the byte already loaded. Leaves 1 when the byte
+    STARTS a codepoint. }
+  procedure EmitIsLead;
+  begin
+    B.I32Const($C0); B.Op(wopI32And);
+    B.I32Const($80); B.Op(wopI32Ne);
+  end;
+
+begin
+  if not FUsesWide then Exit;
+  TLen  := FModule.TypeIndex([wvtI32], [wvtI64]);
+  TSub  := FModule.TypeIndex([wvtI32, wvtI64, wvtI64], [wvtI32]);
+  TEnc  := FModule.TypeIndex([wvtI64], [wvtI32]);
+  TB2CP := FModule.TypeIndex([wvtI32, wvtI64], [wvtI64]);
+  TRep  := FModule.TypeIndex([wvtI64, wvtI64], [wvtI32]);
+
+  { wLen(s) -> how many codepoints the bytes hold. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = s; locals 1 = len, 2 = base, 3 = i, 4 = n
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(1);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(2);
+    B.I32Const(0); B.LocalSet(3);
+    B.I32Const(0); B.LocalSet(4);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(3); B.LocalGet(1); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(4);
+        B.LocalGet(2); B.LocalGet(3); B.Op(wopI32Add); B.OpMem(wopI32Load8U, 0, 0);
+        EmitIsLead;
+        B.Op(wopI32Add); B.LocalSet(4);
+        B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(3);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(4); B.Op(wopI64ExtendI32S);
+    FModule.AddFunction(TLen, [wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { wSub(s, cpStart, cpCount) -> the substring covering cpCount codepoints from
+    the 1-based codepoint cpStart, clamped at both ends. Mirrors Utf8SubCP. }
+  B := TWasmBuf.Create;
+  try
+    // params 0=s 1=cpStart 2=cpCount; locals 3=n 4=base 5=i 6=cp
+    //         7=bStart 8=bEnd 9=cs 10=cc 11=handle
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(4);
+    { ⛔ BOTH ARGUMENTS ARE CLAMPED BEFORE THEY NARROW, and not for tidiness: a
+      count of 2^32+5 wrapped straight to i32 would come out as 5 and cut a
+      string that should have been copied whole. No string can hold more
+      codepoints than it has bytes, so n is a clamp that changes no answer. }
+    B.LocalGet(1); B.I64Const(1); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(1);
+    B.Op(wopElse);
+      B.LocalGet(1); B.LocalGet(3); B.Op(wopI64ExtendI32S); B.Op(wopI64GtS);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add);
+      B.Op(wopElse);
+        B.LocalGet(1); B.Op(wopI32WrapI64);
+      B.EndOp;
+    B.EndOp;
+    B.LocalSet(9);
+    B.LocalGet(2); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(0);
+    B.Op(wopElse);
+      B.LocalGet(2); B.LocalGet(3); B.Op(wopI64ExtendI32S); B.Op(wopI64GtS);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.LocalGet(3);
+      B.Op(wopElse);
+        B.LocalGet(2); B.Op(wopI32WrapI64);
+      B.EndOp;
+    B.EndOp;
+    B.LocalSet(10);
+
+    B.LocalGet(3); B.LocalSet(7);          // bStart: past the end = empty
+    B.LocalGet(3); B.LocalSet(8);          // bEnd:   past the end = to the end
+    B.I32Const(0); B.LocalSet(6);
+    B.I32Const(0); B.LocalSet(5);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(5); B.LocalGet(3); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(4); B.LocalGet(5); B.Op(wopI32Add); B.OpMem(wopI32Load8U, 0, 0);
+        EmitIsLead;
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
+          B.LocalGet(6); B.LocalGet(9); B.Op(wopI32Eq);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(5); B.LocalSet(7);
+          B.EndOp;
+          B.LocalGet(6); B.LocalGet(9); B.LocalGet(10); B.Op(wopI32Add); B.Op(wopI32Eq);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(5); B.LocalSet(8);
+            B.Br(3);
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(5);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+
+    B.LocalGet(7); B.LocalGet(3); B.Op(wopI32GeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Call(FStrNewFunc); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(8); B.LocalGet(7); B.Op(wopI32Sub); B.LocalTee(5);
+    B.Call(FStrNewFunc); B.LocalTee(11);
+    B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(4); B.LocalGet(7); B.Op(wopI32Add);
+    B.LocalGet(5);
+    B.MemoryCopy;
+    B.LocalGet(11);
+    FModule.AddFunction(TSub, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                               wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { wEnc(cp) -> the UTF-8 bytes of one codepoint. Out of range becomes U+FFFD,
+    which is what Utf8EncodeCP does.
+    ⚠️ Surrogates are NOT rejected, deliberately: the interpreter encodes them,
+    and agreeing with sb is the contract. }
+  B := TWasmBuf.Create;
+  try
+    // param 0 = cp; locals 1 = c, 2 = handle, 3 = p
+    B.LocalGet(0); B.I64Const(0); B.Op(wopI64LtS);
+    B.LocalGet(0); B.I64Const($10FFFF); B.Op(wopI64GtS);
+    B.Op(wopI32Or);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const($FFFD);
+    B.Op(wopElse);
+      B.LocalGet(0); B.Op(wopI32WrapI64);
+    B.EndOp;
+    B.LocalSet(1);
+
+    B.LocalGet(1); B.I32Const($80); B.Op(wopI32LtU);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(1); B.Call(FStrNewFunc); B.LocalTee(2);
+      B.I32Const(4); B.Op(wopI32Add);
+      B.LocalGet(1); B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.LocalGet(1); B.I32Const($800); B.Op(wopI32LtU);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(2); B.Call(FStrNewFunc); B.LocalTee(2);
+        B.I32Const(4); B.Op(wopI32Add); B.LocalSet(3);
+        B.LocalGet(3);
+        B.LocalGet(1); B.I32Const(6); B.Op(wopI32ShrU); B.I32Const($C0); B.Op(wopI32Or);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(3);
+        B.LocalGet(1); B.I32Const($3F); B.Op(wopI32And); B.I32Const($80); B.Op(wopI32Or);
+        B.OpMem(wopI32Store8, 0, 1);
+      B.Op(wopElse);
+        B.LocalGet(1); B.I32Const($10000); B.Op(wopI32LtU);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(3); B.Call(FStrNewFunc); B.LocalTee(2);
+          B.I32Const(4); B.Op(wopI32Add); B.LocalSet(3);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const(12); B.Op(wopI32ShrU); B.I32Const($E0); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const(6); B.Op(wopI32ShrU);
+          B.I32Const($3F); B.Op(wopI32And); B.I32Const($80); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 1);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const($3F); B.Op(wopI32And); B.I32Const($80); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 2);
+        B.Op(wopElse);
+          B.I32Const(4); B.Call(FStrNewFunc); B.LocalTee(2);
+          B.I32Const(4); B.Op(wopI32Add); B.LocalSet(3);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const(18); B.Op(wopI32ShrU); B.I32Const($F0); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const(12); B.Op(wopI32ShrU);
+          B.I32Const($3F); B.Op(wopI32And); B.I32Const($80); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 1);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const(6); B.Op(wopI32ShrU);
+          B.I32Const($3F); B.Op(wopI32And); B.I32Const($80); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 2);
+          B.LocalGet(3);
+          B.LocalGet(1); B.I32Const($3F); B.Op(wopI32And); B.I32Const($80); B.Op(wopI32Or);
+          B.OpMem(wopI32Store8, 0, 3);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(2);
+    FModule.AddFunction(TEnc, [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { wB2CP(s, bytePos) -> the 1-based CODEPOINT position of a 1-based BYTE
+    position. 0 stays 0, which is how "not found" travels through it. }
+  B := TWasmBuf.Create;
+  try
+    // params 0 = s, 1 = bytePos; locals 2 = len, 3 = base, 4 = i, 5 = n
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64LeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(2);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(3);
+    B.I32Const(0); B.LocalSet(4);
+    B.I32Const(0); B.LocalSet(5);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        // stop at the byte position asked for, or at the end - whichever first
+        B.LocalGet(4); B.Op(wopI64ExtendI32S); B.LocalGet(1); B.Op(wopI64GeS); B.BrIf(1);
+        B.LocalGet(4); B.LocalGet(2); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(5);
+        B.LocalGet(3); B.LocalGet(4); B.Op(wopI32Add); B.OpMem(wopI32Load8U, 0, 0);
+        EmitIsLead;
+        B.Op(wopI32Add); B.LocalSet(5);
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(5); B.Op(wopI64ExtendI32S);
+    FModule.AddFunction(TB2CP, [wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { wRep(count, cp) -> count copies of one codepoint's bytes. WSTRING(n, cp). }
+  B := TWasmBuf.Create;
+  try
+    // params 0 = count, 1 = cp; locals 2 = one, 3 = L, 4 = cnt, 5 = handle, 6 = dst
+    B.LocalGet(1); B.Call(FWEncFunc); B.LocalTee(2);
+    B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.LocalGet(0); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(0);
+    B.Op(wopElse);
+      B.LocalGet(0); B.Op(wopI32WrapI64);
+    B.EndOp;
+    B.LocalSet(4);
+    B.LocalGet(4); B.LocalGet(3); B.Op(wopI32Mul);
+    B.Call(FStrNewFunc); B.LocalTee(5);
+    B.I32Const(4); B.Op(wopI32Add); B.LocalSet(6);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.Op(wopI32Eqz); B.BrIf(1);
+        B.LocalGet(6);
+        B.LocalGet(2); B.I32Const(4); B.Op(wopI32Add);
+        B.LocalGet(3);
+        B.MemoryCopy;
+        B.LocalGet(6); B.LocalGet(3); B.Op(wopI32Add); B.LocalSet(6);
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(5);
+    FModule.AddFunction(TRep, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
 end;
 
 { MKI$/MKL$/MKSHORT$/MKLONGINT$/MKS$/MKD$ and their eight CV* inverses, as TWO
@@ -6611,6 +6904,93 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { ---- WSTRING: the same operations counted in CODEPOINTS ---- }
+    ssaStrLenW:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FWLenFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrLeftW:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I64Const(1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FWSubFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { RIGHT$ of a wide string has to COUNT before it can cut - there is no
+      walking backwards through UTF-8 - so the start is total - count + 1.
+      ⭐ AND THE CLAMPS ARE NOT REPEATED HERE. The interpreter clamps count to
+      the total before computing the start; wSub already clamps both its own
+      arguments, and the two produce the same answer on every case: a count
+      above the total gives a start at or below zero, which clamps to 1 and
+      returns the whole string, and a negative one gives a start past the end,
+      which returns empty. Clamping twice would be a second place to disagree. }
+    ssaStrRightW:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src1); B.Call(FWLenFunc);
+        LoadReg(B, Instr.Src2); B.Op(wopI64Sub);
+        B.I64Const(1); B.Op(wopI64Add);
+        LoadReg(B, Instr.Src2);
+        B.Call(FWSubFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { MID$ of a wide string. ⚠️ A NEGATIVE length means "the rest", and the
+      interpreter makes that rule conditional on MODERN - which is the only
+      dialect this target accepts, so it applies unconditionally here. }
+    ssaStrMidW:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        LoadReg(B, Instr.Src3);
+        B.I64Const(0); B.Op(wopI64LtS);
+        B.BlockStart(wopIf, WASM_TYPE_I64);
+          LoadReg(B, Instr.Src1); B.Call(FWLenFunc);
+          LoadReg(B, Instr.Src2); B.Op(wopI64Sub);
+          B.I64Const(1); B.Op(wopI64Add);
+        B.Op(wopElse);
+          LoadReg(B, Instr.Src3);
+        B.EndOp;
+        B.Call(FWSubFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { ⭐ The two wide searches need NO wide search: a UTF-8 substring can only
+      match at a codepoint boundary, so the ordinary byte search answers, and the
+      only wide step is turning its byte position into a codepoint one. That is
+      why the interpreter scans bytes here too. }
+    ssaStrInstrW, ssaStrInstrRevW:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.I64Const(1);
+        if Instr.OpCode = ssaStrInstrRevW then B.I32Const(1) else B.I32Const(0);
+        B.Call(FStrFindFunc);
+        B.Call(FWB2CPFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrWChr:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FWEncFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrWStringN:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.Call(FWRepFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaStrUCase, ssaStrLCase:
       begin
         LoadReg(B, Instr.Src1);
@@ -9376,6 +9756,15 @@ begin
       FStrPackFunc := Next;
       FStrUnpackFunc := Next + 1;
       Inc(Next, 2);
+    end;
+    if FUsesWide then
+    begin
+      FWLenFunc  := Next;
+      FWSubFunc  := Next + 1;
+      FWEncFunc  := Next + 2;
+      FWB2CPFunc := Next + 3;
+      FWRepFunc  := Next + 4;
+      Inc(Next, 5);
     end;
   end;
 
