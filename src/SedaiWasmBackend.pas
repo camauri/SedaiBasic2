@@ -7152,22 +7152,27 @@ begin
           B.F64Const(9223372036854775808.0);
           B.Op(wopF64Ge);
           B.BlockStart(wopIf, WASM_TYPE_I64);
-            // High half. The subtraction is exact, and lands in [0, ...): in range unless d was at
-            // or above 2^64, which is the second test.
+            // ⭐ High half - and this is the ONE place where WASM has the exact operation: inside
+            // [2^63, 2^64) i64.trunc_f64_u IS the interpreter's answer, in a single instruction.
+            // It traps on a negative input and out of range, which is why it cannot be the whole
+            // lowering; but here the two comparisons in front of it have already excluded every
+            // input it would trap on, so the trap is unreachable by construction - the same argument
+            // that brought i64.trunc_f64_s back on merit.
+            // It replaces a bias-subtract, a signed truncation and a wrapping add: shorter code that
+            // happens to be one more instruction of the core set, which is the right order of those
+            // two facts.
             B.LocalGet(FFltTmp);
-            B.F64Const(9223372036854775808.0);
-            B.Op(wopF64Sub);
-            B.LocalTee(FFltTmp);
-            B.F64Const(9223372036854775808.0);
+            B.F64Const(18446744073709551616.0);     // 2^64, exactly representable
             B.Op(wopF64Lt);
             B.BlockStart(wopIf, WASM_TYPE_I64);
               B.LocalGet(FFltTmp);
-              B.Op(wopI64TruncF64S);
+              B.Op(wopI64TruncF64U);
             B.Op(wopElse);
-              B.I64Const(Int64($8000000000000000));
+              // 2^64 and above, +inf included: the interpreter's bias arithmetic wraps to ZERO here
+              // (the indefinite plus 2^63), not to the indefinite. MEASURED against fbc, which gives
+              // 0 for 2^64, 1e20, 1e30 and +inf alike.
+              B.I64Const(0);
             B.EndOp;
-            B.I64Const(Int64($8000000000000000));   // + 2^63, the same bit pattern
-            B.Op(wopI64Add);
           B.Op(wopElse);
             // Low half - and a NaN reaches here too, both of its comparisons being false, which is
             // how it arrives at the indefinite without a single explicit NaN test.
