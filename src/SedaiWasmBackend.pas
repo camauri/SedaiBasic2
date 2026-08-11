@@ -836,6 +836,10 @@ begin
           begin FUsesBool := True; FUsesPrint := True; end;
         ssaStrErr:
           begin FUsesErrName := True; FUsesStr := True; end;
+        { SADD hands back a RAW pointer, so it needs the raw-heap machinery as
+          well as the string bank. }
+        ssaStrSAdd:
+          begin FUsesStr := True; FUsesGfx := True; FUsesHeap := True; end;
         ssaMathRnd:
           begin FUsesRnd := True; FUsesHeap := True; end;
         { ⚠️ RANDOMIZE without a seed is time-based, so it needs the clock the
@@ -8339,6 +8343,42 @@ begin
         B.F64Const(60.0); B.Op(wopF64Mul); B.Op(wopF64Add);
         LoadReg(B, Instr.Src3); B.Op(wopF64ConvertI64S); B.Op(wopF64Add);
         B.F64Const(86400.0); B.Op(wopF64Div);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { SADD(s) -> a raw pointer to a NUL-terminated COPY of the bytes, allocated
+      the way RawAlloc allocates: an eight-byte header holding the payload size,
+      then the payload rounded up to eight. The pointer that comes back is the
+      tagged form - region bit clear, offset relative to the heap base - so
+      everything that already dereferences a raw pointer reads it without
+      knowing where it came from.
+      ⚠️ A COPY, and read-only in effect: writing through it does not reach the
+      managed string, exactly as the interpreter documents. A managed string has
+      no stable mutable buffer address to hand out.
+      ⛔ And the value is only meaningful INSIDE the module. SADD exists to hand
+      a ZSTRING to foreign code, and a .wasm has no foreign code to hand it to -
+      it is covered because a program may compute with it, not because the
+      address means anything outside. }
+    ssaStrSAdd:
+      begin
+        LoadReg(B, Instr.Src1); B.LocalTee(FArrTmp);
+        B.OpMem(wopI32Load, 2, 0); B.LocalSet(FGfxN);          // the byte length
+        B.LocalGet(FGfxN); B.I32Const(8); B.Op(wopI32Add);     // len + 1, rounded up to 8
+        B.I32Const(-8); B.Op(wopI32And); B.LocalSet(FRecTmp);
+        B.LocalGet(FRecTmp); B.I32Const(8); B.Op(wopI32Add);
+        B.Call(FAllocFunc); B.LocalTee(FGfxP);
+        B.LocalGet(FRecTmp);
+        B.OpMem(wopI32Store, 2, 0);                            // the size header
+        B.LocalGet(FGfxP); B.I32Const(8); B.Op(wopI32Add);
+        B.LocalGet(FArrTmp); B.I32Const(4); B.Op(wopI32Add);
+        B.LocalGet(FGfxN);
+        B.MemoryCopy;
+        B.LocalGet(FGfxP); B.LocalGet(FGfxN); B.Op(wopI32Add);
+        B.I32Const(0); B.OpMem(wopI32Store8, 0, 8);            // the NUL
+        B.LocalGet(FGfxP); B.I32Const(8); B.Op(wopI32Add);
+        B.I32Const(LongInt(FHeapBase)); B.Op(wopI32Sub);
+        B.Op(wopI64ExtendI32U);
+        B.I64Const(RAWPTR_TAG); B.Op(wopI64Or);
         StoreReg(B, Instr.Dest);
       end;
 
