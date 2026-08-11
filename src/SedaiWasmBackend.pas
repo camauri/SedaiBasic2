@@ -8486,20 +8486,17 @@ begin
           Exit(Fail('ssaArrayErase names an array that was never declared'));
         Info := FProg.GetArray(Instr.Src1.ArrayIndex);
         Desc := FArrDescOf[Instr.Src1.ArrayIndex];
-        { ⛔ "IS THIS ARRAY DYNAMIC" IS ASKED OF THE ARRAY, not of the
-          instruction. The flag the front end packs into Src3 arrives here as
-          zero - the bytecode's immediate carries it, but by the time this
-          backend sees the SSA it does not - and reading it gave a dynamic ERASE
-          that silently behaved like a static one: the elements were cleared and
-          the bounds survived, so LBound/UBound answered 1 and 4 where the
-          interpreter answers 0 and -1.
-          ⭐ The array's own declaration settles it and cannot go stale: a
-          dimension of size 0 is what "runtime-sized" means here, and that is
-          exactly the shape ERASE frees. A property of the array belongs to the
-          array. }
-        IsDyn := (Info.DimCount = 0) or (Instr.Src3.ConstInt <> 0);
-        for d := 0 to Info.DimCount - 1 do
-          if (d > High(Info.Dimensions)) or (Info.Dimensions[d] = 0) then IsDyn := True;
+        { ⚠️⚠️ AND HERE IS A MISDIAGNOSIS WORTH LEAVING WRITTEN DOWN. This read
+          "ask the ARRAY, because the flag in Src3 arrives as zero" for a while,
+          and the flag arrives perfectly - it was measured wrong. A dynamic ERASE
+          that clears the block, the count and the dimension number but NOT the
+          per-dimension bounds answers LBound 1 and UBound 4 - which is exactly
+          what a STATIC erase answers too. The symptom could not tell the two
+          branches apart, I picked the wrong one, and then "confirmed" it by
+          changing the branch test and the bound clearing in the SAME step.
+          ⇒ The bug was only ever the bounds, below. The flag is the front end's
+          own answer and is used as it stands. }
+        IsDyn := Instr.Src3.ConstInt <> 0;
         if IsDyn then
         begin
           B.I32Const(LongInt(Desc));      B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
