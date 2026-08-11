@@ -251,6 +251,8 @@ type
     FDtIvalFunc, FDtIncMoFunc, FDtDoyFunc, FDtWoyFunc, FDtYMFunc: LongWord;
     FUsesDateStr: Boolean;              // DATE$ / TIME$: the rendering, on top of the calendar
     FDtStrFunc: LongWord;
+    FUsesDateParse: Boolean;            // DATEVALUE / TIMEVALUE / ISDATE
+    FDtFindFunc, FDtFieldsFunc, FDtDatePartFunc, FDtTimePartFunc, FDtParseFunc: LongWord;
     FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
     FGfxPsetFunc, FGfxLineFunc: LongWord;
     FPenX, FPenY: LongWord;             // globals: the current graphics point
@@ -388,6 +390,9 @@ type
     procedure EmitDateHelpers;
     function BuildDateNameBlob: AnsiString;
     procedure EmitTwoDigits(B: TWasmBuf; Base, Val: LongWord; Off: LongWord);
+    procedure EmitDateParseHelpers;
+    procedure EmitFlushField(B: TWasmBuf);
+    procedure EmitTrimRange(B: TWasmBuf; Base, Lo, Hi, Tmp: LongWord);
     procedure EmitDatePartSwitch(B: TWasmBuf);
     procedure EmitDateAddSwitch(B: TWasmBuf; Instr: TSSAInstruction);
     procedure EmitDateDiffSwitch(B: TWasmBuf; Instr: TSSAInstruction);
@@ -550,7 +555,21 @@ const
     ⛔ They are the ENGLISH names and there is no locale path: the interpreter
     has one (LocaleDayName) but nothing ever turns it on - SetDateLocaleMode has
     no caller - and a sandbox has no locale to read anyway. }
-  DT_NAMES     = 10496;   // the table of 19 handles, then the strings
+  { DATEVALUE / TIMEVALUE / ISDATE. ⛔ ONLY the DETERMINISTIC forms - "yyyy-mm-dd",
+    "yyyy/mm/dd", "hh:mm[:ss]", either of them alone, the two separated by a
+    space, with an optional AM/PM. The interpreter falls back to the HOST's date
+    parser for anything else, and a sandbox has no host to ask; that divergence
+    is the one the project already declared when it made the deterministic path
+    the default (a parse that changes with the machine's regional settings is not
+    diffable and its baselines are not reproducible). }
+  DT_BAD       = -999999; // the "this field was not a number" sentinel, as SplitInts uses
+  DT_PARSE     = 10472;   // f64: the parsed serial
+  DT_F0        = 10480;   // the three integer fields a split leaves behind
+  DT_F1        = 10484;
+  DT_F2        = 10488;
+  DT_PD        = 10496;   // f64: the date half, once it has parsed
+  DT_PT        = 10504;   // f64: and the time half
+  DT_NAMES     = 10560;   // the table of 19 handles, then the strings
   DT_NAME_COUNT = 19;
   VAL_DIGCAP   = 800;
   VAL_MAXDIG   = 1500;    // ⛔ must stay under PU_NINT - FLT_DEC = 2048
@@ -677,6 +696,7 @@ begin
   FUsesDate := False;
   FUsesDateName := False;
   FUsesDateStr := False;
+  FUsesDateParse := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -776,6 +796,8 @@ begin
         ssaDateStr:
           begin FUsesDateStr := True; FUsesDate := True;
                 FUsesClock := True; FUsesStr := True; end;
+        ssaDateValue, ssaIsDate:
+          begin FUsesDateParse := True; FUsesDate := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
         { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
@@ -3611,6 +3633,434 @@ begin
       B.Free;
     end;
   end;
+end;
+
+{ The DATEVALUE / TIMEVALUE / ISDATE parser, as five small functions rather than
+  one long body - each has its own locals, which is what keeps the branch depths
+  readable.
+
+  ⛔ THE DETERMINISTIC FORMS ONLY, and that is a declared boundary and not an
+  omission: the interpreter hands anything it does not recognise to the HOST's
+  date parser, whose answer depends on the machine's regional settings, and a
+  sandbox has no host to ask. This project already chose the deterministic path
+  as its default for exactly that reason - a result that changes with the
+  machine is not diffable and its baselines are not reproducible - so the module
+  simply has nothing else to fall into. Accepted: "yyyy-mm-dd", "yyyy/mm/dd",
+  "hh:mm[:ss]", either alone, the two separated by a space, with an optional
+  trailing AM or PM. Anything else answers 0 / false. }
+procedure TWasmBackend.EmitDateParseHelpers;
+var
+  B: TWasmBuf;
+begin
+  if not FUsesDateParse then Exit;
+
+  { dtFind(base, from, upto, ch) -> the first index holding ch, or -1. }
+  B := TWasmBuf.Create;
+  try
+    // params 0=base 1=from 2=upto 3=ch; local 4=i
+    B.LocalGet(1); B.LocalSet(4);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.LocalGet(2); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(0); B.LocalGet(4); B.Op(wopI32Add); B.OpMem(wopI32Load8U, 0, 0);
+        B.LocalGet(3); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(4); B.Op(wopReturn);
+        B.EndOp;
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.I32Const(-1);
+    FModule.AddFunction(FModule.TypeIndex([wvtI32, wvtI32, wvtI32, wvtI32], [wvtI32]),
+                        [wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { dtFields(base, len, sep) -> the field count (2 or 3), or -1, with the values
+    at DT_F0..DT_F2. Mirrors SplitInts: spaces around a field are ignored, a
+    THIRD field that is not a number becomes 0 rather than failing, but a bad
+    first or second field fails the whole split - which is the asymmetry that
+    lets "12:30" parse while "12:ab" does not. }
+  B := TWasmBuf.Create;
+  try
+    // params 0=base 1=len 2=sep; locals 3=i 4=n 5=acc 6=neg 7=any 8=bad 9=c 10=v
+    B.I32Const(DT_F0); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(DT_F1); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(DT_F2); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+    B.I32Const(0); B.LocalSet(3);
+    B.I32Const(0); B.LocalSet(4);
+    B.I32Const(0); B.LocalSet(5);
+    B.I32Const(0); B.LocalSet(6);
+    B.I32Const(0); B.LocalSet(7);
+    B.I32Const(0); B.LocalSet(8);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(3); B.LocalGet(1); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(0); B.LocalGet(3); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.LocalSet(9);
+        B.LocalGet(9); B.LocalGet(2); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          EmitFlushField(B);
+          B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+          B.LocalGet(4); B.I32Const(2); B.Op(wopI32GtS);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(-1); B.Op(wopReturn);              // more than three fields
+          B.EndOp;
+          B.I32Const(0); B.LocalSet(5);
+          B.I32Const(0); B.LocalSet(6);
+          B.I32Const(0); B.LocalSet(7);
+          B.I32Const(0); B.LocalSet(8);
+        B.Op(wopElse);
+          B.LocalGet(9); B.I32Const(Ord('0')); B.Op(wopI32GeU);
+          B.LocalGet(9); B.I32Const(Ord('9')); B.Op(wopI32LeU);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.LocalGet(5); B.I32Const(10); B.Op(wopI32Mul);
+            B.LocalGet(9); B.I32Const(Ord('0')); B.Op(wopI32Sub); B.Op(wopI32Add);
+            B.LocalSet(5);
+            B.I32Const(1); B.LocalSet(7);
+          B.Op(wopElse);
+            B.LocalGet(9); B.I32Const(Ord('-')); B.Op(wopI32Eq);
+            B.LocalGet(7); B.Op(wopI32Eqz); B.Op(wopI32And);
+            B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+              B.I32Const(1); B.LocalSet(6);
+            B.Op(wopElse);
+              B.LocalGet(9); B.I32Const(32); B.Op(wopI32Ne);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.I32Const(1); B.LocalSet(8);
+              B.EndOp;
+            B.EndOp;
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(3);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    EmitFlushField(B);
+    // one field alone is never a date or a time
+    B.LocalGet(4); B.I32Const(1); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(-1); B.Op(wopReturn);
+    B.EndOp;
+    B.I32Const(DT_F0); B.OpMem(wopI32Load, 2, 0); B.I32Const(DT_BAD); B.Op(wopI32Eq);
+    B.I32Const(DT_F1); B.OpMem(wopI32Load, 2, 0); B.I32Const(DT_BAD); B.Op(wopI32Eq);
+    B.Op(wopI32Or);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(-1); B.Op(wopReturn);
+    B.EndOp;
+    // a third field that is not a number is zero, exactly as StrToIntDef(…, 0) gives it
+    B.I32Const(DT_F2); B.OpMem(wopI32Load, 2, 0); B.I32Const(DT_BAD); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(DT_F2); B.I32Const(0); B.OpMem(wopI32Store, 2, 0);
+    B.EndOp;
+    B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add);
+    FModule.AddFunction(FModule.TypeIndex([wvtI32, wvtI32, wvtI32], [wvtI32]),
+                        [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { dtDatePart(base, len) -> 1 and DT_PD when the range is a date. }
+  B := TWasmBuf.Create;
+  try
+    // params 0=base 1=len; locals 2=sep 3=y 4=mo 5=d 6=dim
+    B.LocalGet(0); B.I32Const(0); B.LocalGet(1); B.I32Const(Ord('-'));
+    B.Call(FDtFindFunc);
+    B.I32Const(0); B.Op(wopI32GeS);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(Ord('-'));
+    B.Op(wopElse);
+      B.LocalGet(0); B.I32Const(0); B.LocalGet(1); B.I32Const(Ord('/'));
+      B.Call(FDtFindFunc);
+      B.I32Const(0); B.Op(wopI32GeS);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.I32Const(Ord('/'));
+      B.Op(wopElse);
+        B.I32Const(0);                                    // no separator: not a date we know
+      B.EndOp;
+    B.EndOp;
+    B.LocalTee(2); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0); B.LocalGet(1); B.LocalGet(2); B.Call(FDtFieldsFunc);
+    B.I32Const(3); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);                     // "yyyy-mm" is not a date
+    B.EndOp;
+    B.I32Const(DT_F0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.I32Const(DT_F1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+    B.I32Const(DT_F2); B.OpMem(wopI32Load, 2, 0); B.LocalSet(5);
+    { The same ranges TryEncodeDate enforces, the day against the length of ITS
+      OWN month - which comes from the calendar (the 1st of the next month minus
+      the 1st of this one), so February and the leap rule need no special case. }
+    B.LocalGet(3); B.I32Const(1); B.Op(wopI32LtS);
+    B.LocalGet(3); B.I32Const(9999); B.Op(wopI32GtS); B.Op(wopI32Or);
+    B.LocalGet(4); B.I32Const(1); B.Op(wopI32LtS); B.Op(wopI32Or);
+    B.LocalGet(4); B.I32Const(12); B.Op(wopI32GtS); B.Op(wopI32Or);
+    B.LocalGet(5); B.I32Const(1); B.Op(wopI32LtS); B.Op(wopI32Or);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(3);
+    B.LocalGet(4); B.I32Const(12); B.Op(wopI32Eq); B.Op(wopI32Add); B.Op(wopI64ExtendI32S);
+    B.LocalGet(4); B.I32Const(12); B.Op(wopI32Eq);
+    B.BlockStart(wopIf, WASM_TYPE_I64);
+      B.I64Const(1);
+    B.Op(wopElse);
+      B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.Op(wopI64ExtendI32S);
+    B.EndOp;
+    B.I64Const(1); B.Call(FDtDaysFunc);
+    B.LocalGet(3); B.Op(wopI64ExtendI32S);
+    B.LocalGet(4); B.Op(wopI64ExtendI32S);
+    B.I64Const(1); B.Call(FDtDaysFunc);
+    B.Op(wopI64Sub); B.Op(wopI32WrapI64); B.LocalSet(6);
+    B.LocalGet(5); B.LocalGet(6); B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.I32Const(DT_PD);
+    B.LocalGet(3); B.Op(wopI64ExtendI32S);
+    B.LocalGet(4); B.Op(wopI64ExtendI32S);
+    B.LocalGet(5); B.Op(wopI64ExtendI32S);
+    B.Call(FDtDaysFunc); B.Op(wopF64ConvertI64S);
+    B.OpMem(wopF64Store, 3, 0);
+    B.I32Const(1);
+    FModule.AddFunction(FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]),
+                        [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { dtTimePart(base, len) -> 1 and DT_PT when the range is a time. }
+  B := TWasmBuf.Create;
+  try
+    // params 0=base 1=len; locals 2=h 3=m 4=s
+    B.LocalGet(0); B.I32Const(0); B.LocalGet(1); B.I32Const(Ord(':'));
+    B.Call(FDtFindFunc);
+    B.I32Const(0); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0); B.LocalGet(1); B.I32Const(Ord(':')); B.Call(FDtFieldsFunc);
+    B.I32Const(2); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.I32Const(DT_F0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(2);
+    B.I32Const(DT_F1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.I32Const(DT_F2); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+    B.LocalGet(2); B.I32Const(0); B.Op(wopI32LtS);
+    B.LocalGet(2); B.I32Const(23); B.Op(wopI32GtS); B.Op(wopI32Or);
+    B.LocalGet(3); B.I32Const(0); B.Op(wopI32LtS); B.Op(wopI32Or);
+    B.LocalGet(3); B.I32Const(59); B.Op(wopI32GtS); B.Op(wopI32Or);
+    B.LocalGet(4); B.I32Const(0); B.Op(wopI32LtS); B.Op(wopI32Or);
+    B.LocalGet(4); B.I32Const(59); B.Op(wopI32GtS); B.Op(wopI32Or);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+    { The seconds count is an INTEGER before it becomes a fraction, for the
+      reason bcTimeSerial had to learn twice: one conversion, one division. }
+    B.I32Const(DT_PT);
+    B.LocalGet(2); B.I32Const(3600); B.Op(wopI32Mul);
+    B.LocalGet(3); B.I32Const(60); B.Op(wopI32Mul); B.Op(wopI32Add);
+    B.LocalGet(4); B.Op(wopI32Add);
+    B.Op(wopF64ConvertI32S);
+    B.F64Const(86400.0); B.Op(wopF64Div);
+    B.OpMem(wopF64Store, 3, 0);
+    B.I32Const(1);
+    FModule.AddFunction(FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]),
+                        [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  { dtParse(s) -> 1 and DT_PARSE. }
+  B := TWasmBuf.Create;
+  try
+    // param 0=s; locals 1=base 2=b 3=e 4=ampm 5=sp 6=dEnd 7=tStart
+    //            8=haveD 9=haveT 10=c
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(1);
+    B.I32Const(0); B.LocalSet(2);
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+    B.I32Const(0); B.LocalSet(4);
+    B.I32Const(0); B.LocalSet(8);
+    B.I32Const(0); B.LocalSet(9);
+    B.I32Const(DT_PARSE); B.F64Const(0); B.OpMem(wopF64Store, 3, 0);
+    B.I32Const(DT_PD); B.F64Const(0); B.OpMem(wopF64Store, 3, 0);
+    B.I32Const(DT_PT); B.F64Const(0); B.OpMem(wopF64Store, 3, 0);
+    EmitTrimRange(B, 1, 2, 3, 10);
+    B.LocalGet(3); B.LocalGet(2); B.Op(wopI32LeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+
+    { ⛔ THE 12-HOUR MARKER COMES OFF FIRST, before anything else looks at the
+      string. The interpreter learned that the hard way: "07:12:28 AM" otherwise
+      splits on the SPACE, and "07:12:28" goes to the date parser, which fails
+      and takes the whole value down with it. }
+    B.LocalGet(3); B.LocalGet(2); B.Op(wopI32Sub); B.I32Const(2); B.Op(wopI32GeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.LocalGet(3); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Sub);
+      B.OpMem(wopI32Load8U, 0, 0); B.I32Const($DF); B.Op(wopI32And);
+      B.I32Const(Ord('M')); B.Op(wopI32Eq);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(1); B.LocalGet(3); B.Op(wopI32Add); B.I32Const(2); B.Op(wopI32Sub);
+        B.OpMem(wopI32Load8U, 0, 0); B.I32Const($DF); B.Op(wopI32And); B.LocalSet(10);
+        B.LocalGet(10); B.I32Const(Ord('P')); B.Op(wopI32Eq);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(2); B.LocalSet(4);
+        B.Op(wopElse);
+          B.LocalGet(10); B.I32Const(Ord('A')); B.Op(wopI32Eq);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            B.I32Const(1); B.LocalSet(4);
+          B.EndOp;
+        B.EndOp;
+        B.LocalGet(4);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(3); B.I32Const(2); B.Op(wopI32Sub); B.LocalSet(3);
+          EmitTrimRange(B, 1, 2, 3, 10);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(3); B.LocalGet(2); B.Op(wopI32LeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+
+    // a space splits date from time; failing that, a colon means it is all time
+    B.LocalGet(1); B.LocalGet(2); B.LocalGet(3); B.I32Const(Ord(' '));
+    B.Call(FDtFindFunc); B.LocalTee(5);
+    B.I32Const(0); B.Op(wopI32GeS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(5); B.LocalSet(6);
+      B.LocalGet(5); B.LocalSet(7);
+    B.Op(wopElse);
+      B.LocalGet(1); B.LocalGet(2); B.LocalGet(3); B.I32Const(Ord(':'));
+      B.Call(FDtFindFunc);
+      B.I32Const(0); B.Op(wopI32GeS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(2); B.LocalSet(6);                     // no date part
+        B.LocalGet(2); B.LocalSet(7);
+      B.Op(wopElse);
+        B.LocalGet(3); B.LocalSet(6);                     // no time part
+        B.LocalGet(3); B.LocalSet(7);
+      B.EndOp;
+    B.EndOp;
+
+    B.LocalGet(6); B.LocalGet(2); B.Op(wopI32GtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.LocalGet(2); B.Op(wopI32Add);
+      B.LocalGet(6); B.LocalGet(2); B.Op(wopI32Sub);
+      B.Call(FDtDatePartFunc); B.LocalTee(8);
+      B.Op(wopI32Eqz);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.Op(wopReturn);
+      B.EndOp;
+    B.EndOp;
+
+    EmitTrimRange(B, 1, 7, 3, 10);
+    B.LocalGet(7); B.LocalGet(3); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(1); B.LocalGet(7); B.Op(wopI32Add);
+      B.LocalGet(3); B.LocalGet(7); B.Op(wopI32Sub);
+      B.Call(FDtTimePartFunc); B.LocalTee(9);
+      B.Op(wopI32Eqz);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(0); B.Op(wopReturn);
+      B.EndOp;
+    B.EndOp;
+
+    B.LocalGet(8); B.LocalGet(9); B.Op(wopI32Or); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I32Const(0); B.Op(wopReturn);
+    B.EndOp;
+
+    { Half a day is exactly noon, so "before noon" is the whole test: 12:30 PM
+      stays 12:30 and 12:30 AM becomes 00:30, which is the rule VB and
+      FreeBASIC follow. }
+    B.LocalGet(9);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(4); B.I32Const(2); B.Op(wopI32Eq);
+      B.I32Const(DT_PT); B.OpMem(wopF64Load, 3, 0); B.F64Const(0.5); B.Op(wopF64Lt);
+      B.Op(wopI32And);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(DT_PT);
+        B.I32Const(DT_PT); B.OpMem(wopF64Load, 3, 0); B.F64Const(0.5); B.Op(wopF64Add);
+        B.OpMem(wopF64Store, 3, 0);
+      B.Op(wopElse);
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Eq);
+        B.I32Const(DT_PT); B.OpMem(wopF64Load, 3, 0); B.F64Const(0.5); B.Op(wopF64Ge);
+        B.Op(wopI32And);
+        B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+          B.I32Const(DT_PT);
+          B.I32Const(DT_PT); B.OpMem(wopF64Load, 3, 0); B.F64Const(0.5); B.Op(wopF64Sub);
+          B.OpMem(wopF64Store, 3, 0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+
+    B.I32Const(DT_PARSE);
+    B.I32Const(DT_PD); B.OpMem(wopF64Load, 3, 0);
+    B.I32Const(DT_PT); B.OpMem(wopF64Load, 3, 0);
+    B.Op(wopF64Add);
+    B.OpMem(wopF64Store, 3, 0);
+    B.I32Const(1);
+    FModule.AddFunction(FModule.TypeIndex([wvtI32], [wvtI32]),
+                        [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                         wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+end;
+
+{ dtFields' "close the field I was accumulating" step, emitted at each separator
+  and once at the end. A field that never held a digit, or held something that is
+  neither a digit nor a sign nor padding, stores the SENTINEL - which the caller
+  turns into a failure for the first two fields and into a zero for the third. }
+procedure TWasmBackend.EmitFlushField(B: TWasmBuf);
+begin
+  B.I32Const(DT_F0);
+  B.LocalGet(4); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
+  B.LocalGet(8); B.LocalGet(7); B.Op(wopI32Eqz); B.Op(wopI32Or);
+  B.BlockStart(wopIf, WASM_TYPE_I32);
+    B.I32Const(DT_BAD);
+  B.Op(wopElse);
+    B.LocalGet(6);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(0); B.LocalGet(5); B.Op(wopI32Sub);
+    B.Op(wopElse);
+      B.LocalGet(5);
+    B.EndOp;
+  B.EndOp;
+  B.OpMem(wopI32Store, 2, 0);
+end;
+
+{ Move Lo forward and Hi back over padding - every byte at or below 32, which is
+  what Trim removes. Tmp is a scratch local the caller owns. }
+procedure TWasmBackend.EmitTrimRange(B: TWasmBuf; Base, Lo, Hi, Tmp: LongWord);
+begin
+  B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+    B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(Lo); B.LocalGet(Hi); B.Op(wopI32GeS); B.BrIf(1);
+      B.LocalGet(Base); B.LocalGet(Lo); B.Op(wopI32Add);
+      B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32GtU); B.BrIf(1);
+      B.LocalGet(Lo); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(Lo);
+      B.Br(0);
+    B.EndOp;
+  B.EndOp;
+  B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+    B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(Hi); B.LocalGet(Lo); B.Op(wopI32LeS); B.BrIf(1);
+      B.LocalGet(Base); B.LocalGet(Hi); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Sub);
+      B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32GtU); B.BrIf(1);
+      B.LocalGet(Hi); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(Hi);
+      B.Br(0);
+    B.EndOp;
+  B.EndOp;
+  if Tmp = 0 then ;   // the parameter exists so callers can pass their scratch
 end;
 
 { Two zero-padded decimal digits of local Val, written at Base + Off. }
@@ -7689,6 +8139,40 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { DATEVALUE / TIMEVALUE (the immediate picks the half) and ISDATE. A parse
+      that fails is 0 and -1/0, not an error - the interpreter's answer too. }
+    ssaDateValue:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FDtParseFunc);
+        B.BlockStart(wopIf, WASM_TYPE_F64);
+          B.I32Const(DT_PARSE); B.OpMem(wopF64Load, 3, 0);
+          if Instr.Src3.ConstInt = 1 then
+          begin
+            // TIMEVALUE: the fraction, as Frac gives it
+            B.LocalTee(FFltTmp);
+            B.LocalGet(FFltTmp); B.Op(wopF64Trunc); B.Op(wopF64Sub);
+          end
+          else
+            B.Op(wopF64Trunc);
+        B.Op(wopElse);
+          B.F64Const(0);
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaIsDate:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Call(FDtParseFunc);
+        B.BlockStart(wopIf, WASM_TYPE_I64);
+          B.I64Const(-1);
+        B.Op(wopElse);
+          B.I64Const(0);
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaDatePart:
       begin
         LoadReg(B, Instr.Src2);
@@ -10659,6 +11143,15 @@ begin
       FDtStrFunc := Next;
       Inc(Next);
     end;
+    if FUsesDateParse then
+    begin
+      FDtFindFunc      := Next;
+      FDtFieldsFunc    := Next + 1;
+      FDtDatePartFunc  := Next + 2;
+      FDtTimePartFunc  := Next + 3;
+      FDtParseFunc     := Next + 4;
+      Inc(Next, 5);
+    end;
   end;
 
   { The function table. ⭐ It holds EVERY region rather than only the
@@ -10692,6 +11185,7 @@ begin
   if FUsesFlt then EmitFloatHelpers;
   if FUsesGfxPrim then EmitGfxHelpers;
   if FUsesDate then EmitDateHelpers;
+  if FUsesDateParse then EmitDateParseHelpers;
 
   FModule.ExportFunc('main', FFuncIdx[0]);
   for r := 1 to FRegionCount - 1 do
