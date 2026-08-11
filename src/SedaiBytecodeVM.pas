@@ -902,6 +902,15 @@ const
   // fails the program instead of spawning threads without bound.
   MAX_LIVE_WORKERS = 64;
 
+{ ⛔ A TYPED constant, i.e. a variable, and that is the whole point: dividing by a
+  literal lets the optimiser turn the division into a MULTIPLICATION BY THE
+  RECIPROCAL, and 1/86400 is not exact, so the answer lands one ulp away from the
+  IEEE quotient. See bcTimeSerial. }
+const
+  SECS_PER_DAY_D: Double = 86400.0;
+  HOURS_PER_DAY_D: Double = 24.0;
+  MINS_PER_DAY_D: Double = 1440.0;
+
 type
   // M5.2: one record per spawned worker thread. Carries everything the RTL thread function needs:
   // the VM (shared program/heap/runtime), the worker's own TExecutionContext, the SUB entry PC and
@@ -11117,35 +11126,31 @@ begin
         Ctx.FloatRegs[Instr.Dest] := dtVal;
       end;
     23: // bcTimeSerial - TIMESERIAL(h,m,s) -> serial fraction (Src1=h, Src2=m, Immediate=s reg)
-      { ⛔⛔ THE Double() CASTS ARE LOad-BEARING, and leaving them off cost this
-        function eight digits of precision in silence. FPC types an unsuffixed
-        real constant by BEST FIT, so 3600.0, 60.0 and 86400.0 are all SINGLE -
-        and an Int64 times a Single is a SINGLE multiplication, so the whole
-        expression was evaluated in 24 bits and only then widened into the Double
-        register. TimeSerial(0,0,1) answered exactly Single(1/86400) - measured
-        on the bits, 3EE845C8A0000000 against 3EE845C8A0CE5129 - where fbc gives
-        the Double. Found by porting this to WebAssembly, where the module was
-        RIGHT and sb was wrong.
-        ⚠️ The trap needs an INTEGER on the other side: Double * Single promotes
-        to Double, which is why the neighbouring DATEDIFF arms are unaffected. }
-      { ⛔ And it is written as FOUR STATEMENTS, not one expression, for a second
-        reason on top of the first: FPC carries an Int64-times-real intermediate
-        in EXTENDED and rounds once at the store, which is more accurate than
-        double arithmetic and therefore DIFFERENT - one ulp away from what fbc
-        answers. Landing each step in a Double variable rounds where fbc rounds.
-        Measured on the bits: 3FEFFFE7BA375F31 as one expression against
-        ...F32 both here and in fbc. }
-      { ⭐ THE NUMERATOR IS AN INTEGER, so it is computed as one - no real
-        arithmetic before the single division that ends it. That removes the
-        second trap as well as the first: FPC carries a real intermediate in
-        EXTENDED and rounds again at the store, and rounding twice lands one ulp
-        away from rounding once. With an Int64 numerator there is exactly one
-        rounding, which is what fbc does and what a WebAssembly module - which
-        has no extended precision to fall into - does by construction.
-        Measured on the bits: 3FEFFFE7BA375F32 on all three. }
+      { ⛔⛔⛔ TWO DEFECTS LIVED IN THIS ONE LINE, and the second is the one
+        nobody would look for.
+
+        1. FPC types an unsuffixed real constant by BEST FIT, so 3600.0, 60.0 and
+           86400.0 were all SINGLE - and an Int64 times a Single is a SINGLE
+           multiplication, so the whole expression was evaluated in 24 bits and
+           only then widened into the Double register. TimeSerial(0,0,1) answered
+           exactly Single(1/86400): 3EE845C8A0000000 against 3EE845C8A0CE5129.
+           ⇒ The numerator is now INTEGER arithmetic, which cannot fall into a
+           narrower real type at all.
+        2. Dividing by a LITERAL let the optimiser turn the division into a
+           MULTIPLICATION BY THE RECIPROCAL, and 1/86400 is not exact - so the
+           answer landed one ulp off the IEEE quotient (…F31 against …F32) on a
+           value where the first defect was already cured. ⇒ The divisor is a
+           TYPED constant, i.e. a variable, which the optimiser cannot fold.
+
+        ⚠️ Both were found by compiling this to WebAssembly, where the module was
+        right twice: it has no narrower real type to fall into, and no reciprocal
+        rewrite. And neither shows up by reading the code - the signature says
+        Double, the destination is Double, and only what happens in between is not.
+        ⚠️ Trap 1 needs an INTEGER on the other side (Double * Single promotes to
+        Double), which is why the neighbouring DATEDIFF arms were unaffected. }
       Ctx.FloatRegs[Instr.Dest] :=
         (Ctx.IntRegs[Instr.Src1] * 3600 + Ctx.IntRegs[Instr.Src2] * 60 +
-         Ctx.IntRegs[Instr.Immediate]) / Double(86400.0);
+         Ctx.IntRegs[Instr.Immediate]) / SECS_PER_DAY_D;
     24: // bcDateValue - DATEVALUE/TIMEVALUE(str) -> serial. Immediate 0=date part, 1=time part. 0 on failure.
       begin
         if ParseDateSerial(Ctx.StringRegs[Instr.Src1], dtVal) then
@@ -11174,9 +11179,12 @@ begin
           { ⛔ Double() for the reason spelled out at bcTimeSerial: n is an
             INTEGER, so without the cast the division is done in SINGLE and only
             then added to a Double. DateAdd("s", 30, x) was one ulp out. }
-          7: dtVal := dtVal + n / Double(24.0);           // h
-          8: dtVal := dtVal + n / Double(1440.0);         // n (minute)
-          9: dtVal := dtVal + n / Double(86400.0);        // s
+          { ⛔ TYPED constants, not literals: dividing by a literal lets the
+            optimiser multiply by the reciprocal instead, and 1/24, 1/1440 and
+            1/86400 are none of them exact. See bcTimeSerial for the measurement. }
+          7: dtVal := dtVal + n / HOURS_PER_DAY_D;        // h
+          8: dtVal := dtVal + n / MINS_PER_DAY_D;         // n (minute)
+          9: dtVal := dtVal + n / SECS_PER_DAY_D;         // s
         else
           dtVal := dtVal + n;                     // y / d / w (whole days)
         end;
