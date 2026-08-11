@@ -246,8 +246,11 @@ type
     FWLenFunc, FWSubFunc, FWEncFunc, FWB2CPFunc, FWRepFunc: LongWord;
     { DATESERIAL / DATEPART / DATEADD / DATEDIFF and the field accessors. }
     FUsesDate: Boolean;
+    FUsesDateName: Boolean;             // MONTHNAME / WEEKDAYNAME: a data segment, no helper
     FDtSplitFunc, FDtCivilFunc, FDtDaysFunc: LongWord;
     FDtIvalFunc, FDtIncMoFunc, FDtDoyFunc, FDtWoyFunc, FDtYMFunc: LongWord;
+    FUsesDateStr: Boolean;              // DATE$ / TIME$: the rendering, on top of the calendar
+    FDtStrFunc: LongWord;
     FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
     FGfxPsetFunc, FGfxLineFunc: LongWord;
     FPenX, FPenY: LongWord;             // globals: the current graphics point
@@ -383,6 +386,8 @@ type
     procedure EmitPackHelpers;
     procedure EmitWideHelpers;
     procedure EmitDateHelpers;
+    function BuildDateNameBlob: AnsiString;
+    procedure EmitTwoDigits(B: TWasmBuf; Base, Val: LongWord; Off: LongWord);
     procedure EmitDatePartSwitch(B: TWasmBuf);
     procedure EmitDateAddSwitch(B: TWasmBuf; Instr: TSSAInstruction);
     procedure EmitDateDiffSwitch(B: TWasmBuf; Instr: TSSAInstruction);
@@ -537,6 +542,16 @@ const
   DT_Y         = 10456;
   DT_MO        = 10460;
   DT_D         = 10464;
+  { MONTHNAME / WEEKDAYNAME. ⭐ The nineteen names are laid down as ORDINARY
+    STRING HEADERS in their own data segment, preceded by a table of the
+    nineteen handle addresses - so naming one is a single i32.load of a
+    compile-time address and no helper function at all. Weekdays first (Sunday
+    is 1), then the months.
+    ⛔ They are the ENGLISH names and there is no locale path: the interpreter
+    has one (LocaleDayName) but nothing ever turns it on - SetDateLocaleMode has
+    no caller - and a sandbox has no locale to read anyway. }
+  DT_NAMES     = 10496;   // the table of 19 handles, then the strings
+  DT_NAME_COUNT = 19;
   VAL_DIGCAP   = 800;
   VAL_MAXDIG   = 1500;    // ⛔ must stay under PU_NINT - FLT_DEC = 2048
   VAL_MAXLIMB  = 200;
@@ -660,6 +675,8 @@ begin
   FUsesPack := False;
   FUsesWide := False;
   FUsesDate := False;
+  FUsesDateName := False;
+  FUsesDateStr := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -749,6 +766,16 @@ begin
           FUsesDate := True;
         ssaDatePart, ssaDateAdd, ssaDateDiff:
           begin FUsesDate := True; FUsesStr := True; end;
+        { ⚠️ NOT FUsesDate: naming a month needs no calendar arithmetic at all,
+          only the table - so a program that just calls MONTHNAME does not carry
+          seven helpers it never enters. }
+        ssaDateName:
+          begin FUsesDateName := True; FUsesStr := True; end;
+        { DATE$/TIME$ read the clock AND decode it, so they need the import, the
+          calendar and a string to put the answer in. }
+        ssaDateStr:
+          begin FUsesDateStr := True; FUsesDate := True;
+                FUsesClock := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
         { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
@@ -3532,6 +3559,107 @@ begin
   finally
     B.Free;
   end;
+
+  { dtStr(kind) -> DATE$ ("mm-dd-yyyy") when kind is 0, TIME$ ("hh:mm:ss") when
+    it is 1. DT_DAYS and DT_MS are already set by the caller's dtSplit.
+    ⭐ Both fields are FIXED WIDTH and zero-padded, which is what FormatDateTime
+    gives for mm/dd/hh/nn/ss - so there is no number formatter here at all, only
+    digits written into a string of known length. }
+  if FUsesDateStr then
+  begin
+    B := TWasmBuf.Create;
+    try
+      // param 0 = kind; locals 1 = handle, 2 = base, 3 = v
+      B.LocalGet(0); B.I32Const(1); B.Op(wopI32Eq);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I32Const(8); B.Call(FStrNewFunc); B.LocalTee(1);
+        B.I32Const(4); B.Op(wopI32Add); B.LocalSet(2);
+        B.I32Const(DT_MS); B.OpMem(wopI32Load, 2, 0);
+        B.I32Const(3600000); B.Op(wopI32DivS); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 0);
+        B.LocalGet(2); B.I32Const(Ord(':')); B.OpMem(wopI32Store8, 0, 2);
+        B.I32Const(DT_MS); B.OpMem(wopI32Load, 2, 0);
+        B.I32Const(60000); B.Op(wopI32DivS); B.I32Const(60); B.Op(wopI32RemS); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 3);
+        B.LocalGet(2); B.I32Const(Ord(':')); B.OpMem(wopI32Store8, 0, 5);
+        B.I32Const(DT_MS); B.OpMem(wopI32Load, 2, 0);
+        B.I32Const(1000); B.Op(wopI32DivS); B.I32Const(60); B.Op(wopI32RemS); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 6);
+      B.Op(wopElse);
+        B.I32Const(DT_DAYS); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
+        B.Call(FDtCivilFunc);
+        B.I32Const(10); B.Call(FStrNewFunc); B.LocalTee(1);
+        B.I32Const(4); B.Op(wopI32Add); B.LocalSet(2);
+        B.I32Const(DT_MO); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 0);
+        B.LocalGet(2); B.I32Const(Ord('-')); B.OpMem(wopI32Store8, 0, 2);
+        B.I32Const(DT_D); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 3);
+        B.LocalGet(2); B.I32Const(Ord('-')); B.OpMem(wopI32Store8, 0, 5);
+        // the year, four digits: the top two, then the bottom two
+        B.I32Const(DT_Y); B.OpMem(wopI32Load, 2, 0);
+        B.I32Const(100); B.Op(wopI32DivS); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 6);
+        B.I32Const(DT_Y); B.OpMem(wopI32Load, 2, 0);
+        B.I32Const(100); B.Op(wopI32RemS); B.LocalSet(3);
+        EmitTwoDigits(B, 2, 3, 8);
+      B.EndOp;
+      B.LocalGet(1);
+      FModule.AddFunction(FModule.TypeIndex([wvtI32], [wvtI32]),
+                          [wvtI32, wvtI32, wvtI32], B);
+    finally
+      B.Free;
+    end;
+  end;
+end;
+
+{ Two zero-padded decimal digits of local Val, written at Base + Off. }
+procedure TWasmBackend.EmitTwoDigits(B: TWasmBuf; Base, Val: LongWord; Off: LongWord);
+begin
+  B.LocalGet(Base);
+  B.LocalGet(Val); B.I32Const(10); B.Op(wopI32DivS);
+  B.I32Const(Ord('0')); B.Op(wopI32Add);
+  B.OpMem(wopI32Store8, 0, Off);
+  B.LocalGet(Base);
+  B.LocalGet(Val); B.I32Const(10); B.Op(wopI32RemS);
+  B.I32Const(Ord('0')); B.Op(wopI32Add);
+  B.OpMem(wopI32Store8, 0, Off + 1);
+end;
+
+{ The MONTHNAME / WEEKDAYNAME data segment: nineteen i32 handle addresses, then
+  the nineteen strings as ordinary [len][bytes] headers, each 4-aligned.
+  ⭐ Resolving the handles HERE rather than at run time is what makes the opcode
+  a single i32.load with no helper: the addresses are known the moment the base
+  of the block is, so the table can hold the finished handles. }
+function TWasmBackend.BuildDateNameBlob: AnsiString;
+const
+  DT_NAME: array[0..DT_NAME_COUNT - 1] of AnsiString =
+    ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
+     'January', 'February', 'March', 'April', 'May', 'June',
+     'July', 'August', 'September', 'October', 'November', 'December');
+var
+  k, Head: Integer;
+  Addr: LongWord;
+  Body: AnsiString;
+begin
+  Head := DT_NAME_COUNT * 4;
+  SetLength(Result, Head);
+  Body := '';
+  Addr := DT_NAMES + LongWord(Head);
+  for k := 0 to DT_NAME_COUNT - 1 do
+  begin
+    PLongWord(@Result[1 + k * 4])^ := Addr;
+    SetLength(Body, Length(Body) + 4 + Length(DT_NAME[k]));
+    PLongWord(@Body[Length(Body) - 3 - Length(DT_NAME[k])])^ := LongWord(Length(DT_NAME[k]));
+    Move(DT_NAME[k][1], Body[Length(Body) - Length(DT_NAME[k]) + 1], Length(DT_NAME[k]));
+    Inc(Addr, LongWord(4 + Length(DT_NAME[k])));
+    while (Addr and 3) <> 0 do
+    begin
+      Body := Body + #0;
+      Inc(Addr);
+    end;
+  end;
+  Result := Result + Body;
 end;
 
 { DT_DAYS as an i64, which every arm below starts from. }
@@ -7523,6 +7651,44 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { MONTHNAME(n) / WEEKDAYNAME(n): one i32.load of the handle table, and an
+      index outside the range answers the EMPTY string - handle 0, which reads
+      as length 0 because linear memory starts zeroed. Not an error: that is
+      what bcDateName returns. }
+    { DATE$ / TIME$: read the clock, split it once, render a fixed-width field. }
+    ssaDateStr:
+      begin
+        B.Call(FNowFunc);
+        B.Call(FDtSplitFunc);
+        if Instr.Src3.ConstInt = 1 then B.I32Const(1) else B.I32Const(0);
+        B.Call(FDtStrFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaDateName:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.Op(wopI32WrapI64);
+        B.LocalTee(FArrTmp);
+        B.I32Const(1); B.Op(wopI32LtS);
+        B.LocalGet(FArrTmp);
+        if Instr.Src3.ConstInt = 1 then B.I32Const(7) else B.I32Const(12);
+        B.Op(wopI32GtS);
+        B.Op(wopI32Or);
+        B.BlockStart(wopIf, WASM_TYPE_I32);
+          B.I32Const(EMPTY_STR);
+        B.Op(wopElse);
+          B.LocalGet(FArrTmp); B.I32Const(1); B.Op(wopI32Sub);
+          if Instr.Src3.ConstInt <> 1 then
+          begin
+            B.I32Const(7); B.Op(wopI32Add);      // the months follow the weekdays
+          end;
+          B.I32Const(4); B.Op(wopI32Mul);
+          B.OpMem(wopI32Load, 2, DT_NAMES);
+        B.EndOp;
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaDatePart:
       begin
         LoadReg(B, Instr.Src2);
@@ -10222,6 +10388,9 @@ begin
     if Length(FArrTabBytes) > 0 then
       FModule.DataSegment(FArrTabAddr, PByte(PAnsiChar(FArrTabBytes)),
                           Length(FArrTabBytes));
+    if FUsesDateName then
+      FModule.DataSegment(DT_NAMES, PByte(PAnsiChar(BuildDateNameBlob)),
+                          Length(BuildDateNameBlob));
     FModule.ExportMemory('memory');
   end;
   Init := TWasmBuf.Create;
@@ -10483,6 +10652,13 @@ begin
     FDtWoyFunc   := Next + 6;
     FDtYMFunc    := Next + 7;
     Inc(Next, 8);
+    { Conditional, so sequential and last - the same rule the string block's
+      tail follows, and EmitDateHelpers adds it last too. }
+    if FUsesDateStr then
+    begin
+      FDtStrFunc := Next;
+      Inc(Next);
+    end;
   end;
 
   { The function table. ⭐ It holds EVERY region rather than only the
