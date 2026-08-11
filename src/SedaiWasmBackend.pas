@@ -130,6 +130,7 @@ type
     FSlotBase: array[TSSARegisterType] of LongWord;
     FRawTmp: LongWord;            // i64: a raw pointer being decoded
     FFltTmp: LongWord;            // f64 scratch (TIMER's Frac, and whoever needs one next)
+    FF32Tmp: LongWord;            // f32 scratch: a binary32 value that must not be promoted
     FGfxP, FGfxN: LongWord;       // i32: the ScreenRes fill cursor and counter
 
     { ⛔ END INSIDE A PROCEDURE ENDS THE PROGRAM, NOT THE FUNCTION. In WASM a
@@ -359,6 +360,8 @@ type
     function FloatRegUses(First, N, RegIdx: Integer): Integer;
     function IntRegUses(First, N, RegIdx: Integer): Integer;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
+    function RegionNeedsF32Tmp(R: Integer): Boolean;   // is the f32 scratch worth declaring here?
+    procedure EmitTruncF32(B: TWasmBuf; Instr: TSSAInstruction);  // trunc an f32 already on the stack
     function RegIs32(const V: TSSAValue): Boolean;   // does this operand live in an i32 local?
     procedure LoadReg(B: TWasmBuf; const V: TSSAValue);
     procedure LoadRegI32(B: TWasmBuf; const V: TSSAValue);   // ...as an i32, free when it lives in one
@@ -5285,6 +5288,89 @@ end;
 
 { ---------------- 4. lowering ---------------- }
 
+procedure TWasmBackend.EmitTruncF32(B: TWasmBuf; Instr: TSSAInstruction);
+{ The implicit float -> int conversion of a value that is on the stack as an f32 and must NOT be
+  promoted first. Same rule and same guard as the f64 form - MODERN rounds to nearest, out of range
+  gives x86's "integer indefinite" rather than trapping - written against binary32 comparisons so the
+  f32 never has to become an f64 on the way.
+  ⛔ The guard is not decoration: i32/i64.trunc_f32 TRAP outside their range, and reproducing the
+  interpreter means answering the indefinite instead. Every input that would trap is excluded by the
+  comparison in front of it, so the trap is unreachable by construction - the same argument that
+  brought the f64 forms back on merit. }
+var
+  Dst32: Boolean;
+begin
+  if FModern then B.Op(wopF32Nearest);
+  B.LocalTee(FF32Tmp);
+  Dst32 := RegIs32(Instr.Dest);
+  if Dst32 then
+  begin
+    B.F32Const(-2147483649.0);
+    B.Op(wopF32Gt);
+    B.LocalGet(FF32Tmp);
+    B.F32Const(4294967296.0);
+    B.Op(wopF32Lt);
+    B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.LocalGet(FF32Tmp);
+      B.F32Const(0.0);
+      B.Op(wopF32Lt);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.LocalGet(FF32Tmp); B.Op(wopI32TruncF32S);
+      B.Op(wopElse);
+        B.LocalGet(FF32Tmp); B.Op(wopI32TruncF32U);
+      B.EndOp;
+    B.Op(wopElse);
+      B.I32Const(Integer($80000000));
+    B.EndOp;
+    B.LocalSet(FLocalIdx[FCurRegion][FlatId(Instr.Dest)]);
+    Exit;
+  end;
+  B.F32Const(-9223372036854775808.0);
+  B.Op(wopF32Ge);
+  B.LocalGet(FF32Tmp);
+  B.F32Const(9223372036854775808.0);
+  B.Op(wopF32Lt);
+  B.Op(wopI32And);
+  B.BlockStart(wopIf, WASM_TYPE_I64);
+    B.LocalGet(FF32Tmp);
+    if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then
+      B.Op(wopI64TruncF32U)          // unsigned destination, and the guard keeps it in range
+    else
+      B.Op(wopI64TruncF32S);
+  B.Op(wopElse);
+    B.I64Const(Int64($8000000000000000));
+  B.EndOp;
+  StoreReg(B, Instr.Dest);
+end;
+
+function TWasmBackend.RegionNeedsF32Tmp(R: Integer): Boolean;
+{ Does any block in this region hold the shape the trunc_f32 fusion consumes - a narrowing to binary32
+  immediately converted to an integer? Asked BEFORE the locals are laid out, because a scratch local
+  declared in every region and used by almost none is not free: it cost the voxel demo 14 bytes across
+  its six functions, which is exactly the kind of "it is only two bytes" that this backend is not
+  allowed to hand out. }
+var
+  b, j: Integer;
+  Blk: TSSABasicBlock;
+  A, C: TSSAInstruction;
+begin
+  Result := False;
+  for b := FRegionFirst[R] to FRegionLast[R] do
+  begin
+    Blk := FProg.Blocks[b];
+    for j := 0 to Blk.Instructions.Count - 2 do
+    begin
+      A := TSSAInstruction(Blk.Instructions[j]);
+      if A.OpCode <> ssaNarrowSingle then Continue;
+      C := TSSAInstruction(Blk.Instructions[j + 1]);
+      if (C.OpCode = ssaFloatToInt) and (C.Src1.Kind = svkRegister) and
+         (A.Dest.Kind = svkRegister) and (C.Src1.RegIndex = A.Dest.RegIndex) then
+        Exit(True);
+    end;
+  end;
+end;
+
 function TWasmBackend.RegIs32(const V: TSSAValue): Boolean;
 { Does this operand live in an i32 local? Asked by the lowerings that have a 32-bit form available. }
 var f: Integer;
@@ -7785,12 +7871,12 @@ var
   RT: TSSARegisterType;
   Locals: TWasmValTypeArray;
   Terminated: Boolean;
-  SkipNext, F32Un, I32Un, Loaded32: Boolean;
+  SkipNext, SkipTwo, F32Un, I32Un, NeedF32: Boolean;
   F32Op, I32Op: Byte;
   NextI: TSSAInstruction;
   CalleeRegion: Integer;
   FalseTarget: Integer;
-  NextInstr: TSSAInstruction;
+  NextInstr, ThirdI, TruncI: TSSAInstruction;
 
   procedure PushArgs(Callee: Integer);
   // The arguments are already in this region's slot locals, put there by the
@@ -7851,16 +7937,20 @@ begin
   FArrTmp := LongWord(P + 7);
   FRecTmp := LongWord(P + 8);
   FFltTmp := LongWord(P + 9);
-  SetLength(Locals, 10);
+  NeedF32 := RegionNeedsF32Tmp(R);
+  FF32Tmp := LongWord(P + 10);
+  if NeedF32 then SetLength(Locals, 11) else SetLength(Locals, 10);
   Locals[0] := wvtI32;                       // dispatch state
   Locals[1] := wvtI64; Locals[2] := wvtF64; Locals[3] := wvtI32;
   Locals[4] := wvtI64;                       // raw pointer being decoded
   Locals[5] := wvtI32; Locals[6] := wvtI32;  // ScreenRes fill cursor + counter
   Locals[7] := wvtI32;                       // DIM's running element product
   Locals[8] := wvtI32;                       // a record handle being addressed
+  // Locals[9] is FFltTmp (f64); Locals[10] is the f32 scratch - see the trunc_f32 fusion.
   Locals[9] := wvtF64;                       // f64 scratch
+  if NeedF32 then Locals[10] := wvtF32;      // f32 scratch, only where the fusion can use it
   // one local per transfer slot this region mentions
-  k := P + 10;
+  if NeedF32 then k := P + 11 else k := P + 10;
   for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
   begin
     FSlotBase[RT] := LongWord(k);
@@ -8015,9 +8105,10 @@ begin
       B := D.Body(i);
       Terminated := False;
       SkipNext := False;
+      SkipTwo := False;
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
-        if SkipNext then begin SkipNext := False; Continue; end;
+        if SkipNext then begin SkipNext := False; if SkipTwo then begin SkipTwo := False; SkipNext := True; end; Continue; end;
         Instr := TSSAInstruction(Blk.Instructions[j]);
         // f32: this operation and the narrowing that consumes it are ONE f32 instruction. See the
         // block above FloatRegUses for why the operands may be demoted without proving anything.
@@ -8033,6 +8124,23 @@ begin
             F32Op := F32FormOf(Instr.OpCode, F32Un);
           if (F32Op <> 0) and (FloatRegUses(First, N, Instr.Dest.RegIndex) <> 1) then F32Op := 0;
         end;
+        // ⭐ THREE instructions, not two, when the narrowed result is immediately converted to an
+        // integer: the f32 value is truncated where it stands instead of being promoted to f64 first.
+        // That promote is the only thing standing between us and i32/i64.trunc_f32, and dropping it is
+        // shorter as well as more direct - the conversion of a binary32 is the same number either way,
+        // because promoting is exact.
+        TruncI := nil;
+        if (F32Op <> 0) and (j + 2 < Blk.Instructions.Count) then
+        begin
+          ThirdI := TSSAInstruction(Blk.Instructions[j + 2]);
+          if (ThirdI.OpCode = ssaFloatToInt) and
+             (ThirdI.Src1.Kind = svkRegister) and (ThirdI.Src1.RegType = srtFloat) and
+             (NextI.Dest.Kind = svkRegister) and
+             (ThirdI.Src1.RegIndex = NextI.Dest.RegIndex) and
+             (ThirdI.Dest.Kind = svkRegister) and
+             (FloatRegUses(First, N, NextI.Dest.RegIndex) = 1) then
+            TruncI := ThirdI;
+        end;
         if F32Op <> 0 then
         begin
           LoadReg(B, Instr.Src1);
@@ -8043,6 +8151,12 @@ begin
             B.Op(wopF32DemoteF64);
           end;
           B.Op(F32Op);
+          if TruncI <> nil then
+          begin
+            EmitTruncF32(B, TruncI);
+            SkipNext := True; SkipTwo := True;
+            Continue;
+          end;
           B.Op(wopF64PromoteF32);
           StoreReg(B, NextI.Dest);
           SkipNext := True;                 // the narrowing was just emitted as part of this
