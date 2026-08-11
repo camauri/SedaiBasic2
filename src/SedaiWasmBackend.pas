@@ -221,7 +221,7 @@ type
     FAllocFunc, FStrNewFunc, FStrCatFunc, FStrSubFunc, FStrCmpFunc,
     FStrAscFunc, FStrChrFunc, FStrRightFunc, FStrMidFunc,
     FPrintStrFunc, FStrFromIntFunc: LongWord;
-    FStrFillFunc, FStrCaseFunc, FStrInstrFunc, FStrTrimFunc: LongWord;
+    FStrFillFunc, FStrCaseFunc, FStrFindFunc, FStrTrimFunc: LongWord;
     FPuDigFunc, FPuFmtFunc: LongWord;   // PRINT USING: digits, then the field
     { VAL. ⛔ TWO flags, not one: VALINT needs only the integer scanner, while
       VAL needs the decimal-to-double conversion - and that one leans on fltMul,
@@ -230,6 +230,15 @@ type
     FUsesVal: Boolean;                  // VAL(s) -> Double
     FUsesValInt: Boolean;               // VALINT/VALLNG/VALUINT(s) -> Integer
     FStrValIntFunc, FValBitFunc, FStrValFunc: LongWord;
+    FUsesBase: Boolean;                 // HEX$ / OCT / BIN
+    FStrBaseFunc: LongWord;             // one helper, the base is a parameter
+    FUsesTrimSet: Boolean;              // TRIM(s, set) and its two sides
+    FStrTrimSetFunc: LongWord;
+    { MKI$/MKL$/MKD$/MKS$ and CVI/CVL/CVD/CVS. ⭐ TWO helpers for eight
+      spellings, because all eight are "move these bytes" in one direction or
+      the other and a float only differs by a reinterpretation at the edge. }
+    FUsesPack: Boolean;
+    FStrPackFunc, FStrUnpackFunc: LongWord;
     FUsesGfxPrim: Boolean;              // the program DRAWS (LINE / PSET / POINT)
     FGfxPsetFunc, FGfxLineFunc: LongWord;
     FPenX, FPenY: LongWord;             // globals: the current graphics point
@@ -360,6 +369,9 @@ type
     procedure EmitGfxHelpers;
     procedure EmitStringHelpers;
     procedure EmitValHelpers;
+    procedure EmitBaseHelper;
+    procedure EmitTrimSetHelper;
+    procedure EmitPackHelpers;
     function EmitRegion(R: Integer): Boolean;
     function FloatRegUses(First, N, RegIdx: Integer): Integer;
     function IntRegUses(First, N, RegIdx: Integer): Integer;
@@ -494,6 +506,14 @@ const
     one of them. Both callers are in this file, ten lines apart, and each stores
     it immediately before the call. }
   VAL_DECW     = 10244;   // i32: valInt's decimal saturation width
+  { HEX$/OCT/BIN's digit scratch, built BACKWARDS from BASE_SCR_END exactly as
+    the decimal one is. ⛔ It cannot BE the decimal one: that scratch is the 60
+    bytes at 4..63, and a 64-bit value in base 2 is 64 digits - four more than
+    it holds, and the four would land on the EMPTY STRING at address 0, which
+    nothing may ever write to. The widest case is what sizes a scratch, not the
+    common one. }
+  BASE_SCR_END = 10432;
+  BASE_SCR     = BASE_SCR_END - 64;
   VAL_DIGCAP   = 800;
   VAL_MAXDIG   = 1500;    // ⛔ must stay under PU_NINT - FLT_DEC = 2048
   VAL_MAXLIMB  = 200;
@@ -612,6 +632,9 @@ begin
   FUsesFlt := False;
   FUsesVal := False;
   FUsesValInt := False;
+  FUsesBase := False;
+  FUsesTrimSet := False;
+  FUsesPack := False;
   FUsesRec := False;
   SetLength(FConstId, 0);
   for i := 0 to FProg.Blocks.Count - 1 do
@@ -680,6 +703,14 @@ begin
                 FUsesFlt := True; end;   // valFlt leans on the float digit buffer
         ssaStrValInt:
           begin FUsesValInt := True; FUsesStr := True; end;
+        { The three spellings of one operation: the base is the only thing that
+          differs, so they share a helper and one of them makes it exist. }
+        ssaStrHex, ssaStrOct, ssaStrBin:
+          begin FUsesBase := True; FUsesStr := True; end;
+        ssaStrTrimSet:
+          begin FUsesTrimSet := True; FUsesStr := True; end;
+        ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat:
+          begin FUsesPack := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
         { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
@@ -1264,7 +1295,7 @@ begin
   TFromInt := FModule.TypeIndex([wvtI64], [wvtI32]);
   TFill   := FModule.TypeIndex([wvtI64, wvtI64], [wvtI32]);
   TCase   := FModule.TypeIndex([wvtI32, wvtI32], [wvtI32]);
-  TInstr  := FModule.TypeIndex([wvtI32, wvtI32, wvtI64], [wvtI64]);
+  TInstr  := FModule.TypeIndex([wvtI32, wvtI32, wvtI64, wvtI32], [wvtI64]);
   TPuDig  := FModule.TypeIndex([wvtF64, wvtI32, wvtI64, wvtI32], []);
   TPuFmt  := FModule.TypeIndex([wvtI32, wvtF64, wvtI32, wvtI64], [wvtI32]);
 
@@ -1705,63 +1736,117 @@ begin
     B.Free;
   end;
 
-  { strInstr(hay, needle, start) -> 1-based position, 0 if absent.
-    Mirrors bcStrInstr: a start below 1 clamps to 1, and the result is an
-    absolute position in the haystack (the interpreter searches a Copy from
-    start and adds the offset back, which comes to the same thing).
-    ⭐ The EMPTY needle is not an edge case to shrug at: Pascal's Pos returns 0
+  { strFind(hay, pat, start, mode) -> 1-based position, 0 if absent.
+    mode bit 0 scans BACKWARDS, bit 1 makes pat a CHARACTER SET rather than a
+    substring - so the four combinations are INSTR, INSTRREV, INSTR(...Any) and
+    INSTRREV(...Any), which is every search BASIC has.
+
+    ⭐ ONE function for the four because they differ in two independent bits and
+    nothing else. Four bodies would be four places for the empty-pattern rule
+    and the 1-based answer to drift apart, and the interpreter has already shown
+    what that costs elsewhere.
+
+    Mirrors bcStrInstr and its three siblings: a start below 1 clamps to 1, and
+    the result is an absolute position in the haystack.
+    ⭐ The EMPTY pattern is not an edge case to shrug at: Pascal's Pos returns 0
     for it, so an empty needle finds nothing - and a loop written around
-    "Instr(...) > 0" would spin forever if this answered 1. }
+    "Instr(...) > 0" would spin forever if this answered 1. The set forms agree
+    (an empty set matches nothing), which is what fbc returns.
+    ⚠️ START is honoured by the FORWARD forms only, because the interpreter's
+    INSTRREV ignores its own - matching sb is the contract, not matching fbc. }
   B := TWasmBuf.Create;
   try
-    // locals: 3 = hay len, 4 = needle len, 5 = i, 6 = j, 7 = hay base, 8 = needle base
-    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(3);
-    B.LocalGet(1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
-    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(7);
-    B.LocalGet(1); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(8);
-    B.LocalGet(2); B.I64Const(1); B.Op(wopI64LtS);
-    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
-      B.I64Const(1); B.LocalSet(2);
-    B.EndOp;
-    // an empty needle never matches, and neither does a start past the end
-    B.LocalGet(4); B.Op(wopI32Eqz);
+    // params 0=hay 1=pat 2=start 3=mode; locals 4=hlen 5=plen 6=eff 7=i 8=j
+    //                                            9=hbase 10=pbase 11=step
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(4);
+    B.LocalGet(1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(5);
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(9);
+    B.LocalGet(1); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(10);
+    // an empty pattern never matches, whichever way it is read
+    B.LocalGet(5); B.Op(wopI32Eqz);
     B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
       B.I64Const(0); B.Op(wopReturn);
     B.EndOp;
-    B.LocalGet(2); B.Op(wopI32WrapI64); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(5);
+    // a set matches ONE character; a substring matches its own length
+    B.LocalGet(3); B.I32Const(2); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(1);
+    B.Op(wopElse);
+      B.LocalGet(5);
+    B.EndOp;
+    B.LocalSet(6);
+
+    B.LocalGet(3); B.I32Const(1); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      // backwards: the last position where the pattern still fits, walking down
+      B.LocalGet(4); B.LocalGet(6); B.Op(wopI32Sub); B.LocalSet(7);
+      B.I32Const(-1); B.LocalSet(11);
+    B.Op(wopElse);
+      B.LocalGet(2); B.I64Const(1); B.Op(wopI64LtS);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.I64Const(1); B.LocalSet(2);
+      B.EndOp;
+      B.LocalGet(2); B.Op(wopI32WrapI64); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(7);
+      B.I32Const(1); B.LocalSet(11);
+    B.EndOp;
+
     B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);         // A: not found
-      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);        // L: for each start i
-        // no room left for the needle: done
-        B.LocalGet(5); B.LocalGet(4); B.Op(wopI32Add);
-        B.LocalGet(3); B.Op(wopI32GtS); B.BrIf(1);        // -> A
-        B.I32Const(0); B.LocalSet(6);
-        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);     // M: mismatch lands here
-          B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);    // K: compare byte by byte
-            // every byte matched: the answer is this i, 1-based
-            B.LocalGet(6); B.LocalGet(4); B.Op(wopI32GeS);
-            B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
-              B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.Op(wopI64ExtendI32S);
-              B.Op(wopReturn);
-            B.EndOp;
-            B.LocalGet(7); B.LocalGet(5); B.Op(wopI32Add); B.LocalGet(6); B.Op(wopI32Add);
-            B.OpMem(wopI32Load8U, 0, 0);
-            B.LocalGet(8); B.LocalGet(6); B.Op(wopI32Add);
-            B.OpMem(wopI32Load8U, 0, 0);
-            B.Op(wopI32Ne); B.BrIf(1);                    // -> M, i.e. try the next i
-            B.LocalGet(6); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(6);
-            B.Br(0);                                      // -> K
-          B.EndOp;                                        // K
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);        // L: for each position i
+        // off either end - one test serves both directions
+        B.LocalGet(7); B.I32Const(0); B.Op(wopI32LtS); B.BrIf(1);          // -> A
+        B.LocalGet(7); B.LocalGet(6); B.Op(wopI32Add);
+        B.LocalGet(4); B.Op(wopI32GtS); B.BrIf(1);                         // -> A
+        B.I32Const(0); B.LocalSet(8);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);     // M: no match at this i
+          B.LocalGet(3); B.I32Const(2); B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            { THE SET FORM: one character against every member. The quantifier is
+              the opposite of the substring form's - EXISTS a j that matches,
+              where the other needs ALL of them - which is why the two are
+              written out rather than folded into one loop with a flag. }
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);  // K
+              B.LocalGet(8); B.LocalGet(5); B.Op(wopI32GeS); B.BrIf(1);    // -> M
+              B.LocalGet(9); B.LocalGet(7); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.LocalGet(10); B.LocalGet(8); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.Op(wopI32Eq);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.LocalGet(7); B.I32Const(1); B.Op(wopI32Add); B.Op(wopI64ExtendI32S);
+                B.Op(wopReturn);
+              B.EndOp;
+              B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+              B.Br(0);                                    // -> K
+            B.EndOp;                                      // K
+          B.Op(wopElse);
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);  // K: compare byte by byte
+              // every byte matched: the answer is this i, 1-based
+              B.LocalGet(8); B.LocalGet(5); B.Op(wopI32GeS);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.LocalGet(7); B.I32Const(1); B.Op(wopI32Add); B.Op(wopI64ExtendI32S);
+                B.Op(wopReturn);
+              B.EndOp;
+              B.LocalGet(9); B.LocalGet(7); B.Op(wopI32Add); B.LocalGet(8); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.LocalGet(10); B.LocalGet(8); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.Op(wopI32Ne); B.BrIf(1);                  // -> M, i.e. try the next i
+              B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+              B.Br(0);                                    // -> K
+            B.EndOp;                                      // K
+          B.EndOp;
         B.EndOp;                                          // M
         { ⛔ The mismatch exit MUST land here, past the inner loop, so that i is
           advanced before the next attempt. Branching straight back to L instead
           would retry the same i for ever - and a hang is the one failure a
           differential net cannot report, because it never gets to compare. }
-        B.LocalGet(5); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(5);
+        B.LocalGet(7); B.LocalGet(11); B.Op(wopI32Add); B.LocalSet(7);
         B.Br(0);                                          // -> L
       B.EndOp;                                            // L
     B.EndOp;                                              // A
     B.I64Const(0);
-    FModule.AddFunction(TInstr, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+    FModule.AddFunction(TInstr, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                                 wvtI32, wvtI32], B);
   finally
     B.Free;
   end;
@@ -2442,6 +2527,363 @@ begin
   end;
 
   EmitValHelpers;
+  EmitBaseHelper;
+  EmitTrimSetHelper;
+  EmitPackHelpers;
+end;
+
+{ MKI$/MKL$/MKSHORT$/MKLONGINT$/MKS$/MKD$ and their eight CV* inverses, as TWO
+  functions: strPack(bits, width) writes the low `width` bytes of an integer into
+  a fresh string, strUnpack(s, width) reads them back SIGN-EXTENDED.
+
+  ⭐ A FLOAT NEEDS NOTHING OF ITS OWN. MKD$ is strPack of the double's bits and
+  MKS$ is strPack of the single's, so the only float-specific instruction is the
+  reinterpretation at the call site - which is what these eight spellings have
+  always been underneath, and writing four bodies would be four places for the
+  byte order to be got wrong.
+  ⚠️ LITTLE-ENDIAN, which is what the interpreter writes and what WASM's own
+  loads and stores use, so the two agree by construction rather than by testing.
+  ⛔ A string SHORTER than the width reads as 0, not as an error and not as a
+  partial value - that is what FreeBASIC returns and what bcStrCvInt does. }
+procedure TWasmBackend.EmitPackHelpers;
+var
+  B: TWasmBuf;
+  TPack, TUnpack: LongWord;
+begin
+  if not FUsesPack then Exit;
+  TPack   := FModule.TypeIndex([wvtI64, wvtI32], [wvtI32]);
+  TUnpack := FModule.TypeIndex([wvtI32, wvtI32], [wvtI64]);
+
+  B := TWasmBuf.Create;
+  try
+    // params 0 = bits, 1 = width; locals 2 = handle, 3 = base, 4 = i
+    B.LocalGet(1); B.Call(FStrNewFunc); B.LocalTee(2);
+    B.I32Const(4); B.Op(wopI32Add); B.LocalSet(3);
+    B.I32Const(0); B.LocalSet(4);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(4); B.LocalGet(1); B.Op(wopI32GeS); B.BrIf(1);
+        B.LocalGet(3); B.LocalGet(4); B.Op(wopI32Add);
+        { ⛔ A byte at a time rather than one i64.store, because the width is 2,
+          4 or 8 and only known at run time here. Eight iterations at the very
+          most - and branching on the width would be three stores AND the branch. }
+        B.LocalGet(0);
+        B.LocalGet(4); B.Op(wopI64ExtendI32S); B.I64Const(8); B.Op(wopI64Mul);
+        B.Op(wopI64ShrU); B.Op(wopI32WrapI64);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(4); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(4);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    B.LocalGet(2);
+    FModule.AddFunction(TPack, [wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+
+  B := TWasmBuf.Create;
+  try
+    // params 0 = s, 1 = width; locals 2 = base, 3 = i, 4 = acc, 5 = shift
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalGet(1); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(0); B.Op(wopReturn);
+    B.EndOp;
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(2);
+    B.I64Const(0); B.LocalSet(4);
+    // from the TOP byte down, so each one shifts what came before it up
+    B.LocalGet(1); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(3);
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(3); B.I32Const(0); B.Op(wopI32LtS); B.BrIf(1);
+        B.LocalGet(4); B.I64Const(8); B.Op(wopI64Shl);
+        B.LocalGet(2); B.LocalGet(3); B.Op(wopI32Add);
+        B.OpMem(wopI32Load8U, 0, 0); B.Op(wopI64ExtendI32U);
+        B.Op(wopI64Or); B.LocalSet(4);
+        B.LocalGet(3); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(3);
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+    { Sign-extend from the top bit of the width-byte value. ⛔ Skipped at width 8:
+      the shift amount would be 0, which is harmless, but i64.shl by 64 is not -
+      WASM takes the count modulo 64, so it would be a shift by nothing and the
+      sign would come out of the wrong bit. }
+    B.LocalGet(1); B.I32Const(8); B.Op(wopI32LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.I64Const(64);
+      B.LocalGet(1); B.Op(wopI64ExtendI32S); B.I64Const(8); B.Op(wopI64Mul);
+      B.Op(wopI64Sub); B.LocalSet(5);
+      B.LocalGet(4); B.LocalGet(5); B.Op(wopI64Shl);
+      B.LocalGet(5); B.Op(wopI64ShrS); B.LocalSet(4);
+    B.EndOp;
+    B.LocalGet(4);
+    FModule.AddFunction(TUnpack, [wvtI32, wvtI32, wvtI64, wvtI64], B);
+  finally
+    B.Free;
+  end;
+end;
+
+{ strTrimSet(s, pat, mode) -> a new string with the ends stripped.
+  mode low two bits are the side (0 = both, 1 = left, 2 = right) and bit 2 says
+  whether pat is a CHARACTER SET (FreeBASIC's "Any" form) or a whole substring
+  to remove REPEATEDLY - which is bcStrTrimSet's immediate, unchanged.
+
+  ⛔ NOT the same predicate as strTrim, and that is why it is a second helper:
+  strTrim removes every byte <= 32 whatever it is, this one removes exactly what
+  it was handed. Folding them would mean passing "the whitespace set" as a
+  string, and then TRIM(s) and TRIM(s, " ") would stop being different - they
+  are, on a tab.
+  ⚠️ An EMPTY pat removes nothing. The interpreter guards on Len > 0 and returns
+  the string untouched; here the two loops simply never advance, which comes to
+  the same and needs no special case. }
+procedure TWasmBackend.EmitTrimSetHelper;
+var
+  B: TWasmBuf;
+  T: LongWord;
+
+  { The "does this end still start (or finish) with the pattern" test, emitted
+    twice with the ends swapped. AtEnd picks which one.
+
+    ⛔ THE BRANCH DEPTHS ARE THE WHOLE DIFFICULTY, and an `if` COUNTS as a label:
+    inside the innermost guard the stack reads 0 = that guard, 1 = the scan loop,
+    2 = the set/substring `if`, 3 = MATCHED, 4 = the trim loop, 5 = DONE. Every
+    exit below is written against that list. Both scans leave only by branching -
+    match goes to MATCHED and failure to DONE - so nothing falls out of them, and
+    a depth that is one off does not fail to validate, it trims the wrong thing. }
+  procedure EmitStrip(AtEnd: Boolean);
+  begin
+    B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);          // DONE
+      B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);         // the trim loop
+        // no room left for another removal
+        B.LocalGet(5); B.LocalGet(4); B.Op(wopI32Sub);
+        B.LocalGet(7); B.Op(wopI32LtS); B.BrIf(1);         // -> DONE
+        B.I32Const(0); B.LocalSet(8);
+        B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);      // MATCHED
+          B.LocalGet(2); B.I32Const(4); B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+            { THE SET FORM: the single character at this end against every
+              member. EXISTS one -> MATCHED; ran out -> DONE. }
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(8); B.LocalGet(6); B.Op(wopI32GeS);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.Br(5);                                   // -> DONE
+              B.EndOp;
+              B.LocalGet(3);
+              if AtEnd then
+              begin
+                B.LocalGet(5); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Sub);
+              end
+              else
+              begin
+                B.LocalGet(4); B.Op(wopI32Add);
+              end;
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.LocalGet(9); B.LocalGet(8); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.Op(wopI32Eq);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.Br(3);                                   // -> MATCHED
+              B.EndOp;
+              B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+              B.Br(0);
+            B.EndOp;
+          B.Op(wopElse);
+            { THE SUBSTRING FORM: the opposite quantifier - ALL the bytes have to
+              be there, so running out of them is the SUCCESS and a difference is
+              the failure. The two targets swap places, and that is the only
+              thing that changes. }
+            B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+              B.LocalGet(8); B.LocalGet(6); B.Op(wopI32GeS);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.Br(3);                                   // -> MATCHED
+              B.EndOp;
+              B.LocalGet(3);
+              if AtEnd then
+              begin
+                B.LocalGet(5); B.Op(wopI32Add); B.LocalGet(6); B.Op(wopI32Sub);
+              end
+              else
+              begin
+                B.LocalGet(4); B.Op(wopI32Add);
+              end;
+              B.LocalGet(8); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.LocalGet(9); B.LocalGet(8); B.Op(wopI32Add);
+              B.OpMem(wopI32Load8U, 0, 0);
+              B.Op(wopI32Ne);
+              B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+                B.Br(5);                                   // -> DONE
+              B.EndOp;
+              B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+              B.Br(0);
+            B.EndOp;
+          B.EndOp;
+        B.EndOp;                                           // MATCHED
+        // matched: move this end past what was removed and go round again
+        if AtEnd then
+        begin
+          B.LocalGet(5); B.LocalGet(7); B.Op(wopI32Sub); B.LocalSet(5);
+        end
+        else
+        begin
+          B.LocalGet(4); B.LocalGet(7); B.Op(wopI32Add); B.LocalSet(4);
+        end;
+        B.Br(0);
+      B.EndOp;
+    B.EndOp;
+  end;
+
+begin
+  if not FUsesTrimSet then Exit;
+  T := FModule.TypeIndex([wvtI32, wvtI32, wvtI32], [wvtI32]);
+  B := TWasmBuf.Create;
+  try
+    // params 0=s 1=pat 2=mode; locals 3=sbase 4=first 5=last 6=plen
+    //         7=step 8=j 9=pbase 10=len 11=handle
+    B.LocalGet(0); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(3);
+    B.LocalGet(1); B.I32Const(4); B.Op(wopI32Add); B.LocalSet(9);
+    B.I32Const(0); B.LocalSet(4);
+    B.LocalGet(0); B.OpMem(wopI32Load, 2, 0); B.LocalSet(5);
+    B.LocalGet(1); B.OpMem(wopI32Load, 2, 0); B.LocalSet(6);
+    { How much one removal takes off: a single character in the set form, the
+      whole pattern otherwise. ⛔ It is NOT the same as the number of bytes
+      compared when the set form is in play - there the whole set is scanned to
+      remove one byte - which is why these are two locals and not one. }
+    B.LocalGet(2); B.I32Const(4); B.Op(wopI32And);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.I32Const(1);
+    B.Op(wopElse);
+      B.LocalGet(6);
+    B.EndOp;
+    B.LocalSet(7);
+
+    B.LocalGet(6); B.Op(wopI32Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(0); B.Op(wopReturn);       // an empty pattern removes nothing
+    B.EndOp;
+
+    B.LocalGet(2); B.I32Const(3); B.Op(wopI32And); B.I32Const(2); B.Op(wopI32Ne);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      EmitStrip(False);
+    B.EndOp;
+    B.LocalGet(2); B.I32Const(3); B.Op(wopI32And); B.I32Const(1); B.Op(wopI32Ne);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      EmitStrip(True);
+    B.EndOp;
+
+    B.LocalGet(5); B.LocalGet(4); B.Op(wopI32Sub); B.LocalTee(10);
+    B.Call(FStrNewFunc); B.LocalTee(11);
+    B.I32Const(4); B.Op(wopI32Add);
+    B.LocalGet(3); B.LocalGet(4); B.Op(wopI32Add);
+    B.LocalGet(10);
+    B.MemoryCopy;
+    B.LocalGet(11);
+    FModule.AddFunction(T, [wvtI32, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32,
+                            wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
+end;
+
+{ strBase(v: i64, digits: i64, base: i64) -> a fresh string holding v in that
+  base, uppercase, with the optional width applied.
+
+  ⭐ ONE helper for HEX$, OCT and BIN because the interpreter is one function
+  too - IntToBaseStr(v, 16 | 8 | 2) followed by FitBaseDigits - and three copies
+  of it here would be three chances to disagree with sb about, say, what BIN of a
+  negative number is.
+
+  Two rules that are easy to get wrong and are both the interpreter's:
+  ⛔ The value is read UNSIGNED. IntToBaseStr assigns the Int64 to a QWord, so
+  HEX$(-1) is "FFFFFFFFFFFFFFFF" and not "-1"; i64.div_u/rem_u are the same
+  reinterpretation, which is why no sign is handled anywhere below.
+  ⚠️ A width SHORTER than the digits KEEPS THE RIGHTMOST ones - FitBaseDigits
+  cuts from the left. It is not an error and not a clamp: BIN(255, 4) is "1111". }
+procedure TWasmBackend.EmitBaseHelper;
+var
+  B: TWasmBuf;
+  T: LongWord;
+begin
+  if not FUsesBase then Exit;
+  T := FModule.TypeIndex([wvtI64, wvtI64, wvtI64], [wvtI32]);
+  B := TWasmBuf.Create;
+  try
+    // locals: 3 = p, 4 = u, 5 = natural len, 6 = final len, 7 = handle,
+    //         8 = digit then dst, 9 = how many digits actually survive
+    B.I32Const(BASE_SCR_END); B.LocalSet(3);
+    B.LocalGet(0); B.LocalSet(4);
+
+    B.LocalGet(4); B.Op(wopI64Eqz);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      // zero is one digit, not none - the empty string is what a bare loop gives
+      B.LocalGet(3); B.I32Const(1); B.Op(wopI32Sub); B.LocalTee(3);
+      B.I32Const(Ord('0')); B.OpMem(wopI32Store8, 0, 0);
+    B.Op(wopElse);
+      B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
+        B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
+          B.LocalGet(4); B.Op(wopI64Eqz); B.BrIf(1);
+          B.LocalGet(3); B.I32Const(1); B.Op(wopI32Sub); B.LocalTee(3);
+          B.LocalGet(4); B.LocalGet(2); B.Op(wopI64RemU); B.Op(wopI32WrapI64);
+          B.LocalTee(8);
+          B.I32Const(10); B.Op(wopI32LtU);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(8); B.I32Const(Ord('0')); B.Op(wopI32Add);
+          B.Op(wopElse);
+            B.LocalGet(8); B.I32Const(Ord('A') - 10); B.Op(wopI32Add);
+          B.EndOp;
+          B.OpMem(wopI32Store8, 0, 0);
+          B.LocalGet(4); B.LocalGet(2); B.Op(wopI64DivU); B.LocalSet(4);
+          B.Br(0);
+        B.EndOp;
+      B.EndOp;
+    B.EndOp;
+
+    B.I32Const(BASE_SCR_END); B.LocalGet(3); B.Op(wopI32Sub); B.LocalSet(5);
+
+    { The asked-for width, or the natural one. ⛔ The clamp is not cosmetic:
+      wrapping an i64 straight to i32 would turn a width of 2^32 + 5 into 5 and
+      answer a SHORT string with no complaint. Above 2^31 the allocation cannot
+      succeed anyway, so the module traps in strNew - which is the honest end. }
+    B.LocalGet(1); B.I64Const(0); B.Op(wopI64LeS);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.LocalGet(5);
+    B.Op(wopElse);
+      B.LocalGet(1); B.I64Const($7FFFFFFF); B.Op(wopI64GtS);
+      B.BlockStart(wopIf, WASM_TYPE_I32);
+        B.I32Const($7FFFFFFF);
+      B.Op(wopElse);
+        B.LocalGet(1); B.Op(wopI32WrapI64);
+      B.EndOp;
+    B.EndOp;
+    B.LocalSet(6);
+
+    B.LocalGet(6); B.Call(FStrNewFunc); B.LocalTee(7);
+    B.I32Const(4); B.Op(wopI32Add); B.LocalSet(8);
+
+    // how many of the digits fit: the rest are cut from the LEFT
+    B.LocalGet(5); B.LocalGet(6); B.Op(wopI32LtU);
+    B.BlockStart(wopIf, WASM_TYPE_I32);
+      B.LocalGet(5);
+    B.Op(wopElse);
+      B.LocalGet(6);
+    B.EndOp;
+    B.LocalSet(9);
+
+    // the zero padding, then the digits after it - one bulk op each
+    B.LocalGet(8);
+    B.I32Const(Ord('0'));
+    B.LocalGet(6); B.LocalGet(9); B.Op(wopI32Sub);
+    B.MemoryFill;
+
+    B.LocalGet(8); B.LocalGet(6); B.Op(wopI32Add); B.LocalGet(9); B.Op(wopI32Sub);
+    B.LocalGet(3); B.LocalGet(5); B.Op(wopI32Add); B.LocalGet(9); B.Op(wopI32Sub);
+    B.LocalGet(9);
+    B.MemoryCopy;
+
+    B.LocalGet(7);
+    FModule.AddFunction(T, [wvtI32, wvtI64, wvtI32, wvtI32, wvtI32, wvtI32, wvtI32], B);
+  finally
+    B.Free;
+  end;
 end;
 
 procedure TWasmBackend.EmitValHelpers;
@@ -6086,6 +6528,89 @@ begin
         StoreReg(B, Instr.Dest);
       end;
 
+    { HEX$ / OCT / BIN: one helper, the base as a third argument - and Src2 is
+      always a real register holding the optional width (0 when it was absent),
+      materialised by SedaiSSA so nothing here has to guess. }
+    ssaStrHex, ssaStrOct, ssaStrBin:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        case Instr.OpCode of
+          ssaStrHex: B.I64Const(16);
+          ssaStrOct: B.I64Const(8);
+        else         B.I64Const(2);
+        end;
+        B.Call(FStrBaseFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { TRIM(s, set) and its two sides. The mode is a compile-time constant that
+      SedaiSSA already packs the way bcStrTrimSet reads it - side in the low two
+      bits, the "Any" form in bit 2 - so it travels unchanged. }
+    ssaStrTrimSet:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        if Instr.Src3.Kind = svkConstInt then
+          B.I32Const(LongInt(Instr.Src3.ConstInt))
+        else
+          B.I32Const(0);          // both ends, the whole substring: the default
+        B.Call(FStrTrimSetFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { MK* and CV*: the byte movement is one helper each way, and the float
+      spellings are the integer ones with a reinterpretation at the edge.
+      ⚠️ MKS$ DEMOTES first - one rounding, not two - which is the rule the
+      whole SINGLE family follows here. }
+    ssaStrMkInt:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I32Const(LongInt(Instr.Src3.ConstInt));
+        B.Call(FStrPackFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrMkFloat:
+      begin
+        LoadReg(B, Instr.Src1);
+        if Instr.Src3.ConstInt = 4 then
+        begin
+          B.Op(wopF32DemoteF64);
+          B.Op(wopI32ReinterpretF32);
+          B.Op(wopI64ExtendI32U);
+        end
+        else
+          B.Op(wopI64ReinterpretF64);
+        B.I32Const(LongInt(Instr.Src3.ConstInt));
+        B.Call(FStrPackFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrCvInt:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I32Const(LongInt(Instr.Src3.ConstInt));
+        B.Call(FStrUnpackFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrCvFloat:
+      begin
+        LoadReg(B, Instr.Src1);
+        B.I32Const(LongInt(Instr.Src3.ConstInt));
+        B.Call(FStrUnpackFunc);
+        if Instr.Src3.ConstInt = 4 then
+        begin
+          B.Op(wopI32WrapI64);
+          B.Op(wopF32ReinterpretI32);
+          B.Op(wopF64PromoteF32);
+        end
+        else
+          B.Op(wopF64ReinterpretI64);
+        StoreReg(B, Instr.Dest);
+      end;
+
     ssaStrUCase, ssaStrLCase:
       begin
         LoadReg(B, Instr.Src1);
@@ -6104,7 +6629,31 @@ begin
         LoadReg(B, Instr.Src1);
         LoadReg(B, Instr.Src2);
         LoadReg(B, Instr.Src3);
-        B.Call(FStrInstrFunc);
+        B.I32Const(0);               // forwards, a substring
+        B.Call(FStrFindFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    { The other three searches, the same helper with the two bits set. ⚠️ The
+      REV forms take no start of their own - the interpreter's ignore theirs -
+      so they hand over a literal 1 rather than a register. }
+    ssaStrInstrAny:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        LoadReg(B, Instr.Src3);
+        B.I32Const(2);               // forwards, a character set
+        B.Call(FStrFindFunc);
+        StoreReg(B, Instr.Dest);
+      end;
+
+    ssaStrInstrRev, ssaStrInstrRevAny:
+      begin
+        LoadReg(B, Instr.Src1);
+        LoadReg(B, Instr.Src2);
+        B.I64Const(1);
+        if Instr.OpCode = ssaStrInstrRevAny then B.I32Const(3) else B.I32Const(1);
+        B.Call(FStrFindFunc);
         StoreReg(B, Instr.Dest);
       end;
 
@@ -8775,7 +9324,7 @@ begin
       caught by the VALIDATOR, not by a wrong answer, only because the signatures happened to differ.
       See the note above about conditional helpers, which is the same hazard. }
     FStrTrimFunc    := Next + 11;   // LTRIM/RTRIM/TRIM: one helper, the sides in a flag
-    FStrInstrFunc   := Next + 12;
+    FStrFindFunc    := Next + 12;   // INSTR / INSTRREV / both Any forms: direction and kind in a flag
     Inc(Next, 13);
     { ⛔ FROM HERE THE NUMBERING IS SEQUENTIAL, not fixed offsets, because these
       are CONDITIONAL: printStr exists only if the program prints, puDigits only
@@ -8807,6 +9356,25 @@ begin
     begin
       FValBitFunc := Next;
       FStrValFunc := Next + 1;
+      Inc(Next, 2);
+    end;
+    { HEX$/OCT/BIN, after VAL because EmitStringHelpers emits it after
+      EmitValHelpers - sequential and conditional, like everything else in this
+      tail, for the reason spelled out above it. }
+    if FUsesBase then
+    begin
+      FStrBaseFunc := Next;
+      Inc(Next);
+    end;
+    if FUsesTrimSet then
+    begin
+      FStrTrimSetFunc := Next;
+      Inc(Next);
+    end;
+    if FUsesPack then
+    begin
+      FStrPackFunc := Next;
+      FStrUnpackFunc := Next + 1;
       Inc(Next, 2);
     end;
   end;
