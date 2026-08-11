@@ -68,6 +68,16 @@ type
     FMaxReg: array[TSSARegisterType] of Integer;
     FUseRegion: array[TSSARegisterType] of array of Integer;  // 0 none, r+1 one, -1 many
     FIsGlobal: array of Boolean;            // flat id -> lives in a WASM global
+    { ⭐ Flat ids whose value is ALWAYS a 32-bit integer, so their local is an i32 rather than an i64.
+      A register qualifies when EVERY definition of it is a 32-bit narrowing of the same signedness -
+      which is precisely what INT32 / UINT32 arithmetic emits, and what a store to a LONG / ULONG
+      emits. Anything else (a phi, a call result, a mixed signedness) is left alone.
+      ⛔ Correctness does not depend on the classification: LoadReg widens an i32 local back to i64 and
+      StoreReg wraps, so every consumer still sees exactly what it saw before. The classification only
+      decides where the wrap/extend PAIR can be avoided - which is the whole saving, and why a wrong
+      answer here costs bytes and never meaning. }
+    FIs32: array of Boolean;                // flat id -> its local is an i32
+    FIs32Signed: array of Boolean;          // ...and how it widens back (extend_s vs extend_u)
     FGlobalIdx: array of LongWord;
     FRegionUses: array of array of Boolean; // region -> flat id
     FLocalIdx: array of array of LongWord;  // region -> flat id -> local index
@@ -292,6 +302,7 @@ type
     function Fail(const Msg: string): Boolean;
     function BankIs(const V: TSSAValue; Want: TSSARegisterType;
       const Who: string): Boolean;
+    procedure Classify32BitRegisters;   // which int registers can live in an i32 local
     function FlatId(const V: TSSAValue): Integer;
     procedure ComputeUpExposed;
     function BlockOfLabel(const AName: string): Integer;
@@ -348,7 +359,10 @@ type
     function FloatRegUses(First, N, RegIdx: Integer): Integer;
     function IntRegUses(First, N, RegIdx: Integer): Integer;
     function EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer): Boolean;
+    function RegIs32(const V: TSSAValue): Boolean;   // does this operand live in an i32 local?
     procedure LoadReg(B: TWasmBuf; const V: TSSAValue);
+    procedure LoadRegI32(B: TWasmBuf; const V: TSSAValue);   // ...as an i32, free when it lives in one
+    procedure StoreRegI32(B: TWasmBuf; const V: TSSAValue; Signed: Boolean);
     function LoadInt32(B: TWasmBuf; const V: TSSAValue): Boolean;
     procedure StoreReg(B: TWasmBuf; const V: TSSAValue);
     procedure BoolToBasic(B: TWasmBuf);
@@ -4446,6 +4460,92 @@ begin
     FUseRegion[RT][V.RegIndex] := -1;               // more than one region
 end;
 
+procedure TWasmBackend.Classify32BitRegisters;
+{ Which integer registers hold ONLY 32-bit values, and with which signedness.
+  A register qualifies when every definition of it is ssaNarrowInt with width 5 or 6, all the same -
+  exactly what INT32 / UINT32 arithmetic emits for its operands and results, and what a store to a
+  LONG / ULONG emits. One definition of any other kind disqualifies it.
+  ⛔ Globals are excluded: a global is how two regions share a value, and narrowing the storage they
+  share is a change of meaning rather than of representation. }
+var
+  b, j, f, W: Integer;
+  Blk: TSSABasicBlock;
+  Ins: TSSAInstruction;
+  Seen: array of Boolean;      // has any definition at all
+  Bad: array of Boolean;       // has a definition that is not a 32-bit narrowing
+  Sign: array of Integer;      // 0 = none yet, 5 or 6 = the width seen so far, -1 = mixed
+  NativeUse, OtherUse: array of Integer;
+
+  { Can this consumer take the operand as an i32 without widening it first? The list is exactly the
+    lowerings that have a 32-bit form - keep the two in step or the count lies. }
+  procedure CountUse(Ins: TSSAInstruction; const V: TSSAValue);
+  var u: Integer;
+  begin
+    u := FlatId(V);
+    if (u < 0) or (V.RegType <> srtInt) then Exit;
+    if OpIn(Ins.OpCode, [ssaNarrowInt, ssaIntToFloat, ssaAddInt, ssaSubInt, ssaMulInt,
+                         ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaNegInt,
+                         ssaRecordStoreInt]) then
+      Inc(NativeUse[u])
+    else
+      Inc(OtherUse[u]);
+  end;
+
+begin
+  SetLength(FIs32, FFlatCount);
+  SetLength(FIs32Signed, FFlatCount);
+  SetLength(Seen, FFlatCount);
+  SetLength(Bad, FFlatCount);
+  SetLength(Sign, FFlatCount);
+  for b := 0 to FProg.Blocks.Count - 1 do
+  begin
+    Blk := FProg.Blocks[b];
+    for j := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[j]);
+      f := FlatId(Ins.Dest);
+      if (f < 0) or (Ins.Dest.RegType <> srtInt) then Continue;
+      Seen[f] := True;
+      if (Ins.OpCode = ssaNarrowInt) and (Ins.Src3.Kind = svkConstInt) then
+      begin
+        W := Integer(Ins.Src3.ConstInt);
+        if (W = 5) or (W = 6) then
+        begin
+          if Sign[f] = 0 then Sign[f] := W
+          else if Sign[f] <> W then Sign[f] := -1;
+          Continue;
+        end;
+      end;
+      Bad[f] := True;
+    end;
+  end;
+  { ⛔ Eligible is not the same as WORTH IT. Every use by an instruction with no 32-bit form pays a
+    widening, and a register narrowed only because it is stored into a LONG - which has nothing to do
+    with 32-bit arithmetic - is read almost entirely by such instructions. Left unchecked that made a
+    64-bit hash loop SIX BYTES LONGER while the 32-bit one gained two: eligibility said yes where the
+    byte count said no. So the uses are counted, and the classification is taken only when at least
+    half of them can consume an i32 directly. }
+  SetLength(NativeUse, FFlatCount);
+  SetLength(OtherUse, FFlatCount);
+  for b := 0 to FProg.Blocks.Count - 1 do
+  begin
+    Blk := FProg.Blocks[b];
+    for j := 0 to Blk.Instructions.Count - 1 do
+    begin
+      Ins := TSSAInstruction(Blk.Instructions[j]);
+      CountUse(Ins, Ins.Src1);
+      CountUse(Ins, Ins.Src2);
+      CountUse(Ins, Ins.Src3);
+    end;
+  end;
+  for f := 0 to FFlatCount - 1 do
+  begin
+    FIs32[f] := Seen[f] and (not Bad[f]) and (not FIsGlobal[f]) and (Sign[f] > 0)
+                and (NativeUse[f] >= OtherUse[f]);
+    FIs32Signed[f] := Sign[f] = 5;
+  end;
+end;
+
 function TWasmBackend.FlatId(const V: TSSAValue): Integer;
 begin
   if V.Kind <> svkRegister then Exit(-1);
@@ -5185,13 +5285,43 @@ end;
 
 { ---------------- 4. lowering ---------------- }
 
+function TWasmBackend.RegIs32(const V: TSSAValue): Boolean;
+{ Does this operand live in an i32 local? Asked by the lowerings that have a 32-bit form available. }
+var f: Integer;
+begin
+  f := FlatId(V);
+  Result := (f >= 0) and (f < Length(FIs32)) and (not FIsGlobal[f]) and FIs32[f];
+end;
+
 procedure TWasmBackend.LoadReg(B: TWasmBuf; const V: TSSAValue);
+{ Always leaves the bank's own type on the stack - i64 for an integer register - whatever the local
+  actually is. That is what keeps every existing call site correct without being touched: a register
+  living in an i32 local is widened back here, and only the paths that WANT an i32 (LoadRegI32) skip
+  the widening. Correctness never depends on the classification; only the byte count does. }
 var
   f: Integer;
 begin
   f := FlatId(V);
-  if FIsGlobal[f] then B.GlobalGet(FGlobalIdx[f])
-                  else B.LocalGet(FLocalIdx[FCurRegion][f]);
+  if FIsGlobal[f] then begin B.GlobalGet(FGlobalIdx[f]); Exit; end;
+  B.LocalGet(FLocalIdx[FCurRegion][f]);
+  if FIs32[f] then
+    if FIs32Signed[f] then B.Op(wopI64ExtendI32S) else B.Op(wopI64ExtendI32U);
+end;
+
+procedure TWasmBackend.LoadRegI32(B: TWasmBuf; const V: TSSAValue);
+{ The same register as an i32 on the stack: free when it already lives in one, a wrap when it does
+  not. This is the half of the saving that the classification exists for. }
+var
+  f: Integer;
+begin
+  f := FlatId(V);
+  if (f >= 0) and (not FIsGlobal[f]) and FIs32[f] then
+  begin
+    B.LocalGet(FLocalIdx[FCurRegion][f]);
+    Exit;
+  end;
+  LoadReg(B, V);
+  B.Op(wopI32WrapI64);
 end;
 
 function TWasmBackend.LoadInt32(B: TWasmBuf; const V: TSSAValue): Boolean;
@@ -5224,9 +5354,30 @@ procedure TWasmBackend.StoreReg(B: TWasmBuf; const V: TSSAValue);
 var
   f: Integer;
 begin
+  { The mirror of LoadReg: what arrives on the stack is the bank's type, so a register living in an
+    i32 local is wrapped on the way in. StoreRegI32 is the form for a value that is ALREADY an i32. }
   f := FlatId(V);
-  if FIsGlobal[f] then B.GlobalSet(FGlobalIdx[f])
-                  else B.LocalSet(FLocalIdx[FCurRegion][f]);
+  if FIsGlobal[f] then begin B.GlobalSet(FGlobalIdx[f]); Exit; end;
+  if FIs32[f] then B.Op(wopI32WrapI64);
+  B.LocalSet(FLocalIdx[FCurRegion][f]);
+end;
+
+procedure TWasmBackend.StoreRegI32(B: TWasmBuf; const V: TSSAValue; Signed: Boolean);
+{ Store a value that is ALREADY an i32 on the stack. Free when the register lives in an i32 local -
+  which, together with LoadRegI32, is what makes a chain of 32-bit operations cost nothing but the
+  operations themselves. Otherwise it widens, and Signed says how: the caller knows, because it is the
+  width the operation was narrowed to. }
+var
+  f: Integer;
+begin
+  f := FlatId(V);
+  if (f >= 0) and (not FIsGlobal[f]) and FIs32[f] then
+  begin
+    B.LocalSet(FLocalIdx[FCurRegion][f]);
+    Exit;
+  end;
+  if Signed then B.Op(wopI64ExtendI32S) else B.Op(wopI64ExtendI32U);
+  StoreReg(B, V);
 end;
 
 procedure TWasmBackend.BoolToBasic(B: TWasmBuf);
@@ -5397,6 +5548,7 @@ function TWasmBackend.EmitInstr(B: TWasmBuf; Instr: TSSAInstruction; R: Integer)
   end;
 
 var
+  Loaded32, Stored32: Boolean;   // a narrow field went straight to/from an i32 (see ssaRecordLoadInt)
   Slot, d, Bytes, NStr, StrBase: Integer;
   n, k: Integer;                  // the array-bind bookkeeping
   Extras: TSSAValueArray;         // operands past Src1..Src3 (graphics carries them there)
@@ -5933,13 +6085,35 @@ begin
         if Instr.Src3.Kind <> svkConstInt then
           Exit(Fail('a record field access without a constant field encoding'));
         Enc := Instr.Src3.ConstInt;
+        Loaded32 := False;
         LoadReg(B, Instr.Src1);                     // the handle
         B.Op(wopI32WrapI64);
-        if OpIn(Instr.OpCode, [ssaRecordStoreInt, ssaRecordStoreFloat]) then
+        // ⭐ The mirror of the load above: a value that LIVES in an i32 local is stored FROM an i32,
+        // which saves the widening the bank would otherwise force on the way out.
+        Stored32 := (Instr.OpCode = ssaRecordStoreInt) and RegIs32(Instr.Src2) and
+                    ((Enc and $F) >= 1) and ((Enc and $F) <= 6);
+        if Stored32 then LoadRegI32(B, Instr.Src2)
+        else if OpIn(Instr.OpCode, [ssaRecordStoreInt, ssaRecordStoreFloat]) then
           LoadReg(B, Instr.Src2);                   // the value
         Ofs := LongWord(8 + (Enc shr 4));
         case Instr.OpCode of
           ssaRecordLoadInt:
+            // ⭐ A field read into a register that LIVES in an i32 local is loaded AS an i32: the
+            // 8- and 16-bit forms land the value where it belongs, where the i64 form would then be
+            // wrapped on the way into the local. One instruction shorter, and the direct spelling.
+            if RegIs32(Instr.Dest) and ((Enc and $F) >= 1) and ((Enc and $F) <= 6) then
+            begin
+              Loaded32 := True;
+              case Enc and $F of
+                1: B.OpMem(wopI32Load8S, 0, Ofs);
+                2: B.OpMem(wopI32Load8U, 0, Ofs);
+                3: B.OpMem(wopI32Load16S, 0, Ofs);
+                4: B.OpMem(wopI32Load16U, 0, Ofs);
+              else
+                B.OpMem(wopI32Load, 2, Ofs);       // 5 and 6: the whole 32-bit word
+              end;
+            end
+            else
             case Enc and $F of
               1: B.OpMem(wopI64Load8S, 0, Ofs);
               2: B.OpMem(wopI64Load8U, 0, Ofs);
@@ -5951,6 +6125,14 @@ begin
               B.OpMem(wopI64Load, 0, Ofs);
             end;
           ssaRecordStoreInt:
+            if Stored32 then
+              case Enc and $F of
+                1, 2: B.OpMem(wopI32Store8, 0, Ofs);
+                3, 4: B.OpMem(wopI32Store16, 0, Ofs);
+              else
+                B.OpMem(wopI32Store, 2, Ofs);       // 5 and 6: the whole 32-bit word
+              end
+            else
             case Enc and $F of
               1, 2: B.OpMem(wopI64Store8, 0, Ofs);
               3, 4: B.OpMem(wopI64Store16, 0, Ofs);
@@ -5976,7 +6158,10 @@ begin
             B.OpMem(wopF64Store, 0, Ofs);
         end;
         if OpIn(Instr.OpCode, [ssaRecordLoadInt, ssaRecordLoadFloat]) then
-          StoreReg(B, Instr.Dest);
+          // ⛔ The i32 path already put an i32 on the stack, so StoreReg's wrap would be applied to
+          // one - a module that does not validate, not a wrong number. It goes straight to the local.
+          if Loaded32 then B.LocalSet(FLocalIdx[FCurRegion][FlatId(Instr.Dest)])
+          else StoreReg(B, Instr.Dest);
       end;
 
     ssaRecordLoadString, ssaRecordStoreString:
@@ -6903,6 +7088,25 @@ begin
         // anything else is the identity.
         if Instr.Src3.Kind <> svkConstInt then
           Exit(Fail('ssaNarrowInt without a constant width code'));
+        // ⭐ A 32-bit narrowing into a register that LIVES in an i32 local is the wrap itself - and
+        // when the source is already such a register it is nothing at all but a move. This is where
+        // the i32 classification pays for the widening it costs at the boundaries.
+        if RegIs32(Instr.Dest) then
+        begin
+          // Every width has a 32-bit form, and taking it keeps the value out of the 64-bit bank
+          // entirely: the sign extensions are single instructions and the unsigned ones a mask, where
+          // the i64 route would need a widening on the way back in.
+          LoadRegI32(B, Instr.Src1);
+          case Instr.Src3.ConstInt of
+            1: B.Op(wopI32Extend8S);
+            2: begin B.I32Const($FF); B.Op(wopI32And); end;
+            3: B.Op(wopI32Extend16S);
+            4: begin B.I32Const($FFFF); B.Op(wopI32And); end;
+            // 5 and 6 are the identity on a value that is already 32 bits wide.
+          end;
+          B.LocalSet(FLocalIdx[FCurRegion][FlatId(Instr.Dest)]);
+          Exit(True);
+        end;
         LoadReg(B, Instr.Src1);
         case Instr.Src3.ConstInt of
           1: B.Op(wopI64Extend8S);
@@ -7165,11 +7369,31 @@ begin
       // combinations are real, and WASM has a dedicated instruction for each of them.
       if (Instr.Src3.Kind = svkConstInt) and ((Instr.Src3.ConstInt and 2) <> 0) then
       begin
-        // straight to binary32 - one rounding, one instruction - then widened back into the bank
-        LoadReg(B, Instr.Src1);
-        if (Instr.Src3.ConstInt and 1) <> 0 then B.Op(wopF32ConvertI64U)
-        else B.Op(wopF32ConvertI64S);
+        // straight to binary32 - one rounding, one instruction - then widened back into the bank.
+        // ⭐ From a register that LIVES in an i32 local, WASM has the conversion that takes the 32-bit
+        // value directly: it saves the widening the bank would otherwise need, so it is shorter as
+        // well as more direct.
+        if RegIs32(Instr.Src1) then
+        begin
+          LoadRegI32(B, Instr.Src1);
+          if (Instr.Src3.ConstInt and 1) <> 0 then B.Op(wopF32ConvertI32U)
+          else B.Op(wopF32ConvertI32S);
+        end
+        else
+        begin
+          LoadReg(B, Instr.Src1);
+          if (Instr.Src3.ConstInt and 1) <> 0 then B.Op(wopF32ConvertI64U)
+          else B.Op(wopF32ConvertI64S);
+        end;
         B.Op(wopF64PromoteF32);
+        StoreReg(B, Instr.Dest);
+      end
+      else if RegIs32(Instr.Src1) then
+      begin
+        LoadRegI32(B, Instr.Src1);
+        if (Instr.Src3.Kind = svkConstInt) and ((Instr.Src3.ConstInt and 1) <> 0) then
+          B.Op(wopF64ConvertI32U)
+        else B.Op(wopF64ConvertI32S);
         StoreReg(B, Instr.Dest);
       end
       else if (Instr.Src3.Kind = svkConstInt) and ((Instr.Src3.ConstInt and 1) <> 0) then
@@ -7195,6 +7419,34 @@ begin
         LoadReg(B, Instr.Src1);
         if FModern or (Instr.OpCode = ssaFloatRound) then B.Op(wopF64Nearest);
         B.LocalTee(FFltTmp);
+        // ⭐ A destination that LIVES in an i32 local takes the 32-bit truncation, which lands the
+        // value where it belongs and saves the wrap StoreReg would otherwise add. The guard is the
+        // same one the 64-bit form uses and excludes every input that would trap - and here the range
+        // is the 32-bit one, which is what makes trunc_f64_u usable for the unsigned destination:
+        // nothing negative and nothing at or above 2^32 reaches it.
+        if RegIs32(Instr.Dest) and (Instr.OpCode = ssaFloatToInt) then
+        begin
+          B.F64Const(-2147483649.0);
+          B.Op(wopF64Gt);
+          B.LocalGet(FFltTmp);
+          B.F64Const(4294967296.0);
+          B.Op(wopF64Lt);
+          B.Op(wopI32And);
+          B.BlockStart(wopIf, WASM_TYPE_I32);
+            B.LocalGet(FFltTmp);
+            B.F64Const(0.0);
+            B.Op(wopF64Lt);
+            B.BlockStart(wopIf, WASM_TYPE_I32);
+              B.LocalGet(FFltTmp); B.Op(wopI32TruncF64S);   // negative: in [-2^31-1, 0)
+            B.Op(wopElse);
+              B.LocalGet(FFltTmp); B.Op(wopI32TruncF64U);   // non-negative: up to 2^32-1
+            B.EndOp;
+          B.Op(wopElse);
+            B.I32Const(Integer($80000000));                 // out of range: the integer indefinite
+          B.EndOp;
+          B.LocalSet(FLocalIdx[FCurRegion][FlatId(Instr.Dest)]);
+          Exit(True);
+        end;
         if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt = 1) then
         begin
           // Src3 = 1: the DESTINATION is unsigned 64-bit, and [2^63, 2^64) is exactly the range the
@@ -7533,7 +7785,7 @@ var
   RT: TSSARegisterType;
   Locals: TWasmValTypeArray;
   Terminated: Boolean;
-  SkipNext, F32Un, I32Un: Boolean;
+  SkipNext, F32Un, I32Un, Loaded32: Boolean;
   F32Op, I32Op: Byte;
   NextI: TSSAInstruction;
   CalleeRegion: Integer;
@@ -7727,7 +7979,11 @@ begin
       begin
         FLocalIdx[R][j] := LongWord(k);
         SetLength(Locals, Length(Locals) + 1);
-        Locals[High(Locals)] := BankType[RT];
+        // ⭐ A register every definition of which is a 32-bit narrowing lives in an i32 local. The
+        // widening/wrapping at the boundaries is LoadReg's and StoreReg's job, so nothing else in the
+        // backend has to know - and inside a chain of 32-bit operations there are no boundaries.
+        if FIs32[j] then Locals[High(Locals)] := wvtI32
+        else Locals[High(Locals)] := BankType[RT];
         Inc(k);
       end;
     end;
@@ -7812,13 +8068,11 @@ begin
         if I32Op <> 0 then
         begin
           if I32Un then B.I32Const(0)       // NEG is 0 - x, which is what the unary form means here
-          else begin LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); end;
-          if I32Un then begin LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); end
-          else begin LoadReg(B, Instr.Src2); B.Op(wopI32WrapI64); end;
+          else LoadRegI32(B, Instr.Src1);
+          if I32Un then LoadRegI32(B, Instr.Src1)
+          else LoadRegI32(B, Instr.Src2);
           B.Op(I32Op);
-          if NextI.Src3.ConstInt = 5 then B.Op(wopI64ExtendI32S)
-          else B.Op(wopI64ExtendI32U);
-          StoreReg(B, NextI.Dest);
+          StoreRegI32(B, NextI.Dest, NextI.Src3.ConstInt = 5);
           SkipNext := True;
           Continue;
         end;
@@ -8059,6 +8313,7 @@ begin
   ScanForHalt;
   SetLength(FLocalIdx, FProg.Blocks.Count);   // sized by region below
   if not ClassifyRegisters then Exit(False);
+  Classify32BitRegisters;
   SetLength(FLocalIdx, FRegionCount);
   if not BuildSignatures then Exit(False);
   if not DetectRecursion then Exit(False);
