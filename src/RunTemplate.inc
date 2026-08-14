@@ -598,7 +598,7 @@ begin
         begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_IO_BASE + 0 .. DENSE_IO_BASE + 22:
         begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
-      DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 16:
+      DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 17:
         begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + 36:
         begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
@@ -632,16 +632,35 @@ begin
         bcAddInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcSubInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - IntRegs[Instr.Src2]; Inc(CurPC); end;
         bcMulInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * IntRegs[Instr.Src2]; Inc(CurPC); end;
+        { ⭐ THE ONE PLACE THAT NAMES A DIVISION FAULT. The JIT and the AOT both DEOPT
+          on a zero divisor and on INT64_MIN \ -1 rather than emitting the trapping
+          idiv, so whatever is decided here is what all three engines report.
+          ⛔ It used not to decide at all for INT64_MIN \ -1: the guard only tested
+          for zero, the CPU raised #DE, and the ERROR CODE then came from whichever
+          name the OPERATING SYSTEM gave that trap - EDivByZero on Linux (Err 20),
+          something unmapped on Windows (Err 100 = ERR_INTERNAL, i.e. "no idea").
+          One expression, two answers, neither of them right. }
         bcDivInt: begin
           if IntRegs[Instr.Src2] = 0 then
             raise EDivByZero.Create('Integer division by zero');
+          { INT64_MIN \ -1 is 2^63, which no Int64 holds: a genuine OVERFLOW. }
+          if (IntRegs[Instr.Src1] = Low(Int64)) and (IntRegs[Instr.Src2] = -1) then
+            raise EIntOverflow.Create('Integer division overflow');
           IntRegs[Instr.Dest] := IntRegs[Instr.Src1] div IntRegs[Instr.Src2];
           Inc(CurPC);
         end;
         bcModInt: begin
           if IntRegs[Instr.Src2] = 0 then
             raise EDivByZero.Create('Integer modulo by zero');
-          IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2];
+          { ⭐ INT64_MIN Mod -1 is 0 - EXACT, and it fits. No error (user decision,
+            13 Aug 2026). The hardware faults only because idiv produces quotient
+            AND remainder together and the QUOTIENT overflows; we want the
+            remainder, so we answer it instead of inheriting a fault meant for a
+            value nobody asked for. }
+          if (IntRegs[Instr.Src1] = Low(Int64)) and (IntRegs[Instr.Src2] = -1) then
+            IntRegs[Instr.Dest] := 0
+          else
+            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2];
           Inc(CurPC);
         end;
         bcDivUInt: begin   // unsigned 64-bit \ (QWord)
@@ -1442,6 +1461,14 @@ begin
         else if E is EZeroDivide then
           Ctx.LastErrorCode := ERR_DIVISION_BY_ZERO
         else if E is EOverflow then
+          Ctx.LastErrorCode := ERR_OVERFLOW
+        { ⛔ EIntOverflow was MISSING, and its absence is why Windows answered 100.
+          It is a sibling of EOverflow (that one is the FLOAT overflow), not a
+          descendant, so it fell through every arm to the ERR_INTERNAL catch-all -
+          a code that means "unclassified" and told the BASIC programmer nothing.
+          Raised deliberately by bcDivInt now, and also by any INT64_MIN \ -1 that
+          reaches us through FPC's own range checking. }
+        else if E is EIntOverflow then
           Ctx.LastErrorCode := ERR_OVERFLOW
         else if E is EUnderflow then
           Ctx.LastErrorCode := ERR_UNDERFLOW
