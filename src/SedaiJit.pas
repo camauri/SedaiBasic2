@@ -92,7 +92,59 @@ var
   JitDiagCurOp: Word = 0;
   JitDiagCurPC: Integer = -1;
 
+// JIT_DUMP=<dir>: write the machine code of every compiled loop to <dir>/jit_<n>_pc<lo>-<hi>.bin,
+// to be read with
+//     objdump -D -b binary -m i386:x86-64 -M att <file>
+// Purely observational - with the variable unset not one byte of the codegen path changes, and the
+// only cost is one string comparison per compiled loop.
+//
+// ⛔ It exists because the AOT had AOT_DUMP and the JIT had NOTHING, so the only way to look at a
+// JIT miscompilation was to read the emitter and guess. That cost two hours on
+// job/tests/bas/bug_jit_arraystorestr.bas without finding the fault.
+function JitDumpDir: string;
+
 implementation
+
+var
+  GJitDumpState: Integer = -1;    // -1 = env not read yet
+  GJitDumpDir: string = '';
+  GJitDumpSeq: Integer = 0;
+
+function JitDumpDir: string;
+begin
+  if GJitDumpState < 0 then
+  begin
+    GJitDumpDir := GetEnvironmentVariable('JIT_DUMP');
+    GJitDumpState := Ord(GJitDumpDir <> '');
+  end;
+  Result := GJitDumpDir;
+end;
+
+// Write one compiled loop's bytes. Failure is silent on purpose: a diagnostic that can abort a run
+// is worse than one that misses a file.
+procedure JitDumpCode(E: TX86Emitter; LoPC, HiPC: Integer);
+var
+  Dir, Path: string;
+  F: file;
+begin
+  Dir := JitDumpDir;
+  if (Dir = '') or (E = nil) or (E.Len <= 0) then Exit;
+  if not DirectoryExists(Dir) then
+    if not ForceDirectories(Dir) then Exit;
+  Inc(GJitDumpSeq);
+  Path := IncludeTrailingPathDelimiter(Dir) +
+          Format('jit_%.3d_pc%d-%d.bin', [GJitDumpSeq, LoPC, HiPC]);
+  {$I-}
+  AssignFile(F, Path);
+  Rewrite(F, 1);
+  if IOResult = 0 then
+  begin
+    BlockWrite(F, E.Bytes^, E.Len);
+    CloseFile(F);
+  end;
+  if IOResult <> 0 then ;
+  {$I+}
+end;
 
 // x86-64 register numbers (RAX..R15, XMM0/1) come from SedaiX86Emitter.
 
@@ -456,9 +508,57 @@ var
   // RAISES on a zero divisor, and x86 idiv faults on both /0 and the INT64_MIN/-1 overflow; guard both and
   // deopt to `apc` so the interpreter reproduces the exact behaviour (raise, or FPC's overflow result).
   // WantRemainder selects mod (rdx) vs div (rax). Divisor in rcx, dividend in rax; rdx is clobbered.
+  // ⭐ `x \ C` / `x Mod C` with a CONSTANT divisor: multiply-high instead of idiv, the same lowering
+  // the AOT emits and through the SAME magic-number routine (AotMagicSigned), never a second copy.
+  //
+  // ⛔ The divisor is NOT recoverable from the register here - after allocation that number carries
+  // several values. It rides the instruction's Immediate, stamped before allocation by
+  // TSSAProgram.AnnotateDivByConst, which is the only place where a register still identifies a
+  // value. The bytecode carries it through: Immediate is free on these two opcodes.
+  //
+  // 📊 Why it was worth doing: measured 12 Aug 2026 on a loop of two divisions by 10^9, the AOT
+  // took 21 ms and the JIT 52. The control - the same loop with the divisor read from the command
+  // line, so no engine can know it - cost the AOT 56 ms. That is what says the transformation is
+  // the difference, and it is the operation a bignum inner loop is made of.
+  function TryDivModConst(WantRemainder: Boolean): Boolean;
+  var
+    d, M: Int64;
+    s: Integer;
+    NeedAdd, NeedSub: Boolean;
+  begin
+    Result := False;
+    d := I^.Immediate;
+    if d = 0 then Exit;                                   // not annotated: divisor is a real register
+    if (d = 1) or (d = -1) then Exit;                     // identity, and -1 is the INT64_MIN corner
+    if WantRemainder and ((d > High(LongInt)) or (d < Low(LongInt))) then
+      Exit;                                               // the remainder needs d as an imm32 for imul
+    AotMagicSigned(d, M, s, NeedAdd, NeedSub);
+
+    ILoad(RCX, I^.Src1);                          // rcx = n, kept: the remainder needs it
+    MovImm64(RAX, M);
+    E.EmitBytes([$48, $F7, $E9]);                 // imul rcx     -> rdx:rax = M * n (signed)
+    MovRR(RAX, RDX);                              // rax = the high half
+    if NeedAdd then E.EmitBytes([$48, $01, $C8])  // add rax, rcx
+    else if NeedSub then E.EmitBytes([$48, $29, $C8]);   // sub rax, rcx
+    if s > 0 then begin E.EmitBytes([$48, $C1, $F8]); E.Emit8(Byte(s)); end;  // sar rax, s
+    MovRR(RDX, RAX);
+    E.EmitBytes([$48, $C1, $EA, $3F]);            // shr rdx, 63  -> the sign bit
+    E.EmitBytes([$48, $01, $D0]);                 // add rax, rdx -> rax = quotient
+    if WantRemainder then
+    begin
+      E.EmitBytes([$48, $69, $D0]); E.Emit32(LongWord(Int64(LongInt(d))));   // imul rdx, rax, d
+      E.EmitBytes([$48, $29, $D1]);               // sub rcx, rdx -> rcx = n - q*d
+      IStore(I^.Dest, RCX);
+    end
+    else
+      IStore(I^.Dest, RAX);
+    Result := True;
+  end;
+
   procedure DivMod(apc: Integer; WantRemainder: Boolean);
   var p1, p2, p3: Integer;
   begin
+    if TryDivModConst(WantRemainder) then Exit;
     ILoad(RAX, I^.Src1);                          // rax = dividend
     ILoad(RCX, I^.Src2);                          // rcx = divisor
     E.EmitBytes([$48, $85, $C9]);                 // test rcx, rcx
@@ -1037,6 +1137,10 @@ var
         bcStrMid: begin T(J^.Src2); T(Word(J^.Immediate and $FFFF)); end;   // start + length REGISTER
         bcStrInstr: begin T(J^.Dest); T(Word(J^.Immediate and $FFFF)); end; // result + start REGISTER
         bcStrAscMid: begin T(J^.Dest); T(J^.Src2); T(Word(J^.Immediate and $FFFF)); end;
+        // A STRING array element: Dest is a string SLOT and Src1 is an array id, so the only
+        // integer register here is the INDEX. Declaring it is not optional - a register the
+        // scanner does not know about is one the allocator may hand to something else.
+        bcArrayLoadString, bcArrayStoreString: T(J^.Src2);                                   // Src2 = the index
         bcStrConcatCharAt, bcStrAppendMapped: T(Word(J^.Immediate and $FFFF));  // the index REGISTER
         bcRecordNew: T(J^.Dest);            // Src1/Src2/Immediate are slot COUNTS, not registers
         bcRecordFree: T(J^.Src1);           // the handle
@@ -1560,6 +1664,53 @@ var
     LeafRestore;
     FStore(dReg, XMM0);
   end;
+  // StringRegs[dst] := a STRING array element, through the primitive the AOT already calls:
+  //   AotArrLoadStr(dstSlot, VMSelf, ArrIdx, Idx)
+  //
+  // ⛔ This is why the JIT was 5.7x behind the AOT on fasta: four of its six hot loops BAILED on
+  // bcArrayLoadString and fell back to the interpreter whole. The AOT compiled the same regions
+  // NATIVE. Measured 12 Aug 2026 with JIT_DIAG/AOT_DIAG.
+  //
+  // ⚠️ ORDER. The index is read FIRST, while every pooled register still holds what the allocator
+  // says it holds - the AOT's twin carries the scar of getting this wrong: it wrote arg1 and arg2
+  // before reading the index, so an index living in one of those came back as the array id and the
+  // string array silently lost an element. Everything written afterwards comes from a compile-time
+  // constant or from the string bank base in rax, and neither is in the pool.
+  // ⚠️ VMSelf is read from the ctx table at COMPILE time, exactly as the primitive addresses are:
+  // this JIT is already bound to the VM whose table it was handed.
+  procedure EmitArrLoadStrJ(dSlot, ArrayId, idxReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG3, idxReg);                              // arg3 = index, read before anything else
+    StrBaseRax;                                             // rax = string bank base
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);               // arg0 = &StringRegs[dst]
+    MovImm64(ABI_ARG1, PtrInt(Prim(AOTCTX_VMSELF)));        // arg1 = the VM
+    MovImm64(ABI_ARG2, ArrayId);                            // arg2 = array id
+    LeafCall(Prim(AOTCTX_ARRLOADSTR));
+    LeafRestore;
+  end;
+
+  // ⭐ It faulted until 12 Aug 2026, and the fault was NOT here: the two base-register save slots
+  // were only allocated when a loop routed HELPER calls, so a leaf call in a loop without one wrote
+  // both bases to [rsp-1]. See the "or UseLeaf" note further down. Guarded by
+  // job/tests/bas/bug_jit_arraystorestr.bas.
+  // The twin: a STRING array element := StringRegs[src]
+  //   AotArrStoreStr(VMSelf, ArrIdx, srcVal, Idx)
+  // It surfaced the moment the load was covered - four loops stopped bailing on the load and two
+  // began bailing on the store instead. Same ordering rule: the index first, the value out of the
+  // bank base last.
+  procedure EmitArrStoreStrJ(ArrayId, idxReg, sSlot: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG3, idxReg);                              // arg3 = index, read before anything else
+    StrBaseRax;                                             // rax = string bank base
+    MovImm64(ABI_ARG0, PtrInt(Prim(AOTCTX_VMSELF)));        // arg0 = the VM
+    MovImm64(ABI_ARG1, ArrayId);                            // arg1 = array id
+    MovLoadR(ABI_ARG2, RAX, LongWord(sSlot) * 8);           // arg2 = StringRegs[src]
+    LeafCall(Prim(AOTCTX_ARRSTORESTR));
+    LeafRestore;
+  end;
+
   // Dest(int) := VALINT(src, decWidth) - the width is an IMMEDIATE, not a register.
   procedure EmitStrValIntJ(dReg, sSlot: Integer; width: Int64);
   begin
@@ -2112,8 +2263,16 @@ var
           EmitRestoreSparse(RBX, SaveIntRegs, NSaveInt, 0);       // restore memory-homed caller int regs
           EmitRestoreSparse(RSI, SaveFloatRegs, NSaveFloat, LongWord(NSaveInt) * 8);  // ...and float
         end
+        else if InGosub then
+          Exit                                       // inside an inlined GOSUB body: same rule as bcEnd
         else
-          Exit;                                      // a bare RETURN at loop top level is not compilable
+          { ⭐ A native loop cannot return from a BASIC procedure - but it can LEAVE, and the
+            interpreter then executes the very bcReturnSub we stopped at, with its own convention.
+            Exactly the bcEnd/bcStop argument, and the reason it matters is the same: `Exit Sub`
+            inside a hot loop is a COLD branch (fannkuch-redux takes it once, when the permutations
+            run out), and refusing to compile threw away the whole 118-instruction loop for it.
+            📊 fannkuch-redux --jit: 845 -> 190 ms. Was `Exit` until 12 Aug 2026. }
+          DeoptTo(apc);
       // Inlined GOSUB (classic): the body shares the caller frame, so no FramePush -- just spill the caller's
       // allocated regs to their home slots, emit the body all-memory, then reload them (it may have written
       // shared variables through memory). A deopt inside is only reachable on a terminal CLASSIC trap.
@@ -2219,6 +2378,12 @@ var
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcStrChr:
         if UseLeaf and not (InCallee or InGosub) then EmitStrChrJ(I^.Dest, I^.Src1)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcArrayLoadString:
+        if UseLeaf and not (InCallee or InGosub) then EmitArrLoadStrJ(I^.Dest, I^.Src1, I^.Src2)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcArrayStoreString:
+        if UseLeaf and not (InCallee or InGosub) then EmitArrStoreStrJ(I^.Src1, I^.Src2, I^.Dest)
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcStrVal:
         if UseLeaf and not (InCallee or InGosub) then EmitStrValJ(I^.Dest, I^.Src1)
@@ -2510,7 +2675,21 @@ begin
   CtxDisp := GprSaveDisp + NCallerGpr * 8;
   ScratchBytes := CtxDisp + 8;
   ArrDescDisp := -1; FltSaveDisp := -1; HelperAdjust := 0;
-  if UseHelper then
+  { ⛔⛔ "or UseLeaf", and it was missing. These two slots and the stack adjustment are what a CALL
+    out of compiled code needs, and the LEAF path makes calls too - the whole string family goes
+    through LeafSaveBases/LeafRestore. Gated on UseHelper alone, a loop that routes leaf calls but
+    no helper calls emitted them with the displacement still at -1:
+
+        mov %rsi,-0x1(%rsp)      <- the float bank base, stored BELOW rsp
+        ...
+        mov -0x1(%rsp),%r8       <- the array descriptor base, read from the SAME byte
+
+    so r8 came back holding rsi, both lived in the callee's red zone, and HelperAdjust stayed 0 so
+    the stack was not even realigned for the call. It only bit where r8 was USED after the call,
+    which is why it hid for so long: a loop with a string op and no array access survived it.
+    Found 12 Aug 2026 by dumping the emitted code (JIT_DUMP) after two hours of reading the source
+    found nothing - see job/tests/bas/bug_jit_arraystorestr.bas. }
+  if UseHelper or UseLeaf then
   begin
     ArrDescDisp := ScratchBytes;
     FltSaveDisp := ScratchBytes + 8;
@@ -2637,6 +2816,7 @@ begin
       E.Patch32(Fixups[pc].PatchOff, LongWord(target - (Fixups[pc].PatchOff + 4)));
     end;
 
+    JitDumpCode(E, HeaderPC, EndPC);
     Result := TExecMem.Create(E);
     if Result.Ptr = nil then FreeAndNil(Result);
   finally

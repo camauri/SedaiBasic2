@@ -369,6 +369,13 @@ function AotAscMidInline: Boolean;
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 
+// Magic number for a SIGNED 64-bit division by a constant (Hacker's Delight figure 10-4), so that
+// `x \ C` and `x Mod C` become a multiply-high instead of an idiv. Exported for the same reason
+// AotAscMidInline is: the loop JIT emits the same lowering, and two copies of a magic-number
+// derivation is two chances to get a quotient subtly wrong on one engine only.
+// See TryDivModConst in both units for the instruction sequence M/s/NeedAdd/NeedSub describe.
+procedure AotMagicSigned(d: Int64; out M: Int64; out s: Integer; out NeedAdd, NeedSub: Boolean);
+
 implementation
 
 uses TypInfo, Cpu;   // Cpu: AVXSupport, the RUNTIME feature check the AVX vector path is gated on
