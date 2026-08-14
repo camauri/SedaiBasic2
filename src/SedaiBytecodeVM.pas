@@ -45,7 +45,7 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot
+  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot, SedaiCpuInfo
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -12417,6 +12417,18 @@ begin
         {$ELSE}
         Ctx.IntRegs[Instr.Dest] := GetFPCHeapStatus.CurrHeapFree;
         {$ENDIF}
+      end;
+    17: // bcCpuCount - how many of WHAT: the immediate picks the quantity
+      { 0 = logical processors (hardware threads), 1 = physical cores, 2 = physical CPUs (sockets).
+        Three different numbers - 22 / 16 / 1 on a Core Ultra 9 185H - because only the cores with
+        SMT become two logical processors.
+        ⛔ Not System.CPUCount: on FPC 3.2.2/Linux it answers 1 whatever the machine has, so a
+        worker pool sized from it would silently become single-threaded. }
+      case Instr.Immediate of
+        0: Ctx.IntRegs[Instr.Dest] := LogicalProcessorCount;
+        1: Ctx.IntRegs[Instr.Dest] := PhysicalCoreCount;
+      else
+        Ctx.IntRegs[Instr.Dest] := PhysicalCpuCount;
       end;
     5: // bcLoadEL - return last error line number
       Ctx.IntRegs[Instr.Dest] := Ctx.LastErrorLine;

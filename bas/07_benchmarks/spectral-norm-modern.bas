@@ -12,7 +12,13 @@
 '' forty phases in all: creating four threads per phase would cost more than the arithmetic.
 '' The workers are started once and released through a barrier, which is what Pool does too.
 
-Const NW = 4          '' workers, matching Pool(processes=4) in the Python original
+'' ⛔ FOUR workers ON PURPOSE, and this one does NOT follow the machine.
+'' The Python reference asks for Pool(processes=4) - a fixed four, not cpu_count() - so four is what
+'' a like-for-like comparison uses. Widening this to the machine's processors would buy a number
+'' that beats Python for a reason that is not our engine, and it would break comparability with
+'' every measurement taken so far.
+'' A second command-line argument overrides it, for measuring at machine width on purpose.
+Dim Shared As Integer NW
 
 Dim Shared As Integer nSize
 Dim Shared As Any Ptr mtx, cvWork, cvDone
@@ -88,6 +94,12 @@ End Sub
 Dim As Integer N = 5500
 If Len(Command(1)) > 0 Then N = CInt(Command(1))
 
+'' Four, unless told otherwise - see the note at the top of this file.
+NW = 4
+If Len(Command(2)) > 0 Then NW = CInt(Command(2))
+If NW < 1 Then NW = 1
+
+
 nSize = N
 ReDim a(0 To N - 1)
 ReDim b(0 To N - 1)
@@ -99,7 +111,8 @@ Next i
 
 mtx = MutexCreate() : cvWork = CondCreate() : cvDone = CondCreate()
 gPhase = 0 : gDone = 0 : gQuit = 0
-Dim As Any Ptr h(0 To NW - 1)
+Dim As Any Ptr h()
+ReDim h(0 To NW - 1)
 For k As Integer = 0 To NW - 1
   h(k) = ThreadCreate( @worker, k )
 Next k

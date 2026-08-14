@@ -3888,6 +3888,20 @@ begin
           else
             EmitInstruction(ssaStrLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
+        else if (FuncName = kPROCESSORCOUNT) or (FuncName = kCORECOUNT) or (FuncName = kCPUCOUNT) then
+        begin
+          { PROCESSORCOUNT / CORECOUNT / CPUCOUNT - no argument, three DIFFERENT quantities.
+            ⭐ ONE opcode, the kind in Src3, so no consumer can cover one and forget another; three
+            spellings rather than a parameter because a bare literal would say nothing to a reader.
+            MODERN extension: fbc has no equivalent, declared in BASIC.md. }
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          if FuncName = kPROCESSORCOUNT then i := 0
+          else if FuncName = kCORECOUNT then i := 1
+          else i := 2;
+          EmitInstruction(ssaCpuCount, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(i));
+        end
         else if (FuncName = kFREEFILE) then
         begin
           // FreeBASIC FREEFILE - no argument; the lowest unused file number (handle slot is ignored).

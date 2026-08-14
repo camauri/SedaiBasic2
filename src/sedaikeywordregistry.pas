@@ -1834,6 +1834,9 @@ begin
  RegisterKeyword(kSWAP,  ttMemoryCommand,  'Swap content of host RAM to expansion RAM',  kcMemoryHandling);
  // functions
  RegisterKeyword(kFRE,     ttMemoryFunction, 'Return RAM bytes free',                      kcMemoryHandling);
+ RegisterKeyword(kPROCESSORCOUNT,ttMathFunction, 'PROCESSORCOUNT: logical processors (hardware threads)', kcMathFunctions);
+ RegisterKeyword(kCORECOUNT,ttMathFunction, 'CORECOUNT: physical cores on this machine',      kcMathFunctions);
+ RegisterKeyword(kCPUCOUNT,ttMathFunction, 'CPUCOUNT: physical CPUs (sockets)',               kcMathFunctions);
  RegisterKeyword(kPEEK,    ttMemoryFunction, 'Return content of specific RAM location',    kcMemoryHandling);
  // POINTER is NOT registered: like VARPTR it stays a bare name and is intercepted in SedaiSSA as the
  // address-of a variable (POINTER(v) == VARPTR(v) == @v). Registering it would route it to the generic

@@ -1148,7 +1148,9 @@ begin
   // FreeBASIC FREEFILE/NOW/TIMER take no argument: accept bare (FREEFILE), as well as FREEFILE(). Attach
   // an empty argument list so the SSA function dispatch (which only runs for ChildCount>0) still sees it.
   if ((UpperCase(Token.Value) = 'FREEFILE') or (UpperCase(Token.Value) = kNOW) or
-      (UpperCase(Token.Value) = kTIMER)) and not Context.Check(ttDelimParOpen) then
+      (UpperCase(Token.Value) = kTIMER) or (UpperCase(Token.Value) = kPROCESSORCOUNT) or
+      (UpperCase(Token.Value) = kCORECOUNT) or (UpperCase(Token.Value) = kCPUCOUNT))
+     and not Context.Check(ttDelimParOpen) then
   begin
     Result.AddChild(TASTNode.Create(antArgumentList, Token));
     Exit;

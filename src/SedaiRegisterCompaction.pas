@@ -267,6 +267,7 @@ begin
     bcLoadST,         // ST: Kernal I/O status byte (int)
     bcCsrlin,         // CSRLIN: current cursor row (int)
     bcFre,            // FRE: available memory (int)
+    bcCpuCount,       // CPUCOUNT/CPUCORES: processors (int); the immediate is the KIND, not a register
     bcGfxScreenPtr,   // SCREENPTR: Dest = raw pointer to the framebuffer (int); no register sources
     bcPeek,           // PEEK(address): read from memory (int)
     // === GROUP 7: Sprite functions ===

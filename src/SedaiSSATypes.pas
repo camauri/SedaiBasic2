@@ -421,6 +421,7 @@ type
     ssaLoadST,         // ST: Kernal I/O status byte (bit 6 = end-of-file on the last GET#)
     ssaCsrlin,         // CSRLIN: current text cursor row
     ssaFre,            // FRE(x): Return available memory in bytes
+    ssaCpuCount,       // CPUCOUNT / CPUCORES: processors on this machine (Src3 = 0 logical, 1 physical)
     // Memory operations
     ssaPeek,           // PEEK(address): Read from memory-mapped location
     ssaPoke,           // POKE address, value: Write to memory-mapped location

@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 542 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts
+  OPCODE_LIST_COUNT = 543 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -101,7 +101,7 @@ const
     bcPrintBool, bcPrintUInt, bcWInputChars, bcInputChars, bcConScreen, bcConLocate,
     bcConViewPrint, bcLoadTI, bcLoadTIS, bcStoreTIS, bcLoadDTS, bcFre,
     bcLoadEL, bcLoadER, bcLoadERRS, bcPeek, bcPoke, bcLoadCWDS,
-    bcCsrlin, bcLoadDS, bcLoadDSS, bcLoadST, bcLoadERFN, bcLoadERMN,
+    bcCsrlin, bcLoadDS, bcLoadDSS, bcLoadST, bcLoadERFN, bcLoadERMN, bcCpuCount,
     bcDopen, bcDclose, bcOpen, bcClose, bcGetFile, bcInputFile,
     bcPrintFile, bcCmd, bcAppend, bcDclear, bcRecord, bcPrintFileNewLine,
     bcPrintFileFloat, bcPrintFileInt, bcInputFileFloat, bcInputFileInt, bcFileQuery, bcSeekSet,
@@ -160,24 +160,27 @@ const
                               // and it printed the right numbers to use.
   DENSE_ARRAY_BASE    = 263;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
   DENSE_IO_BASE       = 315;  // group 4  (23)          -> 306..328
-  DENSE_SPECIAL_BASE  = 338;  // group 5  (17)          -> 329..345
-  DENSE_FILEIO_BASE   = 355;  // group 6  (37)          -> 346..382 (bcDirAttr = sub 36)
-  DENSE_SPRITE_BASE   = 392;  // group 7  (17)          -> 383..399
+  // ⚠️ bcCpuCount (sub 17) made group 5 one wider, which shifts FILEIO and everything below it -
+  // and DENSE_TOTAL - by one, in BOTH branches. Nothing checks these at compile time;
+  // `sb --verify-opcodes` is what says so, and it prints the right numbers when they are wrong.
+  DENSE_SPECIAL_BASE  = 338;  // group 5  (18)          -> 338..355
+  DENSE_FILEIO_BASE   = 356;  // group 6  (37)
+  DENSE_SPRITE_BASE   = 393;  // group 7  (17)
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 409;  // 400..412 (12 used, slot 0 a hole)
+  DENSE_WEB_BASE      = 410;  // 12 used, slot 0 a hole
   // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
   // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
   // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
-  DENSE_GRAPHICS_BASE = 422;  // group 10 (66)          -> 413..478
-  DENSE_SOUND_BASE    = 488;  // group 11 (6)           -> 479..484
-  DENSE_SUPER_BASE    = 494;  // group 200 (256 slots)  -> 485..740
-  DENSE_TOTAL         = 750;  // N (with web)
+  DENSE_GRAPHICS_BASE = 423;  // group 10 (66)
+  DENSE_SOUND_BASE    = 489;  // group 11 (6)
+  DENSE_SUPER_BASE    = 495;  // group 200 (256 slots)
+  DENSE_TOTAL         = 751;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 409;  // group 10 (66)          -> 400..465
-  DENSE_SOUND_BASE    = 475;  // group 11 (6)           -> 466..471
-  DENSE_SUPER_BASE    = 481;  // group 200 (256 slots)  -> 472..727 (58 used, 198 holes)
-  DENSE_TOTAL         = 737;  // N
+  DENSE_GRAPHICS_BASE = 410;  // group 10 (66)
+  DENSE_SOUND_BASE    = 476;  // group 11 (6)
+  DENSE_SUPER_BASE    = 482;  // group 200 (256 slots, 58 used, 198 holes)
+  DENSE_TOTAL         = 738;  // N
   {$ENDIF}
 
 var

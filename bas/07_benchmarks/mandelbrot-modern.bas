@@ -11,7 +11,7 @@
 '' into a shared byte array and written out IN ORDER by the main thread, which is what Python's
 '' ordered_rows does after imap_unordered.
 
-Const NW = 4
+Dim Shared As Integer NW    '' workers - resolved from the machine below
 
 Dim Shared As Integer nSize, bytesPerRow
 Dim Shared As Any Ptr mtx, cvWork, cvDone
@@ -82,6 +82,15 @@ End Sub
 '' N comes from the command line, as in every reference implementation; the literal is the fallback.
 Dim As Integer N = 200
 If Len(Command(1)) > 0 Then N = CInt(Command(1))
+'' Workers: as many as the machine's LOGICAL processors, because that is what the Python original
+'' asks for - Pool() with no argument is cpu_count(). Sizing this to a hardcoded 4 is what made our
+'' lead collapse when the machine went from 4 cores to 16: Python took the new cores, we did not.
+'' An explicit SECOND command-line argument overrides it, for measuring at a fixed width.
+'' ⛔ PROCESSORCOUNT is a MODERN extension (fbc has no equivalent) - see BASIC.md.
+NW = ProcessorCount
+If Len(Command(2)) > 0 Then NW = CInt(Command(2))
+If NW < 1 Then NW = 1
+
 
 nSize = N
 bytesPerRow = (N + 7) \ 8
@@ -89,7 +98,8 @@ ReDim bits(0 To nSize * bytesPerRow - 1)
 
 mtx = MutexCreate() : cvWork = CondCreate() : cvDone = CondCreate()
 gPhase = 0 : gDone = 0 : gQuit = 0
-Dim As Any Ptr h(0 To NW - 1)
+Dim As Any Ptr h()
+ReDim h(0 To NW - 1)
 For k As Integer = 0 To NW - 1
   h(k) = ThreadCreate( @worker, k )
 Next k

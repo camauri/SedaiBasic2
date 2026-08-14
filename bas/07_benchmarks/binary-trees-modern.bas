@@ -11,7 +11,7 @@
 ''
 '' This benchmark is about ALLOCATION: the trees are built out of real records and thrown away.
 
-Const NW = 4
+Dim Shared As Integer NW    '' workers - resolved from the machine below
 
 Type Node
   left  As Node Ptr
@@ -21,8 +21,12 @@ End Type
 Dim Shared As Any Ptr mtx, cvWork, cvDone
 Dim Shared As Integer gPhase, gDone, gQuit
 Dim Shared As Integer gDepth              '' depth of the trees to build this phase
-Dim Shared As LongInt gFrom(0 To NW - 1), gTo(0 To NW - 1)
-Dim Shared As LongInt gPart(0 To NW - 1)
+'' ⛔ These are dimensioned by NW, which is no longer known at this point: NW is resolved from the
+'' machine further down. They are declared empty here and REDIMensioned once NW is known.
+'' The failure mode if you forget is SILENT - zero-length arrays, workers writing nowhere, and a
+'' "check: 0" on every line instead of an error.
+Dim Shared As LongInt gFrom(), gTo()
+Dim Shared As LongInt gPart()
 
 Function makeTree( ByVal dd As Integer ) As Node Ptr
   Dim As Node Ptr t = New Node
@@ -81,6 +85,18 @@ End Sub
 '' N comes from the command line, as in every reference implementation; the literal is the fallback.
 Dim As Integer N = 10
 If Len(Command(1)) > 0 Then N = CInt(Command(1))
+'' Workers: as many as the machine's LOGICAL processors, because that is what the Python original
+'' asks for - Pool() with no argument is cpu_count(). Sizing this to a hardcoded 4 is what made our
+'' lead collapse when the machine went from 4 cores to 16: Python took the new cores, we did not.
+'' An explicit SECOND command-line argument overrides it, for measuring at a fixed width.
+'' ⛔ PROCESSORCOUNT is a MODERN extension (fbc has no equivalent) - see BASIC.md.
+NW = ProcessorCount
+If Len(Command(2)) > 0 Then NW = CInt(Command(2))
+If NW < 1 Then NW = 1
+ReDim gFrom(0 To NW - 1)
+ReDim gTo(0 To NW - 1)
+ReDim gPart(0 To NW - 1)
+
 
 Dim As Integer minDepth = 4
 Dim As Integer maxDepth = N
@@ -95,7 +111,8 @@ Dim As Node Ptr longLived = makeTree(maxDepth)
 
 mtx = MutexCreate() : cvWork = CondCreate() : cvDone = CondCreate()
 gPhase = 0 : gDone = 0 : gQuit = 0
-Dim As Any Ptr h(0 To NW - 1)
+Dim As Any Ptr h()
+ReDim h(0 To NW - 1)
 For k As Integer = 0 To NW - 1
   h(k) = ThreadCreate( @worker, k )
 Next k

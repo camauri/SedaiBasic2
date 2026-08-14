@@ -606,6 +606,10 @@ const
   bcLoadST          = bcGroupSpecial + 14;  // ST: Kernal I/O status byte (bit 6 = EOF on the last GET#)
   bcLoadERFN        = bcGroupSpecial + 15;  // ERFN: name of the procedure where the last error occurred
   bcLoadERMN        = bcGroupSpecial + 16;  // ERMN: name of the module (source file) of the last error
+  { ⭐ ONE opcode for both counts, the KIND in the immediate (0 = logical, 1 = physical) - the same
+    criterion as the bit intrinsics. Two opcodes would let a build cover one count and forget the
+    other in silence; with one they are the same case in every consumer. }
+  bcCpuCount        = bcGroupSpecial + 17;  // CPUCOUNT / CPUCORES: processors (Imm 0=logical, 1=physical)
 
   // === GROUP 6: FILE I/O (0x06xx) ===
   bcDopen           = bcGroupFileIO + 0;    // DOPEN #handle, "filename" [, mode$]
@@ -2120,6 +2124,7 @@ begin
         1: Result := 'LoadTIS';
         2: Result := 'StoreTIS';
         3: Result := 'LoadDTS';
+        17: Result := 'CpuCount';
       else
         Result := Format('Special_%d', [SubOp]);
       end;

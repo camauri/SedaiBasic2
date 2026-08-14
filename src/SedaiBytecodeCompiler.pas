@@ -504,6 +504,7 @@ begin
     ssaLoadST: Result := bcLoadST;
     ssaCsrlin: Result := bcCsrlin;
     ssaFre: Result := bcFre;
+    ssaCpuCount: Result := bcCpuCount;
     // Memory operations
     ssaPeek: Result := bcPeek;
     ssaPoke: Result := bcPoke;

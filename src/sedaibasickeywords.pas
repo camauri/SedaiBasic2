@@ -316,6 +316,17 @@ const
   kSETTIME     = 'SETTIME';      // SETTIME str: set the (VM-internal) current time
   kEXP     = 'EXP';
   kFRE     = 'FRE';
+  { ⭐ THREE NAMES, one opcode. A parameter would have to be written as a bare literal - this
+    dialect has no predefined constants to name it with - and PROCESSORCOUNT(1) says nothing to a
+    reader.
+    ⛔ And they are three DIFFERENT quantities, which is why one name cannot serve: a machine has
+    one or more CPUs, each CPU has many cores, and only the cores with SMT/HyperThreading turn into
+    two logical processors. On a Core Ultra 9 185H: 1 CPU, 16 cores, 22 logical processors - the
+    six P-cores have SMT, the eight E-cores and two LP-E cores do not. Calling 22 a "CPU count"
+    would be plainly false. }
+  kCPUCOUNT       = 'CPUCOUNT';        // physical CPUs (sockets / packages)
+  kCORECOUNT      = 'CORECOUNT';       // physical cores, across every CPU
+  kPROCESSORCOUNT = 'PROCESSORCOUNT';  // logical processors (hardware threads) - what a pool wants
   kINT     = 'INT';
   kLOG     = 'LOG';
   kLN      = 'LN';
