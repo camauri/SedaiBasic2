@@ -221,7 +221,13 @@ This will:
 
 ### Linux
 
-> **Note:** Linux support is currently under development.
+All five targets build and run on Linux (verified on Debian 13 with FPC 3.2.2, x86_64). You need
+FPC 3.2.2 and, for `sbv` and for `sb --window`, the SDL2 development packages — on Debian/Ubuntu:
+`libsdl2-dev`, plus `libsdl2-image-dev`, `libsdl2-ttf-dev`, `libsdl2-mixer-dev`, `libsdl2-net-dev`
+and `libsdl2-gfx-dev` for the full set of bindings.
+
+> **Note:** `setup.sh` — which downloads and installs the toolchain for you — is still under
+> development. With FPC already installed, `./build.sh` is self-sufficient.
 
 ```bash
 ./setup.sh
@@ -235,15 +241,20 @@ SedaiBasic2 includes cross-platform build scripts for compiling all targets.
 
 | Target | Description | Output |
 |--------|-------------|--------|
-| sb | SedaiBasic VM (interpreter) | sb.exe |
-| sbc | SedaiBasic Compiler (bytecode, or WebAssembly with `--target wasm`) | sbc.exe |
-| sbd | SedaiBasic Disassembler | sbd.exe |
-| sbv | SedaiVision (SDL2 graphical) | sbv.exe |
-| sbw | Web BASIC HTTP server (see [WEB_BASIC.md](WEB_BASIC.md)) | sbw.exe |
+| sb | SedaiBasic VM (interpreter) | sb |
+| sbc | SedaiBasic Compiler (bytecode, or WebAssembly with `--target wasm`) | sbc |
+| sbd | SedaiBasic Disassembler | sbd |
+| sbv | SedaiVision (SDL2 graphical) | sbv |
+| sbw | Web BASIC HTTP server (see [WEB_BASIC.md](WEB_BASIC.md)) | sbw |
 
-`build.ps1 -Target sb -Window` adds an opt-in SDL2 window to the command-line VM, so FreeBASIC/C128
-graphics are visible without `sbv`. Note that a later `build.ps1 -Target sb` **without** `-Window`
-overwrites it with the headless build, where `--window` is accepted and silently ignored.
+Binaries are written to `bin/<cpu>-<os>/`, and carry the `.exe` extension on Windows only — so the
+same target is `bin/x86_64-win64/sb.exe` there and `bin/x86_64-linux/sb` here. Compiled units live
+alongside in `lib/<cpu>-<os>/`.
+
+`build.ps1 -Target sb -Window` (`./build.sh sb --window`) adds an opt-in SDL2 window to the
+command-line VM, so FreeBASIC/C128 graphics are visible without `sbv`. Note that a later build of
+`sb` **without** that switch overwrites it with the headless build, where `--window` is accepted and
+silently ignored.
 
 #### Windows (PowerShell)
 
@@ -278,7 +289,27 @@ overwrites it with the headless build, where `--window` is accepted and silently
 
 # Clean and rebuild
 ./build.sh --clean
+
+# CLI VM with the opt-in SDL2 window presenter (sb --window)
+./build.sh sb --window
+
+# Build without SedaiAudioFoundation, or against a specific copy of it
+./build.sh --with-sedai-audio no
+./build.sh --with-sedai-audio /path/to/SedaiAudioFoundation
+
+# Per-pass debug output at compile time
+./build.sh sb --debug-flags SSA,REGALLOC
+
+# Cross-target selection
+./build.sh --cpu x86_64 --os linux
 ```
+
+The build reports which instruction set it chose (AVX2 + FMA, AVX, or the portable x86-64 baseline)
+from what the CPU actually supports. Set `SEDAI_CPUOPT=none` to force the baseline when the binaries
+must run on an older machine than the one building them, or `=avx` / `=avx2` to pin a level.
+
+If FPC is not on `PATH`, the script also looks in `$SEDAI_FPC`, `setup.config.json`, a project-local
+`fpc/3.2.2/`, and under your home directory before giving up.
 
 ### Manual Installation
 

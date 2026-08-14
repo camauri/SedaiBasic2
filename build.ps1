@@ -247,6 +247,72 @@ function Get-CpuOptLevel {
     }
 }
 
+# One unit directory per BUILD CONFIGURATION, not one per platform.
+#
+# lib\<platform> used to be a single directory shared by every target, so the shared units (VM,
+# SSA, register allocator, lexer) were compiled by whichever target ran FIRST and every later
+# target REUSED them - instruction set and defines included. FPC does not recompile a unit when
+# only -Cp/-Cf/-d change, so the reuse is silent.
+#
+# Measured 12 Aug 2026: compiling sb (audio, no AVX flags) and then sbc (no audio, -CfAVX2) into
+# the same unit directory leaves SedaiBytecodeVM.o BYTE-IDENTICAL, so the engine kept the flags
+# of the first target while the banner announced "AVX2 + FMA".
+#
+# WEB_MODE already had its own directory for exactly this reason; the rule is now general.
+# Must stay identical to unit_dir_for() in build.sh.
+function Get-UnitDir {
+    param(
+        [string]$PlatformDir,
+        [bool]$IsWeb,
+        [bool]$WithAudio,
+        [bool]$IsDebug,
+        [string[]]$DebugDefines = @()
+    )
+
+    $name = $PlatformDir
+    if ($IsWeb) { $name = "$name-web" }
+    if ($WithAudio) { $name = "$name-audio" }
+
+    if ($IsDebug) {
+        $name = "$name-debug"
+    } elseif ($Script:CpuOptLevel -ne 'none') {
+        $name = "$name-$($Script:CpuOptLevel)"
+    }
+
+    # Defines change unit CONTENT, so they belong in the key too - that is what used to make a
+    # forgotten -Clean produce a build with half the units on the old define.
+    if ($DebugDefines.Count -gt 0) {
+        $joined = ($DebugDefines -join ',') + ','
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        $hash = $md5.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($joined))
+        $md5.Dispose()
+        $name = "$name-" + (($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 6)
+    }
+
+    return $name
+}
+
+# The banner says which instruction set was CHOSEN. It used to say "AVX2 + FMA" over binaries that
+# contained not one AVX instruction, and nothing in the build made that visible. So look at the
+# binary that was actually produced and say what is in it. Needs objdump; stays quiet without it.
+function Test-InstructionSet {
+    param([string]$Binary, [bool]$IsDebug, [string]$TargetCPU)
+
+    if ($IsDebug -or $TargetCPU -ne 'x86_64') { return }
+    if (-not (Get-Command objdump -ErrorAction SilentlyContinue)) { return }
+
+    $vex = @(& objdump -d $Binary 2>$null | Select-String -Pattern "`tv[a-z0-9]+" -AllMatches).Count
+
+    if ($Script:CpuOptLevel -eq 'none') {
+        Write-Host "    baseline x86-64, $vex AVX instructions" -ForegroundColor Gray
+    } elseif ($vex -eq 0) {
+        Write-Host "    WARNING: built for $($Script:CpuOptLevel) but the binary has NO AVX instruction." -ForegroundColor Yellow
+        Write-Host "    Shared units were reused from another configuration - build with -Clean." -ForegroundColor Yellow
+    } else {
+        Write-Host "    $vex AVX instructions" -ForegroundColor Gray
+    }
+}
+
 # Build a single target
 function Build-Target {
     param(
@@ -270,8 +336,9 @@ function Build-Target {
         return $false
     }
 
-    # Create output directories - use separate lib directory for WEB_MODE
-    $libSubDir = if ($IsWeb) { "$PlatformDir-web" } else { $PlatformDir }
+    # Create output directories - one unit directory per build configuration
+    $libSubDir = Get-UnitDir -PlatformDir $PlatformDir -IsWeb $IsWeb -WithAudio $WithAudio `
+                             -IsDebug $IsDebug -DebugDefines $DebugDefines
     $libPath = Join-Path $LibDir $libSubDir
     $binPath = Join-Path $BinDir $PlatformDir
 
@@ -295,11 +362,18 @@ function Build-Target {
         # Release optimizations
         $opts += '-O1'
 
-        # CPU-specific optimizations (x86_64 only), gated on what this CPU CAN ACTUALLY EXECUTE.
-        # Audio stays part of the condition for its own reason (SDL2 audio API conflict), but it is
-        # no longer what decides the instruction set - that was how sbc/sbd/sbw came to be built for
-        # AVX2 on a CPU without it. See Get-CpuOptLevel.
-        if ($TargetCPU -eq 'x86_64' -and -not $WithAudio) {
+        # Instruction set from what the CPU HAS. Audio does NOT decide it, on any platform.
+        #
+        # The old rule skipped these flags whenever audio was on, citing an "SDL2 audio API
+        # conflict" (a one-line note from 5 Jan 2026, never verified). Since sb and sbv are the
+        # audio targets AND sb is the first one built, that rule left every shared unit - the
+        # whole engine - at the SSE2 baseline.
+        #
+        # Measured 12 Aug 2026 on Linux: sb built with audio AND -CpCOREAVX2 -OpCOREAVX2 -CfAVX2
+        # compiles, links and runs, with 1352 AVX instructions in SedaiBytecodeVM alone and 34
+        # FMA in the binary. No conflict. build.sh does the same thing: the two scripts must
+        # behave identically, so the exclusion is gone on both rather than kept on one.
+        if ($TargetCPU -eq 'x86_64') {
             switch ($script:CpuOptLevel) {
                 'avx2' {
                     $opts += '-CpCOREAVX2'
@@ -410,6 +484,8 @@ function Build-Target {
 
     if ($process.ExitCode -eq 0) {
         Write-Host " OK" -ForegroundColor Green
+        Write-Host "    units: lib\$libSubDir" -ForegroundColor Gray
+        Test-InstructionSet -Binary (Join-Path $binPath $OutputName) -IsDebug $IsDebug -TargetCPU $TargetCPU
         return $true
     } else {
         Write-Host " FAILED" -ForegroundColor Red
@@ -425,20 +501,14 @@ function Clean-Build {
 
     Write-Host "Cleaning build artifacts..." -ForegroundColor Yellow
 
-    $libPath = Join-Path $Script:LibDir $PlatformDir
-    $libWebPath = Join-Path $Script:LibDir "$PlatformDir-web"
     $binPath = Join-Path $Script:BinDir $PlatformDir
 
-    if (Test-Path $libPath) {
-        Get-ChildItem -Path $libPath -File | Remove-Item -Force -ErrorAction SilentlyContinue
-        Write-Host "  Cleaned: $libPath" -ForegroundColor Gray
-    }
-
-    # Clean web mode lib directory
-    if (Test-Path $libWebPath) {
-        Get-ChildItem -Path $libWebPath -File | Remove-Item -Force -ErrorAction SilentlyContinue
-        Write-Host "  Cleaned: $libWebPath" -ForegroundColor Gray
-    }
+    # Every configuration variant: lib\<platform>, -web, -audio, -avx2, -debug, ...
+    Get-ChildItem -Path $Script:LibDir -Directory -Filter "$PlatformDir*" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Get-ChildItem -Path $_.FullName -File | Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Host "  Cleaned: $($_.FullName)" -ForegroundColor Gray
+        }
 
     # Don't delete executables, just .ppu/.o files
     if (Test-Path $binPath) {
@@ -493,6 +563,13 @@ switch ($Script:CpuOptLevel) {
     'avx2'  { Write-Host "CPU opt:    AVX2 + FMA" -ForegroundColor Green }
     'avx'   { Write-Host "CPU opt:    AVX (no AVX2/FMA on this CPU)" -ForegroundColor Green }
     default { Write-Host "CPU opt:    baseline x86-64 (SSE2) - no AVX detected, or PowerShell 5.1" -ForegroundColor Gray }
+}
+# The level is a property of the machine that COMPILES, not of the project. Now that the flags
+# reach the shared units, binaries built here really do carry those instructions - and die with
+# an illegal instruction on a CPU that lacks them.
+if ($Script:CpuOptLevel -ne 'none' -and -not $env:SEDAI_CPUOPT) {
+    Write-Host "            detected on THIS machine - binaries will not run on a CPU without it" -ForegroundColor Gray
+    Write-Host "            (SEDAI_CPUOPT=none|avx|avx2 to build for an older one)" -ForegroundColor Gray
 }
 Write-Host ""
 

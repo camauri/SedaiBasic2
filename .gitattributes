@@ -1,0 +1,64 @@
+# Line endings: decided HERE, not by each clone's configuration.
+#
+# Why this file exists. Git for Windows installs with core.autocrlf=true by default, so a clone
+# there rewrites every text file to CRLF on checkout - including the shell scripts, which then fail
+# under Git Bash/MSYS with a syntax error on the first line that mentions no line ending at all.
+# The opposite accident is just as easy: an editor on Windows saves CRLF and, with autocrlf=false,
+# those bytes are committed. Both happened in this project (two .sh files in job/ arrived CRLF and
+# could never run on Linux).
+#
+# .gitattributes OVERRIDES core.autocrlf and travels with the repository, so the rules below hold
+# for every clone on every platform, whatever the local git is configured to do.
+#
+# The repository is LF-only today (362 tracked files, all i/lf w/lf on 12 Aug 2026), so adding this
+# normalises nothing and moves nothing: it only stops the state from drifting.
+
+# Default: git decides what is text; text is stored LF and checked out LF EVERYWHERE.
+# Not "eol=native" - a checkout that differs per platform is what makes a .sh unrunnable.
+* text=auto eol=lf
+
+# --- sources and documents: LF, explicitly ------------------------------------------------------
+*.pas    text eol=lf
+*.lpr    text eol=lf
+*.inc    text eol=lf
+*.lpi    text eol=lf
+*.bas    text eol=lf
+*.wbas   text eol=lf
+*.md     text eol=lf
+*.py     text eol=lf
+*.lua    text eol=lf
+*.html   text eol=lf
+*.ini    text eol=lf
+*.cfg    text eol=lf
+*.template text eol=lf
+
+# --- scripts ------------------------------------------------------------------------------------
+# .sh MUST be LF: on Windows these run under Git Bash/MSYS, and a CR at the end of a line becomes
+# part of the last token ("do\r", "{\r"), which reads like a syntax error in the script's own text.
+*.sh     text eol=lf
+# PowerShell reads LF-only files on both 5.1 and 7, so .ps1 stays LF like everything else and the
+# two build scripts remain byte-comparable with each other.
+*.ps1    text eol=lf
+# cmd.exe is the exception that genuinely needs CRLF: an LF-only batch file can mis-parse labels
+# and GOTO. None are tracked today; the rule is here so the first one added is right.
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# --- never touched: bytes are content, not text -------------------------------------------------
+*.wasm   binary
+*.basc   binary
+*.o      binary
+*.ppu    binary
+*.a      binary
+*.exe    binary
+*.dll    binary
+*.so     binary
+*.dylib  binary
+*.zip    binary
+*.gz     binary
+*.png    binary
+*.jpg    binary
+*.gif    binary
+*.ico    binary
+*.sid    binary
+*.wav    binary
