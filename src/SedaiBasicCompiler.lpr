@@ -42,6 +42,8 @@ program SedaiBasicCompiler;
 {$I OptimizationFlags.inc}
 
 uses
+  // M5.2 threading: on Unix the cthreads unit MUST be first so BeginThread uses pthreads.
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   SedaiConsoleState,
   Classes, SysUtils,
