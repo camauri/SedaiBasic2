@@ -13693,7 +13693,7 @@ var
   H, S, A, B: Integer;
   v: Int64;
   u: QWord;
-  NegB: Boolean;
+  NegB, NegA: Boolean;
 begin
   case Instr.OpCode of
     bcBigNew:
@@ -13786,14 +13786,12 @@ begin
         v := Ctx.IntRegs[Instr.Src2];
         if v < 0 then begin NegB := True;  u := QWord(-(v + 1)) + 1; end
                  else begin NegB := False; u := QWord(v); end;
-        if H <> A then
-        begin
-          UniqueLimbs(Ctx.BigVals[H].Limbs);
-          BigCopy(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
-                  Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N);
-          Ctx.BigVals[H].Neg := Ctx.BigVals[A].Neg;
-        end;
-        BigMulSmall(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N, u);
+        { ⭐ UNA passata, non copia-poi-moltiplica: BigMulSmallTo legge a[i] e scrive
+          dst[i] allo stesso indice, quindi vale anche quando H = A. }
+        NegA := Ctx.BigVals[A].Neg;
+        BigMulSmallTo(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
+                      Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N, u);
+        Ctx.BigVals[H].Neg := NegA;
         Ctx.BigVals[H].Neg := (Ctx.BigVals[H].Neg <> NegB) and
                               not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
         Ctx.IntRegs[Instr.Dest] := H;

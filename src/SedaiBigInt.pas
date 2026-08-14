@@ -82,6 +82,12 @@ procedure BigSetSmall(var a: TLimbs; var n: Integer; v: QWord);
 procedure BigCopy(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer);
 { a *= k, con k che sta in un limb. Riporta il numero di limb usati. }
 procedure BigMulSmall(var a: TLimbs; var n: Integer; k: QWord);
+{ dst = a * k in UNA passata, senza copiare prima. ⭐ BigMulSmall lavora in posto, quindi
+  un destinatario diverso dalla sorgente costava una COPIA piu' una moltiplicazione: due
+  passate sull'intero numero dove ne basta una. E' la forma di "probe = den * q", che il
+  ciclo delle cifre esegue fino a dieci volte per cifra.
+  ⚠️ dst puo' coincidere con a: si legge a[i] e si scrive dst[i], stesso indice. }
+procedure BigMulSmallTo(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; k: QWord);
 { a += k, con k che sta in un limb. La coppia con BigMulSmall e' quanto basta a fare
   Horner in base 10^19, cioe' a leggere un numero decimale. }
 procedure BigAddSmall(var a: TLimbs; var n: Integer; k: QWord);
@@ -233,6 +239,35 @@ begin
   end;
   { k = 0 azzera tutto: normalizzare, o un confronto per lunghezza mentirebbe. }
   while (n > 1) and (a[n - 1] = 0) do Dec(n);
+end;
+
+procedure BigMulSmallTo(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; k: QWord);
+var
+  i: Integer;
+  lo, hi, t, carry: QWord;
+begin
+  if (an <= 0) or (k = 0) then
+  begin
+    UniqueLimbs(dst);
+    if Length(dst) < 1 then SetLength(dst, 1);
+    dst[0] := 0; dn := 1;
+    Exit;
+  end;
+  UniqueLimbs(dst);
+  if Length(dst) < an + 1 then SetLength(dst, an + 1);
+  carry := 0;
+  for i := 0 to an - 1 do
+  begin
+    lo := a[i] * k;
+    hi := MulHi64(a[i], k);
+    t := lo + carry;
+    if t < lo then Inc(hi);
+    dst[i] := t;          { stesso indice letto e scritto: dst = a e' innocuo }
+    carry := hi;
+  end;
+  dn := an;
+  if carry > 0 then begin dst[dn] := carry; Inc(dn); end;
+  while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
 end;
 
 procedure BigAddSmall(var a: TLimbs; var n: Integer; k: QWord);
