@@ -71,6 +71,15 @@ function MulHi64Portable(a, b: QWord): QWord;
   paga in convenzioni di chiamata: si aggiunge quando una misura dirà che serve. }
 function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
 
+{$IFDEF CPUX86_64}
+{ I tre cicli caldi in assembly. Esportati perche' il controllo che li confronta con la
+  via portabile e' un programma a parte: una primitiva che nessuno puo' verificare da
+  fuori e' una primitiva di cui nessuno sa se e' giusta. }
+function MulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
+function AddLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
+function SubLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
+{$ENDIF}
+
 { Sgancia SOLO se condiviso: l'equivalente di UniqueString per un array
   dinamico, che di suo NON fa copia su scrittura (a2 := a1; a2[0] := 9 cambia
   anche a1[0] - misurato, non dedotto). }
@@ -129,6 +138,119 @@ implementation
   - ovunque: quattro prodotti a 32 bit. Piu' lento, ma il target WASM e un
     eventuale ARM non restano fuori - ed e' anche l'oracolo con cui la via
     veloce si verifica. }
+{$IFDEF CPUX86_64}
+function MulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
+{ dst[0..n-1] = a[0..n-1] * k, e riporta il riporto uscente. ⭐ E' il ciclo piu' caldo di
+  tutta l'aritmetica multipla, e in Pascal costava ~4 cicli per limb perche' il riporto
+  si rileva con un CONFRONTO e un salto. Qui la MULQ produce rdx:rax e la ADC prende il
+  riporto dai flag: nessun ramo, nessuna dipendenza inventata.
+  ⛔ I parametri si riferiscono PER NOME e si copiano subito in registri CHIAMANTE-salvati
+  (r8-r11, rax, rcx, rdx): toccare rbx o r12-r15 senza salvarli romperebbe il chiamante, e
+  cablare rdi/rsi presupporrebbe una convenzione di chiamata - l'errore che VecScanPrefix
+  ha pagato per mezza giornata. Qui FPC decide dove stanno e l'assembly non lo presuppone. }
+label
+  giro, fine;
+var
+  res: QWord;
+begin
+  asm
+    movq pd, %r8
+    movq pa, %r9
+    movq n,  %r10
+    movq k,  %r11
+    xorq %rcx, %rcx
+    testq %r10, %r10
+    jz   fine
+  giro:
+    movq (%r9), %rax
+    mulq %r11
+    addq %rcx, %rax
+    adcq $0, %rdx
+    movq %rax, (%r8)
+    movq %rdx, %rcx
+    addq $8, %r9
+    addq $8, %r8
+    decq %r10
+    jnz  giro
+  fine:
+    movq %rcx, res
+  end;
+  Result := res;
+end;
+{$ENDIF}
+
+{$IFDEF CPUX86_64}
+function AddLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
+{ dst[0..n-1] = a[0..n-1] + b[0..n-1], riporta il riporto uscente.
+  ⭐ LA CATENA ADC vive nel flag di riporto, quindi il ciclo non puo' toccare i flag fra
+  un limb e il successivo. Il trucco e' l'INDICE NEGATIVO: si parte da -n e si sale con
+  INC, che a differenza di ADD/SUB **non modifica CF** - tocca solo ZF, che serve al
+  salto. Senza questo si dovrebbe salvare e ripristinare il riporto a ogni giro, ed e'
+  esattamente cio' che rende lento il ciclo scritto in Pascal. }
+label giro, fine;
+var
+  res: QWord;
+begin
+  asm
+    movq pd, %r8
+    movq pa, %r9
+    movq pb, %r10
+    movq n,  %rcx
+    testq %rcx, %rcx
+    jz   fine
+    { i puntatori si spostano alla FINE e l'indice sale da -n a 0 }
+    leaq (%r8,%rcx,8), %r8
+    leaq (%r9,%rcx,8), %r9
+    leaq (%r10,%rcx,8), %r10
+    negq %rcx
+    clc
+  giro:
+    movq (%r9,%rcx,8), %rax
+    adcq (%r10,%rcx,8), %rax
+    movq %rax, (%r8,%rcx,8)
+    incq %rcx            { INC non tocca CF: la catena sopravvive }
+    jnz  giro
+  fine:
+    movq $0, %rax
+    adcq $0, %rax
+    movq %rax, res
+  end;
+  Result := res;
+end;
+
+function SubLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
+{ dst = a - b sugli n limb comuni; riporta il PRESTITO uscente. Stessa forma. }
+label giro, fine;
+var
+  res: QWord;
+begin
+  asm
+    movq pd, %r8
+    movq pa, %r9
+    movq pb, %r10
+    movq n,  %rcx
+    testq %rcx, %rcx
+    jz   fine
+    leaq (%r8,%rcx,8), %r8
+    leaq (%r9,%rcx,8), %r9
+    leaq (%r10,%rcx,8), %r10
+    negq %rcx
+    clc
+  giro:
+    movq (%r9,%rcx,8), %rax
+    sbbq (%r10,%rcx,8), %rax
+    movq %rax, (%r8,%rcx,8)
+    incq %rcx
+    jnz  giro
+  fine:
+    movq $0, %rax
+    adcq $0, %rax
+    movq %rax, res
+  end;
+  Result := res;
+end;
+{$ENDIF}
+
 function MulHi64Portable(a, b: QWord): QWord;
 var
   lo: QWord;
@@ -261,6 +383,10 @@ var
   lo, hi, t, carry: QWord;
 begin
   UniqueLimbs(a);
+  {$IFDEF CPUX86_64}
+  { stesso ciclo di BigMulSmallTo, con destinazione = sorgente }
+  carry := MulLimbRun(@a[0], @a[0], n, k);
+  {$ELSE}
   carry := 0;
   for i := 0 to n - 1 do
   begin
@@ -271,6 +397,7 @@ begin
     a[i] := t;
     carry := hi;
   end;
+  {$ENDIF}
   while carry > 0 do
   begin
     if n >= Length(a) then SetLength(a, n + 8);
@@ -296,6 +423,9 @@ begin
   end;
   UniqueLimbs(dst);
   if Length(dst) < an + 1 then SetLength(dst, an + 1);
+  {$IFDEF CPUX86_64}
+  carry := MulLimbRun(@dst[0], @a[0], an, k);
+  {$ELSE}
   carry := 0;
   for i := 0 to an - 1 do
   begin
@@ -306,6 +436,7 @@ begin
     dst[i] := t;          { stesso indice letto e scritto: dst = a e' innocuo }
     carry := hi;
   end;
+  {$ENDIF}
   dn := an;
   if carry > 0 then begin dst[dn] := carry; Inc(dn); end;
   while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
@@ -401,6 +532,18 @@ begin
     fra un'allocazione per operazione e nessuna. }
   if (Length(dst) >= m + 1) and (LimbsRefCount(dst) <= 1) then
   begin
+    {$IFDEF CPUX86_64}
+    { ⭐ Lunghezze uguali: e' esattamente una catena ADC, senza rami. E' il caso normale
+      dell'accumulo, dove i due operandi sono cresciuti insieme. }
+    if (an = bn) and (an > 0) then
+    begin
+      carry := AddLimbRun(@dst[0], @a[0], @b[0], an);
+      dn := an;
+      if carry > 0 then begin dst[dn] := carry; Inc(dn); end;
+      while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
+      Exit;
+    end;
+    {$ENDIF}
     carry := 0;
     for i := 0 to m - 1 do
     begin
@@ -438,6 +581,15 @@ begin
   { Stesso motivo di BigAdd, e stessa scorciatoia: in posto quando non si rialloca. }
   if (Length(dst) >= an) and (LimbsRefCount(dst) <= 1) then
   begin
+    {$IFDEF CPUX86_64}
+    if (an = bn) and (an > 0) then
+    begin
+      SubLimbRun(@dst[0], @a[0], @b[0], an);   { il chiamante garantisce a >= b: niente prestito finale }
+      dn := an;
+      while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
+      Exit;
+    end;
+    {$ENDIF}
     borrow := 0;
     for i := 0 to an - 1 do
     begin
