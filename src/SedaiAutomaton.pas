@@ -807,9 +807,25 @@ function VecScanPrefix(Data: PByte; From, LastP: Integer; F: PVecPrefixFilter): 
   ⛔ And the splat cannot be a memory operand to pcmpeqb: `Splat` sits at offset 8 in the record and
   legacy SSE faults on an unaligned memory source. Hence movdqu into a register first.
 
-  Win64 registers: RCX = Data, EDX = From, R8D = LastP, R9 = F. Volatile only (RAX, RCX, RDX, R8-R11,
-  XMM0-5), so there is nothing to save and the frame can go. }
+  ⛔⛔ CALLING CONVENTION. The body below is written for WIN64: RCX = Data, EDX = From, R8D = LastP,
+  R9 = F. System V hands the same four arguments in RDI, ESI, EDX, RCX instead, so on Linux and macOS
+  the body would read the filter pointer as Data and two registers of garbage as LastP and F. It did:
+  the scan then answered "no candidate anywhere" for whatever the leftover registers happened to hold,
+  which made every REGEXCOUNT and REGEXREPLACE wrong roughly half the time, silently, with the outcome
+  decided by ASLR. Fixed 12 Aug 2026 by moving the arguments into the Win64 registers first.
+  ⚠️ The order of those four moves is load-bearing: each reads a register before a later move writes
+  it. RCX carries F in and Data out; EDX carries LastP in and From out.
+  ⛔ Every register involved (RAX, RCX, RDX, RSI, RDI, R8-R11, XMM0-5) is caller-saved in BOTH
+  conventions, so there is still nothing to save and `nostackframe` still holds.
+
+  Volatile only, so there is nothing to save and the frame can go. }
 asm
+{$IFNDEF WINDOWS}
+    movq    %rcx, %r9                   // F     : RCX (SysV arg3) -> R9   (before RCX is rewritten)
+    movl    %edx, %r8d                  // LastP : EDX (SysV arg2) -> R8D  (before EDX is rewritten)
+    movl    %esi, %edx                  // From  : ESI (SysV arg1) -> EDX
+    movq    %rdi, %rcx                  // Data  : RDI (SysV arg0) -> RCX
+{$ENDIF}
     movslq  %edx, %rdx                  // p = From
     movslq  %r8d, %r8                   // last position we may test
     movl    (%r9), %r10d                // N = number of prefixes
