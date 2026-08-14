@@ -78,6 +78,8 @@ function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
 function MulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
 function AddLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
 function SubLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
+function AddMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
+function SubMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
 {$ENDIF}
 
 { Sgancia SOLO se condiviso: l'equivalente di UniqueString per un array
@@ -246,6 +248,77 @@ begin
     movq $0, %rax
     adcq $0, %rax
     movq %rax, res
+  end;
+  Result := res;
+end;
+{$ENDIF}
+
+{$IFDEF CPUX86_64}
+function AddMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
+{ dst[0..n-1] += a[0..n-1] * k, riporta la parte che resta da propagare. E' mpn_addmul_1,
+  il ciclo interno del prodotto scolastico.
+  ⚠️ Qui il riporto sta in un REGISTRO, non nei flag - lo si ricostruisce a ogni giro con
+  due ADC - quindi il controllo del ciclo puo' usare liberamente ADD e DEC: la cautela
+  dell'indice negativo serve solo dove la catena vive nel flag. }
+label giro, fine;
+var
+  res: QWord;
+begin
+  asm
+    movq pd, %r8
+    movq pa, %r9
+    movq n,  %r10
+    movq k,  %r11
+    xorq %rcx, %rcx
+    testq %r10, %r10
+    jz   fine
+  giro:
+    movq (%r9), %rax
+    mulq %r11
+    addq %rcx, %rax
+    adcq $0, %rdx
+    addq %rax, (%r8)      { somma nel destinatario: il trabocco finisce in CF }
+    adcq $0, %rdx
+    movq %rdx, %rcx
+    addq $8, %r9
+    addq $8, %r8
+    decq %r10
+    jnz  giro
+  fine:
+    movq %rcx, res
+  end;
+  Result := res;
+end;
+
+function SubMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
+{ dst[0..n-1] -= a[0..n-1] * k, riporta la parte che resta da SOTTRARRE piu' in alto.
+  E' mpn_submul_1, il moltiplica-e-sottrai dell'algoritmo D. }
+label giro, fine;
+var
+  res: QWord;
+begin
+  asm
+    movq pd, %r8
+    movq pa, %r9
+    movq n,  %r10
+    movq k,  %r11
+    xorq %rcx, %rcx
+    testq %r10, %r10
+    jz   fine
+  giro:
+    movq (%r9), %rax
+    mulq %r11
+    addq %rcx, %rax
+    adcq $0, %rdx
+    subq %rax, (%r8)      { sottrae: il prestito finisce in CF }
+    adcq $0, %rdx
+    movq %rdx, %rcx
+    addq $8, %r9
+    addq $8, %r8
+    decq %r10
+    jnz  giro
+  fine:
+    movq %rcx, res
   end;
   Result := res;
 end;
@@ -483,6 +556,10 @@ begin
   for i := 0 to an - 1 do
   begin
     if a[i] = 0 then Continue;           { una cifra nulla non contribuisce: saltarla }
+    {$IFDEF CPUX86_64}
+    { ⭐ Il ciclo interno del prodotto scolastico E' mpn_addmul_1. }
+    carry := AddMulLimbRun(@t[i], @b[0], bn, a[i]);
+    {$ELSE}
     carry := 0;
     for j := 0 to bn - 1 do
     begin
@@ -496,6 +573,7 @@ begin
       t[i + j] := s;
       carry := hi;
     end;
+    {$ENDIF}
     k := i + bn;
     while carry <> 0 do
     begin
@@ -739,6 +817,12 @@ begin
     end;
 
     { moltiplica e sottrai: u[j..j+n] -= qhat * v }
+    {$IFDEF CPUX86_64}
+    { ⭐ E' mpn_submul_1: una sola passata, il prestito ricostruito nei registri. }
+    carry := SubMulLimbRun(@u[j], @v[0], n, qhat);
+    borrow := 0;
+    t := carry;
+    {$ELSE}
     borrow := 0; carry := 0;
     for i := 0 to n - 1 do
     begin
@@ -759,6 +843,7 @@ begin
       end;
     end;
     t := carry + borrow;
+    {$ENDIF}
     if u[j + n] < t then begin u[j + n] := u[j + n] - t; borrow := 1; end
     else begin u[j + n] := u[j + n] - t; borrow := 0; end;
 
