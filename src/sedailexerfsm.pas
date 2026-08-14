@@ -2211,7 +2211,16 @@ begin
           if PeekChar(1) = '''' then
           begin
             SkipBlockComment;
-            Result := NextToken;
+            { ⛔⛔ NextToken() CON LE PARENTESI, e non è uno stile: dentro una funzione il suo stesso
+              nome NUDO è la VARIABILE DI RISULTATO, non una chiamata. `Result := NextToken` si
+              compila quindi in `Result := Result` e lascia il risultato NON INIZIALIZZATO.
+              Sintomo misurato il 13 ago 2026: con -OoREGVAR (che sb usa) il risultato è spazzatura
+              e il chiamante muore con EAccessViolation su OGNI programma che contenga un /' '/;
+              senza quel flag lo slot conteneva ancora il token precedente, quindi il difetto
+              restituiva un token DUPLICATO in silenzio invece di sbagliare rumorosamente.
+              ⇒ Su Windows non crashava, e per questo è arrivato fin qui.
+              🥅 job/tests/bas/m320_block_comment.bas. }
+            Result := NextToken();
             {$IFDEF DEBUG}
             if FDebugMode then
               FProcessingTime := FProcessingTime + MilliSecondsBetween(Now, StartTime);

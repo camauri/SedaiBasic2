@@ -1054,7 +1054,14 @@ begin
     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
  begin
    Context.Advance;                    // the decorator
-   Result := ParseStatement;           // ...and the SUB/FUNCTION/DESTRUCTOR that follows
+   { ⚠️ Le PARENTESI non sono stile: dentro una funzione il suo stesso nome NUDO è la variabile di
+     RISULTATO, non una chiamata, e l'assegnazione diventa `Result := Result` con il risultato non
+     inizializzato. È il difetto trovato il 13 ago 2026 in TLexerFSM.NextToken, dove costava un
+     EAccessViolation su ogni programma con un commento /' '/ (e su Windows un token DUPLICATO in
+     silenzio). Qui non sono riuscito a costruire un ingresso che PROVI di raggiungere questa riga -
+     un `Virtual Sub` al livello di modulo sembra gestito prima - quindi la correzione è messa
+     perché è un NO-OP se il nome nudo era già una chiamata, e una cura se non lo era. }
+   Result := ParseStatement();         // ...and the SUB/FUNCTION/DESTRUCTOR that follows
    Exit;
  end;
 
