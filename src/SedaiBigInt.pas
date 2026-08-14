@@ -80,6 +80,9 @@ procedure BigSetSmall(var a: TLimbs; var n: Integer; v: QWord);
 procedure BigCopy(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer);
 { a *= k, con k che sta in un limb. Riporta il numero di limb usati. }
 procedure BigMulSmall(var a: TLimbs; var n: Integer; k: QWord);
+{ a += k, con k che sta in un limb. La coppia con BigMulSmall e' quanto basta a fare
+  Horner in base 10^19, cioe' a leggere un numero decimale. }
+procedure BigAddSmall(var a: TLimbs; var n: Integer; k: QWord);
 { dst = a * b, solo magnitudini. ⚠️ dst PUO' essere a o b senza danno: il prodotto si
   costruisce in un vettore a parte e viene consegnato alla fine, perche' lo schema
   scolastico legge a[i] e b[j] mentre scrive in i+j, e con l'aliasing leggerebbe
@@ -228,6 +231,30 @@ begin
   end;
   { k = 0 azzera tutto: normalizzare, o un confronto per lunghezza mentirebbe. }
   while (n > 1) and (a[n - 1] = 0) do Dec(n);
+end;
+
+procedure BigAddSmall(var a: TLimbs; var n: Integer; k: QWord);
+var
+  i: Integer;
+  s: QWord;
+  carry: QWord;
+begin
+  UniqueLimbs(a);
+  carry := k;
+  i := 0;
+  while (carry <> 0) and (i < n) do
+  begin
+    s := a[i] + carry;
+    if s < carry then carry := 1 else carry := 0;   { il trabocco E' il riporto }
+    a[i] := s;
+    Inc(i);
+  end;
+  if carry <> 0 then
+  begin
+    if n >= Length(a) then SetLength(a, n + 8);
+    a[n] := carry;
+    Inc(n);
+  end;
 end;
 
 procedure BigMul(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);

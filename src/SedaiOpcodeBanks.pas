@@ -122,6 +122,8 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register store (M2): Src1 is the string register read.
     bcXferStoreString,
+    // BigInt (group 12): BigFromStr READS the decimal text from Src1.
+    bcBigFromStr,
     bcVarArgPushStr,     // staging a surplus argument: Src1 = the string value
     // === GROUP 0: Core VM operations ===
     bcCopyString,

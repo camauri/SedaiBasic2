@@ -574,6 +574,7 @@ type
     // relations are that against zero - the checklist's own rule: compose in SSA
     // when the operation composes.
     ssaBigCmp,         // Dest(int) := sign of (Src1 - Src2)
+    ssaBigFromStr,     // Dest(handle) := the value of the DECIMAL TEXT in Src1(string)
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

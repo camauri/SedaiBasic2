@@ -4084,7 +4084,14 @@ begin
           // Str() of a STRING is the string itself (FreeBASIC overloads it for every type). We sent it down
           // the numeric path, which read the string register as a float and produced "0" -- so a UDT
           // building its text with "Str(a) + ..." on a string parameter lost the parameter.
-          if ArgValue.RegType = srtString then
+          { A BigInt argument renders as its DECIMAL TEXT. Tested BEFORE the int branch
+            below, because a BigInt IS an int register: that branch would have printed
+            the handle - "0", "1", "2"... - a number, and a believable one. }
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and IsBigIntExpr(ArgListNode.GetChild(0)) then
+            EmitInstruction(ssaBigToStr, Result, EnsureIntRegister(ArgValue),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else if ArgValue.RegType = srtString then
             Result := EnsureStringRegister(ArgValue)
           else if (ArgValue.RegType = srtInt) and FModernMode then
             EmitInstruction(ssaIntToString, Result, EnsureIntRegister(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
@@ -6751,6 +6758,18 @@ begin
   begin
     VarName := UpperCase(VarToStr(VarNode.Value));
     VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));
+    { ⭐ A STRING source is how a value TOO LARGE FOR A LITERAL is written:
+      b = "123456789012345678901234567890". Without it the only way to build such a
+      number was digit by digit through arithmetic, which is a workaround, not a
+      language. Checked BEFORE processing the expression, because a string expression
+      must be lowered in a string context. }
+    if InferExprBank(ExprNode) = srtString then
+    begin
+      ProcessStringExpression(ExprNode, ExprValue);
+      EmitInstruction(ssaBigFromStr, VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
     ProcessExpression(ExprNode, ExprValue);
     if IsBigIntExpr(ExprNode) then
       EmitInstruction(ssaBigCopy, VarReg, EnsureIntRegister(ExprValue),
@@ -20964,6 +20983,18 @@ function TSSAGenerator.EnsureStringRegisterOf(const Val: TSSAValue; SrcNode: TAS
 // has to come along. Rosetta's accumulator prints its total through PRINT; a program that builds the same
 // number into a string ("[" & s & "]" or Str(s)) must see the same 8.3, not 8.300000190734863.
 begin
+  { ⭐ A BigInt in a STRING context renders as its DECIMAL TEXT. This one place is why
+    Str(b), "x=" & b and "Dim s As String = ..." all work: they all arrive here, and a
+    BigInt is an int register holding a handle, so without this arm every one of them
+    printed the HANDLE - a small plausible number. The same reasoning as the PRINT
+    branch, and deliberately at the SHARED hook rather than repeated at each caller. }
+  if IsBigIntExpr(SrcNode) then
+  begin
+    Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaBigToStr, Result, EnsureIntRegister(Val),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if (Val.Kind = svkRegister) and (Val.RegType = srtFloat) and IsSingleExpr(SrcNode) then
   begin
     Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
@@ -21800,7 +21831,7 @@ function TSSAGenerator.TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue)
 // grows the per-context heap. Said here so the next person does not have to measure
 // it to find out.
 var
-  L, R, CmpReg: TSSAValue;
+  L, R, CmpReg, ZeroReg: TSSAValue;
   Op: string;
   ArithOp: TSSAOpCode;
 begin
@@ -21844,13 +21875,21 @@ begin
     R := BigOperandHandle(Node.GetChild(1));
     CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaBigCmp, CmpReg, L, R, MakeSSAValue(svkNone));
+    { ⛔⛔⛔ THE ZERO MUST BE IN A REGISTER. bcCmpLeInt and its family read
+      IntRegs[Instr.Src2] - a REGISTER INDEX, never an immediate - so passing
+      MakeSSAConstInt(0) here made every one of these compare against REGISTER 0,
+      whose content is whatever the program left there. It happened to hold 0 in a
+      small test and a BigInt HANDLE in pidigits, where "27 <= 9" answered TRUE and
+      the loop never terminated. Correct in isolation, wrong in a real program: the
+      worst shape a defect can take. }
+    ZeroReg := EnsureIntRegister(MakeSSAConstInt(0));
     Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    if Op = '='  then EmitInstruction(ssaCmpEqInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
-    else if Op = '<>' then EmitInstruction(ssaCmpNeInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
-    else if Op = '<'  then EmitInstruction(ssaCmpLtInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
-    else if Op = '<=' then EmitInstruction(ssaCmpLeInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
-    else if Op = '>'  then EmitInstruction(ssaCmpGtInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
-    else EmitInstruction(ssaCmpGeInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone));
+    if Op = '='  then EmitInstruction(ssaCmpEqInt, Res, CmpReg, ZeroReg, MakeSSAValue(svkNone))
+    else if Op = '<>' then EmitInstruction(ssaCmpNeInt, Res, CmpReg, ZeroReg, MakeSSAValue(svkNone))
+    else if Op = '<'  then EmitInstruction(ssaCmpLtInt, Res, CmpReg, ZeroReg, MakeSSAValue(svkNone))
+    else if Op = '<=' then EmitInstruction(ssaCmpLeInt, Res, CmpReg, ZeroReg, MakeSSAValue(svkNone))
+    else if Op = '>'  then EmitInstruction(ssaCmpGtInt, Res, CmpReg, ZeroReg, MakeSSAValue(svkNone))
+    else EmitInstruction(ssaCmpGeInt, Res, CmpReg, ZeroReg, MakeSSAValue(svkNone));
     Exit(True);
   end;
 end;

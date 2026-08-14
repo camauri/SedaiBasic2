@@ -478,6 +478,7 @@ type
     procedure ExecuteBigIntOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function BigAlloc(Ctx: TExecutionContext): Integer;      // a fresh handle, value 0
     function BigDecimal(Ctx: TExecutionContext; H: Integer): string;
+    procedure BigSetDecimal(Ctx: TExecutionContext; H: Integer; const S: string);
     function BigDestOf(Ctx: TExecutionContext; Reg: Integer): Integer;
     function BigSignedCmp(Ctx: TExecutionContext; A, B: Integer): Int64;
     procedure BigSignedAdd(Ctx: TExecutionContext; H, A, B: Integer; NegB: Boolean);
@@ -6479,6 +6480,11 @@ begin
         begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        bcBigFromStr:   { l'inverso: Dest e' un handle (int), Src1 il TESTO }
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
       end;
     end;
@@ -13628,6 +13634,50 @@ begin
   Ctx.BigVals[H].Neg := ResNeg;
 end;
 
+procedure TBytecodeVM.BigSetDecimal(Ctx: TExecutionContext; H: Integer; const S: string);
+// The inverse of BigDecimal: a decimal text into limbs. Horner in base 10^19 - the
+// largest power of ten a limb holds - so one multiply-and-add per NINETEEN digits
+// instead of per digit.
+// ⚠️ Anything that is not a digit ENDS the number, and a leading '-' is the sign, so
+// this accepts exactly what Str() produces and stops at the first character it cannot
+// use. It does not raise: an empty or unparsable text is zero, which is what VAL does
+// for the builtin types and keeps one rule in the language rather than two.
+var
+  i, k, ndig: Integer;
+  chunk, scale: QWord;
+  neg: Boolean;
+begin
+  UniqueLimbs(Ctx.BigVals[H].Limbs);
+  BigSetSmall(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N, 0);
+  Ctx.BigVals[H].Neg := False;
+  i := 1;
+  while (i <= Length(S)) and (S[i] = ' ') do Inc(i);
+  neg := False;
+  if (i <= Length(S)) and ((S[i] = '-') or (S[i] = '+')) then
+  begin
+    neg := S[i] = '-';
+    Inc(i);
+  end;
+  while i <= Length(S) do
+  begin
+    chunk := 0; scale := 1; ndig := 0;
+    while (i <= Length(S)) and (S[i] >= '0') and (S[i] <= '9') and (ndig < 19) do
+    begin
+      chunk := chunk * 10 + QWord(Ord(S[i]) - Ord('0'));
+      scale := scale * 10;
+      Inc(ndig); Inc(i);
+    end;
+    if ndig = 0 then Break;              { primo carattere non-cifra: il numero finisce }
+    BigMulSmall(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N, scale);
+    k := Ctx.BigVals[H].N;
+    BigAddSmall(Ctx.BigVals[H].Limbs, k, chunk);
+    Ctx.BigVals[H].N := k;
+  end;
+  { Uno zero non e' mai negativo: una sola rappresentazione. }
+  if not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0)) then
+    Ctx.BigVals[H].Neg := neg;
+end;
+
 procedure TBytecodeVM.ExecuteBigIntOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 // Group 12. A BigInt value is a HANDLE in the int bank; the limbs live in Ctx.BigVals.
 var
@@ -13702,6 +13752,13 @@ begin
           one representation here, so a zero result is never negative. }
         Ctx.BigVals[H].Neg := (Ctx.BigVals[A].Neg <> Ctx.BigVals[B].Neg) and
                               not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigFromStr:
+      begin
+        H := BigDestOf(Ctx, Instr.Dest);
+        BigSetDecimal(Ctx, H, Ctx.StringRegs[Instr.Src1]);
         Ctx.IntRegs[Instr.Dest] := H;
       end;
 

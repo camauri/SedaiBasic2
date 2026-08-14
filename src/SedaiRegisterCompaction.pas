@@ -274,6 +274,7 @@ begin
     bcBigCopy,        // Dest = the destination handle (likewise)
     bcBigAdd, bcBigSub, bcBigMul,   // Dest = the result handle (also read: reused if live)
     bcBigCmp,         // Dest = the -1/0/1 result, a PLAIN int and not a handle
+    bcBigFromStr,     // Dest = the handle built from the text (also read: reused if live)
     bcGfxScreenPtr,   // SCREENPTR: Dest = raw pointer to the framebuffer (int); no register sources
     bcPeek,           // PEEK(address): read from memory (int)
     // === GROUP 7: Sprite functions ===
@@ -775,7 +776,7 @@ begin
     // === GROUP 12: BigInt === ⛔ Dest is READ as well as written: it carries the handle
     // to fill in, and an existing one is REUSED rather than reallocated. Miss this and the
     // compactor treats the register as dead on entry and may hand it to something else.
-    bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul,
+    bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul, bcBigFromStr,
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
     bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
     // === GROUP 10: Graphics ===
