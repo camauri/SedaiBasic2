@@ -4704,6 +4704,46 @@ begin
     Result := Result or faArchive;
 end;
 
+function DirEntryAttrs(const Rec: TSearchRec): Integer;
+// The attributes of ONE entry, in FreeBASIC's spelling rather than the platform's.
+//
+// ⛔ A DIRECTORY DOES NOT CARRY THE ARCHIVE BIT. Measured against fbc 1.10.1 on Linux:
+//   a plain file -> 32 (archive)        a subdirectory -> 16 (directory), NOT 48.
+// FPC's FindFirst on Unix sets faArchive on EVERYTHING, directories included, so the
+// raw Attr said 48 - and the rule above then rejected the directory from a mask of
+// fbDirectory alone, because 48 carries a bit (archive) the mask does not allow.
+// ⇒ "Dir(""*"", fbDirectory)" came back EMPTY while fbc listed the subdirectory. The
+// two halves look like separate defects and are one: the entry, not the rule.
+//
+// ⚠️ Invisible on Windows, which is where the baseline was captured: on NTFS a
+// directory genuinely has no archive bit, so the raw value was already right. This is
+// the shape of defect the move to Linux exposes - a platform whose spelling we adopted
+// without translating it.
+begin
+  Result := Rec.Attr;
+  if (Result and faDirectory) <> 0 then
+    Result := Result and not faArchive;
+end;
+
+function DirEntrySkipped(const Rec: TSearchRec): Boolean;
+// "." and ".." are not returned by DIR on Unix: MEASURED against fbc 1.10.1 on Linux,
+// which lists only "sub" for a directory holding "sub", "." and "..". FPC's FindFirst
+// yields them like any other entry and we passed them straight through.
+//
+// ⚠️ GATED ON UNIX ON PURPOSE, AND THE WINDOWS HALF IS UNVERIFIED. The blessed Windows
+// baseline for m479 CONTAINS "." and "..", and that test's own header says its rules
+// were read off the oracle - so fbc on Windows may well return them (FindFirstFile
+// does). Changing a platform I cannot measure from here would be inventing an answer.
+// ⇒ TO CLOSE: run job/tests/bas/m479_dir_function.bas under the Windows fbc and
+// compare. If it omits them there too, drop the IFDEF and re-bless both baselines.
+begin
+  {$IFDEF UNIX}
+  Result := (Rec.Name = '.') or (Rec.Name = '..');
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
 function TBytecodeVM.RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;
 // Exactly Count bytes at the raw address, terminator or not: a fixed-length string FIELD of a UDT laid
 // over raw memory occupies its declared width whatever it contains.
@@ -14527,12 +14567,13 @@ begin
         // then archive is not implied and plain files drop out. That is what makes "Dir("*", fbDirectory)"
         // list directories ALONE while "fbDirectory Or fbArchive" lists both, and it fits all twelve
         // mask/entry combinations measured against fbc.
-        while FDirOpen and ((FDirRec.Attr and not DirAllowedAttrs(FDirMask)) <> 0) do
+        while FDirOpen and (DirEntrySkipped(FDirRec) or
+                            ((DirEntryAttrs(FDirRec) and not DirAllowedAttrs(FDirMask)) <> 0)) do
           if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;
         if FDirOpen then
         begin
           Ctx.StringRegs[Instr.Dest] := FDirRec.Name;
-          FDirAttr := FDirRec.Attr;
+          FDirAttr := DirEntryAttrs(FDirRec);
         end
         else
         begin
