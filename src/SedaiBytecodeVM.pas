@@ -6470,7 +6470,7 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
-        bcBigAdd, bcBigSub, bcBigMul, bcBigCmp:
+        bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -13522,6 +13522,7 @@ begin
   Ctx.BigVals[Result].Limbs[0] := 0;
   Ctx.BigVals[Result].N := 1;         { zero is N=1 with a zero limb: ONE representation }
   Ctx.BigVals[Result].Neg := False;
+  Ctx.BigVals[Result].Owner := -1;    { the caller says who owns it }
 end;
 
 function TBytecodeVM.BigDecimal(Ctx: TExecutionContext; H: Integer): string;
@@ -13572,8 +13573,16 @@ function TBytecodeVM.BigDestOf(Ctx: TExecutionContext; Reg: Integer): Integer;
 // the same BigInt would otherwise allocate a handle per iteration and never free one.
 begin
   Result := Integer(Ctx.IntRegs[Reg]);
-  if (Result < 0) or (Result >= Ctx.BigCount) then
-    Result := BigAlloc(Ctx);
+  { ⭐ Reuse the handle this register already OWNS. The ownership test is what makes it
+    safe: a register that finds a handle it does not own (garbage on first execution, or
+    another register's value left behind by the compactor) allocates instead of writing
+    over somebody else's number. One allocation per register per lifetime rather than
+    one per OPERATION - which is the whole difference on pidigits. }
+  if (Result >= 0) and (Result < Ctx.BigCount) and (Ctx.BigVals[Result].Owner = Reg) then
+    Exit;
+  Result := BigAlloc(Ctx);
+  Ctx.BigVals[Result].Owner := Reg;
+  Ctx.IntRegs[Reg] := Result;
 end;
 
 function TBytecodeVM.BigSignedCmp(Ctx: TExecutionContext; A, B: Integer): Int64;
@@ -13688,12 +13697,20 @@ var
 begin
   case Instr.OpCode of
     bcBigNew:
-      Ctx.IntRegs[Instr.Dest] := BigAlloc(Ctx);
+      begin
+        { Same ownership rule: a DIM executes once, but a temporary's BigNew sits inside
+          the loop, and re-allocating there is what made the handle heap grow without
+          bound. Reusing means resetting to zero, which costs nothing. }
+        H := BigDestOf(Ctx, Instr.Dest);
+        UniqueLimbs(Ctx.BigVals[H].Limbs);
+        BigSetSmall(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N, 0);
+        Ctx.BigVals[H].Neg := False;
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
 
     bcBigFromInt:
       begin
-        H := Integer(Ctx.IntRegs[Instr.Dest]);
-        if (H < 0) or (H >= Ctx.BigCount) then H := BigAlloc(Ctx);
+        H := BigDestOf(Ctx, Instr.Dest);
         v := Ctx.IntRegs[Instr.Src1];
         { ⛔ The magnitude of Low(Int64) does not fit in an Int64, so negating it is
           the overflow this project has already been bitten by. Take the two's
@@ -13707,10 +13724,9 @@ begin
 
     bcBigCopy:
       begin
-        H := Integer(Ctx.IntRegs[Instr.Dest]);
+        H := BigDestOf(Ctx, Instr.Dest);
         S := Integer(Ctx.IntRegs[Instr.Src1]);
         if (S < 0) or (S >= Ctx.BigCount) then Exit;
-        if (H < 0) or (H >= Ctx.BigCount) then H := BigAlloc(Ctx);
         { ⭐ VALUE semantics without copying the limbs: the assignment shares them and
           the refcount goes up; UniqueLimbs splits them at the first WRITE. Measured
           at the same price as AnsiString's own copy-on-write. }
@@ -13759,6 +13775,27 @@ begin
       begin
         H := BigDestOf(Ctx, Instr.Dest);
         BigSetDecimal(Ctx, H, Ctx.StringRegs[Instr.Src1]);
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigMulSmall:
+      begin
+        H := BigDestOf(Ctx, Instr.Dest);
+        A := Integer(Ctx.IntRegs[Instr.Src1]);
+        if (A < 0) or (A >= Ctx.BigCount) then Exit;
+        v := Ctx.IntRegs[Instr.Src2];
+        if v < 0 then begin NegB := True;  u := QWord(-(v + 1)) + 1; end
+                 else begin NegB := False; u := QWord(v); end;
+        if H <> A then
+        begin
+          UniqueLimbs(Ctx.BigVals[H].Limbs);
+          BigCopy(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
+                  Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N);
+          Ctx.BigVals[H].Neg := Ctx.BigVals[A].Neg;
+        end;
+        BigMulSmall(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N, u);
+        Ctx.BigVals[H].Neg := (Ctx.BigVals[H].Neg <> NegB) and
+                              not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
         Ctx.IntRegs[Instr.Dest] := H;
       end;
 

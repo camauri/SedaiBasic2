@@ -74,6 +74,13 @@ type
     Limbs: TLimbs;            // magnitude, least significant limb first
     N: Integer;               // limbs in use (Length(Limbs) may be larger)
     Neg: Boolean;             // sign, kept apart: the limbs are unsigned
+    // ⭐ THE REGISTER THAT OWNS THIS HANDLE, or -1. It is what lets an operation
+    // REUSE the handle its destination register already holds instead of allocating
+    // a new one per operation: a register may only overwrite a value it owns, so a
+    // stale or foreign handle can never be scribbled on. Without it every BigInt
+    // operation allocated, and pidigits spent its time in the allocator rather than
+    // in the arithmetic.
+    Owner: Integer;
   end;
 
   TRecordStorage = record

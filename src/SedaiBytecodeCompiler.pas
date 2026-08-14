@@ -516,6 +516,7 @@ begin
     ssaBigMul:     Result := bcBigMul;
     ssaBigCmp:     Result := bcBigCmp;
     ssaBigFromStr: Result := bcBigFromStr;
+    ssaBigMulSmall: Result := bcBigMulSmall;
     // Memory operations
     ssaPeek: Result := bcPeek;
     ssaPoke: Result := bcPoke;

@@ -575,6 +575,11 @@ type
     // when the operation composes.
     ssaBigCmp,         // Dest(int) := sign of (Src1 - Src2)
     ssaBigFromStr,     // Dest(handle) := the value of the DECIMAL TEXT in Src1(string)
+    // ⭐ Dest := Src1(handle) * Src2(a PLAIN Int64 register). Not an optimisation of
+    // convenience: multiplying by a small integer is what pidigits does on every
+    // single term, and routing it through the general product meant converting the
+    // integer to a BigInt and allocating a full product vector for an O(n) job.
+    ssaBigMulSmall,
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

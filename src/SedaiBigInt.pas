@@ -75,6 +75,8 @@ function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
   dinamico, che di suo NON fa copia su scrittura (a2 := a1; a2[0] := 9 cambia
   anche a1[0] - misurato, non dedotto). }
 procedure UniqueLimbs(var a: TLimbs);
+{ Il riconteggio di un vettore di limb: serve a decidere se si puo' scrivere in posto. }
+function LimbsRefCount(const a: TLimbs): PtrInt;
 
 procedure BigSetSmall(var a: TLimbs; var n: Integer; v: QWord);
 procedure BigCopy(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer);
@@ -316,6 +318,26 @@ var
   s, carry, x: QWord;
 begin
   m := an; if bn > m then m := bn;
+  { ⭐ IL TEMPORANEO SOLO QUANDO SERVE. Il pericolo e' la RIALLOCAZIONE mentre `a` o `b`
+    puntano allo stesso blocco di dst; se dst e' gia' abbastanza capiente non si
+    rialloca nulla e si puo' scrivere in posto, che e' il caso NORMALE dentro un ciclo
+    (dopo i primi giri il vettore ha gia' la sua taglia). Misurato: e' la differenza
+    fra un'allocazione per operazione e nessuna. }
+  if (Length(dst) >= m + 1) and (LimbsRefCount(dst) <= 1) then
+  begin
+    carry := 0;
+    for i := 0 to m - 1 do
+    begin
+      s := carry; carry := 0;
+      if i < an then begin x := s + a[i]; if x < s then carry := 1; s := x; end;
+      if i < bn then begin x := s + b[i]; if x < s then Inc(carry); s := x; end;
+      dst[i] := s;      { stesso indice letto e scritto: l'aliasing e' innocuo }
+    end;
+    dn := m;
+    if carry > 0 then begin dst[dn] := carry; Inc(dn); end;
+    while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
+    Exit;
+  end;
   SetLength(t, m + 1);
   carry := 0;
   for i := 0 to m - 1 do
@@ -337,7 +359,23 @@ var
   i: Integer;
   bb, v, borrow: QWord;
 begin
-  { Stesso motivo di BigAdd: dst puo' essere a (o b). Vedi la nota li'. }
+  { Stesso motivo di BigAdd, e stessa scorciatoia: in posto quando non si rialloca. }
+  if (Length(dst) >= an) and (LimbsRefCount(dst) <= 1) then
+  begin
+    borrow := 0;
+    for i := 0 to an - 1 do
+    begin
+      if i < bn then bb := b[i] else bb := 0;
+      v := a[i] - bb;
+      if (a[i] < bb) or (v < borrow) then
+      begin dst[i] := v - borrow; borrow := 1; end
+      else
+      begin dst[i] := v - borrow; borrow := 0; end;
+    end;
+    dn := an;
+    while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
+    Exit;
+  end;
   SetLength(t, an);
   borrow := 0;
   for i := 0 to an - 1 do

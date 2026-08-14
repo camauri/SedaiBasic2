@@ -272,7 +272,7 @@ begin
     bcBigNew,         // Dest = the fresh handle
     bcBigFromInt,     // Dest = the handle written (and READ: see DestReadIsIntReg)
     bcBigCopy,        // Dest = the destination handle (likewise)
-    bcBigAdd, bcBigSub, bcBigMul,   // Dest = the result handle (also read: reused if live)
+    bcBigAdd, bcBigSub, bcBigMul, bcBigMulSmall,   // Dest = the result handle (also read: reused if live)
     bcBigCmp,         // Dest = the -1/0/1 result, a PLAIN int and not a handle
     bcBigFromStr,     // Dest = the handle built from the text (also read: reused if live)
     bcGfxScreenPtr,   // SCREENPTR: Dest = raw pointer to the framebuffer (int); no register sources
@@ -406,7 +406,7 @@ begin
     // === GROUP 12: BigInt === Src1 is an int register in all three: the Int64 value for
     // FromInt, the SOURCE handle for Copy and for ToStr.
     bcBigFromInt, bcBigCopy, bcBigToStr,
-    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp,   // Src1 = the left handle
+    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall,   // Src1 = the left handle
     // UDT/record (M3): Src1 is the record HANDLE (always an int register) for all field ops.
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
@@ -611,7 +611,7 @@ begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
     // === GROUP 12: BigInt === Src2 is the RIGHT operand's handle (an int register).
-    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp,
+    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall,
     // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.
     bcRecordStoreInt,
     // raw heap: Realloc's Src2 = byte count; RawStoreInt's Src2 = int value.
@@ -776,7 +776,7 @@ begin
     // === GROUP 12: BigInt === ⛔ Dest is READ as well as written: it carries the handle
     // to fill in, and an existing one is REUSED rather than reallocated. Miss this and the
     // compactor treats the register as dead on entry and may hand it to something else.
-    bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul, bcBigFromStr,
+    bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul, bcBigFromStr, bcBigMulSmall,
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
     bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
     // === GROUP 10: Graphics ===

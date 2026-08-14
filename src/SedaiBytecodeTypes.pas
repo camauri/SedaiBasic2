@@ -837,6 +837,7 @@ const
   bcBigMul          = bcGroupBigInt + 6;   // Dest := Src1 * Src2
   bcBigCmp          = bcGroupBigInt + 7;   // Dest(int) := sign of (Src1 - Src2)
   bcBigFromStr      = bcGroupBigInt + 8;   // Dest(handle) := value of the decimal text Src1
+  bcBigMulSmall     = bcGroupBigInt + 9;   // Dest := Src1(handle) * Src2 (plain Int64 reg)
 
   // === SUPERINSTRUCTIONS (0xC8xx+) ===
   // Fused compare-and-branch (Int)
@@ -2301,6 +2302,7 @@ begin
         6: Result := 'BigMul';
         7: Result := 'BigCmp';
         8: Result := 'BigFromStr';
+        9: Result := 'BigMulSmall';
       else
         Result := Format('Big_%d', [SubOp]);
       end;

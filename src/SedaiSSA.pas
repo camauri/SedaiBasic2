@@ -821,7 +821,10 @@ type
       and every consumer must keep asking rather than testing for an identifier. }
     function IsBigIntExpr(Node: TASTNode): Boolean;
     function BigOperandHandle(Node: TASTNode): TSSAValue;
-    function TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue): Boolean;
+    { DestReg, quando e' un registro, e' DOVE scrivere il risultato: serve a togliere
+      il temporaneo piu' la copia da ogni assegnazione. svkNone = alloca un temporaneo. }
+    function TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue;
+      const DestReg: TSSAValue): Boolean;
     procedure ProcessPrintUsing(Node: TASTNode);
     { The field engine behind BOTH spellings of PRINT USING - see its body. }
     procedure EmitUsingFields(FmtNode: TASTNode; const ValNodes: array of TASTNode);
@@ -2848,7 +2851,7 @@ begin
         is enough - the other is converted. }
       if (Node.ChildCount >= 2) and Assigned(Node.Token) and FModernMode and
          (IsBigIntExpr(Node.GetChild(0)) or IsBigIntExpr(Node.GetChild(1))) and
-         TryEmitBigIntBinaryOp(Node, Result) then
+         TryEmitBigIntBinaryOp(Node, Result, MakeSSAValue(svkNone)) then
         Exit;
 
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
@@ -6770,6 +6773,28 @@ begin
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Exit;
     end;
+    { ⭐⭐ "x = x * k" IN PLACE. Without this the value is multiplied into a temporary
+      and then copied back, so the hottest statement of the whole benchmark pays a copy
+      of the entire number on every term. Recognised on the SHAPE of the assignment,
+      which is where the information is: only here is it known that the destination and
+      the left operand are the same variable. }
+    if (ExprNode.NodeType = antBinaryOp) and (ExprNode.ChildCount >= 2) and
+       Assigned(ExprNode.Token) and (VarToStr(ExprNode.Token.Value) = '*') and
+       (ExprNode.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(ExprNode.GetChild(0).Value)) = VarName) and
+       IsBigIntExpr(ExprNode.GetChild(0)) and not IsBigIntExpr(ExprNode.GetChild(1)) then
+    begin
+      ProcessExpression(ExprNode.GetChild(1), ExprValue);
+      EmitInstruction(ssaBigMulSmall, VarReg, VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAValue(svkNone));
+      Exit;
+    end;
+    { ⭐⭐ L'assegnazione di un'espressione BigInt scrive DIRETTAMENTE nel registro del
+      bersaglio: niente temporaneo, niente copia di ritorno. Su pidigits e' la meta'
+      del lavoro, perche' ogni termine assegna numeri che crescono di continuo. }
+    if (ExprNode.NodeType = antBinaryOp) and IsBigIntExpr(ExprNode) and
+       TryEmitBigIntBinaryOp(ExprNode, ExprValue, VarReg) then
+      Exit;
     ProcessExpression(ExprNode, ExprValue);
     if IsBigIntExpr(ExprNode) then
       EmitInstruction(ssaBigCopy, VarReg, EnsureIntRegister(ExprValue),
@@ -21813,14 +21838,16 @@ begin
   ProcessExpression(Node, V);
   if IsBigIntExpr(Node) then
     Exit(EnsureIntRegister(V));
+  { ⚠️ NO ssaBigNew here. The destination allocates its own handle the first time and
+    OWNS it from then on (BigDestOf), so a New before every conversion was one wasted
+    allocation per operand per iteration - which is where pidigits was spending itself. }
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaBigNew, Result, MakeSSAValue(svkNone),
-                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   EmitInstruction(ssaBigFromInt, Result, EnsureIntRegister(V),
                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
-function TSSAGenerator.TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue): Boolean;
+function TSSAGenerator.TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue;
+  const DestReg: TSSAValue): Boolean;
 // "a <op> b" with at least one BigInt operand. Answers False for an operator this type
 // does not carry, so the caller can fall through to its own diagnosis.
 //
@@ -21849,6 +21876,29 @@ begin
       'integer type.', [Op]);
   end;
 
+  { ⭐ BigInt * SMALL INTEGER has its own opcode, and it is not a micro-optimisation:
+    every multiplication pidigits performs is of this shape (den*k2, num*k, acc*10,
+    den*q). Through the general product each of them converted the integer into a
+    BigInt and allocated a full product vector for an O(n) job. Commutative, so the
+    integer may be on either side. }
+  if (Op = '*') and (IsBigIntExpr(Node.GetChild(0)) <> IsBigIntExpr(Node.GetChild(1))) then
+  begin
+    if IsBigIntExpr(Node.GetChild(0)) then
+    begin
+      L := BigOperandHandle(Node.GetChild(0));
+      ProcessExpression(Node.GetChild(1), R);
+    end
+    else
+    begin
+      L := BigOperandHandle(Node.GetChild(1));
+      ProcessExpression(Node.GetChild(0), R);
+    end;
+    if DestReg.Kind = svkRegister then Res := DestReg
+    else Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBigMulSmall, Res, L, EnsureIntRegister(R), MakeSSAValue(svkNone));
+    Exit(True);
+  end;
+
   if (Op = '+') or (Op = '-') or (Op = '*') then
   begin
     if Op = '+' then ArithOp := ssaBigAdd
@@ -21856,9 +21906,13 @@ begin
     else ArithOp := ssaBigMul;
     L := BigOperandHandle(Node.GetChild(0));
     R := BigOperandHandle(Node.GetChild(1));
-    Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaBigNew, Res, MakeSSAValue(svkNone),
-                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    { Same reason as in BigOperandHandle: the result register allocates once and reuses.
+      ⭐ And when the caller supplied a destination - an assignment - the operation writes
+      THERE, so "acc = acc + t" needs neither a temporary nor a copy back. The operands
+      are materialised BEFORE this point, so a destination that aliases one of them is
+      already resolved. }
+    if DestReg.Kind = svkRegister then Res := DestReg
+    else Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ArithOp, Res, L, R, MakeSSAValue(svkNone));
     { ⚠️ The result IS a BigInt, and IsBigIntExpr answers that from the SHAPE of the
       node - not from a list of registers. A property of the expression cannot go stale
