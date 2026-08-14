@@ -268,6 +268,10 @@ begin
     bcCsrlin,         // CSRLIN: current cursor row (int)
     bcFre,            // FRE: available memory (int)
     bcCpuCount,       // CPUCOUNT/CPUCORES: processors (int); the immediate is the KIND, not a register
+    // === GROUP 12: BigInt === a VALUE is a handle, and a handle is an int register.
+    bcBigNew,         // Dest = the fresh handle
+    bcBigFromInt,     // Dest = the handle written (and READ: see DestReadIsIntReg)
+    bcBigCopy,        // Dest = the destination handle (likewise)
     bcGfxScreenPtr,   // SCREENPTR: Dest = raw pointer to the framebuffer (int); no register sources
     bcPeek,           // PEEK(address): read from memory (int)
     // === GROUP 7: Sprite functions ===
@@ -396,6 +400,9 @@ begin
   case OpCode of
     // SUB/FUNCTION transfer-register store (M2): Src1 is the int register read.
     bcXferStoreInt,
+    // === GROUP 12: BigInt === Src1 is an int register in all three: the Int64 value for
+    // FromInt, the SOURCE handle for Copy and for ToStr.
+    bcBigFromInt, bcBigCopy, bcBigToStr,
     // UDT/record (M3): Src1 is the record HANDLE (always an int register) for all field ops.
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
@@ -760,6 +767,10 @@ begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
     // === GROUP 3: Array operations ===
+    // === GROUP 12: BigInt === ⛔ Dest is READ as well as written: it carries the handle
+    // to fill in, and an existing one is REUSED rather than reallocated. Miss this and the
+    // compactor treats the register as dead on entry and may hand it to something else.
+    bcBigFromInt, bcBigCopy,
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
     bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
     // === GROUP 10: Graphics ===

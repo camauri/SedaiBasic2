@@ -45,7 +45,7 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot, SedaiCpuInfo
+  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -474,6 +474,10 @@ type
     procedure MaybePresentCadence(Ctx: TExecutionContext);   // windowed runs only; see the body
     procedure PresentBeforeFullRepaint(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    { Group 12: BigInt. A value is a handle into Ctx.BigVals. }
+    procedure ExecuteBigIntOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    function BigAlloc(Ctx: TExecutionContext): Integer;      // a fresh handle, value 0
+    function BigDecimal(Ctx: TExecutionContext; H: Integer): string;
     procedure ExecuteSpriteOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteFileIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     {$IFDEF WEB_MODE}
@@ -6974,6 +6978,7 @@ begin
     {$ENDIF}
     10: begin ExecuteGraphicsOp(Ctx, Instr); Exit; end;
     11: begin ExecuteSoundOp(Ctx, Instr); Exit; end;
+    12: begin ExecuteBigIntOp(Ctx, Instr); Exit; end;
     200..255: begin ExecuteSuperinstruction(Ctx, Instr); Exit; end;
   else
     raise Exception.CreateFmt('Unknown opcode group %d at PC=%d', [Group, Ctx.PC]);
@@ -13466,6 +13471,110 @@ begin
   ;
 end;
 {$ENDIF}
+
+function TBytecodeVM.BigAlloc(Ctx: TExecutionContext): Integer;
+// A fresh BigInt handle, value 0. Grows the per-context heap geometrically, as the
+// record heap does - a BigInt is allocated exactly where a UDT instance would be.
+begin
+  if Ctx.BigCount >= Length(Ctx.BigVals) then
+    SetLength(Ctx.BigVals, (Ctx.BigCount * 2) + 16);
+  Result := Ctx.BigCount;
+  Inc(Ctx.BigCount);
+  SetLength(Ctx.BigVals[Result].Limbs, 1);
+  Ctx.BigVals[Result].Limbs[0] := 0;
+  Ctx.BigVals[Result].N := 1;         { zero is N=1 with a zero limb: ONE representation }
+  Ctx.BigVals[Result].Neg := False;
+end;
+
+function TBytecodeVM.BigDecimal(Ctx: TExecutionContext; H: Integer): string;
+// The decimal text of a BigInt. ⚠️ In base 2^64 this is NOT free the way base 10^9
+// was: it is repeated division of the whole magnitude by 10^19, the largest power of
+// ten a limb holds, which costs O(n^2) digits. Acceptable because printing is not on
+// any hot path here - pidigits emits its digits from the tap, one at a time, and
+// never converts a whole number. If that changes, the answer is a divide-and-conquer
+// split, not a faster inner loop.
+const
+  CHUNK = QWord(10000000000000000000);   { 10^19, the largest power of ten below 2^64 }
+var
+  W: TLimbs;
+  n, i: Integer;
+  rem, cur: QWord;
+  part: string;
+begin
+  if (H < 0) or (H >= Ctx.BigCount) then Exit('0');
+  n := Ctx.BigVals[H].N;
+  if (n = 1) and (Ctx.BigVals[H].Limbs[0] = 0) then Exit('0');
+  { Work on a COPY: the conversion destroys the value it walks. }
+  SetLength(W, n);
+  for i := 0 to n - 1 do W[i] := Ctx.BigVals[H].Limbs[i];
+  Result := '';
+  while (n > 1) or (W[0] <> 0) do
+  begin
+    rem := 0;
+    for i := n - 1 downto 0 do
+    begin
+      { 128-bit ÷ 64-bit one limb at a time. FPC has no 128-bit divide, so the
+        remainder is carried in the high half by hand: this is the schoolbook step
+        rem:W[i] div CHUNK, done with the two 64-bit halves the language does have. }
+      cur := W[i];
+      W[i] := DivMod128By64(rem, cur, CHUNK, rem);
+    end;
+    while (n > 1) and (W[n - 1] = 0) do Dec(n);
+    part := IntToStr(rem);
+    if (n > 1) or (W[0] <> 0) then
+      while Length(part) < 19 do part := '0' + part;   { inner chunks keep their zeros }
+    Result := part + Result;
+  end;
+  if Ctx.BigVals[H].Neg then Result := '-' + Result;
+end;
+
+procedure TBytecodeVM.ExecuteBigIntOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+// Group 12. A BigInt value is a HANDLE in the int bank; the limbs live in Ctx.BigVals.
+var
+  H, S: Integer;
+  v: Int64;
+  u: QWord;
+begin
+  case Instr.OpCode of
+    bcBigNew:
+      Ctx.IntRegs[Instr.Dest] := BigAlloc(Ctx);
+
+    bcBigFromInt:
+      begin
+        H := Integer(Ctx.IntRegs[Instr.Dest]);
+        if (H < 0) or (H >= Ctx.BigCount) then H := BigAlloc(Ctx);
+        v := Ctx.IntRegs[Instr.Src1];
+        { ⛔ The magnitude of Low(Int64) does not fit in an Int64, so negating it is
+          the overflow this project has already been bitten by. Take the two's
+          complement in the UNSIGNED domain, where 2^63 is representable. }
+        if v < 0 then begin Ctx.BigVals[H].Neg := True;  u := QWord(-(v + 1)) + 1; end
+                 else begin Ctx.BigVals[H].Neg := False; u := QWord(v); end;
+        UniqueLimbs(Ctx.BigVals[H].Limbs);
+        BigSetSmall(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N, u);
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigCopy:
+      begin
+        H := Integer(Ctx.IntRegs[Instr.Dest]);
+        S := Integer(Ctx.IntRegs[Instr.Src1]);
+        if (S < 0) or (S >= Ctx.BigCount) then Exit;
+        if (H < 0) or (H >= Ctx.BigCount) then H := BigAlloc(Ctx);
+        { ⭐ VALUE semantics without copying the limbs: the assignment shares them and
+          the refcount goes up; UniqueLimbs splits them at the first WRITE. Measured
+          at the same price as AnsiString's own copy-on-write. }
+        Ctx.BigVals[H].Limbs := Ctx.BigVals[S].Limbs;
+        Ctx.BigVals[H].N     := Ctx.BigVals[S].N;
+        Ctx.BigVals[H].Neg   := Ctx.BigVals[S].Neg;
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigToStr:
+      Ctx.StringRegs[Instr.Dest] := BigDecimal(Ctx, Integer(Ctx.IntRegs[Instr.Src1]));
+  else
+    raise Exception.CreateFmt('Unknown BigInt opcode $%.4x at PC=%d', [Instr.OpCode, Ctx.PC]);
+  end;
+end;
 
 procedure TBytecodeVM.ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var

@@ -816,6 +816,10 @@ type
     procedure ProcessGet(Node: TASTNode);
     procedure ProcessGetkey(Node: TASTNode);
     // Formatted output
+    { True when this expression yields a BigInt. Today that is a variable declared one;
+      it is a FUNCTION because the answer will grow (an operator result, a call return)
+      and every consumer must keep asking rather than testing for an identifier. }
+    function IsBigIntExpr(Node: TASTNode): Boolean;
     procedure ProcessPrintUsing(Node: TASTNode);
     { The field engine behind BOTH spellings of PRINT USING - see its body. }
     procedure EmitUsingFields(FmtNode: TASTNode; const ValNodes: array of TASTNode);
@@ -6722,6 +6726,29 @@ begin
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
 
+  { ⭐ "b = ..." where b is a BigInt. Taken EARLY, before every lvalue shape below,
+    because the target is a HANDLE and the store has to go through the BigInt opcodes:
+    the ordinary scalar path would write the right-hand integer straight into the
+    handle register and destroy the binding - the same accident an unrouted UDT
+    initializer used to cause before ScalarCtorInit existed.
+    Two spellings, and the SOURCE's type picks between them: from another BigInt it is
+    a value copy (share the limbs, split them on the first write), from anything
+    integral it is a conversion. }
+  if FModernMode and (VarNode.NodeType = antIdentifier) and
+     (VarRecordTypeName(VarToStr(VarNode.Value)) = 'BIGINT') then
+  begin
+    VarName := UpperCase(VarToStr(VarNode.Value));
+    VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));
+    ProcessExpression(ExprNode, ExprValue);
+    if IsBigIntExpr(ExprNode) then
+      EmitInstruction(ssaBigCopy, VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaBigFromInt, VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
   // FreeBASIC "Cast(T, place) = expr". A cast on the LEFT is a REINTERPRETATION, never a conversion:
   // fbc accepts it only when the storage is unchanged (Integer <-> UInteger yes; Integer <-> Double and
   // Short <-> Integer are "error 24: Invalid data types"), so the store lands on the place underneath and
@@ -7792,6 +7819,7 @@ var
   SeparatorChar, FuncName: string;
   EndsWithSeparator: Boolean;
   UsingVals: array of TASTNode;   // the items a mid-list "USING fmt" governs
+  BigStrReg: TSSAValue;           // the decimal text of a BigInt item
   PKidx: Integer;   // B1.5 phase C: print kind of an identifier (0 = signed, 1 = BOOLEAN, 2 = unsigned-64)
 begin
   // FreeBASIC console WRITE: quoted-CSV to the screen (child 0 is a placeholder; values are children 1+).
@@ -7930,6 +7958,20 @@ begin
           ExprValue := RegValue;
         end;
       end;
+    end;
+
+    { A BigInt prints as its DECIMAL TEXT, not as the handle it is carried in. Taken
+      before the per-bank dispatch below because that would see an int register and
+      print the handle - a small number that looks entirely plausible, which is the
+      worst kind of wrong. }
+    if IsBigIntExpr(Child) then
+    begin
+      BigStrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaBigToStr, BigStrReg, EnsureIntRegister(ExprValue),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), BigStrReg,
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
     end;
 
     // B1.5 phase C: printing a BOOLEAN variable yields "true"/"false"; a 64-bit unsigned variable
@@ -8709,6 +8751,29 @@ begin
       // "Dim x As Integer = e" (the store IS the initialisation, and a zero before it would be dead).
       HasScalarInit := (ArrayDeclNode.ChildCount >= 3) and
                        (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList);
+      { ⭐ "Dim b As BigInt" - MODERN only. A BigInt binds exactly like a UDT instance:
+        a HANDLE in the int bank, allocated here, with the limbs in the per-context
+        heap. Registering the name in FVarRecordType (the same map UDT variables use)
+        is what makes every later site able to ASK the type - and because
+        FindUDT('BIGINT') is < 0, none of the record-specific paths mistake it for one:
+        they all guard on that index. The type is known by NAME, and the name is
+        already the language's way of asking. }
+      if FModernMode and (RecTypeName = 'BIGINT') then
+      begin
+        RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
+        EmitInstruction(ssaBigNew, RecHandleVal, MakeSSAValue(svkNone),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        FVarRecordType.Values[UpperCase(ArrName)] := 'BIGINT';
+        if HasScalarInit then
+        begin
+          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.Token);
+          InitAssign.AddChild(ArrayDeclNode.GetChild(0).Clone);
+          InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+          ProcessAssignment(InitAssign);
+          InitAssign.Free;
+        end;
+        Continue;
+      end;
       RecUDTIdx := FindUDT(RecTypeName);
       if RecUDTIdx >= 0 then
       begin
@@ -21588,10 +21653,23 @@ var
   Idx: Integer;
 begin
   if VarName = '' then Exit;
+  { ⭐ BIGINT is a HANDLE type, exactly like a UDT, and it has to be said HERE - the
+    one place that decides which bank a declared name lives in. FindUDT('BIGINT') is
+    < 0 by design (it is not a user type), so without this arm it fell to
+    TypeNameToBank, which knows only the builtin scalars and answered with the FLOAT
+    default. The symptom was the one the note above already describes: it depended on
+    DECLARATION ORDER. With "Dim b As BigInt" first the program was right; with the
+    DIM after a statement, the declaration bound one register and every later use
+    resolved another, and the value silently came out 0. }
   if FindUDT(TypeName) >= 0 then
   begin
     FVarRecordType.Values[VarName] := TypeName;
     Bank := srtInt;   // a record var holds an int handle
+  end
+  else if FModernMode and (UpperCase(TypeName) = 'BIGINT') then
+  begin
+    FVarRecordType.Values[VarName] := 'BIGINT';
+    Bank := srtInt;   // a BigInt var holds an int handle too
   end
   else
     Bank := TypeNameToBank(TypeName, VarName);
@@ -21680,6 +21758,17 @@ begin
     end;
     Exit;
   end;
+end;
+
+function TSSAGenerator.IsBigIntExpr(Node: TASTNode): Boolean;
+// Does this expression yield a BigInt? See the declaration for why it is a function.
+begin
+  Result := False;
+  if (Node = nil) or not FModernMode then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then
+    Result := VarRecordTypeName(VarToStr(Node.Value)) = 'BIGINT';
 end;
 
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;

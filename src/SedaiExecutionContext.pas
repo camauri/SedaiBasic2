@@ -27,6 +27,11 @@ unit SedaiExecutionContext;
 
 interface
 
+uses
+  // Only for TLimbs, the limb vector a BigInt value holds. SedaiBigInt depends on
+  // nothing of ours, so this cannot close a cycle.
+  SedaiBigInt;
+
 { TExecutionContext — the per-thread-of-control execution state of the bytecode VM.
 
   M5.1 (multithreading groundwork, see job/docs/SEDAIBASIC_EVOLUTION.md S16.2/S16.8):
@@ -59,6 +64,18 @@ type
     rather than A3-ii: a string is owned by the allocator and is not an inert byte. The layout DOES
     reserve the bytes a fixed-length "String * n" field occupies in fbc's image, at fbc's offset, so
     moving the characters in later is a change to that field's accessors and moves no other field. }
+  { One BigInt value. The magnitude is normalised - no leading zero limb - because
+    a comparison looks at N first and a leading zero would make the smaller number
+    come out larger. Zero is N=1, Limbs[0]=0, Neg=False, so there is exactly one
+    representation of it and no "negative zero" to reason about.
+    ⚠️ Limbs is an FPC dynamic array: refcounted, but WITHOUT copy-on-write. That
+    is the whole reason UniqueLimbs exists in SedaiBigInt.pas. }
+  TBigValue = record
+    Limbs: TLimbs;            // magnitude, least significant limb first
+    N: Integer;               // limbs in use (Length(Limbs) may be larger)
+    Neg: Boolean;             // sign, kept apart: the limbs are unsigned
+  end;
+
   TRecordStorage = record
     TypeId: Integer;          // M4.3: runtime UDT type id (for virtual dispatch); -1 if untyped
     Bytes: array of Byte;     // the record's live C image: numeric fields at their true offsets
@@ -223,6 +240,18 @@ type
     // per-thread because each thread owns its heap (no cross-thread reclamation, S16.4).
     Records: array of TRecordStorage;
     RecordCount: Integer;
+
+    // --- BigInt heap (per-context, exactly as the record heap above) ---
+    // A BigInt VALUE is a handle into this array, which is why it is here and not
+    // beside the register banks: the language already knows how to scope, pass and
+    // reclaim a handle, and reusing that shape means BigInt adds a TYPE, not a new
+    // storage concept. Magnitude in Limbs[0..N-1], least significant first; the
+    // sign is separate because the limbs are unsigned and the core arithmetic in
+    // SedaiBigInt.pas is deliberately magnitude-only.
+    // ⚠️ Value semantics come from copy-on-write, NOT from copying on assignment:
+    // BigCopy shares the limbs and UniqueLimbs splits them at the first write.
+    BigVals: array of TBigValue;
+    BigCount: Integer;
 
     // --- AOT runtime-helper handoff (C3, PIANO_B1_AOT_DESIGN §5.6) ---
     // An exception must never unwind through AOT-generated frames: they carry no unwind

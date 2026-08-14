@@ -505,6 +505,12 @@ begin
     ssaCsrlin: Result := bcCsrlin;
     ssaFre: Result := bcFre;
     ssaCpuCount: Result := bcCpuCount;
+    // BigInt (group 12): a value is a handle in the int bank, the limbs live in
+    // a per-context heap. See job/docs/PIANO_BIGINT.md.
+    ssaBigNew:     Result := bcBigNew;
+    ssaBigFromInt: Result := bcBigFromInt;
+    ssaBigCopy:    Result := bcBigCopy;
+    ssaBigToStr:   Result := bcBigToStr;
     // Memory operations
     ssaPeek: Result := bcPeek;
     ssaPoke: Result := bcPoke;

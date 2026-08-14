@@ -50,6 +50,15 @@ function MulHi64(a, b: QWord): QWord; {$IFDEF CPUX86_64}inline;{$ENDIF}
   sarebbe diventato "assembly contro se stesso" - verde e cieco. }
 function MulHi64Portable(a, b: QWord): QWord;
 
+{ (hi:lo) div d, col resto in rem. ⛔ RICHIEDE hi < d, che è l'invariante del passo
+  scolastico che la usa: senza, il quoziente non starebbe in 64 bit.
+  ⚠️ È la divisione lunga BIT A BIT, 64 giri: lenta di proposito. Serve solo alla
+  conversione in decimale, che non sta su nessun percorso caldo (pidigits fa uscire
+  le cifre dal rubinetto una alla volta e non converte mai un numero intero). La via
+  x86 sarebbe una sola `divq`, ma quella va scritta in assembly e l'assembly qui si
+  paga in convenzioni di chiamata: si aggiunge quando una misura dirà che serve. }
+function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
+
 { Sgancia SOLO se condiviso: l'equivalente di UniqueString per un array
   dinamico, che di suo NON fa copia su scrittura (a2 := a1; a2[0] := 9 cambia
   anche a1[0] - misurato, non dedotto). }
@@ -116,6 +125,33 @@ begin
   Result := MulHi64Portable(a, b);
 end;
 {$ENDIF}
+
+function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
+var
+  i: Integer;
+  q: QWord;
+  carry: Boolean;
+begin
+  q := 0;
+  rem := hi;
+  for i := 63 downto 0 do
+  begin
+    { ⛔ Il bit ALTO va salvato PRIMA dello shift: rem può valere fino a d-1, e con
+      d oltre 2^63 lo shift lo perde. Se è uscito, il valore vero è rem + 2^64 ed è
+      certamente >= d, quindi si sottrae comunque - e la sottrazione modulo 2^64 dà
+      il risultato giusto. Senza questa riga la conversione sbaglia solo sui numeri
+      grandi, che è il modo peggiore di sbagliare. }
+    carry := (rem shr 63) <> 0;
+    rem := (rem shl 1) or ((lo shr i) and 1);
+    q := q shl 1;
+    if carry or (rem >= d) then
+    begin
+      rem := rem - d;
+      q := q or 1;
+    end;
+  end;
+  Result := q;
+end;
 
 { Il refcount di un array dinamico sta due PtrInt prima dei dati (refcount,
   poi high). ⚠️ E' un dettaglio implementativo di FPC e sta QUI, in una

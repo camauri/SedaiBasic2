@@ -56,6 +56,8 @@ begin
     bcXferLoadString,
     // UDT/record (M3): RecordLoadString writes a string field into Dest.
     bcRecordLoadString,
+    // BigInt (group 12): the decimal text of a value.
+    bcBigToStr,
     // === GROUP 0: Core VM operations ===
     bcLoadConstString, bcCopyString,
     bcIntToString, bcFloatToString,

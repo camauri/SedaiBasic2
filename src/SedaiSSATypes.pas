@@ -555,6 +555,16 @@ type
                        //   both 1-based). CLASSIC LOCATE is ssaGraphicLocate, the pixel cursor.
     ssaConViewPrint,   // VIEW PRINT [first TO last]: the text print area (Src1 = first row, Src2 = last row,
                        //   1-based; 0 in either means "the whole screen")
+    // ── BigInt (arbitrary-precision integers), MODERN only ───────────────────
+    // A BigInt VALUE is a HANDLE in the int bank, exactly as a UDT instance is;
+    // the limbs live in a per-context heap. That is not an implementation
+    // detail that leaked: it is the SAME shape the language already has for a
+    // managed aggregate, so scoping, frames and the register allocator need no
+    // new concept. See job/docs/PIANO_BIGINT.md and src/SedaiBigInt.pas.
+    ssaBigNew,         // Dest = a fresh BigInt handle, value 0
+    ssaBigFromInt,     // Dest(handle) := Src1 (an Int64 register), sign included
+    ssaBigCopy,        // Dest(handle) := Src1(handle), by VALUE (copy-on-write)
+    ssaBigToStr,       // Dest(string) := the decimal text of Src1(handle)
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

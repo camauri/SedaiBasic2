@@ -74,6 +74,7 @@ const
   bcWebStatus       = bcGroupWeb + $0C;  // STATUS code - set HTTP status
   {$ENDIF}
   bcGroupSound      = $0B00;  // Group 11: Sound
+  bcGroupBigInt     = $0C00;  // Group 12: BigInt (arbitrary-precision integers)
   bcGroupSuper      = $C800;  // Group 200+: Superinstructions
 
 type
@@ -820,6 +821,17 @@ const
   bcSoundTempo      = bcGroupSound + 3;
   bcSoundPlay       = bcGroupSound + 4;
   bcSoundFilter     = bcGroupSound + 5;
+
+  // === GROUP 12: BIGINT (0x0Cxx) ===
+  // Arbitrary-precision integers, MODERN only. A value is a HANDLE in the int
+  // bank (as a UDT instance is) and its limbs live in a per-context heap, so
+  // scoping, frames and register allocation need no new concept.
+  // ⚠️ A NEW GROUP, not slots appended to an existing one: that moves only
+  // DENSE_SUPER_BASE, and `sb --verify-opcodes` is what says so.
+  bcBigNew          = bcGroupBigInt + 0;   // Dest = fresh handle, value 0
+  bcBigFromInt      = bcGroupBigInt + 1;   // Dest(handle) := Src1 (Int64 reg)
+  bcBigCopy         = bcGroupBigInt + 2;   // Dest(handle) := Src1(handle), BY VALUE
+  bcBigToStr        = bcGroupBigInt + 3;   // Dest(string) := decimal text of Src1
 
   // === SUPERINSTRUCTIONS (0xC8xx+) ===
   // Fused compare-and-branch (Int)
@@ -2272,6 +2284,15 @@ begin
         5: Result := 'SoundFilter';
       else
         Result := Format('Sound_%d', [SubOp]);
+      end;
+    12: // BigInt
+      case SubOp of
+        0: Result := 'BigNew';
+        1: Result := 'BigFromInt';
+        2: Result := 'BigCopy';
+        3: Result := 'BigToStr';
+      else
+        Result := Format('Big_%d', [SubOp]);
       end;
     200..255: // Superinstructions
       case SubOp of

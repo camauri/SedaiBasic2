@@ -614,6 +614,10 @@ begin
         begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
       DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+      // ⚠️ Same warning as the graphics range above: nothing checks this at compile time. Widen it
+      // whenever group 12 grows, or the new opcode builds fine and dies at run time.
+      DENSE_BIGINT_BASE + 0 .. DENSE_BIGINT_BASE + 3:
+        begin Ctx.PC := CurPC; ExecuteBigIntOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
       DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 167:
