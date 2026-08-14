@@ -6487,6 +6487,11 @@ begin
           if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
+        bcBigToInt:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
         bcBigFromStr:   { l'inverso: Dest e' un handle (int), Src1 il TESTO }
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
@@ -13844,6 +13849,18 @@ begin
         Ctx.BigVals[H].Neg := NegA and
                               not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
         Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigToInt:
+      begin
+        A := Integer(Ctx.IntRegs[Instr.Src1]);
+        if (A < 0) or (A >= Ctx.BigCount) then begin Ctx.IntRegs[Instr.Dest] := 0; Exit; end;
+        { ⚠️ I 64 bit BASSI col segno, come ogni altra conversione stretta del linguaggio:
+          un BigInt piu' grande di un Int64 non ha una risposta giusta, e avvolgere e'
+          la stessa regola che vale gia' per Integer <- LongInt. }
+        u := Ctx.BigVals[A].Limbs[0];
+        if Ctx.BigVals[A].Neg then Ctx.IntRegs[Instr.Dest] := -Int64(u)
+        else Ctx.IntRegs[Instr.Dest] := Int64(u);
       end;
 
     bcBigCmp:

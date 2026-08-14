@@ -580,6 +580,10 @@ type
     // single term, and routing it through the general product meant converting the
     // integer to a BigInt and allocating a full product vector for an O(n) job.
     ssaBigMulSmall,
+    // Dest(int) := Src1(handle) come Int64. Mancava, e la sua assenza si pagava con un
+    // giro BigInt -> stringa -> intero: due conversioni e una allocazione per estrarre
+    // un numero che sta in un registro.
+    ssaBigToInt,
     // Divisione lunga (Knuth D). Due opcode e non uno: il quoziente e il resto sono
     // due domande diverse, e un solo Dest non puo' rispondere a entrambe.
     ssaBigDiv,         // Dest := Src1 \\ Src2 (quoziente, troncato verso zero)

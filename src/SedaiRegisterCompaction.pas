@@ -272,7 +272,7 @@ begin
     bcBigNew,         // Dest = the fresh handle
     bcBigFromInt,     // Dest = the handle written (and READ: see DestReadIsIntReg)
     bcBigCopy,        // Dest = the destination handle (likewise)
-    bcBigAdd, bcBigSub, bcBigMul, bcBigMulSmall, bcBigDiv, bcBigMod,   // Dest = the result handle (also read: reused if live)
+    bcBigAdd, bcBigSub, bcBigMul, bcBigMulSmall, bcBigDiv, bcBigMod, bcBigToInt,   // Dest = the result handle (also read: reused if live)
     bcBigCmp,         // Dest = the -1/0/1 result, a PLAIN int and not a handle
     bcBigFromStr,     // Dest = the handle built from the text (also read: reused if live)
     bcGfxScreenPtr,   // SCREENPTR: Dest = raw pointer to the framebuffer (int); no register sources
@@ -406,7 +406,7 @@ begin
     // === GROUP 12: BigInt === Src1 is an int register in all three: the Int64 value for
     // FromInt, the SOURCE handle for Copy and for ToStr.
     bcBigFromInt, bcBigCopy, bcBigToStr,
-    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall, bcBigDiv, bcBigMod,   // Src1 = the left handle
+    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall, bcBigDiv, bcBigMod, bcBigToInt,   // Src1 = the left handle
     // UDT/record (M3): Src1 is the record HANDLE (always an int register) for all field ops.
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,

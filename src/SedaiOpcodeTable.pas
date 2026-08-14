@@ -40,7 +40,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 555 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +12 BigInt
+  OPCODE_LIST_COUNT = 556 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -124,7 +124,7 @@ const
   bcGfxImageConvertRow, bcGfxDrawString, bcRegexCount, bcRegexReplace,
     bcSoundVol, bcSoundSound, bcSoundEnvelope, bcSoundTempo, bcSoundPlay, bcSoundFilter,
     bcBigNew, bcBigFromInt, bcBigCopy, bcBigToStr,
-    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigFromStr, bcBigMulSmall, bcBigDiv, bcBigMod,
+    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigFromStr, bcBigMulSmall, bcBigDiv, bcBigMod, bcBigToInt,
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
     bcAddIntTo, bcSubIntTo, bcMulIntTo, bcAddFloatTo, bcSubFloatTo, bcMulFloatTo,
@@ -178,15 +178,15 @@ const
   DENSE_SOUND_BASE    = 489;  // group 11 (6)
   // group 12 (bigint, 4 subs) sits between sound and super, so it shifts SUPER
   // and TOTAL by 4 in BOTH branches - and nothing checks that at compile time.
-  DENSE_BIGINT_BASE   = 495;  // group 12 (12)
-  DENSE_SUPER_BASE    = 507;  // group 200 (256 slots)
-  DENSE_TOTAL         = 763;  // N (with web)
+  DENSE_BIGINT_BASE   = 495;  // group 12 (13)
+  DENSE_SUPER_BASE    = 508;  // group 200 (256 slots)
+  DENSE_TOTAL         = 764;  // N (with web)
   {$ELSE}
   DENSE_GRAPHICS_BASE = 410;  // group 10 (66)
   DENSE_SOUND_BASE    = 476;  // group 11 (6)
-  DENSE_BIGINT_BASE   = 482;  // group 12 (12)
-  DENSE_SUPER_BASE    = 494;  // group 200 (256 slots, 58 used, 198 holes)
-  DENSE_TOTAL         = 750;  // N
+  DENSE_BIGINT_BASE   = 482;  // group 12 (13)
+  DENSE_SUPER_BASE    = 495;  // group 200 (256 slots, 58 used, 198 holes)
+  DENSE_TOTAL         = 751;  // N
   {$ENDIF}
 
 var

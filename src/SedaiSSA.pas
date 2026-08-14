@@ -4613,6 +4613,22 @@ begin
           // unsignedness IsUnsigned64Expr drives into the unsigned compare/div/mod/print.
           // FreeBASIC integer conversion functions: round-to-nearest (banker's rounding)
           // toward an integer result, then wrap/sign-extend to the type's width (B1.5).
+          { ⛔ UN BIGINT SI CONVERTE CON UN OPCODE, non passando per il testo. Senza questo
+            arm l'unica via era CInt(Str(b)): un numero trasformato in stringa per essere
+            riletto come numero, DENTRO un calcolo. E' anche la ragione per cui il
+            confronto fra la versione con le prove e quella con la divisione era falsato -
+            solo la seconda pagava due conversioni per cifra.
+            ⚠️ Va PRIMA del ramo generale: un BigInt vive in un registro int, e quel ramo
+            ne prenderebbe l'HANDLE per il valore. }
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and IsBigIntExpr(ArgListNode.GetChild(0)) then
+          begin
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue);
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBigToInt, Result, EnsureIntRegister(ArgValue),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
