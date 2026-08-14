@@ -82,7 +82,7 @@ Sub reportEnergy( m() As Double, xx() As Double, yy() As Double, zz() As Double,
       e -= (m(i) * m(j)) / Sqr(dx*dx + dy*dy + dz*dz)
     Next j
   Next i
-  Print Using "-#.#########"; e
+  Print Using "##.#########"; e
 End Sub
 
 reportEnergy( mass(), x(), y(), z(), vx(), vy(), vz() )

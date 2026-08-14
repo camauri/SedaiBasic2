@@ -817,6 +817,8 @@ type
     procedure ProcessGetkey(Node: TASTNode);
     // Formatted output
     procedure ProcessPrintUsing(Node: TASTNode);
+    { The field engine behind BOTH spellings of PRINT USING - see its body. }
+    procedure EmitUsingFields(FmtNode: TASTNode; const ValNodes: array of TASTNode);
     procedure ProcessPudef(Node: TASTNode);
     procedure ProcessChar(Node: TASTNode);
     // File operations
@@ -7783,15 +7785,15 @@ end;
 
 procedure TSSAGenerator.ProcessPrint(Node: TASTNode);
 var
-  i: Integer;
-  ExprValue, RegValue, ArgValue, ArgReg, CurrentFormatReg: TSSAValue;
+  i, j: Integer;
+  ExprValue, RegValue, ArgValue, ArgReg: TSSAValue;
   DestReg: Integer;
   Child, ArgNode: TASTNode;
   SeparatorChar, FuncName: string;
   EndsWithSeparator: Boolean;
+  UsingVals: array of TASTNode;   // the items a mid-list "USING fmt" governs
   PKidx: Integer;   // B1.5 phase C: print kind of an identifier (0 = signed, 1 = BOOLEAN, 2 = unsigned-64)
 begin
-  CurrentFormatReg := MakeSSAValue(svkNone);   // FreeBASIC mid-list "USING fmt" format, once set
   // FreeBASIC console WRITE: quoted-CSV to the screen (child 0 is a placeholder; values are children 1+).
   if Node.Attributes.Values['WRITECSV'] = '1' then
   begin
@@ -7832,16 +7834,28 @@ begin
       Continue;
     end;
 
-    // FreeBASIC mid-list "USING fmt" marker (from "Print , Using ""#.##""; x"): set the format applied
-    // to the value items that follow. Carried as a nested antPrintUsing node with the format at child 0.
+    { FreeBASIC mid-list "USING fmt" marker (from "Print x; Using ""#.##""; v"): the
+      format governs EVERY value item that follows, to the end of the statement.
+      ⭐ Hand the rest of the list to EmitUsingFields - the SAME engine the head
+      form uses. It used to set a "current format" register here and then emit
+      ssaPrintUsing(WHOLE MASK, one value) per item further down, which is the
+      single-field formatter: literals in the mask vanished, the mask was
+      re-applied per value instead of being walked once, and a string field got a
+      float. See EmitUsingFields for the measurements against fbc. }
     if Child.NodeType = antPrintUsing then
     begin
       if Child.ChildCount >= 1 then
       begin
-        ProcessStringExpression(Child.GetChild(0), ExprValue);
-        CurrentFormatReg := EnsureStringRegister(ExprValue);
+        SetLength(UsingVals, 0);
+        for j := i + 1 to Node.ChildCount - 1 do
+          if Node.GetChild(j).NodeType <> antSeparator then
+          begin
+            SetLength(UsingVals, Length(UsingVals) + 1);
+            UsingVals[High(UsingVals)] := Node.GetChild(j);
+          end;
+        EmitUsingFields(Child.GetChild(0), UsingVals);
       end;
-      Continue;
+      Break;   { the USING clause consumed the remainder of the item list }
     end;
 
     // Handle TAB(n) and SPC(n) as special PRINT formatting functions
@@ -7916,15 +7930,6 @@ begin
           ExprValue := RegValue;
         end;
       end;
-    end;
-
-    // Under a mid-list "USING fmt", the value is formatted with the current format string (ssaPrintUsing
-    // takes a float value), overriding the plain per-type print below.
-    if CurrentFormatReg.Kind = svkRegister then
-    begin
-      EmitInstruction(ssaPrintUsing, MakeSSAValue(svkNone), CurrentFormatReg,
-                     EnsureFloatRegister(ExprValue), MakeSSAValue(svkNone));
-      Continue;
     end;
 
     // B1.5 phase C: printing a BOOLEAN variable yields "true"/"false"; a 64-bit unsigned variable
@@ -15183,13 +15188,62 @@ procedure TSSAGenerator.ProcessPrintUsing(Node: TASTNode);
 // "\...\" (a fixed-width STRING field, width = the backslash span, left-justified/padded/truncated);
 // "&" (a variable-width string field); "!" (one character). Any other text is emitted literally.
 // A non-literal (variable) format falls back to formatting each value with the whole format string.
+//
+// ⭐ This handles USING at the HEAD of the statement. The MID-LIST spelling
+// ("Print x; Using fmt$; v") is a different AST shape and arrives at the engine
+// from ProcessPrint - both go through EmitUsingFields, which is the point.
 var
-  i, vi, fi, fLen, W, nVals: Integer;
-  FmtNode: TASTNode;
-  FmtStr, FieldStr: string;
-  FormatVal, ValueVal, FormatReg, ValueReg, FmtReg, TmpReg: TSSAValue;
+  i: Integer;
   EndsWithSeparator: Boolean;
   ValNodes: array of TASTNode;
+  NoneV: TSSAValue;
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount < 2 then Exit;   // need at least a format and one value
+  NoneV := MakeSSAValue(svkNone);
+
+  // Collect the value children (dropping separator nodes); note a trailing separator (suppresses newline).
+  SetLength(ValNodes, 0);
+  EndsWithSeparator := (Node.GetChild(Node.ChildCount - 1).NodeType = antSeparator);
+  for i := 1 to Node.ChildCount - 1 do
+    if Node.GetChild(i).NodeType <> antSeparator then
+    begin
+      SetLength(ValNodes, Length(ValNodes) + 1);
+      ValNodes[High(ValNodes)] := Node.GetChild(i);
+    end;
+
+  EmitUsingFields(Node.GetChild(0), ValNodes);
+
+  if not EndsWithSeparator then
+    EmitInstruction(ssaPrintNewLine, NoneV, NoneV, NoneV, NoneV);
+  EmitInstruction(ssaPrintEnd, NoneV, NoneV, NoneV, NoneV);
+end;
+
+procedure TSSAGenerator.EmitUsingFields(FmtNode: TASTNode; const ValNodes: array of TASTNode);
+{ ⭐⭐⭐ THE ONE field engine for PRINT USING. It exists as its own method because
+  the language has TWO spellings that must mean the same thing:
+
+    Print Using "ab#.#"; 1.5        -> antPrintUsing at the head   (ProcessPrintUsing)
+    Print "p"; Using "ab#.#"; 1.5   -> an antPrintUsing MARKER inside a PRINT
+
+  ⛔ They did NOT mean the same thing until 13 Aug 2026. The second spelling had
+  its own path in ProcessPrint that emitted ssaPrintUsing(WHOLE MASK, one value)
+  per item - the SINGLE-FIELD formatter - so it dropped every literal, re-applied
+  the mask to each value instead of walking it once, and forced values through
+  EnsureFloatRegister, which made a string field print a number:
+
+    Print "p"; Using "## + ##"; 1; 2   fbc "p 1 +  2"   we "p   1+   2+"
+    Print "p"; Using "&!"; "hi"; "xy"  fbc "phix"       we "p%2"
+    Print "p"; Using "#.# "; 1.5; 2.5  fbc "p1.5 2.5 "  we "p1.52.5"
+
+  ⚠️ The defect hid for a long time because it needs a print item BEFORE the
+  USING to appear at all - and it was found only because a comparison harness
+  written in exactly that shape produced four tables of phantom "divergences".
+  ⇒ Two spellings of one feature want one implementation, not two. }
+var
+  i, vi, fi, fLen, W, nVals, PassStart: Integer;
+  FmtStr, FieldStr: string;
+  FormatVal, ValueVal, FormatReg, ValueReg, FmtReg, TmpReg: TSSAValue;
   NoneV: TSSAValue;
 
   function IsNumFieldStart(P: Integer): Boolean;
@@ -15198,8 +15252,38 @@ var
     Result := False;
     if P > fLen then Exit;
     if FmtStr[P] = '#' then Exit(True);
-    // A leading $, +, or - opens a numeric field only if a '#' follows in the same run.
-    if FmtStr[P] in ['$', '+', '-'] then
+    { ⛔ MODERN: a '-' does NOT open a field, it is ORDINARY TEXT. In FreeBASIC
+      '-' is a directive only in TRAILING position; leading, it prints as itself,
+      exactly like any other non-marker character. Measured against fbc 1.10.1:
+        Using "-##.#";  1.5  -> "- 1.5"     (the '-' is text, the field is "##.#")
+        Using "-##.#"; -1.5  -> "--1.5"
+        Using "x#.#";  -1.5  -> "x%-1.5"    <- the case that settles it: 'x' is
+                                               text and prints, and so does '-'.
+      ⛔ It cost a wrong fix to learn: on 12 Aug the leading '-' was made a SIGN
+      POSITION (a 'LeadMinus' flag in FormatUsingFB) because n-body printed
+      "%-0.169075164" where CLBG expects "-0.169075164". That bent the ENGINE to
+      fit ONE program: its mask "-#.#########" was simply the wrong mask, and
+      "##.#########" - which needs nothing from the engine - prints CLBG's line
+      on fbc and on us alike. n-body was corrected instead.
+      ⚠️ CLASSIC is deliberately left alone: Commodore v7 documents '+' and '-'
+      too, but there is no C128 here to say whether a leading '-' is text there,
+      and inventing an answer is worse than recording the gap. }
+    if FModernMode and (FmtStr[P] = '-') then Exit(False);
+    { ⭐ A '.' OPENS A FIELD TOO, when a '#' follows in the same run: ".##" is ONE
+      numeric field with no integer positions, not the character '.' followed by
+      a field "##". fbc 1.10.1 prints ".50" for Using ".##"; 0.5 - we printed
+      ". 1", having formatted 0.5 into "##" and rounded it to 1. Same cause as
+      Using "_#.#"; 1.5, where the escape left a '.' at the head of the rest.
+      ⚠️ The "a '#' must follow" test is what keeps ordinary prose safe: the '.'
+      in "end." or in "3.5 = " opens nothing, because the run stops at the first
+      character outside the marker set without ever seeing a '#'.
+      ⚠️ Not gated on MODERN, unlike the '-' above: this is FIELD SPLITTING, not
+      a dialect's formatting rule, and a mask ".##" is one field wherever PRINT
+      USING is documented. There is still no C128 here to confirm it for CLASSIC,
+      but the behaviour being replaced there - ". 1" for 0.5 - is not a reading
+      of any manual, it is the splitter losing the point. }
+    // A leading $, +, -, or . opens a numeric field only if a '#' follows in the same run.
+    if FmtStr[P] in ['$', '+', '-', '.'] then
     begin
       sawHash := False; k := P;
       while (k <= fLen) and (FmtStr[k] in ['#', '.', '$', '+', '-', '^', ',']) do
@@ -15273,21 +15357,10 @@ var
 
 begin
   if FCurrentBlock = nil then Exit;
-  if Node.ChildCount < 2 then Exit;   // need at least a format and one value
   NoneV := MakeSSAValue(svkNone);
-
-  // Collect the value children (dropping separator nodes); note a trailing separator (suppresses newline).
-  SetLength(ValNodes, 0);
-  EndsWithSeparator := (Node.GetChild(Node.ChildCount - 1).NodeType = antSeparator);
-  for i := 1 to Node.ChildCount - 1 do
-    if Node.GetChild(i).NodeType <> antSeparator then
-    begin
-      SetLength(ValNodes, Length(ValNodes) + 1);
-      ValNodes[High(ValNodes)] := Node.GetChild(i);
-    end;
   nVals := Length(ValNodes);
+  if nVals = 0 then Exit;
 
-  FmtNode := Node.GetChild(0);
   if (FmtNode.NodeType = antLiteral) and VarIsStr(FmtNode.Value) then
   begin
     // Compile-time field engine. FreeBASIC RECYCLES the format when more values than fields are given
@@ -15298,7 +15371,12 @@ begin
     fLen := Length(FmtStr);
     vi := 0;
     repeat
-    W := vi;   // remember the value index at the start of this pass (reusing W as a scratch counter)
+    { ⛔ PassStart is its OWN variable. It used to be W, "reusing W as a scratch
+      counter" - and W is ALSO the width of a "\..\" string field, assigned inside
+      the walk. A mask containing one therefore clobbered the pass marker and the
+      termination test compared vi against a field width. Latent, because it takes
+      a "\..\" plus a recycling pass to show. }
+    PassStart := vi;
     fi := 1;
     while fi <= fLen do
     begin
@@ -15374,7 +15452,27 @@ begin
         fi := i;
       end;
     end;
-    until (vi >= nVals) or (vi = W);   // all values consumed, or this pass consumed none (no field)
+    { ⭐ A MASK WITH NO VALUE-CONSUMING FIELD STILL CONSUMES ONE VALUE PER PASS.
+      Measured on fbc 1.10.1 - the mask is text, and the value is then formatted
+      through a field of ZERO integer positions, which always overflows:
+        Using "end."; 1      -> "end.%1"
+        Using "end."; 1; 2   -> "end.%1end.%2"     the mask RECYCLES
+        Using "abc"; -1.5    -> "abc%-2"           rounded, like any empty field
+        Using "abc"; "hi"    -> "abc"              a STRING is consumed in silence
+      ⛔ We printed the text once and dropped every value, then stopped. Without
+      this arm the pass loop had to break on "consumed none" to avoid spinning
+      forever; now the arm itself guarantees progress. }
+    if vi = PassStart then
+    begin
+      if vi >= nVals then Break;
+      if InferExprBank(ValNodes[vi]) <> srtString then
+      begin
+        ProcessExpression(ValNodes[vi], ValueVal);
+        EmitNumField('', EnsureFloatRegister(ValueVal), False);
+      end;
+      Inc(vi);
+    end;
+    until vi >= nVals;
   end
   else
   begin
@@ -15402,10 +15500,6 @@ begin
     FormatReg := EnsureStringRegister(FormatVal);
     EmitInstruction(ssaPrintUsingRun, NoneV, FormatReg, NoneV, NoneV);
   end;
-
-  if not EndsWithSeparator then
-    EmitInstruction(ssaPrintNewLine, NoneV, NoneV, NoneV, NoneV);
-  EmitInstruction(ssaPrintEnd, NoneV, NoneV, NoneV, NoneV);
 end;
 
 procedure TSSAGenerator.ProcessPudef(Node: TASTNode);

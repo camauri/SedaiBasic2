@@ -2209,6 +2209,21 @@ begin
             B.LocalGet(11); B.I32Const(2); B.Op(wopI32Or); B.LocalSet(11);
           B.EndOp;
         B.EndOp;
+        { ⛔ PARKED BACKEND, AND THE RULE HERE IS INCOMPLETE - read this before
+          porting anything. A '-' at i > 0 sets the trailing-sign flag, which is
+          RIGHT. A '-' at i = 0 sets nothing, so it simply VANISHES, which is
+          wrong: in FreeBASIC a leading '-' is ORDINARY TEXT and must print.
+          ⛔⛔ Do NOT port the version this file's note used to point at. On 12 Aug
+          2026 the native side made a leading '-' a SIGN POSITION and that was
+          REFUTED by fbc 1.10.1 the next day:
+            Using "-##.#";  1.5 -> "- 1.5"    the '-' is text
+            Using "x#.#";  -1.5 -> "x%-1.5"   'x' is text too - '-' is not special
+          The native fix is not a flag at all: IsNumFieldStart refuses to OPEN a
+          field on '-', so the character falls to the literal-text arm of the
+          field splitter. That is the shape to port - and it needs the splitter,
+          which is the real work here, not another bit in local 11.
+          See SedaiSSA.pas EmitUsingFields and job/tests/bas/print_using_lead_sign.bas
+          (44 lines, every one measured against fbc). }
         B.LocalGet(6); B.I32Const(Ord('-')); B.Op(wopI32Eq);
         B.LocalGet(4); B.I32Const(0); B.Op(wopI32GtS); B.Op(wopI32And);
         B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);

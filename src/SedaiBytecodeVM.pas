@@ -1510,7 +1510,14 @@ begin
            else
              FixedDollar := True;
       '+': if i = 1 then LeadSign := True else TrailSign := True;
-      '-': if i > 1 then TrailMinus := True;
+      { ⚠️ A leading '-' never reaches here in MODERN: IsNumFieldStart refuses to
+        open a field on it, so it is emitted as TEXT and the field this function
+        receives begins at the '#'. The unconditional TrailMinus is therefore
+        right - any '-' that gets here is a trailing one.
+        ⛔ It briefly said "if i = 1 then LeadMinus" (a leading SIGN POSITION),
+        which was the wrong reading of fbc: measured, "Using ""-##.#""; 1.5"
+        gives "- 1.5", the '-' printed as text. See IsNumFieldStart. }
+      '-': TrailMinus := True;
       '.': begin
              HasDot := True;
              j := i + 1;
@@ -1646,6 +1653,35 @@ begin
     DecPart := '';
   end;
 
+  { ⭐ THE FIELD'S CAPACITY in integer positions. Computed HERE, above the body,
+    because the zero-drop right below is a decision that needs it. }
+  Width := IntDigits;
+  if FloatDollar then Inc(Width, 2);           // "$$" is TWO field positions
+  { A LEADING '+' owns a position of its own and always prints something there,
+    so it adds one to BOTH sides and never decides an overflow by itself. The
+    sign that DOES compete is the one no position was asked for. }
+  if LeadSign then Inc(Width);
+
+  { ⭐ AN INTEGER PART OF EXACTLY "0" IS DROPPABLE - it yields its position to
+    the sign rather than overflowing the field, and only when it has to.
+    Measured against fbc 1.10.1, and it takes all four rows to pin the rule:
+      "##.#" with -0.5  -> "-0.5"    two positions: sign AND zero fit, zero STAYS
+      "#.#"  with -0.5  -> "-.5"     one position: the zero yields it
+      "#.#"  with -1.5  -> "%-1.5"   the integer part is not "0": nothing to yield
+      ".##"  with  0.5  -> ".50"     zero positions, but no sign wants one either
+    ⛔ We used to print "%-0.5" for the second row - the marker was raised on a
+    capacity the field could have met. It is why "#.#########" on -0.169075164
+    came out "%-0.169075164", which in turn is what made n-body's mask look like
+    an engine defect on 12 Aug (it was the mask; see IsNumFieldStart in
+    SedaiSSA.pas). ⚠️ Keep the ORDER: drop first, THEN measure the overflow. }
+  if IntPart = '0' then
+  begin
+    Sh := 1;
+    if FloatDollar then Inc(Sh);
+    if LeadSign or (Neg and not (TrailSign or TrailMinus)) then Inc(Sh);
+    if Sh > Width then IntPart := '';
+  end;
+
   if HasCommas then
   begin
     Grouped := '';
@@ -1685,16 +1721,29 @@ begin
       "##.#" with  -1.5   -> "-1.5"     1 digit + sign fits exactly
       "$$###.##" with 1234.5  -> fits   4 digits + '$' = 5 positions
       "$$###.##" with -1234.5 -> "%"    the sign makes it 6
-    ⚠️ A TRAILING sign does not compete: it has its own position at the end. }
-  Width := IntDigits;
-  if FloatDollar then Inc(Width, 2);          // "$$" is TWO field positions
-  if LeadSign then Inc(Width);
+    ⚠️ A TRAILING sign does not compete: it has its own position at the end.
+    ⚠️ Width was computed ABOVE, before the droppable zero was resolved. }
   Sh := Length(IntPart);
   if FloatDollar then Inc(Sh);
   if LeadSign or (Neg and not (TrailSign or TrailMinus)) then Inc(Sh);
   Overflow := Sh > Width;
 
-  if TrailSign then
+  { ⭐ THE FIRST SIGN DIRECTIVE WINS; A LATER ONE IS TEXT. It is the same rule as
+    the leading '-' (see IsNumFieldStart): a sign character is a DIRECTIVE only
+    where a sign is actually placed - everywhere else it prints as itself.
+    Measured on fbc 1.10.1:
+      "+#-" with  0.5 -> "+1-"   the '+' signs it, the '-' is the CHARACTER '-'
+      "+#+" with -0.5 -> "-1+"   likewise, and note it is NOT flipped to '-'
+      "#-"  with  0.5 -> "1 "    no leading sign, so the trailing '-' IS the
+      "#-"  with -0.5 -> "1-"    directive: '-' for a negative, a BLANK for a
+                                 positive. That pair is what proves the rule is
+                                 about WHO PLACES THE SIGN, not about position. }
+  if LeadSign then
+  begin
+    if TrailSign then Body := Body + '+'
+    else if TrailMinus then Body := Body + '-';
+  end
+  else if TrailSign then
     if Neg then Body := Body + '-' else Body := Body + '+'
   else if TrailMinus then
     if Neg then Body := Body + '-' else Body := Body + ' ';
@@ -1900,7 +1949,16 @@ var
     Result := False;
     if P > fLen then Exit;
     if FormatStr[P] = '#' then Exit(True);
-    if FormatStr[P] in ['$', '+', '-'] then
+    { ⛔ Must stay identical to the twin in TSSAGenerator.ProcessPrintUsing: a
+      CONSTANT format never reaches this one, so the two engines only agree if
+      kept in step. MODERN: a leading '-' is ORDINARY TEXT, not a field opener -
+      in FreeBASIC '-' is a directive only in TRAILING position. See the long
+      note at the twin for the fbc measurements and for why the opposite fix
+      (a leading sign position) was wrong. }
+    if Assigned(FProgram) and FProgram.ModernMode and (FormatStr[P] = '-') then Exit(False);
+    { A '.' opens a field when a '#' follows in the same run - ".##" is ONE field.
+      See the twin for the fbc measurements. }
+    if FormatStr[P] in ['$', '+', '-', '.'] then
     begin
       sawHash := False; k := P;
       while (k <= fLen) and (FormatStr[k] in ['#', '.', '$', '+', '-', '^', ',']) do
