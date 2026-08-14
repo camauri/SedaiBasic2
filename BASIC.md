@@ -2290,6 +2290,38 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `BITRESET` | ✓ | `x` with bit `b` cleared: `x AND NOT (1 SHL b)`. |
 | `BITSET` | ✓ | `x` with bit `b` set: `x OR (1 SHL b)`. |
 
+#### Processor Counts (SedaiBasic extension)
+
+**No FreeBASIC equivalent** — FreeBASIC has no way to ask how many processors a machine has, so a
+program that sizes a worker pool has to be told from outside. These are **MODERN only**, take no
+argument, and answer for the machine the program is running on.
+
+**They are three different quantities, and one name could not serve.** A machine has one or more
+CPUs; each CPU has many cores; only the cores with SMT/HyperThreading become **two** logical
+processors. On a Core Ultra 9 185H: **1 CPU, 16 cores, 22 logical processors** — the six P-cores
+have SMT, the eight E-cores and two LP-E cores do not.
+
+| Keyword | Status | Description |
+|---|---|---|
+| `PROCESSORCOUNT` | ✓ | **Logical processors** — hardware threads, what the OS schedules onto. This is the number a worker pool wants. |
+| `CORECOUNT` | ✓ | **Physical cores**, across every CPU. Never more than `PROCESSORCOUNT`. |
+| `CPUCOUNT` | ✓ | **Physical CPUs** — sockets, or packages. Never more than `CORECOUNT`; **1** on any ordinary desktop or laptop. |
+
+- All three are **never less than 1**, so `x \ PROCESSORCOUNT` cannot divide by zero.
+- Where the OS will not say, a count falls back to the next larger one it does know rather than
+  inventing a number: reporting too many workers is a milder error than reporting one.
+- The counts are asked of the OS once and cached; they cannot change while a program runs.
+- ⚠️ Three names, **one opcode** (the quantity travels in the immediate) — a build cannot cover one
+  count and forget another. Names rather than a parameter because the dialect has no predefined
+  constants, and `PROCESSORCOUNT(1)` would say nothing to a reader.
+- ⛔ Not available under the **WebAssembly** target: a module has no way to ask, and the backend
+  refuses the program rather than inventing a number.
+
+```basic
+Dim As Integer nw = ProcessorCount                  '' one worker per hardware thread
+If Len(Command(2)) > 0 Then nw = CInt(Command(2))   '' unless told otherwise
+```
+
 #### Bit Counting and Rotation (SedaiBasic extension)
 
 **No FreeBASIC equivalent** — FreeBASIC has no operator or function for any of these. They are
@@ -2399,7 +2431,7 @@ End Function
 |---|---|---|
 | `PRINT` | ✓ |  |
 | `? (Shortcut for 'PRINT')` | ✓ | `?` is a shorthand for `PRINT`. |
-| `PRINT USING` | ✓ |  |
+| `PRINT USING` | ✓ | Sign positions: `+` first or last prints `+`/`-`; `-` **first or last** prints `-` for a negative and a **blank** for a positive. A leading sign owns its own field position, so it never causes the `%` overflow marker by itself; a sign with no position asked for competes with the digits (`"#.###"` on `-1.5` gives `%-1.500`). **Was wrong until 12 Aug 2026**: a `-` in first position was silently dropped, so every negative overflowed its field. |
 | `? USING (Shortcut for 'PRINT USING')` | ✓ | `? USING mask; expr` is a shorthand for `PRINT USING`. |
 | `WRITE` | ✓ | `WRITE #n, ...` quoted-CSV file output and console `WRITE v1, v2` (strings double-quoted, comma-separated). |
 | `SPC` | ✓ | Skips a number of spaces when writing text. |
