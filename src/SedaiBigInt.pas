@@ -99,6 +99,20 @@ procedure BigMul(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer;
 procedure BigAdd(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 { dst = a - b, solo magnitudini: il chiamante garantisce a >= b. }
 procedure BigSub(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
+{ q = a div b, r = a mod b, solo MAGNITUDINI. b <> 0 e' responsabilita' del chiamante.
+  ⭐ E' l'algoritmo D di Knuth (TAOCP 4.3.1): normalizzazione, stima del quoziente da
+  DUE limb del dividendo su UNO del divisore, correzione della stima, moltiplica-e-
+  sottrai, e il raro "somma indietro" quando la stima era alta di uno.
+  ⚠️ q e r NON possono essere a o b: si costruiscono a parte e si consegnano. }
+{ ⚠️ wu e wv sono SPAZIO DI LAVORO del chiamante, non risultati: la normalizzazione di
+  Knuth costruisce un dividendo e un divisore spostati, e allocarli a ogni chiamata
+  costa piu' dell'algoritmo su numeri di migliaia di limb (misurato: la divisione
+  risultava PIU' LENTA del ciclo di prove che doveva sostituire). Chi chiama li tiene
+  e li ripassa; crescono una volta e poi non piu'. }
+procedure BigDivMod(var q: TLimbs; var qn: Integer; var r: TLimbs; var rn: Integer;
+                    const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer;
+                    var wu, wv: TLimbs);
+
 function BigCmp(const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer): Integer;
 
 implementation
@@ -155,6 +169,32 @@ end;
 {$ENDIF}
 
 function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
+{$IFDEF CPUX86_64}
+var
+  q, r: QWord;
+begin
+  { ⭐ Una sola DIVQ. Come in MulHi64, l'assembly riferisce i nomi e lascia a FPC il
+    compito di sapere dove stanno: nessuna convenzione di chiamata da indovinare, e il
+    gate {$IFDEF CPUX86_64} e' quello giusto perche' l'unica cosa che presuppone e'
+    l'esistenza dell'istruzione.
+    ⛔ Il quoziente e il resto passano da VARIABILI LOCALI, non dal parametro `out`: per
+    un parametro per riferimento il nome in assembly designa il PUNTATORE, non il posto
+    dove scrivere, e sbagliarlo qui vorrebbe dire scrivere sopra un indirizzo.
+    ⛔ DIVQ solleva #DE se il quoziente non sta in 64 bit: la precondizione hi < d NON e'
+    una cortesia, e' cio' che tiene in piedi questa funzione. L'algoritmo D la garantisce.
+    📊 Serve al ciclo interno della divisione lunga: la via bit a bit qui sotto fa 64 giri
+    per limb ed e' quella che rendeva impraticabile una divisione vera. }
+  asm
+    movq hi, %rdx
+    movq lo, %rax
+    divq d
+    movq %rax, q
+    movq %rdx, r
+  end;
+  rem := r;
+  Result := q;
+end;
+{$ELSE}
 var
   i: Integer;
   q: QWord;
@@ -180,6 +220,7 @@ begin
   end;
   Result := q;
 end;
+{$ENDIF}
 
 { Il refcount di un array dinamico sta due PtrInt prima dei dati (refcount,
   poi high). ⚠️ E' un dettaglio implementativo di FPC e sta QUI, in una
@@ -436,6 +477,168 @@ begin
   dn := an;
   while (dn > 1) and (t[dn - 1] = 0) do Dec(dn);
   dst := t;
+end;
+
+function LimbClz(x: QWord): Integer;
+begin
+  Result := 0;
+  if x = 0 then Exit(64);
+  while (x and QWord($8000000000000000)) = 0 do begin x := x shl 1; Inc(Result); end;
+end;
+
+procedure BigDivMod(var q: TLimbs; var qn: Integer; var r: TLimbs; var rn: Integer;
+                    const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer;
+                    var wu, wv: TLimbs);
+var
+  u, v, qq: TLimbs;
+  s, i, j, m, n: Integer;
+  qhat, rhat, carry, borrow, t, lo, hi, p: QWord;
+  neg: Boolean;
+begin
+  { normalizza le lunghezze in ingresso }
+  while (an > 1) and (a[an - 1] = 0) do Dec(an);
+  while (bn > 1) and (b[bn - 1] = 0) do Dec(bn);
+
+  if (bn = 1) and (b[0] = 0) then begin qn := 1; rn := 1; SetLength(q,1); SetLength(r,1); q[0]:=0; r[0]:=0; Exit; end;
+
+  if (an < bn) or ((an = bn) and (BigCmp(a, an, b, bn) < 0)) then
+  begin
+    { a < b: quoziente 0, resto a }
+    UniqueLimbs(q); if Length(q) < 1 then SetLength(q, 1);
+    q[0] := 0; qn := 1;
+    UniqueLimbs(r); if Length(r) < an then SetLength(r, an);
+    for i := 0 to an - 1 do r[i] := a[i];
+    rn := an;
+    Exit;
+  end;
+
+  if bn = 1 then
+  begin
+    { divisore di un solo limb: una passata con DIVQ, niente algoritmo D }
+    if Length(wu) < an then SetLength(wu, an);
+    rhat := 0;
+    for i := an - 1 downto 0 do
+      wu[i] := DivMod128By64(rhat, a[i], b[0], rhat);
+    qn := an; while (qn > 1) and (wu[qn - 1] = 0) do Dec(qn);
+    UniqueLimbs(q); if Length(q) < qn then SetLength(q, qn);
+    for i := 0 to qn - 1 do q[i] := wu[i];
+    UniqueLimbs(r); if Length(r) < 1 then SetLength(r, 1);
+    r[0] := rhat; rn := 1;
+    Exit;
+  end;
+
+  n := bn; m := an - bn;
+  s := LimbClz(b[n - 1]);
+
+  { v = b << s, nello spazio di lavoro }
+  if Length(wv) < n then SetLength(wv, n);
+  v := wv;
+  if s = 0 then
+    for i := 0 to n - 1 do v[i] := b[i]
+  else
+  begin
+    for i := n - 1 downto 1 do v[i] := (b[i] shl s) or (b[i - 1] shr (64 - s));
+    v[0] := b[0] shl s;
+  end;
+
+  { u = a << s, con un limb in piu' in cima, nello spazio di lavoro }
+  if Length(wu) < an + 1 then SetLength(wu, an + 1);
+  u := wu;
+  if s = 0 then
+  begin
+    for i := 0 to an - 1 do u[i] := a[i];
+    u[an] := 0;
+  end
+  else
+  begin
+    u[an] := a[an - 1] shr (64 - s);
+    for i := an - 1 downto 1 do u[i] := (a[i] shl s) or (a[i - 1] shr (64 - s));
+    u[0] := a[0] shl s;
+  end;
+
+  UniqueLimbs(q); if Length(q) < m + 1 then SetLength(q, m + 1);
+  qq := q;
+  for j := m downto 0 do
+  begin
+    { stima da due limb su uno; u[j+n] < v[n-1] e' l'invariante che regge DIVQ }
+    if u[j + n] >= v[n - 1] then
+    begin
+      qhat := QWord($FFFFFFFFFFFFFFFF);
+      rhat := u[j + n - 1] + v[n - 1];
+      neg := rhat < v[n - 1];      { il riporto dice che rhat e' gia' oltre un limb }
+    end
+    else
+    begin
+      qhat := DivMod128By64(u[j + n], u[j + n - 1], v[n - 1], rhat);
+      neg := False;
+    end;
+    { correzione: finche' qhat*v[n-2] > rhat:u[j+n-2], qhat e' alto }
+    while (not neg) do
+    begin
+      hi := MulHi64(qhat, v[n - 2]);
+      lo := qhat * v[n - 2];
+      if (hi > rhat) or ((hi = rhat) and (lo > u[j + n - 2])) then
+      begin
+        Dec(qhat);
+        rhat := rhat + v[n - 1];
+        if rhat < v[n - 1] then neg := True;   { rhat e' uscito dal limb: basta correggere }
+      end
+      else Break;
+    end;
+
+    { moltiplica e sottrai: u[j..j+n] -= qhat * v }
+    borrow := 0; carry := 0;
+    for i := 0 to n - 1 do
+    begin
+      p := qhat * v[i];
+      hi := MulHi64(qhat, v[i]);
+      t := p + carry; if t < p then Inc(hi);
+      carry := hi;
+      if u[j + i] < t then
+      begin
+        u[j + i] := u[j + i] - t - borrow;
+        borrow := 1;
+      end
+      else
+      begin
+        lo := u[j + i] - t;
+        if lo < borrow then begin u[j + i] := lo - borrow; borrow := 1; end
+        else begin u[j + i] := lo - borrow; borrow := 0; end;
+      end;
+    end;
+    t := carry + borrow;
+    if u[j + n] < t then begin u[j + n] := u[j + n] - t; borrow := 1; end
+    else begin u[j + n] := u[j + n] - t; borrow := 0; end;
+
+    if borrow <> 0 then
+    begin
+      { la stima era alta di uno: si somma indietro il divisore. Raro - circa due volte
+        su 2^64 - ma senza questo ramo la divisione sbaglia proprio dove nessuno guarda. }
+      Dec(qhat);
+      carry := 0;
+      for i := 0 to n - 1 do
+      begin
+        t := u[j + i] + v[i] + carry;
+        if (t < u[j + i]) or ((carry = 1) and (t = u[j + i])) then carry := 1 else carry := 0;
+        u[j + i] := t;
+      end;
+      u[j + n] := u[j + n] + carry;
+    end;
+    qq[j] := qhat;
+  end;
+
+  qn := m + 1; while (qn > 1) and (qq[qn - 1] = 0) do Dec(qn);
+
+  { il resto e' u[0..n-1] >> s }
+  UniqueLimbs(r); if Length(r) < n then SetLength(r, n);
+  if s = 0 then
+    for i := 0 to n - 1 do r[i] := u[i]
+  else
+  begin
+    for i := 0 to n - 2 do r[i] := (u[i] shr s) or (u[i + 1] shl (64 - s));
+    r[n - 1] := u[n - 1] shr s;
+  end;
+  rn := n; while (rn > 1) and (r[rn - 1] = 0) do Dec(rn);
 end;
 
 function BigCmp(const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer): Integer;

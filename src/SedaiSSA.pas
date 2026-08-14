@@ -21869,11 +21869,26 @@ begin
     the hard piece of every bignum and pidigits does not need it (divDigit tries the
     ten quotients with comparisons). Saying so is the whole point: a silent wrong
     answer would be found by a user, a refusal is found by the compiler. }
+  { ⭐ LA DIVISIONE C'E'. Era dichiarata fuori dalla v1 e RIFIUTATA; ora e' l'algoritmo D
+    di Knuth, verificato su 30 000 divisioni casuali fino a 20 limb, divisori quasi
+    massimi inclusi (e' li' che la stima del quoziente sbaglia di uno).
+    ⚠️ Le tre grafie danno tutte la divisione INTERA: un BigInt con la virgola non
+    esiste, quindi "/" non puo' promettere altro - e prometterlo in silenzio sarebbe
+    peggio del rifiuto di prima. }
   if (Op = '/') or (Op = '\') or (Op = 'MOD') then
   begin
-    raise Exception.CreateFmt('BigInt does not support "%s": division is not implemented ' +
-      '(declared out of scope for this stage). Use comparisons and subtraction, or an ' +
-      'integer type.', [Op]);
+    L := BigOperandHandle(Node.GetChild(0));
+    R := BigOperandHandle(Node.GetChild(1));
+    { ⛔ ONORARE DestReg. Il chiamante che lo passa - un'assegnazione - considera il
+      valore GIA' scritto li' e non copia nulla dopo: ignorarlo lasciava la variabile
+      col suo valore precedente, in silenzio. Successe subito, e la batteria di 240
+      divisioni non lo vide perche' misurava ESPRESSIONI (Print x \ y), dove la
+      destinazione e' un temporaneo e quindi coincide per caso. }
+    if DestReg.Kind = svkRegister then Res := DestReg
+    else Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    if Op = 'MOD' then EmitInstruction(ssaBigMod, Res, L, R, MakeSSAValue(svkNone))
+    else EmitInstruction(ssaBigDiv, Res, L, R, MakeSSAValue(svkNone));
+    Exit(True);
   end;
 
   { ⭐ BigInt * SMALL INTEGER has its own opcode, and it is not a micro-optimisation:
@@ -21965,7 +21980,10 @@ begin
       ordinary integer truth value. }
     Result := (UpperCase(VarToStr(Node.Token.Value)) = '+') or
               (UpperCase(VarToStr(Node.Token.Value)) = '-') or
-              (UpperCase(VarToStr(Node.Token.Value)) = '*');
+              (UpperCase(VarToStr(Node.Token.Value)) = '*') or
+              (UpperCase(VarToStr(Node.Token.Value)) = '/') or
+              (UpperCase(VarToStr(Node.Token.Value)) = '\') or
+              (UpperCase(VarToStr(Node.Token.Value)) = 'MOD');
     if Result then
       Result := IsBigIntExpr(Node.GetChild(0)) or IsBigIntExpr(Node.GetChild(1));
   end;

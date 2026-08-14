@@ -1399,6 +1399,12 @@ end;
 procedure TBytecodeVM.InitializeRegisters;
 var i: Integer;
 begin
+  { ⛔ -1, NON zero. I campi di un oggetto nascono azzerati e 0 e' un handle VALIDO:
+    lasciato cosi', il primo uso dello scratch scriverebbe sul BigInt di qualcun altro.
+    Un sentinella deve stare FUORI dal dominio, non essere il suo minimo. }
+  FCtx.BigScratch := -1;
+  FCtx.BigCount := 0;
+
   // Initialize with minimum register slots
   FCtx.IntRegCount := MIN_REGISTER_SLOTS;
   FCtx.FloatRegCount := MIN_REGISTER_SLOTS;
@@ -6470,7 +6476,7 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
-        bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall:
+        bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall, bcBigDiv, bcBigMod:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -13694,6 +13700,8 @@ var
   v: Int64;
   u: QWord;
   NegB, NegA: Boolean;
+  QTmpLimbs: TLimbs;
+  QTmpN: Integer;
 begin
   case Instr.OpCode of
     bcBigNew:
@@ -13793,6 +13801,47 @@ begin
                       Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N, u);
         Ctx.BigVals[H].Neg := NegA;
         Ctx.BigVals[H].Neg := (Ctx.BigVals[H].Neg <> NegB) and
+                              not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigDiv, bcBigMod:
+      begin
+        H := BigDestOf(Ctx, Instr.Dest);
+        A := Integer(Ctx.IntRegs[Instr.Src1]);
+        B := Integer(Ctx.IntRegs[Instr.Src2]);
+        if (A < 0) or (A >= Ctx.BigCount) or (B < 0) or (B >= Ctx.BigCount) then Exit;
+        if (Ctx.BigVals[B].N = 1) and (Ctx.BigVals[B].Limbs[0] = 0) then
+          raise EDivByZero.Create('BigInt division by zero');
+        { Il quoziente e il resto escono INSIEME dall'algoritmo: si calcolano entrambi e
+          si tiene quello chiesto. Servono due destinazioni distinte da H, perche' H puo'
+          coincidere con A o con B. }
+        if (Ctx.BigScratch < 0) or (Ctx.BigScratch >= Ctx.BigCount) then
+        begin
+          Ctx.BigScratch := BigAlloc(Ctx);
+          Ctx.BigVals[Ctx.BigScratch].Owner := -2;
+        end;
+        S := Ctx.BigScratch;
+        BigDivMod(Ctx.BigVals[S].Limbs, Ctx.BigVals[S].N, QTmpLimbs, QTmpN,
+                  Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N,
+                  Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N,
+                  Ctx.BigDivU, Ctx.BigDivV);
+        if Instr.OpCode = bcBigDiv then
+        begin
+          { ⚠️ TRONCATO VERSO ZERO, come la divisione intera del linguaggio: il segno e'
+            lo xor dei segni e la magnitudine non si corregge. }
+          NegA := Ctx.BigVals[A].Neg <> Ctx.BigVals[B].Neg;
+          Ctx.BigVals[H].Limbs := Ctx.BigVals[S].Limbs;
+          Ctx.BigVals[H].N := Ctx.BigVals[S].N;
+        end
+        else
+        begin
+          { ⚠️ Il resto prende il segno del DIVIDENDO, che e' la convenzione di Mod qui. }
+          NegA := Ctx.BigVals[A].Neg;
+          Ctx.BigVals[H].Limbs := QTmpLimbs;
+          Ctx.BigVals[H].N := QTmpN;
+        end;
+        Ctx.BigVals[H].Neg := NegA and
                               not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
         Ctx.IntRegs[Instr.Dest] := H;
       end;

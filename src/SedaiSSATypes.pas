@@ -580,6 +580,10 @@ type
     // single term, and routing it through the general product meant converting the
     // integer to a BigInt and allocating a full product vector for an O(n) job.
     ssaBigMulSmall,
+    // Divisione lunga (Knuth D). Due opcode e non uno: il quoziente e il resto sono
+    // due domande diverse, e un solo Dest non puo' rispondere a entrambe.
+    ssaBigDiv,         // Dest := Src1 \\ Src2 (quoziente, troncato verso zero)
+    ssaBigMod,         // Dest := Src1 Mod Src2 (resto, col segno del dividendo)
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 
