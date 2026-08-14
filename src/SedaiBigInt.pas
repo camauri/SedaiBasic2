@@ -539,9 +539,174 @@ begin
   end;
 end;
 
+{ ⭐⭐⭐ KARATSUBA. Il prodotto scolastico e' O(n^2): nessuna qualita' di assembly
+  recupera un ordine di complessita', e sopra qualche decina di limb e' li' che le
+  librerie serie guadagnano. Spezzando a = a1*B^m + a0 e b = b1*B^m + b0 servono TRE
+  prodotti di meta' taglia invece di quattro:
+      z0 = a0*b0     z2 = a1*b1     z1 = (a0+a1)*(b0+b1) - z0 - z2
+  e il risultato e' z2*B^2m + z1*B^m + z0. Da O(n^2) a O(n^1.585).
+  ⛔ LA SOGLIA NON E' UN DETTAGLIO: sotto, le tre chiamate e le somme costano piu' dei
+  quattro prodotti che evitano. Il valore qui e' MISURATO su questa macchina.
+  ⚠️ Lo spazio di lavoro e' UNO, passato giu' per la ricorsione: allocare a ogni livello
+  rifarebbe l'errore che questo cantiere ha gia' pagato tre volte. }
+const
+  KARATSUBA_MIN = 24;
+
+procedure PropAdd(p: PQWord; c: QWord);
+var t: QWord;
+begin
+  while c <> 0 do
+  begin
+    t := p^ + c;
+    if t < c then c := 1 else c := 0;
+    p^ := t; Inc(p);
+  end;
+end;
+
+procedure PropSub(p: PQWord; c: QWord);
+var t: QWord; old: QWord;
+begin
+  while c <> 0 do
+  begin
+    old := p^;
+    t := old - c;
+    if old < c then c := 1 else c := 0;
+    p^ := t; Inc(p);
+  end;
+end;
+
+{ d[0..an+bn-1] = a*b, schoolbook, con l'addmul in assembly come ciclo interno. }
+procedure MulSchoolbook(d, a, b: PQWord; an, bn: PtrInt);
+var
+  i: PtrInt;
+  carry: QWord;
+begin
+  for i := 0 to an + bn - 1 do d[i] := 0;
+  for i := 0 to an - 1 do
+  begin
+    if a[i] = 0 then Continue;
+    {$IFDEF CPUX86_64}
+    carry := AddMulLimbRun(@d[i], b, bn, a[i]);
+    {$ELSE}
+    carry := AddMulSlow(@d[i], b, bn, a[i]);
+    {$ENDIF}
+    PropAdd(@d[i + bn], carry);
+  end;
+end;
+
+{$IFNDEF CPUX86_64}
+function AddMulSlow(d, a: PQWord; n: PtrInt; k: QWord): QWord;
+var i: PtrInt; lo, hi, t: QWord;
+begin
+  Result := 0;
+  for i := 0 to n - 1 do
+  begin
+    lo := a[i] * k; hi := MulHi64Portable(a[i], k);
+    t := lo + Result; if t < lo then Inc(hi);
+    d[i] := d[i] + t; if d[i] < t then Inc(hi);
+    Result := hi;
+  end;
+end;
+{$ENDIF}
+
+{ d[0..2n-1] = a[0..n-1] * b[0..n-1]. ws: spazio di lavoro di almeno 8n+64 limb. }
+procedure MulRec(d, a, b, ws: PQWord; n: PtrInt);
+var
+  m, h, i: PtrInt;
+  t0, t1, z1: PQWord;
+  c: QWord;
+begin
+  if n < KARATSUBA_MIN then
+  begin
+    MulSchoolbook(d, a, b, n, n);
+    Exit;
+  end;
+  m := n div 2;          { parte bassa }
+  h := n - m;            { parte alta, h >= m }
+
+  MulRec(d, a, b, ws, m);                        { z0 = a0*b0  -> d[0 .. 2m-1] }
+  MulRec(@d[2 * m], @a[m], @b[m], ws, h);        { z2 = a1*b1  -> d[2m .. 2m+2h-1] }
+
+  { t0 = a0 + a1 e t1 = b0 + b1, h+1 limb ciascuno }
+  t0 := ws;
+  t1 := @ws[h + 1];
+  z1 := @ws[2 * (h + 1)];
+  for i := 0 to h - 1 do t0[i] := a[m + i];
+  t0[h] := 0;
+  {$IFDEF CPUX86_64}
+  c := AddLimbRun(t0, t0, a, m);
+  {$ELSE}
+  c := 0;
+  for i := 0 to m - 1 do
+  begin
+    t0[i] := t0[i] + c; if t0[i] < c then c := 1 else c := 0;
+    t0[i] := t0[i] + a[i]; if t0[i] < a[i] then c := 1;
+  end;
+  {$ENDIF}
+  PropAdd(@t0[m], c);
+
+  for i := 0 to h - 1 do t1[i] := b[m + i];
+  t1[h] := 0;
+  {$IFDEF CPUX86_64}
+  c := AddLimbRun(t1, t1, b, m);
+  {$ELSE}
+  c := 0;
+  for i := 0 to m - 1 do
+  begin
+    t1[i] := t1[i] + c; if t1[i] < c then c := 1 else c := 0;
+    t1[i] := t1[i] + b[i]; if t1[i] < b[i] then c := 1;
+  end;
+  {$ENDIF}
+  PropAdd(@t1[m], c);
+
+  { z1 = t0 * t1, 2(h+1) limb, con spazio di lavoro OLTRE quello gia' occupato }
+  MulRec(z1, t0, t1, @ws[4 * (h + 1)], h + 1);
+
+  { z1 -= z0 (2m limb) e z1 -= z2 (2h limb) }
+  {$IFDEF CPUX86_64}
+  c := SubLimbRun(z1, z1, d, 2 * m);
+  {$ELSE}
+  c := 0;
+  for i := 0 to 2 * m - 1 do
+  begin
+    if z1[i] < d[i] then begin z1[i] := z1[i] - d[i] - c; c := 1; end
+    else begin if z1[i] - d[i] < c then begin z1[i] := z1[i] - d[i] - c; c := 1; end
+               else begin z1[i] := z1[i] - d[i] - c; c := 0; end; end;
+  end;
+  {$ENDIF}
+  PropSub(@z1[2 * m], c);
+  {$IFDEF CPUX86_64}
+  c := SubLimbRun(z1, z1, @d[2 * m], 2 * h);
+  {$ELSE}
+  c := 0;
+  for i := 0 to 2 * h - 1 do
+  begin
+    if z1[i] < d[2*m + i] then begin z1[i] := z1[i] - d[2*m + i] - c; c := 1; end
+    else begin if z1[i] - d[2*m + i] < c then begin z1[i] := z1[i] - d[2*m + i] - c; c := 1; end
+               else begin z1[i] := z1[i] - d[2*m + i] - c; c := 0; end; end;
+  end;
+  {$ENDIF}
+  PropSub(@z1[2 * h], c);
+
+  { d[m ..] += z1, che occupa al piu' 2h+2 limb }
+  {$IFDEF CPUX86_64}
+  c := AddLimbRun(@d[m], @d[m], z1, 2 * h + 2);
+  {$ELSE}
+  c := 0;
+  for i := 0 to 2 * h + 1 do
+  begin
+    d[m + i] := d[m + i] + c; if d[m + i] < c then c := 1 else c := 0;
+    d[m + i] := d[m + i] + z1[i]; if d[m + i] < z1[i] then c := 1;
+  end;
+  {$ENDIF}
+  PropAdd(@d[m + 2 * h + 2], c);
+end;
+
 procedure BigMul(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 var
   t: TLimbs;
+  ka, kb, kws: TLimbs;
+  kn: Integer;
   i, j, k: Integer;
   lo, hi, s, carry: QWord;
 begin
@@ -552,6 +717,29 @@ begin
     dst[0] := 0; dn := 1;
     Exit;
   end;
+  {$IFDEF CPUX86_64}
+  { ⭐ Sopra la soglia, e con entrambi i fattori abbastanza grandi, si passa a Karatsuba.
+    I due fattori vengono portati alla STESSA lunghezza con zeri in testa: la ricorsione
+    e' scritta per operandi di pari taglia, ed e' cio' che tiene semplice - e quindi
+    verificabile - la contabilita' degli indici. }
+  if (an >= KARATSUBA_MIN) and (bn >= KARATSUBA_MIN) then
+  begin
+    kn := an; if bn > kn then kn := bn;
+    SetLength(ka, kn); SetLength(kb, kn);
+    for i := 0 to kn - 1 do
+    begin
+      if i < an then ka[i] := a[i] else ka[i] := 0;
+      if i < bn then kb[i] := b[i] else kb[i] := 0;
+    end;
+    SetLength(t, 2 * kn);
+    SetLength(kws, 8 * kn + 128);
+    MulRec(@t[0], @ka[0], @kb[0], @kws[0], kn);
+    dn := 2 * kn;
+    while (dn > 1) and (t[dn - 1] = 0) do Dec(dn);
+    dst := t;
+    Exit;
+  end;
+  {$ENDIF}
   SetLength(t, an + bn);                 { azzerato da SetLength su un array nuovo }
   for i := 0 to an - 1 do
   begin
