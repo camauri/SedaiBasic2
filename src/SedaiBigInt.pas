@@ -34,6 +34,18 @@ unit SedaiBigInt;
 
 {$mode objfpc}{$H+}{$asmmode att}
 
+{ ⛔⛔ L'AVVOLGIMENTO E' L'ALGORITMO, non un incidente. Il riporto di
+  un'addizione fra limb si rileva PROPRIO dal trabocco (`s := a + b;
+  if s < b then riporto`), e la parte bassa di un prodotto e' il
+  risultato troncato a 64 bit. Con {$Q+} - che la build di debug
+  attiva - ognuna di quelle operazioni solleva EIntOverflow, e il
+  programma muore su un'aritmetica CORRETTA.
+  Trovato il 14 ago 2026: in rilascio andava, in debug no, e il
+  sintomo arrivava come un errore alla riga BASIC sbagliata.
+  ⚠️ Vale per l'intera unita': ogni funzione qui dentro lavora su
+  magnitudini senza segno e conta sul modulo 2^64. }
+{$Q-}{$R-}
+
 interface
 
 type
@@ -68,6 +80,11 @@ procedure BigSetSmall(var a: TLimbs; var n: Integer; v: QWord);
 procedure BigCopy(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer);
 { a *= k, con k che sta in un limb. Riporta il numero di limb usati. }
 procedure BigMulSmall(var a: TLimbs; var n: Integer; k: QWord);
+{ dst = a * b, solo magnitudini. ⚠️ dst PUO' essere a o b senza danno: il prodotto si
+  costruisce in un vettore a parte e viene consegnato alla fine, perche' lo schema
+  scolastico legge a[i] e b[j] mentre scrive in i+j, e con l'aliasing leggerebbe
+  cifre gia' sovrascritte. Costa una allocazione e toglie una classe intera di bachi. }
+procedure BigMul(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 procedure BigAdd(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 { dst = a - b, solo magnitudini: il chiamante garantisce a >= b. }
 procedure BigSub(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
@@ -213,34 +230,88 @@ begin
   while (n > 1) and (a[n - 1] = 0) do Dec(n);
 end;
 
-procedure BigAdd(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
+procedure BigMul(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 var
+  t: TLimbs;
+  i, j, k: Integer;
+  lo, hi, s, carry: QWord;
+begin
+  if (an <= 0) or (bn <= 0) then
+  begin
+    UniqueLimbs(dst);
+    if Length(dst) < 1 then SetLength(dst, 1);
+    dst[0] := 0; dn := 1;
+    Exit;
+  end;
+  SetLength(t, an + bn);                 { azzerato da SetLength su un array nuovo }
+  for i := 0 to an - 1 do
+  begin
+    if a[i] = 0 then Continue;           { una cifra nulla non contribuisce: saltarla }
+    carry := 0;
+    for j := 0 to bn - 1 do
+    begin
+      lo := a[i] * b[j];
+      hi := MulHi64(a[i], b[j]);
+      { Tre addendi sul limb i+j: quello che c'e' gia', la parte bassa del prodotto e
+        il riporto. ⛔ OGNI somma puo' traboccare, e ogni trabocco va nella parte ALTA:
+        dimenticarne uno sbaglia solo su certi valori, che e' il modo peggiore. }
+      s := t[i + j] + lo;  if s < lo then Inc(hi);
+      s := s + carry;      if s < carry then Inc(hi);
+      t[i + j] := s;
+      carry := hi;
+    end;
+    k := i + bn;
+    while carry <> 0 do
+    begin
+      s := t[k] + carry;
+      if s < carry then carry := 1 else carry := 0;
+      t[k] := s;
+      Inc(k);
+    end;
+  end;
+  dn := an + bn;
+  while (dn > 1) and (t[dn - 1] = 0) do Dec(dn);
+  dst := t;                              { consegna: nessun aliasing possibile }
+end;
+
+procedure BigAdd(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
+{ ⛔⛔⛔ COSTRUISCE IN UN VETTORE A PARTE, e non e' pignoleria. `x = x + y` fa arrivare
+  qui dst e a come LO STESSO array: il vecchio codice faceva `SetLength(dst, m+1)`, che
+  RIALLOCA, e il parametro `const a` restava a puntare al blocco appena LIBERATO. Da
+  quel momento si legge memoria morta e si corrompe l'heap - il sintomo era un SIGSEGV
+  dentro SysFreeMem di FPC, molto piu' tardi e su un'operazione innocente, con tutti i
+  valori stampati fino a quel punto CORRETTI.
+  ⚠️ Si vede solo quando la somma FA CRESCERE dst: con un numero che sta gia' nei limb
+  disponibili il SetLength non rialloca e tutto sembra funzionare. 14 ago 2026. }
+var
+  t: TLimbs;
   i, m: Integer;
   s, carry, x: QWord;
 begin
   m := an; if bn > m then m := bn;
-  UniqueLimbs(dst);
-  if Length(dst) < m + 1 then SetLength(dst, m + 1);
+  SetLength(t, m + 1);
   carry := 0;
   for i := 0 to m - 1 do
   begin
     s := carry; carry := 0;
     if i < an then begin x := s + a[i]; if x < s then carry := 1; s := x; end;
     if i < bn then begin x := s + b[i]; if x < s then Inc(carry); s := x; end;
-    dst[i] := s;
+    t[i] := s;
   end;
   dn := m;
-  if carry > 0 then begin dst[dn] := carry; Inc(dn); end;
-  while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
+  if carry > 0 then begin t[dn] := carry; Inc(dn); end;
+  while (dn > 1) and (t[dn - 1] = 0) do Dec(dn);
+  dst := t;
 end;
 
 procedure BigSub(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 var
+  t: TLimbs;
   i: Integer;
   bb, v, borrow: QWord;
 begin
-  UniqueLimbs(dst);
-  if Length(dst) < an then SetLength(dst, an);
+  { Stesso motivo di BigAdd: dst puo' essere a (o b). Vedi la nota li'. }
+  SetLength(t, an);
   borrow := 0;
   for i := 0 to an - 1 do
   begin
@@ -248,22 +319,23 @@ begin
     v := a[i] - bb;
     if a[i] < bb then
     begin
-      dst[i] := v - borrow;
+      t[i] := v - borrow;
       borrow := 1;
     end
     else if v < borrow then
     begin
-      dst[i] := v - borrow;
+      t[i] := v - borrow;
       borrow := 1;
     end
     else
     begin
-      dst[i] := v - borrow;
+      t[i] := v - borrow;
       borrow := 0;
     end;
   end;
   dn := an;
-  while (dn > 1) and (dst[dn - 1] = 0) do Dec(dn);
+  while (dn > 1) and (t[dn - 1] = 0) do Dec(dn);
+  dst := t;
 end;
 
 function BigCmp(const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer): Integer;

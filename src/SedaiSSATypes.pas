@@ -565,6 +565,15 @@ type
     ssaBigFromInt,     // Dest(handle) := Src1 (an Int64 register), sign included
     ssaBigCopy,        // Dest(handle) := Src1(handle), by VALUE (copy-on-write)
     ssaBigToStr,       // Dest(string) := the decimal text of Src1(handle)
+    // Arithmetic. Dest is a handle the VM fills in (allocating one if the register
+    // does not already hold a live one), Src1/Src2 are handles.
+    ssaBigAdd,         // Dest := Src1 + Src2
+    ssaBigSub,         // Dest := Src1 - Src2
+    ssaBigMul,         // Dest := Src1 * Src2
+    // ⭐ ONE comparison opcode, not six. Dest(int) := -1, 0 or 1, and the six BASIC
+    // relations are that against zero - the checklist's own rule: compose in SSA
+    // when the operation composes.
+    ssaBigCmp,         // Dest(int) := sign of (Src1 - Src2)
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

@@ -820,6 +820,8 @@ type
       it is a FUNCTION because the answer will grow (an operator result, a call return)
       and every consumer must keep asking rather than testing for an identifier. }
     function IsBigIntExpr(Node: TASTNode): Boolean;
+    function BigOperandHandle(Node: TASTNode): TSSAValue;
+    function TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessPrintUsing(Node: TASTNode);
     { The field engine behind BOTH spellings of PRINT USING - see its body. }
     procedure EmitUsingFields(FmtNode: TASTNode; const ValNodes: array of TASTNode);
@@ -2839,6 +2841,16 @@ begin
       // The "@2" suffix is what picks the BINARY overload: a type that also declares the unary operator
       // of the same symbol used to share one label with it, and this site then called the unary one with
       // two arguments -- "x - y" silently evaluated to "-x".
+      { ⭐ BigInt arithmetic and comparison. Taken BEFORE the user-operator lookup
+        below, and before the numeric paths further down, because a BigInt operand is
+        an int register holding a HANDLE: the builtin integer path would happily add
+        two handles and produce a plausible small number. Either side being a BigInt
+        is enough - the other is converted. }
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and FModernMode and
+         (IsBigIntExpr(Node.GetChild(0)) or IsBigIntExpr(Node.GetChild(1))) and
+         TryEmitBigIntBinaryOp(Node, Result) then
+        Exit;
+
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
       begin
         OpLhsType := ObjectTypeName(Node.GetChild(0));
@@ -21760,6 +21772,89 @@ begin
   end;
 end;
 
+function TSSAGenerator.BigOperandHandle(Node: TASTNode): TSSAValue;
+// The operand as a BigInt HANDLE. A BigInt yields its own; anything else is converted
+// into a fresh one, which is what makes "b + 1" and "1 + b" both work without a
+// second set of mixed-type opcodes.
+var
+  V: TSSAValue;
+begin
+  ProcessExpression(Node, V);
+  if IsBigIntExpr(Node) then
+    Exit(EnsureIntRegister(V));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBigNew, Result, MakeSSAValue(svkNone),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaBigFromInt, Result, EnsureIntRegister(V),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue): Boolean;
+// "a <op> b" with at least one BigInt operand. Answers False for an operator this type
+// does not carry, so the caller can fall through to its own diagnosis.
+//
+// ⚠️ EVERY arithmetic result gets a FRESH handle (ssaBigNew before the operation) and
+// nothing ever gives one back. That is a DECLARED limitation of this stage, not an
+// oversight: handles are reclaimed by the same frame-mark mechanism the record heap
+// uses, and wiring BigInt into it is its own piece of work. Until then a long loop
+// grows the per-context heap. Said here so the next person does not have to measure
+// it to find out.
+var
+  L, R, CmpReg: TSSAValue;
+  Op: string;
+  ArithOp: TSSAOpCode;
+begin
+  Result := False;
+  Op := UpperCase(VarToStr(Node.Token.Value));
+
+  { ⛔ DIVISION IS OUT OF v1, AND IS REFUSED RATHER THAN APPROXIMATED. Long division is
+    the hard piece of every bignum and pidigits does not need it (divDigit tries the
+    ten quotients with comparisons). Saying so is the whole point: a silent wrong
+    answer would be found by a user, a refusal is found by the compiler. }
+  if (Op = '/') or (Op = '\') or (Op = 'MOD') then
+  begin
+    raise Exception.CreateFmt('BigInt does not support "%s": division is not implemented ' +
+      '(declared out of scope for this stage). Use comparisons and subtraction, or an ' +
+      'integer type.', [Op]);
+  end;
+
+  if (Op = '+') or (Op = '-') or (Op = '*') then
+  begin
+    if Op = '+' then ArithOp := ssaBigAdd
+    else if Op = '-' then ArithOp := ssaBigSub
+    else ArithOp := ssaBigMul;
+    L := BigOperandHandle(Node.GetChild(0));
+    R := BigOperandHandle(Node.GetChild(1));
+    Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBigNew, Res, MakeSSAValue(svkNone),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ArithOp, Res, L, R, MakeSSAValue(svkNone));
+    { ⚠️ The result IS a BigInt, and IsBigIntExpr answers that from the SHAPE of the
+      node - not from a list of registers. A property of the expression cannot go stale
+      the way a side table can. }
+    Exit(True);
+  end;
+
+  { ⭐ SIX relations, ONE opcode: compare, then test the -1/0/1 against zero with the
+    integer comparison that already exists. Six opcodes would have been six chances to
+    disagree with each other. }
+  if (Op = '=') or (Op = '<>') or (Op = '<') or (Op = '<=') or (Op = '>') or (Op = '>=') then
+  begin
+    L := BigOperandHandle(Node.GetChild(0));
+    R := BigOperandHandle(Node.GetChild(1));
+    CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBigCmp, CmpReg, L, R, MakeSSAValue(svkNone));
+    Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    if Op = '='  then EmitInstruction(ssaCmpEqInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
+    else if Op = '<>' then EmitInstruction(ssaCmpNeInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
+    else if Op = '<'  then EmitInstruction(ssaCmpLtInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
+    else if Op = '<=' then EmitInstruction(ssaCmpLeInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
+    else if Op = '>'  then EmitInstruction(ssaCmpGtInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone))
+    else EmitInstruction(ssaCmpGeInt, Res, CmpReg, MakeSSAConstInt(0), MakeSSAValue(svkNone));
+    Exit(True);
+  end;
+end;
+
 function TSSAGenerator.IsBigIntExpr(Node: TASTNode): Boolean;
 // Does this expression yield a BigInt? See the declaration for why it is a function.
 begin
@@ -21768,7 +21863,19 @@ begin
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
     Node := Node.GetChild(0);
   if Node.NodeType = antIdentifier then
-    Result := VarRecordTypeName(VarToStr(Node.Value)) = 'BIGINT';
+    Result := VarRecordTypeName(VarToStr(Node.Value)) = 'BIGINT'
+  else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) then
+  begin
+    { An arithmetic result is a BigInt when an operand is: that is what makes
+      "Print a + b" print digits instead of a handle, and "c = a * b" a value copy
+      instead of a number. A COMPARISON is deliberately not here - it yields an
+      ordinary integer truth value. }
+    Result := (UpperCase(VarToStr(Node.Token.Value)) = '+') or
+              (UpperCase(VarToStr(Node.Token.Value)) = '-') or
+              (UpperCase(VarToStr(Node.Token.Value)) = '*');
+    if Result then
+      Result := IsBigIntExpr(Node.GetChild(0)) or IsBigIntExpr(Node.GetChild(1));
+  end;
 end;
 
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;

@@ -832,6 +832,10 @@ const
   bcBigFromInt      = bcGroupBigInt + 1;   // Dest(handle) := Src1 (Int64 reg)
   bcBigCopy         = bcGroupBigInt + 2;   // Dest(handle) := Src1(handle), BY VALUE
   bcBigToStr        = bcGroupBigInt + 3;   // Dest(string) := decimal text of Src1
+  bcBigAdd          = bcGroupBigInt + 4;   // Dest := Src1 + Src2
+  bcBigSub          = bcGroupBigInt + 5;   // Dest := Src1 - Src2
+  bcBigMul          = bcGroupBigInt + 6;   // Dest := Src1 * Src2
+  bcBigCmp          = bcGroupBigInt + 7;   // Dest(int) := sign of (Src1 - Src2)
 
   // === SUPERINSTRUCTIONS (0xC8xx+) ===
   // Fused compare-and-branch (Int)
@@ -2291,6 +2295,10 @@ begin
         1: Result := 'BigFromInt';
         2: Result := 'BigCopy';
         3: Result := 'BigToStr';
+        4: Result := 'BigAdd';
+        5: Result := 'BigSub';
+        6: Result := 'BigMul';
+        7: Result := 'BigCmp';
       else
         Result := Format('Big_%d', [SubOp]);
       end;

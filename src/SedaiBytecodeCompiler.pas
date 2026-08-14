@@ -511,6 +511,10 @@ begin
     ssaBigFromInt: Result := bcBigFromInt;
     ssaBigCopy:    Result := bcBigCopy;
     ssaBigToStr:   Result := bcBigToStr;
+    ssaBigAdd:     Result := bcBigAdd;
+    ssaBigSub:     Result := bcBigSub;
+    ssaBigMul:     Result := bcBigMul;
+    ssaBigCmp:     Result := bcBigCmp;
     // Memory operations
     ssaPeek: Result := bcPeek;
     ssaPoke: Result := bcPoke;

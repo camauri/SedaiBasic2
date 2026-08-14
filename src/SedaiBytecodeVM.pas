@@ -478,6 +478,9 @@ type
     procedure ExecuteBigIntOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function BigAlloc(Ctx: TExecutionContext): Integer;      // a fresh handle, value 0
     function BigDecimal(Ctx: TExecutionContext; H: Integer): string;
+    function BigDestOf(Ctx: TExecutionContext; Reg: Integer): Integer;
+    function BigSignedCmp(Ctx: TExecutionContext; A, B: Integer): Int64;
+    procedure BigSignedAdd(Ctx: TExecutionContext; H, A, B: Integer; NegB: Boolean);
     procedure ExecuteSpriteOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteFileIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     {$IFDEF WEB_MODE}
@@ -6447,6 +6450,35 @@ begin
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;         // key number
           if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;   // key text (optional)
+        end;
+
+        { ⛔⛔⛔ GROUP 12: BigInt. THIS SCAN IS A FOURTH COUNTER NOBODY CHECKS, and it
+          is not in the opcode checklist. It sizes the register banks from the highest
+          index each bank is ever given, opcode by opcode, with NO default arm: an
+          opcode that is not listed here contributes NOTHING, the bank is created too
+          small, and the interpreter then writes PAST THE END of it.
+          The symptom is as far from the cause as it gets: values all correct, and a
+          SIGSEGV inside FPC's SysFreeMem at teardown, on a program large enough to
+          push a bank past its initial size (~21000 int registers here). Adding one
+          unrelated variable moved the layout and made it vanish. Found 14 Aug 2026.
+          ⚠️ A handle is an INT register; only BigToStr writes a STRING. }
+        bcBigNew:
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+        bcBigFromInt, bcBigCopy:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+        bcBigAdd, bcBigSub, bcBigMul, bcBigCmp:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+        bcBigToStr:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
       end;
     end;
@@ -13528,12 +13560,81 @@ begin
   if Ctx.BigVals[H].Neg then Result := '-' + Result;
 end;
 
+function TBytecodeVM.BigDestOf(Ctx: TExecutionContext; Reg: Integer): Integer;
+// The handle an arithmetic result goes into: the one the register already holds when
+// it is live, a fresh one otherwise. ⚠️ Reusing matters - a loop that accumulates into
+// the same BigInt would otherwise allocate a handle per iteration and never free one.
+begin
+  Result := Integer(Ctx.IntRegs[Reg]);
+  if (Result < 0) or (Result >= Ctx.BigCount) then
+    Result := BigAlloc(Ctx);
+end;
+
+function TBytecodeVM.BigSignedCmp(Ctx: TExecutionContext; A, B: Integer): Int64;
+// -1, 0 or 1. Signs first, magnitudes only when they agree - and for two negatives the
+// magnitude comparison INVERTS, which is the step that is easy to forget.
+begin
+  if Ctx.BigVals[A].Neg <> Ctx.BigVals[B].Neg then
+  begin
+    if Ctx.BigVals[A].Neg then Exit(-1) else Exit(1);
+  end;
+  Result := BigCmp(Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N,
+                   Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N);
+  if Ctx.BigVals[A].Neg then Result := -Result;
+end;
+
+procedure TBytecodeVM.BigSignedAdd(Ctx: TExecutionContext; H, A, B: Integer; NegB: Boolean);
+// H := A + (B with the sign NegB). The core arithmetic is MAGNITUDE-ONLY on purpose, so
+// the sign rules live here, in one place, and BigSub reaches them by flipping NegB.
+//
+//   same signs      -> add the magnitudes, keep the sign
+//   different signs -> subtract the SMALLER magnitude from the LARGER, and take the
+//                      sign of the larger. ⛔ BigSub requires a >= b: handing it the
+//                      operands the other way round underflows silently.
+var
+  c: Integer;
+  ResNeg: Boolean;
+begin
+  UniqueLimbs(Ctx.BigVals[H].Limbs);
+  if Ctx.BigVals[A].Neg = NegB then
+  begin
+    BigAdd(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
+           Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N,
+           Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N);
+    ResNeg := Ctx.BigVals[A].Neg;
+  end
+  else
+  begin
+    c := BigCmp(Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N,
+                Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N);
+    if c >= 0 then
+    begin
+      BigSub(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
+             Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N,
+             Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N);
+      ResNeg := Ctx.BigVals[A].Neg;
+    end
+    else
+    begin
+      BigSub(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
+             Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N,
+             Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N);
+      ResNeg := NegB;
+    end;
+  end;
+  { One representation of zero, so a zero result is never negative - otherwise
+    "0 = -0" would depend on how the zero was reached. }
+  if (Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0) then ResNeg := False;
+  Ctx.BigVals[H].Neg := ResNeg;
+end;
+
 procedure TBytecodeVM.ExecuteBigIntOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 // Group 12. A BigInt value is a HANDLE in the int bank; the limbs live in Ctx.BigVals.
 var
-  H, S: Integer;
+  H, S, A, B: Integer;
   v: Int64;
   u: QWord;
+  NegB: Boolean;
 begin
   case Instr.OpCode of
     bcBigNew:
@@ -13571,6 +13672,48 @@ begin
 
     bcBigToStr:
       Ctx.StringRegs[Instr.Dest] := BigDecimal(Ctx, Integer(Ctx.IntRegs[Instr.Src1]));
+
+    bcBigAdd, bcBigSub:
+      begin
+        H := BigDestOf(Ctx, Instr.Dest);
+        A := Integer(Ctx.IntRegs[Instr.Src1]);
+        B := Integer(Ctx.IntRegs[Instr.Src2]);
+        if (A < 0) or (A >= Ctx.BigCount) or (B < 0) or (B >= Ctx.BigCount) then Exit;
+        { ⭐ a - b IS a + (-b), and saying so here is the point: the sign logic below
+          is written ONCE and both opcodes reach it. Two bodies would be two chances
+          to get the borrow case wrong. }
+        NegB := Ctx.BigVals[B].Neg;
+        if Instr.OpCode = bcBigSub then NegB := not NegB;
+        BigSignedAdd(Ctx, H, A, B, NegB);
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigMul:
+      begin
+        H := BigDestOf(Ctx, Instr.Dest);
+        A := Integer(Ctx.IntRegs[Instr.Src1]);
+        B := Integer(Ctx.IntRegs[Instr.Src2]);
+        if (A < 0) or (A >= Ctx.BigCount) or (B < 0) or (B >= Ctx.BigCount) then Exit;
+        UniqueLimbs(Ctx.BigVals[H].Limbs);
+        BigMul(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
+               Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N,
+               Ctx.BigVals[B].Limbs, Ctx.BigVals[B].N);
+        { The sign of a product is the xor of the signs - EXCEPT that zero has only
+          one representation here, so a zero result is never negative. }
+        Ctx.BigVals[H].Neg := (Ctx.BigVals[A].Neg <> Ctx.BigVals[B].Neg) and
+                              not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0));
+        Ctx.IntRegs[Instr.Dest] := H;
+      end;
+
+    bcBigCmp:
+      begin
+        A := Integer(Ctx.IntRegs[Instr.Src1]);
+        B := Integer(Ctx.IntRegs[Instr.Src2]);
+        if (A < 0) or (A >= Ctx.BigCount) or (B < 0) or (B >= Ctx.BigCount) then
+          Ctx.IntRegs[Instr.Dest] := 0
+        else
+          Ctx.IntRegs[Instr.Dest] := BigSignedCmp(Ctx, A, B);
+      end;
   else
     raise Exception.CreateFmt('Unknown BigInt opcode $%.4x at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
