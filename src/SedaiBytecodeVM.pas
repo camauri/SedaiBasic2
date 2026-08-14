@@ -3788,7 +3788,33 @@ begin
   // ⭐ It also makes the native lowering ONE instruction: roundsd toward zero already preserves
   // the sign of a zero, so the AOT and the JIT need no fix-up at all. Same class of decision as
   // the correctly-rounded PRINT of a float: conform to the standard, declare the divergence.
-  if (Result = 0) and (PInt64(@X)^ < 0) then Result := -Result;
+  //
+  // ⛔⛔ IMPONE il bit del segno, NON nega - e la differenza si è pagata. Negare presuppone che
+  // System.Int abbia PERSO il segno, il che è vero su Windows e FALSO su Linux, dove System.Int(-0.0)
+  // rende già -0. Lì la "cura" faceva -(-0) = +0, cioè introduceva il difetto che doveva togliere:
+  // interprete e JIT rendevano +0 mentre l'AOT rendeva -0, ed è la cosa che il disegno a due
+  // implementazioni non può permettersi. Misurato il 13 ago 2026 con la rete di regressione
+  // (bug_int_floor). Imporre il bit è IDEMPOTENTE, quindi giusto su entrambe le piattaforme.
+  if (Result = 0) and (PInt64(@X)^ < 0) then
+    PInt64(@Result)^ := PInt64(@Result)^ or Int64($8000000000000000);
+end;
+
+function FracDouble(const X: Double): Double; inline;
+// FRAC(x) - the fractional part. ⚠️ A ZERO OPERAND KEEPS ITS OWN SIGN; a zero RESULT
+// from a non-zero operand does not. Measured against fbc 1.10.1 on Linux:
+//   Frac(-0.0)  -> -0        Frac(-5.0)  ->  0        Frac(-3.75) -> -0.75
+// ⛔ The two zero rows look contradictory and are not: fbc computes x - Fix(x) with
+// ITS Fix, where Fix(-0.0) is +0, so -0.0 - (+0.0) = -0.0 while -5.0 - (-5.0) = +0.0.
+// We cannot borrow that arithmetic, because OUR Fix(-0.0) is -0.0 - a divergence the
+// user DECLARED on 10 Aug 2026 (IEEE 754-2019 §5.9 gives the result the sign of the
+// operand, and fbc is inconsistent with itself there). Through FPC's Frac that
+// declared divergence leaked one step downstream and turned Frac(-0.0) into +0.
+// ⇒ State the zero rule directly instead of inheriting it from a Fix we deliberately
+// changed. Imposing the bit is idempotent, so this is right on both platforms.
+begin
+  Result := System.Frac(X);
+  if (Result = 0) and (X = 0) and (PInt64(@X)^ < 0) then
+    PInt64(@Result)^ := PInt64(@Result)^ or Int64($8000000000000000);
 end;
 
 function FloorDouble(const X: Double): Double; inline;
@@ -3796,10 +3822,13 @@ begin
   Result := System.Int(X);
   if Result > X then Result := Result - 1;
   // ⚠️ NEGATIVE ZERO: fbc prints Int(-0.0) as -0, and so does roundsd, which is what the AOT emits.
-  // System.Int loses the sign here, so it is put back - otherwise WHICH ENGINE RAN would change the
-  // answer, and that is the one thing the two-implementation design is not allowed to do.
+  // The sign is put back - otherwise WHICH ENGINE RAN would change the answer, and that is the one
+  // thing the two-implementation design is not allowed to do.
+  // ⛔⛔ IMPONE il bit, non nega: vedi la nota estesa in FixDouble. System.Int PERDE il segno su
+  // Windows ma lo CONSERVA su Linux, quindi negare lo ribaltava e rendeva +0 dove serve -0.
   // Only reachable when the result is zero, so no ordinary value pays for the test.
-  if (Result = 0) and (PInt64(@X)^ < 0) then Result := -Result;
+  if (Result = 0) and (PInt64(@X)^ < 0) then
+    PInt64(@Result)^ := PInt64(@Result)^ or Int64($8000000000000000);
 end;
 
 function RecFieldInt(R: PRecordStorage; Enc: Int64): Int64; inline;
@@ -11101,8 +11130,8 @@ begin
       Ctx.FloatRegs[Instr.Dest] := ArcTan2(Ctx.FloatRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2]);
     18: // bcMathFix - FIX(x) - truncate toward zero
       Ctx.FloatRegs[Instr.Dest] := FixDouble(Ctx.FloatRegs[Instr.Src1]);
-    19: // bcMathFrac - FRAC(x) - fractional part (keeps sign)
-      Ctx.FloatRegs[Instr.Dest] := Frac(Ctx.FloatRegs[Instr.Src1]);
+    19: // bcMathFrac - FRAC(x) - fractional part (keeps sign, negative zero included)
+      Ctx.FloatRegs[Instr.Dest] := FracDouble(Ctx.FloatRegs[Instr.Src1]);
     30: // bcMathSinh - SINH(x) - hyperbolic sine
       Ctx.FloatRegs[Instr.Dest] := Math.Sinh(Ctx.FloatRegs[Instr.Src1]);
     31: // bcMathCosh - COSH(x) - hyperbolic cosine
