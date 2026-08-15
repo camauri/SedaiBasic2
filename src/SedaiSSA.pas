@@ -23718,14 +23718,23 @@ begin
   begin
     VNameU := UpperCase(VarToStr(Node.Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
-    // ⛔ PROVATO E RITIRATO (15 ago): registrare anche il nome dentro "@z[i]" - che sta nel
-    // sottoalbero, non in Node.Value - sembrava la generalizzazione ovvia e MISURA ALLA MANO
-    // fa danni: sei programmi cambiano uscita, fra cui un nostro guardiano
-    // (m370_addrof_raw_pointer_element) e tre esempi sui thread, e "@z[15]" scritto a mano
-    // passa da un errore a COMPILAZIONE a un puntatore nullo a RUNTIME. Marcare come
-    // @-preso un nome che e' gia' un array, o un puntatore grezzo, ne cambia il sostegno.
-    // ⇒ "@z[i]" scritto a mano resta scoperto, ed e' un buco ISOLATO e noto; dentro
-    // fb_Mem* funziona perche' quelle posizioni sono registrate qui sotto, una per una.
+    // "@z[i]": il nome sta nel SOTTOALBERO, non in Node.Value, quindi senza questo il
+    // contenitore non veniva sostenuto e "@z[15]" falliva dove "@z" funzionava.
+    // ⛔⛔ E NON SI PUO' FARE SENZA GUARDIA: la prima versione marcava qualunque base e
+    // rompeva m370_addrof_raw_pointer_element, perche' marcare @-preso un PUNTATORE GREZZO
+    // ne cambia il sostegno - il suo "@p[i]" e' gia' aritmetica sul puntatore, non ha
+    // bisogno di memoria stabile. La stessa guardia serviva, e serve, nelle posizioni ByRef
+    // di fb_Mem* qui sotto: e' la riga che separa un buffer ZString da una variabile
+    // puntatore. ⚠️ FPointerVars e' popolato da QUESTA passata dai DIM "<tipo> PTR", e la
+    // visita e' in ordine di sorgente: la dichiarazione precede l'uso.
+    if (VNameU = '') and (Node.ChildCount >= 1) and
+       (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+       (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+    begin
+      VNameU := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+      if (FPointerVars.IndexOfName(VNameU) < 0) and (Dict.IndexOf(VNameU) < 0) then
+        Dict.Add(VNameU);
+    end;
   end;
   // VARPTR(x) takes the address of a DATA variable x (= @x), so x must be backed with stable storage —
   // mark it @-taken here, just like an antProcAddress operand. (PROCPTR's argument is a procedure: its
@@ -23827,6 +23836,16 @@ var
     if N = nil then Exit;
     if (N.NodeType = antProcAddress) and (N.ChildCount = 0) then
       Result := UpperCase(VarToStr(N.Value))
+    // ⭐ "@x[i]" nomina lo stesso scalare di "@x": l'indice sceglie un byte DENTRO x, non un
+    // altro oggetto. Senza questo il nome non veniva registrato, quindi x restava un valore
+    // gestito e "@x" rispondeva con un handle impacchettato invece di un indirizzo di byte -
+    // e il deref falliva. ⛔ Il sintomo ingannava: "@z[15]" e "@z[0]" fallivano ENTRAMBI e con
+    // lo stesso identico valore di "@z", che invece funziona. Non era l'aritmetica: era che
+    // questa riga decide se z riceve una casella grezza, e non la vedeva.
+    else if (N.NodeType = antProcAddress) and (N.ChildCount >= 1) and
+            (N.GetChild(0).NodeType = antArrayAccess) and (N.GetChild(0).ChildCount >= 1) and
+            (N.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+      Result := UpperCase(VarToStr(N.GetChild(0).GetChild(0).Value))
     else if (N.NodeType = antArrayAccess) and (N.ChildCount >= 2) and
             (N.GetChild(0).NodeType = antIdentifier) and
             ((UpperCase(VarToStr(N.GetChild(0).Value)) = kVARPTR) or
@@ -24315,10 +24334,19 @@ begin
   // @p[i] where p is a raw pointer: FreeBASIC "@p[i]" ≡ "p + i", a raw pointer of the same element type
   // (EmitArrayElementAddress emits the SizeOf-scaled byte address). Treat it as the raw pointer p so a
   // deref of it loads from the byte heap and an assignment "q = @p[i]" carries the raw-ness onto q.
+  // ⭐ E VALE ANCHE SE LA BASE NON E' UN PUNTATORE ma uno scalare o un buffer ZString sostenuti
+  // da memoria grezza: sono gli stessi tre predicati che il caso "@x" qui sopra usa gia'. Senza,
+  // "q = @z[i]" su una `ZString * n` non ereditava la grezzezza, e il deref di q tornava sulla
+  // via gestita decodificando l'indirizzo come un handle - con lo STESSO valore numerico che
+  // funzionava passando per "@z" e poi sommando. ⛔ Ed e' la ragione per cui il sintomo
+  // ingannava: valore giusto, tipo giusto, e a decidere era la classificazione della VARIABILE.
   else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
           (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-          IsRawPtr(VarToStr(Node.GetChild(0).GetChild(0).Value)) then
+          (IsRawPtr(VarToStr(Node.GetChild(0).GetChild(0).Value)) or
+           IsRawModuleScalar(VarToStr(Node.GetChild(0).GetChild(0).Value)) or
+           (RawZStringBufBytes(VarToStr(Node.GetChild(0).GetChild(0).Value)) > 0) or
+           IsRawAddrLocal(VarToStr(Node.GetChild(0).GetChild(0).Value))) then
     Result := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
 end;
 
@@ -25361,20 +25389,12 @@ begin
   ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
   begin
-    // @p[i] where p is a POINTER (a raw Allocate'd buffer, or a managed pointer) rather than a declared
-    // array: FreeBASIC "@p[i]" ≡ "p + i", the very address a "p[i]" deref computes (raw pointers scale the
-    // index by SizeOf(pointee); managed ones do not). Return that address directly instead of failing.
-    if (IsRawPtr(ArrName) or (ManagedPtrPointee(ArrName) <> '')) and
-       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
-    begin
-      Result := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
-      Exit;
-    end;
-    // ⭐ "@z[i]" dove z e' una stringa (tipicamente una `ZString * n`): non e' un array, e
-    // FreeBASIC lo definisce come l'indirizzo del BYTE i del buffer - cioe' "@z + i".
-    // Il modello lo reggeva gia' per intero: "Dim As UByte Ptr b = @z : b[15] = 88" cambia z
-    // ed e' identico a fbc. Mancava solo QUESTA grafia, che e' il modo in cui il manuale
-    // nomina un indirizzo interno (`fb_memmove(z[20], z[15], 11)`).
+    // ⛔ LA STRINGA VA PROVATA PER PRIMA, e l'ordine qui e' il difetto che ho pagato: una
+    // `ZString * n` marcata @-presa risponde SI' anche a ManagedPtrPointee, quindi finiva nel
+    // ramo dei puntatori qui sotto e sommava l'indice al VALORE della stringa. Il sintomo era
+    // un indirizzo 2^62+31 dove me ne aspettavo uno +15: il ramo giusto non veniva nemmeno
+    // raggiunto. ⇒ Un ramo irraggiungibile e' indistinguibile da un ramo sbagliato finche'
+    // non si guardano i NUMERI.
     if (InferExprBank(Node.GetChild(0)) = srtString) and
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
     begin
@@ -25385,6 +25405,15 @@ begin
       Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaAddInt, Result, EnsureIntRegister(BaseVal), EnsureIntRegister(TempVal),
                       MakeSSAValue(svkNone));
+      Exit;
+    end;
+    // @p[i] where p is a POINTER (a raw Allocate'd buffer, or a managed pointer) rather than a declared
+    // array: FreeBASIC "@p[i]" ≡ "p + i", the very address a "p[i]" deref computes (raw pointers scale the
+    // index by SizeOf(pointee); managed ones do not). Return that address directly instead of failing.
+    if (IsRawPtr(ArrName) or (ManagedPtrPointee(ArrName) <> '')) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+    begin
+      Result := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
       Exit;
     end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
