@@ -222,6 +222,22 @@ function Find-SedaiAudio {
 # on $TargetCPU matching. Set SEDAI_CPUOPT=none to force the portable baseline (useful when the
 # binaries have to run on an older machine than the one that builds them), or =avx / =avx2 to force
 # a level explicitly.
+#
+# ⛔ THE DEFAULT IS THE PORTABLE BASELINE, and that is a MEASURED decision, not caution.
+# Measured 15 Aug 2026: the AVX2/FMA flags buy NOTHING. FPC has no auto-vectorizer - on a
+# trivially vectorizable loop, with -O3 -CfAVX2 -OpCOREAVX2 -OoFASTMATH, it emits ZERO %ymm
+# registers where gcc -O3 -march=native emits 19 - so -CfAVX2 only gives the VEX encoding of
+# SCALAR operations. In the whole 653 943-instruction sb binary: 0 %ymm, and 29 FMAs, all
+# scalar. A/B between two sb differing ONLY in the instruction set, best of 7 runs:
+#     n-body (N=50M, --aot)   3973 ms AVX2   3986 ms SSE2   +0.3%
+#     spectral-norm (N=2000)   160 ms AVX2    158 ms SSE2   -1.2%
+# Both gaps are SMALLER than the null A/B (the same binary against a copy of itself: +0.7%
+# and +3.8%). There is no signal.
+# ⇒ Detecting the host made every build unrunnable on an older CPU - a real cost - in exchange
+# for a measured zero. Detection stays available (SEDAI_CPUOPT=avx2) for whoever wants it.
+# ⚠️ The vectorization that IS worth having is not here: it is in the code our own AOT/JIT
+# emitters generate, which we control.
+# ⛔ build.sh does exactly the same thing: the two scripts must behave identically.
 function Get-CpuOptLevel {
     $forced = $env:SEDAI_CPUOPT
     if ($forced) {
@@ -232,6 +248,11 @@ function Get-CpuOptLevel {
             default { Write-Host "  WARNING: SEDAI_CPUOPT='$forced' not understood, detecting instead" -ForegroundColor Yellow }
         }
     }
+    # Nothing forced: the portable baseline. See the note above - the levels are detectable and
+    # cost nothing to reach, they simply do not pay.
+    return 'none'
+
+    # ---- host detection, reachable only via SEDAI_CPUOPT=avx / =avx2 above ----
     # System.Runtime.Intrinsics needs .NET Core (PowerShell 7+). Under Windows PowerShell 5.1 the
     # type is absent, and then the honest answer is the SAFE one: assume nothing beyond the x86-64
     # baseline rather than emit instructions the CPU may not have.
@@ -564,12 +585,12 @@ switch ($Script:CpuOptLevel) {
     'avx'   { Write-Host "CPU opt:    AVX (no AVX2/FMA on this CPU)" -ForegroundColor Green }
     default { Write-Host "CPU opt:    baseline x86-64 (SSE2) - no AVX detected, or PowerShell 5.1" -ForegroundColor Gray }
 }
-# The level is a property of the machine that COMPILES, not of the project. Now that the flags
-# reach the shared units, binaries built here really do carry those instructions - and die with
-# an illegal instruction on a CPU that lacks them.
-if ($Script:CpuOptLevel -ne 'none' -and -not $env:SEDAI_CPUOPT) {
-    Write-Host "            detected on THIS machine - binaries will not run on a CPU without it" -ForegroundColor Gray
-    Write-Host "            (SEDAI_CPUOPT=none|avx|avx2 to build for an older one)" -ForegroundColor Gray
+# The level is a property of the machine that COMPILES, not of the project. The flags reach the
+# shared units, so binaries built with them really do carry those instructions - and die with an
+# illegal instruction on a CPU that lacks them. Only reachable now by asking for it explicitly.
+if ($Script:CpuOptLevel -ne 'none') {
+    Write-Host "            FORCED via SEDAI_CPUOPT - binaries will not run on a CPU without it" -ForegroundColor Gray
+    Write-Host "            (measured 15 Aug: worth 0% here, FPC emits no vector code)" -ForegroundColor Gray
 }
 Write-Host ""
 
