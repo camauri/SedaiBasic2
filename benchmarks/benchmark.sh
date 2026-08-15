@@ -132,6 +132,18 @@ THERMO_EXE="$PROJECT_ROOT/job/tests/bench/nbody_fbc_o2$EXE_SUFFIX"
 #                        running the same algorithm; an oracle is a CORRECTNESS check only and
 #                        is never timed. k-nucleotide's Python version needs a working
 #                        multiprocessing fork; Lua answers instead.
+#
+#  TWO ROWS FOR ONE PROGRAM. pidigits and pidigits-basic are the SAME spigot and measure two
+#  different things, so both are timed:
+#    pidigits        asks the language for the arbitrary-precision arithmetic (the BigInt type).
+#                    This is the comparison the reference invites - the Python entry does not use
+#                    CPython's integers either, it calls GMP through ctypes. LIBRARY against LIBRARY.
+#    pidigits-basic  writes the same arithmetic out by hand over a base-10^9 limb array, ~245 lines
+#                    of BASIC. That measures the ENGINE on a long, loop-heavy, array-heavy program.
+#  Until 2026-08-15 only the second existed and it carried the bare name, so the suite reported us
+#  8x slower than Python on a benchmark where the type is 1.7x FASTER - and the whole BigInt work
+#  was invisible to every published number. Timing one and calling it the other is the error the
+#  two rows exist to prevent.
 
 SUITE=(
 "binary-trees|binary-trees-modern.bas|21|12|||binary-trees.py|binary-trees.lua|python||Allocate and deallocate many binary trees"
@@ -140,7 +152,8 @@ SUITE=(
 "k-nucleotide|k-nucleotide-modern.bas|||25000000|100000|k-nucleotide.py|k-nucleotide.lua|lua||Hashtable update and k-nucleotide strings"
 "mandelbrot|mandelbrot-modern.bas|16000|1000|||mandelbrot.py|mandelbrot.lua|python||Generate a Mandelbrot set portable bitmap"
 "n-body|n-body-modern.bas|50000000|500000|||n-body.py|n-body.lua|python||Double-precision N-body simulation"
-"pidigits|pidigits-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|Streaming arbitrary-precision arithmetic"
+"pidigits|pidigits-bigint-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|Streaming arbitrary-precision arithmetic"
+"pidigits-basic|pidigits-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|The same spigot with the arithmetic written out in BASIC"
 "regex-redux|regex-redux-modern.bas|||5000000|100000|regex-redux.py|regex-redux.lua|oracle|regexredux_oracle.py|Match DNA 8-mers and substitute magic patterns"
 "reverse-complement|reverse-complement-modern.bas|||25000000|100000|reverse-complement.py|reverse-complement.lua|python||Read DNA sequences and write their reverse-complement"
 "spectral-norm|spectral-norm-modern.bas|5500|500|||spectral-norm.py|spectral-norm.lua|python||Eigenvalue using the power method"
