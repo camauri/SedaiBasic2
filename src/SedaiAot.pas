@@ -672,21 +672,47 @@ begin
 end;
 
 function AotVecLanes: Integer;
-// How wide the vector path runs. 0 = off, which is the DEFAULT: this is a loop transformation, the
-// class where a mistake is a silently wrong answer rather than a crash, and the nets that decide
-// are real programs.
+// How wide the vector path runs. The DEFAULT is as wide as the CPU allows.
+//   (unset)          four lanes where the CPU has AVX, two where it does not
+//   AOT_VEC=0        OFF - the A/B baseline, and the escape hatch
 //   AOT_VEC=1 or =2  two lanes, SSE2 - the x86-64 baseline, always available
 //   AOT_VEC=4        four lanes, AVX - falls back to two where the CPU has no AVX
-// ⚠️ The AVX check is at RUN time, not build time: the emitted code runs on the machine executing
-// the program, and the AOT bakes instructions, not a compiler flag. AVXSupport comes from the RTL's
-// cpu unit, which does the CPUID and the XGETBV the OS-enabled-state check needs.
+//
+// ⚠️ THE AVX CHECK IS AT RUN TIME, not build time, and that is what makes ONE executable correct
+// on both: the AOT bakes instructions, it does not receive a compiler flag, so it asks the machine
+// that is executing. AVXSupport comes from the RTL's cpu unit, which does the CPUID *and* the
+// XGETBV that checks the OS has enabled the AVX state. The engine binary itself stays at the
+// portable baseline - see the note in build.sh - because FPC emits no vector code anyway.
+//
+// ⛔⛔ IT USED TO DEFAULT TO OFF, and the reason was sound: a loop transformation is the class
+// where a mistake is a silently wrong answer rather than a crash, "and the nets that decide are
+// real programs". The nets did not decide, because they never reached it: measured 15 Aug 2026,
+// in the whole repository the vector path changed the emitted code in SEVEN programs, and a green
+// net over code it never emitted is worse than no net - it authorises.
+// ⇒ What decided it is job/tests/bench/vec_battery.{py,sh}, written for this: 14 loop shapes x 3
+// types x 30 lengths, the INTERPRETER as the oracle (it never vectorises, so it says what the
+// answer is), at every lane count, on --aot and on the combined --aot --jit profile.
+//     11 844 comparisons, 0 divergences
+// and it prints how many programs the vector path actually TRANSFORMS on every run, so a blind
+// run cannot pass for a green one.
+// ⭐ Verified BACKWARDS, which is the only part that proves a net is worth anything: a short
+// induction step is caught (36 divergences), and a loosened trip guard that overruns is caught
+// (28) - but only after adding SENTINELS, because in MODERN an out-of-range store is DROPPED
+// silently, so the overrun left no trace in any ordinary checksum. A third injection stays green
+// and is not a defect: a MORE conservative guard just runs one vector iteration fewer.
+// 📌 Worth measuring against, not just asserting: matmul 1024^3 goes 770 -> 235 ms, from 6.29x
+// behind gcc -O3 -march=native to 1.9x.
+// ⚠️ Still outside the evidence, by construction: the JIT has no vector path of its own, and
+// multidimensional arrays are not native to the AOT.
 begin
   if GAotVecState < 0 then
   begin
     case GetEnvironmentVariable('AOT_VEC') of
+      '0':      GAotVecState := 0;
       '1', '2': GAotVecState := 2;
-      '4': if AVXSupport then GAotVecState := 4 else GAotVecState := 2;
-    else        GAotVecState := 0;
+      '4':      if AVXSupport then GAotVecState := 4 else GAotVecState := 2;
+    else        // default: the widest this CPU can run
+      if AVXSupport then GAotVecState := 4 else GAotVecState := 2;
     end;
   end;
   Result := GAotVecState;
