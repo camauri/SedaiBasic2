@@ -23718,6 +23718,14 @@ begin
   begin
     VNameU := UpperCase(VarToStr(Node.Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
+    // ⛔ PROVATO E RITIRATO (15 ago): registrare anche il nome dentro "@z[i]" - che sta nel
+    // sottoalbero, non in Node.Value - sembrava la generalizzazione ovvia e MISURA ALLA MANO
+    // fa danni: sei programmi cambiano uscita, fra cui un nostro guardiano
+    // (m370_addrof_raw_pointer_element) e tre esempi sui thread, e "@z[15]" scritto a mano
+    // passa da un errore a COMPILAZIONE a un puntatore nullo a RUNTIME. Marcare come
+    // @-preso un nome che e' gia' un array, o un puntatore grezzo, ne cambia il sostegno.
+    // ⇒ "@z[i]" scritto a mano resta scoperto, ed e' un buco ISOLATO e noto; dentro
+    // fb_Mem* funziona perche' quelle posizioni sono registrate qui sotto, una per una.
   end;
   // VARPTR(x) takes the address of a DATA variable x (= @x), so x must be backed with stable storage —
   // mark it @-taken here, just like an antProcAddress operand. (PROCPTR's argument is a procedure: its
@@ -23729,6 +23737,50 @@ begin
   begin
     VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
+  end;
+  // ⛔⛔ E LE POSIZIONI **ByRef** DI fb_Mem*/Clear SONO LO STESSO CASO. Prendono l'indirizzo
+  // dell'lvalue nominato esattamente come VARPTR, quindi quella variabile va sostenuta con
+  // memoria stabile - e se non la si registra QUI, la sintesi di "@nome" durante la
+  // generazione SSA arriva con pass 1 gia' chiuso e fallisce con "Undefined procedure
+  // (address-of @): DST".
+  // ⚠️ E' il difetto che mi aveva fatto credere che di mezzo ci fosse il MODELLO delle
+  // stringhe: "@z" su una ZString * n funziona da sempre, scrittura compresa (verificato
+  // contro fbc). Mancava solo la registrazione - un elenco di posizioni, non una
+  // rappresentazione.
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    TypeNameU := UpperCase(VarToStr(Node.GetChild(0).Value));
+    if (TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or
+       (TypeNameU = kFBMEMCOPYCLEAR) or (TypeNameU = kCLEAR) then
+      for k := 0 to Node.GetChild(1).ChildCount - 1 do
+      begin
+        // Quali posizioni sono INDIRIZZI: (dst, src) per copy/move; per copyclear la 0 e la 2;
+        // per Clear la sola dst. Le altre sono lunghezze e valori, e vanno lette per valore.
+        if ((TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or (TypeNameU = kCLEAR)) and
+           (k > Ord((TypeNameU <> kCLEAR))) then Break;
+        if (TypeNameU = kFBMEMCOPYCLEAR) and (k <> 0) and (k <> 2) then Continue;
+        Decl := Node.GetChild(1).GetChild(k);
+        // "*p" non si registra: l'indirizzo E' gia' il valore di p.
+        if Decl.NodeType = antDeref then Continue;
+        // ⛔⛔ "q[4]": si scende a marcare il contenitore SOLO SE NON E' UN PUNTATORE.
+        // Marcare @-preso un puntatore grezzo ne cambia il SOSTEGNO, e m146 e' passato da
+        // verde a "Null or invalid raw pointer dereference": provato, misurato, ristretto.
+        // Per una `ZString * n` invece la marcatura SERVE - senza, "fb_memmove(z[20], z[15],
+        // 11)" non trova un @z sostenuto, perche' in quel sorgente non c'e' nessuna "@"
+        // scritta a mano che l'avrebbe fatta registrare.
+        // ⚠️ FPointerVars e' popolato da questa stessa passata dai DIM "<tipo> PTR", e la
+        // visita e' in ordine di sorgente: la dichiarazione viene prima dell'uso.
+        if (Decl.NodeType = antArrayAccess) and (Decl.ChildCount >= 1) and
+           (Decl.GetChild(0).NodeType = antIdentifier) and
+           (FPointerVars.IndexOfName(UpperCase(VarToStr(Decl.GetChild(0).Value))) < 0) then
+          Decl := Decl.GetChild(0);
+        if Decl.NodeType = antIdentifier then
+        begin
+          VNameU := UpperCase(VarToStr(Decl.Value));
+          if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
+        end;
+      end;
   end;
   if Node.NodeType = antDim then
     for k := 0 to Node.ChildCount - 1 do
@@ -24512,7 +24564,7 @@ var
   // (dopo la chiamata q aliasa p - verificato), quindi un programma scritto contro di noi
   // faceva silenziosamente un'altra cosa una volta portato.
   function ByRefAddr(ArgNode: TASTNode): TSSAValue;
-  var AddrNode, BaseNode: TASTNode;
+  var AddrNode: TASTNode;
   begin
     // `*p`: l'indirizzo dell'oggetto puntato E' il puntatore. Nessun @ da sintetizzare.
     if (ArgNode.NodeType = antDeref) and (ArgNode.ChildCount >= 1) then
@@ -24535,21 +24587,15 @@ var
         'overwrite the pointer itself (fbc does exactly that, silently). To copy the memory it ' +
         'points to, write "*%s".',
         [FuncU, VarToStr(ArgNode.Value), VarToStr(ArgNode.Value)]);
-    // ⛔ LA STRINGA: da noi una `String` e una `ZString * n` sono valori GESTITI, non un buffer
-    // nel heap grezzo ([[fixed-length-strings]]), quindi non hanno un indirizzo di cui parlare -
-    // ed e' una decisione di modello, non una svista. Il manuale invece la usa proprio cosi'
-    // (`fb_MemCopyClear(dst, SizeOf(dst), src, 4)` con due `ZString * 10`).
-    // ⇒ Si dice QUAL E' il limite, invece di lasciar arrivare "Undefined procedure (address-of
-    // @): DST" da tre strati piu' sotto. Un messaggio che nomina la causa e' la differenza fra
-    // un limite dichiarato e un difetto apparente.
-    BaseNode := ArgNode;
-    if (ArgNode.NodeType = antArrayAccess) and (ArgNode.ChildCount >= 1) then
-      BaseNode := ArgNode.GetChild(0);
-    if (BaseNode.NodeType = antIdentifier) and (InferExprBank(BaseNode) = srtString) then
-      raise Exception.CreateFmt(
-        '%s takes the ADDRESS of "%s", but a string is a managed value here, not a raw buffer, ' +
-        'so it has no address to take. Copy through a raw pointer instead (Allocate / Cast).',
-        [FuncU, VarToStr(BaseNode.Value)]);
+    // ⛔⛔ QUI C'ERA UNA GUARDIA CHE RIFIUTAVA LE STRINGHE, ed era SBAGLIATA. Avevo concluso
+    // che una `ZString * n`, essendo un valore gestito, non avesse un indirizzo da prendere -
+    // e non l'avevo verificato. Misurato dopo, contro fbc: "@z" su una `ZString * n` funziona
+    // da sempre, e ci si SCRIVE pure ("Dim As UByte Ptr b = @z : b[0] = 74" cambia z, come in
+    // fbc). Il vero difetto era altrove: la pre-passata che raccoglie le variabili @-prese non
+    // conosceva queste posizioni ByRef, quindi la variabile non veniva sostenuta con memoria
+    // stabile - vedi CollectDimVarBanks.
+    // ⇒ Una diagnostica che nomina la causa SBAGLIATA e' peggio di nessuna diagnostica: rende
+    // definitivo un limite che non esiste, e chi la legge smette di cercare.
     // ogni altro lvalue: e' esattamente "@arg" nel nostro modello, come fa VARPTR - e il
     // lowering di @ sa gia' fare scalare / elemento di array / campo di UDT / SHARED.
     if ArgNode.NodeType = antIdentifier then
@@ -25296,6 +25342,7 @@ var
   LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
   TempReg, Stride: Integer;
   RawFieldPointee, RecTypeName: string;
+  AddrNd: TASTNode;
 begin
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
@@ -25321,6 +25368,23 @@ begin
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
     begin
       Result := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
+      Exit;
+    end;
+    // ⭐ "@z[i]" dove z e' una stringa (tipicamente una `ZString * n`): non e' un array, e
+    // FreeBASIC lo definisce come l'indirizzo del BYTE i del buffer - cioe' "@z + i".
+    // Il modello lo reggeva gia' per intero: "Dim As UByte Ptr b = @z : b[15] = 88" cambia z
+    // ed e' identico a fbc. Mancava solo QUESTA grafia, che e' il modo in cui il manuale
+    // nomina un indirizzo interno (`fb_memmove(z[20], z[15], 11)`).
+    if (InferExprBank(Node.GetChild(0)) = srtString) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+    begin
+      AddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(ArrName), Node.GetChild(0).Token);
+      ProcessExpression(AddrNd, BaseVal);
+      AddrNd.Free;
+      ProcessExpression(Node.GetChild(1).GetChild(0), TempVal);
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Result, EnsureIntRegister(BaseVal), EnsureIntRegister(TempVal),
+                      MakeSSAValue(svkNone));
       Exit;
     end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
