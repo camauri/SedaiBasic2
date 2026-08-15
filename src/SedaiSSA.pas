@@ -21529,13 +21529,40 @@ begin
           // not a scalar bank: its value is a record, and InferExprBank would see only the int handle and
           // make v an INTEGER holding that handle. ObjectTypeName reads the type without emitting code.
           TypeName := ObjectTypeName(Decl.GetChild(1));
+          // ⛔⛔ IL BANCO NON E' IL TIPO. InferExprBank risponde int/float/string, cioe' tre
+          // risposte per dieci tipi: "Var b = Cast(Short, 0)" diventava INTEGER e SizeOf(b)
+          // rispondeva 8 invece di 2. Erano sbagliati CINQUE tipi su dieci - Byte, Short,
+          // UByte, UShort e Single - e il sintomo non era un errore, era un numero.
+          // ⭐ La larghezza DICHIARATA esiste gia' e ha un suo registro (Declared32Code, lo
+          // stesso che decide il troncamento allo store): qui si legge di la' invece di
+          // reinventarla, cosi' VAR eredita per costruzione tutto cio' che quel registro sa -
+          // il cast esplicito, una variabile tipata, un campo di UDT, il risultato di una
+          // funzione. ⇒ [[the-declared-width-registry-is-the-store-funnel]]
           if TypeName = '' then
-            case InferExprBank(Decl.GetChild(1)) of
-              srtString: TypeName := 'STRING';
-              srtInt:    TypeName := 'INTEGER';
-            else
-              TypeName := 'DOUBLE';
+          begin
+            case Declared32Code(Decl.GetChild(1)) of
+              1: TypeName := 'BYTE';
+              2: TypeName := 'UBYTE';
+              3: TypeName := 'SHORT';
+              4: TypeName := 'USHORT';
+              5: TypeName := 'LONG';
+              6: TypeName := 'ULONG';
+              7: TypeName := 'SINGLE';
+              8: TypeName := 'UINTEGER';   // UINTEGER e ULONGINT hanno la stessa larghezza
+              9: TypeName := 'INT32';
+             10: TypeName := 'UINT32';
             end;
+            // ⚠️ E il banco resta l'ultima parola quando nessuna larghezza e' dichiarata: un
+            // letterale, una concatenazione, un'espressione mista non hanno un tipo DICHIARATO
+            // da ereditare, e li' il default a 64 bit e' la risposta giusta - la stessa di fbc.
+            if TypeName = '' then
+              case InferExprBank(Decl.GetChild(1)) of
+                srtString: TypeName := 'STRING';
+                srtInt:    TypeName := 'INTEGER';
+              else
+                TypeName := 'DOUBLE';
+              end;
+          end;
           Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
           Decl.Attributes.Values['INFER'] := '0';
           RegisterTypedVar(VarName, TypeName);
