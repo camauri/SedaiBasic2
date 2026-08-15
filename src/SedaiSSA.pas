@@ -24495,12 +24495,80 @@ procedure TSSAGenerator.EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; ou
 // small integer add keeps the tag), rest length = dstlen - srclen.
 var
   DstR, SrcR, BytesR, ValR, DstLenR, SrcLenR, RestPtr, RestLen, ZeroR, TmpV: TSSAValue;
+
+  // ⛔⛔ LE POSIZIONI DI INDIRIZZO SONO **ByRef**, e non e' un dettaglio di firma: cambia
+  // cosa significa il programma. Il manuale di FreeBASIC lo dichiara,
+  //     Declare Function fb_memcopy cdecl (ByRef dst As Any, ByRef src As Any, ByVal bytes As UInteger)
+  //     "Each starting address is taken from a reference to a variable or array element"
+  // e la regola e' UNA sola: si prende l'indirizzo dell'**lvalue nominato**. Da cui, misurato
+  // contro fbc 1.10.1 il 15 ago 2026:
+  //     fb_memcopy(q, p, n)    ->  memcpy(&q, &p, n)   copia le VARIABILI
+  //     fb_memcopy(*q, *p, n)  ->  memcpy( q,  p, n)   copia la MEMORIA PUNTATA
+  // ⭐ E le due grafie non sono un'ambiguita': `*q` E' l'oggetto puntato da q, e il suo
+  // indirizzo E' q - lo stesso modello mentale del C. Quindi allinearsi non rompe la lettura
+  // di chi arriva da memcpy(): gliela rende esplicita.
+  // ⚠️ Prima valutavamo queste posizioni per VALORE, cioe' trattavamo `q` come se fosse `*q`.
+  // Comodo, e sbagliato in un modo che non si vede: `fb_memcopy(q, p, 4)` in fbc CORROMPE q
+  // (dopo la chiamata q aliasa p - verificato), quindi un programma scritto contro di noi
+  // faceva silenziosamente un'altra cosa una volta portato.
+  function ByRefAddr(ArgNode: TASTNode): TSSAValue;
+  var AddrNode, BaseNode: TASTNode;
+  begin
+    // `*p`: l'indirizzo dell'oggetto puntato E' il puntatore. Nessun @ da sintetizzare.
+    if (ArgNode.NodeType = antDeref) and (ArgNode.ChildCount >= 1) then
+    begin
+      ProcessExpression(ArgNode.GetChild(0), Result);
+      Exit;
+    end;
+    // ⛔⛔ IL PUNTATORE NUDO: qui fbc fa una cosa che quasi nessuno vuole, e in SILENZIO.
+    // `fb_memcopy(q, p, 4)` con q e p puntatori diventa `memcpy(&q, &p, 4)`: sovrascrive le
+    // VARIABILI PUNTATORE, e dopo la chiamata q aliasa p. Verificato contro fbc 1.10.1: il
+    // programma stampava perfino i byte "giusti", ma solo perche' q era stato corrotto fino a
+    // puntare al buffer di p.
+    // ⇒ Non lo riproduciamo e non lo lasciamo passare: lo si NOMINA. Riprodurre una corruzione
+    // non serve a nessun programma corretto, e tacere la lascerebbe scoprire a valle, dove non
+    // si risale piu' alla riga che l'ha causata. Chi voleva copiare la memoria puntata scrive
+    // `*q`, che e' la grafia di fbc per quella intenzione ed e' anche quella del C.
+    if (ArgNode.NodeType = antIdentifier) and IsRawPtr(VarToStr(ArgNode.Value)) then
+      raise Exception.CreateFmt(
+        'In %s the address positions are BYREF: "%s" names the POINTER VARIABLE, so this would ' +
+        'overwrite the pointer itself (fbc does exactly that, silently). To copy the memory it ' +
+        'points to, write "*%s".',
+        [FuncU, VarToStr(ArgNode.Value), VarToStr(ArgNode.Value)]);
+    // ⛔ LA STRINGA: da noi una `String` e una `ZString * n` sono valori GESTITI, non un buffer
+    // nel heap grezzo ([[fixed-length-strings]]), quindi non hanno un indirizzo di cui parlare -
+    // ed e' una decisione di modello, non una svista. Il manuale invece la usa proprio cosi'
+    // (`fb_MemCopyClear(dst, SizeOf(dst), src, 4)` con due `ZString * 10`).
+    // ⇒ Si dice QUAL E' il limite, invece di lasciar arrivare "Undefined procedure (address-of
+    // @): DST" da tre strati piu' sotto. Un messaggio che nomina la causa e' la differenza fra
+    // un limite dichiarato e un difetto apparente.
+    BaseNode := ArgNode;
+    if (ArgNode.NodeType = antArrayAccess) and (ArgNode.ChildCount >= 1) then
+      BaseNode := ArgNode.GetChild(0);
+    if (BaseNode.NodeType = antIdentifier) and (InferExprBank(BaseNode) = srtString) then
+      raise Exception.CreateFmt(
+        '%s takes the ADDRESS of "%s", but a string is a managed value here, not a raw buffer, ' +
+        'so it has no address to take. Copy through a raw pointer instead (Allocate / Cast).',
+        [FuncU, VarToStr(BaseNode.Value)]);
+    // ogni altro lvalue: e' esattamente "@arg" nel nostro modello, come fa VARPTR - e il
+    // lowering di @ sa gia' fare scalare / elemento di array / campo di UDT / SHARED.
+    if ArgNode.NodeType = antIdentifier then
+      AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token)
+    else
+    begin
+      AddrNode := TASTNode.Create(antProcAddress, ArgNode.Token);
+      AddrNode.AddChild(ArgNode.Clone);
+    end;
+    ProcessExpression(AddrNode, Result);
+    AddrNode.Free;
+  end;
+
 begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   if (FuncU = kFBMEMCOPY) or (FuncU = kFBMEMMOVE) then
   begin
-    ProcessExpression(ArgsNode.GetChild(0), TmpV); DstR := EnsureIntRegister(TmpV);
-    ProcessExpression(ArgsNode.GetChild(1), TmpV); SrcR := EnsureIntRegister(TmpV);
+    TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
+    TmpV := ByRefAddr(ArgsNode.GetChild(1)); SrcR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
     if FuncU = kFBMEMCOPY then
       EmitInstruction(ssaRawMemCopy, Result, DstR, SrcR, BytesR)   // Result = destination pointer (FB returns dst)
@@ -24509,17 +24577,19 @@ begin
   end
   else if FuncU = kCLEAR then
   begin
-    ProcessExpression(ArgsNode.GetChild(0), TmpV); DstR := EnsureIntRegister(TmpV);
+    // Clear cdecl (ByRef dst As Any, ByVal value As Long = 0, ByVal bytes As UInteger):
+    // solo il destinatario e' ByRef, le altre due posizioni sono valori.
+    TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(1), TmpV); ValR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
     EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), DstR, ValR, BytesR);
     EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end
-  else  // kFBMEMCOPYCLEAR: (dst, dstlen, src, srclen)
+  else  // kFBMEMCOPYCLEAR: (dst, dstlen, src, srclen) - dst e src ByRef, le due lunghezze ByVal
   begin
-    ProcessExpression(ArgsNode.GetChild(0), TmpV); DstR := EnsureIntRegister(TmpV);
+    TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(1), TmpV); DstLenR := EnsureIntRegister(TmpV);
-    ProcessExpression(ArgsNode.GetChild(2), TmpV); SrcR := EnsureIntRegister(TmpV);
+    TmpV := ByRefAddr(ArgsNode.GetChild(2)); SrcR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(3), TmpV); SrcLenR := EnsureIntRegister(TmpV);
     // copy the first srclen bytes
     EmitInstruction(ssaRawMemCopy, MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)), DstR, SrcR, SrcLenR);
