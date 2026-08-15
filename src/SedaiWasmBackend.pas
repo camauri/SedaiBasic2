@@ -857,9 +857,9 @@ begin
           begin FUsesDateParse := True; FUsesDate := True; FUsesStr := True; end;
         ssaDateNow:
           FUsesClock := True;
-        { ⚠️ FORZA le trascendenti: l'ultimo ramo di Power è exp(y * ln x), e
-          una funzione che chiama un helper che il modulo non ha non è una
-          sorpresa a runtime - è un modulo che non carica. }
+        { ⚠️ FORCES the transcendentals: Power's last branch is exp(y * ln x), and a function
+          that calls a helper the module does not have is not a runtime surprise - it is a
+          module that does not load. }
         ssaPowFloat:
           begin FUsesPow := True; FUsesTrig := True; end;
         ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,

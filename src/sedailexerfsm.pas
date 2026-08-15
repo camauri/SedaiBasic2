@@ -2211,14 +2211,14 @@ begin
           if PeekChar(1) = '''' then
           begin
             SkipBlockComment;
-            { ⛔⛔ NextToken() CON LE PARENTESI, e non è uno stile: dentro una funzione il suo stesso
-              nome NUDO è la VARIABILE DI RISULTATO, non una chiamata. `Result := NextToken` si
-              compila quindi in `Result := Result` e lascia il risultato NON INIZIALIZZATO.
-              Sintomo misurato il 13 ago 2026: con -OoREGVAR (che sb usa) il risultato è spazzatura
-              e il chiamante muore con EAccessViolation su OGNI programma che contenga un /' '/;
-              senza quel flag lo slot conteneva ancora il token precedente, quindi il difetto
-              restituiva un token DUPLICATO in silenzio invece di sbagliare rumorosamente.
-              ⇒ Su Windows non crashava, e per questo è arrivato fin qui.
+            { ⛔⛔ NextToken() WITH THE PARENTHESES, and it is not a matter of style: inside a
+              function its own BARE name is the RESULT VARIABLE, not a call. `Result := NextToken`
+              therefore compiles to `Result := Result` and leaves the result UNINITIALIZED.
+              Symptom measured 13 Aug 2026: with -OoREGVAR (which sb uses) the result is garbage
+              and the caller dies with an EAccessViolation on EVERY program containing a /' '/;
+              without that flag the slot still held the previous token, so the defect returned a
+              DUPLICATED token silently instead of failing loudly.
+              ⇒ On Windows it did not crash, which is how it got this far.
               🥅 job/tests/bas/m320_block_comment.bas. }
             Result := NextToken();
             {$IFDEF DEBUG}
@@ -2844,7 +2844,7 @@ begin
         begin
           HandleLexicalError(Format('Unexpected character "%s" in state %s',
             [CurrentChar, GetEnumName(TypeInfo(TLexerState), Ord(FCurrentState))]));
-          TokenBufferAdd(CurrentChar);  // <-- Usa buffer invece di FTokenText := CurrentChar;
+          TokenBufferAdd(CurrentChar);  // <-- use the buffer instead of FTokenText := CurrentChar
           AdvanceChar;
           Result := CreateErrorToken('Lexical error');
           Exit;

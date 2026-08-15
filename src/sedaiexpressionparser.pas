@@ -1889,16 +1889,16 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
-  // @"letterale": l'indirizzo dei byte di un letterale di stringa. In FreeBASIC "@" vuole un
-  // lvalue, e un letterale lo E' perche' ha memoria STATICA - "Dim As ZString Ptr p = @"Fermat""
-  // e' la forma con cui il manuale mostra fb_MemCopy.
-  // ⭐ E non c'e' niente da inventare a valle: STRPTR(<letterale>) fa GIA' esattamente questo
-  // ed e' gia' verificato contro fbc. Quindi qui si costruisce QUELLA forma - un accesso ad
-  // array chiamato STRPTR - invece di aggiungere un secondo percorso che faccia la stessa cosa.
-  // E' lo stesso schema con cui VAR viene riscritto in un DIM tipato: una grafia nuova, nessun
-  // ramo nuovo, e ogni passata a valle continua a vedere una sola forma.
-  // ⚠️ SOLO un letterale, non un'espressione di stringa: "@(a & b)" non e' valido nemmeno in
-  // fbc, perche' un temporaneo non ha un indirizzo di cui si possa parlare.
+  // @"literal": the address of a string literal's bytes. In FreeBASIC "@" wants an lvalue, and a
+  // literal IS one because it has STATIC storage - "Dim As ZString Ptr p = @"Fermat"" is the
+  // spelling the manual uses to hand a name to fb_MemCopy.
+  // ⭐ And there is nothing to invent downstream: STRPTR(<literal>) ALREADY does exactly this and
+  // is already checked against fbc. So this builds THAT shape - an array access named STRPTR -
+  // rather than adding a second path that computes the same thing. It is the same move as
+  // rewriting VAR into a typed DIM: a new spelling, no new branch, and every pass downstream
+  // keeps seeing one form.
+  // ⚠️ A literal ONLY, never a string expression: "@(a & b)" is not valid in fbc either, because
+  // a temporary has no address worth speaking of.
   if Context.Check(ttStringLiteral) then
   begin
     Operand := ParseExpression(precCall);

@@ -259,13 +259,13 @@ type
     // BigCopy shares the limbs and UniqueLimbs splits them at the first write.
     BigVals: array of TBigValue;
     BigCount: Integer;
-    // Un handle di servizio per le operazioni che hanno bisogno di un intermedio (la
-    // divisione produce quoziente E resto insieme). ⛔ -1 finche' non serve: 0 e' un
-    // handle VALIDO, quindi un sentinella azzerato scriverebbe sul BigInt di qualcun altro.
+    // A service handle for operations that need an intermediate (division produces quotient
+    // AND remainder together). ⛔ -1 until it is needed: 0 is a VALID handle, so a zeroed
+    // sentinel would write over somebody else's BigInt.
     BigScratch: Integer;
-    // Spazio di lavoro della divisione lunga: la normalizzazione di Knuth costruisce un
-    // dividendo e un divisore spostati, e allocarli a ogni chiamata costa piu'
-    // dell'algoritmo. Crescono una volta e restano.
+    // Long division's workspace: Knuth's normalization builds a shifted dividend and divisor,
+    // and allocating them on every call costs more than the algorithm itself. They grow once
+    // and stay.
     BigDivU, BigDivV: TLimbs;
 
     // --- AOT runtime-helper handoff (C3, PIANO_B1_AOT_DESIGN §5.6) ---

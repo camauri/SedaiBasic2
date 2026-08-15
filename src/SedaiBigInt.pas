@@ -1,80 +1,81 @@
 unit SedaiBigInt;
 
 { ============================================================================
-  Aritmetica multipla - il NUCLEO, senza superficie di linguaggio.
+  Multiple-precision arithmetic - the CORE, with no language surface.
 
-  Piano: job/docs/PIANO_BIGINT.md. Riferimento di correttezza e di velocita':
-  job/tests/bench/pid64_proto.pas (pidigits completo, MATCH con l'oracolo a
-  1000 cifre).
+  Plan: job/docs/PIANO_BIGINT.md. Reference for correctness and for speed:
+  job/tests/bench/pid64_proto.pas (complete pidigits, MATCH with the oracle at
+  1000 digits).
 
-  ⭐ PERCHE' ESISTE, in un numero: pidigits con l'aritmetica in BASIC sta a
-  18,9x da GMP; con l'aritmetica qui dentro il prototipo misura 2,5x - e a
-  N=1000 batte GMP. Il premio e' 7,7-10,7x sul nostro AOT, e si scompone in
-  due meta' che vanno prese ENTRAMBE: 3,0x dal togliere l'interpretazione PER
-  LIMB (quindi l'intero ciclo sta qui, non una primitiva per limb) e 4,3x dalla
-  base 2^64, che BASIC non puo' esprimere perche' a(i)*k trabocca in Int64.
+  ⭐ WHY IT EXISTS, in one number: pidigits with the arithmetic written in BASIC
+  sits 18.9x from GMP; with the arithmetic in here the prototype measures 2.5x -
+  and at N=1000 it beats GMP. The prize is 7.7-10.7x on our own AOT, and it
+  splits into two halves that must BOTH be taken: 3.0x from removing the PER-LIMB
+  interpretation (hence the whole loop lives here, not a per-limb primitive) and
+  4.3x from base 2^64, which BASIC cannot express because a(i)*k overflows Int64.
 
-  ⭐ LA RAPPRESENTAZIONE, e perche' NON e' una stringa. Le stringhe di questo
-  runtime sono AnsiString di FPC, quindi avrebbero dato riconteggio e copia su
-  scrittura gratis - ed e' stata la prima proposta. E' stata scartata: se un
-  BigInt FOSSE una stringa, ogni consumatore che chiede "cosa c'e' in questo
-  registro stringa?" (banco, spill, chiamate foglia AOT/JIT, PRINT, confronti,
-  LEN) vedrebbe dei BigInt senza saperlo. E' la malattia che PIANO_TIPI.md ha
-  appena curato - un record era tre vettori per banco, quindi un offset in byte
-  non esisteva come concetto. Una cosa che ne porta due.
-  ⇒ Tipo PROPRIO, e la copia su scrittura costa DIECI RIGHE (UniqueLimbs):
-  misurato 0 ms su 2000 chiamate quando non e' condiviso, contro le stesse
-  cifre della stringa quando lo e'.
+  ⭐ THE REPRESENTATION, and why it is NOT a string. The strings of this runtime
+  are FPC AnsiStrings, so they would have given refcounting and copy-on-write for
+  free - and that was the first proposal. It was rejected: if a BigInt WERE a
+  string, every consumer asking "what is in this string register?" (the bank, the
+  spill, AOT/JIT leaf calls, PRINT, comparisons, LEN) would be handed BigInts
+  without knowing it. That is the disease PIANO_TIPI.md had just cured - a record
+  used to be three vectors per bank, so a byte offset did not exist as a concept.
+  One thing carrying two.
+  ⇒ A type of its OWN, and copy-on-write costs TEN LINES (UniqueLimbs): measured
+  at 0 ms over 2000 calls when it is not shared, against the same figures as the
+  string when it is.
 
-  ⛔ INVARIANTE, e vale per ogni funzione qui dentro: una lunghezza descrive
-  sempre una magnitudine NORMALIZZATA - niente limb zero in testa - perche' il
-  confronto guarda la lunghezza per prima e uno zero in testa farebbe risultare
-  maggiore il numero piu' piccolo. Chi accorcia, normalizza.
+  ⛔ INVARIANT, and it holds for every function in here: a length always describes
+  a NORMALIZED magnitude - no zero limbs on top - because the comparison looks at
+  the length first, and a leading zero would make the smaller number compare
+  greater. Whoever shortens, normalizes.
   ============================================================================ }
 
 {$mode objfpc}{$H+}{$asmmode att}
 
-{ ⛔⛔ L'AVVOLGIMENTO E' L'ALGORITMO, non un incidente. Il riporto di
-  un'addizione fra limb si rileva PROPRIO dal trabocco (`s := a + b;
-  if s < b then riporto`), e la parte bassa di un prodotto e' il
-  risultato troncato a 64 bit. Con {$Q+} - che la build di debug
-  attiva - ognuna di quelle operazioni solleva EIntOverflow, e il
-  programma muore su un'aritmetica CORRETTA.
-  Trovato il 14 ago 2026: in rilascio andava, in debug no, e il
-  sintomo arrivava come un errore alla riga BASIC sbagliata.
-  ⚠️ Vale per l'intera unita': ogni funzione qui dentro lavora su
-  magnitudini senza segno e conta sul modulo 2^64. }
+{ ⛔⛔ WRAPAROUND IS THE ALGORITHM, not an accident. The carry of an
+  addition between limbs is detected PRECISELY by the overflow
+  (`s := a + b; if s < b then carry`), and the low half of a product
+  is the result truncated to 64 bits. With {$Q+} - which the debug
+  build turns on - every one of those operations raises EIntOverflow,
+  and the program dies on arithmetic that is CORRECT.
+  Found 14 Aug 2026: it worked in release and not in debug, and the
+  symptom arrived as an error on the wrong BASIC line.
+  ⚠️ It holds for the whole unit: every function in here works on
+  unsigned magnitudes and relies on modulo 2^64. }
 {$Q-}{$R-}
 
 interface
 
 type
-  { I limb, dal meno significativo. La lunghezza in limb e' Length(); la
-    normalizzazione e' un invariante, non una cortesia. }
+  { The limbs, least significant first. The length in limbs is Length(); normalization
+    is an invariant, not a courtesy. }
   TLimbs = array of QWord;
 
-{ 64x64 -> i 64 bit ALTI del prodotto: la via veloce di questa piattaforma. }
+{ 64x64 -> the HIGH 64 bits of the product: this platform's fast path. }
 function MulHi64(a, b: QWord): QWord; {$IFDEF CPUX86_64}inline;{$ENDIF}
 
-{ ⛔ La stessa cosa in Pascal puro, ed e' SEMPRE compilata anche dove non serve.
-  Non e' codice morto: e' l'ORACOLO con cui si verifica la via veloce. Messa in
-  un ramo {$ELSE} sarebbe sparita da x86-64, e il controllo che la confronta
-  sarebbe diventato "assembly contro se stesso" - verde e cieco. }
+{ ⛔ The same thing in pure Pascal, and it is ALWAYS compiled even where it is
+  not needed. It is not dead code: it is the ORACLE the fast path is checked
+  against. Put in an {$ELSE} branch it would have vanished from x86-64, and the
+  check comparing them would have become "assembly against itself" - green and
+  blind. }
 function MulHi64Portable(a, b: QWord): QWord;
 
-{ (hi:lo) div d, col resto in rem. ⛔ RICHIEDE hi < d, che è l'invariante del passo
-  scolastico che la usa: senza, il quoziente non starebbe in 64 bit.
-  ⚠️ È la divisione lunga BIT A BIT, 64 giri: lenta di proposito. Serve solo alla
-  conversione in decimale, che non sta su nessun percorso caldo (pidigits fa uscire
-  le cifre dal rubinetto una alla volta e non converte mai un numero intero). La via
-  x86 sarebbe una sola `divq`, ma quella va scritta in assembly e l'assembly qui si
-  paga in convenzioni di chiamata: si aggiunge quando una misura dirà che serve. }
+{ (hi:lo) div d, with the remainder in rem. ⛔ REQUIRES hi < d, which is the invariant of
+  the schoolbook step that uses it: without it the quotient would not fit in 64 bits.
+  ⚠️ It is BIT BY BIT long division, 64 turns: slow on purpose. It is only needed by the
+  decimal conversion, which is on no hot path (pidigits lets the digits out of the spigot
+  one at a time and never converts a whole number). The x86 route would be a single `divq`,
+  but that has to be written in assembly, and assembly here is paid for in calling
+  conventions: it gets added when a measurement says it is needed. }
 function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
 
 {$IFDEF CPUX86_64}
-{ I tre cicli caldi in assembly. Esportati perche' il controllo che li confronta con la
-  via portabile e' un programma a parte: una primitiva che nessuno puo' verificare da
-  fuori e' una primitiva di cui nessuno sa se e' giusta. }
+{ The hot limb loops in assembly. Exported because the check comparing them with the
+  portable path is a separate program: a primitive nobody can verify from outside is a
+  primitive nobody knows to be right. }
 function MulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
 function AddLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
 function SubLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
@@ -82,44 +83,44 @@ function AddMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
 function SubMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
 {$ENDIF}
 
-{ Sgancia SOLO se condiviso: l'equivalente di UniqueString per un array
-  dinamico, che di suo NON fa copia su scrittura (a2 := a1; a2[0] := 9 cambia
-  anche a1[0] - misurato, non dedotto). }
+{ Detach ONLY if shared: the equivalent of UniqueString for a dynamic array, which on its
+  own does NOT copy on write (a2 := a1; a2[0] := 9 changes a1[0] too - measured, not
+  deduced). }
 procedure UniqueLimbs(var a: TLimbs);
-{ Il riconteggio di un vettore di limb: serve a decidere se si puo' scrivere in posto. }
+{ The refcount of a limb vector: it decides whether an in-place write is allowed. }
 function LimbsRefCount(const a: TLimbs): PtrInt;
 
 procedure BigSetSmall(var a: TLimbs; var n: Integer; v: QWord);
 procedure BigCopy(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer);
-{ a *= k, con k che sta in un limb. Riporta il numero di limb usati. }
+{ a *= k, with k fitting in one limb. Returns the number of limbs used. }
 procedure BigMulSmall(var a: TLimbs; var n: Integer; k: QWord);
-{ dst = a * k in UNA passata, senza copiare prima. ⭐ BigMulSmall lavora in posto, quindi
-  un destinatario diverso dalla sorgente costava una COPIA piu' una moltiplicazione: due
-  passate sull'intero numero dove ne basta una. E' la forma di "probe = den * q", che il
-  ciclo delle cifre esegue fino a dieci volte per cifra.
-  ⚠️ dst puo' coincidere con a: si legge a[i] e si scrive dst[i], stesso indice. }
+{ dst = a * k in ONE pass, without copying first. ⭐ BigMulSmall works in place, so a
+  destination different from the source cost a COPY plus a multiplication: two passes over
+  the whole number where one is enough. It is the shape of "probe = den * q", which the
+  digit loop runs up to ten times per digit.
+  ⚠️ dst may alias a: it reads a[i] and writes dst[i], the same index. }
 procedure BigMulSmallTo(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; k: QWord);
-{ a += k, con k che sta in un limb. La coppia con BigMulSmall e' quanto basta a fare
-  Horner in base 10^19, cioe' a leggere un numero decimale. }
+{ a += k, with k fitting in one limb. Paired with BigMulSmall this is all that Horner in
+  base 10^19 needs, i.e. reading a decimal number. }
 procedure BigAddSmall(var a: TLimbs; var n: Integer; k: QWord);
-{ dst = a * b, solo magnitudini. ⚠️ dst PUO' essere a o b senza danno: il prodotto si
-  costruisce in un vettore a parte e viene consegnato alla fine, perche' lo schema
-  scolastico legge a[i] e b[j] mentre scrive in i+j, e con l'aliasing leggerebbe
-  cifre gia' sovrascritte. Costa una allocazione e toglie una classe intera di bachi. }
+{ dst = a * b, magnitudes only. ⚠️ dst MAY be a or b without harm: the product is built in
+  a separate vector and handed over at the end, because the schoolbook scheme reads a[i] and
+  b[j] while writing into i+j, and with aliasing it would read digits already overwritten.
+  It costs one allocation and removes a whole class of defects. }
 procedure BigMul(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
 procedure BigAdd(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
-{ dst = a - b, solo magnitudini: il chiamante garantisce a >= b. }
+{ dst = a - b, magnitudes only: the caller guarantees a >= b. }
 procedure BigSub(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
-{ q = a div b, r = a mod b, solo MAGNITUDINI. b <> 0 e' responsabilita' del chiamante.
-  ⭐ E' l'algoritmo D di Knuth (TAOCP 4.3.1): normalizzazione, stima del quoziente da
-  DUE limb del dividendo su UNO del divisore, correzione della stima, moltiplica-e-
-  sottrai, e il raro "somma indietro" quando la stima era alta di uno.
-  ⚠️ q e r NON possono essere a o b: si costruiscono a parte e si consegnano. }
-{ ⚠️ wu e wv sono SPAZIO DI LAVORO del chiamante, non risultati: la normalizzazione di
-  Knuth costruisce un dividendo e un divisore spostati, e allocarli a ogni chiamata
-  costa piu' dell'algoritmo su numeri di migliaia di limb (misurato: la divisione
-  risultava PIU' LENTA del ciclo di prove che doveva sostituire). Chi chiama li tiene
-  e li ripassa; crescono una volta e poi non piu'. }
+{ q = a div b, r = a mod b, MAGNITUDES only. b <> 0 is the caller's responsibility.
+  ⭐ It is Knuth's algorithm D (TAOCP 4.3.1): normalization, estimating the quotient from
+  TWO limbs of the dividend over ONE of the divisor, correcting the estimate, multiply-and-
+  subtract, and the rare "add back" when the estimate was one too high.
+  ⚠️ q and r may NOT be a or b: they are built separately and handed over. }
+{ ⚠️ wu and wv are the caller's WORKSPACE, not results: Knuth's normalization builds a
+  shifted dividend and divisor, and allocating them on every call costs more than the
+  algorithm itself on numbers of thousands of limbs (measured: the division came out SLOWER
+  than the trial loop it was meant to replace). The caller keeps them and passes them back;
+  they grow once and then no more. }
 procedure BigDivMod(var q: TLimbs; var qn: Integer; var r: TLimbs; var rn: Integer;
                     const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer;
                     var wu, wv: TLimbs);
@@ -128,28 +129,27 @@ function BigCmp(const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer): Int
 
 implementation
 
-{ ⛔ Il prodotto a 128 bit e' l'unica cosa qui che il linguaggio ospite non sa
-  esprimere, ed e' anche l'unica che tenta l'assembly. Due vie:
-  - x86-64: una MUL, ma l'assembly VA GATED PER SISTEMA. La cicatrice e' del
-    12 ago 2026: VecScanPrefix era scritta per la sola convenzione Win64 e
-    protetta da {$IFDEF CPUX86_64} - l'ARCHITETTURA, non il SISTEMA - e su
-    Linux leggeva gli argomenti dai registri sbagliati, sbagliando ~meta' delle
-    volte a seconda dell'ASLR. Qui la funzione e' scritta in Pascal e il
-    compilatore mette gli argomenti dove vuole lui: nessuna convenzione da
-    indovinare, e nessun ramo per sistema operativo.
-  - ovunque: quattro prodotti a 32 bit. Piu' lento, ma il target WASM e un
-    eventuale ARM non restano fuori - ed e' anche l'oracolo con cui la via
-    veloce si verifica. }
+{ ⛔ The 128-bit product is the only thing here the host language cannot express, and it is
+  also the only one that reaches for assembly. Two routes:
+  - x86-64: a single MUL, but ASSEMBLY MUST BE GATED PER SYSTEM. The scar is from
+    12 Aug 2026: VecScanPrefix was written for the Win64 convention alone and guarded by
+    {$IFDEF CPUX86_64} - the ARCHITECTURE, not the SYSTEM - and on Linux it read its
+    arguments from the wrong registers, going wrong about half the time depending on ASLR.
+    Here the function is written in Pascal and the compiler puts the arguments where it
+    likes: no convention to guess, and no per-OS branch.
+  - everywhere: four 32-bit products. Slower, but the WASM target and a possible ARM are not
+    left out - and it is also the oracle the fast path is checked against. }
 {$IFDEF CPUX86_64}
 function MulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
-{ dst[0..n-1] = a[0..n-1] * k, e riporta il riporto uscente. ⭐ E' il ciclo piu' caldo di
-  tutta l'aritmetica multipla, e in Pascal costava ~4 cicli per limb perche' il riporto
-  si rileva con un CONFRONTO e un salto. Qui la MULQ produce rdx:rax e la ADC prende il
-  riporto dai flag: nessun ramo, nessuna dipendenza inventata.
-  ⛔ I parametri si riferiscono PER NOME e si copiano subito in registri CHIAMANTE-salvati
-  (r8-r11, rax, rcx, rdx): toccare rbx o r12-r15 senza salvarli romperebbe il chiamante, e
-  cablare rdi/rsi presupporrebbe una convenzione di chiamata - l'errore che VecScanPrefix
-  ha pagato per mezza giornata. Qui FPC decide dove stanno e l'assembly non lo presuppone. }
+{ dst[0..n-1] = a[0..n-1] * k, returning the carry out. ⭐ It is the hottest loop in the
+  whole of multiple-precision arithmetic, and in Pascal it cost ~4 cycles per limb because
+  the carry is detected with a COMPARE and a branch. Here MULQ produces rdx:rax and ADC
+  takes the carry from the flags: no branch, no invented dependency.
+  ⛔ The parameters are referred to BY NAME and copied straight into CALLER-saved registers
+  (r8-r11, rax, rcx, rdx): touching rbx or r12-r15 without saving them would break the
+  caller, and hard-wiring rdi/rsi would assume a calling convention - the mistake
+  VecScanPrefix paid half a day for. Here FPC decides where they live and the assembly does
+  not assume it. }
 label
   giro, fine;
 var
@@ -183,12 +183,12 @@ end;
 
 {$IFDEF CPUX86_64}
 function AddLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
-{ dst[0..n-1] = a[0..n-1] + b[0..n-1], riporta il riporto uscente.
-  ⭐ LA CATENA ADC vive nel flag di riporto, quindi il ciclo non puo' toccare i flag fra
-  un limb e il successivo. Il trucco e' l'INDICE NEGATIVO: si parte da -n e si sale con
-  INC, che a differenza di ADD/SUB **non modifica CF** - tocca solo ZF, che serve al
-  salto. Senza questo si dovrebbe salvare e ripristinare il riporto a ogni giro, ed e'
-  esattamente cio' che rende lento il ciclo scritto in Pascal. }
+{ dst[0..n-1] = a[0..n-1] + b[0..n-1], returning the carry out.
+  ⭐ THE ADC CHAIN lives in the carry flag, so the loop must not touch the flags between one
+  limb and the next. The trick is the NEGATIVE INDEX: start at -n and climb with INC, which
+  unlike ADD/SUB **does not modify CF** - it only touches ZF, which is what the branch
+  needs. Without this the carry would have to be saved and restored every turn, and that is
+  exactly what makes the loop written in Pascal slow. }
 label giro, fine;
 var
   res: QWord;
@@ -221,7 +221,7 @@ begin
 end;
 
 function SubLimbRun(pd, pa, pb: Pointer; n: PtrInt): QWord;
-{ dst = a - b sugli n limb comuni; riporta il PRESTITO uscente. Stessa forma. }
+{ dst = a - b over the n common limbs; returns the BORROW out. Same shape. }
 label giro, fine;
 var
   res: QWord;
@@ -255,11 +255,11 @@ end;
 
 {$IFDEF CPUX86_64}
 function AddMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
-{ dst[0..n-1] += a[0..n-1] * k, riporta la parte che resta da propagare. E' mpn_addmul_1,
-  il ciclo interno del prodotto scolastico.
-  ⚠️ Qui il riporto sta in un REGISTRO, non nei flag - lo si ricostruisce a ogni giro con
-  due ADC - quindi il controllo del ciclo puo' usare liberamente ADD e DEC: la cautela
-  dell'indice negativo serve solo dove la catena vive nel flag. }
+{ dst[0..n-1] += a[0..n-1] * k, returning the part still to be propagated. It is
+  mpn_addmul_1, the inner loop of the schoolbook product.
+  ⚠️ Here the carry lives in a REGISTER, not in the flags - it is rebuilt every turn with two
+  ADCs - so the loop control is free to use ADD and DEC: the negative-index caution is only
+  needed where the chain lives in the flag. }
 label giro, fine;
 var
   res: QWord;
@@ -291,8 +291,8 @@ begin
 end;
 
 function SubMulLimbRun(pd, pa: Pointer; n: PtrInt; k: QWord): QWord;
-{ dst[0..n-1] -= a[0..n-1] * k, riporta la parte che resta da SOTTRARRE piu' in alto.
-  E' mpn_submul_1, il moltiplica-e-sottrai dell'algoritmo D. }
+{ dst[0..n-1] -= a[0..n-1] * k, returning the part still to be SUBTRACTED higher up.
+  It is mpn_submul_1, the multiply-and-subtract of algorithm D. }
 label giro, fine;
 var
   res: QWord;
@@ -340,16 +340,15 @@ end;
 {$IFDEF CPUX86_64}
 function MulHi64(a, b: QWord): QWord; inline;
 begin
-  { ⭐ L'assembly riferisce i PARAMETRI PER NOME: e' FPC a sapere dove li ha
-    messi, quindi non c'e' nessuna convenzione di chiamata da indovinare, e il
-    gate {$IFDEF CPUX86_64} - l'ARCHITETTURA - qui e' quello GIUSTO, perche'
-    l'unica cosa che presuppone e' che esista l'istruzione MUL.
-    ⛔ E' esattamente cio' che VecScanPrefix NON faceva: la' i registri erano
-    cablati a mano su Win64 sotto lo stesso gate di architettura, e su System V
-    la funzione leggeva gli argomenti dai registri sbagliati - meta' delle volte
-    la risposta era sbagliata, a seconda dell'ASLR. Vedi
-    job/tests/bas/bug_regex_vecfilter.bas.
-    📊 Vale 1,61x su pidigits N=3000 rispetto alla via portabile. }
+  { ⭐ The assembly refers to its PARAMETERS BY NAME: it is FPC that knows where it put
+    them, so there is no calling convention to guess, and the {$IFDEF CPUX86_64} gate - the
+    ARCHITECTURE - is the RIGHT one here, because the only thing it assumes is that the MUL
+    instruction exists.
+    ⛔ That is exactly what VecScanPrefix did NOT do: there the registers were hand-wired for
+    Win64 under the same architecture gate, and on System V the function read its arguments
+    from the wrong registers - about half the time the answer was wrong, depending on ASLR.
+    See job/tests/bas/bug_regex_vecfilter.bas.
+    📊 Worth 1.61x on pidigits N=3000 against the portable path. }
   asm
     movq a, %rax
     mulq b
@@ -368,17 +367,16 @@ function DivMod128By64(hi, lo, d: QWord; out rem: QWord): QWord;
 var
   q, r: QWord;
 begin
-  { ⭐ Una sola DIVQ. Come in MulHi64, l'assembly riferisce i nomi e lascia a FPC il
-    compito di sapere dove stanno: nessuna convenzione di chiamata da indovinare, e il
-    gate {$IFDEF CPUX86_64} e' quello giusto perche' l'unica cosa che presuppone e'
-    l'esistenza dell'istruzione.
-    ⛔ Il quoziente e il resto passano da VARIABILI LOCALI, non dal parametro `out`: per
-    un parametro per riferimento il nome in assembly designa il PUNTATORE, non il posto
-    dove scrivere, e sbagliarlo qui vorrebbe dire scrivere sopra un indirizzo.
-    ⛔ DIVQ solleva #DE se il quoziente non sta in 64 bit: la precondizione hi < d NON e'
-    una cortesia, e' cio' che tiene in piedi questa funzione. L'algoritmo D la garantisce.
-    📊 Serve al ciclo interno della divisione lunga: la via bit a bit qui sotto fa 64 giri
-    per limb ed e' quella che rendeva impraticabile una divisione vera. }
+  { ⭐ A single DIVQ. As in MulHi64, the assembly refers to the names and leaves it to FPC
+    to know where they are: no calling convention to guess, and the {$IFDEF CPUX86_64} gate
+    is the right one because the only thing it assumes is that the instruction exists.
+    ⛔ The quotient and the remainder go through LOCAL VARIABLES, not through the `out`
+    parameter: for a by-reference parameter the name in assembly denotes the POINTER, not
+    the place to write, and getting that wrong here would mean writing over an address.
+    ⛔ DIVQ raises #DE if the quotient does not fit in 64 bits: the precondition hi < d is
+    NOT a courtesy, it is what holds this function up. Algorithm D guarantees it.
+    📊 It serves the inner loop of long division: the bit-by-bit route below does 64 turns
+    per limb, and that is what made a real division impractical. }
   asm
     movq hi, %rdx
     movq lo, %rax
@@ -399,11 +397,11 @@ begin
   rem := hi;
   for i := 63 downto 0 do
   begin
-    { ⛔ Il bit ALTO va salvato PRIMA dello shift: rem può valere fino a d-1, e con
-      d oltre 2^63 lo shift lo perde. Se è uscito, il valore vero è rem + 2^64 ed è
-      certamente >= d, quindi si sottrae comunque - e la sottrazione modulo 2^64 dà
-      il risultato giusto. Senza questa riga la conversione sbaglia solo sui numeri
-      grandi, che è il modo peggiore di sbagliare. }
+    { ⛔ The TOP bit must be saved BEFORE the shift: rem can be as large as d-1, and with
+      d above 2^63 the shift loses it. If it went out, the true value is rem + 2^64 and is
+      certainly >= d, so the subtraction happens anyway - and subtracting modulo 2^64 gives
+      the right result. Without this line the conversion only goes wrong on large numbers,
+      which is the worst way to go wrong. }
     carry := (rem shr 63) <> 0;
     rem := (rem shl 1) or ((lo shr i) and 1);
     q := q shl 1;
@@ -466,7 +464,7 @@ begin
     lo := a[i] * k;
     hi := MulHi64(a[i], k);
     t := lo + carry;
-    if t < lo then Inc(hi);          { il riporto dell'addizione entra nella parte alta }
+    if t < lo then Inc(hi);          { the addition's carry goes into the high half }
     a[i] := t;
     carry := hi;
   end;
@@ -506,7 +504,7 @@ begin
     hi := MulHi64(a[i], k);
     t := lo + carry;
     if t < lo then Inc(hi);
-    dst[i] := t;          { stesso indice letto e scritto: dst = a e' innocuo }
+    dst[i] := t;          { same index read and written: dst = a is harmless }
     carry := hi;
   end;
   {$ENDIF}
@@ -527,7 +525,7 @@ begin
   while (carry <> 0) and (i < n) do
   begin
     s := a[i] + carry;
-    if s < carry then carry := 1 else carry := 0;   { il trabocco E' il riporto }
+    if s < carry then carry := 1 else carry := 0;   { the overflow IS the carry }
     a[i] := s;
     Inc(i);
   end;
@@ -539,43 +537,43 @@ begin
   end;
 end;
 
-{ ⭐⭐⭐ KARATSUBA. Il prodotto scolastico e' O(n^2): nessuna qualita' di assembly
-  recupera un ordine di complessita', e sopra qualche decina di limb e' li' che le
-  librerie serie guadagnano. Spezzando a = a1*B^m + a0 e b = b1*B^m + b0 servono TRE
-  prodotti di meta' taglia invece di quattro:
+{ ⭐⭐⭐ KARATSUBA. The schoolbook product is O(n^2): no quality of assembly recovers an
+  order of complexity, and above a few tens of limbs that is where serious libraries win.
+  Splitting a = a1*B^m + a0 and b = b1*B^m + b0 needs THREE half-size products instead of
+  four:
       z0 = a0*b0     z2 = a1*b1     z1 = (a0+a1)*(b0+b1) - z0 - z2
-  e il risultato e' z2*B^2m + z1*B^m + z0. Da O(n^2) a O(n^1.585).
-  ⛔ LA SOGLIA NON E' UN DETTAGLIO: sotto, le tre chiamate e le somme costano piu' dei
-  quattro prodotti che evitano. Il valore qui e' MISURATO su questa macchina.
-  ⚠️ Lo spazio di lavoro e' UNO, passato giu' per la ricorsione: allocare a ogni livello
-  rifarebbe l'errore che questo cantiere ha gia' pagato tre volte. }
+  and the result is z2*B^2m + z1*B^m + z0. From O(n^2) to O(n^1.585).
+  ⛔ THE THRESHOLD IS NOT A DETAIL: below it, the three calls and the additions cost more
+  than the four products they avoid. The value here is MEASURED on this machine.
+  ⚠️ The workspace is ONE, passed down through the recursion: allocating at every level
+  would repeat the mistake this worksite has already paid for three times. }
 const
   KARATSUBA_MIN = 24;
-  { ⭐⭐⭐ TOOM-3. Spezzando in TRE parti servono CINQUE prodotti di un terzo di taglia
-    invece dei nove scolastici: O(n^1.465), meglio dell'1.585 di Karatsuba. Il conto a
-    parita' di n: Karatsuba fa 3*(n/2)^2 = 0,75 n^2, Toom-3 fa 5*(n/3)^2 = 0,56 n^2.
-    ⛔ IL PREZZO E' L'INTERPOLAZIONE, ed e' li' che si sbaglia: cinque punti di
-    valutazione (0, 1, -1, 2, infinito), divisioni ESATTE per 2 e per 3, e un valore
-    che puo' essere NEGATIVO. La soglia e' alta proprio perche' quel contorno costa.
+  { ⭐⭐⭐ TOOM-3. Splitting into THREE parts needs FIVE products of a third of the size
+    instead of the nine of schoolbook: O(n^1.465), better than Karatsuba's 1.585. The
+    count at equal n: Karatsuba does 3*(n/2)^2 = 0.75 n^2, Toom-3 does 5*(n/3)^2 = 0.56 n^2.
+    ⛔ THE PRICE IS THE INTERPOLATION, and that is where it gets got wrong: five evaluation
+    points (0, 1, -1, 2, infinity), EXACT divisions by 2 and by 3, and a value that can be
+    NEGATIVE. The threshold is high precisely because that surround costs.
 
-    ⛔⛔ LA SOGLIA E' MISURATA, E IL NUMERO E' MOLTO PIU' ALTO DI QUELLO DI KARATSUBA:
-    il costo LINEARE di Toom-3 (valutazione + interpolazione, ~12 passate sull'intero
-    valore per livello) e' quello che decide, non l'esponente. Misurato il 14 ago 2026
-    su questa macchina, prodotto di due numeri di n limb, migliore di 15 corse x 3
-    passate contro un binario identico salvo questa costante:
+    ⛔⛔ THE THRESHOLD IS MEASURED, AND THE NUMBER IS FAR HIGHER THAN KARATSUBA'S: it is
+    Toom-3's LINEAR cost (evaluation + interpolation, ~12 passes over the whole value per
+    level) that decides, not the exponent. Measured 14 Aug 2026 on this machine, product of
+    two n-limb numbers, best of 15 runs x 3 passes against a binary identical but for this
+    constant:
 
-      limb   320    400    512    700   1000   1400   2000
-      soglia 350   -0,1%  -9,6%  -7,5%  -1,4% -10,1% -10,2%  -9,1%
-      soglia 200   +2,3% -10,9%  -7,7%  -4,8%  -4,0% -11,4%  -3,4%
+      limb        320    400    512    700   1000   1400   2000
+      threshold 350   -0.1%  -9.6%  -7.5%  -1.4% -10.1% -10.2%  -9.1%
+      threshold 200   +2.3% -10.9%  -7.7%  -4.8%  -4.0% -11.4%  -3.4%
 
-    ⭐ Abbassare la soglia NON e' meglio: a 2000 limb la soglia 200 rende -3,4% dove la
-    350 rende -9,1%, perche' ogni livello di Toom in piu' paga il suo costo lineare su
-    sotto-prodotti troppo piccoli per ripagarlo. Con una soglia di 130 il prodotto a 160
-    limb era +14,7%: una PERDITA, riprodotta due volte.
-    ⚠️ Il pavimento di rumore di questa misura e' ~4%: i valori sotto i 400 limb non
-    dicono niente, ed e' per questo che la soglia sta dove il divario e' stabile. }
+    ⭐ Lowering the threshold is NOT better: at 2000 limbs a threshold of 200 gives -3.4%
+    where 350 gives -9.1%, because every extra Toom level pays its linear cost on
+    sub-products too small to repay it. With a threshold of 130 the product at 160 limbs
+    was +14.7%: a LOSS, reproduced twice.
+    ⚠️ The noise floor of this measurement is ~4%: the values below 400 limbs say nothing,
+    which is why the threshold sits where the gap is stable. }
   TOOM3_MIN = 350;
-  { 3 * INV3 = 1 (mod 2^64): la divisione esatta per 3 e' una MOLTIPLICAZIONE. }
+  { 3 * INV3 = 1 (mod 2^64): the exact division by 3 is a MULTIPLICATION. }
   INV3 = QWord($AAAAAAAAAAAAAAAB);
 
 procedure PropAdd(p: PQWord; c: QWord);
@@ -601,11 +599,11 @@ begin
   end;
 end;
 
-{ ⛔ Le due sopra camminano finche' il riporto non si spegne, il che va bene quando si sa
-  che il numero non trabocca. L'interpolazione di Toom lavora in COMPLEMENTO A DUE su una
-  larghezza fissa, dove il riporto in uscita si BUTTA: senza un limite, su un valore
-  negativo (tutti $FF..F) la propagazione uscirebbe dal vettore. Un limite in piu' costa
-  un confronto; la corruzione silenziosa costa una giornata. }
+{ ⛔ The two above walk until the carry dies out, which is fine when the number is known not
+  to overflow. Toom's interpolation works in TWO'S COMPLEMENT at a fixed width, where the
+  carry out is DISCARDED: without a bound, on a negative value (all $FF..F) the propagation
+  would walk off the end of the vector. One more bound costs a comparison; silent corruption
+  costs a day. }
 procedure PropAddLim(p: PQWord; c: QWord; n: PtrInt);
 var t: QWord;
 begin
@@ -629,9 +627,9 @@ begin
   end;
 end;
 
-{ d = x + y e d = x - y su n limb, col riporto/prestito in uscita. Esistono per non
-  ripetere l'{$IFDEF} dentro il corpo di Toom, che e' gia' abbastanza da leggere.
-  ⚠️ d PUO' coincidere con x o con y: per ogni indice si legge prima e si scrive dopo. }
+{ d = x + y and d = x - y over n limbs, returning the carry/borrow out. They exist so the
+  {$IFDEF} is not repeated inside Toom's body, which is already enough to read.
+  ⚠️ d MAY alias x or y: for every index it reads first and writes after. }
 function RunAdd(d, x, y: PQWord; n: PtrInt): QWord;
 {$IFNDEF CPUX86_64}
 var i: PtrInt; s: QWord;
@@ -683,18 +681,18 @@ begin
   {$ENDIF}
 end;
 
-{ ---- l'aritmetica in COMPLEMENTO A DUE su larghezza fissa, per l'interpolazione ----
-  ⭐⭐⭐ E' LA DECISIONE CHE TOGLIE DI MEZZO I SEGNI. L'interpolazione di Toom-3 passa per
-  valori negativi, e la via ovvia - portarsi dietro modulo e segno a ogni passo - e'
-  esattamente il posto dove tutti sbagliano. Qui invece ogni valore intermedio vive in
-  complemento a due su L limb, con L scelto perche' |valore| < B^L/2: somma e sottrazione
-  sono quelle senza segno, il riporto in uscita si butta, e il segno esiste solo come bit
-  alto. Le divisioni ESATTE (per 2 e per 3) sopravvivono al modulo: il quoziente vero e'
-  congruo a quello calcolato, e sta nell'intervallo, quindi e' quello.
-  ⛔ L'UNICO segno che resta e' quello di W(-1), che non si puo' evitare perche' il
-  PRODOTTO vuole due magnitudini. E' un booleano, non un'algebra. }
+{ ---- TWO'S COMPLEMENT arithmetic at a fixed width, for the interpolation ----
+  ⭐⭐⭐ THIS IS THE DECISION THAT TAKES THE SIGNS OUT OF THE WAY. Toom-3's interpolation
+  passes through negative values, and the obvious route - carrying magnitude and sign at
+  every step - is exactly where this is usually got wrong. Here instead every intermediate
+  lives in two's complement over L limbs, with L chosen so that |value| < B^L/2: addition
+  and subtraction are the unsigned ones, the carry out is discarded, and the sign exists
+  only as the top bit. The EXACT divisions (by 2 and by 3) survive the modulus: the true
+  quotient is congruent to the computed one and lies in range, so it IS that one.
+  ⛔ The ONLY sign left is W(-1)'s, which cannot be avoided because the PRODUCT wants two
+  magnitudes. It is a boolean, not an algebra. }
 
-{ d[0..L-1] := s[0..sn-1], esteso con zeri (il valore e' non negativo). }
+{ d[0..L-1] := s[0..sn-1], zero-extended (the value is non-negative). }
 procedure TcSet(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
 var i: PtrInt;
 begin
@@ -703,7 +701,7 @@ begin
   for i := sn to L - 1 do d[i] := 0;
 end;
 
-{ d += s (sn limb, esteso con zeri), modulo B^L. }
+{ d += s (sn limbs, zero-extended), modulo B^L. }
 procedure TcAddN(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
 var c: QWord;
 begin
@@ -712,7 +710,7 @@ begin
   PropAddLim(@d[sn], c, L - sn);
 end;
 
-{ d -= s (sn limb, esteso con zeri), modulo B^L. }
+{ d -= s (sn limbs, zero-extended), modulo B^L. }
 procedure TcSubN(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
 var c: QWord;
 begin
@@ -721,10 +719,9 @@ begin
   PropSubLim(@d[sn], c, L - sn);
 end;
 
-{ ⭐⭐ d -= (t shl s), in UNA passata. La forma ovvia - prima lo spostamento in un
-  vettore d'appoggio, poi la sottrazione - sono DUE passate sull'intero valore piu' un
-  vettore in piu'. A questa taglia il costo lineare non e' contorno: e' misurato che si
-  mangiava due terzi del guadagno di Toom-3. }
+{ ⭐⭐ d -= (t shl s), in ONE pass. The obvious form - shift into a scratch vector first,
+  then subtract - is TWO passes over the whole value plus one more vector. At this size the
+  linear cost is not surround: it was measured eating two thirds of Toom-3's gain. }
 procedure TcSubShl(d, t: PQWord; L: PtrInt; s: Integer);
 var i: PtrInt; carry, cur, v, old: QWord; bo: QWord;
 begin
@@ -741,8 +738,8 @@ begin
   end;
 end;
 
-{ ⭐⭐ d := (d shl 1) + s, in UNA passata: e' il passo di Horner della valutazione in 2
-  (A(2) = ((a2*2) + a1)*2 + a0), e per la stessa ragione non si fa in due. }
+{ ⭐⭐ d := (d shl 1) + s, in ONE pass: it is the Horner step of the evaluation at 2
+  (A(2) = ((a2*2) + a1)*2 + a0), and for the same reason it is not done in two. }
 procedure TcShl1AddN(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
 var i: PtrInt; carry, cur, v, t: QWord; c2: QWord;
 begin
@@ -767,8 +764,8 @@ begin
   end;
 end;
 
-{ d := d div 2, ARITMETICO: il bit alto si ricopia, altrimenti un valore negativo
-  diventerebbe enorme e positivo. La divisione e' esatta per costruzione. }
+{ d := d div 2, ARITHMETIC: the top bit is replicated, otherwise a negative value would
+  become huge and positive. The division is exact by construction. }
 procedure TcShr1(d: PQWord; L: PtrInt);
 var i: PtrInt; sgn: QWord;
 begin
@@ -778,9 +775,9 @@ begin
   d[L - 1] := (d[L - 1] shr 1) or sgn;
 end;
 
-{ d := d div 3, ESATTA. ⭐ Non e' una divisione: si moltiplica per l'inverso di 3 modulo
-  2^64, limb per limb, portandosi dietro quanto e' "avanzato" - che vale al piu' 2.
-  Funziona anche sui valori negativi, perche' il modulo non distingue. }
+{ d := d div 3, EXACT. ⭐ It is not a division: it multiplies by the inverse of 3 modulo
+  2^64, limb by limb, carrying how much was "left over" - which is at most 2. It works on
+  negative values too, because the modulus does not tell them apart. }
 procedure TcDivExact3(d: PQWord; L: PtrInt);
 var i: PtrInt; x, q, bo, c: QWord;
 begin
@@ -796,7 +793,7 @@ begin
   end;
 end;
 
-{ confronto di due magnitudini di pari lunghezza, dal limb piu' alto }
+{ compare two magnitudes of equal length, from the top limb down }
 function CmpRun(x, y: PQWord; n: PtrInt): Integer;
 var i: PtrInt;
 begin
@@ -846,29 +843,29 @@ procedure MulRec(d, a, b, ws: PQWord; n: PtrInt); forward;
 
 { ⭐⭐⭐ TOOM-3, d[0..2n-1] = a[0..n-1] * b[0..n-1].
 
-  Si spezzano i due fattori in TRE parti di k limb (l'ultima ne ha n2 <= k):
+  The two factors are split into THREE parts of k limbs (the last holds n2 <= k):
       a = a0 + a1*B^k + a2*B^2k          b = b0 + b1*B^k + b2*B^2k
-  Il prodotto e' un polinomio di grado 4 in B^k:
+  The product is a degree-4 polynomial in B^k:
       P(x) = c0 + c1 x + c2 x^2 + c3 x^3 + c4 x^4
-  di cui bastano CINQUE valori per ricostruire i coefficienti. I punti sono 0, 1, -1, 2 e
-  "infinito" (cioe' il coefficiente di testa):
+  and FIVE values are enough to reconstruct its coefficients. The points are 0, 1, -1, 2 and
+  "infinity" (i.e. the leading coefficient):
       W0 = a0*b0                W4 = a2*b2
       W1 = A(1)*B(1)            Wm = A(-1)*B(-1)            W2 = A(2)*B(2)
 
-  L'INTERPOLAZIONE, che e' la parte che si sbaglia, in sei passi:
+  THE INTERPOLATION, which is the part that gets got wrong, in six steps:
       tA = (W1 + Wm)/2 = c0 + c2 + c4        tB = (W1 - Wm)/2 = c1 + c3
       c2 = tA - c0 - c4
       tC = (W2 - c0 - 16 c4 - 4 c2)/2 = c1 + 4 c3
       c3 = (tC - tB)/3                       c1 = tB - c3
-  ⛔ Le divisioni sono ESATTE - ogni numeratore e' divisibile per costruzione - e vanno
-  fatte come tali: una divisione lunga qui costerebbe piu' del prodotto che si evita.
-  ⛔ tB, tC e i loro addendi possono essere NEGATIVI: vivono in complemento a due su L
-  limb (vedi le TcXxx sopra), e L e' scelto perche' nessuno arrivi mai a B^L/2.
+  ⛔ The divisions are EXACT - every numerator is divisible by construction - and must be
+  done as such: a long division here would cost more than the product it saves.
+  ⛔ tB, tC and their addends can be NEGATIVE: they live in two's complement over L limbs
+  (see the TcXxx helpers above), and L is chosen so none of them ever reaches B^L/2.
 
-  ⚠️ I cinque prodotti si fanno tutti a taglia k+1, anche W0 e W4 che ne userebbero meno:
-  la ricorsione e' scritta per operandi di PARI taglia, ed e' cio' che tiene verificabile
-  la contabilita' degli indici. Il poco che si spreca si rivede quando una misura dira'
-  che vale la pena. }
+  ⚠️ All five products are done at size k+1, including W0 and W4 which would use less: the
+  recursion is written for operands of EQUAL size, and that is what keeps the index
+  bookkeeping verifiable. The little that is wasted can be revisited when a measurement
+  says it is worth it. }
 procedure MulToom3(d, a, b, ws: PQWord; n: PtrInt);
 var
   k, n2, L, i: PtrInt;
@@ -876,9 +873,9 @@ var
   sa, sb, sm: Integer;
   c: QWord;
 
-  { ⭐ La valutazione in -1 e' l'UNICO posto dove nasce un segno: a0 - a1 + a2 puo'
-    essere negativo, e il prodotto vuole una magnitudine. Si calcola |.| e si riporta
-    il segno; il resto dell'interpolazione non ne sa niente. }
+  { ⭐ The evaluation at -1 is the ONLY place a sign is born: a0 - a1 + a2 can be negative,
+    and the product wants a magnitude. Compute |.| and report the sign; the rest of the
+    interpolation knows nothing about it. }
   function EvalMinus1(dst, tmp, src: PQWord): Integer;
   begin
     TcSet(dst, k + 1, src, k);                 { a0 }
@@ -891,15 +888,15 @@ var
     end
     else
     begin
-      RunSub(dst, tmp, dst, k + 1);            { il verso opposto, e il segno }
+      RunSub(dst, tmp, dst, k + 1);            { the other way round, and the sign }
       Result := 1;
     end;
   end;
 
 begin
-  k := (n + 2) div 3;          { ceil(n/3): le due parti basse }
-  n2 := n - 2 * k;             { la parte alta, 1 <= n2 <= k }
-  L := 2 * k + 4;              { larghezza dei valori intermedi, con due limb di aria }
+  k := (n + 2) div 3;          { ceil(n/3): the two low parts }
+  n2 := n - 2 * k;             { the high part, 1 <= n2 <= k }
+  L := 2 * k + 4;              { width of the intermediates, with two limbs of headroom }
 
   W0 := ws;            W1 := @ws[L];       WM := @ws[2 * L];
   W2 := @ws[3 * L];    W4 := @ws[4 * L];
@@ -907,35 +904,35 @@ begin
   EA := @ws[9 * L];    EB := @ws[9 * L + (k + 2)];
   rest := @ws[9 * L + 2 * (k + 2)];
 
-  { --- W0 = a0*b0, e W4 = a2*b2 --- }
+  { --- W0 = a0*b0, and W4 = a2*b2 --- }
   TcSet(EA, k + 1, a, k);          TcSet(EB, k + 1, b, k);
   MulRec(W0, EA, EB, rest, k + 1); W0[2 * k + 2] := 0; W0[2 * k + 3] := 0;
 
   TcSet(EA, k + 1, @a[2 * k], n2); TcSet(EB, k + 1, @b[2 * k], n2);
   MulRec(W4, EA, EB, rest, k + 1); W4[2 * k + 2] := 0; W4[2 * k + 3] := 0;
 
-  { --- W1 = A(1)*B(1), con A(1) = a0+a1+a2 < 3*B^k, che sta in k+1 limb --- }
+  { --- W1 = A(1)*B(1), with A(1) = a0+a1+a2 < 3*B^k, which fits in k+1 limbs --- }
   TcSet(EA, k + 1, a, k);  TcAddN(EA, k + 1, @a[k], k);  TcAddN(EA, k + 1, @a[2 * k], n2);
   TcSet(EB, k + 1, b, k);  TcAddN(EB, k + 1, @b[k], k);  TcAddN(EB, k + 1, @b[2 * k], n2);
   MulRec(W1, EA, EB, rest, k + 1); W1[2 * k + 2] := 0; W1[2 * k + 3] := 0;
 
-  { --- Wm = |A(-1)| * |B(-1)|, col segno a parte --- }
+  { --- Wm = |A(-1)| * |B(-1)|, with the sign kept aside --- }
   sa := EvalMinus1(EA, TT, a);
   sb := EvalMinus1(EB, TT, b);
   sm := sa xor sb;
   MulRec(WM, EA, EB, rest, k + 1); WM[2 * k + 2] := 0; WM[2 * k + 3] := 0;
 
-  { --- W2 = A(2)*B(2), con A(2) = a0 + 2a1 + 4a2 < 7*B^k: Horner, due raddoppi --- }
+  { --- W2 = A(2)*B(2), with A(2) = a0 + 2a1 + 4a2 < 7*B^k: Horner, two doublings --- }
   TcSet(EA, k + 1, @a[2 * k], n2);
   TcShl1AddN(EA, k + 1, @a[k], k); TcShl1AddN(EA, k + 1, a, k);
   TcSet(EB, k + 1, @b[2 * k], n2);
   TcShl1AddN(EB, k + 1, @b[k], k); TcShl1AddN(EB, k + 1, b, k);
   MulRec(W2, EA, EB, rest, k + 1); W2[2 * k + 2] := 0; W2[2 * k + 3] := 0;
 
-  { ================= interpolazione ================= }
-  { tA = (W1 + Wm)/2, tB = (W1 - Wm)/2 - col segno di Wm che decide il verso.
-    ⭐ Si scrive DIRETTAMENTE nel destinatario: la copia di W1 e poi la somma in posto
-    erano due passate dove ne basta una. }
+  { ================= interpolation ================= }
+  { tA = (W1 + Wm)/2, tB = (W1 - Wm)/2 - with Wm's sign deciding the direction.
+    ⭐ Written STRAIGHT into the destination: copying W1 and then adding in place were two
+    passes where one is enough. }
   if sm = 0 then
   begin
     RunAdd(TA, W1, WM, L);
@@ -949,7 +946,7 @@ begin
   TcShr1(TA, L);                      { tA = c0 + c2 + c4 }
   TcShr1(TB, L);                      { tB = c1 + c3      }
 
-  { c2 = tA - c0 - c4, e da qui TA E' c2 }
+  { c2 = tA - c0 - c4, and from here TA IS c2 }
   TcSubN(TA, L, W0, L);
   TcSubN(TA, L, W4, L);
 
@@ -959,19 +956,19 @@ begin
   TcSubShl(TC, TA, L, 2);
   TcShr1(TC, L);
 
-  { c3 = (tC - tB)/3, poi c1 = tB - c3 }
+  { c3 = (tC - tB)/3, then c1 = tB - c3 }
   TcSubN(TC, L, TB, L);
-  TcDivExact3(TC, L);                 { TC e' c3 }
-  TcSubN(TB, L, TC, L);               { TB e' c1 }
+  TcDivExact3(TC, L);                 { TC is c3 }
+  TcSubN(TB, L, TC, L);               { TB is c1 }
 
-  { ================= si rimonta il risultato =================
-    d = c0 + c1 B^k + c2 B^2k + c3 B^3k + c4 B^4k, e le lunghezze NON si tirano a
-    indovinare: c1 e c2 valgono meno di B^(2k+1), c3 meno di B^(k+n2+1), c4 meno di
-    B^(2*n2). ⛔ Ognuna di queste finisce dentro i 2n limb di d - il conto e' nel
-    commento della procedura - e la propagazione del riporto e' LIMITATA a quel che
-    resta: un riporto che uscisse da d sarebbe memoria di qualcun altro. }
-  { ⭐ c0 e c4 si SCRIVONO, non si sommano: occupano esattamente [0,2k) e [4k,2n), che
-    sono ancora vergini. Restano da azzerare i soli 2k limb di mezzo. }
+  { ================= the result is reassembled =================
+    d = c0 + c1 B^k + c2 B^2k + c3 B^3k + c4 B^4k, and the lengths are NOT guessed: c1 and
+    c2 are below B^(2k+1), c3 below B^(k+n2+1), c4 below B^(2*n2). ⛔ Each of those lands
+    inside d's 2n limbs - the arithmetic is in the procedure's comment - and carry
+    propagation is BOUNDED to what is left: a carry walking off the end of d would be
+    somebody else's memory. }
+  { ⭐ c0 and c4 are WRITTEN, not accumulated: they occupy exactly [0,2k) and [4k,2n),
+    which are still untouched. Only the 2k limbs in the middle are left to zero. }
   for i := 0 to 2 * k - 1 do d[i] := W0[i];
   for i := 0 to 2 * n2 - 1 do d[4 * k + i] := W4[i];
   for i := 2 * k to 4 * k - 1 do d[i] := 0;
@@ -986,10 +983,10 @@ begin
   PropAddLim(@d[4 * k + n2 + 1], c, 2 * n - 4 * k - n2 - 1);
 end;
 
-{ Lo spazio di lavoro che MulRec richiede per n limb, CALCOLATO invece che stimato.
-  ⛔ Una stima generosa e' comunque una stima: qui sotto ci sono cinque puntatori
-  ricavati da k e un livello di ricorsione, e sbagliarla di un limb non da' un errore -
-  da' un risultato giusto quasi sempre. }
+{ The workspace MulRec needs for n limbs, COMPUTED rather than estimated.
+  ⛔ A generous estimate is still an estimate: below there are five pointers derived from k
+  plus one level of recursion, and getting it wrong by one limb does not raise an error -
+  it gives a right answer almost every time. }
 function MulWsNeed(n: PtrInt): PtrInt;
 var k, h: PtrInt;
 begin
@@ -1003,7 +1000,7 @@ begin
   Exit(4 * (h + 1) + MulWsNeed(h + 1));
 end;
 
-{ d[0..2n-1] = a[0..n-1] * b[0..n-1]. ws: spazio di lavoro di MulWsNeed(n) limb. }
+{ d[0..2n-1] = a[0..n-1] * b[0..n-1]. ws: workspace of MulWsNeed(n) limbs. }
 procedure MulRec(d, a, b, ws: PQWord; n: PtrInt);
 var
   m, h, i: PtrInt;
@@ -1117,10 +1114,10 @@ begin
     Exit;
   end;
   {$IFDEF CPUX86_64}
-  { ⭐ Sopra la soglia, e con entrambi i fattori abbastanza grandi, si passa a Karatsuba.
-    I due fattori vengono portati alla STESSA lunghezza con zeri in testa: la ricorsione
-    e' scritta per operandi di pari taglia, ed e' cio' che tiene semplice - e quindi
-    verificabile - la contabilita' degli indici. }
+  { ⭐ Above the threshold, and with both factors large enough, it switches to Karatsuba.
+    The two factors are brought to the SAME length with leading zeros: the recursion is
+    written for operands of equal size, and that is what keeps the index bookkeeping simple
+    - and therefore verifiable. }
   if (an >= KARATSUBA_MIN) and (bn >= KARATSUBA_MIN) then
   begin
     kn := an; if bn > kn then kn := bn;
@@ -1152,9 +1149,9 @@ begin
     begin
       lo := a[i] * b[j];
       hi := MulHi64(a[i], b[j]);
-      { Tre addendi sul limb i+j: quello che c'e' gia', la parte bassa del prodotto e
-        il riporto. ⛔ OGNI somma puo' traboccare, e ogni trabocco va nella parte ALTA:
-        dimenticarne uno sbaglia solo su certi valori, che e' il modo peggiore. }
+      { Three addends on limb i+j: what is already there, the low half of the product and
+        the carry. ⛔ EVERY addition can overflow, and every overflow goes into the HIGH
+        half: forgetting one goes wrong only on certain values, which is the worst way. }
       s := t[i + j] + lo;  if s < lo then Inc(hi);
       s := s + carry;      if s < carry then Inc(hi);
       t[i + j] := s;
@@ -1176,30 +1173,31 @@ begin
 end;
 
 procedure BigAdd(var dst: TLimbs; var dn: Integer; const a: TLimbs; an: Integer; const b: TLimbs; bn: Integer);
-{ ⛔⛔⛔ COSTRUISCE IN UN VETTORE A PARTE, e non e' pignoleria. `x = x + y` fa arrivare
-  qui dst e a come LO STESSO array: il vecchio codice faceva `SetLength(dst, m+1)`, che
-  RIALLOCA, e il parametro `const a` restava a puntare al blocco appena LIBERATO. Da
-  quel momento si legge memoria morta e si corrompe l'heap - il sintomo era un SIGSEGV
-  dentro SysFreeMem di FPC, molto piu' tardi e su un'operazione innocente, con tutti i
-  valori stampati fino a quel punto CORRETTI.
-  ⚠️ Si vede solo quando la somma FA CRESCERE dst: con un numero che sta gia' nei limb
-  disponibili il SetLength non rialloca e tutto sembra funzionare. 14 ago 2026. }
+{ ⛔⛔⛔ IT BUILDS IN A SEPARATE VECTOR, and that is not fussiness. `x = x + y` brings dst
+  and a here as THE SAME array: the old code did `SetLength(dst, m+1)`, which REALLOCATES,
+  and the `const a` parameter went on pointing at the block just FREED. From that moment it
+  reads dead memory and corrupts the heap - the symptom was a SIGSEGV inside FPC's
+  SysFreeMem, much later and on an innocent operation, with every value printed up to that
+  point CORRECT.
+  ⚠️ It only shows when the addition MAKES dst GROW: with a number that already fits in the
+  available limbs the SetLength does not reallocate and everything appears to work.
+  14 Aug 2026. }
 var
   t: TLimbs;
   i, m: Integer;
   s, carry, x: QWord;
 begin
   m := an; if bn > m then m := bn;
-  { ⭐ IL TEMPORANEO SOLO QUANDO SERVE. Il pericolo e' la RIALLOCAZIONE mentre `a` o `b`
-    puntano allo stesso blocco di dst; se dst e' gia' abbastanza capiente non si
-    rialloca nulla e si puo' scrivere in posto, che e' il caso NORMALE dentro un ciclo
-    (dopo i primi giri il vettore ha gia' la sua taglia). Misurato: e' la differenza
-    fra un'allocazione per operazione e nessuna. }
+  { ⭐ THE TEMPORARY ONLY WHEN IT IS NEEDED. The danger is REALLOCATION while `a` or `b`
+    point at the same block as dst; if dst is already large enough nothing is reallocated
+    and the write can happen in place, which is the NORMAL case inside a loop (after the
+    first few turns the vector already has its size). Measured: it is the difference between
+    one allocation per operation and none. }
   if (Length(dst) >= m + 1) and (LimbsRefCount(dst) <= 1) then
   begin
     {$IFDEF CPUX86_64}
-    { ⭐ Lunghezze uguali: e' esattamente una catena ADC, senza rami. E' il caso normale
-      dell'accumulo, dove i due operandi sono cresciuti insieme. }
+    { ⭐ Equal lengths: this is exactly an ADC chain, with no branches. It is the normal case
+      of accumulation, where the two operands have grown together. }
     if (an = bn) and (an > 0) then
     begin
       carry := AddLimbRun(@dst[0], @a[0], @b[0], an);
@@ -1215,7 +1213,7 @@ begin
       s := carry; carry := 0;
       if i < an then begin x := s + a[i]; if x < s then carry := 1; s := x; end;
       if i < bn then begin x := s + b[i]; if x < s then Inc(carry); s := x; end;
-      dst[i] := s;      { stesso indice letto e scritto: l'aliasing e' innocuo }
+      dst[i] := s;      { same index read and written: the aliasing is harmless }
     end;
     dn := m;
     if carry > 0 then begin dst[dn] := carry; Inc(dn); end;
@@ -1243,7 +1241,7 @@ var
   i: Integer;
   bb, v, borrow: QWord;
 begin
-  { Stesso motivo di BigAdd, e stessa scorciatoia: in posto quando non si rialloca. }
+  { Same reason as BigAdd, and the same shortcut: in place when nothing is reallocated. }
   if (Length(dst) >= an) and (LimbsRefCount(dst) <= 1) then
   begin
     {$IFDEF CPUX86_64}
@@ -1377,19 +1375,19 @@ begin
   qq := q;
   for j := m downto 0 do
   begin
-    { stima da due limb su uno; u[j+n] < v[n-1] e' l'invariante che regge DIVQ }
+    { estimate from two limbs over one; u[j+n] < v[n-1] is the invariant that holds DIVQ up }
     if u[j + n] >= v[n - 1] then
     begin
       qhat := QWord($FFFFFFFFFFFFFFFF);
       rhat := u[j + n - 1] + v[n - 1];
-      neg := rhat < v[n - 1];      { il riporto dice che rhat e' gia' oltre un limb }
+      neg := rhat < v[n - 1];      { the carry says rhat is already past one limb }
     end
     else
     begin
       qhat := DivMod128By64(u[j + n], u[j + n - 1], v[n - 1], rhat);
       neg := False;
     end;
-    { correzione: finche' qhat*v[n-2] > rhat:u[j+n-2], qhat e' alto }
+    { correction: while qhat*v[n-2] > rhat:u[j+n-2], qhat is too high }
     while (not neg) do
     begin
       hi := MulHi64(qhat, v[n - 2]);
@@ -1398,7 +1396,7 @@ begin
       begin
         Dec(qhat);
         rhat := rhat + v[n - 1];
-        if rhat < v[n - 1] then neg := True;   { rhat e' uscito dal limb: basta correggere }
+        if rhat < v[n - 1] then neg := True;   { rhat left the limb: correcting is enough }
       end
       else Break;
     end;
@@ -1453,7 +1451,7 @@ begin
 
   qn := m + 1; while (qn > 1) and (qq[qn - 1] = 0) do Dec(qn);
 
-  { il resto e' u[0..n-1] >> s }
+  { the remainder is u[0..n-1] >> s }
   UniqueLimbs(r); if Length(r) < n then SetLength(r, n);
   if s = 0 then
     for i := 0 to n - 1 do r[i] := u[i]

@@ -821,8 +821,8 @@ type
       and every consumer must keep asking rather than testing for an identifier. }
     function IsBigIntExpr(Node: TASTNode): Boolean;
     function BigOperandHandle(Node: TASTNode): TSSAValue;
-    { DestReg, quando e' un registro, e' DOVE scrivere il risultato: serve a togliere
-      il temporaneo piu' la copia da ogni assegnazione. svkNone = alloca un temporaneo. }
+    { DestReg, when it is a register, is WHERE to write the result: it exists to remove the
+      temporary plus the copy from every assignment. svkNone = allocate a temporary. }
     function TryEmitBigIntBinaryOp(Node: TASTNode; out Res: TSSAValue;
       const DestReg: TSSAValue): Boolean;
     procedure ProcessPrintUsing(Node: TASTNode);
@@ -6805,9 +6805,9 @@ begin
                       MakeSSAValue(svkNone));
       Exit;
     end;
-    { ⭐⭐ L'assegnazione di un'espressione BigInt scrive DIRETTAMENTE nel registro del
-      bersaglio: niente temporaneo, niente copia di ritorno. Su pidigits e' la meta'
-      del lavoro, perche' ogni termine assegna numeri che crescono di continuo. }
+    { ⭐⭐ Assigning a BigInt expression writes STRAIGHT into the target's register: no
+      temporary, no copy back. On pidigits that is half the work, because every term assigns
+      numbers that keep growing. }
     if (ExprNode.NodeType = antBinaryOp) and IsBigIntExpr(ExprNode) and
        TryEmitBigIntBinaryOp(ExprNode, ExprValue, VarReg) then
       Exit;
@@ -21529,15 +21529,14 @@ begin
           // not a scalar bank: its value is a record, and InferExprBank would see only the int handle and
           // make v an INTEGER holding that handle. ObjectTypeName reads the type without emitting code.
           TypeName := ObjectTypeName(Decl.GetChild(1));
-          // ⛔⛔ IL BANCO NON E' IL TIPO. InferExprBank risponde int/float/string, cioe' tre
-          // risposte per dieci tipi: "Var b = Cast(Short, 0)" diventava INTEGER e SizeOf(b)
-          // rispondeva 8 invece di 2. Erano sbagliati CINQUE tipi su dieci - Byte, Short,
-          // UByte, UShort e Single - e il sintomo non era un errore, era un numero.
-          // ⭐ La larghezza DICHIARATA esiste gia' e ha un suo registro (Declared32Code, lo
-          // stesso che decide il troncamento allo store): qui si legge di la' invece di
-          // reinventarla, cosi' VAR eredita per costruzione tutto cio' che quel registro sa -
-          // il cast esplicito, una variabile tipata, un campo di UDT, il risultato di una
-          // funzione. ⇒ [[the-declared-width-registry-is-the-store-funnel]]
+          // ⛔⛔ THE BANK IS NOT THE TYPE. InferExprBank answers int/float/string, i.e. three
+          // answers for ten types: "Var b = Cast(Short, 0)" became INTEGER and SizeOf(b) said 8
+          // instead of 2. FIVE of ten types were wrong - Byte, Short, UByte, UShort and Single -
+          // and the symptom was not an error, it was a number.
+          // ⭐ The DECLARED width already exists and has a registry of its own (Declared32Code,
+          // the same one that decides store narrowing): this reads from there rather than
+          // inventing a second answer, so VAR inherits by construction everything that registry
+          // knows - an explicit cast, a typed variable, a UDT field, a function result.
           if TypeName = '' then
           begin
             case Declared32Code(Decl.GetChild(1)) of
@@ -21548,13 +21547,13 @@ begin
               5: TypeName := 'LONG';
               6: TypeName := 'ULONG';
               7: TypeName := 'SINGLE';
-              8: TypeName := 'UINTEGER';   // UINTEGER e ULONGINT hanno la stessa larghezza
+              8: TypeName := 'UINTEGER';   // UINTEGER and ULONGINT have the same width
               9: TypeName := 'INT32';
              10: TypeName := 'UINT32';
             end;
-            // ⚠️ E il banco resta l'ultima parola quando nessuna larghezza e' dichiarata: un
-            // letterale, una concatenazione, un'espressione mista non hanno un tipo DICHIARATO
-            // da ereditare, e li' il default a 64 bit e' la risposta giusta - la stessa di fbc.
+            // ⚠️ And the bank stays the last word when NO width is declared: a literal, a
+            // concatenation, a mixed expression have no DECLARED type to inherit, and there the
+            // 64-bit default is the right answer - the same one fbc gives.
             if TypeName = '' then
               case InferExprBank(Decl.GetChild(1)) of
                 srtString: TypeName := 'STRING';
@@ -21912,21 +21911,21 @@ begin
     the hard piece of every bignum and pidigits does not need it (divDigit tries the
     ten quotients with comparisons). Saying so is the whole point: a silent wrong
     answer would be found by a user, a refusal is found by the compiler. }
-  { ⭐ LA DIVISIONE C'E'. Era dichiarata fuori dalla v1 e RIFIUTATA; ora e' l'algoritmo D
-    di Knuth, verificato su 30 000 divisioni casuali fino a 20 limb, divisori quasi
-    massimi inclusi (e' li' che la stima del quoziente sbaglia di uno).
-    ⚠️ Le tre grafie danno tutte la divisione INTERA: un BigInt con la virgola non
-    esiste, quindi "/" non puo' promettere altro - e prometterlo in silenzio sarebbe
-    peggio del rifiuto di prima. }
+  { ⭐ DIVISION IS HERE. It used to be declared out of v1 and REFUSED; now it is Knuth's
+    algorithm D, verified over 30 000 random divisions up to 20 limbs, near-maximal divisors
+    included (that is where the quotient estimate goes wrong by one).
+    ⚠️ All three spellings give INTEGER division: a BigInt with a fractional part does not
+    exist, so "/" cannot promise anything else - and promising it silently would be worse
+    than the refusal it replaced. }
   if (Op = '/') or (Op = '\') or (Op = 'MOD') then
   begin
     L := BigOperandHandle(Node.GetChild(0));
     R := BigOperandHandle(Node.GetChild(1));
-    { ⛔ ONORARE DestReg. Il chiamante che lo passa - un'assegnazione - considera il
-      valore GIA' scritto li' e non copia nulla dopo: ignorarlo lasciava la variabile
-      col suo valore precedente, in silenzio. Successe subito, e la batteria di 240
-      divisioni non lo vide perche' misurava ESPRESSIONI (Print x \ y), dove la
-      destinazione e' un temporaneo e quindi coincide per caso. }
+    { ⛔ HONOUR DestReg. The caller that passes it - an assignment - considers the value
+      ALREADY written there and copies nothing afterwards: ignoring it left the variable at
+      its previous value, silently. It happened immediately, and the battery of 240 divisions
+      did not see it because it measured EXPRESSIONS (Print x \ y), where the destination is
+      a temporary and so coincides by accident. }
     if DestReg.Kind = svkRegister then Res := DestReg
     else Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     if Op = 'MOD' then EmitInstruction(ssaBigMod, Res, L, R, MakeSSAValue(svkNone))
@@ -23718,15 +23717,15 @@ begin
   begin
     VNameU := UpperCase(VarToStr(Node.Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
-    // "@z[i]": il nome sta nel SOTTOALBERO, non in Node.Value, quindi senza questo il
-    // contenitore non veniva sostenuto e "@z[15]" falliva dove "@z" funzionava.
-    // ⛔⛔ E NON SI PUO' FARE SENZA GUARDIA: la prima versione marcava qualunque base e
-    // rompeva m370_addrof_raw_pointer_element, perche' marcare @-preso un PUNTATORE GREZZO
-    // ne cambia il sostegno - il suo "@p[i]" e' gia' aritmetica sul puntatore, non ha
-    // bisogno di memoria stabile. La stessa guardia serviva, e serve, nelle posizioni ByRef
-    // di fb_Mem* qui sotto: e' la riga che separa un buffer ZString da una variabile
-    // puntatore. ⚠️ FPointerVars e' popolato da QUESTA passata dai DIM "<tipo> PTR", e la
-    // visita e' in ordine di sorgente: la dichiarazione precede l'uso.
+    // "@z[i]": the name lives in the SUBTREE, not in Node.Value, so without this the container
+    // was never backed and "@z[15]" failed where "@z" worked.
+    // ⛔⛔ AND IT CANNOT BE DONE WITHOUT A GUARD: the first version marked any base and broke
+    // m370_addrof_raw_pointer_element, because marking a RAW POINTER address-taken changes its
+    // backing - its "@p[i]" is already pointer arithmetic and needs no stable storage. The same
+    // guard was needed, and is used, in the fb_Mem* ByRef positions below: it is the line that
+    // separates a ZString buffer from a pointer variable.
+    // ⚠️ FPointerVars is populated by THIS pass from the DIM "<type> PTR" nodes, and the walk is
+    // in source order: the declaration precedes the use.
     if (VNameU = '') and (Node.ChildCount >= 1) and
        (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
        (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
@@ -23747,15 +23746,14 @@ begin
     VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
   end;
-  // ⛔⛔ E LE POSIZIONI **ByRef** DI fb_Mem*/Clear SONO LO STESSO CASO. Prendono l'indirizzo
-  // dell'lvalue nominato esattamente come VARPTR, quindi quella variabile va sostenuta con
-  // memoria stabile - e se non la si registra QUI, la sintesi di "@nome" durante la
-  // generazione SSA arriva con pass 1 gia' chiuso e fallisce con "Undefined procedure
+  // ⛔⛔ AND THE **ByRef** POSITIONS OF fb_Mem*/Clear ARE THE SAME CASE. They take the address
+  // of the lvalue they name, exactly as VARPTR does, so that variable must be backed with
+  // stable storage - and if it is not registered HERE, the "@name" synthesized during SSA
+  // generation arrives with pass 1 already closed and fails with "Undefined procedure
   // (address-of @): DST".
-  // ⚠️ E' il difetto che mi aveva fatto credere che di mezzo ci fosse il MODELLO delle
-  // stringhe: "@z" su una ZString * n funziona da sempre, scrittura compresa (verificato
-  // contro fbc). Mancava solo la registrazione - un elenco di posizioni, non una
-  // rappresentazione.
+  // ⚠️ This is the defect that made it look as though the string MODEL were in the way: "@z" on
+  // a ZString * n has always worked, writing through it included (verified against fbc). Only
+  // the registration was missing - a list of positions, not a representation.
   if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
      (Node.GetChild(0).NodeType = antIdentifier) then
   begin
@@ -23764,22 +23762,22 @@ begin
        (TypeNameU = kFBMEMCOPYCLEAR) or (TypeNameU = kCLEAR) then
       for k := 0 to Node.GetChild(1).ChildCount - 1 do
       begin
-        // Quali posizioni sono INDIRIZZI: (dst, src) per copy/move; per copyclear la 0 e la 2;
-        // per Clear la sola dst. Le altre sono lunghezze e valori, e vanno lette per valore.
+        // Which positions are ADDRESSES: (dst, src) for copy/move; 0 and 2 for copyclear; only
+        // dst for Clear. The rest are lengths and values, and are read by value.
         if ((TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or (TypeNameU = kCLEAR)) and
            (k > Ord((TypeNameU <> kCLEAR))) then Break;
         if (TypeNameU = kFBMEMCOPYCLEAR) and (k <> 0) and (k <> 2) then Continue;
         Decl := Node.GetChild(1).GetChild(k);
-        // "*p" non si registra: l'indirizzo E' gia' il valore di p.
+        // "*p" registers nothing: the address IS already the value of p.
         if Decl.NodeType = antDeref then Continue;
-        // ⛔⛔ "q[4]": si scende a marcare il contenitore SOLO SE NON E' UN PUNTATORE.
-        // Marcare @-preso un puntatore grezzo ne cambia il SOSTEGNO, e m146 e' passato da
-        // verde a "Null or invalid raw pointer dereference": provato, misurato, ristretto.
-        // Per una `ZString * n` invece la marcatura SERVE - senza, "fb_memmove(z[20], z[15],
-        // 11)" non trova un @z sostenuto, perche' in quel sorgente non c'e' nessuna "@"
-        // scritta a mano che l'avrebbe fatta registrare.
-        // ⚠️ FPointerVars e' popolato da questa stessa passata dai DIM "<tipo> PTR", e la
-        // visita e' in ordine di sorgente: la dichiarazione viene prima dell'uso.
+        // ⛔⛔ "q[4]": descend to mark the container ONLY IF IT IS NOT A POINTER. Marking a raw
+        // pointer address-taken changes its BACKING, and m146 went from green to "Null or
+        // invalid raw pointer dereference": tried, measured, narrowed.
+        // For a `ZString * n` the marking IS needed - without it "fb_memmove(z[20], z[15], 11)"
+        // finds no backed @z, because that source contains no hand-written "@" that would have
+        // registered it.
+        // ⚠️ FPointerVars is populated by this same pass from the DIM "<type> PTR" nodes, and
+        // the walk is in source order: the declaration precedes the use.
         if (Decl.NodeType = antArrayAccess) and (Decl.ChildCount >= 1) and
            (Decl.GetChild(0).NodeType = antIdentifier) and
            (FPointerVars.IndexOfName(UpperCase(VarToStr(Decl.GetChild(0).Value))) < 0) then
@@ -23836,12 +23834,12 @@ var
     if N = nil then Exit;
     if (N.NodeType = antProcAddress) and (N.ChildCount = 0) then
       Result := UpperCase(VarToStr(N.Value))
-    // ⭐ "@x[i]" nomina lo stesso scalare di "@x": l'indice sceglie un byte DENTRO x, non un
-    // altro oggetto. Senza questo il nome non veniva registrato, quindi x restava un valore
-    // gestito e "@x" rispondeva con un handle impacchettato invece di un indirizzo di byte -
-    // e il deref falliva. ⛔ Il sintomo ingannava: "@z[15]" e "@z[0]" fallivano ENTRAMBI e con
-    // lo stesso identico valore di "@z", che invece funziona. Non era l'aritmetica: era che
-    // questa riga decide se z riceve una casella grezza, e non la vedeva.
+    // ⭐ "@x[i]" names the same scalar as "@x": the index picks a byte INSIDE x, not another
+    // object. Without this the name was not registered, so x stayed a managed value and "@x"
+    // answered with a packed handle rather than a byte address - and the deref failed.
+    // ⛔ The symptom misled: "@z[15]" and "@z[0]" BOTH failed, and with exactly the same value
+    // as "@z", which works. It was not the arithmetic: this line decides whether z gets a raw
+    // slot, and it could not see the shape.
     else if (N.NodeType = antProcAddress) and (N.ChildCount >= 1) and
             (N.GetChild(0).NodeType = antArrayAccess) and (N.GetChild(0).ChildCount >= 1) and
             (N.GetChild(0).GetChild(0).NodeType = antIdentifier) then
@@ -24334,12 +24332,13 @@ begin
   // @p[i] where p is a raw pointer: FreeBASIC "@p[i]" ≡ "p + i", a raw pointer of the same element type
   // (EmitArrayElementAddress emits the SizeOf-scaled byte address). Treat it as the raw pointer p so a
   // deref of it loads from the byte heap and an assignment "q = @p[i]" carries the raw-ness onto q.
-  // ⭐ E VALE ANCHE SE LA BASE NON E' UN PUNTATORE ma uno scalare o un buffer ZString sostenuti
-  // da memoria grezza: sono gli stessi tre predicati che il caso "@x" qui sopra usa gia'. Senza,
-  // "q = @z[i]" su una `ZString * n` non ereditava la grezzezza, e il deref di q tornava sulla
-  // via gestita decodificando l'indirizzo come un handle - con lo STESSO valore numerico che
-  // funzionava passando per "@z" e poi sommando. ⛔ Ed e' la ragione per cui il sintomo
-  // ingannava: valore giusto, tipo giusto, e a decidere era la classificazione della VARIABILE.
+  // ⭐ AND IT HOLDS EVEN WHEN THE BASE IS NOT A POINTER but a scalar or a ZString buffer backed
+  // by raw memory: these are the same three predicates the "@x" case just above already uses.
+  // Without them "q = @z[i]" on a `ZString * n` did not inherit the raw-ness, and q's deref fell
+  // back to the managed path and decoded the address as a handle - with the SAME numeric value
+  // that worked when going through "@z" and adding.
+  // ⛔ That is why the symptom misled: right value, right type, and what decided it was the
+  // classification of the VARIABLE.
   else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
           (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
@@ -24576,56 +24575,56 @@ procedure TSSAGenerator.EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; ou
 var
   DstR, SrcR, BytesR, ValR, DstLenR, SrcLenR, RestPtr, RestLen, ZeroR, TmpV: TSSAValue;
 
-  // ⛔⛔ LE POSIZIONI DI INDIRIZZO SONO **ByRef**, e non e' un dettaglio di firma: cambia
-  // cosa significa il programma. Il manuale di FreeBASIC lo dichiara,
+  // ⛔⛔ THE ADDRESS POSITIONS ARE **ByRef**, and that is not a signature detail: it changes
+  // what the program means. The FreeBASIC manual declares it,
   //     Declare Function fb_memcopy cdecl (ByRef dst As Any, ByRef src As Any, ByVal bytes As UInteger)
   //     "Each starting address is taken from a reference to a variable or array element"
-  // e la regola e' UNA sola: si prende l'indirizzo dell'**lvalue nominato**. Da cui, misurato
-  // contro fbc 1.10.1 il 15 ago 2026:
-  //     fb_memcopy(q, p, n)    ->  memcpy(&q, &p, n)   copia le VARIABILI
-  //     fb_memcopy(*q, *p, n)  ->  memcpy( q,  p, n)   copia la MEMORIA PUNTATA
-  // ⭐ E le due grafie non sono un'ambiguita': `*q` E' l'oggetto puntato da q, e il suo
-  // indirizzo E' q - lo stesso modello mentale del C. Quindi allinearsi non rompe la lettura
-  // di chi arriva da memcpy(): gliela rende esplicita.
-  // ⚠️ Prima valutavamo queste posizioni per VALORE, cioe' trattavamo `q` come se fosse `*q`.
-  // Comodo, e sbagliato in un modo che non si vede: `fb_memcopy(q, p, 4)` in fbc CORROMPE q
-  // (dopo la chiamata q aliasa p - verificato), quindi un programma scritto contro di noi
-  // faceva silenziosamente un'altra cosa una volta portato.
+  // and there is ONE rule: take the address of the **lvalue named**. Hence, measured against
+  // fbc 1.10.1 on 15 Aug 2026:
+  //     fb_memcopy(q, p, n)    ->  memcpy(&q, &p, n)   copies the VARIABLES
+  //     fb_memcopy(*q, *p, n)  ->  memcpy( q,  p, n)   copies the MEMORY POINTED AT
+  // ⭐ And the two spellings are not an ambiguity: `*q` IS the object q points at, and its
+  // address IS q - the same mental model as C. So aligning does not break the reading of
+  // someone arriving from memcpy(): it makes that reading explicit.
+  // ⚠️ We used to evaluate these positions by VALUE, i.e. we treated `q` as if it were `*q`.
+  // Convenient, and wrong in a way that does not show: `fb_memcopy(q, p, 4)` in fbc CORRUPTS q
+  // (after the call q aliases p - verified), so a program written against us silently did
+  // something else once ported.
   function ByRefAddr(ArgNode: TASTNode): TSSAValue;
   var AddrNode: TASTNode;
   begin
-    // `*p`: l'indirizzo dell'oggetto puntato E' il puntatore. Nessun @ da sintetizzare.
+    // `*p`: the address of the object pointed at IS the pointer. No @ to synthesize.
     if (ArgNode.NodeType = antDeref) and (ArgNode.ChildCount >= 1) then
     begin
       ProcessExpression(ArgNode.GetChild(0), Result);
       Exit;
     end;
-    // ⛔⛔ IL PUNTATORE NUDO: qui fbc fa una cosa che quasi nessuno vuole, e in SILENZIO.
-    // `fb_memcopy(q, p, 4)` con q e p puntatori diventa `memcpy(&q, &p, 4)`: sovrascrive le
-    // VARIABILI PUNTATORE, e dopo la chiamata q aliasa p. Verificato contro fbc 1.10.1: il
-    // programma stampava perfino i byte "giusti", ma solo perche' q era stato corrotto fino a
-    // puntare al buffer di p.
-    // ⇒ Non lo riproduciamo e non lo lasciamo passare: lo si NOMINA. Riprodurre una corruzione
-    // non serve a nessun programma corretto, e tacere la lascerebbe scoprire a valle, dove non
-    // si risale piu' alla riga che l'ha causata. Chi voleva copiare la memoria puntata scrive
-    // `*q`, che e' la grafia di fbc per quella intenzione ed e' anche quella del C.
+    // ⛔⛔ THE BARE POINTER: here fbc does something almost nobody wants, and SILENTLY.
+    // `fb_memcopy(q, p, 4)` with q and p pointers becomes `memcpy(&q, &p, 4)`: it overwrites the
+    // POINTER VARIABLES, and after the call q aliases p. Verified against fbc 1.10.1 - the test
+    // program even printed the "right" bytes, but only because q had been wrecked into pointing
+    // at p's buffer.
+    // ⇒ We neither reproduce it nor let it pass: we NAME it. Reproducing a corruption serves no
+    // correct program, and staying silent would leave it to be discovered downstream, where the
+    // line that caused it can no longer be found. Whoever meant to copy the memory pointed at
+    // writes `*q`, which is fbc's spelling for that intention and also C's.
     if (ArgNode.NodeType = antIdentifier) and IsRawPtr(VarToStr(ArgNode.Value)) then
       raise Exception.CreateFmt(
         'In %s the address positions are BYREF: "%s" names the POINTER VARIABLE, so this would ' +
         'overwrite the pointer itself (fbc does exactly that, silently). To copy the memory it ' +
         'points to, write "*%s".',
         [FuncU, VarToStr(ArgNode.Value), VarToStr(ArgNode.Value)]);
-    // ⛔⛔ QUI C'ERA UNA GUARDIA CHE RIFIUTAVA LE STRINGHE, ed era SBAGLIATA. Avevo concluso
-    // che una `ZString * n`, essendo un valore gestito, non avesse un indirizzo da prendere -
-    // e non l'avevo verificato. Misurato dopo, contro fbc: "@z" su una `ZString * n` funziona
-    // da sempre, e ci si SCRIVE pure ("Dim As UByte Ptr b = @z : b[0] = 74" cambia z, come in
-    // fbc). Il vero difetto era altrove: la pre-passata che raccoglie le variabili @-prese non
-    // conosceva queste posizioni ByRef, quindi la variabile non veniva sostenuta con memoria
-    // stabile - vedi CollectDimVarBanks.
-    // ⇒ Una diagnostica che nomina la causa SBAGLIATA e' peggio di nessuna diagnostica: rende
-    // definitivo un limite che non esiste, e chi la legge smette di cercare.
-    // ogni altro lvalue: e' esattamente "@arg" nel nostro modello, come fa VARPTR - e il
-    // lowering di @ sa gia' fare scalare / elemento di array / campo di UDT / SHARED.
+    // ⛔⛔ THERE WAS A GUARD HERE THAT REFUSED STRINGS, and it was WRONG. I had concluded that a
+    // `ZString * n`, being a managed value, had no address to take - and I had not checked it.
+    // Measured afterwards, against fbc: "@z" on a `ZString * n` has always worked, and you can
+    // WRITE through it too ("Dim As UByte Ptr b = @z : b[0] = 74" changes z, as in fbc). The
+    // real defect was elsewhere: the pre-pass that collects address-taken variables did not know
+    // about these ByRef positions, so the variable was never backed with stable storage - see
+    // CollectDimVarBanks.
+    // ⇒ A diagnostic that names the WRONG cause is worse than no diagnostic: it makes a limit
+    // that does not exist look settled, and whoever reads it stops looking.
+    // any other lvalue: it is exactly "@arg" in our model, as VARPTR does - and the @ lowering
+    // already handles scalar / array element / UDT field / SHARED.
     if ArgNode.NodeType = antIdentifier then
       AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token)
     else
@@ -24652,14 +24651,14 @@ begin
   else if FuncU = kCLEAR then
   begin
     // Clear cdecl (ByRef dst As Any, ByVal value As Long = 0, ByVal bytes As UInteger):
-    // solo il destinatario e' ByRef, le altre due posizioni sono valori.
+    // only the destination is ByRef, the other two positions are values.
     TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(1), TmpV); ValR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
     EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), DstR, ValR, BytesR);
     EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end
-  else  // kFBMEMCOPYCLEAR: (dst, dstlen, src, srclen) - dst e src ByRef, le due lunghezze ByVal
+  else  // kFBMEMCOPYCLEAR: (dst, dstlen, src, srclen) - dst and src ByRef, both lengths ByVal
   begin
     TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(1), TmpV); DstLenR := EnsureIntRegister(TmpV);
@@ -25389,12 +25388,12 @@ begin
   ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
   begin
-    // ⛔ LA STRINGA VA PROVATA PER PRIMA, e l'ordine qui e' il difetto che ho pagato: una
-    // `ZString * n` marcata @-presa risponde SI' anche a ManagedPtrPointee, quindi finiva nel
-    // ramo dei puntatori qui sotto e sommava l'indice al VALORE della stringa. Il sintomo era
-    // un indirizzo 2^62+31 dove me ne aspettavo uno +15: il ramo giusto non veniva nemmeno
-    // raggiunto. ⇒ Un ramo irraggiungibile e' indistinguibile da un ramo sbagliato finche'
-    // non si guardano i NUMERI.
+    // ⛔ THE STRING MUST BE TRIED FIRST, and the order here is the defect this cost: a
+    // `ZString * n` marked address-taken also answers YES to ManagedPtrPointee, so it fell into
+    // the pointer branch below and added the index to the string's VALUE. The tell was an
+    // address of 2^62+31 where +15 was expected: the right branch was never reached.
+    // ⇒ An unreachable branch is indistinguishable from a wrong one until you look at the
+    // NUMBERS. Trying the string first is safe - a string is never a pointer.
     if (InferExprBank(Node.GetChild(0)) = srtString) and
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
     begin

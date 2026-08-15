@@ -221,24 +221,24 @@ begin
       if ACount <= VarIdx then ACount := VarIdx + 1;   // so the parameter resolves to the empty text
     end;
   end;
-  // ⛔⛔ GLI ARGOMENTI SI ESPANDONO UNA VOLTA, QUI, PRIMA DI ENTRARE NEL CORPO - e su questo
-  // FreeBASIC NON segue il C. In C un operando di "##" viene congelato; qui no, e lo dimostra
-  // l'esempio del manuale (defines/fbjoin2.bas):
+  // ⛔⛔ THE ARGUMENTS ARE EXPANDED ONCE, HERE, BEFORE THEY ENTER THE BODY - and on this point
+  // FreeBASIC does NOT follow C. In C an operand of "##" is frozen; here it is not, and the
+  // manual's own example proves it (defines/fbjoin2.bas):
   //     #define join( a, b )      a##b
   //     #define makename2( x )    join( PREFIX, join( x, SUFFIX ) )
-  //     makename2(text)  ->  ptext_T           '' non "PREFIXjoin( text, SUFFIX )"
-  // cioe' entrambi gli ARGOMENTI di join sono espansi (PREFIX->p, join(text,SUFFIX)->text_T) e
-  // solo dopo incollati.
-  // ⚠️ E non e' in contraddizione con la riga sopra, "#define makename1(x) PREFIX##x##SUFFIX",
-  // che da' PREFIXtextSUFFIX: li' PREFIX e SUFFIX non sono ARGOMENTI, sono testo del CORPO. Il
-  // corpo non si pre-espande, e l'incollatura ne fa un identificatore nuovo che la riscansione
-  // non riapre. Argomenti ed elementi del corpo seguono due regole diverse, ed e' la distinzione
-  // che questo blocco esiste per tenere.
-  // ⛔ Espandere DOPO l'incollatura non basta e non e' la stessa cosa: "PREFIX" e "join" incollati
-  // diventano l'unico identificatore "PREFIXjoin", e a quel punto non c'e' piu' nessuna chiamata
-  // da espandere. L'informazione e' gia' stata distrutta.
+  //     makename2(text)  ->  ptext_T           '' not "PREFIXjoin( text, SUFFIX )"
+  // i.e. BOTH arguments of join are expanded (PREFIX->p, join(text,SUFFIX)->text_T) and only
+  // then pasted.
+  // ⚠️ And that does not contradict the line above it, "#define makename1(x) PREFIX##x##SUFFIX",
+  // which gives PREFIXtextSUFFIX: there PREFIX and SUFFIX are not ARGUMENTS, they are text of the
+  // BODY. The body is not pre-expanded, and pasting turns it into a new identifier that the
+  // rescan does not reopen. Arguments and body elements follow two different rules, and keeping
+  // them apart is what this block exists to do.
+  // ⛔ Expanding AFTER the paste is not enough and not the same thing: "PREFIX" and "join" pasted
+  // together are the single identifier "PREFIXjoin", and by then there is no call left to expand.
+  // The information has already been destroyed.
   for k := 0 to ACount - 1 do
-    if Pos('#', Args[k]) = 0 then          // un argomento che porta '#' e' gia' testo per il preprocessore
+    if Pos('#', Args[k]) = 0 then          // an argument carrying '#' is already preprocessor text
       Args[k] := SubstituteMacros(Args[k], Defs, FnDefs, Depth + 1);
   // Replace each whole-identifier parameter with its argument, handling the FreeBASIC preprocessor
   // operators: "#param" stringizes the argument; "a ## b" pastes the surrounding tokens together.
@@ -269,15 +269,15 @@ begin
         pi := ParamIndex(Word);
         if (pi >= 0) and (pi < ACount) then
         begin
-          // ⛔ L'ARGOMENTO SI ESPANDE PRIMA DI STRINGIFICARLO, e qui FreeBASIC NON segue il C.
-          // In C "#x" congela il testo scritto dal chiamante; in FreeBASIC il manuale mostra
+          // ⛔ THE ARGUMENT IS EXPANDED BEFORE IT IS STRINGIZED, and here too FreeBASIC does NOT
+          // follow C. In C "#x" freezes the text the caller wrote; in FreeBASIC the manual shows
           //     #macro dump(arg)
           //       #print #arg
           //     #endmacro
-          //     dump( makename1(text) )      '' stampa PREFIXtextSUFFIX, non "makename1(text)"
-          // cioe' l'argomento viene ESPANSO e poi reso testo. Prendere la regola del C dava il
-          // testo grezzo, ed era invisibile: nessun errore, solo la stampa sbagliata.
-          // ⚠️ Args[] e' GIA' espanso dal blocco poco sopra, quindi qui basta renderlo testo.
+          //     dump( makename1(text) )      '' prints PREFIXtextSUFFIX, not "makename1(text)"
+          // i.e. the argument is EXPANDED and then turned into text. Taking the C rule gave the
+          // raw text, and it was invisible: no error, only the wrong output.
+          // ⚠️ Args[] is ALREADY expanded by the block just above, so this only has to quote it.
           Result := Result + Stringize(Args[pi]);
           i := k; Continue;
         end;

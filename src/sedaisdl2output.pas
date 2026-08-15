@@ -709,7 +709,7 @@ begin
       TTF_SizeUTF8(FFont, 'W', @FCharWidth, @FCharHeight);
       WriteLn('Actual character size: ', FCharWidth, 'x', FCharHeight, ' px');
 
-      // Verifica che il carattere entri nella cella logica
+      // check that the character fits the logical cell
       if (FCharWidth > FCalculatedFontSize) or (FCharHeight > FCalculatedFontSize) then
         WriteLn('WARNING: Character larger than calculated font size!');
     end
@@ -1599,7 +1599,7 @@ begin
   SDL_SetRenderDrawColor(FRenderer, FBackgroundColor.R, FBackgroundColor.G, FBackgroundColor.B, 255);
   SDL_RenderClear(FRenderer);
 
-  // === OTTIMIZZAZIONE: Marca tutto come dirty invece di ridisegnare immediatamente ===
+  // === OPTIMIZATION: mark everything dirty instead of redrawing immediately ===
   for y := 0 to FDesiredRows - 1 do
     for x := 0 to FDesiredCols - 1 do
       if FVideoBuffer[x][y].HasChar then
@@ -1613,7 +1613,7 @@ begin
   FCursorX := 0;
   Inc(FCursorY);
 
-  // Se sono all'ultima riga, fai scroll LOGICO invece che fisico
+  // on the last row, scroll LOGICALLY rather than physically
   if FCursorY >= FDesiredRows then
   begin
     // AGGIUNGI la riga che sta per uscire dal top al buffer del pager

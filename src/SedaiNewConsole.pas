@@ -12101,7 +12101,7 @@ begin
         begin
           // Cancella la riga corrente
           FTextBuffer.ClearCurrentLine;
-          // Inserisce il comando dalla history (troncato alla larghezza della riga)
+          // insert the command from the history (truncated to the line width)
           FTextBuffer.PutStringNoWrap(FInputHistory[FHistoryCount - 1 - FHistoryPos]);
           FUserHasTyped := True;  // User selected from history = intent to execute
         end
@@ -12124,7 +12124,7 @@ begin
         begin
           // Cancella la riga corrente
           FTextBuffer.ClearCurrentLine;
-          // Inserisce il comando dalla history (troncato alla larghezza della riga)
+          // insert the command from the history (truncated to the line width)
           FTextBuffer.PutStringNoWrap(FInputHistory[FHistoryCount - 1 - FHistoryPos]);
           FUserHasTyped := True;  // User selected from history = intent to execute
         end

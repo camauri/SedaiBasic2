@@ -1310,7 +1310,7 @@ begin
       Result.Objects[Index] := TObject(ACount);
     end
     else
-      Result.Objects[Index] := TObject(PtrInt(1));  // <-- PtrInt(1) invece di 1
+      Result.Objects[Index] := TObject(PtrInt(1));  // <-- PtrInt(1) rather than 1
   end;
 end;
 

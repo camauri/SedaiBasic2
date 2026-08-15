@@ -31,7 +31,7 @@ uses
   Classes, SysUtils;
 
 type
-  { Comportamento della virgola in PRINT }
+  { Behaviour of the comma in PRINT }
   TCommaAction = (
     caTabZone,        // TAB alla prossima zona (C64, Atari: 10 col, MSX: 14 col, Spectrum: 16 col)
     caFixedSpaces,    // Numero fisso di spazi
@@ -84,7 +84,7 @@ type
   { Comportamento wrap testo }
   TTextWrapMode = (
     twmWrap,          // Wrap automatico alla riga successiva
-    twmTruncate,      // Tronca alla fine della riga
+    twmTruncate,      // truncate at the end of the line
     twmScroll         // Scrolla orizzontalmente (raro)
   );
 

@@ -1399,9 +1399,9 @@ end;
 procedure TBytecodeVM.InitializeRegisters;
 var i: Integer;
 begin
-  { ⛔ -1, NON zero. I campi di un oggetto nascono azzerati e 0 e' un handle VALIDO:
-    lasciato cosi', il primo uso dello scratch scriverebbe sul BigInt di qualcun altro.
-    Un sentinella deve stare FUORI dal dominio, non essere il suo minimo. }
+  { ⛔ -1, NOT zero. An object's fields are born zeroed and 0 is a VALID handle: left that
+    way, the first use of the scratch would write over somebody else's BigInt.
+    A sentinel must live OUTSIDE the domain, not be its minimum. }
   FCtx.BigScratch := -1;
   FCtx.BigCount := 0;
 
@@ -3803,12 +3803,13 @@ begin
   // the sign of a zero, so the AOT and the JIT need no fix-up at all. Same class of decision as
   // the correctly-rounded PRINT of a float: conform to the standard, declare the divergence.
   //
-  // ⛔⛔ IMPONE il bit del segno, NON nega - e la differenza si è pagata. Negare presuppone che
-  // System.Int abbia PERSO il segno, il che è vero su Windows e FALSO su Linux, dove System.Int(-0.0)
-  // rende già -0. Lì la "cura" faceva -(-0) = +0, cioè introduceva il difetto che doveva togliere:
-  // interprete e JIT rendevano +0 mentre l'AOT rendeva -0, ed è la cosa che il disegno a due
-  // implementazioni non può permettersi. Misurato il 13 ago 2026 con la rete di regressione
-  // (bug_int_floor). Imporre il bit è IDEMPOTENTE, quindi giusto su entrambe le piattaforme.
+  // ⛔⛔ It FORCES the sign bit, it does NOT negate - and the difference has been paid for.
+  // Negating assumes System.Int has LOST the sign, which is true on Windows and FALSE on Linux,
+  // where System.Int(-0.0) already returns -0. There the "cure" made -(-0) = +0, i.e. introduced
+  // the very defect it was meant to remove: interpreter and JIT returned +0 while the AOT
+  // returned -0, and that is the thing a two-implementation design cannot afford. Measured
+  // 13 Aug 2026 with the regression net (bug_int_floor). Forcing the bit is IDEMPOTENT, and so
+  // right on both platforms.
   if (Result = 0) and (PInt64(@X)^ < 0) then
     PInt64(@Result)^ := PInt64(@Result)^ or Int64($8000000000000000);
 end;
@@ -3838,8 +3839,9 @@ begin
   // ⚠️ NEGATIVE ZERO: fbc prints Int(-0.0) as -0, and so does roundsd, which is what the AOT emits.
   // The sign is put back - otherwise WHICH ENGINE RAN would change the answer, and that is the one
   // thing the two-implementation design is not allowed to do.
-  // ⛔⛔ IMPONE il bit, non nega: vedi la nota estesa in FixDouble. System.Int PERDE il segno su
-  // Windows ma lo CONSERVA su Linux, quindi negare lo ribaltava e rendeva +0 dove serve -0.
+  // ⛔⛔ It FORCES the bit, it does not negate: see the long note in FixDouble. System.Int LOSES
+  // the sign on Windows but KEEPS it on Linux, so negating flipped it and returned +0 where -0
+  // is wanted.
   // Only reachable when the result is zero, so no ordinary value pays for the test.
   if (Result = 0) and (PInt64(@X)^ < 0) then
     PInt64(@Result)^ := PInt64(@Result)^ or Int64($8000000000000000);
@@ -6492,7 +6494,7 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
         end;
-        bcBigFromStr:   { l'inverso: Dest e' un handle (int), Src1 il TESTO }
+        bcBigFromStr:   { the inverse: Dest is a handle (int), Src1 the TEXT }
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -13693,7 +13695,7 @@ begin
     BigAddSmall(Ctx.BigVals[H].Limbs, k, chunk);
     Ctx.BigVals[H].N := k;
   end;
-  { Uno zero non e' mai negativo: una sola rappresentazione. }
+  { A zero is never negative: one representation only. }
   if not ((Ctx.BigVals[H].N = 1) and (Ctx.BigVals[H].Limbs[0] = 0)) then
     Ctx.BigVals[H].Neg := neg;
 end;
@@ -13800,7 +13802,7 @@ begin
         if v < 0 then begin NegB := True;  u := QWord(-(v + 1)) + 1; end
                  else begin NegB := False; u := QWord(v); end;
         { ⭐ UNA passata, non copia-poi-moltiplica: BigMulSmallTo legge a[i] e scrive
-          dst[i] allo stesso indice, quindi vale anche quando H = A. }
+          dst[i] at the same index, so it holds when H = A too. }
         NegA := Ctx.BigVals[A].Neg;
         BigMulSmallTo(Ctx.BigVals[H].Limbs, Ctx.BigVals[H].N,
                       Ctx.BigVals[A].Limbs, Ctx.BigVals[A].N, u);
@@ -13819,7 +13821,7 @@ begin
         if (Ctx.BigVals[B].N = 1) and (Ctx.BigVals[B].Limbs[0] = 0) then
           raise EDivByZero.Create('BigInt division by zero');
         { Il quoziente e il resto escono INSIEME dall'algoritmo: si calcolano entrambi e
-          si tiene quello chiesto. Servono due destinazioni distinte da H, perche' H puo'
+          only the requested one is kept. Two destinations distinct from H are needed, because H can
           coincidere con A o con B. }
         if (Ctx.BigScratch < 0) or (Ctx.BigScratch >= Ctx.BigCount) then
         begin
@@ -13841,7 +13843,7 @@ begin
         end
         else
         begin
-          { ⚠️ Il resto prende il segno del DIVIDENDO, che e' la convenzione di Mod qui. }
+          { ⚠️ The remainder takes the DIVIDEND's sign, which is Mod's convention here. }
           NegA := Ctx.BigVals[A].Neg;
           Ctx.BigVals[H].Limbs := QTmpLimbs;
           Ctx.BigVals[H].N := QTmpN;

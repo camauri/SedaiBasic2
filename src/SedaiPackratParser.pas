@@ -1059,7 +1059,7 @@ begin
      inizializzato. È il difetto trovato il 13 ago 2026 in TLexerFSM.NextToken, dove costava un
      EAccessViolation su ogni programma con un commento /' '/ (e su Windows un token DUPLICATO in
      silenzio). Qui non sono riuscito a costruire un ingresso che PROVI di raggiungere questa riga -
-     un `Virtual Sub` al livello di modulo sembra gestito prima - quindi la correzione è messa
+     a module-level `Virtual Sub` appears to be handled earlier - so the fix is placed
      perché è un NO-OP se il nome nudo era già una chiamata, e una cura se non lo era. }
    Result := ParseStatement();         // ...and the SUB/FUNCTION/DESTRUCTOR that follows
    Exit;
