@@ -551,6 +551,32 @@ end;
   rifarebbe l'errore che questo cantiere ha gia' pagato tre volte. }
 const
   KARATSUBA_MIN = 24;
+  { ⭐⭐⭐ TOOM-3. Spezzando in TRE parti servono CINQUE prodotti di un terzo di taglia
+    invece dei nove scolastici: O(n^1.465), meglio dell'1.585 di Karatsuba. Il conto a
+    parita' di n: Karatsuba fa 3*(n/2)^2 = 0,75 n^2, Toom-3 fa 5*(n/3)^2 = 0,56 n^2.
+    ⛔ IL PREZZO E' L'INTERPOLAZIONE, ed e' li' che si sbaglia: cinque punti di
+    valutazione (0, 1, -1, 2, infinito), divisioni ESATTE per 2 e per 3, e un valore
+    che puo' essere NEGATIVO. La soglia e' alta proprio perche' quel contorno costa.
+
+    ⛔⛔ LA SOGLIA E' MISURATA, E IL NUMERO E' MOLTO PIU' ALTO DI QUELLO DI KARATSUBA:
+    il costo LINEARE di Toom-3 (valutazione + interpolazione, ~12 passate sull'intero
+    valore per livello) e' quello che decide, non l'esponente. Misurato il 14 ago 2026
+    su questa macchina, prodotto di due numeri di n limb, migliore di 15 corse x 3
+    passate contro un binario identico salvo questa costante:
+
+      limb   320    400    512    700   1000   1400   2000
+      soglia 350   -0,1%  -9,6%  -7,5%  -1,4% -10,1% -10,2%  -9,1%
+      soglia 200   +2,3% -10,9%  -7,7%  -4,8%  -4,0% -11,4%  -3,4%
+
+    ⭐ Abbassare la soglia NON e' meglio: a 2000 limb la soglia 200 rende -3,4% dove la
+    350 rende -9,1%, perche' ogni livello di Toom in piu' paga il suo costo lineare su
+    sotto-prodotti troppo piccoli per ripagarlo. Con una soglia di 130 il prodotto a 160
+    limb era +14,7%: una PERDITA, riprodotta due volte.
+    ⚠️ Il pavimento di rumore di questa misura e' ~4%: i valori sotto i 400 limb non
+    dicono niente, ed e' per questo che la soglia sta dove il divario e' stabile. }
+  TOOM3_MIN = 350;
+  { 3 * INV3 = 1 (mod 2^64): la divisione esatta per 3 e' una MOLTIPLICAZIONE. }
+  INV3 = QWord($AAAAAAAAAAAAAAAB);
 
 procedure PropAdd(p: PQWord; c: QWord);
 var t: QWord;
@@ -573,6 +599,213 @@ begin
     if old < c then c := 1 else c := 0;
     p^ := t; Inc(p);
   end;
+end;
+
+{ ⛔ Le due sopra camminano finche' il riporto non si spegne, il che va bene quando si sa
+  che il numero non trabocca. L'interpolazione di Toom lavora in COMPLEMENTO A DUE su una
+  larghezza fissa, dove il riporto in uscita si BUTTA: senza un limite, su un valore
+  negativo (tutti $FF..F) la propagazione uscirebbe dal vettore. Un limite in piu' costa
+  un confronto; la corruzione silenziosa costa una giornata. }
+procedure PropAddLim(p: PQWord; c: QWord; n: PtrInt);
+var t: QWord;
+begin
+  while (c <> 0) and (n > 0) do
+  begin
+    t := p^ + c;
+    if t < c then c := 1 else c := 0;
+    p^ := t; Inc(p); Dec(n);
+  end;
+end;
+
+procedure PropSubLim(p: PQWord; c: QWord; n: PtrInt);
+var t, old: QWord;
+begin
+  while (c <> 0) and (n > 0) do
+  begin
+    old := p^;
+    t := old - c;
+    if old < c then c := 1 else c := 0;
+    p^ := t; Inc(p); Dec(n);
+  end;
+end;
+
+{ d = x + y e d = x - y su n limb, col riporto/prestito in uscita. Esistono per non
+  ripetere l'{$IFDEF} dentro il corpo di Toom, che e' gia' abbastanza da leggere.
+  ⚠️ d PUO' coincidere con x o con y: per ogni indice si legge prima e si scrive dopo. }
+function RunAdd(d, x, y: PQWord; n: PtrInt): QWord;
+{$IFNDEF CPUX86_64}
+var i: PtrInt; s: QWord;
+{$ENDIF}
+begin
+  {$IFDEF CPUX86_64}
+  Result := AddLimbRun(d, x, y, n);
+  {$ELSE}
+  Result := 0;
+  for i := 0 to n - 1 do
+  begin
+    s := x[i] + y[i];
+    if s < x[i] then
+    begin
+      d[i] := s + Result; Result := 1;
+    end
+    else
+    begin
+      d[i] := s + Result;
+      if d[i] < s then Result := 1 else Result := 0;
+    end;
+  end;
+  {$ENDIF}
+end;
+
+function RunSub(d, x, y: PQWord; n: PtrInt): QWord;
+{$IFNDEF CPUX86_64}
+var i: PtrInt; s, xi: QWord;
+{$ENDIF}
+begin
+  {$IFDEF CPUX86_64}
+  Result := SubLimbRun(d, x, y, n);
+  {$ELSE}
+  Result := 0;
+  for i := 0 to n - 1 do
+  begin
+    xi := x[i];
+    s := xi - y[i];
+    if xi < y[i] then
+    begin
+      d[i] := s - Result; Result := 1;
+    end
+    else
+    begin
+      d[i] := s - Result;
+      if s < Result then Result := 1 else Result := 0;
+    end;
+  end;
+  {$ENDIF}
+end;
+
+{ ---- l'aritmetica in COMPLEMENTO A DUE su larghezza fissa, per l'interpolazione ----
+  ⭐⭐⭐ E' LA DECISIONE CHE TOGLIE DI MEZZO I SEGNI. L'interpolazione di Toom-3 passa per
+  valori negativi, e la via ovvia - portarsi dietro modulo e segno a ogni passo - e'
+  esattamente il posto dove tutti sbagliano. Qui invece ogni valore intermedio vive in
+  complemento a due su L limb, con L scelto perche' |valore| < B^L/2: somma e sottrazione
+  sono quelle senza segno, il riporto in uscita si butta, e il segno esiste solo come bit
+  alto. Le divisioni ESATTE (per 2 e per 3) sopravvivono al modulo: il quoziente vero e'
+  congruo a quello calcolato, e sta nell'intervallo, quindi e' quello.
+  ⛔ L'UNICO segno che resta e' quello di W(-1), che non si puo' evitare perche' il
+  PRODOTTO vuole due magnitudini. E' un booleano, non un'algebra. }
+
+{ d[0..L-1] := s[0..sn-1], esteso con zeri (il valore e' non negativo). }
+procedure TcSet(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
+var i: PtrInt;
+begin
+  if sn > L then sn := L;
+  for i := 0 to sn - 1 do d[i] := s[i];
+  for i := sn to L - 1 do d[i] := 0;
+end;
+
+{ d += s (sn limb, esteso con zeri), modulo B^L. }
+procedure TcAddN(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
+var c: QWord;
+begin
+  if sn > L then sn := L;
+  c := RunAdd(d, d, s, sn);
+  PropAddLim(@d[sn], c, L - sn);
+end;
+
+{ d -= s (sn limb, esteso con zeri), modulo B^L. }
+procedure TcSubN(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
+var c: QWord;
+begin
+  if sn > L then sn := L;
+  c := RunSub(d, d, s, sn);
+  PropSubLim(@d[sn], c, L - sn);
+end;
+
+{ ⭐⭐ d -= (t shl s), in UNA passata. La forma ovvia - prima lo spostamento in un
+  vettore d'appoggio, poi la sottrazione - sono DUE passate sull'intero valore piu' un
+  vettore in piu'. A questa taglia il costo lineare non e' contorno: e' misurato che si
+  mangiava due terzi del guadagno di Toom-3. }
+procedure TcSubShl(d, t: PQWord; L: PtrInt; s: Integer);
+var i: PtrInt; carry, cur, v, old: QWord; bo: QWord;
+begin
+  carry := 0; bo := 0;
+  for i := 0 to L - 1 do
+  begin
+    cur := t[i];
+    v := (cur shl s) or carry;
+    carry := cur shr (64 - s);
+    old := d[i];
+    d[i] := old - v - bo;
+    { il prestito: o non bastava per v, o v era gia' tutto e il prestito lo sfonda }
+    if (old < v) or ((old = v) and (bo <> 0)) then bo := 1 else bo := 0;
+  end;
+end;
+
+{ ⭐⭐ d := (d shl 1) + s, in UNA passata: e' il passo di Horner della valutazione in 2
+  (A(2) = ((a2*2) + a1)*2 + a0), e per la stessa ragione non si fa in due. }
+procedure TcShl1AddN(d: PQWord; L: PtrInt; s: PQWord; sn: PtrInt);
+var i: PtrInt; carry, cur, v, t: QWord; c2: QWord;
+begin
+  if sn > L then sn := L;
+  carry := 0; c2 := 0;
+  for i := 0 to L - 1 do
+  begin
+    cur := d[i];
+    v := (cur shl 1) or carry;
+    carry := cur shr 63;
+    if i < sn then t := s[i] else t := 0;
+    v := v + t;
+    if v < t then
+    begin
+      d[i] := v + c2; c2 := 1;
+    end
+    else
+    begin
+      d[i] := v + c2;
+      if d[i] < v then c2 := 1 else c2 := 0;
+    end;
+  end;
+end;
+
+{ d := d div 2, ARITMETICO: il bit alto si ricopia, altrimenti un valore negativo
+  diventerebbe enorme e positivo. La divisione e' esatta per costruzione. }
+procedure TcShr1(d: PQWord; L: PtrInt);
+var i: PtrInt; sgn: QWord;
+begin
+  sgn := d[L - 1] and QWord($8000000000000000);
+  for i := 0 to L - 2 do
+    d[i] := (d[i] shr 1) or (d[i + 1] shl 63);
+  d[L - 1] := (d[L - 1] shr 1) or sgn;
+end;
+
+{ d := d div 3, ESATTA. ⭐ Non e' una divisione: si moltiplica per l'inverso di 3 modulo
+  2^64, limb per limb, portandosi dietro quanto e' "avanzato" - che vale al piu' 2.
+  Funziona anche sui valori negativi, perche' il modulo non distingue. }
+procedure TcDivExact3(d: PQWord; L: PtrInt);
+var i: PtrInt; x, q, bo, c: QWord;
+begin
+  c := 0;
+  for i := 0 to L - 1 do
+  begin
+    x := d[i];
+    if x < c then bo := 1 else bo := 0;
+    x := x - c;
+    q := x * INV3;
+    d[i] := q;
+    c := MulHi64(q, 3) + bo;
+  end;
+end;
+
+{ confronto di due magnitudini di pari lunghezza, dal limb piu' alto }
+function CmpRun(x, y: PQWord; n: PtrInt): Integer;
+var i: PtrInt;
+begin
+  for i := n - 1 downto 0 do
+  begin
+    if x[i] > y[i] then Exit(1);
+    if x[i] < y[i] then Exit(-1);
+  end;
+  Result := 0;
 end;
 
 { d[0..an+bn-1] = a*b, schoolbook, con l'addmul in assembly come ciclo interno. }
@@ -609,7 +842,168 @@ begin
 end;
 {$ENDIF}
 
-{ d[0..2n-1] = a[0..n-1] * b[0..n-1]. ws: spazio di lavoro di almeno 8n+64 limb. }
+procedure MulRec(d, a, b, ws: PQWord; n: PtrInt); forward;
+
+{ ⭐⭐⭐ TOOM-3, d[0..2n-1] = a[0..n-1] * b[0..n-1].
+
+  Si spezzano i due fattori in TRE parti di k limb (l'ultima ne ha n2 <= k):
+      a = a0 + a1*B^k + a2*B^2k          b = b0 + b1*B^k + b2*B^2k
+  Il prodotto e' un polinomio di grado 4 in B^k:
+      P(x) = c0 + c1 x + c2 x^2 + c3 x^3 + c4 x^4
+  di cui bastano CINQUE valori per ricostruire i coefficienti. I punti sono 0, 1, -1, 2 e
+  "infinito" (cioe' il coefficiente di testa):
+      W0 = a0*b0                W4 = a2*b2
+      W1 = A(1)*B(1)            Wm = A(-1)*B(-1)            W2 = A(2)*B(2)
+
+  L'INTERPOLAZIONE, che e' la parte che si sbaglia, in sei passi:
+      tA = (W1 + Wm)/2 = c0 + c2 + c4        tB = (W1 - Wm)/2 = c1 + c3
+      c2 = tA - c0 - c4
+      tC = (W2 - c0 - 16 c4 - 4 c2)/2 = c1 + 4 c3
+      c3 = (tC - tB)/3                       c1 = tB - c3
+  ⛔ Le divisioni sono ESATTE - ogni numeratore e' divisibile per costruzione - e vanno
+  fatte come tali: una divisione lunga qui costerebbe piu' del prodotto che si evita.
+  ⛔ tB, tC e i loro addendi possono essere NEGATIVI: vivono in complemento a due su L
+  limb (vedi le TcXxx sopra), e L e' scelto perche' nessuno arrivi mai a B^L/2.
+
+  ⚠️ I cinque prodotti si fanno tutti a taglia k+1, anche W0 e W4 che ne userebbero meno:
+  la ricorsione e' scritta per operandi di PARI taglia, ed e' cio' che tiene verificabile
+  la contabilita' degli indici. Il poco che si spreca si rivede quando una misura dira'
+  che vale la pena. }
+procedure MulToom3(d, a, b, ws: PQWord; n: PtrInt);
+var
+  k, n2, L, i: PtrInt;
+  W0, W1, WM, W2, W4, TA, TB, TC, TT, EA, EB, rest: PQWord;
+  sa, sb, sm: Integer;
+  c: QWord;
+
+  { ⭐ La valutazione in -1 e' l'UNICO posto dove nasce un segno: a0 - a1 + a2 puo'
+    essere negativo, e il prodotto vuole una magnitudine. Si calcola |.| e si riporta
+    il segno; il resto dell'interpolazione non ne sa niente. }
+  function EvalMinus1(dst, tmp, src: PQWord): Integer;
+  begin
+    TcSet(dst, k + 1, src, k);                 { a0 }
+    TcAddN(dst, k + 1, @src[2 * k], n2);       { + a2 }
+    TcSet(tmp, k + 1, @src[k], k);             { a1 }
+    if CmpRun(dst, tmp, k + 1) >= 0 then
+    begin
+      RunSub(dst, dst, tmp, k + 1);            { a0+a2 >= a1 }
+      Result := 0;
+    end
+    else
+    begin
+      RunSub(dst, tmp, dst, k + 1);            { il verso opposto, e il segno }
+      Result := 1;
+    end;
+  end;
+
+begin
+  k := (n + 2) div 3;          { ceil(n/3): le due parti basse }
+  n2 := n - 2 * k;             { la parte alta, 1 <= n2 <= k }
+  L := 2 * k + 4;              { larghezza dei valori intermedi, con due limb di aria }
+
+  W0 := ws;            W1 := @ws[L];       WM := @ws[2 * L];
+  W2 := @ws[3 * L];    W4 := @ws[4 * L];
+  TA := @ws[5 * L];    TB := @ws[6 * L];   TC := @ws[7 * L];  TT := @ws[8 * L];
+  EA := @ws[9 * L];    EB := @ws[9 * L + (k + 2)];
+  rest := @ws[9 * L + 2 * (k + 2)];
+
+  { --- W0 = a0*b0, e W4 = a2*b2 --- }
+  TcSet(EA, k + 1, a, k);          TcSet(EB, k + 1, b, k);
+  MulRec(W0, EA, EB, rest, k + 1); W0[2 * k + 2] := 0; W0[2 * k + 3] := 0;
+
+  TcSet(EA, k + 1, @a[2 * k], n2); TcSet(EB, k + 1, @b[2 * k], n2);
+  MulRec(W4, EA, EB, rest, k + 1); W4[2 * k + 2] := 0; W4[2 * k + 3] := 0;
+
+  { --- W1 = A(1)*B(1), con A(1) = a0+a1+a2 < 3*B^k, che sta in k+1 limb --- }
+  TcSet(EA, k + 1, a, k);  TcAddN(EA, k + 1, @a[k], k);  TcAddN(EA, k + 1, @a[2 * k], n2);
+  TcSet(EB, k + 1, b, k);  TcAddN(EB, k + 1, @b[k], k);  TcAddN(EB, k + 1, @b[2 * k], n2);
+  MulRec(W1, EA, EB, rest, k + 1); W1[2 * k + 2] := 0; W1[2 * k + 3] := 0;
+
+  { --- Wm = |A(-1)| * |B(-1)|, col segno a parte --- }
+  sa := EvalMinus1(EA, TT, a);
+  sb := EvalMinus1(EB, TT, b);
+  sm := sa xor sb;
+  MulRec(WM, EA, EB, rest, k + 1); WM[2 * k + 2] := 0; WM[2 * k + 3] := 0;
+
+  { --- W2 = A(2)*B(2), con A(2) = a0 + 2a1 + 4a2 < 7*B^k: Horner, due raddoppi --- }
+  TcSet(EA, k + 1, @a[2 * k], n2);
+  TcShl1AddN(EA, k + 1, @a[k], k); TcShl1AddN(EA, k + 1, a, k);
+  TcSet(EB, k + 1, @b[2 * k], n2);
+  TcShl1AddN(EB, k + 1, @b[k], k); TcShl1AddN(EB, k + 1, b, k);
+  MulRec(W2, EA, EB, rest, k + 1); W2[2 * k + 2] := 0; W2[2 * k + 3] := 0;
+
+  { ================= interpolazione ================= }
+  { tA = (W1 + Wm)/2, tB = (W1 - Wm)/2 - col segno di Wm che decide il verso.
+    ⭐ Si scrive DIRETTAMENTE nel destinatario: la copia di W1 e poi la somma in posto
+    erano due passate dove ne basta una. }
+  if sm = 0 then
+  begin
+    RunAdd(TA, W1, WM, L);
+    RunSub(TB, W1, WM, L);
+  end
+  else
+  begin
+    RunSub(TA, W1, WM, L);
+    RunAdd(TB, W1, WM, L);
+  end;
+  TcShr1(TA, L);                      { tA = c0 + c2 + c4 }
+  TcShr1(TB, L);                      { tB = c1 + c3      }
+
+  { c2 = tA - c0 - c4, e da qui TA E' c2 }
+  TcSubN(TA, L, W0, L);
+  TcSubN(TA, L, W4, L);
+
+  { tC = (W2 - c0 - 16 c4 - 4 c2)/2 = c1 + 4 c3 }
+  RunSub(TC, W2, W0, L);
+  TcSubShl(TC, W4, L, 4);
+  TcSubShl(TC, TA, L, 2);
+  TcShr1(TC, L);
+
+  { c3 = (tC - tB)/3, poi c1 = tB - c3 }
+  TcSubN(TC, L, TB, L);
+  TcDivExact3(TC, L);                 { TC e' c3 }
+  TcSubN(TB, L, TC, L);               { TB e' c1 }
+
+  { ================= si rimonta il risultato =================
+    d = c0 + c1 B^k + c2 B^2k + c3 B^3k + c4 B^4k, e le lunghezze NON si tirano a
+    indovinare: c1 e c2 valgono meno di B^(2k+1), c3 meno di B^(k+n2+1), c4 meno di
+    B^(2*n2). ⛔ Ognuna di queste finisce dentro i 2n limb di d - il conto e' nel
+    commento della procedura - e la propagazione del riporto e' LIMITATA a quel che
+    resta: un riporto che uscisse da d sarebbe memoria di qualcun altro. }
+  { ⭐ c0 e c4 si SCRIVONO, non si sommano: occupano esattamente [0,2k) e [4k,2n), che
+    sono ancora vergini. Restano da azzerare i soli 2k limb di mezzo. }
+  for i := 0 to 2 * k - 1 do d[i] := W0[i];
+  for i := 0 to 2 * n2 - 1 do d[4 * k + i] := W4[i];
+  for i := 2 * k to 4 * k - 1 do d[i] := 0;
+
+  c := RunAdd(@d[k], @d[k], TB, 2 * k + 1);
+  PropAddLim(@d[3 * k + 1], c, 2 * n - 3 * k - 1);
+
+  c := RunAdd(@d[2 * k], @d[2 * k], TA, 2 * k + 1);
+  PropAddLim(@d[4 * k + 1], c, 2 * n - 4 * k - 1);
+
+  c := RunAdd(@d[3 * k], @d[3 * k], TC, k + n2 + 1);
+  PropAddLim(@d[4 * k + n2 + 1], c, 2 * n - 4 * k - n2 - 1);
+end;
+
+{ Lo spazio di lavoro che MulRec richiede per n limb, CALCOLATO invece che stimato.
+  ⛔ Una stima generosa e' comunque una stima: qui sotto ci sono cinque puntatori
+  ricavati da k e un livello di ricorsione, e sbagliarla di un limb non da' un errore -
+  da' un risultato giusto quasi sempre. }
+function MulWsNeed(n: PtrInt): PtrInt;
+var k, h: PtrInt;
+begin
+  if n < KARATSUBA_MIN then Exit(0);
+  if n >= TOOM3_MIN then
+  begin
+    k := (n + 2) div 3;
+    Exit(9 * (2 * k + 4) + 2 * (k + 2) + MulWsNeed(k + 1));
+  end;
+  h := n - n div 2;
+  Exit(4 * (h + 1) + MulWsNeed(h + 1));
+end;
+
+{ d[0..2n-1] = a[0..n-1] * b[0..n-1]. ws: spazio di lavoro di MulWsNeed(n) limb. }
 procedure MulRec(d, a, b, ws: PQWord; n: PtrInt);
 var
   m, h, i: PtrInt;
@@ -619,6 +1013,11 @@ begin
   if n < KARATSUBA_MIN then
   begin
     MulSchoolbook(d, a, b, n, n);
+    Exit;
+  end;
+  if n >= TOOM3_MIN then
+  begin
+    MulToom3(d, a, b, ws, n);
     Exit;
   end;
   m := n div 2;          { parte bassa }
@@ -732,7 +1131,7 @@ begin
       if i < bn then kb[i] := b[i] else kb[i] := 0;
     end;
     SetLength(t, 2 * kn);
-    SetLength(kws, 8 * kn + 128);
+    SetLength(kws, MulWsNeed(kn) + 8);
     MulRec(@t[0], @ka[0], @kb[0], @kws[0], kn);
     dn := 2 * kn;
     while (dn > 1) and (t[dn - 1] = 0) do Dec(dn);
