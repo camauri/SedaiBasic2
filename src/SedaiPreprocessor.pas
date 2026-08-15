@@ -149,9 +149,13 @@ begin
   end;
 end;
 
+function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string; forward;
+
 // Expand a function-like macro body by replacing each whole-identifier parameter with its argument.
 // ParamsBody is "p1,p2,..."#1"body"; ArgsStr is the raw argument text between the parentheses.
-function ExpandFnBody(const ParamsBody, ArgsStr: string): string;
+// Defs/FnDefs/Depth are needed ONLY by the stringize operator - see the comment at its site.
+function ExpandFnBody(const ParamsBody, ArgsStr: string;
+                      Defs, FnDefs: TStringList; Depth: Integer): string;
 var
   sep, i, j, k, pi: Integer;
   ParamList, Body, Word: string;
@@ -217,6 +221,25 @@ begin
       if ACount <= VarIdx then ACount := VarIdx + 1;   // so the parameter resolves to the empty text
     end;
   end;
+  // ⛔⛔ GLI ARGOMENTI SI ESPANDONO UNA VOLTA, QUI, PRIMA DI ENTRARE NEL CORPO - e su questo
+  // FreeBASIC NON segue il C. In C un operando di "##" viene congelato; qui no, e lo dimostra
+  // l'esempio del manuale (defines/fbjoin2.bas):
+  //     #define join( a, b )      a##b
+  //     #define makename2( x )    join( PREFIX, join( x, SUFFIX ) )
+  //     makename2(text)  ->  ptext_T           '' non "PREFIXjoin( text, SUFFIX )"
+  // cioe' entrambi gli ARGOMENTI di join sono espansi (PREFIX->p, join(text,SUFFIX)->text_T) e
+  // solo dopo incollati.
+  // ⚠️ E non e' in contraddizione con la riga sopra, "#define makename1(x) PREFIX##x##SUFFIX",
+  // che da' PREFIXtextSUFFIX: li' PREFIX e SUFFIX non sono ARGOMENTI, sono testo del CORPO. Il
+  // corpo non si pre-espande, e l'incollatura ne fa un identificatore nuovo che la riscansione
+  // non riapre. Argomenti ed elementi del corpo seguono due regole diverse, ed e' la distinzione
+  // che questo blocco esiste per tenere.
+  // ⛔ Espandere DOPO l'incollatura non basta e non e' la stessa cosa: "PREFIX" e "join" incollati
+  // diventano l'unico identificatore "PREFIXjoin", e a quel punto non c'e' piu' nessuna chiamata
+  // da espandere. L'informazione e' gia' stata distrutta.
+  for k := 0 to ACount - 1 do
+    if Pos('#', Args[k]) = 0 then          // un argomento che porta '#' e' gia' testo per il preprocessore
+      Args[k] := SubstituteMacros(Args[k], Defs, FnDefs, Depth + 1);
   // Replace each whole-identifier parameter with its argument, handling the FreeBASIC preprocessor
   // operators: "#param" stringizes the argument; "a ## b" pastes the surrounding tokens together.
   Result := ''; i := 1; InStr := False;
@@ -245,7 +268,19 @@ begin
         Word := Copy(Body, j, k - j);
         pi := ParamIndex(Word);
         if (pi >= 0) and (pi < ACount) then
-        begin Result := Result + Stringize(Args[pi]); i := k; Continue; end;
+        begin
+          // ⛔ L'ARGOMENTO SI ESPANDE PRIMA DI STRINGIFICARLO, e qui FreeBASIC NON segue il C.
+          // In C "#x" congela il testo scritto dal chiamante; in FreeBASIC il manuale mostra
+          //     #macro dump(arg)
+          //       #print #arg
+          //     #endmacro
+          //     dump( makename1(text) )      '' stampa PREFIXtextSUFFIX, non "makename1(text)"
+          // cioe' l'argomento viene ESPANSO e poi reso testo. Prendere la regola del C dava il
+          // testo grezzo, ed era invisibile: nessun errore, solo la stampa sbagliata.
+          // ⚠️ Args[] e' GIA' espanso dal blocco poco sopra, quindi qui basta renderlo testo.
+          Result := Result + Stringize(Args[pi]);
+          i := k; Continue;
+        end;
       end;
       Result := Result + '#'; Inc(i); Continue;   // a lone '#' that is not a stringize
     end;
@@ -515,7 +550,7 @@ begin
         end;
         if (j <= Length(Line)) and (Line[j] = ')') then Inc(j);   // skip ')'
         // Expand the body (param substitution), then re-run object-like substitution on the result.
-        Result := Result + SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr), Defs, FnDefs, Depth + 1);
+        Result := Result + SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr, Defs, FnDefs, Depth), Defs, FnDefs, Depth + 1);
         i := j;
         Continue;
       end;
