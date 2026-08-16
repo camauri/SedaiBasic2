@@ -314,6 +314,16 @@ var
   IsTargetPC: array of Boolean;
   ScanLo, ScanHi: Integer;
   ScanAll: Boolean;
+  // ⭐ Loop weight per PC inside [HeaderPC..EndPC]: 1 at the region's top level, x8 per enclosing
+  // backward edge, capped at 512 - the AOT's BlockW, at bytecode granularity instead of block.
+  // What it is FOR: the seven pool GPRs are worth what their traffic is worth, and traffic is
+  // mentions x TRIP COUNT. Counting bare mentions let a value named four times in an outer loop
+  // outrank an index named three times in a loop that runs a thousand times more often - which is
+  // how a running index ended up in the bank, paying a load AND a store on every iteration.
+  PcW: array of Integer;
+  PcWOn: Boolean;                   // the weights are built (region pass only, never program-wide)
+  HdrTW, HdrEndW: array[0..31] of Integer;   // loop headers found, and how far each one spans
+  NHdrW, wt, wfac: Integer;
   CurPC: Integer;                   // absolute PC of the instruction EmitOne is lowering
   FuseSkipPC: Integer;              // PC whose instruction a fusion already emitted (-1 = none)
   IMaxReg, NextGpr, ii, gpr, w: Integer;
@@ -1376,12 +1386,22 @@ var
   // over the WHOLE program, which is what makes the compare/branch fusion below provably safe
   // without a liveness analysis. CAUTION: for bcArrayLoad/StoreFloat, Src1 is the array id
   // (a constant), NOT a register -- only Src2 (the index) is an int register.
+  //
+  // ⭐ The Mark pass counts LOOP-WEIGHTED mentions, not bare ones: a mention inside a nested loop is
+  // worth what its trip count makes it worth. IUseAll stays unweighted on purpose - it answers a
+  // different question ("is this boolean read by anybody else, ANYWHERE"), and a weight would turn
+  // "mentioned exactly twice" into a number that no longer means twice.
   procedure ScanI(Mark: Boolean);
   var q: Integer; J: PBcInstr;
     procedure T(r: Word);
     begin
       if ScanAll then begin if r <= High(IUseAll) then Inc(IUseAll[r]); end
-      else if Mark then begin ILoc[r] := -2; Inc(IUse[r]); end
+      else if Mark then
+      begin
+        ILoc[r] := -2;
+        if PcWOn and (q >= HeaderPC) and (q <= EndPC) then Inc(IUse[r], PcW[q - HeaderPC])
+        else Inc(IUse[r]);
+      end
       else if r > IMaxReg then IMaxReg := r;
     end;
   begin
@@ -2921,7 +2941,44 @@ begin
   SetLength(ILoc, IMaxReg + 2);
   SetLength(IUse, IMaxReg + 2);
   for ii := 0 to High(ILoc) do begin ILoc[ii] := -1; IUse[ii] := 0; end;
-  if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2 and count mentions
+  // --- loop weight per PC, before the counting pass reads it -------------------------------------
+  // A BACKWARD branch inside the region - target at or before the branch itself - closes a loop, and
+  // every PC it spans runs once per trip of it. x8 per level, capped at 512, which is the AOT's
+  // scale so the two allocators price the same program the same way. Nested loops multiply because
+  // they nest; two separate loops sharing one header must NOT count twice, so a header already seen
+  // widens its span instead of adding a level - the same rule, and the same trap, as BlockW.
+  // JIT_IWEIGHT=<n> sets the per-level factor; 0 restores the unweighted count. Both are A/B
+  // baselines on ONE binary.
+  SetLength(PcW, EndPC - HeaderPC + 1);
+  for ii := 0 to High(PcW) do PcW[ii] := 1;
+  wfac := StrToIntDef(GetEnvironmentVariable('JIT_IWEIGHT'), 8);
+  PcWOn := wfac > 1;
+  if PcWOn then
+  begin
+    NHdrW := 0;
+    for ii := HeaderPC to EndPC do
+      case Prog[ii].OpCode of
+        bcJump, bcJumpIfZero, bcJumpIfNotZero:
+        begin
+          wt := Integer(Prog[ii].Immediate);
+          if (wt < HeaderPC) or (wt > ii) then System.Continue;   // forward edge: not a loop
+          for w := 0 to NHdrW - 1 do
+            if HdrTW[w] = wt then
+            begin
+              if ii > HdrEndW[w] then HdrEndW[w] := ii;           // same header: widen, don't re-count
+              wt := -1;
+              Break;
+            end;
+          if wt < 0 then System.Continue;
+          if NHdrW > High(HdrTW) then System.Continue;            // more nesting than a region can have
+          HdrTW[NHdrW] := wt; HdrEndW[NHdrW] := ii; Inc(NHdrW);
+        end;
+      end;
+    for w := 0 to NHdrW - 1 do
+      for ii := HdrTW[w] to HdrEndW[w] do
+        if PcW[ii - HeaderPC] < 512 then PcW[ii - HeaderPC] := PcW[ii - HeaderPC] * wfac;
+  end;
+  if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2 and count weighted mentions
   NextGpr := 0;
   // ⭐ The seven pool registers go to the MOST MENTIONED registers, not to the lowest-numbered ones.
   // Register indices carry no information about how hot a register is: they are handed out by the
