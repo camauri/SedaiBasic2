@@ -2178,9 +2178,16 @@ var
           E.EmitBytes([$66, $48, $0F, $6E, $C0]);                  // movq xmm0, rax
           FStore(I^.Dest, XMM0);                                   // -> xmm reg or [rsi+d]
         end;
+      // A copy to ITSELF emits nothing - PHI elimination leaves `iv := iv` at the bottom of every
+      // counted loop, and emitting `mov r9,r9` for it costs an instruction per iteration. Same
+      // omission the AOT's ssaCopyInt had.
       bcCopyInt:
-        if (IAlloc(I^.Dest) >= 0) and (IAlloc(I^.Src1) >= 0) then
-          MovRR(IAlloc(I^.Dest), IAlloc(I^.Src1))   // reg-reg copy in one move
+        if I^.Dest = I^.Src1 then { nothing }
+        else if (IAlloc(I^.Dest) >= 0) and (IAlloc(I^.Src1) >= 0) then
+        begin
+          if IAlloc(I^.Dest) <> IAlloc(I^.Src1) then
+            MovRR(IAlloc(I^.Dest), IAlloc(I^.Src1));  // reg-reg copy in one move
+        end
         else
         begin
           ILoad(RAX, I^.Src1);

@@ -370,6 +370,10 @@ type
     FStartTicks: QWord;     // Milliseconds since system start when VM started
     FTimeOffset: Int64;     // TI$ offset in milliseconds from real time
     FClockOffsetDays: Double; // FreeBASIC SETDATE/SETTIME offset (days) applied to NOW/DATE/TIME/TIMER
+    // SB_FAKE_CLOCK=1: NOW/TIMER advance by a fixed 1 ms per reading instead of following the wall
+    // clock, which is what makes a self-timing program's output comparable between two engines.
+    FFakeClock: Boolean;
+    FFakeClockTicks: Int64;
     FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
     // FreeBASIC DIR: ONE directory walk is open at a time, exactly as in fbc - "Dir(spec, mask)" starts
     // it, "Dir()" steps it, and it ends when the entries run out (fbc has no handle to close). The
@@ -1167,6 +1171,9 @@ begin
   SetLength(FWorkerThreads, 0);
   InitCriticalSection(FWorkerLock);
   InitCriticalSection(FArrDescLock);
+  // The deterministic clock (see bcDateNow). Read once per VM: a program cannot turn it on or off.
+  FFakeClock := GetEnvironmentVariable('SB_FAKE_CLOCK') = '1';
+  FFakeClockTicks := 0;
   SetLength(FMutexes, 0);
   InitCriticalSection(FMutexTableLock);
   SetLength(FCondVars, 0);
@@ -11384,11 +11391,40 @@ begin
       end;
     20: // bcDateNow - Immediate 0=NOW (date+time serial), 1=TIMER (seconds since midnight)
       begin
-        dtVal := Now + FClockOffsetDays;
-        if Instr.Immediate = 1 then
-          Ctx.FloatRegs[Instr.Dest] := Frac(dtVal) * 86400.0   // TIMER
+        // ⭐ SB_FAKE_CLOCK=1 makes the clock ADVANCE BY A FIXED STEP instead of reading the wall
+        // clock, so NOW/TIMER return a deterministic sequence and any program that measures itself
+        // prints the same numbers on every run.
+        //
+        // ⛔ THE REASON IT EXISTS: job/tests/bench holds the programs that drive the AOT hardest,
+        // and NOT ONE of them could be checked by a net, because almost every one prints elapsed
+        // milliseconds. Measured: of the first 40, most produce five different outputs in five
+        // IDENTICAL runs. So the hottest code in the compiler had no output comparison at all, and
+        // a divergence there could only ever be found by accident - which is exactly how the
+        // string-argument clobber surfaced.
+        //
+        // The step is 1 ms per reading rather than a constant: several of those programs DIVIDE by
+        // the elapsed time (MFLOP/s, ns per cell), and a frozen clock turns the net into a division
+        // by zero instead of a comparison.
+        if FFakeClock then
+        begin
+          // ⛔ Computed in the unit the caller asked for, NOT as a day serial run through
+          // Frac()*86400: a 1 ms step is 1.16e-8 of a day, and going out to a ~45000 serial and
+          // back loses it - the first version of this printed "0 ms" and an MFLOP/s of Int64.MinValue
+          // (an overflowed divide by an elapsed time of exactly zero).
+          FFakeClockTicks := FFakeClockTicks + 1;
+          if Instr.Immediate = 1 then
+            Ctx.FloatRegs[Instr.Dest] := FFakeClockTicks * 0.001            // TIMER: seconds
+          else
+            Ctx.FloatRegs[Instr.Dest] := 45000.0 + FFakeClockTicks * 0.001 / 86400.0;  // NOW: serial
+        end
         else
-          Ctx.FloatRegs[Instr.Dest] := dtVal;                  // NOW
+        begin
+          dtVal := Now + FClockOffsetDays;
+          if Instr.Immediate = 1 then
+            Ctx.FloatRegs[Instr.Dest] := Frac(dtVal) * 86400.0   // TIMER
+          else
+            Ctx.FloatRegs[Instr.Dest] := dtVal;                  // NOW
+        end
       end;
     21: // bcDateDecode - YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial). Immediate selects the field.
       begin

@@ -385,6 +385,7 @@ uses TypInfo, Cpu;
 
 var
   GArrAddrState: Integer = -1;   // AOT_ARRADDR=0 restores the rcx/rax-staged element addressing
+  GIvWState: Integer = MaxInt;   // AOT_IVW: weight of a loop-carried induction step
    // Cpu: AVXSupport, the RUNTIME feature check the AVX vector path is gated on
 
 // Record layout handed in by AotSetRecordLayout. Zero = "not supplied", which keeps every record op
@@ -757,29 +758,54 @@ begin
   Result := AotVecLanes > 0;
 end;
 
+function IvStepWeight: Integer;
+// What the STEP of a loop-carried `d := d + s` is worth against an ordinary mention. AOT_IVW=<n>.
+//
+// ⛔ THE DEFAULT IS 1, WHICH MEANS OFF, AND THE MECHANISM IT ENCODES IS REAL ANYWAY. Boosting the
+// step does exactly what it was built to do - it recovers most of the regression AOT_ARRW=2 causes
+// by spilling the step onto the loop-carried chain (matmul 906 -> 816 ms). But at the DEFAULT
+// weighting it changes the allocation of 102 corpus programs out of 236, and measured cold on all
+// of them it is worth -1.3% on matmul and +16.4% on matmul_alias. A knob that reshapes register
+// allocation in 43% of programs to win 1% on one and lose 16% on another is not a default.
+//
+// So it stays reachable, with its finding attached: if array-base caching is ever made to pay,
+// AOT_IVW is the thing that stops it from paying for itself twice over. See the use site.
+var s: string; n: Integer;
+begin
+  if GIvWState = MaxInt then
+  begin
+    GIvWState := 1;   // OFF by default - see below
+    s := GetEnvironmentVariable('AOT_IVW');
+    if s <> '' then begin n := StrToIntDef(s, 8); if (n >= 1) and (n <= 64) then GIvWState := n; end;
+  end;
+  Result := GIvWState;
+end;
+
 function AotArrAddrMode: Integer;
 // 0 = historic staging (index via rcx, value via rax/xmm0); 1 = index addressed from its own home
-// register; 2 = value addressed from its own register too. AOT_ARRADDR picks it; THE DEFAULT IS 1,
-// and the reason is measured, not aesthetic:
+// register (THE DEFAULT); 2 = value addressed from its own register too.
 //
-//   mode 0  22 instructions in matmul's inner loop   745 ms
-//   mode 1  19                                       728 ms   -2.3%
-//   mode 2  16                                       765 ms   +2.7% against mode 0
+// 📊 Measured COLD (package under 70C), interleaved on one binary, best of 6 per arm.
+//   mode 0 -> mode 1 (22 -> 19 instructions in matmul's inner loop):
+//     matmul -13.9%   matmul_alias -12.5%   nbody -2.9%   fannkuch -1.2%   intpoly -0.7%
+//     matmul_l1 +5.6%   sieve +3.0%   floatpoly +2.3%
+//   mode 1 -> mode 2 (19 -> 16):
+//     matmul_l1 -4.5%   floatpoly -2.3%   sieve -2.2%   matmul -1.9%   nbody -1.5%
+//     matmul_alias +7.5%   intpoly +1.3%
+// Mode 1 is a large, one-sided win on the streaming loops. Mode 2 is a scatter: five small gains
+// and one 7.5% loss, so it is not the default and not rejected either - it is UNDECIDED, and
+// whoever picks it up needs a wider corpus, not another matmul run.
 //
-// ⛔⛔ So the two halves of the same "remove a redundant register copy" idea go in OPPOSITE
-// directions, and the bigger cut is the losing one. Dropping the index staging (three `mov rcx,X`)
-// pays; also loading the element straight into its allocated xmm instead of through xmm0 (three
-// `movaps`) costs five percent on top of that, on 16 interleaved samples per arm against a 1.5%
-// null-A/B floor. The staged form gives the renamer a fresh xmm0 per iteration and keeps the
-// load->add->store chain off the accumulator's architectural register; the direct form puts all
-// three on it. Whatever the exact microarchitectural account, mode 2 is measured and rejected -
-// do not "finish the job" without re-measuring.
+// ⛔⛔⛔ AND THE REASON THOSE NUMBERS ARE HERE TWICE-MEASURED: the first set was taken on a HOT
+// machine and was wrong by a factor of six. This package reads 597 ms cold and 791 ms hot on the
+// SAME binary running matmul - a 32% drift that swamps every effect worth chasing. Hot, mode 1
+// read -2.2% (it is -13.9%) and mode 2 read +5% (it is mixed). ⇒ Gate every sweep on the package
+// temperature; a thermal drift does not look like noise, it looks like a result.
 //
-// ⚠️ And the instrument matters here: an earlier probe that injected nops into this loop read
+// ⚠️ A second instrument failed before that one: a probe that injected nops into this loop read
 // 763/874/948/1088 ms for 0/2/4/8 nops and looked like a clean "5% per instruction" slope. It was
-// measuring CODE LAYOUT, not instruction count - on the shortened loop the same probe comes out
-// non-monotonic (16 instr 783 ms, 18 instr 746 ms). Use AOT_ARRADDR on one binary, and the
-// program's own timer rather than wall clock (which carries ~20 ms of process startup).
+// measuring CODE LAYOUT - on the shortened loop the same probe comes out non-monotonic (16 instr
+// 783 ms, 18 instr 746 ms). Use AOT_ARRADDR on one binary.
 begin
   if GArrAddrState < 0 then GArrAddrState := StrToIntDef(GetEnvironmentVariable('AOT_ARRADDR'), 1);
   Result := GArrAddrState;
@@ -2918,15 +2944,11 @@ var
   // had a home, and the value staged through xmm0 and copied out. matmul's innermost loop has three
   // accesses, so that is SIX of its twenty-two instructions.
   //
-  // 📊 Why that is worth doing, measured rather than assumed: injecting n one-byte nops into that
-  // loop costs 763 -> 874 -> 948 -> 1088 ms for n = 0, 2, 4, 8. About 40 ms per instruction, ~5% of
-  // the run EACH. The loop is front-end bound on this machine, and every one of the six removed
-  // here is a register-to-register move - eliminated at rename, so it costs issue bandwidth and
-  // nothing else, which is exactly the resource the nop probe says is scarce.
-  // ⛔ This CONTRADICTS the negative recorded above ArrBaseWeight ("a loop at ~3.6 IPC does not get
-  // faster when you remove two of its twenty-two instructions"). That measurement was taken on the
-  // old i7-3630QM before the Linux move; on the Core Ultra 9 the same probe says the opposite. A
-  // performance conclusion carries the machine it was measured on - re-run it, do not inherit it.
+  // 📊 What it is worth, measured cold: -13.9% on matmul and -12.5% on matmul_alias (see
+  // AotArrAddrMode for the full table and for the two instruments that lied on the way here).
+  // ⛔ Do NOT read this as "instructions cost 5% each on this machine" - that was a nop probe
+  // measuring code layout. What this removes is three register-to-register moves; what it buys is
+  // measured per program, not per instruction.
   //
   // The SIB index field cannot name rsp; the allocator never hands out rsp, and the fallback index
   // is rcx, so the encoding is always legal.
@@ -4297,6 +4319,7 @@ var
     Blk: TSSABasicBlock;
     Ins: TSSAInstruction;
     UseW: Integer;                      // current block's loop-depth weight (B1b-lite)
+    IvBoost: Integer;                   // extra weight for a loop-carried induction step (IvStepWeight)
 
     // B1b-lite: weight use counts by loop depth, so the greedy allocator stops preferring
     // init-code registers (many STATIC occurrences, run once) over hot-loop registers (few
@@ -4576,6 +4599,34 @@ var
             if Ins.Src1.Kind = svkRegister then CountVal(Ins.Src1);
             if Ins.Src2.Kind = svkRegister then CountVal(Ins.Src2);
             if Ins.Src3.Kind = svkRegister then CountVal(Ins.Src3);
+            // ⭐ A SELF-ACCUMULATING add (`d := d + s`) in a loop IS the loop-carried dependency,
+            // and its operands are not worth the same as any other mention: spilling `s` puts a
+            // LOAD ON THE CHAIN, so the next iteration's update cannot start until it returns.
+            // Every other spill costs a load the machine can overlap; this one sets the loop's
+            // minimum iteration time.
+            //
+            // 📊 Measured twice, both times as a mystery before it was named. AOT_ARRW=2 gives
+            // matmul's inner loop two fewer instructions AND two fewer memory reads (the array
+            // base stops being re-derived through a double indirection) - and it does not pay: 745
+            // -> 824 ms at ARRADDR=0, 788 -> 969 at ARRADDR=1. The dumps say why, in one line:
+            // `add r9, QWORD PTR [rbx+0xa0]`. Giving the base a register cost the STEP its own,
+            // and that trade is a loss however good the instruction count looks.
+            //
+            // So the step gets a weight boost rather than a hard pin: it competes, but at a price
+            // that reflects what losing costs. AOT_IVW=1 restores the flat weighting (the A/B).
+            if IvStepWeight > 1 then
+              case Ins.OpCode of
+                ssaAddInt, ssaSubInt:
+                  if (Ins.Dest.Kind = svkRegister) and (Ins.Src1.Kind = svkRegister) and
+                     (Ins.Src2.Kind = svkRegister) and
+                     (Prog.AotRemapIntReg(Ins.Dest.RegIndex) =
+                      Prog.AotRemapIntReg(Ins.Src1.RegIndex)) then
+                  begin
+                    IvBoost := UseW * (IvStepWeight - 1);
+                    UseW := IvBoost; CountVal(Ins.Src2); CountVal(Ins.Dest);
+                    UseW := BlockW[b - Region.FirstBlock];
+                  end;
+              end;
           end
           else
             NoteHelperOp;
@@ -5697,8 +5748,17 @@ var
       ssaCopyInt:
       begin
         d := IReg(Cur.Dest); p1 := IReg(Cur.Src1); if not OK then Exit;
+        // ⛔ A copy to ITSELF emits nothing. PHI elimination leaves `iv := iv` at the bottom of
+        // every counted loop, and this emitted `mov r9,r9` for it - once per iteration, forever.
+        // ssaCopyFloat below has skipped its own self-copy since it was written; the integer arm
+        // never got the same line, which is the same half-applied-fix shape as the string
+        // argument clobber. A register is never memory-homed AND register-homed at once, so
+        // comparing the VM registers covers both cases in one test.
+        if d = p1 then Exit;
         if (IAlloc(d) >= 0) and (IAlloc(p1) >= 0) then
-          MovRR(IAlloc(d), IAlloc(p1))
+        begin
+          if IAlloc(d) <> IAlloc(p1) then MovRR(IAlloc(d), IAlloc(p1));
+        end
         else
         begin ILoad(RAX, p1); IStore(d, RAX); end;
       end;
