@@ -2609,6 +2609,19 @@ var
   // the allocation POOL, so it must be written only after every operand read. r11 is NOT
   // used as a stage here (unlike concat): it is in the pool too and an int operand could
   // live there.
+  //
+  // ⛔⛔ AND THE INT OPERANDS MUST BE READ FROM THE BANK, NOT FROM THEIR HOME REGISTER -
+  // which is why every one of them goes through ILoadArgSpilled. The ordering above says
+  // WHEN to write the arg registers; it says nothing about where the value still lives by
+  // then, and on System V it usually does not live where ILoc says. ABI_ARG0/ARG1 are rdi
+  // and rsi, and BOTH are in the allocation pool on Linux, so writing arg1 with the source
+  // string destroys an int operand homed in rsi - and `Left("hello", 3)` then called the
+  // primitive with the string POINTER as its length and answered "hello". Win64 never saw
+  // it: there the arg registers are rcx/rdx/r8/r9 and rdi/rsi are callee-saved.
+  // ⭐ The discipline that survives both ABIs is the one ILoadArgSpilled encodes: after
+  // SpillVolatiles the BANK is authoritative for everything except a callee-saved home,
+  // and no arg register is callee-saved on either ABI. Asking that question costs one
+  // memory read and removes an ordering nothing checks.
   procedure EmitStrSlice(CtxOff: Integer);   // ssaStrLeft/ssaStrRight: (dstSlot, sVal, n)
   var d, s, n: Integer;
   begin
@@ -2618,7 +2631,7 @@ var
     Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
     MovLoad(ABI_ARG1, RAX, LongWord(s) * 8);              // arg1 = StringRegs[src] (value)
     E.MemOp([$49, $8B], RAX, R8, CtxOff);                 // rax = primitive (before r8 clobber)
-    ILoadArg(ABI_ARG2, n);                                // arg2 = length (clobbers r8 on Win64)
+    ILoadArgSpilled(ABI_ARG2, n);                         // arg2 = length, read from the bank
     E.EmitBytes([$FF, $D0]);                              // call rax
     StrCallEpilogue;
   end;
@@ -2632,8 +2645,8 @@ var
     Lea(ABI_ARG0, RAX, LongWord(d) * 8);
     MovLoad(ABI_ARG1, RAX, LongWord(s) * 8);
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRMID);
-    ILoadArg(ABI_ARG2, st);                               // start
-    ILoadArg(ABI_ARG3, ln);                               // length: r9 (pool) written LAST
+    ILoadArgSpilled(ABI_ARG2, st);                        // start, read from the bank
+    ILoadArgSpilled(ABI_ARG3, ln);                        // length: r9 (pool) written LAST
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
   end;
@@ -2760,7 +2773,7 @@ var
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
     Lea(ABI_ARG0, RAX, LongWord(d) * 8);
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRCHR);
-    ILoadArg(ABI_ARG1, c);
+    ILoadArgSpilled(ABI_ARG1, c);                         // the code, read from the bank
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
   end;
@@ -2774,7 +2787,7 @@ var
     MovLoad(ABI_ARG0, RAX, LongWord(hay) * 8);
     MovLoad(ABI_ARG1, RAX, LongWord(nee) * 8);
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRINSTR);
-    ILoadArg(ABI_ARG2, st);
+    ILoadArgSpilled(ABI_ARG2, st);                        // the start, read from the bank
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
     IStore(d, RAX);
@@ -2787,7 +2800,7 @@ var
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
     Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRINTTOSTR);     // rax = primitive (before r8 clobber)
-    ILoadArg(ABI_ARG1, v);                                // arg1 = value (may clobber r8 on Win64)
+    ILoadArgSpilled(ABI_ARG1, v);                         // arg1 = value, read from the bank
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
   end;
