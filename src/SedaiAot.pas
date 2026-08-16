@@ -280,6 +280,8 @@ var
   AotDiagVecLoops: Integer = 0;
   AotDiagVecEmitted: Integer = 0;
   AotDiagVecWhy: string = '';
+  // The measured floor for entering the vector loop; see AotVecMinTrip.
+  GAotVecMinTrip: Integer = -1;
   // Did the interval allocator actually run for the last region, and what did it place?
   AotDiagLinScanActive: Boolean = False;
   AotDiagLsPlacedInt: Integer = 0;
@@ -671,6 +673,11 @@ begin
   Result := (GAotAscMidInlineState = 1) and GAotStrHdrOK;
 end;
 
+const
+  // Set from the sweep in AotVecMinTrip's comment: below this many iterations the vector loop
+  // loses. Tuned once, on measurements, and left visible rather than buried in an expression.
+  AOT_VEC_MIN_TRIP_DEFAULT = 16;
+
 function AotVecLanes: Integer;
 // How wide the vector path runs. The DEFAULT is as wide as the CPU allows.
 //   (unset)          four lanes where the CPU has AVX, two where it does not
@@ -716,6 +723,28 @@ begin
     end;
   end;
   Result := GAotVecState;
+end;
+
+function AotVecMinTrip: Integer;
+// The shortest trip count worth entering the vector loop for. Below it the prologue - the step
+// and alias guards, the broadcasts, and the vzeroupper the exit owes - costs more than the lanes
+// save, and the loop comes out SLOWER.
+// ⛔⛔ MEASURED, and it is why this exists at all: with no threshold, n-body regressed 12.8% and
+// its CLBG twin 16.2%, because NBODIES=5 makes every loop there five iterations - one vector
+// pass plus a scalar tail, paying the whole prologue to save four multiplies. matmul, whose
+// loops are 1024, gained 70% in the same build. A vectoriser without a profitability test is not
+// an optimisation, it is a coin toss decided by the program.
+// ⚠️ The test is on the RUN-TIME trip count, not on a constant bound: the limit is a register,
+// and a loop whose length is only known at run time is exactly the one a compile-time rule would
+// have to guess about.
+// AOT_VEC_MIN=<n> overrides it; =0 restores the unguarded behaviour for an A/B.
+begin
+  if GAotVecMinTrip < 0 then
+  begin
+    GAotVecMinTrip := StrToIntDef(GetEnvironmentVariable('AOT_VEC_MIN'), -1);
+    if GAotVecMinTrip < 0 then GAotVecMinTrip := AOT_VEC_MIN_TRIP_DEFAULT;
+  end;
+  Result := GAotVecMinTrip;
 end;
 
 function AotVecEnabled: Boolean;
@@ -3149,7 +3178,7 @@ var
     AccArr, AccIdx, AccBase: array of Integer;   // one entry per array access, in body order
     RunBase: array of Integer;                   // final int reg -> its base AT THIS POINT
     AccStore: array of Boolean;
-    Lanes, ExitPatch: Integer;
+    Lanes, VecEntryTrip, ExitPatch: Integer;
     NAcc: Integer;
     GuardA, GuardB: array of Integer;            // base-register pairs a guard must compare
     NGuard: Integer;
@@ -3218,6 +3247,10 @@ var
   begin
     Result := False;
     Lanes := AotVecLanes;
+    // How many elements must remain for the vector body to be worth entering: never fewer than
+    // one full vector, and never fewer than the measured profitability floor.
+    VecEntryTrip := AotVecMinTrip;
+    if VecEntryTrip < Lanes then VecEntryTrip := Lanes;
     Bb := SSAProg.Blocks[V.BodyBlk];
 
     // Pass 1: the accesses, and whether every dependence between them can be GUARDED. Nothing is
@@ -3289,6 +3322,23 @@ var
         ILoad(RAX, GuardA[k2]);
         IOp([$48, $3B], RAX, GuardB[k2]);                   // cmp rax, otherBase
         JccRel($85, V.CondBlk);
+      end;
+      // --- profitability ---------------------------------------------------------------------
+      // ⛔ A loop too short to pay for the prologue below runs SCALAR instead. One more guard of
+      // the same shape as the others, so it shares their exit and their reasoning: it jumps out
+      // BEFORE any ymm is dirtied and therefore owes no vzeroupper.
+      // ⚠️ THE OBVIOUS CHEAPER FORM IS WRONG, and it was measured before this one was kept:
+      // raising the in-loop check from Lanes to MinTrip costs no instructions at all, but it
+      // hands everything below MinTrip to the SCALAR TAIL - and on a loop blocked to fit L1,
+      // whose trip count is a few tens, that is a third of the work. matmul_l1 lost 16% that way
+      // while this form costs it 2%. A test that is free per iteration is not free if it changes
+      // how much work the tail does.
+      if VecEntryTrip > Lanes then
+      begin
+        ILoad(RAX, V.LimitReg);
+        IOp([$48, $2B], RAX, V.IvReg);                      // sub rax, iv  -> iterations left
+        E.EmitBytes([$48, $83, $F8, Byte(VecEntryTrip)]);   // cmp rax, min
+        JccRel($8C, V.CondBlk);                             // jl -> scalar loop
       end;
       // --- broadcasts -----------------------------------------------------------------------
       // ⚠️ AFTER the guards: a guard that jumps out must not have dirtied any ymm, or the path it
