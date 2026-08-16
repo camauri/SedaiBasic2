@@ -56,41 +56,67 @@
   Where it runs: after LICM (which is what creates the preheader this needs) and
   before DCE and the range analysis.
 
-  ⛔⛔⛔ OFF BY DEFAULT — IT DISABLES THE VECTORISER, AND THAT COSTS FAR MORE THAN
-  IT SAVES. INDEXRED=1 turns it on.
+  ⛔⛔⛔ OFF BY DEFAULT. INDEXRED=1 turns it on. WHAT KEEPS IT OFF HAS CHANGED
+  TWICE, AND THE CURRENT REASON IS THE THIRD ONE - read to the end before moving
+  it.
 
-  The vector path recognises an array index of the form "invariant + counter" and
-  reads the unit stride straight off it. This pass replaces exactly that shape
-  with a running register, and the relation to the counter stops being visible:
+  ── 1. The vectoriser (CLOSED, 17 Aug 2026) ──────────────────────────────────
+  The vector path recognised ONE unit-stride shape, "invariant + counter", and
+  read the stride straight off it. This pass replaces exactly that shape with a
+  running register, and the relation to the counter stopped being visible:
 
       [AOT] vector: loops=1 emitted=1                      (INDEXRED=0)
       [AOT] vector: loops=0 emitted=0
             rejected: b15(w=512,fp):load-index-not-unit-stride   (INDEXRED=1)
 
-  Measured in the REAL configuration - the vector path ON, which is the default:
-
-      matmul        246 -> 653 ms   +165%
-      matmul_l1     279 -> 684      +145%
-      matmul_alias  243 -> 652      +168%
-      arraysum +1.6%   nbody +2.7%   floatpoly +1.0%   stream_triad 0.0%
+  Measured then, with the vector path ON (which is the default):
+      matmul 246 -> 653 ms (+165%)   matmul_l1 279 -> 684 (+145%)
+      matmul_alias 243 -> 652 (+168%)
 
   ⛔⛔ AND READ HOW THAT WAS NEARLY MISSED, BECAUSE IT IS THE MORE USEFUL HALF.
   Every measurement that put this pass in a good light was taken with AOT_VEC=0.
   That is not the default and never was; it was chosen early to isolate the
   scalar loop and then simply carried forward. In that configuration the pass
-  reads matmul_l1 at -27.8%; in the shipping one it is +145%. A benchmark harness
-  that pins a flag has stopped measuring the product - and the sign of the answer
-  can invert, not merely its size.
+  reads matmul_l1 at -27.8%; in the shipping one it was +145%. A benchmark
+  harness that pins a flag has stopped measuring the product - and the sign of
+  the answer can invert, not merely its size.
 
-  ⭐ WHAT IT WOULD TAKE TO ENABLE IT. The same shape it removes has to be
-  re-recognised downstream, and that has now happened TWICE for this one pass:
-  SedaiRangeAnalysis.EvalDerivedIV had to learn that a running index inherits the
-  counter's proven range (without it, the bounds guards come back and the pass is
-  worth +41%), and ScanVecLoops in this unit has to learn that a register the
-  loop advances by its own step IS a unit-stride index. Until that second one
-  exists, this pass is a large pessimisation on exactly the loops it targets.
-  ⇒ A transformation that erases the shape another analysis matches on is not
-  finished when it is correct.
+  ScanVecLoops now reads a running index (efd3677). With it, on the AOT, the
+  pass is worth what it always promised - best-of-5 on a cold package, both
+  orderings, the gate applied to ONE binary:
+
+      matmul       -3.4% / -5.0%      matmul_l1  -20.9% / -26.6%
+      matmul_alias -9.8% / -12.4%     everything else within a 1.7% noise floor
+      interpreter: matmul_l1 -20.6%   --aot --jit: matmul -6.9%, l1 -20.6%
+
+  ⭐ That is the SECOND downstream consumer this one pass had to be re-taught -
+  SedaiRangeAnalysis.EvalDerivedIV was the first (without it the bounds guards
+  come back and the pass is worth +41%). ⇒ A transformation that erases the shape
+  another analysis matches on is not finished when it is correct.
+
+  ── 2. The JIT's register allocator (OPEN - THIS is what keeps it off) ───────
+  On `--jit` ALONE the same gate reads matmul +65.0% and matmul_l1 +48.5%
+  (arraysum -7.8% and nbody -5.0%, so it is not the pass being wrong - it is
+  pressure). JIT_DUMP says exactly why. In the region actually entered - the
+  whole i/k/j nest - one of the three running indices gets no GPR, and the
+  innermost loop then carries:
+
+      mov rcx,[rbx+0x88]              ; the index, read from the bank
+      ...
+      mov rax,[rbx+0x88]              ; and its advance, read-MODIFY-WRITE
+      add rax,r12
+      mov [rbx+0x88],rax
+
+  ⛔⛔⛔ AND THAT IS THE ASYMMETRY WORTH KEEPING. A RECOMPUTED index that misses a
+  register costs a LOAD per iteration. A RUNNING one costs a load AND A STORE,
+  every iteration, through the same address - a store-to-load dependency in the
+  hottest loop in the program. Strength reduction is only a win while its result
+  gets a register; unallocated, it is strictly worse than the arithmetic it
+  removed. The AOT keeps all three (its `Allocate` competes on LOOP-WEIGHTED
+  traffic); the JIT's picks by UNWEIGHTED mention count over the whole region
+  (`Inc(IUse[r])` in ScanI), so a value mentioned four times in the outer loop
+  outranks an index mentioned three times in a loop that runs 1024x more often.
+  ⇒ Weight the JIT's IUse by loop depth and this pass can go on by default.
 
   What was fixed on the way here, and stands:
    - it transformed any "invariant + counter", not only array indices, and

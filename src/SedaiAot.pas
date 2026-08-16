@@ -279,6 +279,10 @@ var
   // is a recogniser you tune by guessing.
   AotDiagVecLoops: Integer = 0;
   AotDiagVecEmitted: Integer = 0;
+  // ⭐ How many RUNNING indices the emitted vector loops carried. Without this number a green net
+  // over a corpus that contains no such index reads exactly like a green net over one that does -
+  // and the first thing the running-index recogniser needed was a way to tell those apart.
+  AotDiagVecRunIdx: Integer = 0;
   AotDiagVecWhy: string = '';
   // The measured floor for entering the vector loop; see AotVecMinTrip.
   GAotVecMinTrip: Integer = -1;
@@ -1494,6 +1498,12 @@ type
     // DIFFERENT index registers are safe exactly when their bases hold the same value, which is a
     // cmp and a jne in the preheader - see the runtime-guard note on the recogniser.
     IdxBase: array of Integer;
+    // Final int reg -> this register is a RUNNING index: the loop advances it by its own step
+    // instead of recomputing it from the counter (what SedaiIndexReduction emits). It is unit
+    // stride for the same reason the counter is - it moves by the same step register, which the
+    // preheader already guards to be 1 - but the vector body must advance it by a whole VECTOR,
+    // not by one, and it stays live across the back edge where a recomputed index would not.
+    IsRunIdx: array of Boolean;
     UniformF: array of Integer;     // float regs holding a value that is the same in both lanes,
     NUniform: Integer;              // so they are broadcast once before the loop
   end;
@@ -1919,6 +1929,25 @@ var
     n := IAlloc(vmreg);
     if n >= 0 then MovRR(n, scr)
     else E.MemOp([$48, $89], scr, RBX, LongWord(vmreg) * 8);
+  end;
+  // vmreg += imm8, IN PLACE. The obvious spelling - ILoad into rax, add, IStore back - costs three
+  // instructions where one does, and the vector loop pays it once per induction variable per pass:
+  // four of them in matmul's inner loop, which is eight instructions of pure staging on a body of
+  // twenty-seven. `add r12, 4` needs no scratch and clobbers nothing.
+  procedure IAddImm8(vmreg, imm: Integer);
+  var n: Integer; rex: Byte;
+  begin
+    n := IAlloc(vmreg);
+    if n >= 0 then
+    begin
+      rex := $48; if n >= 8 then rex := rex or $01;
+      E.Emit8(rex); E.Emit8($83); E.Emit8($C0 or (n and 7)); E.Emit8(Byte(imm));
+    end
+    else
+    begin
+      E.MemOp([$48, $83], 0, RBX, LongWord(vmreg) * 8);   // add qword [rbx+disp32], imm8  (/0)
+      E.Emit8(Byte(imm));
+    end;
   end;
   procedure IOp(const MemForm: array of Byte; scr, vmreg: Integer);
   var rest: array of Byte; k, n: Integer;
@@ -3323,7 +3352,7 @@ var
     SavedCur: TSSAInstruction; SavedBlk: Integer;
     AccArr, AccIdx, AccBase: array of Integer;   // one entry per array access, in body order
     RunBase: array of Integer;                   // final int reg -> its base AT THIS POINT
-    AccStore: array of Boolean;
+    AccStore, AccRun: array of Boolean;          // ...and whether the index is a RUNNING one
     Lanes, VecEntryTrip, ExitPatch: Integer;
     NAcc: Integer;
     GuardA, GuardB: array of Integer;            // base-register pairs a guard must compare
@@ -3361,6 +3390,24 @@ var
         // before the op reads it. xmm0 is scratch and never in the pool.
         SseRR(PD_MOV, XMM0, a); SseRR(Op, XMM0, b); SseRR(PD_MOV, d, XMM0);
       end;
+    end;
+
+    // The SIB index register for an access: the index's OWN native home when it has one, and only
+    // otherwise a copy staged through rcx. The scalar path was taught this (AOT_ARRADDR mode 1);
+    // the vector path was still staging every access, which on matmul's body is three `mov rcx,rNN`
+    // that do nothing. rcx is never a pool GPR, so the staged form remains available for a
+    // bank-homed index, and rdx (VecBase's scratch) is not a pool GPR either.
+    function VecIdxReg(const Vv: TSSAValue): Integer;
+    var vr, n: Integer;
+    begin
+      vr := Prog.AotRemapIntReg(Vv.RegIndex);
+      if AotArrAddrDirect and (vr >= 0) and (vr <= MaxIReg) then
+      begin
+        n := ILoc[vr];
+        if n >= 0 then Exit(n);
+      end;
+      ILoad(RCX, vr);
+      Result := RCX;
     end;
 
     procedure VecLoad(dst, baseR, idxR: Integer);
@@ -3404,6 +3451,7 @@ var
     NAcc := 0; NGuard := 0;
     SetLength(AccArr, Bb.Instructions.Count); SetLength(AccIdx, Bb.Instructions.Count);
     SetLength(AccBase, Bb.Instructions.Count); SetLength(AccStore, Bb.Instructions.Count);
+    SetLength(AccRun, Bb.Instructions.Count);
     // ⚠️ The base of an index has to be read AT THE POINT OF USE, walking the body in order, not
     // out of a table keyed by register. The REGREUSE merge deliberately gives one VM register to
     // values with disjoint lifetimes, so the same register really does hold two different indices
@@ -3434,7 +3482,14 @@ var
       if (idxr < 0) or (idxr > MaxIReg) then Exit;
       AccArr[NAcc] := Ins2.Src1.ArrayIndex;
       AccIdx[NAcc] := idxr;
-      if idxr = V.IvReg then AccBase[NAcc] := -1 else AccBase[NAcc] := RunBase[idxr];
+      // A RUNNING index has no base register to read: it IS the address, carried from the
+      // preheader. Two of them name the same element exactly when they are equal right here, and
+      // they stay equal, because both advance by the same step - so the index register is its own
+      // comparison key, in a namespace of its own (AccRun) so it is never compared against a base.
+      AccRun[NAcc] := (idxr <= MaxIReg) and (idxr < Length(V.IsRunIdx)) and V.IsRunIdx[idxr];
+      if AccRun[NAcc] then AccBase[NAcc] := idxr
+      else if idxr = V.IvReg then AccBase[NAcc] := -1
+      else AccBase[NAcc] := RunBase[idxr];
       if AccBase[NAcc] = -2 then Exit;                    // no base to compare: give the loop up
       AccStore[NAcc] := Ins2.OpCode = ssaArrayStore;
       Inc(NAcc);
@@ -3451,6 +3506,7 @@ var
         // register alone does not say so, since one register can carry two different indices in
         // one body. Equal bases (including both being the bare IV) need no guard; two different
         // invariant bases get a cmp; a bare IV against a based index cannot be compared that way.
+        if AccRun[ii] <> AccRun[jj] then Exit;   // a running index and a base are not comparable
         if AccBase[ii] = AccBase[jj] then System.Continue;
         if (AccBase[ii] < 0) or (AccBase[jj] < 0) then Exit;
         GuardA[NGuard] := AccBase[ii]; GuardB[NGuard] := AccBase[jj]; Inc(NGuard);
@@ -3509,22 +3565,30 @@ var
         case Ins2.OpCode of
           ssaJump, ssaCopyInt: ;                            // back edge / the IV's self-copy
           ssaAddInt:
+          begin
             // The index computations are per-lane-START values: identical to the scalar form.
             // The induction step is not emitted here - the vector loop advances by two.
-            if Prog.AotRemapIntReg(Ins2.Dest.RegIndex) <> V.IvReg then IntBin([$48, $03], True);
+            hd := Prog.AotRemapIntReg(Ins2.Dest.RegIndex);
+            // ⛔ ...and a RUNNING index has to advance by a whole VECTOR, exactly like the counter
+            // below. Emitting its scalar `add r, step` here would leave it one element on while the
+            // counter moved four, and every following iteration would read the wrong elements.
+            if (hd >= 0) and (hd <= MaxIReg) and (hd < Length(V.IsRunIdx)) and V.IsRunIdx[hd] then
+              IAddImm8(hd, Lanes)
+            else if hd <> V.IvReg then IntBin([$48, $03], True);
+          end;
           ssaArrayLoad:
           begin
             aid := Ins2.Src1.ArrayIndex;
-            ILoad(RCX, Prog.AotRemapIntReg(Ins2.Src2.RegIndex));
+            idxr := VecIdxReg(Ins2.Src2);
             VecBase(aid, baseR);
-            VecLoad(FH(Ins2.Dest), baseR, RCX);
+            VecLoad(FH(Ins2.Dest), baseR, idxr);
           end;
           ssaArrayStore:
           begin
             aid := Ins2.Src1.ArrayIndex;
-            ILoad(RCX, Prog.AotRemapIntReg(Ins2.Src2.RegIndex));
+            idxr := VecIdxReg(Ins2.Src2);
             VecBase(aid, baseR);
-            VecStore(FH(Ins2.Dest), baseR, RCX);
+            VecStore(FH(Ins2.Dest), baseR, idxr);
           end;
           ssaAddFloat, ssaSubFloat, ssaMulFloat, ssaDivFloat:
           begin
@@ -3545,9 +3609,7 @@ var
         end;
       end;
       // --- step by one vector and go round ----------------------------------------------------
-      ILoad(RAX, V.IvReg);
-      E.EmitBytes([$48, $83, $C0, Byte(Lanes)]);            // add rax, lanes
-      IStore(V.IvReg, RAX);
+      IAddImm8(V.IvReg, Lanes);                             // add iv, lanes  (in place)
       E.Emit8($E9); E.Emit32(LongWord(VTop - (E.Len + 4))); // jmp Vtop
       // --- the exit trampoline ----------------------------------------------------------------
       E.Patch32(ExitPatch, LongWord(E.Len - (ExitPatch + 4)));
@@ -3558,6 +3620,8 @@ var
       if Lanes = 4 then E.EmitBytes([$C5, $F8, $77]);       // vzeroupper
       Result := True;
       Inc(AotDiagVecEmitted);
+      for k2 := 0 to High(V.IsRunIdx) do
+        if V.IsRunIdx[k2] then Inc(AotDiagVecRunIdx);
     finally
       Cur := SavedCur; CurBlkIdx := SavedBlk;
     end;
@@ -4689,6 +4753,14 @@ var
     Bad: string;
     IsIdx: array of Boolean;          // final int reg -> holds an index of the form invariant+iv
     IdxB: array of Integer;           // ...and the invariant register it is based on
+    // ⭐ The OTHER unit-stride shape: a RUNNING index, initialised in the preheader and advanced by
+    // the counter's own step at the bottom of the body. SedaiIndexReduction produces exactly this,
+    // and until this recogniser knew it, that pass turned the vectoriser off on every loop it
+    // touched (+165% on matmul). A transformation that erases the shape another analysis matches on
+    // is not finished when it is correct.
+    IsRun: array of Boolean;          // final int reg -> a running index (advances by StepReg)
+    RunBumped: array of Boolean;      // ...and its advance has already been passed in this walk
+    NDef: array of Integer;           // final int reg -> how many times the body defines it
     Wrote: array of Boolean;          // final int reg -> written inside the body (not invariant)
     WroteF: array of Boolean;         // final float reg -> written inside the body
     // "Per-lane": this float register currently holds a value DERIVED FROM THIS ITERATION - an
@@ -4698,7 +4770,7 @@ var
     Lane: array of Boolean;
     IvUpdated: Boolean;               // the induction step has been passed in this walk
     HasFp: Boolean;                   // the loop reads or writes a FLOAT array element
-    nl, ns, na: Integer;
+    nl, ns, na, stpPre: Integer;
 
     function RInt(const V: TSSAValue): Integer;
     begin
@@ -4728,14 +4800,17 @@ var
       r2 := RFlt(V);
       Result := (r2 >= 0) and Lane[r2];
     end;
-    // A unit-stride index: the induction variable itself, or invariant+iv. Either way it advances
-    // by exactly the step every iteration, so consecutive iterations touch consecutive elements -
-    // which is the whole precondition for loading two of them with one movupd.
+    // A unit-stride index: the induction variable itself, invariant+iv, or a running index the loop
+    // advances by the SAME step register. Either way it advances by exactly the step every
+    // iteration, so consecutive iterations touch consecutive elements - which is the whole
+    // precondition for loading two of them with one movupd.
+    // ⛔ A running index is only this iteration's element BEFORE its own advance, exactly as the
+    // counter is only this iteration's before the induction step.
     function IdxOK(const V: TSSAValue): Boolean;
     var r2: Integer;
     begin
       r2 := RInt(V);
-      Result := (r2 >= 0) and ((r2 = iv) or IsIdx[r2]);
+      Result := (r2 >= 0) and ((r2 = iv) or IsIdx[r2] or (IsRun[r2] and not RunBumped[r2]));
     end;
     // A candidate turned down BEFORE the body walk. These used to be silent, which made
     // "loops=0" with an empty reject list read as "there are no loops here" - the one thing it does
@@ -4761,6 +4836,9 @@ var
     nbk := Region.LastBlock - Region.FirstBlock + 1;
     SetLength(IsIdx, MaxIReg + 1);
     SetLength(IdxB, MaxIReg + 1);
+    SetLength(IsRun, MaxIReg + 1);
+    SetLength(RunBumped, MaxIReg + 1);
+    SetLength(NDef, MaxIReg + 1);
     SetLength(Wrote, MaxIReg + 1);
     SetLength(WroteF, MaxFReg + 1);
     SetLength(Lane, MaxFReg + 1);
@@ -4804,7 +4882,11 @@ var
       begin PreReject(bi, 'cond-not-jumpifzero'); System.Continue; end;
       if Bb.Instructions.Count < 4 then begin PreReject(bi, 'body-too-small'); System.Continue; end;
 
-      for k2 := 0 to MaxIReg do begin IsIdx[k2] := False; IdxB[k2] := -1; Wrote[k2] := False; end;
+      for k2 := 0 to MaxIReg do
+      begin
+        IsIdx[k2] := False; IdxB[k2] := -1; Wrote[k2] := False;
+        IsRun[k2] := False; RunBumped[k2] := False; NDef[k2] := 0;
+      end;
       for k2 := 0 to MaxFReg do begin WroteF[k2] := False; Lane[k2] := False; end;
       IvUpdated := False;
       // First pass: what does the body WRITE? Anything it does not write is loop-invariant, which
@@ -4813,11 +4895,47 @@ var
       begin
         Ins2 := Bb.Instructions[ii];
         if Ins2.OpCode = ssaArrayStore then System.Continue;     // Dest is READ here, not written
-        q := RInt(Ins2.Dest); if q >= 0 then Wrote[q] := True;
+        q := RInt(Ins2.Dest);
+        if q >= 0 then
+        begin
+          Wrote[q] := True;
+          // ⛔ NOT the IV's self-copy. `r := r` defines nothing new, and counting it made NDef[iv]
+          // two, which switched the whole running-index recogniser off - silently, because the
+          // rejection then reads `load-index-not-unit-stride`, the very message it was written to
+          // remove.
+          if not ((Ins2.OpCode = ssaCopyInt) and (RInt(Ins2.Src1) = q)) then Inc(NDef[q]);
+        end;
         q := RFlt(Ins2.Dest); if q >= 0 then WroteF[q] := True;
       end;
       if not Wrote[iv] then begin PreReject(bi, 'iv-not-advanced-here'); System.Continue; end;
       if Wrote[lim] then begin PreReject(bi, 'limit-not-invariant'); System.Continue; end;
+
+      // Second pass, and it has to come BEFORE the ordered walk: a running index is USED at the top
+      // of the body and ADVANCED at the bottom, so an in-order walk meets its uses before it has
+      // learnt what it is. The step register is found first for the same reason.
+      // ⛔ The step must be the induction variable's OWN step register, not merely some invariant:
+      // the vector prologue guards `step = 1` once, and that guard is what makes both the counter
+      // and every index riding on it unit stride. A second step register would need a second guard.
+      stpPre := -1;
+      for ii := 0 to Bb.Instructions.Count - 1 do
+      begin
+        Ins2 := Bb.Instructions[ii];
+        if Ins2.OpCode <> ssaAddInt then System.Continue;
+        dr := RInt(Ins2.Dest); sa := RInt(Ins2.Src1); sb2 := RInt(Ins2.Src2);
+        if (dr < 0) or (sa < 0) or (sb2 < 0) then System.Continue;
+        if (dr = iv) and (sa = iv) and (sb2 <> iv) and (not Wrote[sb2]) and (NDef[iv] = 1) then
+          stpPre := sb2;
+      end;
+      if stpPre >= 0 then
+        for ii := 0 to Bb.Instructions.Count - 1 do
+        begin
+          Ins2 := Bb.Instructions[ii];
+          if Ins2.OpCode <> ssaAddInt then System.Continue;
+          dr := RInt(Ins2.Dest); sa := RInt(Ins2.Src1); sb2 := RInt(Ins2.Src2);
+          if (dr < 0) or (sa < 0) or (sb2 < 0) then System.Continue;
+          // rD := rD + step, defined nowhere else in the body: it moves beside the counter.
+          if (dr <> iv) and (dr = sa) and (sb2 = stpPre) and (NDef[dr] = 1) then IsRun[dr] := True;
+        end;
 
       Bad := ''; stp := -1; nl := 0; ns := 0; na := 0;
       for ii := 0 to Bb.Instructions.Count - 1 do
@@ -4839,6 +4957,9 @@ var
             end
             else if (sa = iv) and not Wrote[sb2] then begin IsIdx[dr] := True; IdxB[dr] := sb2; end
             else if (sb2 = iv) and not Wrote[sa] then begin IsIdx[dr] := True; IdxB[dr] := sa; end
+            // The running index's own advance. Past this point it names the NEXT iteration's
+            // element, which is what RunBumped stops IdxOK accepting.
+            else if IsRun[dr] and (dr = sa) and (sb2 = stp) then RunBumped[dr] := True
             else Bad := 'int-add-not-index';
           end;
           ssaCopyInt:
@@ -4911,9 +5032,13 @@ var
         for k2 := 0 to MaxFReg do
           if WroteF[k2] and (k2 < Length(OutF[bi + 1])) and OutF[bi + 1][k2] then
           begin Bad := 'float-live-out'; Break; end;
+      // ...with the same two exceptions: the counter, and a RUNNING index. Both are live across the
+      // back edge BY CONSTRUCTION, and both leave the vector loop holding exactly what the same
+      // number of scalar iterations would have left, because both advance by one whole vector.
       if Bad = '' then
         for k2 := 0 to MaxIReg do
-          if Wrote[k2] and (k2 <> iv) and (k2 < Length(OutI[bi + 1])) and OutI[bi + 1][k2] then
+          if Wrote[k2] and (k2 <> iv) and (not IsRun[k2]) and
+             (k2 < Length(OutI[bi + 1])) and OutI[bi + 1][k2] then
           begin Bad := 'index-live-out'; Break; end;
       // Every float the body touches must live in an xmm register. A memory-homed one would have
       // to spill 128 bits into an 8-byte bank slot - and there is nowhere to put the second lane.
@@ -4950,7 +5075,12 @@ var
       VecLoops[NVecLoop].NArith := na;
       VecLoops[NVecLoop].Weight := BlockW[bi + 1];
       SetLength(VecLoops[NVecLoop].IdxBase, MaxIReg + 1);
-      for k2 := 0 to MaxIReg do VecLoops[NVecLoop].IdxBase[k2] := IdxB[k2];
+      SetLength(VecLoops[NVecLoop].IsRunIdx, MaxIReg + 1);
+      for k2 := 0 to MaxIReg do
+      begin
+        VecLoops[NVecLoop].IdxBase[k2] := IdxB[k2];
+        VecLoops[NVecLoop].IsRunIdx[k2] := IsRun[k2];
+      end;
       // Uniform floats: read by the body, never written by it - the same value in both lanes, so
       // one unpcklpd before the loop puts it there and the scalar tail still reads the low half.
       VecLoops[NVecLoop].NUniform := 0;
@@ -6299,6 +6429,7 @@ begin
   FuseDone := False;
   AotDiagCmpFused := 0;
   AotDiagVecEmitted := 0;
+  AotDiagVecRunIdx := 0;
   BailWhy := '';
   OK := True;
   ArrClassic := not AllowUnsafe;
@@ -6785,8 +6916,8 @@ begin
         if AotDiagHelperOps <> '' then
           WriteLn(ErrOutput, '[AOT]   helper ops: ' + AotDiagHelperOps);
         if AotVecEnabled then
-          WriteLn(ErrOutput, Format('[AOT]   vector: %d lanes, loops=%d emitted=%d%s',
-                  [AotVecLanes, AotDiagVecLoops, AotDiagVecEmitted,
+          WriteLn(ErrOutput, Format('[AOT]   vector: %d lanes, loops=%d emitted=%d runidx=%d%s',
+                  [AotVecLanes, AotDiagVecLoops, AotDiagVecEmitted, AotDiagVecRunIdx,
                    BoolToStr(AotDiagVecWhy <> '', '  rejected: ' + AotDiagVecWhy, '')]));
         // Which register strategy this region got. "merge" and "dynf" are mutually exclusive by
         // arbitration in AUTO (they are antagonistic, never additive); "static" means the region
