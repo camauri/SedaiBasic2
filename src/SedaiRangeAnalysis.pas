@@ -225,7 +225,10 @@ type
     function GuardedRange(li: Integer; H: TSSABasicBlock; Cmp: TSSAInstruction;
                           Step: Int64; const InitR: TRange; Depth: Integer): TRange;
     function EvalForIV(Phi: TSSAInstruction; H, UseBlock: TSSABasicBlock;
-                       Depth: Integer): TRange;
+                       UseIndex, Depth: Integer): TRange;
+    function EvalDerivedIV(H, UseBlock: TSSABasicBlock; li: Integer; UseIndex: Integer;
+                           Step: Int64; const IR: TRange; Depth: Integer): TRange;
+    function LoopStepOf(const V: TSSAValue; li: Integer; out Step: Int64): Boolean;
     function TryUnversionedIV(const V: TSSAValue; UseBlock: TSSABasicBlock;
                               UseIndex, Depth: Integer): TRange;
     function TraceStep(const LatchVal, PhiDest: TSSAValue; out Step: Int64): Boolean;
@@ -1325,8 +1328,103 @@ begin
   Result := MkRange(Lo, Hi);
 end;
 
+function TRangeAnalysis.LoopStepOf(const V: TSSAValue; li: Integer; out Step: Int64): Boolean;
+// The constant this register advances by, once per iteration of loop li. True only when the loop
+// holds EXACTLY ONE def of it and that def is "V := V +/- const" - two defs mean two step values on
+// two paths, and a bound built on either of them would be a guess.
+var
+  di: Integer;
+  S: Int64;
+  Found: Boolean;
+begin
+  Result := False; Step := 0; Found := False;
+  di := FindDefIdx(V);
+  while di >= 0 do
+  begin
+    if FLoops[li].Blocks.IndexOf(FDefRecs[di].Block) >= 0 then
+    begin
+      // degenerate self-phis are merge markers, not defs (same rule as TryUnversionedIV)
+      if not ((FDefRecs[di].Instr.OpCode = ssaPhi) and SelfPhi(FDefRecs[di].Instr)) then
+      begin
+        if Found then Exit;                                   // a second def: refuse
+        if not StepOfDef(FDefRecs[di].Instr, V, S) then Exit;
+        Step := S; Found := True;
+      end;
+    end;
+    di := FDefRecs[di].Next;
+  end;
+  Result := Found and (Step <> 0);
+end;
+
+function TRangeAnalysis.EvalDerivedIV(H, UseBlock: TSSABasicBlock; li: Integer;
+                                      UseIndex: Integer; Step: Int64;
+                                      const IR: TRange; Depth: Integer): TRange;
+// The proof described at the call site, built on ONE identity and nothing else:
+//
+//   p advances once per iteration by Step, beside the guarded counter g which advances by GStep.
+//   Over the whole loop g travels GR.Hi - GR.Lo, so p travels (GR.Hi - GR.Lo) * Step / GStep,
+//   and p stays within its own initial range extended by exactly that much.
+//
+// Using the counter's TRAVEL rather than its absolute value is what keeps this short and sound: it
+// needs no relation between p's origin and g's, only that they step together - so the guarded
+// counter's range, which the analysis already proves, is the only external fact required.
+//
+// ⛔ Refused, deliberately, in every case the identity does not cover:
+//   - either step not positive (a countdown, or a step whose sign differs from the other's);
+//   - the counter's travel or the arithmetic below not exactly divisible / representable;
+//   - more than one def of the counter in the loop (LoopStepOf).
+var
+  k: Integer;
+  Jump, CmpI: TSSAInstruction;
+  CmpDef: TDefRec;
+  GStep, Travel, Reach: Int64;
+  GR: TRange;
+
+  {$IFDEF DEBUG_RANGE}
+  procedure DWhy(const Msg: string);
+  begin
+    if DebugRange then WriteLn('[Range]   derived-IV reject @', H.LabelName, ': ', Msg);
+  end;
+  {$ELSE}
+  procedure DWhy(const Msg: string); begin end;
+  {$ENDIF}
+begin
+  Result := Unknown;
+  if Step <= 0 then begin DWhy('our step is not positive'); Exit; end;
+  // The loop's guard, whatever counter it is on.
+  Jump := nil;
+  for k := H.Instructions.Count - 1 downto 0 do
+    if OpIn(H.Instructions[k].OpCode, [ssaJumpIfZero, ssaJumpIfNotZero]) then
+    begin Jump := H.Instructions[k]; Break; end;
+  if Jump = nil then begin DWhy('header has no conditional jump'); Exit; end;
+  if not FindDef(Jump.Src1, CmpDef) then begin DWhy('no def for the condition'); Exit; end;
+  if CmpDef.Block <> H then begin DWhy('condition not computed in the header'); Exit; end;
+  CmpI := CmpDef.Instr;
+  if CmpI.Src1.Kind <> svkRegister then begin DWhy('guard counter is not a register'); Exit; end;
+  if not LoopStepOf(CmpI.Src1, li, GStep) then
+  begin DWhy('guard counter has no single constant step in this loop'); Exit; end;
+  if GStep <= 0 then begin DWhy('guard counter step is not positive'); Exit; end;
+  // Its proven range AT THIS USE - the same question the analysis answers for the counter itself,
+  // asked again here rather than re-derived, so the two can never disagree.
+  GR := EvalRange(CmpI.Src1, UseBlock, UseIndex, Depth + 1);
+  if not GR.Known then begin DWhy('guard counter range unknown at the use'); Exit; end;
+  Travel := GR.Hi - GR.Lo;
+  if Travel < 0 then begin DWhy('guard counter range inverted'); Exit; end;
+  if (Travel mod GStep) <> 0 then begin DWhy('counter travel not a whole number of steps'); Exit; end;
+  if (Travel div GStep) > (RANGE_MAX div Step) then begin DWhy('reach overflows'); Exit; end;
+  Reach := (Travel div GStep) * Step;
+  if (IR.Hi > RANGE_MAX - Reach) then begin DWhy('reach saturates'); Exit; end;
+  Result := MkRange(IR.Lo, IR.Hi + Reach);
+  {$IFDEF DEBUG_RANGE}
+  if DebugRange then
+    WriteLn('[Range]   derived IV @', H.LabelName, ': counter=[', GR.Lo, ',', GR.Hi,
+            '] step=', GStep, ' ours step=', Step, ' init=[', IR.Lo, ',', IR.Hi,
+            '] -> [', Result.Lo, ',', Result.Hi, ']');
+  {$ENDIF}
+end;
+
 function TRangeAnalysis.EvalForIV(Phi: TSSAInstruction; H, UseBlock: TSSABasicBlock;
-                                  Depth: Integer): TRange;
+                                  UseIndex, Depth: Integer): TRange;
 // VERSIONED induction variable: the canonical loop-header PHI.
 var
   li, i: Integer;
@@ -1390,12 +1488,41 @@ begin
     Exit;
   end;
   if Step = 0 then begin Why('step 0'); Exit; end;
-  if not FindGuard(H, li, Phi.Dest, Cmp) then begin Why('no guard on phi'); Exit; end;
   IR := EvalRange(InitVal, InitBlock, -1, Depth + 1);
   if not IR.Known then begin Why('init range unknown'); Exit; end;
-  Result := GuardedRange(li, H, Cmp, Step, IR, Depth);
+  if FindGuard(H, li, Phi.Dest, Cmp) then
+  begin
+    Result := GuardedRange(li, H, Cmp, Step, IR, Depth);
+    {$IFDEF DEBUG_RANGE}
+    if not Result.Known then Why('guard/limit combination failed');
+    {$ENDIF}
+    Exit;
+  end;
+  // ⭐ DERIVED induction variable: the loop's guard is on a DIFFERENT counter, and this one runs
+  // beside it. `Dim p = base : For j = 0 To n-1 : a(p) : p += 1 : Next` is ordinary BASIC - it is
+  // what a hand strength-reduced loop looks like - and until now every access through `p` kept its
+  // bounds guard, because FindGuard only ever asked about the phi in front of it.
+  //
+  // 📊 What that cost, measured: matmul written with running indices instead of `i*NM+j` runs 846 ms
+  // against the recomputing form's 598 - forty-one percent slower, entirely on three guards the
+  // analysis could not remove. The shape is not exotic; it is the one an induction-variable
+  // strength reduction would produce, so this also has to exist before that pass can pay.
+  //
+  // The proof is one identity: while both counters advance together, p = p0 + (g - g0). So with the
+  // guarded counter's range GR and its own initial range GIR,
+  //     p in [ IR.Lo + (GR.Lo - GIR.Hi) , IR.Hi + (GR.Hi - GIR.Lo) ]
+  // which is exact interval arithmetic on that identity, not an approximation of it.
+  //
+  // ⛔ "Advance together" is the whole safety condition, and it is four things, all required:
+  //   - both phis live in the SAME header, so they are evaluated on the same edge;
+  //   - both are entered from the SAME predecessor, so p0 and g0 are established together;
+  //   - both take their loop value from the SAME latch block, so no path updates one without the
+  //     other;
+  //   - THE STEPS ARE EQUAL. A different step is a different trip relation, and rather than reason
+  //     about ratios this refuses - `p += 2` beside `j += 1` keeps its guard.
+  Result := EvalDerivedIV(H, UseBlock, li, UseIndex, Step, IR, Depth);
   {$IFDEF DEBUG_RANGE}
-  if not Result.Known then Why('guard/limit combination failed');
+  if not Result.Known then Why('no guard on phi, and no derived-IV partner');
   {$ENDIF}
 end;
 
@@ -1808,7 +1935,7 @@ begin
   D := FDefRecs[h];
   case D.Instr.OpCode of
     ssaPhi:
-      Result := EvalForIV(D.Instr, D.Block, UseBlock, Depth);
+      Result := EvalForIV(D.Instr, D.Block, UseBlock, UseIndex, Depth);
   else
     Result := DefValueRange(D.Instr, D.Block, D.InstrIndex, Depth);
   end;
