@@ -56,32 +56,52 @@
   Where it runs: after LICM (which is what creates the preheader this needs) and
   before DCE and the range analysis.
 
-  ON by default; INDEXRED=0 turns it off, which is the A/B on one binary.
+  ⛔⛔⛔ OFF BY DEFAULT — IT DISABLES THE VECTORISER, AND THAT COSTS FAR MORE THAN
+  IT SAVES. INDEXRED=1 turns it on.
 
-  📊 Cold, interleaved, best of 6 per arm:
-      matmul_l1 -27.8%   arraysum -4.9%   floatpoly -3.3%   stream_triad -3.2%
-      nbody -2.7%        fannkuch -1.7%   matmul_alias -0.9%   matmul -0.5%
-      sieve and intpoly flat.
-  ⚠️ nbody, sieve and intpoly first read +2.9/+2.9/+2.0% on three samples per arm and came out
-  -2.7/0.0/0.0% on five. Below about 3% on this machine, three samples is not a measurement.
+  The vector path recognises an array index of the form "invariant + counter" and
+  reads the unit stride straight off it. This pass replaces exactly that shape
+  with a running register, and the relation to the counter stops being visible:
 
-  ⛔⛔ IT SHIPPED DISABLED FIRST, AND THE REASON IS WORTH READING BEFORE EDITING THIS UNIT. Two
-  defects, found in this order:
+      [AOT] vector: loops=1 emitted=1                      (INDEXRED=0)
+      [AOT] vector: loops=0 emitted=0
+            rejected: b15(w=512,fp):load-index-not-unit-stride   (INDEXRED=1)
 
-  1. It transformed ANY "invariant + counter", not only array indices, and rewrote `i * 10 + k` in a
-     printed expression. run_regress caught it: three OPTDIFFs. Narrowing it to array indices - which
-     is its own name - made the corpus green again.
-     ⇒ AND THE GREEN MEANT NOTHING. The corpus holds no array indexed by "invariant + counter" whose
-     counter starts at anything but zero, so the second defect was still there, untouched and
-     invisible. It took a sentinel written on purpose (bug_index_reduction.bas) to see it. A
-     narrowing that restores a green net has removed a symptom until proven otherwise.
+  Measured in the REAL configuration - the vector path ON, which is the default:
 
-  2. The real defect was one line, and it was NOT what the first diagnosis guessed (SSA versions):
-     the counter's start was handed to ssaAddInt as a CONSTANT operand, and the bytecode compiler
-     wants a register there. It lowered to "AddInt R7, R7, R0" - the addend silently became register
-     zero - so every loop whose counter started at a non-zero constant was off by exactly that
-     constant. The fix is to materialise the constant with its own ssaLoadConstInt first.
-     ⇒ A constant is not a universally acceptable operand here. Check what the lowering expects.
+      matmul        246 -> 653 ms   +165%
+      matmul_l1     279 -> 684      +145%
+      matmul_alias  243 -> 652      +168%
+      arraysum +1.6%   nbody +2.7%   floatpoly +1.0%   stream_triad 0.0%
+
+  ⛔⛔ AND READ HOW THAT WAS NEARLY MISSED, BECAUSE IT IS THE MORE USEFUL HALF.
+  Every measurement that put this pass in a good light was taken with AOT_VEC=0.
+  That is not the default and never was; it was chosen early to isolate the
+  scalar loop and then simply carried forward. In that configuration the pass
+  reads matmul_l1 at -27.8%; in the shipping one it is +145%. A benchmark harness
+  that pins a flag has stopped measuring the product - and the sign of the answer
+  can invert, not merely its size.
+
+  ⭐ WHAT IT WOULD TAKE TO ENABLE IT. The same shape it removes has to be
+  re-recognised downstream, and that has now happened TWICE for this one pass:
+  SedaiRangeAnalysis.EvalDerivedIV had to learn that a running index inherits the
+  counter's proven range (without it, the bounds guards come back and the pass is
+  worth +41%), and ScanVecLoops in this unit has to learn that a register the
+  loop advances by its own step IS a unit-stride index. Until that second one
+  exists, this pass is a large pessimisation on exactly the loops it targets.
+  ⇒ A transformation that erases the shape another analysis matches on is not
+  finished when it is correct.
+
+  What was fixed on the way here, and stands:
+   - it transformed any "invariant + counter", not only array indices, and
+     rewrote `i * 10 + k` in a printed expression (three OPTDIFFs). Narrowing it
+     to array indices restored the green AND LEFT the next defect in place,
+     because the corpus holds no array indexed this way with a non-zero start.
+   - that next defect: the counter's start went into ssaAddInt.Src2 as a CONSTANT
+     operand, where the bytecode compiler wants a register. It lowered to
+     "AddInt R7, R7, R0" - the addend became register zero - so every loop whose
+     counter started at a non-zero constant was off by exactly that constant.
+     Materialise the constant with its own ssaLoadConstInt.
   ============================================================================ }
 
 unit SedaiIndexReduction;
@@ -135,7 +155,7 @@ function TIndexReduction.Enabled: Boolean;
 begin
   if GEnabled < 0 then
   begin
-    if GetEnvironmentVariable('INDEXRED') = '0' then GEnabled := 0 else GEnabled := 1;
+    if GetEnvironmentVariable('INDEXRED') = '1' then GEnabled := 1 else GEnabled := 0;
   end;
   Result := GEnabled = 1;
 end;
