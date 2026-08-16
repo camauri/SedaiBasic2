@@ -169,6 +169,8 @@ var
   GJitTwoAddrState: Integer = -1;
   // JIT_TWOADDRF=0 puts every FLOAT ALU op back on the xmm0 round-trip. Read once, cached.
   GJitTwoAddrFState: Integer = -1;
+  // JIT_FPOOL=<n>: how many xmm the float allocator may hand out. Read once, cached (MaxInt = unread).
+  GJitFPoolState: Integer = MaxInt;
   // JIT_CMPFUSE=0 puts every integer compare back on materialising its boolean. Read once, cached.
   GJitCmpFuseState: Integer = -1;
   // How many compare/branch pairs the last compile fused - the probe that says the change is REACHED.
@@ -191,6 +193,30 @@ begin
     if GetEnvironmentVariable('JIT_TWOADDR') = '0' then GJitTwoAddrState := 0 else GJitTwoAddrState := 1;
   end;
   Result := GJitTwoAddrState = 1;
+end;
+
+function JitFloatPoolTop: Integer;
+// Highest xmm the allocator may hand out; the pool is xmm2..Result, with xmm0/xmm1 kept as scratch.
+// JIT_FPOOL=<n> asks for n registers (xmm2..n+1); JIT_FPOOL=6 restores the historic six exactly,
+// which is what makes the measurement an A/B on ONE binary.
+//
+// ⛔ Raising this above 7 is only safe because every float encoding that can name an ALLOCATED
+// register now goes through SseRR/SseMem, which emit REX. The old encoders emitted none, and above
+// xmm7 that does not fail - it addresses a DIFFERENT register, silently. If a new float emitter is
+// added, it goes through those two or this default has to come back down.
+var s: string; n: Integer;
+begin
+  if GJitFPoolState = MaxInt then
+  begin
+    GJitFPoolState := 15;
+    s := GetEnvironmentVariable('JIT_FPOOL');
+    if s <> '' then
+    begin
+      n := StrToIntDef(s, 14);
+      if (n >= 1) and (n <= 14) then GJitFPoolState := 1 + n;
+    end;
+  end;
+  Result := GJitFPoolState;
 end;
 
 function TwoAddrFloatEnabled: Boolean;
@@ -267,7 +293,13 @@ var
   // the stack in the prologue when allocated. Integer VM regs are allocated to r9..r15 (see ILoc below).
   FLoc: array of Integer;
   FMaxReg, NextXmm, fi: Integer;
-  SaveX6, SaveX7: Boolean;
+  // ⛔ ABI, and it is the whole reason this is an array and not two flags: on Win64 xmm6..xmm15 are
+  // CALLEE-SAVED, on System V every xmm is caller-saved. A register the pool hands out therefore
+  // costs a save/restore pair on Windows and nothing on Linux - so the flag is set per register and
+  // only for one the allocator ACTUALLY gave to a value, which is what lets a region that does not
+  // need the extra registers avoid paying for them. Same rule as the AOT's SaveXmm.
+  SaveXmm: array[6..15] of Boolean;
+  NSaveXmm: Integer;
   // Integer register allocation (J5): map a VM int reg -> a native GPR (r9..r15) or -1 (memory-homed).
   // Pool order: r9/r10/r11 (volatile) first, then r12..r15 (callee-saved, push/pop'd when used).
   ILoc: array of Integer;
@@ -284,7 +316,7 @@ var
   ScanAll: Boolean;
   CurPC: Integer;                   // absolute PC of the instruction EmitOne is lowering
   FuseSkipPC: Integer;              // PC whose instruction a fusion already emitted (-1 = none)
-  IMaxReg, NextGpr, ii, gpr: Integer;
+  IMaxReg, NextGpr, ii, gpr, w: Integer;
   IntPool: array[0..6] of Integer;
   SaveGpr: array[0..15] of Boolean;
   GprUsed: array[0..15] of Boolean;  // which native GPRs are claimed (int alloc + array-base cache)
@@ -367,43 +399,81 @@ var
     JmpRel(-1);                                     // jmp epilogue
   end;
 
+  // --- SSE encodings that can name xmm8..xmm15 (J4b) ---
+  // ⛔ EVERY float encoding that can touch an ALLOCATED register has to go through these two. The
+  // historic pair emitted no REX at all, which is correct for xmm0..7 and SILENTLY ADDRESSES THE
+  // WRONG REGISTER above it - so extending the pool without them would not be a slow program, it
+  // would be a wrong one. The same two routines have been in the AOT since 25 Jul (SseRR/SseMem);
+  // this is that pair, not a second design.
+  // The REX byte goes AFTER any mandatory prefix (F2/F3/66) and BEFORE the 0F escape.
+  procedure SseRR(const Op: array of Byte; RegField, RmReg: Integer);
+  var i, rex: Integer;
+  begin
+    i := 0;
+    while (i < Length(Op)) and ((Op[i] = $F2) or (Op[i] = $F3) or (Op[i] = $66)) do
+    begin E.Emit8(Op[i]); Inc(i); end;
+    rex := 0;
+    if RegField >= 8 then rex := rex or $04;         // REX.R
+    if RmReg    >= 8 then rex := rex or $01;         // REX.B
+    if rex <> 0 then E.Emit8($40 or rex);
+    while i < Length(Op) do begin E.Emit8(Op[i]); Inc(i); end;
+    E.Emit8($C0 or ((RegField and 7) shl 3) or (RmReg and 7));
+  end;
+  procedure SseMem(const Op: array of Byte; RegField, BaseReg: Integer; Disp: LongWord);
+  var i, rex: Integer;
+  begin
+    i := 0;
+    while (i < Length(Op)) and ((Op[i] = $F2) or (Op[i] = $F3) or (Op[i] = $66)) do
+    begin E.Emit8(Op[i]); Inc(i); end;
+    rex := 0;
+    if RegField >= 8 then rex := rex or $04;         // REX.R
+    if BaseReg  >= 8 then rex := rex or $01;         // REX.B
+    if rex <> 0 then E.Emit8($40 or rex);
+    while i < Length(Op) do begin E.Emit8(Op[i]); Inc(i); end;
+    E.Emit8($80 or ((RegField and 7) shl 3) or (BaseReg and 7));   // mod=10, disp32
+    if (BaseReg and 7) = 4 then E.Emit8($24);                      // rsp/r12 need a SIB
+    E.Emit32(Disp);
+  end;
+
   // --- float register-allocation aware operand access (J4) ---
   // movsd Wx, <VM float reg vmreg>  (reg-reg if allocated to an xmm, else load from [rsi+off]).
   // In callee-inline mode every VM reg is memory-homed (the caller's FLoc must not be consulted).
   procedure FLoad(Wx, vmreg: Integer);
   begin
     if InCallee or InGosub then
-      E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8)
+      SseMem([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8)
     else if FLoc[vmreg] >= 0 then
     begin
-      if FLoc[vmreg] <> Wx then
-        E.EmitBytes([$0F, $28, $C0 or (Wx shl 3) or FLoc[vmreg]])         // movaps Wx, xmm_src
+      // movaps, not movsd: movsd xmm,xmm MERGES the low 64 bits only, so it is a partial-register
+      // write - not move-eliminated, and falsely dependent on the destination's upper half. movaps
+      // copies all 128 bits, is move-eliminated on Ivy Bridge and later, and no scalar-double op
+      // ever reads the upper half. (The same note is in the AOT's FLoad.)
+      if FLoc[vmreg] <> Wx then SseRR([$0F, $28], Wx, FLoc[vmreg])        // movaps Wx, xmm_src
     end
     else
-      E.MemOp([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);             // movsd Wx, [rsi+off]
+      SseMem([$F2, $0F, $10], Wx, RSI, LongWord(vmreg) * 8);              // movsd Wx, [rsi+off]
   end;
   // <op>sd Wx, <VM float reg vmreg>
   procedure FOp(const SseOp: array of Byte; Wx, vmreg: Integer);
   begin
     if InCallee or InGosub then
-      E.MemOp(SseOp, Wx, RSI, LongWord(vmreg) * 8)
+      SseMem(SseOp, Wx, RSI, LongWord(vmreg) * 8)
     else if FLoc[vmreg] >= 0 then
-      E.EmitBytes([SseOp[0], SseOp[1], SseOp[2], $C0 or (Wx shl 3) or FLoc[vmreg]])
+      SseRR(SseOp, Wx, FLoc[vmreg])
     else
-      E.MemOp(SseOp, Wx, RSI, LongWord(vmreg) * 8);
+      SseMem(SseOp, Wx, RSI, LongWord(vmreg) * 8);
   end;
   // store working xmm Wx -> VM float reg dest
   procedure FStore(vmreg, Wx: Integer);
   begin
     if InCallee or InGosub then
-      E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8)
+      SseMem([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8)
     else if FLoc[vmreg] >= 0 then
     begin
-      if FLoc[vmreg] <> Wx then
-        E.EmitBytes([$0F, $28, $C0 or (FLoc[vmreg] shl 3) or Wx])         // movaps xmm_dst, Wx
+      if FLoc[vmreg] <> Wx then SseRR([$0F, $28], FLoc[vmreg], Wx)        // movaps xmm_dst, Wx
     end
     else
-      E.MemOp([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);             // movsd [rsi+off], Wx
+      SseMem([$F2, $0F, $11], Wx, RSI, LongWord(vmreg) * 8);              // movsd [rsi+off], Wx
   end;
 
   // --- integer GPR register-allocation helpers (J5) ---
@@ -1595,7 +1665,7 @@ var
     for k := 0 to IMaxReg do
       if ILoc[k] >= 0 then StoreRegMem(ILoc[k], LongWord(k) * 8);
     for k := 0 to FMaxReg do
-      if FLoc[k] >= 0 then E.MemOp([$F2, $0F, $11], FLoc[k], RSI, LongWord(k) * 8);
+      if FLoc[k] >= 0 then SseMem([$F2, $0F, $11], FLoc[k], RSI, LongWord(k) * 8);
     // 2. Park the two base registers that have no bank slot, BEFORE the argument setup clobbers
     //    them (r8 is arg2 on Win64; rsi is arg1 on System V and the float bank base here).
     E.EmitBytes([$4C, $89, $84, $24]); E.Emit32(LongWord(ArrDescDisp));   // mov [rsp+ArrDescDisp], r8
@@ -1639,7 +1709,7 @@ var
     for k := 0 to IMaxReg do
       if ILoc[k] >= 0 then LoadRegMem(ILoc[k], LongWord(k) * 8);
     for k := 0 to FMaxReg do
-      if FLoc[k] >= 0 then E.MemOp([$F2, $0F, $10], FLoc[k], RSI, LongWord(k) * 8);
+      if FLoc[k] >= 0 then SseMem([$F2, $0F, $10], FLoc[k], RSI, LongWord(k) * 8);
     for k := 0 to NCArr - 1 do
     begin
       if CArrBase[k]  >= 0 then R8LoadR(CArrBase[k],  LongWord(CArrId[k]) * 32 + LongWord(CArrOff[k]));
@@ -1724,7 +1794,7 @@ var
       if (ILoc[k] >= 0) and not GprSurvives(ILoc[k]) then StoreRegMem(ILoc[k], LongWord(k) * 8);
     for k := 0 to FMaxReg do
       if (FLoc[k] >= 0) and not XmmSurvives(FLoc[k]) then
-        E.MemOp([$F2, $0F, $11], FLoc[k], RSI, LongWord(k) * 8);
+        SseMem([$F2, $0F, $11], FLoc[k], RSI, LongWord(k) * 8);
   end;
   // Park the two base registers a call destroys and that have no bank slot: r8 (the array descriptor
   // table) and rsi (the float bank base - callee-saved on Win64, VOLATILE on System V, where it is
@@ -1768,7 +1838,7 @@ var
       if (ILoc[k] >= 0) and not GprSurvives(ILoc[k]) then LoadRegMem(ILoc[k], LongWord(k) * 8);
     for k := 0 to FMaxReg do
       if (FLoc[k] >= 0) and not XmmSurvives(FLoc[k]) then
-        E.MemOp([$F2, $0F, $10], FLoc[k], RSI, LongWord(k) * 8);
+        SseMem([$F2, $0F, $10], FLoc[k], RSI, LongWord(k) * 8);
     for k := 0 to NCArr - 1 do
     begin
       if CArrBase[k]  >= 0 then R8LoadR(CArrBase[k],  LongWord(CArrId[k]) * 32 + LongWord(CArrOff[k]));
@@ -2513,7 +2583,7 @@ var
           for ck := 0 to High(ILoc) do
             if ILoc[ck] >= 0 then StoreRegMem(ILoc[ck], LongWord(ck) * 8);
           for ck := 0 to High(FLoc) do
-            if FLoc[ck] >= 0 then E.MemOp([$F2, $0F, $11], FLoc[ck], RSI, LongWord(ck) * 8);
+            if FLoc[ck] >= 0 then SseMem([$F2, $0F, $11], FLoc[ck], RSI, LongWord(ck) * 8);
           InGosub := True;
           for cpc := GEntry[cs] to GRet[cs] do
           begin
@@ -2524,7 +2594,7 @@ var
           for ck := 0 to High(ILoc) do
             if ILoc[ck] >= 0 then LoadRegMem(ILoc[ck], LongWord(ck) * 8);
           for ck := 0 to High(FLoc) do
-            if FLoc[ck] >= 0 then E.MemOp([$F2, $0F, $10], FLoc[ck], RSI, LongWord(ck) * 8);
+            if FLoc[ck] >= 0 then SseMem([$F2, $0F, $10], FLoc[ck], RSI, LongWord(ck) * 8);
         end;
       bcReturn:
         if not InGosub then Exit;                    // top-level RETURN not compilable; in-body = terminator
@@ -2780,15 +2850,24 @@ begin
   SetLength(FLoc, FMaxReg + 2);
   for fi := 0 to High(FLoc) do FLoc[fi] := -1;
   if FMaxReg >= 0 then ScanF(True);         // mark used regs as -2
-  NextXmm := 2; SaveX6 := False; SaveX7 := False;
+  // ⭐ The pool is xmm2..FloatPoolTop, and the default top is 15 - the WHOLE register file above the
+  // xmm0/xmm1 scratch pair. It used to stop at xmm7, six registers, on a machine that has sixteen.
+  // What that cost is not theoretical: nbody's innermost loop keeps TWELVE float values live and got
+  // six, so half of them were memory-homed and the loop emitted 73 movsd of pure spill traffic - the
+  // reason removing 21 register copies from it (df92d8b) bought nothing at all.
+  // The AOT crossed this in July and measured it (see FloatPoolTop in SedaiAot.pas: n-body -5%,
+  // floatpoly -6%, everything else flat); JIT_FPOOL=<n> is the same A/B knob, and JIT_FPOOL=6
+  // restores the historic pool exactly.
+  NextXmm := 2;
+  for fi := 6 to 15 do SaveXmm[fi] := False;
+  NSaveXmm := 0;
   for fi := 0 to FMaxReg do
     if FLoc[fi] = -2 then
     begin
-      if NextXmm <= 7 then
+      if NextXmm <= JitFloatPoolTop then
       begin
         FLoc[fi] := NextXmm;
-        if NextXmm = 6 then SaveX6 := True;
-        if NextXmm = 7 then SaveX7 := True;
+        if NextXmm >= 6 then SaveXmm[NextXmm] := True;   // callee-saved on Win64 (no-op on System V)
         Inc(NextXmm);
       end
       else
@@ -2797,6 +2876,13 @@ begin
         Inc(NSaveFloat); SetLength(SaveFloatRegs, NSaveFloat); SaveFloatRegs[NSaveFloat - 1] := fi;
       end;
     end;
+  // How many of the allocated xmm the PROLOGUE must preserve. System V preserves none, so the whole
+  // save/restore block disappears there and the extra registers are free; Win64 pays one 16-byte
+  // slot for each xmm6..15 the allocator actually handed out.
+  NSaveXmm := 0;
+  {$IFDEF WINDOWS}
+  for fi := 6 to 15 do if SaveXmm[fi] then Inc(NSaveXmm);
+  {$ENDIF}
 
   // --- integer GPR allocation (J5): r9/r10/r11 (volatile) then r12..r15 (callee-saved) ---
   IntPool[0] := R9;  IntPool[1] := R10; IntPool[2] := R11;
@@ -2973,7 +3059,7 @@ begin
     // wants 32 bytes of shadow space; System V wants only the alignment.
     ci := 8 + 16;
     for gpr := 12 to 15 do if SaveGpr[gpr] then Inc(ci, 8);
-    if SaveX6 or SaveX7 then Inc(ci, 16);
+    if NSaveXmm > 0 then Inc(ci, NSaveXmm * 16);
     Inc(ci, ScratchBytes);
     {$IFDEF WINDOWS}
     HelperAdjust := 32 + ((16 - (ci mod 16)) mod 16);
@@ -3006,17 +3092,24 @@ begin
     E.EmitBytes([$48, $89, $CA]);             // mov rdx, rcx    (arg3 = Ctx, same reasoning as Win64)
     {$ENDIF}
 
-    // Save the callee-saved xmm6/xmm7 (Win64) if they were allocated, then load the allocated VM float
-    // regs from memory into their native xmm.
-    if SaveX6 or SaveX7 then
+    // Preserve the callee-saved xmm the allocator handed out, then load the allocated VM float regs
+    // from memory into their native xmm. On Win64 that is every allocated xmm6..15, one 16-byte slot
+    // each; on System V every xmm is caller-saved, NSaveXmm is 0 and this whole block disappears -
+    // which is why the extra registers are free there and metered here.
+    if NSaveXmm > 0 then
     begin
-      E.EmitBytes([$48, $83, $EC, $10]);                          // sub rsp, 16
-      if SaveX6 then E.EmitBytes([$F2, $0F, $11, $74, $24, $00]); // movsd [rsp],   xmm6
-      if SaveX7 then E.EmitBytes([$F2, $0F, $11, $7C, $24, $08]); // movsd [rsp+8], xmm7
+      E.EmitBytes([$48, $81, $EC]); E.Emit32(LongWord(NSaveXmm * 16));   // sub rsp, n*16
+      w := 0;
+      for fi := 6 to 15 do
+        if SaveXmm[fi] then
+        begin
+          SseMem([$F2, $0F, $11], fi, RSP, LongWord(w * 16));            // movsd [rsp+w*16], xmm_fi
+          Inc(w);
+        end;
     end;
     for fi := 0 to FMaxReg do
       if FLoc[fi] >= 0 then
-        E.MemOp([$F2, $0F, $10], FLoc[fi], RSI, LongWord(fi) * 8);  // movsd xmm_alloc, [rsi+fi*8]
+        SseMem([$F2, $0F, $10], FLoc[fi], RSI, LongWord(fi) * 8);  // movsd xmm_alloc, [rsi+fi*8]
     // Load the allocated VM int regs from memory into their native GPR.
     for ii := 0 to IMaxReg do
       if ILoc[ii] >= 0 then
@@ -3028,7 +3121,7 @@ begin
       if CArrCount[ci] >= 0 then R8LoadR(CArrCount[ci], LongWord(CArrId[ci]) * 32 + 16);
     end;
 
-    // Reserve stack scratch for inlined SUB frame save/restore + the ctx slot (sits below the xmm6/7
+    // Reserve stack scratch for inlined SUB frame save/restore + the ctx slot (sits below the xmm
     // save area; rsp is stable through the body so the scratch is at a fixed [rsp+0..ScratchBytes)
     // offset). ScratchBytes is always > 0 now (the ctx slot), so the reserve is unconditional.
     if ScratchBytes > 0 then
@@ -3061,18 +3154,23 @@ begin
     // Write the allocated float regs back to memory so the interpreter sees their final values.
     for fi := 0 to FMaxReg do
       if FLoc[fi] >= 0 then
-        E.MemOp([$F2, $0F, $11], FLoc[fi], RSI, LongWord(fi) * 8);  // movsd [rsi+fi*8], xmm_alloc
+        SseMem([$F2, $0F, $11], FLoc[fi], RSI, LongWord(fi) * 8);  // movsd [rsi+fi*8], xmm_alloc
     // Release the inlined-call scratch (brings rsp back to the xmm6/7 save area).
     if ScratchBytes > 0 then
     begin
       E.EmitBytes([$48, $81, $C4]); E.Emit32(LongWord(ScratchBytes));   // add rsp, ScratchBytes
     end;
     // Restore callee-saved xmm and the stack.
-    if SaveX6 or SaveX7 then
+    if NSaveXmm > 0 then
     begin
-      if SaveX6 then E.EmitBytes([$F2, $0F, $10, $74, $24, $00]); // movsd xmm6, [rsp]
-      if SaveX7 then E.EmitBytes([$F2, $0F, $10, $7C, $24, $08]); // movsd xmm7, [rsp+8]
-      E.EmitBytes([$48, $83, $C4, $10]);                          // add rsp, 16
+      w := 0;
+      for fi := 6 to 15 do
+        if SaveXmm[fi] then
+        begin
+          SseMem([$F2, $0F, $10], fi, RSP, LongWord(w * 16));            // movsd xmm_fi, [rsp+w*16]
+          Inc(w);
+        end;
+      E.EmitBytes([$48, $81, $C4]); E.Emit32(LongWord(NSaveXmm * 16));  // add rsp, n*16
     end;
     // Restore the callee-saved GPRs (reverse of the prologue push order).
     if SaveGpr[R15] then E.EmitBytes([$41, $5F]);   // pop r15
