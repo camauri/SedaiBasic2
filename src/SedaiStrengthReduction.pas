@@ -199,6 +199,15 @@ type
 
 implementation
 
+
+// ⛔ The uses clause must sit IMMEDIATELY after `implementation`. It used to be further down, past
+// the first function bodies, which is only legal-looking while DEBUG_STRENGTH is off - turning that
+// flag on broke the build with "BEGIN expected but USES found". A conditional build that nobody
+// runs rots; this one had.
+{$IFDEF DEBUG_STRENGTH}
+uses SedaiDebug;
+{$ENDIF}
+
 var
   // SR_DIAG=1: attribution inside this pass, now that it is the dominant one (10.1 s of 14.4).
   GSRDiag: Integer = -1;
@@ -212,9 +221,6 @@ begin
 end;
 
 
-{$IFDEF DEBUG_STRENGTH}
-uses SedaiDebug;
-{$ENDIF}
 
 { TLoopInfoSR }
 

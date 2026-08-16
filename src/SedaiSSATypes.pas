@@ -725,6 +725,7 @@ type
     function RunAggressiveConstProp(Level: Integer): Integer;  // Aggressive constant propagation with configurable level
     function RunDCE: Integer;  // Dead code elimination (returns removed instruction count)
     function RunLICM: Integer;  // Loop-invariant code motion (returns hoisted instruction count)
+    function RunIndexReduction: Integer;  // IV strength reduction on array indices (AFTER LICM: needs its preheader, BEFORE range analysis: the new indices must be re-proven)
     function RunLoopUnrolling: Integer;  // Loop unrolling (returns unrolled loop count)
     function RunCopyCoalescing: Integer;  // Copy coalescing (returns coalesced copy count)
     procedure PrintSSA;  // Dump SSA for debugging
@@ -788,7 +789,7 @@ function BitRotr(V, Count: Int64; Width: Int64): Int64;
 implementation
 
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
-     SedaiAlgebraic, SedaiStrengthReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
+     SedaiAlgebraic, SedaiStrengthReduction, SedaiIndexReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
      SedaiSubInlining
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
@@ -2944,6 +2945,24 @@ begin
     {$ENDIF}
   finally
     Algebraic.Free;
+  end;
+end;
+
+function TSSAProgram.RunIndexReduction: Integer;
+var
+  IR: TIndexReduction;
+begin
+  if not GSSAOptimizationsEnabled then Exit(0);
+  Result := 0;
+  IR := TIndexReduction.Create(Self);
+  try
+    Result := IR.Run;
+    {$IFDEF DEBUG_STRENGTH}
+    if DebugStrength and (Result > 0) then
+      WriteLn(Format('[TSSAProgram] IndexReduction: %d indices strength-reduced', [Result]));
+    {$ENDIF}
+  finally
+    IR.Free;
   end;
 end;
 

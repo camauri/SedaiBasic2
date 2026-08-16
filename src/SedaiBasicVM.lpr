@@ -1297,6 +1297,22 @@ begin
       {$ENDIF}
       {$ENDIF}
 
+      // Index strength reduction: an array index of the form "invariant + counter" becomes a
+      // running index advanced by the counter's step. Placed HERE for two reasons that are not
+      // interchangeable: after LICM, because it writes the initial value into the preheader LICM
+      // creates; and before the range analysis, because the running indices it emits have to be
+      // re-proven in bounds by EvalDerivedIV or the loop gets its guards back and comes out SLOWER.
+      try
+        SSAProgram.RunIndexReduction;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Index reduction failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
+      PassMark('Index Reduction');
+
       {$IFNDEF DISABLE_LOOP_UNROLL}
       // Loop Unrolling - duplicates loop bodies for reduced overhead
       // IMPORTANT: Rebuild dominator tree first because LICM may have created new blocks (pre-headers)
