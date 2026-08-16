@@ -56,44 +56,32 @@
   Where it runs: after LICM (which is what creates the preheader this needs) and
   before DCE and the range analysis.
 
-  ⛔⛔⛔ OFF BY DEFAULT — IT MISCOMPILES. INDEXRED=1 turns it on; do not change
-  that default until the sentinel below is green.
+  ON by default; INDEXRED=0 turns it off, which is the A/B on one binary.
 
-  What is wrong is CounterInit: it does not reliably find the value the counter
-  holds when the loop is entered. job/tests/bas/bug_index_reduction.bas is four
-  loops whose counter does NOT start at zero, and every one of them comes out
-  wrong with the pass on:
+  📊 Cold, interleaved, best of 6 per arm:
+      matmul_l1 -27.8%   arraysum -4.9%   floatpoly -3.3%   stream_triad -3.2%
+      nbody -2.7%        fannkuch -1.7%   matmul_alias -0.9%   matmul -0.5%
+      sieve and intpoly flat.
+  ⚠️ nbody, sieve and intpoly first read +2.9/+2.9/+2.0% on three samples per arm and came out
+  -2.7/0.0/0.0% on five. Below about 3% on this machine, three samples is not a measurement.
 
-      A  base + j, j from 1, nested        340   should be 360
-      B  j from 2 step 3                    63   should be 81
-      C  j from -1                         138   should be 126
-      D  one counter reused, starts 7 / 0   30   should be 72
+  ⛔⛔ IT SHIPPED DISABLED FIRST, AND THE REASON IS WORTH READING BEFORE EDITING THIS UNIT. Two
+  defects, found in this order:
 
-  A is exactly one step low per iteration (the sum for j in 0..4 instead of
-  1..5), so the initial constant came back 0 where it should have been 1. The
-  most likely reason, not yet proven: this unit compares registers by RegIndex
-  and IGNORES THE SSA VERSION, so a walk backwards from the preheader can match
-  a different loop's counter that happens to share the index - which is also the
-  shape case D exercises hardest, and case D is the worst wrong.
+  1. It transformed ANY "invariant + counter", not only array indices, and rewrote `i * 10 + k` in a
+     printed expression. run_regress caught it: three OPTDIFFs. Narrowing it to array indices - which
+     is its own name - made the corpus green again.
+     ⇒ AND THE GREEN MEANT NOTHING. The corpus holds no array indexed by "invariant + counter" whose
+     counter starts at anything but zero, so the second defect was still there, untouched and
+     invisible. It took a sentinel written on purpose (bug_index_reduction.bas) to see it. A
+     narrowing that restores a green net has removed a symptom until proven otherwise.
 
-  ⭐ WHAT A CORRECT FIX HAS TO CHOOSE BETWEEN, both known to work in isolation:
-   - find the entry value soundly (respect the version, and prove no def of the
-     counter lies between the one found and the header); or
-   - do not look for it at all: MOVE the original "Rd := Inv + Iv" instruction
-     into the preheader, which computes the first index correctly by
-     construction. That is exact, and it costs the bounds proof - the range
-     analysis cannot evaluate a counter outside its own loop, so the index comes
-     out with an unknown initial range and every access gets its guard back.
-     Measured before this pass existed: that is worth +41%, i.e. it turns the
-     whole thing into a pessimisation. So this route needs the range analysis
-     extended too.
-
-  ⚠️ AND DO NOT TRUST THE FIRST BENCHMARK RUN OF IT. An earlier, wider version of
-  this pass (it transformed any "invariant + counter", not only array indices)
-  measured matmul_l1 at -27.9% - from a binary that was miscompiling. The
-  narrowing to array indices removed the SYMPTOM that run_regress could see
-  (three OPTDIFFs) and left the defect underneath, which is why the sentinel
-  above exists and why it must be believed over any timing table.
+  2. The real defect was one line, and it was NOT what the first diagnosis guessed (SSA versions):
+     the counter's start was handed to ssaAddInt as a CONSTANT operand, and the bytecode compiler
+     wants a register there. It lowered to "AddInt R7, R7, R0" - the addend silently became register
+     zero - so every loop whose counter started at a non-zero constant was off by exactly that
+     constant. The fix is to materialise the constant with its own ssaLoadConstInt first.
+     ⇒ A constant is not a universally acceptable operand here. Check what the lowering expects.
   ============================================================================ }
 
 unit SedaiIndexReduction;
@@ -147,7 +135,7 @@ function TIndexReduction.Enabled: Boolean;
 begin
   if GEnabled < 0 then
   begin
-    if GetEnvironmentVariable('INDEXRED') = '1' then GEnabled := 1 else GEnabled := 0;
+    if GetEnvironmentVariable('INDEXRED') = '0' then GEnabled := 0 else GEnabled := 1;
   end;
   Result := GEnabled = 1;
 end;
@@ -335,6 +323,13 @@ begin
     end;
     if Found <> nil then
     begin
+      {$IFDEF DEBUG_STRENGTH}
+      if DebugStrength then
+        WriteLn('[IndexRed]   counter init candidate: ', Found.ToString,
+                ' op=', SSAOpCodeToString(Found.OpCode),
+                ' Src1.Kind=', Ord(Found.Src1.Kind), ' Src1.ConstInt=', Found.Src1.ConstInt,
+                ' Dest.ConstInt=', Found.Dest.ConstInt, ' Src2.ConstInt=', Found.Src2.ConstInt);
+      {$ENDIF}
       if Found.OpCode <> ssaLoadConstInt then Exit;                // not a constant start: decline
       if Found.Src1.Kind <> svkConstInt then Exit;
       K := Found.Src1.ConstInt;
@@ -349,8 +344,8 @@ procedure TIndexReduction.ReduceLoop(H, Body, PreH: TSSABasicBlock);
 var
   i, k, q, IvDefIdx, TermIdx: Integer;
   KInit: Int64;
-  Cmp, Jump, Ins, Init, Bump: TSSAInstruction;
-  Iv, IvStep, Inv, Rd, P: TSSAValue;
+  Cmp, Jump, Ins, Init, Bump, KLoad: TSSAInstruction;
+  Iv, IvStep, Inv, Rd, P, KReg: TSSAValue;
   Cand: TSSAInstruction;
 
   procedure RWhy(const Msg: string);
@@ -445,8 +440,23 @@ begin
     end
     else
     begin
+      // ⛔ THE CONSTANT NEEDS ITS OWN REGISTER. Handing MakeSSAConstInt straight to ssaAddInt.Src2
+      // looks right and lowers WRONG: the bytecode compiler wants a register there, and the
+      // immediate came out as "AddInt R7, R7, R0" - the addend silently became register 0. Every
+      // loop whose counter starts at a non-zero constant was then off by exactly that constant,
+      // which is what the sentinel's case A shows as 340 instead of 360.
+      KReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      KLoad := TSSAInstruction.Create(ssaLoadConstInt);
+      KLoad.Dest := KReg; KLoad.Src1 := MakeSSAConstInt(KInit);
+      KLoad.SourceLine := Cand.SourceLine;
+      KLoad.Comment := 'index reduction: counter start';
+      if (PreH.Instructions.Count > 0) and
+         (PreH.Instructions[PreH.Instructions.Count - 1].OpCode in [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero]) then
+        PreH.Instructions.Insert(PreH.Instructions.Count - 1, KLoad)
+      else
+        PreH.Instructions.Add(KLoad);
       Init := TSSAInstruction.Create(ssaAddInt);
-      Init.Dest := P; Init.Src1 := Inv; Init.Src2 := MakeSSAConstInt(KInit);
+      Init.Dest := P; Init.Src1 := Inv; Init.Src2 := KReg;
     end;
     Init.SourceLine := Cand.SourceLine;
     Init.Comment := 'index reduction: initial ' + IntToStr(Rd.RegIndex);
