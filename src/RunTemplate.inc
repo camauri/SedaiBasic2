@@ -26,6 +26,7 @@ var
   AotFuncs: PExecMemA;     // @FNativeFuncs[0]
   AotFromPC: Integer;      // entry PC of the AOT call in flight, to detect a no-progress return
   LocalAotCtx: TAotCtx;    // per-Run transfer-bank bases of the ACTIVE context (worker-safe)
+  ArrDescPtr: Pointer;     // array-descriptor table for this native entry (AcquireArrDesc: locked)
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
@@ -174,14 +175,17 @@ begin
     // the same register banks, then returns the exit PC. (One predicted-not-taken branch when JIT is off.)
     if JitOn and (JitLoops[CurPC] <> nil) then
     begin
-      if FArraysDirty then RebuildJitArrDesc;
+      // Through AcquireArrDesc: the flag test, the rebuild and taking the address are one locked
+      // step. A compiled loop is entered from every worker, so this arm has the same exposure the
+      // AOT arm below documents.
+      ArrDescPtr := AcquireArrDesc;
       // AotSettle, not a bare assignment: since J14 a compiled loop can route one instruction through
       // the interpreter, and that helper reports a raised exception or a cleared Running as a NEGATIVE
       // sentinel in the same channel as the exit PC. Resolving it here is what makes ON ERROR / TRAP /
       // CTRL+C behave inside a native loop exactly as they do inside a native AOT function - the arm
       // below has always done this, and the two now share the one place that knows the contract.
       CurPC := AotSettle(Ctx,
-        TNativeLoopFn(TExecMem(JitLoops[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), @FJitArrDesc[0],
+        TNativeLoopFn(TExecMem(JitLoops[CurPC]).Ptr)(IntRegs, PInt64(FloatRegs), ArrDescPtr,
                                                      Pointer(Ctx)));
       System.Continue;
     end;
@@ -189,11 +193,20 @@ begin
     // AOT (plan B): a whole compiled function registered at this entry PC runs natively on the
     // same banks and returns the resume PC (its bcReturnSub/bcEnd, or a deopt PC). The array
     // descriptor pointer is refreshed per call (the rebuild may reallocate the table).
+    //
+    // ⛔⛔ THROUGH EnsureArrDesc, WHICH TAKES THE LOCK - never the flag test and the rebuild
+    // written out here. This is the run loop, so it is the entry EVERY WORKER uses: two workers
+    // reaching their first native call together each ran SetLength on the same VM-global dynamic
+    // array, and the one whose buffer lost the assignment kept a pointer into freed memory. It
+    // faulted inside the compiled code, and because a worker's exception is swallowed it died
+    // holding the user mutex - so the other worker blocked on MUTEXLOCK forever and the program
+    // hung with no output at all.
+    // ⛔ There is a second copy of this refresh in SedaiBytecodeVM.pas (the AotCallSub paths).
+    // Both had to move: a lock taken by one caller is a guarantee the other silently loses, which
+    // is the same lesson the FArraysDirty comment in ExecuteArrayOp already records.
     if AotOn and (AotFuncs[CurPC] <> nil) then
     begin
-      if FArraysDirty then RebuildJitArrDesc;
-      if Length(FJitArrDesc) > 0 then LocalAotCtx.ArrDesc := @FJitArrDesc[0]
-      else LocalAotCtx.ArrDesc := nil;
+      EnsureArrDesc(@LocalAotCtx);
       // AotSettle resolves the C3 sentinels, out of line on purpose: this is the interpreter's
       // hot loop, and its speed is measurably sensitive to code layout - see
       // job/docs/PIANO_B1_AOT_DESIGN.md §5.7 - so it stays as small as it was.

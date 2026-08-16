@@ -54,6 +54,10 @@ type
   { Forward declaration }
   TBytecodeVM = class;
 
+  { One buffer of the JIT/AOT array-descriptor table (see FJitArrDesc / FRetiredArrDesc). Named so a
+    retired buffer can be held in a list, which is what keeps it alive under a running worker. }
+  TInt64Array = array of Int64;
+
   { Callback for file commands (LOAD, SAVE) executed from program }
   TFileCommandEvent = procedure(Sender: TBytecodeVM; const Command, Filename: string;
                                 var Handled: Boolean) of object;
@@ -308,7 +312,22 @@ type
     // Array descriptor table passed to compiled loops: 3 Int64 per array (IntData ptr, FloatData ptr,
     // Count). Rebuilt from FArrays only when the array set changes (FArraysDirty), so the per-call cost
     // is a single pointer once the arrays are DIM'd.
+    //
+    // ⛔⛔ THREADS. This table is VM-GLOBAL and every worker reads it, so both the dirty flag and the
+    // rebuild are shared mutable state and BOTH need FArrDescLock. Two workers entering the first
+    // native call together each ran SetLength on this same dynamic array: two allocations, one
+    // assignment winning and dropping the other's buffer, and the loser's context left pointing at
+    // freed memory - so its array writes went nowhere and its increments vanished in silence.
+    // Measured before the fix: of 600 runs of m59_sharedscalar.bas at 32-way parallelism, 73 had two
+    // threads inside RebuildJitArrDesc at once, two printed a wrong total and two printed nothing.
     FJitArrDesc: array of Int64;
+    // Buffers this table used to live in. A worker that is RUNNING native code holds the old pointer
+    // in its own AotCtx and only refreshes it at ITS OWN call boundaries, so a rebuild on another
+    // thread must not free what that worker is still reading. While any worker is live the previous
+    // buffer is retired here instead of freed; the list is dropped when the last worker exits, so a
+    // single-threaded program keeps the old behaviour exactly and pays nothing.
+    FRetiredArrDesc: array of TInt64Array;
+    FArrDescLock: TRTLCriticalSection;
     FArraysDirty: Boolean;
     FOutputDevice: IOutputDevice;
     FGraphics: IGraphicsBackend;     // FreeBASIC graphics phase: operation-level drawing backend (SW headless / SDL2 on sbv)
@@ -495,6 +514,9 @@ type
     // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
     procedure SetAotPrimitives(var C: TAotCtx);
     procedure RebuildJitArrDesc;
+    function AcquireArrDesc: Pointer;
+    procedure EnsureArrDesc(Ctx: PAotCtx);
+    procedure ReleaseRetiredArrDesc;
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
     procedure RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
@@ -995,25 +1017,47 @@ function WorkerThreadEntry(p: Pointer): PtrInt;
 // RTL thread entry (BeginThread): bind this thread's active context, run the worker SUB, then exit.
 var
   Spawn: TWorkerSpawn;
+  Last: Boolean;
 begin
   Spawn := TWorkerSpawn(p);
+  Last := False;
   GActiveCtx := Spawn.Ctx;
   GSelfHandle := Spawn.Handle;   // M5.5: THREADSELF inside this worker returns its own handle
   try
     try
       Spawn.VM.RunWorker(Spawn);
     except
-      // A worker must never propagate an exception past the RTL thread boundary (it would abort the
-      // process). v1: swallow it — the join still completes. (Proper per-thread error reporting: M5.5.)
+      // ⛔ A worker must never propagate an exception past the RTL thread boundary - that aborts the
+      // process - but it must not die in SILENCE either, and this used to do exactly that.
+      //
+      // What silence costs, measured: a worker faulting between MUTEXLOCK and MUTEXUNLOCK exits
+      // without unlocking, so every other worker blocks on that mutex forever and the main thread
+      // blocks in THREADWAIT. The program hangs, prints NOTHING, and there is no clue anywhere that
+      // a thread ever failed. That is how the descriptor-table race above presented: two hung runs
+      // in 600, with no output to explain either of them, and the swallow is what made a diagnosable
+      // fault into an unexplainable hang.
+      // ⭐ So the report is the fix here, not decoration. Full per-thread error reporting (routing
+      // it to ON ERROR, failing the program) is still M5.5; this is the floor: the failure is named,
+      // on stderr, with the thread that had it.
+      on E: Exception do
+        WriteLn(ErrOutput, Format('?thread %d died: %s: %s (mutexes it held stay locked)',
+                                  [Spawn.Handle, E.ClassName, E.Message]));
+      else
+        WriteLn(ErrOutput, Format('?thread %d died: non-Exception (mutexes it held stay locked)',
+                                  [Spawn.Handle]));
     end;
   finally
     // Release this worker's slot against MAX_LIVE_WORKERS even when its body raised.
     EnterCriticalSection(Spawn.VM.FWorkerLock);
     try
       Dec(Spawn.VM.FLiveWorkers);
+      Last := Spawn.VM.FLiveWorkers = 0;
     finally
       LeaveCriticalSection(Spawn.VM.FWorkerLock);
     end;
+    // With the last worker gone, nobody can still be holding a retired descriptor buffer: drop them.
+    // Taken OUTSIDE FWorkerLock because it takes FArrDescLock, and nothing else nests those two.
+    if Last then Spawn.VM.ReleaseRetiredArrDesc;
   end;
   GActiveCtx := nil;
   Result := 0;
@@ -1122,6 +1166,7 @@ begin
   FDrainCtx.ModeSwitchPC := -1;
   SetLength(FWorkerThreads, 0);
   InitCriticalSection(FWorkerLock);
+  InitCriticalSection(FArrDescLock);
   SetLength(FMutexes, 0);
   InitCriticalSection(FMutexTableLock);
   SetLength(FCondVars, 0);
@@ -1231,6 +1276,16 @@ destructor TBytecodeVM.Destroy;
 var
   JitI: Integer;
 begin
+  // ⛔⛔⛔ THE WORKERS GO FIRST, BEFORE ANYTHING THEY COULD STILL BE STANDING ON IS FREED.
+  // A DETACHED worker is by definition still running when the program ends - THREADDETACH is the
+  // statement that says "do not join me" - and this destructor used to unmap the executable pages
+  // as its very first act, twenty lines before it joined anybody. A detached worker inside a
+  // compiled function then executed memory that had just been unmapped and died of an access
+  // violation at a high mmap address. Silently: the thread boundary swallowed the exception, so
+  // m56_threadops.bas simply printed its (correct) output and nobody ever knew a thread had been
+  // shot. 📊 Measured before the fix: 33 dead workers in 200 runs at 32-way parallelism.
+  // ⭐ Order is the whole fix. Nothing above CleanupWorkers may free anything a worker can reach.
+  CleanupWorkers;
   for JitI := 0 to High(FNativeLoops) do FNativeLoops[JitI].Free;   // JIT: release executable pages
   for JitI := 0 to High(FNativeFuncs) do FNativeFuncs[JitI].Free;   // AOT: release executable pages
   FEnvOverrides.Free;
@@ -1253,9 +1308,10 @@ begin
   if Assigned(FOwnedGraphics) then
     FreeAndNil(FOwnedGraphics);   // free a VM-owned graphics backend (e.g. the software backend on sb)
   FVarMap.Free;
-  // M5.2: join any worker still running, then free its spawn record + context.
-  CleanupWorkers;
+  // M5.2: the workers were joined at the TOP of this destructor (see the note there); only their
+  // lock is released here, once nothing can spawn or join any more.
   DoneCriticalSection(FWorkerLock);
+  DoneCriticalSection(FArrDescLock);
   // M5.4: free any sync primitives the program left undestroyed.
   CleanupConds;
   DoneCriticalSection(FCondTableLock);
@@ -8878,9 +8934,7 @@ begin
     // never reallocated during a run, so rbx/rsi stay valid.)
     if AotCtx <> nil then
     begin
-      if VM.FArraysDirty then VM.RebuildJitArrDesc;
-      if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
-      else AotCtx^.ArrDesc := nil;
+  VM.EnsureArrDesc(AotCtx);
     end;
     // A handler that clears Running (CTRL+C, quit, a failed ASSERT) must stop the run loop,
     // not just this instruction - native code cannot do that, so bounce out to the interpreter.
@@ -9111,15 +9165,11 @@ begin
   C.IntRegs := @C.IntRegsMem[C.RegDeltaI];
   C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
   Inc(C.CallStackPtr);
-  if VM.FArraysDirty then VM.RebuildJitArrDesc;
-  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
-  else AotCtx^.ArrDesc := nil;
+  VM.EnsureArrDesc(AotCtx);
   Inc(C.AotCallDepth);
   RetPC := TNativeFuncFn(Fn.Ptr)(C.IntRegs, PInt64(@C.FloatRegs[0]), AotCtx);
   Dec(C.AotCallDepth);
-  if VM.FArraysDirty then VM.RebuildJitArrDesc;
-  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
-  else AotCtx^.ArrDesc := nil;
+  VM.EnsureArrDesc(AotCtx);
   if RetPC < 0 then Exit(RetPC);      // helper sentinel: the frame stays pushed, as in the general one
   if (RetPC < VM.FProgram.GetInstructionCount) and
      (PInstr(VM.FProgram.GetInstructionsPtr)[RetPC].OpCode = bcReturnSub) then
@@ -9179,9 +9229,7 @@ begin
     Exit(AOT_HELPER_EXC);
   end;
   // Same refresh the run loop performs before invoking a native function.
-  if VM.FArraysDirty then VM.RebuildJitArrDesc;
-  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
-  else AotCtx^.ArrDesc := nil;
+  VM.EnsureArrDesc(AotCtx);
   if Prof then
   begin
     T1 := AotRdTsc;
@@ -9205,9 +9253,7 @@ begin
   if Prof then T2 := AotRdTsc;
   // A DIM/REDIM/ERASE inside the callee may have rebuilt/moved the descriptor table the
   // caller's cached bases came from; refresh while still on a Pascal frame.
-  if VM.FArraysDirty then VM.RebuildJitArrDesc;
-  if Length(VM.FJitArrDesc) > 0 then AotCtx^.ArrDesc := @VM.FJitArrDesc[0]
-  else AotCtx^.ArrDesc := nil;
+  VM.EnsureArrDesc(AotCtx);
   if Fine then Td := AotRdTsc;
   if RetPC < 0 then Exit(RetPC);   // helper sentinel from inside the callee: frame stays pushed
   if (RetPC < VM.FProgram.GetInstructionCount) and
@@ -10164,12 +10210,26 @@ begin
 end;
 
 procedure TBytecodeVM.RebuildJitArrDesc;
+// ⛔ CALL ONLY WITH FArrDescLock HELD - use EnsureArrDesc, which is the whole public entry point.
 var
   a, n: Integer;
 begin
   // 4 Int64 per array (32 bytes): IntData ptr, FloatData ptr, Count (TotalSize), lower bound of dim 0.
   // LBound lets the JIT compile LBOUND/UBOUND(arr) for a 1-D array (dim 0); other dims / the rank query
   // deopt to the interpreter.
+  //
+  // The buffer this table lives in is REPLACED, not resized, whenever a worker might still be reading
+  // the old one: a running worker holds the previous pointer in its own AotCtx and refreshes it only
+  // at its own call boundaries, so freeing here would hand it a dangling table. Retiring costs one
+  // list entry per rebuild for the duration of the threaded phase, and rebuilds are rare (DIM/REDIM/
+  // ERASE and native-region installs). With no workers the assignment below just resizes in place,
+  // exactly as before.
+  if FHasWorkers and (Length(FJitArrDesc) > 0) then
+  begin
+    SetLength(FRetiredArrDesc, Length(FRetiredArrDesc) + 1);
+    FRetiredArrDesc[High(FRetiredArrDesc)] := FJitArrDesc;   // the reference is what keeps it alive
+    FJitArrDesc := nil;                                      // so the SetLength below allocates fresh
+  end;
   n := Length(FArrays);
   SetLength(FJitArrDesc, n * 4 + 4);   // +4 so @FJitArrDesc[0] is always valid even with no arrays
   for a := 0 to n - 1 do
@@ -10186,6 +10246,52 @@ begin
     else FJitArrDesc[a * 4 + 3] := 0;
   end;
   FArraysDirty := False;
+end;
+
+function TBytecodeVM.AcquireArrDesc: Pointer;
+// The ONE way compiled code gets its array-descriptor pointer. Test the flag, rebuild if needed and
+// TAKE THE ADDRESS - all three under FArrDescLock, because the flag and the table are VM-global and
+// every worker reaches them.
+//
+// ⛔⛔ Splitting those three steps is what the bug was, and it was written out FOUR TIMES: twice in
+// the AotCallSub paths here and twice in the run-loop template (the JIT arm and the AOT arm). Each
+// copy read the flag, called the rebuild and then took @FJitArrDesc[0] with nothing held. Two
+// workers reaching their first native call together therefore each ran SetLength on the same
+// dynamic array: two buffers allocated, the second assignment dropping the first, and the thread
+// that had already taken the address of the first left holding freed memory.
+// 📊 Measured on m59_sharedscalar.bas at 32-way parallelism, before the fix: of 600 runs, 73 had
+// two threads inside the rebuild at once; two printed a wrong total (increments written into the
+// dead buffer) and two HUNG - the faulting worker died of an access violation inside the compiled
+// code, its exception was swallowed at the thread boundary, and it never released the user mutex.
+// ⭐ The reason one shared helper replaces four inline copies: a lock taken by one caller is a
+// guarantee every other caller silently loses.
+begin
+  EnterCriticalSection(FArrDescLock);
+  try
+    if FArraysDirty then RebuildJitArrDesc;
+    if Length(FJitArrDesc) > 0 then Result := @FJitArrDesc[0]
+    else Result := nil;
+  finally
+    LeaveCriticalSection(FArrDescLock);
+  end;
+end;
+
+procedure TBytecodeVM.EnsureArrDesc(Ctx: PAotCtx);
+// AcquireArrDesc, published into the caller's own context record.
+begin
+  Ctx^.ArrDesc := AcquireArrDesc;
+end;
+
+procedure TBytecodeVM.ReleaseRetiredArrDesc;
+// Drop the retired descriptor buffers once no worker can still be holding one. Called when the last
+// worker exits, so the retention above lasts only as long as the threaded phase does.
+begin
+  EnterCriticalSection(FArrDescLock);
+  try
+    SetLength(FRetiredArrDesc, 0);
+  finally
+    LeaveCriticalSection(FArrDescLock);
+  end;
 end;
 
 {$IFDEF JIT_PROFILE}
