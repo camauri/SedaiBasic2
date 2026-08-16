@@ -380,7 +380,12 @@ procedure AotMagicSigned(d: Int64; out M: Int64; out s: Integer; out NeedAdd, Ne
 
 implementation
 
-uses TypInfo, Cpu;   // Cpu: AVXSupport, the RUNTIME feature check the AVX vector path is gated on
+
+uses TypInfo, Cpu;
+
+var
+  GArrAddrState: Integer = -1;   // AOT_ARRADDR=0 restores the rcx/rax-staged element addressing
+   // Cpu: AVXSupport, the RUNTIME feature check the AVX vector path is gated on
 
 // Record layout handed in by AotSetRecordLayout. Zero = "not supplied", which keeps every record op
 // on the helper. Compilation is single-threaded (the same reason the SSA name pool is), so unit
@@ -750,6 +755,43 @@ end;
 function AotVecEnabled: Boolean;
 begin
   Result := AotVecLanes > 0;
+end;
+
+function AotArrAddrMode: Integer;
+// 0 = historic staging (index via rcx, value via rax/xmm0); 1 = index addressed from its own home
+// register; 2 = value addressed from its own register too. AOT_ARRADDR picks it; THE DEFAULT IS 1,
+// and the reason is measured, not aesthetic:
+//
+//   mode 0  22 instructions in matmul's inner loop   745 ms
+//   mode 1  19                                       728 ms   -2.3%
+//   mode 2  16                                       765 ms   +2.7% against mode 0
+//
+// ⛔⛔ So the two halves of the same "remove a redundant register copy" idea go in OPPOSITE
+// directions, and the bigger cut is the losing one. Dropping the index staging (three `mov rcx,X`)
+// pays; also loading the element straight into its allocated xmm instead of through xmm0 (three
+// `movaps`) costs five percent on top of that, on 16 interleaved samples per arm against a 1.5%
+// null-A/B floor. The staged form gives the renamer a fresh xmm0 per iteration and keeps the
+// load->add->store chain off the accumulator's architectural register; the direct form puts all
+// three on it. Whatever the exact microarchitectural account, mode 2 is measured and rejected -
+// do not "finish the job" without re-measuring.
+//
+// ⚠️ And the instrument matters here: an earlier probe that injected nops into this loop read
+// 763/874/948/1088 ms for 0/2/4/8 nops and looked like a clean "5% per instruction" slope. It was
+// measuring CODE LAYOUT, not instruction count - on the shortened loop the same probe comes out
+// non-monotonic (16 instr 783 ms, 18 instr 746 ms). Use AOT_ARRADDR on one binary, and the
+// program's own timer rather than wall clock (which carries ~20 ms of process startup).
+begin
+  if GArrAddrState < 0 then GArrAddrState := StrToIntDef(GetEnvironmentVariable('AOT_ARRADDR'), 1);
+  Result := GArrAddrState;
+end;
+
+function AotArrAddrDirect: Boolean;
+// Address an array element with the operands' OWN registers instead of staging the index through
+// rcx and the value through rax/xmm0. AOT_ARRADDR=0 restores the historic staging, which is what
+// makes this an A/B on ONE binary - the only way to read a change whose effect is the same size as
+// this machine's code-layout noise.
+begin
+  Result := AotArrAddrMode >= 1;
 end;
 
 function AotCmpFuse: Boolean;
@@ -2869,6 +2911,55 @@ var
     else
     begin E.Emit8($04); E.Emit8(sib); end;
   end;
+  // ⭐ <val> <-> [base + idx*8], with ANY value and ANY index register.
+  //
+  // The historic form (AotArrData below) hardcoded rcx as the index and rax/xmm0 as the value, so
+  // every array access paid two extra instructions: the index copied into rcx even when it already
+  // had a home, and the value staged through xmm0 and copied out. matmul's innermost loop has three
+  // accesses, so that is SIX of its twenty-two instructions.
+  //
+  // 📊 Why that is worth doing, measured rather than assumed: injecting n one-byte nops into that
+  // loop costs 763 -> 874 -> 948 -> 1088 ms for n = 0, 2, 4, 8. About 40 ms per instruction, ~5% of
+  // the run EACH. The loop is front-end bound on this machine, and every one of the six removed
+  // here is a register-to-register move - eliminated at rename, so it costs issue bandwidth and
+  // nothing else, which is exactly the resource the nop probe says is scarce.
+  // ⛔ This CONTRADICTS the negative recorded above ArrBaseWeight ("a loop at ~3.6 IPC does not get
+  // faster when you remove two of its twenty-two instructions"). That measurement was taken on the
+  // old i7-3630QM before the Linux move; on the Core Ultra 9 the same probe says the opposite. A
+  // performance conclusion carries the machine it was measured on - re-run it, do not inherit it.
+  //
+  // The SIB index field cannot name rsp; the allocator never hands out rsp, and the fallback index
+  // is rcx, so the encoding is always legal.
+  procedure AotArrElem(IsFloat, IsStore: Boolean; ValReg, IdxReg, BaseReg: Integer);
+  var rex, sib: Byte;
+  begin
+    rex := 0;
+    if ValReg  >= 8 then rex := rex or $04;      // REX.R
+    if IdxReg  >= 8 then rex := rex or $02;      // REX.X
+    if BaseReg >= 8 then rex := rex or $01;      // REX.B
+    if IsFloat then
+    begin
+      E.Emit8($F2);
+      if rex <> 0 then E.Emit8($40 or rex);
+      E.Emit8($0F);
+      if IsStore then E.Emit8($11) else E.Emit8($10);
+    end
+    else
+    begin
+      E.Emit8($48 or rex);                       // REX.W
+      if IsStore then E.Emit8($89) else E.Emit8($8B);
+    end;
+    sib := $C0 or ((IdxReg and 7) shl 3) or (BaseReg and 7);          // scale 8
+    if (BaseReg and 7) = 5 then
+    begin
+      E.Emit8($40 or ((ValReg and 7) shl 3) or 4); E.Emit8(sib); E.Emit8($00);  // mod=01, disp8=0
+    end
+    else
+    begin
+      E.Emit8(((ValReg and 7) shl 3) or 4); E.Emit8(sib);                       // mod=00
+    end;
+  end;
+
   procedure AotArrData(IsFloat, IsStore: Boolean; BaseReg: Integer);
   begin
     if IsFloat then
@@ -2954,7 +3045,7 @@ var
   // compare, no guard - dialect is irrelevant because the check could never trip.
   procedure AotArrAccess(IsFloat, IsStore: Boolean; ArrayId, IdxReg, ValReg, apc: Integer;
                          Safe: Boolean);
-  var pOOB, pDone, DataOff, cbase, ccount, baseR: Integer;
+  var pOOB, pDone, DataOff, cbase, ccount, baseR, idxR, valR: Integer;
     procedure EmitBase;   // leave the data base register in baseR (cached GPR or reloaded rdx)
     begin
       if cbase >= 0 then baseR := cbase
@@ -2964,36 +3055,61 @@ var
         baseR := RDX;
       end;
     end;
+    // The element access, addressed with the operands' OWN registers wherever they have one.
+    // A memory-homed operand still goes through the scratch (rcx for the index, rax/xmm0 for the
+    // value) exactly as before - the saving is only ever "do not copy something that is already
+    // where it needs to be".
+    procedure Elem(IsStoreE: Boolean);
+    begin
+      if IsStoreE then
+      begin
+        if AotArrAddrMode < 2 then valR := -1
+        else if IsFloat then valR := FAlloc(ValReg) else valR := IAlloc(ValReg);
+        if valR < 0 then
+        begin
+          if IsFloat then begin FLoad(XMM0, ValReg); valR := XMM0; end
+          else begin ILoad(RAX, ValReg); valR := RAX; end;
+        end;
+        AotArrElem(IsFloat, True, valR, idxR, baseR);
+      end
+      else
+      begin
+        if AotArrAddrMode < 2 then valR := -1
+        else if IsFloat then valR := FAlloc(ValReg) else valR := IAlloc(ValReg);
+        if valR < 0 then
+        begin
+          if IsFloat then valR := XMM0 else valR := RAX;
+          AotArrElem(IsFloat, False, valR, idxR, baseR);
+          if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
+        end
+        else
+          AotArrElem(IsFloat, False, valR, idxR, baseR);
+      end;
+    end;
   begin
     if IsFloat then DataOff := 8 else DataOff := 0;
     cbase := CachedBase(ArrayId);
     ccount := CachedCount(ArrayId);
-    ILoad(RCX, IdxReg);                                            // rcx = index
+    // Address off the index's own home register when it has one; only a memory-homed index needs
+    // the rcx round-trip. (rsp is never allocated, so the SIB index field is always legal.)
+    if AotArrAddrDirect then idxR := IAlloc(IdxReg) else idxR := -1;
+    if idxR < 0 then begin ILoad(RCX, IdxReg); idxR := RCX; end;
     if Safe then
     begin
       if cbase < 0 then
         E.MemOp([$49, $8B], RDX, R8, 16);                          // rdx = ctx.ArrDesc
       EmitBase;
-      if IsStore then
-      begin
-        if IsFloat then FLoad(XMM0, ValReg) else ILoad(RAX, ValReg);
-        AotArrData(IsFloat, True, baseR);
-      end
-      else
-      begin
-        AotArrData(IsFloat, False, baseR);
-        if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
-      end;
+      Elem(IsStore);
       Exit;
     end;
     if (cbase < 0) or (ccount < 0) then
       E.MemOp([$49, $8B], RDX, R8, 16);                            // rdx = ctx.ArrDesc
     if ccount >= 0 then
-      EmitRR([$3B], RCX, ccount)                                   // cmp rcx, cachedCount
+      EmitRR([$3B], idxR, ccount)                                  // cmp idx, cachedCount
     else
     begin
       E.MemOp([$48, $8B], RAX, RDX, LongWord(ArrayId) * 32 + 16);  // rax = Count
-      E.EmitBytes([$48, $39, $C1]);                                // cmp rcx, rax
+      EmitRR([$3B], idxR, RAX);                                    // cmp idx, rax
     end;
     if ArrClassic then
     begin
@@ -3001,35 +3117,30 @@ var
       ExitTo(apc);                                                 // OOB -> interpreter raises
       E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
       EmitBase;
-      if IsStore then
-      begin
-        if IsFloat then FLoad(XMM0, ValReg) else ILoad(RAX, ValReg);
-        AotArrData(IsFloat, True, baseR);
-      end
-      else
-        AotArrData(IsFloat, False, baseR);
+      Elem(IsStore);
     end
     else if IsStore then
     begin
       E.EmitBytes([$73, $00]); pOOB := E.Len - 1;                  // jae skip (store dropped)
       EmitBase;
-      if IsFloat then FLoad(XMM0, ValReg) else ILoad(RAX, ValReg);
-      AotArrData(IsFloat, True, baseR);
+      Elem(True);
       E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
     end
     else
     begin
+      // ⛔ The out-of-range arm writes ZERO into the destination, so on this path the value cannot
+      // be left in its home register by the in-range arm alone - both arms have to agree on where
+      // the answer is. Staging through the scratch is what makes them agree, so this is the one
+      // access shape that keeps the historic round-trip.
       E.EmitBytes([$73, $00]); pOOB := E.Len - 1;                  // jae oob
       EmitBase;
-      AotArrData(IsFloat, False, baseR);
+      if IsFloat then AotArrElem(True, False, XMM0, idxR, baseR)
+      else AotArrElem(False, False, RAX, idxR, baseR);
       E.EmitBytes([$EB, $00]); pDone := E.Len - 1;                 // jmp done
       E.PatchByte(pOOB, Byte(E.Len - (pOOB + 1)));
       if IsFloat then E.EmitBytes([$0F, $57, $C0])                 // xorps xmm0,xmm0
       else E.EmitBytes([$48, $31, $C0]);                           // xor rax,rax
       E.PatchByte(pDone, Byte(E.Len - (pDone + 1)));
-    end;
-    if not IsStore then
-    begin
       if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
     end;
   end;
@@ -6673,5 +6784,8 @@ begin
   end;
   SetLength(Result, n);
 end;
+
+initialization
+
 
 end.
