@@ -1677,6 +1677,7 @@ var
   Step: Int64;
   Inc_: TDefRec;
   Cmp: TSSAInstruction;
+  Derived: Boolean;
   IR, R: TRange;
   Ins: TSSAInstruction;
   H_, PreH, Pb: TSSABasicBlock;
@@ -1751,7 +1752,14 @@ begin
     // iteration and the post-increment value is observable only in that block.
     if Inc_.Block.Successors.Count <> 1 then begin UWhy('latch succs<>1'); Continue; end;
     if TSSABasicBlock(Inc_.Block.Successors[0]) <> H_ then begin UWhy('latch succ<>header'); Continue; end;
-    if not FindGuard(H_, li, V, Cmp) then begin UWhy('no guard'); Continue; end;
+    // ⭐ The guard may be on ANOTHER counter, with this register running beside it - the same
+    // derived-IV case EvalForIV handles for versioned phis, and it has to be handled here too or
+    // the whole class of MODULE-LEVEL running indices stays unprovable. That class is not a corner:
+    // `Dim p` at the top of a program and `p += 1` in a loop is ordinary BASIC, and an unversioned
+    // register is exactly what it lowers to.
+    // ⛔ It is deferred to after the preheader/init work below, because the derived proof needs this
+    // register's own initial range too - so the flag is remembered and acted on once IR is known.
+    Derived := not FindGuard(H_, li, V, Cmp);
     // Unique out-of-loop predecessor of the header = the preheader.
     PreH := nil;
     for p := 0 to H_.Predecessors.Count - 1 do
@@ -1787,6 +1795,13 @@ begin
     IR := DefValueRange(FDefRecs[InitIdx].Instr, FDefRecs[InitIdx].Block,
                         FDefRecs[InitIdx].InstrIndex, Depth + 1);
     if not IR.Known then begin UWhy('init range unknown'); Continue; end;
+    if Derived then
+    begin
+      R := EvalDerivedIV(H_, UseBlock, li, UseIndex, Step, IR, Depth);
+      if R.Known then Exit(R);
+      UWhy('no guard, and no derived-IV partner');
+      Continue;
+    end;
     R := GuardedRange(li, H_, Cmp, Step, IR, Depth);
     if not R.Known then begin UWhy('guard/limit combination failed'); Continue; end;
     // Order the use against the increment when they share a block.
