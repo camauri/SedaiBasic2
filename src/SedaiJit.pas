@@ -161,6 +161,16 @@ type
 // helper route on ONE binary (the same shape as AOT_BITOPS). Read once, cached.
 var
   GJitHelperState: Integer = -1;
+  // JIT_IALLOC=0 hands the GPR pool out in register-index order (the historic rule) instead of by
+  // use count, which is the A/B for the allocation change on ONE binary. Read once, cached.
+  GJitIAllocState: Integer = -1;
+  // JIT_TWOADDR=0 puts every integer ALU op back on the rax round-trip (load / op / store), which is
+  // the A/B for writing straight into the destination register. Read once, cached.
+  GJitTwoAddrState: Integer = -1;
+  // JIT_CMPFUSE=0 puts every integer compare back on materialising its boolean. Read once, cached.
+  GJitCmpFuseState: Integer = -1;
+  // How many compare/branch pairs the last compile fused - the probe that says the change is REACHED.
+  JitDiagCmpFused: Integer = 0;
 
 function HelperRouteEnabled: Boolean;
 begin
@@ -237,6 +247,19 @@ var
   // Integer register allocation (J5): map a VM int reg -> a native GPR (r9..r15) or -1 (memory-homed).
   // Pool order: r9/r10/r11 (volatile) first, then r12..r15 (callee-saved, push/pop'd when used).
   ILoc: array of Integer;
+  // How many times each VM int reg is MENTIONED in the region, filled by ScanI(True). The pool is
+  // handed out in descending order of this count, not in register-index order -- see the loop below.
+  IUse: array of Integer;
+  // The same count taken over the WHOLE program, and the set of PCs some jump anywhere lands on.
+  // Together they are the safety proof for the compare/branch fusion: a boolean mentioned exactly
+  // twice in the entire program (its compare and its branch) is read by nobody else, anywhere, and
+  // a PC nothing jumps to can only be reached by falling through the compare that precedes it.
+  IUseAll: array of Integer;
+  IsTargetPC: array of Boolean;
+  ScanLo, ScanHi: Integer;
+  ScanAll: Boolean;
+  CurPC: Integer;                   // absolute PC of the instruction EmitOne is lowering
+  FuseSkipPC: Integer;              // PC whose instruction a fusion already emitted (-1 = none)
   IMaxReg, NextGpr, ii, gpr: Integer;
   IntPool: array[0..6] of Integer;
   SaveGpr: array[0..15] of Boolean;
@@ -437,6 +460,66 @@ var
     if n >= 0 then MovRR(n, scr)
     else E.MemOp([$48, $89], scr, RBX, LongWord(vmreg) * 8);
   end;
+  // ALU op  <native dst> <op> <VM reg vmreg>, with dst allowed to be r8..r15. IOp below encodes its
+  // memory form through E.MemOp, which takes the reg field as a Byte and emits no REX.R, so it can
+  // only target a low register; this is the same operation with the high half of the file reachable.
+  // Op carries the r64 <- r/m64 bytes WITHOUT the REX prefix (add=$03, sub=$2B, imul=$0F,$AF).
+  procedure IOpTo(const Op: array of Byte; dst, vmreg: Integer);
+  var rex: Byte; n, k: Integer;
+  begin
+    n := IAlloc(vmreg);
+    if n >= 0 then EmitRR(Op, dst, n)
+    else
+    begin
+      rex := $48; if dst >= 8 then rex := rex or $04;      // REX.R
+      E.Emit8(rex);
+      for k := 0 to High(Op) do E.Emit8(Op[k]);
+      E.Emit8($80 or ((dst and 7) shl 3) or RBX);          // mod=10 reg=dst rm=rbx (rbx needs no SIB)
+      E.Emit32(LongWord(vmreg) * 8);
+    end;
+  end;
+  // ⭐ Dest := Src1 <op> Src2 written STRAIGHT INTO the destination's register, when it has one.
+  //
+  // The historic shape is `mov rax,src1 / op rax,src2 / mov dest,rax`: three instructions where the
+  // machine does it in two, and the third is a pure register copy sitting ON the loop's dependency
+  // chain. x86 ALU ops are two-address, so a destination that already lives in a GPR needs no
+  // scratch at all - and when the destination IS the first operand (`i = i + 1`, every FOR step)
+  // even the copy disappears and the whole thing is one instruction.
+  //
+  // Returns False when the case is not one the machine can do in place, and the caller then emits
+  // the rax path unchanged:
+  //   - the destination is memory-homed: the rax round-trip is already the minimum;
+  //   - the destination register holds the SECOND operand, so writing Src1 into it first would
+  //     destroy the operand we still need. Commutative ops apply the other operand in place
+  //     instead; a subtraction cannot, and bails.
+  // ILoc is one GPR per VM register, so two DIFFERENT VM registers never share a home: d = s1 means
+  // Dest and Src1 are the same register, which is exactly when the copy is a no-op.
+  // JIT_TWOADDR=0 restores the rax path for every case, as the A/B on one binary.
+  function IntBin2(const Op: array of Byte; Commutative: Boolean): Boolean;
+  var d, s1, s2: Integer;
+  begin
+    Result := False;
+    if GJitTwoAddrState < 0 then
+    begin
+      if GetEnvironmentVariable('JIT_TWOADDR') = '0' then GJitTwoAddrState := 0 else GJitTwoAddrState := 1;
+    end;
+    if GJitTwoAddrState = 0 then Exit;
+    d := IAlloc(I^.Dest);
+    if d < 0 then Exit;
+    s1 := IAlloc(I^.Src1); s2 := IAlloc(I^.Src2);
+    if (s2 >= 0) and (s2 = d) then
+    begin
+      if not Commutative then Exit;
+      IOpTo(Op, d, I^.Src1);                     // dest already holds src2: apply src1 to it
+      Result := True; Exit;
+    end;
+    if s1 <> d then                              // dest already holds src1 -> no copy at all
+    begin
+      if s1 >= 0 then MovRR(d, s1) else LoadRegMem(d, LongWord(I^.Src1) * 8);
+    end;
+    IOpTo(Op, d, I^.Src2);
+    Result := True;
+  end;
   // ALU op  scr <op> vmreg  (MemForm = full memory-form bytes incl. the $48 REX; scr is rax/rcx < 8).
   procedure IOp(const MemForm: array of Byte; scr, vmreg: Integer);
   var rest: array of Byte; k, n: Integer;
@@ -463,9 +546,91 @@ var
     IStore(I^.Dest, RAX);                   // dest := rax
   end;
 
-  // Integer comparison Rd = (Rs1 <cc> Rs2) ? TrueVal : 0
-  procedure IntCmp(SetCC: Byte);
+  // ⭐ Is this integer compare consumed by NOTHING but the branch right after it? Then its boolean
+  // never has to exist, and the pair collapses from NINE instructions to two.
+  //
+  // What the historic shape costs, straight out of matmul's innermost loop:
+  //   mov rax,r9 / cmp rax,r13 / setle al / movzx eax,al / neg rax / mov r11,rax
+  //   mov rax,r11 / test rax,rax / jne ...
+  // - build a -1/0 word, park it in a register, read it back and test it - where the machine has
+  // `cmp` + `jle`. Nine of that loop's thirty-three instructions, and every For in every program
+  // pays it. It is the same fusion the AOT got on 15 Aug (AOT_CMPFUSE); this is the bytecode-side
+  // twin, and it has to prove the same two things WITHOUT an SSA CFG to read liveness from.
+  //
+  // The two conditions are whole-program facts, which is why they need no dataflow:
+  //   - the boolean is mentioned EXACTLY TWICE in the entire program: written by this compare, read
+  //     by this branch. Nobody else anywhere can observe the value we skip writing. (The register's
+  //     pool home keeps whatever the prologue loaded and the epilogue writes it back unchanged, so
+  //     a bank slot nobody reads round-trips untouched - the correct behaviour for a dead value.)
+  //   - NOTHING JUMPS TO the branch's PC, and it is not the region header. The flags must survive
+  //     from the compare to the branch, so the branch must be reachable only by falling through the
+  //     compare. Native entry is HeaderPC alone and only bcJump/bcJumpIfZero/bcJumpIfNotZero become
+  //     native jumps to a PC, so IsTargetPC is the complete answer.
+  //
+  // ⚠️ The mention count is BELT AND BRACES, and it is honest to say so: loosening it to `< 2` and
+  // running the whole corpus under --jit gives 988 comparisons and zero mismatches, because the
+  // bytecode compiler already emits a `CopyInt` between the compare and the branch whenever the
+  // boolean is live afterwards, and the adjacency test above then refuses the pair on its own. The
+  // count stays because it makes the argument stand on a whole-program FACT instead of on an
+  // invariant of another compiler stage that nobody wrote down - but no program in the repository
+  // witnesses it, so do not read a green net as evidence that it works.
+  // Inlined bodies are excluded outright: a conditional exit out of one is already refused below.
+  // JIT_CMPFUSE=0 restores the nine-instruction sequence, as the A/B on one binary.
+  function CmpFusible(out CC: Byte): Boolean;
+  var nx: PBcInstr; d: Word;
   begin
+    Result := False; CC := 0;
+    if GJitCmpFuseState < 0 then
+    begin
+      if GetEnvironmentVariable('JIT_CMPFUSE') = '0' then GJitCmpFuseState := 0 else GJitCmpFuseState := 1;
+    end;
+    if GJitCmpFuseState = 0 then Exit;
+    if InCallee or InGosub then Exit;
+    if (CurPC + 1 > EndPC) or (CurPC + 1 >= ProgLen) then Exit;
+    nx := @Prog[CurPC + 1];
+    if (nx^.OpCode <> bcJumpIfZero) and (nx^.OpCode <> bcJumpIfNotZero) then Exit;
+    d := I^.Dest;
+    if nx^.Src1 <> d then Exit;
+    if (CurPC + 1) = HeaderPC then Exit;
+    if IsTargetPC[CurPC + 1] then Exit;
+    if (d > High(IUseAll)) or (IUseAll[d] <> 2) then Exit;
+    Result := True;
+  end;
+
+  // Integer comparison Rd = (Rs1 <cc> Rs2) ? TrueVal : 0, or `cmp` + the branch when the boolean is
+  // dead on arrival (see CmpFusible).
+  procedure IntCmp(SetCC: Byte);
+  var cc: Byte; nx: PBcInstr; tgt, n1, d2: Integer;
+  begin
+    if CmpFusible(cc) then
+    begin
+      nx := @Prog[CurPC + 1];
+      tgt := Integer(nx^.Immediate);
+      // compare straight out of the home register when there is one; the rax round-trip exists only
+      // for a memory-homed first operand
+      n1 := IAlloc(I^.Src1);
+      if n1 >= 0 then IOpTo([$3B], n1, I^.Src2)
+      else begin ILoad(RAX, I^.Src1); IOp([$48, $3B], RAX, I^.Src2); end;
+      // set<cc> is 0F 9x and j<cc> is 0F 8x with the same low nibble, so the condition code carries
+      // over by subtracting $10. JumpIfZero branches when the compare came out FALSE, which is the
+      // negated condition - and the low bit of the nibble is exactly that negation.
+      cc := SetCC - $10;
+      if nx^.OpCode = bcJumpIfZero then cc := cc xor 1;
+      if InRange[tgt] then JccRel(cc, tgt)
+      else
+      begin
+        // the branch leaves the compiled region: jump OVER the exit sequence on the negated
+        // condition (near 0F 8x -> short 7x, same nibble)
+        E.EmitBytes([Byte((cc xor 1) - $10), $00]);
+        d2 := E.Len;
+        E.EmitBytes([$B8]); E.Emit32(LongWord(tgt));       // mov eax, target
+        JmpRel(-1);                                         // jmp epilogue
+        E.PatchByte(d2 - 1, Byte(E.Len - d2));
+      end;
+      FuseSkipPC := CurPC + 1;                  // the branch itself now emits nothing
+      Inc(JitDiagCmpFused);
+      Exit;
+    end;
     ILoad(RAX, I^.Src1);                    // mov rax, src1
     IOp([$48, $3B], RAX, I^.Src2);          // cmp rax, src2
     E.EmitBytes([$0F, SetCC, $C0]);         // setcc al
@@ -1081,18 +1246,22 @@ var
     end;
   end;
 
-  // Scan the loop for INTEGER register operands. Mark=False: compute IMaxReg. Mark=True: flag each
-  // used int reg as -2 in ILoc (allocation candidate). CAUTION: for bcArrayLoad/StoreFloat, Src1 is
-  // the array id (a constant), NOT a register -- only Src2 (the index) is an int register.
+  // Scan [ScanLo, ScanHi] for INTEGER register operands. Mark=False: compute IMaxReg. Mark=True:
+  // flag each used int reg as -2 in ILoc (allocation candidate) and count its mentions in IUse.
+  // ScanAll overrides both and counts mentions into IUseAll instead -- the same operand list read
+  // over the WHOLE program, which is what makes the compare/branch fusion below provably safe
+  // without a liveness analysis. CAUTION: for bcArrayLoad/StoreFloat, Src1 is the array id
+  // (a constant), NOT a register -- only Src2 (the index) is an int register.
   procedure ScanI(Mark: Boolean);
   var q: Integer; J: PBcInstr;
     procedure T(r: Word);
     begin
-      if Mark then ILoc[r] := -2
+      if ScanAll then begin if r <= High(IUseAll) then Inc(IUseAll[r]); end
+      else if Mark then begin ILoc[r] := -2; Inc(IUse[r]); end
       else if r > IMaxReg then IMaxReg := r;
     end;
   begin
-    for q := HeaderPC to EndPC do
+    for q := ScanLo to ScanHi do
     begin
       J := @Prog[q];
       case J^.OpCode of
@@ -1865,6 +2034,7 @@ var
   begin
     Result := False;
     I := @Prog[apc];
+    CurPC := apc;
     JitDiagCurOp := I^.OpCode; JitDiagCurPC := apc;   // last op seen -> the culprit if we bail below
     Dd := LongWord(I^.Dest) * 8;
     S1 := LongWord(I^.Src1) * 8;
@@ -1898,18 +2068,21 @@ var
           FStore(I^.Dest, XMM0);
         end;
       bcAddInt:
+        if not IntBin2([$03], True) then
         begin
           ILoad(RAX, I^.Src1);
           IOp([$48, $03], RAX, I^.Src2);            // add rax, src2
           IStore(I^.Dest, RAX);
         end;
       bcSubInt:
+        if not IntBin2([$2B], False) then
         begin
           ILoad(RAX, I^.Src1);
           IOp([$48, $2B], RAX, I^.Src2);            // sub rax, src2
           IStore(I^.Dest, RAX);
         end;
       bcMulInt:
+        if not IntBin2([$0F, $AF], True) then
         begin
           ILoad(RAX, I^.Src1);
           IOp([$48, $0F, $AF], RAX, I^.Src2);       // imul rax, src2
@@ -2538,6 +2711,7 @@ begin
   for d := HeaderPC to EndPC do InRange[d] := True;
   InCallee := False;
   InGosub := False;
+  FuseSkipPC := -1;
   NSaveInt := 0; NSaveFloat := 0;     // J6e: sparse-save lists, filled by the allocation overflow branches
   BuildCallSites;                     // find inlinable bcCallSub, mark callee ranges, size the stack scratch
   BuildGosubSites;                    // find inlinable classic GOSUB (bcCall), mark body ranges in-range
@@ -2571,26 +2745,69 @@ begin
   IntPool[0] := R9;  IntPool[1] := R10; IntPool[2] := R11;
   IntPool[3] := R12; IntPool[4] := R13; IntPool[5] := R14; IntPool[6] := R15;
   for gpr := 0 to 15 do SaveGpr[gpr] := False;
+  // --- whole-program facts the compare/branch fusion needs (see CmpFusible) ---
+  ScanAll := False; ScanLo := 0; ScanHi := ProgLen - 1;
+  IMaxReg := -1;
+  ScanI(False);                             // program-wide highest int register
+  SetLength(IUseAll, IMaxReg + 2);
+  for ii := 0 to High(IUseAll) do IUseAll[ii] := 0;
+  ScanAll := True;
+  ScanI(False);                             // count every mention in the whole program
+  ScanAll := False;
+  SetLength(IsTargetPC, ProgLen);
+  for ii := 0 to ProgLen - 1 do IsTargetPC[ii] := False;
+  for ii := 0 to ProgLen - 1 do
+    case Prog[ii].OpCode of
+      // the three opcodes the emitter turns into a native jump to a bytecode PC; nothing else in
+      // the compiled code lands on a PC, and native ENTRY is only ever HeaderPC
+      bcJump, bcJumpIfZero, bcJumpIfNotZero:
+        if (Integer(Prog[ii].Immediate) >= 0) and (Integer(Prog[ii].Immediate) < ProgLen) then
+          IsTargetPC[Integer(Prog[ii].Immediate)] := True;
+    end;
+  // --- region allocation ---
+  ScanLo := HeaderPC; ScanHi := EndPC;
   IMaxReg := -1;
   ScanI(False);                             // compute IMaxReg
   SetLength(ILoc, IMaxReg + 2);
-  for ii := 0 to High(ILoc) do ILoc[ii] := -1;
-  if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2
+  SetLength(IUse, IMaxReg + 2);
+  for ii := 0 to High(ILoc) do begin ILoc[ii] := -1; IUse[ii] := 0; end;
+  if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2 and count mentions
   NextGpr := 0;
+  // ⭐ The seven pool registers go to the MOST MENTIONED registers, not to the lowest-numbered ones.
+  // Register indices carry no information about how hot a register is: they are handed out by the
+  // bytecode compiler in definition order, so an index-ordered pool gives r9..r15 to whatever the
+  // loop happens to define first. matmul's innermost loop paid exactly that -- its two array indices
+  // (four mentions each) came out memory-homed behind five loop-invariant multiplicands with one
+  // mention apiece, so every iteration stored an address to the bank and read it straight back.
+  // The JIT's own INLINED-CALLEE allocator (BuildCalleeCache) already competes by use count; this is
+  // the same rule for the main region. JIT_IALLOC=0 restores the index order as an A/B baseline.
+  if GJitIAllocState < 0 then
+  begin
+    if GetEnvironmentVariable('JIT_IALLOC') = '0' then GJitIAllocState := 0 else GJitIAllocState := 1;
+  end;
+  while NextGpr <= 6 do
+  begin
+    // pick the still-unallocated candidate with the highest use count (index order breaks ties, so
+    // the assignment is deterministic and equals the historic one when every count is equal)
+    gpr := -1;
+    for ii := 0 to IMaxReg do
+      if ILoc[ii] = -2 then
+      begin
+        if gpr < 0 then gpr := ii
+        else if GJitIAllocState = 1 then
+          begin if IUse[ii] > IUse[gpr] then gpr := ii; end;
+        if GJitIAllocState = 0 then Break;      // index order: the first candidate wins
+      end;
+    if gpr < 0 then Break;                      // no candidates left
+    ILoc[gpr] := IntPool[NextGpr];
+    if IntPool[NextGpr] >= 12 then SaveGpr[IntPool[NextGpr]] := True;  // callee-saved
+    Inc(NextGpr);
+  end;
   for ii := 0 to IMaxReg do
     if ILoc[ii] = -2 then
     begin
-      if NextGpr <= 6 then
-      begin
-        ILoc[ii] := IntPool[NextGpr];
-        if IntPool[NextGpr] >= 12 then SaveGpr[IntPool[NextGpr]] := True;  // callee-saved
-        Inc(NextGpr);
-      end
-      else
-      begin
-        ILoc[ii] := -1;                     // overflow -> memory-homed (used but no GPR)
-        Inc(NSaveInt); SetLength(SaveIntRegs, NSaveInt); SaveIntRegs[NSaveInt - 1] := ii;
-      end;
+      ILoc[ii] := -1;                       // overflow -> memory-homed (used but no GPR)
+      Inc(NSaveInt); SetLength(SaveIntRegs, NSaveInt); SaveIntRegs[NSaveInt - 1] := ii;
     end;
 
   // --- array base/count caching (J5c LICM): hand the GPRs left free after int allocation to the
@@ -2768,6 +2985,9 @@ begin
     for pc := HeaderPC to EndPC do
     begin
       NativeOff[pc] := E.Len;
+      // A compare that fused its branch already emitted it: the branch's own turn emits nothing.
+      // Its NativeOff still points here, which costs nothing - CmpFusible proved nothing jumps to it.
+      if pc = FuseSkipPC then Continue;
       if not EmitOne(pc) then Exit;
     end;
 
