@@ -167,6 +167,8 @@ var
   // JIT_TWOADDR=0 puts every integer ALU op back on the rax round-trip (load / op / store), which is
   // the A/B for writing straight into the destination register. Read once, cached.
   GJitTwoAddrState: Integer = -1;
+  // JIT_TWOADDRF=0 puts every FLOAT ALU op back on the xmm0 round-trip. Read once, cached.
+  GJitTwoAddrFState: Integer = -1;
   // JIT_CMPFUSE=0 puts every integer compare back on materialising its boolean. Read once, cached.
   GJitCmpFuseState: Integer = -1;
   // How many compare/branch pairs the last compile fused - the probe that says the change is REACHED.
@@ -179,6 +181,28 @@ begin
     if GetEnvironmentVariable('JIT_HELPER') = '0' then GJitHelperState := 0 else GJitHelperState := 1;
   end;
   Result := GJitHelperState = 1;
+end;
+
+function TwoAddrEnabled: Boolean;
+// The INTEGER two-address form (JIT_TWOADDR=0 restores the rax round-trip).
+begin
+  if GJitTwoAddrState < 0 then
+  begin
+    if GetEnvironmentVariable('JIT_TWOADDR') = '0' then GJitTwoAddrState := 0 else GJitTwoAddrState := 1;
+  end;
+  Result := GJitTwoAddrState = 1;
+end;
+
+function TwoAddrFloatEnabled: Boolean;
+// The FLOAT two-address form, on its own switch (JIT_TWOADDRF=0) so the two banks can be measured
+// apart. Same idea, different bank, and a change that is one idea in two places is still two
+// measurements - crediting both to one number is how a cure gets attributed to the wrong half.
+begin
+  if GJitTwoAddrFState < 0 then
+  begin
+    if GetEnvironmentVariable('JIT_TWOADDRF') = '0' then GJitTwoAddrFState := 0 else GJitTwoAddrFState := 1;
+  end;
+  Result := GJitTwoAddrFState = 1;
 end;
 
 // The opcodes the helper route may carry (J14) - a WHITELIST, and every exclusion is a reason, not a
@@ -499,11 +523,7 @@ var
   var d, s1, s2: Integer;
   begin
     Result := False;
-    if GJitTwoAddrState < 0 then
-    begin
-      if GetEnvironmentVariable('JIT_TWOADDR') = '0' then GJitTwoAddrState := 0 else GJitTwoAddrState := 1;
-    end;
-    if GJitTwoAddrState = 0 then Exit;
+    if not TwoAddrEnabled then Exit;
     d := IAlloc(I^.Dest);
     if d < 0 then Exit;
     s1 := IAlloc(I^.Src1); s2 := IAlloc(I^.Src2);
@@ -659,6 +679,40 @@ var
                E.EmitBytes([$08, $C8]); end;                                          //       or al,cl (not-equal OR unordered)
     end;
     CmpBoolToDest;
+  end;
+
+  // ⭐ Rd = Rs1 <sse> Rs2 written STRAIGHT INTO the destination's xmm - the float twin of IntBin2,
+  // and the same defect on the other bank.
+  //
+  // The historic shape is `movaps xmm0,s1 / <op>sd xmm0,s2 / movaps d,xmm0`: three instructions for
+  // one arithmetic operation, two of them PURE COPIES sitting on the dependency chain. It is the
+  // dominant cost in float code - nbody's innermost loop emitted 46 movaps for 27 arithmetic
+  // instructions, 1.7 copies per operation - and when the destination IS the first operand (`acc +=
+  // x`, every accumulator) the copy is not merely redundant, it disappears entirely.
+  //
+  // The bail cases are the machine's, not a policy: a memory-homed destination is already minimal
+  // through xmm0, and a destination whose xmm holds the SECOND operand cannot be written with the
+  // first - the commutative ops apply the other operand in place instead, subtraction and division
+  // cannot and fall back. xmm0/xmm1 are the scratch pair (allocation starts at xmm2), so the
+  // destination is never the register the fallback path uses.
+  function FloatBin2(const SseOp: array of Byte; Commutative: Boolean): Boolean;
+  var d, s1, s2: Integer;
+  begin
+    Result := False;
+    if not TwoAddrFloatEnabled then Exit;
+    if InCallee or InGosub then Exit;        // inlined body: every VM reg is memory-homed, FLoc is the caller's
+    d := FLoc[I^.Dest];
+    if d < 0 then Exit;
+    s1 := FLoc[I^.Src1]; s2 := FLoc[I^.Src2];
+    if (s2 >= 0) and (s2 = d) then
+    begin
+      if not Commutative then Exit;
+      FOp(SseOp, d, I^.Src1);                // dest already holds src2: apply src1 to it
+      Result := True; Exit;
+    end;
+    if s1 <> d then FLoad(d, I^.Src1);       // dest already holds src1 -> no copy at all
+    FOp(SseOp, d, I^.Src2);
+    Result := True;
   end;
 
   // Float op:  Rd = Rs1 <sse> Rs2   (compute in xmm0, honouring register allocation of the operands)
@@ -2239,15 +2293,18 @@ var
           E.EmitBytes([$F2, $0F, $2A, $C0]);        // cvtsi2sd xmm0, eax
           FStore(I^.Dest, XMM0);
         end;
-      bcAddFloat: FloatBin([$F2, $0F, $58]);        // addsd
-      bcSubFloat: FloatBin([$F2, $0F, $5C]);        // subsd
-      bcMulFloat: FloatBin([$F2, $0F, $59]);        // mulsd
+      bcAddFloat: if not FloatBin2([$F2, $0F, $58], True)  then FloatBin([$F2, $0F, $58]);   // addsd
+      bcSubFloat: if not FloatBin2([$F2, $0F, $5C], False) then FloatBin([$F2, $0F, $5C]);   // subsd
+      bcMulFloat: if not FloatBin2([$F2, $0F, $59], True)  then FloatBin([$F2, $0F, $59]);   // mulsd
       // Float divide. MODERN follows IEEE (divsd: x/0 = +/-Inf, 0/0 = NaN), so it compiles unconditionally.
       // CLASSIC raises ?DIVISION BY ZERO only on an exact-zero divisor (the interpreter tests `= 0.0`); guard
       // the divisor and deopt to the interpreter on zero. A NaN divisor is not zero -> divide (yields NaN,
       // matching the interpreter). Inside an inlined callee a deopt is unsafe (native frame lost) -> bail.
       bcDivFloat:
-        if AllowUnsafe then FloatBin([$F2, $0F, $5E])          // divsd (IEEE = MODERN)
+        if AllowUnsafe then
+        begin
+          if not FloatBin2([$F2, $0F, $5E], False) then FloatBin([$F2, $0F, $5E]);  // divsd (IEEE = MODERN)
+        end
         else if InCallee then Exit
         else
         begin
