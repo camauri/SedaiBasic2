@@ -323,7 +323,8 @@ var
   PcW: array of Integer;
   PcWOn: Boolean;                   // the weights are built (region pass only, never program-wide)
   HdrTW, HdrEndW: array[0..31] of Integer;   // loop headers found, and how far each one spans
-  NHdrW, wt, wfac: Integer;
+  NHdrW, wt, wfac, wcap: Integer;
+  DiagS: string;                    // JIT_DIAG: the allocation decision, in one line
   CurPC: Integer;                   // absolute PC of the instruction EmitOne is lowering
   FuseSkipPC: Integer;              // PC whose instruction a fusion already emitted (-1 = none)
   IMaxReg, NextGpr, ii, gpr, w: Integer;
@@ -2947,11 +2948,33 @@ begin
   // scale so the two allocators price the same program the same way. Nested loops multiply because
   // they nest; two separate loops sharing one header must NOT count twice, so a header already seen
   // widens its span instead of adding a level - the same rule, and the same trap, as BlockW.
-  // JIT_IWEIGHT=<n> sets the per-level factor; 0 restores the unweighted count. Both are A/B
-  // baselines on ONE binary.
+  // JIT_IWEIGHT=<n> sets the per-level factor, 0 restores the unweighted count; JIT_IWCAP=<n> sets
+  // the ceiling. Both are A/B baselines on ONE binary.
+  //
+  // ⛔⛔⛔ DEPTH IS A PROXY FOR TRIP COUNT, AND ON fannkuch THE PROXY IS INVERTED - which is what its
+  // +5% costs, and it is NOT a tuning problem. Its region PC 62..180 holds two loops at depth 3:
+  // the reversal (`Do While i < j`, ~4 trips) and the rotate (`For j = 1 To i`, whose enclosing
+  // `For` exits early most of the time). They are the SHORTEST loops in the program and they
+  // collect x512, so two mentions inside one of them (reg 17, w1024) outbid eleven mentions spread
+  // across the loops that really run (reg 26, w200). JIT_DIAG prints exactly that line.
+  //
+  // Both knobs were swept before this was written down, best-of-3 on a cold package:
+  //     cap    fannkuch   matmul   matmul_l1   sieve    arraysum
+  //       8      -0.3%     +2.1%      +1.2%    +0.3%      -2.4%     <- fixes fannkuch, wins nothing
+  //      64      +1.5%    -52.5%      +0.5%    -1.4%      -5.2%     <- loses matmul_l1 AND sieve
+  //     512      +6.6%    -53.2%     -47.9%   -30.8%      -6.0%     <- the default
+  // and the factor at 2/3/4/8 loses fannkuch 4-9% at EVERY value. ⇒ There is no setting of either
+  // knob that keeps the wins, so 8/512 stands and the +5% is the price.
+  //
+  // ⭐ WHAT WOULD ACTUALLY FIX IT is a trip count, not a better heuristic - and this JIT cannot have
+  // one: BuildJitLoops runs BEFORE the program does (right after the dense-opcode table is built),
+  // and FBackEdgeCount is zeroed there and only ever filled under {$IFDEF JIT_PROFILE}. Nothing has
+  // executed yet when these weights are computed. A profiling tier is the next real step, not
+  // another constant.
   SetLength(PcW, EndPC - HeaderPC + 1);
   for ii := 0 to High(PcW) do PcW[ii] := 1;
   wfac := StrToIntDef(GetEnvironmentVariable('JIT_IWEIGHT'), 8);
+  wcap := StrToIntDef(GetEnvironmentVariable('JIT_IWCAP'), 512);
   PcWOn := wfac > 1;
   if PcWOn then
   begin
@@ -2976,7 +2999,7 @@ begin
       end;
     for w := 0 to NHdrW - 1 do
       for ii := HdrTW[w] to HdrEndW[w] do
-        if PcW[ii - HeaderPC] < 512 then PcW[ii - HeaderPC] := PcW[ii - HeaderPC] * wfac;
+        if PcW[ii - HeaderPC] < wcap then PcW[ii - HeaderPC] := PcW[ii - HeaderPC] * wfac;
   end;
   if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2 and count weighted mentions
   NextGpr := 0;
@@ -3016,6 +3039,31 @@ begin
       ILoc[ii] := -1;                       // overflow -> memory-homed (used but no GPR)
       Inc(NSaveInt); SetLength(SaveIntRegs, NSaveInt); SaveIntRegs[NSaveInt - 1] := ii;
     end;
+  // ⭐ WHO GOT A REGISTER AND WHAT IT WAS WORTH. Without this the only way to read an allocation
+  // decision was to disassemble the prologue and match bank offsets by hand - which is how a
+  // regression on one benchmark stayed a guess for an afternoon. Winners in pool order, then the
+  // losers that were worth the most, so the line answers "what did the seventh register just miss?".
+  if GetEnvironmentVariable('JIT_DIAG') <> '' then
+  begin
+    DiagS := '';
+    for gpr := 0 to 6 do
+      for ii := 0 to IMaxReg do
+        if ILoc[ii] = IntPool[gpr] then
+          DiagS := DiagS + Format(' r%d=%d(w%d)', [IntPool[gpr], ii, IUse[ii]]);
+    DiagS := DiagS + '  |missed:';
+    for wt := 0 to 5 do                     // the six best-scoring losers, descending
+    begin
+      gpr := -1;
+      for ii := 0 to IMaxReg do
+        if (ILoc[ii] < 0) and (IUse[ii] > 0) and
+           ((gpr < 0) or (IUse[ii] > IUse[gpr])) and
+           ((wt = 0) or (IUse[ii] <= NHdrW)) then gpr := ii;
+      if gpr < 0 then Break;
+      DiagS := DiagS + Format(' %d(w%d)', [gpr, IUse[gpr]]);
+      NHdrW := IUse[gpr] - 1;               // reused as the descending cursor; PcW is already built
+    end;
+    WriteLn(ErrOutput, Format('[JIT] alloc PC %d..%d:%s', [HeaderPC, EndPC, DiagS]));
+  end;
 
   // --- array base/count caching (J5c LICM): hand the GPRs left free after int allocation to the
   // loop-invariant array base pointers and counts, most-used arrays first (base then count each). ---
