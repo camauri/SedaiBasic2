@@ -56,9 +56,32 @@
   Where it runs: after LICM (which is what creates the preheader this needs) and
   before DCE and the range analysis.
 
-  ⛔⛔⛔ OFF BY DEFAULT. INDEXRED=1 turns it on. WHAT KEEPS IT OFF HAS CHANGED
-  TWICE, AND THE CURRENT REASON IS THE THIRD ONE - read to the end before moving
-  it.
+  ⭐⭐⭐ ON BY DEFAULT SINCE 17 AUG 2026. INDEXRED=0 turns it off, which is the A/B
+  baseline. IT WAS OFF FOR TWO MONTHS AND FOR THREE DIFFERENT REASONS, EACH OF
+  WHICH LOOKED LIKE THE LAST ONE - the two sections below are both closed, and
+  they are kept because the SHAPE of the mistake recurs, not the mistake.
+
+  ⭐ The rule they add up to: THIS PASS DOES NOT MAKE CODE FASTER. It makes an
+  index cheaper to compute and, in exchange, keeps a value ALIVE ACROSS THE WHOLE
+  LOOP. Everything downstream that reasons about the old shape, or that has to
+  house the new value, has to be checked - an analysis (range), a matcher (the
+  vectoriser), an ALLOCATOR (the JIT). Three consumers, three separate sessions,
+  one transformation.
+
+  What it is finally worth, best-of-5 on a cold package, both orderings, the gate
+  applied to ONE binary:
+
+      engine        matmul        matmul_l1       matmul_alias    everything else
+      interpreter   (49 s)        -1.9%           -1.8%           within +/-1.4%
+      --aot         -4.8/-5.6%    -22.0/-25.6%    -8.0/-9.7%      noise
+      --jit         +0.1/-2.8%    -21.9/-26.6%    -4.0/-4.2%      noise
+      --aot --jit   -3.5/-3.9%    -20.0/-28.3%    -10.2/-10.9%    noise
+
+  ⚠️ The interpreter barely moves, and that is the expected answer, not a
+  disappointment: the pass removes ONE register copy per index per iteration and
+  the bytecode instruction count is otherwise unchanged, so an engine whose cost
+  is dispatch cannot show much. The win is native, where the copy was the
+  instruction.
 
   ── 1. The vectoriser (CLOSED, 17 Aug 2026) ──────────────────────────────────
   The vector path recognised ONE unit-stride shape, "invariant + counter", and
@@ -81,25 +104,20 @@
   harness that pins a flag has stopped measuring the product - and the sign of
   the answer can invert, not merely its size.
 
-  ScanVecLoops now reads a running index (efd3677). With it, on the AOT, the
-  pass is worth what it always promised - best-of-5 on a cold package, both
-  orderings, the gate applied to ONE binary:
+  ScanVecLoops reads a running index since efd3677, and with it the pass is worth
+  on the AOT what it always promised (the table at the top).
 
-      matmul       -3.4% / -5.0%      matmul_l1  -20.9% / -26.6%
-      matmul_alias -9.8% / -12.4%     everything else within a 1.7% noise floor
-      interpreter: matmul_l1 -20.6%   --aot --jit: matmul -6.9%, l1 -20.6%
-
-  ⭐ That is the SECOND downstream consumer this one pass had to be re-taught -
+  ⭐ That was the SECOND downstream consumer this one pass had to be re-taught -
   SedaiRangeAnalysis.EvalDerivedIV was the first (without it the bounds guards
   come back and the pass is worth +41%). ⇒ A transformation that erases the shape
   another analysis matches on is not finished when it is correct.
 
-  ── 2. The JIT's register allocator (OPEN - THIS is what keeps it off) ───────
-  On `--jit` ALONE the same gate reads matmul +65.0% and matmul_l1 +48.5%
-  (arraysum -7.8% and nbody -5.0%, so it is not the pass being wrong - it is
-  pressure). JIT_DUMP says exactly why. In the region actually entered - the
-  whole i/k/j nest - one of the three running indices gets no GPR, and the
-  innermost loop then carries:
+  ── 2. The JIT's register allocator (CLOSED, cd235e2) ────────────────────────
+  On `--jit` ALONE the same gate read matmul +65.0% and matmul_l1 +48.5%
+  (arraysum -7.8% and nbody -5.0%, so it was not the pass being wrong - it was
+  pressure). JIT_DUMP said exactly why. In the region actually entered - the
+  whole i/k/j nest - one of the three running indices got no GPR, and the
+  innermost loop then carried:
 
       mov rcx,[rbx+0x88]              ; the index, read from the bank
       ...
@@ -112,11 +130,12 @@
   every iteration, through the same address - a store-to-load dependency in the
   hottest loop in the program. Strength reduction is only a win while its result
   gets a register; unallocated, it is strictly worse than the arithmetic it
-  removed. The AOT keeps all three (its `Allocate` competes on LOOP-WEIGHTED
-  traffic); the JIT's picks by UNWEIGHTED mention count over the whole region
+  removed. The AOT kept all three (its `Allocate` competes on LOOP-WEIGHTED
+  traffic); the JIT's picked by UNWEIGHTED mention count over the whole region
   (`Inc(IUse[r])` in ScanI), so a value mentioned four times in the outer loop
-  outranks an index mentioned three times in a loop that runs 1024x more often.
-  ⇒ Weight the JIT's IUse by loop depth and this pass can go on by default.
+  outranked an index mentioned three times in a loop that runs 1024x more often.
+  ⇒ The JIT's IUse is loop-weighted now (cd235e2), the spill is gone, and the
+  gate reads matmul +0.1%/-2.8% instead of +65%. That was the last blocker.
 
   What was fixed on the way here, and stands:
    - it transformed any "invariant + counter", not only array indices, and
@@ -178,10 +197,13 @@ begin
 end;
 
 function TIndexReduction.Enabled: Boolean;
+// ON since 17 Aug 2026 (see the header): both consumers that the running index broke - the range
+// analysis and the vectoriser - now read it, and the JIT allocator that could not hold it prices
+// registers by loop weight. INDEXRED=0 is the A/B baseline on one binary.
 begin
   if GEnabled < 0 then
   begin
-    if GetEnvironmentVariable('INDEXRED') = '1' then GEnabled := 1 else GEnabled := 0;
+    if GetEnvironmentVariable('INDEXRED') = '0' then GEnabled := 0 else GEnabled := 1;
   end;
   Result := GEnabled = 1;
 end;
