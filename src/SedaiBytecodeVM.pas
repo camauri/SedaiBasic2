@@ -329,6 +329,10 @@ type
     FRetiredArrDesc: array of TInt64Array;
     FArrDescLock: TRTLCriticalSection;
     FArraysDirty: Boolean;
+    // ⭐ L'ultimo puntatore che AcquireArrDesc ha pubblicato, scritto SOTTO IL LOCK. Serve alla
+    // corsia veloce di EnsureArrDesc: se il contesto del chiamante ha gia' questo puntatore e
+    // nessuno ha sporcato la tabella, non c'e' niente da riacquisire e la sezione critica si salta.
+    FCurArrDesc: Pointer;
     FOutputDevice: IOutputDevice;
     FGraphics: IGraphicsBackend;     // FreeBASIC graphics phase: operation-level drawing backend (SW headless / SDL2 on sbv)
     FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
@@ -795,6 +799,10 @@ var
   // JIT_OVERAOT=1 lets the loop JIT compile loops the AOT already owns (see BuildJitLoops). Default
   // off: the overlap costs a second compilation and buys nothing.
   GJitOverAot: Boolean = False;
+  // AOT_ARRDESC=0 riporta EnsureArrDesc alla sezione critica INCONDIZIONATA (il comportamento del
+  // 4a8b8ac). E' il riferimento dell'A/B su un binario solo: quel commit ha corretto tre difetti a
+  // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
+  GArrDescFast: Boolean = True;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
 begin
@@ -1189,6 +1197,7 @@ begin
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
+  GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
   FRawHeapTop := 0;
@@ -10278,6 +10287,7 @@ begin
     if FArraysDirty then RebuildJitArrDesc;
     if Length(FJitArrDesc) > 0 then Result := @FJitArrDesc[0]
     else Result := nil;
+    FCurArrDesc := Result;          // pubblicato sotto il lock: e' la chiave della corsia veloce
   finally
     LeaveCriticalSection(FArrDescLock);
   end;
@@ -10285,7 +10295,27 @@ end;
 
 procedure TBytecodeVM.EnsureArrDesc(Ctx: PAotCtx);
 // AcquireArrDesc, published into the caller's own context record.
+//
+// ⭐⭐⭐ E LA CORSIA VELOCE, CHE E' TUTTO IL PUNTO. Questa procedura sta sul cammino piu' caldo del
+// motore: AotCallSub la chiama PRIMA e DOPO ogni chiamata nativa, quindi una funzione ricorsiva ne
+// paga due per invocazione. Con la sola sezione critica, `binary-trees` sotto --aot e' passato da
+// 171 ms (11 ago) a 711 ms - due sezioni critiche globali PER NODO, e l'interprete, che non ne
+// prende nessuna, e' finito 5,6 volte piu' veloce del codice compilato.
+//
+// La corsia veloce salta il lock quando NIENTE puo' essere cambiato, e lo decide con DUE domande,
+// non una:
+//   - FArraysDirty: qualcuno ha marcato la tabella (DIM/REDIM/ERASE, ogni ExecuteArrayOp,
+//     l'installazione di una regione nativa). E' gia' scritto SENZA lock da quei siti, quindi
+//     leggerlo senza lock non aggiunge una classe di corse che non ci fosse.
+//   - Ctx^.ArrDesc <> FCurArrDesc: la tabella e' stata RICOSTRUITA da qualcun altro dopo l'ultima
+//     volta che questo contesto l'ha letta. Questa seconda domanda chiude la finestra in cui il
+//     flag e' gia' stato azzerato dal ricostruttore e il lettore lo vedrebbe falso.
+// Se entrambe dicono di no, il puntatore in mano al chiamante e' quello corrente e non serve altro.
+// ⛔ Ogni percorso che PUO' cambiare la tabella passa comunque dal lock, esattamente come prima.
+// AOT_ARRDESC=0 ripristina il lock incondizionato: e' l'A/B su un binario solo.
 begin
+  if GArrDescFast and (not FArraysDirty) and (Ctx^.ArrDesc = FCurArrDesc) and
+     (FCurArrDesc <> nil) then Exit;
   Ctx^.ArrDesc := AcquireArrDesc;
 end;
 
