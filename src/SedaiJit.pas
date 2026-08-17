@@ -2986,8 +2986,32 @@ begin
   // needs more than seven registers AT ONCE; concentrating the pool on the inner loops makes it lose
   // thirteen of them together, and 13 x 3.6M outweighs everything saved inside. The model has no
   // notion of PRESSURE per loop - only of traffic per register.
-  // ⇒ The real next step is a live-interval allocator (the AOT already has one: see its `intervals:
-  // webs int=.. maxOverlap ..` line), not a profiling tier and not another constant.
+  // ⛔⛔⛔ ...AND "SO BUILD A LIVE-INTERVAL ALLOCATOR" WAS ALSO WRONG. JIT_IFORCE (below) hands the
+  // pool to a NAMED set, which turns "which registers won" and "how big the code came out" from one
+  // observation into two. The single-variable experiment: set A and set C differ in ONE register -
+  // A keeps 28 and spills 34, C the reverse - and A is 4-5% FASTER in both orderings. Then:
+  //
+  //   weighted bank references   A = 469M   C = 435M    <- C has FEWER and is SLOWER
+  //   weighted instructions      C = +3.6M on ~1.5G     <- 0.24%, against a measured 4-5%
+  //   64-byte lines covered by the two hottest loops: IDENTICAL in A and C
+  //
+  // The reason the reference count is not the cost is visible in the emitted copy loop (29.4M
+  // trips). Spilling reg 34 there costs NOTHING - it was a staging copy already:
+  //     A:  mov [rbx+0x110],rax  ...  mov rax,[rbx+0x110]     (14 instructions)
+  //     C:  mov r15,rax          ...  mov rax,r15             (14 instructions)
+  // Same instruction count, and the store-to-load is the same address every iteration, forwarded,
+  // off the critical path. Two mentions in the hottest loop of the program, which every model here
+  // prices at a premium, are worth EXACTLY ZERO to spill.
+  //
+  // ⇒ THREE candidate objectives are falsified by measurement - trip-count-weighted mentions,
+  // weighted bank references, weighted instruction count - and the residual is not something an
+  // allocator chooses. Do NOT re-derive the AOT's interval allocator here to chase this 5%: the
+  // evidence says allocation QUALITY is not what moves this program's clock. The knobs stay so the
+  // next person can reproduce all of it in ten minutes instead of a day.
+  //
+  // ⭐ And the general lesson, which outlives fannkuch: A SPILL DOES NOT ALWAYS ADD AN INSTRUCTION.
+  // Any model that scores a register by how often it is MENTIONED is counting something the emitter
+  // does not always charge for.
   SetLength(PcW, EndPC - HeaderPC + 1);
   for ii := 0 to High(PcW) do PcW[ii] := 1;
   wfac := StrToIntDef(GetEnvironmentVariable('JIT_IWEIGHT'), 8);
@@ -3069,6 +3093,29 @@ begin
     ILoc[gpr] := IntPool[NextGpr];
     if IntPool[NextGpr] >= 12 then SaveGpr[IntPool[NextGpr]] := True;  // callee-saved
     Inc(NextGpr);
+  end;
+  // ⭐ JIT_IFORCE="<hdr>=<r>,<r>,..." hands the pool to a NAMED set of VM registers, in the order
+  // given. It exists to separate two things a size-and-time table cannot: "which registers won" from
+  // "how big the code came out". Without it, two allocations that differ in both are one
+  // observation, not two. Applies only to the region whose header PC matches.
+  ProbeS := GetEnvironmentVariable('JIT_IFORCE');
+  if (ProbeS <> '') and (Pos(IntToStr(HeaderPC) + '=', ProbeS) = 1) then
+  begin
+    ProbeS := Copy(ProbeS, Pos('=', ProbeS) + 1, MaxInt);
+    for ii := 0 to IMaxReg do
+      if ILoc[ii] >= 0 then ILoc[ii] := -2;     // hand every pool register back
+    NextGpr := 0;
+    while (ProbeS <> '') and (NextGpr <= 6) do
+    begin
+      wt := Pos(',', ProbeS);
+      if wt = 0 then begin DiagS := ProbeS; ProbeS := ''; end
+      else begin DiagS := Copy(ProbeS, 1, wt - 1); ProbeS := Copy(ProbeS, wt + 1, MaxInt); end;
+      w := StrToIntDef(DiagS, -1);
+      if (w < 0) or (w > IMaxReg) or (ILoc[w] <> -2) then System.Continue;
+      ILoc[w] := IntPool[NextGpr];
+      if IntPool[NextGpr] >= 12 then SaveGpr[IntPool[NextGpr]] := True;
+      Inc(NextGpr);
+    end;
   end;
   for ii := 0 to IMaxReg do
     if ILoc[ii] = -2 then
