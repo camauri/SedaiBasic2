@@ -324,7 +324,7 @@ var
   PcWOn: Boolean;                   // the weights are built (region pass only, never program-wide)
   HdrTW, HdrEndW: array[0..31] of Integer;   // loop headers found, and how far each one spans
   NHdrW, wt, wfac, wcap: Integer;
-  DiagS: string;                    // JIT_DIAG: the allocation decision, in one line
+  DiagS, ProbeS: string;            // JIT_DIAG: the allocation decision; JIT_IWTRIP: the probe
   CurPC: Integer;                   // absolute PC of the instruction EmitOne is lowering
   FuseSkipPC: Integer;              // PC whose instruction a fusion already emitted (-1 = none)
   IMaxReg, NextGpr, ii, gpr, w: Integer;
@@ -2966,11 +2966,28 @@ begin
   // and the factor at 2/3/4/8 loses fannkuch 4-9% at EVERY value. ⇒ There is no setting of either
   // knob that keeps the wins, so 8/512 stands and the +5% is the price.
   //
-  // ⭐ WHAT WOULD ACTUALLY FIX IT is a trip count, not a better heuristic - and this JIT cannot have
-  // one: BuildJitLoops runs BEFORE the program does (right after the dense-opcode table is built),
-  // and FBackEdgeCount is zeroed there and only ever filled under {$IFDEF JIT_PROFILE}. Nothing has
-  // executed yet when these weights are computed. A profiling tier is the next real step, not
-  // another constant.
+  // ⛔⛔⛔ AND "A TRIP COUNT WOULD FIX IT" WAS WRONG - MEASURED, NOT ARGUED. That was written here
+  // first, and a profiling tier was put at the top of the worksite to go and get one. Before
+  // building it, fannkuch's REAL body-execution counts were taken by instrumenting the BASIC
+  // (29.9M/29.4M/22.2M/3.6M/2.6M/2.6M for lines 46/32/37/30/63/72) and injected through JIT_IWTRIP
+  // below. They produce a genuinely different allocation - and fannkuch reads +6.0% against the
+  // unweighted one, the SAME as the depth guess. Perfect frequency information does not recover it.
+  //
+  // ⭐⭐⭐ SO THE DEFECT IS THE RANKING MODEL, NOT THE WEIGHTS, and the per-loop count says so in
+  // numbers. Bank references inside each loop, unweighted allocation -> weighted one:
+  //     outer body (3.6M trips)  22 -> 35     the flip loop (22.2M)   7 -> 10
+  //     copy (29.4M)              3 ->  3     the reversal (29.9M)    4 ->  4
+  //     For i=3 (2.6M)            8 ->  9     the rotate (2.6M)       2 ->  0
+  // Weighted by those real frequencies: 469M references against 580M. The model exists to MINIMISE
+  // that number and it makes it 24% WORSE.
+  //
+  // Why: ranking by "sum of weighted mentions of the registers we KEEP" is not the same objective as
+  // "sum of weighted references the losers PAY". fannkuch's outer body is 132 instructions wide and
+  // needs more than seven registers AT ONCE; concentrating the pool on the inner loops makes it lose
+  // thirteen of them together, and 13 x 3.6M outweighs everything saved inside. The model has no
+  // notion of PRESSURE per loop - only of traffic per register.
+  // ⇒ The real next step is a live-interval allocator (the AOT already has one: see its `intervals:
+  // webs int=.. maxOverlap ..` line), not a profiling tier and not another constant.
   SetLength(PcW, EndPC - HeaderPC + 1);
   for ii := 0 to High(PcW) do PcW[ii] := 1;
   wfac := StrToIntDef(GetEnvironmentVariable('JIT_IWEIGHT'), 8);
@@ -3000,6 +3017,26 @@ begin
     for w := 0 to NHdrW - 1 do
       for ii := HdrTW[w] to HdrEndW[w] do
         if PcW[ii - HeaderPC] < wcap then PcW[ii - HeaderPC] := PcW[ii - HeaderPC] * wfac;
+    // ⭐ CEILING PROBE, and it is here because depth is a GUESS at what the next line would MEASURE.
+    // JIT_IWTRIP="<hdr>:<freq>,..." replaces the depth weights with real body-execution counts, in
+    // the order given (outer first, so an inner loop's entry overwrites its enclosing one). It exists
+    // to answer "would a profiling tier be worth building?" WITHOUT building it - the answer is a
+    // measurement, not an argument, and it costs an afternoon instead of weeks.
+    DiagS := GetEnvironmentVariable('JIT_IWTRIP');
+    while DiagS <> '' do
+    begin
+      wt := Pos(',', DiagS);
+      if wt = 0 then begin ProbeS := DiagS; DiagS := ''; end
+      else begin ProbeS := Copy(DiagS, 1, wt - 1); DiagS := Copy(DiagS, wt + 1, MaxInt); end;
+      wt := Pos(':', ProbeS);
+      if wt = 0 then System.Continue;
+      w := StrToIntDef(Copy(ProbeS, 1, wt - 1), -1);                 // header PC
+      wcap := StrToIntDef(Copy(ProbeS, wt + 1, MaxInt), 0);          // its frequency
+      if (w < 0) or (wcap <= 0) then System.Continue;
+      for ii := 0 to NHdrW - 1 do
+        if HdrTW[ii] = w then
+          for wt := HdrTW[ii] to HdrEndW[ii] do PcW[wt - HeaderPC] := wcap;
+    end;
   end;
   if IMaxReg >= 0 then ScanI(True);         // mark used regs as -2 and count weighted mentions
   NextGpr := 0;
