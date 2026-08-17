@@ -17,6 +17,14 @@ unit SedaiFileIO;
   than an 'R' so that FILEATTR keeps reporting the mode letter fbc reports. }
 
 {$mode objfpc}{$H+}
+{ ⚠️ NOT decoration. SedaiBytecodeVM compiles with {$codepage UTF8}, so the command string it hands
+  to FileData is a CP_UTF8 AnsiString. Without this directive the literals HERE are CP_ACP, the two
+  codepages differ, and `Command = 'LINEINPUT#'` is not a memcmp: FPC routes it through
+  fpc_utf8_compare_equal, which converts BOTH sides to UnicodeString - two heap allocations and a
+  transcode per comparison, five comparisons per line read. Measured 17 Aug 2026 on 833 337 lines of
+  stdin: 684 ns per line becomes 228, and reverse-complement --aot drops 22%. The same trap is set
+  wherever a string crosses a codepage boundary, which is why every unit now carries the directive. }
+{$codepage UTF8}
 
 interface
 

@@ -41,6 +41,8 @@
 unit SedaiGfxFont;
 
 {$mode ObjFPC}{$H+}
+{$codepage UTF8}   // CP_UTF8 literals, like every other unit. A string that crosses a codepage
+                   // boundary is converted and a comparison stops being a memcmp - see SedaiFileIO.
 
 interface
 

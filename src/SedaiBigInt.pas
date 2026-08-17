@@ -33,6 +33,8 @@ unit SedaiBigInt;
   ============================================================================ }
 
 {$mode objfpc}{$H+}{$asmmode att}
+{$codepage UTF8}   // CP_UTF8 literals, like every other unit. A string that crosses a codepage
+                   // boundary is converted and a comparison stops being a memcmp - see SedaiFileIO.
 
 { ⛔⛔ WRAPAROUND IS THE ALGORITHM, not an accident. The carry of an
   addition between limbs is detected PRECISELY by the overflow
