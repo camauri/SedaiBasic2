@@ -52,6 +52,35 @@ const
   {$ENDIF}
 
 function sysconf(name: LongInt): LongInt; cdecl; external 'c' name 'sysconf';
+
+{$IFDEF LINUX}
+{ ⭐ THE PROCESSORS WE ARE ALLOWED TO USE, which is not the same question as how many exist.
+  sched_getaffinity returns the mask this process is actually permitted to run on; sysconf counts
+  every processor that is ONLINE. They differ whenever somebody has pinned us - `taskset`, a
+  container's cpuset, or an HPC batch scheduler, which is the normal case on a cluster: SLURM hands
+  a job a cpuset and every other core on the node belongs to somebody else.
+  ⛔ Measured 17 Aug 2026: under `taskset -c 0-11` on a 22-thread machine PROCESSORCOUNT still said
+  22, so a program sizing its worker pool from it would start 22 threads on 12 logical CPUs and
+  oversubscribe by nearly two. Python gets this right through os.sched_getaffinity and we did not.
+  The mask is a bitset of at least 1024 CPUs; 128 bytes covers every machine this runs on, and a
+  failure (Result < 0) falls back to sysconf rather than guessing. }
+function sched_getaffinity(pid: LongInt; cpusetsize: PtrUInt; mask: Pointer): LongInt;
+  cdecl; external 'c' name 'sched_getaffinity';
+
+function AffinityCount: Integer;
+var
+  mask: array[0 .. 15] of QWord;    // 16 x 64 = 1024 CPUs
+  i, b: Integer;
+begin
+  Result := 0;
+  FillChar(mask, SizeOf(mask), 0);
+  if sched_getaffinity(0, SizeOf(mask), @mask[0]) <> 0 then Exit;
+  for i := 0 to High(mask) do
+    if mask[i] <> 0 then
+      for b := 0 to 63 do
+        if (mask[i] shr b) and 1 = 1 then Inc(Result);
+end;
+{$ENDIF}
 {$ENDIF}
 
 {$IFDEF WINDOWS}
@@ -77,7 +106,11 @@ var
 begin
   Result := 0;
   {$IFDEF UNIX}
-  Result := sysconf(SC_NPROCESSORS_ONLN);
+  {$IFDEF LINUX}
+  Result := AffinityCount;                    // what we are ALLOWED to use, when the OS will say
+  if Result < 1 then
+  {$ENDIF}
+  Result := sysconf(SC_NPROCESSORS_ONLN);     // otherwise, what exists and is online
   {$ENDIF}
   {$IFDEF WINDOWS}
   FillChar(si, SizeOf(si), 0);
