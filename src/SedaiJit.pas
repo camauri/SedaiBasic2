@@ -3009,6 +3009,27 @@ begin
   // evidence says allocation QUALITY is not what moves this program's clock. The knobs stay so the
   // next person can reproduce all of it in ten minutes instead of a day.
   //
+  // ✅ NOT A LOCAL ODDITY. Nine kernels compiled with `gcc -ffixed-<reg>`, registers withdrawn one
+  // at a time on a Xeon E-2236: the correlation between added spills and slowdown is 0.55 over 105
+  // points, with a 30x spread - one kernel takes 23 more spills at ~zero cost while another pays
+  // 2.2% per spill. Same explanation as ours: a spill off the critical path is close to free
+  // because the reorder window covers it and store-to-load forwarding hides the reload.
+  //   https://rjp.io/blog/2026-07-19-register-deprivation
+  //
+  // ⚠️ AND ONE THING WE DO NOT HAVE, WHICH THE CLASSIC FORMULA DOES. Chaitin's spill cost is
+  //     cost(n) = ( rw0(n) + 10*rw1(n) + ... + 10^k*rwk(n) ) / degree(n)
+  // The numerator is exactly the ranking above (8 per level here rather than 10). The DENOMINATOR
+  // is missing: degree(n) is the interference-graph degree - how many other values this one is
+  // actually contending with - which is the "pressure" notion this model lacks, and the literature
+  // has had it for forty years. Untried here, and the single-variable experiment says no static
+  // model predicts fannkuch's sign, so do not expect it to fix that one.
+  //
+  // ⚠️ AND KEEP THE NEGATIVE RESULT NARROW. What is measured is that real trip counts do not
+  // recover FANNKUCH. It is NOT measured that profile data is useless to this allocator in
+  // general - GCC reports frequency-weighted allocation working "considerably better" than the
+  // heuristics, especially on register-starved targets, and seven GPRs is exactly that case.
+  //   https://gcc.gnu.org/news/profiledriven.html
+  //
   // ⭐ And the general lesson, which outlives fannkuch: A SPILL DOES NOT ALWAYS ADD AN INSTRUCTION.
   // Any model that scores a register by how often it is MENTIONED is counting something the emitter
   // does not always charge for.
