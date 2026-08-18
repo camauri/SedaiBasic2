@@ -146,7 +146,7 @@ type
     function FindMatchingNext: Integer;
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
-    procedure ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = '');   // one "Declare ..." line inside a TYPE body
+    procedure ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = ''; ForceAbstract: Boolean = False);   // one "Declare ..." line inside a TYPE body
     function NoDefaultPlaceholder(Tok: TLexerToken): TASTNode;
     procedure SkipTypeQualifiers;
     function SkipTypeQualifiersConst: Boolean;   // ...and report whether CONST was one of them
@@ -260,7 +260,8 @@ type
     // RANDOMIZE [seed] : seed the RNG (the optional seed expression becomes child0).
     function ParseRandomizeStatement: TASTNode;
     // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
-    function ParseRecordDecl(IsUnion: Boolean): TASTNode;
+    function ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
+    function ParseInterfaceDecl: TASTNode;   // MODERN: Interface ... End Interface
     function ParseRecordFieldType: string;
     // Parse a "{ ... }" array initializer group, appending leaf expressions to InitList (row-major).
     // DimSizes (element counts per dimension, empty if not all constant) lets a short nested row/plane be
@@ -1326,7 +1327,14 @@ begin
         // Named label "name:" (FreeBASIC/QB): an identifier immediately followed by
         // ':' defines a GOTO/GOSUB target. (Assignments are "name = ...", calls are
         // "name(...)"/"name arg", so the ':' is unambiguous here.)
-        if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparStmt) then
+        // ⭐ MODERN "Interface name ... End Interface". INTERFACE is not a reserved word (making it
+        // one would break every program that uses it as a variable), so it is matched by spelling
+        // and only in the shape that cannot mean anything else: the word followed by a NAME.
+        if (UpperCase(Token.Value) = 'INTERFACE') and Assigned(Context.PeekNext) and
+           (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+           (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
+          Result := ParseInterfaceDecl
+        else if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparStmt) then
         begin
           Result := TASTNode.CreateWithValue(antLabel, Token.Value, Token);
           Context.Advance;   // consume the identifier
@@ -3097,9 +3105,12 @@ end;
 function TPackratParser.AtEndType: Boolean;
 begin
   // END TYPE / END UNION  (END is ttProgramEnd, TYPE is ttTypeDecl, UNION is ttUnionDecl)
+  // ...and END INTERFACE, which is MODERN's own: INTERFACE is not a reserved word, so it arrives as
+  // a plain identifier and has to be matched by spelling.
   Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
             ((Context.PeekNext.TokenType = ttTypeDecl) or
-             (Context.PeekNext.TokenType = ttUnionDecl));
+             (Context.PeekNext.TokenType = ttUnionDecl) or
+             (UpperCase(VarToStr(Context.PeekNext.Value)) = 'INTERFACE'));
 end;
 
 procedure TPackratParser.ConsumeEndType;
@@ -3373,6 +3384,22 @@ begin
   Result := ParseRecordDecl(True);
 end;
 
+function TPackratParser.ParseInterfaceDecl: TASTNode;
+// ⭐ MODERN ONLY - FreeBASIC has no INTERFACE at all (it reserves IMPLEMENTS and never implemented
+// the other half). Declared as a divergence rather than smuggled in: a source using it does not
+// compile under fbc, and that is the point of having it.
+//
+// It is sugar, not a new kind of entity: an interface IS a TYPE whose every method is implicitly
+// ABSTRACT (no body here) and therefore VIRTUAL. That is what lets it reuse everything built today -
+// the abstract instantiation check refuses a type that leaves one unimplemented, and the type-id
+// dispatcher routes a call made through the interface to the implementor. It carries no fields.
+begin
+  // ParseRecordDecl consumes the leading keyword itself (TYPE / UNION), so INTERFACE is left in place
+  // for it - consuming it here ate the interface's NAME instead.
+  Result := ParseRecordDecl(False, True);
+  if Assigned(Result) then Result.Attributes.Values['ISINTERFACE'] := '1';
+end;
+
 function TPackratParser.ParseRecordFieldType: string;
 var
   FixedCapVal: Int64;   // folded "* n" capacity
@@ -3409,7 +3436,7 @@ begin
   end;
 end;
 
-procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = '');
+procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = ''; ForceAbstract: Boolean = False);
 // One "Declare [Virtual|Abstract|Static|Const] Sub|Function|Property|Operator|Constructor|Destructor
 // name(...) [As ret]" line inside a TYPE body, with DECLARE already consumed. Nothing is emitted: the
 // method is defined out of line. Only the two decorators that change how the DEFINITION reads are
@@ -3422,7 +3449,7 @@ var
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
 begin
-  IsAbstract := False;
+  IsAbstract := ForceAbstract;   // MODERN: every method of an INTERFACE is abstract by construction
   IsStatic := False;
   IsVirtual := False;
   IsOverride := False;
@@ -3565,7 +3592,7 @@ begin
   end;
 end;
 
-function TPackratParser.ParseRecordDecl(IsUnion: Boolean): TASTNode;
+function TPackratParser.ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum: TASTNode;
@@ -3573,6 +3600,7 @@ var
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   IsStaticField, LeadingType, FpIsFP: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
+  ImplList: string;   // MODERN: the IMPLEMENTS list, recorded on the type node
 begin
   CurAccess := '';
   NestedUnionDepth := 0;
@@ -3696,19 +3724,32 @@ begin
     end;
   end;
 
-  // FreeBASIC IMPLEMENTS clause: "TYPE name [EXTENDS base] IMPLEMENTS iface[, iface...]". Interfaces are
-  // a RESERVED-but-UNIMPLEMENTED FreeBASIC feature (the compiler itself does not implement them — the
-  // manual's Implements page is a stub), so we accept and ignore the clause: the type behaves as an
-  // ordinary UDT, matching FB. IMPLEMENTS is not reserved here (it tokenizes as an identifier).
+  // ⭐ MODERN: "TYPE name [EXTENDS base] IMPLEMENTS iface[, iface...]" - a CHECKED contract.
+  //
+  // FreeBASIC reserves IMPLEMENTS and does not implement it (the manual's page is a stub), so the
+  // clause used to be accepted and thrown away: the type behaved as an ordinary UDT. MODERN gives it
+  // a meaning, and DECLARES the divergence rather than hiding it - a type that names an interface
+  // must provide every method of it, and it IS-A that interface for dispatch and for the IS operator.
+  // A source written this way does not compile under fbc, and that is a stated choice, not an
+  // accident. (An fbc source that uses IMPLEMENTS still works here: fbc's own semantics is "no
+  // constraint", and every constraint we add is one such a source already satisfies vacuously,
+  // because fbc has no interfaces to declare in the first place.)
+  //
+  // The names are recorded on the type node as IMPLEMENTS = 'I1,I2'; the SSA resolves them.
   if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'IMPLEMENTS') then
   begin
     Context.Advance;                                // consume IMPLEMENTS
+    ImplList := '';
     repeat
       // consume one (possibly dotted) interface name
       if Context.Check(ttIdentifier) or
          ((Length(VarToStr(Context.CurrentToken.Value)) > 0) and
           (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
-        Context.Advance
+      begin
+        if ImplList <> '' then ImplList := ImplList + ',';
+        ImplList := ImplList + UpperCase(VarToStr(Context.CurrentToken.Value));
+        Context.Advance;
+      end
       else
         Break;
       while Context.Check(ttOpDot) and Assigned(Context.PeekNext) do
@@ -3719,6 +3760,7 @@ begin
       if Context.Check(ttSeparParam) then Context.Advance   // ',' -> another interface
       else Break;
     until False;
+    if ImplList <> '' then Result.Attributes.Values['IMPLEMENTS'] := ImplList;
   end;
 
   while not Context.Check(ttEndOfFile) do
@@ -3776,7 +3818,7 @@ begin
     if TokU = 'DECLARE' then
     begin
       Context.Advance;                              // consume DECLARE
-      ParseInTypeMethodDecl(Result, CurAccess);
+      ParseInTypeMethodDecl(Result, CurAccess, IsInterface);
       Continue;
     end;
     // FreeBASIC lets CONSTRUCTOR / DESTRUCTOR / OPERATOR / PROPERTY be introduced in the TYPE body

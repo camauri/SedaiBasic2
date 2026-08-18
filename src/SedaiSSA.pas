@@ -365,6 +365,8 @@ type
     procedure EmitVarArgClose(const NameU: string);                               // discard them after the call
     procedure EmitCallSubLabel(const LabelName: string);  // ssaCallSub(label) + block split
     // OOP virtual dispatch (M4.3)
+    function ImplementsInterface(const U, T: string): Boolean;             // MODERN: U names T in IMPLEMENTS
+    function IsStrictSubtypeOf(const U, T: string): Boolean;                // the EXTENDS chain alone
     function IsSubtypeOf(const U, T: string): Boolean;
     function MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
     procedure GenerateDispatchers;
@@ -21064,6 +21066,22 @@ begin
     T := FUDTs[Idx].Parent;
     Inc(Guard);
   end;
+  // MODERN: and every method of every interface the type IMPLEMENTS. An interface's methods are
+  // abstract by construction, so the same rule applies - a type that names one and does not provide
+  // its methods is not instantiable, which is the whole content of the contract.
+  for Idx := 0 to High(FUDTs) do
+    if Assigned(FUDTs[Idx].Node) and
+       (FUDTs[Idx].Node.Attributes.Values['ISINTERFACE'] = '1') and
+       ImplementsInterface(TypeName, FUDTs[Idx].Name) then
+      for k := 0 to FUDTs[Idx].Node.Attributes.Count - 1 do
+      begin
+        m := UpperCase(FUDTs[Idx].Node.Attributes.Names[k]);
+        if (Copy(m, 1, 8) = 'ABSTRACT') and (FUDTs[Idx].Node.Attributes.ValueFromIndex[k] = '1') then
+        begin
+          m := Copy(m, 9, MaxInt);
+          if (m <> '') and (ResolveMethodLabel(TypeName, m) = '') then Exit(m);
+        end;
+      end;
 end;
 
 procedure TSSAGenerator.CheckOverrideAnnotations;
@@ -21604,8 +21622,38 @@ begin
   end;
 end;
 
-function TSSAGenerator.IsSubtypeOf(const U, T: string): Boolean;
-// True if U is T or a (transitive) subtype of T.
+function TSSAGenerator.ImplementsInterface(const U, T: string): Boolean;
+// MODERN: does U (or any of its ancestors) name T in an IMPLEMENTS clause? An interface implemented
+// by a base is implemented by every descendant, which is why this walks the chain.
+var
+  cur, tu, list: string;
+  idx, guard, p: Integer;
+begin
+  Result := False;
+  cur := UpperCase(U); tu := UpperCase(T);
+  guard := 0;
+  while (cur <> '') and (guard < 64) do
+  begin
+    idx := FindUDT(cur);
+    if idx < 0 then Break;
+    if Assigned(FUDTs[idx].Node) then
+    begin
+      list := UpperCase(FUDTs[idx].Node.Attributes.Values['IMPLEMENTS']);
+      while list <> '' do
+      begin
+        p := Pos(',', list);
+        if p = 0 then begin if Trim(list) = tu then Exit(True); Break; end;
+        if Trim(Copy(list, 1, p - 1)) = tu then Exit(True);
+        list := Copy(list, p + 1, MaxInt);
+      end;
+    end;
+    cur := FUDTs[idx].Parent;
+    Inc(guard);
+  end;
+end;
+
+function TSSAGenerator.IsStrictSubtypeOf(const U, T: string): Boolean;
+// The EXTENDS chain alone, with no interface arm.
 var
   cur, tu: string;
   idx, guard: Integer;
@@ -21621,6 +21669,20 @@ begin
     cur := FUDTs[idx].Parent;
     Inc(guard);
   end;
+end;
+
+function TSSAGenerator.IsSubtypeOf(const U, T: string): Boolean;
+// True if U is T, a (transitive) subtype of T - or, in MODERN, a type that IMPLEMENTS T.
+//
+// ⭐ The interface arm is why IMPLEMENTS needs almost no machinery of its own. Everything that asks
+// "is this type a T?" comes through here: the virtual dispatcher enumerating the concrete types it
+// must test, the IS operator, the abstract-implementation check. Teaching this ONE predicate about
+// interfaces gives all three at once, and a call made through an interface-typed handle dispatches
+// by the same type-id test as any other call.
+begin
+  if UpperCase(U) = UpperCase(T) then Exit(True);
+  if IsStrictSubtypeOf(U, T) then Exit(True);
+  Result := ImplementsInterface(U, T);
 end;
 
 function TSSAGenerator.MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
