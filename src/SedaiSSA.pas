@@ -386,6 +386,7 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
+    function MethodIsVirtual(const TypeName, MethNm: string): Boolean;      // OOP: "Declare Virtual ..." (Abstract implies it)
     function DeclaresAbstractMethod(const TypeName, MethNm: string): Boolean;  // OOP: "Declare Abstract ..."
     function AnyOverrideLabel(const TypeName, MethNm: string): string;    // ...some concrete override of it
     function HasCallableMethod(const TypeName, MethNm: string; ArgsNode: TASTNode): Boolean;
@@ -20959,6 +20960,36 @@ begin
   end;
 end;
 
+function TSSAGenerator.MethodIsVirtual(const TypeName, MethNm: string): Boolean;
+// ⭐ FreeBASIC dispatches ONLY on a method declared Virtual (Abstract implies it). A method without
+// the word is not overridable: a redeclaration in a child SHADOWS it, and the call resolves on the
+// STATIC type of the expression. We used to dispatch on everything, which is Java semantics and a
+// silent divergence - measured against fbc 1.10.1, through a base-typed pointer fbc runs Root.F and
+// we ran Child.F on the same source. (On a variable of the exact type the two dialects agree, which
+// is why this stayed invisible: it bites only where the static type differs from the dynamic one.)
+//
+// Virtualness is INHERITED and it is a property of the whole chain, not of one level: the word sits
+// on the base declaration, an override may repeat it or not. So walk up from TypeName exactly as
+// DeclaresAbstractMethod does, and answer yes if ANY level declares it Virtual or Abstract.
+var
+  T, m: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  T := UpperCase(TypeName);
+  m := UpperCase(MethNm);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    if Assigned(FUDTs[Idx].Node) and
+       (FUDTs[Idx].Node.Attributes.Values['VIRTUAL' + m] = '1') then Exit(True);
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
 function TSSAGenerator.DeclaresAbstractMethod(const TypeName, MethNm: string): Boolean;
 // FreeBASIC "Declare Abstract Function f() As T": the type declares f but gives it NO body — every
 // concrete subtype must override it. The declaration is recorded on the antTypeDecl by the parser
@@ -21396,6 +21427,11 @@ var
   i: Integer;
 begin
   Result := False;
+  // ⭐ FIRST QUESTION, AND IT USED NOT TO BE ASKED: is the method VIRTUAL at all? Without the word
+  // FreeBASIC does not dispatch - the child's redeclaration shadows and the call resolves on the
+  // static type, which ResolveMethodLabel below already does by walking up from TypeName. Answering
+  // "no" here IS the shadowing.
+  if not MethodIsVirtual(TypeName, MethNm) then Exit(False);
   baseLbl := ResolveMethodLabel(TypeName, MethNm);
   // No body anywhere up the chain, but the type DECLARES the method abstract: the call is polymorphic
   // by construction — the only bodies that exist are the overrides. Without this the call resolved to
@@ -22821,6 +22857,7 @@ var
   u: Integer;
 begin
   if TypeName = '' then Exit;
+  if GetEnvironmentVariable('OOP_DYNTYPE') = '0' then Exit;   // see EmitSetDynamicType
   u := FindUDT(TypeName);
   if u < 0 then Exit;
   EmitInstruction(ssaRecordSetTypeId, MakeSSAValue(svkNone), HandleVal,
@@ -22834,10 +22871,17 @@ procedure TSSAGenerator.EmitSetDynamicType(const TypeName: string);
 // already built) and of every destructor body (before it runs, so the base's own entry can move it
 // back down). Between them they make the dynamic type follow construction and destruction the way
 // C++ and FreeBASIC do, which is what decides where a virtual call made from there dispatches.
+//
+// ⛔ OOP_DYNTYPE=0 EMITS NOTHING, which restores the old (wrong) behaviour on purpose. It is the
+// injection that proves the guardians still SEE this: with it set, oop_vcall_ctor/dtor/chain must
+// change. They went blind once already - when MODERN stopped dispatching without `Virtual`, they
+// kept printing the right answer by static resolution alone - and that is why the switch is
+// permanent rather than a thing that existed for one afternoon.
 var
   u: Integer;
 begin
   if TypeName = '' then Exit;
+  if GetEnvironmentVariable('OOP_DYNTYPE') = '0' then Exit;
   u := FindUDT(TypeName);
   if u < 0 then Exit;
   EmitInstruction(ssaRecordSetTypeId, MakeSSAValue(svkNone), GetOrAllocateVariable('THIS'),

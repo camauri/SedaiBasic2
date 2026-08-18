@@ -3418,19 +3418,30 @@ procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode);
 //   FTypeStaticMethods "TYPE.NAME"    -> NAME is a static member (no implicit THIS).
 var
   DecoU, MethName, Key: string;
-  IsAbstract, IsStatic: Boolean;
+  IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
 begin
   IsAbstract := False;
   IsStatic := False;
+  IsVirtual := False;
+  IsOverride := False;
+  IsFinal := False;
   // Decorators sit between DECLARE and the SUB/FUNCTION/... keyword and arrive as plain identifiers.
   while Context.Check(ttIdentifier) do
   begin
     DecoU := UpperCase(VarToStr(Context.CurrentToken.Value));
     if DecoU = 'ABSTRACT' then IsAbstract := True
     else if DecoU = 'STATIC' then IsStatic := True
-    else if (DecoU <> 'VIRTUAL') and (DecoU <> 'CONST') and (DecoU <> 'OVERRIDE') then Break;
+    // ⭐ VIRTUAL was read and thrown away, and that is what made every method virtual by default -
+    // a SILENT divergence from FreeBASIC, where a method without it is not overridable and a
+    // redeclaration in a child SHADOWS instead. Measured against fbc 1.10.1: through a base-typed
+    // pointer fbc runs Root.F and we ran Child.F, on the same source.
+    else if DecoU = 'VIRTUAL' then IsVirtual := True
+    // OVERRIDE and FINAL are MODERN extensions - fbc has neither. Recorded here, checked in the SSA.
+    else if DecoU = 'OVERRIDE' then IsOverride := True
+    else if DecoU = 'FINAL' then IsFinal := True
+    else if DecoU <> 'CONST' then Break;
     Context.Advance;
   end;
   MethName := '';
@@ -3458,6 +3469,15 @@ begin
   begin
     if IsAbstract and Assigned(TypeNode) then
       TypeNode.Attributes.Values['ABSTRACT' + MethName] := '1';
+    // ABSTRACT implies VIRTUAL: the only implementations an abstract method can ever have are the
+    // overrides, so a call on it must dispatch. fbc requires the word on the base declaration only;
+    // an override may repeat it or not, and either way the method stays virtual from there down.
+    if (IsVirtual or IsAbstract) and Assigned(TypeNode) then
+      TypeNode.Attributes.Values['VIRTUAL' + MethName] := '1';
+    if IsOverride and Assigned(TypeNode) then
+      TypeNode.Attributes.Values['OVERRIDE' + MethName] := '1';
+    if IsFinal and Assigned(TypeNode) then
+      TypeNode.Attributes.Values['FINAL' + MethName] := '1';
     if IsStatic and Assigned(TypeNode) then
       FTypeStaticMethods.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
   end;
