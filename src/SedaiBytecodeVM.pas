@@ -8310,115 +8310,115 @@ begin
         Ctx.PC := Instr.Immediate - 1;
 
     // Fused compare-and-branch (Float) - sub-opcodes 10-15
-    10: // bcBranchEqFloat
+    6: // bcBranchEqFloat
       if Ctx.FloatRegs[Instr.Src1] = Ctx.FloatRegs[Instr.Src2] then
         Ctx.PC := Instr.Immediate - 1;
-    11: // bcBranchNeFloat
+    7: // bcBranchNeFloat
       if Ctx.FloatRegs[Instr.Src1] <> Ctx.FloatRegs[Instr.Src2] then
         Ctx.PC := Instr.Immediate - 1;
-    12: // bcBranchLtFloat
+    8: // bcBranchLtFloat
       if Ctx.FloatRegs[Instr.Src1] < Ctx.FloatRegs[Instr.Src2] then
         Ctx.PC := Instr.Immediate - 1;
-    13: // bcBranchGtFloat
+    9: // bcBranchGtFloat
       if Ctx.FloatRegs[Instr.Src1] > Ctx.FloatRegs[Instr.Src2] then
         Ctx.PC := Instr.Immediate - 1;
-    14: // bcBranchLeFloat
+    10: // bcBranchLeFloat
       if Ctx.FloatRegs[Instr.Src1] <= Ctx.FloatRegs[Instr.Src2] then
         Ctx.PC := Instr.Immediate - 1;
-    15: // bcBranchGeFloat
+    11: // bcBranchGeFloat
       if Ctx.FloatRegs[Instr.Src1] >= Ctx.FloatRegs[Instr.Src2] then
         Ctx.PC := Instr.Immediate - 1;
 
     // Fused arithmetic-to-dest (Int) - sub-opcodes 20-22
-    20: // bcAddIntTo: r[dest] += r[src1]
+    12: // bcAddIntTo: r[dest] += r[src1]
       Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Dest] + Ctx.IntRegs[Instr.Src1];
-    21: // bcSubIntTo: r[dest] -= r[src1]
+    13: // bcSubIntTo: r[dest] -= r[src1]
       Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Dest] - Ctx.IntRegs[Instr.Src1];
-    22: // bcMulIntTo: r[dest] *= r[src1]
+    14: // bcMulIntTo: r[dest] *= r[src1]
       Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Dest] * Ctx.IntRegs[Instr.Src1];
 
     // Fused arithmetic-to-dest (Float) - sub-opcodes 30-33
-    30: // bcAddFloatTo: r[dest] += r[src1]
+    15: // bcAddFloatTo: r[dest] += r[src1]
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] + Ctx.FloatRegs[Instr.Src1];
-    31: // bcSubFloatTo: r[dest] -= r[src1]
+    16: // bcSubFloatTo: r[dest] -= r[src1]
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] - Ctx.FloatRegs[Instr.Src1];
-    32: // bcMulFloatTo: r[dest] *= r[src1]
+    17: // bcMulFloatTo: r[dest] *= r[src1]
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] * Ctx.FloatRegs[Instr.Src1];
-    33: // bcDivFloatTo: r[dest] /= r[src1]
+    18: // bcDivFloatTo: r[dest] /= r[src1]
       if Ctx.FloatRegs[Instr.Src1] <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] / Ctx.FloatRegs[Instr.Src1]
       else
         Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Dest], Ctx.FloatRegs[Instr.Src1]);
 
     // Fused constant arithmetic (Int) - sub-opcodes 40-42
-    40: // bcAddIntConst: r[dest] = r[src1] + immediate
+    19: // bcAddIntConst: r[dest] = r[src1] + immediate
       Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] + Instr.Immediate;
-    41: // bcSubIntConst: r[dest] = r[src1] - immediate
+    20: // bcSubIntConst: r[dest] = r[src1] - immediate
       Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] - Instr.Immediate;
-    42: // bcMulIntConst: r[dest] = r[src1] * immediate
+    21: // bcMulIntConst: r[dest] = r[src1] * immediate
       Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] * Instr.Immediate;
 
     // Fused constant arithmetic (Float) - sub-opcodes 50-53
-    50: // bcAddFloatConst
+    22: // bcAddFloatConst
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^);
-    51: // bcSubFloatConst
+    23: // bcSubFloatConst
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^);
-    52: // bcMulFloatConst
+    24: // bcMulFloatConst
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^);
-    53: // bcDivFloatConst
+    25: // bcDivFloatConst
       if Double(Pointer(@Instr.Immediate)^) <> 0.0 then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^)
       else
         Ctx.FloatRegs[Instr.Dest] := DivZeroFloat(Ctx.FloatRegs[Instr.Src1], Double(Pointer(@Instr.Immediate)^));
 
     // Fused compare-zero-and-branch (Int) - sub-opcodes 60-61
-    60: // bcBranchEqZeroInt
+    26: // bcBranchEqZeroInt
       if Ctx.IntRegs[Instr.Src1] = 0 then
         Ctx.PC := Instr.Immediate - 1;
-    61: // bcBranchNeZeroInt
+    27: // bcBranchNeZeroInt
       if Ctx.IntRegs[Instr.Src1] <> 0 then
         Ctx.PC := Instr.Immediate - 1;
 
     // Fused compare-zero-and-branch (Float) - sub-opcodes 70-71
-    70: // bcBranchEqZeroFloat
+    28: // bcBranchEqZeroFloat
       if Ctx.FloatRegs[Instr.Src1] = 0.0 then
         Ctx.PC := Instr.Immediate - 1;
-    71: // bcBranchNeZeroFloat
+    29: // bcBranchNeZeroFloat
       if Ctx.FloatRegs[Instr.Src1] <> 0.0 then
         Ctx.PC := Instr.Immediate - 1;
 
     // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded to match the base ExecuteArrayOp
     // store path: MODERN drops an out-of-bounds store (memory-safe), CLASSIC/--bounds-check raises.
-    80: // bcArrayStoreIntConst
+    30: // bcArrayStoreIntConst
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
         FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] := Instr.Immediate;
-    81: // bcArrayStoreFloatConst
+    31: // bcArrayStoreFloatConst
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
         FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
-    82: // bcArrayStoreStringConst
+    32: // bcArrayStoreStringConst
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
         FArrays[Instr.Src1].StringData[Ctx.IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate];
 
     // Fused loop increment-and-branch (Int) - sub-opcodes 90-93
-    90: // bcAddIntToBranchLe: r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
+    33: // bcAddIntToBranchLe: r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
       begin
         Inc(Ctx.IntRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1]);
         if Ctx.IntRegs[Instr.Dest] <= Ctx.IntRegs[Instr.Src2] then
           Ctx.PC := Instr.Immediate - 1;
       end;
-    91: // bcAddIntToBranchLt: r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
+    34: // bcAddIntToBranchLt: r[dest] += r[src1]; if (r[dest] < r[src2]) goto target
       begin
         Inc(Ctx.IntRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1]);
         if Ctx.IntRegs[Instr.Dest] < Ctx.IntRegs[Instr.Src2] then
           Ctx.PC := Instr.Immediate - 1;
       end;
-    92: // bcSubIntToBranchGe: r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
+    35: // bcSubIntToBranchGe: r[dest] -= r[src1]; if (r[dest] >= r[src2]) goto target
       begin
         Dec(Ctx.IntRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1]);
         if Ctx.IntRegs[Instr.Dest] >= Ctx.IntRegs[Instr.Src2] then
           Ctx.PC := Instr.Immediate - 1;
       end;
-    93: // bcSubIntToBranchGt: r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
+    36: // bcSubIntToBranchGt: r[dest] -= r[src1]; if (r[dest] > r[src2]) goto target
       begin
         Dec(Ctx.IntRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1]);
         if Ctx.IntRegs[Instr.Dest] > Ctx.IntRegs[Instr.Src2] then
@@ -8426,28 +8426,28 @@ begin
       end;
 
     // FMA (Fused Multiply-Add) - sub-opcodes 100-103
-    100: // bcMulAddFloat: dest = c + a*b
+    37: // bcMulAddFloat: dest = c + a*b
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] + Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src2];
-    101: // bcMulSubFloat: dest = c - a*b
+    38: // bcMulSubFloat: dest = c - a*b
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] - Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src2];
-    102: // bcMulAddToFloat: dest += a*b
+    39: // bcMulAddToFloat: dest += a*b
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] + Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src2];
-    103: // bcMulSubToFloat: dest -= a*b
+    40: // bcMulSubToFloat: dest -= a*b
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Dest] - Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src2];
 
     // Array Load + Arithmetic - sub-opcodes 110-112. Bounds-guarded: an out-of-bounds read yields the
     // element default (0.0) in MODERN, matching the base ExecuteArrayOp load path; CLASSIC raises.
-    110: // bcArrayLoadAddFloat: dest = acc + arr[idx]
+    41: // bcArrayLoadAddFloat: dest = acc + arr[idx]
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] + FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]]
       else
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate];
-    111: // bcArrayLoadSubFloat: dest = acc - arr[idx]
+    42: // bcArrayLoadSubFloat: dest = acc - arr[idx]
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]]
       else
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate];
-    112: // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
+    43: // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
       begin
         if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
           ElemVal := FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]]
@@ -8462,27 +8462,27 @@ begin
       end;
 
     // Square-Sum patterns - sub-opcodes 120-121
-    120: // bcSquareSumFloat: dest = x*x + y*y
+    44: // bcSquareSumFloat: dest = x*x + y*y
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src1] +
                                 Ctx.FloatRegs[Instr.Src2] * Ctx.FloatRegs[Instr.Src2];
-    121: // bcAddSquareFloat: dest = sum + x*x
+    45: // bcAddSquareFloat: dest = sum + x*x
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] + Ctx.FloatRegs[Instr.Src2] * Ctx.FloatRegs[Instr.Src2];
 
     // Mul-Mul and Add-Sqrt - sub-opcodes 130-131
-    130: // bcMulMulFloat: dest = a*b*c
+    46: // bcMulMulFloat: dest = a*b*c
       Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Src1] * Ctx.FloatRegs[Instr.Src2] * Ctx.FloatRegs[Instr.Immediate];
-    131: // bcAddSqrtFloat: dest = sqrt(a+b)
+    47: // bcAddSqrtFloat: dest = sqrt(a+b)
       Ctx.FloatRegs[Instr.Dest] := SqrtFloat(Ctx.FloatRegs[Instr.Src1] + Ctx.FloatRegs[Instr.Src2]);
 
     // Array Load + Branch - sub-opcodes 140-141. Bounds-guarded: an out-of-bounds read is treated as the
     // element default 0 in MODERN (matching the base load path) — NZ does not branch, Z branches; CLASSIC raises.
-    140: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
+    48: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
       begin
         if FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] <> 0 then
           Ctx.PC := Instr.Immediate - 1;
       end;
-    141: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
+    49: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
       begin
         if FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] = 0 then
@@ -8492,7 +8492,7 @@ begin
         Ctx.PC := Instr.Immediate - 1;   // OOB read = 0 -> zero-branch taken
 
     // Array Reverse Range - sub-opcode 156
-    156: // bcArrayReverseRange: reverse arr[start..end-1] in-place
+    50: // bcArrayReverseRange: reverse arr[start..end-1] in-place
       begin
         Ctx.StartIdx := Ctx.IntRegs[Instr.Src2];
         Ctx.EndIdx := Ctx.IntRegs[Instr.Dest] - 1;
@@ -8512,7 +8512,7 @@ begin
       end;
 
     // Array Shift Left - sub-opcode 157
-    157: // bcArrayShiftLeft: shift left and rotate first to end+1
+    51: // bcArrayShiftLeft: shift left and rotate first to end+1
       begin
         Ctx.StartIdx := Ctx.IntRegs[Instr.Src2];
         Ctx.EndIdx := Ctx.IntRegs[Instr.Dest];
@@ -8532,7 +8532,7 @@ begin
       end;
 
     // "acc + MID$(tab, k, 1)" fused - sub-opcode 158.
-    158: // bcStrConcatCharAt: Dest := Src1 + tab[k], with no one-character string ever built.
+    52: // bcStrConcatCharAt: Dest := Src1 + tab[k], with no one-character string ever built.
       begin
         // Which byte (if any) MID$(tab, k, 1) would yield. Every branch mirrors bcStrMid's, in the
         // same order and with the same dialect rules - the two must not drift apart. The length is
@@ -8578,7 +8578,7 @@ begin
       end;
 
     // "acc += tab[Asc(MID$(s, i, 1)) + 1]" fused whole - sub-opcode 159.
-    159: // bcStrAppendMapped: Dest += Src2[Ord(Src1[Immediate]) + 1]
+    53: // bcStrAppendMapped: Dest += Src2[Ord(Src1[Immediate]) + 1]
       begin
         // The three steps this replaces, in the same order and with the same dialect rules as the
         // opcodes it fuses: bcStrAscMid, then the +1, then bcStrConcatCharAt.
@@ -8611,7 +8611,7 @@ begin
       end;
 
     // "MID$(t, start [, len]) = src" - sub-opcode 160.
-    160: // bcStrMidAssign: overwrite Length(Src2) bytes of Dest starting at Immediate, IN PLACE
+    54: // bcStrMidAssign: overwrite Length(Src2) bytes of Dest starting at Immediate, IN PLACE
       begin
         // The FreeBASIC MID STATEMENT never changes Len(t): it overwrites at most what fits. So for a
         // start INSIDE the string this is a bounded Move into t's own buffer, and the old lowering --
@@ -8656,7 +8656,7 @@ begin
       end;
 
     // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip the swap if either index is out of range (MODERN); CLASSIC raises.
-    250: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
+    55: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) and
          ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Dest]) then
       begin
@@ -8666,20 +8666,20 @@ begin
       end;
 
     // Self-increment/decrement (Int) - sub-opcodes 251-252
-    251: // bcAddIntSelf: r[dest] += r[src1]
+    56: // bcAddIntSelf: r[dest] += r[src1]
       Inc(Ctx.IntRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1]);
-    252: // bcSubIntSelf: r[dest] -= r[src1]
+    57: // bcSubIntSelf: r[dest] -= r[src1]
       Dec(Ctx.IntRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1]);
 
     // Array Load to register (Int) - sub-opcode 253. Bounds-guarded: OOB read yields default 0 (MODERN); CLASSIC raises.
-    253: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
+    58: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
       if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
         Ctx.IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]]
       else
         Ctx.IntRegs[Instr.Dest] := 0;
 
     // Array Copy Element - sub-opcode 254. Bounds-guarded: OOB store dropped, OOB source reads default 0 (MODERN); CLASSIC raises.
-    254: // bcArrayCopyElement: arr_dest[idx] = arr_src[idx]
+    59: // bcArrayCopyElement: arr_dest[idx] = arr_src[idx]
       if ArrayBoundsOK(Instr.Dest, Ctx.IntRegs[Instr.Src2]) then
       begin
         if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
@@ -8689,7 +8689,7 @@ begin
       end;
 
     // Array Move Element - sub-opcode 255. Bounds-guarded like 254.
-    255: // bcArrayMoveElement: arr[dest_idx] = arr[src_idx]
+    60: // bcArrayMoveElement: arr[dest_idx] = arr[src_idx]
       if ArrayBoundsOK(Instr.Dest, Ctx.IntRegs[Instr.Src2]) then
       begin
         if ArrayBoundsOK(Instr.Dest, Ctx.IntRegs[Instr.Src1]) then

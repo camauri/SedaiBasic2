@@ -72,7 +72,7 @@
 // Kept from the attempt: the two genuine miscompiles fixed in TryFuseConstantArithmetic, and the
 // SUPERINSTR=0 / SUPERMASK=<n,...> switches that found them.
 // See job/docs/VM_DISPATCH_E_RIDIMENSIONABILITA.md and the JIT design doc.
-{$DEFINE DISABLE_SUPERINSTRUCTIONS}
+{.$DEFINE DISABLE_SUPERINSTRUCTIONS}
 {$DEFINE DISABLE_ARRAYSTORECONST}
 
 // Individual optimization flags (controlled by master switch)

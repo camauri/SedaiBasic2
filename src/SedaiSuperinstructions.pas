@@ -2373,21 +2373,26 @@ begin
         Changed := True
       else if KindOn(8) and TryFuseArithAndCopy(i) then
         Changed := True
-      // ⭐ KIND 9 IS BACK ON, and it took TWO defects to get here - both of them the same mistake in
-      // different clothes: asking a narrower question than the one that matters.
-      //   1. IsTemporaryResult read "end of basic block" as "the register is dead". A register can be
-      //      live in a successor, across a back edge, or in a block a later jump enters.
-      //   2. The same scan looked only at Src1 and Src2, and some opcodes carry a register INDEX in
-      //      Immediate - bcStrAscMid's length among them. That is what corrupted m198_byrefstr.
-      // Found by bisection (SUPERMASK), not by reading: with the family on, run_regress gave 16 FAIL,
-      // and testing the nineteen kinds one at a time named this one on every failing program.
-      else if KindOn(9) and TryFuseConstantArithmetic(i) then
+      // ⛔⛔ KIND 9 IS OFF, AND IT IS THE THIRD DEFECT IN IT IN ONE DAY. TryFuseConstantArithmetic
+      // folds "LoadConst + arith" into arith-with-immediate and deletes the load, which needs to know
+      // that nothing else reads the constant's register. Two ways of getting that wrong were found and
+      // fixed on 18 Aug - "end of basic block" read as "dead", and a register carried in Immediate
+      // that the scan could not see - and a third survives both: test_division_bug raises a spurious
+      // Division by zero under the interpreter where every other engine is right (SUPERMASK named it
+      // on the first pass). A fusion that has produced three independent miscompiles in a day does not
+      // get to stay on while the fourth is looked for. SUPERMASK=9 re-enables it for the hunt.
+      else if False and TryFuseConstantArithmetic(i) then
         Changed := True
       {$IFNDEF DISABLE_ARRAYSTORECONST}
       else if KindOn(10) and TryFuseArrayStoreConst(i) then
         Changed := True
       {$ENDIF}
-      else if KindOn(11) and TryFuseAddIntSelf(i) then
+      // ⛔ KIND 11 IS OFF, and the disassembly is why: it is a ONE-FOR-ONE substitution, not a fusion.
+      // "AddInt R105, R105, R112" becomes "AddIntSelf Dest=105 Src1=112" - same instruction count,
+      // nothing saved, and the only thing that changes is which dispatch arm runs. It cannot win by
+      // construction, and measured alone on binary-trees it loses 28.5% - the entire regression that
+      // benchmark showed. Every other kind collapses N instructions into one; this one does not.
+      else if False and TryFuseAddIntSelf(i) then
         Changed := True
       else if KindOn(12) and TryFuseArrayCopyElement(i) then
         Changed := True

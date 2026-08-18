@@ -855,74 +855,74 @@ const
   bcBranchLeInt     = bcGroupSuper + 4;
   bcBranchGeInt     = bcGroupSuper + 5;
   // Fused compare-and-branch (Float)
-  bcBranchEqFloat   = bcGroupSuper + 10;
-  bcBranchNeFloat   = bcGroupSuper + 11;
-  bcBranchLtFloat   = bcGroupSuper + 12;
-  bcBranchGtFloat   = bcGroupSuper + 13;
-  bcBranchLeFloat   = bcGroupSuper + 14;
-  bcBranchGeFloat   = bcGroupSuper + 15;
+  bcBranchEqFloat   = bcGroupSuper + 6;
+  bcBranchNeFloat   = bcGroupSuper + 7;
+  bcBranchLtFloat   = bcGroupSuper + 8;
+  bcBranchGtFloat   = bcGroupSuper + 9;
+  bcBranchLeFloat   = bcGroupSuper + 10;
+  bcBranchGeFloat   = bcGroupSuper + 11;
   // Fused arithmetic-to-dest (Int)
-  bcAddIntTo        = bcGroupSuper + 20;
-  bcSubIntTo        = bcGroupSuper + 21;
-  bcMulIntTo        = bcGroupSuper + 22;
+  bcAddIntTo        = bcGroupSuper + 12;
+  bcSubIntTo        = bcGroupSuper + 13;
+  bcMulIntTo        = bcGroupSuper + 14;
   // Fused arithmetic-to-dest (Float)
-  bcAddFloatTo      = bcGroupSuper + 30;
-  bcSubFloatTo      = bcGroupSuper + 31;
-  bcMulFloatTo      = bcGroupSuper + 32;
-  bcDivFloatTo      = bcGroupSuper + 33;
+  bcAddFloatTo      = bcGroupSuper + 15;
+  bcSubFloatTo      = bcGroupSuper + 16;
+  bcMulFloatTo      = bcGroupSuper + 17;
+  bcDivFloatTo      = bcGroupSuper + 18;
   // Fused constant arithmetic (Int)
-  bcAddIntConst     = bcGroupSuper + 40;
-  bcSubIntConst     = bcGroupSuper + 41;
-  bcMulIntConst     = bcGroupSuper + 42;
+  bcAddIntConst     = bcGroupSuper + 19;
+  bcSubIntConst     = bcGroupSuper + 20;
+  bcMulIntConst     = bcGroupSuper + 21;
   // Fused constant arithmetic (Float)
-  bcAddFloatConst   = bcGroupSuper + 50;
-  bcSubFloatConst   = bcGroupSuper + 51;
-  bcMulFloatConst   = bcGroupSuper + 52;
-  bcDivFloatConst   = bcGroupSuper + 53;
+  bcAddFloatConst   = bcGroupSuper + 22;
+  bcSubFloatConst   = bcGroupSuper + 23;
+  bcMulFloatConst   = bcGroupSuper + 24;
+  bcDivFloatConst   = bcGroupSuper + 25;
   // Fused compare-zero-and-branch
-  bcBranchEqZeroInt = bcGroupSuper + 60;
-  bcBranchNeZeroInt = bcGroupSuper + 61;
-  bcBranchEqZeroFloat = bcGroupSuper + 70;
-  bcBranchNeZeroFloat = bcGroupSuper + 71;
+  bcBranchEqZeroInt = bcGroupSuper + 26;
+  bcBranchNeZeroInt = bcGroupSuper + 27;
+  bcBranchEqZeroFloat = bcGroupSuper + 28;
+  bcBranchNeZeroFloat = bcGroupSuper + 29;
   // Fused array-store-constant
-  bcArrayStoreIntConst   = bcGroupSuper + 80;
-  bcArrayStoreFloatConst = bcGroupSuper + 81;
-  bcArrayStoreStringConst = bcGroupSuper + 82;
+  bcArrayStoreIntConst   = bcGroupSuper + 30;
+  bcArrayStoreFloatConst = bcGroupSuper + 31;
+  bcArrayStoreStringConst = bcGroupSuper + 32;
 
   // Fused loop increment-and-branch (Int)
-  bcAddIntToBranchLe = bcGroupSuper + 90;
-  bcAddIntToBranchLt = bcGroupSuper + 91;
-  bcSubIntToBranchGe = bcGroupSuper + 92;
-  bcSubIntToBranchGt = bcGroupSuper + 93;
+  bcAddIntToBranchLe = bcGroupSuper + 33;
+  bcAddIntToBranchLt = bcGroupSuper + 34;
+  bcSubIntToBranchGe = bcGroupSuper + 35;
+  bcSubIntToBranchGt = bcGroupSuper + 36;
 
   // Fused Multiply-Add/Sub (FMA)
-  bcMulAddFloat    = bcGroupSuper + 100;
-  bcMulSubFloat    = bcGroupSuper + 101;
-  bcMulAddToFloat  = bcGroupSuper + 102;
-  bcMulSubToFloat  = bcGroupSuper + 103;
+  bcMulAddFloat    = bcGroupSuper + 37;
+  bcMulSubFloat    = bcGroupSuper + 38;
+  bcMulAddToFloat  = bcGroupSuper + 39;
+  bcMulSubToFloat  = bcGroupSuper + 40;
 
   // Array Load + Arithmetic
-  bcArrayLoadAddFloat    = bcGroupSuper + 110;
-  bcArrayLoadSubFloat    = bcGroupSuper + 111;
-  bcArrayLoadDivAddFloat = bcGroupSuper + 112;
+  bcArrayLoadAddFloat    = bcGroupSuper + 41;
+  bcArrayLoadSubFloat    = bcGroupSuper + 42;
+  bcArrayLoadDivAddFloat = bcGroupSuper + 43;
 
   // Square-Sum pattern
-  bcSquareSumFloat = bcGroupSuper + 120;
-  bcAddSquareFloat = bcGroupSuper + 121;
+  bcSquareSumFloat = bcGroupSuper + 44;
+  bcAddSquareFloat = bcGroupSuper + 45;
 
   // Mul-Mul chain
-  bcMulMulFloat = bcGroupSuper + 130;
+  bcMulMulFloat = bcGroupSuper + 46;
 
   // Add-Sqrt
-  bcAddSqrtFloat = bcGroupSuper + 131;
+  bcAddSqrtFloat = bcGroupSuper + 47;
 
   // Array Load + Branch
-  bcArrayLoadIntBranchNZ = bcGroupSuper + 140;
-  bcArrayLoadIntBranchZ  = bcGroupSuper + 141;
+  bcArrayLoadIntBranchNZ = bcGroupSuper + 48;
+  bcArrayLoadIntBranchZ  = bcGroupSuper + 49;
 
   // Additional superinstructions (sub-opcodes 150-158, 250-255)
-  bcArrayReverseRange = bcGroupSuper + 156;
-  bcArrayShiftLeft    = bcGroupSuper + 157;
+  bcArrayReverseRange = bcGroupSuper + 50;
+  bcArrayShiftLeft    = bcGroupSuper + 51;
   // "acc + MID$(tab, k, 1)" fused: Dest = Src1 + the single byte tab[k], with no one-character
   // string ever built. Dest=string, Src1=string (the accumulator), Src2=string (the table),
   // Immediate=int register holding the 1-based index. When Dest and Src1 are the same register
@@ -931,7 +931,7 @@ const
   // It lives in the superinstruction group deliberately: it IS a fusion of two opcodes, and the
   // group already owns 256 dense slots, so filling a hole here moves no DENSE_*_BASE. Adding a
   // sub-opcode to the string group instead would shift every base after it.
-  bcStrConcatCharAt   = bcGroupSuper + 158;
+  bcStrConcatCharAt   = bcGroupSuper + 52;
   // "acc += tab[Asc(MID$(s, i, 1)) + 1]" fused whole: take the byte of s at i, use its code as a
   // 1-based index into tab, append that byte to the accumulator. One instruction for what the
   // reverse-complement inner loop spells as three (bcStrAscMid, an AddInt, bcStrConcatCharAt) -
@@ -940,17 +940,17 @@ const
   // Src2=string table, Immediate=int register holding the 1-based index into Src1.
   // Same group and same reason as the opcode above: a hole in the superinstruction block moves no
   // DENSE_*_BASE.
-  bcStrAppendMapped   = bcGroupSuper + 159;
+  bcStrAppendMapped   = bcGroupSuper + 53;
   // "MID$(t, start [, len]) = src": overwrite t IN PLACE. Dest=string (t out), Src1=string (t in),
   // Src2=string (the replacement, already capped to len), Immediate=int register holding start.
   // Same group and same reason as the two above: a hole here moves no DENSE_*_BASE.
-  bcStrMidAssign      = bcGroupSuper + 160;
-  bcArraySwapInt      = bcGroupSuper + 250;
-  bcAddIntSelf        = bcGroupSuper + 251;
-  bcSubIntSelf        = bcGroupSuper + 252;
-  bcArrayLoadIntTo    = bcGroupSuper + 253;  // ArrayLoadIntToReg
-  bcArrayCopyElement  = bcGroupSuper + 254;  // ArrayCopyInt
-  bcArrayMoveElement  = bcGroupSuper + 255;  // ArrayCopyIntSwap
+  bcStrMidAssign      = bcGroupSuper + 54;
+  bcArraySwapInt      = bcGroupSuper + 55;
+  bcAddIntSelf        = bcGroupSuper + 56;
+  bcSubIntSelf        = bcGroupSuper + 57;
+  bcArrayLoadIntTo    = bcGroupSuper + 58;  // ArrayLoadIntToReg
+  bcArrayCopyElement  = bcGroupSuper + 59;  // ArrayCopyInt
+  bcArrayMoveElement  = bcGroupSuper + 60;  // ArrayCopyIntSwap
 
   // Helper function to extract group from opcode
   function GetOpcodeGroup(Op: TBytecodeOp): Word; inline;
@@ -2325,60 +2325,60 @@ begin
         3: Result := 'BranchGtInt';
         4: Result := 'BranchLeInt';
         5: Result := 'BranchGeInt';
-        10: Result := 'BranchEqFloat';
-        11: Result := 'BranchNeFloat';
-        12: Result := 'BranchLtFloat';
-        13: Result := 'BranchGtFloat';
-        14: Result := 'BranchLeFloat';
-        15: Result := 'BranchGeFloat';
-        20: Result := 'AddIntTo';
-        21: Result := 'SubIntTo';
-        22: Result := 'MulIntTo';
-        30: Result := 'AddFloatTo';
-        31: Result := 'SubFloatTo';
-        32: Result := 'MulFloatTo';
-        33: Result := 'DivFloatTo';
-        40: Result := 'AddIntConst';
-        41: Result := 'SubIntConst';
-        42: Result := 'MulIntConst';
-        50: Result := 'AddFloatConst';
-        51: Result := 'SubFloatConst';
-        52: Result := 'MulFloatConst';
-        53: Result := 'DivFloatConst';
-        60: Result := 'BranchEqZeroInt';
-        61: Result := 'BranchNeZeroInt';
-        70: Result := 'BranchEqZeroFloat';
-        71: Result := 'BranchNeZeroFloat';
-        80: Result := 'ArrayStoreIntConst';
-        81: Result := 'ArrayStoreFloatConst';
-        82: Result := 'ArrayStoreStringConst';
-        90: Result := 'AddIntToBranchLe';
-        91: Result := 'AddIntToBranchLt';
-        92: Result := 'SubIntToBranchGe';
-        93: Result := 'SubIntToBranchGt';
-        100: Result := 'MulAddFloat';
-        101: Result := 'MulSubFloat';
-        102: Result := 'MulAddToFloat';
-        103: Result := 'MulSubToFloat';
-        110: Result := 'ArrayLoadAddFloat';
-        111: Result := 'ArrayLoadSubFloat';
-        112: Result := 'ArrayLoadDivAddFloat';
-        120: Result := 'SquareSumFloat';
-        121: Result := 'AddSquareFloat';
-        130: Result := 'MulMulFloat';
-        131: Result := 'AddSqrtFloat';
-        140: Result := 'ArrayLoadIntBranchNZ';
-        141: Result := 'ArrayLoadIntBranchZ';
-        156: Result := 'ArrayReverseRange';
-        157: Result := 'ArrayShiftLeft';
-        158: Result := 'StrConcatCharAt';
-        159: Result := 'StrAppendMapped';
-        250: Result := 'ArraySwapInt';
-        251: Result := 'AddIntSelf';
-        252: Result := 'SubIntSelf';
-        253: Result := 'ArrayLoadIntTo';
-        254: Result := 'ArrayCopyElement';
-        255: Result := 'ArrayMoveElement';
+        6: Result := 'BranchEqFloat';
+        7: Result := 'BranchNeFloat';
+        8: Result := 'BranchLtFloat';
+        9: Result := 'BranchGtFloat';
+        10: Result := 'BranchLeFloat';
+        11: Result := 'BranchGeFloat';
+        12: Result := 'AddIntTo';
+        13: Result := 'SubIntTo';
+        14: Result := 'MulIntTo';
+        15: Result := 'AddFloatTo';
+        16: Result := 'SubFloatTo';
+        17: Result := 'MulFloatTo';
+        18: Result := 'DivFloatTo';
+        19: Result := 'AddIntConst';
+        20: Result := 'SubIntConst';
+        21: Result := 'MulIntConst';
+        22: Result := 'AddFloatConst';
+        23: Result := 'SubFloatConst';
+        24: Result := 'MulFloatConst';
+        25: Result := 'DivFloatConst';
+        26: Result := 'BranchEqZeroInt';
+        27: Result := 'BranchNeZeroInt';
+        28: Result := 'BranchEqZeroFloat';
+        29: Result := 'BranchNeZeroFloat';
+        30: Result := 'ArrayStoreIntConst';
+        31: Result := 'ArrayStoreFloatConst';
+        32: Result := 'ArrayStoreStringConst';
+        33: Result := 'AddIntToBranchLe';
+        34: Result := 'AddIntToBranchLt';
+        35: Result := 'SubIntToBranchGe';
+        36: Result := 'SubIntToBranchGt';
+        37: Result := 'MulAddFloat';
+        38: Result := 'MulSubFloat';
+        39: Result := 'MulAddToFloat';
+        40: Result := 'MulSubToFloat';
+        41: Result := 'ArrayLoadAddFloat';
+        42: Result := 'ArrayLoadSubFloat';
+        43: Result := 'ArrayLoadDivAddFloat';
+        44: Result := 'SquareSumFloat';
+        45: Result := 'AddSquareFloat';
+        46: Result := 'MulMulFloat';
+        47: Result := 'AddSqrtFloat';
+        48: Result := 'ArrayLoadIntBranchNZ';
+        49: Result := 'ArrayLoadIntBranchZ';
+        50: Result := 'ArrayReverseRange';
+        51: Result := 'ArrayShiftLeft';
+        52: Result := 'StrConcatCharAt';
+        53: Result := 'StrAppendMapped';
+        55: Result := 'ArraySwapInt';
+        56: Result := 'AddIntSelf';
+        57: Result := 'SubIntSelf';
+        58: Result := 'ArrayLoadIntTo';
+        59: Result := 'ArrayCopyElement';
+        60: Result := 'ArrayMoveElement';
       else
         Result := Format('Super_%d', [SubOp]);
       end;

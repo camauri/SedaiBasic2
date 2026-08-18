@@ -183,14 +183,14 @@ const
   // group 12 (bigint, 4 subs) sits between sound and super, so it shifts SUPER
   // and TOTAL by 4 in BOTH branches - and nothing checks that at compile time.
   DENSE_BIGINT_BASE   = 496;  // group 12 (13)
-  DENSE_SUPER_BASE    = 509;  // group 200 (256 slots)
-  DENSE_TOTAL         = 765;  // N (with web)
+  DENSE_SUPER_BASE    = 509;  // group 200 (61 slots: renumbered DENSE 0..60 on 18 Aug)
+  DENSE_TOTAL         = 570;  // N (with web)
   {$ELSE}
   DENSE_GRAPHICS_BASE = 411;  // group 10 (66)
   DENSE_SOUND_BASE    = 477;  // group 11 (6)
   DENSE_BIGINT_BASE   = 483;  // group 12 (13)
-  DENSE_SUPER_BASE    = 496;  // group 200 (256 slots, 58 used, 198 holes)
-  DENSE_TOTAL         = 752;  // N
+  DENSE_SUPER_BASE    = 496;  // group 200 (61 slots, no holes: renumbered DENSE 0..60)
+  DENSE_TOTAL         = 557;  // N
   {$ENDIF}
 
 var
