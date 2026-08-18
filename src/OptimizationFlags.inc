@@ -35,30 +35,40 @@
 // Master switch: uncomment to disable ALL optimizations
 {.$DEFINE DISABLE_ALL_OPTIMIZATIONS}
 
-// SUPERINSTRUCTIONS: ON since 2026-08-18, and the July verdict that turned them off was measuring the
-// DOOR, not the idea.
+// ⛔⛔⛔ SUPERINSTRUCTIONS DISABLED - and the 18 Aug attempt to re-enable them is the reason the note
+// is now this long. Read it before trying again.
 //
-// ⛔ What it used to say (2026-07-18): "Superinstruction fusion is a stack-VM optimization; on this
-// register-based 3-operand VM dispatch-per-useful-work is already minimal, so fusing ops removes at
-// most one dispatch while doing the SAME work -- measured net-zero-to-negative on float (n-body +38%
-// slower with float fusion), a small win only for the integer loop-control fusion. The performance
-// strategy is now a JIT for hot loops; the interpreter handles cold code, where fusion does not
-// matter. So all fusion is off."
+// The July verdict (2026-07-18) was: "superinstruction fusion is a stack-VM optimization; on this
+// register-based 3-operand VM dispatch-per-useful-work is already minimal, so fusing removes at most
+// one dispatch while doing the SAME work -- measured net-zero-to-negative (n-body +38% with float
+// fusion), a small win only for the integer loop-control fusion." It was right.
 //
-// ⭐⭐⭐ Both halves of that have since failed. The premise - "the interpreter handles cold code" - was
-// retired by the user on 18 Aug ("non devi trascurare nemmeno interp"). And the measurement was an
-// ARTEFACT: a superinstruction was dispatched TWICE, once by the outer dense jump table and again by
-// an inner "case Op and $FF of" whose 57 arms scattered over 0..254 compile to a decision tree. A
-// plain opcode cost 4.05 ns and a superinstruction 16.7 ns - 4.1x, about six extra branches - so
-// fusing 11 instructions into 8 made a tight loop 58% SLOWER. Flattening those arms into the outer
-// table (RunTemplate.inc) turns every one of those numbers around, n-body included:
+// On 18 Aug it was overturned on the strength of a real observation - a superinstruction was
+// dispatched TWICE, by the outer dense case and again by an inner "case Op and $FF of" whose 57 arms
+// scattered over 0..254 compile to a decision tree, so a fused opcode cost 16.7 ns against a plain
+// one's 4.05 - and the inner arms were flattened into the outer case. Every benchmark then measured
+// faster. ⛔ AGAINST A BASELINE THE FLATTENING HAD ITSELF DEGRADED: putting 57 sparse arms into the
+// outer case damaged the dispatch of EVERY opcode. Measured against a binary built from the previous
+// commit, with fusion still OFF, the flattened table alone costs +12% to +15% on every program.
 //
-//     micro integer loop  -8.3%    fannkuch  -7.7%    n-body  -16.7%    mandelbrot  -6.1%
+// The honest end-to-end comparison, previous commit versus flattened-and-fused:
+//     binary-trees +37.3%    fannkuch +10.0%    n-body -4.6%
+// and the JIT stops compiling ENTIRELY - it declines any hot loop holding an opcode it cannot lower,
+// which every superinstruction is: fannkuch --jit went from 178 ms to 4378, a factor of 24.
 //
-// ⛔ ONE KIND STAYS OFF: TryFuseConstantArithmetic - see the note at its call site. It is the only
-// one of nineteen that miscompiles, and SUPERMASK named it rather than a hunch.
-// See job/docs/VM_DISPATCH_E_RIDIMENSIONABILITA.md (superinstruction re-study) and the JIT design doc.
-{.$DEFINE DISABLE_SUPERINSTRUCTIONS}
+// ⭐ THREE THINGS TO TAKE AWAY IF THIS IS EVER REOPENED:
+//   1. The interpreter is not uniformly helped even in principle: binary-trees interpreted is +30%
+//      with fusion on. A measurement set without a call-heavy, allocation-heavy program will not
+//      show it - mine did not.
+//   2. Anything that rewrites BYTECODE breaks the JIT, which consumes bytecode and refuses what it
+//      cannot lower. Fusion and the JIT are competing for the same representation.
+//   3. Baseline discipline: an A/B against the same binary with a runtime switch is NOT enough when
+//      the change also alters code the switch does not disable. Build the previous commit.
+//
+// What survived: the two genuine miscompiles found in TryFuseConstantArithmetic (see the comments in
+// SedaiSuperinstructions.pas), and SUPERINSTR=0 / SUPERMASK=<n,...> as instruments.
+// See job/docs/VM_DISPATCH_E_RIDIMENSIONABILITA.md and the JIT design doc.
+{$DEFINE DISABLE_SUPERINSTRUCTIONS}
 {$DEFINE DISABLE_ARRAYSTORECONST}
 
 // Individual optimization flags (controlled by master switch)
