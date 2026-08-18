@@ -400,7 +400,20 @@ begin
 
     // Check if this register is used as source BEFORE checking control flow
     // This catches the case where the jump itself uses the register
-    if (Instr.Src1 = Reg) or (Instr.Src2 = Reg) then
+    //
+    // ⛔⛔⛔ AND THE THIRD PLACE A REGISTER CAN BE READ: THE IMMEDIATE.
+    // Src1 and Src2 are not the whole story - some opcodes carry an int register INDEX in Immediate
+    // (bcStrAscMid's length, bcStrMid's length, bcStrConcatCharAt's index, and forty others).
+    // Without this test the scan declared such a register dead and the fusion deleted the LoadConst
+    // that produced it: m198_byrefstr printed "Hello" with its first byte corrupted, because R3 held
+    // the LENGTH read by the very next StrAscMid.
+    //
+    // ⭐ ImmediateReadsIntReg already existed for exactly this - its own comment says "the only
+    // consumer is a fusion pass asking 'is this int register read anywhere else?'" - and this pass,
+    // the one it was written for, was not calling it. It deliberately over-reports, which costs a
+    // missed fusion and never a miscompile.
+    if (Instr.Src1 = Reg) or (Instr.Src2 = Reg) or
+       SedaiOpcodeBanks.ImmediateReadsIntReg(Instr, Reg) then
     begin
       Result := False;
       Exit;
@@ -2350,15 +2363,15 @@ begin
         Changed := True
       else if KindOn(8) and TryFuseArithAndCopy(i) then
         Changed := True
-      // ⛔ KIND 9 IS OFF. TryFuseConstantArithmetic ("LoadConst + arith" -> arith-with-immediate) is
-      // the ONE kind of nineteen that still miscompiles, and the bisection is what says so rather
-      // than a hunch: turning the family on gave 16 FAIL / 16 OPTDIFF, and SUPERMASK=<n> over all
-      // nineteen named kind 9 on every single failing program. Making IsTemporaryResult conservative
-      // at a basic-block boundary fixed fourteen of the fifteen; m198_byrefstr survives it
-      // ("Hello" comes back with its first byte corrupted), so there is a second defect in this
-      // fusion that is not about liveness. Off until that one is found - SUPERMASK=9 re-enables it
-      // for the hunt, and the other eighteen kinds carry the measured win without it.
-      else if False and TryFuseConstantArithmetic(i) then
+      // ⭐ KIND 9 IS BACK ON, and it took TWO defects to get here - both of them the same mistake in
+      // different clothes: asking a narrower question than the one that matters.
+      //   1. IsTemporaryResult read "end of basic block" as "the register is dead". A register can be
+      //      live in a successor, across a back edge, or in a block a later jump enters.
+      //   2. The same scan looked only at Src1 and Src2, and some opcodes carry a register INDEX in
+      //      Immediate - bcStrAscMid's length among them. That is what corrupted m198_byrefstr.
+      // Found by bisection (SUPERMASK), not by reading: with the family on, run_regress gave 16 FAIL,
+      // and testing the nineteen kinds one at a time named this one on every failing program.
+      else if KindOn(9) and TryFuseConstantArithmetic(i) then
         Changed := True
       {$IFNDEF DISABLE_ARRAYSTORECONST}
       else if KindOn(10) and TryFuseArrayStoreConst(i) then
