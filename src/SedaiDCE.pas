@@ -290,6 +290,10 @@ begin
     // are kept conservatively (cheap, and a record's handle must stay live).
     ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock, ssaRecordFree,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
+    // OOP: writing the runtime type-id mutates the object and DECIDES what a later virtual call
+    // dispatches to. It has no Dest, so nothing consumes it - without this entry DCE deletes it
+    // and the whole fix becomes inert.
+    ssaRecordSetTypeId,
     // FreeBASIC raw heap: alloc/free/realloc and stores mutate the heap; loads are pure (kept if used).
     ssaRawAlloc, ssaRawFree, ssaRawRealloc, ssaRawStoreInt, ssaRawStoreFloat, ssaRawStoreZStr,
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR mutate the raw heap — side-effecting, never elide.

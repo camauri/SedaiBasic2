@@ -7437,6 +7437,7 @@ begin
     bcRecordStoreFloat: RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);
     bcRecordStoreString:ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
     bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId;
+    bcRecordSetTypeId:  ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId := Instr.Immediate;
     // System commands
     bcEnd:
       begin

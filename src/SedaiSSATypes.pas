@@ -260,6 +260,11 @@ type
     // UDT/record heap (M3): allocate a record (Dest=handle, Src1/2/3=const slot counts) and
     // load/store a field (Dest or Src2 = value, Src1 = handle, Src3 = const slot index).
     ssaRecordNew, ssaRecordNewArray, ssaRecordTypeId, ssaRecordFree,
+    // OOP: WRITE the runtime type-id. The dynamic type of an object under construction is not the
+    // final type - it walks the chain, one level per constructor entered, and back down one level
+    // per destructor entered. That is what makes a virtual call from a constructor reach the level
+    // being constructed, as C++ and FreeBASIC do, instead of the most-derived override.
+    ssaRecordSetTypeId,
     ssaRecordNewArrayInd,   // allocate a record per element of a member array by HANDLE: Src1=array-handle reg, Immediate=packed slot counts (like ssaRecordNewArray but the FArrays id comes from a register, for array-of-UDT members)
     ssaRecordNewBlock,      // Callocate(n, SizeOf(T)) of a UDT: allocate N CONSECUTIVE shared records and return the first handle: Dest=first handle, Src1=count reg, Immediate=packed slot counts. "p[i]" = first+i indexes the i-th.
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordLoadString,

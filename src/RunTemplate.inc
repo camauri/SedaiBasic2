@@ -637,7 +637,7 @@ begin
         begin Ctx.PC := CurPC; ExecuteBigIntOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
-      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 167:
+      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 168:
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
@@ -1027,6 +1027,11 @@ begin
           begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
         bcRecordTypeId:
           begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId; Inc(CurPC); end;
+        // OOP: move the object's DYNAMIC type one level along the chain. Emitted at the top of every
+        // constructor body (after the base chain) and of every destructor body, so a virtual call made
+        // from there reaches the level being built or torn down - C++ and FreeBASIC semantics.
+        bcRecordSetTypeId:
+          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId := Instr.Immediate; Inc(CurPC); end;
         bcRecordFree:
           begin FreeSharedRecord(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;   // DELETE p
 

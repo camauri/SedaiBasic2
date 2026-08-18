@@ -319,6 +319,7 @@ begin
     ssaRecordNewArrayInd: Result := bcRecordNewArrayInd;
     ssaRecordNewBlock: Result := bcRecordNewBlock;
     ssaRecordTypeId: Result := bcRecordTypeId;
+    ssaRecordSetTypeId: Result := bcRecordSetTypeId;
     ssaRecordFree: Result := bcRecordFree;     // DELETE
     ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
     ssaRecMarkPop: Result := bcRecMarkPop;

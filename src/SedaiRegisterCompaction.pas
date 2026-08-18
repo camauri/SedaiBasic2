@@ -411,6 +411,7 @@ begin
     bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
     bcRecordTypeId,   // OOP (M4.3): Src1 = handle
+    bcRecordSetTypeId, // OOP: Src1 = handle, Immediate = type id (NOT a register)
     bcRecordFree,     // DELETE: Src1 = handle
     bcRecordNewArrayInd,  // array-of-UDT member alloc: Src1 = member array-handle reg (int)
     bcRecordNewBlock,     // Callocate block: Src1 = count reg (int)

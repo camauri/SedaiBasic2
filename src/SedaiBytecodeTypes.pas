@@ -315,6 +315,10 @@ const
   bcBitPopcnt        = bcGroupCore + 165;  // COUNTONEBITS[32]
   bcBitRotl          = bcGroupCore + 166;  // ROTATELEFT[32]  (Src2 = count)
   bcBitRotr          = bcGroupCore + 167;  // ROTATERIGHT[32] (Src2 = count)
+  // OOP: Src1 = handle reg, Immediate = the type id to install. No Dest.
+  // The dynamic type of an object walks the inheritance chain during construction and destruction;
+  // this is the one instruction that moves it. See EmitSetDynamicType in SedaiSSA.
+  bcRecordSetTypeId  = bcGroupCore + 168;
   bcPrintUsingInt    = bcGroupCore + 154;  // PRINT USING with an EXACT integer value (Src1=format string, Src2=int value)
   // FreeBASIC variadic arguments (CVA_*). A variadic call stages its SURPLUS arguments into a stack of
   // tagged slots, one FRAME per call, and the callee walks that frame with an ordinary integer cursor -
@@ -1991,6 +1995,7 @@ begin
         165: Result := 'BitPopcnt';
         166: Result := 'BitRotl';
         167: Result := 'BitRotr';
+        168: Result := 'RecordSetTypeId';
       else
         Result := Format('Core_%d', [SubOp]);
       end;

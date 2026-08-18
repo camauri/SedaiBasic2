@@ -416,6 +416,8 @@ type
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
     procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
                                        FromFlatIndex: Integer);  // ...and the CONSTRUCTOR on each element
+    procedure EmitSetDynamicType(const TypeName: string);  // OOP: THIS's runtime type-id := TypeName
+    procedure EmitSetDynamicTypeOn(const HandleVal: TSSAValue; const TypeName: string);
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
                                   ArgsNode: TASTNode = nil);  // M4.4 (ArgsNode: M4.4b ctor args)
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
@@ -22617,6 +22619,17 @@ begin
     end;
   end;
   EmitCallSubLabel(ProcedureLabelName(Lbl));
+  // ⛔ AND PUT THE DYNAMIC TYPE BACK. The constructor that just ran set it to ITS OWN level, which is
+  // not necessarily TypeName: ResolveConstructorLabel walks UP the chain, so a derived type with no
+  // constructor of its own runs the base's, and the object would stay typed as the BASE for the rest
+  // of its life - every later virtual call reaching the wrong override.
+  //
+  // Correct in both roles this procedure plays, which is why it lives here and not at the five
+  // allocation sites: as the OUTERMOST construction it restores the final type; as a step of a base
+  // chain it restores the parent's, and the caller's own prologue immediately moves it on to the
+  // derived one. Only emitted where a chain can exist - with no parent nothing could have moved it.
+  if (FindUDT(TypeName) >= 0) and (FUDTs[FindUDT(TypeName)].Parent <> '') then
+    EmitSetDynamicTypeOn(HandleVal, TypeName);
 end;
 
 procedure TSSAGenerator.EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);
@@ -22799,6 +22812,36 @@ begin
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
     end;
   EmitBaseDestructorChain;
+end;
+
+procedure TSSAGenerator.EmitSetDynamicTypeOn(const HandleVal: TSSAValue; const TypeName: string);
+// Same as EmitSetDynamicType but on an explicit handle: the construction SITE is not inside the
+// object's own methods, so there is no THIS to read.
+var
+  u: Integer;
+begin
+  if TypeName = '' then Exit;
+  u := FindUDT(TypeName);
+  if u < 0 then Exit;
+  EmitInstruction(ssaRecordSetTypeId, MakeSSAValue(svkNone), HandleVal,
+                  MakeSSAValue(svkNone), MakeSSAConstInt(u));
+end;
+
+procedure TSSAGenerator.EmitSetDynamicType(const TypeName: string);
+// OOP: install TypeName as THIS's runtime type-id. One instruction, no Dest - see ssaRecordSetTypeId.
+//
+// Emitted at the top of every constructor body (after the base chain, so the base subobject is
+// already built) and of every destructor body (before it runs, so the base's own entry can move it
+// back down). Between them they make the dynamic type follow construction and destruction the way
+// C++ and FreeBASIC do, which is what decides where a virtual call made from there dispatches.
+var
+  u: Integer;
+begin
+  if TypeName = '' then Exit;
+  u := FindUDT(TypeName);
+  if u < 0 then Exit;
+  EmitInstruction(ssaRecordSetTypeId, MakeSSAValue(svkNone), GetOrAllocateVariable('THIS'),
+                  MakeSSAValue(svkNone), MakeSSAConstInt(u));
 end;
 
 procedure TSSAGenerator.EmitBaseDestructorChain;
@@ -28296,6 +28339,25 @@ begin
         end;
       end;
     end;
+
+    // ⭐ OOP: THE OBJECT'S DYNAMIC TYPE WALKS THE INHERITANCE CHAIN.
+    //
+    // Virtual dispatch here is type-id based (GenerateDispatchers reads the record's TypeId), and
+    // AllocRecord writes that id ONCE, to the final type. That gave Java semantics: a virtual call
+    // made from a base constructor reached the most-derived override, on an object whose derived
+    // fields were not initialised yet. C++ and FreeBASIC move the dynamic type instead - one level
+    // per constructor entered, and back one level per destructor entered - so the call reaches the
+    // level currently being built or torn down.
+    //
+    // Measured against fbc 1.10.1 (job/tests/bas/oop_vcall_ctor.bas, oop_vcall_dtor.bas): fbc runs
+    // Root.Build from Root's constructor and Root.Speak from Root's destructor; we ran Child's both
+    // times. One defect, both halves, one point of correction - THIS one.
+    //
+    // The rule is the same in both directions: on entry to type T's constructor body (after the base
+    // chain has run) and on entry to T's destructor body, the dynamic type becomes T.
+    if (FCurrentThisType <> '') and
+       ((Pos('.CONSTRUCTOR#', Name) > 0) or (Pos('.DESTRUCTOR', UpperCase(Name)) > 0)) then
+      EmitSetDynamicType(FCurrentThisType);
 
     // Body statements begin at child index 2 (0 = name, 1 = antParameterList).
     for j := 2 to Proc.ChildCount - 1 do

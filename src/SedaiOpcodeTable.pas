@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 556 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt
+  OPCODE_LIST_COUNT = 557 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -65,7 +65,7 @@ const
     bcCmpLtUInt, bcCmpGtUInt, bcCmpLeUInt, bcCmpGeUInt, bcDivUInt, bcModUInt,
     bcXferStoreInt, bcXferStoreFloat, bcXferStoreString, bcXferLoadInt, bcXferLoadFloat, bcXferLoadString,
     bcRecordNew, bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString, bcRecordStoreInt, bcRecordStoreFloat,
-    bcRecordStoreString, bcRecordNewArray, bcRecordTypeId, bcRecordFree, bcRecMarkPush, bcRecMarkPop,
+    bcRecordStoreString, bcRecordNewArray, bcRecordTypeId, bcRecordSetTypeId, bcRecordFree, bcRecMarkPush, bcRecMarkPop,
     bcLoadProcAddr, bcThreadCreate, bcThreadWait, bcThreadSelf, bcThreadDetach, bcFloatRound,
     bcNarrowInt, bcNarrowSingle, bcShl, bcShr, bcShrUInt, bcPrintUsingInt,
     bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
@@ -151,44 +151,46 @@ const
   // that grows a group (or enabling WEB_MODE) fails the self-check LOUDLY instead of miscompiling.
   // Values below are for the default (no-WEB_MODE) build: web opcodes are gated out, so group 8 takes
   // no dense range and graphics/sound/super sit where they do here.
+  // ⚠️ bcRecordSetTypeId (core sub 168) made group 0 one wider on 18 Aug 2026, which shifts EVERY
+  // base below and DENSE_TOTAL by one, in BOTH branches - and the core range in RunTemplate.inc.
   // ⚠️ The five bit intrinsics (core subs 163..167) made group 0 five wider, which shifts EVERY base
   // below and DENSE_TOTAL by 5, in both branches. Nothing checks these at compile time -
   // `sb --verify-opcodes` is what says so.
-  DENSE_CORE_BASE     = 0;    // group 0  (168 opcodes) -> dense 0..167
-  DENSE_STRING_BASE   = 168;  // group 1  (50)          -> 168..217 (bcStrAscMid = sub 51)
-  DENSE_MATH_BASE     = 220;  // group 2  (43)          -> 220..262
+  DENSE_CORE_BASE     = 0;    // group 0  (169 opcodes) -> dense 0..168
+  DENSE_STRING_BASE   = 169;  // group 1  (50)          -> 168..217 (bcStrAscMid = sub 51)
+  DENSE_MATH_BASE     = 221;  // group 2  (43)          -> 220..262
                               // ⚠️ CEIL/ROUND/MIN/MAX/COPYSIGN and the two bit-casts took this group
                               // from 36 to 43, and every base below moved with it. ⛔ HEADROOM IS NOT
                               // ALLOWED: the runtime map is built from the actual opcode counts, so a
                               // base with slack fails `--verify-opcodes` immediately - which it did,
                               // and it printed the right numbers to use.
-  DENSE_ARRAY_BASE    = 263;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
-  DENSE_IO_BASE       = 315;  // group 4  (23)          -> 306..328
+  DENSE_ARRAY_BASE    = 264;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_BASE       = 316;  // group 4  (23)          -> 306..328
   // ⚠️ bcCpuCount (sub 17) made group 5 one wider, which shifts FILEIO and everything below it -
   // and DENSE_TOTAL - by one, in BOTH branches. Nothing checks these at compile time;
   // `sb --verify-opcodes` is what says so, and it prints the right numbers when they are wrong.
-  DENSE_SPECIAL_BASE  = 338;  // group 5  (18)          -> 338..355
-  DENSE_FILEIO_BASE   = 356;  // group 6  (37)
-  DENSE_SPRITE_BASE   = 393;  // group 7  (17)
+  DENSE_SPECIAL_BASE  = 339;  // group 5  (18)          -> 338..355
+  DENSE_FILEIO_BASE   = 357;  // group 6  (37)
+  DENSE_SPRITE_BASE   = 394;  // group 7  (17)
   {$IFDEF WEB_MODE}
   // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 410;  // 12 used, slot 0 a hole
+  DENSE_WEB_BASE      = 411;  // 12 used, slot 0 a hole
   // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
   // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
   // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
-  DENSE_GRAPHICS_BASE = 423;  // group 10 (66)
-  DENSE_SOUND_BASE    = 489;  // group 11 (6)
+  DENSE_GRAPHICS_BASE = 424;  // group 10 (66)
+  DENSE_SOUND_BASE    = 490;  // group 11 (6)
   // group 12 (bigint, 4 subs) sits between sound and super, so it shifts SUPER
   // and TOTAL by 4 in BOTH branches - and nothing checks that at compile time.
-  DENSE_BIGINT_BASE   = 495;  // group 12 (13)
-  DENSE_SUPER_BASE    = 508;  // group 200 (256 slots)
-  DENSE_TOTAL         = 764;  // N (with web)
+  DENSE_BIGINT_BASE   = 496;  // group 12 (13)
+  DENSE_SUPER_BASE    = 509;  // group 200 (256 slots)
+  DENSE_TOTAL         = 765;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 410;  // group 10 (66)
-  DENSE_SOUND_BASE    = 476;  // group 11 (6)
-  DENSE_BIGINT_BASE   = 482;  // group 12 (13)
-  DENSE_SUPER_BASE    = 495;  // group 200 (256 slots, 58 used, 198 holes)
-  DENSE_TOTAL         = 751;  // N
+  DENSE_GRAPHICS_BASE = 411;  // group 10 (66)
+  DENSE_SOUND_BASE    = 477;  // group 11 (6)
+  DENSE_BIGINT_BASE   = 483;  // group 12 (13)
+  DENSE_SUPER_BASE    = 496;  // group 200 (256 slots, 58 used, 198 holes)
+  DENSE_TOTAL         = 752;  // N
   {$ENDIF}
 
 var
