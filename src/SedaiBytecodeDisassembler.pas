@@ -524,6 +524,11 @@ begin
 
     // === SUPERINSTRUCTIONS (0xC8xx+) ===
     bcBranchEqInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchEqInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString,
+    bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
+      Line := Format('%4d: %-20s R%d, R%d, %d',
+        [Index, BytecodeOpToString(TBytecodeOp(Instr.OpCode)), Instr.Src1, Instr.Src2, Instr.Immediate]);
     bcBranchNeInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchNeInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
     bcBranchLtInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchLtInt', Instr.Src1, Instr.Src2, Instr.Immediate]);
     bcBranchGtInt: Line := Format('%4d: %-20s R%d, R%d, %d', [Index, 'BranchGtInt', Instr.Src1, Instr.Src2, Instr.Immediate]);

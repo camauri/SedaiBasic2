@@ -310,7 +310,7 @@ begin
     // The group-0 and superinstruction BODIES below are byte-identical to the previous nested cases.
     case DenseOp of
       // === Superinstructions (dense DENSE_SUPER_BASE + sub, sub = Op and $FF) ===
-      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 60:
+      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 70:
       case Op and $FF of
         // Fused compare-and-branch (Int) - sub-opcodes 0-5
         0: if IntRegs[Instr^.Src1] = IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchEqInt
@@ -587,6 +587,23 @@ begin
             end;
             Inc(CurPC);
           end; // bcArrayMoveElement
+
+        // Fused compare-and-branch, STRING - sub-opcodes 61-66. Six forms for four comparisons:
+        // the pass fuses "compare + JumpIfZero" by negating, and the negation of Lt is Ge.
+        61: if Ctx.StringRegs[Instr^.Src1] =  Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchEqString
+        62: if Ctx.StringRegs[Instr^.Src1] <> Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchNeString
+        63: if Ctx.StringRegs[Instr^.Src1] <  Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLtString
+        64: if Ctx.StringRegs[Instr^.Src1] >  Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGtString
+        65: if Ctx.StringRegs[Instr^.Src1] <= Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLeString
+        66: if Ctx.StringRegs[Instr^.Src1] >= Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGeString
+
+        // Fused compare-and-branch, UNSIGNED - sub-opcodes 67-70. The operands are INT registers
+        // read as QWord, exactly as bcCmpLtUInt reads them; unsigned equality is bit-identical to
+        // signed and already goes through bcBranchEqInt.
+        67: if QWord(IntRegs[Instr^.Src1]) <  QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLtUInt
+        68: if QWord(IntRegs[Instr^.Src1]) <= QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLeUInt
+        69: if QWord(IntRegs[Instr^.Src1]) >  QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGtUInt
+        70: if QWord(IntRegs[Instr^.Src1]) >= QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGeUInt
 
         // "acc + MID$(tab,k,1)" fused - sub-opcode 158. DELEGATED on purpose: the body is string
         // work, and inlining bodies here is what made every program slower when the whole

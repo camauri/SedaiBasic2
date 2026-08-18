@@ -241,6 +241,8 @@ begin
     bcAddIntConst, bcSubIntConst, bcMulIntConst,
     // Fused compare-and-branch (Int): Src1 is first comparison operand
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    // ...and the unsigned forms read the same bank, differing only in the comparison.
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
     // Fused compare-zero-and-branch (Int): Src1 is the register being compared
     bcBranchEqZeroInt, bcBranchNeZeroInt,
     // Fused loop increment-and-branch (Int): Src1 = step register
@@ -416,6 +418,7 @@ begin
     // === SUPERINSTRUCTIONS ===
     // Fused compare-and-branch (Int): Src2 is second comparison operand
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
     // Fused array-store-constant: Src2 is the int index register
     bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst,
     // Fused loop increment-and-branch (Int): Src2 = limit register
@@ -944,7 +947,11 @@ begin
     bcPSave,          // PSAVE "filename": Src1 = filename string
     // === GROUP 7: Sprite ===
     bcSprSaveFile,    // SPRSAVE "file": Src1 = filename string
-    bcSprLoadFile:    // SPRLOAD "file": Src1 = filename string
+    bcSprLoadFile,    // SPRLOAD "file": Src1 = filename string
+    // Fused compare-and-branch (String): both operands index the string bank; the branch writes
+    // nothing at all, so it appears in no Dest list.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString,
+    bcBranchLeString, bcBranchGeString:
       Result := True;
   else
     Result := False;
@@ -984,7 +991,11 @@ begin
     // used nor rewritten, so any non-identity map made the command read a stale index.
     bcCopyFile, bcRenameFile, bcConcat, bcMoveFile,
     // === GROUP 0: ASSERT/ASSERTWARN — Src2 = message (string) ===
-    bcAssert:
+    bcAssert,
+    // Fused compare-and-branch (String): both operands index the string bank; the branch writes
+    // nothing at all, so it appears in no Dest list.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString,
+    bcBranchLeString, bcBranchGeString:
       Result := True;
   else
     Result := False;

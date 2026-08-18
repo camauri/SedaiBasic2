@@ -126,7 +126,9 @@ begin
     Ord(bcOnError), Ord(bcResumeLabel):
       Result := True;
     // Fused compare-and-branch (Int)
-    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := True;
     // Fused compare-and-branch (Float)
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat:

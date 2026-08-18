@@ -676,6 +676,21 @@ begin
     bcCmpGtFloat: if NegateCondition then FusedOpCode := bcBranchLeFloat else FusedOpCode := bcBranchGtFloat;
     bcCmpLeFloat: if NegateCondition then FusedOpCode := bcBranchGtFloat else FusedOpCode := bcBranchLeFloat;
     bcCmpGeFloat: if NegateCondition then FusedOpCode := bcBranchLtFloat else FusedOpCode := bcBranchGeFloat;
+
+    // String comparisons. ⚠️ Only FOUR of these exist as comparisons - there is no CmpLeString or
+    // CmpGeString - but the negated arm needs both, which is why the branch family has six forms.
+    // This asymmetry is exactly what made "add the missing opcodes" look smaller than it is.
+    bcCmpEqString: if NegateCondition then FusedOpCode := bcBranchNeString else FusedOpCode := bcBranchEqString;
+    bcCmpNeString: if NegateCondition then FusedOpCode := bcBranchEqString else FusedOpCode := bcBranchNeString;
+    bcCmpLtString: if NegateCondition then FusedOpCode := bcBranchGeString else FusedOpCode := bcBranchLtString;
+    bcCmpGtString: if NegateCondition then FusedOpCode := bcBranchLeString else FusedOpCode := bcBranchGtString;
+
+    // Unsigned comparisons. Equality is bit-identical to the signed one and already arrives here as
+    // bcCmpEqInt, so only the four ORDERING forms need a branch of their own.
+    bcCmpLtUInt: if NegateCondition then FusedOpCode := bcBranchGeUInt else FusedOpCode := bcBranchLtUInt;
+    bcCmpGtUInt: if NegateCondition then FusedOpCode := bcBranchLeUInt else FusedOpCode := bcBranchGtUInt;
+    bcCmpLeUInt: if NegateCondition then FusedOpCode := bcBranchGtUInt else FusedOpCode := bcBranchLeUInt;
+    bcCmpGeUInt: if NegateCondition then FusedOpCode := bcBranchLtUInt else FusedOpCode := bcBranchGeUInt;
   else
     Exit;  // Not a comparison we can fuse
   end;

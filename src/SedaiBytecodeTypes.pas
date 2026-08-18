@@ -952,6 +952,28 @@ const
   bcArrayCopyElement  = bcGroupSuper + 59;  // ArrayCopyInt
   bcArrayMoveElement  = bcGroupSuper + 60;  // ArrayCopyIntSwap
 
+  // Fused compare-and-branch for the two comparison families that had no branch form at all, which
+  // is why the fusion pass had to decline them: it had nothing to fuse INTO. Measured on the bas/
+  // corpus before adding them - 232 residual CmpString and 31 CmpUInt, 263 sites, 526 instructions
+  // that could not fuse by construction.
+  //
+  // ⚠️ SIX string forms for FOUR string comparisons. The pass fuses "compare + JumpIfZero" by
+  // NEGATING the condition, and the negation of Lt is Ge - which exists as a branch even though
+  // CmpGeString does not exist as a comparison. Getting this wrong means the pass silently keeps
+  // declining half the sites.
+  bcBranchEqString    = bcGroupSuper + 61;
+  bcBranchNeString    = bcGroupSuper + 62;
+  bcBranchLtString    = bcGroupSuper + 63;
+  bcBranchGtString    = bcGroupSuper + 64;
+  bcBranchLeString    = bcGroupSuper + 65;
+  bcBranchGeString    = bcGroupSuper + 66;
+  // Unsigned needs only four: the negation of each stays inside the set (Lt<->Ge, Le<->Gt), and
+  // unsigned EQUALITY is bit-identical to signed, so it already compiles to bcCmpEqInt.
+  bcBranchLtUInt      = bcGroupSuper + 67;
+  bcBranchLeUInt      = bcGroupSuper + 68;
+  bcBranchGtUInt      = bcGroupSuper + 69;
+  bcBranchGeUInt      = bcGroupSuper + 70;
+
   // Helper function to extract group from opcode
   function GetOpcodeGroup(Op: TBytecodeOp): Word; inline;
 
@@ -2384,6 +2406,16 @@ begin
         58: Result := 'ArrayLoadIntTo';
         59: Result := 'ArrayCopyElement';
         60: Result := 'ArrayMoveElement';
+        61: Result := 'BranchEqString';
+        62: Result := 'BranchNeString';
+        63: Result := 'BranchLtString';
+        64: Result := 'BranchGtString';
+        65: Result := 'BranchLeString';
+        66: Result := 'BranchGeString';
+        67: Result := 'BranchLtUInt';
+        68: Result := 'BranchLeUInt';
+        69: Result := 'BranchGtUInt';
+        70: Result := 'BranchGeUInt';
       else
         Result := Format('Super_%d', [SubOp]);
       end;

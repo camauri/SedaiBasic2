@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 557 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt
+  OPCODE_LIST_COUNT = 567 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -137,7 +137,10 @@ const
     bcArrayLoadSubFloat, bcArrayLoadDivAddFloat, bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
     bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ, bcArrayReverseRange, bcArrayShiftLeft, bcArraySwapInt, bcAddIntSelf,
     bcSubIntSelf, bcArrayLoadIntTo, bcArrayCopyElement, bcArrayMoveElement, bcStrConcatCharAt,
-    bcStrAppendMapped, bcStrMidAssign
+    bcStrAppendMapped, bcStrMidAssign,
+    // The two comparison families that had no branch form; see the note at their declaration.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt
     {$IFDEF WEB_MODE}
     , bcWebGetParam, bcWebPostParam, bcWebGetRaw, bcWebPostRaw, bcWebHtmlEncode, bcWebUrlEncode,
     bcWebMethod, bcWebPath, bcWebQuery, bcWebHeader, bcWebSetHeader, bcWebStatus
@@ -183,14 +186,14 @@ const
   // group 12 (bigint, 4 subs) sits between sound and super, so it shifts SUPER
   // and TOTAL by 4 in BOTH branches - and nothing checks that at compile time.
   DENSE_BIGINT_BASE   = 496;  // group 12 (13)
-  DENSE_SUPER_BASE    = 509;  // group 200 (61 slots: renumbered DENSE 0..60 on 18 Aug)
-  DENSE_TOTAL         = 570;  // N (with web)
+  DENSE_SUPER_BASE    = 509;  // group 200 (71 slots: DENSE 0..70)
+  DENSE_TOTAL         = 580;  // N (with web)
   {$ELSE}
   DENSE_GRAPHICS_BASE = 411;  // group 10 (66)
   DENSE_SOUND_BASE    = 477;  // group 11 (6)
   DENSE_BIGINT_BASE   = 483;  // group 12 (13)
-  DENSE_SUPER_BASE    = 496;  // group 200 (61 slots, no holes: renumbered DENSE 0..60)
-  DENSE_TOTAL         = 557;  // N
+  DENSE_SUPER_BASE    = 496;  // group 200 (71 slots, no holes: DENSE 0..70)
+  DENSE_TOTAL         = 567;  // N
   {$ENDIF}
 
 var

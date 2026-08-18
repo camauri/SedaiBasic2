@@ -2607,7 +2607,10 @@ begin
     // float bank, so they write no integer register either.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat:
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // The string and unsigned forms likewise consume their operands and store nothing.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
@@ -2686,7 +2689,12 @@ begin
     bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
     // The float compare-and-branch READS two floats and writes none of them.
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-    bcBranchEqZeroFloat, bcBranchNeZeroFloat:
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // ⚠️ The STRING compare-and-branch READS two string registers and writes NEITHER - a branch
+    // stores nothing. BW is a WRITE-set question, so BW_NONE is right in both banks; saying
+    // otherwise here would widen every frame that contains one.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := BW_NONE;
   else
     Result := BW_UNKNOWN;
@@ -2730,7 +2738,12 @@ begin
     bcBranchEqZeroInt, bcBranchNeZeroInt,
     bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-    bcBranchEqZeroFloat, bcBranchNeZeroFloat:
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // ⚠️ The STRING compare-and-branch READS two string registers and writes NEITHER - a branch
+    // stores nothing. BW is a WRITE-set question, so BW_NONE is right in both banks; saying
+    // otherwise here would widen every frame that contains one.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := BW_NONE;
   else
     Result := BW_UNKNOWN;
@@ -2768,7 +2781,9 @@ begin
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
     bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat,
-    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := True;
   else
     Result := False;
@@ -2796,7 +2811,9 @@ begin
     bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd,
     // A FLOAT compare-and-branch reads two floats and branches: nothing of ours is read.
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-    bcBranchEqZeroFloat, bcBranchNeZeroFloat:
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // A STRING compare-and-branch reads two strings: nothing of ours.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString:
       Result := US_NONE;
     bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero,
     bcIntToFloat, bcIntToString, bcNarrowInt,
@@ -2826,7 +2843,9 @@ begin
     bcBitRotl, bcBitRotr,   // Src1 = value, Src2 = rotate count (the width is an immediate)
     bcRecordStoreInt,   // Src1 = handle, Src2 = the integer value being stored
     // The fused compare-and-branch reads the two operands the CmpInt used to read.
-    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    // Unsigned reads the same two INT registers; only the comparison differs.
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := US_SRC1 or US_SRC2;
     // The fused loop counter reads all three: the counter in Dest (which it also writes), the step
     // in Src1 and the limit in Src2. Dropping US_DEST here would be the silent miscompile this
@@ -5734,7 +5753,19 @@ begin
     if Instr.OpCode >= bcGroupSuper then
     begin
       case Instr.OpCode of
-        // Fused compare-and-branch (Int) - use IntRegs for Src1, Src2
+        // Fused compare-and-branch (String) - Src1/Src2 index the STRING bank. ⛔ This case has no
+        // else branch: an opcode missing here contributes ZERO, the bank is sized too small, and the
+        // interpreter writes past the end - a heap corruption that surfaces at program EXIT, far
+        // from the cause. It is the fourth of the four unchecked counters an opcode addition touches.
+        bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString,
+        bcBranchLeString, bcBranchGeString:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+        end;
+
+        // Fused compare-and-branch (Int, and Unsigned which reads the same bank) - IntRegs
+        bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
         bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
