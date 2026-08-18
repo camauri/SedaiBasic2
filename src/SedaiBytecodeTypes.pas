@@ -981,6 +981,11 @@ type
     Immediate: Int64;       // Immediate value (for constants, jump offsets, etc)
   end;
 
+  { A pointer to one. The interpreter's dispatch loop holds one of these rather than copying the
+    record per instruction, and ArrayHotOps.inc - compiled into two different scopes - dereferences
+    one, so the type has to be visible to both. }
+  PBytecodeInstruction = ^TBytecodeInstruction;
+
   { Variable info for runtime }
   TVariableInfo = record
     Name: string;

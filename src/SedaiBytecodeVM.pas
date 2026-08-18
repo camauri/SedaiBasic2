@@ -11939,7 +11939,10 @@ var
   PtrAddr, DestArr: Int64;
   PtrOffset, RecSlot: Integer;
   Rec: PRecordStorage;
+  InstrHot: PBytecodeInstruction;   // what ArrayHotOps.inc dereferences; see the note at its include
+                                    // in RunTemplate.inc - the same text is compiled into two scopes.
 begin
+  InstrHot := @Instr;
   // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
   // move an array's backing store; the hot typed accessors never come through here. So the
   // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.

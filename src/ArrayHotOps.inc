@@ -23,56 +23,56 @@
 
     3: // bcArrayLoadInt
       begin
-        ArrayIdx := Instr.Src1;
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        ArrayIdx := InstrHot^.Src1;
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+          Ctx.IntRegs[InstrHot^.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
           {$ENDIF}
         end
         else
-          Ctx.IntRegs[Instr.Dest] := 0;   // MODERN out-of-bounds read -> default (FreeBASIC)
+          Ctx.IntRegs[InstrHot^.Dest] := 0;   // MODERN out-of-bounds read -> default (FreeBASIC)
       end;
     4: // bcArrayLoadFloat
       begin
-        ArrayIdx := Instr.Src1;
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        ArrayIdx := InstrHot^.Src1;
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+          Ctx.FloatRegs[InstrHot^.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
           {$ENDIF}
         end
         else
-          Ctx.FloatRegs[Instr.Dest] := 0.0;   // MODERN out-of-bounds read -> default
+          Ctx.FloatRegs[InstrHot^.Dest] := 0.0;   // MODERN out-of-bounds read -> default
       end;
     5: // bcArrayLoadString
       begin
-        ArrayIdx := Instr.Src1;
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        ArrayIdx := InstrHot^.Src1;
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+          Ctx.StringRegs[InstrHot^.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
           {$ENDIF}
         end
         else
-          Ctx.StringRegs[Instr.Dest] := '';   // MODERN out-of-bounds read -> default
+          Ctx.StringRegs[InstrHot^.Dest] := '';   // MODERN out-of-bounds read -> default
       end;
     6: // bcArrayStoreInt
       begin
-        ArrayIdx := Instr.Src1;
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        ArrayIdx := InstrHot^.Src1;
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then     // MODERN out-of-bounds store is dropped (FreeBASIC)
         begin
-          FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+          FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[InstrHot^.Dest];
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
@@ -81,11 +81,11 @@
       end;
     7: // bcArrayStoreFloat
       begin
-        ArrayIdx := Instr.Src1;
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        ArrayIdx := InstrHot^.Src1;
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+          FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[InstrHot^.Dest];
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
@@ -94,11 +94,11 @@
       end;
     8: // bcArrayStoreString
       begin
-        ArrayIdx := Instr.Src1;
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        ArrayIdx := InstrHot^.Src1;
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+          FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[InstrHot^.Dest];
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
