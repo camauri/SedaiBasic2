@@ -9066,6 +9066,57 @@ begin
   end;
 end;
 
+{ C7b: a PRINT ITEM as a CONDITIONAL leaf call.
+
+  The two bookkeeping opcodes above are unconditional leaves; the item is not, and the reason is one
+  branch: with CMD redirection active the arm hands the text to the file layer, which RAISES a BASIC
+  error on a bad handle - and an exception must not unwind through a compiled frame that carries no
+  unwinding information. So the primitive answers "not handled" for that case and the emitted code
+  falls through to the ordinary helper call, which runs the same arm on an interpreter frame.
+
+  Everything else is an exact transcription of the bcPrintString / bcPrintStringLn arms. Measured
+  worth: the helper round trip costs ~53 ns more than a leaf call, and reverse-complement's write
+  phase makes 1.67 million print items.
+
+  ⛔ The operand is a STRING bank slot, never a homed machine register, and the arm writes no int or
+  float register either - that is what makes the fast path safe without the helper's flush/reload.
+
+  Result: 0 = done, 1 = not handled (run the helper). }
+function AotPrintString(VMSelf, CtxObj: Pointer; SrcSlot, WithNewline: PtrInt): PtrInt; cdecl;
+var
+  VM: TBytecodeVM;
+  C: TExecutionContext;
+  S: string;
+begin
+  VM := TBytecodeVM(VMSelf);
+  // CMD redirection: the only reachable raise on this path. Hand it back.
+  if (VM.FCmdHandle > 0) and Assigned(VM.FOnFileData) then Exit(1);
+  Result := 0;
+  if not Assigned(VM.FOutputDevice) then Exit;
+  C := TExecutionContext(CtxObj);
+  S := VM.FConsoleBehavior.FormatString(C.StringRegs[SrcSlot]);
+  VM.FOutputDevice.Print(S);
+  if WithNewline <> 0 then
+  begin
+    VM.FOutputDevice.NewLine;          // NewLine already calls Present
+    C.CursorCol := 0;
+    Inc(C.CursorRow);                  // CSRLIN: a print newline advances the text row
+  end
+  else
+    VM.AdvancePrintCol(C, Length(S));
+end;
+
+// ⛔ THE BATTERY, VERIFIED BACKWARDS. The CMD-redirection fallback above is the one branch nothing
+// in the corpus exercises - grep finds no program that redirects PRINT to a file - so a defect in it
+// would sit behind a green net. AOT_PRINTSTR=2 installs THIS instead: it always answers "not
+// handled", so EVERY print in every program takes the fallback road and aot_validate compares the
+// result against the interpreter. Green with it set is what proves the road, not the absence of a
+// test that walks it.
+function AotPrintStringForceHelper(VMSelf, CtxObj: Pointer; SrcSlot, WithNewline: PtrInt): PtrInt; cdecl;
+begin
+  Result := 1;
+end;
+
 procedure AotPrintEnd(VMSelf: Pointer); cdecl;
 var
   VM: TBytecodeVM;
@@ -10273,6 +10324,10 @@ begin
   // behaviour's own property, so it needs no per-run flavor the way StrMid does.
   C.PrintSemi := @AotPrintSemicolon;
   C.PrintEnd := @AotPrintEnd;
+  if GetEnvironmentVariable('AOT_PRINTSTR') = '2' then
+    C.PrintStr := @AotPrintStringForceHelper       // injection: see the comment on that function
+  else
+    C.PrintStr := @AotPrintString;
 end;
 
 procedure TBytecodeVM.RebuildJitArrDesc;

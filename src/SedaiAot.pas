@@ -110,6 +110,10 @@ type
     // and, like StrRegs, is sized once and never reallocated, so it is set with them once per Run.
     // No new primitive is needed: both directions are an AotStrAssign between two managed slots.
     XferStr: Pointer;      // offset 264: @Ctx.XferStr[0]
+    // C7b: the PRINT ITEM as a CONDITIONAL leaf. Answers 0 when it did the work and 1 when CMD
+    // redirection is active, which is the one branch of the arm that can RAISE; the emitted code
+    // then falls through to the ordinary helper call.
+    PrintStr: Pointer;     // offset 272: @AotPrintString (VMSelf, CtxObj, srcSlot, withNewline) -> 0/1
   end;
   PAotCtx = ^TAotCtx;
 
@@ -139,6 +143,7 @@ const
   AOTCTX_PRINTSEMI   = 248;
   AOTCTX_PRINTEND    = 256;
   AOTCTX_XFERSTR     = 264;
+  AOTCTX_PRINTSTR    = 272;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -423,6 +428,7 @@ var
   GRecAllocState: Integer = -1;    // C6 New/Delete/RecMark as leaf calls: -1 unread, 0 off, 1 on
   GPrintOpState: Integer = -1;     // C7 PrintSemicolon/PrintEnd as leaf calls: -1 unread, 0 off, 1 on
   GXferStrState: Integer = -1;     // C7 XferLoad/StoreString as leaf calls: -1 unread, 0 off, 1 on
+  GPrintStrState: Integer = -1;    // C7b PrintString/Ln as a conditional leaf: -1 unread, 0 off, 1 on
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
   // A STRING array element can be reached natively (through AotStrAssign) only when an
   // out-of-range index cannot RAISE: the helper would throw across a compiled frame that is not
@@ -607,6 +613,18 @@ begin
     else GXferStrState := 1;
   end;
   Result := GXferStrState = 1;
+end;
+
+// C7b: the PRINT ITEM as a conditional leaf (fast path inline, CMD redirection back to the helper).
+// AOT_PRINTSTR=0 puts it back on AotExecOne unconditionally.
+function AotPrintStrNative: Boolean;
+begin
+  if GPrintStrState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_PRINTSTR') = '0' then GPrintStrState := 0
+    else GPrintStrState := 1;
+  end;
+  Result := GPrintStrState = 1;
 end;
 
 // AOT_DYNF gate, read once. Tri-state: 0 = AUTO (default: enable per region only where the
@@ -1014,6 +1032,9 @@ begin
     // the CMD-redirection branch, which raises a BASIC error, and an exception must not unwind
     // through native frames. AotIsNative reads AotPrintOpNative for the A/B switch.
     ssaPrintSemicolon, ssaPrintEnd,
+    // C7b: and the print ITEM, whose native form is a CONDITIONAL leaf - it falls back to the
+    // helper for CMD redirection, so it still needs a PC and still carries a deopt hazard.
+    ssaPrintString, ssaPrintStringLn,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     // C7: and the STRING pair, which had been left behind. Both are one AotStrAssign between two
@@ -1226,6 +1247,11 @@ begin
     // C7: the two print bookkeeping opcodes. No operands to check - only the A/B gate.
     ssaPrintSemicolon, ssaPrintEnd:
       Result := AotPrintOpNative;
+    // C7b: the print item. The operand must be a string REGISTER (a constant would have no bank
+    // slot to read); anything else takes the helper road whole.
+    ssaPrintString, ssaPrintStringLn:
+      Result := AotPrintStrNative and (Ins.Src1.Kind = svkRegister) and
+                (Ins.Src1.RegType = srtString);
     // C7: the STRING transfer pair. The slot index travels in the bytecode Immediate, which the
     // emitter reads at compile time, so the operand shape is fixed - only the A/B gate to check.
     ssaXferLoadString, ssaXferStoreString:
@@ -2794,6 +2820,29 @@ var
     E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     //   float bank base, hence SpillVolatiles
     E.EmitBytes([$41, $FF, $D3]);                         //   FIRST; StrCallEpilogue restores it)
     StrCallEpilogue;
+  end;
+
+  // C7b: a PRINT ITEM. Fast path is a leaf call; the primitive answers 1 when CMD redirection is
+  // active - the one branch of the arm that can RAISE - and then the ordinary helper call runs,
+  // on an interpreter frame where an exception is legal. Shape mirrors EmitStrAscMid's inline
+  // fast path: rel32 over the slow sequence, because that sequence is well past 127 bytes.
+  procedure EmitPrintStringNative(apc: Integer; WithNL: Boolean);
+  var srcBank, pDone, nl: Integer;
+  begin
+    srcBank := SReg(Cur.Src1); if not OK then Exit;
+    if WithNL then nl := 1 else nl := 0;
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_PRINTSTR);        // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     // arg0 = VMSelf
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);     // arg1 = CtxObj
+    MovImm64(ABI_ARG3, nl);                               // arg3 = with-newline flag
+    MovImm64(ABI_ARG2, srcBank);                          // arg2 = string slot (LAST: r8 on Win64)
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;                                      // restores r8/rsi/volatiles/array cache
+    E.EmitBytes([$48, $85, $C0]);                         // test rax, rax
+    E.EmitBytes([$0F, $84]); pDone := E.Len; E.Emit32(0); // jz done   (0 = handled natively)
+    EmitHelperCall(apc);                                  // 1 = CMD redirection: the old road
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));      // @done
   end;
 
   procedure EmitPrintEnd;
@@ -4749,6 +4798,21 @@ var
             else
               HasHelperCall := True;   // a leaf call still needs a call-ready frame
           end;
+          // C7b: the print ITEM. Its operand is a STRING bank slot - nothing to count, and counting
+          // it would bail the region with 'string-operand'. Unlike the pair above it CAN deopt: the
+          // CMD-redirection branch falls back to the helper call, so it needs both a PC and the
+          // deopt hazard, exactly as if it had stayed on the helper road.
+          ssaPrintString, ssaPrintStringLn:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              HasDeopt := True;
+              if not AotHelperRoutable(Prog, o) then Fail('printstr-not-routable');
+              if Prog.GetSsaPc(o) < 0 then Fail('no-pc-printstr');
+            end;
+          end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
           ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -5989,6 +6053,13 @@ var
       // C7: PRINT's bookkeeping pair as leaf calls. No PC is needed - neither can deopt.
       ssaPrintSemicolon: EmitPrintSemi;
       ssaPrintEnd: EmitPrintEnd;
+
+      // C7b: the print ITEM. A PC is needed because the slow path IS the helper call.
+      ssaPrintString, ssaPrintStringLn:
+      begin
+        apc := NeedPC; if not OK then Exit;
+        EmitPrintStringNative(apc, Cur.OpCode = ssaPrintStringLn);
+      end;
 
 
       ssaLoadConstInt:
