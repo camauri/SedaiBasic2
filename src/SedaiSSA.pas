@@ -571,6 +571,8 @@ type
     function EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;  // indirect call through an already-loaded entry-PC value
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
+    function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
+    procedure CheckMemberAccess(const TypeName, MemberName: string);        // OOP: refuse an illegal member access
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
@@ -20248,6 +20250,65 @@ begin
   Result := -1;
 end;
 
+function TSSAGenerator.MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;
+// OOP: 'PRIVATE', 'PROTECTED' or '' (public). The stamp sits on the type that DECLARED the member, so
+// walk up until one is found - and report that type in Owner, because the permission is decided
+// against the DECLARING level, not against the one the expression happens to be typed as.
+var
+  T, m: string;
+  Idx, Guard: Integer;
+begin
+  Result := '';
+  Owner := '';
+  T := UpperCase(TypeName);
+  m := UpperCase(MemberName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    if Assigned(FUDTs[Idx].Node) and (FUDTs[Idx].Node.Attributes.Values['ACCESS' + m] <> '') then
+    begin
+      Owner := FUDTs[Idx].Name;
+      Exit(FUDTs[Idx].Node.Attributes.Values['ACCESS' + m]);
+    end;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+procedure TSSAGenerator.CheckMemberAccess(const TypeName, MemberName: string);
+// ⭐ "Private:" used to be recognised and skipped - the comment in the parser said "access is not
+// enforced (v1)" - so a field written under it could be read from anywhere. fbc rejects that with
+// "error 202: Illegal member access"; we printed the value, which is encapsulation that exists only
+// in the author's head.
+//
+// PRIVATE   reachable only from inside the DECLARING type's own methods.
+// PROTECTED reachable from the declaring type and from any descendant of it.
+// Outside every method (FCurrentThisType is empty) neither is reachable, which is the case the
+// probe hit: module-level code reading x.segreto.
+var
+  Level, Owner: string;
+begin
+  Level := MemberAccessLevel(TypeName, MemberName, Owner);
+  if (Level = '') or (Owner = '') then Exit;                 // public: nothing to say
+  if Level = 'PRIVATE' then
+  begin
+    if UpperCase(FCurrentThisType) = UpperCase(Owner) then Exit;
+  end
+  else if Level = 'PROTECTED' then
+  begin
+    if (FCurrentThisType <> '') and IsSubtypeOf(FCurrentThisType, Owner) then Exit;
+  end
+  else
+    Exit;                                                    // unknown stamp: do not invent a rule
+  raise Exception.CreateFmt(
+    'Illegal member access: "%s" is %s in type "%s"%s.',
+    [UpperCase(MemberName), LowerCase(Level), UpperCase(Owner),
+     IfThen(FCurrentThisType = '', ' and this code is outside any of its methods',
+            ' and "' + UpperCase(FCurrentThisType) + '" may not reach it')]);
+end;
+
 function TSSAGenerator.UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
   out Bank: TSSARegisterType; out Slot: Integer; out NestedType: string): Boolean;
 // Find a field by name. BACKWARDS -- and so does every other by-name field lookup in this family.
@@ -20274,6 +20335,11 @@ begin
   for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then
     begin
+      // OOP: the permission is checked HERE because this is the one funnel every by-name field read
+      // and write passes through - nine callers, all of them handing it a name the user wrote. The
+      // loops that ENUMERATE fields go by index and never come here, so construction, defaults and
+      // destructors are untouched by the rule.
+      CheckMemberAccess(FUDTs[UDTIdx].Name, F);
       Bank := FUDTs[UDTIdx].Fields[i].Bank;
       Slot := FUDTs[UDTIdx].Fields[i].Slot;
       NestedType := FUDTs[UDTIdx].Fields[i].NestedType;

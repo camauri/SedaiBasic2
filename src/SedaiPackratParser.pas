@@ -146,7 +146,7 @@ type
     function FindMatchingNext: Integer;
     function FindMatchingEnd(StartToken: TTokenType): Integer;
     function ParseDimensionList: TASTNode;
-    procedure ParseInTypeMethodDecl(TypeNode: TASTNode);   // one "Declare ..." line inside a TYPE body
+    procedure ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = '');   // one "Declare ..." line inside a TYPE body
     function NoDefaultPlaceholder(Tok: TLexerToken): TASTNode;
     procedure SkipTypeQualifiers;
     function SkipTypeQualifiersConst: Boolean;   // ...and report whether CONST was one of them
@@ -3409,7 +3409,7 @@ begin
   end;
 end;
 
-procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode);
+procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = '');
 // One "Declare [Virtual|Abstract|Static|Const] Sub|Function|Property|Operator|Constructor|Destructor
 // name(...) [As ret]" line inside a TYPE body, with DECLARE already consumed. Nothing is emitted: the
 // method is defined out of line. Only the two decorators that change how the DEFINITION reads are
@@ -3478,6 +3478,8 @@ begin
       TypeNode.Attributes.Values['OVERRIDE' + MethName] := '1';
     if IsFinal and Assigned(TypeNode) then
       TypeNode.Attributes.Values['FINAL' + MethName] := '1';
+    if Assigned(TypeNode) and (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
+      TypeNode.Attributes.Values['ACCESS' + MethName] := CurAccess;
     if IsStatic and Assigned(TypeNode) then
       FTypeStaticMethods.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
   end;
@@ -3570,7 +3572,9 @@ var
   PrevIdx, NestedUnionDepth: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   IsStaticField, LeadingType, FpIsFP: Boolean;
+  CurAccess: string;   // the Public:/Private:/Protected: section currently in force
 begin
+  CurAccess := '';
   NestedUnionDepth := 0;
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
@@ -3747,11 +3751,15 @@ begin
     end;
     PrevIdx := Context.CurrentIndex;
     TokU := UpperCase(VarToStr(Context.CurrentToken.Value));
-    // FreeBASIC access specifiers inside a TYPE: "Public:" / "Private:" / "Protected:". Access is not
-    // enforced (v1) — recognize and skip the label so it is not mistaken for a field.
+    // FreeBASIC access specifiers inside a TYPE: "Public:" / "Private:" / "Protected:".
+    // ⭐ They used to be recognised and SKIPPED - "access is not enforced (v1)" - which meant a field
+    // written under Private: could be read from anywhere. fbc rejects that with "error 202: Illegal
+    // member access"; we printed the value. The label now sets the level for everything that follows
+    // it in the body, and each member is stamped with it (ACCESS<NAME> on the type node).
     if ((TokU = 'PUBLIC') or (TokU = 'PRIVATE') or (TokU = 'PROTECTED')) and
        Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparStmt) then
     begin
+      CurAccess := TokU;
       Context.Advance;                              // specifier
       Context.Advance;                              // ':'
       Continue;
@@ -3768,7 +3776,7 @@ begin
     if TokU = 'DECLARE' then
     begin
       Context.Advance;                              // consume DECLARE
-      ParseInTypeMethodDecl(Result);
+      ParseInTypeMethodDecl(Result, CurAccess);
       Continue;
     end;
     // FreeBASIC lets CONSTRUCTOR / DESTRUCTOR / OPERATOR / PROPERTY be introduced in the TYPE body
@@ -3892,6 +3900,8 @@ begin
         end;
       end;
       Result.AddChild(FieldNode);
+      if (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
+        Result.Attributes.Values['ACCESS' + UpperCase(VarToStr(FieldNode.Value))] := CurAccess;
       // FreeBASIC "As <type> a, b, c": the leading-AS type is shared by every comma-separated name
       // (e.g. "As String name, value" -> both String). Only the As-first form shares this way; a
       // name-first field carries its own trailing "As type", so its comma is handled by re-parsing.
