@@ -175,6 +175,52 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
 | Date/time | ✓ | Date serial = Double (epoch 1899-12-30). `NOW`/`TIMER`/`DATE`/`TIME` (bare), `DATESERIAL`/`TIMESERIAL`, `DATEVALUE`/`TIMEVALUE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/`WEEKDAY`, `MONTHNAME`/`WEEKDAYNAME`, `ISDATE`, `DATEADD`/`DATEDIFF`/`DATEPART` (intervals `yyyy q m y d w ww h n s`), `SETDATE`/`SETTIME` (VM-internal clock offset). Field functions intercepted by name so `day`/`month`/`year`/`second`… stay usable as variables |
 
+## Object-orientation
+
+Every keyword below is accepted; the third column says what it *does*, which is not the same question.
+FreeBASIC source is a constraint here - a program written for fbc must behave the same way - while a
+MODERN extension is under no obligation to compile under fbc. Where the two dialects differ, the
+difference is stated rather than left to be discovered.
+
+| keyword | form | status |
+|---|---|---|
+| `Type` … `End Type` | `Type T` / `End Type` | FB. The class. |
+| `Extends` | `Type B Extends A` | FB. Single inheritance; fields of the base come first in the layout. |
+| `Object` | `Type T Extends Object` | FB. The built-in RTTI base; `x Is Object` is true for any derived type. |
+| `This` | `This.field`, `This.Method()` | FB. Implicit inside a method, for fields *and* calls. |
+| `Base` | `Base.Method()`, `Base.field` | FB. The super call, dispatched **non**-virtually against the parent. |
+| `Constructor` / `Destructor` | `Constructor T()` | FB. The base is constructed first and destroyed last; `Base(args)` chains explicitly. |
+| `Declare` | `Declare Sub F()` | FB. Methods are defined out of line (`Sub T.F()`). |
+| `Virtual` | `Declare Virtual Sub F()` | FB. **Required for dynamic dispatch.** Without it a redeclaration in a child *shadows*, and the call resolves on the static type - as fbc does. |
+| `Abstract` | `Declare Abstract Sub F()` | FB. No body here; implies `Virtual`. A type that inherits one and does not implement it **cannot be instantiated**. |
+| `Static` | `Declare Static Sub F()`, `Static n As Integer` | FB. No implicit `This`; one storage shared by all instances. |
+| `Private:` `Protected:` `Public:` | section labels in the type body | FB. **Enforced.** `Private` reaches only the declaring type's own methods, `Protected` also its descendants. |
+| `Property` | `Property T.Length()` | FB. Getter and setter forms. |
+| `Operator` | `Operator T.+ (…)` | FB. Including the compound (`*=`) and `Cast` forms. |
+| `Implements` | `Type T Implements I1, I2` | **MODERN extension.** fbc reserves the word and never implemented it. Here it is a *checked contract*. |
+| `Interface` … `End Interface` | `Interface I` / `End Interface` | **MODERN extension.** Does not exist in fbc. Sugar for a type whose every method is implicitly `Abstract` (hence `Virtual`) and which carries no fields. A type may implement several. |
+| `Override` | `Declare Override Sub F()` | **MODERN extension.** Verified: an ancestor must declare that method `Virtual`. Catches the mistyped override, which would otherwise become a new method in silence. Optional - requiring it would reject FreeBASIC source. |
+| `Final` | `Declare Virtual Final Sub F()` | **MODERN extension.** No descendant may redeclare it. |
+| `New` / `Delete` | `New T`, `Delete p` | FB. Heap instances. |
+| `Is` | `x Is T`, `x Is I` | FB, extended: also answers for an implemented **interface**. |
+| `With` … `End With` | `With This.FEnv` / `.Attack = 0.001` | FB. Member access shorthand, in read and write. |
+
+### Declared divergences from FreeBASIC
+
+- `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
+  there. That is the point of an extension.
+- `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
+  names an interface must provide every method of it, and it *is-a* that interface for dispatch and
+  for `Is`. An fbc source is unaffected, since fbc has no interfaces to name.
+
+### Where the two dialects agree, and why it matters
+
+The dynamic type of an object walks the inheritance chain during construction and destruction, so a
+virtual call made from a constructor reaches the level being constructed and not the most-derived
+override - C++ and FreeBASIC semantics. The same holds in destructors, mirrored. Calling a virtual
+method from a constructor is therefore of limited use in either dialect, and two-phase construction
+remains the clearer arrangement.
+
 ## Numeric output and `OPTION DIGITS` (SedaiBasic extension)
 
 `PRINT` shows a `Double` with **16** significant digits and a `Single` with **7**, the same as
