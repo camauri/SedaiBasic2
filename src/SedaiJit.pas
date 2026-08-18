@@ -2105,8 +2105,44 @@ var
     if pDone >= 0 then E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));   // @done
     IStore(dReg, RAX);
   end;
-  // ⛔ The two fused ACCUMULATOR forms - bcStrConcatCharAt and bcStrAppendMapped - are NOT lowered
-  // here, and the reason is not effort: NOTHING IN THE PIPELINE PRODUCES THEM TODAY. The SSA fusion
+  // ⭐ THE TWO FUSED ACCUMULATOR FORMS, LOWERED - 18 Aug 2026. The note that used to sit here said
+  // they were not worth an emitter because "nothing in the pipeline produces them today", and that
+  // was true until the SSA fusions were turned on for the interpreter as well. The moment they
+  // started being produced, the JIT began routing them through the helper on EVERY iteration of
+  // reverse-complement's inner loop - 50 million times - and read 6063 ms against the AOT's 1400.
+  // The premise of that note expired, and unexercised codegen stopped being the risk: the risk
+  // became the helper round trip in the hottest loop we have.
+  //
+  // Both are a leaf call to a primitive the context already carries (the AOT has called them since
+  // C5), and both take the same four arguments: &dst, the accumulator or source VALUE, the table
+  // VALUE, and an INT index. Order matters only in that the pooled int is read BEFORE the string
+  // bank base lands in rax, exactly as EmitStrAscMidJ does above.
+  procedure EmitStrConcatCharAtJ(dSlot, accSlot, tabSlot, kReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG3, kReg);                                     // arg3 = IntRegs[k], pool still intact
+    StrBaseRax;                                                  // rax = string bank base
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);                    // arg0 = &StringRegs[dest]
+    MovLoadR(ABI_ARG1, RAX, LongWord(accSlot) * 8);              // arg1 = StringRegs[acc] (value)
+    MovLoadR(ABI_ARG2, RAX, LongWord(tabSlot) * 8);              // arg2 = StringRegs[tab] (value)
+    LeafCall(Prim(AOTCTX_STRCONCATCHARAT));
+    LeafRestore;
+  end;
+
+  procedure EmitStrAppendMappedJ(dSlot, srcSlot, tabSlot, idxReg: Integer);
+  begin
+    SpillVol; LeafSaveBases;
+    ILoadTo(ABI_ARG3, idxReg);                                   // arg3 = IntRegs[i]
+    StrBaseRax;
+    LeaR(ABI_ARG0, RAX, LongWord(dSlot) * 8);                    // arg0 = &StringRegs[dest] (accumulator)
+    MovLoadR(ABI_ARG1, RAX, LongWord(srcSlot) * 8);              // arg1 = StringRegs[src] (value)
+    MovLoadR(ABI_ARG2, RAX, LongWord(tabSlot) * 8);              // arg2 = StringRegs[tab] (value)
+    LeafCall(Prim(AOTCTX_STRAPPENDMAPPED));
+    LeafRestore;
+  end;
+
+  // ⛔ HISTORICAL NOTE, kept because it explains the shape: they were NOT lowered here, and the reason
+  // was not effort: NOTHING IN THE PIPELINE PRODUCED THEM. The SSA fusion
   // that made ssaStrConcatCharAt is switched off because it miscompiled (five values, four operand
   // slots), and the bytecode fusion that made bcStrAppendMapped is closed by measurement - see the
   // long note in SedaiSuperinstructions.pas, where it came out FOUR TIMES slower under the AOT.
@@ -2724,6 +2760,16 @@ var
       bcStrAscMid:
         if UseLeaf and not (InCallee or InGosub) then
           EmitStrAscMidJ(I^.Dest, I^.Src1, I^.Src2, Integer(I^.Immediate and $FFFF))
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      // The index travels in the Immediate for both (see ScanI), the three string slots in
+      // Dest/Src1/Src2. Same two-way shape as every other string op here.
+      bcStrConcatCharAt:
+        if UseLeaf and not (InCallee or InGosub) then
+          EmitStrConcatCharAtJ(I^.Dest, I^.Src1, I^.Src2, Integer(I^.Immediate and $FFFF))
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcStrAppendMapped:
+        if UseLeaf and not (InCallee or InGosub) then
+          EmitStrAppendMappedJ(I^.Dest, I^.Src1, I^.Src2, Integer(I^.Immediate and $FFFF))
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcRecordNew:
         if UseLeaf and not (InCallee or InGosub) then

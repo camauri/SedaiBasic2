@@ -1978,7 +1978,28 @@ begin
   // leaves it out, which is the right default for a file that will run interpreted.
   ForceFuse := GetEnvironmentVariable('STRCHARFUSE');
   if ForceFuse = '0' then Exit;
-  if (ForceFuse <> '1') and (not GAotWillRun) then Exit;
+  // ⭐ 18 ago 2026: THE GATE IS OPEN FOR THE INTERPRETER TOO, and the measurement above is overturned.
+  //
+  // It used to read `if (ForceFuse <> '1') and (not GAotWillRun) then Exit` - the fusion followed the
+  // AOT, because when it was written the interpreter paid 5.4% for it: bcStrConcatCharAt lives in the
+  // superinstruction group and costs a call into ExecuteSuperinstruction, which was more than the
+  // character it saved. That is no longer true. Re-measured on reverse-complement at N=5M,
+  // interleaved in both orders, six samples each and NO overlap between the two distributions:
+  //
+  //     interpreter, fusion off  6676 ms  ->  on  5986 ms   -10.3%
+  //     fasta interpreted                                    -2%
+  //     k-nucleotide interpreted                              unchanged
+  //
+  // What changed in between is the rest of the string runtime - capacity on append, and the codepage
+  // fix of this morning - which moved the balance: the allocation the fusion removes now costs more
+  // than the dispatch it adds. ⛔ A verdict about relative cost has a DATE on it: this one was right
+  // in July and wrong in August, and nothing but re-measuring would have said so.
+  //
+  // (It also stops being a question at all once the AOT runs by default, which is the plan: the old
+  // gate would have opened by itself and silently changed what the interpreter runs. Better opened
+  // deliberately, with the number that justifies it.)
+  //
+  // STRCHARFUSE=0 still forces it off - that is the A/B, and it is how the numbers above were taken.
   MaxVer := 0;
   for b := 0 to Blocks.Count - 1 do
   begin
@@ -2318,7 +2339,15 @@ begin
   // correctly on a probe with a SINGLE site: a single-site probe does not show that a guard is usable.
   if GetEnvironmentVariable('APPENDMAP') = '0' then Exit;
   if GetEnvironmentVariable('STRCHARFUSE') = '0' then Exit;
-  if (GetEnvironmentVariable('STRCHARFUSE') <> '1') and (not GAotWillRun) then Exit;
+  // ⛔⛔⛔ THE TWO GATES OPEN TOGETHER OR NOT AT ALL, and opening only the other one is how that was
+  // learned. RunConcatCharFusion rewrites "T = Mid(tab,k,1); D = Concat(acc,T)" into ConcatCharAt -
+  // which is exactly the SHAPE this pass matches. Open that gate alone and the small fusion eats the
+  // big one's input: reverse-complement interpreted read 7448 ms, WORSE than the 6852 with both
+  // fusions off, against 5956 with both on. The worst of the three states, and it had never been
+  // measured because until then it could not occur. ⇒ optimization-erases-the-shape-an-analysis-matches
+  //
+  // So this one follows the same rule as its producer: on unless STRCHARFUSE=0 says otherwise.
+  // (It used to read `if ... <> '1' and not GAotWillRun then Exit` - the AOT-only gate.)
 
   MaxVer := 0;
   for b := 0 to Blocks.Count - 1 do
