@@ -2561,7 +2561,15 @@ begin
     // Array element and bound reads. The array itself lives in FArrays, a bank of its own that is
     // never relocated, so an array opcode is transparent to the sliding view: only its register
     // operands matter here. Src1 is the array ID (an immediate), Src2 the index register.
-    bcArrayLoadInt, bcArrayLBound, bcArrayUBound:
+    bcArrayLoadInt, bcArrayLBound, bcArrayUBound,
+    // ⭐ THE FUSED LOOP COUNTER writes its counter into Dest and nothing else in the bank.
+    // Auditing this family is not a micro-narrowing: an UNAUDITED opcode disqualifies its whole
+    // procedure from call-site liveness (see BuildCallSiteLiveness), and every superinstruction was
+    // unaudited - so a single fused branch inside a recursive SUB pushed every call in it back to
+    // the callee-footprint snapshot. Measured on binary-trees: the superinstruction pass and the
+    // frame narrowing were cancelling each other out, 3.7 s -> 7.6 s, TWICE as slow with strictly
+    // FEWER instructions to execute. The fusion was never the cost; losing the narrowing was.
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
       Result := IW_DEST;
     // Dest is not an operand of these at all. Saying so matters for the LOW end of the range and
     // only there: an absent operand lowers to register 0 ([[absent-operand-lowers-to-r0]]), so
@@ -2593,7 +2601,13 @@ begin
     // and bcConScreen even uses Immediate as a register INDEX.
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn, bcPrintInt, bcPrintIntLn,
     bcPrintComma, bcPrintSemicolon, bcPrintTab, bcPrintSpc, bcPrintNewLine, bcPrintEnd,
-    bcPrintBool, bcPrintUInt:
+    bcPrintBool, bcPrintUInt,
+    // The fused compare-and-branch family consumes its operands and stores nothing: the truth value
+    // that used to occupy a register is exactly what the fusion removes. The float forms read the
+    // float bank, so they write no integer register either.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat:
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
@@ -2661,7 +2675,18 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadString, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase:
+    bcArrayBindInd, bcArrayErase,
+    // ⭐ THE FUSED BRANCH FAMILY WRITES NO REGISTER AT ALL, in any bank - it consumes a comparison
+    // and moves the PC - and the loop-counter forms write only the integer counter. Leaving them
+    // unaudited is what made the superinstruction pass LOSE on call-heavy programs: BW_UNKNOWN
+    // credits Dest, Src1 and Src2 to this bank, so one fused branch in a recursive SUB widened its
+    // STRING bank, and the string bank is refcounted. binary-trees paid it once per call.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    // The float compare-and-branch READS two floats and writes none of them.
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat:
       Result := BW_NONE;
   else
     Result := BW_UNKNOWN;
@@ -2698,7 +2723,14 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase:
+    bcArrayBindInd, bcArrayErase,
+    // The fused branch family again - and THIS is the bank where leaving it unaudited was expensive,
+    // because every entry here is a refcounted assignment. See the note in BcFloatWriteShape.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat:
       Result := BW_NONE;
   else
     Result := BW_UNKNOWN;
@@ -2722,6 +2754,27 @@ const
   // wrong in the direction that kills a live register.
   US_DEST    = 4;
 
+function BcIsFusedCondBranch(Op: Word): Boolean;
+// The superinstruction branch family: every one of them carries its target in Immediate and either
+// takes it or falls through, so each has TWO successors exactly like bcJumpIfZero.
+//
+// ⛔ This list and the two shape tables above must move together. Auditing an opcode's operands
+// while leaving its control flow unknown is worse than not auditing it at all: the procedure becomes
+// ELIGIBLE, and the backward liveness then treats a branch as pure fall-through - so a register live
+// only on the taken edge is called dead and gets dropped from the frame snapshot. That is a silent
+// miscompile, not a missed narrowing.
+begin
+  case Op of
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 function BcIntUseShape(Op: Word): Integer;
 begin
   case Op of
@@ -2740,7 +2793,10 @@ begin
     bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayErase,
     // PRINT of a float or a string, and the pure layout ops: nothing of ours is read.
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
-    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd:
+    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd,
+    // A FLOAT compare-and-branch reads two floats and branches: nothing of ours is read.
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat:
       Result := US_NONE;
     bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero,
     bcIntToFloat, bcIntToString, bcNarrowInt,
@@ -2751,7 +2807,9 @@ begin
     // ...and PRINT of an integer value, or a TAB/SPC count, reads it from Src1.
     bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt, bcPrintTab, bcPrintSpc,
     // The counting bit intrinsics take one operand; the WIDTH is an immediate, not a register.
-    bcBitClz, bcBitCtz, bcBitPopcnt:
+    bcBitClz, bcBitCtz, bcBitPopcnt,
+    // "if r[Src1] <> 0 goto target": one integer operand, the target is an immediate.
+    bcBranchEqZeroInt, bcBranchNeZeroInt:
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
@@ -2766,8 +2824,15 @@ begin
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
     bcBitRotl, bcBitRotr,   // Src1 = value, Src2 = rotate count (the width is an immediate)
-    bcRecordStoreInt:   // Src1 = handle, Src2 = the integer value being stored
+    bcRecordStoreInt,   // Src1 = handle, Src2 = the integer value being stored
+    // The fused compare-and-branch reads the two operands the CmpInt used to read.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
       Result := US_SRC1 or US_SRC2;
+    // The fused loop counter reads all three: the counter in Dest (which it also writes), the step
+    // in Src1 and the limit in Src2. Dropping US_DEST here would be the silent miscompile this
+    // table's header warns about - the counter would look dead across a call.
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
+      Result := US_SRC1 or US_SRC2 or US_DEST;
   else
     Result := US_UNKNOWN;
   end;
@@ -3393,7 +3458,8 @@ begin
       Op := Instr.OpCode;
       if (BcIntWriteShapeRaw(Op) = IW_UNKNOWN) or (BcIntUseShape(Op) = US_UNKNOWN) then
       begin Eligible := False; Break; end;
-      if (Op = Ord(bcJump)) or (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) then
+      if (Op = Ord(bcJump)) or (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) or
+         BcIsFusedCondBranch(Op) then
       begin
         Tgt := Instr.Immediate;
         if (Tgt < PcStart) or (Tgt > PcEnd) then begin Eligible := False; Break; end;
@@ -3427,7 +3493,8 @@ begin
         begin
           for w := 0 to Words - 1 do Out_[w] := Live[(Instr.Immediate - PcStart) * Words + w];
         end
-        else if (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) then
+        else if (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) or
+                BcIsFusedCondBranch(Op) then
         begin
           for w := 0 to Words - 1 do
             Out_[w] := Live[(Instr.Immediate - PcStart) * Words + w] or

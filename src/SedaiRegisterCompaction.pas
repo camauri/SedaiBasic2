@@ -177,217 +177,17 @@ begin
 end;
 
 function TRegisterCompactor.DestIsIntReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // SUB/FUNCTION transfer-register load (M2): Dest is the int register written.
-    bcXferLoadInt,
-    // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
-    bcRecordNew, bcRecordNewBlock, bcRecordLoadInt,
-    // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
-    bcRecordTypeId,
-    // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).
-    bcLoadProcAddr, bcThreadCreate,
-    // M5.5: ThreadSelf writes the current thread handle (int).
-    bcThreadSelf,
-    // Mutexes (M5.4): MutexCreate writes a mutex handle (int).
-    bcMutexCreate,
-    // Condition variables (M5.4): CondCreate writes a cond-var handle (int).
-    bcCondCreate,
-    // === GROUP 0: Core VM operations ===
-    // Integer operations
-    bcLoadConstInt, bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
-    bcModInt, bcNegInt, bcDivUInt, bcModUInt,
-    // Comparison results (stored as int)
-    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
-    bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
-    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
-    bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
-    // Bitwise operations (result is int)
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
-    // MODERN bit intrinsics (result is int). Their Immediate is the WIDTH, a plain constant, so they
-    // deliberately stay out of the ImmediateIsXxxReg lists.
-    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
-    // Conversions to int
-    bcFloatToInt, bcStringToInt, bcFloatRound,
-    bcNarrowInt,   // B1.5: integer width narrowing (Dest=int)
-    bcSingleBits,  // SINGLEBITS(x): the 32 bits of a binary32, in an INT register
-    // === GROUP 1: String operations ===
-    bcStrLen,      // String length returns int
-    bcStrLenW,     // LEN(wstring) returns int codepoint count
-    bcStrSAdd,     // SADD(s) returns int (raw pointer)
-    bcFileExists,  // FILEEXISTS(path) returns int (-1/0)
-    bcFileLen,     // FILELEN(path) returns int (size in bytes)
-    bcStrAsc,      // ASC(str) returns int ASCII code
-    bcStrAscMid,   // ASC(MID$(s,start,len)) fused - also an int destination
-    bcStrInstr,    // INSTR(haystack, needle) returns int position
-    bcStrInstrRev, // INSTRREV(str, sub) returns int position
-    // Both "Any set" forms return an int position too. bcStrInstrRevAny was MISSING from this list: its
-    // destination register was never marked as used, so the compactor was free to hand the same int
-    // register to something else -- a miscompile waiting for a program that uses INSTRREV(..., Any ...).
-    bcStrInstrRevAny, bcStrInstrAny,
-    bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
-    bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
-    bcRegexCount,  // REGEXCOUNT(s, pattern) returns an int count
-    bcStrCvInt,    // CVI/CVL/CVSHORT/CVLONGINT(str) returns int (B3 serialization)
-    // === GROUP 2: Date/time -> int ===
-    bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial) -> int
-    bcIsDate,      // ISDATE(str) -> int bool
-    bcDateDiff, bcDatePart,  // DATEDIFF/DATEPART -> int
-    // === GROUP 3: Array operations ===
-    bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
-    bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
-    bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
-    bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
-    bcRawAlloc, bcRawRealloc,  // raw heap: Dest = raw pointer (int)
-    bcRawLoadInt,              // raw deref (int) - Dest = value
-    bcRawMemCopy, bcRawMemMove,  // FB_MEMCOPY/FB_MEMMOVE: Dest = destination pointer returned (int)
-    // === GROUP 4: I/O operations ===
-    bcInputInt,      // Input int
-    bcDataReadInt,   // Read next DATA value into int register
-    // === GROUP 6: File I/O operations ===
-    bcInputFileInt,  // INPUT# file, int var
-    bcFileQuery,     // EOF/FREEFILE/LOF/LOC/SEEK -> int result
-    bcFileAttr,      // FILEATTR(filenum, returntype) -> int result
-    bcFileSetEof,    // FILESETEOF filenum -> int status result
-    bcOpenFunc,      // Open(...) FUNCTION form -> int error code in Dest
-    bcDirAttr,       // DIR: attributes of the entry just returned -> int Dest
-    bcVarArgBase,    // CVA_START: the cursor at the frame's first argument -> int Dest
-    bcVarArgGetInt,  // CVA_ARG of an integer type -> int Dest
-    bcGetBinInt,     // GET #n binary -> int Dest
-    bcArrayIdxResolve,  // runtime multi-dim index -> int Dest (linear index)
-    bcArrayLoadIndInt,      // UDT array member load (int) - Dest is WRITTEN
-    bcArrayIdxResolveInd,   // member multi-dim index -> int Dest (linear index)
-    bcArrayLBoundInd, bcArrayUBoundInd,  // UDT array member LBOUND/UBOUND -> int Dest
-    // === GROUP 5: Special variables ===
-    bcLoadTI,         // TI: jiffies since start (int)
-    bcLoadEL,         // EL: last error line number (int)
-    bcLoadER,         // ER: last error code (int)
-    bcLoadDS,         // DS: Commodore disk status code (int)
-    bcLoadST,         // ST: Kernal I/O status byte (int)
-    bcCsrlin,         // CSRLIN: current cursor row (int)
-    bcFre,            // FRE: available memory (int)
-    bcCpuCount,       // CPUCOUNT/CPUCORES: processors (int); the immediate is the KIND, not a register
-    // === GROUP 12: BigInt === a VALUE is a handle, and a handle is an int register.
-    bcBigNew,         // Dest = the fresh handle
-    bcBigFromInt,     // Dest = the handle written (and READ: see DestReadIsIntReg)
-    bcBigCopy,        // Dest = the destination handle (likewise)
-    bcBigAdd, bcBigSub, bcBigMul, bcBigMulSmall, bcBigDiv, bcBigMod, bcBigToInt,   // Dest = the result handle (also read: reused if live)
-    bcBigCmp,         // Dest = the -1/0/1 result, a PLAIN int and not a handle
-    bcBigFromStr,     // Dest = the handle built from the text (also read: reused if live)
-    bcGfxScreenPtr,   // SCREENPTR: Dest = raw pointer to the framebuffer (int); no register sources
-    bcPeek,           // PEEK(address): read from memory (int)
-    // === GROUP 7: Sprite functions ===
-    bcBump,           // BUMP(n): collision bitmask (int)
-    bcRspcolor,       // RSPCOLOR(n): multicolor value (int)
-    bcRsprite,        // RSPRITE(sprite, attr): sprite attribute (int)
-    bcConScreen,      // SCREEN(row,col[,flag]): Dest = char code or colour attribute (int)
-    // === GROUP 10: Graphics ===
-    bcGraphicRGBA,    // Dest = RGBA result (int)
-    bcGfxPoint,       // POINT(x,y): Dest = pixel color (int)
-    bcGfxPalGet,      // __PALGET(index,which): Dest = palette component (int)
-    bcGfxForeColor,   // current draw foreground: Dest = colour (int)
-    bcGfxImageCreate, // IMAGECREATE: Dest = image handle (int)
-    bcGfxImageInfo,   // __IMGINFO: Dest = width/height (int)
-    bcGfxScreenInfo,  // __SCRINFO: Dest = screen info field (int)
-    bcGfxPMap,        // __PMAP: Dest = mapped coordinate (int)
-    bcMultikey,       // MULTIKEY: Dest = -1/0 key state (int)
-    bcGetmouse,       // GETMOUSE: Dest = status 0/1 (int)
-    bcMouseAxis,      // __MOUSEAXIS: Dest = cached mouse component (int)
-    bcGetJoystick,    // GETJOYSTICK: Dest = status 0/1 (int)
-    bcJoyBtn,         // __JOYBTN: Dest = cached button bitmask (int)
-    bcStick,          // STICK: Dest = axis position 1..200/0 (int)
-    bcStrig,          // STRIG: Dest = button state -1/0 (int)
-    bcGfxPointCoord,  // POINTCOORD(n): Dest = pen coordinate (int)
-    bcGraphicRdot,    // Dest = pixel cursor info (int)
-    bcGraphicGetMode, // Dest = current graphic mode (int)
-    bcGraphicPos,     // POS(x): cursor column position (int)
-    bcGraphicRclr,    // RCLR(n): color of source (int)
-    bcGraphicRwindow, // RWINDOW(n): window info (int)
-    bcGetColor,       // GETCOLOR(source): color value (int)
-    // === SUPERINSTRUCTIONS ===
-    // Fused arithmetic-to-dest (Int): Dest = Dest op Src1
-    bcAddIntTo, bcSubIntTo, bcMulIntTo,
-    // Fused constant arithmetic (Int): Dest = Src1 op Immediate
-    bcAddIntConst, bcSubIntConst, bcMulIntConst,
-    // Fused loop increment-and-branch (Int): Dest = counter register
-    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
-    // Fused self-increment/decrement (Int): Dest = counter (R/W)
-    bcAddIntSelf, bcSubIntSelf,
-    // Fused array load to int: Dest = result
-    bcArrayLoadIntTo,
-    // DEC(hexstring) - result is int
-    bcStrDec:
-      Result := True;
-    // NOTE: bcArrayStoreInt uses Dest as SOURCE (read), handled by DestReadIsIntReg
-    // NOTE: bcGraphicBox uses Dest as SOURCE (y1 coordinate), handled by DestReadIsIntReg
-    // NOTE: bcArraySwapInt uses Dest as idx2_reg (read), handled by DestReadIsIntReg
-    // NOTE: bcArrayShiftLeft/ReverseRange use Dest as end_idx (read), handled by DestReadIsIntReg
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.DestIsIntReg(OpCode);
 end;
 
 function TRegisterCompactor.DestIsFloatReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // SUB/FUNCTION transfer-register load (M2): Dest is the float register written.
-    bcXferLoadFloat,
-    // UDT/record (M3): RecordLoadFloat writes a float field into Dest.
-    bcRecordLoadFloat,
-    // === GROUP 0: Core VM operations ===
-    bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
-    bcModFloat, bcNegFloat, bcPowFloat,
-    // Conversion to float
-    bcIntToFloat, bcStringToFloat,
-    bcNarrowSingle,  // B1.5: single-precision rounding (Dest=float)
-    bcGetBinFloat,   // GET #n binary -> float Dest
-    bcVarArgGetFloat,  // CVA_ARG of a float type -> float Dest
-    // === GROUP 1: String operations ===
-    bcStrVal,      // VAL(str) - string to float
-    bcStrCvFloat,  // CVS/CVD(str) - binary string to float (B3 serialization)
-    // === GROUP 2: Math functions ===
-    bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
-    bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
-    bcMathLog10, bcMathLog2, bcMathLogN,
-    bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
-    bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,  // hyperbolic
-    bcMathCeil, bcMathRound, bcMathMin, bcMathMax, bcMathCopySign,               // IEEE extras
-    bcBitsToSingle,   // ⛔ the bit-casts are MIXED: this one writes a float, SINGLEBITS writes an INT
-    // Date/time -> float (date serial = Double)
-    bcDateNow, bcDateSerial, bcTimeSerial, bcDateValue, bcDateAdd,
-    bcFileDateTime,  // FILEDATETIME(path): last-modified date serial (float Dest, string Src1)
-    // === GROUP 3: Array operations ===
-    bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
-    bcArrayLoadIndFloat,  // UDT array member load (float) - Dest is WRITTEN
-    bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
-    bcRawLoadFloat,    // raw deref (float) - Dest = value loaded
-    // === GROUP 4: I/O operations ===
-    bcInputFloat,
-    bcDataReadFloat,   // Read next DATA value into float register
-    // === GROUP 6: File I/O operations ===
-    bcInputFileFloat,  // INPUT# file, float var
-    // === GROUP 7: Sprite functions ===
-    bcRsppos,          // RSPPOS(sprite, attr): position/speed (float)
-    // === GROUP 10: Graphics ===
-    bcJoyAxis,         // __JOYAXIS: Dest = cached joystick axis value (float, -1..1 / -1000)
-    // === SUPERINSTRUCTIONS ===
-    // Fused arithmetic-to-dest (Float): Dest = Dest op Src1
-    bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
-    // Fused constant arithmetic (Float): Dest = Src1 op Immediate
-    bcAddFloatConst, bcSubFloatConst, bcMulFloatConst, bcDivFloatConst,
-    // Fused ArrayLoad + Arithmetic: Dest = acc op arr[idx]
-    bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat,
-    // Fused Multiply-Add (FMA): Dest = c op (a * b) or Dest op= a * b
-    bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
-    // Fused Square-Sum and Mul-Mul: Dest = x*x + y*y, dest = a*b*c, etc.
-    bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat:
-      Result := True;
-    // NOTE: bcArrayStoreFloat uses Dest as SOURCE (read), handled by DestReadIsFloatReg
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.DestIsFloatReg(OpCode);
 end;
 
 function TRegisterCompactor.DestIsStringReg(OpCode: TBytecodeOp): Boolean;
@@ -398,359 +198,31 @@ begin
 end;
 
 function TRegisterCompactor.Src1IsIntReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // SUB/FUNCTION transfer-register store (M2): Src1 is the int register read.
-    bcXferStoreInt,
-    // === GROUP 12: BigInt === Src1 is an int register in all three: the Int64 value for
-    // FromInt, the SOURCE handle for Copy and for ToStr.
-    bcBigFromInt, bcBigCopy, bcBigToStr,
-    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall, bcBigDiv, bcBigMod, bcBigToInt,   // Src1 = the left handle
-    // UDT/record (M3): Src1 is the record HANDLE (always an int register) for all field ops.
-    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString,
-    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString,
-    bcRecordTypeId,   // OOP (M4.3): Src1 = handle
-    bcRecordSetTypeId, // OOP: Src1 = handle, Immediate = type id (NOT a register)
-    bcRecordFree,     // DELETE: Src1 = handle
-    bcRecordNewArrayInd,  // array-of-UDT member alloc: Src1 = member array-handle reg (int)
-    bcRecordNewBlock,     // Callocate block: Src1 = count reg (int)
-    // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
-    // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
-    bcThreadCreate, bcThreadWait, bcThreadDetach,
-    // FreeBASIC function pointer call: Src1 = int register holding the target entry PC.
-    bcCallSubIndirect,
-    // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
-    bcMutexLock, bcMutexUnlock, bcMutexDestroy,
-    // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
-    bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy,
-    // RANDOMIZE: Src1 = seed reg (Immediate flags seed vs time-based).
-    bcRandomize,
-
-    // === GROUP 0: Core VM operations ===
-    // Int arithmetic
-    bcCopyInt, bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcNegInt,
-    bcDivUInt, bcModUInt,
-    // Int comparisons
-    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
-    bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
-    // Conversion from int
-    bcIntToFloat, bcBitsToSingle, bcIntToString,
-    bcNarrowInt,   // B1.5: integer width narrowing (Src1=int)
-    // Branch on int (comparison result)
-    bcJumpIfZero, bcJumpIfNotZero,
-    // Error handling - RESUME <line> reads line number from Src1
-    bcResume,
-    // ERROR <n> reads the user error number from Src1
-    bcRaiseError,
-    // Bitwise operations
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
-    bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,   // Src1 = the value operated on
-    // === GROUP 3: Pointer deref (FreeBASIC): Src1 = address register (always int) ===
-    bcRefLoadInt, bcRefLoadFloat, bcRefLoadString,
-    bcRefStoreInt, bcRefStoreFloat, bcRefStoreString,
-    bcRefAddrField,  // @obj.field - Src1 = record handle (int)
-    // raw heap: Src1 = byte count (alloc) / raw pointer (free/realloc/load/store) — all int
-    bcRawAlloc, bcRawFree, bcRawRealloc,
-    bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
-    bcRawLoadZStr, bcRawStoreZStr,   // C-string view: Src1 = raw pointer (int)
-    // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Src1 = destination raw pointer (int)
-    bcRawMemCopy, bcRawMemMove, bcRawClear,
-    // === GROUP 1: String operations with int param ===
-    bcStrChr, bcStrHex, bcStrErr, bcStrSpace, bcStrOct, bcStrBin, bcStrWChr,
-    bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src1 = count (int)
-    bcStrMkInt,  // MKI/MKL/MKSHORT/MKLONGINT(n) - Src1 = int value to pack (B3)
-    bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src1 = count (int)
-    bcCommand,  // COMMAND$(index) - Src1 = index (int)
-    // === GROUP 5: Memory operations ===
-    bcPeek,           // PEEK(address): Src1 = address (int)
-    bcPoke,           // POKE address, value: Src1 = address (int)
-    // === GROUP 4: I/O operations ===
-    bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt,
-    bcPrintTab, bcPrintSpc,  // TAB(n) and SPC(n) - Src1 = count register
-    bcConScreen,      // SCREEN(row,col[,flag]): Src1 = row (int)
-    bcConLocate,      // MODERN LOCATE row, col: Src1 = row (int)
-    bcConViewPrint,   // VIEW PRINT first TO last: Src1 = first row (int)
-    // === GROUP 6: Sound operations ===
-    bcSoundVol,       // Src1 = volume (int 0-15)
-    bcSoundSound,     // Src1 = voice number (int)
-    bcSoundEnvelope,  // Src1 = envelope slot (int 0-9)
-    bcSoundTempo,     // Src1 = tempo value (int)
-    // === GROUP 10: Graphics ===
-    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA, bcGraphicRdot, bcGraphicGetMode,
-    bcGraphicWindow,  // Src1 = col1 register (int)
-    bcGraphicCircle,  // Src1 = color register (int)
-    bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,
-    bcGfxSetTarget,  // SETTARGET: Src1 = image handle (int)  // FreeBASIC graphics: Src1 = w / x / x1 (int)
-    bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
-    bcGfxColor,  // COLOR: Src1 = foreground (int)
-    bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo,  // IMAGE*: Src1 = w / handle (int)
-    bcGfxGet, bcGfxPut,  // GET/PUT: Src1 = x1 / x (int)
-    bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src1 = work / src page (int)
-    bcGfxWindow, bcGfxView, bcGfxPMap,  // WINDOW/VIEW: Src1 = x1 ; PMAP: Src1 = coord (int)
-    bcGfxScreen,  // SCREEN: Src1 = mode (int)
-    bcMultikey,  // MULTIKEY: Src1 = scancode (int)
-    bcSetmouse,  // SETMOUSE: Src1 = x (int)
-    bcGetJoystick,  // GETJOYSTICK: Src1 = device id (int)
-    bcStick, bcStrig,  // STICK/STRIG: Src1 = axis / button (int)
-    bcGfxPointCoord,   // POINTCOORD(n): Src1 = selector (int)
-    bcGraphicSShape,  // Src1 = x1 coordinate (int)
-    bcGraphicColor,   // Src1 = source register (int)
-    bcGraphicWidth,   // Src1 = width value (int)
-    bcGraphicScale,   // Src1 = enable flag (int)
-    bcGraphicRclr,    // Src1 = color source index (int)
-    bcGraphicRwindow, // Src1 = info type (int)
-    bcScnClr,         // Src1 = mode register (int)
-    bcSetColor,       // Src1 = source register (int)
-    bcGetColor,       // Src1 = source index (int)
-    bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr,   // CVA_ARG: Src1 = the cursor (int)
-    bcVarArgPushInt,   // staging a surplus argument: Src1 = the int value
-    // === SUPERINSTRUCTIONS ===
-    // Fused arithmetic-to-dest (Int): Src1 is int operand
-    bcAddIntTo, bcSubIntTo, bcMulIntTo,
-    // Fused constant arithmetic (Int): Src1 is source register
-    bcAddIntConst, bcSubIntConst, bcMulIntConst,
-    // Fused compare-and-branch (Int): Src1 is first comparison operand
-    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
-    // Fused compare-zero-and-branch (Int): Src1 is the register being compared
-    bcBranchEqZeroInt, bcBranchNeZeroInt,
-    // Fused loop increment-and-branch (Int): Src1 = step register
-    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
-    // Fused self-increment/decrement (Int): Src1 = step register
-    bcAddIntSelf, bcSubIntSelf,
-    // Fused array element operations: Src1 = src_idx_reg for MoveElement
-    bcArrayMoveElement,
-    // === GROUP 6: File I/O operations ===
-    bcDopen, bcOpenFunc, bcDclose, bcOpen, bcClose,  // Src1 = handle (int)
-    bcGetFile, bcInputFile, bcPrintFile,     // Src1 = handle (int)
-    bcPrintFileComma,                        // PRINT# comma zone pad - Src1 = handle (int)
-    bcPrintFileNewLine,                      // PRINT# newline - Src1 = handle (int); was missing from the classifier
-    bcInputFileFloat, bcInputFileInt,        // Src1 = handle (int)
-    bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
-    bcFileQuery, bcFileAttr, bcFileSetEof, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
-    bcAssert,        // ASSERT/ASSERTWARN: Src1 = condition (int)
-    bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
-    bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
-    // Counted/whole-array/padding binary transfers: Src1 = handle (int)
-    bcPutBinMem, bcGetBinMem, bcPutBinArray, bcGetBinArray, bcPutBinPad, bcGetBinSkip,
-    bcArrayRedimPush,                        // REDIM multi-dim: Src1 = upper bound (int)
-    bcArrayIdxPush,                          // runtime multi-dim index: Src1 = index (int)
-    // UDT array members (indirect): Src1 = the FArrays HANDLE register (load/store/idx-resolve),
-    // or the record-HANDLE register (member REDIM) — always int.
-    bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString,
-    bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
-    bcArrayIdxResolveInd, bcMemberArrayRedim,
-    bcArrayLBoundInd, bcArrayUBoundInd,   // Src1 = FArrays handle (int)
-    bcArrayCopyContents, bcArrayCopyRecords,  // Src1 = dest FArrays handle (int)
-    // Date/time: DATESERIAL/TIMESERIAL Src1 = year/hour (int); MONTHNAME/WEEKDAYNAME Src1 = index (int)
-    bcDateSerial, bcTimeSerial, bcDateName,
-    bcCmd, bcAppend, bcRecord:               // Src1 = handle (int)
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.Src1IsIntReg(OpCode);
 end;
 
 function TRegisterCompactor.Src1IsFloatReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // SUB/FUNCTION transfer-register store (M2): Src1 is the float register read.
-    bcXferStoreFloat,
-    bcVarArgPushFloat,   // staging a surplus argument: Src1 = the float value
-    // === GROUP 0: Core VM operations ===
-    // Float arithmetic
-    bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcNegFloat, bcPowFloat,
-    // Float comparisons
-    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
-    // Conversion from float
-    bcFloatToInt, bcFloatToString, bcFloatRound,
-    bcNarrowSingle,  // B1.5: single-precision rounding (Src1=float)
-    // === GROUP 2: Math functions ===
-    bcMathSqr, bcMathSin, bcMathCos, bcMathTan, bcMathAtn,
-    bcMathExp, bcMathLog, bcMathAbs, bcMathSgn, bcMathInt, bcMathRnd,
-    bcMathLog10, bcMathLog2, bcMathLogN,
-    bcMathAcos, bcMathAsin, bcMathAtan2, bcMathFix, bcMathFrac,  // FreeBASIC math
-    bcMathSinh, bcMathCosh, bcMathTanh, bcMathAsinh, bcMathAcosh, bcMathAtanh,  // hyperbolic
-    bcMathCeil, bcMathRound, bcMathMin, bcMathMax, bcMathCopySign,               // IEEE extras
-    bcSingleBits,     // ...and this one READS a float; BITSTOSINGLE reads an int
-    bcDateDecode,  // YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY: Src1 = float serial
-    // === GROUP 1: String operations with float param ===
-    bcStrStr,      // STR$(n) - reads float, produces string
-    bcStrMkFloat,  // MKS/MKD(n) - reads float, produces binary string (B3)
-    // === GROUP 4: I/O operations ===
-    // Print float value (bcPrint/bcPrintLn use float register in Src1)
-    bcPrint, bcPrintLn,
-    // === SUPERINSTRUCTIONS ===
-    // Fused arithmetic-to-dest (Float): Src1 is float operand
-    bcAddFloatTo, bcSubFloatTo, bcMulFloatTo, bcDivFloatTo,
-    // Fused constant arithmetic (Float): Src1 is source register
-    bcAddFloatConst, bcSubFloatConst, bcMulFloatConst, bcDivFloatConst,
-    // Fused compare-and-branch (Float): Src1 is first comparison operand
-    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-    // Fused compare-zero-and-branch (Float): Src1 is the register being compared
-    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
-    // Fused Multiply-Add (FMA): Src1 is 'a' in (a * b)
-    bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
-    // Fused Square-Sum: Src1 is 'x' or 'sum'
-    bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
-    // === GROUP 11: Sound ===
-    bcSoundFilter,  // Src1 = cutoff frequency (float)
-    // === GROUP 7: Sprite ===
-    bcSpriteDef,    // SPRDEF [n]: Src1 = sprite number (float)
-    bcSprSize,      // SPRSIZE: Src1 = sprite number (float)
-    bcSprForm:      // SPRFORM: Src1 = sprite number (float)
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.Src1IsFloatReg(OpCode);
 end;
 
 function TRegisterCompactor.Src2IsIntReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // === GROUP 12: BigInt === Src2 is the RIGHT operand's handle (an int register).
-    bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall, bcBigDiv, bcBigMod,
-    // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.
-    bcRecordStoreInt,
-    // raw heap: Realloc's Src2 = byte count; RawStoreInt's Src2 = int value.
-    bcRawRealloc, bcRawStoreInt,
-    // FB_MEMCOPY/FB_MEMMOVE: Src2 = source pointer; CLEAR: Src2 = byte value — all int.
-    bcRawMemCopy, bcRawMemMove, bcRawClear,
-    // Counted file<->raw-memory transfer: Src2 = raw pointer (int). NOTE bcPut/GetBinArray are
-    // deliberately NOT here: their Src2 is an array ID immediate, not a register.
-    bcPutBinMem, bcGetBinMem,
-    // Condition variables (M5.4): CondWait's Src2 is the mutex handle (int).
-    bcCondWait,
-    // === GROUP 0: Core VM operations ===
-    // Int arithmetic (second operand)
-    bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt, bcDivUInt, bcModUInt,
-    // Int comparisons (second operand)
-    bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt,
-    bcCmpLtUInt, bcCmpLeUInt, bcCmpGtUInt, bcCmpGeUInt,
-    // Bitwise operations (second operand); shifts: Src2 = shift count
-    bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr, bcShrUInt,
-    bcBitRotl, bcBitRotr,   // rotates: Src2 = the rotate count (the counting forms have no Src2)
-    // HEX$/OCT/BIN(n, digits): Src2 = the digits width (int; 0 = natural length)
-    bcStrHex, bcStrOct, bcStrBin,
-    // === GROUP 5: Memory operations ===
-    bcPoke,           // POKE address, value: Src2 = value (int)
-    bcPrintUsingInt,  // PRINT USING (exact int): Src2 = int value (Src1 = format string)
-    // === GROUP 6: File I/O ===
-    bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
-    bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
-    bcDirSearch,      // DIR(spec, mask): Src2 = the attribute mask (int)
-    bcScratch,        // SCRATCH "pattern", flags: Src2 = flags (int; bit0 silent, bit1 force)
-    bcFileAttr,       // FILEATTR(filenum, returntype): Src2 = returntype (int)
-    bcPutBinInt,      // PUT #n: Src2 = int value
-    // === GROUP 1: String operations with int second param ===
-    bcStrLeft, bcStrRight,  // LEFT$/RIGHT$(str, len) - len is Src2 (int)
-    bcStrLeftW, bcStrRightW, bcStrMidW,  // WSTRING: Src2 = codepoint count/start (int)
-    bcStrMid,  // Mid$(str, start, length) - start is Src1, length is Src2
-    bcStrAscMid,  // ASC(MID$(...)) fused: Src2 = start position (int), like bcStrMid
-    bcStrString, bcStrWStringN,  // STRING/WSTRING(n,ch) - Src2 = char code/codepoint (int)
-    // === GROUP 2: Date/time: DATESERIAL/TIMESERIAL Src2 = month/minute (int); DATEADD Src2 = number ===
-    bcDateSerial, bcTimeSerial, bcDateAdd,
-    // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
-    bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
-    bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
-    // UDT array members (indirect): Src2 = the linear index register (int)
-    bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString,
-    bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
-    bcArrayLBoundInd, bcArrayUBoundInd,  // Src2 = 0-based dim index (int)
-    bcArrayCopyContents, bcArrayCopyRecords,  // Src2 = source FArrays handle (int)
-    bcArrayBindInd,  // Src2 = the arg member array's runtime FArrays handle (int); Src1 is an array id, NOT a register
-    bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
-    bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
-    bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)
-    bcConScreen,    // SCREEN(row,col[,flag]): Src2 = column (int)
-    bcConLocate,    // MODERN LOCATE row, col: Src2 = column (int)
-    bcConViewPrint, // VIEW PRINT first TO last: Src2 = last row (int)
-    // === GROUP 10: Graphics ===
-    bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
-    bcGraphicWindow,  // Src2 = row1 register (int)
-    bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
-    bcGfxDrawString,  // DRAW STRING: Src2 = x (int); Src1 is the TEXT and is classified as a string
-    bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
-    bcGfxColor,  // COLOR: Src2 = background (int)
-    bcGfxImageCreate,  // IMAGECREATE: Src2 = h (int)
-    bcGfxGet, bcGfxPut,  // GET/PUT: Src2 = y1 / y (int)
-    bcGfxScreenSet, bcGfxPCopy,  // SCREENSET/PCOPY: Src2 = visible / dst page (int)
-    bcGfxWindow, bcGfxView,  // WINDOW/VIEW: Src2 = y1 (int)
-    bcSetmouse,  // SETMOUSE: Src2 = y (int)
-    bcGraphicScale,   // Src2 = xmax register (int)
-    bcGraphicColor,   // Src2 = color value (int)
-    bcGraphicPaint,   // Src2 = x coordinate (int)
-    bcGraphicSShape,  // Src2 = y1 coordinate (int)
-    bcGraphicGShape,  // Src2 = x coordinate (int)
-    bcSetColor,       // Src2 = color value (int)
-    // === SUPERINSTRUCTIONS ===
-    // Fused compare-and-branch (Int): Src2 is second comparison operand
-    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
-    // Fused array-store-constant: Src2 is the int index register
-    bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst,
-    // Fused loop increment-and-branch (Int): Src2 = limit register
-    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
-    // Fused ArrayLoad + Arithmetic: Src2 is the int index register
-    bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat,
-    // Fused ArrayLoad + Branch: Src2 is the int index register
-    bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ,
-    // Fused array element operations: Src2 = idx_reg for swap/copy/move, or start_idx for shift
-    bcArraySwapInt, bcArrayCopyElement, bcArrayMoveElement, bcArrayLoadIntTo,
-    bcArrayShiftLeft, bcArrayReverseRange,
-    // === GROUP 11: Sound ===
-    bcSoundFilter,  // Src2 = lowpass (int 0/1)
-    bcSoundSound,   // Src2 = frequency (int)
-    // === GROUP 7: Sprite ===
-    bcSprLoadFile,  // SPRLOAD: Src2 = usefilecolors flag (int)
-    // === GROUP 6: File I/O operations ===
-    bcRecord:       // Src2 = position (int)
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.Src2IsIntReg(OpCode);
 end;
 
 function TRegisterCompactor.Src2IsFloatReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // UDT/record (M3): RecordStoreFloat's Src2 is the float value being written.
-    bcRecordStoreFloat,
-    // raw heap: RawStoreFloat's Src2 is the float value being written.
-    bcRawStoreFloat,
-    // === GROUP 0: Core VM operations ===
-    // Float arithmetic (second operand)
-    bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcPowFloat,
-    // Float comparisons (second operand)
-    bcCmpEqFloat, bcCmpNeFloat, bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat,
-    // === SUPERINSTRUCTIONS ===
-    // Fused compare-and-branch (Float): Src2 is second comparison operand
-    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-    // Fused Multiply-Add (FMA): Src2 is 'b' in (a * b)
-    bcMulAddFloat, bcMulSubFloat, bcMulAddToFloat, bcMulSubToFloat,
-    // Fused Square-Sum: Src2 is 'y' or 'x' (square operand)
-    bcSquareSumFloat, bcAddSquareFloat, bcMulMulFloat, bcAddSqrtFloat,
-    // LOGN(base, x): Src2 is 'x' (the value); ATAN2(y, x): Src2 is 'x'
-    bcMathLogN, bcMathAtan2,
-    // DATEDIFF(interval, s1, s2): Src2 = s1; DATEPART(interval, serial): Src2 = serial (float)
-    bcDateDiff, bcDatePart,
-    // === GROUP 3: Pointer store (FreeBASIC): Src2 = float value ===
-    bcRefStoreFloat,
-    // === GROUP 4: I/O operations ===
-    bcPrintUsing,  // PRINT USING - Src2 = value (float)
-    // === GROUP 6: File I/O ===
-    bcPutBinFloat, // PUT #n: Src2 = float value
-    // === GROUP 7: Sprite ===
-    bcSprSize,     // SPRSIZE: Src2 = width (float)
-    bcSprForm:     // SPRFORM: Src2 = format (float)
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.Src2IsFloatReg(OpCode);
 end;
 
 function TRegisterCompactor.Src1IsStringReg(OpCode: TBytecodeOp): Boolean;
@@ -768,58 +240,17 @@ begin
 end;
 
 function TRegisterCompactor.DestReadIsIntReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  { These opcodes use Dest as a SOURCE register (read, not write).
-    This is critical for ArrayStore where Dest holds the VALUE to store. }
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // === GROUP 3: Array operations ===
-    // === GROUP 12: BigInt === ⛔ Dest is READ as well as written: it carries the handle
-    // to fill in, and an existing one is REUSED rather than reallocated. Miss this and the
-    // compactor treats the register as dead on entry and may hand it to something else.
-    bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul, bcBigFromStr, bcBigMulSmall, bcBigDiv, bcBigMod,
-    bcArrayStoreInt,  // Dest = value register (int) - READ, not written
-    bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
-    // === GROUP 10: Graphics ===
-    bcGraphicBox,     // Dest = y1 register (int) - READ, not written
-    bcGraphicWindow,  // Dest = col2 register (int) - READ, not written
-    bcGraphicCircle,  // Dest = y register (int) - READ, not written
-    bcGraphicScale,   // Dest = ymax register (int) - READ, not written
-    bcGraphicPaint,   // Dest = y coordinate (int) - READ, not written
-    bcGraphicGShape,  // Dest = y coordinate (int) - READ, not written
-    bcSetColor,       // SETCOLOR: Dest = G component (int) - READ, not written
-    // === GROUP 11: Sound ===
-    bcSoundSound,     // Dest = duration register (int) - READ, not written
-    // === SUPERINSTRUCTIONS ===
-    // Array swap: Dest = idx2_reg (int) - READ
-    bcArraySwapInt,
-    // Array shift/reverse: Dest = end_idx_reg (int) - READ
-    bcArrayShiftLeft, bcArrayReverseRange,
-    // === GROUP 6: File I/O operations ===
-    bcPrintFileInt:      // Dest = value register (int) - READ, not written
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.DestReadIsIntReg(OpCode);
 end;
 
 function TRegisterCompactor.DestReadIsFloatReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  { These opcodes use Dest as a SOURCE register (read, not write).
-    This is critical for ArrayStore where Dest holds the VALUE to store. }
-  // Using case statement instead of set because opcodes are now Word (>255)
-  case OpCode of
-    // === GROUP 3: Array operations ===
-    bcArrayStoreFloat,   // Dest = value register (float) - READ, not written
-    bcArrayStoreIndFloat,  // UDT array member store (float): Dest = value register - READ, not written
-    // === GROUP 6: File I/O operations ===
-    bcPrintFileFloat,    // Dest = value register (float) - READ, not written
-    // === GROUP 7: Sprite ===
-    bcSprSize:           // SPRSIZE: Dest = height (float) - READ, not written
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.DestReadIsFloatReg(OpCode);
 end;
 
 function TRegisterCompactor.DestReadIsStringReg(OpCode: TBytecodeOp): Boolean;
@@ -830,25 +261,10 @@ begin
 end;
 
 function TRegisterCompactor.ImmediateIsFloatReg(OpCode: TBytecodeOp): Boolean;
+// Delegates to SedaiOpcodeBanks: this classification lives in ONE place now. Two copies of it
+// disagreed on 88 (opcode, field) pairs, and a pass that gets the bank wrong miscompiles silently.
 begin
-  { These superinstructions store a FLOAT REGISTER INDEX in the Immediate field
-    instead of a constant value. The Immediate field needs to be remapped
-    during register compaction. }
-  case OpCode of
-    // Fused ArrayLoad + Arithmetic: Immediate is the accumulator float register
-    bcArrayLoadAddFloat, bcArrayLoadSubFloat,
-    // Fused Multiply-Add (FMA): Immediate is 'c' in (c op a*b) - the accumulator
-    bcMulAddFloat, bcMulSubFloat,
-    // Fused Mul-Mul: Immediate is 'c' in (a*b*c)
-    bcMulMulFloat,
-    // DATEADD: Immediate = serial (float reg); DATEDIFF: Immediate = s2 (float reg)
-    bcDateAdd, bcDateDiff,
-    // FORMAT(num, mask): Immediate = the value being formatted (float reg)
-    bcStrFormat:
-      Result := True;
-  else
-    Result := False;
-  end;
+  Result := SedaiOpcodeBanks.ImmediateIsFloatReg(OpCode);
 end;
 
 function TRegisterCompactor.ImmediateIsStringReg(OpCode: TBytecodeOp): Boolean;

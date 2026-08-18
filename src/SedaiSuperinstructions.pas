@@ -72,6 +72,7 @@ type
     FFusedCount: Integer;
     FKindMask: string;
     function KindOn(Kind: Integer): Boolean;
+    function KindOptIn(Kind: Integer): Boolean;
 
     { Try to fuse instruction at index i with following instructions }
     function TryFuseCompareAndBranch(Index: Integer): Boolean;
@@ -107,7 +108,8 @@ type
     function IntRegReadElsewhere(Reg: Word; A, B, C: Integer): Boolean;
 
     { Check if register is only used by the next instruction (temporary) }
-    function IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
+    function RegReadElsewhere(Reg: Word; Bank: TRegBank; Lo, Hi: Integer): Boolean;
+    function IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1): Boolean;
 
     { Check if an instruction index is a jump target }
     function IsJumpTarget(Index: Integer): Boolean;
@@ -375,11 +377,84 @@ begin
   Result := True;
 end;
 
-function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word): Boolean;
+function FieldMayName(FieldBank, Wanted: TRegBank): Boolean;
+// Can a field classified as FieldBank be naming a register of bank Wanted?
+//
+// Yes when they agree, and yes when the field's bank is UNKNOWN - a scan looking for reads must
+// assume the worst there.
+//
+// ⛔ IT IS TEMPTING TO READ rbUnknown AS "NOT A REGISTER", AND IT IS WRONG. The argument for it is
+// good and still fails: a Src field claimed by none of the three bank lists is one REGISTER
+// COMPACTION does not remap either, so trusting the lists here would be exactly as safe as
+// compaction already is. Tried, and aot_validate found the hole in one program - Src2IsFloatReg
+// did not list bcMathMin/bcMathMax/bcMathCopySign, whose Src2 is a float operand, so `Min(a, b)`
+// stopped counting as a read of b and the fusion deleted the instruction that produced it
+// (ieee_intrinsics, interpreter against AOT). The lists are complete enough for compaction because
+// compaction only has to RENUMBER consistently; they are not complete enough to prove a NEGATIVE.
+//
+// The cost of staying conservative is real and measured: n-body's hottest loop has
+// `ArrayLoadFloat R17, ARR[17], R29`, whose Src1 is an ARRAY ID and not a register at all, and that
+// makes the integer R17 of the loop's compare-and-branch look read - so the head keeps its
+// CmpInt+JumpIfZero and, with no BranchGtInt in the head, the TAIL cannot fuse either. Two
+// instructions per iteration. Closing it needs a POSITIVE "this field is not a register index"
+// answer from the funnel, not the absence of a claim.
+begin
+  Result := (FieldBank = Wanted) or (FieldBank = rbUnknown);
+end;
+
+function TSuperinstructionOptimizer.RegReadElsewhere(Reg: Word; Bank: TRegBank; Lo, Hi: Integer): Boolean;
+// Does ANY instruction outside [Lo..Hi] read register Reg of bank Bank?
+//
+// This is the question a forward scan cannot answer once it meets a branch, and it is the question
+// that actually licenses deleting a definition: if nothing anywhere reads the value, nothing can
+// observe that we stopped computing it - on every path, across every back edge, with no liveness
+// analysis and no basic blocks. A WRITE elsewhere is irrelevant; only a read is.
+//
+// It is the generalisation of IntRegReadElsewhere just above, which was written for one fusion and
+// could only speak about int registers, because the bank predicates for the other two banks were
+// still locked inside the register compactor. They are in SedaiOpcodeBanks now.
 var
   i: Integer;
   Instr: TBytecodeInstruction;
+  Op: TBytecodeOp;
+begin
+  Result := True;
+  for i := 0 to FProgram.GetInstructionCount - 1 do
+  begin
+    if (i >= Lo) and (i <= Hi) then Continue;
+    Instr := FProgram.GetInstruction(i);
+    Op := TBytecodeOp(Instr.OpCode);
+    if (Instr.Src1 = Reg) and (not SedaiOpcodeBanks.Src1IsArrayId(Op)) and
+       FieldMayName(SedaiOpcodeBanks.BankOfSrc1(Op), Bank) then Exit;
+    if (Instr.Src2 = Reg) and FieldMayName(SedaiOpcodeBanks.BankOfSrc2(Op), Bank) then Exit;
+    // A Dest that is READ BACK is a read like any other (ArrayStore's value, BigInt's target).
+    if Instr.Dest = Reg then
+      case Bank of
+        rbInt:    if SedaiOpcodeBanks.DestReadIsIntReg(Op) then Exit;
+        rbFloat:  if SedaiOpcodeBanks.DestReadIsFloatReg(Op) then Exit;
+        rbString: if SedaiOpcodeBanks.DestReadIsStringReg(Op) then Exit;
+      end;
+    // ...and a superinstruction Dest is read-modify-write often enough (bcAddIntTo, bcAddIntSelf,
+    // bcMulAddToFloat: "Dest = Dest op ...") that any of them holding this number refuses - but only
+    // in the SAME BANK. Refusing bank-blind here undid the whole point of the scan: in n-body the
+    // integer R17 of a loop's compare-and-branch was refused because a `MulSubFloat R17 = ...`
+    // exists elsewhere, so the loop head kept its CmpInt+JumpIfZero, and with no BranchGtInt in the
+    // head the loop TAIL could not fuse either - one missed fusion dragging a second one down, two
+    // instructions per iteration in a hot loop.
+    if (Instr.Dest = Reg) and (Instr.OpCode >= bcGroupSuper) and
+       FieldMayName(SedaiOpcodeBanks.BankOfDest(TBytecodeOp(Instr.OpCode)), Bank) then Exit;
+    if SedaiOpcodeBanks.ImmediateReadsIntReg(Instr, Reg) and (Bank = rbInt) then Exit;
+    if SedaiOpcodeBanks.ImmediateReadsFloatReg(Instr, Reg) and (Bank = rbFloat) then Exit;
+  end;
+  Result := False;
+end;
+
+function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1): Boolean;
+var
+  i: Integer;
+  Instr, DefInstr: TBytecodeInstruction;
   IsControlFlow: Boolean;
+  DestBank: TRegBank;
 begin
   // Check if the register defined at Index is ONLY used by Index+1
   // For superinstruction fusion, we just need to know that:
@@ -393,6 +468,23 @@ begin
   // - Register redefinition -> temporary (safe to fuse)
 
   Result := True;  // Assume temporary until proven otherwise
+
+  // ⭐ THE QUESTION IS MOOT WHEN THE FUSED INSTRUCTION WRITES THE SAME REGISTER. "MulFloat R12,R13,R12
+  // + AddFloat R12,R1,R12" becomes "MulAddFloat R12 = R13*R12 + R1": R12 ends the pair holding the
+  // same value either way, at the same point, so who reads it AFTERWARDS cannot tell the difference.
+  // Only the INTERMEDIATE value disappears, and nothing can observe that - entry at Index+1 is
+  // already excluded by the caller's IsJumpTarget test.
+  // ⛔ The caller must pass this ONLY when the fused instruction really does write Reg. A fusion that
+  // REMOVES the write (compare-and-branch consumes its result and stores nothing) must not: there the
+  // register genuinely stops being written and every later read matters.
+  if (FusedDest >= 0) and (FusedDest = Reg) then Exit;
+
+  // The bank of Reg is the bank the DEFINING instruction writes it in. Every caller passes the Dest
+  // of the instruction at Index; one that does not cannot be answered, and gets a no.
+  DefInstr := FProgram.GetInstruction(Index);
+  if DefInstr.Dest <> Reg then begin Result := False; Exit; end;
+  DestBank := SedaiOpcodeBanks.BankOfDest(TBytecodeOp(DefInstr.OpCode));
+  if DestBank = rbUnknown then begin Result := False; Exit; end;
 
   for i := Index + 2 to FProgram.GetInstructionCount - 1 do
   begin
@@ -412,16 +504,57 @@ begin
     // consumer is a fusion pass asking 'is this int register read anywhere else?'" - and this pass,
     // the one it was written for, was not calling it. It deliberately over-reports, which costs a
     // missed fusion and never a miscompile.
-    if (Instr.Src1 = Reg) or (Instr.Src2 = Reg) or
-       SedaiOpcodeBanks.ImmediateReadsIntReg(Instr, Reg) then
+    // A field holding this NUMBER is a read only if it names the same BANK - and rbUnknown counts
+    // as a read, because "no list claims this field" is not evidence of absence. Getting this half
+    // right costs real fusions: n-body's inner loop has `CmpInt R14` killed by a FLOAT R14, and a
+    // bank-blind scan then sees the float R14 read two instructions later and declines both the
+    // compare-and-branch and the loop-increment-and-branch fusions - two instructions per iteration
+    // out of twenty-two, measured at +6% on the interpreter.
+    // The Immediate is asked of both int and float - the fused multiply-add family carries its
+    // accumulator there, where Src1/Src2 cannot see it - but each answer is kept to ITS OWN bank.
+    // Asking both without that guard is the same bank-blindness one level down, and it cost the
+    // same kind of fusion: `MulSubFloat R16 = R14 * R16 - R17` carries the FLOAT R17 in Immediate,
+    // which made the INTEGER R17 of a loop's compare-and-branch look read.
+    if ((Instr.Src1 = Reg) and (not SedaiOpcodeBanks.Src1IsArrayId(TBytecodeOp(Instr.OpCode))) and
+        FieldMayName(SedaiOpcodeBanks.BankOfSrc1(TBytecodeOp(Instr.OpCode)), DestBank)) or
+       ((Instr.Src2 = Reg) and FieldMayName(SedaiOpcodeBanks.BankOfSrc2(TBytecodeOp(Instr.OpCode)), DestBank)) or
+       (SedaiOpcodeBanks.ImmediateReadsIntReg(Instr, Reg) and (DestBank = rbInt)) or
+       (SedaiOpcodeBanks.ImmediateReadsFloatReg(Instr, Reg) and (DestBank = rbFloat)) then
     begin
       Result := False;
       Exit;
     end;
 
-    // If it's redefined before being used again, it's safe (temporary)
+    // ⛔⛔⛔ AND THE FOURTH WAY TO GET THIS WRONG: A REGISTER NUMBER IS NOT A REGISTER.
+    // "Dest = Reg, so Reg is redefined, so it was dead" compares NUMBERS across three separate
+    // banks. In test_division_bug the constant lived in FLOAT R1 and the next block wrote STRING
+    // R1 ("VX = "): the scan called that a redefinition, the fusion deleted the LoadConstFloat, and
+    // the DivFloat eleven instructions later divided by a register nobody had loaded - a spurious
+    // Division by zero under the interpreter, with every other engine right. IntRegReadElsewhere,
+    // fifteen lines up this file, already carried the diagnosis in its comment ("that helper
+    // compares register NUMBERS with no idea of the bank... a false positive, which is the
+    // direction that miscompiles") - it was written down and never carried back here.
+    //
+    // A kill therefore needs THREE things, and anything less keeps scanning:
+    //   1. the same bank (DestBank below, from the defining instruction);
+    //   2. a pure WRITE - an opcode that reads Dest back (ArrayStore, BigInt) is a USE, not a kill;
+    //   3. not a superinstruction, because that is where the read-modify-write forms live
+    //      (bcAddIntTo, bcAddIntSelf, bcMulAddToFloat: "Dest = Dest op ..."). Declining to kill on
+    //      one costs a fusion; killing on one deletes a live definition.
     if Instr.Dest = Reg then
-      Exit;  // Result remains True
+    begin
+      // A read of Reg through Dest is a use, and ends the question.
+      if ((DestBank = rbInt) and SedaiOpcodeBanks.DestReadIsIntReg(TBytecodeOp(Instr.OpCode))) or
+         ((DestBank = rbFloat) and SedaiOpcodeBanks.DestReadIsFloatReg(TBytecodeOp(Instr.OpCode))) or
+         ((DestBank = rbString) and SedaiOpcodeBanks.DestReadIsStringReg(TBytecodeOp(Instr.OpCode))) then
+      begin
+        Result := False;
+        Exit;
+      end;
+      if (Instr.OpCode < bcGroupSuper) and (SedaiOpcodeBanks.BankOfDest(TBytecodeOp(Instr.OpCode)) = DestBank) then
+        Exit;  // Result remains True: same bank, pure write, really is a redefinition
+      // Otherwise it is some OTHER register that happens to share this number. Keep scanning.
+    end;
 
     // Check for control flow (end of basic block)
     // Must handle both standard opcodes and superinstructions
@@ -467,9 +600,22 @@ begin
     //
     // Answering NO at a block boundary is the conservative reading, and it costs only the fusions
     // that span one - which are exactly the ones that were never safe.
+    // ⛔ A BLOCK BOUNDARY IS NOT AN ANSWER - BUT "NO" IS NOT THE ONLY HONEST ONE.
+    // Reaching a branch means this scan has run out of what it can see: the register may be live in
+    // a successor, across a back edge, or in a block some jump enters later. Answering NO there was
+    // the 18 Aug fix, and it was right against the previous answer (YES, which miscompiled). It is
+    // not the best answer available: ask the WHOLE PROGRAM whether anything else reads the register,
+    // which needs no liveness at all, and decline only if something does.
+    //
+    // This is not a theoretical improvement. n-body's inner loop ends in a back edge, so every
+    // fusion in it dies at this test - the compare-and-branch and the loop-increment-and-branch
+    // both, two instructions per iteration out of twenty-two. Until the bank fix above, they
+    // survived by ACCIDENT: a float register sharing the int register's number ended the scan early,
+    // with the wrong reason and the right result. Removing the accident without adding this made the
+    // interpreter 6% slower on n-body.
     if IsControlFlow then
     begin
-      Result := False;
+      Result := not RegReadElsewhere(Reg, DestBank, Index, Index + 1);
       Exit;
     end;
   end;
@@ -678,7 +824,8 @@ begin
   if IsJumpTarget(Index + 1) then Exit;
 
   // Check if constant register is temporary
-  if not IsTemporaryResult(Index, ConstReg) then Exit;
+  // ArithInstr.Dest is what the fused instruction writes - see IsTemporaryResult.
+  if not IsTemporaryResult(Index, ConstReg, ArithInstr.Dest) then Exit;
 
   // Match LoadConstInt + IntArith
   if LoadOp = bcLoadConstInt then
@@ -1106,7 +1253,8 @@ begin
           // Check if AddFloatTo uses the mul result
           if AddInstr.Src1 <> MulDest then Exit;
           // Check if mul result is temporary
-          if not IsTemporaryResult(Index, MulDest) then Exit;
+          // AddInstr.Dest is what the fused instruction writes - see IsTemporaryResult.
+          if not IsTemporaryResult(Index, MulDest, AddInstr.Dest) then Exit;
 
           FusedOpCode := bcMulAddToFloat;
 
@@ -1138,7 +1286,8 @@ begin
           // Check if SubFloatTo uses the mul result
           if AddInstr.Src1 <> MulDest then Exit;
           // Check if mul result is temporary
-          if not IsTemporaryResult(Index, MulDest) then Exit;
+          // AddInstr.Dest is what the fused instruction writes - see IsTemporaryResult.
+          if not IsTemporaryResult(Index, MulDest, AddInstr.Dest) then Exit;
 
           FusedOpCode := bcMulSubToFloat;
 
@@ -1179,7 +1328,8 @@ begin
           // Check if AddFloat uses the mul result as Src2
           if AddInstr.Src2 <> MulDest then Exit;
           // Check if mul result is temporary
-          if not IsTemporaryResult(Index, MulDest) then Exit;
+          // AddInstr.Dest is what the fused instruction writes - see IsTemporaryResult.
+          if not IsTemporaryResult(Index, MulDest, AddInstr.Dest) then Exit;
           // SAFETY: the extra operand c (Src1, stored in the fused op's Immediate) must not be the mul
           // destination — the fused op recomputes a*b into that register, so reading c=MulDest would take
           // its STALE pre-multiply value. Happens for "(a*b) + (a*b)" (e.g. strength-reduced "2.0*(a*b)").
@@ -1215,7 +1365,8 @@ begin
           // Check if SubFloat uses the mul result as Src2 (c - a*b)
           if AddInstr.Src2 <> MulDest then Exit;
           // Check if mul result is temporary
-          if not IsTemporaryResult(Index, MulDest) then Exit;
+          // AddInstr.Dest is what the fused instruction writes - see IsTemporaryResult.
+          if not IsTemporaryResult(Index, MulDest, AddInstr.Dest) then Exit;
           // SAFETY: the extra operand c (Src1) must not be the mul destination (see the bcAddFloat note).
           if AddInstr.Src1 = MulDest then Exit;
 
@@ -2260,9 +2411,24 @@ end;
 
 
 function TSuperinstructionOptimizer.KindOn(Kind: Integer): Boolean;
-// SUPERMASK bisection - see Run. Empty mask = every kind on.
+// SUPERMASK bisection - see Run. Empty mask = every kind on; the token `all` says the same thing
+// explicitly, so that SUPERMASK=all,9 means "the shipping set PLUS the parked kind 9" - which is the
+// only arrangement that A/Bs a parked kind against what actually ships. Naming kinds one by one
+// cannot express it, and measuring kind 9 ALONE measures a program with no other fusion in it.
 begin
-  Result := (FKindMask = '') or (Pos(',' + IntToStr(Kind) + ',', ',' + FKindMask + ',') > 0);
+  Result := (FKindMask = '') or (Pos(',all,', ',' + FKindMask + ',') > 0) or
+            (Pos(',' + IntToStr(Kind) + ',', ',' + FKindMask + ',') > 0);
+end;
+
+function TSuperinstructionOptimizer.KindOptIn(Kind: Integer): Boolean;
+// The gate for a kind that is OFF by default: an empty mask leaves it off, and only naming it
+// explicitly turns it on. The kinds parked with a measured reason (9, 11) used to be written
+// `False and TryFuseXxx`, which made the SUPERMASK=<n> the comment promised a no-op - the switch
+// documented for hunting the remaining defect could not reach the code it was meant to reach.
+// `all` deliberately does NOT reach these: a kind parked with a measured reason is turned on by
+// name, never by a wildcard.
+begin
+  Result := (FKindMask <> '') and (Pos(',' + IntToStr(Kind) + ',', ',' + FKindMask + ',') > 0);
 end;
 
 function TSuperinstructionOptimizer.Run: Integer;
@@ -2381,7 +2547,7 @@ begin
       // Division by zero under the interpreter where every other engine is right (SUPERMASK named it
       // on the first pass). A fusion that has produced three independent miscompiles in a day does not
       // get to stay on while the fourth is looked for. SUPERMASK=9 re-enables it for the hunt.
-      else if False and TryFuseConstantArithmetic(i) then
+      else if KindOptIn(9) and TryFuseConstantArithmetic(i) then
         Changed := True
       {$IFNDEF DISABLE_ARRAYSTORECONST}
       else if KindOn(10) and TryFuseArrayStoreConst(i) then
@@ -2392,7 +2558,7 @@ begin
       // nothing saved, and the only thing that changes is which dispatch arm runs. It cannot win by
       // construction, and measured alone on binary-trees it loses 28.5% - the entire regression that
       // benchmark showed. Every other kind collapses N instructions into one; this one does not.
-      else if False and TryFuseAddIntSelf(i) then
+      else if KindOptIn(11) and TryFuseAddIntSelf(i) then
         Changed := True
       else if KindOn(12) and TryFuseArrayCopyElement(i) then
         Changed := True
