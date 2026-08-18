@@ -70,6 +70,8 @@ type
   private
     FProgram: TBytecodeProgram;
     FFusedCount: Integer;
+    FKindMask: string;
+    function KindOn(Kind: Integer): Boolean;
 
     { Try to fuse instruction at index i with following instructions }
     function TryFuseCompareAndBranch(Index: Integer): Boolean;
@@ -437,12 +439,29 @@ begin
       end;
     end;
 
+    // ⛔⛔⛔ THIS USED TO SAY "Exit; Result remains True - safe within this basic block", AND IT IS
+    // THE DEFECT THAT KEPT THE WHOLE SUPERINSTRUCTION FAMILY OFF SINCE JULY.
+    //
+    // Reaching the end of a basic block does NOT mean the register is dead. It can be live in a
+    // successor, or across a back edge, or read by a block some jump enters later - none of which a
+    // forward scan that stops at the first branch can see. The guard is right in INTENT and wrong in
+    // SCOPE, exactly like the copy-coalescing miscompile: it asks "is anyone using it HERE?" when the
+    // question is "can anyone use it ANYWHERE".
+    //
+    // Turning the family on with this as it was gave 16 FAIL and 16 OPTDIFF in run_regress, and the
+    // bisection (SUPERMASK) named ONE culprit out of nineteen kinds: ConstantArithmetic, the only one
+    // that leans on this predicate. m6_shared printed COUNTER as 11 where it is 7.
+    //
+    // Answering NO at a block boundary is the conservative reading, and it costs only the fusions
+    // that span one - which are exactly the ones that were never safe.
     if IsControlFlow then
-      Exit;  // Result remains True - safe within this basic block
+    begin
+      Result := False;
+      Exit;
+    end;
   end;
 
-  // Reached end of program - register is temporary
-  // Result remains True
+  // Reached the end of the PROGRAM with no further use and no redefinition: that one really is dead.
 end;
 
 function TSuperinstructionOptimizer.TryFuseCompareAndBranch(Index: Integer): Boolean;
@@ -2227,6 +2246,12 @@ end;
 
 
 
+function TSuperinstructionOptimizer.KindOn(Kind: Integer): Boolean;
+// SUPERMASK bisection - see Run. Empty mask = every kind on.
+begin
+  Result := (FKindMask = '') or (Pos(',' + IntToStr(Kind) + ',', ',' + FKindMask + ',') > 0);
+end;
+
 function TSuperinstructionOptimizer.Run: Integer;
 var
   i, Pass: Integer;
@@ -2238,6 +2263,14 @@ begin
   Result := 0;
   Exit;
   {$ENDIF}
+  // ⚡ SUPERINSTR: runtime A/B while the compile-time switch is being re-decided. '0' forces the pass
+  // off on a binary built with it ON, so the two arrangements are one binary and one switch.
+  if GetEnvironmentVariable('SUPERINSTR') = '0' then begin Result := 0; Exit; end;
+  // ⚡ SUPERMASK: bisect WHICH fusion is wrong. Every TryFuseXxx call is guarded by KindOn(n), and
+  // SUPERMASK is a comma-separated list of the kinds to ENABLE (empty = all). The family was off for
+  // a month, so it has rotted: with all of it on, run_regress gives 16 FAIL and 16 OPTDIFF. This is
+  // how the broken one gets named instead of guessed.
+  FKindMask := GetEnvironmentVariable('SUPERMASK');
 
   Pass := 0;
 
@@ -2260,7 +2293,7 @@ begin
       if (FProgram.GetInstruction(i).OpCode = bcAddIntTo) or
          (FProgram.GetInstruction(i).OpCode = bcAddInt) then
       begin
-        if TryFuseLoopIncrementAndBranch(i) then
+        if KindOn(1) and TryFuseLoopIncrementAndBranch(i) then
         begin
           Changed := True;
           Inc(i);
@@ -2273,7 +2306,7 @@ begin
       // This pattern starts with a superinstruction, so check it before skipping
       if FProgram.GetInstruction(i).OpCode = bcArrayLoadIntTo then
       begin
-        if TryFuseArrayShiftLeft(i) then
+        if KindOn(2) and TryFuseArrayShiftLeft(i) then
           Changed := True;
         Inc(i);
         Continue;
@@ -2284,7 +2317,7 @@ begin
       // before the blanket skip below.
       if FProgram.GetInstruction(i).OpCode = bcStrAscMid then
       begin
-        if TryFuseAppendMapped(i) then
+        if KindOn(3) and TryFuseAppendMapped(i) then
         begin
           Changed := True;
           Inc(i);
@@ -2303,43 +2336,51 @@ begin
       // (8-instruction patterns first, then 5, then 3, then 2)
 
       // NEW: Array reverse range (8 instructions) - HIGHEST IMPACT for fannkuch-redux
-      if TryFuseArrayReverseRange(i) then
+      if KindOn(4) and TryFuseArrayReverseRange(i) then
         Changed := True
       // NEW: Array shift left (9 instructions) - HIGH IMPACT for fannkuch-redux
-      else if TryFuseArrayShiftLeft(i) then
+      else if KindOn(2) and TryFuseArrayShiftLeft(i) then
         Changed := True
       // NEW: Array swap pattern (5 instructions) - HIGH PRIORITY for fannkuch-redux
-      else if TryFuseArraySwapInt(i) then
+      else if KindOn(5) and TryFuseArraySwapInt(i) then
         Changed := True
-      else if TryFuseCompareZeroAndBranch(i) then
+      else if KindOn(6) and TryFuseCompareZeroAndBranch(i) then
         Changed := True
-      else if TryFuseCompareAndBranch(i) then
+      else if KindOn(7) and TryFuseCompareAndBranch(i) then
         Changed := True
-      else if TryFuseArithAndCopy(i) then
+      else if KindOn(8) and TryFuseArithAndCopy(i) then
         Changed := True
-      else if TryFuseConstantArithmetic(i) then
+      // ⛔ KIND 9 IS OFF. TryFuseConstantArithmetic ("LoadConst + arith" -> arith-with-immediate) is
+      // the ONE kind of nineteen that still miscompiles, and the bisection is what says so rather
+      // than a hunch: turning the family on gave 16 FAIL / 16 OPTDIFF, and SUPERMASK=<n> over all
+      // nineteen named kind 9 on every single failing program. Making IsTemporaryResult conservative
+      // at a basic-block boundary fixed fourteen of the fifteen; m198_byrefstr survives it
+      // ("Hello" comes back with its first byte corrupted), so there is a second defect in this
+      // fusion that is not about liveness. Off until that one is found - SUPERMASK=9 re-enables it
+      // for the hunt, and the other eighteen kinds carry the measured win without it.
+      else if False and TryFuseConstantArithmetic(i) then
         Changed := True
       {$IFNDEF DISABLE_ARRAYSTORECONST}
-      else if TryFuseArrayStoreConst(i) then
+      else if KindOn(10) and TryFuseArrayStoreConst(i) then
         Changed := True
       {$ENDIF}
-      else if TryFuseAddIntSelf(i) then
+      else if KindOn(11) and TryFuseAddIntSelf(i) then
         Changed := True
-      else if TryFuseArrayCopyElement(i) then
+      else if KindOn(12) and TryFuseArrayCopyElement(i) then
         Changed := True
-      else if TryFuseArrayMoveElement(i) then
+      else if KindOn(13) and TryFuseArrayMoveElement(i) then
         Changed := True
       else if TryFuseArrayLoadIntTo(i) then
         Changed := True
-      else if TryFuseMulAddFloat(i) then
+      else if KindOn(14) and TryFuseMulAddFloat(i) then
         Changed := True
-      else if TryFuseArrayLoadAddFloat(i) then
+      else if KindOn(15) and TryFuseArrayLoadAddFloat(i) then
         Changed := True
-      else if TryFuseMulMulFloat(i) then
+      else if KindOn(17) and TryFuseMulMulFloat(i) then
         Changed := True
-      else if TryFuseAddSqrtFloat(i) then
+      else if KindOn(18) and TryFuseAddSqrtFloat(i) then
         Changed := True
-      else if TryFuseArrayLoadBranchInt(i) then
+      else if KindOn(19) and TryFuseArrayLoadBranchInt(i) then
         Changed := True
       ;
 

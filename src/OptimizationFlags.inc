@@ -35,14 +35,30 @@
 // Master switch: uncomment to disable ALL optimizations
 {.$DEFINE DISABLE_ALL_OPTIMIZATIONS}
 
-// SUPERINSTRUCTIONS DISABLED (strategy decision, 2026-07-18). Superinstruction fusion is a stack-VM
-// optimization: on this register-based 3-operand VM dispatch-per-useful-work is already minimal, so
-// fusing ops removes at most one dispatch while doing the SAME work -- measured net-zero-to-negative on
-// float (n-body +38% slower with float fusion), a small win only for the integer loop-control fusion.
-// The performance strategy is now a JIT for hot loops (float leaves the interpreter entirely); the
-// interpreter handles cold code, where fusion does not matter. So all fusion is off.
+// SUPERINSTRUCTIONS: ON since 2026-08-18, and the July verdict that turned them off was measuring the
+// DOOR, not the idea.
+//
+// ⛔ What it used to say (2026-07-18): "Superinstruction fusion is a stack-VM optimization; on this
+// register-based 3-operand VM dispatch-per-useful-work is already minimal, so fusing ops removes at
+// most one dispatch while doing the SAME work -- measured net-zero-to-negative on float (n-body +38%
+// slower with float fusion), a small win only for the integer loop-control fusion. The performance
+// strategy is now a JIT for hot loops; the interpreter handles cold code, where fusion does not
+// matter. So all fusion is off."
+//
+// ⭐⭐⭐ Both halves of that have since failed. The premise - "the interpreter handles cold code" - was
+// retired by the user on 18 Aug ("non devi trascurare nemmeno interp"). And the measurement was an
+// ARTEFACT: a superinstruction was dispatched TWICE, once by the outer dense jump table and again by
+// an inner "case Op and $FF of" whose 57 arms scattered over 0..254 compile to a decision tree. A
+// plain opcode cost 4.05 ns and a superinstruction 16.7 ns - 4.1x, about six extra branches - so
+// fusing 11 instructions into 8 made a tight loop 58% SLOWER. Flattening those arms into the outer
+// table (RunTemplate.inc) turns every one of those numbers around, n-body included:
+//
+//     micro integer loop  -8.3%    fannkuch  -7.7%    n-body  -16.7%    mandelbrot  -6.1%
+//
+// ⛔ ONE KIND STAYS OFF: TryFuseConstantArithmetic - see the note at its call site. It is the only
+// one of nineteen that miscompiles, and SUPERMASK named it rather than a hunch.
 // See job/docs/VM_DISPATCH_E_RIDIMENSIONABILITA.md (superinstruction re-study) and the JIT design doc.
-{$DEFINE DISABLE_SUPERINSTRUCTIONS}
+{.$DEFINE DISABLE_SUPERINSTRUCTIONS}
 {$DEFINE DISABLE_ARRAYSTORECONST}
 
 // Individual optimization flags (controlled by master switch)
