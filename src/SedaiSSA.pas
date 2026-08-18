@@ -387,6 +387,9 @@ type
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
     function MethodIsVirtual(const TypeName, MethNm: string): Boolean;      // OOP: "Declare Virtual ..." (Abstract implies it)
+    function UnimplementedAbstract(const TypeName: string): string;        // OOP: an inherited ABSTRACT with no body, or ''
+    procedure CheckInstantiable(const TypeName: string);                    // OOP: refuse to instantiate such a type
+    procedure CheckOverrideAnnotations;                                     // MODERN: OVERRIDE and FINAL, checked
     function DeclaresAbstractMethod(const TypeName, MethNm: string): Boolean;  // OOP: "Declare Abstract ..."
     function AnyOverrideLabel(const TypeName, MethNm: string): string;    // ...some concrete override of it
     function HasCallableMethod(const TypeName, MethNm: string; ArgsNode: TASTNode): Boolean;
@@ -8754,6 +8757,7 @@ begin
           // Shared UDT scalar: allocate the record in the SHARED region (immediate bit 48), construct it,
           // and store its handle into element 0 — so any thread reaches the same instance. (Nested-UDT
           // field instances are still per-thread; flat UDTs are fully cross-thread.)
+          CheckInstantiable(FUDTs[RecUDTIdx].Name);   // OOP: an unimplemented ABSTRACT refuses here
           RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaRecordNew, RecHandleVal,
                           MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
@@ -8856,6 +8860,7 @@ begin
         // the name block-locally (shadowing any outer same-name binding); at module level / CLASSIC it
         // is allocate-or-reuse. Forcing the int bank keeps the binding correct even if the same name is
         // DIM'd with a different type in another scope (the global type table is first-declaration-wins).
+        CheckInstantiable(FUDTs[RecUDTIdx].Name);     // OOP: an unimplemented ABSTRACT refuses here
         RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
         EmitInstruction(ssaRecordNew, RecHandleVal,
                         MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
@@ -20960,6 +20965,139 @@ begin
   end;
 end;
 
+function TSSAGenerator.UnimplementedAbstract(const TypeName: string): string;
+// OOP: the name of an ABSTRACT method that TypeName inherits and does NOT implement, or '' when the
+// type is instantiable. FreeBASIC refuses to instantiate such a type ("error 306: UDT has
+// unimplemented abstract methods"); we used to accept it silently and the call then did nothing.
+//
+// An abstract declaration anywhere up the chain has to be answered by a BODY at or below the level
+// that declared it - which is exactly what ResolveMethodLabel finds, and it returns '' when the only
+// declaration is the abstract one.
+var
+  T, m: string;
+  Idx, Guard, k: Integer;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    if Assigned(FUDTs[Idx].Node) then
+      for k := 0 to FUDTs[Idx].Node.Attributes.Count - 1 do
+      begin
+        m := UpperCase(FUDTs[Idx].Node.Attributes.Names[k]);
+        if (Copy(m, 1, 8) = 'ABSTRACT') and
+           (FUDTs[Idx].Node.Attributes.ValueFromIndex[k] = '1') then
+        begin
+          m := Copy(m, 9, MaxInt);
+          if (m <> '') and (ResolveMethodLabel(TypeName, m) = '') then Exit(m);
+        end;
+      end;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+procedure TSSAGenerator.CheckOverrideAnnotations;
+// ⭐ MODERN EXTENSION - FreeBASIC has neither OVERRIDE nor FINAL, and accepts both as if they were
+// not there. Here they are checked, and each answers a way an override goes wrong in SILENCE:
+//
+//   OVERRIDE  the child says "this replaces a virtual method of an ancestor". Get the name or the
+//             spelling wrong and, without the check, it is simply a NEW method: the program compiles,
+//             the base version keeps running, and nothing says so. That is the same "looks right, is
+//             wrong" family as the two defects fixed today, which is why the annotation is worth a
+//             check rather than a comment.
+//   FINAL     the ancestor says "this one stops here". A descendant that redeclares it is refused.
+//
+// Both run once, after every TYPE is registered - a type may legally name an ancestor declared later
+// in the file, so nothing can be decided while the declarations are still being read.
+//
+// ⛔ Neither is REQUIRED: a child may still override without saying OVERRIDE, because demanding it
+// would reject every FreeBASIC source, and FB compatibility comes first. The annotation is an
+// opt-in guarantee, not a ceremony.
+var
+  i, k, Guard: Integer;
+  T, Parent, m: string;
+  Attrs: TStringList;
+  FoundVirtual, FoundFinal: Boolean;
+  Idx: Integer;
+begin
+  for i := 0 to High(FUDTs) do
+  begin
+    if not Assigned(FUDTs[i].Node) then Continue;
+    Attrs := FUDTs[i].Node.Attributes;
+    for k := 0 to Attrs.Count - 1 do
+    begin
+      T := UpperCase(Attrs.Names[k]);
+      if Attrs.ValueFromIndex[k] <> '1' then Continue;
+
+      // --- OVERRIDE<NAME>: some ancestor must declare NAME Virtual ---
+      if Copy(T, 1, 8) = 'OVERRIDE' then
+      begin
+        m := Copy(T, 9, MaxInt);
+        if m = '' then Continue;
+        FoundVirtual := False;
+        Parent := FUDTs[i].Parent; Guard := 0;
+        while (Parent <> '') and (Guard < 64) do
+        begin
+          if MethodIsVirtual(Parent, m) then begin FoundVirtual := True; Break; end;
+          Idx := FindUDT(Parent);
+          if Idx < 0 then Break;
+          Parent := FUDTs[Idx].Parent; Inc(Guard);
+        end;
+        if not FoundVirtual then
+          raise Exception.CreateFmt(
+            '"%s.%s" is declared OVERRIDE, but no ancestor declares "%s" VIRTUAL. ' +
+            'Without the annotation this would silently become a NEW method and the ancestor version ' +
+            'would keep running.', [FUDTs[i].Name, m, m]);
+      end;
+
+      // --- FINAL<NAME> on an ANCESTOR: this type may not redeclare NAME ---
+      if Copy(T, 1, 5) = 'FINAL' then Continue;   // the mark itself is on the declaring type
+    end;
+
+    // --- the mirror check: does this type redeclare something an ancestor marked FINAL? ---
+    if not Assigned(FUDTs[i].Node) then Continue;
+    for k := 0 to Attrs.Count - 1 do
+    begin
+      T := UpperCase(Attrs.Names[k]);
+      if (Copy(T, 1, 7) <> 'VIRTUAL') or (Attrs.ValueFromIndex[k] <> '1') then Continue;
+      m := Copy(T, 8, MaxInt);
+      if m = '' then Continue;
+      FoundFinal := False;
+      Parent := FUDTs[i].Parent; Guard := 0;
+      while (Parent <> '') and (Guard < 64) do
+      begin
+        Idx := FindUDT(Parent);
+        if Idx < 0 then Break;
+        if Assigned(FUDTs[Idx].Node) and
+           (FUDTs[Idx].Node.Attributes.Values['FINAL' + m] = '1') then
+        begin FoundFinal := True; Break; end;
+        Parent := FUDTs[Idx].Parent; Inc(Guard);
+      end;
+      if FoundFinal then
+        raise Exception.CreateFmt(
+          '"%s.%s" redeclares a method that "%s" declared FINAL: that one stops there.',
+          [FUDTs[i].Name, m, Parent]);
+    end;
+  end;
+end;
+
+procedure TSSAGenerator.CheckInstantiable(const TypeName: string);
+// Raised where FreeBASIC raises it: at the point of INSTANTIATION, not of declaration. An abstract
+// type is perfectly legal to declare and to inherit from - it is only illegal to make one.
+var
+  m: string;
+begin
+  m := UnimplementedAbstract(TypeName);
+  if m <> '' then
+    raise Exception.CreateFmt(
+      'Cannot create an instance of "%s": it does not implement the abstract method "%s" ' +
+      '(declared with DECLARE ABSTRACT further up the chain)', [UpperCase(TypeName), m]);
+end;
+
 function TSSAGenerator.MethodIsVirtual(const TypeName, MethNm: string): Boolean;
 // ⭐ FreeBASIC dispatches ONLY on a method declared Virtual (Abstract implies it). A method without
 // the word is not overridable: a redeclaration in a child SHADOWS it, and the call resolves on the
@@ -25631,6 +25769,7 @@ begin
   // one - and that comparison is meaningless across runs anyway.
   if Node.Attributes.Values['PLACEMENT'] = '1' then
     ProcessExpression(Node.GetChild(Node.ChildCount - 1), CountVal);
+  CheckInstantiable(FUDTs[UDTIdx].Name);           // OOP: NEW of an abstract type refuses here
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Result,
                   MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
@@ -29416,6 +29555,7 @@ begin
   // variable pre-allocation, so record vars are allocated as int handles and DIM..AS builtin
   // vars use their declared bank.
   RegisterUDTs(AST);
+  CheckOverrideAnnotations;   // MODERN: OVERRIDE/FINAL, once every TYPE is known
   // These must be cleared BEFORE RegisterRecordVars: that pre-pass records the print-kind of unsigned
   // 64-bit parameters and FUNCTION return types here (so a call result / a param in a body is seen as
   // unsigned), and a later clear would wipe them. DIM-scalar widths are (re)recorded during body gen.
