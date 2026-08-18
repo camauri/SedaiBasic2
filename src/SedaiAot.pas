@@ -103,6 +103,13 @@ type
     // ITEMS stay on the helper (they carry the CMD-redirection branch, which can raise).
     PrintSemi: Pointer;    // offset 248: @AotPrintSemicolon (VMSelf, CtxObj)
     PrintEnd: Pointer;     // offset 256: @AotPrintEnd (VMSelf)
+    // C7: the STRING transfer bank. The int and float bases sit at offsets 0 and 8 and their Xfer
+    // ops have been native since B1; the string ones had no base here, so every parameter or result
+    // that is a STRING went through AotExecOne - one full flush/reload per argument, on every call
+    // that passes a string. The bank is per-CONTEXT like the other two (a worker must see its own)
+    // and, like StrRegs, is sized once and never reallocated, so it is set with them once per Run.
+    // No new primitive is needed: both directions are an AotStrAssign between two managed slots.
+    XferStr: Pointer;      // offset 264: @Ctx.XferStr[0]
   end;
   PAotCtx = ^TAotCtx;
 
@@ -131,6 +138,7 @@ const
   AOTCTX_RECMARKPOP  = 240;
   AOTCTX_PRINTSEMI   = 248;
   AOTCTX_PRINTEND    = 256;
+  AOTCTX_XFERSTR     = 264;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -414,6 +422,7 @@ var
   GRecNativeState: Integer = -1;   // -1 unread, 0 off, 1 on
   GRecAllocState: Integer = -1;    // C6 New/Delete/RecMark as leaf calls: -1 unread, 0 off, 1 on
   GPrintOpState: Integer = -1;     // C7 PrintSemicolon/PrintEnd as leaf calls: -1 unread, 0 off, 1 on
+  GXferStrState: Integer = -1;     // C7 XferLoad/StoreString as leaf calls: -1 unread, 0 off, 1 on
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
   // A STRING array element can be reached natively (through AotStrAssign) only when an
   // out-of-range index cannot RAISE: the helper would throw across a compiled frame that is not
@@ -587,6 +596,17 @@ begin
     else GPrintOpState := 1;
   end;
   Result := GPrintOpState = 1;
+end;
+
+// C7: the STRING transfer ops as leaf calls. AOT_XFERSTR=0 puts them back on AotExecOne.
+function AotXferStrNative: Boolean;
+begin
+  if GXferStrState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_XFERSTR') = '0' then GXferStrState := 0
+    else GXferStrState := 1;
+  end;
+  Result := GXferStrState = 1;
 end;
 
 // AOT_DYNF gate, read once. Tri-state: 0 = AUTO (default: enable per region only where the
@@ -996,6 +1016,9 @@ begin
     ssaPrintSemicolon, ssaPrintEnd,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
+    // C7: and the STRING pair, which had been left behind. Both are one AotStrAssign between two
+    // managed slots - no allocation, so nothing that can raise across a compiled frame.
+    ssaXferLoadString, ssaXferStoreString,
     ssaReturnSub, ssaEnd, ssaStop,
     ssaRecMarkPush, ssaRecMarkPop,
     // Record FIELD access: Ctx.Records[handle].{Int,Float}Data[slot]. Native only when the layout
@@ -1203,6 +1226,10 @@ begin
     // C7: the two print bookkeeping opcodes. No operands to check - only the A/B gate.
     ssaPrintSemicolon, ssaPrintEnd:
       Result := AotPrintOpNative;
+    // C7: the STRING transfer pair. The slot index travels in the bytecode Immediate, which the
+    // emitter reads at compile time, so the operand shape is fixed - only the A/B gate to check.
+    ssaXferLoadString, ssaXferStoreString:
+      Result := AotXferStrNative;
     // roundsd is SSE4.1, so these three share MathInt's gate.
     ssaMathInt, ssaMathFix:
       Result := AotMathIntNative;
@@ -2579,6 +2606,43 @@ var
     E.MemOp([$48, $8B], ABI_ARG1, RAX, LongWord(s) * 8);  // arg1 = StringRegs[src] (value)
     E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRASSIGN);       // rax = primitive
     E.EmitBytes([$FF, $D0]);                              // call rax
+    StrCallEpilogue;
+  end;
+
+  // C7: the STRING transfer pair, both a managed assignment between two slots - the same
+  // AotStrAssign(&dst, srcVal) EmitStrCopy uses, only with one end in the Xfer bank instead of the
+  // register bank. Staging is EmitStrCopy's: every bank read goes through rax while r8 is still the
+  // ctx, the primitive address last, then the call.
+  //
+  //   XferStr[slot] := StringRegs[src]      (store: a string argument handed to a callee)
+  //   StringRegs[dest] := XferStr[slot]     (load: the callee picking it up, or a string result)
+  // ⛔ NOT named sreg/dreg: Pascal is case-insensitive, so a local `sreg` IS the function `SReg`
+  // and the call below stops parsing. See case-insensitive-means-one-name.
+  procedure EmitXferStoreStr(Slot: Integer);
+  var srcBank: Integer;
+  begin
+    srcBank := SReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);            // rax = register bank base
+    E.MemOp([$48, $8B], ABI_ARG1, RAX, LongWord(srcBank) * 8); // arg1 = StringRegs[src] (value)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_XFERSTR);            // rax = transfer bank base
+    Lea(ABI_ARG0, RAX, LongWord(Slot) * 8);                  // arg0 = &XferStr[slot]
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRASSIGN);          // rax = primitive
+    E.EmitBytes([$FF, $D0]);                                 // call rax
+    StrCallEpilogue;
+  end;
+
+  procedure EmitXferLoadStr(Slot: Integer);
+  var dstBank: Integer;
+  begin
+    dstBank := SReg(Cur.Dest); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_XFERSTR);            // rax = transfer bank base
+    E.MemOp([$48, $8B], ABI_ARG1, RAX, LongWord(Slot) * 8);  // arg1 = XferStr[slot] (value)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);            // rax = register bank base
+    Lea(ABI_ARG0, RAX, LongWord(dstBank) * 8);               // arg0 = &StringRegs[dest]
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRASSIGN);          // rax = primitive
+    E.EmitBytes([$FF, $D0]);                                 // call rax
     StrCallEpilogue;
   end;
 
@@ -4673,6 +4737,18 @@ var
               if Prog.GetSsaPc(o) < 0 then Fail('no-pc-callsub');
             end;
           end;
+          // C7: the STRING transfer pair. Same rule as the string leaf calls below and as the
+          // string ARRAY element above - BOTH ends are bank slots and the slot index is a
+          // constant in Src3, so there is nothing to count. Counting anything here would hand
+          // CountVal a string register, and CountVal rejects those outright: that is what made
+          // the whole region bail with 'string-operand' the first time this path was opened,
+          // and it is the second time the same trap has been sprung.
+          ssaXferLoadString, ssaXferStoreString:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+              HasHelperCall := True;   // a leaf call still needs a call-ready frame
+          end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
           ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -6339,6 +6415,18 @@ var
         LoadXferBase(True);
         FLoad(XMM0, FReg(Cur.Src1));
         SseMem([$F2, $0F, $11], XMM0, RDX, LongWord(w) * 8);
+      end;
+      // C7: the STRING pair. Same slot encoding as the three above (Src3 = the bank slot), but the
+      // value is MANAGED, so it moves through AotStrAssign rather than a mov.
+      ssaXferStoreString:
+      begin
+        w := CInt(Cur.Src3); if not OK then Exit;
+        EmitXferStoreStr(w);
+      end;
+      ssaXferLoadString:
+      begin
+        w := CInt(Cur.Src3); if not OK then Exit;
+        EmitXferLoadStr(w);
       end;
 
       // B3: native call site. The callee entry PC is the resolved label sitting in the

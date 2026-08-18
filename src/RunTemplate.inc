@@ -144,6 +144,10 @@ begin
     LocalAotCtx.CtxObj := Ctx;
     if Length(Ctx.StringRegs) > 0 then LocalAotCtx.StrRegs := @Ctx.StringRegs[0]
     else LocalAotCtx.StrRegs := nil;
+    // C7: the STRING transfer bank, alongside the int and float bases set above. Same lifetime as
+    // StrRegs (sized once, never reallocated), so once per Run is enough.
+    if Length(Ctx.XferStr) > 0 then LocalAotCtx.XferStr := @Ctx.XferStr[0]
+    else LocalAotCtx.XferStr := nil;
   end
   else
     AotFuncs := nil;
