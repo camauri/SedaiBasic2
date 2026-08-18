@@ -2462,7 +2462,10 @@ begin
       else if (Param = '--date-deterministic') then
         SetDateLocaleMode(False) // explicit default: English names, ISO-ish parsing, same on every machine
       else if (Param = '--jit') then
-        OptJit := True   // JIT: compile eligible hot loops to native code (J2/J3)
+        begin
+          OptJit := True;  // JIT: compile eligible hot loops to native code (J2/J3)
+          GJitWillRun := True;   // ...e le superistruzioni devono stare zitte: vedi il flag
+        end
       else if (Param = '--aot') then
       begin
         OptAot := True;  // AOT (plan B): compile eligible whole SSA functions to native

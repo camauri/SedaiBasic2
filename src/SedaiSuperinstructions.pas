@@ -60,7 +60,7 @@ unit SedaiSuperinstructions;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeTypes, SedaiNopCompaction, SedaiOpcodeBanks;
+  Classes, SysUtils, SedaiBytecodeTypes, SedaiNopCompaction, SedaiOpcodeBanks, SedaiSSATypes;
 
 { Superinstruction opcodes are now defined in SedaiBytecodeTypes.pas }
 { All bcXxx constants are imported via the uses clause }
@@ -2279,6 +2279,16 @@ begin
   // ⚡ SUPERINSTR: runtime A/B while the compile-time switch is being re-decided. '0' forces the pass
   // off on a binary built with it ON, so the two arrangements are one binary and one switch.
   if GetEnvironmentVariable('SUPERINSTR') = '0' then begin Result := 0; Exit; end;
+  // ⛔⛔⛔ ONLY WHEN THE INTERPRETER IS THE ONLY ENGINE, AND THE TEST LIVES HERE BECAUSE THERE ARE
+  // FOUR CALLERS - SedaiRunner, SedaiBasicVM.lpr, SedaiBasicCompiler.lpr and SedaiWebServer. Gating
+  // one of them (the runner) left `sb` itself, which calls the second, still fusing under --jit.
+  //
+  // The pass rewrites BYTECODE, which is exactly what the JIT consumes; the JIT declines any hot
+  // loop holding an opcode it cannot lower, and every superinstruction is one. Measured 18 Aug:
+  // fannkuch --jit went from 178 ms to 4378, a factor of 24 - not slower, SWITCHED OFF. The AOT
+  // loses through the regions it declines and runs interpreted. Fusion and the compilers compete for
+  // the same representation, so the pass runs only when no compiler will.
+  if GAotWillRun or GJitWillRun then begin Result := 0; Exit; end;
   // ⚡ SUPERMASK: bisect WHICH fusion is wrong. Every TryFuseXxx call is guarded by KindOn(n), and
   // SUPERMASK is a comma-separated list of the kinds to ENABLE (empty = all). The family was off for
   // a month, so it has rotted: with all of it on, run_regress gives 16 FAIL and 16 OPTDIFF. This is

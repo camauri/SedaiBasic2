@@ -543,6 +543,7 @@ begin
           {$ENDIF}
 
           {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
+          // The engine gate lives inside RunSuperinstructions - four callers, one place.
           if not FSkipSuperinstructions then
             try RunSuperinstructions(Result); except end;
           {$ENDIF}

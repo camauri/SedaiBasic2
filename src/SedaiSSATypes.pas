@@ -108,6 +108,11 @@ var
   // call into the superinstruction dispatcher. A pass that helps one engine and hurts the other
   // should ask which one is coming rather than average the two.
   GAotWillRun: Boolean = False;
+  // Gemello del precedente per il JIT. Serve a UNA decisione: le superistruzioni riscrivono il
+  // BYTECODE, che e' esattamente cio' che il JIT consuma - e il JIT rinuncia a un ciclo caldo che
+  // contenga un opcode che non sa scendere. Fondere sotto JIT gli toglie ogni ciclo: fannkuch e'
+  // passato da 178 ms a 4378, un fattore 24.
+  GJitWillRun: Boolean = False;
 
 type
   TSSARegisterType = (srtInt, srtFloat, srtString);

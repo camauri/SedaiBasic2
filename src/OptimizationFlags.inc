@@ -35,38 +35,42 @@
 // Master switch: uncomment to disable ALL optimizations
 {.$DEFINE DISABLE_ALL_OPTIMIZATIONS}
 
-// ⛔⛔⛔ SUPERINSTRUCTIONS DISABLED - and the 18 Aug attempt to re-enable them is the reason the note
-// is now this long. Read it before trying again.
+// ⛔ SUPERINSTRUCTIONS OFF - and this time WHY is measured, not asserted. Two separate problems,
+// one fixed and one still open. Do not re-enable until the second is fixed.
 //
-// The July verdict (2026-07-18) was: "superinstruction fusion is a stack-VM optimization; on this
-// register-based 3-operand VM dispatch-per-useful-work is already minimal, so fusing removes at most
-// one dispatch while doing the SAME work -- measured net-zero-to-negative (n-body +38% with float
-// fusion), a small win only for the integer loop-control fusion." It was right.
+// PROBLEM 1 - FIXED. The pass rewrites BYTECODE, which is what the JIT consumes; the JIT declines any
+// hot loop holding an opcode it cannot lower, and every superinstruction is one. Turned on globally
+// it does not slow the JIT, it SWITCHES IT OFF: fannkuch --jit 178 ms -> 4378, a factor of 24, and an
+// official benchmark battery ran 85 minutes with half its cells measuring the interpreter under the
+// JIT's name. The AOT loses too, through the regions it declines and runs interpreted. The gate now
+// lives INSIDE RunSuperinstructions (GAotWillRun / GJitWillRun) because there are FOUR callers -
+// SedaiRunner, SedaiBasicVM.lpr, SedaiBasicCompiler.lpr, SedaiWebServer - and gating one left `sb`
+// itself still fusing.
 //
-// On 18 Aug it was overturned on the strength of a real observation - a superinstruction was
-// dispatched TWICE, by the outer dense case and again by an inner "case Op and $FF of" whose 57 arms
-// scattered over 0..254 compile to a decision tree, so a fused opcode cost 16.7 ns against a plain
-// one's 4.05 - and the inner arms were flattened into the outer case. Every benchmark then measured
-// faster. ⛔ AGAINST A BASELINE THE FLATTENING HAD ITSELF DEGRADED: putting 57 sparse arms into the
-// outer case damaged the dispatch of EVERY opcode. Measured against a binary built from the previous
-// commit, with fusion still OFF, the flattened table alone costs +12% to +15% on every program.
+// PROBLEM 2 - OPEN, AND IT IS THE REAL ONE. Even for the interpreter alone the family LOSES:
+// binary-trees +36%, spectral-norm +53%, fannkuch +49%, n-body +12%. The cause is the SUB-OPCODE
+// NUMBERING. The 61 sub-opcodes are scattered over 0..255 (0-5, 10-15, 20-22, ... 250-255), so the
+// inner "case Op and $FF of" compiles to a DECISION TREE rather than a jump table. Isolated outside
+// the VM - the same case with 61 labels, sparse against dense, 20M dispatches:
 //
-// The honest end-to-end comparison, previous commit versus flattened-and-fused:
-//     binary-trees +37.3%    fannkuch +10.0%    n-body -4.6%
-// and the JIT stops compiling ENTIRELY - it declines any hot loop holding an opcode it cannot lower,
-// which every superinstruction is: fannkuch --jit went from 178 ms to 4378, a factor of 24.
+//        sparse (0..255)  80 ms        dense (0..60)  30 ms       2.7x
 //
-// ⭐ THREE THINGS TO TAKE AWAY IF THIS IS EVER REOPENED:
-//   1. The interpreter is not uniformly helped even in principle: binary-trees interpreted is +30%
-//      with fusion on. A measurement set without a call-heavy, allocation-heavy program will not
-//      show it - mine did not.
-//   2. Anything that rewrites BYTECODE breaks the JIT, which consumes bytecode and refuses what it
-//      cannot lower. Fusion and the JIT are competing for the same representation.
-//   3. Baseline discipline: an A/B against the same binary with a runtime switch is NOT enough when
-//      the change also alters code the switch does not disable. Build the previous commit.
+// A fused opcode therefore costs 16.7 ns against a plain one's 4.05, and folding three cheap
+// instructions into one expensive one is a loss by construction. THE FIX IS TO NUMBER THEM DENSELY
+// (0..60), which makes the inner case a jump table and leaves the outer one alone.
 //
-// What survived: the two genuine miscompiles found in TryFuseConstantArithmetic (see the comments in
-// SedaiSuperinstructions.pas), and SUPERINSTR=0 / SUPERMASK=<n,...> as instruments.
+// ⛔ What is NOT the fix, both tried on 18 Aug: flattening the inner arms into the outer dense case
+// (it damaged the dispatch of EVERY opcode - +12% to +15% on every program with fusion still off,
+// measured against a binary built from the previous commit), and hoisting the hot few in front of the
+// inner case (micro -28% but fannkuch +81%, because every other superinstruction then pays six
+// compares first).
+//
+// ⚠️ And a warning for whoever measures the renumbering: an A/B against the same binary with a
+// runtime switch is NOT enough when the change also alters code the switch does not disable. Build
+// the previous commit. That mistake is what made the first attempt look like a win.
+//
+// Kept from the attempt: the two genuine miscompiles fixed in TryFuseConstantArithmetic, and the
+// SUPERINSTR=0 / SUPERMASK=<n,...> switches that found them.
 // See job/docs/VM_DISPATCH_E_RIDIMENSIONABILITA.md and the JIT design doc.
 {$DEFINE DISABLE_SUPERINSTRUCTIONS}
 {$DEFINE DISABLE_ARRAYSTORECONST}
