@@ -26,6 +26,7 @@ DEBUG=false
 CLEAN=false
 WINDOW=false
 NO_BANNER=false
+SELECT_FPC=false
 CPU=""                 # empty => detect from the host
 OS=""                  # empty => detect from the host
 WITH_SEDAI_AUDIO=""    # '' auto-detect | 'no' disabled | <path>
@@ -62,10 +63,11 @@ show_help() {
     echo "  --with-sedai-audio <no|path>  Audio: disable, or use a specific path"
     echo "  --debug-flags <LIST>     Comma-separated: SSA,REGALLOC,... or ALL"
     echo "  --no-banner              Suppress the banner"
+    echo "  --select-fpc             List the Free Pascal compilers found and choose one (stored)"
     echo "  --help                   Show this help"
     echo ""
     echo "Environment:"
-    echo "  SEDAI_FPC=<path>         Use this fpc binary"
+    echo "  SEDAI_FPC=<path>         Use this fpc binary for one run (not stored)"
     echo "  SEDAI_CPUOPT=none|avx|avx2   Instruction set (default: none, the portable baseline)"
     echo "                           avx/avx2 measured to buy nothing: FPC does not vectorize"
 }
@@ -94,44 +96,176 @@ config_value() {
     sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -1
 }
 
+# Write a string value into setup.config.json, creating the file if needed. Flat JSON only, which is
+# all this file has ever held - no parser required, and none available on a bare machine.
+config_set() {
+    local key="$1" val="$2" file="$SCRIPT_DIR/setup.config.json" esc tmp
+    esc="$(printf '%s' "$val" | sed 's/[\\"]/\\&/g')"
+    if [[ ! -f "$file" ]]; then
+        printf '{\n  "%s": "%s"\n}\n' "$key" "$esc" > "$file"
+        return 0
+    fi
+    tmp="$file.tmp.$$"
+    if grep -q "\"$key\"[[:space:]]*:" "$file"; then
+        sed "s|\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"$key\": \"$esc\"|" "$file" > "$tmp"
+    else
+        # Insert as the first member, so a file with or without a trailing comma both stay valid.
+        sed "0,/{/s|{|{\n  \"$key\": \"$esc\",|" "$file" > "$tmp"
+    fi
+    mv "$tmp" "$file"
+}
+
 # Locate fpc. On this machine it is NOT on PATH and NOT under /usr: it lives in the user's
 # home (~/tools/fp/...). An absence from PATH is not evidence that fpc is missing, so the
 # home is searched before giving up - and if it is still not found, the user is asked.
-find_fpc() {
-    local platform="$1"
-    local candidate
+# Which fpc to build with.
+#
+# ⛔ THIS USED TO PICK THE FIRST BINARY IT FOUND, AND THAT IS A TRAP. The search globbed
+# ~/tools/fp/*/fpc/..., which expands in ALPHABETICAL order, so the day an fpc-3.3.1 appeared next
+# to fpc-stable the project silently switched compiler - and that install had no usable RTL, so
+# every build died with "Can't find unit system" pointing at a compiler nobody had chosen. A found
+# binary is not a working compiler, and picking one without saying so is worse than finding none.
+#
+# So: discover EVERY candidate, PROVE each one compiles, list them, let the user choose ONCE, and
+# remember the choice in setup.config.json. After that it is a config read and nothing searches.
 
-    # 1. Explicit environment override
+# Every fpc binary reachable on this machine, one per line, de-duplicated by resolved path.
+fpc_candidates() {
+    local platform="$1" c
+    {
+        printf '%s\n' "$SCRIPT_DIR/fpc/3.2.2/bin/$platform/fpc"
+        for c in "$HOME"/tools/fp/*/fpc/bin/"$platform"/fpc \
+                 "$HOME"/fpcupdeluxe/fpc/bin/"$platform"/fpc; do
+            printf '%s\n' "$c"
+        done
+        command -v fpc 2>/dev/null || true
+        # Last resort, and deliberately last: a deep scan of the home finds installs in odd places
+        # but says nothing about which one is meant.
+        find "$HOME" -maxdepth 6 -type f -name fpc -perm -u+x 2>/dev/null || true
+    } | while read -r c; do
+        [[ -n "$c" && -x "$c" ]] || continue
+        readlink -f "$c" 2>/dev/null || printf '%s\n' "$c"
+    done | awk '!seen[$0]++'
+}
+
+# Does this compiler actually COMPILE? Not "does the binary run" - fpc -iV answers that happily on an
+# install whose RTL it cannot find. The only honest test is a build, done the way build.sh builds:
+# no explicit config file, because that is what the real invocation does.
+fpc_works() {
+    local fpc="$1" d rc
+    d="$(mktemp -d)" || return 1
+    printf 'begin end.\n' > "$d/probe.pas"
+    ( cd "$d" && "$fpc" -o"$d/probe" "$d/probe.pas" ) >/dev/null 2>&1
+    rc=$?
+    rm -rf "$d"
+    return $rc
+}
+
+# .../fpc/bin/<platform>/fpc  ->  .../fpc   (the root form build.ps1 stores as FpcPath).
+# Anything else (a system /usr/bin/fpc) has no such root, and prints nothing.
+fpc_root_of() {
+    local bin="$1" platform="$2"
+    case "$bin" in
+        */bin/"$platform"/fpc) printf '%s\n' "${bin%/bin/$platform/fpc}" ;;
+        *) : ;;
+    esac
+}
+
+# List what is installed, prove which ones work, and ask. Writes the answer to setup.config.json so
+# this happens exactly once.
+choose_fpc() {
+    local platform="$1" c ver ok n=0 sel root
+    local -a paths=() vers=() good=()
+
+    while read -r c; do
+        [[ -n "$c" ]] || continue
+        ver="$("$c" -iV 2>/dev/null)"
+        [[ -n "$ver" ]] || continue
+        if fpc_works "$c"; then ok=yes; else ok=no; fi
+        paths+=("$c"); vers+=("$ver"); good+=("$ok")
+    done < <(fpc_candidates "$platform")
+
+    n=${#paths[@]}
+    if [[ $n -eq 0 ]]; then
+        echo -e "${RED}ERROR: no Free Pascal Compiler found.${NC}" >&2
+        echo -e "${YELLOW}Looked in: fpc/3.2.2/, ~/tools/fp/*/fpc/, ~/fpcupdeluxe/, PATH, and \$HOME.${NC}" >&2
+        return 1
+    fi
+
+    echo "" >&2
+    echo -e "${CYAN}Free Pascal compilers found on this machine:${NC}" >&2
+    for ((i=0; i<n; i++)); do
+        if [[ "${good[$i]}" == yes ]]; then
+            printf "  %d) FPC %-8s %s\n" "$((i+1))" "${vers[$i]}" "${paths[$i]}" >&2
+        else
+            printf "  %d) FPC %-8s %s   ${YELLOW}[cannot compile - skipped]${NC}\n" \
+                   "$((i+1))" "${vers[$i]}" "${paths[$i]}" >&2
+        fi
+    done
+    echo "" >&2
+
+    # A compiler that cannot compile is never the answer, however it got listed.
+    local -a usable=()
+    for ((i=0; i<n; i++)); do [[ "${good[$i]}" == yes ]] && usable+=("$i"); done
+    if [[ ${#usable[@]} -eq 0 ]]; then
+        echo -e "${RED}ERROR: none of them can compile a trivial program.${NC}" >&2
+        echo -e "${YELLOW}An install without a usable fpc.cfg is the usual cause.${NC}" >&2
+        return 1
+    fi
+
+    # No terminal means no question: a script or a CI run must fail loudly rather than hang on a
+    # prompt, or pick for the user and be wrong quietly.
+    if [[ ! -t 0 ]]; then
+        echo -e "${YELLOW}Not a terminal, so nothing was chosen and nothing was stored.${NC}" >&2
+        echo -e "${YELLOW}Run ./build.sh --select-fpc once interactively, or set SEDAI_FPC=<path>.${NC}" >&2
+        return 1
+    fi
+
+    local default=$((usable[0]+1))
+    while :; do
+        read -r -p "Which one should this project use? [$default] " sel >&2 || return 1
+        [[ -z "$sel" ]] && sel=$default
+        [[ "$sel" =~ ^[0-9]+$ ]] || { echo "  a number, please" >&2; continue; }
+        (( sel >= 1 && sel <= n )) || { echo "  out of range" >&2; continue; }
+        [[ "${good[$((sel-1))]}" == yes ]] || { echo "  that one cannot compile; pick another" >&2; continue; }
+        break
+    done
+
+    c="${paths[$((sel-1))]}"
+    config_set FpcBin "$c"
+    root="$(fpc_root_of "$c" "$platform")"
+    # FpcPath is the form build.ps1 reads, so a shared checkout keeps working; a system install has
+    # no such root and simply does not get the key.
+    [[ -n "$root" ]] && config_set FpcPath "$root"
+    echo -e "${GREEN}Stored in setup.config.json: FPC ${vers[$((sel-1))]} - $c${NC}" >&2
+    echo -e "${GRAY}Change it later with ./build.sh --select-fpc${NC}" >&2
+    printf '%s\n' "$c"
+}
+
+find_fpc() {
+    local platform="$1" candidate
+
+    # 1. Explicit environment override - deliberately NOT stored: it is a one-off, and writing it
+    #    would turn "just this once" into the project's setting.
     if [[ -n "$SEDAI_FPC" && -x "$SEDAI_FPC" ]]; then
         echo "$SEDAI_FPC"; return 0
     fi
 
-    # 2. setup.config.json
-    local cfg
-    cfg="$(config_value FpcPath 2>/dev/null || true)"
-    if [[ -n "$cfg" && -x "$cfg/bin/$platform/fpc" ]]; then
-        echo "$cfg/bin/$platform/fpc"; return 0
+    # 2. The stored choice.
+    if [[ "$SELECT_FPC" != "true" ]]; then
+        candidate="$(config_value FpcBin 2>/dev/null || true)"
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            echo "$candidate"; return 0
+        fi
+        # The older key, kept so an existing setup.config.json keeps working.
+        candidate="$(config_value FpcPath 2>/dev/null || true)"
+        if [[ -n "$candidate" && -x "$candidate/bin/$platform/fpc" ]]; then
+            echo "$candidate/bin/$platform/fpc"; return 0
+        fi
     fi
 
-    # 3. Project-local FPC (installed by setup.sh) - always preferred over a system one
-    candidate="$SCRIPT_DIR/fpc/3.2.2/bin/$platform/fpc"
-    [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
-
-    # 4. Known installations under the user's home (fpcupdeluxe layout)
-    for candidate in "$HOME"/tools/fp/*/fpc/bin/"$platform"/fpc \
-                     "$HOME"/fpcupdeluxe/fpc/bin/"$platform"/fpc; do
-        [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-
-    # 5. System PATH
-    candidate="$(command -v fpc 2>/dev/null || true)"
-    [[ -n "$candidate" ]] && { echo "$candidate"; return 0; }
-
-    # 6. Last resort: look through the home before declaring it missing
-    candidate="$(find "$HOME" -maxdepth 6 -type f -name fpc -perm -u+x 2>/dev/null | head -1)"
-    [[ -n "$candidate" ]] && { echo "$candidate"; return 0; }
-
-    return 1
+    # 3. Nothing stored (or --select-fpc): ask, once.
+    choose_fpc "$platform"
 }
 
 # What the CPU we are building FOR can actually execute.
@@ -404,6 +538,7 @@ while [[ $# -gt 0 ]]; do
         --clean) CLEAN=true; shift ;;
         --window) WINDOW=true; shift ;;
         --no-banner) NO_BANNER=true; shift ;;
+        --select-fpc) SELECT_FPC=true; shift ;;
         --cpu) CPU="$2"; shift 2 ;;
         --os) OS="$2"; shift 2 ;;
         --with-sedai-audio) WITH_SEDAI_AUDIO="$2"; shift 2 ;;
@@ -426,12 +561,7 @@ fi
 [[ -z "$OS" ]] && OS="$(detect_os)"
 PLATFORM_DIR="$CPU-$OS"
 
-FPC="$(find_fpc "$PLATFORM_DIR")" || {
-    echo -e "${RED}ERROR: Free Pascal Compiler (fpc) not found!${NC}"
-    echo -e "${YELLOW}Looked in: \$SEDAI_FPC, setup.config.json, fpc/3.2.2/, ~/tools/fp/*/fpc/, PATH, \$HOME.${NC}"
-    echo -e "${YELLOW}Set SEDAI_FPC=<path to fpc> or install it.${NC}"
-    exit 1
-}
+FPC="$(find_fpc "$PLATFORM_DIR")" || exit 1
 
 echo -e "${GRAY}Compiler: FPC $("$FPC" -iV 2>/dev/null) - $FPC${NC}"
 echo -e "${GRAY}Platform: $PLATFORM_DIR${NC}"
