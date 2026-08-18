@@ -9029,6 +9029,52 @@ begin
   end;
 end;
 
+{ ===== C7: PRINT's two bookkeeping opcodes as leaf calls =====
+
+  ⭐ Why these two and not the print ITEMS. `Print a;` is THREE bytecode instructions -
+  bcPrintString, bcPrintSemicolon, bcPrintEnd - and without a native lowering each one is a full
+  AotExecOne round trip: flush every homed register, call, reload them, compare the returned PC.
+  Measured 17 Aug 2026 on 800 000 statements: an AOT print ITEM costs 145 ns against the
+  interpreter's 65, so compiled code was 2.2x SLOWER than interpreted code at printing - and the
+  helper call is where the difference lives (the same ~76 ns per helper call that put ABS and SGN
+  in IsB1Op). Two of the three instructions do almost nothing: in every dialect preset in the tree
+  SemicolonAction is saNoSpace, and PrintEnd is one virtual call that resets C128 reverse mode.
+
+  They are safe as LEAF calls for the three reasons the C5/C6 primitives are: neither moves the PC,
+  neither can invalidate the array-descriptor table, and neither can ask to leave for the
+  interpreter. The print ITEMS stay on the helper - they carry the CMD-redirection branch, which
+  can raise a BASIC error, and an exception must not unwind through native frames.
+
+  ⛔ Each is an EXACT transcription of its ExecuteIOOp arm; the interpreter stays the definition of
+  the behaviour. In particular the SemicolonAction case is reproduced in full rather than collapsed
+  to "do nothing", because the property is writable at run time. }
+
+procedure AotPrintSemicolon(VMSelf, CtxObj: Pointer); cdecl;
+var
+  VM: TBytecodeVM;
+begin
+  VM := TBytecodeVM(VMSelf);
+  if not Assigned(VM.FOutputDevice) then Exit;
+  case VM.FConsoleBehavior.SemicolonAction of
+    saNoSpace: ;
+    saSpaceAfter, saSpaceBoth:
+      begin
+        VM.FOutputDevice.Print(' ');
+        VM.AdvancePrintCol(TExecutionContext(CtxObj), 1);
+      end;
+    saSpaceBefore: ;
+  end;
+end;
+
+procedure AotPrintEnd(VMSelf: Pointer); cdecl;
+var
+  VM: TBytecodeVM;
+begin
+  VM := TBytecodeVM(VMSelf);
+  if Assigned(VM.FOutputDevice) then
+    VM.FOutputDevice.ResetPrintState;
+end;
+
 const
   // B3: cap on native-to-native call nesting. Each level consumes real machine stack (the
   // callee's native frame plus this Pascal frame); the interpreter's call stack lives on the
@@ -10223,6 +10269,10 @@ begin
   C.RecFree := @AotRecordFree;
   C.RecMarkPush := @AotRecMarkPush;
   C.RecMarkPop := @AotRecMarkPop;
+  // C7: PRINT's bookkeeping pair. Dialect-blind - the semicolon primitive reads the console
+  // behaviour's own property, so it needs no per-run flavor the way StrMid does.
+  C.PrintSemi := @AotPrintSemicolon;
+  C.PrintEnd := @AotPrintEnd;
 end;
 
 procedure TBytecodeVM.RebuildJitArrDesc;

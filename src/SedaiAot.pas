@@ -97,6 +97,12 @@ type
     RecFree: Pointer;      // offset 224: @AotRecordFree (VMSelf, handle)
     RecMarkPush: Pointer;  // offset 232: @AotRecMarkPush (CtxObj)
     RecMarkPop: Pointer;   // offset 240: @AotRecMarkPop (CtxObj)
+    // C7: PRINT's two bookkeeping opcodes. `Print a;` is THREE bytecode instructions and without
+    // these two it was three helper calls - measured 145 ns per print item against the
+    // interpreter's 65, i.e. compiled code SLOWER than interpreted code at printing. The print
+    // ITEMS stay on the helper (they carry the CMD-redirection branch, which can raise).
+    PrintSemi: Pointer;    // offset 248: @AotPrintSemicolon (VMSelf, CtxObj)
+    PrintEnd: Pointer;     // offset 256: @AotPrintEnd (VMSelf)
   end;
   PAotCtx = ^TAotCtx;
 
@@ -123,6 +129,8 @@ const
   AOTCTX_RECFREE     = 224;
   AOTCTX_RECMARKPUSH = 232;
   AOTCTX_RECMARKPOP  = 240;
+  AOTCTX_PRINTSEMI   = 248;
+  AOTCTX_PRINTEND    = 256;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -405,6 +413,7 @@ var
   GSharedRecOff: Integer = 0;
   GRecNativeState: Integer = -1;   // -1 unread, 0 off, 1 on
   GRecAllocState: Integer = -1;    // C6 New/Delete/RecMark as leaf calls: -1 unread, 0 off, 1 on
+  GPrintOpState: Integer = -1;     // C7 PrintSemicolon/PrintEnd as leaf calls: -1 unread, 0 off, 1 on
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
   // A STRING array element can be reached natively (through AotStrAssign) only when an
   // out-of-range index cannot RAISE: the helper would throw across a compiled frame that is not
@@ -565,6 +574,19 @@ begin
     else GRecAllocState := 1;
   end;
   Result := GRecAllocState = 1;
+end;
+
+// C7: PRINT's two bookkeeping opcodes as leaf calls instead of runtime helper calls, gated on its
+// own so the two arrangements are A/B-able on ONE binary: AOT_PRINTOP=0 puts bcPrintSemicolon and
+// bcPrintEnd back on AotExecOne (the historical behaviour).
+function AotPrintOpNative: Boolean;
+begin
+  if GPrintOpState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_PRINTOP') = '0' then GPrintOpState := 0
+    else GPrintOpState := 1;
+  end;
+  Result := GPrintOpState = 1;
 end;
 
 // AOT_DYNF gate, read once. Tri-state: 0 = AUTO (default: enable per region only where the
@@ -966,6 +988,12 @@ begin
     // but Fix(-0.0) = +0, while Int(-0.0) = -0), and a lowering must not cement that before it is
     // decided. The transcendentals need the leaf-call table, which is a block of its own.
     ssaMathAbs, ssaMathSgn, ssaMathFix,
+    // C7: PRINT's bookkeeping pair as leaf calls. Neither moves the PC, neither can invalidate the
+    // array-descriptor table, neither can ask to leave for the interpreter - the same three
+    // properties that make the C5 string primitives safe. The print ITEMS are NOT here: they carry
+    // the CMD-redirection branch, which raises a BASIC error, and an exception must not unwind
+    // through native frames. AotIsNative reads AotPrintOpNative for the A/B switch.
+    ssaPrintSemicolon, ssaPrintEnd,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     ssaReturnSub, ssaEnd, ssaStop,
@@ -1172,6 +1200,9 @@ begin
       Result := AotRecAllocNative and (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     ssaRecordFree:
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
+    // C7: the two print bookkeeping opcodes. No operands to check - only the A/B gate.
+    ssaPrintSemicolon, ssaPrintEnd:
+      Result := AotPrintOpNative;
     // roundsd is SSE4.1, so these three share MathInt's gate.
     ssaMathInt, ssaMathFix:
       Result := AotMathIntNative;
@@ -2683,6 +2714,29 @@ var
     SpillVolatiles;
     E.MemOp([$4D, $8B], R11, R8, Off);                    // r11 = primitive
     E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_CTXOBJ);     // arg0 = CtxObj
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+  end;
+
+  // C7: PRINT's bookkeeping pair. Two arguments at most, both read out of the ctx, no result and
+  // nothing to store - the cheapest shape a leaf call has. Same staging as EmitRecMarkNative: the
+  // primitive goes to r11 (loaded from r8 while r8 is still the ctx), then the ctx-derived
+  // arguments, then the call.
+  procedure EmitPrintSemi;
+  begin
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_PRINTSEMI);       // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);     // arg1 = CtxObj (rsi on System V - the
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     //   float bank base, hence SpillVolatiles
+    E.EmitBytes([$41, $FF, $D3]);                         //   FIRST; StrCallEpilogue restores it)
+    StrCallEpilogue;
+  end;
+
+  procedure EmitPrintEnd;
+  begin
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_PRINTEND);        // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     // arg0 = VMSelf
     E.EmitBytes([$41, $FF, $D3]);                         // call r11
     StrCallEpilogue;
   end;
@@ -5855,6 +5909,10 @@ var
         EmitRecordNew(apc);
       end;
       ssaRecordFree: EmitRecordFree;
+
+      // C7: PRINT's bookkeeping pair as leaf calls. No PC is needed - neither can deopt.
+      ssaPrintSemicolon: EmitPrintSemi;
+      ssaPrintEnd: EmitPrintEnd;
 
 
       ssaLoadConstInt:
