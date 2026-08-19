@@ -42,12 +42,11 @@ var
   IntRegs: PInt64;
   FloatRegs: PDouble;
   NextPC: Integer;          // indirect call target, read before FramePush can slide the view
-  ArrayIdx, LinearIdx, ArrLowerBound: Integer;
+  ArrayIdx, LinearIdx: Integer;   // used by the HOT typed accessors in ArrayHotOps.inc
   InputStr, PrintStr: string;
   InputVal: Double;
-  i, ProdDims: Integer;
+  i: Integer;
   NextTabCol, TabIdx: Integer;
-  ArrInfo: TSSAArrayInfo;
   // Local vars for ArrayReverseRange and ArrayShiftLeft
   ArrIdxW: Word;
   LStartIdx, LEndIdx, LLoopIdx: Integer;
@@ -1070,148 +1069,20 @@ begin
         bcRecordFree:
           begin FreeSharedRecord(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;   // DELETE p
 
-        // Array operations - typed versions are faster. Bounds-guarded to match the base ExecuteArrayOp
-        // path and the m207 model: MODERN OOB read -> default, OOB store -> dropped (memory-safe); CLASSIC raises.
-        bcArrayLoadInt:
-          begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              Ctx.IntRegs[Instr^.Dest] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
-            else
-              Ctx.IntRegs[Instr^.Dest] := 0;
-            Inc(CurPC);
-          end;
-        bcArrayLoadFloat:
-          begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              Ctx.FloatRegs[Instr^.Dest] := FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
-            else
-              Ctx.FloatRegs[Instr^.Dest] := 0.0;
-            Inc(CurPC);
-          end;
-        bcArrayLoadString:
-          begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              Ctx.StringRegs[Instr^.Dest] := FArrays[Instr^.Src1].StringData[IntRegs[Instr^.Src2]]
-            else
-              Ctx.StringRegs[Instr^.Dest] := '';
-            Inc(CurPC);
-          end;
-        bcArrayStoreInt:
-          begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := IntRegs[Instr^.Dest];
-            Inc(CurPC);
-          end;
-        bcArrayStoreFloat:
-          begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]] := FloatRegs[Instr^.Dest];
-            Inc(CurPC);
-          end;
-        bcArrayStoreString:
-          begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              FArrays[Instr^.Src1].StringData[IntRegs[Instr^.Src2]] := Ctx.StringRegs[Instr^.Dest];
-            Inc(CurPC);
-          end;
-
-        // Array dimension (slow path - only at initialization)
-        bcArrayDim:
-          begin
-            ArrayIdx := Instr^.Src1;
-            ArrInfo := FProgram.GetArray(ArrayIdx);
-            if ArrayIdx >= Length(FArrays) then
-              SetLength(FArrays, ArrayIdx + 1);
-            FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
-            FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
-            SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
-            SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
-            for i := 0 to ArrInfo.DimCount - 1 do
-            begin
-              // Effective lower bound: a RUNTIME lb register (FreeBASIC "Lbound(m) To Ubound(m)")
-              // overrides the compile-time constant; recorded for LBOUND/UBOUND and index adjustment.
-              ArrLowerBound := 0;
-              if (i < Length(ArrInfo.LowerBoundRegisters)) and (ArrInfo.LowerBoundRegisters[i] >= 0) then
-                ArrLowerBound := IntRegs[ArrInfo.LowerBoundRegisters[i]]
-              else if i <= High(ArrInfo.LowerBounds) then
-                ArrLowerBound := ArrInfo.LowerBounds[i];
-              FArrays[ArrayIdx].LowerBounds[i] := ArrLowerBound;
-
-              if ArrInfo.Dimensions[i] = 0 then
-              begin
-                // Variable upper bound: size = ub - lb + 1.
-                case ArrInfo.DimRegTypes[i] of
-                  srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] - ArrLowerBound + 1;
-                  srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) - ArrLowerBound + 1;
-                end;
-              end
-              else
-                FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
-            end;
-            ProdDims := 1;
-            for i := 0 to ArrInfo.DimCount - 1 do
-              ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
-            FArrays[ArrayIdx].TotalSize := ProdDims;
-            case ArrInfo.ElementType of
-              srtInt: SetLength(FArrays[ArrayIdx].IntData, ProdDims);
-              srtFloat: SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
-              srtString: SetLength(FArrays[ArrayIdx].StringData, ProdDims);
-            end;
-            Inc(CurPC);
-          end;
-
-        // LBOUND/UBOUND(arr[, dim]) - bound of a dimension (B1.4)
-        bcArrayLBound:
-          begin
-            ArrayIdx := Instr^.Src1;
-            LinearIdx := IntRegs[Instr^.Src2];  // 0-based dim index
-            IntRegs[Instr^.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
-            Inc(CurPC);
-          end;
-        bcArrayUBound:
-          begin
-            ArrayIdx := Instr^.Src1;
-            LinearIdx := IntRegs[Instr^.Src2];  // 0-based dim index
-            IntRegs[Instr^.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
-                                   + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
-            Inc(CurPC);
-          end;
-
-        // ERASE arr / REDIM [PRESERVE] arr(ub) (B1.4)
-        bcArrayErase:
-          begin
-            EraseArray(Instr^.Src1);
-            Inc(CurPC);
-          end;
-        bcArrayRedim:
-          begin
-            RedimArray(Instr^.Src1, IntRegs[Instr^.Src2], (Instr^.Immediate and 1) <> 0);
-            Inc(CurPC);
-          end;
-
-        // Generic array load/store (slower - legacy)
-        bcArrayLoad:
-          begin
-            ArrayIdx := Instr^.Src1;
-            LinearIdx := IntRegs[Instr^.Src2];
-            case FArrays[ArrayIdx].ElementType of
-              0: Ctx.IntRegs[Instr^.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-              1: Ctx.FloatRegs[Instr^.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-              2: Ctx.StringRegs[Instr^.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-            end;
-            Inc(CurPC);
-          end;
-        bcArrayStore:
-          begin
-            ArrayIdx := Instr^.Src1;
-            LinearIdx := IntRegs[Instr^.Src2];
-            case FArrays[ArrayIdx].ElementType of
-              0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr^.Dest];
-              1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr^.Dest];
-              2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr^.Dest];
-            end;
-            Inc(CurPC);
-          end;
+        // ⛔ THE GROUP-3 ARMS THAT USED TO SIT HERE WERE UNREACHABLE, AND THEY WERE NOT FREE.
+        // bcArrayLoadInt/Float/String, bcArrayStore*, bcArrayDim, bcArrayRedim, bcArrayErase,
+        // bcArrayLBound/UBound and the two deprecated generic forms are all GROUP 3 opcodes, and the
+        // outer case routes group 3 away before this one is ever entered - the hot typed accessors to
+        // ArrayHotOps.inc, everything else to ExecuteArrayOp. A group-3 value cannot reach the group-0
+        // case, so these 143 lines could never run.
+        //
+        // They still cost, which is why they are gone rather than merely commented: they are the only
+        // users of ArrInfo (a RECORD), ArrayIdx, LinearIdx, ProdDims and ArrLowerBound, so their
+        // presence forced those locals into the frame of the interpreter's hottest procedure - the one
+        // place where register pressure is the measured problem.
+        //
+        // The check that this is right is loud: a live opcode with no arm falls to the case's else,
+        // which raises "Unknown Group 0 opcode" on the first execution.
 
         // NOTE: I/O operations (bcPrint*, bcInput*) are now handled by Group 4 (ExecuteIOOp)
         // NOTE: String operations (bcStr*) are now handled by Group 1 (ExecuteStringOp)
