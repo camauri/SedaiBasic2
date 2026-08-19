@@ -2623,7 +2623,19 @@ begin
     bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat,
     // The string and unsigned forms likewise consume their operands and store nothing.
     bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
-    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
+    // Thread primitives: each takes a HANDLE out of the integer bank and returns nothing to it.
+    // Verified against RunTemplate.inc - "LockMutex(Ctx.IntRegs[Instr^.Src1])" and its siblings.
+    // Leaving them unaudited disqualified every procedure that touches a mutex, which is both
+    // multi-threaded benchmarks: binary-trees' WORKER and spectral-norm's whole worker unit.
+    bcMutexLock, bcMutexUnlock, bcMutexDestroy,
+    bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy,
+    // INT(x): "FloatRegs[Dest] := FloorDouble(FloatRegs[Src1])" - float in, float out, nothing of
+    // ours on either side. Unaudited, its float Src1 counted as an INTEGER read of that register
+    // number, and one such read anywhere in the program refused relocation to a procedure that
+    // merely wrote the same number in the integer bank. Measured on a recursive fib whose only
+    // Int() was in a PRINT executed once: 137 ms against 86 with it gone.
+    bcMathInt:
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
@@ -2826,7 +2838,9 @@ begin
     bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
     bcBranchEqZeroFloat, bcBranchNeZeroFloat,
     // A STRING compare-and-branch reads two strings: nothing of ours.
-    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString:
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    // INT(x) is float in, float out: "FloatRegs[Dest] := FloorDouble(FloatRegs[Src1])".
+    bcMathInt:
       Result := US_NONE;
     bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero,
     bcIntToFloat, bcIntToString, bcNarrowInt,
@@ -2839,7 +2853,10 @@ begin
     // The counting bit intrinsics take one operand; the WIDTH is an immediate, not a register.
     bcBitClz, bcBitCtz, bcBitPopcnt,
     // "if r[Src1] <> 0 goto target": one integer operand, the target is an immediate.
-    bcBranchEqZeroInt, bcBranchNeZeroInt:
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    // Thread primitives taking one HANDLE from the integer bank and writing nothing back to it.
+    bcMutexLock, bcMutexUnlock, bcMutexDestroy,
+    bcCondSignal, bcCondBroadcast, bcCondDestroy:
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
@@ -2858,7 +2875,9 @@ begin
     // The fused compare-and-branch reads the two operands the CmpInt used to read.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     // Unsigned reads the same two INT registers; only the comparison differs.
-    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
+    // "CondWaitOp(Ctx.IntRegs[Instr^.Src1], Ctx.IntRegs[Instr^.Src2])": the condition and the mutex.
+    bcCondWait:
       Result := US_SRC1 or US_SRC2;
     // The fused loop counter reads all three: the counter in Dest (which it also writes), the step
     // in Src1 and the limit in Src2. Dropping US_DEST here would be the silent miscompile this
