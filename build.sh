@@ -429,7 +429,10 @@ build_target() {
     opts+=("-MObjFPC")
 
     if [[ "$is_debug" == "false" ]]; then
-        opts+=("-O1")
+        # SEDAI_OLEVEL / SEDAI_OEXTRA: build-time knobs for measuring optimisation settings without
+        # editing this file. Not a supported configuration - the shipped default is the line below.
+        opts+=("${SEDAI_OLEVEL:--O1}")
+        [[ -n "${SEDAI_OEXTRA:-}" ]] && opts+=(${SEDAI_OEXTRA})
 
         # Instruction set from what the CPU HAS. Audio does NOT decide it, on any platform.
         #

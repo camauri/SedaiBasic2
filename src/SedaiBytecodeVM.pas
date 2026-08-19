@@ -489,6 +489,7 @@ type
     // Dialect-aware bounds test for a flat element index. Returns True when in range. Out of bounds:
     // CLASSIC (Commodore ?BAD SUBSCRIPT) or an explicit --bounds-check raises; MODERN (FreeBASIC, which
     // does not bounds-check) returns False so the caller yields a default on read / skips the write.
+    function ArrayBoundsFail(ArrayIdx, LinearIdx: Integer): Boolean;   // the raise path, out of line
     function ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean; inline;
     procedure EraseArray(ArrayIdx: Integer; Deallocate: Boolean = False);      // B1.4: ERASE (deallocate = dynamic array)
     procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean; HasNewLower: Boolean = False; NewLower: Integer = 0);  // B1.4: REDIM (1-D)
@@ -10572,6 +10573,35 @@ begin
 end;
 {$ENDIF}
 
+{ ⛔ THIS MUST STAY ABOVE THE RUN LOOP. It is declared `inline` and it is called on every typed
+  array element access, which is the interpreter's hot array path - but FPC can only inline a body it
+  has ALREADY compiled, and this one used to sit 1345 lines BELOW the {$I RunTemplate.inc} that calls
+  it. The result was a real function call per array access, and the compiler said so 69 times in one
+  build: "Call to subroutine TBytecodeVM.ArrayBoundsOK ... marked as inline is not inlined". An
+  `inline` directive is a request, and the compiler answers it in source order. }
+{ The out-of-bounds half, deliberately OUT OF LINE. CLASSIC keeps Commodore's ?BAD SUBSCRIPT
+  semantics; --bounds-check forces the raise in any dialect. Otherwise MODERN matches FreeBASIC,
+  which performs no bounds check by default: the caller substitutes a default value on a read and
+  drops the store, keeping us memory-safe (FB would touch adjacent heap). }
+function TBytecodeVM.ArrayBoundsFail(ArrayIdx, LinearIdx: Integer): Boolean;
+begin
+  if FBoundsCheck or (Assigned(FProgram) and not FProgram.ModernMode) then
+    raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+  Result := False;
+end;
+
+function TBytecodeVM.ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
+begin
+  // ⭐ WHAT GETS INLINED IS THIS AND NOTHING MORE: one compare, one branch. The raise path - with its
+  // Format call and its two conditions - lives in ArrayBoundsFail, out of line. Inlining the whole
+  // thing into fifty call sites grew the run loop enough to COST on an array-heavy program
+  // (spectral-norm +5%, stable over ten runs) while paying on others, which is code growth rather
+  // than work: the check itself is two instructions.
+  if (LinearIdx >= 0) and (LinearIdx < FArrays[ArrayIdx].TotalSize) then
+    Exit(True);
+  Result := ArrayBoundsFail(ArrayIdx, LinearIdx);
+end;
+
 { RunFast - Optimized execution loop
   - Direct pointer access to instruction array (no method calls)
   - Inline dispatch (no procedure calls for each instruction)
@@ -11922,18 +11952,6 @@ begin
   FArrays[ArrayIdx].TotalSize := NewSize;
 end;
 
-function TBytecodeVM.ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
-begin
-  if (LinearIdx >= 0) and (LinearIdx < FArrays[ArrayIdx].TotalSize) then
-    Exit(True);
-  // Out of bounds. CLASSIC keeps Commodore's ?BAD SUBSCRIPT semantics; --bounds-check forces the raise in
-  // any dialect. Otherwise MODERN matches FreeBASIC, which performs no bounds check by default: the caller
-  // substitutes a default value on a read and drops the store, keeping us memory-safe (FB would touch
-  // adjacent heap). Enable BoundsCheck to turn accidental out-of-bounds accesses back into hard errors.
-  if FBoundsCheck or (Assigned(FProgram) and not FProgram.ModernMode) then
-    raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-  Result := False;
-end;
 
 function ArrayDataShared(const A, B: TArrayStorage): Boolean;
 // True if A and B still reference the SAME element-data buffer (a dynamic array shares its reference on
