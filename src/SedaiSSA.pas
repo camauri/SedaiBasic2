@@ -644,6 +644,7 @@ type
     // Fold LBOUND/UBOUND(arr[,dim]) to a compile-time constant when arr's target dimension is static.
     function EnumTypeOfOperand(Node: TASTNode): string;   // enum type name of an enum operand (member/var/param), else '' — for operator overloading
     function ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string): string; // "2.0 * udt": operator label owned by a builtin scalar type
+    function TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
@@ -8240,6 +8241,71 @@ begin
           end;
         end;
     end;
+  end;
+end;
+
+function TSSAGenerator.TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
+// A module CONST whose initialiser is an integer EXPRESSION over literals and CONSTs already
+// declared above it - "Const TMASK = TSIZE - 1" - folded to its value.
+//
+// ⛔ WHY THIS MATTERS AND IS NOT COSMETIC. Only a bare LITERAL used to be recorded, so a const
+// defined from another const was not an integer constant at all: its backing scalar landed in the
+// FLOAT bank, and every use of it dragged the expression around it into floating point. In
+// k-nucleotide's open-addressing probe - the innermost loop of the program - "p = (p + 1) And TMASK"
+// came out as AddInt, IntToFloat, FloatToInt, BitwiseAnd: two conversions per probe step for a mask
+// the compiler could have known. It also matches fbc, where an untyped CONST over integer literals
+// is an integer.
+//
+// Only the operators whose integer result is exact are folded. "/" is deliberately absent: it is
+// FreeBASIC's FLOATING division, so "Const HALF = 1 / 2" must stay 0.5 and not become 0.
+var
+  L, R: Int64;
+begin
+  Result := False;
+  Val := 0;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antLiteral:
+      begin
+        if (not VarIsNumeric(Node.Value)) or VarIsFloat(Node.Value) then Exit;
+        Val := Int64(Node.Value);
+        Result := True;
+      end;
+    antIdentifier:
+      Result := (FModuleConstVals <> nil) and
+                TryStrToInt64(FModuleConstVals.Values[UpperCase(VarToStr(Node.Value))], Val);
+    antUnaryOp:
+      begin
+        if (Node.ChildCount < 1) or (Node.Token = nil) then Exit;
+        if not TryFoldConstIntExpr(Node.GetChild(0), L) then Exit;
+        case Node.Token.TokenType of
+          ttOpSub: begin Val := -L; Result := True; end;
+          ttOpAdd: begin Val := L; Result := True; end;
+          ttBitwiseNOT: begin Val := not L; Result := True; end;
+        end;
+      end;
+    antBinaryOp:
+      begin
+        if (Node.ChildCount < 2) or (Node.Token = nil) then Exit;
+        if not TryFoldConstIntExpr(Node.GetChild(0), L) then Exit;
+        if not TryFoldConstIntExpr(Node.GetChild(1), R) then Exit;
+        case Node.Token.TokenType of
+          ttOpAdd:      begin Val := L + R; Result := True; end;
+          ttOpSub:      begin Val := L - R; Result := True; end;
+          ttOpMul:      begin Val := L * R; Result := True; end;
+          // The two the hardware traps on are refused rather than folded to a wrong answer.
+          ttOpIntDiv:   if (R <> 0) and not ((L = Low(Int64)) and (R = -1)) then
+                          begin Val := L div R; Result := True; end;
+          ttOpMod:      if R <> 0 then
+                          begin if (L = Low(Int64)) and (R = -1) then Val := 0 else Val := L mod R;
+                                Result := True; end;
+          ttBitwiseAND: begin Val := L and R; Result := True; end;
+          ttBitwiseOR:  begin Val := L or R; Result := True; end;
+          ttBitwiseXOR: begin Val := L xor R; Result := True; end;
+          ttOpShl:      if (R >= 0) and (R < 64) then begin Val := L shl R; Result := True; end;
+          ttOpShr:      if (R >= 0) and (R < 64) then begin Val := L shr R; Result := True; end;
+        end;
+      end;
   end;
 end;
 
@@ -23816,6 +23882,7 @@ var
   Decl: TASTNode;
   VNameU, TypeNameU: string;
   ElemBank: TSSARegisterType;
+  ConstFoldVal: Int64;
 begin
   if Node = nil then Exit;
   // Do not descend into procedure bodies: DIM SHARED (and a module-level CONST, which lowers to a
@@ -23844,9 +23911,8 @@ begin
         // only for now: a float would have to round-trip through text, and a string literal needs its
         // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
         if (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
-           (Decl.GetChild(2).NodeType = antLiteral) and VarIsNumeric(Decl.GetChild(2).Value) and
-           not VarIsFloat(Decl.GetChild(2).Value) then
-          FModuleConstVals.Values[VNameU] := IntToStr(Int64(Decl.GetChild(2).Value));
+           TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal) then
+          FModuleConstVals.Values[VNameU] := IntToStr(ConstFoldVal);
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
