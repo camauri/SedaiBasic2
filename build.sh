@@ -27,7 +27,13 @@ CLEAN=false
 WINDOW=false
 NO_BANNER=false
 SELECT_FPC=false
-HOT_C=false
+# ⭐ ON BY DEFAULT since 20 Aug 2026. The hot dispatch arms compiled by a C compiler are worth
+# 27-45% wherever they apply, on Linux and - verified under wine - on win64 too. HOT_C_EXPLICIT
+# separates "the user asked for it" from "it is simply the default": a missing C compiler is an
+# ERROR in the first case and a warning-and-carry-on in the second, so a machine without gcc still
+# builds. --no-hot-c turns it off.
+HOT_C=true
+HOT_C_EXPLICIT=false
 CPU=""                 # empty => detect from the host
 OS=""                  # empty => detect from the host
 WITH_SEDAI_AUDIO=""    # '' auto-detect | 'no' disabled | <path>
@@ -65,7 +71,8 @@ show_help() {
     echo "  --debug-flags <LIST>     Comma-separated: SSA,REGALLOC,... or ALL"
     echo "  --no-banner              Suppress the banner"
     echo "  --select-fpc             List the Free Pascal compilers found and choose one (stored)"
-    echo "  --hot-c                  Compile the hot dispatch arms with a C compiler (needs gcc/clang)"
+    echo "  --no-hot-c               Do NOT compile the hot dispatch arms with a C compiler"
+    echo "  --hot-c                  Force it on (it is the default; fails if no C compiler)"
     echo "  --help                   Show this help"
     echo ""
     echo "Environment:"
@@ -545,7 +552,8 @@ while [[ $# -gt 0 ]]; do
         --window) WINDOW=true; shift ;;
         --no-banner) NO_BANNER=true; shift ;;
         --select-fpc) SELECT_FPC=true; shift ;;
-        --hot-c) HOT_C=true; shift ;;
+        --hot-c) HOT_C=true; HOT_C_EXPLICIT=true; shift ;;
+        --no-hot-c) HOT_C=false; shift ;;
         --cpu) CPU="$2"; shift 2 ;;
         --os) OS="$2"; shift 2 ;;
         --with-sedai-audio) WITH_SEDAI_AUDIO="$2"; shift 2 ;;
@@ -584,28 +592,44 @@ if [[ "$HOT_C" == "true" ]]; then
     if [[ -z "$CC_BIN" && "$OS" == "win64" ]]; then
         CC_BIN="$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)"
         if [[ -z "$CC_BIN" ]]; then
-            echo -e "${RED}ERROR: --hot-c for win64 needs x86_64-w64-mingw32-gcc.${NC}" >&2
-            echo -e "${GRAY}  Debian/Ubuntu: sudo apt install gcc-mingw-w64-x86-64-win32${NC}" >&2
-            exit 1
+            if [[ "$HOT_C_EXPLICIT" == "true" ]]; then
+                echo -e "${RED}ERROR: --hot-c for win64 needs x86_64-w64-mingw32-gcc.${NC}" >&2
+                echo -e "${GRAY}  Debian/Ubuntu: sudo apt install gcc-mingw-w64-x86-64-win32${NC}" >&2
+                exit 1
+            fi
+            echo -e "${YELLOW}NOTE: no x86_64-w64-mingw32-gcc - building win64 WITHOUT the C hot loop.${NC}" >&2
+            echo -e "${GRAY}  sudo apt install gcc-mingw-w64-x86-64-win32   (or pass --no-hot-c to silence this)${NC}" >&2
+            HOT_C=false
         fi
     fi
     if [[ -z "$CC_BIN" && "$OS" == "win32" ]]; then
         # ⛔ win32 decorates a cdecl symbol with a LEADING UNDERSCORE, which win64 does not, so the
         # external declarations in SedaiBytecodeVM.pas would not resolve. Refused rather than failing
         # obscurely at link time.
-        echo -e "${RED}ERROR: --hot-c is not supported for win32 (leading-underscore cdecl names).${NC}" >&2
-        exit 1
+        if [[ "$HOT_C_EXPLICIT" == "true" ]]; then
+            echo -e "${RED}ERROR: --hot-c is not supported for win32 (leading-underscore cdecl names).${NC}" >&2
+            exit 1
+        fi
+        HOT_C=false      # not an error when it is merely the default
     fi
-    if [[ -z "$CC_BIN" ]]; then
+    if [[ "$HOT_C" == "true" && -z "$CC_BIN" ]]; then
         for c in gcc clang cc; do
             command -v "$c" >/dev/null 2>&1 && { CC_BIN="$c"; break; }
         done
     fi
-    if [[ -z "$CC_BIN" ]]; then
-        echo -e "${RED}ERROR: --hot-c needs a C compiler and none was found.${NC}" >&2
-        echo -e "${YELLOW}Install gcc or clang, or set SEDAI_CC=<path>. On Windows: MinGW-w64.${NC}" >&2
-        exit 1
+    if [[ "$HOT_C" == "true" && -z "$CC_BIN" ]]; then
+        if [[ "$HOT_C_EXPLICIT" == "true" ]]; then
+            echo -e "${RED}ERROR: --hot-c needs a C compiler and none was found.${NC}" >&2
+            echo -e "${YELLOW}Install gcc or clang, or set SEDAI_CC=<path>. On Windows: MinGW-w64.${NC}" >&2
+            exit 1
+        fi
+        # Merely the default: say so once and build the pure-Pascal interpreter, which is what this
+        # was before 20 Aug 2026 and is still correct - just slower on the arms the C loop covers.
+        echo -e "${YELLOW}NOTE: no C compiler found - building WITHOUT the C hot loop.${NC}" >&2
+        echo -e "${GRAY}  Install gcc or clang for 27-45% on arithmetic-heavy programs, or pass --no-hot-c.${NC}" >&2
+        HOT_C=false
     fi
+    if [[ "$HOT_C" == "true" ]]; then
     echo -e "${GRAY}C compiler: $("$CC_BIN" --version 2>/dev/null | head -1) - $CC_BIN${NC}"
     # -fno-math-errno is REQUIRED, not a tuning knob: without it gcc assumes llrint/sqrt may touch
     # errno and emits CALLS to libm, which a freestanding object linked into an FPC program cannot
@@ -613,6 +637,7 @@ if [[ "$HOT_C" == "true" ]]; then
     "$CC_BIN" -O2 -ffreestanding -fno-math-errno -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
         echo -e "${RED}ERROR: could not compile src/hotdisp.c${NC}" >&2; exit 1; }
     HOT_C_DEFINE="-dHOT_C"
+    fi
 fi
 
 echo -e "${GRAY}Compiler: FPC $("$FPC" -iV 2>/dev/null) - $FPC${NC}"
