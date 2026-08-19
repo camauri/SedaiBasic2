@@ -7,7 +7,7 @@
   which measured +20% on n-body and +13% on spectral-norm - both array-heavy, and arrays are not
   covered yet. }
 const
-  HOT_OP_COUNT = 67;
+  HOT_OP_COUNT = 84;
   HOT_OPS: array[0..HOT_OP_COUNT - 1] of Word = (
     $0000,
     $0001,
@@ -40,6 +40,10 @@ const
     $002E,
     $002F,
     $0030,
+    $0061,
+    $0062,
+    $0064,
+    $0065,
     $0303,
     $0304,
     $0306,
@@ -70,10 +74,23 @@ const
     $C818,
     $C81A,
     $C81B,
+    $C81E,
     $C821,
     $C822,
     $C823,
     $C824,
+    $C825,
+    $C826,
+    $C827,
+    $C828,
+    $C829,
+    $C82A,
+    $C82C,
+    $C82D,
+    $C82E,
+    $C830,
+    $C831,
     $C838,
-    $C839
+    $C839,
+    $C83A
   );

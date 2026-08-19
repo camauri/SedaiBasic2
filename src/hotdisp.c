@@ -34,7 +34,8 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
  * the array arms hand the PC back and the Pascal loop does it. */
 int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
                   int pc, int count, int64_t tv,
-                  const int64_t *arrdesc, int modern_arrays)
+                  const int64_t *arrdesc, int modern_arrays,
+                  int64_t *xi, double *xf)
 {
   for (;;) {
     if (pc < 0 || pc >= count) return pc;
@@ -126,6 +127,51 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if (li >= 0 && li < d[2]) ((double *)(intptr_t)d[1])[li] = freg[I->dest]; }
       pc++; break;
+
+    /* ---- fused float arithmetic and the transfer banks ---- */
+    case 0xC825: freg[I->dest] = freg[I->imm] + freg[I->s1] * freg[I->s2];          pc++; break;   /* bcMulAddFloat */
+    case 0xC826: freg[I->dest] = freg[I->imm] - freg[I->s1] * freg[I->s2];          pc++; break;   /* bcMulSubFloat */
+    case 0xC827: freg[I->dest] = freg[I->dest] + freg[I->s1] * freg[I->s2];         pc++; break;   /* bcMulAddToFloat */
+    case 0xC828: freg[I->dest] = freg[I->dest] - freg[I->s1] * freg[I->s2];         pc++; break;   /* bcMulSubToFloat */
+    case 0xC82C: freg[I->dest] = freg[I->s1]*freg[I->s1] + freg[I->s2]*freg[I->s2]; pc++; break;   /* bcSquareSumFloat */
+    case 0xC82D: freg[I->dest] = freg[I->s1] + freg[I->s2]*freg[I->s2];             pc++; break;   /* bcAddSquareFloat */
+    case 0xC82E: freg[I->dest] = freg[I->s1] * freg[I->s2] * freg[I->imm];          pc++; break;   /* bcMulMulFloat */
+    case 0x0061: xi[I->imm] = ireg[I->s1];                                          pc++; break;   /* bcXferStoreInt */
+    case 0x0062: xf[I->imm] = freg[I->s1];                                          pc++; break;   /* bcXferStoreFloat */
+    case 0x0064: ireg[I->dest] = xi[I->imm];                                        pc++; break;   /* bcXferLoadInt */
+    case 0x0065: freg[I->dest] = xf[I->imm];                                        pc++; break;   /* bcXferLoadFloat */
+
+    /* ---- fused array forms. MODERN only, for the same reason as the plain accessors. ---- */
+    case 0xC829:   /* bcArrayLoadAddFloat */
+      if (!modern_arrays) return pc;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        freg[I->dest] = freg[I->imm] + ((li >= 0 && li < d[2]) ? ((const double *)(intptr_t)d[1])[li] : 0.0); }
+      pc++; break;
+    case 0xC82A:   /* bcArrayLoadSubFloat */
+      if (!modern_arrays) return pc;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        freg[I->dest] = freg[I->imm] - ((li >= 0 && li < d[2]) ? ((const double *)(intptr_t)d[1])[li] : 0.0); }
+      pc++; break;
+    case 0xC83A:   /* bcArrayLoadIntTo */
+      if (!modern_arrays) return pc;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        ireg[I->dest] = (li >= 0 && li < d[2]) ? ((const int64_t *)(intptr_t)d[0])[li] : 0; }
+      pc++; break;
+    case 0xC81E:   /* bcArrayStoreIntConst */
+      if (!modern_arrays) return pc;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        if (li >= 0 && li < d[2]) ((int64_t *)(intptr_t)d[0])[li] = I->imm; }
+      pc++; break;
+    case 0xC830:   /* bcArrayLoadIntBranchNZ */
+      if (!modern_arrays) return pc;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        int nz = (li >= 0 && li < d[2]) && ((const int64_t *)(intptr_t)d[0])[li] != 0;
+        pc = nz ? (int)I->imm : pc + 1; } continue;
+    case 0xC831:   /* bcArrayLoadIntBranchZ */
+      if (!modern_arrays) return pc;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        int z = !(li >= 0 && li < d[2]) || ((const int64_t *)(intptr_t)d[0])[li] == 0;
+        pc = z ? (int)I->imm : pc + 1; } continue;
 
     default:
       return pc;   /* not ours: the Pascal loop runs this one, then calls back in */

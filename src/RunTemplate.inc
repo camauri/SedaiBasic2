@@ -65,6 +65,8 @@ var
   HotNewPC: LongInt;
   HotArrDesc: Pointer;
   HotModernArr: LongInt;   // 1 only where an out-of-bounds access must NOT raise
+  HotXferI: PInt64;        // the SUB/FUNCTION argument banks of THIS context - never baked in,
+  HotXferF: PDouble;       // a worker must see its own, exactly as the AOT context does
   {$ENDIF}
   {$IFDEF JIT_PROFILE}
   // J1: local copy of the JIT back-edge-profiling flag; BEBase points at FBackEdgeCount[0].
@@ -167,6 +169,10 @@ begin
   // raise; there its array arms hand the PC back instead.
   if ModernConv and (not FBoundsCheck) then HotModernArr := 1 else HotModernArr := 0;
   if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
+  if Length(Ctx.XferInt) > 0 then HotXferI := @Ctx.XferInt[0] else HotXferI := nil;
+  if Length(Ctx.XferFloat) > 0 then HotXferF := @Ctx.XferFloat[0] else HotXferF := nil;
+  // Without both transfer banks the C loop must not run the Xfer opcodes at all.
+  if (HotXferI = nil) or (HotXferF = nil) then HotCOk := False;
   // ⛔ MEASURED: the entry test costs even when it can never fire. With the C code merely PRESENT and
   // permanently disabled, binary-trees was +3.5% and spectral-norm +11.8% against a build without it
   // - the same as with it enabled. So the condition is folded into the per-PC table here, once,
@@ -278,7 +284,7 @@ begin
       // a plain field read on the hot path and the lock only when something really moved.
       if FArraysDirty then HotArrDesc := AcquireArrDesc;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
-                                HotArrDesc, HotModernArr);
+                                HotArrDesc, HotModernArr, HotXferI, HotXferF);
       if HotNewPC <> CurPC then
       begin
         CurPC := HotNewPC;

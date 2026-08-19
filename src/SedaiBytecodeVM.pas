@@ -10658,7 +10658,8 @@ end;
 {$L hotdisp.o}
 function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
                        pc, count: LongInt; tv: Int64;
-                       arrdesc: Pointer; modern_arrays: LongInt): LongInt; cdecl; external;
+                       arrdesc: Pointer; modern_arrays: LongInt;
+                       xi: PInt64; xf: PDouble): LongInt; cdecl; external;
 {$ENDIF}
 
 { RunFast - Optimized execution loop
