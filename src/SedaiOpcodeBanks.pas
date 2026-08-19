@@ -118,7 +118,8 @@ begin
     bcArrayStoreIntConst, bcArrayStoreFloatConst, bcArrayStoreStringConst,
     bcArrayLoadAddFloat, bcArrayLoadSubFloat, bcArrayLoadDivAddFloat,
     bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ,
-    bcArraySwapInt, bcArrayLoadIntTo, bcArrayCopyElement:
+    bcArraySwapInt, bcArrayLoadIntTo, bcArrayCopyElement,
+    bcStrMidAssignArr:   // MID$ into an element: Src1 = the array, Src2 = the linear index
       Result := True;
   else
     Result := False;
@@ -384,6 +385,7 @@ begin
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    bcStrMidAssignArr,   // MID$ into an element: Src2 = the linear index, same as the stores above
     // UDT array members (indirect): Src2 = the linear index register (int)
     bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString,
     bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
@@ -1020,7 +1022,9 @@ begin
     // "acc = ''" then lands on one register while the append keeps growing another.
     // bcStrMidAssign overwrites PART of Dest, so the rest of the incoming value survives into the
     // result: like the append above, Dest is an input as well as the destination.
-    bcStrAppendMapped, bcStrMidAssign:
+    // bcStrMidAssignArr never writes a register at all: its Dest is the REPLACEMENT text and the
+    // result goes into the array element. Dest is purely an input.
+    bcStrAppendMapped, bcStrMidAssign, bcStrMidAssignArr:
       Result := True;
   else
     Result := False;
@@ -1070,6 +1074,7 @@ begin
   Result := False;
   case TBytecodeOp(Instr.OpCode) of
     bcStrMid, bcStrMidW, bcStrAscMid, bcStrConcatCharAt, bcStrAppendMapped, bcStrMidAssign,
+    bcStrMidAssignArr,
     bcStrInstr, bcStrInstrAny,
     bcDateSerial, bcTimeSerial,
     bcRawMemCopy, bcRawMemMove, bcRawClear, bcPutBinMem, bcGetBinMem,

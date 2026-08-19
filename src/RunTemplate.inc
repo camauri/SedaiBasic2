@@ -357,7 +357,7 @@ begin
     // The group-0 and superinstruction BODIES below are byte-identical to the previous nested cases.
     case DenseOp of
       // === Superinstructions (dense DENSE_SUPER_BASE + sub, sub = Op and $FF) ===
-      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 70:
+      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 71:
       case Op and $FF of
         // Fused compare-and-branch (Int) - sub-opcodes 0-5
         0: if IntRegs[Instr^.Src1] = IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchEqInt
@@ -665,6 +665,10 @@ begin
 
         // "MID$(t, start [, len]) = src" in place - sub-opcode 160. Delegated for the same reason.
         54: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+
+        // "MID$(arr(i), start [, len]) = src" - the same statement when the target is an ARRAY
+        // ELEMENT, which is how every DIM SHARED scalar is stored. Delegated for the same reason.
+        71: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
       else
         raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full opcode $%.4X) at CurPC=%d', [Op and $FF, Op, CurPC]);

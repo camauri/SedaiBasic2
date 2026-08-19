@@ -5897,6 +5897,27 @@ begin
         begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index register
         end;
+
+        // The string fusions. ⛔ These three were MISSING here until 19 Aug 2026: they contributed
+        // zero to the string bank, and only the fact that their registers are also touched by an
+        // ordinary string opcode elsewhere in the same program kept the bank big enough. That is
+        // luck, not design - a register used ONLY by one of these would have sized the bank short.
+        // Dest/Src1/Src2 are string registers, Immediate is the INT register holding the index.
+        bcStrConcatCharAt, bcStrAppendMapped, bcStrMidAssign:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
+        end;
+        // MID$ into an array element: Src1 is the ARRAY ID and indexes no bank at all; Dest is the
+        // replacement (string), Src2 the linear index and Immediate the start (both int).
+        bcStrMidAssignArr:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
+        end;
       end;
     end
     else
@@ -8394,6 +8415,8 @@ var
   MidRepl: AnsiString; // bcStrMidAssign: the replacement, held across a possible Dest/Src2 collision
   SrcLen: Integer;   // ...length of the accumulator being extended
   CharVal: AnsiChar; // ...and the byte taken from the table
+  ArrayIdx: Integer;   // bcStrMidAssignArr: the target array...
+  LinearIdx: Integer;  // ...and the element inside it
 begin
   // Superinstructions use sub-opcode (low byte) for dispatch
   // Full opcode is 0xC800 + SubOp (group 200)
@@ -8762,6 +8785,36 @@ begin
             // lowering, which emits the variable's canonical register for both).
             UniqueString(Ctx.StringRegs[Instr.Dest]);
             Move(MidRepl[1], Ctx.StringRegs[Instr.Dest][CharPos], CharVal2);
+          end;
+        end;
+      end;
+    71: // bcStrMidAssignArr: the same statement when the target is an ARRAY ELEMENT
+      begin
+        // ⛔ WHY THIS IS NOT sub-opcode 54 ON A LOADED REGISTER. UniqueString is free at reference
+        // count 1 and a FULL COPY at 2, and loading an array element into a register makes it 2 by
+        // construction - so the register form copies the whole string on every assignment. Measured
+        // 19 Aug 2026: a 400,000-character SHARED string filled one byte at a time took 33.9 s that
+        // way against 28 ms for the identical code on a local, and the cost grew with the SQUARE of
+        // the length. Writing the slot directly keeps the count at 1 and the write free.
+        // Src1 = array id, Src2 = the linear index, Dest = the replacement (READ), Immediate = start.
+        ArrayIdx := Instr.Src1;
+        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          MidRepl := Ctx.StringRegs[Instr.Dest];
+          CharPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
+          SrcLen := Length(FArrays[ArrayIdx].StringData[LinearIdx]);
+          // Same clamping as sub-opcode 54, in the same order: a start past the end writes nothing,
+          // and the replacement is already capped to len by the ssaStrLeft the lowering emits.
+          if (CharPos >= 1) and (CharPos <= SrcLen) then
+          begin
+            CharVal2 := Length(MidRepl);
+            if CharVal2 > SrcLen - CharPos + 1 then CharVal2 := SrcLen - CharPos + 1;
+            if CharVal2 > 0 then
+            begin
+              UniqueString(FArrays[ArrayIdx].StringData[LinearIdx]);
+              Move(MidRepl[1], FArrays[ArrayIdx].StringData[LinearIdx][CharPos], CharVal2);
+            end;
           end;
         end;
       end;

@@ -974,6 +974,22 @@ const
   bcBranchGtUInt      = bcGroupSuper + 69;
   bcBranchGeUInt      = bcGroupSuper + 70;
 
+  // "MID$(arr(i), start [, len]) = src" where the target is an ARRAY ELEMENT - which includes every
+  // DIM SHARED scalar, since one is stored as element 0 of a 1-element global array.
+  //
+  // ⛔ WHY A SEPARATE OPCODE AND NOT bcStrMidAssign ON A LOADED REGISTER. The in-place write is only
+  // free when the string it writes is UNSHARED: UniqueString is a no-op at reference count 1 and a
+  // FULL COPY at 2. Loading an array element into a register makes it 2 by construction, so the
+  // register form copies the whole string on every assignment - measured 19 Aug 2026, filling a
+  // 400,000-character SHARED string one byte at a time took 33.9 s against 28 ms for the identical
+  // code on a local: 1212x, and growing with the SQUARE of the length. The write has to happen where
+  // the string LIVES, so this one addresses the slot directly.
+  //
+  // Dest = the replacement string register (READ, not written - the same convention as
+  // bcArrayStoreString), Src1 = array id, Src2 = int register holding the linear index,
+  // Immediate = int register holding the 1-based start.
+  bcStrMidAssignArr   = bcGroupSuper + 71;
+
   // Helper function to extract group from opcode
   function GetOpcodeGroup(Op: TBytecodeOp): Word; inline;
 
@@ -2400,6 +2416,7 @@ begin
         51: Result := 'ArrayShiftLeft';
         52: Result := 'StrConcatCharAt';
         53: Result := 'StrAppendMapped';
+        54: Result := 'StrMidAssign';
         55: Result := 'ArraySwapInt';
         56: Result := 'AddIntSelf';
         57: Result := 'SubIntSelf';
@@ -2416,6 +2433,7 @@ begin
         68: Result := 'BranchLeUInt';
         69: Result := 'BranchGtUInt';
         70: Result := 'BranchGeUInt';
+        71: Result := 'StrMidAssignArr';
       else
         Result := Format('Super_%d', [SubOp]);
       end;

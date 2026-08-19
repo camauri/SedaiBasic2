@@ -194,6 +194,12 @@ type
     // replacement ALREADY capped to len by the ssaStrLeft the lowering emits, Immediate = the int
     // register holding start. Four values, exactly like ssaStrConcatCharAt - no packing needed.
     ssaStrMidAssign,
+    // The same statement when the target is an ARRAY ELEMENT, which is also how every DIM SHARED
+    // scalar is stored. It cannot go through ssaStrMidAssign: loading the element into a register
+    // makes its reference count 2, and the in-place write then copies the whole string instead of
+    // being free - which is what made a SHARED target quadratic. Dest = the replacement (read),
+    // Src1 = the array ref, Src2 = the linear index, Immediate = the int register holding start.
+    ssaStrMidAssignArr,
     // FreeBASIC string functions (B1.2): single string arg -> string result.
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase,
     ssaStrInstrRev,   // INSTRREV(s, sub) -> int (last occurrence)
