@@ -60,6 +60,12 @@ var
   TrapTriggered: Boolean;
   // Event polling counter
   EventPollCounter: Integer;
+  {$IFDEF HOT_C}
+  HotCOk: Boolean;      // may the C hot loop run? see the note at its call
+  HotNewPC: LongInt;
+  HotArrDesc: Pointer;
+  HotModernArr: LongInt;   // 1 only where an out-of-bounds access must NOT raise
+  {$ENDIF}
   {$IFDEF JIT_PROFILE}
   // J1: local copy of the JIT back-edge-profiling flag; BEBase points at FBackEdgeCount[0].
   BEProfile: Boolean;
@@ -155,6 +161,18 @@ begin
   ModernConv := Assigned(FProgram) and FProgram.ModernMode;
   // Initialize event polling counter
   EventPollCounter := 0;
+  {$IFDEF HOT_C}
+  HotCOk := (not JitOn) and (not AotOn) and (not Assigned(FEventPollCallback));
+  // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
+  // raise; there its array arms hand the PC back instead.
+  if ModernConv and (not FBoundsCheck) then HotModernArr := 1 else HotModernArr := 0;
+  if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
+  // ⛔ MEASURED: the entry test costs even when it can never fire. With the C code merely PRESENT and
+  // permanently disabled, binary-trees was +3.5% and spectral-norm +11.8% against a build without it
+  // - the same as with it enabled. So the condition is folded into the per-PC table here, once,
+  // leaving exactly one array read on the hot path instead of a Boolean, an AND and a read.
+  SetHotOpEnabled(HotCOk);
+  {$ENDIF}
 
   {$IFDEF DEBUG_MODE}
   {$IFDEF ENABLE_PROFILER}
@@ -246,6 +264,28 @@ begin
     // is the signature of a per-instruction cost rather than a shape change -
     // spectral-norm -10.5%, min loop -5.5%, fannkuch -4.1%, binary-trees -4.1%, n-body -3.8%,
     // mandelbrot -3.4%.
+    {$IFDEF HOT_C}
+    // The C hot loop runs until it meets an opcode it does not implement, then hands the PC back.
+    // Its cost is therefore one call per COLD instruction and none per hot one. It is used only when
+    // nothing else needs to look at every instruction: no compiled region to enter, and no event
+    // poll to service.
+    if FHotOp[CurPC] then
+    begin
+      // ⛔ AcquireArrDesc TAKES A LOCK, and calling it per entry to the C loop was catastrophic:
+      // mandelbrot went from -32.8% to +33%, spectral-norm to +84%. This VM has paid that lesson
+      // before - a lock on the call path took binary-trees from 171 ms to 711. So the pointer is
+      // taken ONCE before the loop and refreshed only when the array set actually changed, which is
+      // a plain field read on the hot path and the lock only when something really moved.
+      if FArraysDirty then HotArrDesc := AcquireArrDesc;
+      HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
+                                HotArrDesc, HotModernArr);
+      if HotNewPC <> CurPC then
+      begin
+        CurPC := HotNewPC;
+        System.Continue;
+      end;
+    end;
+    {$ENDIF}
     Instr := @Instructions[CurPC];
     Op := Instr^.OpCode;
     DenseOp := DenseOps[CurPC];

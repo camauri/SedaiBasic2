@@ -245,6 +245,11 @@ type
     // the on-file bytecode and TBytecodeInstruction.OpCode are left untouched (format unchanged).
     FDenseOps: array of Word;
     FDenseOpsFor: TBytecodeProgram;   // the program FDenseOps was built for (rebuild guard)
+    {$IFDEF HOT_C}
+    FHotOp: array of Boolean;         // per PC: can the C hot loop start here? see HotOps.inc
+    FHotOpBase: array of Boolean;     // ...before the run-wide gate is folded in
+    FHotOpEnabled: Boolean;
+    {$ENDIF}
     {$IFDEF JIT_PROFILE}
     // JIT hot-loop profiling (milestone J1): per-instruction count of how often a BACKWARD branch
     // targets that PC. A loop back-edge is a branch to a lower PC, so a high count marks a hot loop
@@ -517,6 +522,9 @@ type
     {$ENDIF}
     // Build FDenseOps for the current program if it is not already current (VM perf plan M2).
     procedure EnsureDenseOps;
+    {$IFDEF HOT_C}
+    procedure SetHotOpEnabled(AEnabled: Boolean);
+    {$ENDIF}
     // JIT (J2/J3): compile every eligible hot loop of the current program to native (called from
     // EnsureDenseOps when FJitEnabled). Loops with an unsupported opcode are left to the interpreter.
     procedure BuildJitLoops;
@@ -789,6 +797,11 @@ uses
   // drawing surface, because unlike sbv's controller it is not the graphics backend itself. In the
   // implementation section so the interface of this unit stays free of it.
   SedaiTerminalIO;
+
+{$IFDEF HOT_C}
+{$I HotOps.inc}
+{$ENDIF}
+
 
 // Declared here because ExecuteSuperinstruction (bcStrConcatCharAt) calls it well before its
 // definition further down, next to AppendString.
@@ -8867,6 +8880,9 @@ type
   PBytecodeInstr = ^TBytecodeInstruction;
 var
   i, n: Integer;
+  {$IFDEF HOT_C}
+  j: Integer;
+  {$ENDIF}
   Ins: PBytecodeInstr;
 begin
   if FProgram = nil then Exit;
@@ -8877,6 +8893,21 @@ begin
   if Ins <> nil then
     for i := 0 to n - 1 do
       FDenseOps[i] := Word(Op16ToDense(Ins[i].OpCode));
+  {$IFDEF HOT_C}
+  // Per PC: may the C hot loop start here? Answering it with an array read costs a load; answering
+  // it by calling C and being refused costs a call.
+  SetLength(FHotOpBase, n);
+  SetLength(FHotOp, n);
+  if Ins <> nil then
+    for i := 0 to n - 1 do
+    begin
+      FHotOpBase[i] := False;
+      for j := 0 to HOT_OP_COUNT - 1 do
+        if HOT_OPS[j] = Ins[i].OpCode then begin FHotOpBase[i] := True; Break; end;
+      FHotOp[i] := False;
+    end;
+  FHotOpEnabled := False;
+  {$ENDIF}
   {$IFDEF JIT_PROFILE}
   // J1: (re)size the back-edge counters for this program and clear them.
   SetLength(FBackEdgeCount, n);
@@ -10601,6 +10632,34 @@ begin
     Exit(True);
   Result := ArrayBoundsFail(ArrayIdx, LinearIdx);
 end;
+
+{$IFDEF HOT_C}
+{ Fold the run-wide gate into the per-PC table, so the hot path reads one array and tests nothing
+  else. Cheap because it only runs when the gate CHANGES, which is once per run in practice. }
+procedure TBytecodeVM.SetHotOpEnabled(AEnabled: Boolean);
+var
+  i: Integer;
+begin
+  if (FHotOpEnabled = AEnabled) and (Length(FHotOp) = Length(FHotOpBase)) then Exit;
+  FHotOpEnabled := AEnabled;
+  SetLength(FHotOp, Length(FHotOpBase));
+  for i := 0 to High(FHotOpBase) do
+    FHotOp[i] := AEnabled and FHotOpBase[i];
+end;
+
+{ The hot arithmetic/branch opcodes, compiled by a C compiler rather than by FPC. The reason is
+  measured and is not a preference: the same dispatch loop - same arms, same values live across it -
+  runs in 253 ms under gcc -O2 and 443 under FPC on this machine, and no FPC optimisation level
+  closes any of it. gcc keeps the hot pointers in registers where FPC spills them. See src/hotdisp.c.
+
+  The record layouts match exactly: TBytecodeInstruction is a packed record of four Words and an
+  Int64, which is C's { uint16_t x4; int64_t } with no padding on either side. cdecl is the right
+  convention on both platforms - on win64 FPC's cdecl IS the Microsoft x64 ABI that MinGW-w64 emits. }
+{$L hotdisp.o}
+function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
+                       pc, count: LongInt; tv: Int64;
+                       arrdesc: Pointer; modern_arrays: LongInt): LongInt; cdecl; external;
+{$ENDIF}
 
 { RunFast - Optimized execution loop
   - Direct pointer access to instruction array (no method calls)

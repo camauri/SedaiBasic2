@@ -27,6 +27,7 @@ CLEAN=false
 WINDOW=false
 NO_BANNER=false
 SELECT_FPC=false
+HOT_C=false
 CPU=""                 # empty => detect from the host
 OS=""                  # empty => detect from the host
 WITH_SEDAI_AUDIO=""    # '' auto-detect | 'no' disabled | <path>
@@ -64,6 +65,7 @@ show_help() {
     echo "  --debug-flags <LIST>     Comma-separated: SSA,REGALLOC,... or ALL"
     echo "  --no-banner              Suppress the banner"
     echo "  --select-fpc             List the Free Pascal compilers found and choose one (stored)"
+    echo "  --hot-c                  Compile the hot dispatch arms with a C compiler (needs gcc/clang)"
     echo "  --help                   Show this help"
     echo ""
     echo "Environment:"
@@ -454,6 +456,7 @@ build_target() {
         fi
 
         opts+=("-OoREGVAR" "-OoCSE" "-OoDFA" "-OoFASTMATH" "-OoCONSTPROP")
+        [[ -n "$HOT_C_DEFINE" ]] && opts+=("$HOT_C_DEFINE")
         opts+=("-Xs" "-XX")
     else
         opts+=("-g" "-gl" "-gw" "-Ci" "-Cr" "-Co")
@@ -542,6 +545,7 @@ while [[ $# -gt 0 ]]; do
         --window) WINDOW=true; shift ;;
         --no-banner) NO_BANNER=true; shift ;;
         --select-fpc) SELECT_FPC=true; shift ;;
+        --hot-c) HOT_C=true; shift ;;
         --cpu) CPU="$2"; shift 2 ;;
         --os) OS="$2"; shift 2 ;;
         --with-sedai-audio) WITH_SEDAI_AUDIO="$2"; shift 2 ;;
@@ -565,6 +569,29 @@ fi
 PLATFORM_DIR="$CPU-$OS"
 
 FPC="$(find_fpc "$PLATFORM_DIR")" || exit 1
+
+# ⭐ The hot arithmetic/branch/array opcodes, compiled by a C compiler instead of by FPC. Opt-in and
+# never required: without --hot-c the interpreter is exactly the Pascal loop it has always been.
+# Why it exists: measured on the same dispatch loop, gcc -O2 runs it in 253 ms against FPC's 443,
+# and no FPC optimisation level closes any of that - see src/hotdisp.c.
+HOT_C_DEFINE=""
+if [[ "$HOT_C" == "true" ]]; then
+    CC_BIN="${SEDAI_CC:-}"
+    if [[ -z "$CC_BIN" ]]; then
+        for c in gcc clang cc; do
+            command -v "$c" >/dev/null 2>&1 && { CC_BIN="$c"; break; }
+        done
+    fi
+    if [[ -z "$CC_BIN" ]]; then
+        echo -e "${RED}ERROR: --hot-c needs a C compiler and none was found.${NC}" >&2
+        echo -e "${YELLOW}Install gcc or clang, or set SEDAI_CC=<path>. On Windows: MinGW-w64.${NC}" >&2
+        exit 1
+    fi
+    echo -e "${GRAY}C compiler: $("$CC_BIN" --version 2>/dev/null | head -1) - $CC_BIN${NC}"
+    "$CC_BIN" -O2 -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
+        echo -e "${RED}ERROR: could not compile src/hotdisp.c${NC}" >&2; exit 1; }
+    HOT_C_DEFINE="-dHOT_C"
+fi
 
 echo -e "${GRAY}Compiler: FPC $("$FPC" -iV 2>/dev/null) - $FPC${NC}"
 echo -e "${GRAY}Platform: $PLATFORM_DIR${NC}"

@@ -95,3 +95,4 @@ test_out.txt
 # ./build.sh --select-fpc. It holds absolute paths, so committing it would point every other machine
 # at a compiler that is not there.
 setup.config.json
+src/hotdisp.o
