@@ -218,6 +218,12 @@ type
     // True when the ONLY thing keeping this region out is its calls, and every target is itself
     // eligible - i.e. exactly what B3 would unlock. Filled by AotMarkB3Candidates.
     B3Candidate: Boolean;
+    // Profitability: how the region's instructions split between a NATIVE lowering and a call into
+    // the runtime helper. An op with no native descent costs ~76 ns compiled against ~32 ns
+    // interpreted, so a region that is mostly helpers is SLOWER compiled - measured on binary-trees,
+    // where every compiled profile loses to the interpreter (49.8 s against 42.7 s).
+    NativeOps: Integer;
+    HelperOps: Integer;
   end;
   TAotRegions = array of TAotRegion;
 
@@ -1330,6 +1336,8 @@ var
       HasIndirectCall := False;
       EligibleNoCalls := True;
       B3Candidate := False;
+      NativeOps := 0;
+      HelperOps := 0;
     end;
     Inc(NRegions);
   end;
@@ -1421,7 +1429,11 @@ begin
             begin
               Regions[r].Eligible := False;
               Regions[r].BailReason := OpName(Instr.OpCode);
-            end;
+            end
+            else if AotIsNative(SSAProg, Instr) then
+              Inc(Regions[r].NativeOps)
+            else
+              Inc(Regions[r].HelperOps);
           end;
           Inc(o);
         end;
@@ -1480,8 +1492,10 @@ begin
       if Eligible then
       begin
         Inc(NElig);
-        WriteLn(ErrOutput, Format('[AOT] %-24s blocks=%-4d instrs=%-5d entryPC=%-6d NATIVE',
-                                  [Name, LastBlock - FirstBlock + 1, InstrCount, EntryPC]));
+        WriteLn(ErrOutput, Format('[AOT] %-24s blocks=%-4d instrs=%-5d entryPC=%-6d NATIVE  native=%d helper=%d (%d%% helper)',
+                                  [Name, LastBlock - FirstBlock + 1, InstrCount, EntryPC,
+                                   NativeOps, HelperOps,
+                                   (HelperOps * 100) div (NativeOps + HelperOps + Ord((NativeOps + HelperOps) = 0))]));
       end
       else if B3Candidate then
       begin

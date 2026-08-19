@@ -1807,13 +1807,6 @@ begin
     {$ENDIF}
     {$ENDIF}
 
-    // === AOT SURVEY (B1-S3, diagnostics only) ===
-    // Slices the SSA program into function regions and reports which are compilable
-    // with the B1 scalar set (stderr). No codegen yet; gated by the env var.
-    if GetEnvironmentVariable('AOT_DIAG') = '1' then
-      AotSurvey(SSAProgram, BytecodeProgram,
-                BytecodeProgram.ModernMode and not OptBoundsCheck);  // same gate the compiler uses
-
     // === DISASSEMBLY (Optional) ===
     if OptDisasm then
     begin
@@ -1926,6 +1919,21 @@ begin
       VM.JitProfile := OptJitProfile;    // --jit-profile: count loop back-edges (J1)
       {$ENDIF}
       VM.LoadProgram(BytecodeProgram);
+
+      // === AOT SURVEY (B1-S3, diagnostics only) ===
+      // Slices the SSA program into function regions and reports which are compilable with the B1
+      // scalar set (stderr). ⛔ It runs HERE, after the VM exists and with the record layout already
+      // handed over, because it must see the SAME gates the compiler will: run before that, GRecSize
+      // was 0, AotRecNative answered False, and every record field access was reported as taking the
+      // helper road when the compiled code lowers it natively. A diagnostic that disagrees with
+      // reality is worse than none.
+      if GetEnvironmentVariable('AOT_DIAG') = '1' then
+      begin
+        VM.GetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        AotSetRecordLayout(AotRecordsOff, AotRecSize, AotRecIntOff, AotRecFloatOff, AotSharedRecOff);
+        AotSurvey(SSAProgram, BytecodeProgram,
+                  BytecodeProgram.ModernMode and not OptBoundsCheck);  // same gate the compiler uses
+      end;
 
       // === AOT (plan B, B1) ===
       // Compile eligible whole SSA functions to native and register them under their
