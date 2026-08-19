@@ -23883,6 +23883,7 @@ var
   VNameU, TypeNameU: string;
   ElemBank: TSSARegisterType;
   ConstFoldVal: Int64;
+  ConstIsInt: Boolean;
 begin
   if Node = nil then Exit;
   // Do not descend into procedure bodies: DIM SHARED (and a module-level CONST, which lowers to a
@@ -23910,8 +23911,9 @@ begin
         // it keeps working - but the hot path stops loading a constant from memory. Integer literals
         // only for now: a float would have to round-trip through text, and a string literal needs its
         // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
-        if (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
-           TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal) then
+        ConstIsInt := (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
+                      TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal);
+        if ConstIsInt then
           FModuleConstVals.Values[VNameU] := IntToStr(ConstFoldVal);
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
@@ -23921,6 +23923,13 @@ begin
         begin
           if FindUDT(TypeNameU) >= 0 then
             ElemBank := srtInt                           // UDT scalar: the array element is the record handle
+          // ⛔ An untyped CONST whose value is an INTEGER must be backed by an integer, or the
+          // declaration and the folded reads disagree about what it is: reads folded to an immediate
+          // while the backing scalar sat in the float bank. With no suffix to go on, the type
+          // inference below falls back to the numeric default, which is float - so the VALUE has to
+          // decide, exactly as it already does for a bare literal.
+          else if ConstIsInt and (TypeNameU = '') then
+            ElemBank := srtInt
           else
             ElemBank := TypeNameToBank(TypeNameU, VNameU);
           ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name
