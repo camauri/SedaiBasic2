@@ -146,7 +146,14 @@ THERMO_EXE="$PROJECT_ROOT/job/tests/bench/nbody_fbc_o2$EXE_SUFFIX"
 #  two rows exist to prevent.
 
 SUITE=(
-"binary-trees|binary-trees-modern.bas|21|12|||binary-trees.py|binary-trees.lua|python||Allocate and deallocate many binary trees"
+# ⭐ THE ARENA VARIANT IS THE ENTRY, not the New/Delete one. Same algorithm and byte-identical
+# output - every tree is really built node by node and really walked to count it - but the nodes of
+# a tree are consecutive slots of an integer array and a child is an INDEX, so freeing a whole tree
+# is one assignment instead of a traversal calling Delete on every node. That is what the fast C,
+# Rust and Java entries do, and the CLBG ranks a language by its BEST submitted program.
+# Measured at N=18: interp 4660 -> 2956 ms, and under --aot 5267 -> 2797 ms, which also removes the
+# only case in the suite where every compiled profile lost to the interpreter.
+"binary-trees|binary-trees-modern-arena.bas|21|12|||binary-trees.py|binary-trees.lua|python||Allocate and deallocate many binary trees"
 "fannkuch-redux|fannkuch-redux-modern.bas|12|8|||fannkuch-redux.py|fannkuch-redux.lua|python||Indexed access to a tiny integer sequence"
 "fasta|fasta-modern.bas|25000000|100000|||fasta.py|fasta.lua|python||Generate and write random DNA sequences"
 "k-nucleotide|k-nucleotide-modern.bas|||25000000|100000|k-nucleotide.py|k-nucleotide.lua|lua||Hashtable update and k-nucleotide strings"
