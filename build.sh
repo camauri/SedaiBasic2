@@ -577,6 +577,25 @@ FPC="$(find_fpc "$PLATFORM_DIR")" || exit 1
 HOT_C_DEFINE=""
 if [[ "$HOT_C" == "true" ]]; then
     CC_BIN="${SEDAI_CC:-}"
+    # CROSS-COMPILING. The object has to be built for the TARGET, not for this machine: FPC's {$L}
+    # links a COFF object on win64 and an ELF one on linux, and handing it the wrong format fails at
+    # link time with no useful message. The C side needs nothing else from the target - it is
+    # freestanding, so `nm -u` on the object is empty and no Windows runtime is involved.
+    if [[ -z "$CC_BIN" && "$OS" == "win64" ]]; then
+        CC_BIN="$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)"
+        if [[ -z "$CC_BIN" ]]; then
+            echo -e "${RED}ERROR: --hot-c for win64 needs x86_64-w64-mingw32-gcc.${NC}" >&2
+            echo -e "${GRAY}  Debian/Ubuntu: sudo apt install gcc-mingw-w64-x86-64-win32${NC}" >&2
+            exit 1
+        fi
+    fi
+    if [[ -z "$CC_BIN" && "$OS" == "win32" ]]; then
+        # ⛔ win32 decorates a cdecl symbol with a LEADING UNDERSCORE, which win64 does not, so the
+        # external declarations in SedaiBytecodeVM.pas would not resolve. Refused rather than failing
+        # obscurely at link time.
+        echo -e "${RED}ERROR: --hot-c is not supported for win32 (leading-underscore cdecl names).${NC}" >&2
+        exit 1
+    fi
     if [[ -z "$CC_BIN" ]]; then
         for c in gcc clang cc; do
             command -v "$c" >/dev/null 2>&1 && { CC_BIN="$c"; break; }
