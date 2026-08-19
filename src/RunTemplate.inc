@@ -64,7 +64,7 @@ var
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
   HotNewPC: LongInt;
   HotArrDesc: Pointer;
-  HotModernArr: LongInt;   // 1 only where an out-of-bounds access must NOT raise
+  HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
   HotXferI: PInt64;        // the SUB/FUNCTION argument banks of THIS context - never baked in,
   HotXferF: PDouble;       // a worker must see its own, exactly as the AOT context does
   {$ENDIF}
@@ -167,7 +167,9 @@ begin
   HotCOk := (not JitOn) and (not AotOn) and (not Assigned(FEventPollCallback));
   // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
   // raise; there its array arms hand the PC back instead.
-  if ModernConv and (not FBoundsCheck) then HotModernArr := 1 else HotModernArr := 0;
+  HotFlags := 0;
+  if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
+  if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
   if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
   if Length(Ctx.XferInt) > 0 then HotXferI := @Ctx.XferInt[0] else HotXferI := nil;
   if Length(Ctx.XferFloat) > 0 then HotXferF := @Ctx.XferFloat[0] else HotXferF := nil;
@@ -275,7 +277,7 @@ begin
     // Its cost is therefore one call per COLD instruction and none per hot one. It is used only when
     // nothing else needs to look at every instruction: no compiled region to enter, and no event
     // poll to service.
-    if FHotOp[CurPC] then
+    if FHotOp[CurPC] <> 0 then
     begin
       // ⛔ AcquireArrDesc TAKES A LOCK, and calling it per entry to the C loop was catastrophic:
       // mandelbrot went from -32.8% to +33%, spectral-norm to +84%. This VM has paid that lesson
@@ -284,7 +286,7 @@ begin
       // a plain field read on the hot path and the lock only when something really moved.
       if FArraysDirty then HotArrDesc := AcquireArrDesc;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
-                                HotArrDesc, HotModernArr, HotXferI, HotXferF);
+                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0]);
       if HotNewPC <> CurPC then
       begin
         CurPC := HotNewPC;

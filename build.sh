@@ -588,7 +588,10 @@ if [[ "$HOT_C" == "true" ]]; then
         exit 1
     fi
     echo -e "${GRAY}C compiler: $("$CC_BIN" --version 2>/dev/null | head -1) - $CC_BIN${NC}"
-    "$CC_BIN" -O2 -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
+    # -fno-math-errno is REQUIRED, not a tuning knob: without it gcc assumes llrint/sqrt may touch
+    # errno and emits CALLS to libm, which a freestanding object linked into an FPC program cannot
+    # resolve. With it they are cvtsd2si and sqrtsd, one instruction each.
+    "$CC_BIN" -O2 -ffreestanding -fno-math-errno -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
         echo -e "${RED}ERROR: could not compile src/hotdisp.c${NC}" >&2; exit 1; }
     HOT_C_DEFINE="-dHOT_C"
 fi

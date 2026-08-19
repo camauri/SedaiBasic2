@@ -246,8 +246,8 @@ type
     FDenseOps: array of Word;
     FDenseOpsFor: TBytecodeProgram;   // the program FDenseOps was built for (rebuild guard)
     {$IFDEF HOT_C}
-    FHotOp: array of Boolean;         // per PC: can the C hot loop start here? see HotOps.inc
-    FHotOpBase: array of Boolean;     // ...before the run-wide gate is folded in
+    FHotOp: array of Word;            // per PC: 1 + the C arm that runs it, 0 = not the C loop's
+    FHotOpBase: array of Word;        // ...before the run-wide gate is folded in
     FHotOpEnabled: Boolean;
     {$ENDIF}
     {$IFDEF JIT_PROFILE}
@@ -799,7 +799,6 @@ uses
   SedaiTerminalIO;
 
 {$IFDEF HOT_C}
-{$I HotOps.inc}
 {$ENDIF}
 
 
@@ -8870,6 +8869,25 @@ begin
   RunFast;
 end;
 
+{$IFDEF HOT_C}
+{ The hot arithmetic/branch opcodes, compiled by a C compiler rather than by FPC. The reason is
+  measured and is not a preference: the same dispatch loop - same arms, same values live across it -
+  runs in 253 ms under gcc -O2 and 443 under FPC on this machine, and no FPC optimisation level
+  closes any of it. gcc keeps the hot pointers in registers where FPC spills them. See src/hotdisp.c.
+
+  The record layouts match exactly: TBytecodeInstruction is a packed record of four Words and an
+  Int64, which is C's { uint16_t x4; int64_t } with no padding on either side. cdecl is the right
+  convention on both platforms - on win64 FPC's cdecl IS the Microsoft x64 ABI that MinGW-w64 emits. }
+{$L hotdisp.o}
+function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
+                       pc, count: LongInt; tv: Int64;
+                       arrdesc: Pointer; flags: LongInt;
+                       xi: PInt64; xf: PDouble; hidx: PWord): LongInt; cdecl; external;
+{ The opcode list in DISPATCH-TABLE order, published by the C file so that nothing here holds a
+  second copy of it. Entry j is run by arm j, which is what makes FHotOpBase an index. }
+function sedai_hot_ops(out list: PWord): LongInt; cdecl; external;
+{$ENDIF}
+
 { EnsureDenseOps - decode-once dense dispatch table (VM perf plan, milestone M2).
   Translate every instruction's 16-bit (group.sub) opcode to its dense linear index ONCE, so the hot
   loop dispatches on a single compact case (no per-instruction group extraction / superinstruction
@@ -8878,10 +8896,15 @@ end;
 procedure TBytecodeVM.EnsureDenseOps;
 type
   PBytecodeInstr = ^TBytecodeInstruction;
+  {$IFDEF HOT_C}
+  TWordArr = array[0..High(Word)] of Word;
+  PWordArr = ^TWordArr;
+  {$ENDIF}
 var
   i, n: Integer;
   {$IFDEF HOT_C}
-  j: Integer;
+  j, HotOpN: Integer;
+  HotOpList: PWord;
   {$ENDIF}
   Ins: PBytecodeInstr;
 begin
@@ -8894,17 +8917,19 @@ begin
     for i := 0 to n - 1 do
       FDenseOps[i] := Word(Op16ToDense(Ins[i].OpCode));
   {$IFDEF HOT_C}
-  // Per PC: may the C hot loop start here? Answering it with an array read costs a load; answering
+  // Per PC: WHICH C arm runs this instruction (1-based, 0 = none), so the C loop dispatches on an
+  // index instead of decoding the opcode. Answering it with an array read costs a load; answering
   // it by calling C and being refused costs a call.
   SetLength(FHotOpBase, n);
   SetLength(FHotOp, n);
+  HotOpN := sedai_hot_ops(HotOpList);
   if Ins <> nil then
     for i := 0 to n - 1 do
     begin
-      FHotOpBase[i] := False;
-      for j := 0 to HOT_OP_COUNT - 1 do
-        if HOT_OPS[j] = Ins[i].OpCode then begin FHotOpBase[i] := True; Break; end;
-      FHotOp[i] := False;
+      FHotOpBase[i] := 0;
+      for j := 0 to HotOpN - 1 do
+        if PWordArr(HotOpList)^[j] = Ins[i].OpCode then begin FHotOpBase[i] := Word(j + 1); Break; end;
+      FHotOp[i] := 0;
     end;
   FHotOpEnabled := False;
   {$ENDIF}
@@ -10643,23 +10668,11 @@ begin
   if (FHotOpEnabled = AEnabled) and (Length(FHotOp) = Length(FHotOpBase)) then Exit;
   FHotOpEnabled := AEnabled;
   SetLength(FHotOp, Length(FHotOpBase));
-  for i := 0 to High(FHotOpBase) do
-    FHotOp[i] := AEnabled and FHotOpBase[i];
+  if AEnabled then
+    for i := 0 to High(FHotOpBase) do FHotOp[i] := FHotOpBase[i]
+  else
+    for i := 0 to High(FHotOpBase) do FHotOp[i] := 0;
 end;
-
-{ The hot arithmetic/branch opcodes, compiled by a C compiler rather than by FPC. The reason is
-  measured and is not a preference: the same dispatch loop - same arms, same values live across it -
-  runs in 253 ms under gcc -O2 and 443 under FPC on this machine, and no FPC optimisation level
-  closes any of it. gcc keeps the hot pointers in registers where FPC spills them. See src/hotdisp.c.
-
-  The record layouts match exactly: TBytecodeInstruction is a packed record of four Words and an
-  Int64, which is C's { uint16_t x4; int64_t } with no padding on either side. cdecl is the right
-  convention on both platforms - on win64 FPC's cdecl IS the Microsoft x64 ABI that MinGW-w64 emits. }
-{$L hotdisp.o}
-function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
-                       pc, count: LongInt; tv: Int64;
-                       arrdesc: Pointer; modern_arrays: LongInt;
-                       xi: PInt64; xf: PDouble): LongInt; cdecl; external;
 {$ENDIF}
 
 { RunFast - Optimized execution loop
