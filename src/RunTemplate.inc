@@ -62,6 +62,7 @@ var
   EventPollCounter: Integer;
   {$IFDEF HOT_C}
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
+  JitArrDescCache: Pointer;      // corsia veloce del descrittore array per l'arm JIT
   HotNewPC: LongInt;
   HotArrDesc: Pointer;
   HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
@@ -94,6 +95,7 @@ begin
   // main thread (the old "main context only" gate for the m451 corruption is gone).
   JitOn := FJitEnabled and (Length(FNativeLoops) > 0);
   if JitOn then JitLoops := @FNativeLoops[0] else JitLoops := nil;
+  JitArrDescCache := nil;
   {$IFDEF JIT_PROFILE}
   // J1: bind the back-edge profiler (counting is a no-op unless FJitProfile is set).
   BEProfile := FJitProfile;
@@ -190,10 +192,34 @@ begin
   // ⚠️ At N small the two shortest read -4.3% and -9.1%; re-measured at a real size they are -2.5%
   // and -10.3%. Under a second, this machine's noise eats the signal - do not quote the short ones.
   //
-  // JIT still disqualifies: it rewrites the bytecode the C loop would be dispatching.
-  // HOTC_AOT=0 restores the old behaviour, so the A/B above lives on ONE binary.
-  HotCOk := (not JitOn) and (not Assigned(FEventPollCallback)) and
-            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0'));
+  // ⛔ The line above used to also exclude the JIT, on the stated grounds that "it rewrites the
+  // bytecode the C loop would be dispatching". THAT WAS WRONG, and it was written the same day it
+  // was disproved: the loop JIT never writes to the instruction stream (nothing does - every use of
+  // GetInstructionsPtr in this unit is a read). It installs compiled loops in FNativeLoops, a per-PC
+  // side table exactly like the AOT's FNativeFuncs, so the SAME coexistence applies: SetHotOpEnabled
+  // zeroes the header pc and the C dispatcher hands it back there.
+  //
+  // What that mistake cost, measured on binary-trees-modern-arena N=16, best of 3, one binary:
+  //   interpreter, C loop on    744 ms
+  //   interpreter, C loop off  2906 ms      <- what --jit was getting
+  //   --jit                    3036 ms
+  // So 94% of the JIT's 4x "slowdown" was never the JIT: it was this gate. The JIT's own cost is
+  // 130 ms, 4.5%. ⛔ And note the C loop is worth 291% here against the "27-45% where it applies"
+  // written elsewhere - that range was measured on other programs and is not a maximum.
+  //
+  // HOTC_AOT=0 / HOTC_JIT=0 restore the old behaviour per engine, and HOTC_OFF=1 disables the C loop
+  // outright, so all three A/Bs live on ONE binary.
+  // ⛔ ...and NOT WHILE TRON IS TRACING. The C loop does not emit trace lines - it runs a stretch of
+  // instructions and hands back a PC - so with tracing on it silently swallows the lines it ran.
+  // That is a TRON fidelity defect that predates this change and was invisible: test_tron_troff
+  // printed [60] once for a three-iteration FOR instead of once per iteration, and nobody compared
+  // it against anything that did. It surfaced only because zeroing FHotOp at JIT loop headers made
+  // --jit trace those lines while the interpreter still did not, and the differential net caught the
+  // two engines disagreeing. Fix the cause: no C loop while tracing, and both engines trace fully.
+  HotCOk := (not Assigned(FEventPollCallback)) and (not Ctx.TraceActive) and
+            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0')) and
+            ((not JitOn) or (GetEnvironmentVariable('HOTC_JIT') <> '0'));
+  if GetEnvironmentVariable('HOTC_OFF') = '1' then HotCOk := False;
   // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
   // raise; there its array arms hand the PC back instead.
   HotFlags := 0;
@@ -236,7 +262,7 @@ begin
       // Through AcquireArrDesc: the flag test, the rebuild and taking the address are one locked
       // step. A compiled loop is entered from every worker, so this arm has the same exposure the
       // AOT arm below documents.
-      ArrDescPtr := AcquireArrDesc;
+      ArrDescPtr := AcquireArrDescFast(JitArrDescCache);
       // AotSettle, not a bare assignment: since J14 a compiled loop can route one instruction through
       // the interpreter, and that helper reports a raised exception or a cleared Running as a NEGATIVE
       // sentinel in the same channel as the exit PC. Resolving it here is what makes ON ERROR / TRAP /

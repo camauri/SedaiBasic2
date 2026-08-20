@@ -533,6 +533,7 @@ type
     procedure RebuildJitArrDesc;
     function AcquireArrDesc: Pointer;
     procedure EnsureArrDesc(Ctx: PAotCtx);
+    function AcquireArrDescFast(var Cached: Pointer): Pointer;
     procedure ReleaseRetiredArrDesc;
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
@@ -10512,6 +10513,20 @@ begin
   // B3: native call site primitive. The FAST one specialises the case worth specialising - a
   // callee whose frame is a pointer slide - and falls back to the general one for everything
   // else, so it is correct for any program. AOT_FASTCALL=0 restores the general one always.
+  //
+  // ⛔ MISURATO E RESPINTO (20 ago 2026). Questa condizione ha una seconda meta' - FAllCalleesFast -
+  // che CONTRADDICE la frase qui sopra: e' di programma intero, quindi una sola unita' chiamata che
+  // copia float o stringhe spegne il percorso veloce per OGNI chiamata del programma. Su
+  // binary-trees-modern-arena quell'unita' e' WORKER, che gira una volta per thread, e squalificava
+  // MAKETREE e CHECKTREE, che girano milioni di volte ed erano entrambe RELOCATABLE.
+  // La decisione per singolo chiamato esiste gia' ed e' esatta (FFrameFast[pc] = -1 per le non
+  // idonee, e AotCallSubFast delega su quel -1), quindi il cancello sembrava puro spreco.
+  // 📊 Tolto e misurato, N=18 best-of-5, output confrontato: AOT 2994 -> 3067 ms, AOT+JIT
+  // 2978 -> 3102 ms. Nessun guadagno, e le due configurazioni peggiorano nella stessa direzione.
+  // Le reti restavano verdi (AOT e JIT 1012 confrontati, 0 MISMATCH): era corretto, non conveniente.
+  // ⛔ Non ritentarlo senza una misura: il costo del frame che AotCallSubFast "toglie" non sparisce,
+  // viene INLINEATO, e su questo programma l'indirezione in piu' per i chiamati non idonei se lo
+  // mangia. Se un giorno serve, va misurato di nuovo - questo verdetto ha una data.
   if (GAotFastCall = 1) and FAllCalleesFast then C.CallSub := @AotCallSubFast
   else C.CallSub := @AotCallSub;
   // C5 residuals. StrMid is dialect-variant: install the flavor once per run.
@@ -10652,6 +10667,25 @@ begin
   Ctx^.ArrDesc := AcquireArrDesc;
 end;
 
+function TBytecodeVM.AcquireArrDescFast(var Cached: Pointer): Pointer;
+// La stessa corsia veloce di EnsureArrDesc, per un chiamante che tiene il puntatore in una VARIABILE
+// invece che in un contesto AOT: e' l'arm del JIT nel ciclo di esecuzione.
+//
+// ⛔ Perche' esiste invece di due righe scritte li': l'arm del JIT chiamava AcquireArrDesc a OGNI
+// ingresso in un ciclo compilato, cioe' una sezione critica globale per ingresso. E' esattamente il
+// difetto che EnsureArrDesc documenta di aver tolto dall'AOT (binary-trees 171 -> 711 ms, 4,2x): la
+// corsia veloce era stata aggiunta a UN motore e non al gemello. Misurato il 20 ago 2026 su
+// binary-trees-modern-arena N=14: --jit 668 ms contro 196 dell'interprete.
+//
+// ⭐ E il file lo dice gia' sopra: «una corsia scritta in linea da un chiamante e' una garanzia che
+// ogni altro chiamante perde in silenzio». Quindi un helper solo, non una quinta copia.
+begin
+  if GArrDescFast and (not FArraysDirty) and (Cached = FCurArrDesc) and (FCurArrDesc <> nil) then
+    Exit(Cached);
+  Cached := AcquireArrDesc;
+  Result := Cached;
+end;
+
 procedure TBytecodeVM.ReleaseRetiredArrDesc;
 // Drop the retired descriptor buffers once no worker can still be holding one. Called when the last
 // worker exits, so the retention above lasts only as long as the threaded phase does.
@@ -10750,6 +10784,13 @@ begin
     // stops being used and a measurement of the two together measures neither.
     for i := 0 to High(FNativeFuncs) do
       if (FNativeFuncs[i] <> nil) and (i <= High(FHotOp)) then FHotOp[i] := 0;
+    // ...and the same for the LOOP JIT, for the same reason. FNativeLoops is a per-PC side table
+    // exactly like FNativeFuncs - the JIT does not rewrite the instruction stream, it indexes the
+    // loop HEADER pc - so zeroing the header makes the C dispatcher hand the pc back there, and the
+    // interpreter then enters the compiled loop. Order is safe: BuildJitLoops fills FNativeLoops
+    // while the program is being prepared, and this runs at RunFast entry, after it.
+    for i := 0 to High(FNativeLoops) do
+      if (FNativeLoops[i] <> nil) and (i <= High(FHotOp)) then FHotOp[i] := 0;
   end
   else
     for i := 0 to High(FHotOpBase) do FHotOp[i] := 0;
