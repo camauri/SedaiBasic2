@@ -2080,6 +2080,11 @@ begin
         37: Result := 'StrMkFloat';
         38: Result := 'StrCvInt';
         39: Result := 'StrCvFloat';
+        15: Result := 'StrUCase';
+        18: Result := 'StrSpace';
+        13: Result := 'StrRTrim';
+        14: Result := 'StrTrim';
+        16: Result := 'StrLCase';
       else
         Result := Format('String_%d', [SubOp]);
       end;
@@ -2117,6 +2122,8 @@ begin
         33: Result := 'MathAsinh';
         34: Result := 'MathAcosh';
         35: Result := 'MathAtanh';
+        11: Result := 'MathLog10';
+        36: Result := 'MathCeil';
       else
         Result := Format('Math_%d', [SubOp]);
       end;
@@ -2156,6 +2163,10 @@ begin
         35: Result := 'ArrayUnbind';
         50: Result := 'RawLoadZStr';
         51: Result := 'RawStoreZStr';
+        27: Result := 'ArrayRedimPush';
+        28: Result := 'ArrayRedimN';
+        29: Result := 'ArrayIdxPush';
+        30: Result := 'ArrayIdxResolve';
       else
         Result := Format('Array_%d', [SubOp]);
       end;
@@ -2219,6 +2230,16 @@ begin
         34: Result := 'OpenFunc';
         35: Result := 'DirSearch';
         36: Result := 'DirAttr';
+        15: Result := 'InputFileInt';
+        16: Result := 'FileQuery';
+        17: Result := 'SeekSet';
+        18: Result := 'InputFileLine';
+        19: Result := 'PutBinInt';
+        20: Result := 'PutBinFloat';
+        21: Result := 'GetBinInt';
+        22: Result := 'GetBinFloat';
+        23: Result := 'PutBinStr';
+        24: Result := 'GetBinStr';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;
