@@ -34,6 +34,10 @@ SELECT_FPC=false
 # builds. --no-hot-c turns it off.
 HOT_C=true
 HOT_C_EXPLICIT=false
+# --symbols keeps the RELEASE build exactly as it is and only stops stripping it. A --debug
+# build is no substitute for profiling: it also turns on -Ci -Cr -Co, and range and overflow
+# checks change the very timings you came to measure.
+SYMBOLS=false
 CPU=""                 # empty => detect from the host
 OS=""                  # empty => detect from the host
 WITH_SEDAI_AUDIO=""    # '' auto-detect | 'no' disabled | <path>
@@ -72,6 +76,7 @@ show_help() {
     echo "  --no-banner              Suppress the banner"
     echo "  --select-fpc             List the Free Pascal compilers found and choose one (stored)"
     echo "  --no-hot-c               Do NOT compile the hot dispatch arms with a C compiler"
+    echo "  --symbols                Release build, but NOT stripped (for a profiler; --debug is not a substitute)"
     echo "  --hot-c                  Force it on (it is the default; fails if no C compiler)"
     echo "  --help                   Show this help"
     echo ""
@@ -464,7 +469,13 @@ build_target() {
 
         opts+=("-OoREGVAR" "-OoCSE" "-OoDFA" "-OoFASTMATH" "-OoCONSTPROP")
         [[ -n "$HOT_C_DEFINE" ]] && opts+=("$HOT_C_DEFINE")
-        opts+=("-Xs" "-XX")
+        # -Xs strips. Keeping the symbols is what lets a sampler put a NAME on a program
+        # counter; -XX (smart linking) stays either way.
+        # ⛔ Dropping -Xs is NOT enough: fpc links release builds stripped anyway, so the binary
+        # came out with zero symbols and the sampler had nothing to name a PC with. -gw asks for
+        # DWARF explicitly. It is NOT -debug: the range and overflow checks (-Ci -Cr -Co) stay
+        # off and every optimisation flag above stays on, so the timings are the release ones.
+        if [[ "$SYMBOLS" == "true" ]]; then opts+=("-gw" "-XX"); else opts+=("-Xs" "-XX"); fi
     else
         opts+=("-g" "-gl" "-gw" "-Ci" "-Cr" "-Co")
     fi
@@ -554,6 +565,7 @@ while [[ $# -gt 0 ]]; do
         --select-fpc) SELECT_FPC=true; shift ;;
         --hot-c) HOT_C=true; HOT_C_EXPLICIT=true; shift ;;
         --no-hot-c) HOT_C=false; shift ;;
+        --symbols|--no-strip) SYMBOLS=true; shift ;;
         --cpu) CPU="$2"; shift 2 ;;
         --os) OS="$2"; shift 2 ;;
         --with-sedai-audio) WITH_SEDAI_AUDIO="$2"; shift 2 ;;

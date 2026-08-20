@@ -7064,6 +7064,46 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------------------------
+// AOT_MAP: publish where each generated region LIVES, so a sampler can name a program counter.
+//
+// ⛔ THE REASON THIS EXISTS. binary-trees is the one benchmark where every compiled profile loses
+// to the interpreter, and the cause has resisted every indirect probe: helper routing is 0% in the
+// hot regions, the compiled call protocol is FASTER on fib(30), and turning the native record paths
+// off makes it much worse. The phase split says freeTree +47%, yet each of those operations probed
+// in ISOLATION is faster compiled - so the cost is contextual and only a profile of the real run
+// can find it. There is no perf and no valgrind on the target machine, only gdb, and gdb cannot
+// unwind out of generated code: a sample taken inside an AOT region used to be an address with no
+// name attached.
+//
+// A flat profile does not need unwinding - it needs to know which region a PC falls in. That is a
+// base, a length and a name, which is exactly what this writes: one line per region,
+//     <hex start> <hex size> <name>
+// in the same shape a perf map uses, so the file stays useful if perf ever is available.
+//
+// AOT_MAP=1 writes /tmp/sb-aot-<pid>.map; AOT_MAP=<path> writes there instead. Off by default: it
+// costs a file per run and says nothing to anyone not holding a sampler.
+procedure AotWriteMapLine(const Name: string; Base: Pointer; Size: PtrUInt);
+var
+  Where: string;
+  F: TextFile;
+begin
+  Where := GetEnvironmentVariable('AOT_MAP');
+  if Where = '' then Exit;
+  if Where = '1' then Where := Format('/tmp/sb-aot-%d.map', [GetProcessID]);
+  AssignFile(F, Where);
+  try
+    if FileExists(Where) then Append(F) else Rewrite(F);
+    try
+      WriteLn(F, Format('%x %x %s', [PtrUInt(Base), Size, Name]));
+    finally
+      CloseFile(F);
+    end;
+  except
+    // A diagnostic that cannot write must not take the run down with it.
+  end;
+end;
+
 function AotCompileProgram(SSAProg: TSSAProgram; Prog: TBytecodeProgram;
                            TrueVal: Int64; AllowUnsafe, Diag, SkipMain: Boolean): TAotFuncs;
 var
@@ -7134,6 +7174,7 @@ begin
         end;
       end;
       Result[n].Mem := Mem;
+      AotWriteMapLine(Regions[r].Name, Mem.Ptr, Mem.Size);
       Inc(n);
       if Diag then
       begin

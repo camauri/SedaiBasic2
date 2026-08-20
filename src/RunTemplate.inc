@@ -164,6 +164,19 @@ begin
   // Initialize event polling counter
   EventPollCounter := 0;
   {$IFDEF HOT_C}
+  // ⛔ AotOn disqualifies the C loop for the WHOLE run, and that is the binary-trees inversion:
+  // sampled 20 Aug 2026, the AOT's compiled regions take 1% of the samples on that program while
+  // sedai_hot_run takes 6.2% of the interpreted profile and is documented as worth 27-45% where it
+  // applies. It also explains why every ISOLATED probe said the opposite - one operation on its own
+  // has no interpreted stretch long enough for the C loop to matter.
+  //
+  // ⚠️ Letting the two coexist was TRIED on 20 Aug and reverted. The mechanism looks available: the
+  // C dispatcher already hands the PC back on a zero entry ("if (!h_) return pc"), so zeroing the
+  // per-PC table at every compiled entry should stop it exactly where the interpreter has to look.
+  // With that in place the program HANGS - at every N, with one worker or twenty-two - spinning in
+  // Move under ReAllocMem, growing an execution-context array without bound, and it never even
+  // reaches SetHotOpEnabled. So the fault is upstream, in the AcquireArrDesc call this gate guards
+  // on the line below. Not understood yet; do not re-open the gate without explaining that first.
   HotCOk := (not JitOn) and (not AotOn) and (not Assigned(FEventPollCallback));
   // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
   // raise; there its array arms hand the PC back instead.
