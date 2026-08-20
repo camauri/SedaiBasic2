@@ -577,6 +577,7 @@ type
     // bcCallSub: snapshot the registers the callee at TargetPC can touch (-1 = unknown target,
     // e.g. an indirect call: falls back to the program-wide width). bcReturnSub restores exactly
     // what was pushed, reading the width back off the frame-width stack.
+    function FramePushIsAllocFree(Ctx: TExecutionContext; TargetPC: Integer): Boolean;
     procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1; CallPC: Integer = -1);
     procedure FramePop(Ctx: TExecutionContext);
     // Size the integer bank to LogicalCount slots PLUS the relocatable frame region above them,
@@ -817,6 +818,9 @@ var
   // 4a8b8ac). E' il riferimento dell'A/B su un binario solo: quel commit ha corretto tre difetti a
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
   GArrDescFast: Boolean = True;
+  // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
+  // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
+  GNoExcFrame: Boolean = True;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
 begin
@@ -1212,6 +1216,7 @@ begin
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
+  GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
   FRawHeapTop := 0;
@@ -3604,6 +3609,35 @@ end;
 
 var
   GFrameSaveNoStr: Integer = 0;   // measurement probe, set from FRAMESAVE_NOSTR at startup
+
+function TBytecodeVM.FramePushIsAllocFree(Ctx: TExecutionContext; TargetPC: Integer): Boolean;
+// Vero quando FramePush(Ctx, TargetPC, _) seguito da GrowCallStackIfNeeded NON puo' allocare - e
+// quindi non puo' sollevare, e quindi il chiamante non ha bisogno di un frame di eccezione.
+//
+// ⛔ PERCHE' ESISTE. AotCallSub avvolge FramePush + GrowCallStackIfNeeded in un try...except per
+// catturare l'allocazione che fallisce. Quel try costa un setjmp e la manipolazione della catena
+// delle eccezioni A OGNI CHIAMATA, mentre la crescita che protegge avviene forse una volta ogni
+// diecimila. Campionato il 20 ago 2026 su binary-trees-modern-arena sotto --aot, contando i soli
+// thread attivi: fpc_pushexceptaddr + fpc_popaddrstack + fpc_setjmp = 11,3% del tempo.
+//
+// ⛔ QUESTA FUNZIONE RIPRODUCE LE CONDIZIONI DEL RAMO VELOCE DI FramePush, ED E' QUI ACCANTO PER
+// QUESTO: se quel ramo cambia, questa cambia con lui. Sono due copie della stessa condizione e
+// l'unica difesa e' che siano ADIACENTI e dichiarate tali. Quando il ramo veloce non si applica si
+// risponde False e il chiamante tiene il suo try: la risposta prudente e' sempre False.
+var
+  PW: Int64;
+  FBHi: Integer;
+begin
+  Result := False;
+  if (TargetPC < 0) or (TargetPC >= Length(FFrameFast)) then Exit;
+  PW := FFrameFast[TargetPC];
+  if PW < 0 then Exit;                                     // non e' uno scorrimento di puntatore
+  FBHi := PW shr 32;
+  if Ctx.RegHwI + FBHi > Ctx.RegFrameCap then Exit;        // regione piena: si copia, e si alloca
+  if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then Exit; // i marcatori vanno cresciuti
+  if Ctx.CallStackPtr >= Length(Ctx.CallStack) then Exit;  // e la pila dei ritorni idem
+  Result := True;
+end;
 
 procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer; CallPC: Integer);
 // Snapshot the live part of each register bank onto the flat per-bank save stacks (one frame).
@@ -9557,6 +9591,20 @@ begin
     Exit(BcCallSubPC);
   SI := C.FrameSaveIntTop; SF := C.FrameSaveFloatTop; SS := C.FrameSaveStrTop;
   if Fine then Ta := AotRdTsc;
+  // ⭐ SENZA FRAME DI ECCEZIONE quando niente puo' allocare. Il try qui sotto esiste per una
+  // allocazione che fallisce, ma costa un setjmp e la catena delle eccezioni A OGNI CHIAMATA -
+  // 11,3% del tempo AOT su binary-trees, campionato. FramePushIsAllocFree (accanto a FramePush,
+  // apposta) risponde True solo se il ramo veloce si applica E nessuna delle tre capacita' va
+  // cresciuta: allora questo blocco e' identico a quello sotto, meno la protezione che non serve.
+  if VM.FramePushIsAllocFree(C, Integer(CalleeEntryPC)) and GNoExcFrame then
+  begin
+    VM.FramePush(C, Integer(CalleeEntryPC), Integer(BcCallSubPC));
+    if Fine then Tb := AotRdTsc;
+    C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
+    Inc(C.CallStackPtr);
+    if Fine then Tc := AotRdTsc;
+  end
+  else
   try
     VM.FramePush(C, Integer(CalleeEntryPC), Integer(BcCallSubPC));
     if Fine then Tb := AotRdTsc;
