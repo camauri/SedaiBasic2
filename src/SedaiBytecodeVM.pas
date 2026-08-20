@@ -10741,7 +10741,16 @@ begin
   FHotOpEnabled := AEnabled;
   SetLength(FHotOp, Length(FHotOpBase));
   if AEnabled then
-    for i := 0 to High(FHotOpBase) do FHotOp[i] := FHotOpBase[i]
+  begin
+    for i := 0 to High(FHotOpBase) do FHotOp[i] := FHotOpBase[i];
+    // ...and ZERO every PC that starts a compiled region, so the C loop hands the PC back there
+    // instead of running past it - the dispatcher already does exactly that on a zero entry
+    // ("if (!h_) return pc"). Without this the C loop can step over a compiled entry and the region
+    // is simply skipped: the answer stays right, because the bytecode is equivalent, but the AOT
+    // stops being used and a measurement of the two together measures neither.
+    for i := 0 to High(FNativeFuncs) do
+      if (FNativeFuncs[i] <> nil) and (i <= High(FHotOp)) then FHotOp[i] := 0;
+  end
   else
     for i := 0 to High(FHotOpBase) do FHotOp[i] := 0;
 end;

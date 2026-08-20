@@ -164,20 +164,36 @@ begin
   // Initialize event polling counter
   EventPollCounter := 0;
   {$IFDEF HOT_C}
-  // ⛔ AotOn disqualifies the C loop for the WHOLE run, and that is the binary-trees inversion:
-  // sampled 20 Aug 2026, the AOT's compiled regions take 1% of the samples on that program while
-  // sedai_hot_run takes 6.2% of the interpreted profile and is documented as worth 27-45% where it
-  // applies. It also explains why every ISOLATED probe said the opposite - one operation on its own
-  // has no interpreted stretch long enough for the C loop to matter.
+  // ⭐ AotOn NO LONGER disqualifies the C loop, and that was the binary-trees inversion.
   //
-  // ⚠️ Letting the two coexist was TRIED on 20 Aug and reverted. The mechanism looks available: the
-  // C dispatcher already hands the PC back on a zero entry ("if (!h_) return pc"), so zeroing the
-  // per-PC table at every compiled entry should stop it exactly where the interpreter has to look.
-  // With that in place the program HANGS - at every N, with one worker or twenty-two - spinning in
-  // Move under ReAllocMem, growing an execution-context array without bound, and it never even
-  // reaches SetHotOpEnabled. So the fault is upstream, in the AcquireArrDesc call this gate guards
-  // on the line below. Not understood yet; do not re-open the gate without explaining that first.
-  HotCOk := (not JitOn) and (not AotOn) and (not Assigned(FEventPollCallback));
+  // It used to read `(not JitOn) and (not AotOn) and ...`, so switching the AOT on cost the WHOLE
+  // program its C dispatch - not just the compiled parts. Sampled 20 Aug 2026 on binary-trees: the
+  // compiled regions take 1% of the samples while sedai_hot_run takes 6.2% of the interpreted
+  // profile, and the C loop is worth 27-45% where it applies. It is also why every ISOLATED probe
+  // said the AOT was faster: one operation on its own has no interpreted stretch long enough for
+  // the C loop to matter, so disabling it there costs nothing. The cost only exists whole-program.
+  //
+  // The two coexist because SetHotOpEnabled zeroes the per-PC table at every compiled entry and the
+  // C dispatcher hands the PC back on a zero entry ("if (!h_) return pc"), so it stops exactly
+  // where the interpreter has to look. ⛔ And because the AOT arm above now refreshes IntRegs /
+  // FloatRegs after a native call: a native call reaches AotCallSub, that pushes a frame, and
+  // growing the integer bank REALLOCATES Ctx.IntRegsMem. Without that refresh the C loop was handed
+  // a stale base and wrote through it - binary-trees hung inside Move with a negative byte count.
+  //
+  // Measured, --aot, gate closed -> open, best of 5, interleaved on one binary:
+  //   mandelbrot N=8000        1007 -> 903 ms  -10.3%
+  //   binary-trees N/D N=16    1621 -> 1484    -8.5%
+  //   binary-trees 1-thread    3646 -> 3341    -8.4%
+  //   spectral-norm N=5000      729 -> 711     -2.5%
+  //   k-nucleotide f5M         1963 -> 1943    -1.0%
+  //   fasta, fannkuch, n-body, reverse-complement: flat (-0.9% .. +0.7%, inside the noise)
+  // ⚠️ At N small the two shortest read -4.3% and -9.1%; re-measured at a real size they are -2.5%
+  // and -10.3%. Under a second, this machine's noise eats the signal - do not quote the short ones.
+  //
+  // JIT still disqualifies: it rewrites the bytecode the C loop would be dispatching.
+  // HOTC_AOT=0 restores the old behaviour, so the A/B above lives on ONE binary.
+  HotCOk := (not JitOn) and (not Assigned(FEventPollCallback)) and
+            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0'));
   // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
   // raise; there its array arms hand the PC back instead.
   HotFlags := 0;
@@ -269,6 +285,15 @@ begin
       // ⚠️ "not Running" has to go through Continue too: AotSettle clears it on AOT_HELPER_HALT and
       // parks the fault PC, which may well BE the entry. Falling through there would interpret one
       // instruction after the run was already over; Continue exits via the loop's own condition.
+      // ⛔ THE VIEW MUST FOLLOW THE REALLOCATION, exactly as it does after the frame ops below
+      // ("may have slid to a relocated frame"). A native call reaches AotCallSub, AotCallSub pushes
+      // a frame, and growing the integer bank REALLOCATES Ctx.IntRegsMem and re-points Ctx.IntRegs -
+      // at which point this loop's local still holds the old base. Missing here and present three
+      // times below is exactly the asymmetry that made the C hot loop unusable under --aot: opened
+      // for an experiment, binary-trees hung inside Move under ReAllocMem with a negative byte
+      // count, because the C loop was handed this stale pointer and wrote through it.
+      IntRegs := Ctx.IntRegs;
+      FloatRegs := @Ctx.FloatRegs[0];
       if (CurPC <> AotFromPC) or (not Ctx.Running) then System.Continue;
     end;
 
