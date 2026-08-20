@@ -161,7 +161,15 @@ function RunLoopUnrolling(Prog: TSSAProgram): Integer;
 
 implementation
 
+
 uses SedaiDebug;
+
+var
+  // ⛔ UNROLL_DIAG=1: perche' questo passo non srotola MAI. L'audit del 20 ago 2026 ha misurato che
+  // spegnerlo non cambia un byte su 162 programmi, ma i motivi di scarto erano dietro
+  // {$IFDEF DEBUG_SSA} e il PRIMO cancello - HasSimpleStructure - scartava in SILENZIO.
+  UD_Seen, UD_Struct, UD_Size, UD_NoIV, UD_Step, UD_Done: Integer;
+
 
 { TUnrollableLoop }
 
@@ -320,8 +328,10 @@ begin
   try
     GetLoopBlocks(Loop);
 
+    Inc(UD_Seen);
     if not HasSimpleStructure(Loop) then
     begin
+      Inc(UD_Struct);
       Loop.Free;
       Exit;
     end;
@@ -330,6 +340,7 @@ begin
 
     if Loop.BodyInstrCount > FMaxBodySize then
     begin
+      Inc(UD_Size);
       {$IFDEF DEBUG_SSA}
       WriteLn('[UNROLL] Skipping loop at ', Header.LabelName,
         ': body too large (', Loop.BodyInstrCount, ' > ', FMaxBodySize, ')');
@@ -342,6 +353,7 @@ begin
     Loop.IVInfo := FindInductionVariable(Loop);
     if not Loop.IVInfo.Found then
     begin
+      Inc(UD_NoIV);
       {$IFDEF DEBUG_SSA}
       WriteLn('[UNROLL] Skipping loop at ', Header.LabelName,
         ': could not identify induction variable');
@@ -353,6 +365,7 @@ begin
     // Only unroll loops with constant integer step
     if not Loop.IVInfo.StepIsConst then
     begin
+      Inc(UD_Step);
       {$IFDEF DEBUG_SSA}
       WriteLn('[UNROLL] Skipping loop at ', Header.LabelName,
         ': non-constant step');
@@ -494,6 +507,33 @@ begin
 
   // Strategy: Look for the pattern IV = IV + const in the latch block
   // This is the increment that happens at the end of each iteration
+  //
+  // ⛔⛔ QUI STA IL MOTIVO PER CUI QUESTO PASSO NON SROTOLA MAI (diagnosi 21 ago 2026).
+  // La condizione sotto pretende `Instr.Src2.Kind = svkConstInt`, cioe' il passo come OPERANDO
+  // COSTANTE IMMEDIATO. Ma la generazione SSA MATERIALIZZA le costanti in un REGISTRO prima di
+  // usarle - la forma che emettiamo e':
+  //     LoadConstInt R116, 1
+  //     AddInt       R116, R116, R70
+  // quindi Src2 e' un REGISTRO che contiene 1, non un svkConstInt, e il confronto fallisce.
+  //
+  // 📊 Misurato con UNROLL_DIAG=1 (la strumentazione qui sotto): su quattro programmi pieni di
+  // cicli, 26 candidati su 35 vengono scartati proprio qui.
+  //     mandelbrot     8 esaminati -> 7 senza indice
+  //     spectral-norm 18 esaminati -> 15 senza indice
+  //     sieve          4 esaminati -> 2 senza indice
+  //     n-body         5 esaminati -> 2 senza indice (3 scartati per dimensione)
+  // Nessuno scartato per "passo non costante": non ci si arriva nemmeno.
+  //
+  // ⭐ LA CORREZIONE, per chi la fa: risolvere UN livello, accettando un registro la cui
+  // definizione e' un ssaLoadConstInt - esattamente cio' che SedaiAlgebraic.IsZero fa gia' per
+  // riconoscere lo zero attraverso un registro. Il valore del passo si legge da li'.
+  // ⛔ NON e' una modifica piccola nei suoi EFFETTI: accende una trasformazione DORMIENTE su
+  // centinaia di cicli del corpus. Va fatta con la rete differenziale completa (opt vs --no-opt),
+  // AOT e JIT, e misurata - uno srotolamento che allunga il codice senza far guadagnare tempo e'
+  // un peggioramento, non un pareggio.
+  //
+  // E' la stessa forma di CONST_PROP, che cerca ssaStoreVar/ssaLoadVar che l'SSA non emette piu':
+  // un matcher scritto per una rappresentazione che l'IR ha smesso di produrre.
 
   Block := Loop.Latch;
   for j := 0 to Block.Instructions.Count - 1 do
@@ -714,6 +754,7 @@ var
   Loop: TUnrollableLoop;
 begin
   FUnrolledCount := 0;
+  UD_Seen := 0; UD_Struct := 0; UD_Size := 0; UD_NoIV := 0; UD_Step := 0; UD_Done := 0;
 
   BuildDominatorMap;
 
@@ -749,6 +790,11 @@ begin
   finally
     Loops.Free;
   end;
+  if GetEnvironmentVariable('UNROLL_DIAG') = '1' then
+    WriteLn(ErrOutput, '[UNROLL] esaminati=', UD_Seen,
+            '  scartati: struttura=', UD_Struct, ' dimensione=', UD_Size,
+            ' senza-indice=', UD_NoIV, ' passo-non-costante=', UD_Step,
+            '  SROTOLATI=', FUnrolledCount);
 end;
 
 function RunLoopUnrolling(Prog: TSSAProgram): Integer;

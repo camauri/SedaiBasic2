@@ -245,6 +245,21 @@ type
     // the on-file bytecode and TBytecodeInstruction.OpCode are left untouched (format unchanged).
     FDenseOps: array of Word;
     FDenseOpsFor: TBytecodeProgram;   // the program FDenseOps was built for (rebuild guard)
+    // ⛔ MISURATO E RESPINTO (21 ago 2026). Il profilo diceva che AotCallSub spende il 3,8% in
+    // GetInstructionCount + GetInstructionsPtr, due metodi di un'altra unita' chiamati A OGNI
+    // RITORNO per decidere se il PC restituito e' un bcReturnSub. Metterli in due CAMPI della VM,
+    // riempiti una volta per programma, sembrava gratis.
+    // 📊 A/B alternato su un binario solo, macchina fredda, con fannkuch come controllo:
+    //     binary-trees N=18   metodi 4050 -> campi 4128 ms   +1,9%
+    //                         metodi 4023 -> campi 4214 ms   +4,7%
+    //     fannkuch     N=11   2023 / 2026 / 2023             piatto, come deve essere
+    // Le due coppie concordano: i campi sono PIU' LENTI. Spiegazione plausibile: i campi nuovi
+    // cadevano in una zona fredda dell'oggetto, quindi ogni ritorno toccava una RIGA DI CACHE in
+    // piu', mentre le due chiamate a metodo leggono campi gia' caldi. Il controllo non si muove,
+    // quindi l'effetto e' reale e sta sul percorso di chiamata.
+    // ⛔ Non ritentarlo senza misurare: se un giorno serve, va provato mettendo i campi ACCANTO a
+    // quelli che il percorso di ritorno tocca gia', non in fondo all'oggetto.
+
     {$IFDEF HOT_C}
     FHotOp: array of Word;            // per PC: 1 + the C arm that runs it, 0 = not the C loop's
     FHotOpBase: array of Word;        // ...before the run-wide gate is folded in
