@@ -728,16 +728,12 @@ begin
   end;
 end;
 
-{ Packed map keys. TIV mirrors LICMRegMatches (bank + index + version); IV deliberately drops the
-  bank, mirroring IsDefinedOutsideLoop's historical index+version-only match. }
+{ The packed map key: bank + index + version, the same three fields LICMRegMatches compares. There
+  used to be a second, bank-dropping key next to this one; it is gone, and deliberately, so that a
+  register cannot be looked up by a name another bank also answers to. }
 function LICMKeyTIV(const V: TSSAValue): Int64; inline;
 begin
   Result := Int64(Ord(V.RegType)) or (Int64(V.RegIndex) shl 2) or (Int64(V.Version) shl 32);
-end;
-
-function LICMKeyIV(const V: TSSAValue): Int64; inline;
-begin
-  Result := Int64(V.RegIndex) or (Int64(V.Version) shl 32);
 end;
 
 function TLoopInvariantCodeMotion.IsArrayModifiedInLoop(ArrayIndex: Integer; Loop: TLoopInfo): Boolean;
@@ -800,10 +796,10 @@ begin
   end;
 
   // For registers, look up the first defining block (precomputed by BuildLoopMaps; the key
-  // matches RegIndex AND Version - historically bank-blind, kept that way).
+  // matches BANK, RegIndex and Version - see the note where the map is filled).
   if Val.Kind = svkRegister then
   begin
-    if FFirstDefIV.TryGetValue(LICMKeyIV(Val), Block) then
+    if FFirstDefIV.TryGetValue(LICMKeyTIV(Val), Block) then
       Exit(not Loop.ContainsBlock(Block));
 
     // CRITICAL FIX: Definition not found = CONSERVATIVELY assume INSIDE loop
@@ -995,9 +991,18 @@ begin
       if Instr.OpCode = ssaThreadCreate then FProgramCreatesThreads := True;
       if Instr.Dest.Kind = svkRegister then
       begin
-        // First definition in program order decides IsDefinedOutsideLoop, exactly as the
-        // historical scan did (multi-def Version=0 names answer by their first def).
-        Key := LICMKeyIV(Instr.Dest);
+        // First definition in program order decides IsDefinedOutsideLoop (multi-def Version=0
+        // names answer by their first def).
+        //
+        // ⛔ The key carries the BANK. It used to drop it, faithfully to the linear scan this map
+        // replaced, and the three banks number their registers from 0 independently -- so int r5_v2,
+        // float r5_v2 and string r5_v2 all collided on one entry and the first one in program order
+        // took it. Two ways that goes wrong, pointing in opposite directions: the loser's lookup can
+        // find the WINNER's block and answer "defined outside the loop" for a value the loop
+        // redefines (a hoist that must not happen), or find nothing at all and answer conservatively
+        // (a hoist that could have happened). LICMRegMatches next door has always compared the bank;
+        // this is the same question and now gets the same key.
+        Key := LICMKeyTIV(Instr.Dest);
         if not FFirstDefIV.ContainsKey(Key) then
           FFirstDefIV.Add(Key, Block);
       end;
