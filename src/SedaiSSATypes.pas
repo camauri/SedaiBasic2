@@ -1704,7 +1704,11 @@ begin
       Bump(UseCount, Prod.Src3);
       for k := 0 to High(Prod.PhiSources) do
         Bump(UseCount, Prod.PhiSources[k].Value);
-      if Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+      // Every opcode that READS its Dest, not a hand-written three. DestIsPureDef is the derived
+      // list and it names ssaArrayStore (the value being stored), ssaStrMidAssignArr (the
+      // replacement text) and ssaStrAppendMapped as well - all of which reach this census with a
+      // STRING register in Dest. Counting only three left the other reads invisible.
+      if not DestIsPureDef(Prod.OpCode) then
         Bump(UseCount, Prod.Dest);
     end;
   end;
@@ -1839,7 +1843,12 @@ var
       K2 := KeyOf(P.PhiSources[q].Value);
       if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
     end;
-    if P.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+    // Every opcode that READS its Dest, from the derived list, not a hand-written three. The comment
+    // above is right and the list under it was not: ssaArrayStore carries the value being stored in
+    // Dest and ssaStrMidAssignArr the replacement text, so "a(0) = s" and "Mid(a(0),1,2) = s" are
+    // READS of s that this walk could not see - and this walk is what decides whether the VM may
+    // STEAL a buffer. Missing a read here calls a live value dead.
+    if not DestIsPureDef(P.OpCode) then
     begin
       K2 := KeyOf(P.Dest); if (K2 >= 0) and (K2 <= High(S)) then S[K2] := True;
     end;
@@ -1847,12 +1856,18 @@ var
 
 begin
   Result := 0;
-  // ⛔ DEFAULT OFF (STRDEADSRC=1 to enable), and the measurement says why. The mark is CORRECT -- it
-  // fires on 4 concatenations in reverse-complement -- but on its own it buys nothing, because the
-  // buffer it lets the VM steal is shared by THREE registers, not one: the copies that close the
-  // loop-carried PHI alias it, so the refcount is 3, the steal brings it to 2, and AppendString only
-  // grows in place at 1. It becomes useful the day those copies are coalesced away; until then it
-  // would only cost a liveness fixpoint at compile time.
+  // ⛔ DEFAULT OFF (STRDEADSRC=1 to enable), and the measurement says why. The mark is CORRECT, but on
+  // its own it buys nothing, because the buffer it lets the VM steal is shared by THREE registers,
+  // not one: the copies that close the loop-carried PHI alias it, so the refcount is 3, the steal
+  // brings it to 2, and AppendString only grows in place at 1. It becomes useful the day those copies
+  // are coalesced away; until then it would only cost a liveness fixpoint at compile time.
+  //
+  // ⭐ RE-MEASURED 20 Aug 2026, because a verdict that switches a pass off has a date on it and this
+  // one was written before the register merge and LICM work of that day. It still holds. Best of 5,
+  // STRDEADSRC set on BOTH arms so the wrapper costs the same: fasta +0.6%, regex-redux +1.4%,
+  // k-nucleotide +0.3% - noise, and if anything the wrong way. Marks fired: fasta 6, regex-redux 3,
+  // reverse-complement 0 (the "4 concatenations" the earlier note quoted were a different version of
+  // that .bas, and are not a figure to compare against today).
   if GetEnvironmentVariable('STRDEADSRC') <> '1' then Exit;
 
   MaxVer := 0;
@@ -1911,8 +1926,8 @@ begin
       begin
         Ins := TSSAInstruction(Blk.Instructions[i]);
         Key := KeyOf(Ins.Dest);
-        if (Key >= 0) and (Key < NSlots) and
-           not (Ins.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString]) then
+        // ...and only a REAL definition kills. Same derived list as MarkReads.
+        if (Key >= 0) and (Key < NSlots) and DestIsPureDef(Ins.OpCode) then
           LiveIn[Key] := False;
         MarkReads(Ins, LiveIn);
       end;
@@ -1945,8 +1960,7 @@ begin
         end;
       end;
       Key := KeyOf(Ins.Dest);
-      if (Key >= 0) and (Key < NSlots) and
-         not (Ins.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString]) then
+      if (Key >= 0) and (Key < NSlots) and DestIsPureDef(Ins.OpCode) then
         Live[Key] := False;
       MarkReads(Ins, Live);
     end;
@@ -2103,7 +2117,11 @@ begin
       BumpStr(UseCount, Prod.Src3);
       for k := 0 to High(Prod.PhiSources) do
         BumpStr(UseCount, Prod.PhiSources[k].Value);
-      if Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+      // Every opcode that READS its Dest, not a hand-written three. DestIsPureDef is the derived
+      // list and it names ssaArrayStore (the value being stored), ssaStrMidAssignArr (the
+      // replacement text) and ssaStrAppendMapped as well - all of which reach this census with a
+      // STRING register in Dest. Counting only three left the other reads invisible.
+      if not DestIsPureDef(Prod.OpCode) then
         BumpStr(UseCount, Prod.Dest);
       // Track integer definitions, so a length held in a register can still be recognised as 1.
       k2 := IntKey(Prod.Dest);
@@ -2660,7 +2678,11 @@ begin
         Bump(UseCount, Prod.PhiSources[k].Value);
       // An instruction that READS its own Dest (a store carrying the value there) counts as a use
       // too; treating it as a pure definition would let the fusion overwrite a live value.
-      if Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString] then
+      // Every opcode that READS its Dest, not a hand-written three. DestIsPureDef is the derived
+      // list and it names ssaArrayStore (the value being stored), ssaStrMidAssignArr (the
+      // replacement text) and ssaStrAppendMapped as well - all of which reach this census with a
+      // STRING register in Dest. Counting only three left the other reads invisible.
+      if not DestIsPureDef(Prod.OpCode) then
         Bump(UseCount, Prod.Dest);
     end;
   end;
@@ -2679,9 +2701,12 @@ begin
       // the append keeps growing another, so every emitted line contains all the previous ones.
       // (Costly to find: it only shows inside a PROCEDURE, and the INTERPRETER runs the same
       // bytecode correctly, which sends you looking at the AOT emitter instead of at this list.)
+      // DestIsPureDef subsumes both the ssaStrAppendMapped exclusion above and the three stores that
+      // used to be spelled out here: all of them READ their Dest, which is precisely what disqualifies
+      // a producer. It also covers ssaArrayStore and ssaStrMidAssignArr, which were never listed.
       if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.RegType = srtString) and
-         (Prod.OpCode <> ssaCopyString) and (Prod.OpCode <> ssaStrAppendMapped) and
-         not (Prod.OpCode in [ssaArrayStoreIndString, ssaRecordStoreString, ssaXferStoreString, ssaPhi]) then
+         (Prod.OpCode <> ssaCopyString) and (Prod.OpCode <> ssaPhi) and
+         DestIsPureDef(Prod.OpCode) then
         T := KeyOf(Prod.Dest);
       if (T >= 0) and (T <= High(DefCount)) and
          ((DefCount[T] <> 1) or (UseCount[T] <> 1)) then
