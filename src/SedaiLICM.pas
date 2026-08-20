@@ -1067,7 +1067,24 @@ begin
       // It went unnoticed because the only caller refused svkArrayRef loads outright; the moment
       // that refusal was lifted, a SHARED FOR counter (stepped in a register and republished to its
       // backing on every Next) hoisted its own read out of the loop and read a stale value.
-      if Instr.OpCode = ssaArrayStore then
+      //
+      // ⛔ AND THE THIRD SPELLING, found 20 Aug 2026. "MID$(s, i, 1) = c" on a SHARED scalar string
+      // is a STORE into the 1-element array that backs it, but it is spelled ssaStrMidAssignArr --
+      // deliberately, because loading the element into a register first is what made that write
+      // quadratic. It never reached this set, so a loop that filled a SHARED string byte by byte was
+      // told the array was untouched and the ArrayLoadString reading it back was hoisted out:
+      //
+      //   Dim Shared As String s : s = "AAAA"
+      //   For i = 1 To 4 : Mid(s, i, 1) = "B" : seen += s + " " : Next
+      //
+      // printed "AAAA AAAA AAAA AAAA" optimized against "BAAA BBAA BBBA BBBB" with --no-opt, and
+      // fbc agrees with --no-opt. Same class as the svkArrayRef omission above: an opcode that
+      // writes an array without being called a store.
+      //
+      // The ...Ind family (ssaArrayStoreIndString and friends) is NOT here and does not need to be:
+      // it addresses a UDT member array through a RUNTIME handle, and no Ind LOAD is hoistable, so
+      // nothing ever asks this set about one.
+      if (Instr.OpCode = ssaArrayStore) or (Instr.OpCode = ssaStrMidAssignArr) then
       begin
         if Instr.Src1.Kind = svkConstInt then
           FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True)
