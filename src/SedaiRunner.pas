@@ -124,6 +124,29 @@ uses
   SedaiPeephole, SedaiSuperinstructions,
   SedaiNopCompaction, SedaiRegisterCompaction;
 
+{ ⛔ PERCHE' ESISTE (20 ago 2026). I ventidue passi di ottimizzazione erano invocati come
+  `try SSAProgram.RunX; except end;` - un except NUDO. Se un passo sollevava un'eccezione:
+    - nessuno lo sapeva: niente messaggio, niente codice d'uscita, niente;
+    - il passo si fermava A META', lasciando l'IR in uno stato PARZIALE - meta' trasformazioni
+      applicate e meta' no, che non e' come non averlo eseguito;
+    - la compilazione proseguiva come se niente fosse.
+  Un audit sul corpus (162 programmi) ha trovato TRE passi che non cambiano un byte, e con
+  l'except nudo non era distinguibile «non trova niente» da «esplode alla prima istruzione».
+
+  Ora il fallimento PARLA. E OPT_STRICT=1 lo fa RILANCIARE, cosi' le reti possono pretendere che
+  nessun passo fallisca invece di misurarne solo il risultato finale. }
+procedure OptPassFailed(const PassName: string; E: Exception);
+begin
+  WriteLn(ErrOutput, '[OPT] il passo ', PassName, ' e'' FALLITO: ',
+          E.ClassName, ': ', E.Message,
+          ' - l''IR resta nello stato parziale in cui il passo si e'' interrotto');
+  Flush(ErrOutput);
+  if GetEnvironmentVariable('OPT_STRICT') = '1' then
+    raise Exception.CreateFmt('OPT_STRICT: il passo %s e'' fallito (%s: %s)',
+                              [PassName, E.ClassName, E.Message]);
+end;
+
+
 { Include optimization flags }
 {$I OptimizationFlags.inc}
 
@@ -379,9 +402,9 @@ begin
         // === SSA OPTIMIZATIONS ===
         {$IFNDEF DISABLE_DBE}
         {$IFNDEF DISABLE_SUB_INLINING}
-        try SSAProgram.RunSubInlining; except end;   // unification: before everything
+        try SSAProgram.RunSubInlining; except on E: Exception do OptPassFailed('SubInlining', E); end;   // unification: before everything
         {$ENDIF}
-        try SSAProgram.RunDBE; except end;
+        try SSAProgram.RunDBE; except on E: Exception do OptPassFailed('DBE', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_DOMINATOR_TREE}
@@ -411,39 +434,39 @@ begin
         // GVN or CSE
         {$IFNDEF DISABLE_GVN}
         {$IFDEF DISABLE_CSE}
-        try SSAProgram.RunGVN; except end;
+        try SSAProgram.RunGVN; except on E: Exception do OptPassFailed('GVN', E); end;
         {$ENDIF}
         {$ENDIF}
 
         {$IFNDEF DISABLE_CSE}
         {$IFDEF DISABLE_GVN}
-        try SSAProgram.RunCSE; except end;
+        try SSAProgram.RunCSE; except on E: Exception do OptPassFailed('CSE', E); end;
         {$ENDIF}
         {$ENDIF}
 
         // Other optimizations
         {$IFNDEF DISABLE_ALGEBRAIC}
-        try SSAProgram.RunAlgebraic; except end;
+        try SSAProgram.RunAlgebraic; except on E: Exception do OptPassFailed('Algebraic', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_STRENGTH_RED}
-        try SSAProgram.RunStrengthReduction; except end;
+        try SSAProgram.RunStrengthReduction; except on E: Exception do OptPassFailed('StrengthReduction', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_GOSUB_INLINE}
-        try SSAProgram.RunGosubInlining; except end;
+        try SSAProgram.RunGosubInlining; except on E: Exception do OptPassFailed('GosubInlining', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_CONST_PROP}
-        try SSAProgram.RunConstProp; except end;
+        try SSAProgram.RunConstProp; except on E: Exception do OptPassFailed('ConstProp', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_COPY_PROP}
-        try SSAProgram.RunCopyProp; except end;
+        try SSAProgram.RunCopyProp; except on E: Exception do OptPassFailed('CopyProp', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_LICM}
-        try SSAProgram.RunLICM; except end;
+        try SSAProgram.RunLICM; except on E: Exception do OptPassFailed('LICM', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_LOOP_UNROLL}
@@ -456,12 +479,12 @@ begin
         {$ENDIF}
 
         {$IFNDEF DISABLE_DCE}
-        try SSAProgram.RunDCE; except end;
+        try SSAProgram.RunDCE; except on E: Exception do OptPassFailed('DCE', E); end;
         {$ENDIF}
 
         // B4 bounds-check elimination hints (after DCE, before PHI elimination)
         {$IFNDEF DISABLE_RANGE_ANALYSIS}
-        try SSAProgram.RunRangeAnalysis; except end;
+        try SSAProgram.RunRangeAnalysis; except on E: Exception do OptPassFailed('RangeAnalysis', E); end;
         {$ENDIF}
 
         // PHI Elimination
@@ -481,7 +504,7 @@ begin
 
         // Copy Coalescing
         {$IFNDEF DISABLE_COPY_COAL}
-        try SSAProgram.RunCopyCoalescing; except end;
+        try SSAProgram.RunCopyCoalescing; except on E: Exception do OptPassFailed('CopyCoalescing', E); end;
         {$ENDIF}
 
         // String temp fusion: let a string primitive write straight into its destination register.
@@ -491,11 +514,11 @@ begin
         // exactly one definition and one use. STRFUSE=0 turns it off.
         if GetEnvironmentVariable('STRFUSE') <> '0' then
         begin
-          try SSAProgram.RunStringTempFusion; except end;
-          try SSAProgram.RunAscMidFusion; except end;
-          try SSAProgram.RunStringTempFusion; except end;
-          try SSAProgram.RunConcatCharFusion; except end;
-          try SSAProgram.RunConcatDeadSourceMark; except end;
+          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end;
+          try SSAProgram.RunAscMidFusion; except on E: Exception do OptPassFailed('AscMidFusion', E); end;
+          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end;
+          try SSAProgram.RunConcatCharFusion; except on E: Exception do OptPassFailed('ConcatCharFusion', E); end;
+          try SSAProgram.RunConcatDeadSourceMark; except on E: Exception do OptPassFailed('ConcatDeadSourceMark', E); end;
         end;
 
         // Register Allocation
@@ -539,18 +562,18 @@ begin
 
           // === BYTECODE OPTIMIZATIONS ===
           {$IFNDEF DISABLE_PEEPHOLE}
-          try RunPeephole(Result); except end;
+          try RunPeephole(Result); except on E: Exception do OptPassFailed('Peephole', E); end;
           {$ENDIF}
 
           {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
           // The engine gate lives inside RunSuperinstructions - four callers, one place.
           if not FSkipSuperinstructions then
-            try RunSuperinstructions(Result); except end;
+            try RunSuperinstructions(Result); except on E: Exception do OptPassFailed('Superinstructions', E); end;
           {$ENDIF}
 
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_NOP_COMPACTION}
-          try RunNopCompaction(Result); except end;
+          try RunNopCompaction(Result); except on E: Exception do OptPassFailed('NopCompaction', E); end;
           {$ENDIF}
           {$ENDIF}
 
@@ -570,7 +593,7 @@ begin
           // Register Compaction
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_REG_COMPACTION}
-          try RunRegisterCompaction(Result); except end;
+          try RunRegisterCompaction(Result); except on E: Exception do OptPassFailed('RegisterCompaction', E); end;
           {$ENDIF}
           {$ENDIF}
 

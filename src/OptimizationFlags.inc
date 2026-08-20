@@ -147,11 +147,24 @@
 // the regression corpus, but it is left OFF: on the current line-per-block CFG it
 // finds little, and the array loop-idiom superinstructions already capture the wins.
 //
-// Re-evaluated with fresh data 2026-06-20 (DISABLE_CSE on -> GVN runs): the produced
-// bytecode was BYTE-IDENTICAL to GVN-off on every benchmark (n-body 485, fannkuch 81,
-// spectral-norm 158, sieve 87, sieve_int 77) and the corpus differential stayed 47/47,
-// 0 OPTDIFF. So GVN is correct but yields ZERO reduction here -- enabling it only adds
-// compile-time work. Left OFF until the CFG/pipeline rework that would make it pay off.
+// ⛔ IL VERDETTO DEL 20 GIUGNO 2026 E' FALSO. Diceva: «il bytecode prodotto era BYTE-IDENTICAL
+// a GVN-off su ogni banco (n-body 485, fannkuch 81, spectral-norm 158, sieve 87, sieve_int 77)
+// ... GVN e' corretto ma qui produce ZERO riduzione». Era misurato su CINQUE programmi.
+// Rimisurato il 20 ago 2026 su 162 (bas/07_benchmarks + 01_language + rosetta), contando le
+// ISTRUZIONI EMESSE e non le righe di diff:
+//     GVN acceso   34 590 istruzioni
+//     GVN spento   39 498 istruzioni
+//     GVN ne toglie 4 908, il 14,19%, e cambia il bytecode di 152 programmi su 162.
+// E' il passo che toglie piu' codice di tutta la pipeline. NON e' inerte e non va spento.
+//
+// ⭐ La lezione, che vale oltre GVN: un verdetto di costo misurato su cinque programmi non e' un
+// verdetto sul corpus. Questo era onesto quando scritto e falso di un settimo del codice generato
+// due mesi dopo, e nel frattempo invitava per iscritto a lasciare spento il passo piu' produttivo.
+//
+// ⛔ E l'audit che l'ha scoperto ha trovato anche TRE passi che non cambiano un byte su 162
+// programmi: CONST_PROP (cerca ssaStoreVar/ssaLoadVar, che la generazione SSA non emette PIU' -
+// obsoleto, non ridondante), LOOP_UNROLL e PEEPHOLE_PASS2. ALGEBRAIC ne tocca 3 su 162.
+// Strumento: job/tests/tools/opt_audit.sh - spegne un passo alla volta e confronta il corpus.
 // To toggle:
 //   - GVN on:  uncomment {$DEFINE DISABLE_CSE} below.
 //   - CSE on:  define DISABLE_GVN instead.
