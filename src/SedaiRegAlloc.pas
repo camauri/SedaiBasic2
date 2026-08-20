@@ -743,46 +743,8 @@ begin
   end;
 end;
 
-function DestIsPureDef(Op: TSSAOpCode): Boolean;
-// Does this opcode's Dest field WRITE a value and never read one?
-//
-// It is not a rhetorical question: several opcodes carry an INPUT in Dest (the graphics family puts
-// a coordinate there, ssaArrayStore the value being stored) and several read the incoming value
-// before overwriting it (bcGetBinStr reads Len(dest) to know how many bytes to read -- the very op
-// this session touched). Treating those as definitions would let liveness end a value that is still
-// needed, and the merge would then hand its register to somebody else. Silently.
-//
-// So the list is DERIVED, never eyeballed -- the same rule C4's helper deny-list follows. Regenerate
-// with, from the repository root:
-//
-//   awk '/^    [0-9]+: *\/\/ *bc[A-Za-z0-9_]+/ { match($0,/bc[A-Za-z0-9_]+/); cur=substr($0,RSTART,RLENGTH) }
-//        /Regs\[Instr\.Dest\]/ { l=$0
-//          if (l ~ /Regs\[Instr\.Dest\] *:=/) { r=l; sub(/.*Regs\[Instr\.Dest\] *:=/,"",r); if (r !~ /Regs\[Instr\.Dest\]/) next }
-//          if (l ~ /WriteLn|StdErr/) next; if (cur != "") print cur }' src/SedaiBytecodeVM.pas | sort -u
-//
-// then map each bytecode name back through the "ssaX: Result := bcY" table in SedaiBytecodeCompiler.
-// For every opcode below, Dest is treated as a pure USE: correct when it is an input, and merely
-// conservative (a longer live range) when it is a read-modify-write.
-//
-// The "To"/"Self" accumulator superinstructions (bcAddIntTo, bcMulFloatTo, ...) do read their Dest
-// but never appear here: the bytecode peephole fuses them AFTER register allocation, out of reach
-// of this analysis.
-begin
-  case Op of
-    ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
-    // ssaStrAppendMapped APPENDS to its Dest, so the incoming value is an input: treating Dest as a
-    // pure definition would let liveness end the accumulator that the instruction is about to grow.
-    ssaStrAppendMapped,
-    ssaGetBinStr, ssaStrInstr, ssaPrintFile, ssaSetColor,
-    ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicGShape, ssaGraphicPaint,
-    ssaGraphicScale, ssaGraphicWindow, ssaGfxCircleEx, ssaGfxLineStyled,
-    ssaMovsprAbs, ssaMovsprAuto, ssaMovsprPolar, ssaMovsprRel,
-    ssaSprite, ssaSprsize, ssaSoundSound, ssaSoundFilter:
-      Result := False;
-  else
-    Result := True;
-  end;
-end;
+{ Moved to SedaiSSATypes: SedaiDCE has to agree with this pass about which opcodes carry an
+  INPUT in Dest, and while the list lived here it did not know. }
 
 function TLinearScanAllocator.ComputeReuseColouring(Map: specialize TDictionary<Int64, Integer>; Report: Boolean): Boolean;
 // Liveness over the CFG + interference graph + greedy colouring, per bank. Reports how many VM

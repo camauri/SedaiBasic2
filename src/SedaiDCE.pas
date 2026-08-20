@@ -219,7 +219,14 @@ begin
     begin
       Instr := Block.Instructions[j];
 
-      // If this instruction defines a register, record its location
+      // If this instruction defines a register, record its location.
+      //
+      // ⛔ EVERY Dest register is recorded, including the ones DestIsPureDef calls impure. Gating
+      // this on DestIsPureDef was tried on 20 Aug 2026 and the differential arm rejected it
+      // immediately - 12 programs, 12 OPTDIFF. The reason is that "not a pure definition" means
+      // "it READS Dest", which is not the same as "it does not WRITE it": ssaStrAppendMapped and
+      // ssaGetBinStr read the incoming value AND leave a new one, so they are real definitions too,
+      // and dropping them left their register with no definition at all in this map.
       if Instr.Dest.Kind = svkRegister then
       begin
         DefLoc.BlockIdx := i;
@@ -330,7 +337,13 @@ begin
       Result := True;
 
     // Memory operations - always live (may affect program state)
-    ssaStoreVar, ssaArrayStore, ssaArrayDim,
+    ssaStoreVar, ssaArrayStore,
+    // "MID$(arr(i), start) = src" writes into array storage and returns nothing. It was not
+    // here, and survived only because BuildDefMap recorded its Dest - the REPLACEMENT TEXT,
+    // a use - as a definition, collided with the real one and tripped the duplicate-definition
+    // net below, which marks both live. Correct by accident. Named now.
+    ssaStrMidAssignArr,
+    ssaArrayDim,
     ssaArrayErase, ssaArrayRedim,  // B1.4: mutate array storage in place
     ssaArrayRedimPush, ssaArrayRedimN,  // REDIM multi-dim (mutate array storage)
     ssaArrayIdxPush, ssaArrayIdxResolve,  // runtime multi-dim index (mutate the pending-index accumulator)
@@ -548,6 +561,17 @@ begin
     else
     begin
       { Regular instruction: mark all register operands' definitions as live }
+
+      // ⛔ Dest first, and only for the opcodes that READ it. ssaArrayStore carries the VALUE BEING
+      // STORED in Dest, ssaStrMidAssignArr the replacement text, the graphics family a coordinate -
+      // DestIsPureDef in SedaiSSATypes is the derived list. This walk used to mark Src1..Src3 and
+      // stop, so the instruction COMPUTING a stored value was never reached from the store. It
+      // stayed alive anyway, because BuildDefMap had recorded the store's Dest as a second
+      // definition of that register and the duplicate-definition net marks both live - so the
+      // liveness was right by accident, and would have stopped being right the moment that net was
+      // tightened.
+      if (Instr.Dest.Kind = svkRegister) and (not DestIsPureDef(Instr.OpCode)) then
+        EnqueueDefiningInstruction(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
 
       if Instr.Src1.Kind = svkRegister then
         EnqueueDefiningInstruction(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);

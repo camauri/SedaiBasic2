@@ -782,6 +782,12 @@ function MakeSSAVariable(const VarName: string): TSSAValue;
 function MakeSSALabel(const LabelName: string): TSSAValue;
 function MakeSSAArrayRef(ArrayIdx: Integer; ElementType: TSSARegisterType): TSSAValue;
 function SSAValueToString(const Value: TSSAValue): string;
+{ Does this opcode's Dest field WRITE a value and never read one? Lives here, not in a pass,
+  because more than one pass has to agree on the answer: the register merge in SedaiRegAlloc
+  and the liveness walk in SedaiDCE both ask it, and when only one of them knew, an opcode
+  whose Dest is an INPUT was read as a definition. }
+function DestIsPureDef(Op: TSSAOpCode): Boolean;
+
 function SSAOpCodeToString(OpCode: TSSAOpCode): string;
 function SSARegisterTypeToString(RegType: TSSARegisterType): string;
 // Membership test over an open array of opcodes. Replaces `Op in [..]`: TSSAOpCode now has
@@ -804,11 +810,60 @@ function BitRotr(V, Count: Int64; Width: Int64): Int64;
 
 implementation
 
+
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
      SedaiAlgebraic, SedaiStrengthReduction, SedaiIndexReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
      SedaiSubInlining
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
+
+function DestIsPureDef(Op: TSSAOpCode): Boolean;
+// Does this opcode's Dest field WRITE a value and never read one?
+//
+// It is not a rhetorical question: several opcodes carry an INPUT in Dest (the graphics family puts
+// a coordinate there, ssaArrayStore the value being stored) and several read the incoming value
+// before overwriting it (bcGetBinStr reads Len(dest) to know how many bytes to read -- the very op
+// this session touched). Treating those as definitions would let liveness end a value that is still
+// needed, and the merge would then hand its register to somebody else. Silently.
+//
+// So the list is DERIVED, never eyeballed -- the same rule C4's helper deny-list follows. Regenerate
+// with, from the repository root:
+//
+//   awk '/^    [0-9]+: *\/\/ *bc[A-Za-z0-9_]+/ { match($0,/bc[A-Za-z0-9_]+/); cur=substr($0,RSTART,RLENGTH) }
+//        /Regs\[Instr\.Dest\]/ { l=$0
+//          if (l ~ /Regs\[Instr\.Dest\] *:=/) { r=l; sub(/.*Regs\[Instr\.Dest\] *:=/,"",r); if (r !~ /Regs\[Instr\.Dest\]/) next }
+//          if (l ~ /WriteLn|StdErr/) next; if (cur != "") print cur }' src/SedaiBytecodeVM.pas | sort -u
+//
+// then map each bytecode name back through the "ssaX: Result := bcY" table in SedaiBytecodeCompiler.
+// For every opcode below, Dest is treated as a pure USE: correct when it is an input, and merely
+// conservative (a longer live range) when it is a read-modify-write.
+//
+// The "To"/"Self" accumulator superinstructions (bcAddIntTo, bcMulFloatTo, ...) do read their Dest
+// but never appear here: the bytecode peephole fuses them AFTER register allocation, out of reach
+// of this analysis.
+begin
+  case Op of
+    ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat, ssaArrayStoreIndString,
+    // ssaStrMidAssignArr - "MID$(arr(i), start) = src" - carries the REPLACEMENT TEXT in Dest and
+    // writes no register at all. Missing here until 20 Aug 2026, which let two passes read that use
+    // as a definition: the merge could end the replacement's live range at the instruction that
+    // consumes it, and DCE recorded a second definition of a register that already had one, tripped
+    // its own SSA-corruption net, and kept both alive - correct by accident rather than by rule.
+    ssaStrMidAssignArr,
+    // ssaStrAppendMapped APPENDS to its Dest, so the incoming value is an input: treating Dest as a
+    // pure definition would let liveness end the accumulator that the instruction is about to grow.
+    ssaStrAppendMapped,
+    ssaGetBinStr, ssaStrInstr, ssaPrintFile, ssaSetColor,
+    ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicGShape, ssaGraphicPaint,
+    ssaGraphicScale, ssaGraphicWindow, ssaGfxCircleEx, ssaGfxLineStyled,
+    ssaMovsprAbs, ssaMovsprAuto, ssaMovsprPolar, ssaMovsprRel,
+    ssaSprite, ssaSprsize, ssaSoundSound, ssaSoundFilter:
+      Result := False;
+  else
+    Result := True;
+  end;
+end;
+
 
 constructor TSSAInstruction.Create(AOpCode: TSSAOpCode);
 begin
