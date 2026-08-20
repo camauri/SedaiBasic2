@@ -10603,48 +10603,30 @@ end;
 
 procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
 // FreeBASIC "s[i] = c" on a scalar STRING: set the byte at 0-based index i to character code c.
-// Lowered to s = LEFT$(s, i) + CHR$(c) + MID$(s, i+2, LEN(s)), landing in a named temp string var,
-// then written back through the existing assignment machinery. No new opcode.
+//
+// It IS the MID statement: "MID$(s, i + 1, 1) = CHR$(c)" overwrites exactly that one byte and
+// nothing else. So it is lowered to that statement and inherits BOTH in-place paths MID$ already
+// has - ssaStrMidAssignArr when the target is an array element or a SHARED scalar, ssaStrMidAssign
+// when it is a plain register variable.
+//
+// ⛔ It used to rebuild the string instead: "s = LEFT$(s,i) + CHR$(c) + MID$(s,i+2,LEN(s))". Same
+// bytes, but a copy of the WHOLE string on every byte, so filling a buffer one character at a time
+// was QUADRATIC - measured 20 Aug 2026, a 400,000-byte fill took 17.0 s where the identical fill
+// written as MID$ took 37 ms. That is the same defect the MID statement was cured of the day before
+// (see the fast paths in ProcessMidStatement); this writing had simply never been routed there.
 var
-  SVal, IdxVal, ValVal, SReg, IdxReg, ValReg: TSSAValue;
-  PrefixReg, ChrReg, TwoReg, SufStartReg, LenSReg, SufReg, R1Reg, ResultReg: TSSAValue;
-  NoneV: TSSAValue;
-  TmpName: string;
-  AsnNode, TmpRef: TASTNode;
+  MidNode, ArgsNode: TASTNode;
 begin
-  NoneV := MakeSSAValue(svkNone);
-  ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
-  ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
-  ProcessExpression(ValNode, ValVal); ValReg := EnsureIntRegister(ValVal);
-  // prefix = LEFT$(s, i)   (the first i bytes, before the target)
-  PrefixReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrLeft, PrefixReg, SReg, IdxReg, NoneV);
-  // chr = CHR$(c)
-  ChrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrChr, ChrReg, ValReg, NoneV, NoneV);
-  // suffix = MID$(s, i+2, LEN(s))   (the rest, after the replaced byte)
-  TwoReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaLoadConstInt, TwoReg, MakeSSAConstInt(2), NoneV, NoneV);
-  SufStartReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaAddInt, SufStartReg, IdxReg, TwoReg, NoneV);
-  LenSReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaStrLen, LenSReg, SReg, NoneV, NoneV);
-  SufReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrMid, SufReg, SReg, SufStartReg, LenSReg);
-  // result = prefix + chr + suffix, into a named temp so it can be assigned back to the target lvalue.
-  TmpName := '__IDX' + IntToStr(FSwapTempSeq) + '$';
-  Inc(FSwapTempSeq);
-  ResultReg := GetOrAllocateVariable(TmpName);
-  R1Reg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrConcat, R1Reg, PrefixReg, ChrReg, NoneV);
-  EmitInstruction(ssaStrConcat, ResultReg, R1Reg, SufReg, NoneV);
-  // s = result
-  AsnNode := TASTNode.Create(antAssignment, Tok);
-  AsnNode.AddChild(SNode.Clone);
-  TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Tok);
-  AsnNode.AddChild(TmpRef);
-  ProcessAssignment(AsnNode);
-  AsnNode.Free;
+  MidNode := TASTNode.Create(antMidStatement, Tok);
+  MidNode.AddChild(SNode.Clone);                                        // target
+  MidNode.AddChild(CreateBinaryOpNode(ttOpAdd, IdxNode.Clone,           // start = i + 1 (MID$ is 1-based)
+                                      TASTNode.CreateWithValue(antLiteral, 1, Tok), Tok));
+  ArgsNode := TASTNode.Create(antArgumentList, Tok);                    // ...the $-suffixed name is the
+  ArgsNode.AddChild(ValNode.Clone);                                     // one the lowering dispatches on
+  MidNode.AddChild(CreateFunctionCallNode(kCHRS, ArgsNode, Tok));       // source = CHR$(c), one byte, so
+                                                                        // no length child is needed
+  ProcessMidStatement(MidNode);
+  MidNode.Free;
 end;
 
 function TSSAGenerator.TryLRSetRecord(DstNode, SrcNode: TASTNode): Boolean;
