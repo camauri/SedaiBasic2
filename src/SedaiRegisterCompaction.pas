@@ -463,9 +463,15 @@ begin
     // bcStrMid/bcStrMidW: Immediate contains length register index (int)
     // MID$(str, start, length) - start is Src2, length is in Immediate
     // bcStrConcatCharAt: same convention - Immediate is the INDEX register (int).
+    // bcStrMidAssignArr carries the START register there too - it is the SHARED/array form of the
+    // same statement - and it was missing from both this mark and the remap below. Found 20 Aug 2026
+    // by diffing this pass against ImmediateReadsIntReg in SedaiOpcodeBanks, whose own comment claims
+    // the two lists are the same set; that claim was false by exactly this one opcode. Left out, the
+    // start register can be left out of the used set and the Immediate can keep pointing at a
+    // pre-compaction number.
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or (OpCode = bcStrAscMid) or
        (OpCode = bcStrConcatCharAt) or (OpCode = bcStrAppendMapped) or
-       (OpCode = bcStrMidAssign) then
+       (OpCode = bcStrMidAssign) or (OpCode = bcStrMidAssignArr) then
       MarkIntRegUsed(Instr.Immediate and $FFFF);
 
     // bcDateSerial/bcTimeSerial: Immediate contains the 3rd arg (day/second) register index (int)
@@ -1109,6 +1115,7 @@ begin
     if (OpCode = bcStrMid) or (OpCode = bcStrMidW) or (OpCode = bcStrAscMid) or
        (OpCode = bcStrConcatCharAt) or (OpCode = bcStrAppendMapped) or
        (OpCode = bcStrMidAssign) or                                      // Immediate = the START register (int)
+       (OpCode = bcStrMidAssignArr) or                                   // ...and its SHARED/array form
        (OpCode = bcDateSerial) or (OpCode = bcTimeSerial) or
        (OpCode = bcRawMemCopy) or (OpCode = bcRawMemMove) or (OpCode = bcRawClear) or
        (OpCode = bcPutBinMem) or (OpCode = bcGetBinMem) or   // PUT/GET #n, , *p, n: byte-count register
