@@ -103,6 +103,8 @@ function ReadsStringReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolea
   cannot see - so trusting it here is exactly as safe as register compaction already is. Keep the two
   in step: an opcode that starts packing a register into Immediate must be added in BOTH places until
   the compactor's own copies move here. }
+function OpCarriesJumpTarget(OpCode: Word): Boolean;
+
 function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
 
 implementation
@@ -1025,6 +1027,48 @@ begin
     // bcStrMidAssignArr never writes a register at all: its Dest is the REPLACEMENT text and the
     // result goes into the array element. Dest is purely an input.
     bcStrAppendMapped, bcStrMidAssign, bcStrMidAssignArr:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function OpCarriesJumpTarget(OpCode: Word): Boolean;
+// Does this opcode's Immediate name an INSTRUCTION INDEX - a jump, call, handler entry or fused
+// branch target? Three passes need the answer and each used to answer for itself:
+//   SedaiNopCompaction  - to remap targets when instructions shift  (this list, the complete one)
+//   SedaiPeephole       - to refuse a rewrite whose second half is a target
+//   SedaiSuperinstructions - the same refusal, with an explicit case that named 14 fewer opcodes:
+//                            the STRING and UNSIGNED compare-and-branch families, the two
+//                            array-load-and-branch forms, and bcOnError / bcResumeLabel.
+// A pass that cannot see a target may fuse ONTO it, and the jump then lands after the fused pair.
+// Diffed and unified 20 Aug 2026; the peephole keeps its own extra blanket rule on top of this
+// (every Group-super Immediate), which over-reports and is the safe direction for a refusal.
+begin
+  // Check base bytecode jump instructions
+  case OpCode of
+    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall), Ord(bcCallSub),
+    // M5.2: bcLoadProcAddr's Immediate is a SUB entry PC; remap it when instructions shift, like a call target.
+    Ord(bcLoadProcAddr),
+    // FreeBASIC error handling: bcOnError / bcResumeLabel Immediate is a handler/target PC; remap on shift.
+    Ord(bcOnError), Ord(bcResumeLabel):
+      Result := True;
+    // Fused compare-and-branch (Int)
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
+      Result := True;
+    // Fused compare-and-branch (Float)
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat:
+      Result := True;
+    // Fused compare-zero-and-branch
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat:
+      Result := True;
+    // Fused loop increment-and-branch
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
+      Result := True;
+    // Array load and branch
+    bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ:
       Result := True;
   else
     Result := False;

@@ -43,7 +43,7 @@ unit SedaiNopCompaction;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeTypes;
+  Classes, SysUtils, SedaiBytecodeTypes, SedaiOpcodeBanks;
 
 type
   TNopCompactor = class
@@ -115,37 +115,8 @@ begin
   end;
 end;
 
-function IsJumpOrBranchOp(OpCode: Word): Boolean;
-begin
-  // Check base bytecode jump instructions
-  case OpCode of
-    Ord(bcJump), Ord(bcJumpIfZero), Ord(bcJumpIfNotZero), Ord(bcCall), Ord(bcCallSub),
-    // M5.2: bcLoadProcAddr's Immediate is a SUB entry PC; remap it when instructions shift, like a call target.
-    Ord(bcLoadProcAddr),
-    // FreeBASIC error handling: bcOnError / bcResumeLabel Immediate is a handler/target PC; remap on shift.
-    Ord(bcOnError), Ord(bcResumeLabel):
-      Result := True;
-    // Fused compare-and-branch (Int)
-    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
-    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
-    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
-      Result := True;
-    // Fused compare-and-branch (Float)
-    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat:
-      Result := True;
-    // Fused compare-zero-and-branch
-    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat:
-      Result := True;
-    // Fused loop increment-and-branch
-    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
-      Result := True;
-    // Array load and branch
-    bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ:
-      Result := True;
-  else
-    Result := False;
-  end;
-end;
+{ Moved to SedaiOpcodeBanks as OpCarriesJumpTarget: three passes need this answer and each had
+  written its own, with three different coverages. }
 
 procedure TNopCompactor.AdjustJumpTargets;
 var
@@ -158,7 +129,7 @@ begin
     Instr := FProgram.GetInstruction(i);
 
     // Check if this is a jump/branch instruction
-    if IsJumpOrBranchOp(Instr.OpCode) then
+    if OpCarriesJumpTarget(Instr.OpCode) then
     begin
       // Get the current jump target from Immediate field
       OldTarget := Instr.Immediate;

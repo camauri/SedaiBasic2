@@ -66,7 +66,7 @@ unit SedaiPeephole;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeTypes;
+  Classes, SysUtils, SedaiBytecodeTypes, SedaiOpcodeBanks;
 
 type
   TPeepholeOptimizer = class
@@ -137,14 +137,15 @@ begin
   begin
     Instr := FProgram.GetInstruction(i);
 
-    case TBytecodeOp(Instr.OpCode) of
-      bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub,
-      bcLoadProcAddr:   // M5.2: Immediate is a SUB entry PC (a worker enters there) → a block boundary
-      begin
-        Target := Instr.Immediate;
-        if (Target >= 0) and (Target < FProgram.GetInstructionCount) then
-          FJumpTargets[Target] := True;
-      end;
+    // ⛔ The SHARED list, not a local case. The local one named six core opcodes and left out
+    // bcOnError and bcResumeLabel, whose Immediate is a handler / RESUME target - so a handler's
+    // first instruction did not read as a jump target and could be rewritten into its predecessor.
+    // (The blanket rule below already covered the Group-super branches; this is the core half.)
+    if OpCarriesJumpTarget(Instr.OpCode) then
+    begin
+      Target := Instr.Immediate;
+      if (Target >= 0) and (Target < FProgram.GetInstructionCount) then
+        FJumpTargets[Target] := True;
     end;
 
     // Also check for superinstruction branch opcodes

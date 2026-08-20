@@ -151,45 +151,27 @@ begin
 end;
 
 function TSuperinstructionOptimizer.IsJumpTarget(Index: Integer): Boolean;
+// Is any instruction's Immediate this index?
+//
+// ⛔ This used to answer with two explicit cases - six core opcodes and nineteen Group-super ones -
+// and between them they left out FOURTEEN opcodes whose Immediate is a target: the STRING and the
+// UNSIGNED compare-and-branch families (added later and never added here), the two
+// array-load-and-branch forms, and bcOnError / bcResumeLabel. This test exists to REFUSE a fusion
+// whose second half is a jump target; a target it cannot see is a jump that lands after the fused
+// pair. One shared list now, in SedaiOpcodeBanks, which is also the one the NOP compactor uses to
+// remap those very targets.
 var
   i: Integer;
   Instr: TBytecodeInstruction;
 begin
-  // Check if any jump instruction targets this index
-  // Must handle both standard opcodes and superinstructions
   Result := False;
   for i := 0 to FProgram.GetInstructionCount - 1 do
   begin
     Instr := FProgram.GetInstruction(i);
-
-    // Check standard jump opcodes in Group 0 (Core)
-    if Instr.OpCode < bcGroupString then
+    if OpCarriesJumpTarget(Instr.OpCode) and (Instr.Immediate = Index) then
     begin
-      case Instr.OpCode of
-        bcJump, bcJumpIfZero, bcJumpIfNotZero, bcCall, bcCallSub,
-        bcLoadProcAddr:   // M5.2: Immediate is a SUB entry PC → a block boundary (worker entry)
-          if Instr.Immediate = Index then
-          begin
-            Result := True;
-            Exit;
-          end;
-      end;
-    end
-    // Check superinstruction branch opcodes (Group 200+)
-    else if Instr.OpCode >= bcGroupSuper then
-    begin
-      case Instr.OpCode of
-        bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
-        bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
-        bcBranchEqZeroInt, bcBranchNeZeroInt,
-        bcBranchEqZeroFloat, bcBranchNeZeroFloat,
-        bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
-          if Instr.Immediate = Index then
-          begin
-            Result := True;
-            Exit;
-          end;
-      end;
+      Result := True;
+      Exit;
     end;
   end;
 end;
