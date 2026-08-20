@@ -436,6 +436,12 @@ var
   GXferStrState: Integer = -1;     // C7 XferLoad/StoreString as leaf calls: -1 unread, 0 off, 1 on
   GPrintStrState: Integer = -1;    // C7b PrintString/Ln as a conditional leaf: -1 unread, 0 off, 1 on
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
+  GSharedRecLockFree: Boolean = True;  // the INTERPRETER resolves a shared handle without the lock
+  GAotRecNative: Boolean = True;   // AOT_RECDEOPT=1 restores the old deopt-to-interpreter path
+                                   // for shared-record fields (A/B knob, see AotRecAccess)
+                                       // (TBytecodeVM.FSharedRecLockFree, SHAREDREC_LOCK=1 turns it
+                                       // off). Mirrored here so compiled code takes the native path
+                                       // exactly when the interpreter's own read is lock-free.
   // A STRING array element can be reached natively (through AotStrAssign) only when an
   // out-of-range index cannot RAISE: the helper would throw across a compiled frame that is not
   // registered for unwinding. That is exactly AllowUnsafe (MODERN, no forced bounds check), which
@@ -3414,9 +3420,23 @@ var
     // version made intrec_fb 84% SLOWER than the helper it replaced, because every one of its four
     // per-iteration field accesses left to the interpreter.
     // Each shared record is its own heap block with a STABLE pointer; the VM's lock exists only to
-    // guard the array of those pointers while it GROWS. So this is safe without the lock precisely
-    // when no other thread can grow it - hence the whole-program "creates no thread" gate.
-    if GNoThreads then
+    // guard the array of those pointers while it GROWS - and GrowSharedRecords RETIRES the outgrown
+    // array instead of freeing it, so a reader is always reading live memory and a live handle's
+    // entry is valid in every array from the one current when the handle was issued onwards.
+    //
+    // That is the interpreter's OWN argument, written out at ResolveRec, where the per-access lock is
+    // gone by default (FSharedRecLockFree). So this path is not an extra exposure to reason about: it
+    // is the SAME unlocked read the interpreter already performs, and the condition to emit it is
+    // therefore the interpreter's condition, not a thread census. When SHAREDREC_LOCK=1 puts the
+    // interpreter's lock back, compiled code stands down with it and deopts here as before.
+    // AOT_RECDEOPT=1 forces the pre-20-Aug-2026 behaviour (leave to the interpreter) so the two
+    // can be compared in ONE binary. SHAREDREC_LOCK cannot do this job: it also puts the
+    // interpreter's own lock back, so it moves both sides at once and isolates nothing. Measured
+    // with it, binary-trees-modern-1t 18, three independent readings, output compared every run:
+    //   interpreter 14384 / 14278 / 14398 ms
+    //   native      11614 / 11482 / 11578 ms   -19.6% vs interpreter
+    //   deopt       15288 / 15195 / 15200 ms    +5.6% vs interpreter
+    if (GNoThreads or GSharedRecLockFree) and GAotRecNative then
     begin
       E.EmitBytes([$48, $0F, $BA, $F0, 62]);        // btr rax, 62  -> shared-region index
       E.MemOp([$49, $8B], RDX, R8, AOTCTX_VMSELF);  // rdx = the TBytecodeVM instance
@@ -7114,19 +7134,35 @@ var
 begin
   Result := nil;
   n := 0;
-  // Whole-program gate for the native SHARED-record path: without a second thread nothing can grow
-  // the shared-pointer array while compiled code indexes it, so the VM's lock is not needed there.
+  // Thread census for the native SHARED-record path. It is no longer the deciding condition - see
+  // GSharedRecLockFree below and the emit site in AotRecAccess - but it still stands on its own:
+  // without a second thread nothing can grow the shared-pointer array at all.
   //
-  // ⛔ MEASURED AND REJECTED (29 Jul 2026): lifting this gate is worth ZERO, do not retry it blind.
-  // Once the VM stopped freeing the outgrown pointer array the gate's original reason was gone, so
-  // the obvious next step was to drop it and let compiled code index the shared region even with
-  // threads about. On binary-trees -- whose MAKETREE/CHECKTREE/FREETREE regions ARE native, so the
-  // gate really did apply -- it measured -1.6% against a 1.2% null floor. Nothing.
-  // The reason is that removing the per-access LOCK (see ResolveRec) already made the deopt cheap:
-  // what dominates binary-trees now is AllocSharedRecord, four mallocs and a global lock per node.
-  // Revisit only once allocation is fixed and the benchmark is traversal-bound again -- and measure
-  // it then, because it buys cross-thread exposure in compiled code that nothing currently pays for.
+  // ⛔ THE 29 Jul 2026 VERDICT ON THIS GATE IS DEAD. It read "lifting this gate is worth ZERO, do
+  // not retry it blind: -1.6% against a 1.2% null floor on binary-trees", and its own closing line
+  // said to revisit "once the benchmark is traversal-bound again". It is, and the number inverted:
+  //
+  //     binary-trees-modern-1t 18, best of 3      interpreter  14384 ms
+  //       gate closed (the state that verdict describes)   AOT  15288 ms   +6.3% SLOWER than interp
+  //       gate open                                        AOT  11614 ms  -19.3% vs interp, -24% vs closed
+  //
+  // What changed is not the gate, it is what the gate was hiding behind. In July the C hot loop was
+  // switched OFF for the whole program whenever --aot was passed (fixed 20 Aug 2026), so the closed
+  // gate's cost was measured against an interpreter that was itself crippled. With that repaired the
+  // deopt is the dominant term: an ExitTo abandons the WHOLE REGION, so MAKETREE / CHECKTREE /
+  // FREETREE compiled, entered, left at their first field access and ran interpreted anyway - 1.6% of
+  // samples inside AOT code against 23.4% in RunFast, while still paying to enter and leave.
+  //
+  // ⛔ And the lesson under the lesson: a cost verdict has a DATE on it. This one was honest when
+  // written and false eight weeks later, because a defect somewhere else was inside the measurement.
   GNoThreads := True;
+  // The condition compiled code actually answers to. Not a thread census: the interpreter's own
+  // resolve of a shared handle is unlocked by default (TBytecodeVM.FSharedRecLockFree, same env var),
+  // so emitting the native path adds no exposure that the interpreter does not already have - and
+  // when the lock is put back, both stand down together. Read here rather than threaded through the
+  // signature; FSharedRecLockFree is the source of truth and this must not outlive a change to it.
+  GSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GAotRecNative := GetEnvironmentVariable('AOT_RECDEOPT') <> '1';
   if AotDumpDir <> '' then
     WriteLn(ErrOutput, '[AOT] AOT_DUMP: region dumps go to ', AotDumpDir,
             ' (disassemble with job/tests/tools/aot_disasm.ps1)');
