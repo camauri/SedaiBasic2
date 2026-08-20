@@ -716,6 +716,14 @@ begin
     // input in Dest (it is in the read-Dest list below).
     ssaCopyString, ssaLoadConstString, ssaStrConcat,
     ssaStrLen, ssaStrAsc, ssaStrAscMid, ssaStrChr,
+    // SPACE(n) and STRING(n,ch) are how a BUFFER is created before it is filled a byte at a time,
+    // and leaving them out pinned the buffer itself. The fill then came out "MidAssign Dest=R1
+    // Src1=R0" plus "CopyString R0, R1", so target and result ALIAS at the top of the next
+    // iteration and UniqueString copies the whole buffer per byte - quadratic. Measured 20 Aug 2026
+    // inside a SUB: 100,000 bytes 245 ms, 200,000 bytes 931 ms, against 8 ms for the identical fill
+    // at module level (where the variable is one register and no copy closes the loop).
+    // Both write Dest and never read it, and read only integer sources - see their VM arms.
+    ssaStrSpace, ssaStrString,
     // ssaStrConcatCharAt is modelled exactly like ssaStrConcat -- Dest written, Src1/Src2/Src3 read
     // -- and it needs the merge for the same reason and more sharply: its whole point is to grow the
     // accumulator in place, which only happens when Dest and Src1 end up as the same register. Left
