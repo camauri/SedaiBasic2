@@ -259,10 +259,29 @@ begin
     GDenseToOp16[Op16ToDense(OPCODES[i])] := OPCODES[i];
 end;
 
+function IsFallbackOpName(const N: string): Boolean;
+// True for the shape BytecodeOpToString invents when it does not know an opcode: a word, an
+// underscore, and digits to the end ("Group_4", "Web_11", "Op_7"). A real opcode name never has
+// that shape - they are CamelCase with no underscore at all.
+var
+  i, u: Integer;
+begin
+  Result := False;
+  u := 0;
+  for i := 1 to Length(N) do
+    if N[i] = '_' then u := i;
+  if (u = 0) or (u = Length(N)) then Exit;
+  for i := u + 1 to Length(N) do
+    if not (N[i] in ['0'..'9']) then Exit;
+  Result := True;
+end;
+
 function VerifyOpcodeTable(out Msg: string): Boolean;
 var
   i, d: Integer;
   seen: array of Boolean;
+  NoName: Integer;
+  NoNameMsg: string;
 begin
   Result := False;
   if GDenseCount = 0 then
@@ -270,6 +289,7 @@ begin
     Msg := 'opcode table not initialized';
     Exit;
   end;
+  NoName := 0; NoNameMsg := '';
   SetLength(seen, GDenseCount);
   for i := 0 to GDenseCount - 1 do
     seen[i] := False;
@@ -292,6 +312,31 @@ begin
       Msg := Format('inverse mismatch at dense %d (got $%.4X, want $%.4X)', [d, GDenseToOp16[d], OPCODES[i]]);
       Exit;
     end;
+    // ...and it must have a NAME. BytecodeOpToString is a hand-written case statement parallel to
+    // the opcode constants, so a new opcode gets a name only if somebody remembers a second place.
+    // On 20 Aug 2026 TWENTY-ONE of them had been forgotten and disassembled as "Group_4" - readable
+    // only by grepping the sources for the number. That is the shape this project keeps paying for:
+    // two hand-maintained lists drift, silently, and nothing says so.
+    // The fallbacks all look like <Word>_<digits> ("Group_4", "Web_11"), which a real name never
+    // does, so the check is exact and needs no second list of its own - it reads OPCODES, which is
+    // the list the compiler itself emits from.
+    if IsFallbackOpName(BytecodeOpToString(TBytecodeOp(OPCODES[i]))) then
+    begin
+      // ⛔ ACCUMULA, non esce: la prima versione usciva al primo trovato e li faceva scoprire uno
+      // per build. Una rete deve dire TUTTO quello che ha trovato in un colpo solo.
+      Inc(NoName);
+      if NoName <= 40 then
+        NoNameMsg := NoNameMsg + Format('%s  $%.4X -> "%s"', [LineEnding,
+                     OPCODES[i], BytecodeOpToString(TBytecodeOp(OPCODES[i]))]);
+    end;
+  end;
+  if NoName > 0 then
+  begin
+    Msg := Format('%d opcodes have no name in BytecodeOpToString ' +
+                  '(a hand-written case parallel to the constants - add them there):%s',
+                  [NoName, NoNameMsg]);
+    if NoName > 40 then Msg := Msg + LineEnding + '  ...';
+    Exit;
   end;
   // The compile-time dense bases used as flat-dispatch case labels must match the runtime map.
   if (GGroupBase[bcGroupCore     shr 8] <> DENSE_CORE_BASE)     or
