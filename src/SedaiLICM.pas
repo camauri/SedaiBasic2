@@ -722,6 +722,42 @@ begin
     ssaArrayLBound, ssaArrayUBound:
       Result := True;
 
+    // === STRING BANK ==========================================================================
+    // The whole bank used to fall through to False - by omission, with no note saying why, so an
+    // invariant like Left(s, 2) or Asc(Mid(s, 2, 1)) was recomputed on every turn while the int and
+    // float invariants beside it were hoisted. Measured on a 2,000,000-turn loop, 20 Aug 2026:
+    //   acc += Left(s, 2)          130 ms -> 59 ms hoisted by hand
+    //   accI += Asc(Mid(s, 2, 1))   50 ms ->  5 ms
+    //   acc += Chr(10)              93 ms -> 56 ms
+    //
+    // The admission rule is the one the rest of this list follows: a PURE function of its Src
+    // operands, total (no input traps - the substring family clamps rather than failing), no side
+    // effect, and Dest written and never read.
+    //
+    // ⛔ Deliberately ABSENT, and each for a reason:
+    //   ssaStrAppendMapped, ssaStrConcatCharAt, ssaStrMidAssign, ssaStrMidAssignArr - these READ
+    //     their Dest. They are accumulators and in-place writes, the opposite of hoistable.
+    //   ssaStrInstr and the INSTR family - INSTR carries an input in Dest (see the read-Dest list
+    //     in SedaiRegAlloc), so the same reading that disqualifies it there disqualifies it here.
+    //   ssaStrErr - ERR$ reads the runtime error state, which a loop can change.
+    //   ssaStrSAdd - SADD is the ADDRESS of a string's buffer; hoisting it would outlive the
+    //     reallocation that any append in the loop can cause.
+    //   ssaStrStr, ssaStrFormat, ssaStrVal and the conversion family - formatting and parsing that
+    //     read settings or can raise; left out until one of them is measured to be worth the audit.
+    ssaStrLen, ssaStrLenW,
+    ssaStrLeft, ssaStrRight, ssaStrMid,
+    ssaStrLeftW, ssaStrRightW, ssaStrMidW,
+    ssaStrAsc, ssaStrAscMid,
+    ssaStrChr, ssaStrWChr,
+    ssaStrSpace, ssaStrString, ssaStrWStringN,
+    ssaStrUCase, ssaStrLCase,
+    ssaStrTrim, ssaStrLTrim, ssaStrRTrim, ssaStrTrimSet,
+    ssaStrHex, ssaStrOct, ssaStrBin,
+    ssaStrConcat,
+    ssaLoadConstString,
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+      Result := True;
+
     // Everything else - NOT safe
     else
       Result := False;
