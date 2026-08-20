@@ -231,7 +231,12 @@ begin
     Header.StringConstCount := 0;
   Header.VariableCount := Program_.GetVariableCount;
   Header.ArrayCount := Program_.GetArrayCount;
-  Header.Reserved1 := 0;
+  // OPTION DIGITS travels in Reserved1. Without it the setting was lost on the round trip through
+  // a .basc: `Option Digits 25` printed 0.1000000000000000055511151 from source and plain 0.1 from
+  // the compiled form - the same program answering differently depending on how it was launched.
+  // 0 keeps meaning "the directive was not used", so a .basc written before this reads unchanged
+  // and the header keeps its size and version.
+  Header.Reserved1 := LongWord(Program_.OptionDigits);
   Header.Reserved2 := 0;
 
   Header.Checksum := CalculateChecksum(Program_);
@@ -388,6 +393,7 @@ begin
 
     // Restore the source dialect (older files have the flag clear => classic, as before)
     Result.ModernMode := (Header.Flags and BASC_FLAG_MODERN) <> 0;
+    Result.OptionDigits := Integer(Header.Reserved1);   // see the note where it is written
     Result.QBLang := (Header.Flags and BASC_FLAG_QBLANG) <> 0;
 
     // Read string constants

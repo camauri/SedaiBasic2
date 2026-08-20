@@ -15,7 +15,6 @@
  *}
 
 type
-  PBytecodeInstruction = ^TBytecodeInstruction;
   PExecMemA = ^TExecMem;
 var
   JitOn: Boolean;          // JIT enabled for this run (compiled loops present)
@@ -30,7 +29,8 @@ var
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
-  Instr: TBytecodeInstruction;
+  Instr: PBytecodeInstruction;   // POINTER, not a copy - see the note at the assignment
+  InstrHot: PBytecodeInstruction;  // ...and what ArrayHotOps.inc dereferences (two including scopes)
   Ctx: TExecutionContext;  // M5.2: active execution context, read once per Run (zero hot-path cost)
   Op: Word;
   // M2 decode-once dense dispatch: DenseOps[CurPC] is the instruction's dense linear index (built once
@@ -42,12 +42,11 @@ var
   IntRegs: PInt64;
   FloatRegs: PDouble;
   NextPC: Integer;          // indirect call target, read before FramePush can slide the view
-  ArrayIdx, LinearIdx, ArrLowerBound: Integer;
+  ArrayIdx, LinearIdx: Integer;   // used by the HOT typed accessors in ArrayHotOps.inc
   InputStr, PrintStr: string;
   InputVal: Double;
-  i, ProdDims: Integer;
+  i: Integer;
   NextTabCol, TabIdx: Integer;
-  ArrInfo: TSSAArrayInfo;
   // Local vars for ArrayReverseRange and ArrayShiftLeft
   ArrIdxW: Word;
   LStartIdx, LEndIdx, LLoopIdx: Integer;
@@ -61,6 +60,14 @@ var
   TrapTriggered: Boolean;
   // Event polling counter
   EventPollCounter: Integer;
+  {$IFDEF HOT_C}
+  HotCOk: Boolean;      // may the C hot loop run? see the note at its call
+  HotNewPC: LongInt;
+  HotArrDesc: Pointer;
+  HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
+  HotXferI: PInt64;        // the SUB/FUNCTION argument banks of THIS context - never baked in,
+  HotXferF: PDouble;       // a worker must see its own, exactly as the AOT context does
+  {$ENDIF}
   {$IFDEF JIT_PROFILE}
   // J1: local copy of the JIT back-edge-profiling flag; BEBase points at FBackEdgeCount[0].
   BEProfile: Boolean;
@@ -156,6 +163,53 @@ begin
   ModernConv := Assigned(FProgram) and FProgram.ModernMode;
   // Initialize event polling counter
   EventPollCounter := 0;
+  {$IFDEF HOT_C}
+  // ⭐ AotOn NO LONGER disqualifies the C loop, and that was the binary-trees inversion.
+  //
+  // It used to read `(not JitOn) and (not AotOn) and ...`, so switching the AOT on cost the WHOLE
+  // program its C dispatch - not just the compiled parts. Sampled 20 Aug 2026 on binary-trees: the
+  // compiled regions take 1% of the samples while sedai_hot_run takes 6.2% of the interpreted
+  // profile, and the C loop is worth 27-45% where it applies. It is also why every ISOLATED probe
+  // said the AOT was faster: one operation on its own has no interpreted stretch long enough for
+  // the C loop to matter, so disabling it there costs nothing. The cost only exists whole-program.
+  //
+  // The two coexist because SetHotOpEnabled zeroes the per-PC table at every compiled entry and the
+  // C dispatcher hands the PC back on a zero entry ("if (!h_) return pc"), so it stops exactly
+  // where the interpreter has to look. ⛔ And because the AOT arm above now refreshes IntRegs /
+  // FloatRegs after a native call: a native call reaches AotCallSub, that pushes a frame, and
+  // growing the integer bank REALLOCATES Ctx.IntRegsMem. Without that refresh the C loop was handed
+  // a stale base and wrote through it - binary-trees hung inside Move with a negative byte count.
+  //
+  // Measured, --aot, gate closed -> open, best of 5, interleaved on one binary:
+  //   mandelbrot N=8000        1007 -> 903 ms  -10.3%
+  //   binary-trees N/D N=16    1621 -> 1484    -8.5%
+  //   binary-trees 1-thread    3646 -> 3341    -8.4%
+  //   spectral-norm N=5000      729 -> 711     -2.5%
+  //   k-nucleotide f5M         1963 -> 1943    -1.0%
+  //   fasta, fannkuch, n-body, reverse-complement: flat (-0.9% .. +0.7%, inside the noise)
+  // ⚠️ At N small the two shortest read -4.3% and -9.1%; re-measured at a real size they are -2.5%
+  // and -10.3%. Under a second, this machine's noise eats the signal - do not quote the short ones.
+  //
+  // JIT still disqualifies: it rewrites the bytecode the C loop would be dispatching.
+  // HOTC_AOT=0 restores the old behaviour, so the A/B above lives on ONE binary.
+  HotCOk := (not JitOn) and (not Assigned(FEventPollCallback)) and
+            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0'));
+  // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
+  // raise; there its array arms hand the PC back instead.
+  HotFlags := 0;
+  if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
+  if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
+  if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
+  if Length(Ctx.XferInt) > 0 then HotXferI := @Ctx.XferInt[0] else HotXferI := nil;
+  if Length(Ctx.XferFloat) > 0 then HotXferF := @Ctx.XferFloat[0] else HotXferF := nil;
+  // Without both transfer banks the C loop must not run the Xfer opcodes at all.
+  if (HotXferI = nil) or (HotXferF = nil) then HotCOk := False;
+  // ⛔ MEASURED: the entry test costs even when it can never fire. With the C code merely PRESENT and
+  // permanently disabled, binary-trees was +3.5% and spectral-norm +11.8% against a build without it
+  // - the same as with it enabled. So the condition is folded into the per-PC table here, once,
+  // leaving exactly one array read on the hot path instead of a Boolean, an AND and a read.
+  SetHotOpEnabled(HotCOk);
+  {$ENDIF}
 
   {$IFDEF DEBUG_MODE}
   {$IFDEF ENABLE_PROFILER}
@@ -231,11 +285,55 @@ begin
       // ⚠️ "not Running" has to go through Continue too: AotSettle clears it on AOT_HELPER_HALT and
       // parks the fault PC, which may well BE the entry. Falling through there would interpret one
       // instruction after the run was already over; Continue exits via the loop's own condition.
+      // ⛔ THE VIEW MUST FOLLOW THE REALLOCATION, exactly as it does after the frame ops below
+      // ("may have slid to a relocated frame"). A native call reaches AotCallSub, AotCallSub pushes
+      // a frame, and growing the integer bank REALLOCATES Ctx.IntRegsMem and re-points Ctx.IntRegs -
+      // at which point this loop's local still holds the old base. Missing here and present three
+      // times below is exactly the asymmetry that made the C hot loop unusable under --aot: opened
+      // for an experiment, binary-trees hung inside Move under ReAllocMem with a negative byte
+      // count, because the C loop was handed this stale pointer and wrote through it.
+      IntRegs := Ctx.IntRegs;
+      FloatRegs := @Ctx.FloatRegs[0];
       if (CurPC <> AotFromPC) or (not Ctx.Running) then System.Continue;
     end;
 
-    Instr := Instructions[CurPC];
-    Op := Instr.OpCode;
+    // ⭐ A POINTER, NOT A COPY. This used to be `Instr := Instructions[CurPC]`, a 16-byte record
+    // copied into a stack local on EVERY dispatched instruction - and every later Instr^.Dest /
+    // Src1 / Src2 then read that stack slot instead of the instruction array, which is L1-hot
+    // anyway. The copy buys nothing: nothing in the loop writes to Instr.
+    //
+    // The lifetime assumption is the one `Instructions` itself already makes: the instruction array
+    // does not move for the duration of Run. Nothing reachable from a handler calls LoadProgram, so
+    // a pointer into it is exactly as safe as the base pointer read above it.
+    //
+    // Measured against f756661, interleaved best-of-3 on one machine: it moves EVERY program, which
+    // is the signature of a per-instruction cost rather than a shape change -
+    // spectral-norm -10.5%, min loop -5.5%, fannkuch -4.1%, binary-trees -4.1%, n-body -3.8%,
+    // mandelbrot -3.4%.
+    {$IFDEF HOT_C}
+    // The C hot loop runs until it meets an opcode it does not implement, then hands the PC back.
+    // Its cost is therefore one call per COLD instruction and none per hot one. It is used only when
+    // nothing else needs to look at every instruction: no compiled region to enter, and no event
+    // poll to service.
+    if FHotOp[CurPC] <> 0 then
+    begin
+      // ⛔ AcquireArrDesc TAKES A LOCK, and calling it per entry to the C loop was catastrophic:
+      // mandelbrot went from -32.8% to +33%, spectral-norm to +84%. This VM has paid that lesson
+      // before - a lock on the call path took binary-trees from 171 ms to 711. So the pointer is
+      // taken ONCE before the loop and refreshed only when the array set actually changed, which is
+      // a plain field read on the hot path and the lock only when something really moved.
+      if FArraysDirty then HotArrDesc := AcquireArrDesc;
+      HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
+                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0]);
+      if HotNewPC <> CurPC then
+      begin
+        CurPC := HotNewPC;
+        System.Continue;
+      end;
+    end;
+    {$ENDIF}
+    Instr := @Instructions[CurPC];
+    Op := Instr^.OpCode;
     DenseOp := DenseOps[CurPC];
 
     {$IFDEF DEBUG_MODE}
@@ -297,101 +395,101 @@ begin
     // The group-0 and superinstruction BODIES below are byte-identical to the previous nested cases.
     case DenseOp of
       // === Superinstructions (dense DENSE_SUPER_BASE + sub, sub = Op and $FF) ===
-      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 60:
+      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 71:
       case Op and $FF of
         // Fused compare-and-branch (Int) - sub-opcodes 0-5
-        0: if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchEqInt
-        1: if IntRegs[Instr.Src1] <> IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); // bcCmpBranchNeInt
-        2: if IntRegs[Instr.Src1] < IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchLtInt
-        3: if IntRegs[Instr.Src1] > IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchGtInt
-        4: if IntRegs[Instr.Src1] <= IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); // bcCmpBranchLeInt
-        5: if IntRegs[Instr.Src1] >= IntRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); // bcCmpBranchGeInt
+        0: if IntRegs[Instr^.Src1] = IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchEqInt
+        1: if IntRegs[Instr^.Src1] <> IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC); // bcCmpBranchNeInt
+        2: if IntRegs[Instr^.Src1] < IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchLtInt
+        3: if IntRegs[Instr^.Src1] > IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchGtInt
+        4: if IntRegs[Instr^.Src1] <= IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC); // bcCmpBranchLeInt
+        5: if IntRegs[Instr^.Src1] >= IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC); // bcCmpBranchGeInt
 
         // Fused compare-and-branch (Float) - sub-opcodes 10-15
-        6: if FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchEqFloat
-        7: if FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); // bcCmpBranchNeFloat
-        8: if FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchLtFloat
-        9: if FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC);  // bcCmpBranchGtFloat
-        10: if FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); // bcCmpBranchLeFloat
-        11: if FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2] then CurPC := Instr.Immediate else Inc(CurPC); // bcCmpBranchGeFloat
+        6: if FloatRegs[Instr^.Src1] = FloatRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchEqFloat
+        7: if FloatRegs[Instr^.Src1] <> FloatRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC); // bcCmpBranchNeFloat
+        8: if FloatRegs[Instr^.Src1] < FloatRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchLtFloat
+        9: if FloatRegs[Instr^.Src1] > FloatRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchGtFloat
+        10: if FloatRegs[Instr^.Src1] <= FloatRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC); // bcCmpBranchLeFloat
+        11: if FloatRegs[Instr^.Src1] >= FloatRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC); // bcCmpBranchGeFloat
 
         // Fused arithmetic-to-dest (Int) - sub-opcodes 20-22
-        12: begin IntRegs[Instr.Dest] := IntRegs[Instr.Dest] + IntRegs[Instr.Src1]; Inc(CurPC); end; // bcAddIntTo
-        13: begin IntRegs[Instr.Dest] := IntRegs[Instr.Dest] - IntRegs[Instr.Src1]; Inc(CurPC); end; // bcSubIntTo
-        14: begin IntRegs[Instr.Dest] := IntRegs[Instr.Dest] * IntRegs[Instr.Src1]; Inc(CurPC); end; // bcMulIntTo
+        12: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Dest] + IntRegs[Instr^.Src1]; Inc(CurPC); end; // bcAddIntTo
+        13: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Dest] - IntRegs[Instr^.Src1]; Inc(CurPC); end; // bcSubIntTo
+        14: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Dest] * IntRegs[Instr^.Src1]; Inc(CurPC); end; // bcMulIntTo
 
         // Fused arithmetic-to-dest (Float) - sub-opcodes 30-33
-        15: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] + FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcAddFloatTo
-        16: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcSubFloatTo
-        17: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] * FloatRegs[Instr.Src1]; Inc(CurPC); end; // bcMulFloatTo
+        15: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Dest] + FloatRegs[Instr^.Src1]; Inc(CurPC); end; // bcAddFloatTo
+        16: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Dest] - FloatRegs[Instr^.Src1]; Inc(CurPC); end; // bcSubFloatTo
+        17: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Dest] * FloatRegs[Instr^.Src1]; Inc(CurPC); end; // bcMulFloatTo
         18: begin // bcDivFloatTo
-          if Abs(FloatRegs[Instr.Src1]) < 1e-300 then
-            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Dest], FloatRegs[Instr.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+          if Abs(FloatRegs[Instr^.Src1]) < 1e-300 then
+            FloatRegs[Instr^.Dest] := DivZeroFloat(FloatRegs[Instr^.Dest], FloatRegs[Instr^.Src1])   // MODERN: IEEE Inf/NaN; CLASSIC: error
           else
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] / FloatRegs[Instr.Src1];
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Dest] / FloatRegs[Instr^.Src1];
           Inc(CurPC);
         end;
 
         // Fused constant arithmetic (Int) - sub-opcodes 40-42
-        19: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + Instr.Immediate; Inc(CurPC); end; // bcAddIntConst
-        20: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - Instr.Immediate; Inc(CurPC); end; // bcSubIntConst
-        21: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * Instr.Immediate; Inc(CurPC); end; // bcMulIntConst
+        19: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] + Instr^.Immediate; Inc(CurPC); end; // bcAddIntConst
+        20: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] - Instr^.Immediate; Inc(CurPC); end; // bcSubIntConst
+        21: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] * Instr^.Immediate; Inc(CurPC); end; // bcMulIntConst
 
         // Fused constant arithmetic (Float) - sub-opcodes 50-53
-        22: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcAddFloatConst
-        23: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcSubFloatConst
-        24: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcMulFloatConst
+        22: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] + Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcAddFloatConst
+        23: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] - Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcSubFloatConst
+        24: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] * Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcMulFloatConst
         25: begin // bcDivFloatConst
-          if Abs(Double(Pointer(@Instr.Immediate)^)) < 1e-300 then
-            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1], Double(Pointer(@Instr.Immediate)^))   // MODERN: IEEE Inf/NaN; CLASSIC: error
+          if Abs(Double(Pointer(@Instr^.Immediate)^)) < 1e-300 then
+            FloatRegs[Instr^.Dest] := DivZeroFloat(FloatRegs[Instr^.Src1], Double(Pointer(@Instr^.Immediate)^))   // MODERN: IEEE Inf/NaN; CLASSIC: error
           else
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / Double(Pointer(@Instr.Immediate)^);
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] / Double(Pointer(@Instr^.Immediate)^);
           Inc(CurPC);
         end;
 
         // Fused compare-zero-and-branch (Int) - sub-opcodes 60-61
-        26: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC);  // bcBranchEqZeroInt
-        27: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC); // bcBranchNeZeroInt
+        26: if IntRegs[Instr^.Src1] = 0 then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchEqZeroInt
+        27: if IntRegs[Instr^.Src1] <> 0 then CurPC := Instr^.Immediate else Inc(CurPC); // bcBranchNeZeroInt
 
         // Fused compare-zero-and-branch (Float) - sub-opcodes 70-71
-        28: if FloatRegs[Instr.Src1] = 0.0 then CurPC := Instr.Immediate else Inc(CurPC);  // bcBranchEqZeroFloat
-        29: if FloatRegs[Instr.Src1] <> 0.0 then CurPC := Instr.Immediate else Inc(CurPC); // bcBranchNeZeroFloat
+        28: if FloatRegs[Instr^.Src1] = 0.0 then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchEqZeroFloat
+        29: if FloatRegs[Instr^.Src1] <> 0.0 then CurPC := Instr^.Immediate else Inc(CurPC); // bcBranchNeZeroFloat
 
         // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded: OOB store dropped (MODERN), CLASSIC raises.
-        30: begin if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := Instr.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
-        31: begin if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
-        32: begin if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
+        30: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := Instr^.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
+        31: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
+        32: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
 
         // Fused loop increment-and-branch (most common in hot loops) - sub-opcodes 90-93
         33: // bcAddIntToBranchLe
           begin
-            Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] <= IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
+            Inc(IntRegs[Instr^.Dest], IntRegs[Instr^.Src1]);
+            if IntRegs[Instr^.Dest] <= IntRegs[Instr^.Src2] then
+              CurPC := Instr^.Immediate
             else
               Inc(CurPC);
           end;
         34: // bcAddIntToBranchLt
           begin
-            Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] < IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
+            Inc(IntRegs[Instr^.Dest], IntRegs[Instr^.Src1]);
+            if IntRegs[Instr^.Dest] < IntRegs[Instr^.Src2] then
+              CurPC := Instr^.Immediate
             else
               Inc(CurPC);
           end;
         35: // bcSubIntToBranchGe
           begin
-            Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] >= IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
+            Dec(IntRegs[Instr^.Dest], IntRegs[Instr^.Src1]);
+            if IntRegs[Instr^.Dest] >= IntRegs[Instr^.Src2] then
+              CurPC := Instr^.Immediate
             else
               Inc(CurPC);
           end;
         36: // bcSubIntToBranchGt
           begin
-            Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]);
-            if IntRegs[Instr.Dest] > IntRegs[Instr.Src2] then
-              CurPC := Instr.Immediate
+            Dec(IntRegs[Instr^.Dest], IntRegs[Instr^.Src1]);
+            if IntRegs[Instr^.Dest] > IntRegs[Instr^.Src2] then
+              CurPC := Instr^.Immediate
             else
               Inc(CurPC);
           end;
@@ -399,19 +497,19 @@ begin
         // FMA (Fused Multiply-Add) - sub-opcodes 100-103
         // Format: Dest, Src1=a, Src2=b, Immediate=c (extra register)
         37: begin // bcMulAddFloat: dest = c + a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] + FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] + FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         38: begin // bcMulSubFloat: dest = c - a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] - FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] - FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         39: begin // bcMulAddToFloat: dest += a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] + FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Dest] + FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         40: begin // bcMulSubToFloat: dest -= a*b
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Dest] - FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Dest] - FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
 
@@ -419,76 +517,76 @@ begin
         // Format: Dest, Src1=arr_index, Src2=idx_reg, Immediate=acc_reg
         // Bounds-guarded: an OOB read yields the element default 0.0 (MODERN); CLASSIC raises.
         41: begin // bcArrayLoadAddFloat: dest = acc + arr[idx]
-          if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] + FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]]
+          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] + FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
           else
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate];
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         42: begin // bcArrayLoadSubFloat: dest = acc - arr[idx]
-          if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]]
+          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] - FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
           else
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate];
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         43: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
           // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-          if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-            LElemVal := FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]]
+          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
+            LElemVal := FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
           else
             LElemVal := 0.0;
-          if Abs(FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
-              DivZeroFloat(LElemVal, FloatRegs[(Instr.Immediate shr 16) and $FFFF])   // MODERN: IEEE; CLASSIC: error
+          if Abs(FloatRegs[(Instr^.Immediate shr 16) and $FFFF]) < 1e-300 then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate and $FFFF] +
+              DivZeroFloat(LElemVal, FloatRegs[(Instr^.Immediate shr 16) and $FFFF])   // MODERN: IEEE; CLASSIC: error
           else
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Immediate and $FFFF] +
-              LElemVal / FloatRegs[(Instr.Immediate shr 16) and $FFFF];
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate and $FFFF] +
+              LElemVal / FloatRegs[(Instr^.Immediate shr 16) and $FFFF];
           Inc(CurPC);
         end;
 
         // Square-Sum patterns - sub-opcodes 120-121
         44: begin // bcSquareSumFloat: dest = x*x + y*y
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src1] +
-                                   FloatRegs[Instr.Src2] * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src1] +
+                                   FloatRegs[Instr^.Src2] * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         45: begin // bcAddSquareFloat: dest = sum + x*x
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2] * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] + FloatRegs[Instr^.Src2] * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
 
         // Mul-Mul and Add-Sqrt - sub-opcodes 130-131
         46: begin // bcMulMulFloat: dest = a*b*c
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2] * FloatRegs[Instr.Immediate];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src2] * FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         47: begin // bcAddSqrtFloat: dest = sqrt(a+b)
-          FloatRegs[Instr.Dest] := SqrtFloat(FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]);
+          FloatRegs[Instr^.Dest] := SqrtFloat(FloatRegs[Instr^.Src1] + FloatRegs[Instr^.Src2]);
           Inc(CurPC);
         end;
 
         // Array Load + Branch - sub-opcodes 140-141. Bounds-guarded: an OOB read is treated as the element
         // default 0 in MODERN (NZ does not branch, Z branches); CLASSIC raises.
         48: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
-          if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) and
-             (FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] <> 0) then
-            CurPC := Instr.Immediate
+          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) and
+             (FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] <> 0) then
+            CurPC := Instr^.Immediate
           else
             Inc(CurPC);
         49: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
-          if (not ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2])) or
-             (FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] = 0) then
-            CurPC := Instr.Immediate
+          if (not ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2])) or
+             (FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] = 0) then
+            CurPC := Instr^.Immediate
           else
             Inc(CurPC);
 
         // Array Reverse Range - sub-opcode 156
         50: // bcArrayReverseRange: reverse arr[start..end-1] in-place
           begin
-            LStartIdx := IntRegs[Instr.Src2];
-            LEndIdx := IntRegs[Instr.Dest] - 1;
-            ArrIdxW := Instr.Src1;
+            LStartIdx := IntRegs[Instr^.Src2];
+            LEndIdx := IntRegs[Instr^.Dest] - 1;
+            ArrIdxW := Instr^.Src1;
             // Bounds-guard the contiguous range once (endpoints valid => interior valid); skip if OOB (MODERN).
             if (LStartIdx < LEndIdx) and
                (not ArrayBoundsOK(ArrIdxW, LStartIdx) or not ArrayBoundsOK(ArrIdxW, LEndIdx)) then
@@ -507,9 +605,9 @@ begin
         // Array Shift Left - sub-opcode 157
         51: // bcArrayShiftLeft: shift left and rotate first to end+1
           begin
-            LStartIdx := IntRegs[Instr.Src2];
-            LEndIdx := IntRegs[Instr.Dest];
-            ArrIdxW := Instr.Src1;
+            LStartIdx := IntRegs[Instr^.Src2];
+            LEndIdx := IntRegs[Instr^.Dest];
+            ArrIdxW := Instr^.Src1;
             // Bounds-guard the touched range [start .. end+1] once; skip the whole rotate if OOB (MODERN).
             if ArrayBoundsOK(ArrIdxW, LStartIdx) and ArrayBoundsOK(ArrIdxW, LEndIdx + 1) then
             begin
@@ -528,66 +626,87 @@ begin
         // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip if either index OOB (MODERN); CLASSIC raises.
         55: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
           begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) and
-               ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Dest]) then
+            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) and
+               ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Dest]) then
             begin
-              Ctx.SwapTempInt := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]];
-              FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]];
-              FArrays[Instr.Src1].IntData[IntRegs[Instr.Dest]] := Ctx.SwapTempInt;
+              Ctx.SwapTempInt := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]];
+              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Dest]];
+              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Dest]] := Ctx.SwapTempInt;
             end;
             Inc(CurPC);
           end;
 
         // Self-increment/decrement (Int) - sub-opcodes 251-252
-        56: begin Inc(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); end; // bcAddIntSelf
-        57: begin Dec(IntRegs[Instr.Dest], IntRegs[Instr.Src1]); Inc(CurPC); end; // bcSubIntSelf
+        56: begin Inc(IntRegs[Instr^.Dest], IntRegs[Instr^.Src1]); Inc(CurPC); end; // bcAddIntSelf
+        57: begin Dec(IntRegs[Instr^.Dest], IntRegs[Instr^.Src1]); Inc(CurPC); end; // bcSubIntSelf
 
         // Array Load to register (Int) - sub-opcode 253. Bounds-guarded: OOB read = default 0 (MODERN); CLASSIC raises.
         58: begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]
+            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
+              IntRegs[Instr^.Dest] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
             else
-              IntRegs[Instr.Dest] := 0;
+              IntRegs[Instr^.Dest] := 0;
             Inc(CurPC);
           end; // bcArrayLoadIntTo
 
         // Array Copy Element - sub-opcode 254. Bounds-guarded: OOB store dropped, OOB source reads 0 (MODERN); CLASSIC raises.
         59: begin
-            if ArrayBoundsOK(Instr.Dest, IntRegs[Instr.Src2]) then
+            if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src2]) then
             begin
-              if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-                FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]
+              if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
+                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
               else
-                FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := 0;
+                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := 0;
             end;
             Inc(CurPC);
           end; // bcArrayCopyElement
 
         // Array Move Element - sub-opcode 255. Bounds-guarded like 254.
         60: begin
-            if ArrayBoundsOK(Instr.Dest, IntRegs[Instr.Src2]) then
+            if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src2]) then
             begin
-              if ArrayBoundsOK(Instr.Dest, IntRegs[Instr.Src1]) then
-                FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[IntRegs[Instr.Src1]]
+              if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src1]) then
+                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src1]]
               else
-                FArrays[Instr.Dest].IntData[IntRegs[Instr.Src2]] := 0;
+                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := 0;
             end;
             Inc(CurPC);
           end; // bcArrayMoveElement
 
+        // Fused compare-and-branch, STRING - sub-opcodes 61-66. Six forms for four comparisons:
+        // the pass fuses "compare + JumpIfZero" by negating, and the negation of Lt is Ge.
+        61: if Ctx.StringRegs[Instr^.Src1] =  Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchEqString
+        62: if Ctx.StringRegs[Instr^.Src1] <> Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchNeString
+        63: if Ctx.StringRegs[Instr^.Src1] <  Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLtString
+        64: if Ctx.StringRegs[Instr^.Src1] >  Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGtString
+        65: if Ctx.StringRegs[Instr^.Src1] <= Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLeString
+        66: if Ctx.StringRegs[Instr^.Src1] >= Ctx.StringRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGeString
+
+        // Fused compare-and-branch, UNSIGNED - sub-opcodes 67-70. The operands are INT registers
+        // read as QWord, exactly as bcCmpLtUInt reads them; unsigned equality is bit-identical to
+        // signed and already goes through bcBranchEqInt.
+        67: if QWord(IntRegs[Instr^.Src1]) <  QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLtUInt
+        68: if QWord(IntRegs[Instr^.Src1]) <= QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchLeUInt
+        69: if QWord(IntRegs[Instr^.Src1]) >  QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGtUInt
+        70: if QWord(IntRegs[Instr^.Src1]) >= QWord(IntRegs[Instr^.Src2]) then CurPC := Instr^.Immediate else Inc(CurPC);  // bcBranchGeUInt
+
         // "acc + MID$(tab,k,1)" fused - sub-opcode 158. DELEGATED on purpose: the body is string
         // work, and inlining bodies here is what made every program slower when the whole
         // superinstruction set was inline. One delegated instruction still replaces two.
-        52: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        52: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
         // "acc += tab[Asc(MID$(s,i,1))+1]" fused whole - sub-opcode 159. Delegated for the same
         // reason as 158. ⛔ THIS LINE is the one an opcode addition forgets: the arm in
         // ExecuteSuperinstruction compiles fine on its own and is simply never reached, and the
         // program dies at RUNTIME with "Unknown superinstruction sub-opcode".
-        53: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        53: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
         // "MID$(t, start [, len]) = src" in place - sub-opcode 160. Delegated for the same reason.
-        54: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        54: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+
+        // "MID$(arr(i), start [, len]) = src" - the same statement when the target is an ARRAY
+        // ELEMENT, which is how every DIM SHARED scalar is stored. Delegated for the same reason.
+        71: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
       else
         raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full opcode $%.4X) at CurPC=%d', [Op and $FF, Op, CurPC]);
@@ -595,14 +714,19 @@ begin
 
       // === Delegated families (each a contiguous dense range) ===
       DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 51:
-        begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 42:
-        begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
       // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.
       DENSE_ARRAY_BASE + 3 .. DENSE_ARRAY_BASE + 8:
         begin
           // The shared branches never touch the PC, so this path advances it itself.
+          // InstrHot is what the shared text below dereferences: this include is compiled into two
+          // scopes - here, where Instr is a POINTER into the instruction array, and in
+          // SedaiBytecodeVM's ExecuteArrayOp, where it is a const VALUE parameter - so the one name
+          // it uses has to be set by each of them.
+          InstrHot := Instr;
           case Op and $FF of
             {$I ArrayHotOps.inc}
           end;
@@ -612,47 +736,47 @@ begin
         // Cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store; the
         // descriptor rebuild is triggered inside ExecuteArrayOp itself (it has two callers now - here
         // and the AOT helper - so the flag lives with the op, not the call site).
-        begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_IO_BASE + 0 .. DENSE_IO_BASE + 22:
-        begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr^); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
       DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 17:
-        begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + 36:
-        begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_SPRITE_BASE + 0 .. DENSE_SPRITE_BASE + 16:
-        begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       {$IFDEF WEB_MODE}
       DENSE_WEB_BASE + 0 .. DENSE_WEB_BASE + 12:
-        begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       {$ENDIF}
       // ⚠️ 65, not 64: bcGfxDrawString. This range has NO compile-time check of any kind - leave it too
       // narrow and everything builds, then the program dies at run time with "Unknown/illegal opcode".
       DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 65:
-        begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
-        begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       // ⚠️ Same warning as the graphics range above: nothing checks this at compile time. Widen it
       // whenever group 12 grows, or the new opcode builds fine and dies at run time.
       DENSE_BIGINT_BASE + 0 .. DENSE_BIGINT_BASE + 12:
-        begin Ctx.PC := CurPC; ExecuteBigIntOp(Ctx, Instr); CurPC := Ctx.PC + 1; end;
+        begin Ctx.PC := CurPC; ExecuteBigIntOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
       DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 168:
           case Op of
         // Load constants - very common
-        bcLoadConstInt: begin IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
-        bcLoadConstFloat: begin FloatRegs[Instr.Dest] := Double(Pointer(@Instr.Immediate)^); Inc(CurPC); end;
-        bcLoadConstString: begin Ctx.StringRegs[Instr.Dest] := FProgram.StringConstants[Instr.Immediate]; Inc(CurPC); end;
+        bcLoadConstInt: begin IntRegs[Instr^.Dest] := Instr^.Immediate; Inc(CurPC); end;
+        bcLoadConstFloat: begin FloatRegs[Instr^.Dest] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end;
+        bcLoadConstString: begin Ctx.StringRegs[Instr^.Dest] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end;
 
         // Copy operations
-        bcCopyInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1]; Inc(CurPC); end;
-        bcCopyFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1]; Inc(CurPC); end;
-        bcCopyString: begin Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1]; Inc(CurPC); end;
+        bcCopyInt: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1]; Inc(CurPC); end;
+        bcCopyFloat: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1]; Inc(CurPC); end;
+        bcCopyString: begin Ctx.StringRegs[Instr^.Dest] := Ctx.StringRegs[Instr^.Src1]; Inc(CurPC); end;
 
         // Integer arithmetic
-        bcAddInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] + IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcSubInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] - IntRegs[Instr.Src2]; Inc(CurPC); end;
-        bcMulInt: begin IntRegs[Instr.Dest] := IntRegs[Instr.Src1] * IntRegs[Instr.Src2]; Inc(CurPC); end;
+        bcAddInt: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] + IntRegs[Instr^.Src2]; Inc(CurPC); end;
+        bcSubInt: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] - IntRegs[Instr^.Src2]; Inc(CurPC); end;
+        bcMulInt: begin IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] * IntRegs[Instr^.Src2]; Inc(CurPC); end;
         { ⭐ THE ONE PLACE THAT NAMES A DIVISION FAULT. The JIT and the AOT both DEOPT
           on a zero divisor and on INT64_MIN \ -1 rather than emitting the trapping
           idiv, so whatever is decided here is what all three engines report.
@@ -662,61 +786,61 @@ begin
           something unmapped on Windows (Err 100 = ERR_INTERNAL, i.e. "no idea").
           One expression, two answers, neither of them right. }
         bcDivInt: begin
-          if IntRegs[Instr.Src2] = 0 then
+          if IntRegs[Instr^.Src2] = 0 then
             raise EDivByZero.Create('Integer division by zero');
           { INT64_MIN \ -1 is 2^63, which no Int64 holds: a genuine OVERFLOW. }
-          if (IntRegs[Instr.Src1] = Low(Int64)) and (IntRegs[Instr.Src2] = -1) then
+          if (IntRegs[Instr^.Src1] = Low(Int64)) and (IntRegs[Instr^.Src2] = -1) then
             raise EIntOverflow.Create('Integer division overflow');
-          IntRegs[Instr.Dest] := IntRegs[Instr.Src1] div IntRegs[Instr.Src2];
+          IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] div IntRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         bcModInt: begin
-          if IntRegs[Instr.Src2] = 0 then
+          if IntRegs[Instr^.Src2] = 0 then
             raise EDivByZero.Create('Integer modulo by zero');
           { ⭐ INT64_MIN Mod -1 is 0 - EXACT, and it fits. No error (user decision,
             13 Aug 2026). The hardware faults only because idiv produces quotient
             AND remainder together and the QUOTIENT overflows; we want the
             remainder, so we answer it instead of inheriting a fault meant for a
             value nobody asked for. }
-          if (IntRegs[Instr.Src1] = Low(Int64)) and (IntRegs[Instr.Src2] = -1) then
-            IntRegs[Instr.Dest] := 0
+          if (IntRegs[Instr^.Src1] = Low(Int64)) and (IntRegs[Instr^.Src2] = -1) then
+            IntRegs[Instr^.Dest] := 0
           else
-            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] mod IntRegs[Instr.Src2];
+            IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] mod IntRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         bcDivUInt: begin   // unsigned 64-bit \ (QWord)
-          if IntRegs[Instr.Src2] = 0 then
+          if IntRegs[Instr^.Src2] = 0 then
             raise EDivByZero.Create('Integer division by zero');
-          IntRegs[Instr.Dest] := Int64(QWord(IntRegs[Instr.Src1]) div QWord(IntRegs[Instr.Src2]));
+          IntRegs[Instr^.Dest] := Int64(QWord(IntRegs[Instr^.Src1]) div QWord(IntRegs[Instr^.Src2]));
           Inc(CurPC);
         end;
         bcModUInt: begin   // unsigned 64-bit Mod (QWord)
-          if IntRegs[Instr.Src2] = 0 then
+          if IntRegs[Instr^.Src2] = 0 then
             raise EDivByZero.Create('Integer modulo by zero');
-          IntRegs[Instr.Dest] := Int64(QWord(IntRegs[Instr.Src1]) mod QWord(IntRegs[Instr.Src2]));
+          IntRegs[Instr^.Dest] := Int64(QWord(IntRegs[Instr^.Src1]) mod QWord(IntRegs[Instr^.Src2]));
           Inc(CurPC);
         end;
-        bcNegInt: begin IntRegs[Instr.Dest] := -IntRegs[Instr.Src1]; Inc(CurPC); end;
+        bcNegInt: begin IntRegs[Instr^.Dest] := -IntRegs[Instr^.Src1]; Inc(CurPC); end;
 
         // Float arithmetic - critical for spectral-norm
-        bcAddFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] + FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcSubFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloatRegs[Instr.Src2]; Inc(CurPC); end;
-        bcMulFloat: begin FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] * FloatRegs[Instr.Src2]; Inc(CurPC); end;
+        bcAddFloat: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] + FloatRegs[Instr^.Src2]; Inc(CurPC); end;
+        bcSubFloat: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] - FloatRegs[Instr^.Src2]; Inc(CurPC); end;
+        bcMulFloat: begin FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] * FloatRegs[Instr^.Src2]; Inc(CurPC); end;
         bcDivFloat: begin
-          if FloatRegs[Instr.Src2] = 0.0 then
-            FloatRegs[Instr.Dest] := DivZeroFloat(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2])   // MODERN: IEEE Inf/NaN; CLASSIC: error
+          if FloatRegs[Instr^.Src2] = 0.0 then
+            FloatRegs[Instr^.Dest] := DivZeroFloat(FloatRegs[Instr^.Src1], FloatRegs[Instr^.Src2])   // MODERN: IEEE Inf/NaN; CLASSIC: error
           else
-            FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2];
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] / FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
         bcModFloat: begin
-          if FloatRegs[Instr.Src2] = 0.0 then
+          if FloatRegs[Instr^.Src2] = 0.0 then
             raise EZeroDivide.Create('Float modulo by zero');
-          FloatRegs[Instr.Dest] := FloatRegs[Instr.Src1] - FloorDouble(FloatRegs[Instr.Src1] / FloatRegs[Instr.Src2]) * FloatRegs[Instr.Src2];
+          FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Src1] - FloorDouble(FloatRegs[Instr^.Src1] / FloatRegs[Instr^.Src2]) * FloatRegs[Instr^.Src2];
           Inc(CurPC);
         end;
-        bcPowFloat: begin FloatRegs[Instr.Dest] := Power(FloatRegs[Instr.Src1], FloatRegs[Instr.Src2]); Inc(CurPC); end;
-        bcNegFloat: begin FloatRegs[Instr.Dest] := -FloatRegs[Instr.Src1]; Inc(CurPC); end;
+        bcPowFloat: begin FloatRegs[Instr^.Dest] := Power(FloatRegs[Instr^.Src1], FloatRegs[Instr^.Src2]); Inc(CurPC); end;
+        bcNegFloat: begin FloatRegs[Instr^.Dest] := -FloatRegs[Instr^.Src1]; Inc(CurPC); end;
 
         // Type conversions
         // Immediate = 1: the SOURCE was UNSIGNED, so its bit pattern is a magnitude, not a signed
@@ -728,17 +852,17 @@ begin
         // straight to binary32 (ONE rounding). They are independent, and the combination is real:
         // "Dim As Single s = u" on an unsigned u needs both, and used to take the binary32 arm alone -
         // reading the magnitude as a signed number and answering -1 where fbc answers 1.844674e+019.
-        if (Instr.Immediate and 2) <> 0 then
+        if (Instr^.Immediate and 2) <> 0 then
         begin
-          if (Instr.Immediate and 1) <> 0 then
-            FloatRegs[Instr.Dest] := Single(QWord(IntRegs[Instr.Src1]))
+          if (Instr^.Immediate and 1) <> 0 then
+            FloatRegs[Instr^.Dest] := Single(QWord(IntRegs[Instr^.Src1]))
           else
-            FloatRegs[Instr.Dest] := Single(IntRegs[Instr.Src1]);
+            FloatRegs[Instr^.Dest] := Single(IntRegs[Instr^.Src1]);
         end
-        else if (Instr.Immediate and 1) <> 0 then
-          FloatRegs[Instr.Dest] := QWord(IntRegs[Instr.Src1])
+        else if (Instr^.Immediate and 1) <> 0 then
+          FloatRegs[Instr^.Dest] := QWord(IntRegs[Instr^.Src1])
         else
-          FloatRegs[Instr.Dest] := IntRegs[Instr.Src1];
+          FloatRegs[Instr^.Dest] := IntRegs[Instr^.Src1];
             Inc(CurPC);
           end;
         // Implicit float -> int: MODERN rounds (to nearest, ties to even), CLASSIC truncates. See the
@@ -746,105 +870,105 @@ begin
         // Immediate = 1: the DESTINATION is unsigned 64-bit. See the ExecuteInstruction copy.
         bcFloatToInt:
           begin
-            if Instr.Immediate = 1 then
-              IntRegs[Instr.Dest] := FloatToUIntConv(FloatRegs[Instr.Src1], ModernConv)
+            if Instr^.Immediate = 1 then
+              IntRegs[Instr^.Dest] := FloatToUIntConv(FloatRegs[Instr^.Src1], ModernConv)
             else
-              IntRegs[Instr.Dest] := FloatToIntConv(FloatRegs[Instr.Src1], ModernConv);
+              IntRegs[Instr^.Dest] := FloatToIntConv(FloatRegs[Instr^.Src1], ModernConv);
             Inc(CurPC);
           end;
         // Numeric -> string (FreeBASIC Str() / "&" concat): no leading sign-space, unlike v7 STR$.
-        bcIntToString: begin Ctx.StringRegs[Instr.Dest] := IntToStr(IntRegs[Instr.Src1]); Inc(CurPC); end;
+        bcIntToString: begin Ctx.StringRegs[Instr^.Dest] := IntToStr(IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcFloatToString:
           // FreeBASIC Str()/"&" concat: no leading sign-space AND no trailing field-space (FormatNumber
           // adds both under the Commodore preset). Trim both, matching the ExecuteInstruction path.
           // Immediate = 1 -> the value is SINGLE-typed: 7 significant digits, as PRINT gives it.
           begin
-            Ctx.StringRegs[Instr.Dest] := Trim(FConsoleBehavior.FormatNumber(FloatRegs[Instr.Src1],
-                                                                             Instr.Immediate = 1));
+            Ctx.StringRegs[Instr^.Dest] := Trim(FConsoleBehavior.FormatNumber(FloatRegs[Instr^.Src1],
+                                                                             Instr^.Immediate = 1));
             Inc(CurPC);
           end;
         // CINT (round-to-even); Immediate = 1 = unsigned-64 destination. See the ExecuteInstruction copy.
         bcFloatRound:
           begin
-            if Instr.Immediate = 1 then
-              IntRegs[Instr.Dest] := FloatToUIntConv(FloatRegs[Instr.Src1], True)
+            if Instr^.Immediate = 1 then
+              IntRegs[Instr^.Dest] := FloatToUIntConv(FloatRegs[Instr^.Src1], True)
             else
-              IntRegs[Instr.Dest] := Round(FloatRegs[Instr.Src1]);
+              IntRegs[Instr^.Dest] := Round(FloatRegs[Instr^.Src1]);
             Inc(CurPC);
           end;
-        bcNarrowInt: begin IntRegs[Instr.Dest] := NarrowInt64(IntRegs[Instr.Src1], Instr.Immediate); Inc(CurPC); end;  // B1.5
-        bcNarrowSingle: begin FloatRegs[Instr.Dest] := Single(FloatRegs[Instr.Src1]); Inc(CurPC); end;  // B1.5
+        bcNarrowInt: begin IntRegs[Instr^.Dest] := NarrowInt64(IntRegs[Instr^.Src1], Instr^.Immediate); Inc(CurPC); end;  // B1.5
+        bcNarrowSingle: begin FloatRegs[Instr^.Dest] := Single(FloatRegs[Instr^.Src1]); Inc(CurPC); end;  // B1.5
 
         // Integer comparisons (use TrueVal for TRUE, 0 for FALSE)
-        bcCmpEqInt: begin if IntRegs[Instr.Src1] = IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpNeInt: begin if IntRegs[Instr.Src1] <> IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLtInt: begin if IntRegs[Instr.Src1] < IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGtInt: begin if IntRegs[Instr.Src1] > IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLeInt: begin if IntRegs[Instr.Src1] <= IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGeInt: begin if IntRegs[Instr.Src1] >= IntRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpEqInt: begin if IntRegs[Instr^.Src1] = IntRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeInt: begin if IntRegs[Instr^.Src1] <> IntRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtInt: begin if IntRegs[Instr^.Src1] < IntRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtInt: begin if IntRegs[Instr^.Src1] > IntRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpLeInt: begin if IntRegs[Instr^.Src1] <= IntRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGeInt: begin if IntRegs[Instr^.Src1] >= IntRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
         // Unsigned 64-bit comparisons (reinterpret registers as QWord)
-        bcCmpLtUInt: begin if QWord(IntRegs[Instr.Src1]) < QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGtUInt: begin if QWord(IntRegs[Instr.Src1]) > QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLeUInt: begin if QWord(IntRegs[Instr.Src1]) <= QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGeUInt: begin if QWord(IntRegs[Instr.Src1]) >= QWord(IntRegs[Instr.Src2]) then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtUInt: begin if QWord(IntRegs[Instr^.Src1]) < QWord(IntRegs[Instr^.Src2]) then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtUInt: begin if QWord(IntRegs[Instr^.Src1]) > QWord(IntRegs[Instr^.Src2]) then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpLeUInt: begin if QWord(IntRegs[Instr^.Src1]) <= QWord(IntRegs[Instr^.Src2]) then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGeUInt: begin if QWord(IntRegs[Instr^.Src1]) >= QWord(IntRegs[Instr^.Src2]) then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
 
         // Float comparisons (use TrueVal for TRUE, 0 for FALSE)
-        bcCmpEqFloat: begin if FloatRegs[Instr.Src1] = FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpNeFloat: begin if FloatRegs[Instr.Src1] <> FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLtFloat: begin if FloatRegs[Instr.Src1] < FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGtFloat: begin if FloatRegs[Instr.Src1] > FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLeFloat: begin if FloatRegs[Instr.Src1] <= FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGeFloat: begin if FloatRegs[Instr.Src1] >= FloatRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpEqFloat: begin if FloatRegs[Instr^.Src1] = FloatRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeFloat: begin if FloatRegs[Instr^.Src1] <> FloatRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtFloat: begin if FloatRegs[Instr^.Src1] < FloatRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtFloat: begin if FloatRegs[Instr^.Src1] > FloatRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpLeFloat: begin if FloatRegs[Instr^.Src1] <= FloatRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGeFloat: begin if FloatRegs[Instr^.Src1] >= FloatRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
 
         // String comparisons (use TrueVal for TRUE, 0 for FALSE)
-        bcCmpEqString: begin if Ctx.StringRegs[Instr.Src1] = Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpNeString: begin if Ctx.StringRegs[Instr.Src1] <> Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpLtString: begin if Ctx.StringRegs[Instr.Src1] < Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
-        bcCmpGtString: begin if Ctx.StringRegs[Instr.Src1] > Ctx.StringRegs[Instr.Src2] then IntRegs[Instr.Dest] := TrueVal else IntRegs[Instr.Dest] := 0; Inc(CurPC); end;
+        bcCmpEqString: begin if Ctx.StringRegs[Instr^.Src1] = Ctx.StringRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpNeString: begin if Ctx.StringRegs[Instr^.Src1] <> Ctx.StringRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpLtString: begin if Ctx.StringRegs[Instr^.Src1] < Ctx.StringRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
+        bcCmpGtString: begin if Ctx.StringRegs[Instr^.Src1] > Ctx.StringRegs[Instr^.Src2] then IntRegs[Instr^.Dest] := TrueVal else IntRegs[Instr^.Dest] := 0; Inc(CurPC); end;
 
         // Math functions
-        bcMathAbs: begin FloatRegs[Instr.Dest] := Abs(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMathAbs: begin FloatRegs[Instr^.Dest] := Abs(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
         bcMathSgn: begin
-          if FloatRegs[Instr.Src1] > 0 then FloatRegs[Instr.Dest] := 1
-          else if FloatRegs[Instr.Src1] < 0 then FloatRegs[Instr.Dest] := -1
-          else FloatRegs[Instr.Dest] := 0;
+          if FloatRegs[Instr^.Src1] > 0 then FloatRegs[Instr^.Dest] := 1
+          else if FloatRegs[Instr^.Src1] < 0 then FloatRegs[Instr^.Dest] := -1
+          else FloatRegs[Instr^.Dest] := 0;
           Inc(CurPC);
         end;
-        bcMathInt: begin FloatRegs[Instr.Dest] := FloorDouble(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathSqr: begin FloatRegs[Instr.Dest] := SqrtFloat(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathSin: begin FloatRegs[Instr.Dest] := Sin(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathCos: begin FloatRegs[Instr.Dest] := Cos(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathTan: begin FloatRegs[Instr.Dest] := Tan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathExp: begin FloatRegs[Instr.Dest] := Exp(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathLog: begin FloatRegs[Instr.Dest] := LnFloat(FloatRegs[Instr.Src1]); Inc(CurPC); end;
-        bcMathRnd: begin FloatRegs[Instr.Dest] := Random; Inc(CurPC); end;
-        bcMathAtn: begin FloatRegs[Instr.Dest] := ArcTan(FloatRegs[Instr.Src1]); Inc(CurPC); end;
+        bcMathInt: begin FloatRegs[Instr^.Dest] := FloorDouble(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathSqr: begin FloatRegs[Instr^.Dest] := SqrtFloat(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathSin: begin FloatRegs[Instr^.Dest] := Sin(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathCos: begin FloatRegs[Instr^.Dest] := Cos(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathTan: begin FloatRegs[Instr^.Dest] := Tan(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathExp: begin FloatRegs[Instr^.Dest] := Exp(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathLog: begin FloatRegs[Instr^.Dest] := LnFloat(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
+        bcMathRnd: begin FloatRegs[Instr^.Dest] := Random; Inc(CurPC); end;
+        bcMathAtn: begin FloatRegs[Instr^.Dest] := ArcTan(FloatRegs[Instr^.Src1]); Inc(CurPC); end;
 
         // Control flow
         {$IFDEF JIT_PROFILE}
         bcJump:
           begin
-            if BEProfile and (Instr.Immediate < CurPC) then Inc(BEBase[Instr.Immediate]);  // J1 back-edge
-            CurPC := Instr.Immediate;
+            if BEProfile and (Instr^.Immediate < CurPC) then Inc(BEBase[Instr^.Immediate]);  // J1 back-edge
+            CurPC := Instr^.Immediate;
           end;
         bcJumpIfZero:
-          if IntRegs[Instr.Src1] = 0 then
+          if IntRegs[Instr^.Src1] = 0 then
           begin
-            if BEProfile and (Instr.Immediate < CurPC) then Inc(BEBase[Instr.Immediate]);  // J1 back-edge
-            CurPC := Instr.Immediate;
+            if BEProfile and (Instr^.Immediate < CurPC) then Inc(BEBase[Instr^.Immediate]);  // J1 back-edge
+            CurPC := Instr^.Immediate;
           end
           else Inc(CurPC);
         bcJumpIfNotZero:
-          if IntRegs[Instr.Src1] <> 0 then
+          if IntRegs[Instr^.Src1] <> 0 then
           begin
-            if BEProfile and (Instr.Immediate < CurPC) then Inc(BEBase[Instr.Immediate]);  // J1 back-edge
-            CurPC := Instr.Immediate;
+            if BEProfile and (Instr^.Immediate < CurPC) then Inc(BEBase[Instr^.Immediate]);  // J1 back-edge
+            CurPC := Instr^.Immediate;
           end
           else Inc(CurPC);
         {$ELSE}
-        bcJump: CurPC := Instr.Immediate;
-        bcJumpIfZero: if IntRegs[Instr.Src1] = 0 then CurPC := Instr.Immediate else Inc(CurPC);
-        bcJumpIfNotZero: if IntRegs[Instr.Src1] <> 0 then CurPC := Instr.Immediate else Inc(CurPC);
+        bcJump: CurPC := Instr^.Immediate;
+        bcJumpIfZero: if IntRegs[Instr^.Src1] = 0 then CurPC := Instr^.Immediate else Inc(CurPC);
+        bcJumpIfNotZero: if IntRegs[Instr^.Src1] <> 0 then CurPC := Instr^.Immediate else Inc(CurPC);
         {$ENDIF}
         bcCall:
           begin
@@ -854,7 +978,7 @@ begin
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyCall;
             {$ENDIF}
-            CurPC := Instr.Immediate;
+            CurPC := Instr^.Immediate;
           end;
         bcReturn:
           begin
@@ -868,7 +992,7 @@ begin
         // register banks so the callee has its own locals and recursion works.
         bcCallSub:
           begin
-            FramePush(Ctx, Instr.Immediate, CurPC);   // narrowed by callee footprint AND caller liveness
+            FramePush(Ctx, Instr^.Immediate, CurPC);   // narrowed by callee footprint AND caller liveness
             IntRegs := Ctx.IntRegs;                   // may have slid to a relocated frame
             GrowCallStackIfNeeded(Ctx);
             Ctx.CallStack[Ctx.CallStackPtr] := CurPC + 1;
@@ -876,19 +1000,19 @@ begin
             {$IFDEF DEBUG_MODE}
             if Assigned(FDebugger) then FDebugger.NotifyCall;
             {$ENDIF}
-            CurPC := Instr.Immediate;
+            CurPC := Instr^.Immediate;
           end;
         bcCallSubIndirect:  // FreeBASIC function pointer: like bcCallSub but the target entry PC is in Src1 (int reg)
-          if (IntRegs[Instr.Src1] and BUILTIN_FP_TAG) <> 0 then
+          if (IntRegs[Instr^.Src1] and BUILTIN_FP_TAG) <> 0 then
           begin
             // @Sin etc.: compute the math op on the Double arg (xfer slot 0), write the Double result slot.
-            Ctx.XferFloat[255] := ComputeBuiltinFP(IntRegs[Instr.Src1] and $FF, Ctx.XferFloat[0]);
+            Ctx.XferFloat[255] := ComputeBuiltinFP(IntRegs[Instr^.Src1] and $FF, Ctx.XferFloat[0]);
             Inc(CurPC);
           end
           else
           begin
             // Indirect call: the entry PC is in the register, not the Immediate.
-            NextPC := IntRegs[Instr.Src1];            // read BEFORE the view can slide
+            NextPC := IntRegs[Instr^.Src1];            // read BEFORE the view can slide
             FramePush(Ctx, NextPC, CurPC);
             IntRegs := Ctx.IntRegs;
             GrowCallStackIfNeeded(Ctx);
@@ -912,44 +1036,44 @@ begin
         // OS threading (M5.2, FreeBASIC API).
         bcLoadProcAddr:
           // @sub: the SUB's entry PC was resolved into Immediate at link time; load it into Dest.
-          begin Ctx.IntRegs[Instr.Dest] := Instr.Immediate; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := Instr^.Immediate; Inc(CurPC); end;
         bcThreadCreate:
           // h = THREADCREATE/THREADCALL: spawn a worker running the SUB at the entry PC (Src1). The
           // arguments are already staged in this context's transfer slots; SpawnWorker snapshots them
           // into the worker. The returned int handle goes into Dest. Falls through.
           begin
-            Ctx.IntRegs[Instr.Dest] := SpawnWorker(Ctx.IntRegs[Instr.Src1], Ctx);
+            Ctx.IntRegs[Instr^.Dest] := SpawnWorker(Ctx.IntRegs[Instr^.Src1], Ctx);
             Inc(CurPC);
           end;
         bcThreadWait:
           // THREADWAIT h: join the worker named by the handle in Src1, then continue.
-          begin JoinWorker(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin JoinWorker(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcThreadSelf:
           // THREADSELF(): the current thread's handle (0 on the main thread).
-          begin Ctx.IntRegs[Instr.Dest] := GSelfHandle; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := GSelfHandle; Inc(CurPC); end;
         bcThreadDetach:
           // THREADDETACH h: detach the worker named by the handle in Src1.
-          begin DetachWorker(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin DetachWorker(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         // Mutexes (M5.4, FreeBASIC API).
         bcMutexCreate:
-          begin Ctx.IntRegs[Instr.Dest] := CreateMutex; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := CreateMutex; Inc(CurPC); end;
         bcMutexLock:
-          begin LockMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin LockMutex(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcMutexUnlock:
-          begin UnlockMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin UnlockMutex(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcMutexDestroy:
-          begin DestroyMutex(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin DestroyMutex(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         // Condition variables (M5.4, FreeBASIC API).
         bcCondCreate:
-          begin Ctx.IntRegs[Instr.Dest] := CreateCond; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := CreateCond; Inc(CurPC); end;
         bcCondWait:
-          begin CondWaitOp(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]); Inc(CurPC); end;
+          begin CondWaitOp(Ctx.IntRegs[Instr^.Src1], Ctx.IntRegs[Instr^.Src2]); Inc(CurPC); end;
         bcCondSignal:
-          begin CondSignalOp(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin CondSignalOp(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcCondBroadcast:
-          begin CondBroadcastOp(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin CondBroadcastOp(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcCondDestroy:
-          begin DestroyCond(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;
+          begin DestroyCond(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
         bcRecMarkPush:
           begin
@@ -971,212 +1095,84 @@ begin
           end;
         // Transfer registers (M2): move a value to/from the non-saved transfer banks.
         bcXferStoreInt:
-          begin Ctx.XferInt[Instr.Immediate] := Ctx.IntRegs[Instr.Src1]; Inc(CurPC); end;
+          begin Ctx.XferInt[Instr^.Immediate] := Ctx.IntRegs[Instr^.Src1]; Inc(CurPC); end;
         bcXferStoreFloat:
-          begin Ctx.XferFloat[Instr.Immediate] := Ctx.FloatRegs[Instr.Src1]; Inc(CurPC); end;
+          begin Ctx.XferFloat[Instr^.Immediate] := Ctx.FloatRegs[Instr^.Src1]; Inc(CurPC); end;
         bcXferStoreString:
-          begin Ctx.XferStr[Instr.Immediate] := Ctx.StringRegs[Instr.Src1]; Inc(CurPC); end;
+          begin Ctx.XferStr[Instr^.Immediate] := Ctx.StringRegs[Instr^.Src1]; Inc(CurPC); end;
         bcXferLoadInt:
-          begin Ctx.IntRegs[Instr.Dest] := Ctx.XferInt[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := Ctx.XferInt[Instr^.Immediate]; Inc(CurPC); end;
         bcXferLoadFloat:
-          begin Ctx.FloatRegs[Instr.Dest] := Ctx.XferFloat[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr^.Dest] := Ctx.XferFloat[Instr^.Immediate]; Inc(CurPC); end;
         bcXferLoadString:
-          begin Ctx.StringRegs[Instr.Dest] := Ctx.XferStr[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.StringRegs[Instr^.Dest] := Ctx.XferStr[Instr^.Immediate]; Inc(CurPC); end;
         // UDT/record heap (M3)
         bcRecordNew:
           begin
             // Immediate bit 48 (M5.2c refinement): allocate in the shared region (cross-thread, e.g. a
             // SHARED UDT scalar); otherwise in this thread's per-context heap. typeId is bits 32..47.
-            if (Instr.Immediate shr 48) and 1 <> 0 then
-              Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1,
-                                      Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF)
+            if (Instr^.Immediate shr 48) and 1 <> 0 then
+              Ctx.IntRegs[Instr^.Dest] := AllocSharedRecord(Instr^.Src1,
+                                      Instr^.Immediate and $FFFF, (Instr^.Immediate shr 32) and $FFFF)
             else
-              Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1,
-                                      Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
+              Ctx.IntRegs[Instr^.Dest] := AllocRecord(Ctx, Instr^.Src1,
+                                      Instr^.Immediate and $FFFF, (Instr^.Immediate shr 32) and $FFFF);
             Inc(CurPC);
           end;
         bcRecordNewArray:
           begin
-            RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);
+            RecordNewArrayInit(Ctx, Instr^.Src1, Instr^.Immediate);
             Inc(CurPC);
           end;
         bcRecordNewArrayInd:  // array-of-UDT MEMBER: FArrays id is the runtime handle in IntRegs[Src1]
           begin
-            RecordNewArrayInit(Ctx, IntRegs[Instr.Src1], Instr.Immediate);
+            RecordNewArrayInit(Ctx, IntRegs[Instr^.Src1], Instr^.Immediate);
             Inc(CurPC);
           end;
         bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first
           begin
-            IntRegs[Instr.Dest] := AllocSharedRecordBlock(IntRegs[Instr.Src1],
-                                     Instr.Immediate and $FFFF,
-                                     (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
+            IntRegs[Instr^.Dest] := AllocSharedRecordBlock(IntRegs[Instr^.Src1],
+                                     Instr^.Immediate and $FFFF,
+                                     (Instr^.Immediate shr 32) and $FFFF, (Instr^.Immediate shr 48) and $FFFF);
             Inc(CurPC);
           end;
         // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
         bcRecordLoadInt:
-          begin Ctx.IntRegs[Instr.Dest] := RecFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate); Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := RecFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate); Inc(CurPC); end;
         bcRecordLoadFloat:
-          begin Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate); Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr^.Dest] := RecFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate); Inc(CurPC); end;
         bcRecordLoadString:
-          begin Ctx.StringRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate]; Inc(CurPC); end;
+          begin Ctx.StringRegs[Instr^.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1])^.StringData[Instr^.Immediate]; Inc(CurPC); end;
         bcRecordStoreInt:
-          begin RecSetFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.IntRegs[Instr.Src2]); Inc(CurPC); end;
+          begin RecSetFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate, Ctx.IntRegs[Instr^.Src2]); Inc(CurPC); end;
         bcRecordStoreFloat:
-          begin RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.FloatRegs[Instr.Src2]); Inc(CurPC); end;
+          begin RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate, Ctx.FloatRegs[Instr^.Src2]); Inc(CurPC); end;
         bcRecordStoreString:
-          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2]; Inc(CurPC); end;
+          begin ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1])^.StringData[Instr^.Immediate] := Ctx.StringRegs[Instr^.Src2]; Inc(CurPC); end;
         bcRecordTypeId:
-          begin Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId; Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1])^.TypeId; Inc(CurPC); end;
         // OOP: move the object's DYNAMIC type one level along the chain. Emitted at the top of every
         // constructor body (after the base chain) and of every destructor body, so a virtual call made
         // from there reaches the level being built or torn down - C++ and FreeBASIC semantics.
         bcRecordSetTypeId:
-          begin ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId := Instr.Immediate; Inc(CurPC); end;
+          begin ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1])^.TypeId := Instr^.Immediate; Inc(CurPC); end;
         bcRecordFree:
-          begin FreeSharedRecord(Ctx.IntRegs[Instr.Src1]); Inc(CurPC); end;   // DELETE p
+          begin FreeSharedRecord(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;   // DELETE p
 
-        // Array operations - typed versions are faster. Bounds-guarded to match the base ExecuteArrayOp
-        // path and the m207 model: MODERN OOB read -> default, OOB store -> dropped (memory-safe); CLASSIC raises.
-        bcArrayLoadInt:
-          begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              Ctx.IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]]
-            else
-              Ctx.IntRegs[Instr.Dest] := 0;
-            Inc(CurPC);
-          end;
-        bcArrayLoadFloat:
-          begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              Ctx.FloatRegs[Instr.Dest] := FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]]
-            else
-              Ctx.FloatRegs[Instr.Dest] := 0.0;
-            Inc(CurPC);
-          end;
-        bcArrayLoadString:
-          begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              Ctx.StringRegs[Instr.Dest] := FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]]
-            else
-              Ctx.StringRegs[Instr.Dest] := '';
-            Inc(CurPC);
-          end;
-        bcArrayStoreInt:
-          begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              FArrays[Instr.Src1].IntData[IntRegs[Instr.Src2]] := IntRegs[Instr.Dest];
-            Inc(CurPC);
-          end;
-        bcArrayStoreFloat:
-          begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              FArrays[Instr.Src1].FloatData[IntRegs[Instr.Src2]] := FloatRegs[Instr.Dest];
-            Inc(CurPC);
-          end;
-        bcArrayStoreString:
-          begin
-            if ArrayBoundsOK(Instr.Src1, IntRegs[Instr.Src2]) then
-              FArrays[Instr.Src1].StringData[IntRegs[Instr.Src2]] := Ctx.StringRegs[Instr.Dest];
-            Inc(CurPC);
-          end;
-
-        // Array dimension (slow path - only at initialization)
-        bcArrayDim:
-          begin
-            ArrayIdx := Instr.Src1;
-            ArrInfo := FProgram.GetArray(ArrayIdx);
-            if ArrayIdx >= Length(FArrays) then
-              SetLength(FArrays, ArrayIdx + 1);
-            FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
-            FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
-            SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
-            SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
-            for i := 0 to ArrInfo.DimCount - 1 do
-            begin
-              // Effective lower bound: a RUNTIME lb register (FreeBASIC "Lbound(m) To Ubound(m)")
-              // overrides the compile-time constant; recorded for LBOUND/UBOUND and index adjustment.
-              ArrLowerBound := 0;
-              if (i < Length(ArrInfo.LowerBoundRegisters)) and (ArrInfo.LowerBoundRegisters[i] >= 0) then
-                ArrLowerBound := IntRegs[ArrInfo.LowerBoundRegisters[i]]
-              else if i <= High(ArrInfo.LowerBounds) then
-                ArrLowerBound := ArrInfo.LowerBounds[i];
-              FArrays[ArrayIdx].LowerBounds[i] := ArrLowerBound;
-
-              if ArrInfo.Dimensions[i] = 0 then
-              begin
-                // Variable upper bound: size = ub - lb + 1.
-                case ArrInfo.DimRegTypes[i] of
-                  srtInt: FArrays[ArrayIdx].Dimensions[i] := IntRegs[ArrInfo.DimRegisters[i]] - ArrLowerBound + 1;
-                  srtFloat: FArrays[ArrayIdx].Dimensions[i] := Trunc(FloatRegs[ArrInfo.DimRegisters[i]]) - ArrLowerBound + 1;
-                end;
-              end
-              else
-                FArrays[ArrayIdx].Dimensions[i] := ArrInfo.Dimensions[i];
-            end;
-            ProdDims := 1;
-            for i := 0 to ArrInfo.DimCount - 1 do
-              ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
-            FArrays[ArrayIdx].TotalSize := ProdDims;
-            case ArrInfo.ElementType of
-              srtInt: SetLength(FArrays[ArrayIdx].IntData, ProdDims);
-              srtFloat: SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
-              srtString: SetLength(FArrays[ArrayIdx].StringData, ProdDims);
-            end;
-            Inc(CurPC);
-          end;
-
-        // LBOUND/UBOUND(arr[, dim]) - bound of a dimension (B1.4)
-        bcArrayLBound:
-          begin
-            ArrayIdx := Instr.Src1;
-            LinearIdx := IntRegs[Instr.Src2];  // 0-based dim index
-            IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
-            Inc(CurPC);
-          end;
-        bcArrayUBound:
-          begin
-            ArrayIdx := Instr.Src1;
-            LinearIdx := IntRegs[Instr.Src2];  // 0-based dim index
-            IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
-                                   + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
-            Inc(CurPC);
-          end;
-
-        // ERASE arr / REDIM [PRESERVE] arr(ub) (B1.4)
-        bcArrayErase:
-          begin
-            EraseArray(Instr.Src1);
-            Inc(CurPC);
-          end;
-        bcArrayRedim:
-          begin
-            RedimArray(Instr.Src1, IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0);
-            Inc(CurPC);
-          end;
-
-        // Generic array load/store (slower - legacy)
-        bcArrayLoad:
-          begin
-            ArrayIdx := Instr.Src1;
-            LinearIdx := IntRegs[Instr.Src2];
-            case FArrays[ArrayIdx].ElementType of
-              0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-              1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-              2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-            end;
-            Inc(CurPC);
-          end;
-        bcArrayStore:
-          begin
-            ArrayIdx := Instr.Src1;
-            LinearIdx := IntRegs[Instr.Src2];
-            case FArrays[ArrayIdx].ElementType of
-              0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
-              1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
-              2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
-            end;
-            Inc(CurPC);
-          end;
+        // ⛔ THE GROUP-3 ARMS THAT USED TO SIT HERE WERE UNREACHABLE, AND THEY WERE NOT FREE.
+        // bcArrayLoadInt/Float/String, bcArrayStore*, bcArrayDim, bcArrayRedim, bcArrayErase,
+        // bcArrayLBound/UBound and the two deprecated generic forms are all GROUP 3 opcodes, and the
+        // outer case routes group 3 away before this one is ever entered - the hot typed accessors to
+        // ArrayHotOps.inc, everything else to ExecuteArrayOp. A group-3 value cannot reach the group-0
+        // case, so these 143 lines could never run.
+        //
+        // They still cost, which is why they are gone rather than merely commented: they are the only
+        // users of ArrInfo (a RECORD), ArrayIdx, LinearIdx, ProdDims and ArrLowerBound, so their
+        // presence forced those locals into the frame of the interpreter's hottest procedure - the one
+        // place where register pressure is the measured problem.
+        //
+        // The check that this is right is loud: a live opcode with no arm falls to the case's else,
+        // which raises "Unknown Group 0 opcode" on the first execution.
 
         // NOTE: I/O operations (bcPrint*, bcInput*) are now handled by Group 4 (ExecuteIOOp)
         // NOTE: String operations (bcStr*) are now handled by Group 1 (ExecuteStringOp)
@@ -1184,45 +1180,45 @@ begin
         // Bitwise operations
         bcBitwiseAnd:
           begin
-            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] and IntRegs[Instr.Src2];
+            IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] and IntRegs[Instr^.Src2];
             Inc(CurPC);
           end;
         bcBitwiseOr:
           begin
-            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] or IntRegs[Instr.Src2];
+            IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] or IntRegs[Instr^.Src2];
             Inc(CurPC);
           end;
         bcBitwiseXor:
           begin
-            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] xor IntRegs[Instr.Src2];
+            IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] xor IntRegs[Instr^.Src2];
             Inc(CurPC);
           end;
         bcBitwiseNot:
           begin
-            IntRegs[Instr.Dest] := not IntRegs[Instr.Src1];
+            IntRegs[Instr^.Dest] := not IntRegs[Instr^.Src1];
             Inc(CurPC);
           end;
         bcShl:  // FreeBASIC SHL
           begin
-            IntRegs[Instr.Dest] := IntRegs[Instr.Src1] shl IntRegs[Instr.Src2];
+            IntRegs[Instr^.Dest] := IntRegs[Instr^.Src1] shl IntRegs[Instr^.Src2];
             Inc(CurPC);
           end;
         bcShr:  // MODERN: arithmetic (a signed operand keeps its sign, "-5 Shr 2" = -2). CLASSIC: logical.
           begin
             if ModernConv then
-              IntRegs[Instr.Dest] := ArithShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2])
+              IntRegs[Instr^.Dest] := ArithShr64(IntRegs[Instr^.Src1], IntRegs[Instr^.Src2])
             else
-              IntRegs[Instr.Dest] := LogicalShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2]);
+              IntRegs[Instr^.Dest] := LogicalShr64(IntRegs[Instr^.Src1], IntRegs[Instr^.Src2]);
             Inc(CurPC);
           end;
         bcShrUInt:  // SHR on an unsigned operand (UInteger/ULongInt): zero-filling
           begin
-            IntRegs[Instr.Dest] := LogicalShr64(IntRegs[Instr.Src1], IntRegs[Instr.Src2]);
+            IntRegs[Instr^.Dest] := LogicalShr64(IntRegs[Instr^.Src1], IntRegs[Instr^.Src2]);
             Inc(CurPC);
           end;
         bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
           begin
-            if Instr.Immediate <> 0 then RandSeed := Cardinal(IntRegs[Instr.Src1]) else Randomize;
+            if Instr^.Immediate <> 0 then RandSeed := Cardinal(IntRegs[Instr^.Src1]) else Randomize;
             Inc(CurPC);
           end;
 
@@ -1233,7 +1229,7 @@ begin
         bcLoadTI, bcLoadTIS, bcStoreTIS, bcLoadDTS, bcFre, bcPeek, bcPoke:
           begin
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             CurPC := Ctx.PC + 1;
           end;
 
@@ -1271,7 +1267,7 @@ begin
           begin
             // CLR: Clear all variables (fall back to slow path for simplicity)
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             CurPC := Ctx.PC + 1;
           end;
 
@@ -1280,7 +1276,7 @@ begin
           begin
             // Fall back to slow path
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             CurPC := Ctx.PC + 1;
           end;
 
@@ -1288,7 +1284,7 @@ begin
         bcDataAdd, bcDataReadInt, bcDataReadFloat, bcDataReadString, bcDataRestore:
           begin
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             CurPC := Ctx.PC + 1;
           end;
 
@@ -1298,7 +1294,7 @@ begin
         bcAssert:
           begin
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             if not Ctx.Running then Break;  // CTRL+C, quit requested, or a failed ASSERT
             CurPC := Ctx.PC + 1;
           end;
@@ -1307,7 +1303,7 @@ begin
         bcFast, bcSlow, bcSleep, bcKey, bcFrame:
           begin
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             CurPC := Ctx.PC + 1;
           end;
 
@@ -1317,10 +1313,10 @@ begin
             // TRAP linenum - Set error handler line
             // If Immediate >= 0, use it directly (constant line number)
             // If Immediate = -1, use register R[Src1] (variable line number)
-            if Instr.Immediate >= 0 then
-              Ctx.TrapLine := Instr.Immediate
+            if Instr^.Immediate >= 0 then
+              Ctx.TrapLine := Instr^.Immediate
             else
-              Ctx.TrapLine := IntRegs[Instr.Src1];
+              Ctx.TrapLine := IntRegs[Instr^.Src1];
             if Ctx.TrapLine > 0 then
               Ctx.TrapPC := -1  // Will be resolved when error occurs
             else
@@ -1340,10 +1336,10 @@ begin
               // perfectly valid register - the old Src1 <> 0 test alone silently degraded
               // RESUME <line> to plain RESUME when the line landed in R0). Src1 <> 0 is kept
               // as a fallback for .basc files predating the flag.
-              if (Instr.Immediate = -1) or (Instr.Src1 <> 0) then
+              if (Instr^.Immediate = -1) or (Instr^.Src1 <> 0) then
               begin
                 // RESUME <line> - jump to specified line
-                CurPC := FProgram.FindPCForLine(IntRegs[Instr.Src1]);
+                CurPC := FProgram.FindPCForLine(IntRegs[Instr^.Src1]);
                 if CurPC < 0 then
                   CurPC := InstrCount;  // Line not found - end program
               end
@@ -1389,7 +1385,7 @@ begin
           begin
             // ON ERROR GOTO <label> - install a label-based error handler.
             // Immediate = resolved handler PC; TrapLine = -2 marks "label handler, PC pre-resolved".
-            Ctx.TrapPC := Instr.Immediate;
+            Ctx.TrapPC := Instr^.Immediate;
             Ctx.TrapLine := -2;
             Inc(CurPC);
           end;
@@ -1398,7 +1394,7 @@ begin
             // RESUME <label> - resume at a named label (Immediate = target PC)
             if Ctx.InErrorHandler then
             begin
-              CurPC := Instr.Immediate;
+              CurPC := Instr^.Immediate;
               Ctx.InErrorHandler := False;
               ResetErrorStateIfModern(Ctx);  // FreeBASIC clears Err after RESUME <label> (MODERN only)
               System.Continue;  // Jump to target PC immediately
@@ -1423,7 +1419,7 @@ begin
         bcRaiseError:
           begin
             Ctx.PC := CurPC;
-            ExecuteInstruction(Ctx, Instr);
+            ExecuteInstruction(Ctx, Instr^);
             CurPC := Ctx.PC + 1;
           end;
       else

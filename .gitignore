@@ -90,3 +90,9 @@ VM_EVOLUTION.md
 # *.so
 # *.dylib
 test_out.txt
+
+# Per-machine build configuration: which Free Pascal compiler this checkout uses, chosen once by
+# ./build.sh --select-fpc. It holds absolute paths, so committing it would point every other machine
+# at a compiler that is not there.
+setup.config.json
+src/hotdisp.o

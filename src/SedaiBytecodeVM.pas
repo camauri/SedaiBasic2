@@ -245,6 +245,11 @@ type
     // the on-file bytecode and TBytecodeInstruction.OpCode are left untouched (format unchanged).
     FDenseOps: array of Word;
     FDenseOpsFor: TBytecodeProgram;   // the program FDenseOps was built for (rebuild guard)
+    {$IFDEF HOT_C}
+    FHotOp: array of Word;            // per PC: 1 + the C arm that runs it, 0 = not the C loop's
+    FHotOpBase: array of Word;        // ...before the run-wide gate is folded in
+    FHotOpEnabled: Boolean;
+    {$ENDIF}
     {$IFDEF JIT_PROFILE}
     // JIT hot-loop profiling (milestone J1): per-instruction count of how often a BACKWARD branch
     // targets that PC. A loop back-edge is a branch to a lower PC, so a high count marks a hot loop
@@ -489,6 +494,7 @@ type
     // Dialect-aware bounds test for a flat element index. Returns True when in range. Out of bounds:
     // CLASSIC (Commodore ?BAD SUBSCRIPT) or an explicit --bounds-check raises; MODERN (FreeBASIC, which
     // does not bounds-check) returns False so the caller yields a default on read / skips the write.
+    function ArrayBoundsFail(ArrayIdx, LinearIdx: Integer): Boolean;   // the raise path, out of line
     function ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean; inline;
     procedure EraseArray(ArrayIdx: Integer; Deallocate: Boolean = False);      // B1.4: ERASE (deallocate = dynamic array)
     procedure RedimArray(ArrayIdx, NewUpper: Integer; Preserve: Boolean; HasNewLower: Boolean = False; NewLower: Integer = 0);  // B1.4: REDIM (1-D)
@@ -516,6 +522,9 @@ type
     {$ENDIF}
     // Build FDenseOps for the current program if it is not already current (VM perf plan M2).
     procedure EnsureDenseOps;
+    {$IFDEF HOT_C}
+    procedure SetHotOpEnabled(AEnabled: Boolean);
+    {$ENDIF}
     // JIT (J2/J3): compile every eligible hot loop of the current program to native (called from
     // EnsureDenseOps when FJitEnabled). Loops with an unsupported opcode are left to the interpreter.
     procedure BuildJitLoops;
@@ -788,6 +797,10 @@ uses
   // drawing surface, because unlike sbv's controller it is not the graphics backend itself. In the
   // implementation section so the interface of this unit stays free of it.
   SedaiTerminalIO;
+
+{$IFDEF HOT_C}
+{$ENDIF}
+
 
 // Declared here because ExecuteSuperinstruction (bcStrConcatCharAt) calls it well before its
 // definition further down, next to AppendString.
@@ -2561,7 +2574,15 @@ begin
     // Array element and bound reads. The array itself lives in FArrays, a bank of its own that is
     // never relocated, so an array opcode is transparent to the sliding view: only its register
     // operands matter here. Src1 is the array ID (an immediate), Src2 the index register.
-    bcArrayLoadInt, bcArrayLBound, bcArrayUBound:
+    bcArrayLoadInt, bcArrayLBound, bcArrayUBound,
+    // ⭐ THE FUSED LOOP COUNTER writes its counter into Dest and nothing else in the bank.
+    // Auditing this family is not a micro-narrowing: an UNAUDITED opcode disqualifies its whole
+    // procedure from call-site liveness (see BuildCallSiteLiveness), and every superinstruction was
+    // unaudited - so a single fused branch inside a recursive SUB pushed every call in it back to
+    // the callee-footprint snapshot. Measured on binary-trees: the superinstruction pass and the
+    // frame narrowing were cancelling each other out, 3.7 s -> 7.6 s, TWICE as slow with strictly
+    // FEWER instructions to execute. The fusion was never the cost; losing the narrowing was.
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
       Result := IW_DEST;
     // Dest is not an operand of these at all. Saying so matters for the LOW end of the range and
     // only there: an absent operand lowers to register 0 ([[absent-operand-lowers-to-r0]]), so
@@ -2593,7 +2614,28 @@ begin
     // and bcConScreen even uses Immediate as a register INDEX.
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn, bcPrintInt, bcPrintIntLn,
     bcPrintComma, bcPrintSemicolon, bcPrintTab, bcPrintSpc, bcPrintNewLine, bcPrintEnd,
-    bcPrintBool, bcPrintUInt:
+    bcPrintBool, bcPrintUInt,
+    // The fused compare-and-branch family consumes its operands and stores nothing: the truth value
+    // that used to occupy a register is exactly what the fusion removes. The float forms read the
+    // float bank, so they write no integer register either.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // The string and unsigned forms likewise consume their operands and store nothing.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
+    // Thread primitives: each takes a HANDLE out of the integer bank and returns nothing to it.
+    // Verified against RunTemplate.inc - "LockMutex(Ctx.IntRegs[Instr^.Src1])" and its siblings.
+    // Leaving them unaudited disqualified every procedure that touches a mutex, which is both
+    // multi-threaded benchmarks: binary-trees' WORKER and spectral-norm's whole worker unit.
+    bcMutexLock, bcMutexUnlock, bcMutexDestroy,
+    bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy,
+    // INT(x): "FloatRegs[Dest] := FloorDouble(FloatRegs[Src1])" - float in, float out, nothing of
+    // ours on either side. Unaudited, its float Src1 counted as an INTEGER read of that register
+    // number, and one such read anywhere in the program refused relocation to a procedure that
+    // merely wrote the same number in the integer bank. Measured on a recursive fib whose only
+    // Int() was in a PRINT executed once: 137 ms against 86 with it gone.
+    bcMathInt:
       Result := IW_NONE;
   else
     Result := IW_UNKNOWN;
@@ -2661,7 +2703,23 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadString, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase:
+    bcArrayBindInd, bcArrayErase,
+    // ⭐ THE FUSED BRANCH FAMILY WRITES NO REGISTER AT ALL, in any bank - it consumes a comparison
+    // and moves the PC - and the loop-counter forms write only the integer counter. Leaving them
+    // unaudited is what made the superinstruction pass LOSE on call-heavy programs: BW_UNKNOWN
+    // credits Dest, Src1 and Src2 to this bank, so one fused branch in a recursive SUB widened its
+    // STRING bank, and the string bank is refcounted. binary-trees paid it once per call.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    // The float compare-and-branch READS two floats and writes none of them.
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // ⚠️ The STRING compare-and-branch READS two string registers and writes NEITHER - a branch
+    // stores nothing. BW is a WRITE-set question, so BW_NONE is right in both banks; saying
+    // otherwise here would widen every frame that contains one.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := BW_NONE;
   else
     Result := BW_UNKNOWN;
@@ -2698,7 +2756,19 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase:
+    bcArrayBindInd, bcArrayErase,
+    // The fused branch family again - and THIS is the bank where leaving it unaudited was expensive,
+    // because every entry here is a refcounted assignment. See the note in BcFloatWriteShape.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // ⚠️ The STRING compare-and-branch READS two string registers and writes NEITHER - a branch
+    // stores nothing. BW is a WRITE-set question, so BW_NONE is right in both banks; saying
+    // otherwise here would widen every frame that contains one.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
       Result := BW_NONE;
   else
     Result := BW_UNKNOWN;
@@ -2722,6 +2792,29 @@ const
   // wrong in the direction that kills a live register.
   US_DEST    = 4;
 
+function BcIsFusedCondBranch(Op: Word): Boolean;
+// The superinstruction branch family: every one of them carries its target in Immediate and either
+// takes it or falls through, so each has TWO successors exactly like bcJumpIfZero.
+//
+// ⛔ This list and the two shape tables above must move together. Auditing an opcode's operands
+// while leaving its control flow unknown is worse than not auditing it at all: the procedure becomes
+// ELIGIBLE, and the backward liveness then treats a branch as pure fall-through - so a register live
+// only on the taken edge is called dead and gets dropped from the frame snapshot. That is a silent
+// miscompile, not a missed narrowing.
+begin
+  case Op of
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroInt, bcBranchNeZeroInt, bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt,
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 function BcIntUseShape(Op: Word): Integer;
 begin
   case Op of
@@ -2740,7 +2833,14 @@ begin
     bcArrayBind, bcArrayUnbind, bcArrayBindApply, bcArrayErase,
     // PRINT of a float or a string, and the pure layout ops: nothing of ours is read.
     bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
-    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd:
+    bcPrintComma, bcPrintSemicolon, bcPrintNewLine, bcPrintEnd,
+    // A FLOAT compare-and-branch reads two floats and branches: nothing of ours is read.
+    bcBranchEqFloat, bcBranchNeFloat, bcBranchLtFloat, bcBranchGtFloat, bcBranchLeFloat, bcBranchGeFloat,
+    bcBranchEqZeroFloat, bcBranchNeZeroFloat,
+    // A STRING compare-and-branch reads two strings: nothing of ours.
+    bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString, bcBranchLeString, bcBranchGeString,
+    // INT(x) is float in, float out: "FloatRegs[Dest] := FloorDouble(FloatRegs[Src1])".
+    bcMathInt:
       Result := US_NONE;
     bcCopyInt, bcNegInt, bcBitwiseNot, bcXferStoreInt, bcJumpIfZero, bcJumpIfNotZero,
     bcIntToFloat, bcIntToString, bcNarrowInt,
@@ -2751,7 +2851,12 @@ begin
     // ...and PRINT of an integer value, or a TAB/SPC count, reads it from Src1.
     bcPrintInt, bcPrintIntLn, bcPrintBool, bcPrintUInt, bcPrintTab, bcPrintSpc,
     // The counting bit intrinsics take one operand; the WIDTH is an immediate, not a register.
-    bcBitClz, bcBitCtz, bcBitPopcnt:
+    bcBitClz, bcBitCtz, bcBitPopcnt,
+    // "if r[Src1] <> 0 goto target": one integer operand, the target is an immediate.
+    bcBranchEqZeroInt, bcBranchNeZeroInt,
+    // Thread primitives taking one HANDLE from the integer bank and writing nothing back to it.
+    bcMutexLock, bcMutexUnlock, bcMutexDestroy,
+    bcCondSignal, bcCondBroadcast, bcCondDestroy:
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
@@ -2766,8 +2871,19 @@ begin
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
     bcBitRotl, bcBitRotr,   // Src1 = value, Src2 = rotate count (the width is an immediate)
-    bcRecordStoreInt:   // Src1 = handle, Src2 = the integer value being stored
+    bcRecordStoreInt,   // Src1 = handle, Src2 = the integer value being stored
+    // The fused compare-and-branch reads the two operands the CmpInt used to read.
+    bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
+    // Unsigned reads the same two INT registers; only the comparison differs.
+    bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
+    // "CondWaitOp(Ctx.IntRegs[Instr^.Src1], Ctx.IntRegs[Instr^.Src2])": the condition and the mutex.
+    bcCondWait:
       Result := US_SRC1 or US_SRC2;
+    // The fused loop counter reads all three: the counter in Dest (which it also writes), the step
+    // in Src1 and the limit in Src2. Dropping US_DEST here would be the silent miscompile this
+    // table's header warns about - the counter would look dead across a call.
+    bcAddIntToBranchLe, bcAddIntToBranchLt, bcSubIntToBranchGe, bcSubIntToBranchGt:
+      Result := US_SRC1 or US_SRC2 or US_DEST;
   else
     Result := US_UNKNOWN;
   end;
@@ -3393,7 +3509,8 @@ begin
       Op := Instr.OpCode;
       if (BcIntWriteShapeRaw(Op) = IW_UNKNOWN) or (BcIntUseShape(Op) = US_UNKNOWN) then
       begin Eligible := False; Break; end;
-      if (Op = Ord(bcJump)) or (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) then
+      if (Op = Ord(bcJump)) or (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) or
+         BcIsFusedCondBranch(Op) then
       begin
         Tgt := Instr.Immediate;
         if (Tgt < PcStart) or (Tgt > PcEnd) then begin Eligible := False; Break; end;
@@ -3427,7 +3544,8 @@ begin
         begin
           for w := 0 to Words - 1 do Out_[w] := Live[(Instr.Immediate - PcStart) * Words + w];
         end
-        else if (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) then
+        else if (Op = Ord(bcJumpIfZero)) or (Op = Ord(bcJumpIfNotZero)) or
+                BcIsFusedCondBranch(Op) then
         begin
           for w := 0 to Words - 1 do
             Out_[w] := Live[(Instr.Immediate - PcStart) * Words + w] or
@@ -5667,7 +5785,19 @@ begin
     if Instr.OpCode >= bcGroupSuper then
     begin
       case Instr.OpCode of
-        // Fused compare-and-branch (Int) - use IntRegs for Src1, Src2
+        // Fused compare-and-branch (String) - Src1/Src2 index the STRING bank. ⛔ This case has no
+        // else branch: an opcode missing here contributes ZERO, the bank is sized too small, and the
+        // interpreter writes past the end - a heap corruption that surfaces at program EXIT, far
+        // from the cause. It is the fourth of the four unchecked counters an opcode addition touches.
+        bcBranchEqString, bcBranchNeString, bcBranchLtString, bcBranchGtString,
+        bcBranchLeString, bcBranchGeString:
+        begin
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+        end;
+
+        // Fused compare-and-branch (Int, and Unsigned which reads the same bank) - IntRegs
+        bcBranchLtUInt, bcBranchLeUInt, bcBranchGtUInt, bcBranchGeUInt,
         bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt:
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
@@ -5785,6 +5915,27 @@ begin
         bcArrayLoadIntBranchNZ, bcArrayLoadIntBranchZ:
         begin
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index register
+        end;
+
+        // The string fusions. ⛔ These three were MISSING here until 19 Aug 2026: they contributed
+        // zero to the string bank, and only the fact that their registers are also touched by an
+        // ordinary string opcode elsewhere in the same program kept the bank big enough. That is
+        // luck, not design - a register used ONLY by one of these would have sized the bank short.
+        // Dest/Src1/Src2 are string registers, Immediate is the INT register holding the index.
+        bcStrConcatCharAt, bcStrAppendMapped, bcStrMidAssign:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+          if Instr.Src2 > MaxStringReg then MaxStringReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
+        end;
+        // MID$ into an array element: Src1 is the ARRAY ID and indexes no bank at all; Dest is the
+        // replacement (string), Src2 the linear index and Immediate the start (both int).
+        bcStrMidAssignArr:
+        begin
+          if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+          if (Instr.Immediate and $FFFF) > MaxIntReg then MaxIntReg := Instr.Immediate and $FFFF;
         end;
       end;
     end
@@ -8283,6 +8434,8 @@ var
   MidRepl: AnsiString; // bcStrMidAssign: the replacement, held across a possible Dest/Src2 collision
   SrcLen: Integer;   // ...length of the accumulator being extended
   CharVal: AnsiChar; // ...and the byte taken from the table
+  ArrayIdx: Integer;   // bcStrMidAssignArr: the target array...
+  LinearIdx: Integer;  // ...and the element inside it
 begin
   // Superinstructions use sub-opcode (low byte) for dispatch
   // Full opcode is 0xC800 + SubOp (group 200)
@@ -8654,6 +8807,36 @@ begin
           end;
         end;
       end;
+    71: // bcStrMidAssignArr: the same statement when the target is an ARRAY ELEMENT
+      begin
+        // ⛔ WHY THIS IS NOT sub-opcode 54 ON A LOADED REGISTER. UniqueString is free at reference
+        // count 1 and a FULL COPY at 2, and loading an array element into a register makes it 2 by
+        // construction - so the register form copies the whole string on every assignment. Measured
+        // 19 Aug 2026: a 400,000-character SHARED string filled one byte at a time took 33.9 s that
+        // way against 28 ms for the identical code on a local, and the cost grew with the SQUARE of
+        // the length. Writing the slot directly keeps the count at 1 and the write free.
+        // Src1 = array id, Src2 = the linear index, Dest = the replacement (READ), Immediate = start.
+        ArrayIdx := Instr.Src1;
+        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+        begin
+          MidRepl := Ctx.StringRegs[Instr.Dest];
+          CharPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
+          SrcLen := Length(FArrays[ArrayIdx].StringData[LinearIdx]);
+          // Same clamping as sub-opcode 54, in the same order: a start past the end writes nothing,
+          // and the replacement is already capped to len by the ssaStrLeft the lowering emits.
+          if (CharPos >= 1) and (CharPos <= SrcLen) then
+          begin
+            CharVal2 := Length(MidRepl);
+            if CharVal2 > SrcLen - CharPos + 1 then CharVal2 := SrcLen - CharPos + 1;
+            if CharVal2 > 0 then
+            begin
+              UniqueString(FArrays[ArrayIdx].StringData[LinearIdx]);
+              Move(MidRepl[1], FArrays[ArrayIdx].StringData[LinearIdx][CharPos], CharVal2);
+            end;
+          end;
+        end;
+      end;
 
     // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip the swap if either index is out of range (MODERN); CLASSIC raises.
     55: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
@@ -8758,6 +8941,25 @@ begin
   RunFast;
 end;
 
+{$IFDEF HOT_C}
+{ The hot arithmetic/branch opcodes, compiled by a C compiler rather than by FPC. The reason is
+  measured and is not a preference: the same dispatch loop - same arms, same values live across it -
+  runs in 253 ms under gcc -O2 and 443 under FPC on this machine, and no FPC optimisation level
+  closes any of it. gcc keeps the hot pointers in registers where FPC spills them. See src/hotdisp.c.
+
+  The record layouts match exactly: TBytecodeInstruction is a packed record of four Words and an
+  Int64, which is C's { uint16_t x4; int64_t } with no padding on either side. cdecl is the right
+  convention on both platforms - on win64 FPC's cdecl IS the Microsoft x64 ABI that MinGW-w64 emits. }
+{$L hotdisp.o}
+function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
+                       pc, count: LongInt; tv: Int64;
+                       arrdesc: Pointer; flags: LongInt;
+                       xi: PInt64; xf: PDouble; hidx: PWord): LongInt; cdecl; external;
+{ The opcode list in DISPATCH-TABLE order, published by the C file so that nothing here holds a
+  second copy of it. Entry j is run by arm j, which is what makes FHotOpBase an index. }
+function sedai_hot_ops(out list: PWord): LongInt; cdecl; external;
+{$ENDIF}
+
 { EnsureDenseOps - decode-once dense dispatch table (VM perf plan, milestone M2).
   Translate every instruction's 16-bit (group.sub) opcode to its dense linear index ONCE, so the hot
   loop dispatches on a single compact case (no per-instruction group extraction / superinstruction
@@ -8766,8 +8968,16 @@ end;
 procedure TBytecodeVM.EnsureDenseOps;
 type
   PBytecodeInstr = ^TBytecodeInstruction;
+  {$IFDEF HOT_C}
+  TWordArr = array[0..High(Word)] of Word;
+  PWordArr = ^TWordArr;
+  {$ENDIF}
 var
   i, n: Integer;
+  {$IFDEF HOT_C}
+  j, HotOpN: Integer;
+  HotOpList: PWord;
+  {$ENDIF}
   Ins: PBytecodeInstr;
 begin
   if FProgram = nil then Exit;
@@ -8778,6 +8988,23 @@ begin
   if Ins <> nil then
     for i := 0 to n - 1 do
       FDenseOps[i] := Word(Op16ToDense(Ins[i].OpCode));
+  {$IFDEF HOT_C}
+  // Per PC: WHICH C arm runs this instruction (1-based, 0 = none), so the C loop dispatches on an
+  // index instead of decoding the opcode. Answering it with an array read costs a load; answering
+  // it by calling C and being refused costs a call.
+  SetLength(FHotOpBase, n);
+  SetLength(FHotOp, n);
+  HotOpN := sedai_hot_ops(HotOpList);
+  if Ins <> nil then
+    for i := 0 to n - 1 do
+    begin
+      FHotOpBase[i] := 0;
+      for j := 0 to HotOpN - 1 do
+        if PWordArr(HotOpList)^[j] = Ins[i].OpCode then begin FHotOpBase[i] := Word(j + 1); Break; end;
+      FHotOp[i] := 0;
+    end;
+  FHotOpEnabled := False;
+  {$ENDIF}
   {$IFDEF JIT_PROFILE}
   // J1: (re)size the back-edge counters for this program and clear them.
   SetLength(FBackEdgeCount, n);
@@ -10474,6 +10701,61 @@ begin
 end;
 {$ENDIF}
 
+{ ⛔ THIS MUST STAY ABOVE THE RUN LOOP. It is declared `inline` and it is called on every typed
+  array element access, which is the interpreter's hot array path - but FPC can only inline a body it
+  has ALREADY compiled, and this one used to sit 1345 lines BELOW the {$I RunTemplate.inc} that calls
+  it. The result was a real function call per array access, and the compiler said so 69 times in one
+  build: "Call to subroutine TBytecodeVM.ArrayBoundsOK ... marked as inline is not inlined". An
+  `inline` directive is a request, and the compiler answers it in source order. }
+{ The out-of-bounds half, deliberately OUT OF LINE. CLASSIC keeps Commodore's ?BAD SUBSCRIPT
+  semantics; --bounds-check forces the raise in any dialect. Otherwise MODERN matches FreeBASIC,
+  which performs no bounds check by default: the caller substitutes a default value on a read and
+  drops the store, keeping us memory-safe (FB would touch adjacent heap). }
+function TBytecodeVM.ArrayBoundsFail(ArrayIdx, LinearIdx: Integer): Boolean;
+begin
+  if FBoundsCheck or (Assigned(FProgram) and not FProgram.ModernMode) then
+    raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
+  Result := False;
+end;
+
+function TBytecodeVM.ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
+begin
+  // ⭐ WHAT GETS INLINED IS THIS AND NOTHING MORE: one compare, one branch. The raise path - with its
+  // Format call and its two conditions - lives in ArrayBoundsFail, out of line. Inlining the whole
+  // thing into fifty call sites grew the run loop enough to COST on an array-heavy program
+  // (spectral-norm +5%, stable over ten runs) while paying on others, which is code growth rather
+  // than work: the check itself is two instructions.
+  if (LinearIdx >= 0) and (LinearIdx < FArrays[ArrayIdx].TotalSize) then
+    Exit(True);
+  Result := ArrayBoundsFail(ArrayIdx, LinearIdx);
+end;
+
+{$IFDEF HOT_C}
+{ Fold the run-wide gate into the per-PC table, so the hot path reads one array and tests nothing
+  else. Cheap because it only runs when the gate CHANGES, which is once per run in practice. }
+procedure TBytecodeVM.SetHotOpEnabled(AEnabled: Boolean);
+var
+  i: Integer;
+begin
+  if (FHotOpEnabled = AEnabled) and (Length(FHotOp) = Length(FHotOpBase)) then Exit;
+  FHotOpEnabled := AEnabled;
+  SetLength(FHotOp, Length(FHotOpBase));
+  if AEnabled then
+  begin
+    for i := 0 to High(FHotOpBase) do FHotOp[i] := FHotOpBase[i];
+    // ...and ZERO every PC that starts a compiled region, so the C loop hands the PC back there
+    // instead of running past it - the dispatcher already does exactly that on a zero entry
+    // ("if (!h_) return pc"). Without this the C loop can step over a compiled entry and the region
+    // is simply skipped: the answer stays right, because the bytecode is equivalent, but the AOT
+    // stops being used and a measurement of the two together measures neither.
+    for i := 0 to High(FNativeFuncs) do
+      if (FNativeFuncs[i] <> nil) and (i <= High(FHotOp)) then FHotOp[i] := 0;
+  end
+  else
+    for i := 0 to High(FHotOpBase) do FHotOp[i] := 0;
+end;
+{$ENDIF}
+
 { RunFast - Optimized execution loop
   - Direct pointer access to instruction array (no method calls)
   - Inline dispatch (no procedure calls for each instruction)
@@ -11824,18 +12106,6 @@ begin
   FArrays[ArrayIdx].TotalSize := NewSize;
 end;
 
-function TBytecodeVM.ArrayBoundsOK(ArrayIdx, LinearIdx: Integer): Boolean;
-begin
-  if (LinearIdx >= 0) and (LinearIdx < FArrays[ArrayIdx].TotalSize) then
-    Exit(True);
-  // Out of bounds. CLASSIC keeps Commodore's ?BAD SUBSCRIPT semantics; --bounds-check forces the raise in
-  // any dialect. Otherwise MODERN matches FreeBASIC, which performs no bounds check by default: the caller
-  // substitutes a default value on a read and drops the store, keeping us memory-safe (FB would touch
-  // adjacent heap). Enable BoundsCheck to turn accidental out-of-bounds accesses back into hard errors.
-  if FBoundsCheck or (Assigned(FProgram) and not FProgram.ModernMode) then
-    raise ERangeError.CreateFmt('Array index out of bounds: %d (size: %d)', [LinearIdx, FArrays[ArrayIdx].TotalSize]);
-  Result := False;
-end;
 
 function ArrayDataShared(const A, B: TArrayStorage): Boolean;
 // True if A and B still reference the SAME element-data buffer (a dynamic array shares its reference on
@@ -11872,7 +12142,10 @@ var
   PtrAddr, DestArr: Int64;
   PtrOffset, RecSlot: Integer;
   Rec: PRecordStorage;
+  InstrHot: PBytecodeInstruction;   // what ArrayHotOps.inc dereferences; see the note at its include
+                                    // in RunTemplate.inc - the same text is compiled into two scopes.
 begin
+  InstrHot := @Instr;
   // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
   // move an array's backing store; the hot typed accessors never come through here. So the
   // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.

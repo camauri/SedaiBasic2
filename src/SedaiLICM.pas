@@ -83,6 +83,9 @@ type
     FHoistedCount: Integer;
     FProgMapsHoists: Integer;   // FHoistedCount when the program-wide maps were built (-1 = never)
     FProgMapsBlocks: Integer;   // and the block count then - a hoist adds a pre-header
+    // Does this program ever start a THREAD? A whole-program property, and the only thing that
+    // makes an array-backed read safe to hoist: see the note in IsInvariant.
+    FProgramCreatesThreads: Boolean;
     FUserVarByBank: array[TSSARegisterType] of array of Boolean;  // RegIndex → mapped to a user variable
     { Per-loop query maps, rebuilt by BuildLoopMaps at the start of each HoistInvariants call
       (collection never moves instructions, so they stay exact for the whole collection). They
@@ -218,6 +221,7 @@ begin
   FDominatorMap := TFPHashList.Create;
   FHoistedCount := 0;
   FProgMapsHoists := -1;
+  FProgramCreatesThreads := False;
   FProgMapsBlocks := -1;
   FFirstDefIV := TDefBlockMap.Create;
   FLoopDefCount := TKeyCountMap.Create;
@@ -718,22 +722,54 @@ begin
     ssaArrayLBound, ssaArrayUBound:
       Result := True;
 
+    // === STRING BANK ==========================================================================
+    // The whole bank used to fall through to False - by omission, with no note saying why, so an
+    // invariant like Left(s, 2) or Asc(Mid(s, 2, 1)) was recomputed on every turn while the int and
+    // float invariants beside it were hoisted. Measured on a 2,000,000-turn loop, 20 Aug 2026:
+    //   acc += Left(s, 2)          130 ms -> 59 ms hoisted by hand
+    //   accI += Asc(Mid(s, 2, 1))   50 ms ->  5 ms
+    //   acc += Chr(10)              93 ms -> 56 ms
+    //
+    // The admission rule is the one the rest of this list follows: a PURE function of its Src
+    // operands, total (no input traps - the substring family clamps rather than failing), no side
+    // effect, and Dest written and never read.
+    //
+    // ⛔ Deliberately ABSENT, and each for a reason:
+    //   ssaStrAppendMapped, ssaStrConcatCharAt, ssaStrMidAssign, ssaStrMidAssignArr - these READ
+    //     their Dest. They are accumulators and in-place writes, the opposite of hoistable.
+    //   ssaStrInstr and the INSTR family - INSTR carries an input in Dest (see the read-Dest list
+    //     in SedaiRegAlloc), so the same reading that disqualifies it there disqualifies it here.
+    //   ssaStrErr - ERR$ reads the runtime error state, which a loop can change.
+    //   ssaStrSAdd - SADD is the ADDRESS of a string's buffer; hoisting it would outlive the
+    //     reallocation that any append in the loop can cause.
+    //   ssaStrStr, ssaStrFormat, ssaStrVal and the conversion family - formatting and parsing that
+    //     read settings or can raise; left out until one of them is measured to be worth the audit.
+    ssaStrLen, ssaStrLenW,
+    ssaStrLeft, ssaStrRight, ssaStrMid,
+    ssaStrLeftW, ssaStrRightW, ssaStrMidW,
+    ssaStrAsc, ssaStrAscMid,
+    ssaStrChr, ssaStrWChr,
+    ssaStrSpace, ssaStrString, ssaStrWStringN,
+    ssaStrUCase, ssaStrLCase,
+    ssaStrTrim, ssaStrLTrim, ssaStrRTrim, ssaStrTrimSet,
+    ssaStrHex, ssaStrOct, ssaStrBin,
+    ssaStrConcat,
+    ssaLoadConstString,
+    ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString:
+      Result := True;
+
     // Everything else - NOT safe
     else
       Result := False;
   end;
 end;
 
-{ Packed map keys. TIV mirrors LICMRegMatches (bank + index + version); IV deliberately drops the
-  bank, mirroring IsDefinedOutsideLoop's historical index+version-only match. }
+{ The packed map key: bank + index + version, the same three fields LICMRegMatches compares. There
+  used to be a second, bank-dropping key next to this one; it is gone, and deliberately, so that a
+  register cannot be looked up by a name another bank also answers to. }
 function LICMKeyTIV(const V: TSSAValue): Int64; inline;
 begin
   Result := Int64(Ord(V.RegType)) or (Int64(V.RegIndex) shl 2) or (Int64(V.Version) shl 32);
-end;
-
-function LICMKeyIV(const V: TSSAValue): Int64; inline;
-begin
-  Result := Int64(V.RegIndex) or (Int64(V.Version) shl 32);
 end;
 
 function TLoopInvariantCodeMotion.IsArrayModifiedInLoop(ArrayIndex: Integer; Loop: TLoopInfo): Boolean;
@@ -796,10 +832,10 @@ begin
   end;
 
   // For registers, look up the first defining block (precomputed by BuildLoopMaps; the key
-  // matches RegIndex AND Version - historically bank-blind, kept that way).
+  // matches BANK, RegIndex and Version - see the note where the map is filled).
   if Val.Kind = svkRegister then
   begin
-    if FFirstDefIV.TryGetValue(LICMKeyIV(Val), Block) then
+    if FFirstDefIV.TryGetValue(LICMKeyTIV(Val), Block) then
       Exit(not Loop.ContainsBlock(Block));
 
     // CRITICAL FIX: Definition not found = CONSERVATIVELY assume INSIDE loop
@@ -986,11 +1022,23 @@ begin
     for j := 0 to Block.Instructions.Count - 1 do
     begin
       Instr := Block.Instructions[j];
+      // Only THREADCREATE starts a worker - the VM never spawns one of its own - so its absence
+      // from the whole program is a guarantee that no other thread can write anything.
+      if Instr.OpCode = ssaThreadCreate then FProgramCreatesThreads := True;
       if Instr.Dest.Kind = svkRegister then
       begin
-        // First definition in program order decides IsDefinedOutsideLoop, exactly as the
-        // historical scan did (multi-def Version=0 names answer by their first def).
-        Key := LICMKeyIV(Instr.Dest);
+        // First definition in program order decides IsDefinedOutsideLoop (multi-def Version=0
+        // names answer by their first def).
+        //
+        // ⛔ The key carries the BANK. It used to drop it, faithfully to the linear scan this map
+        // replaced, and the three banks number their registers from 0 independently -- so int r5_v2,
+        // float r5_v2 and string r5_v2 all collided on one entry and the first one in program order
+        // took it. Two ways that goes wrong, pointing in opposite directions: the loser's lookup can
+        // find the WINNER's block and answer "defined outside the loop" for a value the loop
+        // redefines (a hoist that must not happen), or find nothing at all and answer conservatively
+        // (a hoist that could have happened). LICMRegMatches next door has always compared the bank;
+        // this is the same question and now gets the same key.
+        Key := LICMKeyTIV(Instr.Dest);
         if not FFirstDefIV.ContainsKey(Key) then
           FFirstDefIV.Add(Key, Block);
       end;
@@ -1053,8 +1101,37 @@ begin
       CountInsideUse(Instr.Src3);
       for k := 0 to High(Instr.PhiSources) do
         CountInsideUse(Instr.PhiSources[k].Value);
-      if (Instr.OpCode = ssaArrayStore) and (Instr.Src1.Kind = svkConstInt) then
-        FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True);
+      // ⛔ BOTH spellings of the array operand, and the second one was missing until 19 Aug 2026.
+      // A store into a STRING array or into any array-backed DIM SHARED names its array with
+      // svkArrayRef, exactly as the matching load does - so recording only svkConstInt left those
+      // stores invisible here, and any pass asking "is this array written in the loop?" was told no.
+      // It went unnoticed because the only caller refused svkArrayRef loads outright; the moment
+      // that refusal was lifted, a SHARED FOR counter (stepped in a register and republished to its
+      // backing on every Next) hoisted its own read out of the loop and read a stale value.
+      //
+      // ⛔ AND THE THIRD SPELLING, found 20 Aug 2026. "MID$(s, i, 1) = c" on a SHARED scalar string
+      // is a STORE into the 1-element array that backs it, but it is spelled ssaStrMidAssignArr --
+      // deliberately, because loading the element into a register first is what made that write
+      // quadratic. It never reached this set, so a loop that filled a SHARED string byte by byte was
+      // told the array was untouched and the ArrayLoadString reading it back was hoisted out:
+      //
+      //   Dim Shared As String s : s = "AAAA"
+      //   For i = 1 To 4 : Mid(s, i, 1) = "B" : seen += s + " " : Next
+      //
+      // printed "AAAA AAAA AAAA AAAA" optimized against "BAAA BBAA BBBA BBBB" with --no-opt, and
+      // fbc agrees with --no-opt. Same class as the svkArrayRef omission above: an opcode that
+      // writes an array without being called a store.
+      //
+      // The ...Ind family (ssaArrayStoreIndString and friends) is NOT here and does not need to be:
+      // it addresses a UDT member array through a RUNTIME handle, and no Ind LOAD is hoistable, so
+      // nothing ever asks this set about one.
+      if (Instr.OpCode = ssaArrayStore) or (Instr.OpCode = ssaStrMidAssignArr) then
+      begin
+        if Instr.Src1.Kind = svkConstInt then
+          FLoopModArrays.AddOrSetValue(Instr.Src1.ConstInt, True)
+        else if Instr.Src1.Kind = svkArrayRef then
+          FLoopModArrays.AddOrSetValue(Instr.Src1.ArrayIndex, True);
+      end;
       // An array's SHAPE (its bounds) is fixed for the whole loop unless the loop itself can change
       // it. That is what makes LBOUND/UBOUND hoistable. Everything that can move a bound counts:
       // DIM/REDIM/ERASE on any array (including a UDT member array), and the BYREF param binding
@@ -1152,6 +1229,8 @@ end;
 
 function TLoopInvariantCodeMotion.IsCandidateModern(const Instr: TSSAInstruction; Block: TSSABasicBlock;
   Loop: TLoopInfo; ToHoist: TFPList): Boolean;
+var
+  ArrIdForHoist: Integer;   // the array an ssaArrayLoad reads, from either spelling of Src1
 begin
   Result := False;
   if not IsSafeToHoist(Instr) then Exit;
@@ -1183,16 +1262,33 @@ begin
     // Src1 = the array, Src2 = linear index. Invariant iff the array is not modified in the loop and
     // the index is loop-invariant.
     //
-    // ⛔ ONLY a constant array id, deliberately. Accepting svkArrayRef as well (the spelling a STRING
-    // array uses) would hoist the complement-table read out of reverse-complement's hot loop -- worth
-    // 2,8% -- but it HUNG spectral-norm: its workers spin on "Do While gDone < NW", gDone is a
-    // "Dim Shared" and therefore array-backed, and the value they are waiting for is written by
-    // ANOTHER THREAD. Hoisting that load out of the wait loop means the worker reads it once and
-    // waits forever. Loop-invariance here is invariance with respect to THIS loop; a shared array is
-    // not invariant just because this thread does not write it, and this pass has no notion of what
-    // the other threads do.
-    if Instr.Src1.Kind <> svkConstInt then Exit;
-    if IsArrayModifiedInLoop(Instr.Src1.ConstInt, Loop) then Exit;
+    // ⛔ A constant array id is always fine. svkArrayRef -- the spelling a STRING array and every
+    // array-backed DIM SHARED use -- is fine ONLY in a program that never starts a thread, and the
+    // reason is a hang, not a slowdown: accepting it unconditionally (2026-08-18) hoisted the
+    // complement-table read out of reverse-complement's hot loop, worth 2.8%, and HUNG spectral-norm.
+    // Its workers spin on "Do While gDone < NW"; gDone is a Dim Shared, therefore array-backed, and
+    // the value they wait for is written by ANOTHER THREAD. Hoisting that read out of the wait loop
+    // makes the worker read it once and wait forever. Loop-invariance here is invariance with respect
+    // to THIS loop, and a shared array is not invariant merely because this thread does not write it.
+    //
+    // The gate is what closes that hole: only THREADCREATE ever starts a worker, and the VM never
+    // spawns one of its own, so a program with no THREADCREATE anywhere has no other writer by
+    // construction. spectral-norm has one and keeps the old behaviour; reverse-complement has none
+    // and gets the hoist.
+    if Instr.Src1.Kind = svkConstInt then
+      ArrIdForHoist := Instr.Src1.ConstInt
+    else if (Instr.Src1.Kind = svkArrayRef) and (not FProgramCreatesThreads) and
+            (not FLoopReshapesArrays) then
+      // ...and not with a CALL in the loop either: a callee can write a module-level DIM SHARED,
+      // and the CFG carries no return edge to model it. FLoopReshapesArrays is already set by every
+      // call for the LBOUND/UBOUND rule, so it is exactly the flag wanted here.
+      ArrIdForHoist := Instr.Src1.ArrayIndex
+    else
+      Exit;
+    if LicmDiagOn then
+      WriteLn(ErrOutput, '[LICM] array-backed load, line ', Instr.SourceLine,
+              ': program starts threads = ', FProgramCreatesThreads);
+    if IsArrayModifiedInLoop(ArrIdForHoist, Loop) then Exit;
     Result := OperandInvariantModern(Instr.Src2, Loop, ToHoist);
     Exit;
   end;

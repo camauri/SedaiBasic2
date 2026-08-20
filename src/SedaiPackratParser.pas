@@ -93,6 +93,9 @@ type
     // in FreeBASIC ("error 119: Cannot modify a constant") and used to be silently accepted here,
     // because a module-level CONST lowers to a DIM and was therefore an ordinary variable.
     FConstNames: TStringList;
+    // ...and what each one's inferred TYPE NAME is, so a CONST defined from another CONST can be
+    // typed by its VALUE instead of falling back to the numeric default. See InferConstTypeName.
+    FConstTypes: TStringList;
     // True while ParseConstStatement is parsing the declaration itself. One of its three forms reads
     // the "name = value" part with ParseAssignmentStatement, so without this the rejection below
     // fires on the DECLARATION of a constant whose name was already declared in another scope
@@ -414,6 +417,8 @@ begin
   FProcSeen.CaseSensitive := False;
   FConstNames := TStringList.Create;
   FConstNames.CaseSensitive := False;
+  FConstTypes := TStringList.Create;
+  FConstTypes.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
@@ -430,6 +435,7 @@ begin
 
   FProcSeen.Free;
   FConstNames.Free;
+  FConstTypes.Free;
   FTypeStaticMethods.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
@@ -711,6 +717,7 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
+  FConstTypes.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   ClearTypeMethodDefaults;   // ...and the declared default arguments
 
@@ -779,6 +786,7 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
+  FConstTypes.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   ClearTypeMethodDefaults;   // ...and the declared default arguments
 
@@ -9729,6 +9737,13 @@ var
   // Bank of an untyped CONST from its initializer: string literal / string-valued expression -> STRING;
   // numeric literal with fraction or exponent -> DOUBLE; other numeric literal -> LONGINT; unknown -> DOUBLE.
   function InferConstTypeName(V: TASTNode): string;
+  // The type a CONST takes from its VALUE. ⛔ It used to answer DOUBLE for anything that was not a
+  // bare literal, so "Const TMASK = TSIZE - 1" was a Double even though both sides are integers -
+  // and every use of it dragged the surrounding expression into floating point. In k-nucleotide's
+  // open-addressing probe, the innermost loop of the program, "p = (p + 1) And TMASK" came out as
+  // AddInt, IntToFloat, FloatToInt, BitwiseAnd. fbc types that CONST as an integer, and so do we now.
+  var
+    L, R: string;
   begin
     Result := 'DOUBLE';
     if V = nil then Exit;
@@ -9741,9 +9756,34 @@ var
         Result := 'DOUBLE'
       else
         Result := 'LONGINT';
-    end
-    else if ValueIsString(V) then
-      Result := 'STRING';
+      Exit;
+    end;
+    if ValueIsString(V) then Exit('STRING');
+    // A CONST already declared above this one answers with the type IT was given.
+    if V.NodeType = antIdentifier then
+    begin
+      R := FConstTypes.Values[UpperCase(VarToStr(V.Value))];
+      if R <> '' then Result := R;
+      Exit;
+    end;
+    if (V.NodeType = antUnaryOp) and (V.ChildCount >= 1) then
+      Exit(InferConstTypeName(V.GetChild(0)));
+    if (V.NodeType = antBinaryOp) and (V.ChildCount >= 2) and (V.Token <> nil) then
+    begin
+      // ⛔ "/" is FreeBASIC's FLOATING division whatever its operands are: "Const HALF = 1 / 2" is
+      // 0.5, not 0. Only the operators whose result is an integer when both sides are keep LONGINT.
+      case V.Token.TokenType of
+        ttOpAdd, ttOpSub, ttOpMul, ttOpIntDiv, ttOpMod,
+        ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR, ttOpShl, ttOpShr:
+          begin
+            L := InferConstTypeName(V.GetChild(0));
+            R := InferConstTypeName(V.GetChild(1));
+            if (L = 'STRING') or (R = 'STRING') then Result := 'STRING'
+            else if (L = 'LONGINT') and (R = 'LONGINT') then Result := 'LONGINT'
+            else Result := 'DOUBLE';
+          end;
+      end;
+    end;
   end;
 
   // Comma-separated continuation of a CONST list: ", name [As type] = value, ...". Shared by all three
@@ -9861,6 +9901,8 @@ begin
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
+    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
+      UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
@@ -9908,6 +9950,8 @@ begin
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
+    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
+      UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
@@ -9950,6 +9994,8 @@ begin
   ArrayDecl.Attributes.Values['CONSTDECL'] := '1';    // a CONST, not a variable: the SSA folds it to an immediate
   if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
     FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
+  FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
+    UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);

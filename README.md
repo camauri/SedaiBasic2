@@ -229,6 +229,13 @@ and `libsdl2-gfx-dev` for the full set of bindings.
 > **Note:** `setup.sh` — which downloads and installs the toolchain for you — is still under
 > development. With FPC already installed, `./build.sh` is self-sufficient.
 
+> **A C compiler is used, and it is worth having.** The interpreter's hot dispatch arms are
+> compiled by `gcc` or `clang` (`src/hotdisp.c`) and linked into the binary, which is worth 27-45%
+> on arithmetic-heavy programs. This is **on by default**; without a C compiler the build still
+> succeeds and says so, and `--no-hot-c` turns it off explicitly. Cross-building for Windows needs
+> `gcc-mingw-w64-x86-64-win32` (Debian/Ubuntu) and is picked up automatically; win32 is not
+> supported for this — its calling convention decorates symbol names differently from win64.
+
 ```bash
 ./setup.sh
 ```

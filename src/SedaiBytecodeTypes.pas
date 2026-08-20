@@ -952,6 +952,44 @@ const
   bcArrayCopyElement  = bcGroupSuper + 59;  // ArrayCopyInt
   bcArrayMoveElement  = bcGroupSuper + 60;  // ArrayCopyIntSwap
 
+  // Fused compare-and-branch for the two comparison families that had no branch form at all, which
+  // is why the fusion pass had to decline them: it had nothing to fuse INTO. Measured on the bas/
+  // corpus before adding them - 232 residual CmpString and 31 CmpUInt, 263 sites, 526 instructions
+  // that could not fuse by construction.
+  //
+  // ⚠️ SIX string forms for FOUR string comparisons. The pass fuses "compare + JumpIfZero" by
+  // NEGATING the condition, and the negation of Lt is Ge - which exists as a branch even though
+  // CmpGeString does not exist as a comparison. Getting this wrong means the pass silently keeps
+  // declining half the sites.
+  bcBranchEqString    = bcGroupSuper + 61;
+  bcBranchNeString    = bcGroupSuper + 62;
+  bcBranchLtString    = bcGroupSuper + 63;
+  bcBranchGtString    = bcGroupSuper + 64;
+  bcBranchLeString    = bcGroupSuper + 65;
+  bcBranchGeString    = bcGroupSuper + 66;
+  // Unsigned needs only four: the negation of each stays inside the set (Lt<->Ge, Le<->Gt), and
+  // unsigned EQUALITY is bit-identical to signed, so it already compiles to bcCmpEqInt.
+  bcBranchLtUInt      = bcGroupSuper + 67;
+  bcBranchLeUInt      = bcGroupSuper + 68;
+  bcBranchGtUInt      = bcGroupSuper + 69;
+  bcBranchGeUInt      = bcGroupSuper + 70;
+
+  // "MID$(arr(i), start [, len]) = src" where the target is an ARRAY ELEMENT - which includes every
+  // DIM SHARED scalar, since one is stored as element 0 of a 1-element global array.
+  //
+  // ⛔ WHY A SEPARATE OPCODE AND NOT bcStrMidAssign ON A LOADED REGISTER. The in-place write is only
+  // free when the string it writes is UNSHARED: UniqueString is a no-op at reference count 1 and a
+  // FULL COPY at 2. Loading an array element into a register makes it 2 by construction, so the
+  // register form copies the whole string on every assignment - measured 19 Aug 2026, filling a
+  // 400,000-character SHARED string one byte at a time took 33.9 s against 28 ms for the identical
+  // code on a local: 1212x, and growing with the SQUARE of the length. The write has to happen where
+  // the string LIVES, so this one addresses the slot directly.
+  //
+  // Dest = the replacement string register (READ, not written - the same convention as
+  // bcArrayStoreString), Src1 = array id, Src2 = int register holding the linear index,
+  // Immediate = int register holding the 1-based start.
+  bcStrMidAssignArr   = bcGroupSuper + 71;
+
   // Helper function to extract group from opcode
   function GetOpcodeGroup(Op: TBytecodeOp): Word; inline;
 
@@ -980,6 +1018,11 @@ type
     Src2: Word;             // Source 2 register index (2 bytes, 0-65535)
     Immediate: Int64;       // Immediate value (for constants, jump offsets, etc)
   end;
+
+  { A pointer to one. The interpreter's dispatch loop holds one of these rather than copying the
+    record per instruction, and ArrayHotOps.inc - compiled into two different scopes - dereferences
+    one, so the type has to be visible to both. }
+  PBytecodeInstruction = ^TBytecodeInstruction;
 
   { Variable info for runtime }
   TVariableInfo = record
@@ -2037,6 +2080,11 @@ begin
         37: Result := 'StrMkFloat';
         38: Result := 'StrCvInt';
         39: Result := 'StrCvFloat';
+        15: Result := 'StrUCase';
+        18: Result := 'StrSpace';
+        13: Result := 'StrRTrim';
+        14: Result := 'StrTrim';
+        16: Result := 'StrLCase';
       else
         Result := Format('String_%d', [SubOp]);
       end;
@@ -2074,6 +2122,8 @@ begin
         33: Result := 'MathAsinh';
         34: Result := 'MathAcosh';
         35: Result := 'MathAtanh';
+        11: Result := 'MathLog10';
+        36: Result := 'MathCeil';
       else
         Result := Format('Math_%d', [SubOp]);
       end;
@@ -2113,6 +2163,10 @@ begin
         35: Result := 'ArrayUnbind';
         50: Result := 'RawLoadZStr';
         51: Result := 'RawStoreZStr';
+        27: Result := 'ArrayRedimPush';
+        28: Result := 'ArrayRedimN';
+        29: Result := 'ArrayIdxPush';
+        30: Result := 'ArrayIdxResolve';
       else
         Result := Format('Array_%d', [SubOp]);
       end;
@@ -2176,6 +2230,16 @@ begin
         34: Result := 'OpenFunc';
         35: Result := 'DirSearch';
         36: Result := 'DirAttr';
+        15: Result := 'InputFileInt';
+        16: Result := 'FileQuery';
+        17: Result := 'SeekSet';
+        18: Result := 'InputFileLine';
+        19: Result := 'PutBinInt';
+        20: Result := 'PutBinFloat';
+        21: Result := 'GetBinInt';
+        22: Result := 'GetBinFloat';
+        23: Result := 'PutBinStr';
+        24: Result := 'GetBinStr';
       else
         Result := Format('FileIO_%d', [SubOp]);
       end;
@@ -2373,12 +2437,24 @@ begin
         51: Result := 'ArrayShiftLeft';
         52: Result := 'StrConcatCharAt';
         53: Result := 'StrAppendMapped';
+        54: Result := 'StrMidAssign';
         55: Result := 'ArraySwapInt';
         56: Result := 'AddIntSelf';
         57: Result := 'SubIntSelf';
         58: Result := 'ArrayLoadIntTo';
         59: Result := 'ArrayCopyElement';
         60: Result := 'ArrayMoveElement';
+        61: Result := 'BranchEqString';
+        62: Result := 'BranchNeString';
+        63: Result := 'BranchLtString';
+        64: Result := 'BranchGtString';
+        65: Result := 'BranchLeString';
+        66: Result := 'BranchGeString';
+        67: Result := 'BranchLtUInt';
+        68: Result := 'BranchLeUInt';
+        69: Result := 'BranchGtUInt';
+        70: Result := 'BranchGeUInt';
+        71: Result := 'StrMidAssignArr';
       else
         Result := Format('Super_%d', [SubOp]);
       end;

@@ -501,6 +501,8 @@ type
     procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
     procedure CollectDynamicArrays(Node: TASTNode);                             // pre-scan: dynamic arrays (empty-declared / REDIM target)
     function UsesRuntimeLBound(ArrayIdx: Integer; const ArrName: string): Boolean;  // access subtracts the runtime lower bound?
+    function ResolveArrayElementTarget(TargetNode: TASTNode; const ArrName: string;
+      out ArrayIdx: Integer; out ArrInfo: TSSAArrayInfo; out LinearIndex: TSSAValue): Boolean;
     function EmitArrayLinearIndex(const Indices: array of TSSAValue; const ArrInfo: TSSAArrayInfo;
                                   const ArrName: string): TSSAValue;            // row-major linear index (const or runtime)
     function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
@@ -642,6 +644,7 @@ type
     // Fold LBOUND/UBOUND(arr[,dim]) to a compile-time constant when arr's target dimension is static.
     function EnumTypeOfOperand(Node: TASTNode): string;   // enum type name of an enum operand (member/var/param), else '' — for operator overloading
     function ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string): string; // "2.0 * udt": operator label owned by a builtin scalar type
+    function TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
@@ -8241,6 +8244,71 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
+// A module CONST whose initialiser is an integer EXPRESSION over literals and CONSTs already
+// declared above it - "Const TMASK = TSIZE - 1" - folded to its value.
+//
+// ⛔ WHY THIS MATTERS AND IS NOT COSMETIC. Only a bare LITERAL used to be recorded, so a const
+// defined from another const was not an integer constant at all: its backing scalar landed in the
+// FLOAT bank, and every use of it dragged the expression around it into floating point. In
+// k-nucleotide's open-addressing probe - the innermost loop of the program - "p = (p + 1) And TMASK"
+// came out as AddInt, IntToFloat, FloatToInt, BitwiseAnd: two conversions per probe step for a mask
+// the compiler could have known. It also matches fbc, where an untyped CONST over integer literals
+// is an integer.
+//
+// Only the operators whose integer result is exact are folded. "/" is deliberately absent: it is
+// FreeBASIC's FLOATING division, so "Const HALF = 1 / 2" must stay 0.5 and not become 0.
+var
+  L, R: Int64;
+begin
+  Result := False;
+  Val := 0;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antLiteral:
+      begin
+        if (not VarIsNumeric(Node.Value)) or VarIsFloat(Node.Value) then Exit;
+        Val := Int64(Node.Value);
+        Result := True;
+      end;
+    antIdentifier:
+      Result := (FModuleConstVals <> nil) and
+                TryStrToInt64(FModuleConstVals.Values[UpperCase(VarToStr(Node.Value))], Val);
+    antUnaryOp:
+      begin
+        if (Node.ChildCount < 1) or (Node.Token = nil) then Exit;
+        if not TryFoldConstIntExpr(Node.GetChild(0), L) then Exit;
+        case Node.Token.TokenType of
+          ttOpSub: begin Val := -L; Result := True; end;
+          ttOpAdd: begin Val := L; Result := True; end;
+          ttBitwiseNOT: begin Val := not L; Result := True; end;
+        end;
+      end;
+    antBinaryOp:
+      begin
+        if (Node.ChildCount < 2) or (Node.Token = nil) then Exit;
+        if not TryFoldConstIntExpr(Node.GetChild(0), L) then Exit;
+        if not TryFoldConstIntExpr(Node.GetChild(1), R) then Exit;
+        case Node.Token.TokenType of
+          ttOpAdd:      begin Val := L + R; Result := True; end;
+          ttOpSub:      begin Val := L - R; Result := True; end;
+          ttOpMul:      begin Val := L * R; Result := True; end;
+          // The two the hardware traps on are refused rather than folded to a wrong answer.
+          ttOpIntDiv:   if (R <> 0) and not ((L = Low(Int64)) and (R = -1)) then
+                          begin Val := L div R; Result := True; end;
+          ttOpMod:      if R <> 0 then
+                          begin if (L = Low(Int64)) and (R = -1) then Val := 0 else Val := L mod R;
+                                Result := True; end;
+          ttBitwiseAND: begin Val := L and R; Result := True; end;
+          ttBitwiseOR:  begin Val := L or R; Result := True; end;
+          ttBitwiseXOR: begin Val := L xor R; Result := True; end;
+          ttOpShl:      if (R >= 0) and (R < 64) then begin Val := L shl R; Result := True; end;
+          ttOpShr:      if (R >= 0) and (R < 64) then begin Val := L shr R; Result := True; end;
+        end;
+      end;
+  end;
+end;
+
 function TSSAGenerator.TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
 // Fold LBOUND/UBOUND(arr[, dim]) to a compile-time constant when `arr` is a declared array whose
 // target dimension is STATICALLY sized (element count fixed at DIM time). This lets an array be
@@ -8287,6 +8355,85 @@ begin
     Val := Lb
   else
     Val := Lb + ArrInfo.Dimensions[Dim0] - 1;          // UBOUND = lb + count - 1
+  Result := True;
+end;
+
+function TSSAGenerator.ResolveArrayElementTarget(TargetNode: TASTNode; const ArrName: string;
+  out ArrayIdx: Integer; out ArrInfo: TSSAArrayInfo; out LinearIndex: TSSAValue): Boolean;
+// Turn an antArrayAccess target into (array, linear index): look the array up, evaluate and
+// materialise every subscript, subtract each dimension's lower bound, then fold the row-major
+// index. Lifted verbatim out of ProcessArrayStore so that the MID$ statement can address an element
+// the same way instead of growing a third copy of this - a second copy of the SAME knowledge is how
+// this VM has been bitten before, and there are already two (the load path has its own).
+var
+  ArrInfoTmp: TSSAArrayInfo;
+  IndicesNode: TASTNode;
+  Indices: array of TSSAValue;
+  i, TempReg: Integer;
+  TempVal, AddResult: TSSAValue;
+begin
+  Result := False;
+  // Find array in program
+  ArrayIdx := ArrayIndexOf(ArrName);
+  if ArrayIdx < 0 then
+    raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
+
+  ArrInfoTmp := FProgram.GetArray(ArrayIdx);
+  ArrInfo := ArrInfoTmp;
+  IndicesNode := TargetNode.GetChild(1);  // antExpressionList
+
+  // Evaluate each index expression
+  SetLength(Indices, IndicesNode.ChildCount);
+  for i := 0 to IndicesNode.ChildCount - 1 do
+  begin
+    ProcessExpression(IndicesNode.GetChild(i), Indices[i]);
+
+    // Materialize constants into int registers and convert float registers to int
+    if Indices[i].Kind = svkConstInt then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Indices[i] := TempVal;
+    end
+    else if Indices[i].Kind = svkConstFloat then
+    begin
+      // Convert float constant to int
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Indices[i] := TempVal;
+    end
+    else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtFloat) then
+    begin
+      // Convert float register to int (FOR loop counters are float)
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaFloatToInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Indices[i] := TempVal;
+    end;
+  end;
+
+  // FreeBASIC explicit lower bounds ("lb TO ub"): map each source index to a 0-based offset by
+  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1). Array PARAMETERs and
+  // dynamic arrays use the run-time lower bound (it aliases the caller's array / can change via REDIM).
+  for i := 0 to High(Indices) do
+    if UsesRuntimeLBound(ArrayIdx, ArrName) then
+      Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
+    else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
+    begin
+      TempReg := FProgram.AllocRegister(srtInt);
+      TempVal := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ArrInfo.LowerBounds[i]),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      TempReg := FProgram.AllocRegister(srtInt);
+      AddResult := MakeSSARegister(srtInt, TempReg);
+      EmitInstruction(ssaSubInt, AddResult, Indices[i], TempVal, MakeSSAValue(svkNone));
+      Indices[i] := AddResult;
+    end;
+
+  // Row-major linear index (compile-time const strides, or runtime push/resolve for REDIM'd arrays).
+  LinearIndex := EmitArrayLinearIndex(Indices, ArrInfo, ArrName);
   Result := True;
 end;
 
@@ -8370,66 +8517,7 @@ begin
     Exit;
   end;
 
-  // Find array in program
-  ArrayIdx := ArrayIndexOf(ArrName);
-  if ArrayIdx < 0 then
-    raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
-
-  ArrInfo := FProgram.GetArray(ArrayIdx);
-  IndicesNode := TargetNode.GetChild(1);  // antExpressionList
-
-  // Evaluate each index expression
-  SetLength(Indices, IndicesNode.ChildCount);
-  for i := 0 to IndicesNode.ChildCount - 1 do
-  begin
-    ProcessExpression(IndicesNode.GetChild(i), Indices[i]);
-
-    // Materialize constants into int registers and convert float registers to int
-    if Indices[i].Kind = svkConstInt then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      TempVal := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      Indices[i] := TempVal;
-    end
-    else if Indices[i].Kind = svkConstFloat then
-    begin
-      // Convert float constant to int
-      TempReg := FProgram.AllocRegister(srtInt);
-      TempVal := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ConstFloatToInt(Indices[i].ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      Indices[i] := TempVal;
-    end
-    else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtFloat) then
-    begin
-      // Convert float register to int (FOR loop counters are float)
-      TempReg := FProgram.AllocRegister(srtInt);
-      TempVal := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaFloatToInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      Indices[i] := TempVal;
-    end;
-  end;
-
-  // FreeBASIC explicit lower bounds ("lb TO ub"): map each source index to a 0-based offset by
-  // subtracting its dimension's lower bound (the heap is 0-based, size is ub-lb+1). Array PARAMETERs and
-  // dynamic arrays use the run-time lower bound (it aliases the caller's array / can change via REDIM).
-  for i := 0 to High(Indices) do
-    if UsesRuntimeLBound(ArrayIdx, ArrName) then
-      Indices[i] := EmitParamArrayLBoundSub(Indices[i], ArrayIdx, i)
-    else if (i <= High(ArrInfo.LowerBounds)) and (ArrInfo.LowerBounds[i] <> 0) then
-    begin
-      TempReg := FProgram.AllocRegister(srtInt);
-      TempVal := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(ArrInfo.LowerBounds[i]),
-                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      TempReg := FProgram.AllocRegister(srtInt);
-      AddResult := MakeSSARegister(srtInt, TempReg);
-      EmitInstruction(ssaSubInt, AddResult, Indices[i], TempVal, MakeSSAValue(svkNone));
-      Indices[i] := AddResult;
-    end;
-
-  // Row-major linear index (compile-time const strides, or runtime push/resolve for REDIM'd arrays).
-  LinearIndex := EmitArrayLinearIndex(Indices, ArrInfo, ArrName);
+  if not ResolveArrayElementTarget(TargetNode, ArrName, ArrayIdx, ArrInfo, LinearIndex) then Exit;
 
   // Evaluate value expression
   ProcessExpression(ExprNode, ExprValue);
@@ -10281,6 +10369,12 @@ var
   TmpName: string;
   HasLen: Boolean;
   NoneV: TSSAValue;
+  AccessNode: TASTNode;     // the array-element form of the target, real or synthesised
+  OwnAccess: Boolean;       // ...and whether this call owns it and must free it
+  ArrName: string;
+  ArrIdx: Integer;
+  ArrInfoT: TSSAArrayInfo;
+  LinIdx: TSSAValue;
 begin
   if Node.ChildCount < 3 then Exit;
   NoneV := MakeSSAValue(svkNone);
@@ -10296,6 +10390,55 @@ begin
   begin
     LenNode := nil;
     SourceNode := Node.GetChild(2);
+  end;
+
+  // ⭐ FAST PATH for an ARRAY ELEMENT target, which includes every DIM SHARED scalar (one is stored
+  // as element 0 of a 1-element global array). It has to come BEFORE the target is read: reading it
+  // would emit an ArrayLoadString that this path does not need, and a dead managed load left in a
+  // per-character loop is precisely the reference-count traffic being removed here.
+  //
+  // ⛔ NOT the register form below with a load and a store around it: UniqueString is free at
+  // reference count 1 and a FULL COPY at 2, and loading an element makes it 2 by construction.
+  // Measured 19 Aug 2026 - filling a 400,000-character SHARED string one byte at a time took 33.9 s
+  // against 28 ms for the identical code on a local, and grew with the SQUARE of the length.
+  //
+  // The order of evaluation is the one the general path uses - target subscripts, then start, then
+  // source - so a program whose subscript or source has side effects sees them in the same order.
+  AccessNode := nil;
+  OwnAccess := False;
+  if (TargetNode.NodeType = antIdentifier) and IsSharedScalar(VarToStr(TargetNode.Value)) then
+  begin
+    AccessNode := MakeSharedScalarAccess(VarToStr(TargetNode.Value), Node.Token);
+    OwnAccess := True;
+  end
+  else if (TargetNode.NodeType = antArrayAccess) and (TargetNode.ChildCount >= 2) and
+          (TargetNode.GetChild(0).NodeType = antIdentifier) then
+    AccessNode := TargetNode;
+  if AccessNode <> nil then
+  begin
+    ArrName := VarToStr(AccessNode.GetChild(0).Value);
+    ArrIdx := ArrayIndexOf(ArrName);
+    // Only a real, declared STRING array: a UDT member array, a pointer or a byte subscript all
+    // resolve elsewhere and must keep the general lowering.
+    if (ArrIdx >= 0) and (FProgram.GetArray(ArrIdx).ElementType = srtString) and
+       (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
+       ResolveArrayElementTarget(AccessNode, ArrName, ArrIdx, ArrInfoT, LinIdx) then
+    begin
+      ProcessExpression(StartNode, StartVal); StartReg := EnsureIntRegister(StartVal);
+      ProcessStringExpression(SourceNode, SrcVal); SrcReg := EnsureStringRegister(SrcVal);
+      if HasLen then
+      begin
+        ProcessExpression(LenNode, LenVal);
+        SrcCapReg := NS;
+        EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg, EnsureIntRegister(LenVal), NoneV);
+      end
+      else
+        SrcCapReg := SrcReg;
+      EmitInstruction(ssaStrMidAssignArr, SrcCapReg, MakeSSAArrayRef(ArrIdx, srtString), LinIdx, StartReg);
+      if OwnAccess then AccessNode.Free;
+      Exit;
+    end;
+    if OwnAccess then AccessNode.Free;
   end;
 
   // Read inputs.
@@ -10460,48 +10603,30 @@ end;
 
 procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
 // FreeBASIC "s[i] = c" on a scalar STRING: set the byte at 0-based index i to character code c.
-// Lowered to s = LEFT$(s, i) + CHR$(c) + MID$(s, i+2, LEN(s)), landing in a named temp string var,
-// then written back through the existing assignment machinery. No new opcode.
+//
+// It IS the MID statement: "MID$(s, i + 1, 1) = CHR$(c)" overwrites exactly that one byte and
+// nothing else. So it is lowered to that statement and inherits BOTH in-place paths MID$ already
+// has - ssaStrMidAssignArr when the target is an array element or a SHARED scalar, ssaStrMidAssign
+// when it is a plain register variable.
+//
+// ⛔ It used to rebuild the string instead: "s = LEFT$(s,i) + CHR$(c) + MID$(s,i+2,LEN(s))". Same
+// bytes, but a copy of the WHOLE string on every byte, so filling a buffer one character at a time
+// was QUADRATIC - measured 20 Aug 2026, a 400,000-byte fill took 17.0 s where the identical fill
+// written as MID$ took 37 ms. That is the same defect the MID statement was cured of the day before
+// (see the fast paths in ProcessMidStatement); this writing had simply never been routed there.
 var
-  SVal, IdxVal, ValVal, SReg, IdxReg, ValReg: TSSAValue;
-  PrefixReg, ChrReg, TwoReg, SufStartReg, LenSReg, SufReg, R1Reg, ResultReg: TSSAValue;
-  NoneV: TSSAValue;
-  TmpName: string;
-  AsnNode, TmpRef: TASTNode;
+  MidNode, ArgsNode: TASTNode;
 begin
-  NoneV := MakeSSAValue(svkNone);
-  ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
-  ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
-  ProcessExpression(ValNode, ValVal); ValReg := EnsureIntRegister(ValVal);
-  // prefix = LEFT$(s, i)   (the first i bytes, before the target)
-  PrefixReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrLeft, PrefixReg, SReg, IdxReg, NoneV);
-  // chr = CHR$(c)
-  ChrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrChr, ChrReg, ValReg, NoneV, NoneV);
-  // suffix = MID$(s, i+2, LEN(s))   (the rest, after the replaced byte)
-  TwoReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaLoadConstInt, TwoReg, MakeSSAConstInt(2), NoneV, NoneV);
-  SufStartReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaAddInt, SufStartReg, IdxReg, TwoReg, NoneV);
-  LenSReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaStrLen, LenSReg, SReg, NoneV, NoneV);
-  SufReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrMid, SufReg, SReg, SufStartReg, LenSReg);
-  // result = prefix + chr + suffix, into a named temp so it can be assigned back to the target lvalue.
-  TmpName := '__IDX' + IntToStr(FSwapTempSeq) + '$';
-  Inc(FSwapTempSeq);
-  ResultReg := GetOrAllocateVariable(TmpName);
-  R1Reg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrConcat, R1Reg, PrefixReg, ChrReg, NoneV);
-  EmitInstruction(ssaStrConcat, ResultReg, R1Reg, SufReg, NoneV);
-  // s = result
-  AsnNode := TASTNode.Create(antAssignment, Tok);
-  AsnNode.AddChild(SNode.Clone);
-  TmpRef := TASTNode.CreateWithValue(antIdentifier, TmpName, Tok);
-  AsnNode.AddChild(TmpRef);
-  ProcessAssignment(AsnNode);
-  AsnNode.Free;
+  MidNode := TASTNode.Create(antMidStatement, Tok);
+  MidNode.AddChild(SNode.Clone);                                        // target
+  MidNode.AddChild(CreateBinaryOpNode(ttOpAdd, IdxNode.Clone,           // start = i + 1 (MID$ is 1-based)
+                                      TASTNode.CreateWithValue(antLiteral, 1, Tok), Tok));
+  ArgsNode := TASTNode.Create(antArgumentList, Tok);                    // ...the $-suffixed name is the
+  ArgsNode.AddChild(ValNode.Clone);                                     // one the lowering dispatches on
+  MidNode.AddChild(CreateFunctionCallNode(kCHRS, ArgsNode, Tok));       // source = CHR$(c), one byte, so
+                                                                        // no length child is needed
+  ProcessMidStatement(MidNode);
+  MidNode.Free;
 end;
 
 function TSSAGenerator.TryLRSetRecord(DstNode, SrcNode: TASTNode): Boolean;
@@ -23739,6 +23864,8 @@ var
   Decl: TASTNode;
   VNameU, TypeNameU: string;
   ElemBank: TSSARegisterType;
+  ConstFoldVal: Int64;
+  ConstIsInt: Boolean;
 begin
   if Node = nil then Exit;
   // Do not descend into procedure bodies: DIM SHARED (and a module-level CONST, which lowers to a
@@ -23766,10 +23893,10 @@ begin
         // it keeps working - but the hot path stops loading a constant from memory. Integer literals
         // only for now: a float would have to round-trip through text, and a string literal needs its
         // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
-        if (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
-           (Decl.GetChild(2).NodeType = antLiteral) and VarIsNumeric(Decl.GetChild(2).Value) and
-           not VarIsFloat(Decl.GetChild(2).Value) then
-          FModuleConstVals.Values[VNameU] := IntToStr(Int64(Decl.GetChild(2).Value));
+        ConstIsInt := (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
+                      TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal);
+        if ConstIsInt then
+          FModuleConstVals.Values[VNameU] := IntToStr(ConstFoldVal);
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
@@ -23778,6 +23905,13 @@ begin
         begin
           if FindUDT(TypeNameU) >= 0 then
             ElemBank := srtInt                           // UDT scalar: the array element is the record handle
+          // ⛔ An untyped CONST whose value is an INTEGER must be backed by an integer, or the
+          // declaration and the folded reads disagree about what it is: reads folded to an immediate
+          // while the backing scalar sat in the float bank. With no suffix to go on, the type
+          // inference below falls back to the numeric default, which is float - so the VALUE has to
+          // decide, exactly as it already does for a bare literal.
+          else if ConstIsInt and (TypeNameU = '') then
+            ElemBank := srtInt
           else
             ElemBank := TypeNameToBank(TypeNameU, VNameU);
           ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name

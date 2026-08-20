@@ -90,6 +90,10 @@ type
     constructor Create(const Code: TX86Emitter);
     destructor Destroy; override;
     property Ptr: Pointer read FPtr;
+    // The EXTENT, not just the base. A sampler holding a program counter can only say "this is
+    // inside region X" if it knows where X ends - and until it could, a profile of a program that
+    // spends its time in generated code had nothing to attribute those samples to.
+    property Size: PtrUInt read FSize;
   end;
 
 implementation

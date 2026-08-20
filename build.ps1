@@ -58,6 +58,10 @@ param(
     [switch]$Clean,
     [switch]$NoBanner,
 
+    # List every Free Pascal compiler on this machine and choose one. The answer is stored in
+    # setup.config.json and used from then on; pass this again to change it.
+    [switch]$SelectFpc,
+
     # Build the CLI VM (sb) with the optional SDL2 window presenter, enabling `sb --window`.
     # Default off: the headless sb (regression target) takes no SDL2 window dependency.
     [switch]$Window,
@@ -116,43 +120,225 @@ function Load-BuildConfig {
     return $false
 }
 
-# Detect FPC compiler
-function Find-FPC {
-    # First check user configuration from setup.config.json
-    if ($UserConfig.FpcPath) {
-        $configFpc = Join-Path $UserConfig.FpcPath "bin\x86_64-win64\fpc.exe"
-        if (Test-Path $configFpc) {
-            return $configFpc
+# Which fpc to build with.
+#
+# This used to return the FIRST path that existed, walking a hardcoded list. Its Linux twin did the
+# same and it cost a session: the search there globbed ~/tools/fp/*, which expands alphabetically,
+# so the day an fpc-3.3.1 appeared next to fpc-stable the project silently switched compiler - and
+# that install had no usable RTL, so every build died with "Can't find unit system" naming a
+# compiler nobody had chosen. A found binary is not a working compiler, and picking one without
+# saying so is worse than finding none.
+#
+# So: discover EVERY candidate, PROVE each one compiles, list them, let the user choose ONCE, and
+# remember the choice in setup.config.json. After that it is a config read and nothing searches.
+
+# Every fpc.exe reachable on this machine, de-duplicated by resolved path.
+function Get-FpcCandidates {
+    param([string]$Platform = 'x86_64-win64')
+
+    $found = New-Object System.Collections.Generic.List[string]
+    $add = {
+        param($p)
+        if ($p -and (Test-Path $p -PathType Leaf)) {
+            try { $rp = (Resolve-Path $p -ErrorAction Stop).Path } catch { $rp = $p }
+            if (-not $found.Contains($rp)) { $found.Add($rp) }
         }
     }
 
-    # Project-local FPC (installed by setup.ps1) - always preferred
-    $localFpc = Join-Path $ProjectRoot 'fpc\3.2.2\bin\x86_64-win64\fpc.exe'
-    if (Test-Path $localFpc) {
-        return $localFpc
-    }
+    # Project-local, installed by setup.ps1.
+    & $add (Join-Path $ProjectRoot "fpc\3.2.2\bin\$Platform\fpc.exe")
 
-    # Check common Lazarus installations
-    $lazarusPaths = @(
-        'C:\lazarus-3.8\fpc\3.2.2\bin\x86_64-win64\fpc.exe',
-        'C:\lazarus-3.6\fpc\3.2.2\bin\x86_64-win64\fpc.exe',
-        'C:\lazarus-3.4\fpc\3.2.2\bin\x86_64-win64\fpc.exe',
-        'C:\lazarus-3.2\fpc\3.2.2\bin\x86_64-win64\fpc.exe',
-        'C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe'
-    )
-    foreach ($lazPath in $lazarusPaths) {
-        if (Test-Path $lazPath) {
-            return $lazPath
+    # Lazarus, any version - a glob rather than the hardcoded list this used to carry, which went
+    # stale every time Lazarus released.
+    foreach ($root in @('C:\lazarus*', 'C:\Program Files\lazarus*', 'C:\Program Files (x86)\lazarus*')) {
+        Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-ChildItem -Path (Join-Path $_.FullName 'fpc') -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { & $add (Join-Path $_.FullName "bin\$Platform\fpc.exe") }
         }
     }
 
-    # Fallback to system PATH
-    $fpc = Get-Command fpc -ErrorAction SilentlyContinue
-    if ($fpc) {
-        return $fpc.Source
-    }
+    # The standard FPC installer, and fpcupdeluxe in both the layouts it uses.
+    Get-ChildItem -Path 'C:\FPC' -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { & $add (Join-Path $_.FullName "bin\$Platform\fpc.exe") }
+    & $add (Join-Path $HOME "fpcupdeluxe\fpc\bin\$Platform\fpc.exe")
+    Get-ChildItem -Path (Join-Path $HOME 'tools\fp') -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { & $add (Join-Path $_.FullName "fpc\bin\$Platform\fpc.exe") }
 
+    # PATH.
+    $onPath = Get-Command fpc -ErrorAction SilentlyContinue
+    if ($onPath) { & $add $onPath.Source }
+
+    return $found
+}
+
+# Does this compiler actually COMPILE? Not "does the binary run" - fpc -iV answers happily on an
+# install whose RTL it cannot find, which is exactly the case that broke. The only honest test is a
+# build, done the way this script builds: with no explicit config file.
+function Test-FpcWorks {
+    param([string]$Fpc)
+
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sedai_fpcprobe_" + [Guid]::NewGuid().ToString('N'))
+    # ⛔ This script runs under $ErrorActionPreference = 'Stop', where a native command writing to
+    # stderr can raise a terminating error. A compiler that merely WARNS would then be recorded as
+    # broken, which is the same class of mistake this whole function exists to prevent - so the
+    # preference is lowered for the probe and the output goes to a file, not down the pipeline.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $src = Join-Path $dir 'probe.pas'
+        Set-Content -Path $src -Value 'begin end.' -Encoding ASCII
+        $out = Join-Path $dir 'probe.exe'
+        $log = Join-Path $dir 'probe.log'
+        $global:LASTEXITCODE = 0
+        & $Fpc "-o$out" $src > $log 2> $log
+        return (($LASTEXITCODE -eq 0) -and (Test-Path $out))
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $prev
+        Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ...\bin\<platform>\fpc.exe -> ...   (the root form FpcPath has always held). Anything else has no
+# such root and returns $null.
+function Get-FpcRoot {
+    param([string]$Fpc, [string]$Platform = 'x86_64-win64')
+    $suffix = "\bin\$Platform\fpc.exe"
+    if ($Fpc.ToLower().EndsWith($suffix.ToLower())) {
+        return $Fpc.Substring(0, $Fpc.Length - $suffix.Length)
+    }
     return $null
+}
+
+# Write keys into setup.config.json, preserving whatever else is in it.
+function Set-ConfigValues {
+    param([hashtable]$Values)
+
+    $obj = $null
+    if (Test-Path $ConfigFile) {
+        try { $obj = Get-Content $ConfigFile -Raw | ConvertFrom-Json } catch { $obj = $null }
+    }
+    if (-not $obj) { $obj = New-Object PSObject }
+    foreach ($k in $Values.Keys) {
+        if ($obj.PSObject.Properties.Name -contains $k) { $obj.$k = $Values[$k] }
+        else { $obj | Add-Member -MemberType NoteProperty -Name $k -Value $Values[$k] }
+    }
+    $obj | ConvertTo-Json -Depth 5 | Set-Content -Path $ConfigFile -Encoding UTF8
+}
+
+# List what is installed, prove which ones work, and ask. Writes the answer so this happens once.
+function Select-Fpc {
+    param([string]$Platform = 'x86_64-win64')
+
+    $paths = Get-FpcCandidates -Platform $Platform
+    $rows = @()
+    foreach ($p in $paths) {
+        $ver = ''
+        try { $ver = (& $p -iV 2>$null) } catch { $ver = '' }
+        if (-not $ver) { continue }
+        $rows += [PSCustomObject]@{ Path = $p; Version = "$ver".Trim(); Works = (Test-FpcWorks -Fpc $p) }
+    }
+
+    if ($rows.Count -eq 0) {
+        Write-Host "ERROR: no Free Pascal Compiler found." -ForegroundColor Red
+        Write-Host "Looked in: fpc\3.2.2\, C:\lazarus*, C:\FPC\, ~\fpcupdeluxe\, ~\tools\fp\*, PATH." -ForegroundColor Yellow
+        return $null
+    }
+
+    Write-Host ""
+    Write-Host "Free Pascal compilers found on this machine:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        if ($r.Works) {
+            Write-Host ("  {0}) FPC {1,-8} {2}" -f ($i + 1), $r.Version, $r.Path)
+        } else {
+            Write-Host ("  {0}) FPC {1,-8} {2}   [cannot compile - skipped]" -f ($i + 1), $r.Version, $r.Path) -ForegroundColor Yellow
+        }
+    }
+    Write-Host ""
+
+    # A compiler that cannot compile is never the answer, however it got listed.
+    $usable = @(0..($rows.Count - 1) | Where-Object { $rows[$_].Works })
+    if ($usable.Count -eq 0) {
+        Write-Host "ERROR: none of them can compile a trivial program." -ForegroundColor Red
+        Write-Host "An install without a usable fpc.cfg is the usual cause." -ForegroundColor Yellow
+        return $null
+    }
+
+    # ⚠️ No console means no question: a script or a CI run must fail loudly rather than pick for the
+    # user and be wrong quietly. This has to be tested BEFORE asking - unlike a shell read, Read-Host
+    # does not fail on redirected input, it returns empty, so the default would be taken and STORED
+    # without anyone seeing the list.
+    $interactive = $true
+    try {
+        if (-not [Environment]::UserInteractive) { $interactive = $false }
+        if ([Console]::IsInputRedirected) { $interactive = $false }
+    } catch { $interactive = $false }
+    if (-not $interactive) {
+        Write-Host "Not an interactive console, so nothing was chosen and nothing was stored." -ForegroundColor Yellow
+        Write-Host "Run .\build.ps1 -SelectFpc once interactively, or set SEDAI_FPC=<path>." -ForegroundColor Yellow
+        return $null
+    }
+
+    $default = $usable[0] + 1
+    $sel = $null
+    while ($true) {
+        $answer = Read-Host "Which one should this project use? [$default]"
+        if ([string]::IsNullOrWhiteSpace($answer)) { $sel = $default } else { $sel = $answer }
+        $n = 0
+        # [string] cast on purpose: $sel is an int when the default was taken, and TryParse wants text.
+        if (-not [int]::TryParse([string]$sel, [ref]$n)) { Write-Host "  a number, please"; continue }
+        if ($n -lt 1 -or $n -gt $rows.Count) { Write-Host "  out of range"; continue }
+        if (-not $rows[$n - 1].Works) { Write-Host "  that one cannot compile; pick another"; continue }
+        $sel = $n
+        break
+    }
+
+    $chosen = $rows[$sel - 1]
+    $values = @{ FpcBin = $chosen.Path }
+    $root = Get-FpcRoot -Fpc $chosen.Path -Platform $Platform
+    # FpcPath is the form this script has always read, kept so an existing config keeps working; a
+    # PATH install has no such root and simply does not get the key.
+    if ($root) { $values['FpcPath'] = $root }
+    Set-ConfigValues -Values $values
+    $Script:UserConfig.FpcPath = $root
+
+    Write-Host ("Stored in setup.config.json: FPC {0} - {1}" -f $chosen.Version, $chosen.Path) -ForegroundColor Green
+    Write-Host "Change it later with .\build.ps1 -SelectFpc" -ForegroundColor Gray
+    return $chosen.Path
+}
+
+function Find-FPC {
+    param([string]$Platform = 'x86_64-win64')
+
+    # 1. Explicit environment override - deliberately NOT stored: it is a one-off, and writing it
+    #    would turn "just this once" into the project's setting.
+    if ($env:SEDAI_FPC -and (Test-Path $env:SEDAI_FPC -PathType Leaf)) {
+        return $env:SEDAI_FPC
+    }
+
+    # 2. The stored choice.
+    if (-not $SelectFpc) {
+        $stored = $null
+        if (Test-Path $ConfigFile) {
+            try {
+                $json = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+                if ($json.FpcBin) { $stored = $json.FpcBin }
+            } catch { $stored = $null }
+        }
+        if ($stored -and (Test-Path $stored -PathType Leaf)) { return $stored }
+
+        # The older key, kept so an existing setup.config.json keeps working.
+        if ($UserConfig.FpcPath) {
+            $configFpc = Join-Path $UserConfig.FpcPath "bin\$Platform\fpc.exe"
+            if (Test-Path $configFpc) { return $configFpc }
+        }
+    }
+
+    # 3. Nothing stored (or -SelectFpc): ask, once.
+    return (Select-Fpc -Platform $Platform)
 }
 
 # Get target platform string
@@ -553,12 +739,8 @@ if (Load-BuildConfig) {
 }
 
 # Find FPC
-$fpc = Find-FPC
-if (-not $fpc) {
-    Write-Host "ERROR: Free Pascal Compiler (fpc) not found!" -ForegroundColor Red
-    Write-Host "Please install FPC or add it to PATH." -ForegroundColor Yellow
-    exit 1
-}
+$fpc = Find-FPC -Platform (Get-PlatformDir -cpu $CPU -os $OS)
+if (-not $fpc) { exit 1 }
 Write-Host "Compiler: FPC $(& $fpc -iV 2>$null)" -ForegroundColor Gray
 Write-Host "Platform: $(Get-PlatformDir -cpu $CPU -os $OS)" -ForegroundColor Gray
 Write-Host "Mode: $(if ($Debug) { 'Debug' } else { 'Release' })" -ForegroundColor Gray
