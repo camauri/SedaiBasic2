@@ -10816,6 +10816,9 @@ begin
     raise Exception.Create('array contexts exhausted: no private array block available');
   for i := 0 to FStaticArrCount - 1 do
     if FArrPrivSlot[i] >= 0 then Ctx.ArrMap[i] := Base + FArrPrivSlot[i];
+  // The block this context just took may have been somebody else's a moment ago, so the entries the
+  // descriptor table holds for it are not this context's. Same reason as the release path above.
+  FArraysDirty := True;
   if GArrPrivDiag then
     WriteLn(ErrOutput, Format('[arrpriv] bind: ctx=%p block=%d base=%d', [Pointer(Ctx), Ctx.ArrPrivBlock, Base]));
 end;
@@ -10828,17 +10831,34 @@ var
 begin
   if (Ctx = nil) or (Ctx.ArrPrivBlock < 0) then Exit;
   Base := FPrivBlockBase + Ctx.ArrPrivBlock * FPrivArrCount;
-  for i := Base to Base + FPrivArrCount - 1 do
-    if i <= High(FArrays) then
-    begin
-      SetLength(FArrays[i].IntData, 0);
-      SetLength(FArrays[i].FloatData, 0);
-      SetLength(FArrays[i].StringData, 0);
-      SetLength(FArrays[i].Dimensions, 0);
-      SetLength(FArrays[i].LowerBounds, 0);
-      FArrays[i].TotalSize := 0;
-      FArrays[i].DimCount := 0;
-    end;
+  // ⛔ UNDER FArrDescLock. Freeing these buffers changes the very fields RebuildJitArrDesc reads to
+  // build the table (@FArrays[a].IntData[0] and TotalSize), and that rebuild runs on ANOTHER thread
+  // holding this lock. Doing it unlocked is a data race on the dynamic-array headers, and it showed
+  // as parallel fasta answering differently in about one run in twelve - on every engine, which is
+  // what told us the descriptor table was no longer the culprit.
+  EnterCriticalSection(FArrDescLock);
+  try
+    for i := Base to Base + FPrivArrCount - 1 do
+      if i <= High(FArrays) then
+      begin
+        SetLength(FArrays[i].IntData, 0);
+        SetLength(FArrays[i].FloatData, 0);
+        SetLength(FArrays[i].StringData, 0);
+        SetLength(FArrays[i].Dimensions, 0);
+        SetLength(FArrays[i].LowerBounds, 0);
+        FArrays[i].TotalSize := 0;
+        FArrays[i].DimCount := 0;
+      end;
+  finally
+    LeaveCriticalSection(FArrDescLock);
+  end;
+  // ⛔ THE DESCRIPTOR TABLE STILL POINTS AT THE STORAGE JUST FREED. Say so, or the next context handed
+  // this block reads and writes through dangling pointers until something else happens to dirty the
+  // table - which is a use-after-free that only appears when blocks are REUSED, i.e. when a program
+  // spawns more than one wave of workers. 📊 Found on parallel fasta (three waves): threads died with
+  // access violations and the output changed run to run, while fannkuch, k-nucleotide and
+  // reverse-complement - one wave each, or no local array at all - were stable.
+  FArraysDirty := True;
   EnterCriticalSection(FWorkerLock);
   try
     if Ctx.ArrPrivBlock <= High(FPrivBlockUsed) then FPrivBlockUsed[Ctx.ArrPrivBlock] := False;
@@ -10933,28 +10953,47 @@ begin
     if FArraysDirty then RebuildJitArrDesc;
     if (ECtx.ArrDescGen <> FArrDescGen) or (Length(ECtx.ArrDescOwn) <> Length(FJitArrDesc)) then
     begin
-      // RETIRE, never resize: a native frame further up this thread's stack may still be holding the
-      // address of the previous buffer and will only re-read it at its next call boundary. Same policy
-      // as the master table's, for the same reason, and released by the same ReleaseRetiredArrDesc.
-      if Length(ECtx.ArrDescOwn) > 0 then
+      // ⛔ UPDATE IN PLACE WHENEVER THE LENGTH ALLOWS IT, and retire only when it does not.
+      // Compiled code caches base pointers READ OUT OF this table in machine registers and reloads
+      // them only at its own call boundaries, so handing it a different buffer mid-function is handing
+      // it stale bases. The master table has always behaved this way - SetLength to the same length
+      // keeps the buffer and the loop below overwrites the entries - and the per-context copy has to
+      // behave the same. 📊 Retiring unconditionally cost reverse-complement its whole output under
+      // --aot: a shared scalar read after a shared string write came back 0 and the program died on a
+      // division by zero.
+      // A LENGTH CHANGE still retires: the buffer must move, and a native frame may hold the old one.
+      if Length(ECtx.ArrDescOwn) <> Length(FJitArrDesc) then
       begin
-        n := Length(ECtx.ArrDescRetired);
-        SetLength(ECtx.ArrDescRetired, n + 1);
-        ECtx.ArrDescRetired[n] := ECtx.ArrDescOwn;
-        ECtx.ArrDescOwn := nil;
-      end;
-      SetLength(ECtx.ArrDescOwn, Length(FJitArrDesc));
-      if Length(FJitArrDesc) > 0 then
-        Move(FJitArrDesc[0], ECtx.ArrDescOwn[0], Length(FJitArrDesc) * SizeOf(Int64));
-      // ...then redirect every PRIVATE logical id at the slot this context owns.
-      for i := 0 to Length(FArrPrivSlot) - 1 do
-        if FArrPrivSlot[i] >= 0 then
+        if Length(ECtx.ArrDescOwn) > 0 then
         begin
-          Src := ECtx.ArrMap[i] * 4;
-          Dst := i * 4;
-          if (Src >= 0) and (Src + 3 < Length(ECtx.ArrDescOwn)) and (Dst + 3 < Length(ECtx.ArrDescOwn)) then
-            Move(FJitArrDesc[Src], ECtx.ArrDescOwn[Dst], 4 * SizeOf(Int64));
+          n := Length(ECtx.ArrDescRetired);
+          SetLength(ECtx.ArrDescRetired, n + 1);
+          ECtx.ArrDescRetired[n] := ECtx.ArrDescOwn;
+          ECtx.ArrDescOwn := nil;
         end;
+        SetLength(ECtx.ArrDescOwn, Length(FJitArrDesc));
+      end;
+      // ⛔ WRITE EACH ENTRY ALREADY MAPPED - do NOT copy the master and then patch it.
+      // The two-step version has a WINDOW: after the copy and before the patch, this context's own
+      // private entries hold the master's values for the dead compile-time slot, which are zero. The
+      // buffer is updated IN PLACE (see above), so a compiled loop of this thread that re-reads the
+      // table inside that window reads a null data pointer. 📊 That window made parallel fasta under
+      // --jit produce a different answer in roughly one run out of three, while --aot - which only
+      // re-reads at call boundaries - was stable.
+      // Written this way each entry goes from one correct value straight to the next, and a 64-bit
+      // aligned store is atomic, so there is no moment at which the table is wrong.
+      for i := 0 to (Length(ECtx.ArrDescOwn) div 4) - 1 do
+      begin
+        if (i < Length(FArrPrivSlot)) and (FArrPrivSlot[i] >= 0) then Src := ECtx.ArrMap[i] else Src := i;
+        Dst := i * 4;
+        if (Src >= 0) and (Src * 4 + 3 < Length(FJitArrDesc)) and (Dst + 3 < Length(ECtx.ArrDescOwn)) then
+        begin
+          ECtx.ArrDescOwn[Dst + 0] := FJitArrDesc[Src * 4 + 0];
+          ECtx.ArrDescOwn[Dst + 1] := FJitArrDesc[Src * 4 + 1];
+          ECtx.ArrDescOwn[Dst + 2] := FJitArrDesc[Src * 4 + 2];
+          ECtx.ArrDescOwn[Dst + 3] := FJitArrDesc[Src * 4 + 3];
+        end;
+      end;
       ECtx.ArrDescGen := FArrDescGen;
       if GArrPrivDiag then
         for i := 0 to Length(FArrPrivSlot) - 1 do
