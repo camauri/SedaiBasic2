@@ -154,15 +154,15 @@ SUITE=(
 # Measured at N=18: interp 4660 -> 2956 ms, and under --aot 5267 -> 2797 ms, which also removes the
 # only case in the suite where every compiled profile lost to the interpreter.
 "binary-trees|binary-trees-modern-arena.bas|21|12|||binary-trees.py|binary-trees.lua|python||Allocate and deallocate many binary trees"
-"fannkuch-redux|fannkuch-redux-modern.bas|12|8|||fannkuch-redux.py|fannkuch-redux.lua|python||Indexed access to a tiny integer sequence"
+"fannkuch-redux|fannkuch-redux-modern-mt.bas|12|8|||fannkuch-redux.py|fannkuch-redux.lua|python||Indexed access to a tiny integer sequence"
 "fasta|fasta-modern.bas|25000000|100000|||fasta.py|fasta.lua|python||Generate and write random DNA sequences"
-"k-nucleotide|k-nucleotide-modern.bas|||25000000|100000|k-nucleotide.py|k-nucleotide.lua|lua||Hashtable update and k-nucleotide strings"
+"k-nucleotide|k-nucleotide-modern-mt.bas|||25000000|100000|k-nucleotide.py|k-nucleotide.lua|lua||Hashtable update and k-nucleotide strings"
 "mandelbrot|mandelbrot-modern.bas|16000|1000|||mandelbrot.py|mandelbrot.lua|python||Generate a Mandelbrot set portable bitmap"
 "n-body|n-body-modern.bas|50000000|500000|||n-body.py|n-body.lua|python||Double-precision N-body simulation"
 "pidigits|pidigits-bigint-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|Streaming arbitrary-precision arithmetic"
 "pidigits-basic|pidigits-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|The same spigot with the arithmetic written out in BASIC"
-"regex-redux|regex-redux-modern.bas|||5000000|100000|regex-redux.py|regex-redux.lua|oracle|regexredux_oracle.py|Match DNA 8-mers and substitute magic patterns"
-"reverse-complement|reverse-complement-modern.bas|||25000000|100000|reverse-complement.py|reverse-complement.lua|python||Read DNA sequences and write their reverse-complement"
+"regex-redux|regex-redux-modern-mt.bas|||5000000|100000|regex-redux.py|regex-redux.lua|oracle|regexredux_oracle.py|Match DNA 8-mers and substitute magic patterns"
+"reverse-complement|reverse-complement-modern-mt.bas|||25000000|100000|reverse-complement.py|reverse-complement.lua|python||Read DNA sequences and write their reverse-complement"
 "spectral-norm|spectral-norm-modern.bas|5500|500|||spectral-norm.py|spectral-norm.lua|python||Eigenvalue using the power method"
 )
 
