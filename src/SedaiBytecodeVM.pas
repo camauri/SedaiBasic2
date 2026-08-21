@@ -846,6 +846,8 @@ var
   GHotCDiag: Boolean = False;
   GHotCReported: Boolean = False;
   GHotCCalls: Int64 = 0;    // how many times the C loop was entered
+  GSuperDiag: Boolean = False;      // SUPER_DIAG=1: census of the NESTED superinstruction dispatch
+  GSuperCount: array[0..255] of Int64;
   GHotCExit: array[0..65535] of Int64;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
@@ -1241,6 +1243,7 @@ begin
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
+  GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
@@ -8517,6 +8520,12 @@ begin
   // Superinstructions use sub-opcode (low byte) for dispatch
   // Full opcode is 0xC800 + SubOp (group 200)
   SubOp := Instr.OpCode and $FF;
+
+  // SUPER_DIAG=1: count how often each sub-opcode is reached HERE, that is, through the SECOND
+  // dispatch. Every one of these paid the main dispatch already; the count is what says which of
+  // them is worth flattening into it. Naming candidates by reading the list is how the last two
+  // attempts at this kind of work produced nothing (see the inliner) - the ranking is the answer.
+  if GSuperDiag then Inc(GSuperCount[SubOp]);
 
   case SubOp of
     // Fused compare-and-branch (Int) - sub-opcodes 0-5
@@ -16373,6 +16382,32 @@ begin
   WriteLn(ErrOutput, '[CALLPROF]   emitted code around the call and is charged to the caller.');
 end;
 
+procedure ReportSuperCounts;
+// The nested-dispatch census, printed at shutdown. Sorted by count: an arm reached rarely costs
+// nothing to leave here, one reached in an inner loop pays the second dispatch every iteration.
+var
+  i, j, n, t: Integer;
+  Idx: array of Integer;
+  Tot: Int64;
+begin
+  if not GSuperDiag then Exit;
+  SetLength(Idx, 0); Tot := 0;
+  for i := 0 to 255 do
+    if GSuperCount[i] > 0 then
+    begin
+      n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i; Tot := Tot + GSuperCount[i];
+    end;
+  if Length(Idx) = 0 then begin WriteLn(ErrOutput, '[SUPER] nessun dispatch annidato'); Exit; end;
+  for i := 0 to High(Idx) - 1 do
+    for j := i + 1 to High(Idx) do
+      if GSuperCount[Idx[j]] > GSuperCount[Idx[i]] then
+      begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
+  WriteLn(ErrOutput, '[SUPER] dispatch annidati, per sotto-opcode (totale ', Tot, '):');
+  for i := 0 to High(Idx) do
+    WriteLn(ErrOutput, '[SUPER]   sub=', Idx[i]:3, '  ', GSuperCount[Idx[i]]:14,
+            '  (', OpcodeToString(Word($C800 or Idx[i])), ')');
+end;
+
 procedure ReportHotCExits;
 // The HOTC_DIAG census, printed once at shutdown so it covers every engine and every thread that
 // ran. Sorted by count, because the ranking IS the answer: an uncovered opcode that never lands in
@@ -16427,6 +16462,7 @@ initialization
   StrCapacityInit;
   if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
   AddExitProc(@ReportHotCExits);
+  AddExitProc(@ReportSuperCounts);
 
 finalization
   // NOT the only place it is called from: see the AddExitProc in the initialization above. A CLASSIC

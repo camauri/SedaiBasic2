@@ -29,6 +29,7 @@ var
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
+  S53Pos, S53Idx: Integer;   // sub-opcode 53 fast lane: the source index and the table index
   Instr: PBytecodeInstruction;   // POINTER, not a copy - see the note at the assignment
   InstrHot: PBytecodeInstruction;  // ...and what ArrayHotOps.inc dereferences (two including scopes)
   Ctx: TExecutionContext;  // M5.2: active execution context, read once per Run (zero hot-path cost)
@@ -770,11 +771,35 @@ begin
         // superinstruction set was inline. One delegated instruction still replaces two.
         52: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
-        // "acc += tab[Asc(MID$(s,i,1))+1]" fused whole - sub-opcode 159. Delegated for the same
-        // reason as 158. ⛔ THIS LINE is the one an opcode addition forgets: the arm in
+        // "acc += tab[Asc(MID$(s,i,1))+1]" fused whole - sub-opcode 159. ⛔ THIS LINE is the one an
+        // opcode addition forgets: the arm in
         // ExecuteSuperinstruction compiles fine on its own and is simply never reached, and the
         // program dies at RUNTIME with "Unknown superinstruction sub-opcode".
-        53: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+        // ⭐ FAST LANE, and only the fast lane. SUPER_DIAG=1 over the benchmark corpus counted
+        // 25 000 000 nested dispatches and 324 for everything else put together: sub-opcode 53 IS
+        // the nested dispatch, because it is the inner loop of reverse-complement. Measured net cost
+        // 34 ns per character, against ~12 ns of second dispatch by the figures in the note that
+        // flattened the arithmetic superinstructions.
+        //
+        // ⛔ What is NOT done here is inlining the BODY, and the note above says why: doing that for
+        // the whole superinstruction set made every program slower. So only the common case lands
+        // here - index inside the source, table long enough - and every edge (index out of range,
+        // dialect clamp, short table) still goes to ExecuteSuperinstruction, which keeps the two
+        // arms from drifting on the cases that are hard to get right.
+        53: begin
+              S53Pos := Ctx.IntRegs[Instr^.Immediate and $FFFF];
+              if (S53Pos >= 1) and (S53Pos <= Length(Ctx.StringRegs[Instr^.Src1])) then
+              begin
+                S53Idx := Ord(Ctx.StringRegs[Instr^.Src1][S53Pos]) + 1;
+                if S53Idx <= Length(Ctx.StringRegs[Instr^.Src2]) then
+                begin
+                  AppendChar(Ctx.StringRegs[Instr^.Dest], Ctx.StringRegs[Instr^.Src2][S53Idx]);
+                  Inc(CurPC);
+                end
+                else begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+              end
+              else begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+            end;
 
         // "MID$(t, start [, len]) = src" in place - sub-opcode 160. Delegated for the same reason.
         54: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
