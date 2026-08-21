@@ -374,6 +374,8 @@ begin
       // a plain field read on the hot path and the lock only when something really moved.
       if FArraysDirty or ((FPrivArrCount > 0) and (Ctx.ArrDescGen <> FArrDescGen)) then
         HotArrDesc := AcquireArrDescCtx(Ctx);
+      if GArrPrivDiag and (FPrivArrCount > 0) and (HotArrDesc <> nil) then
+        CheckPrivDesc(Ctx, HotArrDesc);
       // The two record bases, re-read per entry. Ctx.Records grows through bcRecordNew, which this
       // loop does not implement - so it can only move while we are OUTSIDE, and re-reading here is
       // exactly enough. The shared table is published only when the per-access lock is off; leaving

@@ -17,11 +17,22 @@
 '' ⭐ THE SLICE IS A MULTIPLE OF 60, so a worker cuts its own lines and there is no second pass over
 '' the assembled sequence - the serial tail that turned out to be 46% of parallel mandelbrot.
 ''
-'' ⛔⛔ NOT READY FOR THE BATTERY (21 Aug 2026). This program spawns THREE waves of workers whose SUB
-'' declares local arrays, and the per-context private-array blocks are corrupted when a block is
-'' REUSED across waves - see job/tests/bas/bug_privarray_block_reuse_across_waves.bas. Interpreted and
-'' --aot are stable here after three fixes, --jit still answers differently in about one run in three.
-'' Keep it out of benchmark.sh until that guard is green.
+'' 📉 NOT THE BATTERY ENTRY, AND THE MEASUREMENT SAYS WHY. N=2500000, best of one:
+''      interpreted  1 861 -> 1 212 ms   1.54x
+''      --aot          776 -> 1 265 ms   0.61x
+''      --jit          902 -> 1 331 ms   0.68x
+'' Splitting the stream wins where the RNG loop is the cost and LOSES where it is not: under a
+'' compiler the draws get cheap enough that building and printing 25 MB of per-worker strings becomes
+'' the wall, and the sequential version - which prints each 60-character line as it makes it - never
+'' builds them. The game ranks the best program per language, so benchmark.sh keeps fasta-modern.bas.
+'' ⇒ Worth revisiting if the workers ever emit in ROUNDS instead of one string per slice.
+''
+'' ⛔ THIS PROGRAM SPAWNS THREE WAVES OF WORKERS whose SUB declares local arrays, so a per-context
+'' array block is RELEASED and CLAIMED AGAIN between waves. It is the first program to do that, and it
+'' found four defects in that machinery on 21 Aug 2026 - the last one being that a private descriptor
+'' entry was copied from the VM-global table, which another thread can leave stale for exactly the
+'' window in which this program reads it. Private entries are now built from the storage itself.
+'' 🥅 job/tests/bas/bug_privarray_block_reuse_across_waves.bas is the miniature of that shape.
 ''
 '' ⛔ ProcessorCount(), not CpuCount(): the latter counts SOCKETS (1 on this machine) and using it
 '' makes the program single-threaded in silence - right answer, right output, no parallelism.

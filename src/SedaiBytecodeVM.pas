@@ -554,6 +554,7 @@ type
     procedure BindArrayMap(Ctx: TExecutionContext);         // hand Ctx a free block and build its ArrMap
     procedure ReleaseArrayMap(Ctx: TExecutionContext);      // give the block back (and clear its storage)
     function MapArrDyn(Ctx: TExecutionContext; Id: Int64): Integer;  // id carried in a register/pointer
+    procedure CheckPrivDesc(Ctx: TExecutionContext; Desc: Pointer);  // ARRPRIV_DIAG: descriptor vs storage
     function ActiveCtx: TExecutionContext; inline;   // this thread's context (GActiveCtx, or the main one)
     procedure RebuildJitArrDesc;
     function AcquireArrDesc: Pointer;
@@ -1134,8 +1135,16 @@ begin
       // it to ON ERROR, failing the program) is still M5.5; this is the floor: the failure is named,
       // on stderr, with the thread that had it.
       on E: Exception do
+      begin
         WriteLn(ErrOutput, Format('?thread %d died: %s: %s (mutexes it held stay locked)',
                                   [Spawn.Handle, E.ClassName, E.Message]));
+        // ⭐ AND WHERE. A named failure without a location is still a guessing game: this file already
+        // documents that swallowing a worker's exception turned a diagnosable fault into an
+        // unexplainable hang, and "?thread 14 died: EAccessViolation" on its own is only half a step
+        // better. Costs nothing - it runs once, on a thread that is already failing - and needs a
+        // build with symbols (./build.sh sb --symbols) to name the frames.
+        DumpExceptionBackTrace(ErrOutput);
+      end;
       else
         WriteLn(ErrOutput, Format('?thread %d died: non-Exception (mutexes it held stay locked)',
                                   [Spawn.Handle]));
@@ -10873,6 +10882,27 @@ begin
   Ctx.ArrDescGen := 0;
 end;
 
+procedure TBytecodeVM.CheckPrivDesc(Ctx: TExecutionContext; Desc: Pointer);
+// ARRPRIV_DIAG=1: every PRIVATE entry of the table about to be handed to the C loop must point at the
+// storage THIS context owns. Says which id, what the table holds and what it should hold.
+var
+  i, phys: Integer;
+  D: PInt64;
+  want: Int64;
+begin
+  D := PInt64(Desc);
+  for i := 0 to Length(FArrPrivSlot) - 1 do
+    if FArrPrivSlot[i] >= 0 then
+    begin
+      phys := Ctx.ArrMap[i];
+      if (phys < 0) or (phys > High(FArrays)) then Continue;
+      if Length(FArrays[phys].IntData) > 0 then want := Int64(PtrUInt(@FArrays[phys].IntData[0])) else want := 0;
+      if D[i * 4] <> want then
+        WriteLn(ErrOutput, Format('[arrpriv] ⛔ ARR[%d] phys=%d desc=%x atteso=%x size=%d gen=%d/%d',
+                [i, phys, D[i * 4], want, FArrays[phys].TotalSize, Ctx.ArrDescGen, FArrDescGen]));
+    end;
+end;
+
 function TBytecodeVM.ActiveCtx: TExecutionContext; inline;
 // ⛔ GActiveCtx is set only inside a WORKER; on the main thread it is nil. Every reader of it in this
 // unit resolves it the same way, and writing that out again at each site is how one of them ends up
@@ -10984,14 +11014,36 @@ begin
       // aligned store is atomic, so there is no moment at which the table is wrong.
       for i := 0 to (Length(ECtx.ArrDescOwn) div 4) - 1 do
       begin
-        if (i < Length(FArrPrivSlot)) and (FArrPrivSlot[i] >= 0) then Src := ECtx.ArrMap[i] else Src := i;
         Dst := i * 4;
-        if (Src >= 0) and (Src * 4 + 3 < Length(FJitArrDesc)) and (Dst + 3 < Length(ECtx.ArrDescOwn)) then
+        if Dst + 3 >= Length(ECtx.ArrDescOwn) then Break;
+        if (i < Length(FArrPrivSlot)) and (FArrPrivSlot[i] >= 0) then
         begin
-          ECtx.ArrDescOwn[Dst + 0] := FJitArrDesc[Src * 4 + 0];
-          ECtx.ArrDescOwn[Dst + 1] := FJitArrDesc[Src * 4 + 1];
-          ECtx.ArrDescOwn[Dst + 2] := FJitArrDesc[Src * 4 + 2];
-          ECtx.ArrDescOwn[Dst + 3] := FJitArrDesc[Src * 4 + 3];
+          // ⛔ A PRIVATE ENTRY IS BUILT FROM THE STORAGE, NOT FROM THE MASTER TABLE.
+          // The master is only rebuilt when FArraysDirty says so, and that flag is VM-global: another
+          // thread can consume it - clearing it - in the window between this context allocating its
+          // array and reading the table back, leaving the master's entry for this block empty while
+          // the storage exists. Reading FArrays directly cannot be stale: it IS the storage.
+          // 📊 That is what killed a worker inside sedai_hot_run on the multi-wave guard, roughly one
+          // run in six: `desc=0 atteso=7F7D4975B050 size=64`.
+          Src := ECtx.ArrMap[i];
+          if (Src < 0) or (Src > High(FArrays)) then Continue;
+          if Length(FArrays[Src].IntData) > 0 then
+            ECtx.ArrDescOwn[Dst + 0] := Int64(PtrUInt(@FArrays[Src].IntData[0]))
+          else ECtx.ArrDescOwn[Dst + 0] := 0;
+          if Length(FArrays[Src].FloatData) > 0 then
+            ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
+          else ECtx.ArrDescOwn[Dst + 1] := 0;
+          ECtx.ArrDescOwn[Dst + 2] := FArrays[Src].TotalSize;
+          if Length(FArrays[Src].LowerBounds) > 0 then
+            ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
+          else ECtx.ArrDescOwn[Dst + 3] := 0;
+        end
+        else if i * 4 + 3 < Length(FJitArrDesc) then
+        begin
+          ECtx.ArrDescOwn[Dst + 0] := FJitArrDesc[i * 4 + 0];
+          ECtx.ArrDescOwn[Dst + 1] := FJitArrDesc[i * 4 + 1];
+          ECtx.ArrDescOwn[Dst + 2] := FJitArrDesc[i * 4 + 2];
+          ECtx.ArrDescOwn[Dst + 3] := FJitArrDesc[i * 4 + 3];
         end;
       end;
       ECtx.ArrDescGen := FArrDescGen;
