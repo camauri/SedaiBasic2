@@ -56,6 +56,7 @@ COOLDOWN=-1
 COOL_TO=0
 COOL_MAX=180
 ONLY=""
+EXTRA=""
 RUNTIME_FILTER=""
 PROFILE_FILTER=""
 NO_THERMOMETER=false
@@ -77,7 +78,8 @@ Usage: ./benchmark.sh [options]
   --cooldown <s>       Seconds to idle between runs (default: 0 with --quick, 20 otherwise)
   --cool-to <ms>       Adaptive cooldown: idle until the thermometer reads at most this
   --cool-max <s>       Cap on the extra waiting --cool-to may add per run (default 180)
-  --only <a,b>         Run only the named benchmarks
+  --only <a,b>         Run only the named benchmarks (an opt-in row may be named here too)
+  --extra <a,b>        ADD an opt-in row to the run. Available: pidigits-basic
   --runtime <a,b>      Run only the named runtimes: sedai, python, lua
   --profile <a,b>      Run only the named sb profiles: interp, aot, jit, aotjit
   --no-thermometer     Skip the thermometer readings
@@ -133,17 +135,21 @@ THERMO_EXE="$PROJECT_ROOT/job/tests/bench/nbody_fbc_o2$EXE_SUFFIX"
 #                        is never timed. k-nucleotide's Python version needs a working
 #                        multiprocessing fork; Lua answers instead.
 #
-#  TWO ROWS FOR ONE PROGRAM. pidigits and pidigits-basic are the SAME spigot and measure two
-#  different things, so both are timed:
-#    pidigits        asks the language for the arbitrary-precision arithmetic (the BigInt type).
-#                    This is the comparison the reference invites - the Python entry does not use
-#                    CPython's integers either, it calls GMP through ctypes. LIBRARY against LIBRARY.
-#    pidigits-basic  writes the same arithmetic out by hand over a base-10^9 limb array, ~245 lines
-#                    of BASIC. That measures the ENGINE on a long, loop-heavy, array-heavy program.
-#  Until 2026-08-15 only the second existed and it carried the bare name, so the suite reported us
-#  8x slower than Python on a benchmark where the type is 1.7x FASTER - and the whole BigInt work
-#  was invisible to every published number. Timing one and calling it the other is the error the
-#  two rows exist to prevent.
+#  pidigits HAS AN OPT-IN TWIN, AND THE DEFAULT TABLE DOES NOT CARRY IT (22 Aug 2026, user's call).
+#  `pidigits` asks the LANGUAGE for the arbitrary-precision arithmetic (the BigInt type). That is the
+#  comparison the reference invites: the Python entry does not use CPython's integers either, it calls
+#  GMP through ctypes, and the Lua entry calls `bn`. Library against library.
+#  `pidigits-basic` times the same spigot with the arithmetic written out by hand over a base-10^9
+#  limb array - our BASIC against those same C libraries. It earned its place on 2026-08-15, when the
+#  suite ran ONLY that program under the bare name `pidigits` and reported us 8x slower than Python on
+#  a benchmark where the type is faster; a second row was how that error was made visible and kept
+#  visible.
+#  ⇒ That job is done, and what the row measures now - a BASIC program against GMP - says nothing
+#  about the engine that the other ten rows do not say better, while carrying a permanent 0.04x into
+#  the table. So it moved to SUITE_EXTRA: still there, still correct, run with
+#      benchmarks/benchmark.sh --extra pidigits-basic
+#  bas/07_benchmarks/pidigits-modern.bas is also in the regression corpus, so the PROGRAM stays
+#  verified whether or not anybody times it.
 
 SUITE=(
 # ⭐ THE ARENA VARIANT IS THE ENTRY, not the New/Delete one. Same algorithm and byte-identical
@@ -160,10 +166,16 @@ SUITE=(
 "mandelbrot|mandelbrot-modern.bas|16000|1000|||mandelbrot.py|mandelbrot.lua|python||Generate a Mandelbrot set portable bitmap"
 "n-body|n-body-modern.bas|50000000|500000|||n-body.py|n-body.lua|python||Double-precision N-body simulation"
 "pidigits|pidigits-bigint-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|Streaming arbitrary-precision arithmetic"
-"pidigits-basic|pidigits-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|The same spigot with the arithmetic written out in BASIC"
 "regex-redux|regex-redux-modern-mt.bas|||5000000|100000|regex-redux.py|regex-redux.lua|oracle|regexredux_oracle.py|Match DNA 8-mers and substitute magic patterns"
 "reverse-complement|reverse-complement-modern-mt.bas|||25000000|100000|reverse-complement.py|reverse-complement.lua|python||Read DNA sequences and write their reverse-complement"
 "spectral-norm|spectral-norm-modern.bas|5500|500|||spectral-norm.py|spectral-norm.lua|python||Eigenvalue using the power method"
+)
+
+# OPT-IN ROWS. Never measured in a default run: they are asked for by name with --extra (or --only).
+# A row belongs here when it is a legitimate thing to measure but is NOT a statement about the engine,
+# so that leaving it in the default table misleads more than it informs.
+SUITE_EXTRA=(
+"pidigits-basic|pidigits-modern.bas|10000|1000|||pidigits.py|pidigits.lua|oracle|pidigits_oracle.py|The same spigot with the arithmetic written out in BASIC"
 )
 
 PROFILE_KEYS=(interp aot jit aotjit)
@@ -750,6 +762,7 @@ while [[ $# -gt 0 ]]; do
         --cool-to) COOL_TO="$2"; shift 2 ;;
         --cool-max) COOL_MAX="$2"; shift 2 ;;
         --only) ONLY="$2"; shift 2 ;;
+        --extra) EXTRA="$2"; shift 2 ;;
         --runtime) RUNTIME_FILTER="$2"; shift 2 ;;
         --profile) PROFILE_FILTER="$2"; shift 2 ;;
         --no-thermometer) NO_THERMOMETER=true; shift ;;
@@ -783,22 +796,39 @@ if [[ -n "$PROFILE_FILTER" ]]; then
     done
 fi
 
+# ⛔ --only searches BOTH lists: naming an opt-in row explicitly IS asking for it, and a name that
+# resolved in one list but not the other would be a trap. A run with neither flag gets the main suite.
+ALL_SPECS=("${SUITE[@]}" "${SUITE_EXTRA[@]}")
 SELECTED=()
 if [[ -n "$ONLY" ]]; then
     IFS=',' read -ra _only <<< "$ONLY"
     for want in "${_only[@]}"; do
         found=false
-        for spec in "${SUITE[@]}"; do
+        for spec in "${ALL_SPECS[@]}"; do
             [[ "${spec%%|*}" == "$want" ]] && { SELECTED+=("$spec"); found=true; break; }
         done
         if [[ "$found" != "true" ]]; then
             echo -e "${RED}ERROR: unknown benchmark: $want${NC}"
-            echo -e "${YELLOW}Valid: $(for s in "${SUITE[@]}"; do printf '%s ' "${s%%|*}"; done)${NC}"
+            echo -e "${YELLOW}Valid: $(for s in "${ALL_SPECS[@]}"; do printf '%s ' "${s%%|*}"; done)${NC}"
             exit 1
         fi
     done
 else
     SELECTED=("${SUITE[@]}")
+fi
+if [[ -n "$EXTRA" ]]; then
+    IFS=',' read -ra _extra <<< "$EXTRA"
+    for want in "${_extra[@]}"; do
+        found=false
+        for spec in "${SUITE_EXTRA[@]}"; do
+            [[ "${spec%%|*}" == "$want" ]] && { SELECTED+=("$spec"); found=true; break; }
+        done
+        if [[ "$found" != "true" ]]; then
+            echo -e "${RED}ERROR: unknown opt-in benchmark: $want${NC}"
+            echo -e "${YELLOW}Opt-in: $(for s in "${SUITE_EXTRA[@]}"; do printf '%s ' "${s%%|*}"; done)${NC}"
+            exit 1
+        fi
+    done
 fi
 
 # A quick verification pass does not need a cooldown; a real measurement session does.
