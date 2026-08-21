@@ -457,9 +457,20 @@ begin
         try SSAProgram.RunGosubInlining; except on E: Exception do OptPassFailed('GosubInlining', E); end;
         {$ENDIF}
 
-        {$IFNDEF DISABLE_CONST_PROP}
-        try SSAProgram.RunConstProp; except on E: Exception do OptPassFailed('ConstProp', E); end;
-        {$ENDIF}
+        // ⛔ CONST_PROP RIMOSSO DALLA PIPELINE (21 ago 2026). Non e' stato spento: e' STACCATO,
+        // perche' non poteva funzionare. Il passo cerca ssaStoreVar / ssaLoadVar per trovare le
+        // variabili BASIC assegnate una volta sola con un valore costante - e la generazione SSA
+        // non emette quei due opcode NEMMENO UNA VOLTA (zero siti in SedaiSSA.pas): le variabili
+        // sono promosse a registri durante la costruzione dell'SSA. Il passo e' del 25 gen 2025 e
+        // l'IR gli e' cambiato sotto senza che nessuno ripercorresse le sue ipotesi.
+        //
+        // 📊 Che non facesse nulla era gia' misurato: l'audit del 20 ago (job/tests/tools/opt_audit.sh)
+        // ha spento un passo alla volta su 162 programmi, e spegnere CONST_PROP non cambiava UN BYTE.
+        // Cio' che mancava era il PERCHE', e con l'except nudo di allora «non trova niente» e
+        // «esplode alla prima istruzione» erano indistinguibili.
+        //
+        // L'unita' SedaiConstProp resta in albero con una nota in testa: per rianimarla servirebbe
+        // riscriverla sui REGISTRI invece che sulle variabili, e a quel punto sarebbe un passo nuovo.
 
         {$IFNDEF DISABLE_COPY_PROP}
         try SSAProgram.RunCopyProp; except on E: Exception do OptPassFailed('CopyProp', E); end;
