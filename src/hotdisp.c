@@ -41,6 +41,10 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
    the opcode table handed to the Pascal side, the dispatch table, and the label each arm carries.
    A name in the list with no matching arm is a COMPILE error, which is the point. */
 #define HOT_OP_LIST \
+  X(0x0068, RecordLoadInt         ) \
+  X(0x0069, RecordLoadFloat       ) \
+  X(0x006B, RecordStoreInt        ) \
+  X(0x006C, RecordStoreFloat      ) \
   X(0x0000, LoadConstInt          ) \
   X(0x0003, CopyInt               ) \
   X(0x0008, AddInt                ) \
@@ -163,8 +167,41 @@ int sedai_hot_ops(const uint16_t **out)
 int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
                   int pc, int count, int64_t tv,
                   const int64_t *arrdesc, int flags,
-                  int64_t *xi, double *xf, const uint16_t *hidx)
+                  int64_t *xi, double *xf, const uint16_t *hidx,
+                  const int64_t *recdesc)
 {
+  /* RECORD FIELDS. recdesc is built on the Pascal side, which is the side that knows the layout of
+     TRecordStorage - this file holds no offset of its own, so the two cannot drift the way a
+     hand-copied struct would. Its six slots are:
+        [0] base of the executing context's per-thread Records array (0 = none)
+        [1] stride between two records = SizeOf(TRecordStorage)
+        [2] byte offset of the Bytes field inside TRecordStorage
+        [3] base of the shared-record pointer table, or 0 when the per-access lock is in force -
+            and 0 makes every shared handle leave the C loop, which is the prudent answer
+        [4] SHARED_REC_FLAG   [5] SHARED_REC_MASK
+     A null recdesc disables all four arms. */
+#define RECPTR(h_, out_) do {                                                     \
+    int64_t hh_ = (h_);                                                           \
+    if (!recdesc) return pc;                                                      \
+    if (hh_ & recdesc[4]) {                                                       \
+      if (!recdesc[3]) return pc;               /* locked mode: not ours */       \
+      (out_) = ((char *const *)(intptr_t)recdesc[3])[hh_ & recdesc[5]];           \
+    } else {                                                                      \
+      if (!recdesc[0] || hh_ < 0) return pc;                                      \
+      (out_) = (char *)(intptr_t)recdesc[0] + hh_ * recdesc[1];                   \
+    }                                                                             \
+    if (!(out_)) return pc;                                                       \
+  } while (0)
+
+/* The field byte image, then the width code in the low nibble of the immediate - transcribed from
+   RecFieldInt / RecSetFieldInt in SedaiBytecodeVM.pas. A record whose Bytes array is still nil
+   hands the PC back rather than dereferencing it. */
+#define RECBYTES(rec_, enc_, out_) do {                                           \
+    uint8_t *b_ = *(uint8_t **)((rec_) + recdesc[2]);                             \
+    if (!b_) return pc;                                                           \
+    (out_) = b_ + ((enc_) >> 4);                                                  \
+  } while (0)
+
 #define X(hex, name) &&L_##name,
   static void *const disp[] = { HOT_OP_LIST };
 #undef X
@@ -177,6 +214,59 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
                      I = prog + pc; goto *disp[h_ - 1]; } } while (0)
 
   NEXT;   /* entry is the same step as every other */
+
+  /* RECORD FIELDS, transcribed from RunTemplate.inc's four bcRecordLoad and bcRecordStore arms and from
+     RecFieldInt / RecFieldFloat / RecSetFieldInt / RecSetFieldFloat in SedaiBytecodeVM.pas.
+     The width lives in the low nibble of the immediate and the byte offset in the rest of it; code 7
+     is a SINGLE, which is four bytes and not a widened Double. bcRecordLoadString and its store are
+     deliberately absent - the string bank is off limits to this loop.
+
+     ⭐ WHY THESE FOUR EARN THEIR PLACE. Measured 21 Aug 2026 on binary-trees-modern (records) and
+     binary-trees-modern-arena (the same algorithm over a flat array), N=16, interpreter only:
+         arena, C loop on 0.566 s / off 0.821 s .... the C loop is worth 45%
+         records, C loop on 1.252 s / off 1.231 s .. worth NOTHING
+     A record field appearing in a hot loop split it into covered runs too short to pay for
+     themselves, which is the exact failure the header of this file already records for
+     spectral-norm. On a probe isolating one field read, the field cost +132.6% of the loop with the
+     C loop on and +32.2% with it off - the same +32% an array read costs. So the field was never
+     expensive; it was expensive only because it left. */
+  L_RecordLoadInt: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm;
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    switch (enc_ & 0xF) {
+      case 1:  ireg[I->dest] = *(int8_t   *)p_; break;
+      case 2:  ireg[I->dest] = *(uint8_t  *)p_; break;
+      case 3:  ireg[I->dest] = *(int16_t  *)p_; break;
+      case 4:  ireg[I->dest] = *(uint16_t *)p_; break;
+      case 5:  ireg[I->dest] = *(int32_t  *)p_; break;
+      case 6:  ireg[I->dest] = *(uint32_t *)p_; break;
+      default: ireg[I->dest] = *(int64_t  *)p_; break;
+    }
+    pc++; } NEXT;
+  L_RecordLoadFloat: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm;
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    freg[I->dest] = ((enc_ & 0xF) == 7) ? (double)*(float *)p_ : *(double *)p_;
+    pc++; } NEXT;
+  L_RecordStoreInt: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm, v_ = ireg[I->s2];
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    switch (enc_ & 0xF) {
+      case 1: case 2: *(uint8_t  *)p_ = (uint8_t )v_; break;
+      case 3: case 4: *(uint16_t *)p_ = (uint16_t)v_; break;
+      case 5: case 6: *(uint32_t *)p_ = (uint32_t)v_; break;
+      default:        *(int64_t  *)p_ = v_;           break;
+    }
+    pc++; } NEXT;
+  L_RecordStoreFloat: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm; double v_ = freg[I->s2];
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    if ((enc_ & 0xF) == 7) *(float *)p_ = (float)v_; else *(double *)p_ = v_;
+    pc++; } NEXT;
 
   L_LoadConstInt: ireg[I->dest] = I->imm;                                        pc++; NEXT;
   L_CopyInt: ireg[I->dest] = ireg[I->s1];                                   pc++; NEXT;

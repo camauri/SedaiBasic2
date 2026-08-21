@@ -60,9 +60,18 @@ var
   TrapTriggered: Boolean;
   // Event polling counter
   EventPollCounter: Integer;
+  // The JIT arm's array-descriptor fast lane. It belongs to the JIT and NOT to the C hot loop, and
+  // it used to be declared inside the {$IFDEF HOT_C} block below while being initialised and read
+  // from the common body - so --no-hot-c did not compile at all ("Identifier not found"). Nobody
+  // saw it because nobody builds that way: the C compiler is present on every machine this is built
+  // on, and the flag exists for the machines where it is not.
+  JitArrDescCache: Pointer;
   {$IFDEF HOT_C}
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
-  JitArrDescCache: Pointer;      // corsia veloce del descrittore array per l'arm JIT
+  // The record-field descriptor handed to the C loop. It is built HERE, by the side that knows the
+  // layout of TRecordStorage, so hotdisp.c holds no offset of its own and the two cannot drift.
+  HotRecDesc: array[0..5] of Int64;
+  HotRecProbe: TRecordStorage;   // only ever used to take the offset of its Bytes field
   HotNewPC: LongInt;
   HotArrDesc: Pointer;
   HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
@@ -226,6 +235,13 @@ begin
   if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
   if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
   if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
+  // Slots 1, 2, 4 and 5 are layout and never change during a run. Slots 0 and 3 are the two bases,
+  // and they are refreshed at every entry below - taking an address costs nothing, and unlike
+  // AcquireArrDesc neither of them needs a lock to read.
+  HotRecDesc[1] := SizeOf(TRecordStorage);
+  HotRecDesc[2] := PtrUInt(@HotRecProbe.Bytes) - PtrUInt(@HotRecProbe);
+  HotRecDesc[4] := SHARED_REC_FLAG;
+  HotRecDesc[5] := SHARED_REC_MASK;
   if Length(Ctx.XferInt) > 0 then HotXferI := @Ctx.XferInt[0] else HotXferI := nil;
   if Length(Ctx.XferFloat) > 0 then HotXferF := @Ctx.XferFloat[0] else HotXferF := nil;
   // Without both transfer banks the C loop must not run the Xfer opcodes at all.
@@ -349,8 +365,27 @@ begin
       // taken ONCE before the loop and refreshed only when the array set actually changed, which is
       // a plain field read on the hot path and the lock only when something really moved.
       if FArraysDirty then HotArrDesc := AcquireArrDesc;
+      // The two record bases, re-read per entry. Ctx.Records grows through bcRecordNew, which this
+      // loop does not implement - so it can only move while we are OUTSIDE, and re-reading here is
+      // exactly enough. The shared table is published only when the per-access lock is off; leaving
+      // slot 3 at zero makes the C arms hand back every shared handle instead of racing for it.
+      //
+      // ⛔ ONE DIFFERENCE FROM THE PASCAL ARM, AND IT IS DELIBERATE. ResolveRec re-reads the
+      // FSharedRecords field on EVERY access; the C loop is handed the base once and holds it for
+      // the whole run. That is safe for the same reason ResolveRec is allowed to be lock-free:
+      // GrowSharedRecords RETIRES the old array instead of freeing it, and an entry valid when a
+      // handle was issued stays valid in every array from that one onwards. So a stale base still
+      // reads live memory and still resolves every handle this thread can legally name - it cannot
+      // name one another thread minted mid-run without synchronising first, which is the same
+      // assumption the Pascal side already makes. If that retirement policy ever changes, this is
+      // the second place that depends on it.
+      if Length(Ctx.Records) > 0 then HotRecDesc[0] := PtrUInt(@Ctx.Records[0]) else HotRecDesc[0] := 0;
+      if FSharedRecLockFree and (Length(FSharedRecords) > 0) then
+        HotRecDesc[3] := PtrUInt(@FSharedRecords[0])
+      else
+        HotRecDesc[3] := 0;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
-                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0]);
+                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0]);
       if HotNewPC <> CurPC then
       begin
         CurPC := HotNewPC;
