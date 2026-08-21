@@ -118,16 +118,10 @@ type
   end;
 
   { Array storage structure }
-  TArrayStorage = record
-    ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
-    DimCount: Integer;
-    Dimensions: array of Integer;   // element count per dimension
-    LowerBounds: array of Integer;  // lower bound per dimension (B1.4: LBOUND/UBOUND)
-    TotalSize: Integer;
-    IntData: array of Int64;
-    FloatData: array of Double;
-    StringData: array of string;
-  end;
+  { TArrayStorage moved to SedaiExecutionContext (21 Aug 2026: the array BIND SAVE-STACK is
+    per-context, and the context has to see the type - exactly as TRecordStorage moved for the
+    record heap). Aliased here so every existing use of the name still resolves. }
+  TArrayStorage = SedaiExecutionContext.TArrayStorage;
 
   { TRecordStorage moved to SedaiExecutionContext (M5.2b: the record heap is per-context). }
 
@@ -245,6 +239,21 @@ type
     // the on-file bytecode and TBytecodeInstruction.OpCode are left untouched (format unchanged).
     FDenseOps: array of Word;
     FDenseOpsFor: TBytecodeProgram;   // the program FDenseOps was built for (rebuild guard)
+    // ⛔ MISURATO E RESPINTO (21 ago 2026). Il profilo diceva che AotCallSub spende il 3,8% in
+    // GetInstructionCount + GetInstructionsPtr, due metodi di un'altra unita' chiamati A OGNI
+    // RITORNO per decidere se il PC restituito e' un bcReturnSub. Metterli in due CAMPI della VM,
+    // riempiti una volta per programma, sembrava gratis.
+    // 📊 A/B alternato su un binario solo, macchina fredda, con fannkuch come controllo:
+    //     binary-trees N=18   metodi 4050 -> campi 4128 ms   +1,9%
+    //                         metodi 4023 -> campi 4214 ms   +4,7%
+    //     fannkuch     N=11   2023 / 2026 / 2023             piatto, come deve essere
+    // Le due coppie concordano: i campi sono PIU' LENTI. Spiegazione plausibile: i campi nuovi
+    // cadevano in una zona fredda dell'oggetto, quindi ogni ritorno toccava una RIGA DI CACHE in
+    // piu', mentre le due chiamate a metodo leggono campi gia' caldi. Il controllo non si muove,
+    // quindi l'effetto e' reale e sta sul percorso di chiamata.
+    // ⛔ Non ritentarlo senza misurare: se un giorno serve, va provato mettendo i campi ACCANTO a
+    // quelli che il percorso di ritorno tocca gia', non in fondo all'oggetto.
+
     {$IFDEF HOT_C}
     FHotOp: array of Word;            // per PC: 1 + the C arm that runs it, 0 = not the C loop's
     FHotOpBase: array of Word;        // ...before the run-wide gate is folded in
@@ -338,6 +347,10 @@ type
     // corsia veloce di EnsureArrDesc: se il contesto del chiamante ha gia' questo puntatore e
     // nessuno ha sporcato la tabella, non c'e' niente da riacquisire e la sezione critica si salta.
     FCurArrDesc: Pointer;
+    // Bumped on every master rebuild. A per-context copy carries the generation it was built from,
+    // which is how a context knows its own table has gone stale without comparing pointers it does
+    // not own. Read outside the lock on the fast lane, exactly as FArraysDirty is.
+    FArrDescGen: Int64;
     FOutputDevice: IOutputDevice;
     FGraphics: IGraphicsBackend;     // FreeBASIC graphics phase: operation-level drawing backend (SW headless / SDL2 on sbv)
     FOwnedGraphics: TObject;         // concrete backend object the VM owns and frees (e.g. the software backend on sb)
@@ -408,13 +421,19 @@ type
     FFunctionKeys: array[1..12] of string;
     FVarMap: TStringList;
     FArrays: array of TArrayStorage;
-    // Array BYREF parameter binding (MODERN): a save-stack for bcArrayBind/bcArrayUnbind. Binding
-    // aliases a callee param-array slot to the caller's array (sharing the element data); the saved
-    // original is restored on unbind. A stack so recursion / re-entrancy nest correctly. ArgId is the
-    // caller's array slot, kept so a REDIM [PRESERVE] inside the callee (which reallocates the param's
-    // storage and thereby breaks the shared reference) is propagated back to the caller on unbind.
-    FArrayBindStack: array of record SlotId: Integer; ArgId: Integer; Saved: TArrayStorage; Snapshot: TArrayStorage; end;
-    FArrayBindTop: Integer;
+    // --- Private (proc-local) arrays: one storage PER EXECUTION CONTEXT -------------------------
+    // ⛔ Defect fixed 21 Aug 2026. A DIM inside a SUB compiles to an immediate array id, i.e. ONE
+    // slot for the whole program, so two threads running the same SUB wrote the same elements. Every
+    // context now owns a BLOCK of physical slots, one per private array, appended after the static
+    // id space; Ctx.ArrMap turns the logical id the bytecode names into the physical slot.
+    // The blocks are reserved ONCE at load (never grown afterwards) because a UDT member array
+    // appends to FArrays at RUNTIME and a concurrent SetLength would move the table under it.
+    FArrPrivSlot: array of Integer;   // per LOGICAL array id: position inside a block, or -1 = shared
+    FPrivArrCount: Integer;           // arrays per block (0 = the program has no private array at all)
+    FPrivBlockBase: Integer;          // FArrays index of block 0
+    FPrivBlockUsed: array of Boolean; // which blocks are handed out (guarded by FWorkerLock)
+    FStaticArrCount: Integer;         // size of the compile-time id space (ArrMap covers exactly this)
+    // The array BYREF bind save-stack moved to TExecutionContext (per-context since 21 Aug 2026).
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
     FRedimPendingLBs: array of Integer;   // REDIM "lb TO ub" with a RUNTIME lb: lower bounds accumulated (immediate flag on the push)
     FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
@@ -530,9 +549,18 @@ type
     procedure BuildJitLoops;
     // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
     procedure SetAotPrimitives(var C: TAotCtx);
+    // --- private (proc-local) array plumbing; see FArrPrivSlot ---
+    procedure BuildPrivateArrayPlan;                       // census the private ids, reserve every block
+    procedure BindArrayMap(Ctx: TExecutionContext);         // hand Ctx a free block and build its ArrMap
+    procedure ReleaseArrayMap(Ctx: TExecutionContext);      // give the block back (and clear its storage)
+    function MapArrDyn(Ctx: TExecutionContext; Id: Int64): Integer;  // id carried in a register/pointer
+    procedure CheckPrivDesc(Ctx: TExecutionContext; Desc: Pointer);  // ARRPRIV_DIAG: descriptor vs storage
+    function ActiveCtx: TExecutionContext; inline;   // this thread's context (GActiveCtx, or the main one)
     procedure RebuildJitArrDesc;
     function AcquireArrDesc: Pointer;
     procedure EnsureArrDesc(Ctx: PAotCtx);
+    function AcquireArrDescCtx(ECtx: TExecutionContext): Pointer;   // per-context table when arrays are private
+    function AcquireArrDescFast(var Cached: Pointer; ECtx: TExecutionContext): Pointer;
     procedure ReleaseRetiredArrDesc;
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
@@ -576,6 +604,7 @@ type
     // bcCallSub: snapshot the registers the callee at TargetPC can touch (-1 = unknown target,
     // e.g. an indirect call: falls back to the program-wide width). bcReturnSub restores exactly
     // what was pushed, reading the width back off the frame-width stack.
+    function FramePushIsAllocFree(Ctx: TExecutionContext; TargetPC: Integer): Boolean;
     procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1; CallPC: Integer = -1);
     procedure FramePop(Ctx: TExecutionContext);
     // Size the integer bank to LogicalCount slots PLUS the relocatable frame region above them,
@@ -816,6 +845,47 @@ var
   // 4a8b8ac). E' il riferimento dell'A/B su un binario solo: quel commit ha corretto tre difetti a
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
   GArrDescFast: Boolean = True;
+  GArrPrivDiag: Boolean = False;   // ARRPRIV_DIAG=1: trace the private-array mapping
+  // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
+  // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
+  GNoExcFrame: Boolean = True;
+  // HOTC_DIAG=1 counts, per opcode, how many times the C hot loop HANDED THE PC BACK on it - that
+  // is, how often each uncovered opcode SPLITS a hot run. It is the census that answers "which
+  // opcode should get an arm next" with a measurement instead of a hand-written list, which is the
+  // only way that question has ever been answered correctly here: covering the record loads and
+  // stores on 21 Aug was worth 12.7% on binary-trees, and nobody had asked since spectral-norm.
+  // The count is what matters, not the opcode's presence: an uncovered opcode that never lands in
+  // a loop costs nothing at all.
+  GHotCDiag: Boolean = False;
+  GHotCReported: Boolean = False;
+  GHotCCalls: Int64 = 0;    // how many times the C loop was entered
+  GPairDiag: Boolean = False;       // PAIR_DIAG=1: census of the adjacent opcode pairs executed
+  // ⛔ NOT the raw opcode as an index. A 16-bit opcode would need a 65536x65536 table, and masking
+  // it down to 12 bits - which is what the first version of this did - both mislabels the entries
+  // (0xC8xx superinstructions come out as group 8/9 "Web_nn") and COLLIDES two real opcodes into
+  // one counter. PairSlot compacts group|sub into 0..2047 losslessly for the groups that exist.
+  GPairCount: array[0..2047, 0..2047] of LongWord;
+  GSuperDiag: Boolean = False;      // SUPER_DIAG=1: census of the NESTED superinstruction dispatch
+  GSuperCount: array[0..255] of Int64;
+  GHotCExit: array[0..65535] of Int64;
+
+function PairSlot(Op: Word): Integer;
+// group -> a small dense id, sub kept whole: slot = gid*256 + sub, so no two opcodes share a slot.
+var gid: Integer;
+begin
+  case Op shr 8 of
+    $00: gid := 0; $01: gid := 1; $02: gid := 2; $03: gid := 3;
+    $04: gid := 4; $0A: gid := 5; $0B: gid := 6; $C8: gid := 7;
+  else   gid := 7;   // anything unforeseen lands with the superinstructions rather than colliding
+  end;                // with a core opcode - and the report prints the real name, so it is visible
+  Result := gid * 256 + (Op and $FF);
+end;
+
+function SlotOpcode(Slot: Integer): Word;
+const G: array[0..7] of Word = ($00, $01, $02, $03, $04, $0A, $0B, $C8);
+begin
+  Result := (G[Slot div 256] shl 8) or Word(Slot mod 256);
+end;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
 begin
@@ -1065,13 +1135,25 @@ begin
       // it to ON ERROR, failing the program) is still M5.5; this is the floor: the failure is named,
       // on stderr, with the thread that had it.
       on E: Exception do
+      begin
         WriteLn(ErrOutput, Format('?thread %d died: %s: %s (mutexes it held stay locked)',
                                   [Spawn.Handle, E.ClassName, E.Message]));
+        // ⭐ AND WHERE. A named failure without a location is still a guessing game: this file already
+        // documents that swallowing a worker's exception turned a diagnosable fault into an
+        // unexplainable hang, and "?thread 14 died: EAccessViolation" on its own is only half a step
+        // better. Costs nothing - it runs once, on a thread that is already failing - and needs a
+        // build with symbols (./build.sh sb --symbols) to name the frames.
+        DumpExceptionBackTrace(ErrOutput);
+      end;
       else
         WriteLn(ErrOutput, Format('?thread %d died: non-Exception (mutexes it held stay locked)',
                                   [Spawn.Handle]));
     end;
   finally
+    // Give the private-array block back HERE and not when the context is freed. Contexts live until
+    // the VM dies, so releasing at destruction would let a program that spawns workers one after
+    // another run out of blocks after MAX_LIVE_WORKERS spawns even though only one is ever live.
+    Spawn.VM.ReleaseArrayMap(Spawn.Ctx);
     // Release this worker's slot against MAX_LIVE_WORKERS even when its body raised.
     EnterCriticalSection(Spawn.VM.FWorkerLock);
     try
@@ -1209,8 +1291,13 @@ begin
   // Default ON. SHAREDREC_LOCK=1 puts the per-access lock back, so the two can be timed against each
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GArrPrivDiag := GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
+  GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
+  GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
+  GPairDiag := GetEnvironmentVariable('PAIR_DIAG') = '1';
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
+  GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
   FRawHeapTop := 0;
@@ -3428,10 +3515,21 @@ begin
             ((FProcWidths[UStart[p]].WFloat shr 32) = 0) and
             ((FProcWidths[UStart[p]].WStr shr 32) = 0)) then
     begin
+      // ⛔ "copies float/string" NAMES TWO BANKS AND TELLS YOU NEITHER. Which one disqualifies a
+      // procedure is the whole question - the float bank could follow the relocation scheme, the
+      // string bank cannot - and reconstructing it by grepping a listing for float-looking opcode
+      // names is a list by omission that gets it wrong. Print the widths the decision actually read.
       if GFrameBaseDiag = 1 then
-        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
-                                  + ' (copies float/string) - keeping the copying frame',
-                                  [p, UStart[p], UEnd[p]]));
+        if (UStart[p] < Length(FProcWidths)) and (FProcWidths[UStart[p]].WInt >= 0) then
+          WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
+                                    + ' - keeping the copying frame (wFloat=%d wStr=%d)',
+                                    [p, UStart[p], UEnd[p],
+                                     FProcWidths[UStart[p]].WFloat shr 32,
+                                     FProcWidths[UStart[p]].WStr shr 32]))
+        else
+          WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
+                                    + ' - keeping the copying frame (widths NOT MEASURED for it)',
+                                    [p, UStart[p], UEnd[p]]));
       System.Continue;
     end;
     // Published per entry PC, packed like the widths: one past the highest index used in the high
@@ -3603,6 +3701,35 @@ end;
 
 var
   GFrameSaveNoStr: Integer = 0;   // measurement probe, set from FRAMESAVE_NOSTR at startup
+
+function TBytecodeVM.FramePushIsAllocFree(Ctx: TExecutionContext; TargetPC: Integer): Boolean;
+// Vero quando FramePush(Ctx, TargetPC, _) seguito da GrowCallStackIfNeeded NON puo' allocare - e
+// quindi non puo' sollevare, e quindi il chiamante non ha bisogno di un frame di eccezione.
+//
+// ⛔ PERCHE' ESISTE. AotCallSub avvolge FramePush + GrowCallStackIfNeeded in un try...except per
+// catturare l'allocazione che fallisce. Quel try costa un setjmp e la manipolazione della catena
+// delle eccezioni A OGNI CHIAMATA, mentre la crescita che protegge avviene forse una volta ogni
+// diecimila. Campionato il 20 ago 2026 su binary-trees-modern-arena sotto --aot, contando i soli
+// thread attivi: fpc_pushexceptaddr + fpc_popaddrstack + fpc_setjmp = 11,3% del tempo.
+//
+// ⛔ QUESTA FUNZIONE RIPRODUCE LE CONDIZIONI DEL RAMO VELOCE DI FramePush, ED E' QUI ACCANTO PER
+// QUESTO: se quel ramo cambia, questa cambia con lui. Sono due copie della stessa condizione e
+// l'unica difesa e' che siano ADIACENTI e dichiarate tali. Quando il ramo veloce non si applica si
+// risponde False e il chiamante tiene il suo try: la risposta prudente e' sempre False.
+var
+  PW: Int64;
+  FBHi: Integer;
+begin
+  Result := False;
+  if (TargetPC < 0) or (TargetPC >= Length(FFrameFast)) then Exit;
+  PW := FFrameFast[TargetPC];
+  if PW < 0 then Exit;                                     // non e' uno scorrimento di puntatore
+  FBHi := PW shr 32;
+  if Ctx.RegHwI + FBHi > Ctx.RegFrameCap then Exit;        // regione piena: si copia, e si alloca
+  if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then Exit; // i marcatori vanno cresciuti
+  if Ctx.CallStackPtr >= Length(Ctx.CallStack) then Exit;  // e la pila dei ritorni idem
+  Result := True;
+end;
 
 procedure TBytecodeVM.FramePush(Ctx: TExecutionContext; TargetPC: Integer; CallPC: Integer);
 // Snapshot the live part of each register bank onto the flat per-bank save stacks (one frame).
@@ -4200,10 +4327,14 @@ begin
   // move at all. It is safe here because the handle has not been handed back yet, so no other thread
   // can resolve it.
   R^.TypeId := TypeId;
-  // On a recycled record these are almost always no-ops (same shape as the record that was freed),
-  // and FPC returns immediately when the length already matches.
-  SetLength(R^.Bytes, ByteSize);
-  SetLength(R^.StringData, StrC);
+  // On a recycled record these are almost always no-ops - the shape matches the record that was
+  // retired - and FPC does return immediately when the length already matches. ⛔ BUT "returns
+  // immediately" IS STILL A CALL. Profiled 21 Aug 2026 on a New/Delete loop, release build with
+  // symbols, sampling only running threads: fpc_dynarray_setlength was 10.8% of the whole program,
+  // second only to the allocator body itself, while doing nothing on almost every call. Length() on
+  // a dynamic array is an inline header read, so asking first turns those calls into a compare.
+  if Length(R^.Bytes) <> ByteSize then SetLength(R^.Bytes, ByteSize);
+  if Length(R^.StringData) <> StrC then SetLength(R^.StringData, StrC);
   // A recycled record must be indistinguishable from a fresh one: a brand-new SetLength zero-fills,
   // so recycling has to zero explicitly. (Strings were already emptied when it was retired.)
   if ByteSize > 0 then FillChar(R^.Bytes[0], ByteSize, 0);
@@ -5213,6 +5344,9 @@ begin
   WCtx.FrameSaveFloatTop := 0;
   WCtx.FrameSaveStrTop := 0;
   WCtx.BlockRecMarkTop := 0;
+  // The worker's own block of PROC-LOCAL array slots. Without this every worker inside the same SUB
+  // indexed the one storage the compile-time id names, and they overwrote each other's elements.
+  BindArrayMap(WCtx);
   SetLength(WCtx.Records, 0);
   WCtx.RecordCount := 0;
   WCtx.CursorCol := 0;
@@ -5771,6 +5905,12 @@ begin
   // often a param placeholder, which is never DIM'd at all — and the two then ALIAS the same storage.
   if FProgram.GetArrayCount > Length(FArrays) then
     SetLength(FArrays, FProgram.GetArrayCount);
+
+  // Reserve the per-context blocks for the PROC-LOCAL arrays and give the main context its map. Must
+  // come after the reservation above (the static id space has to be complete) and before anything
+  // executes: from here on every array access goes through Ctx.ArrMap.
+  BuildPrivateArrayPlan;
+  BindArrayMap(FCtx);
 
   // Scan bytecode to determine maximum register indices used
   MaxIntReg := -1;
@@ -7570,10 +7710,10 @@ begin
         Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1,
                                           Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
     bcRecordNewArray:
-      RecordNewArrayInit(Ctx, Instr.Src1, Instr.Immediate);  // Src1=array id; Imm=packed slot counts
+      RecordNewArrayInit(Ctx, Ctx.ArrMap[Instr.Src1], Instr.Immediate);  // Src1=array id; Imm=packed slot counts
     bcRecordNewArrayInd:
       // Array-of-UDT MEMBER: the FArrays id is a runtime handle in IntRegs[Src1]. Imm=packed slot counts.
-      RecordNewArrayInit(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
+      RecordNewArrayInit(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
     bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first handle
       Ctx.IntRegs[Instr.Dest] := AllocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
                                    Instr.Immediate and $FFFF,
@@ -8441,6 +8581,12 @@ begin
   // Full opcode is 0xC800 + SubOp (group 200)
   SubOp := Instr.OpCode and $FF;
 
+  // SUPER_DIAG=1: count how often each sub-opcode is reached HERE, that is, through the SECOND
+  // dispatch. Every one of these paid the main dispatch already; the count is what says which of
+  // them is worth flattening into it. Naming candidates by reading the list is how the last two
+  // attempts at this kind of work produced nothing (see the inliner) - the ranking is the answer.
+  if GSuperDiag then Inc(GSuperCount[SubOp]);
+
   case SubOp of
     // Fused compare-and-branch (Int) - sub-opcodes 0-5
     0: // bcBranchEqInt: if (r[src1] == r[src2]) goto target
@@ -8543,14 +8689,14 @@ begin
     // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded to match the base ExecuteArrayOp
     // store path: MODERN drops an out-of-bounds store (memory-safe), CLASSIC/--bounds-check raises.
     30: // bcArrayStoreIntConst
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-        FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] := Instr.Immediate;
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+        FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] := Instr.Immediate;
     31: // bcArrayStoreFloatConst
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-        FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+        FArrays[Ctx.ArrMap[Instr.Src1]].FloatData[Ctx.IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
     32: // bcArrayStoreStringConst
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-        FArrays[Instr.Src1].StringData[Ctx.IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate];
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+        FArrays[Ctx.ArrMap[Instr.Src1]].StringData[Ctx.IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate];
 
     // Fused loop increment-and-branch (Int) - sub-opcodes 90-93
     33: // bcAddIntToBranchLe: r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
@@ -8591,19 +8737,19 @@ begin
     // Array Load + Arithmetic - sub-opcodes 110-112. Bounds-guarded: an out-of-bounds read yields the
     // element default (0.0) in MODERN, matching the base ExecuteArrayOp load path; CLASSIC raises.
     41: // bcArrayLoadAddFloat: dest = acc + arr[idx]
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] + FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]]
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] + FArrays[Ctx.ArrMap[Instr.Src1]].FloatData[Ctx.IntRegs[Instr.Src2]]
       else
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate];
     42: // bcArrayLoadSubFloat: dest = acc - arr[idx]
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] - FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]]
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+        Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate] - FArrays[Ctx.ArrMap[Instr.Src1]].FloatData[Ctx.IntRegs[Instr.Src2]]
       else
         Ctx.FloatRegs[Instr.Dest] := Ctx.FloatRegs[Instr.Immediate];
     43: // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
       begin
-        if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-          ElemVal := FArrays[Instr.Src1].FloatData[Ctx.IntRegs[Instr.Src2]]
+        if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+          ElemVal := FArrays[Ctx.ArrMap[Instr.Src1]].FloatData[Ctx.IntRegs[Instr.Src2]]
         else
           ElemVal := 0.0;
         if Abs(Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF]) < 1e-300 then
@@ -8630,15 +8776,15 @@ begin
     // Array Load + Branch - sub-opcodes 140-141. Bounds-guarded: an out-of-bounds read is treated as the
     // element default 0 in MODERN (matching the base load path) — NZ does not branch, Z branches; CLASSIC raises.
     48: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
       begin
-        if FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] <> 0 then
+        if FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] <> 0 then
           Ctx.PC := Instr.Immediate - 1;
       end;
     49: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
       begin
-        if FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] = 0 then
+        if FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] = 0 then
           Ctx.PC := Instr.Immediate - 1;
       end
       else
@@ -8649,7 +8795,7 @@ begin
       begin
         Ctx.StartIdx := Ctx.IntRegs[Instr.Src2];
         Ctx.EndIdx := Ctx.IntRegs[Instr.Dest] - 1;
-        Ctx.ArrIdxTmp := Instr.Src1;
+        Ctx.ArrIdxTmp := Ctx.ArrMap[Instr.Src1];
         // Bounds-guard the whole contiguous range once (endpoints valid => interior valid).
         if (Ctx.StartIdx < Ctx.EndIdx) and
            (not ArrayBoundsOK(Ctx.ArrIdxTmp, Ctx.StartIdx) or not ArrayBoundsOK(Ctx.ArrIdxTmp, Ctx.EndIdx)) then
@@ -8669,7 +8815,7 @@ begin
       begin
         Ctx.StartIdx := Ctx.IntRegs[Instr.Src2];
         Ctx.EndIdx := Ctx.IntRegs[Instr.Dest];
-        Ctx.ArrIdxTmp := Instr.Src1;
+        Ctx.ArrIdxTmp := Ctx.ArrMap[Instr.Src1];
         // Bounds-guard the touched range [start .. end+1] once; skip the whole rotate if out of range (MODERN).
         if ArrayBoundsOK(Ctx.ArrIdxTmp, Ctx.StartIdx) and ArrayBoundsOK(Ctx.ArrIdxTmp, Ctx.EndIdx + 1) then
         begin
@@ -8816,7 +8962,7 @@ begin
         // way against 28 ms for the identical code on a local, and the cost grew with the SQUARE of
         // the length. Writing the slot directly keeps the count at 1 and the write free.
         // Src1 = array id, Src2 = the linear index, Dest = the replacement (READ), Immediate = start.
-        ArrayIdx := Instr.Src1;
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[Instr.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
@@ -8840,12 +8986,12 @@ begin
 
     // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip the swap if either index is out of range (MODERN); CLASSIC raises.
     55: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) and
-         ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Dest]) then
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) and
+         ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Dest]) then
       begin
-        Ctx.SwapTempInt := FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]];
-        FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Dest]];
-        FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Dest]] := Ctx.SwapTempInt;
+        Ctx.SwapTempInt := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]];
+        FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Dest]];
+        FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Dest]] := Ctx.SwapTempInt;
       end;
 
     // Self-increment/decrement (Int) - sub-opcodes 251-252
@@ -8856,29 +9002,29 @@ begin
 
     // Array Load to register (Int) - sub-opcode 253. Bounds-guarded: OOB read yields default 0 (MODERN); CLASSIC raises.
     58: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
-      if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-        Ctx.IntRegs[Instr.Dest] := FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]]
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+        Ctx.IntRegs[Instr.Dest] := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]]
       else
         Ctx.IntRegs[Instr.Dest] := 0;
 
     // Array Copy Element - sub-opcode 254. Bounds-guarded: OOB store dropped, OOB source reads default 0 (MODERN); CLASSIC raises.
     59: // bcArrayCopyElement: arr_dest[idx] = arr_src[idx]
-      if ArrayBoundsOK(Instr.Dest, Ctx.IntRegs[Instr.Src2]) then
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2]) then
       begin
-        if ArrayBoundsOK(Instr.Src1, Ctx.IntRegs[Instr.Src2]) then
-          FArrays[Instr.Dest].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Instr.Src1].IntData[Ctx.IntRegs[Instr.Src2]]
+        if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
+          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]]
         else
-          FArrays[Instr.Dest].IntData[Ctx.IntRegs[Instr.Src2]] := 0;
+          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := 0;
       end;
 
     // Array Move Element - sub-opcode 255. Bounds-guarded like 254.
     60: // bcArrayMoveElement: arr[dest_idx] = arr[src_idx]
-      if ArrayBoundsOK(Instr.Dest, Ctx.IntRegs[Instr.Src2]) then
+      if ArrayBoundsOK(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2]) then
       begin
-        if ArrayBoundsOK(Instr.Dest, Ctx.IntRegs[Instr.Src1]) then
-          FArrays[Instr.Dest].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Instr.Dest].IntData[Ctx.IntRegs[Instr.Src1]]
+        if ArrayBoundsOK(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src1]) then
+          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src1]]
         else
-          FArrays[Instr.Dest].IntData[Ctx.IntRegs[Instr.Src2]] := 0;
+          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := 0;
       end;
 
   else
@@ -8954,7 +9100,8 @@ end;
 function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
                        pc, count: LongInt; tv: Int64;
                        arrdesc: Pointer; flags: LongInt;
-                       xi: PInt64; xf: PDouble; hidx: PWord): LongInt; cdecl; external;
+                       xi: PInt64; xf: PDouble; hidx: PWord;
+                       recdesc: PInt64): LongInt; cdecl; external;
 { The opcode list in DISPATCH-TABLE order, published by the C file so that nothing here holds a
   second copy of it. Entry j is run by arm j, which is what makes FHotOpBase an index. }
 function sedai_hot_ops(out list: PWord): LongInt; cdecl; external;
@@ -9556,6 +9703,20 @@ begin
     Exit(BcCallSubPC);
   SI := C.FrameSaveIntTop; SF := C.FrameSaveFloatTop; SS := C.FrameSaveStrTop;
   if Fine then Ta := AotRdTsc;
+  // ⭐ SENZA FRAME DI ECCEZIONE quando niente puo' allocare. Il try qui sotto esiste per una
+  // allocazione che fallisce, ma costa un setjmp e la catena delle eccezioni A OGNI CHIAMATA -
+  // 11,3% del tempo AOT su binary-trees, campionato. FramePushIsAllocFree (accanto a FramePush,
+  // apposta) risponde True solo se il ramo veloce si applica E nessuna delle tre capacita' va
+  // cresciuta: allora questo blocco e' identico a quello sotto, meno la protezione che non serve.
+  if VM.FramePushIsAllocFree(C, Integer(CalleeEntryPC)) and GNoExcFrame then
+  begin
+    VM.FramePush(C, Integer(CalleeEntryPC), Integer(BcCallSubPC));
+    if Fine then Tb := AotRdTsc;
+    C.CallStack[C.CallStackPtr] := Integer(BcCallSubPC) + 1;
+    Inc(C.CallStackPtr);
+    if Fine then Tc := AotRdTsc;
+  end
+  else
   try
     VM.FramePush(C, Integer(CalleeEntryPC), Integer(BcCallSubPC));
     if Fine then Tb := AotRdTsc;
@@ -9672,6 +9833,10 @@ var
   VM: TBytecodeVM;
 begin
   VM := TBytecodeVM(VMSelf);
+  // Logical id, baked into the emitted code: resolve it against the ACTIVE context, which is this
+  // thread's. Unlike the typed accessors these two never see the descriptor table, so the mapping the
+  // table would have done for them has to happen here.
+  ArrIdx := VM.MapArrDyn(VM.ActiveCtx, ArrIdx);
   if (Idx >= 0) and (Idx < VM.FArrays[ArrIdx].TotalSize) then
     PAnsiString(dstSlot)^ := VM.FArrays[ArrIdx].StringData[Idx]
   else
@@ -9689,6 +9854,10 @@ var
   VM: TBytecodeVM;
 begin
   VM := TBytecodeVM(VMSelf);
+  // Logical id, baked into the emitted code: resolve it against the ACTIVE context, which is this
+  // thread's. Unlike the typed accessors these two never see the descriptor table, so the mapping the
+  // table would have done for them has to happen here.
+  ArrIdx := VM.MapArrDyn(VM.ActiveCtx, ArrIdx);
   if (Idx >= 0) and (Idx < VM.FArrays[ArrIdx].TotalSize) then
     VM.FArrays[ArrIdx].StringData[Idx] := AnsiString(srcVal);
 end;
@@ -10512,6 +10681,20 @@ begin
   // B3: native call site primitive. The FAST one specialises the case worth specialising - a
   // callee whose frame is a pointer slide - and falls back to the general one for everything
   // else, so it is correct for any program. AOT_FASTCALL=0 restores the general one always.
+  //
+  // ⛔ MISURATO E RESPINTO (20 ago 2026). Questa condizione ha una seconda meta' - FAllCalleesFast -
+  // che CONTRADDICE la frase qui sopra: e' di programma intero, quindi una sola unita' chiamata che
+  // copia float o stringhe spegne il percorso veloce per OGNI chiamata del programma. Su
+  // binary-trees-modern-arena quell'unita' e' WORKER, che gira una volta per thread, e squalificava
+  // MAKETREE e CHECKTREE, che girano milioni di volte ed erano entrambe RELOCATABLE.
+  // La decisione per singolo chiamato esiste gia' ed e' esatta (FFrameFast[pc] = -1 per le non
+  // idonee, e AotCallSubFast delega su quel -1), quindi il cancello sembrava puro spreco.
+  // 📊 Tolto e misurato, N=18 best-of-5, output confrontato: AOT 2994 -> 3067 ms, AOT+JIT
+  // 2978 -> 3102 ms. Nessun guadagno, e le due configurazioni peggiorano nella stessa direzione.
+  // Le reti restavano verdi (AOT e JIT 1012 confrontati, 0 MISMATCH): era corretto, non conveniente.
+  // ⛔ Non ritentarlo senza una misura: il costo del frame che AotCallSubFast "toglie" non sparisce,
+  // viene INLINEATO, e su questo programma l'indirezione in piu' per i chiamati non idonei se lo
+  // mangia. Se un giorno serve, va misurato di nuovo - questo verdetto ha una data.
   if (GAotFastCall = 1) and FAllCalleesFast then C.CallSub := @AotCallSubFast
   else C.CallSub := @AotCallSub;
   // C5 residuals. StrMid is dialect-variant: install the flavor once per run.
@@ -10558,6 +10741,187 @@ begin
     C.PrintStr := @AotPrintString;
 end;
 
+procedure TBytecodeVM.BuildPrivateArrayPlan;
+// Census the arrays the compiler marked PRIVATE (a DIM inside a SUB/FUNCTION, neither SHARED nor
+// STATIC) and reserve one block of physical slots per execution context, appended after the whole
+// static id space.
+//
+// ⛔ RESERVED ONCE, NEVER GROWN. A UDT array member allocates its slot at RUNTIME by appending at
+// Length(FArrays), so a SetLength here while a worker is indexing the table would move it under that
+// worker. Reserving every block up front (one for the main context plus MAX_LIVE_WORKERS) means the
+// spawn path never resizes the table - it only claims a block that is already there.
+//
+// A program with no private array at all pays NOTHING: FPrivArrCount stays 0, the table keeps exactly
+// the length it had, and every ArrMap is the identity.
+var
+  i, n, Blocks: Integer;
+begin
+  // A second LoadProgram (the REPL) must not stack a new set of blocks on top of the old ones: if the
+  // table still ends exactly where the previous reservation left it, take that reservation back first.
+  if (FPrivArrCount > 0) and (FPrivBlockBase > 0) and
+     (Length(FArrays) = FPrivBlockBase + Length(FPrivBlockUsed) * FPrivArrCount) then
+    SetLength(FArrays, FPrivBlockBase);
+  FStaticArrCount := Length(FArrays);
+  FPrivArrCount := 0;
+  FPrivBlockBase := FStaticArrCount;
+  SetLength(FArrPrivSlot, FStaticArrCount);
+  for i := 0 to FStaticArrCount - 1 do FArrPrivSlot[i] := -1;
+  if FProgram = nil then Exit;
+  n := FProgram.GetArrayCount;
+  if n > FStaticArrCount then n := FStaticArrCount;
+  for i := 0 to n - 1 do
+    if FProgram.GetArray(i).IsPrivate then
+    begin
+      FArrPrivSlot[i] := FPrivArrCount;
+      Inc(FPrivArrCount);
+    end;
+  if FPrivArrCount = 0 then
+  begin
+    SetLength(FPrivBlockUsed, 0);
+    Exit;
+  end;
+  if GArrPrivDiag then
+    for i := 0 to FStaticArrCount - 1 do
+      WriteLn(ErrOutput, Format('[arrpriv] plan: ARR[%d] "%s" priv=%d', [i,
+              FProgram.GetArray(i).Name, FArrPrivSlot[i]]));
+  // ⚠️ COST, and it is the MCU target that will care: one TArrayStorage (~64 bytes of descriptor, no
+  // elements until a DIM runs) per private array per block. A program with 100 proc-local arrays
+  // reserves 65 x 100 slots, about 400 KB of descriptors on a build whose whole budget there is 64 KB.
+  // Lowering MAX_LIVE_WORKERS is the lever; reserving lazily is NOT, for the reason in the header.
+  Blocks := MAX_LIVE_WORKERS + 1;   // the main context holds one too, so every context takes one path
+  SetLength(FPrivBlockUsed, Blocks);
+  for i := 0 to Blocks - 1 do FPrivBlockUsed[i] := False;
+  SetLength(FArrays, FPrivBlockBase + Blocks * FPrivArrCount);
+end;
+
+procedure TBytecodeVM.BindArrayMap(Ctx: TExecutionContext);
+// Hand Ctx a free private block and build its logical -> physical vector. Called for the main context
+// at load and for every worker before it runs. Claiming is under FWorkerLock: two spawns racing here
+// must not be handed the same block.
+var
+  i, b, Base: Integer;
+begin
+  Ctx.ArrPrivBlock := -1;
+  SetLength(Ctx.ArrMap, FStaticArrCount);
+  for i := 0 to FStaticArrCount - 1 do Ctx.ArrMap[i] := i;   // identity: every shared array, and the
+  if FPrivArrCount = 0 then Exit;                            // whole map when nothing is private
+  Base := -1;
+  EnterCriticalSection(FWorkerLock);
+  try
+    for b := 0 to High(FPrivBlockUsed) do
+      if not FPrivBlockUsed[b] then
+      begin
+        FPrivBlockUsed[b] := True;
+        Ctx.ArrPrivBlock := b;
+        Base := FPrivBlockBase + b * FPrivArrCount;
+        Break;
+      end;
+  finally
+    LeaveCriticalSection(FWorkerLock);
+  end;
+  // No block left. That needs MAX_LIVE_WORKERS+1 LIVE contexts, which SpawnWorker already refuses to
+  // create - so this is unreachable rather than tolerated, and saying so beats corrupting quietly.
+  if Base < 0 then
+    raise Exception.Create('array contexts exhausted: no private array block available');
+  for i := 0 to FStaticArrCount - 1 do
+    if FArrPrivSlot[i] >= 0 then Ctx.ArrMap[i] := Base + FArrPrivSlot[i];
+  // The block this context just took may have been somebody else's a moment ago, so the entries the
+  // descriptor table holds for it are not this context's. Same reason as the release path above.
+  FArraysDirty := True;
+  if GArrPrivDiag then
+    WriteLn(ErrOutput, Format('[arrpriv] bind: ctx=%p block=%d base=%d', [Pointer(Ctx), Ctx.ArrPrivBlock, Base]));
+end;
+
+procedure TBytecodeVM.ReleaseArrayMap(Ctx: TExecutionContext);
+// Give the block back and drop its element data. A worker context dies at CleanupWorkers; its arrays
+// must not keep their storage alive for the rest of the run, and the block must be reusable.
+var
+  i, Base: Integer;
+begin
+  if (Ctx = nil) or (Ctx.ArrPrivBlock < 0) then Exit;
+  Base := FPrivBlockBase + Ctx.ArrPrivBlock * FPrivArrCount;
+  // ⛔ UNDER FArrDescLock. Freeing these buffers changes the very fields RebuildJitArrDesc reads to
+  // build the table (@FArrays[a].IntData[0] and TotalSize), and that rebuild runs on ANOTHER thread
+  // holding this lock. Doing it unlocked is a data race on the dynamic-array headers, and it showed
+  // as parallel fasta answering differently in about one run in twelve - on every engine, which is
+  // what told us the descriptor table was no longer the culprit.
+  EnterCriticalSection(FArrDescLock);
+  try
+    for i := Base to Base + FPrivArrCount - 1 do
+      if i <= High(FArrays) then
+      begin
+        SetLength(FArrays[i].IntData, 0);
+        SetLength(FArrays[i].FloatData, 0);
+        SetLength(FArrays[i].StringData, 0);
+        SetLength(FArrays[i].Dimensions, 0);
+        SetLength(FArrays[i].LowerBounds, 0);
+        FArrays[i].TotalSize := 0;
+        FArrays[i].DimCount := 0;
+      end;
+  finally
+    LeaveCriticalSection(FArrDescLock);
+  end;
+  // ⛔ THE DESCRIPTOR TABLE STILL POINTS AT THE STORAGE JUST FREED. Say so, or the next context handed
+  // this block reads and writes through dangling pointers until something else happens to dirty the
+  // table - which is a use-after-free that only appears when blocks are REUSED, i.e. when a program
+  // spawns more than one wave of workers. 📊 Found on parallel fasta (three waves): threads died with
+  // access violations and the output changed run to run, while fannkuch, k-nucleotide and
+  // reverse-complement - one wave each, or no local array at all - were stable.
+  FArraysDirty := True;
+  EnterCriticalSection(FWorkerLock);
+  try
+    if Ctx.ArrPrivBlock <= High(FPrivBlockUsed) then FPrivBlockUsed[Ctx.ArrPrivBlock] := False;
+  finally
+    LeaveCriticalSection(FWorkerLock);
+  end;
+  Ctx.ArrPrivBlock := -1;
+  Ctx.ArrDescCur := nil;
+  SetLength(Ctx.ArrMap, 0);
+  SetLength(Ctx.ArrDescRetired, 0);   // this context is done: nothing can still be reading them
+  SetLength(Ctx.ArrDescOwn, 0);
+  Ctx.ArrDescGen := 0;
+end;
+
+procedure TBytecodeVM.CheckPrivDesc(Ctx: TExecutionContext; Desc: Pointer);
+// ARRPRIV_DIAG=1: every PRIVATE entry of the table about to be handed to the C loop must point at the
+// storage THIS context owns. Says which id, what the table holds and what it should hold.
+var
+  i, phys: Integer;
+  D: PInt64;
+  want: Int64;
+begin
+  D := PInt64(Desc);
+  for i := 0 to Length(FArrPrivSlot) - 1 do
+    if FArrPrivSlot[i] >= 0 then
+    begin
+      phys := Ctx.ArrMap[i];
+      if (phys < 0) or (phys > High(FArrays)) then Continue;
+      if Length(FArrays[phys].IntData) > 0 then want := Int64(PtrUInt(@FArrays[phys].IntData[0])) else want := 0;
+      if D[i * 4] <> want then
+        WriteLn(ErrOutput, Format('[arrpriv] ⛔ ARR[%d] phys=%d desc=%x atteso=%x size=%d gen=%d/%d',
+                [i, phys, D[i * 4], want, FArrays[phys].TotalSize, Ctx.ArrDescGen, FArrDescGen]));
+    end;
+end;
+
+function TBytecodeVM.ActiveCtx: TExecutionContext; inline;
+// ⛔ GActiveCtx is set only inside a WORKER; on the main thread it is nil. Every reader of it in this
+// unit resolves it the same way, and writing that out again at each site is how one of them ends up
+// dereferencing nil.
+begin
+  Result := GActiveCtx;
+  if Result = nil then Result := FCtx;
+end;
+
+function TBytecodeVM.MapArrDyn(Ctx: TExecutionContext; Id: Int64): Integer;
+// The array id arrived in a REGISTER or packed inside a pointer, so it may be a runtime slot (a UDT
+// array member appended past the static space) as easily as a compile-time one. Only a compile-time
+// id can be private, hence the range test the immediate path does not need.
+begin
+  Result := Integer(Id);
+  if (FPrivArrCount > 0) and (Result >= 0) and (Result < Length(Ctx.ArrMap)) then
+    Result := Ctx.ArrMap[Result];
+end;
+
 procedure TBytecodeVM.RebuildJitArrDesc;
 // ⛔ CALL ONLY WITH FArrDescLock HELD - use EnsureArrDesc, which is the whole public entry point.
 var
@@ -10595,6 +10959,105 @@ begin
     else FJitArrDesc[a * 4 + 3] := 0;
   end;
   FArraysDirty := False;
+  Inc(FArrDescGen);   // every per-context copy built from the old one is now stale
+end;
+
+function TBytecodeVM.AcquireArrDescCtx(ECtx: TExecutionContext): Pointer;
+// The descriptor table THIS context may hand to compiled code.
+//
+// ⭐ Why it exists. hotdisp.c, the AOT and the loop JIT all index the table with the array id baked
+// into their code, which is a LOGICAL id. A proc-local array has one storage PER CONTEXT, so the same
+// logical id must resolve to different memory in different threads - and the cheapest place to say so
+// is the table itself, not every access. Patching the copy here is what let all three compiled
+// engines stay byte-identical while local arrays became per-thread.
+//
+// ⛔ A program with NO private array gets the master table, unchanged and unlocked on the fast lane,
+// exactly as before: this whole path must cost nothing where it buys nothing.
+var
+  i, n: Integer;
+  Src, Dst: Integer;
+begin
+  if FPrivArrCount = 0 then Exit(AcquireArrDesc);
+  EnterCriticalSection(FArrDescLock);
+  try
+    if FArraysDirty then RebuildJitArrDesc;
+    if (ECtx.ArrDescGen <> FArrDescGen) or (Length(ECtx.ArrDescOwn) <> Length(FJitArrDesc)) then
+    begin
+      // ⛔ UPDATE IN PLACE WHENEVER THE LENGTH ALLOWS IT, and retire only when it does not.
+      // Compiled code caches base pointers READ OUT OF this table in machine registers and reloads
+      // them only at its own call boundaries, so handing it a different buffer mid-function is handing
+      // it stale bases. The master table has always behaved this way - SetLength to the same length
+      // keeps the buffer and the loop below overwrites the entries - and the per-context copy has to
+      // behave the same. 📊 Retiring unconditionally cost reverse-complement its whole output under
+      // --aot: a shared scalar read after a shared string write came back 0 and the program died on a
+      // division by zero.
+      // A LENGTH CHANGE still retires: the buffer must move, and a native frame may hold the old one.
+      if Length(ECtx.ArrDescOwn) <> Length(FJitArrDesc) then
+      begin
+        if Length(ECtx.ArrDescOwn) > 0 then
+        begin
+          n := Length(ECtx.ArrDescRetired);
+          SetLength(ECtx.ArrDescRetired, n + 1);
+          ECtx.ArrDescRetired[n] := ECtx.ArrDescOwn;
+          ECtx.ArrDescOwn := nil;
+        end;
+        SetLength(ECtx.ArrDescOwn, Length(FJitArrDesc));
+      end;
+      // ⛔ WRITE EACH ENTRY ALREADY MAPPED - do NOT copy the master and then patch it.
+      // The two-step version has a WINDOW: after the copy and before the patch, this context's own
+      // private entries hold the master's values for the dead compile-time slot, which are zero. The
+      // buffer is updated IN PLACE (see above), so a compiled loop of this thread that re-reads the
+      // table inside that window reads a null data pointer. 📊 That window made parallel fasta under
+      // --jit produce a different answer in roughly one run out of three, while --aot - which only
+      // re-reads at call boundaries - was stable.
+      // Written this way each entry goes from one correct value straight to the next, and a 64-bit
+      // aligned store is atomic, so there is no moment at which the table is wrong.
+      for i := 0 to (Length(ECtx.ArrDescOwn) div 4) - 1 do
+      begin
+        Dst := i * 4;
+        if Dst + 3 >= Length(ECtx.ArrDescOwn) then Break;
+        if (i < Length(FArrPrivSlot)) and (FArrPrivSlot[i] >= 0) then
+        begin
+          // ⛔ A PRIVATE ENTRY IS BUILT FROM THE STORAGE, NOT FROM THE MASTER TABLE.
+          // The master is only rebuilt when FArraysDirty says so, and that flag is VM-global: another
+          // thread can consume it - clearing it - in the window between this context allocating its
+          // array and reading the table back, leaving the master's entry for this block empty while
+          // the storage exists. Reading FArrays directly cannot be stale: it IS the storage.
+          // 📊 That is what killed a worker inside sedai_hot_run on the multi-wave guard, roughly one
+          // run in six: `desc=0 atteso=7F7D4975B050 size=64`.
+          Src := ECtx.ArrMap[i];
+          if (Src < 0) or (Src > High(FArrays)) then Continue;
+          if Length(FArrays[Src].IntData) > 0 then
+            ECtx.ArrDescOwn[Dst + 0] := Int64(PtrUInt(@FArrays[Src].IntData[0]))
+          else ECtx.ArrDescOwn[Dst + 0] := 0;
+          if Length(FArrays[Src].FloatData) > 0 then
+            ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
+          else ECtx.ArrDescOwn[Dst + 1] := 0;
+          ECtx.ArrDescOwn[Dst + 2] := FArrays[Src].TotalSize;
+          if Length(FArrays[Src].LowerBounds) > 0 then
+            ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
+          else ECtx.ArrDescOwn[Dst + 3] := 0;
+        end
+        else if i * 4 + 3 < Length(FJitArrDesc) then
+        begin
+          ECtx.ArrDescOwn[Dst + 0] := FJitArrDesc[i * 4 + 0];
+          ECtx.ArrDescOwn[Dst + 1] := FJitArrDesc[i * 4 + 1];
+          ECtx.ArrDescOwn[Dst + 2] := FJitArrDesc[i * 4 + 2];
+          ECtx.ArrDescOwn[Dst + 3] := FJitArrDesc[i * 4 + 3];
+        end;
+      end;
+      ECtx.ArrDescGen := FArrDescGen;
+      if GArrPrivDiag then
+        for i := 0 to Length(FArrPrivSlot) - 1 do
+          if FArrPrivSlot[i] >= 0 then
+            WriteLn(ErrOutput, Format('[arrpriv] desc gen=%d ARR[%d]->phys %d data=%x size=%d',
+                    [FArrDescGen, i, ECtx.ArrMap[i], ECtx.ArrDescOwn[i*4], ECtx.ArrDescOwn[i*4+2]]));
+    end;
+    if Length(ECtx.ArrDescOwn) > 0 then Result := @ECtx.ArrDescOwn[0] else Result := nil;
+    ECtx.ArrDescCur := Result;   // published: this is what a cached pointer must compare equal to
+  finally
+    LeaveCriticalSection(FArrDescLock);
+  end;
 end;
 
 function TBytecodeVM.AcquireArrDesc: Pointer;
@@ -10646,10 +11109,52 @@ procedure TBytecodeVM.EnsureArrDesc(Ctx: PAotCtx);
 // Se entrambe dicono di no, il puntatore in mano al chiamante e' quello corrente e non serve altro.
 // ⛔ Ogni percorso che PUO' cambiare la tabella passa comunque dal lock, esattamente come prima.
 // AOT_ARRDESC=0 ripristina il lock incondizionato: e' l'A/B su un binario solo.
+var
+  ECtx: TExecutionContext;
 begin
+  if FPrivArrCount > 0 then
+  begin
+    // Private arrays: the table is per-context, so "is it still the current one" is a GENERATION
+    // question, not a pointer one - FCurArrDesc names the master, which this context never holds.
+    ECtx := TExecutionContext(Ctx^.CtxObj);
+    if ECtx = nil then ECtx := ActiveCtx;
+    // TWO questions, and both are needed: the generation says the CONTENT is current, the pointer
+    // says the caller holds the CURRENT BUFFER. Dropping the second cost an access violation in
+    // compiled code - see TExecutionContext.ArrDescCur.
+    if GArrDescFast and (not FArraysDirty) and (Ctx^.ArrDesc <> nil) and
+       (Ctx^.ArrDesc = ECtx.ArrDescCur) and (ECtx.ArrDescGen = FArrDescGen) then Exit;
+    Ctx^.ArrDesc := AcquireArrDescCtx(ECtx);
+    Exit;
+  end;
   if GArrDescFast and (not FArraysDirty) and (Ctx^.ArrDesc = FCurArrDesc) and
      (FCurArrDesc <> nil) then Exit;
   Ctx^.ArrDesc := AcquireArrDesc;
+end;
+
+function TBytecodeVM.AcquireArrDescFast(var Cached: Pointer; ECtx: TExecutionContext): Pointer;
+// La stessa corsia veloce di EnsureArrDesc, per un chiamante che tiene il puntatore in una VARIABILE
+// invece che in un contesto AOT: e' l'arm del JIT nel ciclo di esecuzione.
+//
+// ⛔ Perche' esiste invece di due righe scritte li': l'arm del JIT chiamava AcquireArrDesc a OGNI
+// ingresso in un ciclo compilato, cioe' una sezione critica globale per ingresso. E' esattamente il
+// difetto che EnsureArrDesc documenta di aver tolto dall'AOT (binary-trees 171 -> 711 ms, 4,2x): la
+// corsia veloce era stata aggiunta a UN motore e non al gemello. Misurato il 20 ago 2026 su
+// binary-trees-modern-arena N=14: --jit 668 ms contro 196 dell'interprete.
+//
+// ⭐ E il file lo dice gia' sopra: «una corsia scritta in linea da un chiamante e' una garanzia che
+// ogni altro chiamante perde in silenzio». Quindi un helper solo, non una quinta copia.
+begin
+  if FPrivArrCount > 0 then
+  begin
+    if GArrDescFast and (not FArraysDirty) and (Cached <> nil) and
+       (Cached = ECtx.ArrDescCur) and (ECtx.ArrDescGen = FArrDescGen) then Exit(Cached);
+    Cached := AcquireArrDescCtx(ECtx);
+    Exit(Cached);
+  end;
+  if GArrDescFast and (not FArraysDirty) and (Cached = FCurArrDesc) and (FCurArrDesc <> nil) then
+    Exit(Cached);
+  Cached := AcquireArrDesc;
+  Result := Cached;
 end;
 
 procedure TBytecodeVM.ReleaseRetiredArrDesc;
@@ -10750,6 +11255,13 @@ begin
     // stops being used and a measurement of the two together measures neither.
     for i := 0 to High(FNativeFuncs) do
       if (FNativeFuncs[i] <> nil) and (i <= High(FHotOp)) then FHotOp[i] := 0;
+    // ...and the same for the LOOP JIT, for the same reason. FNativeLoops is a per-PC side table
+    // exactly like FNativeFuncs - the JIT does not rewrite the instruction stream, it indexes the
+    // loop HEADER pc - so zeroing the header makes the C dispatcher hand the pc back there, and the
+    // interpreter then enters the compiled loop. Order is safe: BuildJitLoops fills FNativeLoops
+    // while the program is being prepared, and this runs at RunFast entry, after it.
+    for i := 0 to High(FNativeLoops) do
+      if (FNativeLoops[i] <> nil) and (i <= High(FHotOp)) then FHotOp[i] := 0;
   end
   else
     for i := 0 to High(FHotOpBase) do FHotOp[i] := 0;
@@ -11074,6 +11586,16 @@ var
   SubOp: Word;
   Len, StartPos, Count, EnvIdx, Idx: Integer;
   S, SubStr: string;
+  // ⛔ READ-ONLY ALIAS of a string register. Assigning a register to the local S above is a MANAGED
+  // assignment: a reference count up when it is taken and down when it is replaced, i.e. TWO atomic
+  // read-modify-writes per executed opcode. In a per-character loop that is two atomics per
+  // CHARACTER, and when several threads read the SAME string they are hitting one cache line.
+  // 📊 Measured 21 Aug 2026 on a probe (1 M characters x 20 passes of Asc(Mid(s,i,1))): reading a
+  // SHARED string took 677 ms on one thread and 12 357 ms on eight - EIGHTEEN TIMES WORSE for
+  // eight times the parallelism. The same loop over a shared ARRAY went 90 -> 137 ms.
+  // ⭐ The rule was already written in this file, at bcStrAppendMapped: "Read both strings IN
+  // PLACE". It was true there and lost everywhere else.
+  SP: PString;
   PackInt: Int64;        // B3 serialization scratch (MK*/CV* integer pack/unpack)
   PackSingle: Single;
   PackDouble: Double;
@@ -11288,10 +11810,10 @@ begin
     3: // bcStrRight
       begin
         Len := Ctx.IntRegs[Instr.Src2];
-        S := Ctx.StringRegs[Instr.Src1];
+        SP := @Ctx.StringRegs[Instr.Src1];   // IN PLACE: see the note at SP's declaration
         if Len < 0 then Len := 0;
-        if Len > Length(S) then Len := Length(S);
-        AssignSubstr(Ctx.StringRegs[Instr.Dest], S, Length(S) - Len + 1, Len);
+        if Len > Length(SP^) then Len := Length(SP^);
+        AssignSubstr(Ctx.StringRegs[Instr.Dest], SP^, Length(SP^) - Len + 1, Len);
       end;
     4: // bcStrMid - MID$(s, start, len)
       begin
@@ -11331,7 +11853,7 @@ begin
         // same order, followed by bcStrAsc's "empty yields 0" - the two arms must not drift apart.
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        S := Ctx.StringRegs[Instr.Src1];
+        SP := @Ctx.StringRegs[Instr.Src1];   // IN PLACE: see the note at SP's declaration
         if (StartPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
           Ctx.IntRegs[Instr.Dest] := 0        // FB: a start below 1 is an empty string, not the first char
         else
@@ -11341,22 +11863,22 @@ begin
           begin
             // FB: a negative length means "the rest of the string"; CLASSIC rejects it (length 0).
             if Assigned(FProgram) and FProgram.ModernMode then
-              Count := Length(S) - StartPos + 1
+              Count := Length(SP^) - StartPos + 1
             else
               Count := 0;
             if Count < 0 then Count := 0;
           end;
-          if (Count <= 0) or (StartPos > Length(S)) then
+          if (Count <= 0) or (StartPos > Length(SP^)) then
             Ctx.IntRegs[Instr.Dest] := 0
           else
-            Ctx.IntRegs[Instr.Dest] := Ord(S[StartPos]);
+            Ctx.IntRegs[Instr.Dest] := Ord(SP^[StartPos]);
         end;
       end;
     5: // bcStrAsc
       begin
-        S := Ctx.StringRegs[Instr.Src1];
-        if Length(S) > 0 then
-          Ctx.IntRegs[Instr.Dest] := Ord(S[1])
+        SP := @Ctx.StringRegs[Instr.Src1];   // IN PLACE: see the note at SP's declaration
+        if Length(SP^) > 0 then
+          Ctx.IntRegs[Instr.Dest] := Ord(SP^[1])
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
@@ -12144,8 +12666,10 @@ var
   Rec: PRecordStorage;
   InstrHot: PBytecodeInstruction;   // what ArrayHotOps.inc dereferences; see the note at its include
                                     // in RunTemplate.inc - the same text is compiled into two scopes.
+  ArrMapP: PInteger;                // ...and so is the array-id map alias, for the same reason.
 begin
   InstrHot := @Instr;
+  if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
   // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
   // move an array's backing store; the hot typed accessors never come through here. So the
   // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.
@@ -12159,7 +12683,7 @@ begin
   case SubOp of
     0: // bcArrayLoad (generic, deprecated)
       begin
-        ArrayIdx := Instr.Src1;
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
           raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
         LinearIdx := Ctx.IntRegs[Instr.Src2];
@@ -12178,7 +12702,7 @@ begin
       end;
     1: // bcArrayStore (generic, deprecated)
       begin
-        ArrayIdx := Instr.Src1;
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
           raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
         LinearIdx := Ctx.IntRegs[Instr.Src2];
@@ -12191,10 +12715,18 @@ begin
       end;
     2: // bcArrayDim
       begin
-        ArrayIdx := Instr.Src1;
-        if (ArrayIdx < 0) or (ArrayIdx >= FProgram.GetArrayCount) then
-          raise Exception.CreateFmt('Invalid array index: %d', [ArrayIdx]);
-        ArrInfo := FProgram.GetArray(ArrayIdx);
+        // ⛔ TWO ids, and they are not interchangeable. The DECLARATION (element type, rank, bounds)
+        // is looked up by the LOGICAL id, because the compiler's array table is indexed that way; the
+        // STORAGE is written at the PHYSICAL slot this context owns. Mapping before the lookup reads
+        // the declaration of a slot that has none - and the first thing that happened was every
+        // worker dying on "Invalid array index".
+        if (Instr.Src1 < 0) or (Instr.Src1 >= FProgram.GetArrayCount) then
+          raise Exception.CreateFmt('Invalid array index: %d', [Instr.Src1]);
+        ArrInfo := FProgram.GetArray(Instr.Src1);
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];
+        if GArrPrivDiag then
+          WriteLn(ErrOutput, Format('[arrpriv] DIM ARR[%d] -> phys %d (ctx=%p)',
+                  [Instr.Src1, ArrayIdx, Pointer(Ctx)]));
         if ArrayIdx >= Length(FArrays) then
           SetLength(FArrays, ArrayIdx + 1);
         FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
@@ -12257,7 +12789,7 @@ begin
     9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4). Dim 0 (index -1) is the
        // special FreeBASIC query "how many dimensions": LBOUND(arr, 0) is always 1.
       begin
-        ArrayIdx := Instr.Src1;
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[Instr.Src2];
         if LinearIdx < 0 then
           Ctx.IntRegs[Instr.Dest] := 1
@@ -12268,7 +12800,7 @@ begin
         // FreeBASIC "number of dimensions" query: the count of ALLOCATED dimensions -- a fixed array's rank,
         // and 0 for a dynamic array not yet dimensioned (TotalSize 0, which reports UBOUND(arr) = -1).
       begin
-        ArrayIdx := Instr.Src1;
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[Instr.Src2];
         if LinearIdx < 0 then
         begin
@@ -12283,19 +12815,19 @@ begin
       end;
     11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
         // 0 = static array (keep bounds, zero the elements).
-      EraseArray(Instr.Src1, Instr.Immediate <> 0);
+      EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
     12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
         // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
         // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
       begin
         if Length(FRedimPendingLBs) > 0 then
         begin
-          RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+          RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
                      True, FRedimPendingLBs[0]);
           SetLength(FRedimPendingLBs, 0);
         end
         else
-          RedimArray(Instr.Src1, Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+          RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
                      (Instr.Immediate and 2) <> 0, Instr.Immediate shr 8);
       end;
     // FreeBASIC pointer dereference. Two pointer kinds share these ops, discriminated by bit 63: a
@@ -12313,7 +12845,7 @@ begin
         end
         else
         begin
-          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -12330,7 +12862,7 @@ begin
         end
         else
         begin
-          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -12347,7 +12879,7 @@ begin
         end
         else
         begin
-          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -12364,7 +12896,7 @@ begin
         end
         else
         begin
-          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -12381,7 +12913,7 @@ begin
         end
         else
         begin
-          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -12398,7 +12930,7 @@ begin
         end
         else
         begin
-          ArrayIdx := (PtrAddr shr POINTER_ARRAY_SHIFT) - 1;
+          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -12448,72 +12980,78 @@ begin
              // arg from the UNMODIFIED table before any assignment. Src1=param id, Imm=arg id.
         if (Instr.Src1 >= 0) and (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
         begin
+          // Both ids are logical. The ARGUMENT in particular may be a proc-local array being passed
+          // on, so it has to name this context's copy and not the dead compile-time slot.
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];
+          LinearIdx := Ctx.ArrMap[Instr.Immediate];
           // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
-          if Instr.Src1 > High(FArrays) then SetLength(FArrays, Instr.Src1 + 1);
-          if FArrayBindTop >= Length(FArrayBindStack) then
-            SetLength(FArrayBindStack, (FArrayBindTop + 1) * 2);
-          FArrayBindStack[FArrayBindTop].SlotId := Instr.Src1;
-          FArrayBindStack[FArrayBindTop].ArgId := Instr.Immediate;
-          FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];        // dyn-array fields share by ref
-          FArrayBindStack[FArrayBindTop].Snapshot := FArrays[Instr.Immediate]; // the arg, captured now
-          Inc(FArrayBindTop);
+          if ArrayIdx > High(FArrays) then SetLength(FArrays, ArrayIdx + 1);
+          if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
+            SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := LinearIdx;
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved := FArrays[ArrayIdx];        // dyn-array fields share by ref
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot := FArrays[LinearIdx];    // the arg, captured now
+          Inc(Ctx.ArrayBindTop);
         end;
       end;
     49: // bcArrayBindInd - PHASE 1 bind whose arg is a UDT ARRAY MEMBER: its FArrays handle is only known at
       begin  // runtime (per instance), so it arrives in a register instead of an immediate. Src1=param id,
              // Src2=handle reg. Always pushes a save-stack entry — bcArrayBindApply commits a FIXED count and
              // bcArrayUnbind pops LIFO by SlotId, so skipping a push here would desynchronize both.
-        PtrAddr := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
         if Instr.Src1 >= 0 then
         begin
-          if Instr.Src1 > High(FArrays) then SetLength(FArrays, Instr.Src1 + 1);  // grow AFTER reading the handle
-          if FArrayBindTop >= Length(FArrayBindStack) then
-            SetLength(FArrayBindStack, (FArrayBindTop + 1) * 2);
-          FArrayBindStack[FArrayBindTop].SlotId := Instr.Src1;
-          FArrayBindStack[FArrayBindTop].Saved := FArrays[Instr.Src1];
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];
+          if ArrayIdx > High(FArrays) then SetLength(FArrays, ArrayIdx + 1);  // grow AFTER reading the handle
+          if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
+            SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved := FArrays[ArrayIdx];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
           begin
-            FArrayBindStack[FArrayBindTop].ArgId := PtrAddr;
-            FArrayBindStack[FArrayBindTop].Snapshot := FArrays[PtrAddr];   // alias the member's storage
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot := FArrays[PtrAddr];   // alias the member's storage
           end
           else
           begin  // handle < 1 = member array never allocated: bind an EMPTY array (UBOUND = -1), and set
                  // ArgId = -1 so unbind performs no copy-back (there is no caller slot to write to).
-            FArrayBindStack[FArrayBindTop].ArgId := -1;
-            ClearArrayStorage(FArrayBindStack[FArrayBindTop].Snapshot);
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := -1;
+            ClearArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);
           end;
-          Inc(FArrayBindTop);
+          Inc(Ctx.ArrayBindTop);
         end;
       end;
     36: // bcArrayBindApply - commit the top N pending binds (Immediate=N): alias each param slot to its
       begin  // snapshotted arg. All snapshots were captured (in phase 1) from the unmodified table.
-        for I := FArrayBindTop - Instr.Immediate to FArrayBindTop - 1 do
-          if (I >= 0) and (FArrayBindStack[I].SlotId <= High(FArrays)) then
-            FArrays[FArrayBindStack[I].SlotId] := FArrayBindStack[I].Snapshot;  // alias: share the caller's data
+        for I := Ctx.ArrayBindTop - Instr.Immediate to Ctx.ArrayBindTop - 1 do
+          if (I >= 0) and (Ctx.ArrayBindStack[I].SlotId <= High(FArrays)) then
+            FArrays[Ctx.ArrayBindStack[I].SlotId] := Ctx.ArrayBindStack[I].Snapshot;  // alias: share the caller's data
       end;
     35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
       begin
-        if (FArrayBindTop > 0) and (FArrayBindStack[FArrayBindTop - 1].SlotId = Instr.Src1) then
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];
+        if (Ctx.ArrayBindTop > 0) and (Ctx.ArrayBindStack[Ctx.ArrayBindTop - 1].SlotId = ArrayIdx) then
         begin
-          Dec(FArrayBindTop);
+          Dec(Ctx.ArrayBindTop);
           // Propagate the callee's final array back to the caller's slot ONLY if a REDIM [PRESERVE]
           // reallocated the param's storage — detected by its data no longer sharing the reference we
           // snapshotted from the arg at bind time. Without a resize the caller already sees the writes via
           // the shared reference, and copying would be wrong: in deep recursion the arg slot may have been
           // rebound at an outer level (merge sort's swapped a()/b()), so an unconditional copy corrupts it.
-          if (FArrayBindStack[FArrayBindTop].ArgId >= 0) and
-             (FArrayBindStack[FArrayBindTop].ArgId <= High(FArrays)) and
-             (FArrayBindStack[FArrayBindTop].ArgId <> Instr.Src1) and
-             not ArrayDataShared(FArrays[Instr.Src1], FArrayBindStack[FArrayBindTop].Snapshot) then
-            FArrays[FArrayBindStack[FArrayBindTop].ArgId] := FArrays[Instr.Src1];
-          FArrays[Instr.Src1] := FArrayBindStack[FArrayBindTop].Saved;
+          if (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId >= 0) and
+             (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <= High(FArrays)) and
+             (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <> ArrayIdx) and
+             not ArrayDataShared(FArrays[ArrayIdx], Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot) then
+            FArrays[Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId] := FArrays[ArrayIdx];
+          FArrays[ArrayIdx] := Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved;
           // Release the saved/snapshot copies' references (ownership transferred back to the live slots).
-          SetLength(FArrayBindStack[FArrayBindTop].Saved.IntData, 0);
-          SetLength(FArrayBindStack[FArrayBindTop].Saved.FloatData, 0);
-          SetLength(FArrayBindStack[FArrayBindTop].Saved.StringData, 0);
-          SetLength(FArrayBindStack[FArrayBindTop].Snapshot.IntData, 0);
-          SetLength(FArrayBindStack[FArrayBindTop].Snapshot.FloatData, 0);
-          SetLength(FArrayBindStack[FArrayBindTop].Snapshot.StringData, 0);
+          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved.IntData, 0);
+          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved.FloatData, 0);
+          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved.StringData, 0);
+          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot.IntData, 0);
+          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot.FloatData, 0);
+          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot.StringData, 0);
         end;
       end;
     27: // bcArrayRedimPush - push one bound onto the pending REDIM list (Immediate bit0 = it is a
@@ -12532,7 +13070,7 @@ begin
       end;
     28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper (and any lower) bounds
       begin
-        RedimArrayN(Instr.Src1, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
+        RedimArrayN(Ctx.ArrMap[Instr.Src1], FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
         SetLength(FRedimPendingUBs, 0);
         SetLength(FRedimPendingLBs, 0);
       end;
@@ -12544,7 +13082,7 @@ begin
     30: // bcArrayIdxResolve - linear row-major index from the array's CURRENT dimensions: Dest=int, Src1=array id.
         // Matches the compile-time formula Σ idx[d] * (Π Dimensions[d+1..]) but with runtime sizes (REDIM).
       begin
-        ArrayIdx := Instr.Src1;
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         LinearIdx := 0;
         if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
           for i := 0 to High(FIdxPending) do
@@ -12561,7 +13099,7 @@ begin
     //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
     37: // bcArrayLoadIndInt
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].IntData[LinearIdx]
         else
@@ -12569,7 +13107,7 @@ begin
       end;
     38: // bcArrayLoadIndFloat
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
         else
@@ -12577,7 +13115,7 @@ begin
       end;
     39: // bcArrayLoadIndString
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
         else
@@ -12585,25 +13123,25 @@ begin
       end;
     40: // bcArrayStoreIndInt (Dest = value register, READ)
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
       end;
     41: // bcArrayStoreIndFloat (Dest = value register, READ)
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
       end;
     42: // bcArrayStoreIndString (Dest = value register, READ)
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
       end;
     43: // bcArrayIdxResolveInd - member multi-dim linear index from the handle array's CURRENT dimensions
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]);
         LinearIdx := 0;
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
           for i := 0 to High(FIdxPending) do
@@ -12643,7 +13181,7 @@ begin
       end;
     45: // bcArrayLBoundInd - LBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
            (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].LowerBounds)) then
           Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
@@ -12652,7 +13190,7 @@ begin
       end;
     46: // bcArrayUBoundInd - UBOUND of a UDT array member (upper = lower + size - 1; -1 if unallocated)
       begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1]; LinearIdx := Ctx.IntRegs[Instr.Src2];
+        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
            (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].Dimensions)) then
           Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
@@ -12662,7 +13200,7 @@ begin
       end;
     47: // bcArrayCopyContents - deep-copy FArrays[Src1] <- FArrays[Src2] (value semantics of an array member)
       begin
-        DestArr := Ctx.IntRegs[Instr.Src1]; PtrAddr := Ctx.IntRegs[Instr.Src2];
+        DestArr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
         if (DestArr >= 1) and (DestArr <= High(FArrays)) and
            (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
         begin
@@ -12677,10 +13215,21 @@ begin
         end;
       end;
     48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
-      DeepCopyArrayRecords(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
+      DeepCopyArrayRecords(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]),
+                                MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]), Instr.Immediate);
   else
     raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
+  // ⛔ AND AGAIN, AFTER THE WORK. The flag above says "the table is about to change"; this one says
+  // "it has changed". Both are needed because the rebuild that CONSUMES the flag also CLEARS it, and
+  // it runs on another thread: a worker that set the flag and then allocated its elements could have
+  // the flag cleared by a rebuild that ran between the two - publishing a descriptor with a NULL data
+  // pointer, which compiled code then dereferences.
+  // 📊 Found 21 Aug 2026 while giving proc-local arrays per-thread storage: four workers DIMming four
+  // different slots at once, and the guard program either read another thread's data or died in the
+  // JIT on `mov (%rdx,%rcx,8)` with rdx = 0. The window existed before - every worker DIMmed the same
+  // slot, so a stale entry was overwritten by the next DIM instead of staying null.
+  FArraysDirty := True;
 end;
 
 procedure TBytecodeVM.AdvancePrintCol(Ctx: TExecutionContext; Chars: Integer);
@@ -15458,7 +16007,7 @@ begin
           raise Exception.Create('GET/PUT command not supported: no handler assigned');
         if (Instr.Src2 < Length(FArrays)) then
         begin
-          BinArr := @FArrays[Instr.Src2];
+          BinArr := @FArrays[Ctx.ArrMap[Instr.Src2]];   // Src2 is a LOGICAL array id
           BinCount := BinArr^.TotalSize;
           if BinCount < 0 then BinCount := 0;
           if BinCount > 0 then
@@ -16241,6 +16790,107 @@ begin
   WriteLn(ErrOutput, '[CALLPROF]   emitted code around the call and is charged to the caller.');
 end;
 
+procedure ReportPairCounts;
+// The top adjacent pairs actually executed. Printed raw: the ranking is the answer, and deciding
+// which of them is FUSABLE (same operand slots, temporary dead, no jump target in between) is a
+// separate question that belongs to whoever writes the fusion.
+var
+  a, b, i, j, n: Integer;
+  KA, KB: array of Word;
+  KC: array of LongWord;
+  tc: LongWord; tw: Word;
+  Tot: Int64;
+begin
+  if not GPairDiag then Exit;
+  SetLength(KA, 0); SetLength(KB, 0); SetLength(KC, 0); Tot := 0;
+  for a := 0 to 2047 do
+    for b := 0 to 2047 do
+      if GPairCount[a, b] > 0 then
+      begin
+        Tot := Tot + GPairCount[a, b];
+        n := Length(KA); SetLength(KA, n+1); SetLength(KB, n+1); SetLength(KC, n+1);
+        KA[n] := a; KB[n] := b; KC[n] := GPairCount[a, b];
+      end;
+  if Length(KA) = 0 then begin WriteLn(ErrOutput, '[PAIR] nessuna coppia'); Exit; end;
+  for i := 0 to High(KA) - 1 do
+    for j := i + 1 to High(KA) do
+      if KC[j] > KC[i] then
+      begin
+        tc := KC[i]; KC[i] := KC[j]; KC[j] := tc;
+        tw := KA[i]; KA[i] := KA[j]; KA[j] := tw;
+        tw := KB[i]; KB[i] := KB[j]; KB[j] := tw;
+      end;
+  WriteLn(ErrOutput, '[PAIR] coppie adiacenti eseguite (totale ', Tot, '), le prime 20:');
+  for i := 0 to High(KA) do
+  begin
+    if i >= 20 then Break;
+    WriteLn(ErrOutput, '[PAIR]   ', KC[i]:12, '  ', OpcodeToString(SlotOpcode(KA[i])), ' -> ', OpcodeToString(SlotOpcode(KB[i])));
+  end;
+end;
+
+procedure ReportSuperCounts;
+// The nested-dispatch census, printed at shutdown. Sorted by count: an arm reached rarely costs
+// nothing to leave here, one reached in an inner loop pays the second dispatch every iteration.
+var
+  i, j, n, t: Integer;
+  Idx: array of Integer;
+  Tot: Int64;
+begin
+  if not GSuperDiag then Exit;
+  SetLength(Idx, 0); Tot := 0;
+  for i := 0 to 255 do
+    if GSuperCount[i] > 0 then
+    begin
+      n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i; Tot := Tot + GSuperCount[i];
+    end;
+  if Length(Idx) = 0 then begin WriteLn(ErrOutput, '[SUPER] nessun dispatch annidato'); Exit; end;
+  for i := 0 to High(Idx) - 1 do
+    for j := i + 1 to High(Idx) do
+      if GSuperCount[Idx[j]] > GSuperCount[Idx[i]] then
+      begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
+  WriteLn(ErrOutput, '[SUPER] dispatch annidati, per sotto-opcode (totale ', Tot, '):');
+  for i := 0 to High(Idx) do
+    WriteLn(ErrOutput, '[SUPER]   sub=', Idx[i]:3, '  ', GSuperCount[Idx[i]]:14,
+            '  (', OpcodeToString(Word($C800 or Idx[i])), ')');
+end;
+
+procedure ReportHotCExits;
+// The HOTC_DIAG census, printed once at shutdown so it covers every engine and every thread that
+// ran. Sorted by count, because the ranking IS the answer: an uncovered opcode that never lands in
+// a loop costs nothing, and one that lands in the innermost loop of a benchmark costs it the whole
+// C loop. Printed to stderr so it never mixes with a program's own output.
+var
+  i, j, n: Integer;
+  Idx: array of Integer;
+  t: Integer;
+  Tot: Int64;
+begin
+  if (not GHotCDiag) or GHotCReported then Exit;
+  GHotCReported := True;
+  SetLength(Idx, 0);
+  Tot := 0;
+  for i := 0 to High(GHotCExit) do
+    if GHotCExit[i] > 0 then
+    begin
+      n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i;
+      Tot := Tot + GHotCExit[i];
+    end;
+  if Length(Idx) = 0 then
+  begin
+    WriteLn(ErrOutput, '[HOTC] nessuna uscita dal ciclo caldo C (ingressi=', GHotCCalls, ')');
+    Exit;
+  end;
+  for i := 0 to High(Idx) - 1 do
+    for j := i + 1 to High(Idx) do
+      if GHotCExit[Idx[j]] > GHotCExit[Idx[i]] then
+      begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
+  WriteLn(ErrOutput, '[HOTC] ingressi nel ciclo C=', GHotCCalls);
+  WriteLn(ErrOutput, '[HOTC] uscite dal ciclo caldo C, per opcode (totale ', Tot, '):');
+  for i := 0 to High(Idx) do
+    WriteLn(ErrOutput, '[HOTC]   ', GHotCExit[Idx[i]]:12, '  ', OpcodeToString(Word(Idx[i])));
+end;
+
+
 initialization
   if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
   if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
@@ -16257,8 +16907,15 @@ initialization
   // STRCAP=0 forces the old SetLength-per-append behaviour, so the two can be timed on ONE binary.
   StrCapacityInit;
   if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
+  AddExitProc(@ReportHotCExits);
+  AddExitProc(@ReportSuperCounts);
+  AddExitProc(@ReportPairCounts);
 
 finalization
+  // NOT the only place it is called from: see the AddExitProc in the initialization above. A CLASSIC
+  // program ends at END, which halts, and a halt does not always reach unit finalization - so the
+  // census was silent on exactly the programs it was written to measure, and silence read as
+  // "no exits". ReportHotCExits guards itself against running twice.
   AotCallProfReport;
 
 end.

@@ -23,7 +23,7 @@
 
     3: // bcArrayLoadInt
       begin
-        ArrayIdx := InstrHot^.Src1;
+        ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
@@ -38,7 +38,7 @@
       end;
     4: // bcArrayLoadFloat
       begin
-        ArrayIdx := InstrHot^.Src1;
+        ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
@@ -53,7 +53,7 @@
       end;
     5: // bcArrayLoadString
       begin
-        ArrayIdx := InstrHot^.Src1;
+        ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
@@ -68,7 +68,7 @@
       end;
     6: // bcArrayStoreInt
       begin
-        ArrayIdx := InstrHot^.Src1;
+        ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then     // MODERN out-of-bounds store is dropped (FreeBASIC)
         begin
@@ -81,7 +81,7 @@
       end;
     7: // bcArrayStoreFloat
       begin
-        ArrayIdx := InstrHot^.Src1;
+        ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
@@ -94,7 +94,7 @@
       end;
     8: // bcArrayStoreString
       begin
-        ArrayIdx := InstrHot^.Src1;
+        ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin

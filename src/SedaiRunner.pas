@@ -124,6 +124,29 @@ uses
   SedaiPeephole, SedaiSuperinstructions,
   SedaiNopCompaction, SedaiRegisterCompaction;
 
+{ ⛔ PERCHE' ESISTE (20 ago 2026). I ventidue passi di ottimizzazione erano invocati come
+  `try SSAProgram.RunX; except end;` - un except NUDO. Se un passo sollevava un'eccezione:
+    - nessuno lo sapeva: niente messaggio, niente codice d'uscita, niente;
+    - il passo si fermava A META', lasciando l'IR in uno stato PARZIALE - meta' trasformazioni
+      applicate e meta' no, che non e' come non averlo eseguito;
+    - la compilazione proseguiva come se niente fosse.
+  Un audit sul corpus (162 programmi) ha trovato TRE passi che non cambiano un byte, e con
+  l'except nudo non era distinguibile «non trova niente» da «esplode alla prima istruzione».
+
+  Ora il fallimento PARLA. E OPT_STRICT=1 lo fa RILANCIARE, cosi' le reti possono pretendere che
+  nessun passo fallisca invece di misurarne solo il risultato finale. }
+procedure OptPassFailed(const PassName: string; E: Exception);
+begin
+  WriteLn(ErrOutput, '[OPT] il passo ', PassName, ' e'' FALLITO: ',
+          E.ClassName, ': ', E.Message,
+          ' - l''IR resta nello stato parziale in cui il passo si e'' interrotto');
+  Flush(ErrOutput);
+  if GetEnvironmentVariable('OPT_STRICT') = '1' then
+    raise Exception.CreateFmt('OPT_STRICT: il passo %s e'' fallito (%s: %s)',
+                              [PassName, E.ClassName, E.Message]);
+end;
+
+
 { Include optimization flags }
 {$I OptimizationFlags.inc}
 
@@ -379,9 +402,9 @@ begin
         // === SSA OPTIMIZATIONS ===
         {$IFNDEF DISABLE_DBE}
         {$IFNDEF DISABLE_SUB_INLINING}
-        try SSAProgram.RunSubInlining; except end;   // unification: before everything
+        try SSAProgram.RunSubInlining; except on E: Exception do OptPassFailed('SubInlining', E); end;   // unification: before everything
         {$ENDIF}
-        try SSAProgram.RunDBE; except end;
+        try SSAProgram.RunDBE; except on E: Exception do OptPassFailed('DBE', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_DOMINATOR_TREE}
@@ -411,39 +434,50 @@ begin
         // GVN or CSE
         {$IFNDEF DISABLE_GVN}
         {$IFDEF DISABLE_CSE}
-        try SSAProgram.RunGVN; except end;
+        try SSAProgram.RunGVN; except on E: Exception do OptPassFailed('GVN', E); end;
         {$ENDIF}
         {$ENDIF}
 
         {$IFNDEF DISABLE_CSE}
         {$IFDEF DISABLE_GVN}
-        try SSAProgram.RunCSE; except end;
+        try SSAProgram.RunCSE; except on E: Exception do OptPassFailed('CSE', E); end;
         {$ENDIF}
         {$ENDIF}
 
         // Other optimizations
         {$IFNDEF DISABLE_ALGEBRAIC}
-        try SSAProgram.RunAlgebraic; except end;
+        try SSAProgram.RunAlgebraic; except on E: Exception do OptPassFailed('Algebraic', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_STRENGTH_RED}
-        try SSAProgram.RunStrengthReduction; except end;
+        try SSAProgram.RunStrengthReduction; except on E: Exception do OptPassFailed('StrengthReduction', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_GOSUB_INLINE}
-        try SSAProgram.RunGosubInlining; except end;
+        try SSAProgram.RunGosubInlining; except on E: Exception do OptPassFailed('GosubInlining', E); end;
         {$ENDIF}
 
-        {$IFNDEF DISABLE_CONST_PROP}
-        try SSAProgram.RunConstProp; except end;
-        {$ENDIF}
+        // ⛔ CONST_PROP RIMOSSO DALLA PIPELINE (21 ago 2026). Non e' stato spento: e' STACCATO,
+        // perche' non poteva funzionare. Il passo cerca ssaStoreVar / ssaLoadVar per trovare le
+        // variabili BASIC assegnate una volta sola con un valore costante - e la generazione SSA
+        // non emette quei due opcode NEMMENO UNA VOLTA (zero siti in SedaiSSA.pas): le variabili
+        // sono promosse a registri durante la costruzione dell'SSA. Il passo e' del 25 gen 2025 e
+        // l'IR gli e' cambiato sotto senza che nessuno ripercorresse le sue ipotesi.
+        //
+        // 📊 Che non facesse nulla era gia' misurato: l'audit del 20 ago (job/tests/tools/opt_audit.sh)
+        // ha spento un passo alla volta su 162 programmi, e spegnere CONST_PROP non cambiava UN BYTE.
+        // Cio' che mancava era il PERCHE', e con l'except nudo di allora «non trova niente» e
+        // «esplode alla prima istruzione» erano indistinguibili.
+        //
+        // L'unita' SedaiConstProp resta in albero con una nota in testa: per rianimarla servirebbe
+        // riscriverla sui REGISTRI invece che sulle variabili, e a quel punto sarebbe un passo nuovo.
 
         {$IFNDEF DISABLE_COPY_PROP}
-        try SSAProgram.RunCopyProp; except end;
+        try SSAProgram.RunCopyProp; except on E: Exception do OptPassFailed('CopyProp', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_LICM}
-        try SSAProgram.RunLICM; except end;
+        try SSAProgram.RunLICM; except on E: Exception do OptPassFailed('LICM', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_LOOP_UNROLL}
@@ -451,17 +485,16 @@ begin
           SSAProgram.ClearDomTree;
           SSAProgram.BuildDominatorTree;
           SSAProgram.RunLoopUnrolling;
-        except
-        end;
+        except on E: Exception do OptPassFailed('LoopUnrolling', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_DCE}
-        try SSAProgram.RunDCE; except end;
+        try SSAProgram.RunDCE; except on E: Exception do OptPassFailed('DCE', E); end;
         {$ENDIF}
 
         // B4 bounds-check elimination hints (after DCE, before PHI elimination)
         {$IFNDEF DISABLE_RANGE_ANALYSIS}
-        try SSAProgram.RunRangeAnalysis; except end;
+        try SSAProgram.RunRangeAnalysis; except on E: Exception do OptPassFailed('RangeAnalysis', E); end;
         {$ENDIF}
 
         // PHI Elimination
@@ -481,7 +514,7 @@ begin
 
         // Copy Coalescing
         {$IFNDEF DISABLE_COPY_COAL}
-        try SSAProgram.RunCopyCoalescing; except end;
+        try SSAProgram.RunCopyCoalescing; except on E: Exception do OptPassFailed('CopyCoalescing', E); end;
         {$ENDIF}
 
         // String temp fusion: let a string primitive write straight into its destination register.
@@ -491,11 +524,11 @@ begin
         // exactly one definition and one use. STRFUSE=0 turns it off.
         if GetEnvironmentVariable('STRFUSE') <> '0' then
         begin
-          try SSAProgram.RunStringTempFusion; except end;
-          try SSAProgram.RunAscMidFusion; except end;
-          try SSAProgram.RunStringTempFusion; except end;
-          try SSAProgram.RunConcatCharFusion; except end;
-          try SSAProgram.RunConcatDeadSourceMark; except end;
+          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end;
+          try SSAProgram.RunAscMidFusion; except on E: Exception do OptPassFailed('AscMidFusion', E); end;
+          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end;
+          try SSAProgram.RunConcatCharFusion; except on E: Exception do OptPassFailed('ConcatCharFusion', E); end;
+          try SSAProgram.RunConcatDeadSourceMark; except on E: Exception do OptPassFailed('ConcatDeadSourceMark', E); end;
         end;
 
         // Register Allocation
@@ -539,38 +572,51 @@ begin
 
           // === BYTECODE OPTIMIZATIONS ===
           {$IFNDEF DISABLE_PEEPHOLE}
-          try RunPeephole(Result); except end;
+          try RunPeephole(Result); except on E: Exception do OptPassFailed('Peephole', E); end;
           {$ENDIF}
 
           {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
           // The engine gate lives inside RunSuperinstructions - four callers, one place.
           if not FSkipSuperinstructions then
-            try RunSuperinstructions(Result); except end;
+            try RunSuperinstructions(Result); except on E: Exception do OptPassFailed('Superinstructions', E); end;
           {$ENDIF}
 
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_NOP_COMPACTION}
-          try RunNopCompaction(Result); except end;
+          try RunNopCompaction(Result); except on E: Exception do OptPassFailed('NopCompaction', E); end;
           {$ENDIF}
           {$ENDIF}
 
           // Peephole pass 2
+          // ⛔ IL SUO INTERRUTTORE NON ERA COLLEGATO (trovato il 21 ago 2026). Questo blocco era
+          // protetto da DISABLE_PEEPHOLE - lo stesso flag della PRIMA passata - mentre
+          // DISABLE_PEEPHOLE_PASS2 era l'unico dei 26 flag che NESSUN {$IFNDEF} consultava.
+          // Conseguenza: l'audit che spegne un passo alla volta lo dava per «inerte, spegnerlo non
+          // cambia un byte», il che era banalmente vero per un flag che non spegne niente. Un passo
+          // inerte e un interruttore scollegato danno lo STESSO zero, e dai numeri non si distinguono.
+          //
+          // 📊 MISURATO per la prima volta col flag collegato (21 ago 2026): accesa contro spenta,
+          // 158 programmi, ZERO differenze e ZERO righe. E' inerte davvero. Ma NON e' il caso di
+          // CONST_PROP, che non puo' funzionare per costruzione: questa non trova nulla su QUESTO
+          // corpus, il che e' una cosa piu' debole. Resta collegata e attiva; se un giorno il tempo
+          // di compilazione conta, e' il primo passo da togliere - con una rimisura, non a memoria.
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_PEEPHOLE}
+          {$IFNDEF DISABLE_PEEPHOLE_PASS2}
           try
             RunPeephole(Result);
             {$IFNDEF DISABLE_NOP_COMPACTION}
             RunNopCompaction(Result);
             {$ENDIF}
-          except
-          end;
+          except on E: Exception do OptPassFailed('Peephole2', E); end;
+          {$ENDIF}
           {$ENDIF}
           {$ENDIF}
 
           // Register Compaction
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_REG_COMPACTION}
-          try RunRegisterCompaction(Result); except end;
+          try RunRegisterCompaction(Result); except on E: Exception do OptPassFailed('RegisterCompaction', E); end;
           {$ENDIF}
           {$ENDIF}
 

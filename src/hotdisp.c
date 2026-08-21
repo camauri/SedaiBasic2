@@ -37,7 +37,27 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
 #define HF_MODERN_ARRAYS 1
 #define HF_MODERN_CONV   2
 
-/* THE list. One entry per arm, and it drives three things that used to be maintained separately:
+/* ⛔ THE ORDER OF THIS LIST COSTS REAL TIME, AND THERE IS NO RULE FOR IT - ONLY MEASUREMENT.
+   The arms are indirect-jump targets, so where each one LANDS matters. Adding the four record
+   entries cost fannkuch-redux 12% (1.345 -> 1.507 s at N=10) although it touches no record at all:
+   bisecting the binaries put the loss at exactly that commit, and switching the C loop off collapsed
+   the gap to +2.3%, so it is layout and nothing else.
+
+   ⛔ AND THE FIRST ATTEMPT TO FIX IT MEASURED A LIE. Moving the four entries to the END read as
+   spectral-norm +17.4%, n-body +11.9%, fannkuch +5.8% - so "append instead of insert" looked
+   decisively wrong. It was not: the edit that moved them had also DROPPED
+   X(0xC831, ArrayLoadIntBranchZ) from the list, taking an opcode out of the C loop entirely, and
+   that is what those numbers measured. The list went from 95 entries to 94 and nothing complained -
+   a name with no arm is a compile error, an ARM WITH NO NAME is silent. Caught by diffing the
+   generated .text against HEAD, which is the check worth keeping for any edit to this list.
+   Re-run with all 95 present, appending is slightly BETTER on three of four (fannkuch -1.6%,
+   binary-trees -1.0%, spectral-norm -0.9%, n-body +0.2%), and that is the arrangement below.
+
+   -falign-labels=32 was swept the same way against none/16/64 and wins on all three programs, so
+   that one stays. ⇒ Do not reason about this list's order: change it only with an A/B in hand, on
+   more than one program - and diff the .text to be sure the A/B is comparing what you think.
+
+   THE list. One entry per arm, and it drives three things that used to be maintained separately:
    the opcode table handed to the Pascal side, the dispatch table, and the label each arm carries.
    A name in the list with no matching arm is a COMPILE error, which is the point. */
 #define HOT_OP_LIST \
@@ -131,7 +151,12 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
   X(0xC83A, ArrayLoadIntTo        ) \
   X(0xC81E, ArrayStoreIntConst    ) \
   X(0xC830, ArrayLoadIntBranchNZ  ) \
-  X(0xC831, ArrayLoadIntBranchZ   )
+  X(0xC831, ArrayLoadIntBranchZ   ) \
+  X(0x0068, RecordLoadInt         ) \
+  X(0x0069, RecordLoadFloat       ) \
+  X(0x006B, RecordStoreInt        ) \
+  X(0x006C, RecordStoreFloat      )
+
 
 
 #define X(hex, name) hex,
@@ -163,8 +188,41 @@ int sedai_hot_ops(const uint16_t **out)
 int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
                   int pc, int count, int64_t tv,
                   const int64_t *arrdesc, int flags,
-                  int64_t *xi, double *xf, const uint16_t *hidx)
+                  int64_t *xi, double *xf, const uint16_t *hidx,
+                  const int64_t *recdesc)
 {
+  /* RECORD FIELDS. recdesc is built on the Pascal side, which is the side that knows the layout of
+     TRecordStorage - this file holds no offset of its own, so the two cannot drift the way a
+     hand-copied struct would. Its six slots are:
+        [0] base of the executing context's per-thread Records array (0 = none)
+        [1] stride between two records = SizeOf(TRecordStorage)
+        [2] byte offset of the Bytes field inside TRecordStorage
+        [3] base of the shared-record pointer table, or 0 when the per-access lock is in force -
+            and 0 makes every shared handle leave the C loop, which is the prudent answer
+        [4] SHARED_REC_FLAG   [5] SHARED_REC_MASK
+     A null recdesc disables all four arms. */
+#define RECPTR(h_, out_) do {                                                     \
+    int64_t hh_ = (h_);                                                           \
+    if (!recdesc) return pc;                                                      \
+    if (hh_ & recdesc[4]) {                                                       \
+      if (!recdesc[3]) return pc;               /* locked mode: not ours */       \
+      (out_) = ((char *const *)(intptr_t)recdesc[3])[hh_ & recdesc[5]];           \
+    } else {                                                                      \
+      if (!recdesc[0] || hh_ < 0) return pc;                                      \
+      (out_) = (char *)(intptr_t)recdesc[0] + hh_ * recdesc[1];                   \
+    }                                                                             \
+    if (!(out_)) return pc;                                                       \
+  } while (0)
+
+/* The field byte image, then the width code in the low nibble of the immediate - transcribed from
+   RecFieldInt / RecSetFieldInt in SedaiBytecodeVM.pas. A record whose Bytes array is still nil
+   hands the PC back rather than dereferencing it. */
+#define RECBYTES(rec_, enc_, out_) do {                                           \
+    uint8_t *b_ = *(uint8_t **)((rec_) + recdesc[2]);                             \
+    if (!b_) return pc;                                                           \
+    (out_) = b_ + ((enc_) >> 4);                                                  \
+  } while (0)
+
 #define X(hex, name) &&L_##name,
   static void *const disp[] = { HOT_OP_LIST };
 #undef X
@@ -177,6 +235,59 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
                      I = prog + pc; goto *disp[h_ - 1]; } } while (0)
 
   NEXT;   /* entry is the same step as every other */
+
+  /* RECORD FIELDS, transcribed from RunTemplate.inc's four bcRecordLoad and bcRecordStore arms and from
+     RecFieldInt / RecFieldFloat / RecSetFieldInt / RecSetFieldFloat in SedaiBytecodeVM.pas.
+     The width lives in the low nibble of the immediate and the byte offset in the rest of it; code 7
+     is a SINGLE, which is four bytes and not a widened Double. bcRecordLoadString and its store are
+     deliberately absent - the string bank is off limits to this loop.
+
+     ⭐ WHY THESE FOUR EARN THEIR PLACE. Measured 21 Aug 2026 on binary-trees-modern (records) and
+     binary-trees-modern-arena (the same algorithm over a flat array), N=16, interpreter only:
+         arena, C loop on 0.566 s / off 0.821 s .... the C loop is worth 45%
+         records, C loop on 1.252 s / off 1.231 s .. worth NOTHING
+     A record field appearing in a hot loop split it into covered runs too short to pay for
+     themselves, which is the exact failure the header of this file already records for
+     spectral-norm. On a probe isolating one field read, the field cost +132.6% of the loop with the
+     C loop on and +32.2% with it off - the same +32% an array read costs. So the field was never
+     expensive; it was expensive only because it left. */
+  L_RecordLoadInt: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm;
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    switch (enc_ & 0xF) {
+      case 1:  ireg[I->dest] = *(int8_t   *)p_; break;
+      case 2:  ireg[I->dest] = *(uint8_t  *)p_; break;
+      case 3:  ireg[I->dest] = *(int16_t  *)p_; break;
+      case 4:  ireg[I->dest] = *(uint16_t *)p_; break;
+      case 5:  ireg[I->dest] = *(int32_t  *)p_; break;
+      case 6:  ireg[I->dest] = *(uint32_t *)p_; break;
+      default: ireg[I->dest] = *(int64_t  *)p_; break;
+    }
+    pc++; } NEXT;
+  L_RecordLoadFloat: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm;
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    freg[I->dest] = ((enc_ & 0xF) == 7) ? (double)*(float *)p_ : *(double *)p_;
+    pc++; } NEXT;
+  L_RecordStoreInt: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm, v_ = ireg[I->s2];
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    switch (enc_ & 0xF) {
+      case 1: case 2: *(uint8_t  *)p_ = (uint8_t )v_; break;
+      case 3: case 4: *(uint16_t *)p_ = (uint16_t)v_; break;
+      case 5: case 6: *(uint32_t *)p_ = (uint32_t)v_; break;
+      default:        *(int64_t  *)p_ = v_;           break;
+    }
+    pc++; } NEXT;
+  L_RecordStoreFloat: {
+    char *rec_; uint8_t *p_; int64_t enc_ = I->imm; double v_ = freg[I->s2];
+    RECPTR(ireg[I->s1], rec_);
+    RECBYTES(rec_, enc_, p_);
+    if ((enc_ & 0xF) == 7) *(float *)p_ = (float)v_; else *(double *)p_ = v_;
+    pc++; } NEXT;
 
   L_LoadConstInt: ireg[I->dest] = I->imm;                                        pc++; NEXT;
   L_CopyInt: ireg[I->dest] = ireg[I->s1];                                   pc++; NEXT;
@@ -298,25 +409,40 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
   L_SubIntToBranchGt: ireg[I->dest] -= ireg[I->s1]; pc = (ireg[I->dest] >  ireg[I->s2]) ? (int)I->imm : pc + 1; NEXT;
 
     /* ---- typed array element access. Src1 is the ARRAY ID, Src2 the register holding the index. ---- */
+    /* ⭐ THE FLAG GUARDS THE OUT-OF-BOUNDS CASE, NOT THE ACCESS. These four used to hand the PC back
+       on the very first instruction whenever HF_MODERN_ARRAYS was clear - and that flag is
+       "MODERN dialect AND bounds checking off", so EVERY CLASSIC program lost the C loop at its
+       first array element. In bounds, the two dialects do exactly the same thing through exactly
+       the same descriptor; they differ only when the index is out of range, where MODERN yields
+       zero (or drops the store) and CLASSIC has to RAISE. So the in-bounds path is taken in both,
+       and only the out-of-range case leaves - which is an error path, not a hot one.
+
+       Measured 21 Aug 2026 by HOTC_DIAG=1 over the benchmark corpus: ArrayLoadFloat alone handed
+       the PC back 6.40 M times, 11.2% of all exits, and ArrayLoadInt another 0.91 M - all of it in
+       the CLASSIC programs, spectral-norm.bas and n-body.bas among them. */
+    /* The in-bounds test is ONE unsigned compare: a negative index wraps to a huge unsigned value
+       and fails the same test, so there is no separate li >= 0 branch on the hot path. */
   L_ArrayLoadInt:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        ireg[I->dest] = (li >= 0 && li < d[2]) ? ((const int64_t *)(intptr_t)d[0])[li] : 0; }
+        if ((uint64_t)li < (uint64_t)d[2]) ireg[I->dest] = ((const int64_t *)(intptr_t)d[0])[li];
+        else if (flags & HF_MODERN_ARRAYS) ireg[I->dest] = 0;
+        else return pc; }
       pc++; NEXT;
   L_ArrayLoadFloat:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        freg[I->dest] = (li >= 0 && li < d[2]) ? ((const double *)(intptr_t)d[1])[li] : 0.0; }
+        if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = ((const double *)(intptr_t)d[1])[li];
+        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = 0.0;
+        else return pc; }
       pc++; NEXT;
   L_ArrayStoreInt:   /* bcArrayStoreInt - the VALUE is in Dest, read not written */
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        if (li >= 0 && li < d[2]) ((int64_t *)(intptr_t)d[0])[li] = ireg[I->dest]; }
+        if ((uint64_t)li < (uint64_t)d[2]) ((int64_t *)(intptr_t)d[0])[li] = ireg[I->dest];
+        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
       pc++; NEXT;
   L_ArrayStoreFloat:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        if (li >= 0 && li < d[2]) ((double *)(intptr_t)d[1])[li] = freg[I->dest]; }
+        if ((uint64_t)li < (uint64_t)d[2]) ((double *)(intptr_t)d[1])[li] = freg[I->dest];
+        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
       pc++; NEXT;
 
     /* ---- fused float arithmetic and the transfer banks ---- */

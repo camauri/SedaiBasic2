@@ -48,6 +48,14 @@
                - Variables modified in conditionals
                - Complex expressions (function results, array elements)
 
+  ⛔⛔ NON E' PIU' NELLA PIPELINE (staccato il 21 ago 2026, vedi SedaiRunner).
+  Questo passo cerca ssaStoreVar / ssaLoadVar. La generazione SSA non li emette PIU': zero siti in
+  SedaiSSA.pas. Le variabili BASIC sono promosse a registri durante la costruzione dell'SSA, quindi
+  la Fase 1 non trova mai un candidato e la Fase 2 non ha mai niente da sostituire.
+  Misurato: spegnerlo non cambiava un byte su 162 programmi (audit del 20 ago 2026).
+  Per rianimarlo servirebbe riscriverlo sui REGISTRI invece che sulle variabili - a quel punto e'
+  un passo nuovo, non questo. Lasciato in albero come documentazione di cosa cercava.
+
   Phase: Simple Optimization Pass (post-GVN, pre-DCE)
   Author: Sedai Project - Code Generation Improvements
   Date: 2025-01-25

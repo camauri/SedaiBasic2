@@ -93,6 +93,28 @@ type
   // rather than freed: that is what lets a handle lookup run without taking the region's lock.
   TSharedRecArray = array of PRecordStorage;
 
+  { One array's storage. Lived in SedaiBytecodeVM until 21 Aug 2026 and moved here for the same reason
+    TRecordStorage did: the moment a kind of storage becomes PER-CONTEXT, its type has to be visible to
+    the context. The VM still owns the table of these; what is per-context is the BIND SAVE-STACK below
+    and the map from a bytecode array id to a slot in that table (ArrMap). }
+  TArrayStorage = record
+    ElementType: Byte;        // 0=Int, 1=Float, 2=String (maps to TSSARegisterType)
+    DimCount: Integer;
+    Dimensions: array of Integer;   // element count per dimension
+    LowerBounds: array of Integer;  // lower bound per dimension (B1.4: LBOUND/UBOUND)
+    TotalSize: Integer;
+    IntData: array of Int64;
+    FloatData: array of Double;
+    StringData: array of string;
+  end;
+
+  TArrayBindEntry = record
+    SlotId: Integer;
+    ArgId: Integer;
+    Saved: TArrayStorage;
+    Snapshot: TArrayStorage;
+  end;
+
   { One call frame's bookkeeping, pushed by FramePush and read back by FramePop. 32 bytes, so two
     frames share a cache line - see the FrameMarks field for why this is one record and not the
     five parallel arrays it replaced. WInt/WFloat/WStr each pack (width shl 32) or base, the two
@@ -240,6 +262,44 @@ type
 
     // --- DATA / READ / RESTORE cursor (the DATA pool itself stays shared) ---
     DataIndex: Integer;         // Current read position in the DATA pool
+
+    // --- Array BYREF parameter binding (MODERN) ---
+    // ⛔ PER-CONTEXT since 21 Aug 2026, and it had to move for the same reason the param slot itself
+    // became private: binding aliases a callee param-array slot to the caller's array and pushes the
+    // original here, to be restored on unbind. One stack for the whole VM meant two threads inside the
+    // same SUB pushed and popped each other's entries - the alias one restored was the other's.
+    // ArgId is the caller's array slot, kept so a REDIM [PRESERVE] inside the callee (which reallocates
+    // the param's storage and thereby breaks the shared reference) is propagated back on unbind.
+    ArrayBindStack: array of TArrayBindEntry;
+    ArrayBindTop: Integer;
+
+    // --- Array identity (M?, 21 Aug 2026): logical array id -> PHYSICAL slot in the VM's array table ---
+    // ⛔ A proc-local array used to be ONE storage for the whole program: the slot id is an immediate
+    // baked into the bytecode, so two threads inside the same SUB addressed the same elements and
+    // overwrote each other (job/tests/bas/bug_local_array_shared_across_threads.bas). The bytecode
+    // still names a LOGICAL id; this vector turns it into the physical slot THIS context owns.
+    // Identity for every global array (ArrMap[i] = i), and each context's own block for the private
+    // ones - which is why the lookup is a plain load and not a branch: the common case must not pay
+    // for the rare one. Covers the STATIC id space only; a UDT member array allocated at runtime gets
+    // a physical id beyond it and is never private (it lives in its record, not in a frame).
+    ArrMap: array of Integer;
+    ArrPrivBlock: Integer;      // index of the private block this context holds (-1 = none), released at exit
+    // The compiled engines (the C hot loop, the AOT, the loop JIT) read an array through a DESCRIPTOR
+    // table indexed by the id baked into their code - a LOGICAL id. They therefore cannot be handed the
+    // VM's one table once private arrays exist: each context gets its own copy, identical to the master
+    // except that the private entries point at the slots THIS context owns. That is the whole reason
+    // hotdisp.c, SedaiAot and SedaiJit needed no change at all for per-thread local arrays.
+    // Empty (and unused) when the program declares no private array: then the master table is handed
+    // out exactly as before.
+    ArrDescOwn: array of Int64;
+    ArrDescRetired: array of array of Int64;  // superseded buffers; a native frame may still hold one
+    ArrDescGen: Int64;          // the master generation this copy was built from (0 = never built)
+    // ⛔ The pointer LAST PUBLISHED from ArrDescOwn. A caller that caches the table (the JIT arm)
+    // must be able to ask "is what I hold still the current buffer", and the generation alone
+    // cannot answer it: another arm of the same thread can rebuild this context's table, which
+    // RETIRES the old buffer and allocates a new one, leaving the generation matching while the
+    // cached pointer names a buffer that is one DIM out of date.
+    ArrDescCur: Pointer;
 
     // --- UDT/record heap (M3; per-context since M5.2b) ---
     // Instances allocated by bcRecordNew; a handle is an index here. RAII (V2) rolls

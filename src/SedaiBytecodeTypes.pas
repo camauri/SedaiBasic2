@@ -1866,10 +1866,34 @@ begin
   Result := BestPC;
 end;
 
+{$I SedaiOpcodeNames.inc}
+
+function LookupOpcodeName(Op: Word; out N: string): Boolean;
+// Bisezione su OPCODE_NAMES, che e' ordinata per codice. Vedi la nota in testa a
+// SedaiOpcodeNames.inc: quella tabella e' l'UNICO posto dove un opcode prende il nome, e il case
+// qui sotto resta solo come ripiego per cio' che non e' ancora nella tabella.
+var
+  lo, hi, mid: Integer;
+begin
+  lo := 0; hi := OPCODE_NAME_COUNT - 1;
+  while lo <= hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if OPCODE_NAMES[mid].Code = Op then
+    begin
+      N := OPCODE_NAMES[mid].Name;
+      Exit(True);
+    end;
+    if OPCODE_NAMES[mid].Code < Op then lo := mid + 1 else hi := mid - 1;
+  end;
+  Result := False;
+end;
+
 function BytecodeOpToString(Op: TBytecodeOp): string;
 var
   Group, SubOp: Word;
 begin
+  if LookupOpcodeName(Word(Op), Result) then Exit;
   Group := Op shr 8;
   SubOp := Op and $FF;
 
@@ -2022,6 +2046,15 @@ begin
         140: Result := 'CallSubIndirect';
         141: Result := 'SetEnviron';
         142: Result := 'Shell';
+        // La famiglia UNSIGNED: sei opcode emessi e nessuno nominato, trovati dal controllo
+        // nomi aggiunto a --verify-opcodes il 20 ago 2026 (la passata MANUALE dello stesso
+        // giorno, che ne aveva nominati 21, si era fermata prima di questi).
+        143: Result := 'CmpLtUInt';
+        144: Result := 'CmpGtUInt';
+        145: Result := 'CmpLeUInt';
+        146: Result := 'CmpGeUInt';
+        147: Result := 'DivUInt';
+        148: Result := 'ModUInt';
         149: Result := 'PrintUsingStage';
         150: Result := 'PrintUsingRun';
         154: Result := 'PrintUsingInt';

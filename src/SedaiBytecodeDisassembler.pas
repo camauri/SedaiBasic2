@@ -224,16 +224,26 @@ begin
       Line := Format('%4d: %-20s [hR%d] <= [hR%d] (deep)', [Index, 'ArrayCopyRecords', Instr.Src1, Instr.Src2]);
     bcReturnSub:
       Line := Format('%4d: %-20s', [Index, 'ReturnSub']);
-    bcXferStoreInt, bcXferStoreFloat, bcXferStoreString:
-      Line := Format('%4d: %-20s R%d -> X%d', [Index, 'XferStore', Instr.Src1, Instr.Immediate]);
-    bcXferLoadInt, bcXferLoadFloat, bcXferLoadString:
-      Line := Format('%4d: %-20s R%d <- X%d', [Index, 'XferLoad', Instr.Dest, Instr.Immediate]);
+    // ⛔ THE BANK IS PART OF THE INSTRUCTION AND IT USED TO BE MISSING. These three opcodes printed
+    // under ONE name, so a disassembly could not answer "does this procedure touch the float bank?"
+    // - which is exactly the question that decides whether it gets the fast frame. On
+    // binary-trees-modern, freeTree is pure integer code and still loses the fast frame; reading its
+    // listing gave no way to see why, because the deciding detail was the one being hidden.
+    // Same for the record and array forms below.
+    bcXferStoreInt:    Line := Format('%4d: %-20s R%d -> X%d', [Index, 'XferStoreI', Instr.Src1, Instr.Immediate]);
+    bcXferStoreFloat:  Line := Format('%4d: %-20s R%d -> X%d', [Index, 'XferStoreF', Instr.Src1, Instr.Immediate]);
+    bcXferStoreString: Line := Format('%4d: %-20s R%d -> X%d', [Index, 'XferStoreS', Instr.Src1, Instr.Immediate]);
+    bcXferLoadInt:     Line := Format('%4d: %-20s R%d <- X%d', [Index, 'XferLoadI', Instr.Dest, Instr.Immediate]);
+    bcXferLoadFloat:   Line := Format('%4d: %-20s R%d <- X%d', [Index, 'XferLoadF', Instr.Dest, Instr.Immediate]);
+    bcXferLoadString:  Line := Format('%4d: %-20s R%d <- X%d', [Index, 'XferLoadS', Instr.Dest, Instr.Immediate]);
     bcRecordNew:
       Line := Format('%4d: %-20s R%d = rec(i%d,f%d,s%d)', [Index, 'RecordNew', Instr.Dest, Instr.Src1, Instr.Src2, Instr.Immediate]);
-    bcRecordLoadInt, bcRecordLoadFloat, bcRecordLoadString:
-      Line := Format('%4d: %-20s R%d <- [R%d].fld%d', [Index, 'RecordLoad', Instr.Dest, Instr.Src1, Instr.Immediate]);
-    bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString:
-      Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStore', Instr.Src1, Instr.Immediate, Instr.Src2]);
+    bcRecordLoadInt:     Line := Format('%4d: %-20s R%d <- [R%d].fld%d', [Index, 'RecordLoadI', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcRecordLoadFloat:   Line := Format('%4d: %-20s R%d <- [R%d].fld%d', [Index, 'RecordLoadF', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcRecordLoadString:  Line := Format('%4d: %-20s R%d <- [R%d].fld%d', [Index, 'RecordLoadS', Instr.Dest, Instr.Src1, Instr.Immediate]);
+    bcRecordStoreInt:    Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStoreI', Instr.Src1, Instr.Immediate, Instr.Src2]);
+    bcRecordStoreFloat:  Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStoreF', Instr.Src1, Instr.Immediate, Instr.Src2]);
+    bcRecordStoreString: Line := Format('%4d: %-20s [R%d].fld%d <- R%d', [Index, 'RecordStoreS', Instr.Src1, Instr.Immediate, Instr.Src2]);
     bcRecordNewArray:
       Line := Format('%4d: %-20s ARR[%d] fill records', [Index, 'RecordNewArray', Instr.Src1]);
     bcRecordNewArrayInd:

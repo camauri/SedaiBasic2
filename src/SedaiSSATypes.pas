@@ -672,6 +672,12 @@ type
     // everywhere. A compiled backend must not compute UBound natively for such an array: its
     // descriptor carries the total element COUNT, not per-dimension extents.
     MultiDimEver: Boolean;
+    // ⛔ A PROC-LOCAL array (a DIM inside a SUB/FUNCTION that is neither SHARED nor STATIC) must have
+    // ONE STORAGE PER THREAD. Until 21 Aug 2026 it had one storage per PROGRAM - the slot id baked
+    // into the bytecode is a static index into the VM's single array table - so two threads inside the
+    // same SUB overwrote each other. Marked here, at the only place that knows the scope, and carried
+    // through to the VM, which gives every execution context its own block of private slots.
+    IsPrivate: Boolean;
   end;
 
   TSSAProgram = class
@@ -712,6 +718,7 @@ type
     procedure SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
+    procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
     procedure BuildDominatorTree;  // PHASE 3 TIER 2: Build dominator tree for optimizations
@@ -733,6 +740,7 @@ type
     function RunAscMidFusion: Integer;      // Asc(Mid(s,i,n)) without building the substring
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
+    function RunXferForwarding: Integer;  // forward inlined call-argument slots
     function RunCopyProp: Integer;  // Copy propagation (returns replacement count)
     function RunAlgebraic: Integer;  // Algebraic simplification (returns simplification count)
     function RunStrengthReduction: Integer;  // Strength reduction (returns reduction count)
@@ -814,7 +822,7 @@ implementation
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
      SedaiAlgebraic, SedaiStrengthReduction, SedaiIndexReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
-     SedaiSubInlining
+     SedaiSubInlining, SedaiXferForward
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
 
 function DestIsPureDef(Op: TSSAOpCode): Boolean;
@@ -1446,6 +1454,15 @@ begin
     if FArrays[i].Name = SearchName then
       Exit(i);
   Result := -1;
+end;
+
+procedure TSSAProgram.SetArrayPrivate(ArrayIdx: Integer);
+// Mark a slot as proc-local: the VM must give every execution context its own storage for it. Only
+// ever set, never cleared - a slot that is private for one declaration stays private (a REDIM of the
+// same local reuses the slot and must not demote it back to shared storage).
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then
+    FArrays[ArrayIdx].IsPrivate := True;
 end;
 
 function TSSAProgram.GetArray(Index: Integer): TSSAArrayInfo;
@@ -3023,6 +3040,16 @@ begin
   finally
     CSE.Free;
   end;
+end;
+
+function TSSAProgram.RunXferForwarding: Integer;
+// After SUB inlining the argument protocol survives around the spliced body: the arguments are
+// staged into the transfer bank and read straight back, with no call left between the two. See
+// SedaiXferForward for the safety conditions - they are checked, not assumed.
+begin
+  Result := 0;
+  if not GSSAOptimizationsEnabled then Exit;
+  Result := SedaiXferForward.RunXferForward(Self);
 end;
 
 function TSSAProgram.RunCopyProp: Integer;

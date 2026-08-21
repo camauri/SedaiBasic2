@@ -29,6 +29,7 @@ var
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
   CurPC: Integer;  // Current Program Counter (local for speed)
+  S53Pos, S53Idx: Integer;   // sub-opcode 53 fast lane: the source index and the table index
   Instr: PBytecodeInstruction;   // POINTER, not a copy - see the note at the assignment
   InstrHot: PBytecodeInstruction;  // ...and what ArrayHotOps.inc dereferences (two including scopes)
   Ctx: TExecutionContext;  // M5.2: active execution context, read once per Run (zero hot-path cost)
@@ -41,6 +42,11 @@ var
   // Local copies of frequently accessed fields for better register allocation
   IntRegs: PInt64;
   FloatRegs: PDouble;
+  // Logical array id -> the physical slot THIS context owns. Aliased like the register banks and for
+  // the same reason: it is on the array arms' critical path. A PROC-LOCAL array has one storage per
+  // context (see TBytecodeVM.BuildPrivateArrayPlan); for every other array the entry is the identity,
+  // which is why this is a load and not a branch.
+  ArrMapP: PInteger;
   NextPC: Integer;          // indirect call target, read before FramePush can slide the view
   ArrayIdx, LinearIdx: Integer;   // used by the HOT typed accessors in ArrayHotOps.inc
   InputStr, PrintStr: string;
@@ -48,7 +54,7 @@ var
   i: Integer;
   NextTabCol, TabIdx: Integer;
   // Local vars for ArrayReverseRange and ArrayShiftLeft
-  ArrIdxW: Word;
+  ArrIdxW, ArrIdxW2: Integer;   // PHYSICAL slot ids: the per-context blocks live past the static space
   LStartIdx, LEndIdx, LLoopIdx: Integer;
   LFirstVal: Int64;
   LElemVal: Double;  // scratch for bounds-guarded array element reads in superinstructions
@@ -60,8 +66,18 @@ var
   TrapTriggered: Boolean;
   // Event polling counter
   EventPollCounter: Integer;
+  // The JIT arm's array-descriptor fast lane. It belongs to the JIT and NOT to the C hot loop, and
+  // it used to be declared inside the {$IFDEF HOT_C} block below while being initialised and read
+  // from the common body - so --no-hot-c did not compile at all ("Identifier not found"). Nobody
+  // saw it because nobody builds that way: the C compiler is present on every machine this is built
+  // on, and the flag exists for the machines where it is not.
+  JitArrDescCache: Pointer;
   {$IFDEF HOT_C}
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
+  // The record-field descriptor handed to the C loop. It is built HERE, by the side that knows the
+  // layout of TRecordStorage, so hotdisp.c holds no offset of its own and the two cannot drift.
+  HotRecDesc: array[0..5] of Int64;
+  HotRecProbe: TRecordStorage;   // only ever used to take the offset of its Bytes field
   HotNewPC: LongInt;
   HotArrDesc: Pointer;
   HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
@@ -94,6 +110,7 @@ begin
   // main thread (the old "main context only" gate for the m451 corruption is gone).
   JitOn := FJitEnabled and (Length(FNativeLoops) > 0);
   if JitOn then JitLoops := @FNativeLoops[0] else JitLoops := nil;
+  JitArrDescCache := nil;
   {$IFDEF JIT_PROFILE}
   // J1: bind the back-edge profiler (counting is a no-op unless FJitProfile is set).
   BEProfile := FJitProfile;
@@ -134,6 +151,7 @@ begin
   // it (and so does anything that can grow the bank).
   IntRegs := Ctx.IntRegs;
   FloatRegs := @Ctx.FloatRegs[0];
+  if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
   // AOT: bind the compiled-function table and this context's transfer-bank bases (built per
   // Run and passed per call, NEVER baked into code: a worker must see its own banks).
   AotOn := FAotEnabled and (Length(FNativeFuncs) > 0) and
@@ -190,16 +208,47 @@ begin
   // ⚠️ At N small the two shortest read -4.3% and -9.1%; re-measured at a real size they are -2.5%
   // and -10.3%. Under a second, this machine's noise eats the signal - do not quote the short ones.
   //
-  // JIT still disqualifies: it rewrites the bytecode the C loop would be dispatching.
-  // HOTC_AOT=0 restores the old behaviour, so the A/B above lives on ONE binary.
-  HotCOk := (not JitOn) and (not Assigned(FEventPollCallback)) and
-            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0'));
+  // ⛔ The line above used to also exclude the JIT, on the stated grounds that "it rewrites the
+  // bytecode the C loop would be dispatching". THAT WAS WRONG, and it was written the same day it
+  // was disproved: the loop JIT never writes to the instruction stream (nothing does - every use of
+  // GetInstructionsPtr in this unit is a read). It installs compiled loops in FNativeLoops, a per-PC
+  // side table exactly like the AOT's FNativeFuncs, so the SAME coexistence applies: SetHotOpEnabled
+  // zeroes the header pc and the C dispatcher hands it back there.
+  //
+  // What that mistake cost, measured on binary-trees-modern-arena N=16, best of 3, one binary:
+  //   interpreter, C loop on    744 ms
+  //   interpreter, C loop off  2906 ms      <- what --jit was getting
+  //   --jit                    3036 ms
+  // So 94% of the JIT's 4x "slowdown" was never the JIT: it was this gate. The JIT's own cost is
+  // 130 ms, 4.5%. ⛔ And note the C loop is worth 291% here against the "27-45% where it applies"
+  // written elsewhere - that range was measured on other programs and is not a maximum.
+  //
+  // HOTC_AOT=0 / HOTC_JIT=0 restore the old behaviour per engine, and HOTC_OFF=1 disables the C loop
+  // outright, so all three A/Bs live on ONE binary.
+  // ⛔ ...and NOT WHILE TRON IS TRACING. The C loop does not emit trace lines - it runs a stretch of
+  // instructions and hands back a PC - so with tracing on it silently swallows the lines it ran.
+  // That is a TRON fidelity defect that predates this change and was invisible: test_tron_troff
+  // printed [60] once for a three-iteration FOR instead of once per iteration, and nobody compared
+  // it against anything that did. It surfaced only because zeroing FHotOp at JIT loop headers made
+  // --jit trace those lines while the interpreter still did not, and the differential net caught the
+  // two engines disagreeing. Fix the cause: no C loop while tracing, and both engines trace fully.
+  HotCOk := (not Assigned(FEventPollCallback)) and (not Ctx.TraceActive) and
+            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0')) and
+            ((not JitOn) or (GetEnvironmentVariable('HOTC_JIT') <> '0'));
+  if GetEnvironmentVariable('HOTC_OFF') = '1' then HotCOk := False;
   // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
   // raise; there its array arms hand the PC back instead.
   HotFlags := 0;
   if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
   if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
-  if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
+  if HotCOk then HotArrDesc := AcquireArrDescCtx(Ctx) else HotArrDesc := nil;
+  // Slots 1, 2, 4 and 5 are layout and never change during a run. Slots 0 and 3 are the two bases,
+  // and they are refreshed at every entry below - taking an address costs nothing, and unlike
+  // AcquireArrDesc neither of them needs a lock to read.
+  HotRecDesc[1] := SizeOf(TRecordStorage);
+  HotRecDesc[2] := PtrUInt(@HotRecProbe.Bytes) - PtrUInt(@HotRecProbe);
+  HotRecDesc[4] := SHARED_REC_FLAG;
+  HotRecDesc[5] := SHARED_REC_MASK;
   if Length(Ctx.XferInt) > 0 then HotXferI := @Ctx.XferInt[0] else HotXferI := nil;
   if Length(Ctx.XferFloat) > 0 then HotXferF := @Ctx.XferFloat[0] else HotXferF := nil;
   // Without both transfer banks the C loop must not run the Xfer opcodes at all.
@@ -236,7 +285,7 @@ begin
       // Through AcquireArrDesc: the flag test, the rebuild and taking the address are one locked
       // step. A compiled loop is entered from every worker, so this arm has the same exposure the
       // AOT arm below documents.
-      ArrDescPtr := AcquireArrDesc;
+      ArrDescPtr := AcquireArrDescFast(JitArrDescCache, Ctx);
       // AotSettle, not a bare assignment: since J14 a compiled loop can route one instruction through
       // the interpreter, and that helper reports a raised exception or a cleared Running as a NEGATIVE
       // sentinel in the same channel as the exit PC. Resolving it here is what makes ON ERROR / TRAP /
@@ -294,6 +343,7 @@ begin
       // count, because the C loop was handed this stale pointer and wrote through it.
       IntRegs := Ctx.IntRegs;
       FloatRegs := @Ctx.FloatRegs[0];
+      if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
       if (CurPC <> AotFromPC) or (not Ctx.Running) then System.Continue;
     end;
 
@@ -322,9 +372,45 @@ begin
       // before - a lock on the call path took binary-trees from 171 ms to 711. So the pointer is
       // taken ONCE before the loop and refreshed only when the array set actually changed, which is
       // a plain field read on the hot path and the lock only when something really moved.
-      if FArraysDirty then HotArrDesc := AcquireArrDesc;
+      if FArraysDirty or ((FPrivArrCount > 0) and (Ctx.ArrDescGen <> FArrDescGen)) then
+        HotArrDesc := AcquireArrDescCtx(Ctx);
+      if GArrPrivDiag and (FPrivArrCount > 0) and (HotArrDesc <> nil) then
+        CheckPrivDesc(Ctx, HotArrDesc);
+      // The two record bases, re-read per entry. Ctx.Records grows through bcRecordNew, which this
+      // loop does not implement - so it can only move while we are OUTSIDE, and re-reading here is
+      // exactly enough. The shared table is published only when the per-access lock is off; leaving
+      // slot 3 at zero makes the C arms hand back every shared handle instead of racing for it.
+      //
+      // ⛔ ONE DIFFERENCE FROM THE PASCAL ARM, AND IT IS DELIBERATE. ResolveRec re-reads the
+      // FSharedRecords field on EVERY access; the C loop is handed the base once and holds it for
+      // the whole run. That is safe for the same reason ResolveRec is allowed to be lock-free:
+      // GrowSharedRecords RETIRES the old array instead of freeing it, and an entry valid when a
+      // handle was issued stays valid in every array from that one onwards. So a stale base still
+      // reads live memory and still resolves every handle this thread can legally name - it cannot
+      // name one another thread minted mid-run without synchronising first, which is the same
+      // assumption the Pascal side already makes. If that retirement policy ever changes, this is
+      // the second place that depends on it.
+      if Length(Ctx.Records) > 0 then HotRecDesc[0] := PtrUInt(@Ctx.Records[0]) else HotRecDesc[0] := 0;
+      if FSharedRecLockFree and (Length(FSharedRecords) > 0) then
+        HotRecDesc[3] := PtrUInt(@FSharedRecords[0])
+      else
+        HotRecDesc[3] := 0;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
-                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0]);
+                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0]);
+      // HOTC_DIAG=1: charge this exit to the opcode that caused it. The C loop is only entered when
+      // FHotOp[CurPC] <> 0, so wherever it stops is an instruction it does not implement - and the
+      // count of stops per opcode is exactly the cost of NOT covering that opcode.
+      // ⛔ COUNT ENTRIES, NOT "INSTRUCTIONS". HotNewPC - CurPC is the PC DISPLACEMENT, and the C loop
+      // executes back edges: it can run an eight-million-iteration BASIC loop and come back with a
+      // displacement of nine. An earlier version of this counter reported that difference as
+      // "instructions executed" and it was wrong by whatever the trip count happened to be.
+      // Entries and per-opcode exits are the two numbers that mean what they say.
+      if GHotCDiag then
+      begin
+        Inc(GHotCCalls);
+        if (HotNewPC >= 0) and (HotNewPC < InstrCount) then
+          Inc(GHotCExit[Instructions[HotNewPC].OpCode]);
+      end;
       if HotNewPC <> CurPC then
       begin
         CurPC := HotNewPC;
@@ -335,6 +421,14 @@ begin
     Instr := @Instructions[CurPC];
     Op := Instr^.OpCode;
     DenseOp := DenseOps[CurPC];
+
+    // PAIR_DIAG=1: count the ADJACENT opcode pairs actually executed, which is the only honest way
+    // to ask "what should be fused next". The superinstruction set was chosen when the pipeline
+    // looked different; a pair that mattered then may not be executed at all now, and the ones that
+    // matter now were not fusable then. Run it with HOTC_OFF=1 so every instruction passes through
+    // here - the C loop runs whole stretches without coming back, and would hide most of the pairs.
+    if GPairDiag and (CurPC + 1 < InstrCount) then
+      Inc(GPairCount[PairSlot(Instructions[CurPC].OpCode), PairSlot(Instructions[CurPC + 1].OpCode)]);
 
     {$IFDEF DEBUG_MODE}
     // Debugger integration: check for breakpoints and stepping
@@ -456,9 +550,9 @@ begin
         29: if FloatRegs[Instr^.Src1] <> 0.0 then CurPC := Instr^.Immediate else Inc(CurPC); // bcBranchNeZeroFloat
 
         // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded: OOB store dropped (MODERN), CLASSIC raises.
-        30: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := Instr^.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
-        31: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
-        32: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
+        30: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := Instr^.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
+        31: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
+        32: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
 
         // Fused loop increment-and-branch (most common in hot loops) - sub-opcodes 90-93
         33: // bcAddIntToBranchLe
@@ -517,23 +611,26 @@ begin
         // Format: Dest, Src1=arr_index, Src2=idx_reg, Immediate=acc_reg
         // Bounds-guarded: an OOB read yields the element default 0.0 (MODERN); CLASSIC raises.
         41: begin // bcArrayLoadAddFloat: dest = acc + arr[idx]
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] + FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
+          ArrIdxW := ArrMapP[Instr^.Src1];
+          if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] + FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]]
           else
             FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         42: begin // bcArrayLoadSubFloat: dest = acc - arr[idx]
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] - FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
+          ArrIdxW := ArrMapP[Instr^.Src1];
+          if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] - FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]]
           else
             FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         43: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
           // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-            LElemVal := FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
+          ArrIdxW := ArrMapP[Instr^.Src1];
+          if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+            LElemVal := FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]]
           else
             LElemVal := 0.0;
           if Abs(FloatRegs[(Instr^.Immediate shr 16) and $FFFF]) < 1e-300 then
@@ -569,24 +666,30 @@ begin
         // Array Load + Branch - sub-opcodes 140-141. Bounds-guarded: an OOB read is treated as the element
         // default 0 in MODERN (NZ does not branch, Z branches); CLASSIC raises.
         48: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) and
-             (FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] <> 0) then
-            CurPC := Instr^.Immediate
-          else
-            Inc(CurPC);
+          begin
+            ArrIdxW := ArrMapP[Instr^.Src1];
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) and
+               (FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] <> 0) then
+              CurPC := Instr^.Immediate
+            else
+              Inc(CurPC);
+          end;
         49: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
-          if (not ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2])) or
-             (FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] = 0) then
-            CurPC := Instr^.Immediate
-          else
-            Inc(CurPC);
+          begin
+            ArrIdxW := ArrMapP[Instr^.Src1];
+            if (not ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2])) or
+               (FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] = 0) then
+              CurPC := Instr^.Immediate
+            else
+              Inc(CurPC);
+          end;
 
         // Array Reverse Range - sub-opcode 156
         50: // bcArrayReverseRange: reverse arr[start..end-1] in-place
           begin
             LStartIdx := IntRegs[Instr^.Src2];
             LEndIdx := IntRegs[Instr^.Dest] - 1;
-            ArrIdxW := Instr^.Src1;
+            ArrIdxW := ArrMapP[Instr^.Src1];
             // Bounds-guard the contiguous range once (endpoints valid => interior valid); skip if OOB (MODERN).
             if (LStartIdx < LEndIdx) and
                (not ArrayBoundsOK(ArrIdxW, LStartIdx) or not ArrayBoundsOK(ArrIdxW, LEndIdx)) then
@@ -607,7 +710,7 @@ begin
           begin
             LStartIdx := IntRegs[Instr^.Src2];
             LEndIdx := IntRegs[Instr^.Dest];
-            ArrIdxW := Instr^.Src1;
+            ArrIdxW := ArrMapP[Instr^.Src1];
             // Bounds-guard the touched range [start .. end+1] once; skip the whole rotate if OOB (MODERN).
             if ArrayBoundsOK(ArrIdxW, LStartIdx) and ArrayBoundsOK(ArrIdxW, LEndIdx + 1) then
             begin
@@ -626,12 +729,13 @@ begin
         // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip if either index OOB (MODERN); CLASSIC raises.
         55: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
           begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) and
-               ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Dest]) then
+            ArrIdxW := ArrMapP[Instr^.Src1];   // once: this arm named the id five times
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) and
+               ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Dest]) then
             begin
-              Ctx.SwapTempInt := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]];
-              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Dest]];
-              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Dest]] := Ctx.SwapTempInt;
+              Ctx.SwapTempInt := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]];
+              FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Dest]];
+              FArrays[ArrIdxW].IntData[IntRegs[Instr^.Dest]] := Ctx.SwapTempInt;
             end;
             Inc(CurPC);
           end;
@@ -642,8 +746,9 @@ begin
 
         // Array Load to register (Int) - sub-opcode 253. Bounds-guarded: OOB read = default 0 (MODERN); CLASSIC raises.
         58: begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              IntRegs[Instr^.Dest] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
+            ArrIdxW := ArrMapP[Instr^.Src1];
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+              IntRegs[Instr^.Dest] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]]
             else
               IntRegs[Instr^.Dest] := 0;
             Inc(CurPC);
@@ -651,24 +756,27 @@ begin
 
         // Array Copy Element - sub-opcode 254. Bounds-guarded: OOB store dropped, OOB source reads 0 (MODERN); CLASSIC raises.
         59: begin
-            if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src2]) then
+            ArrIdxW := ArrMapP[Instr^.Dest];   // destination array
+            ArrIdxW2 := ArrMapP[Instr^.Src1];  // source array
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
             begin
-              if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
+              if ArrayBoundsOK(ArrIdxW2, IntRegs[Instr^.Src2]) then
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW2].IntData[IntRegs[Instr^.Src2]]
               else
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := 0;
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := 0;
             end;
             Inc(CurPC);
           end; // bcArrayCopyElement
 
         // Array Move Element - sub-opcode 255. Bounds-guarded like 254.
         60: begin
-            if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src2]) then
+            ArrIdxW := ArrMapP[Instr^.Dest];
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
             begin
-              if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src1]) then
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src1]]
+              if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src1]) then
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src1]]
               else
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := 0;
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := 0;
             end;
             Inc(CurPC);
           end; // bcArrayMoveElement
@@ -695,11 +803,35 @@ begin
         // superinstruction set was inline. One delegated instruction still replaces two.
         52: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
-        // "acc += tab[Asc(MID$(s,i,1))+1]" fused whole - sub-opcode 159. Delegated for the same
-        // reason as 158. ⛔ THIS LINE is the one an opcode addition forgets: the arm in
+        // "acc += tab[Asc(MID$(s,i,1))+1]" fused whole - sub-opcode 159. ⛔ THIS LINE is the one an
+        // opcode addition forgets: the arm in
         // ExecuteSuperinstruction compiles fine on its own and is simply never reached, and the
         // program dies at RUNTIME with "Unknown superinstruction sub-opcode".
-        53: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+        // ⭐ FAST LANE, and only the fast lane. SUPER_DIAG=1 over the benchmark corpus counted
+        // 25 000 000 nested dispatches and 324 for everything else put together: sub-opcode 53 IS
+        // the nested dispatch, because it is the inner loop of reverse-complement. Measured net cost
+        // 34 ns per character, against ~12 ns of second dispatch by the figures in the note that
+        // flattened the arithmetic superinstructions.
+        //
+        // ⛔ What is NOT done here is inlining the BODY, and the note above says why: doing that for
+        // the whole superinstruction set made every program slower. So only the common case lands
+        // here - index inside the source, table long enough - and every edge (index out of range,
+        // dialect clamp, short table) still goes to ExecuteSuperinstruction, which keeps the two
+        // arms from drifting on the cases that are hard to get right.
+        53: begin
+              S53Pos := Ctx.IntRegs[Instr^.Immediate and $FFFF];
+              if (S53Pos >= 1) and (S53Pos <= Length(Ctx.StringRegs[Instr^.Src1])) then
+              begin
+                S53Idx := Ord(Ctx.StringRegs[Instr^.Src1][S53Pos]) + 1;
+                if S53Idx <= Length(Ctx.StringRegs[Instr^.Src2]) then
+                begin
+                  AppendChar(Ctx.StringRegs[Instr^.Dest], Ctx.StringRegs[Instr^.Src2][S53Idx]);
+                  Inc(CurPC);
+                end
+                else begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+              end
+              else begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
+            end;
 
         // "MID$(t, start [, len]) = src" in place - sub-opcode 160. Delegated for the same reason.
         54: begin Ctx.PC := CurPC; ExecuteSuperinstruction(Ctx, Instr^); CurPC := Ctx.PC + 1; end;

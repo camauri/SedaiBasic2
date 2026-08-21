@@ -920,6 +920,20 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      // ARGUMENT-SLOT FORWARDING - immediately after inlining, and only useful there. Inlining
+      // splices the callee's body in but leaves the argument protocol around it: the arguments are
+      // staged into the transfer bank and read straight back out, with no call in between any more.
+      // Measured on a three-statement SUB in a hot loop: five instructions of fourteen, and 52% of
+      // the running time against the same statements written inline by hand.
+      try
+        SSAProgram.RunXferForwarding;
+      except
+        on E: Exception do
+        begin
+          WriteLn('ERROR: Xfer forwarding failed: ', E.Message);
+          WriteLn('Continuing...');
+        end;
+      end;
       {$ENDIF}
 
       {$IFNDEF DISABLE_DBE}
@@ -2364,6 +2378,7 @@ var
   i: Integer;
   Param: string;
   VerifyMsg: string;
+  VerifyI: Integer;
 
 begin
   try
@@ -2405,6 +2420,18 @@ begin
         WriteLn('opcode-table OK: ', VerifyMsg)
       else
         WriteLn('opcode-table FAIL: ', VerifyMsg);
+      Halt(0);
+    end;
+
+    // Every opcode the compiler can emit, with the name the disassembler would print for it. One line
+    // per opcode, sorted by code. Diagnostic only -- but it is also the NET for any change to how
+    // names are produced: capture it before, capture it after, and require the diff to contain only
+    // the lines you meant to change.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--dump-opnames') then
+    begin
+      for VerifyI := 0 to OPCODE_LIST_COUNT - 1 do
+        WriteLn(Format('$%.4X %s', [OPCODES[VerifyI],
+                       BytecodeOpToString(TBytecodeOp(OPCODES[VerifyI]))]));
       Halt(0);
     end;
 

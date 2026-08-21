@@ -272,6 +272,12 @@ type
                                          // element access computes the linear index from RUNTIME dimensions
                                          // (push/resolve), since REDIM changes the strides; others stay const-folded.
     FDynamicArrays: TStringList;         // array names (UPPER) that are dynamic (declared empty "()" or a REDIM
+    // Fra gli array DINAMICI, quelli in cui OGNI Dim/ReDim del programma dichiara il limite
+    // inferiore come lo zero LETTERALE (o lo omette, che vuol dire zero). Per questi l'accesso non
+    // deve sottrarre niente: vedi UsesRuntimeLBound. Un array esce da qui appena UNA sola
+    // dichiarazione usa un'altra forma - una costante diversa, un'espressione, LBOUND(altro).
+    FZeroLbArrays: TStringList;
+    FZeroLbPoisoned: TStringList;   // nomi visti almeno una volta con un limite NON zero
                                          // target) → their lower bound can change at run time, so element access
                                          // subtracts the RUNTIME lower bound (bcArrayLBound) instead of the DIM one.
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
@@ -376,6 +382,8 @@ type
     function MemberArrayArgHandle(MemberNode: TASTNode; Emit: Boolean; out HandleReg: TSSAValue): Boolean;
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
     function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
+    function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
+                                const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
@@ -499,6 +507,7 @@ type
     function IsRawReturnExpr(Node: TASTNode): Boolean;                          // a FUNCTION-return expr that yields a raw byte-heap pointer?
     procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
     procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
+    function DeclLowerBoundKind(Decl: TASTNode): Integer;
     procedure CollectDynamicArrays(Node: TASTNode);                             // pre-scan: dynamic arrays (empty-declared / REDIM target)
     function UsesRuntimeLBound(ArrayIdx: Integer; const ArrName: string): Boolean;  // access subtracts the runtime lower bound?
     function ResolveArrayElementTarget(TargetNode: TASTNode; const ArrName: string;
@@ -1127,6 +1136,8 @@ begin
   FRedimMultiArrays := TStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
   FDynamicArrays := TStringList.Create;
+  FZeroLbArrays := TStringList.Create;
+  FZeroLbPoisoned := TStringList.Create;
   FDynamicArrays.CaseSensitive := False;
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
@@ -1218,6 +1229,8 @@ begin
   FWStringVars.Free;
   FRedimMultiArrays.Free;
   FDynamicArrays.Free;
+  FZeroLbArrays.Free;
+  FZeroLbPoisoned.Free;
   FFixedLenVars.Free;
   FZStringVars.Free;
   FByrefRetFuncs.Free;
@@ -9150,7 +9163,7 @@ begin
     begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
-      ArrayIdx := FProgram.DeclareArray(DeclArrName, ElementType, Dimensions);
+      ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
@@ -9317,7 +9330,7 @@ begin
     end;
 
     // Declare array in SSA program
-    ArrayIdx := FProgram.DeclareArray(DeclArrName, ElementType, Dimensions);
+    ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -25480,13 +25493,47 @@ begin
     CollectRedimMultiArrays(Node.GetChild(i));
 end;
 
+function TSSAGenerator.DeclLowerBoundKind(Decl: TASTNode): Integer;
+// Cosa dice QUESTA dichiarazione sul limite inferiore dell'array?
+//    1 = ogni dimensione parte da ZERO, dimostrato:
+//        - una dimensione scritta come semplice limite superiore ("a(n)") parte da zero per
+//          definizione del dialetto;
+//        - una antDimRange il cui limite inferiore e' il LETTERALE 0 ("a(0 To n-1)").
+//   -1 = almeno una dimensione parte da altro, o da qualcosa che non e' un letterale (una
+//        costante diversa, un'espressione, LBOUND(altro)): il limite va letto a run time.
+//    0 = la dichiarazione non dice niente ("Dim a()"): saranno i REDIM a dirlo.
+//
+// ⛔ Volutamente NON piega espressioni: un letterale o niente. Piegare qui vorrebbe dire
+// rifare il lavoro che la dichiarazione fa gia' piu' avanti, con due copie che possono divergere -
+// ed e' esattamente la forma di difetto che questo progetto paga di piu'.
+var
+  Dims, D, Lo: TASTNode;
+  i: Integer;
+begin
+  Result := 0;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  Dims := Decl.GetChild(1);
+  if (Dims = nil) or (Dims.NodeType <> antDimensions) or (Dims.ChildCount = 0) then Exit;
+  for i := 0 to Dims.ChildCount - 1 do
+  begin
+    D := Dims.GetChild(i);
+    if D = nil then Exit(-1);
+    if D.NodeType <> antDimRange then Continue;        // solo limite superiore -> parte da zero
+    if D.ChildCount < 1 then Exit(-1);
+    Lo := D.GetChild(0);
+    if (Lo = nil) or (Lo.NodeType <> antLiteral) then Exit(-1);
+    if VarToStr(Lo.Value) <> '0' then Exit(-1);
+  end;
+  Result := 1;
+end;
+
 procedure TSSAGenerator.CollectDynamicArrays(Node: TASTNode);
 // Pre-scan: record every DYNAMIC array — one declared empty ("DIM/REDIM x()") or that is the target of any
 // REDIM. Such an array's lower bound is a run-time property (a REDIM "lb TO ub" can change it, and a ByRef
 // writeback can carry a changed bound back to the caller's array), so its element access must subtract the
 // current lower bound rather than the one fixed at DIM time.
 var
-  i, k: Integer;
+  i, k, k2: Integer;
   Decl, Dims: TASTNode;
   Nm: string;
 begin
@@ -25509,6 +25556,23 @@ begin
       end;
       Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
       if FDynamicArrays.IndexOf(Nm) < 0 then FDynamicArrays.Add(Nm);
+      // ...e SEPARATAMENTE: questa dichiarazione lascia il limite inferiore a ZERO?
+      // Zero vuol dire "nessun aggiustamento da fare sull'indice", che e' il caso comune di gran
+      // lunga (ReDim a(n) e ReDim a(0 To n-1) sono entrambi zero). La regola e' per NOME e per
+      // PROGRAMMA: basta una dichiarazione di forma diversa - un'altra costante, un'espressione,
+      // LBOUND(altro) - e il nome esce dall'insieme e si torna al limite letto a run time.
+      // ⛔ Conservativa per costruzione: si ENTRA solo dimostrando lo zero su OGNI dimensione, si
+      // ESCE al primo dubbio, e chi non e' mai entrato non ci finisce.
+      case DeclLowerBoundKind(Decl) of
+        1: if (FZeroLbArrays.IndexOf(Nm) < 0) and (FZeroLbPoisoned.IndexOf(Nm) < 0) then
+             FZeroLbArrays.Add(Nm);
+       -1: begin
+             if FZeroLbPoisoned.IndexOf(Nm) < 0 then FZeroLbPoisoned.Add(Nm);
+             k2 := FZeroLbArrays.IndexOf(Nm);
+             if k2 >= 0 then FZeroLbArrays.Delete(k2);
+           end;
+        // 0 = la dichiarazione non dice niente sui limiti ("Dim a()"): non e' una prova ne' un veto.
+      end;
     end;
   for i := 0 to Node.ChildCount - 1 do
     CollectDynamicArrays(Node.GetChild(i));
@@ -25523,8 +25587,27 @@ var
   Info: TSSAArrayInfo;
   d: Integer;
 begin
-  Result := IsArrayParamSlot(ArrayIdx) or (FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0);
+  // Un array PARAMETRO alias quello del chiamante: il limite e' suo e si legge a run time. Punto.
+  Result := IsArrayParamSlot(ArrayIdx);
   if Result then Exit;
+  // ⭐ Essere DINAMICO non basta piu' a condannare l'accesso al limite letto a run time. Un REDIM
+  // puo' cambiare il limite SUPERIORE - ed e' quasi sempre l'unica cosa che cambia - mentre quello
+  // INFERIORE resta lo zero scritto nel sorgente. FZeroLbArrays contiene i nomi per cui OGNI
+  // Dim/ReDim del programma dichiara zero (vedi DeclLowerBoundKind); per quelli l'aggiustamento
+  // dell'indice non serve, e il ramo costante qui sotto non emette nulla perche' il limite e' 0.
+  //
+  // 📊 Perche' e' stato fatto (20 ago 2026): letto il bytecode di checkTree in binary-trees, SEI
+  // istruzioni su VENTIQUATTRO per nodo se ne andavano in ArrayLBound + SubInt, TRE VOLTE, per
+  // ricavare uno zero scritto nel ReDim. Nel corpus: 501 ArrayLBound su 33 496 istruzioni.
+  //
+  // SB_NO_ZEROLB=1 ripristina il comportamento precedente (ogni array dinamico legge il limite a
+  // run time), cosi' l'A/B vive su UN binario solo.
+  if FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0 then
+  begin
+    Result := (FZeroLbArrays.IndexOf(UpperCase(ArrName)) < 0) or
+              (GetEnvironmentVariable('SB_NO_ZEROLB') = '1');
+    if Result then Exit;
+  end;
   if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
   begin
     Info := FProgram.GetArray(ArrayIdx);
@@ -26497,6 +26580,8 @@ var
   UDTIdx: Integer;
   RcHandle, AddrVal: TSSAValue;
   Resolved: string;
+  IsFunc: Boolean;
+  Decl: TASTNode;
 begin
   // An OVERLOADED name has no bare label -- every member of the set carries a "~<sig>" suffix -- so pick
   // the one whose parameter banks match these arguments. A name declared once resolves to itself.
@@ -26541,9 +26626,35 @@ begin
   else
   begin
     EmitProcedureCall(Name, ArgsNode);
-    FuncRetType := GetVariableType(Name);
-    Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
-    EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+    // ⛔ A SUB HAS NO RESULT, AND READING ONE IS NOT HARMLESS. This routine lowers calls to both
+    // FUNCTION and SUB, and it used to read the result slot for either. For a SUB the bank came from
+    // GetVariableType on a name with no type suffix - which in BASIC means FLOAT - so every call to
+    // a SUB emitted an XferLoadFloat of a slot the callee never wrote.
+    //
+    // Dead, but not free: BuildProcFrameBases decides a procedure may use the FAST frame only if it
+    // touches neither the float nor the string bank, and that one instruction says it touches float.
+    // On binary-trees-modern, freeTree is pure integer code called ONCE PER NODE and was reported by
+    // FRAMEBASE_DIAG=1 as "relocatable but NOT fast (copies float/string)" - because of this. Same
+    // for worker. It is the shape an-unaudited-opcode-costs-the-fast-frame already records: an
+    // instruction that does nothing still disqualifies the procedure that contains it.
+    //
+    // So a SUB yields int 0, exactly as the indirect-call path above already does for a SUB pointer
+    // used as a value; LoadConstInt is pure, so DCE removes it when the value is unused.
+    IsFunc := True;
+    if FProcDecls.TryGetValue(UpperCase(Name), Decl) and Assigned(Decl) then
+      IsFunc := UpperCase(VarToStr(Decl.Value)) = kFUNCTION;
+    if IsFunc then
+    begin
+      FuncRetType := GetVariableType(Name);
+      Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+      EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+    end
+    else
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end;
 end;
 
@@ -28314,6 +28425,25 @@ begin
   Result := '@P@' + ProcName + '@' + ParamName;
 end;
 
+function TSSAGenerator.DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
+                                          const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
+// DeclareArray, plus the one thing DeclareArray cannot know: whether the slot it just created belongs
+// to a PROCEDURE. A proc-local array (not SHARED, not STATIC) needs one storage per THREAD, and this is
+// the only point in the pipeline where the scope is still in hand.
+// ⛔ Only a NEWLY CREATED slot is marked. DeclareArray REUSES a slot when the name already exists
+// (REDIM semantics), and a REDIM inside a SUB of a module array must not turn that module array
+// private - which would give every thread its own copy of a shared global.
+var
+  Prev: Integer;
+begin
+  Prev := FProgram.GetArrayCount;
+  Result := FProgram.DeclareArray(AName, ET, Dims);
+  if (Result >= Prev) and FInProcedure and
+     (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+     (ArrayDeclNode.Attributes.Values['STATIC'] <> '1') then
+    FProgram.SetArrayPrivate(Result);
+end;
+
 function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string;
 // Per-proc name for a LOCAL array (a DIM inside a SUB/FUNCTION) that shadows a module array of the same
 // name. Without this the local's DeclareArray would reuse the module array's slot (REDIM semantics),
@@ -28369,7 +28499,12 @@ begin
         ET := GetVariableType(PName);
       end;
       if FProgram.FindArray(MangledName) < 0 then
-        FProgram.DeclareArray(MangledName, ET, [0]);   // placeholder; overwritten by bind at each call
+        // ⛔ PRIVATE, like any other proc-local array. The placeholder is the slot bcArrayBind aliases
+        // to the caller's array for the duration of the call: one slot for the whole program meant two
+        // threads inside the same SUB aliased the SAME slot and each saw the other's argument
+        // (job/tests/bas/probe_thread_array_param.bas). It is per-procedure by construction, so there
+        // is no case in which it may be shared.
+        FProgram.SetArrayPrivate(FProgram.DeclareArray(MangledName, ET, [0]));
       // Array-of-UDT parameter "p() As SomeType": record the element UDT under the placeholder's mangled
       // name so element access (p(i), p(i).field, Swap p(i),p(j)) is recognized as an array-of-UDT. The
       // aliased caller array already holds a record handle per element, so the placeholder allocates none.
