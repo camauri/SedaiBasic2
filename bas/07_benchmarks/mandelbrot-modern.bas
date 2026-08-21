@@ -140,13 +140,21 @@ For y As Integer = 0 To N - 1
   bits(idx) = bits(idx) And m
 Next y
 
+'' A 256-byte table so the row loop below becomes "acc += tab[byte]", which the pipeline fuses into
+'' the single bcStrAppendMapped instruction. Written as "row += Chr(b)" the same loop is three
+'' opcodes and a one-character temporary per byte, and for N=8000 that is 8 M of them - measured at
+'' 46% of the whole program, more than the parallel computation it follows.
+Dim As String allBytes = Space(256)
+For i As Integer = 0 To 255
+  Mid(allBytes, i + 1, 1) = Chr(i)
+Next i
 Print "P4"; Chr(10);
 Print Str(N); " "; Str(N); Chr(10);
 For y As Integer = 0 To N - 1
   Dim As String row = ""
   Dim As Integer rowBase = y * bytesPerRow
   For bx As Integer = 0 To bytesPerRow - 1
-    row += Chr(bits(rowBase + bx))
+    row += Mid(allBytes, bits(rowBase + bx) + 1, 1)
   Next bx
   Print row;
 Next y
