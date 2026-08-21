@@ -26578,6 +26578,8 @@ var
   UDTIdx: Integer;
   RcHandle, AddrVal: TSSAValue;
   Resolved: string;
+  IsFunc: Boolean;
+  Decl: TASTNode;
 begin
   // An OVERLOADED name has no bare label -- every member of the set carries a "~<sig>" suffix -- so pick
   // the one whose parameter banks match these arguments. A name declared once resolves to itself.
@@ -26622,9 +26624,35 @@ begin
   else
   begin
     EmitProcedureCall(Name, ArgsNode);
-    FuncRetType := GetVariableType(Name);
-    Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
-    EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+    // ⛔ A SUB HAS NO RESULT, AND READING ONE IS NOT HARMLESS. This routine lowers calls to both
+    // FUNCTION and SUB, and it used to read the result slot for either. For a SUB the bank came from
+    // GetVariableType on a name with no type suffix - which in BASIC means FLOAT - so every call to
+    // a SUB emitted an XferLoadFloat of a slot the callee never wrote.
+    //
+    // Dead, but not free: BuildProcFrameBases decides a procedure may use the FAST frame only if it
+    // touches neither the float nor the string bank, and that one instruction says it touches float.
+    // On binary-trees-modern, freeTree is pure integer code called ONCE PER NODE and was reported by
+    // FRAMEBASE_DIAG=1 as "relocatable but NOT fast (copies float/string)" - because of this. Same
+    // for worker. It is the shape an-unaudited-opcode-costs-the-fast-frame already records: an
+    // instruction that does nothing still disqualifies the procedure that contains it.
+    //
+    // So a SUB yields int 0, exactly as the indirect-call path above already does for a SUB pointer
+    // used as a value; LoadConstInt is pure, so DCE removes it when the value is unused.
+    IsFunc := True;
+    if FProcDecls.TryGetValue(UpperCase(Name), Decl) and Assigned(Decl) then
+      IsFunc := UpperCase(VarToStr(Decl.Value)) = kFUNCTION;
+    if IsFunc then
+    begin
+      FuncRetType := GetVariableType(Name);
+      Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+      EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+    end
+    else
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
   end;
 end;
 
