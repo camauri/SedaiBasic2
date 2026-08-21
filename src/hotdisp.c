@@ -37,14 +37,30 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
 #define HF_MODERN_ARRAYS 1
 #define HF_MODERN_CONV   2
 
-/* THE list. One entry per arm, and it drives three things that used to be maintained separately:
+/* ⛔ THE ORDER OF THIS LIST COSTS REAL TIME, AND THERE IS NO RULE FOR IT - ONLY MEASUREMENT.
+   The arms are indirect-jump targets, so where each one LANDS matters. Adding the four record
+   entries cost fannkuch-redux 12% (1.345 -> 1.507 s at N=10) although it touches no record at all:
+   bisecting the binaries put the loss at exactly that commit, and switching the C loop off collapsed
+   the gap to +2.3%, so it is layout and nothing else.
+
+   ⛔ AND THE FIRST ATTEMPT TO FIX IT MEASURED A LIE. Moving the four entries to the END read as
+   spectral-norm +17.4%, n-body +11.9%, fannkuch +5.8% - so "append instead of insert" looked
+   decisively wrong. It was not: the edit that moved them had also DROPPED
+   X(0xC831, ArrayLoadIntBranchZ) from the list, taking an opcode out of the C loop entirely, and
+   that is what those numbers measured. The list went from 95 entries to 94 and nothing complained -
+   a name with no arm is a compile error, an ARM WITH NO NAME is silent. Caught by diffing the
+   generated .text against HEAD, which is the check worth keeping for any edit to this list.
+   Re-run with all 95 present, appending is slightly BETTER on three of four (fannkuch -1.6%,
+   binary-trees -1.0%, spectral-norm -0.9%, n-body +0.2%), and that is the arrangement below.
+
+   -falign-labels=32 was swept the same way against none/16/64 and wins on all three programs, so
+   that one stays. ⇒ Do not reason about this list's order: change it only with an A/B in hand, on
+   more than one program - and diff the .text to be sure the A/B is comparing what you think.
+
+   THE list. One entry per arm, and it drives three things that used to be maintained separately:
    the opcode table handed to the Pascal side, the dispatch table, and the label each arm carries.
    A name in the list with no matching arm is a COMPILE error, which is the point. */
 #define HOT_OP_LIST \
-  X(0x0068, RecordLoadInt         ) \
-  X(0x0069, RecordLoadFloat       ) \
-  X(0x006B, RecordStoreInt        ) \
-  X(0x006C, RecordStoreFloat      ) \
   X(0x0000, LoadConstInt          ) \
   X(0x0003, CopyInt               ) \
   X(0x0008, AddInt                ) \
@@ -135,7 +151,12 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
   X(0xC83A, ArrayLoadIntTo        ) \
   X(0xC81E, ArrayStoreIntConst    ) \
   X(0xC830, ArrayLoadIntBranchNZ  ) \
-  X(0xC831, ArrayLoadIntBranchZ   )
+  X(0xC831, ArrayLoadIntBranchZ   ) \
+  X(0x0068, RecordLoadInt         ) \
+  X(0x0069, RecordLoadFloat       ) \
+  X(0x006B, RecordStoreInt        ) \
+  X(0x006C, RecordStoreFloat      )
+
 
 
 #define X(hex, name) hex,
