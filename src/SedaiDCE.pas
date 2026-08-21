@@ -398,6 +398,7 @@ begin
     ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
     ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow,
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
+    ssaScreenLock, ssaScreenUnlock,   // the frame boundary IS the effect: never dead
     // GETMOUSE snapshot / SETMOUSE mutate external state; __MOUSEAXIS reads the mutable cache and must
     // keep program order with the snapshot (no reorder/CSE) -> all three are treated as side-effecting.
     // GETJOYSTICK snapshot + __JOYBTN/__JOYAXIS cache reads follow the same rule. (STICK/STRIG are pure

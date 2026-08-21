@@ -366,6 +366,13 @@ type
     ssaScnClr,         // SCNCLR [mode]: Clear screen (text or graphics)
     ssaGfxScreenRes,   // SCREENRES w,h (FreeBASIC graphics, via IGraphicsBackend)
     ssaGfxScreenPtr,   // SCREENPTR: raw pointer to the working page's framebuffer
+    // SCREENLOCK / SCREENUNLOCK. Until 22 Aug 2026 both were parsed and DISCARDED, and the VM had to
+    // GUESS where a frame ended by watching for a full-screen filled box. A guess cannot be right for
+    // a program that clears with Cls, draws to an image, or repaints only part of the screen - and
+    // when it is wrong the window presents mid-draw, which is exactly what tearing is. These two carry
+    // no operands: their whole content is WHEN they occur.
+    ssaScreenLock,
+    ssaScreenUnlock,
   ssaGfxImageConvertRow,  // IMAGECONVERTROW(src,src_bpp,dst,dst_bpp,width[,isrgb]): convert one pixel row
     ssaGfxDrawGML,     // DRAW "..." : FreeBASIC graphics-macro-language string (Src1 = string)
     // DRAW STRING [img,] (x,y), text [,colour] : text INTO the drawing surface, from the built-in 8x8

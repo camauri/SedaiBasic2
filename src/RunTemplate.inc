@@ -883,7 +883,10 @@ begin
       {$ENDIF}
       // ⚠️ 65, not 64: bcGfxDrawString. This range has NO compile-time check of any kind - leave it too
       // narrow and everything builds, then the program dies at run time with "Unknown/illegal opcode".
-      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 65:
+      // ⛔ THE UPPER BOUND IS WRITTEN OUT AND NOTHING CHECKS IT. It was 65 until SCREENLOCK and
+      // SCREENUNLOCK became real opcodes (subs 66/67), and the failure is not a compile error - it is
+      // "Unknown/illegal opcode $0A42" the first time a program executes one.
+      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 67:
         begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;

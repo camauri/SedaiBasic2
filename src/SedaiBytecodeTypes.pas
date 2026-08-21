@@ -816,6 +816,13 @@ const
   // mechanism the compactor already understands, and bcGfxCircleEx / bcGfxLineStyled already use it.
   // The image target rides on the bcGfxSetTarget pair, so there is no surface operand.
   bcGfxDrawString   = bcGroupGraphics + 65;
+  // FreeBASIC SCREENLOCK / SCREENUNLOCK - the frame boundary, made explicit. No operands at all.
+  // ⛔ These two grew group 10 from 66 to 68, which pushes DENSE_SOUND_BASE, DENSE_BIGINT_BASE,
+  // DENSE_SUPER_BASE and DENSE_TOTAL up by two in BOTH branches of SedaiOpcodeTable.pas. Nothing
+  // checks that at compile time; `sb --verify-opcodes` is what says so, and it prints the right
+  // numbers when they are wrong.
+  bcGfxScreenLock   = bcGroupGraphics + 66;
+  bcGfxScreenUnlock = bcGroupGraphics + 67;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -2382,6 +2389,8 @@ begin
         62: Result := 'GfxLineStyled';
         64: Result := 'GfxImageConvertRow';
         65: Result := 'GfxDrawString';
+        66: Result := 'GfxScreenLock';
+        67: Result := 'GfxScreenUnlock';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

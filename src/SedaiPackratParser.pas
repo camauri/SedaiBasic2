@@ -5397,7 +5397,14 @@ begin
     Result := TASTNode.Create(antScreenInfo, Token)
   else if (CmdName = 'SCREENLOCK') or (CmdName = 'SCREENUNLOCK') or
           (CmdName = 'SCREENSYNC') or (CmdName = 'WINDOWTITLE') then
-    Result := TASTNode.Create(antGfxNop, Token)
+  begin
+    // ⛔ SCREENLOCK and SCREENUNLOCK are NOT nops any more (22 Aug 2026): they are the frame
+    // boundary, and the windowed presenter needs it. The node type stays antGfxNop so the argument
+    // skipping below is shared; which of the four it is rides on the attribute. SCREENSYNC and
+    // WINDOWTITLE really are accept-and-ignore.
+    Result := TASTNode.Create(antGfxNop, Token);
+    Result.Attributes.Values['NOP'] := CmdName;
+  end
   else if CmdName = 'SCREENSET' then
   begin
     Result := TASTNode.Create(antScreenSet, Token);

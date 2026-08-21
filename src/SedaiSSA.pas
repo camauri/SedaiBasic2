@@ -29339,7 +29339,15 @@ begin
     antViewPrint: ProcessViewPrint(Node);
     antGfxScreen: ProcessGfxScreen(Node);
     antGfxSetmouse: ProcessGfxSetmouse(Node);
-    antGfxNop: ;  // SCREENLOCK/UNLOCK/SYNC/WINDOWTITLE: accept-and-ignore (no code emitted)
+    antGfxNop:
+      // SCREENSYNC and WINDOWTITLE stay accept-and-ignore; the two LOCK forms emit, because they are
+      // the only statement in the language that says "the picture is finished" - see ssaScreenLock.
+      if Node.Attributes.Values['NOP'] = 'SCREENLOCK' then
+        EmitInstruction(ssaScreenLock, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+      else if Node.Attributes.Values['NOP'] = 'SCREENUNLOCK' then
+        EmitInstruction(ssaScreenUnlock, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     antColor: ProcessColor(Node);
     antSetColor: ProcessSetColor(Node);
     antWidth: ProcessWidth(Node);

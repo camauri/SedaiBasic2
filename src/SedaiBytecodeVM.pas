@@ -466,6 +466,11 @@ type
     FPresentCadenceMs: LongWord;
     FLastPresentTick: QWord;
     FFrameBoundarySeen: Boolean;   // the program repaints the whole screen: use that, not the clock
+    // SCREENLOCK / SCREENUNLOCK depth. While positive the picture in the buffer is HALF DRAWN and must
+    // not be shown: that is the whole definition of the statement, and it is what the clock-driven
+    // cadence could never know. Counted rather than flagged so nested locks - a SUB that brackets its
+    // own drawing inside a caller that already did - unwind correctly instead of presenting early.
+    FScreenLockDepth: Integer;
     // SPRDEF modal sprite editor callback (set by the SDL console; nil elsewhere)
     FSpriteEditorCallback: TSpriteEditorCallback;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -1349,6 +1354,7 @@ begin
   FPresentCadenceMs := 0;      // off unless a windowed front end asks for it
   FLastPresentTick := 0;
   FFrameBoundarySeen := False;
+  FScreenLockDepth := 0;
   FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
   // Initialize error state for EL, ER, ERR$
@@ -14213,6 +14219,28 @@ begin
         if (GetX1 >= 0) and (GetX1 <= High(FGfxPages)) and (GetY1 >= 0) and (GetY1 <= High(FGfxPages)) and (GetX1 <> GetY1) then
           FGraphics.Blit(FGfxPages[GetY1], 0, 0, FGfxPages[GetX1], gbmPSet);
       end;
+    66: // bcGfxScreenLock - SCREENLOCK: the frame starts here; suppress every present until it ends.
+      begin
+        Inc(FScreenLockDepth);
+        // A program that locks has TOLD us where its frames end, so the clock-driven guess must stop
+        // guessing - permanently, not just while locked. Leaving it on would present between the
+        // unlock and the next lock, which is a gap of microseconds and produces a flicker that looks
+        // random because it depends on when the 16 ms tick lands.
+        FFrameBoundarySeen := True;
+      end;
+    67: // bcGfxScreenUnlock - SCREENUNLOCK: the picture is finished. Show it, exactly once.
+      begin
+        if FScreenLockDepth > 0 then Dec(FScreenLockDepth);
+        if (FScreenLockDepth = 0) and (FPresentCadenceMs > 0) then
+        begin
+          if Assigned(FEventPollCallback) then
+          begin
+            if FEventPollCallback() then Ctx.Running := False;
+          end
+          else
+            PresentFrame;
+        end;
+      end;
     63: // bcGfxScreenPtr - SCREENPTR: a raw pointer to the working page's framebuffer.
         //  Offset 0 of the framebuffer REGION of the raw-pointer namespace: dereferencing it goes through
         //  the ordinary raw load/store path, which bounds-checks against the surface's byte size. FB
@@ -14527,6 +14555,7 @@ procedure TBytecodeVM.PresentBeforeFullRepaint(Ctx: TExecutionContext; const Ins
 var
   X1, Y1, X2, Y2, W, H: Integer;
 begin
+  if FScreenLockDepth > 0 then Exit;   // inside a lock the boundary is the UNLOCK, not a guess
   if Instr.OpCode <> bcGfxLine then Exit;
   if ((Instr.Immediate shr 48) and $3) <> 2 then Exit;        // not BF: not a filled box
   if not Assigned(FGraphics) then Exit;
@@ -14555,6 +14584,7 @@ procedure TBytecodeVM.MaybePresentCadence(Ctx: TExecutionContext);
 var
   Tick: QWord;
 begin
+  if FScreenLockDepth > 0 then Exit; // ⛔ the picture is half drawn: showing it IS the tearing
   if FFrameBoundarySeen then Exit;   // the program has a real frame boundary; the clock would only
                                      // catch it mid-picture and make it flicker
   // GetTickCount64 reads a shared page on Windows and a monotonic clock on Linux: cheap enough to
