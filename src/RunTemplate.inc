@@ -389,10 +389,14 @@ begin
       // HOTC_DIAG=1: charge this exit to the opcode that caused it. The C loop is only entered when
       // FHotOp[CurPC] <> 0, so wherever it stops is an instruction it does not implement - and the
       // count of stops per opcode is exactly the cost of NOT covering that opcode.
+      // ⛔ COUNT ENTRIES, NOT "INSTRUCTIONS". HotNewPC - CurPC is the PC DISPLACEMENT, and the C loop
+      // executes back edges: it can run an eight-million-iteration BASIC loop and come back with a
+      // displacement of nine. An earlier version of this counter reported that difference as
+      // "instructions executed" and it was wrong by whatever the trip count happened to be.
+      // Entries and per-opcode exits are the two numbers that mean what they say.
       if GHotCDiag then
       begin
         Inc(GHotCCalls);
-        Inc(GHotCSteps, HotNewPC - CurPC);
         if (HotNewPC >= 0) and (HotNewPC < InstrCount) then
           Inc(GHotCExit[Instructions[HotNewPC].OpCode]);
       end;

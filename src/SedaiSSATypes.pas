@@ -733,6 +733,7 @@ type
     function RunAscMidFusion: Integer;      // Asc(Mid(s,i,n)) without building the substring
     function RunGVN: Integer;  // PHASE 3 TIER 2: Run Global Value Numbering optimization (returns replacements count)
     function RunCSE: Integer;  // Common subexpression elimination (returns eliminated count)
+    function RunXferForwarding: Integer;  // forward inlined call-argument slots
     function RunCopyProp: Integer;  // Copy propagation (returns replacement count)
     function RunAlgebraic: Integer;  // Algebraic simplification (returns simplification count)
     function RunStrengthReduction: Integer;  // Strength reduction (returns reduction count)
@@ -814,7 +815,7 @@ implementation
 uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiGVN, SedaiCSE, SedaiCopyProp,
      SedaiAlgebraic, SedaiStrengthReduction, SedaiIndexReduction, SedaiGosubInlining, SedaiConstProp, SedaiConstPropAggressive,
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
-     SedaiSubInlining
+     SedaiSubInlining, SedaiXferForward
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
 
 function DestIsPureDef(Op: TSSAOpCode): Boolean;
@@ -3023,6 +3024,16 @@ begin
   finally
     CSE.Free;
   end;
+end;
+
+function TSSAProgram.RunXferForwarding: Integer;
+// After SUB inlining the argument protocol survives around the spliced body: the arguments are
+// staged into the transfer bank and read straight back, with no call left between the two. See
+// SedaiXferForward for the safety conditions - they are checked, not assumed.
+begin
+  Result := 0;
+  if not GSSAOptimizationsEnabled then Exit;
+  Result := SedaiXferForward.RunXferForward(Self);
 end;
 
 function TSSAProgram.RunCopyProp: Integer;

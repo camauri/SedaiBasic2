@@ -846,7 +846,6 @@ var
   GHotCDiag: Boolean = False;
   GHotCReported: Boolean = False;
   GHotCCalls: Int64 = 0;    // how many times the C loop was entered
-  GHotCSteps: Int64 = 0;    // and how many instructions it ran before handing the PC back
   GHotCExit: array[0..65535] of Int64;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
@@ -16389,8 +16388,7 @@ begin
     for j := i + 1 to High(Idx) do
       if GHotCExit[Idx[j]] > GHotCExit[Idx[i]] then
       begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
-  WriteLn(ErrOutput, '[HOTC] ingressi=', GHotCCalls, '  istruzioni eseguite dal C=', GHotCSteps,
-          '  media per ingresso=', (GHotCSteps / GHotCCalls):0:2);
+  WriteLn(ErrOutput, '[HOTC] ingressi nel ciclo C=', GHotCCalls);
   WriteLn(ErrOutput, '[HOTC] uscite dal ciclo caldo C, per opcode (totale ', Tot, '):');
   for i := 0 to High(Idx) do
     WriteLn(ErrOutput, '[HOTC]   ', GHotCExit[Idx[i]]:12, '  ', OpcodeToString(Word(Idx[i])));
