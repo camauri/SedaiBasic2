@@ -11495,6 +11495,16 @@ var
   SubOp: Word;
   Len, StartPos, Count, EnvIdx, Idx: Integer;
   S, SubStr: string;
+  // ⛔ READ-ONLY ALIAS of a string register. Assigning a register to the local S above is a MANAGED
+  // assignment: a reference count up when it is taken and down when it is replaced, i.e. TWO atomic
+  // read-modify-writes per executed opcode. In a per-character loop that is two atomics per
+  // CHARACTER, and when several threads read the SAME string they are hitting one cache line.
+  // 📊 Measured 21 Aug 2026 on a probe (1 M characters x 20 passes of Asc(Mid(s,i,1))): reading a
+  // SHARED string took 677 ms on one thread and 12 357 ms on eight - EIGHTEEN TIMES WORSE for
+  // eight times the parallelism. The same loop over a shared ARRAY went 90 -> 137 ms.
+  // ⭐ The rule was already written in this file, at bcStrAppendMapped: "Read both strings IN
+  // PLACE". It was true there and lost everywhere else.
+  SP: PString;
   PackInt: Int64;        // B3 serialization scratch (MK*/CV* integer pack/unpack)
   PackSingle: Single;
   PackDouble: Double;
@@ -11709,10 +11719,10 @@ begin
     3: // bcStrRight
       begin
         Len := Ctx.IntRegs[Instr.Src2];
-        S := Ctx.StringRegs[Instr.Src1];
+        SP := @Ctx.StringRegs[Instr.Src1];   // IN PLACE: see the note at SP's declaration
         if Len < 0 then Len := 0;
-        if Len > Length(S) then Len := Length(S);
-        AssignSubstr(Ctx.StringRegs[Instr.Dest], S, Length(S) - Len + 1, Len);
+        if Len > Length(SP^) then Len := Length(SP^);
+        AssignSubstr(Ctx.StringRegs[Instr.Dest], SP^, Length(SP^) - Len + 1, Len);
       end;
     4: // bcStrMid - MID$(s, start, len)
       begin
@@ -11752,7 +11762,7 @@ begin
         // same order, followed by bcStrAsc's "empty yields 0" - the two arms must not drift apart.
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        S := Ctx.StringRegs[Instr.Src1];
+        SP := @Ctx.StringRegs[Instr.Src1];   // IN PLACE: see the note at SP's declaration
         if (StartPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
           Ctx.IntRegs[Instr.Dest] := 0        // FB: a start below 1 is an empty string, not the first char
         else
@@ -11762,22 +11772,22 @@ begin
           begin
             // FB: a negative length means "the rest of the string"; CLASSIC rejects it (length 0).
             if Assigned(FProgram) and FProgram.ModernMode then
-              Count := Length(S) - StartPos + 1
+              Count := Length(SP^) - StartPos + 1
             else
               Count := 0;
             if Count < 0 then Count := 0;
           end;
-          if (Count <= 0) or (StartPos > Length(S)) then
+          if (Count <= 0) or (StartPos > Length(SP^)) then
             Ctx.IntRegs[Instr.Dest] := 0
           else
-            Ctx.IntRegs[Instr.Dest] := Ord(S[StartPos]);
+            Ctx.IntRegs[Instr.Dest] := Ord(SP^[StartPos]);
         end;
       end;
     5: // bcStrAsc
       begin
-        S := Ctx.StringRegs[Instr.Src1];
-        if Length(S) > 0 then
-          Ctx.IntRegs[Instr.Dest] := Ord(S[1])
+        SP := @Ctx.StringRegs[Instr.Src1];   // IN PLACE: see the note at SP's declaration
+        if Length(SP^) > 0 then
+          Ctx.IntRegs[Instr.Dest] := Ord(SP^[1])
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
