@@ -382,6 +382,8 @@ type
     function MemberArrayArgHandle(MemberNode: TASTNode; Emit: Boolean; out HandleReg: TSSAValue): Boolean;
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
     function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
+    function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
+                                const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
@@ -9161,7 +9163,7 @@ begin
     begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
-      ArrayIdx := FProgram.DeclareArray(DeclArrName, ElementType, Dimensions);
+      ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
@@ -9328,7 +9330,7 @@ begin
     end;
 
     // Declare array in SSA program
-    ArrayIdx := FProgram.DeclareArray(DeclArrName, ElementType, Dimensions);
+    ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -28423,6 +28425,25 @@ begin
   Result := '@P@' + ProcName + '@' + ParamName;
 end;
 
+function TSSAGenerator.DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
+                                          const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
+// DeclareArray, plus the one thing DeclareArray cannot know: whether the slot it just created belongs
+// to a PROCEDURE. A proc-local array (not SHARED, not STATIC) needs one storage per THREAD, and this is
+// the only point in the pipeline where the scope is still in hand.
+// ⛔ Only a NEWLY CREATED slot is marked. DeclareArray REUSES a slot when the name already exists
+// (REDIM semantics), and a REDIM inside a SUB of a module array must not turn that module array
+// private - which would give every thread its own copy of a shared global.
+var
+  Prev: Integer;
+begin
+  Prev := FProgram.GetArrayCount;
+  Result := FProgram.DeclareArray(AName, ET, Dims);
+  if (Result >= Prev) and FInProcedure and
+     (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+     (ArrayDeclNode.Attributes.Values['STATIC'] <> '1') then
+    FProgram.SetArrayPrivate(Result);
+end;
+
 function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string;
 // Per-proc name for a LOCAL array (a DIM inside a SUB/FUNCTION) that shadows a module array of the same
 // name. Without this the local's DeclareArray would reuse the module array's slot (REDIM semantics),
@@ -28478,7 +28499,12 @@ begin
         ET := GetVariableType(PName);
       end;
       if FProgram.FindArray(MangledName) < 0 then
-        FProgram.DeclareArray(MangledName, ET, [0]);   // placeholder; overwritten by bind at each call
+        // ⛔ PRIVATE, like any other proc-local array. The placeholder is the slot bcArrayBind aliases
+        // to the caller's array for the duration of the call: one slot for the whole program meant two
+        // threads inside the same SUB aliased the SAME slot and each saw the other's argument
+        // (job/tests/bas/probe_thread_array_param.bas). It is per-procedure by construction, so there
+        // is no case in which it may be shared.
+        FProgram.SetArrayPrivate(FProgram.DeclareArray(MangledName, ET, [0]));
       // Array-of-UDT parameter "p() As SomeType": record the element UDT under the placeholder's mangled
       // name so element access (p(i), p(i).field, Swap p(i),p(j)) is recognized as an array-of-UDT. The
       // aliased caller array already holds a record handle per element, so the placeholder allocates none.

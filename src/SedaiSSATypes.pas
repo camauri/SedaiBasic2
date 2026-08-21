@@ -672,6 +672,12 @@ type
     // everywhere. A compiled backend must not compute UBound natively for such an array: its
     // descriptor carries the total element COUNT, not per-dimension extents.
     MultiDimEver: Boolean;
+    // ⛔ A PROC-LOCAL array (a DIM inside a SUB/FUNCTION that is neither SHARED nor STATIC) must have
+    // ONE STORAGE PER THREAD. Until 21 Aug 2026 it had one storage per PROGRAM - the slot id baked
+    // into the bytecode is a static index into the VM's single array table - so two threads inside the
+    // same SUB overwrote each other. Marked here, at the only place that knows the scope, and carried
+    // through to the VM, which gives every execution context its own block of private slots.
+    IsPrivate: Boolean;
   end;
 
   TSSAProgram = class
@@ -712,6 +718,7 @@ type
     procedure SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
+    procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
     procedure BuildDominatorTree;  // PHASE 3 TIER 2: Build dominator tree for optimizations
@@ -1447,6 +1454,15 @@ begin
     if FArrays[i].Name = SearchName then
       Exit(i);
   Result := -1;
+end;
+
+procedure TSSAProgram.SetArrayPrivate(ArrayIdx: Integer);
+// Mark a slot as proc-local: the VM must give every execution context its own storage for it. Only
+// ever set, never cleared - a slot that is private for one declaration stays private (a REDIM of the
+// same local reuses the slot and must not demote it back to shared storage).
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then
+    FArrays[ArrayIdx].IsPrivate := True;
 end;
 
 function TSSAProgram.GetArray(Index: Integer): TSSAArrayInfo;

@@ -42,6 +42,11 @@ var
   // Local copies of frequently accessed fields for better register allocation
   IntRegs: PInt64;
   FloatRegs: PDouble;
+  // Logical array id -> the physical slot THIS context owns. Aliased like the register banks and for
+  // the same reason: it is on the array arms' critical path. A PROC-LOCAL array has one storage per
+  // context (see TBytecodeVM.BuildPrivateArrayPlan); for every other array the entry is the identity,
+  // which is why this is a load and not a branch.
+  ArrMapP: PInteger;
   NextPC: Integer;          // indirect call target, read before FramePush can slide the view
   ArrayIdx, LinearIdx: Integer;   // used by the HOT typed accessors in ArrayHotOps.inc
   InputStr, PrintStr: string;
@@ -49,7 +54,7 @@ var
   i: Integer;
   NextTabCol, TabIdx: Integer;
   // Local vars for ArrayReverseRange and ArrayShiftLeft
-  ArrIdxW: Word;
+  ArrIdxW, ArrIdxW2: Integer;   // PHYSICAL slot ids: the per-context blocks live past the static space
   LStartIdx, LEndIdx, LLoopIdx: Integer;
   LFirstVal: Int64;
   LElemVal: Double;  // scratch for bounds-guarded array element reads in superinstructions
@@ -146,6 +151,7 @@ begin
   // it (and so does anything that can grow the bank).
   IntRegs := Ctx.IntRegs;
   FloatRegs := @Ctx.FloatRegs[0];
+  if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
   // AOT: bind the compiled-function table and this context's transfer-bank bases (built per
   // Run and passed per call, NEVER baked into code: a worker must see its own banks).
   AotOn := FAotEnabled and (Length(FNativeFuncs) > 0) and
@@ -235,7 +241,7 @@ begin
   HotFlags := 0;
   if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
   if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
-  if HotCOk then HotArrDesc := AcquireArrDesc else HotArrDesc := nil;
+  if HotCOk then HotArrDesc := AcquireArrDescCtx(Ctx) else HotArrDesc := nil;
   // Slots 1, 2, 4 and 5 are layout and never change during a run. Slots 0 and 3 are the two bases,
   // and they are refreshed at every entry below - taking an address costs nothing, and unlike
   // AcquireArrDesc neither of them needs a lock to read.
@@ -279,7 +285,7 @@ begin
       // Through AcquireArrDesc: the flag test, the rebuild and taking the address are one locked
       // step. A compiled loop is entered from every worker, so this arm has the same exposure the
       // AOT arm below documents.
-      ArrDescPtr := AcquireArrDescFast(JitArrDescCache);
+      ArrDescPtr := AcquireArrDescFast(JitArrDescCache, Ctx);
       // AotSettle, not a bare assignment: since J14 a compiled loop can route one instruction through
       // the interpreter, and that helper reports a raised exception or a cleared Running as a NEGATIVE
       // sentinel in the same channel as the exit PC. Resolving it here is what makes ON ERROR / TRAP /
@@ -337,6 +343,7 @@ begin
       // count, because the C loop was handed this stale pointer and wrote through it.
       IntRegs := Ctx.IntRegs;
       FloatRegs := @Ctx.FloatRegs[0];
+      if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
       if (CurPC <> AotFromPC) or (not Ctx.Running) then System.Continue;
     end;
 
@@ -365,7 +372,8 @@ begin
       // before - a lock on the call path took binary-trees from 171 ms to 711. So the pointer is
       // taken ONCE before the loop and refreshed only when the array set actually changed, which is
       // a plain field read on the hot path and the lock only when something really moved.
-      if FArraysDirty then HotArrDesc := AcquireArrDesc;
+      if FArraysDirty or ((FPrivArrCount > 0) and (Ctx.ArrDescGen <> FArrDescGen)) then
+        HotArrDesc := AcquireArrDescCtx(Ctx);
       // The two record bases, re-read per entry. Ctx.Records grows through bcRecordNew, which this
       // loop does not implement - so it can only move while we are OUTSIDE, and re-reading here is
       // exactly enough. The shared table is published only when the per-access lock is off; leaving
@@ -540,9 +548,9 @@ begin
         29: if FloatRegs[Instr^.Src1] <> 0.0 then CurPC := Instr^.Immediate else Inc(CurPC); // bcBranchNeZeroFloat
 
         // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded: OOB store dropped (MODERN), CLASSIC raises.
-        30: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := Instr^.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
-        31: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
-        32: begin if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then FArrays[Instr^.Src1].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
+        30: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := Instr^.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
+        31: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
+        32: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
 
         // Fused loop increment-and-branch (most common in hot loops) - sub-opcodes 90-93
         33: // bcAddIntToBranchLe
@@ -601,23 +609,26 @@ begin
         // Format: Dest, Src1=arr_index, Src2=idx_reg, Immediate=acc_reg
         // Bounds-guarded: an OOB read yields the element default 0.0 (MODERN); CLASSIC raises.
         41: begin // bcArrayLoadAddFloat: dest = acc + arr[idx]
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] + FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
+          ArrIdxW := ArrMapP[Instr^.Src1];
+          if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] + FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]]
           else
             FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         42: begin // bcArrayLoadSubFloat: dest = acc - arr[idx]
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] - FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
+          ArrIdxW := ArrMapP[Instr^.Src1];
+          if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+            FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate] - FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]]
           else
             FloatRegs[Instr^.Dest] := FloatRegs[Instr^.Immediate];
           Inc(CurPC);
         end;
         43: begin // bcArrayLoadDivAddFloat: dest = acc + arr[idx] / denom
           // Extra encodes: acc_reg (low 16) + denom_reg (high 16)
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-            LElemVal := FArrays[Instr^.Src1].FloatData[IntRegs[Instr^.Src2]]
+          ArrIdxW := ArrMapP[Instr^.Src1];
+          if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+            LElemVal := FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]]
           else
             LElemVal := 0.0;
           if Abs(FloatRegs[(Instr^.Immediate shr 16) and $FFFF]) < 1e-300 then
@@ -653,24 +664,30 @@ begin
         // Array Load + Branch - sub-opcodes 140-141. Bounds-guarded: an OOB read is treated as the element
         // default 0 in MODERN (NZ does not branch, Z branches); CLASSIC raises.
         48: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
-          if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) and
-             (FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] <> 0) then
-            CurPC := Instr^.Immediate
-          else
-            Inc(CurPC);
+          begin
+            ArrIdxW := ArrMapP[Instr^.Src1];
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) and
+               (FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] <> 0) then
+              CurPC := Instr^.Immediate
+            else
+              Inc(CurPC);
+          end;
         49: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
-          if (not ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2])) or
-             (FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] = 0) then
-            CurPC := Instr^.Immediate
-          else
-            Inc(CurPC);
+          begin
+            ArrIdxW := ArrMapP[Instr^.Src1];
+            if (not ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2])) or
+               (FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] = 0) then
+              CurPC := Instr^.Immediate
+            else
+              Inc(CurPC);
+          end;
 
         // Array Reverse Range - sub-opcode 156
         50: // bcArrayReverseRange: reverse arr[start..end-1] in-place
           begin
             LStartIdx := IntRegs[Instr^.Src2];
             LEndIdx := IntRegs[Instr^.Dest] - 1;
-            ArrIdxW := Instr^.Src1;
+            ArrIdxW := ArrMapP[Instr^.Src1];
             // Bounds-guard the contiguous range once (endpoints valid => interior valid); skip if OOB (MODERN).
             if (LStartIdx < LEndIdx) and
                (not ArrayBoundsOK(ArrIdxW, LStartIdx) or not ArrayBoundsOK(ArrIdxW, LEndIdx)) then
@@ -691,7 +708,7 @@ begin
           begin
             LStartIdx := IntRegs[Instr^.Src2];
             LEndIdx := IntRegs[Instr^.Dest];
-            ArrIdxW := Instr^.Src1;
+            ArrIdxW := ArrMapP[Instr^.Src1];
             // Bounds-guard the touched range [start .. end+1] once; skip the whole rotate if OOB (MODERN).
             if ArrayBoundsOK(ArrIdxW, LStartIdx) and ArrayBoundsOK(ArrIdxW, LEndIdx + 1) then
             begin
@@ -710,12 +727,13 @@ begin
         // Array Swap (Int) - sub-opcode 250. Bounds-guarded: skip if either index OOB (MODERN); CLASSIC raises.
         55: // bcArraySwapInt: swap arr[idx1] and arr[idx2]
           begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) and
-               ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Dest]) then
+            ArrIdxW := ArrMapP[Instr^.Src1];   // once: this arm named the id five times
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) and
+               ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Dest]) then
             begin
-              Ctx.SwapTempInt := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]];
-              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Dest]];
-              FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Dest]] := Ctx.SwapTempInt;
+              Ctx.SwapTempInt := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]];
+              FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Dest]];
+              FArrays[ArrIdxW].IntData[IntRegs[Instr^.Dest]] := Ctx.SwapTempInt;
             end;
             Inc(CurPC);
           end;
@@ -726,8 +744,9 @@ begin
 
         // Array Load to register (Int) - sub-opcode 253. Bounds-guarded: OOB read = default 0 (MODERN); CLASSIC raises.
         58: begin
-            if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-              IntRegs[Instr^.Dest] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
+            ArrIdxW := ArrMapP[Instr^.Src1];
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
+              IntRegs[Instr^.Dest] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]]
             else
               IntRegs[Instr^.Dest] := 0;
             Inc(CurPC);
@@ -735,24 +754,27 @@ begin
 
         // Array Copy Element - sub-opcode 254. Bounds-guarded: OOB store dropped, OOB source reads 0 (MODERN); CLASSIC raises.
         59: begin
-            if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src2]) then
+            ArrIdxW := ArrMapP[Instr^.Dest];   // destination array
+            ArrIdxW2 := ArrMapP[Instr^.Src1];  // source array
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
             begin
-              if ArrayBoundsOK(Instr^.Src1, IntRegs[Instr^.Src2]) then
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Src1].IntData[IntRegs[Instr^.Src2]]
+              if ArrayBoundsOK(ArrIdxW2, IntRegs[Instr^.Src2]) then
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW2].IntData[IntRegs[Instr^.Src2]]
               else
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := 0;
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := 0;
             end;
             Inc(CurPC);
           end; // bcArrayCopyElement
 
         // Array Move Element - sub-opcode 255. Bounds-guarded like 254.
         60: begin
-            if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src2]) then
+            ArrIdxW := ArrMapP[Instr^.Dest];
+            if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
             begin
-              if ArrayBoundsOK(Instr^.Dest, IntRegs[Instr^.Src1]) then
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src1]]
+              if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src1]) then
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src1]]
               else
-                FArrays[Instr^.Dest].IntData[IntRegs[Instr^.Src2]] := 0;
+                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := 0;
             end;
             Inc(CurPC);
           end; // bcArrayMoveElement
