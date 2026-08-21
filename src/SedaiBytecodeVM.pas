@@ -836,6 +836,18 @@ var
   // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
   // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
   GNoExcFrame: Boolean = True;
+  // HOTC_DIAG=1 counts, per opcode, how many times the C hot loop HANDED THE PC BACK on it - that
+  // is, how often each uncovered opcode SPLITS a hot run. It is the census that answers "which
+  // opcode should get an arm next" with a measurement instead of a hand-written list, which is the
+  // only way that question has ever been answered correctly here: covering the record loads and
+  // stores on 21 Aug was worth 12.7% on binary-trees, and nobody had asked since spectral-norm.
+  // The count is what matters, not the opcode's presence: an uncovered opcode that never lands in
+  // a loop costs nothing at all.
+  GHotCDiag: Boolean = False;
+  GHotCReported: Boolean = False;
+  GHotCCalls: Int64 = 0;    // how many times the C loop was entered
+  GHotCSteps: Int64 = 0;    // and how many instructions it ran before handing the PC back
+  GHotCExit: array[0..65535] of Int64;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
 begin
@@ -1229,6 +1241,7 @@ begin
   // Default ON. SHAREDREC_LOCK=1 puts the per-access lock back, so the two can be timed against each
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
@@ -16346,6 +16359,44 @@ begin
   WriteLn(ErrOutput, '[CALLPROF]   emitted code around the call and is charged to the caller.');
 end;
 
+procedure ReportHotCExits;
+// The HOTC_DIAG census, printed once at shutdown so it covers every engine and every thread that
+// ran. Sorted by count, because the ranking IS the answer: an uncovered opcode that never lands in
+// a loop costs nothing, and one that lands in the innermost loop of a benchmark costs it the whole
+// C loop. Printed to stderr so it never mixes with a program's own output.
+var
+  i, j, n: Integer;
+  Idx: array of Integer;
+  t: Integer;
+  Tot: Int64;
+begin
+  if (not GHotCDiag) or GHotCReported then Exit;
+  GHotCReported := True;
+  SetLength(Idx, 0);
+  Tot := 0;
+  for i := 0 to High(GHotCExit) do
+    if GHotCExit[i] > 0 then
+    begin
+      n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i;
+      Tot := Tot + GHotCExit[i];
+    end;
+  if Length(Idx) = 0 then
+  begin
+    WriteLn(ErrOutput, '[HOTC] nessuna uscita dal ciclo caldo C (ingressi=', GHotCCalls, ')');
+    Exit;
+  end;
+  for i := 0 to High(Idx) - 1 do
+    for j := i + 1 to High(Idx) do
+      if GHotCExit[Idx[j]] > GHotCExit[Idx[i]] then
+      begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
+  WriteLn(ErrOutput, '[HOTC] ingressi=', GHotCCalls, '  istruzioni eseguite dal C=', GHotCSteps,
+          '  media per ingresso=', (GHotCSteps / GHotCCalls):0:2);
+  WriteLn(ErrOutput, '[HOTC] uscite dal ciclo caldo C, per opcode (totale ', Tot, '):');
+  for i := 0 to High(Idx) do
+    WriteLn(ErrOutput, '[HOTC]   ', GHotCExit[Idx[i]]:12, '  ', OpcodeToString(Word(Idx[i])));
+end;
+
+
 initialization
   if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
   if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
@@ -16362,8 +16413,13 @@ initialization
   // STRCAP=0 forces the old SetLength-per-append behaviour, so the two can be timed on ONE binary.
   StrCapacityInit;
   if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
+  AddExitProc(@ReportHotCExits);
 
 finalization
+  // NOT the only place it is called from: see the AddExitProc in the initialization above. A CLASSIC
+  // program ends at END, which halts, and a halt does not always reach unit finalization - so the
+  // census was silent on exactly the programs it was written to measure, and silence read as
+  // "no exits". ReportHotCExits guards itself against running twice.
   AotCallProfReport;
 
 end.

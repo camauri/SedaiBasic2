@@ -646,7 +646,15 @@ if [[ "$HOT_C" == "true" ]]; then
     # -fno-math-errno is REQUIRED, not a tuning knob: without it gcc assumes llrint/sqrt may touch
     # errno and emits CALLS to libm, which a freestanding object linked into an FPC program cannot
     # resolve. With it they are cvtsd2si and sqrtsd, one instruction each.
-    "$CC_BIN" -O2 -ffreestanding -fno-math-errno -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
+    # -falign-labels/-falign-jumps: the dispatch arms are jump targets reached by an indirect jump,
+    # and where each one LANDS in the instruction cache turned out to matter more than what it
+    # contains. Measured 21 Aug 2026: adding four record arms left n-body executing byte-identical
+    # work in the C loop - same entries, same instruction count, verified with HOTC_DIAG=1 - and
+    # still moved it 10%, purely because the later arms shifted. Aligning the labels removes that
+    # sensitivity and pays on its own: n-body -12.0%, spectral-norm -8.5%, binary-trees-arena -2.2%,
+    # binary-trees -0.3%. A layout effect is machine-specific by nature, so re-measure it before
+    # trusting the numbers on a different CPU.
+    "$CC_BIN" -O2 -ffreestanding -fno-math-errno -falign-labels=32 -falign-jumps=32 -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
         echo -e "${RED}ERROR: could not compile src/hotdisp.c${NC}" >&2; exit 1; }
     HOT_C_DEFINE="-dHOT_C"
     fi

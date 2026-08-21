@@ -386,6 +386,16 @@ begin
         HotRecDesc[3] := 0;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
                                 HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0]);
+      // HOTC_DIAG=1: charge this exit to the opcode that caused it. The C loop is only entered when
+      // FHotOp[CurPC] <> 0, so wherever it stops is an instruction it does not implement - and the
+      // count of stops per opcode is exactly the cost of NOT covering that opcode.
+      if GHotCDiag then
+      begin
+        Inc(GHotCCalls);
+        Inc(GHotCSteps, HotNewPC - CurPC);
+        if (HotNewPC >= 0) and (HotNewPC < InstrCount) then
+          Inc(GHotCExit[Instructions[HotNewPC].OpCode]);
+      end;
       if HotNewPC <> CurPC then
       begin
         CurPC := HotNewPC;

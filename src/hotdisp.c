@@ -388,25 +388,40 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
   L_SubIntToBranchGt: ireg[I->dest] -= ireg[I->s1]; pc = (ireg[I->dest] >  ireg[I->s2]) ? (int)I->imm : pc + 1; NEXT;
 
     /* ---- typed array element access. Src1 is the ARRAY ID, Src2 the register holding the index. ---- */
+    /* ⭐ THE FLAG GUARDS THE OUT-OF-BOUNDS CASE, NOT THE ACCESS. These four used to hand the PC back
+       on the very first instruction whenever HF_MODERN_ARRAYS was clear - and that flag is
+       "MODERN dialect AND bounds checking off", so EVERY CLASSIC program lost the C loop at its
+       first array element. In bounds, the two dialects do exactly the same thing through exactly
+       the same descriptor; they differ only when the index is out of range, where MODERN yields
+       zero (or drops the store) and CLASSIC has to RAISE. So the in-bounds path is taken in both,
+       and only the out-of-range case leaves - which is an error path, not a hot one.
+
+       Measured 21 Aug 2026 by HOTC_DIAG=1 over the benchmark corpus: ArrayLoadFloat alone handed
+       the PC back 6.40 M times, 11.2% of all exits, and ArrayLoadInt another 0.91 M - all of it in
+       the CLASSIC programs, spectral-norm.bas and n-body.bas among them. */
+    /* The in-bounds test is ONE unsigned compare: a negative index wraps to a huge unsigned value
+       and fails the same test, so there is no separate li >= 0 branch on the hot path. */
   L_ArrayLoadInt:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        ireg[I->dest] = (li >= 0 && li < d[2]) ? ((const int64_t *)(intptr_t)d[0])[li] : 0; }
+        if ((uint64_t)li < (uint64_t)d[2]) ireg[I->dest] = ((const int64_t *)(intptr_t)d[0])[li];
+        else if (flags & HF_MODERN_ARRAYS) ireg[I->dest] = 0;
+        else return pc; }
       pc++; NEXT;
   L_ArrayLoadFloat:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        freg[I->dest] = (li >= 0 && li < d[2]) ? ((const double *)(intptr_t)d[1])[li] : 0.0; }
+        if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = ((const double *)(intptr_t)d[1])[li];
+        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = 0.0;
+        else return pc; }
       pc++; NEXT;
   L_ArrayStoreInt:   /* bcArrayStoreInt - the VALUE is in Dest, read not written */
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        if (li >= 0 && li < d[2]) ((int64_t *)(intptr_t)d[0])[li] = ireg[I->dest]; }
+        if ((uint64_t)li < (uint64_t)d[2]) ((int64_t *)(intptr_t)d[0])[li] = ireg[I->dest];
+        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
       pc++; NEXT;
   L_ArrayStoreFloat:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        if (li >= 0 && li < d[2]) ((double *)(intptr_t)d[1])[li] = freg[I->dest]; }
+        if ((uint64_t)li < (uint64_t)d[2]) ((double *)(intptr_t)d[1])[li] = freg[I->dest];
+        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
       pc++; NEXT;
 
     /* ---- fused float arithmetic and the transfer banks ---- */
