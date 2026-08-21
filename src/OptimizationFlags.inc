@@ -78,6 +78,30 @@
 // Individual optimization flags (controlled by master switch)
 // Ordered by execution sequence in the optimization pipeline
 
+// ⛔ LOOP UNROLLING IS OFF, AND NOT BECAUSE IT IS USELESS - BECAUSE IT MISCOMPILES.
+//
+// Until 21 Aug 2026 this pass was INERT: its induction-variable matcher wanted the step as an
+// immediate operand and the SSA had long since started materialising constants into a register, so
+// it unrolled nothing and nobody noticed. Repairing the matcher (SedaiLoopUnroll.ResolveConstStep)
+// makes it fire on 70 loops of the 162-program corpus - and three of those programs then give the
+// wrong answer:
+//     mandelbrot-modern.bas, mandelbrot-modern-1t.bas ... picture differs from --no-opt
+//     fannkuch-redux-modern.bas, k-nucleotide-modern.bas ... do not terminate
+// The cause is structural, not a detail: the pass copies the body, increments the induction
+// variable between the copies, and re-tests the loop condition only ONCE per pair. A loop meant to
+// run an ODD number of times therefore runs one iteration too many. mandelbrot's innermost loop is
+// "For h = 1 To 7" - seven trips - which is exactly the shape. The unit header claims this needs no
+// epilogue "for any trip count"; that claim is false and is corrected there.
+//
+// Turning it on needs an EPILOGUE (run trip-count mod 2 iterations first, then the pairs), which is
+// writing the pass rather than repairing it. The ceiling for that work was measured the same day and
+// was measured the same day: at equal body size, a register-only body gains 15.1% and a body with
+// one array read gains 3.1%, and only 56 of 724 candidates (7.7%) are register-only.
+// The pass still RUNS, so that UNROLL_DIAG=1 keeps reporting what the corpus looks like; what it
+// refuses to do is transform anything, and it refuses in ONE named place
+// (SedaiLoopUnroll.TripCountIsProvablyEven) that says why and counts the loops waiting on it.
+// Disabling it here instead would take the instrument away with the transformation.
+
 {$IFDEF DISABLE_ALL_OPTIMIZATIONS}
   {$DEFINE DISABLE_CONSTANT_FOLDING}   // Skip constant folding in SSA generation
   {$DEFINE DISABLE_SUB_INLINING}       // Skip SUB/FUNCTION inlining (unification pass, pre-everything)
