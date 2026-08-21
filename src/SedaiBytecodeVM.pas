@@ -3461,10 +3461,21 @@ begin
             ((FProcWidths[UStart[p]].WFloat shr 32) = 0) and
             ((FProcWidths[UStart[p]].WStr shr 32) = 0)) then
     begin
+      // ⛔ "copies float/string" NAMES TWO BANKS AND TELLS YOU NEITHER. Which one disqualifies a
+      // procedure is the whole question - the float bank could follow the relocation scheme, the
+      // string bank cannot - and reconstructing it by grepping a listing for float-looking opcode
+      // names is a list by omission that gets it wrong. Print the widths the decision actually read.
       if GFrameBaseDiag = 1 then
-        WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
-                                  + ' (copies float/string) - keeping the copying frame',
-                                  [p, UStart[p], UEnd[p]]));
+        if (UStart[p] < Length(FProcWidths)) and (FProcWidths[UStart[p]].WInt >= 0) then
+          WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
+                                    + ' - keeping the copying frame (wFloat=%d wStr=%d)',
+                                    [p, UStart[p], UEnd[p],
+                                     FProcWidths[UStart[p]].WFloat shr 32,
+                                     FProcWidths[UStart[p]].WStr shr 32]))
+        else
+          WriteLn(ErrOutput, Format('[FRAMEBASE] unit %d @pc %d..%d: relocatable but NOT fast'
+                                    + ' - keeping the copying frame (widths NOT MEASURED for it)',
+                                    [p, UStart[p], UEnd[p]]));
       System.Continue;
     end;
     // Published per entry PC, packed like the widths: one past the highest index used in the high
