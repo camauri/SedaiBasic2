@@ -412,6 +412,14 @@ begin
     Op := Instr^.OpCode;
     DenseOp := DenseOps[CurPC];
 
+    // PAIR_DIAG=1: count the ADJACENT opcode pairs actually executed, which is the only honest way
+    // to ask "what should be fused next". The superinstruction set was chosen when the pipeline
+    // looked different; a pair that mattered then may not be executed at all now, and the ones that
+    // matter now were not fusable then. Run it with HOTC_OFF=1 so every instruction passes through
+    // here - the C loop runs whole stretches without coming back, and would hide most of the pairs.
+    if GPairDiag and (CurPC + 1 < InstrCount) then
+      Inc(GPairCount[PairSlot(Instructions[CurPC].OpCode), PairSlot(Instructions[CurPC + 1].OpCode)]);
+
     {$IFDEF DEBUG_MODE}
     // Debugger integration: check for breakpoints and stepping
     // SourceLine now retrieved from Source Map

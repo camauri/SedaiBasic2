@@ -846,9 +846,33 @@ var
   GHotCDiag: Boolean = False;
   GHotCReported: Boolean = False;
   GHotCCalls: Int64 = 0;    // how many times the C loop was entered
+  GPairDiag: Boolean = False;       // PAIR_DIAG=1: census of the adjacent opcode pairs executed
+  // ⛔ NOT the raw opcode as an index. A 16-bit opcode would need a 65536x65536 table, and masking
+  // it down to 12 bits - which is what the first version of this did - both mislabels the entries
+  // (0xC8xx superinstructions come out as group 8/9 "Web_nn") and COLLIDES two real opcodes into
+  // one counter. PairSlot compacts group|sub into 0..2047 losslessly for the groups that exist.
+  GPairCount: array[0..2047, 0..2047] of LongWord;
   GSuperDiag: Boolean = False;      // SUPER_DIAG=1: census of the NESTED superinstruction dispatch
   GSuperCount: array[0..255] of Int64;
   GHotCExit: array[0..65535] of Int64;
+
+function PairSlot(Op: Word): Integer;
+// group -> a small dense id, sub kept whole: slot = gid*256 + sub, so no two opcodes share a slot.
+var gid: Integer;
+begin
+  case Op shr 8 of
+    $00: gid := 0; $01: gid := 1; $02: gid := 2; $03: gid := 3;
+    $04: gid := 4; $0A: gid := 5; $0B: gid := 6; $C8: gid := 7;
+  else   gid := 7;   // anything unforeseen lands with the superinstructions rather than colliding
+  end;                // with a core opcode - and the report prints the real name, so it is visible
+  Result := gid * 256 + (Op and $FF);
+end;
+
+function SlotOpcode(Slot: Integer): Word;
+const G: array[0..7] of Word = ($00, $01, $02, $03, $04, $0A, $0B, $C8);
+begin
+  Result := (G[Slot div 256] shl 8) or Word(Slot mod 256);
+end;
 
 procedure SetDateLocaleMode(Enabled: Boolean);
 begin
@@ -1244,6 +1268,7 @@ begin
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
   GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
+  GPairDiag := GetEnvironmentVariable('PAIR_DIAG') = '1';
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
@@ -16382,6 +16407,44 @@ begin
   WriteLn(ErrOutput, '[CALLPROF]   emitted code around the call and is charged to the caller.');
 end;
 
+procedure ReportPairCounts;
+// The top adjacent pairs actually executed. Printed raw: the ranking is the answer, and deciding
+// which of them is FUSABLE (same operand slots, temporary dead, no jump target in between) is a
+// separate question that belongs to whoever writes the fusion.
+var
+  a, b, i, j, n: Integer;
+  KA, KB: array of Word;
+  KC: array of LongWord;
+  tc: LongWord; tw: Word;
+  Tot: Int64;
+begin
+  if not GPairDiag then Exit;
+  SetLength(KA, 0); SetLength(KB, 0); SetLength(KC, 0); Tot := 0;
+  for a := 0 to 2047 do
+    for b := 0 to 2047 do
+      if GPairCount[a, b] > 0 then
+      begin
+        Tot := Tot + GPairCount[a, b];
+        n := Length(KA); SetLength(KA, n+1); SetLength(KB, n+1); SetLength(KC, n+1);
+        KA[n] := a; KB[n] := b; KC[n] := GPairCount[a, b];
+      end;
+  if Length(KA) = 0 then begin WriteLn(ErrOutput, '[PAIR] nessuna coppia'); Exit; end;
+  for i := 0 to High(KA) - 1 do
+    for j := i + 1 to High(KA) do
+      if KC[j] > KC[i] then
+      begin
+        tc := KC[i]; KC[i] := KC[j]; KC[j] := tc;
+        tw := KA[i]; KA[i] := KA[j]; KA[j] := tw;
+        tw := KB[i]; KB[i] := KB[j]; KB[j] := tw;
+      end;
+  WriteLn(ErrOutput, '[PAIR] coppie adiacenti eseguite (totale ', Tot, '), le prime 20:');
+  for i := 0 to High(KA) do
+  begin
+    if i >= 20 then Break;
+    WriteLn(ErrOutput, '[PAIR]   ', KC[i]:12, '  ', OpcodeToString(SlotOpcode(KA[i])), ' -> ', OpcodeToString(SlotOpcode(KB[i])));
+  end;
+end;
+
 procedure ReportSuperCounts;
 // The nested-dispatch census, printed at shutdown. Sorted by count: an arm reached rarely costs
 // nothing to leave here, one reached in an inner loop pays the second dispatch every iteration.
@@ -16463,6 +16526,7 @@ initialization
   if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
   AddExitProc(@ReportHotCExits);
   AddExitProc(@ReportSuperCounts);
+  AddExitProc(@ReportPairCounts);
 
 finalization
   // NOT the only place it is called from: see the AddExitProc in the initialization above. A CLASSIC
