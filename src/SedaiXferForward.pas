@@ -132,6 +132,9 @@ var
   ScanFrom, Hops: Integer;
 begin
   Result := 0;
+  // XFER_OFF=1 disables the pass on one binary, which is what lets a failure be attributed to this
+  // pass or to whatever else changed alongside it.
+  if GetEnvironmentVariable('XFER_OFF') = '1' then Exit;
   D_Seen := 0; D_NoSlot := 0; D_NotReg := 0; D_Redefined := 0; D_NotStraight := 0; D_ManyPreds := 0; D_Call := 0;
   D_LoadUnversioned := 0; D_NoReader := 0;
   for bi := 0 to Prog.Blocks.Count - 1 do

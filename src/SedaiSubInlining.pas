@@ -88,6 +88,22 @@ implementation
 uses SedaiDebug;
 {$ENDIF}
 
+var
+  ID_Sites, ID_TooBig, ID_Call, ID_Record, ID_Jump: Integer;
+  ID_Block: array of TSSAOpCode;      // and WHICH opcode blocked each one
+  ID_BlockN: array of Integer;
+
+procedure RecordBlocker(Op: TSSAOpCode);
+var i: Integer;
+begin
+  for i := 0 to High(ID_Block) do
+    if ID_Block[i] = Op then begin Inc(ID_BlockN[i]); Exit; end;
+  SetLength(ID_Block, Length(ID_Block) + 1);
+  SetLength(ID_BlockN, Length(ID_Block));
+  ID_Block[High(ID_Block)] := Op;
+  ID_BlockN[High(ID_BlockN)] := 1;
+end;
+
 constructor TSubInliner.Create(AProgram: TSSAProgram);
 begin
   inherited Create;
@@ -151,6 +167,10 @@ begin
 end;
 
 function TSubInliner.Inlinable(FirstB, LastB: Integer): Boolean;
+// ⛔ EVERY REFUSAL HERE USED TO BE SILENT, and a pass that refuses in silence cannot be improved:
+// nobody can tell an inliner that declines everything from one that has nothing to decline. That is
+// the same blindness that hid LOOP_UNROLL's dead matcher and the C hot loop's CLASSIC array gate,
+// both found on 21 Aug 2026 by making the refusals speak. INLINE_DIAG=1 reports them by reason.
 var
   b, j, n: Integer;
   Blk: TSSABasicBlock;
@@ -176,7 +196,7 @@ begin
     begin
       Blk := FProgram.Blocks[b];
       Inc(n, Blk.Instructions.Count);
-      if n > MAX_INLINE_INSTRS then Exit;
+      if n > MAX_INLINE_INSTRS then begin Inc(ID_TooBig); Exit; end;
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
         Ins := Blk.Instructions[j];
@@ -185,14 +205,43 @@ begin
                              ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd,
                              ssaRecordNewBlock, ssaArrayDim,
                              ssaArrayBind, ssaArrayBindInd, ssaArrayBindApply,
-                             ssaArrayUnbind]) then Exit;
-        // V1: no UDT/record machinery and no handle-indirect member ops at all - UDT
-        // operator functions inlined naively loop forever (m403/m433); the record
-        // handle/RAII model needs its own analysis before it can be flattened.
+                             ssaArrayUnbind]) then begin Inc(ID_Call); RecordBlocker(Ins.OpCode); Exit; end;
+        // V1 refused anything whose OPCODE NAME contained "Record" or "Ind", because UDT operator
+        // functions inlined naively loop forever (m403/m433) and the record handle/RAII model needs
+        // its own analysis before it can be flattened. That reasoning is sound for the machinery -
+        // allocation, freeing, the runtime type-id, parameter binding - and a substring match on an
+        // enum name cannot tell the machinery apart from a plain FIELD READ.
+        //
+        // 📊 Measured 21 Aug 2026 with INLINE_DIAG=1 over 558 call sites: 146 were refused here, and
+        // the single biggest blocker was RecordLoadInt at 92 sites, with RecordLoadFloat at 27 and
+        // RecordLoadString at 5. Reading p->v inside a SUB has no more to do with RAII than reading
+        // an array element does: it allocates nothing, frees nothing, and cannot recurse.
+        //
+        // ⛔ THE READS ARE LET THROUGH; NOTHING ELSE IS. Stores stay refused too - conservatively,
+        // not because a case is known against them - so the change can be measured on its own.
+        // ⛔⛔ THE SUBSTRING MATCH IS CRUDE AND IT WAS TRIED PROPERLY - THE ANSWER WAS NO.
+        // It refuses any opcode whose enum NAME contains "Record" or "Ind", which puts a plain field
+        // READ in the same bag as allocation and the runtime type-id. INLINE_DIAG=1 priced it on
+        // 21 Aug 2026: of 558 call sites in the corpus, 146 die here, and the single biggest blocker
+        // is RecordLoadInt at 92 sites (RecordLoadFloat 27, RecordLoadString 5).
+        //
+        // Letting the three reads through raises inlined sites from 241 to 316 - and immediately
+        // miscompiles m483_udt_iterator_for, whose "Operator Next" then returns false forever and
+        // whose loop runs zero times. Cause, not symptom: a METHOD carries an implicit SELF handle
+        // that this inliner does not remap the way it remaps declared parameters, so a field read
+        // inside one reads the wrong object. That is exactly the "UDT operator functions inlined
+        // naively" the note above records, and a method is identifiable - PROC_TYPE.MEMBER has a dot.
+        //
+        // ⛔ Restricted to non-methods it is CORRECT (602 PASS / 0 OPTDIFF) and still WORTHLESS:
+        // 292 sites instead of 241, +51 bytecode instructions, and no time anywhere -
+        // binary-trees +1.5%, fannkuch +2.3%, k-nucleotide +6.7%, spectral-norm +0.2%,
+        // n-body -0.3%. More inlining is not more speed here; it is more code, which the MCU target
+        // is the one paying for. ⇒ NOT APPLIED, and this is the measurement so nobody re-derives it.
         if (Pos('Record', GetEnumName(TypeInfo(TSSAOpCode), Ord(Ins.OpCode))) > 0) or
-           (Pos('Ind', GetEnumName(TypeInfo(TSSAOpCode), Ord(Ins.OpCode))) > 0) then Exit;
+           (Pos('Ind', GetEnumName(TypeInfo(TSSAOpCode), Ord(Ins.OpCode))) > 0) then
+        begin Inc(ID_Record); RecordBlocker(Ins.OpCode); Exit; end;
         if OpIn(Ins.OpCode, [ssaJump, ssaJumpIfZero, ssaJumpIfNotZero]) and
-           not JumpTargetOK(Ins.Dest) then Exit;
+           not JumpTargetOK(Ins.Dest) then begin Inc(ID_Jump); Exit; end;
       end;
     end;
     Result := True;
@@ -220,6 +269,10 @@ var
 begin
   Result := False;
   if not ProcRange(ProcLabel, FirstB, LastB) then Exit;
+  Inc(ID_Sites);
+  if GetEnvironmentVariable('INLINE_DIAG') = '2' then
+    WriteLn(ErrOutput, '[INLINE] sito -> ', ProcLabel,
+            ' metodo=', Pos('.', ProcLabel) > 0, '  inlinabile=', Inlinable(FirstB, LastB));
   if not Inlinable(FirstB, LastB) then Exit;
   // The call site cannot be inside the callee itself (leafness already excludes
   // recursion, but stay explicit).
@@ -405,6 +458,8 @@ var
   Blk: TSSABasicBlock;
   Ins: TSSAInstruction;
 begin
+  ID_Sites := 0; ID_TooBig := 0; ID_Call := 0; ID_Record := 0; ID_Jump := 0;
+  SetLength(ID_Block, 0); SetLength(ID_BlockN, 0);
   Result := 0;
   // Walk a SNAPSHOT of the current block list: inlining inserts blocks, and
   // clones of leaf callees contain no calls, so one pass converges.
@@ -431,6 +486,14 @@ begin
   // Marks orphaned by the removed calls become pure (and expensive) stack noise.
   if Result > 0 then
     ElideDeadRecMarks;
+  if GetEnvironmentVariable('INLINE_DIAG') = '1' then
+  begin
+    WriteLn(ErrOutput, '[INLINE] siti di chiamata=', ID_Sites, '  INLINATI=', Result,
+            '  scartati: troppo-grande=', ID_TooBig, ' chiama-o-alloca=', ID_Call,
+            ' record/indiretto=', ID_Record, ' salto-fuori=', ID_Jump);
+    for b := 0 to High(ID_Block) do
+      WriteLn(ErrOutput, '[INLINE]   bloccato da ', SSAOpCodeToString(ID_Block[b]), ' x', ID_BlockN[b]);
+  end;
   {$IFDEF DEBUG_INLINE}
   if DebugInline and (Result > 0) then
     for b := 0 to FProgram.Blocks.Count - 1 do
