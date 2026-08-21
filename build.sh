@@ -646,6 +646,22 @@ if [[ "$HOT_C" == "true" ]]; then
     # -fno-math-errno is REQUIRED, not a tuning knob: without it gcc assumes llrint/sqrt may touch
     # errno and emits CALLS to libm, which a freestanding object linked into an FPC program cannot
     # resolve. With it they are cvtsd2si and sqrtsd, one instruction each.
+    # ⭐ -fno-crossjumping IS THE ONE THAT MATTERS, and it took perf to find it. The dispatch macro
+    # NEXT ends every arm with its own "goto *disp[]" - the replicated dispatch that threaded
+    # interpreters use so each arm gets its OWN branch-predictor history ("after ArrayLoad comes
+    # AddInt") instead of all of them sharing one saturated entry. gcc undoes it: cross-jumping
+    # merges identical tails, and 96 NEXT in the source came out as THREE indirect jumps in the
+    # assembly. The technique was written down and compiled away.
+    #
+    # Measured 21 Aug 2026 with perf, which is also what corrected the diagnosis: the problem was
+    # never the I-cache (300-500 k misses against 29 G instructions) but BRANCH MISPREDICTION -
+    # adding four arms took it from 17.2 M to 24.2 M. With the flag: 97 indirect jumps, misses back
+    # to 21.0 M, cycles 7.33 G -> 6.37 G, which is below where the session started.
+    #     spectral-norm -16.1%   fannkuch-redux -12.2%   n-body -8.1%
+    #     binary-trees-arena N=21 -6.6% (the regression this session had opened)   binary-trees -4.1%
+    # ⚠️ It costs SIZE: .text goes 6760 -> 11784 bytes, +74%. Worth re-deciding for the MCU target,
+    # where size is the binding constraint - the flag is one word to remove.
+    #
     # -falign-labels/-falign-jumps: the dispatch arms are jump targets reached by an indirect jump,
     # and where each one LANDS in the instruction cache turned out to matter more than what it
     # contains. Measured 21 Aug 2026: adding four record arms left n-body executing byte-identical
@@ -654,7 +670,7 @@ if [[ "$HOT_C" == "true" ]]; then
     # sensitivity and pays on its own: n-body -12.0%, spectral-norm -8.5%, binary-trees-arena -2.2%,
     # binary-trees -0.3%. A layout effect is machine-specific by nature, so re-measure it before
     # trusting the numbers on a different CPU.
-    "$CC_BIN" -O2 -ffreestanding -fno-math-errno -falign-labels=32 -falign-jumps=32 -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
+    "$CC_BIN" -O2 -ffreestanding -fno-math-errno -falign-labels=32 -falign-jumps=32 -fno-crossjumping -c -o "$SCRIPT_DIR/src/hotdisp.o" "$SCRIPT_DIR/src/hotdisp.c" || {
         echo -e "${RED}ERROR: could not compile src/hotdisp.c${NC}" >&2; exit 1; }
     HOT_C_DEFINE="-dHOT_C"
     fi
