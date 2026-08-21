@@ -485,8 +485,7 @@ begin
           SSAProgram.ClearDomTree;
           SSAProgram.BuildDominatorTree;
           SSAProgram.RunLoopUnrolling;
-        except
-        end;
+        except on E: Exception do OptPassFailed('LoopUnrolling', E); end;
         {$ENDIF}
 
         {$IFNDEF DISABLE_DCE}
@@ -589,15 +588,28 @@ begin
           {$ENDIF}
 
           // Peephole pass 2
+          // ⛔ IL SUO INTERRUTTORE NON ERA COLLEGATO (trovato il 21 ago 2026). Questo blocco era
+          // protetto da DISABLE_PEEPHOLE - lo stesso flag della PRIMA passata - mentre
+          // DISABLE_PEEPHOLE_PASS2 era l'unico dei 26 flag che NESSUN {$IFNDEF} consultava.
+          // Conseguenza: l'audit che spegne un passo alla volta lo dava per «inerte, spegnerlo non
+          // cambia un byte», il che era banalmente vero per un flag che non spegne niente. Un passo
+          // inerte e un interruttore scollegato danno lo STESSO zero, e dai numeri non si distinguono.
+          //
+          // 📊 MISURATO per la prima volta col flag collegato (21 ago 2026): accesa contro spenta,
+          // 158 programmi, ZERO differenze e ZERO righe. E' inerte davvero. Ma NON e' il caso di
+          // CONST_PROP, che non puo' funzionare per costruzione: questa non trova nulla su QUESTO
+          // corpus, il che e' una cosa piu' debole. Resta collegata e attiva; se un giorno il tempo
+          // di compilazione conta, e' il primo passo da togliere - con una rimisura, non a memoria.
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_PEEPHOLE}
+          {$IFNDEF DISABLE_PEEPHOLE_PASS2}
           try
             RunPeephole(Result);
             {$IFNDEF DISABLE_NOP_COMPACTION}
             RunNopCompaction(Result);
             {$ENDIF}
-          except
-          end;
+          except on E: Exception do OptPassFailed('Peephole2', E); end;
+          {$ENDIF}
           {$ENDIF}
           {$ENDIF}
 
