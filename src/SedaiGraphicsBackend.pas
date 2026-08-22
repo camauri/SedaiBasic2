@@ -95,6 +95,13 @@ type
     procedure SetPaletteColor(Index: TPaletteIndex; Color: TGfxColor);
     function  GetPaletteColor(Index: TPaletteIndex): TGfxColor;
     procedure ResetPalette;
+    { ⭐ A CAPABILITY QUERY, not a window onto the buffer. The C hot loop implements PSET as a single
+      32-bpp store, and this is the one question that says whether that is the WHOLE of what PSET
+      means right now: a backend with no plain buffer, or one whose state makes PSET do more than
+      store (a palette search, an active clip), answers False and the arm is refused wholesale.
+      ⭐ Answering False is always safe - it costs speed, never correctness. }
+    function PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer;
+                              out W, H: Integer): Boolean;
   end;
 
   { Software reference backend: TGraphicsMemory + the *ToMemory primitives. No SDL, headless, fully
@@ -113,6 +120,7 @@ type
     destructor Destroy; override;
     function  SetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
     function  ResizeScreen(W, H, Depth: Integer): Boolean;
+    function  PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer): Boolean;
     function  GetMode: TGraphicMode;
     function  InGraphics: Boolean;
     procedure ClearSurface(Surface: TGfxSurface; Color: TGfxColor);
@@ -174,6 +182,24 @@ end;
 function TSoftwareGraphicsBackend.ValidScreen: Boolean;
 begin
   Result := Assigned(FScreen) and Assigned(FScreen.GraphicsBuffer);
+end;
+
+function TSoftwareGraphicsBackend.PixelStoreTarget(Surface: TGfxSurface; out Base: Pointer;
+                                                   out W, H: Integer): Boolean;
+// Every condition under which PSET is MORE than one store is refused here, because the C arm tests
+// none of them: it tests the base it is handed and trusts this answer.
+var
+  M: TGraphicsMemory;
+begin
+  Base := nil; W := 0; H := 0; Result := False;
+  M := MemoryOf(Surface);
+  if not Assigned(M) then Exit;
+  if not Assigned(M.GraphicsBuffer) then Exit;
+  if M.ClipActive then Exit;                                    // the store would land unclipped
+  if M.State.PaletteMode and M.State.PaletteEnabled then Exit;  // a nearest-index SEARCH, plus a
+                                                                // second buffer to write
+  Base := M.GraphicsBuffer; W := M.State.Width; H := M.State.Height;
+  Result := (W > 0) and (H > 0);
 end;
 
 function TSoftwareGraphicsBackend.MemoryOf(Surface: TGfxSurface): TGraphicsMemory;

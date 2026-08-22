@@ -78,7 +78,14 @@ var
   // layout of TRecordStorage, so hotdisp.c holds no offset of its own and the two cannot drift.
   HotRecDesc: array[0..5] of Int64;
   HotRecProbe: TRecordStorage;   // only ever used to take the offset of its Bytes field
-  HotNewPC: LongInt;
+  HotNewPC: LongInt;       // NEGATIVE means the back-edge budget ran out, with the PC as -(pc+1)
+  HotBudget: LongInt;      // back edges this stay may take; High(LongInt) when nobody needs pumping
+  HotBudgetExit: Boolean;  // this return was the budget running out, not an uncovered opcode
+  // PSET's descriptor. Built HERE because this is the side that knows when a PSET is nothing but a
+  // store: the C arm is handed a null base whenever it is not, and refuses itself wholesale.
+  HotGfxDesc: array[0..4] of Int64;
+  HotGfxBase: Pointer;
+  HotGfxW, HotGfxH: Integer;
   HotArrDesc: Pointer;
   HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
   HotXferI: PInt64;        // the SUB/FUNCTION argument banks of THIS context - never baked in,
@@ -232,7 +239,14 @@ begin
   // it against anything that did. It surfaced only because zeroing FHotOp at JIT loop headers made
   // --jit trace those lines while the interpreter still did not, and the differential net caught the
   // two engines disagreeing. Fix the cause: no C loop while tracing, and both engines trace fully.
-  HotCOk := (not Assigned(FEventPollCallback)) and (not Ctx.TraceActive) and
+  // ⭐ THE EVENT-POLL GATE IS GONE, and a BACK-EDGE BUDGET stands where it stood. It used to read
+  // `not Assigned(FEventPollCallback)`, which under --window means ALWAYS OFF: measured 22 Aug 2026,
+  // that cost bubble_universe 54.6 against 157.6 fps, +189%. The gate existed for a real reason - a
+  // fully covered loop never hands the PC back, so the window would stop answering events for the
+  // length of the run - but the cure was never to refuse the loop: it is to bound how long one stay
+  // can last. HOTC_GATE=1 puts the old refusal back, so the A/B lives on ONE binary.
+  HotCOk := (not Ctx.TraceActive) and
+            ((not Assigned(FEventPollCallback)) or (GetEnvironmentVariable('HOTC_GATE') <> '1')) and
             ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0')) and
             ((not JitOn) or (GetEnvironmentVariable('HOTC_JIT') <> '0'));
   if GetEnvironmentVariable('HOTC_OFF') = '1' then HotCOk := False;
@@ -241,6 +255,13 @@ begin
   HotFlags := 0;
   if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
   if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
+  // The budget is spent on BACK EDGES, so it bounds a stay in units of BASIC loop iterations rather
+  // than of instructions - a test per instruction in that loop was measured at 3.5-11.8% and would
+  // tax every headless program to help the windowed ones. With no event callback there is nobody to
+  // pump for, so the budget is effectively infinite and the headless path - the regression target -
+  // pays one compare per branch and nothing else.
+  if Assigned(FEventPollCallback) then HotBudget := HOT_BACKEDGE_BUDGET
+                                  else HotBudget := High(LongInt);
   if HotCOk then HotArrDesc := AcquireArrDescCtx(Ctx) else HotArrDesc := nil;
   // Slots 1, 2, 4 and 5 are layout and never change during a run. Slots 0 and 3 are the two bases,
   // and they are refreshed at every entry below - taking an address costs nothing, and unlike
@@ -390,13 +411,42 @@ begin
       // name one another thread minted mid-run without synchronising first, which is the same
       // assumption the Pascal side already makes. If that retirement policy ever changes, this is
       // the second place that depends on it.
+      // ⛔ EVERY condition under which PSET does more than one store must appear here, because the C
+      // arm tests none of them - it tests the base and trusts this. Palette mode searches for the
+      // nearest index and writes a second buffer; a clip, a WINDOW transform or a VIEW offset all
+      // change WHERE the pixel lands; a draw target that is not the work page is a different surface
+      // entirely. Rebuilt per entry, which is safe because every statement that could change any of
+      // these is itself outside the C loop and so ends the stay first.
+      HotGfxDesc[0] := 0;
+      if Assigned(FGraphics) and (not FGfxWinActive)
+         and (FGfxViewOffsetX = 0) and (FGfxViewOffsetY = 0) then
+      begin
+        if FGraphics.PixelStoreTarget(DrawSurface, HotGfxBase, HotGfxW, HotGfxH) then
+        begin
+          HotGfxDesc[0] := PtrUInt(HotGfxBase);
+          HotGfxDesc[1] := HotGfxW;
+          HotGfxDesc[2] := HotGfxH;
+          HotGfxDesc[3] := PtrUInt(@FDrawPenX);
+          HotGfxDesc[4] := PtrUInt(@FDrawPenY);
+        end;
+      end;
       if Length(Ctx.Records) > 0 then HotRecDesc[0] := PtrUInt(@Ctx.Records[0]) else HotRecDesc[0] := 0;
       if FSharedRecLockFree and (Length(FSharedRecords) > 0) then
         HotRecDesc[3] := PtrUInt(@FSharedRecords[0])
       else
         HotRecDesc[3] := 0;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
-                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0]);
+                                HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0],
+                                HotBudget, @HotGfxDesc[0]);
+      // A NEGATIVE answer is the budget running out, with the PC encoded as -(pc+1): decode it and
+      // pump, which is the whole point of having a budget. Any other exit is an opcode this loop does
+      // not implement, and there the Pascal instruction counter keeps pumping as it always did.
+      HotBudgetExit := HotNewPC < 0;
+      if HotBudgetExit then
+      begin
+        HotNewPC := (-HotNewPC) - 1;
+        if Assigned(FEventPollCallback) then FEventPollCallback();
+      end;
       // HOTC_DIAG=1: charge this exit to the opcode that caused it. The C loop is only entered when
       // FHotOp[CurPC] <> 0, so wherever it stops is an instruction it does not implement - and the
       // count of stops per opcode is exactly the cost of NOT covering that opcode.
@@ -408,7 +458,11 @@ begin
       if GHotCDiag then
       begin
         Inc(GHotCCalls);
-        if (HotNewPC >= 0) and (HotNewPC < InstrCount) then
+        // ⛔ A BUDGET exit is not an uncovered opcode. Charging it to whatever instruction happens to
+        // sit at the back edge's target invented 1 499 exits on IntToFloat the first time this ran,
+        // and this census is precisely what decides which opcode to cover next.
+        if HotBudgetExit then Inc(GHotCBudgetExits)
+        else if (HotNewPC >= 0) and (HotNewPC < InstrCount) then
           Inc(GHotCExit[Instructions[HotNewPC].OpCode]);
       end;
       if HotNewPC <> CurPC then
