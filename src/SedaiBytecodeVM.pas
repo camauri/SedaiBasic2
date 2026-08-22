@@ -894,6 +894,8 @@ var
   GHotCDiag: Boolean = False;
   GHotCReported: Boolean = False;
   GHotCCalls: Int64 = 0;    // how many times the C loop was entered
+  GHotCBudgetExits: Int64 = 0;  // ...of which returned because the BACK-EDGE BUDGET ran out, which
+                                // is NOT an uncovered opcode and must not be ranked as one
   GPairDiag: Boolean = False;       // PAIR_DIAG=1: census of the adjacent opcode pairs executed
   // ⛔ NOT the raw opcode as an index. A 16-bit opcode would need a 65536x65536 table, and masking
   // it down to 12 bits - which is what the first version of this did - both mislabels the entries
@@ -9134,11 +9136,18 @@ end;
   Int64, which is C's { uint16_t x4; int64_t } with no padding on either side. cdecl is the right
   convention on both platforms - on win64 FPC's cdecl IS the Microsoft x64 ABI that MinGW-w64 emits. }
 {$L hotdisp.o}
+{ How many BACK EDGES one stay inside the C loop may take before it hands the PC back so the caller
+  can pump events. Spent per ITERATION of a BASIC loop, not per instruction: the whole point is that
+  a program with nobody to pump for never pays for this. At the couple of nanoseconds an iteration of
+  a covered loop costs, 200 000 back edges is a fraction of a millisecond of unresponsiveness - far
+  below a frame - while being long enough that the exit is nowhere near a hot path. }
+const HOT_BACKEDGE_BUDGET = 200000;
+
 function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
                        pc, count: LongInt; tv: Int64;
                        arrdesc: Pointer; flags: LongInt;
                        xi: PInt64; xf: PDouble; hidx: PWord;
-                       recdesc: PInt64): LongInt; cdecl; external;
+                       recdesc: PInt64; backedge_budget: LongInt): LongInt; cdecl; external;
 { The opcode list in DISPATCH-TABLE order, published by the C file so that nothing here holds a
   second copy of it. Entry j is run by arm j, which is what makes FHotOpBase an index. }
 function sedai_hot_ops(out list: PWord): LongInt; cdecl; external;
@@ -16933,6 +16942,9 @@ begin
       n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i;
       Tot := Tot + GHotCExit[i];
     end;
+  if GHotCBudgetExits > 0 then
+    WriteLn(ErrOutput, '[HOTC] uscite per BUDGET sui back edge = ', GHotCBudgetExits,
+            ' (non sono opcode scoperti: il ciclo e'' rientrato per far pompare gli eventi)');
   if Length(Idx) = 0 then
   begin
     WriteLn(ErrOutput, '[HOTC] nessuna uscita dal ciclo caldo C (ingressi=', GHotCCalls, ')');
