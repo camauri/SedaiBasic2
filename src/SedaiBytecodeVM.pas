@@ -839,6 +839,29 @@ uses
   // implementation section so the interface of this unit stays free of it.
   SedaiTerminalIO;
 
+{ Trigonometry comes from the platform C library, NOT from FPC's RTL.
+  FPC lowers Sin/Cos/Tan onto the x87's fsin/fcos, whose argument reduction carries pi to 66 bits.
+  Past about 1e6 that is not enough: measured 22 Aug 2026, Sin(1e15) came out 0.8582721324763734
+  where the true value is 0.85827279317023583 - NINE significant digits lost. glibc reduces
+  correctly, and fbc (our oracle) answers exactly what glibc answers, so we were alone and wrong.
+  Atn, Log, Exp and Sqr were measured on the same day and do NOT diverge: they need no reduction
+  modulo pi, and they stay on the RTL.
+  ⚠️ All THREE entry points must use these - ExecuteMathOp, ComputeBuiltinFP and the C hot loop's
+  arms in hotdisp.c - or the same program would answer differently depending on which engine ran
+  it, which is the silent miscompilation this project has already paid for once.
+  ⚠️ On Windows these bind to the CRT's sin/cos/tan, which is what MinGW's hotdisp.o also calls:
+  the invariant that matters is that every engine on ONE platform agrees. Whether the CRT reduces
+  as well as glibc has NOT been measured here. }
+{$IFDEF UNIX}
+function c_sin(x: Double): Double; cdecl; external 'm' name 'sin';
+function c_cos(x: Double): Double; cdecl; external 'm' name 'cos';
+function c_tan(x: Double): Double; cdecl; external 'm' name 'tan';
+{$ELSE}
+function c_sin(x: Double): Double; cdecl; external 'msvcrt' name 'sin';
+function c_cos(x: Double): Double; cdecl; external 'msvcrt' name 'cos';
+function c_tan(x: Double): Double; cdecl; external 'msvcrt' name 'tan';
+{$ENDIF}
+
 {$IFDEF HOT_C}
 {$ENDIF}
 
@@ -7324,9 +7347,9 @@ function TBytecodeVM.ComputeBuiltinFP(OpId: Int64; X: Double): Double;
 // Apply a math builtin taken as a function pointer (@Sin etc.), per the op id in a BUILTIN_FP_TAG value.
 begin
   case OpId of
-    1:  Result := System.Sin(X);
-    2:  Result := System.Cos(X);
-    3:  Result := Math.Tan(X);
+    1:  Result := c_sin(X);      // NOT System.Sin - see the note by the declaration
+    2:  Result := c_cos(X);
+    3:  Result := c_tan(X);
     4:  Result := System.ArcTan(X);
     5:  Result := SqrtFloat(X);
     6:  Result := System.Exp(X);
@@ -12180,11 +12203,11 @@ begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcMathSin
-      Ctx.FloatRegs[Instr.Dest] := Sin(Ctx.FloatRegs[Instr.Src1]);
+      Ctx.FloatRegs[Instr.Dest] := c_sin(Ctx.FloatRegs[Instr.Src1]);
     1: // bcMathCos
-      Ctx.FloatRegs[Instr.Dest] := Cos(Ctx.FloatRegs[Instr.Src1]);
+      Ctx.FloatRegs[Instr.Dest] := c_cos(Ctx.FloatRegs[Instr.Src1]);
     2: // bcMathTan
-      Ctx.FloatRegs[Instr.Dest] := Tan(Ctx.FloatRegs[Instr.Src1]);
+      Ctx.FloatRegs[Instr.Dest] := c_tan(Ctx.FloatRegs[Instr.Src1]);
     3: // bcMathAtn
       Ctx.FloatRegs[Instr.Dest] := ArcTan(Ctx.FloatRegs[Instr.Src1]);
     4: // bcMathLog

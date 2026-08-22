@@ -60,6 +60,12 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
    THE list. One entry per arm, and it drives three things that used to be maintained separately:
    the opcode table handed to the Pascal side, the dispatch table, and the label each arm carries.
    A name in the list with no matching arm is a COMPILE error, which is the point. */
+/* -ffreestanding means no math.h; these three are resolved at the FINAL link, where FPC already
+   pulls in libm (ldd shows libm.so.6). Prototyped by hand so the object stays freestanding. */
+double sin(double);
+double cos(double);
+double tan(double);
+
 #define HOT_OP_LIST \
   X(0x0000, LoadConstInt          ) \
   X(0x0003, CopyInt               ) \
@@ -82,6 +88,10 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
   X(0x0013, NegFloat              ) \
   X(0x0015, FloatToInt            ) \
   X(0x0206, MathSqr               ) \
+  X(0x0200, MathSin               ) \
+  X(0x0201, MathCos               ) \
+  X(0x0202, MathTan               ) \
+  X(0x0209, MathInt               ) \
   X(0x0309, ArrayLBound           ) \
   X(0x0014, IntToFloat            ) \
   X(0x001A, CmpEqInt              ) \
@@ -344,6 +354,23 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       if (!(freg[I->s1] >= 0.0)) return pc;   /* also sends NaN back, which the Pascal arm handles */
       freg[I->dest] = __builtin_sqrt(freg[I->s1]);
       pc++; NEXT;
+
+  /* SIN/COS/TAN call the platform C library, exactly as the Pascal side now does. They are here
+     because a math opcode LEAVING the loop is not neutral: it splits the loop into runs too short
+     to pay for their own entry - measured 22 Aug 2026, a Sin/Cos/Int recurrence exited 60 M times
+     in 20 M iterations (three per iteration) and the C loop was worth only +20% there against
+     +381% on the same loop shape with everything covered.
+     ⚠️ These MUST be the same functions the interpreter calls (SedaiBytecodeVM.pas declares them
+     external 'm'), or the answer would depend on whether the hot loop ran - HOTC_OFF=1 would
+     change the result. FPC's own Sin is NOT the same function: it is the x87's fsin, which loses
+     nine significant digits by 1e15. See the note by the declaration in SedaiBytecodeVM.pas. */
+  L_MathSin: freg[I->dest] = sin(freg[I->s1]);                                pc++; NEXT;
+  L_MathCos: freg[I->dest] = cos(freg[I->s1]);                                pc++; NEXT;
+  L_MathTan: freg[I->dest] = tan(freg[I->s1]);                                pc++; NEXT;
+
+  /* INT() is FLOOR, not truncation - Int(-1.5) is -2 - which is FloorDouble on the Pascal side and
+     __builtin_floor here. Exact in both, so no dialect bit and no way for the two to disagree. */
+  L_MathInt: freg[I->dest] = __builtin_floor(freg[I->s1]);                     pc++; NEXT;
 
   /* LBOUND(arr, dim). Only dim 0 is in the descriptor, so other dimensions and the rank query (a
      NEGATIVE index, which answers 1) hand the PC back - the same line the JIT draws from the same
