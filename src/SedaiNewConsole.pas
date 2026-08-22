@@ -68,9 +68,12 @@ const
   // Sentinel: cell uses the global background color (no per-cell override)
   BG_USE_DEFAULT = 255;
 
-  DEFAULT_FONT_PATHS: array[0..0] of string = (
-    'font\PixelOperatorMono8-Bold.ttf'
-  );
+  // ⛔ NO PATH SEPARATOR IS WRITTEN OUT HERE. This was 'font\PixelOperatorMono8-Bold.ttf', and on
+  // Linux a backslash is an ordinary character in a filename: the open failed, sbv refused to start
+  // with "ERROR: No TTF font found!", and the message printed the very path it had just built - with
+  // the backslash still in it - so it looked like the file was missing rather than misnamed.
+  // PathDelim is a constant, so it composes inside a const initialiser like any other string.
+  DEFAULT_FONT_NAME = 'PixelOperatorMono8-Bold.ttf';
 
 type
   TCursorEnableCallback = procedure(Enable: Boolean) of object;
@@ -1666,35 +1669,40 @@ begin
 end;
 
 function TVideoController.LoadFontWithSize(Size: Integer): Boolean;
+// Look for the console font in every place it legitimately lives, and build each candidate with
+// SysUtils' platform-independent pieces rather than by pasting separators.
+//
+// ⛔ TWO LAYOUTS, AND ONLY ONE OF THEM USED TO WORK. A DISTRIBUTED build has the font in a `font`
+// directory beside the executable. A build from this REPOSITORY has it in `assets/font`, and the
+// executable sits two levels down in `bin/<target>/` - so relative to the binary it is `../../assets/
+// font`. Nothing ever copied it into bin/x86_64-linux/, which is why sbv could not start here even
+// after the separator was fixed: the separator was one bug and the missing search path was another.
 var
   i: Integer;
-  ExePath, FontPath: string;
+  ExeDir: string;
+  Candidates: array[0..3] of string;
 begin
   Result := False;
+  ExeDir := ExtractFilePath(ParamStr(0));
 
-  // Get the executable path
-  ExePath := ExtractFilePath(ParamStr(0));
+  Candidates[0] := ConcatPaths([ExeDir, 'font', DEFAULT_FONT_NAME]);                    // distributed
+  Candidates[1] := ConcatPaths([ExeDir, '..', '..', 'assets', 'font', DEFAULT_FONT_NAME]); // repo
+  Candidates[2] := ConcatPaths(['assets', 'font', DEFAULT_FONT_NAME]);                  // run from root
+  Candidates[3] := ConcatPaths(['font', DEFAULT_FONT_NAME]);                            // run beside it
 
-  for i := Low(DEFAULT_FONT_PATHS) to High(DEFAULT_FONT_PATHS) do
-  begin
-    // Try first with the absolute path (relative to executable)
-    FontPath := ExePath + DEFAULT_FONT_PATHS[i];
-    if TryLoadFont(FontPath, Size) then
+  for i := Low(Candidates) to High(Candidates) do
+    if TryLoadFont(Candidates[i], Size) then
     begin
       Result := True;
       Exit;
     end;
 
-    // Then try with the original relative path
-    if TryLoadFont(DEFAULT_FONT_PATHS[i], Size) then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-
-  WriteLn('ERROR: No TTF font found!');
-  WriteLn('Searched in: ', ExePath, DEFAULT_FONT_PATHS[0]);
+  // ⛔ Report EVERY place that was tried, not just the first. The old message named one path out of a
+  // list it had looped over, which reads as "this file is missing" when the truth may be "it is
+  // somewhere else in the list and none of them matched".
+  WriteLn('ERROR: No TTF font found (', DEFAULT_FONT_NAME, '). Searched:');
+  for i := Low(Candidates) to High(Candidates) do
+    WriteLn('  ', ExpandFileName(Candidates[i]));
 end;
 
 function TVideoController.Initialize(Mode: TGraphicMode; Fullscreen: Boolean = False): Boolean;

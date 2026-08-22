@@ -1240,14 +1240,25 @@ end;
 
 procedure TSDL2OutputDevice.LoadFontWithSize(Size: Integer);
 const
+  // ⛔ OURS are composed with PathDelim; the SYSTEM ones are left exactly as the platform writes them.
+  // The distinction matters: a path we build has to work everywhere, while /usr/share/fonts and
+  // C:\Windows\Fonts are platform facts that only exist on the platform that spells them that way -
+  // rewriting those with PathDelim would produce a path that is wrong on both.
+  // 📊 The one that was written out by hand, 'font\...' in SedaiNewConsole, is exactly the one that
+  // broke: on Linux the backslash is an ordinary filename character, so sbv refused to start.
   DefaultFontPaths: array[0..9] of string = (
-    'font/PixelOperatorMono8-Bold.ttf',
-    'assets/PixelOperatorMono8-Bold.ttf',
-    'font/Hack-Bold.ttf',
-    'assets/Hack-Bold.ttf',
+    'font' + PathDelim + 'PixelOperatorMono8-Bold.ttf',
+    'assets' + PathDelim + 'PixelOperatorMono8-Bold.ttf',
+    'font' + PathDelim + 'Hack-Bold.ttf',
+    'assets' + PathDelim + 'Hack-Bold.ttf',
     'Hack-Bold.ttf',
+    {$IFDEF WINDOWS}
     'C:\Windows\Fonts\consola.ttf',
     'C:\Windows\Fonts\courbd.ttf',
+    {$ELSE}
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf',
+    {$ENDIF}
     '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf',
     '/System/Library/Fonts/Monaco.ttf',
     '/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf'
