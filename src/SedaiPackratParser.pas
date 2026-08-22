@@ -3604,7 +3604,8 @@ function TPackratParser.ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean =
 var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum: TASTNode;
-  PrevIdx, NestedUnionDepth: Integer;
+  PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur: Integer;
+  NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   IsStaticField, LeadingType, FpIsFP: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
@@ -3612,6 +3613,8 @@ var
 begin
   CurAccess := '';
   NestedUnionDepth := 0;
+  UnionGrpSeq := 0; UnionGrpCur := 0;
+  NestedStructDepth := 0; StructGrpCur := 0;
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
   // An empty type name child means "infer from the field's name suffix" (SSA side).
@@ -3779,12 +3782,43 @@ begin
     // ordinary (non-overlapping) fields of the parent — enough for code that reads back whichever member it
     // last wrote (true storage overlap / type-punning is not modelled). Track nesting so a nested "end
     // union" closes the union (not the whole type); the members parse as normal fields in between.
-    if Context.Check(ttUnionDecl) then begin Inc(NestedUnionDepth); Context.Advance; Continue; end;
+    // A NESTED "Union ... End Union" inside a TYPE. Its tokens used to be skipped and nothing else:
+    // the members came out FLAT, so they were laid out one after another instead of overlapping -
+    // OffsetOf(MyType, i) answered 16 where fbc says 8, SizeOf 24 where fbc says 16, and writing one
+    // member did not change the other. Each block now gets an id that every field inside carries.
+    if Context.Check(ttUnionDecl) then
+    begin
+      Inc(NestedUnionDepth);
+      if NestedUnionDepth = 1 then begin Inc(UnionGrpSeq); UnionGrpCur := UnionGrpSeq; end;
+      Context.Advance; Continue;
+    end;
     if (NestedUnionDepth > 0) and Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttUnionDecl) then
     begin
       Dec(NestedUnionDepth);
+      if NestedUnionDepth = 0 then UnionGrpCur := 0;
       Context.Advance; Context.Advance;               // consume END UNION
+      Continue;
+    end;
+    // ...AND ITS MIRROR: an ANONYMOUS "Type ... End Type" block. Inside a UNION it is what makes the
+    // members SEQUENTIAL while the union overlaps the groups - "Union: ul As ULong / Type: ub0..ub3"
+    // is the whole point of udt/union.bas. The parser used to see the bare TYPE, demand a type name
+    // and fail outright ("is a reserved word and cannot be used as a type name"), so three manual
+    // examples never even parsed. Only the ANONYMOUS form is a block: "Type Name" is still a nested
+    // type declaration and is left to whoever handled it before.
+    if Context.Check(ttTypeDecl) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttEndOfLine) then
+    begin
+      Inc(NestedStructDepth);
+      if NestedStructDepth = 1 then begin Inc(UnionGrpSeq); StructGrpCur := UnionGrpSeq; end;
+      Context.Advance; Continue;
+    end;
+    if (NestedStructDepth > 0) and Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttTypeDecl) then
+    begin
+      Dec(NestedStructDepth);
+      if NestedStructDepth = 0 then StructGrpCur := 0;
+      Context.Advance; Context.Advance;               // consume END TYPE
       Continue;
     end;
     if (NestedUnionDepth = 0) and AtEndType then Break;
@@ -3949,6 +3983,8 @@ begin
           FieldNode.Attributes.Values['HASDEFAULT'] := '1';
         end;
       end;
+      if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
+      if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
       Result.AddChild(FieldNode);
       if (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
         Result.Attributes.Values['ACCESS' + UpperCase(VarToStr(FieldNode.Value))] := CurAccess;
@@ -3990,6 +4026,8 @@ begin
               FieldNode.Attributes.Values['HASDEFAULT'] := '1';
             end;
           end;
+          if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
+      if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
           Result.AddChild(FieldNode);
         end;
     end

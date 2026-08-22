@@ -108,6 +108,13 @@ type
     StringData: array of string;
   end;
 
+  { One suspended invocation's copy of a proc-local array. The storage record is copied WHOLE, which
+    is O(1): its dynamic fields share by reference, exactly as TArrayBindEntry.Saved already relies on. }
+  TArrayPrivSave = record
+    SlotId: Integer;          // PHYSICAL slot in the VM's array table
+    Saved: TArrayStorage;     // what the caller's invocation had there
+  end;
+
   TArrayBindEntry = record
     SlotId: Integer;
     ArgId: Integer;
@@ -129,6 +136,8 @@ type
     // frame that did NOT relocate (the copying path ran instead), so pop knows not to slide back.
     SaveDeltaI: Integer;
     SaveHwI: Integer;
+    // ⛔ The proc-local array mark does NOT live here: it lives in FrameMarkArrSave, grown in step
+    // with FrameMarks and read with the same index.
   end;
   PFrameMark = ^TFrameMark;
 
@@ -227,6 +236,8 @@ type
     FrameWidthStr: array of Int64;
     FrameWidthTop: Integer;
     FrameRecBase: array of Integer;
+    FrameArrSaveBase: array of Integer;   // the same mark, for the path that does not use FrameMarks
+    FrameMarkArrSave: array of Integer;   // ...and for the FrameMarks path, indexed by FrameMarkTop
     FrameBlockMarkTop: array of Integer;
     FrameRecBaseTop: Integer;
 
@@ -272,6 +283,14 @@ type
     // the param's storage and thereby breaks the shared reference) is propagated back on unbind.
     ArrayBindStack: array of TArrayBindEntry;
     ArrayBindTop: Integer;
+
+    // --- Proc-local array identity PER INVOCATION (22 Aug 2026) ---
+    // ⛔ A DIM inside a SUB writes the context's physical slot IN PLACE, so a recursive call used to
+    // destroy the values of the level that called it: rec(3) printed 108 where fbc prints 198. The
+    // frame marks its top here; the DIM pushes what was in the slot and starts clean; the pop puts it
+    // back. Same shape as the record heap (FrameRecBase) and as the array-parameter bind stack above.
+    ArrPrivSave: array of TArrayPrivSave;
+    ArrPrivSaveTop: Integer;
 
     // --- Array identity (M?, 21 Aug 2026): logical array id -> PHYSICAL slot in the VM's array table ---
     // ⛔ A proc-local array used to be ONE storage for the whole program: the slot id is an immediate

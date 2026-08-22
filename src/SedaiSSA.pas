@@ -83,6 +83,11 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    StructGroup: Integer;   // an anonymous "Type ... End Type" block inside a UNION: its members are
+                            // SEQUENTIAL among themselves while the union overlaps the groups. 0 = none.
+    UnionGroup: Integer;    // a nested "Union ... End Union" block inside this TYPE: every field of the
+                            // same block shares its start, and the block is as wide as its widest member.
+                            // 0 = not in one. (A whole-type UNION is IsUnion instead, and predates this.)
     ByteOffset: Integer;    // A3: the field's offset in the record's LIVE byte image (UDTLiveLayout).
                             // Computed for EVERY field of EVERY type, including the ones UDTCLayout
                             // declines - see UDTLiveLayout for the rule and for why a fixed-length
@@ -284,6 +289,11 @@ type
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
     FAddrTakenScalars: TStringList;      // program-wide @-taken builtin SCALARS (local DIMs + params): name (UPPER) -> type. Raw-backed for bit-exact @/deref (type-punning). Used by CollectRawPtrVars (persistent, unlike per-proc FAddrLocalVars).
+    // MODULE-level @-taken scalar that stayed SAME-BANK, so it is array-backed rather than raw:
+    // name (UPPER) -> declared type. It exists for ONE reason: turning the scalar into a 1-element
+    // array is what LOSES its declared width - the declaration is rewritten, so RecordVarWidth never
+    // runs for it - and LEN then answered the array's element size, 1, where fbc answers the type's.
+    FAddrSharedScalars: TStringList;
     FRawModuleScalars: TStringList;      // MODULE-level @-taken builtin scalars: name (UPPER) -> type. Raw byte slot whose address lives in a shared int array "<name>$RA" (cross-proc visible), so @/deref are bit-exact like the local case.
     FScalarPtrBanks: TStringList;        // name (UPPER) -> distinct bank chars of pointers taking its @ (I/F/$). A module scalar is raw-backed (RAWMODULE) ONLY if a DIFFERENT-bank pointer takes its @ (genuine type-punning); a same-bank-only scalar stays SHARED/managed so @/varptr/byref/pointer-param keep working across call boundaries.
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
@@ -1124,6 +1134,8 @@ begin
   FAddrTakenScalars.CaseSensitive := False;
   FRawModuleScalars := TStringList.Create;
   FRawModuleScalars.CaseSensitive := False;
+  FAddrSharedScalars := TStringList.Create;
+  FAddrSharedScalars.CaseSensitive := False;
   FScalarPtrBanks := TStringList.Create;
   FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
@@ -1221,6 +1233,7 @@ begin
   FPointerVars.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
+  FAddrSharedScalars.Free;
   FScalarPtrBanks.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
@@ -18142,10 +18155,11 @@ function TSSAGenerator.UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; 
 // and the whole point of "sig(0 To 5) As UByte" over a file header. UDTCLayout itself stays strict: it
 // serves binary GET/PUT, where an array member is a separate transfer and must not silently change shape.
 var
-  i, n: Integer;
-  Sz, Al, MaxAl, Ofs, Cnt, EB: Int64;
+  i, k, n, GrpCur: Integer;
+  Sz, Al, MaxAl, Ofs, Cnt, EB, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
 begin
   Result := False;
+  GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
   SetLength(Offsets, 0); TotalSize := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   if FUDTs[UDTIdx].IsUnion then Exit;
@@ -18169,10 +18183,44 @@ begin
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
     if Al > MaxAl then MaxAl := Al;
-    if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
-    Offsets[i] := Ofs;
-    Ofs := Ofs + Sz;
+    // A nested "Union ... End Union" block: its members all start where the BLOCK starts and it is as
+    // wide as its widest member. ⛔ THREE layout routines say this, not one - UDTCLayoutRaw,
+    // UDTCLayout and ComputeUDTLiveLayout. Fixing only the live one made the members ALIAS correctly
+    // while OffsetOf still answered 16 and SizeOf 24, which is how the other two were found. The
+    // block start is aligned to the WIDEST member (hence the pre-scan): C aligns the union, not
+    // whichever member happens to come first.
+    if FUDTs[UDTIdx].Fields[i].UnionGroup <> 0 then
+    begin
+      if FUDTs[UDTIdx].Fields[i].UnionGroup <> GrpCur then
+      begin
+        if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
+        GrpCur := FUDTs[UDTIdx].Fields[i].UnionGroup;
+        GrpAl := 1;
+        for k := i to n - 1 do
+          if FUDTs[UDTIdx].Fields[k].UnionGroup = GrpCur then
+          begin
+            UDTFieldCShape(UDTIdx, k, Sz2, Al2);
+            if (FUDTs[UDTIdx].FieldAlign > 0) and (Al2 > FUDTs[UDTIdx].FieldAlign) then
+              Al2 := FUDTs[UDTIdx].FieldAlign;
+            if Al2 < 1 then Al2 := 1;
+            if Al2 > GrpAl then GrpAl := Al2;
+          end;
+        if GrpAl > MaxAl then MaxAl := GrpAl;
+        if (Ofs mod GrpAl) <> 0 then Ofs := Ofs + (GrpAl - (Ofs mod GrpAl));
+        GrpBase := Ofs; GrpMax := 0;
+      end;
+      Offsets[i] := GrpBase;
+      if Sz > GrpMax then GrpMax := Sz;
+    end
+    else
+    begin
+      if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;
+      if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
+      Offsets[i] := Ofs;
+      Ofs := Ofs + Sz;
+    end;
   end;
+  if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   TotalSize := Ofs;
   Result := n > 0;
@@ -19167,10 +19215,11 @@ function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out
 // Returns False when the type has a shape whose image we cannot reproduce (a variable-length string,
 // an array or nested-record member): those hold a pointer/descriptor in C, not the data.
 var
-  i, n: Integer;
-  Sz, Al, MaxAl, Ofs: Int64;
+  i, k, n, GrpCur: Integer;
+  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
 begin
   Result := False;
+  GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
   SetLength(Offsets, 0); TotalSize := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   if FUDTs[UDTIdx].IsUnion then Exit;   // overlapping members: not a sequential image
@@ -19186,10 +19235,44 @@ begin
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
     if Al > MaxAl then MaxAl := Al;
-    if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
-    Offsets[i] := Ofs;
-    Ofs := Ofs + Sz;
+    // A nested "Union ... End Union" block: its members all start where the BLOCK starts and it is as
+    // wide as its widest member. ⛔ THREE layout routines say this, not one - UDTCLayoutRaw,
+    // UDTCLayout and ComputeUDTLiveLayout. Fixing only the live one made the members ALIAS correctly
+    // while OffsetOf still answered 16 and SizeOf 24, which is how the other two were found. The
+    // block start is aligned to the WIDEST member (hence the pre-scan): C aligns the union, not
+    // whichever member happens to come first.
+    if FUDTs[UDTIdx].Fields[i].UnionGroup <> 0 then
+    begin
+      if FUDTs[UDTIdx].Fields[i].UnionGroup <> GrpCur then
+      begin
+        if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
+        GrpCur := FUDTs[UDTIdx].Fields[i].UnionGroup;
+        GrpAl := 1;
+        for k := i to n - 1 do
+          if FUDTs[UDTIdx].Fields[k].UnionGroup = GrpCur then
+          begin
+            UDTFieldCShape(UDTIdx, k, Sz2, Al2);
+            if (FUDTs[UDTIdx].FieldAlign > 0) and (Al2 > FUDTs[UDTIdx].FieldAlign) then
+              Al2 := FUDTs[UDTIdx].FieldAlign;
+            if Al2 < 1 then Al2 := 1;
+            if Al2 > GrpAl then GrpAl := Al2;
+          end;
+        if GrpAl > MaxAl then MaxAl := GrpAl;
+        if (Ofs mod GrpAl) <> 0 then Ofs := Ofs + (GrpAl - (Ofs mod GrpAl));
+        GrpBase := Ofs; GrpMax := 0;
+      end;
+      Offsets[i] := GrpBase;
+      if Sz > GrpMax then GrpMax := Sz;
+    end
+    else
+    begin
+      if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;
+      if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
+      Offsets[i] := Ofs;
+      Ofs := Ofs + Sz;
+    end;
   end;
+  if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   TotalSize := Ofs;
   Result := n > 0;
@@ -19406,12 +19489,44 @@ function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
 // store-narrowing and print machinery maintain: FPointerVars, FVarWidthCode (1..7 = the
 // sub-64-bit kinds + Single), FVarPrintKind (1 = Boolean); a declared wide numeric is 8.
 var
-  Nm: string;
-  idx: Integer;
+  Nm, Nm2: string;
+  idx, Idx2: Integer;
 begin
   Result := -1;
   if not FModernMode then Exit;
   Nm := UpperCase(Name);
+  // ⛔ AN @-TAKEN MODULE SCALAR IS STILL ITS DECLARED TYPE. Taking the address of a module-level
+  // builtin scalar whose pointer is in the SAME bank turns it into a 1-element SHARED ARRAY (the
+  // raw-byte backing is only for genuine cross-bank type-punning), and that rewrite is what LOSES
+  // the declared width: RecordVarWidth never runs for the rewritten declaration, so the array guard
+  // below fired and LEN fell through to the string path, which answers 1.
+  // Measured 22 Aug 2026 against fbc: `Dim As Integer c: Var p = @c: Print Len(c)` said 1 where fbc
+  // says 8, and a Short said 1 where fbc says 2. ⭐ Inside a PROCEDURE the same program was already
+  // right (8): there the scalar is raw-backed and FAddrLocalVars keeps its type. Only the module
+  // path lost it, which is why the declared type is now kept at the rewrite.
+  // ⚠️ Strings are excluded: a fixed-length ZSTRING/WSTRING measures its declared CAPACITY, which is
+  // the string path's business further down, not a type size.
+  // Three registries, one question, and each one is the ONLY place that still knows the answer for
+  // its case: FAddrLocalVars a proc-local @-taken scalar, FRawModuleScalars a module one that is
+  // raw-backed (cross-bank punning), FAddrSharedScalars a module one that stayed array-backed.
+  // ⛔ The proc-local case looked already correct and was not: an Integer answered 8 by falling
+  // through to the wide default, so only a NARROW type showed it - a Short answered 8 where fbc
+  // says 2. Covering the module case is what made that visible.
+  Nm2 := '';
+  Idx2 := FAddrLocalVars.IndexOfName(Nm);
+  if Idx2 >= 0 then Nm2 := UpperCase(FAddrLocalVars.ValueFromIndex[Idx2])
+  else
+  begin
+    Idx2 := FRawModuleScalars.IndexOfName(Nm);
+    if Idx2 >= 0 then Nm2 := UpperCase(FRawModuleScalars.ValueFromIndex[Idx2])
+    else
+    begin
+      Idx2 := FAddrSharedScalars.IndexOfName(Nm);
+      if Idx2 >= 0 then Nm2 := UpperCase(FAddrSharedScalars.ValueFromIndex[Idx2]);
+    end;
+  end;
+  if (Nm2 <> '') and (Nm2 <> 'STRING') and (Nm2 <> 'ZSTRING') and (Nm2 <> 'WSTRING') then
+    Exit(TypeSizeBytes(Nm2));
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
   if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
   if GetVariableType(Nm) = srtString then Exit;
@@ -20957,6 +21072,8 @@ begin
       // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
+      FUDTs[Idx].Fields[n].UnionGroup := StrToIntDef(FieldNode.Attributes.Values['UNIONGRP'], 0);
+      FUDTs[Idx].Fields[n].StructGroup := StrToIntDef(FieldNode.Attributes.Values['STRUCTGRP'], 0);
       if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
          (not FUDTs[Idx].Fields[n].IsWString) and (not FUDTs[Idx].Fields[n].IsZString) then
         FHasFixedLenFields := True;
@@ -21014,14 +21131,16 @@ procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
   record with an array member still cannot be PUT to a file byte-faithfully, and closing that is
   its own piece of work. }
 var
-  i, n, WireW: Integer;
-  Sz, Al, MaxAl, Ofs: Int64;
+  i, k, n, WireW, GrpCur, SGrpCur: Integer;
+  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, SGrpOfs: Int64;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   n := Length(FUDTs[UDTIdx].Fields);
   FUDTs[UDTIdx].LiveBytes := 0;
   if n = 0 then Exit;
   MaxAl := 1; Ofs := 0;
+  GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1;
+  SGrpCur := 0; SGrpOfs := 0;
   for i := 0 to n - 1 do
   begin
     UDTFieldCShape(UDTIdx, i, Sz, Al);
@@ -21032,12 +21151,56 @@ begin
     if Al > MaxAl then MaxAl := Al;
     if FUDTs[UDTIdx].IsUnion then
     begin
-      // every member starts at zero; the type is as big as its widest member
-      FUDTs[UDTIdx].Fields[i].ByteOffset := 0;
-      if Sz > Ofs then Ofs := Sz;
+      if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
+      begin
+        // An anonymous "Type ... End Type" INSIDE a union: its members run one after another from the
+        // union's start, and the union is as big as the widest of its members AND groups. This is the
+        // mirror of the nested-union case and the whole point of udt/union.bas: "ul As ULong"
+        // overlapping "ub0..ub3", where the four bytes must be at 0,1,2,3 and not all at 0.
+        if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
+        FUDTs[UDTIdx].Fields[i].ByteOffset := SGrpOfs;
+        SGrpOfs := SGrpOfs + Sz;
+        if SGrpOfs > Ofs then Ofs := SGrpOfs;
+      end
+      else
+      begin
+        // every member starts at zero; the type is as big as its widest member
+        SGrpCur := 0;
+        FUDTs[UDTIdx].Fields[i].ByteOffset := 0;
+        if Sz > Ofs then Ofs := Sz;
+      end;
+    end
+    else if FUDTs[UDTIdx].Fields[i].UnionGroup <> 0 then
+    begin
+      // A NESTED "Union ... End Union": every member of the block starts where the BLOCK starts, and
+      // the block is as wide as its widest member. Aligning the block start to the widest member's
+      // alignment is why the group is pre-scanned rather than aligned to whoever comes first - the
+      // first member can be a Byte and the second a Double, and C aligns the union, not the member.
+      if FUDTs[UDTIdx].Fields[i].UnionGroup <> GrpCur then
+      begin
+        if GrpCur <> 0 then Ofs := GrpBase + GrpMax;      // close the previous block
+        GrpCur := FUDTs[UDTIdx].Fields[i].UnionGroup;
+        GrpAl := 1;
+        for k := i to n - 1 do
+          if FUDTs[UDTIdx].Fields[k].UnionGroup = GrpCur then
+          begin
+            UDTFieldCShape(UDTIdx, k, Sz2, Al2);
+            if (FUDTs[UDTIdx].FieldAlign > 0) and (Al2 > FUDTs[UDTIdx].FieldAlign) then
+              Al2 := FUDTs[UDTIdx].FieldAlign;
+            if Al2 > GrpAl then GrpAl := Al2;
+          end;
+        if GrpAl > MaxAl then MaxAl := GrpAl;
+        if (Ofs mod GrpAl) <> 0 then Ofs := Ofs + (GrpAl - (Ofs mod GrpAl));
+        GrpBase := Ofs; GrpMax := 0;
+      end;
+      FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase;
+      if Sz > GrpMax then GrpMax := Sz;
     end
     else
     begin
+      if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;   // a block just ended
       if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
       FUDTs[UDTIdx].Fields[i].ByteOffset := Ofs;
       Ofs := Ofs + Sz;
@@ -21066,6 +21229,7 @@ begin
         (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (WireW and $F);
     end;
   end;
+  if GrpCur <> 0 then Ofs := GrpBase + GrpMax;        // a block that runs to the end of the type
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   FUDTs[UDTIdx].LiveBytes := Ofs;
 end;
@@ -24458,7 +24622,12 @@ begin
             if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
           end
           else
+          begin
             Decl.Attributes.Values['SHARED'] := '1';      // module STRING / DIM SHARED / same-bank @: shared array
+            // Keep the declared type: the rewrite is what loses it, and LEN needs it back.
+            if FAddrSharedScalars.IndexOfName(VNameU) < 0 then
+              FAddrSharedScalars.Add(VNameU + '=' + VTypeU);
+          end;
         end;
       end;
     end;
