@@ -232,7 +232,11 @@ begin
   // it against anything that did. It surfaced only because zeroing FHotOp at JIT loop headers made
   // --jit trace those lines while the interpreter still did not, and the differential net caught the
   // two engines disagreeing. Fix the cause: no C loop while tracing, and both engines trace fully.
-  HotCOk := (not Assigned(FEventPollCallback)) and (not Ctx.TraceActive) and
+  // HOTC_FORCE=1 ignores ONLY the event-poll gate, so that what a BACK-EDGE BUDGET would be worth
+  // can be MEASURED before one is built. ⛔ It is a stopwatch, not a mode: with it on, a fully
+  // covered loop never returns, so the window stops answering events for the length of the run.
+  HotCOk := ((not Assigned(FEventPollCallback)) or (GetEnvironmentVariable('HOTC_FORCE') = '1'))
+            and (not Ctx.TraceActive) and
             ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0')) and
             ((not JitOn) or (GetEnvironmentVariable('HOTC_JIT') <> '0'));
   if GetEnvironmentVariable('HOTC_OFF') = '1' then HotCOk := False;
