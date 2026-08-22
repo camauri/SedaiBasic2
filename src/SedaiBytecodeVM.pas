@@ -9147,7 +9147,8 @@ function sedai_hot_run(prog: PBytecodeInstruction; ireg: PInt64; freg: PDouble;
                        pc, count: LongInt; tv: Int64;
                        arrdesc: Pointer; flags: LongInt;
                        xi: PInt64; xf: PDouble; hidx: PWord;
-                       recdesc: PInt64; backedge_budget: LongInt): LongInt; cdecl; external;
+                       recdesc: PInt64; backedge_budget: LongInt;
+                       gfxdesc: PInt64): LongInt; cdecl; external;
 { The opcode list in DISPATCH-TABLE order, published by the C file so that nothing here holds a
   second copy of it. Entry j is run by arm j, which is what makes FHotOpBase an index. }
 function sedai_hot_ops(out list: PWord): LongInt; cdecl; external;

@@ -81,6 +81,11 @@ var
   HotNewPC: LongInt;       // NEGATIVE means the back-edge budget ran out, with the PC as -(pc+1)
   HotBudget: LongInt;      // back edges this stay may take; High(LongInt) when nobody needs pumping
   HotBudgetExit: Boolean;  // this return was the budget running out, not an uncovered opcode
+  // PSET's descriptor. Built HERE because this is the side that knows when a PSET is nothing but a
+  // store: the C arm is handed a null base whenever it is not, and refuses itself wholesale.
+  HotGfxDesc: array[0..4] of Int64;
+  HotGfxBase: Pointer;
+  HotGfxW, HotGfxH: Integer;
   HotArrDesc: Pointer;
   HotFlags: LongInt;       // bit0: an out-of-bounds access must NOT raise; bit1: MODERN rounding
   HotXferI: PInt64;        // the SUB/FUNCTION argument banks of THIS context - never baked in,
@@ -406,6 +411,25 @@ begin
       // name one another thread minted mid-run without synchronising first, which is the same
       // assumption the Pascal side already makes. If that retirement policy ever changes, this is
       // the second place that depends on it.
+      // ⛔ EVERY condition under which PSET does more than one store must appear here, because the C
+      // arm tests none of them - it tests the base and trusts this. Palette mode searches for the
+      // nearest index and writes a second buffer; a clip, a WINDOW transform or a VIEW offset all
+      // change WHERE the pixel lands; a draw target that is not the work page is a different surface
+      // entirely. Rebuilt per entry, which is safe because every statement that could change any of
+      // these is itself outside the C loop and so ends the stay first.
+      HotGfxDesc[0] := 0;
+      if Assigned(FGraphics) and (not FGfxWinActive)
+         and (FGfxViewOffsetX = 0) and (FGfxViewOffsetY = 0) then
+      begin
+        if FGraphics.PixelStoreTarget(DrawSurface, HotGfxBase, HotGfxW, HotGfxH) then
+        begin
+          HotGfxDesc[0] := PtrUInt(HotGfxBase);
+          HotGfxDesc[1] := HotGfxW;
+          HotGfxDesc[2] := HotGfxH;
+          HotGfxDesc[3] := PtrUInt(@FDrawPenX);
+          HotGfxDesc[4] := PtrUInt(@FDrawPenY);
+        end;
+      end;
       if Length(Ctx.Records) > 0 then HotRecDesc[0] := PtrUInt(@Ctx.Records[0]) else HotRecDesc[0] := 0;
       if FSharedRecLockFree and (Length(FSharedRecords) > 0) then
         HotRecDesc[3] := PtrUInt(@FSharedRecords[0])
@@ -413,7 +437,7 @@ begin
         HotRecDesc[3] := 0;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
                                 HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0],
-                                HotBudget);
+                                HotBudget, @HotGfxDesc[0]);
       // A NEGATIVE answer is the budget running out, with the PC encoded as -(pc+1): decode it and
       // pump, which is the whole point of having a budget. Any other exit is an opcode this loop does
       // not implement, and there the Pascal instruction counter keeps pumping as it always did.

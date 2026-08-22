@@ -92,6 +92,7 @@ double tan(double);
   X(0x0201, MathCos               ) \
   X(0x0202, MathTan               ) \
   X(0x0209, MathInt               ) \
+  X(0x0A1A, GfxPset               ) \
   X(0x0309, ArrayLBound           ) \
   X(0x0014, IntToFloat            ) \
   X(0x001A, CmpEqInt              ) \
@@ -199,7 +200,8 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
                   int pc, int count, int64_t tv,
                   const int64_t *arrdesc, int flags,
                   int64_t *xi, double *xf, const uint16_t *hidx,
-                  const int64_t *recdesc, int backedge_budget)
+                  const int64_t *recdesc, int backedge_budget,
+                  const int64_t *gfxdesc)
 {
   int be_ = backedge_budget;
   /* RECORD FIELDS. recdesc is built on the Pascal side, which is the side that knows the layout of
@@ -389,6 +391,26 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
   /* INT() is FLOOR, not truncation - Int(-1.5) is -2 - which is FloorDouble on the Pascal side and
      __builtin_floor here. Exact in both, so no dialect bit and no way for the two to disagree. */
   L_MathInt: freg[I->dest] = __builtin_floor(freg[I->s1]);                     pc++; NEXT;
+
+  /* PSET (x,y),colour. gfxdesc is built by the Pascal side, which is the side that knows when this
+     store is the WHOLE of what PSET does, and it hands over a NULL base whenever it is not: palette
+     mode (which searches for the nearest index), an active clip, a WINDOW transform, a VIEW offset,
+     or a draw target that is not the plain work page. One test at the top, and the arm is refused
+     wholesale - the same shape recdesc uses for a locked shared record.
+        [0] framebuffer base of the draw surface, 0 = not ours
+        [1] width in pixels   [2] height in pixels
+        [3] address of FDrawPenX   [4] address of FDrawPenY
+     ⚠️ The pen is set even when the point falls OUTSIDE the surface, because the interpreter sets it
+     after SetPixel unconditionally and POINTCOORD reads it. Clipping the store but not the pen is
+     what the Pascal arm does, so it is what this one does. */
+  L_GfxPset:
+      if (!gfxdesc || !gfxdesc[0]) return pc;
+      { int64_t x_ = ireg[I->s1], y_ = ireg[I->s2];
+        if (x_ >= 0 && x_ < gfxdesc[1] && y_ >= 0 && y_ < gfxdesc[2])
+          ((uint32_t *)(intptr_t)gfxdesc[0])[y_ * gfxdesc[1] + x_] = (uint32_t)ireg[I->imm];
+        *(int32_t *)(intptr_t)gfxdesc[3] = (int32_t)x_;
+        *(int32_t *)(intptr_t)gfxdesc[4] = (int32_t)y_; }
+      pc++; NEXT;
 
   /* LBOUND(arr, dim). Only dim 0 is in the descriptor, so other dimensions and the rank query (a
      NEGATIVE index, which answers 1) hand the PC back - the same line the JIT draws from the same

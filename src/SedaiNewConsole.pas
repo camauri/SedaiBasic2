@@ -317,6 +317,7 @@ type
     // methods of different signatures. This is the live graphics device for running programs on sbv. ===
     function  GBSetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
     function  GBResizeScreen(W, H, Depth: Integer): Boolean;
+    function  GBPixelStoreTarget(Surface: TGfxSurface; out Base: Pointer; out W, H: Integer): Boolean;
     function  GBGetMode: TGraphicMode;
     function  GBInGraphics: Boolean;
     procedure GBClearSurface(Surface: TGfxSurface; Color: TGfxColor);
@@ -347,6 +348,7 @@ type
     procedure GBResetPalette;
     function  IGraphicsBackend.SetMode = GBSetMode;
     function  IGraphicsBackend.ResizeScreen = GBResizeScreen;
+    function  IGraphicsBackend.PixelStoreTarget = GBPixelStoreTarget;
     function  IGraphicsBackend.GetMode = GBGetMode;
     function  IGraphicsBackend.InGraphics = GBInGraphics;
     procedure IGraphicsBackend.ClearSurface = GBClearSurface;
@@ -3809,6 +3811,16 @@ begin
 end;
 
 // === TVideoController IGraphicsBackend implementation (delegates to the existing drawing methods) ===
+
+function TVideoController.GBPixelStoreTarget(Surface: TGfxSurface; out Base: Pointer;
+                                             out W, H: Integer): Boolean;
+// Refused, deliberately. This controller owns an SDL2 surface and makes no promise to keep the
+// pixels in a plain 32-bpp buffer of its own, so the C hot loop's PSET arm must not write one.
+// Answering False costs speed and never correctness; it can be implemented the day someone
+// measures that sbv wants it.
+begin
+  Base := nil; W := 0; H := 0; Result := False;
+end;
 
 function TVideoController.GBSetMode(Mode: TGraphicMode; ClearBuffer: Boolean; SplitLine: Integer): Boolean;
 begin

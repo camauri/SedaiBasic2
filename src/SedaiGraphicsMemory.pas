@@ -138,6 +138,9 @@ type
     property State: TGraphicsState read FState write FState;
     property GraphicsBuffer: PByte read FGraphicsBuffer;
     property GraphicsBufferSize: Integer read FGraphicsBufferSize;   // bytes; 32bpp, Width*Height*4
+    // Read-only, and it exists so the C hot loop's PSET arm can be REFUSED while a clip is in
+    // force: that arm writes the framebuffer directly and knows nothing about clipping.
+    property ClipActive: Boolean read FClipActive;
     property ColorBuffer: PByte read FColorBuffer;
     property Palette[Index: TPaletteIndex]: UInt32 read GetPaletteColor write SetPaletteColor;
   end;
