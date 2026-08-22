@@ -3605,6 +3605,7 @@ var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum: TASTNode;
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur: Integer;
+  NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   IsStaticField, LeadingType, FpIsFP: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
@@ -3613,6 +3614,7 @@ begin
   CurAccess := '';
   NestedUnionDepth := 0;
   UnionGrpSeq := 0; UnionGrpCur := 0;
+  NestedStructDepth := 0; StructGrpCur := 0;
   // TYPE/UNION name <newline> field AS type <newline> ... END TYPE/END UNION
   // Each field node is antIdentifier(fieldName) with one child antIdentifier(typeName).
   // An empty type name child means "infer from the field's name suffix" (SSA side).
@@ -3798,6 +3800,27 @@ begin
       Context.Advance; Context.Advance;               // consume END UNION
       Continue;
     end;
+    // ...AND ITS MIRROR: an ANONYMOUS "Type ... End Type" block. Inside a UNION it is what makes the
+    // members SEQUENTIAL while the union overlaps the groups - "Union: ul As ULong / Type: ub0..ub3"
+    // is the whole point of udt/union.bas. The parser used to see the bare TYPE, demand a type name
+    // and fail outright ("is a reserved word and cannot be used as a type name"), so three manual
+    // examples never even parsed. Only the ANONYMOUS form is a block: "Type Name" is still a nested
+    // type declaration and is left to whoever handled it before.
+    if Context.Check(ttTypeDecl) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttEndOfLine) then
+    begin
+      Inc(NestedStructDepth);
+      if NestedStructDepth = 1 then begin Inc(UnionGrpSeq); StructGrpCur := UnionGrpSeq; end;
+      Context.Advance; Continue;
+    end;
+    if (NestedStructDepth > 0) and Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttTypeDecl) then
+    begin
+      Dec(NestedStructDepth);
+      if NestedStructDepth = 0 then StructGrpCur := 0;
+      Context.Advance; Context.Advance;               // consume END TYPE
+      Continue;
+    end;
     if (NestedUnionDepth = 0) and AtEndType then Break;
     // FreeBASIC nested ENUM inside a TYPE: "Type T : Enum e : a : b : End Enum : ... : End Type". Its
     // members are ordinary module-wide constants (reachable bare, or as "T.e.member"), not fields — so
@@ -3961,6 +3984,7 @@ begin
         end;
       end;
       if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
+      if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
       Result.AddChild(FieldNode);
       if (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
         Result.Attributes.Values['ACCESS' + UpperCase(VarToStr(FieldNode.Value))] := CurAccess;
@@ -4003,6 +4027,7 @@ begin
             end;
           end;
           if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
+      if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
           Result.AddChild(FieldNode);
         end;
     end

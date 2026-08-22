@@ -83,6 +83,8 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    StructGroup: Integer;   // an anonymous "Type ... End Type" block inside a UNION: its members are
+                            // SEQUENTIAL among themselves while the union overlaps the groups. 0 = none.
     UnionGroup: Integer;    // a nested "Union ... End Union" block inside this TYPE: every field of the
                             // same block shares its start, and the block is as wide as its widest member.
                             // 0 = not in one. (A whole-type UNION is IsUnion instead, and predates this.)
@@ -21071,6 +21073,7 @@ begin
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
       FUDTs[Idx].Fields[n].UnionGroup := StrToIntDef(FieldNode.Attributes.Values['UNIONGRP'], 0);
+      FUDTs[Idx].Fields[n].StructGroup := StrToIntDef(FieldNode.Attributes.Values['STRUCTGRP'], 0);
       if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
          (not FUDTs[Idx].Fields[n].IsWString) and (not FUDTs[Idx].Fields[n].IsZString) then
         FHasFixedLenFields := True;
@@ -21128,8 +21131,8 @@ procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
   record with an array member still cannot be PUT to a file byte-faithfully, and closing that is
   its own piece of work. }
 var
-  i, k, n, WireW, GrpCur: Integer;
-  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
+  i, k, n, WireW, GrpCur, SGrpCur: Integer;
+  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, SGrpOfs: Int64;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   n := Length(FUDTs[UDTIdx].Fields);
@@ -21137,6 +21140,7 @@ begin
   if n = 0 then Exit;
   MaxAl := 1; Ofs := 0;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1;
+  SGrpCur := 0; SGrpOfs := 0;
   for i := 0 to n - 1 do
   begin
     UDTFieldCShape(UDTIdx, i, Sz, Al);
@@ -21147,9 +21151,26 @@ begin
     if Al > MaxAl then MaxAl := Al;
     if FUDTs[UDTIdx].IsUnion then
     begin
-      // every member starts at zero; the type is as big as its widest member
-      FUDTs[UDTIdx].Fields[i].ByteOffset := 0;
-      if Sz > Ofs then Ofs := Sz;
+      if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
+      begin
+        // An anonymous "Type ... End Type" INSIDE a union: its members run one after another from the
+        // union's start, and the union is as big as the widest of its members AND groups. This is the
+        // mirror of the nested-union case and the whole point of udt/union.bas: "ul As ULong"
+        // overlapping "ub0..ub3", where the four bytes must be at 0,1,2,3 and not all at 0.
+        if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
+        FUDTs[UDTIdx].Fields[i].ByteOffset := SGrpOfs;
+        SGrpOfs := SGrpOfs + Sz;
+        if SGrpOfs > Ofs then Ofs := SGrpOfs;
+      end
+      else
+      begin
+        // every member starts at zero; the type is as big as its widest member
+        SGrpCur := 0;
+        FUDTs[UDTIdx].Fields[i].ByteOffset := 0;
+        if Sz > Ofs then Ofs := Sz;
+      end;
     end
     else if FUDTs[UDTIdx].Fields[i].UnionGroup <> 0 then
     begin
