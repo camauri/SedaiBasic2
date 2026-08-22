@@ -284,6 +284,11 @@ type
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
     FAddrTakenScalars: TStringList;      // program-wide @-taken builtin SCALARS (local DIMs + params): name (UPPER) -> type. Raw-backed for bit-exact @/deref (type-punning). Used by CollectRawPtrVars (persistent, unlike per-proc FAddrLocalVars).
+    // MODULE-level @-taken scalar that stayed SAME-BANK, so it is array-backed rather than raw:
+    // name (UPPER) -> declared type. It exists for ONE reason: turning the scalar into a 1-element
+    // array is what LOSES its declared width - the declaration is rewritten, so RecordVarWidth never
+    // runs for it - and LEN then answered the array's element size, 1, where fbc answers the type's.
+    FAddrSharedScalars: TStringList;
     FRawModuleScalars: TStringList;      // MODULE-level @-taken builtin scalars: name (UPPER) -> type. Raw byte slot whose address lives in a shared int array "<name>$RA" (cross-proc visible), so @/deref are bit-exact like the local case.
     FScalarPtrBanks: TStringList;        // name (UPPER) -> distinct bank chars of pointers taking its @ (I/F/$). A module scalar is raw-backed (RAWMODULE) ONLY if a DIFFERENT-bank pointer takes its @ (genuine type-punning); a same-bank-only scalar stays SHARED/managed so @/varptr/byref/pointer-param keep working across call boundaries.
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
@@ -1124,6 +1129,8 @@ begin
   FAddrTakenScalars.CaseSensitive := False;
   FRawModuleScalars := TStringList.Create;
   FRawModuleScalars.CaseSensitive := False;
+  FAddrSharedScalars := TStringList.Create;
+  FAddrSharedScalars.CaseSensitive := False;
   FScalarPtrBanks := TStringList.Create;
   FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
@@ -1221,6 +1228,7 @@ begin
   FPointerVars.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
+  FAddrSharedScalars.Free;
   FScalarPtrBanks.Free;
   FAddrLocalVars.Free;
   FRefVars.Free;
@@ -19406,12 +19414,44 @@ function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
 // store-narrowing and print machinery maintain: FPointerVars, FVarWidthCode (1..7 = the
 // sub-64-bit kinds + Single), FVarPrintKind (1 = Boolean); a declared wide numeric is 8.
 var
-  Nm: string;
-  idx: Integer;
+  Nm, Nm2: string;
+  idx, Idx2: Integer;
 begin
   Result := -1;
   if not FModernMode then Exit;
   Nm := UpperCase(Name);
+  // ⛔ AN @-TAKEN MODULE SCALAR IS STILL ITS DECLARED TYPE. Taking the address of a module-level
+  // builtin scalar whose pointer is in the SAME bank turns it into a 1-element SHARED ARRAY (the
+  // raw-byte backing is only for genuine cross-bank type-punning), and that rewrite is what LOSES
+  // the declared width: RecordVarWidth never runs for the rewritten declaration, so the array guard
+  // below fired and LEN fell through to the string path, which answers 1.
+  // Measured 22 Aug 2026 against fbc: `Dim As Integer c: Var p = @c: Print Len(c)` said 1 where fbc
+  // says 8, and a Short said 1 where fbc says 2. ⭐ Inside a PROCEDURE the same program was already
+  // right (8): there the scalar is raw-backed and FAddrLocalVars keeps its type. Only the module
+  // path lost it, which is why the declared type is now kept at the rewrite.
+  // ⚠️ Strings are excluded: a fixed-length ZSTRING/WSTRING measures its declared CAPACITY, which is
+  // the string path's business further down, not a type size.
+  // Three registries, one question, and each one is the ONLY place that still knows the answer for
+  // its case: FAddrLocalVars a proc-local @-taken scalar, FRawModuleScalars a module one that is
+  // raw-backed (cross-bank punning), FAddrSharedScalars a module one that stayed array-backed.
+  // ⛔ The proc-local case looked already correct and was not: an Integer answered 8 by falling
+  // through to the wide default, so only a NARROW type showed it - a Short answered 8 where fbc
+  // says 2. Covering the module case is what made that visible.
+  Nm2 := '';
+  Idx2 := FAddrLocalVars.IndexOfName(Nm);
+  if Idx2 >= 0 then Nm2 := UpperCase(FAddrLocalVars.ValueFromIndex[Idx2])
+  else
+  begin
+    Idx2 := FRawModuleScalars.IndexOfName(Nm);
+    if Idx2 >= 0 then Nm2 := UpperCase(FRawModuleScalars.ValueFromIndex[Idx2])
+    else
+    begin
+      Idx2 := FAddrSharedScalars.IndexOfName(Nm);
+      if Idx2 >= 0 then Nm2 := UpperCase(FAddrSharedScalars.ValueFromIndex[Idx2]);
+    end;
+  end;
+  if (Nm2 <> '') and (Nm2 <> 'STRING') and (Nm2 <> 'ZSTRING') and (Nm2 <> 'WSTRING') then
+    Exit(TypeSizeBytes(Nm2));
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
   if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
   if GetVariableType(Nm) = srtString then Exit;
@@ -24458,7 +24498,12 @@ begin
             if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
           end
           else
+          begin
             Decl.Attributes.Values['SHARED'] := '1';      // module STRING / DIM SHARED / same-bank @: shared array
+            // Keep the declared type: the rewrite is what loses it, and LEN needs it back.
+            if FAddrSharedScalars.IndexOfName(VNameU) < 0 then
+              FAddrSharedScalars.Add(VNameU + '=' + VTypeU);
+          end;
         end;
       end;
     end;
