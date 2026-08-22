@@ -12620,7 +12620,14 @@ begin
           3: Ctx.IntRegs[Instr.Dest] := DayOfTheYear(dtVal);   // y (day of year)
           4: Ctx.IntRegs[Instr.Dest] := DayOf(dtVal);          // d
           5: Ctx.IntRegs[Instr.Dest] := DayOfWeek(dtVal);      // w (1=Sunday)
-          6: Ctx.IntRegs[Instr.Dest] := WeekOfTheYear(dtVal);  // ww
+          // ww - ⛔ NOT WeekOfTheYear. That is ISO 8601: weeks start on MONDAY and week 1 is the one
+          // holding the first Thursday. VB and fbc use a different definition entirely - week 1 is the
+          // week CONTAINING 1 January and weeks start on SUNDAY - and the two agree most of the time,
+          // which is why this survived: measured 23 Aug 2026 over 48 dates, 7 differed and every one
+          // of them was a SUNDAY, the day the VB week turns over and the ISO one does not.
+          //   offset from the Sunday that opens week 1 = (dayOfYear - 1) + (weekday(Jan 1) - 1)
+          6: Ctx.IntRegs[Instr.Dest] :=
+               ((DayOfTheYear(dtVal) - 1) + (DayOfWeek(EncodeDate(YearOf(dtVal), 1, 1)) - 1)) div 7 + 1;
           7: Ctx.IntRegs[Instr.Dest] := HourOf(dtVal);
           8: Ctx.IntRegs[Instr.Dest] := MinuteOf(dtVal);
           9: Ctx.IntRegs[Instr.Dest] := SecondOf(dtVal);

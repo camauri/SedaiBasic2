@@ -2499,6 +2499,7 @@ End Function
 | `HOUR` | ✓ | `HOUR(serial)` -> 0..23. |
 | `DAY` | ✓ | `DAY(serial)` -> 1..31. Intercepted by name so `day` stays usable as a variable. |
 | `WEEKDAY` | ✓ | `WEEKDAY(serial)` -> 1=Sunday..7=Saturday. |
+| `DATEPART("ww")` | ✓ | Week number by the **VB rule**, which is what `fbc` answers: week 1 is the week *containing* 1 January and weeks start on **Sunday**. ⚠️ Not ISO 8601 (Monday-based, week 1 = the week of the first Thursday); the two agree except on Sundays. Measured against `fbc` over 48 dates, 23 Aug 2026. |
 | `MONTH` | ✓ | `MONTH(serial)` -> 1..12. Intercepted by name (not a reserved word). |
 | `YEAR` | ✓ | `YEAR(serial)` -> integer. Intercepted by name (not a reserved word). |
 | `DATEPART` | ✓ | `DATEPART(interval$, serial)` -> component. Intervals: `yyyy q m y d w ww h n s`. |
