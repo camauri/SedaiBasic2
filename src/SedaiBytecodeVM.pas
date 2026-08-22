@@ -462,6 +462,11 @@ type
     // Event polling callback for UI responsiveness
     FEventPollCallback: TEventPollCallback;
     FEventPollInterval: Integer;
+    // ⛔ TWO CALLBACKS, NOT ONE, and the split is the whole point. The POLL runs on an instruction
+    // counter and must stay cheap; PRESENT runs at a frame boundary and may be expensive. Sharing one
+    // callback meant the instruction counter decided how often the screen was shown - 158 times per
+    // frame on a compute-heavy program, at about 0.7 ms each.
+    FPresentCallback: TEventPollCallback;
     // Present cadence for a windowed run (0 = off, which is every target except `sb --window`)
     FPresentCadenceMs: LongWord;
     FLastPresentTick: QWord;
@@ -528,6 +533,7 @@ type
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    function PresentNow: Boolean;
     procedure MaybePresentCadence(Ctx: TExecutionContext);   // windowed runs only; see the body
     procedure PresentBeforeFullRepaint(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -798,6 +804,7 @@ type
     // Event polling callback (for deferred rendering during VM execution)
     property EventPollCallback: TEventPollCallback read FEventPollCallback write FEventPollCallback;
     property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
+    property PresentCallback: TEventPollCallback read FPresentCallback write FPresentCallback;
     // Minimum milliseconds between presents driven from the graphics opcodes. 0 disables the
     // mechanism entirely, which is the default and what every target other than `sb --window`
     // leaves it at, so nothing else changes behaviour or pays more than one integer compare.
@@ -1357,6 +1364,7 @@ begin
   FScreenLockDepth := 0;
   FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
+  FPresentCallback := nil;
   // Initialize error state for EL, ER, ERR$
   FCtx.LastErrorLine := 0;
   FCtx.LastErrorCode := 0;
@@ -14232,14 +14240,7 @@ begin
       begin
         if FScreenLockDepth > 0 then Dec(FScreenLockDepth);
         if (FScreenLockDepth = 0) and (FPresentCadenceMs > 0) then
-        begin
-          if Assigned(FEventPollCallback) then
-          begin
-            if FEventPollCallback() then Ctx.Running := False;
-          end
-          else
-            PresentFrame;
-        end;
+          if PresentNow then Ctx.Running := False;
       end;
     63: // bcGfxScreenPtr - SCREENPTR: a raw pointer to the working page's framebuffer.
         //  Offset 0 of the framebuffer REGION of the raw-pointer namespace: dereferencing it goes through
@@ -14572,12 +14573,18 @@ begin
 
   // The picture standing in the buffer is finished. Show it, then let the clear happen.
   FFrameBoundarySeen := True;
-  if Assigned(FEventPollCallback) then
-  begin
-    if FEventPollCallback() then Ctx.Running := False;
-  end
-  else
-    PresentFrame;
+  if PresentNow then Ctx.Running := False;
+end;
+
+function TBytecodeVM.PresentNow: Boolean;
+// Show the picture, through the PRESENT callback and not the poll one. Returns True if the window was
+// closed. Falls back to the poll callback for any front end that has not been split yet, and to the
+// direct PresentFrame when there is no callback at all.
+begin
+  Result := False;
+  if Assigned(FPresentCallback) then Result := FPresentCallback()
+  else if Assigned(FEventPollCallback) then Result := FEventPollCallback()
+  else PresentFrame;
 end;
 
 procedure TBytecodeVM.MaybePresentCadence(Ctx: TExecutionContext);
@@ -14594,14 +14601,7 @@ begin
   if Tick - FLastPresentTick < FPresentCadenceMs then Exit;
   FLastPresentTick := Tick;
 
-  if Assigned(FEventPollCallback) then
-  begin
-    // The callback both presents and pumps events, and returns True when the window was closed.
-    if FEventPollCallback() then
-      Ctx.Running := False;
-  end
-  else
-    PresentFrame;
+  if PresentNow then Ctx.Running := False;
 end;
 
 {$IFDEF WITH_SEDAI_AUDIO}
