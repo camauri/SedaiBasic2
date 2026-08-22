@@ -13818,7 +13818,12 @@ var
   ScrData: PByte;      // SCREENPTR: working-page pixel bytes (existence check only)
   ScrSize: Integer;
 begin
-  if FPresentCadenceMs > 0 then PresentBeforeFullRepaint(Ctx, Instr);
+  // ⛔ THE TEST IS INLINE AND THE CALL IS NOT MADE WHILE LOCKED. Both of these run once per GRAPHICS
+  // OPERATION - 62 500 times a frame in a demo that plots points - and a call that returns immediately
+  // still costs its call. Measured: with the frame bracketed by SCREENLOCK the two of them were 5.8 ms
+  // of a 24 ms frame, about 47 ns per call. Inside a lock neither can do anything anyway: the boundary
+  // is the UNLOCK, so testing the depth here is strictly better than testing it inside.
+  if (FPresentCadenceMs > 0) and (FScreenLockDepth = 0) then PresentBeforeFullRepaint(Ctx, Instr);
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
   if FHasWorkers and not IsRenderOwner then
@@ -14510,7 +14515,7 @@ begin
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
 
-  if FPresentCadenceMs > 0 then MaybePresentCadence(Ctx);
+  if (FPresentCadenceMs > 0) and (FScreenLockDepth = 0) then MaybePresentCadence(Ctx);
 end;
 
 // Present the framebuffer on a wall-clock cadence, driven from the graphics opcodes.

@@ -610,6 +610,8 @@ begin
     // deliberately left at 0 everywhere else (sbv, sbw, headless sb), which is what keeps this
     // from interfering with SedaiVision's own rendering.
     AVM.PresentCadenceMs := 16;
+    if GetEnvironmentVariable('SB_POLL_EVERY') <> '' then
+      AVM.EventPollInterval := StrToIntDef(GetEnvironmentVariable('SB_POLL_EVERY'), 10000);
     Exit;
   end;
   {$ENDIF}

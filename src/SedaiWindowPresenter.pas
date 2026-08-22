@@ -57,6 +57,9 @@ implementation
 
 var
   GPumpCalls: Int64 = 0;
+  GPumpNs: Int64 = 0;
+  GPumpT0: Int64 = 0;
+  GPumpT1: Int64 = 0;
 
 {$IFDEF WITH_WINDOW}
 
@@ -232,6 +235,12 @@ var
   Src: PByte;
 begin
   Inc(GPumpCalls);
+  // SB_NO_PUMP=1: count the call but do nothing. An A/B knob on ONE binary, which is how the windowed
+  // frame time was split into its three parts - the C hot loop being off (29%), the mere presence of
+  // the window (52%) and the present itself (19%). Two separately linked binaries could not have
+  // answered that: this project has measured 14% from code alignment alone.
+  if GetEnvironmentVariable('SB_NO_PUMP') = '1' then begin Result := FClosed; Exit; end;
+  GPumpT0 := GetTickCount64;
   // Drain the SDL event queue (quit / window close -> request abort).
   while SDL_PollEvent(@Event) <> 0 do
   begin
@@ -268,6 +277,8 @@ begin
     SDL_RenderPresent(FRenderer);
   end;
 
+  GPumpT1 := GetTickCount64;
+  Inc(GPumpNs, GPumpT1 - GPumpT0);
   Result := FClosed;
 end;
 
@@ -277,7 +288,7 @@ procedure TWindowPresenter.ReportPumpCalls;
 // frame - which no amount of reading the code had suggested, and one present per frame is 61.
 begin
   if GetEnvironmentVariable('PUMP_DIAG') = '1' then
-    WriteLn(ErrOutput, Format('[pump] presentazioni = %d', [GPumpCalls]));
+    WriteLn(ErrOutput, Format('[pump] presentazioni = %d, tempo totale = %.0f ms (%.2f ms l''una)', [GPumpCalls, GPumpNs*1.0, GPumpNs*1.0/GPumpCalls]));
 end;
 
 procedure TWindowPresenter.WaitClose;
