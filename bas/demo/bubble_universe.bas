@@ -95,6 +95,7 @@
 ''      sb bas/demo/bubble_universe.bas 300             stop after 300 frames (for timing runs)
 ''      sb bas/demo/bubble_universe.bas 1 dump.ppm      render ONE frame and write it as a PPM
 ''      sb bas/demo/bubble_universe.bas 1 out.ppm 0.0   ...at a FIXED phase, for comparison
+''      sb bas/demo/bubble_universe.bas 0 "" 0 0.15      run with a different animation speed
 ''
 ''  The third form exists because a still is the only way to inspect the figure when there is no
 ''  window - but see the warning at DumpFrame: a still is blind to everything that goes wrong
@@ -119,12 +120,31 @@ Const K      = 1.0          '' FEEDBACK INTENSITY, and the one knob that changes
 
 Const TWOPI  = 6.283185307179586
 
-'' Animation speed, in phase units per SECOND OF WALL CLOCK. Markowski advances t by 1/30 per frame
-'' at a 30 Hz frame rate, i.e. exactly 1.0 per second; we keep that speed but drive t from the clock
-'' instead of from the frame counter. The difference matters on a machine that cannot hold the target
-'' rate: a per-frame step would make the figure evolve in slow motion instead of dropping frames,
-'' which is the wrong failure - the viewer should see the same animation, less smoothly.
-Const PHASE_RATE = 1.0
+'' ---- animation speed ---------------------------------------------------------------------------
+'' Phase units per SECOND OF WALL CLOCK. t is driven from the clock and not from the frame counter,
+'' and that is what makes SPEED and FLUIDITY independent here: lowering this slows the figure without
+'' dropping a single frame. On a machine that cannot hold the frame rate it also fails the right way -
+'' the viewer sees the same animation less smoothly, rather than the same smoothness in slow motion.
+''
+'' ⛔ WHY NOT THE REFERENCE'S 1.0. Markowski advances t by 1/30 per frame at 30 Hz, i.e. exactly 1.0
+'' per second, and at that speed the figure is unwatchable - it reads as flicker rather than motion.
+'' Measured rather than eyeballed, by rendering two consecutive frames and comparing them:
+''
+''   PHASE_RATE   structure changed between consecutive frames (20x20 density blocks)
+''      1.00                       25.0%      <- the reference: a quarter of the picture, every frame
+''      0.25                        9.3%
+''      0.12                        6.3%
+''      0.06                        3.2%      <- here
+''      0.015                       1.3%      <- so slow it reads as a still
+''
+'' ⚠️ AND THE PER-PIXEL VIEW SAYS SOMETHING ELSE ENTIRELY: at the reference speed 148% of the LIT
+'' PIXELS change between two frames - more than there are lit pixels, because the old ones go dark and
+'' new ones appear elsewhere. Even 33 times slower it is still 63%. The recurrence is CHAOTIC: the
+'' feedback amplifies any change in t, so no individual point ever persists from one frame to the next
+'' and per-pixel smoothness is not available at any speed. What the eye follows is the ENVELOPE - the
+'' spiral eyes and the arms - which is why the number that matters is the structural one above, and
+'' why slowing the phase works at all.
+Const PHASE_RATE = 0.06
 
 '' ---- plotting geometry -----------------------------------------------------------------------
 '' A point is drawn at c + RAD*Z with |Z| <= 2 (see THE RECURRENCE), so the disc exactly fills the
@@ -264,6 +284,9 @@ End Sub
 Dim As Integer maxFrames = 0            '' 0 = run until a key is pressed
 If Len(Command(1)) > 0 Then maxFrames = CInt(Command(1))
 Dim As String dumpName = Command(2)     '' non-empty = write the LAST frame as a PPM and exit
+'' A fourth argument overrides the speed, so it can be tuned by watching instead of by rebuilding.
+Dim As Double phaseRate = PHASE_RATE
+If Len(Command(4)) > 0 Then phaseRate = Val(Command(4))
 
 BuildPalette()
 ScreenRes N, N, 32
@@ -321,7 +344,7 @@ Do
   If frame > 8 And ms > worst Then worst = ms
 
   '' Advance the animation by REAL elapsed time - see PHASE_RATE.
-  t += PHASE_RATE * dt
+  t += phaseRate * dt
 
   frame += 1
   If maxFrames > 0 And frame >= maxFrames Then Exit Do
