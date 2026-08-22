@@ -499,6 +499,8 @@ begin
     ssaLoadERMN: Result := bcLoadERMN;
     ssaWInputChars: Result := bcWInputChars;
     ssaGfxScreenPtr: Result := bcGfxScreenPtr;
+    ssaScreenLock: Result := bcGfxScreenLock;
+    ssaScreenUnlock: Result := bcGfxScreenUnlock;
     ssaGfxImageConvertRow: Result := bcGfxImageConvertRow;
     ssaInputChars: Result := bcInputChars;
     ssaLoadDS: Result := bcLoadDS;

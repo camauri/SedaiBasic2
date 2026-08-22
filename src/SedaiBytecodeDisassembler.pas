@@ -483,6 +483,10 @@ begin
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'ConLocate', Instr.Src1, Instr.Src2]);
     bcConViewPrint:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'ConViewPrint', Instr.Src1, Instr.Src2]);
+    bcGfxScreenLock:
+      Line := Format('%4d: %-20s', [Index, 'ScreenLock']);
+    bcGfxScreenUnlock:
+      Line := Format('%4d: %-20s', [Index, 'ScreenUnlock']);
     bcGfxScreenPtr:
       Line := Format('%4d: %-20s R%d', [Index, 'GfxScreenPtr', Instr.Dest]);
     bcCsrlin:

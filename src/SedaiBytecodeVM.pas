@@ -462,10 +462,20 @@ type
     // Event polling callback for UI responsiveness
     FEventPollCallback: TEventPollCallback;
     FEventPollInterval: Integer;
+    // ⛔ TWO CALLBACKS, NOT ONE, and the split is the whole point. The POLL runs on an instruction
+    // counter and must stay cheap; PRESENT runs at a frame boundary and may be expensive. Sharing one
+    // callback meant the instruction counter decided how often the screen was shown - 158 times per
+    // frame on a compute-heavy program, at about 0.7 ms each.
+    FPresentCallback: TEventPollCallback;
     // Present cadence for a windowed run (0 = off, which is every target except `sb --window`)
     FPresentCadenceMs: LongWord;
     FLastPresentTick: QWord;
     FFrameBoundarySeen: Boolean;   // the program repaints the whole screen: use that, not the clock
+    // SCREENLOCK / SCREENUNLOCK depth. While positive the picture in the buffer is HALF DRAWN and must
+    // not be shown: that is the whole definition of the statement, and it is what the clock-driven
+    // cadence could never know. Counted rather than flagged so nested locks - a SUB that brackets its
+    // own drawing inside a caller that already did - unwind correctly instead of presenting early.
+    FScreenLockDepth: Integer;
     // SPRDEF modal sprite editor callback (set by the SDL console; nil elsewhere)
     FSpriteEditorCallback: TSpriteEditorCallback;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -523,6 +533,7 @@ type
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    function PresentNow: Boolean;
     procedure MaybePresentCadence(Ctx: TExecutionContext);   // windowed runs only; see the body
     procedure PresentBeforeFullRepaint(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSoundOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -793,6 +804,7 @@ type
     // Event polling callback (for deferred rendering during VM execution)
     property EventPollCallback: TEventPollCallback read FEventPollCallback write FEventPollCallback;
     property EventPollInterval: Integer read FEventPollInterval write FEventPollInterval;
+    property PresentCallback: TEventPollCallback read FPresentCallback write FPresentCallback;
     // Minimum milliseconds between presents driven from the graphics opcodes. 0 disables the
     // mechanism entirely, which is the default and what every target other than `sb --window`
     // leaves it at, so nothing else changes behaviour or pays more than one integer compare.
@@ -1349,8 +1361,10 @@ begin
   FPresentCadenceMs := 0;      // off unless a windowed front end asks for it
   FLastPresentTick := 0;
   FFrameBoundarySeen := False;
+  FScreenLockDepth := 0;
   FSpriteEditorCallback := nil;
   FEventPollInterval := 10000;  // Poll every 10000 instructions by default
+  FPresentCallback := nil;
   // Initialize error state for EL, ER, ERR$
   FCtx.LastErrorLine := 0;
   FCtx.LastErrorCode := 0;
@@ -13804,7 +13818,12 @@ var
   ScrData: PByte;      // SCREENPTR: working-page pixel bytes (existence check only)
   ScrSize: Integer;
 begin
-  if FPresentCadenceMs > 0 then PresentBeforeFullRepaint(Ctx, Instr);
+  // ⛔ THE TEST IS INLINE AND THE CALL IS NOT MADE WHILE LOCKED. Both of these run once per GRAPHICS
+  // OPERATION - 62 500 times a frame in a demo that plots points - and a call that returns immediately
+  // still costs its call. Measured: with the frame bracketed by SCREENLOCK the two of them were 5.8 ms
+  // of a 24 ms frame, about 47 ns per call. Inside a lock neither can do anything anyway: the boundary
+  // is the UNLOCK, so testing the depth here is strictly better than testing it inside.
+  if (FPresentCadenceMs > 0) and (FScreenLockDepth = 0) then PresentBeforeFullRepaint(Ctx, Instr);
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
   if FHasWorkers and not IsRenderOwner then
@@ -14213,6 +14232,21 @@ begin
         if (GetX1 >= 0) and (GetX1 <= High(FGfxPages)) and (GetY1 >= 0) and (GetY1 <= High(FGfxPages)) and (GetX1 <> GetY1) then
           FGraphics.Blit(FGfxPages[GetY1], 0, 0, FGfxPages[GetX1], gbmPSet);
       end;
+    66: // bcGfxScreenLock - SCREENLOCK: the frame starts here; suppress every present until it ends.
+      begin
+        Inc(FScreenLockDepth);
+        // A program that locks has TOLD us where its frames end, so the clock-driven guess must stop
+        // guessing - permanently, not just while locked. Leaving it on would present between the
+        // unlock and the next lock, which is a gap of microseconds and produces a flicker that looks
+        // random because it depends on when the 16 ms tick lands.
+        FFrameBoundarySeen := True;
+      end;
+    67: // bcGfxScreenUnlock - SCREENUNLOCK: the picture is finished. Show it, exactly once.
+      begin
+        if FScreenLockDepth > 0 then Dec(FScreenLockDepth);
+        if (FScreenLockDepth = 0) and (FPresentCadenceMs > 0) then
+          if PresentNow then Ctx.Running := False;
+      end;
     63: // bcGfxScreenPtr - SCREENPTR: a raw pointer to the working page's framebuffer.
         //  Offset 0 of the framebuffer REGION of the raw-pointer namespace: dereferencing it goes through
         //  the ordinary raw load/store path, which bounds-checks against the surface's byte size. FB
@@ -14481,7 +14515,7 @@ begin
     raise Exception.CreateFmt('Unknown graphics opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
 
-  if FPresentCadenceMs > 0 then MaybePresentCadence(Ctx);
+  if (FPresentCadenceMs > 0) and (FScreenLockDepth = 0) then MaybePresentCadence(Ctx);
 end;
 
 // Present the framebuffer on a wall-clock cadence, driven from the graphics opcodes.
@@ -14527,6 +14561,7 @@ procedure TBytecodeVM.PresentBeforeFullRepaint(Ctx: TExecutionContext; const Ins
 var
   X1, Y1, X2, Y2, W, H: Integer;
 begin
+  if FScreenLockDepth > 0 then Exit;   // inside a lock the boundary is the UNLOCK, not a guess
   if Instr.OpCode <> bcGfxLine then Exit;
   if ((Instr.Immediate shr 48) and $3) <> 2 then Exit;        // not BF: not a filled box
   if not Assigned(FGraphics) then Exit;
@@ -14543,18 +14578,25 @@ begin
 
   // The picture standing in the buffer is finished. Show it, then let the clear happen.
   FFrameBoundarySeen := True;
-  if Assigned(FEventPollCallback) then
-  begin
-    if FEventPollCallback() then Ctx.Running := False;
-  end
-  else
-    PresentFrame;
+  if PresentNow then Ctx.Running := False;
+end;
+
+function TBytecodeVM.PresentNow: Boolean;
+// Show the picture, through the PRESENT callback and not the poll one. Returns True if the window was
+// closed. Falls back to the poll callback for any front end that has not been split yet, and to the
+// direct PresentFrame when there is no callback at all.
+begin
+  Result := False;
+  if Assigned(FPresentCallback) then Result := FPresentCallback()
+  else if Assigned(FEventPollCallback) then Result := FEventPollCallback()
+  else PresentFrame;
 end;
 
 procedure TBytecodeVM.MaybePresentCadence(Ctx: TExecutionContext);
 var
   Tick: QWord;
 begin
+  if FScreenLockDepth > 0 then Exit; // ⛔ the picture is half drawn: showing it IS the tearing
   if FFrameBoundarySeen then Exit;   // the program has a real frame boundary; the clock would only
                                      // catch it mid-picture and make it flicker
   // GetTickCount64 reads a shared page on Windows and a monotonic clock on Linux: cheap enough to
@@ -14564,14 +14606,7 @@ begin
   if Tick - FLastPresentTick < FPresentCadenceMs then Exit;
   FLastPresentTick := Tick;
 
-  if Assigned(FEventPollCallback) then
-  begin
-    // The callback both presents and pumps events, and returns True when the window was closed.
-    if FEventPollCallback() then
-      Ctx.Running := False;
-  end
-  else
-    PresentFrame;
+  if PresentNow then Ctx.Running := False;
 end;
 
 {$IFDEF WITH_SEDAI_AUDIO}

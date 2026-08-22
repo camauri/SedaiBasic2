@@ -599,13 +599,19 @@ begin
     // ...and the backend itself, so PRINT inside a FreeBASIC graphics mode lands on that same surface.
     if Assigned(GTermCtrl) then GTermCtrl.AttachGraphicsBackend(SW);
     GPresenter := TWindowPresenter.Create(SW, 'SedaiBasic');
-    AVM.EventPollCallback := @GPresenter.Pump;   // present + pump events during execution
+    // ⛔ THE SPLIT: the POLL drains events (cheap, on an instruction counter), the PRESENT shows the
+    // picture (expensive, at a frame boundary). Wiring Pump to the poll made the instruction counter
+    // decide the frame rate - 158 presents per frame on a compute-heavy program.
+    AVM.EventPollCallback := @GPresenter.PollEvents;
+    AVM.PresentCallback := @GPresenter.Pump;
     // ...but the dispatch loop only reaches that callback at blocking points, so a graphics
     // program with no SLEEP in its loop would never present. Ask the VM for a wall-clock cadence
     // from the graphics opcodes as well. 16 ms = about 60 presents a second. This property is
     // deliberately left at 0 everywhere else (sbv, sbw, headless sb), which is what keeps this
     // from interfering with SedaiVision's own rendering.
     AVM.PresentCadenceMs := 16;
+    if GetEnvironmentVariable('SB_POLL_EVERY') <> '' then
+      AVM.EventPollInterval := StrToIntDef(GetEnvironmentVariable('SB_POLL_EVERY'), 10000);
     Exit;
   end;
   {$ENDIF}
@@ -625,6 +631,7 @@ begin
   if Assigned(GPresenter) then
   begin
     AVM.EventPollCallback := nil;
+    GPresenter.ReportPumpCalls;
     // FreeBASIC convention: the program terminates at END and the window closes with it. To keep the
     // window visible after drawing, the program waits (SLEEP / a GETKEY loop) — those keep the event
     // pump alive and presenting. We do NOT block here, so `END` actually ends the program.
@@ -2513,7 +2520,17 @@ begin
         OptJitProfile := True   // JIT J1: profile hot loops (back-edge counts) and dump them after the run
       {$ENDIF}
       else if Param = '--window' then
-        OptWindow := True   // present graphics in an SDL2 window (WITH_WINDOW build only; ignored otherwise)
+      begin
+        OptWindow := True;   // present graphics in an SDL2 window
+        {$IFNDEF WITH_WINDOW}
+        // ⛔ SAY SO. WITH_WINDOW is a {$DEFINE}, so on a build without it this flag used to be accepted
+        // and IGNORED: the program ran headless, printed its frame rate, exited cleanly - and no window
+        // ever appeared. Nothing was wrong with the program, nothing was wrong with the command line,
+        // and there was no way to tell from the outside. That is the same shape as an exit code of 0
+        // meaning "did not complain" rather than "worked".
+        WriteLn(ErrOutput, '?--window: this build has no window presenter (rebuild with: ./build.sh sb --window)');
+        {$ENDIF}
+      end
       else if (Param = '--help') or (Param = '-h') or (Param = '-?') then
         OptHelp := True
       {$IFDEF ENABLE_PROFILER}
