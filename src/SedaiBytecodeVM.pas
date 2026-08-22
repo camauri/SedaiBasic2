@@ -617,6 +617,7 @@ type
     // what was pushed, reading the width back off the frame-width stack.
     function FramePushIsAllocFree(Ctx: TExecutionContext; TargetPC: Integer): Boolean;
     procedure FramePush(Ctx: TExecutionContext; TargetPC: Integer = -1; CallPC: Integer = -1);
+    procedure ArrPrivRestoreSlow(Ctx: TExecutionContext; Base: Integer);
     procedure FramePop(Ctx: TExecutionContext);
     // Size the integer bank to LogicalCount slots PLUS the relocatable frame region above them,
     // then reset the view to offset 0. Every reallocation of IntRegsMem must go through here, or
@@ -3802,7 +3803,10 @@ begin
       if Ctx.RegHwI + FBHi <= Ctx.RegFrameCap then
       begin
         if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+        begin
           SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+          SetLength(Ctx.FrameMarkArrSave, Ctx.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+        end;
         with Ctx.FrameMarks[Ctx.FrameMarkTop] do
         begin
           SaveDeltaI := Ctx.RegDeltaI;
@@ -3811,6 +3815,7 @@ begin
           RecBase := Ctx.RecordCount;
           BlockMark := Ctx.BlockRecMarkTop;
         end;
+        Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] := Ctx.ArrPrivSaveTop;
         Inc(Ctx.FrameMarkTop);
         Ctx.RegDeltaI := Ctx.RegHwI - FBLo;
         Inc(Ctx.RegHwI, FBHi);
@@ -3851,7 +3856,10 @@ begin
          ((FProcWidths[TargetPC].WFloat shr 32) = 0) and ((FProcWidths[TargetPC].WStr shr 32) = 0) then
       begin
         if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+        begin
           SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+          SetLength(Ctx.FrameMarkArrSave, Ctx.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+        end;
         with Ctx.FrameMarks[Ctx.FrameMarkTop] do
         begin
           SaveDeltaI := SaveDelta;
@@ -3860,6 +3868,7 @@ begin
           RecBase := Ctx.RecordCount;
           BlockMark := Ctx.BlockRecMarkTop;
         end;
+        Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] := Ctx.ArrPrivSaveTop;
         Inc(Ctx.FrameMarkTop);
         Ctx.RegDeltaI := NewDelta;
         Ctx.RegHwI := NewHw;
@@ -3966,7 +3975,10 @@ begin
   if GFrameMark = 1 then
   begin
     if Ctx.FrameMarkTop >= Length(Ctx.FrameMarks) then
+    begin
       SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
+      SetLength(Ctx.FrameMarkArrSave, Ctx.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+    end;
     with Ctx.FrameMarks[Ctx.FrameMarkTop] do
     begin
       WInt := (Int64(NI) shl 32) or Int64(BI);
@@ -3977,6 +3989,7 @@ begin
       SaveDeltaI := SaveDelta;          // -1 = this frame COPIED: pop must not slide the view back
       SaveHwI := SaveHw;
     end;
+    Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] := Ctx.ArrPrivSaveTop;
     Inc(Ctx.FrameMarkTop);
     // Slide the integer view only now: the copies above had to read the CALLER's float and string
     // banks, and FramePop undoes this from the mark just written.
@@ -4004,10 +4017,36 @@ begin
       SetLength(Ctx.FrameRecBase, Ctx.FrameRecBaseTop + 256);
     if Ctx.FrameRecBaseTop >= Length(Ctx.FrameBlockMarkTop) then
       SetLength(Ctx.FrameBlockMarkTop, Ctx.FrameRecBaseTop + 256);
+    if Ctx.FrameRecBaseTop >= Length(Ctx.FrameArrSaveBase) then
+      SetLength(Ctx.FrameArrSaveBase, Ctx.FrameRecBaseTop + 256);
     Ctx.FrameRecBase[Ctx.FrameRecBaseTop] := Ctx.RecordCount;
     Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop] := Ctx.BlockRecMarkTop;
+    Ctx.FrameArrSaveBase[Ctx.FrameRecBaseTop] := Ctx.ArrPrivSaveTop;
     Inc(Ctx.FrameRecBaseTop);
   end;
+end;
+
+procedure TBytecodeVM.ArrPrivRestoreSlow(Ctx: TExecutionContext; Base: Integer);
+// The COLD half. It is a separate routine for one reason: it needs a TArrayStorage temporary to
+// clear the stack slot, and TArrayStorage is a MANAGED record - so FPC emits fpc_initialize and
+// fpc_finalize in this routine's prologue and epilogue, with RTTI, on EVERY call.
+// ⛔ Measured 22 Aug 2026: with the loop and the guard in ONE routine called from FramePop, a
+// program that never DIMs a private array still paid it once per RETURN. binary-trees went 2980 ->
+// 4460 ms, +50%, and `perf` named it in one run - fpc_initialize 9.4%, fpc_finalize 8.2%,
+// RECORDRTTI 4.6%, dynarray_clear 4.2%, together 26.5% of a benchmark that has no private array at
+// all. Two guesses at the cause (the frame record growing, the extra store) were both wrong.
+var
+  i: Integer;
+begin
+  if GArrPrivDiag then
+    WriteLn(ErrOutput, Format('[arrpriv] RIPRISTINA da %d a %d', [Ctx.ArrPrivSaveTop, Base]));
+  for i := Ctx.ArrPrivSaveTop - 1 downto Base do
+  begin
+    FArrays[Ctx.ArrPrivSave[i].SlotId] := Ctx.ArrPrivSave[i].Saved;
+    Ctx.ArrPrivSave[i].Saved := Default(TArrayStorage);   // drop this stack slot's references
+  end;
+  Ctx.ArrPrivSaveTop := Base;
+  FArraysDirty := True;
 end;
 
 procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
@@ -4096,6 +4135,8 @@ begin
       Ctx.RecordCount := Mark^.RecBase;
     // M8: discard any block marks this frame left dangling (e.g. EXIT SUB from inside a loop).
     Ctx.BlockRecMarkTop := Mark^.BlockMark;
+    if Ctx.ArrPrivSaveTop > Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] then
+      ArrPrivRestoreSlow(Ctx, Ctx.FrameMarkArrSave[Ctx.FrameMarkTop]);
   end
   else if (GFrameMark = 0) and (Ctx.FrameRecBaseTop > 0) then
   begin
@@ -4103,6 +4144,9 @@ begin
     if Ctx.FrameRecBase[Ctx.FrameRecBaseTop] < Ctx.RecordCount then
       Ctx.RecordCount := Ctx.FrameRecBase[Ctx.FrameRecBaseTop];
     Ctx.BlockRecMarkTop := Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop];
+    if (Ctx.FrameRecBaseTop < Length(Ctx.FrameArrSaveBase))
+       and (Ctx.ArrPrivSaveTop > Ctx.FrameArrSaveBase[Ctx.FrameRecBaseTop]) then
+      ArrPrivRestoreSlow(Ctx, Ctx.FrameArrSaveBase[Ctx.FrameRecBaseTop]);
   end;
 end;
 
@@ -9677,7 +9721,10 @@ begin
     Exit(AotCallSub(AotCtx, CalleeEntryPC, BcCallSubPC));                // region full: copy instead
   try
     if C.FrameMarkTop >= Length(C.FrameMarks) then
+    begin
       SetLength(C.FrameMarks, C.FrameMarkTop + 256);
+      SetLength(C.FrameMarkArrSave, C.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+    end;
     VM.GrowCallStackIfNeeded(C);
   except
     C.AotPendingExc := TObject(AcquireExceptionObject);
@@ -9694,6 +9741,7 @@ begin
     RecBase := C.RecordCount;
     BlockMark := C.BlockRecMarkTop;
   end;
+  C.FrameMarkArrSave[C.FrameMarkTop] := C.ArrPrivSaveTop;
   Inc(C.FrameMarkTop);
   C.RegDeltaI := SaveHw - FBLo;
   C.RegHwI := SaveHw + FBHi;
@@ -9810,6 +9858,12 @@ begin
   begin
     Dec(C.CallStackPtr);           // the interpreter's bcReturnSub order: pop, then FramePop
     VM.FramePop(C);
+    // ⛔ AND AGAIN AFTER THE POP. The refresh above happens while the callee's arrays are still
+    // installed; FramePop then restores this frame's own proc-local arrays, which moves their
+    // storage a second time. Refreshing only before the pop left the caller reading the CALLEE's
+    // array: rec(3) answered 138 where the interpreter and the JIT both said 198, with the save and
+    // restore counts IDENTICAL on all three - the bookkeeping was right and the descriptor was stale.
+    VM.EnsureArrDesc(AotCtx);
     if Prof then
     begin
       T3 := AotRdTsc;
@@ -12776,6 +12830,22 @@ begin
                   [Instr.Src1, ArrayIdx, Pointer(Ctx)]));
         if ArrayIdx >= Length(FArrays) then
           SetLength(FArrays, ArrayIdx + 1);
+        // ⛔ A PRIVATE array is one storage PER CONTEXT, and every recursion level runs in the same
+        // context: DIMming it here would destroy the values of the invocation that called us. Push
+        // what is in the slot and start clean; FramePop puts it back. Copying the record is O(1) -
+        // its dynamic fields share by reference - and clearing them is what makes the new DIM
+        // ALLOCATE instead of resizing the storage we just saved.
+        if (Instr.Src1 < Length(FArrPrivSlot)) and (FArrPrivSlot[Instr.Src1] >= 0) then
+        begin
+          if Ctx.ArrPrivSaveTop >= Length(Ctx.ArrPrivSave) then
+            SetLength(Ctx.ArrPrivSave, (Ctx.ArrPrivSaveTop + 1) * 2);
+          Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].SlotId := ArrayIdx;
+          Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Saved := FArrays[ArrayIdx];
+          Inc(Ctx.ArrPrivSaveTop);
+          if GArrPrivDiag then
+            WriteLn(ErrOutput, Format('[arrpriv] SALVA phys %d, pila -> %d', [ArrayIdx, Ctx.ArrPrivSaveTop]));
+          FArrays[ArrayIdx] := Default(TArrayStorage);
+        end;
         FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
         FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
         SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
