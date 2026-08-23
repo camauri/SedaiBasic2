@@ -441,6 +441,7 @@ begin
     ssaGfxLine: Result := bcGfxLine;
     ssaGfxCircle: Result := bcGfxCircle;
     ssaGfxCircleEx: Result := bcGfxCircleEx;
+    ssaGfxCircleExF: Result := bcGfxCircleExF;
     ssaGfxPaintBorder: Result := bcGfxPaintBorder;
     ssaGfxSetTarget: Result := bcGfxSetTarget;
     ssaGfxLineStyled: Result := bcGfxLineStyled;
@@ -1552,9 +1553,14 @@ begin
   // not a definition); Immediate packs RY (PhiSources[0], bits 0-15), color (PhiSources[1], bits 16-31),
   // start-angle-degrees (PhiSources[2], bits 32-47) and end-angle-degrees (PhiSources[3], bits 48-63) —
   // all integer registers (RX/RY and the angle-degree values are precomputed in the SSA generator).
-  if Instr.OpCode = ssaGfxCircleEx then
+  if OpIn(Instr.OpCode, [ssaGfxCircleEx, ssaGfxCircleExF]) then
   begin
-    BCInstr := MakeBytecodeInstruction(bcGfxCircleEx, 0, 0, 0, 0);
+    // ⭐ ONE packing for both: the filled form differs only in the opcode, so the two can never drift
+    // apart in how they read their four register indices.
+    if Instr.OpCode = ssaGfxCircleExF then
+      BCInstr := MakeBytecodeInstruction(bcGfxCircleExF, 0, 0, 0, 0)
+    else
+      BCInstr := MakeBytecodeInstruction(bcGfxCircleEx, 0, 0, 0, 0);
     if Instr.Src1.Kind = svkRegister then
       BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
     if Instr.Src2.Kind = svkRegister then
@@ -1848,6 +1854,11 @@ begin
       BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
       if Instr.Src1.Kind = svkRegister then
         BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      // Src2, when it is a constant, is the PRINT KIND (0 signed / 1 boolean / 2 unsigned-64) the SSA
+      // worked out from the value's declared type. It rides in the Immediate, which this opcode does
+      // not otherwise use.
+      if Instr.Src2.Kind = svkConstInt then
+        BCInstr.Immediate := Instr.Src2.ConstInt;
       FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
       Exit;
     end;

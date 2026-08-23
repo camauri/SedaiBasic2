@@ -940,7 +940,8 @@ begin
       // ⛔ THE UPPER BOUND IS WRITTEN OUT AND NOTHING CHECKS IT. It was 65 until SCREENLOCK and
       // SCREENUNLOCK became real opcodes (subs 66/67), and the failure is not a compile error - it is
       // "Unknown/illegal opcode $0A42" the first time a program executes one.
-      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 67:
+      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 68:   // ⚠️ +68 since bcGfxCircleExF; the range
+                                                             // is written out, so a new sub-op needs it
         begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;

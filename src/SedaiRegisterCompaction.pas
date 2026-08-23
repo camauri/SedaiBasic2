@@ -534,7 +534,9 @@ begin
 
     // CIRCLE (ellipse/arc): Dest=RX (an input, not a def); Immediate [0-15]=RY, [16-31]=color,
     // [32-47]=start°, [48-63]=end° (all int regs). Dest handled here, NOT via the Dest-def lists.
-    if OpCode = bcGfxCircleEx then
+    // ⛔ The FILLED form packs identically, so it belongs to the same test - naming only one of the
+    // two here would compact the outline's registers and leave the filled form reading stale ones.
+    if (OpCode = bcGfxCircleEx) or (OpCode = bcGfxCircleExF) then
     begin
       MarkIntRegUsed(Instr.Dest);                            // RX
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // RY
@@ -1215,10 +1217,10 @@ begin
       end;
     end;
 
-    // bcGfxCircleEx: Dest=RX (an input slot); Immediate [0-15]=RY, [16-31]=color, [32-47]=start°,
-    // [48-63]=end° (all int regs). Dest is remapped here as an input (bcGfxCircleEx is NOT in the
-    // Dest-definition lists, so the generic Dest remap skips it).
-    if OpCode = bcGfxCircleEx then
+    // bcGfxCircleEx / bcGfxCircleExF: Dest=RX (an input slot); Immediate [0-15]=RY, [16-31]=color,
+    // [32-47]=start°, [48-63]=end° (all int regs). Dest is remapped here as an input (neither is in
+    // the Dest-definition lists, so the generic Dest remap skips them).
+    if (OpCode = bcGfxCircleEx) or (OpCode = bcGfxCircleExF) then
     begin
       OldReg := Instr.Dest;                                  // RX
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) and (FIntRegMap[OldReg] <> OldReg) then

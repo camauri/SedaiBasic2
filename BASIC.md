@@ -212,6 +212,21 @@ difference is stated rather than left to be discovered.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
   names an interface must provide every method of it, and it *is-a* that interface for dispatch and
   for `Is`. An fbc source is unaffected, since fbc has no interfaces to name.
+- **A graphics screen is always 32-bit truecolour.** `ScreenRes w, h, depth` and `Screen n` accept
+  every depth the manual lists and give a truecolour surface for all of them; `ScreenInfo` reports
+  `depth = 32`, `bpp = 4`, `pitch = w * 4`, which is what the framebuffer `ScreenPtr` hands out
+  actually is. fbc has real 1/2/4/8-bit palette-indexed screens — and `ScreenRes w, h` with no depth
+  and `Screen 13` are **8-bit** there, so the default mode of most manual examples is a palette one.
+  What follows from that, measured against fbc:
+  - the **width and height** of every mode agree, all 18 of them;
+  - `PSET c` / `POINT` round-trip any value in either engine, so a program that only moves colour
+    numbers around behaves identically;
+  - an **untouched or cleared** screen reads `&hFF000000` here and `0` in an fbc palette mode;
+  - `ScreenInfo`'s depth/bpp/pitch describe our surface, not the requested mode.
+
+  ⛔ Reporting the *requested* depth while handing out a 4-byte-per-pixel buffer would be a lie the
+  `ScreenPtr` idiom (`scrsize = pitch * height`) would write straight past. The honest fix is a real
+  indexed surface, which is work, not a constant.
 
 ### Where the two dialects agree, and why it matters
 

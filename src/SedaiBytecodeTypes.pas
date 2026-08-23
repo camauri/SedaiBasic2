@@ -823,6 +823,10 @@ const
   // numbers when they are wrong.
   bcGfxScreenLock   = bcGroupGraphics + 66;
   bcGfxScreenUnlock = bcGroupGraphics + 67;
+  // CIRCLE ... , F - the FILLED ellipse/arc. A separate opcode rather than a flag because
+  // bcGfxCircleEx's 64-bit Immediate is fully spent on four register indices; the PACKING is
+  // identical, so the two share the compiler branch and the VM arm.
+  bcGfxCircleExF    = bcGroupGraphics + 68;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -2391,6 +2395,7 @@ begin
         65: Result := 'GfxDrawString';
         66: Result := 'GfxScreenLock';
         67: Result := 'GfxScreenUnlock';
+        68: Result := 'GfxCircleExF';
       else
         Result := Format('Graphics_%d', [SubOp]);
       end;

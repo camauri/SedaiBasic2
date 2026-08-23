@@ -639,10 +639,13 @@ begin
 
       // Check if instruction defines a register
       // CRITICAL FIX: Some instructions USE their Dest operand instead of DEFINING it!
-      if (Instr.Dest.Kind = svkRegister) and
-         (Instr.OpCode <> ssaArrayStore) and
-         (Instr.OpCode <> ssaPrint) and
-         (Instr.OpCode <> ssaPrintLn) then
+      // ⛔ The list of those opcodes is DestIsPureDef, and it is derived from the VM (see its body).
+      // This test used to spell out three names of its own - and the two other places in this unit
+      // that ask the same question spelled out six. PRINT# carries the VALUE to print in Dest, so the
+      // renamer gave it a fresh version and the print read a register nothing had ever written: a
+      // variable declared inside ANY inner scope printed empty / 0 to a file, while the same variable
+      // at module scope printed correctly, because global semantics pin every version to 0.
+      if (Instr.Dest.Kind = svkRegister) and DestIsPureDef(Instr.OpCode) then
       begin
         VarIdx := GetOrCreateVarIndex(Instr.Dest.RegType, Instr.Dest.RegIndex);
 
@@ -737,8 +740,7 @@ begin
       // Member-array indirect stores also carry the stored VALUE in Dest (Src1=handle, Src2=index),
       // so Dest is a USE, not a def — else versioning renames the value operand to a fresh version and
       // the store reads an undefined register (m226/m314: storing a versioned param into obj.field(i)).
-      if OpIn(Instr.OpCode, [ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
-                             ssaArrayStoreIndString, ssaPrint, ssaPrintLn]) then
+      if not DestIsPureDef(Instr.OpCode) then
         AddUse(Instr.Dest)
       else
         // Same opcode classification CollectDefinitions uses; the kill comes after the uses.
@@ -1133,8 +1135,7 @@ begin
       // Member-array indirect stores also carry the stored VALUE in Dest (Src1=handle, Src2=index),
       // so Dest is a USE, not a def — else versioning renames the value operand to a fresh version and
       // the store reads an undefined register (m226/m314: storing a versioned param into obj.field(i)).
-      if OpIn(Instr.OpCode, [ssaArrayStore, ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
-                             ssaArrayStoreIndString, ssaPrint, ssaPrintLn]) then
+      if not DestIsPureDef(Instr.OpCode) then
       begin
         // USE Dest - with global semantics keep Version=0
         if not FGlobalVariableSemantics then

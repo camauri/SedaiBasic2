@@ -212,7 +212,7 @@ begin
     bcGraphicWindow,  // Src1 = col1 register (int)
     bcGraphicCircle,  // Src1 = color register (int)
     bcGraphicPaint,   // Src1 = source register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxCircleExF, bcGfxImageConvertRow,
     bcGfxSetTarget,  // SETTARGET: Src1 = image handle (int)  // FreeBASIC graphics: Src1 = w / x / x1 (int)
     bcGfxPalette, bcGfxPalGet,  // PALETTE: Src1 = index (int)
     bcGfxColor,  // COLOR: Src1 = foreground (int)
@@ -404,7 +404,7 @@ begin
     bcGraphicBox, bcGraphicSetMode, bcGraphicRGBA,
     bcGraphicWindow,  // Src2 = row1 register (int)
     bcGraphicCircle,  // Src2 = x register (int)
-    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxImageConvertRow,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
+    bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled, bcGfxCircle, bcGfxCircleEx, bcGfxCircleExF, bcGfxImageConvertRow,  // FreeBASIC graphics: Src2 = h / y / y1 (int)
     bcGfxDrawString,  // DRAW STRING: Src2 = x (int); Src1 is the TEXT and is classified as a string
     bcGfxPalette,  // PALETTE set: Src2 = packed colour (int)
     bcGfxColor,  // COLOR: Src2 = background (int)
@@ -1126,7 +1126,7 @@ begin
     bcCopyFile, bcRenameFile, bcShell,
     bcSoundEnvelope, bcSoundFilter, bcSoundSound,
     bcGfxPset, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled,
-    bcGfxCircle, bcGfxCircleEx, bcGfxGet, bcGfxPut, bcGfxView, bcGfxWindow,
+    bcGfxCircle, bcGfxCircleEx, bcGfxCircleExF, bcGfxGet, bcGfxPut, bcGfxView, bcGfxWindow,
     bcGfxImageCreate, bcGfxImageConvertRow,
     bcGraphicBox, bcGraphicRGBA, bcGraphicSetMode:
       begin

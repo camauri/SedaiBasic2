@@ -878,6 +878,7 @@ type
     // File data I/O
     procedure ProcessGetFile(Node: TASTNode);
     procedure ProcessInputFile(Node: TASTNode);
+    function  FilePrintKind(Child: TASTNode; const ExprVal: TSSAValue): Int64;  // PRINT#/WRITE# form
     procedure ProcessPrintFile(Node: TASTNode);
     procedure ProcessCmd(Node: TASTNode);
     procedure ProcessAppend(Node: TASTNode);
@@ -5133,10 +5134,13 @@ begin
           // PMAP(coord, n) -> mapped coordinate (n: 0=lx->px,1=ly->py,2=px->lx,3=py->ly).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);  // coord
+            // ⛔ FLOAT in and FLOAT out, all four selectors. fbc's PMAP returns a SINGLE: under a
+            // viewport 101 pixels wide, "PMap(5,0)" is 50.5, and the pixel->logical directions are
+            // fractional by construction (PMap(319,2) is 0.99375, which we answered as 1).
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureFloatRegister(ArgValue);  // coord
             ProcessExpression(ArgListNode.GetChild(1), RVal);     // n (constant)
-            DestReg := FProgram.AllocRegister(srtInt);
-            Result := MakeSSARegister(srtInt, DestReg);
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
             if RVal.Kind = svkConstInt then
               EmitInstruction(ssaGfxPMap, Result, ArgReg, MakeSSAValue(svkNone), RVal)
             else
@@ -12708,7 +12712,7 @@ var
   XV, YV, RV, CV, XR, YR, RR, CR, PenX, PenY: TSSAValue;
   AspV, StartV, EndV, RadF, AspF, RYf, RYr, StF, EndF, StDegF, EnDegF, StDeg, EnDeg: TSSAValue;
   Instr: TSSAInstruction;
-  HasArc, HasAspect, HasTarget: Boolean;
+  HasArc, HasAspect, HasTarget, HasFill: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
@@ -12730,7 +12734,13 @@ begin
   HasAspect := Node.Attributes.Values['HASASPECT'] = '1';
   HasTarget := EmitDrawTargetBegin(Node);
 
-  if not HasArc and not HasAspect then
+  // ⛔ The F flag was PARSED AND DROPPED - "no filled-ellipse primitive", said the parser comment, and
+  // 12 manual examples drew an outline where fbc draws a disc (the whole PUT family builds its source
+  // image with one). A filled circle takes the ellipse path even with no arc and no aspect, because
+  // that is the only opcode that carries the two radii.
+  HasFill := Node.Attributes.Values['FILL'] = '1';
+
+  if not HasArc and not HasAspect and not HasFill then
   begin
     // Plain circle: the original, well-tested path (RX = RY = r, full 360°).
     EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
@@ -12775,7 +12785,11 @@ begin
   end;
 
   // ssaGfxCircleEx: Src1=x, Src2=y, Src3=RX; PhiSources[0]=RY, [1]=colour, [2]=start°, [3]=end°.
-  EmitInstruction(ssaGfxCircleEx, MakeSSAValue(svkNone), XR, YR, RR);
+  // ssaGfxCircleExF is the SAME operands, filled - a separate opcode because that Immediate is full.
+  if HasFill then
+    EmitInstruction(ssaGfxCircleExF, MakeSSAValue(svkNone), XR, YR, RR)
+  else
+    EmitInstruction(ssaGfxCircleEx, MakeSSAValue(svkNone), XR, YR, RR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(RYr, nil);
   Instr.AddPhiSource(CR, nil);
@@ -13477,18 +13491,21 @@ var
 
   function ZeroReg: TSSAValue;
   begin
-    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
 begin
   if FCurrentBlock = nil then Exit;
   if Node.ChildCount >= 4 then
   begin
-    ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
-    ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
-    ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
-    ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+    // ⛔ FLOAT bounds. "Window (-2.5,-2.5)-(2.5,2.5)" is the whole point of the statement - a logical
+    // coordinate system that is NOT the pixel grid - and integer registers truncated it to (-2,-2)-(2,2),
+    // which silently rescaled every drawing under it. fbc takes Singles here.
+    ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureFloatRegister(X1V);
+    ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureFloatRegister(Y1V);
+    ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureFloatRegister(X2V);
+    ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureFloatRegister(Y2V);
     Flags := 1;                                    // has-bounds
     if Node.Attributes.Values['SCREEN'] = '1' then Flags := Flags or 2;
   end
@@ -16668,6 +16685,7 @@ procedure TSSAGenerator.EmitWriteFileValues(Node: TASTNode; const HandleReg: TSS
 // INPUT# reads the fields back). Children 1+ are values (separators are ignored — WRITE always uses ',').
 var
   i, vc: Integer;
+  Kind: Int64;
   Child: TASTNode;
   ExprVal, StrReg: TSSAValue;
 
@@ -16703,9 +16721,25 @@ begin
     end
     else if (ExprVal.Kind = svkConstInt) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtInt)) then
     begin
-      StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-      EmitInstruction(ssaIntToString, StrReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      EmitStr(StrReg);
+      // A BOOLEAN or an unsigned value is written in ITS OWN form ("true", no sign space), not through
+      // the signed IntToString: fbc's WRITE# spells them the same way its PRINT does.
+      Kind := FilePrintKind(Child, ExprVal);
+      if Kind = 0 then
+      begin
+        StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaIntToString, StrReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitStr(StrReg);
+      end
+      else if ToConsole then
+      begin
+        if Kind = 1 then
+          EmitInstruction(ssaPrintBool, MakeSSAValue(svkNone), EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        EmitInstruction(ssaPrintFile, EnsureIntRegister(ExprVal), HandleReg,
+                        MakeSSAConstInt(Kind), MakeSSAValue(svkNone));
     end
     else
     begin
@@ -16719,6 +16753,30 @@ begin
     EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
   else
     EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.FilePrintKind(Child: TASTNode; const ExprVal: TSSAValue): Int64;
+// The print form PRINT#/WRITE# must use for this value: 0 = signed, 1 = BOOLEAN ("true"/"false"),
+// 2 = unsigned (no leading sign space). Deliberately the SAME two questions the console PRINT asks -
+// PrintKindOfExpr for a declared type, PrintsUnsigned64Expr for an unsigned-valued expression - so
+// the two paths cannot drift apart again. Kinds 2 and 3 differ only in whether the unsignedness is
+// contagious through arithmetic, which is a question about the EXPRESSION, not about the printing.
+var
+  PK: Integer;
+begin
+  Result := 0;
+  if ExprVal.RegType = srtFloat then
+  begin
+    // A SINGLE prints with 7 significant digits in a file as on screen (fbc writes PMap's 9.90099,
+    // not the double 9.90099048614502). Kind 3 on the FLOAT side means exactly that flag.
+    if IsSingleExpr(Child) then Result := 3;
+    Exit;
+  end;
+  if ExprVal.RegType <> srtInt then Exit;
+  PK := PrintKindOfExpr(Child);
+  if PK = 1 then Exit(1);
+  if (PK = 2) or (PK = 3) then Exit(2);
+  if PrintsUnsigned64Expr(Child) then Exit(2);
 end;
 
 procedure TSSAGenerator.ProcessPrintFile(Node: TASTNode);
@@ -16870,11 +16928,25 @@ begin
     // Dest = value to print, Src1 = file handle
     if ExprVal.Kind in [svkConstFloat, svkConstInt] then
     begin
-      ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-      EmitInstruction(ssaLoadConstFloat, ExprReg, ExprVal,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // A CONSTANT that must print in an unsigned or boolean form goes through the INT path with its
+      // kind, not through the float one: "Print #f, RGB(17,34,51)" folds to a constant, and the float
+      // path has no way to say "no sign space".
+      if (ExprVal.Kind = svkConstInt) and (FilePrintKind(Child, MakeSSARegister(srtInt, 0)) <> 0) then
+      begin
+        ExprReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, ExprReg, ExprVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
+                       MakeSSAConstInt(FilePrintKind(Child, ExprReg)), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+        EmitInstruction(ssaLoadConstFloat, ExprReg, ExprVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end
     else if ExprVal.Kind = svkConstString then
     begin
@@ -16886,9 +16958,13 @@ begin
     end
     else
     begin
-      // Variable or expression - emit directly (type is preserved in register)
+      // Variable or expression - emit directly (type is preserved in register).
+      // ⛔ ...with the PRINT KIND alongside it. A file is not a lesser console: fbc writes "true" for
+      // a BOOLEAN and no sign space for an unsigned there exactly as it does on screen. The console
+      // arm above has decided this since B1.5 and PRINT#/WRITE# had their own lowering that never
+      // asked - so "Print #f, b" wrote -1 while "Print b" wrote true, in the same program.
       EmitInstruction(ssaPrintFile, ExprVal, HandleReg,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                     MakeSSAConstInt(FilePrintKind(Child, ExprVal)), MakeSSAValue(svkNone));
     end;
   end;
 
@@ -19924,6 +20000,10 @@ begin
         if (not Result) and (FCurrentThisType <> '') then
           Result := UDTFieldIsSingle(FCurrentThisType, VarToStr(Node.Value));
       end;
+    antGraphicsFunction:
+      // PMAP returns a SINGLE, and a graphics function is its own node type - the same lookup by name
+      // the ordinary call below does, so a graphics function with no entry answers False as before.
+      Result := PrintKindOf(VarToStr(Node.Value)) = 4;
     antFunctionCall:
       begin
         // A builtin overloaded for a UDT ("Abs(v)" on an "Operator Abs ... As Single") returns whatever
@@ -20007,6 +20087,11 @@ begin
     antIdentifier:
       Result := PrintKindOf(VarToStr(Node.Value));
     antFunctionCall:
+      Result := PrintKindOf(VarToStr(Node.Value));
+    antGraphicsFunction:
+      // RGB/RGBA are graphics-function nodes, not antFunctionCall - and they return a ULONG, which
+      // prints with no leading sign space. Asking the same table by the same name is all this needs;
+      // a graphics function with no entry answers 0 exactly as before.
       Result := PrintKindOf(VarToStr(Node.Value));
     antArrayAccess:
       // "s[i]" on a STRING - a variable or a FIELD - is the BYTE at that index: a UByte, and an unsigned
@@ -30184,6 +30269,20 @@ begin
     FVarPrintKind.AddObject(kLOBYTE, TObject(PtrInt(2)));
     FVarPrintKind.AddObject(kHIWORD, TObject(PtrInt(2)));
     FVarPrintKind.AddObject(kLOWORD, TObject(PtrInt(2)));
+  end;
+  // The three colour-valued graphics functions return a ULONG, and an unsigned prints with NO leading
+  // sign space: "Print Point(x,y)" was a column wider than fbc's for every graphics program.
+  // ⚠️ Kind 3 and not 2, and only fbc settles it: "Point(x,y) - 200" prints WITH a sign space there,
+  // so the unsignedness is NOT contagious through arithmetic the way HiByte's is. Same measurement,
+  // opposite answer - which is why the kind is asked of the oracle and not inferred from the width.
+  if FModernMode then
+  begin
+    FVarPrintKind.AddObject(kPOINT, TObject(PtrInt(3)));
+    FVarPrintKind.AddObject(kRGB, TObject(PtrInt(3)));
+    FVarPrintKind.AddObject(kRGBA, TObject(PtrInt(3)));
+    // PMAP returns a SINGLE - kind 4 - so it shows 7 significant digits, not a double's 16:
+    // fbc prints 9.90099 where the same mapping in double precision is 9.900990099009901.
+    FVarPrintKind.AddObject(kPMAP, TObject(PtrInt(4)));
   end;
   RegisterRecordVars(AST);
 
