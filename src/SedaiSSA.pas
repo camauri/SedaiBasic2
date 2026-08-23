@@ -6884,7 +6884,7 @@ procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // probes live in their own Try*/Process* frames below, so THIS frame — entered for every
 // assignment — keeps only the managed locals of the common scalar path.
 var
-  VarNode, ExprNode, SharedAssign, CastNode: TASTNode;
+  VarNode, ExprNode, SharedAssign, CastNode, UnwrapAssign: TASTNode;
   VarName: string;
   ExprValue, VarReg: TSSAValue;
   CopyOp: TSSAOpCode;
@@ -6899,6 +6899,31 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // Parentheses around an LVALUE are FreeBASIC's own spelling and carry no meaning of their own: the
+  // manual wraps a byref-returning call that way and notes the enclosing parentheses are REQUIRED
+  // there, to tell the assignment apart from a call whose result is discarded. Left wrapped, the target
+  // matched NO shape below and the whole statement was dropped in SILENCE - the manual's own
+  // procs/byref-result2 lost one of its four lines, and the line after it still worked, which made it
+  // look like a byref-result defect rather than a parenthesis one.
+  //
+  // ⛔ Rebuilt as a NODE, not just re-pointed: several of the shapes below read the target back from
+  // Node.GetChild(0) rather than from this variable, so unwrapping only the variable fixed the call
+  // form and left "( a(1) ) = 9" still dropped. One statement, one lvalue, one place that says so.
+  if VarNode.NodeType = antParentheses then
+  begin
+    while (VarNode <> nil) and (VarNode.NodeType = antParentheses) and (VarNode.ChildCount >= 1) do
+      VarNode := VarNode.GetChild(0);
+    if VarNode = nil then Exit;
+    UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+    try
+      UnwrapAssign.AddChild(VarNode.Clone);
+      UnwrapAssign.AddChild(ExprNode.Clone);
+      ProcessAssignment(UnwrapAssign);
+    finally
+      UnwrapAssign.Free;
+    end;
+    Exit;
+  end;
 
   { ⭐ "Err = n" - the SETTER the FreeBASIC manual defines as ERROR minus the raise: "Unlike Error,
     Err = number sets the error number WITHOUT invoking an error handler." It parsed as an ordinary
