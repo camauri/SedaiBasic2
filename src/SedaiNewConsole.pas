@@ -645,6 +645,7 @@ type
     function ReadKey: Char;
     function KeyPressed: Boolean;
     function HasChar: Boolean;           // Non-blocking character check
+    function InputExhausted: Boolean;    // a console with a keyboard can always deliver another key
     function GetLastChar: string;        // Get and consume last character
     procedure EnableTextInput;           // Enable SDL text input mode
     procedure DisableTextInput;          // Disable SDL text input mode
@@ -695,6 +696,7 @@ type
     function ReadKey: Char;
     function KeyPressed: Boolean;
     function HasChar: Boolean;
+    function InputExhausted: Boolean;
     function GetLastChar: string;
     procedure EnableTextInput;
     procedure DisableTextInput;
@@ -12537,6 +12539,11 @@ begin
   Result := FHasChar;
 end;
 
+function TInputHandler.InputExhausted: Boolean;
+begin
+  Result := False;   // a console with a keyboard can always deliver another key
+end;
+
 function TInputHandler.HasChar: Boolean;
 begin
   Result := FHasChar;
@@ -12896,6 +12903,11 @@ begin
       end;
     end;
   end;
+end;
+
+function TProgramInputHandler.InputExhausted: Boolean;
+begin
+  Result := False;
 end;
 
 function TProgramInputHandler.HasChar: Boolean;

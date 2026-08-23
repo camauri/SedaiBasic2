@@ -121,6 +121,7 @@ type
     function ReadKey: Char;
     function KeyPressed: Boolean;
     function HasChar: Boolean;
+    function InputExhausted: Boolean;
     function GetLastChar: string;
 
     // Text input mode (required for SDL2 TEXTINPUT events)
@@ -1079,6 +1080,12 @@ begin
       end;
     end;
   end;
+end;
+
+function TSDL2InputDevice.InputExhausted: Boolean;
+// A window with a keyboard can always deliver another key.
+begin
+  Result := False;
 end;
 
 function TSDL2InputDevice.HasChar: Boolean;

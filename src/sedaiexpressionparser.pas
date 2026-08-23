@@ -1694,6 +1694,21 @@ begin
     Result := nil;
     Exit;
   end;
+  // GETKEY takes NO parentheses and no arguments: "Dim As Integer k = GetKey". It shares this token
+  // type with INPUT, whose function form requires them, so the bare name was rejected with
+  // 'Expected "(" after string function' - the manual's own spelling, refused.
+  if UpperCase(Token.Value) = kGETKEY then
+  begin
+    Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
+    Result.AddChild(TASTNode.Create(antArgumentList, Token));   // nullary
+    if Context.Check(ttDelimParOpen) then
+    begin
+      Context.Advance;
+      Context.Match(ttDelimParClose);                            // "GetKey()" is accepted too
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
   Result := ParseStringFunction(Token);   // antFunctionCall "INPUT" + argument list
 end;
 

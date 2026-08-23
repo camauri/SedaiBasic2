@@ -242,6 +242,12 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- ⚠️ **Keyboard input on the headless Linux build**: `TTerminalInput.ProcessEvents` is implemented for
+  Windows only, so under `sb` on Unix no key can ever reach `INKEY` / `GETKEY` from a real terminal.
+  ⭐ This is *not* observable as a divergence — fbc's `INKEY` reads the console, not stdin, so with
+  input redirected both engines answer the empty string, and at EOF both answer `-1` from `GETKEY`.
+  It is a platform gap found by reading the code, recorded here rather than left to be rediscovered
+  as a freeze. `IInputDevice.InputExhausted` is what stops a blocking read from spinning for ever.
 - ⛔ **`OPEN PIPE` is not implemented** (neither the statement nor the function form). fbc runs the
   command and binds its stdout/stdin to the handle; we refuse it at the parser. `OPEN CONS`,
   `OPEN SCRN` and `OPEN ERR` all work, with or without the `FOR` clause, and `SHELL`'s exit code

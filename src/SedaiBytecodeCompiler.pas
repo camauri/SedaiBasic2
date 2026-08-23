@@ -1902,6 +1902,10 @@ begin
     BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
     if Instr.Dest.Kind = svkRegister then
       BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
+    // Src3, when constant, selects GETKEY's FreeBASIC FUNCTION form (an integer key code in Dest,
+    // -1 when no key can be had) over the Commodore statement form (a character).
+    if Instr.Src3.Kind = svkConstInt then
+      BCInstr.Immediate := Instr.Src3.ConstInt;
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

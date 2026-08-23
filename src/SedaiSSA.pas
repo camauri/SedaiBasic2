@@ -3640,6 +3640,22 @@ begin
         FuncName := UpperCase(VarToStr(Node.Value));
         ArgListNode := Node.GetChild(0);
 
+        // FreeBASIC GETKEY is a FUNCTION returning the key CODE (-1 when no key can be had), and it
+        // takes no parentheses. It was registered as a statement keyword only, so "Dim As Integer k =
+        // GetKey" - the manual's own shape, and the "Do : Loop Until GetKey = 27" idiom - was a syntax
+        // error. Src3 = 1 selects the function behaviour inside the one shared VM arm; without it the
+        // arm answers a CHARACTER, which is the Commodore statement form.
+        // ⚠️ It lives HERE, in antFunctionCall, because that is the node the parser builds. Put in the
+        // antGraphicsFunction case next to GETMOUSE it compiled, ran, and did NOTHING - the branch was
+        // simply never reached and the call lowered to no instruction at all.
+        if FModernMode and (FuncName = kGETKEY) then
+        begin
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaGetkey, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(1));
+          Exit;
+        end;
+
         // FreeBASIC lets a builtin be OVERLOADED for a UDT by name: "Operator Abs (ByRef v As Vector2D)
         // As Single" makes "Abs(v)" the user's operator, not the numeric intrinsic. Dispatch on the
         // argument's static type before the intrinsic gets it -- it was being handed the record HANDLE

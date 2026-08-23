@@ -227,6 +227,10 @@ type
     // Non-blocking character input (for GET command)
     function HasChar: Boolean;          // Returns true if a character is available
     function GetLastChar: string;       // Returns the last character pressed (or empty string)
+    // ⛔ Can a character EVER arrive on this device again? A blocking read has to have an answer, or
+    // it is not a read, it is a hang: "Getkey a$" with no key source spun forever instead of ending.
+    // fbc's own GetKey returns -1 when its input is exhausted; this is the question behind that -1.
+    function InputExhausted: Boolean;
 
     // Text input mode (required for SDL2 to generate TEXTINPUT events)
     procedure EnableTextInput;          // Call before waiting for text input (GETKEY)
