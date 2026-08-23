@@ -212,6 +212,26 @@ difference is stated rather than left to be discovered.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
   names an interface must provide every method of it, and it *is-a* that interface for dispatch and
   for `Is`. An fbc source is unaffected, since fbc has no interfaces to name.
+- **Error handling in MODERN is FreeBASIC's, never QB's.** fbc is QB-compatible only where a program
+  asks for it (`-lang qb` / `fblite`), so MODERN's reference is fbc's own base dialect:
+  - `Err` carries **FreeBASIC** error numbers, and `Err$` their **FreeBASIC** messages. ⛔ That is a
+    DIFFERENT TABLE from the Commodore one, not a translation of it — the two share only numbers
+    (FreeBASIC 5 is *Illegal resume*, Commodore 5 is `DEVICE NOT PRESENT`; FreeBASIC 2 is *File not
+    found*, Commodore 2 is `FILE OPEN`). **The two tables stay separate**, including for this
+    project's own extended codes 100–113, which are written out in each table's own voice rather than
+    fetched from the other.
+  - A **filesystem** error with no active handler sets `Err` and continues, as fbc's base dialect
+    does — that is what makes the manual's inline idiom (`Open f For Input As #1 : Loop Until Err() = 0`)
+    work. `Error n` with no handler still aborts, there and here.
+  - ⚠️ **Declared divergence**: fbc's `Err` is *volatile* — any internal call, `Print` included,
+    resets it to its own status. We do not clear `Err` on unrelated calls, so `Print "e="; Err()`
+    prints `0` under fbc and the real code here. The manual's own advice ("store it in a variable as
+    soon as the error handler is entered") makes the difference unobservable in code written the way
+    it prescribes.
+  - **Extensions** (fbc's base dialect rejects them; they exist only in `-lang fblite`/`qb` there, or
+    not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
+  - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
+    `As #90` is legal there and an error here.
 - **A graphics screen is always 32-bit truecolour.** `ScreenRes w, h, depth` and `Screen n` accept
   every depth the manual lists and give a truecolour surface for all of them; `ScreenInfo` reports
   `depth = 32`, `bpp = 4`, `pitch = w * 4`, which is what the framebuffer `ScreenPtr` hands out

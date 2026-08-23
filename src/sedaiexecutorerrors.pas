@@ -224,9 +224,61 @@ const
 
 // === UTILITY FUNCTIONS ===
 function GetErrorCodeDescription(ErrorCode: Integer): string;
+// The FreeBASIC message for a FreeBASIC code. The two tables COLLIDE numerically - FB 5 is "illegal
+// resume" and Commodore 5 is DEVICE NOT PRESENT - so "Error 5" in MODERN reported the Commodore text
+// until 23 Aug 2026. Word-for-word from the manual's Runtime Error Codes table.
+function GetFBErrorCodeDescription(ErrorCode: Integer): string;
 function CreateExecutorError(ErrorCode: Integer; const Message: string; LineNumber: Integer = 0): TExecutorException;
 
 implementation
+
+function GetFBErrorCodeDescription(ErrorCode: Integer): string;
+begin
+  case ErrorCode of
+    0:  Result := '';
+    1:  Result := 'Illegal function call';
+    2:  Result := 'File not found';
+    3:  Result := 'File I/O error';
+    4:  Result := 'Out of memory';
+    5:  Result := 'Illegal resume';
+    6:  Result := 'Out of bounds array access';
+    7:  Result := 'Null Pointer Access';
+    8:  Result := 'No privileges';
+    9:  Result := 'interrupted signal';
+    10: Result := 'illegal instruction signal';
+    11: Result := 'floating point error signal';
+    12: Result := 'segmentation violation signal';
+    13: Result := 'Termination request signal';
+    14: Result := 'abnormal termination signal';
+    15: Result := 'quit request signal';
+    16: Result := 'return without gosub';
+    17: Result := 'end of file';
+    // Our OWN extended codes. FreeBASIC defines nothing at these numbers, so there is no collision -
+    // but the WORDS are written HERE, in this table's own voice, and are NOT fetched from the
+    // Commodore one. ⛔⛔ THE TWO TABLES ARE SEPARATE AND STAY SEPARATE: borrowing 'INTERNAL ERROR'
+    // from the Commodore side would put Commodore wording inside a FreeBASIC program's Err$, which is
+    // mixing two dialects that share only a number. If a code is added, it is added TWICE, on purpose.
+    100: Result := 'Internal error';
+    101: Result := 'Stack overflow';
+    102: Result := 'Numeric underflow';
+    103: Result := 'Domain error';
+    104: Result := 'Range error';
+    105: Result := 'Undefined variable';
+    106: Result := 'Array not dimensioned';
+    107: Result := 'Wrong number of array dimensions';
+    108: Result := 'Invalid string index';
+    109: Result := 'String conversion error';
+    110: Result := 'File access error';
+    111: Result := 'Input past end of file';
+    112: Result := 'Wrong number of arguments';
+    113: Result := 'Invalid argument';
+  else
+    // ⭐ The manual: "No user error code range is defined. If Error is used to set an error code it
+    // is wise to use high values to avoid collisions." So anything else is a USER code, not a gap:
+    // the Commodore texts for 18..41 mean nothing to a FreeBASIC program.
+    Result := 'user error ' + IntToStr(ErrorCode);
+  end;
+end;
 
 // === ERROR DESCRIPTIONS ===
 // Returns C128 BASIC 7.0 compatible error messages
