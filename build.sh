@@ -20,6 +20,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# shellcheck source=scripts/lib/deps-linux.sh
+source "$SCRIPT_DIR/scripts/lib/deps-linux.sh"
+
 # Defaults
 TARGET="all"
 DEBUG=false
@@ -144,23 +147,8 @@ config_set() {
 # remember the choice in setup.config.json. After that it is a config read and nothing searches.
 
 # Every fpc binary reachable on this machine, one per line, de-duplicated by resolved path.
-fpc_candidates() {
-    local platform="$1" c
-    {
-        printf '%s\n' "$SCRIPT_DIR/fpc/3.2.2/bin/$platform/fpc"
-        for c in "$HOME"/tools/fp/*/fpc/bin/"$platform"/fpc \
-                 "$HOME"/fpcupdeluxe/fpc/bin/"$platform"/fpc; do
-            printf '%s\n' "$c"
-        done
-        command -v fpc 2>/dev/null || true
-        # Last resort, and deliberately last: a deep scan of the home finds installs in odd places
-        # but says nothing about which one is meant.
-        find "$HOME" -maxdepth 6 -type f -name fpc -perm -u+x 2>/dev/null || true
-    } | while read -r c; do
-        [[ -n "$c" && -x "$c" ]] || continue
-        readlink -f "$c" 2>/dev/null || printf '%s\n' "$c"
-    done | awk '!seen[$0]++'
-}
+# fpc_candidates lives in scripts/lib/deps-linux.sh, shared with setup.sh: the two must look in the
+# SAME places or setup will offer to install a compiler the build has already found.
 
 # Does this compiler actually COMPILE? Not "does the binary run" - fpc -iV answers that happily on an
 # install whose RTL it cannot find. The only honest test is a build, done the way build.sh builds:
@@ -776,23 +764,6 @@ dep_add() {
     DEP_NAMES+=("$1"); DEP_STATE+=("$2"); DEP_REQ+=("$3"); DEP_WHY+=("$4")
     DEP_PKG_APT+=("$5"); DEP_PKG_DNF+=("$6"); DEP_PKG_PACMAN+=("$7")
     DEP_PKG_ZYPPER+=("$8"); DEP_PKG_APK+=("$9"); DEP_PKG_BREW+=("${10}")
-}
-
-# A shared library is present if pkg-config knows it, or if the linker can find the
-# unversioned .so - which is what a -dev/-devel package provides and what the LINK needs.
-# The versioned .so.0 alone is the RUNTIME package and is not enough to build against.
-have_shared_lib() {
-    local pc="$1" soname="$2" d
-    command -v pkg-config >/dev/null 2>&1 && pkg-config --exists "$pc" 2>/dev/null && return 0
-    for d in /usr/lib /usr/local/lib /usr/lib64 /lib "/usr/lib/$(uname -m)-linux-gnu" /opt/homebrew/lib; do
-        [[ -e "$d/$soname" ]] && return 0
-    done
-    return 1
-}
-
-pkg_manager() {
-    for m in apt dnf pacman zypper apk brew; do command -v "$m" >/dev/null 2>&1 && { echo "$m"; return; }; done
-    echo ""
 }
 
 # Collect every dependency the SELECTED targets and options actually need.
