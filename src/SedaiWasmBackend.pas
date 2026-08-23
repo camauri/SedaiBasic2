@@ -621,14 +621,19 @@ const
     fixed base above a growing heap cannot exist when the framebuffer's size is
     only known at run time. One allocator, one arena, no partition to get wrong. }
   { The framebuffer's initial contents are not zero: a fresh ScreenRes fills
-    every pixel with $000000FF (ClearCurrentMode, SedaiGraphicsMemory), and
-    linear memory starts zeroed, so the fill has to be emitted or the very first
-    byte of every comparison would differ.
+    every pixel with opaque black, and linear memory starts zeroed, so the fill
+    has to be emitted or the very first byte of every comparison would differ.
     ⚠️ MEASURED TWICE. The first reading said $FF000000, because the probe
     PRINTED before reading it back - and in graphics mode PRINT renders into the
     framebuffer, so the probe was reading its own output. Any measurement of the
-    initial buffer has to happen before the first character is printed. }
-  FB_CLEAR     = 255;          // $000000FF
+    initial buffer has to happen before the first character is printed.
+    ⛔ It then read 255 for a year, and that was the interpreter's own defect
+    faithfully copied: the native ResizeScreen cleared to $000000FF, the same
+    black in the WRONG byte order for a buffer the presenter uploads as ARGB.
+    fbc answers &hFF000000, and so do we now - on both backends. This constant
+    is not independent of SedaiGraphicsBackend.ResizeScreen; they are one
+    decision written twice. }
+  FB_CLEAR     = $FF000000;    // opaque black, ARGB - matches fbc and the interpreter
 
   { PRINT's comma zone, and the line it wraps on. Both are the FreeBASIC values
     the interpreter sets for MODERN (SedaiBytecodeVM: "A comma indicates
@@ -3607,38 +3612,38 @@ begin
     B.Free;
   end;
 
-  { dtWeekOfYear(days) -> the ISO 8601 week, which is what FPC's WeekOfTheYear
-    returns.
-    ⛔⛔ AND THAT IS NOW A DISAGREEMENT WITH THE INTERPRETER, stated here rather than
-    discovered later. On 23 Aug 2026 DATEPART("ww") was measured against fbc and the
-    interpreter moved to the VB rule - week 1 is the week CONTAINING 1 January and
-    weeks start on SUNDAY - because that is what fbc answers. This backend still
-    computes the ISO week, so `sbw` gives a different number from `sb` on any date
-    that is a SUNDAY (7 of 48 probe dates). It is hand-written WASM and the target is
-    parked; porting the same one-line rule here is the fix, and until then this
-    comment is the record that the two engines differ. }
-  { The ISO identity, unchanged: ⭐ The identity that removes every special case: the week number of
-    a day is ((the Thursday of its week) - (the 1st of THAT Thursday's January))
-    div 7 + 1. A year straddled at either end lands in the right year because
-    the Thursday decides it, not the day. }
+  { dtWeekOfYear(days) -> the VB week number, which is what fbc's DATEPART("ww")
+    answers: week 1 is the week CONTAINING 1 January, and weeks start on SUNDAY.
+    ⛔ NOT the ISO 8601 week (Monday-based, week 1 holds the first Thursday), which
+    is what this emitted until 23 Aug 2026 and what FPC's WeekOfTheYear returns. The
+    two agree most of the time - measured against fbc over 48 dates, 7 differed and
+    every one was a SUNDAY, the day the VB week turns over and the ISO one does not -
+    so the disagreement with the interpreter survived a full corpus run and only the
+    WASM differential's calendar.bas showed it.
+    ⭐ ONE arithmetic identity, the same one the interpreter uses:
+        week = ((dayOfYear - 1) + (weekday(1 Jan) - 1)) div 7 + 1
+    and both halves are differences of SERIALS here, so no calendar decode is needed
+    beyond finding 1 January:
+        dayOfYear - 1   = days - jan1
+        weekday(x) - 1  = (x + 6) mod 7   (serial 0 is a Saturday, so 0 -> 6)
+    Both terms are non-negative, so the floor division is a plain I64DivS. }
   B := TWasmBuf.Create;
   try
-    // param 0 = days; locals 1 = dow, 2 = thursday, 3 = jan1
-    { The day of the week, Monday = 0. Serial 0 is a Saturday, so the shift that
-      turns the serial into a Monday-based index is +5 under a floor modulo. }
-    B.LocalGet(0); B.I64Const(5); B.Op(wopI64Add);
-    B.I64Const(7); B.Op(wopI64RemS);
-    B.LocalTee(1); B.I64Const(0); B.Op(wopI64LtS);
-    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
-      B.LocalGet(1); B.I64Const(7); B.Op(wopI64Add); B.LocalSet(1);
-    B.EndOp;
-    B.LocalGet(0); B.LocalGet(1); B.Op(wopI64Sub); B.I64Const(3); B.Op(wopI64Add);
-    B.LocalSet(2);
-    B.LocalGet(2); B.Call(FDtCivilFunc);
+    // param 0 = days; locals 1 = jan1 serial, 2 = weekday(jan1) - 1, 3 = unused (kept
+    // so the local list matches the other date helpers)
+    B.LocalGet(0); B.Call(FDtCivilFunc);
     B.I32Const(DT_Y); B.OpMem(wopI32Load, 2, 0); B.Op(wopI64ExtendI32S);
     B.I64Const(1); B.I64Const(1); B.Call(FDtDaysFunc);
-    B.LocalSet(3);
-    B.LocalGet(2); B.LocalGet(3); B.Op(wopI64Sub); B.I64Const(7); B.Op(wopI64DivS);
+    B.LocalSet(1);
+    B.LocalGet(1); B.I64Const(6); B.Op(wopI64Add);
+    B.I64Const(7); B.Op(wopI64RemS);
+    B.LocalTee(2); B.I64Const(0); B.Op(wopI64LtS);
+    B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+      B.LocalGet(2); B.I64Const(7); B.Op(wopI64Add); B.LocalSet(2);
+    B.EndOp;
+    B.LocalGet(0); B.LocalGet(1); B.Op(wopI64Sub);
+    B.LocalGet(2); B.Op(wopI64Add);
+    B.I64Const(7); B.Op(wopI64DivS);
     B.I64Const(1); B.Op(wopI64Add);
     FModule.AddFunction(TWoy, [wvtI64, wvtI64, wvtI64], B);
   finally
@@ -10494,11 +10499,14 @@ begin
             back until m162_rgb was measured. }
           B.Op(wopI64ExtendI32U);
         B.Op(wopElse);
-          { And out of bounds is ZERO, not -1: TGraphicsMemory.GetPixel returns 0
-            when ValidateCoordinates fails, so -1 was a value no interpreter run
-            can produce. Silent, because a guardian that reads a pixel outside
-            the screen is exactly what nobody writes. }
-          B.I64Const(0);
+          { Out of bounds is &hFFFFFFFF. It was ZERO here, faithfully copying the
+            interpreter - which was itself wrong: fbc answers -1 as a ULONG for a
+            point outside the current VIEW, and outside the surface as well, so
+            the two idioms that use POINT as a bounds test both read as a
+            legitimate black. Corrected on both sides on 23 Aug; the interpreter
+            also tests the VIEW rectangle, which this backend has no viewport for
+            yet, so only the surface bound is emitted. }
+          B.I64Const(4294967295);
         B.EndOp;
         StoreReg(B, Instr.Dest);
       end;

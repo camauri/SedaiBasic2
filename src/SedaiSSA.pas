@@ -878,6 +878,7 @@ type
     // File data I/O
     procedure ProcessGetFile(Node: TASTNode);
     procedure ProcessInputFile(Node: TASTNode);
+    function  FilePrintKind(Child: TASTNode; const ExprVal: TSSAValue): Int64;  // PRINT#/WRITE# form
     procedure ProcessPrintFile(Node: TASTNode);
     procedure ProcessCmd(Node: TASTNode);
     procedure ProcessAppend(Node: TASTNode);
@@ -16668,6 +16669,7 @@ procedure TSSAGenerator.EmitWriteFileValues(Node: TASTNode; const HandleReg: TSS
 // INPUT# reads the fields back). Children 1+ are values (separators are ignored — WRITE always uses ',').
 var
   i, vc: Integer;
+  Kind: Int64;
   Child: TASTNode;
   ExprVal, StrReg: TSSAValue;
 
@@ -16703,9 +16705,25 @@ begin
     end
     else if (ExprVal.Kind = svkConstInt) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtInt)) then
     begin
-      StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-      EmitInstruction(ssaIntToString, StrReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      EmitStr(StrReg);
+      // A BOOLEAN or an unsigned value is written in ITS OWN form ("true", no sign space), not through
+      // the signed IntToString: fbc's WRITE# spells them the same way its PRINT does.
+      Kind := FilePrintKind(Child, ExprVal);
+      if Kind = 0 then
+      begin
+        StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaIntToString, StrReg, EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitStr(StrReg);
+      end
+      else if ToConsole then
+      begin
+        if Kind = 1 then
+          EmitInstruction(ssaPrintBool, MakeSSAValue(svkNone), EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), EnsureIntRegister(ExprVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        EmitInstruction(ssaPrintFile, EnsureIntRegister(ExprVal), HandleReg,
+                        MakeSSAConstInt(Kind), MakeSSAValue(svkNone));
     end
     else
     begin
@@ -16719,6 +16737,23 @@ begin
     EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
   else
     EmitInstruction(ssaPrintFileNewLine, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.FilePrintKind(Child: TASTNode; const ExprVal: TSSAValue): Int64;
+// The print form PRINT#/WRITE# must use for this value: 0 = signed, 1 = BOOLEAN ("true"/"false"),
+// 2 = unsigned (no leading sign space). Deliberately the SAME two questions the console PRINT asks -
+// PrintKindOfExpr for a declared type, PrintsUnsigned64Expr for an unsigned-valued expression - so
+// the two paths cannot drift apart again. Kinds 2 and 3 differ only in whether the unsignedness is
+// contagious through arithmetic, which is a question about the EXPRESSION, not about the printing.
+var
+  PK: Integer;
+begin
+  Result := 0;
+  if ExprVal.RegType <> srtInt then Exit;
+  PK := PrintKindOfExpr(Child);
+  if PK = 1 then Exit(1);
+  if (PK = 2) or (PK = 3) then Exit(2);
+  if PrintsUnsigned64Expr(Child) then Exit(2);
 end;
 
 procedure TSSAGenerator.ProcessPrintFile(Node: TASTNode);
@@ -16870,11 +16905,25 @@ begin
     // Dest = value to print, Src1 = file handle
     if ExprVal.Kind in [svkConstFloat, svkConstInt] then
     begin
-      ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-      EmitInstruction(ssaLoadConstFloat, ExprReg, ExprVal,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // A CONSTANT that must print in an unsigned or boolean form goes through the INT path with its
+      // kind, not through the float one: "Print #f, RGB(17,34,51)" folds to a constant, and the float
+      // path has no way to say "no sign space".
+      if (ExprVal.Kind = svkConstInt) and (FilePrintKind(Child, MakeSSARegister(srtInt, 0)) <> 0) then
+      begin
+        ExprReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, ExprReg, ExprVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
+                       MakeSSAConstInt(FilePrintKind(Child, ExprReg)), MakeSSAValue(svkNone));
+      end
+      else
+      begin
+        ExprReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+        EmitInstruction(ssaLoadConstFloat, ExprReg, ExprVal,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitInstruction(ssaPrintFile, ExprReg, HandleReg,
+                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end
     else if ExprVal.Kind = svkConstString then
     begin
@@ -16886,9 +16935,13 @@ begin
     end
     else
     begin
-      // Variable or expression - emit directly (type is preserved in register)
+      // Variable or expression - emit directly (type is preserved in register).
+      // ⛔ ...with the PRINT KIND alongside it. A file is not a lesser console: fbc writes "true" for
+      // a BOOLEAN and no sign space for an unsigned there exactly as it does on screen. The console
+      // arm above has decided this since B1.5 and PRINT#/WRITE# had their own lowering that never
+      // asked - so "Print #f, b" wrote -1 while "Print b" wrote true, in the same program.
       EmitInstruction(ssaPrintFile, ExprVal, HandleReg,
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                     MakeSSAConstInt(FilePrintKind(Child, ExprVal)), MakeSSAValue(svkNone));
     end;
   end;
 
@@ -20007,6 +20060,11 @@ begin
     antIdentifier:
       Result := PrintKindOf(VarToStr(Node.Value));
     antFunctionCall:
+      Result := PrintKindOf(VarToStr(Node.Value));
+    antGraphicsFunction:
+      // RGB/RGBA are graphics-function nodes, not antFunctionCall - and they return a ULONG, which
+      // prints with no leading sign space. Asking the same table by the same name is all this needs;
+      // a graphics function with no entry answers 0 exactly as before.
       Result := PrintKindOf(VarToStr(Node.Value));
     antArrayAccess:
       // "s[i]" on a STRING - a variable or a FIELD - is the BYTE at that index: a UByte, and an unsigned
@@ -30184,6 +30242,17 @@ begin
     FVarPrintKind.AddObject(kLOBYTE, TObject(PtrInt(2)));
     FVarPrintKind.AddObject(kHIWORD, TObject(PtrInt(2)));
     FVarPrintKind.AddObject(kLOWORD, TObject(PtrInt(2)));
+  end;
+  // The three colour-valued graphics functions return a ULONG, and an unsigned prints with NO leading
+  // sign space: "Print Point(x,y)" was a column wider than fbc's for every graphics program.
+  // ⚠️ Kind 3 and not 2, and only fbc settles it: "Point(x,y) - 200" prints WITH a sign space there,
+  // so the unsignedness is NOT contagious through arithmetic the way HiByte's is. Same measurement,
+  // opposite answer - which is why the kind is asked of the oracle and not inferred from the width.
+  if FModernMode then
+  begin
+    FVarPrintKind.AddObject(kPOINT, TObject(PtrInt(3)));
+    FVarPrintKind.AddObject(kRGB, TObject(PtrInt(3)));
+    FVarPrintKind.AddObject(kRGBA, TObject(PtrInt(3)));
   end;
   RegisterRecordVars(AST);
 

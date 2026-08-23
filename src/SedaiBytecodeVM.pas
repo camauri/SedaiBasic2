@@ -375,6 +375,14 @@ type
     FGfxWinAx, FGfxWinBx, FGfxWinAy, FGfxWinBy: Double;
     // FreeBASIC VIEW viewport: physical origin added to mapped coords (non-SCREEN form); clip is on the surface.
     FGfxViewOffsetX, FGfxViewOffsetY: Integer;
+    // ...and the rectangle itself, because CLS clears the VIEWPORT, not the screen. The clip lives on
+    // the surface and the backend has no way to hand it back, so the VM keeps its own copy.
+    FGfxViewActive: Boolean;
+    FGfxViewX1, FGfxViewY1, FGfxViewX2, FGfxViewY2: Integer;
+    // True from SCREENRES/SCREEN until the program leaves graphics: a FreeBASIC truecolor screen is up,
+    // so CLS means "clear the framebuffer POINT reads", not "clear the text device". The C128 GRAPHIC
+    // modes keep their own path, which is why this is a flag and not a test on InGraphics.
+    FGfxFBScreen: Boolean;
     // FreeBASIC GETMOUSE snapshot cache: bcGetmouse queries the input provider once and stores the state
     // here; bcMouseAxis(which) then reads the requested component (0=x,1=y,2=wheel,3=buttons,4=clip).
     FMouseX, FMouseY, FMouseWheel, FMouseButtons, FMouseClip: Integer;
@@ -514,6 +522,7 @@ type
     procedure ExecuteSuperinstruction(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     function GfxMapX(LX: Double): Integer;   // FreeBASIC WINDOW: logical x -> physical x
     function GfxMapY(LY: Double): Integer;   // FreeBASIC WINDOW: logical y -> physical y
+    function PointOutsideView(PX, PY: Integer): Boolean;  // POINT answers -1 outside the VIEW / the surface
     function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
     procedure SetupGfxScreen(W, H, NumPages: Integer);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
@@ -1280,7 +1289,7 @@ begin
   FEnvOverrides.CaseSensitive := False;   // environment names are case-insensitive on Windows; harmless elsewhere
   // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
   FGfxForeColor := $FFFFFFFF;
-  FGfxBackColor := $000000FF;
+  FGfxBackColor := $FF000000;   // opaque black, ARGB - what fbc reads back from an untouched screen
   FConColorFg := 7;   // fbc's console defaults, which "Color()" reports before any COLOR statement
   FConColorBg := 0;
   // FreeBASIC page flipping: single page (the screen) until SCREENRES requests more.
@@ -13923,10 +13932,13 @@ begin
   SetLength(FGfxPages, NumPages);
   FGfxPages[0] := GFX_SCREEN_SURFACE;
   for i := 1 to NumPages - 1 do
-    FGfxPages[i] := FGraphics.CreateSurface(W, H, $000000FF);
+    FGfxPages[i] := FGraphics.CreateSurface(W, H, $FF000000);   // opaque black (ARGB), as page 0
   FGfxWorkPage := 0;
   FGfxVisiblePage := 0;
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
+  FGfxFBScreen := True;
+  FGfxViewActive := False;                      // a new mode has no viewport, as in FreeBASIC
+  FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;
 end;
 
 function TBytecodeVM.DrawSurface: Integer;
@@ -13947,6 +13959,29 @@ function TBytecodeVM.GfxMapY(LY: Double): Integer;
 begin
   if FGfxWinActive then Result := Round(FGfxWinAy * LY + FGfxWinBy) else Result := Round(LY);
   Result := Result + FGfxViewOffsetY;
+end;
+
+function TBytecodeVM.PointOutsideView(PX, PY: Integer): Boolean;
+// Is this PHYSICAL pixel outside what POINT is allowed to see? The VIEW rectangle when one is
+// defined, the surface itself otherwise. fbc answers &hFFFFFFFF for both, which is why they are one
+// question and not two.
+var
+  Lo, Hi: Integer;
+begin
+  Result := True;
+  if not Assigned(FGraphics) then Exit;
+  if FGfxViewActive then
+  begin
+    if FGfxViewX1 <= FGfxViewX2 then begin Lo := FGfxViewX1; Hi := FGfxViewX2; end
+                                else begin Lo := FGfxViewX2; Hi := FGfxViewX1; end;
+    if (PX < Lo) or (PX > Hi) then Exit;
+    if FGfxViewY1 <= FGfxViewY2 then begin Lo := FGfxViewY1; Hi := FGfxViewY2; end
+                                else begin Lo := FGfxViewY2; Hi := FGfxViewY1; end;
+    if (PY < Lo) or (PY > Hi) then Exit;
+  end;
+  if (PX < 0) or (PY < 0) then Exit;
+  if (PX >= FGraphics.SurfaceWidth(DrawSurface)) or (PY >= FGraphics.SurfaceHeight(DrawSurface)) then Exit;
+  Result := False;
 end;
 
 procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -14172,7 +14207,21 @@ begin
         Ctx.IntRegs[Instr.Dest] := 0;
     21: // bcScnClr - SCNCLR [mode] / CLS: clear screen and home the cursor (POS/CSRLIN -> 0)
       begin
-        if Assigned(FOutputDevice) then
+        // ⛔ TWO CLEARS, and only one of them was ever instructed. CLS went to the TEXT device, which
+        // clears the framebuffer only when it has been handed one (sb --window does that; headless sb
+        // does not) - so under a FreeBASIC SCREENRES the picture survived every CLS, in all four
+        // forms, and POINT proved it. A FreeBASIC graphics screen is cleared HERE, on the same surface
+        // PSET writes and POINT reads, and to the background colour COLOR set (fbc: measured).
+        if FGfxFBScreen and Assigned(FGraphics) then
+        begin
+          if FGfxViewActive then
+            // CLS clears the VIEWPORT when one is defined, and leaves the rest of the screen standing.
+            FGraphics.DrawRect(FGfxWorkSurface, FGfxViewX1, FGfxViewY1, FGfxViewX2, FGfxViewY2,
+                               FGfxBackColor, True, 1, 0)
+          else
+            FGraphics.ClearSurface(FGfxWorkSurface, FGfxBackColor);
+        end
+        else if Assigned(FOutputDevice) then
           FOutputDevice.ClearScreen(Ctx.IntRegs[Instr.Src1]);
         Ctx.CursorCol := 0;
         Ctx.CursorRow := 0;
@@ -14213,10 +14262,22 @@ begin
         FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // becomes the current graphics point
       end;
     27: // bcGfxPoint - POINT(x, y [, img]) -> color  (reads the work page, or the image target when active)
+      // ⛔ OUT OF THE VIEWPORT IS -1, NOT ZERO, and "the viewport" is not "the surface": with a VIEW
+      // defined, fbc answers &hFFFFFFFF for anything outside the RECTANGLE, even where the screen has
+      // a pixel. We answered the pixel there and 0 past the edge of the surface - so the two idioms
+      // that use POINT as a bounds test ("is this inside?" and "did the fill reach here?") both read
+      // as a legitimate black. Measured against fbc; -1 is the answer for both cases.
       if Assigned(FGraphics) then
-        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2])))
+      begin
+        GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src1]);
+        GetY1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
+        if PointOutsideView(GetX1, GetY1) then
+          Ctx.IntRegs[Instr.Dest] := $FFFFFFFF
+        else
+          Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.GetPixel(DrawSurface, GetX1, GetY1));
+      end
       else
-        Ctx.IntRegs[Instr.Dest] := 0;
+        Ctx.IntRegs[Instr.Dest] := $FFFFFFFF;
     28: // bcGfxPaint - PAINT (x,y), color  (flood fill; color in the Immediate int register)
       if Assigned(FGraphics) then
         FGraphics.Fill(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
@@ -14457,6 +14518,7 @@ begin
         if ((Instr.Immediate shr 32) and 1) = 0 then
         begin
           FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;          // reset -> full screen, no offset
+          FGfxViewActive := False;
           FGraphics.SetClip(FGfxWorkSurface, False, 0, 0, 0, 0);
         end
         else
@@ -14466,6 +14528,8 @@ begin
           WinX2 := Ctx.IntRegs[Instr.Immediate and $FFFF];
           WinY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
           FGraphics.SetClip(FGfxWorkSurface, True, WinX1, WinY1, WinX2, WinY2);
+          FGfxViewActive := True;
+          FGfxViewX1 := WinX1; FGfxViewY1 := WinY1; FGfxViewX2 := WinX2; FGfxViewY2 := WinY2;
           if ((Instr.Immediate shr 33) and 1) = 1 then
           begin
             FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;        // VIEW SCREEN: absolute coordinates
@@ -14497,7 +14561,9 @@ begin
           WinW := 0; WinH := 0;   // mode 0 / unknown: no graphics mode change (v1)
         end;
         if (WinW > 0) and (WinH > 0) then
-          SetupGfxScreen(WinW, WinH, Instr.Immediate);
+          SetupGfxScreen(WinW, WinH, Instr.Immediate)
+        else if Ctx.IntRegs[Instr.Src1] = 0 then
+          FGfxFBScreen := False;   // SCREEN 0 asks for text back: CLS belongs to the console again
       end;
     48: // bcMultikey - MULTIKEY(scancode): -1 if held, 0 otherwise (real-time, via the input provider)
       if Assigned(GKeyDownProvider) and GKeyDownProvider(Ctx.IntRegs[Instr.Src1]) then
@@ -15896,7 +15962,16 @@ begin
           Dest = int register (value to print)
           Src1 = file handle register (int) }
         HandleNum := Ctx.IntRegs[Instr.Src1];
-        Data := FConsoleBehavior.FormatInt(Ctx.IntRegs[Instr.Dest]);  // exact 64-bit (no Double rounding above 2^53)
+        // Immediate carries the PRINT KIND, the same one the console arms use: 0 = signed,
+        // 1 = BOOLEAN ("true"/"false"), 2 = unsigned 64-bit. Without it a file got "-1" where the
+        // console got "true", and every unsigned value carried a sign space fbc does not write - the
+        // console path had known all three since B1.5 and PRINT#/WRITE# had never been told.
+        case Instr.Immediate of
+          1: if Ctx.IntRegs[Instr.Dest] <> 0 then Data := 'true' else Data := 'false';
+          2: Data := FConsoleBehavior.FormatUInt(QWord(Ctx.IntRegs[Instr.Dest]));
+        else
+          Data := FConsoleBehavior.FormatInt(Ctx.IntRegs[Instr.Dest]);  // exact 64-bit (no Double rounding above 2^53)
+        end;
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);

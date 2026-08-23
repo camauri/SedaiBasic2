@@ -1848,6 +1848,11 @@ begin
       BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
       if Instr.Src1.Kind = svkRegister then
         BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      // Src2, when it is a constant, is the PRINT KIND (0 signed / 1 boolean / 2 unsigned-64) the SSA
+      // worked out from the value's declared type. It rides in the Immediate, which this opcode does
+      // not otherwise use.
+      if Instr.Src2.Kind = svkConstInt then
+        BCInstr.Immediate := Instr.Src2.ConstInt;
       FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
       Exit;
     end;

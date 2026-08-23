@@ -230,7 +230,12 @@ begin
   // FreeBASIC SCREENRES: a truecolor (non-palette) surface of W x H. Depth ignored in phase 1.
   if (W <= 0) or (H <= 0) then Exit(False);
   FScreen.AllocateBuffers(W, H, False, gmSDL2Dynamic);
-  FScreen.ClearCurrentMode($000000FF);   // black, opaque
+  // ⛔ ARGB ($AARRGGBB), which is what the window presenter uploads (SDL_PIXELFORMAT_ARGB8888) and
+  // what a program reads back from POINT. This constant used to be $000000FF - the same black in the
+  // OTHER byte order - so an untouched FreeBASIC screen answered POINT with 255 where fbc answers
+  // &hFF000000, and every "is this pixel background?" test in a program was wrong. The line below,
+  // written at the same time, already had it right.
+  FScreen.ClearCurrentMode($FF000000);   // black, opaque
   FTextFG := $FFFFFFFF;                  // SCREENRES resets the text pair, as FreeBASIC does
   FTextBG := $FF000000;
   FInGraphics := True;
