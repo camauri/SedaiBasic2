@@ -57,6 +57,46 @@ dep_pkg() {
         sdl2ttf-dev:apk)    echo "sdl2_ttf-dev" ;;
         sdl2ttf-dev:brew)   echo "sdl2_ttf" ;;
 
+        # ⚠️ THESE FIVE ARE NOT USED BY THE BUILD YET. They are the libraries that sit beside the
+        # Windows binaries (SDL2_image and the image/font codecs SDL2_image and SDL2_ttf can be built
+        # against), installed so that the two platforms carry the same set and the day something
+        # starts using them nothing has to be installed again. Never required: their absence is
+        # reported and the build goes ahead.
+        sdl2image-dev:apt)    echo "libsdl2-image-dev" ;;
+        sdl2image-dev:dnf)    echo "SDL2_image-devel" ;;
+        sdl2image-dev:pacman) echo "sdl2_image" ;;
+        sdl2image-dev:zypper) echo "libSDL2_image-devel" ;;
+        sdl2image-dev:apk)    echo "sdl2_image-dev" ;;
+        sdl2image-dev:brew)   echo "sdl2_image" ;;
+
+        freetype-dev:apt)     echo "libfreetype-dev" ;;
+        freetype-dev:dnf)     echo "freetype-devel" ;;
+        freetype-dev:pacman)  echo "freetype2" ;;
+        freetype-dev:zypper)  echo "freetype2-devel" ;;
+        freetype-dev:apk)     echo "freetype-dev" ;;
+        freetype-dev:brew)    echo "freetype" ;;
+
+        png-dev:apt)          echo "libpng-dev" ;;
+        png-dev:dnf)          echo "libpng-devel" ;;
+        png-dev:pacman)       echo "libpng" ;;
+        png-dev:zypper)       echo "libpng16-devel" ;;
+        png-dev:apk)          echo "libpng-dev" ;;
+        png-dev:brew)         echo "libpng" ;;
+
+        jpeg-dev:apt)         echo "libjpeg-dev" ;;
+        jpeg-dev:dnf)         echo "libjpeg-turbo-devel" ;;
+        jpeg-dev:pacman)      echo "libjpeg-turbo" ;;
+        jpeg-dev:zypper)      echo "libjpeg8-devel" ;;
+        jpeg-dev:apk)         echo "jpeg-dev" ;;
+        jpeg-dev:brew)        echo "jpeg-turbo" ;;
+
+        zlib-dev:apt)         echo "zlib1g-dev" ;;
+        zlib-dev:dnf)         echo "zlib-devel" ;;
+        zlib-dev:pacman)      echo "zlib" ;;
+        zlib-dev:zypper)      echo "zlib-devel" ;;
+        zlib-dev:apk)         echo "zlib-dev" ;;
+        zlib-dev:brew)        echo "zlib" ;;
+
         unzip:apt|unzip:dnf|unzip:pacman|unzip:zypper|unzip:apk|unzip:brew) echo "unzip" ;;
         curl:apt|curl:dnf|curl:pacman|curl:zypper|curl:apk|curl:brew)         echo "curl" ;;
 
