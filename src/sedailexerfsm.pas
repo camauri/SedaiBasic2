@@ -113,6 +113,7 @@ type
     // onto the token it builds and clears it. The suffix is scanned before the token object exists, so the
     // mark cannot be written straight to the token.
     FPendingSingleSuffix: Boolean;
+    FPendingUnsignedSuffix: Boolean;   // the 'U' of an integer literal's type suffix ("12u", "5UL")
 
     // Set while lexing an integer whose type suffix is '&' (Long, "3000000000&"). Long is a signed 32-bit
     // type, so the value is WRAPPED to signed 32 bits; unlike the other dropped suffixes this one changes
@@ -1138,7 +1139,9 @@ begin
     Inc(Off);
     Ch := PeekChar(Off);
   end;
-  Result := (Ch = #10) or (Ch = #13) or (Ch = #0) or (Ch = '''');
+  // cVirtualEOL is a line end here as everywhere else: a '_' at the end of a macro body line continues
+  // into the NEXT body line, and the marker is what separates them.
+  Result := (Ch = #10) or (Ch = #13) or (Ch = #0) or (Ch = cVirtualEOL) or (Ch = '''');
 end;
 
 procedure TLexerFSM.ConsumeLineContinuation;
@@ -1153,8 +1156,9 @@ begin
   Ch := GetCurrentChar;
   while (Ch = ' ') or (Ch = #9) do begin AdvanceChar; Ch := GetCurrentChar; end;
   if Ch = '''' then
-    while (Ch <> #0) and (Ch <> #10) and (Ch <> #13) do begin AdvanceChar; Ch := GetCurrentChar; end;
-  if (Ch = #13) or (Ch = #10) then
+    while (Ch <> #0) and (Ch <> #10) and (Ch <> #13) and (Ch <> cVirtualEOL) do
+    begin AdvanceChar; Ch := GetCurrentChar; end;
+  if (Ch = #13) or (Ch = #10) or (Ch = cVirtualEOL) then
     AdvanceChar;  // AdvanceChar consumes CRLF as one step
 end;
 
@@ -1311,6 +1315,7 @@ begin
   Result.KeywordInfo := KeywordInfo;
   Result.BasePrefixed := False;   // pooled object: clear it, or the previous token's "&H.." mark carries over
   Result.SingleSuffixed := False; // ditto for the "1.5f" mark (ProcessNumber sets it from FPendingSingleSuffix)
+  Result.UnsignedSuffixed := False;  // ...and for the "12u" mark
 
   Result.Line := ATokenLine;
   Result.Column := FTokenStartColumn;
@@ -1468,6 +1473,7 @@ begin
      Result.SetExtractedValue(TokenText);
    end;
    Result.SingleSuffixed := FPendingSingleSuffix;
+   Result.UnsignedSuffixed := FPendingUnsignedSuffix;
 
    // '&' Long suffix: Long is signed 32-bit, so wrap the value to signed 32 bits and store the wrapped
    // decimal (3000000000& -> -1294967296, exactly as fbc). The wrap only applies to an INTEGER literal;
@@ -1487,6 +1493,7 @@ begin
  // Always cleared, on BOTH branches and whichever call site got here: ProcessNumber is reached from FSM
  // paths that never scan a suffix, and a stale mark would make the NEXT literal a Single/Long.
  FPendingSingleSuffix := False;
+ FPendingUnsignedSuffix := False;
  FPendingLongSuffix := False;
 end;
 
@@ -1546,6 +1553,11 @@ begin
   end;
   Result := CreateToken(ttNumber);
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
+  // The 'U' of the suffix, carried and cleared HERE for the same reason the '&' Long suffix is:
+  // ProcessNumber never runs for a base literal, so a flag left standing would both miss THIS literal
+  // and mark the NEXT one ("&hFFul" printed a sign space, and the following "76543ll" lost its own).
+  Result.UnsignedSuffixed := FPendingUnsignedSuffix;
+  FPendingUnsignedSuffix := False;
   // ...which is why the token has to remember that it WAS base-prefixed: with the source text gone it is
   // indistinguishable from a plain decimal literal, and FreeBASIC's type ladder treats the two differently
   // (a decimal 4294967295 is an unsigned ULong; &HFFFFFFFF is not).
@@ -1974,6 +1986,9 @@ begin
   C := GetCurrentChar;
   if (C = 'U') or (C = 'u') then
   begin
+    // The suffix is dropped from the text, so the U is the only place the literal's UNSIGNEDNESS ever
+    // appears - and FreeBASIC prints an unsigned with no leading sign space ("12u" is "12", not " 12").
+    FPendingUnsignedSuffix := True;
     AdvanceChar; C := GetCurrentChar;
     if (C = 'L') or (C = 'l') then
     begin
@@ -2660,7 +2675,14 @@ begin
           ResetToken;
           AdvanceChar;                 // consume the apostrophe
           CurrentChar := GetCurrentChar;
-          while (CurrentChar <> #0) and (CurrentChar <> #10) and (CurrentChar <> #13) do
+          // ⛔ cVirtualEOL ENDS THE COMMENT TOO. A #macro body is spliced as ONE physical line whose
+          // lines are separated by that marker, and the FSM's own newline set has always contained it
+          // -- but this fast path listed #0/#10/#13 by hand and did not. So a trailing ' comment on any
+          // line of a macro body swallowed EVERY line after it, in silence: the manual's fbquote2
+          // printed nothing at all, and it looked like a stringize bug because the comment on that very
+          // line talks about stringizing.
+          while (CurrentChar <> #0) and (CurrentChar <> #10) and (CurrentChar <> #13) and
+                (CurrentChar <> cVirtualEOL) do
           begin
             AdvanceChar;
             CurrentChar := GetCurrentChar;

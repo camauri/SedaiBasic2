@@ -7388,6 +7388,7 @@ var
   RawFieldPointee, RawPtrName: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
+  DerefTgt: TASTNode;
 begin
   // FreeBASIC RAW pointer-deref store through a FIELD: "*obj.field = expr" / "*(@obj.field[i]) = expr"
   // where the field is a raw "<scalar> PTR". Store SizeOf(pointee) bytes to the raw heap. Type-based (a
@@ -7409,6 +7410,35 @@ begin
       EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
     end;
     Exit;
+  end;
+
+  // "*Cast/CPtr(T Ptr, x) = v" over a RAW address: the CAST's pointee decides the WIDTH of the store,
+  // not x's declared pointee - the mirror of the load-side rule in the antDeref lowering, and it was
+  // missing here. The by-name branch below resolves x through the cast and then used x's OWN width, so
+  // "*CPtr(UByte Ptr, p) = 65" on an Integer Ptr wrote EIGHT bytes: fbc leaves 833 where we left 65.
+  // This is the shape the typed POKE desugars to, so getting it wrong would have mis-poked every width.
+  DerefTgt := VarNode.GetChild(0);
+  while (DerefTgt <> nil) and (DerefTgt.NodeType = antParentheses) and (DerefTgt.ChildCount >= 1) do
+    DerefTgt := DerefTgt.GetChild(0);
+  if (DerefTgt <> nil) and (DerefTgt.NodeType = antCast) and (RawPtrExprName(DerefTgt) <> '') then
+  begin
+    RawFieldPointee := UpperCase(DerefedType(DerefTgt));
+    if RawFieldPointee <> '' then
+    begin
+      ProcessExpression(DerefTgt, VarReg);
+      VarReg := EnsureIntRegister(VarReg);
+      ProcessExpression(ExprNode, ExprValue);
+      if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') then
+        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                        MakeSSAConstInt(Ord(RawFieldPointee = 'WSTRING')))
+      else if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
+        EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)))
+      else
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+      Exit;
+    end;
   end;
 
   // FreeBASIC RAW pointer-deref store: "*p = expr" / "*(p±n) = expr" where p is Allocate'd → store
@@ -20218,7 +20248,18 @@ begin
     antIdentifier:
       Result := PrintKindOf(VarToStr(Node.Value));
     antFunctionCall:
+    begin
       Result := PrintKindOf(VarToStr(Node.Value));
+      // ...and when the name is not in the table, the FIXED-WIDTH CONVERSIONS still answer: CUByte,
+      // CUShort, CULng and CUnsg produce an UNSIGNED value, which prints with no leading sign space.
+      // OperandWidthCode is the DERIVED answer and already knows every one of them - asking it beats
+      // repeating the list here, which is how the two drifted apart in the first place.
+      if (Result = 0) and FModernMode then
+      begin
+        AwCode := OperandWidthCode(Node);
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+      end;
+    end;
     antGraphicsFunction:
       // RGB/RGBA are graphics-function nodes, not antFunctionCall - and they return a ULONG, which
       // prints with no leading sign space. Asking the same table by the same name is all this needs;
@@ -20293,6 +20334,18 @@ begin
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
+    antDeref:
+      // "*p" through a pointer to a narrow UNSIGNED type prints unsigned - no leading sign space -
+      // exactly as "p[i]" through the same pointer already did. Only the INDEXED form was covered, so
+      // the very same byte printed a sign space when read one way and not the other. DerefedType
+      // resolves the pointee through a variable, a cast or pointer arithmetic alike, so PEEK - which
+      // desugars to "*CPtr(T Ptr, ...)" - is covered by the same line.
+      if FModernMode and (Node.ChildCount >= 1) then
+      begin
+        AwCode := TypeNameWidthCode(UpperCase(DerefedType(Node.GetChild(0))));
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        else if AwCode = 8 then Result := 2;
+      end;
     antCast:
       // "Cast(UByte, -1)" is 255 with NO leading sign space: the cast gives the value an UNSIGNED type,
       // and FreeBASIC drops the sign column for unsigned types. Kind 3, not 2 - a narrow unsigned
@@ -20315,7 +20368,12 @@ begin
       // to the decimal string), so the token's BasePrefixed mark is the only thing that still tells them
       // apart. Without it, keying off the digits alone would strip the sign space from every hex literal in
       // the range: one divergence traded for another.
-      if FModernMode and Assigned(Node.Token) and (not Node.Token.BasePrefixed) and
+      if FModernMode and Assigned(Node.Token) and Node.Token.UnsignedSuffixed then
+        // An explicit 'U' type suffix ("12u", "5UL") makes the literal unsigned outright, whatever its
+        // magnitude - no need to consult the ladder below, which only ever recognised the one range
+        // where a DECIMAL literal becomes unsigned on its own.
+        Result := 3
+      else if FModernMode and Assigned(Node.Token) and (not Node.Token.BasePrefixed) and
          (Node.Token.TokenType <> ttStringLiteral) then
       begin
         Txt := Trim(VarToStr(Node.Token.Value));
@@ -25302,9 +25360,15 @@ var
   T: string;
 begin
   T := UpperCase(PointeeType);
-  if (T = 'BYTE') or (T = 'UBYTE') then Result := RTC_I8
-  else if (T = 'SHORT') or (T = 'USHORT') then Result := RTC_I16
-  else if (T = 'LONG') or (T = 'ULONG') then Result := RTC_I32
+  // ⛔ SIGNEDNESS IS PART OF THE CODE, not a detail: the narrow views used to collapse onto the signed
+  // one, so every unsigned pointee sign-extended on load (a UByte holding 200 read back as -56). The
+  // 64-bit codes need no pair - the int bank IS 64 bits, so there is nothing to extend.
+  if T = 'UBYTE' then Result := RTC_U8
+  else if T = 'USHORT' then Result := RTC_U16
+  else if T = 'ULONG' then Result := RTC_U32
+  else if (T = 'BYTE') or (T = 'BOOLEAN') then Result := RTC_I8
+  else if T = 'SHORT' then Result := RTC_I16
+  else if T = 'LONG' then Result := RTC_I32
   else if T = 'SINGLE' then Result := RTC_SINGLE
   else if T = 'DOUBLE' then Result := RTC_DOUBLE
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
@@ -25333,9 +25397,9 @@ function TSSAGenerator.RawElemSizeOfPointee(const PointeeType: string): Int64;
 // SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
 begin
   case RawTypeCodeOfPointee(PointeeType) of
-    RTC_I8: Result := 1;
-    RTC_I16: Result := 2;
-    RTC_I32, RTC_SINGLE: Result := 4;
+    RTC_I8, RTC_U8: Result := 1;
+    RTC_I16, RTC_U16: Result := 2;
+    RTC_I32, RTC_U32, RTC_SINGLE: Result := 4;
   else
     Result := 8;   // I64 / DOUBLE
   end;

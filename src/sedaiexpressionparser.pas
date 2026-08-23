@@ -89,6 +89,7 @@ type
     function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
+    function ParsePeekFB(Token: TLexerToken): TASTNode;        // FB PEEK([type,] ptr) → *CPtr(T Ptr, ptr); nil if not the FB form
     function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
     function AtPointerSuffix: Boolean;                         // FB: the current token is "PTR" (or its synonym "POINTER")
     function ParseDeref(Token: TLexerToken): TASTNode;         // *ptr → antDeref (FreeBASIC pointers)
@@ -1270,6 +1271,18 @@ begin
     Exit;
   end;
 
+  // FreeBASIC PEEK([datatype,] pointer) reads REAL memory at an address; the Commodore PEEK(address)
+  // reads the emulated memory map. Same name, two dialects, and they stay separate -- only MODERN takes
+  // this branch. Both FB forms are exactly a typed dereference, so they desugar to "*CPtr(<T> Ptr, ptr)"
+  // and inherit the width and the signedness the deref lowering already gets right; untyped means UBYTE,
+  // fbc's default. ⛔ PEEK is a ttMemoryFunction, NOT a ttIdentifier: putting this next to CAST in
+  // ParseIdentifier compiled, ran, and was never reached -- PEEK went on answering the memory map.
+  if (UpperCase(VarToStr(Token.Value)) = kPEEK) and ModernMode and Context.Check(ttDelimParOpen) then
+  begin
+    Result := ParsePeekFB(Token);
+    if Assigned(Result) then Exit;
+  end;
+
   Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
 
   // FreeBASIC FRE takes no argument and is written BARE: "Dim mem As UInteger = Fre". Demanding the
@@ -2163,6 +2176,69 @@ begin
   Result := TASTNode.Create(antArrayAccess, Token);
   Result.AddChild(NameNode);
   Result.AddChild(Args);
+end;
+
+function IsFBScalarTypeName(const N: string): Boolean;
+// The built-in scalar type names FreeBASIC's PEEK/POKE accept as their leading datatype. Deliberately
+// a local list rather than the parser's own IsBuiltinTypeName: that one lives in the implementation of
+// another unit, and STRING has no meaning as a PEEK width.
+var
+  T: string;
+begin
+  T := UpperCase(N);
+  Result := (T = 'BYTE') or (T = 'UBYTE') or (T = 'SHORT') or (T = 'USHORT') or
+            (T = 'LONG') or (T = 'ULONG') or (T = 'INTEGER') or (T = 'UINTEGER') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+            (T = 'SINGLE') or (T = 'DOUBLE') or (T = 'ZSTRING') or (T = 'WSTRING') or
+            (T = 'ANY');
+end;
+
+function TExpressionParser.ParsePeekFB(Token: TLexerToken): TASTNode;
+// FreeBASIC "PEEK([datatype,] pointer)". The name is already consumed; the current token is '('.
+// Produces antDeref(antCast("<T> PTR", <ptr expr>)) -- the very form "*CPtr(T Ptr, p)" parses to -- so
+// the whole feature is a desugaring and adds no SSA op, no bytecode and no VM arm.
+//
+// Speculative on the TYPE only: "Peek(Integer, p)" commits, "Peek(x, y)" and "Peek(p)" do not need to,
+// because the untyped form is just the UBYTE case. Returns nil only when the parse cannot be made, and
+// then the caller falls through to the ordinary function-call path (which is what CLASSIC keeps).
+var
+  Saved: Integer;
+  TypeStr: string;
+  PtrExpr, CastNode: TASTNode;
+begin
+  Result := nil;
+  Context.SavePosition(Saved);
+  Context.Advance;                                   // consume '('
+  TypeStr := '';
+  // A leading built-in type name followed by ',' is the typed form. Anything else is an address
+  // expression, and the pointee is UBYTE.
+  if Context.Check(ttIdentifier) and IsFBScalarTypeName(VarToStr(Context.CurrentToken.Value)) then
+  begin
+    TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;
+    while AtPointerSuffix do begin TypeStr := TypeStr + ' PTR'; Context.Advance; end;
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                // consume ','
+    else
+    begin
+      Context.RestorePosition(Saved);                // "Peek(Integer)" -- not our form
+      Exit;
+    end;
+  end;
+  if TypeStr = '' then TypeStr := 'UBYTE';
+  PtrExpr := ParseExpression(precNone);
+  if not Assigned(PtrExpr) then begin Context.RestorePosition(Saved); Exit; end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    PtrExpr.Free;
+    Context.RestorePosition(Saved);
+    Exit;
+  end;
+  CastNode := TASTNode.CreateWithValue(antCast, TypeStr + ' PTR', Token);
+  CastNode.AddChild(PtrExpr);
+  Result := TASTNode.Create(antDeref, Token);
+  Result.AddChild(CastNode);
+  DoNodeCreated(Result);
 end;
 
 function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
