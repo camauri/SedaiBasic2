@@ -97,6 +97,10 @@ $Script:LibDir = Join-Path $ProjectRoot 'lib'
 $Script:BinDir = Join-Path $ProjectRoot 'bin'
 $Script:ConfigFile = Join-Path $ProjectRoot 'setup.config.json'
 
+# ⛔ EXACTLY 3.2.2. Other versions are not "probably fine": 3.3.1 does not compile SedaiBasic at all,
+# so a build that picks one fails in a way that looks like a source problem.
+$Script:FpcRequiredVersion = '3.2.2'
+
 # User configuration (loaded from setup.config.json if exists)
 $Script:UserConfig = @{
     FpcPath = $null
@@ -263,8 +267,19 @@ function Select-Fpc {
         $ver = ''
         try { $ver = (& $p -iV 2>$null) } catch { $ver = '' }
         if (-not $ver) { continue }
-        $works = Test-FpcWorks -Fpc $p
-        $rows += [PSCustomObject]@{ Path = $p; Version = "$ver".Trim(); Works = $works; Why = $script:FpcProbeLog }
+        # ⛔ THE VERSION IS A GATE, not a preference: 3.3.1 does not compile SedaiBasic. Checked
+        # BEFORE the compile probe, because a wrong-version compiler that happens to build
+        # "begin end." would otherwise be listed as usable and fail on the real source, which reads
+        # as a problem with our code. The revision suffix (3.2.2-r0d122c49) is not part of the version.
+        $vClean = ("$ver".Trim() -split '-')[0]
+        if ($vClean -ne $Script:FpcRequiredVersion) {
+            $works = $false
+            $why = "version $vClean : SedaiBasic needs exactly $($Script:FpcRequiredVersion)"
+        } else {
+            $works = Test-FpcWorks -Fpc $p
+            $why = $script:FpcProbeLog
+        }
+        $rows += [PSCustomObject]@{ Path = $p; Version = "$ver".Trim(); Works = $works; Why = $why }
     }
 
     if ($rows.Count -eq 0) {
@@ -280,7 +295,7 @@ function Select-Fpc {
         if ($r.Works) {
             Write-Host ("  {0}) FPC {1,-8} {2}" -f ($i + 1), $r.Version, $r.Path)
         } else {
-            Write-Host ("  {0}) FPC {1,-8} {2}   [cannot compile - skipped]" -f ($i + 1), $r.Version, $r.Path) -ForegroundColor Yellow
+            Write-Host ("  {0}) FPC {1,-8} {2}   [skipped]" -f ($i + 1), $r.Version, $r.Path) -ForegroundColor Yellow
             # ...and WHY, in the compiler's own words. A verdict with no reason is not actionable.
             if ($r.Why) {
                 foreach ($line in ($r.Why -split "`n")) {
@@ -294,8 +309,9 @@ function Select-Fpc {
     # A compiler that cannot compile is never the answer, however it got listed.
     $usable = @(0..($rows.Count - 1) | Where-Object { $rows[$_].Works })
     if ($usable.Count -eq 0) {
-        Write-Host "ERROR: none of them can compile a trivial program." -ForegroundColor Red
-        Write-Host "An install without a usable fpc.cfg is the usual cause." -ForegroundColor Yellow
+        Write-Host "ERROR: none of them is usable." -ForegroundColor Red
+        Write-Host "SedaiBasic needs Free Pascal $($Script:FpcRequiredVersion) exactly; an install without a" -ForegroundColor Yellow
+        Write-Host "usable fpc.cfg is the other usual cause. The reason is printed under each one above." -ForegroundColor Yellow
         return $null
     }
 
