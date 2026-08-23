@@ -4370,17 +4370,30 @@ begin
   FillChar(Result[1], Head, 0);
   Body := '';
   Addr := ERR_NAMES + LongWord(Head);
+  { ⛔ THE FREEBASIC TABLE, because this target is MODERN-only. The numbers had been separated by
+    dialect since the beginning and the WORDS had not: ERR$(5) answered DEVICE NOT PRESENT (Commodore
+    5) for a program whose Err() reports FreeBASIC codes, where 5 is "Illegal resume". Our own
+    extended codes (100..113) keep their own messages inside GetFBErrorCodeDescription - FreeBASIC
+    defines nothing there, so there is nothing to collide with. }
+  { ⭐ A code whose message IS the fallback gets no slot at all: the handle stays 0, which is exactly
+    what the emitted lookup already tests to build "user error <n>" at run time. FreeBASIC defines only
+    0..17, so codes 18..41 are all fallback here where the Commodore table had a word for each - and
+    storing those 24 strings is what pushed the blob past STR_CONST_BASE the moment the table became
+    FreeBASIC's. ⛔ Code 0 is NOT one of them: its message is genuinely the empty string. }
   for k := 0 to ERR_LO_MAX do
-    Put(k, AnsiString(SedaiExecutorErrors.GetErrorCodeDescription(k)));
+  begin
+    M := AnsiString(SedaiExecutorErrors.GetFBErrorCodeDescription(k));
+    if M <> AnsiString('user error ' + IntToStr(k)) then Put(k, M);
+  end;
   for k := ERR_HI_LO to ERR_HI_MAX do
   begin
     Slot := (ERR_LO_MAX + 1) + (k - ERR_HI_LO);
-    M := AnsiString(SedaiExecutorErrors.GetErrorCodeDescription(k));
-    Put(Slot, M);
+    M := AnsiString(SedaiExecutorErrors.GetFBErrorCodeDescription(k));
+    if M <> AnsiString('user error ' + IntToStr(k)) then Put(Slot, M);
   end;
   { The last slot is the word the fallback prefixes to a code with no message of
-    its own - "ERROR 42" - which is what the interpreter's else branch formats. }
-  Put(ERR_SLOTS - 1, 'ERROR ');
+    its own - "user error 42" - which is what the interpreter's else branch formats. }
+  Put(ERR_SLOTS - 1, 'user error ');
   Result := Result + Body;
   if LongWord(Length(Result)) + ERR_NAMES > STR_CONST_BASE then
     raise Exception.CreateFmt('the ERR$ message table no longer fits below the string ' +

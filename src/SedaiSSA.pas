@@ -5574,6 +5574,21 @@ begin
           Exit;
         end;
 
+        // ⛔ A SPECIAL VARIABLE WITH AN EMPTY ARGUMENT LIST IS THE VARIABLE ITSELF. "Err()" is the form
+        // the FreeBASIC manual writes ("result = Err()") and it parsed as an indexed access into a name
+        // no rule below recognises - so it fell through to the ordinary-variable path and read whatever
+        // register happened to carry that slot. Not zero: a SILENT GARBAGE read, which answered with the
+        // file HANDLE of the preceding OPEN and looked like a plausible error code.
+        // The rule is written once, for every special variable, rather than per name: "Err()", "Timer()",
+        // "Command()" and the rest all mean the bare form when the parentheses are empty.
+        if (Node.GetChild(0).NodeType = antSpecialVariable) and
+           (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+           (Node.GetChild(1).ChildCount = 0) then
+        begin
+          ProcessExpression(Node.GetChild(0), Result);
+          Exit;
+        end;
+
         // FreeBASIC INDEX OPERATOR "v[i]" on a UDT that declares "Operator [] (i) ByRef As E". Tested
         // first: the node is shaped like any other indexed access, so every rule below would read the
         // object as an array or a call and answer with its handle.
@@ -6806,6 +6821,20 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+
+  { ⭐ "Err = n" - the SETTER the FreeBASIC manual defines as ERROR minus the raise: "Unlike Error,
+    Err = number sets the error number WITHOUT invoking an error handler." It parsed as an ordinary
+    assignment to a variable that happens to be called ERR, so it wrote a slot nothing reads and the
+    next "Print Err" answered 0. Lowered to the ERROR opcode with the no-raise flag, so the two
+    spellings share one arm and cannot answer differently. }
+  if FModernMode and (VarNode.NodeType = antSpecialVariable) and
+     (UpperCase(VarToStr(VarNode.Value)) = 'ERR') then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    EmitInstruction(ssaRaiseError, MakeSSAValue(svkNone), EnsureIntRegister(ExprValue),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(1));
+    Exit;
+  end;
 
   { ⭐ "b = ..." where b is a BigInt. Taken EARLY, before every lvalue shape below,
     because the target is a HANDLE and the store has to go through the BigInt opcodes:

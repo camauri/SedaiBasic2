@@ -595,6 +595,7 @@ type
     procedure ReleaseRetiredArrDesc;
     // Raise a dialect-aware filesystem runtime error: FreeBASIC error number + message in MODERN,
     // Commodore error number + '?...' message in CLASSIC. The code reaches ERR via the except handler.
+    function ErrorText(Code: Integer): string;   // the dialect's own message for an error NUMBER
     procedure RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);
     // FreeBASIC resets Err/Erl after RESUME / RESUME NEXT; Commodore keeps EL/ER. Reset only in MODERN.
     procedure ResetErrorStateIfModern(Ctx: TExecutionContext);
@@ -8173,8 +8174,20 @@ begin
         // code into ERR and transfers to any active ON ERROR / TRAP handler (or aborts if none).
         // Known codes report their standard BASIC message (e.g. 10 -> NEXT WITHOUT FOR, also
         // reached by the compiler's orphan-NEXT lowering); unknown ones fall back to "ERROR n".
-        raise TExecutorRuntimeException.CreateWithCode(
-          GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);
+        //
+        // ⭐ Immediate = 1 is "Err = n", which the FreeBASIC manual defines as exactly this minus the
+        // raise: "Unlike Error, Err = number sets the error number without invoking an error handler."
+        // One arm for both, so the two spellings cannot answer differently.
+        if Instr.Immediate = 1 then
+        begin
+          Ctx.LastErrorCode := Ctx.IntRegs[Instr.Src1];
+          Ctx.LastErrorMessage := ErrorText(Ctx.IntRegs[Instr.Src1]);
+          if Ctx.LastErrorCode <> 0 then
+            Ctx.LastErrorLine := FProgram.GetSourceLine(Ctx.PC);
+        end
+        else
+          raise TExecutorRuntimeException.CreateWithCode(
+            ErrorText(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);
       end;
     // === FreeBASIC variadic arguments (CVA_*) ===
     bcVarArgCtl:
@@ -12174,7 +12187,7 @@ begin
         Ctx.IntRegs[Instr.Dest] := Len;
       end;
     11: // bcStrErr - ERR$(n)
-      Ctx.StringRegs[Instr.Dest] := SedaiExecutorErrors.GetErrorCodeDescription(Ctx.IntRegs[Instr.Src1]);
+      Ctx.StringRegs[Instr.Dest] := ErrorText(Ctx.IntRegs[Instr.Src1]);
     19: // bcStrOct - OCT(n[, digits]) - octal string, full INT64 range. Src2 = digits width (0 = natural).
       Ctx.StringRegs[Instr.Dest] := FitBaseDigits(IntToBaseStr(Ctx.IntRegs[Instr.Src1], 8), Ctx.IntRegs[Instr.Src2]);
     20: // bcStrBin - BIN(n[, digits]) - binary string, full INT64 range. Src2 = digits width (0 = natural).
@@ -15751,6 +15764,7 @@ procedure TBytecodeVM.ExecuteFileIOOp(Ctx: TExecutionContext; const Instr: TByte
 var
   SubOp: Word;
   ErrorCode: Integer;
+  OpenFbCode: Integer;   // the FreeBASIC status of an OPEN: delivered in Dest AND in Err
   HandleNum: Integer;
   HandleName, Filename, Mode, Data: string;
   QVal: Int64;         // bcFileQuery numeric fast path result (unmanaged: costs nothing to declare)
@@ -15814,17 +15828,32 @@ begin
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);
+          // The FreeBASIC code for what the file layer reported: 62 FILE NOT FOUND is fbc's 2, and the
+          // other failures the layer can return are its 3 (file I/O error).
+          case ErrorCode of
+            0:      OpenFbCode := 0;
+            62:     OpenFbCode := 2;
+          else      OpenFbCode := 3;
+          end;
           if SubOp = 34 then
-            // The FUNCTION form is FreeBASIC's, so it answers with FreeBASIC's code, not the Commodore
-            // one the statement form raises: 62 FILE NOT FOUND is fbc's 2, and the two failure codes the
-            // file layer can otherwise return are its 3 (file I/O error). The statement form is untouched.
-            case ErrorCode of
-              0:      Ctx.IntRegs[Instr.Dest] := 0;
-              62:     Ctx.IntRegs[Instr.Dest] := 2;
-            else      Ctx.IntRegs[Instr.Dest] := 3;
-            end
-          else if ErrorCode <> 0 then
+            // The FUNCTION form is FreeBASIC's, so it answers with FreeBASIC's code.
+            Ctx.IntRegs[Instr.Dest] := OpenFbCode
+          else if not (Assigned(FProgram) and FProgram.ModernMode) and (ErrorCode <> 0) then
             raise Exception.CreateFmt('DOPEN error %d opening file: %s', [ErrorCode, Filename]);
+          // ⛔ AND IT REACHES Err, WHICH IS THE WHOLE POINT OF THE STATEMENT FORM IN FreeBASIC.
+          // "Open f For Input As #1 : Loop Until Err() = 0" is the manual's own inline idiom, and the
+          // statement form lowers to THIS opcode - the function one - with its result discarded, so a
+          // missing file simply vanished: Err stayed 0 and the program read an empty file.
+          // Every open sets Err to its OWN status, 0 on success included, exactly as fbc does.
+          if Assigned(FProgram) and FProgram.ModernMode then
+          begin
+            Ctx.LastErrorCode := OpenFbCode;
+            if OpenFbCode <> 0 then
+            begin
+              Ctx.LastErrorLine := FProgram.GetSourceLine(Ctx.PC);
+              Ctx.LastErrorMessage := 'File not found';
+            end;
+          end;
         end
         else
           raise Exception.Create('DOPEN command not supported: no handler assigned');
@@ -16536,6 +16565,17 @@ begin
   end
   else
     raise Exception.Create('LOG of non-positive number');
+end;
+
+function TBytecodeVM.ErrorText(Code: Integer): string;
+// The message for an error NUMBER, in the dialect's own table. The two collide: FreeBASIC 5 is
+// "Illegal resume" and Commodore 5 is DEVICE NOT PRESENT, so "Error 5" in MODERN used to report the
+// Commodore text - the numbers had been separated by dialect and the WORDS had not.
+begin
+  if Assigned(FProgram) and FProgram.ModernMode then
+    Result := SedaiExecutorErrors.GetFBErrorCodeDescription(Code)
+  else
+    Result := SedaiExecutorErrors.GetErrorCodeDescription(Code);
 end;
 
 procedure TBytecodeVM.RaiseFileError(const FBMsg: string; FBCode: Integer; const CBMMsg: string; CBMCode: Integer);

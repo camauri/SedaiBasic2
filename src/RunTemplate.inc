@@ -1713,6 +1713,25 @@ begin
           raise;
         end;
       end
+      // ⛔ NO HANDLER, AND IN MODERN A FILESYSTEM ERROR IS NOT FATAL. FreeBASIC's base dialect does not
+      // abort on one: it records the code in Err and carries on, which is what makes the manual's own
+      // inline idiom work - "Open f For Input As #1 : Loop Until Err() = 0". Measured against fbc: a
+      // failed KILL, a failed OPEN and a CLOSE of an unopened handle all continue with Err set, while
+      // "Error n" with no handler DOES abort ("Aborting due to runtime error 5"). So the line is drawn
+      // at the filesystem family - TExecutorIOException - and nowhere else.
+      // ⚠️ MODERN only. In CLASSIC a missing file is ?FILE NOT FOUND and stops the program, which is
+      // Commodore behaviour and is what the CLASSIC corpus expects.
+      else if (E is TExecutorIOException) and Assigned(FProgram) and FProgram.ModernMode then
+      begin
+        Ctx.LastErrorLine := FProgram.GetSourceLine(CurPC);
+        Ctx.LastErrorProc := FProgram.GetProcNameAt(CurPC);
+        Ctx.LastErrorCode := TExecutorException(E).ErrorCode;
+        Ctx.LastErrorMessage := E.Message;
+        CurPC := CurPC + 1;          // resume at the next statement, as fbc does
+        Ctx.PC := CurPC;
+        Ctx.Running := True;
+        TrapTriggered := True;       // restart the dispatch loop at the new PC
+      end
       else
       begin
         // No TRAP set - re-raise exception
