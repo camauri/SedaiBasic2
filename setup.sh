@@ -331,6 +331,46 @@ if [[ "$DO_DEPS" == "true" ]]; then
     echo ""
 fi
 
+# ---------------------------------------------------------------------------
+#  SedaiAudioFoundation (optional)
+# ---------------------------------------------------------------------------
+# It is what makes SOUND work at all - the SID emulation included - and it is a separate repository
+# rather than a package. build.sh auto-detects it in deps/ or beside the project, and builds without
+# it if it is not there, so this never fails the setup.
+if [[ "$DO_DEPS" == "true" ]]; then
+    echo -e "${CYAN}  SedaiAudioFoundation${NC}"
+    echo ""
+    audio_here=""
+    for cand in "$SCRIPT_DIR/deps/SedaiAudioFoundation" "$(dirname "$SCRIPT_DIR")/SedaiAudioFoundation"; do
+        file_exists_nocase "$cand/src" "$SEDAI_AUDIO_MARKER" && { audio_here="$cand"; break; }
+    done
+    if [[ -n "$audio_here" ]]; then
+        show_status "already present: $audio_here" "Success"
+    else
+        # ⚠️ A BRANCH ARCHIVE, so there is nothing to verify against: no release, no version, no
+        # checksum. Said out loud rather than passed over, because every other download in this
+        # project is hash-pinned and this one cannot be.
+        show_status "downloading $SEDAI_AUDIO_REPO ($SEDAI_AUDIO_BRANCH, unpinned)..." "Info"
+        tmpa="$(mktemp -d)"
+        if curl -sSL --fail -o "$tmpa/audio.zip" "$SEDAI_AUDIO_URL" \
+           && unzip -q -o "$tmpa/audio.zip" -d "$tmpa"; then
+            src_dir="$(find "$tmpa" -maxdepth 1 -type d -name 'SedaiAudio-*' | head -1)"
+            if [[ -n "$src_dir" ]] && file_exists_nocase "$src_dir/src" "$SEDAI_AUDIO_MARKER"; then
+                mkdir -p "$SCRIPT_DIR/deps"
+                rm -rf "$SCRIPT_DIR/deps/SedaiAudioFoundation"
+                mv "$src_dir" "$SCRIPT_DIR/deps/SedaiAudioFoundation"
+                show_status "installed: deps/SedaiAudioFoundation" "Success"
+            else
+                show_status "the archive does not look like SedaiAudioFoundation - audio disabled" "Warning"
+            fi
+        else
+            show_status "download failed - the build will run without audio" "Warning"
+        fi
+        rm -rf "$tmpa"
+    fi
+    echo ""
+fi
+
 [[ "$DO_BUILD" != "true" ]] && exit 0
 
 # ---------------------------------------------------------------------------

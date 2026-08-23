@@ -355,11 +355,7 @@ cpu_opt_level() {
 
 # Case-insensitive test for a file: a name that matched on Windows may differ in case here,
 # and a case-only mismatch reads exactly like "the dependency is not installed".
-file_exists_nocase() {
-    local dir="$1" name="$2"
-    [[ -d "$dir" ]] || return 1
-    find "$dir" -maxdepth 1 -iname "$name" -type f 2>/dev/null | grep -q .
-}
+# file_exists_nocase lives in scripts/lib/deps-linux.sh, shared with setup.sh.
 
 # Detect SedaiAudioFoundation. Audio is enabled for sb and sbv only.
 AUDIO_ENABLED=false

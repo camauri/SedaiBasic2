@@ -226,3 +226,24 @@ distro_name() {
 SDL2_BINDINGS_VERSION="2.3"
 SDL2_BINDINGS_URL="https://github.com/camauri/SedaiBasic2-Deps/releases/download/SDL2-for-Pascal-v2.3/SDL2-for-Pascal-v2.3.zip"
 SDL2_BINDINGS_SHA256="829dd68bebfe7756bf037160e7cc268c115976d640480d73ebb8badaa46a9e47"
+
+# ⛔ SedaiAudioFoundation IS A SEPARATE REPOSITORY, not a package and not a release: the Windows
+# installer takes a BRANCH archive, so there is no version to pin and no checksum to verify. That is
+# a real difference from the Pascal bindings, which are a pinned release, and it is stated here rather
+# than quietly skipped: what arrives is whatever main holds today.
+# It carries the SID emulation (src/SID/SedaiSIDEvo.pas) among much else, and build.sh adds every one
+# of its source subdirectories.
+SEDAI_AUDIO_REPO="camauri/SedaiAudio"
+SEDAI_AUDIO_BRANCH="main"
+SEDAI_AUDIO_URL="https://github.com/camauri/SedaiAudio/archive/refs/heads/main.zip"
+SEDAI_AUDIO_MARKER="sedaiaudiofoundation.pas"   # matched case-insensitively, under src/
+
+# ⛔ CASE-INSENSITIVE ON PURPOSE. The audio foundation's own file is SedaiAudioFoundation.pas with
+# capitals, and a check written with the lowercase spelling finds nothing on a case-sensitive
+# filesystem - which is exactly how the first version of setup.sh decided a perfectly good
+# download 'does not look like SedaiAudioFoundation'.
+file_exists_nocase() {
+    local dir="$1" name="$2"
+    [[ -d "$dir" ]] || return 1
+    find "$dir" -maxdepth 1 -iname "$name" -type f 2>/dev/null | grep -q .
+}
