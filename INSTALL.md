@@ -25,6 +25,7 @@ without it, and that is the exception, not the normal case.
 | **SDL2 Pascal bindings** | compiling the SDL2 units | downloaded into `deps/sdl2`; they are not in the repository |
 | **ALSA** (`libasound.so.2`) | MIDI input | optional, opened at run time: without it MIDI input is unavailable and nothing else changes |
 | **SedaiAudioFoundation** | the audio subsystem itself | optional, auto-detected; it drives SDL2's audio device |
+| **SDL2_image**, **FreeType**, **libpng**, **libjpeg**, **zlib** | nothing yet | installed on purpose: they sit beside the Windows binaries, and keeping both platforms carrying the same set means nothing has to be installed again the day something uses them |
 
 ⭐ **The Pascal bindings are platform independent**: 52 text files, `.pas` and `.inc`, no binaries,
 every platform difference behind an `{$IFDEF}`. Windows, Linux and macOS download the very same

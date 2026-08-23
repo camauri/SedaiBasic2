@@ -232,6 +232,25 @@ if [[ "$DO_DEPS" == "true" ]]; then
         fi
     fi
 
+    # ⚠️ NOT USED BY THE BUILD YET, installed on purpose. These are the libraries that sit beside the
+    # Windows binaries: SDL2_image and the image and font codecs. Keeping the two platforms carrying
+    # the same set means that the day something starts using them, nothing has to be installed again.
+    # None of them is required: a missing one is reported and the build goes ahead.
+    for spec in "sdl2image-dev:SDL2_image:libSDL2_image.so:SDL2_image" \
+                "freetype-dev:freetype2:libfreetype.so:FreeType" \
+                "png-dev:libpng:libpng.so:libpng" \
+                "jpeg-dev:libjpeg:libjpeg.so:libjpeg" \
+                "zlib-dev:zlib:libz.so:zlib"; do
+        key="${spec%%:*}"; rest="${spec#*:}"
+        pc="${rest%%:*}"; rest="${rest#*:}"
+        soname="${rest%%:*}"; label="${rest##*:}"
+        if have_shared_lib "$pc" "$soname"; then
+            show_status "$label" "Success"
+        else
+            MISSING+=("$(dep_pkg "$key" "$PM")"); MISSING_WHY+=("$label (not used by the build yet)")
+        fi
+    done
+
     # The two tools this script itself needs to fetch and unpack the Pascal bindings.
     for tool in curl unzip; do
         if command -v "$tool" >/dev/null 2>&1; then
