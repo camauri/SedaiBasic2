@@ -83,6 +83,12 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    BitWidth: Integer;      // FreeBASIC BIT FIELD "name : n As T": n bits (0 = not a bit field). A RUN of
+    BitOffset: Integer;     // consecutive bit fields shares ONE storage unit of the declared type: every
+                            // member of the run gets that unit's ByteOffset and width code, and its own
+                            // (BitOffset, BitWidth) within it. ⭐ THAT IS WHAT KEPT THE WIRE UNTOUCHED:
+                            // Slot still carries (byte offset, width code) and the shift-and-mask lives
+                            // in the SSA, so the interpreter, the AOT and the disassembler are unchanged.
     StructGroup: Integer;   // an anonymous "Type ... End Type" block inside a UNION: its members are
                             // SEQUENTIAL among themselves while the union overlaps the groups. 0 = none.
     UnionGroup: Integer;    // a nested "Union ... End Union" block inside this TYPE: every field of the
@@ -619,6 +625,10 @@ type
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
     function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;  // fbc's C layout of a UDT
+    procedure AssignBitFieldRuns(UDTIdx: Integer);   // pack a run of "name : n As T" members into one unit
+    function UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;   // a field's index in its type
+    function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+    function EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
     procedure ComputeUDTLiveLayout(UDTIdx: Integer);   // A3: the LIVE byte image of a UDT, for every type
     function EmitBinFileBlock(IsGet: Boolean; const HandleReg: TSSAValue;
                               ValueNode, CountNode: TASTNode): Boolean;  // GET/PUT #n of a whole array / raw memory block
@@ -21310,6 +21320,20 @@ begin
     end;
 end;
 
+function TSSAGenerator.UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;
+// The index of a field within its type's field array, or -1. The bit-field accessors need the INDEX
+// (they read BitOffset and BitWidth), not just one derived number.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := -1;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(i);
+end;
+
 function TSSAGenerator.UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
 // B1.5: the narrow width code of a field (0 = full width / not found).
 var
@@ -21710,6 +21734,8 @@ begin
       // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
+      FUDTs[Idx].Fields[n].BitWidth := StrToIntDef(FieldNode.Attributes.Values['BITWIDTH'], 0);
+      FUDTs[Idx].Fields[n].BitOffset := 0;   // assigned by the run pass in ComputeUDTLiveLayout
       FUDTs[Idx].Fields[n].UnionGroup := StrToIntDef(FieldNode.Attributes.Values['UNIONGRP'], 0);
       FUDTs[Idx].Fields[n].StructGroup := StrToIntDef(FieldNode.Attributes.Values['STRUCTGRP'], 0);
       if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
@@ -21739,6 +21765,111 @@ begin
     end;
   FUDTs[Idx].NStr := cStr;
   ComputeUDTLiveLayout(Idx);
+end;
+
+function TSSAGenerator.EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+// A BIT FIELD is read out of its storage unit: (unit SHR BitOffset) AND ((1 SHL BitWidth) - 1).
+// The unit itself is loaded by the ordinary field op - the two share a slot - so the whole feature
+// costs a shift and a mask in the SSA and NOTHING on the wire.
+var
+  OfsReg, MaskReg, Shifted: TSSAValue;
+  Mask: Int64;
+begin
+  Result := UnitVal;
+  if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
+  Result := EnsureIntRegister(UnitVal);
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitOffset > 0 then
+  begin
+    OfsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].BitOffset),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShr, Shifted, Result, OfsReg, MakeSSAValue(svkNone));
+    Result := Shifted;
+  end;
+  Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
+  MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Shifted, Result, MaskReg, MakeSSAValue(svkNone));
+  Result := Shifted;
+end;
+
+function TSSAGenerator.EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+// ...and written back into it: (unit AND NOT (mask SHL ofs)) OR ((value AND mask) SHL ofs). The caller
+// loads the unit, calls this, and stores the result through the same ordinary field op - a
+// read-modify-write, which is what a bit field IS.
+var
+  Mask: Int64;
+  MaskReg, OfsReg, KeepMaskReg, Kept, Vm, Vs, Res: TSSAValue;
+begin
+  Result := NewVal;
+  if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
+  Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
+  MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Vm := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Vm, EnsureIntRegister(NewVal), MaskReg, MakeSSAValue(svkNone));
+  Vs := Vm;
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitOffset > 0 then
+  begin
+    OfsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].BitOffset),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Vs := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShl, Vs, Vm, OfsReg, MakeSSAValue(svkNone));
+  end;
+  KeepMaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, KeepMaskReg,
+                  MakeSSAConstInt(not (Mask shl FUDTs[UDTIdx].Fields[FieldIdx].BitOffset)),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Kept := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Kept, EnsureIntRegister(UnitVal), KeepMaskReg, MakeSSAValue(svkNone));
+  Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseOr, Res, Kept, Vs, MakeSSAValue(svkNone));
+  Result := Res;
+end;
+
+procedure TSSAGenerator.AssignBitFieldRuns(UDTIdx: Integer);
+// FreeBASIC BIT FIELDS: a run of consecutive "name : n As T" members shares ONE storage unit of type T.
+// Each member gets its BitOffset within that unit; a new unit starts when the next member would not fit,
+// or when the declared type changes, or at any non-bit member. C's rule, and fbc's.
+//
+// Marks continuation members with ByteSize = -1 so the layout below can recognise them without
+// re-deriving the runs: they take the unit's own offset and advance nothing.
+var
+  i, UnitBits, Used, UnitW: Integer;
+  Sz, Al: Int64;
+begin
+  UnitBits := 0; Used := 0; UnitW := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    if FUDTs[UDTIdx].Fields[i].BitWidth <= 0 then
+    begin
+      UnitBits := 0; Used := 0; UnitW := -1;
+      Continue;
+    end;
+    UDTFieldCShape(UDTIdx, i, Sz, Al);
+    // The unit's identity is its declared WIDTH CODE - that is what decides the storage width, and the
+    // field record keeps no type name to compare.
+    if (UnitW <> FUDTs[UDTIdx].Fields[i].WidthCode) or
+       (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
+    begin
+      // A new storage unit: this member starts it, and the layout treats it as an ordinary field.
+      UnitW := FUDTs[UDTIdx].Fields[i].WidthCode;
+      UnitBits := Integer(Sz) * 8;
+      Used := 0;
+      FUDTs[UDTIdx].Fields[i].BitOffset := 0;
+    end
+    else
+    begin
+      FUDTs[UDTIdx].Fields[i].BitOffset := Used;
+      FUDTs[UDTIdx].Fields[i].ByteSize := -1;        // continuation: shares the unit before it
+    end;
+    Inc(Used, FUDTs[UDTIdx].Fields[i].BitWidth);
+  end;
 end;
 
 procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
@@ -21779,8 +21910,18 @@ begin
   MaxAl := 1; Ofs := 0;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1;
   SGrpCur := 0; SGrpOfs := 0;
+  AssignBitFieldRuns(UDTIdx);           // marks the continuation members with ByteSize = -1
   for i := 0 to n - 1 do
   begin
+    // A BIT FIELD that continues the unit before it takes that unit's offset, width code and slot, and
+    // advances nothing: there is one piece of storage and several names for parts of it.
+    if (i > 0) and (FUDTs[UDTIdx].Fields[i].BitWidth > 0) and (FUDTs[UDTIdx].Fields[i].ByteSize = -1) then
+    begin
+      FUDTs[UDTIdx].Fields[i].ByteOffset := FUDTs[UDTIdx].Fields[i - 1].ByteOffset;
+      FUDTs[UDTIdx].Fields[i].ByteSize := FUDTs[UDTIdx].Fields[i - 1].ByteSize;
+      FUDTs[UDTIdx].Fields[i].Slot := FUDTs[UDTIdx].Fields[i - 1].Slot;
+      Continue;
+    end;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
@@ -28485,6 +28626,8 @@ begin
     Op := ssaRecordLoadInt;
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  // A BIT FIELD names part of the unit just loaded: shift it down and mask it.
+  DestVal := EmitBitFieldExtract(DestVal, UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(Node.Value)));
   // A fixed-length string FIELD ("As String * n") is stored NUL-padded to its capacity, like a
   // fixed-length scalar: an ordinary read converts at the first NUL (see TryFixedLenStore's header).
   if (Bank = srtString) and AnyFixedLen then DestVal := MaybeFixedLenRead(Node, DestVal);
@@ -28595,7 +28738,8 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
   TypeName, NestedT, SMBack: string;
-  UDTIdx, Slot, FixCap: Integer;
+  UDTIdx, Slot, FixCap, BitIdx: Integer;
+  BitUnit: TSSAValue;
   Bank: TSSARegisterType;
   FixWide: Boolean;
   HandleVal, ExprVal, DummyVal: TSSAValue;
@@ -28648,6 +28792,15 @@ begin
     // so going through it first would settle the conversion as signed and leave ApplyNarrowCode an
     // integer it can only pass through. For widths 1..6 either order gives the same answer.
     begin ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); ExprVal := EnsureIntRegister(ExprVal); Op := ssaRecordStoreInt; end;
+  end;
+  // A BIT FIELD is a READ-MODIFY-WRITE of its unit: load the unit, splice the value's bits in, store
+  // the unit back. The ordinary field op does both halves - the bit field and its unit share a slot.
+  BitIdx := UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value));
+  if (BitIdx >= 0) and (FUDTs[UDTIdx].Fields[BitIdx].BitWidth > 0) then
+  begin
+    BitUnit := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordLoadInt, BitUnit, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+    ExprVal := EmitBitFieldInsert(BitUnit, ExprVal, UDTIdx, BitIdx);
   end;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;

@@ -7588,6 +7588,7 @@ var
   KeyNum, KeyIdx, CharIdx: Integer;
   KeyText: string;
   KeyStr: string;       // GETKEY: the character just read (the FUNCTION form turns it into a code)
+  PrintStr: string;     // PRINT USING: the formatted text, kept so the cursor column can be advanced by it
   Ch: Char;
   InQuotes: Boolean;
   HandleNum64: Int64;   // indirect-call target (entry PC, or a BUILTIN_FP_TAG @Sin sentinel)
@@ -8467,20 +8468,33 @@ begin
           Ctx.StringRegs[Instr.Dest] := '';
       end;
     // Formatted output
+    // ⛔ PRINT USING ADVANCES THE CURSOR COLUMN like any other output. All four arms wrote straight to
+    // the device and left Ctx.CursorCol alone, so a following comma computed its tab zone from a column
+    // that did not include what USING had just printed. "Print Using ""###: ""; i;" then "Print s," put
+    // the next zone 5 columns too far - the whole width of the USING output - on EVERY item of the row.
+    // The tracked column is also what POS() and CSRLIN answer, so it was wrong there too.
     bcPrintUsing:
       begin
         // PRINT USING format$; value
         // Src1 = format string register, Src2 = value register
         if Assigned(FOutputDevice) then
+        begin
           // Src2 is a FLOAT value here; the exact-integer form is bcPrintUsingInt (below).
-          FOutputDevice.Print(FormatUsing(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2], False, 0));
+          PrintStr := FormatUsing(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2], False, 0);
+          FOutputDevice.Print(PrintStr);
+          AdvancePrintCol(Ctx, Length(PrintStr));
+        end;
       end;
     bcPrintUsingInt:
       // PRINT USING with an EXACT integer value: Src1 = format string, Src2 = int value. A LongInt beyond
       // 2^53 keeps every digit instead of being rounded through a Double (Pell's 2469645423824185801).
       begin
         if Assigned(FOutputDevice) then
-          FOutputDevice.Print(FormatUsing(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]));
+        begin
+          PrintStr := FormatUsing(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]);
+          FOutputDevice.Print(PrintStr);
+          AdvancePrintCol(Ctx, Length(PrintStr));
+        end;
       end;
     bcPrintUsingStage:
       // Stage one already-stringified value for a runtime-format PRINT USING (Src1 = string register).
@@ -8492,7 +8506,11 @@ begin
       // Run a runtime-format PRINT USING over the staged values (Src1 = format string register).
       begin
         if Assigned(FOutputDevice) then
-          FOutputDevice.Print(FormatUsingRuntime(Ctx.StringRegs[Instr.Src1]))
+        begin
+          PrintStr := FormatUsingRuntime(Ctx.StringRegs[Instr.Src1]);
+          FOutputDevice.Print(PrintStr);
+          AdvancePrintCol(Ctx, Length(PrintStr));
+        end
         else
           SetLength(FPUStage, 0);
       end;
