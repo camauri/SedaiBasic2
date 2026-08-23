@@ -5433,6 +5433,17 @@ begin
 
     antInputFunction:
     begin
+      // ⛔ "Pos()" WITH EMPTY PARENTHESES HAS NO CHILDREN AT ALL, and the whole body below sits behind
+      // "ChildCount > 0" - so it emitted NOTHING and the caller read whatever register happened to be
+      // there (zero, which looked like a plausible column). Same shape as "Err()": the nullary
+      // parenthesised form of a name falls off the end of a handler written for the form WITH
+      // arguments. Handled first, before the gate that hides it.
+      if (Node.ChildCount = 0) and (UpperCase(VarToStr(Node.Value)) = kPOS) then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaGraphicPos, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
       // Handle input functions: RWINDOW, POS, etc.
       if Node.ChildCount > 0 then
       begin
