@@ -77,6 +77,8 @@ $Script:UserConfig = @{
     SedaiAudioPath = $null    # Custom SedaiAudioFoundation path
 }
 $Script:FpcVersion = "3.2.2"
+# The one version that compiles SedaiBasic. Same constant build.ps1 and setup.sh enforce.
+$Script:FpcRequiredVersion = "3.2.2"
 $Script:FpcArch = "x86_64-win64"
 $Script:FpcDir = Join-Path $ProjectRoot "fpc\$FpcVersion"
 $Script:FpcExe = Join-Path $FpcDir "bin\$FpcArch\fpc.exe"
@@ -607,14 +609,18 @@ function Test-GccInstallation {
     return (Test-Path (Join-Path $ProjectRoot "deps\gcc\bin\gcc.exe"))
 }
 
+# ⛔ THE VERSION IS PART OF "INSTALLED". This read -iV and threw the answer away, so a user who
+# pointed setup at their own FPC 3.3.1 was told the install was fine - and then build.ps1, which does
+# check, refused it. Two scripts, two answers, and the one that spoke first was wrong.
+# 3.3.1 does not compile SedaiBasic; the revision suffix (3.2.2-r0d122c49) is not part of the version.
 function Test-FpcInstallation {
     if (!(Test-Path $FpcExe)) {
         return $false
     }
 
     try {
-        $version = & $FpcExe -iV 2>&1
-        return $true
+        $version = ("$(& $FpcExe -iV 2>&1)".Trim() -split '-')[0]
+        return ($version -eq $Script:FpcRequiredVersion)
     } catch {
         return $false
     }
@@ -1039,8 +1045,11 @@ function Invoke-Setup {
         Show-Step -Number $currentStep -Total $totalSteps -Title "Verifying FPC Installation"
 
         if (!(Test-FpcInstallation)) {
-            Show-Status "FPC is not properly installed" -Type "Error"
+            Show-Status "no usable Free Pascal $($Script:FpcRequiredVersion)" -Type "Error"
             Show-Status "Expected: $FpcExe" -Type "Error"
+            if (Test-Path $FpcExe) {
+                Show-Status "found version $(& $FpcExe -iV 2>&1) - SedaiBasic needs exactly $($Script:FpcRequiredVersion)" -Type "Error"
+            }
             Show-Summary -Success $false
             return 1
         }
