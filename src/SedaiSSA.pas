@@ -6204,12 +6204,16 @@ begin
           Exit;
         end;
 
-        // FreeBASIC INP(port): read a hardware I/O port. A portable VM has no ports, so the value is 0.
+        // FreeBASIC INP(port): read a hardware I/O port. A portable VM has no ports - and the answer to
+        // "no port access" is -8, not 0. ⛔ Measured against fbc on this platform: it answers -8 for
+        // EVERY port (&h60, &h3DA, 0, &hFFFF alike), which is the negation of its runtime error 8, "No
+        // privileges". Zero was never fbc's answer anywhere: where the OS grants access fbc reads real
+        // data, and where it does not it says -8. We can only ever be the second case, so we say so.
         if FModernMode and (UpperCase(ArrName) = kINP) and (ArrayIndexOf(ArrName) < 0) then
         begin
           if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(-8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
         end;
 
