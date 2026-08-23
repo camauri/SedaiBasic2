@@ -534,6 +534,7 @@ type
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
     function RawTypeCodeOfPointee(const PointeeType: string): Integer;           // raw element type code for a given scalar pointee
+    function RawStrModeOf(const PointeeType: string): Integer;                  // ssaRaw*ZStr mode: 0 zstring, 1 wstring, -1 managed String cell
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
     function RawElemSizeOfPointee(const PointeeType: string): Int64;             // SizeOf(scalar pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
@@ -571,6 +572,8 @@ type
     // "Cast(T, u) = expr" through a UDT's BYREF cast operator.
     function ProcessCastOperatorStore(CastNode, ExprNode: TASTNode): Boolean;
     // "u = expr" through a UDT's assignment operator ("Operator T.Let").
+    function TryLetOperatorOnResult(const RetRecType: string; ExprNode: TASTNode; const ExprVal: TSSAValue): Boolean;
+    function TryLetOperatorOnCastResult(ExprNode: TASTNode; const ExprVal: TSSAValue): Boolean;
     function ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
     function EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
     procedure EmitByrefRetStore(const AddrVal, Val: TSSAValue; const Lbl: string);
@@ -2145,6 +2148,17 @@ begin
       begin
         ProcessExpression(Node.GetChild(0), Left);   // field value / @field[i] address = raw byte address
         Left := EnsureIntRegister(Left);
+        // A ZSTRING/WSTRING pointee is a C STRING: "*t.zp" is the CHARACTERS at that address, read to
+        // the terminator - the same rule the by-NAME path a few branches down has always had. Missing
+        // here, the field's deref took the scalar arm and read eight bytes as a number, so a UDT
+        // holding a "ZString Ptr" printed 0 where fbc prints the text.
+        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') or (TempStr = 'STRING') then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RawStrModeOf(TempStr)));
+          Exit;
+        end;
         if (TempStr = 'SINGLE') or (TempStr = 'DOUBLE') then
         begin
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -2214,13 +2228,12 @@ begin
         // FreeBASIC-style - not an 8-byte scalar load. WSTRING stores UCS-2 units on the heap and
         // converts to/from our uniform UTF-8 managed strings (Src3: 0 = bytes, 1 = UCS-2).
         TempStr := UpperCase(FPointerVars.Values[UpperCase(ArrName2)]);
-        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+        if TempStr = '' then TempStr := UpperCase(PointeeTypeOf(ArrName2));
+        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') or (TempStr = 'STRING') then
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-          if TempStr = 'WSTRING' then
-            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(1))
-          else
-            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RawStrModeOf(TempStr)));
           Exit;
         end;
         if PointeeBankOf(ArrName2) = srtFloat then
@@ -7156,8 +7169,14 @@ begin
     end;
     ProcessExpression(ExprNode, ExprValue);
     // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
-    // result is staged into the result transfer slot as before.
-    if FCurrentProcRetRecType <> '' then
+    // result is staged into the result transfer slot as before. The "fname = expr" spelling takes the
+    // Let-operator conversion too, being the same statement written the other way.
+    if (FCurrentProcRetRecType <> '') and
+       TryLetOperatorOnResult(FCurrentProcRetRecType, ExprNode, ExprValue) then
+      // handled by the operator
+    else if TryLetOperatorOnCastResult(ExprNode, ExprValue) then
+      // ...and the OPERATOR CAST shape of the same conversion
+    else if FCurrentProcRetRecType <> '' then
       EmitRecordCopy(FCurrentResultHandle, ExprValue, FindUDT(FCurrentProcRetRecType))
     else
       // The "fname = expr" spelling of a result reaches the same declared type as "Return expr".
@@ -7399,6 +7418,15 @@ begin
     ProcessExpression(VarNode.GetChild(0), VarReg);
     VarReg := EnsureIntRegister(VarReg);
     ProcessExpression(ExprNode, ExprValue);
+    // "*t.zp = s" writes the string's BYTES plus the terminator at the pointed address, the mirror of
+    // the load above and of the by-NAME store below. Without it the assignment stored an eight-byte
+    // scalar, so the buffer the constructor had just CAllocate'd never received the characters.
+    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') or (RawFieldPointee = 'STRING') then
+    begin
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(RawFieldPointee)));
+      Exit;
+    end;
     if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
     begin
       ExprValue := EnsureFloatRegister(ExprValue);
@@ -7452,13 +7480,11 @@ begin
     // ZSTRING/WSTRING pointee: "*p = s" writes the string's characters + NUL at the pointed
     // address (WSTRING as UCS-2 units), FreeBASIC-style - not a scalar store.
     RawFieldPointee := UpperCase(FPointerVars.Values[UpperCase(RawPtrName)]);
-    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') then
+    if RawFieldPointee = '' then RawFieldPointee := UpperCase(PointeeTypeOf(RawPtrName));
+    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') or (RawFieldPointee = 'STRING') then
     begin
-      ExprValue := EnsureStringRegister(ExprValue);
-      if RawFieldPointee = 'WSTRING' then
-        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(1))
-      else
-        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(0));
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(RawFieldPointee)));
       Exit;
     end;
     if PointeeBankOf(RawPtrName) = srtFloat then
@@ -18177,6 +18203,103 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.TryLetOperatorOnCastResult(ExprNode: TASTNode; const ExprVal: TSSAValue): Boolean;
+// The same conversion as TryLetOperatorOnResult, for an OPERATOR CAST whose return type is a UDT.
+//
+// ⛔ WHY IT NEEDS ITS OWN ROUTINE: a cast's label carries a return-BANK suffix ('%', '#', '$') that the
+// return-type pre-scan never saw, so FCurrentProcRetRecType is EMPTY inside one - the very trap
+// CastRetRecType documents. The callee therefore stages a HANDLE into the result slot instead of
+// copying into a caller-allocated instance, and the caller allocates nothing. Rather than change that
+// protocol on both sides, this allocates the destination HERE, runs the operator on it, and hands its
+// handle back the way the cast already does. "Operator U1.Cast() As U2" whose body is "Return This"
+// then converts through "U2.Let(ByRef As U1)" - the manual's casting/opcast5 - instead of returning
+// the SOURCE's handle and reading a U1 through U2's layout, which agrees by accident when the two
+// layouts line up and lies otherwise.
+var
+  RetT, RhsType, Lbl, ParamType: string;
+  Decl, PList, P: TASTNode;
+  i, UDTIdx: Integer;
+  RcHandle: TSSAValue;
+begin
+  Result := False;
+  if (not FModernMode) or (FCurrentProcRetRecType <> '') or (ExprNode = nil) then Exit;
+  RetT := UpperCase(CastRetRecType(FCurrentProcName));
+  if (RetT = '') or (FindUDT(RetT) < 0) then Exit;
+  RhsType := UpperCase(ObjectTypeName(ExprNode));
+  if (RhsType = '') or (RhsType = RetT) or (FindUDT(RhsType) < 0) then Exit;
+  Lbl := ResolveMethodLabel(RetT, 'OPERATORLET');
+  if Lbl = '' then Exit;
+  ParamType := '';
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+  begin
+    PList := Decl.GetChild(1);
+    if Assigned(PList) and (PList.NodeType = antParameterList) then
+      for i := 1 to PList.ChildCount - 1 do
+      begin
+        P := PList.GetChild(i);
+        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
+          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
+        Break;
+      end;
+  end;
+  if ParamType <> RhsType then Exit;
+  UDTIdx := FindUDT(RetT);
+  RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordNew, RcHandle, MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
+                  MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
+  EmitRecordInit(RcHandle, UDTIdx);
+  EmitXferStore(srtInt, 0, RcHandle);                    // THIS = the new destination instance
+  EmitXferStore(srtInt, 1, EnsureIntRegister(ExprVal));  // the operand, by reference
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RcHandle);   // the cast's result: its handle
+  Result := True;
+end;
+
+function TSSAGenerator.TryLetOperatorOnResult(const RetRecType: string; ExprNode: TASTNode;
+  const ExprVal: TSSAValue): Boolean;
+// "Return <a UDT of a DIFFERENT type>" from a FUNCTION/OPERATOR declared As RetRecType: FreeBASIC
+// converts through "Operator RetRecType.Let (ByRef As <that type>)" when one is declared, instead of
+// copying the record. It is what makes the manual's casting/opcast5 work - "Operator U1.Cast() As U2"
+// whose body is "Return This", where This is a U1 and the result a U2 - and the conversion is exactly
+// the one an assignment "b = a" already took (ProcessLetOperatorStore); only the DESTINATION differs,
+// being a handle in a register rather than a named variable.
+//
+// The two arguments are both int-bank (a record handle is an int), so they occupy int slots 0 and 1 -
+// the same layout StageCallArgs would produce for "THIS, rhs". Staged by hand because the destination
+// has no AST node to clone.
+var
+  Lbl, ParamType, RhsType: string;
+  Decl, PList, P: TASTNode;
+  i: Integer;
+begin
+  Result := False;
+  if (not FModernMode) or (RetRecType = '') or (ExprNode = nil) then Exit;
+  RhsType := UpperCase(ObjectTypeName(ExprNode));
+  if (RhsType = '') or (RhsType = UpperCase(RetRecType)) then Exit;   // same type: an ordinary copy
+  if FindUDT(RhsType) < 0 then Exit;
+  Lbl := ResolveMethodLabel(RetRecType, 'OPERATORLET');
+  if Lbl = '' then Exit;
+  // ...and only when the operator's declared operand IS that type.
+  ParamType := '';
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+  begin
+    PList := Decl.GetChild(1);
+    if Assigned(PList) and (PList.NodeType = antParameterList) then
+      for i := 1 to PList.ChildCount - 1 do
+      begin
+        P := PList.GetChild(i);
+        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
+          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
+        Break;
+      end;
+  end;
+  if ParamType <> RhsType then Exit;
+  EmitXferStore(srtInt, 0, EnsureIntRegister(FCurrentResultHandle));   // THIS = the result instance
+  EmitXferStore(srtInt, 1, EnsureIntRegister(ExprVal));                // the operand, by reference
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  Result := True;
+end;
+
 function TSSAGenerator.ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
 // "u = expr" where u is an instance of a UDT declaring "Operator T.Let (rhs)": FreeBASIC routes the
 // assignment through that operator instead of copying. Without this the value was stored straight into
@@ -25354,6 +25477,21 @@ begin
     Result := FRawPtrRetFuncs.Values[UpperCase(VarToStr(Node.GetChild(0).Value))];
 end;
 
+function TSSAGenerator.RawStrModeOf(const PointeeType: string): Integer;
+// The Src3 mode of ssaRaw{Load,Store}ZStr for a STRING-ish pointee: 0 = C bytes to the terminator
+// (ZSTRING), 1 = UCS-2 units (WSTRING), -1 = a MANAGED STRING CELL (STRING). The last is FreeBASIC's
+// String DESCRIPTOR in our terms - SizeOf(String) bytes holding an index, with the characters in the
+// managed heap - and it is deliberately NOT the ZSTRING treatment, which would fit the manual's own
+// example by luck (23 characters into 24 bytes) and raise on the next longer string.
+var
+  T: string;
+begin
+  T := UpperCase(PointeeType);
+  if T = 'STRING' then Result := -1
+  else if T = 'WSTRING' then Result := 1
+  else Result := 0;
+end;
+
 function TSSAGenerator.RawTypeCodeOfPointee(const PointeeType: string): Integer;
 // Raw element type code for a raw pointer with the given (scalar) pointee type.
 var
@@ -25396,6 +25534,9 @@ end;
 function TSSAGenerator.RawElemSizeOfPointee(const PointeeType: string): Int64;
 // SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
 begin
+  // A "String Ptr" steps by SizeOf(String) - fbc's descriptor width, 24 bytes - so p[i] names the
+  // i-th cell. Left to the scalar ladder it stepped by 8 and the cells overlapped.
+  if UpperCase(PointeeType) = 'STRING' then Exit(24);
   case RawTypeCodeOfPointee(PointeeType) of
     RTC_I8, RTC_U8: Result := 1;
     RTC_I16, RTC_U16: Result := 2;
@@ -27792,7 +27933,8 @@ end;
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
-  ArrName, ParentType, NestedT, MemberArrElemType: string;
+  ArrName, ParentType, NestedT, MemberArrElemType, MethodLbl: string;
+  MethodArgs: TASTNode;
   MemberArrHandle, MemberArrIdx: TSSAValue;
   MemberArrBank: TSSARegisterType;
   ParentHandle, NestedHandle: TSSAValue;
@@ -27907,6 +28049,37 @@ begin
         TypeName := MemberArrElemType;
         Result := True;
         Exit;
+      end;
+    end;
+    // "obj.method(args).field" / ".method()": a METHOD returning a UDT. The same shape as the
+    // "f(args).field" rule further down, and it was missing here - only a MODULE-level function was
+    // known, so a method call fell past every branch, Result stayed False, and the field read answered
+    // garbage in silence ("vv.copy().I1" printed 1 for a record holding 123, and the method never ran).
+    // Placed after the member-ARRAY rule above, so "obj.arrfield(i)" keeps winning.
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) and
+       (ObjNode.GetChild(0).ChildCount >= 1) then
+    begin
+      ParentType := ObjectTypeName(ObjNode.GetChild(0).GetChild(0));
+      if ParentType <> '' then
+      begin
+        MethodArgs := nil;
+        if ObjNode.ChildCount >= 2 then MethodArgs := ObjNode.GetChild(1);
+        MethodLbl := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), MethodArgs);
+        if MethodLbl <> '' then
+        begin
+          // A UDT returned BY VALUE, or a "T PTR" whose value IS the handle - the two cases the
+          // module-level rule already separates.
+          MemberArrElemType := VarRecordTypeName(MethodLbl);
+          if MemberArrElemType = '' then MemberArrElemType := ProcReturnPtrUDT(MethodLbl);
+          if MemberArrElemType <> '' then
+          begin
+            ProcessExpression(ObjNode, HandleVal);   // lowers the call; the result is the handle
+            HandleVal := EnsureIntRegister(HandleVal);
+            TypeName := MemberArrElemType;
+            Result := True;
+            Exit;
+          end;
+        end;
       end;
     end;
     if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
@@ -29959,7 +30132,14 @@ begin
             end;
             ProcessExpression(Node.GetChild(0), RetVal);
             // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
-            if FCurrentProcRetRecType <> '' then
+            // ...unless the returned UDT is of ANOTHER type and the result type declares a Let for it:
+            // then the conversion is that operator's, exactly as it is for an assignment.
+            if (FCurrentProcRetRecType <> '') and
+               TryLetOperatorOnResult(FCurrentProcRetRecType, Node.GetChild(0), RetVal) then
+              // handled by the operator
+            else if TryLetOperatorOnCastResult(Node.GetChild(0), RetVal) then
+              // ...and the OPERATOR CAST shape of the same conversion
+            else if FCurrentProcRetRecType <> '' then
               EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
             else
               // A FUNCTION declared As UInteger/ULongInt returning a float takes the UNSIGNED

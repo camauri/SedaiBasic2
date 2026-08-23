@@ -227,6 +227,9 @@ type
     // go on a first-fit free list. VM-managed (not OS addresses) → memory-safe and portable. Guarded by
     // FRawHeapLock for cross-thread Allocate/Free.
     FRawHeap: array of Byte;
+    // Managed STRING cells: a "String Ptr" points at a 24-byte cell holding an INDEX into this, the
+    // way FreeBASIC's String is a descriptor whose characters live elsewhere. Slot 0 is ''.
+    FRawStrCells: array of string;
     FRawHeapTop: PtrUInt;                       // bump pointer (next free byte)
     FRawFreeOfs: array of PtrUInt;              // free-list block data offsets
     FRawFreeSz: array of PtrUInt;               // matching block payload sizes
@@ -701,6 +704,8 @@ type
     function RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;      // C string at the raw address, up to NUL
     function RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;    // exactly Count bytes at the raw address
     procedure RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);  // chars + NUL at the raw address
+    function RawStrCellGet(RawPtr: Int64): string;                             // managed String cell at a raw address
+    procedure RawStrCellSet(RawPtr: Int64; const S: string);                   // ...and writing one
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
     procedure RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes on the raw heap
@@ -5324,6 +5329,51 @@ begin
     if Length(W) > 0 then Move(W[1], P^, PtrUInt(Length(W)) * 2);
     PWord(P)[Length(W)] := 0;
   end;
+end;
+
+function TBytecodeVM.RawStrCellGet(RawPtr: Int64): string;
+// "*p" where p is a "STRING PTR": a MANAGED string cell. FreeBASIC's String is a DESCRIPTOR - a
+// pointer, a length and a capacity, SizeOf(String) = 24 bytes - whose characters live elsewhere, and
+// this is that model in our terms: the 24-byte cell holds an INDEX into FRawStrCells, and the text
+// itself stays a managed string. Reading a cell that was never written (CAllocate zeroes it) gives
+// index 0, which is reserved for the empty string.
+//
+// ⛔ Deliberately NOT the ZSTRING treatment. Writing the characters into the cell would fit the
+// manual's example by luck - 23 characters into 24 bytes - and raise on the next longer string.
+var
+  Idx: Int64;
+begin
+  Idx := PInt64(RawAddr(RawPtr, 8))^;
+  if (Idx > 0) and (Idx <= High(FRawStrCells)) then Result := FRawStrCells[Idx] else Result := '';
+end;
+
+procedure TBytecodeVM.RawStrCellSet(RawPtr: Int64; const S: string);
+// Store into a managed string cell: reuse the slot this cell already names, or take a new one.
+// ⚠️ A slot is not reclaimed when the block is Deallocate'd - the cell is gone by then and nothing
+// names the slot. The leak is one string per DISTINCT cell ever written, which no realistic program
+// makes unbounded; reclaiming it would need the raw heap to know which of its bytes are cells.
+var
+  Idx: Int64;
+  P: PInt64;
+begin
+  P := PInt64(RawAddr(RawPtr, 8));
+  Idx := P^;
+  if (Idx <= 0) or (Idx > High(FRawStrCells)) then
+  begin
+    if Length(FRawStrCells) = 0 then
+    begin
+      SetLength(FRawStrCells, 2);
+      FRawStrCells[0] := '';        // slot 0 is the empty string: a zeroed cell reads as ""
+      Idx := 1;
+    end
+    else
+    begin
+      Idx := Length(FRawStrCells);
+      SetLength(FRawStrCells, Idx + 1);
+    end;
+    P^ := Idx;
+  end;
+  FRawStrCells[Idx] := S;
 end;
 
 procedure TBytecodeVM.RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
@@ -13184,15 +13234,22 @@ begin
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
     50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2).
+        // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
         // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
         // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
-      if Instr.Immediate >= 2 then
+      if Instr.Immediate = -1 then
+        Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
+      else if Instr.Immediate >= 2 then
         Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
       else
         Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
-    51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING
-      RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
+    51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING,
+        // Imm -1 a MANAGED STRING CELL ("String Ptr" - see RawStrCellSet).
+      if Instr.Immediate = -1 then
+        RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+      else
+        RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
     34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
       begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
              // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
