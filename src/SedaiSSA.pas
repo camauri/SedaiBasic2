@@ -8889,7 +8889,15 @@ begin
           // AS T v = other" (or "= f()") left v zeroed, silently.
           ScalarCtorInit := (ArrayDeclNode.ChildCount >= 3) and
                             (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
-                            (UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName)) and
+                            ((UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName))
+                             // ⛔ ...OR the same type WITH A COPY CONSTRUCTOR. Excluding the same type
+                             // outright meant "Dim As T b = a" ran the EMPTY ctor and then field-copied,
+                             // so a declared Constructor(ByRef As T) was never called: measured against
+                             // fbc 23 Aug 2026, fbc prints "ctor di copia da rex" and answers
+                             // "rex-copia" where we printed "ctor vuoto" and answered "rex".
+                             // Without such a ctor the old path is still right - a plain field copy is
+                             // exactly what a type that declares none should get.
+                             or (ResolveConstructorLabel(RecTypeName, 'I', UpperCase(RecTypeName)) <> '')) and
                             (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
           if ScalarCtorInit then
           begin
@@ -8991,7 +8999,10 @@ begin
         // below, which stored the scalar straight into the handle register and corrupted it (AV on use).
         ScalarCtorInit := (ArrayDeclNode.ChildCount >= 3) and
                           (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
-                          (UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName)) and
+                          ((UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName))
+                           // Same rule as the SHARED path above: the same type still runs a COPY ctor
+                           // when one is declared. ⛔ Two sites, and both have to say it.
+                           or (ResolveConstructorLabel(RecTypeName, 'I', UpperCase(RecTypeName)) <> '')) and
                           (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
         // M4.4: run the constructor (if any). M4.4b: a "DIM v AS T(args)" attaches the ctor
         // argument list as child[2] (antArgumentList).
