@@ -22,8 +22,13 @@ without it, and that is the exception, not the normal case.
 | **Free Pascal 3.2.2** | everything | always |
 | **libSDL2** + **libSDL2_ttf** | **graphics AND audio** — the window, every drawing primitive, every sound | development files to build `sbv` and any target with audio; runtime files to run anything that draws or plays |
 | **GCC** (MinGW-w64 on Windows) | the C hot loop, worth **27–45%** | optional — without it the build succeeds and the interpreter is slower |
-| **SDL2 Pascal bindings** | compiling the SDL2 units | shipped in `deps/sdl2`; nothing to install |
+| **SDL2 Pascal bindings** | compiling the SDL2 units | downloaded into `deps/sdl2`; they are not in the repository |
+| **ALSA** (`libasound.so.2`) | MIDI input | optional, opened at run time: without it MIDI input is unavailable and nothing else changes |
 | **SedaiAudioFoundation** | the audio subsystem itself | optional, auto-detected; it drives SDL2's audio device |
+
+⭐ **The Pascal bindings are platform independent**: 52 text files, `.pas` and `.inc`, no binaries,
+every platform difference behind an `{$IFDEF}`. Windows, Linux and macOS download the very same
+archive, with the very same checksum. `setup.sh` and `setup.ps1` both fetch it.
 
 ⚠️ **When SDL2 is needed to LINK depends on what was detected.** `sbv` always links it. With
 SedaiAudioFoundation present the audio backend pulls it in, so even the plain `sb` links `libSDL2`.
