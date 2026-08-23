@@ -7158,12 +7158,19 @@ begin
   if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
   if Context.Check(ttSeparParam) then Context.Advance;        // ','
   Result.AddChild(ParseExpression);                           // src image handle
-  ModeOrd := 0;                                               // default: PSET
+  // ⛔ THE DEFAULT METHOD IS XOR, NOT PSET. It is the one line of the PUT page a reader skims past
+  // ("the default method is XOR") and it is measurable: "Put (x,y), img" over a grey background gives
+  // the XOR of the two here and in fbc, where this used to copy the source. A program that omits the
+  // method - which the manual's own examples do - drew something else entirely.
+  ModeOrd := 5;                                               // default: XOR (FreeBASIC's)
   if Context.Check(ttSeparParam) then
   begin
     Context.Advance;                                          // ','
     ModeStr := UpperCase(Context.CurrentToken.Value);
-    if (ModeStr = 'PSET') or (ModeStr = 'PRESET') then ModeOrd := 0
+    if ModeStr = 'PSET' then ModeOrd := 0
+    // PRESET is the 1's complement of the source, NOT a synonym for PSET: it was folded into PSET
+    // here, so "Put ..., PReset" copied the image unnegated.
+    else if ModeStr = 'PRESET' then ModeOrd := 8
     else if ModeStr = 'TRANS' then ModeOrd := 1
     else if ModeStr = 'ALPHA' then ModeOrd := 2
     else if ModeStr = 'AND' then ModeOrd := 3
@@ -7188,6 +7195,17 @@ begin
         Context.Advance;                                      // ','
         Result.AddChild(ParseExpression);                     // child 4: parameter (optional)
       end;
+    end
+    // ALPHA and ADD take a 0..255 blend value: "Put (x,y), img, Alpha, 128". It was never parsed, so
+    // the value was left dangling as an unattached node (the SSA logged "Unhandled node type 0") and
+    // the blit ran without it. ⭐ For ALPHA the ABSENCE of a value is not a default - it selects a
+    // different formula, the image's own per-pixel alpha - so it is recorded as HASVALUE rather than
+    // filled in with 255 here.
+    else if ((ModeOrd = 2) or (ModeOrd = 6)) and Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                        // ','
+      Result.AddChild(ParseExpression);                       // child 3: the blend value
+      Result.Attributes.Values['HASVALUE'] := '1';
     end;
   end;
   Result.Attributes.Values['MODE'] := IntToStr(ModeOrd);

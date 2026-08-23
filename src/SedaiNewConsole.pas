@@ -338,7 +338,7 @@ type
     procedure GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer; Filled: Boolean = False);
     procedure GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     procedure GBSetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
-    procedure GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+    procedure GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode; Value: Integer = 255);
     procedure GBDrawText(Surface: TGfxSurface; X, Y: Integer; const S: string; FG, BG: TGfxColor; Opaque: Boolean);
     procedure GBSetTextColors(FG, BG: TGfxColor);
     procedure GBGetTextColors(out FG, BG: TGfxColor);
@@ -4050,7 +4050,7 @@ begin
   else if Assigned(FGraphicsMemory) then FGraphicsMemory.SetClip(Active, X1, Y1, X2, Y2);   // screen
 end;
 
-procedure TVideoController.GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+procedure TVideoController.GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode; Value: Integer);
 // Blit the whole Src surface onto Dst at (X,Y), per pixel, applying the blit mode (ABGR colours;
 // TRANS skips the magenta key). Mirrors the software backend so sb and sbv agree pixel-for-pixel.
 const
