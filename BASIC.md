@@ -242,6 +242,11 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- ⚠️ **`PAINT` with no border colour**: in MODERN an omitted border is the **fill colour itself**, so
+  the flood spreads over everything that is not already that colour — a barrier of another colour is
+  painted over, not respected. Measured against fbc. In **CLASSIC** it stays the Commodore rule: the
+  flood covers the connected region of the *seed pixel's* colour and stops at anything else. The two
+  dialects have different flood rules and they stay apart.
 - ⚠️ **`DRAW`**: the turtle language matches fbc — the eight directions, the `B`/`N` prefixes, `S`
   scaling, absolute and relative `M`, `C`, `A`/`TA` rotation and `P` flood fill — with two
   differences. `POINTCOORD` reports the pen **rounded** (fbc's is fractional: `TA45 R20` reports

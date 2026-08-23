@@ -12653,6 +12653,17 @@ begin
     Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
     Instr.AddPhiSource(BReg, nil);   // border -> Immediate bits 16-31
   end
+  else if FModernMode then
+  begin
+    // ⛔ IN FreeBASIC AN OMITTED BORDER IS THE FILL COLOUR ITSELF, not "no border". Measured: on a
+    // black screen with a white barrier, "Paint (10,10), blue" fills the WHOLE screen, barrier
+    // included - it floods everything that is not already blue. We flooded the connected region of
+    // the SEED's colour and stopped at the barrier, which is the Commodore reading and is kept for
+    // CLASSIC below. The two dialects have different flood rules and they stay apart.
+    EmitInstruction(ssaGfxPaintBorder, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color
+    Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+    Instr.AddPhiSource(CReg, nil);   // border = the fill colour
+  end
   else
     EmitInstruction(ssaGfxPaint, MakeSSAValue(svkNone), XReg, YReg, CReg);   // Src3=color -> Immediate
   if HasTarget then EmitDrawTargetEnd;
