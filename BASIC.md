@@ -242,6 +242,18 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- ⚠️ **`DRAW`**: the turtle language matches fbc — the eight directions, the `B`/`N` prefixes, `S`
+  scaling, absolute and relative `M`, `C`, `A`/`TA` rotation and `P` flood fill — with two
+  differences. `POINTCOORD` reports the pen **rounded** (fbc's is fractional: `TA45 R20` reports
+  `114.1421,85.85786` where we report `114,86`, the same pixel); the pen is carried at full precision
+  for the length of a `DRAW` string, but the pair `POINTCOORD` and `PSET` share is the integer one the
+  C hot loop writes directly, and one authoritative pen beats two that can disagree. And
+  **`X <string pointer>`** (execute another command string) is not implemented: resolving a packed
+  string address back to its text has a different encoding per storage class in this model.
+- ⚠️ **`DRAW STRING`**: placement, colour, transparency and the 8-pixel advance are fbc's, measured.
+  The **glyph shapes of the built-in font are ours** — of the 95 printable ASCII glyphs, 54 have
+  pixel-identical coverage to fbc's and 41 differ. That is a font asset, not a semantics gap: adopting
+  fbc's would mean transcribing their bitmap, which is a decision rather than a fix.
 - **A graphics screen is always 32-bit truecolour.** `ScreenRes w, h, depth` and `Screen n` accept
   every depth the manual lists and give a truecolour surface for all of them; `ScreenInfo` reports
   `depth = 32`, `bpp = 4`, `pitch = w * 4`, which is what the framebuffer `ScreenPtr` hands out

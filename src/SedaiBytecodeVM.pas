@@ -16824,7 +16824,9 @@ var
   i: Integer;
   cmd: Char;
   blindP, noUpdateP, sgn, sgnY: Boolean;
-  num, my, sc, ang, nx, ny: Integer;
+  num, my, sc, nx, ny: Integer;
+  angDeg: Double;                 // the current rotation, in DEGREES (A n is TA n*90)
+  penFX, penFY: Double;           // the pen, carried at full precision for the whole string
   penColor: UInt32;
 
   procedure SkipSep;
@@ -16846,30 +16848,42 @@ var
     val := val * s2;
   end;
 
-  function Scaled(d: Integer): Integer;
-  begin Result := (d * sc) div 4; end;
+  function Scaled(d: Integer): Double;
+  begin Result := (d * sc) / 4; end;
 
-  procedure StepPen(dx, dy: Integer);   // draw a scaled+rotated segment from the pen, honouring B/N
-  var t, ex, ey: Integer;
+  procedure StepPen(dxi, dyi: Integer);   // draw a scaled+rotated segment from the pen, honouring B/N
+  // ⛔ THE ROTATION IS COUNTER-CLOCKWISE, and it used to be clockwise: measured against fbc, "A1 R20"
+  // from (100,100) lands on (100,80) - UP - and we landed on (100,120). A1 and A3 were each other's.
+  // ⭐ And it is one formula for BOTH A and TA now: A n is exactly TA (n*90). "TA" was not a case at
+  // all, so "TA45" parsed as an unknown T followed by A45, and "45 and 3" made it a 90-degree turn -
+  // an arbitrary angle silently snapped to a right angle.
+  var
+    dx, dy, ex, ey, cs, sn, r: Double;
   begin
-    dx := Scaled(dx); dy := Scaled(dy);
-    case ang and 3 of
-      1: begin t := dx; dx := -dy; dy := t; end;    // 90 CW (screen y grows down)
-      2: begin dx := -dx; dy := -dy; end;           // 180
-      3: begin t := dx; dx := dy; dy := -t; end;    // 270
+    dx := Scaled(dxi); dy := Scaled(dyi);
+    if angDeg <> 0 then
+    begin
+      r := angDeg * Pi / 180.0;
+      cs := Cos(r); sn := Sin(r);
+      ex := dx * cs + dy * sn;      // screen y grows DOWN, so a CCW turn is this pair of signs
+      ey := -dx * sn + dy * cs;
+      dx := ex; dy := ey;
     end;
-    ex := FDrawPenX + dx; ey := FDrawPenY + dy;
+    ex := penFX + dx; ey := penFY + dy;
     if (not blindP) and Assigned(FGraphics) then
-      FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(FDrawPenX), GfxMapY(FDrawPenY),
-                         GfxMapX(ex), GfxMapY(ey), penColor, 1);
-    if not noUpdateP then begin FDrawPenX := ex; FDrawPenY := ey; end;
+      FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(Round(penFX)), GfxMapY(Round(penFY)),
+                         GfxMapX(Round(ex)), GfxMapY(Round(ey)), penColor, 1);
+    if not noUpdateP then begin penFX := ex; penFY := ey; end;
   end;
 
 begin
   if S = '' then Exit;
   i := 1;
   penColor := FGfxForeColor;
-  sc := 4; ang := 0;
+  sc := 4; angDeg := 0;
+  // The pen is carried at full precision for the whole string and rounded back at the end: a rotated
+  // step lands between pixels, and rounding every segment accumulates the error over a long figure.
+  penFX := FDrawPenX; penFY := FDrawPenY;
   while i <= Length(S) do
   begin
     SkipSep;
@@ -16885,7 +16899,30 @@ begin
     case cmd of
       'C': if ReadNum(num, sgn) then penColor := UInt32(num);
       'S': if ReadNum(num, sgn) then sc := num;
-      'A': if ReadNum(num, sgn) then ang := num and 3;
+      'A': if ReadNum(num, sgn) then angDeg := (num and 3) * 90.0;
+      // TA n - rotate by n DEGREES, not by quarter turns. It was not a case at all, so "TA45" read as
+      // an unknown T plus "A45" and snapped to a right angle.
+      'T':
+        begin
+          if (i <= Length(S)) and (UpCase(S[i]) = 'A') then
+          begin
+            Inc(i);
+            if ReadNum(num, sgn) then angDeg := num;
+          end;
+        end;
+      // P colour,border - flood fill from the pen, bounded by a border colour. Never implemented, so
+      // the manual's own DRAW example ("P 1,2" inside a box) drew the box and left it hollow.
+      'P':
+        begin
+          if ReadNum(num, sgn) then
+          begin
+            if (i <= Length(S)) and (S[i] = ',') then Inc(i);
+            if not ReadNum(my, sgnY) then my := num;
+            if Assigned(FGraphics) then
+              FGraphics.FillBorder(FGfxWorkSurface, GfxMapX(Round(penFX)), GfxMapY(Round(penFY)),
+                                   UInt32(num), UInt32(my));
+          end;
+        end;
       'U': begin if not ReadNum(num, sgn) then num := 1; StepPen(0, -num); end;
       'D': begin if not ReadNum(num, sgn) then num := 1; StepPen(0,  num); end;
       'L': begin if not ReadNum(num, sgn) then num := 1; StepPen(-num, 0); end;
@@ -16899,15 +16936,19 @@ begin
           ReadNum(num, sgn);
           if (i <= Length(S)) and (S[i] = ',') then Inc(i);
           ReadNum(my, sgnY);
-          if sgn then begin nx := FDrawPenX + Scaled(num); ny := FDrawPenY + Scaled(my); end
+          if sgn then begin nx := Round(penFX + Scaled(num)); ny := Round(penFY + Scaled(my)); end
           else begin nx := num; ny := my; end;
           if (not blindP) and Assigned(FGraphics) then
-            FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(FDrawPenX), GfxMapY(FDrawPenY),
+            FGraphics.DrawLine(FGfxWorkSurface, GfxMapX(Round(penFX)), GfxMapY(Round(penFY)),
                                GfxMapX(nx), GfxMapY(ny), penColor, 1);
-          if not noUpdateP then begin FDrawPenX := nx; FDrawPenY := ny; end;
+          if not noUpdateP then begin penFX := nx; penFY := ny; end;
         end;
     end;
   end;
+  // Hand the pen back to the integer pair POINTCOORD and PSET share - and which the C hot loop writes
+  // directly, which is why there is one authoritative INTEGER pen and the fractional one lives only
+  // for the duration of a DRAW string.
+  FDrawPenX := Round(penFX); FDrawPenY := Round(penFY);
 end;
 
 procedure TBytecodeVM.ExecuteChdir(const Path: string);
