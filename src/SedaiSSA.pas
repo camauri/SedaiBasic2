@@ -13522,16 +13522,14 @@ begin
   VisReg := ZeroReg;
   if Op = 'FLIP' then
   begin
-    if Node.ChildCount = 0 then
-      Flags := 4                                   // swap work<->visible
-    else
-    begin
-      ProcessExpression(Node.GetChild(0), V0); VisReg := EnsureIntRegister(V0); Flags := Flags or 2;  // visible
-      if Node.ChildCount >= 2 then
-      begin
-        ProcessExpression(Node.GetChild(1), V1); WorkReg := EnsureIntRegister(V1); Flags := Flags or 1;  // work
-      end;
-    end;
+    // ⛔ FLIP IS A COPY, NOT A SWAP, AND IT DOES NOT SELECT ANYTHING. The manual says it in one line -
+    // "In normal graphics mode, Flip is an alias for PCopy and ScreenCopy" - and fbc agrees when
+    // measured: "Flip 1,2" gives page 2 page 1's content and leaves the work page where it was, while
+    // this swapped work and visible and, with arguments, SELECTED them. A double-buffering loop
+    // written the FreeBASIC way ("ScreenSet 1,0 : ...draw... : Flip") therefore drew onto the page
+    // being displayed on alternate frames.
+    ProcessPCopy(Node);
+    Exit;
   end
   else  // SET: work[,visible]
   begin

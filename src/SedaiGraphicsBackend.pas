@@ -239,6 +239,9 @@ begin
   // FreeBASIC SCREENRES: a truecolor (non-palette) surface of W x H. Depth ignored in phase 1.
   if (W <= 0) or (H <= 0) then Exit(False);
   FScreen.AllocateBuffers(W, H, False, gmSDL2Dynamic);
+  // A FreeBASIC screen carries FreeBASIC's default palette, not the Commodore one - and PALETTE with
+  // no arguments resets to it. Measured: fbc's entry 1 is (0,0,170) where the C64's is white.
+  FScreen.LoadFBDefaultPalette;
   // ⛔ ARGB ($AARRGGBB), which is what the window presenter uploads (SDL_PIXELFORMAT_ARGB8888) and
   // what a program reads back from POINT. This constant used to be $000000FF - the same black in the
   // OTHER byte order - so an untouched FreeBASIC screen answered POINT with 255 where fbc answers
