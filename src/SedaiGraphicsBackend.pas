@@ -40,7 +40,9 @@ uses
 type
   TGfxSurface = Integer;   // 0 = screen; >0 = image buffers (IMAGECREATE — deferred to phase 2/G3)
   TGfxColor   = UInt32;    // RGBA packed in the engine's internal ABGR layout ($AABBGGRR)
-  TGfxBlitMode = (gbmPSet, gbmTrans, gbmAlpha, gbmAnd, gbmOr, gbmXor, gbmAdd, gbmCustom);
+  // ⛔ APPENDED, never inserted: the ordinal travels from the parser to the VM as a number, so adding
+  // gbmPReset anywhere but the end would silently renumber every mode already compiled into a .basc.
+  TGfxBlitMode = (gbmPSet, gbmTrans, gbmAlpha, gbmAnd, gbmOr, gbmXor, gbmAdd, gbmCustom, gbmPReset);
 
 const
   GFX_SCREEN_SURFACE  = 0;
@@ -77,7 +79,10 @@ type
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);   // flood fill (PAINT)
     procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);  // boundary fill (PAINT ...,border)
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);  // VIEW clip rect
-    procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);  // accelerable; deferred to G3
+    // Value is the 0..255 blend factor ALPHA and ADD take ("Put (x,y), img, Alpha, 128").
+    // 255 is the default the FreeBASIC manual gives, and the one ALPHA reads as "use the image's own
+    // per-pixel alpha" - the two are different formulas in fbc, and measurably so.
+    procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode; Value: Integer = 255);  // accelerable; deferred to G3
     // Text INTO the drawing surface, from the built-in 8x8 font (SedaiGfxFont). X,Y is the TOP-LEFT of
     // the first cell, in pixels - not a text row/column - because that is what DRAW STRING means and
     // what PRINT in a graphics mode has to be reduced to.
@@ -144,7 +149,7 @@ type
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
-    procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
+    procedure Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode; Value: Integer = 255);
     procedure DrawText(Surface: TGfxSurface; X, Y: Integer; const S: string; FG, BG: TGfxColor; Opaque: Boolean);
     procedure SetTextColors(FG, BG: TGfxColor);
     procedure GetTextColors(out FG, BG: TGfxColor);
@@ -539,18 +544,34 @@ begin
   if Assigned(M) then M.SetClip(Active, X1, Y1, X2, Y2);
 end;
 
-procedure TSoftwareGraphicsBackend.Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
-// Blit the whole Src surface onto Dst at top-left (X,Y), per-pixel, applying the blit mode. Colours are
-// in the engine ABGR layout ($AABBGGRR). TRANS skips magenta (RGB 255,0,255). CUSTOM falls back to PSET.
+procedure TSoftwareGraphicsBackend.Blit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode; Value: Integer);
+// Blit the whole Src surface onto Dst at top-left (X,Y), per-pixel, applying the blit mode. TRANS skips
+// magenta (RGB 255,0,255).
+//
+// ⭐ EVERY FORMULA HERE WAS READ OFF fbc, not derived: a source colour and a destination colour were
+// swept and the arithmetic fitted to the answers. Two of them are NOT what a reasonable person would
+// write, and would never have been guessed:
+//   ALPHA with an explicit value : (src*a + dst*(255-a)) DIV 255, and the alpha byte becomes a
+//   ALPHA per-pixel (no value)   : (src*a + dst*(256-a)) SHR 8, a = the source pixel's own alpha
+// The two differ by one unit per channel on most inputs. fbc really does use both.
+//   ADD : dst + ((src*a) SHR 8), saturating, a defaulting to 255 - so a plain saturating add (which is
+//         what this did) came out one unit HIGH per channel.
+//   PRESET : the 1's complement of the source, all 32 bits.
+//   TRANS  : the source with the ALPHA BYTE CLEARED, which is fbc's own oddity and is measured.
+//
+// ⚠️ The channel names below say r/g/b and the layout is ARGB, so "sr" is really the blue byte. The
+// arithmetic is per-channel identical, so the mislabelling changes no result - but it is a trap for
+// the next reader and is called out rather than quietly renamed under a working formula.
 const
-  TRANS_KEY = TGfxColor($FFFF00FF);   // ABGR magenta = RGB(255,0,255)
+  TRANS_KEY = TGfxColor($FFFF00FF);   // magenta = RGB(255,0,255)
 var
   MD, MS: TGraphicsMemory;
   SW, SH, DW, DH, sx, sy, dx, dy: Integer;
   sc, dc, nc: TGfxColor;
+  BlendVal: Integer;
 
   function Blend(D, S: TGfxColor): TGfxColor;
-  var dr, dg, db, sr, sg, sb, sa, r, g, b: Integer;
+  var dr, dg, db, da, sr, sg, sb, sa, r, g, b, a: Integer;
   begin
     case Mode of
       gbmAnd: Result := D and S;
@@ -558,23 +579,46 @@ var
       gbmXor: Result := D xor S;
       gbmAdd:
         begin
-          sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
-          dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
-          r := dr + sr; if r > 255 then r := 255;
-          g := dg + sg; if g > 255 then g := 255;
-          b := db + sb; if b > 255 then b := 255;
-          Result := (D and $FF000000) or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+          // dst + ((src * a) shr 8), saturating, ALPHA CHANNEL INCLUDED - fbc treats it as one more
+          // channel here, unlike ALPHA which gives it a meaning.
+          sa := (S shr 24) and $FF; sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
+          da := (D shr 24) and $FF; dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
+          r := dr + ((sr * BlendVal) shr 8); if r > 255 then r := 255;
+          g := dg + ((sg * BlendVal) shr 8); if g > 255 then g := 255;
+          b := db + ((sb * BlendVal) shr 8); if b > 255 then b := 255;
+          a := da + ((sa * BlendVal) shr 8); if a > 255 then a := 255;
+          Result := TGfxColor(a shl 24) or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
         end;
       gbmAlpha:
         begin
-          sa := (S shr 24) and $FF;
           sr := S and $FF; sg := (S shr 8) and $FF; sb := (S shr 16) and $FF;
           dr := D and $FF; dg := (D shr 8) and $FF; db := (D shr 16) and $FF;
-          r := (sr * sa + dr * (255 - sa)) div 255;
-          g := (sg * sa + dg * (255 - sa)) div 255;
-          b := (sb * sa + db * (255 - sa)) div 255;
-          Result := $FF000000 or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+          if BlendVal >= 0 then
+          begin
+            // An EXPLICIT value: /255 arithmetic, and the value itself becomes the alpha byte.
+            a := BlendVal;
+            r := (sr * a + dr * (255 - a)) div 255;
+            g := (sg * a + dg * (255 - a)) div 255;
+            b := (sb * a + db * (255 - a)) div 255;
+            Result := TGfxColor(a shl 24) or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+          end
+          else
+          begin
+            // NO value: the source pixel's own alpha, and >>8 arithmetic with (256-a).
+            sa := (S shr 24) and $FF;
+            da := (D shr 24) and $FF;
+            r := (sr * sa + dr * (256 - sa)) shr 8;
+            g := (sg * sa + dg * (256 - sa)) shr 8;
+            b := (sb * sa + db * (256 - sa)) shr 8;
+            // ⚠️ DECLARED DIVERGENCE. fbc's alpha BYTE here is an artefact of the two-mask trick its
+            // blitter uses - it is not the blend of the two alphas, and it is not documented: measured
+            // 0x0F for src 64 over dst 255, where any blend of 64 and 255 is far larger. We blend the
+            // alpha channel like the other three, which is the answer the manual's words describe.
+            a := (sa * sa + da * (256 - sa)) shr 8;
+            Result := TGfxColor(a shl 24) or TGfxColor(b shl 16) or TGfxColor(g shl 8) or TGfxColor(r);
+          end;
         end;
+      gbmPReset: Result := not S;   // 1's complement, all 32 bits
     else
       Result := S;   // gbmPSet / gbmTrans (handled by caller) / gbmCustom
     end;
@@ -584,6 +628,10 @@ begin
   MD := MemoryOf(Dst);
   MS := MemoryOf(Src);
   if (not Assigned(MD)) or (not Assigned(MS)) then Exit;
+  // -1 means the statement named no value. ADD's default is 255 (the manual's); ALPHA's "no value" is
+  // not a default at all - it selects the per-pixel formula, which is a DIFFERENT one.
+  BlendVal := Value;
+  if (Mode = gbmAdd) and (BlendVal < 0) then BlendVal := 255;
   SW := MS.State.Width;  SH := MS.State.Height;
   DW := MD.State.Width;  DH := MD.State.Height;
   for sy := 0 to SH - 1 do
@@ -596,7 +644,14 @@ begin
       if (dx < 0) or (dx >= DW) then Continue;
       sc := MS.GetPixel(sx, sy);
       if (Mode = gbmTrans) and (sc = TRANS_KEY) then Continue;   // transparent pixel: leave dst
-      if Mode in [gbmPSet, gbmTrans, gbmCustom] then
+      // ALPHA writes nothing at all when the factor is zero - which is why a fully transparent blit
+      // leaves the destination's OWN alpha byte standing instead of zeroing it.
+      if (Mode = gbmAlpha) and (((BlendVal = 0)) or ((BlendVal < 0) and (((sc shr 24) and $FF) = 0))) then Continue;
+      if Mode = gbmTrans then
+        // ⚠️ MEASURED: fbc's TRANS clears the alpha byte of what it writes. Source $FF123456 lands as
+        // $00123456. Not a rounding artefact and not documented - swept and reproduced.
+        nc := sc and $00FFFFFF
+      else if Mode in [gbmPSet, gbmCustom] then
         nc := sc
       else
       begin

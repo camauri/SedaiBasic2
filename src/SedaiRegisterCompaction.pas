@@ -573,7 +573,10 @@ begin
 
     // PUT: Immediate [0-15]=src handle (int reg; bits 16-31 = mode ordinal, NOT a reg)
     if OpCode = bcGfxPut then
+    begin
       MarkIntRegUsed(Instr.Immediate and $FFFF);            // src handle
+      MarkIntRegUsed((Instr.Immediate shr 32) and $FFFF);   // ALPHA/ADD blend value
+    end;
 
     // WINDOW/VIEW: Immediate [0-15]=x2, [16-31]=y2 (int regs; bits 32-33 = flags, not regs)
     if (OpCode = bcGfxWindow) or (OpCode = bcGfxView) then
@@ -1279,12 +1282,20 @@ begin
       end;
     end;
 
-    // bcGfxPut: Immediate [0-15]=src handle (int reg); bits 16-31 = mode ordinal (preserved)
+    // bcGfxPut: Immediate [0-15]=src handle (int reg), [16-31]=mode ordinal (preserved),
+    // [32-47]=ALPHA/ADD blend value (int reg).
+    // ⛔ THIS REBUILT THE IMMEDIATE AND DROPPED EVERYTHING ABOVE BIT 31. That was harmless while the
+    // field ended at 31 and is a silent zeroing the moment anything is added above it - which is
+    // exactly what happened to the blend value. The mask is written from the layout now, so a new
+    // field is preserved by default instead of by luck.
     if OpCode = bcGfxPut then
     begin
       OldReg := Instr.Immediate and $FFFF;
       if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
-      NewImm := (NewReg and $FFFF) or (Instr.Immediate and Int64($FFFF0000));   // preserve mode bits 16-31
+      NewImm := (Instr.Immediate and not Int64($FFFF)) or (NewReg and $FFFF);
+      OldReg := (Instr.Immediate shr 32) and $FFFF;
+      if (OldReg < Length(FIntRegMap)) and (FIntRegMap[OldReg] >= 0) then NewReg := FIntRegMap[OldReg] else NewReg := OldReg;
+      NewImm := (NewImm and not (Int64($FFFF) shl 32)) or ((Int64(NewReg) and $FFFF) shl 32);
       if NewImm <> Instr.Immediate then
       begin
         Instr.Immediate := NewImm;

@@ -13178,12 +13178,12 @@ procedure TSSAGenerator.ProcessGfxPut(Node: TASTNode);
 // PUT (x,y), src [, mode] : blit image src onto the screen at (x,y). Children x,y,src; MODE attribute =
 // blit-mode ordinal. Packed as Src1=x, Src2=y, Src3=src handle, PhiSources[0]=mode (constant).
 var
-  XV, YV, SV, XR, YR, SR: TSSAValue;
+  XV, YV, SV, VV, XR, YR, SR, VR: TSSAValue;
   Instr: TSSAInstruction;
   Mode: Int64;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
-  Mode := StrToIntDef(Node.Attributes.Values['MODE'], 0);
+  Mode := StrToIntDef(Node.Attributes.Values['MODE'], 5);
   // CUSTOM is not a blend FORMULA, it is a user FUNCTION called once per pixel - so it cannot be a mode
   // ordinal handed to the backend, which knows nothing of the interpreter. It is lowered here instead,
   // as an ordinary loop over the source image built from opcodes that already exist (POINT with an image
@@ -13199,9 +13199,19 @@ begin
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
   ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
   if Mode = 7 then Mode := 0;                   // CUSTOM without a function: PSET, as the backend does
+  // The 0..255 blend value ALPHA and ADD take. ⭐ -1 means "the statement named none", which is NOT the
+  // same as 255: ALPHA reads it as "use the image's own per-pixel alpha", a different formula.
+  if (Node.Attributes.Values['HASVALUE'] = '1') and (Node.ChildCount >= 4) then
+  begin
+    ProcessExpression(Node.GetChild(3), VV);
+    VR := EnsureIntRegister(VV);
+  end
+  else
+    VR := EnsureIntRegister(MakeSSAConstInt(-1));
   EmitInstruction(ssaGfxPut, MakeSSAValue(svkNone), XR, YR, SR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(MakeSSAConstInt(Mode), nil);
+  Instr.AddPhiSource(VR, nil);                  // PhiSources[1] = the blend-value REGISTER
 end;
 
 procedure TSSAGenerator.ProcessImageConvertRow(Node: TASTNode);

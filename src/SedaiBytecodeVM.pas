@@ -14489,8 +14489,10 @@ begin
     40: // bcGfxPut - PUT (x,y),src[,mode] : blit image src onto the work page (Immediate[0-15]=src handle
         //  register, Immediate[16-31]=mode ordinal constant)
       if Assigned(FGraphics) then
-        FGraphics.Blit(FGfxWorkSurface, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-                       Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF));
+        // Immediate [0-15]=src handle reg, [16-31]=mode ordinal, [32-47]=blend-value reg (-1 = none).
+        FGraphics.Blit(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+                       Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
+                       Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
       if Assigned(FGraphics) then
         case Instr.Immediate of

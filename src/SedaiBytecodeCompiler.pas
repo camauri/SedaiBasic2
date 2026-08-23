@@ -1688,6 +1688,12 @@ begin
         (Int64(MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version)) and $FFFF);
     if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkConstInt) then
       BCInstr.Immediate := BCInstr.Immediate or ((Int64(Instr.PhiSources[0].Value.ConstInt) and $FFFF) shl 16);
+    // bits 32-47 = the blend-value REGISTER (ALPHA / ADD). A register index, so the register compactor
+    // has to remap it - both of its sites, which is the step the opcode checklist warns is easy to miss.
+    if (Length(Instr.PhiSources) >= 2) and (Instr.PhiSources[1].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[1].Value.RegType,
+          Instr.PhiSources[1].Value.RegIndex, Instr.PhiSources[1].Value.Version)) and $FFFF) shl 32);
     FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
     Exit;
   end;

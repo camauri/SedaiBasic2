@@ -232,6 +232,11 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
+- ⚠️ **`PUT ..., Alpha` without a value**: the RGB matches fbc exactly, but the resulting **alpha
+  byte** differs. fbc's is an artefact of the masked blitter it uses and is self-inconsistent — with
+  the same source alpha, destination alpha and blend value it answers `&h80` for source `&hFF123456`
+  and `&hFF` for source `&hFF00FF00`, a difference that depends on the *RGB* of the source and so
+  cannot be a defined semantic. We blend the alpha channel like the other three.
 - **A graphics screen is always 32-bit truecolour.** `ScreenRes w, h, depth` and `Screen n` accept
   every depth the manual lists and give a truecolour surface for all of them; `ScreenInfo` reports
   `depth = 32`, `bpp = 4`, `pitch = w * 4`, which is what the framebuffer `ScreenPtr` hands out
