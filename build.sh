@@ -750,6 +750,176 @@ echo ""
 
 [[ "$CLEAN" == "true" ]] && clean_build "$PLATFORM_DIR"
 
+# ============================================================================
+#  DEPENDENCY PREFLIGHT
+#
+#  ⛔ ONE REPORT, NOT ONE ERROR AT A TIME. The build used to discover a missing
+#  dependency the way a compiler does - the first one that stops it - so a person
+#  setting the project up installed something, ran it again, and was told about the
+#  next one. Four rounds to learn four package names is the difference between a
+#  project you can try and one you give up on.
+#
+#  Everything is checked BEFORE anything is compiled, and the whole answer is
+#  printed at once with a single command that installs all of it.
+#
+#  ⚠️ WHAT IS NEEDED IS NOT A FIXED LIST: it depends on what was detected. With
+#  SedaiAudioFoundation present, even the plain `sb` links libSDL2 (the audio
+#  backend uses it), and without it `sb` needs no SDL2 at all. So the report is
+#  built from the options as they finally stand, after auto-detection.
+# ============================================================================
+
+DEP_NAMES=(); DEP_STATE=(); DEP_WHY=(); DEP_REQ=(); DEP_PKG_APT=(); DEP_PKG_DNF=()
+DEP_PKG_PACMAN=(); DEP_PKG_ZYPPER=(); DEP_PKG_APK=(); DEP_PKG_BREW=()
+
+# dep_add <name> <ok|missing> <required|optional> <why> <apt> <dnf> <pacman> <zypper> <apk> <brew>
+dep_add() {
+    DEP_NAMES+=("$1"); DEP_STATE+=("$2"); DEP_REQ+=("$3"); DEP_WHY+=("$4")
+    DEP_PKG_APT+=("$5"); DEP_PKG_DNF+=("$6"); DEP_PKG_PACMAN+=("$7")
+    DEP_PKG_ZYPPER+=("$8"); DEP_PKG_APK+=("$9"); DEP_PKG_BREW+=("${10}")
+}
+
+# A shared library is present if pkg-config knows it, or if the linker can find the
+# unversioned .so - which is what a -dev/-devel package provides and what the LINK needs.
+# The versioned .so.0 alone is the RUNTIME package and is not enough to build against.
+have_shared_lib() {
+    local pc="$1" soname="$2" d
+    command -v pkg-config >/dev/null 2>&1 && pkg-config --exists "$pc" 2>/dev/null && return 0
+    for d in /usr/lib /usr/local/lib /usr/lib64 /lib "/usr/lib/$(uname -m)-linux-gnu" /opt/homebrew/lib; do
+        [[ -e "$d/$soname" ]] && return 0
+    done
+    return 1
+}
+
+pkg_manager() {
+    for m in apt dnf pacman zypper apk brew; do command -v "$m" >/dev/null 2>&1 && { echo "$m"; return; }; done
+    echo ""
+}
+
+# Collect every dependency the SELECTED targets and options actually need.
+collect_deps() {
+    local t needs_sdl_link=false needs_bindings=false wants_sdl_runtime=false
+
+    for t in "${BUILD_LIST[@]}"; do
+        case "$t" in
+            sbv) needs_sdl_link=true; needs_bindings=true; wants_sdl_runtime=true ;;
+        esac
+    done
+    # ⭐ SDL2 IS THE AUDIO BACKEND AS WELL AS THE VIDEO ONE - SedaiAudioFoundation opens its device
+    # with SDL_OpenAudioDevice and feeds it with SDL_QueueAudio. So with the audio library enabled
+    # EVERY target that links it needs libSDL2, "sb" included. This is the case that makes a static
+    # dependency list wrong, and it is why the report is built from what was actually detected.
+    [[ "$AUDIO_ENABLED" == "true" ]] && { needs_sdl_link=true; needs_bindings=true; }
+    # "sb --window" loads SDL2 at RUN time (SedaiSDL2Dyn calls LoadLibrary), so it needs nothing to
+    # build - but a user who builds it and finds no window would rather be told now.
+    [[ "$WINDOW" == "true" ]] && wants_sdl_runtime=true
+
+    if [[ "$HOT_C" == "true" ]]; then
+        local ccname="a C compiler (gcc or clang)"
+        if [[ -n "${SEDAI_CC:-}" ]] || command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
+           || command -v clang >/dev/null 2>&1; then
+            dep_add "$ccname" ok optional "the C hot loop" gcc gcc gcc gcc gcc ""
+        else
+            dep_add "$ccname" missing optional \
+                "the C hot loop - WITHOUT IT THE INTERPRETER IS 27-45% SLOWER, but it still builds" \
+                gcc gcc gcc gcc gcc ""
+        fi
+    fi
+
+    if [[ "$needs_bindings" == "true" ]]; then
+        local b="$SDL2_FOR_TARGETS/sdl2.pas"
+        if [[ -f "$b" ]]; then
+            dep_add "SDL2 Pascal bindings" ok required "compiling the SDL2 units" "" "" "" "" "" ""
+        else
+            dep_add "SDL2 Pascal bindings ($SDL2_FOR_TARGETS)" missing required \
+                "compiling the SDL2 units - they ship in deps/sdl2, see INSTALL.md" "" "" "" "" "" ""
+        fi
+    fi
+
+    if [[ "$needs_sdl_link" == "true" ]]; then
+        if have_shared_lib sdl2 libSDL2.so; then
+            dep_add "libSDL2 (development)" ok required "GRAPHICS and AUDIO - the window, every drawing primitive, every sound" \
+                    libsdl2-dev SDL2-devel sdl2 libSDL2-devel sdl2-dev sdl2
+        else
+            dep_add "libSDL2 (development)" missing required "GRAPHICS and AUDIO - without it there is no window, no drawing and no sound" \
+                    libsdl2-dev SDL2-devel sdl2 libSDL2-devel sdl2-dev sdl2
+        fi
+        if have_shared_lib SDL2_ttf libSDL2_ttf.so; then
+            dep_add "libSDL2_ttf (development)" ok required "the text renderer SDL2 draws characters with" \
+                    libsdl2-ttf-dev SDL2_ttf-devel sdl2_ttf libSDL2_ttf-devel sdl2_ttf-dev sdl2_ttf
+        else
+            dep_add "libSDL2_ttf (development)" missing required "the text renderer SDL2 draws characters with" \
+                    libsdl2-ttf-dev SDL2_ttf-devel sdl2_ttf libSDL2_ttf-devel sdl2_ttf-dev sdl2_ttf
+        fi
+    elif [[ "$wants_sdl_runtime" == "true" ]]; then
+        # Needed to RUN, not to build: report it, never refuse the build for it.
+        if have_shared_lib sdl2 libSDL2.so || [[ -n "$(ldconfig -p 2>/dev/null | grep -m1 libSDL2-2.0.so.0)" ]]; then
+            dep_add "libSDL2 + libSDL2_ttf (runtime)" ok optional "graphics and audio at RUN time" \
+                    "libsdl2-2.0-0 libsdl2-ttf-2.0-0" "SDL2 SDL2_ttf" "sdl2 sdl2_ttf" \
+                    "libSDL2-2_0-0 libSDL2_ttf-2_0-0" "sdl2 sdl2_ttf" "sdl2 sdl2_ttf"
+        else
+            dep_add "libSDL2 + libSDL2_ttf (runtime)" missing optional \
+                    "graphics and audio at RUN time - it builds without them, then has no window and no sound" \
+                    "libsdl2-2.0-0 libsdl2-ttf-2.0-0" "SDL2 SDL2_ttf" "sdl2 sdl2_ttf" \
+                    "libSDL2-2_0-0 libSDL2_ttf-2_0-0" "sdl2 sdl2_ttf" "sdl2 sdl2_ttf"
+        fi
+    fi
+}
+
+# Print the one report. Answers 1 when a REQUIRED dependency is missing.
+report_deps() {
+    local i n missing_req=0 missing_any=0 pm pkgs="" p
+    n=${#DEP_NAMES[@]}
+    [[ $n -eq 0 ]] && return 0
+    for ((i=0; i<n; i++)); do
+        [[ "${DEP_STATE[$i]}" == "missing" ]] || continue
+        missing_any=1
+        [[ "${DEP_REQ[$i]}" == "required" ]] && missing_req=1
+    done
+    # Nothing to say when everything is there: a check that talks when it has no news is noise.
+    [[ $missing_any -eq 0 ]] && return 0
+
+    echo "" >&2
+    echo -e "${CYAN}Dependency check${NC}" >&2
+    echo -e "${CYAN}================${NC}" >&2
+    for ((i=0; i<n; i++)); do
+        if [[ "${DEP_STATE[$i]}" == "ok" ]]; then
+            printf "  ${GREEN}[ok]${NC}      %-34s %s\n" "${DEP_NAMES[$i]}" "${DEP_WHY[$i]}" >&2
+        elif [[ "${DEP_REQ[$i]}" == "required" ]]; then
+            printf "  ${RED}[MISSING]${NC} %-34s %s\n" "${DEP_NAMES[$i]}" "${DEP_WHY[$i]}" >&2
+        else
+            printf "  ${YELLOW}[missing]${NC} %-34s %s\n" "${DEP_NAMES[$i]}" "${DEP_WHY[$i]}" >&2
+        fi
+    done
+
+    pm="$(pkg_manager)"
+    for ((i=0; i<n; i++)); do
+        [[ "${DEP_STATE[$i]}" == "missing" ]] || continue
+        case "$pm" in
+            apt)    p="${DEP_PKG_APT[$i]}" ;;    dnf)  p="${DEP_PKG_DNF[$i]}" ;;
+            pacman) p="${DEP_PKG_PACMAN[$i]}" ;; zypper) p="${DEP_PKG_ZYPPER[$i]}" ;;
+            apk)    p="${DEP_PKG_APK[$i]}" ;;    brew) p="${DEP_PKG_BREW[$i]}" ;;
+            *)      p="" ;;
+        esac
+        [[ -n "$p" ]] && pkgs="$pkgs $p"
+    done
+    if [[ -n "$pkgs" ]]; then
+        echo "" >&2
+        echo -e "${CYAN}  Install all of them at once:${NC}" >&2
+        case "$pm" in
+            apt)    echo -e "      ${GREEN}sudo apt install$pkgs${NC}" >&2 ;;
+            dnf)    echo -e "      ${GREEN}sudo dnf install$pkgs${NC}" >&2 ;;
+            pacman) echo -e "      ${GREEN}sudo pacman -S$pkgs${NC}" >&2 ;;
+            zypper) echo -e "      ${GREEN}sudo zypper install$pkgs${NC}" >&2 ;;
+            apk)    echo -e "      ${GREEN}sudo apk add$pkgs${NC}" >&2 ;;
+            brew)   echo -e "      ${GREEN}brew install$pkgs${NC}" >&2 ;;
+        esac
+    fi
+    echo "" >&2
+    echo -e "${GRAY}  Full instructions, other distributions and Windows: INSTALL.md${NC}" >&2
+    echo "" >&2
+    return $missing_req
+}
+
 # Targets: lpr : output : extra unit path : supports audio : is web
 SDL2_FOR_TARGETS="$(config_value SDL2Path 2>/dev/null || true)"
 [[ -z "$SDL2_FOR_TARGETS" ]] && SDL2_FOR_TARGETS="./deps/sdl2"
@@ -766,6 +936,12 @@ if [[ "$TARGET" == "all" ]]; then
     BUILD_LIST=("sb" "sbc" "sbd" "sbv" "sbw")
 else
     BUILD_LIST=("$TARGET")
+fi
+
+collect_deps
+if ! report_deps; then
+    echo -e "${RED}Missing required dependencies - nothing was built.${NC}" >&2
+    exit 1
 fi
 
 echo -e "${CYAN}Building Targets...${NC}"

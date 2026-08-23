@@ -851,6 +851,112 @@ if ($Window) {
     Write-Host "Window presenter: ENABLED (sb --window available)" -ForegroundColor Magenta
 }
 
+# ============================================================================
+#  DEPENDENCY PREFLIGHT
+#
+#  ⛔ ONE REPORT, NOT ONE ERROR AT A TIME. The build used to discover a missing
+#  dependency the way a compiler does - the first one that stops it - so a person
+#  setting the project up installed something, ran again, and was told about the
+#  next one. Four rounds to learn four names is the difference between a project
+#  you can try and one you give up on.
+#
+#  ⛔ AND IT DOWNLOADS NOTHING. The SDL2 DLLs belong to the SDL project; packaging
+#  someone else's binaries is not something this project takes responsibility for
+#  outside a real, digitally signed installer. The report says what to fetch and
+#  from where, and the person fetching it knows what they are running.
+# ============================================================================
+
+$Script:Deps = @()
+
+function Add-Dep {
+    param([string]$Name, [bool]$Ok, [bool]$Required, [string]$Why, [string]$How)
+    $Script:Deps += [PSCustomObject]@{ Name = $Name; Ok = $Ok; Required = $Required; Why = $Why; How = $How }
+}
+
+# A DLL counts as present if it sits beside the executables we build or anywhere on the PATH -
+# which are the two places the program will look for it when it runs.
+function Test-DllPresent {
+    param([string]$Dll, [string]$BinDir)
+    if ($BinDir -and (Test-Path (Join-Path $BinDir $Dll))) { return $true }
+    foreach ($p in ($env:PATH -split ';')) {
+        if ($p -and (Test-Path (Join-Path $p $Dll))) { return $true }
+    }
+    return $false
+}
+
+function Collect-Deps {
+    param([string[]]$TargetList, [string]$Sdl2Path, [bool]$AudioOn, [string]$BinDir)
+
+    # ⭐ SDL2 IS THE BACKEND FOR GRAPHICS *AND* AUDIO: SedaiAudioFoundation opens its device with
+    # SDL_OpenAudioDevice and feeds it with SDL_QueueAudio, and every drawing primitive ends in SDL2.
+    # Without it there is no window, no drawing and no sound - it is not an accessory.
+    $needsSdl = $AudioOn -or ($TargetList -contains 'sbv')
+
+    # A C compiler. ⚠️ Advisory today: build.ps1 does not compile src/hotdisp.c yet, so a Windows
+    # build has no C hot loop however the compiler was installed. Reported so that anyone setting up
+    # a machine installs it once rather than twice.
+    $cc = $null
+    foreach ($n in @('gcc.exe', 'clang.exe', 'cl.exe')) {
+        $found = Get-Command $n -ErrorAction SilentlyContinue
+        if ($found) { $cc = $found.Source; break }
+    }
+    Add-Dep -Name 'a C compiler (gcc or MSVC)' -Ok ([bool]$cc) -Required $false `
+            -Why 'the C hot loop, worth 27-45% - NOT WIRED UP ON WINDOWS YET, see INSTALL.md' `
+            -How 'w64devkit, MSYS2 (pacman -S mingw-w64-x86_64-gcc), or Build Tools for Visual Studio'
+
+    if ($needsSdl) {
+        $bindings = Join-Path $Sdl2Path 'sdl2.pas'
+        Add-Dep -Name 'SDL2 Pascal bindings' -Ok (Test-Path $bindings) -Required $true `
+                -Why "compiling the SDL2 units ($Sdl2Path)" `
+                -How 'they ship in deps\sdl2 - check SDL2Path in setup.config.json'
+
+        Add-Dep -Name 'SDL2.dll' -Ok (Test-DllPresent -Dll 'SDL2.dll' -BinDir $BinDir) -Required $false `
+                -Why 'GRAPHICS and AUDIO - without it there is no window, no drawing and no sound' `
+                -How 'github.com/libsdl-org/SDL/releases - put it in bin\x86_64-win64\ or on the PATH'
+
+        Add-Dep -Name 'SDL2_ttf.dll' -Ok (Test-DllPresent -Dll 'SDL2_ttf.dll' -BinDir $BinDir) -Required $false `
+                -Why 'the text renderer SDL2 draws characters with' `
+                -How 'github.com/libsdl-org/SDL_ttf/releases - with the DLLs shipped beside it'
+    }
+}
+
+# Print the one report. Answers $false when a REQUIRED dependency is missing.
+function Show-Deps {
+    $missingAny = @($Script:Deps | Where-Object { -not $_.Ok }).Count -gt 0
+    # A check that talks when it has no news is noise.
+    if (-not $missingAny) { return $true }
+
+    $missingReq = @($Script:Deps | Where-Object { -not $_.Ok -and $_.Required }).Count -gt 0
+    Write-Host ""
+    Write-Host "Dependency check" -ForegroundColor Cyan
+    Write-Host "================" -ForegroundColor Cyan
+    foreach ($d in $Script:Deps) {
+        if ($d.Ok) {
+            Write-Host ("  [ok]      {0,-28} {1}" -f $d.Name, $d.Why) -ForegroundColor Green
+        } elseif ($d.Required) {
+            Write-Host ("  [MISSING] {0,-28} {1}" -f $d.Name, $d.Why) -ForegroundColor Red
+        } else {
+            Write-Host ("  [missing] {0,-28} {1}" -f $d.Name, $d.Why) -ForegroundColor Yellow
+        }
+    }
+    Write-Host ""
+    Write-Host "  Where to get what is missing:" -ForegroundColor Cyan
+    foreach ($d in ($Script:Deps | Where-Object { -not $_.Ok })) {
+        Write-Host ("      {0,-28} {1}" -f $d.Name, $d.How) -ForegroundColor Gray
+    }
+    Write-Host ""
+    Write-Host "  Full instructions: INSTALL.md" -ForegroundColor DarkGray
+    Write-Host ""
+    return (-not $missingReq)
+}
+
+Collect-Deps -TargetList $buildTargets -Sdl2Path $sdl2PathForTargets -AudioOn $SedaiAudioEnabled `
+             -BinDir (Join-Path $ProjectRoot "bin\$platformDir")
+if (-not (Show-Deps)) {
+    Write-Host "Missing required dependencies - nothing was built." -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "Building Targets..." -ForegroundColor Cyan
 Write-Host "===================" -ForegroundColor Cyan
 
