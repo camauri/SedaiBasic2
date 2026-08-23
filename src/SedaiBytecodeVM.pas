@@ -4769,6 +4769,40 @@ var
     end;
     Result := intOut;
     if fracOut <> '' then Result := Result + '.' + fracOut;
+    // ⛔ A '+' or '-' TOUCHING the placeholders is a SIGN POSITION, not a literal. Everything outside
+    // the placeholders used to go through ProcLiteral, so the mask's '+' was printed AND the number's
+    // own '-' was added: Format(-42, "+#####") answered "+-42" where fbc answers "-42", and
+    // Format(42, "-#####") answered "-42" where fbc answers "42". Measured against fbc 23 Aug 2026.
+    //   leading  '+' : the sign is always shown, '+' or '-'
+    //   leading  '-' : only a negative shows one, a positive shows nothing
+    //   trailing '+' : the sign follows the digits ("42+", "42-")
+    //   trailing '-' : only a negative shows one, after the digits
+    // ⭐ PRINT USING already knew all of this (FormatUsingFB, measured the same way). FORMAT() goes
+    // through a DIFFERENT formatter, and only one of the two had been taught - the same parallel-list
+    // shape this project keeps paying for.
+    // ⚠️ Declared divergence: fbc answers Format(0, "+#####") with a NUL byte followed by "0". That is
+    // an fbc defect, not a rule; we answer "+0".
+    if (prefix <> '') and (prefix[Length(prefix)] in ['+', '-']) then
+    begin
+      if prefix[Length(prefix)] = '+' then
+      begin
+        // always a sign, and it REPLACES the mask character rather than being dropped
+        if neg and (scaled <> 0) then prefix[Length(prefix)] := '-';
+      end
+      else
+        if not (neg and (scaled <> 0)) then SetLength(prefix, Length(prefix) - 1);
+      neg := False;                                  // the mask owns the sign now
+    end
+    else if (suffix <> '') and (suffix[1] in ['+', '-']) then
+    begin
+      if suffix[1] = '+' then
+      begin
+        if neg and (scaled <> 0) then suffix[1] := '-';
+      end
+      else
+        if not (neg and (scaled <> 0)) then Delete(suffix, 1, 1);
+      neg := False;
+    end;
     if neg and (scaled <> 0) then Result := '-' + Result;
     Result := prefix + Result + suffix;
   end;
@@ -12586,7 +12620,14 @@ begin
           3: Ctx.IntRegs[Instr.Dest] := DayOfTheYear(dtVal);   // y (day of year)
           4: Ctx.IntRegs[Instr.Dest] := DayOf(dtVal);          // d
           5: Ctx.IntRegs[Instr.Dest] := DayOfWeek(dtVal);      // w (1=Sunday)
-          6: Ctx.IntRegs[Instr.Dest] := WeekOfTheYear(dtVal);  // ww
+          // ww - ⛔ NOT WeekOfTheYear. That is ISO 8601: weeks start on MONDAY and week 1 is the one
+          // holding the first Thursday. VB and fbc use a different definition entirely - week 1 is the
+          // week CONTAINING 1 January and weeks start on SUNDAY - and the two agree most of the time,
+          // which is why this survived: measured 23 Aug 2026 over 48 dates, 7 differed and every one
+          // of them was a SUNDAY, the day the VB week turns over and the ISO one does not.
+          //   offset from the Sunday that opens week 1 = (dayOfYear - 1) + (weekday(Jan 1) - 1)
+          6: Ctx.IntRegs[Instr.Dest] :=
+               ((DayOfTheYear(dtVal) - 1) + (DayOfWeek(EncodeDate(YearOf(dtVal), 1, 1)) - 1)) div 7 + 1;
           7: Ctx.IntRegs[Instr.Dest] := HourOf(dtVal);
           8: Ctx.IntRegs[Instr.Dest] := MinuteOf(dtVal);
           9: Ctx.IntRegs[Instr.Dest] := SecondOf(dtVal);

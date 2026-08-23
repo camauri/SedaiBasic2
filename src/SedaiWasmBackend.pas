@@ -3608,7 +3608,16 @@ begin
   end;
 
   { dtWeekOfYear(days) -> the ISO 8601 week, which is what FPC's WeekOfTheYear
-    returns. ⭐ The identity that removes every special case: the week number of
+    returns.
+    ⛔⛔ AND THAT IS NOW A DISAGREEMENT WITH THE INTERPRETER, stated here rather than
+    discovered later. On 23 Aug 2026 DATEPART("ww") was measured against fbc and the
+    interpreter moved to the VB rule - week 1 is the week CONTAINING 1 January and
+    weeks start on SUNDAY - because that is what fbc answers. This backend still
+    computes the ISO week, so `sbw` gives a different number from `sb` on any date
+    that is a SUNDAY (7 of 48 probe dates). It is hand-written WASM and the target is
+    parked; porting the same one-line rule here is the fix, and until then this
+    comment is the record that the two engines differ. }
+  { The ISO identity, unchanged: ⭐ The identity that removes every special case: the week number of
     a day is ((the Thursday of its week) - (the 1st of THAT Thursday's January))
     div 7 + 1. A year straddled at either end lands in the right year because
     the Thursday decides it, not the day. }
