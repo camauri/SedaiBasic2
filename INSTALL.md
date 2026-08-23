@@ -23,9 +23,9 @@ without it, and that is the exception, not the normal case.
 | **libSDL2** + **libSDL2_ttf** | **graphics AND audio** — the window, every drawing primitive, every sound | development files to build `sbv` and any target with audio; runtime files to run anything that draws or plays |
 | **GCC** (MinGW-w64 on Windows) | the C hot loop, worth **27–45%** | optional — without it the build succeeds and the interpreter is slower |
 | **SDL2 Pascal bindings** | compiling the SDL2 units | downloaded into `deps/sdl2`; they are not in the repository |
-| **ALSA** (`libasound.so.2`) | MIDI input | optional, opened at run time: without it MIDI input is unavailable and nothing else changes |
+| **ALSA** (`libasound.so.2`) | MIDI input | optional, opened at run time; arrives as a dependency of `libsdl2-dev` |
 | **SedaiAudioFoundation** | the audio subsystem itself | optional, auto-detected; it drives SDL2's audio device |
-| **SDL2_image**, **FreeType**, **libpng**, **libjpeg**, **zlib** | nothing yet | installed on purpose: they sit beside the Windows binaries, and keeping both platforms carrying the same set means nothing has to be installed again the day something uses them |
+| **SDL2_image** | nothing yet | installed on purpose: it sits beside the Windows binaries, so the day something uses it nothing has to be installed again |
 
 ⭐ **The Pascal bindings are platform independent**: 52 text files, `.pas` and `.inc`, no binaries,
 every platform difference behind an `{$IFDEF}`. Windows, Linux and macOS download the very same
@@ -65,8 +65,12 @@ distribution being behind.
 ### Debian 13 and later, Ubuntu 24.04 and later
 
 ```sh
-sudo apt install fpc gcc libsdl2-dev libsdl2-ttf-dev
+sudo apt install fpc gcc libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev
 ```
+
+FreeType, libpng, libjpeg, zlib and ALSA are not listed because they arrive as dependencies:
+`libsdl2-dev` pulls `libasound2-dev`, `libsdl2-ttf-dev` pulls `libfreetype-dev`, and
+`libsdl2-image-dev` pulls `libjpeg-dev` and `libpng-dev`, which pulls `zlib1g-dev`.
 
 ### Fedora, RHEL, Rocky, Alma
 

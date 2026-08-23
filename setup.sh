@@ -222,34 +222,21 @@ if [[ "$DO_DEPS" == "true" ]]; then
         MISSING+=("$(dep_pkg sdl2ttf-dev "$PM")"); MISSING_WHY+=("the text renderer SDL2 draws characters with")
     fi
 
-    # ⭐ ALSA is for MIDI INPUT and is opened with dlopen, so it is genuinely optional: without it
-    # MIDI input is unavailable and nothing else changes. Nothing links against it.
-    if [[ -n "$(dep_pkg alsa "$PM")" ]]; then
-        if have_shared_lib alsa libasound.so.2 || [[ -n "$(ldconfig -p 2>/dev/null | grep -m1 libasound.so.2)" ]]; then
-            show_status "ALSA (MIDI input)" "Success"
-        else
-            MISSING+=("$(dep_pkg alsa "$PM")"); MISSING_WHY+=("MIDI input (optional; opened at run time)")
-        fi
+    # ⚠️ SDL2_image IS NOT USED BY THE BUILD YET. It is installed because it sits beside the Windows
+    # binaries, so that the day something starts using it nothing has to be installed again. Never
+    # required: a missing one is reported and the build goes ahead.
+    #
+    # ⛔ AND IT IS THE ONLY ONE LISTED HERE, because the rest arrive as DEPENDENCIES and naming them
+    # again would just make the install command longer. Checked with apt-cache on Debian 13:
+    #   libsdl2-dev       -> libasound2-dev -> libasound2t64   (ALSA, for MIDI input)
+    #   libsdl2-ttf-dev   -> libfreetype-dev                   (FreeType)
+    #   libsdl2-image-dev -> libjpeg-dev, libpng-dev -> zlib1g-dev
+    # If some distribution does not imply them, the library is simply absent and this check says so.
+    if have_shared_lib SDL2_image libSDL2_image.so; then
+        show_status "SDL2_image" "Success"
+    else
+        MISSING+=("$(dep_pkg sdl2image-dev "$PM")"); MISSING_WHY+=("SDL2_image (not used by the build yet)")
     fi
-
-    # ⚠️ NOT USED BY THE BUILD YET, installed on purpose. These are the libraries that sit beside the
-    # Windows binaries: SDL2_image and the image and font codecs. Keeping the two platforms carrying
-    # the same set means that the day something starts using them, nothing has to be installed again.
-    # None of them is required: a missing one is reported and the build goes ahead.
-    for spec in "sdl2image-dev:SDL2_image:libSDL2_image.so:SDL2_image" \
-                "freetype-dev:freetype2:libfreetype.so:FreeType" \
-                "png-dev:libpng:libpng.so:libpng" \
-                "jpeg-dev:libjpeg:libjpeg.so:libjpeg" \
-                "zlib-dev:zlib:libz.so:zlib"; do
-        key="${spec%%:*}"; rest="${spec#*:}"
-        pc="${rest%%:*}"; rest="${rest#*:}"
-        soname="${rest%%:*}"; label="${rest##*:}"
-        if have_shared_lib "$pc" "$soname"; then
-            show_status "$label" "Success"
-        else
-            MISSING+=("$(dep_pkg "$key" "$PM")"); MISSING_WHY+=("$label (not used by the build yet)")
-        fi
-    done
 
     # The two tools this script itself needs to fetch and unpack the Pascal bindings.
     for tool in curl unzip; do
