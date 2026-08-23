@@ -232,11 +232,33 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
-- ⚠️ **`PUT ..., Alpha` without a value**: the RGB matches fbc exactly, but the resulting **alpha
-  byte** differs. fbc's is an artefact of the masked blitter it uses and is self-inconsistent — with
-  the same source alpha, destination alpha and blend value it answers `&h80` for source `&hFF123456`
-  and `&hFF` for source `&hFF00FF00`, a difference that depends on the *RGB* of the source and so
-  cannot be a defined semantic. We blend the alpha channel like the other three.
+- ⚠️ **`PUT ..., Alpha`**: the blended RGB matches fbc exactly; the resulting **alpha byte** does not.
+  fbc's is deterministic and fully characterised — with an explicit value it is the blend value when
+  the destination's **green** exceeds the source's green and the destination's own alpha otherwise
+  (threshold `srcGreen+1`, whatever the blend value); without one it is a fixed function of the two
+  alphas. ⭐ The destination's red and blue move it *not at all*, which is what identifies it: the
+  alpha byte shares its 32-bit lane with green (an `&hFF00FF00` mask groups A with G), so green's
+  borrow lands in alpha and red's and blue's cannot. It is a corrupted channel — "is the destination
+  greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
+  channel like the other three. Same position as the float double-rounding above: where fbc is
+  measurably wrong we do not follow, and we declare it.
+- ⚠️ **`PAINT` with no border colour**: in MODERN an omitted border is the **fill colour itself**, so
+  the flood spreads over everything that is not already that colour — a barrier of another colour is
+  painted over, not respected. Measured against fbc. In **CLASSIC** it stays the Commodore rule: the
+  flood covers the connected region of the *seed pixel's* colour and stops at anything else. The two
+  dialects have different flood rules and they stay apart.
+- ⚠️ **`DRAW`**: the turtle language matches fbc — the eight directions, the `B`/`N` prefixes, `S`
+  scaling, absolute and relative `M`, `C`, `A`/`TA` rotation and `P` flood fill — with two
+  differences. `POINTCOORD` reports the pen **rounded** (fbc's is fractional: `TA45 R20` reports
+  `114.1421,85.85786` where we report `114,86`, the same pixel); the pen is carried at full precision
+  for the length of a `DRAW` string, but the pair `POINTCOORD` and `PSET` share is the integer one the
+  C hot loop writes directly, and one authoritative pen beats two that can disagree. And
+  **`X <string pointer>`** (execute another command string) is not implemented: resolving a packed
+  string address back to its text has a different encoding per storage class in this model.
+- ⚠️ **`DRAW STRING`**: placement, colour, transparency and the 8-pixel advance are fbc's, measured.
+  The **glyph shapes of the built-in font are ours** — of the 95 printable ASCII glyphs, 54 have
+  pixel-identical coverage to fbc's and 41 differ. That is a font asset, not a semantics gap: adopting
+  fbc's would mean transcribing their bitmap, which is a decision rather than a fix.
 - **A graphics screen is always 32-bit truecolour.** `ScreenRes w, h, depth` and `Screen n` accept
   every depth the manual lists and give a truecolour surface for all of them; `ScreenInfo` reports
   `depth = 32`, `bpp = 4`, `pitch = w * 4`, which is what the framebuffer `ScreenPtr` hands out
