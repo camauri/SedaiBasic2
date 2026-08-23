@@ -115,6 +115,11 @@ The hot dispatch arms (`src/hotdisp.c`) are compiled by a C compiler, not by FPC
 27–45% where they apply. `setup.ps1` installs one into `deps\gcc` and `build.ps1` picks it up from
 there; the build also accepts a `gcc.exe` on the `PATH`, or one named by `SEDAI_CC`.
 
+The package it installs is an 18.5 MB subset of a [WinLibs](https://winlibs.com/) build — Brecht
+Sanders' standalone MinGW-w64 GCC for Windows — carrying only what `gcc -c` needs. What is in it,
+how it was verified and its licences are in
+[scripts/windows/GCC-PACKAGE.md](scripts/windows/GCC-PACKAGE.md).
+
 ⛔ **GCC, not "a C compiler".** The flag set is GCC's and it is not decoration: `-fno-crossjumping`
 alone is worth spectral-norm −16.1%, because it stops the compiler merging the replicated dispatch
 tails that give every arm its own branch-predictor history. Microsoft's compiler has no equivalent

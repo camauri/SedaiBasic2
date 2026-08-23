@@ -968,9 +968,20 @@ function Build-HotDisp {
     $log = Join-Path ([System.IO.Path]::GetTempPath()) ("sedai_hotc_" + [Guid]::NewGuid().ToString('N') + ".log")
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # ⛔ THE COMPILER'S OWN bin MUST BE ON THE PATH, and calling gcc.exe by absolute path is not
+    # enough. gcc.exe hands the work to cc1.exe, which lives in libexec\ while the DLLs both of them
+    # import live in bin\ - and Windows resolves a DLL against the directory of the EXECUTABLE that
+    # needs it, not against the one that launched it. So an install into deps\gcc, on a machine with
+    # no other gcc, failed with cc1 unable to start and gcc reporting nothing at all.
+    # Measured under wine: same command, same files - fails without this, produces a byte-identical
+    # object with it.
+    $ccDir = Split-Path -Parent $Cc
+    $savedPath = $env:PATH
+    if ($ccDir -and ($env:PATH -notlike "*$ccDir*")) { $env:PATH = "$ccDir;$env:PATH" }
     $global:LASTEXITCODE = 0
     & $Cc @ccArgs > $log 2>&1
     $ok = (($LASTEXITCODE -eq 0) -and (Test-Path $obj))
+    $env:PATH = $savedPath
     $ErrorActionPreference = $prev
     if (-not $ok) {
         Write-Host "ERROR: could not compile src/hotdisp.c" -ForegroundColor Red

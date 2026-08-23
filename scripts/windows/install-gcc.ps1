@@ -58,14 +58,27 @@ $EXIT_ALREADY_INSTALLED = 5
 
 # Configuration
 $GCC_VERSION = "14.2.0"
-$DOWNLOAD_URL = "https://github.com/camauri/SedaiBasic2-Deps/releases/download/gcc-mingw64-$GCC_VERSION/gcc-mingw64-$GCC_VERSION-x86_64-win64.zip"
+# ⭐ THIS IS OUR OWN REPACK, not WinLibs' archive - see scripts/windows/GCC-PACKAGE.md for how it is
+# made and what it contains. 18.5 MB against upstream's 247, because the build only ever runs
+# "gcc -c": no linker, no CRT, no import libraries, and with -ffreestanding not even the mingw-w64
+# headers (the whole 84 MB of them - hotdisp.c needs exactly two headers, both internal to gcc).
+#
+# ⛔ ONE SOURCE ON PURPOSE, and it is the opposite of the earlier note here. A fallback to upstream
+# only works when both serve the SAME BYTES, so that one hash satisfies both; repacking makes that
+# impossible. The choice was smaller-download versus second-source, and it went to smaller: the
+# mirror is ours to keep alive, which was the argument for putting it first anyway.
+$ARCHIVE_NAME = "sedai-gcc-$GCC_VERSION-x86_64-win64.zip"
+$DOWNLOAD_URLS = @(
+    "https://github.com/camauri/SedaiBasic2-Deps/releases/download/gcc-mingw64-$GCC_VERSION/$ARCHIVE_NAME"
+)
 
-# ⛔ FILL THIS IN WHEN THE RELEASE IS CUT. It is deliberately a recognisable placeholder rather
-# than a plausible-looking string: a wrong-but-plausible hash would fail every install with
-# "file corrupted" and send whoever hits it looking for a network problem. The check below
-# refuses to run against the placeholder instead, and says exactly what to do.
-$EXPECTED_HASH = "0000000000000000000000000000000000000000000000000000000000000000"
-$REQUIRED_SPACE_MB = 400  # a trimmed MinGW-w64 unpacks to roughly 300 MB
+# The hash of the archive named above, computed from the file itself. The placeholder guard below
+# stays: it is what makes a not-yet-published component fail with "the hash has not been filled in"
+# rather than with "file corrupted", which would send whoever hits it looking for a network problem.
+$EXPECTED_HASH = "0432ffe1f877b22ca5c81a98b4983736af173ded4bc4750b4f19bd74b56acaea"
+# Measured on the archive itself: 18.5 MB compressed, 47 MB unpacked. The zip is removed afterwards
+# but both exist at once during extraction, so ask for the sum with room to spare.
+$REQUIRED_SPACE_MB = 150
 
 # Determine paths
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -74,7 +87,7 @@ $DepsDir = Join-Path $ProjectRoot "deps"
 $GccDir = Join-Path $DepsDir "gcc"
 $GccMarker = Join-Path $GccDir "bin\gcc.exe"   # File to check for existing installation
 $TempDir = Join-Path $env:TEMP "gcc-install"
-$ZipFile = Join-Path $TempDir "gcc-mingw64-$GCC_VERSION-x86_64-win64.zip"
+$ZipFile = Join-Path $TempDir $ARCHIVE_NAME
 
 # Import utilities
 $UtilsPath = Join-Path $ScriptDir "..\lib\download-utils.ps1"
@@ -204,7 +217,8 @@ function Install-Gcc {
         Write-Status "Hash verification skipped (-SkipVerify)" -Color Yellow
     }
 
-    # Step 7: Extract (the zip carries a gcc/ root, so it lands in deps/gcc)
+    # Step 7: Extract. Our repack carries a "gcc/" root, so it lands in deps/gcc directly - the
+    # earlier version renamed WinLibs' "mingw64/" here, which repacking removed the need for.
     Write-Step "Extracting to: $GccDir"
 
     $extractResult = Expand-ArchiveWithProgress -Path $ZipFile -DestinationPath $DepsDir -Quiet:$Quiet
@@ -236,9 +250,16 @@ function Install-Gcc {
     Set-Content -Path $probeSrc -Value 'int probe_ok(void){return 0;}' -Encoding ASCII
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # The compiler's own bin on the PATH - cc1.exe lives in libexec\ and imports DLLs that live in
+    # bin\, and Windows resolves those against cc1's directory, not gcc's. Without this the probe
+    # fails on a perfectly good install. (build.ps1 does the same, for the same reason.)
+    $savedPath = $env:PATH
+    $ccDir = Split-Path -Parent $GccMarker
+    if ($ccDir -and ($env:PATH -notlike "*$ccDir*")) { $env:PATH = "$ccDir;$env:PATH" }
     $global:LASTEXITCODE = 0
     & $GccMarker "-c" "-o" $probeObj $probeSrc > (Join-Path $probeDir "probe.log") 2>&1
     $compiled = (($LASTEXITCODE -eq 0) -and (Test-Path $probeObj))
+    $env:PATH = $savedPath
     $ErrorActionPreference = $prev
     if (!$compiled) {
         Write-Error "gcc.exe was installed but cannot compile a trivial C file."
