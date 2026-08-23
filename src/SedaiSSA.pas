@@ -16784,6 +16784,7 @@ end;
 procedure TSSAGenerator.ProcessInputFile(Node: TASTNode);
 var
   HandleVal, HandleReg, VarReg: TSSAValue;
+  LineTmp, CutTmp, LenVal, LenReg, OneReg, AddrVal2: TSSAValue;
   HandleChild, VarChild: TASTNode;
   VarName: string;
   i: Integer;
@@ -16842,10 +16843,40 @@ begin
     HandleReg := EnsureIntRegister(HandleVal);
   end;
 
-  // Process each variable (children 1+)
-  for i := 1 to Node.ChildCount - 1 do
+  // Process each variable (children 1+). A plain FOR cannot skip the length child of the "*pz, n" form
+  // below, so the loop counter is stepped by hand.
+  i := 1;
+  while i < Node.ChildCount do
   begin
     VarChild := Node.GetChild(i);
+    // FreeBASIC "LINE INPUT #n, *pz, maxlength": the destination is a ZSTRING BUFFER named by a pointer,
+    // and the length that follows is the buffer's SIZE IN BYTES - so at most maxlength-1 characters are
+    // stored, plus the terminator. fbc REQUIRES the length in this form ("Line Input #1, *pz" alone is
+    // a syntax error there), which is what makes the trailing child unambiguous.
+    // Only an antIdentifier destination was ever handled here, so this whole form was silently skipped:
+    // the line was read and thrown away, the buffer stayed empty, and the length was then read as a
+    // SECOND destination.
+    if (Node.Attributes.Values['LINEINPUT'] = '1') and (VarChild.NodeType = antDeref) and
+       (i + 1 < Node.ChildCount) then
+    begin
+      LineTmp := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaInputFileLine, LineTmp, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ProcessExpression(Node.GetChild(i + 1), LenVal);       // the buffer size, terminator included
+      LenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaSubInt, LenReg, EnsureIntRegister(LenVal), OneReg, MakeSSAValue(svkNone));
+      CutTmp := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrLeft, CutTmp, LineTmp, LenReg, MakeSSAValue(svkNone));
+      ProcessExpression(VarChild.GetChild(0), AddrVal2);     // the pointer's own value = the byte address
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), EnsureIntRegister(AddrVal2), CutTmp,
+                      MakeSSAConstInt(0));
+      // BOTH children are consumed here - the destination and the length - and Continue skips the
+      // loop's own step, so the advance is by two. Stepping by one left the LENGTH to be read as a
+      // second destination: a SECOND LINE INPUT ran, past the end of the file.
+      Inc(i, 2);
+      Continue;
+    end;
     if VarChild.NodeType = antIdentifier then
     begin
       VarName := string(VarChild.Value);
@@ -16860,6 +16891,7 @@ begin
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
     // Skip separators and other nodes
+    Inc(i);
   end;
 end;
 

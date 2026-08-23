@@ -5220,6 +5220,18 @@ begin
     Result := Result or faArchive;
 end;
 
+function DirTranslateSpec(const Spec: string): string;
+// FreeBASIC's DIR keeps the DOS reading of "*.*": it means EVERY entry, dotted or not. On Unix the
+// pattern reaches fnmatch, where "*.*" demands a literal dot, so a directory named "sub" was missing
+// from a listing fbc includes. Measured: fbc on Linux lists "sub" for "*.*".
+begin
+  if Spec = '*.*' then Result := '*'
+  else if (Length(Spec) >= 4) and (Copy(Spec, Length(Spec) - 3, 4) = '/*.*') then
+    Result := Copy(Spec, 1, Length(Spec) - 3) + '*'
+  else
+    Result := Spec;
+end;
+
 function DirEntryAttrs(const Rec: TSearchRec): Integer;
 // The attributes of ONE entry, in FreeBASIC's spelling rather than the platform's.
 //
@@ -5237,27 +5249,33 @@ function DirEntryAttrs(const Rec: TSearchRec): Integer;
 // without translating it.
 begin
   Result := Rec.Attr;
+  {$IFDEF UNIX}
+  // A leading dot IS the hidden attribute on Unix, and that is how fbc reports it: ".hidden.txt" is
+  // 34 (archive|hidden), "." and ".." are 18 (directory|hidden). FPC's FindFirst marks the ordinary
+  // dotfiles but not "." and "..", so the two dot entries came back as plain directories - and the
+  // MASK then let them through where fbc excludes them, which is the whole reason a fbDirectory-only
+  // walk looked as if fbc dropped them.
+  if (Rec.Name <> '') and (Rec.Name[1] = '.') then Result := Result or faHidden;
+  {$ENDIF}
   if (Result and faDirectory) <> 0 then
     Result := Result and not faArchive;
 end;
 
 function DirEntrySkipped(const Rec: TSearchRec): Boolean;
-// "." and ".." are not returned by DIR on Unix: MEASURED against fbc 1.10.1 on Linux,
-// which lists only "sub" for a directory holding "sub", "." and "..". FPC's FindFirst
-// yields them like any other entry and we passed them straight through.
+// Nothing is skipped: the MASK decides, and "." and ".." are ordinary entries to it.
 //
-// ⚠️ GATED ON UNIX ON PURPOSE, AND THE WINDOWS HALF IS UNVERIFIED. The blessed Windows
-// baseline for m479 CONTAINS "." and "..", and that test's own header says its rules
-// were read off the oracle - so fbc on Windows may well return them (FindFirstFile
-// does). Changing a platform I cannot measure from here would be inventing an answer.
-// ⇒ TO CLOSE: run job/tests/bas/m479_dir_function.bas under the Windows fbc and
-// compare. If it omits them there too, drop the IFDEF and re-bless both baselines.
+// ⛔ THIS USED TO DROP "." AND ".." ON UNIX, on a measurement that was real and read the wrong way.
+// The observation was that fbc listed only "sub" for a directory holding "sub", "." and ".." - true,
+// and it was measured with a mask of fbDirectory ALONE. Re-measured across four masks: a dot entry
+// carries DIRECTORY *and* HIDDEN (attrib 18), so fbDirectory alone excludes it by the ordinary rule,
+// while "fbDirectory Or fbHidden" lists all three, exactly as fbc does. The skip was a second rule
+// saying what the first already said, and where they disagreed the second one won and was wrong -
+// the manual's own system/dirfolder walks with every bit set and prints "." and "..".
+//
+// ⚠️ The dotted names get their HIDDEN bit from the platform layer (a leading dot on Unix), which is
+// also why ".hidden.txt" reports 34 - measured, and identical to fbc.
 begin
-  {$IFDEF UNIX}
-  Result := (Rec.Name = '.') or (Rec.Name = '..');
-  {$ELSE}
   Result := False;
-  {$ENDIF}
 end;
 
 function TBytecodeVM.RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;
@@ -16562,11 +16580,16 @@ begin
 
     35: // bcDirSearch - DIR(spec, mask) starts a walk (Immediate 0), DIR() steps it (Immediate 1).
       begin
-        if Instr.Immediate = 0 then
+        // ⛔ AN EMPTY FILESPEC MEANS "THE NEXT ONE", not a new search. The manual is explicit - "if
+        // filespec is omitted or empty, the next matching file is returned" - and Dir("") is how a
+        // FreeBASIC loop is actually written, the manual's own fileio and system examples included.
+        // Taken as a new search it handed FindFirst an empty pattern, which matches nothing, so every
+        // such loop stopped after its FIRST entry: a directory listing that silently listed one file.
+        if (Instr.Immediate = 0) and (Ctx.StringRegs[Instr.Src1] <> '') then
         begin
           if FDirOpen then begin FindClose(FDirRec); FDirOpen := False; end;   // a new search cancels the old one
           FDirMask := Integer(Ctx.IntRegs[Instr.Src2]);
-          FDirOpen := FindFirst(Ctx.StringRegs[Instr.Src1], faAnyFile, FDirRec) = 0;
+          FDirOpen := FindFirst(DirTranslateSpec(Ctx.StringRegs[Instr.Src1]), faAnyFile, FDirRec) = 0;
         end
         else if FDirOpen then
           if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;
