@@ -86,6 +86,7 @@ source "$SCRIPT_DIR/scripts/lib/deps-linux.sh"
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; GRAY='\033[0;90m'; NC='\033[0m'
 
 ASSUME_YES=false
+FPC_OVERRIDE=""
 DO_BUILD=true
 DO_DEPS=true
 BUILD_TARGET="all"
@@ -101,6 +102,7 @@ Options:
       --deps-only      Install the dependencies and stop
       --build-only     Skip the dependencies and build
       --target <name>  What to build: all (default), sb, sbc, sbd, sbv, sbw
+      --fpc <path>     Use THIS Free Pascal (binary, bin dir or install root)
   -h, --help           This help
 
   Supported package managers: apt, dnf, pacman, zypper, apk, brew.
@@ -114,6 +116,7 @@ while [[ $# -gt 0 ]]; do
         --deps-only)  DO_BUILD=false; shift ;;
         --build-only) DO_DEPS=false; shift ;;
         --target)     BUILD_TARGET="$2"; shift 2 ;;
+        --fpc)        FPC_OVERRIDE="$2"; shift 2 ;;
         -h|--help)    show_help; exit 0 ;;
         *) echo -e "${RED}Unknown option: $1${NC}" >&2; show_help; exit 1 ;;
     esac
@@ -190,6 +193,17 @@ if [[ "$DO_DEPS" == "true" ]]; then
             if fpc_version_ok "$c"; then FPC_FOUND="$c"; break
             else FPC_WRONG="$FPC_WRONG $(fpc_version_of "$c")"; fi
         done < <(fpc_candidates "$FPC_PLATFORM" 2>/dev/null)
+    fi
+    # ⛔ --fpc is checked FIRST and its failure is fatal, not a fallback: someone who names a
+    # compiler wants that one, and quietly installing a different one is the opposite of the answer.
+    if [[ -n "$FPC_OVERRIDE" ]]; then
+        FPC_FOUND=""; FPC_WRONG=""
+        if named="$(fpc_resolve "$FPC_OVERRIDE" "$FPC_PLATFORM")" && fpc_check "$named"; then
+            FPC_FOUND="$named"
+        else
+            show_status "--fpc $FPC_OVERRIDE cannot be used: ${FPC_CHECK_WHY:-no fpc binary there}" "Error"
+            exit 1
+        fi
     fi
     if [[ -n "$FPC_FOUND" ]]; then
         show_status "Free Pascal $FPC_REQUIRED_VERSION: $FPC_FOUND" "Success"
@@ -386,7 +400,9 @@ fi
 
 # build.sh runs its own dependency preflight and reports anything still missing, so a package that
 # the manager installed under a name we did not expect is caught there rather than as a link error.
-if "$SCRIPT_DIR/build.sh" "$BUILD_TARGET"; then
+BUILD_ARGS=("$BUILD_TARGET")
+[[ -n "$FPC_OVERRIDE" ]] && BUILD_ARGS+=(--fpc "$FPC_OVERRIDE")
+if "$SCRIPT_DIR/build.sh" "${BUILD_ARGS[@]}"; then
     echo ""
     show_status "SedaiBasic2 built: $SCRIPT_DIR/bin/" "Success"
     exit 0

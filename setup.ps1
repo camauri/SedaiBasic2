@@ -58,7 +58,11 @@ param(
     [switch]$ForceGcc,
     [switch]$Clean,
     [switch]$NonInteractive,
-    [switch]$ResetConfig
+    [switch]$ResetConfig,
+
+    # Use THIS Free Pascal instead of downloading one. Accepts the binary, its bin directory or the
+    # installation root; handed to build.ps1, which checks it and refuses a wrong version.
+    [string]$Fpc
 )
 
 # ============================================================================
@@ -871,7 +875,9 @@ function Build-SedaiBasic {
         Write-Host ""
 
         # Use build.ps1 -Clean to compile all targets (suppress banner as setup shows its own)
-        & $buildScript -Clean -NoBanner
+        $buildArgs = @('-Clean', '-NoBanner')
+        if ($Fpc) { $buildArgs += @('-Fpc', $Fpc) }
+        & $buildScript @buildArgs
         $exitCode = $LASTEXITCODE
 
         Write-Host ""
@@ -1027,6 +1033,11 @@ function Invoke-Setup {
 
         if ($skipFpcDownload) {
             Show-Status "Using custom FPC path: $($UserConfig.FpcPath)" -Type "Info"
+        } elseif ($Fpc) {
+            # ⛔ Named on the command line: do NOT download one, and do not verify OUR install path
+            # either, because there is nothing there to verify. build.ps1 checks the named compiler
+            # and refuses a wrong version, which is the one place that check belongs.
+            Show-Status "Using the Free Pascal named with -Fpc: $Fpc" -Type "Info"
         } elseif (Test-FpcInstallation -and !$ForceFpc) {
             Show-Status "FPC $FpcVersion is already installed" -Type "Skip"
         } else {
@@ -1040,7 +1051,9 @@ function Invoke-Setup {
         $currentStep++
         Show-Step -Number $currentStep -Total $totalSteps -Title "Verifying FPC Installation"
 
-        if (!(Test-FpcInstallation)) {
+        if ($Fpc) {
+            Show-Status "checked by build.ps1, which refuses anything but $($Script:FpcRequiredVersion)" -Type "Skip"
+        } elseif (!(Test-FpcInstallation)) {
             Show-Status "no usable Free Pascal $($Script:FpcRequiredVersion)" -Type "Error"
             Show-Status "Expected: $FpcExe" -Type "Error"
             if (Test-Path $FpcExe) {
