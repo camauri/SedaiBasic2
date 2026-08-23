@@ -30,6 +30,7 @@ CLEAN=false
 WINDOW=false
 NO_BANNER=false
 SELECT_FPC=false
+FPC_OVERRIDE=""
 # ⭐ ON BY DEFAULT since 20 Aug 2026. The hot dispatch arms compiled by a C compiler are worth
 # 27-45% wherever they apply, on Linux and - verified under wine - on win64 too. HOT_C_EXPLICIT
 # separates "the user asked for it" from "it is simply the default": a missing C compiler is an
@@ -78,6 +79,7 @@ show_help() {
     echo "  --debug-flags <LIST>     Comma-separated: SSA,REGALLOC,... or ALL"
     echo "  --no-banner              Suppress the banner"
     echo "  --select-fpc             List the Free Pascal compilers found and choose one (stored)"
+    echo "  --fpc <path>             Use THIS Free Pascal (binary, bin dir or install root)"
     echo "  --no-hot-c               Do NOT compile the hot dispatch arms with a C compiler"
     echo "  --symbols                Release build, but NOT stripped (for a profiler; --debug is not a substitute)"
     echo "  --hot-c                  Force it on (it is the default; fails if no C compiler)"
@@ -161,31 +163,45 @@ config_set() {
 # names outright.
 FPC_PROBE_LOG=""
 
-fpc_works() {
-    local fpc="$1" d rc
-    FPC_PROBE_LOG=""
-    d="$(mktemp -d)" || return 1
-    printf 'begin end.\n' > "$d/probe.pas"
-    ( cd "$d" && "$fpc" -o"$d/probe" "$d/probe.pas" ) > "$d/probe.log" 2>&1
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-        # The first few lines carry the reason; the banner above them is noise.
-        FPC_PROBE_LOG="$(grep -viE '^(Free Pascal Compiler|Copyright|Target OS:|Compiling |Linking )' \
-                          "$d/probe.log" 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 4)"
-        [[ -n "$FPC_PROBE_LOG" ]] || FPC_PROBE_LOG="$(head -n 4 "$d/probe.log" 2>/dev/null)"
-    fi
-    rm -rf "$d"
-    return $rc
+# When the search finds nothing usable, ask for a path instead of giving up. The person running this
+# very often knows where their compiler is, and an error message that does not offer to be told is
+# just a dead end. ⛔ Only when stdin is a terminal: a CI run must fail loudly, never hang on a
+# prompt nobody will answer.
+ask_for_fpc() {
+    local platform="$1" typed c
+    [[ -t 0 ]] || return 1
+    echo "" >&2
+    echo -e "${CYAN}Type the path to a Free Pascal $FPC_REQUIRED_VERSION, or press Enter to give up.${NC}" >&2
+    echo -e "${GRAY}The binary itself, its bin directory, or the installation root all work.${NC}" >&2
+    while :; do
+        read -r -p "  fpc: " typed >&2 || return 1
+        [[ -n "$typed" ]] || return 1
+        c="$(fpc_resolve "$typed" "$platform")" || {
+            echo -e "${YELLOW}  no fpc binary there. Try again, or Enter to give up.${NC}" >&2
+            continue
+        }
+        if ! fpc_check "$c"; then
+            echo -e "${YELLOW}  $c cannot be used:${NC}" >&2
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && echo -e "${YELLOW}    $line${NC}" >&2
+            done <<< "$FPC_CHECK_WHY"
+            continue
+        fi
+        printf '%s\n' "$c"
+        return 0
+    done
 }
 
-# .../fpc/bin/<platform>/fpc  ->  .../fpc   (the root form build.ps1 stores as FpcPath).
-# Anything else (a system /usr/bin/fpc) has no such root, and prints nothing.
-fpc_root_of() {
-    local bin="$1" platform="$2"
-    case "$bin" in
-        */bin/"$platform"/fpc) printf '%s\n' "${bin%/bin/$platform/fpc}" ;;
-        *) : ;;
-    esac
+# Remember an answer so the question is asked once.
+store_fpc() {
+    local c="$1" platform="$2" root
+    config_set FpcBin "$c"
+    root="$(fpc_root_of "$c" "$platform")"
+    # FpcPath is the form build.ps1 reads, so a shared checkout keeps working; a system install has
+    # no such root and simply does not get the key.
+    [[ -n "$root" ]] && config_set FpcPath "$root"
+    echo -e "${GREEN}Stored in setup.config.json: $c${NC}" >&2
+    echo -e "${GRAY}Change it later with ./build.sh --select-fpc, or once with --fpc <path>${NC}" >&2
 }
 
 # List what is installed, prove which ones work, and ask. Writes the answer to setup.config.json so
@@ -214,6 +230,12 @@ choose_fpc() {
     if [[ $n -eq 0 ]]; then
         echo -e "${RED}ERROR: no Free Pascal Compiler found.${NC}" >&2
         echo -e "${YELLOW}Looked in: fpc/3.2.2/, ~/tools/fp/*/fpc/, ~/fpcupdeluxe/, PATH, and \$HOME.${NC}" >&2
+        if c="$(ask_for_fpc "$platform")"; then
+            store_fpc "$c" "$platform"
+            printf '%s\n' "$c"
+            return 0
+        fi
+        echo -e "${YELLOW}Install it, or point at one with ./build.sh --fpc <path>.${NC}" >&2
         return 1
     fi
 
@@ -243,6 +265,12 @@ choose_fpc() {
         echo -e "${YELLOW}SedaiBasic needs Free Pascal $FPC_REQUIRED_VERSION exactly; an install${NC}" >&2
         echo -e "${YELLOW}without a usable fpc.cfg is the other usual cause. The reason is printed${NC}" >&2
         echo -e "${YELLOW}under each one above.${NC}" >&2
+        if c="$(ask_for_fpc "$platform")"; then
+            store_fpc "$c" "$platform"
+            printf '%s\n' "$c"
+            return 0
+        fi
+        echo -e "${YELLOW}Or point at another one with ./build.sh --fpc <path>.${NC}" >&2
         return 1
     fi
 
@@ -250,7 +278,8 @@ choose_fpc() {
     # prompt, or pick for the user and be wrong quietly.
     if [[ ! -t 0 ]]; then
         echo -e "${YELLOW}Not a terminal, so nothing was chosen and nothing was stored.${NC}" >&2
-        echo -e "${YELLOW}Run ./build.sh --select-fpc once interactively, or set SEDAI_FPC=<path>.${NC}" >&2
+        echo -e "${YELLOW}Run ./build.sh --select-fpc once interactively, pass --fpc <path>,${NC}" >&2
+        echo -e "${YELLOW}or set SEDAI_FPC=<path>.${NC}" >&2
         return 1
     fi
 
@@ -265,18 +294,32 @@ choose_fpc() {
     done
 
     c="${paths[$((sel-1))]}"
-    config_set FpcBin "$c"
-    root="$(fpc_root_of "$c" "$platform")"
-    # FpcPath is the form build.ps1 reads, so a shared checkout keeps working; a system install has
-    # no such root and simply does not get the key.
-    [[ -n "$root" ]] && config_set FpcPath "$root"
-    echo -e "${GREEN}Stored in setup.config.json: FPC ${vers[$((sel-1))]} - $c${NC}" >&2
-    echo -e "${GRAY}Change it later with ./build.sh --select-fpc${NC}" >&2
+    store_fpc "$c" "$platform"
     printf '%s\n' "$c"
 }
 
 find_fpc() {
     local platform="$1" candidate
+
+    # 0. --fpc on the command line wins over everything, including a stored choice: it is the answer
+    #    to "the search got it wrong", so a stored wrong answer must not survive it. It is checked
+    #    rather than trusted, and a bad one STOPS the build instead of falling through to the search:
+    #    silently building with a different compiler than the one named is worse than not building.
+    if [[ -n "$FPC_OVERRIDE" ]]; then
+        candidate="$(fpc_resolve "$FPC_OVERRIDE" "$platform")" || {
+            echo -e "${RED}ERROR: --fpc $FPC_OVERRIDE: no fpc binary there.${NC}" >&2
+            echo -e "${YELLOW}Give the binary itself, its bin directory, or the installation root.${NC}" >&2
+            return 1
+        }
+        if ! fpc_check "$candidate"; then
+            echo -e "${RED}ERROR: --fpc $candidate cannot be used:${NC}" >&2
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && echo -e "${YELLOW}  $line${NC}" >&2
+            done <<< "$FPC_CHECK_WHY"
+            return 1
+        fi
+        echo "$candidate"; return 0
+    fi
 
     # 1. Explicit environment override - deliberately NOT stored: it is a one-off, and writing it
     #    would turn "just this once" into the project's setting.
@@ -578,6 +621,7 @@ while [[ $# -gt 0 ]]; do
         --window) WINDOW=true; shift ;;
         --no-banner) NO_BANNER=true; shift ;;
         --select-fpc) SELECT_FPC=true; shift ;;
+        --fpc) FPC_OVERRIDE="$2"; shift 2 ;;
         --hot-c) HOT_C=true; HOT_C_EXPLICIT=true; shift ;;
         --no-hot-c) HOT_C=false; shift ;;
         --symbols|--no-strip) SYMBOLS=true; shift ;;

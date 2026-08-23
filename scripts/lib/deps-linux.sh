@@ -222,3 +222,85 @@ file_exists_nocase() {
     [[ -d "$dir" ]] || return 1
     find "$dir" -maxdepth 1 -iname "$name" -type f 2>/dev/null | grep -q .
 }
+
+# ---------------------------------------------------------------------------
+# Naming a compiler by hand
+#
+# The automatic search covers the usual places, and when it comes up empty the answer used to be an
+# error and nothing else. That is the wrong end of the exchange: the person running the script very
+# often knows exactly where their compiler is. These three turn "what you typed" into "the fpc binary
+# to use, or why not", and they live here so build.sh and setup.sh agree on the answer.
+# ---------------------------------------------------------------------------
+
+# Does this compiler actually build anything? Leaves the reason in FPC_PROBE_LOG when it does not.
+fpc_works() {
+    local fpc="$1" d rc
+    FPC_PROBE_LOG=""
+    d="$(mktemp -d)" || return 1
+    printf 'begin end.\n' > "$d/probe.pas"
+    ( cd "$d" && "$fpc" -o"$d/probe" "$d/probe.pas" ) > "$d/probe.log" 2>&1
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        # The first few lines carry the reason; the banner above them is noise.
+        FPC_PROBE_LOG="$(grep -viE '^(Free Pascal Compiler|Copyright|Target OS:|Compiling |Linking )' \
+                          "$d/probe.log" 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 4)"
+        [[ -n "$FPC_PROBE_LOG" ]] || FPC_PROBE_LOG="$(head -n 4 "$d/probe.log" 2>/dev/null)"
+    fi
+    rm -rf "$d"
+    return $rc
+}
+
+# .../fpc/bin/<platform>/fpc  ->  .../fpc   (the root form build.ps1 stores as FpcPath).
+# Anything else (a system /usr/bin/fpc) has no such root, and prints nothing.
+fpc_root_of() {
+    local bin="$1" platform="$2"
+    case "$bin" in
+        */bin/"$platform"/fpc) printf '%s\n' "${bin%/bin/$platform/fpc}" ;;
+        *) : ;;
+    esac
+}
+
+# What someone types is not always the binary. Accept the four spellings that all mean the same
+# compiler, because rejecting three of them teaches nothing:
+#   /opt/fpc/bin/x86_64-linux/fpc   the binary itself
+#   /opt/fpc/bin/x86_64-linux       the directory holding it
+#   /opt/fpc                        the installation root
+#   /opt/fpc/bin                    the bin directory of a root
+# Prints the binary on success, nothing on failure.
+fpc_resolve() {
+    local what="$1" platform="${2:-}" c
+    [[ -n "$what" ]] || return 1
+    what="${what/#\~/$HOME}"
+    if [[ -f "$what" && -x "$what" ]]; then printf '%s\n' "$what"; return 0; fi
+    if [[ -d "$what" ]]; then
+        for c in "$what/bin/$platform/fpc" "$what/fpc" "$what/$platform/fpc" \
+                 "$what/bin/fpc" "$what"/bin/*/fpc; do
+            [[ -f "$c" && -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+        done
+    fi
+    return 1
+}
+
+# The whole gate in one place: it exists, it runs, it is the required version, it compiles.
+# Leaves the reason in FPC_CHECK_WHY. ⛔ The version is checked BEFORE the compile probe, because a
+# 3.3.1 that happily builds "begin end." would otherwise pass here and fail on the real source, which
+# reads as a problem with our code rather than with the compiler.
+fpc_check() {
+    local c="$1"
+    FPC_CHECK_WHY=""
+    if [[ ! -f "$c" || ! -x "$c" ]]; then
+        FPC_CHECK_WHY="not an executable file"; return 1
+    fi
+    local v; v="$("$c" -iV 2>/dev/null)"
+    if [[ -z "$v" ]]; then
+        FPC_CHECK_WHY="does not answer 'fpc -iV', so it is not a Free Pascal compiler"; return 1
+    fi
+    if ! fpc_version_ok "$c"; then
+        FPC_CHECK_WHY="version $(fpc_version_of "$c"): SedaiBasic needs exactly $FPC_REQUIRED_VERSION"
+        return 1
+    fi
+    if ! fpc_works "$c"; then
+        FPC_CHECK_WHY="$FPC_PROBE_LOG"; return 1
+    fi
+    return 0
+}

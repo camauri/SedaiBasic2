@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build SedaiBasic projects (sb, sbc, sbd, sbv, sbw)
 
@@ -61,6 +61,10 @@ param(
     # List every Free Pascal compiler on this machine and choose one. The answer is stored in
     # setup.config.json and used from then on; pass this again to change it.
     [switch]$SelectFpc,
+
+    # Use THIS Free Pascal, whatever the search would have found. Accepts the binary, its bin
+    # directory or the installation root. Not stored: it is a one-off, like SEDAI_FPC.
+    [string]$Fpc,
 
     # Build the CLI VM (sb) with the optional SDL2 window presenter, enabling `sb --window`.
     # Default off: the headless sb (regression target) takes no SDL2 window dependency.
@@ -258,6 +262,113 @@ function Set-ConfigValues {
 }
 
 # List what is installed, prove which ones work, and ask. Writes the answer so this happens once.
+# What someone types is not always the binary. Accept the four spellings that all mean the same
+# compiler, because rejecting three of them teaches nothing:
+#   C:\fpc\3.2.2\bin\x86_64-win64\fpc.exe   the binary itself
+#   C:\fpc\3.2.2\bin\x86_64-win64           the directory holding it
+#   C:\fpc\3.2.2                             the installation root
+#   C:\fpc\3.2.2\bin                         the bin directory of a root
+function Resolve-FpcPath {
+    param([string]$What, [string]$Platform = 'x86_64-win64')
+
+    if ([string]::IsNullOrWhiteSpace($What)) { return $null }
+    $What = [Environment]::ExpandEnvironmentVariables($What.Trim('"').Trim())
+    if (Test-Path $What -PathType Leaf) { return (Resolve-Path $What).Path }
+    if (Test-Path $What -PathType Container) {
+        $tries = @(
+            (Join-Path $What "bin\$Platform\fpc.exe"),
+            (Join-Path $What 'fpc.exe'),
+            (Join-Path $What "$Platform\fpc.exe"),
+            (Join-Path $What 'bin\fpc.exe')
+        )
+        foreach ($t in $tries) { if (Test-Path $t -PathType Leaf) { return (Resolve-Path $t).Path } }
+        $any = Get-ChildItem -Path (Join-Path $What 'bin') -Filter 'fpc.exe' -Recurse -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($any) { return $any.FullName }
+    }
+    return $null
+}
+
+# The whole gate in one place: it exists, it runs, it is the required version, it compiles.
+# Leaves the reason in $script:FpcCheckWhy.
+function Test-FpcUsable {
+    param([string]$Fpc)
+
+    $script:FpcCheckWhy = ''
+    if (-not (Test-Path $Fpc -PathType Leaf)) {
+        $script:FpcCheckWhy = 'not an executable file'; return $false
+    }
+    $ver = ''
+    try { $ver = (& $Fpc -iV 2>$null) } catch { $ver = '' }
+    if (-not $ver) {
+        $script:FpcCheckWhy = "does not answer 'fpc -iV', so it is not a Free Pascal compiler"
+        return $false
+    }
+    $vClean = ("$ver".Trim() -split '-')[0]
+    if ($vClean -ne $Script:FpcRequiredVersion) {
+        $script:FpcCheckWhy = "version $vClean : SedaiBasic needs exactly $($Script:FpcRequiredVersion)"
+        return $false
+    }
+    if (-not (Test-FpcWorks -Fpc $Fpc)) {
+        $script:FpcCheckWhy = $script:FpcProbeLog; return $false
+    }
+    return $true
+}
+
+# Is there anyone at the keyboard? ⚠️ Tested BEFORE asking: unlike a shell read, Read-Host does not
+# fail on redirected input, it returns empty, so an unattended run would sail past the question.
+function Test-Interactive {
+    try {
+        if (-not [Environment]::UserInteractive) { return $false }
+        if ([Console]::IsInputRedirected) { return $false }
+    } catch { return $false }
+    return $true
+}
+
+# When the search finds nothing usable, ask for a path instead of giving up. The person running this
+# very often knows where their compiler is, and an error message that does not offer to be told is
+# just a dead end.
+function Request-FpcPath {
+    param([string]$Platform = 'x86_64-win64')
+
+    if (-not (Test-Interactive)) { return $null }
+    Write-Host ""
+    Write-Host "Type the path to a Free Pascal $($Script:FpcRequiredVersion), or press Enter to give up." -ForegroundColor Cyan
+    Write-Host "The binary itself, its bin directory, or the installation root all work." -ForegroundColor DarkGray
+    while ($true) {
+        $typed = Read-Host "  fpc"
+        if ([string]::IsNullOrWhiteSpace($typed)) { return $null }
+        $c = Resolve-FpcPath -What $typed -Platform $Platform
+        if (-not $c) {
+            Write-Host "  no fpc.exe there. Try again, or Enter to give up." -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Test-FpcUsable -Fpc $c)) {
+            Write-Host "  $c cannot be used:" -ForegroundColor Yellow
+            foreach ($line in ("$script:FpcCheckWhy" -split "`n")) {
+                if ($line.Trim() -ne '') { Write-Host ("    " + $line.Trim()) -ForegroundColor Yellow }
+            }
+            continue
+        }
+        return $c
+    }
+}
+
+# Remember an answer so the question is asked once.
+function Save-FpcChoice {
+    param([string]$Fpc, [string]$Platform = 'x86_64-win64')
+
+    $values = @{ FpcBin = $Fpc }
+    $root = Get-FpcRoot -Fpc $Fpc -Platform $Platform
+    # FpcPath is the form this script has always read, kept so an existing config keeps working; a
+    # PATH install has no such root and simply does not get the key.
+    if ($root) { $values['FpcPath'] = $root }
+    Set-ConfigValues -Values $values
+    $Script:UserConfig.FpcPath = $root
+    Write-Host "Stored in setup.config.json: $Fpc" -ForegroundColor Green
+    Write-Host "Change it later with .\build.ps1 -SelectFpc, or once with -Fpc <path>" -ForegroundColor DarkGray
+}
+
 function Select-Fpc {
     param([string]$Platform = 'x86_64-win64')
 
@@ -285,6 +396,9 @@ function Select-Fpc {
     if ($rows.Count -eq 0) {
         Write-Host "ERROR: no Free Pascal Compiler found." -ForegroundColor Red
         Write-Host "Looked in: fpc\3.2.2\, C:\lazarus*, C:\FPC\, ~\fpcupdeluxe\, ~\tools\fp\*, PATH." -ForegroundColor Yellow
+        $typed = Request-FpcPath -Platform $Platform
+        if ($typed) { Save-FpcChoice -Fpc $typed -Platform $Platform; return $typed }
+        Write-Host "Install it, run .\setup.ps1, or point at one with .\build.ps1 -Fpc <path>." -ForegroundColor Yellow
         return $null
     }
 
@@ -312,6 +426,9 @@ function Select-Fpc {
         Write-Host "ERROR: none of them is usable." -ForegroundColor Red
         Write-Host "SedaiBasic needs Free Pascal $($Script:FpcRequiredVersion) exactly; an install without a" -ForegroundColor Yellow
         Write-Host "usable fpc.cfg is the other usual cause. The reason is printed under each one above." -ForegroundColor Yellow
+        $typed = Request-FpcPath -Platform $Platform
+        if ($typed) { Save-FpcChoice -Fpc $typed -Platform $Platform; return $typed }
+        Write-Host "Or point at another one with .\build.ps1 -Fpc <path>." -ForegroundColor Yellow
         return $null
     }
 
@@ -319,14 +436,10 @@ function Select-Fpc {
     # user and be wrong quietly. This has to be tested BEFORE asking - unlike a shell read, Read-Host
     # does not fail on redirected input, it returns empty, so the default would be taken and STORED
     # without anyone seeing the list.
-    $interactive = $true
-    try {
-        if (-not [Environment]::UserInteractive) { $interactive = $false }
-        if ([Console]::IsInputRedirected) { $interactive = $false }
-    } catch { $interactive = $false }
-    if (-not $interactive) {
+    if (-not (Test-Interactive)) {
         Write-Host "Not an interactive console, so nothing was chosen and nothing was stored." -ForegroundColor Yellow
-        Write-Host "Run .\build.ps1 -SelectFpc once interactively, or set SEDAI_FPC=<path>." -ForegroundColor Yellow
+        Write-Host "Run .\build.ps1 -SelectFpc once interactively, pass -Fpc <path>," -ForegroundColor Yellow
+        Write-Host "or set SEDAI_FPC=<path>." -ForegroundColor Yellow
         return $null
     }
 
@@ -345,13 +458,7 @@ function Select-Fpc {
     }
 
     $chosen = $rows[$sel - 1]
-    $values = @{ FpcBin = $chosen.Path }
-    $root = Get-FpcRoot -Fpc $chosen.Path -Platform $Platform
-    # FpcPath is the form this script has always read, kept so an existing config keeps working; a
-    # PATH install has no such root and simply does not get the key.
-    if ($root) { $values['FpcPath'] = $root }
-    Set-ConfigValues -Values $values
-    $Script:UserConfig.FpcPath = $root
+    Save-FpcChoice -Fpc $chosen.Path -Platform $Platform
 
     Write-Host ("Stored in setup.config.json: FPC {0} - {1}" -f $chosen.Version, $chosen.Path) -ForegroundColor Green
     Write-Host "Change it later with .\build.ps1 -SelectFpc" -ForegroundColor Gray
@@ -360,6 +467,27 @@ function Select-Fpc {
 
 function Find-FPC {
     param([string]$Platform = 'x86_64-win64')
+
+    # 0. -Fpc on the command line wins over everything, including a stored choice: it is the answer
+    #    to "the search got it wrong", so a stored wrong answer must not survive it. It is checked
+    #    rather than trusted, and a bad one STOPS the build instead of falling through to the search:
+    #    silently building with a different compiler than the one named is worse than not building.
+    if ($Fpc) {
+        $c = Resolve-FpcPath -What $Fpc -Platform $Platform
+        if (-not $c) {
+            Write-Host "ERROR: -Fpc $Fpc : no fpc.exe there." -ForegroundColor Red
+            Write-Host "Give the binary itself, its bin directory, or the installation root." -ForegroundColor Yellow
+            return $null
+        }
+        if (-not (Test-FpcUsable -Fpc $c)) {
+            Write-Host "ERROR: -Fpc $c cannot be used:" -ForegroundColor Red
+            foreach ($line in ("$script:FpcCheckWhy" -split "`n")) {
+                if ($line.Trim() -ne '') { Write-Host ("  " + $line.Trim()) -ForegroundColor Yellow }
+            }
+            return $null
+        }
+        return $c
+    }
 
     # 1. Explicit environment override - deliberately NOT stored: it is a one-off, and writing it
     #    would turn "just this once" into the project's setting.
