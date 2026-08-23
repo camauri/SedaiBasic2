@@ -260,14 +260,21 @@ difference is stated rather than left to be discovered.
   default; MODERN is FreeBASIC's own base dialect throughout, where a parameter defaults to BYVAL, and
   it stays that way whatever `#lang` asks for. The manual's `switches/option-byval` therefore cannot
   agree with us — its own first line says *"compile with the -lang fblite compiler switch"*.
-- **`ByRef ... As Any` converts; it does not type-pun.** fbc's `Any` disables the parameter's type
-  check, so passing a `Single` to a body declared `ByRef a As Integer` makes the body read that
-  variable's BYTES as an Integer. We convert the value instead (`-15.0` arrives as `-15`), because in
-  our model a parameter is a value in a typed bank and the alternative reads four bytes past the end
-  of a `Single` — bytes the language does not define, and whose value in fbc's own output
-  (`C1700000`) is exactly those four undefined bytes reading as zero. Reproducing that would mean
-  reproducing an accident. The manual's `misc/any-param` exists to show the type check being
-  disabled, and it is: we compile it without complaint too.
+- **`ByRef ... As Any` converts; it does not type-pun — and that is a MISSING FEATURE, not a rule.**
+  fbc's `Any` disables the parameter's type check, so passing a `Single` to a body declared
+  `ByRef a As Integer` makes the body read that variable's BYTES as an Integer: `-15.0` prints as
+  `C1700000`, the Single's bit pattern. We convert the value instead and print `FFFFFFFFFFFFFFF1`,
+  which is `-15` as an Int64. The type CHECK is disabled here as it is there — the manual's
+  `misc/any-param` compiles and runs without complaint — but the value differs.
+  Why: in our model a parameter is a value in a TYPED BANK (int / float / string), not an address
+  into bytes, and crossing banks is a conversion; there is no address in the middle, so there are no
+  bytes to reinterpret. ⚠️ This is a scoping decision and not a limit of the model: the raw-backed
+  @-taken-scalar machinery already exists, and a `ByRef As Any` parameter could be lowered to a raw
+  address with the body reading its own declared width.
+  ⛔ One caveat on the oracle, and it is only half the answer: `SizeOf(Integer)` is 8 while a `Single`
+  is 4, so fbc's `C1700000` is really `00000000_C1700000` — the Single's four real bytes plus four
+  bytes PAST THE END of the object that happen to read as zero. The low half is a perfectly
+  well-defined type-pun and we are simply wrong about it; only the high half is an accident.
 - **`__FB_UNIQUEID__`'s numbers are not part of the contract.** The identifiers it generates are
   unique and correctly nested — which is everything a program can depend on — but they start at
   `Lt_0001` where fbc starts at `Lt_0002`, its own label counter having already spent one. The
