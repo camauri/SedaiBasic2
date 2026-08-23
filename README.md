@@ -36,28 +36,28 @@
 
 SedaiBasic2 began as a reimplementation of Commodore BASIC v7 and is now a language in its own right, built on a full optimizing compiler pipeline that targets a fast register-based bytecode virtual machine. It carries **two dialects** in the same engine, and they are not the same kind of thing:
 
-- **CLASSIC** — line-numbered, from Commodore BASIC v7 (**202 / 210** core commands, 96%). It keeps
+- **CLASSIC**: line-numbered, from Commodore BASIC v7 (**202 / 210** core commands, 96%). It keeps
   v7's *language*, not v7's machine: this does not run on a C64/C128 and has none of its peripherals,
   so the palette is 256 RGBA entries where v7 had sixteen fixed colours, sprites go to 256×256 and
   full colour against the C128's fixed 24×21, there are twelve video modes plus a dynamic one, and
-  the audio is our own engine — in the reSID lineage, well past the chip it descends from.
-- **MODERN** — line-number-free, from FreeBASIC. Compatibility is measured (**566 / 645** of
+  the audio is our own engine, in the reSID lineage, well past the chip it descends from.
+- **MODERN**: line-number-free, from FreeBASIC. Compatibility is measured (**566 / 645** of
   FreeBASIC's keywords; 60+ unmodified Rosetta Code programs run as-is) and it is worth a great deal,
   but it is a *property, not a definition*: MODERN has commands FreeBASIC does not, and departs from
   it where FreeBASIC is demonstrably wrong.
 
 > **Neither dialect is a clone, and the two are not the same kind of thing.** CLASSIC keeps a
-> language and replaces the machine — necessarily, since the machine is gone. MODERN keeps a language
+> language and replaces the machine, necessarily, since the machine is gone. MODERN keeps a language
 > and extends it. Each has a reference it grew from, and a compatibility figure measures how much of
-> that reference's code runs here — never how complete the language is. The clearest illustration is
+> that reference's code runs here, never how complete the language is. The clearest illustration is
 > [numeric output](#numeric-output-follows-the-standard-not-the-reference): where FreeBASIC's float
 > rounding disagrees with IEEE 754-2019, we follow the standard. A clone could not make that choice.
 
 ### Language features
 
-- **Core BASIC** — all data types and suffixes (`%` integer, `!`/`#` float, `$` string, plus FreeBASIC `Integer`/`Long`/`Double`/`Single`/`Byte`/`UInteger`/…), multi-dimensional arrays with arbitrary lower bounds, `DIM`/`REDIM`/array initializers/variable-length and ellipsis-sized arrays, string functions, math, date/time, `DATA`/`READ`, structured flow control.
-- **MODERN / FreeBASIC** — user-defined types and **OOP** (methods, `EXTENDS` inheritance, virtual dispatch, constructors/destructors, RAII value semantics, **operator overloading** including `Cast`, aggregate/tuple initialization and anonymous `type<T>(…)` temporaries), lexical scoping, **multithreading** (threads, mutexes, condition variables), **managed and raw pointers**, `WSTRING` (UTF-16), typed `CONST`, function pointers, a preprocessor (`#define`, function-like/multi-line `#macro`, conditional compilation), and a two-dialect parser that disambiguates keywords shared with v7.
-- **I/O** — console text modes (40x25 / 80x25 / 80x50), full file I/O (FreeBASIC `OPEN … FOR …` and Commodore forms), **2D graphics** (primitives, palettes, image buffers/blit, page-flipping) rendered on both the SDL2 console and, optionally, the CLI VM (`sb --window`), **interactive input** (keyboard / mouse / joystick), and optional **SID audio** emulation.
+- **Core BASIC**: all data types and suffixes (`%` integer, `!`/`#` float, `$` string, plus FreeBASIC `Integer`/`Long`/`Double`/`Single`/`Byte`/`UInteger`/…), multi-dimensional arrays with arbitrary lower bounds, `DIM`/`REDIM`/array initializers/variable-length and ellipsis-sized arrays, string functions, math, date/time, `DATA`/`READ`, structured flow control.
+- **MODERN / FreeBASIC**: user-defined types and **OOP** (methods, `EXTENDS` inheritance, virtual dispatch, constructors/destructors, RAII value semantics, **operator overloading** including `Cast`, aggregate/tuple initialization and anonymous `type<T>(…)` temporaries), lexical scoping, **multithreading** (threads, mutexes, condition variables), **managed and raw pointers**, `WSTRING` (UTF-16), typed `CONST`, function pointers, a preprocessor (`#define`, function-like/multi-line `#macro`, conditional compilation), and a two-dialect parser that disambiguates keywords shared with v7.
+- **I/O**: console text modes (40x25 / 80x25 / 80x50), full file I/O (FreeBASIC `OPEN … FOR …` and Commodore forms), **2D graphics** (primitives, palettes, image buffers/blit, page-flipping) rendered on both the SDL2 console and, optionally, the CLI VM (`sb --window`), **interactive input** (keyboard / mouse / joystick), and optional **SID audio** emulation.
 
 ### Compilation pipeline
 
@@ -79,7 +79,7 @@ sb --aot program.bas     # compile eligible whole functions from the SSA, before
 
 They are checked the same way everything else is: a differential net compiles the corpus both ways and
 requires identical output, so a function the AOT takes over has to agree with the interpreter **bit
-for bit** — which is also the constraint that decides what it may do. Where a loop's shape allows it
+for bit**, which is also the constraint that decides what it may do. Where a loop's shape allows it
 the AOT emits two-lane SSE2, and that stays inside the constraint because the two lanes accumulate
 independently and are combined in the same order the scalar code would have used.
 
@@ -88,7 +88,7 @@ independently and are combined in the same order the scalar code would have used
 `sbc --target wasm` emits a **WebAssembly module** from the same SSA the bytecode compiler uses. The
 generated `.wasm` runs in a browser or under Node with no interpreter, no runtime library and no
 toolchain: procedures become WASM functions (so recursion runs on the engine's own stack), registers
-become locals, and the only import is a byte sink for output — the formatting of numbers is the
+become locals, and the only import is a byte sink for output: the formatting of numbers is the
 language's own, so a module prints exactly what `sb` prints.
 
 ```bash
@@ -98,7 +98,7 @@ sbc program.bas --target wasm     # -> program.wasm
 Covered today: integer and floating-point arithmetic, comparisons, bitwise and shifts, control flow,
 calls and recursion, `PRINT` (including correctly-rounded floats and `PRINT USING`), strings, arrays
 including array parameters and `REDIM`, user-defined types, raw memory, `DIM SHARED` globals, the
-transcendental functions, and 2D graphics — both the drawing primitives (`LINE`, `PSET`, `POINT`) and
+transcendental functions, and 2D graphics, both the drawing primitives (`LINE`, `PSET`, `POINT`) and
 direct framebuffer access through `SCREENPTR`. A program that draws produces the same framebuffer
 natively and in the browser, and the page paints it by reading linear memory directly, without a
 single extra import. The voxel-landscape demo in `bas/demo/` compiles and runs this way.
@@ -119,7 +119,7 @@ the browser build entirely.
 
 Pattern matching does not link a third-party library: `SedaiRegexEngine` compiles a pattern to a DFA
 (`SedaiAutomaton`) with an SSE2 prefix pre-filter. The target is the accepted subset behaving exactly
-as PCRE2 does and everything outside it being declined cleanly — which is why the number that matters
+as PCRE2 does and everything outside it being declined cleanly, which is why the number that matters
 is not one but two, the second being the acceptance rate. On the Benchmarks Game's `regex-redux` this
 puts the engine level with CPython driving PCRE2.
 
@@ -128,7 +128,7 @@ puts the engine level with CPython driving PCRE2.
 Where FreeBASIC compatibility and **IEEE 754-2019** disagree, SedaiBasic2 follows the standard. This
 is a deliberate, measured departure and the only one of its kind.
 
-Printing a `Double` at 16 significant digits, FreeBASIC rounds **twice** — the exact value to 17
+Printing a `Double` at 16 significant digits, FreeBASIC rounds **twice**: the exact value to 17
 digits, then those 17 to 16. §5.12.2 of IEEE 754-2019 asks for a conversion that is *correctly
 rounded*, i.e. rounded once, and the two disagree on **4.75% of doubles** (measured over 20 706 bit
 patterns). The textbook case is `1e-283`, whose nearest double is exactly
@@ -136,9 +136,9 @@ patterns). The textbook case is `1e-283`, whose nearest double is exactly
 `9.999999999999999e-284`, while rounding to 17 first turns `…946` into `…95` and carries it through
 sixteen nines to print `1e-283`.
 
-SedaiBasic2 prints `9.999999999999999e-284`. Its digits come from the **exact** binary value —
+SedaiBasic2 prints `9.999999999999999e-284`. Its digits come from the **exact** binary value,
 a double is `M × 2^E`, so the decimal expansion is an integer built by repeated multiplication, with
-no floating point and no approximation anywhere — and are rounded once, half-to-even.
+no floating point and no approximation anywhere, and are rounded once, half-to-even.
 
 Real programs are unaffected: the divergence needs the extreme exponents that random bit patterns
 produce. The regression corpus did not move a single baseline, and the FreeBASIC example sweep
@@ -146,7 +146,7 @@ returned exactly the counts it had before the change.
 
 `OPTION DIGITS n` sets how many significant digits `PRINT` shows for a float (default: the dialect's
 16 for a `Double`, 7 for a `Single`). Because the digits come from the exact value and are rounded
-once, the count is a display choice and the rounding is not — raising it shows *more of the same
+once, the count is a display choice and the rounding is not: raising it shows *more of the same
 number* rather than a differently-rounded one:
 
 ```basic
@@ -156,13 +156,13 @@ Option Digits Exact : Print 0.1  '  0.100000000000000005551115123125782702118158
 
 `Exact` is not shorthand for "very many": a double's decimal expansion is **finite**. The value is
 `M × 2^E`, so for `E ≥ 0` it is an integer and for `E < 0` it is `M × 5^(-E) / 10^(-E)`, which
-terminates after exactly `-E` fractional digits. There is nothing past the end to truncate — the
+terminates after exactly `-E` fractional digits. There is nothing past the end to truncate: the
 widest any double gets is 751 significant digits (the smallest subnormal), and `Print 0.5` at that
 setting is still `0.5`, because that is all the digits it has.
 
 ### Real-world FreeBASIC compatibility
 
-The MODERN dialect is exercised against real programs: [`bas/rosetta/`](bas/rosetta/README.md) collects 60+ **unmodified** FreeBASIC solutions from [Rosetta Code](https://rosettacode.org), each verified to run correctly (optimized output matching `--no-opt`, deterministic, non-interactive). They are third-party works included as a mere aggregation under their original GFDL 1.2 license — see the [attribution note](bas/rosetta/README.md).
+The MODERN dialect is exercised against real programs: [`bas/rosetta/`](bas/rosetta/README.md) collects 60+ **unmodified** FreeBASIC solutions from [Rosetta Code](https://rosettacode.org), each verified to run correctly (optimized output matching `--no-opt`, deterministic, non-interactive). They are third-party works included as a mere aggregation under their original GFDL 1.2 license; see the [attribution note](bas/rosetta/README.md).
 
 ```bash
 sb bas/rosetta/vector_products.bas
@@ -171,9 +171,10 @@ sb bas/rosetta/sieve_of_eratosthenes.bas
 
 ## Setup
 
-> **Dependencies:** both build scripts check every dependency *before* compiling and print all the
-> missing ones at once, with a single command that installs them. If you would rather read the list
-> first — or the automatic suggestion does not fit your system — see **[INSTALL.md](INSTALL.md)**.
+> **Dependencies:** `setup.ps1` (Windows) and `setup.sh` (Linux) install everything and build. Both
+> build scripts also check every dependency *before* compiling and print all the missing ones at
+> once; on Linux the report ends with a single command that installs the lot. To read the list first,
+> see **[INSTALL.md](INSTALL.md)**.
 > ⚠️ SDL2 is the backend for **both** the graphics and the audio: without it there is no window, no
 > drawing and no sound.
 
@@ -207,8 +208,15 @@ After this one-time setup, all local scripts will run without restrictions.
 ```
 
 This will:
-1. Download and install Free Pascal Compiler (FPC) 3.2.2 locally
-2. Compile SedaiBasic2 (`sb.exe`)
+1. Download and install Free Pascal 3.2.2 locally, and refuse any other version
+2. Install the SDL2 runtime: `SDL2.dll`, `SDL2_ttf.dll`, `SDL2_image.dll` and the console font
+3. Download the SDL2 Pascal bindings into `deps\sdl2`
+4. Install MinGW-w64 GCC into `deps\gcc` for the C hot loop, worth 27-45%
+5. Download SedaiAudioFoundation, without which there is no sound
+6. Compile SedaiBasic2 (`sb.exe`)
+
+Every download is pinned by SHA-256. Steps 4 and 5 are never fatal: without them you get a slower
+interpreter and no audio, not a failed build.
 
 #### Setup Options
 
@@ -228,20 +236,28 @@ This will:
 
 ### Linux
 
-All five targets build and run on Linux (verified on Debian 13 with FPC 3.2.2, x86_64). You need
-FPC 3.2.2 and, for `sbv` and for `sb --window`, the SDL2 development packages — on Debian/Ubuntu:
-`libsdl2-dev`, plus `libsdl2-image-dev`, `libsdl2-ttf-dev`, `libsdl2-mixer-dev`, `libsdl2-net-dev`
-and `libsdl2-gfx-dev` for the full set of bindings.
+All five targets build and run on Linux (verified on Debian 13 with FPC 3.2.2, x86_64). `./setup.sh`
+works out what is missing, prints one command that installs all of it, fetches the bindings and
+SedaiAudioFoundation, and builds.
 
-> **Note:** `setup.sh` — which downloads and installs the toolchain for you — is still under
-> development. With FPC already installed, `./build.sh` is self-sufficient.
+On Debian and Ubuntu the packages are:
+
+```bash
+sudo apt install fpc gcc libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev
+```
+
+⛔ **The distribution has to be recent enough**, and it is the libraries that decide: the bindings
+need **SDL2 2.30.0** and **SDL2_ttf 2.22.0** or newer, so Debian 13 and Ubuntu 24.04 are in, Debian 12
+and Ubuntu 22.04 are out. Free Pascal must be **exactly 3.2.2**; 3.3.1 does not compile SedaiBasic.
+Only `sdl2` and `sdl2_ttf` bindings are actually used, so there is no need for `libsdl2-mixer-dev`,
+`libsdl2-net-dev` or `libsdl2-gfx-dev`.
 
 > **A C compiler is used, and it is worth having.** The interpreter's hot dispatch arms are
 > compiled by `gcc` or `clang` (`src/hotdisp.c`) and linked into the binary, which is worth 27-45%
 > on arithmetic-heavy programs. This is **on by default**; without a C compiler the build still
 > succeeds and says so, and `--no-hot-c` turns it off explicitly. Cross-building for Windows needs
 > `gcc-mingw-w64-x86-64-win32` (Debian/Ubuntu) and is picked up automatically; win32 is not
-> supported for this — its calling convention decorates symbol names differently from win64.
+> supported for this: its calling convention decorates symbol names differently from win64.
 
 ```bash
 ./setup.sh
@@ -261,7 +277,7 @@ SedaiBasic2 includes cross-platform build scripts for compiling all targets.
 | sbv | SedaiVision (SDL2 graphical) | sbv |
 | sbw | Web BASIC HTTP server (see [WEB_BASIC.md](WEB_BASIC.md)) | sbw |
 
-Binaries are written to `bin/<cpu>-<os>/`, and carry the `.exe` extension on Windows only — so the
+Binaries are written to `bin/<cpu>-<os>/`, and carry the `.exe` extension on Windows only, so the
 same target is `bin/x86_64-win64/sb.exe` there and `bin/x86_64-linux/sb` here. Compiled units live
 alongside in `lib/<cpu>-<os>/`.
 
@@ -289,7 +305,7 @@ silently ignored.
 .\build.ps1 -CPU x86_64 -OS win64
 ```
 
-#### Linux/macOS (Bash)
+#### Linux (Bash)
 
 ```bash
 # Build all targets
@@ -558,7 +574,7 @@ The suite is the whole of [The Computer Language Benchmarks Game](https://benchm
 
 Measured results are in [BENCHMARK.md](BENCHMARK.md). Two of these have no runnable reference on a
 stock Windows box, and `k-nucleotide`'s Python version needs a working `multiprocessing` fork, so Lua
-answers for it instead — the runner says which reference it used rather than quietly dropping one.
+answers for it instead: the runner says which reference it used rather than quietly dropping one.
 
 #### Cumulative Statistics
 
