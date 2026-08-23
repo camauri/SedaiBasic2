@@ -49,6 +49,16 @@ binds `SDL2_ttf.dll`. The file is shipped so the day something uses it nothing h
    `objdump -p SDL2_image.dll` against `objdump -p SDL2.dll`. 68 symbols on this pair, all present.
 3. Zip as `x86_64-win64/`, with the font, and update `$EXPECTED_HASH` in
    `install-runtime-x86_64.ps1`.
+4. Load the three DLLs with only the package's own files present and call into each one:
+   `SDL_Init`, `TTF_Init`, `TTF_OpenFont` on the shipped font, `IMG_Init` for JPG and PNG. On Linux
+   a small `LoadLibrary`/`GetProcAddress` program built with `x86_64-w64-mingw32-gcc` and run under
+   wine does it, in a `WINEARCH=win64` prefix of its own.
+
+⛔ That check is the one that matters, and it is NOT running `sbv.exe`: under wine `sbv.exe` hangs
+waiting on its window, identically on a good package and a broken one, so its timeout says nothing.
+A missing dependency instead shows up immediately as error 126 from `LoadLibrary`, which is exactly
+how the old `SDL2_image.dll` failed. A dependency that is shipped but never exercised is verified by
+nothing.
 
 ⚠️ The SDL2 bindings decide the floor: `SDL2_BINDINGS_URL` in `scripts/lib/deps-linux.sh` pins
 SDL2-for-Pascal v2.3, which needs SDL2 2.30.0 and SDL2_ttf 2.22.0 or newer. Linux installs whatever
