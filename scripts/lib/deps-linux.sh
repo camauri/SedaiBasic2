@@ -57,6 +57,19 @@ dep_pkg() {
         sdl2ttf-dev:apk)    echo "sdl2_ttf-dev" ;;
         sdl2ttf-dev:brew)   echo "sdl2_ttf" ;;
 
+        unzip:apt|unzip:dnf|unzip:pacman|unzip:zypper|unzip:apk|unzip:brew) echo "unzip" ;;
+        curl:apt|curl:dnf|curl:pacman|curl:zypper|curl:apk|curl:brew)         echo "curl" ;;
+
+        # ⭐ ALSA, for MIDI INPUT. SedaiAudioFoundation opens libasound.so.2 with dlopen
+        # (SedaiMIDIInput.pas), so it is optional at run time: without it MIDI input is silently
+        # unavailable and everything else works. Nothing links against it.
+        alsa:apt)           echo "libasound2t64" ;;
+        alsa:dnf)           echo "alsa-lib" ;;
+        alsa:pacman)        echo "alsa-lib" ;;
+        alsa:zypper)        echo "libasound2" ;;
+        alsa:apk)           echo "alsa-lib" ;;
+        alsa:brew)          echo "" ;;
+
         sdl2-run:apt)       echo "libsdl2-2.0-0 libsdl2-ttf-2.0-0" ;;
         sdl2-run:dnf)       echo "SDL2 SDL2_ttf" ;;
         sdl2-run:pacman)    echo "sdl2 sdl2_ttf" ;;
@@ -165,3 +178,11 @@ distro_name() {
     ver="$(sed -n 's/^VERSION_ID="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release | head -1)"
     printf '%s %s\n' "$name" "$ver"
 }
+
+# ⛔ THE PASCAL BINDINGS ARE NOT IN THE REPOSITORY: deps/ is gitignored and they are downloaded.
+# ⭐ And they are PLATFORM INDEPENDENT - 52 text files, .pas and .inc, no binaries, every platform
+# difference behind an {$IFDEF} - so Windows, Linux and macOS take the very same archive. That is why
+# this hash is the same one scripts/windows/install-sdl2.ps1 pins.
+SDL2_BINDINGS_VERSION="2.3"
+SDL2_BINDINGS_URL="https://github.com/camauri/SedaiBasic2-Deps/releases/download/SDL2-for-Pascal-v2.3/SDL2-for-Pascal-v2.3.zip"
+SDL2_BINDINGS_SHA256="829dd68bebfe7756bf037160e7cc268c115976d640480d73ebb8badaa46a9e47"
