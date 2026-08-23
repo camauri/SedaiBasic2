@@ -372,7 +372,15 @@ type
     FGfxPages: array of Integer;     // page index -> surface id (page 0 = screen surface 0; 1+ = image surfaces)
     // FreeBASIC WINDOW logical coordinate system: physical = A*logical + B (per axis). Identity when off.
     FGfxWinActive: Boolean;
-    FGfxWinAx, FGfxWinBx, FGfxWinAy, FGfxWinBy: Double;
+    FGfxWinScreen: Boolean;                            // WINDOW SCREEN: y grows downward (no flip)
+    FGfxWinX1, FGfxWinY1, FGfxWinX2, FGfxWinY2: Double;  // the logical bounds, kept so the coefficients
+                                                         // can be REBUILT when the viewport changes
+    // ⛔ TWO coefficient sets, because fbc HAS two. Drawing divides the viewport into W-1 steps (world
+    // x2 lands on the LAST pixel); PMAP divides it into W (world x2 answers W, one past the last).
+    // Measured on an 11x11 screen with WINDOW (0,0)-(10,10): PSET (3,7) lands at physical (3,3) while
+    // PMAP(7,1) answers 2.3. Using one set for both moves every drawing by up to a pixel per unit.
+    FGfxWinAx, FGfxWinBx, FGfxWinAy, FGfxWinBy: Double;       // DRAWING (PSET/LINE/CIRCLE/POINT)
+    FGfxPMapAx, FGfxPMapBx, FGfxPMapAy, FGfxPMapBy: Double;   // PMAP only
     // FreeBASIC VIEW viewport: physical origin added to mapped coords (non-SCREEN form); clip is on the surface.
     FGfxViewOffsetX, FGfxViewOffsetY: Integer;
     // ...and the rectangle itself, because CLS clears the VIEWPORT, not the screen. The clip lives on
@@ -523,6 +531,9 @@ type
     function GfxMapX(LX: Double): Integer;   // FreeBASIC WINDOW: logical x -> physical x
     function GfxMapY(LY: Double): Integer;   // FreeBASIC WINDOW: logical y -> physical y
     function PointOutsideView(PX, PY: Integer): Boolean;  // POINT answers -1 outside the VIEW / the surface
+    function GfxViewW: Integer;              // the width WINDOW maps onto: the viewport's, or the screen's
+    function GfxViewH: Integer;
+    procedure RecomputeGfxWindow;            // rebuild the WINDOW coefficients against the current viewport
     function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
     procedure SetupGfxScreen(W, H, NumPages: Integer);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
@@ -13939,6 +13950,7 @@ begin
   FGfxFBScreen := True;
   FGfxViewActive := False;                      // a new mode has no viewport, as in FreeBASIC
   FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;
+  RecomputeGfxWindow;                           // the surface changed size under any live WINDOW
 end;
 
 function TBytecodeVM.DrawSurface: Integer;
@@ -13959,6 +13971,72 @@ function TBytecodeVM.GfxMapY(LY: Double): Integer;
 begin
   if FGfxWinActive then Result := Round(FGfxWinAy * LY + FGfxWinBy) else Result := Round(LY);
   Result := Result + FGfxViewOffsetY;
+end;
+
+function TBytecodeVM.GfxViewW: Integer;
+// What WINDOW divides up: the VIEWPORT when one is defined, the whole surface otherwise. Measured
+// against fbc - with "View Screen (100,50)-(200,150)" the viewport is 101 pixels wide (both edges
+// included) and "Window (0,0)-(10,10)" then maps world 10 to 101, not to the screen width.
+begin
+  if FGfxViewActive then
+    Result := Abs(FGfxViewX2 - FGfxViewX1) + 1
+  else if Assigned(FGraphics) then
+    Result := FGraphics.SurfaceWidth(FGfxWorkSurface)
+  else
+    Result := 0;
+end;
+
+function TBytecodeVM.GfxViewH: Integer;
+begin
+  if FGfxViewActive then
+    Result := Abs(FGfxViewY2 - FGfxViewY1) + 1
+  else if Assigned(FGraphics) then
+    Result := FGraphics.SurfaceHeight(FGfxWorkSurface)
+  else
+    Result := 0;
+end;
+
+procedure TBytecodeVM.RecomputeGfxWindow;
+// The WINDOW transform, rebuilt from the logical bounds and the CURRENT viewport.
+//
+// ⛔ It has to be rebuilt, not computed once: fbc derives the mapping at use time, so setting a VIEW
+// after a WINDOW changes what the WINDOW means (measured - "Window (0,0)-(10,10)" answers PMap(10,0)
+// = 320 before a viewport and 101 after it). Keeping the coefficients but recomputing them on every
+// statement that can change the viewport keeps the drawing path a multiply-add.
+//
+// The scale is the viewport size W, NOT W-1: world x2 maps to W, one past the last pixel. The
+// vertical form of the default (non-SCREEN) WINDOW flips AND shifts by one, so world y2 maps to -1
+// and world y1 to H-1. Both read off fbc, and the asymmetry is fbc's, not a simplification here.
+var
+  VW, VH: Integer;
+begin
+  if not FGfxWinActive then Exit;
+  VW := GfxViewW; VH := GfxViewH;
+  if (FGfxWinX2 = FGfxWinX1) or (FGfxWinY2 = FGfxWinY1) or (VW < 1) or (VH < 1) then
+  begin
+    FGfxWinActive := False;
+    Exit;
+  end;
+  // Drawing: the last pixel is W-1, so world x2 lands ON it.
+  FGfxWinAx := (VW - 1) / (FGfxWinX2 - FGfxWinX1);
+  FGfxWinBx := -FGfxWinX1 * FGfxWinAx;
+  // PMAP: world x2 answers W, one past the last pixel. Not the same number, and not a rounding of it.
+  FGfxPMapAx := VW / (FGfxWinX2 - FGfxWinX1);
+  FGfxPMapBx := -FGfxWinX1 * FGfxPMapAx;
+  if FGfxWinScreen then
+  begin
+    FGfxWinAy := (VH - 1) / (FGfxWinY2 - FGfxWinY1);   // y1 = top, y2 = bottom
+    FGfxWinBy := -FGfxWinY1 * FGfxWinAy;
+    FGfxPMapAy := VH / (FGfxWinY2 - FGfxWinY1);
+    FGfxPMapBy := -FGfxWinY1 * FGfxPMapAy;
+  end
+  else
+  begin
+    FGfxWinAy := -(VH - 1) / (FGfxWinY2 - FGfxWinY1); // y1 = bottom, y2 = top
+    FGfxWinBy := (VH - 1) - FGfxWinY1 * FGfxWinAy;
+    FGfxPMapAy := -VH / (FGfxWinY2 - FGfxWinY1);
+    FGfxPMapBy := (VH - 1) - FGfxWinY1 * FGfxPMapAy;
+  end;
 end;
 
 function TBytecodeVM.PointOutsideView(PX, PY: Integer): Boolean;
@@ -13991,6 +14069,7 @@ var
   PalColor: UInt32;
   GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
   WinX1, WinY1, WinX2, WinY2, WinW, WinH: Integer;
+  PMapVal: Double;                        // PMAP's answer before it is narrowed to a SINGLE
   JoyBtns, JoyDev, JoyLocal, JoyBtnIdx: Integer;
   JoyAx: array[0..7] of Single;
   JoyV: Single;
@@ -14465,52 +14544,53 @@ begin
       end;
     64: // bcGfxImageConvertRow - IMAGECONVERTROW(src, src_bpp, dst, dst_bpp, width [, isrgb])
       ImageConvertRowExec(Ctx, Instr);
-    44: // bcGfxWindow - WINDOW [SCREEN] (x1,y1)-(x2,y2): set/clear the logical coordinate transform
+    44: // bcGfxWindow - WINDOW [SCREEN] (x1,y1)-(x2,y2): set/clear the logical coordinate transform.
+        //  ⛔ The bounds are FLOAT registers: "Window (-2.5,-2.5)-(2.5,2.5)" is the whole point of the
+        //  statement, and integer registers truncated it. Only the BOUNDS are stored here; the
+        //  coefficients come from RecomputeGfxWindow, which the VIEW and SCREENRES arms also call.
       if Assigned(FGraphics) then
       begin
         if ((Instr.Immediate shr 32) and 1) = 0 then
           FGfxWinActive := False                                    // no bounds -> identity
         else
         begin
-          WinX1 := Ctx.IntRegs[Instr.Src1];
-          WinY1 := Ctx.IntRegs[Instr.Src2];
-          WinX2 := Ctx.IntRegs[Instr.Immediate and $FFFF];
-          WinY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
-          WinW := FGraphics.SurfaceWidth(FGfxWorkSurface);
-          WinH := FGraphics.SurfaceHeight(FGfxWorkSurface);
-          if (WinX2 <> WinX1) and (WinY2 <> WinY1) and (WinW > 1) and (WinH > 1) then
-          begin
-            FGfxWinAx := (WinW - 1) / (WinX2 - WinX1);
-            FGfxWinBx := -WinX1 * FGfxWinAx;
-            if ((Instr.Immediate shr 33) and 1) = 1 then
-            begin
-              // WINDOW SCREEN: y1 = top, y2 = bottom (no flip)
-              FGfxWinAy := (WinH - 1) / (WinY2 - WinY1);
-              FGfxWinBy := -WinY1 * FGfxWinAy;
-            end
-            else
-            begin
-              // WINDOW (default): y1 = bottom, y2 = top (y flipped)
-              FGfxWinAy := -(WinH - 1) / (WinY2 - WinY1);
-              FGfxWinBy := (WinH - 1) - WinY1 * FGfxWinAy;
-            end;
-            FGfxWinActive := True;
-          end
-          else
-            FGfxWinActive := False;
+          FGfxWinX1 := Ctx.FloatRegs[Instr.Src1];
+          FGfxWinY1 := Ctx.FloatRegs[Instr.Src2];
+          FGfxWinX2 := Ctx.FloatRegs[Instr.Immediate and $FFFF];
+          FGfxWinY2 := Ctx.FloatRegs[(Instr.Immediate shr 16) and $FFFF];
+          FGfxWinScreen := ((Instr.Immediate shr 33) and 1) = 1;
+          FGfxWinActive := True;
+          RecomputeGfxWindow;
         end;
       end;
-    45: // bcGfxPMap - __PMAP(coord, n): map between logical and physical coordinates (incl. VIEW offset)
-      case Instr.Immediate of
-        0: Ctx.IntRegs[Instr.Dest] := GfxMapX(Ctx.IntRegs[Instr.Src1]);   // logical x -> physical x
-        1: Ctx.IntRegs[Instr.Dest] := GfxMapY(Ctx.IntRegs[Instr.Src1]);   // logical y -> physical y
-        2: if FGfxWinActive and (FGfxWinAx <> 0) then                      // physical x -> logical x
-             Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetX - FGfxWinBx) / FGfxWinAx)
-           else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetX;
-      else
-        if FGfxWinActive and (FGfxWinAy <> 0) then                        // physical y -> logical y
-          Ctx.IntRegs[Instr.Dest] := Round((Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetY - FGfxWinBy) / FGfxWinAy)
-        else Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1] - FGfxViewOffsetY;
+    45: // bcGfxPMap - __PMAP(coord, n): map between logical and physical coordinates.
+        //  0 = logical x -> physical x   1 = logical y -> physical y
+        //  2 = physical x -> logical x   3 = physical y -> logical y
+        //  ⛔ FLOAT in and out, all four. fbc's PMAP returns a SINGLE, and both directions are
+        //  fractional: PMap(319,2) is 0.99375 under a unit window, and PMap(5,0) is 50.5 under a
+        //  101-pixel viewport. Rounding either one to an integer is a different function.
+        //  ⚠️ It does NOT round the way GfxMapX does. GfxMapX exists to pick a PIXEL; PMAP exists to
+        //  report the mapping, and the answer fbc gives is the unrounded product - narrowed to SINGLE,
+        //  which is the type fbc declares and the reason it prints 9.90099 where a double says
+        //  9.900990099009901.
+      begin
+        case Instr.Immediate of
+          0: if FGfxWinActive then PMapVal := FGfxPMapAx * Ctx.FloatRegs[Instr.Src1] + FGfxPMapBx
+             else PMapVal := Ctx.FloatRegs[Instr.Src1];
+          1: if FGfxWinActive then PMapVal := FGfxPMapAy * Ctx.FloatRegs[Instr.Src1] + FGfxPMapBy
+             else PMapVal := Ctx.FloatRegs[Instr.Src1];
+          2: if FGfxWinActive and (FGfxPMapAx <> 0) then
+               PMapVal := (Ctx.FloatRegs[Instr.Src1] - FGfxPMapBx) / FGfxPMapAx
+             else PMapVal := Ctx.FloatRegs[Instr.Src1];
+        else
+          if FGfxWinActive and (FGfxPMapAy <> 0) then
+            PMapVal := (Ctx.FloatRegs[Instr.Src1] - FGfxPMapBy) / FGfxPMapAy
+          else PMapVal := Ctx.FloatRegs[Instr.Src1];
+        end;
+        // A flipped window has a NEGATIVE scale, so an exact zero numerator gives -0 - which prints
+        // as "-0" and fbc prints " 0". Same value, and the comparison against 0 catches both signs.
+        if PMapVal = 0 then PMapVal := 0;
+        Ctx.FloatRegs[Instr.Dest] := Double(Single(PMapVal));
       end;
     46: // bcGfxView - VIEW [SCREEN] (x1,y1)-(x2,y2): set/clear the viewport (offset + clip on the work page)
       if Assigned(FGraphics) then
@@ -14520,6 +14600,7 @@ begin
           FGfxViewOffsetX := 0; FGfxViewOffsetY := 0;          // reset -> full screen, no offset
           FGfxViewActive := False;
           FGraphics.SetClip(FGfxWorkSurface, False, 0, 0, 0, 0);
+          RecomputeGfxWindow;                                  // WINDOW now divides the whole screen
         end
         else
         begin
@@ -14541,6 +14622,7 @@ begin
             if WinY1 <= WinY2 then FGfxViewOffsetY := WinY1 else FGfxViewOffsetY := WinY2;
           end;
         end;
+        RecomputeGfxWindow;   // a WINDOW set BEFORE the VIEW now divides the VIEWPORT (fbc-measured)
       end;
     47: // bcGfxScreen - SCREEN mode [, , num_pages]: numbered graphics mode -> resolution (QB/FB table)
       begin
@@ -15944,7 +16026,9 @@ begin
           Dest = float register (value to print)
           Src1 = file handle register (int) }
         HandleNum := Ctx.IntRegs[Instr.Src1];
-        Data := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Dest]);
+        // Immediate = 3: the value is SINGLE-typed, so 7 significant digits, exactly as the console
+        // arm does it. The kind travels with the value for floats too, not just for integers.
+        Data := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Dest], Instr.Immediate = 3);
         if Assigned(FOnFileData) then
         begin
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);

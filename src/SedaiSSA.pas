@@ -5134,10 +5134,13 @@ begin
           // PMAP(coord, n) -> mapped coordinate (n: 0=lx->px,1=ly->py,2=px->lx,3=py->ly).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureIntRegister(ArgValue);  // coord
+            // ⛔ FLOAT in and FLOAT out, all four selectors. fbc's PMAP returns a SINGLE: under a
+            // viewport 101 pixels wide, "PMap(5,0)" is 50.5, and the pixel->logical directions are
+            // fractional by construction (PMap(319,2) is 0.99375, which we answered as 1).
+            ProcessExpression(ArgListNode.GetChild(0), ArgValue); ArgReg := EnsureFloatRegister(ArgValue);  // coord
             ProcessExpression(ArgListNode.GetChild(1), RVal);     // n (constant)
-            DestReg := FProgram.AllocRegister(srtInt);
-            Result := MakeSSARegister(srtInt, DestReg);
+            DestReg := FProgram.AllocRegister(srtFloat);
+            Result := MakeSSARegister(srtFloat, DestReg);
             if RVal.Kind = svkConstInt then
               EmitInstruction(ssaGfxPMap, Result, ArgReg, MakeSSAValue(svkNone), RVal)
             else
@@ -13478,18 +13481,21 @@ var
 
   function ZeroReg: TSSAValue;
   begin
-    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaLoadConstFloat, Result, MakeSSAConstFloat(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
 begin
   if FCurrentBlock = nil then Exit;
   if Node.ChildCount >= 4 then
   begin
-    ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
-    ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
-    ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
-    ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+    // ⛔ FLOAT bounds. "Window (-2.5,-2.5)-(2.5,2.5)" is the whole point of the statement - a logical
+    // coordinate system that is NOT the pixel grid - and integer registers truncated it to (-2,-2)-(2,2),
+    // which silently rescaled every drawing under it. fbc takes Singles here.
+    ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureFloatRegister(X1V);
+    ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureFloatRegister(Y1V);
+    ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureFloatRegister(X2V);
+    ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureFloatRegister(Y2V);
     Flags := 1;                                    // has-bounds
     if Node.Attributes.Values['SCREEN'] = '1' then Flags := Flags or 2;
   end
@@ -16749,6 +16755,13 @@ var
   PK: Integer;
 begin
   Result := 0;
+  if ExprVal.RegType = srtFloat then
+  begin
+    // A SINGLE prints with 7 significant digits in a file as on screen (fbc writes PMap's 9.90099,
+    // not the double 9.90099048614502). Kind 3 on the FLOAT side means exactly that flag.
+    if IsSingleExpr(Child) then Result := 3;
+    Exit;
+  end;
   if ExprVal.RegType <> srtInt then Exit;
   PK := PrintKindOfExpr(Child);
   if PK = 1 then Exit(1);
@@ -19977,6 +19990,10 @@ begin
         if (not Result) and (FCurrentThisType <> '') then
           Result := UDTFieldIsSingle(FCurrentThisType, VarToStr(Node.Value));
       end;
+    antGraphicsFunction:
+      // PMAP returns a SINGLE, and a graphics function is its own node type - the same lookup by name
+      // the ordinary call below does, so a graphics function with no entry answers False as before.
+      Result := PrintKindOf(VarToStr(Node.Value)) = 4;
     antFunctionCall:
       begin
         // A builtin overloaded for a UDT ("Abs(v)" on an "Operator Abs ... As Single") returns whatever
@@ -30253,6 +30270,9 @@ begin
     FVarPrintKind.AddObject(kPOINT, TObject(PtrInt(3)));
     FVarPrintKind.AddObject(kRGB, TObject(PtrInt(3)));
     FVarPrintKind.AddObject(kRGBA, TObject(PtrInt(3)));
+    // PMAP returns a SINGLE - kind 4 - so it shows 7 significant digits, not a double's 16:
+    // fbc prints 9.90099 where the same mapping in double precision is 9.900990099009901.
+    FVarPrintKind.AddObject(kPMAP, TObject(PtrInt(4)));
   end;
   RegisterRecordVars(AST);
 
