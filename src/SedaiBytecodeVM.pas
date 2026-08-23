@@ -890,6 +890,22 @@ function c_tan(x: Double): Double; cdecl; external 'msvcrt' name 'tan';
 {$ENDIF}
 
 {$IFDEF HOT_C}
+{ WINDOWS ONLY, and the gate is not tidiness. On win64 there is no libm to pull and FPC ships no
+  msvcrt import library, so the C object cannot name "sin" itself - the link died on "Undefined
+  symbol: sin". These forward to the same c_sin/c_cos/c_tan every other engine uses, so one platform
+  still has one implementation.
+  ⛔ NOT used on Unix, because the forwarding is NOT free: measured on a 3 M-iteration loop saturated
+  with Sin/Cos/Tan, the C object calling libc directly runs 0.097 s and calling through here 0.114 s,
+  +17.5%. (An earlier version of this comment called that "below the noise, and measured". It was
+  neither until it was.) Where the alternative is not linking at all, the call is worth paying. }
+{$IFDEF WINDOWS}
+function sb_hot_sin(x: Double): Double; cdecl; public name 'sb_hot_sin';
+begin Result := c_sin(x); end;
+function sb_hot_cos(x: Double): Double; cdecl; public name 'sb_hot_cos';
+begin Result := c_cos(x); end;
+function sb_hot_tan(x: Double): Double; cdecl; public name 'sb_hot_tan';
+begin Result := c_tan(x); end;
+{$ENDIF}
 {$ENDIF}
 
 
@@ -9361,6 +9377,13 @@ end;
   Int64, which is C's { uint16_t x4; int64_t } with no padding on either side. cdecl is the right
   convention on both platforms - on win64 FPC's cdecl IS the Microsoft x64 ABI that MinGW-w64 emits. }
 {$L hotdisp.o}
+{ ⛔ AND THE OBJECT IS NO LONGER FREESTANDING. It calls sin/cos/tan since the trigonometry moved to
+  the libc on 22 Aug 2026 - "nm -u" on it lists exactly those three. On Linux the Pascal RTL has
+  already pulled libm, so nothing was needed and nothing was noticed; on win64 the link failed with
+  "Undefined symbol: sin", and it failed for MONTHS unnoticed because build.ps1 does not implement
+  HOT_C at all and nobody cross-built for win64 in between. The comment above still claimed the
+  object was freestanding and that win64 had been verified - that verification predates the change. }
+
 { How many BACK EDGES one stay inside the C loop may take before it hands the PC back so the caller
   can pump events. Spent per ITERATION of a BASIC loop, not per instruction: the whole point is that
   a program with nobody to pump for never pays for this. At the couple of nanoseconds an iteration of
