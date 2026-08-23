@@ -171,11 +171,18 @@ function Install-Gcc {
 
     # Step 5: Download
     Write-Step "Downloading MinGW-w64 GCC $GCC_VERSION..."
-    Write-Status "URL: $DOWNLOAD_URL" -Color Gray
-
-    $downloadResult = Get-FileWithProgress -Url $DOWNLOAD_URL -OutFile $ZipFile -Quiet:$Quiet
-    if ($downloadResult.Status -ne 0) {
-        Write-Error $downloadResult.Message
+    # Try each source in turn. A source that answers but serves the wrong bytes is caught by the
+    # hash check below, not here - this loop only cares about reaching something at all.
+    $downloadResult = $null
+    foreach ($url in $DOWNLOAD_URLS) {
+        if (-not $url) { continue }
+        Write-Status "URL: $url" -Color Gray
+        $attempt = Get-FileWithProgress -Url $url -OutFile $ZipFile -Quiet:$Quiet
+        if ($attempt.Status -eq 0) { $downloadResult = $attempt; break }
+        Write-Status "  unreachable: $($attempt.Message)" -Color Yellow
+    }
+    if (-not $downloadResult) {
+        Write-Error "none of the $($DOWNLOAD_URLS.Count) download source(s) could be reached."
         return $EXIT_NETWORK_ERROR
     }
 
