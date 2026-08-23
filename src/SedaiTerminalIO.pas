@@ -240,6 +240,7 @@ type
     function ReadKey: Char;
     function KeyPressed: Boolean;
     function HasChar: Boolean;
+    function InputExhausted: Boolean;
     function GetLastChar: string;
     procedure EnableTextInput;   // No-op for terminal (text input always enabled)
     procedure DisableTextInput;  // No-op for terminal
@@ -1290,6 +1291,19 @@ begin
 
   ProcessEvents;
   Result := FHasPendingChar;
+end;
+
+function TTerminalInput.InputExhausted: Boolean;
+// ⛔ ON UNIX THIS CLASS HAS NO KEY SOURCE AT ALL: ProcessEvents above is one big {$IFDEF WINDOWS},
+// so HasChar can never become True and a blocking read would spin for ever - which is exactly what
+// "Getkey a$" did. Saying so plainly here turns an infinite hang into fbc's own answer (-1) and puts
+// the platform gap where a reader will find it, instead of leaving it to be rediscovered as a freeze.
+begin
+  {$IFDEF WINDOWS}
+  Result := False;      // a real console can always deliver another key
+  {$ELSE}
+  Result := True;
+  {$ENDIF}
 end;
 
 function TTerminalInput.GetLastChar: string;

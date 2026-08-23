@@ -7508,6 +7508,7 @@ var
   NowTick, TargetTick: QWord;
   KeyNum, KeyIdx, CharIdx: Integer;
   KeyText: string;
+  KeyStr: string;       // GETKEY: the character just read (the FUNCTION form turns it into a code)
   Ch: Char;
   InQuotes: Boolean;
   HandleNum64: Int64;   // indirect-call target (entry PC, or a BUILTIN_FP_TAG @Sin sentinel)
@@ -8345,6 +8346,10 @@ begin
               end;
               if FInputDevice.HasChar then
                 Break;  // Got a character, exit loop
+              // ⛔ ...and a read that can never succeed must END, not spin. With no key source (the
+              // headless terminal on Unix) or with the input exhausted, this looped for ever: a
+              // program doing GETKEY simply froze. fbc answers -1 in exactly this situation.
+              if FInputDevice.InputExhausted then Break;
               // Use event poll callback for full rendering (sprites, cursor, etc.)
               if Assigned(FEventPollCallback) then
               begin
@@ -8359,7 +8364,17 @@ begin
               Sleep(10);  // Prevent busy-wait
             until False;
             // Only read character if we didn't exit due to CTRL+C
-            if Ctx.Running then
+            if Instr.Immediate = 1 then
+            begin
+              // FreeBASIC's GETKEY is a FUNCTION returning the key CODE, and -1 when no key can be
+              // had. The Commodore statement form below answers with a character instead: one arm,
+              // two dialects, and the Immediate is which.
+              KeyStr := '';
+              if Ctx.Running and FInputDevice.HasChar then KeyStr := FInputDevice.GetLastChar;
+              if KeyStr = '' then Ctx.IntRegs[Instr.Dest] := -1
+              else Ctx.IntRegs[Instr.Dest] := Ord(KeyStr[1]);
+            end
+            else if Ctx.Running then
               Ctx.StringRegs[Instr.Dest] := FInputDevice.GetLastChar
             else
               Ctx.StringRegs[Instr.Dest] := '';
@@ -8367,6 +8382,8 @@ begin
             FInputDevice.DisableTextInput;
           end;
         end
+        else if Instr.Immediate = 1 then
+          Ctx.IntRegs[Instr.Dest] := -1
         else
           Ctx.StringRegs[Instr.Dest] := '';
       end;
@@ -14703,8 +14720,10 @@ begin
           Ctx.IntRegs[Instr.Dest] := 0    // success
         else
         begin
-          // No provider (headless) or device absent: FB sets buttons 0, axes -1000, returns 1.
-          FJoyButtons := 0;
+          // No provider (headless) or device absent: fbc answers status 1, axes -1000 and buttons -1.
+          // ⛔ The comment here used to say "buttons 0" and the code agreed with it - an assumption
+          // written as a fact and never asked of the oracle. Measured: -1, for every device id.
+          FJoyButtons := -1;
           for JoyLocal := 0 to 7 do FJoyAxes[JoyLocal] := -1000.0;
           Ctx.IntRegs[Instr.Dest] := 1;   // failure
         end;
