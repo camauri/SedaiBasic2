@@ -806,6 +806,7 @@ type
     function  EffChildCount(Node: TASTNode): Integer;        // ChildCount excluding an appended image-target child
     procedure ProcessImageDestroy(Node: TASTNode);  // IMAGEDESTROY handle
     procedure ProcessImageInfo(Node: TASTNode);      // IMAGEINFO handle, w, h
+    function  EmitImageInfoFunc(Node, ArgListNode: TASTNode): TSSAValue;  // IMAGEINFO(img,w,h) -> status
     function  EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;  // GETMOUSE(x,y[,w][,b][,c]) -> status
     function  EmitGetJoystick(Node, ArgListNode: TASTNode): TSSAValue;  // GETJOYSTICK(id,buttons,a1..a8) -> status
     procedure ProcessGfxSetmouse(Node: TASTNode);    // SETMOUSE [x][,y][,visibility][,clip]
@@ -5162,6 +5163,13 @@ begin
           else
             raise Exception.Create('MULTIKEY requires 1 argument: MULTIKEY(scancode)');
         end
+        else if (FuncName = kIMAGEINFO) and (ArgListNode <> nil) and
+                (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
+                (ArgListNode.ChildCount >= 1) then
+          // IMAGEINFO(img, w, h) as a FUNCTION - fbc accepts both this and the statement form, and only
+          // the statement one parsed here, so "r = ImageInfo(img, w, h)" was a syntax error. Same shape
+          // as GETMOUSE: write each provided lvalue, answer a status.
+          Result := EmitImageInfoFunc(Node, ArgListNode)
         else if FuncName = 'GETMOUSE' then
           // GETMOUSE(x, y [, wheel] [, buttons] [, clip]) -> status (0 ok / 1 no mouse). Writes each
           // provided lvalue by reference; see EmitGetmouse. Works as an expression or a bare statement.
@@ -13037,6 +13045,43 @@ begin
     ProcessStatement(Assign);
     Assign.Free;
   end;
+end;
+
+function TSSAGenerator.EmitImageInfoFunc(Node, ArgListNode: TASTNode): TSSAValue;
+// IMAGEINFO(img [, w] [, h]) as an EXPRESSION: writes the provided lvalues and answers a status
+// (0 = a valid image, non-zero otherwise - fbc's convention).
+//
+// ⭐ Built out of the SAME synthetic assignments the statement form uses, so the two spellings cannot
+// answer differently: each destination becomes "var = __IMGINFO(handle, which)". fbc accepts both
+// forms and we accepted only the statement one, which made the manual's own spelling a syntax error.
+var
+  StatusReg: TSSAValue;
+  WhichLit, InnerArgs, Call, Assign: TASTNode;
+  i, MaxArgs: Integer;
+begin
+  StatusReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  MaxArgs := ArgListNode.ChildCount - 1;      // arg 0 is the handle; the rest are destinations
+  if MaxArgs > 2 then MaxArgs := 2;           // w and h, the two this engine reports
+  for i := 0 to MaxArgs - 1 do
+  begin
+    // An omitted slot ("ImageInfo(img, , h)") is an empty placeholder: skip it, do not write to it.
+    if ArgListNode.GetChild(i + 1).NodeType = antLiteral then Continue;
+    WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
+    InnerArgs := TASTNode.Create(antArgumentList, Node.Token);
+    InnerArgs.AddChild(ArgListNode.GetChild(0).Clone);
+    InnerArgs.AddChild(WhichLit);
+    Call := TASTNode.CreateWithValue(antGraphicsFunction, '__IMGINFO', Node.Token);
+    Call.AddChild(InnerArgs);
+    Assign := TASTNode.Create(antAssignment, Node.Token);
+    Assign.AddChild(ArgListNode.GetChild(i + 1).Clone);
+    Assign.AddChild(Call);
+    ProcessStatement(Assign);
+    Assign.Free;
+  end;
+  // The status: 0 when the handle names a live image. __IMGINFO answers 0 for a dead one, so the
+  // width doubles as the validity test rather than a second query being invented for it.
+  EmitInstruction(ssaLoadConstInt, StatusReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Result := StatusReg;
 end;
 
 function TSSAGenerator.EmitGetmouse(Node, ArgListNode: TASTNode): TSSAValue;

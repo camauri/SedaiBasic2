@@ -1392,13 +1392,19 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
-  if (Cmd <> kSCREENGFX) or not ModernMode or not Context.Check(ttDelimParOpen) then
+  // IMAGEINFO has a FUNCTION form too - "r = ImageInfo(img, w, h)" - and fbc accepts BOTH it and the
+  // statement form. Only the statement one parsed here, so the manual's own spelling was a syntax
+  // error. It keeps its ttGraphicsCommand token (the statement form is written without parentheses,
+  // which a ttGraphicsFunction would not accept) and gains the function form HERE, which is exactly
+  // what this routine exists for.
+  if (Cmd <> kSCREENGFX) and ((Cmd <> kIMAGEINFO) or not Context.Check(ttDelimParOpen)) or
+     not ModernMode or not Context.Check(ttDelimParOpen) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
     Result := nil;
     Exit;
   end;
-  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN" + argument list
+  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN"/"IMAGEINFO" + argument list
 end;
 
 function TExpressionParser.ParseFsFunctionForm(Token: TLexerToken): TASTNode;
