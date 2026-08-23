@@ -592,7 +592,9 @@ const
   DT_PT        = 10504;   // f64: and the time half
   { ERR$(n). The messages go in as ordinary string headers with a table of
     already-resolved handles in front, exactly as the month names do - and the
-    TABLE IS BUILT BY CALLING THE INTERPRETER'S OWN GetErrorCodeDescription, so
+    TABLE IS BUILT BY CALLING THE INTERPRETER'S OWN GetFBErrorCodeDescription -
+    the FreeBASIC one, this target being MODERN-only, and a DIFFERENT table from
+    the Commodore GetErrorCodeDescription, sharing only numbers - so
     the two cannot drift apart by a word. Codes with no message of their own
     hold 0 here and are rendered at run time as "ERROR n". }
   { ⭐ The codes are TWO ranges, not one - 0..41 from Commodore BASIC and
@@ -4337,7 +4339,8 @@ end;
   as the month names are.
 
   ⭐⭐ THE MESSAGES ARE NOT TRANSCRIBED - the table is built by CALLING the
-  interpreter's own GetErrorCodeDescription, so the two cannot drift apart by a
+  interpreter's own GetFBErrorCodeDescription - the FreeBASIC table, this target
+  being MODERN-only - so the two cannot drift apart by a
   word, an apostrophe or a code. A copied table would be right on the day it was
   written and wrong the first time somebody adds an error.
   ⛔ It sits in a FIXED region under the string literals, and the fit is tight -
