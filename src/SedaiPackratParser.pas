@@ -6390,7 +6390,7 @@ function TPackratParser.ParseFileOperationStatement: TASTNode;
 var
   Token: TLexerToken;
   Param, HandleNode, LenExpr: TASTNode;
-  CmdName, ModeStr, MW: string;
+  CmdName, ModeStr, MW, EncStr: string;
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
   C64CommaPos: Integer;
@@ -6583,12 +6583,24 @@ begin
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
-    // Optional "ENCODING <string>" clause (FreeBASIC text encoding): accepted; v1 treats file text as an
-    // ASCII/UTF-8 byte passthrough (utf16/utf32 re-encoding of file I/O is not applied).
+    // Optional "ENCODING <string>" clause (FreeBASIC text encoding). The width travels on the MODE
+    // string as a trailing "~<bits>" - the same way "ACCESS READ" travels as '<' - so nothing between
+    // here and the file layer had to learn a new parameter. "ascii"/"utf8" need no marker: our strings
+    // are already UTF-8 bytes and that is what the file gets.
     if UpperCase(Context.CurrentToken.Value) = kENCODING then
     begin
       Context.Advance;            // ENCODING
-      if Context.Check(ttStringLiteral) then Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+      if Context.Check(ttStringLiteral) then
+      begin
+        EncStr := UpperCase(StringReplace(StringReplace(VarToStr(Context.CurrentToken.Value),
+                                                        '-', '', [rfReplaceAll]), '_', '', [rfReplaceAll]));
+        if (EncStr = 'UTF16') or (EncStr = 'UTF16LE') then ModeStr := ModeStr + '~16'
+        else if EncStr = 'UTF32' then ModeStr := ModeStr + '~32'
+        // "utf8" needs no CONVERSION - our strings are already UTF-8 bytes - but it is not the same as
+        // no clause at all: fbc still writes the byte-order mark EF BB BF. So it gets a marker too.
+        else if (EncStr = 'UTF8') then ModeStr := ModeStr + '~8';
+        Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+      end;
     end;
     // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC). Only READ-alone changes anything
     // we model: it makes the open READ-ONLY, so a MISSING file is an error where a plain "For Binary"
