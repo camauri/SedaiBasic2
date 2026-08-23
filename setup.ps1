@@ -675,12 +675,8 @@ function Test-RuntimeInstallation {
 # Required runtime files
 $Script:RuntimeFiles = @(
     'SDL2.dll',
-    'SDL2_image.dll',
     'SDL2_ttf.dll',
-    'zlib1.dll',
-    'freetype.dll',
-    'libjpeg-8.dll',
-    'libpng16-16.dll'
+    'SDL2_image.dll'
 )
 $Script:RuntimeFontDir = 'font'
 $Script:RuntimeFontFile = 'PixelOperatorMono8-Bold.ttf'

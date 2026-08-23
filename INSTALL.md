@@ -176,9 +176,15 @@ From the official releases:
   `SDL2-devel-<version>-VC.zip` or `-mingw.zip` archive
 - SDL2_ttf: [github.com/libsdl-org/SDL_ttf/releases](https://github.com/libsdl-org/SDL_ttf/releases)
 
-Put `SDL2.dll` and `SDL2_ttf.dll` (and the DLLs shipped beside `SDL2_ttf.dll`) next to the built
-executable in `bin\x86_64-win64\`, or anywhere on the `PATH`. The Pascal bindings are already in
-`deps\sdl2`; nothing else is needed to compile.
+Put `SDL2.dll` and `SDL2_ttf.dll` next to the built executable in `bin\x86_64-win64\`, or anywhere
+on the `PATH`. The Pascal bindings are already in `deps\sdl2`; nothing else is needed to compile.
+
+⭐ **Two files, not a pile.** The official builds are self-contained: their only imports are Win32
+system DLLs and `SDL2.dll`, with FreeType, libpng, libjpeg and zlib linked inside. Any archive that
+makes you copy `freetype.dll`, `zlib1.dll` or a `libpng`/`libjpeg` beside them is a different build
+(MSYS2 or vcpkg), and then every one of those has its own dependencies to chase. `setup.ps1`
+installs the same two files plus `SDL2_image.dll`, listed in
+[scripts/windows/RUNTIME-PACKAGE.md](scripts/windows/RUNTIME-PACKAGE.md).
 
 Skip this only if you want a text-only build with no sound: without these two DLLs there is no
 window, no drawing primitive and no audio device.

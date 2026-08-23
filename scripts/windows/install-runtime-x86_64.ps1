@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Downloads and installs SedaiBasic2 runtime dependencies for Windows
 
@@ -46,8 +46,8 @@ $EXIT_ALREADY_INSTALLED = 5
 
 # Configuration
 $RUNTIME_VERSION = "x86_64-win64"
-$DOWNLOAD_URL = "https://github.com/camauri/SedaiBasic2-Deps/releases/download/Runtime-x86_64-win64/sedai_runtime-x86_64-win64.zip"
-$EXPECTED_HASH = "0da2172731dd90ca4eac0c21fc31aa6e89debb4b6e8504214c1a3ce23f025967"
+$DOWNLOAD_URL = "https://github.com/camauri/SedaiBasic2-Deps/releases/download/Runtime-v2-x86_64-win64/sedai_runtime-x86_64-win64.zip"
+$EXPECTED_HASH = "d84cbf451426dfcc8bba3b1526e2f0522def89af8af54795a3f0c8e67f16453d"
 $REQUIRED_SPACE_MB = 30  # Approximate space needed
 
 # Determine paths
@@ -188,7 +188,7 @@ function Install-Runtime {
     $requiredFiles = @(
         "SDL2.dll",
         "SDL2_ttf.dll",
-        "zlib1.dll",
+        "SDL2_image.dll",
         "font\PixelOperatorMono8-Bold.ttf"
     )
 
