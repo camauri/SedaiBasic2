@@ -242,11 +242,18 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- **`PALETTE`**: a MODERN (`ScreenRes`/`Screen`) screen carries **FreeBASIC's** default 256-colour
+  table, and `PALETTE` with no arguments resets to *that*; a CLASSIC screen keeps the Commodore one
+  and its own reset. Two tables, two dialects, never mixed — the same rule the error-code tables
+  follow. The MODERN table was dumped out of `fbc` rather than transcribed.
 - ⚠️ **`PAINT` with no border colour**: in MODERN an omitted border is the **fill colour itself**, so
   the flood spreads over everything that is not already that colour — a barrier of another colour is
   painted over, not respected. Measured against fbc. In **CLASSIC** it stays the Commodore rule: the
   flood covers the connected region of the *seed pixel's* colour and stops at anything else. The two
   dialects have different flood rules and they stay apart.
+- **`FLIP` is a copy, not a page swap** — the manual: *"In normal graphics mode, Flip is an alias for
+  PCopy and ScreenCopy"*. It copies the work page onto the visible one (or `from` onto `to`) and does
+  **not** change which page is the work page. `ScreenSet`, `PCopy` and `ScreenCopy` already matched.
 - ⚠️ **`DRAW`**: the turtle language matches fbc — the eight directions, the `B`/`N` prefixes, `S`
   scaling, absolute and relative `M`, `C`, `A`/`TA` rotation and `P` flood fill — with two
   differences. `POINTCOORD` reports the pen **rounded** (fbc's is fractional: `TA45 R20` reports

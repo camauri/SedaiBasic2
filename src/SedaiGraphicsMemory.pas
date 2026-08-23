@@ -69,6 +69,7 @@ type
     FState: TGraphicsState;
     FPalette: array[0..255] of UInt32;
     FDefaultC64Palette: array[0..15] of UInt32;
+    FPaletteIsFB: Boolean;      // this screen was opened by the FreeBASIC path: reset to ITS palette
     // FreeBASIC VIEW clip rectangle (inclusive, physical pixels). When active, pixel writes outside it
     // are discarded. Reads (GetPixel) are unaffected.
     FClipActive: Boolean;
@@ -111,6 +112,7 @@ type
     procedure SetPaletteColor(Index: TPaletteIndex; RGB: UInt32);
     procedure SetPaletteColorRGBA(Index: TPaletteIndex; R, G, B: Byte; A: Byte = 255);
     function GetPaletteColor(Index: TPaletteIndex): UInt32;
+    procedure LoadFBDefaultPalette;   // FreeBASIC's default 256-colour table (MODERN screens)
     procedure ResetPalette;
     // Load a built-in palette model into all 256 entries (ABGR). Models:
     //   0 = C64/C128 Commodore (default, repeated)   2 = greyscale ramp
@@ -202,6 +204,80 @@ begin
 
   inherited Destroy;
 end;
+
+const
+  // The FreeBASIC default 256-colour palette, in the engine's ABGR ($AABBGGRR) layout.
+  // ⛔ NOT TRANSCRIBED: dumped out of fbc itself with "Palette Get i, r, g, b" over 0..255 and packed
+  // by a script. A hand-copied table is right the day it is written and wrong the first time anybody
+  // mis-reads a digit - and there are 768 of them here.
+  // ⛔⛔ It is a SECOND table, not a replacement: the Commodore palette below stays exactly as it is,
+  // and the two never mix. MODERN gets this one, CLASSIC keeps its own.
+  FB_DEFAULT_PALETTE: array[0..255] of UInt32 = (
+    $FF000000, $FFAA0000, $FF00AA00, $FFAAAA00,
+    $FF0000AA, $FFAA00AA, $FF0055AA, $FFAAAAAA,
+    $FF555555, $FFFF5555, $FF55FF55, $FFFFFF55,
+    $FF5555FF, $FFFF55FF, $FF55FFFF, $FFFFFFFF,
+    $FF000000, $FF141414, $FF202020, $FF2C2C2C,
+    $FF383838, $FF444444, $FF505050, $FF616161,
+    $FF717171, $FF818181, $FF919191, $FFA1A1A1,
+    $FFB6B6B6, $FFCACACA, $FFE2E2E2, $FFFFFFFF,
+    $FFFF0000, $FFFF0040, $FFFF007D, $FFFF00BE,
+    $FFFF00FF, $FFBE00FF, $FF7D00FF, $FF4000FF,
+    $FF0000FF, $FF0040FF, $FF007DFF, $FF00BEFF,
+    $FF00FFFF, $FF00FFBE, $FF00FF7D, $FF00FF40,
+    $FF00FF00, $FF40FF00, $FF7DFF00, $FFBEFF00,
+    $FFFFFF00, $FFFFBE00, $FFFF7D00, $FFFF4000,
+    $FFFF7D7D, $FFFF7D9D, $FFFF7DBE, $FFFF7DDE,
+    $FFFF7DFF, $FFDE7DFF, $FFBE7DFF, $FF9D7DFF,
+    $FF7D7DFF, $FF7D9DFF, $FF7DBEFF, $FF7DDEFF,
+    $FF7DFFFF, $FF7DFFDE, $FF7DFFBE, $FF7DFF9D,
+    $FF7DFF7D, $FF9DFF7D, $FFBEFF7D, $FFDEFF7D,
+    $FFFFFF7D, $FFFFDE7D, $FFFFBE7D, $FFFF9D7D,
+    $FFFFB6B6, $FFFFB6C6, $FFFFB6DA, $FFFFB6EA,
+    $FFFFB6FF, $FFEAB6FF, $FFDAB6FF, $FFC6B6FF,
+    $FFB6B6FF, $FFB6C6FF, $FFB6DAFF, $FFB6EAFF,
+    $FFB6FFFF, $FFB6FFEA, $FFB6FFDA, $FFB6FFC6,
+    $FFB6FFB6, $FFC6FFB6, $FFDAFFB6, $FFEAFFB6,
+    $FFFFFFB6, $FFFFEAB6, $FFFFDAB6, $FFFFC6B6,
+    $FF710000, $FF71001C, $FF710038, $FF710055,
+    $FF710071, $FF550071, $FF380071, $FF1C0071,
+    $FF000071, $FF001C71, $FF003871, $FF005571,
+    $FF007171, $FF007155, $FF007138, $FF00711C,
+    $FF007100, $FF1C7100, $FF387100, $FF557100,
+    $FF717100, $FF715500, $FF713800, $FF711C00,
+    $FF713838, $FF713844, $FF713855, $FF713861,
+    $FF713871, $FF613871, $FF553871, $FF443871,
+    $FF383871, $FF384471, $FF385571, $FF386171,
+    $FF387171, $FF387161, $FF387155, $FF387144,
+    $FF387138, $FF447138, $FF557138, $FF617138,
+    $FF717138, $FF716138, $FF715538, $FF714438,
+    $FF715050, $FF715059, $FF715061, $FF715069,
+    $FF715071, $FF695071, $FF615071, $FF595071,
+    $FF505071, $FF505971, $FF506171, $FF506971,
+    $FF507171, $FF507169, $FF507161, $FF507159,
+    $FF507150, $FF597150, $FF617150, $FF697150,
+    $FF717150, $FF716950, $FF716150, $FF715950,
+    $FF400000, $FF400010, $FF400020, $FF400030,
+    $FF400040, $FF300040, $FF200040, $FF100040,
+    $FF000040, $FF001040, $FF002040, $FF003040,
+    $FF004040, $FF004030, $FF004020, $FF004010,
+    $FF004000, $FF104000, $FF204000, $FF304000,
+    $FF404000, $FF403000, $FF402000, $FF401000,
+    $FF402020, $FF402028, $FF402030, $FF402038,
+    $FF402040, $FF382040, $FF302040, $FF282040,
+    $FF202040, $FF202840, $FF203040, $FF203840,
+    $FF204040, $FF204038, $FF204030, $FF204028,
+    $FF204020, $FF284020, $FF304020, $FF384020,
+    $FF404020, $FF403820, $FF403020, $FF402820,
+    $FF402C2C, $FF402C30, $FF402C34, $FF402C3C,
+    $FF402C40, $FF3C2C40, $FF342C40, $FF302C40,
+    $FF2C2C40, $FF2C3040, $FF2C3440, $FF2C3C40,
+    $FF2C4040, $FF2C403C, $FF2C4034, $FF2C4030,
+    $FF2C402C, $FF30402C, $FF34402C, $FF3C402C,
+    $FF40402C, $FF403C2C, $FF40342C, $FF40302C,
+    $FF000000, $FF000000, $FF000000, $FF000000,
+    $FF000000, $FF000000, $FF000000, $FF000000
+  );
 
 procedure TGraphicsMemory.InitC64Palette;
 var
@@ -742,10 +818,26 @@ begin
   end;
 end;
 
+procedure TGraphicsMemory.LoadFBDefaultPalette;
+// Install FreeBASIC's default 256-colour palette, and make it what PALETTE (no args) resets TO.
+// Called from the FreeBASIC screen path (SCREENRES / SCREEN n); the C128 modes never reach it, so
+// CLASSIC keeps the Commodore palette and its reset.
+begin
+  Move(FB_DEFAULT_PALETTE[0], FPalette[0], 256 * SizeOf(UInt32));
+  FPaletteIsFB := True;
+end;
+
 procedure TGraphicsMemory.ResetPalette;
 var
   i: Integer;
 begin
+  // ⛔ Resets to whichever default this screen was opened with. A single reset that always restored
+  // the Commodore table made "PALETTE" inside a FreeBASIC program hand back C64 colours.
+  if FPaletteIsFB then
+  begin
+    Move(FB_DEFAULT_PALETTE[0], FPalette[0], 256 * SizeOf(UInt32));
+    Exit;
+  end;
   // Complete reset: C64 in first 16, then repetition
   Move(FDefaultC64Palette[0], FPalette[0], 16 * SizeOf(UInt32));
 
