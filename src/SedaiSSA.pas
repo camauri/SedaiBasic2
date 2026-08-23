@@ -12712,7 +12712,7 @@ var
   XV, YV, RV, CV, XR, YR, RR, CR, PenX, PenY: TSSAValue;
   AspV, StartV, EndV, RadF, AspF, RYf, RYr, StF, EndF, StDegF, EnDegF, StDeg, EnDeg: TSSAValue;
   Instr: TSSAInstruction;
-  HasArc, HasAspect, HasTarget: Boolean;
+  HasArc, HasAspect, HasTarget, HasFill: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
@@ -12734,7 +12734,13 @@ begin
   HasAspect := Node.Attributes.Values['HASASPECT'] = '1';
   HasTarget := EmitDrawTargetBegin(Node);
 
-  if not HasArc and not HasAspect then
+  // ⛔ The F flag was PARSED AND DROPPED - "no filled-ellipse primitive", said the parser comment, and
+  // 12 manual examples drew an outline where fbc draws a disc (the whole PUT family builds its source
+  // image with one). A filled circle takes the ellipse path even with no arc and no aspect, because
+  // that is the only opcode that carries the two radii.
+  HasFill := Node.Attributes.Values['FILL'] = '1';
+
+  if not HasArc and not HasAspect and not HasFill then
   begin
     // Plain circle: the original, well-tested path (RX = RY = r, full 360°).
     EmitInstruction(ssaGfxCircle, MakeSSAValue(svkNone), XR, YR, RR);
@@ -12779,7 +12785,11 @@ begin
   end;
 
   // ssaGfxCircleEx: Src1=x, Src2=y, Src3=RX; PhiSources[0]=RY, [1]=colour, [2]=start°, [3]=end°.
-  EmitInstruction(ssaGfxCircleEx, MakeSSAValue(svkNone), XR, YR, RR);
+  // ssaGfxCircleExF is the SAME operands, filled - a separate opcode because that Immediate is full.
+  if HasFill then
+    EmitInstruction(ssaGfxCircleExF, MakeSSAValue(svkNone), XR, YR, RR)
+  else
+    EmitInstruction(ssaGfxCircleEx, MakeSSAValue(svkNone), XR, YR, RR);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(RYr, nil);
   Instr.AddPhiSource(CR, nil);

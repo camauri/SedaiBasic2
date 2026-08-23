@@ -93,6 +93,16 @@ procedure DrawCircleToMemory(Memory: TGraphicsMemory;
   LineWidth: Integer;
   ViewWidth, ViewHeight: Integer);
 
+{ CIRCLE ... , F : the SOLID interior of an ellipse, one horizontal span per row.
+  Deliberately NOT a flood fill from the centre: the outline above is an angle-stepped polyline, so a
+  thin ellipse leaves diagonal gaps a 4-way fill leaks through, and a fill that depends on the outline
+  being watertight fails exactly where the shape is hardest to see. A span per row cannot leak. }
+procedure FillEllipseToMemory(Memory: TGraphicsMemory;
+  CX, CY, RadiusX, RadiusY: Integer;
+  Color: UInt32;
+  UseIndex: Boolean;
+  ViewWidth, ViewHeight: Integer);
+
 { Helper: Set a single pixel with bounds checking }
 procedure SetPixelSafe(Memory: TGraphicsMemory;
   X, Y: Integer;
@@ -356,6 +366,33 @@ begin
       // Right edge
       DrawLineToMemory(Memory, MaxX, MinY, MaxX, MaxY, Color, UseIndex, LineWidth, ViewWidth, ViewHeight);
     end;
+  end;
+end;
+
+procedure FillEllipseToMemory(Memory: TGraphicsMemory;
+  CX, CY, RadiusX, RadiusY: Integer;
+  Color: UInt32;
+  UseIndex: Boolean;
+  ViewWidth, ViewHeight: Integer);
+var
+  DY, DX, X, Y: Integer;
+  T: Double;
+begin
+  if (Memory = nil) or (RadiusX < 0) or (RadiusY < 0) then Exit;
+  if RadiusY = 0 then
+  begin
+    for X := CX - RadiusX to CX + RadiusX do
+      SetPixelSafe(Memory, X, CY, Color, UseIndex, ViewWidth, ViewHeight);
+    Exit;
+  end;
+  for DY := -RadiusY to RadiusY do
+  begin
+    T := 1.0 - (DY * DY) / (Double(RadiusY) * RadiusY);
+    if T < 0 then T := 0;
+    DX := Round(RadiusX * Sqrt(T));
+    Y := CY + DY;
+    for X := CX - DX to CX + DX do
+      SetPixelSafe(Memory, X, Y, Color, UseIndex, ViewWidth, ViewHeight);
   end;
 end;
 

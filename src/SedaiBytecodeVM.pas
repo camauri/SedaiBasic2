@@ -14746,7 +14746,8 @@ begin
         Ctx.IntRegs[Instr.Dest] := FDrawPenY
       else
         Ctx.IntRegs[Instr.Dest] := FDrawPenX;
-    59: // bcGfxCircleEx - CIRCLE ellipse/arc. Src1=x, Src2=y, Dest=RX; Immediate [0-15]=RY, [16-31]=color,
+    59, 68: // bcGfxCircleEx / bcGfxCircleExF - CIRCLE ellipse/arc, outline or FILLED (sub-op 68).
+        // Src1=x, Src2=y, Dest=RX; Immediate [0-15]=RY, [16-31]=color,
         // [32-47]=start-angle-degrees, [48-63]=end-angle-degrees (all int regs). Angles are already in
         // degrees; RX/RY already carry the aspect ratio. Centre mapped and radii scaled by the WINDOW axes.
       if Assigned(FGraphics) then
@@ -14766,7 +14767,7 @@ begin
           UInt32(Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF]),
           Double(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]),   // start angle (degrees)
           Double(Ctx.IntRegs[(Instr.Immediate shr 48) and $FFFF]),   // end angle (degrees)
-          0.0, 0.0, 1);
+          0.0, 0.0, 1, SubOp = 68);                                  // sub-op 68 = the F flag
         FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];  // centre becomes the current point
       end;
     60: // bcGfxPaintBorder - PAINT (x,y),color,border : boundary flood fill (stops at the border colour).

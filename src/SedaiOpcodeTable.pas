@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 570 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr
+  OPCODE_LIST_COUNT = 571 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -122,7 +122,7 @@ const
     bcGfxScreenInfo, bcGfxScreenSet, bcGfxPCopy, bcGfxWindow, bcGfxPMap, bcGfxView,
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
     bcJoyBtn, bcJoyAxis, bcStick, bcStrig, bcGfxDrawGML, bcGfxPointCoord,
-    bcGfxCircleEx, bcGfxPaintBorder, bcGfxSetTarget, bcGfxLineStyled, bcGfxScreenPtr,
+    bcGfxCircleEx, bcGfxCircleExF, bcGfxPaintBorder, bcGfxSetTarget, bcGfxLineStyled, bcGfxScreenPtr,
     bcGfxScreenLock, bcGfxScreenUnlock, bcScnClr,
   bcGfxImageConvertRow, bcGfxDrawString, bcRegexCount, bcRegexReplace,
     bcSoundVol, bcSoundSound, bcSoundEnvelope, bcSoundTempo, bcSoundPlay, bcSoundFilter,
@@ -162,6 +162,11 @@ const
   // ⚠️ The five bit intrinsics (core subs 163..167) made group 0 five wider, which shifts EVERY base
   // below and DENSE_TOTAL by 5, in both branches. Nothing checks these at compile time -
   // `sb --verify-opcodes` is what says so.
+  // ⚠️ bcGfxCircleExF (graphics sub 68) made group 10 one wider on 23 Aug 2026: SOUND, BIGINT, SUPER
+  // and TOTAL each moved up by one, in BOTH branches. ⭐ The self-check earned its keep again - the
+  // new opcode compiled, disassembled and reached the VM's arm, and simply DID NOTHING, because the
+  // dense map had shifted under it. `--verify-opcodes` printed "sound=480/479 super=499/498 N=571/570"
+  // and that is the whole diagnosis.
   DENSE_CORE_BASE     = 0;    // group 0  (169 opcodes) -> dense 0..168
   DENSE_STRING_BASE   = 169;  // group 1  (50)          -> 168..217 (bcStrAscMid = sub 51)
   DENSE_MATH_BASE     = 221;  // group 2  (43)          -> 220..262
@@ -184,19 +189,19 @@ const
   // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
   // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
   // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
-  DENSE_GRAPHICS_BASE = 424;  // group 10 (68)
-  DENSE_SOUND_BASE    = 492;  // group 11 (6)
+  DENSE_GRAPHICS_BASE = 424;  // group 10 (69)
+  DENSE_SOUND_BASE    = 493;  // group 11 (6)
   // group 12 (bigint, 4 subs) sits between sound and super, so it shifts SUPER
   // and TOTAL by 4 in BOTH branches - and nothing checks that at compile time.
-  DENSE_BIGINT_BASE   = 498;  // group 12 (13)
-  DENSE_SUPER_BASE    = 511;  // group 200 (72 slots: DENSE 0..71)
-  DENSE_TOTAL         = 583;  // N (with web)
+  DENSE_BIGINT_BASE   = 499;  // group 12 (13)
+  DENSE_SUPER_BASE    = 512;  // group 200 (72 slots: DENSE 0..71)
+  DENSE_TOTAL         = 584;  // N (with web)
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 411;  // group 10 (68)
-  DENSE_SOUND_BASE    = 479;  // group 11 (6)
-  DENSE_BIGINT_BASE   = 485;  // group 12 (13)
-  DENSE_SUPER_BASE    = 498;  // group 200 (72 slots, no holes: DENSE 0..71)
-  DENSE_TOTAL         = 570;  // N
+  DENSE_GRAPHICS_BASE = 411;  // group 10 (69)
+  DENSE_SOUND_BASE    = 480;  // group 11 (6)
+  DENSE_BIGINT_BASE   = 486;  // group 12 (13)
+  DENSE_SUPER_BASE    = 499;  // group 200 (72 slots, no holes: DENSE 0..71)
+  DENSE_TOTAL         = 571;  // N
   {$ENDIF}
 
 var

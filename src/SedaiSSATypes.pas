@@ -387,6 +387,7 @@ type
     ssaGfxLine,        // LINE (x1,y1)-(x2,y2),color[,B|BF] (line / box outline / filled box)
     ssaGfxCircle,      // CIRCLE (x,y),r[,color] (circle via DrawEllipse)
     ssaGfxCircleEx,    // CIRCLE (x,y),r,c,start,end,aspect (ellipse / arc; Src3=RX, Immediate=RY|color|start°|end°)
+    ssaGfxCircleExF,   // ...and the same operands with the F flag: FILLED
     ssaGfxPaintBorder, // PAINT (x,y),color,border (boundary fill; Src1=x, Src2=y, Src3=color, PhiSources[0]=border)
     ssaGfxSetTarget,   // set/clear the per-statement image draw target (Src1=handle, Src3=active flag const)
     ssaGfxLineStyled,  // LINE with a style mask (Src1=x1, Src2=y1, Src3=x2, PhiSources y2|color|style|shape)
@@ -870,7 +871,7 @@ begin
     ssaStrAppendMapped,
     ssaGetBinStr, ssaStrInstr, ssaPrintFile, ssaSetColor,
     ssaGraphicBox, ssaGraphicCircle, ssaGraphicDraw, ssaGraphicGShape, ssaGraphicPaint,
-    ssaGraphicScale, ssaGraphicWindow, ssaGfxCircleEx, ssaGfxLineStyled,
+    ssaGraphicScale, ssaGraphicWindow, ssaGfxCircleEx, ssaGfxCircleExF, ssaGfxLineStyled,
     ssaMovsprAbs, ssaMovsprAuto, ssaMovsprPolar, ssaMovsprRel,
     ssaSprite, ssaSprsize, ssaSoundSound, ssaSoundFilter:
       Result := False;

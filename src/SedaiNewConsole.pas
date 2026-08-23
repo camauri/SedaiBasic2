@@ -335,7 +335,7 @@ type
     procedure GBDrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);
     procedure GBFillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
     procedure GBDrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
-    procedure GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+    procedure GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer; Filled: Boolean = False);
     procedure GBFill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     procedure GBSetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
     procedure GBBlit(Dst: TGfxSurface; X, Y: Integer; Src: TGfxSurface; Mode: TGfxBlitMode);
@@ -4028,8 +4028,12 @@ begin
   DrawBoxWithColor(X1, Y1, X2, Y2, Color, Angle, Filled);
 end;
 
-procedure TVideoController.GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+procedure TVideoController.GBDrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer; Filled: Boolean);
 begin
+  // CIRCLE ... , F on the console device: the interior first, then the outline the unfilled form draws.
+  if Filled and Assigned(FGraphicsMemory) then
+    FillEllipseToMemory(FGraphicsMemory, CX, CY, RX, RY, Color, False,
+                        FGraphicsMemory.State.Width, FGraphicsMemory.State.Height);
   DrawCircleWithColor(CX, CY, RX, RY, Color, StartAngle, EndAngle, RotationAngle, AngleStep);
 end;
 

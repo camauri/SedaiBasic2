@@ -71,7 +71,9 @@ type
     procedure DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
     procedure DrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);  // LINE ...,style (dashed)
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
-    procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+    // Filled = CIRCLE ... , F : the interior is painted before the outline, so the outline stays
+    // exactly the one the unfilled form draws. A default, so no existing call site changes.
+    procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer; Filled: Boolean = False);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);   // flood fill (PAINT)
     procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);  // boundary fill (PAINT ...,border)
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);  // VIEW clip rect
@@ -136,7 +138,9 @@ type
     procedure DrawLine(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; LineWidth: Integer);
     procedure DrawLineStyled(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Style: Word);  // LINE ...,style (dashed)
     procedure DrawRect(Surface: TGfxSurface; X1, Y1, X2, Y2: Integer; Color: TGfxColor; Filled: Boolean; LineWidth: Integer; Angle: Double);
-    procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+    // Filled = CIRCLE ... , F : the interior is painted before the outline, so the outline stays
+    // exactly the one the unfilled form draws. A default, so no existing call site changes.
+    procedure DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer; Filled: Boolean = False);
     procedure Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     procedure FillBorder(Surface: TGfxSurface; X, Y: Integer; Color, BorderColor: TGfxColor);
     procedure SetClip(Surface: TGfxSurface; Active: Boolean; X1, Y1, X2, Y2: Integer);
@@ -439,12 +443,14 @@ begin
     DrawBoxToMemory(M, X1, Y1, X2, Y2, Color, False, Filled, LineWidth, Angle, M.State.Width, M.State.Height);
 end;
 
-procedure TSoftwareGraphicsBackend.DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer);
+procedure TSoftwareGraphicsBackend.DrawEllipse(Surface: TGfxSurface; CX, CY, RX, RY: Integer; Color: TGfxColor; StartAngle, EndAngle, RotationAngle, AngleStep: Double; LineWidth: Integer; Filled: Boolean);
 var M: TGraphicsMemory;
 begin
   M := MemoryOf(Surface);
-  if Assigned(M) then
-    DrawCircleToMemory(M, CX, CY, RX, RY, Color, False, StartAngle, EndAngle, RotationAngle, AngleStep, LineWidth, M.State.Width, M.State.Height);
+  if not Assigned(M) then Exit;
+  if Filled then
+    FillEllipseToMemory(M, CX, CY, RX, RY, Color, False, M.State.Width, M.State.Height);
+  DrawCircleToMemory(M, CX, CY, RX, RY, Color, False, StartAngle, EndAngle, RotationAngle, AngleStep, LineWidth, M.State.Width, M.State.Height);
 end;
 
 procedure TSoftwareGraphicsBackend.Fill(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
