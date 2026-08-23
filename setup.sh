@@ -222,6 +222,25 @@ if [[ "$DO_DEPS" == "true" ]]; then
         MISSING+=("$(dep_pkg sdl2ttf-dev "$PM")"); MISSING_WHY+=("the text renderer SDL2 draws characters with")
     fi
 
+    # ⭐ ALSA is for MIDI INPUT and is opened with dlopen, so it is genuinely optional: without it
+    # MIDI input is unavailable and nothing else changes. Nothing links against it.
+    if [[ -n "$(dep_pkg alsa "$PM")" ]]; then
+        if have_shared_lib alsa libasound.so.2 || [[ -n "$(ldconfig -p 2>/dev/null | grep -m1 libasound.so.2)" ]]; then
+            show_status "ALSA (MIDI input)" "Success"
+        else
+            MISSING+=("$(dep_pkg alsa "$PM")"); MISSING_WHY+=("MIDI input (optional; opened at run time)")
+        fi
+    fi
+
+    # The two tools this script itself needs to fetch and unpack the Pascal bindings.
+    for tool in curl unzip; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            show_status "$tool" "Success"
+        else
+            MISSING+=("$(dep_pkg "$tool" "$PM")"); MISSING_WHY+=("needed to download and unpack the SDL2 Pascal bindings")
+        fi
+    done
+
     echo ""
     if [[ ${#MISSING[@]} -gt 0 ]]; then
         echo -e "${YELLOW}  Missing:${NC}"
@@ -259,6 +278,49 @@ if [[ "$DO_DEPS" == "true" ]]; then
         show_status "dependencies installed" "Success"
     else
         show_status "everything needed is already installed" "Success"
+    fi
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
+#  SDL2 Pascal bindings
+# ---------------------------------------------------------------------------
+# ⛔ THEY ARE NOT IN THE REPOSITORY. deps/ is gitignored, so a fresh clone has no bindings and sbv
+# does not compile - on Linux nobody was fetching them at all, which is a hole this script existed
+# to close and did not.
+# ⭐ The archive is PLATFORM INDEPENDENT: 52 text files with every platform difference behind an
+# {$IFDEF}, so this is the very same file, and the very same hash, the Windows installer uses.
+if [[ "$DO_DEPS" == "true" ]]; then
+    echo -e "${CYAN}  SDL2 Pascal bindings${NC}"
+    echo ""
+    if [[ -f "$SCRIPT_DIR/deps/sdl2/sdl2.pas" ]]; then
+        show_status "already present: deps/sdl2" "Success"
+    else
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        show_status "downloading v$SDL2_BINDINGS_VERSION..." "Info"
+        if ! curl -sSL --fail -o "$tmp/sdl2.zip" "$SDL2_BINDINGS_URL"; then
+            show_status "download failed: $SDL2_BINDINGS_URL" "Error"
+            exit 1
+        fi
+        got="$(sha256sum "$tmp/sdl2.zip" | cut -d' ' -f1)"
+        if [[ "$got" != "$SDL2_BINDINGS_SHA256" ]]; then
+            show_status "checksum mismatch, the download is not what we expect" "Error"
+            show_status "expected $SDL2_BINDINGS_SHA256" "Info"
+            show_status "got      $got" "Info"
+            exit 1
+        fi
+        mkdir -p "$SCRIPT_DIR/deps"
+        if ! unzip -q -o "$tmp/sdl2.zip" -d "$SCRIPT_DIR/deps"; then
+            show_status "could not unpack the archive" "Error"
+            exit 1
+        fi
+        if [[ -f "$SCRIPT_DIR/deps/sdl2/sdl2.pas" ]]; then
+            show_status "installed: deps/sdl2" "Success"
+        else
+            show_status "unpacked, but deps/sdl2/sdl2.pas is not there" "Error"
+            exit 1
+        fi
     fi
     echo ""
 fi
