@@ -271,6 +271,12 @@ type
   read together. }
 function ExactStrToDouble(const S: string): Double;
 
+{ A Double formatted the way PRINT formats it in the FreeBASIC dialect. Exported because the
+  PREPROCESSOR needs it too: "#print __FB_EVAL__( 4 * Atn(1) )" echoes the folded value, and it has
+  to be the same text PRINT would produce - two spellings of one number is exactly the kind of drift
+  this file exists to prevent. }
+function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
+
 implementation
 
 uses Math;

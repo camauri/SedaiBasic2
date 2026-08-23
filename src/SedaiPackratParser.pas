@@ -3605,7 +3605,7 @@ function TPackratParser.ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean =
 var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum: TASTNode;
-  PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur: Integer;
+  PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   IsStaticField, LeadingType, FpIsFP: Boolean;
@@ -3914,6 +3914,18 @@ begin
     begin
       FieldTok := Context.CurrentToken;
       Context.Advance;                              // field name
+      // FreeBASIC BIT FIELD: "name : <bits> As <type>". The ':' is the statement separator token
+      // everywhere else, which is why this has to be recognised HERE, right after the member's name and
+      // before anything treats it as the end of a statement - a member declared that way otherwise fell
+      // apart into two fragments and the type came out with the wrong members entirely.
+      BitWidth := 0;
+      if Context.Check(ttSeparStmt) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+      begin
+        Context.Advance;                            // ':'
+        BitWidth := StrToIntDef(Context.CurrentToken.Value, 0);
+        Context.Advance;                            // the bit count
+      end;
       // Array member "name(dims)" — the dimension list may appear before the AS (name-first) or after
       // the name (As-first). Only the dimension COUNT is kept; REDIM (or the declared bounds) sizes it.
       if Context.Check(ttDelimParOpen) then
@@ -3960,6 +3972,7 @@ begin
         FieldNode.Attributes.Values['FPRET'] := FpRet;
       end;
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
+      if BitWidth > 0 then FieldNode.Attributes.Values['BITWIDTH'] := IntToStr(BitWidth);
       // "As String * n": the declared capacity. Storage stays variable-length (advisory), but the
       // BINARY layout needs it — fbc gives such a field n+1 bytes on file (the NUL terminator).
       if FLastFieldFixedLen > 0 then
@@ -6377,7 +6390,7 @@ function TPackratParser.ParseFileOperationStatement: TASTNode;
 var
   Token: TLexerToken;
   Param, HandleNode, LenExpr: TASTNode;
-  CmdName, ModeStr, MW: string;
+  CmdName, ModeStr, MW, EncStr: string;
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
   C64CommaPos: Integer;
@@ -6570,12 +6583,24 @@ begin
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
-    // Optional "ENCODING <string>" clause (FreeBASIC text encoding): accepted; v1 treats file text as an
-    // ASCII/UTF-8 byte passthrough (utf16/utf32 re-encoding of file I/O is not applied).
+    // Optional "ENCODING <string>" clause (FreeBASIC text encoding). The width travels on the MODE
+    // string as a trailing "~<bits>" - the same way "ACCESS READ" travels as '<' - so nothing between
+    // here and the file layer had to learn a new parameter. "ascii"/"utf8" need no marker: our strings
+    // are already UTF-8 bytes and that is what the file gets.
     if UpperCase(Context.CurrentToken.Value) = kENCODING then
     begin
       Context.Advance;            // ENCODING
-      if Context.Check(ttStringLiteral) then Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+      if Context.Check(ttStringLiteral) then
+      begin
+        EncStr := UpperCase(StringReplace(StringReplace(VarToStr(Context.CurrentToken.Value),
+                                                        '-', '', [rfReplaceAll]), '_', '', [rfReplaceAll]));
+        if (EncStr = 'UTF16') or (EncStr = 'UTF16LE') then ModeStr := ModeStr + '~16'
+        else if EncStr = 'UTF32' then ModeStr := ModeStr + '~32'
+        // "utf8" needs no CONVERSION - our strings are already UTF-8 bytes - but it is not the same as
+        // no clause at all: fbc still writes the byte-order mark EF BB BF. So it gets a marker too.
+        else if (EncStr = 'UTF8') then ModeStr := ModeStr + '~8';
+        Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+      end;
     end;
     // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC). Only READ-alone changes anything
     // we model: it makes the open READ-ONLY, so a MISSING file is an error where a plain "For Binary"

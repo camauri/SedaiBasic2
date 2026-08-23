@@ -22,7 +22,7 @@ unit SedaiPreprocessor;
 
 interface
 
-uses SysUtils;
+uses SysUtils, Math, SedaiConsoleBehavior;
 
 type
   // Raised by #error / a failed #assert. Callers catch it to report a clean compile-time
@@ -333,6 +333,253 @@ begin
       i := j;
     end
     else begin Result := Result + Body[i]; Inc(i); end;
+  end;
+end;
+
+var
+  PPFloatFmt: TFormatSettings;   // '.' as the decimal separator, whatever the locale says
+
+function IsPPMathFn(const N: string): Boolean;
+// The maths functions __FB_EVAL__ folds. fbc folds its whole constant-expression set; this is the
+// portion a preprocessor can answer with no symbol table, and the manual's own example needs Atn.
+begin
+  Result := (N = 'ATN') or (N = 'SIN') or (N = 'COS') or (N = 'TAN') or (N = 'ASIN') or
+            (N = 'ACOS') or (N = 'EXP') or (N = 'LOG') or (N = 'SQR') or (N = 'ABS') or
+            (N = 'INT') or (N = 'FIX') or (N = 'SGN');
+end;
+
+function ApplyPPMathFn(const N: string; A: Double): Double;
+begin
+  if N = 'ATN' then Result := ArcTan(A)
+  else if N = 'SIN' then Result := Sin(A)
+  else if N = 'COS' then Result := Cos(A)
+  else if N = 'TAN' then Result := Tan(A)
+  else if N = 'ASIN' then Result := ArcSin(A)
+  else if N = 'ACOS' then Result := ArcCos(A)
+  else if N = 'EXP' then Result := Exp(A)
+  else if N = 'LOG' then begin if A > 0 then Result := Ln(A) else Result := 0; end
+  else if N = 'SQR' then begin if A >= 0 then Result := Sqrt(A) else Result := 0; end
+  else if N = 'ABS' then Result := Abs(A)
+  else if N = 'INT' then Result := Floor(A)
+  else if N = 'FIX' then Result := Trunc(A)
+  else if N = 'SGN' then begin if A > 0 then Result := 1 else if A < 0 then Result := -1 else Result := 0; end
+  else Result := A;
+end;
+
+function EvalPPExprFloat(const RawExpr: string; Defs: TStringList; out V: Double): Boolean;
+// __FB_EVAL__ over a constant FLOAT expression, intrinsics included: "4 * Atn(1)" is 3.141592653589793
+// and not the text "4 * Atn(1)". The integer evaluator above is tried FIRST and answers whenever the
+// expression is integral, so this one exists for exactly the cases it cannot take: a division that does
+// not divide, a literal with a point, a call to one of the maths functions.
+//
+// ⛔ Deliberately a SECOND evaluator rather than a widening of the first. The integer one is what
+// __FB_ARG_EXTRACT__ asks for an INDEX, and what "#if" asks for a condition; giving those a Double and
+// rounding back would turn an exact answer into a rounded one for no gain. They are separate questions
+// and they get separate answers.
+var
+  Toks: TStringList;
+  TPos: Integer;
+
+  procedure Tokenize(const S: string; Depth: Integer);
+  var p, q: Integer; id, two: string;
+  begin
+    p := 1;
+    while p <= Length(S) do
+    begin
+      if S[p] in [' ', #9] then begin Inc(p); Continue; end;
+      if p < Length(S) then
+      begin
+        two := Copy(S, p, 2);
+        if (two = '<=') or (two = '>=') or (two = '<>') then begin Toks.Add(two); Inc(p, 2); Continue; end;
+      end;
+      if S[p] in ['=', '<', '>', '(', ')', ',', '+', '-', '*', '/', '\', '^'] then
+      begin Toks.Add(S[p]); Inc(p); Continue; end;
+      if (S[p] in ['0'..'9']) or ((S[p] = '.') and (p < Length(S)) and (S[p + 1] in ['0'..'9'])) then
+      begin
+        q := p;
+        while (q <= Length(S)) and (S[q] in ['0'..'9', '.']) do Inc(q);
+        // an exponent, and its sign
+        if (q <= Length(S)) and (UpCase(S[q]) in ['E', 'D']) then
+        begin
+          Inc(q);
+          if (q <= Length(S)) and (S[q] in ['+', '-']) then Inc(q);
+          while (q <= Length(S)) and (S[q] in ['0'..'9']) do Inc(q);
+        end;
+        Toks.Add(Copy(S, p, q - p)); p := q; Continue;
+      end;
+      if IsIdentChar(S[p]) then
+      begin
+        q := p;
+        while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
+        id := UpperCase(Copy(S, p, q - p)); p := q;
+        if (id = 'MOD') or (id = 'SHL') or (id = 'SHR') or IsPPMathFn(id) then Toks.Add(id)
+        else if Defs.IndexOfName(id) >= 0 then
+        begin
+          if Depth < 32 then Tokenize(Trim(Defs.Values[id]), Depth + 1) else Toks.Add('0');
+        end
+        else
+          Toks.Add('?');                 // an unknown identifier: this is not a constant expression
+        Continue;
+      end;
+      Toks.Add('?'); Inc(p);             // anything else: not foldable
+    end;
+  end;
+
+  function Peek: string;
+  begin if TPos < Toks.Count then Result := Toks[TPos] else Result := ''; end;
+
+  function ParseSum: Double; forward;
+
+  function ParseUnary: Double;
+  var t: string; a: Double;
+  begin
+    Result := 0;
+    t := Peek;
+    if t = '(' then begin Inc(TPos); Result := ParseSum; if Peek = ')' then Inc(TPos); end
+    else if t = '-' then begin Inc(TPos); Result := -ParseUnary(); end
+    else if t = '+' then begin Inc(TPos); Result := ParseUnary(); end
+    else if IsPPMathFn(t) then
+    begin
+      Inc(TPos);
+      if Peek = '(' then Inc(TPos);
+      a := ParseSum;
+      if Peek = ')' then Inc(TPos);
+      Result := ApplyPPMathFn(t, a);
+    end
+    else if (t <> '') and (t[1] in ['0'..'9', '.']) then
+    begin Result := StrToFloatDef(t, 0, PPFloatFmt); Inc(TPos); end
+    else
+      Inc(TPos);                          // '?' and friends: consumed, and the caller has already failed
+  end;
+
+  function ParsePow: Double;
+  var r: Double;
+  begin
+    Result := ParseUnary;
+    while Peek = '^' do begin Inc(TPos); r := ParseUnary; Result := Power(Result, r); end;
+  end;
+
+  function ParseProd: Double;
+  var op: string; r: Double;
+  begin
+    Result := ParsePow;
+    while (Peek = '*') or (Peek = '/') or (Peek = '\') or (Peek = 'MOD') do
+    begin
+      op := Peek; Inc(TPos); r := ParsePow;
+      if op = '*' then Result := Result * r
+      else if r = 0 then Result := 0
+      else if op = '/' then Result := Result / r
+      else if op = '\' then Result := Trunc(Result) div Trunc(r)
+      else Result := Trunc(Result) mod Trunc(r);
+    end;
+  end;
+
+  function ParseSum: Double;
+  var op: string; r: Double;
+  begin
+    Result := ParseProd;
+    while (Peek = '+') or (Peek = '-') do
+    begin op := Peek; Inc(TPos); r := ParseProd; if op = '+' then Result := Result + r else Result := Result - r; end;
+  end;
+
+var
+  i: Integer;
+begin
+  Result := False;
+  V := 0;
+  Toks := TStringList.Create;
+  try
+    Tokenize(RawExpr, 0);
+    if Toks.Count = 0 then Exit;
+    for i := 0 to Toks.Count - 1 do
+      if Toks[i] = '?' then Exit;         // something in there is not a constant: leave the text alone
+    TPos := 0;
+    V := ParseSum;
+    Result := TPos >= Toks.Count;         // every token consumed, or it was not an expression
+  finally
+    Toks.Free;
+  end;
+end;
+
+function PPConstStrFold(const S: string; Defs: TStringList; out Res: string): Boolean;
+// A constant STRING expression: a chain of string literals and string-valued macros joined by '+' or
+// '&'. Answers the folded text as a LITERAL (quotes included), so it can be substituted where the
+// expression stood. fbc's __FB_EVAL__ folds these too, and the manual's own defines/fbeval2 builds a
+// "#define ..." line out of them - without the fold the directive was assembled at the wrong time and
+// carried the source text of its parts.
+var
+  i, j: Integer;
+  Part, W: string;
+  WantOp: Boolean;
+begin
+  Result := False;
+  Res := '';
+  WantOp := False;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if S[i] in [' ', #9] then begin Inc(i); Continue; end;
+    if WantOp then
+    begin
+      if (S[i] <> '+') and (S[i] <> '&') then Exit;   // not a pure concatenation
+      WantOp := False; Inc(i); Continue;
+    end;
+    if (S[i] = '"') or (((S[i] = '$') or (S[i] = '!')) and (i < Length(S)) and (S[i + 1] = '"')) then
+    begin
+      j := i; if S[j] <> '"' then Inc(j);
+      Inc(j);                                          // past the opening quote
+      Part := '';
+      while j <= Length(S) do
+      begin
+        if S[j] = '"' then
+        begin
+          if (j < Length(S)) and (S[j + 1] = '"') then begin Part := Part + '"'; Inc(j, 2); Continue; end;
+          Inc(j); Break;
+        end;
+        Part := Part + S[j]; Inc(j);
+      end;
+      Res := Res + Part; i := j; WantOp := True; Continue;
+    end;
+    if S[i] in ['A'..'Z', 'a'..'z', '_'] then
+    begin
+      j := i;
+      while (j <= Length(S)) and IsIdentChar(S[j]) do Inc(j);
+      W := UpperCase(Copy(S, i, j - i));
+      if Defs.IndexOfName(W) < 0 then Exit;            // an unknown name is not a constant
+      Part := Trim(Defs.Values[W]);
+      if not PPConstStrFold(Part, Defs, Part) then Exit;
+      Res := Res + Part; i := j; WantOp := True; Continue;
+    end;
+    Exit;                                              // anything else: not a string expression
+  end;
+  if not WantOp then Exit;                             // nothing was consumed, or it ended on a '+'
+  Res := '"' + StringReplace(Res, '"', '""', [rfReplaceAll]) + '"';
+  Result := True;
+end;
+
+function IsPPFloatExpr(const S: string): Boolean;
+// Does this constant expression have to be evaluated as a FLOAT? True when it holds a decimal point, a
+// '/' (fbc's '/' is float division - "10 / 4" is 2.5, and '\\' is the integer one), or a maths function.
+var
+  i, j: Integer;
+  W: string;
+begin
+  Result := False;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if S[i] = '/' then Exit(True);
+    if (S[i] = '.') and (i < Length(S)) and (S[i + 1] in ['0'..'9']) then Exit(True);
+    if S[i] in ['A'..'Z', 'a'..'z', '_'] then
+    begin
+      j := i;
+      while (j <= Length(S)) and IsIdentChar(S[j]) do Inc(j);
+      W := UpperCase(Copy(S, i, j - i));
+      if IsPPMathFn(W) then Exit(True);
+      i := j;
+      Continue;
+    end;
+    Inc(i);
   end;
 end;
 
@@ -691,6 +938,55 @@ begin
   end;
 end;
 
+function PPPrintMessage(const S: string): string;
+// The text a "#print" line echoes. MEASURED against fbc 1.10.1, six shapes:
+//   "#print A   B"        -> "A B"     the TOKENS, one space between them, not the verbatim text
+//   "#print C  "          -> "C "      trailing whitespace collapses to ONE space
+//   "#print D    '' tail" -> "D "      a comment ends the message, and leaves that one space behind
+//   "#print E"            -> "E"       nothing after the last token, nothing added
+//   "#print ""x  y"""     -> "x  y"    inside a string literal the spacing is the author's
+//
+// ⛔ THIS FILE USED TO SAY THE MESSAGE WAS THE REST OF THE LINE VERBATIM, "trailing blanks included",
+// and cited "#print Release mode " ending in a space. That example agrees with BOTH readings, which is
+// why it settled nothing: what separates them is a run of several spaces, or a comment. A guard written
+// with ordinary trailing comments on its own #print lines is what finally showed the difference.
+var
+  i: Integer;
+  Pending: Boolean;   // a whitespace run has been seen and not yet emitted
+begin
+  Result := '';
+  Pending := False;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    if S[i] in [' ', #9] then begin Pending := True; Inc(i); Continue; end;
+    if S[i] = '''' then                       // a comment ends the message, pending space and all
+    begin
+      if Pending then Result := Result + ' ';
+      Exit;
+    end;
+    if Pending then begin Result := Result + ' '; Pending := False; end;
+    if S[i] = '"' then                        // a string literal keeps the author's own spacing
+    begin
+      Result := Result + S[i]; Inc(i);
+      while i <= Length(S) do
+      begin
+        Result := Result + S[i];
+        if S[i] = '"' then
+        begin
+          if (i < Length(S)) and (S[i + 1] = '"') then begin Result := Result + '"'; Inc(i, 2); Continue; end;
+          Inc(i); Break;
+        end;
+        Inc(i);
+      end;
+      Continue;
+    end;
+    Result := Result + S[i];
+    Inc(i);
+  end;
+  if Pending then Result := Result + ' ';
+end;
+
 function UnquotePPMessage(const S: string): string;
 // A "#print" message that is EXACTLY one string literal prints as its content: fbc shows
 //   #print "quoted"      -> quoted
@@ -699,14 +995,24 @@ function UnquotePPMessage(const S: string): string;
 // word, a literal with something after it, an unterminated quote - is echoed verbatim, because then
 // the quotes are part of what the author wrote rather than a wrapper the expansion put on.
 // Escaped quotes inside are left alone: fbc does not process escapes here either.
+//
+// ⚠️ The SURROUNDING whitespace is kept: only the two quote characters go. Trimming it away as well
+// cost the trailing space fbc leaves where a comment followed the literal - the message is built by
+// PPPrintMessage, which has already decided what whitespace belongs there.
 var
   T: string;
+  L, R: Integer;
 begin
   Result := S;
   T := Trim(S);
   if (Length(T) >= 2) and (T[1] = '"') and (T[Length(T)] = '"') and
      (Pos('"', Copy(T, 2, Length(T) - 2)) = 0) then
-    Result := Copy(T, 2, Length(T) - 2);
+  begin
+    L := Pos('"', S);
+    R := Length(S);
+    while (R > 0) and (S[R] <> '"') do Dec(R);
+    Result := Copy(S, 1, L - 1) + Copy(S, L + 1, R - L - 1) + Copy(S, R + 1, MaxInt);
+  end;
 end;
 
 // Parse a "#name rest" directive line: returns the lowercase directive name and the trimmed rest.
@@ -1195,18 +1501,25 @@ begin
 end;
 
 function PPConstIntStr(const Expr: string; Defs: TStringList): string;
-// The value of a constant INTEGER expression as text, or the expression unchanged when it is not one.
+// The value of a constant expression as text, or the expression unchanged when it is not one. This is
+// what __FB_EVAL__ substitutes, and fbc folds integers, floats WITH the maths intrinsics, and strings -
+// all three are here now. (This comment used to end "we fold integers, and say so by not pretending";
+// the honesty was right and the limit is gone.)
 //
-// "Not one" has to be tested up front: the expression tokenizer resolves an unknown identifier to 0, so
-// asking it to evaluate "4 * Atn(1)" would answer 0 - a wrong VALUE where the honest answer is "I do not
-// fold this". So an identifier that is not a known macro means: leave the text alone. (fbc's own
-// __FB_EVAL__ does fold floats and intrinsics; we fold integers, and say so by not pretending.)
+// "Not a constant expression" has to be tested up front for the NUMERIC forms: the tokenizer resolves an
+// unknown identifier to 0, so asking it to evaluate "4 * Atn(1)" before Atn was known would answer 0 - a
+// wrong VALUE where the honest answer is "I do not fold this".
 var
   V: Int64;
+  F: Double;
   i, j: Integer;
   W: string;
 begin
   Result := Trim(Expr);
+  // ⛔ THE STRING FOLD COMES FIRST, before the identifier scan below - that scan walks the WHOLE text,
+  // quoted parts included, so the letters inside "a" + "b" looked like unknown macros and refused the
+  // expression before anything could fold it.
+  if (Pos('"', Expr) > 0) and PPConstStrFold(Expr, Defs, W) then Exit(W);
   i := 1;
   while i <= Length(Expr) do
     if Expr[i] in ['A'..'Z', 'a'..'z', '_'] then
@@ -1215,11 +1528,21 @@ begin
       while (j <= Length(Expr)) and IsIdentChar(Expr[j]) do Inc(j);
       W := UpperCase(Copy(Expr, i, j - i));
       if (W <> 'MOD') and (W <> 'AND') and (W <> 'OR') and (W <> 'NOT') and
-         (W <> 'SHL') and (W <> 'SHR') and (Defs.IndexOfName(W) < 0) then Exit;
+         (W <> 'SHL') and (W <> 'SHR') and (not IsPPMathFn(W)) and (Defs.IndexOfName(W) < 0) then Exit;
       i := j;
     end
     else
       Inc(i);
+  // ⛔ WHICH EVALUATOR ANSWERS IS DECIDED BY THE TEXT, not by trying one and falling through. The
+  // integer one always ANSWERS - "10 / 4" is 2 to it and "4 * Atn(1)" is 0, Atn being an unknown name -
+  // so asking it first meant it always won and the float one was never reached. A '.' , a '/' or a
+  // maths function makes the expression a FLOAT expression; anything else stays integer, which keeps a
+  // big literal exact (a Double cannot hold every Int64) and keeps __FB_ARG_EXTRACT__'s index whole.
+  if IsPPFloatExpr(Expr) then
+  begin
+    if EvalPPExprFloat(Expr, Defs, F) then Result := FormatDoubleFB(F, 16);
+    Exit;
+  end;
   if EvalPPExprInt(Expr, Defs, V) then Result := IntToStr(V);
 end;
 
@@ -1772,15 +2095,15 @@ var
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
           end
           else if (DName = 'print') and Emitting then
-            // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. The message is
-            // the rest of the line VERBATIM, trailing blanks included: fbc echoes exactly what was
-            // written, and "#print Release mode " really does end in a space.
+            // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. What exactly gets
+            // echoed is PPPrintMessage's business: the TOKENS with one space between them, a comment
+            // ending the line. (This used to be done here, as "the rest of the line verbatim".)
             // ...but when what is left after expansion is a single STRING LITERAL, fbc prints its
             // CONTENT, not the quotes. That is what makes "#print #arg" - the standard way to see what
             // a macro argument expanded to - readable: stringizing adds the quotes, and #print takes
             // them back off. We echoed them, so every such line differed from fbc by two characters.
-            WriteLn(StdErr, UnquotePPMessage(SubstituteMacros(TrimRight(DRest) +
-                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0)))
+            WriteLn(StdErr, UnquotePPMessage(PPPrintMessage(SubstituteMacros(TrimRight(DRest) +
+                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0))))
           else if (DName = 'cmdline') and Emitting then
           begin
             // #cmdline "opts" - fbc appends the quoted text to its own command line. Almost none of
@@ -1905,5 +2228,12 @@ begin
     Output.Free;
   end;
 end;
+
+
+initialization
+  // A constant expression's decimal point is a '.', whatever the machine's locale calls it: the SOURCE
+  // says '.', and StrToFloat would otherwise read "1.5" as 15 on a comma-decimal locale.
+  PPFloatFmt := DefaultFormatSettings;
+  PPFloatFmt.DecimalSeparator := '.';
 
 end.

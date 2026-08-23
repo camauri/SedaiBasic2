@@ -227,6 +227,9 @@ type
     // go on a first-fit free list. VM-managed (not OS addresses) → memory-safe and portable. Guarded by
     // FRawHeapLock for cross-thread Allocate/Free.
     FRawHeap: array of Byte;
+    // Managed STRING cells: a "String Ptr" points at a 24-byte cell holding an INDEX into this, the
+    // way FreeBASIC's String is a descriptor whose characters live elsewhere. Slot 0 is ''.
+    FRawStrCells: array of string;
     FRawHeapTop: PtrUInt;                       // bump pointer (next free byte)
     FRawFreeOfs: array of PtrUInt;              // free-list block data offsets
     FRawFreeSz: array of PtrUInt;               // matching block payload sizes
@@ -701,6 +704,8 @@ type
     function RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;      // C string at the raw address, up to NUL
     function RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;    // exactly Count bytes at the raw address
     procedure RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);  // chars + NUL at the raw address
+    function RawStrCellGet(RawPtr: Int64): string;                             // managed String cell at a raw address
+    procedure RawStrCellSet(RawPtr: Int64; const S: string);                   // ...and writing one
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
     procedure RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes on the raw heap
@@ -5215,6 +5220,18 @@ begin
     Result := Result or faArchive;
 end;
 
+function DirTranslateSpec(const Spec: string): string;
+// FreeBASIC's DIR keeps the DOS reading of "*.*": it means EVERY entry, dotted or not. On Unix the
+// pattern reaches fnmatch, where "*.*" demands a literal dot, so a directory named "sub" was missing
+// from a listing fbc includes. Measured: fbc on Linux lists "sub" for "*.*".
+begin
+  if Spec = '*.*' then Result := '*'
+  else if (Length(Spec) >= 4) and (Copy(Spec, Length(Spec) - 3, 4) = '/*.*') then
+    Result := Copy(Spec, 1, Length(Spec) - 3) + '*'
+  else
+    Result := Spec;
+end;
+
 function DirEntryAttrs(const Rec: TSearchRec): Integer;
 // The attributes of ONE entry, in FreeBASIC's spelling rather than the platform's.
 //
@@ -5232,27 +5249,33 @@ function DirEntryAttrs(const Rec: TSearchRec): Integer;
 // without translating it.
 begin
   Result := Rec.Attr;
+  {$IFDEF UNIX}
+  // A leading dot IS the hidden attribute on Unix, and that is how fbc reports it: ".hidden.txt" is
+  // 34 (archive|hidden), "." and ".." are 18 (directory|hidden). FPC's FindFirst marks the ordinary
+  // dotfiles but not "." and "..", so the two dot entries came back as plain directories - and the
+  // MASK then let them through where fbc excludes them, which is the whole reason a fbDirectory-only
+  // walk looked as if fbc dropped them.
+  if (Rec.Name <> '') and (Rec.Name[1] = '.') then Result := Result or faHidden;
+  {$ENDIF}
   if (Result and faDirectory) <> 0 then
     Result := Result and not faArchive;
 end;
 
 function DirEntrySkipped(const Rec: TSearchRec): Boolean;
-// "." and ".." are not returned by DIR on Unix: MEASURED against fbc 1.10.1 on Linux,
-// which lists only "sub" for a directory holding "sub", "." and "..". FPC's FindFirst
-// yields them like any other entry and we passed them straight through.
+// Nothing is skipped: the MASK decides, and "." and ".." are ordinary entries to it.
 //
-// ⚠️ GATED ON UNIX ON PURPOSE, AND THE WINDOWS HALF IS UNVERIFIED. The blessed Windows
-// baseline for m479 CONTAINS "." and "..", and that test's own header says its rules
-// were read off the oracle - so fbc on Windows may well return them (FindFirstFile
-// does). Changing a platform I cannot measure from here would be inventing an answer.
-// ⇒ TO CLOSE: run job/tests/bas/m479_dir_function.bas under the Windows fbc and
-// compare. If it omits them there too, drop the IFDEF and re-bless both baselines.
+// ⛔ THIS USED TO DROP "." AND ".." ON UNIX, on a measurement that was real and read the wrong way.
+// The observation was that fbc listed only "sub" for a directory holding "sub", "." and ".." - true,
+// and it was measured with a mask of fbDirectory ALONE. Re-measured across four masks: a dot entry
+// carries DIRECTORY *and* HIDDEN (attrib 18), so fbDirectory alone excludes it by the ordinary rule,
+// while "fbDirectory Or fbHidden" lists all three, exactly as fbc does. The skip was a second rule
+// saying what the first already said, and where they disagreed the second one won and was wrong -
+// the manual's own system/dirfolder walks with every bit set and prints "." and "..".
+//
+// ⚠️ The dotted names get their HIDDEN bit from the platform layer (a leading dot on Unix), which is
+// also why ".hidden.txt" reports 34 - measured, and identical to fbc.
 begin
-  {$IFDEF UNIX}
-  Result := (Rec.Name = '.') or (Rec.Name = '..');
-  {$ELSE}
   Result := False;
-  {$ENDIF}
 end;
 
 function TBytecodeVM.RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;
@@ -5324,6 +5347,51 @@ begin
     if Length(W) > 0 then Move(W[1], P^, PtrUInt(Length(W)) * 2);
     PWord(P)[Length(W)] := 0;
   end;
+end;
+
+function TBytecodeVM.RawStrCellGet(RawPtr: Int64): string;
+// "*p" where p is a "STRING PTR": a MANAGED string cell. FreeBASIC's String is a DESCRIPTOR - a
+// pointer, a length and a capacity, SizeOf(String) = 24 bytes - whose characters live elsewhere, and
+// this is that model in our terms: the 24-byte cell holds an INDEX into FRawStrCells, and the text
+// itself stays a managed string. Reading a cell that was never written (CAllocate zeroes it) gives
+// index 0, which is reserved for the empty string.
+//
+// ⛔ Deliberately NOT the ZSTRING treatment. Writing the characters into the cell would fit the
+// manual's example by luck - 23 characters into 24 bytes - and raise on the next longer string.
+var
+  Idx: Int64;
+begin
+  Idx := PInt64(RawAddr(RawPtr, 8))^;
+  if (Idx > 0) and (Idx <= High(FRawStrCells)) then Result := FRawStrCells[Idx] else Result := '';
+end;
+
+procedure TBytecodeVM.RawStrCellSet(RawPtr: Int64; const S: string);
+// Store into a managed string cell: reuse the slot this cell already names, or take a new one.
+// ⚠️ A slot is not reclaimed when the block is Deallocate'd - the cell is gone by then and nothing
+// names the slot. The leak is one string per DISTINCT cell ever written, which no realistic program
+// makes unbounded; reclaiming it would need the raw heap to know which of its bytes are cells.
+var
+  Idx: Int64;
+  P: PInt64;
+begin
+  P := PInt64(RawAddr(RawPtr, 8));
+  Idx := P^;
+  if (Idx <= 0) or (Idx > High(FRawStrCells)) then
+  begin
+    if Length(FRawStrCells) = 0 then
+    begin
+      SetLength(FRawStrCells, 2);
+      FRawStrCells[0] := '';        // slot 0 is the empty string: a zeroed cell reads as ""
+      Idx := 1;
+    end
+    else
+    begin
+      Idx := Length(FRawStrCells);
+      SetLength(FRawStrCells, Idx + 1);
+    end;
+    P^ := Idx;
+  end;
+  FRawStrCells[Idx] := S;
 end;
 
 procedure TBytecodeVM.RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
@@ -7520,6 +7588,7 @@ var
   KeyNum, KeyIdx, CharIdx: Integer;
   KeyText: string;
   KeyStr: string;       // GETKEY: the character just read (the FUNCTION form turns it into a code)
+  PrintStr: string;     // PRINT USING: the formatted text, kept so the cursor column can be advanced by it
   Ch: Char;
   InQuotes: Boolean;
   HandleNum64: Int64;   // indirect-call target (entry PC, or a BUILTIN_FP_TAG @Sin sentinel)
@@ -8399,20 +8468,33 @@ begin
           Ctx.StringRegs[Instr.Dest] := '';
       end;
     // Formatted output
+    // ⛔ PRINT USING ADVANCES THE CURSOR COLUMN like any other output. All four arms wrote straight to
+    // the device and left Ctx.CursorCol alone, so a following comma computed its tab zone from a column
+    // that did not include what USING had just printed. "Print Using ""###: ""; i;" then "Print s," put
+    // the next zone 5 columns too far - the whole width of the USING output - on EVERY item of the row.
+    // The tracked column is also what POS() and CSRLIN answer, so it was wrong there too.
     bcPrintUsing:
       begin
         // PRINT USING format$; value
         // Src1 = format string register, Src2 = value register
         if Assigned(FOutputDevice) then
+        begin
           // Src2 is a FLOAT value here; the exact-integer form is bcPrintUsingInt (below).
-          FOutputDevice.Print(FormatUsing(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2], False, 0));
+          PrintStr := FormatUsing(Ctx.StringRegs[Instr.Src1], Ctx.FloatRegs[Instr.Src2], False, 0);
+          FOutputDevice.Print(PrintStr);
+          AdvancePrintCol(Ctx, Length(PrintStr));
+        end;
       end;
     bcPrintUsingInt:
       // PRINT USING with an EXACT integer value: Src1 = format string, Src2 = int value. A LongInt beyond
       // 2^53 keeps every digit instead of being rounded through a Double (Pell's 2469645423824185801).
       begin
         if Assigned(FOutputDevice) then
-          FOutputDevice.Print(FormatUsing(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]));
+        begin
+          PrintStr := FormatUsing(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]);
+          FOutputDevice.Print(PrintStr);
+          AdvancePrintCol(Ctx, Length(PrintStr));
+        end;
       end;
     bcPrintUsingStage:
       // Stage one already-stringified value for a runtime-format PRINT USING (Src1 = string register).
@@ -8424,7 +8506,11 @@ begin
       // Run a runtime-format PRINT USING over the staged values (Src1 = format string register).
       begin
         if Assigned(FOutputDevice) then
-          FOutputDevice.Print(FormatUsingRuntime(Ctx.StringRegs[Instr.Src1]))
+        begin
+          PrintStr := FormatUsingRuntime(Ctx.StringRegs[Instr.Src1]);
+          FOutputDevice.Print(PrintStr);
+          AdvancePrintCol(Ctx, Length(PrintStr));
+        end
         else
           SetLength(FPUStage, 0);
       end;
@@ -13184,15 +13270,22 @@ begin
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
     50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2).
+        // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
         // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
         // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
-      if Instr.Immediate >= 2 then
+      if Instr.Immediate = -1 then
+        Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
+      else if Instr.Immediate >= 2 then
         Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
       else
         Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
-    51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING
-      RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
+    51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING,
+        // Imm -1 a MANAGED STRING CELL ("String Ptr" - see RawStrCellSet).
+      if Instr.Immediate = -1 then
+        RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+      else
+        RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
     34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
       begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
              // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
@@ -16505,11 +16598,16 @@ begin
 
     35: // bcDirSearch - DIR(spec, mask) starts a walk (Immediate 0), DIR() steps it (Immediate 1).
       begin
-        if Instr.Immediate = 0 then
+        // ⛔ AN EMPTY FILESPEC MEANS "THE NEXT ONE", not a new search. The manual is explicit - "if
+        // filespec is omitted or empty, the next matching file is returned" - and Dir("") is how a
+        // FreeBASIC loop is actually written, the manual's own fileio and system examples included.
+        // Taken as a new search it handed FindFirst an empty pattern, which matches nothing, so every
+        // such loop stopped after its FIRST entry: a directory listing that silently listed one file.
+        if (Instr.Immediate = 0) and (Ctx.StringRegs[Instr.Src1] <> '') then
         begin
           if FDirOpen then begin FindClose(FDirRec); FDirOpen := False; end;   // a new search cancels the old one
           FDirMask := Integer(Ctx.IntRegs[Instr.Src2]);
-          FDirOpen := FindFirst(Ctx.StringRegs[Instr.Src1], faAnyFile, FDirRec) = 0;
+          FDirOpen := FindFirst(DirTranslateSpec(Ctx.StringRegs[Instr.Src1]), faAnyFile, FDirRec) = 0;
         end
         else if FDirOpen then
           if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;

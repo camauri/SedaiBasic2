@@ -83,6 +83,12 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    BitWidth: Integer;      // FreeBASIC BIT FIELD "name : n As T": n bits (0 = not a bit field). A RUN of
+    BitOffset: Integer;     // consecutive bit fields shares ONE storage unit of the declared type: every
+                            // member of the run gets that unit's ByteOffset and width code, and its own
+                            // (BitOffset, BitWidth) within it. ⭐ THAT IS WHAT KEPT THE WIRE UNTOUCHED:
+                            // Slot still carries (byte offset, width code) and the shift-and-mask lives
+                            // in the SSA, so the interpreter, the AOT and the disassembler are unchanged.
     StructGroup: Integer;   // an anonymous "Type ... End Type" block inside a UNION: its members are
                             // SEQUENTIAL among themselves while the union overlaps the groups. 0 = none.
     UnionGroup: Integer;    // a nested "Union ... End Union" block inside this TYPE: every field of the
@@ -534,6 +540,7 @@ type
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
     function RawTypeCodeOfPointee(const PointeeType: string): Integer;           // raw element type code for a given scalar pointee
+    function RawStrModeOf(const PointeeType: string): Integer;                  // ssaRaw*ZStr mode: 0 zstring, 1 wstring, -1 managed String cell
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
     function RawElemSizeOfPointee(const PointeeType: string): Int64;             // SizeOf(scalar pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
@@ -571,6 +578,8 @@ type
     // "Cast(T, u) = expr" through a UDT's BYREF cast operator.
     function ProcessCastOperatorStore(CastNode, ExprNode: TASTNode): Boolean;
     // "u = expr" through a UDT's assignment operator ("Operator T.Let").
+    function TryLetOperatorOnResult(const RetRecType: string; ExprNode: TASTNode; const ExprVal: TSSAValue): Boolean;
+    function TryLetOperatorOnCastResult(ExprNode: TASTNode; const ExprVal: TSSAValue): Boolean;
     function ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
     function EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
     procedure EmitByrefRetStore(const AddrVal, Val: TSSAValue; const Lbl: string);
@@ -616,6 +625,10 @@ type
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
     function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;  // fbc's C layout of a UDT
+    procedure AssignBitFieldRuns(UDTIdx: Integer);   // pack a run of "name : n As T" members into one unit
+    function UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;   // a field's index in its type
+    function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+    function EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
     procedure ComputeUDTLiveLayout(UDTIdx: Integer);   // A3: the LIVE byte image of a UDT, for every type
     function EmitBinFileBlock(IsGet: Boolean; const HandleReg: TSSAValue;
                               ValueNode, CountNode: TASTNode): Boolean;  // GET/PUT #n of a whole array / raw memory block
@@ -740,6 +753,9 @@ type
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
+    function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
+    function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
+    function RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;   // byte address of an @-taken "ZSTRING * n"
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -2145,6 +2161,17 @@ begin
       begin
         ProcessExpression(Node.GetChild(0), Left);   // field value / @field[i] address = raw byte address
         Left := EnsureIntRegister(Left);
+        // A ZSTRING/WSTRING pointee is a C STRING: "*t.zp" is the CHARACTERS at that address, read to
+        // the terminator - the same rule the by-NAME path a few branches down has always had. Missing
+        // here, the field's deref took the scalar arm and read eight bytes as a number, so a UDT
+        // holding a "ZString Ptr" printed 0 where fbc prints the text.
+        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') or (TempStr = 'STRING') then
+        begin
+          Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+          EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RawStrModeOf(TempStr)));
+          Exit;
+        end;
         if (TempStr = 'SINGLE') or (TempStr = 'DOUBLE') then
         begin
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -2214,13 +2241,12 @@ begin
         // FreeBASIC-style - not an 8-byte scalar load. WSTRING stores UCS-2 units on the heap and
         // converts to/from our uniform UTF-8 managed strings (Src3: 0 = bytes, 1 = UCS-2).
         TempStr := UpperCase(FPointerVars.Values[UpperCase(ArrName2)]);
-        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+        if TempStr = '' then TempStr := UpperCase(PointeeTypeOf(ArrName2));
+        if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') or (TempStr = 'STRING') then
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-          if TempStr = 'WSTRING' then
-            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(1))
-          else
-            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RawStrModeOf(TempStr)));
           Exit;
         end;
         if PointeeBankOf(ArrName2) = srtFloat then
@@ -5624,6 +5650,15 @@ begin
           Exit;
         end;
 
+        // "(*p)[i]" where p is a ZSTRING/WSTRING pointer: the i-th character, as a number.
+        if (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+           DerefZStringByteAddr(Node.GetChild(0), Node.GetChild(1).GetChild(0), TempVal) then
+        begin
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRawLoadInt, Result, TempVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U8));
+          Exit;
+        end;
+
         // FreeBASIC INDEX OPERATOR "v[i]" on a UDT that declares "Operator [] (i) ByRef As E". Tested
         // first: the node is shaped like any other indexed access, so every rule below would read the
         // object as an array or a call and answer with its handle.
@@ -6849,7 +6884,7 @@ procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // probes live in their own Try*/Process* frames below, so THIS frame — entered for every
 // assignment — keeps only the managed locals of the common scalar path.
 var
-  VarNode, ExprNode, SharedAssign, CastNode: TASTNode;
+  VarNode, ExprNode, SharedAssign, CastNode, UnwrapAssign: TASTNode;
   VarName: string;
   ExprValue, VarReg: TSSAValue;
   CopyOp: TSSAOpCode;
@@ -6864,6 +6899,31 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // Parentheses around an LVALUE are FreeBASIC's own spelling and carry no meaning of their own: the
+  // manual wraps a byref-returning call that way and notes the enclosing parentheses are REQUIRED
+  // there, to tell the assignment apart from a call whose result is discarded. Left wrapped, the target
+  // matched NO shape below and the whole statement was dropped in SILENCE - the manual's own
+  // procs/byref-result2 lost one of its four lines, and the line after it still worked, which made it
+  // look like a byref-result defect rather than a parenthesis one.
+  //
+  // ⛔ Rebuilt as a NODE, not just re-pointed: several of the shapes below read the target back from
+  // Node.GetChild(0) rather than from this variable, so unwrapping only the variable fixed the call
+  // form and left "( a(1) ) = 9" still dropped. One statement, one lvalue, one place that says so.
+  if VarNode.NodeType = antParentheses then
+  begin
+    while (VarNode <> nil) and (VarNode.NodeType = antParentheses) and (VarNode.ChildCount >= 1) do
+      VarNode := VarNode.GetChild(0);
+    if VarNode = nil then Exit;
+    UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+    try
+      UnwrapAssign.AddChild(VarNode.Clone);
+      UnwrapAssign.AddChild(ExprNode.Clone);
+      ProcessAssignment(UnwrapAssign);
+    finally
+      UnwrapAssign.Free;
+    end;
+    Exit;
+  end;
 
   { ⭐ "Err = n" - the SETTER the FreeBASIC manual defines as ERROR minus the raise: "Unlike Error,
     Err = number sets the error number WITHOUT invoking an error handler." It parsed as an ordinary
@@ -7156,8 +7216,14 @@ begin
     end;
     ProcessExpression(ExprNode, ExprValue);
     // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
-    // result is staged into the result transfer slot as before.
-    if FCurrentProcRetRecType <> '' then
+    // result is staged into the result transfer slot as before. The "fname = expr" spelling takes the
+    // Let-operator conversion too, being the same statement written the other way.
+    if (FCurrentProcRetRecType <> '') and
+       TryLetOperatorOnResult(FCurrentProcRetRecType, ExprNode, ExprValue) then
+      // handled by the operator
+    else if TryLetOperatorOnCastResult(ExprNode, ExprValue) then
+      // ...and the OPERATOR CAST shape of the same conversion
+    else if FCurrentProcRetRecType <> '' then
       EmitRecordCopy(FCurrentResultHandle, ExprValue, FindUDT(FCurrentProcRetRecType))
     else
       // The "fname = expr" spelling of a result reaches the same declared type as "Return expr".
@@ -7399,6 +7465,27 @@ begin
     ProcessExpression(VarNode.GetChild(0), VarReg);
     VarReg := EnsureIntRegister(VarReg);
     ProcessExpression(ExprNode, ExprValue);
+    // "*t.zp = s" writes the string's BYTES plus the terminator at the pointed address, the mirror of
+    // the load above and of the by-NAME store below. Without it the assignment stored an eight-byte
+    // scalar, so the buffer the constructor had just CAllocate'd never received the characters.
+    // ⛔ A NUMERIC value stored through a ZSTRING/WSTRING pointer is ONE CHARACTER, not the number's
+    // TEXT. fbc calls it "converted to an Ubyte reference", and the manual's own strings_types2 writes
+    // "*(pz + 11) = Asc("0")" to set one byte. Converting to a string instead wrote "48" - two
+    // characters - and walked over the byte after it as well.
+    if ((RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING')) and
+       (ExprValue.Kind <> svkConstString) and
+       not ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString)) then
+    begin
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+      Exit;
+    end;
+    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') or (RawFieldPointee = 'STRING') then
+    begin
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(RawFieldPointee)));
+      Exit;
+    end;
     if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
     begin
       ExprValue := EnsureFloatRegister(ExprValue);
@@ -7452,13 +7539,21 @@ begin
     // ZSTRING/WSTRING pointee: "*p = s" writes the string's characters + NUL at the pointed
     // address (WSTRING as UCS-2 units), FreeBASIC-style - not a scalar store.
     RawFieldPointee := UpperCase(FPointerVars.Values[UpperCase(RawPtrName)]);
-    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') then
+    if RawFieldPointee = '' then RawFieldPointee := UpperCase(PointeeTypeOf(RawPtrName));
+    // The same rule as the FIELD path above: a NUMERIC value through a ZSTRING/WSTRING pointer is ONE
+    // CHARACTER, not the number's text.
+    if ((RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING')) and
+       (ExprValue.Kind <> svkConstString) and
+       not ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString)) then
     begin
-      ExprValue := EnsureStringRegister(ExprValue);
-      if RawFieldPointee = 'WSTRING' then
-        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(1))
-      else
-        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(0));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
+      Exit;
+    end;
+    if (RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING') or (RawFieldPointee = 'STRING') then
+    begin
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(RawFieldPointee)));
       Exit;
     end;
     if PointeeBankOf(RawPtrName) = srtFloat then
@@ -7506,6 +7601,21 @@ var
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
 begin
+  // "(*p)[i] = c" where p is a ZSTRING/WSTRING pointer: one character at that address.
+  if (VarNode.ChildCount >= 2) and (VarNode.GetChild(1).ChildCount = 1) and
+     DerefZStringByteAddr(VarNode.GetChild(0), VarNode.GetChild(1).GetChild(0), VarReg) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    if (ExprValue.Kind = svkConstString) or
+       ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString)) then
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(0))
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAConstInt(RTC_U8));
+    Exit;
+  end;
+
   // FreeBASIC INDEX OPERATOR as an lvalue: "v[i] = expr" on a UDT declaring "Operator [] ByRef As E".
   // The operator call yields the element's ADDRESS; store through it, exactly as the byref-function
   // lvalue below does. This is what the operator is FOR — without it the assignment fell through to the
@@ -8780,7 +8890,8 @@ end;
 
 procedure TSSAGenerator.ProcessDim(Node: TASTNode);
 var
-  ArrName, DeclArrName: string;
+  ArrName, DeclArrName, RefTgtType: string;
+  RefTgt: TASTNode;
   ElementType: TSSARegisterType;
   DimsNode, DimExpr, DimChild, ArrayDeclNode: TASTNode;
   Dimensions: array of Integer;
@@ -8873,6 +8984,39 @@ begin
     // "@target" (an antProcAddress); evaluate it to the packed address and store it into r's int
     // register. r is already registered in FRefVars (RegisterRecordVars), so subsequent reads/writes of
     // r auto-dereference through this address.
+    // "DIM BYREF r AS <UDT> = target": in the managed-reference model a UDT variable IS a handle, so a
+    // REFERENCE to one is the SAME handle - no address, no allocation and no copy. Handled before the
+    // typed-scalar path below, which would allocate a fresh instance and copy into it: the alias would
+    // then be a clone, and a virtual call through it would dispatch on the CLONE's type. It printed
+    // nothing at all, because the scalar reference machinery had made r an INT holding an address and
+    // "r.method()" found no record there.
+    if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and (ArrayDeclNode.ChildCount >= 3) and
+       (DimsNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
+    begin
+      RefTgt := ArrayDeclNode.GetChild(2);
+      // The parser writes the initializer as "@target"; the handle is the TARGET's, not its address.
+      if (RefTgt.NodeType = antProcAddress) and (RefTgt.ChildCount = 0) and (RefTgt.Value <> Null) then
+      begin
+        RefTgt := TASTNode.CreateWithValue(antIdentifier, VarToStr(RefTgt.Value), ArrayDeclNode.Token);
+        try
+          if ResolveRecordObject(RefTgt, RecHandleVal, RefTgtType) then
+          begin
+            EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
+                            EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Continue;
+          end;
+        finally
+          RefTgt.Free;
+        end;
+      end
+      else if ResolveRecordObject(RefTgt, RecHandleVal, RefTgtType) then
+      begin
+        EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
+                        EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Continue;
+      end;
+    end;
+
     if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and IsRefVar(ArrName) and
        (ArrayDeclNode.ChildCount >= 3) then
     begin
@@ -10727,9 +10871,21 @@ function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
 // ASC(MID$(s, i+1, 1)) with existing string ops (no new opcode). Out-of-range -> 0 (ASC of "").
 var
   SVal, IdxVal, SReg, IdxReg, OneReg, StartReg, LenReg, MidReg: TSSAValue;
-  NoneV: TSSAValue;
+  NoneV, BufAddr2, ByteAddr2: TSSAValue;
 begin
   NoneV := MakeSSAValue(svkNone);
+  // The mirror of the write: a raw-backed buffer is READ from the byte heap. Without it the read
+  // answered the managed register - the text as DECLARED - so a program that wrote a byte and read it
+  // back got the old character and the two halves disagreed with each other, not just with fbc.
+  if RawZStringBufAddr(SNode, BufAddr2) then
+  begin
+    ProcessExpression(IdxNode, IdxVal);
+    ByteAddr2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, ByteAddr2, EnsureIntRegister(BufAddr2), EnsureIntRegister(IdxVal), NoneV);
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
+    Exit;
+  end;
   ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
   ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
   OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -10742,6 +10898,84 @@ begin
   EmitInstruction(ssaStrMid, MidReg, SReg, StartReg, LenReg);          // MID$(s, i+1, 1)
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaStrAsc, Result, MidReg, NoneV, NoneV);            // ASC(...)
+end;
+
+function TSSAGenerator.DerefedZStringIndexBase(BaseNode: TASTNode): string;
+// The pointee type when BaseNode is "(*p)" over a ZSTRING/WSTRING pointer, else ''. A no-emit query:
+// PrintKindOfExpr must not lower anything.
+var
+  Inner: TASTNode;
+  T: string;
+begin
+  Result := '';
+  if BaseNode = nil then Exit;
+  Inner := BaseNode;
+  while (Inner.NodeType = antParentheses) and (Inner.ChildCount >= 1) do Inner := Inner.GetChild(0);
+  if (Inner.NodeType <> antDeref) or (Inner.ChildCount < 1) then Exit;
+  T := UpperCase(DerefedType(Inner.GetChild(0)));
+  if (T = 'ZSTRING') or (T = 'WSTRING') then Result := T;
+end;
+
+function TSSAGenerator.DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;
+// "(*p)[i]" where p is a ZSTRING/WSTRING pointer: the i-th CHARACTER of the string at that address.
+// Answers the byte address (p + i*SizeOf(char)) so the caller can load or store one character there.
+//
+// FreeBASIC writes the same byte three ways - "p[i]", "*(p + i)" and "(*p)[i]" - and the manual's own
+// strings_types2 uses all three on the same buffer. The first two are ordinary raw-pointer forms; this
+// one wraps the dereference in parentheses (the only way to write it, since "*p[i]" parses as
+// "*(p[i])") and so matched no branch at all: the read answered a stale register and the store was
+// dropped in silence.
+var
+  Inner: TASTNode;
+  Pointee: string;
+  BaseVal, IdxVal, ScaledIdx, ElemSz: TSSAValue;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if (BaseNode = nil) or (IdxNode = nil) then Exit;
+  Inner := BaseNode;
+  while (Inner.NodeType = antParentheses) and (Inner.ChildCount >= 1) do Inner := Inner.GetChild(0);
+  if (Inner.NodeType <> antDeref) or (Inner.ChildCount < 1) then Exit;
+  Pointee := UpperCase(DerefedType(Inner.GetChild(0)));
+  if (Pointee <> 'ZSTRING') and (Pointee <> 'WSTRING') then Exit;
+  ProcessExpression(Inner.GetChild(0), BaseVal);      // the pointer's own value = the byte address
+  ProcessExpression(IdxNode, IdxVal);
+  if Pointee = 'WSTRING' then
+  begin
+    ElemSz := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ElemSz, MakeSSAConstInt(2), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, ScaledIdx, EnsureIntRegister(IdxVal), ElemSz, MakeSSAValue(svkNone));
+  end
+  else
+    ScaledIdx := EnsureIntRegister(IdxVal);
+  Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Addr, EnsureIntRegister(BaseVal), ScaledIdx, MakeSSAValue(svkNone));
+  Result := True;
+end;
+
+function TSSAGenerator.RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;
+// The BYTE ADDRESS of a "ZSTRING * n" whose address has been taken, either as a module scalar or as a
+// local. Such a buffer keeps its characters in RAW BYTES - that is the whole point of having taken its
+// address - so an indexed read or write must go there and not to the managed string register, which
+// stopped being the storage the moment "@z" appeared.
+var
+  Nm: string;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if (SNode = nil) or (SNode.NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(SNode.Value));
+  if IsRawModuleScalar(Nm) and (TypeNameToBank(RawModuleScalarType(Nm), Nm) = srtString) then
+  begin
+    Addr := RawModuleAddrReg(Nm);
+    Exit(True);
+  end;
+  if RawZStringBufBytes(Nm) > 0 then
+  begin
+    Addr := EnsureIntRegister(AddrLocalHandle(Nm));
+    Exit(True);
+  end;
 end;
 
 procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
@@ -10759,7 +10993,22 @@ procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; T
 // (see the fast paths in ProcessMidStatement); this writing had simply never been routed there.
 var
   MidNode, ArgsNode: TASTNode;
+  BufAddr, IdxV, ByteAddr, ValV: TSSAValue;
 begin
+  // A RAW-BACKED "ZSTRING * n" (its address has been taken) keeps its characters in the byte heap, so
+  // one byte is written THERE. The MID$ lowering below writes the managed string register, which for
+  // such a buffer is no longer the storage - so "z[10] = Asc(""2"")" changed nothing at all, in
+  // silence, and the buffer still read as it was declared.
+  if RawZStringBufAddr(SNode, BufAddr) then
+  begin
+    ProcessExpression(IdxNode, IdxV);
+    ByteAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, ByteAddr, EnsureIntRegister(BufAddr), EnsureIntRegister(IdxV), MakeSSAValue(svkNone));
+    ProcessExpression(ValNode, ValV);
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
+                    MakeSSAConstInt(RTC_U8));
+    Exit;
+  end;
   MidNode := TASTNode.Create(antMidStatement, Tok);
   MidNode.AddChild(SNode.Clone);                                        // target
   MidNode.AddChild(CreateBinaryOpNode(ttOpAdd, IdxNode.Clone,           // start = i + 1 (MID$ is 1-based)
@@ -16758,6 +17007,7 @@ end;
 procedure TSSAGenerator.ProcessInputFile(Node: TASTNode);
 var
   HandleVal, HandleReg, VarReg: TSSAValue;
+  LineTmp, CutTmp, LenVal, LenReg, OneReg, AddrVal2: TSSAValue;
   HandleChild, VarChild: TASTNode;
   VarName: string;
   i: Integer;
@@ -16816,10 +17066,40 @@ begin
     HandleReg := EnsureIntRegister(HandleVal);
   end;
 
-  // Process each variable (children 1+)
-  for i := 1 to Node.ChildCount - 1 do
+  // Process each variable (children 1+). A plain FOR cannot skip the length child of the "*pz, n" form
+  // below, so the loop counter is stepped by hand.
+  i := 1;
+  while i < Node.ChildCount do
   begin
     VarChild := Node.GetChild(i);
+    // FreeBASIC "LINE INPUT #n, *pz, maxlength": the destination is a ZSTRING BUFFER named by a pointer,
+    // and the length that follows is the buffer's SIZE IN BYTES - so at most maxlength-1 characters are
+    // stored, plus the terminator. fbc REQUIRES the length in this form ("Line Input #1, *pz" alone is
+    // a syntax error there), which is what makes the trailing child unambiguous.
+    // Only an antIdentifier destination was ever handled here, so this whole form was silently skipped:
+    // the line was read and thrown away, the buffer stayed empty, and the length was then read as a
+    // SECOND destination.
+    if (Node.Attributes.Values['LINEINPUT'] = '1') and (VarChild.NodeType = antDeref) and
+       (i + 1 < Node.ChildCount) then
+    begin
+      LineTmp := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaInputFileLine, LineTmp, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ProcessExpression(Node.GetChild(i + 1), LenVal);       // the buffer size, terminator included
+      LenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaSubInt, LenReg, EnsureIntRegister(LenVal), OneReg, MakeSSAValue(svkNone));
+      CutTmp := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrLeft, CutTmp, LineTmp, LenReg, MakeSSAValue(svkNone));
+      ProcessExpression(VarChild.GetChild(0), AddrVal2);     // the pointer's own value = the byte address
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), EnsureIntRegister(AddrVal2), CutTmp,
+                      MakeSSAConstInt(0));
+      // BOTH children are consumed here - the destination and the length - and Continue skips the
+      // loop's own step, so the advance is by two. Stepping by one left the LENGTH to be read as a
+      // second destination: a SECOND LINE INPUT ran, past the end of the file.
+      Inc(i, 2);
+      Continue;
+    end;
     if VarChild.NodeType = antIdentifier then
     begin
       VarName := string(VarChild.Value);
@@ -16834,6 +17114,7 @@ begin
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
     // Skip separators and other nodes
+    Inc(i);
   end;
 end;
 
@@ -18174,6 +18455,103 @@ begin
   AddrVal := EnsureIntRegister(AddrVal);
   ProcessExpression(ExprNode, ExprValue);
   EmitByrefRetStore(AddrVal, ExprValue, Lbl);
+  Result := True;
+end;
+
+function TSSAGenerator.TryLetOperatorOnCastResult(ExprNode: TASTNode; const ExprVal: TSSAValue): Boolean;
+// The same conversion as TryLetOperatorOnResult, for an OPERATOR CAST whose return type is a UDT.
+//
+// ⛔ WHY IT NEEDS ITS OWN ROUTINE: a cast's label carries a return-BANK suffix ('%', '#', '$') that the
+// return-type pre-scan never saw, so FCurrentProcRetRecType is EMPTY inside one - the very trap
+// CastRetRecType documents. The callee therefore stages a HANDLE into the result slot instead of
+// copying into a caller-allocated instance, and the caller allocates nothing. Rather than change that
+// protocol on both sides, this allocates the destination HERE, runs the operator on it, and hands its
+// handle back the way the cast already does. "Operator U1.Cast() As U2" whose body is "Return This"
+// then converts through "U2.Let(ByRef As U1)" - the manual's casting/opcast5 - instead of returning
+// the SOURCE's handle and reading a U1 through U2's layout, which agrees by accident when the two
+// layouts line up and lies otherwise.
+var
+  RetT, RhsType, Lbl, ParamType: string;
+  Decl, PList, P: TASTNode;
+  i, UDTIdx: Integer;
+  RcHandle: TSSAValue;
+begin
+  Result := False;
+  if (not FModernMode) or (FCurrentProcRetRecType <> '') or (ExprNode = nil) then Exit;
+  RetT := UpperCase(CastRetRecType(FCurrentProcName));
+  if (RetT = '') or (FindUDT(RetT) < 0) then Exit;
+  RhsType := UpperCase(ObjectTypeName(ExprNode));
+  if (RhsType = '') or (RhsType = RetT) or (FindUDT(RhsType) < 0) then Exit;
+  Lbl := ResolveMethodLabel(RetT, 'OPERATORLET');
+  if Lbl = '' then Exit;
+  ParamType := '';
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+  begin
+    PList := Decl.GetChild(1);
+    if Assigned(PList) and (PList.NodeType = antParameterList) then
+      for i := 1 to PList.ChildCount - 1 do
+      begin
+        P := PList.GetChild(i);
+        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
+          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
+        Break;
+      end;
+  end;
+  if ParamType <> RhsType then Exit;
+  UDTIdx := FindUDT(RetT);
+  RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordNew, RcHandle, MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
+                  MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
+  EmitRecordInit(RcHandle, UDTIdx);
+  EmitXferStore(srtInt, 0, RcHandle);                    // THIS = the new destination instance
+  EmitXferStore(srtInt, 1, EnsureIntRegister(ExprVal));  // the operand, by reference
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RcHandle);   // the cast's result: its handle
+  Result := True;
+end;
+
+function TSSAGenerator.TryLetOperatorOnResult(const RetRecType: string; ExprNode: TASTNode;
+  const ExprVal: TSSAValue): Boolean;
+// "Return <a UDT of a DIFFERENT type>" from a FUNCTION/OPERATOR declared As RetRecType: FreeBASIC
+// converts through "Operator RetRecType.Let (ByRef As <that type>)" when one is declared, instead of
+// copying the record. It is what makes the manual's casting/opcast5 work - "Operator U1.Cast() As U2"
+// whose body is "Return This", where This is a U1 and the result a U2 - and the conversion is exactly
+// the one an assignment "b = a" already took (ProcessLetOperatorStore); only the DESTINATION differs,
+// being a handle in a register rather than a named variable.
+//
+// The two arguments are both int-bank (a record handle is an int), so they occupy int slots 0 and 1 -
+// the same layout StageCallArgs would produce for "THIS, rhs". Staged by hand because the destination
+// has no AST node to clone.
+var
+  Lbl, ParamType, RhsType: string;
+  Decl, PList, P: TASTNode;
+  i: Integer;
+begin
+  Result := False;
+  if (not FModernMode) or (RetRecType = '') or (ExprNode = nil) then Exit;
+  RhsType := UpperCase(ObjectTypeName(ExprNode));
+  if (RhsType = '') or (RhsType = UpperCase(RetRecType)) then Exit;   // same type: an ordinary copy
+  if FindUDT(RhsType) < 0 then Exit;
+  Lbl := ResolveMethodLabel(RetRecType, 'OPERATORLET');
+  if Lbl = '' then Exit;
+  // ...and only when the operator's declared operand IS that type.
+  ParamType := '';
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
+  begin
+    PList := Decl.GetChild(1);
+    if Assigned(PList) and (PList.NodeType = antParameterList) then
+      for i := 1 to PList.ChildCount - 1 do
+      begin
+        P := PList.GetChild(i);
+        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
+          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
+        Break;
+      end;
+  end;
+  if ParamType <> RhsType then Exit;
+  EmitXferStore(srtInt, 0, EnsureIntRegister(FCurrentResultHandle));   // THIS = the result instance
+  EmitXferStore(srtInt, 1, EnsureIntRegister(ExprVal));                // the operand, by reference
+  EmitCallSubLabel(ProcedureLabelName(Lbl));
   Result := True;
 end;
 
@@ -20310,8 +20688,18 @@ begin
         begin
           AwCode := TypeNameWidthCode(UpperCase(PointeeTypeOf(VarToStr(Node.GetChild(0).Value))));
           if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+          // "p[i]" through a ZSTRING/WSTRING pointer is a CHARACTER CODE - an unsigned byte - so it
+          // prints with no leading sign space, like every other unsigned value.
+          if (Result = 0) and (UpperCase(PointeeTypeOf(VarToStr(Node.GetChild(0).Value))) = 'ZSTRING') then
+            Result := 3;
         end;
-      end;
+      end
+      // "(*p)[i]" on a ZSTRING/WSTRING pointer: the same character, written the third way FreeBASIC
+      // allows. Its base is a parenthesised dereference, not an identifier, so none of the rules above
+      // could see it.
+      else if FModernMode and (Node.ChildCount >= 1) and
+              (DerefedZStringIndexBase(Node.GetChild(0)) <> '') then
+        Result := 3;
     antMemberAccess:
       // "obj.field" of a NARROW UNSIGNED type (UByte/UShort/ULong) prints unsigned - no leading sign
       // space - exactly like the scalar and the member-ARRAY-element forms above. Only the element form
@@ -20957,6 +21345,20 @@ begin
     end;
 end;
 
+function TSSAGenerator.UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;
+// The index of a field within its type's field array, or -1. The bit-field accessors need the INDEX
+// (they read BitOffset and BitWidth), not just one derived number.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := -1;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(i);
+end;
+
 function TSSAGenerator.UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
 // B1.5: the narrow width code of a field (0 = full width / not found).
 var
@@ -21357,6 +21759,8 @@ begin
       // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
+      FUDTs[Idx].Fields[n].BitWidth := StrToIntDef(FieldNode.Attributes.Values['BITWIDTH'], 0);
+      FUDTs[Idx].Fields[n].BitOffset := 0;   // assigned by the run pass in ComputeUDTLiveLayout
       FUDTs[Idx].Fields[n].UnionGroup := StrToIntDef(FieldNode.Attributes.Values['UNIONGRP'], 0);
       FUDTs[Idx].Fields[n].StructGroup := StrToIntDef(FieldNode.Attributes.Values['STRUCTGRP'], 0);
       if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
@@ -21386,6 +21790,111 @@ begin
     end;
   FUDTs[Idx].NStr := cStr;
   ComputeUDTLiveLayout(Idx);
+end;
+
+function TSSAGenerator.EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+// A BIT FIELD is read out of its storage unit: (unit SHR BitOffset) AND ((1 SHL BitWidth) - 1).
+// The unit itself is loaded by the ordinary field op - the two share a slot - so the whole feature
+// costs a shift and a mask in the SSA and NOTHING on the wire.
+var
+  OfsReg, MaskReg, Shifted: TSSAValue;
+  Mask: Int64;
+begin
+  Result := UnitVal;
+  if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
+  Result := EnsureIntRegister(UnitVal);
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitOffset > 0 then
+  begin
+    OfsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].BitOffset),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShr, Shifted, Result, OfsReg, MakeSSAValue(svkNone));
+    Result := Shifted;
+  end;
+  Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
+  MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Shifted, Result, MaskReg, MakeSSAValue(svkNone));
+  Result := Shifted;
+end;
+
+function TSSAGenerator.EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+// ...and written back into it: (unit AND NOT (mask SHL ofs)) OR ((value AND mask) SHL ofs). The caller
+// loads the unit, calls this, and stores the result through the same ordinary field op - a
+// read-modify-write, which is what a bit field IS.
+var
+  Mask: Int64;
+  MaskReg, OfsReg, KeepMaskReg, Kept, Vm, Vs, Res: TSSAValue;
+begin
+  Result := NewVal;
+  if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
+  Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
+  MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Vm := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Vm, EnsureIntRegister(NewVal), MaskReg, MakeSSAValue(svkNone));
+  Vs := Vm;
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitOffset > 0 then
+  begin
+    OfsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].BitOffset),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Vs := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShl, Vs, Vm, OfsReg, MakeSSAValue(svkNone));
+  end;
+  KeepMaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, KeepMaskReg,
+                  MakeSSAConstInt(not (Mask shl FUDTs[UDTIdx].Fields[FieldIdx].BitOffset)),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Kept := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Kept, EnsureIntRegister(UnitVal), KeepMaskReg, MakeSSAValue(svkNone));
+  Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseOr, Res, Kept, Vs, MakeSSAValue(svkNone));
+  Result := Res;
+end;
+
+procedure TSSAGenerator.AssignBitFieldRuns(UDTIdx: Integer);
+// FreeBASIC BIT FIELDS: a run of consecutive "name : n As T" members shares ONE storage unit of type T.
+// Each member gets its BitOffset within that unit; a new unit starts when the next member would not fit,
+// or when the declared type changes, or at any non-bit member. C's rule, and fbc's.
+//
+// Marks continuation members with ByteSize = -1 so the layout below can recognise them without
+// re-deriving the runs: they take the unit's own offset and advance nothing.
+var
+  i, UnitBits, Used, UnitW: Integer;
+  Sz, Al: Int64;
+begin
+  UnitBits := 0; Used := 0; UnitW := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    if FUDTs[UDTIdx].Fields[i].BitWidth <= 0 then
+    begin
+      UnitBits := 0; Used := 0; UnitW := -1;
+      Continue;
+    end;
+    UDTFieldCShape(UDTIdx, i, Sz, Al);
+    // The unit's identity is its declared WIDTH CODE - that is what decides the storage width, and the
+    // field record keeps no type name to compare.
+    if (UnitW <> FUDTs[UDTIdx].Fields[i].WidthCode) or
+       (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
+    begin
+      // A new storage unit: this member starts it, and the layout treats it as an ordinary field.
+      UnitW := FUDTs[UDTIdx].Fields[i].WidthCode;
+      UnitBits := Integer(Sz) * 8;
+      Used := 0;
+      FUDTs[UDTIdx].Fields[i].BitOffset := 0;
+    end
+    else
+    begin
+      FUDTs[UDTIdx].Fields[i].BitOffset := Used;
+      FUDTs[UDTIdx].Fields[i].ByteSize := -1;        // continuation: shares the unit before it
+    end;
+    Inc(Used, FUDTs[UDTIdx].Fields[i].BitWidth);
+  end;
 end;
 
 procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
@@ -21426,8 +21935,18 @@ begin
   MaxAl := 1; Ofs := 0;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1;
   SGrpCur := 0; SGrpOfs := 0;
+  AssignBitFieldRuns(UDTIdx);           // marks the continuation members with ByteSize = -1
   for i := 0 to n - 1 do
   begin
+    // A BIT FIELD that continues the unit before it takes that unit's offset, width code and slot, and
+    // advances nothing: there is one piece of storage and several names for parts of it.
+    if (i > 0) and (FUDTs[UDTIdx].Fields[i].BitWidth > 0) and (FUDTs[UDTIdx].Fields[i].ByteSize = -1) then
+    begin
+      FUDTs[UDTIdx].Fields[i].ByteOffset := FUDTs[UDTIdx].Fields[i - 1].ByteOffset;
+      FUDTs[UDTIdx].Fields[i].ByteSize := FUDTs[UDTIdx].Fields[i - 1].ByteSize;
+      FUDTs[UDTIdx].Fields[i].Slot := FUDTs[UDTIdx].Fields[i - 1].Slot;
+      Continue;
+    end;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
@@ -22490,6 +23009,14 @@ begin
       begin
         VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
         TypeName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ...but a reference to a UDT is NOT one of these. A UDT variable already IS a handle, so the
+        // reference is an ordinary variable of that type carrying the SAME handle; making it an int
+        // address instead is what left "r.method()" with no record to find.
+        if FindUDT(TypeName) >= 0 then
+        begin
+          RegisterTypedVar(VarName, TypeName);
+          Continue;
+        end;
         if FRefVars.IndexOfName(VarName) < 0 then
           FRefVars.Add(VarName + '=' + TypeName);
         RegisterTypedVar(VarName, 'INTEGER');   // r holds an address -> int register
@@ -23957,30 +24484,33 @@ begin
 end;
 
 procedure TSSAGenerator.EmitModuleConstructors;
-// FreeBASIC: run each module constructor before module-level code, LAST DEFINED FIRST - and each module
-// destructor at program end in the mirror order, first defined first. Measured against fbc on
-// examples/manual/procs/mod-ctor, which defines two of each and prints the order it gets:
-//   Constructor2, Constructor1, <module code>, Destructor1, Destructor2
-// We ran both the other way round. It is the LIFO discipline seen from the constructor end, and the
-// destructors are its mirror, so getting one right and the other wrong was not possible: they were both
-// simply reversed. (The optional integer priority that orders multiple constructors is parsed but not
-// yet honoured - rare in practice.)
+// FreeBASIC: run each module constructor before module-level code, FIRST DEFINED FIRST - and each
+// module destructor at program end in the mirror order, last defined first. Re-measured against fbc
+// 1.10.1 on Linux with examples/manual/procs/mod-ctor, which defines two of each and prints:
+//   Constructor1, Constructor2, <module code>, Destructor2, Destructor1
+//
+// ⛔ THIS COMMENT USED TO CLAIM THE EXACT OPPOSITE, and said it had been measured on this very
+// example. It had not been - or not on this fbc. The reasoning attached to it was self-confirming
+// ("the destructors are its mirror, so getting one right and the other wrong was not possible"), and
+// a symmetric wrong answer is exactly what a reversed pair looks like. The oracle is the measurement,
+// not the argument. (The optional integer priority that orders multiple constructors is parsed but
+// not yet honoured - rare in practice.)
 var
   i: Integer;
 begin
   if (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
-  for i := FModuleCtors.Count - 1 downto 0 do
+  for i := 0 to FModuleCtors.Count - 1 do
     EmitProcedureCall(FModuleCtors[i], nil);
 end;
 
 procedure TSSAGenerator.EmitModuleProcDestructors;
-// The mirror of EmitModuleConstructors: first defined, first destroyed (after the module's global-UDT
-// destructors).
+// The mirror of EmitModuleConstructors: LAST defined, first destroyed (after the module's global-UDT
+// destructors) - the LIFO discipline, measured.
 var
   i: Integer;
 begin
   if (FModuleDtors = nil) or (FModuleDtors.Count = 0) then Exit;
-  for i := 0 to FModuleDtors.Count - 1 do
+  for i := FModuleDtors.Count - 1 downto 0 do
     EmitProcedureCall(FModuleDtors[i], nil);
 end;
 
@@ -25354,6 +25884,21 @@ begin
     Result := FRawPtrRetFuncs.Values[UpperCase(VarToStr(Node.GetChild(0).Value))];
 end;
 
+function TSSAGenerator.RawStrModeOf(const PointeeType: string): Integer;
+// The Src3 mode of ssaRaw{Load,Store}ZStr for a STRING-ish pointee: 0 = C bytes to the terminator
+// (ZSTRING), 1 = UCS-2 units (WSTRING), -1 = a MANAGED STRING CELL (STRING). The last is FreeBASIC's
+// String DESCRIPTOR in our terms - SizeOf(String) bytes holding an index, with the characters in the
+// managed heap - and it is deliberately NOT the ZSTRING treatment, which would fit the manual's own
+// example by luck (23 characters into 24 bytes) and raise on the next longer string.
+var
+  T: string;
+begin
+  T := UpperCase(PointeeType);
+  if T = 'STRING' then Result := -1
+  else if T = 'WSTRING' then Result := 1
+  else Result := 0;
+end;
+
 function TSSAGenerator.RawTypeCodeOfPointee(const PointeeType: string): Integer;
 // Raw element type code for a raw pointer with the given (scalar) pointee type.
 var
@@ -25363,7 +25908,13 @@ begin
   // ⛔ SIGNEDNESS IS PART OF THE CODE, not a detail: the narrow views used to collapse onto the signed
   // one, so every unsigned pointee sign-extended on load (a UByte holding 200 read back as -56). The
   // 64-bit codes need no pair - the int bank IS 64 bits, so there is nothing to extend.
-  if T = 'UBYTE' then Result := RTC_U8
+  // A ZSTRING/WSTRING pointee is a CHARACTER: one byte, or one UCS-2 unit. It used to fall off the end
+  // of this ladder onto the 64-bit default, so "p + n" on a "ZString Ptr" advanced EIGHT bytes per step
+  // and "p[i]" loaded eight - which is why the manual's own "*(pz + 11) = Asc(""0"")" wrote nowhere
+  // near where it meant to. (The whole-string reading of "*p" is decided before the type code is ever
+  // consulted, so this does not disturb it.)
+  if (T = 'ZSTRING') or (T = 'UBYTE') then Result := RTC_U8
+  else if T = 'WSTRING' then Result := RTC_U16
   else if T = 'USHORT' then Result := RTC_U16
   else if T = 'ULONG' then Result := RTC_U32
   else if (T = 'BYTE') or (T = 'BOOLEAN') then Result := RTC_I8
@@ -25396,6 +25947,9 @@ end;
 function TSSAGenerator.RawElemSizeOfPointee(const PointeeType: string): Int64;
 // SizeOf(pointee) in bytes — scales raw pointer arithmetic and p[i] indexing.
 begin
+  // A "String Ptr" steps by SizeOf(String) - fbc's descriptor width, 24 bytes - so p[i] names the
+  // i-th cell. Left to the scalar ladder it stepped by 8 and the cells overlapped.
+  if UpperCase(PointeeType) = 'STRING' then Exit(24);
   case RawTypeCodeOfPointee(PointeeType) of
     RTC_I8, RTC_U8: Result := 1;
     RTC_I16, RTC_U16: Result := 2;
@@ -27792,7 +28346,8 @@ end;
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
-  ArrName, ParentType, NestedT, MemberArrElemType: string;
+  ArrName, ParentType, NestedT, MemberArrElemType, MethodLbl: string;
+  MethodArgs: TASTNode;
   MemberArrHandle, MemberArrIdx: TSSAValue;
   MemberArrBank: TSSARegisterType;
   ParentHandle, NestedHandle: TSSAValue;
@@ -27907,6 +28462,37 @@ begin
         TypeName := MemberArrElemType;
         Result := True;
         Exit;
+      end;
+    end;
+    // "obj.method(args).field" / ".method()": a METHOD returning a UDT. The same shape as the
+    // "f(args).field" rule further down, and it was missing here - only a MODULE-level function was
+    // known, so a method call fell past every branch, Result stayed False, and the field read answered
+    // garbage in silence ("vv.copy().I1" printed 1 for a record holding 123, and the method never ran).
+    // Placed after the member-ARRAY rule above, so "obj.arrfield(i)" keeps winning.
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) and
+       (ObjNode.GetChild(0).ChildCount >= 1) then
+    begin
+      ParentType := ObjectTypeName(ObjNode.GetChild(0).GetChild(0));
+      if ParentType <> '' then
+      begin
+        MethodArgs := nil;
+        if ObjNode.ChildCount >= 2 then MethodArgs := ObjNode.GetChild(1);
+        MethodLbl := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), MethodArgs);
+        if MethodLbl <> '' then
+        begin
+          // A UDT returned BY VALUE, or a "T PTR" whose value IS the handle - the two cases the
+          // module-level rule already separates.
+          MemberArrElemType := VarRecordTypeName(MethodLbl);
+          if MemberArrElemType = '' then MemberArrElemType := ProcReturnPtrUDT(MethodLbl);
+          if MemberArrElemType <> '' then
+          begin
+            ProcessExpression(ObjNode, HandleVal);   // lowers the call; the result is the handle
+            HandleVal := EnsureIntRegister(HandleVal);
+            TypeName := MemberArrElemType;
+            Result := True;
+            Exit;
+          end;
+        end;
       end;
     end;
     if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
@@ -28065,6 +28651,8 @@ begin
     Op := ssaRecordLoadInt;
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  // A BIT FIELD names part of the unit just loaded: shift it down and mask it.
+  DestVal := EmitBitFieldExtract(DestVal, UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(Node.Value)));
   // A fixed-length string FIELD ("As String * n") is stored NUL-padded to its capacity, like a
   // fixed-length scalar: an ordinary read converts at the first NUL (see TryFixedLenStore's header).
   if (Bank = srtString) and AnyFixedLen then DestVal := MaybeFixedLenRead(Node, DestVal);
@@ -28175,7 +28763,8 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
   TypeName, NestedT, SMBack: string;
-  UDTIdx, Slot, FixCap: Integer;
+  UDTIdx, Slot, FixCap, BitIdx: Integer;
+  BitUnit: TSSAValue;
   Bank: TSSARegisterType;
   FixWide: Boolean;
   HandleVal, ExprVal, DummyVal: TSSAValue;
@@ -28228,6 +28817,15 @@ begin
     // so going through it first would settle the conversion as signed and leave ApplyNarrowCode an
     // integer it can only pass through. For widths 1..6 either order gives the same answer.
     begin ExprVal := ApplyNarrowCode(UDTFieldWidthCode(UDTIdx, VarToStr(MemberNode.Value)), ExprVal); ExprVal := EnsureIntRegister(ExprVal); Op := ssaRecordStoreInt; end;
+  end;
+  // A BIT FIELD is a READ-MODIFY-WRITE of its unit: load the unit, splice the value's bits in, store
+  // the unit back. The ordinary field op does both halves - the bit field and its unit share a slot.
+  BitIdx := UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value));
+  if (BitIdx >= 0) and (FUDTs[UDTIdx].Fields[BitIdx].BitWidth > 0) then
+  begin
+    BitUnit := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordLoadInt, BitUnit, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+    ExprVal := EmitBitFieldInsert(BitUnit, ExprVal, UDTIdx, BitIdx);
   end;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;
@@ -29959,7 +30557,14 @@ begin
             end;
             ProcessExpression(Node.GetChild(0), RetVal);
             // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
-            if FCurrentProcRetRecType <> '' then
+            // ...unless the returned UDT is of ANOTHER type and the result type declares a Let for it:
+            // then the conversion is that operator's, exactly as it is for an assignment.
+            if (FCurrentProcRetRecType <> '') and
+               TryLetOperatorOnResult(FCurrentProcRetRecType, Node.GetChild(0), RetVal) then
+              // handled by the operator
+            else if TryLetOperatorOnCastResult(Node.GetChild(0), RetVal) then
+              // ...and the OPERATOR CAST shape of the same conversion
+            else if FCurrentProcRetRecType <> '' then
               EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
             else
               // A FUNCTION declared As UInteger/ULongInt returning a float takes the UNSIGNED

@@ -80,6 +80,7 @@ type
     FInPos: Integer;        // next byte to consume
     FInEof: Boolean;        // the OS said "no more"
     FInBufMode: Integer;
+    function TextEncodingOf(Handle: Integer): Integer;   // 8/16/32 bits per unit, from the mode string
     function CachedSize(Handle: Integer; FS: TFileStream): Int64;
     procedure InvalidateSize(Handle: Integer);
     function RecordUnit(Handle: Integer): Int64;
@@ -288,11 +289,75 @@ begin
     end;
 end;
 
+function TVMFileHandler.TextEncodingOf(Handle: Integer): Integer;
+// The text encoding of a handle, in BITS PER UNIT: 8 (bytes, the default), 16 or 32. It travels on the
+// mode string as a trailing "~<bits>", put there by the OPEN parser - the same way "ACCESS READ"
+// travels as '<'. Carrying it on the mode meant nothing between the parser and here had to grow a
+// parameter, and a handle that was opened without an ENCODING clause reads exactly as it always did.
+var
+  p: Integer;
+begin
+  Result := 8;
+  if (Handle < 1) or (Handle > 15) then Exit;
+  p := Pos('~', FFileModes[Handle]);
+  if p > 0 then Result := StrToIntDef(Copy(FFileModes[Handle], p + 1, MaxInt), 8);
+end;
+
+function EncodeTextUnits(const S: string; Bits: Integer): string;
+// A UTF-8 string as a byte sequence in the file's encoding. 8 bits is the identity - our strings ARE
+// UTF-8 bytes - so only the wide forms convert, little-endian as fbc writes them.
+var
+  W: UnicodeString;
+  i: Integer;
+  U: LongWord;
+begin
+  if Bits = 8 then Exit(S);
+  W := UTF8Decode(S);
+  if Bits = 16 then
+  begin
+    SetLength(Result, Length(W) * 2);
+    if Length(W) > 0 then Move(W[1], Result[1], Length(W) * 2);
+    Exit;
+  end;
+  SetLength(Result, Length(W) * 4);         // UTF-32LE: one 4-byte unit per UCS-2 unit
+  for i := 1 to Length(W) do
+  begin
+    U := LongWord(Ord(W[i]));
+    Move(U, Result[(i - 1) * 4 + 1], 4);
+  end;
+end;
+
+function DecodeTextUnits(const S: string; Bits: Integer): string;
+// The inverse: file bytes back to a UTF-8 string.
+var
+  W: UnicodeString;
+  i, n: Integer;
+  U: LongWord;
+begin
+  if Bits = 8 then Exit(S);
+  if Bits = 16 then
+  begin
+    n := Length(S) div 2;
+    SetLength(W, n);
+    if n > 0 then Move(S[1], W[1], n * 2);
+    Exit(UTF8Encode(W));
+  end;
+  n := Length(S) div 4;
+  SetLength(W, n);
+  for i := 1 to n do
+  begin
+    Move(S[(i - 1) * 4 + 1], U, 4);
+    W[i] := WideChar(Word(U));
+  end;
+  Result := UTF8Encode(W);
+end;
+
 procedure TVMFileHandler.DiskFile(Sender: TBytecodeVM; const Command: string; Handle: Integer;
   const HandleName, Filename, Mode: string; var ErrorCode: Integer);
 var
   M: string;
   FileMode: Word;
+  BomBuf: array[0..3] of Byte;
 begin
   ErrorCode := 0;
   // DCLEAR / RESET: close every open handle. Signalled with Handle 0, so it must be handled before
@@ -372,6 +437,27 @@ begin
       InvalidateSize(Handle);
       FFileModes[Handle] := M;
       if Pos('A', M) > 0 then FFileHandles[Handle].Seek(0, soEnd);
+      // A freshly CREATED wide-encoded text file opens with a byte-order mark, as fbc writes it:
+      // FF FE for UTF-16LE, FF FE 00 00 for UTF-32LE. Only on creation - appending to an existing
+      // file must not put a second one in the middle of it.
+      if (FileMode = fmCreate) and (Pos('~8', M) > 0) then
+      begin
+        BomBuf[0] := $EF; BomBuf[1] := $BB; BomBuf[2] := $BF;
+        FFileHandles[Handle].Write(BomBuf[0], 3);
+        InvalidateSize(Handle);
+      end
+      else if (FileMode = fmCreate) and (TextEncodingOf(Handle) = 16) then
+      begin
+        BomBuf[0] := $FF; BomBuf[1] := $FE;
+        FFileHandles[Handle].Write(BomBuf[0], 2);
+        InvalidateSize(Handle);
+      end
+      else if (FileMode = fmCreate) and (TextEncodingOf(Handle) = 32) then
+      begin
+        BomBuf[0] := $FF; BomBuf[1] := $FE; BomBuf[2] := 0; BomBuf[3] := 0;
+        FFileHandles[Handle].Write(BomBuf[0], 4);
+        InvalidateSize(Handle);
+      end;
     except
       on E: EFOpenError do begin ErrorCode := 62; FFileHandles[Handle] := nil; end;
       on E: EFCreateError do begin ErrorCode := 26; FFileHandles[Handle] := nil; end;
@@ -476,6 +562,8 @@ var
   LInQ: Boolean;      // INPUT#: inside a "..." field, where a comma is text
   LWant: Integer;      // INPUT(n [, #f]): bytes requested, carried in through Data
   Ch2: Char;
+  EncBits, UW, UIdx, WCode: Integer;   // wide text encoding: bits per unit, its byte width, a unit's code
+  WRaw, WUnit: string;                 // the line's raw units, and the one being examined
 begin
   ErrorCode := 0;
 
@@ -662,6 +750,68 @@ begin
       meaning the logical position, and SEEK/LOC/GET/PUT/RECORD all read it - the same aliasing trap
       the buffered-stdin comment above warns about. Reading ahead and seeking back keeps every other
       command looking at exactly what it looked at before, at the cost of one extra seek per line. }
+    // ⛔ A WIDE-ENCODED TEXT FILE IS SCANNED BY UNIT, NOT BY BYTE. The loop below looks for a byte 10 or
+    // 13; in UTF-16LE those are the LOW half of a unit whose high half is 0, so a byte scan would cut the
+    // line in the middle of a character and hand back half of one. The unit scan is a separate branch
+    // rather than a widened version of the byte loop: the byte loop is the hot one (a 158 KB file used to
+    // take 1.4 seconds before it was written this way) and it stays exactly as it was.
+    EncBits := TextEncodingOf(Handle);
+    // An explicit "utf8" handle needs no conversion, but its file opens with a BOM: skip it once.
+    if (EncBits = 8) and (Pos('~8', FFileModes[Handle]) > 0) and (FS.Position = 0) then
+    begin
+      SetLength(WRaw, 3);
+      if (CachedSize(Handle, FS) >= 3) and (FS.Read(WRaw[1], 3) = 3) and
+         (Ord(WRaw[1]) = $EF) and (Ord(WRaw[2]) = $BB) and (Ord(WRaw[3]) = $BF) then
+        FS.Position := 3
+      else
+        FS.Position := 0;
+    end;
+    if EncBits <> 8 then
+    begin
+      UW := EncBits div 8;
+      LStart := FS.Position;
+      LSize := CachedSize(Handle, FS);
+      // The byte-order mark is not text: skip it once, at the very start of the file.
+      if LStart = 0 then
+      begin
+        SetLength(WRaw, UW);
+        if (LSize >= UW) and (FS.Read(WRaw[1], UW) = UW) and
+           (Ord(WRaw[1]) = $FF) and (Ord(WRaw[2]) = $FE) then
+          LStart := UW;
+        FS.Position := LStart;
+      end;
+      if LStart >= LSize then begin ErrorCode := 62; Data := ''; Exit; end;
+      WRaw := '';
+      LUsed := 0;
+      LTerm := False;
+      SetLength(WUnit, UW);
+      while (LStart + LUsed + UW) <= LSize do
+      begin
+        FS.Position := LStart + LUsed;
+        if FS.Read(WUnit[1], UW) <> UW then Break;
+        WCode := Ord(WUnit[1]);                       // little-endian: the low byte carries 10/13
+        for UIdx := 2 to UW do
+          if Ord(WUnit[UIdx]) <> 0 then WCode := -1;  // a non-ASCII unit is never a terminator
+        Inc(LUsed, UW);
+        if (WCode = 10) or (WCode = 13) then
+        begin
+          // CRLF counts as ONE terminator here too.
+          if (WCode = 13) and ((LStart + LUsed + UW) <= LSize) then
+          begin
+            FS.Position := LStart + LUsed;
+            if (FS.Read(WUnit[1], UW) = UW) and (Ord(WUnit[1]) = 10) then Inc(LUsed, UW);
+          end;
+          LTerm := True;
+          Break;
+        end;
+        if (Command = 'INPUT#') and (WCode = Ord('"')) then LInQ := not LInQ;
+        if (WCode = Ord(',')) and (Command = 'INPUT#') and (not LInQ) then begin LTerm := True; Break; end;
+        WRaw := WRaw + WUnit;
+      end;
+      FS.Position := LStart + LUsed;
+      Data := DecodeTextUnits(WRaw, EncBits);
+      Exit;
+    end;
     LStart := FS.Position;
     LSize := CachedSize(Handle, FS);
     if LStart >= LSize then begin ErrorCode := 62; Data := ''; Exit; end;
@@ -727,6 +877,9 @@ begin
   end
   else if (Command = 'PRINT#') or (Command = 'CMD') or (Command = 'APPEND') or (Command = 'WRITE#') then
   begin
+    // TEXT output goes out in the handle's encoding. Binary PUT below deliberately does NOT: it writes
+    // the bytes the program serialised, which is what "Open ... For Binary" means.
+    Data := EncodeTextUnits(Data, TextEncodingOf(Handle));
     if Length(Data) > 0 then
       try FS.Write(Data[1], Length(Data)); InvalidateSize(Handle); except ErrorCode := 25; end;
   end
