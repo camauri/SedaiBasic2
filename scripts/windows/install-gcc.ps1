@@ -67,9 +67,9 @@ $GCC_VERSION = "14.2.0"
 # only works when both serve the SAME BYTES, so that one hash satisfies both; repacking makes that
 # impossible. The choice was smaller-download versus second-source, and it went to smaller: the
 # mirror is ours to keep alive, which was the argument for putting it first anyway.
-$ARCHIVE_NAME = "sedai-gcc-$GCC_VERSION-x86_64-win64.zip"
+$ARCHIVE_NAME = "gcc-$GCC_VERSION-x86_64-win64.zip"
 $DOWNLOAD_URLS = @(
-    "https://github.com/camauri/SedaiBasic2-Deps/releases/download/gcc-mingw64-$GCC_VERSION/$ARCHIVE_NAME"
+    "https://github.com/camauri/SedaiBasic2-Deps/releases/download/gcc-$GCC_VERSION-x86_64-win64/$ARCHIVE_NAME"
 )
 
 # The hash of the archive named above, computed from the file itself. The placeholder guard below
