@@ -62,9 +62,32 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
    A name in the list with no matching arm is a COMPILE error, which is the point. */
 /* -ffreestanding means no math.h; these three are resolved at the FINAL link, where FPC already
    pulls in libm (ldd shows libm.so.6). Prototyped by hand so the object stays freestanding. */
+/* ⛔ THE LINKER, NOT THE MATHS, DECIDES WHICH OF THESE IS USED.
+   On Unix the bare libc names link straight through - the Pascal RTL has already pulled libm - and
+   that is the fast path: measured on a 3 M-iteration loop saturated with Sin/Cos/Tan, calling the
+   libc directly runs 0.097 s where forwarding through a Pascal wrapper runs 0.114 s, +17.5%.
+   On win64 there is no libm to pull and FPC ships no msvcrt import library, so a bare "sin" left the
+   link with "Undefined symbol: sin" - and it did so for anyone cross-building for win64 while NOBODY
+   SAW IT, because build.ps1 does not implement the C hot loop at all and no Windows build ever links
+   this object. There the three are forwarded from SedaiBytecodeVM, which reaches the CRT through its
+   own "external 'msvcrt'" declarations - the very same c_sin/c_cos/c_tan the interpreter and the AOT
+   use, so every engine on one platform still answers identically. The extra call is paid only where
+   the alternative is not linking at all. */
+#ifdef _WIN32
+double sb_hot_sin(double);
+double sb_hot_cos(double);
+double sb_hot_tan(double);
+#define HOT_SIN sb_hot_sin
+#define HOT_COS sb_hot_cos
+#define HOT_TAN sb_hot_tan
+#else
 double sin(double);
 double cos(double);
 double tan(double);
+#define HOT_SIN sin
+#define HOT_COS cos
+#define HOT_TAN tan
+#endif
 
 #define HOT_OP_LIST \
   X(0x0000, LoadConstInt          ) \
@@ -384,9 +407,9 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
      external 'm'), or the answer would depend on whether the hot loop ran - HOTC_OFF=1 would
      change the result. FPC's own Sin is NOT the same function: it is the x87's fsin, which loses
      nine significant digits by 1e15. See the note by the declaration in SedaiBytecodeVM.pas. */
-  L_MathSin: freg[I->dest] = sin(freg[I->s1]);                                pc++; NEXT;
-  L_MathCos: freg[I->dest] = cos(freg[I->s1]);                                pc++; NEXT;
-  L_MathTan: freg[I->dest] = tan(freg[I->s1]);                                pc++; NEXT;
+  L_MathSin: freg[I->dest] = HOT_SIN(freg[I->s1]);                                pc++; NEXT;
+  L_MathCos: freg[I->dest] = HOT_COS(freg[I->s1]);                                pc++; NEXT;
+  L_MathTan: freg[I->dest] = HOT_TAN(freg[I->s1]);                                pc++; NEXT;
 
   /* INT() is FLOOR, not truncation - Int(-1.5) is -2 - which is FloorDouble on the Pascal side and
      __builtin_floor here. Exact in both, so no dialect bit and no way for the two to disagree. */

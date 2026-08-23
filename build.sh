@@ -612,8 +612,9 @@ PLATFORM_DIR="$CPU-$OS"
 
 FPC="$(find_fpc "$PLATFORM_DIR")" || exit 1
 
-# ⭐ The hot arithmetic/branch/array opcodes, compiled by a C compiler instead of by FPC. Opt-in and
-# never required: without --hot-c the interpreter is exactly the Pascal loop it has always been.
+# ⭐ The hot arithmetic/branch/array opcodes, compiled by a C compiler instead of by FPC. ON BY DEFAULT
+# since 20 Aug 2026 and never required: with --no-hot-c the interpreter is exactly the Pascal loop it
+# has always been. (This comment said "opt-in" long after it stopped being true.)
 # Why it exists: measured on the same dispatch loop, gcc -O2 runs it in 253 ms against FPC's 443,
 # and no FPC optimisation level closes any of that - see src/hotdisp.c.
 HOT_C_DEFINE=""
@@ -621,8 +622,12 @@ if [[ "$HOT_C" == "true" ]]; then
     CC_BIN="${SEDAI_CC:-}"
     # CROSS-COMPILING. The object has to be built for the TARGET, not for this machine: FPC's {$L}
     # links a COFF object on win64 and an ELF one on linux, and handing it the wrong format fails at
-    # link time with no useful message. The C side needs nothing else from the target - it is
-    # freestanding, so `nm -u` on the object is empty and no Windows runtime is involved.
+    # link time with no useful message.
+    # ⛔ The object is NOT freestanding, whatever this comment used to claim: since the trigonometry
+    # moved to the libc on 22 Aug 2026 it calls sin/cos/tan, and `nm -u` lists them. On Unix they bind
+    # to libm, which the RTL has already pulled; on win64 there is neither libm nor an msvcrt import
+    # library, so hotdisp.c routes them through three symbols SedaiBytecodeVM exports (see the #ifdef
+    # _WIN32 at the top of it). Until that was done the win64 cross-build simply did not link.
     if [[ -z "$CC_BIN" && "$OS" == "win64" ]]; then
         CC_BIN="$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)"
         if [[ -z "$CC_BIN" ]]; then
