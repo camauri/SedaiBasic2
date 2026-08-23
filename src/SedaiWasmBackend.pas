@@ -6430,7 +6430,7 @@ begin
         EmitRangeToK;
       B.EndOp;
     B.Op(wopElse);
-      // d.dddde+xxx, the exponent signed and three digits wide
+      // d.dddde+xx, the exponent signed and AT LEAST TWO digits wide (three when it needs three)
       LastNonZeroFrom(-1);
       B.LocalGet(8);
       B.I32Const(FLT_DIG); B.OpMem(wopI32Load8U, 0, 0);
@@ -6454,11 +6454,17 @@ begin
       B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
         B.I32Const(0); B.LocalGet(7); B.Op(wopI32Sub); B.LocalSet(7);
       B.EndOp;
-      B.LocalGet(8);
-      B.LocalGet(7); B.I32Const(100); B.Op(wopI32DivU);
-        B.I32Const(10); B.Op(wopI32RemU); B.I32Const(Ord('0')); B.Op(wopI32Add);
-      B.OpMem(wopI32Store8, 0, 0);
-      B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      // The HUNDREDS digit only when the exponent has one: %g's rule is at least TWO digits, widening
+      // to three only for 100 and up ("1e+16", "1e+300"). This used to emit three unconditionally,
+      // and after the interpreter was corrected it was the last place still printing "1e+020".
+      B.LocalGet(7); B.I32Const(100); B.Op(wopI32GeU);
+      B.BlockStart(wopIf, WASM_BLOCKTYPE_EMPTY);
+        B.LocalGet(8);
+        B.LocalGet(7); B.I32Const(100); B.Op(wopI32DivU);
+          B.I32Const(10); B.Op(wopI32RemU); B.I32Const(Ord('0')); B.Op(wopI32Add);
+        B.OpMem(wopI32Store8, 0, 0);
+        B.LocalGet(8); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(8);
+      B.EndOp;
       B.LocalGet(8);
       B.LocalGet(7); B.I32Const(10); B.Op(wopI32DivU);
         B.I32Const(10); B.Op(wopI32RemU); B.I32Const(Ord('0')); B.Op(wopI32Add);
@@ -9817,13 +9823,18 @@ begin
           Exit(Fail('a raw load without a constant element type code'));
         LoadReg(B, Instr.Src1);
         EmitRawAddr(B);
-        // every width SIGN-extends, exactly as RawLoadInt does - a ULong Ptr
-        // deref comes back negative in the interpreter too, and the backend
-        // reproduces the interpreter rather than correcting it
+        // The type code carries the SIGNEDNESS, so the extension follows it. This comment used to say
+        // every width sign-extends "exactly as RawLoadInt does - a ULong Ptr deref comes back negative
+        // in the interpreter too, and the backend reproduces the interpreter rather than correcting
+        // it". That was true and is no longer: the interpreter was wrong, RTC_U8/U16/U32 now exist, and
+        // reproducing the interpreter means zero-extending here too.
         case Instr.Src3.ConstInt of
           RTC_I8:  B.OpMem(wopI64Load8S, 0, 0);
           RTC_I16: B.OpMem(wopI64Load16S, 1, 0);
           RTC_I32: B.OpMem(wopI64Load32S, 2, 0);
+          RTC_U8:  B.OpMem(wopI64Load8U, 0, 0);
+          RTC_U16: B.OpMem(wopI64Load16U, 1, 0);
+          RTC_U32: B.OpMem(wopI64Load32U, 2, 0);
         else
           B.OpMem(wopI64Load, 3, 0);
         end;
@@ -9838,9 +9849,9 @@ begin
         EmitRawAddr(B);
         LoadReg(B, Instr.Src2);
         case Instr.Src3.ConstInt of
-          RTC_I8:  B.OpMem(wopI64Store8, 0, 0);
-          RTC_I16: B.OpMem(wopI64Store16, 1, 0);
-          RTC_I32: B.OpMem(wopI64Store32, 2, 0);
+          RTC_I8, RTC_U8:   B.OpMem(wopI64Store8, 0, 0);
+          RTC_I16, RTC_U16: B.OpMem(wopI64Store16, 1, 0);
+          RTC_I32, RTC_U32: B.OpMem(wopI64Store32, 2, 0);
         else
           B.OpMem(wopI64Store, 3, 0);
         end;

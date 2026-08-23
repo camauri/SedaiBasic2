@@ -5153,6 +5153,10 @@ begin
     RTC_I8:  Result := PShortInt(RawAddr(RawPtr, 1))^;
     RTC_I16: Result := PSmallInt(RawAddr(RawPtr, 2))^;
     RTC_I32: Result := PLongInt(RawAddr(RawPtr, 4))^;
+    // The unsigned views ZERO-extend: a UByte holding 200 is 200 in the int bank, not -56.
+    RTC_U8:  Result := PByte(RawAddr(RawPtr, 1))^;
+    RTC_U16: Result := PWord(RawAddr(RawPtr, 2))^;
+    RTC_U32: Result := PLongWord(RawAddr(RawPtr, 4))^;
   else
     Result := PInt64(RawAddr(RawPtr, 8))^;
   end;
@@ -5328,6 +5332,10 @@ begin
     RTC_I8:  PShortInt(RawAddr(RawPtr, 1))^ := ShortInt(Value);
     RTC_I16: PSmallInt(RawAddr(RawPtr, 2))^ := SmallInt(Value);
     RTC_I32: PLongInt(RawAddr(RawPtr, 4))^ := LongInt(Value);
+    // Unsigned views: same WIDTH, so the bytes written are the same - they exist for the LOAD.
+    RTC_U8:  PByte(RawAddr(RawPtr, 1))^ := Byte(Value);
+    RTC_U16: PWord(RawAddr(RawPtr, 2))^ := Word(Value);
+    RTC_U32: PLongWord(RawAddr(RawPtr, 4))^ := LongWord(Value);
   else
     PInt64(RawAddr(RawPtr, 8))^ := Value;
   end;

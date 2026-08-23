@@ -92,6 +92,15 @@ const
   RAWPTR_OFS_MASK = RAWPTR_REGION_FB - 1;   // byte offset occupies the low 61 bits
   // Raw element type codes (Immediate of bcRaw{Load,Store}): width + bank.
   RTC_I8 = 1; RTC_I16 = 2; RTC_I32 = 3; RTC_I64 = 4; RTC_SINGLE = 5; RTC_DOUBLE = 6;
+  // ...and the UNSIGNED narrow views. The width is the signed code's, so a STORE treats them alike; only
+  // the LOAD differs, and it is the whole reason they exist: an unsigned pointee must ZERO-extend into
+  // the 64-bit int bank, not sign-extend. Without them "*p" on a "UByte Ptr" holding 200 answered -56,
+  // a UShort holding 60000 answered -5536, and a ULong holding 4000000000 answered -294967296 - one
+  // root, four shapes (*p, p[i], Peek, and the typed cast deref). ⚠️ TWO engines execute them and both
+  // must be taught: the interpreter and the WASM backend (hotdisp.c, SedaiAot and SedaiJit implement no
+  // raw load at all). The WASM arm even CARRIED the bug in a comment - "the backend reproduces the
+  // interpreter rather than correcting it" - so the note was right and the behaviour it copied was not.
+  RTC_U8 = 7; RTC_U16 = 8; RTC_U32 = 9;
 
 var
   // Runtime master switch for the SSA optimization passes (the `--no-opt` CLI flag clears it). The

@@ -342,6 +342,7 @@ type
     function ParseBlockStatement: TASTNode;
     function ParseBlockEndStatement: TASTNode;
     function ParseMemoryStatement: TASTNode;
+    function ParseFBPokeStatement(Token: TLexerToken): TASTNode;  // FB POKE [type,] ptr, value → *CPtr(T Ptr, ptr) = value; nil if not the FB form
     function ParseGraphicsStatement: TASTNode;
     function ParseSpriteStatement: TASTNode;
     function ParseSoundStatement: TASTNode;
@@ -5261,6 +5262,57 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.ParseFBPokeStatement(Token: TLexerToken): TASTNode;
+// FreeBASIC "POKE [datatype,] pointer, value" as an assignment through a typed dereference:
+// antAssignment( antDeref(antCast("<T> PTR", <ptr>)), <value> ). The current token is POKE.
+//
+// Speculative: it rewinds and returns nil if the shape does not hold, so a MODERN program that
+// somehow reaches here with something else keeps the old path rather than failing to parse.
+var
+  Saved: Integer;
+  TypeStr: string;
+  PtrExpr, ValExpr, CastNode, DerefNode: TASTNode;
+begin
+  Result := nil;
+  Context.SavePosition(Saved);
+  Context.Advance;                                    // consume POKE
+  TypeStr := '';
+  if Context.Check(ttIdentifier) and IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) and
+     (UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'STRING') then
+  begin
+    TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                 // consume ',' after the datatype
+    else
+    begin
+      Context.RestorePosition(Saved);                 // a variable that happens to be named like a type
+      Exit;
+    end;
+  end;
+  if TypeStr = '' then TypeStr := 'UBYTE';
+  PtrExpr := ParseExpression;
+  if not Assigned(PtrExpr) then begin Context.RestorePosition(Saved); Exit; end;
+  if not Context.Check(ttSeparParam) then
+  begin
+    PtrExpr.Free; Context.RestorePosition(Saved); Exit;
+  end;
+  Context.Advance;                                    // consume ',' before the value
+  ValExpr := ParseExpression;
+  if not Assigned(ValExpr) then
+  begin
+    PtrExpr.Free; Context.RestorePosition(Saved); Exit;
+  end;
+  CastNode := TASTNode.CreateWithValue(antCast, TypeStr + ' PTR', Token);
+  CastNode.AddChild(PtrExpr);
+  DerefNode := TASTNode.Create(antDeref, Token);
+  DerefNode.AddChild(CastNode);
+  Result := TASTNode.Create(antAssignment, Token);
+  Result.AddChild(DerefNode);
+  Result.AddChild(ValExpr);
+  DoNodeCreated(Result);
+end;
+
 function TPackratParser.ParseMemoryStatement: TASTNode;
 var
   Token: TLexerToken;
@@ -5277,6 +5329,16 @@ begin
   // Select appropriate node type based on command
   if CmdName = 'POKE' then
   begin
+    // FreeBASIC "POKE [datatype,] pointer, value" writes REAL memory at an address; the Commodore
+    // "POKE address, value" writes the emulated memory map. Same name, two dialects, and they stay
+    // separate -- only MODERN takes the branch below, and CLASSIC keeps antPoke untouched. The FB form
+    // is exactly a typed pointer store, so it desugars to "*CPtr(<T> Ptr, ptr) = value" and needs no
+    // node, no SSA op and no VM arm of its own. Untyped means UBYTE, fbc's default.
+    if FModernMode then
+    begin
+      Result := ParseFBPokeStatement(Token);
+      if Assigned(Result) then Exit;
+    end;
     Result := TASTNode.Create(antPoke, Token);
     Context.Advance; // Consume POKE
 

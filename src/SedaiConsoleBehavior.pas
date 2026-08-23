@@ -791,9 +791,11 @@ function FormatDoubleFB(Value: Double; SIGDIGITS: Integer = 16): string;
 // regression and it is not to be "fixed" back -- read job/docs/PIANO_FLOAT_PRINT.md first.
 //
 // The fixed/exponential choice is still %g's, from the decimal exponent alone: exponential when the
-// exponent is < -4 or >= SIGDIGITS, with a signed exponent of AT LEAST THREE digits ("1e+016",
-// "1e-005", "1e+300"). The exponent comes from the ROUNDED digits, because a carry can move the value
-// into the next decade and across that boundary.
+// exponent is < -4 or >= SIGDIGITS, with a signed exponent of AT LEAST TWO digits ("1e+16", "1e-05",
+// "1e+300") - %g's own rule, and it widens to three only when the exponent needs three. It used to pad
+// to three unconditionally, on a comment claiming fbc printed "1e+016"; fbc prints "1e+16", measured
+// across Double and Single and across Print's comma form. The exponent comes from the ROUNDED digits,
+// because a carry can move the value into the next decade and across that boundary.
 var
   Digits, S: string;
   Ex, i: Integer;
@@ -825,13 +827,13 @@ begin
     Exit(S);
   end;
 
-  // EXPONENTIAL, FreeBASIC style: "1e+016", "1.234568e+010", "5e-005", "1e+300".
+  // EXPONENTIAL, FreeBASIC style: "1e+16", "1.234568e+10", "5e-05", "1e+300".
   i := Length(Digits);
   while (i > 1) and (Digits[i] = '0') do Dec(i);
   S := Copy(Digits, 1, 1);
   if i > 1 then S := S + '.' + Copy(Digits, 2, i - 1);
   Result := IntToStr(Abs(Ex));
-  while Length(Result) < 3 do Result := '0' + Result;      // at least three digits
+  while Length(Result) < 2 do Result := '0' + Result;      // at least two digits, %g's rule
   if Ex >= 0 then Result := S + 'e+' + Result else Result := S + 'e-' + Result;
   if Neg then Result := '-' + Result;
 end;
@@ -1072,7 +1074,7 @@ begin
   //
   // This comes BEFORE the integral-value shortcut below, which used to pre-empt it: FreeBASIC chooses
   // fixed vs exponential from the MAGNITUDE alone, and 1e16 is integral and fits an Int64 yet still prints
-  // as "1e+016". FormatDoubleFB renders a whole number just as well ("1000000000000000"), so nothing needs
+  // as "1e+16". FormatDoubleFB renders a whole number just as well ("1000000000000000"), so nothing needs
   // the shortcut here -- and going through it was what made every double past 2^63 print the Int64 overflow
   // -9223372036854775808.
   else if FNumberFormat = nfFreeBASIC then

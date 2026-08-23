@@ -52,6 +52,7 @@ type
     FSourceFile: string;        // Source file name (optional)
     FBasePrefixed: Boolean;     // "&H../&O../&B.." literal (its value is rewritten to decimal -- see the property)
     FSingleSuffixed: Boolean;   // "1.5f" / "1.5!" literal: a SINGLE (the suffix is dropped -- see the property)
+    FUnsignedSuffixed: Boolean; // "12u" / "5ul" literal: UNSIGNED (the suffix is dropped -- see the property)
 
     // Lazy evaluation flags for performance
     FDisplayStringCached: string;
@@ -157,6 +158,9 @@ type
     // "1.5", and FreeBASIC types them differently: the first is a Single (prints 7 significant digits and
     // keeps an expression single), the second a Double. This is the only surviving trace of the suffix.
     property SingleSuffixed: Boolean read FSingleSuffixed write FSingleSuffixed;
+    // "12u"/"5UL": the U marks the literal UNSIGNED, and an unsigned prints with no leading sign space.
+    // The suffix is consumed and dropped, so nothing downstream could tell "12u" from "12" without this.
+    property UnsignedSuffixed: Boolean read FUnsignedSuffixed write FUnsignedSuffixed;
 
     // INTERNAL: Lazy extraction setup (used by lexer)
     procedure SetupLazyExtraction(ExtractorCtx: Pointer; ExtractorFn: TTokenValueExtractor; RecIdx: Integer);

@@ -166,6 +166,8 @@ var
   Starts: array[0..63] of Integer;
   PCount, ACount, VarIdx: Integer;
   InStr: Boolean;
+  InCmt: Boolean;    // inside a ' comment: copy verbatim until the line end
+  JoinStr: Boolean;   // the right side of a "##" that joins two STRING LITERALS: drop its opening quote
 
   function ParamIndex(const W: string): Integer;
   var n: Integer;
@@ -189,6 +191,9 @@ var
 begin
   sep := Pos(#1, ParamsBody);
   ParamList := Copy(ParamsBody, 1, sep - 1);
+  // The optional-paren mark is not a parameter: strip it here too, so the ORDINARY parenthesised call
+  // of such a macro reads the same list the paren-less one does.
+  if (ParamList <> '') and (ParamList[1] = '?') then ParamList := Copy(ParamList, 2, MaxInt);
   Body := Copy(ParamsBody, sep + 1, MaxInt);
   // parameter names
   SetLength(Params, 0); PCount := 0;
@@ -244,11 +249,30 @@ begin
       Args[k] := SubstituteMacros(Args[k], Defs, FnDefs, Depth + 1);
   // Replace each whole-identifier parameter with its argument, handling the FreeBASIC preprocessor
   // operators: "#param" stringizes the argument; "a ## b" pastes the surrounding tokens together.
-  Result := ''; i := 1; InStr := False;
+  Result := ''; i := 1; InStr := False; JoinStr := False; InCmt := False;
   while i <= Length(Body) do
   begin
+    // ⛔ A ' COMMENT IS TEXT, and it ends at the line end. The body's lines are joined with
+    // cVirtualEOL, and neither fact was modelled: the quotes inside a comment toggled the string
+    // state, so the manual's fbquote2 - whose comment reads (otherwise the result would be
+    // "arg1""arg2" => "arg1"arg2") - left an ODD number of them and every line AFTER it was treated
+    // as being inside a string. Nothing was substituted there, __FB_QUOTE__ reached the parser
+    // unexpanded, and the error pointed at a column 300 characters into a line the author never wrote.
+    if Body[i] = cVirtualEOL then
+    begin
+      InCmt := False; InStr := False;      // a line end closes both, whatever they were
+      Result := Result + Body[i]; Inc(i); Continue;
+    end;
+    if InCmt then begin Result := Result + Body[i]; Inc(i); Continue; end;
     if InStr then begin Result := Result + Body[i]; if Body[i] = '"' then InStr := False; Inc(i); Continue; end;
-    if Body[i] = '"' then begin InStr := True; Result := Result + Body[i]; Inc(i); Continue; end;
+    if Body[i] = '''' then begin InCmt := True; Result := Result + Body[i]; Inc(i); Continue; end;
+    if Body[i] = '"' then
+    begin
+      InStr := True;
+      if JoinStr then JoinStr := False   // right side of a paste: its opening quote is dropped
+      else Result := Result + Body[i];
+      Inc(i); Continue;
+    end;
     // Token paste "##": drop trailing whitespace already emitted and skip whitespace after ##.
     if (Body[i] = '#') and (i < Length(Body)) and (Body[i + 1] = '#') then
     begin
@@ -256,6 +280,14 @@ begin
         Delete(Result, Length(Result), 1);
       Inc(i, 2);
       while (i <= Length(Body)) and (Body[i] in [' ', #9]) do Inc(i);
+      // Pasting two STRING LITERALS joins their CONTENTS, not their text. Textual pasting produced
+      // ""a""b"", which BASIC reads as ONE literal holding a"b - the doubled quote is an escaped
+      // quote - so the manual's own "#arg1###arg2" (stringize, paste, stringize) printed Free"BASIC
+      // where fbc prints FreeBASIC. Only taken when BOTH sides really are literals: the left one is
+      // already emitted, and the right is either a literal or a stringize about to produce one.
+      JoinStr := (Length(Result) > 0) and (Result[Length(Result)] = '"') and (i <= Length(Body)) and
+                 ((Body[i] = '"') or (Body[i] = '#'));
+      if JoinStr then Delete(Result, Length(Result), 1);
       Continue;
     end;
     // Stringize "#param": emit the matching argument as a quoted string literal.
@@ -280,7 +312,11 @@ begin
           // i.e. the argument is EXPANDED and then turned into text. Taking the C rule gave the
           // raw text, and it was invisible: no error, only the wrong output.
           // ⚠️ Args[] is ALREADY expanded by the block just above, so this only has to quote it.
-          Result := Result + Stringize(Args[pi]);
+          Word := Stringize(Args[pi]);
+          // ...and when this literal is the RIGHT side of a paste, its opening quote is dropped: the
+          // left one's closing quote is already gone, so the two contents become one literal.
+          if JoinStr then begin Delete(Word, 1, 1); JoinStr := False; end;
+          Result := Result + Word;
           i := k; Continue;
         end;
       end;
@@ -474,17 +510,70 @@ begin
   Result := False;
 end;
 
+function LastSegmentIsDirective(const S: string): Boolean;
+// Does the LAST cVirtualEOL-separated segment of S begin (after blanks) with '#'? Used to decide
+// whether a macro expansion must be closed off before the rest of the invocation line follows it.
+var
+  i: Integer;
+  Seg: string;
+begin
+  i := Length(S);
+  while (i > 0) and (S[i] <> cVirtualEOL) do Dec(i);
+  Seg := TrimLeft(Copy(S, i + 1, MaxInt));
+  Result := (Seg <> '') and (Seg[1] = '#');
+end;
+
+function SkipDirectiveSegment(const Line: string; From: Integer; var Acc: string): Integer;
+// If the segment starting at From is a PREPROCESSOR DIRECTIVE (its first non-blank character is '#'),
+// append it verbatim to Acc and answer the index just past it; otherwise answer From unchanged. The
+// segment ends at cVirtualEOL, which is how a #macro body's lines are joined.
+var
+  j: Integer;
+begin
+  Result := From;
+  j := From;
+  while (j <= Length(Line)) and (Line[j] in [' ', #9]) do Inc(j);
+  if (j > Length(Line)) or (Line[j] <> '#') then Exit;
+  j := From;
+  while (j <= Length(Line)) and (Line[j] <> cVirtualEOL) do begin Acc := Acc + Line[j]; Inc(j); end;
+  Result := j;
+end;
+
 function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string;
 var
   i, j, k, idx, ParenDepth: Integer;
   Word, ArgsStr, BuiltinVal: string;
   InStr: Boolean;
+  InCmt: Boolean;   // inside a ' comment: copy verbatim to the end of the line
 begin
   Result := '';
   i := 1;
   InStr := False;
+  InCmt := False;
+  // A DIRECTIVE segment is copied verbatim and left to the directive handlers, which run AFTER this
+  // pass and each substitute their own text. Resolving it here inverts the order: a "#define" written
+  // inside a macro body had not run yet when a later "#print __FB_ARG_EXTRACT__( that_define, args )"
+  // in the SAME body was resolved, so the index read as undefined and the extraction came out empty -
+  // while the identical line with a literal index worked, which is what made it look like an
+  // ARG_EXTRACT bug rather than an ordering one.
+  k := SkipDirectiveSegment(Line, i, Result);
+  if k > i then i := k;
   while i <= Length(Line) do
   begin
+    // A ' COMMENT IS TEXT, and it ends at the line end - cVirtualEOL included, because a #macro body
+    // arrives here as ONE line with its lines joined by that marker. The SAME omission as in
+    // ExpandFnBody, in a second place: the quotes inside the manual's own comment
+    // ( "arg1""arg2" => "arg1"arg2" ) are an ODD number, so everything after them read as a string
+    // and __FB_QUOTE__ was never expanded - it reached the parser as an undeclared array.
+    if Line[i] = cVirtualEOL then
+    begin
+      InCmt := False; InStr := False;
+      Result := Result + Line[i]; Inc(i);
+      k := SkipDirectiveSegment(Line, i, Result);   // the NEXT segment may be a directive too
+      if k > i then i := k;
+      Continue;
+    end;
+    if InCmt then begin Result := Result + Line[i]; Inc(i); Continue; end;
     if InStr then
     begin
       Result := Result + Line[i];
@@ -492,6 +581,7 @@ begin
       Inc(i);
       Continue;
     end;
+    if Line[i] = '''' then begin InCmt := True; Result := Result + Line[i]; Inc(i); Continue; end;
     if Line[i] = '"' then
     begin
       InStr := True; Result := Result + Line[i]; Inc(i); Continue;
@@ -534,6 +624,23 @@ begin
       // unexpanded, so the macro's own name reached the parser.
       k := j;
       while (k <= Length(Line)) and (Line[k] in [' ', #9]) do Inc(k);
+      // "#macro name ? (params)" may also be invoked WITHOUT the parentheses, and then the arguments
+      // run to the end of the LINE. The mark is the '?' the parameter list carries; it is stripped
+      // before the body is expanded, so ExpandFnBody sees the ordinary list.
+      if (idx >= 0) and (Length(FnDefs.ValueFromIndex[idx]) > 0) and (FnDefs.ValueFromIndex[idx][1] = '?') and
+         ((k > Length(Line)) or (Line[k] <> '(')) then
+      begin
+        j := k;
+        ArgsStr := '';
+        // A macro body is joined with cVirtualEOL, so "the end of the line" is that marker, not the end
+        // of the buffer: a paren-less invocation INSIDE a macro body must not swallow the lines after it.
+        while (j <= Length(Line)) and (Line[j] <> cVirtualEOL) and (Line[j] <> ':') do
+        begin ArgsStr := ArgsStr + Line[j]; Inc(j); end;
+        Result := Result + SubstituteMacros(ExpandFnBody(Copy(FnDefs.ValueFromIndex[idx], 2, MaxInt),
+                                                         ArgsStr, Defs, FnDefs, Depth), Defs, FnDefs, Depth + 1);
+        i := j;
+        Continue;
+      end;
       if (idx >= 0) and (k <= Length(Line)) and (Line[k] = '(') then
       begin
         j := k;
@@ -552,7 +659,13 @@ begin
         end;
         if (j <= Length(Line)) and (Line[j] = ')') then Inc(j);   // skip ')'
         // Expand the body (param substitution), then re-run object-like substitution on the result.
-        Result := Result + SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr, Defs, FnDefs, Depth), Defs, FnDefs, Depth + 1);
+        BuiltinVal := SubstituteMacros(ExpandFnBody(FnDefs.ValueFromIndex[idx], ArgsStr, Defs, FnDefs, Depth), Defs, FnDefs, Depth + 1);
+        // A macro body ends where the body ends: when its LAST segment is a DIRECTIVE, close it so
+        // whatever follows the invocation on its own line - a trailing ' comment, most often - does
+        // not become part of it. Without this the comment after "print_last( ... )" was appended to
+        // the body's final "#print" and echoed as part of the compile-time message.
+        if LastSegmentIsDirective(BuiltinVal) then BuiltinVal := BuiltinVal + cVirtualEOL;
+        Result := Result + BuiltinVal;
         i := j;
         Continue;
       end;
@@ -839,6 +952,9 @@ begin
   Result := EvalPPExprInt(RawExpr, Defs, V) and (V <> 0);
 end;
 
+const
+  cPPStrTok = #2;   // leading byte marking a tokenized STRING LITERAL; no source character can be this
+
 function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64): Boolean;
 // ...and as a VALUE, which is what "__FB_EVAL__(expr)" needs: it substitutes the RESULT of a constant
 // integer expression, so another macro can take it as an argument. False when there is nothing to
@@ -876,6 +992,29 @@ var
         if (two = '==') or (two = '<>') or (two = '!=') or (two = '<=') or (two = '>=') or
            (two = '&&') or (two = '||') then
         begin Toks.Add(two); Inc(p, 2); Continue; end;
+      end;
+      // A STRING LITERAL, kept as one token behind a marker byte that no source text can produce.
+      // It used to be skipped character by character, so comparing a stringized macro argument
+      // against an empty literal compared NOTHING against nothing: the quotes vanished, the empty
+      // case left a lone '=' (false), and the non-empty case left "0 =" whose missing right operand
+      // read as 0 - so the condition came out true exactly when it should have been false. An
+      // optional '$'/'!' prefix is FreeBASIC's escaped/non-escaped literal marker, and stringizing
+      // produces the '$' form.
+      if (S[p] = '"') or (((S[p] = '$') or (S[p] = '!')) and (p < Length(S)) and (S[p + 1] = '"')) then
+      begin
+        q := p; if S[q] <> '"' then Inc(q);
+        Inc(q);                                     // past the opening quote
+        id := '';
+        while q <= Length(S) do
+        begin
+          if S[q] = '"' then
+          begin
+            if (q < Length(S)) and (S[q + 1] = '"') then begin id := id + '"'; Inc(q, 2); Continue; end;
+            Inc(q); Break;                          // closing quote
+          end;
+          id := id + S[q]; Inc(q);
+        end;
+        Toks.Add(cPPStrTok + id); p := q; Continue;
       end;
       if S[p] in ['=', '<', '>', '(', ')', '+', '-', '*', '/', '\', '!'] then
       begin Toks.Add(S[p]); Inc(p); Continue; end;
@@ -977,9 +1116,39 @@ var
     begin op := Peek; Inc(TPos); r := ParseMul; if op = '+' then Result := Result + r else Result := Result - r; end;
   end;
 
+  function IsStrTok(const T: string): Boolean;
+  begin Result := (T <> '') and (T[1] = cPPStrTok); end;
+
+  function StrTokText(const T: string): string;
+  begin Result := Copy(T, 2, MaxInt); end;
+
   function ParseCmp: Int64;
-  var op: string; l, r: Int64; b: Boolean;
+  var op, ls, rs: string; l, r: Int64; b: Boolean;
   begin
+    // A comparison whose LEFT side is a string literal is decided on the TEXT. Tested before ParseAdd
+    // is asked for a number, because a string has no number to give. FreeBASIC's own idiom for "was
+    // this variadic argument passed?" compares the stringized argument against an EMPTY literal, and
+    // it can only work this way.
+    if IsStrTok(Peek) then
+    begin
+      ls := StrTokText(Peek); Inc(TPos);
+      Result := 0;
+      while (Peek='=') or (Peek='==') or (Peek='<>') or (Peek='!=') or (Peek='<') or (Peek='<=') or (Peek='>') or (Peek='>=') do
+      begin
+        op := Peek; Inc(TPos);
+        if IsStrTok(Peek) then begin rs := StrTokText(Peek); Inc(TPos); end
+        else begin rs := ''; Inc(TPos); end;
+        if (op='=') or (op='==') then b := ls = rs
+        else if (op='<>') or (op='!=') then b := ls <> rs
+        else if op='<' then b := ls < rs
+        else if op='<=' then b := ls <= rs
+        else if op='>' then b := ls > rs
+        else b := ls >= rs;
+        if b then Result := 1 else Result := 0;
+        ls := rs;
+      end;
+      Exit;
+    end;
     Result := ParseAdd;
     while (Peek='=') or (Peek='==') or (Peek='<>') or (Peek='!=') or (Peek='<') or (Peek='<=') or (Peek='>') or (Peek='>=') do
     begin
@@ -1139,6 +1308,10 @@ begin
   // fbc defines this while compiling the module that holds the program's entry point. There is exactly
   // one module here - sb compiles and runs a single source - so it is always the main one.
   Defs.Values['__FB_MAIN__']    := '-1';
+  // The optimisation level the SOURCE asked for. fbc's default is 0 (no -O on its command line), and
+  // a #cmdline carrying -O raises it; a program reads it back to compile differently. It reports the
+  // REQUEST, not our pipeline, which has no -O ladder to report.
+  Defs.Values['__FB_OPTIMIZE__'] := '0';
   { Which machine the program is being compiled FOR. SedaiBasic's own, with no
     FreeBASIC counterpart - fbc has no WebAssembly target - so it does not
     pretend to be an __FB_ macro. }
@@ -1336,6 +1509,7 @@ var
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
     Params, MacroBody, BodyTrim, EName, ERest: string;
     IsFn: Boolean;
+    OptParen: Boolean;   // "#macro name ? (params)": the parentheses are optional at the call site
     ParentEmit, Cond: Boolean;
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
@@ -1474,6 +1648,13 @@ var
             else
             begin
               MacroVal := Trim(StripDirectiveComment(Copy(DRest, p, MaxInt)));
+              // __FB_EVAL__ means "evaluate HERE", so a #define carrying one stores the RESULT, not the
+              // text. That is the whole reason the manual's print_last macro works: the index is
+              // "__FB_EVAL__( __FB_ARG_COUNT__( args ) - 1 )", and args exists only while the macro is
+              // being expanded - stored raw, it was re-expanded later where args means nothing.
+              // Narrow on purpose: an ordinary #define still stores its text, as #define must.
+              if Pos('__FB_EVAL__', UpperCase(MacroVal)) > 0 then
+                MacroVal := Trim(SubstituteMacros(MacroVal, Defs, FnDefs, 0));
               if MacroName <> '' then Defs.Values[MacroName] := MacroVal;
             end;
           end
@@ -1495,6 +1676,17 @@ var
             // manual writes it that way. Testing the very next character made such a macro OBJECT-like,
             // so an invocation expanded to the raw body and its arguments leaked out as code.
             while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
+            // "#macro name ? ( params )": the '?' makes the PARENTHESES OPTIONAL at the call site, so
+            // "repeat 3" invokes it with 3 and the arguments run to the end of the line. Without this
+            // the '?' was not a '(' and the macro came out OBJECT-like: its body expanded with the
+            // parameters unsubstituted and its arguments leaked out as code, which the SSA then met as
+            // a statement it had no node for.
+            OptParen := (p <= Length(DRest)) and (DRest[p] = '?');
+            if OptParen then
+            begin
+              Inc(p);
+              while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
+            end;
             IsFn := (p <= Length(DRest)) and (DRest[p] = '(');
             Params := '';
             if IsFn then
@@ -1523,6 +1715,10 @@ var
             end;
             if MacroName <> '' then
             begin
+              // The optional-paren mark travels with the PARAMETER LIST, as a leading '?': it has to
+              // reach the call site, and the parameter list is the only thing stored per macro. A
+              // parameter can never begin with '?', so nothing else can be read as the mark.
+              if IsFn and OptParen then Params := '?' + Params;
               if IsFn then FnDefs.Values[MacroName] := Params + #1 + MacroBody
               else Defs.Values[MacroName] := MacroBody;
             end;
@@ -1585,6 +1781,27 @@ var
             // them back off. We echoed them, so every such line differed from fbc by two characters.
             WriteLn(StdErr, UnquotePPMessage(SubstituteMacros(TrimRight(DRest) +
                             Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0)))
+          else if (DName = 'cmdline') and Emitting then
+          begin
+            // #cmdline "opts" - fbc appends the quoted text to its own command line. Almost none of
+            // fbc's switches has a counterpart here (they name a linker, an object format, a target),
+            // and pretending otherwise would be worse than ignoring them. What DOES have an observable
+            // meaning is the optimisation LEVEL, because a program can read it back through
+            // __FB_OPTIMIZE__ and compile differently on it. So the level is honoured and the rest of
+            // the line is deliberately ignored.
+            // ⛔ Honoured means REPORTED, not applied: our pipeline has no -O ladder, and the level
+            // here says what the SOURCE asked for - which is exactly what fbc's macro says too.
+            p := Pos('-O', DRest);
+            if p > 0 then
+            begin
+              q := p + 2;
+              while (q <= Length(DRest)) and (DRest[q] in [' ', #9]) do Inc(q);
+              MacroName := '';
+              while (q <= Length(DRest)) and (DRest[q] in ['0'..'9']) do
+              begin MacroName := MacroName + DRest[q]; Inc(q); end;
+              if MacroName <> '' then Defs.Values['__FB_OPTIMIZE__'] := MacroName;
+            end;
+          end
           else if (DName = 'error') and Emitting then
             // #error msg — abort compilation with a macro-expanded diagnostic.
             raise EPreprocessorError.Create(Trim(SubstituteMacros(DRest, Defs, FnDefs, 0)))
