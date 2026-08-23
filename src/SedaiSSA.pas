@@ -6215,11 +6215,15 @@ begin
           Exit;
         end;
 
-        // FreeBASIC INP(port): read a hardware I/O port. A portable VM has no ports - and the answer to
-        // "no port access" is -8, not 0. ⛔ Measured against fbc on this platform: it answers -8 for
-        // EVERY port (&h60, &h3DA, 0, &hFFFF alike), which is the negation of its runtime error 8, "No
-        // privileges". Zero was never fbc's answer anywhere: where the OS grants access fbc reads real
-        // data, and where it does not it says -8. We can only ever be the second case, so we say so.
+        // ⛔⛔ INP IS NOT IMPLEMENTED. It is accepted, its argument is evaluated, and it answers a
+        // CONSTANT: no port is ever read. The constant is -8 because that is what fbc answers where
+        // the OS denies port access (the negation of its runtime error 8, "No privileges") and zero
+        // was never its answer anywhere - but answering it is not the same as reading a port, and the
+        // difference is invisible from a program. That is the whole reason this comment is loud.
+        // 🟡 OPEN DECISION (23 Aug 2026): implement it somehow, or WITHDRAW the keyword so a program
+        // cannot silently use something inert. BASIC.md marks it ✗ and carries the argument; the short
+        // version is that INP/OUT are the x86 in/out instructions and ARM has no I/O space at all, so
+        // on a Pi or an RP2040 the seam is PEEK/POKE through IMemoryMapper, not this.
         if FModernMode and (UpperCase(ArrName) = kINP) and (ArrayIndexOf(ArrName) < 0) then
         begin
           if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
@@ -18855,8 +18859,11 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessOut(Node: TASTNode);
-// OUT port, value: write a hardware I/O port. A portable VM has no hardware ports, so this is a no-op —
-// but the operand expressions are still evaluated (in case they have side effects), then discarded.
+// ⛔⛔ OUT IS NOT IMPLEMENTED. The operands are evaluated (they may have side effects) and then
+// DISCARDED: no port is ever written, and nothing about the program says so. Paired with INP, which
+// answers a constant, a program using either appears to work and does nothing.
+// 🟡 OPEN DECISION (23 Aug 2026): implement it somehow, or withdraw the keyword. See the note at the
+// INP lowering and the entry in BASIC.md, which marks both ✗.
 var
   i: Integer;
   Val: TSSAValue;

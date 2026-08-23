@@ -4867,9 +4867,12 @@ begin
 end;
 
 function TPackratParser.ParseWaitStatement: TASTNode;
-// Commodore WAIT addr, mask [, xor]: pause until (PEEK(addr) XOR xor) AND mask <> 0. A portable VM has no
-// such hardware — the location would never change, so a real wait would hang. WAIT is therefore a no-op:
-// the arguments are parsed and discarded, and an empty statement (no code) is emitted.
+// Commodore WAIT addr, mask [, xor]: pause until (PEEK(addr) XOR xor) AND mask <> 0.
+// ⛔⛔ WAIT IS NOT IMPLEMENTED: the arguments are parsed and DISCARDED and an empty statement is
+// emitted. It waits for nothing and returns at once. It is built on INP, which answers a constant, so
+// it could not do more than INP does even if the wait loop were written.
+// 🟡 OPEN DECISION (23 Aug 2026): implement the family somehow, or withdraw the keywords so a program
+// cannot silently use something inert. BASIC.md marks INP/OUT/WAIT ✗ and carries the argument.
 var
   Token: TLexerToken;
   Args: TASTNode;
