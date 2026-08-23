@@ -175,39 +175,90 @@ begin
 end;
 
 class function TSedaiRunner.SourceHasLineNumbers(const Source: string): Boolean;
+// Heuristic: the program uses line numbers iff some logical line begins with an integer. A modern
+// (FreeBASIC) statement never starts a line with a bare number; a classic line is "<number>
+// <statement>". A FreeBASIC line-CONTINUATION line does not begin a logical one, so its first
+// character decides nothing: "a = 1 + _" / "    2 + _" / "    3" must not read as line number 3.
+// ⚠️ That rule was in the original and I dropped it while making this comment-aware, on the written
+// claim that it was "irrelevant here". It is not, and m214_linecont caught it on the next run.
+//
+// ⛔⛔ IT MUST NOT LOOK INSIDE COMMENTS OR STRINGS, AND IT USED TO. This runs BEFORE the lexer - it is
+// what CONFIGURES the lexer - so it has to do its own skipping, and skipping nothing meant that
+// A COMMENT COULD CHANGE THE DIALECT OF THE WHOLE PROGRAM. The FreeBASIC manual ends dozens of its
+// examples with a block comment showing the expected output:
+//     /' Output:
+//      0
+//      1
+//     '/
+// and that " 0" made the program CLASSIC. Everything downstream moved with it - Commodore prints a
+// trailing space after a number, POS and CSRLIN count from 0, PAINT floods by the seed's colour, the
+// error messages change - because of a comment. Ten of the manual's own examples were affected.
+//
+// ⚠️ The duplication with the parser (which decides the same thing from ttLineNumber and cannot be
+// fooled, because by then the lexer has removed the comments) is NOT removable: something has to
+// answer before there are any tokens. So this one is made to agree with it instead.
 var
-  Lines: TStringList;
-  i: Integer;
-  Line, Prev: string;
+  i, n, Depth: Integer;
+  AtLineStart: Boolean;
+  LastSig: Char;           // last significant character of the line, for the '_' continuation rule
+  Ch: Char;
 begin
-  // Heuristic: the program uses line numbers iff some logical line begins with an
-  // integer. A modern (FreeBASIC) statement never starts a line with a bare number;
-  // a classic line is "<number> <statement>". FreeBASIC line-continuation lines
-  // (previous line ends with '_') are skipped so a wrapped numeric operand is not
-  // mistaken for a line number.
   Result := False;
-  Lines := TStringList.Create;
-  try
-    Lines.Text := Source;
-    Prev := '';
-    for i := 0 to Lines.Count - 1 do
+  n := Length(Source);
+  i := 1;
+  Depth := 0;              // /' ... '/ nesting
+  AtLineStart := True;     // no non-blank character seen yet on this logical line
+  LastSig := #0;
+  while i <= n do
+  begin
+    Ch := Source[i];
+    if Depth > 0 then                                   // inside a block comment
     begin
-      Line := TrimLeft(Lines[i]);
-      if Line = '' then Continue;
-      if (Prev <> '') and (Prev[Length(Prev)] = '_') then
+      if (Ch = '/') and (i < n) and (Source[i + 1] = '''') then
+      begin Inc(Depth); Inc(i, 2); Continue; end;
+      if (Ch = '''') and (i < n) and (Source[i + 1] = '/') then
+      begin Dec(Depth); Inc(i, 2); Continue; end;
+      if Ch = #10 then                                  // a comment line starts no statement
       begin
-        Prev := TrimRight(Line);   // continuation line: not a statement start
-        Continue;
+        AtLineStart := LastSig <> '_';
+        LastSig := #0;
       end;
-      if (Line[1] >= '0') and (Line[1] <= '9') then
-      begin
-        Result := True;
-        Exit;
-      end;
-      Prev := TrimRight(Line);
+      Inc(i);
+      Continue;
     end;
-  finally
-    Lines.Free;
+    if Ch = #13 then begin Inc(i); Continue; end;
+    if Ch = #10 then
+    begin
+      // A line ending in '_' continues into the next one, which therefore begins no statement.
+      AtLineStart := LastSig <> '_';
+      LastSig := #0;
+      Inc(i);
+      Continue;
+    end;
+    if (Ch = ' ') or (Ch = #9) then begin Inc(i); Continue; end;
+    if (Ch = '/') and (i < n) and (Source[i + 1] = '''') then
+    begin Inc(Depth); Inc(i, 2); Continue; end;          // /' opens a block comment
+    if Ch = '''' then
+    begin
+      while (i <= n) and (Source[i] <> #10) do Inc(i);   // ' runs to end of line
+      Continue;
+    end;
+    if Ch = '"' then
+    begin
+      Inc(i);                                           // a string literal, skipped whole
+      while (i <= n) and (Source[i] <> '"') and (Source[i] <> #10) do Inc(i);
+      if (i <= n) and (Source[i] = '"') then Inc(i);
+      AtLineStart := False;
+      LastSig := '"';
+      Continue;
+    end;
+    if AtLineStart then                                 // the first real character decides
+    begin
+      if (Ch >= '0') and (Ch <= '9') then Exit(True);
+      AtLineStart := False;
+    end;
+    LastSig := Ch;
+    Inc(i);
   end;
 end;
 
