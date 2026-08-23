@@ -36,14 +36,31 @@ build does not strictly demand them.
 
 ## Linux
 
-### Debian, Ubuntu, Mint, Raspberry Pi OS
+`./setup.sh` does all of this for you: it works out what is missing, shows one command that installs
+all of it, and builds. What follows is the same thing by hand.
+
+⛔ **The distribution has to be recent enough, and it is the LIBRARIES that decide.** The SDL2 Pascal
+bindings declare every entry point as an ordinary external, so a distribution whose SDL2 is older
+than the bindings leaves undefined symbols: `sbv` fails to link, or fails to start. The minimums are
+**SDL2 2.30.0** and **SDL2_ttf 2.22.0**, and Free Pascal must be **exactly 3.2.2** (3.3.1 does not
+compile SedaiBasic). Checked against the archives on 23 August 2026:
+
+| | Free Pascal | SDL2 | SDL2_ttf | |
+|---|---|---|---|---|
+| Debian 13 (trixie) | 3.2.2 | 2.32.4 | 2.24.0 | supported |
+| Ubuntu 24.04 LTS (noble) | 3.2.2 | 2.30.0 | 2.22.0 | supported, exactly at the minimum |
+| Debian 12 (bookworm) | 3.2.2 | 2.26.5 | 2.20.1 | **too old** |
+| Ubuntu 22.04 LTS (jammy) | 3.2.2 | 2.0.20 | 2.0.18 | **too old** |
+
+`setup.sh` checks what `apt` would install *before* installing it, and stops with the offending
+versions named, because finding out afterwards looks like our build is broken rather than the
+distribution being behind.
+
+### Debian 13 and later, Ubuntu 24.04 and later
 
 ```sh
 sudo apt install fpc gcc libsdl2-dev libsdl2-ttf-dev
 ```
-
-The distribution's `fpc` is usually 3.2.2, which is what this project targets. If yours is older, see
-*Free Pascal, when the distribution's is too old* below.
 
 ### Fedora, RHEL, Rocky, Alma
 

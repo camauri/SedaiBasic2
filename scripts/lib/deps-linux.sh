@@ -127,3 +127,41 @@ fpc_configured() {
     p="$(sed -n 's/.*"FpcBin"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -1)"
     [[ -n "$p" && -x "$p" ]] && printf '%s\n' "$p"
 }
+
+# ⛔ MINIMUM LIBRARY VERSIONS, and they are LINK-TIME requirements, not advice. The Pascal bindings
+# declare every SDL2 and SDL2_ttf entry point as an ordinary external, so a library older than the
+# binding leaves undefined symbols: sbv fails to link, or fails to load. Measured from the bindings
+# themselves - the newest functions they declare are "since SDL 2.30.0" (e.g.
+# SDL_GameControllerGetSteamHandle) and "since SDL_ttf 2.22.0".
+#
+# What that rules out, checked against the archives on 23 Aug 2026:
+#   Debian 13 trixie   SDL2 2.32.4  SDL2_ttf 2.24.0   ok
+#   Debian 12 bookworm SDL2 2.26.5  SDL2_ttf 2.20.1   too old
+#   Ubuntu 24.04 noble SDL2 2.30.0  SDL2_ttf 2.22.0   ok, exactly at the minimum
+#   Ubuntu 22.04 jammy SDL2 2.0.20  SDL2_ttf 2.0.18   too old
+SDL2_MIN_VERSION="2.30.0"
+SDL2_TTF_MIN_VERSION="2.22.0"
+
+# Is $1 at least $2? Uses sort -V, so 2.4.0 is correctly newer than 2.20.0's predecessor ordering.
+version_at_least() {
+    [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]
+}
+
+# The version apt would install for a package, '' when apt is not here or the package is unknown.
+apt_candidate_version() {
+    local pkg="$1" v
+    command -v apt-cache >/dev/null 2>&1 || return 1
+    v="$(apt-cache policy "$pkg" 2>/dev/null | sed -n 's/.*Candidat[oe]*:[[:space:]]*//p' | head -1)"
+    [[ -z "$v" ]] && v="$(apt-cache policy "$pkg" 2>/dev/null | sed -n 's/.*Candidate:[[:space:]]*//p' | head -1)"
+    v="${v%%+*}"; v="${v%%-*}"
+    [[ -n "$v" && "$v" != "(none)" && "$v" != "(nessuno)" ]] && printf '%s\n' "$v"
+}
+
+# "Debian 13" / "Ubuntu 24.04" / '' - for the message, never for the decision.
+distro_name() {
+    [[ -r /etc/os-release ]] || return 1
+    local name ver
+    name="$(sed -n 's/^NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release | head -1)"
+    ver="$(sed -n 's/^VERSION_ID="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release | head -1)"
+    printf '%s %s\n' "$name" "$ver"
+}

@@ -140,6 +140,38 @@ if [[ "$DO_DEPS" == "true" ]]; then
     MISSING=()
     MISSING_WHY=()
 
+    # ⛔ ON A DEBIAN-LIKE SYSTEM, CHECK WHAT apt WOULD ACTUALLY INSTALL, before installing it.
+    # The SDL2 bindings declare every entry point as an ordinary external, so a distribution whose
+    # libraries are older than the bindings leaves undefined symbols: sbv fails to link, or fails to
+    # load. Finding that out after "sudo apt install" is the worst moment, because by then it looks
+    # like our build is broken rather than the distribution being too old.
+    # Supported today: Debian 13+ and Ubuntu 24.04+. Debian 12 and Ubuntu 22.04 have the right FPC
+    # and SDL2_ttf that is two minor versions short.
+    if [[ "$PM" == "apt" ]]; then
+        TOO_OLD=""
+        for spec in "libsdl2-dev:$SDL2_MIN_VERSION:libSDL2" "libsdl2-ttf-dev:$SDL2_TTF_MIN_VERSION:libSDL2_ttf"; do
+            pkg="${spec%%:*}"; rest="${spec#*:}"; min="${rest%%:*}"; label="${rest##*:}"
+            cand="$(apt_candidate_version "$pkg" || true)"
+            [[ -z "$cand" ]] && continue
+            if ! version_at_least "$cand" "$min"; then
+                TOO_OLD="$TOO_OLD\n      $label $cand, needs $min or newer"
+            fi
+        done
+        cand_fpc="$(apt_candidate_version fpc || true)"
+        if [[ -n "$cand_fpc" && "$cand_fpc" != "$FPC_REQUIRED_VERSION" ]]; then
+            TOO_OLD="$TOO_OLD\n      Free Pascal $cand_fpc, needs exactly $FPC_REQUIRED_VERSION"
+        fi
+        if [[ -n "$TOO_OLD" ]]; then
+            show_status "$(distro_name) is too old for SedaiBasic:" "Error"
+            echo -e "${YELLOW}$TOO_OLD${NC}"
+            echo ""
+            show_status "supported: Debian 13 or newer, Ubuntu 24.04 or newer" "Info"
+            show_status "the SDL2 Pascal bindings declare entry points these libraries do not have," "Info"
+            show_status "so it would install cleanly and then fail to link or to start" "Info"
+            exit 1
+        fi
+    fi
+
     # ⛔ THE SAME SEARCH build.sh USES, not "is fpc on the PATH". A compiler installed under
     # ~/tools/fp or by fpcupdeluxe is one the build finds and this check would not, so setup would
     # offer to install a second one over the top of a perfectly good install.
