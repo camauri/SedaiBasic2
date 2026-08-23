@@ -255,6 +255,24 @@ difference is stated rather than left to be discovered.
   real pty, its `POS` answers `1` however much has been printed. Ours answers the true column, which
   is what the manual describes; theirs is a missing implementation on this platform, so the manual's
   own `console/pos` example cannot agree with both.
+- **`#lang "fblite"` and `Option ByVal` / `Option ByRef` are not implemented.** They parse and are
+  inert. In fbc's `fblite` dialect a parameter defaults to **BYREF** and `Option ByVal` flips that
+  default; MODERN is FreeBASIC's own base dialect throughout, where a parameter defaults to BYVAL, and
+  it stays that way whatever `#lang` asks for. The manual's `switches/option-byval` therefore cannot
+  agree with us — its own first line says *"compile with the -lang fblite compiler switch"*.
+- **`ByRef ... As Any` converts; it does not type-pun.** fbc's `Any` disables the parameter's type
+  check, so passing a `Single` to a body declared `ByRef a As Integer` makes the body read that
+  variable's BYTES as an Integer. We convert the value instead (`-15.0` arrives as `-15`), because in
+  our model a parameter is a value in a typed bank and the alternative reads four bytes past the end
+  of a `Single` — bytes the language does not define, and whose value in fbc's own output
+  (`C1700000`) is exactly those four undefined bytes reading as zero. Reproducing that would mean
+  reproducing an accident. The manual's `misc/any-param` exists to show the type check being
+  disabled, and it is: we compile it without complaint too.
+- **`__FB_UNIQUEID__`'s numbers are not part of the contract.** The identifiers it generates are
+  unique and correctly nested — which is everything a program can depend on — but they start at
+  `Lt_0001` where fbc starts at `Lt_0002`, its own label counter having already spent one. The
+  manual's `defines/fbuniqueid` prints its values under the heading *"Compiler output example"*, and
+  matching another compiler's private counter is not compatibility.
 - ⛔ **`INP` / `OUT` / `WAIT` ARE NOT IMPLEMENTED.** They parse, they evaluate their operands, and
   they do nothing: `INP` always answers **-8**, `OUT` never writes, `WAIT` returns at once. The value
   is not arbitrary — it is what `fbc` itself answers where the OS denies port access, and the
