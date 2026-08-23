@@ -24,6 +24,7 @@
 ## Documentation
 
 > **Note:** This README provides an overview. For detailed information, see:
+> - [INSTALL.md](INSTALL.md) - **Everything the build needs, per platform, and how to get it**
 > - [BASIC.md](BASIC.md) - Complete list of BASIC commands with implementation status
 > - [ARCHITECTURE.md](ARCHITECTURE.md) - Detailed compilation pipeline and VM architecture
 > - [CONSOLE.md](CONSOLE.md) - Keyboard shortcuts and graphics mode reference
@@ -169,6 +170,12 @@ sb bas/rosetta/sieve_of_eratosthenes.bas
 ```
 
 ## Setup
+
+> **Dependencies:** both build scripts check every dependency *before* compiling and print all the
+> missing ones at once, with a single command that installs them. If you would rather read the list
+> first — or the automatic suggestion does not fit your system — see **[INSTALL.md](INSTALL.md)**.
+> ⚠️ SDL2 is the backend for **both** the graphics and the audio: without it there is no window, no
+> drawing and no sound.
 
 ### Windows
 

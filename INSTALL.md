@@ -1,0 +1,170 @@
+# Building SedaiBasic2
+
+There are no binary releases yet, so building is currently the only way in. This document lists
+everything the build needs, per platform, and how to get it.
+
+**You should not need this document.** `./build.sh` (Linux/macOS) and `.\build.ps1` (Windows) check
+every dependency *before* compiling anything and print all the missing ones at once, with a single
+command that installs them. This file is the long form: what each dependency is for, and what to do
+when the automatic suggestion does not fit your system.
+
+---
+
+## What the build actually needs
+
+**SDL2 is not an accessory: it is the backend for BOTH the graphics and the audio.** Without
+`libSDL2` there is no window, no drawing and no sound — `SCREEN`, `PSET`, `LINE`, `PLAY`, `SOUND` and
+the SID emulation all end there. Only a build that is text-only *and* has no audio library can do
+without it, and that is the exception, not the normal case.
+
+| | Needed for | When |
+|---|---|---|
+| **Free Pascal 3.2.2** | everything | always |
+| **libSDL2** + **libSDL2_ttf** | **graphics AND audio** — the window, every drawing primitive, every sound | development files to build `sbv` and any target with audio; runtime files to run anything that draws or plays |
+| **A C compiler** (gcc or clang) | the C hot loop, worth **27–45%** | optional — without it the build succeeds and the interpreter is slower |
+| **SDL2 Pascal bindings** | compiling the SDL2 units | shipped in `deps/sdl2`; nothing to install |
+| **SedaiAudioFoundation** | the audio subsystem itself | optional, auto-detected; it drives SDL2's audio device |
+
+⚠️ **When SDL2 is needed to LINK depends on what was detected.** `sbv` always links it. With
+SedaiAudioFoundation present the audio backend pulls it in, so even the plain `sb` links `libSDL2`.
+`sb --window` and the audio backend can also load it at RUN time (`LoadLibrary`), so a build can
+succeed and then find nothing to draw on. This is why the build reports what *your* configuration
+needs rather than a fixed list — and why the runtime libraries are worth installing even when the
+build does not strictly demand them.
+
+---
+
+## Linux
+
+### Debian, Ubuntu, Mint, Raspberry Pi OS
+
+```sh
+sudo apt install fpc gcc libsdl2-dev libsdl2-ttf-dev
+```
+
+The distribution's `fpc` is usually 3.2.2, which is what this project targets. If yours is older, see
+*Free Pascal, when the distribution's is too old* below.
+
+### Fedora, RHEL, Rocky, Alma
+
+```sh
+sudo dnf install fpc gcc SDL2-devel SDL2_ttf-devel
+```
+
+### Arch, Manjaro
+
+```sh
+sudo pacman -S fpc gcc sdl2 sdl2_ttf
+```
+
+### openSUSE
+
+```sh
+sudo zypper install fpc gcc libSDL2-devel libSDL2_ttf-devel
+```
+
+### Alpine
+
+```sh
+sudo apk add fpc gcc sdl2-dev sdl2_ttf-dev
+```
+
+Then:
+
+```sh
+./build.sh sb          # the CLI VM — the default target and the regression one
+./build.sh all         # everything: sb, sbc, sbd, sbv, sbw
+./build.sh sb --window # sb with the optional SDL2 window presenter
+```
+
+### Free Pascal, when the distribution's is too old
+
+Either [fpcupdeluxe](https://github.com/LongDirtyAnimAlf/fpcupdeluxe) (it installs FPC and Lazarus
+side by side with whatever the system has, and writes a working `fpc.cfg`), or the official tarball
+from [freepascal.org](https://www.freepascal.org/download.html). The build looks for a compiler in
+`fpc/3.2.2/`, `~/tools/fp/*/fpc/`, `~/fpcupdeluxe/`, and on the `PATH`, and asks which one to use if
+it finds several.
+
+---
+
+## Windows
+
+**We do not ship or download the SDL2 DLLs.** They belong to the SDL project, they are signed by
+nobody in this chain, and packaging someone else's binaries is not something this project wants to be
+responsible for outside a real, digitally signed installer. Get them from the source below; it takes
+a minute and you know what you are running.
+
+### 1. Free Pascal 3.2.2
+
+[freepascal.org/download.html](https://www.freepascal.org/download.html), or
+[fpcupdeluxe](https://github.com/LongDirtyAnimAlf/fpcupdeluxe) if you also want Lazarus.
+
+⚠️ Whichever you choose, make sure a **usable `fpc.cfg`** ends up next to the compiler. It is the one
+thing that most often goes wrong, and the symptom is confusing: the compiler works perfectly inside
+Lazarus — which supplies its own unit paths and never reads `fpc.cfg` — and fails from a plain shell
+with `Fatal: Can't find unit system used by Program`. You can check in ten seconds: put `begin end.`
+in `probe.pas` and run `fpc probe.pas`. If it fails, generate the config:
+
+```
+<fpcroot>\bin\x86_64-win64\fpcmkcfg.exe -d basepath=<fpcroot> -o <fpcroot>\bin\x86_64-win64\fpc.cfg
+```
+
+### 2. A C compiler — gcc or MSVC
+
+The C hot loop (`src/hotdisp.c`) is compiled by a C compiler, not by FPC, and is worth 27–45% where
+it applies. Either:
+
+- **MinGW-w64 gcc** — via [w64devkit](https://github.com/skeeto/w64devkit) (one zip, no installer),
+  [MSYS2](https://www.msys2.org/) (`pacman -S mingw-w64-x86_64-gcc`), or a TDM-GCC build; or
+- **Microsoft's compiler** — the *Build Tools for Visual Studio*, C++ workload.
+
+⛔ **Not wired up yet on Windows.** `build.ps1` does not compile `hotdisp.c` today, so a Windows build
+currently has no C hot loop however the compiler was installed. The cross-build from Linux does
+(`./build.sh sb --os win64`, needing `x86_64-w64-mingw32-gcc`).
+
+### 3. SDL2 and SDL2_ttf — for graphics and for audio
+
+From the official releases:
+
+- SDL2: [github.com/libsdl-org/SDL/releases](https://github.com/libsdl-org/SDL/releases) — the
+  `SDL2-devel-<version>-VC.zip` or `-mingw.zip` archive
+- SDL2_ttf: [github.com/libsdl-org/SDL_ttf/releases](https://github.com/libsdl-org/SDL_ttf/releases)
+
+Put `SDL2.dll` and `SDL2_ttf.dll` (and the DLLs shipped beside `SDL2_ttf.dll`) next to the built
+executable in `bin\x86_64-win64\`, or anywhere on the `PATH`. The Pascal bindings are already in
+`deps\sdl2`; nothing else is needed to compile.
+
+Skip this only if you want a text-only build with no sound: without these two DLLs there is no
+window, no drawing primitive and no audio device.
+
+Then:
+
+```
+.\build.ps1 -Target sb
+.\build.ps1 -Target all
+```
+
+---
+
+## macOS
+
+```sh
+brew install fpc sdl2 sdl2_ttf
+./build.sh sb
+```
+
+Apple's `clang` is already there and serves as the C compiler.
+
+---
+
+## When something still does not work
+
+- **`Fatal: Can't find unit system used by Program`** — no usable `fpc.cfg`. See the Windows section
+  above; the same `fpcmkcfg` recipe works on Linux.
+- **`Can't find unit SDL2`** — the bindings are missing. They ship in `deps/sdl2`; if you cloned
+  without them, or pointed the build elsewhere, check `SDL2Path` in `setup.config.json`.
+- **A linker error naming `SDL2` or `SDL2_ttf`** — the *development* package is missing, not the
+  runtime one. `libSDL2.so.0` alone is not enough to link against; you need the unversioned
+  `libSDL2.so` that the `-dev` / `-devel` package provides.
+- **The build says a compiler `[cannot compile - skipped]`** — it prints the compiler's own message
+  underneath. That message is the answer; it is almost always the `fpc.cfg` above.
