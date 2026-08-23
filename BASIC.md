@@ -24,6 +24,12 @@ bytecode VM. Of the
 > implemented. The authority is the project's machine-checked inventory — a keyword-recognition pass
 > and a sweep that runs the FreeBASIC examples against fbc; where those disagree with this page, they
 > are right. A tick here means "we believe it works", not "something checked".
+>
+> ⛔ **And the machine-checked inventory has its own blind spot, which this page must not inherit.**
+> `kwcheck.sh` reports 567/567 = 100% — that figure counts whether the FRONT END RECOGNISES a name,
+> and a keyword can be recognised and do nothing at all. `INP`, `OUT` and `WAIT` are exactly that:
+> accepted, operands evaluated, no port ever touched. They are marked ✗ here on purpose, and the
+> disagreement with the 100% is not an error in either — the two answer different questions.
 
 > 📌 Rows marked **SedaiBasic extension** (`REGEXCOUNT`, `OPTION DIGITS`, the `SPR*` sprite commands…)
 > are full members of the MODERN dialect, and deliberately absent from the FreeBASIC totals above.
@@ -90,7 +96,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | `ON` | ✓ | Conditional jump |
 | `RETURN` | ✓ | Return from jump |
 
-## Flow Control - Program Execution (9/9 - 100%)
+## Flow Control - Program Execution (8/9 - 89%)
 
 | Command | Status | Description |
 |---------|--------|-------------|
@@ -102,7 +108,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | `SLEEP` | ✓ | Delay program for n seconds (0 < n < 65536, interruptible with CTRL+C) |
 | `SLOW` | ✓ | Set slow speed clock (hides black overlay) |
 | `STOP` | ✓ | Halt program execution (can resume with CONT) |
-| `WAIT` | ✓ | `WAIT addr, mask [,xor]` — no-op on a portable VM (the awaited hardware bit would never change, so the arguments are parsed and discarded). |
+| `WAIT` | ✗ | **Not implemented.** Accepted and inert: the arguments are parsed and discarded and it returns at once. It is built on `INP`, so it cannot do more than `INP` does — see the note under *Declared divergences*. |
 
 ## Flow Control - Loops (8/8 - 100%)
 
@@ -166,7 +172,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `SETENVIRON` / `ENVIRON$` | ✓ | Set / read an environment variable (SETENVIRON sets a VM-internal override) |
 | `SHELL cmd` | ✓ | Run a command via the platform shell (cmd.exe / /bin/sh); returns the exit code |
 | `ISREDIRECTED(n)` | ✓ | Whether a standard stream is redirected (portable default 0) |
-| `INP(port)` / `OUT port, value` | ✓ | Hardware I/O port read/write — no-op on a portable VM (INP → 0) |
+| `INP(port)` / `OUT port, value` | ✗ | **Not implemented.** Accepted and inert: `INP` always answers `-8` and `OUT` performs no write. See *Declared divergences* — whether to implement them or withdraw the keywords is an open decision. |
 | `LOCK` / `UNLOCK` | ✓ | File record locking — no-op on a single-process VM |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
@@ -249,14 +255,25 @@ difference is stated rather than left to be discovered.
   real pty, its `POS` answers `1` however much has been printed. Ours answers the true column, which
   is what the manual describes; theirs is a missing implementation on this platform, so the manual's
   own `console/pos` example cannot agree with both.
-- **`INP` / `OUT` / `WAIT`**: a portable VM has no hardware ports. `INP` answers **-8** — fbc's own
-  answer where the OS denies port access, and the negation of its runtime error 8 (*No privileges*);
-  `OUT` is a no-op and `WAIT` returns immediately. Where the OS *does* grant access fbc reads real
-  ports and we still cannot, which is the declared part.
-  ⛔ Not implemented: fbc's graphics library hooks `&h3C7`/`&h3C8`/`&h3C9` while a graphics mode is up
-  to emulate QB's VGA palette. The manual calls that use deprecated and no example in the FreeBASIC
-  distribution uses it; the measured protocol is written out in
-  `job/tests/bas/hw_ports_no_access.bas` so implementing it later needs no new measurement.
+- ⛔ **`INP` / `OUT` / `WAIT` ARE NOT IMPLEMENTED.** They parse, they evaluate their operands, and
+  they do nothing: `INP` always answers **-8**, `OUT` never writes, `WAIT` returns at once. The value
+  is not arbitrary — it is what `fbc` itself answers where the OS denies port access, and the
+  negation of its runtime error 8 (*No privileges*) — but answering it is **not the same as reading a
+  port**, and this entry exists so that nobody reads the matching output as a working implementation.
+  Where the OS *does* grant access (Windows with the driver `fbc` installs, Linux as root) `fbc`
+  reads real hardware and we still answer -8.
+  🟡 **Open decision, deliberately not taken**: implement them somehow, or withdraw the keywords so a
+  program cannot silently use something inert. Two things bear on it:
+  - `INP`/`OUT` are the **x86** `in`/`out` instructions. On ARM — a Raspberry Pi, an RP2040 — there is
+    no separate I/O space at all: hardware is memory-mapped, so the seam there is `PEEK`/`POKE`
+    through `IMemoryMapper`, which already exists and is what `job/docs/PICO_ARCHITECTURE.md` plans.
+    Implementing `INP` for those targets would mean *inventing* a meaning the CPU has not.
+  - the only part of this family that **is** portable is the emulated palette below, and that one is
+    specified rather than guessed.
+  ⛔ Also not implemented: `fbc`'s graphics library hooks `&h3C7`/`&h3C8`/`&h3C9` while a graphics
+  mode is up, to emulate QB's VGA palette — those three are not hardware. The manual calls that use
+  deprecated and no example in the FreeBASIC distribution uses it; the measured protocol is written
+  out in `job/tests/bas/hw_ports_no_access.bas` so implementing it later needs no new measurement.
 - ⚠️ **Keyboard input on the headless Linux build**: `TTerminalInput.ProcessEvents` is implemented for
   Windows only, so under `sb` on Unix no key can ever reach `INKEY` / `GETKEY` from a real terminal.
   ⭐ This is *not* observable as a divergence — fbc's `INKEY` reads the console, not stdin, so with
@@ -2320,11 +2337,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INP` | ✓ | Hardware port read — no hardware on a portable VM, so `INP(port)` returns 0. |
+| `INP` | ◐ | Name recognised, **behaviour not implemented**: always answers `-8` (*no port access*), never reads a port. |
 | `LPRINT` | ✓ | Line-printer output — no printer, so routed to stdout (reuses the PRINT machinery). |
 | `LPOS` | ✓ | Printer head column — always 1 (no printer). |
-| `OUT` | ✓ | Hardware port write — a no-op that still evaluates its operands. |
-| `WAIT` | ✓ |  |
+| `OUT` | ◐ | Name recognised, **behaviour not implemented**: evaluates its operands and writes nothing. |
+| `WAIT` | ◐ | Name recognised, **behaviour not implemented**: returns at once. Built on `INP`, so it cannot do more than `INP` does. |
 
 ##### Operating System
 

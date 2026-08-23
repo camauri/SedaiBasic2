@@ -1667,7 +1667,7 @@ begin
  RegisterKeyword(kFRAME, ttProgramFrame, 'Wait for frame sync (default 60fps)', kcProgramFlowControl);
  RegisterKeyword(kSLOW,  ttProgramClock, 'Set slow speed clock',            kcProgramFlowControl);
  RegisterKeyword(kSTOP,  ttProgramStop,  'Halt program execution',          kcProgramFlowControl);
- RegisterKeyword(kWAIT,  ttProgramWait,  'Pause until condition satisfied', kcProgramFlowControl);
+ RegisterKeyword(kWAIT,  ttProgramWait,  'Pause until condition satisfied (NOT IMPLEMENTED: accepted and inert)', kcProgramFlowControl);
 
  // === FLOW CONTROL - LOOP CONSTRUCTS ===
  RegisterKeyword(kDO,    ttLoopBlockStart, 'Starts DO/LOOP cycle',                            kcLoopConstructs);
@@ -1781,7 +1781,7 @@ begin
  RegisterKeyword(kSETENVIRON, ttFileManagement, 'Set an environment variable (NAME=value)', kcDOSCommands);
  RegisterKeyword(kSHELL,     ttFileManagement, 'Run a command via the system shell',        kcDOSCommands);
  RegisterKeyword(kLPRINT,    ttOutputCommand,  'Print to the line printer (routed to stdout here)', kcStdIO);
- RegisterKeyword(kOUT,       ttFileManagement, 'Write a hardware I/O port (no-op on a portable VM)', kcDOSCommands);
+ RegisterKeyword(kOUT,       ttFileManagement, 'Write a hardware I/O port (NOT IMPLEMENTED: accepted and inert)', kcDOSCommands);
  RegisterKeyword(kSCREENCONTROL, ttFileManagement, 'Get/set internal graphics settings (no-op here)',  kcDOSCommands);
  RegisterKeyword(kCD,        ttFileManagement, 'Change directory (alias for CHDIR)',       kcDOSCommands);
  RegisterKeyword(kMOVE,      ttFileManagement, 'Move file to another location',            kcDOSCommands);
