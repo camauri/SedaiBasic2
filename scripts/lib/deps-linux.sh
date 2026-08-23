@@ -101,3 +101,29 @@ fpc_candidates() {
         readlink -f "$c" 2>/dev/null || printf '%s\n' "$c"
     done | awk '!seen[$0]++'
 }
+
+# ⛔ EXACTLY 3.2.2, AND IT IS NOT A PREFERENCE. Other versions are not "probably fine": 3.3.1 does not
+# compile SedaiBasic at all. A build that picks one silently fails in a way that looks like a source
+# problem, so both scripts refuse it by version before ever trying to compile.
+FPC_REQUIRED_VERSION="3.2.2"
+
+# The version a compiler reports, or '' when it cannot be asked.
+fpc_version_of() {
+    local fpc="$1" v
+    [[ -x "$fpc" ]] || return 1
+    v="$("$fpc" -iV 2>/dev/null)"
+    # 3.2.2-r0d122c49 and 3.2.2 are the same compiler: the revision suffix is not part of the version.
+    printf '%s\n' "${v%%-*}"
+}
+
+fpc_version_ok() {
+    [[ "$(fpc_version_of "$1")" == "$FPC_REQUIRED_VERSION" ]]
+}
+
+# The compiler setup.config.json points at, if any and if it is still there.
+fpc_configured() {
+    local cfg="$SCRIPT_DIR/setup.config.json" p
+    [[ -f "$cfg" ]] || return 1
+    p="$(sed -n 's/.*"FpcBin"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -1)"
+    [[ -n "$p" && -x "$p" ]] && printf '%s\n' "$p"
+}

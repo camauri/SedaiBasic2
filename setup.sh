@@ -143,9 +143,28 @@ if [[ "$DO_DEPS" == "true" ]]; then
     # ⛔ THE SAME SEARCH build.sh USES, not "is fpc on the PATH". A compiler installed under
     # ~/tools/fp or by fpcupdeluxe is one the build finds and this check would not, so setup would
     # offer to install a second one over the top of a perfectly good install.
-    FPC_FOUND="$(fpc_candidates "$(uname -m | sed 's/^amd64$/x86_64/')-linux" 2>/dev/null | head -1)"
+    # ⛔ AND THE VERSION DECIDES, not the presence. This took the FIRST candidate and on a machine
+    # with both 3.3.1 and 3.2.2 installed it reported the 3.3.1 as fine - a compiler that does not
+    # build SedaiBasic at all.
+    FPC_PLATFORM="$(uname -m | sed 's/^amd64$/x86_64/')-linux"
+    FPC_FOUND=""
+    FPC_WRONG=""
+    CFG_FPC="$(fpc_configured 2>/dev/null || true)"
+    if [[ -n "$CFG_FPC" ]] && fpc_version_ok "$CFG_FPC"; then
+        FPC_FOUND="$CFG_FPC"
+    else
+        while read -r c; do
+            [[ -n "$c" ]] || continue
+            if fpc_version_ok "$c"; then FPC_FOUND="$c"; break
+            else FPC_WRONG="$FPC_WRONG $(fpc_version_of "$c")"; fi
+        done < <(fpc_candidates "$FPC_PLATFORM" 2>/dev/null)
+    fi
     if [[ -n "$FPC_FOUND" ]]; then
-        show_status "Free Pascal: $("$FPC_FOUND" -iV 2>/dev/null) ($FPC_FOUND)" "Success"
+        show_status "Free Pascal $FPC_REQUIRED_VERSION: $FPC_FOUND" "Success"
+    elif [[ -n "$FPC_WRONG" ]]; then
+        show_status "Free Pascal found, but the wrong version:$FPC_WRONG" "Error"
+        show_status "SedaiBasic needs exactly $FPC_REQUIRED_VERSION - 3.3.1 does not compile it" "Info"
+        MISSING+=("$(dep_pkg fpc "$PM")"); MISSING_WHY+=("Free Pascal $FPC_REQUIRED_VERSION exactly")
     else
         MISSING+=("$(dep_pkg fpc "$PM")"); MISSING_WHY+=("Free Pascal, the compiler everything is built with")
     fi

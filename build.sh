@@ -199,7 +199,14 @@ choose_fpc() {
         [[ -n "$c" ]] || continue
         ver="$("$c" -iV 2>/dev/null)"
         [[ -n "$ver" ]] || continue
-        if fpc_works "$c"; then ok=yes; why=""; else ok=no; why="$FPC_PROBE_LOG"; fi
+        # ⛔ THE VERSION IS A GATE, not a preference: 3.3.1 does not compile SedaiBasic. Checked
+        # BEFORE the compile probe, because a wrong-version compiler that happens to build
+        # "begin end." would otherwise be listed as usable and then fail on the real source, which
+        # reads as a problem with our code.
+        if ! fpc_version_ok "$c"; then
+            ok=no; why="version $(fpc_version_of "$c"): SedaiBasic needs exactly $FPC_REQUIRED_VERSION"
+        elif fpc_works "$c"; then ok=yes; why=""
+        else ok=no; why="$FPC_PROBE_LOG"; fi
         paths+=("$c"); vers+=("$ver"); good+=("$ok"); whys+=("$why")
     done < <(fpc_candidates "$platform")
 
@@ -216,7 +223,7 @@ choose_fpc() {
         if [[ "${good[$i]}" == yes ]]; then
             printf "  %d) FPC %-8s %s\n" "$((i+1))" "${vers[$i]}" "${paths[$i]}" >&2
         else
-            printf "  %d) FPC %-8s %s   ${YELLOW}[cannot compile - skipped]${NC}\n" \
+            printf "  %d) FPC %-8s %s   ${YELLOW}[skipped]${NC}\n" \
                    "$((i+1))" "${vers[$i]}" "${paths[$i]}" >&2
             # ...and WHY, in the compiler's own words. A verdict with no reason is not actionable.
             if [[ -n "${whys[$i]}" ]]; then
@@ -232,8 +239,10 @@ choose_fpc() {
     local -a usable=()
     for ((i=0; i<n; i++)); do [[ "${good[$i]}" == yes ]] && usable+=("$i"); done
     if [[ ${#usable[@]} -eq 0 ]]; then
-        echo -e "${RED}ERROR: none of them can compile a trivial program.${NC}" >&2
-        echo -e "${YELLOW}An install without a usable fpc.cfg is the usual cause.${NC}" >&2
+        echo -e "${RED}ERROR: none of them is usable.${NC}" >&2
+        echo -e "${YELLOW}SedaiBasic needs Free Pascal $FPC_REQUIRED_VERSION exactly; an install${NC}" >&2
+        echo -e "${YELLOW}without a usable fpc.cfg is the other usual cause. The reason is printed${NC}" >&2
+        echo -e "${YELLOW}under each one above.${NC}" >&2
         return 1
     fi
 
