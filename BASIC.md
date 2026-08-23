@@ -242,6 +242,14 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- **`INP` / `OUT` / `WAIT`**: a portable VM has no hardware ports. `INP` answers **-8** — fbc's own
+  answer where the OS denies port access, and the negation of its runtime error 8 (*No privileges*);
+  `OUT` is a no-op and `WAIT` returns immediately. Where the OS *does* grant access fbc reads real
+  ports and we still cannot, which is the declared part.
+  ⛔ Not implemented: fbc's graphics library hooks `&h3C7`/`&h3C8`/`&h3C9` while a graphics mode is up
+  to emulate QB's VGA palette. The manual calls that use deprecated and no example in the FreeBASIC
+  distribution uses it; the measured protocol is written out in
+  `job/tests/bas/hw_ports_no_access.bas` so implementing it later needs no new measurement.
 - ⚠️ **Keyboard input on the headless Linux build**: `TTerminalInput.ProcessEvents` is implemented for
   Windows only, so under `sb` on Unix no key can ever reach `INKEY` / `GETKEY` from a real terminal.
   ⭐ This is *not* observable as a divergence — fbc's `INKEY` reads the console, not stdin, so with
