@@ -242,6 +242,13 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- **`POS` and `CSRLIN` count from 1** in MODERN, as FreeBASIC does (*"The topmost row is number 1"*);
+  in CLASSIC they keep the Commodore numbering from 0. `Color()` before any `COLOR` statement reports
+  `0` on `0`, measured.
+  ⚠️ **Declared divergence**: we *track* the cursor column and fbc, on Linux, does not — measured on a
+  real pty, its `POS` answers `1` however much has been printed. Ours answers the true column, which
+  is what the manual describes; theirs is a missing implementation on this platform, so the manual's
+  own `console/pos` example cannot agree with both.
 - **`INP` / `OUT` / `WAIT`**: a portable VM has no hardware ports. `INP` answers **-8** — fbc's own
   answer where the OS denies port access, and the negation of its runtime error 8 (*No privileges*);
   `OUT` is a no-op and `WAIT` returns immediately. Where the OS *does* grant access fbc reads real

@@ -1302,7 +1302,10 @@ begin
   // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
   FGfxForeColor := $FFFFFFFF;
   FGfxBackColor := $FF000000;   // opaque black, ARGB - what fbc reads back from an untouched screen
-  FConColorFg := 7;   // fbc's console defaults, which "Color()" reports before any COLOR statement
+  // ⛔ ZERO, and it was 7 on an assumption. The comment claimed these were "fbc's console defaults,
+  // which Color() reports before any COLOR statement" - measured, fbc reports 0 there. The example
+  // that caught it reads Color() before issuing any COLOR at all, so it measures exactly this value.
+  FConColorFg := 0;
   FConColorBg := 0;
   // FreeBASIC page flipping: single page (the screen) until SCREENRES requests more.
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
@@ -13947,7 +13950,12 @@ begin
     10: // bcLoadCWDS - return current working directory
       Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
     11: // bcCsrlin - return current text cursor row (VM-tracked, parallels POS/CursorCol)
-      Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow;
+      // ⛔ ONE-BASED IN MODERN, for the same reason POS is: the manual says "The topmost row is
+      // number 1". CLASSIC keeps the Commodore numbering.
+      if Assigned(FProgram) and FProgram.ModernMode then
+        Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow + 1
+      else
+        Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow;
     12: // bcLoadDS - Commodore disk status code = last file-operation error code (0 = OK)
       Ctx.IntRegs[Instr.Dest] := Ctx.LastErrorCode;
     13: // bcLoadDSS - Commodore disk status message line "NN, MESSAGE,00,00"
@@ -14270,9 +14278,15 @@ begin
       end;
     16: // bcGraphicPos - POS(x)
       begin
-        // Return cursor column position (0-indexed, consistent with TAB)
-        // Use Ctx.CursorCol which is tracked by the VM during PRINT operations
-        Ctx.IntRegs[Instr.Dest] := Ctx.CursorCol;
+        // Cursor column, tracked by the VM during PRINT.
+        // ⛔ ONE-BASED IN MODERN. FreeBASIC counts the leftmost column as 1 (CSRLIN's page says it
+        // outright for rows: "The topmost row is number 1"), and we answered 0 - so every FreeBASIC
+        // program reading POS was off by one, silently. Commodore counts from 0 and CLASSIC keeps it:
+        // the two dialects number their columns differently and they stay apart.
+        if Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.IntRegs[Instr.Dest] := Ctx.CursorCol + 1
+        else
+          Ctx.IntRegs[Instr.Dest] := Ctx.CursorCol;
       end;
     17: // bcGraphicRclr - RCLR(n)
       if Assigned(FOutputDevice) then
