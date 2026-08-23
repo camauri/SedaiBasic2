@@ -174,9 +174,18 @@ function Get-FpcCandidates {
 # Does this compiler actually COMPILE? Not "does the binary run" - fpc -iV answers happily on an
 # install whose RTL it cannot find, which is exactly the case that broke. The only honest test is a
 # build, done the way this script builds: with no explicit config file.
+# The compiler's OWN message from the last failed probe. ⛔ It used to be written to a log inside a
+# temp directory that the finally block then DELETED: the script reported "cannot compile" and
+# destroyed the only thing that says why. Two people setting the project up hit exactly that and could
+# not tell whether the verdict was even true. The probe is a bare "fpc -o<path> probe.pas" over
+# "begin end.", and its failure is nearly always a missing or unusable fpc.cfg - which the compiler
+# names outright ("Can't find unit system used by Program").
+$script:FpcProbeLog = ''
+
 function Test-FpcWorks {
     param([string]$Fpc)
 
+    $script:FpcProbeLog = ''
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("sedai_fpcprobe_" + [Guid]::NewGuid().ToString('N'))
     # ⛔ This script runs under $ErrorActionPreference = 'Stop', where a native command writing to
     # stderr can raise a terminating error. A compiler that merely WARNS would then be recorded as
@@ -191,16 +200,24 @@ function Test-FpcWorks {
         $out = Join-Path $dir 'probe.exe'
         $log = Join-Path $dir 'probe.log'
         $global:LASTEXITCODE = 0
-        & $Fpc "-o$out" $src > $log 2> $log
-        return (($LASTEXITCODE -eq 0) -and (Test-Path $out))
+        & $Fpc "-o$out" $src > $log 2>&1
+        $ok = (($LASTEXITCODE -eq 0) -and (Test-Path $out))
+        if (-not $ok -and (Test-Path $log)) {
+            # The first few real lines carry the reason; the banner above them is noise.
+            $lines = @(Get-Content $log |
+                       Where-Object { $_ -notmatch '^(Free Pascal Compiler|Copyright|Target OS:|Compiling |Linking )' -and $_.Trim() -ne '' })
+            if ($lines.Count -eq 0) { $lines = @(Get-Content $log) }
+            $script:FpcProbeLog = ($lines | Select-Object -First 4) -join "`n"
+        }
+        return $ok
     } catch {
+        $script:FpcProbeLog = "$_"
         return $false
     } finally {
         $ErrorActionPreference = $prev
         Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-
 # ...\bin\<platform>\fpc.exe -> ...   (the root form FpcPath has always held). Anything else has no
 # such root and returns $null.
 function Get-FpcRoot {
@@ -238,7 +255,8 @@ function Select-Fpc {
         $ver = ''
         try { $ver = (& $p -iV 2>$null) } catch { $ver = '' }
         if (-not $ver) { continue }
-        $rows += [PSCustomObject]@{ Path = $p; Version = "$ver".Trim(); Works = (Test-FpcWorks -Fpc $p) }
+        $works = Test-FpcWorks -Fpc $p
+        $rows += [PSCustomObject]@{ Path = $p; Version = "$ver".Trim(); Works = $works; Why = $script:FpcProbeLog }
     }
 
     if ($rows.Count -eq 0) {
@@ -255,6 +273,12 @@ function Select-Fpc {
             Write-Host ("  {0}) FPC {1,-8} {2}" -f ($i + 1), $r.Version, $r.Path)
         } else {
             Write-Host ("  {0}) FPC {1,-8} {2}   [cannot compile - skipped]" -f ($i + 1), $r.Version, $r.Path) -ForegroundColor Yellow
+            # ...and WHY, in the compiler's own words. A verdict with no reason is not actionable.
+            if ($r.Why) {
+                foreach ($line in ($r.Why -split "`n")) {
+                    if ($line.Trim() -ne '') { Write-Host ("       " + $line) -ForegroundColor Yellow }
+                }
+            }
         }
     }
     Write-Host ""
