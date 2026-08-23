@@ -470,6 +470,7 @@ var
   LStart, LSize: Int64;
   LGot, LIdx, LOld, LUsed: Integer;
   LTerm: Boolean;
+  LInQ: Boolean;      // INPUT#: inside a "..." field, where a comma is text
   LWant: Integer;      // INPUT(n [, #f]): bytes requested, carried in through Data
   Ch2: Char;
 begin
@@ -651,6 +652,7 @@ begin
     Line := '';
     LUsed := 0;                          // bytes of the file consumed, terminator included
     LTerm := False;
+    LInQ := False;                       // inside a "..." field: see the comma rule below
     while not LTerm do
     begin
       FS.Position := LStart + LUsed;
@@ -660,8 +662,12 @@ begin
       while LIdx < LGot do
       begin
         if (LBuf[LIdx] = 10) or (LBuf[LIdx] = 13) then Break;
-        // A comma separates fields for INPUT#, but is ordinary text for LINE INPUT#.
-        if (LBuf[LIdx] = Ord(',')) and (Command = 'INPUT#') then Break;
+        // ⛔ A COMMA INSIDE QUOTES IS TEXT, not a separator. INPUT# used to break on every comma and
+        // keep the quotes, so `Write #1, "a,b", -1` read back as the two fields `"a` and (nothing),
+        // where fbc reads `a,b` and `-1`. Measured against fbc 23 Aug 2026; the quotes themselves are
+        // stripped below, once the whole field is in hand.
+        if (Command = 'INPUT#') and (LBuf[LIdx] = Ord('"')) then LInQ := not LInQ;
+        if (LBuf[LIdx] = Ord(',')) and (Command = 'INPUT#') and (not LInQ) then Break;
         Inc(LIdx);
       end;
       if LIdx > 0 then                   // the data before the terminator, appended in one Move
@@ -696,6 +702,11 @@ begin
       LTerm := True;
     end;
     FS.Position := LStart + LUsed;       // where the byte-at-a-time loop would have stopped
+    // A quoted field yields its CONTENT: `"con virgolette"` is `con virgolette`. LINE INPUT# keeps the
+    // line exactly as written, quotes included, which is its whole point.
+    if (Command = 'INPUT#') and (Length(Line) >= 2) and
+       (Line[1] = '"') and (Line[Length(Line)] = '"') then
+      Line := Copy(Line, 2, Length(Line) - 2);
     Data := Line;
   end
   else if (Command = 'PRINT#') or (Command = 'CMD') or (Command = 'APPEND') or (Command = 'WRITE#') then
