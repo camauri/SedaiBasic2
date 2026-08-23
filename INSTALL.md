@@ -122,7 +122,15 @@ spelling. If you install one yourself, use [w64devkit](https://github.com/skeeto
 no installer) or [MSYS2](https://www.msys2.org/) (`pacman -S mingw-w64-x86_64-gcc`).
 
 ⭐ **Only the compiler proper is needed.** The build never *links* with it — it runs `gcc -c` and
-hands the object to FPC — so no linker, no CRT and no import libraries are involved.
+hands the object to FPC — so no linker, no CRT and no import libraries are involved. Measured: the
+object it produces has three undefined symbols, all of them ours.
+
+⭐ **Which MinGW flavour does not matter.** UCRT vs MSVCRT, SEH vs SJLJ, POSIX vs win32 threads —
+every one of those distinguishes *link-time and runtime* behaviour, and we never link. Verified by
+building the object with a win32-threads toolchain: same three symbols, nothing from the CRT. Take
+whatever x86_64 build is convenient. ⚠️ The one thing worth re-checking on a much newer GCC is not
+correctness but the *gain*: `-falign-labels=32 -falign-jumps=32 -fno-crossjumping` are exactly the
+options whose value shifts between compiler versions, so re-measure rather than assume the 27–45%.
 
 Without it the build still succeeds and says so; you get a slower interpreter, not a failure. Pass
 `-NoHotC` to leave it out on purpose, or `-HotC` to make a missing compiler an error instead of a
