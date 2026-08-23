@@ -596,8 +596,8 @@ const
     the FreeBASIC one, this target being MODERN-only, and a DIFFERENT table from
     the Commodore GetErrorCodeDescription, sharing only numbers - so
     the two cannot drift apart by a word. Codes with no message of their own
-    hold 0 here and are rendered at run time as "ERROR n". }
-  { ⭐ The codes are TWO ranges, not one - 0..41 from Commodore BASIC and
+    hold 0 here and are rendered at run time as "user error n". }
+  { ⭐ The codes are TWO ranges, not one - 0..41 and
     100..113 added by this project - so the table is 56 compact slots instead of
     114, which is what makes it fit at all. Slot 56 holds the word the fallback
     needs. }
