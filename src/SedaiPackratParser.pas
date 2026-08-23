@@ -6415,10 +6415,17 @@ begin
     // program did not fail - it wrote its diagnostics into a file called "0" in the working directory,
     // while BASIC.md ticked "OPEN ERR" as implemented. A word followed by FOR can only be the device
     // form here; the error-code function is never followed by FOR.
+    // ⚠️ ...and the FOR clause is OPTIONAL: fbc takes "Open Err As #1" as readily as
+    // "Open Err For Output As #1". Requiring FOR sent the bare form back to the expression parser,
+    // where ERR is the error-code function - so it evaluated to 0 and became the FILENAME again, the
+    // very defect the note above describes, just through the other door. A device word can only be a
+    // device when the next token is FOR or AS.
     if ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'SCRN') or
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ERR')) and
-       Assigned(Context.PeekNext) and (UpperCase(VarToStr(Context.PeekNext.Value)) = kFOR) then
+       Assigned(Context.PeekNext) and
+       ((UpperCase(VarToStr(Context.PeekNext.Value)) = kFOR) or
+        (UpperCase(VarToStr(Context.PeekNext.Value)) = kAS)) then
     begin
       Param := TASTNode.CreateWithValue(antLiteral,
                  UpperCase(VarToStr(Context.CurrentToken.Value)) + ':', Context.CurrentToken);

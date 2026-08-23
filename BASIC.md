@@ -242,6 +242,10 @@ difference is stated rather than left to be discovered.
   greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
   channel like the other three. Same position as the float double-rounding above: where fbc is
   measurably wrong we do not follow, and we declare it.
+- ⛔ **`OPEN PIPE` is not implemented** (neither the statement nor the function form). fbc runs the
+  command and binds its stdout/stdin to the handle; we refuse it at the parser. `OPEN CONS`,
+  `OPEN SCRN` and `OPEN ERR` all work, with or without the `FOR` clause, and `SHELL`'s exit code
+  matches fbc exactly.
 - **`PALETTE`**: a MODERN (`ScreenRes`/`Screen`) screen carries **FreeBASIC's** default 256-colour
   table, and `PALETTE` with no arguments resets to *that*; a CLASSIC screen keeps the Commodore one
   and its own reset. Two tables, two dialects, never mixed — the same rule the error-code tables

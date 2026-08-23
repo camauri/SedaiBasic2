@@ -29,7 +29,10 @@ unit SedaiFileIO;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeVM
+  Classes, SysUtils, SedaiBytecodeVM,
+  // TerminalOutFlush: the console keeps its OWN stdout buffer, so anything that writes through
+  // System.Write has to drain it first or the two arrive out of order. See the SCRN/CONS device write.
+  SedaiTerminalIO
   // Only to ask whether stdin is a console: the buffered reader must not read ahead on a terminal.
   {$IFDEF WINDOWS}, Windows{$ELSE}, termio{$ENDIF};
 
@@ -541,8 +544,21 @@ begin
     end;
     if (Command = 'PRINT#') or (Command = 'WRITE#') or (Command = 'CMD') or (Command = 'APPEND') then
     begin
+      // ⛔ TWO WRITERS ON ONE STREAM, AND THE ORDER WAS WRONG. Ordinary PRINT goes through the
+      // terminal's OWN buffer (OutWrite), which under a pipe is drained only at exit; this one goes
+      // through Pascal's Output. So "Open Scrn ... : Print #s, a : Print b" delivered them in
+      // whichever order the two buffers happened to drain - every byte correct, every byte present,
+      // and the sequence wrong.
+      // ⭐ The cure was already written down: TerminalOutFlush's own comment says "any code that
+      // writes through System.Write/WriteLn while a program's output may still be buffered MUST call
+      // this first, or its text jumps ahead of text that was produced before it". This was that code.
+      TerminalOutFlush;
       if FDeviceKind[Handle] = 3 then System.Write(System.ErrOutput, Data)
-      else System.Write(System.Output, Data);
+      else
+      begin
+        System.Write(System.Output, Data);
+        System.Flush(System.Output);   // ...and do not let the NEXT console write overtake this one
+      end;
       Exit;
     end;
     // INPUT(n [, #f]) on a DEVICE. These used to fall through to the Exit below and answer an empty
