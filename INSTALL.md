@@ -21,7 +21,7 @@ without it, and that is the exception, not the normal case.
 |---|---|---|
 | **Free Pascal 3.2.2** | everything | always |
 | **libSDL2** + **libSDL2_ttf** | **graphics AND audio** — the window, every drawing primitive, every sound | development files to build `sbv` and any target with audio; runtime files to run anything that draws or plays |
-| **A C compiler** (gcc or clang) | the C hot loop, worth **27–45%** | optional — without it the build succeeds and the interpreter is slower |
+| **GCC** (MinGW-w64 on Windows) | the C hot loop, worth **27–45%** | optional — without it the build succeeds and the interpreter is slower |
 | **SDL2 Pascal bindings** | compiling the SDL2 units | shipped in `deps/sdl2`; nothing to install |
 | **SedaiAudioFoundation** | the audio subsystem itself | optional, auto-detected; it drives SDL2's audio device |
 
@@ -109,18 +109,24 @@ in `probe.pas` and run `fpc probe.pas`. If it fails, generate the config:
 <fpcroot>\bin\x86_64-win64\fpcmkcfg.exe -d basepath=<fpcroot> -o <fpcroot>\bin\x86_64-win64\fpc.cfg
 ```
 
-### 2. A C compiler — gcc or MSVC
+### 2. GCC — the C hot loop
 
-The C hot loop (`src/hotdisp.c`) is compiled by a C compiler, not by FPC, and is worth 27–45% where
-it applies. Either:
+The hot dispatch arms (`src/hotdisp.c`) are compiled by a C compiler, not by FPC, and are worth
+27–45% where they apply. `setup.ps1` installs one into `deps\gcc` and `build.ps1` picks it up from
+there; the build also accepts a `gcc.exe` on the `PATH`, or one named by `SEDAI_CC`.
 
-- **MinGW-w64 gcc** — via [w64devkit](https://github.com/skeeto/w64devkit) (one zip, no installer),
-  [MSYS2](https://www.msys2.org/) (`pacman -S mingw-w64-x86_64-gcc`), or a TDM-GCC build; or
-- **Microsoft's compiler** — the *Build Tools for Visual Studio*, C++ workload.
+⛔ **GCC, not "a C compiler".** The flag set is GCC's and it is not decoration: `-fno-crossjumping`
+alone is worth spectral-norm −16.1%, because it stops the compiler merging the replicated dispatch
+tails that give every arm its own branch-predictor history. Microsoft's compiler has no equivalent
+spelling. If you install one yourself, use [w64devkit](https://github.com/skeeto/w64devkit) (one zip,
+no installer) or [MSYS2](https://www.msys2.org/) (`pacman -S mingw-w64-x86_64-gcc`).
 
-⛔ **Not wired up yet on Windows.** `build.ps1` does not compile `hotdisp.c` today, so a Windows build
-currently has no C hot loop however the compiler was installed. The cross-build from Linux does
-(`./build.sh sb --os win64`, needing `x86_64-w64-mingw32-gcc`).
+⭐ **Only the compiler proper is needed.** The build never *links* with it — it runs `gcc -c` and
+hands the object to FPC — so no linker, no CRT and no import libraries are involved.
+
+Without it the build still succeeds and says so; you get a slower interpreter, not a failure. Pass
+`-NoHotC` to leave it out on purpose, or `-HotC` to make a missing compiler an error instead of a
+note.
 
 ### 3. SDL2 and SDL2_ttf — for graphics and for audio
 

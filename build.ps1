@@ -66,6 +66,12 @@ param(
     # Default off: the headless sb (regression target) takes no SDL2 window dependency.
     [switch]$Window,
 
+    # The C hot loop (src/hotdisp.c), worth 27-45% where it applies. ON BY DEFAULT when a C
+    # compiler is there; -NoHotC leaves it out, -HotC makes a missing compiler an ERROR
+    # instead of a note (the difference between "it is the default" and "I asked for it").
+    [switch]$HotC,
+    [switch]$NoHotC,
+
     [ValidateSet('x86_64', 'i386', 'aarch64', '')]
     [string]$CPU = 'x86_64',
 
@@ -95,6 +101,7 @@ $Script:ConfigFile = Join-Path $ProjectRoot 'setup.config.json'
 $Script:UserConfig = @{
     FpcPath = $null
     SDL2Path = $null
+    GccPath = $null
     RuntimePath = $null
     SedaiAudioPath = $null
 }
@@ -110,6 +117,7 @@ function Load-BuildConfig {
             $json = Get-Content $ConfigFile -Raw | ConvertFrom-Json
             if ($json.FpcPath) { $Script:UserConfig.FpcPath = $json.FpcPath }
             if ($json.SDL2Path) { $Script:UserConfig.SDL2Path = $json.SDL2Path }
+            if ($json.GccPath) { $Script:UserConfig.GccPath = $json.GccPath }
             if ($json.RuntimePath) { $Script:UserConfig.RuntimePath = $json.RuntimePath }
             if ($json.SedaiAudioPath) { $Script:UserConfig.SedaiAudioPath = $json.SedaiAudioPath }
             return $true
@@ -851,6 +859,40 @@ if ($Window) {
     Write-Host "Window presenter: ENABLED (sb --window available)" -ForegroundColor Magenta
 }
 
+# The C hot loop, resolved once for the whole run. It is a {$DEFINE}, so a build that changes it
+# needs -Clean on BOTH sides of a comparison or FPC reuses the units and the difference reads as zero.
+$hotCEnabled = $false
+if (-not $NoHotC) {
+    if ($OS -ne 'win64') {
+        # An object for the WRONG target fails at link with no useful message. Cross-building from
+        # Windows would need a cross gcc, which is not what this script is for.
+        if ($HotC) {
+            Write-Host "ERROR: -HotC is only supported for the native win64 build (asked for: $OS)." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "NOTE: building for $OS - the C hot loop is left out (native win64 only here)." -ForegroundColor Yellow
+    } else {
+        $ccBin = Find-CCompiler -ProjectRoot $ProjectRoot
+        if ($ccBin) {
+            if (Build-HotDisp -Cc $ccBin -ProjectRoot $ProjectRoot) {
+                $debugDefines += 'HOT_C'
+                $hotCEnabled = $true
+                Write-Host "C hot loop: ENABLED ($ccBin)" -ForegroundColor Magenta
+            } else {
+                if ($HotC) { exit 1 }
+                Write-Host "NOTE: hotdisp.c did not compile - building WITHOUT the C hot loop." -ForegroundColor Yellow
+            }
+        } elseif ($HotC) {
+            Write-Host "ERROR: -HotC needs a C compiler (gcc) and none was found." -ForegroundColor Red
+            Write-Host "  .\setup.ps1 installs one into deps\gcc, or see INSTALL.md." -ForegroundColor Gray
+            exit 1
+        } else {
+            Write-Host "NOTE: no C compiler - building WITHOUT the C hot loop (27-45% slower where it applies)." -ForegroundColor Yellow
+            Write-Host "  .\setup.ps1 installs one into deps\gcc, or pass -NoHotC to silence this." -ForegroundColor Gray
+        }
+    }
+}
+
 # ============================================================================
 #  DEPENDENCY PREFLIGHT
 #
@@ -865,6 +907,80 @@ if ($Window) {
 #  outside a real, digitally signed installer. The report says what to fetch and
 #  from where, and the person fetching it knows what they are running.
 # ============================================================================
+
+
+# ============================================================================
+#  C HOT LOOP
+#
+#  ⭐ The hot arithmetic/branch/array dispatch arms are compiled by a C compiler
+#  rather than by FPC (src/hotdisp.c). Measured on the same dispatch loop, gcc -O2
+#  runs it in 253 ms against FPC's 443, and no FPC optimisation level closes any of
+#  that. Worth 27-45% wherever it applies.
+#
+#  ⛔ GCC, not "a C compiler". The flags are GCC's and are not decoration:
+#  -fno-crossjumping alone is worth spectral-norm -16.1%, because it stops the
+#  compiler merging the replicated dispatch tails that give every arm its own
+#  branch-predictor history. MSVC has no equivalent spelling. clang takes most of
+#  the rest but not that one, so it is accepted with a warning, not preferred.
+#
+#  ⭐ ONLY THE COMPILER PROPER IS NEEDED - the build never LINKS with it. It runs
+#  "gcc -c" and hands the object to FPC's {$L}, so no linker, no CRT and no import
+#  libraries are involved.
+#
+#  A machine with no C compiler still builds: the loop is simply left out and the
+#  build says so. Asking for it explicitly (-HotC) turns that into an error, which
+#  is the difference between "it is the default" and "I asked for it".
+# ============================================================================
+
+function Find-CCompiler {
+    param([string]$ProjectRoot)
+
+    if ($env:SEDAI_CC -and (Test-Path $env:SEDAI_CC)) { return $env:SEDAI_CC }
+    # Whatever setup.ps1 recorded, then the one it installs: a CONFIGURED or project-local toolchain
+    # must beat whatever happens to be on the PATH, or two machines with the same repo build
+    # differently. The order is the same one setup.ps1's Test-GccInstallation uses, so the setup and
+    # the build can never disagree about which compiler is "the" one.
+    if ($UserConfig -and $UserConfig.GccPath) {
+        $cfg = Join-Path $UserConfig.GccPath 'bin\gcc.exe'
+        if (Test-Path $cfg) { return $cfg }
+    }
+    $local = Join-Path $ProjectRoot 'deps\gcc\bin\gcc.exe'
+    if (Test-Path $local) { return $local }
+    foreach ($n in @('gcc.exe', 'clang.exe')) {
+        $found = Get-Command $n -ErrorAction SilentlyContinue
+        if ($found) { return $found.Source }
+    }
+    return $null
+}
+
+function Build-HotDisp {
+    param([string]$Cc, [string]$ProjectRoot)
+
+    $src = Join-Path $ProjectRoot 'src\hotdisp.c'
+    $obj = Join-Path $ProjectRoot 'src\hotdisp.o'
+    if (!(Test-Path $src)) { return $false }
+
+    # The SAME flags build.sh uses. They are measured, and the alignment ones are
+    # machine-specific by nature - see the notes in CLAUDE.md before changing any of them.
+    $ccArgs = @('-O2', '-ffreestanding', '-fno-math-errno',
+                '-falign-labels=32', '-falign-jumps=32', '-fno-crossjumping',
+                '-c', '-o', $obj, $src)
+    $log = Join-Path ([System.IO.Path]::GetTempPath()) ("sedai_hotc_" + [Guid]::NewGuid().ToString('N') + ".log")
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 0
+    & $Cc @ccArgs > $log 2>&1
+    $ok = (($LASTEXITCODE -eq 0) -and (Test-Path $obj))
+    $ErrorActionPreference = $prev
+    if (-not $ok) {
+        Write-Host "ERROR: could not compile src/hotdisp.c" -ForegroundColor Red
+        if (Test-Path $log) {
+            Get-Content $log | Select-Object -First 6 | ForEach-Object { Write-Host "       $_" -ForegroundColor Yellow }
+        }
+    }
+    Remove-Item $log -Force -ErrorAction SilentlyContinue
+    return $ok
+}
 
 $Script:Deps = @()
 
@@ -892,17 +1008,15 @@ function Collect-Deps {
     # Without it there is no window, no drawing and no sound - it is not an accessory.
     $needsSdl = $AudioOn -or ($TargetList -contains 'sbv')
 
-    # A C compiler. ⚠️ Advisory today: build.ps1 does not compile src/hotdisp.c yet, so a Windows
-    # build has no C hot loop however the compiler was installed. Reported so that anyone setting up
-    # a machine installs it once rather than twice.
-    $cc = $null
-    foreach ($n in @('gcc.exe', 'clang.exe', 'cl.exe')) {
-        $found = Get-Command $n -ErrorAction SilentlyContinue
-        if ($found) { $cc = $found.Source; break }
-    }
-    Add-Dep -Name 'a C compiler (gcc or MSVC)' -Ok ([bool]$cc) -Required $false `
-            -Why 'the C hot loop, worth 27-45% - NOT WIRED UP ON WINDOWS YET, see INSTALL.md' `
-            -How 'w64devkit, MSYS2 (pacman -S mingw-w64-x86_64-gcc), or Build Tools for Visual Studio'
+    # GCC, resolved exactly as the build resolves it - one place decides, so the report and the
+    # build can never disagree about whether the hot loop will be built.
+    # ⛔ GCC and not "a C compiler": -fno-crossjumping alone is worth spectral-norm -16.1% and MSVC
+    # has no equivalent spelling. (An earlier version of this line said "gcc or MSVC" and said the
+    # loop was not wired up on Windows. Both were true when written and neither is now.)
+    $cc = Find-CCompiler -ProjectRoot $ProjectRoot
+    Add-Dep -Name 'GCC (MinGW-w64)' -Ok ([bool]$cc) -Required $false `
+            -Why 'the C hot loop - WITHOUT IT THE INTERPRETER IS 27-45% SLOWER, but it still builds' `
+            -How '.\setup.ps1 installs one into deps\gcc - or w64devkit / MSYS2, see INSTALL.md'
 
     if ($needsSdl) {
         $bindings = Join-Path $Sdl2Path 'sdl2.pas'

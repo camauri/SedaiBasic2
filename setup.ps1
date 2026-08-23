@@ -19,6 +19,9 @@
 .PARAMETER BuildOnly
     Compile SedaiBasic2 only, skip FPC installation (requires FPC already installed)
 
+.PARAMETER ForceGcc
+    Force reinstallation of the GCC used for the C hot loop
+
 .PARAMETER ForceFpc
     Force reinstallation of FPC even if already present
 
@@ -52,6 +55,7 @@ param(
     [switch]$FpcOnly,
     [switch]$BuildOnly,
     [switch]$ForceFpc,
+    [switch]$ForceGcc,
     [switch]$Clean,
     [switch]$NonInteractive,
     [switch]$ResetConfig
@@ -67,7 +71,8 @@ $Script:ConfigFile = Join-Path $ProjectRoot "setup.config.json"
 # User configuration (loaded from file or set interactively)
 $Script:UserConfig = @{
     FpcPath = $null           # Custom FPC path (null = use default/download)
-    SDL2Path = $null          # Custom SDL2 bindings path
+    SDL2Path = $null
+    GccPath = $null          # Custom SDL2 bindings path
     RuntimePath = $null       # Custom runtime path
     SedaiAudioPath = $null    # Custom SedaiAudioFoundation path
 }
@@ -82,6 +87,7 @@ $Script:LibDir = "lib\$FpcArch"
 
 # SDL2 for Pascal paths
 $Script:SDL2Dir = Join-Path $ProjectRoot "deps\sdl2"
+$Script:GccDir = Join-Path $ProjectRoot "deps\gcc"
 $Script:SDL2Marker = Join-Path $SDL2Dir "sdl2.pas"
 
 # Runtime paths (SDL2 DLLs, fonts, etc.)
@@ -102,6 +108,7 @@ function Load-Config {
             $json = Get-Content $ConfigFile -Raw | ConvertFrom-Json
             if ($json.FpcPath) { $Script:UserConfig.FpcPath = $json.FpcPath }
             if ($json.SDL2Path) { $Script:UserConfig.SDL2Path = $json.SDL2Path }
+            if ($json.GccPath) { $Script:UserConfig.GccPath = $json.GccPath }
             if ($json.RuntimePath) { $Script:UserConfig.RuntimePath = $json.RuntimePath }
             if ($json.SedaiAudioPath) { $Script:UserConfig.SedaiAudioPath = $json.SedaiAudioPath }
             return $true
@@ -283,6 +290,23 @@ function Run-InteractiveSetup {
         $Script:UserConfig.SDL2Path = $null
     }
 
+    # 3b. GCC — the C hot loop
+    # ⛔ GCC, not "a C compiler": the flag set is GCC's, and -fno-crossjumping alone is worth
+    # spectral-norm -16.1%. MSVC has no equivalent spelling. Skipping this component is allowed
+    # and costs 27-45% wherever the hot loop applies; it never stops the build.
+    $gccResult = Prompt-ForPath `
+        -ComponentName "3b. GCC (MinGW-w64, for the C hot loop)" `
+        -Description "Compiles src/hotdisp.c - worth 27-45%; the build works without it" `
+        -ValidationFile "bin\gcc.exe" `
+        -DefaultDownloadPath $GccDir `
+        -CurrentValue $UserConfig.GccPath
+
+    if (-not $gccResult.UseDefault -and $gccResult.Path) {
+        $Script:UserConfig.GccPath = $gccResult.Path
+    } elseif ($gccResult.UseDefault) {
+        $Script:UserConfig.GccPath = $null
+    }
+
     # 4. SedaiAudioFoundation Configuration (optional)
     Write-Host ""
     Write-Host "  4. SEDAIAUDIOFOUNDATION (optional)" -ForegroundColor Cyan
@@ -377,6 +401,7 @@ function Show-Help {
     Write-Host "    -FpcOnly        Download and install FPC only, do not compile"
     Write-Host "    -BuildOnly      Compile SedaiBasic2 only, skip FPC installation"
     Write-Host "    -ForceFpc       Force reinstallation of FPC even if present"
+    Write-Host "    -ForceGcc       Force reinstallation of GCC (the C hot loop)"
     Write-Host "    -Clean          Clean build directories before compilation"
     Write-Host ""
     Write-Host "EXAMPLES:" -ForegroundColor Yellow
@@ -551,6 +576,35 @@ function Install-Fpc {
             return $false
         }
     }
+}
+
+function Install-Gcc {
+    $installScript = Join-Path $ProjectRoot "scripts\windows\install-gcc.ps1"
+
+    if (!(Test-Path $installScript)) {
+        Show-Status "GCC install script not found: $installScript" -Type "Error"
+        return $false
+    }
+
+    Show-Status "Running GCC installer..."
+
+    $params = @{}
+    if ($ForceGcc) { $params["Force"] = $true }
+
+    & $installScript @params
+    $exitCode = $LASTEXITCODE
+
+    switch ($exitCode) {
+        0 { Show-Status "GCC installed successfully" -Type "Success"; return $true }
+        5 { Show-Status "GCC already installed" -Type "Success"; return $true }
+        default { Show-Status "GCC installation failed (exit code: $exitCode)" -Type "Error"; return $false }
+    }
+}
+
+function Test-GccInstallation {
+    # The one the build will actually pick up, in the same order build.ps1 looks.
+    if ($UserConfig.GccPath) { return (Test-Path (Join-Path $UserConfig.GccPath "bin\gcc.exe")) }
+    return (Test-Path (Join-Path $ProjectRoot "deps\gcc\bin\gcc.exe"))
 }
 
 function Test-FpcInstallation {
@@ -914,6 +968,9 @@ function Invoke-Setup {
     }
     if ($UserConfig.SDL2Path) {
         $Script:SDL2Dir = $UserConfig.SDL2Path
+    }
+    if ($UserConfig.GccPath) {
+        $Script:GccDir = $UserConfig.GccPath
         $Script:SDL2Marker = Join-Path $SDL2Dir "sdl2.pas"
     }
     if ($UserConfig.RuntimePath) {
@@ -942,18 +999,21 @@ function Invoke-Setup {
     $doSDL2 = -not $FpcOnly         # Install SDL2 bindings unless FpcOnly
     $doRuntime = -not $FpcOnly      # Install runtime (SDL2 DLLs, fonts) unless FpcOnly
     $doSedaiAudio = (-not $FpcOnly) -and ($UserConfig.SedaiAudioPath -ne "disabled")
+    $doGcc = (-not $FpcOnly) -and ($UserConfig.GccPath -ne "disabled")
 
     # Skip download steps if user provided custom paths
     $skipFpcDownload = ($UserConfig.FpcPath -ne $null)
     $skipSDL2Download = ($UserConfig.SDL2Path -ne $null)
     $skipRuntimeDownload = ($UserConfig.RuntimePath -ne $null)
     $skipSedaiAudioDownload = ($UserConfig.SedaiAudioPath -ne $null)
+    $skipGccDownload = ($UserConfig.GccPath -ne $null)
 
     $totalSteps = 0
     if ($doFpc) { $totalSteps += 2 }        # Install + Verify
     if ($doRuntime) { $totalSteps += 1 }    # Runtime (DLLs, fonts)
     if ($doSDL2) { $totalSteps += 1 }       # SDL2 bindings
     if ($doSedaiAudio) { $totalSteps += 1 } # SedaiAudio (if not disabled)
+    if ($doGcc) { $totalSteps += 1 }        # GCC (the C hot loop)
     if ($doBuild) { $totalSteps += 1 }      # Build
 
     $currentStep = 0
@@ -1042,6 +1102,25 @@ function Invoke-Setup {
             if (!(Install-SedaiAudio)) {
                 Show-Status "SedaiAudioFoundation installation failed (audio support disabled)" -Type "Warning"
                 # Don't fail the setup, just warn - audio is optional
+            }
+        }
+    }
+
+    # Step: Install GCC (the C hot loop)
+    # ⚠️ NEVER fatal. Without it the build succeeds and the interpreter is 27-45% slower where the
+    # hot loop applies - a performance choice, not a broken install, and the message says which.
+    if ($doGcc) {
+        $currentStep++
+        Show-Step -Number $currentStep -Total $totalSteps -Title "Installing GCC (C hot loop)"
+
+        if ($skipGccDownload) {
+            Show-Status "Using custom GCC path: $($UserConfig.GccPath)" -Type "Info"
+        } elseif (Test-GccInstallation) {
+            Show-Status "GCC is already installed" -Type "Skip"
+        } else {
+            if (!(Install-Gcc)) {
+                Show-Status "GCC installation failed - the build will run WITHOUT the C hot loop" -Type "Warning"
+                Show-Status "  That costs 27-45% where it applies; everything still works." -Type "Info"
             }
         }
     }
