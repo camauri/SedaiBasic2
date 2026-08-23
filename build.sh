@@ -165,12 +165,27 @@ fpc_candidates() {
 # Does this compiler actually COMPILE? Not "does the binary run" - fpc -iV answers that happily on an
 # install whose RTL it cannot find. The only honest test is a build, done the way build.sh builds:
 # no explicit config file, because that is what the real invocation does.
+# The compiler's OWN message from the last failed probe, one per candidate (see choose_fpc). ⛔ It used
+# to go to /dev/null, and the twin in build.ps1 did the same: the script then reported "cannot compile"
+# and DESTROYED the only thing that says why. Two people setting the project up hit exactly that and
+# could not tell whether the verdict was even true - the probe is a bare "fpc -o<path> probe.pas" with
+# "begin end." in it, and its failure is nearly always a missing or unusable fpc.cfg, which the message
+# names outright.
+FPC_PROBE_LOG=""
+
 fpc_works() {
     local fpc="$1" d rc
+    FPC_PROBE_LOG=""
     d="$(mktemp -d)" || return 1
     printf 'begin end.\n' > "$d/probe.pas"
-    ( cd "$d" && "$fpc" -o"$d/probe" "$d/probe.pas" ) >/dev/null 2>&1
+    ( cd "$d" && "$fpc" -o"$d/probe" "$d/probe.pas" ) > "$d/probe.log" 2>&1
     rc=$?
+    if [[ $rc -ne 0 ]]; then
+        # The first few lines carry the reason; the banner above them is noise.
+        FPC_PROBE_LOG="$(grep -viE '^(Free Pascal Compiler|Copyright|Target OS:|Compiling |Linking )' \
+                          "$d/probe.log" 2>/dev/null | grep -v '^[[:space:]]*$' | head -n 4)"
+        [[ -n "$FPC_PROBE_LOG" ]] || FPC_PROBE_LOG="$(head -n 4 "$d/probe.log" 2>/dev/null)"
+    fi
     rm -rf "$d"
     return $rc
 }
@@ -189,14 +204,15 @@ fpc_root_of() {
 # this happens exactly once.
 choose_fpc() {
     local platform="$1" c ver ok n=0 sel root
-    local -a paths=() vers=() good=()
+    local -a paths=() vers=() good=() whys=()
+    local why
 
     while read -r c; do
         [[ -n "$c" ]] || continue
         ver="$("$c" -iV 2>/dev/null)"
         [[ -n "$ver" ]] || continue
-        if fpc_works "$c"; then ok=yes; else ok=no; fi
-        paths+=("$c"); vers+=("$ver"); good+=("$ok")
+        if fpc_works "$c"; then ok=yes; why=""; else ok=no; why="$FPC_PROBE_LOG"; fi
+        paths+=("$c"); vers+=("$ver"); good+=("$ok"); whys+=("$why")
     done < <(fpc_candidates "$platform")
 
     n=${#paths[@]}
@@ -214,6 +230,12 @@ choose_fpc() {
         else
             printf "  %d) FPC %-8s %s   ${YELLOW}[cannot compile - skipped]${NC}\n" \
                    "$((i+1))" "${vers[$i]}" "${paths[$i]}" >&2
+            # ...and WHY, in the compiler's own words. A verdict with no reason is not actionable.
+            if [[ -n "${whys[$i]}" ]]; then
+                while IFS= read -r line; do
+                    [[ -n "$line" ]] && printf "       ${YELLOW}%s${NC}\n" "$line" >&2
+                done <<< "${whys[$i]}"
+            fi
         fi
     done
     echo "" >&2
