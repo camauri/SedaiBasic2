@@ -147,6 +147,7 @@ begin
     bcRecordNewArrayInd,  // array-of-UDT member alloc: Src1 = member array-handle reg (int)
     bcRecordNewBlock,     // Callocate block: Src1 = count reg (int)
     bcRecordReallocBlock, // ...and its resize: Dest = new first handle, Src1 = old handle, Src2 = count reg
+    bcRecordBlockLen,     // ...and its length: Src1 = the block's first handle (int)
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
     bcThreadCreate, bcThreadWait, bcThreadDetach,
@@ -532,7 +533,7 @@ begin
     // SUB/FUNCTION transfer-register load (M2): Dest is the int register written.
     bcXferLoadInt,
     // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
-    bcRecordNew, bcRecordNewBlock, bcRecordReallocBlock, bcRecordLoadInt,
+    bcRecordNew, bcRecordNewBlock, bcRecordReallocBlock, bcRecordBlockLen, bcRecordLoadInt,
     // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).

@@ -1952,7 +1952,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame |
+| `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame. `NEW T[n]` allocates **n** contiguous elements and `DELETE[] p` releases them: when `T` has a constructor or a destructor each element gets its own, in element order; when it has neither the block is plain bytes, so a program may lay a byte view over it or `memcopy` it. `NEW T PTR [n]` allocates an array of POINTERS, which is how a 2-dimensional object array is built — `p[i] = NEW T[m]`, then `p[i][j].field` and `DELETE[] p[i]`. |
 | `New Overload` | N/A | A member `OPERATOR NEW` replaces the *allocation* step with user code returning a raw address. `NEW T` here yields a managed record handle — a slot in the VM's record table, not an address the program could have allocated — so a user allocator cannot be honoured. Constructor overloads do apply. |
 | `Placement New` | N/A | `NEW(address) T` constructs an object at a caller-supplied address. Records live in the VM's managed table, not at raw addresses; the all-raw object model was evaluated and rejected because it conflicts with value semantics, RAII, virtual dispatch and threading. |
 | `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor and frees the heap record (slot recycled via a free list) |

@@ -680,6 +680,7 @@ type
     procedure GrowSharedRecords(NeedLen: Integer);
     function AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
     function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
+    function SharedRecordBlockLen(Handle: Int64): Int64;
     function ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
@@ -5566,6 +5567,20 @@ begin
   Result := SHARED_REC_FLAG or Int64(firstIdx);
 end;
 
+function TBytecodeVM.SharedRecordBlockLen(Handle: Int64): Int64;
+// How many CONSECUTIVE records the block starting at Handle holds. Only the FIRST record of a block
+// carries the number (AllocSharedRecordBlock writes it there), so anything else - a lone record, a
+// handle into the middle - answers 1, which is what "Delete[] p" on a single object must do.
+var
+  Idx: Integer;
+begin
+  Result := 1;
+  if (Handle and SHARED_REC_FLAG) = 0 then Exit;
+  Idx := Integer(Handle and not SHARED_REC_FLAG);
+  if (Idx < 0) or (Idx >= FSharedRecordCount) then Exit;
+  if FSharedRecords[Idx]^.BlockLen > 1 then Result := FSharedRecords[Idx]^.BlockLen;
+end;
+
 function TBytecodeVM.ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;
 // FreeBASIC "p = Reallocate(p, n * SizeOf(T))" where p is a MANAGED block of UDT records: give the block
 // NewN records, keeping the contents of the ones already there.
@@ -8090,6 +8105,8 @@ begin
                                    Integer(Ctx.IntRegs[Instr.Src2]),
                                    Instr.Immediate and $FFFF,
                                    (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
+    bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
+      Ctx.IntRegs[Instr.Dest] := SharedRecordBlockLen(Ctx.IntRegs[Instr.Src1]);
     bcRecordFree:
       FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).

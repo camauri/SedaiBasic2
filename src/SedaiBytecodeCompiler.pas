@@ -320,6 +320,7 @@ begin
     ssaRecordNewArrayInd: Result := bcRecordNewArrayInd;
     ssaRecordNewBlock: Result := bcRecordNewBlock;
     ssaRecordReallocBlock: Result := bcRecordReallocBlock;
+    ssaRecordBlockLen: Result := bcRecordBlockLen;
     ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecordSetTypeId: Result := bcRecordSetTypeId;
     ssaRecordFree: Result := bcRecordFree;     // DELETE

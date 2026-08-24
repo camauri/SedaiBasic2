@@ -338,6 +338,7 @@ type
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
+    FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
@@ -380,6 +381,7 @@ type
     // SUB/FUNCTION (M2): pre-scan the AST to register all declarations up front (so CALL
     // sites resolve parameter info even for procedures defined later); collect a declaration
     // for deferred lowering; lower a CALL site; lower all bodies after the module END.
+    procedure CollectBlockManagedTypes(Node: TASTNode);  // pre-scan: types with a CONSTRUCTOR/DESTRUCTOR body
     procedure PreCollectProcedures(Node: TASTNode);
     procedure CollectProcedureDecl(Node: TASTNode);
     procedure ProcessProcedureCall(Node: TASTNode);
@@ -453,7 +455,10 @@ type
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
-    procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);  // init each of N records  // alloc nested records
+    procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);
+    function UDTBlockIsManaged(const TypeName: string): Boolean;
+    procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
+                                      const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
     procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
                                        FromFlatIndex: Integer);  // ...and the CONSTRUCTOR on each element
@@ -1216,6 +1221,9 @@ begin
   FRawUDTPtrs := TStringList.Create;
   FRawUDTPtrs.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
+  FBlockManagedTypes := TStringList.Create;
+  FBlockManagedTypes.Sorted := True;
+  FBlockManagedTypes.Duplicates := dupIgnore;
   FWStringVars := TStringList.Create;
   FWStringVars.CaseSensitive := False;
   FRedimMultiArrays := TStringList.Create;
@@ -1313,6 +1321,7 @@ begin
   FAddrLocalVars.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
+  FBlockManagedTypes.Free;
   FRawUDTPtrs.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
@@ -19451,6 +19460,11 @@ begin
   end
   else
     Exit;
+  // ⛔ A MANAGED element is not bytes. When the pointee is a UDT with a constructor or a destructor,
+  // "New T[n]" gave a block of RECORDS and the value is a HANDLE: the next index is "handle + j", not
+  // "base + j*SizeOf(T)", and the field is a record slot rather than a byte offset. Decline here and let
+  // ResolveRecordObject own the shape, or the stride would turn a handle into a wild address.
+  if (FindUDT(BasePointee) >= 0) and UDTBlockIsManaged(BasePointee) then Exit;
   Stride := RawChainElemBytes(BasePointee);
   if Stride <= 0 then Exit;
   Addr := EnsureIntRegister(BaseVal);
@@ -19609,6 +19623,7 @@ begin
   begin
     TypeName := RawChainElemType(ObjNode);
     if TypeName = '' then Exit;
+    if UDTBlockIsManaged(TypeName) then Exit;   // records, not bytes: ResolveRecordObject owns it
     UDTIdx := FindUDT(TypeName);
     if UDTIdx < 0 then Exit;
     if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
@@ -24564,6 +24579,120 @@ begin
       Exit(True);
 end;
 
+function TSSAGenerator.UDTBlockIsManaged(const TypeName: string): Boolean;
+// Does "New T[n]" of this type have to allocate MANAGED records rather than a raw byte block?
+//
+// It does exactly when T has a constructor or a destructor to run per element. A raw block cannot run
+// either: our methods take a record HANDLE as THIS, and the bytes of a raw block are not a record - so
+// on a raw block "New T[5]" allocated the storage and ran nothing, which is what operator/nested_new
+// showed as twenty missing "Constructor" lines.
+//
+// ⭐ fbc branches on the same question, for its own reason: it allocates an extra UInteger in front of
+// the block to remember the element count, but only "because allocation of an array of UDT objects
+// WITH DESTRUCTOR" - its own comment, in that example. Where there is nothing to run per element the
+// block stays a plain block, here as there, and m497 pins that: a POD type keeps the byte image a
+// program can memcopy and lay a type over.
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    if FBlockManagedTypes.IndexOf(T) >= 0 then Exit(True);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := UpperCase(FUDTs[Idx].Parent);   // a base's constructor is the derived type's too
+    Inc(Guard);
+  end;
+end;
+
+procedure TSSAGenerator.EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
+  const TypeName: string; Construct: Boolean);
+// Run the default CONSTRUCTOR (Construct) or the DESTRUCTOR (not Construct) on each of the N
+// consecutive records of a managed block, in the order FreeBASIC runs them: forwards to construct,
+// forwards to destruct (fbc's own "Delete []" output on operator/nested_new is in element order).
+// Destruction also releases each record's slot. Same shape as EmitRecordBlockInit - a small constant
+// count is unrolled, anything else loops - because record i's handle is FirstHandle + i.
+const
+  UNROLL_MAX = 64;
+var
+  i: Integer;
+  Hi, CounterVar, LimitReg, CmpReg: TSSAValue;
+  CondLabel, BodyLabel, EndLabel, CounterName: string;
+  PrevBlock, CondBlock, BodyBlock, EndBlock: TSSABasicBlock;
+
+  procedure OneElement(const H: TSSAValue);
+  begin
+    if Construct then
+      EmitConstructorCall(H, TypeName)
+    else
+    begin
+      EmitDestructorCall(H, TypeName);
+      EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), EnsureIntRegister(H),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+  end;
+
+begin
+  if (CountVal.Kind = svkConstInt) and (CountVal.ConstInt <= UNROLL_MAX) then
+  begin
+    for i := 0 to CountVal.ConstInt - 1 do
+    begin
+      if i = 0 then
+        Hi := FirstHandle
+      else
+      begin
+        Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        // ⚠️ ssaAddInt takes two REGISTERS -- a constant operand is read as R0.
+        EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
+                        EnsureIntRegister(MakeSSAConstInt(i)), MakeSSAValue(svkNone));
+      end;
+      OneElement(Hi);
+    end;
+    Exit;
+  end;
+
+  LimitReg := EnsureIntRegister(CountVal);
+  if Construct then CounterName := '__RECBLKCTOR%' else CounterName := '__RECBLKDTOR%';
+  CounterName := CounterName + IntToStr(FScopeSerial);
+  Inc(FScopeSerial);
+  CounterVar := DeclareVariableTyped(CounterName, srtInt);
+  EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  CondLabel := GenerateUniqueLabel('recblkcd_cond');
+  BodyLabel := GenerateUniqueLabel('recblkcd_body');
+  EndLabel  := GenerateUniqueLabel('recblkcd_end');
+
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  FCurrentBlock := FProgram.CreateBlock(CondLabel);
+  CondBlock := FCurrentBlock;
+  if Assigned(PrevBlock) then begin PrevBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(PrevBlock); end;
+  CmpReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, CmpReg, EnsureIntRegister(GetOrAllocateVariable(CounterName)), LimitReg, MakeSSAValue(svkNone));
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), CmpReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  BodyBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(CondBlock);
+  Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+  OneElement(Hi);
+  EmitInstruction(ssaAddInt, GetOrAllocateVariable(CounterName),
+                  EnsureIntRegister(GetOrAllocateVariable(CounterName)),
+                  EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BodyBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(BodyBlock);
+
+  FCurrentBlock := FProgram.CreateBlock(EndLabel);
+  EndBlock := FCurrentBlock;
+  CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
+end;
+
 procedure TSSAGenerator.EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);
 // Run EmitRecordInit on each of the N consecutive records of a CAllocate/Allocate block, so every one
 // gets its member-array / nested-UDT backing (AllocSharedRecordBlock only sizes the flat slots). Record
@@ -27380,7 +27509,11 @@ var
     Result := False;
     if (Rhs = nil) or (Rhs.NodeType <> antArrayAccess) then Exit;
     ET := RawChainElemType(Rhs);
-    Result := (Length(ET) >= 4) and (Copy(ET, Length(ET) - 3, 4) = ' PTR');
+    if (Length(ET) < 4) or (Copy(ET, Length(ET) - 3, 4) <> ' PTR') then Exit;
+    // ...unless the cell holds a MANAGED block. Then its value is a record HANDLE, and marking the
+    // target raw would send "q[j].field" onto the byte heap with a handle for an address.
+    ET := Trim(Copy(ET, 1, Length(ET) - 4));
+    Result := not ((FindUDT(ET) >= 0) and UDTBlockIsManaged(ET));
   end;
 
   procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
@@ -27406,8 +27539,12 @@ var
       // New T[4]" allocated the bytes, then read "p[0].v" through the managed record path and faulted
       // on the first store. "New Integer[n]" was fine throughout - a scalar pointee never enters this
       // branch - which is why the form looked implemented.
+      // ...and NOT when the elements have a constructor or a destructor: then "New T[n]" allocates
+      // MANAGED records (EmitNewObject says why), the value IS a handle, and marking it raw would send
+      // "p[i].field" onto the byte heap - the exact mirror of the accident this branch exists to prevent.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
-         ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1')) then
+         ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
+          (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
           FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
       Exit;
@@ -28324,6 +28461,25 @@ begin
     if Node.ChildCount < 1 then
       raise Exception.Create('NEW T[n] needs an element count');
     ProcessExpression(Node.GetChild(0), CountVal);
+    // ...unless the elements have a CONSTRUCTOR or a DESTRUCTOR to run. Then the block is n consecutive
+    // MANAGED records - "handle + i" indexes the i-th just as "base + i*size" does, because the region
+    // allocates them at consecutive slots - and each one gets its default constructor here and its
+    // destructor at Delete[]. A raw block could run neither: a method's THIS is a record handle, and the
+    // bytes of a raw block are not a record. See UDTBlockIsManaged for why the discriminator is that
+    // question and not "is it a UDT".
+    if (UDTIdx >= 0) and UDTBlockIsManaged(NewType) then
+    begin
+      CheckInstantiable(FUDTs[UDTIdx].Name);
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordNewBlock, Result, EnsureIntRegister(CountVal),
+                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                                      or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
+                                      or ((Int64(UDTIdx) and $FFFF) shl 48)),
+                      MakeSSAValue(svkNone));
+      EmitRecordBlockInit(Result, CountVal, UDTIdx);
+      EmitRecordBlockCtorDtor(Result, CountVal, NewType, True);
+      Exit;
+    end;
     ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaLoadConstInt, ElemVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -28372,7 +28528,7 @@ procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
 // recycle its slot (ssaRecordFree). Node child0 = the pointer expression (must be a UDT pointer).
 var
   PtrName, PtrType: string;
-  HandleReg: TSSAValue;
+  HandleReg, CountReg: TSSAValue;
 begin
   if Node.ChildCount < 1 then Exit;
   // "Delete @r" where r is a REFERENCE (or a UDT variable): "@r" of a record is its HANDLE in this
@@ -28390,6 +28546,27 @@ begin
     EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
+  // "Delete[] p[i]" where the CELL holds a managed block ("p[i] = New T[m]", T with a ctor/dtor):
+  // run one destructor per element, then release the records. The count is on the block itself -
+  // ssaRecordBlockLen - exactly as fbc keeps it in a UInteger in front of its own block.
+  if (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 2) then
+  begin
+    PtrType := RawChainElemType(Node.GetChild(0));
+    if (Length(PtrType) >= 4) and (Copy(PtrType, Length(PtrType) - 3, 4) = ' PTR') then
+    begin
+      PtrType := Trim(Copy(PtrType, 1, Length(PtrType) - 4));
+      if (FindUDT(PtrType) >= 0) and UDTBlockIsManaged(PtrType) then
+      begin
+        ProcessExpression(Node.GetChild(0), HandleReg);
+        HandleReg := EnsureIntRegister(HandleReg);
+        CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+        Exit;
+      end;
+    end;
+  end;
+
   // "Delete a(i)": the element holds the record handle, so destroy and free THAT.
   if (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
      (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
@@ -28410,6 +28587,19 @@ begin
   if Node.GetChild(0).NodeType <> antIdentifier then
     raise Exception.Create('DELETE expects a pointer variable');
   PtrName := VarToStr(Node.GetChild(0).Value);
+  // "Delete[] p" on a MANAGED block: one destructor per element, then the records. Asked before the raw
+  // form below, which would free a byte block that was never allocated.
+  if (Node.Attributes.Values['NEWARRAY'] = '1') and (not IsRawPtr(PtrName)) and
+     (PointerUDTType(PtrName) <> '') and UDTBlockIsManaged(PointerUDTType(PtrName)) then
+  begin
+    PtrType := PointerUDTType(PtrName);
+    HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+    CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+    Exit;
+  end;
+
   // "Delete[] p" (and "Delete p" on a RAW pointer): the pointee is a byte block, not a record - free the
   // block. Only a managed UDT pointer has a destructor and a record slot to recycle.
   if (Node.Attributes.Values['NEWARRAY'] = '1') or
@@ -29330,6 +29520,20 @@ begin
         if Result = '' then Result := ProcReturnPtrUDT(ArrName);
       end;
     end
+    // "p[i][j].field": the cell p[i] holds a MANAGED block, so p[i][j] is a record of the cell's
+    // pointee type. ⛔ ProcessMemberAccess asks this BEFORE it asks ResolveRecordObject and gives up
+    // when the answer is '': the write half already worked through the resolver while the read half
+    // answered a stale register, which is what a missing type name looks like from the outside.
+    else if (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+            (ObjNode.GetChild(0).NodeType = antArrayAccess) then
+    begin
+      ArrName := RawChainElemType(ObjNode.GetChild(0));
+      if (Length(ArrName) >= 4) and (Copy(ArrName, Length(ArrName) - 3, 4) = ' PTR') then
+      begin
+        ArrName := Trim(Copy(ArrName, 1, Length(ArrName) - 4));
+        if (FindUDT(ArrName) >= 0) and UDTBlockIsManaged(ArrName) then Result := ArrName;
+      end;
+    end
     // Array-of-UDT MEMBER element "obj.field(i)", or a method call "obj.method(args)": child 0 is a
     // member access. The element type is the field's ArrayElemType; a method call yields its return type.
     else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
@@ -29739,7 +29943,7 @@ var
   ParentHandle, NestedHandle: TSSAValue;
   ParentUDT, Slot: Integer;
   Bank: TSSARegisterType;
-  SharedTmp: TASTNode;
+  SharedTmp, ChainIdx: TASTNode;
 begin
   Result := False;
   TypeName := '';
@@ -29850,6 +30054,36 @@ begin
         Exit;
       end;
     end;
+    // "p[i][j].field" where the CELL p[i] holds a MANAGED block: the record handle is what the first
+    // index loaded, and the second index is "handle + j" - the same unscaled add "ptr[i]" uses below,
+    // because a block's records sit at consecutive slots. The raw chain declines this shape on purpose
+    // (RawChainAddr): a handle scaled by SizeOf(T) is a wild address, not an element.
+    if (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+       (ObjNode.GetChild(0).NodeType = antArrayAccess) then
+    begin
+      MemberArrElemType := RawChainElemType(ObjNode.GetChild(0));
+      if (Length(MemberArrElemType) >= 4) and
+         (Copy(MemberArrElemType, Length(MemberArrElemType) - 3, 4) = ' PTR') then
+      begin
+        MemberArrElemType := Trim(Copy(MemberArrElemType, 1, Length(MemberArrElemType) - 4));
+        if (FindUDT(MemberArrElemType) >= 0) and UDTBlockIsManaged(MemberArrElemType) and
+           RawChainValue(ObjNode.GetChild(0), ParentHandle, ParentType) then
+        begin
+          ChainIdx := ObjNode.GetChild(1);
+          if (ChainIdx <> nil) and (ChainIdx.NodeType in [antArgumentList, antExpressionList]) then
+            ChainIdx := ChainIdx.GetChild(0);
+          ProcessExpression(ChainIdx, NestedHandle);
+          HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaAddInt, HandleVal, EnsureIntRegister(ParentHandle),
+                          EnsureIntRegister(NestedHandle), MakeSSAValue(svkNone));
+          TypeName := MemberArrElemType;
+          Result := True;
+          Exit;
+        end;
+      end;
+      MemberArrElemType := '';
+    end;
+
     // "obj.method(args).field" / ".method()": a METHOD returning a UDT. The same shape as the
     // "f(args).field" rule further down, and it was missing here - only a MODULE-level function was
     // known, so a method call fell past every branch, Result stayed False, and the field read answered
@@ -30463,6 +30697,49 @@ begin
   end;
   // (FUNCTION returning a raw "<scalar> PTR" is collected earlier by CollectRawPtrRetFuncs, before
   // CollectRawPtrVars, so a var assigned from such a call can be propagated raw.)
+end;
+
+procedure TSSAGenerator.CollectBlockManagedTypes(Node: TASTNode);
+// Pre-scan: the types that DEFINE a constructor or a destructor. "New T[n]" of such a type allocates
+// managed records rather than a raw byte block (UDTBlockIsManaged says why), and the decision has to be
+// available EARLY - the raw-pointer fixpoint that marks "Dim As T Ptr p = New T[n]" raw runs long before
+// PreCollectProcedures fills FProcDecls, so asking ResolveMethodLabel there answers '' for every type
+// and the two halves would disagree about what the block is.
+//
+// The DEFINITION is the right thing to look for, not the declaration inside the TYPE body: a method with
+// no body cannot run, and the in-TYPE line is skipped by the parser without leaving a node to find.
+var
+  i, q: Integer;
+  Nm, Tail: string;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+    if Pos('~', Nm) > 0 then Nm := Copy(Nm, 1, Pos('~', Nm) - 1);   // an overload carries its signature
+    q := LastDelimiter('.', Nm);
+    if q > 1 then
+    begin
+      Tail := Copy(Nm, q + 1, MaxInt);
+      // ⛔ AND A CONSTRUCTOR'S LABEL CARRIES A TRAILING BANK SIGIL. It arrives as
+      // "ANCESTOR.CONSTRUCTOR#", not "ANCESTOR.CONSTRUCTOR" - the destructor's does not - so an exact
+      // match saw every DESTRUCTOR and no CONSTRUCTOR at all. That reads as "a type with only a
+      // constructor is not managed", which is a rule nobody wrote: "New T[2]" of such a type ran
+      // nothing and answered zeros, while the same type with a destructor beside it worked.
+      while (Tail <> '') and not (Tail[Length(Tail)] in ['A'..'Z']) do
+        SetLength(Tail, Length(Tail) - 1);
+      if (Tail = kCONSTRUCTOR) or (Tail = kDESTRUCTOR) then
+        Nm := Copy(Nm, 1, q - 1)     // the owner may itself be dotted: a NESTED type owns methods too
+      else
+        Nm := '';
+    end
+    else
+      Nm := '';
+    if (Nm <> '') and (FBlockManagedTypes.IndexOf(Nm) < 0) then FBlockManagedTypes.Add(Nm);
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectBlockManagedTypes(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.PreCollectProcedures(Node: TASTNode);
@@ -32552,10 +32829,12 @@ begin
   FByrefRetFuncs.Clear;
   FByrefRetValue.Clear;
   FRawPtrRetFuncs.Clear;
+  FBlockManagedTypes.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
+  CollectBlockManagedTypes(AST);   // before the raw-pointer fixpoint: it asks whether New T[n] is managed
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
   // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
