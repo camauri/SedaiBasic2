@@ -5801,6 +5801,19 @@ begin
                 Exit;
               end;
             end;
+            // "obj.Constructor()" / "obj.Destructor()", called EXPLICITLY on an existing instance -
+            // FreeBASIC allows it, and proguide/dynamicmemory is built on it. Neither name has an
+            // ordinary method label (a constructor's carries its parameter SIGNATURE, and an implicit
+            // one has no body at all), so HasCallableMethod below answered NO and the statement was
+            // dropped in silence. Asked here, and answered in ProcessMethodCall by the same two
+            // emitters NEW and the frame exit already use.
+            if (UpperCase(VarToStr(Node.GetChild(0).Value)) = kCONSTRUCTOR) or
+               (UpperCase(VarToStr(Node.GetChild(0).Value)) = kDESTRUCTOR) then
+            begin
+              ProcessMethodCall(MethodObjNode, MethodOwnerType,
+                                UpperCase(VarToStr(Node.GetChild(0).Value)), Node.GetChild(1), Result);
+              Exit;
+            end;
             // Overload-aware: an overloaded method has no bare label, so this test must be able to see
             // the "~<sig>" members too -- otherwise "b.g(5)" fell through as if the type had no g at all.
             if HasCallableMethod(MethodOwnerType, VarToStr(Node.GetChild(0).Value), Node.GetChild(1)) then
@@ -28871,6 +28884,27 @@ var
   MethodLabel, RetRecType: string;
 begin
   Result := MakeSSAValue(svkNone);
+  // "obj.Constructor()" / "obj.Destructor()" called EXPLICITLY on an existing instance. FreeBASIC
+  // allows it, and the manual's proguide/dynamicmemory is built on it: it hand-constructs elements in
+  // memory it allocated itself, then hand-destroys them. Neither name has an ordinary method label -
+  // a constructor's carries its parameter SIGNATURE, and an implicit one has no body at all - so the
+  // resolution below found nothing and the call was DROPPED IN SILENCE: the example printed '0' '1'
+  // '2' where fbc prints 'FreeBASIC0' 'FreeBASIC1' 'FreeBASIC2', the field initialiser never having run.
+  // Routed to the same two emitters NEW and the frame exit already use, so there is one construction
+  // sequence and one destruction sequence, not three.
+  if (UpperCase(MethNm) = kCONSTRUCTOR) or (UpperCase(MethNm) = kDESTRUCTOR) then
+  begin
+    if not ResolveRecordObject(ObjNode, RcHandle, RetRecType) then Exit;
+    if UpperCase(MethNm) = kCONSTRUCTOR then
+    begin
+      // The same order NEW uses: the field initialisers and nested members first, then the ctor body.
+      EmitRecordInit(RcHandle, FindUDT(RetRecType));
+      EmitConstructorCall(RcHandle, RetRecType, ArgsNode);
+    end
+    else
+      EmitDestructorCall(RcHandle, RetRecType);
+    Exit;
+  end;
   // Overload-aware: a method declared twice with different parameter types has no bare label, so pick by
   // the argument banks (ArgsNode carries no THIS, and neither does the label's signature).
   MethodLabel := ResolveMethodLabelArgs(ObjType, MethNm, ArgsNode);   // static (base) target
