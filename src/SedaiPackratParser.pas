@@ -8184,6 +8184,29 @@ var
 begin
   Token := Context.CurrentToken;
 
+  // "REDIM (<array expression>)(dims)" - the target in PARENTHESES. FreeBASIC's own manual prescribes
+  // this spelling, and says why: "Redim u(0).array(0 To 9)" is ambiguous (fbc reads it as redimming u
+  // and reports "Duplicated definition"), so the array expression is wrapped to say where it ends.
+  // The name-then-dots walk below cannot express it - the object is an array ELEMENT, not a plain name -
+  // so the whole declaration failed with "Expected variable name in array declaration". Reading and
+  // writing "u(0).array(i)" already worked; only the REDIM target had no route to it.
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                                  // (
+    VarName := FExpressionParser.ParseExpression;
+    if not Assigned(VarName) then
+    begin
+      HandleError('Expected an array expression after "(" in REDIM', Context.CurrentToken);
+      Result := nil; Exit;
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after the array expression in REDIM', Context.CurrentToken);
+      VarName.Free; Result := nil; Exit;
+    end;
+  end
+  else
+  begin
   // Parse variable name
   if not Context.Check(ttIdentifier) then
   begin
@@ -8213,6 +8236,7 @@ begin
     VarName := MemberNode;
     Context.Advance;                                  // field name
   end;
+  end;   // end of the unparenthesised "name[.field...]" target
 
   // Expect opening parenthesis
   if not Context.Match(ttDelimParOpen) then
