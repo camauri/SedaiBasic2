@@ -30974,14 +30974,20 @@ begin
   if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then
   begin
     // Not a field — a PROPERTY setter? obj.prop = expr -> SUB Type.prop.SET(expr).
-    if ResolveMethodLabel(TypeName, VarToStr(MemberNode.Value) + '.SET') <> '' then
-    begin
-      SetterArgs := TASTNode.Create(antArgumentList, MemberNode.Token);
-      SetterArgs.AddChild(ExprNode.Clone);
+    // ⛔ ASKED WITH THE ARGUMENT, because a property may be OVERLOADED on it:
+    //     Property bar.v ( ByVal n As Integer )
+    //     Property bar.v ( ByVal n As ZString Ptr )
+    // are two setters sharing the name "V.SET", so each carries a parameter signature in its label
+    // and the BARE name is registered nowhere. The plain lookup therefore found neither, and the
+    // assignment was DROPPED IN SILENCE - "b.v = 1" did nothing and the next read answered 0. A
+    // single setter worked, which is what made the shape look supported.
+    // ProcessMethodCall below already resolves the overload the same way; only this guard did not.
+    SetterArgs := TASTNode.Create(antArgumentList, MemberNode.Token);
+    SetterArgs.AddChild(ExprNode.Clone);
+    if ResolveMethodLabelArgs(TypeName, VarToStr(MemberNode.Value) + '.SET', SetterArgs) <> '' then
       ProcessMethodCall(MemberNode.GetChild(0), TypeName, VarToStr(MemberNode.Value) + '.SET',
                         SetterArgs, DummyVal);
-      SetterArgs.Free;
-    end;
+    SetterArgs.Free;
     Exit;
   end;
 
