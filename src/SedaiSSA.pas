@@ -2015,6 +2015,7 @@ var
   OpLhsType, OpRhsType, OpLabel: string;  // operator overloading: UDT operand types + resolved operator label
   OpArgs: TASTNode;
   AddrNode: TASTNode;          // VARPTR/PROCPTR: synthesized "@arg" node lowered via the address path
+  TempNode: TASTNode;          // "@(*p)": the operand seen through its parentheses
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -2050,6 +2051,23 @@ begin
          ((UpperCase(VarToStr(Node.Value)) = kMACROFUNCTIONNQ) or
           (UpperCase(VarToStr(Node.Value)) = kMACROFUNCTION)) then
         Node.Value := UpperCase(FCurrentProcName);
+      // "@*expr" / "VarPtr(*expr)": the address of what a pointer points at IS the pointer. Written with
+      // parentheses ("@(*p)", "VarPtr(*(Cast(UInteger Ptr, n)))") it reaches here as a DEREF child, and
+      // nothing claimed that shape - the node fell through to the procedure-address path with an empty
+      // name and failed with "Undefined procedure (address-of @): ". Answered by evaluating the POINTER
+      // and dropping both operators: there is no address to take, the value already is one.
+      if (Node.ChildCount > 0) and (Node.GetChild(0) <> nil) then
+      begin
+        TempNode := Node.GetChild(0);
+        while (TempNode.NodeType = antParentheses) and (TempNode.ChildCount >= 1) do
+          TempNode := TempNode.GetChild(0);
+        if (TempNode.NodeType = antDeref) and (TempNode.ChildCount >= 1) then
+        begin
+          ProcessExpression(TempNode.GetChild(0), Result);
+          Result := EnsureIntRegister(Result);
+          Exit;
+        end;
+      end;
       // "@Type.method": the entry PC of a member procedure named through its TYPE (a STATIC member sub
       // has no instance, so this is the only way to point at it). Tried before the field path, which
       // would otherwise report "object is not a record" for a type NAME.
@@ -2102,6 +2120,21 @@ begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadConstInt, Result,
                         MakeSSAConstInt(BUILTIN_FP_TAG or Int64(BuiltinFuncPtrOpId(VarToStr(Node.Value)))),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) and FInProcedure and
+              (OwnerTypeOfLabel(FCurrentProcName) <> '') and
+              (ResolveMethodLabel(OwnerTypeOfLabel(FCurrentProcName), VarToStr(Node.Value)) <> '') then
+      begin
+        // "@foo" INSIDE a method of the type that declares foo. Written unqualified it is the same
+        // procedure "@T.foo" names - FreeBASIC resolves a bare name against the enclosing type first -
+        // and only the qualified spelling was understood here, so the whole file failed with
+        // "Undefined procedure (address-of @): FOO". The lookup walks the inheritance chain, so a
+        // method inherited from a base answers too.
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadProcAddr, Result,
+                        MakeSSALabel(ProcedureLabelName(
+                          ResolveMethodLabel(OwnerTypeOfLabel(FCurrentProcName), VarToStr(Node.Value)))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
       else
