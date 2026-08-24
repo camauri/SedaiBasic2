@@ -573,6 +573,7 @@ type
     procedure EmitNewObject(Node: TASTNode; out Result: TSSAValue);             // NEW T [(args)] → heap record handle
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
+    function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;  // "Cast(T Ptr, e)[i]" read
     function EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue; // obj.field[i] → raw address
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     // FreeBASIC index operator "v[i]" on a UDT, and the addressable element a BYREF one returns.
@@ -5654,6 +5655,25 @@ begin
       if Node.ChildCount < 2 then
         begin
           Result := MakeSSAValue(svkNone);
+          Exit;
+        end;
+
+        // "Cast(T Ptr, expr)[i]" - the cast INDEXED IN PLACE, without a variable to hold it. Both
+        // pointer-index branches below key off the NAME of a declared pointer, and a cast has none: the
+        // node's Value is the type string ("INTEGER PTR"), so nothing matched and the expression fell
+        // through to a shape that answered 4294967296. Through a DIM the same cast was correct, which is
+        // what said the defect was the missing SHAPE and not the cast or the indexing.
+        // The pointee comes from the cast's own type, and the address family from the OPERAND: a raw
+        // byte-heap pointer scales the index by SizeOf(pointee), a managed one advances one element.
+        if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antCast) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+           (Node.GetChild(1).ChildCount = 1) and
+           (Length(UpperCase(VarToStr(Node.GetChild(0).Value))) > 4) and
+           (Copy(UpperCase(VarToStr(Node.GetChild(0).Value)),
+                 Length(UpperCase(VarToStr(Node.GetChild(0).Value))) - 3, 4) = ' PTR') then
+        begin
+          Result := EmitCastPointerIndexRead(Node.GetChild(0), Node.GetChild(1));
           Exit;
         end;
 
@@ -27611,6 +27631,68 @@ begin
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
+// "Cast(T Ptr, expr)[i]" read in place. Same two address families as EmitPointerIndexAddress, but the
+// base is a VALUE and the pointee comes from the cast's own type instead of a declaration:
+//   RAW     (a byte-heap / framebuffer address): index scaled by SizeOf(pointee), raw load.
+//   MANAGED (an FArrays-backed packed address):  index advances one ELEMENT, ref load.
+// The family is decided by the OPERAND, exactly as it is for a named pointer - a cast reinterprets the
+// type, never the kind of address.
+var
+  Pointee, TName: string;
+  BaseVal, IdxVal, SzVal, ScaledIdx, AddrVal: TSSAValue;
+  Sz: Int64;
+  Bank: TSSARegisterType;
+  IsRaw: Boolean;
+begin
+  TName := UpperCase(VarToStr(CastNode.Value));
+  Pointee := Trim(Copy(TName, 1, Length(TName) - 4));    // drop the trailing " PTR"
+  ProcessExpression(CastNode, BaseVal);                  // a pointer cast is a value passthrough
+  BaseVal := EnsureIntRegister(BaseVal);
+  ProcessExpression(IndicesNode.GetChild(0), IdxVal);
+  IdxVal := EnsureIntRegister(IdxVal);
+  IsRaw := (RawPtrExprName(CastNode.GetChild(0)) <> '') or IsStrDataPtrExpr(CastNode.GetChild(0));
+  if IsRaw then
+  begin
+    Sz := RawElemSizeOfPointee(Pointee);
+    if Sz > 1 then
+    begin
+      SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(Sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
+      IdxVal := ScaledIdx;
+    end;
+  end;
+  AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, AddrVal, BaseVal, IdxVal, MakeSSAValue(svkNone));
+
+  // A UDT pointee: the record's VALUE is its handle, and base+i IS that handle for a managed block.
+  if FindUDT(Pointee) >= 0 then
+  begin
+    Result := AddrVal;
+    Exit;
+  end;
+  Bank := TypeNameToBank(Pointee, '''');
+  Result := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
+  if IsRaw then
+  begin
+    if Bank = srtFloat then
+      EmitInstruction(ssaRawLoadFloat, Result, AddrVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(Pointee)))
+    else
+      EmitInstruction(ssaRawLoadInt, Result, AddrVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(Pointee)));
+  end
+  else
+    case Bank of
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else
+      EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
 end;
 
 function TSSAGenerator.EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue;

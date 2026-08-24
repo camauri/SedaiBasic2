@@ -3114,6 +3114,14 @@ Each of these is *refused with a message that names the reason*, never answered 
   byte count would cover a different number of elements. Loop over the elements instead.
 - **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
   byte image — the elements are managed values.
+- **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
+  walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
+  not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported
+  and matches fbc whenever the pointee is the array's own element type, and over the raw byte heap
+  (`Allocate`) it matches for every width. Same root as `ByRef As Any` below.
+- **`Dim As T a(n) = Any`** parses and means "do not initialise" — but the storage still comes out
+  zeroed here, where fbc hands back whatever was on the stack. A defined state instead of an undefined
+  one.
 - **`__FUNCTION_NQ__` read as a VALUE.** It substitutes the *symbol*, not a string, so in fbc
   `Return __FUNCTION_NQ__` inside its own function is a recursive **call** — the program compiles with
   "infinite recursion detected" and dies. Here it yields the procedure's name as text, like

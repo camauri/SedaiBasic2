@@ -8297,6 +8297,33 @@ procedure TPackratParser.ParseOptionalArrayInit(Decl, Dimensions: TASTNode; cons
 var
   InitList: TASTNode;
 begin
+  // "= Any" / "=> Any": FreeBASIC's way of saying DO NOT INITIALISE this array. It is an initializer
+  // sign like the others, and it was not accepted here at all - so the '=' was left standing and the
+  // whole declaration failed to parse ("Unexpected token in statement"). The scalar form has always
+  // gone through (it lands on the ordinary initializer path, where the bare name ANY reads as an
+  // undeclared identifier); only the array spelling had no route.
+  // ⚠️ The storage still comes out ZEROED here, where fbc hands back whatever was on the stack. That
+  // is a defined state instead of an undefined one, and it is declared in BASIC.md.
+  if Context.Check(ttOpEq) then
+  begin
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) and
+       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ANY') then
+    begin
+      Context.Advance;                              // =
+      Context.Advance;                              // Any
+      Decl.Attributes.Values['ANYINIT'] := '1';
+      Exit;
+    end;
+    // the "=> Any" spelling of the same thing ("=>" is lexed as '=' then '>')
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpGt) and
+       Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
+       (UpperCase(VarToStr(Context.PeekToken(2).Value)) = 'ANY') then
+    begin
+      Context.Advance; Context.Advance; Context.Advance;   // = > Any
+      Decl.Attributes.Values['ANYINIT'] := '1';
+      Exit;
+    end;
+  end;
   if not (Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
           ((Context.PeekNext.TokenType = ttOpGt) or (Context.PeekNext.TokenType = ttDelimBraceOpen))) then
     Exit;
