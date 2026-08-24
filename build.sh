@@ -702,11 +702,13 @@ if [[ "$HOT_C" == "true" ]]; then
         # Merely the default: say so once and build the pure-Pascal interpreter, which is what this
         # was before 20 Aug 2026 and is still correct - just slower on the arms the C loop covers.
         echo -e "${YELLOW}NOTE: no C compiler found - building WITHOUT the C hot loop.${NC}" >&2
-        echo -e "${GRAY}  Install gcc or clang for 27-45% on arithmetic-heavy programs, or pass --no-hot-c.${NC}" >&2
+        echo -e "${GRAY}  Install gcc or clang: measured +5% to +281% depending on the program.${NC}" >&2
+        echo -e "${GRAY}  Pass --no-hot-c to choose the Pascal loop on purpose and silence this.${NC}" >&2
         HOT_C=false
     fi
     if [[ "$HOT_C" == "true" ]]; then
     echo -e "${GRAY}C compiler: $("$CC_BIN" --version 2>/dev/null | head -1) - $CC_BIN${NC}"
+    echo -e "${GRAY}Hot loop:   C (src/hotdisp.c)${NC}"
     # -fno-math-errno is REQUIRED, not a tuning knob: without it gcc assumes llrint/sqrt may touch
     # errno and emits CALLS to libm, which a freestanding object linked into an FPC program cannot
     # resolve. With it they are cvtsd2si and sqrtsd, one instruction each.
@@ -738,6 +740,19 @@ if [[ "$HOT_C" == "true" ]]; then
         echo -e "${RED}ERROR: could not compile src/hotdisp.c${NC}" >&2; exit 1; }
     HOT_C_DEFINE="-dHOT_C"
     fi
+fi
+
+# ⛔ OUTSIDE the block above, and that is the whole point: with --no-hot-c the block never runs, so a
+# note placed inside it announced the C loop and said NOTHING about the Pascal one. A build with the
+# Pascal arms looked exactly like a build with the C arms, and the difference surfaced later as "why
+# is this slow?".
+#
+# The interpreter is CORRECT either way - the 649-program corpus passes identically on both, checked
+# 24 Aug 2026 - so this is a note about a choice, never a warning about a fault.
+if [[ "$HOT_C" != "true" ]]; then
+    echo -e "${YELLOW}Hot loop:   Free Pascal (the C loop is OFF)${NC}"
+    echo -e "${GRAY}  Correct, and slower on the arms the C loop covers: measured +5% to +281%${NC}"
+    echo -e "${GRAY}  depending on the program, 24 Aug 2026. Drop --no-hot-c to use the C loop.${NC}"
 fi
 
 echo -e "${GRAY}Compiler: FPC $("$FPC" -iV 2>/dev/null) - $FPC${NC}"
