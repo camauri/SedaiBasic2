@@ -453,9 +453,10 @@ type
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
-    procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
+    procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
-    procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);
+    procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
+    procedure EmitRecordBlockInitFrom(const FirstHandle, StartVal, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function UDTBlockIsManaged(const TypeName: string): Boolean;
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
@@ -564,6 +565,7 @@ type
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
     procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
+    function TryEmitManagedRecordClear(ArgsNode: TASTNode): Boolean;  // CLEAR over a MANAGED record
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record/raw-address handle (hidden var)
@@ -8044,7 +8046,7 @@ function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode)
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
 var
   AllocFuncU, LhsRecType: string;
-  ExprValue, CountReg, BytesVal, SizeVal, ProdReg: TSSAValue;
+  ExprValue, CountReg, BytesVal, SizeVal, ProdReg, OldNReg: TSSAValue;
   UDTIdx: Integer;
   AllocOffsets: TInt64Array;
   AllocElemSize: Int64;
@@ -8082,6 +8084,12 @@ begin
       CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaDivInt, CountReg, ProdReg,
                       EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
+      // ⛔ The OLD length, read BEFORE the resize: the init below must touch only the elements this
+      // Reallocate ADDS. It applies the type's field defaults, and putting a declaration's default back
+      // over a value the program wrote is not a partial init, it is data loss.
+      OldNReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordBlockLen, OldNReg,
+                      EnsureIntRegister(GetOrAllocateVariable(VarName)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordReallocBlock, ExprValue,
                       EnsureIntRegister(GetOrAllocateVariable(VarName)), EnsureIntRegister(CountReg),
@@ -8090,9 +8098,9 @@ begin
                                       or ((Int64(UDTIdx) and $FFFF) shl 48)));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
-      // Give the elements that are NEW their member-array / nested-UDT backing, as the first allocation
-      // did. EmitRecordBlockInit only fills what is still empty, so the kept ones are untouched.
-      EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx);
+      // Give the elements that are NEW their member-array / nested-UDT backing and field defaults, as
+      // the first allocation did; the kept ones are before OldNReg and are not touched.
+      EmitRecordBlockInitFrom(GetOrAllocateVariable(VarName), OldNReg, CountReg, UDTIdx, False);
       Exit;
     end;
   end;
@@ -8151,7 +8159,7 @@ begin
     // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
     // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
     // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
-    EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx);
+    EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx, False);   // Allocate/CAllocate construct nothing
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
@@ -24472,7 +24480,7 @@ begin
   end;
 end;
 
-procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer);
+procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
 // After a record instance is allocated, recursively allocate one instance for each nested-UDT
 // field and link its handle into the parent's int slot (so a.b.c works without manual init).
 var
@@ -24549,6 +24557,12 @@ begin
   // FreeBASIC field default values "field AS T = expr": store each into its slot. Runs after nested-UDT
   // allocation and before any constructor (so a constructor can override), and is itself overridden by
   // aggregate initialization "Dim v As T = (a, b, ...)" which stores over these slots afterwards.
+  // ⛔ ...but NOT for ALLOCATE / CALLOCATE, which is why WithDefaults exists. FreeBASIC's allocators
+  // hand back RAW, zeroed storage and run nothing: the manual's own proguide/dynamicmemory calls
+  // "p1[I].Constructor()" on each element right after the CAllocate, and would have no reason to if
+  // the allocation had constructed them. fbc prints '' 0 0 for a CAllocate'd element of a type whose
+  // fields all have defaults; NEW and DIM print the defaults.
+  if WithDefaults then
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then
     begin
@@ -24566,8 +24580,14 @@ end;
 
 function TSSAGenerator.TypeNeedsRecordInit(UDTIdx: Integer): Boolean;
 // True when a fresh record of this type needs per-instance setup beyond its flat slots: a member array
-// (its FArrays backing) or a nested-UDT field (its own instance). A flat record needs none, so a block
-// of them is fully usable straight from AllocSharedRecordBlock.
+// (its FArrays backing), a nested-UDT field (its own instance), a FIELD DEFAULT, or a fixed-length
+// string field (which starts at full capacity). A record with none of those is fully usable straight
+// from AllocSharedRecordBlock, and a block of them skips the init loop.
+//
+// ⛔ THE FIELD DEFAULT WAS MISSING HERE, and it is what EmitRecordInit ends with. So "Dim As U v"
+// applied "Dim As String S = "FB"" and "ReDim As U p(0 To 1)" / "New U[2]" did not: the element
+// answered '' where the scalar answered 'FB'. The defect was not in either allocation path - both call
+// EmitRecordInit - it was in the question they ask FIRST about whether to bother.
 var
   i: Integer;
 begin
@@ -24575,7 +24595,10 @@ begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
-       (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) then
+       (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) or
+       (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or
+       ((FUDTs[UDTIdx].Fields[i].Bank = srtString) and (FUDTs[UDTIdx].Fields[i].StrCapacity > 0) and
+        (not FUDTs[UDTIdx].Fields[i].IsArray)) then
       Exit(True);
 end;
 
@@ -24595,6 +24618,8 @@ function TSSAGenerator.UDTBlockIsManaged(const TypeName: string): Boolean;
 var
   T: string;
   Idx, Guard: Integer;
+  Offsets: TInt64Array;
+  Total: Int64;
 begin
   Result := False;
   T := UpperCase(TypeName);
@@ -24607,6 +24632,14 @@ begin
     T := UpperCase(FUDTs[Idx].Parent);   // a base's constructor is the derived type's too
     Inc(Guard);
   end;
+  // ...and a type that HAS NO BYTE IMAGE cannot be a raw block whatever it declares: a variable-length
+  // String, an array member or a nested record lives outside the flat layout, which is exactly what
+  // UDTCLayoutRaw declines for. proguide/dynamicmemory's type is one field - "Dim As String S =
+  // "FreeBASIC"" - and its constructor is IMPLICIT, so the ctor/dtor question above answers no and the
+  // block went raw: the first "p[i].S" walked off it. CAllocate of the same type already allocated
+  // managed records, so the two spellings disagreed about what the storage was.
+  Idx := FindUDT(UpperCase(TypeName));
+  if (Idx >= 0) and (not UDTCLayoutRaw(Idx, Offsets, Total)) then Result := True;
 end;
 
 procedure TSSAGenerator.EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
@@ -24693,11 +24726,24 @@ begin
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
-procedure TSSAGenerator.EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer);
+procedure TSSAGenerator.EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
+// The whole block, from element 0.
+begin
+  EmitRecordBlockInitFrom(FirstHandle, MakeSSAConstInt(0), CountVal, UDTIdx, WithDefaults);
+end;
+
+procedure TSSAGenerator.EmitRecordBlockInitFrom(const FirstHandle, StartVal, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
 // Run EmitRecordInit on each of the N consecutive records of a CAllocate/Allocate block, so every one
 // gets its member-array / nested-UDT backing (AllocSharedRecordBlock only sizes the flat slots). Record
 // i's handle is FirstHandle + i -- the indices are consecutive and the SHARED_REC_FLAG bit is untouched
 // by a small add. A flat type needs nothing. A constant count is unrolled; a runtime count loops.
+//
+// ⛔ StartVal is why this exists apart from EmitRecordBlockInit. A REALLOCATE grows a block and must
+// init ONLY the elements it added: the setup EmitRecordInit does now includes the FIELD DEFAULTS, and
+// re-applying those to an element the program has already written puts the declaration's value back
+// over the program's. proguide/dynamicmemory reads exactly that - three strings the program appended
+// to, and a Reallocate right after - and it printed 'FreeBASIC' three times where it had printed
+// 'FreeBASIC0'..'2' a line earlier.
 const
   UNROLL_MAX = 64;   // beyond this, loop rather than emit N copies of the init sequence
 var
@@ -24708,9 +24754,10 @@ var
 begin
   if not TypeNeedsRecordInit(UDTIdx) then Exit;
 
-  if (CountVal.Kind = svkConstInt) and (CountVal.ConstInt <= UNROLL_MAX) then
+  if (CountVal.Kind = svkConstInt) and (CountVal.ConstInt <= UNROLL_MAX) and
+     (StartVal.Kind = svkConstInt) then
   begin
-    for i := 0 to CountVal.ConstInt - 1 do
+    for i := StartVal.ConstInt to CountVal.ConstInt - 1 do
     begin
       if i = 0 then
         Hi := FirstHandle
@@ -24721,7 +24768,7 @@ begin
         EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
                         EnsureIntRegister(MakeSSAConstInt(i)), MakeSSAValue(svkNone));
       end;
-      EmitRecordInit(Hi, UDTIdx);
+      EmitRecordInit(Hi, UDTIdx, WithDefaults);
     end;
     Exit;
   end;
@@ -24732,7 +24779,7 @@ begin
   CounterName := '__RECBLKINIT%' + IntToStr(FScopeSerial);
   Inc(FScopeSerial);
   CounterVar := DeclareVariableTyped(CounterName, srtInt);
-  EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaCopyInt, CounterVar, EnsureIntRegister(StartVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   CondLabel := GenerateUniqueLabel('recblk_cond');
   BodyLabel := GenerateUniqueLabel('recblk_body');
   EndLabel  := GenerateUniqueLabel('recblk_end');
@@ -24753,7 +24800,7 @@ begin
   Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
-  EmitRecordInit(Hi, UDTIdx);
+  EmitRecordInit(Hi, UDTIdx, WithDefaults);
   EmitInstruction(ssaAddInt, GetOrAllocateVariable(CounterName),
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)),
                   EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
@@ -24779,20 +24826,37 @@ procedure TSSAGenerator.EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);
 // array inits only the freshly-appended elements and leaves existing ones -- and their data -- untouched.
 var
   ArrayRef, One, Acc, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
-  CmpReg, HandleVal, CounterVar, ProbeVal: TSSAValue;
+  CmpReg, HandleVal, CounterVar, ProbeVal, GuardStr, GuardFlt: TSSAValue;
   d, DimCount, i, GuardSlot: Integer;
+  GuardBank: TSSARegisterType;
   CounterName, CondLabel, BodyLabel, InitLabel, IncrLabel, EndLabel: string;
   PrevBlock, CondBlock, BodyBlock, InitBlock, IncrBlock, EndBlock: TSSABasicBlock;
 begin
   if not TypeNeedsRecordInit(UDTIdx) then Exit;
 
   // Slot of the first field that EmitRecordInit populates (member array or nested UDT) -- used as the
-  // "already inited?" probe. TypeNeedsRecordInit is true, so one exists.
+  // "already inited?" probe.
   GuardSlot := -1;
+  GuardBank := srtInt;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
        (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) then
     begin GuardSlot := FUDTs[UDTIdx].Fields[i].Slot; Break; end;
+  // ...or, for a type whose only per-instance setup is a FIELD DEFAULT, that field's own slot. A fresh
+  // record's slots are zero / empty, so "still zero" means "not inited yet" here as it does above.
+  // ⚠️ Which makes the probe approximate for exactly one case: a REDIM PRESERVE over an element the
+  // program itself set BACK to zero (or to "") gets the declaration's default again. That is the price
+  // of having no per-record "constructed" mark, and it is the same approximation the nested-UDT probe
+  // above has always made; without it "Dim As U v" applied the default and "ReDim As U a(0 To 1)" did
+  // not, which is a difference in the COMMON case rather than in a corner of it.
+  if GuardSlot < 0 then
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+      if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then
+      begin
+        GuardSlot := FUDTs[UDTIdx].Fields[i].Slot;
+        GuardBank := FUDTs[UDTIdx].Fields[i].Bank;
+        Break;
+      end;
   if GuardSlot < 0 then Exit;
 
   ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
@@ -24850,7 +24914,24 @@ begin
   EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
   ProbeVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaRecordLoadInt, ProbeVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(GuardSlot));
+  case GuardBank of
+    srtString:
+      begin
+        // A string slot is "still empty" by its LENGTH: the slot holds the text, not a handle.
+        GuardStr := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        EmitInstruction(ssaRecordLoadString, GuardStr, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(GuardSlot));
+        EmitInstruction(ssaStrLen, ProbeVal, GuardStr, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
+    srtFloat:
+      begin
+        GuardFlt := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+        EmitInstruction(ssaRecordLoadFloat, GuardFlt, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(GuardSlot));
+        EmitInstruction(ssaCmpNeFloat, ProbeVal, GuardFlt,
+                        EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone));
+      end;
+  else
+    EmitInstruction(ssaRecordLoadInt, ProbeVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(GuardSlot));
+  end;
   EmitInstruction(ssaJumpIfZero, MakeSSALabel(InitLabel), ProbeVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
@@ -27328,6 +27409,81 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryEmitManagedRecordClear(ArgsNode: TASTNode): Boolean;
+// FreeBASIC "Clear rec, 0, n" where rec is a MANAGED record - a "T Ptr" element of a CAllocate'd or
+// New'd block, or a record variable. There is no byte image to write over: the record is slots in a
+// table, and its address is a HANDLE. So the operation is honoured as what the program means by it -
+// bring the instance back to the state a fresh allocation gives it - by storing zero / "" into each
+// flat slot. proguide/dynamicmemory writes exactly this to clear the string descriptor of an element
+// its Reallocate has just added, and notes in its own comment that it is "maybe useless because of the
+// constructor's call right behind".
+//
+// ⚠️ DECLARED DIVERGENCE, and it is bounded on purpose:
+//   · only a fill value of ZERO is honoured; any other byte pattern still refuses, because a pattern
+//     over a record's storage means nothing here and answering something plausible would be worse;
+//   · the BYTE COUNT is not honoured - the whole instance is reset, not a prefix of it. A partial
+//     byte range has no meaning over slots that are not laid out in bytes;
+//   · nested-UDT and member-array fields keep their instances: their slots hold HANDLES, and zeroing
+//     one leaks the instance and leaves "rec.member(i)" dereferencing 0.
+var
+  Handle, ZeroI, ZeroF, ZeroS: TSSAValue;
+  TypeName: string;
+  UDTIdx, i: Integer;
+  ValNode: TASTNode;
+begin
+  Result := False;
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+  // The fill value: absent, or the literal 0. Anything else is not this.
+  if ArgsNode.ChildCount >= 2 then
+  begin
+    ValNode := ArgsNode.GetChild(1);
+    if (ValNode <> nil) and (ValNode.NodeType <> antLiteral) then Exit;
+    if (ValNode <> nil) and (Trim(VarToStr(ValNode.Value)) <> '0') then Exit;
+  end;
+  if not ResolveRecordObject(ArgsNode.GetChild(0), Handle, TypeName) then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  Handle := EnsureIntRegister(Handle);
+  ZeroI := MakeSSAValue(svkNone); ZeroF := MakeSSAValue(svkNone); ZeroS := MakeSSAValue(svkNone);
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or FUDTs[UDTIdx].Fields[i].IsArray then Continue;
+    case FUDTs[UDTIdx].Fields[i].Bank of
+      srtFloat:
+        begin
+          if ZeroF.Kind = svkNone then
+          begin
+            ZeroF := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+            EmitInstruction(ssaLoadConstFloat, ZeroF, MakeSSAConstFloat(0.0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), Handle, ZeroF,
+                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+        end;
+      srtString:
+        begin
+          if ZeroS.Kind = svkNone then
+          begin
+            ZeroS := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaLoadConstString, ZeroS, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
+          EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), Handle, ZeroS,
+                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+        end;
+    else
+      begin
+        if ZeroI.Kind = svkNone then
+        begin
+          ZeroI := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, ZeroI, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), Handle, ZeroI,
+                        MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
 procedure TSSAGenerator.EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);
 // FreeBASIC raw-memory block ops on the byte heap. The byte count register is carried in Src3 (the
 // compiler maps Src3 -> Immediate). FB_MEMCOPYCLEAR is composed from a memcopy plus a clear of the
@@ -27448,6 +27604,11 @@ begin
   end
   else if FuncU = kCLEAR then
   begin
+    // ...over a MANAGED record, first: there is no byte image to write over, and the operation is
+    // honoured as "bring the instance back to what a fresh allocation gives it". Asked BEFORE
+    // ByRefAddr, which refuses the shape - the refusal is still right for FB_MEMCOPY/FB_MEMMOVE,
+    // where there is no such reading.
+    if TryEmitManagedRecordClear(ArgsNode) then Exit;
     // Clear cdecl (ByRef dst As Any, ByVal value As Long = 0, ByVal bytes As UInteger):
     // only the destination is ByRef, the other two positions are values.
     TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);

@@ -2780,7 +2780,7 @@ End Function
 |---|---|---|
 | `PEEK` | ✓ | Reads some type of value from an address. |
 | `POKE` | ✓ | Writes some type of value to an address. |
-| `CLEAR` | ✓ | `CLEAR(dst, value, bytes)`: set a block of raw heap memory (from Allocate) to a byte value. v1 takes the pointer directly. |
+| `CLEAR` | ✓ | `CLEAR(dst, value, bytes)`: set a block of raw heap memory (from Allocate) to a byte value. v1 takes the pointer directly. Over a **managed record** (a `T PTR` element of a `NEW`/`CALLOCATE` block, or a record variable) there is no byte image to write over — the record is slots in a table — so the operation resets the instance to what a fresh allocation gives it. Bounded and declared: only a fill value of **0** is honoured (any other byte pattern still refuses), the **byte count is ignored** (the whole instance is reset), and nested-UDT / member-array fields keep their instances, since their slots hold handles. |
 | `FB_MEMCOPY` | ✓ | `FB_MEMCOPY(dst, src, bytes)`: copy a block of raw heap memory; returns dst. v1 takes pointers directly. |
 | `FB_MEMCOPYCLEAR` | ✓ | `FB_MEMCOPYCLEAR(dst, dstlen, src, srclen)`: copy the first srclen bytes, clear the rest (composed from FB_MEMCOPY + CLEAR). |
 | `FB_MEMMOVE` | ✓ | `FB_MEMMOVE(dst, src, bytes)`: copy a block of raw heap memory, overlap-safe; returns dst. |
