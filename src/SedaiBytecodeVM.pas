@@ -708,8 +708,9 @@ type
     procedure RawStrCellSet(RawPtr: Int64; const S: string);                   // ...and writing one
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
-    procedure RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes on the raw heap
-    procedure RawClear(DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value on the raw heap
+    function BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt): Pointer;  // CLEAR/FB_MEMCOPY: the raw heap, the framebuffer, OR an array's element storage
+    procedure RawMemCopy(Ctx: TExecutionContext; DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes
+    procedure RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
     procedure CleanupSharedRecords;   // free the shared region (destructor)
@@ -5441,21 +5442,74 @@ begin
   else PDouble(RawAddr(RawPtr, 8))^ := Value;
 end;
 
+// The destination of a BLOCK operation (CLEAR, FB_MEMCOPY, FB_MEMMOVE), which is not always the byte
+// heap. FreeBASIC's own manual clears an ARRAY with it -
+//     Clear array(0), , 100 * SizeOf(Integer)
+// - and "array(0)" is not a raw pointer here: it is an FArrays-backed pointer (bit 63 and bit 62 both
+// clear), packing arrayId+1 and the element offset, which RawAddr rejects out of hand. The statement
+// therefore died on "Null or invalid raw pointer dereference" - and where the array was otherwise
+// unused, DCE dropped the whole thing and the program printed fbc's answer for the wrong reason.
+//
+// An int or float array IS a contiguous byte image: IntData is "array of Int64" and FloatData "array of
+// Double", so a block operation over it means what fbc means, element for element, PROVIDED the elements
+// are eight bytes wide. A NARROW element type ("As Short") is stored widened here and its byte image is
+// not fbc's; the SSA generator refuses those at compile time rather than answering differently in
+// silence (see EmitRawMemOp). A STRING array has no byte image at all and is refused here.
+//
+// The bounds check is the same contract RawAddr keeps: NeedBytes must fit from the offset to the end of
+// the storage, so a block operation can never reach memory the VM does not own.
+function TBytecodeVM.BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt): Pointer;
+var
+  ArrayIdx: Integer;
+  PtrOffset, Avail: Int64;
+begin
+  // A raw-heap / framebuffer pointer, or a record-field pointer (bit 63): RawAddr owns both answers -
+  // the second one by refusing it, since a record field is not a byte image either.
+  if (Ptr and RAWPTR_TAG) <> 0 then Exit(RawAddr(Ptr, NeedBytes));
+  if Ptr < 0 then
+    raise ERangeError.Create('CLEAR/FB_MEMCOPY: a record-field pointer is not a byte image');
+  if Ptr = 0 then
+    raise ERangeError.Create('Null or invalid raw pointer dereference');
+
+  ArrayIdx := MapArrDyn(Ctx, (Ptr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := Ptr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ptr]);
+  case FArrays[ArrayIdx].ElementType of
+    0: begin
+         Avail := (Int64(Length(FArrays[ArrayIdx].IntData)) - PtrOffset) * SizeOf(Int64);
+         if (PtrOffset > High(FArrays[ArrayIdx].IntData)) or (Int64(NeedBytes) > Avail) then
+           raise ERangeError.CreateFmt('Block operation out of bounds: %d bytes from element %d, %d available',
+                                       [Int64(NeedBytes), PtrOffset, Avail]);
+         Result := @FArrays[ArrayIdx].IntData[PtrOffset];
+       end;
+    1: begin
+         Avail := (Int64(Length(FArrays[ArrayIdx].FloatData)) - PtrOffset) * SizeOf(Double);
+         if (PtrOffset > High(FArrays[ArrayIdx].FloatData)) or (Int64(NeedBytes) > Avail) then
+           raise ERangeError.CreateFmt('Block operation out of bounds: %d bytes from element %d, %d available',
+                                       [Int64(NeedBytes), PtrOffset, Avail]);
+         Result := @FArrays[ArrayIdx].FloatData[PtrOffset];
+       end;
+  else
+    raise ERangeError.Create('CLEAR/FB_MEMCOPY over a STRING array: its elements are managed values, not bytes');
+  end;
+end;
+
 // FB_MEMCOPY / FB_MEMMOVE: copy ByteCount bytes from SrcPtr to DstPtr. Both pointers are resolved
-// through RawAddr, so either may name the byte heap or the framebuffer, and both ends are bounds-checked
-// against their own region. FPC Move is overlap-safe, so this serves both the (non-overlapping) memcopy
-// and the (overlap-safe) memmove semantics.
-procedure TBytecodeVM.RawMemCopy(DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);
+// through BlockAddr, so either may name the byte heap, the framebuffer or an array's storage, and both
+// ends are bounds-checked against their own region. FPC Move is overlap-safe, so this serves both the
+// (non-overlapping) memcopy and the (overlap-safe) memmove semantics.
+procedure TBytecodeVM.RawMemCopy(Ctx: TExecutionContext; DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);
 begin
   if ByteCount = 0 then Exit;
-  Move(RawAddr(SrcPtr, ByteCount)^, RawAddr(DstPtr, ByteCount)^, ByteCount);
+  Move(BlockAddr(Ctx, SrcPtr, ByteCount)^, BlockAddr(Ctx, DstPtr, ByteCount)^, ByteCount);
 end;
 
 // CLEAR: set ByteCount bytes at DstPtr to Value, in whichever region DstPtr names.
-procedure TBytecodeVM.RawClear(DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);
+procedure TBytecodeVM.RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);
 begin
   if ByteCount = 0 then Exit;
-  FillChar(RawAddr(DstPtr, ByteCount)^, ByteCount, Value);
+  FillChar(BlockAddr(Ctx, DstPtr, ByteCount)^, ByteCount, Value);
 end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
@@ -13292,16 +13346,16 @@ begin
     26: RawStoreFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);        // bcRawStoreFloat
     31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
       begin
-        RawMemCopy(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+        RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
         Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
       end;
     32: // bcRawMemMove - FB_MEMMOVE(dst, src, bytes); overlap-safe
       begin
-        RawMemCopy(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+        RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
         Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
-      RawClear(Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+      RawClear(Ctx, Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
     50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2).
         // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that

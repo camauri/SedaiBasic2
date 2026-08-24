@@ -501,6 +501,19 @@ begin
   end;
 end;
 
+function PPDirectiveContinues(const S: string): Boolean;
+// Does this preprocessor-directive line end with FreeBASIC's '_' LINE CONTINUATION?
+// True only when the underscore stands alone at the end: an identifier may end in '_' too
+// ("#define MAX_" defines MAX_, it does not continue), so the character before it must not be
+// one an identifier could hold.
+var
+  T: string;
+begin
+  T := TrimRight(StripDirectiveComment(S));
+  Result := (T <> '') and (T[Length(T)] = '_') and
+            ((Length(T) = 1) or not IsIdentChar(T[Length(T) - 1]));
+end;
+
 function PPConstStrFold(const S: string; Defs: TStringList; out Res: string): Boolean;
 // A constant STRING expression: a chain of string literals and string-valued macros joined by '+' or
 // '&'. Answers the folded text as a LITERAL (quotes included), so it can be substituted where the
@@ -637,6 +650,7 @@ var
   Args: array[0..63] of string;
   N, Idx: Integer;
   Cond: string;
+  CondVal: Int64;
 begin
   Result := True;
   Value := '';
@@ -690,7 +704,18 @@ begin
     if N >= 3 then
     begin
       Cond := PPConstIntStr(Args[0], Defs);
-      if StrToInt64Def(Trim(Cond), 0) <> 0 then Value := Trim(Args[1]) else Value := Trim(Args[2]);
+      // ⛔ THE CONDITION MUST FOLD. __FB_IIF__ picks a branch at COMPILE TIME, so fbc requires a
+      // constant expression and refuses anything else. PPConstIntStr hands back the expression
+      // UNCHANGED when it cannot fold it, and StrToInt64Def then read that text as 0 - which silently
+      // chose the ELSE branch. operator/procptr4 is exactly that case: its condition is
+      // "ProcPtr(p, Virtual ...) >= 0", a constant for fbc and not for us, and the else branch took
+      // the ordinary address of the procedure and printed 4611686018427387904 where fbc runs the
+      // override. Naming it costs one test and turns a wrong answer into a refusal.
+      if not TryStrToInt64(Trim(Cond), CondVal) then
+        raise Exception.CreateFmt(
+          '__FB_IIF__ needs a CONSTANT condition - it chooses a branch while compiling - and "%s" ' +
+          'does not fold to one here. Use IIf(...) for a value decided at run time.', [Trim(Args[0])]);
+      if CondVal <> 0 then Value := Trim(Args[1]) else Value := Trim(Args[2]);
     end;
     Exit;
   end;
@@ -1890,6 +1915,23 @@ var
           Output.Add('');
           Inc(li);
           Continue;
+        end;
+        // A DIRECTIVE CONTINUED ON THE NEXT LINE. FreeBASIC's '_' continuation works inside a
+        // preprocessor directive too, and the manual's own #define is written that way:
+        //     #define printval(bar) _
+        //         Print #bar; " ="; bar
+        // Without the join the directive defined an EMPTY macro and its body was left standing in the
+        // source as ordinary code - so prepro/define went on to execute "Print #bar; ..." and died on
+        // "PRINT# error 64 writing to file: 0", a complaint about a file handle for a line nobody
+        // wrote. Every line swallowed here leaves a blank behind, exactly as #macro does, so the line
+        // numbers the rest of the pipeline reports stay the source's own.
+        while (Length(Trimmed) > 0) and (Trimmed[1] = '#') and PPDirectiveContinues(Trimmed) and
+              (li + 1 < Lines.Count) do
+        begin
+          Trimmed := TrimRight(StripDirectiveComment(Trimmed));
+          Trimmed := Copy(Trimmed, 1, Length(Trimmed) - 1) + ' ' + Trim(Lines[li + 1]);
+          Inc(li);
+          Output.Add('');
         end;
         if (Length(Trimmed) > 0) and (Trimmed[1] = '#') then
         begin

@@ -2938,6 +2938,20 @@ begin
           Context.Check(ttSeparStmt) or Context.Check(ttDelimParClose)) then
   begin
     repeat
+      // An OMITTED argument, which is how FreeBASIC's own manual writes the default:
+      //     Clear array(0), , 100 * SizeOf(Integer)
+      // The parenthesised list (ParseExpressionList) has always stood an empty antLiteral in that
+      // position; this loop instead handed the comma itself to ParseExpression, whose prefix rule for a
+      // separator is a debug stub - so the argument list came out short and shifted, the byte count was
+      // read from the wrong place, and the program printed "[SSA] WARNING: Unhandled node type" on the
+      // way past. Same spelling, same node: the two paths must agree on what "nothing" is.
+      if Context.Check(ttSeparParam) then
+      begin
+        ArgList.AddChild(TASTNode.Create(antLiteral));
+        Context.Advance;                          // ,
+        if Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt) then Break;
+        Continue;
+      end;
       ArgExpr := FExpressionParser.ParseExpression;
       if not Assigned(ArgExpr) then Break;
       ArgList.AddChild(ArgExpr);
@@ -2969,6 +2983,15 @@ begin
   if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
   begin
     repeat
+      // An OMITTED argument - see the same handling in ParseCallStatement, and why the two spellings
+      // have to agree on what "nothing" is.
+      if Context.Check(ttSeparParam) then
+      begin
+        ArgList.AddChild(TASTNode.Create(antLiteral));
+        Context.Advance;                          // ,
+        if Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt) then Break;
+        Continue;
+      end;
       ArgExpr := FExpressionParser.ParseExpression;
       if not Assigned(ArgExpr) then Break;
       ArgList.AddChild(ArgExpr);
@@ -3547,7 +3570,17 @@ begin
          ((not Context.Check(ttDelimParOpen)) and (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
           (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
       begin
-        MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+        // ⭐ An OPERATOR keeps the word in its name. The definition side labels it "TYPE.OPERATORCAST"
+        // (and "TYPE.OPERATOR[]", "TYPE.OPERATORLET", ...), so recording the bare "CAST" here filed
+        // every decorator under a key nothing looks up: "Declare Virtual Operator Cast() As String"
+        // stored VIRTUALCAST while MethodIsVirtual asked for VIRTUALOPERATORCAST$, answered no, and the
+        // call resolved on the STATIC type. A Child overriding a virtual Cast printed the Parent's
+        // answer through a Parent pointer, while a virtual Sub next to it dispatched correctly - the
+        // tell that the defect was in the NAME and not in the dispatcher.
+        if MethName = kOPERATOR then
+          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value))
+        else
+          MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
         Context.Advance;
       end
       else

@@ -3091,12 +3091,26 @@ End Function
 |---|---|---|
 | `EVENT` | ✗ | Data type for ScreenEvent function. |
 
-### Non implementato, dichiarato (24 agosto 2026)
+### Declared unsupported (24 August 2026)
 
-- **Tipo o union annidati CON NOME**: `Union U ... End Union` dentro un `Type`, poi `m As U`.
-  Dichiarano un tipo a se', mentre questo modello appiattisce i membri nel tipo che li contiene.
-  Rifiutato con un messaggio esplicito: dare al blocco nessun nome, oppure dichiarare il tipo fuori.
-  La forma ANONIMA e' supportata e i suoi membri sono sequenziali, come in FreeBASIC.
-- **`TypeOf` come tipo esatto**: `Dim As TypeOf(x)` funziona, ma il tipo dedotto e' approssimato al
-  banco (stringa / intero / virgola mobile). `Cast(TypeOf(p), 0)` con `p As Double Ptr` non ottiene
-  `Double Ptr`, quindi non e' supportato.
+Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
+
+- **A NAMED nested type or union**: `Union U ... End Union` inside a `Type`, then `m As U`. That
+  declares a type of its own, while this model flattens the members into the type that holds them.
+  Refused: leave the block unnamed, or declare the type outside. The ANONYMOUS form *is* supported and
+  its members are laid out in sequence, as in FreeBASIC.
+- **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
+  BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
+  `Double Ptr`, so it is not supported.
+- **`ProcPtr(p, Virtual ...)`** (fbc 1.10+) asks for a member's **vtable index**, not its address.
+  There is no vtable a program can index here: a virtual call goes through a generated dispatcher
+  keyed on the instance's runtime type-id. Call the method directly — the dispatch is the same one.
+- **`__FB_IIF__` with a condition that does not fold to a constant.** It chooses a branch while
+  compiling, so the condition must be constant; fbc folds some that we cannot (a vtable index, for
+  one). `IIf(...)` is the run-time form and is fully supported.
+- **`Clear` / `FB_MEMCOPY` / `FB_MEMMOVE` over an array whose elements are declared NARROW**
+  (`As Short`, `As UByte`, …). An `Integer`/`LongInt`/`Double` array is a real contiguous byte image
+  here and these ops work over it exactly as in fbc; a narrow element type is stored widened, so a
+  byte count would cover a different number of elements. Loop over the elements instead.
+- **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
+  byte image — the elements are managed values.
