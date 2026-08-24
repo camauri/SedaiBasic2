@@ -345,6 +345,9 @@ type
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
+    FArrayScalarPointee: TStringList;    // array of NON-UDT pointers ("DIM a(..) As ZString Ptr") -> the pointee type name.
+                                         //   Kept apart from FArrayPtrPointee, whose readers all assume a UDT (a record HANDLE);
+                                         //   this one only says what "*a(i)" dereferences TO.
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
     FDeclaredNames: TStringList;         // names introduced by an EXPLICIT declaration (DIM/VAR/STATIC/CONST,
                                          //   procedure parameters). Distinct from FVarMap, which also holds
@@ -516,6 +519,8 @@ type
     function ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;  // a DIFFERENT-bank pointer takes @scalar
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
+    function IsBuiltinNewType(NewNode: TASTNode): Boolean;  // "New <builtin>" -> a RAW pointer
+    function DeclaredTypeNameOf(Node: TASTNode): string;   // the DECLARED type of an expression, or ''
     function ManagedPtrPointee(const Name: string): string;                     // pointee type of a managed pointer (per-proc param or DIM'd), else ''
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
@@ -1144,6 +1149,8 @@ begin
   FArrayRecordType.CaseSensitive := False;
   FArrayFuncPtrSig := TStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
+  FArrayScalarPointee := TStringList.Create;
+  FArrayScalarPointee.CaseSensitive := False;
   FArrayPtrPointee := TStringList.Create;
   FArrayPtrPointee.CaseSensitive := False;
   FNeededDispatchers := TStringList.Create;
@@ -1260,6 +1267,7 @@ begin
   FArrayRecordType.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
+  FArrayScalarPointee.Free;
   FArrayPtrPointee.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
@@ -2092,6 +2100,25 @@ begin
 
     antCast:
     begin
+      // "Cast(TypeOf(x), v)": the type was ASKED, not written. Answer it from x's DECLARATION and put
+      // the answer where the type string goes, so everything below is the ordinary cast it already is.
+      // Done ONCE, in place: the node is visited again by the optimizer passes and re-deriving the type
+      // each time would make the answer depend on when it was asked.
+      if (Node.Attributes.Values['TYPEOFEXPR'] = '1') and (Node.ChildCount >= 2) then
+      begin
+        TempStr := DeclaredTypeNameOf(Node.GetChild(1));
+        if TempStr = '' then
+          raise Exception.Create(
+            'Cast(TypeOf(expr), ...): the type of that expression is not known here. TypeOf answers ' +
+            'for a name this compiler recorded a declaration for (a UDT, a pointer, a narrow scalar) ' +
+            'and for "*p"; write the type out instead.');
+        // "TypeOf(x) Ptr" keeps whatever levels of indirection were written after it.
+        ArrName2 := UpperCase(VarToStr(Node.Value));
+        if Copy(ArrName2, 1, 6) = 'TYPEOF' then
+          TempStr := TempStr + Copy(ArrName2, 7, MaxInt);
+        Node.Value := TempStr;
+        Node.Attributes.Values['TYPEOFEXPR'] := '0';
+      end;
       // FreeBASIC CAST/CPTR(type, expr). A pointer target type is a value passthrough (the raw byte
       // offset / managed handle is reinterpreted, not changed — the receiving variable's declared type
       // drives the deref). A scalar target type converts the value to that bank.
@@ -2176,10 +2203,28 @@ begin
       // is its CHARACTERS, read at the address up to the terminator. Any other reading of it - a scalar
       // load of eight bytes, say - takes the address itself for data. This is how a string reaches a
       // procedure declared "ByVal r As ZString Ptr".
-      if (DerefTarget.NodeType = antIdentifier) then
+      // ...and the same pointee reached through an ARRAY ELEMENT: "Dim As ZString Ptr names(0 To 2)"
+      // then "*names(i)". The rule below recognises a pointer NAME, and an array of pointers has one
+      // pointee for the whole array - recorded per-array when it was declared - so the question is the
+      // same one asked of the element. Without this the deref fell to the generic scalar load, which
+      // read the ADDRESS itself as data and faulted. It is the shape a table of C strings has, and the
+      // manual's defines/fbquerysymbol2 is built on one.
+      if (DerefTarget.NodeType = antIdentifier) or
+         ((DerefTarget.NodeType = antArrayAccess) and (DerefTarget.ChildCount >= 1) and
+          (DerefTarget.GetChild(0).NodeType = antIdentifier) and
+          (ArrayIndexOf(VarToStr(DerefTarget.GetChild(0).Value)) >= 0)) then
       begin
-        TempStr := UpperCase(FPointerVars.Values[UpperCase(VarToStr(DerefTarget.Value))]);
-        if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
+        if DerefTarget.NodeType = antIdentifier then
+        begin
+          TempStr := UpperCase(FPointerVars.Values[UpperCase(VarToStr(DerefTarget.Value))]);
+          if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
+        end
+        else
+        begin
+          TempStr := UpperCase(FArrayScalarPointee.Values[UpperCase(VarToStr(DerefTarget.GetChild(0).Value))]);
+          if TempStr = '' then
+            TempStr := UpperCase(ArrayPointerUDTType(VarToStr(DerefTarget.GetChild(0).Value)));
+        end;
         if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
         begin
           ProcessExpression(DerefTarget, Left);
@@ -5923,6 +5968,25 @@ begin
         // (identifier); a pointer variable argument resolves to pointer size (8). Used for "Allocate(n *
         // SizeOf(Integer))". A POINTER TYPE argument arrives as the single identifier "T PTR" (the parser
         // folds the juxtaposition, as it does for a DIM) and is likewise 8 bytes.
+        // "SizeOf(*Cast(T Ptr, 0))" - FreeBASIC's idiom for "the size of the POINTEE type", and the
+        // whole point of casting a null pointer: nothing is dereferenced, the expression exists only to
+        // name a type. It is what the manual's own sizeofDerefPtr() macro is built on. The intercept
+        // below reads a NAME or a field; this reads the DECLARED type of the expression and asks its
+        // size, which is the same question one level up.
+        if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+           (Node.GetChild(1).ChildCount = 1) and
+           (Node.GetChild(1).GetChild(0).NodeType in [antDeref, antCast]) then
+        begin
+          TempStr := DeclaredTypeNameOf(Node.GetChild(1).GetChild(0));
+          if TempStr <> '' then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
+        end;
         if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
            (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess]) then
@@ -7315,9 +7379,14 @@ begin
   // function it sits in, so it emits the reserved word as the target and it resolves here.
   // Evaluate the expression and stage it into the result transfer slot (delivered to the
   // caller on bcReturnSub). QB semantics: execution continues; the actual return is at END.
+  // ...and "OPERATOR = expr", which is how an operator hands its value back and what the manual writes.
+  // The pre-scan that classifies a BYREF return already counts it as a result target; this one did not,
+  // so inside an operator the statement fell through to the ordinary assignment path and the result was
+  // never staged. It showed only on a BYREF cast, where the caller then dereferenced a zero.
   if FInProcedure and FCurrentProcIsFunction and
      ((UpperCase(VarName) = FCurrentProcName) or
       (UpperCase(VarName) = kFUNCTION) or
+      (UpperCase(VarName) = kOPERATOR) or
       (Pos('.', FCurrentProcName) > 0) and
       (UpperCase(VarName) = Copy(FCurrentProcName, Pos('.', FCurrentProcName) + 1, MaxInt))) then
   begin
@@ -7338,6 +7407,15 @@ begin
     if FCurrentProcByrefRet and TryEmitIndexedElementAddress(ExprNode, ExprValue) then
     begin
       EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
+      Exit;
+    end;
+    // ...and "Operator = This.I": a FIELD, whose address is a record-field pointer. Same rule as the
+    // RETURN spelling, and it has to be in both or one form of the same operator works and the other
+    // hands back the field's VALUE where the caller expects a reference.
+    if FCurrentProcByrefRet and (ExprNode.NodeType = antMemberAccess) then
+    begin
+      EmitFieldAddress(ExprNode, ExprValue);
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
       Exit;
     end;
     ProcessExpression(ExprNode, ExprValue);
@@ -9570,6 +9648,14 @@ begin
     // Record the pointee so "a(i)->field" resolves to record access on the loaded element.
     if (RecArrUDTIdx < 0) and (PointeeOfPtrTypeName(ArrElemTypeName) <> '') then
       FArrayPtrPointee.Values[UpperCase(ArrName)] := PointeeOfPtrTypeName(ArrElemTypeName);
+    // ...and the SCALAR pointee, which the map above declines by design (its readers all expect a UDT
+    // record handle). "Dim names(0 To 2) As ZString Ptr" is a table of C strings, and "*names(i)" has
+    // to know it dereferences to CHARACTERS and not to eight bytes read as a number.
+    if (RecArrUDTIdx < 0) and (Length(ArrElemTypeName) >= 5) and
+       (Copy(ArrElemTypeName, Length(ArrElemTypeName) - 3, 4) = ' PTR') and
+       (PointeeOfPtrTypeName(ArrElemTypeName) = '') then
+      FArrayScalarPointee.Values[UpperCase(ArrName)] :=
+        Trim(Copy(ArrElemTypeName, 1, Length(ArrElemTypeName) - 4));
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
@@ -18250,8 +18336,16 @@ begin
   // line-delete form attaches line-number LITERALS, never an address, so this is unambiguous too -
   // and without it the statement fell into the line-delete path below and did nothing at all, so the
   // object was destroyed only at program end.
+  // ...and "Delete a(i)", an element of an array of UDT pointers. The classic line-delete form attaches
+  // line-number LITERALS, so an antArrayAccess on a DECLARED array is unambiguous too - and without this
+  // the statement fell into the line-delete path below and emitted a CLASSIC opcode the VM has no arm
+  // for. ⚠️ Invisible with the optimizer ON, which dropped the dead statement: only --no-opt failed, so
+  // the corpus caught it as an OPTDIFF rather than as an error.
   if (Node.ChildCount >= 1) and
-     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress)) then
+     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress) or
+      ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+       (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+       (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) >= 0))) then
   begin
     EmitDeleteObject(Node);
     Exit;
@@ -26143,6 +26237,89 @@ begin
     if Proc.GetChild(i).NodeType <> antProcedureDecl then Walk(Proc.GetChild(i));
 end;
 
+function TSSAGenerator.IsBuiltinNewType(NewNode: TASTNode): Boolean;
+// Does this "New <type>" allocate a BUILTIN scalar rather than a UDT? Such a pointer is RAW - a scalar
+// has no record to be a handle to - and the pre-scan has to know it, or "*p = 3.14" writes through the
+// managed path into nothing. ⚠️ It runs BEFORE the TypeOf form is resolved, so it answers for that one
+// by asking the operand, exactly as EmitNewObject will.
+var
+  T: string;
+begin
+  Result := False;
+  if (NewNode = nil) or (NewNode.NodeType <> antNew) then Exit;
+  if NewNode.Attributes.Values['TYPEOFHELD'] = '1' then
+  begin
+    if NewNode.ChildCount < 1 then Exit;
+    T := DeclaredTypeNameOf(NewNode.GetChild(NewNode.ChildCount - 1));
+  end
+  else
+    T := UpperCase(VarToStr(NewNode.Value));
+  Result := (T <> '') and (FindUDT(T) < 0) and (TypeSizeBytes(T) > 0);
+end;
+
+function TSSAGenerator.DeclaredTypeNameOf(Node: TASTNode): string;
+// The type a name was DECLARED as, spelled the way the rest of the pipeline spells one ("DOUBLE PTR",
+// "MYUDT", "SHORT"). This is what "TypeOf(x)" asks, and asking the BANK instead - three answers for ten
+// types - is the approximation that made "Cast(TypeOf(pd), 0)" unusable: a Double Ptr and an Integer are
+// the same bank and not the same type.
+//
+// It is not a static type system and does not pretend to be one: it answers for a NAME whose declaration
+// this generator recorded (a UDT, a pointer, a narrow scalar), for "*p" (one level of indirection off),
+// and for a CAST (which says its own type). Anything else answers '' and the caller falls back to the
+// bank, exactly as before.
+var
+  NameU, T: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  if Node.NodeType = antParentheses then
+    Exit(DeclaredTypeNameOf(Node.GetChild(0)));
+  if Node.NodeType = antCast then
+  begin
+    // An UNRESOLVED "Cast(TypeOf(x), ...)": the type is still the marker, so ask x. This is reached
+    // before the cast is lowered - "SizeOf(*Cast(TypeOf(p), 0))" never evaluates the cast at all - so
+    // the answer cannot be left to the lowering.
+    if (Node.Attributes.Values['TYPEOFEXPR'] = '1') and (Node.ChildCount >= 2) then
+    begin
+      Result := DeclaredTypeNameOf(Node.GetChild(1));
+      if Result = '' then Exit;
+      T := UpperCase(VarToStr(Node.Value));
+      if Copy(T, 1, 6) = 'TYPEOF' then Result := Result + Copy(T, 7, MaxInt);
+      Exit;
+    end;
+    Exit(UpperCase(VarToStr(Node.Value)));
+  end;
+  if Node.NodeType = antDeref then
+  begin
+    // "*p" is p's type with one " PTR" taken off.
+    T := DeclaredTypeNameOf(Node.GetChild(0));
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
+    Exit;
+  end;
+  if Node.NodeType <> antIdentifier then Exit;
+  NameU := UpperCase(VarToStr(Node.Value));
+  Result := VarRecordTypeName(NameU);                       // a UDT instance
+  if Result <> '' then Exit;
+  T := ManagedPtrPointee(NameU);                            // a declared "T PTR"
+  if T <> '' then Exit(T + ' PTR');
+  T := RawUDTPtrType(NameU);                                // ...laid over raw memory
+  if T <> '' then Exit(T + ' PTR');
+  case Declared32Code(Node) of                              // a NARROW scalar keeps its own name
+    1: Result := 'BYTE';   2: Result := 'UBYTE';
+    3: Result := 'SHORT';  4: Result := 'USHORT';
+    5: Result := 'LONG';   6: Result := 'ULONG';
+    7: Result := 'SINGLE';
+  end;
+  if Result <> '' then Exit;
+  if FVarExplicitType.IndexOf(NameU) >= 0 then
+    case TSSARegisterType(PtrInt(FVarExplicitType.Objects[FVarExplicitType.IndexOf(NameU)])) of
+      srtString: Result := 'STRING';
+      srtFloat:  Result := 'DOUBLE';
+      srtInt:    Result := 'INTEGER';
+    end;
+end;
+
 function TSSAGenerator.ManagedPtrPointee(const Name: string): string;
 // The pointee type name of a managed pointer: a "param AS T PTR" of the proc being lowered (per-proc,
 // checked first so it wins over a same-named global) or a DIM'd/global "T PTR" (FPointerVars). '' if
@@ -26795,8 +26972,9 @@ var
           FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
       Exit;
     end;
-    if (Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') then
-      MarkRaw(TargetU)   // p = New T[n]: a byte block, indexed and freed raw
+    if (Rhs.NodeType = antNew) and
+       ((Rhs.Attributes.Values['NEWARRAY'] = '1') or IsBuiltinNewType(Rhs)) then
+      MarkRaw(TargetU)   // p = New T[n] / New <builtin>: a byte block, indexed and freed raw
     else if IsAllocCall(Rhs, FU) then
       MarkRaw(TargetU)
     else if IsScreenPtrExpr(Rhs) then
@@ -27681,6 +27859,20 @@ var
   CountVal, ElemVal, BytesVal: TSSAValue;
 begin
   NewType := UpperCase(VarToStr(Node.Value));
+  // "New TypeOf(expr)": the operand is the LAST child (after the placement address, if any) and the
+  // type is whatever that expression was DECLARED as. Resolved once, in place.
+  if (Node.Attributes.Values['TYPEOFHELD'] = '1') and (Node.ChildCount >= 1) then
+  begin
+    NewType := DeclaredTypeNameOf(Node.GetChild(Node.ChildCount - 1));
+    if NewType = '' then
+      raise Exception.Create(
+        'New TypeOf(expr): the type of that expression is not known here. TypeOf answers for a name ' +
+        'this compiler recorded a declaration for (a UDT, a pointer, a narrow scalar) and for "*p"; ' +
+        'write the type out instead.');
+    Node.Value := NewType;
+    Node.Attributes.Values['TYPEOFHELD'] := '0';
+    Node.RemoveChildAt(Node.ChildCount - 1);   // the operand named a type; it is not a ctor argument
+  end;
   UDTIdx := FindUDT(NewType);
   // "New T[n]": n contiguous elements of T on the byte heap, and the value IS the address of the first.
   // A record handle cannot express that - the elements have to be adjacent for "p[i]" to walk them - so
@@ -27695,6 +27887,19 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaMulInt, BytesVal, EnsureIntRegister(CountVal), ElemVal, MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  // "New <builtin>": one instance of a scalar type on the heap, the value being a pointer to it -
+  // "Dim As Double Ptr p = New Double". Same allocation as "New T[1]" and the same RAW pointer, which
+  // is what "*p = 3.14" then writes through; a scalar has no record to be a handle to.
+  // (The manual reaches it through a macro: "New TypeOf(*Cast(TypeOf(pd), 0))" resolves to New Double.)
+  if (UDTIdx < 0) and (TypeSizeBytes(NewType) > 0) and (NewType <> '') then
+  begin
+    BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, BytesVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
@@ -27741,6 +27946,23 @@ begin
     HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
     EmitDestructorCall(HandleReg, PtrType);
     EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  // "Delete a(i)": the element holds the record handle, so destroy and free THAT.
+  if (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    PtrType := ArrayPointerUDTType(VarToStr(Node.GetChild(0).GetChild(0).Value));
+    ProcessExpression(Node.GetChild(0), HandleReg);
+    HandleReg := EnsureIntRegister(HandleReg);
+    if PtrType <> '' then
+    begin
+      EmitDestructorCall(HandleReg, PtrType);
+      EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      // not a UDT pointer: a raw block, freed as "Delete[] p" frees one
+      EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
   if Node.GetChild(0).NodeType <> antIdentifier then
@@ -27931,6 +28153,12 @@ begin
   if N = nil then Exit;
   while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
   if N.NodeType = antIdentifier then Exit(True);
+  // ...and a FIELD. "Operator T.Cast() ByRef As Integer : Return This.I" hands back a reference to a
+  // member, which is the whole point of an assignable cast operator (the manual's casting/opcast2 writes
+  // "Cast(Integer, u) = 78"). A record field HAS an address here - "@obj.field" packs a record-field
+  // pointer, and the very ssaRefLoad/ssaRefStore the byref-return machinery uses know how to follow one -
+  // so calling it non-addressable made the operator a VALUE return and the assignment was refused.
+  if N.NodeType = antMemberAccess then Exit(True);
   Result := (N.NodeType = antArrayAccess) and (N.Attributes.Values['BRACKET'] = '1') and
             (N.ChildCount >= 2) and
             (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]);
@@ -28818,6 +29046,11 @@ begin
     if Lbl = '' then Exit;
     ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
   end;
+  // A cast declared BYREF hands back an ADDRESS - that is what makes "Cast(Integer, u) = 78" possible -
+  // so READING through it has to dereference, exactly as the index operator's read already does. Without
+  // this the value printed was the record-field POINTER itself.
+  if (Lbl <> '') and ByrefRetByAddress(Lbl) then
+    Val := EmitByrefRetDeref(EnsureIntRegister(Val), Lbl);
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -28895,6 +29128,9 @@ begin
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   if ResolveMethodLabel(TypeName, 'OPERATORCAST$') = '' then Exit;   // '$' = string-returning cast
   ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);
+  // ...and the same dereference for a BYREF string cast (see the numeric one).
+  if ByrefRetByAddress(ResolveMethodLabel(TypeName, 'OPERATORCAST$')) then
+    Val := EmitByrefRetDeref(EnsureIntRegister(Val), ResolveMethodLabel(TypeName, 'OPERATORCAST$'));
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -28999,6 +29235,11 @@ begin
   if IsFunc then
   begin
     RT := GetVariableType(MethodLabel);   // method return bank (record handle => int)
+    // ⛔ ...unless it returns BYREF. Then what travels is an ADDRESS - an INT - whatever the POINTEE's
+    // bank is, and the callee stages it in the int slot. Reading it back in the pointee's bank looked at
+    // the float slot and found nothing: "Operator T.Cast() ByRef As Double" answered 0 while the same
+    // operator declared "As Integer" was right, because there the two banks happen to coincide.
+    if ByrefRetByAddress(MethodLabel) then RT := srtInt;
     DestVal := MakeSSARegister(RT, FProgram.AllocRegister(RT));
     EmitXferLoad(RT, XFER_RESULT_SLOT, DestVal);
     Result := DestVal;
@@ -31285,6 +31526,14 @@ begin
           else if FCurrentProcByrefRet and
                   TryEmitIndexedElementAddress(Node.GetChild(0), RetVal) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
+          // ...and a FIELD, which is what an assignable "Operator Cast() ByRef As T" hands back:
+          // "Return This.I". Its address is a record-field pointer, and the ssaRefLoad/ssaRefStore the
+          // caller uses on a byref result already follow one - only nothing had ever handed one over.
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antMemberAccess) then
+          begin
+            EmitFieldAddress(Node.GetChild(0), RetVal);
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal));
+          end
           else
           begin
             // FreeBASIC "Return Type(args)" shorthand: the bare Type() carries no <T>, so fill its type
