@@ -398,6 +398,15 @@ implementation
 uses
   Math, StrUtils, TypInfo;
 
+
+// The MODERN extensions that FreeBASIC does NOT reserve: a program may use any of them as the name
+// of its own procedure, and then that name is the program's, not ours.
+function IsShadowableExtensionName(const NameU: string): Boolean;
+begin
+  Result := (NameU = 'MIN') or (NameU = 'MAX') or (NameU = 'CEIL') or (NameU = 'ROUND') or
+            (NameU = 'COPYSIGN') or (NameU = 'SINGLEBITS') or (NameU = 'BITSTOSINGLE');
+end;
+
 { TPackratParser }
 
 constructor TPackratParser.Create;
@@ -1009,6 +1018,15 @@ begin
   Token := Context.CurrentToken;
   if not Assigned(Token) then
     Exit;
+
+  // ⭐ A shadowable MODERN extension at the START of a statement is a NAME, not our intrinsic:
+  // "min(A, B) = 0" assigns through a ByRef result, and "myproc arg" calls the user's procedure.
+  // The declaration site already accepts these names (see IsShadowableExtensionName); a statement
+  // that begins with one has to as well, or the program parses its own function and then cannot
+  // call it. Nothing is lost: the extensions are FUNCTIONS, so none of them ever begins a statement.
+  if FModernMode and (Token.TokenType <> ttIdentifier) and
+     IsShadowableExtensionName(UpperCase(Token.Value)) then
+    Token.TokenType := ttIdentifier;
 
  // Skip statement separators (:)
  if Token.TokenType = ttSeparStmt then
@@ -2496,6 +2514,19 @@ begin
   // keyword such as CIRCLE/BOX/LINE used as a type name) is malformed: report a clean error and
   // skip the body up to its END, so the parser terminates instead of derailing on a misaligned
   // token stream. (The method name *after* the dot may be a reserved word — handled below.)
+  // ⭐ A MODERN EXTENSION IS NOT A FreeBASIC KEYWORD, so it must not reserve the name. MIN, MAX,
+  // CEIL, ROUND, COPYSIGN, SINGLEBITS and BITSTOSINGLE are ours - the IEEE operations WASM has an
+  // instruction for - and fbc accepts every one of them as a procedure name (checked against fbc,
+  // 24 Aug 2026). Reserving them made "Function min(...)" a syntax error, which is a real FreeBASIC
+  // program failing to compile on a name FreeBASIC leaves free.
+  //
+  // ⭐ Nothing else is needed: SedaiSSA consults FProcedureNames BEFORE the intrinsic chain, so once
+  // the declaration is accepted the user's procedure already wins at every call site. The extension
+  // stays available to every program that does not declare one.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(Context.CurrentToken.Value)) then
+    Context.CurrentToken.TokenType := ttIdentifier;
+
   if not Context.Check(ttIdentifier) then
   begin
     HandleError(Format('Expected a name after %s, but found the reserved word "%s"',
@@ -6395,6 +6426,7 @@ var
   C64Dev, C64Sa, C64FileName: TASTNode;
   C64CommaPos: Integer;
   AccessRead: Boolean;
+  ClosedParen: Boolean;   // "Close(fileNum)": the FreeBASIC parenthesised handle
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
@@ -6685,6 +6717,16 @@ begin
       Exit;
     end;
 
+    // ⭐ FreeBASIC also writes the handle in PARENTHESES - "Close(fileNum)" - which reads like a call
+    // and is not one. Accepted only in MODERN: Commodore BASIC has no such form, and letting CLASSIC
+    // take it would make "CLOSE (1)" mean something it never meant.
+    ClosedParen := False;
+    if FModernMode and Context.Check(ttDelimParOpen) then
+    begin
+      ClosedParen := True;
+      Context.Advance;
+    end;
+
     // Expect # prefix
     if Context.Check(ttFileHandlePrefix) then
       Context.Advance  // Consume #
@@ -6711,6 +6753,17 @@ begin
     begin
       HandleError('Expected file handle after #', Token);
       Exit;
+    end;
+
+    if ClosedParen then
+    begin
+      if Context.Check(ttDelimParClose) then
+        Context.Advance
+      else
+      begin
+        HandleError('Expected ")" after the file handle', Token);
+        Exit;
+      end;
     end;
 
     // For DOPEN/OPEN, parse filename and optional mode
