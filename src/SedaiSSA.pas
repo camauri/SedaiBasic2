@@ -987,6 +987,31 @@ type
 
 implementation
 
+function CRuntimeHint(const Name: string): string;
+// An extra sentence for an UNDECLARED name that is a well-known C standard-library function. The
+// program included <crt.bi> and called into the C runtime, which this VM does not have and will not:
+// it owns its own memory and its own file handles, and handing a BASIC program a real FILE* is the
+// one thing the memory-safety design exists to prevent.
+// ⚠️ It reserves NOTHING. The name has already failed to resolve when this is asked, so a program
+// that declares its own "printf" never reaches here - which is the rule a MODERN extension must obey
+// (see the MODERN keyword note in BASIC.md).
+const
+  CRT: array[0..23] of string = (
+    'PRINTF', 'FPRINTF', 'SPRINTF', 'SNPRINTF', 'VPRINTF', 'VFPRINTF', 'VSPRINTF',
+    'FOPEN', 'FCLOSE', 'FREAD', 'FWRITE', 'FSEEK', 'FTELL', 'FFLUSH', 'FGETS', 'FPUTS',
+    'SCANF', 'SSCANF', 'FSCANF', 'PUTS', 'PUTCHAR', 'GETCHAR', 'PERROR', 'REMOVE');
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := Low(CRT) to High(CRT) do
+    if UpperCase(Name) = CRT[i] then
+      Exit(' — this is the C standard library (<crt.bi>), which SedaiBasic does not link: the VM owns ' +
+           'its own memory and file handles. Use the BASIC equivalent (Open/Print #/Close, Print Using) ' +
+           'instead.');
+end;
+
+
 // Is this SSA value already a floating-point one? (A constant float, or a float-bank register.)
 function IsFloatOperand(const V: TSSAValue): Boolean;
 begin
@@ -6786,7 +6811,7 @@ begin
 
         ArrayIdx := ArrayIndexOf(ArrName);
         if ArrayIdx < 0 then
-          raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
+          raise Exception.CreateFmt('Array not declared: %s%s', [ArrName, CRuntimeHint(ArrName)]);
 
         ArrInfo := FProgram.GetArray(ArrayIdx);
         IndicesNode := Node.GetChild(1);  // antExpressionList
@@ -8694,7 +8719,7 @@ begin
   // Find array in program
   ArrayIdx := ArrayIndexOf(ArrName);
   if ArrayIdx < 0 then
-    raise Exception.CreateFmt('Array not declared: %s', [ArrName]);
+    raise Exception.CreateFmt('Array not declared: %s%s', [ArrName, CRuntimeHint(ArrName)]);
 
   ArrInfoTmp := FProgram.GetArray(ArrayIdx);
   ArrInfo := ArrInfoTmp;

@@ -3150,6 +3150,14 @@ Each of these is *refused with a message that names the reason*, never answered 
   "infinite recursion detected" and dies. Here it yields the procedure's name as text, like
   `__FUNCTION__`. ⚠️ The one use the manual makes of it, `@__FUNCTION_NQ__` (the enclosing
   procedure's own address), *is* supported and means exactly `@<that procedure>`.
+- **The C standard library through `<crt.bi>`** (`printf`, `fopen`, `fprintf`, `vprintf`, …). There is
+  no C FFI here and there will not be one: the VM owns its memory and its file handles, and handing a
+  BASIC program a real `FILE*` is the one thing the memory-safety design exists to prevent. Including
+  the header is harmless — most programs that do never call into it — but a *call* fails, now with a
+  message that says so rather than "Array not declared". Use the BASIC equivalents
+  (`Open`/`Print #`/`Close`, `Print Using`).
+- **Inline assembly**: `Asm … End Asm`, `Naked` procedures, `#pragma reserve`, and `__FB_ASM__`
+  branches that select one. Machine code in the source is not something a bytecode VM can host.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance
