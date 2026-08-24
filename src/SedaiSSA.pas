@@ -229,6 +229,10 @@ type
                                             //        their final register value is written back to the slot at each return
     FCurrentProcAddrParams: TStringList;    // BYREF-return funcs: BYREF params carried as addresses (auto-deref);
                                             //   ValueFromIndex = pointee type name. Lets "RETURN param" return a reference.
+    FCurrentProcPtrLocals: TStringList;     // "DIM x AS T PTR" INSIDE this proc: VARNAME -> pointee type.
+                                            //   Separate from FCurrentProcPtrParams on purpose: that list also means
+                                            //   "a T Ptr Ptr here is raw by construction", which is true of a PARAMETER
+                                            //   and false of a local DIM (CollectRawPtrVars rules on those).
     FCurrentProcPtrParams: TStringList;     // "param AS T PTR" of THIS proc: VARNAME -> pointee type ("INTEGER","DOUBLE"...).
                                             //   Per-proc (not global FPointerVars) so same-named ptr params of different
                                             //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
@@ -507,7 +511,7 @@ type
     procedure CheckTypeNameShadowedByVar(Node: TASTNode);
     procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
     procedure MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList); // mark their call args address-taken
-    procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
+    procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     procedure CollectScalarPtrBanks(Node: TASTNode);                            // record, per @-taken scalar, the banks of pointers taking its @ (drives RAWMODULE vs SHARED)
     function ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;  // a DIFFERENT-bank pointer takes @scalar
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
@@ -711,6 +715,7 @@ type
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
     function ModuleTypeHiddenHere(const NameU: string): Boolean;   // a module DIM's TYPE, invisible in this proc?
+    procedure CollectProcPtrLocals(Proc: TASTNode);   // this proc's own "DIM x AS T PTR" locals
     procedure CollectProcDeclaredNames(Node: TASTNode);            // names this proc declares of its own
     function CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;  // is VarName a param of the current proc? UDTType = its UDT ('' if not a UDT)
     function CurrentProcLocalRecType(const VarName: string): string;  // UDT type of a DIM'd local UDT of the current proc (shadows the global map), else ''
@@ -1127,6 +1132,7 @@ begin
   FCurrentProcByvalRecs := TStringList.Create;
   FCurrentProcByrefScalars := TStringList.Create;
   FCurrentProcAddrParams := TStringList.Create;
+  FCurrentProcPtrLocals := TStringList.Create;
   FCurrentProcPtrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
   FFuncPtrTypes := TStringList.Create;
@@ -1237,6 +1243,7 @@ begin
   FCurrentProcByvalRecs.Free;
   FCurrentProcByrefScalars.Free;
   FCurrentProcAddrParams.Free;
+  FCurrentProcPtrLocals.Free;
   FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
@@ -25443,7 +25450,7 @@ begin
   EmitInstruction(ssaArrayStore, V, ArrayRef, Idx0, MakeSSAValue(svkNone));
 end;
 
-procedure TSSAGenerator.CollectDimVarBanks(Node: TASTNode; Dict: TStringList);
+procedure TSSAGenerator.CollectDimVarBanks(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
 // Pass 1: gather every @-taken NAME (antProcAddress operand) into Dict, and record pointee types of
 // pointer-typed DIMs ("type PTR") in FPointerVars (for typing "*p").
 var
@@ -25537,13 +25544,25 @@ begin
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
         TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
-        if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') and
-           (FPointerVars.IndexOfName(VNameU) < 0) then
-          FPointerVars.Add(VNameU + '=' + Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4)));
+        if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
+        begin
+          // ⭐ A MODULE-LEVEL DECLARATION WINS. This map is keyed by NAME with no scope, so when two
+          // declarations share a name only one can be in it - and until now the winner was whichever
+          // the walk MET FIRST, which is source order, not meaning. A local "Dim As Any Ptr p" inside
+          // a function therefore took the name from the module's own "Dim As Object Ptr p" declared
+          // below it, and "Delete p" at module level answered 'DELETE expects a UDT pointer, "P" is
+          // not one' (proguide's four RTTI examples, none of which is about RTTI).
+          // The module declaration is the one this map should describe: it is visible everywhere,
+          // while a proc-local shadow is what FCurrentProcPtrLocals exists for.
+          if not InProc then
+            FPointerVars.Values[VNameU] := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4))
+          else if FPointerVars.IndexOfName(VNameU) < 0 then
+            FPointerVars.Add(VNameU + '=' + Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4)));
+        end;
       end;
     end;
   for i := 0 to Node.ChildCount - 1 do
-    CollectDimVarBanks(Node.GetChild(i), Dict);
+    CollectDimVarBanks(Node.GetChild(i), Dict, InProc or (Node.GetChild(i).NodeType = antProcedureDecl));
 end;
 
 procedure TSSAGenerator.CollectScalarPtrBanks(Node: TASTNode);
@@ -25721,7 +25740,9 @@ begin
     ProcDict := TStringList.Create;
     try
       ProcDict.CaseSensitive := False;
-      CollectDimVarBanks(Node, ProcDict);       // the @-taken names of this procedure's own subtree
+      // InProc: everything under here IS a procedure body, so its pointer DIMs must not overwrite a
+      // module declaration of the same name in the global map (see the ⭐ note at the registration).
+      CollectDimVarBanks(Node, ProcDict, True);  // the @-taken names of this procedure's own subtree
       for k := 0 to Node.ChildCount - 1 do
         if Node.GetChild(k).NodeType = antParameterList then
           for i := 0 to Node.GetChild(k).ChildCount - 1 do
@@ -25882,6 +25903,53 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.CollectProcPtrLocals(Proc: TASTNode);
+// Every "DIM x AS T PTR" declared INSIDE this procedure, recorded per-proc.
+//
+// ⛔ THE GLOBAL MAP CANNOT HOLD BOTH. FPointerVars is keyed by NAME with no scope, and it is
+// FIRST-WINS over a walk in source order - so a local "Dim As Any Ptr p" inside a function, met before
+// the module's own "Dim As Object Ptr p", took the name and the module pointer stopped being a UDT
+// pointer anywhere: "Delete p" at module level then failed with 'DELETE expects a UDT pointer, "P" is
+// not one'. That is what stopped the four RTTI examples of proguide/, and it had nothing to do with
+// RTTI. Parameters already had this treatment, and for the same stated reason.
+//
+// Kept OUT of FCurrentProcPtrParams: that list carries a second meaning - "a T Ptr Ptr here is raw by
+// construction" - which holds for a parameter and not for a local DIM, where CollectRawPtrVars can see
+// where the value came from and rules on it.
+var
+  i: Integer;
+
+  procedure Walk(N: TASTNode);
+  var
+    j, k: Integer;
+    Decl: TASTNode;
+    VNameU, TypeNameU: string;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antDim then
+      for k := 0 to N.ChildCount - 1 do
+      begin
+        Decl := N.GetChild(k);
+        if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+           (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
+        begin
+          VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+          if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
+            FCurrentProcPtrLocals.Values[VNameU] := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4));
+        end;
+      end;
+    for j := 0 to N.ChildCount - 1 do
+      // A nested procedure declares in a scope of its own; it gets its own pass.
+      if N.GetChild(j).NodeType <> antProcedureDecl then Walk(N.GetChild(j));
+  end;
+
+begin
+  if (Proc = nil) or (FCurrentProcPtrLocals = nil) then Exit;
+  for i := 0 to Proc.ChildCount - 1 do
+    if Proc.GetChild(i).NodeType <> antProcedureDecl then Walk(Proc.GetChild(i));
+end;
+
 function TSSAGenerator.ManagedPtrPointee(const Name: string): string;
 // The pointee type name of a managed pointer: a "param AS T PTR" of the proc being lowered (per-proc,
 // checked first so it wins over a same-named global) or a DIM'd/global "T PTR" (FPointerVars). '' if
@@ -25894,6 +25962,13 @@ begin
   begin
     idx := FCurrentProcPtrParams.IndexOfName(UpperCase(Name));
     if idx >= 0 then Exit(FCurrentProcPtrParams.ValueFromIndex[idx]);
+  end;
+  // ...then this proc's own pointer DIMs, for the same reason the parameters come before the globals:
+  // a local shadows a module variable of the same name, and the global map cannot hold both.
+  if FCurrentProcPtrLocals <> nil then
+  begin
+    idx := FCurrentProcPtrLocals.IndexOfName(UpperCase(Name));
+    if idx >= 0 then Exit(FCurrentProcPtrLocals.ValueFromIndex[idx]);
   end;
   idx := FPointerVars.IndexOfName(UpperCase(Name));
   if idx >= 0 then Result := FPointerVars.ValueFromIndex[idx];
@@ -30108,6 +30183,8 @@ begin
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
     FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
     FCurrentProcPtrParams.Clear;                          // "param AS T PTR" of this proc (filled in prologue)
+    FCurrentProcPtrLocals.Clear;
+    CollectProcPtrLocals(Proc);                           // "DIM x AS T PTR" in THIS body (see the method)
     FFuncPtrSigs.Clear;                                   // function-pointer params/locals of THIS proc (filled in prologue / ProcessDim)
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)

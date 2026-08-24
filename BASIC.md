@@ -3114,3 +3114,9 @@ Each of these is *refused with a message that names the reason*, never answered 
   byte count would cover a different number of elements. Loop over the elements instead.
 - **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
   byte image — the elements are managed values.
+- **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
+  examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
+  base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance
+  is a managed record, its runtime type is an id, and a virtual call goes through a generated
+  dispatcher rather than a vtable slot. `Object`, `Extends`, `Is`, virtual and abstract members are
+  all supported — only the memory *layout* behind them is not a thing a program can walk here.
