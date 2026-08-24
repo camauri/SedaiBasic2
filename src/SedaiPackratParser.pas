@@ -3790,7 +3790,7 @@ end;
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum: TASTNode;
+  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum, NestedRec: TASTNode;
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
@@ -3980,11 +3980,22 @@ begin
       // silently made "U" a FIELD and the program then computed wrong values rather than failing:
       // udt/union4 printed 1 1 1 where FreeBASIC prints 1 2 513. A wrong answer in silence is worse
       // than a refusal, so it is refused until nested types are real.
+      // ⭐ A NAMED nested block DECLARES A TYPE OF ITS OWN ("Union U ... End Union", then "m As U"),
+      // and it is parsed as exactly that: ParseRecordDecl consumes the keyword itself, so it can be
+      // called right here and hands back a complete antTypeDecl. It is hung on the enclosing type the
+      // way a nested ENUM already is - the SSA registers it as a type and NOT as a field of the parent.
+      // ⛔ Until this existed the name was refused, because accepting it and FLATTENING the members
+      // silently computed wrong values: udt/union4 printed 1 1 1 where FreeBASIC prints 1 2 513.
       if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) then
       begin
-        HandleError('a NAMED nested UNION is not supported yet: give the block no name, or ' +
-                    'declare the union as a type of its own outside this one', Context.CurrentToken);
-        Exit;
+        NestedRec := ParseRecordDecl(True);
+        if Assigned(NestedRec) then
+        begin
+          NestedRec.Attributes.Values['NESTEDTYPE'] := '1';
+          NestedRec.Attributes.Values['OUTERTYPE'] := UpperCase(VarToStr(Result.Value));
+          Result.AddChild(NestedRec);
+        end;
+        Continue;
       end;
       Inc(NestedUnionDepth);
       if NestedUnionDepth = 1 then begin Inc(UnionGrpSeq); UnionGrpCur := UnionGrpSeq; end;
@@ -4010,6 +4021,21 @@ begin
       Inc(NestedStructDepth);
       if NestedStructDepth = 1 then begin Inc(UnionGrpSeq); StructGrpCur := UnionGrpSeq; end;
       Context.Advance; Continue;
+    end;
+    // ...and the NAMED nested TYPE, the mirror of the named nested UNION above: "Type Child ... End
+    // Type" inside a Type declares Child, it does not add fields to the parent. (Only when a NAME
+    // follows - the anonymous form, handled just above, is a layout block.)
+    if Context.Check(ttTypeDecl) and (NestedStructDepth = 0) and (NestedUnionDepth = 0) and
+       Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) then
+    begin
+      NestedRec := ParseRecordDecl(False);
+      if Assigned(NestedRec) then
+      begin
+        NestedRec.Attributes.Values['NESTEDTYPE'] := '1';
+        NestedRec.Attributes.Values['OUTERTYPE'] := UpperCase(VarToStr(Result.Value));
+        Result.AddChild(NestedRec);
+      end;
+      Continue;
     end;
     if (NestedStructDepth > 0) and Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttTypeDecl) then

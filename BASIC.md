@@ -3110,6 +3110,14 @@ failed as fbc's would"* from *"we cannot do this"*. `--verbose` restores the ful
 ⚠️ `#line` currently reaches the **abort message** and `__LINE__`. `ERL`, `ERMN` and `Assert`'s
 `path(line):` prefix still report the physical position.
 
+### Nested types
+
+A **named** `Type` or `Union` declared inside a `Type` is a type of its own, not a set of fields:
+`Union U … End Union` inside `Type T` declares `U`, reachable as `U` and as `T.U`. A method is defined
+qualified — `Sub T.U.proc` — and `This` inside it is the *nested* type. A nested type reaches its
+enclosing type's **private** members, as it does in FreeBASIC and in C++. The **anonymous** form is
+what it has always been: a layout block whose members are sequential inside the surrounding union.
+
 ### Declared divergence: integer division by zero
 
 `x \ 0` and `x Mod 0` raise a **catchable runtime error** here. `fbc` emits the bare machine
@@ -3121,10 +3129,6 @@ the divergence is deliberate and is not going to be reproduced.
 
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
 
-- **A NAMED nested type or union**: `Union U ... End Union` inside a `Type`, then `m As U`. That
-  declares a type of its own, while this model flattens the members into the type that holds them.
-  Refused: leave the block unnamed, or declare the type outside. The ANONYMOUS form *is* supported and
-  its members are laid out in sequence, as in FreeBASIC.
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
