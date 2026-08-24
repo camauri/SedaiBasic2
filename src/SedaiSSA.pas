@@ -27292,6 +27292,25 @@ begin
       Result := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
       Exit;
     end;
+    // "@f(args)" where f RETURNS BYREF: the call already hands back the address of the variable it
+    // referred to, so there is no @ left to take - the answer IS the returned value.
+    // This is how a reference variable is BOUND to a function's result:
+    //     Function fr() ByRef As ZString ... End Function
+    //     Dim ByRef As ZString rz = fr()
+    // The DIM lowers to "@fr()", which reached this point and failed with "Cannot take address of
+    // element of undeclared array: FR" - fr is a procedure, and nothing before this branch had asked
+    // whether it was one. Binding a reference to a plain VARIABLE always worked, which is what kept
+    // this shape out of sight.
+    if ByrefRetByAddress(ArrName) then
+    begin
+      if Node.ChildCount >= 2 then
+        EmitProcedureCall(ArrName, Node.GetChild(1))
+      else
+        EmitProcedureCall(ArrName, nil);
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);   // the address the function returned
+      Exit;
+    end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   end;
   // @g(i) where g is an array-of-UDT: FreeBASIC "@g(i)" is a "T Ptr" to element i, and in the managed model
