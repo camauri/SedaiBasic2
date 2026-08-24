@@ -3842,6 +3842,17 @@ begin
     // member did not change the other. Each block now gets an id that every field inside carries.
     if Context.Check(ttUnionDecl) then
     begin
+      // ⛔ A NAMED nested block declares a TYPE OF ITS OWN ("Union U ... End Union" then "m As U"),
+      // and this model flattens the members into the enclosing type instead. Accepting the name
+      // silently made "U" a FIELD and the program then computed wrong values rather than failing:
+      // udt/union4 printed 1 1 1 where FreeBASIC prints 1 2 513. A wrong answer in silence is worse
+      // than a refusal, so it is refused until nested types are real.
+      if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) then
+      begin
+        HandleError('a NAMED nested UNION is not supported yet: give the block no name, or ' +
+                    'declare the union as a type of its own outside this one', Context.CurrentToken);
+        Exit;
+      end;
       Inc(NestedUnionDepth);
       if NestedUnionDepth = 1 then begin Inc(UnionGrpSeq); UnionGrpCur := UnionGrpSeq; end;
       Context.Advance; Continue;
