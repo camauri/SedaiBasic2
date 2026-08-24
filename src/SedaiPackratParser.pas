@@ -2551,6 +2551,10 @@ begin
       MethodType := QualName;
       QualName := MethodType + '.' + Kind;
     end
+    // ⭐ A NESTED UDT OWNS METHODS TOO, and then the owner has a dotted name of its own:
+    // "Sub T.U.proc(...)" is the method proc of the Union U declared inside Type T. One dot was
+    // consumed and the next one had no object, so the whole declaration was a syntax error. The
+    // owner is everything before the LAST name, which is what a nested type is called.
     else if Context.Check(ttOpDot) then
     begin
       // Type.method — a method of an existing TYPE. The method name may be a reserved word
@@ -2563,6 +2567,16 @@ begin
         MethodType := QualName;
         QualName := MethodType + '.' + UpperCase(Context.CurrentToken.Value);
         Context.Advance;                          // method name
+        while Context.Check(ttOpDot) do
+        begin
+          Context.Advance;                        // '.' of a deeper qualification
+          if not (Context.Check(ttIdentifier) or
+                  ((Length(Context.CurrentToken.Value) > 0) and
+                   (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_']))) then Break;
+          MethodType := QualName;                 // the owner grows; the last name stays the method
+          QualName := MethodType + '.' + UpperCase(Context.CurrentToken.Value);
+          Context.Advance;
+        end;
       end;
     end;
     NameNode := TASTNode.CreateWithValue(antIdentifier, QualName, NameTok);
