@@ -8277,6 +8277,7 @@ end;
 
 function TPackratParser.ParseArrayDeclaration: TASTNode;
 var
+  ElemTypeName: string;
   VarName: TASTNode;
   Dimensions: TASTNode;
   Token, TypeTok: TLexerToken;
@@ -8396,8 +8397,19 @@ begin
     if Context.Check(ttIdentifier) then
     begin
       TypeTok := Context.CurrentToken;
-      Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                   ParseDottedName, TypeTok));        // dotted: namespace-qualified element type
+      ElemTypeName := ParseDottedName;                // dotted: namespace-qualified element type
+      // ⛔ THE POINTER SUFFIX. "Dim a(0 To 3) As ZString Ptr" is an array of POINTERS, and this was the
+      // one declaration shape with no "PTR" loop: the element type came out "ZSTRING", so the elements
+      // were allocated in the STRING bank and the address stored into one was lost - "*a(i)" then read
+      // a null. Worse, the leftover "Ptr" was parsed as a STATEMENT of its own (a bare call to a
+      // procedure named PTR), so nothing complained. Every other declaration form has had this loop for
+      // a long time; this one is where a table of C strings is declared.
+      while AtPointerSuffix do
+      begin
+        ElemTypeName := ElemTypeName + ' PTR';
+        Context.Advance;                              // consume PTR
+      end;
+      Result.AddChild(TASTNode.CreateWithValue(antIdentifier, ElemTypeName, TypeTok));
       // FreeBASIC fixed-length string array: "AS STRING * n" / "AS WSTRING * n" (advisory in v1).
       if Context.Check(ttOpMul) then
       begin

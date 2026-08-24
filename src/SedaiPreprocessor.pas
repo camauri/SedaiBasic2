@@ -886,6 +886,22 @@ begin
       j := i;
       while (j <= Length(Line)) and IsIdentChar(Line[j]) do Inc(j);
       Word := Copy(Line, i, j - i);
+      // A DOTTED key is tried before the bare one: "FB_DATACLASS.FB_DATACLASS_INTEGER" is one name, an
+      // ENUM MEMBER reached through its enum, and substituting only the half after the dot would leave
+      // "FB_DATACLASS.0". Nothing a program can #define carries a dot, so the only keys of this shape
+      // are the ones the EMULATED HEADERS register - which is exactly where the qualified spelling
+      // comes from. A member access is untouched: "x.field" is not a key.
+      if (j <= Length(Line)) and (Line[j] = '.') then
+      begin
+        k := j + 1;
+        while (k <= Length(Line)) and IsIdentChar(Line[k]) do Inc(k);
+        if (k > j + 1) and (Defs.IndexOfName(UpperCase(Copy(Line, i, k - i))) >= 0) then
+        begin
+          Result := Result + Trim(Defs.Values[UpperCase(Copy(Line, i, k - i))]);
+          i := k;
+          Continue;
+        end;
+      end;
       // A BUILT-IN function-like macro is tried first: it is the preprocessor's own, and a program may
       // not shadow it with a #define.
       if (j <= Length(Line)) and (Line[j] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
@@ -1194,6 +1210,12 @@ begin
   Result := '0';
   SymU := UpperCase(Trim(Sym));
   if SymU = '' then Exit;
+  // A QUALIFIED name - "T.l", "t1.l" - is a FIELD, and what is asked of it is the field's own class.
+  // The scan below matches a declaration by its NAME, and a field is declared inside its type under
+  // the bare one, so ask under that. (It cannot tell two types' fields of the same name apart; the
+  // scan is declaration-shaped, not a symbol table, and says so at the top of this routine.)
+  if Pos('.', SymU) > 0 then
+    while Pos('.', SymU) > 0 do SymU := Copy(SymU, Pos('.', SymU) + 1, MaxInt);
   SymClass := 0; DataClass := DC_UNKNOWN; DataType := DT_VOID; FoundType := '';
 
   // A #define is a symbol too, and it is the one kind we hold outright rather than infer.
@@ -1309,6 +1331,17 @@ end;
 
 const
   cPPStrTok = #2;   // leading byte marking a tokenized STRING LITERAL; no source character can be this
+
+function DottedTail(const S: string; P: Integer): string;
+// The identifier that follows the '.' at P, or ''. Used to try a DOTTED macro key before the bare one.
+var q: Integer;
+begin
+  Result := '';
+  if (P > Length(S)) or (S[P] <> '.') then Exit;
+  q := P + 1;
+  while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
+  if q > P + 1 then Result := UpperCase(Copy(S, P + 1, q - P - 1));
+end;
 
 function NextNonBlankIsOpenParen(const S: string; P: Integer): Boolean;
 // Is the next non-blank character at or after P an opening parenthesis? Tells a function-like macro
@@ -1461,6 +1494,16 @@ var
           nm := id + GatherBalancedParens(S, q);   // q lands past the closing ')'
           p := q;
           if Depth < 32 then Tokenize(SubstituteMacros(nm, Defs, FnDefs, 0), Depth + 1)
+          else Toks.Add('0');
+        end
+        // A DOTTED key ("FB_DATACLASS.FB_DATACLASS_UDT") is one name here too - the same rule the
+        // line substituter follows, and a condition must not answer differently from the code below it.
+        else if (p <= Length(S)) and (S[p] = '.') and
+                (Defs.IndexOfName(id + '.' + DottedTail(S, p)) >= 0) then
+        begin
+          nm := id + '.' + DottedTail(S, p);
+          p := p + 1 + Length(DottedTail(S, p));
+          if Depth < 32 then Tokenize(Trim(Defs.Values[nm]), Depth + 1)
           else Toks.Add('0');
         end
         else if Defs.IndexOfName(id) >= 0 then
@@ -1698,6 +1741,32 @@ begin
     Defs.Values['FB_DATACLASS_STRING']    := '2';
     Defs.Values['FB_DATACLASS_UDT']       := '3';
     Defs.Values['FB_DATACLASS_PROC']      := '4';
+    // ...and the ENUM-QUALIFIED spelling, which is what the header really declares and what the
+    // manual's own fbquerysymbol2 writes: "FB_DATACLASS.FB_DATACLASS_INTEGER". In the real header these
+    // are members of "Enum FB_DATACLASS" inside "Namespace FBC"; emulated as macros they need the
+    // qualified name as a key of its own, or the substitution would leave "FB_DATACLASS.0".
+    Defs.Values['FB_DATACLASS.FB_DATACLASS_INTEGER'] := '0';
+    Defs.Values['FB_DATACLASS.FB_DATACLASS_FPOINT']  := '1';
+    Defs.Values['FB_DATACLASS.FB_DATACLASS_FLOAT']   := '1';
+    Defs.Values['FB_DATACLASS.FB_DATACLASS_STRING']  := '2';
+    Defs.Values['FB_DATACLASS.FB_DATACLASS_UDT']     := '3';
+    Defs.Values['FB_DATACLASS.FB_DATACLASS_PROC']    := '4';
+    Defs.Values['FB_SYMBCLASS.FB_SYMBCLASS_VAR']       := '1';
+    Defs.Values['FB_SYMBCLASS.FB_SYMBCLASS_CONST']     := '2';
+    Defs.Values['FB_SYMBCLASS.FB_SYMBCLASS_PROC']      := '3';
+    Defs.Values['FB_SYMBCLASS.FB_SYMBCLASS_NAMESPACE'] := '8';
+    Defs.Values['FB_SYMBCLASS.FB_SYMBCLASS_ENUM']      := '9';
+    Defs.Values['FB_SYMBCLASS.FB_SYMBCLASS_STRUCT']    := '10';
+    // The SELECTOR enum, which is what a program actually writes: "__FB_QUERY_SYMBOL__(
+    // FB_QUERY_SYMBOL.dataclass, sym )". Unregistered it folded to 0, so every query asked for
+    // symbclass whatever the source said - the manual's fbquerysymbol2 printed "integer" for a Double,
+    // a String and a UDT alike. Values are the header's own (symbclass 0, datatype 1, dataclass 2).
+    Defs.Values['FB_QUERY_SYMBOL.SYMBCLASS']  := '0';
+    Defs.Values['FB_QUERY_SYMBOL.DATATYPE']   := '1';
+    Defs.Values['FB_QUERY_SYMBOL.DATACLASS']  := '2';
+    Defs.Values['FB_QUERY_SYMBOL.TYPENAME']   := '3';
+    Defs.Values['FB_QUERY_SYMBOL.TYPENAMEID'] := '4';
+    Defs.Values['FB_QUERY_SYMBOL.EXISTS']     := '6';
   end;
   if Base = 'dir.bi' then
   begin

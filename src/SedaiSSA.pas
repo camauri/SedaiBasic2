@@ -345,6 +345,9 @@ type
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
+    FArrayScalarPointee: TStringList;    // array of NON-UDT pointers ("DIM a(..) As ZString Ptr") -> the pointee type name.
+                                         //   Kept apart from FArrayPtrPointee, whose readers all assume a UDT (a record HANDLE);
+                                         //   this one only says what "*a(i)" dereferences TO.
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
     FDeclaredNames: TStringList;         // names introduced by an EXPLICIT declaration (DIM/VAR/STATIC/CONST,
                                          //   procedure parameters). Distinct from FVarMap, which also holds
@@ -1146,6 +1149,8 @@ begin
   FArrayRecordType.CaseSensitive := False;
   FArrayFuncPtrSig := TStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
+  FArrayScalarPointee := TStringList.Create;
+  FArrayScalarPointee.CaseSensitive := False;
   FArrayPtrPointee := TStringList.Create;
   FArrayPtrPointee.CaseSensitive := False;
   FNeededDispatchers := TStringList.Create;
@@ -1262,6 +1267,7 @@ begin
   FArrayRecordType.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
+  FArrayScalarPointee.Free;
   FArrayPtrPointee.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
@@ -2197,10 +2203,28 @@ begin
       // is its CHARACTERS, read at the address up to the terminator. Any other reading of it - a scalar
       // load of eight bytes, say - takes the address itself for data. This is how a string reaches a
       // procedure declared "ByVal r As ZString Ptr".
-      if (DerefTarget.NodeType = antIdentifier) then
+      // ...and the same pointee reached through an ARRAY ELEMENT: "Dim As ZString Ptr names(0 To 2)"
+      // then "*names(i)". The rule below recognises a pointer NAME, and an array of pointers has one
+      // pointee for the whole array - recorded per-array when it was declared - so the question is the
+      // same one asked of the element. Without this the deref fell to the generic scalar load, which
+      // read the ADDRESS itself as data and faulted. It is the shape a table of C strings has, and the
+      // manual's defines/fbquerysymbol2 is built on one.
+      if (DerefTarget.NodeType = antIdentifier) or
+         ((DerefTarget.NodeType = antArrayAccess) and (DerefTarget.ChildCount >= 1) and
+          (DerefTarget.GetChild(0).NodeType = antIdentifier) and
+          (ArrayIndexOf(VarToStr(DerefTarget.GetChild(0).Value)) >= 0)) then
       begin
-        TempStr := UpperCase(FPointerVars.Values[UpperCase(VarToStr(DerefTarget.Value))]);
-        if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
+        if DerefTarget.NodeType = antIdentifier then
+        begin
+          TempStr := UpperCase(FPointerVars.Values[UpperCase(VarToStr(DerefTarget.Value))]);
+          if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
+        end
+        else
+        begin
+          TempStr := UpperCase(FArrayScalarPointee.Values[UpperCase(VarToStr(DerefTarget.GetChild(0).Value))]);
+          if TempStr = '' then
+            TempStr := UpperCase(ArrayPointerUDTType(VarToStr(DerefTarget.GetChild(0).Value)));
+        end;
         if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
         begin
           ProcessExpression(DerefTarget, Left);
@@ -9610,6 +9634,14 @@ begin
     // Record the pointee so "a(i)->field" resolves to record access on the loaded element.
     if (RecArrUDTIdx < 0) and (PointeeOfPtrTypeName(ArrElemTypeName) <> '') then
       FArrayPtrPointee.Values[UpperCase(ArrName)] := PointeeOfPtrTypeName(ArrElemTypeName);
+    // ...and the SCALAR pointee, which the map above declines by design (its readers all expect a UDT
+    // record handle). "Dim names(0 To 2) As ZString Ptr" is a table of C strings, and "*names(i)" has
+    // to know it dereferences to CHARACTERS and not to eight bytes read as a number.
+    if (RecArrUDTIdx < 0) and (Length(ArrElemTypeName) >= 5) and
+       (Copy(ArrElemTypeName, Length(ArrElemTypeName) - 3, 4) = ' PTR') and
+       (PointeeOfPtrTypeName(ArrElemTypeName) = '') then
+      FArrayScalarPointee.Values[UpperCase(ArrName)] :=
+        Trim(Copy(ArrElemTypeName, 1, Length(ArrElemTypeName) - 4));
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
@@ -18290,8 +18322,16 @@ begin
   // line-delete form attaches line-number LITERALS, never an address, so this is unambiguous too -
   // and without it the statement fell into the line-delete path below and did nothing at all, so the
   // object was destroyed only at program end.
+  // ...and "Delete a(i)", an element of an array of UDT pointers. The classic line-delete form attaches
+  // line-number LITERALS, so an antArrayAccess on a DECLARED array is unambiguous too - and without this
+  // the statement fell into the line-delete path below and emitted a CLASSIC opcode the VM has no arm
+  // for. ⚠️ Invisible with the optimizer ON, which dropped the dead statement: only --no-opt failed, so
+  // the corpus caught it as an OPTDIFF rather than as an error.
   if (Node.ChildCount >= 1) and
-     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress)) then
+     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress) or
+      ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+       (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+       (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) >= 0))) then
   begin
     EmitDeleteObject(Node);
     Exit;
@@ -27892,6 +27932,23 @@ begin
     HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
     EmitDestructorCall(HandleReg, PtrType);
     EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  // "Delete a(i)": the element holds the record handle, so destroy and free THAT.
+  if (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    PtrType := ArrayPointerUDTType(VarToStr(Node.GetChild(0).GetChild(0).Value));
+    ProcessExpression(Node.GetChild(0), HandleReg);
+    HandleReg := EnsureIntRegister(HandleReg);
+    if PtrType <> '' then
+    begin
+      EmitDestructorCall(HandleReg, PtrType);
+      EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      // not a UDT pointer: a raw block, freed as "Delete[] p" frees one
+      EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
   if Node.GetChild(0).NodeType <> antIdentifier then
