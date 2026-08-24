@@ -107,6 +107,10 @@ type
     IsZString: Boolean;     // ZSTRING field: like a WSTRING it keeps VARIABLE-length semantics (no padding
                             // to StrCapacity, LEN is the content length) and occupies n bytes in the C
                             // layout -- not n+1: for a ZSTRING the terminator is inside the declared n
+    IsBoolean: Boolean;     // BOOLEAN field. It has no WIDTH CODE - a Boolean is not a narrowed integer,
+                            // it is its own type - so the declared type had to be remembered outright:
+                            // without it "Print obj.flag" answered -1 where fbc prints "true", and
+                            // Len/SizeOf of the field answered 8 where fbc answers 1.
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
     ArrayElemType: string;  // element UDT type name if the array member is an array-of-UDT ("verts(100) As Vertex"),
@@ -636,7 +640,8 @@ type
     function UDTArrayElemType(UDTIdx: Integer; const FieldName: string): string;  // element UDT type of an array-of-UDT member (else '')
     function UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT when an array member's elements are UDT POINTERS (else '')
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
-    function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // B1.5: field narrow width
+    function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
+    function UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;  // B1.5: field narrow width
     function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
     function TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean; out Size: Int64): Boolean;
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
@@ -20641,6 +20646,12 @@ begin
   begin
     Size := 8; Align := 8; Exit;
   end;
+  // ⭐ A BOOLEAN IS ONE BYTE, and it carries no width code - it is not a narrowed integer, it is its
+  // own type - so it fell to the 8-byte default here. That default is what "SizeOf(rec.flag)" and
+  // "Len(rec.flag)" answered, and it is also what the type's C LAYOUT was built from, so a type
+  // holding a Boolean was the wrong size and every field after it sat at the wrong offset.
+  // (fbc: SizeOf(Boolean) = 1, and a Boolean member is byte-aligned like a Byte.)
+  if F.IsBoolean then begin Size := 1; Align := 1; Exit; end;
   Size := BinaryElemBytesOfWidthCode(F.WidthCode);
   Align := Size;
 end;
@@ -20957,6 +20968,13 @@ begin
   Result := -1;
   if not FModernMode then Exit;
   Nm := UpperCase(Name);
+  // ⭐ TRUE and FALSE are BOOLEAN, and a BOOLEAN is one byte. They are keyword CONSTANTS, not
+  // literals, so they arrive here as bare identifiers that name no declared variable - and the size
+  // question then fell off the ladder: "Len(False)" took the string path and answered 0, while
+  // "SizeOf(True)" reached the unknown-type default and answered 8. "Len(Boolean)" was right all
+  // along, which is what said the gap was in the VALUE and not in the type. (fbc: all four are 1.)
+  if (Nm = kTRUE) or (Nm = kFALSE) then
+    if not IsDeclaredVariable(Nm) then Exit(1);
   // ⛔ AN @-TAKEN MODULE SCALAR IS STILL ITS DECLARED TYPE. Taking the address of a module-level
   // builtin scalar whose pointer is in the SAME bank turns it into a 1-element SHARED ARRAY (the
   // raw-byte backing is only for genuine cross-bank type-punning), and that rewrite is what LOSES
@@ -21501,6 +21519,13 @@ begin
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
+        // ⭐ CBOOL PRODUCES A BOOLEAN, so it prints "true"/"false" - the conversion IS the type.
+        // A declared Boolean variable printed right all along; the value CBool answers printed -1/0,
+        // because only a NAME in the print-kind table was ever consulted and a conversion has none.
+        // (fbc prints "true false" for "Print CBool(1), CBool(0)".)
+        if FModernMode and (UpperCase(VarToStr(Node.GetChild(0).Value)) = 'CBOOL') and
+           (ArrayIndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0) then
+          Exit(1);
         Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
         // An element of an array declared AS a NARROW UNSIGNED type (UByte/UShort/ULong) prints unsigned
         // too -- without the leading sign space, like the scalar form. Array names are never in
@@ -21547,6 +21572,10 @@ begin
       // an UBYTE field must keep that column (see the m75 guard).
       if FModernMode and (Node.ChildCount >= 1) then
       begin
+        // ...and a BOOLEAN field prints "true"/"false", like the scalar and the function-return forms.
+        // A Boolean has no width code - it is not a narrowed integer - so it is asked by name.
+        if UDTFieldIsBoolean(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) then
+          Exit(1);
         AwCode := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
         // A UInteger/ULongInt FIELD is unsigned-SIXTY-FOUR, so kind 2 and not 3: it must reach the
@@ -22225,6 +22254,20 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
 end;
 
+function TSSAGenerator.UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;
+// Was this field declared AS BOOLEAN? It decides how the field PRINTS ("true"/"false") and what
+// LEN/SIZEOF of it answer (1). A Boolean carries no width code, so there is nothing else to ask.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsBoolean);
+end;
+
 function TSSAGenerator.UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
 // Declared capacity of an "As String/WString * n" field (0 = variable-length / not found). Its storage
 // is padded to that capacity, exactly as a fixed-length scalar's is.
@@ -22615,6 +22658,7 @@ begin
         FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       FUDTs[Idx].Fields[n].IsZString := (TypeName = 'ZSTRING');  // variable-length, n bytes in C
+      FUDTs[Idx].Fields[n].IsBoolean := (CanonicalType(TypeName) = 'BOOLEAN');
       // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
