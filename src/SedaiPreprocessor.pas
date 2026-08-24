@@ -37,6 +37,28 @@ type
 var
   GTargetIsWasm: Boolean = False;
 
+type
+  { One "#line <n> ["file"]" directive: from the PHYSICAL source line it stands on, positions are
+    reported as if that line were ReportedLine of ModuleName. FreeBASIC's own use for it is a code
+    GENERATOR: the emitted file carries the positions of the file it was generated FROM, so a
+    diagnostic points at what the author wrote. It affects REPORTING only - never what the program
+    computes - which is why ignoring it, as this preprocessor used to, was silent rather than loud. }
+  TPPLineDirective = record
+    FromPhysical: Integer;    // the physical line the directive itself occupies (1-based)
+    ReportedLine: Integer;    // ...which is reported as this
+    ModuleName: string;       // '' = keep the module name it had
+  end;
+
+var
+  { Filled by PreprocessSource, in physical-line order; empty for a source with no #line. Read by
+    whoever reports a POSITION (the uncaught-error abort message). A global for the same reason
+    GUniqueIdStacks is one: the preprocessor hands back text, and this is about that text. }
+  GPPLineDirectives: array of TPPLineDirective;
+
+{ The line number to REPORT for a physical source line, and the module to report it in. Answers the
+  physical line and the unchanged module when no #line covers it. }
+procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string);
+
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 function DetectQBLang(const Src: string): Boolean;
 
@@ -1787,6 +1809,28 @@ begin
   {$ENDIF}
 end;
 
+function PPFirstBreak(const S: string): Integer;
+// How many characters of S run up to the first blank: the "<n>" of "#line <n> \"file\"".
+begin
+  Result := 0;
+  while (Result < Length(S)) and not (S[Result + 1] in [' ', #9]) do Inc(Result);
+end;
+
+procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string);
+// The LAST #line at or before this physical line wins, and the count runs on from there: a directive
+// standing on physical line P and saying N makes P report as N, P+1 as N+1, and so on.
+var
+  i, k: Integer;
+begin
+  Reported := Physical;
+  k := -1;
+  for i := 0 to High(GPPLineDirectives) do
+    if GPPLineDirectives[i].FromPhysical <= Physical then k := i else Break;
+  if k < 0 then Exit;
+  Reported := GPPLineDirectives[k].ReportedLine + (Physical - GPPLineDirectives[k].FromPhysical);
+  if GPPLineDirectives[k].ModuleName <> '' then Module := GPPLineDirectives[k].ModuleName;
+end;
+
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 var
   Defs: TStringList;     // Names = UPPER object-like macro names, Values = macro bodies
@@ -1922,10 +1966,13 @@ var
     Lines: TStringList;
     li, p, q: Integer;
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
-    Params, MacroBody, BodyTrim, EName, ERest: string;
+    Params, MacroBody, BodyTrim, EName, ERest, LineFile: string;
+    LineNum: Integer;
     IsFn: Boolean;
     OptParen: Boolean;   // "#macro name ? (params)": the parentheses are optional at the call site
     ParentEmit, Cond: Boolean;
+    MappedLine: Integer;
+    MappedModule: string;
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
     SavedStackTop: Integer;
@@ -1941,7 +1988,9 @@ var
         Trimmed := TrimLeft(Raw);
         // __LINE__ expands to the current source line number (1-based). Updated every line so it is
         // correct wherever it appears; __FILE__ is set once (top-level file) in the begin block below.
-        Defs.Values['__LINE__'] := IntToStr(li + 1);
+        // __LINE__ is the same question a diagnostic asks, so it follows #line too.
+        PPMapLine(li + 1, MappedLine, MappedModule);
+        Defs.Values['__LINE__'] := IntToStr(MappedLine);
         // QuickBASIC-style metacommand '$INCLUDE: 'file' (a leading apostrophe makes it a comment to
         // the lexer; intercept it here and splice the file, like #include).
         if (Length(Trimmed) >= 9) and (UpperCase(Copy(Trimmed, 1, 9)) = '''$INCLUDE') and Emitting then
@@ -2062,6 +2111,31 @@ var
             begin
               SetLength(Active, Length(Active) - 1);
               SetLength(Taken, Length(Taken) - 1);
+            end;
+          end
+          else if (DName = 'line') and Emitting then
+          begin
+            // "#line <n> ["file"]": from here on, report positions as if this line were <n> of
+            // <file>. It changes NOTHING the program computes - only what a diagnostic says - which
+            // is why ignoring it was silent: prepro/line aborted with our own line and our own file
+            // name and looked like an ordinary answer.
+            // ⚠️ Recorded here and consulted where a position is REPORTED. __LINE__ follows it too,
+            // being the same question asked from inside the program.
+            LineNum := StrToIntDef(Trim(Copy(Trim(DRest), 1, PPFirstBreak(Trim(DRest)))), -1);
+            LineFile := '';
+            p := Pos('"', DRest);
+            if p > 0 then
+            begin
+              LineFile := Copy(DRest, p + 1, MaxInt);
+              q := Pos('"', LineFile);
+              if q > 0 then LineFile := Copy(LineFile, 1, q - 1) else LineFile := '';
+            end;
+            if LineNum >= 0 then
+            begin
+              SetLength(GPPLineDirectives, Length(GPPLineDirectives) + 1);
+              GPPLineDirectives[High(GPPLineDirectives)].FromPhysical := li + 1;
+              GPPLineDirectives[High(GPPLineDirectives)].ReportedLine := LineNum;
+              GPPLineDirectives[High(GPPLineDirectives)].ModuleName := LineFile;
             end;
           end
           else if (DName = 'define') and Emitting then
@@ -2298,6 +2372,7 @@ begin
   GUniqueIdStacks.Clear;
   GUniqueIdSerial := 0;
 
+  SetLength(GPPLineDirectives, 0);   // per COMPILATION, like the unique-id stacks above
   IncOnce := TStringList.Create;
   FReprocessDepth := 0;
   FnDefs := TStringList.Create;

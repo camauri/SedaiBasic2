@@ -3091,6 +3091,25 @@ End Function
 |---|---|---|
 | `EVENT` | ✗ | Data type for ScreenEvent function. |
 
+### Runtime errors in MODERN: fbc's own abort message
+
+An **uncaught** FreeBASIC runtime error aborts the way `fbc`'s runtime aborts, word for word — a blank
+line, `Aborting due to runtime error N [(text)] at line L of <module>()`, a blank line — and the error
+number is the process **exit code**. The parenthesised text exists for codes 1–17 only; above that
+`fbc` names nothing and prints the number alone. The module is the source path exactly as it was
+passed on the command line, which is the same value `ERMN` reports, and `#line n "file"` renames it.
+
+⛔ **Only an error that carries a FreeBASIC number.** A Pascal exception leaking out of the VM (a
+raw-pointer range error, an access violation) is *ours*: `fbc` has no such error, and dressing it in
+`fbc`'s sentence would claim a fidelity we do not have. Those keep this project's own voice
+(`ERROR during VM execution (BASIC LINE n): …`), which is also what lets a net tell *"the program
+failed as fbc's would"* from *"we cannot do this"*. `--verbose` restores the full dump either way.
+
+**CLASSIC is untouched**: its errors follow the Commodore table, and the two tables stay separate.
+
+⚠️ `#line` currently reaches the **abort message** and `__LINE__`. `ERL`, `ERMN` and `Assert`'s
+`path(line):` prefix still report the physical position.
+
 ### Declared unsupported (24 August 2026)
 
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
