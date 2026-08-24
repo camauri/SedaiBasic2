@@ -931,7 +931,11 @@ type
     function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64): Boolean;
     function UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
     function TryEmitRawUDTMemberArray(MemberNode: TASTNode; Emit: Boolean; out ArrId: Integer): Boolean;
+    function EmitRawUDTFieldAddr(BaseNode, IdxNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
+    function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
+      out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode: TASTNode): Boolean;
     function TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string; out Value: TSSAValue): Boolean;
+    function TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string; ExprNode: TASTNode): Boolean;
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
     function TryEmitCvaMacro(const NameU: string; ArgsNode: TASTNode;
                              Tok: TLexerToken; out Value: TSSAValue): Boolean;  // CVA_START/ARG/COPY/END
@@ -18990,6 +18994,81 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitRawUDTFieldAddr(BaseNode, IdxNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
+// The byte address of "base[idx].field" (idx absent for the plain "base->field"): base + idx*ElemSize +
+// FieldOfs, all in one place so the load and the store halves cannot drift apart on it.
+// ⚠️ ssaAddInt / ssaMulInt take REGISTERS: a constant operand lowers to register 0, which silently
+// contributes whatever happens to live there instead of the offset.
+var
+  BaseVal, IdxVal, SizeVal, ProdVal, OffVal, Sum: TSSAValue;
+begin
+  ProcessExpression(BaseNode, BaseVal);
+  Result := EnsureIntRegister(BaseVal);
+  if IdxNode <> nil then
+  begin
+    ProcessExpression(IdxNode, IdxVal);
+    SizeVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, SizeVal, MakeSSAConstInt(ElemSize),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ProdVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, ProdVal, EnsureIntRegister(IdxVal), SizeVal, MakeSSAValue(svkNone));
+    Sum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Sum, Result, ProdVal, MakeSSAValue(svkNone));
+    Result := Sum;
+  end;
+  if FieldOfs <> 0 then
+  begin
+    OffVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, OffVal, MakeSSAConstInt(FieldOfs),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Sum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Sum, Result, OffVal, MakeSSAValue(svkNone));
+    Result := Sum;
+  end;
+end;
+
+function TSSAGenerator.ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
+  out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode: TASTNode): Boolean;
+// The object half of "h->field" / "h[i].field" where h is a "T PTR" holding a RAW ADDRESS: answer the
+// pointee type, its C layout, the node that evaluates to the base address, and the index expression if
+// the program wrote one. Emits NOTHING - the two callers do, and they must not each grow their own copy
+// of this.
+//
+// The INDEX is why this exists. "p[i].field" is the C idiom for walking a block, and it is what
+// "New T[n]" and "CAllocate(n, Len(T))" hand back; both callers only knew the bare identifier, so an
+// indexed write fell through to the managed record path and faulted on a byte offset read as a handle.
+// Only the SQUARE-bracket spelling qualifies: "p(i)" on a pointer is not FreeBASIC's element access.
+begin
+  Result := False;
+  TypeName := ''; UDTIdx := -1; TotalSize := 0; BaseNode := nil; IdxNode := nil;
+  if ObjNode = nil then Exit;
+  if ObjNode.NodeType = antIdentifier then
+    BaseNode := ObjNode
+  else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
+          (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+          (ObjNode.GetChild(0).NodeType = antIdentifier) then
+  begin
+    BaseNode := ObjNode.GetChild(0);
+    IdxNode := ObjNode.GetChild(1);
+    // The index arrives wrapped in the argument list the call syntax shares with it.
+    if (IdxNode <> nil) and (IdxNode.NodeType in [antArgumentList, antExpressionList]) then
+    begin
+      if IdxNode.ChildCount <> 1 then Exit;      // "p[i, j]" is not an element of a block
+      IdxNode := IdxNode.GetChild(0);
+    end;
+    if IdxNode = nil then Exit;
+  end
+  else
+    Exit;
+  TypeName := RawUDTPtrType(UpperCase(VarToStr(BaseNode.Value)));
+  if TypeName = '' then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  if (IdxNode <> nil) and (TotalSize <= 0) then Exit;   // no stride, no element
+  Result := True;
+end;
+
 function TSSAGenerator.TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string;
   out Value: TSSAValue): Boolean;
 // "h->field" where h holds a RAW ADDRESS: read the field at its C-LAYOUT BYTE OFFSET, with the width and
@@ -18999,42 +19078,24 @@ function TSSAGenerator.TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: st
 // Declines - leaving the managed path alone - for a type whose image we cannot lay out (a variable-length
 // string, an array or a nested record member): UDTCLayout answers False for exactly those.
 var
-  PtrName, TypeName: string;
+  TypeName: string;
   UDTIdx, FieldIdx, i: Integer;
   Offsets: TInt64Array;
   TotalSize, Sz, Al: Int64;
-  BaseVal, AddrVal, OffVal: TSSAValue;
+  AddrVal: TSSAValue;
+  BaseNode, IdxNode: TASTNode;
   F: TUDTField;
 begin
   Result := False;
   Value := MakeSSAValue(svkNone);
-  if (ObjNode = nil) or (ObjNode.NodeType <> antIdentifier) then Exit;
-  PtrName := UpperCase(VarToStr(ObjNode.Value));
-  TypeName := RawUDTPtrType(PtrName);
-  if TypeName = '' then Exit;
-  UDTIdx := FindUDT(TypeName);
-  if UDTIdx < 0 then Exit;
-  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode) then Exit;
   FieldIdx := -1;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(FieldName) then begin FieldIdx := i; Break; end;
   if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not loaded
 
-  ProcessExpression(ObjNode, BaseVal);
-  BaseVal := EnsureIntRegister(BaseVal);
-  if Offsets[FieldIdx] = 0 then
-    AddrVal := BaseVal
-  else
-  begin
-    // ssaAddInt takes REGISTERS: a constant operand lowers to register 0, which silently adds whatever
-    // happens to live there instead of the field's offset.
-    OffVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, OffVal, MakeSSAConstInt(Offsets[FieldIdx]),
-                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaAddInt, AddrVal, BaseVal, OffVal, MakeSSAValue(svkNone));
-  end;
+  AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, TotalSize, Offsets[FieldIdx]);
 
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
@@ -19063,6 +19124,72 @@ begin
       4: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I32));
     else
       EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+    end;
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string;
+  ExprNode: TASTNode): Boolean;
+// "h->field = expr" where h holds a RAW ADDRESS: the WRITE half of TryEmitRawUDTField, and it did not
+// exist. Reading a field of a UDT laid over raw memory went to its byte offset; writing one still took
+// the managed path, which indexed the record table with a byte offset and died on an access violation.
+// So "Dim p As T Ptr = CPtr(T Ptr, @buf(0)) : Print p->v" answered correctly while "p->v = 1" faulted -
+// the recurring shape here: a rule the LOAD path has and the STORE path does not.
+//
+// It is also what "New T[n]" needs. That form must allocate raw (p[i] can only walk adjacent elements
+// if they are adjacent in memory), so every field write through such a pointer arrives here.
+//
+// Declines on exactly what the load declines on, and for the same reason - UDTCLayoutRaw answers False
+// for a type whose image we cannot lay out - so nothing that worked before changes route.
+var
+  TypeName: string;
+  UDTIdx, FieldIdx, i: Integer;
+  Offsets: TInt64Array;
+  TotalSize, Sz, Al: Int64;
+  AddrVal, ExprVal: TSSAValue;
+  BaseNode, IdxNode: TASTNode;
+  F: TUDTField;
+begin
+  Result := False;
+  if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode) then Exit;
+  FieldIdx := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(FieldName) then begin FieldIdx := i; Break; end;
+  if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not stored
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0 then Exit;  // a bit field is a read-modify-write: leave it
+
+  AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, TotalSize, Offsets[FieldIdx]);
+
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  ProcessExpression(ExprNode, ExprVal);
+  if F.Bank = srtString then
+    // A fixed-length string field is its DECLARED width of bytes, terminator and all - the same
+    // capacity code the load half passes.
+    EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(ExprVal),
+                    MakeSSAConstInt(2 + F.StrCapacity))
+  else if F.Bank = srtFloat then
+  begin
+    if Sz = 4 then
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(ExprVal),
+                      MakeSSAConstInt(RTC_SINGLE))
+    else
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(ExprVal),
+                      MakeSSAConstInt(RTC_DOUBLE));
+  end
+  else
+  begin
+    // The raw type code follows the field's BYTE WIDTH, exactly as the load half derives it: writing a
+    // UShort field writes two bytes at its offset, not eight, or the next field goes with it.
+    ExprVal := EnsureIntRegister(ExprVal);
+    case Sz of
+      1: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
+      2: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I16));
+      4: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I32));
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I64));
     end;
   end;
   Result := True;
@@ -26330,7 +26457,16 @@ var
       // over bytes that are not a record: the value is an ADDRESS, and reading a field means reading at
       // its C-layout OFFSET. Treating it as a managed handle indexed the record table with a byte offset
       // - an unchecked wild read, because SHARED_REC_FLAG and RAWPTR_TAG are the same bit.
-      if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) then
+      //
+      // "New T[n]" is that same case and it was NOT reaching this test. EmitNewObject allocates the
+      // block RAW - it has to, because p[i] can only walk adjacent elements if they are adjacent in
+      // memory - so the value is an address, exactly like the CPtr form above. The NEWARRAY branch that
+      // marks it raw sits BELOW this Exit, so for a UDT pointer it could never run: "Dim p As T Ptr =
+      // New T[4]" allocated the bytes, then read "p[0].v" through the managed record path and faulted
+      // on the first store. "New Integer[n]" was fine throughout - a scalar pointee never enters this
+      // branch - which is why the form looked implemented.
+      if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or
+         ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1')) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
           FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
       Exit;
@@ -28883,6 +29019,9 @@ begin
     try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
     Exit;
   end;
+  // "h->field = expr" where h is a UDT pointer holding a RAW ADDRESS: write at the C-layout byte
+  // offset. Asked BEFORE ResolveRecordObject, which would read the address as a record handle.
+  if TryEmitRawUDTFieldStore(MemberNode.GetChild(0), VarToStr(MemberNode.Value), ExprNode) then Exit;
   // Evaluate the RHS first, then resolve the target (object handle). Order matters only for
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
