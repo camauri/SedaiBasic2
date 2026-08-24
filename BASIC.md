@@ -3090,3 +3090,13 @@ End Function
 | Keyword | Status | Description |
 |---|---|---|
 | `EVENT` | ✗ | Data type for ScreenEvent function. |
+
+### Non implementato, dichiarato (24 agosto 2026)
+
+- **Tipo o union annidati CON NOME**: `Union U ... End Union` dentro un `Type`, poi `m As U`.
+  Dichiarano un tipo a se', mentre questo modello appiattisce i membri nel tipo che li contiene.
+  Rifiutato con un messaggio esplicito: dare al blocco nessun nome, oppure dichiarare il tipo fuori.
+  La forma ANONIMA e' supportata e i suoi membri sono sequenziali, come in FreeBASIC.
+- **`TypeOf` come tipo esatto**: `Dim As TypeOf(x)` funziona, ma il tipo dedotto e' approssimato al
+  banco (stringa / intero / virgola mobile). `Cast(TypeOf(p), 0)` con `p As Double Ptr` non ottiene
+  `Double Ptr`, quindi non e' supportato.
