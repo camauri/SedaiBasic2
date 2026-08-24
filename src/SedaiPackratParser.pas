@@ -281,6 +281,7 @@ type
     procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
     function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
     // Optional "= { ... }" / "=> { ... }" array initializer on an already-built antArrayDecl.
+    function TryParseAggregateTuple(const DimTypeName: string): TASTNode;
     procedure ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
     function AtEndType: Boolean;
     procedure ConsumeEndType;
@@ -8510,6 +8511,84 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.TryParseAggregateTuple(const DimTypeName: string): TASTNode;
+// FreeBASIC aggregate init "= (a, b, c)": a parenthesised comma-tuple that sets a UDT's fields in
+// declaration order. Answers the antArgumentList (TUPLEINIT), or NIL with the stream left exactly where
+// it was - so the caller can fall through to an ordinary expression, which is what "= (x + y) \ 2" is.
+//
+// ⛔ EXTRACTED because DIM had it and STATIC did not: "Static As T v = (a, b)" is the same declaration
+// with the other modifier, and it parsed the parentheses as an expression and failed. One grammar in
+// one place is the only way the two spellings cannot drift apart again.
+// The current token must be the '('.
+var
+  SavedIdx, TupleDepth: Integer;
+  IsTuple, HadComma: Boolean;
+  CtorArgs, ArgExpr: TASTNode;
+begin
+  Result := nil;
+  if not Context.Check(ttDelimParOpen) then Exit;
+  SavedIdx := Context.CurrentIndex;
+  Context.Advance;           // step past '(' for the scan
+  TupleDepth := 1; IsTuple := False; HadComma := False;
+  while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
+  begin
+    if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
+    else if Context.Check(ttDelimParClose) then
+    begin
+      Dec(TupleDepth);
+      // ...and a SINGLE-element group is an initializer list too when the declared type is a UDT
+      // and the parentheses span the WHOLE initializer: "Dim As UDT1 u = (1)" sets the first
+      // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
+      // into a record variable left the record's handle showing (the manual's control/iif4).
+      // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
+      if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
+      begin
+        Context.Advance;
+        if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
+        Break;
+      end;
+    end
+    else if Context.Check(ttSeparParam) and (TupleDepth = 1) then
+      begin IsTuple := True; HadComma := True; Break; end;
+    Context.Advance;
+  end;
+  Context.CurrentIndex := SavedIdx;  // rewind to the '('
+  if IsTuple then
+  begin
+    Context.Advance;         // (
+    CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
+    CtorArgs.Attributes.Values['TUPLEINIT'] := '1';   // UDT aggregate field init
+    if not HadComma then
+      // A SINGLE-element group is ambiguous: "= (1)" is a field list, but "= (""A.x"")" on a type
+      // with a matching CONSTRUCTOR is a construction. Mark it so the SSA resolves a constructor
+      // first and only aggregates when none matches.
+      CtorArgs.Attributes.Values['TUPLE1'] := '1';
+    repeat
+      // ⭐ A TUPLE ELEMENT MAY BE A BRACE LIST, and it initialises an ARRAY MEMBER:
+      //     type foo_2 : bar(0 to 1) as integer : end type
+      //     static as foo_2 chkref2 = ( { 1234, -5678 } )
+      // is FreeBASIC's own spelling (its test suite writes it), and the braces reached an
+      // expression parser that has no rule for '{' - the whole declaration failed to parse.
+      // Parsed by the same brace reader the array initializer uses, marked so the SSA knows
+      // this element is a LIST for a member array and not a value for a scalar field.
+      if Context.Check(ttDelimBraceOpen) then
+      begin
+        ArgExpr := TASTNode.Create(antArgumentList, Context.CurrentToken);
+        ArgExpr.Attributes.Values['BRACEINIT'] := '1';
+        SetLength(FInitLevelSizes, 0);
+        ParseArrayInitBraceGroup(ArgExpr, ConstDimSizes(nil), 0);   // no shape: plain row-major
+      end
+      else
+        ArgExpr := FExpressionParser.ParseExpression;
+      if not Assigned(ArgExpr) then Break;
+      CtorArgs.AddChild(ArgExpr);
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+    if Context.Check(ttDelimParClose) then Context.Advance;   // )
+    Result := CtorArgs;
+  end;
+end;
+
 procedure TPackratParser.ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
 // FreeBASIC array initializer: "DIM arr(dims) AS type = { v0, v1, ... }" or "=> { ... }". Both '=' and
 // '=>' are valid initializer signs (FB manual: plain '=' is the common form, '=>' avoids the declaration
@@ -9505,51 +9584,12 @@ begin
           // fields in declaration order. Distinguish it from an expression that merely STARTS with '(' —
           // e.g. "= (x + y) \ 2" — by looking ahead for a TOP-LEVEL comma inside the leading parentheses;
           // only then is it a tuple. Without one, fall through to the normal (full) expression parse.
-          SavedIdx := Context.CurrentIndex;
-          Context.Advance;                   // step past '(' for the scan
-          TupleDepth := 1; IsTuple := False; HadComma := False;
-          while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
-          begin
-            if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
-            else if Context.Check(ttDelimParClose) then
-            begin
-              Dec(TupleDepth);
-              // ...and a SINGLE-element group is an initializer list too when the declared type is a UDT
-              // and the parentheses span the WHOLE initializer: "Dim As UDT1 u = (1)" sets the first
-              // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
-              // into a record variable left the record's handle showing (the manual's control/iif4).
-              // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
-              if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
-              begin
-                Context.Advance;
-                if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
-                Break;
-              end;
-            end
-            else if Context.Check(ttSeparParam) and (TupleDepth = 1) then
-              begin IsTuple := True; HadComma := True; Break; end;
-            Context.Advance;
-          end;
-          Context.CurrentIndex := SavedIdx;  // rewind to the '('
-          if IsTuple then
-          begin
-            Context.Advance;                 // (
-            CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
-            CtorArgs.Attributes.Values['TUPLEINIT'] := '1';   // UDT aggregate field init
-            if not HadComma then
-              // A SINGLE-element group is ambiguous: "= (1)" is a field list, but "= (""A.x"")" on a type
-              // with a matching CONSTRUCTOR is a construction. Mark it so the SSA resolves a constructor
-              // first and only aggregates when none matches.
-              CtorArgs.Attributes.Values['TUPLE1'] := '1';
-            repeat
-              ArgExpr := FExpressionParser.ParseExpression;
-              if not Assigned(ArgExpr) then Break;
-              CtorArgs.AddChild(ArgExpr);
-              if Context.Check(ttSeparParam) then Context.Advance else Break;
-            until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
-            if Context.Check(ttDelimParClose) then Context.Advance;   // )
-            ArrayDecl.AddChild(CtorArgs);                     // child[2] = tuple
-          end
+          // ⭐ ONE reader for the aggregate tuple, shared with STATIC. It used to live inline here and
+          // nowhere else, so "Static As T v = (a, b)" - the same declaration with the other modifier -
+          // parsed the parentheses as an EXPRESSION and failed. See TryParseAggregateTuple.
+          CtorArgs := TryParseAggregateTuple(DimTypeName);
+          if Assigned(CtorArgs) then
+            ArrayDecl.AddChild(CtorArgs)                      // child[2] = tuple
           else
           begin
             InitExpr := FExpressionParser.ParseExpression;    // full expression, e.g. "(x + y) \ 2"
@@ -9797,7 +9837,11 @@ begin
         if Context.Check(ttOpEq) then
         begin
           Context.Advance;                           // =
-          Init := FExpressionParser.ParseExpression;
+          // ⭐ ...including the AGGREGATE TUPLE, "Static As T v = (a, b)" and "= ( { 1, 2 } )". The
+          // grammar lived inline in DIM and nowhere else, so the very same declaration written with
+          // STATIC parsed the parentheses as an expression and failed. One reader, both spellings.
+          Init := TryParseAggregateTuple(StaticTypeName);
+          if not Assigned(Init) then Init := FExpressionParser.ParseExpression;
           if Assigned(Init) then DeclNode.AddChild(Init);
         end;
       end;
