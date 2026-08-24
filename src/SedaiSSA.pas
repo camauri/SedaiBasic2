@@ -427,6 +427,9 @@ type
     function DeclaresAbstractMethod(const TypeName, MethNm: string): Boolean;  // OOP: "Declare Abstract ..."
     function AnyOverrideLabel(const TypeName, MethNm: string): string;    // ...some concrete override of it
     function HasCallableMethod(const TypeName, MethNm: string; ArgsNode: TASTNode): Boolean;
+    function EnclosingTypeOf(const TypeName: string): string;  // the type a NESTED type was declared inside
+    function OwnerTypeOfLabel(const Name: string): string;   // THIS's type inside a method body
+    function NestedQualifiedMethod(const TypeName, MethNm: string): string;  // "Sub T.U.proc" label of a nested type's method
     function ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;  // + overloads
     function ResolveConstructorLabel(const TypeName, ArgSig: string;
                                      const UdtSig: string = ''): string;       // M4.4g: by type signature (+ UDT tail)
@@ -1823,7 +1826,10 @@ begin
   if not Assigned(FCurrentBlock) then
     Exit;
 
-  if (OpCode in RECORD_ALLOCATING_OPS) or
+  // ⚠️ ssaRecordReallocBlock is tested BESIDE the set, not in it: a Pascal set holds ordinals
+  // 0..255 and this opcode sits at the END of the enum - where it has to be, because
+  // inserting one in the middle shifts every ordinal after it.
+  if (OpCode = ssaRecordReallocBlock) or (OpCode in RECORD_ALLOCATING_OPS) or
      ((GRecMarkCall = 1) and (OpCode in RECORD_ALLOCATING_CALL_OPS)) then Inc(FRecAllocSeq);
 
   Instr := TSSAInstruction.Create(OpCode);
@@ -7992,6 +7998,42 @@ begin
   // by EmitRecordInit). p is NOT marked raw (see CollectRawPtrVars), so it stays a managed handle. Scalar
   // /byte pointees keep the raw byte-heap path below. REALLOCATE of a UDT pointer stays raw (rare).
   LhsRecType := PointerUDTType(VarName);
+  // "p = Reallocate(p, n * SizeOf(T))" where p is a MANAGED block of UDT records. It used to take the
+  // RAW path below, which read the managed handle as a byte offset - proguide/dynamicmemory printed its
+  // first line and died on an access violation. The block is records, so the resize is a record
+  // operation: keep what is there, give it n elements, and hand back the (possibly moved) first handle.
+  if (LhsRecType <> '') and (AllocFuncU = 'REALLOCATE') and
+     (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount >= 2) then
+  begin
+    UDTIdx := FindUDT(LhsRecType);
+    // ⚠️ The element size is the one SIZEOF answers, not the C layout's. UDTCLayout declines a type
+    // holding a variable-length STRING - which is exactly the type the manual's example uses - so
+    // asking it here made the whole branch inert and the raw path took over again.
+    AllocElemSize := TypeSizeBytes(LhsRecType);
+    if (UDTIdx >= 0) and (AllocElemSize > 0) then
+    begin
+      // The byte count is the argument fbc's realloc takes; the element count is it over the type's size.
+      ProcessExpression(ExprNode.GetChild(1).GetChild(1), BytesVal);
+      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
+      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, CountReg, ProdReg,
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
+      ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordReallocBlock, ExprValue,
+                      EnsureIntRegister(GetOrAllocateVariable(VarName)), EnsureIntRegister(CountReg),
+                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                                      or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
+                                      or ((Int64(UDTIdx) and $FFFF) shl 48)));
+      EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+      // Give the elements that are NEW their member-array / nested-UDT backing, as the first allocation
+      // did. EmitRecordBlockInit only fills what is still empty, so the kept ones are untouched.
+      EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx);
+      Exit;
+    end;
+  end;
   if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
   begin
     UDTIdx := FindUDT(LhsRecType);
@@ -10103,10 +10145,10 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 // The array must already be declared (DIM first); each dimension's original lower bound is kept (only
 // the upper bounds / size change). PRESERVE keeps the flat element order up to the new size.
 var
-  j, di, ArrayIdx, MSlot, MDimCount, UdtIdx: Integer;
+  j, di, ArrayIdx, MSlot, MDimCount, UdtIdx, MElemUDT: Integer;
   ArrName, MTypeName, ElemUdtName: string;
   ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode: TASTNode;
-  UbValue, UbReg, MHandle, LbVal: TSSAValue;
+  UbValue, UbReg, MHandle, LbVal, MArrHandle: TSSAValue;
   MElemBank: TSSARegisterType;
   PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
   AllExplicitLb: Boolean;
@@ -10139,6 +10181,22 @@ begin
       // Immediate packs (slot<<8) | (elemType<<4) | preserve.
       EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), MHandle, MakeSSAValue(svkNone),
                       MakeSSAConstInt((Int64(MSlot) shl 8) or (Int64(Ord(MElemBank)) shl 4) or PreserveFlag));
+      // ...and if the elements are UDTs, give each one a record. Construction does this for a member
+      // array with FIXED bounds (see EmitRecordInit); an "Any"-bounded one is sized HERE and nothing
+      // allocated its elements, so "This.items(i).field = v" dereferenced a 0 handle and died on an
+      // access violation. The same opcode, for the same reason, at the other place the array gets a size.
+      // (ssaRecordNewArrayInd fills only the slots still empty, so PRESERVE keeps what was there.)
+      MElemUDT := FindUDT(UDTArrayElemType(FindUDT(MTypeName), VarToStr(MemberNode.Value)));
+      if MElemUDT >= 0 then
+      begin
+        MArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordLoadInt, MArrHandle, MHandle, MakeSSAValue(svkNone), MakeSSAConstInt(MSlot));
+        EmitInstruction(ssaRecordNewArrayInd, MakeSSAValue(svkNone), MArrHandle,
+                        MakeSSAConstInt((Int64(FUDTs[MElemUDT].LiveBytes) and $FFFF)
+                                        or ((Int64(FUDTs[MElemUDT].NStr) and $FFFF) shl 32)
+                                        or ((Int64(MElemUDT) and $FFFF) shl 48)),
+                        MakeSSAValue(svkNone));
+      end;
       Continue;
     end;
     if ArrayDeclNode.GetChild(0).NodeType <> antIdentifier then Continue;
@@ -21633,6 +21691,16 @@ begin
   U := CanonicalType(TypeName);
   for i := 0 to High(FUDTs) do
     if FUDTs[i].Name = U then Exit(i);
+  // A NESTED type is registered under its own simple name, and FreeBASIC also reaches it QUALIFIED:
+  // "Union U" inside "Type T" is both U and T.U, and a method defined on it is written
+  // "Sub T.U.proc". Try the last segment when the qualified spelling is not a type of its own.
+  // ⚠️ Fallback, not a rename: an exact match always wins, so a real "T.U" would still be found first.
+  if Pos('.', U) > 0 then
+  begin
+    while Pos('.', U) > 0 do U := Copy(U, Pos('.', U) + 1, MaxInt);
+    for i := 0 to High(FUDTs) do
+      if FUDTs[i].Name = U then Exit(i);
+  end;
   Result := -1;
 end;
 
@@ -21678,6 +21746,13 @@ var
 begin
   Level := MemberAccessLevel(TypeName, MemberName, Owner);
   if (Level = '') or (Owner = '') then Exit;                 // public: nothing to say
+  // ⭐ A NESTED type reaches its ENCLOSING type's private members. FreeBASIC grants it (the manual's
+  // udt/type4 has "Type Child" inside "Type Parent" reading Parent's private nameParent through a
+  // back-pointer), and so does C++ for a nested class. The nested declaration records which type it
+  // sits in, so the question is answerable exactly and without widening anything else.
+  if (FCurrentThisType <> '') and (EnclosingTypeOf(FCurrentThisType) <> '') and
+     ((UpperCase(EnclosingTypeOf(FCurrentThisType)) = UpperCase(Owner)) or
+      IsSubtypeOf(EnclosingTypeOf(FCurrentThisType), Owner)) then Exit;
   if Level = 'PRIVATE' then
   begin
     if UpperCase(FCurrentThisType) = UpperCase(Owner) then Exit;
@@ -22038,6 +22113,12 @@ begin
       FUDTs[n].IsUnion := (Node.Attributes.Values['UNION'] = '1');  // UNION: overlap same-bank fields
       FUDTs[n].FieldAlign := StrToIntDef(Node.Attributes.Values['FIELDALIGN'], 0);  // "FIELD = n" packing
     end;
+    // ...and a NESTED named type declares one of its own. Without descending here the block was
+    // registered nowhere and "m As U" found no type, so the member came out as a plain integer.
+    for i := 0 to Node.ChildCount - 1 do
+      if (Node.GetChild(i).NodeType = antTypeDecl) and
+         (Node.GetChild(i).Attributes.Values['NESTEDTYPE'] = '1') then
+        CollectUDTNames(Node.GetChild(i));
     Exit;
   end;
   for i := 0 to Node.ChildCount - 1 do
@@ -22578,6 +22659,57 @@ begin
   WriteLn(ErrOutput, 'udt: ', Length(FUDTs), ' types, ', Bad, ' disagreements');
 end;
 
+function TSSAGenerator.EnclosingTypeOf(const TypeName: string): string;
+// The type a NESTED type was declared inside, or '' when TypeName is not one.
+var
+  Idx: Integer;
+begin
+  Result := '';
+  Idx := FindUDT(TypeName);
+  if (Idx < 0) or (FUDTs[Idx].Node = nil) then Exit;
+  Result := UpperCase(FUDTs[Idx].Node.Attributes.Values['OUTERTYPE']);
+end;
+
+function TSSAGenerator.OwnerTypeOfLabel(const Name: string): string;
+// The type whose method this label names, i.e. THIS's type inside the body. A label may carry two dots
+// for two different reasons and they must not be confused:
+//   "TYPE.PROP.GET"  - a PROPERTY: the owner is the FIRST segment;
+//   "T.U.PROC"       - a method of a NESTED type: the owner is "T.U", which resolves to U.
+// So the longest prefix that IS a type wins, tried from the last dot backwards. Reading the first
+// segment always (what this did) typed THIS as the OUTER type inside a nested type's method, and
+// "This.b1" then looked for a field the outer type does not have and the assignment was dropped;
+// reading the last always broke every property, whose middle segment is not a type at all.
+var
+  i: Integer;
+  Pfx: string;
+begin
+  Result := '';
+  if Pos('.', Name) = 0 then Exit;
+  for i := Length(Name) downto 2 do
+    if Name[i] = '.' then
+    begin
+      Pfx := UpperCase(Copy(Name, 1, i - 1));
+      if FindUDT(Pfx) >= 0 then Exit(Pfx);
+    end;
+  Result := UpperCase(Copy(Name, 1, Pos('.', Name) - 1));   // no prefix is a known type: the old reading
+end;
+
+function TSSAGenerator.NestedQualifiedMethod(const TypeName, MethNm: string): string;
+// The label a method of a NESTED type is DEFINED under. FreeBASIC writes the definition qualified -
+// "Sub T.U.proc" for a Union U declared inside Type T - while the expression that calls it knows only
+// the member's type, U. The nested declaration records which type it sits in, so the outer name can be
+// put back. Empty when TypeName is not a nested type.
+var
+  Idx: Integer;
+begin
+  Result := '';
+  Idx := FindUDT(TypeName);
+  if (Idx < 0) or (FUDTs[Idx].Node = nil) then Exit;
+  if FUDTs[Idx].Node.Attributes.Values['OUTERTYPE'] = '' then Exit;
+  Result := UpperCase(FUDTs[Idx].Node.Attributes.Values['OUTERTYPE']) + '.' +
+            UpperCase(FUDTs[Idx].Name) + '.' + UpperCase(MethNm);
+end;
+
 function TSSAGenerator.ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;
 // ResolveMethodLabel, but able to pick between OVERLOADS of the method (which carry a "~<sig>" suffix and
 // therefore have no bare label). Walks the inheritance chain the same way. ArgsNode is the call's argument
@@ -22593,6 +22725,12 @@ begin
   begin
     Lbl := ResolveCallLabel(T + '.' + UpperCase(MethNm), ArgsNode);
     if Lbl <> '' then Exit(Lbl);
+    // ...and the qualified spelling a NESTED type's method is defined under (see the helper).
+    if NestedQualifiedMethod(T, MethNm) <> '' then
+    begin
+      Lbl := ResolveCallLabel(NestedQualifiedMethod(T, MethNm), ArgsNode);
+      if Lbl <> '' then Exit(Lbl);
+    end;
     Idx := FindUDT(T);
     if Idx < 0 then Break;
     T := FUDTs[Idx].Parent;
@@ -22613,6 +22751,8 @@ begin
   begin
     Lbl := T + '.' + UpperCase(MethNm);
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    Lbl := NestedQualifiedMethod(T, MethNm);
+    if (Lbl <> '') and FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     Idx := FindUDT(T);
     if Idx < 0 then Break;
     T := FUDTs[Idx].Parent;
@@ -26818,6 +26958,19 @@ var
       ProcessExpression(ArgNode.GetChild(0), Result);
       Exit;
     end;
+    // ⛔ An element of a MANAGED UDT BLOCK ("Clear p1[3], 0, n" after "p1 = CAllocate(3, SizeOf(T))").
+    // Its address is a record HANDLE, not a byte offset - and the two are indistinguishable by value
+    // here, because SHARED_REC_FLAG and RAWPTR_TAG are the same bit; only the SSA knows which it is,
+    // which is why the refusal has to be here and cannot be a check in the VM. Reading it as a byte
+    // offset walked into the heap's first bytes.
+    if (ArgNode.NodeType = antArrayAccess) and (ArgNode.ChildCount >= 1) and
+       (ArgNode.GetChild(0).NodeType = antIdentifier) and
+       (ArrayIndexOf(VarToStr(ArgNode.GetChild(0).Value)) < 0) and
+       (PointerUDTType(VarToStr(ArgNode.GetChild(0).Value)) <> '') then
+      raise Exception.CreateFmt(
+        '%s over "%s[i]" is refused: the elements are MANAGED records, not a byte image, and their ' +
+        'address is a record handle. Assign the fields, or construct the element ("p[i].Constructor()").',
+        [FuncU, UpperCase(VarToStr(ArgNode.GetChild(0).Value))]);
     // An ARRAY element, which is the manual's own idiom for clearing an array:
     //     Clear array(0), , 100 * SizeOf(Integer)
     // The address is an FArrays-backed pointer, and the VM's BlockAddr resolves it to the element
@@ -30768,11 +30921,13 @@ begin
     CollectLocalRecordVars(Proc);
     FCurrentProcDeclNames.Clear;
     CollectProcDeclaredNames(Proc);
-    // Method body (M4.1): the owner type (before the '.') is THIS's type while lowering here.
-    if Pos('.', Name) > 0 then
-      FCurrentThisType := Copy(Name, 1, Pos('.', Name) - 1)
-    else
-      FCurrentThisType := '';
+    // Method body (M4.1): the owner type is everything before the LAST '.', and that is THIS's type
+    // while lowering here.
+    // ⚠️ The LAST, not the first. A method of a NESTED type is defined "Sub T.U.proc": taking the first
+    // segment typed THIS as T, so "This.b1" looked for a field of the OUTER type, found none, and the
+    // assignment was dropped - the method ran and wrote nothing. For an ordinary "TYPE.METHOD" the two
+    // readings coincide, which is why it went unnoticed.
+    FCurrentThisType := OwnerTypeOfLabel(Name);
 
     // FB lexical scope (MODERN): open the procedure-root scope frame. Parameters, THIS, the FUNCTION
     // result handle and the body's locals/implicit names bind here; resolution stops at this frame for

@@ -679,7 +679,8 @@ type
     // M5.2c: allocate in the shared region (cross-thread); ResolveRec routes a handle to its record.
     procedure GrowSharedRecords(NeedLen: Integer);
     function AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
-    function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
+    function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
+    function ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
     // that NeedBytes bytes fit. Every raw access goes through it.
@@ -5549,6 +5550,7 @@ begin
     begin
       New(R);
       R^.TypeId := TypeId;
+      R^.BlockLen := 0;
       SetLength(R^.Bytes, ByteSize);
       SetLength(R^.StringData, StrC);
       if FSharedRecordCount >= Length(FSharedRecords) then
@@ -5557,10 +5559,76 @@ begin
       FSharedRecStore[FSharedRecordCount] := R;
       Inc(FSharedRecordCount);
     end;
+    FSharedRecords[firstIdx]^.BlockLen := N;   // only the FIRST record carries the block's length
   finally
     LeaveCriticalSection(FSharedRecLock);
   end;
   Result := SHARED_REC_FLAG or Int64(firstIdx);
+end;
+
+function TBytecodeVM.ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;
+// FreeBASIC "p = Reallocate(p, n * SizeOf(T))" where p is a MANAGED block of UDT records: give the block
+// NewN records, keeping the contents of the ones already there.
+//
+// The region only ever APPENDS, so when the block is the last thing in it the extra records go straight
+// on the end and the handle does not move - which is what a C realloc usually does too. Otherwise a
+// fresh block is allocated and the old records' contents are copied one level deep, exactly as
+// DeepCopyArrayRecords does for an array member. The old block is left alone rather than freed: every
+// other path here leaks a superseded record the same way, and freeing one a live handle may still name
+// is the one thing that must not happen.
+//
+// ⛔ Reallocate on a UDT pointer used to take the RAW path, which read the managed handle as a byte
+// offset: proguide/dynamicmemory printed its first line and died on an access violation.
+var
+  OldIdx, OldN, i, k: Integer;
+  NewHandle: Int64;
+  Src, Dst: PRecordStorage;
+begin
+  Result := OldHandle;
+  if (OldHandle and SHARED_REC_FLAG) = 0 then Exit;        // not a managed block: nothing to do here
+  OldIdx := Integer(OldHandle and not SHARED_REC_FLAG);
+  if (OldIdx < 0) or (OldIdx >= FSharedRecordCount) then Exit;
+  OldN := FSharedRecords[OldIdx]^.BlockLen;
+  if OldN < 1 then OldN := 1;
+  if NewN < 1 then NewN := 1;
+  if NewN = OldN then Exit;
+
+  EnterCriticalSection(FSharedRecLock);
+  try
+    if (NewN > OldN) and (OldIdx + OldN = FSharedRecordCount) then
+    begin
+      // The block ends the region: extend it in place.
+      for i := 0 to NewN - OldN - 1 do
+      begin
+        New(Dst);
+        Dst^.TypeId := TypeId;
+        Dst^.BlockLen := 0;
+        SetLength(Dst^.Bytes, ByteSize);
+        SetLength(Dst^.StringData, StrC);
+        if FSharedRecordCount >= Length(FSharedRecords) then
+          GrowSharedRecords(FSharedRecordCount + 1);
+        FSharedRecords[FSharedRecordCount] := Dst;
+        FSharedRecStore[FSharedRecordCount] := Dst;
+        Inc(FSharedRecordCount);
+      end;
+      FSharedRecords[OldIdx]^.BlockLen := NewN;
+      Exit(OldHandle);
+    end;
+  finally
+    LeaveCriticalSection(FSharedRecLock);
+  end;
+
+  NewHandle := AllocSharedRecordBlock(NewN, ByteSize, StrC, TypeId);
+  k := NewN; if OldN < k then k := OldN;
+  for i := 0 to k - 1 do
+  begin
+    Src := FSharedRecords[OldIdx + i];
+    Dst := FSharedRecords[Integer(NewHandle and not SHARED_REC_FLAG) + i];
+    Dst^.TypeId := Src^.TypeId;
+    Dst^.Bytes := Copy(Src^.Bytes, 0, Length(Src^.Bytes));
+    Dst^.StringData := Copy(Src^.StringData, 0, Length(Src^.StringData));
+  end;
+  Result := NewHandle;
 end;
 
 procedure TBytecodeVM.DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);
@@ -8015,6 +8083,11 @@ begin
       RecordNewArrayInit(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
     bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first handle
       Ctx.IntRegs[Instr.Dest] := AllocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
+                                   Instr.Immediate and $FFFF,
+                                   (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
+    bcRecordReallocBlock:  // Reallocate a UDT block: Dest = the (possibly moved) first handle
+      Ctx.IntRegs[Instr.Dest] := ReallocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
+                                   Integer(Ctx.IntRegs[Instr.Src2]),
                                    Instr.Immediate and $FFFF,
                                    (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
     bcRecordFree:

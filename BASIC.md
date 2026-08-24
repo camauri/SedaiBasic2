@@ -3110,6 +3110,14 @@ failed as fbc's would"* from *"we cannot do this"*. `--verbose` restores the ful
 ⚠️ `#line` currently reaches the **abort message** and `__LINE__`. `ERL`, `ERMN` and `Assert`'s
 `path(line):` prefix still report the physical position.
 
+### Nested types
+
+A **named** `Type` or `Union` declared inside a `Type` is a type of its own, not a set of fields:
+`Union U … End Union` inside `Type T` declares `U`, reachable as `U` and as `T.U`. A method is defined
+qualified — `Sub T.U.proc` — and `This` inside it is the *nested* type. A nested type reaches its
+enclosing type's **private** members, as it does in FreeBASIC and in C++. The **anonymous** form is
+what it has always been: a layout block whose members are sequential inside the surrounding union.
+
 ### Declared divergence: integer division by zero
 
 `x \ 0` and `x Mod 0` raise a **catchable runtime error** here. `fbc` emits the bare machine
@@ -3121,10 +3129,6 @@ the divergence is deliberate and is not going to be reproduced.
 
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
 
-- **A NAMED nested type or union**: `Union U ... End Union` inside a `Type`, then `m As U`. That
-  declares a type of its own, while this model flattens the members into the type that holds them.
-  Refused: leave the block unnamed, or declare the type outside. The ANONYMOUS form *is* supported and
-  its members are laid out in sequence, as in FreeBASIC.
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
@@ -3138,8 +3142,11 @@ Each of these is *refused with a message that names the reason*, never answered 
   (`As Short`, `As UByte`, …). An `Integer`/`LongInt`/`Double` array is a real contiguous byte image
   here and these ops work over it exactly as in fbc; a narrow element type is stored widened, so a
   byte count would cover a different number of elements. Loop over the elements instead.
-- **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
-  byte image — the elements are managed values.
+- **`Clear` / `FB_MEMCOPY` over a STRING array, through a record-field pointer, or over an element of a
+  MANAGED UDT block** (`Clear p[i], 0, n` after `p = CAllocate(n, SizeOf(T))`): none of them has a byte
+  image — the elements are managed records, and their address is a record handle. Assign the fields, or
+  construct the element with `p[i].Constructor()`.
+  ⚠️ `Reallocate` of such a block *is* supported and keeps what was there.
 - **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
   walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
   not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported

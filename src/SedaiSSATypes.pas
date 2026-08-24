@@ -621,6 +621,11 @@ type
     // due domande diverse, e un solo Dest non puo' rispondere a entrambe.
     ssaBigDiv,         // Dest := Src1 \\ Src2 (quoziente, troncato verso zero)
     ssaBigMod,         // Dest := Src1 Mod Src2 (resto, col segno del dividendo)
+    // ⛔ ADDED AT THE END, on purpose. Inserting an opcode in the MIDDLE shifts every ordinal after
+    // it, and this enum is read by ordinal in more than one place - a Reallocate emitted as a
+    // STRING opcode is what said so ("Unknown string opcode 169").
+    ssaRecordReallocBlock,  // Reallocate a UDT block: Dest=new first handle, Src1=old handle,
+                            //   Src2=new element count reg, Src3 const=packed slot counts
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

@@ -319,6 +319,7 @@ begin
     ssaRecordNewArray: Result := bcRecordNewArray;
     ssaRecordNewArrayInd: Result := bcRecordNewArrayInd;
     ssaRecordNewBlock: Result := bcRecordNewBlock;
+    ssaRecordReallocBlock: Result := bcRecordReallocBlock;
     ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecordSetTypeId: Result := bcRecordSetTypeId;
     ssaRecordFree: Result := bcRecordFree;     // DELETE
@@ -2155,6 +2156,10 @@ begin
   // ssaRecordNewBlock: Dest = first handle, Src1 = count register (mapped normally); Src2 const = packed counts.
   if Instr.OpCode = ssaRecordNewBlock then
     BCInstr.Immediate := Instr.Src2.ConstInt;
+  // ssaRecordReallocBlock: Src1 = old handle reg, Src2 = new count reg (both mapped normally),
+  // Src3 const = the packed slot counts.
+  if Instr.OpCode = ssaRecordReallocBlock then
+    BCInstr.Immediate := Instr.Src3.ConstInt;
   // B4 bounds-check elimination: array load/store carries no Src3, so Immediate is free
   // (always 0 here). BoundsSafe (proven by SedaiRangeAnalysis) rides bit 0 for the JIT;
   // the interpreter ignores Immediate on these opcodes and keeps checking.
