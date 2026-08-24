@@ -8297,6 +8297,33 @@ procedure TPackratParser.ParseOptionalArrayInit(Decl, Dimensions: TASTNode; cons
 var
   InitList: TASTNode;
 begin
+  // "= Any" / "=> Any": FreeBASIC's way of saying DO NOT INITIALISE this array. It is an initializer
+  // sign like the others, and it was not accepted here at all - so the '=' was left standing and the
+  // whole declaration failed to parse ("Unexpected token in statement"). The scalar form has always
+  // gone through (it lands on the ordinary initializer path, where the bare name ANY reads as an
+  // undeclared identifier); only the array spelling had no route.
+  // ⚠️ The storage still comes out ZEROED here, where fbc hands back whatever was on the stack. That
+  // is a defined state instead of an undefined one, and it is declared in BASIC.md.
+  if Context.Check(ttOpEq) then
+  begin
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) and
+       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ANY') then
+    begin
+      Context.Advance;                              // =
+      Context.Advance;                              // Any
+      Decl.Attributes.Values['ANYINIT'] := '1';
+      Exit;
+    end;
+    // the "=> Any" spelling of the same thing ("=>" is lexed as '=' then '>')
+    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpGt) and
+       Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
+       (UpperCase(VarToStr(Context.PeekToken(2).Value)) = 'ANY') then
+    begin
+      Context.Advance; Context.Advance; Context.Advance;   // = > Any
+      Decl.Attributes.Values['ANYINIT'] := '1';
+      Exit;
+    end;
+  end;
   if not (Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
           ((Context.PeekNext.TokenType = ttOpGt) or (Context.PeekNext.TokenType = ttDelimBraceOpen))) then
     Exit;
@@ -9365,7 +9392,7 @@ function TPackratParser.ParseStaticStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
-  StaticTypeName: string;
+  StaticTypeName, StaticFixedLen: string;
 
   // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
   // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
@@ -9394,6 +9421,25 @@ var
     end;
   end;
 
+  // "* n" after the type: a FIXED-LENGTH string capacity ("Static As ZString * 32 z"). Answers the
+  // capacity as text for the FIXEDLEN attribute, or '' when there is none, exactly as the DIM parser
+  // does it. ⛔ STATIC had no such step in EITHER of its two spellings, so the '*' ended the type,
+  // the name after it was never read as a declaration, and "* 32 z" was parsed as a separate
+  // statement - an antDeref of 32 followed by a bare call to Z. The declaration silently disappeared
+  // and "@z" then named nothing.
+  function ParseStaticFixedLen: string;
+  var CapExpr: TASTNode; CapVal: Int64;
+  begin
+    Result := '';
+    if not Context.Check(ttOpMul) then Exit;
+    Context.Advance;                                 // '*'
+    CapExpr := FExpressionParser.ParseExpression(precCall);   // the capacity (no binary ops)
+    if not Assigned(CapExpr) then Exit;
+    if TryConstIntExpr(CapExpr, CapVal) then Result := IntToStr(CapVal)
+    else Result := '-1';                             // present but non-constant -> advisory
+    CapExpr.Free;
+  end;
+
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -9413,6 +9459,7 @@ begin
     StaticTypeName := ParseDottedName;
     while AtPointerSuffix do
     begin StaticTypeName := StaticTypeName + ' PTR'; Context.Advance; end;
+    StaticFixedLen := ParseStaticFixedLen;   // "Static As String * n a, b": one capacity, every name
     repeat
       if not Context.Check(ttIdentifier) then Break;
       NameTok := Context.CurrentToken;
@@ -9438,6 +9485,7 @@ begin
         end;
       end;
       DeclNode.Attributes.Values['STATIC'] := '1';
+      if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
       DoNodeCreated(DeclNode);
       Result.AddChild(DeclNode);
       if Context.Check(ttSeparParam) then Context.Advance else Break;
@@ -9476,6 +9524,7 @@ begin
       StaticTypeName := StaticTypeName + ' PTR';
       Context.Advance;                               // consume PTR
     end;
+    StaticFixedLen := ParseStaticFixedLen;           // "Static z As String * n"
     DeclNode := TASTNode.Create(antArrayDecl, NameTok);
     NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
     TypeNd := TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok);
@@ -9499,6 +9548,7 @@ begin
       end;
     end;
     DeclNode.Attributes.Values['STATIC'] := '1';
+    if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
     DoNodeCreated(DeclNode);
     Result.AddChild(DeclNode);
     if Context.Check(ttSeparParam) then

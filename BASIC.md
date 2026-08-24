@@ -3114,3 +3114,26 @@ Each of these is *refused with a message that names the reason*, never answered 
   byte count would cover a different number of elements. Loop over the elements instead.
 - **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
   byte image — the elements are managed values.
+- **Assigning through a byref `Operator Cast` that returns a record FIELD**, i.e.
+  `Cast(Integer, u) = 78` where `Operator U.Cast() ByRef As Integer` does `Return This.I`. Reading
+  through such an operator works; taking the address of a field *as a byref result* does not yet.
+  Refused with that reason at the point of use.
+- **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
+  walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
+  not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported
+  and matches fbc whenever the pointee is the array's own element type, and over the raw byte heap
+  (`Allocate`) it matches for every width. Same root as `ByRef As Any` below.
+- **`Dim As T a(n) = Any`** parses and means "do not initialise" — but the storage still comes out
+  zeroed here, where fbc hands back whatever was on the stack. A defined state instead of an undefined
+  one.
+- **`__FUNCTION_NQ__` read as a VALUE.** It substitutes the *symbol*, not a string, so in fbc
+  `Return __FUNCTION_NQ__` inside its own function is a recursive **call** — the program compiles with
+  "infinite recursion detected" and dies. Here it yields the procedure's name as text, like
+  `__FUNCTION__`. ⚠️ The one use the manual makes of it, `@__FUNCTION_NQ__` (the enclosing
+  procedure's own address), *is* supported and means exactly `@<that procedure>`.
+- **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
+  examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
+  base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance
+  is a managed record, its runtime type is an id, and a virtual call goes through a generated
+  dispatcher rather than a vtable slot. `Object`, `Extends`, `Is`, virtual and abstract members are
+  all supported — only the memory *layout* behind them is not a thing a program can walk here.
