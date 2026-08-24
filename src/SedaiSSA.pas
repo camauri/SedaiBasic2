@@ -1826,7 +1826,10 @@ begin
   if not Assigned(FCurrentBlock) then
     Exit;
 
-  if (OpCode in RECORD_ALLOCATING_OPS) or
+  // ⚠️ ssaRecordReallocBlock is tested BESIDE the set, not in it: a Pascal set holds ordinals
+  // 0..255 and this opcode sits at the END of the enum - where it has to be, because
+  // inserting one in the middle shifts every ordinal after it.
+  if (OpCode = ssaRecordReallocBlock) or (OpCode in RECORD_ALLOCATING_OPS) or
      ((GRecMarkCall = 1) and (OpCode in RECORD_ALLOCATING_CALL_OPS)) then Inc(FRecAllocSeq);
 
   Instr := TSSAInstruction.Create(OpCode);
@@ -7995,6 +7998,42 @@ begin
   // by EmitRecordInit). p is NOT marked raw (see CollectRawPtrVars), so it stays a managed handle. Scalar
   // /byte pointees keep the raw byte-heap path below. REALLOCATE of a UDT pointer stays raw (rare).
   LhsRecType := PointerUDTType(VarName);
+  // "p = Reallocate(p, n * SizeOf(T))" where p is a MANAGED block of UDT records. It used to take the
+  // RAW path below, which read the managed handle as a byte offset - proguide/dynamicmemory printed its
+  // first line and died on an access violation. The block is records, so the resize is a record
+  // operation: keep what is there, give it n elements, and hand back the (possibly moved) first handle.
+  if (LhsRecType <> '') and (AllocFuncU = 'REALLOCATE') and
+     (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount >= 2) then
+  begin
+    UDTIdx := FindUDT(LhsRecType);
+    // ⚠️ The element size is the one SIZEOF answers, not the C layout's. UDTCLayout declines a type
+    // holding a variable-length STRING - which is exactly the type the manual's example uses - so
+    // asking it here made the whole branch inert and the raw path took over again.
+    AllocElemSize := TypeSizeBytes(LhsRecType);
+    if (UDTIdx >= 0) and (AllocElemSize > 0) then
+    begin
+      // The byte count is the argument fbc's realloc takes; the element count is it over the type's size.
+      ProcessExpression(ExprNode.GetChild(1).GetChild(1), BytesVal);
+      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
+      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, CountReg, ProdReg,
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
+      ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordReallocBlock, ExprValue,
+                      EnsureIntRegister(GetOrAllocateVariable(VarName)), EnsureIntRegister(CountReg),
+                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                                      or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
+                                      or ((Int64(UDTIdx) and $FFFF) shl 48)));
+      EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+      // Give the elements that are NEW their member-array / nested-UDT backing, as the first allocation
+      // did. EmitRecordBlockInit only fills what is still empty, so the kept ones are untouched.
+      EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx);
+      Exit;
+    end;
+  end;
   if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
   begin
     UDTIdx := FindUDT(LhsRecType);
@@ -26919,6 +26958,19 @@ var
       ProcessExpression(ArgNode.GetChild(0), Result);
       Exit;
     end;
+    // ⛔ An element of a MANAGED UDT BLOCK ("Clear p1[3], 0, n" after "p1 = CAllocate(3, SizeOf(T))").
+    // Its address is a record HANDLE, not a byte offset - and the two are indistinguishable by value
+    // here, because SHARED_REC_FLAG and RAWPTR_TAG are the same bit; only the SSA knows which it is,
+    // which is why the refusal has to be here and cannot be a check in the VM. Reading it as a byte
+    // offset walked into the heap's first bytes.
+    if (ArgNode.NodeType = antArrayAccess) and (ArgNode.ChildCount >= 1) and
+       (ArgNode.GetChild(0).NodeType = antIdentifier) and
+       (ArrayIndexOf(VarToStr(ArgNode.GetChild(0).Value)) < 0) and
+       (PointerUDTType(VarToStr(ArgNode.GetChild(0).Value)) <> '') then
+      raise Exception.CreateFmt(
+        '%s over "%s[i]" is refused: the elements are MANAGED records, not a byte image, and their ' +
+        'address is a record handle. Assign the fields, or construct the element ("p[i].Constructor()").',
+        [FuncU, UpperCase(VarToStr(ArgNode.GetChild(0).Value))]);
     // An ARRAY element, which is the manual's own idiom for clearing an array:
     //     Clear array(0), , 100 * SizeOf(Integer)
     // The address is an FArrays-backed pointer, and the VM's BlockAddr resolves it to the element

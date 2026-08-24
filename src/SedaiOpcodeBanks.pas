@@ -146,6 +146,7 @@ begin
     bcRecordFree,     // DELETE: Src1 = handle
     bcRecordNewArrayInd,  // array-of-UDT member alloc: Src1 = member array-handle reg (int)
     bcRecordNewBlock,     // Callocate block: Src1 = count reg (int)
+    bcRecordReallocBlock, // ...and its resize: Dest = new first handle, Src1 = old handle, Src2 = count reg
     // OS threading (M5.2): ThreadCreate Src1 = proc-addr reg; ThreadWait Src1 = handle reg.
     // (bcLoadProcAddr's Src1 is the entry-PC label → Immediate, not a register, so it is excluded.)
     bcThreadCreate, bcThreadWait, bcThreadDetach,
@@ -371,6 +372,11 @@ begin
     bcPrintUsingInt,  // PRINT USING (exact int): Src2 = int value (Src1 = format string)
     // === GROUP 6: File I/O ===
     bcWInputChars, bcInputChars,    // W/INPUT(n[,#f]): Src2 = file handle (int; 0 = keyboard)
+    // bcRecordReallocBlock's Src2 is the NEW ELEMENT COUNT, an int register. Src1 (the old handle)
+    // and Dest (the new one) are in their own lists; leaving Src2 out of THIS one let register
+    // compaction renumber around a register it did not know was live, and the resized block's
+    // handle was lost - only with the optimizer ON, so --no-opt answered correctly and hid it.
+    bcRecordReallocBlock,
     bcSeekSet,        // SEEK #n, pos: Src2 = position (int)
     bcDirSearch,      // DIR(spec, mask): Src2 = the attribute mask (int)
     bcScratch,        // SCRATCH "pattern", flags: Src2 = flags (int; bit0 silent, bit1 force)
@@ -526,7 +532,7 @@ begin
     // SUB/FUNCTION transfer-register load (M2): Dest is the int register written.
     bcXferLoadInt,
     // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
-    bcRecordNew, bcRecordNewBlock, bcRecordLoadInt,
+    bcRecordNew, bcRecordNewBlock, bcRecordReallocBlock, bcRecordLoadInt,
     // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).

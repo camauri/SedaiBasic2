@@ -203,7 +203,7 @@ begin
         if OpIn(Ins.OpCode, [ssaCall, ssaCallSub, ssaCallSubIndirect, ssaLoadProcAddr,
                              ssaOnError, ssaResume, ssaResumeNext, ssaResumeLabel, ssaTrap,
                              ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd,
-                             ssaRecordNewBlock, ssaArrayDim,
+                             ssaRecordNewBlock, ssaRecordReallocBlock, ssaArrayDim,
                              ssaArrayBind, ssaArrayBindInd, ssaArrayBindApply,
                              ssaArrayUnbind]) then begin Inc(ID_Call); RecordBlocker(Ins.OpCode); Exit; end;
         // V1 refused anything whose OPCODE NAME contained "Record" or "Ind", because UDT operator
@@ -408,8 +408,8 @@ procedure TSubInliner.ElideDeadRecMarks;
 // push/pops on every path (including EXIT unwinds), so removing all of them leaves the
 // mark stack at its entry depth throughout - outer scopes see nothing.
 const
-  ALLOC_OPS: array[0..6] of TSSAOpCode = (
-    ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock,
+  ALLOC_OPS: array[0..7] of TSSAOpCode = (
+    ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock, ssaRecordReallocBlock,
     ssaCall, ssaCallSub, ssaCallSubIndirect);
 var
   b, j, RegionStart: Integer;

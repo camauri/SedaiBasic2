@@ -295,7 +295,7 @@ begin
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferLoadString,
     // UDT/record heap ops (M3): allocation and field stores mutate heap state; field loads
     // are kept conservatively (cheap, and a record's handle must stay live).
-    ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock, ssaRecordFree,
+    ssaRecordNew, ssaRecordNewArray, ssaRecordNewArrayInd, ssaRecordNewBlock, ssaRecordReallocBlock, ssaRecordFree,
     ssaRecordStoreInt, ssaRecordStoreFloat, ssaRecordStoreString,
     // OOP: writing the runtime type-id mutates the object and DECIDES what a later virtual call
     // dispatches to. It has no Dest, so nothing consumes it - without this entry DCE deletes it

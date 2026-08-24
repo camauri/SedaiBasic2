@@ -85,6 +85,9 @@ type
 
   TRecordStorage = record
     TypeId: Integer;          // M4.3: runtime UDT type id (for virtual dispatch); -1 if untyped
+    BlockLen: Integer;        // records in the CONSECUTIVE block this one starts (1 for a lone record).
+                              //   Only the FIRST record of a block carries it, and only a block
+                              //   allocation sets it: it is what lets Reallocate know how much to keep.
     Bytes: array of Byte;     // the record's live C image: numeric fields at their true offsets
     StringData: array of string;
   end;

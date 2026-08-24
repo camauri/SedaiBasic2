@@ -3142,8 +3142,11 @@ Each of these is *refused with a message that names the reason*, never answered 
   (`As Short`, `As UByte`, …). An `Integer`/`LongInt`/`Double` array is a real contiguous byte image
   here and these ops work over it exactly as in fbc; a narrow element type is stored widened, so a
   byte count would cover a different number of elements. Loop over the elements instead.
-- **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
-  byte image — the elements are managed values.
+- **`Clear` / `FB_MEMCOPY` over a STRING array, through a record-field pointer, or over an element of a
+  MANAGED UDT block** (`Clear p[i], 0, n` after `p = CAllocate(n, SizeOf(T))`): none of them has a byte
+  image — the elements are managed records, and their address is a record handle. Assign the fields, or
+  construct the element with `p[i].Constructor()`.
+  ⚠️ `Reallocate` of such a block *is* supported and keeps what was there.
 - **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
   walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
   not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported
