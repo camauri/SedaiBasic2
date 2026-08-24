@@ -22631,9 +22631,12 @@ begin
     end;
     // ...and a NESTED named type declares one of its own. Without descending here the block was
     // registered nowhere and "m As U" found no type, so the member came out as a plain integer.
+    // ...and so does each extra alias of a COMMA LIST ("Type t As Integer, u As Double"): they are
+    // declarations in their own right, carried as children only because one statement produces one node.
     for i := 0 to Node.ChildCount - 1 do
       if (Node.GetChild(i).NodeType = antTypeDecl) and
-         (Node.GetChild(i).Attributes.Values['NESTEDTYPE'] = '1') then
+         ((Node.GetChild(i).Attributes.Values['NESTEDTYPE'] = '1') or
+          (Node.GetChild(i).Attributes.Values['ALIASLIST'] = '1')) then
         CollectUDTNames(Node.GetChild(i));
     Exit;
   end;

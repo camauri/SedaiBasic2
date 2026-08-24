@@ -3794,6 +3794,7 @@ var
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
+  AliasNode: TASTNode;   // "Type a As Integer, b As Double": the extra aliases of a comma list
   IsStaticField, LeadingType, FpIsFP: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
   ImplList: string;   // MODERN: the IMPLEMENTS list, recorded on the type node
@@ -3839,6 +3840,21 @@ begin
     Result.Value := UpperCase(Context.CurrentToken.Value);
     Context.Advance;
     Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    // "Type As Integer a, b": ONE type, several names. FreeBASIC's own test suite writes it, and the
+    // list simply ended the declaration here - the ',' was left where a statement was expected.
+    // The extra aliases ride as CHILD antTypeDecl nodes marked ALIASLIST, which CollectUDTNames
+    // descends into; they are declarations in their own right, not members of anything.
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                              // ','
+      if not Context.Check(ttIdentifier) then Break;
+      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperCase(Context.CurrentToken.Value),
+                                            Context.CurrentToken);
+      Context.Advance;
+      AliasNode.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+      AliasNode.Attributes.Values['ALIASLIST'] := '1';
+      Result.AddChild(AliasNode);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -3888,6 +3904,27 @@ begin
       end;
     end;
     Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    // "Type t As Integer, u As Double": several aliases on one line, each with its own type. Same
+    // shape as the leading-AS list above and the same carrier (a child marked ALIASLIST).
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                              // ','
+      if not Context.Check(ttIdentifier) then Break;
+      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperCase(Context.CurrentToken.Value),
+                                            Context.CurrentToken);
+      Context.Advance;                              // the alias name
+      if not Context.Check(ttAsType) then begin AliasNode.Free; Break; end;
+      Context.Advance;                              // AS
+      AliasType := ParseDottedName;
+      while AtPointerSuffix do
+      begin
+        AliasType := AliasType + ' PTR';
+        Context.Advance;
+      end;
+      AliasNode.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+      AliasNode.Attributes.Values['ALIASLIST'] := '1';
+      Result.AddChild(AliasNode);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
