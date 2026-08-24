@@ -26333,13 +26333,37 @@ var
   // (after the call q aliases p - verified), so a program written against us silently did
   // something else once ported.
   function ByRefAddr(ArgNode: TASTNode): TSSAValue;
-  var AddrNode: TASTNode;
+  var AddrNode: TASTNode; ElemName: string; WIdx: Integer;
   begin
     // `*p`: the address of the object pointed at IS the pointer. No @ to synthesize.
     if (ArgNode.NodeType = antDeref) and (ArgNode.ChildCount >= 1) then
     begin
       ProcessExpression(ArgNode.GetChild(0), Result);
       Exit;
+    end;
+    // An ARRAY element, which is the manual's own idiom for clearing an array:
+    //     Clear array(0), , 100 * SizeOf(Integer)
+    // The address is an FArrays-backed pointer, and the VM's BlockAddr resolves it to the element
+    // storage - an "array of Int64" / "array of Double", i.e. a real contiguous byte image, so the
+    // byte count means what fbc means it to mean.
+    // ⛔ ...but only while the elements are EIGHT bytes wide. A narrow element type ("As Short",
+    // "As UByte") is stored widened here, so "n * SizeOf(Short)" bytes would cover a different
+    // number of elements than in fbc and the program would get a different answer in silence.
+    // Refuse those by name: FArrayElemWidth holds an entry for exactly the narrowed arrays.
+    if (ArgNode.NodeType = antArrayAccess) and (ArgNode.ChildCount >= 1) and
+       (ArgNode.GetChild(0).NodeType = antIdentifier) then
+    begin
+      ElemName := UpperCase(VarToStr(ArgNode.GetChild(0).Value));
+      if ArrayIndexOf(ElemName) >= 0 then
+      begin
+        WIdx := FArrayElemWidth.IndexOf(ElemName);
+        if WIdx >= 0 then
+          raise Exception.CreateFmt(
+            '%s over the array "%s" is refused: its elements are declared NARROW, and this VM stores ' +
+            'them widened to 8 bytes - a byte count would cover a different number of elements than it ' +
+            'does in fbc. Loop over the elements, or declare the array As Integer/LongInt/Double.',
+            [FuncU, ElemName]);
+      end;
     end;
     // ⛔⛔ THE BARE POINTER: here fbc does something almost nobody wants, and SILENTLY.
     // `fb_memcopy(q, p, 4)` with q and p pointers becomes `memcpy(&q, &p, 4)`: it overwrites the
@@ -29684,6 +29708,21 @@ begin
   begin
     ProcessExpression(ArgList.GetChild(0), PtrVal);
     EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(PtrVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  // FreeBASIC's raw-memory block ops written as STATEMENTS, which is how the manual writes them:
+  //   Clear array(0), , 100 * SizeOf(Integer)
+  //   Clear p1[3], 0, 3 * SizeOf(Integer)
+  // The parenthesised spelling has been intercepted in the expression path for a long time; the bare
+  // statement had no intercept at all, so it was lowered as a call to an undefined PROC_CLEAR and the
+  // program died with "Undefined procedure: CLEAR". They are the same call - fbc declares Clear as a
+  // cdecl SUB, and both spellings reach it - so they must be intercepted in the same terms.
+  if FModernMode and Assigned(ArgList) and (ArgList.ChildCount >= 1) and
+     (ArrayIndexOf(VarToStr(Node.Value)) < 0) and
+     ((UpperCase(VarToStr(Node.Value)) = kFBMEMCOPY) or (UpperCase(VarToStr(Node.Value)) = kFBMEMMOVE) or
+      (UpperCase(VarToStr(Node.Value)) = kCLEAR) or (UpperCase(VarToStr(Node.Value)) = kFBMEMCOPYCLEAR)) then
+  begin
+    EmitRawMemOp(UpperCase(VarToStr(Node.Value)), ArgList, PtrVal);
     Exit;
   end;
   // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor on THIS.

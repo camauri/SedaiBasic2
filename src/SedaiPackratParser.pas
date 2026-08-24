@@ -2938,6 +2938,20 @@ begin
           Context.Check(ttSeparStmt) or Context.Check(ttDelimParClose)) then
   begin
     repeat
+      // An OMITTED argument, which is how FreeBASIC's own manual writes the default:
+      //     Clear array(0), , 100 * SizeOf(Integer)
+      // The parenthesised list (ParseExpressionList) has always stood an empty antLiteral in that
+      // position; this loop instead handed the comma itself to ParseExpression, whose prefix rule for a
+      // separator is a debug stub - so the argument list came out short and shifted, the byte count was
+      // read from the wrong place, and the program printed "[SSA] WARNING: Unhandled node type" on the
+      // way past. Same spelling, same node: the two paths must agree on what "nothing" is.
+      if Context.Check(ttSeparParam) then
+      begin
+        ArgList.AddChild(TASTNode.Create(antLiteral));
+        Context.Advance;                          // ,
+        if Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt) then Break;
+        Continue;
+      end;
       ArgExpr := FExpressionParser.ParseExpression;
       if not Assigned(ArgExpr) then Break;
       ArgList.AddChild(ArgExpr);
@@ -2969,6 +2983,15 @@ begin
   if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
   begin
     repeat
+      // An OMITTED argument - see the same handling in ParseCallStatement, and why the two spellings
+      // have to agree on what "nothing" is.
+      if Context.Check(ttSeparParam) then
+      begin
+        ArgList.AddChild(TASTNode.Create(antLiteral));
+        Context.Advance;                          // ,
+        if Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt) then Break;
+        Continue;
+      end;
       ArgExpr := FExpressionParser.ParseExpression;
       if not Assigned(ArgExpr) then Break;
       ArgList.AddChild(ArgExpr);
