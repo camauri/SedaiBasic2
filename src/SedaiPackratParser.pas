@@ -3821,6 +3821,11 @@ begin
   begin
     Context.Advance;                                // consume AS
     Result := TASTNode.CreateWithValue(antTypeDecl, '', Token);
+    // "Type As Const u Ptr t": the CONST qualifier belongs to the aliased type and is not part of its
+    // NAME - left in place it was read as the type itself ("Undefined procedure: PTR"). Skipped here
+    // as it is on a DIM, and for the same reason: this VM does not enforce const, but it must read
+    // the declaration the same way fbc does.
+    SkipTypeQualifiers;
     if Context.Check(ttProcedureStart) and TryParseProcPtrType(Result) then
       AliasType := 'INTEGER'
     else
@@ -3886,6 +3891,7 @@ begin
       Exit;
     end;
     AliasType := '';
+    SkipTypeQualifiers;                             // "Type t As Const Integer Ptr" - see the note above
     if Context.Check(ttIdentifier) or
        ((Length(Context.CurrentToken.Value) > 0) and
         (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
@@ -9667,6 +9673,7 @@ var
   Token, NameTok, TypeTok: TLexerToken;
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
   StaticTypeName, StaticFixedLen: string;
+  IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
 
   // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
   // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
@@ -9718,6 +9725,13 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume STATIC
+  // ⭐ "STATIC SHARED ...": at module level FreeBASIC lets the two modifiers stand together, and it is
+  // how a module variable is written when the source also wants to say "this storage persists". Both
+  // words then mean the same thing here - a module variable already persists - so the SHARED is
+  // consumed and the declaration goes on exactly as "STATIC ..." does. Left unread it was not an
+  // identifier, and the whole statement died with "Expected a variable name after STATIC".
+  IsShared := Context.Check(ttSharedDecl);
+  if IsShared then Context.Advance;                  // consume SHARED
   // FreeBASIC AS-first form: "STATIC AS type name1 [= init] [, name2 ...]" — the shared type precedes the
   // names (like "DIM AS type name"). Distinct from the "STATIC name AS type" form handled below.
   if Context.Check(ttAsType) then
@@ -9759,6 +9773,7 @@ begin
         end;
       end;
       DeclNode.Attributes.Values['STATIC'] := '1';
+      if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
       if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
       DoNodeCreated(DeclNode);
       Result.AddChild(DeclNode);
@@ -9822,6 +9837,7 @@ begin
       end;
     end;
     DeclNode.Attributes.Values['STATIC'] := '1';
+    if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
     if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
     DoNodeCreated(DeclNode);
     Result.AddChild(DeclNode);
