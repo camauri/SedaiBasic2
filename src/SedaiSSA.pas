@@ -948,9 +948,15 @@ type
     function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64): Boolean;
     function UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
     function TryEmitRawUDTMemberArray(MemberNode: TASTNode; Emit: Boolean; out ArrId: Integer): Boolean;
-    function EmitRawUDTFieldAddr(BaseNode, IdxNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
+    function EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
+    function RawChainElemType(Node: TASTNode): string;
+    function RawChainElemBytes(const ElemType: string): Int64;
+    function RawChainAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
+    function RawChainValue(Node: TASTNode; out Val: TSSAValue; out Pointee: string): Boolean;
+    function TryEmitRawChainRead(Node: TASTNode; out Value: TSSAValue): Boolean;
+    function TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
     function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
-      out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode: TASTNode): Boolean;
+      out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode, ChainNode: TASTNode): Boolean;
     function TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string; out Value: TSSAValue): Boolean;
     function TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string; ExprNode: TASTNode): Boolean;
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
@@ -5770,6 +5776,17 @@ begin
           Exit;
         end;
 
+        // "p[i][j]" - a raw pointer-to-pointer walked twice. Asked EARLY, like the cast above and for
+        // the same reason: every branch below keys off the NAME of a declared pointer, and the base of
+        // the second index is not a name but the pointer the FIRST index loaded. Without it the node
+        // fell through to a shape that answered the ELEMENT SIZE.
+        if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           TryEmitRawChainRead(Node, TempVal) then
+        begin
+          Result := TempVal;
+          Exit;
+        end;
+
         // ⛔ A SPECIAL VARIABLE WITH AN EMPTY ARGUMENT LIST IS THE VARIABLE ITSELF. "Err()" is the form
         // the FreeBASIC manual writes ("result = Err()") and it parsed as an indexed access into a name
         // no rule below recognises - so it fell through to the ordinary-variable path and read whatever
@@ -7148,6 +7165,14 @@ begin
     end;
     Exit;
   end;
+
+  // "p[i][j] = expr" - the write half of a raw pointer-to-pointer walked twice. Taken EARLY for the
+  // reason the read is: every lvalue shape below keys off a NAME, and the base of the second index is
+  // the pointer the first one loaded.
+  if (VarNode.NodeType = antArrayAccess) and (VarNode.ChildCount >= 1) and
+     (VarNode.GetChild(0) <> nil) and (VarNode.GetChild(0).NodeType = antArrayAccess) and
+     TryEmitRawChainStore(VarNode, ExprNode) then
+    Exit;
 
   { ⭐ "Err = n" - the SETTER the FreeBASIC manual defines as ERROR minus the raise: "Unlike Error,
     Err = number sets the error number WITHOUT invoking an error handler." It parsed as an ordinary
@@ -18438,7 +18463,13 @@ begin
      ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress) or
       ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
        (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-       (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) >= 0))) then
+       ((ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) >= 0) or
+        // ...and "Delete[] p[i]", a CELL of a pointer-to-pointer - the manual's own way of freeing the
+        // second dimension of a 2-dimensional object array (operator/nested_new). The base is a POINTER,
+        // not a declared array, so the array test alone sent it down the line-delete path and emitted
+        // bcDelete - the SAME classic opcode, the SAME silence with the optimizer on, one spelling later.
+        IsRawPtr(VarToStr(Node.GetChild(0).GetChild(0).Value)) or
+        (ManagedPtrPointee(VarToStr(Node.GetChild(0).GetChild(0).Value)) <> '')))) then
   begin
     EmitDeleteObject(Node);
     Exit;
@@ -19340,16 +19371,198 @@ begin
   end;
 end;
 
-function TSSAGenerator.EmitRawUDTFieldAddr(BaseNode, IdxNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
+function TSSAGenerator.RawChainElemType(Node: TASTNode): string;
+// The declared type of the element "<chain>[i]" names, WITHOUT emitting anything. RawChainAddr answers
+// the same question, but it emits while it does - and the field paths have to know what the element IS
+// before they decide whether they own the node at all.
+var
+  Nm, Inner: string;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.Attributes.Values['BRACKET'] <> '1' then Exit;
+  if Node.GetChild(0).NodeType = antIdentifier then
+  begin
+    Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+    if (ArrayIndexOf(Nm) >= 0) or (not IsRawPtr(Nm)) then Exit;
+    Result := UpperCase(PointeeTypeOf(Nm));
+  end
+  else if Node.GetChild(0).NodeType = antArrayAccess then
+  begin
+    Inner := RawChainElemType(Node.GetChild(0));
+    if (Length(Inner) < 4) or (Copy(Inner, Length(Inner) - 3, 4) <> ' PTR') then Exit;
+    Result := Trim(Copy(Inner, 1, Length(Inner) - 4));
+  end;
+end;
+
+function TSSAGenerator.RawChainElemBytes(const ElemType: string): Int64;
+// The STRIDE of "p[i]" for an element of the given type: a pointer element is 8 bytes, a UDT element is
+// its C layout, everything else is what the scalar ladder says. Kept apart from RawElemSizeOfPointee
+// because that one has no answer for a UDT - it falls off its ladder onto 8, which is the size of a
+// HANDLE and not the size of the record.
+var
+  U: Integer;
+  Offsets: TInt64Array;
+  Total: Int64;
+begin
+  if (Length(ElemType) >= 4) and (Copy(UpperCase(ElemType), Length(ElemType) - 3, 4) = ' PTR') then
+    Exit(8);
+  U := FindUDT(ElemType);
+  if (U >= 0) and UDTCLayoutRaw(U, Offsets, Total) and (Total > 0) then Exit(Total);
+  Result := RawElemSizeOfPointee(ElemType);
+end;
+
+function TSSAGenerator.RawChainAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
+// The BYTE ADDRESS of "<chain>[i]", where <chain> is a raw pointer name or another such indexing, and
+// the TYPE of the element that address names. This is what makes "p[i][j]" work: the manual builds a
+// 2-dimensional object array as a "T Ptr Ptr" - "New T Ptr [n]" for the first dimension, "New T [m]"
+// stored into each cell for the second - and the second index has to start from the pointer the FIRST
+// one loaded, not from a name. Only the SQUARE-bracket spelling qualifies, as everywhere else here.
+var
+  Nm: string;
+  BasePointee: string;
+  IdxNode: TASTNode;
+  BaseVal, IdxVal, SizeVal, ProdVal, Sum: TSSAValue;
+  Stride: Int64;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  ElemType := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.Attributes.Values['BRACKET'] <> '1' then Exit;
+  IdxNode := Node.GetChild(1);
+  if (IdxNode <> nil) and (IdxNode.NodeType in [antArgumentList, antExpressionList]) then
+  begin
+    if IdxNode.ChildCount <> 1 then Exit;    // "p[i, j]" is not an element of a block
+    IdxNode := IdxNode.GetChild(0);
+  end;
+  if IdxNode = nil then Exit;
+  if Node.GetChild(0).NodeType = antIdentifier then
+  begin
+    Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+    if (ArrayIndexOf(Nm) >= 0) or (not IsRawPtr(Nm)) then Exit;
+    BasePointee := UpperCase(PointeeTypeOf(Nm));
+    if BasePointee = '' then Exit;
+    ProcessExpression(Node.GetChild(0), BaseVal);
+  end
+  else if Node.GetChild(0).NodeType = antArrayAccess then
+  begin
+    if not RawChainValue(Node.GetChild(0), BaseVal, BasePointee) then Exit;
+  end
+  else
+    Exit;
+  Stride := RawChainElemBytes(BasePointee);
+  if Stride <= 0 then Exit;
+  Addr := EnsureIntRegister(BaseVal);
+  ProcessExpression(IdxNode, IdxVal);
+  // ⚠️ ssaMulInt / ssaAddInt take REGISTERS: a constant operand lowers to register 0 and contributes
+  // whatever lives there. Materialize the stride.
+  SizeVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, SizeVal, MakeSSAConstInt(Stride), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  ProdVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, ProdVal, EnsureIntRegister(IdxVal), SizeVal, MakeSSAValue(svkNone));
+  Sum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Sum, Addr, ProdVal, MakeSSAValue(svkNone));
+  Addr := Sum;
+  ElemType := BasePointee;
+  Result := True;
+end;
+
+function TSSAGenerator.RawChainValue(Node: TASTNode; out Val: TSSAValue; out Pointee: string): Boolean;
+// The POINTER stored in "<chain>[i]", and what it points at. Only a pointer element can carry the chain
+// on, so a non-pointer element declines here rather than loading eight bytes of something else.
+var
+  Addr: TSSAValue;
+  ElemType: string;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  Pointee := '';
+  if not RawChainAddr(Node, Addr, ElemType) then Exit;
+  if (Length(ElemType) < 4) or (Copy(ElemType, Length(ElemType) - 3, 4) <> ' PTR') then Exit;
+  Val := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRawLoadInt, Val, Addr, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+  Pointee := Trim(Copy(ElemType, 1, Length(ElemType) - 4));
+  Result := Pointee <> '';
+end;
+
+function TSSAGenerator.TryEmitRawChainRead(Node: TASTNode; out Value: TSSAValue): Boolean;
+// "p[i][j]" read, for a scalar element. The one-index case still belongs to the existing name-based
+// path; this only claims a chain whose base is ANOTHER indexing, which nothing else knew how to read.
+var
+  Addr: TSSAValue;
+  ElemType: string;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if (Node = nil) or (Node.ChildCount < 1) or (Node.GetChild(0) = nil) or
+     (Node.GetChild(0).NodeType <> antArrayAccess) then Exit;
+  if not RawChainAddr(Node, Addr, ElemType) then Exit;
+  if FindUDT(ElemType) >= 0 then Exit;      // a record element is an address, not a scalar load
+  if RawTypeCodeOfPointee(ElemType) in [RTC_SINGLE, RTC_DOUBLE] then
+  begin
+    Value := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaRawLoadFloat, Value, Addr, MakeSSAValue(svkNone),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  end
+  else
+  begin
+    Value := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Value, Addr, MakeSSAValue(svkNone),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
+// "p[i][j] = expr", the write half of the above.
+var
+  Addr, ExprVal: TSSAValue;
+  ElemType: string;
+begin
+  Result := False;
+  if (Node = nil) or (Node.ChildCount < 1) or (Node.GetChild(0) = nil) or
+     (Node.GetChild(0).NodeType <> antArrayAccess) then Exit;
+  if not RawChainAddr(Node, Addr, ElemType) then Exit;
+  if FindUDT(ElemType) >= 0 then Exit;
+  if RawTypeCodeOfPointee(ElemType) in [RTC_SINGLE, RTC_DOUBLE] then
+  begin
+    ProcessExpression(ExprNode, ExprVal);
+    EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Addr, EnsureFloatRegister(ExprVal),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  end
+  else
+  begin
+    ProcessExpression(ExprNode, ExprVal);
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Addr, EnsureIntRegister(ExprVal),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
 // The byte address of "base[idx].field" (idx absent for the plain "base->field"): base + idx*ElemSize +
 // FieldOfs, all in one place so the load and the store halves cannot drift apart on it.
 // ⚠️ ssaAddInt / ssaMulInt take REGISTERS: a constant operand lowers to register 0, which silently
 // contributes whatever happens to live there instead of the offset.
+// ChainNode is the "p[i][j]" spelling: there the element's address is what RawChainAddr already built -
+// stride included - so only the field's own offset is left to add.
 var
   BaseVal, IdxVal, SizeVal, ProdVal, OffVal, Sum: TSSAValue;
+  ChainType: string;
 begin
-  ProcessExpression(BaseNode, BaseVal);
-  Result := EnsureIntRegister(BaseVal);
+  if ChainNode <> nil then
+  begin
+    if not RawChainAddr(ChainNode, BaseVal, ChainType) then
+      raise Exception.Create('the element address of "p[i][j]" could not be built');
+    Result := EnsureIntRegister(BaseVal);
+    IdxNode := nil;
+  end
+  else
+  begin
+    ProcessExpression(BaseNode, BaseVal);
+    Result := EnsureIntRegister(BaseVal);
+  end;
   if IdxNode <> nil then
   begin
     ProcessExpression(IdxNode, IdxVal);
@@ -19374,7 +19587,7 @@ begin
 end;
 
 function TSSAGenerator.ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
-  out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode: TASTNode): Boolean;
+  out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode, ChainNode: TASTNode): Boolean;
 // The object half of "h->field" / "h[i].field" where h is a "T PTR" holding a RAW ADDRESS: answer the
 // pointee type, its C layout, the node that evaluates to the base address, and the index expression if
 // the program wrote one. Emits NOTHING - the two callers do, and they must not each grow their own copy
@@ -19386,8 +19599,23 @@ function TSSAGenerator.ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string
 // Only the SQUARE-bracket spelling qualifies: "p(i)" on a pointer is not FreeBASIC's element access.
 begin
   Result := False;
-  TypeName := ''; UDTIdx := -1; TotalSize := 0; BaseNode := nil; IdxNode := nil;
+  TypeName := ''; UDTIdx := -1; TotalSize := 0; BaseNode := nil; IdxNode := nil; ChainNode := nil;
   if ObjNode = nil then Exit;
+  // "p[i][j].field": the base of the LAST index is the pointer the first one loaded, not a name, so the
+  // shape below - which reads a name out of child0 - cannot see it. Hand the whole indexing over as a
+  // chain and let EmitRawUDTFieldAddr build the element address from it.
+  if (ObjNode.NodeType = antArrayAccess) and (ObjNode.ChildCount >= 2) and
+     (ObjNode.GetChild(0) <> nil) and (ObjNode.GetChild(0).NodeType = antArrayAccess) then
+  begin
+    TypeName := RawChainElemType(ObjNode);
+    if TypeName = '' then Exit;
+    UDTIdx := FindUDT(TypeName);
+    if UDTIdx < 0 then Exit;
+    if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+    if TotalSize <= 0 then Exit;
+    ChainNode := ObjNode;
+    Exit(True);
+  end;
   if ObjNode.NodeType = antIdentifier then
     BaseNode := ObjNode
   else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
@@ -19429,19 +19657,19 @@ var
   Offsets: TInt64Array;
   TotalSize, Sz, Al: Int64;
   AddrVal: TSSAValue;
-  BaseNode, IdxNode: TASTNode;
+  BaseNode, IdxNode, ChainNode: TASTNode;
   F: TUDTField;
 begin
   Result := False;
   Value := MakeSSAValue(svkNone);
-  if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode) then Exit;
+  if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode, ChainNode) then Exit;
   FieldIdx := -1;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(FieldName) then begin FieldIdx := i; Break; end;
   if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not loaded
 
-  AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, TotalSize, Offsets[FieldIdx]);
+  AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FieldIdx]);
 
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
@@ -19494,11 +19722,11 @@ var
   Offsets: TInt64Array;
   TotalSize, Sz, Al: Int64;
   AddrVal, ExprVal: TSSAValue;
-  BaseNode, IdxNode: TASTNode;
+  BaseNode, IdxNode, ChainNode: TASTNode;
   F: TUDTField;
 begin
   Result := False;
-  if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode) then Exit;
+  if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode, ChainNode) then Exit;
   FieldIdx := -1;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(FieldName) then begin FieldIdx := i; Break; end;
@@ -19506,7 +19734,7 @@ begin
   if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not stored
   if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0 then Exit;  // a bit field is a read-modify-write: leave it
 
-  AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, TotalSize, Offsets[FieldIdx]);
+  AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FieldIdx]);
 
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
@@ -27141,6 +27369,20 @@ var
 
   // Mark TargetU raw if its initializer/RHS is a raw source: ALLOCATE/CALLOCATE/REALLOCATE, a pointer
   // CAST/CPTR of a raw value, another raw pointer, or SADD/STRPTR of a string (byte-heap pointer).
+  function IsRawPtrCellExpr(Rhs: TASTNode): Boolean;
+  // "q = p[i]" where p is a raw POINTER TO A POINTER: the cell holds a pointer, and it is exactly as
+  // raw as p is. Without this the target kept the managed reading and "q[j].field" indexed the record
+  // table with a byte address - the same unchecked wild read the New[] case used to take, because
+  // SHARED_REC_FLAG and RAWPTR_TAG are the same bit.
+  var
+    ET: string;
+  begin
+    Result := False;
+    if (Rhs = nil) or (Rhs.NodeType <> antArrayAccess) then Exit;
+    ET := RawChainElemType(Rhs);
+    Result := (Length(ET) >= 4) and (Copy(ET, Length(ET) - 3, 4) = ' PTR');
+  end;
+
   procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
   var
     FU, TU: string;
@@ -27164,7 +27406,7 @@ var
       // New T[4]" allocated the bytes, then read "p[0].v" through the managed record path and faulted
       // on the first store. "New Integer[n]" was fine throughout - a scalar pointee never enters this
       // branch - which is why the form looked implemented.
-      if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or
+      if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1')) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
           FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
@@ -27192,6 +27434,8 @@ var
       MarkRaw(TargetU)   // p = @x where x is a raw-backed @-taken scalar: a real byte pointer
     else if RawPtrExprName(Rhs) <> '' then
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
+    else if IsRawPtrCellExpr(Rhs) then
+      MarkRaw(TargetU)   // p = q[i] where q is a raw pointer-to-pointer: the cell holds a raw pointer
     else if ((Rhs.NodeType = antArrayAccess) or (Rhs.NodeType = antFunctionCall)) and
             (Rhs.ChildCount >= 1) and (Rhs.GetChild(0).NodeType = antIdentifier) and
             (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) and
