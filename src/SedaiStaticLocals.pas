@@ -53,15 +53,33 @@ begin
   end;
   if (Node.NodeType = antIdentifier) and (UpperCase(VarToStr(Node.Value)) = FromU) then
     Node.Value := ToName;
+  // ⭐ "@z" DOES NOT HOLD AN IDENTIFIER. The parser keeps the historical shape for the bare form -
+  // an antProcAddress whose VALUE is the name and which has no children - so walking only
+  // antIdentifier left it naming a variable this pass had just renamed away, and the SSA failed with
+  // "Undefined procedure (address-of @): Z". Every other spelling was renamed and worked, which is
+  // why it read as a defect of STATIC rather than of the rename: "@z(i)" and "@z.f" keep their
+  // operand as a CHILD identifier and were reached; only the one-node form was not.
+  // (The form WITH children is left to the recursion below, which renames the child.)
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) and
+     (UpperCase(VarToStr(Node.Value)) = FromU) then
+    Node.Value := ToName;
   for i := 0 to Node.ChildCount - 1 do
     RenameRefs(Node.GetChild(i), FromU, ToName);
 end;
 
 // Build the hoisted "DIM SHARED <mangled> AS <typeName> [= initClone]" node for one static.
-function BuildSharedDecl(const Mangled, TypeName: string; InitClone: TASTNode;
+// Src is the ORIGINAL declaration, and it is here for its ATTRIBUTES: this path REBUILDS the node
+// (unlike the array path, which clones) so it can move only a constant initializer, and rebuilding
+// dropped everything the parser had stamped on the declaration. FIXEDLEN is the one that showed:
+// "Static As ZString * 32 z" hoisted to a plain variable-length global, so "@z" handed back a managed
+// string reference where a raw buffer address was expected and the deref failed. The attributes
+// describe the TYPE, not the storage class, so they belong on the hoisted declaration - only STATIC
+// itself is replaced by SHARED.
+function BuildSharedDecl(Src: TASTNode; const Mangled, TypeName: string; InitClone: TASTNode;
                         const Tok: TLexerToken): TASTNode;
 var
   DimNode, DeclNode: TASTNode;
+  a: Integer;
 begin
   DimNode := TASTNode.Create(antDim, Tok);
   DeclNode := TASTNode.Create(antArrayDecl, Tok);
@@ -69,6 +87,10 @@ begin
   DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, Tok));  // child1 = type
   if InitClone <> nil then
     DeclNode.AddChild(InitClone);                                            // child2 = initializer
+  if Src <> nil then
+    for a := 0 to Src.Attributes.Count - 1 do
+      DeclNode.Attributes.Values[Src.Attributes.Names[a]] := Src.Attributes.ValueFromIndex[a];
+  DeclNode.Attributes.Values['STATIC'] := '0';
   DeclNode.Attributes.Values['SHARED'] := '1';   // module global, persistent, visible inside procedures
   DimNode.AddChild(DeclNode);
   Result := DimNode;
@@ -269,7 +291,7 @@ begin
           FlagName := Mangled + '.UNSIZED';
           InitOne := TASTNode.CreateWithValue(antLiteral, 1, NameNode.Token);
           Hoisted.Add(BuildSharedVarlenDecl(Mangled, TName, NameNode.Token));
-          Hoisted.Add(BuildSharedDecl(FlagName, 'INTEGER', InitOne, NameNode.Token));
+          Hoisted.Add(BuildSharedDecl(nil, FlagName, 'INTEGER', InitOne, NameNode.Token));
           SlotIdx := GrandNode.Children.IndexOf(DimNode);
           if SlotIdx < 0 then SlotIdx := GrandNode.ChildCount - 1;
           GrandNode.Children.Insert(SlotIdx + 1,
@@ -285,7 +307,7 @@ begin
           InitClone := Decl.GetChild(2).Clone
         else
           InitClone := nil;
-        Hoisted.Add(BuildSharedDecl(Mangled, TName, InitClone, NameNode.Token));
+        Hoisted.Add(BuildSharedDecl(Decl, Mangled, TName, InitClone, NameNode.Token));
       end;
       // Rename references to the static in the procedure body, then drop the declaration. An antDim
       // left empty afterwards is harmless (ProcessDim exits early when it has no children).
