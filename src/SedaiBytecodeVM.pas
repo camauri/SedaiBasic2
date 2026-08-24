@@ -940,6 +940,7 @@ var
   GHotCBudgetExits: Int64 = 0;  // ...of which returned because the BACK-EDGE BUDGET ran out, which
                                 // is NOT an uncovered opcode and must not be ranked as one
   GPairDiag: Boolean = False;       // PAIR_DIAG=1: census of the adjacent opcode pairs executed
+  GPairDiagTop: Integer = 20;       // how many to print: 0 = all (PAIR_DIAG=all), else the number
   // ⛔ NOT the raw opcode as an index. A 16-bit opcode would need a 65536x65536 table, and masking
   // it down to 12 bits - which is what the first version of this did - both mislabels the entries
   // (0xC8xx superinstructions come out as group 8/9 "Web_nn") and COLLIDES two real opcodes into
@@ -1312,8 +1313,9 @@ end;
 {$ENDIF}
 
 constructor TBytecodeVM.Create;
-{$IFDEF WITH_SEDAI_AUDIO}
 var
+  PairDiagEnv: string;
+{$IFDEF WITH_SEDAI_AUDIO}
   i: Integer;
 {$ENDIF}
 begin
@@ -1377,7 +1379,15 @@ begin
   GArrPrivDiag := GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
   GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
   GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
-  GPairDiag := GetEnvironmentVariable('PAIR_DIAG') = '1';
+  // PAIR_DIAG=1 (the old spelling, top 20) | PAIR_DIAG=all | PAIR_DIAG=<n>
+  PairDiagEnv := LowerCase(Trim(GetEnvironmentVariable('PAIR_DIAG')));
+  GPairDiag := (PairDiagEnv <> '') and (PairDiagEnv <> '0');
+  if PairDiagEnv = 'all' then GPairDiagTop := 0
+  else if (PairDiagEnv <> '') and (PairDiagEnv <> '1') then
+  begin
+    GPairDiagTop := StrToIntDef(PairDiagEnv, 20);
+    if GPairDiagTop < 0 then GPairDiagTop := 20;
+  end;
   GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
@@ -17404,10 +17414,17 @@ begin
         tw := KA[i]; KA[i] := KA[j]; KA[j] := tw;
         tw := KB[i]; KB[i] := KB[j]; KB[j] := tw;
       end;
-  WriteLn(ErrOutput, '[PAIR] coppie adiacenti eseguite (totale ', Tot, '), le prime 20:');
+  // ⛔ THE CUT-OFF USED TO BE 20, HARD-CODED, and a census that shows only its own top 20 cannot
+  // answer "was this opcode executed at all?" - which is the question the rare ones are asked. The
+  // rare pairs are exactly the ones a coverage check needs. PAIR_DIAG=1 keeps the old 20;
+  // PAIR_DIAG=<n> shows n; PAIR_DIAG=all shows every pair.
+  if GPairDiagTop <= 0 then
+    WriteLn(ErrOutput, '[PAIR] coppie adiacenti eseguite (totale ', Tot, '), tutte:')
+  else
+    WriteLn(ErrOutput, '[PAIR] coppie adiacenti eseguite (totale ', Tot, '), le prime ', GPairDiagTop, ':');
   for i := 0 to High(KA) do
   begin
-    if i >= 20 then Break;
+    if (GPairDiagTop > 0) and (i >= GPairDiagTop) then Break;
     WriteLn(ErrOutput, '[PAIR]   ', KC[i]:12, '  ', OpcodeToString(SlotOpcode(KA[i])), ' -> ', OpcodeToString(SlotOpcode(KB[i])));
   end;
 end;
