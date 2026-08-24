@@ -1983,7 +1983,7 @@ function TExpressionParser.ParseNew(Token: TLexerToken): TASTNode;
 // name, then an optional parenthesised constructor argument list. Lowers to antNew(value = type name,
 // child0 = antArgumentList of ctor args when present). SSA allocates a heap record and runs its ctor.
 var
-  ArgList, PlaceExpr: TASTNode;
+  ArgList, PlaceExpr, PlaceExpr2: TASTNode;
 begin
   // FreeBASIC "placement new": "New (addr) T(args)" constructs at an address the caller already owns.
   // Read and keep the address expression; the type name follows it.
@@ -2004,6 +2004,36 @@ begin
     HandleError('Expected a TYPE name after NEW', Context.CurrentToken);
     if Assigned(PlaceExpr) then PlaceExpr.Free;
     Result := nil;
+    Exit;
+  end;
+  // "New TypeOf(expr)": the type is ASKED, not written - the manual's own typeofDerefPtr() macro ends
+  // in exactly this. Keep the operand as a child and let the SSA answer it from the DECLARATION, the
+  // same way Cast(TypeOf(...)) does; without it the type name came out as the literal "TYPEOF" and
+  // NEW refused it as an unknown type.
+  if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                          // TypeOf
+    Context.Advance;                          // (
+    PlaceExpr2 := ParseExpression(precNone);
+    if not Assigned(PlaceExpr2) or not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected "TypeOf(expression)" after NEW', Context.CurrentToken);
+      if Assigned(PlaceExpr2) then PlaceExpr2.Free;
+      if Assigned(PlaceExpr) then PlaceExpr.Free;
+      Result := nil; Exit;
+    end;
+    Result := TASTNode.CreateWithValue(antNew, 'TYPEOF', Token);
+    Result.Attributes.Values['TYPEOFEXPR'] := '1';
+    Result.Attributes.Values['TYPEOFHELD'] := '1';   // the operand is the LAST child; see EmitNewObject
+    if Assigned(PlaceExpr) then
+    begin
+      Result.Attributes.Values['PLACEMENT'] := '1';
+      Result.AddChild(PlaceExpr);
+      PlaceExpr := nil;
+    end;
+    Result.AddChild(PlaceExpr2);
+    DoNodeCreated(Result);
     Exit;
   end;
   Result := TASTNode.CreateWithValue(antNew, UpperCase(Context.CurrentToken.Value), Token);
@@ -2247,11 +2277,41 @@ function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
 // value expression. Lowers to antCast(value = upper-case type string, child0 = value expr).
 var
   TypeStr: string;
-  ValExpr: TASTNode;
+  ValExpr, TypeOfExpr: TASTNode;
 begin
   Context.Advance;   // consume '('
   TypeStr := '';
-  while (not Context.IsAtEnd) and (not Context.Check(ttSeparParam)) and (not Context.Check(ttDelimParClose)) do
+  TypeOfExpr := nil;
+  // "Cast(TypeOf(expr), v)" / "CPtr(TypeOf(expr) Ptr, v)": the type is not written, it is ASKED. The
+  // loop below reads the type as a run of tokens up to the ',', and TypeOf's own parentheses ended it
+  // early - the ')' of "TypeOf(pd)" looked like the end of the CAST, so the comma was never found and
+  // the whole expression failed with "Expected ',' after the type in CAST/CPTR".
+  // The operand is kept as a CHILD and resolved in the SSA, which is the only place that knows what a
+  // name was DECLARED as.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                          // TypeOf
+    Context.Advance;                          // (
+    TypeOfExpr := ParseExpression(precNone);
+    if not Assigned(TypeOfExpr) then
+    begin
+      HandleError('Expected an expression inside TypeOf(...)', Context.CurrentToken);
+      Exit(nil);
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after TypeOf(...)', Context.CurrentToken);
+      TypeOfExpr.Free;
+      Exit(nil);
+    end;
+    TypeStr := 'TYPEOF';
+    // "TypeOf(x) Ptr" adds a level of indirection to whatever x was declared as.
+    while AtPointerSuffix do
+    begin TypeStr := TypeStr + ' ' + kPTR; Context.Advance; end;
+  end;
+  while (TypeOfExpr = nil) and
+        (not Context.IsAtEnd) and (not Context.Check(ttSeparParam)) and (not Context.Check(ttDelimParClose)) do
   begin
     if Context.Check(ttOpDot) then TypeStr := TypeStr + '.'
     else
@@ -2285,6 +2345,11 @@ begin
   end;
   Result := TASTNode.CreateWithValue(antCast, Trim(TypeStr), Token);
   Result.AddChild(ValExpr);
+  if Assigned(TypeOfExpr) then
+  begin
+    Result.Attributes.Values['TYPEOFEXPR'] := '1';
+    Result.AddChild(TypeOfExpr);       // child1 = the operand of TypeOf, resolved in the SSA
+  end;
   DoNodeCreated(Result);
 end;
 

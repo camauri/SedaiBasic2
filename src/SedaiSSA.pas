@@ -516,6 +516,8 @@ type
     function ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;  // a DIFFERENT-bank pointer takes @scalar
     procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
+    function IsBuiltinNewType(NewNode: TASTNode): Boolean;  // "New <builtin>" -> a RAW pointer
+    function DeclaredTypeNameOf(Node: TASTNode): string;   // the DECLARED type of an expression, or ''
     function ManagedPtrPointee(const Name: string): string;                     // pointee type of a managed pointer (per-proc param or DIM'd), else ''
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
@@ -2092,6 +2094,25 @@ begin
 
     antCast:
     begin
+      // "Cast(TypeOf(x), v)": the type was ASKED, not written. Answer it from x's DECLARATION and put
+      // the answer where the type string goes, so everything below is the ordinary cast it already is.
+      // Done ONCE, in place: the node is visited again by the optimizer passes and re-deriving the type
+      // each time would make the answer depend on when it was asked.
+      if (Node.Attributes.Values['TYPEOFEXPR'] = '1') and (Node.ChildCount >= 2) then
+      begin
+        TempStr := DeclaredTypeNameOf(Node.GetChild(1));
+        if TempStr = '' then
+          raise Exception.Create(
+            'Cast(TypeOf(expr), ...): the type of that expression is not known here. TypeOf answers ' +
+            'for a name this compiler recorded a declaration for (a UDT, a pointer, a narrow scalar) ' +
+            'and for "*p"; write the type out instead.');
+        // "TypeOf(x) Ptr" keeps whatever levels of indirection were written after it.
+        ArrName2 := UpperCase(VarToStr(Node.Value));
+        if Copy(ArrName2, 1, 6) = 'TYPEOF' then
+          TempStr := TempStr + Copy(ArrName2, 7, MaxInt);
+        Node.Value := TempStr;
+        Node.Attributes.Values['TYPEOFEXPR'] := '0';
+      end;
       // FreeBASIC CAST/CPTR(type, expr). A pointer target type is a value passthrough (the raw byte
       // offset / managed handle is reinterpreted, not changed — the receiving variable's declared type
       // drives the deref). A scalar target type converts the value to that bank.
@@ -5923,6 +5944,25 @@ begin
         // (identifier); a pointer variable argument resolves to pointer size (8). Used for "Allocate(n *
         // SizeOf(Integer))". A POINTER TYPE argument arrives as the single identifier "T PTR" (the parser
         // folds the juxtaposition, as it does for a DIM) and is likewise 8 bytes.
+        // "SizeOf(*Cast(T Ptr, 0))" - FreeBASIC's idiom for "the size of the POINTEE type", and the
+        // whole point of casting a null pointer: nothing is dereferenced, the expression exists only to
+        // name a type. It is what the manual's own sizeofDerefPtr() macro is built on. The intercept
+        // below reads a NAME or a field; this reads the DECLARED type of the expression and asks its
+        // size, which is the same question one level up.
+        if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+           (Node.GetChild(1).ChildCount = 1) and
+           (Node.GetChild(1).GetChild(0).NodeType in [antDeref, antCast]) then
+        begin
+          TempStr := DeclaredTypeNameOf(Node.GetChild(1).GetChild(0));
+          if TempStr <> '' then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
+        end;
         if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
            (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess]) then
@@ -26143,6 +26183,89 @@ begin
     if Proc.GetChild(i).NodeType <> antProcedureDecl then Walk(Proc.GetChild(i));
 end;
 
+function TSSAGenerator.IsBuiltinNewType(NewNode: TASTNode): Boolean;
+// Does this "New <type>" allocate a BUILTIN scalar rather than a UDT? Such a pointer is RAW - a scalar
+// has no record to be a handle to - and the pre-scan has to know it, or "*p = 3.14" writes through the
+// managed path into nothing. ⚠️ It runs BEFORE the TypeOf form is resolved, so it answers for that one
+// by asking the operand, exactly as EmitNewObject will.
+var
+  T: string;
+begin
+  Result := False;
+  if (NewNode = nil) or (NewNode.NodeType <> antNew) then Exit;
+  if NewNode.Attributes.Values['TYPEOFHELD'] = '1' then
+  begin
+    if NewNode.ChildCount < 1 then Exit;
+    T := DeclaredTypeNameOf(NewNode.GetChild(NewNode.ChildCount - 1));
+  end
+  else
+    T := UpperCase(VarToStr(NewNode.Value));
+  Result := (T <> '') and (FindUDT(T) < 0) and (TypeSizeBytes(T) > 0);
+end;
+
+function TSSAGenerator.DeclaredTypeNameOf(Node: TASTNode): string;
+// The type a name was DECLARED as, spelled the way the rest of the pipeline spells one ("DOUBLE PTR",
+// "MYUDT", "SHORT"). This is what "TypeOf(x)" asks, and asking the BANK instead - three answers for ten
+// types - is the approximation that made "Cast(TypeOf(pd), 0)" unusable: a Double Ptr and an Integer are
+// the same bank and not the same type.
+//
+// It is not a static type system and does not pretend to be one: it answers for a NAME whose declaration
+// this generator recorded (a UDT, a pointer, a narrow scalar), for "*p" (one level of indirection off),
+// and for a CAST (which says its own type). Anything else answers '' and the caller falls back to the
+// bank, exactly as before.
+var
+  NameU, T: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  if Node.NodeType = antParentheses then
+    Exit(DeclaredTypeNameOf(Node.GetChild(0)));
+  if Node.NodeType = antCast then
+  begin
+    // An UNRESOLVED "Cast(TypeOf(x), ...)": the type is still the marker, so ask x. This is reached
+    // before the cast is lowered - "SizeOf(*Cast(TypeOf(p), 0))" never evaluates the cast at all - so
+    // the answer cannot be left to the lowering.
+    if (Node.Attributes.Values['TYPEOFEXPR'] = '1') and (Node.ChildCount >= 2) then
+    begin
+      Result := DeclaredTypeNameOf(Node.GetChild(1));
+      if Result = '' then Exit;
+      T := UpperCase(VarToStr(Node.Value));
+      if Copy(T, 1, 6) = 'TYPEOF' then Result := Result + Copy(T, 7, MaxInt);
+      Exit;
+    end;
+    Exit(UpperCase(VarToStr(Node.Value)));
+  end;
+  if Node.NodeType = antDeref then
+  begin
+    // "*p" is p's type with one " PTR" taken off.
+    T := DeclaredTypeNameOf(Node.GetChild(0));
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
+    Exit;
+  end;
+  if Node.NodeType <> antIdentifier then Exit;
+  NameU := UpperCase(VarToStr(Node.Value));
+  Result := VarRecordTypeName(NameU);                       // a UDT instance
+  if Result <> '' then Exit;
+  T := ManagedPtrPointee(NameU);                            // a declared "T PTR"
+  if T <> '' then Exit(T + ' PTR');
+  T := RawUDTPtrType(NameU);                                // ...laid over raw memory
+  if T <> '' then Exit(T + ' PTR');
+  case Declared32Code(Node) of                              // a NARROW scalar keeps its own name
+    1: Result := 'BYTE';   2: Result := 'UBYTE';
+    3: Result := 'SHORT';  4: Result := 'USHORT';
+    5: Result := 'LONG';   6: Result := 'ULONG';
+    7: Result := 'SINGLE';
+  end;
+  if Result <> '' then Exit;
+  if FVarExplicitType.IndexOf(NameU) >= 0 then
+    case TSSARegisterType(PtrInt(FVarExplicitType.Objects[FVarExplicitType.IndexOf(NameU)])) of
+      srtString: Result := 'STRING';
+      srtFloat:  Result := 'DOUBLE';
+      srtInt:    Result := 'INTEGER';
+    end;
+end;
+
 function TSSAGenerator.ManagedPtrPointee(const Name: string): string;
 // The pointee type name of a managed pointer: a "param AS T PTR" of the proc being lowered (per-proc,
 // checked first so it wins over a same-named global) or a DIM'd/global "T PTR" (FPointerVars). '' if
@@ -26795,8 +26918,9 @@ var
           FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
       Exit;
     end;
-    if (Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') then
-      MarkRaw(TargetU)   // p = New T[n]: a byte block, indexed and freed raw
+    if (Rhs.NodeType = antNew) and
+       ((Rhs.Attributes.Values['NEWARRAY'] = '1') or IsBuiltinNewType(Rhs)) then
+      MarkRaw(TargetU)   // p = New T[n] / New <builtin>: a byte block, indexed and freed raw
     else if IsAllocCall(Rhs, FU) then
       MarkRaw(TargetU)
     else if IsScreenPtrExpr(Rhs) then
@@ -27681,6 +27805,20 @@ var
   CountVal, ElemVal, BytesVal: TSSAValue;
 begin
   NewType := UpperCase(VarToStr(Node.Value));
+  // "New TypeOf(expr)": the operand is the LAST child (after the placement address, if any) and the
+  // type is whatever that expression was DECLARED as. Resolved once, in place.
+  if (Node.Attributes.Values['TYPEOFHELD'] = '1') and (Node.ChildCount >= 1) then
+  begin
+    NewType := DeclaredTypeNameOf(Node.GetChild(Node.ChildCount - 1));
+    if NewType = '' then
+      raise Exception.Create(
+        'New TypeOf(expr): the type of that expression is not known here. TypeOf answers for a name ' +
+        'this compiler recorded a declaration for (a UDT, a pointer, a narrow scalar) and for "*p"; ' +
+        'write the type out instead.');
+    Node.Value := NewType;
+    Node.Attributes.Values['TYPEOFHELD'] := '0';
+    Node.RemoveChildAt(Node.ChildCount - 1);   // the operand named a type; it is not a ctor argument
+  end;
   UDTIdx := FindUDT(NewType);
   // "New T[n]": n contiguous elements of T on the byte heap, and the value IS the address of the first.
   // A record handle cannot express that - the elements have to be adjacent for "p[i]" to walk them - so
@@ -27695,6 +27833,19 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaMulInt, BytesVal, EnsureIntRegister(CountVal), ElemVal, MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  // "New <builtin>": one instance of a scalar type on the heap, the value being a pointer to it -
+  // "Dim As Double Ptr p = New Double". Same allocation as "New T[1]" and the same RAW pointer, which
+  // is what "*p = 3.14" then writes through; a scalar has no record to be a handle to.
+  // (The manual reaches it through a macro: "New TypeOf(*Cast(TypeOf(pd), 0))" resolves to New Double.)
+  if (UDTIdx < 0) and (TypeSizeBytes(NewType) > 0) and (NewType <> '') then
+  begin
+    BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, BytesVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
