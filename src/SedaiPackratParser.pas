@@ -9234,6 +9234,56 @@ begin
         DimTypeName := SharedTypeName;
         TypeTok := SharedTypeTok;
       end
+      // FreeBASIC STATIC MEMBER DEFINITION, trailing-AS spelling: "Dim T.x As Integer". The leading-AS
+      // one ("Dim As Integer T.x") was already read below; this is the SAME declaration written the
+      // other way round, and it is the way FreeBASIC's own test suite writes it - so every program that
+      // gives a static member its storage failed to parse on the definition line, while the member
+      // itself worked. Our static members are backed by a shared global declared with the TYPE, so the
+      // definition is worth exactly its initializer: an assignment to the member, or nothing at all.
+      // ⚠️ The owner may be a NESTED type ("Dim T.U.x As Integer"), so the dotted run is read whole.
+      else if (Result.ChildCount = 0) and Context.Check(ttIdentifier) and
+              Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot) then
+      begin
+        NameTok := Context.CurrentToken;
+        Context.Advance;                       // owner name
+        MemberAccess := TASTNode.CreateWithValue(antIdentifier,
+                          UpperCase(VarToStr(NameTok.Value)), NameTok);
+        while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+              (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+              (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+        begin
+          Context.Advance;                     // '.'
+          StaticDef := TASTNode.CreateWithValue(antMemberAccess,
+                         UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
+          StaticDef.AddChild(MemberAccess);
+          MemberAccess := StaticDef;
+          Context.Advance;                     // member name
+        end;
+        // "As <type>" (and any "* n" / PTR tail) belongs to the member's own declaration inside the
+        // TYPE, not here: skip it to the end of the statement, then keep the initializer if there is one.
+        while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and
+              (not Context.Check(ttOpEq)) do
+          Context.Advance;
+        if Context.Check(ttOpEq) then
+        begin
+          Context.Advance;                     // '='
+          InitExpr := FExpressionParser.ParseExpression;
+          if Assigned(InitExpr) then
+          begin
+            StaticDef := TASTNode.Create(antAssignment, NameTok);
+            StaticDef.AddChild(MemberAccess);
+            StaticDef.AddChild(InitExpr);
+            Result.Free;
+            Result := StaticDef;
+            DoNodeCreated(Result);
+            Exit;
+          end;
+        end;
+        MemberAccess.Free;                     // no initializer: the declaration alone emits nothing
+        Result.Free;
+        Result := nil;
+        Exit;
+      end
       else if not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttAsType)) then
       begin
         // Bare suffix-typed scalar "Dim x" / "Dim s$": no AS clause; the type is inferred from the name
@@ -10369,6 +10419,18 @@ var
   end;
 
 begin
+  // FreeBASIC CONST METHOD DEFINITION: "Const Sub|Function|Operator|Property T.m(...)". The qualifier
+  // sits in FRONT of the procedure keyword, so the statement opens with CONST and is not a constant
+  // declaration at all - it was read as one and died on "Expected variable name in assignment". Same
+  // move STATIC already makes for "Static Sub T.m()": consume the qualifier and let the procedure
+  // grammar read the rest. CONST on a method is a promise about THIS, and this VM does not enforce it
+  // (as it does not enforce "As Const" on a variable), so nothing else is needed for the definition to
+  // mean what it means.
+  if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
+  begin
+    Context.Advance;                                   // consume CONST
+    Exit(ParseProcedureDecl);
+  end;
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
   Context.Advance; // Consume CONST

@@ -1949,6 +1949,40 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
+  // "@*expr": the address of what a pointer points at IS the pointer - "@*p" is p, and
+  // "@*Cast(Integer Ptr, n)" is that cast. FreeBASIC's own test suite writes it, and the C reading is
+  // the same one. Without this the '*' was not an identifier and "@" refused the whole expression.
+  // Handled by DROPPING both operators rather than by building an address node: there is no address to
+  // take, the value already is one, and a second path that computes it could only disagree with the first.
+  if Context.Check(ttOpMul) then
+  begin
+    Context.Advance;                          // '*'
+    Result := ParseExpression(precCall);
+    if not Assigned(Result) then
+      HandleError('Expected an expression after "@*"', Context.CurrentToken);
+    Exit;
+  end;
+  // "@( <lvalue> )": FreeBASIC's own way of writing the address of something that is not a bare name -
+  // "@(cast(T Ptr, n)->i)" is the manual's shape, and the parentheses are what make the "->" bind
+  // before the "@". Only a NAME was accepted here, so the '(' ended the statement.
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                          // '('
+    Operand := ParseExpression(precNone);
+    if not Assigned(Operand) or (not Context.Match(ttDelimParClose)) then
+    begin
+      HandleError('Expected a parenthesised lvalue after "@"', Context.CurrentToken);
+      if Assigned(Operand) then Operand.Free;
+      Result := nil;
+      Exit;
+    end;
+    while (Operand.NodeType = antParentheses) and (Operand.ChildCount >= 1) do
+      Operand := Operand.GetChild(0);
+    Result := TASTNode.Create(antProcAddress, Token);
+    Result.AddChild(Operand.Clone);
+    DoNodeCreated(Result);
+    Exit;
+  end;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a name after "@"', Context.CurrentToken);
