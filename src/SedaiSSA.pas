@@ -665,6 +665,7 @@ type
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
+    function TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
     function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
     // FB: a builtin overloaded for a UDT under its own name ("Operator Abs (v As Vector2D) As Single").
     function UDTNamedOperatorLabel(const FuncName: string; ArgsNode: TASTNode): string;
@@ -6823,8 +6824,19 @@ begin
         end;
 
         ArrayIdx := ArrayIndexOf(ArrName);
+        // ⚠️ begin/end, not a bare "if ... then if ...": the raise below belongs to THIS test, and
+        // leaving it dangling made it unconditional - every array access in the corpus raised
+        // "Array not declared" and 205 programs went red at once.
         if ArrayIdx < 0 then
+        begin
+          // "arr(i)" inside a method, where arr is a member ARRAY of THIS: rewrite to "this.arr(i)".
+          if TryImplicitThisArrayNode(Node, ThisFieldNode) then
+          begin
+            try ProcessExpression(ThisFieldNode, Result); finally ThisFieldNode.Free; end;
+            Exit;
+          end;
           raise Exception.CreateFmt('Array not declared: %s%s', [ArrName, CRuntimeHint(ArrName)]);
+        end;
 
         ArrInfo := FProgram.GetArray(ArrayIdx);
         IndicesNode := Node.GetChild(1);  // antExpressionList
@@ -8900,6 +8912,23 @@ begin
      (TargetNode.GetChild(1).NodeType = antExpressionList) and (TargetNode.GetChild(1).ChildCount = 1) then
   begin
     EmitStringByteWrite(TargetNode.GetChild(0), TargetNode.GetChild(1).GetChild(0), ExprNode, Node.Token);
+    Exit;
+  end;
+
+  // "arr(i) = v" inside a method, where arr is a member ARRAY of THIS: rewrite to "this.arr(i) = v".
+  // The bare-name rule above covers a scalar FIELD (a string byte write); an array element never
+  // reaches it, because the name sits INSIDE the subscript node. The explicit "This.arr(i) = v"
+  // always worked, which is what said the defect was in the resolution and not in member arrays.
+  if (ArrayIndexOf(ArrName) < 0) and TryImplicitThisArrayNode(TargetNode, ThisFieldNode) then
+  begin
+    try
+      PropArgs := TASTNode.Create(antAssignment, Node.Token);
+      PropArgs.AddChild(ThisFieldNode.Clone);
+      PropArgs.AddChild(ExprNode.Clone);
+      try ProcessArrayStore(PropArgs); finally PropArgs.Free; end;
+    finally
+      ThisFieldNode.Free;
+    end;
     Exit;
   end;
 
@@ -29389,6 +29418,42 @@ begin
   finally
     ThisNode.Free;
   end;
+  Result := True;
+end;
+
+function TSSAGenerator.TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
+// FreeBASIC implicit THIS, for a member ARRAY: inside a method body "arr(i)" means "this.arr(i)".
+//
+// TryImplicitThisField below does this for a BARE NAME, and that is all it can see: an array element
+// arrives as antArrayAccess(identifier, indices), so the identifier is never asked about on its own and
+// the lookup fell through to "Array not declared: ARR". The explicit "This.arr(i)" always worked -
+// which is what said the defect was in the RESOLUTION, not in member arrays.
+//
+// Answers a REWRITTEN copy of the node with "this." spliced in front (the caller frees it), so there is
+// one member-array lowering and this adds no second path to it. Declines when a parameter or a local
+// DIM shadows the name: FreeBASIC gives those the name, exactly as for a scalar field.
+var
+  UDTIdx, FI: Integer;
+  MemberNode: TASTNode;
+  NameU: string;
+  tmp: TSSAValue;
+begin
+  Result := False;
+  Rewritten := nil;
+  if FCurrentThisType = '' then Exit;                          // not lowering a method body
+  if (Node = nil) or (Node.ChildCount < 1) or (Node.GetChild(0) = nil) or
+     (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  NameU := UpperCase(VarToStr(Node.GetChild(0).Value));
+  UDTIdx := FindUDT(FCurrentThisType);
+  if UDTIdx < 0 then Exit;
+  FI := UDTFieldIndex(UDTIdx, NameU);
+  if (FI < 0) or (not FUDTs[UDTIdx].Fields[FI].IsArray) then Exit;
+  if ResolveExisting(NameU, tmp) then Exit;                    // a param / local DIM shadows the field
+  Rewritten := Node.Clone;
+  MemberNode := TASTNode.CreateWithValue(antMemberAccess, NameU, Node.Token);
+  MemberNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'THIS', Node.Token));
+  Rewritten.RemoveChildAt(0);
+  Rewritten.InsertChild(0, MemberNode);
   Result := True;
 end;
 

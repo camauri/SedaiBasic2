@@ -240,6 +240,7 @@ type
     function AtEndProcedure: Boolean;
     // CALL name [ ( args ) ] : statement-level SUB invocation.
     function ParseCallStatement: TASTNode;
+    function ParenGroupIsFollowedByAs(Offset: Integer): Boolean;  // "( ... ) As" starting at Offset?
     function ParseBareCallStatement: TASTNode;
     // BASE [ ( args ) ] : explicit base-constructor call inside a child CONSTRUCTOR (M4.4f).
     function ParseBaseStatement: TASTNode;
@@ -1235,9 +1236,16 @@ begin
       // "PROPERTY = expr" is the same statement inside a property GETTER: the manual's static-member
       // example ends its getter with "Property = This.ID", which parsed as a declaration and stopped the
       // whole file at "Expected a name after PROPERTY".
+      // ⛔ ...unless it is the DECLARATION of the equality operator: "Operator = ( ByRef lhs As T,
+      // ByRef rhs As U ) As R" begins with the same two tokens and is not an assignment at all. It was
+      // taken for one, and the parameter list was then read as a parenthesised EXPRESSION, which died
+      // on "Unexpected token ByRef" - the whole of proguide/object-class stopped there.
+      // The two are told apart by what CLOSES the parentheses: a declaration continues "... ) As <type>",
+      // a result assignment does not (and "Operator = (a + b)" is a perfectly ordinary one).
       if ((UpperCase(Token.Value) = kFUNCTION) or (UpperCase(Token.Value) = kOPERATOR) or
           (UpperCase(Token.Value) = kPROPERTY)) and
-         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) and
+         not ((UpperCase(Token.Value) = kOPERATOR) and ParenGroupIsFollowedByAs(2)) then
         Result := Memoize('FunctionResultAssign', @ParseFunctionResultAssign)
       else if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
          (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
@@ -1700,6 +1708,12 @@ begin
     Result := TASTNode.Create(antAssignment, SavedToken);
     Result.AddChild(LeftSide);
     Result.AddChild(Expression);
+    // ...and the mark the SYMBOLIC branch below stamps, for the same reason: a UDT may overload the
+    // SELF-operator ("Operator T.Mod= (rhs)"), which mutates in place and is not "x = x Mod rhs" -
+    // there may be no binary Mod for the type at all. Without it the desugared form was lowered
+    // against the record HANDLE and the statement did nothing visible: "x Mod= 5" left x unchanged
+    // while "x += 3" ran the operator, one keyword apart. One rule, two spellings, one place each.
+    Result.Attributes.Values['COMPOUNDOP'] := UpperCase(OpSym);
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2519,12 +2533,34 @@ begin
       // exactly like the binary "*" and the two could not be told apart.
       if Context.Check(ttCompoundAssign) then OpSym := OpSym + '=';
       Context.Advance;                              // operator name
+      // ...and the KEYWORD self-operators, "Operator T.Mod= (rhs)" and its family. A keyword operator
+      // stops at the '=', so the lexer yields the operator token and a SEPARATE ttOpEq - the same
+      // shape the assignment grammar already has to undo for "lhs Mod= rhs". Without spelling the '='
+      // back in here the '=' was left where a parameter list was expected and derailed the statement.
+      if ((OpSym = kMOD) or (OpSym = 'SHL') or (OpSym = 'SHR') or (OpSym = 'AND') or (OpSym = 'OR') or
+          (OpSym = 'XOR') or (OpSym = 'EQV') or (OpSym = 'IMP')) and Context.Check(ttOpEq) then
+      begin
+        OpSym := OpSym + '=';
+        Context.Advance;                            // '='
+      end;
       // The INDEX operator "Operator T.[] (i) ByRef As E" is written with two delimiter tokens, not one
       // name: '[' was taken as the whole operator and the ']' left behind derailed the statement. It is a
       // method with an implicit THIS, like CAST and LET, so it only needs its name spelled whole.
       if (OpSym = '[') and Context.Check(ttDelimBrackClose) then
       begin
         OpSym := '[]';
+        Context.Advance;                            // ']'
+      end;
+      // The ARRAY forms of the allocation operators, "Operator T.New[] (...)" and "Operator
+      // T.Delete[] (...)": the name is a word FOLLOWED by the two bracket tokens, so the '[' was left
+      // where a parameter list was expected and derailed the statement. The brackets are part of the
+      // NAME and must stay in it - "New" and "New[]" are two different operators, and one label for
+      // both would let the second definition overwrite the first.
+      if ((OpSym = kNEW) or (OpSym = kDELETE)) and Context.Check(ttDelimBrackOpen) and
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimBrackClose) then
+      begin
+        OpSym := OpSym + '[]';
+        Context.Advance;                            // '['
         Context.Advance;                            // ']'
       end;
     end
@@ -2994,6 +3030,40 @@ begin
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
   DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParenGroupIsFollowedByAs(Offset: Integer): Boolean;
+// Is the token at Offset an opening parenthesis whose MATCHING close is followed by "As"? That is the
+// shape of a parameter list with a return type - "( ByRef lhs As T, ByRef rhs As U ) As R" - and it is
+// what tells the declaration of the equality operator from "Operator = <expr>", which begins with the
+// same two tokens. Bounded: it stops at the end of the statement.
+var
+  i, Depth: Integer;
+  T: TLexerToken;
+begin
+  Result := False;
+  T := Context.PeekToken(Offset);
+  if not Assigned(T) or (T.TokenType <> ttDelimParOpen) then Exit;
+  Depth := 0;
+  i := Offset;
+  while True do
+  begin
+    T := Context.PeekToken(i);
+    if not Assigned(T) then Exit;
+    if T.TokenType in [ttEndOfFile] then Exit;
+    if T.TokenType = ttDelimParOpen then Inc(Depth)
+    else if T.TokenType = ttDelimParClose then
+    begin
+      Dec(Depth);
+      if Depth = 0 then
+      begin
+        T := Context.PeekToken(i + 1);
+        Result := Assigned(T) and (T.TokenType = ttAsType);
+        Exit;
+      end;
+    end;
+    Inc(i);
+  end;
 end;
 
 function TPackratParser.ParseBareCallStatement: TASTNode;
