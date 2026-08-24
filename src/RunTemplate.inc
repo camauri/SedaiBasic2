@@ -1311,7 +1311,19 @@ begin
           end;
         bcRecordNewArray:
           begin
-            RecordNewArrayInit(Ctx, Instr^.Src1, Instr^.Immediate);
+            // ⛔ THE PHYSICAL SLOT, NOT THE LOGICAL ID. An array declared inside a SUB is PRIVATE - one
+            // storage per execution context - and Ctx.ArrMap turns the id the bytecode names into the
+            // slot this context owns. This arm passed the LOGICAL id, so the element records were
+            // allocated into a DIFFERENT array and the one the procedure reads kept its zero handles:
+            // "Dim As T a(2)" inside a SUB dimensioned correctly (UBound answered 2) and then faulted
+            // on "a(1).field" - a null record handle. The VM's own case already mapped it, and the AOT
+            // reads through the mapped descriptor table, so ONLY the interpreter and the JIT (which
+            // deopts here) were wrong - the divergence the two engines were built to make impossible.
+            // ⚠️ CLAUDE.md names this trap by name: "Two ids, never interchangeable."
+            if ArrMapP <> nil then
+              RecordNewArrayInit(Ctx, ArrMapP[Instr^.Src1], Instr^.Immediate)
+            else
+              RecordNewArrayInit(Ctx, Instr^.Src1, Instr^.Immediate);
             Inc(CurPC);
           end;
         bcRecordNewArrayInd:  // array-of-UDT MEMBER: FArrays id is the runtime handle in IntRegs[Src1]

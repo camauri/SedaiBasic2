@@ -10426,6 +10426,16 @@ begin
         // Give the freshly-grown elements their member-array / nested-UDT backing too. The per-element
         // guard skips any pre-existing (PRESERVE'd) element, so their data is untouched.
         EmitRecordArrayInit(ArrayIdx, UdtIdx);
+        // ⛔ AND RUN THE CONSTRUCTOR. The records were allocated but never CONSTRUCTED, so a REDIM'd
+        // array of a type with a constructor came up with zeroed fields where fbc has whatever the
+        // constructor put there - no fault, no message, just the wrong values. A plain DIM has always
+        // done this (EmitRecordArrayConstruct); the REDIM path allocated and stopped.
+        // ⚠️ NOT on PRESERVE, and that is a declared limit rather than an approximation: after a
+        // PRESERVE the kept elements are already constructed and re-running their constructor would be
+        // worse than leaving the new ones unbuilt. Telling one from the other needs a per-record
+        // "constructed" mark, which this model does not have (the same wall EmitRecordArrayInit's
+        // zero-probe works around, and a probe cannot work here - a constructed record may hold zeros).
+        if PreserveFlag = 0 then EmitRecordArrayConstruct(ArrayIdx, ElemUdtName, 0);
       end;
     end;
   end;
