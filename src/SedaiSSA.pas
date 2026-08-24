@@ -25293,8 +25293,8 @@ procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx:
 // constructor is initialized field-by-field — store each value into the field at the same position (in
 // declaration order). Extra values past the field count are ignored (FB would reject them; v1 is lenient).
 var
-  i, Slot: Integer;
-  ArgVal: TSSAValue;
+  i, j, Slot: Integer;
+  ArgVal, ArrHandle: TSSAValue;
   SrcType: string;
   Bank: TSSARegisterType;
 begin
@@ -25312,6 +25312,29 @@ begin
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
     if i > High(FUDTs[UDTIdx].Fields) then Break;
+    // ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives the
+    // middle field - an array - its elements one by one; the field's slot holds the member array's
+    // FArrays handle, so the values go in through the same indirect store "v.field(j) = x" uses.
+    if (ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1') and
+       FUDTs[UDTIdx].Fields[i].IsArray then
+    begin
+      ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+      for j := 0 to ArgsNode.GetChild(i).ChildCount - 1 do
+      begin
+        ProcessExpression(ArgsNode.GetChild(i).GetChild(j), ArgVal);
+        case FUDTs[UDTIdx].Fields[i].ArrayElemBank of
+          srtFloat:  EmitInstruction(ssaArrayStoreIndFloat, EnsureFloatRegister(ArgVal), ArrHandle,
+                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+          srtString: EmitInstruction(ssaArrayStoreIndString, EnsureStringRegister(ArgVal), ArrHandle,
+                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+        else         EmitInstruction(ssaArrayStoreIndInt, EnsureIntRegister(ArgVal), ArrHandle,
+                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+        end;
+      end;
+      Continue;
+    end;
     ProcessExpression(ArgsNode.GetChild(i), ArgVal);
     Bank := FUDTs[UDTIdx].Fields[i].Bank;
     Slot := FUDTs[UDTIdx].Fields[i].Slot;
@@ -32850,8 +32873,10 @@ begin
       else
         EmitModuleDestructors(True);
       EmitModuleProcDestructors;   // FB: module destructors run on an explicit END too
-      EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // "End n" / "System n": n is the PROCESS exit code, and it rides in the opcode's Immediate.
+      // Zero is both "no code given" and "End 0", which answer the same thing, so no marker is needed.
+      EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAConstInt(StrToInt64Def(Node.Attributes.Values['EXITCODE'], 0)));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
       FCurrentBlock := nil;
     end;

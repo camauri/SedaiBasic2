@@ -1463,8 +1463,13 @@ begin
             {$ENDIF}
           end;
 
-        // Termination
-        bcEnd, bcStop: Break;
+        // Termination. "End n" carries the PROCESS exit code in the Immediate; bcStop has none.
+        bcEnd:
+          begin
+            if Instr^.Immediate <> 0 then FProgramExitCode := Instr^.Immediate;
+            Break;
+          end;
+        bcStop: Break;
         bcNop: Inc(CurPC);
         bcClear:
           begin

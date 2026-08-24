@@ -754,6 +754,7 @@ begin
     else
     begin
       WriteLn('ERROR: File not found: ', SourceFile);
+      ExitCode := 1;   // a compiler that fails must not report success
       Exit;
     end;
 
@@ -786,6 +787,7 @@ begin
       on E: EPreprocessorError do
       begin
         WriteLn('ERROR: ', E.Message);
+        ExitCode := 1;   // a compiler that fails must not report success
         Exit;
       end;
     end;
@@ -816,6 +818,7 @@ begin
         on E: Exception do
         begin
           WriteLn('ERROR during lexing: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -841,12 +844,14 @@ begin
           WriteLn('ERROR: Parsing failed!');
           if ParserResult.Errors.Count > 0 then
             WriteLn('  ', ParserResult.Errors[0].ToString);
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       except
         on E: Exception do
         begin
           WriteLn('ERROR during parsing: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -886,12 +891,14 @@ begin
         if not Assigned(SSAProgram) then
         begin
           WriteLn('ERROR: SSA generation failed!');
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       except
         on E: Exception do
         begin
           WriteLn('ERROR during SSA generation: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -1000,6 +1007,7 @@ begin
         begin
           WriteLn('ERROR: Dominator tree construction failed: ', E.Message);
           WriteLn('Compilation aborted.');
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -1016,6 +1024,7 @@ begin
         begin
           WriteLn('ERROR: SSA construction failed: ', E.Message);
           WriteLn('Compilation aborted.');
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -1445,6 +1454,7 @@ begin
         begin
           WriteLn('ERROR: PHI elimination failed: ', E.Message);
           WriteLn('Compilation aborted.');
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -1576,6 +1586,7 @@ begin
           begin
             WriteLn('ERROR: Register allocation failed: ', E.Message);
             WriteLn('Compilation aborted.');
+            ExitCode := 1;   // a compiler that fails must not report success
             Exit;
           end;
         end;
@@ -1644,6 +1655,7 @@ begin
         if not Assigned(BytecodeProgram) then
         begin
           WriteLn('ERROR: Bytecode compilation failed!');
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
         // Record the source dialect on the program so the VM can pick dialect-aware behaviour
@@ -1667,6 +1679,7 @@ begin
         on E: Exception do
         begin
           WriteLn('ERROR during bytecode compilation: ', E.ClassName, ': ', E.Message);
+          ExitCode := 1;   // a compiler that fails must not report success
           Exit;
         end;
       end;
@@ -1996,6 +2009,11 @@ begin
         if OptJitProfile then VM.DumpHotLoops;  // JIT J1: report hot loops found by back-edge profiling
         {$ENDIF}
         FinishVMGraphics(VM);  // sb --window: keep the window open until closed
+        // ⛔ A RUN THAT ABORTED MUST NOT REPORT SUCCESS. The VM carries the program's own exit code -
+        // 1 from a failed ASSERT, n from "End n" - and it used to have nowhere to go: sb answered 0
+        // whatever happened, so every harness that reads $? was blind by construction. Only a NON-ZERO
+        // code is copied, so nothing that already set one (an uncaught runtime error, below) is undone.
+        if VM.ProgramExitCode <> 0 then ExitCode := VM.ProgramExitCode;
       except
         on E: Exception do
         begin
@@ -2069,6 +2087,10 @@ begin
               end;
             end;
           end;
+          // ⛔ AND A RUN THAT DIED MUST NOT REPORT SUCCESS EITHER. This arm is OUR error - a Pascal
+          // exception leaking out of the VM, which fbc has no number for - so there is no fbc code to
+          // copy; 1 is what fbc's own runtime abort uses, and what every caller reads as "it failed".
+          ExitCode := 1;
           Exit;
         end;
       end;
@@ -2210,6 +2232,7 @@ begin
       on E: Exception do
       begin
         WriteLn('ERROR loading bytecode: ', E.Message);
+        ExitCode := 1;   // a compiler that fails must not report success
         Exit;
       end;
     end;
@@ -2627,6 +2650,7 @@ begin
     begin
       WriteLn('ERROR: File not found: ', TestFile);
       ExitCode := 1;
+      ExitCode := 1;   // a compiler that fails must not report success
       Exit;
     end;
 

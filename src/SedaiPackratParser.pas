@@ -96,6 +96,14 @@ type
     // ...and what each one's inferred TYPE NAME is, so a CONST defined from another CONST can be
     // typed by its VALUE instead of falling back to the numeric default. See InferConstTypeName.
     FConstTypes: TStringList;
+    // ⭐ The VALUE of a CONST that folds to an integer, keyed by name. It exists for the FIXED-LENGTH
+    // CAPACITY of a string declaration, which FreeBASIC routinely writes as a CONST ("f As ZString *
+    // MAXLEN") or an expression over one ("* TOTLEN+1"): TryConstIntExpr knew literals and arithmetic
+    // and NOT names, so such a declaration recorded "capacity present but unknown" and every question
+    // about the SIZE of the field fell back to the 24-byte string descriptor - SizeOf answered 24
+    // where fbc answers 4, and the whole type's layout with it.
+    FConstIntValues: TStringList;
+    FConstFoldVal: Int64;   // scratch for the fold above (a field, so every CONST site can use it)
     // True while ParseConstStatement is parsing the declaration itself. One of its three forms reads
     // the "name = value" part with ParseAssignmentStatement, so without this the rejection below
     // fires on the DECLARATION of a constant whose name was already declared in another scope
@@ -273,6 +281,7 @@ type
     procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
     function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
     // Optional "= { ... }" / "=> { ... }" array initializer on an already-built antArrayDecl.
+    function TryParseAggregateTuple(const DimTypeName: string): TASTNode;
     procedure ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
     function AtEndType: Boolean;
     procedure ConsumeEndType;
@@ -430,6 +439,8 @@ begin
   FConstNames.CaseSensitive := False;
   FConstTypes := TStringList.Create;
   FConstTypes.CaseSensitive := False;
+  FConstIntValues := TStringList.Create;
+  FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
@@ -447,6 +458,7 @@ begin
   FProcSeen.Free;
   FConstNames.Free;
   FConstTypes.Free;
+  FConstIntValues.Free;
   FTypeStaticMethods.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
@@ -3611,7 +3623,7 @@ begin
     if Context.Check(ttOpMul) then
     begin
       Context.Advance;                            // '*'
-      FixedLenExpr := FExpressionParser.ParseExpression(precCall);
+      FixedLenExpr := FExpressionParser.ParseExpression(precTerm);   { '* n': an EXPRESSION - see ParseStaticFixedLen }
       if Assigned(FixedLenExpr) then
       begin
         if TryConstIntExpr(FixedLenExpr, FixedCapVal) then FLastFieldFixedLen := FixedCapVal;
@@ -4888,6 +4900,7 @@ function TPackratParser.ParseEndStatement: TASTNode;
 var
   Token: TLexerToken;
   ExitArg: TASTNode;
+  ExitCodeVal: Int64;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnd, Token);
@@ -4902,22 +4915,27 @@ begin
     Result := nil;
     Exit;
   end;
-  // FreeBASIC END and SYSTEM both carry an optional exit code ("End 1", "System 0"). We have no process
-  // exit-code channel, so it is parsed and discarded; both otherwise halt the program exactly the same.
+  // FreeBASIC END and SYSTEM both carry an optional exit code ("End 1", "System 0"): the value the
+  // PROCESS answers with. It used to be parsed and DISCARDED - the note here said "we have no process
+  // exit-code channel", and that was true of the whole program: sb answered 0 whatever happened. There
+  // is one now (TBytecodeVM.ProgramExitCode), so the value is kept.
   // SYSTEM (FB-only) accepts any expression. For END, only consume a NUMERIC argument, and only in MODERN:
   // this cannot mis-eat a block-ender's keyword ("End Sub") should one ever reach here, and CLASSIC v7 END
-  // is always standalone. Without this the exit code was left as a stray literal statement ("Unhandled node
-  // type 0" warning) and ignored anyway.
+  // is always standalone.
+  // ⚠️ Only a CONSTANT is honoured, and that is declared: the code rides in the opcode's IMMEDIATE, so
+  // a computed one has nowhere to go without a register operand on an opcode that has none. "End n"
+  // with a variable halts exactly as before and answers 0.
+  ExitArg := nil;
   if (UpperCase(Token.Value) = kSYSTEM) and
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
-  begin
-    ExitArg := ParseExpression;
-    if Assigned(ExitArg) then ExitArg.Free;
-  end
+    ExitArg := ParseExpression
   else if FModernMode and Context.CheckAny([ttNumber, ttInteger, ttFloat, ttOpSub, ttDelimParOpen]) then
-  begin
     ExitArg := ParseExpression;
-    if Assigned(ExitArg) then ExitArg.Free;
+  if Assigned(ExitArg) then
+  begin
+    if TryConstIntExpr(ExitArg, ExitCodeVal) then
+      Result.Attributes.Values['EXITCODE'] := IntToStr(ExitCodeVal and 255);
+    ExitArg.Free;
   end;
   DoNodeCreated(Result);
 end;
@@ -8483,7 +8501,7 @@ begin
       if Context.Check(ttOpMul) then
       begin
         Context.Advance;                              // '*'
-        FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
+        FExpressionParser.ParseExpression(precTerm).Free;   // length operand (discarded); an EXPRESSION
       end;
     end;
   end;
@@ -8491,6 +8509,84 @@ begin
   ParseOptionalArrayInit(Result, Dimensions, Token);
 
   DoNodeCreated(Result);
+end;
+
+function TPackratParser.TryParseAggregateTuple(const DimTypeName: string): TASTNode;
+// FreeBASIC aggregate init "= (a, b, c)": a parenthesised comma-tuple that sets a UDT's fields in
+// declaration order. Answers the antArgumentList (TUPLEINIT), or NIL with the stream left exactly where
+// it was - so the caller can fall through to an ordinary expression, which is what "= (x + y) \ 2" is.
+//
+// ⛔ EXTRACTED because DIM had it and STATIC did not: "Static As T v = (a, b)" is the same declaration
+// with the other modifier, and it parsed the parentheses as an expression and failed. One grammar in
+// one place is the only way the two spellings cannot drift apart again.
+// The current token must be the '('.
+var
+  SavedIdx, TupleDepth: Integer;
+  IsTuple, HadComma: Boolean;
+  CtorArgs, ArgExpr: TASTNode;
+begin
+  Result := nil;
+  if not Context.Check(ttDelimParOpen) then Exit;
+  SavedIdx := Context.CurrentIndex;
+  Context.Advance;           // step past '(' for the scan
+  TupleDepth := 1; IsTuple := False; HadComma := False;
+  while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
+  begin
+    if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
+    else if Context.Check(ttDelimParClose) then
+    begin
+      Dec(TupleDepth);
+      // ...and a SINGLE-element group is an initializer list too when the declared type is a UDT
+      // and the parentheses span the WHOLE initializer: "Dim As UDT1 u = (1)" sets the first
+      // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
+      // into a record variable left the record's handle showing (the manual's control/iif4).
+      // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
+      if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
+      begin
+        Context.Advance;
+        if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
+        Break;
+      end;
+    end
+    else if Context.Check(ttSeparParam) and (TupleDepth = 1) then
+      begin IsTuple := True; HadComma := True; Break; end;
+    Context.Advance;
+  end;
+  Context.CurrentIndex := SavedIdx;  // rewind to the '('
+  if IsTuple then
+  begin
+    Context.Advance;         // (
+    CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
+    CtorArgs.Attributes.Values['TUPLEINIT'] := '1';   // UDT aggregate field init
+    if not HadComma then
+      // A SINGLE-element group is ambiguous: "= (1)" is a field list, but "= (""A.x"")" on a type
+      // with a matching CONSTRUCTOR is a construction. Mark it so the SSA resolves a constructor
+      // first and only aggregates when none matches.
+      CtorArgs.Attributes.Values['TUPLE1'] := '1';
+    repeat
+      // ⭐ A TUPLE ELEMENT MAY BE A BRACE LIST, and it initialises an ARRAY MEMBER:
+      //     type foo_2 : bar(0 to 1) as integer : end type
+      //     static as foo_2 chkref2 = ( { 1234, -5678 } )
+      // is FreeBASIC's own spelling (its test suite writes it), and the braces reached an
+      // expression parser that has no rule for '{' - the whole declaration failed to parse.
+      // Parsed by the same brace reader the array initializer uses, marked so the SSA knows
+      // this element is a LIST for a member array and not a value for a scalar field.
+      if Context.Check(ttDelimBraceOpen) then
+      begin
+        ArgExpr := TASTNode.Create(antArgumentList, Context.CurrentToken);
+        ArgExpr.Attributes.Values['BRACEINIT'] := '1';
+        SetLength(FInitLevelSizes, 0);
+        ParseArrayInitBraceGroup(ArgExpr, ConstDimSizes(nil), 0);   // no shape: plain row-major
+      end
+      else
+        ArgExpr := FExpressionParser.ParseExpression;
+      if not Assigned(ArgExpr) then Break;
+      CtorArgs.AddChild(ArgExpr);
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
+    if Context.Check(ttDelimParClose) then Context.Advance;   // )
+    Result := CtorArgs;
+  end;
 end;
 
 procedure TPackratParser.ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
@@ -8825,6 +8921,13 @@ begin
         if VarIsOrdinal(N.Value) then begin V := N.Value; Exit(True); end;
         Result := TryStrToInt64(VarToStr(N.Value), V);
       end;
+    antIdentifier:
+      // ⭐ A CONST NAME. FreeBASIC writes a capacity as one all the time ("f As ZString * MAXLEN"),
+      // and only literals were folded here - so the capacity was recorded as "present but unknown"
+      // and SizeOf of the field answered the string DESCRIPTOR's width instead. Resolved from the
+      // values recorded as each CONST was parsed, so a name used before its declaration still
+      // declines, exactly as it does in fbc.
+      Result := TryStrToInt64(FConstIntValues.Values[UpperCase(VarToStr(N.Value))], V);
     antParentheses:
       if N.ChildCount >= 1 then Result := TryConstIntExpr(N.GetChild(0), V);
     antUnaryOp:
@@ -9181,7 +9284,7 @@ begin
     if Context.Check(ttOpMul) then
     begin
       Context.Advance;                        // '*'
-      InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
+      InitExpr := FExpressionParser.ParseExpression(precTerm);   // length operand: an EXPRESSION
       if Assigned(InitExpr) then
       begin
         if TryConstIntExpr(InitExpr, FixedCapVal) then SharedFixedLen := IntToStr(FixedCapVal)
@@ -9451,7 +9554,7 @@ begin
       if Context.Check(ttOpMul) then
       begin
         Context.Advance;                     // consume '*'
-        InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
+        InitExpr := FExpressionParser.ParseExpression(precTerm);   // length operand: an EXPRESSION
         if Assigned(InitExpr) then
         begin
           // Record the capacity. A constant literal becomes the number (the SSA truncates assignments
@@ -9481,51 +9584,12 @@ begin
           // fields in declaration order. Distinguish it from an expression that merely STARTS with '(' —
           // e.g. "= (x + y) \ 2" — by looking ahead for a TOP-LEVEL comma inside the leading parentheses;
           // only then is it a tuple. Without one, fall through to the normal (full) expression parse.
-          SavedIdx := Context.CurrentIndex;
-          Context.Advance;                   // step past '(' for the scan
-          TupleDepth := 1; IsTuple := False; HadComma := False;
-          while (TupleDepth > 0) and (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) do
-          begin
-            if Context.Check(ttDelimParOpen) then Inc(TupleDepth)
-            else if Context.Check(ttDelimParClose) then
-            begin
-              Dec(TupleDepth);
-              // ...and a SINGLE-element group is an initializer list too when the declared type is a UDT
-              // and the parentheses span the WHOLE initializer: "Dim As UDT1 u = (1)" sets the first
-              // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
-              // into a record variable left the record's handle showing (the manual's control/iif4).
-              // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
-              if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
-              begin
-                Context.Advance;
-                if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
-                Break;
-              end;
-            end
-            else if Context.Check(ttSeparParam) and (TupleDepth = 1) then
-              begin IsTuple := True; HadComma := True; Break; end;
-            Context.Advance;
-          end;
-          Context.CurrentIndex := SavedIdx;  // rewind to the '('
-          if IsTuple then
-          begin
-            Context.Advance;                 // (
-            CtorArgs := TASTNode.Create(antArgumentList, Context.CurrentToken);
-            CtorArgs.Attributes.Values['TUPLEINIT'] := '1';   // UDT aggregate field init
-            if not HadComma then
-              // A SINGLE-element group is ambiguous: "= (1)" is a field list, but "= (""A.x"")" on a type
-              // with a matching CONSTRUCTOR is a construction. Mark it so the SSA resolves a constructor
-              // first and only aggregates when none matches.
-              CtorArgs.Attributes.Values['TUPLE1'] := '1';
-            repeat
-              ArgExpr := FExpressionParser.ParseExpression;
-              if not Assigned(ArgExpr) then Break;
-              CtorArgs.AddChild(ArgExpr);
-              if Context.Check(ttSeparParam) then Context.Advance else Break;
-            until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
-            if Context.Check(ttDelimParClose) then Context.Advance;   // )
-            ArrayDecl.AddChild(CtorArgs);                     // child[2] = tuple
-          end
+          // ⭐ ONE reader for the aggregate tuple, shared with STATIC. It used to live inline here and
+          // nowhere else, so "Static As T v = (a, b)" - the same declaration with the other modifier -
+          // parsed the parentheses as an EXPRESSION and failed. See TryParseAggregateTuple.
+          CtorArgs := TryParseAggregateTuple(DimTypeName);
+          if Assigned(CtorArgs) then
+            ArrayDecl.AddChild(CtorArgs)                      // child[2] = tuple
           else
           begin
             InitExpr := FExpressionParser.ParseExpression;    // full expression, e.g. "(x + y) \ 2"
@@ -9714,7 +9778,12 @@ var
     Result := '';
     if not Context.Check(ttOpMul) then Exit;
     Context.Advance;                                 // '*'
-    CapExpr := FExpressionParser.ParseExpression(precCall);   // the capacity (no binary ops)
+    // ⛔ THE CAPACITY IS AN EXPRESSION, not one term. "Dim z As ZString * TOTLEN+1" is FreeBASIC's own
+    // spelling (its test suite writes it), and reading a single term stopped at the '+': the rest of the
+    // line was then parsed as a separate statement and the declaration silently lost its capacity.
+    // precTerm takes '+' and '-' and everything tighter, and stops before a comma or a following NAME -
+    // which is what keeps the leading-AS form ("Dim As String * 3 s") reading the name as the name.
+    CapExpr := FExpressionParser.ParseExpression(precTerm);   // the capacity: an EXPRESSION
     if not Assigned(CapExpr) then Exit;
     if TryConstIntExpr(CapExpr, CapVal) then Result := IntToStr(CapVal)
     else Result := '-1';                             // present but non-constant -> advisory
@@ -9768,7 +9837,11 @@ begin
         if Context.Check(ttOpEq) then
         begin
           Context.Advance;                           // =
-          Init := FExpressionParser.ParseExpression;
+          // ⭐ ...including the AGGREGATE TUPLE, "Static As T v = (a, b)" and "= ( { 1, 2 } )". The
+          // grammar lived inline in DIM and nowhere else, so the very same declaration written with
+          // STATIC parsed the parentheses as an expression and failed. One reader, both spellings.
+          Init := TryParseAggregateTuple(StaticTypeName);
+          if not Assigned(Init) then Init := FExpressionParser.ParseExpression;
           if Assigned(Init) then DeclNode.AddChild(Init);
         end;
       end;
@@ -10534,6 +10607,8 @@ begin
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
     FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
       UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
+      FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
@@ -10583,6 +10658,8 @@ begin
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
     FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
       UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
+      FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
@@ -10627,6 +10704,8 @@ begin
     FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
   FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
     UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+  if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
+    FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);
@@ -10712,6 +10791,20 @@ begin
       if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
       begin
         DataItem := TASTNode.CreateWithValue(antLiteral, -StrToFloat(Context.CurrentToken.Value), Context.CurrentToken);
+        Result.AddChild(DataItem);
+        Context.Advance;
+      end;
+    end
+    // ⭐ ...and an EXPLICIT PLUS. "Data 0, +0.0" is FreeBASIC's own way of writing the positive zero
+    // beside the negative one, and its test suite does exactly that (tests/boolean/boolean_data). Only
+    // the MINUS was read here, so the '+' ended the DATA statement and everything after it on the line
+    // was lost - the item count then no longer matched the READs.
+    else if Context.Check(ttOpAdd) then
+    begin
+      Context.Advance;                                 // consume '+'
+      if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
+      begin
+        DataItem := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
         Result.AddChild(DataItem);
         Context.Advance;
       end;
