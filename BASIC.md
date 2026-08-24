@@ -3114,6 +3114,11 @@ Each of these is *refused with a message that names the reason*, never answered 
   byte count would cover a different number of elements. Loop over the elements instead.
 - **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
   byte image — the elements are managed values.
+- **`__FUNCTION_NQ__` read as a VALUE.** It substitutes the *symbol*, not a string, so in fbc
+  `Return __FUNCTION_NQ__` inside its own function is a recursive **call** — the program compiles with
+  "infinite recursion detected" and dies. Here it yields the procedure's name as text, like
+  `__FUNCTION__`. ⚠️ The one use the manual makes of it, `@__FUNCTION_NQ__` (the enclosing
+  procedure's own address), *is* supported and means exactly `@<that procedure>`.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance

@@ -1980,6 +1980,16 @@ begin
       // (CollectAddressTakenVars); its packed address is (arrayId+1) shl POINTER_ARRAY_SHIFT so 0
       // stays a NULL sentinel. A child is present for @arr(i) (index list → array element) and
       // @obj.field (member access → record-field pointer).
+      // "@__FUNCTION_NQ__": the enclosing procedure's own address. __FUNCTION_NQ__ substitutes the
+      // SYMBOL, not a string - that is the whole difference from __FUNCTION__, and taking its address
+      // is the manual's only example of it. Read as a value it is still the name as text (see the
+      // intercept in the identifier path); only under "@" does the symbol matter. Without this the
+      // name reached the procedure-address path unchanged and failed with "Undefined procedure
+      // (address-of @): __FUNCTION_NQ__".
+      if (Node.ChildCount = 0) and FInProcedure and
+         ((UpperCase(VarToStr(Node.Value)) = kMACROFUNCTIONNQ) or
+          (UpperCase(VarToStr(Node.Value)) = kMACROFUNCTION)) then
+        Node.Value := UpperCase(FCurrentProcName);
       // "@Type.method": the entry PC of a member procedure named through its TYPE (a STATIC member sub
       // has no instance, so this is the only way to point at it). Tried before the field path, which
       // would otherwise report "object is not a record" for a type NAME.
