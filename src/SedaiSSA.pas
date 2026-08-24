@@ -566,6 +566,7 @@ type
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
     procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
     function TryEmitManagedRecordClear(ArgsNode: TASTNode): Boolean;  // CLEAR over a MANAGED record
+    function TryEmitManagedMemCopy(ArgsNode: TASTNode; out Res: TSSAValue): Boolean;  // FB_MEMCOPY over MANAGED storage
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record/raw-address handle (hidden var)
@@ -27409,6 +27410,102 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryEmitManagedMemCopy(ArgsNode: TASTNode; out Res: TSSAValue): Boolean;
+// FreeBASIC "fb_memcopy(dst, src, bytes)" where the lvalue NAMED is a managed object. The manual is
+// explicit that both address positions are ByRef - "each starting address is taken from a reference to
+// a variable or array element" - so the operation is about the OBJECTS those references name, and
+// where an object has no byte image the copy is honoured as the copy OF THAT OBJECT. Two shapes, both
+// from array/memcopy, which is where FB_MEMCOPY is documented:
+//
+//   fb_memcopy(person2, person1, SizeOf(Person))     -> copy the record
+//   fb_memcopy(person1.name, *mynameptr, Len(*mynameptr) + 1)  -> assign the fixed-length string field
+//
+// ⚠️ DECLARED DIVERGENCE: the BYTE COUNT is honoured only as a character count on the string shape,
+// and not at all on the record shape - a partial byte range has no meaning over slots that are not
+// laid out in bytes. A record copy of a PREFIX of a type is refused rather than approximated (the
+// count is not read), which is the same line the CLEAR reading draws.
+var
+  DstH, SrcH, SrcStr, CntVal, CutStr: TSSAValue;
+  DstT, SrcT: string;
+  UDTIdx, DstUDT, Slot: Integer;
+  Bank: TSSARegisterType;
+  NestedT: string;
+
+  function IsStringSourceForField(N: TASTNode): Boolean;
+  // A source that is TEXT. ⛔ "*pz" on a ZSTRING PTR is one and does NOT infer as the string bank:
+  // the whole-string reading of "*p" is decided further down, after this question is asked, so
+  // InferExprBank answers int and the manual's own line - fb_memcopy(person1.name, *mynameptr, ...) -
+  // fell through to the byte path and died on a record-field pointer.
+  var
+    Pointee: string;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if InferExprBank(N) = srtString then Exit(True);
+    if (N.NodeType = antDeref) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+    begin
+      Pointee := UpperCase(PointeeTypeOf(VarToStr(N.GetChild(0).Value)));
+      Result := (Pointee = 'ZSTRING') or (Pointee = 'WSTRING') or (Pointee = 'STRING');
+    end;
+  end;
+
+  function IsRecordObjectLvalue(N: TASTNode): Boolean;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+    case N.NodeType of
+      antIdentifier:   Result := VarRecordTypeName(VarToStr(N.Value)) <> '';
+      antDeref,
+      antArrayAccess,
+      antMemberAccess: Result := True;
+    end;
+  end;
+
+begin
+  Result := False;
+  Res := MakeSSAValue(svkNone);
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 3) then Exit;
+
+  // Shape 2 first: a fixed-length STRING/ZSTRING field is a slot, not bytes, and it would otherwise
+  // resolve as a record-field pointer and die in the VM ("a record-field pointer is not a byte
+  // address"). Tested before the record shape because a member access resolves as an object too.
+  if (ArgsNode.GetChild(0).NodeType = antMemberAccess) and
+     ResolveRecordObject(ArgsNode.GetChild(0).GetChild(0), DstH, DstT) then
+  begin
+    DstUDT := FindUDT(DstT);
+    if (DstUDT >= 0) and UDTFieldBankSlot(DstUDT, VarToStr(ArgsNode.GetChild(0).Value), Bank, Slot, NestedT) and
+       (Bank = srtString) and IsStringSourceForField(ArgsNode.GetChild(1)) then
+    begin
+      ProcessStringExpression(ArgsNode.GetChild(1), SrcStr);
+      ProcessExpression(ArgsNode.GetChild(2), CntVal);
+      CutStr := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrLeft, CutStr, EnsureStringRegister(SrcStr), EnsureIntRegister(CntVal),
+                      MakeSSAValue(svkNone));
+      EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), EnsureIntRegister(DstH), CutStr,
+                      MakeSSAConstInt(Slot));
+      Res := EnsureIntRegister(DstH);
+      Exit(True);
+    end;
+  end;
+
+  // Shape 1: two records of the SAME type.
+  // ⛔ AND ONLY WHERE THE NAME IS THE OBJECT. "fb_memcopy(q, p, n)" on two "T PTR" VARIABLES copies the
+  // POINTERS - the manual's ByRef rule taken literally, and fbc really does make q alias p - so reading
+  // it as a copy of the pointees would be the very substitution this whole reading exists to avoid.
+  // A record VARIABLE, an element, a "*p" and a nested field all name the object; a pointer name does not.
+  if not IsRecordObjectLvalue(ArgsNode.GetChild(0)) then Exit;
+  if not IsRecordObjectLvalue(ArgsNode.GetChild(1)) then Exit;
+  if not ResolveRecordObject(ArgsNode.GetChild(0), DstH, DstT) then Exit;
+  if not ResolveRecordObject(ArgsNode.GetChild(1), SrcH, SrcT) then Exit;
+  if (DstT = '') or (UpperCase(DstT) <> UpperCase(SrcT)) then Exit;
+  UDTIdx := FindUDT(DstT);
+  if UDTIdx < 0 then Exit;
+  EmitRecordCopy(EnsureIntRegister(DstH), EnsureIntRegister(SrcH), UDTIdx);
+  Res := EnsureIntRegister(DstH);
+  Result := True;
+end;
+
 function TSSAGenerator.TryEmitManagedRecordClear(ArgsNode: TASTNode): Boolean;
 // FreeBASIC "Clear rec, 0, n" where rec is a MANAGED record - a "T Ptr" element of a CAllocate'd or
 // New'd block, or a record variable. There is no byte image to write over: the record is slots in a
@@ -27594,6 +27691,9 @@ begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   if (FuncU = kFBMEMCOPY) or (FuncU = kFBMEMMOVE) then
   begin
+    // ...over MANAGED storage first: a record or a fixed-length string field has no byte image, and
+    // the copy is honoured as the copy of the OBJECT the reference names. See TryEmitManagedMemCopy.
+    if TryEmitManagedMemCopy(ArgsNode, TmpV) then begin Result := TmpV; Exit; end;
     TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     TmpV := ByRefAddr(ArgsNode.GetChild(1)); SrcR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);

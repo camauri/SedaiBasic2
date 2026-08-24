@@ -2781,7 +2781,7 @@ End Function
 | `PEEK` | ✓ | Reads some type of value from an address. |
 | `POKE` | ✓ | Writes some type of value to an address. |
 | `CLEAR` | ✓ | `CLEAR(dst, value, bytes)`: set a block of raw heap memory (from Allocate) to a byte value. v1 takes the pointer directly. Over a **managed record** (a `T PTR` element of a `NEW`/`CALLOCATE` block, or a record variable) there is no byte image to write over — the record is slots in a table — so the operation resets the instance to what a fresh allocation gives it. Bounded and declared: only a fill value of **0** is honoured (any other byte pattern still refuses), the **byte count is ignored** (the whole instance is reset), and nested-UDT / member-array fields keep their instances, since their slots hold handles. |
-| `FB_MEMCOPY` | ✓ | `FB_MEMCOPY(dst, src, bytes)`: copy a block of raw heap memory; returns dst. v1 takes pointers directly. |
+| `FB_MEMCOPY` | ✓ | `FB_MEMCOPY(dst, src, bytes)`: copy a block of raw heap memory; returns dst. v1 takes pointers directly. Both address positions are **ByRef** — the address of the lvalue NAMED — so `fb_memcopy(q, p, n)` on two pointer variables copies the POINTERS and `fb_memcopy(*q, *p, n)` copies the memory, as in fbc. Where the lvalue names a **managed object** (a record variable, an element, `*p`, a nested field, or a fixed-length string field) the copy is honoured as the copy of that OBJECT: the byte count is a character count on a string field and is not read at all on a record. |
 | `FB_MEMCOPYCLEAR` | ✓ | `FB_MEMCOPYCLEAR(dst, dstlen, src, srclen)`: copy the first srclen bytes, clear the rest (composed from FB_MEMCOPY + CLEAR). |
 | `FB_MEMMOVE` | ✓ | `FB_MEMMOVE(dst, src, bytes)`: copy a block of raw heap memory, overlap-safe; returns dst. |
 | `SWAP` | ✓ | Exchange the contents of two variables. |
@@ -3142,11 +3142,11 @@ Each of these is *refused with a message that names the reason*, never answered 
   (`As Short`, `As UByte`, …). An `Integer`/`LongInt`/`Double` array is a real contiguous byte image
   here and these ops work over it exactly as in fbc; a narrow element type is stored widened, so a
   byte count would cover a different number of elements. Loop over the elements instead.
-- **`Clear` / `FB_MEMCOPY` over a STRING array, through a record-field pointer, or over an element of a
-  MANAGED UDT block** (`Clear p[i], 0, n` after `p = CAllocate(n, SizeOf(T))`): none of them has a byte
-  image — the elements are managed records, and their address is a record handle. Assign the fields, or
-  construct the element with `p[i].Constructor()`.
-  ⚠️ `Reallocate` of such a block *is* supported and keeps what was there.
+- **`Clear` / `FB_MEMCOPY` over a STRING array.** No byte image: the elements are managed strings.
+  ⚠️ Over a **managed record** both are supported, as the copy or the reset of the OBJECT the reference
+  names rather than of a byte range — see `CLEAR` and `FB_MEMCOPY` in the tables above for exactly what
+  is honoured and what is ignored (the byte count, in both). `Reallocate` of such a block is supported
+  too and keeps what was there.
 - **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
   walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
   not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported
