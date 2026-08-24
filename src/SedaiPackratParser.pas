@@ -2732,16 +2732,24 @@ begin
   // machinery (return type, body, END) applies unchanged; END PROPERTY is accepted generically.
   if (Kind = kPROPERTY) and Assigned(NameNode) then
   begin
-    if (ParamList.ChildCount - 1) >= 1 then       // >=1 explicit param (THIS at index 0) => setter
+    // ⛔ THE RESULT TYPE TELLS THEM APART, NOT THE PARAMETERS. This used to read "any explicit
+    // parameter means setter", which is right for the common pair and wrong for an INDEXED property:
+    //
+    //   Property NumBit( ByVal Index As Integer ) As Integer           '' getter, and it HAS a param
+    //   Property NumBit( ByVal Index As Integer, ByVal Value As Byte ) '' setter
+    //
+    // Read as a setter, the getter became a SUB and its "As Integer" then had nowhere to go:
+    // "Unexpected token in statement: As". FreeBASIC's own rule is the presence of a result type.
+    if Context.Check(ttAsType) then
+    begin
+      Kind := kFUNCTION;                           // getter returns the property value
+      Result.Value := kFUNCTION;
+    end
+    else
     begin
       Kind := kSUB;
       Result.Value := kSUB;
       NameNode.Value := QualName + '.SET';
-    end
-    else
-    begin
-      Kind := kFUNCTION;                           // getter returns the property value
-      Result.Value := kFUNCTION;
     end;
   end;
 

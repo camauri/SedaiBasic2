@@ -8694,6 +8694,10 @@ var
   IntVal: Int64;
   Stride: Int64;
   ElemUDT: string;
+  PropType: string;                 // indexed property setter: obj.prop(i) = value
+  PropHandle, PropDummy: TSSAValue;
+  PropArgs: TASTNode;
+  PropI: Integer;
 begin
   // Array store: A(5) = 10
   // Node structure: antAssignment
@@ -8722,6 +8726,32 @@ begin
   end;
 
   // UDT array member store obj.field(i,j) = expr: the array root is a member access -> indirect store.
+  // ⭐ AN INDEXED PROPERTY SETTER: "obj.prop(i) = value" is not an array store at all, it is
+  // SUB Type.prop.SET(i, value). FreeBASIC allows a property to take parameters, and then the
+  // assignment carries them: the subscripts are the leading arguments and the assigned value is
+  // the last one. Checked BEFORE the member-array path, because a property is not a field and
+  // that path would look for one and find nothing.
+  if (TargetNode.GetChild(0).NodeType = antMemberAccess) and
+     (TargetNode.GetChild(0).ChildCount >= 1) and
+     ResolveRecordObject(TargetNode.GetChild(0).GetChild(0), PropHandle, PropType) and
+     (ResolveMethodLabel(PropType, VarToStr(TargetNode.GetChild(0).Value) + '.SET') <> '') then
+  begin
+    PropArgs := TASTNode.Create(antArgumentList, TargetNode.Token);
+    try
+      if TargetNode.GetChild(1).NodeType = antExpressionList then
+        for PropI := 0 to TargetNode.GetChild(1).ChildCount - 1 do
+          PropArgs.AddChild(TargetNode.GetChild(1).GetChild(PropI).Clone)
+      else
+        PropArgs.AddChild(TargetNode.GetChild(1).Clone);
+      PropArgs.AddChild(ExprNode.Clone);
+      ProcessMethodCall(TargetNode.GetChild(0).GetChild(0), PropType,
+                        VarToStr(TargetNode.GetChild(0).Value) + '.SET', PropArgs, PropDummy);
+    finally
+      PropArgs.Free;
+    end;
+    Exit;
+  end;
+
   if TargetNode.GetChild(0).NodeType = antMemberAccess then
   begin
     ProcessMemberArrayStore(TargetNode, ExprNode);
