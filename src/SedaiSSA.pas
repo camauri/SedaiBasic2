@@ -18810,6 +18810,7 @@ function TSSAGenerator.UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; 
 var
   i, k, n, GrpCur: Integer;
   Sz, Al, MaxAl, Ofs, Cnt, EB, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
+  SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
 begin
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
@@ -18862,8 +18863,31 @@ begin
         if (Ofs mod GrpAl) <> 0 then Ofs := Ofs + (GrpAl - (Ofs mod GrpAl));
         GrpBase := Ofs; GrpMax := 0;
       end;
-      Offsets[i] := GrpBase;
-      if Sz > GrpMax then GrpMax := Sz;
+      // ⭐ AN ANONYMOUS "Type ... End Type" INSIDE THE BLOCK IS STILL SEQUENTIAL. A union overlaps its
+      // ALTERNATIVES, and such a block is ONE alternative whose own members follow each other:
+      //
+      //   Union U : a As Short : Type : b1 As Byte : b2 As Byte : End Type : End Union
+      //
+      // b1 and b2 sit at +0 and +1 and both overlap a. The rule existed for a whole-type UNION and
+      // not for a union NESTED in a type, so there b1 and b2 both landed on +0: "x.m.b2 = 2"
+      // overwrote b1 and the Short read 1 where FreeBASIC reads 513.
+      // ⛔ THREE routines lay a UDT out and each one needed it - the same shape as the last time a
+      // UDT rule was found in one place and missing from the other two.
+      if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
+      begin
+        if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
+        Offsets[i] := GrpBase + SGrpOfs;
+        SGrpOfs := SGrpOfs + Sz;
+        if SGrpOfs > GrpMax then GrpMax := SGrpOfs;
+      end
+      else
+      begin
+        SGrpCur := 0;
+        Offsets[i] := GrpBase;
+        if Sz > GrpMax then GrpMax := Sz;
+      end;
     end
     else
     begin
@@ -19873,6 +19897,7 @@ function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out
 var
   i, k, n, GrpCur: Integer;
   Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
+  SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
 begin
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
@@ -19917,8 +19942,31 @@ begin
         if (Ofs mod GrpAl) <> 0 then Ofs := Ofs + (GrpAl - (Ofs mod GrpAl));
         GrpBase := Ofs; GrpMax := 0;
       end;
-      Offsets[i] := GrpBase;
-      if Sz > GrpMax then GrpMax := Sz;
+      // ⭐ AN ANONYMOUS "Type ... End Type" INSIDE THE BLOCK IS STILL SEQUENTIAL. A union overlaps its
+      // ALTERNATIVES, and such a block is ONE alternative whose own members follow each other:
+      //
+      //   Union U : a As Short : Type : b1 As Byte : b2 As Byte : End Type : End Union
+      //
+      // b1 and b2 sit at +0 and +1 and both overlap a. The rule existed for a whole-type UNION and
+      // not for a union NESTED in a type, so there b1 and b2 both landed on +0: "x.m.b2 = 2"
+      // overwrote b1 and the Short read 1 where FreeBASIC reads 513.
+      // ⛔ THREE routines lay a UDT out and each one needed it - the same shape as the last time a
+      // UDT rule was found in one place and missing from the other two.
+      if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
+      begin
+        if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
+        Offsets[i] := GrpBase + SGrpOfs;
+        SGrpOfs := SGrpOfs + Sz;
+        if SGrpOfs > GrpMax then GrpMax := SGrpOfs;
+      end
+      else
+      begin
+        SGrpCur := 0;
+        Offsets[i] := GrpBase;
+        if Sz > GrpMax then GrpMax := Sz;
+      end;
     end
     else
     begin
@@ -22029,8 +22077,31 @@ begin
         if (Ofs mod GrpAl) <> 0 then Ofs := Ofs + (GrpAl - (Ofs mod GrpAl));
         GrpBase := Ofs; GrpMax := 0;
       end;
-      FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase;
-      if Sz > GrpMax then GrpMax := Sz;
+      // ⭐ AN ANONYMOUS "Type ... End Type" INSIDE THE BLOCK IS STILL SEQUENTIAL. A union overlaps its
+      // ALTERNATIVES, and such a block is ONE alternative whose own members follow each other:
+      //
+      //   Union U : a As Short : Type : b1 As Byte : b2 As Byte : End Type : End Union
+      //
+      // b1 and b2 sit at +0 and +1 and both overlap a. The rule existed for a whole-type UNION and
+      // not for a union NESTED in a type, so there b1 and b2 both landed on +0: "x.m.b2 = 2"
+      // overwrote b1 and the Short read 1 where FreeBASIC reads 513.
+      // ⛔ THREE routines lay a UDT out and each one needed it - the same shape as the last time a
+      // UDT rule was found in one place and missing from the other two.
+      if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
+      begin
+        if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
+        FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase + SGrpOfs;
+        SGrpOfs := SGrpOfs + Sz;
+        if SGrpOfs > GrpMax then GrpMax := SGrpOfs;
+      end
+      else
+      begin
+        SGrpCur := 0;
+        FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase;
+        if Sz > GrpMax then GrpMax := Sz;
+      end;
     end
     else
     begin
