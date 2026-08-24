@@ -951,7 +951,7 @@ begin
         begin Ctx.PC := CurPC; ExecuteBigIntOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
-      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 169:
+      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 170:
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr^.Dest] := Instr^.Immediate; Inc(CurPC); end;
@@ -1324,6 +1324,11 @@ begin
             IntRegs[Instr^.Dest] := AllocSharedRecordBlock(IntRegs[Instr^.Src1],
                                      Instr^.Immediate and $FFFF,
                                      (Instr^.Immediate shr 32) and $FFFF, (Instr^.Immediate shr 48) and $FFFF);
+            Inc(CurPC);
+          end;
+        bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
+          begin
+            IntRegs[Instr^.Dest] := SharedRecordBlockLen(IntRegs[Instr^.Src1]);
             Inc(CurPC);
           end;
         bcRecordReallocBlock:  // Reallocate a UDT block: Dest = the (possibly moved) first handle

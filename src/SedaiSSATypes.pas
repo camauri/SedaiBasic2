@@ -626,6 +626,8 @@ type
     // STRING opcode is what said so ("Unknown string opcode 169").
     ssaRecordReallocBlock,  // Reallocate a UDT block: Dest=new first handle, Src1=old handle,
                             //   Src2=new element count reg, Src3 const=packed slot counts
+    ssaRecordBlockLen,      // Dest := how many CONSECUTIVE records the block at Src1 holds (1 for a lone
+                            //   record). "Delete[] p" needs it to run one destructor per element.
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

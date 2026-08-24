@@ -1984,6 +1984,7 @@ function TExpressionParser.ParseNew(Token: TLexerToken): TASTNode;
 // child0 = antArgumentList of ctor args when present). SSA allocates a heap record and runs its ctor.
 var
   ArgList, PlaceExpr, PlaceExpr2: TASTNode;
+  PtrDepth, ArgIdx: Integer;
 begin
   // FreeBASIC "placement new": "New (addr) T(args)" constructs at an address the caller already owns.
   // Read and keep the address expression; the type name follows it.
@@ -2038,6 +2039,21 @@ begin
   end;
   Result := TASTNode.CreateWithValue(antNew, UpperCase(Context.CurrentToken.Value), Token);
   Context.Advance;  // consume the type name
+  // "New T Ptr [n]": the ELEMENT is a pointer, not a T - an array of pointers to be filled in later,
+  // which is how the manual builds a 2-dimensional object array. The suffix belongs to the TYPE, and
+  // without reading it here the "Ptr" was left standing where the '[' was expected, so "New UDT Ptr[4]"
+  // came out as an index on an array named PTR. Count the suffixes: "T Ptr Ptr" is legal too.
+  PtrDepth := 0;
+  while AtPointerSuffix do
+  begin
+    Inc(PtrDepth);
+    Context.Advance;
+  end;
+  if PtrDepth > 0 then
+  begin
+    Result.Attributes.Values['PTRDEPTH'] := IntToStr(PtrDepth);
+    for ArgIdx := 1 to PtrDepth do Result.Value := VarToStr(Result.Value) + ' ' + kPTR;
+  end;
   // FreeBASIC "New T[n]": n CONTIGUOUS elements, and the result is a pointer to the first. Without this
   // the "[n]" stayed behind as a postfix index on the allocation itself, so "New Integer[100]" allocated
   // ONE thing and every element past the first ran off it.

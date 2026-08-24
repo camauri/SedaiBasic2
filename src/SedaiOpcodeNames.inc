@@ -17,7 +17,7 @@
   la dimenticanza non e' piu' una cosa che si scopre, e' una cosa che non si puo' spedire. }
 
 const
-  OPCODE_NAME_COUNT = 568;
+  OPCODE_NAME_COUNT = 570;
   OPCODE_NAMES: array[0..OPCODE_NAME_COUNT - 1] of record
     Code: Word;
     Name: string[28];
@@ -191,6 +191,8 @@ const
     (Code: $00A6; Name: 'BitRotl'),
     (Code: $00A7; Name: 'BitRotr'),
     (Code: $00A8; Name: 'RecordSetTypeId'),
+    (Code: $00A9; Name: 'RecordReallocBlock'),
+    (Code: $00AA; Name: 'RecordBlockLen'),
     (Code: $0100; Name: 'StrConcat'),
     (Code: $0101; Name: 'StrLen'),
     (Code: $0102; Name: 'StrLeft'),

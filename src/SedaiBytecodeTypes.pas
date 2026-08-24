@@ -198,6 +198,10 @@ const
   bcRecordNewArrayInd = bcGroupCore + 151; // allocate a record per element of the member array whose FArrays handle is in IntRegs[Src1]; Immediate = packed slot counts (int|float<<16|str<<32|typeId<<48)
   bcRecordReallocBlock = bcGroupCore + 169; // Reallocate a UDT block: Dest = new first handle, Src1 = old first handle,
                                            //   Src2 = new element count reg; Immediate = packed slot counts (as bcRecordNewBlock).
+  bcRecordBlockLen  = bcGroupCore + 170; // Dest = how many CONSECUTIVE records the block starting at IntRegs[Src1] holds
+                                        //   (1 when the handle is a lone record). What "Delete[] p" needs to run one
+                                        //   destructor per element: fbc keeps the same number in a UInteger in front
+                                        //   of the block, we keep it on the block's first record (TRecordStorage.BlockLen).
   bcRecordNewBlock    = bcGroupCore + 152; // Callocate(n,SizeOf(T)) of a UDT: allocate IntRegs[Src1] CONSECUTIVE shared records, Dest = first handle; Immediate = packed slot counts. "p[i]" (first+i) indexes the i-th.
   bcPudef           = bcGroupCore + 69;  // PUDEF format string
   bcChar            = bcGroupCore + 70;  // CHAR mode, col, row, text
@@ -2027,6 +2031,7 @@ begin
         151: Result := 'RecordNewArrayInd';
         152: Result := 'RecordNewBlock';
         169: Result := 'RecordReallocBlock';
+        170: Result := 'RecordBlockLen';
         111: Result := 'RecordTypeId';
         133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';

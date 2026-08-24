@@ -1694,7 +1694,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
 | `EXTENDS` | ✓ | Single inheritance `TYPE Child EXTENDS Parent`: inherited fields (prefix layout) + methods + reference polymorphism (M4.2); virtual dispatch — an overridden method is selected by the instance's runtime type even through a base-typed variable (M4.3); inherited/ chained constructors & destructors (M4.4). |
 | `EXTENDS WSTRING` | ~ | `TYPE T EXTENDS WSTRING` parses, and a `T` declaring `OPERATOR T.CAST() AS STRING` converts through that cast in **every string context**: PRINT, `&`, assignment, DIM-initialisation, the built-in string functions (UCASE/LEFT/INSTR/…), a comparison against a string (hence `SELECT CASE`), `LSET`/`RSET`, `STRPTR`/`SADD`, and passing to a STRING parameter (by value or by reference — the callee binds a temporary, so the caller's object is not written back). `LEN(t)` reports the type's size in bytes, as FreeBASIC does for a UDT with no `OPERATOR LEN`. Still partial: without a user-declared `CAST`, the type is not implicitly a string. |
-| `EXTENDS ZSTRING` | ~ | `TYPE T EXTENDS ZSTRING` parses, and a `T` declaring `OPERATOR T.CAST() AS STRING` converts through that cast in **every string context** — see `EXTENDS WSTRING` above for the list. Still partial: without a user-declared `CAST`, the type is not implicitly a string, and `OPERATOR LEN` is not supported. |
+| `EXTENDS ZSTRING` | ~ | `TYPE T EXTENDS ZSTRING` parses, and a `T` declaring `OPERATOR T.CAST() AS STRING` (or `BYREF AS ZSTRING`) converts through that cast in **every string context** — see `EXTENDS WSTRING` above for the list — including `TYPE<STRING>(v)`, a `BYREF` parameter that wants a `ZSTRING PTR`, and a comparison of two such values (`SELECT CASE v` / `CASE TYPE<T>(…)`), which goes through the conversion when no `OPERATOR =` matches. A global `OPERATOR LEN (BYREF v AS T)` is honoured. Still partial: **without** a user-declared `CAST` the type is not implicitly a string. |
 | `IMPLEMENTS` | ✓ | `TYPE name [EXTENDS base] IMPLEMENTS iface[, ...]` clause accepted and ignored — interfaces are a reserved-but-unimplemented FB feature (the FB compiler itself does not implement them), so the type behaves as an ordinary UDT, matching FB. |
 | `FIELD` | ✓ | `TYPE name FIELD = n` alignment header — accepted and ignored (advisory in the slot-based record model). |
 | `OBJECT` | ✓ | Built-in RTTI base type. `TYPE X EXTENDS Object` gives RTTI; `X IS Object` is true for any derived instance; `DIM v AS Object` is a generic object handle. Modelled as an empty base UDT (type-id dispatch, no vtable pointer field). |
@@ -1952,7 +1952,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame |
+| `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame. `NEW T[n]` allocates **n** contiguous elements and `DELETE[] p` releases them: when `T` has a constructor or a destructor each element gets its own, in element order; when it has neither the block is plain bytes, so a program may lay a byte view over it or `memcopy` it. `NEW T PTR [n]` allocates an array of POINTERS, which is how a 2-dimensional object array is built — `p[i] = NEW T[m]`, then `p[i][j].field` and `DELETE[] p[i]`. |
 | `New Overload` | N/A | A member `OPERATOR NEW` replaces the *allocation* step with user code returning a raw address. `NEW T` here yields a managed record handle — a slot in the VM's record table, not an address the program could have allocated — so a user allocator cannot be honoured. Constructor overloads do apply. |
 | `Placement New` | N/A | `NEW(address) T` constructs an object at a caller-supplied address. Records live in the VM's managed table, not at raw addresses; the all-raw object model was evaluated and rejected because it conflicts with value semantics, RAII, virtual dispatch and threading. |
 | `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor and frees the heap record (slot recycled via a free list) |
@@ -2780,8 +2780,8 @@ End Function
 |---|---|---|
 | `PEEK` | ✓ | Reads some type of value from an address. |
 | `POKE` | ✓ | Writes some type of value to an address. |
-| `CLEAR` | ✓ | `CLEAR(dst, value, bytes)`: set a block of raw heap memory (from Allocate) to a byte value. v1 takes the pointer directly. |
-| `FB_MEMCOPY` | ✓ | `FB_MEMCOPY(dst, src, bytes)`: copy a block of raw heap memory; returns dst. v1 takes pointers directly. |
+| `CLEAR` | ✓ | `CLEAR(dst, value, bytes)`: set a block of raw heap memory (from Allocate) to a byte value. v1 takes the pointer directly. Over a **managed record** (a `T PTR` element of a `NEW`/`CALLOCATE` block, or a record variable) there is no byte image to write over — the record is slots in a table — so the operation resets the instance to what a fresh allocation gives it. Bounded and declared: only a fill value of **0** is honoured (any other byte pattern still refuses), the **byte count is ignored** (the whole instance is reset), and nested-UDT / member-array fields keep their instances, since their slots hold handles. |
+| `FB_MEMCOPY` | ✓ | `FB_MEMCOPY(dst, src, bytes)`: copy a block of raw heap memory; returns dst. v1 takes pointers directly. Both address positions are **ByRef** — the address of the lvalue NAMED — so `fb_memcopy(q, p, n)` on two pointer variables copies the POINTERS and `fb_memcopy(*q, *p, n)` copies the memory, as in fbc. Where the lvalue names a **managed object** (a record variable, an element, `*p`, a nested field, or a fixed-length string field) the copy is honoured as the copy of that OBJECT: the byte count is a character count on a string field and is not read at all on a record. |
 | `FB_MEMCOPYCLEAR` | ✓ | `FB_MEMCOPYCLEAR(dst, dstlen, src, srclen)`: copy the first srclen bytes, clear the rest (composed from FB_MEMCOPY + CLEAR). |
 | `FB_MEMMOVE` | ✓ | `FB_MEMMOVE(dst, src, bytes)`: copy a block of raw heap memory, overlap-safe; returns dst. |
 | `SWAP` | ✓ | Exchange the contents of two variables. |
@@ -3142,11 +3142,11 @@ Each of these is *refused with a message that names the reason*, never answered 
   (`As Short`, `As UByte`, …). An `Integer`/`LongInt`/`Double` array is a real contiguous byte image
   here and these ops work over it exactly as in fbc; a narrow element type is stored widened, so a
   byte count would cover a different number of elements. Loop over the elements instead.
-- **`Clear` / `FB_MEMCOPY` over a STRING array, through a record-field pointer, or over an element of a
-  MANAGED UDT block** (`Clear p[i], 0, n` after `p = CAllocate(n, SizeOf(T))`): none of them has a byte
-  image — the elements are managed records, and their address is a record handle. Assign the fields, or
-  construct the element with `p[i].Constructor()`.
-  ⚠️ `Reallocate` of such a block *is* supported and keeps what was there.
+- **`Clear` / `FB_MEMCOPY` over a STRING array.** No byte image: the elements are managed strings.
+  ⚠️ Over a **managed record** both are supported, as the copy or the reset of the OBJECT the reference
+  names rather than of a byte range — see `CLEAR` and `FB_MEMCOPY` in the tables above for exactly what
+  is honoured and what is ignored (the byte count, in both). `Reallocate` of such a block is supported
+  too and keeps what was there.
 - **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
   walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
   not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported
