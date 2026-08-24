@@ -3114,6 +3114,10 @@ Each of these is *refused with a message that names the reason*, never answered 
   byte count would cover a different number of elements. Loop over the elements instead.
 - **`Clear` / `FB_MEMCOPY` over a STRING array, or through a record-field pointer**: neither has a
   byte image — the elements are managed values.
+- **Assigning through a byref `Operator Cast` that returns a record FIELD**, i.e.
+  `Cast(Integer, u) = 78` where `Operator U.Cast() ByRef As Integer` does `Return This.I`. Reading
+  through such an operator works; taking the address of a field *as a byref result* does not yet.
+  Refused with that reason at the point of use.
 - **A BYTE VIEW over an array through `Any Ptr` / a narrow-pointee cast.** `Cast(UByte Ptr, @a(0))[i]`
   walks *elements*, not bytes: an array is typed storage here (one `Int64` or `Double` per element),
   not a byte image, so a pointer into it can only step by element. `Cast(T Ptr, p)[i]` *is* supported
