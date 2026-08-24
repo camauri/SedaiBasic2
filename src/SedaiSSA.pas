@@ -32850,8 +32850,10 @@ begin
       else
         EmitModuleDestructors(True);
       EmitModuleProcDestructors;   // FB: module destructors run on an explicit END too
-      EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
-                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // "End n" / "System n": n is the PROCESS exit code, and it rides in the opcode's Immediate.
+      // Zero is both "no code given" and "End 0", which answer the same thing, so no marker is needed.
+      EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                     MakeSSAConstInt(StrToInt64Def(Node.Attributes.Values['EXITCODE'], 0)));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
       FCurrentBlock := nil;
     end;

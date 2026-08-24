@@ -495,6 +495,13 @@ type
     // cadence could never know. Counted rather than flagged so nested locks - a SUB that brackets its
     // own drawing inside a caller that already did - unwind correctly instead of presenting early.
     FScreenLockDepth: Integer;
+    // ⛔ THE PROCESS EXIT CODE. A run that ABORTED must not report success: fbc's runtime answers 1
+    // when an ASSERT fails, and "End n" / "System n" answer n. We had no channel at all for it - the
+    // END parser said so in a comment ("we have no process exit-code channel, so it is parsed and
+    // discarded") - so every failure looked like a success to whatever ran us, and every net that
+    // read $? was blind by construction.
+    FProgramExitCode: Integer;
+
     // SPRDEF modal sprite editor callback (set by the SDL console; nil elsewhere)
     FSpriteEditorCallback: TSpriteEditorCallback;
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
@@ -792,6 +799,12 @@ type
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
     function GetInstructionsExecuted: Int64;
     property InstructionsExecuted: Int64 read FInstructionsExecuted;
+    {$ENDIF}
+    // ⚠️ OUTSIDE the instruction-counting IFDEF on purpose: the exit code is not a statistic, it is the
+    // program's ANSWER, and it must exist in every build. Put inside it once by accident, the field
+    // vanished from the default build and the compiler said so at the one line that used it.
+    property ProgramExitCode: Integer read FProgramExitCode write FProgramExitCode;
+    {$IFDEF ENABLE_INSTRUCTION_COUNTING}
     {$ENDIF}
     function FindPCForSourceLine(SourceLine: Integer): Integer;
     {$IFDEF ENABLE_PROFILER}
@@ -8123,6 +8136,8 @@ begin
       begin
         Ctx.Running := False;
         Ctx.Stopped := False;  // END clears stopped state
+        // "End n": n is what the PROCESS answers with. 0 is both "no code" and "End 0".
+        if Instr.Immediate <> 0 then FProgramExitCode := Instr.Immediate;
       end;
     bcAssert:
       begin
@@ -8144,6 +8159,7 @@ begin
           begin
             Ctx.Running := False;
             Ctx.Stopped := False;
+            FProgramExitCode := 1;   // fbc's runtime exits 1 on a failed ASSERT (measured, -g)
           end;
         end;
       end;

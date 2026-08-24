@@ -4888,6 +4888,7 @@ function TPackratParser.ParseEndStatement: TASTNode;
 var
   Token: TLexerToken;
   ExitArg: TASTNode;
+  ExitCodeVal: Int64;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antEnd, Token);
@@ -4902,22 +4903,27 @@ begin
     Result := nil;
     Exit;
   end;
-  // FreeBASIC END and SYSTEM both carry an optional exit code ("End 1", "System 0"). We have no process
-  // exit-code channel, so it is parsed and discarded; both otherwise halt the program exactly the same.
+  // FreeBASIC END and SYSTEM both carry an optional exit code ("End 1", "System 0"): the value the
+  // PROCESS answers with. It used to be parsed and DISCARDED - the note here said "we have no process
+  // exit-code channel", and that was true of the whole program: sb answered 0 whatever happened. There
+  // is one now (TBytecodeVM.ProgramExitCode), so the value is kept.
   // SYSTEM (FB-only) accepts any expression. For END, only consume a NUMERIC argument, and only in MODERN:
   // this cannot mis-eat a block-ender's keyword ("End Sub") should one ever reach here, and CLASSIC v7 END
-  // is always standalone. Without this the exit code was left as a stray literal statement ("Unhandled node
-  // type 0" warning) and ignored anyway.
+  // is always standalone.
+  // ⚠️ Only a CONSTANT is honoured, and that is declared: the code rides in the opcode's IMMEDIATE, so
+  // a computed one has nowhere to go without a register operand on an opcode that has none. "End n"
+  // with a variable halts exactly as before and answers 0.
+  ExitArg := nil;
   if (UpperCase(Token.Value) = kSYSTEM) and
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
-  begin
-    ExitArg := ParseExpression;
-    if Assigned(ExitArg) then ExitArg.Free;
-  end
+    ExitArg := ParseExpression
   else if FModernMode and Context.CheckAny([ttNumber, ttInteger, ttFloat, ttOpSub, ttDelimParOpen]) then
-  begin
     ExitArg := ParseExpression;
-    if Assigned(ExitArg) then ExitArg.Free;
+  if Assigned(ExitArg) then
+  begin
+    if TryConstIntExpr(ExitArg, ExitCodeVal) then
+      Result.Attributes.Values['EXITCODE'] := IntToStr(ExitCodeVal and 255);
+    ExitArg.Free;
   end;
   DoNodeCreated(Result);
 end;
