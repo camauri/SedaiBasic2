@@ -445,6 +445,7 @@ type
     function ConstFloatToInt(V: Double): Int64;                 // implicit float->int of a CONSTANT
     function ConstFloatToUInt(V: Double): Int64;                // ... to an UNSIGNED-64 destination
     function ToIntValue(const V: TSSAValue): TSSAValue;         // ...of any value (const folded or emitted)
+    function MaskToDeclaredWidth(const Val: TSSAValue; ArgNode: TASTNode): TSSAValue;
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
@@ -4396,6 +4397,12 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           ArgReg := EnsureIntRegister(ArgValue);
+          // ...at the argument's DECLARED WIDTH (see the note on MaskToDeclaredWidth).
+          // ⚠️ ALWAYS, an explicit digit count included: fbc masks FIRST and pads or cuts to the count
+          // afterwards - "Hex(CByte(-1), 4)" is "00FF", not "FFFF". Skipping the mask when a count was
+          // given (the first thing I wrote) made that case sign-extend again, and the guard caught it.
+          if (ArgListNode <> nil) and (ArgListNode.ChildCount >= 1) then
+            ArgReg := EnsureIntRegister(MaskToDeclaredWidth(ArgReg, ArgListNode.GetChild(0)));
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrHex, Result, ArgReg, BaseDigitsArg(ArgListNode), MakeSSAValue(svkNone));
@@ -4411,6 +4418,8 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           ArgReg := EnsureIntRegister(ArgValue);
+          if (ArgListNode <> nil) and (ArgListNode.ChildCount >= 1) then
+            ArgReg := EnsureIntRegister(MaskToDeclaredWidth(ArgReg, ArgListNode.GetChild(0)));   // see HEX above
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           if (FuncName = 'OCT') or (FuncName = kWOCT) then
@@ -23639,6 +23648,36 @@ begin
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaFloatToInt, Result, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
+end;
+
+function TSSAGenerator.MaskToDeclaredWidth(const Val: TSSAValue; ArgNode: TASTNode): TSSAValue;
+// HEX$/OCT/BIN show the value AT ITS DECLARED WIDTH. Measured on fbc 1.10.1:
+//   Dim As Byte b = -1    Hex(b) = "FF"      Oct(b) = "377"    Bin(b) = "11111111"
+//   Dim As Short s = -1   Hex(s) = "FFFF"    Oct(s) = "177777" Bin(s) = 16 ones
+//   Dim As Long  l = -1   Hex(l) = "FFFFFFFF"                  Bin(l) = 32 ones
+// and a positive value is NOT zero-padded ("Hex(CByte(1))" is "1"), so the width is a MASK and not a
+// digit count. We converted at 64 bits, so every negative narrow value came out with the sign extended
+// - "Bin(b)" answered fifty-six ones and then the byte, which is not a number the program ever held.
+//
+// The declared width comes from OperandWidthCode, the same derived answer the print form and the
+// unsigned-opcode selection use; an expression it cannot type keeps the full 64 bits, as before.
+var
+  Mask: Int64;
+  MaskReg: TSSAValue;
+begin
+  Result := Val;
+  if not FModernMode then Exit;
+  case OperandWidthCode(ArgNode) of
+    1, 2, 11: Mask := $FF;              // Byte / UByte / Boolean
+    3, 4:     Mask := $FFFF;            // Short / UShort
+    5, 6, 9, 10: Mask := $FFFFFFFF;     // Long / ULong / Int32 / UInt32
+  else
+    Exit;                               // Integer / LongInt / unknown: the full width, as before
+  end;
+  MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Result, EnsureIntRegister(Val), MaskReg, MakeSSAValue(svkNone));
 end;
 
 function TSSAGenerator.BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;
