@@ -6969,6 +6969,22 @@ begin
   // ⛔ Rebuilt as a NODE, not just re-pointed: several of the shapes below read the target back from
   // Node.GetChild(0) rather than from this variable, so unwrapping only the variable fixed the call
   // form and left "( a(1) ) = 9" still dropped. One statement, one lvalue, one place that says so.
+  // "@ref = expr": RESEATING a reference - pointing it at another object. The reference's OWN storage
+  // is what is written, and in this model that storage holds exactly what the right-hand side yields:
+  // a UDT reference carries the record HANDLE (a "T Ptr" and a T instance are the same handle here),
+  // a scalar reference carries a packed address. Either way it is one copy into the variable.
+  // Without this the statement matched no lvalue shape and was dropped in SILENCE - the right-hand
+  // side was never even evaluated, so "@ru = New UDT" ran no constructor and the reference went on
+  // naming the old object.
+  if (VarNode.NodeType = antProcAddress) and (VarNode.ChildCount = 0) and
+     (VarNode.Value <> Null) and (VarToStr(VarNode.Value) <> '') and
+     ((VarRecordTypeName(VarToStr(VarNode.Value)) <> '') or IsRefVar(VarToStr(VarNode.Value))) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(VarToStr(VarNode.Value))),
+                    EnsureIntRegister(ExprValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if VarNode.NodeType = antParentheses then
   begin
     while (VarNode <> nil) and (VarNode.NodeType = antParentheses) and (VarNode.ChildCount >= 1) do
@@ -9098,6 +9114,21 @@ begin
         finally
           RefTgt.Free;
         end;
+      end
+      // "Dim ByRef As T r = *p" (and the manual's "= *New T"): a reference to what a POINTER points at.
+      // The parser writes the initializer as "@(*expr)", and a reference to "*expr" IS expr - in the
+      // managed model a "T Ptr" and a T instance are the same handle, so binding r to the pointer's
+      // value is the whole operation. Without this the node fell through to the typed-scalar path,
+      // which took the address of an antProcAddress carrying no name and raised "Undefined procedure
+      // (address-of @): " with an EMPTY name - the tell that nothing had claimed the shape.
+      else if (RefTgt.NodeType = antProcAddress) and (RefTgt.ChildCount = 1) and
+              (RefTgt.GetChild(0) <> nil) and (RefTgt.GetChild(0).NodeType = antDeref) and
+              (RefTgt.GetChild(0).ChildCount >= 1) then
+      begin
+        ProcessExpression(RefTgt.GetChild(0).GetChild(0), RecHandleVal);
+        EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
+                        EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Continue;
       end
       else if ResolveRecordObject(RefTgt, RecHandleVal, RefTgtType) then
       begin
@@ -18148,7 +18179,12 @@ begin
   // FreeBASIC "DELETE p": the MODERN parser attaches the pointer expression (an identifier) as child0.
   // The classic line-delete form attaches line-number literals instead, so an antIdentifier child0
   // unambiguously selects the FB form.
-  if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+  // ...and "Delete @r", where the target is a REFERENCE: child0 is an antProcAddress. The classic
+  // line-delete form attaches line-number LITERALS, never an address, so this is unambiguous too -
+  // and without it the statement fell into the line-delete path below and did nothing at all, so the
+  // object was destroyed only at program end.
+  if (Node.ChildCount >= 1) and
+     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress)) then
   begin
     EmitDeleteObject(Node);
     Exit;
@@ -23189,7 +23225,7 @@ procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
 // pre-allocation so the handle/explicit type is honoured.
 var
   i, k: Integer;
-  Decl, ParamList, ParamNode: TASTNode;
+  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned: TASTNode;
   VarName, TypeName: string;
   SavedInProc: Boolean;
 begin
@@ -23227,6 +23263,59 @@ begin
       // so every downstream pass (pre-allocation, ProcessDim, regalloc) handles it identically — no
       // VAR-specific code path. This pre-pass runs in source order before pre-allocation, so an earlier
       // VAR's inferred type is visible to a later VAR that references it. Idempotent (INFER cleared).
+      // "Var ByRef r = target": the reference spelling of VAR. The parser writes the initializer as
+      // "@target", exactly as DIM BYREF does, and leaves the TYPE to be inferred - so it is read here
+      // out of the referand and inserted at child[1], after which the node is the DIM BYREF shape and
+      // every path below treats the two spellings alike.
+      if (Decl.Attributes.Values['INFER'] = '1') and (Decl.Attributes.Values['BYREF'] = '1') and
+         (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) and
+         (Decl.GetChild(1).NodeType = antProcAddress) then
+      begin
+        VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        // The referand: the @ node's operand, or - for the bare "@name" shape, which carries the name
+        // in the node's own value - a stand-in identifier so the same three questions can be asked.
+        if Decl.GetChild(1).ChildCount >= 1 then
+        begin
+          RefTgt := Decl.GetChild(1).GetChild(0);
+          RefTgtOwned := nil;
+        end
+        else
+        begin
+          RefTgtOwned := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Decl.GetChild(1).Value)),
+                                                  Decl.GetChild(0).Token);
+          RefTgt := RefTgtOwned;
+        end;
+        try
+          // Same three questions, in the same order, as the ordinary VAR above: the UDT type first,
+          // then the DECLARED width, and the bank only when nothing declared one.
+          TypeName := ObjectTypeName(RefTgt);
+          if TypeName = '' then
+            case Declared32Code(RefTgt) of
+              1: TypeName := 'BYTE';   2: TypeName := 'UBYTE';
+              3: TypeName := 'SHORT';  4: TypeName := 'USHORT';
+              5: TypeName := 'LONG';   6: TypeName := 'ULONG';
+              7: TypeName := 'SINGLE'; 8: TypeName := 'UINTEGER';
+              9: TypeName := 'INT32'; 10: TypeName := 'UINT32';
+            end;
+          if TypeName = '' then
+            case InferExprBank(RefTgt) of
+              srtString: TypeName := 'STRING';
+              srtInt:    TypeName := 'INTEGER';
+            else
+              TypeName := 'DOUBLE';
+            end;
+        finally
+          if RefTgtOwned <> nil then RefTgtOwned.Free;
+        end;
+        Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
+        Decl.Attributes.Values['INFER'] := '0';
+        // ⛔ NO "Continue" HERE. The node is now the DIM BYREF shape, and the branch that makes a
+        // reference a REFERENCE - recording the pointee in FRefVars and forcing the int bank - is the
+        // one below. Skipping to the next declaration left a scalar "Var ByRef m = n" registered as an
+        // ordinary INTEGER holding an address, which printed 4294967296. The UDT case went right
+        // regardless, because for a UDT the reference IS the handle and needs no such registration -
+        // which is exactly why only half of it looked broken.
+      end;
       if Decl.Attributes.Values['INFER'] = '1' then
       begin
         if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
@@ -24436,7 +24525,12 @@ begin
     for k := 0 to Node.ChildCount - 1 do
     begin
       Decl := Node.GetChild(k);
+      // ⛔ A BYREF declaration is a REFERENCE, not an instance: it OWNS nothing. Collecting it here
+      // gave the scope a second claim on an object someone else had already destroyed - the manual's
+      // variable/byref3 prints every line correctly and then died on an access violation at END,
+      // destroying through "@ru" what "Delete @ru" had already freed.
       if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.Attributes.Values['BYREF'] <> '1') and
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
@@ -24476,6 +24570,7 @@ begin
     begin
       Decl := Node.GetChild(k);
       if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.Attributes.Values['BYREF'] <> '1') and              // a reference owns nothing
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
@@ -24742,6 +24837,7 @@ begin
     begin
       Decl := Node.GetChild(k);
       if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 2) and
+         (Decl.Attributes.Values['BYREF'] <> '1') and              // a reference owns nothing
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
@@ -27565,6 +27661,21 @@ var
   HandleReg: TSSAValue;
 begin
   if Node.ChildCount < 1 then Exit;
+  // "Delete @r" where r is a REFERENCE (or a UDT variable): "@r" of a record is its HANDLE in this
+  // model, so the object to destroy is the one r names. It is the manual's own way of freeing what a
+  // reference was bound to, and it reached here as an antProcAddress rather than a name - a shape
+  // nothing claimed, so the statement was DROPPED and the record was only destroyed at program end.
+  if (Node.GetChild(0).NodeType = antProcAddress) and (Node.GetChild(0).ChildCount = 0) and
+     (Node.GetChild(0).Value <> Null) and
+     (VarRecordTypeName(VarToStr(Node.GetChild(0).Value)) <> '') then
+  begin
+    PtrName := VarToStr(Node.GetChild(0).Value);
+    PtrType := VarRecordTypeName(PtrName);
+    HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+    EmitDestructorCall(HandleReg, PtrType);
+    EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if Node.GetChild(0).NodeType <> antIdentifier then
     raise Exception.Create('DELETE expects a pointer variable');
   PtrName := VarToStr(Node.GetChild(0).Value);
@@ -28444,7 +28555,16 @@ begin
     if FindUDT(Result) < 0 then Result := '';
   end
   else if ObjNode.NodeType = antDeref then
-    Result := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value))           // (*p).field
+  begin
+    // "*New T": the deref of a fresh allocation names T. Needed by "Var ByRef r = *New T", where the
+    // type has to be read out of the initializer - there is no declaration to read it from.
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) and
+       (ObjNode.GetChild(0).NodeType = antNew) then
+      Result := UpperCase(VarToStr(ObjNode.GetChild(0).Value))
+    else
+      Result := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));        // (*p).field
+    if FindUDT(Result) < 0 then Result := '';
+  end
   else if ObjNode.NodeType = antArrayAccess then
   begin
     if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antIdentifier) then

@@ -1522,6 +1522,22 @@ begin
         end;
       end;
 
+    // === REFERENCE RESEATING: "@ref = expr" ===
+    // FreeBASIC lets a reference be POINTED SOMEWHERE ELSE by assigning to its address: "@ru = New UDT"
+    // is the manual's own way of reusing one reference over successive objects. Nothing else can begin
+    // a statement with '@', so this costs no other shape; without it the line was met by the fallback
+    // below and reported as "Unexpected token in statement: @".
+    ttOpAt:
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
+
     {$IFDEF WEB_MODE}
     // === WEB COMMANDS ===
     ttWebCommand: Result := Memoize('WebStatement', @ParseWebStatement);
@@ -1632,6 +1648,20 @@ begin
     SavedToken := Context.CurrentToken;
     LeftSide := TASTNode.CreateWithValue(antSpecialVariable, UpperCase(Token.Value), Token);
     Context.Advance; // Consume special variable
+  end
+  else if Context.Check(ttOpAt) then
+  begin
+    // "@ref = expr": RESEATING a reference - pointing it at another object. The left side is the
+    // reference's own storage, so it parses as the ordinary "@name" address node and the SSA writes
+    // the pointer value into it. Only a reference variable can be on the left, and the SSA says so.
+    LeftSide := FExpressionParser.ParseExpression(precUnary);
+    LhsIsExpr := True;
+    if not Assigned(LeftSide) then
+    begin
+      HandleError('Expected a reference after "@" in assignment', Context.CurrentToken);
+      Result := nil;
+      Exit;
+    end;
   end
   else
   begin
@@ -9371,11 +9401,19 @@ function TPackratParser.ParseVarStatement: TASTNode;
 // bank, declares the (lexically scoped) variable in that bank, and stores the value.
 var
   Token, NameTok: TLexerToken;
-  Decl, InitExpr: TASTNode;
+  Decl, InitExpr, AddrNode: TASTNode;
+  VarIsByref: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume VAR
+  // "Var ByRef r = target": the reference spelling, which the manual writes beside "Dim ByRef As T r".
+  // It was not accepted at all - the word BYREF was met where a name was expected and the statement
+  // failed with "Expected a variable name after VAR". The initializer is wrapped in "@" here, exactly
+  // as DIM BYREF wraps it, so the two spellings reach the SSA in one shape; the TYPE is what VAR
+  // leaves to be inferred, and the pre-pass reads it out of the referand.
+  VarIsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  if VarIsByref then Context.Advance;                // consume BYREF
   repeat
     if not Context.Check(ttIdentifier) then
     begin
@@ -9396,7 +9434,24 @@ begin
     if not Assigned(InitExpr) then Break;
     Decl := TASTNode.Create(antArrayDecl, NameTok);
     Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    Decl.AddChild(InitExpr);                         // child[1] = initializer (NOT a type / dimensions)
+    if VarIsByref then
+    begin
+      // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
+      if InitExpr.NodeType = antIdentifier then
+      begin
+        AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(InitExpr.Value)), NameTok);
+        InitExpr.Free;
+      end
+      else
+      begin
+        AddrNode := TASTNode.Create(antProcAddress, NameTok);
+        AddrNode.AddChild(InitExpr);
+      end;
+      Decl.AddChild(AddrNode);
+      Decl.Attributes.Values['BYREF'] := '1';
+    end
+    else
+      Decl.AddChild(InitExpr);                       // child[1] = initializer (NOT a type / dimensions)
     Decl.Attributes.Values['INFER'] := '1';
     DoNodeCreated(Decl);
     Result.AddChild(Decl);
