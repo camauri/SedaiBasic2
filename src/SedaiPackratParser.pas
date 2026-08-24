@@ -96,6 +96,14 @@ type
     // ...and what each one's inferred TYPE NAME is, so a CONST defined from another CONST can be
     // typed by its VALUE instead of falling back to the numeric default. See InferConstTypeName.
     FConstTypes: TStringList;
+    // ⭐ The VALUE of a CONST that folds to an integer, keyed by name. It exists for the FIXED-LENGTH
+    // CAPACITY of a string declaration, which FreeBASIC routinely writes as a CONST ("f As ZString *
+    // MAXLEN") or an expression over one ("* TOTLEN+1"): TryConstIntExpr knew literals and arithmetic
+    // and NOT names, so such a declaration recorded "capacity present but unknown" and every question
+    // about the SIZE of the field fell back to the 24-byte string descriptor - SizeOf answered 24
+    // where fbc answers 4, and the whole type's layout with it.
+    FConstIntValues: TStringList;
+    FConstFoldVal: Int64;   // scratch for the fold above (a field, so every CONST site can use it)
     // True while ParseConstStatement is parsing the declaration itself. One of its three forms reads
     // the "name = value" part with ParseAssignmentStatement, so without this the rejection below
     // fires on the DECLARATION of a constant whose name was already declared in another scope
@@ -430,6 +438,8 @@ begin
   FConstNames.CaseSensitive := False;
   FConstTypes := TStringList.Create;
   FConstTypes.CaseSensitive := False;
+  FConstIntValues := TStringList.Create;
+  FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
@@ -447,6 +457,7 @@ begin
   FProcSeen.Free;
   FConstNames.Free;
   FConstTypes.Free;
+  FConstIntValues.Free;
   FTypeStaticMethods.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
@@ -3611,7 +3622,7 @@ begin
     if Context.Check(ttOpMul) then
     begin
       Context.Advance;                            // '*'
-      FixedLenExpr := FExpressionParser.ParseExpression(precCall);
+      FixedLenExpr := FExpressionParser.ParseExpression(precTerm);   { '* n': an EXPRESSION - see ParseStaticFixedLen }
       if Assigned(FixedLenExpr) then
       begin
         if TryConstIntExpr(FixedLenExpr, FixedCapVal) then FLastFieldFixedLen := FixedCapVal;
@@ -8489,7 +8500,7 @@ begin
       if Context.Check(ttOpMul) then
       begin
         Context.Advance;                              // '*'
-        FExpressionParser.ParseExpression(precCall).Free;   // length operand (discarded)
+        FExpressionParser.ParseExpression(precTerm).Free;   // length operand (discarded); an EXPRESSION
       end;
     end;
   end;
@@ -8831,6 +8842,13 @@ begin
         if VarIsOrdinal(N.Value) then begin V := N.Value; Exit(True); end;
         Result := TryStrToInt64(VarToStr(N.Value), V);
       end;
+    antIdentifier:
+      // ⭐ A CONST NAME. FreeBASIC writes a capacity as one all the time ("f As ZString * MAXLEN"),
+      // and only literals were folded here - so the capacity was recorded as "present but unknown"
+      // and SizeOf of the field answered the string DESCRIPTOR's width instead. Resolved from the
+      // values recorded as each CONST was parsed, so a name used before its declaration still
+      // declines, exactly as it does in fbc.
+      Result := TryStrToInt64(FConstIntValues.Values[UpperCase(VarToStr(N.Value))], V);
     antParentheses:
       if N.ChildCount >= 1 then Result := TryConstIntExpr(N.GetChild(0), V);
     antUnaryOp:
@@ -9187,7 +9205,7 @@ begin
     if Context.Check(ttOpMul) then
     begin
       Context.Advance;                        // '*'
-      InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
+      InitExpr := FExpressionParser.ParseExpression(precTerm);   // length operand: an EXPRESSION
       if Assigned(InitExpr) then
       begin
         if TryConstIntExpr(InitExpr, FixedCapVal) then SharedFixedLen := IntToStr(FixedCapVal)
@@ -9457,7 +9475,7 @@ begin
       if Context.Check(ttOpMul) then
       begin
         Context.Advance;                     // consume '*'
-        InitExpr := FExpressionParser.ParseExpression(precCall);   // length operand (no binary ops)
+        InitExpr := FExpressionParser.ParseExpression(precTerm);   // length operand: an EXPRESSION
         if Assigned(InitExpr) then
         begin
           // Record the capacity. A constant literal becomes the number (the SSA truncates assignments
@@ -9720,7 +9738,12 @@ var
     Result := '';
     if not Context.Check(ttOpMul) then Exit;
     Context.Advance;                                 // '*'
-    CapExpr := FExpressionParser.ParseExpression(precCall);   // the capacity (no binary ops)
+    // ⛔ THE CAPACITY IS AN EXPRESSION, not one term. "Dim z As ZString * TOTLEN+1" is FreeBASIC's own
+    // spelling (its test suite writes it), and reading a single term stopped at the '+': the rest of the
+    // line was then parsed as a separate statement and the declaration silently lost its capacity.
+    // precTerm takes '+' and '-' and everything tighter, and stops before a comma or a following NAME -
+    // which is what keeps the leading-AS form ("Dim As String * 3 s") reading the name as the name.
+    CapExpr := FExpressionParser.ParseExpression(precTerm);   // the capacity: an EXPRESSION
     if not Assigned(CapExpr) then Exit;
     if TryConstIntExpr(CapExpr, CapVal) then Result := IntToStr(CapVal)
     else Result := '-1';                             // present but non-constant -> advisory
@@ -10540,6 +10563,8 @@ begin
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
     FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
       UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
+      FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
@@ -10589,6 +10614,8 @@ begin
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
     FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
       UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
+      FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
@@ -10633,6 +10660,8 @@ begin
     FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
   FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
     UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+  if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
+    FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);
@@ -10718,6 +10747,20 @@ begin
       if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
       begin
         DataItem := TASTNode.CreateWithValue(antLiteral, -StrToFloat(Context.CurrentToken.Value), Context.CurrentToken);
+        Result.AddChild(DataItem);
+        Context.Advance;
+      end;
+    end
+    // ⭐ ...and an EXPLICIT PLUS. "Data 0, +0.0" is FreeBASIC's own way of writing the positive zero
+    // beside the negative one, and its test suite does exactly that (tests/boolean/boolean_data). Only
+    // the MINUS was read here, so the '+' ended the DATA statement and everything after it on the line
+    // was lost - the item count then no longer matched the READs.
+    else if Context.Check(ttOpAdd) then
+    begin
+      Context.Advance;                                 // consume '+'
+      if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then
+      begin
+        DataItem := TASTNode.CreateWithValue(antLiteral, Context.CurrentToken.Value, Context.CurrentToken);
         Result.AddChild(DataItem);
         Context.Advance;
       end;
