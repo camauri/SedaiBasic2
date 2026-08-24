@@ -7379,9 +7379,14 @@ begin
   // function it sits in, so it emits the reserved word as the target and it resolves here.
   // Evaluate the expression and stage it into the result transfer slot (delivered to the
   // caller on bcReturnSub). QB semantics: execution continues; the actual return is at END.
+  // ...and "OPERATOR = expr", which is how an operator hands its value back and what the manual writes.
+  // The pre-scan that classifies a BYREF return already counts it as a result target; this one did not,
+  // so inside an operator the statement fell through to the ordinary assignment path and the result was
+  // never staged. It showed only on a BYREF cast, where the caller then dereferenced a zero.
   if FInProcedure and FCurrentProcIsFunction and
      ((UpperCase(VarName) = FCurrentProcName) or
       (UpperCase(VarName) = kFUNCTION) or
+      (UpperCase(VarName) = kOPERATOR) or
       (Pos('.', FCurrentProcName) > 0) and
       (UpperCase(VarName) = Copy(FCurrentProcName, Pos('.', FCurrentProcName) + 1, MaxInt))) then
   begin
@@ -7402,6 +7407,15 @@ begin
     if FCurrentProcByrefRet and TryEmitIndexedElementAddress(ExprNode, ExprValue) then
     begin
       EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
+      Exit;
+    end;
+    // ...and "Operator = This.I": a FIELD, whose address is a record-field pointer. Same rule as the
+    // RETURN spelling, and it has to be in both or one form of the same operator works and the other
+    // hands back the field's VALUE where the caller expects a reference.
+    if FCurrentProcByrefRet and (ExprNode.NodeType = antMemberAccess) then
+    begin
+      EmitFieldAddress(ExprNode, ExprValue);
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
       Exit;
     end;
     ProcessExpression(ExprNode, ExprValue);
@@ -28139,6 +28153,12 @@ begin
   if N = nil then Exit;
   while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
   if N.NodeType = antIdentifier then Exit(True);
+  // ...and a FIELD. "Operator T.Cast() ByRef As Integer : Return This.I" hands back a reference to a
+  // member, which is the whole point of an assignable cast operator (the manual's casting/opcast2 writes
+  // "Cast(Integer, u) = 78"). A record field HAS an address here - "@obj.field" packs a record-field
+  // pointer, and the very ssaRefLoad/ssaRefStore the byref-return machinery uses know how to follow one -
+  // so calling it non-addressable made the operator a VALUE return and the assignment was refused.
+  if N.NodeType = antMemberAccess then Exit(True);
   Result := (N.NodeType = antArrayAccess) and (N.Attributes.Values['BRACKET'] = '1') and
             (N.ChildCount >= 2) and
             (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]);
@@ -29026,6 +29046,11 @@ begin
     if Lbl = '' then Exit;
     ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
   end;
+  // A cast declared BYREF hands back an ADDRESS - that is what makes "Cast(Integer, u) = 78" possible -
+  // so READING through it has to dereference, exactly as the index operator's read already does. Without
+  // this the value printed was the record-field POINTER itself.
+  if (Lbl <> '') and ByrefRetByAddress(Lbl) then
+    Val := EmitByrefRetDeref(EnsureIntRegister(Val), Lbl);
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -29103,6 +29128,9 @@ begin
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   if ResolveMethodLabel(TypeName, 'OPERATORCAST$') = '' then Exit;   // '$' = string-returning cast
   ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);
+  // ...and the same dereference for a BYREF string cast (see the numeric one).
+  if ByrefRetByAddress(ResolveMethodLabel(TypeName, 'OPERATORCAST$')) then
+    Val := EmitByrefRetDeref(EnsureIntRegister(Val), ResolveMethodLabel(TypeName, 'OPERATORCAST$'));
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -29207,6 +29235,11 @@ begin
   if IsFunc then
   begin
     RT := GetVariableType(MethodLabel);   // method return bank (record handle => int)
+    // ⛔ ...unless it returns BYREF. Then what travels is an ADDRESS - an INT - whatever the POINTEE's
+    // bank is, and the callee stages it in the int slot. Reading it back in the pointee's bank looked at
+    // the float slot and found nothing: "Operator T.Cast() ByRef As Double" answered 0 while the same
+    // operator declared "As Integer" was right, because there the two banks happen to coincide.
+    if ByrefRetByAddress(MethodLabel) then RT := srtInt;
     DestVal := MakeSSARegister(RT, FProgram.AllocRegister(RT));
     EmitXferLoad(RT, XFER_RESULT_SLOT, DestVal);
     Result := DestVal;
@@ -31493,6 +31526,14 @@ begin
           else if FCurrentProcByrefRet and
                   TryEmitIndexedElementAddress(Node.GetChild(0), RetVal) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
+          // ...and a FIELD, which is what an assignable "Operator Cast() ByRef As T" hands back:
+          // "Return This.I". Its address is a record-field pointer, and the ssaRefLoad/ssaRefStore the
+          // caller uses on a byref result already follow one - only nothing had ever handed one over.
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antMemberAccess) then
+          begin
+            EmitFieldAddress(Node.GetChild(0), RetVal);
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal));
+          end
           else
           begin
             // FreeBASIC "Return Type(args)" shorthand: the bare Type() carries no <T>, so fill its type
