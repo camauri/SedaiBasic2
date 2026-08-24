@@ -713,6 +713,7 @@ type
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
+    function HasUDTNumberCast(Node: TASTNode): Boolean;  // ...and its numeric mirror (emits nothing)
     // "Operator Cast() As <another UDT>": run it and hand back the RESULT's record handle.
     function TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string; out Val: TSSAValue): Boolean;
     function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
@@ -3072,6 +3073,21 @@ begin
       begin
         CastLeft := HasUDTStringCast(Node.GetChild(0)) and (InferExprBank(Node.GetChild(1)) = srtString);
         CastRight := HasUDTStringCast(Node.GetChild(1)) and (InferExprBank(Node.GetChild(0)) = srtString);
+        // ...and BOTH sides when both are such a UDT. The comment above says a UDT-against-UDT
+        // comparison belongs to an "Operator =" - and it does, which is why the overload is tried first
+        // and this is only reached when NONE matched. Left alone at that point the two record HANDLES
+        // were compared, i.e. allocation order: "Select Case v / Case Type<T>(...)" on a type whose only
+        // conversion is "Operator Cast() As String" matched nothing and printed no arm at all.
+        // ⚠️ ...and only when NEITHER side has a NUMERIC cast, which answers first and differently:
+        // udt/step-fraction-iterator compares "This <= end_cond" on a type whose conversion is
+        // "Operator Cast() As Double", and preferring the string one there compared the two as TEXT.
+        if (not CastLeft) and (not CastRight) and
+           (not HasUDTNumberCast(Node.GetChild(0))) and (not HasUDTNumberCast(Node.GetChild(1))) and
+           HasUDTStringCast(Node.GetChild(0)) and HasUDTStringCast(Node.GetChild(1)) then
+        begin
+          CastLeft := True;
+          CastRight := True;
+        end;
       end;
       // In an arithmetic/bitwise op, a UDT operand with a numeric Cast operator converts through it, so a
       // custom numeric type works as "udt + n". Not for "&", which is the string side. No matching
@@ -6061,6 +6077,18 @@ begin
         if (ArrayIndexOf(ArrName) < 0) and
            ((UpperCase(ArrName) = 'STRING$') or (FModernMode and (UpperCase(ArrName) = 'STRING'))) then
         begin
+          // ⛔ ONE argument is not a fill, it is a CONVERSION: "Type<String>(x)" parses as "String(x)",
+          // and FreeBASIC's fill always takes the count AND the character. Sent to the fill anyway it
+          // answered with something plausible - the manual's udt/extendszstring2 printed a length that
+          // was right once and then never changed again, because the fill was reading the wrong operand.
+          // The conversion is the ordinary one, so a UDT goes through its "Operator Cast() As String"
+          // exactly as it does in any other string context.
+          if (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+             (Node.GetChild(1).ChildCount = 1) then
+          begin
+            ProcessStringExpression(Node.GetChild(1).GetChild(0), Result);
+            Exit;
+          end;
           EmitStringFill(Node.GetChild(1), Result);
           Exit;
         end;
@@ -11196,6 +11224,13 @@ begin
             (ArgNode.Token.TokenType = ttStringLiteral);
   if not Result then
     Result := (ArgNode.NodeType = antIdentifier) and (GetVariableType(VarToStr(ArgNode.Value)) = srtString);
+  // ...and any string EXPRESSION, not just a literal or a bare name. FreeBASIC passes the address of
+  // whatever the string is - "v &= Space(2)" becomes "Operator Let(Space(2))" on a ZString Ptr
+  // parameter, and a concatenation or a function result is the common shape there. Recognising only
+  // the two simple ones staged the string register's INDEX into the int slot and the callee
+  // dereferenced it.
+  if not Result then
+    Result := InferExprBank(ArgNode) = srtString;
 end;
 
 function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
@@ -23163,13 +23198,23 @@ begin
 end;
 
 function TSSAGenerator.SigBankPart(const Sig: string): string;
-// The bank-character part of a label's signature, i.e. everything before the ':' that introduces the UDT
-// type tail. Its LENGTH is the parameter count, which is what the arity fallback needs.
+// The bank-character part of a label's signature: everything before the tails. Its LENGTH is the
+// parameter count, which is what the arity fallback needs.
+//
+// ⛔ THERE ARE TWO TAILS, and only one of them was stripped. ':' introduces the UDT type tail; '!'
+// introduces the CONST one, which a parameter declared "As Const" adds. A constructor taking
+// "ByVal pz As Const ZString Ptr" signs "I!-", and reading that as THREE parameters made the arity
+// fallback miss it - so "Dim As T v = <expr>" ran the DEFAULT constructor and dropped the initializer.
+// Without the "Const" the very same declaration worked, which is what said the defect was in the
+// signature and not in the conversion.
 var
-  p: Integer;
+  p, q: Integer;
 begin
-  p := Pos(':', Sig);
-  if p > 0 then Result := Copy(Sig, 1, p - 1) else Result := Sig;
+  Result := Sig;
+  p := Pos(':', Result);
+  if p > 0 then Result := Copy(Result, 1, p - 1);
+  q := Pos('!', Result);
+  if q > 0 then Result := Copy(Result, 1, q - 1);
 end;
 
 function TSSAGenerator.ArgConstSigFromArgs(ArgsNode: TASTNode): string;
@@ -29265,6 +29310,22 @@ begin
   TypeName := ObjectTypeName(Node);
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   Result := ResolveMethodLabel(TypeName, 'OPERATORCAST$') <> '';   // '$' = string-returning cast
+end;
+
+function TSSAGenerator.HasUDTNumberCast(Node: TASTNode): Boolean;
+// The mirror of HasUDTStringCast for the NUMERIC conversions ('%' int, '#' float), and it exists for
+// one decision: when a UDT-against-UDT comparison has no operator overload, which conversion answers.
+// A type with a numeric Cast compares as a NUMBER - the manual's fraction iterator does exactly that -
+// so the string rule must stand aside for it.
+var
+  TypeName: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  TypeName := ObjectTypeName(Node);
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  Result := (ResolveMethodLabel(TypeName, 'OPERATORCAST%') <> '') or
+            (ResolveMethodLabel(TypeName, 'OPERATORCAST#') <> '');
 end;
 
 function TSSAGenerator.TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
