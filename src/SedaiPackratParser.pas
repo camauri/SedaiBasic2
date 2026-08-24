@@ -3570,7 +3570,17 @@ begin
          ((not Context.Check(ttDelimParOpen)) and (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
           (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
       begin
-        MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+        // ⭐ An OPERATOR keeps the word in its name. The definition side labels it "TYPE.OPERATORCAST"
+        // (and "TYPE.OPERATOR[]", "TYPE.OPERATORLET", ...), so recording the bare "CAST" here filed
+        // every decorator under a key nothing looks up: "Declare Virtual Operator Cast() As String"
+        // stored VIRTUALCAST while MethodIsVirtual asked for VIRTUALOPERATORCAST$, answered no, and the
+        // call resolved on the STATIC type. A Child overriding a virtual Cast printed the Parent's
+        // answer through a Parent pointer, while a virtual Sub next to it dispatched correctly - the
+        // tell that the defect was in the NAME and not in the dispatcher.
+        if MethName = kOPERATOR then
+          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value))
+        else
+          MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
         Context.Advance;
       end
       else

@@ -412,6 +412,7 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
+    function MethAttrKey(const MethNm: string): string;   // the name a type-decl decorator is filed under
     function MethodIsVirtual(const TypeName, MethNm: string): Boolean;      // OOP: "Declare Virtual ..." (Abstract implies it)
     function UnimplementedAbstract(const TypeName: string): string;        // OOP: an inherited ABSTRACT with no body, or ''
     procedure CheckInstantiable(const TypeName: string);                    // OOP: refuse to instantiate such a type
@@ -6378,6 +6379,24 @@ begin
             // @arr(i) / @obj.field: keep the operand subtree as child0.
             AddrNode := TASTNode.Create(antProcAddress, ArgNode.Token);
             AddrNode.AddChild(ArgNode.Clone);
+          end;
+          // ⛔ "ProcPtr(p, Virtual ...)" (fbc 1.10+) does NOT ask for an address: it answers the
+          // procedure's VTABLE INDEX, or -1 when it is not virtual, so a program can reach an override
+          // through the object's own vtable pointer. We do not have a vtable a program can index -
+          // polymorphism here is a generated dispatcher chosen by the instance's runtime type-id - so
+          // there is no number we could hand back that would mean the same thing.
+          // Refused by name rather than answered wrongly: before this, operator/procptr4 took the
+          // ordinary address path and printed 4611686018427387904 where fbc runs the override.
+          if (Node.GetChild(1).ChildCount >= 2) and (Node.GetChild(1).GetChild(1) <> nil) and
+             (Node.GetChild(1).GetChild(1).NodeType = antIdentifier) and
+             (UpperCase(VarToStr(Node.GetChild(1).GetChild(1).Value)) = 'VIRTUAL') then
+          begin
+            AddrNode.Free;
+            raise Exception.Create(
+              'ProcPtr(p, Virtual ...) asks for a VTABLE INDEX, which this implementation does not ' +
+              'have: virtual calls go through a generated dispatcher keyed on the runtime type-id, ' +
+              'not through a table the program can index. Call the method directly - the dispatch is ' +
+              'the same one.');
           end;
           // "ProcPtr(p, Sub(...))" (fbc 1.09+): the second argument is a SIGNATURE that names which
           // OVERLOAD of p to take. Its parameter count is all that separates them here.
@@ -21394,7 +21413,7 @@ begin
   Result := '';
   Owner := '';
   T := UpperCase(TypeName);
-  m := UpperCase(MemberName);
+  m := MethAttrKey(MemberName);
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
@@ -22516,6 +22535,19 @@ begin
       '(declared with DECLARE ABSTRACT further up the chain)', [UpperCase(TypeName), m]);
 end;
 
+function TSSAGenerator.MethAttrKey(const MethNm: string): string;
+// The name a DECLARE's decorator (VIRTUAL / ABSTRACT / ACCESS...) is filed under on the antTypeDecl.
+// It is the method name as the PARSER saw it, and for one family that is not the name the rest of the
+// pipeline uses: an OPERATOR CAST is labelled with its RETURN BANK ("TYPE.OPERATORCAST$"), because a
+// type may declare several casts that differ in nothing else. The parser has no return type in hand
+// when it records the decorator, so it files "OPERATORCAST" and this drops the sigil back off.
+begin
+  Result := UpperCase(MethNm);
+  if (Copy(Result, 1, 8) = 'OPERATOR') and (Result <> '') and
+     (Result[Length(Result)] in ['$', '%', '#']) then
+    Result := Copy(Result, 1, Length(Result) - 1);
+end;
+
 function TSSAGenerator.MethodIsVirtual(const TypeName, MethNm: string): Boolean;
 // ⭐ FreeBASIC dispatches ONLY on a method declared Virtual (Abstract implies it). A method without
 // the word is not overridable: a redeclaration in a child SHADOWS it, and the call resolves on the
@@ -22533,7 +22565,7 @@ var
 begin
   Result := False;
   T := UpperCase(TypeName);
-  m := UpperCase(MethNm);
+  m := MethAttrKey(MethNm);
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
@@ -22557,7 +22589,7 @@ var
 begin
   Result := False;
   T := UpperCase(TypeName);
-  m := UpperCase(MethNm);
+  m := MethAttrKey(MethNm);
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
