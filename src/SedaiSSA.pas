@@ -10426,6 +10426,16 @@ begin
         // Give the freshly-grown elements their member-array / nested-UDT backing too. The per-element
         // guard skips any pre-existing (PRESERVE'd) element, so their data is untouched.
         EmitRecordArrayInit(ArrayIdx, UdtIdx);
+        // ⛔ AND RUN THE CONSTRUCTOR. The records were allocated but never CONSTRUCTED, so a REDIM'd
+        // array of a type with a constructor came up with zeroed fields where fbc has whatever the
+        // constructor put there - no fault, no message, just the wrong values. A plain DIM has always
+        // done this (EmitRecordArrayConstruct); the REDIM path allocated and stopped.
+        // ⚠️ NOT on PRESERVE, and that is a declared limit rather than an approximation: after a
+        // PRESERVE the kept elements are already constructed and re-running their constructor would be
+        // worse than leaving the new ones unbuilt. Telling one from the other needs a per-record
+        // "constructed" mark, which this model does not have (the same wall EmitRecordArrayInit's
+        // zero-probe works around, and a probe cannot work here - a constructed record may hold zeros).
+        if PreserveFlag = 0 then EmitRecordArrayConstruct(ArrayIdx, ElemUdtName, 0);
       end;
     end;
   end;
@@ -30974,14 +30984,20 @@ begin
   if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then
   begin
     // Not a field — a PROPERTY setter? obj.prop = expr -> SUB Type.prop.SET(expr).
-    if ResolveMethodLabel(TypeName, VarToStr(MemberNode.Value) + '.SET') <> '' then
-    begin
-      SetterArgs := TASTNode.Create(antArgumentList, MemberNode.Token);
-      SetterArgs.AddChild(ExprNode.Clone);
+    // ⛔ ASKED WITH THE ARGUMENT, because a property may be OVERLOADED on it:
+    //     Property bar.v ( ByVal n As Integer )
+    //     Property bar.v ( ByVal n As ZString Ptr )
+    // are two setters sharing the name "V.SET", so each carries a parameter signature in its label
+    // and the BARE name is registered nowhere. The plain lookup therefore found neither, and the
+    // assignment was DROPPED IN SILENCE - "b.v = 1" did nothing and the next read answered 0. A
+    // single setter worked, which is what made the shape look supported.
+    // ProcessMethodCall below already resolves the overload the same way; only this guard did not.
+    SetterArgs := TASTNode.Create(antArgumentList, MemberNode.Token);
+    SetterArgs.AddChild(ExprNode.Clone);
+    if ResolveMethodLabelArgs(TypeName, VarToStr(MemberNode.Value) + '.SET', SetterArgs) <> '' then
       ProcessMethodCall(MemberNode.GetChild(0), TypeName, VarToStr(MemberNode.Value) + '.SET',
                         SetterArgs, DummyVal);
-      SetterArgs.Free;
-    end;
+    SetterArgs.Free;
     Exit;
   end;
 
