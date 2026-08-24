@@ -1021,7 +1021,7 @@ if (-not $NoHotC) {
             if (Build-HotDisp -Cc $ccBin -ProjectRoot $ProjectRoot) {
                 $debugDefines += 'HOT_C'
                 $hotCEnabled = $true
-                Write-Host "C hot loop: ENABLED ($ccBin)" -ForegroundColor Magenta
+                Write-Host "Hot loop:   C (src\hotdisp.c, $ccBin)" -ForegroundColor Magenta
             } else {
                 if ($HotC) { exit 1 }
                 Write-Host "NOTE: hotdisp.c did not compile - building WITHOUT the C hot loop." -ForegroundColor Yellow
@@ -1031,10 +1031,24 @@ if (-not $NoHotC) {
             Write-Host "  .\setup.ps1 installs one into deps\gcc, or see INSTALL.md." -ForegroundColor Gray
             exit 1
         } else {
-            Write-Host "NOTE: no C compiler - building WITHOUT the C hot loop (27-45% slower where it applies)." -ForegroundColor Yellow
-            Write-Host "  .\setup.ps1 installs one into deps\gcc, or pass -NoHotC to silence this." -ForegroundColor Gray
+            Write-Host "NOTE: no C compiler found." -ForegroundColor Yellow
+            Write-Host "  .\setup.ps1 installs one into deps\gcc, or pass -NoHotC to choose the" -ForegroundColor Gray
+            Write-Host "  Pascal loop on purpose and silence this." -ForegroundColor Gray
         }
     }
+}
+
+# ⛔ OUTSIDE the block above, and that is the whole point: with -NoHotC the block never runs, so a
+# note placed inside it announced the C loop and said NOTHING about the Pascal one. A build with the
+# Pascal arms looked exactly like a build with the C arms, and the difference surfaced later as "why
+# is this slow?".
+#
+# The interpreter is CORRECT either way - the 649-program corpus passes identically on both, checked
+# 24 Aug 2026 on Linux - so this is a note about a choice, never a warning about a fault.
+if (-not $hotCEnabled) {
+    Write-Host "Hot loop:   Free Pascal (the C loop is OFF)" -ForegroundColor Yellow
+    Write-Host "  Correct, and slower on the arms the C loop covers: measured +5% to +281%" -ForegroundColor Gray
+    Write-Host "  depending on the program, 24 Aug 2026. Drop -NoHotC to use the C loop." -ForegroundColor Gray
 }
 
 # ============================================================================
