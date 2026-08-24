@@ -3091,6 +3091,32 @@ End Function
 |---|---|---|
 | `EVENT` | ✗ | Data type for ScreenEvent function. |
 
+### Runtime errors in MODERN: fbc's own abort message
+
+An **uncaught** FreeBASIC runtime error aborts the way `fbc`'s runtime aborts, word for word — a blank
+line, `Aborting due to runtime error N [(text)] at line L of <module>()`, a blank line — and the error
+number is the process **exit code**. The parenthesised text exists for codes 1–17 only; above that
+`fbc` names nothing and prints the number alone. The module is the source path exactly as it was
+passed on the command line, which is the same value `ERMN` reports, and `#line n "file"` renames it.
+
+⛔ **Only an error that carries a FreeBASIC number.** A Pascal exception leaking out of the VM (a
+raw-pointer range error, an access violation) is *ours*: `fbc` has no such error, and dressing it in
+`fbc`'s sentence would claim a fidelity we do not have. Those keep this project's own voice
+(`ERROR during VM execution (BASIC LINE n): …`), which is also what lets a net tell *"the program
+failed as fbc's would"* from *"we cannot do this"*. `--verbose` restores the full dump either way.
+
+**CLASSIC is untouched**: its errors follow the Commodore table, and the two tables stay separate.
+
+⚠️ `#line` currently reaches the **abort message** and `__LINE__`. `ERL`, `ERMN` and `Assert`'s
+`path(line):` prefix still report the physical position.
+
+### Declared divergence: integer division by zero
+
+`x \ 0` and `x Mod 0` raise a **catchable runtime error** here. `fbc` emits the bare machine
+instruction, so on x86 the program takes a hardware `SIGFPE` and **dumps core** — the manual's own
+`control/iif` and `control/iif2` do exactly that. Ours is a defined state where `fbc`'s is a crash;
+the divergence is deliberate and is not going to be reproduced.
+
 ### Declared unsupported (24 August 2026)
 
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
@@ -3131,6 +3157,14 @@ Each of these is *refused with a message that names the reason*, never answered 
   "infinite recursion detected" and dies. Here it yields the procedure's name as text, like
   `__FUNCTION__`. ⚠️ The one use the manual makes of it, `@__FUNCTION_NQ__` (the enclosing
   procedure's own address), *is* supported and means exactly `@<that procedure>`.
+- **The C standard library through `<crt.bi>`** (`printf`, `fopen`, `fprintf`, `vprintf`, …). There is
+  no C FFI here and there will not be one: the VM owns its memory and its file handles, and handing a
+  BASIC program a real `FILE*` is the one thing the memory-safety design exists to prevent. Including
+  the header is harmless — most programs that do never call into it — but a *call* fails, now with a
+  message that says so rather than "Array not declared". Use the BASIC equivalents
+  (`Open`/`Print #`/`Close`, `Print Using`).
+- **Inline assembly**: `Asm … End Asm`, `Naked` procedures, `#pragma reserve`, and `__FB_ASM__`
+  branches that select one. Machine code in the source is not something a bytecode VM can host.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance

@@ -240,6 +240,7 @@ type
     function AtEndProcedure: Boolean;
     // CALL name [ ( args ) ] : statement-level SUB invocation.
     function ParseCallStatement: TASTNode;
+    function ParenGroupIsFollowedByAs(Offset: Integer): Boolean;  // "( ... ) As" starting at Offset?
     function ParseBareCallStatement: TASTNode;
     // BASE [ ( args ) ] : explicit base-constructor call inside a child CONSTRUCTOR (M4.4f).
     function ParseBaseStatement: TASTNode;
@@ -1235,9 +1236,16 @@ begin
       // "PROPERTY = expr" is the same statement inside a property GETTER: the manual's static-member
       // example ends its getter with "Property = This.ID", which parsed as a declaration and stopped the
       // whole file at "Expected a name after PROPERTY".
+      // ⛔ ...unless it is the DECLARATION of the equality operator: "Operator = ( ByRef lhs As T,
+      // ByRef rhs As U ) As R" begins with the same two tokens and is not an assignment at all. It was
+      // taken for one, and the parameter list was then read as a parenthesised EXPRESSION, which died
+      // on "Unexpected token ByRef" - the whole of proguide/object-class stopped there.
+      // The two are told apart by what CLOSES the parentheses: a declaration continues "... ) As <type>",
+      // a result assignment does not (and "Operator = (a + b)" is a perfectly ordinary one).
       if ((UpperCase(Token.Value) = kFUNCTION) or (UpperCase(Token.Value) = kOPERATOR) or
           (UpperCase(Token.Value) = kPROPERTY)) and
-         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) and
+         not ((UpperCase(Token.Value) = kOPERATOR) and ParenGroupIsFollowedByAs(2)) then
         Result := Memoize('FunctionResultAssign', @ParseFunctionResultAssign)
       else if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
          (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
@@ -1522,6 +1530,22 @@ begin
         end;
       end;
 
+    // === REFERENCE RESEATING: "@ref = expr" ===
+    // FreeBASIC lets a reference be POINTED SOMEWHERE ELSE by assigning to its address: "@ru = New UDT"
+    // is the manual's own way of reusing one reference over successive objects. Nothing else can begin
+    // a statement with '@', so this costs no other shape; without it the line was met by the fallback
+    // below and reported as "Unexpected token in statement: @".
+    ttOpAt:
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end;
+
     {$IFDEF WEB_MODE}
     // === WEB COMMANDS ===
     ttWebCommand: Result := Memoize('WebStatement', @ParseWebStatement);
@@ -1633,6 +1657,20 @@ begin
     LeftSide := TASTNode.CreateWithValue(antSpecialVariable, UpperCase(Token.Value), Token);
     Context.Advance; // Consume special variable
   end
+  else if Context.Check(ttOpAt) then
+  begin
+    // "@ref = expr": RESEATING a reference - pointing it at another object. The left side is the
+    // reference's own storage, so it parses as the ordinary "@name" address node and the SSA writes
+    // the pointer value into it. Only a reference variable can be on the left, and the SSA says so.
+    LeftSide := FExpressionParser.ParseExpression(precUnary);
+    LhsIsExpr := True;
+    if not Assigned(LeftSide) then
+    begin
+      HandleError('Expected a reference after "@" in assignment', Context.CurrentToken);
+      Result := nil;
+      Exit;
+    end;
+  end
   else
   begin
     HandleError('Expected variable name in assignment', Context.CurrentToken);  // ← Token corrente
@@ -1670,6 +1708,12 @@ begin
     Result := TASTNode.Create(antAssignment, SavedToken);
     Result.AddChild(LeftSide);
     Result.AddChild(Expression);
+    // ...and the mark the SYMBOLIC branch below stamps, for the same reason: a UDT may overload the
+    // SELF-operator ("Operator T.Mod= (rhs)"), which mutates in place and is not "x = x Mod rhs" -
+    // there may be no binary Mod for the type at all. Without it the desugared form was lowered
+    // against the record HANDLE and the statement did nothing visible: "x Mod= 5" left x unchanged
+    // while "x += 3" ran the operator, one keyword apart. One rule, two spellings, one place each.
+    Result.Attributes.Values['COMPOUNDOP'] := UpperCase(OpSym);
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2489,12 +2533,34 @@ begin
       // exactly like the binary "*" and the two could not be told apart.
       if Context.Check(ttCompoundAssign) then OpSym := OpSym + '=';
       Context.Advance;                              // operator name
+      // ...and the KEYWORD self-operators, "Operator T.Mod= (rhs)" and its family. A keyword operator
+      // stops at the '=', so the lexer yields the operator token and a SEPARATE ttOpEq - the same
+      // shape the assignment grammar already has to undo for "lhs Mod= rhs". Without spelling the '='
+      // back in here the '=' was left where a parameter list was expected and derailed the statement.
+      if ((OpSym = kMOD) or (OpSym = 'SHL') or (OpSym = 'SHR') or (OpSym = 'AND') or (OpSym = 'OR') or
+          (OpSym = 'XOR') or (OpSym = 'EQV') or (OpSym = 'IMP')) and Context.Check(ttOpEq) then
+      begin
+        OpSym := OpSym + '=';
+        Context.Advance;                            // '='
+      end;
       // The INDEX operator "Operator T.[] (i) ByRef As E" is written with two delimiter tokens, not one
       // name: '[' was taken as the whole operator and the ']' left behind derailed the statement. It is a
       // method with an implicit THIS, like CAST and LET, so it only needs its name spelled whole.
       if (OpSym = '[') and Context.Check(ttDelimBrackClose) then
       begin
         OpSym := '[]';
+        Context.Advance;                            // ']'
+      end;
+      // The ARRAY forms of the allocation operators, "Operator T.New[] (...)" and "Operator
+      // T.Delete[] (...)": the name is a word FOLLOWED by the two bracket tokens, so the '[' was left
+      // where a parameter list was expected and derailed the statement. The brackets are part of the
+      // NAME and must stay in it - "New" and "New[]" are two different operators, and one label for
+      // both would let the second definition overwrite the first.
+      if ((OpSym = kNEW) or (OpSym = kDELETE)) and Context.Check(ttDelimBrackOpen) and
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimBrackClose) then
+      begin
+        OpSym := OpSym + '[]';
+        Context.Advance;                            // '['
         Context.Advance;                            // ']'
       end;
     end
@@ -2964,6 +3030,40 @@ begin
   if HasParens and Context.Check(ttDelimParClose) then
     Context.Advance;                              // )
   DoNodeCreated(Result);
+end;
+
+function TPackratParser.ParenGroupIsFollowedByAs(Offset: Integer): Boolean;
+// Is the token at Offset an opening parenthesis whose MATCHING close is followed by "As"? That is the
+// shape of a parameter list with a return type - "( ByRef lhs As T, ByRef rhs As U ) As R" - and it is
+// what tells the declaration of the equality operator from "Operator = <expr>", which begins with the
+// same two tokens. Bounded: it stops at the end of the statement.
+var
+  i, Depth: Integer;
+  T: TLexerToken;
+begin
+  Result := False;
+  T := Context.PeekToken(Offset);
+  if not Assigned(T) or (T.TokenType <> ttDelimParOpen) then Exit;
+  Depth := 0;
+  i := Offset;
+  while True do
+  begin
+    T := Context.PeekToken(i);
+    if not Assigned(T) then Exit;
+    if T.TokenType in [ttEndOfFile] then Exit;
+    if T.TokenType = ttDelimParOpen then Inc(Depth)
+    else if T.TokenType = ttDelimParClose then
+    begin
+      Dec(Depth);
+      if Depth = 0 then
+      begin
+        T := Context.PeekToken(i + 1);
+        Result := Assigned(T) and (T.TokenType = ttAsType);
+        Exit;
+      end;
+    end;
+    Inc(i);
+  end;
 end;
 
 function TPackratParser.ParseBareCallStatement: TASTNode;
@@ -8184,6 +8284,29 @@ var
 begin
   Token := Context.CurrentToken;
 
+  // "REDIM (<array expression>)(dims)" - the target in PARENTHESES. FreeBASIC's own manual prescribes
+  // this spelling, and says why: "Redim u(0).array(0 To 9)" is ambiguous (fbc reads it as redimming u
+  // and reports "Duplicated definition"), so the array expression is wrapped to say where it ends.
+  // The name-then-dots walk below cannot express it - the object is an array ELEMENT, not a plain name -
+  // so the whole declaration failed with "Expected variable name in array declaration". Reading and
+  // writing "u(0).array(i)" already worked; only the REDIM target had no route to it.
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                                  // (
+    VarName := FExpressionParser.ParseExpression;
+    if not Assigned(VarName) then
+    begin
+      HandleError('Expected an array expression after "(" in REDIM', Context.CurrentToken);
+      Result := nil; Exit;
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after the array expression in REDIM', Context.CurrentToken);
+      VarName.Free; Result := nil; Exit;
+    end;
+  end
+  else
+  begin
   // Parse variable name
   if not Context.Check(ttIdentifier) then
   begin
@@ -8213,6 +8336,7 @@ begin
     VarName := MemberNode;
     Context.Advance;                                  // field name
   end;
+  end;   // end of the unparenthesised "name[.field...]" target
 
   // Expect opening parenthesis
   if not Context.Match(ttDelimParOpen) then
@@ -9347,11 +9471,19 @@ function TPackratParser.ParseVarStatement: TASTNode;
 // bank, declares the (lexically scoped) variable in that bank, and stores the value.
 var
   Token, NameTok: TLexerToken;
-  Decl, InitExpr: TASTNode;
+  Decl, InitExpr, AddrNode: TASTNode;
+  VarIsByref: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume VAR
+  // "Var ByRef r = target": the reference spelling, which the manual writes beside "Dim ByRef As T r".
+  // It was not accepted at all - the word BYREF was met where a name was expected and the statement
+  // failed with "Expected a variable name after VAR". The initializer is wrapped in "@" here, exactly
+  // as DIM BYREF wraps it, so the two spellings reach the SSA in one shape; the TYPE is what VAR
+  // leaves to be inferred, and the pre-pass reads it out of the referand.
+  VarIsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  if VarIsByref then Context.Advance;                // consume BYREF
   repeat
     if not Context.Check(ttIdentifier) then
     begin
@@ -9372,7 +9504,24 @@ begin
     if not Assigned(InitExpr) then Break;
     Decl := TASTNode.Create(antArrayDecl, NameTok);
     Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    Decl.AddChild(InitExpr);                         // child[1] = initializer (NOT a type / dimensions)
+    if VarIsByref then
+    begin
+      // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
+      if InitExpr.NodeType = antIdentifier then
+      begin
+        AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(InitExpr.Value)), NameTok);
+        InitExpr.Free;
+      end
+      else
+      begin
+        AddrNode := TASTNode.Create(antProcAddress, NameTok);
+        AddrNode.AddChild(InitExpr);
+      end;
+      Decl.AddChild(AddrNode);
+      Decl.Attributes.Values['BYREF'] := '1';
+    end
+    else
+      Decl.AddChild(InitExpr);                       // child[1] = initializer (NOT a type / dimensions)
     Decl.Attributes.Values['INFER'] := '1';
     DoNodeCreated(Decl);
     Result.AddChild(Decl);

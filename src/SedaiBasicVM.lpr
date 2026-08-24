@@ -49,6 +49,8 @@ uses
   SedaiBytecodeDisassembler, SedaiOpcodeTable, SedaiJit, SedaiAot,
   // Headless file I/O handler (OPEN/PRINT#/INPUT#/EOF/FREEFILE...) for the CLI VM
   SedaiFileIO,
+  // FreeBASIC runtime error codes and the wording fbc's runtime uses when a program aborts
+  SedaiExecutorErrors,
   // Register Allocation
   SedaiRegAlloc,
   // Peephole and Superinstructions
@@ -673,6 +675,8 @@ var
   PassPrevCount: Integer;
   i, removed: Integer;
   ErrorSourceLine: Integer;
+  ProgIsModern: Boolean;      // dialect of THIS program: drives fbc's abort message on an uncaught error
+  AbortDesc, AbortModule: string;
   QBLangDetected: Boolean;
   ShowBanners: Boolean;
   AotFuncList: TAotFuncs;
@@ -872,7 +876,8 @@ begin
     try
       // Dialect gate for FB lexical scope: MODERN when the source has no line numbers (mirrors the
       // lexer config above), CLASSIC otherwise. CLASSIC keeps BASIC v7 global-by-name semantics.
-      SSAGen.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+      ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+      SSAGen.ModernMode := ProgIsModern;
       try
         Timer := CreateHiResTimer;
         SSAProgram := SSAGen.Generate(ParserResult.AST);
@@ -2001,6 +2006,38 @@ begin
           // The program's own output may still be buffered: drain it FIRST, or this message
           // lands ahead of text the program produced before failing.
           TerminalOutFlush;
+          // ⭐ MODERN: an uncaught FreeBASIC RUNTIME ERROR aborts the way fbc's runtime aborts, word
+          // for word - a blank line, "Aborting due to runtime error N [(text)] at line L of <module>()",
+          // a blank line, and the error number as the EXIT CODE. That is what a FreeBASIC program's
+          // failure looks like, and a program that prints it is what its user is expecting to read.
+          // MEASURED against fbc 1.10.1; the module name is the source path exactly as it was passed
+          // on the command line, which is the same value ERMN already reports.
+          //
+          // ⛔ ONLY an error that CARRIES A FREEBASIC NUMBER. A Pascal exception leaking out of the VM
+          // (ERangeError on a raw pointer, EAccessViolation, an internal message) is OURS: fbc has no
+          // such error, there is no number to print, and dressing it in fbc's sentence would claim a
+          // fidelity we do not have. Those keep this project's own voice - which is also what lets a
+          // net tell "the program failed as fbc's would" from "we cannot do this".
+          // CLASSIC is untouched: its errors follow the Commodore table, and the two stay separate.
+          if ProgIsModern and (not OptVerbose) and (E is SedaiExecutorErrors.TExecutorException) and
+             (SedaiExecutorErrors.TExecutorException(E).ErrorCode <> 0) then
+          begin
+            ErrorSourceLine := 0;
+            if (VM.PC >= 0) and (VM.PC < BytecodeProgram.GetInstructionCount) then
+              ErrorSourceLine := BytecodeProgram.GetSourceLine(VM.PC);
+            // "#line n "file"" renames the position a diagnostic reports, which is exactly this one.
+            AbortModule := BytecodeProgram.ModuleName;
+            PPMapLine(ErrorSourceLine, ErrorSourceLine, AbortModule);
+            AbortDesc := FBAbortDescription(SedaiExecutorErrors.TExecutorException(E).ErrorCode);
+            if AbortDesc <> '' then AbortDesc := ' (' + AbortDesc + ')';
+            WriteLn;
+            WriteLn('Aborting due to runtime error ', SedaiExecutorErrors.TExecutorException(E).ErrorCode, AbortDesc,
+                    ' at line ', ErrorSourceLine, ' of ', AbortModule, '()');
+            WriteLn;
+            TerminalOutFlush;
+            ExitCode := SedaiExecutorErrors.TExecutorException(E).ErrorCode;
+            Exit;
+          end;
           Write('ERROR during VM execution');
           if OptVerbose then
             Write(' at PC=', VM.PC);

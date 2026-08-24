@@ -37,6 +37,28 @@ type
 var
   GTargetIsWasm: Boolean = False;
 
+type
+  { One "#line <n> ["file"]" directive: from the PHYSICAL source line it stands on, positions are
+    reported as if that line were ReportedLine of ModuleName. FreeBASIC's own use for it is a code
+    GENERATOR: the emitted file carries the positions of the file it was generated FROM, so a
+    diagnostic points at what the author wrote. It affects REPORTING only - never what the program
+    computes - which is why ignoring it, as this preprocessor used to, was silent rather than loud. }
+  TPPLineDirective = record
+    FromPhysical: Integer;    // the physical line the directive itself occupies (1-based)
+    ReportedLine: Integer;    // ...which is reported as this
+    ModuleName: string;       // '' = keep the module name it had
+  end;
+
+var
+  { Filled by PreprocessSource, in physical-line order; empty for a source with no #line. Read by
+    whoever reports a POSITION (the uncaught-error abort message). A global for the same reason
+    GUniqueIdStacks is one: the preprocessor hands back text, and this is about that text. }
+  GPPLineDirectives: array of TPPLineDirective;
+
+{ The line number to REPORT for a physical source line, and the module to report it in. Answers the
+  physical line and the unchanged module when no #line covers it. }
+procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string);
+
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 function DetectQBLang(const Src: string): Boolean;
 
@@ -1273,20 +1295,57 @@ end;
 // non-numeric); parentheses; unary "-"/"+" and NOT/"!"; "*" "/" "\" MOD; "+" "-"; comparisons
 // "=" "==" "<>" "!=" "<" "<=" ">" ">="; AND/"&&"; OR/"||". Nonzero result => take the branch. On any
 // problem it returns False (safe default: branch not taken).
-function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64): Boolean; forward;
+function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64;
+  FnDefs: TStringList = nil): Boolean; forward;
 
-function EvalPPExpr(const RawExpr: string; Defs: TStringList): Boolean;
+function EvalPPExpr(const RawExpr: string; Defs: TStringList;
+  FnDefs: TStringList = nil): Boolean;
 // #if / #elseif: the expression as a CONDITION.
 var
   V: Int64;
 begin
-  Result := EvalPPExprInt(RawExpr, Defs, V) and (V <> 0);
+  Result := EvalPPExprInt(RawExpr, Defs, V, FnDefs) and (V <> 0);
 end;
 
 const
   cPPStrTok = #2;   // leading byte marking a tokenized STRING LITERAL; no source character can be this
 
-function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64): Boolean;
+function NextNonBlankIsOpenParen(const S: string; P: Integer): Boolean;
+// Is the next non-blank character at or after P an opening parenthesis? Tells a function-like macro
+// INVOCATION from a bare mention of its name.
+begin
+  while (P <= Length(S)) and (S[P] in [' ', #9]) do Inc(P);
+  Result := (P <= Length(S)) and (S[P] = '(');
+end;
+
+function GatherBalancedParens(const S: string; var P: Integer): string;
+// The "( ... )" starting at P, parentheses balanced, quotes respected. P is left past the closing one.
+var
+  Depth: Integer;
+  InStr: Boolean;
+begin
+  Result := '';
+  if (P > Length(S)) or (S[P] <> '(') then Exit;
+  Depth := 0; InStr := False;
+  while P <= Length(S) do
+  begin
+    Result := Result + S[P];
+    if S[P] = '"' then InStr := not InStr
+    else if not InStr then
+    begin
+      if S[P] = '(' then Inc(Depth)
+      else if S[P] = ')' then
+      begin
+        Dec(Depth);
+        if Depth = 0 then begin Inc(P); Exit; end;
+      end;
+    end;
+    Inc(P);
+  end;
+end;
+
+function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64;
+  FnDefs: TStringList = nil): Boolean;
 // ...and as a VALUE, which is what "__FB_EVAL__(expr)" needs: it substitutes the RESULT of a constant
 // integer expression, so another macro can take it as an argument. False when there is nothing to
 // evaluate. The two entry points share one parser - the condition is simply "the value is non-zero".
@@ -1387,6 +1446,23 @@ var
             'TypeOf() in a #if condition is not supported: the preprocessor has no type information')
         else if (id = 'AND') or (id = 'OR') or (id = 'NOT') or (id = 'MOD') then
           Toks.Add(id)
+        // A FUNCTION-LIKE macro INVOCATION: "__FB_MIN_VERSION__(0, 18, 2)". Only object-like macros
+        // were substituted here, so a call like that read as an undefined identifier (0) followed by a
+        // parenthesised list - and the condition came out FALSE whatever the arguments. fbc defines
+        // __FB_MIN_VERSION__ as an ordinary function-like macro, and a module guarding itself with
+        // "#if Not __FB_MIN_VERSION__(0,18,2)" therefore refused to compile against a version that
+        // satisfies it. The call text is expanded through the ordinary substitution and re-tokenized,
+        // exactly as an object-like macro's value is.
+        else if (FnDefs <> nil) and (FnDefs.IndexOfName(id) >= 0) and
+                (NextNonBlankIsOpenParen(S, p)) then
+        begin
+          q := p;
+          while (q <= Length(S)) and (S[q] in [' ', #9]) do Inc(q);
+          nm := id + GatherBalancedParens(S, q);   // q lands past the closing ')'
+          p := q;
+          if Depth < 32 then Tokenize(SubstituteMacros(nm, Defs, FnDefs, 0), Depth + 1)
+          else Toks.Add('0');
+        end
         else if Defs.IndexOfName(id) >= 0 then
         begin
           // Re-tokenize the macro's value so multi-token values (-1, &HFF, 1+2) and nested
@@ -1634,7 +1710,7 @@ begin
   end;
 end;
 
-procedure RegisterIntrinsicDefines(Defs: TStringList);
+procedure RegisterIntrinsicDefines(Defs, FnDefs: TStringList);
 // Pre-populate the macro table with FreeBASIC compiler intrinsic defines, so FB programs that use
 // conditional compilation (#if __FB_WIN32__ / #ifdef __FB_64BIT__ / #if __FB_VER_MAJOR__ >= 1) take
 // the right branch instead of failing. SedaiBasic claims FreeBASIC 1.10.x compatibility. Values use
@@ -1648,9 +1724,22 @@ begin
   Defs.Values['__FB_VER_MAJOR__'] := '1';
   Defs.Values['__FB_VER_MINOR__'] := '10';
   Defs.Values['__FB_VER_PATCH__'] := '1';
+  // __FB_MIN_VERSION__(major, minor, patch): true when the compiler is at least that version. fbc
+  // defines it in its own prelude as this very expression, so it is written out the same way rather
+  // than folded to a constant - a program may pass any triple. Measured against fbc 1.10.1:
+  // (0,18,2) -> -1, (2,0,0) -> 0.
+  FnDefs.Values['__FB_MIN_VERSION__'] :=
+    'major,minor,patchlevel'#1 +
+    '(__FB_VER_MAJOR__ > (major) or (__FB_VER_MAJOR__ = (major) and ' +
+    '(__FB_VER_MINOR__ > (minor) or (__FB_VER_MINOR__ = (minor) and ' +
+    '__FB_VER_PATCH__ >= (patchlevel)))))';
   Defs.Values['__FB_SIGNATURE__'] := '"SedaiBasic (FreeBASIC-compatible)"';
   // --- Language / compile mode, mapped to SedaiBasic's actual state ---
   Defs.Values['__FB_LANG__']    := '"fb"';
+  // OPTION EXPLICIT is IMPLIED by -lang fb: every variable must be declared, and fbc answers -1 here
+  // (measured). MODERN is that dialect, so the answer is the same - a module guarding itself with
+  // "#if __FB_OPTION_EXPLICIT__ = 0 : #error ..." must compile, not refuse.
+  Defs.Values['__FB_OPTION_EXPLICIT__'] := '-1';
   Defs.Values['__FB_MT__']      := '-1';   // multithreading runtime is available
   Defs.Values['__FB_OUT_EXE__'] := '-1';   // programs are run (executable-like target)
   // fbc defines this while compiling the module that holds the program's entry point. There is exactly
@@ -1718,6 +1807,28 @@ begin
   {$IFDEF ENDIAN_BIG}
   Defs.Values['__FB_BIGENDIAN__'] := '-1';
   {$ENDIF}
+end;
+
+function PPFirstBreak(const S: string): Integer;
+// How many characters of S run up to the first blank: the "<n>" of "#line <n> \"file\"".
+begin
+  Result := 0;
+  while (Result < Length(S)) and not (S[Result + 1] in [' ', #9]) do Inc(Result);
+end;
+
+procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string);
+// The LAST #line at or before this physical line wins, and the count runs on from there: a directive
+// standing on physical line P and saying N makes P report as N, P+1 as N+1, and so on.
+var
+  i, k: Integer;
+begin
+  Reported := Physical;
+  k := -1;
+  for i := 0 to High(GPPLineDirectives) do
+    if GPPLineDirectives[i].FromPhysical <= Physical then k := i else Break;
+  if k < 0 then Exit;
+  Reported := GPPLineDirectives[k].ReportedLine + (Physical - GPPLineDirectives[k].FromPhysical);
+  if GPPLineDirectives[k].ModuleName <> '' then Module := GPPLineDirectives[k].ModuleName;
 end;
 
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
@@ -1855,10 +1966,13 @@ var
     Lines: TStringList;
     li, p, q: Integer;
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
-    Params, MacroBody, BodyTrim, EName, ERest: string;
+    Params, MacroBody, BodyTrim, EName, ERest, LineFile: string;
+    LineNum: Integer;
     IsFn: Boolean;
     OptParen: Boolean;   // "#macro name ? (params)": the parentheses are optional at the call site
     ParentEmit, Cond: Boolean;
+    MappedLine: Integer;
+    MappedModule: string;
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
     SavedStackTop: Integer;
@@ -1874,7 +1988,9 @@ var
         Trimmed := TrimLeft(Raw);
         // __LINE__ expands to the current source line number (1-based). Updated every line so it is
         // correct wherever it appears; __FILE__ is set once (top-level file) in the begin block below.
-        Defs.Values['__LINE__'] := IntToStr(li + 1);
+        // __LINE__ is the same question a diagnostic asks, so it follows #line too.
+        PPMapLine(li + 1, MappedLine, MappedModule);
+        Defs.Values['__LINE__'] := IntToStr(MappedLine);
         // QuickBASIC-style metacommand '$INCLUDE: 'file' (a leading apostrophe makes it a comment to
         // the lexer; intercept it here and splice the file, like #include).
         if (Length(Trimmed) >= 9) and (UpperCase(Copy(Trimmed, 1, 9)) = '''$INCLUDE') and Emitting then
@@ -1953,7 +2069,7 @@ var
           else if DName = 'if' then
           begin
             ParentEmit := Emitting;
-            Cond := ParentEmit and EvalPPExpr(DRest, Defs);
+            Cond := ParentEmit and EvalPPExpr(DRest, Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -1973,7 +2089,7 @@ var
                 else if DName = 'elseifndef' then
                   Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0)
                 else
-                  Cond := ParentEmit and EvalPPExpr(DRest, Defs);
+                  Cond := ParentEmit and EvalPPExpr(DRest, Defs, FnDefs);
                 Active[High(Active)] := Cond;
                 if Cond then Taken[High(Taken)] := True;
               end;
@@ -1995,6 +2111,31 @@ var
             begin
               SetLength(Active, Length(Active) - 1);
               SetLength(Taken, Length(Taken) - 1);
+            end;
+          end
+          else if (DName = 'line') and Emitting then
+          begin
+            // "#line <n> ["file"]": from here on, report positions as if this line were <n> of
+            // <file>. It changes NOTHING the program computes - only what a diagnostic says - which
+            // is why ignoring it was silent: prepro/line aborted with our own line and our own file
+            // name and looked like an ordinary answer.
+            // ⚠️ Recorded here and consulted where a position is REPORTED. __LINE__ follows it too,
+            // being the same question asked from inside the program.
+            LineNum := StrToIntDef(Trim(Copy(Trim(DRest), 1, PPFirstBreak(Trim(DRest)))), -1);
+            LineFile := '';
+            p := Pos('"', DRest);
+            if p > 0 then
+            begin
+              LineFile := Copy(DRest, p + 1, MaxInt);
+              q := Pos('"', LineFile);
+              if q > 0 then LineFile := Copy(LineFile, 1, q - 1) else LineFile := '';
+            end;
+            if LineNum >= 0 then
+            begin
+              SetLength(GPPLineDirectives, Length(GPPLineDirectives) + 1);
+              GPPLineDirectives[High(GPPLineDirectives)].FromPhysical := li + 1;
+              GPPLineDirectives[High(GPPLineDirectives)].ReportedLine := LineNum;
+              GPPLineDirectives[High(GPPLineDirectives)].ModuleName := LineFile;
             end;
           end
           else if (DName = 'define') and Emitting then
@@ -2173,7 +2314,7 @@ var
           else if (DName = 'assert') and Emitting then
           begin
             // #assert <expr> — abort compilation if the constant integer expression is false.
-            if not EvalPPExpr(DRest, Defs) then
+            if not EvalPPExpr(DRest, Defs, FnDefs) then
               raise EPreprocessorError.Create('assertion failed: ' + Trim(DRest));
           end;
           // All directive lines are dropped from the output; emit a blank to keep line numbers.
@@ -2231,12 +2372,13 @@ begin
   GUniqueIdStacks.Clear;
   GUniqueIdSerial := 0;
 
+  SetLength(GPPLineDirectives, 0);   // per COMPILATION, like the unique-id stacks above
   IncOnce := TStringList.Create;
   FReprocessDepth := 0;
   FnDefs := TStringList.Create;
   Output := TStringList.Create;
   try
-    RegisterIntrinsicDefines(Defs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
+    RegisterIntrinsicDefines(Defs, FnDefs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
     // __FILE__ expands to the top-level source file name (string literal); empty if unknown.
     // In the PLATFORM's spelling: the name arrives here however the caller wrote it, and on Windows a
     // program that prints __FILE__ got forward slashes where fbc gives backslashes. The path is the

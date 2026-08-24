@@ -228,6 +228,7 @@ function GetErrorCodeDescription(ErrorCode: Integer): string;
 // resume" and Commodore 5 is DEVICE NOT PRESENT - so "Error 5" in MODERN reported the Commodore text
 // until 23 Aug 2026. Word-for-word from the manual's Runtime Error Codes table.
 function GetFBErrorCodeDescription(ErrorCode: Integer): string;
+function FBAbortDescription(ErrorCode: Integer): string;
 function CreateExecutorError(ErrorCode: Integer; const Message: string; LineNumber: Integer = 0): TExecutorException;
 
 implementation
@@ -277,6 +278,43 @@ begin
     // is wise to use high values to avoid collisions." So anything else is a USER code, not a gap:
     // the Commodore texts for 18..41 mean nothing to a FreeBASIC program.
     Result := 'user error ' + IntToStr(ErrorCode);
+  end;
+end;
+
+function FBAbortDescription(ErrorCode: Integer): string;
+// The parenthesised text fbc's runtime puts in "Aborting due to runtime error N (...)" when a program
+// aborts on an uncaught error. MEASURED against fbc 1.10.1, code by code.
+//
+// ⛔ THIS IS NOT Err$'s TABLE and must not be merged with it. The wording differs - lower case
+// throughout, and the signal names carry their own QUOTES ("interrupted" signal) - and the two are
+// read in different places: Err$ is a value a program prints, this is what the runtime says as it
+// dies. Above 17 fbc names nothing and prints the number alone.
+//
+// The extended codes 100..113 are OURS: fbc has no error there and would print nothing, so what is
+// printed is this project's own wording - our voice for our errors, exactly as the Err$ table's own
+// comment insists for the same reason.
+begin
+  case ErrorCode of
+    1:  Result := 'illegal function call';
+    2:  Result := 'file not found';
+    3:  Result := 'file I/O error';
+    4:  Result := 'out of memory';
+    5:  Result := 'illegal resume';
+    6:  Result := 'out of bounds array access';
+    7:  Result := 'null pointer access';
+    8:  Result := 'no privileges';
+    9:  Result := '"interrupted" signal';
+    10: Result := '"illegal instruction" signal';
+    11: Result := '"floating point error" signal';
+    12: Result := '"segmentation violation" signal';
+    13: Result := '"termination request" signal';
+    14: Result := '"abnormal termination" signal';
+    15: Result := '"quit request" signal';
+    16: Result := 'return without gosub';
+    17: Result := 'end of file';
+    100..113: Result := LowerCase(GetFBErrorCodeDescription(ErrorCode));
+  else
+    Result := '';        // fbc names nothing here: the number stands alone
   end;
 end;
 
