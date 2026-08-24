@@ -109,7 +109,7 @@ type
 
     { Check if register is only used by the next instruction (temporary) }
     function RegReadElsewhere(Reg: Word; Bank: TRegBank; Lo, Hi: Integer): Boolean;
-    function IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1): Boolean;
+    function IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1; PatternEnd: Integer = -1): Boolean;
 
     { Check if an instruction index is a jump target }
     function IsJumpTarget(Index: Integer): Boolean;
@@ -431,7 +431,7 @@ begin
   Result := False;
 end;
 
-function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1): Boolean;
+function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1; PatternEnd: Integer = -1): Boolean;
 var
   i: Integer;
   Instr, DefInstr: TBytecodeInstruction;
@@ -468,7 +468,15 @@ begin
   DestBank := SedaiOpcodeBanks.BankOfDest(TBytecodeOp(DefInstr.OpCode));
   if DestBank = rbUnknown then begin Result := False; Exit; end;
 
-  for i := Index + 2 to FProgram.GetInstructionCount - 1 do
+  // ⭐ PatternEnd IS THE LAST INSTRUCTION THE FUSION REPLACES, and the whole function assumed it was
+  // Index+1 - a PAIR - in two separate places. A three-instruction fusion has its first result read
+  // by its own last instruction, so both the forward scan and the RegReadElsewhere exclusion below
+  // counted a read that is part of the pattern being removed, and answered "not temporary" every
+  // time. That is precisely what kept bcSquareSumFloat from ever being produced: it is a 3-for-1.
+  // ⛔ Fixing only the scan is not enough - the exclusion range at the control-flow test is the same
+  // assumption written a second time, and it is the one that actually fires.
+  if PatternEnd < 0 then PatternEnd := Index + 1;
+  for i := PatternEnd + 1 to FProgram.GetInstructionCount - 1 do
   begin
     Instr := FProgram.GetInstruction(i);
 
@@ -597,7 +605,7 @@ begin
     // interpreter 6% slower on n-body.
     if IsControlFlow then
     begin
-      Result := not RegReadElsewhere(Reg, DestBank, Index, Index + 1);
+      Result := not RegReadElsewhere(Reg, DestBank, Index, PatternEnd);
       Exit;
     end;
   end;
@@ -1530,10 +1538,11 @@ begin
   // SAFETY: Don't fuse if second instruction is a jump target
   if IsJumpTarget(Index + 1) then Exit;
 
-  // Check if mul result is temporary
-  if not IsTemporaryResult(Index, Mul1Dest) then Exit;
-
-  // Check second instruction - could be another MulFloat (square) or AddFloat
+  // ⛔ THIS CHECK USED TO LIVE HERE, BEFORE THE CASE, and it is why bcSquareSumFloat could not be
+  // produced by anything. The two-instruction form needs Mul1's result dead after the PAIR; the
+  // three-instruction form has it read by the AddFloat at Index+2, which is part of the pattern.
+  // Asking the pair's question of the triple always answers no, so the triple never fused - and the
+  // C hot loop carried an arm for an opcode nothing could emit. Each branch now asks its own.
   if AddInstr.OpCode >= bcGroupSuper then Exit;
 
   case TBytecodeOp(AddInstr.OpCode) of
@@ -1541,6 +1550,7 @@ begin
       begin
         // Pattern: sq + something
         // If sq is in Src2, we have: dest = sum + sq => AddSquareFloat
+        if not IsTemporaryResult(Index, Mul1Dest) then Exit;
         if AddInstr.Src2 = Mul1Dest then
         begin
           // Create: dest = sum + x*x
@@ -1583,7 +1593,10 @@ begin
         if IsJumpTarget(Index + 2) then Exit;
 
         // Check if both results are temporary
-        if not IsTemporaryResult(Index + 1, Mul2Dest) then Exit;
+        if not IsTemporaryResult(Index + 1, Mul2Dest, -1, Index + 2) then Exit;
+        // Mul1's result IS read at Index+2, by the AddFloat that is part of the pattern: the
+        // question is whether anything reads it AFTER the triple.
+        if not IsTemporaryResult(Index, Mul1Dest, -1, Index + 2) then Exit;
 
         // Check third instruction is AddFloat that combines both squares
         if AddInstr.OpCode >= bcGroupSuper then Exit;
@@ -2562,6 +2575,16 @@ begin
       else if KindOn(13) and TryFuseArrayMoveElement(i) then
         Changed := True
       else if TryFuseArrayLoadIntTo(i) then
+        Changed := True
+      // ⛔ KIND 16 WAS DECLARED, DEFINED AND NEVER CALLED. TryFuseSquareSumFloat existed in full,
+      // with both its patterns, and no line in this driver reached it - so bcAddSquareFloat and
+      // bcSquareSumFloat could not be produced by anything, while the C hot loop carried an arm for
+      // each. Found 24 Aug 2026 by asking which of the 100 arms in hotdisp.c anything ever emits.
+      //
+      // ⭐ BEFORE KIND 14, and that is not a preference. TryFuseMulAddFloat matches the general
+      // "MulFloat + AddFloat"; a square is that pattern with Src1 = Src2, so whichever runs first
+      // takes it. Placed after, this one would keep on never firing.
+      else if KindOn(16) and TryFuseSquareSumFloat(i) then
         Changed := True
       else if KindOn(14) and TryFuseMulAddFloat(i) then
         Changed := True
