@@ -3110,6 +3110,13 @@ failed as fbc's would"* from *"we cannot do this"*. `--verbose` restores the ful
 ⚠️ `#line` currently reaches the **abort message** and `__LINE__`. `ERL`, `ERMN` and `Assert`'s
 `path(line):` prefix still report the physical position.
 
+### Declared divergence: integer division by zero
+
+`x \ 0` and `x Mod 0` raise a **catchable runtime error** here. `fbc` emits the bare machine
+instruction, so on x86 the program takes a hardware `SIGFPE` and **dumps core** — the manual's own
+`control/iif` and `control/iif2` do exactly that. Ours is a defined state where `fbc`'s is a crash;
+the divergence is deliberate and is not going to be reproduced.
+
 ### Declared unsupported (24 August 2026)
 
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
