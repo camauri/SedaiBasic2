@@ -3794,6 +3794,7 @@ var
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
+  AliasNode: TASTNode;   // "Type a As Integer, b As Double": the extra aliases of a comma list
   IsStaticField, LeadingType, FpIsFP: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
   ImplList: string;   // MODERN: the IMPLEMENTS list, recorded on the type node
@@ -3820,6 +3821,11 @@ begin
   begin
     Context.Advance;                                // consume AS
     Result := TASTNode.CreateWithValue(antTypeDecl, '', Token);
+    // "Type As Const u Ptr t": the CONST qualifier belongs to the aliased type and is not part of its
+    // NAME - left in place it was read as the type itself ("Undefined procedure: PTR"). Skipped here
+    // as it is on a DIM, and for the same reason: this VM does not enforce const, but it must read
+    // the declaration the same way fbc does.
+    SkipTypeQualifiers;
     if Context.Check(ttProcedureStart) and TryParseProcPtrType(Result) then
       AliasType := 'INTEGER'
     else
@@ -3839,6 +3845,21 @@ begin
     Result.Value := UpperCase(Context.CurrentToken.Value);
     Context.Advance;
     Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    // "Type As Integer a, b": ONE type, several names. FreeBASIC's own test suite writes it, and the
+    // list simply ended the declaration here - the ',' was left where a statement was expected.
+    // The extra aliases ride as CHILD antTypeDecl nodes marked ALIASLIST, which CollectUDTNames
+    // descends into; they are declarations in their own right, not members of anything.
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                              // ','
+      if not Context.Check(ttIdentifier) then Break;
+      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperCase(Context.CurrentToken.Value),
+                                            Context.CurrentToken);
+      Context.Advance;
+      AliasNode.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+      AliasNode.Attributes.Values['ALIASLIST'] := '1';
+      Result.AddChild(AliasNode);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -3870,6 +3891,7 @@ begin
       Exit;
     end;
     AliasType := '';
+    SkipTypeQualifiers;                             // "Type t As Const Integer Ptr" - see the note above
     if Context.Check(ttIdentifier) or
        ((Length(Context.CurrentToken.Value) > 0) and
         (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
@@ -3888,6 +3910,27 @@ begin
       end;
     end;
     Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    // "Type t As Integer, u As Double": several aliases on one line, each with its own type. Same
+    // shape as the leading-AS list above and the same carrier (a child marked ALIASLIST).
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                              // ','
+      if not Context.Check(ttIdentifier) then Break;
+      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperCase(Context.CurrentToken.Value),
+                                            Context.CurrentToken);
+      Context.Advance;                              // the alias name
+      if not Context.Check(ttAsType) then begin AliasNode.Free; Break; end;
+      Context.Advance;                              // AS
+      AliasType := ParseDottedName;
+      while AtPointerSuffix do
+      begin
+        AliasType := AliasType + ' PTR';
+        Context.Advance;
+      end;
+      AliasNode.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+      AliasNode.Attributes.Values['ALIASLIST'] := '1';
+      Result.AddChild(AliasNode);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -9630,6 +9673,7 @@ var
   Token, NameTok, TypeTok: TLexerToken;
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
   StaticTypeName, StaticFixedLen: string;
+  IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
 
   // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
   // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
@@ -9681,6 +9725,13 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume STATIC
+  // ⭐ "STATIC SHARED ...": at module level FreeBASIC lets the two modifiers stand together, and it is
+  // how a module variable is written when the source also wants to say "this storage persists". Both
+  // words then mean the same thing here - a module variable already persists - so the SHARED is
+  // consumed and the declaration goes on exactly as "STATIC ..." does. Left unread it was not an
+  // identifier, and the whole statement died with "Expected a variable name after STATIC".
+  IsShared := Context.Check(ttSharedDecl);
+  if IsShared then Context.Advance;                  // consume SHARED
   // FreeBASIC AS-first form: "STATIC AS type name1 [= init] [, name2 ...]" — the shared type precedes the
   // names (like "DIM AS type name"). Distinct from the "STATIC name AS type" form handled below.
   if Context.Check(ttAsType) then
@@ -9722,6 +9773,7 @@ begin
         end;
       end;
       DeclNode.Attributes.Values['STATIC'] := '1';
+      if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
       if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
       DoNodeCreated(DeclNode);
       Result.AddChild(DeclNode);
@@ -9785,6 +9837,7 @@ begin
       end;
     end;
     DeclNode.Attributes.Values['STATIC'] := '1';
+    if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
     if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
     DoNodeCreated(DeclNode);
     Result.AddChild(DeclNode);

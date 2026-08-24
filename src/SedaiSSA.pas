@@ -671,6 +671,8 @@ type
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
+    function IsBooleanExprNode(Node: TASTNode): Boolean;                 // declared BOOLEAN, so it reads "true"/"false"
+    function BooleanTextOf(const Val: TSSAValue): TSSAValue;            // ...and this is that text
     function Narrow32Code(Node: TASTNode): Integer;  // 9 or 10: which 32-bit wrap this expression takes
     function Is32BitExpr(Node: TASTNode): Boolean;   // computes at 32 bits (INT32/UINT32)
     function Declared32Code(Node: TASTNode): Integer; // declared width code of a named operand
@@ -4345,7 +4347,13 @@ begin
           { A BigInt argument renders as its DECIMAL TEXT. Tested BEFORE the int branch
             below, because a BigInt IS an int register: that branch would have printed
             the handle - "0", "1", "2"... - a number, and a believable one. }
-          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+          { A BOOLEAN renders as "true"/"false", which is what PRINT already shows for it. Tested
+            before the int branch below for the same reason the BigInt case is: a Boolean IS an int
+            register, and that branch would answer "-1"/"0" - a number, and a believable one. }
+          if (ArgListNode <> nil) and (ArgListNode.ChildCount >= 1) and
+             IsBooleanExprNode(ArgListNode.GetChild(0)) then
+            Result := BooleanTextOf(ArgValue)
+          else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
              (ArgListNode.ChildCount >= 1) and IsBigIntExpr(ArgListNode.GetChild(0)) then
             EmitInstruction(ssaBigToStr, Result, EnsureIntRegister(ArgValue),
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone))
@@ -10580,6 +10588,13 @@ var
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then begin Result := MakeSSAValue(svkNone); Exit; end;
   ProcessStringExpression(ArgsNode.GetChild(0), ArgValue);
+  // A BOOLEAN argument is "true"/"false", the same text Str() and PRINT give it - the wide form of a
+  // boolean is still the word, not the number.
+  if IsBooleanExprNode(ArgsNode.GetChild(0)) and (ArgValue.RegType = srtInt) then
+  begin
+    Result := BooleanTextOf(ArgValue);
+    Exit;
+  end;
   if ArgValue.RegType = srtString then
     Result := EnsureStringRegister(ArgValue)      // already UTF-8 bytes: widen is a no-op on storage
   else
@@ -10747,6 +10762,7 @@ procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode;
 //   CBOOL(x)       = -1 if x <> 0 else 0     (matches the VM's -1/0 boolean convention)
 var
   V0, V1, A0, A1, Tmp, Tmp2, OneShl, NotShl: TSSAValue;
+  SArg, SLow, SWord, FVal, TmpNum: TSSAValue;   // CBOOL of a STRING
 
   function NewIntReg: TSSAValue;
   begin
@@ -10783,7 +10799,35 @@ begin
     EmitInstruction(ssaBitwiseAnd, Result, Tmp, IntConst($FFFF), MakeSSAValue(svkNone));
   end
   else if FuncName = kCBOOL then
-    EmitInstruction(ssaCmpNeInt, Result, A0, IntConst(0), MakeSSAValue(svkNone))
+  begin
+    // ⭐ CBOOL OF A STRING READS THE WORD. fbc answers true for "true" in any case and false for
+    // "false", and falls back to the numeric value for anything else - measured on fbc 1.10.1:
+    // "true"/"TrUe" -> true, "false"/"abc" -> false, "2"/"-1"/"0.5" -> true, and " true " -> FALSE,
+    // because nothing is trimmed. We converted the string REGISTER to an int, which is not a number
+    // at all: every string answered false except the ones VAL happened to like.
+    if (ArgsNode.ChildCount >= 1) and (InferExprBank(ArgsNode.GetChild(0)) = srtString) then
+    begin
+      ProcessStringExpression(ArgsNode.GetChild(0), V0);
+      SArg := EnsureStringRegister(V0);
+      SLow := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrLCase, SLow, SArg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      SWord := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaLoadConstString, SWord, MakeSSAConstString('true'),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Tmp := NewIntReg;
+      EmitInstruction(ssaCmpEqString, Tmp, SLow, SWord, MakeSSAValue(svkNone));   // -1 when it is the word
+      FVal := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaStrVal, FVal, SArg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // ⚠️ Compared as a FLOAT, not converted to an int first: "0.5" is TRUE in fbc, and truncating
+      // it to 0 answers false - a value that is not zero read as zero.
+      TmpNum := NewIntReg;
+      EmitInstruction(ssaCmpNeFloat, TmpNum, FVal,
+                      EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone));
+      EmitInstruction(ssaBitwiseOr, Result, Tmp, TmpNum, MakeSSAValue(svkNone));
+      Exit;
+    end;
+    EmitInstruction(ssaCmpNeInt, Result, A0, IntConst(0), MakeSSAValue(svkNone));
+  end
   else if (FuncName = kBIT) or (FuncName = kBITSET) or (FuncName = kBITRESET) then
   begin
     if ArgsNode.ChildCount < 2 then begin Result := A0; Exit; end;   // missing bit index: pass x through
@@ -20494,6 +20538,14 @@ begin
   // declared semantics and programs that rely on it. Nothing existing moves.
   else if (T = 'INT32') and FModernMode then Result := 9
   else if (T = 'UINT32') and FModernMode then Result := 10
+  // ⭐ BOOLEAN, code 11. Not a narrowing but a NORMALISATION: FreeBASIC stores 0 or -1 and nothing
+  // else, so "Dim As Boolean b = 2" holds -1 and a "ByVal b As Boolean" parameter given 1 receives -1.
+  // We stored the value as it came, so a Boolean could hold 2 - and then it printed "true", compared
+  // unequal to TRUE, and disagreed with CBool of the same number. It belongs in THIS registry because
+  // this is the one place that knows a destination's declared type at the moment a value is stored
+  // into it, which is exactly what the conversion needs; ApplyNarrowCode is the single door it goes
+  // through, so DIM, assignment, parameter and field all normalise the same way.
+  else if (T = 'BOOLEAN') and FModernMode then Result := 11
   else Result := 0;
 end;
 
@@ -20756,7 +20808,7 @@ function TSSAGenerator.BinaryElemBytesOfWidthCode(W: Integer): Integer;
 // Long/ULong=4, Single=4; anything else (Integer/LongInt/Double) is a full 8-byte slot.
 begin
   case W of
-    1, 2: Result := 1;
+    1, 2, 11: Result := 1;   // 11 = BOOLEAN, one byte like a Byte
     3, 4: Result := 2;
     5, 6, 7, 9, 10: Result := 4;
   else   Result := 8;
@@ -21462,6 +21514,48 @@ begin
   end;
 end;
 
+function TSSAGenerator.IsBooleanExprNode(Node: TASTNode): Boolean;
+// Does this expression read as a BOOLEAN? The print-kind registry already answers it - code 1 - and it
+// is what makes PRINT show "true"/"false". Asking the same registry keeps the printer and every
+// string conversion on ONE answer instead of two that can drift.
+begin
+  Result := FModernMode and (Node <> nil) and (PrintKindOfExpr(Node) = 1);
+end;
+
+function TSSAGenerator.BooleanTextOf(const Val: TSSAValue): TSSAValue;
+// The text of a BOOLEAN: "true" or "false". PRINT knew it (bcPrintBool); Str(), WStr() and "&" did
+// not, so the same value printed one way and converted another - and the manual never notices,
+// because the manual prints COMPARISONS, which are Integers here as they are in fbc.
+//
+// ⭐ Computed, not branched: "false" and "true" are one constant string, and the value picks a
+// substring of it. z = 1 when the boolean is false, 0 when it is true; the answer is
+// Mid("truefalse", 1 + 4*z, 4 + z). No basic blocks, no second evaluation of the operand - which
+// matters, because the operand has ALREADY been evaluated by every caller here, and re-lowering the
+// node to build an IIf would run a function-call operand twice.
+var
+  Src, ZeroCmp, ZFlag, Prod, StartV, LenV, FourV, OneV: TSSAValue;
+begin
+  Src := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, Src, MakeSSAConstString('truefalse'),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // z := 1 when the value is zero. "= 0" yields -1 here, so negate it.
+  ZeroCmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpEqInt, ZeroCmp, EnsureIntRegister(Val),
+                  EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  ZFlag := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaNegInt, ZFlag, ZeroCmp, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  FourV := EnsureIntRegister(MakeSSAConstInt(4));
+  OneV  := EnsureIntRegister(MakeSSAConstInt(1));
+  Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, Prod, ZFlag, FourV, MakeSSAValue(svkNone));
+  StartV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, StartV, Prod, OneV, MakeSSAValue(svkNone));
+  LenV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, LenV, ZFlag, FourV, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrMid, Result, Src, StartV, LenV);
+end;
+
 function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;
 // The print form of a printable EXPRESSION, not just of a bare variable. A FUNCTION's return type is
 // recorded under its own name, so "Print isOverlapping(a, b)" on a "... As Boolean" function must print
@@ -21478,7 +21572,18 @@ begin
   if Node = nil then Exit;
   case Node.NodeType of
     antIdentifier:
-      Result := PrintKindOf(VarToStr(Node.Value));
+      begin
+        // ⭐ TRUE and FALSE are BOOLEAN, and they are keyword CONSTANTS - no declaration, so no entry
+        // in the print-kind table. "Print Str(True)" therefore said "-1" where fbc says "true", and
+        // "b = True" did not read as a comparison of two BOOLEANS. Same fact DeclaredScalarLenBytes
+        // had to be told for Len/SizeOf; a variable of that name (impossible in MODERN, where both are
+        // reserved) would still win.
+        if FModernMode and ((UpperCase(VarToStr(Node.Value)) = kTRUE) or
+                            (UpperCase(VarToStr(Node.Value)) = kFALSE)) and
+           (not IsDeclaredVariable(UpperCase(VarToStr(Node.Value)))) then
+          Exit(1);
+        Result := PrintKindOf(VarToStr(Node.Value));
+      end;
     antFunctionCall:
     begin
       Result := PrintKindOf(VarToStr(Node.Value));
@@ -21587,6 +21692,27 @@ begin
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
+    antBinaryOp:
+      // ⭐ A LOGICAL OPERATOR OVER TWO BOOLEANS ANSWERS A BOOLEAN. "b1 Or b2" is still true/false, so
+      // Str() and PRINT of it must say so - fbc's own tests/boolean/boolean_str asserts exactly that.
+      // Only AND/OR/XOR/EQV/IMP qualify, and only when BOTH operands are Boolean: mixing in an Integer
+      // makes the expression an Integer in FreeBASIC too, and a COMPARISON ("a < b") is an Integer
+      // whatever its operands are - which is why the manual's own comparisons must keep printing -1/0.
+      // ⚠️ ...and so do "=" and "<>" when BOTH sides are Boolean - fbc's own tests/boolean/boolean_str
+      // asserts str(b1 = b2) = "false". The ORDERING comparisons are not in the list because fbc
+      // REFUSES them on Booleans ("Type mismatch"), and a comparison with an Integer operand stays an
+      // Integer, which is why the manual's own "Print (a < b)" keeps answering -1/0.
+      if FModernMode and (Node.ChildCount >= 2) and
+         (Node.Token.TokenType in [ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR,
+                                   ttOpEqv, ttOpImp, ttOpAndAlso, ttOpOrElse,
+                                   ttOpEq, ttOpNeq]) and
+         (PrintKindOfExpr(Node.GetChild(0)) = 1) and (PrintKindOfExpr(Node.GetChild(1)) = 1) then
+        Result := 1;
+    antUnaryOp:
+      // "Not b" of a Boolean is a Boolean, for the same reason.
+      if FModernMode and (Node.ChildCount >= 1) and (Node.Token.TokenType = ttBitwiseNOT) and
+         (PrintKindOfExpr(Node.GetChild(0)) = 1) then
+        Result := 1;
     antDeref:
       // "*p" through a pointer to a narrow UNSIGNED type prints unsigned - no leading sign space -
       // exactly as "p[i]" through the same pointer already did. Only the INDEXED form was covered, so
@@ -21898,6 +22024,33 @@ begin
   else if W = 10 then W := 6;
 
   Result := Value;
+  // ⭐ BOOLEAN (11): NORMALISE, do not truncate. FreeBASIC keeps 0 or -1 in a Boolean and nothing
+  // else, so the conversion is "value <> 0" - which this VM's comparison already answers as -1/0.
+  // Emitted here rather than given a NarrowInt width, so no backend meets a code it has no arm for.
+  if W = 11 then
+  begin
+    if Value.Kind = svkConstInt then
+      Result := MakeSSAConstInt(Ord(Value.ConstInt <> 0) * -1)
+    else if Value.Kind = svkConstFloat then
+      Result := MakeSSAConstInt(Ord(Value.ConstFloat <> 0) * -1)
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtInt) then
+    begin
+      NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaCmpNeInt, NarrowReg, Value,
+                      EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+      Result := NarrowReg;
+    end
+    else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
+    begin
+      IntTmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaFloatToInt, IntTmp, Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      NarrowReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaCmpNeInt, NarrowReg, IntTmp,
+                      EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+      Result := NarrowReg;
+    end;
+    Exit;
+  end;
   if W = 7 then
   begin
     // SINGLE: round a value to what binary32 can carry.
@@ -22478,9 +22631,12 @@ begin
     end;
     // ...and a NESTED named type declares one of its own. Without descending here the block was
     // registered nowhere and "m As U" found no type, so the member came out as a plain integer.
+    // ...and so does each extra alias of a COMMA LIST ("Type t As Integer, u As Double"): they are
+    // declarations in their own right, carried as children only because one statement produces one node.
     for i := 0 to Node.ChildCount - 1 do
       if (Node.GetChild(i).NodeType = antTypeDecl) and
-         (Node.GetChild(i).Attributes.Values['NESTEDTYPE'] = '1') then
+         ((Node.GetChild(i).Attributes.Values['NESTEDTYPE'] = '1') or
+          (Node.GetChild(i).Attributes.Values['ALIASLIST'] = '1')) then
         CollectUDTNames(Node.GetChild(i));
     Exit;
   end;
@@ -23393,6 +23549,15 @@ begin
     Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
     EmitInstruction(ssaBigToStr, Result, EnsureIntRegister(Val),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  { ⭐ ...and a BOOLEAN renders as "true"/"false". Same reasoning as the BigInt arm above and
+    deliberately at the same SHARED hook: "x" & b, "Dim s As String = ..." and every other string
+    context arrive here, and a Boolean is an int register - so without this they answered "-1"/"0"
+    while PRINT of the very same value answered "true". }
+  if IsBooleanExprNode(SrcNode) and (Val.RegType = srtInt) then
+  begin
+    Result := BooleanTextOf(Val);
     Exit;
   end;
   if (Val.Kind = svkRegister) and (Val.RegType = srtFloat) and IsSingleExpr(SrcNode) then
@@ -31924,7 +32089,14 @@ begin
         begin
           WIdx := TypeNameWidthCode(VarToStr(ParamNodeJ.GetChild(0).Value));
           if (WIdx >= 1) and (WIdx <= 6) then
-            EmitInstruction(ssaNarrowInt, ParamReg, ParamReg, MakeSSAValue(svkNone), MakeSSAConstInt(WIdx));
+            EmitInstruction(ssaNarrowInt, ParamReg, ParamReg, MakeSSAValue(svkNone), MakeSSAConstInt(WIdx))
+          // ⭐ ...and a BOOLEAN parameter NORMALISES its argument to 0/-1. Not a NarrowInt width - it is
+          // a comparison - so it goes through the single door instead, and the result is copied back
+          // into the parameter register the body reads.
+          else if WIdx = 11 then
+            EmitInstruction(ssaCopyInt, ParamReg,
+                            EnsureIntRegister(ApplyNarrowCode(11, ParamReg, nil)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
         // V4: a BYVAL UDT parameter gets its own copy (the caller passed a handle = BYREF default,
         // so copy the caller's record into a fresh local instance that the body mutates instead).

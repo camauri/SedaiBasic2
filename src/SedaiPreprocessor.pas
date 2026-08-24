@@ -323,6 +323,18 @@ begin
         while (k <= Length(Body)) and IsIdentChar(Body[k]) do Inc(k);
         Word := Copy(Body, j, k - j);
         pi := ParamIndex(Word);
+        // ⛔ A PARAMETER THE CALLER LEFT OUT IS AN EMPTY ARGUMENT, not a missing one. "m()" on a
+        // one-parameter macro passes ONE argument and it is empty - FreeBASIC's own test suite writes
+        // exactly that ("#define m( s ) "a" + #s + "b"" then "m()"), and stringizing it must give "".
+        // We required the index to be INSIDE the argument list, so the whole "#s" fell through to the
+        // lone-'#' rule and a bare '#' reached the lexer.
+        if (pi >= 0) and (pi >= ACount) then
+        begin
+          Word := '""';
+          if JoinStr then begin Delete(Word, 1, 1); JoinStr := False; end;
+          Result := Result + Word;
+          i := k; Continue;
+        end;
         if (pi >= 0) and (pi < ACount) then
         begin
           // ⛔ THE ARGUMENT IS EXPANDED BEFORE IT IS STRINGIZED, and here too FreeBASIC does NOT
@@ -351,6 +363,8 @@ begin
       Word := Copy(Body, i, j - i);
       pi := ParamIndex(Word);
       if (pi >= 0) and (pi < ACount) then Result := Result + Args[pi]
+      // ...and an omitted parameter substitutes to NOTHING, for the same reason: it was passed, empty.
+      else if pi >= 0 then Result := Result + ''
       else Result := Result + Word;
       i := j;
     end
@@ -1464,7 +1478,12 @@ var
           while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
           nm := UpperCase(Copy(S, p, q - p)); p := q;
           while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
-          if (Defs.IndexOfName(nm) >= 0) or SourceDeclaresSymbol(nm) then
+          // ⛔ A FUNCTION-LIKE MACRO IS DEFINED TOO. "#macro m(a)" and "#define f(a) ..." live in
+          // FnDefs, not Defs, and only Defs was consulted - so "defined(m)" answered 0 for a macro
+          // that had just been written three lines above. The two tables are one QUESTION with two
+          // storages; every place that asks "is this name a macro?" has to ask both.
+          if (Defs.IndexOfName(nm) >= 0) or
+             ((FnDefs <> nil) and (FnDefs.IndexOfName(nm) >= 0)) or SourceDeclaresSymbol(nm) then
             Toks.Add('1')
           else
             Toks.Add('0');
@@ -2124,14 +2143,17 @@ var
           if DName = 'ifdef' then
           begin
             ParentEmit := Emitting;
-            Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0);
+            // ...and a FUNCTION-LIKE macro is defined too (FnDefs); see the note on defined() above.
+            Cond := ParentEmit and ((Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
+                                    (FnDefs.IndexOfName(UpperCase(Trim(DRest))) >= 0));
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
           else if DName = 'ifndef' then
           begin
             ParentEmit := Emitting;
-            Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0);
+            Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
+                                   (FnDefs.IndexOfName(UpperCase(Trim(DRest))) < 0);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -2300,8 +2322,12 @@ var
           end
           else if (DName = 'undef') and Emitting then
           begin
+            // ⛔ ...from BOTH tables. "#undef m" of a function-like macro left it in FnDefs, so the
+            // name went on expanding after the program had explicitly retired it.
             p := Defs.IndexOfName(UpperCase(Trim(DRest)));
             if p >= 0 then Defs.Delete(p);
+            p := FnDefs.IndexOfName(UpperCase(Trim(DRest)));
+            if p >= 0 then FnDefs.Delete(p);
           end
           else if (DName = 'include') and Emitting then
           begin
