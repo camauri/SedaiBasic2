@@ -10297,7 +10297,14 @@ begin
           // "T(a, b, c)" temporary of the array's element type so the element-store path constructs and
           // copies it. A "T(...)" temporary element is already an expression — used as-is.
           InitElemNode := InitVals.GetChild(k);
-          if (InitElemNode.NodeType = antArgumentList) and (InitElemNode.Attributes.Values['TUPLEINIT'] = '1') then
+          // ⛔ ...and a ONE-VALUE group "(v)" is that same aggregate. The parser decides "tuple" by
+          // looking for a top-level COMMA, so "{ (a, b) }" was tagged TUPLEINIT and "{ (-1) }" came
+          // through as ordinary PARENTHESES - which this branch then missed, and the element store
+          // took the value for a record HANDLE and dereferenced -1. ⭐ Asked HERE, where the array is
+          // already known to hold RECORDS, so a scalar array's "{ (1), (2) }" keeps meaning the values
+          // 1 and 2 and nothing about it changes.
+          if ((InitElemNode.NodeType = antArgumentList) and (InitElemNode.Attributes.Values['TUPLEINIT'] = '1'))
+             or ((InitElemNode.NodeType = antParentheses) and (InitElemNode.ChildCount = 1)) then
           begin
             TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
             TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
@@ -26899,7 +26906,14 @@ var
   nameU: string;
 begin
   Result := False;
-  if not (FModernMode and FInProcedure) then Exit;
+  // ⛔ NOT "and FInProcedure". A BLOCK frame shadows a shared scalar wherever it is opened, and a
+  // SCOPE / IF block at MODULE level opens one exactly as a block inside a procedure does. Requiring a
+  // procedure made the answer always False out there, so "Dim v As Integer = -2" inside a module-level
+  // Scope did not shadow the module's own v: it STORED INTO THE SHARED BACKING, and the value stayed
+  // changed after the block closed. ⚠️ The identical code inside a Sub was right, which is what
+  // isolated it. The walk still stops at a skProcRoot; at module level there is none, so it covers the
+  // block frames and stops - which is the whole stack there.
+  if not FModernMode then Exit;
   nameU := UpperCase(Name);
   for f := High(FScopeStack) downto 0 do
   begin
