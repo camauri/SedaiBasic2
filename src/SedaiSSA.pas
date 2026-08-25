@@ -222,7 +222,8 @@ type
     FResultExitsStaged: Integer;          // ... of which staged the result on the same path
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
-    FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
+    FCurrentProcLocalRecs: TStringList;
+    FDefinedLabels: TStringList;         // named labels already DEFINED in the current procedure  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
     // Names DECLARED at module level and not SHARED, and the names this procedure declares of its
     // own. A module DIM is invisible inside a SUB, so its declared TYPE must be invisible too.
     FModuleOnlyVars: TStringList;
@@ -836,6 +837,7 @@ type
     // Block label for a GOTO/GOSUB target: 'LABEL_<NAME>' for a named label
     // (identifier, case-insensitive), 'LINE_<n>' for a classic line number.
     function JumpLabelName(LabelNode: TASTNode): string;
+    function NamedLabelBlockName(const RawName: string): string;   // a named label belongs to its PROCEDURE
     procedure ProcessOnGosub(Node: TASTNode);
     procedure ProcessBox(Node: TASTNode);
     procedure ProcessCircle(Node: TASTNode);
@@ -1190,6 +1192,8 @@ begin
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
   FCurrentProcLocalRecs := TStringList.Create;
+  FDefinedLabels := TStringList.Create;
+  FDefinedLabels.CaseSensitive := False;
   FConstVars := TStringList.Create;
   FConstVars.CaseSensitive := False;
   FModuleOnlyVars := TStringList.Create;
@@ -1311,6 +1315,7 @@ begin
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
+  FDefinedLabels.Free;
   FModuleOnlyVars.Free;
   FConstVars.Free;
   FCurrentProcDeclNames.Free;
@@ -13033,10 +13038,27 @@ begin
   end;
 end;
 
+function TSSAGenerator.NamedLabelBlockName(const RawName: string): string;
+// The basic-block name of a NAMED label, QUALIFIED BY THE PROCEDURE that contains it.
+//
+// ⛔ A label belongs to its procedure, and without the qualifier two procedures that both used the
+// obvious name shared ONE block: "Sub uno(): GoTo skip: ... skip:" and an identically-written "Sub
+// due()" MERGED, so calling due() ran uno's body. Silently, and it is legal FreeBASIC - fbc compiles
+// it and prints two different lines. Nothing in the corpus paired two procedures that way.
+//
+// ⭐ A MODULE-LEVEL label keeps the bare "LABEL_<NAME>" it always had, so every program without a
+// procedure-local label produces byte-identical blocks.
+begin
+  if FCurrentProcName = '' then
+    Result := 'LABEL_' + UpperCase(RawName)
+  else
+    Result := 'LABEL_' + UpperCase(FCurrentProcName) + '.' + UpperCase(RawName);
+end;
+
 function TSSAGenerator.JumpLabelName(LabelNode: TASTNode): string;
 begin
   if LabelNode.NodeType = antIdentifier then
-    Result := 'LABEL_' + UpperCase(VarToStr(LabelNode.Value))   // named label (case-insensitive)
+    Result := NamedLabelBlockName(VarToStr(LabelNode.Value))    // named label (case-insensitive)
   else
     Result := 'LINE_' + VarToStr(LabelNode.Value);              // classic line number
 end;
@@ -32456,6 +32478,7 @@ begin
     // Establish procedure context (for "fname = expr" results, RETURN, EXIT SUB/FUNCTION).
     FInProcedure := True;
     FCurrentProcName := Name;
+    FDefinedLabels.Clear;                 // labels belong to the procedure being lowered
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = kFUNCTION);
     FCurrentProcRetType := GetVariableType(Name);
     FCurrentProcByrefRet := ByrefRetByAddress(Name);      // BYREF result: the function returns an address
@@ -32737,6 +32760,7 @@ begin
     FCurrentBlock := nil;   // procedure body terminated
     FInProcedure := False;
     FCurrentProcName := '';
+    FDefinedLabels.Clear;                 // back to module scope: its own labels, its own set
     FCurrentThisType := '';
     FCurrentProcRetRecType := '';
     FCurrentResultHandle := MakeSSAValue(svkNone);
@@ -32877,6 +32901,7 @@ var
   ExprResult, LineNumReg: TSSAValue;  // For TRAP command
   AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
   ExitKind: string;       // M2: EXIT/RETURN kind
+  LabelScope: string;     // where a duplicated label was found, for the message
   IsExitStmt: Boolean;    // M2
   IsContinueStmt: Boolean; // FreeBASIC CONTINUE
   ExitLevels, ExitLoopIdx, ExitAllDepth: Integer;  // multi-level EXIT/CONTINUE
@@ -33014,7 +33039,20 @@ begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
       // target), with a fall-through edge from the previous block. Mirrors the
       // antLineNumber handling above (case-insensitive name).
-      LabelName := 'LABEL_' + UpperCase(VarToStr(Node.Value));
+      LabelName := NamedLabelBlockName(VarToStr(Node.Value));
+      // ⛔ A label DEFINED TWICE in the same procedure is an error - fbc: "error 4: Duplicated
+      // definition". GetOrCreateBlock quietly reused the first block instead, so the second GoTo
+      // jumped to the FIRST label: two scopes each ending in "skip:" turned into an INFINITE LOOP
+      // that printed the first scope for ever. A silent miscompile is worse than a missing message,
+      // which is why this is a refusal and not a warning.
+      if FDefinedLabels.IndexOf(LabelName) >= 0 then
+      begin
+        if FCurrentProcName = '' then LabelScope := 'the module'
+        else LabelScope := UpperCase(FCurrentProcName);
+        raise Exception.CreateFmt('Duplicated definition: label "%s" is defined more than once in %s',
+          [UpperCase(VarToStr(Node.Value)), LabelScope]);
+      end;
+      FDefinedLabels.Add(LabelName);
       if not Assigned(FCurrentBlock) or (FCurrentBlock.LabelName <> LabelName) then
       begin
         PrevBlock := FCurrentBlock;
