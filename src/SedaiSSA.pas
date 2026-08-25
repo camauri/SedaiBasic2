@@ -817,6 +817,8 @@ type
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
     function RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;   // byte address of an @-taken "ZSTRING * n"
+    function RawStringBufElemBytes(SNode: TASTNode): Integer;   // ...and how wide ONE character is in it
+    function IsRawStringBuf(SNode: TASTNode): Boolean;          // ...asked WITHOUT emitting anything
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -11787,6 +11789,7 @@ function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
 var
   SVal, IdxVal, SReg, IdxReg, OneReg, StartReg, LenReg, MidReg: TSSAValue;
   NoneV, BufAddr2, ByteAddr2: TSSAValue;
+  ElemBytes: Integer;
 begin
   NoneV := MakeSSAValue(svkNone);
   // The mirror of the write: a raw-backed buffer is READ from the byte heap. Without it the read
@@ -11794,11 +11797,24 @@ begin
   // back got the old character and the two halves disagreed with each other, not just with fbc.
   if RawZStringBufAddr(SNode, BufAddr2) then
   begin
+    ElemBytes := RawStringBufElemBytes(SNode);   // 1 for a ZSTRING, 2 for a WSTRING's UCS-2 image
     ProcessExpression(IdxNode, IdxVal);
+    IdxReg := EnsureIntRegister(IdxVal);
+    if ElemBytes > 1 then
+    begin
+      OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(ElemBytes), NoneV, NoneV);
+      StartReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, StartReg, IdxReg, OneReg, NoneV);
+      IdxReg := StartReg;
+    end;
     ByteAddr2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaAddInt, ByteAddr2, EnsureIntRegister(BufAddr2), EnsureIntRegister(IdxVal), NoneV);
+    EmitInstruction(ssaAddInt, ByteAddr2, EnsureIntRegister(BufAddr2), IdxReg, NoneV);
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
+    if ElemBytes > 1 then
+      EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U16))
+    else
+      EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
     Exit;
   end;
   ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
@@ -11893,6 +11909,37 @@ begin
   end;
 end;
 
+function TSSAGenerator.IsRawStringBuf(SNode: TASTNode): Boolean;
+// Whether a fixed-length string variable keeps its characters in RAW BYTES because its address was
+// taken. The same two tests RawZStringBufAddr makes, asked without emitting the address register - a
+// predicate is needed where the answer only decides which LOWERING to take.
+var
+  Nm: string;
+begin
+  Result := False;
+  if (SNode = nil) or (SNode.NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(SNode.Value));
+  Result := (IsRawModuleScalar(Nm) and (TypeNameToBank(RawModuleScalarType(Nm), Nm) = srtString)) or
+            (RawZStringBufBytes(Nm) > 0);
+end;
+
+function TSSAGenerator.RawStringBufElemBytes(SNode: TASTNode): Integer;
+// How wide ONE character is in a raw-backed fixed-length string buffer: 1 byte for a ZSTRING, TWO for a
+// WSTRING, whose raw image is UCS-2.
+// ⛔ Both the indexed READ and the indexed WRITE used to assume one byte for either, so on a WSTRING
+// "w[2]" read the SECOND BYTE of the first character - "abcdef" answered 97, 0, 98, 0 instead of
+// 97, 98, 99, 100. Invisible until a program took the buffer's address (a "Clear w, 0, SizeOf(w)" is
+// enough), which is why fbc's own wstring/midstmt could not compile at all before today and now finds
+// it: 17540 failing assertions, the largest single item in the suite.
+var
+  Nm: string;
+begin
+  Result := 1;
+  if (SNode = nil) or (SNode.NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(SNode.Value));
+  if IsWStringVar(Nm) then Result := 2;
+end;
+
 procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
 // FreeBASIC "s[i] = c" on a scalar STRING: set the byte at 0-based index i to character code c.
 //
@@ -11908,7 +11955,8 @@ procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; T
 // (see the fast paths in ProcessMidStatement); this writing had simply never been routed there.
 var
   MidNode, ArgsNode: TASTNode;
-  BufAddr, IdxV, ByteAddr, ValV: TSSAValue;
+  BufAddr, IdxV, ByteAddr, ValV, ScaledIdx, WReg: TSSAValue;
+  ElemBytes: Integer;
 begin
   // A RAW-BACKED "ZSTRING * n" (its address has been taken) keeps its characters in the byte heap, so
   // one byte is written THERE. The MID$ lowering below writes the managed string register, which for
@@ -11916,12 +11964,26 @@ begin
   // silence, and the buffer still read as it was declared.
   if RawZStringBufAddr(SNode, BufAddr) then
   begin
+    ElemBytes := RawStringBufElemBytes(SNode);   // the mirror of the read: a WSTRING steps by two
     ProcessExpression(IdxNode, IdxV);
+    ScaledIdx := EnsureIntRegister(IdxV);
+    if ElemBytes > 1 then
+    begin
+      WReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, WReg, MakeSSAConstInt(ElemBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ByteAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, ByteAddr, ScaledIdx, WReg, MakeSSAValue(svkNone));
+      ScaledIdx := ByteAddr;
+    end;
     ByteAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaAddInt, ByteAddr, EnsureIntRegister(BufAddr), EnsureIntRegister(IdxV), MakeSSAValue(svkNone));
+    EmitInstruction(ssaAddInt, ByteAddr, EnsureIntRegister(BufAddr), ScaledIdx, MakeSSAValue(svkNone));
     ProcessExpression(ValNode, ValV);
-    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
-                    MakeSSAConstInt(RTC_U8));
+    if ElemBytes > 1 then
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
+                      MakeSSAConstInt(RTC_U16))
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
+                      MakeSSAConstInt(RTC_U8));
     Exit;
   end;
   MidNode := TASTNode.Create(antMidStatement, Tok);
