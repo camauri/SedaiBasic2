@@ -453,8 +453,11 @@ type
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
     function ArgWidthSigFromArgs(ArgsNode: TASTNode; PtrKinds: Boolean = False): string;
     function ArgPtrKindChar(Node: TASTNode): Char;   // 'Z'/'W' for text a pointer parameter would receive  // declared-width tail of a call's arguments
+    function DeclaredPointerTypeOfArg(Node: TASTNode): string;  // the declared "T PTR" type of an argument, or ''
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
     function SigBankPart(const Sig: string): string;
+    function SigNamePart(const Sig: string): string;   // the type-name tail of a label signature
+    function TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
     function SigWidthPart(const Sig: string): string;   // ...and the WIDTH tail after '%'            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
     function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
@@ -24262,6 +24265,29 @@ begin
   Result := '';                         // all placeholders: no tail, as declared
 end;
 
+function TSSAGenerator.DeclaredPointerTypeOfArg(Node: TASTNode): string;
+// The full declared POINTER type of an argument ("INTEGER PTR", "BYTE PTR PTR"), or '' when nothing
+// here says. It is the call site's half of the pointer names ProcSigFromParams writes into the type
+// tail, and only a DECLARED name can answer: a pointer variable or a pointer parameter. An expression
+// answers '' and the resolver reads that as "any", which is what every pointer argument used to be.
+var
+  Pt: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType <> antIdentifier then Exit;
+  // ⛔ TWO registries, and neither alone is enough: FPointerVars (through PointeeTypeOf) holds the raw
+  // scalar pointers and the parameters, while a pointer to a UDT is recorded elsewhere and only
+  // DeclaredTypeNameOf reaches it. Asking just the first answered "INTEGER PTR" for a "Pt Ptr" - the
+  // guard caught it, which is what a guard is for.
+  Pt := UpperCase(DeclaredTypeNameOf(Node));
+  if (Length(Pt) > 4) and (Copy(Pt, Length(Pt) - 3, 4) = ' PTR') then Exit(Pt);
+  Pt := UpperCase(PointeeTypeOf(VarToStr(Node.Value)));
+  if Pt = '' then Exit;
+  Result := Pt + ' ' + 'PTR';
+end;
+
 function TSSAGenerator.ArgUdtSigFromArgs(ArgsNode: TASTNode): string;
 // The UDT-type tail of a call's arguments, in the alphabet the declaration's label uses: the record type
 // name of each argument that IS a record, '-' for every other one (the tail is POSITIONAL). Returns ''
@@ -24274,13 +24300,64 @@ begin
   if ArgsNode = nil then Exit;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
-    T := UpperCase(ObjectTypeName(ArgsNode.GetChild(i)));   // '' when the argument is not a record
+    // ⛔ THE POINTER QUESTION COMES FIRST. In the managed model a "T PTR" IS the record handle, so
+    // ObjectTypeName answers "PT" for a "Pt Ptr" variable just as it does for a Pt one - and the call
+    // then asked for the by-value overload. Asked in this order, a UDT VALUE still answers '' here (it
+    // is not a pointer) and falls through to ObjectTypeName exactly as before.
+    T := DeclaredPointerTypeOfArg(ArgsNode.GetChild(i));
+    if T = '' then
+      T := UpperCase(ObjectTypeName(ArgsNode.GetChild(i)));   // '' when the argument is not a record
+    // ⭐ ...and an ENUM-typed argument names its type here too. The DECLARATION already puts it in this
+    // tail - ProcSigFromParams writes the name of any parameter type that is neither builtin nor a
+    // pointer, which an enum is - so "f( As enum_a )" and "f( As enum_b )" sign "~I:ENUM_A" and
+    // "~I:ENUM_B" and are correctly two labels. Only the CALL SITE could not say which one it wanted:
+    // ObjectTypeName answers for records alone, so the tail came out empty, no label matched, and the
+    // arity fallback handed every call to the FIRST of the pair.
+    if T = '' then T := UpperCase(EnumTypeOfOperand(ArgsNode.GetChild(i)));
     if Result <> '' then Result := Result + ',';
     if T <> '' then Result := Result + T else Result := Result + '-';
   end;
   for i := 1 to Length(Result) do
     if not (Result[i] in ['-', ',']) then Exit;             // at least one real type name: keep the tail
   Result := '';                                             // all placeholders: no tail, as declared
+end;
+
+function TSSAGenerator.SigNamePart(const Sig: string): string;
+// The TYPE-NAME tail of a label's signature - what stands between ':' and the next tail marker - or ''
+// when the label carries none. The mirror of SigBankPart and SigWidthPart.
+var
+  p, q, i: Integer;
+begin
+  Result := '';
+  p := Pos(':', Sig);
+  if p = 0 then Exit;
+  q := Length(Sig) + 1;
+  for i := p + 1 to Length(Sig) do
+    if (Sig[i] = '!') or (Sig[i] = '%') then begin q := i; Break; end;
+  Result := Copy(Sig, p + 1, q - p - 1);
+end;
+
+function TSSAGenerator.TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
+// Compare two positional, comma-separated type tails where a '-' ON THE CALL SIDE matches anything.
+// The declaration names every position it can; the call site names the ones it can derive. Same number
+// of positions or no match at all - the tail is positional, so a different length is a different arity.
+var
+  C, D: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  C := TStringList.Create;
+  D := TStringList.Create;
+  try
+    C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := CallTail;
+    D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
+    if C.Count <> D.Count then Exit;
+    for i := 0 to C.Count - 1 do
+      if (C[i] <> '-') and (C[i] <> D[i]) then Exit;
+    Result := True;
+  finally
+    C.Free; D.Free;
+  end;
 end;
 
 function TSSAGenerator.SigWidthPart(const Sig: string): string;
@@ -24361,7 +24438,7 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 //      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, UdtSig, ConstSig, WidthSig, Pref, Cand: string;
+  Sig, UdtSig, ConstSig, WidthSig, Pref, Cand, Tail: string;
   k: Integer;
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
@@ -24425,6 +24502,27 @@ begin
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
   Pref := BaseLabel + '~';
+  // ⭐ A '-' IN THE CALL'S TYPE TAIL MEANS "UNKNOWN", NOT "NONE". The tail is positional and the
+  // declaration fills every position it can name (a by-value UDT, an enum, a pointer type); the call
+  // site fills the ones it can DERIVE. Where it cannot, an exact comparison finds nothing and the call
+  // falls onto the arity fallback - which takes the first of that many parameters and is precisely
+  // where the wrong overload lives. Matching '-' against anything keeps every call that resolved by
+  // arity resolving, and resolves it more accurately: the bank part still has to match exactly, and a
+  // candidate is accepted only if it is the ONLY one that fits.
+  if UdtSig <> '' then
+  begin
+    Cand := '';
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+        if SigBankPart(Tail) <> Sig then Continue;
+        if not TypeTailMatchesWithWildcards(UdtSig, SigNamePart(Tail)) then Continue;
+        if Cand <> '' then begin Cand := ''; Break; end;   // ambiguous: leave it to the fallback
+        Cand := FProcedureNames[k];
+      end;
+    if Cand <> '' then Exit(Cand);
+  end;
   // ⭐ The arity fallback prefers a candidate whose BANK part matches exactly. It used to take the
   // first of the right parameter COUNT, which was fine while the bank signature was the whole key -
   // an exact bank match would have been found above. With a width tail in play a call can reach here

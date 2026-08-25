@@ -573,7 +573,14 @@ begin
     if Names <> '' then Names := Names + ',';
     // A by-value UDT: not builtin, not a pointer, and named. Anything else contributes a placeholder --
     // the tail is POSITIONAL, so a "-" must hold the slot.
-    if (T <> '') and (not IsBuiltinTypeName(T)) and (Pos(' PTR', T) = 0) then
+    // ⭐ ...and a POINTER type names itself here too, with its full spelling ("INTEGER PTR",
+    // "BYTE PTR PTR"). Every pointer signs the bank 'I', so a set overloaded on pointee type - which is
+    // what fbc's own overload/pointers declares, 22 of them - collided on ONE label and every call went
+    // to the first. The comment that used to stand here said a call site cannot reconstruct a pointee
+    // type; it can, for the shape that matters: a declared pointer VARIABLE or PARAMETER, which is what
+    // such a call passes. When it cannot, it writes '-' and the resolver treats that as "any" (see
+    // ResolveCallLabel), so nothing that resolved before stops resolving.
+    if (T <> '') and ((not IsBuiltinTypeName(T)) or (Pos(' PTR', T) > 0)) then
     begin
       Names := Names + T;
       AnyUDT := True;
