@@ -88,6 +88,7 @@ type
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
     function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
+    function ParseBraceInitializer(Token: TLexerToken): TASTNode; // { a, b, ... } aggregate initialiser in expression position
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParsePeekFB(Token: TLexerToken): TASTNode;        // FB PEEK([type,] ptr) → *CPtr(T Ptr, ptr); nil if not the FB form
     function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
@@ -146,6 +147,7 @@ function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
@@ -306,6 +308,11 @@ end;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseTypeConstructor(Token);
+end;
+
+function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseBraceInitializer(Token);
 end;
 
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
@@ -495,6 +502,11 @@ begin
   // FreeBASIC "type<T>(args)" anonymous temporary as a value expression. TYPE lexes as ttTypeDecl (its
   // statement role opens a record declaration); a prefix rule here only fires in expression position.
   Context.SetParseRule(ttTypeDecl, MakePrefixRule(@StaticParseTypeConstructor, precCall));
+  // FreeBASIC "{ a, b, ... }" aggregate initialiser where an EXPRESSION is expected: an argument of a
+  // type constructor ("udt = type( -1, -2, {-3, -4}, -5 )") and a tuple element of an array-of-UDT
+  // initialiser. The DIM path has read those braces for a long time; the expression grammar had no rule
+  // for '{' at all, so the same braces one comma to the left failed the whole declaration.
+  Context.SetParseRule(ttDelimBraceOpen, MakePrefixRule(@StaticParseBraceInitializer, precCall));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
   // M5.5: THREADSELF() value + THREADCALL sub(arg) (sugar that lowers to THREADCREATE).
   Context.SetParseRule(ttThreadSelf, MakePrefixRule(@StaticParseThreadSelf, precCall));
@@ -2071,6 +2083,8 @@ begin
   DoNodeCreated(Result);
 end;
 
+function IsManagedNewElemType(const N: string): Boolean; forward;   // a "New T[n]" element that cannot be left uninitialised
+
 function TExpressionParser.ParseNew(Token: TLexerToken): TASTNode;
 // FreeBASIC "NEW T" / "NEW T(args)". The NEW token is already consumed (prefix rule). Read the type
 // name, then an optional parenthesised constructor argument list. Lowers to antNew(value = type name,
@@ -2166,6 +2180,34 @@ begin
     end;
     Result.Attributes.Values['NEWARRAY'] := '1';
     Result.AddChild(ArgList);                 // child0 = the element count
+    // FreeBASIC "New T[n] { Any }": the block is left UNINITIALISED. It is the only initialiser fbc
+    // accepts after an array NEW, and it accepts it only for a type that needs no initialising -
+    // "New String[10] { Any }" is an error, because a managed element without its header is unusable.
+    // ⛔ Without reading it here the braces stayed behind and PRINT took them for a second item: the
+    // statement printed an address and a stray number instead of failing.
+    if Context.Check(ttDelimBraceOpen) then
+    begin
+      Context.Advance;                        // {
+      if not (Context.Check(ttIdentifier) and
+              (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ANY')) then
+      begin
+        HandleError('Only "{ Any }" may follow "New T[n]"', Context.CurrentToken);
+        Result.Free; Result := nil; Exit;
+      end;
+      if IsManagedNewElemType(VarToStr(Result.Value)) then
+      begin
+        HandleError('"{ Any }" cannot leave a ' + VarToStr(Result.Value) +
+                    ' element uninitialised', Context.CurrentToken);
+        Result.Free; Result := nil; Exit;
+      end;
+      Context.Advance;                        // Any
+      if not Context.Match(ttDelimBraceClose) then
+      begin
+        HandleError('Expected "}" after "{ Any }"', Context.CurrentToken);
+        Result.Free; Result := nil; Exit;
+      end;
+      Result.Attributes.Values['ANYINIT'] := '1';
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2193,6 +2235,16 @@ begin
 end;
 
 function IsFBScalarTypeName(const N: string): Boolean; forward;   // built-in scalar type names; defined below
+
+function IsManagedNewElemType(const N: string): Boolean;
+// A "New T[n]" element that cannot be left uninitialised: a STRING carries a header the runtime writes.
+// A pointer to one is not managed - it is an address like any other.
+var
+  T: string;
+begin
+  T := UpperCase(Trim(N));
+  Result := (T = 'STRING') or (T = 'WSTRING') or (T = 'ZSTRING');
+end;
 
 function TExpressionParser.ParseTypeConstructor(Token: TLexerToken): TASTNode;
 // FreeBASIC "type<T>(args)": an anonymous temporary of UDT T initialised with args (via T's constructor,
@@ -2372,6 +2424,35 @@ begin
   Result.Attributes.Values['TYPECTOR'] := '1';
   Result.AddChild(NameNode);
   Result.AddChild(Args);
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseBraceInitializer(Token: TLexerToken): TASTNode;
+// FreeBASIC "{ a, b, ... }" in EXPRESSION position. The '{' is already consumed (prefix rule). Builds
+// exactly the node the DIM path builds for the same braces - an antArgumentList marked BRACEINIT - so
+// the SSA keeps seeing ONE shape for an aggregate initialiser however it was reached. Nested braces
+// recurse through this same rule.
+var
+  Item: TASTNode;
+begin
+  Result := TASTNode.Create(antArgumentList, Token);
+  Result.Attributes.Values['BRACEINIT'] := '1';
+  if not Context.Check(ttDelimBraceClose) then
+    repeat
+      Item := ParseExpression(precNone);
+      if not Assigned(Item) then
+      begin
+        HandleError('Expected a value inside "{ ... }"', Context.CurrentToken);
+        Result.Free; Exit(nil);
+      end;
+      Result.AddChild(Item);
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile]);
+  if not Context.Match(ttDelimBraceClose) then
+  begin
+    HandleError('Expected "}" to close an aggregate initialiser', Context.CurrentToken);
+    Result.Free; Exit(nil);
+  end;
   DoNodeCreated(Result);
 end;
 

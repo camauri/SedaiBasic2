@@ -481,6 +481,7 @@ type
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
     function EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode; out Handle: TSSAValue): Boolean;
     // FreeBASIC aggregate init "Dim As T v = (a,b,c)" / "Type<T>(a,b,c)": store args into fields in order.
+    procedure EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer; BraceNode: TASTNode);
     procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
@@ -25942,6 +25943,44 @@ begin
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
+procedure TSSAGenerator.EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer;
+  BraceNode: TASTNode);
+// ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives that field -
+// an array - its elements one by one; the field's slot holds the member array's FArrays handle, so the
+// values go in through the same indirect store "v.field(j) = x" uses.
+// ⛔ ONE implementation, called from BOTH field-list paths: the aggregate init and the no-constructor
+// fallback inside EmitConstructorCall reach the very same "( a, { b, c }, d )" written two ways
+// ("Dim As T v = (...)" and "v = Type(...)"), and only the first knew about the braces - the second
+// stored nothing and the member array read back zeros.
+var
+  j: Integer;
+  ArgVal, ArrHandle: TSSAValue;
+begin
+  if (UDTIdx < 0) or (BraceNode = nil) then Exit;
+  // ⛔ A brace list belongs to an ARRAY member and to nothing else - fbc says "Expected array" when the
+  // field at that position is a scalar, and it is right: there is no meaning to give the values. Left
+  // unchecked the list was evaluated as an ordinary expression and the fields came out scrambled.
+  if not FUDTs[UDTIdx].Fields[FieldIdx].IsArray then
+    raise Exception.CreateFmt(
+      'A "{ ... }" initialiser needs an array member: field %d of %s is not an array.',
+      [FieldIdx + 1, FUDTs[UDTIdx].Name]);
+  ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
+                  MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+  for j := 0 to BraceNode.ChildCount - 1 do
+  begin
+    ProcessExpression(BraceNode.GetChild(j), ArgVal);
+    case FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank of
+      srtFloat:  EmitInstruction(ssaArrayStoreIndFloat, EnsureFloatRegister(ArgVal), ArrHandle,
+                   EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaArrayStoreIndString, EnsureStringRegister(ArgVal), ArrHandle,
+                   EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaArrayStoreIndInt, EnsureIntRegister(ArgVal), ArrHandle,
+                   EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+    end;
+  end;
+end;
+
 procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
 // FreeBASIC aggregate initialization "Dim As T v = (a, b, c)" and "Type<T>(a, b, c)": a UDT with no
 // constructor is initialized field-by-field — store each value into the field at the same position (in
@@ -25969,24 +26008,9 @@ begin
     // ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives the
     // middle field - an array - its elements one by one; the field's slot holds the member array's
     // FArrays handle, so the values go in through the same indirect store "v.field(j) = x" uses.
-    if (ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1') and
-       FUDTs[UDTIdx].Fields[i].IsArray then
+    if ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1' then
     begin
-      ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
-                      MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
-      for j := 0 to ArgsNode.GetChild(i).ChildCount - 1 do
-      begin
-        ProcessExpression(ArgsNode.GetChild(i).GetChild(j), ArgVal);
-        case FUDTs[UDTIdx].Fields[i].ArrayElemBank of
-          srtFloat:  EmitInstruction(ssaArrayStoreIndFloat, EnsureFloatRegister(ArgVal), ArrHandle,
-                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
-          srtString: EmitInstruction(ssaArrayStoreIndString, EnsureStringRegister(ArgVal), ArrHandle,
-                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
-        else         EmitInstruction(ssaArrayStoreIndInt, EnsureIntRegister(ArgVal), ArrHandle,
-                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
-        end;
-      end;
+      EmitBraceArrayMemberInit(HandleVal, UDTIdx, i, ArgsNode.GetChild(i));
       Continue;
     end;
     ProcessExpression(ArgsNode.GetChild(i), ArgVal);
@@ -26081,6 +26105,14 @@ begin
       for i := 0 to ArgCount - 1 do
       begin
         if i > High(FUDTs[AggUDT].Fields) then Break;
+        // A brace list initialises an ARRAY member - the same rule the aggregate-init path carries,
+        // asked here because "v = Type( 1, 2, {3, 4}, 5 )" reaches the field list through THIS path.
+        if (ArgsNode <> nil) and (i < ArgsNode.ChildCount) and
+           (ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1') then
+        begin
+          EmitBraceArrayMemberInit(HandleVal, AggUDT, i, ArgsNode.GetChild(i));
+          Continue;
+        end;
         Slot := FUDTs[AggUDT].Fields[i].Slot;
         case FUDTs[AggUDT].Fields[i].Bank of
           srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVals[i]), MakeSSAConstInt(Slot));
