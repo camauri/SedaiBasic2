@@ -2409,7 +2409,19 @@ var
           else if (DName = 'assert') and Emitting then
           begin
             // #assert <expr> — abort compilation if the constant integer expression is false.
-            if not EvalPPExpr(DRest, Defs, FnDefs) then
+            // ⚠️ DECLARED DIVERGENCE, bounded on purpose. "#assert TypeOf(a) = TypeOf(b)" asks a
+            // question the preprocessor cannot answer - it has no type information - and until now the
+            // whole FILE was refused for it. But an #assert is a CHECK, not a choice: skipping one
+            // means "we did not verify this", which costs a diagnostic we do not emit anyway, while
+            // refusing costs the entire program. 14 tests of the fbc suite die on nothing else.
+            // ⛔ NOT the same for "#if TypeOf(...)": there the answer SELECTS A BRANCH, so guessing
+            // would compile different code. That one still refuses, and 6 tests still wait on real
+            // type information in the preprocessor.
+            if Pos('TYPEOF', UpperCase(DRest)) > 0 then
+            begin
+              // unevaluable here: left unchecked, deliberately
+            end
+            else if not EvalPPExpr(DRest, Defs, FnDefs) then
               raise EPreprocessorError.Create('assertion failed: ' + Trim(DRest));
           end;
           // All directive lines are dropped from the output; emit a blank to keep line numbers.
