@@ -11239,7 +11239,20 @@ begin
   end;
 
   // Read inputs.
-  ProcessStringExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
+  // ⛔ A FIXED-LENGTH TARGET IS READ AT ITS CAPACITY, NOT AT ITS CONTENT LENGTH. An ordinary read of a
+  // "String * n" / "ZString * n" converts at the first NUL - that is what LEN and PRINT want - but the
+  // MID statement writes into the BUFFER, and reading the converted form handed it an EMPTY string for
+  // a declared-but-unassigned one. The fast path below then wrote nothing AND published that empty
+  // value back into the variable: "Dim t As String * 8 : Mid(t,1,1) = "C"" left LEN 0 where fbc leaves
+  // 8 with a C in front. The variable's own register IS the padded buffer; only the READ was lossy.
+  if (TargetNode.NodeType = antIdentifier) and
+     (StrToIntDef(FFixedLenVars.Values[UpperCase(VarToStr(TargetNode.Value))], 0) > 0) and
+     (not IsSharedScalar(VarToStr(TargetNode.Value))) then
+    TextReg := EnsureStringRegister(GetOrAllocateVariable(UpperCase(VarToStr(TargetNode.Value))))
+  else
+  begin
+    ProcessStringExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
+  end;
   ProcessExpression(StartNode, StartVal); StartReg := EnsureIntRegister(StartVal);
   ProcessStringExpression(SourceNode, SrcVal);  SrcReg := EnsureStringRegister(SrcVal);
 
