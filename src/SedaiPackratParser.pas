@@ -10015,7 +10015,7 @@ function TPackratParser.ParseStaticStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
-  StaticTypeName, StaticFixedLen: string;
+  StaticTypeName, StaticFixedLen, StaticDottedName: string;
   StaticAddrNd: TASTNode;
   IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
   IsByrefStatic: Boolean;  // ...and "Static Shared ByRef As T r = target"
@@ -10167,7 +10167,21 @@ begin
       Break;
     end;
     NameTok := Context.CurrentToken;
+    StaticDottedName := UpperCase(VarToStr(NameTok.Value));
     Context.Advance;                                 // name
+    // ⭐ "Static Shared UDT.g As Integer": the DEFINITION, outside the type, of a member declared
+    // "Static g As Integer" inside it. The two halves must name the SAME storage, and a static member is
+    // backed by a 1-element array called "TYPE.FIELD" (CollectStaticMembers) - so the dotted spelling is
+    // folded into that one name here. Read as a single identifier the '.' was left behind and the
+    // statement died as "STATIC requires a type".
+    while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+          (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+          (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+    begin
+      Context.Advance;                               // '.'
+      StaticDottedName := StaticDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;                               // segment
+    end;
     Dims := ParseStaticDims;                         // "STATIC a(dims) AS type": array with static storage
     if not Context.Check(ttAsType) then
     begin
@@ -10191,7 +10205,7 @@ begin
     end;
     StaticFixedLen := ParseStaticFixedLen;           // "Static z As String * n"
     DeclNode := TASTNode.Create(antArrayDecl, NameTok);
-    NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+    NameNode := TASTNode.CreateWithValue(antIdentifier, StaticDottedName, NameTok);
     TypeNd := TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok);
     DeclNode.AddChild(NameNode);
     if Assigned(Dims) then
@@ -10766,9 +10780,15 @@ var
           Result := (Nm <> '') and (Nm[Length(Nm)] = '$');
         end;
       antArrayAccess, antFunctionCall:
-        if (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
         begin
-          Nm := UpperCase(VarToStr(N.GetChild(0).Value));
+          // ⛔ THE TWO NODE SHAPES KEEP THE NAME IN DIFFERENT PLACES: antArrayAccess in child 0,
+          // antFunctionCall in its own Value. Only child 0 was read, so every intrinsic that parses as
+          // a FUNCTION CALL failed the test - "Const w = WChr(65,66,67)" was typed DOUBLE and the string
+          // went into a float register, which is why it came back one character long. The list already
+          // named WCHR; the name simply never reached it.
+          Nm := UpperCase(VarToStr(N.Value));
+          if (Nm = '') and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+            Nm := UpperCase(VarToStr(N.GetChild(0).Value));
           Result := ((Nm <> '') and (Nm[Length(Nm)] = '$')) or
                     (Nm = 'CHR') or (Nm = 'MID') or (Nm = 'LEFT') or (Nm = 'RIGHT') or
                     (Nm = 'STRING') or (Nm = 'SPACE') or (Nm = 'STR') or (Nm = 'HEX') or

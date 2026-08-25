@@ -1573,8 +1573,9 @@ end;
 
 function TLexerFSM.ProcessEscapes(const Raw: string): string;
 // Expand the FreeBASIC escape sequences accepted inside an escaped string literal (!"...").
-// Recognised: \a \b \f \n \l \r \t \v \\ \" \' ; \DDD decimal (1-3 digits); \&hNN hex; \&oNNN octal;
-// \&bNNNNNNNN binary; \uNNNN unicode codepoint (1-4 hex digits, UTF-8 encoded). A produced NUL
+// Recognised: \a \b \f \n \l \r \t \v \\ \" \' ; \DDD decimal (1-3 digits); \xNN hex (1-2 digits);
+// \&hNN hex; \&oNNN octal; \&bNNNNNNNN binary; \uNNNN unicode codepoint (1-4 hex digits, UTF-8 encoded).
+// ⛔ Only \u names a CODEPOINT (and is UTF-8 encoded); every other numeric escape names one BYTE. A produced NUL
 // (\0 / \&h00 / ...) is the string terminator: only the bytes before it are kept (FB semantics).
 var
   i, n: Integer;
@@ -1589,6 +1590,12 @@ var
       'a'..'f': Result := Ord(ch) - Ord('a') + 10;
     else        Result := -1;
     end;
+  end;
+
+  procedure AppendByte(B: Integer);
+  // Append ONE raw byte. A numeric escape names a byte, not a codepoint - see EmitByte.
+  begin
+    Result := Result + Chr(B and $FF);
   end;
 
   procedure AppendCP(CP: Integer);
@@ -1617,7 +1624,22 @@ var
   end;
 
   // Emit a numeric escape result. Returns False when the value is NUL (truncate the string).
+  // ⛔ A NUMERIC escape names a BYTE, not a codepoint. "\128" is one byte 128 in fbc; encoded as UTF-8
+  // it became TWO (0xC2 0x80) and Len(!"\128\65\66") answered 4 where fbc answers 3. Only "\u" names a
+  // CODEPOINT and keeps the UTF-8 encoding - which is what AppendCP is for, and why the two are now
+  // separate calls instead of one.
   function EmitByte(Val: Integer): Boolean;
+  begin
+    if Val = 0 then
+      Result := False
+    else
+    begin
+      AppendByte(Val);
+      Result := True;
+    end;
+  end;
+
+  function EmitCodepoint(Val: Integer): Boolean;
   begin
     if Val = 0 then
       Result := False
@@ -1676,6 +1698,24 @@ begin
             Val := Val * 16 + HexDigit(Raw[i]);
             Inc(i); Inc(Cnt);
           end;
+          if not EmitCodepoint(Val) then Exit;
+        end;
+      // FreeBASIC HEX escape "\xNN" - the spelling its own suite uses. It was not recognised at all, so
+      // "!\"\x41\"" came out as the three characters x, 4, 1.
+      'x', 'X':
+        begin
+          Inc(i);
+          Val := 0; Cnt := 0;
+          while (i <= n) and (Cnt < 2) and (HexDigit(Raw[i]) >= 0) do
+          begin
+            Val := Val * 16 + HexDigit(Raw[i]);
+            Inc(i); Inc(Cnt);
+          end;
+          if Cnt = 0 then
+          begin
+            Result := Result + c;          // "\x" with no digits: keep it literally
+            Continue;
+          end;
           if not EmitByte(Val) then Exit;
         end;
       '&':
@@ -1690,10 +1730,7 @@ begin
           else        Base := 0;
           end;
           if Base = 0 then
-          begin
-            Result := Result + '&';   // not a valid base prefix: keep literally
-            Continue;
-          end;
+            Continue;   // "\&" with no h/o/b prefix: fbc drops both characters (measured: !"\&101" is "101")
           Inc(i);
           Val := 0;
           while i <= n do

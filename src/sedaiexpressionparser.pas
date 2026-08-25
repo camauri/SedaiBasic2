@@ -81,7 +81,8 @@ type
     function ParseRunFunctionForm(Token: TLexerToken): TASTNode;  // FreeBASIC Run(prog) -> -1 if it cannot start
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
-    function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
+    function ParseInputFunctionForm(Token: TLexerToken): TASTNode;
+    function ParseBinaryFileFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
@@ -794,8 +795,13 @@ begin
         Context.Advance;
 
       WasAny := False;
+      // ⛔ ...but "ANY PTR" IS A TYPE, not the modifier followed by an expression. "Len(Any Ptr)" had its
+      // ANY eaten here and only "Ptr" reached LEN, which answered 1 where fbc answers 8. The exclusion is
+      // on the POINTER SUFFIX alone, so every real "Instr(s, Any t)" is untouched.
       if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY')
          and Assigned(Context.PeekNext)
+         and (UpperCase(VarToStr(Context.PeekNext.Value)) <> 'PTR')
+         and (UpperCase(VarToStr(Context.PeekNext.Value)) <> 'POINTER')
          and not (Context.PeekNext.TokenType in
                   [ttDelimParClose, ttDelimBrackClose, ttSeparParam, ttEndOfLine, ttEndOfFile]) then
       begin
@@ -1840,7 +1846,72 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
+  // ⭐ GET and PUT have FUNCTION forms too - "Get(#f, pos, var)" answers 0 on success, and fbc's own
+  // suite writes them that way ("CU_ASSERT( get( #f, 1, array4b() ) = 0 )"). They share this token type
+  // with INPUT, so in expression position they reached the string-function path and died as an
+  // undeclared array. Built here into the very node the STATEMENT builds - child0 = handle,
+  // child1 = variable, child2 = position when given - so there is ONE lowering, marked FUNCFORM for the
+  // SSA to answer 0 with.
+  if ((UpperCase(Token.Value) = 'GET') or (UpperCase(Token.Value) = 'PUT')) and
+     Context.Check(ttDelimParOpen) then
+  begin
+    Result := ParseBinaryFileFunctionForm(Token);
+    if Assigned(Result) then Exit;
+  end;
   Result := ParseStringFunction(Token);   // antFunctionCall "INPUT" + argument list
+end;
+
+function TExpressionParser.ParseBinaryFileFunctionForm(Token: TLexerToken): TASTNode;
+// "Get(#f [, [pos]] [, var])" / "Put(...)": the function form of the binary file statements. Answers nil
+// (having consumed nothing) when the shape is not that, so the caller falls back.
+var
+  Saved: Integer;
+  HandleE, PosE, VarE: TASTNode;
+  IsGet: Boolean;
+begin
+  Result := nil;
+  IsGet := UpperCase(Token.Value) = 'GET';
+  Context.SavePosition(Saved);
+  Context.Advance;                                   // '('
+  if Context.Check(ttFileHandlePrefix) then Context.Advance;   // the optional '#'
+  HandleE := ParseExpression(precNone);
+  if not Assigned(HandleE) then begin Context.RestorePosition(Saved); Exit; end;
+  PosE := nil; VarE := nil;
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;                                 // ','
+    if not Context.Check(ttSeparParam) then PosE := ParseExpression(precNone);   // the position may be empty
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                               // ','
+      VarE := ParseExpression(precNone);
+    end;
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleE.Free; if Assigned(PosE) then PosE.Free; if Assigned(VarE) then VarE.Free;
+    Context.RestorePosition(Saved);
+    Exit;
+  end;
+  if IsGet then
+  begin
+    Result := TASTNode.Create(antGetFile, Token);
+    Result.Attributes.Values['BIN'] := '1';
+  end
+  else
+  begin
+    Result := TASTNode.Create(antPrintFile, Token);
+    Result.Attributes.Values['PUTBIN'] := '1';
+  end;
+  Result.Attributes.Values['FUNCFORM'] := '1';
+  Result.AddChild(HandleE);
+  if Assigned(VarE) then Result.AddChild(VarE);
+  if Assigned(PosE) then
+  begin
+    Result.AddChild(PosE);
+    Result.Attributes.Values['HASPOS'] := '1';
+  end;
+  DoNodeCreated(Result);
 end;
 
 function TExpressionParser.ParseInputFunction(Token: TLexerToken): TASTNode;

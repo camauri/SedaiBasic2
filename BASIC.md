@@ -460,7 +460,7 @@ overlap; `-lang fb`). A `.fb`/`.fbas` extension forces MODERN.
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `GET` | ✓ | Get character (non-blocking, returns empty string if no key) |
+| `GET` | ✓ | Get character (non-blocking, returns empty string if no key). The binary file form also has a FUNCTION spelling, `Get(#f, pos, target)`, which answers 0 — as `PUT` does. |
 | `GETKEY` | ✓ | Get keypress (blocking, waits for key) |
 | `INPUT` | ✓ | Input statement |
 | `CHAR` | ✓ | Displays text at specific position (mode, col, row, text [,reverse]) |
@@ -1942,7 +1942,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `# (Argument stringize)` | ✓ | `#param` in a function-like macro body stringizes the argument into a string literal. |
 | `## (Argument concatenation)` | ✓ | `a ## b` in a macro body pastes the surrounding tokens together. |
-| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer). |
+| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer): `\a \b \f \n \l \r \t \v \\ \" \'`, `\DDD` decimal, `\xNN` hex, `\&hNN`/`\&oNNN`/`\&bNNNN`, `\uNNNN`. Every numeric escape but `\u` names one **byte**; `\u` names a codepoint and is UTF-8 encoded. |
 | `$ (Non-Escaped String Literal)` | ✓ | `$"..."` takes the body verbatim (our default for `"..."`). |
 
 #### Pointer Operators
@@ -2420,7 +2420,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
-| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
+| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The `#if TypeOf(a)=TypeOf(b)` form is **rejected with an error**, not silently evaluated: this preprocessor runs on text, before any declaration is seen, so it cannot answer the question — and answering it "false" (the undefined-identifier rule) would quietly take the wrong branch. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
@@ -2860,7 +2860,7 @@ End Function
 | `WSTRING (Function)` | ✓ | `WSTRING(n, cp)` — n copies of the wide char for Unicode codepoint cp. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
 | `WSPACE` | ✓ | `WSPACE(n)` — a wide string of n spaces. |
-| `LEN` | ✓ | Returns the length of a string in characters. Takes a TYPE NAME too, including a pointer type (`Len(Integer Ptr)`). For a user-defined type it returns the size of the type in bytes, as FreeBASIC does when the type declares no `OPERATOR LEN` (which is not supported); in particular it does **not** route through `OPERATOR CAST() AS STRING`. |
+| `LEN` | ✓ | Returns the length of a string in characters. Takes a TYPE NAME too, including a pointer type (`Len(Integer Ptr)`, `Len(Any Ptr)`), and an expression of known declared width (`Len(CULng(0))` = 4). For a user-defined type it returns the size of the type in bytes, as FreeBASIC does when the type declares no `OPERATOR LEN` (which is not supported); in particular it does **not** route through `OPERATOR CAST() AS STRING`. |
 
 #### Character Conversion
 
