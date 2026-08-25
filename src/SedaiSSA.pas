@@ -17221,6 +17221,8 @@ var
   HandleVal, FilenameVal, ModeVal: TSSAValue;
   HandleReg, FilenameReg, ModeReg: TSSAValue;
   RecLenVal, RecLenStr, RecLenTrim: TSSAValue;   // FOR RANDOM: "L" + LEN = <expr>
+  EncVal, EncVal2, EncTilde, EncCat: TSSAValue;  // ENCODING <expr>: "~" + the name, built at run time
+  EncIdx: Integer;
   HandleNameIdx: Integer;
   HandleChild: TASTNode;
   HandleStr: string;
@@ -17346,6 +17348,28 @@ begin
     ModeReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
     EmitInstruction(ssaLoadConstString, ModeReg, MakeSSAConstString('R'),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+
+  // ⭐ "ENCODING <expr>": a name that is only known at RUN time (fbc's own tests write
+  // "encoding encod" and "encoding files(i).encoding"). The parser could not bake a marker into the
+  // mode string, so it left the expression as a child and named its index; the marker is built here
+  // the same way the RANDOM record length is, by CONCATENATION, and the file layer maps the name.
+  // The '~' stays a SUFFIX of the mode string, which is what everything downstream reads.
+  if Node.Attributes.Values['ENCEXPR'] <> '' then
+  begin
+    EncIdx := StrToIntDef(Node.Attributes.Values['ENCEXPR'], -1);
+    if (EncIdx >= 0) and (EncIdx < Node.ChildCount) then
+    begin
+      ProcessStringExpression(Node.GetChild(EncIdx), EncVal);
+      EncTilde := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaLoadConstString, EncTilde, MakeSSAConstString('~'),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EncCat := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrConcat, EncCat, ModeReg, EncTilde, MakeSSAValue(svkNone));
+      EncVal2 := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrConcat, EncVal2, EncCat, EnsureStringRegister(EncVal), MakeSSAValue(svkNone));
+      ModeReg := EncVal2;
+    end;
   end;
 
   // Emit DOPEN instruction

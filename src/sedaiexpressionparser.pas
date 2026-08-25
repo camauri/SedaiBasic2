@@ -1541,8 +1541,8 @@ function TExpressionParser.ParseOpenFunctionForm(Token: TLexerToken): TASTNode;
 // MODERN only. OPEN lexes as ttFileOperation, a family that is otherwise all statements, so this rule
 // fires only in expression position and only for OPEN: every other member stays the syntax error it was.
 var
-  Param, HandleNode, LenExpr: TASTNode;
-  ModeStr, MW: string;
+  Param, HandleNode, LenExpr, EncExpr: TASTNode;
+  ModeStr, MW, EncMark: string;
   AccessRead: Boolean;
 
   procedure SkipClauseComma;
@@ -1588,12 +1588,25 @@ begin
     end;
     Context.Advance;                                // mode word
   end;
-  // ENCODING / ACCESS / lock clauses: accepted and ignored, exactly as the statement accepts them.
+  // ⛔ "ENCODING <expr>" USED TO BE CONSUMED AND THROWN AWAY here, while the STATEMENT form put it on
+  // the mode string: "Open(f, For Output, Encoding "utf16", As #1)" wrote UTF-8 bytes and the same
+  // clause one line above, written as a statement, wrote UTF-16. One rule, two paths, and only one of
+  // them had it. The mapping is now EncodingModeMarker, asked by BOTH.
   SkipClauseComma;
+  EncMark := '';
+  EncExpr := nil;
   if AtWord(kENCODING) then
   begin
     Context.Advance;
-    if Context.Check(ttStringLiteral) then Context.Advance;
+    if Context.Check(ttStringLiteral) then
+    begin
+      EncMark := EncodingModeMarker(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;
+    end
+    else
+      // The name need not be a LITERAL: fbc's own tests write "encoding encod". Then the marker is
+      // appended at RUN time (SSA) and the file layer reads the name after the '~'.
+      EncExpr := ParseExpression(precCall);
   end;
   SkipClauseComma;
   if AtWord(kACCESS) then
@@ -1606,6 +1619,9 @@ begin
     // record length appended in the SSA.
     if AccessRead and (ModeStr <> 'L') then ModeStr := ModeStr + '<';
   end;
+  // The encoding marker goes on LAST, so '~' is always a suffix: appended before ACCESS it would build
+  // "R~16<", with the '<' inside the number the file layer reads.
+  if (EncMark <> '') and (ModeStr <> 'L') then ModeStr := ModeStr + EncMark;
   SkipClauseComma;
   if AtWord(kSHARED) then
     Context.Advance
@@ -1640,6 +1656,17 @@ begin
   if Assigned(LenExpr) then
   begin
     if ModeStr = 'L' then Result.AddChild(LenExpr) else LenExpr.Free;     // 3 = reclen (RANDOM only)
+  end;
+  // A run-time ENCODING name rides as an extra child, at whatever index it lands on: the attribute
+  // says WHICH, so nothing has to count the optional ones.
+  if Assigned(EncExpr) then
+  begin
+    if ModeStr = 'L' then EncExpr.Free
+    else
+    begin
+      Result.Attributes.Values['ENCEXPR'] := IntToStr(Result.ChildCount);
+      Result.AddChild(EncExpr);
+    end;
   end;
   if not Context.Match(ttDelimParClose) then
   begin

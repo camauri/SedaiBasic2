@@ -6715,8 +6715,8 @@ end;
 function TPackratParser.ParseFileOperationStatement: TASTNode;
 var
   Token: TLexerToken;
-  Param, HandleNode, LenExpr: TASTNode;
-  CmdName, ModeStr, MW, EncStr: string;
+  Param, HandleNode, LenExpr, EncExpr: TASTNode;
+  CmdName, ModeStr, MW, EncMark: string;
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
   C64CommaPos: Integer;
@@ -6910,23 +6910,31 @@ begin
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
-    // Optional "ENCODING <string>" clause (FreeBASIC text encoding). The width travels on the MODE
+    // Optional "ENCODING <expr>" clause (FreeBASIC text encoding). The width travels on the MODE
     // string as a trailing "~<bits>" - the same way "ACCESS READ" travels as '<' - so nothing between
-    // here and the file layer had to learn a new parameter. "ascii"/"utf8" need no marker: our strings
-    // are already UTF-8 bytes and that is what the file gets.
+    // here and the file layer had to learn a new parameter. "ascii" needs no marker: our strings are
+    // already UTF-8 bytes and that is what the file gets. The mapping is EncodingModeMarker, shared
+    // with the function form, which used to drop the clause entirely.
+    // ⛔ The marker is appended LAST, after ACCESS/LOCK - not here. It used to be appended on the spot,
+    // and "Encoding "utf16" Access Read" then built "R~16<": the '<' landed INSIDE the number and the
+    // handle read raw bytes. The same file without ACCESS decoded correctly, which is how a clause
+    // that changes nothing on its own changed the meaning of the one before it.
+    EncMark := '';
+    EncExpr := nil;
     if UpperCase(Context.CurrentToken.Value) = kENCODING then
     begin
       Context.Advance;            // ENCODING
       if Context.Check(ttStringLiteral) then
       begin
-        EncStr := UpperCase(StringReplace(StringReplace(VarToStr(Context.CurrentToken.Value),
-                                                        '-', '', [rfReplaceAll]), '_', '', [rfReplaceAll]));
-        if (EncStr = 'UTF16') or (EncStr = 'UTF16LE') then ModeStr := ModeStr + '~16'
-        else if EncStr = 'UTF32' then ModeStr := ModeStr + '~32'
-        // "utf8" needs no CONVERSION - our strings are already UTF-8 bytes - but it is not the same as
-        // no clause at all: fbc still writes the byte-order mark EF BB BF. So it gets a marker too.
-        else if (EncStr = 'UTF8') then ModeStr := ModeStr + '~8';
+        EncMark := EncodingModeMarker(VarToStr(Context.CurrentToken.Value));
         Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+      end
+      else
+      begin
+        // ⭐ The name need not be a LITERAL: fbc's own tests write "encoding encod" and
+        // "encoding files(i).encoding". Then the marker cannot be baked into the mode string here -
+        // it is appended at run time (SSA), and the file layer reads the NAME after the '~'.
+        EncExpr := ParseExpression;
       end;
     end;
     // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC). Only READ-alone changes anything
@@ -6945,6 +6953,9 @@ begin
       // marker in between would be read as part of the number.
       if AccessRead and (ModeStr <> 'L') then ModeStr := ModeStr + '<';
     end;
+    // The encoding marker goes on LAST, so '~' is always a suffix of the mode string (see above).
+    // Not on RANDOM, whose 'L' takes the record length appended in the SSA.
+    if (EncMark <> '') and (ModeStr <> 'L') then ModeStr := ModeStr + EncMark;
     // Optional lock_type clause (FreeBASIC): "SHARED" or "LOCK {READ|WRITE|READ WRITE}" — accepted and
     // ignored (single-process VM, no file locking).
     if UpperCase(Context.CurrentToken.Value) = kSHARED then
@@ -6986,6 +6997,17 @@ begin
     if LenExpr <> nil then
     begin
       if ModeStr = 'L' then Result.AddChild(LenExpr) else LenExpr.Free;
+    end;
+    // A run-time ENCODING name rides as an extra child, at whatever index it lands on: the attribute
+    // says WHICH, so nothing has to count the optional ones.
+    if EncExpr <> nil then
+    begin
+      if ModeStr = 'L' then EncExpr.Free
+      else
+      begin
+        Result.Attributes.Values['ENCEXPR'] := IntToStr(Result.ChildCount);
+        Result.AddChild(EncExpr);
+      end;
     end;
     DoNodeCreated(Result);
     Exit;

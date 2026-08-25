@@ -705,7 +705,17 @@ function IsBitIntrinsicName(const Name: string): Boolean;
 // The 32-bit width of a name is its "32" suffix, and BitIntrinsicWidth is the only place that reads it.
 function BitIntrinsicWidth(const Name: string): Integer;
 
+// ⭐ The ONE reading of an OPEN ... ENCODING name. It answers the marker the mode string carries -
+// "~16" / "~32" / "~8", or '' for ascii, which needs nothing - and it lives here because THREE places
+// ask the question: the OPEN statement, the OPEN function form, and the file layer when the name was
+// only known at run time. It used to live in the statement parser alone, and the function form
+// silently DROPPED the clause: "Open(f, For Output, Encoding "utf16", As #1)" wrote UTF-8 while the
+// statement one line above wrote UTF-16.
+function EncodingModeMarker(const Enc: string): string;
+
 implementation
+
+uses SysUtils;
 
 function IsBitIntrinsicName(const Name: string): Boolean;
 begin
@@ -718,6 +728,19 @@ end;
 function BitIntrinsicWidth(const Name: string): Integer;
 begin
   if (Length(Name) > 2) and (Copy(Name, Length(Name) - 1, 2) = '32') then Result := 32 else Result := 64;
+end;
+
+function EncodingModeMarker(const Enc: string): string;
+var
+  E: string;
+begin
+  E := UpperCase(StringReplace(StringReplace(Enc, '-', '', [rfReplaceAll]), '_', '', [rfReplaceAll]));
+  if (E = 'UTF16') or (E = 'UTF16LE') then Result := '~16'
+  else if E = 'UTF32' then Result := '~32'
+  // "utf8" needs no CONVERSION - our strings are already UTF-8 bytes - but it is not the same as no
+  // clause at all: fbc still writes the byte-order mark EF BB BF. So it gets a marker too.
+  else if E = 'UTF8' then Result := '~8'
+  else Result := '';                        // "ascii", and anything we do not model
 end;
 
 end.
