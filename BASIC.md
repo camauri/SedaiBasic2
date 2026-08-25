@@ -238,6 +238,16 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
+- ⚠️ **Overload resolution does not tell `Integer` from `LongInt`, nor `UInteger` from `ULongInt`.**
+  On this target all four are 64 bits and all four sign the same register bank, and no registry records
+  which of the four a name was *declared* as — so given `f(ByVal x As Integer)` and
+  `f(ByVal x As UInteger)`, both `f(i)` and `f(u)` answer the first declaration. Everything the bank
+  and the declared width *can* separate is resolved exactly: `Byte`/`UByte`/`Short`/`UShort`/`Long`/
+  `ULong`/`Single`/`Double`/`Boolean`, each **enum** type, each **pointee** type (`Integer Ptr` from
+  `Double Ptr` from `T Ptr`, at any pointer depth), each by-value UDT, and `Const` against non-`Const`.
+  ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
+  an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
+  when exactly one fits.
 - ⚠️ **`PUT ..., Alpha`**: the blended RGB matches fbc exactly; the resulting **alpha byte** does not.
   fbc's is deterministic and fully characterised — with an explicit value it is the blend value when
   the destination's **green** exceeds the source's green and the destination's own alpha otherwise
