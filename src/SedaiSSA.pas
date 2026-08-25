@@ -763,6 +763,7 @@ type
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue); overload;
     function TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
+    function IsTypeCtorTemporary(Node: TASTNode): Boolean;   // "type<T>(args)" / "T(args)" anonymous temporary
     procedure ProcessAssignment(Node: TASTNode);
     function TryCompoundSelfOp(Node, VarNode, ExprNode: TASTNode): Boolean;
     procedure FillInferredCtorType(VarNode, ExprNode: TASTNode);
@@ -1928,6 +1929,29 @@ begin
 end;
 
 // Overload without hint - creates empty hint internally
+function IsBuiltinStringTypeName(const N: string): Boolean;
+// The built-in STRING types, which convert through the string path and never through a cast.
+var
+  T: string;
+begin
+  T := UpperCase(N);
+  Result := (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING');
+end;
+
+function IsBuiltinScalarTypeName(const N: string): Boolean;
+// The built-in (non-UDT) type names a FreeBASIC "Type( value )" shorthand can infer. Used to tell a
+// CONVERSION from an anonymous UDT temporary once the inferred name is filled in.
+var
+  T: string;
+begin
+  T := UpperCase(N);
+  Result := (T = 'BYTE') or (T = 'UBYTE') or (T = 'SHORT') or (T = 'USHORT') or
+            (T = 'LONG') or (T = 'ULONG') or (T = 'INTEGER') or (T = 'UINTEGER') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+            (T = 'SINGLE') or (T = 'DOUBLE') or
+            (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING');
+end;
+
 procedure TSSAGenerator.ProcessExpression(Node: TASTNode; out Result: TSSAValue);
 var
   EmptyHint: TSSAValue;
@@ -2013,6 +2037,7 @@ var
   TempReg, IntReg: Integer;
   IntRegVal, TempVal, TempVal2: TSSAValue;
   ArgListNode: TASTNode;
+  CtorValNode: TASTNode;   // "Type( v )" whose inferred type is BUILT-IN: the single value
   TempFloat: Double;
   TempInt: Integer;
   TempStr: string;
@@ -6098,6 +6123,54 @@ begin
 
         ArrName := VarToStr(Node.GetChild(0).Value);
 
+        // FreeBASIC's "Type( value )" shorthand whose type was INFERRED from the target, and the target
+        // is a BUILT-IN type ("Dim x As Integer = Type( 1.5 )", "f = Type( 1.5 )"): there is no temporary
+        // to construct, the form is a CONVERSION - exactly what the explicit "type<Integer>( 1.5 )"
+        // lowers to. Rewritten IN PLACE, here, where the filled-in name is finally visible: four places
+        // fill that name (DIM, assignment, argument, RETURN) and each clears the INFERTYPE mark, so
+        // teaching them all the same rule is the shape that keeps going wrong. TYPECTOR survives the fill.
+        // ⛔ NUMERIC types only. A STRING type reaching antCast prints a number: fbc rejects
+        // "Cast(String, x)" outright and our cast has no string arm. The string spellings are the
+        // one-argument STRING(x) conversion further down, which is where they already worked.
+        if (Node.Attributes.Values['TYPECTOR'] = '1') and IsBuiltinScalarTypeName(ArrName) and
+           (not IsBuiltinStringTypeName(ArrName)) and
+           (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antExpressionList) and
+           (Node.GetChild(1).ChildCount = 1) then
+        begin
+          CtorValNode := Node.GetChild(1).GetChild(0);
+          Node.GetChild(1).Children.Extract(CtorValNode);   // detach WITHOUT freeing: the list owns its children
+          Node.ClearChildren;                               // frees the name node and the emptied list
+          Node.NodeType := antCast;
+          Node.Value := UpperCase(ArrName);
+          Node.Attributes.Values['TYPECTOR'] := '';         // done once; the optimizer visits this node again
+          Node.AddChild(CtorValNode);
+          ProcessExpression(Node, Result, DestHint);
+          Exit;
+        end;
+
+        // ...and the same shorthand whose type NOBODY filled in: every filling site knows how to answer
+        // "what UDT is the target?" and none of them knows how to answer "what BUILT-IN type is it?", so
+        // for a scalar target the name is still empty here ("i = Type( 456 )", "Return Type( 9 )"). It
+        // does not need one: a conversion to the target's own type is exactly what the store or the
+        // return already performs on any other value. Hand the value through.
+        // ⛔ One argument only - a field list with an unresolved type is a real failure and keeps its error.
+        // ...and the same for a written type that is neither a UDT nor a built-in scalar: an ENUM
+        // ("i = type<E>( B )") or a procedure type ("p = type<Sub( )>( 0 )"). Both convert to the
+        // value's own bank, so there is nothing to emit but the value.
+        // ⛔ ...but NOT a STRING type: "type<String>( x )" is a real CONVERSION, not the identity - on a
+        // UDT it runs that type's string Cast operator, and lowering it to its operand turned
+        // "Operator Len( v As VZ ) = Len( Type<String>( v ) )" into unbounded recursion. It already
+        // lowers to the one-argument STRING(x) conversion, which is where the string types belong.
+        if (Node.Attributes.Values['TYPECTOR'] = '1') and
+           ((Node.Attributes.Values['INFERTYPE'] = '1') or
+            ((FindUDT(UpperCase(ArrName)) < 0) and (not IsBuiltinScalarTypeName(ArrName)))) and
+           (Node.ChildCount >= 2) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), Result, DestHint);
+          Exit;
+        end;
+
         // FreeBASIC anonymous temporary construction "TypeName(args)" used as a VALUE (array-of-UDT
         // initializer element, assignment RHS, function argument): the "array name" is actually a declared
         // UDT type and not a real array. Construct a temporary instance (allocate + constructor) and return
@@ -7262,6 +7335,21 @@ begin
   {$ENDIF}
 end;
 
+function TSSAGenerator.IsTypeCtorTemporary(Node: TASTNode): Boolean;
+// True when Node is an anonymous UDT temporary written as a type constructor - "type<T>( args )" or
+// the bare "T( args )" with no array of that name in scope. The same guard the temporary's own
+// lowering uses, asked as a question so the places that must REFUSE one ask it the same way.
+var
+  Nm: string;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 1) then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  Result := (Node.Attributes.Values['TYPECTOR'] = '1') or
+            ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0));
+end;
+
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // Frame diet (same disease as ProcessExpression/ProcessStatement): the rare lvalue shapes and
 // probes live in their own Try*/Process* frames below, so THIS frame — entered for every
@@ -7283,6 +7371,16 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // ⛔ A TEMPORARY IS NOT AN LVALUE. "type<UDT>( 1 ) = x" and its "*@type<UDT>( 1 ) = x" spelling are
+  // errors in fbc (sf.net #801), while "type<UDT>( 0 ).i = 1" is legal - the difference is whether the
+  // target is the temporary ITSELF or a member of it, which is why the test is on the target node and
+  // not on the presence of a temporary anywhere in the statement.
+  if IsTypeCtorTemporary(VarNode) or
+     ((VarNode.NodeType = antDeref) and (VarNode.ChildCount >= 1) and
+      (VarNode.GetChild(0).NodeType = antProcAddress) and (VarNode.GetChild(0).ChildCount = 1) and
+      IsTypeCtorTemporary(VarNode.GetChild(0).GetChild(0))) then
+    raise Exception.Create(
+      'A type<T>(...) temporary is not assignable: it has no storage beyond the statement.');
   // Parentheses around an LVALUE are FreeBASIC's own spelling and carry no meaning of their own: the
   // manual wraps a byref-returning call that way and notes the enclosing parentheses are REQUIRED
   // there, to tell the assignment apart from a call whose result is discarded. Left wrapped, the target
@@ -7656,6 +7754,10 @@ begin
     // an EMPTY type name and the SSA read it as an array access: "Array not declared:" with no name.
     // ⚠️ THREE other spellings of the same thing already worked - "Return Type(...)", "<fname> =
     // Type(...)" and the DIM - so only this one refused, and only when the result was written this way.
+    // ⛔ ONLY when the UDT result type is known HERE. This site is reached before the one that knows it
+    // for the "Function = ..." spelling, and a scalar fallback taken here answered "DOUBLE" for a
+    // function returning a UDT - the temporary then died as "Array not declared: DOUBLE". The scalar
+    // case is answered further down, at the RETURN site that does know.
     if (FCurrentProcRetRecType <> '') and (ExprNode <> nil) and
        (ExprNode.Attributes.Values['INFERTYPE'] = '1') and (ExprNode.ChildCount >= 1) then
     begin
@@ -9556,6 +9658,23 @@ begin
     // then be a clone, and a virtual call through it would dispatch on the CLONE's type. It printed
     // nothing at all, because the scalar reference machinery had made r an INT holding an address and
     // "r.method()" found no record there.
+    // ⛔ ...but NOT to a TEMPORARY. "Var ByRef x = type<UDT>( 123 )" and "Var ByRef x = UDT( )" are
+    // errors in fbc, and rightly: the temporary dies at the end of the statement and the reference
+    // would outlive it. Taking its address is legal as an ARGUMENT (the callee runs inside the
+    // statement), which is why the check belongs here at the BIND and not in the address-of path.
+    if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and (ArrayDeclNode.ChildCount >= 3) and
+       (ArrayDeclNode.GetChild(2).NodeType = antProcAddress) and
+       (ArrayDeclNode.GetChild(2).ChildCount = 1) and
+       (ArrayDeclNode.GetChild(2).GetChild(0).NodeType = antArrayAccess) and
+       (ArrayDeclNode.GetChild(2).GetChild(0).ChildCount >= 1) and
+       (ArrayDeclNode.GetChild(2).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+       ((ArrayDeclNode.GetChild(2).GetChild(0).Attributes.Values['TYPECTOR'] = '1') or
+        ((FindUDT(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).GetChild(0).GetChild(0).Value))) >= 0) and
+         (ArrayIndexOf(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).GetChild(0).GetChild(0).Value))) < 0))) then
+      raise Exception.CreateFmt(
+        'Cannot bind the reference "%s" to a temporary: the temporary does not outlive the statement.',
+        [ArrName]);
+
     if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and (ArrayDeclNode.ChildCount >= 3) and
        (DimsNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
     begin
@@ -29589,6 +29708,14 @@ begin
       EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);   // the address the function returned
       Exit;
     end;
+    // "@type<T>( ... )" / "@T( ... )": the operand is not an array access at all, it is an anonymous
+    // TEMPORARY of a declared UDT - fbc's own suite passes one BYREF that way. In the managed model a
+    // "T Ptr" IS the record handle, so the address of the temporary is the temporary: build it and hand
+    // its handle back. Same guard as the temporary hook in ProcessExpression (a real array of that name
+    // still wins), so the two paths cannot disagree about what a name means.
+    if (FindUDT(UpperCase(ArrName)) >= 0) and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) then
+      if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   end;
   // @g(i) where g is an array-of-UDT: FreeBASIC "@g(i)" is a "T Ptr" to element i, and in the managed model

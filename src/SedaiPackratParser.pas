@@ -1332,7 +1332,28 @@ begin
     ttCondSignal, ttCondBroadcast, ttCondDestroy:
       Result := Memoize('CondOpStatement', @ParseCondOpStatement);
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
-    ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
+    // ⛔ TYPE at statement start is not always a DECLARATION: "type<UDT>( ).method( )" is an anonymous
+    // temporary a method is called on, and fbc's own suite writes it that way. The declaration is always
+    // "Type <name>" or "Type As <t> <name>"; only the type-CONSTRUCTOR spellings put "<" or "(" there,
+    // which is a one-token look-ahead and cannot take a declaration away from ParseTypeDecl.
+    ttTypeDecl:
+      if Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType in [ttOpLt, ttDelimParOpen]) then
+      begin
+        // Assignment FIRST, exactly as the '(' case does: "type<UDT>( 0 ).i = 1" writes a member of the
+        // temporary and is legal, and only the assignment shape carries the check that refuses writing
+        // to the temporary ITSELF. Read as a plain expression it would be a discarded comparison, which
+        // is how "type<UDT>( 1 ) = x" - an ERROR in fbc - came out silently accepted.
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end
+      else
+        Result := Memoize('TypeDecl', @ParseTypeDecl);
     ttUnionDecl: Result := Memoize('UnionDecl', @ParseUnionDecl);
     ttRandomize: Result := Memoize('RandomizeStatement', @ParseRandomizeStatement);
     ttWithBlock: Result := ParseWith;
@@ -1668,6 +1689,16 @@ begin
   begin
     // "(*p).field = expr", and any other target that opens with a parenthesis. The expression parser
     // builds antMemberAccess over the parenthesised deref and stops before '=' (lower precedence).
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+  end
+  else if Context.Check(ttTypeDecl) and Assigned(Context.PeekNext) and
+    (Context.PeekNext.TokenType in [ttOpLt, ttDelimParOpen]) then
+  begin
+    // "type<UDT>( 0 ).i = 1": a MEMBER of an anonymous temporary is a legal target (fbc's sf.net #801
+    // says so, and says the temporary itself is not). The statement dispatch sends every "Type <" /
+    // "Type (" here first; with no '=' this returns nil QUIETLY and the caller reads it as the
+    // expression statement it is ("type<UDT>( ).method( )").
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
   end

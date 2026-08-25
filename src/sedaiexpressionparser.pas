@@ -1948,6 +1948,7 @@ end;
 function TExpressionParser.ParseProcAddress(Token: TLexerToken): TASTNode;
 var
   Operand: TASTNode;
+  CtorTok: TLexerToken;   // "@type<T>(...)": the TYPE token handed to the type-constructor parser
 begin
   // '@' is already consumed. Parse the operand as a full postfix expression (precCall stops before
   // binary operators), so all of these are handled: @sub / @x (identifier), @arr(i) (array access),
@@ -2024,6 +2025,20 @@ begin
       Operand := Operand.GetChild(0);
     Result := TASTNode.Create(antProcAddress, Token);
     Result.AddChild(Operand.Clone);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  // "@type<T>( ... )": the address of an anonymous temporary, which fbc's own suite passes BYREF that
+  // way. TYPE lexes as ttTypeDecl and not as an identifier, so the name test below refused it and the
+  // whole argument failed - the operand is built by the same routine the expression grammar uses.
+  if Context.Check(ttTypeDecl) then
+  begin
+    CtorTok := Context.CurrentToken;
+    Context.Advance;                          // TYPE
+    Operand := ParseTypeConstructor(CtorTok);
+    if not Assigned(Operand) then Exit(nil);
+    Result := TASTNode.Create(antProcAddress, Token);
+    Result.AddChild(Operand);
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2177,14 +2192,23 @@ begin
   DoNodeCreated(Result);
 end;
 
+function IsFBScalarTypeName(const N: string): Boolean; forward;   // built-in scalar type names; defined below
+
 function TExpressionParser.ParseTypeConstructor(Token: TLexerToken): TASTNode;
 // FreeBASIC "type<T>(args)": an anonymous temporary of UDT T initialised with args (via T's constructor,
 // or field-by-field when T has none). The TYPE token is already consumed. Lowers to the same shape the
 // SSA's UDT-temporary hook recognises for "T(args)": antArrayAccess(child0 = antIdentifier(T),
 // child1 = antExpressionList(args)). The angle brackets are the comparison tokens ttOpLt / ttOpGt.
+//
+// The type position is a full FreeBASIC type, not only a UDT name: "type<Integer>", "type<Integer Ptr>"
+// and "type<TypeOf(x)>" are all legal. Only a UDT builds a temporary — for a BUILT-IN type the form is a
+// CONVERSION, which is what Cast(T, v) already is, so it lowers to antCast and adds nothing downstream.
+// A conversion also has a parenthesis-less spelling ("x = type<Integer>1"); a UDT temporary does not,
+// its parentheses delimiting the field list.
 var
-  TypeName: TLexerToken;
-  NameNode, Args: TASTNode;
+  TypeStr: string;
+  NameNode, Args, ValExpr, TypeOfExpr: TASTNode;
+  IsConversion, HadParen: Boolean;
 begin
   if not Context.Check(ttOpLt) then
   begin
@@ -2206,6 +2230,10 @@ begin
       end;
       Result := TASTNode.Create(antArrayAccess, Token);
       Result.Attributes.Values['INFERTYPE'] := '1';     // type deduced by the DIM/assignment/return lowering
+      // ...and the deduced type may be a BUILT-IN one ("Dim x As Integer = Type( 1.5 )"), where there is
+      // no temporary to construct and the form is a conversion. INFERTYPE is CLEARED once filled, so the
+      // SSA cannot tell this node from a genuine "T(args)" afterwards: this marker survives the fill.
+      Result.Attributes.Values['TYPECTOR'] := '1';
       Result.AddChild(NameNode);
       Result.AddChild(Args);
       DoNodeCreated(Result);
@@ -2215,34 +2243,133 @@ begin
     Exit(nil);
   end;
   Context.Advance;   // consume '<'
-  if not Context.Check(ttIdentifier) then
+  TypeStr := '';
+  TypeOfExpr := nil;
+  // "type<TypeOf(expr)>": the type is not written, it is ASKED. Read exactly as CAST/CPTR reads it — the
+  // operand stays a CHILD and is resolved in the SSA, the only place that knows what a name was DECLARED as.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                          // TypeOf
+    Context.Advance;                          // (
+    TypeOfExpr := ParseExpression(precNone);
+    if not Assigned(TypeOfExpr) then
+    begin
+      HandleError('Expected an expression inside TypeOf(...)', Context.CurrentToken);
+      Exit(nil);
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after TypeOf(...)', Context.CurrentToken);
+      TypeOfExpr.Free; Exit(nil);
+    end;
+    TypeStr := 'TYPEOF';
+    while AtPointerSuffix do
+    begin TypeStr := TypeStr + ' ' + kPTR; Context.Advance; end;
+  end
+  else
+    while (not Context.IsAtEnd) and (not Context.Check(ttOpGt)) do
+    begin
+      if Context.Check(ttOpDot) then TypeStr := TypeStr + '.'
+      else
+      begin
+        if (TypeStr <> '') and (TypeStr[Length(TypeStr)] <> '.') then TypeStr := TypeStr + ' ';
+        // "type<ZString Pointer>": POINTER is fbc's synonym of PTR and only "T PTR" is understood
+        // downstream. Normalise it here, where it can only be the suffix (a type name is already left of it).
+        if (TypeStr <> '') and AtPointerSuffix then
+          TypeStr := TypeStr + kPTR
+        else
+          TypeStr := TypeStr + UpperCase(VarToStr(Context.CurrentToken.Value));
+      end;
+      Context.Advance;
+    end;
+  if TypeStr = '' then
   begin
     HandleError('Expected a TYPE name in a type<T>(...) expression', Context.CurrentToken);
     Exit(nil);
   end;
-  TypeName := Context.CurrentToken;
-  NameNode := TASTNode.CreateWithValue(antIdentifier, TypeName.Value, TypeName);
-  Context.Advance;   // consume the type name
   if not Context.Match(ttOpGt) then
   begin
     HandleError('Expected ">" after the type name in a type<T>(...) expression', Context.CurrentToken);
-    NameNode.Free; Exit(nil);
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Exit(nil);
   end;
-  if not Context.Match(ttDelimParOpen) then
+
+  // ⛔ A STRING type is NOT lowered to a cast: fbc itself rejects "Cast(String, x)" ("Type mismatch"),
+  // and our antCast has no string arm - routing it there gave 0 where the operand was already a string.
+  // "type<String>( s )" is the IDENTITY on a string, and it reaches the SSA's own pass-through below.
+  IsConversion := ((TypeStr = 'TYPEOF') or IsFBScalarTypeName(TypeStr) or
+                   (Pos(' ' + kPTR, TypeStr) > 0)) and
+                  (TypeStr <> 'ZSTRING') and (TypeStr <> 'WSTRING') and (TypeStr <> 'ANY');
+
+  if IsConversion then
   begin
-    HandleError('Expected "(" after type<T> in a type<T>(...) expression', Context.CurrentToken);
-    NameNode.Free; Exit(nil);
+    // "type<Integer>(v)", "type<Integer>v", "type<Integer>((v))" — one value, converted. The
+    // parenthesised form has to read the value at NO precedence floor (the parentheses close it);
+    // the bare form reads it at unary precedence, so "type<Integer>4 + 1" converts 4 and then adds.
+    HadParen := Context.Match(ttDelimParOpen);
+    if HadParen then
+      ValExpr := ParseExpression(precNone)
+    else
+      ValExpr := ParseExpression(precUnary);
+    if not Assigned(ValExpr) then
+    begin
+      HandleError('Expected a value in a type<T>(...) conversion', Context.CurrentToken);
+      if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+      Exit(nil);
+    end;
+    if HadParen and (not Context.Match(ttDelimParClose)) then
+    begin
+      HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
+      ValExpr.Free; if Assigned(TypeOfExpr) then TypeOfExpr.Free; Exit(nil);
+    end;
+    Result := TASTNode.CreateWithValue(antCast, TypeStr, Token);
+    Result.AddChild(ValExpr);
+    if Assigned(TypeOfExpr) then
+    begin
+      Result.Attributes.Values['TYPEOFEXPR'] := '1';
+      Result.AddChild(TypeOfExpr);       // child1 = the operand of TypeOf, resolved in the SSA
+    end;
+    DoNodeCreated(Result);
+    Exit;
   end;
-  if Context.Check(ttDelimParClose) then
-    Args := TASTNode.Create(antExpressionList, Token)   // type<T>() — no field values
+
+  // ⭐ UPPER-CASED, not as written: every other producer of this node puts the type name in upper case
+  // (the argument-fill site spells it "UpperCase(...)" too) and the readers compare it exactly. Handing
+  // the source spelling through made "type<string>( s )" a different name from "STRING(s)" - the very
+  // conversion it lowers to - and Print showed a number where the string was.
+  NameNode := TASTNode.CreateWithValue(antIdentifier, TypeStr, Token);
+  if Context.Match(ttDelimParOpen) then
+  begin
+    if Context.Check(ttDelimParClose) then
+      Args := TASTNode.Create(antExpressionList, Token)   // type<T>() — no field values
+    else
+      Args := ParseExpressionList(ttSeparParam);          // comma-separated field/ctor args
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
+      NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
+    end;
+  end
   else
-    Args := ParseExpressionList(ttSeparParam);          // comma-separated field/ctor args
-  if not Context.Match(ttDelimParClose) then
   begin
-    HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
-    NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
+    // "Dim As Parent p = type<Child>c": the parenthesis-less form works for a UDT too, where it is the
+    // ONE-value conversion (an upcast here) rather than a field list. Read at unary precedence, as the
+    // built-in conversion above does, so "type<Child>c.i" binds the value and not the whole expression.
+    ValExpr := ParseExpression(precUnary);
+    if not Assigned(ValExpr) then
+    begin
+      HandleError('Expected "(" or a value after type<T> in a type<T>(...) expression', Context.CurrentToken);
+      NameNode.Free; Exit(nil);
+    end;
+    Args := TASTNode.Create(antExpressionList, Token);
+    Args.AddChild(ValExpr);
   end;
   Result := TASTNode.Create(antArrayAccess, Token);
+  // The written type may be neither a UDT nor a built-in scalar - an ENUM, or a procedure type
+  // ("type<Sub( )>( 0 )"). There is no temporary to build for those either; the marker is what lets the
+  // SSA tell "a type constructor whose type is not a UDT" from a genuine call to an undeclared array.
+  Result.Attributes.Values['TYPECTOR'] := '1';
   Result.AddChild(NameNode);
   Result.AddChild(Args);
   DoNodeCreated(Result);
