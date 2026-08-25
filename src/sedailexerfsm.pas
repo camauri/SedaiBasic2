@@ -1540,7 +1540,14 @@ begin
       'a'..'f': DigVal := Ord(Ch) - Ord('a') + 10;
     else        DigVal := 0;
     end;
+    {$PUSH}{$Q-}{$R-}
+    // ⛔ THE WRAP IS THE SEMANTICS. FreeBASIC lets a base literal fill all 64 bits - "&hFFFFFFFFFFFFFFFF"
+    // is a legal way to write -1 - so the accumulation overflows Int64 on purpose. A DEBUG build (-Co)
+    // stopped the LEXER on it, which killed the program before anything could be diagnosed.
+    // ⇒ A check that fires on an INTENTIONAL operation does not protect: it disables the tool. Same
+    //   family as the FNV-1a hashes; found the same way, by running the corpus under the debug build.
     Val := Val * Base + DigVal;
+    {$POP}
     TokenBufferAdd(Ch); AdvanceChar;
   end;
   ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: &hFFul, &b1010ULL, ... (dropped)

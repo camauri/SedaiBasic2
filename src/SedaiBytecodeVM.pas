@@ -1111,7 +1111,11 @@ begin
   begin
     if V - TWO63 >= TWO63 then Q := QWord(INDEFINITE)
     else Q := QWord(FloatToIntConv(V - TWO63, Modern));
+    {$PUSH}{$Q-}{$R-}
+    // "Take 2^63 off, convert, put it back": the addition wraps THROUGH the sign, which is the whole
+    // trick. Deliberate, and silenced here so a debug build stays usable.
     Result := Int64(Q + QWord(INDEFINITE));
+    {$POP}
   end
   else
     Result := FloatToIntConv(V, Modern);
@@ -11816,7 +11820,11 @@ begin
         else if (C >= 'A') and (C <= 'F') then D := Ord(C) - Ord('A') + 10
         else Break;
         if D >= Base then Break;
+        {$PUSH}{$Q-}{$R-}
+        // The UNSIGNED accumulation wraps by design - that is what parsing a full-width base literal
+        // means. Silenced here so a debug build can be used; see the lexer's twin.
         U := U * QWord(Base) + QWord(D);
+        {$POP}
         Inc(I);
       end;
       Result := Int64(U);
@@ -14428,6 +14436,12 @@ var
   DrawMode: Integer;
   PalColor: UInt32;
   GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
+  // ⛔ A COLOUR DOES NOT FIT IN AN Integer. "Rgb(0, 255, 0)" is 4278255360 with its alpha byte set, and
+  // reading it into the 32-bit signed GetSx TRUNCATED it - silently in a release build (the bit pattern
+  // survives the later UInt32 cast, which is why nothing ever looked wrong) and as a range error in a
+  // debug one, where it made every graphics program undebuggable. Found 25 Aug 2026 by running the
+  // corpus under the debug build.
+  GfxColour: Int64;
   WinX1, WinY1, WinX2, WinY2, WinW, WinH: Integer;
   PMapVal: Double;                        // PMAP's answer before it is narrowed to a SINGLE
   JoyBtns, JoyDev, JoyLocal, JoyBtnIdx: Integer;
@@ -15107,9 +15121,9 @@ begin
       begin
         GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src2]);
         GetY1 := GfxMapY(Ctx.IntRegs[Instr.Immediate and $FFFF]);
-        GetSx := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour
+        GfxColour := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour: 64-bit, see above
         FGraphics.DrawText(DrawSurface, GetX1, GetY1, Ctx.StringRegs[Instr.Src1],
-                           UInt32(GetSx), 0, False);
+                           UInt32(GfxColour and $FFFFFFFF), 0, False);
       end;
     58: // bcGfxPointCoord - POINTCOORD(n): the DRAW pen coordinate (Src1 selector: 0 = x, 1 = y).
       if Ctx.IntRegs[Instr.Src1] = 1 then
@@ -15160,18 +15174,18 @@ begin
       begin
         GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src1]); GetY1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
         GetX2 := GfxMapX(Ctx.IntRegs[Instr.Dest]); GetY2 := GfxMapY(Ctx.IntRegs[(Instr.Immediate) and $FFFF]);
-        GetSx := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour
+        GfxColour := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour: 64-bit, see above
         GetSy := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF] and $FFFF;   // style mask (16-bit)
         if ((Instr.Immediate shr 48) and $3) = 1 then
         begin
           // B: styled box outline = four styled edges (pattern restarts on each edge).
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY1, UInt32(GetSx), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY1, GetX2, GetY2, UInt32(GetSx), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY2, GetX1, GetY2, UInt32(GetSx), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX1, GetY1, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY1, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY1, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY2, GetX1, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX1, GetY1, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
         end
         else
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY2, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
         FDrawPenX := Ctx.IntRegs[Instr.Dest]; FDrawPenY := Ctx.IntRegs[(Instr.Immediate) and $FFFF];
       end;
   else
