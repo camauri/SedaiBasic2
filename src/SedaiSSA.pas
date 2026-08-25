@@ -100,6 +100,12 @@ type
                             // string reserves its bytes here even while its characters still live in
                             // the side vector.
     ByteSize: Integer;      // how many bytes the field occupies at that offset
+    BitContinues: Boolean;  // a BIT FIELD that shares the storage unit of the member before it.
+                            // ⛔ A DURABLE mark, and it has to be: AssignBitFieldRuns used to say the
+                            // same thing with "ByteSize = -1", and ComputeUDTLiveLayout OVERWRITES
+                            // ByteSize with the unit's real size a few lines later - so by the time the
+                            // two C layout routines ran, the only record of the run was gone and they
+                            // gave every bit member a unit of its own.
     StrCapacity: Integer;   // declared capacity of a fixed-length string field ("As String * 20" -> 20;
                             // 0 = variable-length). Storage stays variable-length (advisory), but the
                             // C BYTE LAYOUT of the type needs it: fbc gives such a field n+1 bytes.
@@ -19787,6 +19793,20 @@ begin
   MaxAl := 1; Ofs := 0;
   for i := 0 to n - 1 do
   begin
+    // ⭐ A BIT-FIELD CONTINUATION SHARES THE UNIT BEFORE IT: same offset, and it advances nothing - and
+    // it contributes NO ALIGNMENT of its own, which is why the test stands before the shape work and
+    // not after it. Put after, a "Boolean b:1, Integer i:1" pair still rounded the type up to EIGHT
+    // bytes: the continuation was not given a slot but its alignment was still counted.
+    // AssignBitFieldRuns marks these members; the LIVE layout has honoured the mark from the start and
+    // these two C routines never did, so SizeOf and OffsetOf answered as if every bit member had a unit
+    // of its own ("Short a:3, Short b:8" said 4 where fbc says 2).
+    // ⛔ THE THIRD TIME a UDT rule lived in one of the three layout routines and was missing from the
+    // others; UDT_DIAG=1 had been printing the disagreement all along ("SIZE DISAGREES ... C=4 live=2").
+    if (i > 0) and FUDTs[UDTIdx].Fields[i].BitContinues then
+    begin
+      Offsets[i] := Offsets[i - 1];
+      Continue;
+    end;
     if FUDTs[UDTIdx].Fields[i].IsArray then
     begin
       if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB) then Exit;
@@ -21214,6 +21234,13 @@ begin
   MaxAl := 1; Ofs := 0;
   for i := 0 to n - 1 do
   begin
+    // A BIT-FIELD CONTINUATION shares the unit before it and contributes no alignment - the same guard
+    // UDTCLayoutRaw carries, and in the same position, before the shape work.
+    if (i > 0) and FUDTs[UDTIdx].Fields[i].BitContinues then
+    begin
+      Offsets[i] := Offsets[i - 1];
+      Continue;
+    end;
     with FUDTs[UDTIdx].Fields[i] do
       if IsArray or (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
@@ -23471,22 +23498,36 @@ procedure TSSAGenerator.AssignBitFieldRuns(UDTIdx: Integer);
 // Marks continuation members with ByteSize = -1 so the layout below can recognise them without
 // re-deriving the runs: they take the unit's own offset and advance nothing.
 var
-  i, UnitBits, Used, UnitW: Integer;
+  i, UnitBits, Used, UnitW, UGrp, SGrp: Integer;
   Sz, Al: Int64;
 begin
-  UnitBits := 0; Used := 0; UnitW := -1;
+  UnitBits := 0; Used := 0; UnitW := -1; UGrp := 0; SGrp := 0;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    FUDTs[UDTIdx].Fields[i].BitContinues := False;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
+    // ⛔ A RUN NEVER CROSSES A UNION OR A NESTED-TYPE BOUNDARY. The alternatives of a union OVERLAP, so
+    // the second run must start its own unit at bit 0 - fbc's own boolean/boolean_bitfield declares two
+    // anonymous Type blocks of four one-bit members over the same UByte, and merged into one unit the
+    // second block's members read bits 4..7 of the first: 100 assertions instead of 68.
+    // ⚠️ Found only after the unit rule stopped keying on the declared TYPE, which had been hiding it.
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> UGrp) or (FUDTs[UDTIdx].Fields[i].StructGroup <> SGrp) then
+    begin
+      UGrp := FUDTs[UDTIdx].Fields[i].UnionGroup;
+      SGrp := FUDTs[UDTIdx].Fields[i].StructGroup;
+      UnitBits := 0; Used := 0; UnitW := -1;
+    end;
     if FUDTs[UDTIdx].Fields[i].BitWidth <= 0 then
     begin
       UnitBits := 0; Used := 0; UnitW := -1;
       Continue;
     end;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
-    // The unit's identity is its declared WIDTH CODE - that is what decides the storage width, and the
-    // field record keeps no type name to compare.
-    if (UnitW <> FUDTs[UDTIdx].Fields[i].WidthCode) or
-       (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
+    // ⛔ THE UNIT'S WIDTH IS THE FIRST MEMBER'S, and a later bit member of ANOTHER declared type still
+    // joins it as long as the bits fit. Opening a new unit on a type change is C's textbook rule and it
+    // is NOT what fbc does - measured 25 Aug 2026: "Short a:3, Integer b:8" is TWO bytes there (and was
+    // ten here), "Integer a:8, Short b:3" is eight. Only "the bits do not fit" opens a unit.
+    if (UnitW < 0) or (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
     begin
       // A new storage unit: this member starts it, and the layout treats it as an ordinary field.
       UnitW := FUDTs[UDTIdx].Fields[i].WidthCode;
@@ -23498,6 +23539,7 @@ begin
     begin
       FUDTs[UDTIdx].Fields[i].BitOffset := Used;
       FUDTs[UDTIdx].Fields[i].ByteSize := -1;        // continuation: shares the unit before it
+      FUDTs[UDTIdx].Fields[i].BitContinues := True;  // ...and this mark SURVIVES the live layout
     end;
     Inc(Used, FUDTs[UDTIdx].Fields[i].BitWidth);
   end;
