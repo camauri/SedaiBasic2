@@ -394,6 +394,7 @@ type
     procedure ProcessProcedureCall(Node: TASTNode);
     // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
     procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+    function TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode; out Val: TSSAValue): Boolean;
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode);   // raw-ness crosses the call here
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -676,6 +677,7 @@ type
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
+    function CurrentProcParamTypeName(const Name: string): string;   // a PARAMETER's declared type, from its own declaration
     function DeclaredScalarLenBytes(const Name: string): Int64;
     function FixedLenVarSizeBytes(const Name: string): Int64;   // SizeOf of a "* n" string var, else -1         // Len(numeric var) = declared type size; -1 = keep the string path
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
@@ -21477,6 +21479,34 @@ begin
   Result := Cap + 1;   // "String * n": the n characters plus the terminator fbc keeps
 end;
 
+function TSSAGenerator.CurrentProcParamTypeName(const Name: string): string;
+// The type a PARAMETER of the procedure being lowered was declared as, read off that procedure's OWN
+// declaration. '' when the name is not one of its parameters.
+// ⛔ It exists because the bare-name maps cannot answer for a parameter: they are keyed by NAME, so two
+// OVERLOADS that share a parameter name share the entry. With "Constructor W( ByVal v As Integer )"
+// declared beside "Constructor W( ByRef v As String )", "Len( v )" inside the STRING one answered 8 -
+// the size of an Integer. Renaming either parameter made the same program right, which is the
+// signature of a by-name collision and the same disease RegisterTypedVar's own comment describes.
+var
+  Decl, ParamList, Pm: TASTNode;
+  i: Integer;
+begin
+  Result := '';
+  if FCurrentProcName = '' then Exit;
+  if not (FProcDecls.TryGetValue(FCurrentProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    Pm := ParamList.GetChild(i);
+    if UpperCase(VarToStr(Pm.Value)) <> UpperCase(Name) then Continue;
+    if Pm.Attributes.Values['ARRAY'] = '1' then Exit;      // an array parameter is not a scalar
+    if (Pm.ChildCount >= 1) and (Pm.GetChild(0).NodeType = antIdentifier) and
+       not ((Pm.Attributes.Values['HASDEFAULT'] = '1') and (Pm.ChildCount = 1)) then
+      Result := UpperCase(VarToStr(Pm.GetChild(0).Value));
+    Exit;
+  end;
+end;
+
 function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
 // FreeBASIC Len(v) of a declared NUMERIC or POINTER scalar is SizeOf of its DECLARED type
 // (fbc-verified, examples/manual/variable/dim: Byte->1, Short->2, Integer->8, Single->4,
@@ -21531,6 +21561,16 @@ begin
   end;
   if (Nm2 <> '') and (Nm2 <> 'STRING') and (Nm2 <> 'ZSTRING') and (Nm2 <> 'WSTRING') then
     Exit(TypeSizeBytes(Nm2));
+  // ⭐ A PARAMETER answers from its OWN declaration, before any bare-name map is consulted - see
+  // CurrentProcParamTypeName for what goes wrong when it does not.
+  Nm2 := CurrentProcParamTypeName(Nm);
+  if Nm2 <> '' then
+  begin
+    if (Nm2 = 'STRING') or (Nm2 = 'ZSTRING') or (Nm2 = 'WSTRING') then Exit(-1);   // the string path
+    if Pos(' PTR', Nm2) > 0 then Exit(8);
+    if FindUDT(Nm2) >= 0 then Exit(-1);   // a UDT parameter is handled above, by ObjectTypeName
+    if TypeSizeBytes(Nm2) > 0 then Exit(TypeSizeBytes(Nm2));
+  end;
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
   if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
   if GetVariableType(Nm) = srtString then Exit;
@@ -32633,6 +32673,35 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode;
+  out Val: TSSAValue): Boolean;
+// FreeBASIC builds a TEMPORARY when an argument is not of the parameter's UDT type and that UDT
+// declares a constructor taking it: "Sub s( ByRef f As foo )" called as "s( 5 )" constructs "foo( 5 )"
+// and passes it. Without this the scalar was staged into the int slot AS IF IT WERE A RECORD HANDLE,
+// and the callee's first field access faulted - an access violation, not a diagnostic, which is the
+// worst way for a missing conversion to show.
+// ⛔ Only when a constructor really MATCHES. EmitUDTTemporary falls back to aggregate field init when
+// none does, and that would silently store the value into the first field of a type fbc would refuse
+// the call for.
+var
+  Args: TASTNode;
+  Lbl: string;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if (ArgExpr = nil) or (FindUDT(ParamTypeU) < 0) then Exit;
+  Args := TASTNode.Create(antExpressionList, ArgExpr.Token);
+  try
+    Args.AddChild(ArgExpr.Clone);
+    Lbl := ResolveConstructorLabel(ParamTypeU, ArgSigFromArgs(Args), ArgUdtSigFromArgs(Args),
+                                   ArgWidthSigFromArgs(Args, True));
+    if Lbl = '' then Exit;
+    Result := EmitUDTTemporary(ParamTypeU, Args, Val);
+  finally
+    Args.Free;
+  end;
+end;
+
 procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);
 // Evaluate each argument, coerce to the parameter's type, and stage it into the matching transfer slot.
 // The parameter layout is taken from ParamOwnerName's declaration (so a virtual call stages per the base
@@ -32647,6 +32716,7 @@ var
   Decl, ParamList, ArgExpr, ParamI: TASTNode;
   i, NArgs, Slot, NStage: Integer;
   RT: TSSARegisterType;
+  ParamUdtU: string;
   ArgVal, TempVal2: TSSAValue;
   StageSlots: array of Integer;
   StageRTs: array of TSSARegisterType;
@@ -32690,7 +32760,31 @@ begin
     // value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated to
     // int-banked params (address and slot are both int). The arg was address-backed by
     // CollectAddressTakenVars; EmitVarAddress yields its stable packed address.
-    if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) and
+    // A UDT parameter given something that is NOT one: FreeBASIC constructs a temporary through the
+    // matching constructor. Asked FIRST, because the shapes below all assume the staged int already IS
+    // a record handle - and a scalar staged as one faults on the callee's first field access.
+    ParamUdtU := '';
+    ParamI := ParamList.GetChild(i);
+    if (ParamI.Attributes.Values['ARRAY'] <> '1') and (ParamI.ChildCount >= 1) and
+       (ParamI.GetChild(0).NodeType = antIdentifier) and
+       // ⛔ NEVER PARAMETER 0 OF A METHOD. That one is the implicit THIS, and it is declared As <the
+       // owner type> - so an object reached through a BASE-class pointer looks like "not a subtype of
+       // the parameter" and was CONSTRUCTED AFRESH: the manual's udt/extends2 then dispatched every
+       // virtual call on the new temporary and answered "animal" for a dog. A THIS is never converted.
+       not ((i = 0) and (Pos('.', ParamOwnerName) > 0)) and
+       not ((ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount = 1)) then
+    begin
+      ParamUdtU := UpperCase(VarToStr(ParamI.GetChild(0).Value));
+      // ...and only from something that is NOT already an object: a RECORD is an up/down-cast and a
+      // POINTER is an address, neither of which is a construction. What crashes - and what fbc really
+      // converts here - is a SCALAR or a string.
+      if (Pos(' PTR', ParamUdtU) > 0) or (FindUDT(ParamUdtU) < 0) or
+         (ObjectTypeName(ArgExpr) <> '') or (DeclaredPointerTypeOfArg(ArgExpr) <> '') then
+        ParamUdtU := '';
+    end;
+    if (ParamUdtU <> '') and TryEmitImplicitUDTArg(ParamUdtU, ArgExpr, ArgVal) then
+      // handled: ArgVal holds the temporary's record handle
+    else if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) and
        (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
        (ArgExpr.NodeType = antIdentifier) then
       ArgVal := EmitVarAddress(VarToStr(ArgExpr.Value))
