@@ -248,6 +248,9 @@ difference is stated rather than left to be discovered.
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.
+  An overload whose trailing parameters carry **defaults** is reachable with fewer arguments
+  (`f(0)` selecting `f(i As Integer, j As Integer = 0, k As Integer = 0)`); among the candidates the
+  one needing the fewest omissions wins, and an exact bank prefix breaks a tie.
 - ⚠️ **`PUT ..., Alpha`**: the blended RGB matches fbc exactly; the resulting **alpha byte** does not.
   fbc's is deterministic and fully characterised — with an explicit value it is the blend value when
   the destination's **green** exceeds the source's green and the destination's own alpha otherwise
@@ -2417,7 +2420,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
-| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`. |
+| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The `#if TypeOf(a)=TypeOf(b)` form is **rejected with an error**, not silently evaluated: this preprocessor runs on text, before any declaration is seen, so it cannot answer the question — and answering it "false" (the undefined-identifier rule) would quietly take the wrong branch. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
@@ -2923,8 +2926,8 @@ End Function
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
 | `INSTRREV` | ✓ | Position of the last occurrence. `INSTRREV(str, sub [, start])` and `INSTRREV(str, Any set [, start])`. |
 | `MID (Statement)` | ✓ | Copies a substring to a substring of a string. |
-| `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
-| `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
+| `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). Over a **fixed-length** destination the buffer is its DECLARED capacity, so the result is padded to it. |
+| `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). Same declared-capacity rule as `LSET`. |
 
 ### Threading Support Functions
 

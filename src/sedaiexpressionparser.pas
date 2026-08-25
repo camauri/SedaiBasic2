@@ -2719,6 +2719,7 @@ function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
 // value expression. Lowers to antCast(value = upper-case type string, child0 = value expr).
 var
   TypeStr: string;
+  Depth: Integer;
   ValExpr, TypeOfExpr: TASTNode;
 begin
   Context.Advance;   // consume '('
@@ -2751,6 +2752,38 @@ begin
     // "TypeOf(x) Ptr" adds a level of indirection to whatever x was declared as.
     while AtPointerSuffix do
     begin TypeStr := TypeStr + ' ' + kPTR; Context.Advance; end;
+  end;
+  // ⛔ "CPtr(Sub(), 0)" / "Cast(Function() As Integer, p)": a PROCEDURE-POINTER type contains its own
+  // parentheses, and the token run below ends at the first ')' - so the type swallowed half of itself and
+  // the comma was never found ("Expected "," after the type in CAST/CPTR"). The same shape TypeOf hit
+  // just above, and the cure is the same: let the reader that knows this grammar consume it. What the
+  // cast produces is an entry address, which is int-banked, so the type name recorded is INTEGER.
+  if (TypeOfExpr = nil) and (TypeStr = '') and Context.Check(ttProcedureStart) then
+  begin
+    begin
+      Context.Advance;                        // SUB / FUNCTION
+      if Context.Check(ttDelimParOpen) then
+      begin
+        Depth := 1;
+        Context.Advance;
+        while (Depth > 0) and (not Context.IsAtEnd) do
+        begin
+          if Context.Check(ttDelimParOpen) then Inc(Depth)
+          else if Context.Check(ttDelimParClose) then Dec(Depth);
+          Context.Advance;
+        end;
+      end;
+      // "Function(...) [ByRef] As R": the return type follows, and it is part of the TYPE, not the
+      // cast's second argument.
+      if Context.Check(ttParamMode) then Context.Advance;
+      if Context.Check(ttAsType) then
+      begin
+        Context.Advance;
+        if Context.Check(ttIdentifier) then Context.Advance;
+        while AtPointerSuffix do Context.Advance;
+      end;
+    end;
+    TypeStr := 'INTEGER';
   end;
   while (TypeOfExpr = nil) and
         (not Context.IsAtEnd) and (not Context.Check(ttSeparParam)) and (not Context.Check(ttDelimParClose)) do

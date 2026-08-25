@@ -3597,6 +3597,17 @@ begin
   if (KindU <> kFUNCTION) and (KindU <> kSUB) then Exit;
   IsFunc := (KindU = kFUNCTION);
   Context.Advance;                                   // consume FUNCTION / SUB
+  // A CALLING CONVENTION may stand between the keyword and the parameter list here exactly as it may in
+  // a declaration ("Dim f As Sub CDecl ()"). The declaration path has skipped these all along; the TYPE
+  // did not, so the convention was read as the parameter list's opening name and the whole declaration
+  // fell apart. One internal convention here, so they are accepted and ignored - as in the other path.
+  while Context.Check(ttIdentifier) and
+        ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CDECL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STDCALL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PASCAL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'FASTCALL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'THISCALL')) do
+    Context.Advance;
   ParamTypes := '';
   if Context.Check(ttDelimParOpen) then
   begin
@@ -10197,10 +10208,28 @@ begin
       begin
         Context.Advance;                             // =
         Init := FExpressionParser.ParseExpression;
+        // ⛔ The BYREF wrapping belongs to BOTH spellings. "Static ByRef As T r = x" was taught it and
+        // "Static ByRef r As T = x" was not, so the name-first form declared an ordinary variable and
+        // read 0 - the same rule in one path and not its sibling, one edit later in the same routine.
+        if IsByrefStatic and Assigned(Init) then
+        begin
+          if Init.NodeType = antIdentifier then
+          begin
+            StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Init.Value)), NameTok);
+            Init.Free;
+          end
+          else
+          begin
+            StaticAddrNd := TASTNode.Create(antProcAddress, NameTok);
+            StaticAddrNd.AddChild(Init);
+          end;
+          Init := StaticAddrNd;
+        end;
         if Assigned(Init) then
           DeclNode.AddChild(Init);                   // child[2] = once-only initializer expression
       end;
     end;
+    if IsByrefStatic then DeclNode.Attributes.Values['BYREF'] := '1';
     DeclNode.Attributes.Values['STATIC'] := '1';
     if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
     if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;

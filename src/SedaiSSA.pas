@@ -358,6 +358,7 @@ type
     FUDTs: array of TUDTType;            // declared record types
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
+    FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
@@ -489,7 +490,8 @@ type
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
     procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
-                                       FromFlatIndex: Integer);  // ...and the CONSTRUCTOR on each element
+                                       FromFlatIndex: Integer;
+                                       RunDtor: Boolean = False);  // ...and the CONSTRUCTOR (or the DESTRUCTOR) on each element
     procedure EmitSetDynamicType(const TypeName: string);  // OOP: THIS's runtime type-id := TypeName
     procedure EmitSetDynamicTypeOn(const HandleVal: TSSAValue; const TypeName: string);
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
@@ -499,6 +501,7 @@ type
     // FreeBASIC aggregate init "Dim As T v = (a,b,c)" / "Type<T>(a,b,c)": store args into fields in order.
     procedure EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer; BraceNode: TASTNode);
     procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
+    function UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     // MODERN: gather the DIM'd UDTs of THIS scope only -- a DIM inside a block belongs to the block.
@@ -691,6 +694,7 @@ type
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
     function CurrentProcParamTypeName(const Name: string): string;   // a PARAMETER's declared type, from its own declaration
+    function StringLiteralBytes(Node: TASTNode; out Bytes: Int64): Boolean;
     function DeclaredScalarLenBytes(const Name: string): Int64;
     function FixedLenVarSizeBytes(const Name: string): Int64;   // SizeOf of a "* n" string var, else -1         // Len(numeric var) = declared type size; -1 = keep the string path
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
@@ -739,6 +743,7 @@ type
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
+    function NameIsRealArray(const Name: string): Boolean;
     function RecordHandleOfVar(const Name: string): TSSAValue;   // however that variable is stored
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
                                  out TypeName: string): Boolean;
@@ -811,6 +816,7 @@ type
     function EmitMemberArrayErase(MemberNode: TASTNode): Boolean;
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
+    function HoistLValueSubscripts(Node: TASTNode): TASTNode;
     procedure ProcessSwap(Node: TASTNode);
     procedure ProcessDefType(Node: TASTNode);
     procedure CollectDefTypes(Node: TASTNode);
@@ -1276,6 +1282,8 @@ begin
   FRawUDTPtrs.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
   FBlockManagedTypes := TStringList.Create;
+  FConstStrBytes := TStringList.Create;
+  FConstStrBytes.CaseSensitive := False;
   FConstDeclSeen := TStringList.Create;
   FConstDeclSeen.Sorted := True;
   FConstDeclSeen.Duplicates := dupIgnore;
@@ -1382,6 +1390,7 @@ begin
   FRawPtrVars.Free;
   FBlockManagedTypes.Free;
   FConstDeclSeen.Free;
+  FConstStrBytes.Free;
   FRawUDTPtrs.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
@@ -6300,8 +6309,12 @@ begin
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
            not (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess, antDeref, antCast]) then
         begin
+          // ⛔ A STRING LITERAL IS NOT A "STRING". fbc types "123456" as a ZSTRING * 7 and answers its
+          // BYTES (length + 1 for the terminator); we answered the 24-byte string DESCRIPTOR. The same
+          // is true of a literal reached through parentheses, which is how a macro hands one over.
           case InferExprBank(Node.GetChild(1).GetChild(0)) of
-            srtString: FieldSzConst := TypeSizeBytes('STRING');
+            srtString: if StringLiteralBytes(Node.GetChild(1).GetChild(0), FieldSzConst) then
+                       else FieldSzConst := TypeSizeBytes('STRING');
             srtFloat:  if IsSingleExpr(Node.GetChild(1).GetChild(0)) then FieldSzConst := 4
                        else FieldSzConst := 8;
           else
@@ -6332,6 +6345,14 @@ begin
             Exit;    // a member access we cannot size: fall out rather than answer nonsense
           ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (see FConstStrBytes).
+          if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
+          begin
+            EmitInstruction(ssaLoadConstInt, Result,
+                            MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
           if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
              ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
             EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
@@ -7132,7 +7153,11 @@ begin
 
         // FreeBASIC RAW pointer indexing: "p[i]" where p is an Allocate'd raw pointer. The byte address
         // is p + i*SizeOf(pointee); load SizeOf(pointee) bytes from the raw heap with the pointee's type.
-        if (ArrayIndexOf(ArrName) < 0) and IsRawPtr(ArrName) and
+        // ⛔ ...and never on the SYNTHETIC element-0 access of a backing array (SHAREDELEM): that node
+        // is how the backing is READ, so re-reading it as a pointer index recurses forever. The
+        // marker exists for exactly this hazard on the string-byte branch - this is the second one.
+        if (not NameIsRealArray(ArrName)) and IsRawPtr(ArrName) and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));   // raw-scaled (see helper)
@@ -7151,7 +7176,11 @@ begin
 
         // FreeBASIC pointer indexing: "p[i]" (also "p(i)") where p is a declared pointer, not an array.
         // Lower to *(p + i): compute the address then load the pointee with p's declared bank.
-        if (ArrayIndexOf(ArrName) < 0) and (ManagedPtrPointee(ArrName) <> '') and
+        // ⛔ ...and never on the SYNTHETIC element-0 access of a backing array (SHAREDELEM): that node
+        // is how the backing is READ, so re-reading it as a pointer index recurses forever. The
+        // marker exists for exactly this hazard on the string-byte branch - this is the second one.
+        if (not NameIsRealArray(ArrName)) and (ManagedPtrPointee(ArrName) <> '') and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
@@ -8311,7 +8340,8 @@ begin
   // bytes at p + i*SizeOf(T) into the raw heap.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (not NameIsRealArray(VarToStr(VarNode.GetChild(0).Value))) and
+     (VarNode.Attributes.Values['SHAREDELEM'] <> '1') and
      IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
@@ -8334,7 +8364,8 @@ begin
   // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (not NameIsRealArray(VarToStr(VarNode.GetChild(0).Value))) and
+     (VarNode.Attributes.Values['SHAREDELEM'] <> '1') and
      (ManagedPtrPointee(VarToStr(VarNode.GetChild(0).Value)) <> '') and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
@@ -10637,7 +10668,7 @@ procedure TSSAGenerator.ProcessErase(Node: TASTNode);
 // REDIM target) is FREED -- its storage goes away and it reports LBound 0 / UBound -1 until re-DIMmed.
 // The Immediate flag (1 = dynamic/deallocate, 0 = static/zero) tells the VM which.
 var
-  j, ArrayIdx: Integer;
+  j, ArrayIdx, RecUDT: Integer;
   ArrName: string;
   Child: TASTNode;
   DynFlag: Int64;
@@ -10661,9 +10692,32 @@ begin
     if ArrayIdx < 0 then
       raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
     if FDynamicArrays.IndexOf(ArrName) >= 0 then DynFlag := 1 else DynFlag := 0;
+    // ...and its DESTRUCTOR runs on every element FIRST, before the storage goes: fbc's own suite counts
+    // the calls ("erase x2 '' dtors & clear"). Emitted here, ahead of the erase, for the obvious reason.
+    RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
+    if RecUDT >= 0 then EmitRecordArrayConstruct(ArrayIdx, FUDTs[RecUDT].Name, 0, True);
     EmitInstruction(ssaArrayErase, MakeSSAValue(svkNone),
                     MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
                     MakeSSAValue(svkNone), MakeSSAConstInt(DynFlag));
+    // ⛔ AN ARRAY OF UDT HOLDS HANDLES, and zeroing them leaves every element pointing at record 0: the
+    // very next "a(0).field" dereferenced it and died with an access violation. fbc's ERASE on a fixed
+    // array RESETS its elements, so a fresh record per element is what "reset" means here - the same
+    // allocation DIM does, and the same one REDIM re-runs. A DYNAMIC array is FREED by ERASE and has no
+    // elements to give records to, so it is left alone.
+    RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
+    if (DynFlag = 0) and (RecUDT >= 0) then
+    begin
+      EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
+                      MakeSSAArrayRef(ArrayIdx, srtInt),
+                      MakeSSAConstInt((Int64(FUDTs[RecUDT].LiveBytes) and $FFFF)
+                                      or ((Int64(FUDTs[RecUDT].NStr) and $FFFF) shl 32)
+                                      or ((Int64(RecUDT) and $FFFF) shl 48)),
+                      MakeSSAValue(svkNone));
+      EmitRecordArrayInit(ArrayIdx, RecUDT);   // member arrays / nested UDTs of each element
+      // ...and CONSTRUCT them: fbc's "erase x1" on an array of a type with a constructor runs it again
+      // on every element ("clear & ctors"), which is what makes ERASE a RESET rather than a wipe.
+      EmitRecordArrayConstruct(ArrayIdx, FUDTs[RecUDT].Name, 0);
+    end;
   end;
 end;
 
@@ -10888,6 +10942,47 @@ begin
     CollectDefTypes(Node.GetChild(i));
 end;
 
+function TSSAGenerator.HoistLValueSubscripts(Node: TASTNode): TASTNode;
+// ⛔ SWAP READS EACH OPERAND THREE TIMES - once for the snapshot and once in each of the two
+// assignments it lowers to - so any SIDE EFFECT inside a subscript ran three times:
+// "Swap arr(nextIdx()), arr(nextIdx())" advanced the counter six times and wrote to elements nobody
+// named. fbc evaluates each lvalue ONCE. Returns a CLONE of Node in which every subscript that is not
+// already a literal or a bare name has been evaluated into a fresh temp, with the temp's NAME left in
+// its place - so the three uses all name the same, already-computed index.
+// The caller owns the result.
+  procedure HoistIn(N: TASTNode);
+  var
+    i: Integer;
+    IdxList, Child: TASTNode;
+    Val, TmpReg: TSSAValue;
+    TmpName: string;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antArrayAccess) and (N.ChildCount >= 2) then
+    begin
+      IdxList := N.GetChild(1);
+      if (IdxList <> nil) and (IdxList.NodeType in [antExpressionList, antArgumentList]) then
+        for i := 0 to IdxList.ChildCount - 1 do
+        begin
+          Child := IdxList.GetChild(i);
+          if Child = nil then Continue;
+          if Child.NodeType in [antLiteral, antIdentifier] then Continue;   // nothing to run twice
+          ProcessExpression(Child, Val);
+          TmpName := '__SWPIX' + IntToStr(FSwapTempSeq) + '%';
+          Inc(FSwapTempSeq);
+          TmpReg := GetOrAllocateVariable(TmpName);
+          EmitInstruction(ssaCopyInt, TmpReg, EnsureIntRegister(Val), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          IdxList.RemoveChildAt(i);
+          IdxList.InsertChild(i, TASTNode.CreateWithValue(antIdentifier, TmpName, Child.Token));
+        end;
+    end;
+    for i := 0 to N.ChildCount - 1 do HoistIn(N.GetChild(i));
+  end;
+begin
+  Result := Node.Clone;
+  HoistIn(Result);
+end;
+
 procedure TSSAGenerator.ProcessSwap(Node: TASTNode);
 // SWAP a, b (FreeBASIC): exchange the values of two lvalues. We snapshot a's current value
 // into a freshly-named typed temp, then reuse ProcessAssignment for "a = b" and "b = tmp" so
@@ -10901,8 +10996,11 @@ var
   SwapUDTIdx: Integer;
 begin
   if Node.ChildCount < 2 then Exit;
-  LeftNode := Node.GetChild(0);
-  RightNode := Node.GetChild(1);
+  // Evaluate any side-effecting subscript ONCE (see HoistLValueSubscripts): the three reads below all
+  // have to name the same element. The hoisted clones are owned here.
+  LeftNode := HoistLValueSubscripts(Node.GetChild(0));
+  RightNode := HoistLValueSubscripts(Node.GetChild(1));
+  try
 
   // Snapshot the current value of the first operand (scalar / array / member read).
   ProcessExpression(LeftNode, ValA);
@@ -10961,6 +11059,11 @@ begin
   AsnBTmp.AddChild(TmpRef);
   ProcessAssignment(AsnBTmp);
   AsnBTmp.Free;
+
+  finally
+    LeftNode.Free;
+    RightNode.Free;
+  end;
 end;
 
 procedure TSSAGenerator.EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -12195,6 +12298,8 @@ var
   DstReg, SrcReg, NReg, CappedReg, LCapReg, PadNReg, PadReg, ResultReg: TSSAValue;
   TmpName: string;
   NoneV: TSSAValue;
+  FixedCap: Integer;
+  FixedWide: Boolean;
 begin
   if Node.ChildCount < 2 then Exit;
   NoneV := MakeSSAValue(svkNone);
@@ -12212,8 +12317,18 @@ begin
   ProcessStringExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
   ProcessStringExpression(SrcNode, SrcVal); SrcReg := EnsureStringRegister(SrcVal);
 
-  // N = LEN(dst): the buffer size to preserve.
-  NReg := NI; EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
+  // N = the buffer size to preserve.
+  // ⛔ FOR A FIXED-LENGTH STRING THAT IS ITS DECLARED CAPACITY, not the length of the value just read.
+  // "Dim As String * 8 s = "ab" : LSet s, "xy"" must answer "xy      " (fbc), and reading LEN off the
+  // VALUE gave 2, so the justification had nothing to justify INTO and both LSET and RSET answered
+  // "xy". The capacity is a compile-time fact - the same one Len(s) already reports as 8 - so it is
+  // asked for here; a variable-length destination keeps the runtime LEN, which is what QB's LSET means.
+  FixedCap := FixedLenCapOfNode(DstNode, FixedWide);
+  NReg := NI;
+  if FixedCap > 0 then
+    EmitInstruction(ssaLoadConstInt, NReg, MakeSSAConstInt(FixedCap), NoneV, NoneV)
+  else
+    EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
 
   // capped = LEFT$(src, N): truncate from the right when src is longer than the buffer.
   CappedReg := NS; EmitInstruction(ssaStrLeft, CappedReg, SrcReg, NReg, NoneV);
@@ -21750,6 +21865,21 @@ begin
   end;
 end;
 
+function TSSAGenerator.StringLiteralBytes(Node: TASTNode; out Bytes: Int64): Boolean;
+// A STRING LITERAL's size in bytes as fbc reports it: the characters plus the NUL terminator, because a
+// literal has type "ZString * (n+1)" there and not the STRING descriptor. Answers False for anything
+// that is not (or does not wrap) a literal string.
+begin
+  Result := False;
+  Bytes := 0;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType <> antLiteral then Exit;
+  if VarType(Node.Value) <> varString then Exit;
+  Bytes := Length(VarToStr(Node.Value)) + 1;
+  Result := True;
+end;
+
 function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
 // FreeBASIC Len(v) of a declared NUMERIC or POINTER scalar is SizeOf of its DECLARED type
 // (fbc-verified, examples/manual/variable/dim: Byte->1, Short->2, Integer->8, Single->4,
@@ -24770,7 +24900,9 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 // Returns '' when nothing matches, and the caller reports it as before.
 var
   Sig, UdtSig, ConstSig, WidthSig, Pref, Cand, Tail: string;
-  k: Integer;
+  k, j, Extra, BestExtra: Integer;
+  DeclN, ParamsN: TASTNode;
+  OkDef: Boolean;
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
@@ -24865,6 +24997,32 @@ begin
       Cand := SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
       if Cand = Sig then Exit(FProcedureNames[k]);
     end;
+  // ⛔ ...and this AHEAD of the length-only fallback, not after it. "f(0, 0)" has two candidates of
+  // arity 2 by that measure - "f(Integer, String)" among them - and the first of them wins; the
+  // overload that actually FITS is the three-parameter one with two defaults, which the length test
+  // cannot see at all. fbc chooses by how well the types match, so a candidate whose bank prefix is
+  // exact must be preferred over one of the right COUNT and the wrong banks.
+  Cand := '';
+  BestExtra := MaxInt;
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
+    Tail := SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
+    if Length(Tail) <= Length(Sig) then Continue;                  // handled by the attempts above
+    if not (FProcDecls.TryGetValue(FProcedureNames[k], DeclN) and Assigned(DeclN) and
+            (DeclN.ChildCount >= 2)) then Continue;
+    ParamsN := DeclN.GetChild(1);
+    if (ParamsN = nil) or (ParamsN.NodeType <> antParameterList) then Continue;
+    if ParamsN.ChildCount <> Length(Tail) then Continue;
+    OkDef := True;
+    for j := Length(Sig) to ParamsN.ChildCount - 1 do              // every parameter past the call's
+      if ParamsN.GetChild(j).Attributes.Values['HASDEFAULT'] <> '1' then begin OkDef := False; Break; end;
+    if not OkDef then Continue;
+    Extra := (Length(Tail) - Length(Sig)) * 2;                     // fewer omitted parameters wins...
+    if Copy(Tail, 1, Length(Sig)) <> Sig then Inc(Extra);          // ...and an exact bank prefix wins a tie
+    if Extra < BestExtra then begin BestExtra := Extra; Cand := FProcedureNames[k]; end;
+  end;
+  if Cand <> '' then Exit(Cand);
   for k := 0 to FProcedureNames.Count - 1 do
     if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
        (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(Sig)) then
@@ -26353,7 +26511,7 @@ begin
 end;
 
 procedure TSSAGenerator.EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
-  FromFlatIndex: Integer);
+  FromFlatIndex: Integer; RunDtor: Boolean = False);
 // Run the DEFAULT constructor on every element of a DIM'd array-of-UDT, from flat index FromFlatIndex on.
 // "Dim a(1 To 3) As T" declares THREE objects, and FreeBASIC constructs each one: only the scalar case
 // was ever constructed here, so every element of an array came up with its fields at 0 -- a member
@@ -26372,7 +26530,15 @@ begin
   // Nothing to run without a constructor callable with NO arguments — which includes one whose every
   // parameter carries a default ("Constructor(ht As handlertype = ht_default)"), the form this example
   // is built on. Testing the exact empty signature alone declared that type constructor-less.
-  if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
+  // ⭐ ...or the DESTRUCTOR, when the caller asks for that pass instead. ERASE on an array of a type
+  // that declares one must run it on every element before the storage is reset - fbc counts two dtors
+  // for "Erase x" over a two-element array - and writing a second loop for it would be a second copy of
+  // this whole shape. One loop, two methods.
+  if RunDtor then
+  begin
+    if ResolveMethodLabel(TypeName, 'DESTRUCTOR') = '' then Exit;
+  end
+  else if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
   ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
   DimCount := FProgram.GetArray(ArrayIdx).DimCount;
   if DimCount < 1 then DimCount := 1;
@@ -26422,7 +26588,10 @@ begin
   HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
-  EmitConstructorCall(HandleVal, TypeName, nil);
+  if RunDtor then
+    EmitDestructorCall(HandleVal, TypeName)
+  else
+    EmitConstructorCall(HandleVal, TypeName, nil);
   EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
   FCurrentBlock := FProgram.CreateBlock(IncrLabel);
@@ -26485,6 +26654,7 @@ var
   i, j, Slot, FieldIdx: Integer;
   ArgVal, ArrHandle, UnitVal: TSSAValue;
   SrcType: string;
+  NestedArgs: TASTNode;
   Bank: TSSARegisterType;
 begin
   if (UDTIdx < 0) or (ArgsNode = nil) then Exit;
@@ -26520,6 +26690,38 @@ begin
     if ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1' then
     begin
       EmitBraceArrayMemberInit(HandleVal, UDTIdx, FieldIdx, ArgsNode.GetChild(i));
+      Inc(FieldIdx);
+      Continue;
+    end;
+    // ⛔ A NESTED UDT FIELD OWNS A RECORD, and its slot holds that record's HANDLE. Storing the value
+    // over the handle left the nested instance unreachable: "Dim b As baz = (111)" - baz's only field
+    // being "f As foo" - printed garbage for b.f.bar and CRASHED the next program that did it. fbc lets
+    // the initializer reach through: the value (or the parenthesised group, "( (111) )") initialises the
+    // NESTED type, positionally, exactly as it does at this level. Recurse on the member's handle.
+    if (FUDTs[UDTIdx].Fields[FieldIdx].NestedType <> '') and
+       (not FUDTs[UDTIdx].Fields[FieldIdx].IsArray) and
+       (FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType) >= 0) and
+       (ObjectTypeName(ArgsNode.GetChild(i)) = '') then
+    begin
+      j := FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType);
+      ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+      NestedArgs := ArgsNode.GetChild(i);
+      // "( (111) )" hands the nested type its own list; a bare value is that list with one element, and
+      // building the one-element list here keeps ONE recursion instead of two shapes of it.
+      if not (NestedArgs.NodeType in [antArgumentList, antExpressionList]) then
+      begin
+        NestedArgs := TASTNode.Create(antArgumentList, ArgsNode.GetChild(i).Token);
+        NestedArgs.AddChild(ArgsNode.GetChild(i).Clone);
+        try
+          EmitUDTAggregateInit(ArrHandle, j, NestedArgs);
+        finally
+          NestedArgs.Free;
+        end;
+      end
+      else
+        EmitUDTAggregateInit(ArrHandle, j, NestedArgs);
       Inc(FieldIdx);
       Continue;
     end;
@@ -26568,6 +26770,22 @@ begin
   // initialized field-by-field from the args (EmitConstructorCall handles that fallback).
   EmitConstructorCall(Handle, UpperCase(TypeName), ArgsNode);
   Result := True;
+end;
+
+function TSSAGenerator.UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
+// Does this type have a field whose initialisation is NOT "store the value into the slot"? A union
+// member (one value between them all), a bit field (part of a shared unit), or a nested UDT (the slot
+// holds a handle). See the call site: these are the three shapes the constructor path's own field loop
+// does not know, and the reason it must defer to EmitUDTAggregateInit for them.
+var
+  i: Integer;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) or (FUDTs[UDTIdx].Fields[i].BitWidth > 0) or
+       ((FUDTs[UDTIdx].Fields[i].NestedType <> '') and (not FUDTs[UDTIdx].Fields[i].IsArray)) then
+      Exit(True);
 end;
 
 procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
@@ -26620,6 +26838,19 @@ begin
        IsSubtypeOf(UpperCase(ObjectTypeName(ArgsNode.GetChild(0))), UpperCase(TypeName)) then
     begin
       EmitRecordCopy(HandleVal, EnsureIntRegister(ArgVals[0]), AggUDT);
+      Exit;
+    end;
+    // ⛔ THE FIELD-WISE LOOP BELOW IS A SECOND COPY of EmitUDTAggregateInit, and it never learned what
+    // that one did: a UNION consumes ONE value, a BIT FIELD is part of a shared unit, and a NESTED UDT
+    // field holds a HANDLE that a positional store overwrites - which is how "Dim b As baz = (111)",
+    // baz's only field being a nested "foo", printed garbage and crashed the program after it.
+    // Where the type has any of those three shapes, ask the ONE routine that knows them.
+    // ⚠️ The arguments were already evaluated above (for the ctor signature) and this re-evaluates them;
+    // that is accepted deliberately and ONLY here, because these are exactly the types the loop below
+    // miscompiled. A type with none of the three shapes takes the loop, unchanged, as it always did.
+    if (AggUDT >= 0) and (ArgsNode <> nil) and UDTNeedsAggregateWalk(AggUDT) then
+    begin
+      EmitUDTAggregateInit(HandleVal, AggUDT, ArgsNode);
       Exit;
     end;
     if AggUDT >= 0 then
@@ -27551,7 +27782,7 @@ var
   Decl: TASTNode;
   VNameU, TypeNameU: string;
   ElemBank: TSSARegisterType;
-  ConstFoldVal: Int64;
+  ConstFoldVal, ConstStrBytes: Int64;
   ConstIsInt: Boolean;
   ConstDupIdx: Integer;   // a CONST name declared twice: the entry to withdraw
 begin
@@ -27606,7 +27837,15 @@ begin
           end;
         end
         else if Decl.Attributes.Values['CONSTDECL'] = '1' then
+        begin
           FConstDeclSeen.Add(VNameU);   // a non-int CONST still occupies the name
+          // ⭐ ...and a STRING const remembers how many BYTES it is. fbc types "Const S = "12345"" as a
+          // ZSTRING * 6 and SizeOf(S) is 6; without the length recorded here the name reached SizeOf as
+          // an ordinary variable and answered the 8-byte default. Only the byte COUNT is kept - the
+          // value itself is not folded, for the scoping reason above.
+          if (Decl.ChildCount >= 3) and StringLiteralBytes(Decl.GetChild(2), ConstStrBytes) then
+            FConstStrBytes.Values[VNameU] := IntToStr(ConstStrBytes);
+        end;
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
@@ -31996,6 +32235,19 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.NameIsRealArray(const Name: string): Boolean;
+// Is this name a DECLARED ARRAY, as opposed to a scalar that merely has an array-shaped BACKING?
+//
+// ⛔ Taking a scalar's address backs it with a ONE-ELEMENT array registered under its own name, so
+// ArrayIndexOf answers YES for it - and every "not an array, therefore a pointer" guard then read the
+// wrong way. "Dim pp As Integer Ptr Ptr = @p" made "p[1]" compile to ArrayLoadInt ARR[p], 1: an element
+// of P'S OWN BACKING at index 1, which does not exist, so it read 0 while "*p" - a different path -
+// stayed right. The question every such guard means to ask is this one, so it is asked in one place.
+begin
+  Result := (ArrayIndexOf(Name) >= 0) and
+            (not IsSharedScalar(Name)) and (not IsRawModuleScalar(Name)) and (not IsRawAddrLocal(Name));
+end;
+
 function TSSAGenerator.RecordHandleOfVar(const Name: string): TSSAValue;
 // The HANDLE of a record variable, read the way that variable is actually stored.
 //
@@ -32003,10 +32255,29 @@ function TSSAGenerator.RecordHandleOfVar(const Name: string): TSSAValue;
 // to when the variable is SHARED - which is array-backed, its handle in element 0 of a 1-element
 // global array. m534 fixed the program-end destructor, m537 fixed "@obj", and this is the third:
 // "(*p).field". A rule that keeps going missing belongs in ONE place, so here it is.
+//
+// ⛔ ...and SHARED is not the only storage that is not a register. Once a program takes the variable's
+// ADDRESS ("Dim pp As Integer Ptr Ptr = @p") it is RAW-BACKED, and the register it used to live in is
+// never written again: "p[1]" then added the index to an undefined register and read 0, while "*p" -
+// which asks a different path - stayed right. EmitFuncPtrCall had already learned all three storages
+// for its own reason; the fourth caller found the gap, so the knowledge moves HERE and that one now
+// asks this instead of carrying its own copy.
 var
   AccNode: TASTNode;
 begin
-  if IsSharedScalar(Name) then
+  if IsRawAddrLocal(Name) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(AddrLocalHandle(UpperCase(Name))),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+  end
+  else if IsRawModuleScalar(Name) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Result, RawModuleAddrReg(UpperCase(Name)),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+  end
+  else if IsSharedScalar(Name) then
   begin
     AccNode := MakeSharedScalarAccess(Name, nil);
     try
@@ -35072,6 +35343,7 @@ begin
   FRawPtrRetFuncs.Clear;
   FBlockManagedTypes.Clear;
   FConstDeclSeen.Clear;
+  FConstStrBytes.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
