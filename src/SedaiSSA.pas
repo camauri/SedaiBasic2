@@ -7362,8 +7362,8 @@ procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 var
   VarNode, ExprNode, SharedAssign, CastNode, UnwrapAssign: TASTNode;
   ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
-  VarName: string;
-  ExprValue, VarReg: TSSAValue;
+  VarName, CastTypeU, TgtTypeU: string;
+  ExprValue, VarReg, DstHandleV, SrcHandleV: TSSAValue;
   CopyOp: TSSAOpCode;
 begin
   // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
@@ -7523,6 +7523,22 @@ begin
     // A UDT that could not be reached through an assignable cast operator must NOT fall through to the
     // plain path: the store would land on the object itself (or, if the type also declares one, run its
     // LET operator — a different operator answering for the one that was written). Say so instead.
+    // ⭐ "Cast(<Base>, <derived>) = <base value>": FreeBASIC's UPCAST SLICE assignment. It writes the
+    // BASE PART of the object and leaves the derived fields alone - the shape fbc's own suite uses for a
+    // constructor that takes its base by reference ("Cast( udt2, This ) = u2"). It is NOT the
+    // "Operator Cast() ByRef" case: there is no operator, the cast NAMES an ancestor of the target, and
+    // the slice is exactly what EmitRecordCopy already does when handed the ancestor's field set - it
+    // says so in its own comment. Asked BEFORE the refusal below, which was rejecting a legal program.
+    CastTypeU := UpperCase(Trim(VarToStr(VarNode.Value)));
+    TgtTypeU := UpperCase(ObjectTypeName(VarNode.GetChild(0)));
+    if (CastTypeU <> '') and (TgtTypeU <> '') and (FindUDT(CastTypeU) >= 0) and
+       IsSubtypeOf(TgtTypeU, CastTypeU) and
+       ResolveRecordObject(VarNode.GetChild(0), DstHandleV, TgtTypeU) and
+       ResolveRecordObject(ExprNode, SrcHandleV, CastTypeU) then
+    begin
+      EmitRecordCopy(DstHandleV, EnsureIntRegister(SrcHandleV), FindUDT(UpperCase(Trim(VarToStr(VarNode.Value)))));
+      Exit;
+    end;
     if (ObjectTypeName(VarNode.GetChild(0)) <> '') and
        (FindUDT(ObjectTypeName(VarNode.GetChild(0))) >= 0) then
       raise Exception.CreateFmt('Cannot assign through CAST to %s: it needs an "Operator Cast() BYREF ' +
