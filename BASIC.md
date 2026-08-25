@@ -1689,7 +1689,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `SCOPE` | ✓ | Begins a new scope block. |
 | `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders, with the `SHARED` and `BYREF` modifiers (`STATIC SHARED BYREF AS T r = target`). |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
-| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. Takes the `SHARED` and `BYREF` modifiers in either order (`VAR SHARED v = e`, `VAR SHARED BYREF r = target`). The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
+| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. Takes the `SHARED` and `BYREF` modifiers in either order (`VAR SHARED v = e`, `VAR SHARED BYREF r = target`), and `BYREF` may be repeated before each name in the list. The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
 | `BYREF (variables)` | ✓ | Used with Dim or Static or Var allows to declare references. (DIM BYREF done; VAR/STATIC BYREF deferred.) |
 
 #### User Defined Types
@@ -2443,7 +2443,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ERASE` | ✓ | `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). |
+| `ERASE` | ✓ | `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). Also erases a UDT **array member**, written out (`Erase obj.arr`) or with the leading dot inside a `WITH` block (`Erase .arr`). |
 
 #### Retrieving Array Size
 
@@ -2857,7 +2857,7 @@ End Function
 | `WSTRING (Function)` | ✓ | `WSTRING(n, cp)` — n copies of the wide char for Unicode codepoint cp. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
 | `WSPACE` | ✓ | `WSPACE(n)` — a wide string of n spaces. |
-| `LEN` | ✓ | Returns the length of a string in characters. For a user-defined type it returns the size of the type in bytes, as FreeBASIC does when the type declares no `OPERATOR LEN` (which is not supported); in particular it does **not** route through `OPERATOR CAST() AS STRING`. |
+| `LEN` | ✓ | Returns the length of a string in characters. Takes a TYPE NAME too, including a pointer type (`Len(Integer Ptr)`). For a user-defined type it returns the size of the type in bytes, as FreeBASIC does when the type declares no `OPERATOR LEN` (which is not supported); in particular it does **not** route through `OPERATOR CAST() AS STRING`. |
 
 #### Character Conversion
 
@@ -3063,7 +3063,7 @@ End Function
 | Keyword | Status | Description |
 |---|---|---|
 | `SCREENLIST` | ✓ | Enumerate fullscreen resolutions — returns 0 (no hardware modes on a portable/headless VM). |
-| `SCREEN (Graphics) and SCREENRES` | ✓ | `SCREENRES w,h[,depth[,num_pages]]` sets the graphics screen surface; `SCREEN n` selects a numbered QB/FB mode (1/7→320×200, 13→320×200, 18→640×480, 19→800×600, 20→1024×768, 21→1280×1024, …) mapped to a resolution. Both allocate pages and route through IGraphicsBackend (headless-testable via SCREENINFO). depth accepted-and-ignored. |
+| `SCREEN (Graphics) and SCREENRES` | ✓ | `SCREENRES w,h[,depth[,num_pages]]` sets the graphics screen surface; `SCREEN n` selects a numbered QB/FB mode (1/7→320×200, 13→320×200, 18→640×480, 19→800×600, 20→1024×768, 21→1280×1024, …) mapped to a resolution. Both allocate pages and route through IGraphicsBackend (headless-testable via SCREENINFO). depth accepted-and-ignored. `SCREENRES` also has the FUNCTION form fbc accepts, `r = ScreenRes(w, h, ...)`, which answers 0. |
 | `SCREENINFO` | ✓ | `SCREENINFO w, h [, depth, bpp, pitch, rate]` writes the current graphics surface's width/height (and depth=32, bpp=4, pitch=w*4) into the variables (via IGraphicsBackend; headless-testable). Desktop-info form deferred. |
 | `SCREENCONTROL` | ✓ | Get/set internal graphics settings — a no-op here (arguments parsed and discarded). |
 | `SCREENEVENT` | ✗ | Gets system events. |

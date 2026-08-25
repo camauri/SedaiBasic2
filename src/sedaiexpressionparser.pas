@@ -739,6 +739,7 @@ begin
 end;
 
 function FoldSizedIntegerTypeName(const S: string): string; forward;
+function IsFBScalarTypeName(const N: string): Boolean; forward;
 
 function TExpressionParser.ParseExpressionList(Delimiter: TTokenType = ttSeparParam): TASTNode;
 var
@@ -976,6 +977,18 @@ begin
   begin
     Result := ParseSizeOfPtrType(Token);
     if Assigned(Result) then Exit;
+  end;
+
+  // A POINTER TYPE written in expression position: "Integer Ptr" is two juxtaposed identifiers and every
+  // reader that meets one died on the second ("Len(Integer Ptr)" -> Expected ")"). SIZEOF had its own
+  // speculative parse for exactly this; folded here instead, the same spelling the rest of the pipeline
+  // uses ("INTEGER PTR") reaches EVERY function that takes a type - Len among them.
+  if IsFBScalarTypeName(IdentName) and AtPointerSuffix then
+  begin
+    while AtPointerSuffix do
+    begin IdentName := IdentName + ' PTR'; Context.Advance; end;
+    Result := TASTNode.CreateWithValue(antIdentifier, IdentName, Token);
+    Exit;
   end;
 
   // A call to a Commodore v7 one-line function: "DEF FNA(X) = ..." defines it and "FNA(7)" calls it, so
@@ -1484,14 +1497,18 @@ begin
   // error. It keeps its ttGraphicsCommand token (the statement form is written without parentheses,
   // which a ttGraphicsFunction would not accept) and gains the function form HERE, which is exactly
   // what this routine exists for.
-  if (Cmd <> kSCREENGFX) and ((Cmd <> kIMAGEINFO) or not Context.Check(ttDelimParOpen)) or
-     not ModernMode or not Context.Check(ttDelimParOpen) then
+  // ⭐ ...and SCREENRES, whose function form answers 0 on success and an error code otherwise - which is
+  // how fbc's own graphics suite writes it ("CU_ASSERT( screenres(w, h, 32, , GFX_NULL) = 0 )"). The
+  // three commands with a function form are a CLOSED list, so an allow-list is finishable here; written
+  // as one, the condition also stops reading as a chain of exceptions to a rule.
+  if (not ModernMode) or (not Context.Check(ttDelimParOpen)) or
+     ((Cmd <> kSCREENGFX) and (Cmd <> kIMAGEINFO) and (Cmd <> kSCREENRES)) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
     Result := nil;
     Exit;
   end;
-  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN"/"IMAGEINFO" + argument list
+  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN"/"IMAGEINFO"/"SCREENRES" + args
 end;
 
 function TExpressionParser.ParseFsFunctionForm(Token: TLexerToken): TASTNode;
@@ -2110,6 +2127,16 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
+  // ⛔ A NAME AFTER "@" CAN ONLY BE A NAME. In MODERN a field or variable may be spelled like a
+  // Commodore STATEMENT keyword - fbc's own suite declares "data As Integer" and writes "Return @data" -
+  // and the keyword token is not ttIdentifier, so the whole file failed with "Expected a name after @".
+  // Inverted here onto the CLOSED side: after "@" the operand can be a name, a "*expr", a "(...)" or a
+  // "Type<T>(...)", and the last three are already claimed above. Anything left that SPELLS like an
+  // identifier is one. (A whitelist of the keywords that may be shadowed cannot be finished.)
+  if (not Context.Check(ttIdentifier)) and ModernMode and
+     (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+     (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) then
+    Context.CurrentToken.TokenType := ttIdentifier;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a name after "@"', Context.CurrentToken);
@@ -2289,8 +2316,6 @@ begin
   end;
   DoNodeCreated(Result);
 end;
-
-function IsFBScalarTypeName(const N: string): Boolean; forward;   // built-in scalar type names; defined below
 
 function IsManagedNewElemType(const N: string): Boolean;
 // A "New T[n]" element that cannot be left uninitialised: a STRING carries a header the runtime writes.

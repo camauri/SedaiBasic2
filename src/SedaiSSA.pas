@@ -808,6 +808,7 @@ type
     procedure ProcessPrint(Node: TASTNode);
     procedure ProcessInput(Node: TASTNode);
     procedure ProcessDim(Node: TASTNode);
+    function EmitMemberArrayErase(MemberNode: TASTNode): Boolean;
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
     procedure ProcessSwap(Node: TASTNode);
@@ -1682,6 +1683,12 @@ begin
   if TypeU = 'BOOLEAN' then Result := 1
   else if (TypeU = 'UINTEGER') or (TypeU = 'ULONGINT') then Result := 2
   else if (TypeU = 'UBYTE') or (TypeU = 'USHORT') or (TypeU = 'ULONG') or (TypeU = 'UINT32') then Result := 3
+  // ...and a POINTER, which is an address and therefore unsigned: fbc prints "0" for a null pointer
+  // where an Integer 0 prints " 0". Measured against fbc 1.10.1 on "Integer Ptr", "Any Ptr" and a
+  // procedure-pointer CONST - all three lose the sign space, and the plain Integer beside them keeps it.
+  // Kind 3, not 2: printing is all that changes, and letting a pointer taint the ARITHMETIC would make
+  // "p - q" answer an unsigned difference.
+  else if (Length(TypeU) >= 4) and (Copy(TypeU, Length(TypeU) - 3, 4) = ' PTR') then Result := 3
   else if TypeU = 'SINGLE' then Result := 4
   else Result := 0;
 end;
@@ -2129,6 +2136,22 @@ begin
       // intercept in the identifier path); only under "@" does the symbol matter. Without this the
       // name reached the procedure-address path unchanged and failed with "Undefined procedure
       // (address-of @): __FUNCTION_NQ__".
+      // FreeBASIC ADDRESS-OF OPERATOR: a type may declare "Operator @() As T Ptr", and then "@obj" is
+      // that operator's result, not the object's storage address. Asked FIRST, because every path below
+      // answers with an address of its own and the operator would never be reached - "@x" handed back the
+      // record handle and "*(@x)" dereferenced a null.
+      if (Node.ChildCount = 0) and (VarRecordTypeName(VarToStr(Node.Value)) <> '') and
+         (ResolveMethodLabel(VarRecordTypeName(VarToStr(Node.Value)), 'OPERATOR@') <> '') then
+      begin
+        TempNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
+        try
+          ProcessMethodCall(TempNode, VarRecordTypeName(VarToStr(Node.Value)), 'OPERATOR@', nil, Result);
+        finally
+          TempNode.Free;
+        end;
+        Result := EnsureIntRegister(Result);
+        Exit;
+      end;
       if (Node.ChildCount = 0) and FInProcedure and
          ((UpperCase(VarToStr(Node.Value)) = kMACROFUNCTIONNQ) or
           (UpperCase(VarToStr(Node.Value)) = kMACROFUNCTION)) then
@@ -5508,6 +5531,18 @@ begin
           end
           else
             raise Exception.Create('MULTIKEY requires 1 argument: MULTIKEY(scancode)');
+        end
+        else if (FuncName = kSCREENRES) and (ArgListNode <> nil) and
+                (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
+                (ArgListNode.ChildCount >= 2) then
+        begin
+          // SCREENRES(w, h [, depth [, pages [, driver]]]) as a FUNCTION: fbc accepts both this and the
+          // statement form and answers 0 on success. The statement path already knows how to set the
+          // mode - it is handed the SAME argument list rather than a second copy of the lowering.
+          ProcessScreenRes(ArgListNode);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = kIMAGEINFO) and (ArgListNode <> nil) and
                 (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
@@ -9676,7 +9711,8 @@ begin
     // an indirect call. Falls through to the typed-scalar path below (element type INTEGER).
     if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
-        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET']
+        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
+        Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'))
     // "DIM f AS X" where X is a named function-pointer type ("Type X As Function(...)"): f is a funcptr
     // with X's signature (X aliases to INTEGER, so the typed-scalar path below gives it the int bank).
     else if (DimsNode.NodeType = antIdentifier) and
@@ -10562,6 +10598,39 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitMemberArrayErase(MemberNode: TASTNode): Boolean;
+// "Erase obj.arr": re-dimension the member array to the bound it already has, with PRESERVE off. See the
+// call site for why that is the erase. Answers False (emitting nothing) when the node is not a UDT array
+// member, so the caller can report it rather than drop the statement.
+var
+  TypeName: string;
+  Slot, DimCount, di: Integer;
+  ElemBank: TSSARegisterType;
+  ObjHandle, ArrHandle, DimReg, UbVal: TSSAValue;
+begin
+  Result := False;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
+  if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
+  if DimCount < 1 then DimCount := 1;
+  ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, ArrHandle, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  for di := 0 to DimCount - 1 do
+  begin
+    DimReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(di), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    UbVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayUBoundInd, UbVal, ArrHandle, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+  // Immediate packs (slot<<8) | (elemType<<4) | preserve, the same encoding REDIM uses.
+  EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), ObjHandle, MakeSSAValue(svkNone),
+                  MakeSSAConstInt((Int64(Slot) shl 8) or (Int64(Ord(ElemBank)) shl 4) or 0));
+  Result := True;
+end;
+
 procedure TSSAGenerator.ProcessErase(Node: TASTNode);
 // ERASE arr [, arr ...] (B1.4). FreeBASIC erases the two array kinds differently: a STATIC (fixed-size)
 // array keeps its bounds and only resets its elements to zero/""; a DYNAMIC array (declared "()" or any
@@ -10576,6 +10645,16 @@ begin
   for j := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(j);
+    // "Erase obj.field" / "Erase .field" inside a WITH: a UDT ARRAY MEMBER. Its storage is a runtime
+    // FArrays handle, not a compile-time id, so ssaArrayErase cannot name it. Erasing it is a REDIM to
+    // its CURRENT upper bound with PRESERVE off - the reallocation is what zeroes the elements, which is
+    // exactly what fbc's ERASE does to a fixed-bound array (bounds kept, values reset).
+    // ⛔ A member access used to be SKIPPED here in silence: the statement parsed and erased nothing.
+    if Child.NodeType = antMemberAccess then
+    begin
+      if EmitMemberArrayErase(Child) then Continue;
+      raise Exception.Create('ERASE: not an array member');
+    end;
     if Child.NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(Child.Value));
     ArrayIdx := ArrayIndexOf(ArrName);
@@ -22308,6 +22387,14 @@ begin
            (ArrayIndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0) then
           Exit(1);
         Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
+        // ⛔ ...but a POINTER's own print kind is not its ELEMENT's. "p[i]" reads the POINTEE, and the
+        // pointee's type is what decides the sign space - the pointer prints unsigned because an address
+        // is unsigned, which says nothing about the Integer it points at. Cleared here so the pointee
+        // rules just below answer instead; without it "Print p[0]" over an Integer array lost the space.
+        if (Result <> 0) and
+           (Pos(' PTR', UpperCase(PointeeTypeOf(UpperCase(VarToStr(Node.GetChild(0).Value))))) = 0) and
+           (PointeeTypeOf(UpperCase(VarToStr(Node.GetChild(0).Value))) <> '') then
+          Result := 0;
         // An element of an array declared AS a NARROW UNSIGNED type (UByte/UShort/ULong) prints unsigned
         // too -- without the leading sign space, like the scalar form. Array names are never in
         // FVarPrintKind (only scalars/params/returns), but the element's narrow width IS in FArrayElemWidth:
@@ -23498,6 +23585,15 @@ begin
       FUDTs[Idx].Fields[n].DefaultExpr := nil;
       if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT = '') and (not IsArrayField) and
          (FieldNode.ChildCount >= 2) then
+        FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1)
+      // ...and a NESTED member may carry the AGGREGATE TUPLE, "d As A = (4, 5, 6)", which sets that
+      // member's own fields. The nested case was excluded outright because a scalar store into a nested
+      // slot would overwrite the member's handle; a tuple is not a scalar, and EmitRecordInit hands it
+      // to EmitUDTAggregateInit against the member's handle instead.
+      else if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT <> '') and
+              (not IsArrayField) and (FieldNode.ChildCount >= 2) and
+              (FieldNode.GetChild(FieldNode.ChildCount - 1).NodeType in [antArgumentList, antExpressionList]) and
+              (FieldNode.GetChild(FieldNode.ChildCount - 1).Attributes.Values['TUPLEINIT'] = '1') then
         FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1);
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
       FUDTs[Idx].Fields[n].RawPtrPointee := RawPtrPointeeT;
@@ -25767,7 +25863,7 @@ procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integ
 // After a record instance is allocated, recursively allocate one instance for each nested-UDT
 // field and link its handle into the parent's int slot (so a.b.c works without manual init).
 var
-  i, di, NestedUDT, ElemUDT: Integer;
+  i, di, j, NestedUDT, ElemUDT: Integer;
   NestedHandle, DefVal: TSSAValue;
   DimsN, UbExpr: TASTNode;
 begin
@@ -25849,6 +25945,21 @@ begin
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then
     begin
+      // A NESTED member's tuple default sets the member's OWN fields: load its handle (allocated just
+      // above) and run the same aggregate init a "Dim As T v = (a, b, c)" runs.
+      if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
+         (FUDTs[UDTIdx].Fields[i].DefaultExpr.NodeType in [antArgumentList, antExpressionList]) then
+      begin
+        j := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+        if j >= 0 then
+        begin
+          NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+          EmitUDTAggregateInit(NestedHandle, j, FUDTs[UDTIdx].Fields[i].DefaultExpr);
+        end;
+        Continue;
+      end;
       ProcessExpression(FUDTs[UDTIdx].Fields[i].DefaultExpr, DefVal);
       case FUDTs[UDTIdx].Fields[i].Bank of
         srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal,
@@ -30964,12 +31075,21 @@ var
   ParamList: TStringList;
   Bar, i, NArgs, Slot, cInt, cFloat, cStr: Integer;
   RetPart: string;
+  RetIsByref: Boolean;
   RT, RetRT: TSSARegisterType;
-  ArgVal, PCVal: TSSAValue;
+  ArgVal, PCVal, AddrVal: TSSAValue;
 begin
   PCVal := PCValIn;
   Bar := Pos('|', Sig);
   RetPart := Copy(Sig, Bar + 1, MaxInt);
+  // "Function(...) ByRef As R": the signature carries a third field, and the call then hands back the
+  // ADDRESS of the referand rather than its value - the same protocol a named BYREF function uses.
+  RetIsByref := False;
+  if (Length(RetPart) > 6) and (Copy(RetPart, Length(RetPart) - 5, 6) = '|BYREF') then
+  begin
+    RetIsByref := True;
+    RetPart := Copy(RetPart, 1, Length(RetPart) - 6);
+  end;
   ParamList := TStringList.Create;
   try
     ParamList.StrictDelimiter := True;
@@ -31004,6 +31124,21 @@ begin
   // Read the result (FUNCTION); a SUB pointer used as a value yields int 0 harmlessly.
   RetRT := srtInt;
   if RetPart <> '' then RetRT := TypeNameToBank(RetPart, '');
+  // A BYREF return arrives as an ADDRESS in the INT result slot; load it there and dereference into the
+  // declared return bank. Read straight out of RetRT's slot it was the packed address itself, which is
+  // what "Print pb()" printed (4294967296) where fbc printed the referand.
+  if RetIsByref and (RetPart <> '') then
+  begin
+    AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitXferLoad(srtInt, XFER_RESULT_SLOT, AddrVal);
+    Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
+    case RetRT of
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
   Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
   if RetPart <> '' then
     EmitXferLoad(RetRT, XFER_RESULT_SLOT, Result)

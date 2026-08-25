@@ -1660,7 +1660,7 @@ end;
 
 function TPackratParser.ParseAssignmentStatement: TASTNode;
 var
- LeftSide, Expression: TASTNode;
+ LeftSide, Expression, BareArgs, BareArg: TASTNode;
  Token: TLexerToken;
  SavedToken: TLexerToken;
  LhsIsExpr: Boolean;   // LHS built by the expression parser (member/array): may be a call stmt
@@ -1886,6 +1886,27 @@ begin
         Result := TASTNode.Create(antArrayAccess, SavedToken);   // the shape a "name(args)" call has
         Result.AddChild(LeftSide);
         Result.AddChild(ParseArgumentList);
+        DoNodeCreated(Result);
+        Exit;
+      end;
+      // ...and the same statement with its FIRST argument in parentheses: "proc1 (3), 4". The expression
+      // parser reads "proc1 (3)" as a complete call - the two spellings are identical up to that point -
+      // and the arguments after the comma were ORPHANED: the call ran with one argument and the rest
+      // became statements of their own ("Unhandled node type"), so "proc1 (3), 4" printed "3 0".
+      // The group already parsed IS the first argument; the remaining ones join the same list.
+      if (LeftSide <> nil) and (LeftSide.NodeType = antArrayAccess) and Context.Check(ttSeparParam) and
+         (LeftSide.ChildCount >= 2) and
+         (LeftSide.GetChild(1).NodeType in [antExpressionList, antArgumentList]) then
+      begin
+        BareArgs := LeftSide.GetChild(1);
+        while Context.Check(ttSeparParam) do
+        begin
+          Context.Advance;                                     // ','
+          BareArg := FExpressionParser.ParseExpression;
+          if not Assigned(BareArg) then Break;
+          BareArgs.AddChild(BareArg);
+        end;
+        Result := LeftSide;
         DoNodeCreated(Result);
         Exit;
       end;
@@ -2602,6 +2623,7 @@ function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
   Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName, ParamTypeName, ParamNameU: string;
+  ProcPtrRet: TASTNode;
   OpSymbolForm: Boolean;   // "OPERATOR <sym>(...)" (arity goes in the label) vs "OPERATOR T.CAST/LET"
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
@@ -2982,7 +3004,22 @@ begin
   begin
     Context.Advance;                              // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    // "Function f(...) As Sub()" / "As Function(...) As R": the return is a PROCEDURE POINTER, which is
+    // not an identifier - so this reader passed it by and the SUB keyword was met where a name was
+    // expected. A PARAMETER of that type has always been read (TryParseProcPtrType); the RETURN had not,
+    // the same rule in one path and not its sibling. What comes back is an entry address: int-banked.
+    if Context.Check(ttProcedureStart) then
+    begin
+      RetTok := Context.CurrentToken;
+      ProcPtrRet := TASTNode.Create(antArrayDecl, RetTok);
+      try
+        TryParseProcPtrType(ProcPtrRet);
+      finally
+        ProcPtrRet.Free;
+      end;
+      NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'INTEGER', RetTok));
+    end
+    else if Context.Check(ttIdentifier) then
     begin
       RetTok := Context.CurrentToken;
       RetTypeName := ParseDottedName;               // dotted: namespace-qualified return type
@@ -3595,6 +3632,16 @@ begin
   Node.Attributes.Values['FUNCPTR'] := '1';
   Node.Attributes.Values['FPPARAMS'] := ParamTypes;
   Node.Attributes.Values['FPRET'] := '';
+  // "Function(...) ByRef As R": the RETURN may be a reference, and the word stands between the parameter
+  // list and AS. Unread, the '(' of the signature was parsed and then BYREF met where a variable name was
+  // expected. What the pointer HOLDS is the same entry address either way, so the modifier is recorded and
+  // the return type read as usual - a call through it dereferences by the callee's own protocol.
+  if IsFunc and Context.Check(ttParamMode) and
+     (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+  begin
+    Node.Attributes.Values['FPRETBYREF'] := '1';
+    Context.Advance;                                 // BYREF
+  end;
   if IsFunc and Context.Check(ttAsType) then
   begin
     Context.Advance;                                 // AS
@@ -4387,7 +4434,12 @@ begin
       else if Context.Check(ttOpEq) then
       begin
         Context.Advance;                            // '='
-        FieldDefault := FExpressionParser.ParseExpression;
+        // ⛔ ...and the AGGREGATE TUPLE, "d As A = (4, 5, 6)", which sets the member UDT's fields in
+        // declaration order. DIM and STATIC both read it through TryParseAggregateTuple; a FIELD did not,
+        // so the parentheses were parsed as an expression and the declaration failed on the first comma.
+        // The third caller of the one grammar, for the same reason the second exists.
+        FieldDefault := TryParseAggregateTuple(FieldTypeName);
+        if not Assigned(FieldDefault) then FieldDefault := FExpressionParser.ParseExpression;
         if Assigned(FieldDefault) then
         begin
           FieldNode.AddChild(FieldDefault);
@@ -9475,6 +9527,15 @@ begin
   //   AS typename name   -> leading-AS typed scalar (shared type parsed above)
   //   name ( dims )      -> array (classic)
   repeat
+    // "Dim ByRef a As T = x, ByRef b As T = y": BYREF may be repeated before EACH name, and fbc's own
+    // suite writes the list that way. Only the LEADING one was read, so the second died as "Expected
+    // variable name in array declaration". The modifier is list-wide here either way, so a repeat is
+    // consumed rather than tracked per name.
+    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    begin
+      IsByref := True;
+      Context.Advance;
+    end;
     // Leading-AS array declaration: "DIM [SHARED] AS type name(dims)". Route to ParseArrayDeclaration
     // (which handles the dimension list, including "lo TO hi" ranges and negative lower bounds) and
     // inject the shared type when no explicit "AS type" follows the array.
@@ -9686,6 +9747,9 @@ begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := FuncPtrSigNode.Attributes.Values['FPPARAMS'];
         ArrayDecl.Attributes.Values['FPRET'] := FuncPtrSigNode.Attributes.Values['FPRET'];
+        // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
+        // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
+        ArrayDecl.Attributes.Values['FPRETBYREF'] := FuncPtrSigNode.Attributes.Values['FPRETBYREF'];
         FuncPtrSigNode.Free; FuncPtrSigNode := nil;
       end
       else if LeadingAS and Assigned(SharedFpNode) then
@@ -9693,6 +9757,9 @@ begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
         ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
+        // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
+        // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
+        ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
       end;
       // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
       // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;
@@ -9848,7 +9915,7 @@ function TPackratParser.ParseVarStatement: TASTNode;
 var
   Token, NameTok: TLexerToken;
   Decl, InitExpr, AddrNode: TASTNode;
-  VarIsByref, VarIsShared: Boolean;
+  VarIsByref, VarIsShared, DeclIsByref: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -9871,6 +9938,15 @@ begin
     Context.Advance;
   end;
   repeat
+    // ...and BYREF may also stand before EACH name: "Var Shared ByRef a = x, ByRef b = y". The leading
+    // modifier applies to the whole list, a per-name one only to its own declaration - so the flag is
+    // read here as well, into a copy, and the list-wide value survives for the names that omit it.
+    DeclIsByref := VarIsByref;
+    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    begin
+      DeclIsByref := True;
+      Context.Advance;
+    end;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after VAR', Context.CurrentToken);
@@ -9890,7 +9966,7 @@ begin
     if not Assigned(InitExpr) then Break;
     Decl := TASTNode.Create(antArrayDecl, NameTok);
     Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    if VarIsByref then
+    if DeclIsByref then
     begin
       // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
       if InitExpr.NodeType = antIdentifier then
@@ -10142,11 +10218,36 @@ function TPackratParser.ParseEraseStatement: TASTNode;
 // ERASE arr [, arr ...] (FreeBASIC, B1.4) - reset each named array's elements to default.
 var
   Token, NameTok: TLexerToken;
+  EraseTarget: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antErase, Token);
   Context.Advance; // Consume ERASE
   repeat
+    // ⭐ "Erase .field" INSIDE A WITH BLOCK, the same leading dot REDIM reads a few pages above and an
+    // assignment reads everywhere: it names a member of the WITH object. Only a bare NAME was accepted,
+    // so the dot ended the statement - a third statement missing the rule its siblings have.
+    // ⛔ ...and the QUALIFIED spelling, "Erase obj.arr", which is the same member with its object written
+    // out. Fixing only the leading dot would have left the two halves of one rule in different states -
+    // "Erase e.meep" read "e" as the array and died as "ERASE: array not declared: E".
+    if Context.Check(ttOpDot) or
+       (Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+        (Context.PeekNext.TokenType = ttOpDot)) then
+    begin
+      // ⛔ At precCALL, not precPRIMARY: the ".field" postfix is what has to be read, and at primary the
+      // expression parser stopped at the bare name and left the dot behind - the statement then held the
+      // OBJECT where the array belonged ("ERASE: array not declared: E"). REDIM reads its own target at
+      // primary for the opposite reason: there the "(...)" that follows is its dimension list.
+      EraseTarget := FExpressionParser.ParseExpression(precCall);
+      if not Assigned(EraseTarget) then
+      begin
+        HandleError('Expected a member name after "." in ERASE', Context.CurrentToken);
+        Break;
+      end;
+      Result.AddChild(EraseTarget);
+      if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
+      Break;
+    end;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected array name after ERASE', Context.CurrentToken);
@@ -10615,7 +10716,7 @@ end;
 function TPackratParser.ParseConstStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
-  Assignment, ValueNode, ArrayDecl: TASTNode;
+  Assignment, ValueNode, ArrayDecl, ProcPtrScratch: TASTNode;
   TypeName: string;
 
   // Best-effort bank of an untyped CONST initializer that is NOT a plain literal — a string-returning
@@ -10860,7 +10961,20 @@ begin
     SkipTypeQualifiers;                     // FB: "As Const <type>"
     TypeTok := Context.CurrentToken;
     TypeName := 'INTEGER';
-    if Context.Check(ttIdentifier) then
+    // "Const p As Sub() = 0" / "As Function(...) As R": the type is a PROCEDURE POINTER, which is not an
+    // identifier at all - so the reader below skipped it, the type stayed INTEGER and the '(' was met
+    // where '=' was expected. DIM has read this signature all along; a constant holds only the pointer
+    // VALUE (int-banked here), so the signature is consumed and its shape recorded on a scratch node.
+    if Context.Check(ttProcedureStart) then
+    begin
+      ProcPtrScratch := TASTNode.Create(antArrayDecl, TypeTok);
+      try
+        TryParseProcPtrType(ProcPtrScratch);
+      finally
+        ProcPtrScratch.Free;
+      end;
+    end
+    else if Context.Check(ttIdentifier) then
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
