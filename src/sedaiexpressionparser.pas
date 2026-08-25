@@ -738,6 +738,8 @@ begin
   Result := ParseExpression(precPrimary);
 end;
 
+function FoldSizedIntegerTypeName(const S: string): string; forward;
+
 function TExpressionParser.ParseExpressionList(Delimiter: TTokenType = ttSeparParam): TASTNode;
 var
   Expr: TASTNode;
@@ -934,6 +936,25 @@ begin
   end;
 
   IdentName := UpperCase(Token.Value);
+
+  // "Integer<8>" in EXPRESSION position - SizeOf(Integer<8>), Type<Integer<8>>. Fold the three tokens
+  // into the ordinary type name of that width, so every reader downstream sees a plain type identifier.
+  // Unfolded, the '<' read as a comparison and the expression failed on the ')' that followed.
+  if ((IdentName = 'INTEGER') or (IdentName = 'UINTEGER')) and Context.Check(ttOpLt) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    FnName := IdentName + '<' + VarToStr(Context.PeekNext.Value) + '>';
+    IdentName := FoldSizedIntegerTypeName(FnName);
+    if IdentName <> FnName then
+    begin
+      Context.Advance;                               // '<'
+      Context.Advance;                               // the bit count
+      if Context.Check(ttOpGt) then Context.Advance; // '>'
+      Result := TASTNode.CreateWithValue(antIdentifier, IdentName, Token);
+      Exit;
+    end;
+    IdentName := UpperCase(Token.Value);
+  end;
 
   // FreeBASIC CAST(type, expr) / CPTR(type, expr): the first argument is a TYPE (which the expression
   // parser cannot parse as an expression), so handle it specially. Lowers to antCast(value = type
@@ -2627,6 +2648,46 @@ begin
   DoNodeCreated(Result);
 end;
 
+function FoldSizedIntegerTypeName(const S: string): string;
+// FreeBASIC's EXPLICIT-WIDTH integer names, "Integer<8>" / "UInteger<16>", collapsed to the ordinary type
+// name of that width. The parser's type readers gather a type as a run of tokens, so the angle brackets
+// arrive spaced out ("INTEGER < 8 >"); both spellings are normalised here so there is ONE place that
+// knows the mapping. The declaration form is read token-by-token in ParseDottedName, which needs no
+// string at all - this is for the readers that build a type NAME.
+var
+  T: string;
+  P: Integer;
+  Base, Bits: string;
+begin
+  Result := S;
+  P := Pos('<', Result);
+  if P = 0 then Exit;
+  Base := UpperCase(Trim(Copy(Result, 1, P - 1)));
+  if (Base <> 'INTEGER') and (Base <> 'UINTEGER') then Exit;
+  T := Copy(Result, P + 1, MaxInt);
+  P := Pos('>', T);
+  if P = 0 then Exit;
+  Bits := Trim(Copy(T, 1, P - 1));
+  T := Trim(Copy(T, P + 1, MaxInt));            // whatever followed ">" (a PTR suffix, say)
+  if Base = 'INTEGER' then
+    case StrToIntDef(Bits, 0) of
+       8: Base := 'BYTE';
+      16: Base := 'SHORT';
+      32: Base := 'LONG';
+      64: Base := 'LONGINT';
+    else Exit;
+    end
+  else
+    case StrToIntDef(Bits, 0) of
+       8: Base := 'UBYTE';
+      16: Base := 'USHORT';
+      32: Base := 'ULONG';
+      64: Base := 'ULONGINT';
+    else Exit;
+    end;
+  if T <> '' then Result := Base + ' ' + T else Result := Base;
+end;
+
 function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
 // CAST/CPTR(type, expr). The leading identifier is already consumed; the current token is '('. Read the
 // type (identifiers joined with spaces, dots kept tight — e.g. "INTEGER PTR", "FORMS.POINT"), then the
@@ -2683,6 +2744,7 @@ begin
     end;
     Context.Advance;
   end;
+  TypeStr := FoldSizedIntegerTypeName(TypeStr);   // "INTEGER < 8 >" -> "BYTE"
   if not Context.Match(ttSeparParam) then
   begin
     HandleError('Expected "," after the type in CAST/CPTR', Context.CurrentToken);

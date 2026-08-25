@@ -151,6 +151,7 @@ type
     function ParseArrayDeclaration: TASTNode;
     function FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
     function ParseFileHandleIdent: TASTNode;
+    function ParseFileNumberOperand: TASTNode;
 
     // Helper methods for block parsing
     function ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
@@ -1922,7 +1923,7 @@ end;
 function TPackratParser.ParsePrintStatement: TASTNode;
 var
   Token: TLexerToken;
-  Expr, FormatNode, UsingMarker: TASTNode;
+  Expr, FormatNode, UsingMarker, HandleNode: TASTNode;
   SeparatorNode: TASTNode;
   IsUsingFormat: Boolean;
 begin
@@ -1949,13 +1950,9 @@ begin
       Result.Free;
       Result := TASTNode.Create(antPrintFile, Token);
       Context.Advance;  // consume '#'
-      if Context.Check(ttNumber) or Context.Check(ttInteger) then
-      begin
-        Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-        Context.Advance;
-      end
-      else if Context.Check(ttIdentifier) then
-        Result.AddChild(ParseFileHandleIdent)
+      HandleNode := ParseFileNumberOperand;
+      if Assigned(HandleNode) then
+        Result.AddChild(HandleNode)
       else
         HandleError('Expected file number after PRINT #', Token);
       if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
@@ -2056,7 +2053,7 @@ function TPackratParser.ParseInputStatement: TASTNode;
 var
   Token: TLexerToken;
   Expr: TASTNode;
-  SeparatorNode: TASTNode;
+  SeparatorNode, HandleNode: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antInput, Token);
@@ -2068,13 +2065,9 @@ begin
     Result.Free;
     Result := TASTNode.Create(antInputFile, Token);
     Context.Advance;  // consume '#'
-    if Context.Check(ttNumber) or Context.Check(ttInteger) then
-    begin
-      Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-      Context.Advance;
-    end
-    else if Context.Check(ttIdentifier) then
-      Result.AddChild(ParseFileHandleIdent)
+    HandleNode := ParseFileNumberOperand;
+    if Assigned(HandleNode) then
+      Result.AddChild(HandleNode)
     else
       HandleError('Expected file number after INPUT #', Token);
     if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after handle
@@ -3514,6 +3507,33 @@ begin
 
   Result := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // first segment
+  // FreeBASIC EXPLICIT-WIDTH integer: "Integer<8>" / "UInteger<16>" name the same types BYTE..LONGINT
+  // by their bit count. Read here, at the central type-name reader, for the same reason UNSIGNED is:
+  // every declaration form asks this one question. Left unread, the '<' looked like a comparison and
+  // "Dim As Integer<8> b" failed as "Expected variable name".
+  if ((Result = 'INTEGER') or (Result = 'UINTEGER')) and Context.Check(ttOpLt) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    Context.Advance;                                 // '<'
+    BaseU := VarToStr(Context.CurrentToken.Value);
+    Context.Advance;                                 // the bit count
+    if Context.Check(ttOpGt) then Context.Advance;   // '>'
+    if Result = 'INTEGER' then
+      case StrToIntDef(BaseU, 0) of
+         8: Result := 'BYTE';
+        16: Result := 'SHORT';
+        32: Result := 'LONG';
+        64: Result := 'LONGINT';
+      end
+    else
+      case StrToIntDef(BaseU, 0) of
+         8: Result := 'UBYTE';
+        16: Result := 'USHORT';
+        32: Result := 'ULONG';
+        64: Result := 'ULONGINT';
+      end;
+    Exit;
+  end;
   while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
         (Length(VarToStr(Context.PeekNext.Value)) > 0) and
         (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
@@ -7028,18 +7048,9 @@ begin
       SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
       Context.Advance;            // optional '#'
-    if Context.Check(ttNumber) or Context.Check(ttInteger) then
-    begin
-      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
-      Context.Advance;
-    end
-    else if Context.Check(ttIdentifier) then
-    begin
-      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Context.Advance;
-      HandleNode := FoldFileHandlePostfix(HandleNode);
-    end
-    else begin HandleError('Expected file number after AS', Token); Exit; end;
+    HandleNode := ParseFileNumberOperand;
+    if not Assigned(HandleNode) then
+    begin HandleError('Expected file number after AS', Token); Exit; end;
     LenExpr := nil;
     if UpperCase(Context.CurrentToken.Value) = kLEN then    // optional "LEN = reclen" (RANDOM)
     begin
@@ -7123,6 +7134,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after #', Token);
@@ -7218,6 +7233,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after #', Token);
@@ -7269,6 +7288,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after #', Token);
@@ -7407,6 +7430,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after GET#', Token);
@@ -7457,6 +7484,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after INPUT#', Token);
@@ -7535,17 +7566,9 @@ begin
   Result := TASTNode.Create(antInputFile, Tok);
   Result.Attributes.Values['LINEINPUT'] := '1';
   if not CombinedHash then Context.Advance;  // consume the separate '#' (combined 'INPUT#' already has it)
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-  begin
-    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-    Result.AddChild(FoldFileHandlePostfix(P));
-  end
+  P := ParseFileNumberOperand;
+  if Assigned(P) then
+    Result.AddChild(P)
   else
     HandleError('Expected file number after LINE INPUT #', Tok);
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after the handle
@@ -7749,17 +7772,9 @@ begin
   Result.Attributes.Values['WRITE'] := '1';
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
     Context.Advance;  // '#'
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-  begin
-    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-    Result.AddChild(FoldFileHandlePostfix(P));
-  end
+  P := ParseFileNumberOperand;
+  if Assigned(P) then
+    Result.AddChild(P)
   else
     HandleError('Expected file number after WRITE #', Tok);
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after the handle
@@ -7790,14 +7805,8 @@ begin
   end;
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
     Context.Advance;  // '#'
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    H := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-    H := ParseFileHandleIdent
-  else
+  H := ParseFileNumberOperand;
+  if not Assigned(H) then
   begin
     HandleError('Expected file number after GET/PUT #', Tok);
     H := TASTNode.CreateWithValue(antLiteral, 1, Tok);
@@ -7869,17 +7878,9 @@ begin
   Result.Attributes.Values['SEEK'] := '1';
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
     Context.Advance;  // '#'
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-  begin
-    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-    Result.AddChild(FoldFileHandlePostfix(P));
-  end
+  P := ParseFileNumberOperand;
+  if Assigned(P) then
+    Result.AddChild(P)
   else
     HandleError('Expected file number after SEEK #', Tok);
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma
@@ -8007,6 +8008,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after PRINT#', Token);
@@ -9248,6 +9253,26 @@ begin
   Result := FoldFileHandlePostfix(Result);
 end;
 
+function TPackratParser.ParseFileNumberOperand: TASTNode;
+// ⛔ ONE place decides what a file number may LOOK like; the '#' has already been consumed. Three
+// spellings: a literal, an identifier with its trailing ".field" chain, and a PARENTHESISED
+// expression. "Print #(1), x" is FreeBASIC's own spelling - its suite writes it that way inside a
+// macro, where the parentheses protect the argument - and it failed at SEVEN statements at once
+// because each of them re-listed the two spellings it happened to know.
+// Returns nil when the current token begins none of the three; the caller reports its own message.
+begin
+  Result := nil;
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    Result := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+    Result := ParseFileHandleIdent
+  else if Context.Check(ttDelimParOpen) then
+    Result := FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall));
+end;
+
 function TPackratParser.ParseArrayAccess: TASTNode;
 var
   ArrayName: TASTNode;
@@ -9643,6 +9668,13 @@ begin
       begin
         TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
         ArrayDecl.AddChild(TypeNode);        // child[1] is antIdentifier (type) => typed scalar
+        // ⛔ ...and the TRAILING spelling of TypeOf is one of these. "Dim b As TypeOf(a)" reads its type
+        // as the ordinary name "TYPEOF" with the operand landing in the argument list beside it, so the
+        // SSA pre-pass that resolves TypeOf never fired and the variable was declared with an UNKNOWN
+        // type: a String answered the float default and printed 0. Only the leading-AS spelling
+        // ("Dim As TypeOf(a) b") was ever marked, which is why the feature looked present.
+        if UpperCase(DimTypeName) = 'TYPEOF' then
+          ArrayDecl.Attributes.Values['TYPEOF'] := '1';
       end;
       // Leading-AS fixed-length string capacity ("DIM AS STRING * n name") applies to each name.
       if LeadingAS and (SharedFixedLen <> '') then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;
@@ -9816,7 +9848,7 @@ function TPackratParser.ParseVarStatement: TASTNode;
 var
   Token, NameTok: TLexerToken;
   Decl, InitExpr, AddrNode: TASTNode;
-  VarIsByref: Boolean;
+  VarIsByref, VarIsShared: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -9826,8 +9858,18 @@ begin
   // failed with "Expected a variable name after VAR". The initializer is wrapped in "@" here, exactly
   // as DIM BYREF wraps it, so the two spellings reach the SSA in one shape; the TYPE is what VAR
   // leaves to be inferred, and the pre-pass reads it out of the referand.
-  VarIsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
-  if VarIsByref then Context.Advance;                // consume BYREF
+  // "Var Shared v = e": the module-global spelling, which DIM and STATIC both accept and this did not -
+  // "Var Shared" failed as "Expected a variable name after VAR", the word SHARED being where a name was
+  // expected. Either order is FreeBASIC's ("Var Shared ByRef r = t"), so both modifiers are read in a
+  // loop rather than in a fixed sequence.
+  VarIsByref := False;
+  VarIsShared := False;
+  while Context.Check(ttSharedDecl) or
+        (Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF')) do
+  begin
+    if Context.Check(ttSharedDecl) then VarIsShared := True else VarIsByref := True;
+    Context.Advance;
+  end;
   repeat
     if not Context.Check(ttIdentifier) then
     begin
@@ -9867,6 +9909,7 @@ begin
     else
       Decl.AddChild(InitExpr);                       // child[1] = initializer (NOT a type / dimensions)
     Decl.Attributes.Values['INFER'] := '1';
+    if VarIsShared then Decl.Attributes.Values['SHARED'] := '1';   // module-global, as DIM SHARED marks it
     DoNodeCreated(Decl);
     Result.AddChild(Decl);
     if Context.Check(ttSeparParam) then
@@ -9886,7 +9929,9 @@ var
   Token, NameTok, TypeTok: TLexerToken;
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
   StaticTypeName, StaticFixedLen: string;
+  StaticAddrNd: TASTNode;
   IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
+  IsByrefStatic: Boolean;  // ...and "Static Shared ByRef As T r = target"
 
   // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
   // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
@@ -9950,6 +9995,11 @@ begin
   // identifier, and the whole statement died with "Expected a variable name after STATIC".
   IsShared := Context.Check(ttSharedDecl);
   if IsShared then Context.Advance;                  // consume SHARED
+  // ...and BYREF may stand between them and the type: "Static Shared ByRef As Integer r = target" is a
+  // module-level REFERENCE that persists, and DIM has accepted the same spelling all along. Left unread
+  // it was not an identifier either, so the statement died with "Expected a variable name after STATIC".
+  IsByrefStatic := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  if IsByrefStatic then Context.Advance;             // consume BYREF
   // FreeBASIC AS-first form: "STATIC AS type name1 [= init] [, name2 ...]" — the shared type precedes the
   // names (like "DIM AS type name"). Distinct from the "STATIC name AS type" form handled below.
   if Context.Check(ttAsType) then
@@ -9991,9 +10041,26 @@ begin
           // STATIC parsed the parentheses as an expression and failed. One reader, both spellings.
           Init := TryParseAggregateTuple(StaticTypeName);
           if not Assigned(Init) then Init := FExpressionParser.ParseExpression;
+          // A BYREF declaration binds to the referand's ADDRESS, so the initializer is wrapped in "@" -
+          // the same shape DIM BYREF builds, so both spellings reach the SSA as one thing.
+          if IsByrefStatic and Assigned(Init) then
+          begin
+            if Init.NodeType = antIdentifier then
+            begin
+              StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Init.Value)), NameTok);
+              Init.Free;
+            end
+            else
+            begin
+              StaticAddrNd := TASTNode.Create(antProcAddress, NameTok);
+              StaticAddrNd.AddChild(Init);
+            end;
+            Init := StaticAddrNd;
+          end;
           if Assigned(Init) then DeclNode.AddChild(Init);
         end;
       end;
+      if IsByrefStatic then DeclNode.Attributes.Values['BYREF'] := '1';
       DeclNode.Attributes.Values['STATIC'] := '1';
       if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
       if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;

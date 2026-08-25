@@ -1687,9 +1687,9 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DIM` | ✓ | Declares a variable at the current scope. Both `DIM name AS type [= init]` and the leading-AS form `DIM [SHARED] AS type name[, ...] [= init]` (type shared by every name) are supported. Array forms: fixed `DIM a(dims) AS type`, an initializer with either sign `DIM a(dims) AS type = { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (starts at `UBOUND = -1`, sized later with `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` (size deduced from the initializer). |
 | `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported (immutability is not enforced). |
 | `SCOPE` | ✓ | Begins a new scope block. |
-| `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders. |
+| `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders, with the `SHARED` and `BYREF` modifiers (`STATIC SHARED BYREF AS T r = target`). |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
-| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
+| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. Takes the `SHARED` and `BYREF` modifiers in either order (`VAR SHARED v = e`, `VAR SHARED BYREF r = target`). The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
 | `BYREF (variables)` | ✓ | Used with Dim or Static or Var allows to declare references. (DIM BYREF done; VAR/STATIC BYREF deferred.) |
 
 #### User Defined Types
@@ -1783,6 +1783,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CONST` | ✓ | Specifies a read only type. |
 | `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
 | `UNSIGNED` | ✓ | `AS UNSIGNED <basetype>` modifier → maps to the unsigned variant (INTEGER→UINTEGER, BYTE→UBYTE, SHORT→USHORT, LONG→ULONG, LONGINT→ULONGINT). Bare `UNSIGNED` == UNSIGNED INTEGER. |
+| `INTEGER<n>` / `UINTEGER<n>` | ✓ | Explicit-width integer type names: `<8>` → BYTE/UBYTE, `<16>` → SHORT/USHORT, `<32>` → LONG/ULONG, `<64>` → LONGINT/ULONGINT. Accepted in a declaration (`Dim As Integer<8> b`) and in expression position (`SizeOf(Integer<8>)`, `Cast(Integer<8>, e)`). |
 | `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. |
 
 ##### String types
@@ -2700,7 +2701,7 @@ End Function
 | `OPEN LPT` | ✗ | Binds a file number to a printer device. **Not implemented**, same reason as `OPEN COM`. Deliberately never exercised by any net either: FreeBASIC's LPT support goes through the Windows print spooler, so running such an example queues a real job on a real printer. |
 | `OPEN PIPE` | ✗ | Binds a file number to the input and output streams of a process. **Not implemented**: the parser does not know `PIPE` at all, and the line is a syntax error. |
 | `OPEN SCRN` | ✓ | Binds a file number directly to the console. |
-| `CLOSE` | ✓ | Unbinds a file number from a file or device. |
+| `CLOSE` | ✓ | Unbinds a file number from a file or device. ⚠️ The **statement** only: `CLOSE #n` and the bare `CLOSE` (all channels). The FUNCTION form `Close(n)`, which answers an error code, is not implemented — see *Declared unsupported*. |
 | `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). |
 | `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
 | `OUTPUT` | ✓ | `OPEN "f" FOR OUTPUT AS #n` opens the file for writing (truncating). |
@@ -2722,7 +2723,7 @@ End Function
 | `INPUT()` | ✓ | `INPUT(n, [#]filenum)` — reads n characters (BYTES; `WINPUT()` counts Unicode codepoints instead) from a file. A short read at end of file returns fewer characters, as in FreeBASIC. |
 | `WINPUT()` | ✓ | `WINPUT(n, [#]filenum)` — reads n wide characters (Unicode codepoints) from a file. A WSTRING is UTF-8 here, so a character may span several bytes; a short read at end of file returns fewer characters, as in FreeBASIC. |
 | `LINE INPUT #` | ✓ | `LINE INPUT #n, s` reads a whole line of text (commas not split). |
-| `PRINT #` | ✓ |  |
+| `PRINT #` | ✓ | The file number may be written parenthesised, `PRINT #(1), x` — as it may on every statement that takes one (`OPEN … AS`, `CLOSE`, `INPUT #`, `LINE INPUT #`, `WRITE #`, `GET`/`PUT`, `SEEK`). |
 | `? # (Shortcut for 'PRINT #')` | ✓ | `? #n, ...` is the shortcut for `PRINT #n, ...` (the lexer maps `?` to PRINT). |
 | `PUT #` | ✓ | Writes arbitrary data to a file or device. |
 | `GET #` | ✓ | Reads arbitrary data from a file or device. |
@@ -3142,6 +3143,9 @@ Each of these is *refused with a message that names the reason*, never answered 
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
+- **`Close(n)` as a FUNCTION.** fbc lets `CLOSE` be called as an expression that answers an error
+  code (`0` when the channel was open, `1` = illegal function call otherwise). Only the STATEMENT
+  forms are implemented here — `Close #n` and the bare `Close`, which closes every channel.
 - **`ProcPtr(p, Virtual ...)`** (fbc 1.10+) asks for a member's **vtable index**, not its address.
   There is no vtable a program can index here: a virtual call goes through a generated dispatcher
   keyed on the instance's runtime type-id. Call the method directly — the dispatch is the same one.

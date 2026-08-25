@@ -12476,11 +12476,19 @@ begin
         // Src1 = haystack, Src2 = needle, Immediate = the int register holding the 1-based start position
         // (the 2-arg form passes a register holding 1).
         StartPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        if StartPos < 1 then StartPos := 1;
-        Ctx.IntRegs[Instr.Dest] := Pos(Ctx.StringRegs[Instr.Src2],
-          Copy(Ctx.StringRegs[Instr.Src1], StartPos, MaxInt));
-        if Ctx.IntRegs[Instr.Dest] > 0 then
-          Inc(Ctx.IntRegs[Instr.Dest], StartPos - 1);
+        // ⛔ A START BELOW 1 IS AN ERROR, NOT A CLAMP. fbc answers 0 for "Instr( 0, s, sub )" - the
+        // position is 1-based and 0 names nothing - while clamping it to 1 SEARCHED THE WHOLE STRING and
+        // answered a position the caller had asked not to look at. The 2-argument form passes a register
+        // holding 1, so it is unaffected.
+        if StartPos < 1 then
+          Ctx.IntRegs[Instr.Dest] := 0
+        else
+        begin
+          Ctx.IntRegs[Instr.Dest] := Pos(Ctx.StringRegs[Instr.Src2],
+            Copy(Ctx.StringRegs[Instr.Src1], StartPos, MaxInt));
+          if Ctx.IntRegs[Instr.Dest] > 0 then
+            Inc(Ctx.IntRegs[Instr.Dest], StartPos - 1);
+        end;
       end;
     48: // bcStrInstrAny - INSTR([start,] str, Any set) -> FIRST position of any char in the set (1-based, 0 if none)
       begin

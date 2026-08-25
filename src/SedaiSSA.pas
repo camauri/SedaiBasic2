@@ -623,6 +623,7 @@ type
     function EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue; // obj.field[i] → raw address
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     // FreeBASIC index operator "v[i]" on a UDT, and the addressable element a BYREF one returns.
+    function IsMemberArrayField(MemberNode: TASTNode): Boolean;
     function TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
     function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
     function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
@@ -11179,6 +11180,24 @@ begin
       EmitInstruction(ssaBitwiseOr, Result, Tmp, TmpNum, MakeSSAValue(svkNone));
       Exit;
     end;
+    // ⛔ A FLOAT IS COMPARED AS A FLOAT. The argument arrives converted to an int, so "CBool( 0.5 )"
+    // truncated to 0 and answered FALSE where fbc answers true - a value that is not zero read as zero,
+    // which is the same mistake the string path above already carries a note about.
+    if (ArgsNode.ChildCount >= 1) and (InferExprBank(ArgsNode.GetChild(0)) = srtFloat) then
+    begin
+      ProcessExpression(ArgsNode.GetChild(0), V0);
+      EmitInstruction(ssaCmpNeFloat, Result, EnsureFloatRegister(V0),
+                      EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone));
+      Exit;
+    end;
+    // ⛔ ...and a UDT goes through its own "Operator Cast() As Boolean". Without it the RECORD HANDLE
+    // was compared against zero - always true, whatever the object says about itself.
+    if (ArgsNode.ChildCount >= 1) and (ObjectTypeName(ArgsNode.GetChild(0)) <> '') and
+       TryEmitUDTCastToNumber(ArgsNode.GetChild(0), V0) then
+    begin
+      EmitInstruction(ssaCmpNeInt, Result, EnsureIntRegister(V0), IntConst(0), MakeSSAValue(svkNone));
+      Exit;
+    end;
     EmitInstruction(ssaCmpNeInt, Result, A0, IntConst(0), MakeSSAValue(svkNone));
   end
   else if (FuncName = kBIT) or (FuncName = kBITSET) or (FuncName = kBITRESET) then
@@ -19429,6 +19448,21 @@ begin
   EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);
 end;
 
+function TSSAGenerator.IsMemberArrayField(MemberNode: TASTNode): Boolean;
+// "obj.name" where name is an ARRAY member of obj's type — asked WITHOUT emitting anything, so a caller
+// can decide which address family a "obj.name(i)" belongs to before it commits to one.
+var
+  TypeName: string;
+  Slot, DimCount: Integer;
+  Bank: TSSARegisterType;
+begin
+  Result := False;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  Result := UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, Bank, DimCount);
+end;
+
 function TSSAGenerator.TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
 // "<raw pointer expression>[i]" as an ADDRESSABLE place: emit the element's address on the raw byte
 // heap and answer True. Two spellings reach here — "obj.field[i]" (a "<scalar> PTR" MEMBER, which is
@@ -19446,7 +19480,18 @@ begin
   if Node.GetChild(0).NodeType = antMemberAccess then
   begin
     Pointee := MemberRawPtrPointee(Node.GetChild(0));
-    if Pointee = '' then Exit;
+    // ...and a member ARRAY element, "this.v(i)", whose address is the packed one EmitArrayElementAddress
+    // builds from the field's run-time handle. It is not a raw byte address, so it must not go through the
+    // raw branch above - the two kinds are not interchangeable.
+    if Pointee = '' then
+    begin
+      if (Node.Attributes.Values['BRACKET'] <> '1') and IsMemberArrayField(Node.GetChild(0)) then
+      begin
+        EmitArrayElementAddress(Node, Addr);
+        Exit(True);
+      end;
+      Exit;
+    end;
     Addr := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), Pointee);
     Exit(True);
   end;
@@ -25047,7 +25092,7 @@ procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
 // pre-allocation so the handle/explicit type is honoured.
 var
   i, k: Integer;
-  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned: TASTNode;
+  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand: TASTNode;
   VarName, TypeName: string;
   SavedInProc: Boolean;
 begin
@@ -25195,12 +25240,25 @@ begin
         if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
         begin
           VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          case InferExprBank(Decl.GetChild(1)) of
-            srtString: TypeName := 'STRING';
-            srtInt:    TypeName := 'INTEGER';
-          else
-            TypeName := 'DOUBLE';
-          end;
+          // ⛔⛔ THE OPERAND IS NOT CHILD 1. "Dim b As TypeOf(a)" parses as the type identifier "TYPEOF"
+          // at child 1 with the ARGUMENT LIST at child 2, so this asked the bank of a name called
+          // "TYPEOF" - an unknown one - and always got the float default. It looked right only because
+          // an Integer stored in a Double register still prints as itself; a STRING printed 0.
+          TypeOfOperand := Decl.GetChild(1);
+          if (UpperCase(VarToStr(TypeOfOperand.Value)) = 'TYPEOF') and (Decl.ChildCount >= 3) and
+             (Decl.GetChild(2).NodeType in [antArgumentList, antExpressionList]) and
+             (Decl.GetChild(2).ChildCount >= 1) then
+            TypeOfOperand := Decl.GetChild(2).GetChild(0);
+          // ⭐ And then the DECLARED TYPE, with the bank only as the fallback: asking the bank alone is
+          // three answers for ten types.
+          TypeName := DeclaredTypeNameOf(TypeOfOperand);
+          if TypeName = '' then
+            case InferExprBank(TypeOfOperand) of
+              srtString: TypeName := 'STRING';
+              srtInt:    TypeName := 'INTEGER';
+            else
+              TypeName := 'DOUBLE';
+            end;
           Decl.RemoveChildAt(1);   // drop the type-of expression (the child list owns and frees it)
           Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
           Decl.Attributes.Values['TYPEOF'] := '0';
@@ -26313,8 +26371,8 @@ procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx:
 // constructor is initialized field-by-field — store each value into the field at the same position (in
 // declaration order). Extra values past the field count are ignored (FB would reject them; v1 is lenient).
 var
-  i, j, Slot: Integer;
-  ArgVal, ArrHandle: TSSAValue;
+  i, j, Slot, FieldIdx: Integer;
+  ArgVal, ArrHandle, UnitVal: TSSAValue;
   SrcType: string;
   Bank: TSSARegisterType;
 begin
@@ -26329,25 +26387,50 @@ begin
       EmitRecordCopy(HandleVal, ArgVal, UDTIdx);
     Exit;
   end;
+  // ⛔⛔ THE VALUES ARE POSITIONAL OVER *FIELDS THAT HAVE STORAGE OF THEIR OWN*, not over the field
+  // array. Two shapes break that one-to-one, and the LAYOUT knew about both while this did not:
+  //  - a UNION consumes ONE value between them all (its members share the storage), and the value
+  //    after it belongs to the field FOLLOWING the union. Writing one value per member made
+  //    "Dim As T x = (1, 2, 3)" put 2 and 3 into the same bytes and leave the field after the union 0;
+  //  - a BIT FIELD is part of a shared unit, so a plain store writes the WHOLE unit and the members of
+  //    a run overwrote each other: "(1, 2, 3)" answered 3, 0, 0.
+  // ⇒ Walk the FIELDS and the VALUES with two cursors, and let the field decide how it is written.
+  FieldIdx := 0;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
-    if i > High(FUDTs[UDTIdx].Fields) then Break;
+    while (FieldIdx <= High(FUDTs[UDTIdx].Fields)) and (FieldIdx > 0) and
+          (FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup <> 0) and
+          (FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup = FUDTs[UDTIdx].Fields[FieldIdx - 1].UnionGroup) do
+      Inc(FieldIdx);                       // the rest of a union block shares the value already written
+    if FieldIdx > High(FUDTs[UDTIdx].Fields) then Break;
     // ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives the
     // middle field - an array - its elements one by one; the field's slot holds the member array's
     // FArrays handle, so the values go in through the same indirect store "v.field(j) = x" uses.
     if ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1' then
     begin
-      EmitBraceArrayMemberInit(HandleVal, UDTIdx, i, ArgsNode.GetChild(i));
+      EmitBraceArrayMemberInit(HandleVal, UDTIdx, FieldIdx, ArgsNode.GetChild(i));
+      Inc(FieldIdx);
       Continue;
     end;
     ProcessExpression(ArgsNode.GetChild(i), ArgVal);
-    Bank := FUDTs[UDTIdx].Fields[i].Bank;
-    Slot := FUDTs[UDTIdx].Fields[i].Slot;
+    Bank := FUDTs[UDTIdx].Fields[FieldIdx].Bank;
+    Slot := FUDTs[UDTIdx].Fields[FieldIdx].Slot;
+    if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0 then
+    begin
+      // A bit field names part of a unit: read the unit, insert the bits, write it back.
+      UnitVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, UnitVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      UnitVal := EmitBitFieldInsert(UnitVal, EnsureIntRegister(ArgVal), UDTIdx, FieldIdx);
+      EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(UnitVal), MakeSSAConstInt(Slot));
+      Inc(FieldIdx);
+      Continue;
+    end;
     case Bank of
       srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVal), MakeSSAConstInt(Slot));
       srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, EnsureStringRegister(ArgVal), MakeSSAConstInt(Slot));
     else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVal), MakeSSAConstInt(Slot));
     end;
+    Inc(FieldIdx);
   end;
 end;
 
@@ -30030,6 +30113,8 @@ var
   TempReg, Stride: Integer;
   RawFieldPointee, RecTypeName: string;
   AddrNd: TASTNode;
+  MArrHandle, MArrIdx: TSSAValue;
+  MArrBank: TSSARegisterType;
 begin
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
@@ -30043,6 +30128,27 @@ begin
       Result := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), RawFieldPointee);
       Exit;
     end;
+  end;
+  // @obj.arr(i) where arr is a UDT ARRAY MEMBER. The packing is the same as a module array's below, with
+  // one difference that is the whole reason this branch exists: the array id is not known while compiling
+  // - a member array is allocated in FArrays per INSTANCE - so the base is built from the handle the field
+  // holds at RUN TIME instead of from a constant. Without it "@this.v(i)" raised "Cannot take address of
+  // element of undeclared array: V", and with it an "Operator [] ByRef" backed by a member array becomes
+  // assignable, which is the shape the operator is normally written in.
+  if (Node.GetChild(0).NodeType = antMemberAccess) and
+     IsMemberArrayAccess(Node, MArrHandle, MArrBank, MArrIdx) then
+  begin
+    TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, AddResult, MArrHandle, TempVal, MakeSSAValue(svkNone));
+    StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(POINTER_ARRAY_SHIFT), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShl, MulResult, AddResult, StrideVal, MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Result, MulResult, MArrIdx, MakeSSAValue(svkNone));
+    Exit;
   end;
   ArrName := VarToStr(Node.GetChild(0).Value);
   ArrayIdx := ArrayIndexOf(ArrName);
@@ -30591,9 +30697,17 @@ begin
   // pointer, and the very ssaRefLoad/ssaRefStore the byref-return machinery uses know how to follow one -
   // so calling it non-addressable made the operator a VALUE return and the assignment was refused.
   if N.NodeType = antMemberAccess then Exit(True);
-  Result := (N.NodeType = antArrayAccess) and (N.Attributes.Values['BRACKET'] = '1') and
-            (N.ChildCount >= 2) and
-            (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]);
+  // ...and an INDEXED element, in EITHER bracketing. "p[i]" is a pointer element and "this.v(i)" is a
+  // member ARRAY element; both have an address now that EmitArrayElementAddress builds a member array's
+  // base from the handle at run time. Only the square bracket used to qualify, so
+  // "Operator T.[]() ByRef As Integer : Return This.v(i)" - the shape an assignable index operator is
+  // normally written in - was judged a VALUE return and "a[2] = 7" fell through to the array store and
+  // died as "Array not declared: A", while the READ half worked. The usual tell of a rule one path has.
+  // ⛔ The round bracket is ambiguous - "f(i)" is also a CALL - so it qualifies only through a FIELD
+  // ("this.v(i)"), where the base cannot be a free function.
+  Result := (N.NodeType = antArrayAccess) and (N.ChildCount >= 2) and
+            (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]) and
+            ((N.Attributes.Values['BRACKET'] = '1') or (N.GetChild(0).NodeType = antMemberAccess));
 end;
 
 function TSSAGenerator.BodyReturnsRawIndexedElement(Decl: TASTNode): Boolean;
