@@ -490,17 +490,41 @@ function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean
 var
   i, First: Integer;
   p: TASTNode;
-  T, Nm, Banks, Names, Consts: string;
+  T, Nm, Banks, Names, Consts, Widths: string;
   C: Char;
-  AnyUDT, AnyConst: Boolean;
+  AnyUDT, AnyConst, AnyWidth: Boolean;
+
+  // The DECLARED WIDTH of a parameter, as one character. ⛔ The codes are TypeNameWidthCode's, and they
+  // have to be, because the call site reproduces this tail from OperandWidthCode - which reads the very
+  // same registry. Two spellings of the same fact would be two facts.
+  //   1 Byte  2 UByte  3 Short  4 UShort  5 Long  6 ULong  7 Single  8 UInteger/ULongInt
+  //   9 Int32 A UInt32 B Boolean          '-' = full 64-bit (Integer/LongInt/Double) or not known
+  function WidthCharOf(const TN: string): Char;
+  begin
+    if (TN = 'BYTE') then Result := '1'
+    else if (TN = 'UBYTE') then Result := '2'
+    else if (TN = 'SHORT') then Result := '3'
+    else if (TN = 'USHORT') then Result := '4'
+    else if (TN = 'LONG') then Result := '5'
+    else if (TN = 'ULONG') then Result := '6'
+    else if (TN = 'SINGLE') then Result := '7'
+    else if (TN = 'UINTEGER') or (TN = 'ULONGINT') then Result := '8'
+    else if (TN = 'INT32') then Result := '9'
+    else if (TN = 'UINT32') then Result := 'A'
+    else if (TN = 'BOOLEAN') then Result := 'B'
+    else Result := '-';
+  end;
+
 begin
   Result := '';
   if ParamList = nil then Exit;
   Banks := '';
   Names := '';
   Consts := '';
+  Widths := '';
   AnyUDT := False;
   AnyConst := False;
+  AnyWidth := False;
   if SkipThis then First := 1 else First := 0;   // a method's implicit THIS sits at index 0
   for i := First to ParamList.ChildCount - 1 do
   begin
@@ -527,6 +551,8 @@ begin
       else C := 'I';
     end;
     Banks := Banks + C;
+    Widths := Widths + WidthCharOf(T);
+    if Widths[Length(Widths)] <> '-' then AnyWidth := True;
     if p.Attributes.Values['CONSTP'] = '1' then
     begin
       Consts := Consts + 'C';
@@ -553,6 +579,12 @@ begin
   // POSITIONAL ('C' or '-' per parameter) because the call site has to reproduce it from its arguments.
   if AnyConst then
     Result := Result + '!' + Consts;
+  // ⭐ A WIDTH tail, appended only when some parameter has a width of its own - so a set of overloads
+  // that differ by BANK alone keeps byte-identical labels, exactly as the two tails above do. It is what
+  // tells "g(As Long)" from "g(As Integer)": both sign the bank 'I', so before this the two collided on
+  // one label and the FIRST declaration won every call. POSITIONAL, like the others.
+  if AnyWidth then
+    Result := Result + '%' + Widths;
 end;
 
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
