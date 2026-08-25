@@ -719,6 +719,7 @@ type
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
+    function RecordHandleOfVar(const Name: string): TSSAValue;   // however that variable is stored
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
                                  out TypeName: string): Boolean;
     // True if the expression is unsigned 64-bit (UInteger/ULongInt), selecting the QWord compare/
@@ -29817,7 +29818,12 @@ function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNod
 var
   PtrReg, IdxVal, SzVal, ScaledIdx: TSSAValue;
 begin
-  PtrReg := EnsureIntRegister(GetOrAllocateVariable(PtrName));
+  // ⛔ The POINTER'S OWN VALUE, read the way that pointer is stored. Asking GetOrAllocateVariable gave
+  // a REGISTER, and an @-taken or SHARED pointer does not live in one - it is array-backed. The emitted
+  // code then added the index to an UNDEFINED register ("AddInt R4, R5, R7" with R5 never written), so
+  // "p[i].field" answered rubbish and p[0] and p[1] gave the SAME wrong answer. ⚠️ The identical program
+  // without "Dim pp As T Ptr Ptr = @p" worked, because without the @ the pointer does stay in a register.
+  PtrReg := RecordHandleOfVar(PtrName);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxVal := EnsureIntRegister(IdxVal);
   if IsRawPtr(PtrName) and (RawElemSizeOf(PtrName) > 1) then
@@ -30667,7 +30673,11 @@ begin
       Result := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
       // "arr(i)->field": the array's ELEMENTS are UDT pointers, so the element is a record of the
       // pointee type. Mirrors the branch ResolveRecordObject takes to load that element's handle.
-      if Result = '' then
+      // ⛔ ...but NOT when that "array" is a SCALAR'S BACKING: an @-taken pointer is made array-backed
+      // (one element, holding the pointer itself), and answering here made "p[i].field" read p's own
+      // backing instead of indexing what p points at - the index was ignored entirely, so p[0] and
+      // p[1] gave the same wrong answer. A scalar's backing is not a program array.
+      if (Result = '') and not (IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
         Result := ArrayPointerUDTType(ArrName);
       // "type<T>(...)"/"T(...)" anonymous temporary: the "array name" is a UDT type with no array of that
       // name in scope — the node constructs a temporary T (same guard as the codegen hook).
@@ -30675,7 +30685,11 @@ begin
         Result := ArrName;
       // "ptr[i].field": ptr is a pointer to a UDT (Callocate'd record block / managed handle); ptr[i] is a
       // record of the pointee type.
-      if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
+      // ⛔ "ArrayIndexOf >= 0" is meant to let a REAL array win over a pointer of the same name. An
+      // @-taken pointer, though, is made ARRAY-BACKED (one element, holding the pointer itself), so it
+      // answered yes and "p[i].field" stopped being pointer indexing: the type came out '' and the
+      // access read p's own backing. A scalar's backing is not a program array.
+      if (Result = '') and ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
         Result := PointerUDTType(ArrName);
       // "f(args).field" / "f(args).method()": a user FUNCTION whose return type is a UDT. Its return
       // type is registered under the function's own name (that is what makes "Dim As T x = f(...)" work).
@@ -31106,6 +31120,30 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.RecordHandleOfVar(const Name: string): TSSAValue;
+// The HANDLE of a record variable, read the way that variable is actually stored.
+//
+// ⛔ THREE PLACES HAD ASKED GetOrAllocateVariable FOR IT and got a register the name was never bound
+// to when the variable is SHARED - which is array-backed, its handle in element 0 of a 1-element
+// global array. m534 fixed the program-end destructor, m537 fixed "@obj", and this is the third:
+// "(*p).field". A rule that keeps going missing belongs in ONE place, so here it is.
+var
+  AccNode: TASTNode;
+begin
+  if IsSharedScalar(Name) then
+  begin
+    AccNode := MakeSharedScalarAccess(Name, nil);
+    try
+      ProcessExpression(AccNode, Result);
+      Result := EnsureIntRegister(Result);
+    finally
+      AccNode.Free;
+    end;
+  end
+  else
+    Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(Name)));
+end;
+
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
@@ -31198,7 +31236,7 @@ begin
     // (*p).field where p is a UDT pointer: the deref yields p's handle directly.
     TypeName := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));
     if TypeName = '' then Exit;
-    HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.GetChild(0).Value))));
+    HandleVal := RecordHandleOfVar(VarToStr(ObjNode.GetChild(0).Value));
     Result := True;
   end
   else if ObjNode.NodeType = antArrayAccess then
@@ -31310,7 +31348,13 @@ begin
       // Note this is the array-of-pointers case, NOT "ptr[i]" below (there the NAME is the pointer).
       // Without it the node matched no branch: reads yielded the raw tagged handle instead of the field
       // and stores were silently dropped.
+      // ⛔ ...and NOT when that "array" is a SCALAR'S BACKING. An @-taken pointer is made array-backed
+      // (one element, holding the pointer itself), so "p[i]" matched HERE and read element 0 of p's own
+      // backing instead of indexing what p POINTS AT: "p[0].i" answered the handle where 123 was meant.
+      // ⚠️ The very same program without "Dim pp As T Ptr Ptr = @p" worked, because without the @ the
+      // pointer stays in a register and no backing array exists - which is what isolated it.
       ParentType := ArrayPointerUDTType(ArrName);
+      if IsSharedScalar(ArrName) or IsAddrLocal(ArrName) then ParentType := '';
       if (ParentType <> '') and (ObjNode.ChildCount >= 2) then
       begin
         ProcessExpression(ObjNode, HandleVal);      // ordinary int element load (indices, lbounds, binds)
