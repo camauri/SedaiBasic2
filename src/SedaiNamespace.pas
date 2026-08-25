@@ -106,6 +106,12 @@ begin
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
         Result := UpperCase(VarToStr(Node.GetChild(0).Value));
+        // ⛔ AN OVERLOADED PROCEDURE'S NAME CARRIES ITS SIGNATURE by the time this pass runs -
+        // RegisterOverloadLabel rewrites it to "G~II" during parsing, and namespace flattening happens
+        // afterwards. Keyed under the decorated name, the member was invisible: a call to "g()" from
+        // INSIDE its own namespace resolved to the GLOBAL g instead, while "n.g()" from outside worked
+        // and a VARIABLE of the same shape worked too. That difference is what named it.
+        if Pos('~', Result) > 0 then Result := Copy(Result, 1, Pos('~', Result) - 1);
         if Pos('.', Result) > 0 then Result := '';
       end;
   end;
@@ -250,6 +256,8 @@ var
   ChildPrefix, BaseName, Mangled, V: string;
   NewNode, BaseId: TASTNode;
   UseShadow: TStringList;
+  SigPos: Integer;
+  BaseV, SigV: string;
 begin
   Result := Node;
 
@@ -317,12 +325,27 @@ begin
     // namespace means the MODULE-LEVEL v. There are two identifier sites in this pass and the rule has
     // to be in BOTH - with it only in the first, ".g()" (a call, rewritten there) answered the global
     // one while ".v" (a plain read, rewritten here) still answered the namespace's.
-    if (Pos('.', V) = 0) and (V <> '') and (ActivePrefix <> '') and
-       (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
-       ((Shadow = nil) or (Shadow.IndexOf(V) < 0)) then
+    // ⛔ AN OVERLOADED PROCEDURE'S NAME CARRIES ITS SIGNATURE - "G~II" - because RegisterOverloadLabel
+    // decorates it during parsing and this pass runs afterwards. Resolve on the BASE and put the
+    // signature back, or the DECLARATION keeps its bare "G~II" while the CALL becomes "N.G" and the
+    // two stop naming the same thing ("Array not declared: N.G").
+    SigPos := Pos('~', V);
+    if SigPos > 0 then
     begin
-      Mangled := ResolveUnqualified(ActivePrefix, V, Ctx);
-      if Mangled <> '' then Node.Value := Mangled;
+      BaseV := Copy(V, 1, SigPos - 1);
+      SigV := Copy(V, SigPos, MaxInt);
+    end
+    else
+    begin
+      BaseV := V;
+      SigV := '';
+    end;
+    if (Pos('.', BaseV) = 0) and (BaseV <> '') and (ActivePrefix <> '') and
+       (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
+       ((Shadow = nil) or (Shadow.IndexOf(BaseV) < 0)) then
+    begin
+      Mangled := ResolveUnqualified(ActivePrefix, BaseV, Ctx);
+      if Mangled <> '' then Node.Value := Mangled + SigV;
     end;
   end;
 end;
