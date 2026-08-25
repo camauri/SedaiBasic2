@@ -1376,6 +1376,15 @@ begin
     // by-reference side effects, discarding the status). Mirrors ttSpriteFunction / ttInputFunction.
     ttGraphicsFunction: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
 
+    // ⭐ A BUILT-IN FUNCTION CALLED FOR NOTHING IS STILL A STATEMENT. FreeBASIC lets any function's
+    // result be discarded - "CUInt( f( 1, 2, 3 ) )" is written exactly to run f and throw the number
+    // away, and "Hex( i )" appears in fbc's own ignore-result test. Only the graphics/sprite/input
+    // families were routed here; the math and string ones fell to the generic dispatcher and came out
+    // as "Unexpected token in statement: "cuint"".
+    ttMathFunction, ttStringFunction, ttMemoryFunction, ttSystemFunction,
+    ttErrorHandlingFunction, ttOutputFunction:
+      Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
     // === SPRITE COMMANDS ===
     ttSpriteCommand: Result := Memoize('SpriteStatement', @ParseSpriteStatement);
     ttSpriteFunction: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);

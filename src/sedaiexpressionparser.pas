@@ -899,6 +899,19 @@ begin
   // legitimate content that itself begins and ends with a quote (e.g. """x""" -> "x") would be corrupted.
   Value := Token.Value;
 
+  // ⭐ ADJACENT STRING LITERALS CONCATENATE, as they do in C and as FreeBASIC's own test suite writes
+  // them (`!"\32" "1"` is one three-character string). Two literals in a row are not two expressions:
+  // nothing separates them, so the second one was simply LEFT where an operator was expected - and the
+  // declaration it belonged to took only the first, silently. A wrong answer, not a refusal, which is
+  // why it survived: `Dim s As String = "ab" "cd"` said "ab" and complained about nothing.
+  // Done here rather than in the lexer so an ESCAPED literal (whose escapes the lexer has already
+  // resolved) joins a plain one on equal terms.
+  while Context.Check(ttStringLiteral) do
+  begin
+    Value := Value + VarToStr(Context.CurrentToken.Value);
+    Context.Advance;
+  end;
+
   Result := CreateLiteralNode(Value, Token);
   DoNodeCreated(Result);
 end;
