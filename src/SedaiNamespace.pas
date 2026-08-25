@@ -396,7 +396,7 @@ var
   UseShadow, UseUsing: TStringList;
   Drop: array of Integer;
   UsingNs: string;
-  SigPos: Integer;
+  SigPos, DotPos: Integer;
   BaseV, SigV: string;
 begin
   Result := Node;
@@ -467,6 +467,29 @@ begin
     UseShadow.Free;
   if UseUsing <> Using then
     UseUsing.Free;
+
+  // ⛔ A METHOD IS DECLARED AS "T.foo", AND THE TYPE IT BELONGS TO IS MANGLED right below. The type
+  // became "N1.T" while its constructor kept the name "T.CONSTRUCTOR#", so the two stopped naming the
+  // same thing and EVERY member procedure of a type declared inside a Namespace was silently never
+  // called - no diagnostic, because the type itself resolves and its field DEFAULTS still appear,
+  // which is exactly what made it read as "the type works". MemberDeclName declines a dotted name (it
+  // is not a free member of the namespace) and the identifier branch below declines a dotted name too
+  // (a dot means "already qualified"): the rule lived in the TYPE path and in neither of the two paths
+  // that carry the METHOD - the same shape as [[a-rule-one-path-has-and-the-other-does-not]].
+  // The owner half is mangled with the very rule the type gets, so the two agree by construction.
+  if (Node.NodeType = antProcedureDecl) and (ActivePrefix <> '') and
+     (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+     (Node.Attributes.Values['GLOBALSCOPE'] <> '1') then
+  begin
+    V := UpperCase(VarToStr(Node.GetChild(0).Value));
+    DotPos := Pos('.', V);
+    if DotPos > 1 then
+    begin
+      BaseV := Copy(V, 1, DotPos - 1);
+      if Ctx.IsMember(ActivePrefix, BaseV) then
+        Node.GetChild(0).Value := ActivePrefix + '.' + V;
+    end;
+  end;
 
   // antTypeDecl name lives in Value (not a child identifier): mangle it here.
   if (Node.NodeType = antTypeDecl) and (ActivePrefix <> '') then

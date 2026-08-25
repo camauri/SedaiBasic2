@@ -550,6 +550,37 @@ begin
             ((Length(T) = 1) or not IsIdentChar(T[Length(T) - 1]));
 end;
 
+function LineContinuationCut(const S: string): Integer;
+// The position of FreeBASIC's '_' LINE CONTINUATION in an ordinary source line, or 0 when the line
+// does not continue.
+// ⛔ THE ANSWER HAS TO BE A POSITION, NOT A YES/NO: fbc drops everything that follows the '_', so
+// "check( 1, _ )" continues on the next line and that ')' is not part of the program at all. A
+// predicate that looked at the LAST character - which is what PPDirectiveContinues does, correctly,
+// for a directive - answers False for exactly that shape, and fbc's own wstring tests are written
+// with it.
+// A '_' inside a string literal, or after a "'" comment, is text. An identifier may hold '_' at
+// either end ("MAX_", "__FB_ARG__"), so the token has to stand alone on both sides.
+var
+  i: Integer;
+  InStr: Boolean;
+begin
+  Result := 0;
+  InStr := False;
+  for i := 1 to Length(S) do
+  begin
+    if S[i] = '"' then InStr := not InStr
+    else if InStr then Continue
+    else if S[i] = '''' then Break                     // a line comment: the rest is not code
+    else if (S[i] = '_') and
+            ((i = 1) or not IsIdentChar(S[i - 1])) and
+            ((i = Length(S)) or not IsIdentChar(S[i + 1])) then
+    begin
+      Result := i;
+      Break;
+    end;
+  end;
+end;
+
 function PPConstStrFold(const S: string; Defs: TStringList; out Res: string): Boolean;
 // A constant STRING expression: a chain of string literals and string-valued macros joined by '+' or
 // '&'. Answers the folded text as a LITERAL (quotes included), so it can be substituted where the
@@ -2064,6 +2095,7 @@ var
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
     SavedStackTop: Integer;
+    ContJoin, CutPos: Integer;   // '_'-continued physical lines folded into this logical one
   begin
     SavedStackTop := High(Active);   // remember depth so includes can't leak unbalanced conditionals
     Lines := TStringList.Create;
@@ -2429,6 +2461,24 @@ var
         end
         else if Emitting then
         begin
+          // ⛔ '_' CONTINUATION IS NOT A DIRECTIVE-ONLY RULE. The join further up is gated on
+          // Trimmed[1] = '#', and that looked sufficient because the LEXER folds a continued line of
+          // ordinary code on its own - a continued SUB call works. But SubstituteMacros takes ONE
+          // PHYSICAL LINE, so a macro whose ARGUMENT LIST is split across lines was expanded with the
+          // arguments TRUNCATED: "chk( 1, _" / "2 )" died on 'Unexpected token ")"' while the very
+          // same continuation in a plain call was fine. That difference is what named it, and nine
+          // tests of fbc's own suite are written this way.
+          // Folded HERE, before substitution, so the macro sees the whole argument list; every line
+          // swallowed leaves a blank behind, exactly as the directive join does, so the line numbers
+          // the rest of the pipeline reports stay the source's own.
+          ContJoin := 0;
+          CutPos := LineContinuationCut(Raw);
+          while (CutPos > 0) and (li + ContJoin + 1 < Lines.Count) do
+          begin
+            Raw := Copy(Raw, 1, CutPos - 1) + ' ' + TrimLeft(Lines[li + ContJoin + 1]);
+            Inc(ContJoin);
+            CutPos := LineContinuationCut(Raw);
+          end;
           if IsOptionEscapeLine(Trimmed) then EscapeOn := True;   // takes effect from THIS line on
           if EscapeOn then
             ExpandedLine := ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs, 0))
@@ -2444,6 +2494,12 @@ var
             Output.Add(ReprocessExpansion(ExpandedLine, Dir))
           else
             Output.Add(ExpandedLine);
+          while ContJoin > 0 do                       // one blank per swallowed line: keep numbering
+          begin
+            Output.Add('');
+            Inc(li);
+            Dec(ContJoin);
+          end;
         end
         else
           Output.Add('');   // excluded line — blank placeholder preserves line numbers

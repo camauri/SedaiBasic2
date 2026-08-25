@@ -2188,6 +2188,20 @@ begin
           Exit;
         end;
       end;
+      // ⭐ "@r" WHERE r IS A REFERENCE VARIABLE ("Dim ByRef r As T = target"). Its register ALREADY
+      // HOLDS the target's address - that is the whole representation, and the read at ssaRefLoad* and
+      // the write at ssaRefStore* both use it that way - so the address of the alias IS that value.
+      // Without this branch the name fell through to IsSharedScalar/VarRecordTypeName and answered the
+      // address of the alias's OWN slot, so "@r = @target" was FALSE while reading and writing r
+      // behaved perfectly: an alias that is the same object for every purpose except its identity.
+      // IsRefVar was consulted everywhere the rule was needed - the read (2823), the write (7773), even
+      // the read fast-path's exclusion (2049) - and in the one path that answers "where is it".
+      // ⛔ It has to be tested FIRST: a shared ref-to-UDT matches the two branches below it as well.
+      if (Node.ChildCount = 0) and IsRefVar(VarToStr(Node.Value)) then
+      begin
+        Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))));
+        Exit;
+      end;
       // "@Type.method": the entry PC of a member procedure named through its TYPE (a STATIC member sub
       // has no instance, so this is the only way to point at it). Tried before the field path, which
       // would otherwise report "object is not a record" for a type NAME.
@@ -28697,9 +28711,18 @@ begin
             begin
               VNameU := UpperCase(VarToStr(Decl.Value));
               VTypeU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-              // Only a @-taken builtin SCALAR param (not a UDT, not a "T PTR", not a STRING -- raw bytes only).
+              // Only a @-taken builtin SCALAR param (not a UDT, not a STRING -- raw bytes only).
+              // ⛔ A "T PTR" PARAMETER USED TO BE EXCLUDED HERE, and that one clause is the whole reason
+              // "@p" of "ByVal p As Integer Ptr" died with "Undefined procedure (address-of @): P". The
+              // exclusion reads as though pointers were a separate case with a path of their own; they
+              // are not. A pointer VALUE is raw bytes like any other scalar - RawTypeCodeOfPointee
+              // answers RTC_I64 for "INTEGER PTR", which is exactly a pointer's width - and the lowering
+              // chain was already sound: "@x" on a ByVal Integer/Single/UDT param works, so the hole was
+              // in the MARKING, not in @. It cost every "@" of a pointer parameter, BYVAL and BYREF
+              // alike, which is why it read as a defect of the BYREF protocol and is not one.
+              // STRING stays out: its slot holds a MANAGED handle, not bytes (see the prologue's note).
               if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
-                 (Pos(' PTR', VTypeU) = 0) and (VTypeU <> 'STRING') then
+                 (VTypeU <> 'STRING') then
               begin
                 Decl.Attributes.Values['ADDRPARAM'] := '1';
                 if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
