@@ -2764,14 +2764,25 @@ function TExpressionParser.ParseWithMember(Token: TLexerToken): TASTNode;
 // already been consumed (prefix rule). Builds antMemberAccess(field, clone of the WITH object).
 var
   FieldName: string;
+  ExplicitGlobal: Boolean;
 begin
+  // ⭐ FreeBASIC's EXPLICIT global-scope operator, "..name". ONE leading dot means the WITH object
+  // whenever there is one; TWO dots always mean the GLOBAL namespace, and that is the only way to reach
+  // a module-level name from INSIDE a WITH block - where a single dot is already spoken for. fbc's own
+  // tests write it both ways: "..foo" and, via "#define global .", "global.foo" - the same two tokens.
+  ExplicitGlobal := False;
+  if Context.Check(ttOpDot) then
+  begin
+    Context.Advance;   // consume the second '.'
+    ExplicitGlobal := True;
+  end;
   // ⭐ FreeBASIC's GLOBAL-SCOPE operator. Outside a WITH block a leading '.' does not want an object:
   // ".name" means "the name in the GLOBAL namespace", which is how code inside a NAMESPACE reaches a
   // module-level declaration its own namespace shadows. Answered as the bare identifier, marked so the
   // namespace flattener leaves it UNMANGLED - which is exactly what "global" means once namespaces are
   // flattened into prefixed names. fbc's tests/namespace/ uses it throughout (15 of the suite's parse
   // failures), and before this it was reported as an error.
-  if (WithObject = nil) or not HasValidContext then
+  if ExplicitGlobal or (WithObject = nil) or not HasValidContext then
   begin
     if Context.Check(ttIdentifier) then
     begin
