@@ -6160,6 +6160,30 @@ begin
             Exit;
           end;
         end;
+        // ⛔ ...and SIZEOF OF ANY OTHER EXPRESSION. fbc sizes the expression's TYPE and never evaluates
+        // it, so "SizeOf(p2 - p1)", "SizeOf(x + 1)" and "SizeOf(a(UBound(a)))" are all legal - and all
+        // of them fell past the two branches above, leaving the name SIZEOF to reach the ARRAY lookup:
+        // "Array not declared: SIZEOF". Six tests of the suite die on that one gap. Only the AST is
+        // inspected here, so nothing is evaluated, which is what SizeOf requires.
+        if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
+           not (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess, antDeref, antCast]) then
+        begin
+          case InferExprBank(Node.GetChild(1).GetChild(0)) of
+            srtString: FieldSzConst := TypeSizeBytes('STRING');
+            srtFloat:  if IsSingleExpr(Node.GetChild(1).GetChild(0)) then FieldSzConst := 4
+                       else FieldSzConst := 8;
+          else
+            begin
+              FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(Node.GetChild(1).GetChild(0)));
+              if FieldSzConst <= 0 then FieldSzConst := 8;
+            end;
+          end;
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
         if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
            (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess]) then
@@ -7625,6 +7649,18 @@ begin
       EmitFieldAddress(ExprNode, ExprValue);
       EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
       Exit;
+    end;
+    // FreeBASIC "Function = Type(args)": the bare Type() carries no <T>, so its type comes from the
+    // FUNCTION's UDT return type - exactly as the "Return Type(args)" spelling fills it, and as
+    // "Dim v As T = Type(args)" fills it from the declared type. ⛔ Without this the constructor kept
+    // an EMPTY type name and the SSA read it as an array access: "Array not declared:" with no name.
+    // ⚠️ THREE other spellings of the same thing already worked - "Return Type(...)", "<fname> =
+    // Type(...)" and the DIM - so only this one refused, and only when the result was written this way.
+    if (FCurrentProcRetRecType <> '') and (ExprNode <> nil) and
+       (ExprNode.Attributes.Values['INFERTYPE'] = '1') and (ExprNode.ChildCount >= 1) then
+    begin
+      ExprNode.GetChild(0).Value := FCurrentProcRetRecType;
+      ExprNode.Attributes.Values['INFERTYPE'] := '';
     end;
     ProcessExpression(ExprNode, ExprValue);
     // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
