@@ -4386,10 +4386,17 @@ begin
         else if (FuncName = 'STR$') then
         begin
           // STR$(n) - returns string from number
+          // ⛔ ...and a UDT carrying "Operator Cast() As String" converts THROUGH IT. Read as an
+          // ordinary expression it is an int HANDLE, and the int branch below then rendered that
+          // handle - "1", "2", "3" - a number, and a believable one. It is the SAME trap the BigInt
+          // and BOOLEAN cases below are written to avoid, said twice already in this very branch, and
+          // a string-casting UDT is the third instance of it. ⚠️ PRINT, "&" and an assignment all
+          // took the cast; only Str did not, so a program printed one thing and Str'd another.
+          // ProcessStringExpression is exactly ProcessExpression for anything that is not such a UDT.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+            ProcessStringExpression(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           DestReg := FProgram.AllocRegister(srtString);
@@ -4432,10 +4439,14 @@ begin
         else if (FuncName = 'VAL') then
         begin
           // VAL(str) - returns float from string
+          // ...through "Operator Cast() As String" for a UDT, as STR$ above: read as an ordinary
+          // expression the argument is an int HANDLE, EnsureStringRegister rendered THAT, and VAL
+          // parsed a handle. Measured over eleven string builtins, STR$ and VAL were the only two
+          // that did not convert - UCASE, LCASE, LEFT, RIGHT, MID, INSTR, TRIM and ASC all did.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+            ProcessStringExpression(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           ArgReg := EnsureStringRegister(ArgValue);
