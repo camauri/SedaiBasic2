@@ -8648,7 +8648,13 @@ begin
       // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
       // into a record variable left the record's handle showing (the manual's control/iif4).
       // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
-      if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
+      // ⛔ ...and a POINTER type is never an aggregate: it has no fields to fill, so parentheses around
+      // its initializer are plain grouping. "Dim As ZString Ptr r = (StrPtr(s) + 1)" was read as a
+      // one-field tuple and the pointer arithmetic was stored as if it were a field value - the program
+      // then died dereferencing a null. IsBuiltinTypeName only matches BARE names, so "ZSTRING PTR"
+      // answered False and looked like a UDT.
+      if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) and
+         (Pos(' PTR', UpperCase(DimTypeName)) = 0) then
       begin
         Context.Advance;
         if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
