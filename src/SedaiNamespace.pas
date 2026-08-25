@@ -214,27 +214,47 @@ end;
 
 // Collect names that shadow a namespace member within a procedure body (parameters + DIM'd locals),
 // so an unqualified use of such a name is NOT prefixed.
-procedure CollectShadowNames(Node: TASTNode; Shadow: TStringList);
+//
+// ⛔⛔ A LOCAL SHADOWS FROM ITS DECLARATION ONWARD, NOT FOR THE WHOLE BODY. This walked the entire
+// procedure up front, so a "Dim x" written LATER suppressed the namespace prefix for every use BEFORE
+// it: inside "Namespace N : Dim Shared x = 2 : Sub s() : Print x : Dim x = 3", fbc prints the member
+// (2) and we printed the global (1). Measured 25 Aug 2026 - fbc's own namespace/global3 spends 37
+// assertions on exactly this shape.
+// ⇒ The DIM'd locals are therefore added AS THE WALK REACHES THEM (see RewriteRefs), and this routine
+//   now collects only what is in scope for the WHOLE body: the parameters.
+procedure CollectParamNames(Node: TASTNode; Shadow: TStringList);
 var
   i: Integer;
   Child: TASTNode;
 begin
-  case Node.NodeType of
-    antParameterList:
-      for i := 0 to Node.ChildCount - 1 do
-        if Node.GetChild(i).NodeType = antIdentifier then
-          Shadow.Add(UpperCase(VarToStr(Node.GetChild(i).Value)));
-    antArrayDecl:
-      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
-        Shadow.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  if Node.NodeType = antParameterList then
+  begin
+    for i := 0 to Node.ChildCount - 1 do
+      if Node.GetChild(i).NodeType = antIdentifier then
+        Shadow.Add(UpperCase(VarToStr(Node.GetChild(i).Value)));
+    Exit;
   end;
   for i := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(i);
-    // Do not descend into nested namespaces here (different scope).
-    if Child.NodeType <> antNamespace then
-      CollectShadowNames(Child, Shadow);
+    if (Child.NodeType <> antNamespace) and (Child.NodeType <> antProcedureDecl) then
+      CollectParamNames(Child, Shadow);
   end;
+end;
+
+// The names a DIM/declaration node binds locally, appended to Shadow. Called by the walk at the moment
+// the declaration is REACHED, so it shadows from there on and not before.
+procedure AddDeclaredNames(Node: TASTNode; Shadow: TStringList);
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+    Shadow.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  for i := 0 to Node.ChildCount - 1 do
+    if Node.GetChild(i).NodeType in [antArrayDecl, antDim] then
+      AddDeclaredNames(Node.GetChild(i), Shadow);
 end;
 
 // Resolve an unqualified member name V against the active prefix chain (innermost first). Returns
@@ -329,7 +349,7 @@ begin
     UseShadow := TStringList.Create;
     UseShadow.Duplicates := dupIgnore;
     UseShadow.Sorted := True;
-    CollectShadowNames(Node, UseShadow);
+    CollectParamNames(Node, UseShadow);
   end;
 
   // Recurse into children first (bottom-up), replacing each in place if needed.
@@ -353,6 +373,24 @@ begin
       SetLength(Drop, Length(Drop) + 1);
       Drop[High(Drop)] := i;
       Continue;
+    end;
+    // A DIM shadows the namespace member FROM HERE ON: add its names before descending, so its own
+    // declared name is not prefixed and every later sibling sees the local. Cloned per node, so a
+    // Scope block's locals do not leak out of it.
+    // ⛔ ONLY INSIDE A PROCEDURE. At namespace level a DIM is a MEMBER declaration and must be MANGLED,
+    // not shadowed - treating it as a local made the member's own name skip the prefix, so "N.x" never
+    // existed and every reference to it read as undeclared. UseShadow is non-nil exactly from the
+    // procedure node down, which is the same marker the parameter rule already uses.
+    if (UseShadow <> nil) and (Node.GetChild(i).NodeType = antDim) then
+    begin
+      if UseShadow = Shadow then
+      begin
+        UseShadow := TStringList.Create;
+        UseShadow.Duplicates := dupIgnore;
+        UseShadow.Sorted := True;
+        if Shadow <> nil then UseShadow.Assign(Shadow);
+      end;
+      AddDeclaredNames(Node.GetChild(i), UseShadow);
     end;
     NewNode := RewriteRefs(Node.GetChild(i), ChildPrefix, UseShadow, Ctx, UseUsing);
     if NewNode <> Node.GetChild(i) then
@@ -482,7 +520,7 @@ begin
     // The names the program declares at MODULE level, so an import cannot take one over.
     for gi := 0 to AST.ChildCount - 1 do
       if AST.GetChild(gi).NodeType <> antNamespace then
-        CollectShadowNames(AST.GetChild(gi), Ctx.GlobalNames);
+        AddDeclaredNames(AST.GetChild(gi), Ctx.GlobalNames);
     RewriteRefs(AST, '', nil, Ctx, nil);
     HoistNamespaces(AST);
   finally
