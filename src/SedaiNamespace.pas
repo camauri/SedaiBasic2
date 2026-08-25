@@ -114,7 +114,7 @@ end;
 // PASS 1 — collect namespace names and member keys (no mutation).
 procedure CollectNamespaces(Node: TASTNode; const Prefix: string; Ctx: TNsContext);
 var
-  i, j: Integer;
+  i, j, k: Integer;
   Child, Decl: TASTNode;
   ChildPrefix, MemName: string;
 begin
@@ -125,6 +125,16 @@ begin
     begin
       ChildPrefix := CombinePrefix(Prefix, VarToStr(Child.Value));
       Ctx.NamespaceNames.Add(ChildPrefix);
+      // ⛔ A DOTTED declaration - "Namespace a.b.c" - is the same thing as three nested blocks, and it
+      // has to register the same NAMES: the reader walks "a.b.c.v" one dot at a time and needs to know
+      // that "a" and "a.b" are namespaces too. Registering only the full path made a dotted namespace
+      // silently unreadable - "a.b.v" answered 0 - while spelling the blocks out worked, and writing a
+      // "Namespace a" anywhere else in the file made the dotted one start working. That difference is
+      // what isolated it. fbc's own tests/namespace/ declares them this way throughout.
+      for k := 2 to Length(ChildPrefix) do
+        if ChildPrefix[k] = '.' then
+          if Ctx.NamespaceNames.IndexOf(Copy(ChildPrefix, 1, k - 1)) < 0 then
+            Ctx.NamespaceNames.Add(Copy(ChildPrefix, 1, k - 1));
       // Collect this namespace's direct member declarations.
       for j := 0 to Child.ChildCount - 1 do
       begin
