@@ -543,7 +543,14 @@ begin
   end;
 
   // Prefix an unqualified identifier that names a member of the active (or enclosing) namespace.
-  if Node.NodeType = antIdentifier then
+  // ⛔ ...AND "@x" IS ONE OF THEM. An address-of node is not an antIdentifier - it carries its name in
+  // Value with no child at all - so this branch never saw it and "@i" inside a namespace kept the bare
+  // name "I", which exists nowhere after flattening: it fell off the end of the @ chain as "Undefined
+  // procedure (address-of @): I". What proves the lowering itself is sound is that VARPTR(i) on the
+  // very same member WORKS: VarPtr synthesises its antProcAddress AFTER this pass, from a name that is
+  // already mangled. So the defect was never in @ - it was the name arriving unmangled.
+  if (Node.NodeType = antIdentifier) or
+     ((Node.NodeType = antProcAddress) and (Node.ChildCount = 0)) then
   begin
     V := UpperCase(VarToStr(Node.Value));
     // ⛔ ...and GLOBALSCOPE is a request NOT to resolve against the enclosing namespace: ".v" inside a

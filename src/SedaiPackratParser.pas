@@ -9213,6 +9213,14 @@ var
 begin
   Result := TASTNode.Create(antDimensions);
 
+  // ⛔ AN EMPTY DIMENSION LIST IS STILL A DIMENSION LIST: "a()" declares a DYNAMIC array, and the
+  // caller has already consumed the '('. This went straight into ParseExpression, which has nothing to
+  // read at a ')', so "Static a() As Integer" as a FIELD of a Type died on 'Unexpected token ")"' -
+  // while the identical "Dim a() As Integer" at module level was accepted, because THAT path spells
+  // the empty case out for itself. One more rule that one path had and its sibling did not; answered
+  // here, once, where every caller asks.
+  if Context.Check(ttDelimParClose) then Exit;
+
   repeat
     // FreeBASIC bare ellipsis dimension "(...)": no lower bound (defaults to 0), the upper bound is deduced
     // from the initializer element count (ProcessDim). "..." lexes as consecutive '.' tokens.

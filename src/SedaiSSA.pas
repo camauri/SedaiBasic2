@@ -829,6 +829,7 @@ type
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
+    function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a UCS-2 temporary
     procedure ProcessDefaultValue(Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name included
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
@@ -2151,6 +2152,25 @@ begin
       // intercept in the identifier path); only under "@" does the symbol matter. Without this the
       // name reached the procedure-address path unchanged and failed with "Undefined procedure
       // (address-of @): __FUNCTION_NQ__".
+      // ⭐ "@ns.member": the NAMESPACE pass collapses the qualified access into a single mangled
+      // IDENTIFIER, and it leaves it where it found it - as this node's CHILD. Every branch below
+      // reads the name from Value, and the chain has a case for a child that is a member access or an
+      // array access and none for a child that is a plain identifier, so the node fell off the end
+      // with an EMPTY name: "Undefined procedure (address-of @): ". Hoisted here, once, so the whole
+      // chain sees the name the program wrote - rather than teaching ten branches a second spelling.
+      // ⛔ An antIdentifier child at this point can only BE that collapse: an access on a record
+      // variable stays an antMemberAccess (the pass leaves it alone), which the branch below claims.
+      if (Node.ChildCount = 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+         (Trim(VarToStr(Node.Value)) = '') and (Node.GetChild(0).ChildCount = 0) then
+      begin
+        TempNode := Node.GetChild(0);
+        Node.Value := TempNode.Value;
+        // ⛔ RemoveChildAt FREES the child: FChildren is a TFPObjectList created OwnsObjects=True, so
+        // its Delete disposes of the node. Freeing it here as well is a DOUBLE FREE, and it answers
+        // with an access violation during SSA generation - which reads exactly like a defect in the
+        // lowering that was just added. The name is copied out FIRST, above, for the same reason.
+        Node.RemoveChildAt(0);
+      end;
       // FreeBASIC ADDRESS-OF OPERATOR: a type may declare "Operator @() As T Ptr", and then "@obj" is
       // that operator's result, not the object's storage address. Asked FIRST, because every path below
       // answers with an address of its own and the operator would never be reached - "@x" handed back the
@@ -12051,6 +12071,35 @@ begin
     Result := InferExprBank(ArgNode) = srtString;
 end;
 
+function TSSAGenerator.EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;
+// Materialise an addressable UCS-2 TEMPORARY holding this string's characters, and answer its address.
+//
+// ⭐ This is the WIDE half of what StrSAdd already is for bytes, and it is composed out of instructions
+// that already exist rather than by inventing an opcode: allocate, then store the characters WIDE
+// (ssaRawStoreZStr's Immediate 1 is exactly "encode as UCS-2 and NUL-terminate").
+//
+// The block is sized (byte length + 1) * 2, which is always enough: UTF8Decode never yields more
+// UTF-16 units than the string has bytes (ASCII is 1 byte -> 1 unit, and a supplementary character is
+// 4 bytes -> 2 units), and RawStoreZStrVal bounds-checks the store as a whole in any case.
+//
+// ⚠️ The temporary is not reclaimed - and neither is SADD's, which allocates a fresh raw block on
+// every call. That is the byte-heap model as it stands, not a new leak introduced here; the two halves
+// behave the same way, which is the property that matters.
+var
+  SReg, LenV, BytesV, AddrV: TSSAValue;
+begin
+  SReg := EnsureStringRegister(StrVal);
+  LenV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaStrLen, LenV, SReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BytesV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, BytesV, LenV, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaMulInt, BytesV, BytesV, EnsureIntRegister(MakeSSAConstInt(2)), MakeSSAValue(svkNone));
+  AddrV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRawAlloc, AddrV, BytesV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrV, SReg, MakeSSAConstInt(1));
+  Result := AddrV;
+end;
+
 function TSSAGenerator.TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;
 // A "WSTRING * n" variable given to a "WSTRING PTR" parameter: FreeBASIC passes its ADDRESS, and the
 // pointee is UCS-2 - which is the raw buffer MarkFixedWStringVars backs such a variable with.
@@ -12071,14 +12120,31 @@ begin
   if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
   if (ParamNode.GetChild(0).NodeType <> antIdentifier) or
      (UpperCase(VarToStr(ParamNode.GetChild(0).Value)) <> 'WSTRING PTR') then Exit;
-  if ArgNode.NodeType <> antIdentifier then Exit;
-  if not IsWStringVar(VarToStr(ArgNode.Value)) then Exit;
-  AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token);
-  try
-    ProcessExpression(AddrNode, Val);
-  finally
-    AddrNode.Free;
+  if (ArgNode.NodeType = antIdentifier) and IsWStringVar(VarToStr(ArgNode.Value)) then
+  begin
+    AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token);
+    try
+      ProcessExpression(AddrNode, Val);
+    finally
+      AddrNode.Free;
+    end;
+    Result := (Val.Kind <> svkNone);
+    Exit;
   end;
+  // ⛔ ...AND EVERY OTHER STRING-VALUED ARGUMENT, which is where this used to answer False and NOBODY
+  // ELSE CLAIMED THE CASE: IsStringArgForBytePtrParam - the ZSTRING half, which does take a literal, a
+  // Const, a plain String variable and any string EXPRESSION - excludes 'WSTRING PTR' from its list of
+  // parameter types on purpose, because SADD's bytes are UTF-8 and a wide dereference would misread
+  // them. So the else-if chain fell through to ProcessExpression, which staged the STRING REGISTER'S
+  // INDEX into an int slot and the callee dereferenced it: "hello" reached a "WString Ptr" parameter
+  // as NULL. The comment above used to say "answers False for every other shape - so no other
+  // conversion changes", which described the hole as though it were a design.
+  // The answer is not SADD, it is the WIDE equivalent of SADD: a UCS-2 temporary. 50 files of fbc's
+  // own suite declare a "wstring ptr" parameter.
+  if InferExprBank(ArgNode) <> srtString then Exit;
+  ProcessExpression(ArgNode, Val);
+  if Val.Kind = svkNone then Exit;
+  Val := EmitWStringTempAddr(Val);
   Result := (Val.Kind <> svkNone);
 end;
 
