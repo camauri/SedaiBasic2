@@ -80,6 +80,29 @@ begin
 end;
 
 // Forward declarations (mutual references in pass 1).
+// Register the MEMBERS of an ENUM declared inside a namespace, and mangle their declared names, so an
+// unqualified use inside the namespace resolves to them and one outside does not see them at all.
+procedure CollectEnumMemberNames(EnumNode: TASTNode; const Prefix: string; Ctx: TNsContext);
+var
+  i: Integer;
+  Item, NameNode: TASTNode;
+  Nm: string;
+begin
+  for i := 0 to EnumNode.ChildCount - 1 do
+  begin
+    Item := EnumNode.GetChild(i);
+    NameNode := nil;
+    if (Item.NodeType = antAssignment) and (Item.ChildCount >= 1) and
+       (Item.GetChild(0).NodeType = antIdentifier) then
+      NameNode := Item.GetChild(0)
+    else if Item.NodeType = antIdentifier then
+      NameNode := Item;
+    if NameNode = nil then Continue;
+    Nm := UpperCase(VarToStr(NameNode.Value));
+    if Nm <> '' then Ctx.MemberKeys.Add(Prefix + '|' + Nm);
+  end;
+end;
+
 procedure CollectDimMembers(DimNode: TASTNode; const Prefix: string; Ctx: TNsContext); forward;
 procedure CollectConstMembers(ConstNode: TASTNode; const Prefix: string; Ctx: TNsContext); forward;
 
@@ -164,6 +187,13 @@ begin
         begin
           MemName := MemberDeclName(Decl);
           if MemName <> '' then Ctx.MemberKeys.Add(ChildPrefix + '|' + MemName);
+          // ⛔ AN ENUM'S MEMBERS ARE MEMBERS OF THE NAMESPACE TOO, and registering only the enum's own
+          // NAME let them LEAK to module level: with an "E1.B = 2" outside and an "E1.B = 12" inside a
+          // namespace, an unqualified B answered 12 - the namespace one - where fbc answers 2, and
+          // "NS.B" answered nothing at all where fbc answers 12. The member names are mangled with the
+          // rest, so both spellings land on the same declaration.
+          if Decl.NodeType = antEnum then
+            CollectEnumMemberNames(Decl, ChildPrefix, Ctx);
         end;
       end;
       // Recurse for physically nested namespaces.
@@ -298,7 +328,29 @@ begin
   Result := Result + '.' + VarToStr(Node.Value);
 end;
 
-function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext): string;
+function ResolveNamespacePrefix(const ActivePrefix, Base: string; Ctx: TNsContext;
+                                Using: TStringList): string;
+// The full name of a namespace referred to by the PARTIAL name Base - through the enclosing chain
+// first, then through what a USING has imported. '' when Base does not name one.
+var
+  P: string;
+  DotPos, u: Integer;
+begin
+  Result := '';
+  P := ActivePrefix;
+  while P <> '' do
+  begin
+    if Ctx.NamespaceNames.IndexOf(P + '.' + Base) >= 0 then Exit(P + '.' + Base);
+    DotPos := LastDelimiter('.', P);
+    if DotPos = 0 then Break;
+    P := Copy(P, 1, DotPos - 1);
+  end;
+  if Using <> nil then
+    for u := 0 to Using.Count - 1 do
+      if Ctx.NamespaceNames.IndexOf(Using[u] + '.' + Base) >= 0 then Exit(Using[u] + '.' + Base);
+end;
+
+function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext; const ActivePrefix: string): string;
 // The namespace a "Using N" statement names, or '' when this is not one.
 // ⛔ "USING" IS NOT PARSED AS A DIRECTIVE AT ALL: at statement level it is routed to PRINT USING (the
 // Commodore format clause), so it arrives here as antPrintUsing with the namespace name as its only
@@ -306,7 +358,8 @@ function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext): string;
 // a format STRING, and this one carries a name that IS a declared namespace. If no namespace of that
 // name exists the node is left exactly as it was.
 var
-  Nm: string;
+  Nm, P: string;
+  DotPos: Integer;
 begin
   Result := '';
   if (Node = nil) or (Node.NodeType <> antPrintUsing) or (Node.ChildCount <> 1) then Exit;
@@ -316,7 +369,18 @@ begin
     Nm := UpperCase(FlattenDottedName(Node.GetChild(0)))
   else
     Exit;
-  if (Nm <> '') and (Ctx.NamespaceNames.IndexOf(Nm) >= 0) then Result := Nm;
+  if Nm = '' then Exit;
+  if Ctx.NamespaceNames.IndexOf(Nm) >= 0 then Exit(Nm);
+  // ⭐ ...and the name may be RELATIVE to where the directive stands: "Namespace reimp1.bar : Using foo"
+  // means reimp1.foo, exactly as an unqualified reference would. Walk the enclosing chain outwards.
+  P := ActivePrefix;
+  while P <> '' do
+  begin
+    if Ctx.NamespaceNames.IndexOf(P + '.' + Nm) >= 0 then Exit(P + '.' + Nm);
+    DotPos := LastDelimiter('.', P);
+    if DotPos = 0 then Break;
+    P := Copy(P, 1, DotPos - 1);
+  end;
 end;
 
 // PASS 2 — rewrite references (and member declaration names) bottom-up. Returns the node to use in
@@ -327,7 +391,7 @@ function RewriteRefs(Node: TASTNode; const ActivePrefix: string;
                      Shadow: TStringList; Ctx: TNsContext; Using: TStringList): TASTNode;
 var
   i: Integer;
-  ChildPrefix, BaseName, Mangled, V: string;
+  ChildPrefix, BaseName, Mangled, V, Qual: string;
   NewNode, BaseId: TASTNode;
   UseShadow, UseUsing: TStringList;
   Drop: array of Integer;
@@ -361,7 +425,7 @@ begin
   SetLength(Drop, 0);
   for i := 0 to Node.ChildCount - 1 do
   begin
-    UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx);
+    UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx, ChildPrefix);
     if UsingNs <> '' then
     begin
       if UseUsing = Using then
@@ -423,6 +487,27 @@ begin
     begin
       BaseId := Node.GetChild(0);
       BaseName := UpperCase(VarToStr(BaseId.Value));
+      // ⭐ A PARTIALLY QUALIFIED CHAIN. After "Using nested.multi.lev1", the reference
+      // "lev2.lev3.value" names nested.multi.lev1.lev2.lev3.value - the base is a namespace only once
+      // the import (or the enclosing chain) is put in front of it. Resolved here, and the collapse
+      // then CASCADES: the innermost pair becomes one mangled name, which is itself a namespace, so
+      // the level above collapses in turn.
+      if (Ctx.NamespaceNames.IndexOf(BaseName) < 0) and (Pos('.', BaseName) = 0) then
+      begin
+        Qual := ResolveNamespacePrefix(ActivePrefix, BaseName, Ctx, Using);
+        if Qual <> '' then BaseName := Qual;
+      end;
+      // ⛔ ...and the ENUM'S NAME IN THE MIDDLE. "NS.E1.B" names the same member as "NS.B" once the
+      // enum's members are members of NS: the base has already collapsed to "NS.E1", which is not a
+      // namespace, so the chain stopped there and read as a record field - 0. Drop the middle component
+      // when what is left IS a namespace that has the member.
+      if (Ctx.NamespaceNames.IndexOf(BaseName) < 0) and (LastDelimiter('.', BaseName) > 0) then
+      begin
+        Qual := Copy(BaseName, 1, LastDelimiter('.', BaseName) - 1);
+        if (Ctx.NamespaceNames.IndexOf(Qual) >= 0) and
+           Ctx.IsMember(Qual, UpperCase(VarToStr(Node.Value))) then
+          BaseName := Qual;
+      end;
       if Ctx.NamespaceNames.IndexOf(BaseName) >= 0 then
       begin
         Mangled := BaseName + '.' + UpperCase(VarToStr(Node.Value));

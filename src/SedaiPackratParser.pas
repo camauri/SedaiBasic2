@@ -10318,6 +10318,15 @@ begin
   begin
     Result.Value := UpperCase(VarToStr(Context.CurrentToken.Value));   // enum type name
     Context.Advance;
+    // FreeBASIC "Enum <name> Explicit": the members are reachable ONLY through the enum's name. Left
+    // unconsumed, the word was read as the FIRST MEMBER and the real members stayed plain globals - so
+    // an explicit enum's B shadowed the B of an ordinary one declared beside it.
+    if Context.Check(ttIdentifier) and
+       (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXPLICIT') then
+    begin
+      Result.Attributes.Values['EXPLICIT'] := '1';
+      Context.Advance;
+    end;
   end;
   if Context.Check(ttAsType) then
   begin
