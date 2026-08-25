@@ -9961,6 +9961,16 @@ begin
         // DIM'd with a different type in another scope (the global type table is first-declaration-wins).
         CheckInstantiable(FUDTs[RecUDTIdx].Name);     // OOP: an unimplemented ABSTRACT refuses here
         RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
+        // ⛔⛔ ...AND THE TYPE, not only the bank. The comment above named the hazard - "the global type
+        // table is first-declaration-wins" - and only the BANK was protected from it. The type table is
+        // what every FIELD ACCESS reads, so with two scopes declaring the same name as two different
+        // UDTs the record was ALLOCATED as one type and ACCESSED with the other's byte offsets: an
+        // eight-byte store at offset 10 into a four-byte record. In a release build that is a HEAP
+        // CORRUPTION - the program printed everything and died at exit with "Invalid pointer operation".
+        // Lowering runs in source order, so re-pointing the map AT THE DECLARATION gives each scope its
+        // own answer without a per-scope table.
+        // ⇒ A note that names a trap is not a check: the arm right beside it was never visited.
+        FVarRecordType.Values[UpperCase(ArrName)] := RecTypeName;
         EmitInstruction(ssaRecordNew, RecHandleVal,
                         MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
                         MakeSSAConstInt(0),
