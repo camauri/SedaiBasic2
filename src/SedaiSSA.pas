@@ -26406,6 +26406,7 @@ var
   i, bar, slotIdx: Integer;
   VName, TName: string;
   H: TSSAValue;
+  AccessNode: TASTNode;
 begin
   if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
   for i := FModuleRecordVars.Count - 1 downto 0 do
@@ -26426,6 +26427,24 @@ begin
       H := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitXferLoad(srtInt, PtrInt(FModuleDtorSlots.Objects[slotIdx]), H);
       EmitDestructorCall(H, TName);
+    end
+    else if IsSharedScalar(VName) then
+    begin
+      // ⛔ A "DIM SHARED" record does not live in a REGISTER: it is array-backed, and its handle is
+      // element 0 of its 1-element global array. GetOrAllocateVariable answers a register the name was
+      // never bound to here, so the destructor was called on a handle that had never been written -
+      // "XferStoreI R3 -> X0" with R3 undefined, and an Access violation at program exit before the
+      // destructor body ran at all. ⚠️ The very same declaration written "Dim As T g" worked, which is
+      // why nothing in the corpus caught it: at module level the two spellings read the same.
+      // Read through the ONE path that knows how a shared scalar is stored, rather than a second
+      // opinion here.
+      AccessNode := MakeSharedScalarAccess(VName, nil);
+      try
+        ProcessExpression(AccessNode, H);
+        EmitDestructorCall(H, TName);
+      finally
+        AccessNode.Free;
+      end;
     end
     else
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
