@@ -604,6 +604,7 @@ type
     function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
     function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
     function ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
+    function ProcessByrefMethodStore(VarNode, ExprNode: TASTNode): Boolean;   // "obj.m() = expr" through a BYREF result
     // "Cast(T, u) = expr" through a UDT's BYREF cast operator.
     function ProcessCastOperatorStore(CastNode, ExprNode: TASTNode): Boolean;
     // "u = expr" through a UDT's assignment operator ("Operator T.Let").
@@ -737,7 +738,8 @@ type
     function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
-                                ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
+                                ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False;
+                                WantAddress: Boolean = False);   // BYREF result: keep the ADDRESS (lvalue use)
     function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
                                  ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
@@ -2030,6 +2032,7 @@ var
   OpArgs: TASTNode;
   AddrNode: TASTNode;          // VARPTR/PROCPTR: synthesized "@arg" node lowered via the address path
   TempNode: TASTNode;          // "@(*p)": the operand seen through its parentheses
+  ThisAddrNode: TASTNode;      // "@<bare field>": the implicit-THIS rewrite (we free it)
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -2150,6 +2153,21 @@ begin
                         MakeSSALabel(ProcedureLabelName(
                           ResolveMethodLabel(OwnerTypeOfLabel(FCurrentProcName), VarToStr(Node.Value)))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else if (Node.ChildCount = 0) and
+              TryImplicitThisField(VarToStr(Node.Value), Node.Token, ThisAddrNode) then
+      begin
+        // "@_data" inside a method: a bare name that is a field of the owner type means "this.<field>",
+        // and only the spelled-out "@This._data" was understood. The bare spelling fell through to the
+        // PROCEDURE path below, so a module built on it failed outright with "Undefined procedure
+        // (address-of @): _DATA" - fbc's own udt-zstring reference implementation is written that way.
+        // Same rule the read, the write and the BYREF return already carry; the rewrite declines on its
+        // own when a parameter or a local DIM shadows the field, which is what fbc does too.
+        try
+          EmitFieldAddress(ThisAddrNode, Result);
+        finally
+          ThisAddrNode.Free;
+        end;
       end
       else
       begin
@@ -7183,6 +7201,7 @@ procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // assignment — keeps only the managed locals of the common scalar path.
 var
   VarNode, ExprNode, SharedAssign, CastNode, UnwrapAssign: TASTNode;
+  ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
   VarName: string;
   ExprValue, VarReg: TSSAValue;
   CopyOp: TSSAOpCode;
@@ -7531,6 +7550,20 @@ begin
       // the caller's variable, the min(a,b)=0 idiom); any other named var returns its backing address.
       if IsAddrParam(VarToStr(ExprNode.Value)) then
         EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(ExprNode.Value))))
+      // ...and a bare FIELD name, which inside a method body means "this.<field>". Only the spelled-out
+      // "This.f" reached the field branch below, so "Operator Cast() ByRef As ZString : Function = _data"
+      // asked EmitVarAddress for a variable that does not exist and staged 0 - which the caller then
+      // dereferenced. The implicit-THIS rewrite stands aside on its own when a param or a local DIM
+      // shadows the field, so it is safe to try before the plain-variable reading.
+      else if TryImplicitThisField(VarToStr(ExprNode.Value), ExprNode.Token, ThisFieldNode) then
+      begin
+        try
+          EmitFieldAddress(ThisFieldNode, ExprValue);
+          EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
+        finally
+          ThisFieldNode.Free;
+        end;
+      end
       else
         EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
       Exit;
@@ -7957,6 +7990,12 @@ begin
   // lvalue below does. This is what the operator is FOR — without it the assignment fell through to the
   // array-store path, which had no array and dropped the write in silence.
   if ProcessIndexOperatorStore(VarNode, ExprNode) then Exit;
+
+  // ...and the same store through a BYREF-returning METHOD, "obj.m() = expr". The free-FUNCTION form
+  // just below has always worked; the method form matched no shape here and the write was dropped in
+  // SILENCE - "t.nref() = 99" left t.n untouched and said nothing. One more place where a rule lived in
+  // one path and not in the other beside it.
+  if ProcessByrefMethodStore(VarNode, ExprNode) then Exit;
 
   // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
   // the referenced variable; store expr through it (parsed like an array access / call target).
@@ -18963,7 +19002,35 @@ begin
   Result := False;
   Lbl := IndexOperatorLabel(VarNode, ObjType);
   if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
-  ProcessMethodCall(VarNode.GetChild(0), ObjType, 'OPERATOR[]', VarNode.GetChild(1), AddrVal);
+  ProcessMethodCall(VarNode.GetChild(0), ObjType, 'OPERATOR[]', VarNode.GetChild(1), AddrVal, False, True);
+  AddrVal := EnsureIntRegister(AddrVal);
+  ProcessExpression(ExprNode, ExprValue);
+  EmitByrefRetStore(AddrVal, ExprValue, Lbl);
+  Result := True;
+end;
+
+function TSSAGenerator.ProcessByrefMethodStore(VarNode, ExprNode: TASTNode): Boolean;
+// "obj.m(args) = expr" where m is declared "ByRef As T": the call yields the referenced variable's
+// ADDRESS and the value is stored through it - the protocol ProcessIndexOperatorStore already uses for
+// "v[i] = expr" and ProcessCastOperatorStore for "Cast(T, u) = expr". A method returning BY VALUE hands
+// back a copy, which is not assignable (fbc rejects it too), so this answers False and emits nothing.
+var
+  ObjType, MethNm, Lbl: string;
+  MemberNode, ArgsNode: TASTNode;
+  AddrVal, ExprValue: TSSAValue;
+begin
+  Result := False;
+  if (VarNode = nil) or (VarNode.NodeType <> antArrayAccess) or (VarNode.ChildCount < 1) then Exit;
+  MemberNode := VarNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  ObjType := ObjectTypeName(MemberNode.GetChild(0));
+  if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
+  MethNm := VarToStr(MemberNode.Value);
+  if VarNode.ChildCount >= 2 then ArgsNode := VarNode.GetChild(1) else ArgsNode := nil;
+  Lbl := ResolveMethodLabelArgs(ObjType, MethNm, ArgsNode);
+  if Lbl = '' then Lbl := ResolveMethodLabel(ObjType, MethNm);
+  if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
+  ProcessMethodCall(MemberNode.GetChild(0), ObjType, MethNm, ArgsNode, AddrVal, False, True);
   AddrVal := EnsureIntRegister(AddrVal);
   ProcessExpression(ExprNode, ExprValue);
   EmitByrefRetStore(AddrVal, ExprValue, Lbl);
@@ -19000,7 +19067,7 @@ begin
     Lbl := ResolveMethodLabel(ObjType, MethNm);
   end;
   if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
-  ProcessMethodCall(Inner, ObjType, MethNm, nil, AddrVal);
+  ProcessMethodCall(Inner, ObjType, MethNm, nil, AddrVal, False, True);
   AddrVal := EnsureIntRegister(AddrVal);
   ProcessExpression(ExprNode, ExprValue);
   EmitByrefRetStore(AddrVal, ExprValue, Lbl);
@@ -19186,9 +19253,7 @@ begin
   Lbl := IndexOperatorLabel(Node, ObjType);
   if Lbl = '' then Exit;
   ProcessMethodCall(Node.GetChild(0), ObjType, 'OPERATOR[]', Node.GetChild(1), Value);
-  if ByrefRetByAddress(Lbl) then
-    Value := EmitByrefRetDeref(EnsureIntRegister(Value), Lbl);
-  Result := True;
+  Result := True;   // the BYREF dereference happens inside ProcessMethodCall now
 end;
 
 function TSSAGenerator.EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
@@ -30425,10 +30490,7 @@ begin
     ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
   end;
   // A cast declared BYREF hands back an ADDRESS - that is what makes "Cast(Integer, u) = 78" possible -
-  // so READING through it has to dereference, exactly as the index operator's read already does. Without
-  // this the value printed was the record-field POINTER itself.
-  if (Lbl <> '') and ByrefRetByAddress(Lbl) then
-    Val := EmitByrefRetDeref(EnsureIntRegister(Val), Lbl);
+  // so READING through it has to dereference. ProcessMethodCall does that for every rvalue now.
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -30471,7 +30533,9 @@ begin
     Lbl := ResolveMethodLabel(SrcType, MethNm);
     if (Lbl <> '') and (UpperCase(CastRetRecType(Lbl)) = UpperCase(DstType)) then
     begin
-      ProcessMethodCall(Node, SrcType, MethNm, nil, Val);
+      // A UDT-returning cast yields the record HANDLE, which is already what the caller copies from:
+      // asking for the address keeps this site byte-identical to what it did before the default moved.
+      ProcessMethodCall(Node, SrcType, MethNm, nil, Val, False, True);
       Result := (Val.Kind <> svkNone);
       if Result then Val := EnsureIntRegister(Val);
       Exit;
@@ -30521,15 +30585,12 @@ begin
   TypeName := ObjectTypeName(Node);                       // UDT type, no code emitted
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   if ResolveMethodLabel(TypeName, 'OPERATORCAST$') = '' then Exit;   // '$' = string-returning cast
-  ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);
-  // ...and the same dereference for a BYREF string cast (see the numeric one).
-  if ByrefRetByAddress(ResolveMethodLabel(TypeName, 'OPERATORCAST$')) then
-    Val := EmitByrefRetDeref(EnsureIntRegister(Val), ResolveMethodLabel(TypeName, 'OPERATORCAST$'));
+  ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);   // BYREF dereferenced inside
   Result := (Val.Kind <> svkNone);
 end;
 
 procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
-  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
+  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False; WantAddress: Boolean = False);
 // Lower obj.method(args): pass the object handle as the implicit THIS first argument, then the
 // declared args. A monomorphic call goes straight to the resolved method; a polymorphic one goes
 // through a generated virtual dispatcher (chosen by the instance's runtime type-id). Read the
@@ -30539,7 +30600,7 @@ var
   i, UDTIdx: Integer;
   RT: TSSARegisterType;
   DestVal, RcHandle: TSSAValue;
-  IsFunc: Boolean;
+  IsFunc, IsByrefRet: Boolean;
   MethodLabel, RetRecType: string;
 begin
   Result := MakeSSAValue(svkNone);
@@ -30633,10 +30694,20 @@ begin
     // bank is, and the callee stages it in the int slot. Reading it back in the pointee's bank looked at
     // the float slot and found nothing: "Operator T.Cast() ByRef As Double" answered 0 while the same
     // operator declared "As Integer" was right, because there the two banks happen to coincide.
-    if ByrefRetByAddress(MethodLabel) then RT := srtInt;
+    IsByrefRet := ByrefRetByAddress(MethodLabel);
+    if IsByrefRet then RT := srtInt;
     DestVal := MakeSSARegister(RT, FProgram.AllocRegister(RT));
     EmitXferLoad(RT, XFER_RESULT_SLOT, DestVal);
-    Result := DestVal;
+    // ...and then READ through that address, because an rvalue wants the VALUE. This used to be left to
+    // the caller, and only THREE callers did it (the index operator and the two Cast helpers): every
+    // other site - a plain "obj.m()", a property GET, an implicit-THIS call - handed the raw pointer on.
+    // A method declared "ByRef As ZString" printed as an integer, and the whole udt-zstring family of the
+    // fbc suite rests on exactly that declaration. The address is still what the LVALUE sites need, so
+    // they ask for it: WantAddress is the opt-out, and the common case is the default.
+    if IsByrefRet and (not WantAddress) then
+      Result := EmitByrefRetDeref(DestVal, MethodLabel)
+    else
+      Result := DestVal;
   end;
 end;
 
@@ -32645,6 +32716,7 @@ var
   ExitLevels, ExitLoopIdx, ExitAllDepth: Integer;  // multi-level EXIT/CONTINUE
   ExitLoopKind: TLoopKind;
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
+  ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
   if Node = nil then Exit;
@@ -33000,6 +33072,18 @@ begin
           if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
              IsAddrParam(VarToStr(Node.GetChild(0).Value)) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(Node.GetChild(0).Value))))
+          // ...and the same field named WITHOUT "This." - see the "f = expr" spelling, which has to
+          // carry the identical rule or one form of an operator works and the other hands back 0.
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
+                  TryImplicitThisField(VarToStr(Node.GetChild(0).Value), Node.GetChild(0).Token, ThisFieldNode) then
+          begin
+            try
+              EmitFieldAddress(ThisFieldNode, RetVal);
+              EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal));
+            finally
+              ThisFieldNode.Free;
+            end;
+          end
           else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
           // ...and an INDEXED byte on the raw heap is just as addressable as a named variable:
