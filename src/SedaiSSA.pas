@@ -795,6 +795,7 @@ type
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
+    procedure ProcessDefaultValue(Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name included
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
@@ -11497,6 +11498,41 @@ begin
     AddrNode.Free;
   end;
   Result := (Val.Kind <> svkNone);
+end;
+
+procedure TSSAGenerator.ProcessDefaultValue(Node: TASTNode; out Val: TSSAValue);
+// Evaluate a PARAMETER's default value. Everywhere else this is exactly ProcessExpression - the one
+// thing it adds is FreeBASIC's bare-type-name form.
+//
+// ⛔ "Sub s( ByRef p As foo = foo )" means "a default-CONSTRUCTED foo", and the parser hands the
+// default over as a bare antIdentifier holding the TYPE name. Lowered as an expression that is an
+// undefined VARIABLE, which reads 0, and the callee then dereferenced handle 0. Written "= foo()" the
+// same declaration worked - the parenthesised form parses as a call and takes the constructor - which
+// is what said the defect was in the SPELLING and not in the default machinery.
+//
+// ⚠️ Both places that fill an omitted argument call this: a SUB/FUNCTION's staging and a
+// CONSTRUCTOR's. One of them knowing the rule and the other not is how the same declaration comes to
+// behave two ways.
+var
+  CallNode: TASTNode;
+begin
+  Val := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) and
+     (FindUDT(UpperCase(VarToStr(Node.Value))) >= 0) and
+     (VarRecordTypeName(VarToStr(Node.Value)) = '') then     // a TYPE name, not a variable of that type
+  begin
+    CallNode := TASTNode.Create(antArrayAccess, Node.Token);
+    try
+      CallNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token));
+      CallNode.AddChild(TASTNode.Create(antExpressionList, Node.Token));
+      ProcessExpression(CallNode, Val);
+    finally
+      CallNode.Free;
+    end;
+    Exit;
+  end;
+  ProcessExpression(Node, Val);
 end;
 
 function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
@@ -25786,7 +25822,7 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 // call inside an argument expression.
 var
   Lbl, ArgSig, UdtSig: string;
-  Decl, ParamList, PNode: TASTNode;
+  Decl, ParamList, PNode, ArrayBindArgs: TASTNode;
   i, Slot, ArgCount, AggUDT: Integer;
   RT: TSSARegisterType;
   ArgVals: array of TSSAValue;
@@ -25843,6 +25879,11 @@ begin
     for i := 0 to ArgCount - 1 do
     begin
       if i + 1 >= ParamList.ChildCount then Break;  // defensive: arity already matched the resolution
+      // ⛔ AN ARRAY PARAMETER IS BOUND, NOT STAGED - it has no scalar transfer slot, so ParamBankAndSlot
+      // answers slot 0, which is where the implicit THIS handle already sits. Staging the argument there
+      // OVERWROTE THIS, and the constructor faulted on its very first field access. StageCallArgs skips
+      // such a parameter for exactly this reason and says so; the constructor's own staging did not.
+      if ParamList.GetChild(i + 1).Attributes.Values['ARRAY'] = '1' then Continue;
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
       // A STRING argument for a byte-POINTER parameter is passed by ADDRESS (see StageCallArgs): the
       // constructor stages its own arguments, so the conversion has to be made here too.
@@ -25868,13 +25909,30 @@ begin
       PNode := ParamList.GetChild(i);
       if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
       begin
-        ProcessExpression(PNode.GetChild(PNode.ChildCount - 1), DefVal);
+        ProcessDefaultValue(PNode.GetChild(PNode.ChildCount - 1), DefVal);
         Slot := ParamBankAndSlot(ParamList, i, RT);
         EmitXferStore(RT, Slot, DefVal);
       end;
     end;
   end;
-  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  // ⛔ ARRAY PARAMETERS ARE BOUND, NOT STAGED. A "<T> Ptr"-free array parameter is passed by ALIASING
+  // the callee's placeholder slot to the caller's array, and every other call shape does it: a plain
+  // SUB/FUNCTION, a UDT-returning function, a METHOD. A CONSTRUCTOR did not, so
+  // "Constructor UDT1( a() As Integer )" ran against an unbound placeholder and UBOUND(a) faulted.
+  // ⚠️ ArrayBindArgs must line up 1:1 with the parameter list, which carries the implicit THIS at
+  // index 0 - so the list handed over gets a placeholder there, exactly as the method site does.
+  ArrayBindArgs := TASTNode.Create(antArgumentList, nil);
+  try
+    ArrayBindArgs.AddChild(TASTNode.CreateWithValue(antLiteral, 0, nil));      // stands in for THIS
+    if ArgsNode <> nil then
+      for i := 0 to ArgsNode.ChildCount - 1 do
+        ArrayBindArgs.AddChild(ArgsNode.GetChild(i).Clone);
+    EmitArrayArgBinds(Lbl, ArrayBindArgs, True);
+    EmitCallSubLabel(ProcedureLabelName(Lbl));
+    EmitArrayArgBinds(Lbl, ArrayBindArgs, False);        // restore the aliased slots after the call
+  finally
+    ArrayBindArgs.Free;
+  end;
   // ⛔ AND PUT THE DYNAMIC TYPE BACK. The constructor that just ran set it to ITS OWN level, which is
   // not necessarily TypeName: ResolveConstructorLabel walks UP the chain, so a derived type with no
   // constructor of its own runs the base's, and the object would stay typed as the BASE for the rest
@@ -32150,7 +32208,7 @@ begin
     ParamI := ParamList.GetChild(i);
     if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
     begin
-      ProcessExpression(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      ProcessDefaultValue(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
       Slot := ParamBankAndSlot(ParamList, i, RT);
       case RT of
         srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
