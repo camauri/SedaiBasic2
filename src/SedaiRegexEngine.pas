@@ -824,13 +824,24 @@ var
   GRegexDiag: Boolean = False;
   GRegexNoFastCopy: Boolean = False;   // REGEX_NOSLAB=1: the A/B arm, see RegexEngineReplace
 
+{$PUSH}{$Q-}{$R-}
 function PatHash(const S: string): Cardinal;
+// ⛔ THE WRAP-AROUND IS THE ALGORITHM. FNV-1a multiplies modulo 2^32 by definition, so a DEBUG build
+// (-Co -Cr) raised a range error on the first pattern ever cached and every regex program died with
+// "Range check error" — EIGHT of the corpus's programs, all on this one line, and none of them had
+// anything wrong with them.
+// ⇒ That is worse than a crash: it makes the debug build useless for the very hunts it exists for.
+// The SSA label pool carries the same hash and the same note; two copies of one algorithm, and both
+// had to be told. Found 25 Aug 2026 by running the whole corpus under the debug build - which is the
+// measurement to repeat, because -Cr and -Co catch out-of-range accesses that a release build turns
+// into silent corruption.
 var i: Integer;
 begin
   Result := 2166136261;
   for i := 1 to Length(S) do
     Result := (Result xor Byte(S[i])) * 16777619;
 end;
+{$POP}
 
 function AcquirePattern(const Pattern: string; out Owned: Boolean;
                         SubjectLen: Integer): TCompiledRegex;

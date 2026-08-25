@@ -190,7 +190,13 @@ type
     FLoopStack: array of TLoopInfo;  // Stack for nested loops
     FUserFunctions: specialize TDictionary<string, TUserFunctionDef>;  // User-defined functions (DEF FN)
     FConstFloatRegs: specialize TDictionary<Integer, Double>;   // Maps float register to constant value
-    FConstIntRegs: specialize TDictionary<Integer, Integer>;    // Maps int register to constant value
+    FConstIntRegs: specialize TDictionary<Integer, Int64>;      // Maps int register to constant value.
+                            // ⛔ Int64, and it has to be: an SSA int constant IS 64-bit, and a 32-bit
+                            // value type TRUNCATED it on the way in - silently in a release build, as a
+                            // range error in a debug one. What reads this map is CONSTANT FOLDING, so a
+                            // truncated constant is not a lost fact but a WRONG one. Found 25 Aug 2026
+                            // by running the whole corpus under the debug build; m289_unsigned64 and
+                            // m446_addr_scalar_raw_typepun were the two that reached it.
     // SUB/FUNCTION declarations (M2). Bodies are NOT lowered at their definition point
     // (they must not run as part of module flow); they are collected here and lowered
     // after the module's END, each into its own block region reachable only via ssaCallSub.
@@ -1029,7 +1035,7 @@ type
     // Constant register tracking helpers
     procedure RecordConstantRegister(const Val: TSSAValue);
     function TryGetConstantFloat(RegIndex: Integer; out ConstValue: Double): Boolean;
-    function TryGetConstantInt(RegIndex: Integer; out ConstValue: Integer): Boolean;
+    function TryGetConstantInt(RegIndex: Integer; out ConstValue: Int64): Boolean;
     procedure InvalidateRegister(RegIndex: Integer; RegType: TSSARegisterType);
 
     // Type conversion helpers
@@ -1191,7 +1197,7 @@ begin
   SetLength(FLoopStack, 0);
   FUserFunctions := specialize TDictionary<string, TUserFunctionDef>.Create;
   FConstFloatRegs := specialize TDictionary<Integer, Double>.Create;
-  FConstIntRegs := specialize TDictionary<Integer, Integer>.Create;
+  FConstIntRegs := specialize TDictionary<Integer, Int64>.Create;
   SetLength(FDeferredProcs, 0);
   FProcedureNames := TStringList.Create;
   FProcedureNames.CaseSensitive := False;
@@ -2055,6 +2061,7 @@ var
   CtorValNode: TASTNode;   // "Type( v )" whose inferred type is BUILT-IN: the single value
   TempFloat: Double;
   TempInt: Integer;
+  TempInt64: Int64;   // an SSA int constant unwrapped from a register: 64-bit, never truncated
   TempStr: string;
   ValCode: Integer;
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
@@ -3275,8 +3282,8 @@ begin
       end
       else if (Left.Kind = svkRegister) and (Left.RegType = srtInt) then
       begin
-        if TryGetConstantInt(Left.RegIndex, TempInt) then
-          Left := MakeSSAConstInt(TempInt);
+        if TryGetConstantInt(Left.RegIndex, TempInt64) then
+          Left := MakeSSAConstInt(TempInt64);
       end;
 
       // Same for Right operand
@@ -3287,8 +3294,8 @@ begin
       end
       else if (Right.Kind = svkRegister) and (Right.RegType = srtInt) then
       begin
-        if TryGetConstantInt(Right.RegIndex, TempInt) then
-          Right := MakeSSAConstInt(TempInt);
+        if TryGetConstantInt(Right.RegIndex, TempInt64) then
+          Right := MakeSSAConstInt(TempInt64);
       end;
 
       // ALWAYS perform basic algebraic simplification (even with optimizations disabled)
@@ -19070,6 +19077,7 @@ end;
 procedure TSSAGenerator.ProcessDelete(Node: TASTNode);
 var
   StartVal, EndVal, StartReg, EndReg: TSSAValue;
+  DelTarget: TASTNode;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -19085,20 +19093,32 @@ begin
   // the statement fell into the line-delete path below and emitted a CLASSIC opcode the VM has no arm
   // for. ⚠️ Invisible with the optimizer ON, which dropped the dead statement: only --no-opt failed, so
   // the corpus caught it as an OPTDIFF rather than as an error.
-  if (Node.ChildCount >= 1) and
-     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress) or
-      ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
-       (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-       ((ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) >= 0) or
-        // ...and "Delete[] p[i]", a CELL of a pointer-to-pointer - the manual's own way of freeing the
-        // second dimension of a 2-dimensional object array (operator/nested_new). The base is a POINTER,
-        // not a declared array, so the array test alone sent it down the line-delete path and emitted
-        // bcDelete - the SAME classic opcode, the SAME silence with the optimizer on, one spelling later.
-        IsRawPtr(VarToStr(Node.GetChild(0).GetChild(0).Value)) or
-        (ManagedPtrPointee(VarToStr(Node.GetChild(0).GetChild(0).Value)) <> '')))) then
+  // ⛔⛔ THE RULE IS INVERTED, and that is the whole point of this rewrite. It used to be a WHITELIST of
+  // node kinds - an identifier, then "@r", then "a(i)", then "p[i]" - and the three comments above
+  // record three separate days on which a new SPELLING of the same statement fell through it, emitted
+  // the CLASSIC line-delete opcode and freed nothing. The fourth was "Delete (p)": parentheses.
+  // ⇒ A whitelist of shapes cannot be finished. The CLASSIC form is the closed one - it attaches
+  //   line-number LITERALS and nothing else - so in MODERN anything that is not a literal is the
+  //   FreeBASIC heap delete. One rule, and no fifth spelling to wait for.
+  // ⚠️ Every one of those days it was INVISIBLE with the optimizer on, which dropped the dead
+  //   instruction: only --no-opt failed. That is the whole reason to run the suite both ways.
+  if (Node.ChildCount >= 1) and FModernMode then
   begin
-    EmitDeleteObject(Node);
-    Exit;
+    DelTarget := Node.GetChild(0);
+    while (DelTarget.NodeType = antParentheses) and (DelTarget.ChildCount >= 1) do
+      DelTarget := DelTarget.GetChild(0);
+    if DelTarget.NodeType <> antLiteral then
+    begin
+      // Parentheses around the target carry no meaning: drop them so EmitDeleteObject sees the pointer.
+      if DelTarget <> Node.GetChild(0) then
+      begin
+        DelTarget := DelTarget.Clone;
+        Node.ClearChildren;
+        Node.AddChild(DelTarget);
+      end;
+      EmitDeleteObject(Node);
+      Exit;
+    end;
   end;
 
   // DELETE [start[-end]]
@@ -30330,6 +30350,35 @@ begin
       EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
+  // "Delete[] This.psbb" / "Delete obj.p": the target is a FIELD that holds the pointer. The field read
+  // yields the handle (or the block address), so destroy and free THAT - the same two shapes the array
+  // element above has, one spelling further out. ⛔ The FIFTH spelling of this statement to be found,
+  // and the first one the inverted rule in ProcessDelete surfaced: before it, this fell into the
+  // line-delete path and freed NOTHING, which is why the manual's udt/operator3 "matched" - the example
+  // does not print what the delete affects.
+  if Node.GetChild(0).NodeType = antMemberAccess then
+  begin
+    // What the field DENOTES: for a "T Ptr" field that is T, which is the same question every
+    // "obj.field->method" already asks. A scalar-pointer field answers '' and is freed as raw bytes.
+    PtrType := UpperCase(ObjectTypeName(Node.GetChild(0)));
+    ProcessExpression(Node.GetChild(0), HandleReg);
+    HandleReg := EnsureIntRegister(HandleReg);
+    if (PtrType <> '') and (FindUDT(PtrType) >= 0) then
+    begin
+      if (Node.Attributes.Values['NEWARRAY'] = '1') and UDTBlockIsManaged(PtrType) then
+      begin
+        CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+        Exit;
+      end;
+      EmitDestructorCall(HandleReg, PtrType);
+      EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if Node.GetChild(0).NodeType <> antIdentifier then
     raise Exception.Create('DELETE expects a pointer variable');
   PtrName := VarToStr(Node.GetChild(0).Value);
@@ -35007,7 +35056,7 @@ begin
   Result := FConstFloatRegs.TryGetValue(RegIndex, ConstValue);
 end;
 
-function TSSAGenerator.TryGetConstantInt(RegIndex: Integer; out ConstValue: Integer): Boolean;
+function TSSAGenerator.TryGetConstantInt(RegIndex: Integer; out ConstValue: Int64): Boolean;
 begin
   Result := FConstIntRegs.TryGetValue(RegIndex, ConstValue);
 end;
