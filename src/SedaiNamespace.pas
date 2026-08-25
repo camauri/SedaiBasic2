@@ -42,6 +42,12 @@ type
   TNsContext = class
     NamespaceNames: TStringList;   // every effective namespace prefix (UPPER), e.g. FORMS, OUTER.INNER
     MemberKeys: TStringList;       // "PREFIX|MEMBER" for each declared member (membership test)
+    GlobalNames: TStringList;      // names declared at MODULE level, outside every namespace.
+                                   // ⛔ They WIN over a name a USING imported: fbc resolves an
+                                   // unqualified reference against the global scope before the
+                                   // imported ones, so "Dim Shared v" beside "Using A" (which also
+                                   // has a v) means the global v. Without this the import silently
+                                   // took over a name the program had declared itself.
     constructor Create;
     destructor Destroy; override;
     function IsMember(const Prefix, Name: string): Boolean;
@@ -55,12 +61,16 @@ begin
   MemberKeys := TStringList.Create;
   MemberKeys.Duplicates := dupIgnore;
   MemberKeys.Sorted := True;
+  GlobalNames := TStringList.Create;
+  GlobalNames.Duplicates := dupIgnore;
+  GlobalNames.Sorted := True;
 end;
 
 destructor TNsContext.Destroy;
 begin
   NamespaceNames.Free;
   MemberKeys.Free;
+  GlobalNames.Free;
   inherited Destroy;
 end;
 
@@ -229,10 +239,14 @@ end;
 
 // Resolve an unqualified member name V against the active prefix chain (innermost first). Returns
 // the mangled "PREFIX.V" if V is a member of some enclosing namespace, else ''.
-function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext): string;
+function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext;
+                            Using: TStringList): string;
+// ...and then against the namespaces a USING has brought into scope. Tried AFTER the enclosing chain,
+// so a name of the namespace one is written INSIDE always wins over an imported one - which is what
+// fbc does and the only order that keeps an existing program's meaning.
 var
   P: string;
-  DotPos: Integer;
+  DotPos, u: Integer;
 begin
   Result := '';
   P := ActivePrefix;
@@ -243,6 +257,46 @@ begin
     if DotPos = 0 then Break;
     P := Copy(P, 1, DotPos - 1);
   end;
+  // ⛔ ...but a MODULE-LEVEL name of the program's own wins over every import: fbc resolves an
+  // unqualified reference against the global scope first. "Dim Shared v" beside a "Using A" that also
+  // has a v means the global v, and without this test the import silently took the name over.
+  if (Using <> nil) and (Ctx.GlobalNames.IndexOf(V) < 0) then
+    for u := 0 to Using.Count - 1 do
+      if Ctx.IsMember(Using[u], V) then Exit(Using[u] + '.' + V);
+end;
+
+function FlattenDottedName(Node: TASTNode): string;
+// Render a member-access chain "A.B.C" as the dotted string a namespace prefix is spelled with, or ''
+// when the chain is not made of plain names. Used to read "Using Outer.Inner".
+begin
+  Result := '';
+  if Node = nil then Exit;
+  if Node.NodeType = antIdentifier then Exit(VarToStr(Node.Value));
+  if (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  Result := FlattenDottedName(Node.GetChild(0));
+  if Result = '' then Exit;
+  Result := Result + '.' + VarToStr(Node.Value);
+end;
+
+function UsingDirectiveName(Node: TASTNode; Ctx: TNsContext): string;
+// The namespace a "Using N" statement names, or '' when this is not one.
+// ⛔ "USING" IS NOT PARSED AS A DIRECTIVE AT ALL: at statement level it is routed to PRINT USING (the
+// Commodore format clause), so it arrives here as antPrintUsing with the namespace name as its only
+// child. That is enough to tell the two apart without touching the parser - a real PRINT USING carries
+// a format STRING, and this one carries a name that IS a declared namespace. If no namespace of that
+// name exists the node is left exactly as it was.
+var
+  Nm: string;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antPrintUsing) or (Node.ChildCount <> 1) then Exit;
+  if Node.GetChild(0).NodeType = antIdentifier then
+    Nm := UpperCase(VarToStr(Node.GetChild(0).Value))
+  else if Node.GetChild(0).NodeType = antMemberAccess then
+    Nm := UpperCase(FlattenDottedName(Node.GetChild(0)))
+  else
+    Exit;
+  if (Nm <> '') and (Ctx.NamespaceNames.IndexOf(Nm) >= 0) then Result := Nm;
 end;
 
 // PASS 2 — rewrite references (and member declaration names) bottom-up. Returns the node to use in
@@ -250,12 +304,14 @@ end;
 // ActivePrefix = current namespace ('' at module level). Shadow = names bound as params/locals of
 // the enclosing procedure (not to be prefixed). The caller owns freeing a replaced node.
 function RewriteRefs(Node: TASTNode; const ActivePrefix: string;
-                     Shadow: TStringList; Ctx: TNsContext): TASTNode;
+                     Shadow: TStringList; Ctx: TNsContext; Using: TStringList): TASTNode;
 var
   i: Integer;
   ChildPrefix, BaseName, Mangled, V: string;
   NewNode, BaseId: TASTNode;
-  UseShadow: TStringList;
+  UseShadow, UseUsing: TStringList;
+  Drop: array of Integer;
+  UsingNs: string;
   SigPos: Integer;
   BaseV, SigV: string;
 begin
@@ -277,15 +333,38 @@ begin
   end;
 
   // Recurse into children first (bottom-up), replacing each in place if needed.
+  // ⭐ A "Using N" seen among the children brings N into scope FOR THE CHILDREN THAT FOLLOW IT, and only
+  // within this node - which is exactly FreeBASIC's rule and needs no new machinery: the imported prefix
+  // joins the chain ResolveUnqualified already walks. The directive itself is then DROPPED, so nothing
+  // downstream ever sees a stray PRINT USING that would take the next PRINT's format with it.
+  UseUsing := Using;
+  SetLength(Drop, 0);
   for i := 0 to Node.ChildCount - 1 do
   begin
-    NewNode := RewriteRefs(Node.GetChild(i), ChildPrefix, UseShadow, Ctx);
+    UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx);
+    if UsingNs <> '' then
+    begin
+      if UseUsing = Using then
+      begin
+        UseUsing := TStringList.Create;
+        if Using <> nil then UseUsing.Assign(Using);
+      end;
+      if UseUsing.IndexOf(UsingNs) < 0 then UseUsing.Add(UsingNs);
+      SetLength(Drop, Length(Drop) + 1);
+      Drop[High(Drop)] := i;
+      Continue;
+    end;
+    NewNode := RewriteRefs(Node.GetChild(i), ChildPrefix, UseShadow, Ctx, UseUsing);
     if NewNode <> Node.GetChild(i) then
       ReplaceChildAt(Node, i, NewNode);   // frees the old child, installs the rewritten one
   end;
+  for i := High(Drop) downto 0 do
+    Node.RemoveChildAt(Drop[i]);          // the directive has done its work; it is not a statement
 
   if UseShadow <> Shadow then
     UseShadow.Free;
+  if UseUsing <> Using then
+    UseUsing.Free;
 
   // antTypeDecl name lives in Value (not a child identifier): mangle it here.
   if (Node.NodeType = antTypeDecl) and (ActivePrefix <> '') then
@@ -340,11 +419,16 @@ begin
       BaseV := V;
       SigV := '';
     end;
-    if (Pos('.', BaseV) = 0) and (BaseV <> '') and (ActivePrefix <> '') and
+    // ⛔ ...or a USING has brought a namespace into scope. The test used to be "we are INSIDE a
+    // namespace" (ActivePrefix <> ''), which is right for the enclosing-chain rule and wrong the moment
+    // an import exists: a "Using N" at MODULE level leaves the active prefix empty, so the whole
+    // prefixing branch was skipped and the imported names resolved to nothing at all.
+    if (Pos('.', BaseV) = 0) and (BaseV <> '') and
+       ((ActivePrefix <> '') or ((Using <> nil) and (Using.Count > 0))) and
        (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
        ((Shadow = nil) or (Shadow.IndexOf(BaseV) < 0)) then
     begin
-      Mangled := ResolveUnqualified(ActivePrefix, BaseV, Ctx);
+      Mangled := ResolveUnqualified(ActivePrefix, BaseV, Ctx, Using);
       if Mangled <> '' then Node.Value := Mangled + SigV;
     end;
   end;
@@ -388,13 +472,18 @@ end;
 procedure FlattenNamespaces(AST: TASTNode);
 var
   Ctx: TNsContext;
+  gi: Integer;
 begin
   if AST = nil then Exit;
   Ctx := TNsContext.Create;
   try
     CollectNamespaces(AST, '', Ctx);
     if Ctx.NamespaceNames.Count = 0 then Exit;   // no namespaces: nothing to do
-    RewriteRefs(AST, '', nil, Ctx);
+    // The names the program declares at MODULE level, so an import cannot take one over.
+    for gi := 0 to AST.ChildCount - 1 do
+      if AST.GetChild(gi).NodeType <> antNamespace then
+        CollectShadowNames(AST.GetChild(gi), Ctx.GlobalNames);
+    RewriteRefs(AST, '', nil, Ctx, nil);
     HoistNamespaces(AST);
   finally
     Ctx.Free;
