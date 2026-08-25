@@ -133,7 +133,8 @@ type
     procedure ClearTypeMethodDefaults;
 
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
-                               WithTypeNames: Boolean = False): string;
+                               WithTypeNames: Boolean = False;
+                               PtrKinds: Boolean = False): string;   // CONSTRUCTORS only: see the body
     procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 
     // Dialect profile application + the per-dialect statement handlers it installs.
@@ -469,7 +470,7 @@ end;
 function IsBuiltinTypeName(const N: string): Boolean; forward;
 
 function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
-                                          WithTypeNames: Boolean): string;
+                                          WithTypeNames: Boolean; PtrKinds: Boolean): string;
 // One bank character per explicit parameter -- 'S' string, 'F' float, 'I' everything else (integers,
 // pointers and UDT handles, which are int handles). This is the scheme that tells "g(As Long)" from
 // "g(As Single)" apart, and the one a call site can reproduce from its arguments' banks.
@@ -512,6 +513,15 @@ var
     else if (TN = 'INT32') then Result := '9'
     else if (TN = 'UINT32') then Result := 'A'
     else if (TN = 'BOOLEAN') then Result := 'B'
+    // ⭐ 'Z' / 'W': a ZSTRING PTR and a WSTRING PTR parameter. Both sign the bank 'I' - every pointer
+    // does - so a type declaring one CONSTRUCTOR for each shared ONE label and the second was silently
+    // discarded; fbc's own udt-zstring reference implementation declares exactly that pair, and the
+    // argument then arrived as 0. ⛔ CONSTRUCTORS ONLY (PtrKinds), and that is the ORACLE's rule, not a
+    // shortcut: fbc REFUSES two SUBs that differ only this way ("error 4: Duplicated definition") while
+    // accepting the two constructors. Handing SUBs the same distinction would invent an overload set
+    // fbc does not have.
+    else if PtrKinds and (TN = 'ZSTRING PTR') then Result := 'Z'
+    else if PtrKinds and (TN = 'WSTRING PTR') then Result := 'W'
     else Result := '-';
   end;
 
@@ -2965,7 +2975,7 @@ begin
     ApplyDeclaredDefaults(QualName, ParamList, FTypeStaticMethods.IndexOf(QualName) < 0);
 
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
-    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True);   // True: skip the implicit THIS
+    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True, True);   // True: skip the implicit THIS
 
   Result.AddChild(ParamList);
 

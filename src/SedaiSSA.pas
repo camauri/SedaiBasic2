@@ -449,9 +449,11 @@ type
     function MaskToDeclaredWidth(const Val: TSSAValue; ArgNode: TASTNode): TSSAValue;
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
-    function ArgWidthSigFromArgs(ArgsNode: TASTNode): string;  // declared-width tail of a call's arguments
+    function ArgWidthSigFromArgs(ArgsNode: TASTNode; PtrKinds: Boolean = False): string;
+    function ArgPtrKindChar(Node: TASTNode): Char;   // 'Z'/'W' for text a pointer parameter would receive  // declared-width tail of a call's arguments
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
-    function SigBankPart(const Sig: string): string;            // the bank chars of a signature = its parameter count
+    function SigBankPart(const Sig: string): string;
+    function SigWidthPart(const Sig: string): string;   // ...and the WIDTH tail after '%'            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
     function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
     function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
@@ -789,6 +791,7 @@ type
     function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
+    function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
@@ -11433,6 +11436,37 @@ begin
   // dereferenced it.
   if not Result then
     Result := InferExprBank(ArgNode) = srtString;
+end;
+
+function TSSAGenerator.TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;
+// A "WSTRING * n" variable given to a "WSTRING PTR" parameter: FreeBASIC passes its ADDRESS, and the
+// pointee is UCS-2 - which is the raw buffer MarkFixedWStringVars backs such a variable with.
+//
+// ⛔ IT IS NOT THE ZSTRING CONVERSION. That one (IsStringArgForBytePtrParam) hands over SADD, the byte
+// address of the MANAGED string, whose bytes are UTF-8; the callee's wide dereference reads them as
+// UCS-2 and gets nonsense - or, on an address the raw heap does not own, raises. "t(w)" died where the
+// same call written "t(@w)" worked, and that difference is the whole diagnosis.
+//
+// Lowered by building the "@name" the program could have written, so the address comes from the ONE
+// place that knows how to produce it rather than from a second opinion here. Answers False, emitting
+// nothing, for every other shape - so no other conversion changes.
+var
+  AddrNode: TASTNode;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
+  if (ParamNode.GetChild(0).NodeType <> antIdentifier) or
+     (UpperCase(VarToStr(ParamNode.GetChild(0).Value)) <> 'WSTRING PTR') then Exit;
+  if ArgNode.NodeType <> antIdentifier then Exit;
+  if not IsWStringVar(VarToStr(ArgNode.Value)) then Exit;
+  AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token);
+  try
+    ProcessExpression(AddrNode, Val);
+  finally
+    AddrNode.Free;
+  end;
+  Result := (Val.Kind <> svkNone);
 end;
 
 function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
@@ -23803,7 +23837,43 @@ begin
     end;
 end;
 
-function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode): string;
+function TSSAGenerator.ArgPtrKindChar(Node: TASTNode): Char;
+// 'Z' or 'W' when the argument is - or points at - ZSTRING / WSTRING text, '-' when nothing here says.
+// It is the call site's half of the 'Z'/'W' width codes ProcSigFromParams writes for a CONSTRUCTOR's
+// pointer parameters, and the two must read the same fact: a declaration says "ZSTRING PTR", an
+// argument is a fixed-length ZSTRING variable, its address, or a pointer whose declared pointee is one.
+var
+  N: TASTNode;
+  Pt: string;
+begin
+  Result := '-';
+  if Node = nil then Exit;
+  N := Node;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  // "@x": what is judged is the thing whose address is taken, not the address.
+  if N.NodeType = antProcAddress then
+  begin
+    if N.ChildCount >= 1 then
+      N := N.GetChild(0)
+    else if VarToStr(N.Value) <> '' then
+    begin
+      if IsWStringVar(VarToStr(N.Value)) then Exit('W');
+      Exit('Z');                       // a byte-string variable, or the address of a literal
+    end;
+  end;
+  // A pointer VARIABLE or PARAMETER passed straight on ("Base(s)" inside a constructor): its declared
+  // pointee decides, and that is the only thing that can - the staged value is just an integer.
+  if N.NodeType = antIdentifier then
+  begin
+    Pt := UpperCase(PointeeTypeOf(VarToStr(N.Value)));
+    if Pt = 'WSTRING' then Exit('W');
+    if Pt = 'ZSTRING' then Exit('Z');
+  end;
+  if IsWStringExpr(N) then Exit('W');
+  if InferExprBank(N) = srtString then Exit('Z');
+end;
+
+function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode; PtrKinds: Boolean): string;
 // The DECLARED-WIDTH tail of a call's arguments, in the alphabet ProcSigFromParams uses: one character
 // per argument ('1'..'9','A','B' for the narrow/specific types, '-' for a full 64-bit one or for an
 // expression whose width cannot be derived). Returns '' when every argument is a placeholder - the case
@@ -23816,11 +23886,24 @@ function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode): string;
 // which would happily pick a different overload of the same parameter count.
 var
   i, W: Integer;
+  PK: Char;
 begin
   Result := '';
   if ArgsNode = nil then Exit;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
+    // A CONSTRUCTOR's pointer parameters carry 'Z' / 'W' instead of a numeric width - see ArgPtrKindChar
+    // and the matching branch in ProcSigFromParams. Asked FIRST, because a text argument has no numeric
+    // width of its own and would otherwise report a placeholder.
+    if PtrKinds then
+    begin
+      PK := ArgPtrKindChar(ArgsNode.GetChild(i));
+      if PK <> '-' then
+      begin
+        Result := Result + PK;
+        Continue;
+      end;
+    end;
     W := OperandWidthCode(ArgsNode.GetChild(i));
     // ⛔ A SINGLE IS NOT IN THAT REGISTRY. OperandWidthCode answers the narrow-INTEGER width, and a
     // Single is tracked by its own predicate (IsSingleExpr) - which is why "h(As Single)" against
@@ -23857,6 +23940,17 @@ begin
   for i := 1 to Length(Result) do
     if not (Result[i] in ['-', ',']) then Exit;             // at least one real type name: keep the tail
   Result := '';                                             // all placeholders: no tail, as declared
+end;
+
+function TSSAGenerator.SigWidthPart(const Sig: string): string;
+// The WIDTH tail of a label's signature - what follows '%' - or '' when the label carries none. The
+// mirror of SigBankPart, and it exists so the arity fallback can compare tails it cannot match exactly.
+var
+  p: Integer;
+begin
+  Result := '';
+  p := Pos('%', Sig);
+  if p > 0 then Result := Copy(Sig, p + 1, MaxInt);
 end;
 
 function TSSAGenerator.SigBankPart(const Sig: string): string;
@@ -24092,6 +24186,17 @@ begin
     //    reason ResolveMethodLabelArgs gives: with a width tail in play a call can arrive here knowing
     //    its bank and not its width, and "the first of that many parameters" may be another bank.
     Pref := T + '.CONSTRUCTOR#';
+    // ⭐ ...and BEFORE either of them, the WIDTH TAIL, when the call brought one. A text argument signs
+    //    the bank 'S' while a ZSTRING PTR parameter signs 'I', so a call like "Dim As T v = z" can NEVER
+    //    match by bank and always lands here - where "the first ctor of that many parameters" is a coin
+    //    toss between the ZSTRING and the WSTRING overload. The tail is the only thing that tells them
+    //    apart, so it is consulted here too and not only in the exact-match attempts above.
+    if WidthSig <> '' then
+      for k := 0 to FProcedureNames.Count - 1 do
+        if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
+           (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) and
+           (SigWidthPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = WidthSig) then
+          Exit(FProcedureNames[k]);
     for k := 0 to FProcedureNames.Count - 1 do
       if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
          (SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = ArgSig) then
@@ -25654,7 +25759,7 @@ begin
   // values. Without this, "Constructor(v As S)" and "Constructor(v As T)" both resolved to whichever was
   // declared first, and the ctor then read the wrong record's fields.
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
-  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig, ArgWidthSigFromArgs(ArgsNode));
+  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig, ArgWidthSigFromArgs(ArgsNode, True));
   // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
   if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
   if Lbl = '' then
@@ -25694,7 +25799,11 @@ begin
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
       // A STRING argument for a byte-POINTER parameter is passed by ADDRESS (see StageCallArgs): the
       // constructor stages its own arguments, so the conversion has to be made here too.
-      if (RT = srtInt) and (ArgVals[i].RegType = srtString) and
+      // ...and the WSTRING half of it, which is a different address (see TryEmitWStringPtrArg). Both
+      // conversions have to be in BOTH staging paths, or a constructor converts where a SUB does not.
+      if (RT = srtInt) and TryEmitWStringPtrArg(ParamList.GetChild(i + 1), ArgsNode.GetChild(i), DefVal) then
+        ArgVals[i] := DefVal
+      else if (RT = srtInt) and (ArgVals[i].RegType = srtString) and
          IsStringArgForBytePtrParam(ParamList.GetChild(i + 1), ArgsNode.GetChild(i)) then
       begin
         DefVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -27218,6 +27327,56 @@ begin
     MarkAddressTaken(Node.GetChild(i), Dict, InProc);
 end;
 
+function AnyWStringPtrParam(Node: TASTNode): Boolean;
+// True if ANY procedure in the program declares a "WSTRING PTR" parameter. It is the gate on the
+// marking below, so a program without one keeps byte-identical output.
+var
+  i: Integer;
+  P: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  if Node.NodeType = antParameterList then
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      P := Node.GetChild(i);
+      if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) and
+         (UpperCase(VarToStr(P.GetChild(0).Value)) = 'WSTRING PTR') then Exit(True);
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    if AnyWStringPtrParam(Node.GetChild(i)) then Exit(True);
+end;
+
+procedure MarkFixedWStringVars(Node: TASTNode; Dict: TStringList);
+// Mark every "DIM w AS WSTRING * n" as address-taken, so it is backed by a real UCS-2 BUFFER.
+//
+// ⛔ WHY IT HAS TO BE THE BUFFER. FreeBASIC passes such a variable to a "WSTRING PTR" parameter by
+// ADDRESS, and the pointee is UCS-2. The conversion we do for a ZSTRING PTR - SADD, the byte address
+// of the managed string - hands over UTF-8 instead, and the callee's wide dereference read it as
+// UCS-2: "Sub t(ByVal s As Const WString Const Ptr)" called as "t(w)" died on the first "*s", while
+// the very same call written "t(@w)" worked, because THAT spelling makes the variable address-taken
+// and RawZStringBufBytes gives it (n+1)*2 bytes of exactly the right encoding.
+//
+// ⚠️ CONSERVATIVE ON PURPOSE, and the reason is the pipeline order: this pass runs BEFORE the
+// procedure declarations are collected, so an argument cannot be matched to its parameter's type here.
+// Rather than duplicate that collection, every fixed-length WSTRING in such a program is backed. The
+// cost is one raw buffer per variable and NOTHING observable - an @-taken WSTRING reads, writes, LENs
+// and MIDs exactly as a plain one - and the gate above keeps every other program untouched.
+var
+  i: Integer;
+begin
+  if (Node = nil) or (Dict = nil) then Exit;
+  if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (Node.GetChild(1).NodeType = antIdentifier) and
+     (UpperCase(VarToStr(Node.GetChild(1).Value)) = 'WSTRING') and
+     (StrToIntDef(Node.Attributes.Values['FIXEDLEN'], -1) > 0) then
+    if Dict.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0 then
+      Dict.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  for i := 0 to Node.ChildCount - 1 do
+    MarkFixedWStringVars(Node.GetChild(i), Dict);
+end;
+
 function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;
 // True if Node is a FUNCTION declared BYREF-return ("FUNCTION f() BYREF AS T") with at least one
 // explicit-BYREF parameter — the shape that can return a reference to one of its parameters.
@@ -27343,6 +27502,10 @@ begin
     GatherByrefRetFuncNames(Node, ByrefRetNames);
     if ByrefRetNames.Count > 0 then
       MarkByrefRetCallArgs(Node, ByrefRetNames, Dict);   // back the args of byref-return calls
+    // ...and back every fixed-length WSTRING when the program has a WSTRING PTR parameter to pass one
+    // to: the pointee has to be the UCS-2 BUFFER, not the managed string's UTF-8 bytes.
+    if AnyWStringPtrParam(Node) then
+      MarkFixedWStringVars(Node, Dict);
     MarkAddressTaken(Node, Dict);     // mark their DIMs SHARED
   finally
     Dict.Free;
@@ -31826,6 +31989,9 @@ begin
     // string's ADDRESS, which is what SADD/STRPTR yield here. Without it the string register's INDEX was
     // staged into the int slot and the callee dereferenced address 1. A FOR over a UDT iterator built
     // from string literals is exactly this conversion.
+    // A WSTRING variable for a WSTRING PTR parameter: its UCS-2 BUFFER's address, not SADD.
+    else if (RT = srtInt) and TryEmitWStringPtrArg(ParamList.GetChild(i), ArgExpr, ArgVal) then
+      // handled: ArgVal already holds the buffer address
     else if (RT = srtInt) and IsStringArgForBytePtrParam(ParamList.GetChild(i), ArgExpr) then
     begin
       ProcessStringExpression(ArgExpr, ArgVal);

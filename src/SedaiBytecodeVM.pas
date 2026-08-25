@@ -13467,7 +13467,28 @@ begin
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
         // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
         // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
-      if Instr.Immediate = -1 then
+      // ⭐ A NEGATIVE address is not raw memory at all: it is a RECORD-FIELD pointer (RECPTR_TAG,
+      // bit 63), which is what "@obj.field" yields for a MANAGED record. A raw byte address carries
+      // RAWPTR_TAG (bit 62) and so is never negative - the two domains are told apart here exactly as
+      // bcRefLoad*/bcRefStore* already tell them apart. Without this "*Cast(ZString Ptr, @_data)",
+      // which is how fbc's OWN udt-zstring reference implementation reads a fixed-length field, took a
+      // field pointer for a heap offset and raised "Null or invalid raw pointer dereference".
+      // The exact-byte-count form still means "the field's DECLARED width", so the content is padded
+      // with NULs or cut to it; the managed slot holds the content and has no padding of its own.
+      if Ctx.IntRegs[Instr.Src1] < 0 then
+      begin
+        Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
+        Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
+        if Instr.Immediate >= 2 then
+        begin
+          if Length(Ctx.StringRegs[Instr.Dest]) > Instr.Immediate - 2 then
+            Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Dest], 1, Instr.Immediate - 2)
+          else if Length(Ctx.StringRegs[Instr.Dest]) < Instr.Immediate - 2 then
+            Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Dest] +
+              StringOfChar(#0, Instr.Immediate - 2 - Length(Ctx.StringRegs[Instr.Dest]));
+        end;
+      end
+      else if Instr.Immediate = -1 then
         Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
       else if Instr.Immediate >= 2 then
         Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
@@ -13475,7 +13496,14 @@ begin
         Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
     51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING,
         // Imm -1 a MANAGED STRING CELL ("String Ptr" - see RawStrCellSet).
-      if Instr.Immediate = -1 then
+      // ...and the write half of the same discrimination: a negative address is the MANAGED field
+      // itself, so the characters go into its slot rather than into bytes that do not exist.
+      if Ctx.IntRegs[Instr.Src1] < 0 then
+      begin
+        Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
+        Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
+      end
+      else if Instr.Immediate = -1 then
         RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
       else
         RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
