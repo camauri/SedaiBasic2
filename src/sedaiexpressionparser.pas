@@ -2748,8 +2748,23 @@ function TExpressionParser.ParseWithMember(Token: TLexerToken): TASTNode;
 var
   FieldName: string;
 begin
+  // ⭐ FreeBASIC's GLOBAL-SCOPE operator. Outside a WITH block a leading '.' does not want an object:
+  // ".name" means "the name in the GLOBAL namespace", which is how code inside a NAMESPACE reaches a
+  // module-level declaration its own namespace shadows. Answered as the bare identifier, marked so the
+  // namespace flattener leaves it UNMANGLED - which is exactly what "global" means once namespaces are
+  // flattened into prefixed names. fbc's tests/namespace/ uses it throughout (15 of the suite's parse
+  // failures), and before this it was reported as an error.
   if (WithObject = nil) or not HasValidContext then
   begin
+    if Context.Check(ttIdentifier) then
+    begin
+      Result := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Context.CurrentToken.Value)),
+                                         Context.CurrentToken);
+      Result.Attributes.Values['GLOBALSCOPE'] := '1';
+      Context.Advance;
+      DoNodeCreated(Result);
+      Exit;
+    end;
     HandleError('"." with no object (outside a WITH block)', Token);
     Result := nil;
     Exit;

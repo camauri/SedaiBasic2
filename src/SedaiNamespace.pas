@@ -283,7 +283,10 @@ begin
   if (Node.NodeType = antTypeDecl) and (ActivePrefix <> '') then
   begin
     V := UpperCase(VarToStr(Node.Value));
-    if (Pos('.', V) = 0) and Ctx.IsMember(ActivePrefix, V) then
+    // ⛔ ...unless the program asked for the GLOBAL one with a leading '.': that is precisely a request
+    // NOT to be resolved against the enclosing namespace.
+    if (Pos('.', V) = 0) and (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
+       Ctx.IsMember(ActivePrefix, V) then
       Node.Value := ActivePrefix + '.' + V;
     Exit;
   end;
@@ -310,7 +313,12 @@ begin
   if Node.NodeType = antIdentifier then
   begin
     V := UpperCase(VarToStr(Node.Value));
+    // ⛔ ...and GLOBALSCOPE is a request NOT to resolve against the enclosing namespace: ".v" inside a
+    // namespace means the MODULE-LEVEL v. There are two identifier sites in this pass and the rule has
+    // to be in BOTH - with it only in the first, ".g()" (a call, rewritten there) answered the global
+    // one while ".v" (a plain read, rewritten here) still answered the namespace's.
     if (Pos('.', V) = 0) and (V <> '') and (ActivePrefix <> '') and
+       (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
        ((Shadow = nil) or (Shadow.IndexOf(V) < 0)) then
     begin
       Mangled := ResolveUnqualified(ActivePrefix, V, Ctx);
