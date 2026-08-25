@@ -27561,7 +27561,7 @@ procedure TSSAGenerator.CollectDimVarBanks(Node: TASTNode; Dict: TStringList; In
 // pointer-typed DIMs ("type PTR") in FPointerVars (for typing "*p").
 var
   i, k: Integer;
-  Decl: TASTNode;
+  Decl, ArgsNd: TASTNode;
   VNameU, TypeNameU: string;
 begin
   if Node = nil then Exit;
@@ -27606,20 +27606,38 @@ begin
   // ⚠️ This is the defect that made it look as though the string MODEL were in the way: "@z" on
   // a ZString * n has always worked, writing through it included (verified against fbc). Only
   // the registration was missing - a list of positions, not a representation.
+  // ⛔ TWO SHAPES, ONE CALL. The parenthesised spelling "Clear( v, 0, n )" arrives as an array access
+  // (name in child 0, arguments in child 1); the bare STATEMENT "Clear v, 0, n" arrives as a procedure
+  // call (name in Value, arguments in child 0). The lowering already knows both - it says so in its own
+  // comment - and only THIS pass knew one, so a bare "Clear n, 0, 8" on a plain scalar was never
+  // registered as address-taken and died on the "@n" the lowering synthesises: "Undefined procedure
+  // (address-of @): N". The fix is to read the name and the arguments out of either shape, once.
+  ArgsNd := nil;
+  TypeNameU := '';
   if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
      (Node.GetChild(0).NodeType = antIdentifier) then
   begin
     TypeNameU := UpperCase(VarToStr(Node.GetChild(0).Value));
+    ArgsNd := Node.GetChild(1);
+  end
+  else if (Node.NodeType = antProcedureCall) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType in [antArgumentList, antExpressionList]) then
+  begin
+    TypeNameU := UpperCase(VarToStr(Node.Value));
+    ArgsNd := Node.GetChild(0);
+  end;
+  if Assigned(ArgsNd) then
+  begin
     if (TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or
        (TypeNameU = kFBMEMCOPYCLEAR) or (TypeNameU = kCLEAR) then
-      for k := 0 to Node.GetChild(1).ChildCount - 1 do
+      for k := 0 to ArgsNd.ChildCount - 1 do
       begin
         // Which positions are ADDRESSES: (dst, src) for copy/move; 0 and 2 for copyclear; only
         // dst for Clear. The rest are lengths and values, and are read by value.
         if ((TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or (TypeNameU = kCLEAR)) and
            (k > Ord((TypeNameU <> kCLEAR))) then Break;
         if (TypeNameU = kFBMEMCOPYCLEAR) and (k <> 0) and (k <> 2) then Continue;
-        Decl := Node.GetChild(1).GetChild(k);
+        Decl := ArgsNd.GetChild(k);
         // "*p" registers nothing: the address IS already the value of p.
         if Decl.NodeType = antDeref then Continue;
         // ⛔⛔ "q[4]": descend to mark the container ONLY IF IT IS NOT A POINTER. Marking a raw
@@ -28938,6 +28956,15 @@ var
 
 begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  // ⛔ A CONST destination is not writable, and these operations WRITE. fbc refuses "Clear a, 0, n"
+  // on a "Dim As Const Integer a" (sf.net #642) and so does this: the ByRef positions are exactly the
+  // ones an assignment would refuse, so the rule is the assignment's, applied where the address is
+  // taken instead of where a value is stored.
+  if (ArgsNode <> nil) and (ArgsNode.ChildCount >= 1) and
+     (ArgsNode.GetChild(0).NodeType = antIdentifier) and
+     (FConstVars.IndexOf(UpperCase(VarToStr(ArgsNode.GetChild(0).Value))) >= 0) then
+    raise Exception.CreateFmt('Cannot modify a constant: %s is declared As Const.',
+                              [UpperCase(VarToStr(ArgsNode.GetChild(0).Value))]);
   if (FuncU = kFBMEMCOPY) or (FuncU = kFBMEMMOVE) then
   begin
     // ...over MANAGED storage first: a record or a fixed-length string field has no byte image, and

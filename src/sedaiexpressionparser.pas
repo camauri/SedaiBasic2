@@ -2035,8 +2035,19 @@ begin
     end;
     while (Operand.NodeType = antParentheses) and (Operand.ChildCount >= 1) do
       Operand := Operand.GetChild(0);
-    Result := TASTNode.Create(antProcAddress, Token);
-    Result.AddChild(Operand.Clone);
+    // ⛔ "@( a )" WITH A BARE NAME INSIDE IS "@a", and it has to build the SAME node: the historical
+    // shape carries the name in Value with no child, and every scalar/proc address path downstream
+    // reads it there. Built as a child instead, the name was nowhere the SSA looks and the whole
+    // statement died as "Undefined procedure (address-of @): " with an EMPTY name - the tell that the
+    // node was the right kind and the wrong shape. The parentheses exist for "@(cast(T Ptr, n)->i)",
+    // where they make "->" bind first; around a name they carry no meaning at all.
+    if Operand.NodeType = antIdentifier then
+      Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Operand.Value)), Token)
+    else
+    begin
+      Result := TASTNode.Create(antProcAddress, Token);
+      Result.AddChild(Operand.Clone);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
