@@ -343,6 +343,7 @@ type
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
+    FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
@@ -1234,6 +1235,9 @@ begin
   FRawUDTPtrs.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
   FBlockManagedTypes := TStringList.Create;
+  FConstDeclSeen := TStringList.Create;
+  FConstDeclSeen.Sorted := True;
+  FConstDeclSeen.Duplicates := dupIgnore;
   FBlockManagedTypes.Sorted := True;
   FBlockManagedTypes.Duplicates := dupIgnore;
   FWStringVars := TStringList.Create;
@@ -1334,6 +1338,7 @@ begin
   FRefVars.Free;
   FRawPtrVars.Free;
   FBlockManagedTypes.Free;
+  FConstDeclSeen.Free;
   FRawUDTPtrs.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
@@ -26466,6 +26471,7 @@ var
   ElemBank: TSSARegisterType;
   ConstFoldVal: Int64;
   ConstIsInt: Boolean;
+  ConstDupIdx: Integer;   // a CONST name declared twice: the entry to withdraw
 begin
   if Node = nil then Exit;
   // Do not descend into procedure bodies: DIM SHARED (and a module-level CONST, which lowers to a
@@ -26495,8 +26501,30 @@ begin
         // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
         ConstIsInt := (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
                       TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal);
+        // ⛔ ...BUT ONLY WHEN THE NAME IS DECLARED ONCE. This map is keyed by NAME with no scope, and it
+        // is filled by a pre-scan over the WHOLE program, so two sibling SCOPEs each declaring "Const k"
+        // left the LAST value in it - and every read of k folded to that, retroactively, including the
+        // ones in the first scope. "Scope: Const k = -1: Print k: End Scope" printed 7 because a later,
+        // unrelated block said so. FreeBASIC scopes a CONST like any other declaration.
+        // ⚠️ The cure here is not to fold, not to guess: a name declared twice keeps the ordinary
+        // variable path, where the DIM assigns each value where it stands and the reads see the one in
+        // force. Real scoping of a CONST is a separate piece of work (the same rung the SCOPE block is
+        // missing for a UDT variable); this stops the fold from making the answer WORSE than no fold.
         if ConstIsInt then
-          FModuleConstVals.Values[VNameU] := IntToStr(ConstFoldVal);
+        begin
+          if FConstDeclSeen.IndexOf(VNameU) >= 0 then
+          begin
+            ConstDupIdx := FModuleConstVals.IndexOfName(VNameU);
+            if ConstDupIdx >= 0 then FModuleConstVals.Delete(ConstDupIdx);   // declared twice: do not fold
+          end
+          else
+          begin
+            FConstDeclSeen.Add(VNameU);
+            FModuleConstVals.Values[VNameU] := IntToStr(ConstFoldVal);
+          end;
+        end
+        else if Decl.Attributes.Values['CONSTDECL'] = '1' then
+          FConstDeclSeen.Add(VNameU);   // a non-int CONST still occupies the name
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
@@ -33536,6 +33564,7 @@ begin
   FByrefRetValue.Clear;
   FRawPtrRetFuncs.Clear;
   FBlockManagedTypes.Clear;
+  FConstDeclSeen.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
