@@ -1144,6 +1144,23 @@ begin
     Exit;
   end;
 
+  // ⭐ A MODERN extension FreeBASIC does NOT reserve - MIN, MAX, CEIL, ROUND, COPYSIGN, SINGLEBITS,
+  // BITSTOSINGLE - used WITHOUT "(" is not a call: those are all FUNCTIONS, so a bare occurrence can
+  // only be the program's own name. fbc compiles "Const MAX = 8 : x = MAX + 1" (it REJECTS ABS/FIX/SGN,
+  // which are reserved there, and we must keep rejecting those); we refused it outright and the whole
+  // file failed to parse. ⚠️ The declaration site already accepted such a name for a PROCEDURE
+  // (IsShadowableExtensionName); a CONST or a variable had no such door, and neither did the USE.
+  if ((UpperCase(Token.Value) = 'MIN') or (UpperCase(Token.Value) = 'MAX') or
+      (UpperCase(Token.Value) = 'CEIL') or (UpperCase(Token.Value) = 'ROUND') or
+      (UpperCase(Token.Value) = 'COPYSIGN') or (UpperCase(Token.Value) = 'SINGLEBITS') or
+      (UpperCase(Token.Value) = 'BITSTOSINGLE'))
+     and not Context.Check(ttDelimParOpen) then
+  begin
+    Result := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+
   Result := TASTNode.CreateWithValue(antFunctionCall, Token.Value, Token);
 
   // FreeBASIC FREEFILE/NOW/TIMER take no argument: accept bare (FREEFILE), as well as FREEFILE(). Attach

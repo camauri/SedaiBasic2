@@ -8438,6 +8438,11 @@ begin
   else
   begin
   // Parse variable name
+  // ⭐ ...and a MODERN extension FreeBASIC does not reserve may be a VARIABLE'S name too. The same
+  // door the PROCEDURE and CONST declarations have; without it "Dim Round As Integer" refused.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected variable name in array declaration', Token);
@@ -10602,6 +10607,13 @@ begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
   Context.Advance; // Consume CONST
+  // ⭐ A MODERN extension FreeBASIC does NOT reserve may be a CONSTANT'S NAME. The rule already
+  // existed for a PROCEDURE name (IsShadowableExtensionName at ParseProcedureDecl) and for a
+  // statement that begins with one; a CONST had no such door, so "Const MAX = 8" - which fbc
+  // compiles - failed the whole file to parse. ⚠️ ABS/FIX/SGN stay reserved, as they are in fbc.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
 
   // FreeBASIC leading-AS typed constant: "CONST AS type name = value" (e.g. "Const As UInteger
   // children = 100"). The alternate spelling of the name-first form below; same lowering to a typed
