@@ -438,7 +438,7 @@ type
     function NestedQualifiedMethod(const TypeName, MethNm: string): string;  // "Sub T.U.proc" label of a nested type's method
     function ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;  // + overloads
     function ResolveConstructorLabel(const TypeName, ArgSig: string;
-                                     const UdtSig: string = ''): string;       // M4.4g: by type signature (+ UDT tail)
+      const UdtSig: string = ''; const WidthSig: string = ''): string;
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
     function CtorSigFromParams(ParamList: TASTNode): string;    // M4.4g: type signature of a ctor's params
     function EnsureStringRegisterOf(const Val: TSSAValue; SrcNode: TASTNode): TSSAValue;  // SINGLE-aware
@@ -448,6 +448,7 @@ type
     function MaskToDeclaredWidth(const Val: TSSAValue; ArgNode: TASTNode): TSSAValue;
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
+    function ArgWidthSigFromArgs(ArgsNode: TASTNode): string;  // declared-width tail of a call's arguments
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
     function SigBankPart(const Sig: string): string;            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
@@ -23719,6 +23720,41 @@ begin
     end;
 end;
 
+function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode): string;
+// The DECLARED-WIDTH tail of a call's arguments, in the alphabet ProcSigFromParams uses: one character
+// per argument ('1'..'9','A','B' for the narrow/specific types, '-' for a full 64-bit one or for an
+// expression whose width cannot be derived). Returns '' when every argument is a placeholder - the case
+// where the declaration carries no width tail either.
+//
+// ⛔ THE CODES MUST BE THE SAME ONES the parser wrote, and they are: both sides read TypeNameWidthCode's
+// numbering, the parser from the declared type name and this from OperandWidthCode, which is the derived
+// answer the print form and the unsigned-opcode selection already share. Two spellings of the same fact
+// would be two facts, and a tail the call site can never match pushes the call onto the ARITY fallback -
+// which would happily pick a different overload of the same parameter count.
+var
+  i, W: Integer;
+begin
+  Result := '';
+  if ArgsNode = nil then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+  begin
+    W := OperandWidthCode(ArgsNode.GetChild(i));
+    // ⛔ A SINGLE IS NOT IN THAT REGISTRY. OperandWidthCode answers the narrow-INTEGER width, and a
+    // Single is tracked by its own predicate (IsSingleExpr) - which is why "h(As Single)" against
+    // "h(As Double)" still picked the first declaration after the width tail was in place: the two
+    // sign the same bank 'F', and the call site was reporting no width at all. Asked here rather than
+    // widened inside OperandWidthCode, whose callers (CSIGN/CUNSG, the print form) mean integers.
+    if (W = 0) and IsSingleExpr(ArgsNode.GetChild(i)) then W := 7;
+    if (W >= 1) and (W <= 9) then Result := Result + Chr(Ord('0') + W)
+    else if W = 10 then Result := Result + 'A'
+    else if W = 11 then Result := Result + 'B'
+    else Result := Result + '-';
+  end;
+  for i := 1 to Length(Result) do
+    if Result[i] <> '-' then Exit;      // at least one real width: keep the tail
+  Result := '';                         // all placeholders: no tail, as declared
+end;
+
 function TSSAGenerator.ArgUdtSigFromArgs(ArgsNode: TASTNode): string;
 // The UDT-type tail of a call's arguments, in the alphabet the declaration's label uses: the record type
 // name of each argument that IS a record, '-' for every other one (the tail is POSITIONAL). Returns ''
@@ -23757,6 +23793,10 @@ begin
   p := Pos(':', Result);
   if p > 0 then Result := Copy(Result, 1, p - 1);
   q := Pos('!', Result);
+  if q > 0 then Result := Copy(Result, 1, q - 1);
+  // ...and there is now a THIRD, '%', for the declared WIDTHS. Every tail that is added has to be
+  // subtracted HERE, or the arity fallback counts the tail's characters as parameters.
+  q := Pos('%', Result);
   if q > 0 then Result := Copy(Result, 1, q - 1);
 end;
 
@@ -23803,13 +23843,50 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 //      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, UdtSig, ConstSig, Pref: string;
+  Sig, UdtSig, ConstSig, WidthSig, Pref, Cand: string;
   k: Integer;
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
   ConstSig := ArgConstSigFromArgs(ArgsNode);
+  WidthSig := ArgWidthSigFromArgs(ArgsNode);
+  if GetEnvironmentVariable('OVL_DIAG') = '1' then
+    WriteLn(ErrOutput, 'OVL: ', BaseLabel, ' sig="', Sig, '" udt="', UdtSig, '" const="', ConstSig,
+            '" width="', WidthSig, '"');
+  // ⭐ THE DECLARED WIDTH FIRST, when there is one. It is the only thing that tells "g(As Long)" from
+  // "g(As Integer)": both sign the bank 'I', so before this the two collided and the FIRST declaration
+  // won every call. Tried ahead of the other tails and then abandoned, so an overload set without a
+  // narrow parameter takes exactly the path it took before.
+  if WidthSig <> '' then
+  begin
+    if ConstSig <> '' then
+    begin
+      if UdtSig <> '' then
+      begin
+        Result := BaseLabel + '~' + Sig + ':' + UdtSig + '!' + ConstSig + '%' + WidthSig;
+        if FProcDecls.ContainsKey(Result) then Exit;
+      end;
+      Result := BaseLabel + '~' + Sig + '!' + ConstSig + '%' + WidthSig;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    if UdtSig <> '' then
+    begin
+      Result := BaseLabel + '~' + Sig + ':' + UdtSig + '%' + WidthSig;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    Result := BaseLabel + '~' + Sig + '%' + WidthSig;
+    if FProcDecls.ContainsKey(Result) then Exit;
+  end;
+  // ⚠️ AND THE ALL-PLACEHOLDER FORM. An argument of full width contributes '-', and a set that has ANY
+  // narrow member carries a tail on EVERY member - so the Integer overload of a Long/Integer pair signs
+  // "%-" and is reached only by asking for it. Without this line "g(n)" fell through to the arity
+  // fallback, which is precisely where the wrong overload lives.
+  if (Sig <> '') and (WidthSig = '') then
+  begin
+    Result := BaseLabel + '~' + Sig + '%' + StringOfChar('-', Length(Sig));
+    if FProcDecls.ContainsKey(Result) then Exit;
+  end;
   // A const ARGUMENT prefers the const overload; everything else falls through to the same order as
   // before, so a program without such a pair resolves exactly as it did.
   if ConstSig <> '' then
@@ -23830,6 +23907,17 @@ begin
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
   Pref := BaseLabel + '~';
+  // ⭐ The arity fallback prefers a candidate whose BANK part matches exactly. It used to take the
+  // first of the right parameter COUNT, which was fine while the bank signature was the whole key -
+  // an exact bank match would have been found above. With a width tail in play a call can reach here
+  // with its bank still known and only its width unknown, and then "the first of that many
+  // parameters" can be a different BANK entirely: "g(As Long)" answering a String argument.
+  for k := 0 to FProcedureNames.Count - 1 do
+    if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+    begin
+      Cand := SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
+      if Cand = Sig then Exit(FProcedureNames[k]);
+    end;
   for k := 0 to FProcedureNames.Count - 1 do
     if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
        (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(Sig)) then
@@ -23864,7 +23952,7 @@ begin
 end;
 
 function TSSAGenerator.ResolveConstructorLabel(const TypeName, ArgSig: string;
-  const UdtSig: string = ''): string;
+  const UdtSig: string = ''; const WidthSig: string = ''): string;
 // M4.4g: find a constructor by TYPE SIGNATURE, walking up the inheritance chain. Each CONSTRUCTOR's
 // label encodes its parameter bank signature as "TYPE.CONSTRUCTOR#<sig>" (e.g. "#II", "#IS", "#"),
 // so same-arity/different-type overloads coexist. Resolution:
@@ -23886,6 +23974,28 @@ begin
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
+    // 0) ⭐ the DECLARED WIDTH tail, when there is one. A constructor's label is built by the very same
+    //    ProcSigFromParams a SUB's is, so it carries the width tail too - and a resolver that did not
+    //    know about it looked for "#F" where the declaration says "#F%7", missed, and fell through to
+    //    the ARITY fallback, which answered a UDT constructor for a Single argument. ⛔ That is what
+    //    m415 caught the moment the tail was added: the two halves of one scheme, one of them taught.
+    if WidthSig <> '' then
+    begin
+      if UdtSig <> '' then
+      begin
+        Lbl := T + '.CONSTRUCTOR#' + ArgSig + ':' + UdtSig + '%' + WidthSig;
+        if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+      end;
+      Lbl := T + '.CONSTRUCTOR#' + ArgSig + '%' + WidthSig;
+      if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    end;
+    // ...and the all-placeholder form, for the member of the set that has NO width of its own: a set
+    // with any narrow member carries a tail on every member.
+    if ArgSig <> '' then
+    begin
+      Lbl := T + '.CONSTRUCTOR#' + ArgSig + '%' + StringOfChar('-', Length(ArgSig));
+      if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    end;
     // 1) exact signature, type tail included
     if UdtSig <> '' then
     begin
@@ -23895,8 +24005,14 @@ begin
     // 2) exact bank signature
     Lbl := T + '.CONSTRUCTOR#' + ArgSig;
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
-    // 3) arity fallback: first ctor of T with the same parameter count
+    // 3) arity fallback: a ctor of T with the same parameter count - the BANK-exact one first, for the
+    //    reason ResolveMethodLabelArgs gives: with a width tail in play a call can arrive here knowing
+    //    its bank and not its width, and "the first of that many parameters" may be another bank.
     Pref := T + '.CONSTRUCTOR#';
+    for k := 0 to FProcedureNames.Count - 1 do
+      if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
+         (SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = ArgSig) then
+        Exit(FProcedureNames[k]);
     for k := 0 to FProcedureNames.Count - 1 do
       if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
          (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) then
@@ -25455,7 +25571,7 @@ begin
   // values. Without this, "Constructor(v As S)" and "Constructor(v As T)" both resolved to whichever was
   // declared first, and the ctor then read the wrong record's fields.
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
-  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig);
+  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig, ArgWidthSigFromArgs(ArgsNode));
   // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
   if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
   if Lbl = '' then
