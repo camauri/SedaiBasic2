@@ -766,6 +766,8 @@ type
     procedure ProcessDerefStore(VarNode, ExprNode: TASTNode);
     procedure ProcessIndexedStore(Node, VarNode, ExprNode: TASTNode);
     procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
+    function EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
+                                      ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     function AnyFixedLen: Boolean; inline;
@@ -8150,6 +8152,79 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
+  ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
+// The MANAGED-record half of "Allocate/CAllocate for a UDT pointer" (Option B), as a VALUE: allocate
+// the block, give every record its member-array / nested-UDT backing, and hand back the handle.
+//
+// ⛔ EXTRACTED because it had ONE caller and needed two. TryAllocAssign applied it when the target was
+// a VARIABLE; a FIELD target ("a->b = CAllocate(Len(uc))") never reached it and stored the RAW byte
+// address instead, so the very next "a->b->plain" read a byte offset through the managed record path
+// and faulted. Written with a temporary in between - "dim t As uc Ptr = CAllocate(...) : a->b = t" -
+// the same program worked, because THERE the conversion happened at the DIM.
+var
+  CountReg, BytesVal, ProdReg: TSSAValue;
+  UDTIdx: Integer;
+  AllocOffsets: TInt64Array;
+  AllocElemSize: Int64;
+begin
+  Result := False;
+  ExprValue := MakeSSAValue(svkNone);
+  if (RecType = '') or (AllocFuncU = 'REALLOCATE') then Exit;
+  if FindUDT(RecType) < 0 then Exit;
+    UDTIdx := FindUDT(RecType);
+    // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
+    // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
+    // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
+    // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
+    // How many records? FreeBASIC's CAllocate is calloc's shape with a DEFAULTED second argument
+    // (Declare Function CAllocate (ByVal count As UInteger, ByVal size As UInteger = 1)), so the
+    // manual's own idiom passes ONE argument holding the TOTAL BYTE COUNT:
+    //     the_rectangle = CAllocate( 5 * Len( rect_type ) )
+    // Reading that single argument as a record count gave 5*Len(T) records; ignoring it, as this did,
+    // gave exactly ONE - so p[0] worked and every other index walked off the end of the allocation
+    // into an Access Violation. That is the manual's udt/with-2, and any C-style array of UDTs.
+    //
+    // Both forms are the same question in bytes, so ask it that way: records = total bytes DIV the
+    // type's C-layout size, floored at 1. With "CAllocate(n, Len(T))" the division gives n back; with
+    // "CAllocate(n * Len(T))" it gives n; with Allocate's single byte count it gives the right number
+    // too instead of assuming one.
+    // TWO-argument "CAllocate(count, size)" keeps reading argument 0 as the count, exactly as before:
+    // that form was already right, and the guards m367/m428 pin it. Only the ONE-argument form is
+    // reinterpreted, because only it was wrong.
+    CountReg := MakeSSAConstInt(1);
+    if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
+       (ExprNode.GetChild(1).ChildCount >= 2) then
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)
+    else if (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount = 1) and
+       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize) and (AllocElemSize > 0) then
+    begin
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), BytesVal);
+      // Divide ROUNDING UP - "(bytes + size - 1) \ size" - so any non-zero request yields at least
+      // one usable instance. That matters for the linked-list idiom "p = Allocate(Len(T))" if Len ever
+      // rounds below the layout size, and it costs one add.
+      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
+      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, CountReg, ProdReg,
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
+    end;
+    ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
+                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                                    
+                                    or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
+                                    or ((Int64(UDTIdx) and $FFFF) shl 48)),
+                    MakeSSAValue(svkNone));
+    // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
+    // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
+    // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
+    // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
+  EmitRecordBlockInit(ExprValue, CountReg, UDTIdx, False);   // Allocate/CAllocate construct nothing
+  Result := True;
+end;
+
 function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
 // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
@@ -8213,62 +8288,12 @@ begin
       Exit;
     end;
   end;
-  if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
+  if EmitAllocRecordBlockValue(LhsRecType, AllocFuncU, ExprNode, ExprValue) then
   begin
-    UDTIdx := FindUDT(LhsRecType);
-    // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
-    // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
-    // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
-    // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
-    // How many records? FreeBASIC's CAllocate is calloc's shape with a DEFAULTED second argument
-    // (Declare Function CAllocate (ByVal count As UInteger, ByVal size As UInteger = 1)), so the
-    // manual's own idiom passes ONE argument holding the TOTAL BYTE COUNT:
-    //     the_rectangle = CAllocate( 5 * Len( rect_type ) )
-    // Reading that single argument as a record count gave 5*Len(T) records; ignoring it, as this did,
-    // gave exactly ONE - so p[0] worked and every other index walked off the end of the allocation
-    // into an Access Violation. That is the manual's udt/with-2, and any C-style array of UDTs.
-    //
-    // Both forms are the same question in bytes, so ask it that way: records = total bytes DIV the
-    // type's C-layout size, floored at 1. With "CAllocate(n, Len(T))" the division gives n back; with
-    // "CAllocate(n * Len(T))" it gives n; with Allocate's single byte count it gives the right number
-    // too instead of assuming one.
-    // TWO-argument "CAllocate(count, size)" keeps reading argument 0 as the count, exactly as before:
-    // that form was already right, and the guards m367/m428 pin it. Only the ONE-argument form is
-    // reinterpreted, because only it was wrong.
-    CountReg := MakeSSAConstInt(1);
-    if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
-       (ExprNode.GetChild(1).ChildCount >= 2) then
-      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)
-    else if (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount = 1) and
-       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize) and (AllocElemSize > 0) then
-    begin
-      ProcessExpression(ExprNode.GetChild(1).GetChild(0), BytesVal);
-      // Divide ROUNDING UP - "(bytes + size - 1) \ size" - so any non-zero request yields at least
-      // one usable instance. That matters for the linked-list idiom "p = Allocate(Len(T))" if Len ever
-      // rounds below the layout size, and it costs one add.
-      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
-                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
-      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaDivInt, CountReg, ProdReg,
-                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
-    end;
-    ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
-                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
-                                    
-                                    or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
-                                    or ((Int64(UDTIdx) and $FFFF) shl 48)),
-                    MakeSSAValue(svkNone));
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
     // deref from another procedure (or module level) sees the allocated record, not a stale 0.
     if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
-    // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
-    // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
-    // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
-    // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
-    EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx, False);   // Allocate/CAllocate construct nothing
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
@@ -28517,6 +28542,36 @@ var
     Result := not ((FindUDT(ET) >= 0) and UDTBlockIsManaged(ET));
   end;
 
+  function IsRawPtrFieldExpr(Rhs: TASTNode): Boolean;
+  // "q = a->b" where a is a RAW UDT pointer and b is a field declared "<T> Ptr": that field lives in
+  // RAW BYTES, so what it holds is a raw address - exactly as raw as the block it sits in.
+  //
+  // ⛔ The INDEXED form of the same fact ("q = p[i]", IsRawPtrCellExpr just above) has had this rule
+  // since the New[] case; the FIELD form never did. So "a->b = CAllocate(...)" followed by
+  // "a->b->plain" read a byte address through the MANAGED record path and faulted - while the very
+  // same program written with a temporary ("dim t as uc ptr = CAllocate(...) : a->b = t") worked,
+  // because there the temporary was marked raw by the ordinary Allocate rule.
+  var
+    ObjNode: TASTNode;
+    ObjT, FieldT: string;
+    UDTIdx: Integer;
+  begin
+    Result := False;
+    if (Rhs = nil) or (Rhs.NodeType <> antMemberAccess) or (Rhs.ChildCount < 1) then Exit;
+    ObjNode := Rhs.GetChild(0);
+    while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do ObjNode := ObjNode.GetChild(0);
+    if ObjNode.NodeType <> antIdentifier then Exit;
+    ObjT := RawUDTPtrType(VarToStr(ObjNode.Value));      // '' unless the object is a RAW UDT pointer
+    if ObjT = '' then Exit;
+    UDTIdx := FindUDT(ObjT);
+    if UDTIdx < 0 then Exit;
+    FieldT := UpperCase(UDTFieldPtrPointee(UDTIdx, UpperCase(VarToStr(Rhs.Value))));
+    if FieldT = '' then Exit;                            // not a "<UDT> Ptr" field
+    // ...unless that pointee's blocks are MANAGED: then the field holds a record HANDLE, and marking
+    // the target raw would send "q->field" onto the byte heap - the mirror of the accident above.
+    Result := not UDTBlockIsManaged(FieldT);
+  end;
+
   procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
   var
     FU, TU: string;
@@ -28544,6 +28599,7 @@ var
       // MANAGED records (EmitNewObject says why), the value IS a handle, and marking it raw would send
       // "p[i].field" onto the byte heap - the exact mirror of the accident this branch exists to prevent.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
+         IsRawPtrFieldExpr(Rhs) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
           (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
@@ -31425,7 +31481,7 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot). If the member is not a field
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
-  TypeName, NestedT, SMBack: string;
+  TypeName, NestedT, SMBack, AllocFn: string;
   UDTIdx, Slot, FixCap, BitIdx: Integer;
   BitUnit: TSSAValue;
   Bank: TSSARegisterType;
@@ -31452,6 +31508,22 @@ begin
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
+  // ⛔ "a->b = CAllocate( Len(T) )" where b is a "<T> Ptr" FIELD: FreeBASIC's linked-list idiom, and
+  // it has to take the SAME Option-B conversion a pointer VARIABLE takes - allocate a MANAGED record
+  // block and store its HANDLE. TryAllocAssign only ever saw a variable name, so a field kept the RAW
+  // byte address and the very next "a->b->plain" read it through the managed record path and faulted.
+  // ⚠️ Writing the same program with a temporary in between made it work, which is what said the
+  // defect was in the TARGET SHAPE and not in the allocation.
+  if (UDTIdx >= 0) and IsAllocCall(ExprNode, AllocFn) and
+     (UDTFieldPtrPointee(UDTIdx, UpperCase(VarToStr(MemberNode.Value))) <> '') and
+     EmitAllocRecordBlockValue(UpperCase(UDTFieldPtrPointee(UDTIdx, UpperCase(VarToStr(MemberNode.Value)))),
+                               AllocFn, ExprNode, ExprVal) then
+  begin
+    UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT);
+    EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ExprVal),
+                    MakeSSAConstInt(Slot));
+    Exit;
+  end;
   if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then
   begin
     // Not a field — a PROPERTY setter? obj.prop = expr -> SUB Type.prop.SET(expr).
