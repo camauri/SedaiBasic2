@@ -89,6 +89,7 @@ type
     function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
     function ParseBraceInitializer(Token: TLexerToken): TASTNode; // { a, b, ... } aggregate initialiser in expression position
+    function ParseArgPassMode(Token: TLexerToken): TASTNode;   // BYVAL/BYREF written on an ARGUMENT at a call site
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParsePeekFB(Token: TLexerToken): TASTNode;        // FB PEEK([type,] ptr) → *CPtr(T Ptr, ptr); nil if not the FB form
     function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
@@ -148,6 +149,7 @@ function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseArgPassMode(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
@@ -313,6 +315,11 @@ end;
 function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseBraceInitializer(Token);
+end;
+
+function StaticParseArgPassMode(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseArgPassMode(Token);
 end;
 
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
@@ -507,6 +514,10 @@ begin
   // initialiser. The DIM path has read those braces for a long time; the expression grammar had no rule
   // for '{' at all, so the same braces one comma to the left failed the whole declaration.
   Context.SetParseRule(ttDelimBraceOpen, MakePrefixRule(@StaticParseBraceInitializer, precCall));
+  // FreeBASIC lets an ARGUMENT carry its passing mode: "f( ByVal p )" / "test_const ByVal 1234"
+  // overrides a ByRef parameter for that one call. BYVAL/BYREF lex as ttParamMode, whose statement role
+  // is a parameter declaration; a prefix rule here only fires where an expression is expected.
+  Context.SetParseRule(ttParamMode, MakePrefixRule(@StaticParseArgPassMode, precUnary));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
   // M5.5: THREADSELF() value + THREADCALL sub(arg) (sugar that lowers to THREADCREATE).
   Context.SetParseRule(ttThreadSelf, MakePrefixRule(@StaticParseThreadSelf, precCall));
@@ -2436,6 +2447,25 @@ begin
   Result.AddChild(NameNode);
   Result.AddChild(Args);
   DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseArgPassMode(Token: TLexerToken): TASTNode;
+// FreeBASIC's per-ARGUMENT passing mode: "f( ByVal p )", "test_const ByVal 1234". The keyword is
+// already consumed (prefix rule); read the value it qualifies and mark the node with the mode.
+// ⚠️ The mark is carried, not yet honoured: a "ByVal" argument to a ByRef parameter should bind a
+// TEMPORARY, and it currently binds the operand itself. Recorded in job/markdown/DIVERGENZE.md - what
+// this closes is the PARSE, which is what stood between these programs and being measured at all.
+var
+  ModeU: string;
+begin
+  ModeU := UpperCase(VarToStr(Token.Value));
+  Result := ParseExpression(precUnary);
+  if not Assigned(Result) then
+  begin
+    HandleError('Expected a value after ' + ModeU, Context.CurrentToken);
+    Exit(nil);
+  end;
+  Result.Attributes.Values['ARGPASSMODE'] := ModeU;
 end;
 
 function TExpressionParser.ParseBraceInitializer(Token: TLexerToken): TASTNode;

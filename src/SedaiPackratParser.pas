@@ -1545,7 +1545,12 @@ begin
                                                 ttStringFunction, ttMathFunction, ttMemoryFunction,
                                                 ttSystemFunction, ttInputFunction, ttUsrFunction,
                                                 ttErrorHandlingFunction, ttOutputFunction,
-                                                ttGraphicsFunction, ttSpriteFunction, ttSoundFunction]) then
+                                                ttGraphicsFunction, ttSpriteFunction, ttSoundFunction,
+                                                // ...or with its PASSING MODE written on it:
+                                                // "test_const ByVal 1234" is FreeBASIC's per-argument
+                                                // override, and it can only be a bare call - an
+                                                // assignment never has BYVAL where its '=' belongs.
+                                                ttParamMode]) then
           // A value token (or a leading +/- sign of a signed numeric argument, e.g. "bitwise -15, 3")
           // right after the name makes this a bare SUB call, never an assignment. Compound assignment
           // ("name += ..." / "name -= ...") uses a single ttCompoundAssign token, so it is unaffected.
@@ -1782,6 +1787,11 @@ begin
       (Context.CurrentToken.TokenType = ttBitwiseOR) or
       (Context.CurrentToken.TokenType = ttBitwiseXOR) or
       (Context.CurrentToken.TokenType = ttOpEqv) or
+      // ...and the SHORT-CIRCUIT pair. "i OrElse= 1" and "i AndAlso= 0" are the same spelling with the
+      // same desugaring, and they were the only two keyword operators missing from this list - the
+      // statement fell through to "Expected "=" in assignment", which names the very token that IS there.
+      (Context.CurrentToken.TokenType = ttOpAndAlso) or
+      (Context.CurrentToken.TokenType = ttOpOrElse) or
       (Context.CurrentToken.TokenType = ttOpImp)) then
   begin
     OpType := Context.CurrentToken.TokenType;
@@ -8493,6 +8503,23 @@ begin
     begin
       HandleError('Expected ")" after the array expression in REDIM', Context.CurrentToken);
       VarName.Free; Result := nil; Exit;
+    end;
+  end
+  // ⭐ "Redim .field( ... )" INSIDE A WITH BLOCK: the leading dot names a member of the WITH object,
+  // exactly as it does in an assignment or a read. Only a NAME was accepted here, so the dot ended the
+  // statement and the declaration failed with "Expected variable name in array declaration" - a message
+  // about the very thing the WITH block is there to leave out. The expression parser's own leading-dot
+  // rule builds the member access, which is the same node the "obj.field" walk below produces.
+  else if Context.Check(ttOpDot) then
+  begin
+    // ⛔ At precPRIMARY, not precCall: the dimensions that follow are REDIM's own "( 0 To 2 )" and must
+    // stay for the dimension parser. Read at call precedence they were swallowed as an array INDEX, and
+    // the "To" inside then failed as "Expected ")" after array indices".
+    VarName := FExpressionParser.ParseExpression(precPrimary);
+    if not Assigned(VarName) then
+    begin
+      HandleError('Expected a member name after "." in REDIM', Context.CurrentToken);
+      Result := nil; Exit;
     end;
   end
   else
