@@ -2117,6 +2117,21 @@ begin
         EmitFieldAddress(Node.GetChild(0), Result)
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArrayAccess) then
         EmitArrayElementAddress(Node.GetChild(0), Result)
+      else if (VarRecordTypeName(VarToStr(Node.Value)) <> '') and IsSharedScalar(VarToStr(Node.Value)) then
+      begin
+        // ...and a SHARED one is ARRAY-BACKED: its handle is element 0 of a 1-element global array,
+        // never a register. Asking GetOrAllocateVariable gave a register the name was never bound to,
+        // so "@res" yielded 0 and the caller dereferenced it. ⚠️ This is the same defect m534 fixed at
+        // the program-end destructor, in a second path - and a STATIC local is exactly this case,
+        // because LowerStaticLocals hoists one into a uniquely-named DIM SHARED.
+        TempNode := MakeSharedScalarAccess(VarToStr(Node.Value), Node.Token);
+        try
+          ProcessExpression(TempNode, Result);
+          Result := EnsureIntRegister(Result);
+        finally
+          TempNode.Free;
+        end;
+      end
       else if VarRecordTypeName(VarToStr(Node.Value)) <> '' then
         // @obj where obj is a UDT value variable: its handle IS the pointer (managed-reference model).
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))))
