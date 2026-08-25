@@ -516,6 +516,7 @@ type
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
+    procedure CollectEnumNames(Node: TASTNode);    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
     procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
@@ -10993,6 +10994,19 @@ begin
           else if (L = srtFloat) or (R = srtFloat) then Result := srtFloat
           else Result := srtInt;
         end;
+      end;
+    antMemberAccess:
+      // The bank of a record FIELD is the field's DECLARED bank. There was no arm here at all, so a
+      // member access answered the float default below - and "f( h.n )" against f(As Integer)/f(As
+      // Double) picked the DOUBLE overload for an Integer field, the same way an enum-typed variable
+      // did before its type name was known to be an integer one.
+      // ⛔ Only when the field is really FOUND: UDTFieldBankOf answers srtInt for anything it cannot
+      // resolve, and a member this pass cannot resolve is exactly what the default is still for.
+      begin
+        ai := FindUDT(ObjectTypeName(Node.GetChild(0)));
+        if (Node.ChildCount >= 1) and (ai >= 0) and
+           (UDTFieldIndex(ai, UpperCase(VarToStr(Node.Value))) >= 0) then
+          Result := UDTFieldBankOf(Node);
       end;
     antUnaryOp:
       if Node.ChildCount > 0 then Result := InferExprBank(Node.GetChild(0));
@@ -22597,6 +22611,13 @@ begin
     Result := srtFloat
   else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then
     Result := srtString
+  // ⭐ An ENUM is an INTEGER type. Without this it fell to the suffix fallback below, which for a bare
+  // name is the classic FLOAT default - so "Dim v As MyEnum" was banked as a float. The VALUES were
+  // right (the stores and the printing go their own way), which is what kept it out of sight; what it
+  // broke was every question asked ABOUT the declaration, and overload resolution first: two enum
+  // types both signed "F" and a call to "f( As MyEnum )" picked the Double overload instead.
+  else if (FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0) then
+    Result := srtInt
   else
     Result := GetVariableType(FieldName);  // unknown (e.g. nested UDT, deferred): fall back to suffix
 end;
@@ -23001,6 +23022,24 @@ begin
   F := UpperCase(FieldName);
   for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsWString);
+end;
+
+procedure TSSAGenerator.CollectEnumNames(Node: TASTNode);
+// Just the ENUM TYPE names, and nothing else. CollectEnumMembers records them too, but it runs far
+// later - after the DIM pre-scan - and by then "Dim v As MyEnum" has already been given a BANK.
+// ⛔ An enum is an INTEGER type; with the registry still empty the name fell through to the classic
+// FLOAT default, so the declaration was banked as a float. The VALUES were right (the stores and the
+// printing go their own way), which is what kept it invisible; what it broke was every question asked
+// ABOUT the declaration - overload resolution first, where two enum types both signed "F".
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') and
+     (FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
+    FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+  for i := 0 to Node.ChildCount - 1 do
+    CollectEnumNames(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
@@ -34302,6 +34341,12 @@ begin
   // UDT/record types (M3): register TYPE declarations and DIM..AS variable types BEFORE
   // variable pre-allocation, so record vars are allocated as int handles and DIM..AS builtin
   // vars use their declared bank.
+  // The ENUM type names FIRST: a declared name's BANK depends on them, and both the UDT FIELD layout
+  // (inside RegisterUDTs) and the DIM pre-scan ask that question before anything else fills the
+  // registry. Moving it one pass later left an enum FIELD banked as a float while the enum VARIABLE
+  // was already right - the guard found that, which is the whole point of writing one.
+  FEnumNames.Clear;
+  CollectEnumNames(AST);
   RegisterUDTs(AST);
   CheckOverrideAnnotations;   // MODERN: OVERRIDE/FINAL, once every TYPE is known
   // These must be cleared BEFORE RegisterRecordVars: that pre-pass records the print-kind of unsigned
