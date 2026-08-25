@@ -265,7 +265,8 @@ type
     // still declared and initialised, so anything else that resolves through it is unaffected.
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
-    FEnumMembers: TStringList;           // FreeBASIC ENUM members (UPPER), backed by a shared global scalar so they are visible inside procedures
+    FEnumMembers: TStringList;
+    FTypeEnumMembers: TStringList;       // ENUM members declared INSIDE a TYPE: "TYPE.MEMBER" (UPPER)
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
@@ -514,13 +515,14 @@ type
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
-    procedure CollectEnumMembers(Node: TASTNode);       // FB: back each module-level ENUM member with a shared global (proc-visible)
+    procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
     procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)? False when shadowed by a param/local
+    function TypeEnumMemberOwner(const TypeName, MemberName: string): string;   // ENUM member declared inside a TYPE
     function ModuleConstInt(const Name: string; out V: Int64): Boolean;         // name is a module CONST with an integer literal value? (folds to an immediate)
     function IsSharedScalarRaw(const Name: string): Boolean;                    // ...as DECLARED, ignoring shadowing (the slot-sync asks HOW it is stored, not WHICH variable is meant)
     function SharedScalarShadowed(const Name: string): Boolean;                 // ...is a param/local of the procedure being lowered hiding it? (MODERN)
@@ -1225,6 +1227,8 @@ begin
   FStaticMembers := TStringList.Create;
   FStaticMembers.CaseSensitive := False;
   FEnumMembers := TStringList.Create;
+  FTypeEnumMembers := TStringList.Create;
+  FTypeEnumMembers.CaseSensitive := False;
   FEnumMembers.CaseSensitive := False;
   FEnumNames := TStringList.Create;
   FEnumNames.CaseSensitive := False;
@@ -1339,6 +1343,7 @@ begin
   FModuleConstVals.Free;
   FStaticMembers.Free;
   FEnumMembers.Free;
+  FTypeEnumMembers.Free;
   FEnumNames.Free;
   FEnumMemberType.Free;
   FVarEnumType.Free;
@@ -26917,6 +26922,28 @@ begin
   Result := IsSharedScalarRaw(Name) and not SharedScalarShadowed(Name);
 end;
 
+function TSSAGenerator.TypeEnumMemberOwner(const TypeName, MemberName: string): string;
+// The type - TypeName itself or an ancestor - that declares MemberName as a member of an ENUM inside
+// its body, or '' when none does. Walks the chain, because a member declared in a base is nameable
+// through a derived instance exactly as a field is.
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  Result := '';
+  if (FTypeEnumMembers = nil) or (TypeName = '') or (MemberName = '') then Exit;
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    if FTypeEnumMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0 then Exit(T);
+    Idx := FindUDT(T);
+    if Idx < 0 then Exit;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
 function TSSAGenerator.ModuleConstInt(const Name: string; out V: Int64): Boolean;
 // A module-level CONST whose value is an integer literal. Reads of it fold to that immediate instead
 // of loading element 0 of the SHARED backing array it is otherwise stored in. Shadowing is asked the
@@ -27014,7 +27041,7 @@ begin
   end;
 end;
 
-procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode);
+procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');
 // FreeBASIC ENUM members are module-wide integer constants: like a module-level CONST they must be
 // visible INSIDE SUB/FUNCTION bodies. The parser lowers an ENUM to a sequence of plain assignments
 // (member = value); left as ordinary module variables, MODERN lexical scope hides them from procedures
@@ -27036,7 +27063,7 @@ begin
   if not FModernMode then
   begin
     for i := 0 to Node.ChildCount - 1 do
-      CollectEnumMembers(Node.GetChild(i));      // still walk, to reach every enum's name
+      CollectEnumMembers(Node.GetChild(i), OwnerType);   // still walk, to reach every enum's name
     Exit;                                        // CLASSIC has no procedure scope: members stay plain globals
   end;
   if Node.NodeType = antProcedureDecl then Exit; // an ENUM inside a SUB/FUNCTION is proc-local, not a global
@@ -27051,6 +27078,8 @@ begin
         if (VNameU = '') or (FSharedScalarArr.IndexOf(VNameU) >= 0) then Continue;
         ai := FProgram.DeclareArray(VNameU, srtInt, [1]);   // 1-element global int array, same name
         FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
+        if (OwnerType <> '') and (FTypeEnumMembers.IndexOf(OwnerType + '.' + VNameU) < 0) then
+          FTypeEnumMembers.Add(OwnerType + '.' + VNameU);
         FEnumMembers.Add(VNameU);
         // Remember which named enum this member belongs to, so an operand that is a bare enum member
         // ("F And i") resolves to the enum type for operator-overload dispatch.
@@ -27059,7 +27088,15 @@ begin
       end;
     end;
   for i := 0 to Node.ChildCount - 1 do
-    CollectEnumMembers(Node.GetChild(i));
+    // ⭐ An ENUM declared INSIDE a TYPE keeps its members reachable as "obj.member" - fbc scopes them
+    //    to the type, and reading one through an instance is what the suite's structs/const_access
+    //    does. The member itself is still backed globally (that is how the bare name resolves); this
+    //    only records WHICH TYPE may name it, so a member access can answer instead of falling
+    //    through to "not a field" and reading a register nobody wrote.
+    if Node.NodeType = antTypeDecl then
+      CollectEnumMembers(Node.GetChild(i), UpperCase(VarToStr(Node.Value)))
+    else
+      CollectEnumMembers(Node.GetChild(i), OwnerType);
 end;
 
 procedure TSSAGenerator.EmitEnumMemberAllocs;
@@ -31375,6 +31412,15 @@ begin
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
   if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
   TypeName := ObjectTypeName(Node.GetChild(0));
+  // ...and an ENUM member named through the TYPE ITSELF ("T.member"), not through an instance. The
+  // object is a type NAME, so ObjectTypeName answers '' and the instance branch below never sees it.
+  if (TypeName = '') and (Node.GetChild(0).NodeType = antIdentifier) and
+     (TypeEnumMemberOwner(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value)) <> '') then
+  begin
+    AccNode := MakeSharedScalarAccess(UpperCase(VarToStr(Node.Value)), Node.Token);
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   if TypeName = '' then
   begin
     // Static member method called with no args via the type name: "TypeName.method".
@@ -31386,6 +31432,22 @@ begin
   begin
     // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
     // Args-aware with a nil list, so an overload set is searched for its zero-parameter member.
+    // ...or an ENUM member declared INSIDE this type (or an ancestor). fbc scopes such a member to
+    // the type, so "obj.member" is how a program reads one; without this the access fell through as
+    // "not a field", nothing was emitted, and the caller read a register nobody had written - which
+    // printed a raw pointer tag. The VALUE lives in the ordinary global the enum collector backs it
+    // with; only the NAMING is per type.
+    if TypeEnumMemberOwner(TypeName, VarToStr(Node.Value)) <> '' then
+    begin
+      AccNode := MakeSharedScalarAccess(UpperCase(VarToStr(Node.Value)), Node.Token);
+      try
+        ProcessExpression(AccNode, Result);
+      finally
+        AccNode.Free;
+      end;
+      Exit;
+    end;
+    // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
     if HasCallableMethod(TypeName, VarToStr(Node.Value), nil) then
       // "base.method" written WITHOUT parentheses is the same super call as "base.method()", and it
       // needs the same NON-VIRTUAL dispatch: ObjectTypeName has already resolved `base` to the parent
