@@ -312,6 +312,7 @@ type
     function ParseGosubStatement: TASTNode;
     function ParseFunctionResultAssign: TASTNode;
     function ParseReturnStatement: TASTNode;
+    function IsStrayBlockCloser(const W: string): Boolean;   // a word that can only CLOSE a block
     function ParseEndStatement: TASTNode;
     function ParseFastStatement: TASTNode;
     function ParseSlowStatement: TASTNode;
@@ -5164,6 +5165,17 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.IsStrayBlockCloser(const W: string): Boolean;
+// Is W a word that can only ever CLOSE a block, so that meeting it after END means the block was
+// never opened? A matched closer is consumed by its own block parser and never reaches END.
+// ⛔ EXTERN is not here: "End Extern" is handled a few lines up, where the linkage block's body is
+// parsed in place and there is genuinely nothing to end.
+begin
+  Result := (W = 'SCOPE') or (W = 'OPERATOR') or (W = 'MACRO') or (W = 'ANY') or
+            (W = 'WITH') or (W = 'SELECT') or (W = 'ENUM') or (W = 'UNION') or
+            (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'PROPERTY');
+end;
+
 function TPackratParser.ParseEndStatement: TASTNode;
 var
   Token: TLexerToken;
@@ -5193,6 +5205,28 @@ begin
   // ⚠️ Only a CONSTANT is honoured, and that is declared: the code rides in the opcode's IMMEDIATE, so
   // a computed one has nowhere to go without a register operand on an opcode that has none. "End n"
   // with a variable halts exactly as before and answers 0.
+  // ⛔⛔ AN UNMATCHED BLOCK CLOSER IS NOT A PROGRAM END. Reached here, "End Scope" / "End Operator" /
+  // "End Macro" / "End Any" - and any word this parser does not know - left the word behind and HALTED
+  // THE PROGRAM: a Print before it ran, a Print after it did not, and the exit code was 0. fbc reports
+  // an error on every one of them. A matched closer never arrives here at all (its own block parser
+  // consumes it), so a closer that DOES arrive has no opener and is exactly the thing to refuse.
+  // ⭐ Found by CENSUS after "End Asm" was fixed on its own: the question asked was which OTHER
+  // "End <word>" forms end the program in silence, and the answer was all of them.
+  // ⚠️ A reserved word only. "End n" takes an EXIT CODE, and an identifier there may be a variable -
+  // that stays exactly as it was, halting with 0, which is declared just above.
+  // ⚠️ NOT gated on ttIdentifier: SCOPE and OPERATOR carry token types of their own, so asking for an
+  // identifier caught MACRO and ANY and let exactly those two through - which is the shape of half a
+  // fix. The word itself is the test, and every word in the list is reserved, so no variable can
+  // answer to it.
+  if IsStrayBlockCloser(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+  begin
+    HandleError('"End ' + UpperCase(VarToStr(Context.CurrentToken.Value)) +
+                '" closes a block that is not open here.', Context.CurrentToken);
+    Context.Advance;
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
   ExitArg := nil;
   if (UpperCase(Token.Value) = kSYSTEM) and
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
