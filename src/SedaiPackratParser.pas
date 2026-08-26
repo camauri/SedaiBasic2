@@ -1528,6 +1528,37 @@ begin
           Context.Advance;   // consume PUT
           Result := ParseBinaryFileTail(False, Token);
         end
+        // ⛔⛔ INLINE ASSEMBLY IS REFUSED, and it has to be refused HERE rather than left alone. "ASM" is
+        // not a reserved word, so an "Asm ... End Asm" block parsed as a bare call to an undefined name
+        // followed by ordinary statements - and its closing "End Asm" was read as plain "END", which
+        // STOPS THE PROGRAM. A block that emits nothing would be one thing; a block that silently ends
+        // the program at the point it appears is a wrong answer with no diagnostic at all: "print" before
+        // it ran, "print" after it did not, and the exit code was 0.
+        // x86 assembly has no meaning in a bytecode VM whose engines include an interpreter, so this is
+        // structural and declared (BASIC.md, "Declared unsupported"); saying so is the whole fix.
+        // ⚠️ MODERN only, and only when ASM opens the statement: "asm" stays usable as a name elsewhere.
+        else if FModernMode and (UpperCase(Token.Value) = 'ASM') and
+                ((Context.PeekNext = nil) or
+                 (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile])) then
+        begin
+          HandleError('Inline assembly (ASM ... END ASM) is not supported: this is a bytecode VM, ' +
+                      'and one of its engines is an interpreter. Rewrite the block in BASIC.',
+                      Token);
+          // Swallow the block so the "End Asm" that closes it is not read as "END" - which is what
+          // silently terminated the program - and so one refusal is reported instead of a cascade.
+          while not Context.CheckAny([ttEndOfFile]) do
+          begin
+            if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+               (Context.PeekNext.TokenType = ttIdentifier) and
+               (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ASM') then
+            begin
+              Context.Advance; Context.Advance;      // END ASM
+              Break;
+            end;
+            Context.Advance;
+          end;
+          Result := nil;
+        end
         // FreeBASIC/QB "NAME old AS new" (rename). NAME is a bare identifier (not reserved, so it can
         // still be a variable/field); the trailing AS before end-of-statement disambiguates from an
         // assignment "name = ..." (no bare AS) and from "name" used as a value.

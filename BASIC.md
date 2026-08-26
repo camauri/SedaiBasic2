@@ -3184,7 +3184,12 @@ Each of these is *refused with a message that names the reason*, never answered 
   message that says so rather than "Array not declared". Use the BASIC equivalents
   (`Open`/`Print #`/`Close`, `Print Using`).
 - **Inline assembly**: `Asm … End Asm`, `Naked` procedures, `#pragma reserve`, and `__FB_ASM__`
-  branches that select one. Machine code in the source is not something a bytecode VM can host.
+  branches that select one. Machine code in the source is not something a bytecode VM can host —
+  one of its engines is an interpreter.
+  ⚠️ Until 26 August 2026 an `Asm … End Asm` block was worse than unsupported: `Asm` is not a reserved
+  word, so the block parsed as a bare call to an undefined name and its closing `End Asm` was read as
+  plain `End` — which **stops the program**. A `Print` before the block ran, a `Print` after it did
+  not, and the exit code was `0`. It is now refused by name, which is what this whole section promises.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance
