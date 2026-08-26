@@ -2104,6 +2104,7 @@ var
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
   DerefTarget: TASTNode;          // "*expr": the operand, with any parentheses stripped
+  ExprList2: TASTNode;            // synthesized empty argument list for "Cast(T, T)"
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
   ArgValue, ArgReg: TSSAValue;
@@ -2491,6 +2492,23 @@ begin
           if (ArrName2 = 'DOUBLE') or (ArrName2 = 'SINGLE') then Result := EnsureFloatRegister(Left)
           else Result := EnsureIntRegister(Left);
           Exit;
+        end;
+      end;
+      // ⛔ ...AND A BARE TYPE NAME AS THE OPERAND IS A DEFAULT-CONSTRUCTED TEMPORARY. "Cast(P, P)" is
+      // FreeBASIC for "a default P, seen as a P"; lowered as an expression the second P was an
+      // undefined VARIABLE, which reads 0, and the receiving DIM then dereferenced handle 0 - an access
+      // violation on four lines. ProcessDefaultValue has known this spelling since the "= Foo" default
+      // was fixed, and asks it exactly this way; this is the second place that reads a value where a
+      // type name may stand.
+      if (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(0).ChildCount = 0) and
+         (FindUDT(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) and
+         (VarRecordTypeName(VarToStr(Node.GetChild(0).Value)) = '') then
+      begin
+        ExprList2 := TASTNode.Create(antExpressionList, Node.GetChild(0).Token);
+        try
+          if EmitUDTTemporary(UpperCase(VarToStr(Node.GetChild(0).Value)), ExprList2, Result) then Exit;
+        finally
+          ExprList2.Free;
         end;
       end;
       ProcessExpression(Node.GetChild(0), Left);
@@ -10559,7 +10577,18 @@ begin
     // it as one runtime-sized dimension whose upper bound is -1 (LBOUND 0, so the VM computes size
     // ub-lb+1 = 0); a later REDIM resizes it. Reusing the variable-dimension path (a register holding the
     // upper bound) needs no VM change: an empty array is just an array whose runtime upper bound is -1.
-    if (DimCount = 0) and (ArrayDeclNode.Attributes.Values['VARLEN'] = '1') then
+    // ⛔ ...AND "(Any)" IS THE SAME DECLARATION WRITTEN THE OTHER WAY. FreeBASIC's "Dim a(Any) As T"
+    // declares the same empty variable-length array as "Dim a()", and both answer UBOUND -1; here the
+    // ANY arrived as an ordinary dimension EXPRESSION, the bare name read 0, and UBOUND answered 0.
+    // The "()" spelling was right all along, which is what said it was the spelling and not the model.
+    // ⚠️ One dimension only: "(Any, Any)" declares a 2-D dynamic array and the empty form below models
+    // a single runtime-sized dimension, so that spelling is left to raise rather than answered wrong.
+    if (DimCount = 1) and (DimsNode.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(DimsNode.GetChild(0).Value)) = 'ANY') then
+      DimCount := 0;
+    if (DimCount = 0) and ((ArrayDeclNode.Attributes.Values['VARLEN'] = '1') or
+                           ((DimsNode.ChildCount = 1) and (DimsNode.GetChild(0).NodeType = antIdentifier) and
+                            (UpperCase(VarToStr(DimsNode.GetChild(0).Value)) = 'ANY'))) then
     begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
@@ -26396,18 +26425,33 @@ begin
     DECLARATION ORDER. With "Dim b As BigInt" first the program was right; with the
     DIM after a statement, the declaration bound one register and every later use
     resolved another, and the value silently came out 0. }
+  // ⛔ AND FVarRecordType IS KEYED BY BARE NAME TOO. The note above says this for FVarExplicitType and
+  // gives the cure - a MODULE-level declaration owns the bare name, anything inside a procedure only
+  // adds if absent - and that cure was never replicated here. So "Sub touch( ByRef stp As foo )"
+  // anywhere in the file made the module's own "Dim As Integer stp = 1" a record: printing it
+  // dereferenced the integer 1 as a handle and the program died on an access violation, with no
+  // pointer and no UDT anywhere near the line that failed.
+  // ...and a module declaration that is NOT a record has to CLEAR the entry, not merely decline to
+  // write one: it is the authority on that name, and saying nothing would leave a procedure's earlier
+  // claim standing.
   if FindUDT(TypeName) >= 0 then
   begin
-    FVarRecordType.Values[VarName] := TypeName;
+    if not FPreScanInProc then FVarRecordType.Values[VarName] := TypeName
+    else if FVarRecordType.IndexOfName(VarName) < 0 then FVarRecordType.Add(VarName + '=' + TypeName);
     Bank := srtInt;   // a record var holds an int handle
   end
   else if FModernMode and (UpperCase(TypeName) = 'BIGINT') then
   begin
-    FVarRecordType.Values[VarName] := 'BIGINT';
+    if not FPreScanInProc then FVarRecordType.Values[VarName] := 'BIGINT'
+    else if FVarRecordType.IndexOfName(VarName) < 0 then FVarRecordType.Add(VarName + '=BIGINT');
     Bank := srtInt;   // a BigInt var holds an int handle too
   end
   else
+  begin
+    if (not FPreScanInProc) and (FVarRecordType.IndexOfName(VarName) >= 0) then
+      FVarRecordType.Delete(FVarRecordType.IndexOfName(VarName));
     Bank := TypeNameToBank(TypeName, VarName);
+  end;
   Idx := FVarExplicitType.IndexOf(VarName);
   if Idx < 0 then
     FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))))
