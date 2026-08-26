@@ -10517,14 +10517,23 @@ begin
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('Invalid array dimensions for: %s', [ArrName]);
 
-    // A local array (DIM inside a proc) whose name matches an already-declared module/global array must
-    // get its own slot: DeclareArray otherwise REUSES that slot (REDIM semantics), resizing/clearing the
-    // module array — and corrupting a same-name ByRef parameter aliased to it. Mangle the DECLARED name on
-    // such a collision (ArrayIndexOf resolves references via LocalArrayMangle). A SHARED array is
-    // module-visible and never mangled; a name that is this proc's own array parameter is left alone.
+    // A local array (DIM inside a proc) gets its own slot: DeclareArray otherwise REUSES the slot of
+    // the same name (REDIM semantics), resizing/clearing it — and corrupting a same-name ByRef
+    // parameter aliased to it. ArrayIndexOf resolves references through LocalArrayMangle, so the
+    // procedure's own code still finds it. A SHARED array is module-visible and never mangled; a name
+    // that is this proc's own array parameter is left alone.
+    //
+    // ⛔ IT USED TO MANGLE ONLY WHEN A MODULE ARRAY OF THAT NAME ALREADY EXISTED, and that made the
+    // identity depend on DECLARATION ORDER. Two SUBS each declaring "c" and no module "c": the first
+    // declared a GLOBAL slot called C, and the second then found it and mangled - so with DIM the two
+    // were separate by luck, while with REDIM the second took the RESIZE path over the FIRST sub's
+    // array and the program died on an access violation nine lines in. A local is local whether or not
+    // something else happens to share its name.
+    // ⚠️ MODERN only. CLASSIC has no procedure scope at all - in Commodore BASIC every name is global -
+    // so there the old collision-only rule is the right one and stays.
     DeclArrName := ArrName;
     if FInProcedure and (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
-       (FProgram.FindArray(UpperCase(ArrName)) >= 0) and
+       (FModernMode or (FProgram.FindArray(UpperCase(ArrName)) >= 0)) and
        (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
       DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
 
