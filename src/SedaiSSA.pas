@@ -849,7 +849,7 @@ type
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
     function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a UCS-2 temporary
-    procedure ProcessDefaultValue(Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name included
+    procedure ProcessDefaultValue(ParamNode, Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name and UDT conversion included
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
@@ -12332,7 +12332,7 @@ begin
   Result := (Val.Kind <> svkNone);
 end;
 
-procedure TSSAGenerator.ProcessDefaultValue(Node: TASTNode; out Val: TSSAValue);
+procedure TSSAGenerator.ProcessDefaultValue(ParamNode, Node: TASTNode; out Val: TSSAValue);
 // Evaluate a PARAMETER's default value. Everywhere else this is exactly ProcessExpression - the one
 // thing it adds is FreeBASIC's bare-type-name form.
 //
@@ -12347,6 +12347,7 @@ procedure TSSAGenerator.ProcessDefaultValue(Node: TASTNode; out Val: TSSAValue);
 // behave two ways.
 var
   CallNode: TASTNode;
+  ParamTypeU: string;
 begin
   Val := MakeSSAValue(svkNone);
   if Node = nil then Exit;
@@ -12363,6 +12364,29 @@ begin
       CallNode.Free;
     end;
     Exit;
+  end;
+  // ⛔ ...AND "= 3344" ON A UDT PARAMETER IS A CONVERSION, not a number. FreeBASIC runs the type's
+  // one-argument constructor there, exactly as "Dim As T v = <non-T expr>" does - and THAT path has
+  // known it since the copy-constructor work (see ScalarCtorInit in ProcessDim). Here the 3344 was
+  // staged as a plain int into a slot the callee reads as a record HANDLE, and "x.i" dereferenced it:
+  // an access violation on eleven lines, with "= foo" and "= foo()" both working beside it. One rule,
+  // two places that fill an omitted argument, written in one of them.
+  ParamTypeU := '';
+  if (ParamNode <> nil) and (ParamNode.ChildCount >= 1) and
+     (ParamNode.GetChild(0).NodeType = antIdentifier) and
+     not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) then
+    ParamTypeU := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+  if (ParamTypeU <> '') and (FindUDT(ParamTypeU) >= 0) and
+     (UpperCase(ObjectTypeName(Node)) <> ParamTypeU) and
+     (ResolveConstructorLabel(ParamTypeU, '?') <> '') then
+  begin
+    CallNode := TASTNode.Create(antExpressionList, Node.Token);
+    try
+      CallNode.AddChild(Node.Clone);
+      if EmitUDTTemporary(ParamTypeU, CallNode, Val) then Exit;
+    finally
+      CallNode.Free;
+    end;
   end;
   ProcessExpression(Node, Val);
 end;
@@ -27525,7 +27549,7 @@ begin
       PNode := ParamList.GetChild(i);
       if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
       begin
-        ProcessDefaultValue(PNode.GetChild(PNode.ChildCount - 1), DefVal);
+        ProcessDefaultValue(PNode, PNode.GetChild(PNode.ChildCount - 1), DefVal);
         Slot := ParamBankAndSlot(ParamList, i, RT);
         EmitXferStore(RT, Slot, DefVal);
       end;
@@ -34360,7 +34384,7 @@ begin
     ParamI := ParamList.GetChild(i);
     if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
     begin
-      ProcessDefaultValue(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      ProcessDefaultValue(ParamI, ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
       Slot := ParamBankAndSlot(ParamList, i, RT);
       case RT of
         srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
