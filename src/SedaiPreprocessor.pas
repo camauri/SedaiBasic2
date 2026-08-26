@@ -963,8 +963,15 @@ begin
       end;
       // A BUILT-IN function-like macro is tried first: it is the preprocessor's own, and a program may
       // not shadow it with a #define.
-      if (j <= Length(Line)) and (Line[j] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
+      // ⛔ ...and a SPACE between the name and its parenthesis is ordinary FreeBASIC here too. The
+      // USER-macro path three dozen lines below skips the blanks, and the #if evaluator has an
+      // NextNonBlankIsOpenParen of its own; only this one demanded the '(' be glued to the name, so
+      // "__FB_QUOTE__ ( abc )" reached the parser as an undefined array called __FB_QUOTE__.
+      k := j;
+      while (k <= Length(Line)) and (Line[k] in [' ', #9]) do Inc(k);
+      if (k <= Length(Line)) and (Line[k] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
       begin
+        j := k;
         // ⛔ AND A PARENTHESIS INSIDE A STRING LITERAL IS NOT A PARENTHESIS. This counted '(' and ')'
         // with no in-string flag, so an argument like "2,(3" closed the list early and the macro was
         // expanded with the arguments cut short - 'Unexpected token ")"'. SplitMacroArgs and
@@ -1682,7 +1689,21 @@ var
     Result := ParseAdd;
     while (Peek='=') or (Peek='==') or (Peek='<>') or (Peek='!=') or (Peek='<') or (Peek='<=') or (Peek='>') or (Peek='>=') do
     begin
-      op := Peek; Inc(TPos); l := Result; r := ParseAdd;
+      op := Peek; Inc(TPos);
+      // ⛔ A NUMBER ON THE LEFT AND A STRING ON THE RIGHT IS NOT EQUAL - and the case matters because
+      // an UNDEFINED identifier tokenizes as 0. "#if __FB_BACKEND__ = "gas"" with the macro missing
+      // therefore read as 0 = 0 and came out TRUE, so we compiled the branch fbc does not: the string
+      // rule lived in the LEFT-hand path only, and ParsePrimary's discard arm answered 0 for the
+      // literal on the right. Measured against fbc 1.10.1: "UNKNOWN = "gas"" is FALSE, "UNKNOWN <>
+      // "gas"" is TRUE, and "0 = "0"" is a type-mismatch ERROR it refuses outright - the one case we
+      // are deliberately more permissive about, since a #if must still answer something.
+      if IsStrTok(Peek) then
+      begin
+        Inc(TPos);
+        if (op='<>') or (op='!=') then Result := 1 else Result := 0;
+        Continue;
+      end;
+      l := Result; r := ParseAdd;
       if (op='=') or (op='==') then b := l = r
       else if (op='<>') or (op='!=') then b := l <> r
       else if op='<' then b := l < r
@@ -1898,6 +1919,19 @@ begin
   // a #cmdline carrying -O raises it; a program reads it back to compile differently. It reports the
   // REQUEST, not our pipeline, which has no -O ladder to report.
   Defs.Values['__FB_OPTIMIZE__'] := '0';
+  // --- WHICH COMPILER THE PROGRAM THINKS IT IS TALKING TO. ⛔ These six were MISSING, and a missing
+  // one is not neutral: a program guarded by "#if __FB_BACKEND__ = "gas"" was compiled by us on the
+  // GAS side, where fbc itself takes the gcc side - so we then died inside a body the oracle never
+  // builds (functions/va_*, typedef/backpatch: four "defects" that were four wrong branches).
+  // Values measured from fbc 1.10.1 on linux-x86_64 with its own defaults, which is the configuration
+  // we claim to be; getting them WRONG would be worse than leaving them out, so each is the oracle's
+  // answer and not a preference of ours.
+  Defs.Values['__FB_BACKEND__']   := '"gcc"';      // -gen gcc is fbc's default here
+  Defs.Values['__FB_GCC__']       := '-1';         // ...and its flag form
+  Defs.Values['__FB_FPMODE__']    := '"precise"';  // -fpmode precise
+  Defs.Values['__FB_ASM__']       := '"intel"';    // the dialect an Asm block would be written in
+  Defs.Values['__FB_ERR__']       := '0';          // -e/-exx error-checking level: none
+  Defs.Values['__FB_VECTORIZE__'] := '0';          // -vec 0
   { Which machine the program is being compiled FOR. SedaiBasic's own, with no
     FreeBASIC counterpart - fbc has no WebAssembly target - so it does not
     pretend to be an __FB_ macro. }

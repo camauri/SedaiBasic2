@@ -1889,6 +1889,9 @@ begin
       BCInstr.Dest := MapSSARegisterToBytecode(Instr.Dest.RegType, Instr.Dest.RegIndex, Instr.Dest.Version);
       if Instr.Src1.Kind = svkRegister then
         BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+      // Src2, when constant, is the READ KIND (1 = BOOLEAN) - the same channel PRINT# uses above.
+      if Instr.Src2.Kind = svkConstInt then
+        BCInstr.Immediate := Instr.Src2.ConstInt;
       FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
       Exit;
     end;

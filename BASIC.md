@@ -2238,17 +2238,24 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 ##### Command-line switches
 
+⛔ **A define that describes the COMPILER still decides what gets COMPILED.** Six of these used to read
+"no meaning for a bytecode VM" and were left undefined, which is not neutral: a body wrapped in
+`#if __FB_BACKEND__ = "gas"` was compiled by us and skipped by fbc, and we then died inside code the
+oracle never builds. Each now answers what fbc 1.10.1 answers on linux-x86_64 with its own defaults —
+the value is the *oracle's*, not a preference of ours, because getting it wrong is worse than leaving
+it out. Fixed 26 Aug 2026, guard `m585`.
+
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ASM__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_BACKEND__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_GCC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTIMIZE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ASM__` | ✓ | `"intel"` — fbc's own answer on linux-x86_64. Naming a dialect does not make inline `Asm` supported; that stays a declared gap (see divergence 51). |
+| `__FB_BACKEND__` | ✓ | `"gcc"` — fbc's default backend on this host, and therefore the branch fbc itself compiles. |
+| `__FB_GCC__` | ✓ | `-1` — the flag form of `__FB_BACKEND__ = "gcc"`, kept consistent with it. |
+| `__FB_OPTIMIZE__` | ✓ | `0` — the optimisation level the SOURCE asked for (fbc's default; a `#cmdline` carrying `-O` raises it). It reports the REQUEST, not our pipeline, which has no `-O` ladder. |
 | `__FB_GUI__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_MAIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_DEBUG__` | ✓ | True (-1) if the "-g" switch was used, false (0) otherwise. |
-| `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_FPMODE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ERR__` | ✓ | `0` — the `-e`/`-ex`/`-exx` error-checking level, none by default, as in fbc. |
+| `__FB_FPMODE__` | ✓ | `"precise"` — fbc's default `-fpmode`. |
 | `__FB_FPU__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_LANG__` | ✓ | Defined to a string literal of the "-lang" dialect used. |
 | `__FB_MT__` | ✓ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
@@ -2258,7 +2265,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_OUT_OBJ__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_SSE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_VECTORIZE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_VECTORIZE__` | ✓ | `0` — fbc's default `-vec 0`. |
 
 ##### Environment Information
 
@@ -2352,7 +2359,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Local` | ✓ | `ON LOCAL ERROR GOTO label` installs a procedure-local error handler. |
 | `Resume` | ✓ |  |
 | `Resume Next` | ✓ |  |
-| `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ERR__` | ✓ | `0` — the `-e`/`-ex`/`-exx` error-checking level, none by default, as in fbc. |
 
 #### Miscellaneous Keywords
 
@@ -2420,7 +2427,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
-| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
+| `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The `#if TypeOf(a)=TypeOf(b)` form is **rejected with an error**, not silently evaluated: this preprocessor runs on text, before any declaration is seen, so it cannot answer the question — and answering it "false" (the undefined-identifier rule) would quietly take the wrong branch. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
@@ -2721,7 +2728,7 @@ End Function
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INPUT #` | ✓ | Reads a list of values from a file or device. |
+| `INPUT #` | ✓ | Reads a list of values from a file or device. A numeric field is read with the SAME grammar `VAL` uses — the `&H`/`&O`/`&B` base prefixes, a saturating magnitude, the full 64 bits — and a `BOOLEAN` destination takes the words `true`/`false` in either case, anything else through that grammar with non-zero meaning true. (Until 26 Aug 2026 it had its own conversion, 32-bit and prefix-blind: `Val("&h1F")` was 31 and `INPUT #` of the same text was 0. Guard `m584`.) |
 | `WRITE #` | ✓ | Writes a list of values to a file as quoted CSV (strings in `"`, comma-separated). |
 | `INPUT()` | ✓ | `INPUT(n, [#]filenum)` — reads n characters (BYTES; `WINPUT()` counts Unicode codepoints instead) from a file. A short read at end of file returns fewer characters, as in FreeBASIC. |
 | `WINPUT()` | ✓ | `WINPUT(n, [#]filenum)` — reads n wide characters (Unicode codepoints) from a file. A WSTRING is UTF-8 here, so a character may span several bytes; a short read at end of file returns fewer characters, as in FreeBASIC. |

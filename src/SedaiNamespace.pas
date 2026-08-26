@@ -549,8 +549,13 @@ begin
   // procedure (address-of @): I". What proves the lowering itself is sound is that VARPTR(i) on the
   // very same member WORKS: VarPtr synthesises its antProcAddress AFTER this pass, from a name that is
   // already mangled. So the defect was never in @ - it was the name arriving unmangled.
+  // ⛔ ...AND A CALL WRITTEN AS A STATEMENT IS ONE OF THEM TOO. "p1 7" inside a namespace is an
+  // antProcedureCall, which carries its name in Value with an ARGUMENT LIST as its child - so neither
+  // arm above ever saw it, and the name stayed bare while the very same call written as an EXPRESSION
+  // ("print p1(7)") was prefixed and worked. antProcedureCall appeared nowhere in this unit.
   if (Node.NodeType = antIdentifier) or
-     ((Node.NodeType = antProcAddress) and (Node.ChildCount = 0)) then
+     ((Node.NodeType = antProcAddress) and (Node.ChildCount = 0)) or
+     (Node.NodeType = antProcedureCall) then
   begin
     V := UpperCase(VarToStr(Node.Value));
     // ⛔ ...and GLOBALSCOPE is a request NOT to resolve against the enclosing namespace: ".v" inside a

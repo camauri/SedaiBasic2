@@ -89,6 +89,7 @@ type
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
     function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
+    function ParseConstQualifier(Token: TLexerToken): TASTNode; // CONST written where a TYPE is expected: step over it
     function ParseBraceInitializer(Token: TLexerToken): TASTNode; // { a, b, ... } aggregate initialiser in expression position
     function ParseArgPassMode(Token: TLexerToken): TASTNode;   // BYVAL/BYREF written on an ARGUMENT at a call site
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
@@ -149,6 +150,7 @@ function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseConstQualifier(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseArgPassMode(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
@@ -311,6 +313,11 @@ end;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseTypeConstructor(Token);
+end;
+
+function StaticParseConstQualifier(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseConstQualifier(Token);
 end;
 
 function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
@@ -510,6 +517,15 @@ begin
   // FreeBASIC "type<T>(args)" anonymous temporary as a value expression. TYPE lexes as ttTypeDecl (its
   // statement role opens a record declaration); a prefix rule here only fires in expression position.
   Context.SetParseRule(ttTypeDecl, MakePrefixRule(@StaticParseTypeConstructor, precCall));
+  // ⛔ A TYPE MAY BE QUALIFIED "CONST" WHEREVER A TYPE NAME IS EXPECTED - and one is expected in
+  // EXPRESSION position too: "SizeOf(Const UDT)", "Len(Const Integer)", "New Const T". The statement
+  // parser has SkipTypeQualifiers and fourteen readers call it; the expression grammar had no rule for
+  // the keyword at all, so each of those spellings was a syntax error on the word "const" while the
+  // very same type worked in a DIM. CONST binds to the type and changes neither its SIZE nor its
+  // IDENTITY, so the rule is to step over it and read what follows - accepted, not enforced, exactly
+  // as the statement side documents. The prefix rule fires only where a value is expected, so the
+  // CONST STATEMENT, dispatched before the expression parser is ever asked, is untouched.
+  Context.SetParseRule(ttConstant, MakePrefixRule(@StaticParseConstQualifier, precCall));
   // FreeBASIC "{ a, b, ... }" aggregate initialiser where an EXPRESSION is expected: an argument of a
   // type constructor ("udt = type( -1, -2, {-3, -4}, -5 )") and a tuple element of an array-of-UDT
   // initialiser. The DIM path has read those braces for a long time; the expression grammar had no rule
@@ -2261,6 +2277,12 @@ begin
       Result := nil; Exit;
     end;
   end;
+  // ⛔ ...AND IT MAY CARRY THE "CONST" QUALIFIER: "New Const T", "New Const T[n]". NEW reads its own
+  // type name rather than going through the expression grammar, so the rule registered there does not
+  // reach it - it is the one type reader of the whole compiler that calls neither SkipTypeQualifiers
+  // nor anything like it, and it answered "Expected a TYPE name after NEW" on the word const.
+  while Context.Check(ttConstant) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') do
+    Context.Advance;
   // ⛔ ...AND A TYPE NAME MAY BEGIN WITH THE GLOBAL-SCOPE DOTS. "New ..ns.T" is FreeBASIC; asking
   // ttIdentifier alone refused it outright. Fifth reader of a type name found by the same census.
   while Context.Check(ttOpDot) do Context.Advance;
@@ -2401,6 +2423,15 @@ begin
   Result := (T = 'STRING') or (T = 'WSTRING') or (T = 'ZSTRING');
 end;
 
+function TExpressionParser.ParseConstQualifier(Token: TLexerToken): TASTNode;
+// The CONST token is already consumed. Skip any further qualifiers and read the thing being
+// qualified. See the note at the rule's registration for why this belongs in the expression grammar.
+begin
+  while Context.Check(ttConstant) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') do
+    Context.Advance;
+  Result := ParseExpression(precCall);
+end;
+
 function TExpressionParser.ParseTypeConstructor(Token: TLexerToken): TASTNode;
 // FreeBASIC "type<T>(args)": an anonymous temporary of UDT T initialised with args (via T's constructor,
 // or field-by-field when T has none). The TYPE token is already consumed. Lowers to the same shape the
@@ -2497,6 +2528,12 @@ begin
   // for the DIM and PARAMETER positions; type<> is the third place that reads a type name, and it did
   // not. fbc's own namespace/reimp1 and reimp2 are written this way.
   while (TypeStr <> '') and (TypeStr[1] = '.') do Delete(TypeStr, 1, 1);
+  // ⛔ ...AND NEITHER IS THE "CONST" QUALIFIER. "type<Const UDT>( )" names the same type as
+  // "type<UDT>( )" - const says how the temporary may be USED, not which type it is - and the reader
+  // above copies it into the name, so FindUDT was asked for a type called "CONST UDT" and answered
+  // nothing: "Array not declared: CONST UDT". Leading only, the spelling fbc's own structs/anon-assign
+  // uses; "T Const Ptr" is a different question (a const POINTER) and is left alone.
+  if Copy(TypeStr, 1, 6) = 'CONST ' then Delete(TypeStr, 1, 6);
   if TypeStr = '' then
   begin
     HandleError('Expected a TYPE name in a type<T>(...) expression', Context.CurrentToken);

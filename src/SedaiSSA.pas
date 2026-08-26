@@ -18685,8 +18685,13 @@ begin
         EmitInstruction(ssaInputFileLine, VarReg, HandleReg,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone))
       else
+        // ⛔ ...and with the READ KIND alongside it, the mirror of the one PRINT#/WRITE# carries.
+        // A file is not a lesser console in either direction: fbc's INPUT# knows the word "true"
+        // when the destination is a BOOLEAN, so a value WE had just written as "true" read back as
+        // 0. The kind is computed by the same FilePrintKind the writing side uses, off the same
+        // declared type, so the two halves cannot drift apart.
         EmitInstruction(ssaInputFile, VarReg, HandleReg,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                       MakeSSAConstInt(FilePrintKind(VarChild, VarReg)), MakeSSAValue(svkNone));
     end;
     // Skip separators and other nodes
     Inc(i);
@@ -34261,6 +34266,13 @@ begin
   // (the parser routes any lone identifier statement here). Treat it as a no-op instead of emitting a
   // call to an undefined PROC_ label (which the CFG pass would reject). Calls WITH arguments, or to a
   // known procedure, fall through to the normal lowering.
+  // ⛔ ...AND THE IMPLICIT THIS IS MISSING IN THE STATEMENT FORM. Inside a method body "bar 7" means
+  // "this.bar 7", exactly as "print bar(7)" means "print this.bar(7)". TryImplicitThisMethod exists and
+  // had two callers, BOTH on the expression side, so the very same call written as a statement died as
+  // "Undefined procedure: BAR" one line below its working twin. Tried before the no-op rule below: a
+  // method of the owner type is not a stray identifier.
+  if (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) and
+     TryImplicitThisMethod(UpperCase(VarToStr(Node.Value)), ArgList, Node.Token, PtrVal) then Exit;
   if (not Assigned(ArgList) or (ArgList.ChildCount = 0)) and
      (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
     Exit;

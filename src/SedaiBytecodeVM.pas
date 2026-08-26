@@ -16496,9 +16496,14 @@ begin
           FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
-          // Convert string to float and store in float register
+          // ⛔ THE SAME TEXT, READ BY TWO DIFFERENT PARSERS. VAL has known FreeBASIC's number
+          // grammar - the &H/&O/&B base prefixes, the saturating magnitude, the full 64 bits -
+          // since it was written, and INPUT# converted with the RTL's StrToFloatDef/StrToIntDef,
+          // which know none of it and follow the locale's decimal separator besides. So
+          // "&h1F" read back as 0 and 9223372036854775807 as -1, while VAL("&h1F") was 31.
+          // One grammar, one parser: file/large_int.bas alone reads 4116 numbers this way.
           if Instr.Dest >= 0 then
-            Ctx.FloatRegs[Instr.Dest] := StrToFloatDef(Trim(Data), 0.0);
+            Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Trim(Data));
         end
         else
           raise Exception.Create('INPUT# command not supported: no handler assigned');
@@ -16516,9 +16521,26 @@ begin
           FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
-          // Convert string to integer and store in int register
+          // Same grammar as VAL - see the float arm above. StrToIntDef is a 32-BIT conversion
+          // (its result is a LongInt), so every value past 2^31 came back as the default 0 even
+          // when the register that holds it is 64 bits wide.
+          // Immediate carries the READ KIND the SSA worked out from the destination's declared type,
+          // the mirror of PRINT#'s: 1 = BOOLEAN. fbc reads the WORDS "true"/"false" (either case)
+          // there, and anything else through the numeric grammar with "non-zero" meaning true - so
+          // "1.7" is true and "abc" is false. Measured against fbc 1.10.1 for all nine forms.
           if Instr.Dest >= 0 then
-            Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
+          begin
+            if Instr.Immediate = 1 then
+            begin
+              Mode := UpperCase(Trim(Data));
+              if Mode = 'TRUE' then Ctx.IntRegs[Instr.Dest] := -1
+              else if Mode = 'FALSE' then Ctx.IntRegs[Instr.Dest] := 0
+              else if ParseLeadingFloat(Trim(Data)) <> 0.0 then Ctx.IntRegs[Instr.Dest] := -1
+              else Ctx.IntRegs[Instr.Dest] := 0;
+            end
+            else
+              Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Trim(Data), 64);
+          end;
         end
         else
           raise Exception.Create('INPUT# command not supported: no handler assigned');
