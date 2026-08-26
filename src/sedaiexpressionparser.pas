@@ -2261,6 +2261,9 @@ begin
       Result := nil; Exit;
     end;
   end;
+  // ⛔ ...AND A TYPE NAME MAY BEGIN WITH THE GLOBAL-SCOPE DOTS. "New ..ns.T" is FreeBASIC; asking
+  // ttIdentifier alone refused it outright. Fifth reader of a type name found by the same census.
+  while Context.Check(ttOpDot) do Context.Advance;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a TYPE name after NEW', Context.CurrentToken);
@@ -2880,6 +2883,13 @@ begin
     end;
     Context.Advance;
   end;
+  // ⛔ ...AND THE GLOBAL-SCOPE DOTS ARE NOT PART OF THE NAME HERE EITHER. This loop copies every '.' it
+  // meets, so "CPtr(..ns.T Ptr, p)" produced "..NS.T PTR", which names nothing: the pointee was unknown
+  // and "p->field" read the wrong place and answered a plausible small number rather than raising.
+  // ⭐ Found by CENSUS, not by a failing test - after the same hole turned up in a third reader, the
+  // question asked was "who ELSE reads a type name" instead of "does this test pass now". CAST spells
+  // its type the same way and shares this loop; DIM, PARAMETER and type<> are the other three.
+  while (TypeStr <> '') and (TypeStr[1] = '.') do Delete(TypeStr, 1, 1);
   TypeStr := FoldSizedIntegerTypeName(TypeStr);   // "INTEGER < 8 >" -> "BYTE"
   if not Context.Match(ttSeparParam) then
   begin

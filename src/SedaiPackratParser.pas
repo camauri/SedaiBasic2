@@ -3053,7 +3053,7 @@ begin
       end;
       NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'INTEGER', RetTok));
     end
-    else if Context.Check(ttIdentifier) then
+    else if AtDottedTypeName then
     begin
       RetTok := Context.CurrentToken;
       RetTypeName := ParseDottedName;               // dotted: namespace-qualified return type
@@ -3837,7 +3837,7 @@ var
 // int handle), and an optional fixed-length "* n" (advisory in v1). Returns '' if no type token follows.
 begin
   Result := '';
-  if Context.Check(ttIdentifier) or
+  if AtDottedTypeName or
      ((Length(Context.CurrentToken.Value) > 0) and
       (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
   begin
@@ -4855,7 +4855,7 @@ begin
   begin
     Context.Advance;                              // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    if AtDottedTypeName then
     begin
       ForVarType := ParseDottedName;
       while AtPointerSuffix do
@@ -8747,7 +8747,7 @@ begin
   begin
     Context.Advance;                                // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    if AtDottedTypeName then
     begin
       TypeTok := Context.CurrentToken;
       ElemTypeName := ParseDottedName;                // dotted: namespace-qualified element type
@@ -10475,7 +10475,7 @@ begin
   begin
     Context.Advance;                          // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    if AtDottedTypeName then
     begin
       RedimTypeTok := Context.CurrentToken;
       RedimTypeName := UpperCase(ParseDottedName);
