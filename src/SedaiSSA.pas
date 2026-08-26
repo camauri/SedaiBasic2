@@ -29795,7 +29795,12 @@ begin
   if Node.NodeType = antDeref then
   begin
     // "*p" is p's type with one " PTR" taken off.
-    T := DeclaredTypeNameOf(Node.GetChild(0));
+    // ⛔ ...AFTER RESOLVING THE ALIAS, or the second star has nothing to take off. "Type y As z Ptr :
+    // Dim f2 As y Ptr" records the pointee as "Y", so "*f2" answered "Y" - a name with no " PTR" in it
+    // - and "**f2" then found nothing to strip and fell off the end as "Array not declared: SIZEOF".
+    // One star worked and two did not, which is what said it was the SPELLING of the intermediate type
+    // and not the depth. CanonicalType is the resolver the rest of the generator already uses.
+    T := CanonicalType(UpperCase(DeclaredTypeNameOf(Node.GetChild(0))));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
     Exit;
