@@ -4212,14 +4212,16 @@ begin
   end;
 
   // Optional single inheritance: TYPE Child EXTENDS Parent (M4.2). Stored as an attribute.
+  // ⛔ ...AND THE BASE IS A TYPE NAME, SO IT MAY BE QUALIFIED. "Type TW Extends ns1.TU" took ONE
+  // identifier token and recorded EXTENDS='NS1', leaving ".TU" to be read as the first member - so the
+  // derived type inherited NOTHING, in silence: sizeof answered its own fields only, the base's fields
+  // read rubbish and writes to them were lost. ParseDottedName is the reader every other type-name
+  // position uses; EXTENDS was one more that had never been told about it.
   if Context.Check(ttExtends) then
   begin
     Context.Advance;                                // consume EXTENDS
-    if Context.Check(ttIdentifier) then
-    begin
-      Result.Attributes.Values['EXTENDS'] := UpperCase(Context.CurrentToken.Value);
-      Context.Advance;                              // parent type name
-    end;
+    if Context.Check(ttIdentifier) or Context.Check(ttOpDot) then
+      Result.Attributes.Values['EXTENDS'] := UpperCase(ParseDottedName);
   end;
 
   // FreeBASIC field alignment header: "TYPE name [EXTENDS base] FIELD = n". Our record STORAGE is

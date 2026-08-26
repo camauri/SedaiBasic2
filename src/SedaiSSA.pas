@@ -286,6 +286,12 @@ type
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
+    FVarDeclTypeName: TStringList;       // every DIM/VAR'd scalar: name (UPPER) -> the type NAME it was declared as
+                                         // ⛔ FVarExplicitType beside it holds only the BANK - three answers for ten
+                                         // types - and DeclaredTypeNameOf fell back to it, so "Dim s As Short" answered
+                                         // INTEGER and "Dim As TypeOf(s) w" gave w eight bytes instead of two. The name
+                                         // is what the declaration SAID; asking a registry that guesses a default
+                                         // instead of declining is how three defects were built on this one.
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
@@ -1282,6 +1288,8 @@ begin
   FEnumMemberType.CaseSensitive := False;
   FVarEnumType := TStringList.Create;
   FVarEnumType.CaseSensitive := False;
+  FVarDeclTypeName := TStringList.Create;
+  FVarDeclTypeName.CaseSensitive := False;
   FPointerVars := TStringList.Create;
   FAddrTakenScalars := TStringList.Create;
   FAddrTakenScalars.CaseSensitive := False;
@@ -1396,6 +1404,7 @@ begin
   FEnumNames.Free;
   FEnumMemberType.Free;
   FVarEnumType.Free;
+  FVarDeclTypeName.Free;
   FPointerVars.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
@@ -26256,6 +26265,14 @@ var
   Idx: Integer;
 begin
   if VarName = '' then Exit;
+  // The type NAME the declaration said, kept beside the bank: see the note on FVarDeclTypeName.
+  // Module-level wins over a procedure-local of the same name, exactly as the bank map below does.
+  if TypeName <> '' then
+  begin
+    if not FPreScanInProc then FVarDeclTypeName.Values[VarName] := UpperCase(TypeName)
+    else if FVarDeclTypeName.IndexOfName(VarName) < 0 then
+      FVarDeclTypeName.Add(VarName + '=' + UpperCase(TypeName));
+  end;
   { ⭐ BIGINT is a HANDLE type, exactly like a UDT, and it has to be said HERE - the
     one place that decides which bank a declared name lives in. FindUDT('BIGINT') is
     < 0 by design (it is not a user type), so without this arm it fell to
@@ -28845,7 +28862,12 @@ begin
          (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ⛔ ...THROUGH ITS TYPEDEF. "Type y As Short Ptr : Dim f1 As y" declares a pointer as surely
+        // as "Dim f1 As Short Ptr" does, but the test below is on the SPELLING, so an aliased name
+        // never entered this map at all: f1 was not a pointer to anything, and "SizeOf(*f1)" fell off
+        // the end of DeclaredTypeNameOf and down to the array ladder as "Array not declared: SIZEOF".
+        // CanonicalType is the resolver the rest of the generator already uses for exactly this.
+        TypeNameU := CanonicalType(UpperCase(VarToStr(Decl.GetChild(1).Value)));
         if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
         begin
           // ⭐ A MODULE-LEVEL DECLARATION WINS. This map is keyed by NAME with no scope, so when two
@@ -29012,6 +29034,15 @@ begin
           // bytes", which only a raw slot can honour. It never looked type-punned - a pointer to it is
           // the same (string) bank - so it stayed a managed SHARED cell and "@z" answered a packed array
           // address instead of a byte pointer. The manual's udt/type2 starts exactly there.
+          // ⛔ ...AND ADDING "STRING" TO THIS LIST IS NOT THE CURE - it was TRIED and WITHDRAWN on
+          // 26 Aug 2026. Marking a fixed-length String RAWMODULE does give it a raw slot, and "@fs"
+          // stops answering a packed handle, but the slot is never WRITTEN: the size and the store go
+          // through RawZStringBufBytes, which reads FZStringVars, and a "String * n" is recorded in
+          // FFixedLenVars instead (n characters, not n-1 cells). The measured result was worse than
+          // the defect - "Dim As String * 8 fs : fs = "abc" : Print fs" printed nothing at all, len 0,
+          // the moment its address was taken. Two machineries, one taught: extending the OTHER one is
+          // the piece of work, and it is a model change (padding lives on the managed path), not a
+          // name added to a list. Costs 291 assertions of the fbc suite; see DIVERGENZE.md.
           else if ((VTypeU = 'ZSTRING') or (VTypeU = 'WSTRING')) and
                   (StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0) > 0) then
           begin
@@ -29365,6 +29396,7 @@ function TSSAGenerator.DeclaredTypeNameOf(Node: TASTNode): string;
 // bank, exactly as before.
 var
   NameU, T: string;
+  UDTIdx, FI: Integer;
 begin
   Result := '';
   if Node = nil then Exit;
@@ -29393,6 +29425,26 @@ begin
       Result := Trim(Copy(T, 1, Length(T) - 4));
     Exit;
   end;
+  // ⛔ ...AND A FIELD HAS A DECLARED TYPE TOO. Only a NAME was asked here, so "SizeOf(*x.pz)" - the
+  // deref of a "ZString Ptr" FIELD - got '' from the arm above, propagated '' out of the antDeref arm,
+  // and the SIZEOF call slid down to the array ladder ("Array not declared: SIZEOF"). Both halves work
+  // separately: "SizeOf(*p)" on a declared pointer and "SizeOf(x.pz)" on the field itself. The record
+  // already carries the answer per field; nobody was asking it.
+  if Node.NodeType = antMemberAccess then
+  begin
+    if Node.ChildCount < 1 then Exit;
+    UDTIdx := FindUDT(ObjectTypeName(Node.GetChild(0)));
+    if UDTIdx < 0 then Exit;
+    FI := UDTFieldIndex(UDTIdx, UpperCase(VarToStr(Node.Value)));
+    if FI < 0 then Exit;
+    if FUDTs[UDTIdx].Fields[FI].PtrPointee <> '' then
+      Exit(UpperCase(FUDTs[UDTIdx].Fields[FI].PtrPointee) + ' PTR');
+    if FUDTs[UDTIdx].Fields[FI].RawPtrPointee <> '' then
+      Exit(UpperCase(FUDTs[UDTIdx].Fields[FI].RawPtrPointee) + ' PTR');
+    if FUDTs[UDTIdx].Fields[FI].NestedType <> '' then
+      Exit(UpperCase(FUDTs[UDTIdx].Fields[FI].NestedType));
+    Exit;
+  end;
   if Node.NodeType <> antIdentifier then Exit;
   NameU := UpperCase(VarToStr(Node.Value));
   Result := VarRecordTypeName(NameU);                       // a UDT instance
@@ -29408,6 +29460,12 @@ begin
     7: Result := 'SINGLE';
   end;
   if Result <> '' then Exit;
+  // ⭐ ...AND THE NAME THE DECLARATION ACTUALLY SAID, before the bank has to guess. Declared32Code
+  // above answers only once its own registry is filled, which is AFTER this pre-pass runs, so
+  // "Dim s As Short : Dim As TypeOf(s) w" fell straight through to the bank and made w an INTEGER -
+  // eight bytes against fbc's two. A type ALIAS is resolved, so "Type y As Short" answers SHORT.
+  T := UpperCase(FVarDeclTypeName.Values[NameU]);
+  if T <> '' then Exit(CanonicalType(T));
   if FVarExplicitType.IndexOf(NameU) >= 0 then
     case TSSARegisterType(PtrInt(FVarExplicitType.Objects[FVarExplicitType.IndexOf(NameU)])) of
       srtString: Result := 'STRING';
@@ -29806,6 +29864,11 @@ begin
   // 24-byte descriptor (pointer + length + capacity) and a WSTRING is one 2-byte wide character. Both
   // verified against fbc. Nothing here allocates by these numbers -- they are what SizeOf/LEN must SAY.
   if T = 'STRING' then Result := 24
+  // ⛔ ...AND A ZSTRING IS ONE BYTE. It was absent from this list, so it fell all the way to the
+  // "unknown type is pointer-sized" default and SizeOf(ZString) answered 8 against fbc's 1 - the same
+  // wrong number an unrecognised name gets, which is why nothing ever pointed at it. Its WSTRING
+  // neighbour was here from the start.
+  else if T = 'ZSTRING' then Result := 1
   else if T = 'WSTRING' then Result := 2
   else if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
   else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
@@ -35986,6 +36049,7 @@ begin
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
+  FVarDeclTypeName.Clear;
   FScalarPtrBanks.Clear;
   FAddrTakenScalars.Clear;
   FRawModuleScalars.Clear;

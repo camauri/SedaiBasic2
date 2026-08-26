@@ -500,6 +500,14 @@ begin
     if (Pos('.', V) = 0) and (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
        Ctx.IsMember(ActivePrefix, V) then
       Node.Value := ActivePrefix + '.' + V;
+    // ⛔ ...AND SO DOES THE NAME OF ITS BASE. The declaration's own name was mangled here and the
+    // EXTENDS attribute beside it was not - the word did not appear ONCE in this unit - so the SSA
+    // looked the parent up by its bare name, found nothing, and the derived type inherited NOTHING
+    // with no diagnostic at all: sizeof gave its own fields only and the base's fields read rubbish.
+    // Same rule, same node, one of the two halves written.
+    BaseV := UpperCase(Node.Attributes.Values['EXTENDS']);
+    if (BaseV <> '') and (Pos('.', BaseV) = 0) and Ctx.IsMember(ActivePrefix, BaseV) then
+      Node.Attributes.Values['EXTENDS'] := ActivePrefix + '.' + BaseV;
     Exit;
   end;
 
