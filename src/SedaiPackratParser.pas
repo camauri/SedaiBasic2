@@ -283,7 +283,7 @@ type
     procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
     function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
     // Optional "= { ... }" / "=> { ... }" array initializer on an already-built antArrayDecl.
-    function TryParseAggregateTuple(const DimTypeName: string): TASTNode;
+    function TryParseAggregateTuple(const DimTypeName: string; Nested: Boolean = False): TASTNode;
     procedure ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
     function AtEndType: Boolean;
     procedure ConsumeEndType;
@@ -1561,10 +1561,19 @@ begin
                                                 // "test_const ByVal 1234" is FreeBASIC's per-argument
                                                 // override, and it can only be a bare call - an
                                                 // assignment never has BYVAL where its '=' belongs.
-                                                ttParamMode]) then
+                                                ttParamMode]) and
+                // ⛔ ...UNLESS THE SIGN IS THE OPERATOR OF A COMPOUND ASSIGNMENT WRITTEN APART.
+                // FreeBASIC allows the operator and its '=' to be separated - "i + => 5" and "i - = 2"
+                // mean "i += 5" and "i -= 2", and fbc's own quirk/assignment-token is written that way.
+                // The note below says a compound assignment "uses a single ttCompoundAssign token, so
+                // it is unaffected": true of the FUSED spelling and false of the spaced one, which
+                // therefore came here and was parsed as a bare call with a signed first argument.
+                // ("=>" is folded into one ttOpEq by the lexer, so both spellings of the '=' are this
+                // one test.)
+                not ((Context.PeekNext.TokenType in [ttOpAdd, ttOpSub]) and
+                     Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttOpEq)) then
           // A value token (or a leading +/- sign of a signed numeric argument, e.g. "bitwise -15, 3")
-          // right after the name makes this a bare SUB call, never an assignment. Compound assignment
-          // ("name += ..." / "name -= ...") uses a single ttCompoundAssign token, so it is unaffected.
+          // right after the name makes this a bare SUB call, never an assignment.
           Result := Memoize('BareCallStatement', @ParseBareCallStatement)
         // FreeBASIC/QB bare parameterless SUB call: a lone "SubName" as a whole statement (nothing after
         // the name before the end of the statement). Parsed as an argument-less call; the SSA no-ops it
@@ -1803,12 +1812,26 @@ begin
       // statement fell through to "Expected "=" in assignment", which names the very token that IS there.
       (Context.CurrentToken.TokenType = ttOpAndAlso) or
       (Context.CurrentToken.TokenType = ttOpOrElse) or
+      // ⛔ ...AND THE SYMBOLIC OPERATORS BELONG IN THIS LIST TOO. FreeBASIC lets the operator and the
+      // '=' be written APART - "i + => 5" and "i - = 2" mean "i += 5" and "i -= 2", and its own
+      // quirk/assignment-token test is written that way. The symbolic forms relied entirely on the
+      // LEXER fusing "+=" into one token, so with a space between them the statement fell through and
+      // reported the '=>' it was left standing on. The keyword operators have carried this exact rule
+      // from the start; one more case of a rule living in one half of a pair.
+      (Context.CurrentToken.TokenType = ttOpAdd) or
+      (Context.CurrentToken.TokenType = ttOpSub) or
+      (Context.CurrentToken.TokenType = ttOpMul) or
+      (Context.CurrentToken.TokenType = ttOpDiv) or
+      (Context.CurrentToken.TokenType = ttOpIntDiv) or
+      (Context.CurrentToken.TokenType = ttOpPow) or
+      (Context.CurrentToken.TokenType = ttOpConcat) or
       (Context.CurrentToken.TokenType = ttOpImp)) then
   begin
     OpType := Context.CurrentToken.TokenType;
     OpSym := Context.CurrentToken.Value;
     Context.Advance;                                 // consume the operator keyword
     Context.Advance;                                 // consume the trailing "="
+    if Context.Check(ttOpGt) then Context.Advance;   // ...and the "=>" spelling of that '='
     Expression := FExpressionParser.ParseExpression;
     if not Assigned(Expression) then
     begin
@@ -8754,7 +8777,7 @@ begin
   DoNodeCreated(Result);
 end;
 
-function TPackratParser.TryParseAggregateTuple(const DimTypeName: string): TASTNode;
+function TPackratParser.TryParseAggregateTuple(const DimTypeName: string; Nested: Boolean = False): TASTNode;
 // FreeBASIC aggregate init "= (a, b, c)": a parenthesised comma-tuple that sets a UDT's fields in
 // declaration order. Answers the antArgumentList (TUPLEINIT), or NIL with the stream left exactly where
 // it was - so the caller can fall through to an ordinary expression, which is what "= (x + y) \ 2" is.
@@ -8789,7 +8812,7 @@ begin
       // one-field tuple and the pointer arithmetic was stored as if it were a field value - the program
       // then died dereferencing a null. IsBuiltinTypeName only matches BARE names, so "ZSTRING PTR"
       // answered False and looked like a UDT.
-      if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) and
+      if (TupleDepth = 0) and (not Nested) and (not IsBuiltinTypeName(DimTypeName)) and
          (Pos(' PTR', UpperCase(DimTypeName)) = 0) then
       begin
         Context.Advance;
@@ -8828,7 +8851,20 @@ begin
         ParseArrayInitBraceGroup(ArgExpr, ConstDimSizes(nil), 0);   // no shape: plain row-major
       end
       else
-        ArgExpr := FExpressionParser.ParseExpression;
+      begin
+        // ⭐ ...AND A TUPLE ELEMENT MAY BE A TUPLE, for a field whose type is itself a UDT:
+        //     type udt2 : dummy as integer : u as udt : end type
+        //     static as udt2 t1 = (0, (1, 2)), t2 = (0, (3, 4))
+        // is fbc's own spelling (swap/udt.bas is written that way). The BRACE nesting above has been
+        // understood for a while; the PARENTHESISED nesting reached ParseExpression, which read "(1"
+        // and wanted a ')' where the comma was - so the whole declaration failed on a diagnostic
+        // pointing at the comma. Read by THIS function, recursively, so one grammar describes both
+        // levels; in nested mode a top-level comma is the whole test, since there is no declared type
+        // to consult and no "spans the whole initializer" question to ask.
+        ArgExpr := TryParseAggregateTuple(DimTypeName, True);
+        if not Assigned(ArgExpr) then
+          ArgExpr := FExpressionParser.ParseExpression;
+      end;
       if not Assigned(ArgExpr) then Break;
       CtorArgs.AddChild(ArgExpr);
       if Context.Check(ttSeparParam) then Context.Advance else Break;

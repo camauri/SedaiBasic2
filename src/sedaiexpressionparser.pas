@@ -2487,6 +2487,13 @@ begin
       end;
       Context.Advance;
     end;
+  // ⛔ ...AND THE GLOBAL-SCOPE DOTS ARE NOT PART OF THE NAME. "type<..n1.foo.t1>(x)" says "resolve n1
+  // from the global scope"; the reader above copies every '.' it meets, so the type came out as
+  // "..N1.FOO.T1", matched no declaration, and the temporary was built as though the type were unknown
+  // - an ACCESS VIOLATION at run time, with nothing said at compile time. ParseDottedName learned this
+  // for the DIM and PARAMETER positions; type<> is the third place that reads a type name, and it did
+  // not. fbc's own namespace/reimp1 and reimp2 are written this way.
+  while (TypeStr <> '') and (TypeStr[1] = '.') do Delete(TypeStr, 1, 1);
   if TypeStr = '' then
   begin
     HandleError('Expected a TYPE name in a type<T>(...) expression', Context.CurrentToken);
