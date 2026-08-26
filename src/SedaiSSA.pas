@@ -25390,6 +25390,10 @@ begin
   // "Dim p As Integer Ptr = @a(0)" has always worked, which is what said the gap was in the DEDUCTION.
   // The element type is already recorded for exactly this pre-pass (FArrayScalarType, whose comment
   // says so); FProgram's own table is asked first for everything declared by then.
+  // ⛔ THE MEMBER-ARRAY FORM, "Var p = @x.array(0)", IS NOT CLOSED HERE AND THE ATTEMPT IS WRITTEN
+  // DOWN: asking UDTArrayElemType off ObjectTypeName of the object answers nothing at this point -
+  // this pre-pass runs before the record variables are registered - so the branch was INERT and is
+  // not shipped. DIVERGENZE 64.
   if (Node.NodeType = antProcAddress) and (Node.ChildCount = 1) and
      (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
      (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
