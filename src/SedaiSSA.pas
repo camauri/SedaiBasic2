@@ -5193,6 +5193,22 @@ begin
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             Exit;
           end;
+          // ⛔ ...AND A UDT WITH AN "Operator Cast" IS A NUMBER TOO. The IMPLICIT conversion runs it -
+          // "Dim i As Integer = t" answers 5 - and the EXPLICIT one did not: ProcessExpression handed
+          // back the record HANDLE and the narrowing below turned it into a small integer, so "CInt(t)"
+          // answered 1 while "Dim i As Integer = t" on the very same object answered 5. One rule, two
+          // conversion paths, present in one. TryEmitUDTCastToNumber is the reader the implicit path
+          // already uses; the width conversion below then applies to the value it returns, which is
+          // what makes "CByte(t)" narrow the OPERATOR'S result rather than a handle.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and
+             TryEmitUDTCastToNumber(ArgListNode.GetChild(0), ArgValue) then
+          begin
+            Result := ApplyNarrowCode(TypeNameWidthCode(Copy(FuncName, 2, MaxInt)),
+                                      EnsureIntRegister(ArgValue), nil);
+            if Result.Kind = svkNone then Result := EnsureIntRegister(ArgValue);
+            Exit;
+          end;
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
@@ -5273,6 +5289,24 @@ begin
         begin
           // FreeBASIC float conversion functions: produce a float value. CSNG rounds to true
           // single precision (held in the Double bank) via bcNarrowSingle (B1.5).
+          // ⛔ ...AND THE OTHER HALF OF THE SAME RULE. A UDT with an "Operator Cast" is a number here
+          // too, and this path handed back the record HANDLE: "CDbl(t)" answered 1 on a type whose Cast
+          // returns 3.75 - and fbc ACCEPTS that call, so this is a wrong answer, not permissiveness.
+          // The integer family a few lines up needed the same branch; writing it in one and not the
+          // other is what this whole campaign keeps meeting.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and
+             TryEmitUDTCastToNumber(ArgListNode.GetChild(0), ArgValue) then
+          begin
+            Result := EnsureFloatRegister(ArgValue);
+            if FuncName = 'CSNG' then
+            begin
+              TempVal := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaNarrowSingle, TempVal, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Result := TempVal;
+            end;
+            Exit;
+          end;
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
