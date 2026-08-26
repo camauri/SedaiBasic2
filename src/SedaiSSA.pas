@@ -25294,6 +25294,40 @@ begin
   // as DECLARED as a pointer variable's own type. Without it every "f(@d)" answered '' - "any pointer" -
   // and the resolver took the first pointer overload: "Sub f(p As Double Ptr)" was unreachable through
   // "f(@d)" while "f(@i)" worked, which reads as the overloads being wrong rather than the argument.
+  // ⛔ ...AND "@a(0)" NAMES ONE TOO. The branch below wants a BARE name; "@a(0)" is an antProcAddress
+  // WITH a child, so it fell straight through and answered '' - and the VAR pre-pass, taking that '',
+  // fell back to InferExprBank and made "Var p = @a(0)" an INTEGER, after which "p[3]" was lowered as an
+  // access to an array called P: "Array not declared: P". The explicit spelling
+  // "Dim p As Integer Ptr = @a(0)" has always worked, which is what said the gap was in the DEDUCTION.
+  // The element type is already recorded for exactly this pre-pass (FArrayScalarType, whose comment
+  // says so); FProgram's own table is asked first for everything declared by then.
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 1) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    Pt := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+    if FArrayScalarType.IndexOfName(Pt) >= 0 then
+      Exit(UpperCase(FArrayScalarType.Values[Pt]) + ' PTR');
+    if ArrayIndexOf(Pt) >= 0 then
+      case FProgram.GetArray(ArrayIndexOf(Pt)).ElementType of
+        srtFloat:  Exit('DOUBLE PTR');
+        srtString: Exit('STRING PTR');
+      else         Exit('INTEGER PTR');
+      end;
+    Exit;
+  end;
+  // ...and so do the two other spellings that produce a pointer without naming one. "New T" IS a
+  // "T Ptr" - it says its own type - and "ProcPtr(f)" is the entry PC of f, which is what a procedure
+  // pointer holds. Both reached the VAR pre-pass as '' and became INTEGERs, so "p()" and "*p" were
+  // then lowered against a plain integer.
+  if (Node.NodeType = antNew) and (VarToStr(Node.Value) <> '') then
+    Exit(UpperCase(VarToStr(Node.Value)) + ' PTR');
+  // ⛔ "Var p = ProcPtr(f)" is NOT closed by answering a type name here, and it was TRIED: a
+  // procedure pointer is not carried by a name in this map at all, it is carried by its SIGNATURE in
+  // FFuncPtrSigs, so "p()" still lowered as an array access ("Array not declared: P1"). Deducing it
+  // means registering the signature of f under p, which is a different piece of work from naming a
+  // pointee type - and shipping the branch that names one would have been a branch that does nothing.
+  // The explicit "Dim p As Sub() = ProcPtr(f)" works. DIVERGENZE 57.
   if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) then
   begin
     NameNd := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
@@ -29306,6 +29340,20 @@ begin
     end;
   end;
   if Node.NodeType = antProcedureDecl then InProc := True;
+  // ⛔ A BLOCK IS A SCOPE TOO, AND MAKING THIS MARKING SEE THAT WAS TRIED TWICE AND WITHDRAWN
+  // (26 Aug 2026). The marking applies RETROACTIVELY BY NAME: two sibling Scopes each declaring "a",
+  // the second taking "@a" of a ZString * 5, and the FIRST one's plain String is turned into a raw slot
+  // too - so the program dies on its first executable line, in the scope ABOVE the one with the pointer
+  // in it. Reversing the two scopes makes it work, which is what says it is the marking and not the
+  // pointer.
+  // ⚠️ Judging each antBlock on the @s taken inside ITS OWN subtree fixes that repro and the corpus
+  // stays green - and the fbc suite goes CUPASS 273 -> 263. Narrowing it to names the program declares
+  // MORE THAN ONCE still reads 264. An @ taken outside a block reaches a variable declared inside it in
+  // plenty of shapes, and a block dictionary loses those; and the registries below (FRawModuleScalars,
+  // FAddrSharedScalars) are keyed by NAME with no scope anyway, so marking one declaration and not the
+  // other still leaves both reading the same entry. It is PER-DECLARATION IDENTITY that is missing -
+  // what LocalArrayMangle gives an array - and that is a model change, not a branch here. Worth 516
+  // assertions; DIVERGENZE 56.
   for i := 0 to Node.ChildCount - 1 do
     MarkAddressTaken(Node.GetChild(i), Dict, InProc);
 end;
@@ -34483,6 +34531,20 @@ begin
       (UpperCase(VarToStr(Node.Value)) = kCLEAR) or (UpperCase(VarToStr(Node.Value)) = kFBMEMCOPYCLEAR)) then
   begin
     EmitRawMemOp(UpperCase(VarToStr(Node.Value)), ArgList, PtrVal);
+    Exit;
+  end;
+  // fbc's RUNTIME LIBRARY, declared by the program itself: "Declare Sub fb_I18nSet Alias "fb_I18nSet"
+  // ( ByVal on_off As Long )" and then called. fbc resolves it in libfb; here it named nothing and the
+  // whole module was refused with "Undefined procedure: FB_I18NSET" - three of fbc's own datetime tests
+  // die on that one line, and behind it are 80 assertions about DateSerial/DatePart/TimeSerial that
+  // nobody had ever seen. fb_I18nSet(0) turns localisation OFF, which is this VM's permanent state (we
+  // have no locale tables at all), so honouring it is a NO-OP and honouring it faithfully means
+  // evaluating the argument and doing nothing. Declared in BASIC.md.
+  if (UpperCase(VarToStr(Node.Value)) = 'FB_I18NSET') and
+     (FProcedureNames.IndexOf('FB_I18NSET') < 0) then
+  begin
+    if Assigned(ArgList) and (ArgList.ChildCount >= 1) then
+      ProcessExpression(ArgList.GetChild(0), PtrVal);   // the argument is still evaluated
     Exit;
   end;
   // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor on THIS.
