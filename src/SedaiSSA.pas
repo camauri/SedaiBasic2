@@ -2200,13 +2200,39 @@ begin
       if (Node.ChildCount > 0) and (Node.GetChild(0) <> nil) then
       begin
         TempNode := Node.GetChild(0);
-        while (TempNode.NodeType = antParentheses) and (TempNode.ChildCount >= 1) do
-          TempNode := TempNode.GetChild(0);
+        // ⭐ ...AND A CAST IS TRANSPARENT TO "@" as well. "@Cast(UByte, b(0))" is the address of b(0):
+        // the cast says how to READ those bytes, and @ asks where they are. Only parentheses were seen
+        // through here, so the node reached the procedure-address branch with an EMPTY name and failed
+        // with "Undefined procedure (address-of @): " - the empty name being the standing signal for
+        // "right node, unrecognised shape". ⛔ ObjectTypeName, one door along, DOES read through an
+        // antCast: the rule was present in one path and missing in the other.
+        // A cast keeps its TYPE in Value and its operand as the LAST child - one child in the ordinary
+        // "Cast(T, e)", two in the "Cast(TypeOf(x), e)" spelling, which puts the type expression first.
+        while ((TempNode.NodeType = antParentheses) and (TempNode.ChildCount >= 1)) or
+              ((TempNode.NodeType = antCast) and (TempNode.ChildCount >= 1)) do
+          if TempNode.NodeType = antParentheses then TempNode := TempNode.GetChild(0)
+          else TempNode := TempNode.GetChild(TempNode.ChildCount - 1);
         if (TempNode.NodeType = antDeref) and (TempNode.ChildCount >= 1) then
         begin
           ProcessExpression(TempNode.GetChild(0), Result);
           Result := EnsureIntRegister(Result);
           Exit;
+        end;
+        if TempNode <> Node.GetChild(0) then
+        begin
+          if TempNode.NodeType = antArrayAccess then
+          begin
+            EmitArrayElementAddress(TempNode, Result);
+            Exit;
+          end;
+          if TempNode.NodeType = antMemberAccess then
+          begin
+            EmitFieldAddress(TempNode, Result);
+            Exit;
+          end;
+          if (TempNode.NodeType = antIdentifier) and (TempNode.ChildCount = 0) and
+             (Trim(VarToStr(Node.Value)) = '') then
+            Node.Value := TempNode.Value;      // let the whole chain below see the name, as it does for @ns.member
         end;
       end;
       // ⭐ "@r" WHERE r IS A REFERENCE VARIABLE ("Dim ByRef r As T = target"). Its register ALREADY
@@ -12683,13 +12709,25 @@ var
 
 begin
   Result := False;
+  VarName := '';
+  if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+    VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
   TypeName := UpperCase(Node.Attributes.Values['VARTYPE']);
+  // ⛔ THE COUNTER DOES NOT HAVE TO BE DECLARED IN THE HEAD. VARTYPE is filled only by the
+  // "For i As T = a To b" spelling; fbc's own tests - and the manual's iterator examples - write
+  //     Dim i As T
+  //     For i = T(1) To T(3)
+  // and there the type comes from the VARIABLE. With only the first spelling understood, the whole
+  // type-driven expansion was skipped in silence and the loop fell through to the NUMERIC path: not
+  // one of Operator For, Step or Next was ever called, while the counter still advanced and the loop
+  // still terminated, so it looked like a STEP applied twice rather than like an iterator that had
+  // never run. ⭐ The tell is that the operators print NOTHING - the numbers alone do not say it.
+  if (TypeName = '') and (VarName <> '') then TypeName := UpperCase(VarRecordTypeName(VarName));
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   // A type with no iteration NEXT is not an iterator: leave it to the numeric path below.
   if (IterOperatorLabel(TypeName, kNEXT, 2) = '') then Exit;
   Result := True;
 
-  VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
   HasStep := Node.ChildCount > 3;
   if HasStep then NArgs := 1 else NArgs := 0;
 
@@ -28620,6 +28658,24 @@ begin
         end;
       end;
     end;
+  // ⛔ A FOR COUNTER DECLARED IN THE HEAD IS A DECLARATION TOO. "For i As T Ptr = a To b" gives i a
+  // pointer type exactly as a DIM would, and this pass only ever looked at antDim - so the counter
+  // never entered FPointerVars, PointerUDTType answered '' for it, and "@i->field" failed with
+  // "Cannot take address of field: object is not a record" while the WRITE "i->x = i" in the same
+  // loop went through. The type is on the node as VARTYPE, which is where the FOR head keeps it.
+  if (Node.NodeType = antForLoop) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    TypeNameU := UpperCase(Node.Attributes.Values['VARTYPE']);
+    if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
+    begin
+      VNameU := UpperCase(VarToStr(Node.GetChild(0).Value));
+      if not InProc then
+        FPointerVars.Values[VNameU] := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4))
+      else if FPointerVars.IndexOfName(VNameU) < 0 then
+        FPointerVars.Add(VNameU + '=' + Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4)));
+    end;
+  end;
   for i := 0 to Node.ChildCount - 1 do
     CollectDimVarBanks(Node.GetChild(i), Dict, InProc or (Node.GetChild(i).NodeType = antProcedureDecl));
 end;

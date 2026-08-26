@@ -883,6 +883,7 @@ var
   i, j, k, idx, ParenDepth: Integer;
   Word, ArgsStr, BuiltinVal: string;
   InStr: Boolean;
+  InArgStr: Boolean;   // inside a "..." while scanning a macro invocation's arguments
   InCmt: Boolean;   // inside a ' comment: copy verbatim to the end of the line
 begin
   Result := '';
@@ -951,11 +952,19 @@ begin
       // not shadow it with a #define.
       if (j <= Length(Line)) and (Line[j] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
       begin
-        ParenDepth := 0; ArgsStr := '';
+        // ⛔ AND A PARENTHESIS INSIDE A STRING LITERAL IS NOT A PARENTHESIS. This counted '(' and ')'
+        // with no in-string flag, so an argument like "2,(3" closed the list early and the macro was
+        // expanded with the arguments cut short - 'Unexpected token ")"'. SplitMacroArgs and
+        // GatherBalancedParens, downstream, DO carry the flag and are correct; they simply never
+        // receive the whole argument text. One more rule that lives in one path and not in the one
+        // ahead of it.
+        ParenDepth := 0; ArgsStr := ''; InArgStr := False;
         k := j + 1;
         while k <= Length(Line) do
         begin
-          if (Line[k] = '(') then Inc(ParenDepth)
+          if (Line[k] = '"') then InArgStr := not InArgStr
+          else if InArgStr then                     // text, not structure
+          else if (Line[k] = '(') then Inc(ParenDepth)
           else if (Line[k] = ')') then
           begin
             if ParenDepth = 0 then Break;
@@ -999,11 +1008,19 @@ begin
       if (idx >= 0) and (k <= Length(Line)) and (Line[k] = '(') then
       begin
         j := k;
-        ParenDepth := 0; ArgsStr := '';
+        // ⛔ AND A PARENTHESIS INSIDE A STRING LITERAL IS NOT A PARENTHESIS. This counted '(' and ')'
+        // with no in-string flag, so an argument like "2,(3" closed the list early and the macro was
+        // expanded with the arguments cut short - 'Unexpected token ")"'. SplitMacroArgs and
+        // GatherBalancedParens, downstream, DO carry the flag and are correct; they simply never
+        // receive the whole argument text. One more rule that lives in one path and not in the one
+        // ahead of it.
+        ParenDepth := 0; ArgsStr := ''; InArgStr := False;
         Inc(j);   // skip '('
         while j <= Length(Line) do
         begin
-          if (Line[j] = '(') then Inc(ParenDepth)
+          if (Line[j] = '"') then InArgStr := not InArgStr
+          else if InArgStr then                     // text, not structure
+          else if (Line[j] = '(') then Inc(ParenDepth)
           else if (Line[j] = ')') then
           begin
             if ParenDepth = 0 then Break;

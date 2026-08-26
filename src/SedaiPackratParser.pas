@@ -300,6 +300,7 @@ type
     // Read a dotted name "ident(.ident)*" (e.g. a namespace-qualified type "Forms.Point"); returns
     // the joined UPPER-cased name and consumes all segments. The first token must already be checked.
     function ParseDottedName: string;
+    function AtDottedTypeName: Boolean;   // at a type NAME, leading global-scope dots included
     // FreeBASIC function-pointer type "FUNCTION(params) AS ret" / "SUB(params)" after AS. If the
     // current token is FUNCTION/SUB, consume the whole type and mark Node with FUNCPTR / FPPARAMS /
     // FPRET attributes (the variable holds a procedure entry PC, int-banked). Returns True if matched.
@@ -2870,7 +2871,11 @@ begin
           // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
           if TryParseProcPtrType(ParamNode) then
             ParamTypeName := ''
-          else if Context.Check(ttIdentifier) then
+          // ⛔ ...and a PARAMETER's type may carry the global-scope dots too ("ByVal p As ..r.foo.t1").
+          // Asking ttIdentifier alone did not fail here - it fell through with an EMPTY type name, so
+          // the parameter silently defaulted and the callee read a different object. Same spelling as
+          // the DIM gate, and the same reader now answers for both.
+          else if AtDottedTypeName then
           begin
             RetTok := Context.CurrentToken;
             ParamTypeName := UpperCase(ParseDottedName);
@@ -3511,6 +3516,13 @@ function TPackratParser.ParseDottedName: string;
 var
   BaseU: string;
 begin
+  // ⛔ A TYPE NAME MAY BEGIN WITH DOTS. "Dim v As ..r.foo.t1" is FreeBASIC for "resolve r from the
+  // GLOBAL scope": the dots are part of the type-name SPELLING, not an operator, and the same program
+  // written "r.foo.t1" is accepted. Left unread they made the DIM path fail to parse outright and the
+  // PARAMETER path keep its default type in silence - one spelling, two different wrong answers.
+  // ⚠️ The dots are consumed and the name is resolved as written. Whether an explicit global-scope dot
+  // BEATS a local shadow is a separate, declared question (DIVERGENZE 39); this is about reading it.
+  while Context.Check(ttOpDot) do Context.Advance;
   // FreeBASIC "UNSIGNED <basetype>" modifier: map to the unsigned variant type name. A bare
   // "UNSIGNED" (no integer base type following) means UNSIGNED INTEGER. UNSIGNED is not a reserved
   // keyword (it tokenizes as an identifier), so handle it here at the central type-name reader.
@@ -3579,6 +3591,20 @@ begin
     Result := Result + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
     Context.Advance;                                 // segment
   end;
+end;
+
+function TPackratParser.AtDottedTypeName: Boolean;
+// Is the cursor at the start of a type NAME, counting FreeBASIC's leading global-scope dots?
+// One reader for every gate that used to ask "is this an identifier?" and so refused "..r.foo.t1".
+var
+  k: Integer;
+begin
+  if Context.Check(ttIdentifier) then Exit(True);
+  Result := False;
+  if not Context.Check(ttOpDot) then Exit;
+  k := 1;
+  while Assigned(Context.PeekToken(k)) and (Context.PeekToken(k).TokenType = ttOpDot) do Inc(k);
+  Result := Assigned(Context.PeekToken(k)) and (Context.PeekToken(k).TokenType = ttIdentifier);
 end;
 
 function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
@@ -9419,6 +9445,7 @@ var
   FixedCapVal: Int64;   // folded "* n" capacity
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
+  TrailingTypeOfExpr: TASTNode;   // "name As TypeOf(expr)": the operand, consumed per declared name
   SharedFpNode: TASTNode;   // leading-AS "Dim As Sub(...) g": the shared funcptr signature
   MemberAccess, StaticDef: TASTNode;   // "Dim As T Type.member = init": static member definition
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
@@ -9448,6 +9475,7 @@ begin
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
   LeadingTypeOfExpr := nil;   // set when the leading-AS type is "TypeOf(expr)" (inferred in the SSA pre-pass)
+  TrailingTypeOfExpr := nil;
   // M6: "DIM SHARED ..." — the declared variables are module globals visible (read/write) inside
   // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
   IsShared := Context.Check(ttSharedDecl);
@@ -9509,7 +9537,7 @@ begin
     end
     else
     begin
-    if not Context.Check(ttIdentifier) then
+    if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
       DoNodeCreated(Result);
@@ -9718,13 +9746,26 @@ begin
         end;
         if not Assigned(FuncPtrSigNode) then
         begin
-          if not Context.Check(ttIdentifier) then
+          if not AtDottedTypeName then
           begin
             HandleError('Expected type name after AS', Context.CurrentToken);
             Break;
           end;
           TypeTok := Context.CurrentToken;
           DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
+          // ⛔ ...AND THE TRAILING SPELLING OF TypeOf HAS TO CONSUME ITS OPERAND. "Dim b As TypeOf(a)"
+          // read the type as the ordinary name "TYPEOF" and left "( a )" standing in the token stream.
+          // With no initializer nothing noticed, because the statement ended there - which is exactly
+          // why the feature looked present - but "Dim b As TypeOf(a) = 5" then met the '=' with the
+          // parentheses unread and died on 'Unexpected token in statement: "="'. The leading-AS
+          // spelling consumes it; this one only marked the attribute.
+          if (UpperCase(DimTypeName) = 'TYPEOF') and Context.Check(ttDelimParOpen) then
+          begin
+            Context.Advance;                       // '('
+            if Assigned(TrailingTypeOfExpr) then TrailingTypeOfExpr.Free;
+            TrailingTypeOfExpr := FExpressionParser.ParseExpression;
+            if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+          end;
           // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
           // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
           while AtPointerSuffix do
@@ -9742,6 +9783,12 @@ begin
       begin
         // "DIM AS TypeOf(expr) name": child[1] is the expression; the SSA pre-pass infers its type.
         ArrayDecl.AddChild(LeadingTypeOfExpr.Clone);
+        ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+      end
+      else if Assigned(TrailingTypeOfExpr) then
+      begin
+        // "DIM name As TypeOf(expr)": the same shape, reached by the other spelling.
+        ArrayDecl.AddChild(TrailingTypeOfExpr.Clone);
         ArrayDecl.Attributes.Values['TYPEOF'] := '1';
       end
       else
@@ -9937,6 +9984,7 @@ begin
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
   if Assigned(LeadingTypeOfExpr) then LeadingTypeOfExpr.Free;   // clones are on each decl; free the original
+  if Assigned(TrailingTypeOfExpr) then TrailingTypeOfExpr.Free;
   if Assigned(SharedFpNode) then SharedFpNode.Free;             // one signature shared by every name above
   DoNodeCreated(Result);
 end;
@@ -10116,7 +10164,7 @@ begin
   begin
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if not Context.Check(ttIdentifier) then
+    if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
       DoNodeCreated(Result); Exit;
@@ -10214,7 +10262,7 @@ begin
     end;
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if not Context.Check(ttIdentifier) then
+    if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
       Break;
