@@ -2494,6 +2494,16 @@ begin
           Exit;
         end;
       end;
+      // ⛔ A POINTER TARGET IS LEFT A REINTERPRETATION HERE, AND THE ATTEMPT IS WRITTEN DOWN.
+      // "Cast(Integer Ptr, u)" over a UDT declaring "Operator Cast() As Integer Ptr" ought to run that
+      // operator, exactly as the implicit "Dim q As Integer Ptr = bar" already does. Routing it through
+      // TryEmitUDTCastToNumber was TRIED on 26 Aug 2026 and WITHDRAWN: a cast operator's label carries
+      // only its return BANK ('%' int, '#' float, '$' string), and an "Integer Ptr" and a "Double Ptr"
+      // are BOTH int-banked - so the two operators of that very test collide on one label, the second
+      // registration wins, and the explicit cast then answered 4662966031284069990, the bit pattern of
+      // the OTHER operator's Double. A wrong answer where there had been an error. The information is
+      // gone by the time this code runs; the fix is to key the label by the return TYPE for a pointer
+      // return, in PreCollectProcedures, and that is a change to the label scheme. DIVERGENZE 58.
       // ⛔ ...AND A BARE TYPE NAME AS THE OPERAND IS A DEFAULT-CONSTRUCTED TEMPORARY. "Cast(P, P)" is
       // FreeBASIC for "a default P, seen as a P"; lowered as an expression the second P was an
       // undefined VARIABLE, which reads 0, and the receiving DIM then dereferenced handle 0 - an access
@@ -2538,6 +2548,31 @@ begin
       DerefTarget := Node.GetChild(0);
       while (DerefTarget.NodeType = antParentheses) and (DerefTarget.ChildCount >= 1) do
         DerefTarget := DerefTarget.GetChild(0);
+      // ⛔ A UNARY "*" CAN BE OVERLOADED, and the lookup for one lives in the antUnaryOp arm - which a
+      // deref never reaches, because "*f" parses as antDeref and not as a unary operator. So a type
+      // declaring "Operator *( ByRef lhs As foo ) As Integer" had that operator ignored and "*f" read
+      // the record HANDLE as an address, while "f->data" - dispatched elsewhere - worked on the very
+      // same line of the very same test. The list in that arm names "-" and "Not"; this is the third
+      // unary operator FreeBASIC lets a type declare, and it is the one with a node type of its own.
+      if FModernMode and Assigned(DerefTarget) then
+      begin
+        OpLhsType := ObjectTypeName(DerefTarget);
+        if OpLhsType <> '' then
+        begin
+          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR*' + OperatorArityCode(1));
+          if (OpLabel <> '') and ProcHasParamCount(OpLabel, 1) then
+          begin
+            OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+            try
+              OpArgs.AddChild(DerefTarget.Clone);
+              EmitUserFunctionCall(OpLabel, OpArgs, Result);
+            finally
+              OpArgs.Free;
+            end;
+            Exit;
+          end;
+        end;
+      end;
       // "Erfn" arrives as a bare antIdentifier; "Erfn()" as an antArrayAccess whose FIRST CHILD carries
       // the name (the node itself has no Value).
       if FModernMode and Assigned(DerefTarget) and
@@ -24085,6 +24120,16 @@ begin
       if Node.Attributes.Values['FUNCPTR'] = '1' then
         FFuncPtrTypes.Values[Name] :=
           Node.Attributes.Values['FPPARAMS'] + '|' + Node.Attributes.Values['FPRET'];
+      // ⛔ ...AND THE REST OF A COMMA LIST STILL HAS TO BE READ. "Type a As Integer, d As UDT" carries
+      // its extra aliases as ALIASLIST children, and the loop that descends into them is at the BOTTOM
+      // of this branch's sibling - which this Exit never reaches, because the FIRST alias always sets
+      // ALIAS on the parent node. So every alias after the first was registered nowhere: "Dim x As d"
+      // found no type and "x.y" answered 0. The loop was there and UNREACHABLE, which reads exactly
+      // like a loop that does nothing.
+      for i := 0 to Node.ChildCount - 1 do
+        if (Node.GetChild(i).NodeType = antTypeDecl) and
+           (Node.GetChild(i).Attributes.Values['ALIASLIST'] = '1') then
+          CollectUDTNames(Node.GetChild(i));
       Exit;
     end;
     if FindUDT(Name) < 0 then

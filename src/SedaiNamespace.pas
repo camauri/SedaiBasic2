@@ -486,7 +486,16 @@ begin
     if DotPos > 1 then
     begin
       BaseV := Copy(V, 1, DotPos - 1);
-      if Ctx.IsMember(ActivePrefix, BaseV) then
+      // ⛔ ...OR A NESTED NAMESPACE OF IT. The guard asks "is PROCB a MEMBER of PROCA?", and
+      // CollectNamespaces records a nested namespace in NamespaceNames and NEVER in MemberKeys - so
+      // "Private Function procB.f2()" written inside "Namespace procA" kept the bare name procB.f2,
+      // the declaration landed nowhere, and "procA.procB.f2()" was refused as an undeclared array.
+      // ⚠️ And it was worse than a refusal one spelling over: "print procB.f2()" from inside procA
+      // printed 0 where fbc refuses the program outright. The rule was written for "T.method" - where
+      // T is a TYPE, and types ARE member keys - and a NAMESPACE is the other thing a dotted head can
+      // name here.
+      if Ctx.IsMember(ActivePrefix, BaseV) or
+         (Ctx.NamespaceNames.IndexOf(ActivePrefix + '.' + BaseV) >= 0) then
         Node.GetChild(0).Value := ActivePrefix + '.' + V;
     end;
   end;
