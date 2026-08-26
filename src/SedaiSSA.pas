@@ -31956,6 +31956,21 @@ begin
   Result := MakeSSAValue(svkNone);
   if MemberNode.ChildCount < 1 then Exit;
   TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  // ⛔ ...AND "ProcPtr( B.proc1 )" ON AN ABSTRACT METHOD IS NOT A FIELD ADDRESS AT ALL. An abstract
+  // method has no body to point at, and fbc answers 0 for it rather than refusing - the base here is a
+  // TYPE NAME, so ObjectTypeName says nothing and the whole program was refused with a message about
+  // records. The concrete case ("ProcPtr(p, Virtual)") is a declared gap of its own: this VM has no
+  // indexable vtable, and that refusal names itself.
+  if (TypeName = '') and (MemberNode.ChildCount >= 1) and
+     (MemberNode.GetChild(0).NodeType = antIdentifier) and
+     (FindUDT(UpperCase(VarToStr(MemberNode.GetChild(0).Value))) >= 0) and
+     DeclaresAbstractMethod(UpperCase(VarToStr(MemberNode.GetChild(0).Value)),
+                            UpperCase(VarToStr(MemberNode.Value))) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if TypeName = '' then
     raise Exception.Create('Cannot take address of field: object is not a record');
   UDTIdx := FindUDT(TypeName);
