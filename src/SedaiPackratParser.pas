@@ -1837,6 +1837,12 @@ begin
   begin
     OpSym := Context.CurrentToken.Value;
     Context.Advance;                                 // consume the "op=" token
+    // ⛔ ...AND THE "=>" SPELLING OF THE SAME OPERATOR. FreeBASIC accepts "i +=> 5" beside "i += 5",
+    // just as it accepts "i => 5" beside "i = 5"; the lexer answers a single ttCompoundAssign for the
+    // "+=" and leaves the '>' standing, which then read as a comparison and failed with 'Unexpected
+    // token ">"'. The plain "=>" form was already understood - only the COMPOUND one was not, which is
+    // the same one-spelling-of-two shape as everywhere else in this campaign.
+    if Context.Check(ttOpGt) then Context.Advance;    // the "op=>" spelling
     Expression := FExpressionParser.ParseExpression;
     if not Assigned(Expression) then
     begin
@@ -9997,6 +10003,7 @@ function TPackratParser.ParseVarStatement: TASTNode;
 var
   Token, NameTok: TLexerToken;
   Decl, InitExpr, AddrNode: TASTNode;
+  VarDottedName: string;   // "Var UDT.i = ...": a static member DEFINED outside its type
   VarIsByref, VarIsShared, DeclIsByref: Boolean;
 begin
   Token := Context.CurrentToken;
@@ -10037,7 +10044,21 @@ begin
       Break;
     end;
     NameTok := Context.CurrentToken;
+    // ⛔ ...AND THE NAME MAY BE DOTTED. "Var UDT.i = 456" DEFINES, outside the type, the static member
+    // declared "Static i As Integer" inside it - the same thing "Static Shared UDT.g As Integer" does,
+    // and that path already folds the dotted spelling into the single name a static member is backed
+    // by. VAR read ONE identifier, so it stopped on the '.' and reported "VAR requires an
+    // initializer" - a complaint about the '=' that is right there.
+    VarDottedName := UpperCase(VarToStr(NameTok.Value));
     Context.Advance;                                 // name
+    while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+          (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+          (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+    begin
+      Context.Advance;                               // '.'
+      VarDottedName := VarDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;                               // segment
+    end;
     if not Context.Check(ttOpEq) then
     begin
       HandleError('VAR requires an initializer: VAR name = expression', Context.CurrentToken);
@@ -10047,7 +10068,7 @@ begin
     InitExpr := FExpressionParser.ParseExpression;
     if not Assigned(InitExpr) then Break;
     Decl := TASTNode.Create(antArrayDecl, NameTok);
-    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, VarDottedName, NameTok));
     if DeclIsByref then
     begin
       // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
@@ -10831,6 +10852,8 @@ function TPackratParser.ParseConstStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
   Assignment, ValueNode, ArrayDecl, ProcPtrScratch: TASTNode;
+  ConstTypeOfExpr: TASTNode;   // "Const ... As TypeOf(expr)": the operand, in either spelling
+  DecoK: Integer;              // how many OOP decorators sit between CONST and the procedure keyword
   TypeName: string;
 
   // Best-effort bank of an untyped CONST initializer that is NOT a plain literal — a string-returning
@@ -10991,6 +11014,7 @@ var
   end;
 
 begin
+  ConstTypeOfExpr := nil;
   // FreeBASIC CONST METHOD DEFINITION: "Const Sub|Function|Operator|Property T.m(...)". The qualifier
   // sits in FRONT of the procedure keyword, so the statement opens with CONST and is not a constant
   // declaration at all - it was read as one and died on "Expected variable name in assignment". Same
@@ -10998,9 +11022,20 @@ begin
   // grammar read the rest. CONST on a method is a promise about THIS, and this VM does not enforce it
   // (as it does not enforce "As Const" on a variable), so nothing else is needed for the definition to
   // mean what it means.
-  if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
+  // ⛔ ...AND THE QUALIFIERS COME IN EITHER ORDER. "Const Virtual Function A.f()" is FreeBASIC, and
+  // this gate asked only whether the VERY NEXT token opens a procedure - so one decorator between
+  // CONST and FUNCTION sent the whole definition down the constant-declaration path, where it died on
+  // "Expected = in assignment", a message about a statement it never was. The decorators are read here
+  // only to LOOK PAST them; what they MEAN is already handled where a decorator leads the definition.
+  DecoK := 1;
+  while Assigned(Context.PeekToken(DecoK)) and (Context.PeekToken(DecoK).TokenType = ttIdentifier) and
+        ((UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'VIRTUAL') or
+         (UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'ABSTRACT') or
+         (UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'OVERRIDE')) do
+    Inc(DecoK);
+  if Assigned(Context.PeekToken(DecoK)) and (Context.PeekToken(DecoK).TokenType = ttProcedureStart) then
   begin
-    Context.Advance;                                   // consume CONST
+    while DecoK > 0 do begin Context.Advance; Dec(DecoK); end;   // CONST and any decorators after it
     Exit(ParseProcedureDecl);
   end;
   Token := Context.CurrentToken;
@@ -11023,7 +11058,22 @@ begin
     SkipTypeQualifiers;                     // FB: "As Const <type>"
     TypeTok := Context.CurrentToken;
     TypeName := 'INTEGER';
-    if Context.Check(ttIdentifier) then
+    // ⛔ ...AND THE CONST PATHS HAD NO TypeOf BRANCH AT ALL, in either spelling. "Const a As TypeOf(x)
+    // = 1" and "Const As TypeOf(x) K = 5" are both FreeBASIC, and both read the type as the ordinary
+    // name "TYPEOF", leaving "( x )" in the stream - so the reader met '(' where it wanted a name or an
+    // '=' and reported the wrong thing entirely ("Expected constant name after CONST AS type"). DIM has
+    // carried this rule in its leading-AS spelling for a long time; the constant is lowered to a typed
+    // scalar DIM, so it wants exactly the same answer.
+    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttDelimParOpen) then
+    begin
+      Context.Advance;                                // TYPEOF
+      Context.Advance;                                // '('
+      if Assigned(ConstTypeOfExpr) then ConstTypeOfExpr.Free;
+      ConstTypeOfExpr := FExpressionParser.ParseExpression;
+      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    end
+    else if Context.Check(ttIdentifier) then
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
@@ -11052,14 +11102,22 @@ begin
     Result.Free;                                      // discard the antConst; emit a typed DIM instead
     ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
+    // "Const ... As TypeOf(expr)": child[1] is the EXPRESSION and the SSA pre-pass infers the concrete
+    // type from it, exactly as the DIM path does. Its own registries keep the placeholder name, since
+    // there is no type name to record until that pass has run.
+    if Assigned(ConstTypeOfExpr) then
+    begin
+      ArrayDecl.AddChild(ConstTypeOfExpr.Clone);
+      ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+    end
+    else
+      ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
-      UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := TypeName;
     if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
       FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
@@ -11085,7 +11143,17 @@ begin
     // identifier at all - so the reader below skipped it, the type stayed INTEGER and the '(' was met
     // where '=' was expected. DIM has read this signature all along; a constant holds only the pointer
     // VALUE (int-banked here), so the signature is consumed and its shape recorded on a scratch node.
-    if Context.Check(ttProcedureStart) then
+    // ...and the trailing spelling wants the very same TypeOf branch (see the note on the leading one).
+    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttDelimParOpen) then
+    begin
+      Context.Advance;                                // TYPEOF
+      Context.Advance;                                // '('
+      if Assigned(ConstTypeOfExpr) then ConstTypeOfExpr.Free;
+      ConstTypeOfExpr := FExpressionParser.ParseExpression;
+      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    end
+    else if Context.Check(ttProcedureStart) then
     begin
       ProcPtrScratch := TASTNode.Create(antArrayDecl, TypeTok);
       try
@@ -11116,14 +11184,22 @@ begin
     Result.Free;                                      // discard the antConst; emit a typed DIM instead
     ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
+    // "Const ... As TypeOf(expr)": child[1] is the EXPRESSION and the SSA pre-pass infers the concrete
+    // type from it, exactly as the DIM path does. Its own registries keep the placeholder name, since
+    // there is no type name to record until that pass has run.
+    if Assigned(ConstTypeOfExpr) then
+    begin
+      ArrayDecl.AddChild(ConstTypeOfExpr.Clone);
+      ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+    end
+    else
+      ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
-      UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := TypeName;
     if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
       FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
