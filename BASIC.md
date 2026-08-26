@@ -2074,7 +2074,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Constructor (Module)` | ✓ | `Sub name [()] Constructor [priority]` runs before module-level code (definition order); a ctor may initialise SHARED globals. Priority parsed but not yet ordering. |
+| `Constructor (Module)` | ✓ | `Sub name [()] Constructor [priority]` runs before module-level code (definition order); a ctor may initialise SHARED globals. What it SEES is what fbc's static initialisation puts there first: a `Dim Shared x As <scalar> = <constant>` already holds its value (and is *not* re-run afterwards, so a value the ctor writes survives), and a `Dim Shared v(0 To n)` with constant bounds is already dimensioned. A non-constant initialiser is a declared divergence — fbc refuses one — and stays where it is written. Fixed 26 Aug 2026, guard `m589`. Priority parsed but not yet ordering. |
 | `Destructor (Module)` | ✓ | `Sub name [()] Destructor [priority]` runs after module-level code (reverse order), on fall-through and explicit `END`. |
 
 ##### Miscellaneous

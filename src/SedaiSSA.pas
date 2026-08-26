@@ -552,6 +552,10 @@ type
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
     procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
+    procedure EmitSharedScalarConstInits(Node: TASTNode); // ...and apply their CONSTANT initialisers, which fbc does statically
+    procedure EmitSharedArrayAllocs(Node: TASTNode);      // ...and DIM the module arrays whose bounds are constant
+    function DimBoundsAreConstant(DimsNode: TASTNode): Boolean;  // every subscript written as a literal
+    function AnyHoistedDim(DimNode: TASTNode): Boolean;          // ...this antDim holds one such declaration
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
@@ -6445,7 +6449,13 @@ begin
         // initializer element, assignment RHS, function argument): the "array name" is actually a declared
         // UDT type and not a real array. Construct a temporary instance (allocate + constructor) and return
         // its handle. Guarded by ArrayIndexOf < 0 so a genuine array of the same name still wins.
-        if (FindUDT(UpperCase(ArrName)) >= 0) and (ArrayIndexOf(UpperCase(ArrName)) < 0) and
+        // ⛔ ...AND A PROCEDURE OF THAT NAME WINS, which is why the test is the SHARED guard and not a
+        // FindUDT written out again here. "Type T ... End Type : Sub t() ... : t()" is legal in fbc and
+        // calls the SUB; the type name matched first here, so the call built an anonymous temporary and
+        // threw it away - it SILENTLY did not happen, with no diagnostic anywhere. Eight lines reproduce
+        // it, and it took a module constructor to notice, because there the missing call is all the
+        // constructor does. "type<T>( ... )" carries TYPECTOR and still names the type on purpose.
+        if IsTypeCtorTemporary(Node) and
            (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antExpressionList) then
           if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
 
@@ -6583,7 +6593,14 @@ begin
 
         // FreeBASIC function pointer "fp(args)": an indirect call through the variable's entry-PC value.
         // Checked before the FUNCTION/array paths (the name is a local variable, not a declared proc).
-        if FFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0 then
+        // ⛔ ...BUT NOT WHEN THE NODE IS THE SYNTHETIC "name(0)" OF A SHARED SCALAR. A DIM SHARED is
+        // array-backed and every READ of it is rewritten to element 0 of that backing, which has the
+        // very shape of an indirect call: "Dim Shared cl As Sub()" then merely PRINTING cl called
+        // through it - and a null procptr calls PC 0, which is the start of the module, so the program
+        // silently restarted for ever. SHAREDELEM is the marker MakeSharedScalarAccess already puts
+        // there for the same reason on the string-subscript path.
+        if (FFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0) and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') then
         begin
           Result := EmitFuncPtrCall(UpperCase(ArrName), FFuncPtrSigs.Values[UpperCase(ArrName)], Node.GetChild(1));
           Exit;
@@ -7665,8 +7682,13 @@ begin
   if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 1) then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
   Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  // ⛔ ...AND A PROCEDURE OF THAT NAME WINS. "Type T ... End Type : Sub t() ... : t()" is legal in fbc
+  // and calls the SUB; here the type name matched first, so "t()" built an anonymous temporary and
+  // threw it away - the call SILENTLY did not happen, with no diagnostic anywhere. It took a module
+  // constructor to notice, because there the missing call is all the constructor did. The explicit
+  // "type<T>( ... )" spelling carries TYPECTOR and is unaffected: that one names a type on purpose.
   Result := (Node.Attributes.Values['TYPECTOR'] = '1') or
-            ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0));
+            ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0) and (FProcedureNames.IndexOf(Nm) < 0));
 end;
 
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
@@ -9966,6 +9988,14 @@ begin
   begin
     ArrayDeclNode := Node.GetChild(j);
 
+    // ⭐ A DECLARATION HOISTED BEFORE THE MODULE CONSTRUCTORS IS LOWERED EXACTLY ONCE. The mark is set
+    // by EmitSharedArrayAllocs and turned to '2' the first time through, so the module walk that meets
+    // the very same node afterwards steps over it instead of re-declaring (which would resize the array
+    // and drop whatever a constructor had put in it).
+    if ArrayDeclNode.Attributes.Values['HOISTEDDIM'] = '2' then Continue;
+    if ArrayDeclNode.Attributes.Values['HOISTEDDIM'] = '1' then
+      ArrayDeclNode.Attributes.Values['HOISTEDDIM'] := '2';
+
     // Only process antArrayDecl nodes (modern AST format)
     if ArrayDeclNode.NodeType <> antArrayDecl then
       Continue;
@@ -10241,7 +10271,10 @@ begin
               EmitXferStore(srtInt, PtrInt(FModuleDtorSlots.Objects[MDtorSlotIdx]), RecHandleVal);
           end;
         end
-        else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        // PREINITED: the constant was already stored before the module constructors ran, and a
+        // constructor may have changed it since - re-running the initialiser here would undo that.
+        else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+                (ArrayDeclNode.Attributes.Values['PREINITED'] <> '1') then
         begin
           InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
           InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
@@ -28704,6 +28737,119 @@ begin
   end;
 end;
 
+function TSSAGenerator.AnyHoistedDim(DimNode: TASTNode): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  for i := 0 to DimNode.ChildCount - 1 do
+    if DimNode.GetChild(i).Attributes.Values['HOISTEDDIM'] = '1' then Exit(True);
+end;
+
+function TSSAGenerator.DimBoundsAreConstant(DimsNode: TASTNode): Boolean;
+// Every subscript of this declaration is written as a LITERAL (either "n" or "lb To ub"). Only such a
+// declaration can be hoisted before the module constructors: a bound that is an expression would move
+// an evaluation, which is a different question from allocating storage.
+var
+  i, k: Integer;
+  D: TASTNode;
+begin
+  Result := False;
+  if (DimsNode = nil) or (DimsNode.NodeType <> antDimensions) or (DimsNode.ChildCount = 0) then Exit;
+  for i := 0 to DimsNode.ChildCount - 1 do
+  begin
+    D := DimsNode.GetChild(i);
+    if D.NodeType = antLiteral then Continue;
+    if D.NodeType <> antDimRange then Exit;
+    if D.ChildCount < 2 then Exit;
+    for k := 0 to 1 do
+      if D.GetChild(k).NodeType <> antLiteral then Exit;
+  end;
+  Result := True;
+end;
+
+procedure TSSAGenerator.EmitSharedArrayAllocs(Node: TASTNode);
+// ⛔ AND A MODULE CONSTRUCTOR RUNS BEFORE THE MODULE'S ARRAYS EXIST. EmitSharedScalarAllocs pre-sizes
+// every SHARED SCALAR backing here for exactly this reason, and nobody ever did the same for a real
+// ARRAY: "Dim Shared procs(0 To 7) As Sub()" plus "procs(0) = ProcPtr(t)" inside a constructor wrote
+// into an array that had not been dimensioned yet, and the module body then called through it - an
+// access violation on eight lines of legal FreeBASIC. In fbc a constant-bounds Dim Shared is static
+// storage: it exists before any code runs.
+//
+// The whole declaration is lowered HERE, mark and all, and the module walk skips the node it has
+// already handled (HOISTEDDIM). Only module level, only SHARED, only CONSTANT bounds, and only when
+// the program defines a module constructor - without one nothing can observe the difference.
+var
+  i, k: Integer;
+  Decl: TASTNode;
+begin
+  if (Node = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    if Node.GetChild(i).NodeType <> antDim then Continue;
+    for k := 0 to Node.GetChild(i).ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(i).GetChild(k);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
+      if Decl.Attributes.Values['SHARED'] <> '1' then Continue;
+      if Decl.GetChild(1).NodeType <> antDimensions then Continue;      // a scalar: the allocs above have it
+      if not DimBoundsAreConstant(Decl.GetChild(1)) then Continue;
+      Decl.Attributes.Values['HOISTEDDIM'] := '1';
+    end;
+    if AnyHoistedDim(Node.GetChild(i)) then ProcessDim(Node.GetChild(i));
+  end;
+end;
+
+procedure TSSAGenerator.EmitSharedScalarConstInits(Node: TASTNode);
+// ⛔ A MODULE CONSTRUCTOR MUST SEE THE VALUE, NOT THE ZERO. "Dim Shared a As Integer = 7" is a STATIC
+// initialisation in fbc - it refuses a non-constant one outright ("error 11: Expected constant") - so
+// the value is in place before any constructor runs, and the declaration is never re-executed. Here the
+// "= expr" was lowered where the DIM stands, i.e. AFTER the ctors, so a constructor read 0; and worse,
+// re-running it at the DIM then OVERWROTE what the constructor had written ("a = 99" in the ctor, 7
+// afterwards, against fbc's 99).
+//
+// So the constant initialisers are applied HERE, beside the backing-array pre-sizing that already
+// exists for the same reason, and the DIM skips them (it asks the same PREINITED mark). Only CONSTANT
+// initialisers - a literal, or a sign in front of one - are hoisted: those are the ones fbc calls
+// static, and hoisting anything else would move an evaluation, which is a different question.
+// Module level only, and only when the program defines a module constructor: without one, nothing can
+// observe the difference and the DIM path stays exactly as it was.
+var
+  i, k: Integer;
+  Decl, InitNode, InitAssign: TASTNode;
+  NameU: string;
+begin
+  if (Node = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    if Node.GetChild(i).NodeType <> antDim then Continue;
+    for k := 0 to Node.GetChild(i).ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(i).GetChild(k);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 3) then Continue;
+      if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+      InitNode := Decl.GetChild(2);
+      // A literal, or a unary +/- applied to one. Anything else is left where it was written.
+      if InitNode.NodeType = antUnaryOp then
+      begin
+        if (InitNode.ChildCount < 1) or (InitNode.GetChild(0).NodeType <> antLiteral) then Continue;
+      end
+      else if InitNode.NodeType <> antLiteral then Continue;
+      NameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      if not IsSharedScalar(NameU) then Continue;
+      if FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) >= 0 then Continue;   // a record is built at its DIM
+      InitAssign := TASTNode.Create(antAssignment, Decl.GetChild(0).Token);
+      InitAssign.AddChild(MakeSharedScalarAccess(NameU, Decl.GetChild(0).Token));
+      InitAssign.AddChild(InitNode.Clone);
+      try
+        ProcessArrayStore(InitAssign);
+        Decl.Attributes.Values['PREINITED'] := '1';
+      finally
+        InitAssign.Free;
+      end;
+    end;
+  end;
+end;
+
 function TSSAGenerator.StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;
 // If ObjNode.FieldName is a static member (accessed via the type name OR via an instance), return the
 // backing shared-scalar name "DECLTYPE.FIELD" (walking the inheritance chain); otherwise ''.
@@ -31200,7 +31346,7 @@ begin
     // "T Ptr" IS the record handle, so the address of the temporary is the temporary: build it and hand
     // its handle back. Same guard as the temporary hook in ProcessExpression (a real array of that name
     // still wins), so the two paths cannot disagree about what a name means.
-    if (FindUDT(UpperCase(ArrName)) >= 0) and (Node.ChildCount >= 2) and
+    if IsTypeCtorTemporary(Node) and (Node.ChildCount >= 2) and
        (Node.GetChild(1).NodeType = antExpressionList) then
       if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
     // "@wstr(expr)": WSTR produces a WIDE string, and its address is the address of that UCS-2
@@ -36185,6 +36331,8 @@ begin
   // after static-member allocation). No-op when the program defines none. Pre-size SHARED-scalar backings
   // first so a constructor can touch module globals before their DIM statement runs.
   EmitSharedScalarAllocs;
+  EmitSharedScalarConstInits(AST);
+  EmitSharedArrayAllocs(AST);
   EmitModuleConstructors;
 
   // Process AST (DATA statements will be skipped since they're already processed).
