@@ -286,6 +286,9 @@ type
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
+    FFixedStrNames: TStringList;         // names DIM'd as a FIXED-LENGTH ZSTRING/WSTRING ("ZString * n").
+                                         // Collected before the @-taken pass so STRPTR/SADD of one can be
+                                         // treated as the address-taking it is - see CollectFixedStrNames.
     FVarDeclTypeName: TStringList;       // every DIM/VAR'd scalar: name (UPPER) -> the type NAME it was declared as
                                          // ⛔ FVarExplicitType beside it holds only the BANK - three answers for ten
                                          // types - and DeclaredTypeNameOf fell back to it, so "Dim s As Short" answered
@@ -568,6 +571,7 @@ type
     procedure EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);  // store an SSA value into name(0)
     // FreeBASIC pointers: record pointer-var pointee types and back every address-taken (@x) scalar
     // with a 1-element global array (reusing the SHARED-scalar machinery), so it has a stable address.
+    procedure CollectFixedStrNames(Node: TASTNode);   // fills FFixedStrNames
     procedure CollectAddressTakenVars(Node: TASTNode);
     // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
     procedure CheckTypeNameShadowedByVar(Node: TASTNode);
@@ -1292,6 +1296,8 @@ begin
   FEnumMemberType.CaseSensitive := False;
   FVarEnumType := TStringList.Create;
   FVarEnumType.CaseSensitive := False;
+  FFixedStrNames := TStringList.Create;
+  FFixedStrNames.CaseSensitive := False;
   FVarDeclTypeName := TStringList.Create;
   FVarDeclTypeName.CaseSensitive := False;
   FPointerVars := TStringList.Create;
@@ -1408,6 +1414,7 @@ begin
   FEnumNames.Free;
   FEnumMemberType.Free;
   FVarEnumType.Free;
+  FFixedStrNames.Free;
   FVarDeclTypeName.Free;
   FPointerVars.Free;
   FAddrTakenScalars.Free;
@@ -6737,6 +6744,14 @@ begin
         if FModernMode and ((UpperCase(ArrName) = kSADD) or (UpperCase(ArrName) = kSTRPTR)) and
            (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
+          // ⭐ ...unless the argument HAS a real buffer, in which case that address IS the answer and it
+          // is the same one every time. See the note beside VARPTR in CollectDimVarBanks for why a
+          // fixed-length string is backed at all.
+          if RawZStringBufAddr(Node.GetChild(1).GetChild(0), ArgValue) then
+          begin
+            Result := EnsureIntRegister(ArgValue);
+            Exit;
+          end;
           ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -29006,6 +29021,22 @@ begin
     VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
   end;
+  // ⛔ ...AND SO DOES STRPTR/SADD OF A FIXED-LENGTH STRING. fbc's StrPtr answers the variable's OWN
+  // buffer address, the same one every time; ours answered a fresh NUL-terminated COPY per call, which
+  // its own comment calls a snapshot - so "cint(strptr(s)) - cint(strptr(s))" was 16 where fbc says 0,
+  // and every program that indexes off StrPtr walked a different buffer each time it asked. A
+  // "ZString * n" HAS a stable buffer the moment it is backed, so taking StrPtr of one is exactly the
+  // address-taking VARPTR is treated as, three lines above. ⚠️ Only a FIXED-LENGTH one: a var-length
+  // String has no such buffer here, and there the copy is still the honest answer.
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     ((UpperCase(VarToStr(Node.GetChild(0).Value)) = kSTRPTR) or
+      (UpperCase(VarToStr(Node.GetChild(0).Value)) = kSADD)) and
+     (Node.GetChild(1).ChildCount >= 1) and (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+  begin
+    VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
+    if (FFixedStrNames.IndexOf(VNameU) >= 0) and (Dict.IndexOf(VNameU) < 0) then Dict.Add(VNameU);
+  end;
   // ⛔⛔ AND THE **ByRef** POSITIONS OF fb_Mem*/Clear ARE THE SAME CASE. They take the address
   // of the lvalue they name, exactly as VARPTR does, so that variable must be backed with
   // stable storage - and if it is not registered HERE, the "@name" synthesized during SSA
@@ -29517,6 +29548,32 @@ begin
     CheckTypeNameShadowedByVar(Node.GetChild(i));
 end;
 
+procedure TSSAGenerator.CollectFixedStrNames(Node: TASTNode);
+// Every name declared "AS ZSTRING * n" / "AS WSTRING * n". A whole-AST prescan rather than a running
+// note, because STRPTR may be written BEFORE the declaration inside a procedure body.
+var
+  i, k: Integer;
+  D: TASTNode;
+  T: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      D := Node.GetChild(k);
+      if (D.NodeType = antArrayDecl) and (D.ChildCount >= 2) and
+         (D.GetChild(0).NodeType = antIdentifier) and (D.GetChild(1).NodeType = antIdentifier) and
+         (StrToIntDef(D.Attributes.Values['FIXEDLEN'], 0) > 0) then
+      begin
+        T := UpperCase(VarToStr(D.GetChild(1).Value));
+        if ((T = 'ZSTRING') or (T = 'WSTRING')) and
+           (FFixedStrNames.IndexOf(UpperCase(VarToStr(D.GetChild(0).Value))) < 0) then
+          FFixedStrNames.Add(UpperCase(VarToStr(D.GetChild(0).Value)));
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do CollectFixedStrNames(Node.GetChild(i));
+end;
+
 procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
 // Runs BEFORE CollectSharedVars: marks @-taken declared scalars SHARED so they become array-backed
 // (addressable). Also records pointer-var pointee types in FPointerVars. In addition, arguments passed
@@ -29528,6 +29585,8 @@ begin
   Dict := TStringList.Create;
   ByrefRetNames := TStringList.Create;
   try
+    FFixedStrNames.Clear;
+    CollectFixedStrNames(Node);       // which names are fixed-length character BUFFERS
     CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
     CollectScalarPtrBanks(Node);      // per @-taken scalar, the banks of pointers taking its @ (RAWMODULE gate)
     GatherByrefRetFuncNames(Node, ByrefRetNames);
@@ -31333,10 +31392,11 @@ var
   Indices: array of TSSAValue;
   LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
   TempReg, Stride: Integer;
-  RawFieldPointee, RecTypeName: string;
+  RawFieldPointee, RecTypeName, BaseTypeName: string;
   AddrNd: TASTNode;
   MArrHandle, MArrIdx: TSSAValue;
   MArrBank: TSSARegisterType;
+  ElemSz: Int64;
 begin
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
@@ -31442,6 +31502,44 @@ begin
       if TempVal.Kind <> svkNone then
       begin
         Result := EmitWStringTempAddr(TempVal);
+        Exit;
+      end;
+    end;
+    // ⛔ ...AND THE BASE NEED NOT BE A NAME AT ALL. Every rung of this ladder is indexed by ArrName, so
+    // "@(strptr(s)[1])" - whose base is a CALL - arrived with an EMPTY name and fell off the end with a
+    // message that names nothing ("undeclared array: "). The same thing through a variable,
+    // "q = strptr(s) : @(q[1])", has always worked, which is what said the gap was the NAME and not the
+    // indexing. Answered here for the bases whose pointee this generator can actually name: a string
+    // DATA pointer (SADD/STRPTR and that plus an offset), and any expression with a declared "T PTR"
+    // type. Anything else still raises - a wrong scale would be worse than a refusal.
+    if (Node.GetChild(0).NodeType <> antIdentifier) and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+    begin
+      BaseTypeName := UpperCase(DeclaredTypeNameOf(Node.GetChild(0)));
+      if IsStrDataPtrExpr(Node.GetChild(0)) then
+        ElemSz := 1                                  // a string's data pointer addresses BYTES
+      else if RawPtrExprName(Node.GetChild(0)) <> '' then
+        // "p ± n" over a raw pointer VARIABLE: the same name-based question the p[i] path asks.
+        ElemSz := RawElemSizeOf(RawPtrExprName(Node.GetChild(0)))
+      else if (Length(BaseTypeName) > 4) and (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') then
+        ElemSz := RawElemSizeOfPointee(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
+      else
+        ElemSz := 0;                                 // nothing here can name the pointee: refuse below
+      if ElemSz > 0 then
+      begin
+        ProcessExpression(Node.GetChild(0), BaseVal);
+        ProcessExpression(Node.GetChild(1).GetChild(0), TempVal);
+        TempVal := EnsureIntRegister(TempVal);
+        if ElemSz > 1 then
+        begin
+          StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(ElemSz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaMulInt, MulResult, TempVal, StrideVal, MakeSSAValue(svkNone));
+          TempVal := MulResult;
+        end;
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, Result, EnsureIntRegister(BaseVal), TempVal, MakeSSAValue(svkNone));
         Exit;
       end;
     end;
