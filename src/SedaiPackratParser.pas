@@ -9841,7 +9841,22 @@ begin
       if Context.Check(ttOpEq) then
       begin
         Context.Advance;                     // =
-        if Context.Check(ttIdentifier) and
+        // ⛔ "= Any" IS NOT AN INITIALIZER EXPRESSION, and letting it be one is not harmless. The array
+        // spelling is recognised explicitly and marks ANYINIT; the note there says the SCALAR spelling
+        // "has always gone through (it lands on the ordinary initializer path, where the bare name ANY
+        // reads as an undeclared identifier)". For a builtin scalar that undeclared name reads 0 and
+        // nothing shows. For a UDT it OVERWRITES THE HANDLE with 0, so the record allocated a moment
+        // earlier is lost and the first field access dereferences null: "Dim v As T = Any" died with an
+        // access violation while "Dim v As T" - the same declaration without the words that mean DO NOT
+        // INITIALISE - worked. Marked the same way as the array form, and no initializer is attached.
+        // ⚠️ The storage is still ZEROED, as it is for the array form: a defined state where fbc hands
+        // back whatever was there. Declared in BASIC.md.
+        if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY') then
+        begin
+          Context.Advance;                   // Any
+          ArrayDecl.Attributes.Values['ANYINIT'] := '1';
+        end
+        else if Context.Check(ttIdentifier) and
            (UpperCase(Context.CurrentToken.Value) = DimTypeName) and
            (not IsBuiltinTypeName(DimTypeName)) then
           Context.Advance                    // RHS == declared UDT: ctor form (block below reads '(')

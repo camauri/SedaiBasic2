@@ -590,6 +590,7 @@ type
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
     function IsStrDataPtrExpr(Node: TASTNode): Boolean;                         // SADD(s)/STRPTR(s), and that ± an offset
+    function IsStringConstName(const Name: string): Boolean;                    // a declared STRING constant?
     function RawPtrExprPointee(Node: TASTNode): string;                         // scalar pointee of a raw FIELD ptr expr (obj.field, @obj.field[i]), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
@@ -2276,6 +2277,33 @@ begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaRefAddrField, Result, AddrLocalHandle(VarToStr(Node.Value)),
                         MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      end
+      else if IsStringConstName(VarToStr(Node.Value)) then
+      begin
+        // ⭐ "@C" WHERE C IS A STRING CONST. In FreeBASIC a string constant IS a ZString sitting in
+        // memory, so its address is the address of its CHARACTERS - the same thing SADD answers - and
+        // "Dim p As ZString Ptr = @C : Print *p" is how fbc's own tests reach one.
+        // ⛔ It was being claimed by the branch just below: a const is registered like a shared scalar,
+        // so @ handed back the PACKED SLOT address (2^32 for the first one) and dereferencing it raised
+        // "Null or invalid raw pointer dereference" - a diagnostic about the pointer that never
+        // mentions the const. STRPTR(C) on the very same name was right all along, which is the
+        // difference that named it.
+        // ⚠️ A string VARIABLE is deliberately NOT included: fbc answers its DESCRIPTOR there, not its
+        // characters, and that is a separate question about a model we do not have.
+        // Asked of FConstStrBytes, a registry that answers "no" for a name it does not hold, rather
+        // than of InferExprBank, whose default for the unrecognised is FLOAT.
+        // ⛔ The value is read through a fresh IDENTIFIER node. Handing THIS node to ProcessExpression
+        // re-enters the address-of case on the same node and recurses until the stack is gone - a
+        // SEGFAULT, not an exception, so nothing in the pipeline reports it.
+        TempNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
+        try
+          ProcessExpression(TempNode, TempVal);
+        finally
+          TempNode.Free;
+        end;
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
@@ -12069,6 +12097,13 @@ begin
   // dereferenced it.
   if not Result then
     Result := InferExprBank(ArgNode) = srtString;
+end;
+
+function TSSAGenerator.IsStringConstName(const Name: string): Boolean;
+// Is this name a declared STRING constant? FConstStrBytes holds exactly those, by name, and answers
+// nothing at all for a name it does not have - which is the property being asked for here.
+begin
+  Result := (Name <> '') and (FConstStrBytes.IndexOfName(UpperCase(Name)) >= 0);
 end;
 
 function TSSAGenerator.EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;
@@ -30844,6 +30879,21 @@ begin
     if (FindUDT(UpperCase(ArrName)) >= 0) and (Node.ChildCount >= 2) and
        (Node.GetChild(1).NodeType = antExpressionList) then
       if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
+    // "@wstr(expr)": WSTR produces a WIDE string, and its address is the address of that UCS-2
+    // TEMPORARY - the very thing the WSTRING PTR argument conversion now materialises. It arrives here
+    // as an antArrayAccess named WSTR (that is how a call with no declaration parses) and fell out of
+    // the ladder with "Cannot take address of element of undeclared array: WSTR", which names the
+    // spelling rather than the problem. Evaluated as the call it is, then handed a temporary.
+    if (UpperCase(ArrName) = 'WSTR') and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 1) then
+    begin
+      ProcessExpression(Node, TempVal);
+      if TempVal.Kind <> svkNone then
+      begin
+        Result := EmitWStringTempAddr(TempVal);
+        Exit;
+      end;
+    end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   end;
   // @g(i) where g is an array-of-UDT: FreeBASIC "@g(i)" is a "T Ptr" to element i, and in the managed model

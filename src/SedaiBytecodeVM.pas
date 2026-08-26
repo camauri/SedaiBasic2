@@ -5348,6 +5348,14 @@ var
   W: UnicodeString;
   PW: PWord;
 begin
+  // ⛔ A NULL ZSTRING/WSTRING POINTER READS AS THE EMPTY STRING, and that is fbc's rule rather than
+  // undefined behaviour it gets away with: its string runtime tests the pointer, so "Len(*pz)" answers
+  // 0 and "*pz" answers "" on a null "ZString Ptr". We went through RawAddr, which raises "Null or
+  // invalid raw pointer dereference" - correct for every NUMERIC view of a raw pointer and wrong for
+  // the STRING one, which is the only view with a defined answer at zero.
+  // ⚠️ EXACTLY zero. An invalid non-zero pointer still raises: that check is what keeps a raw pointer
+  // from addressing memory the VM does not own, and it is not being relaxed here.
+  if RawPtr = 0 then Exit('');
   P := PByte(RawAddr(RawPtr, 1));                      // validates region + at least one byte
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
   if (RawPtr and RAWPTR_REGION_FB) <> 0 then
