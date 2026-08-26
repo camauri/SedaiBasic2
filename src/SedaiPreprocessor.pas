@@ -118,6 +118,19 @@ begin
   begin
     if S[i] = '"' then
       InStr := not InStr
+    // ⛔ ...AND A BLOCK COMMENT IS NOT A LINE COMMENT. "/' c '/" opens with a '/' followed by the very
+    // character this scanner treats as "the rest of the line is a comment", so a directive carrying one
+    // was truncated at the '/' - and since this is what decides whether a directive CONTINUES on the
+    // next line, "# macro create_macro /' c '/ _" stopped continuing and the parameter list that
+    // followed was left standing as code. The same line without the comment worked, which is the
+    // difference that named it.
+    else if (not InStr) and (S[i] = '/') and (i < Length(S)) and (S[i + 1] = '''') then
+    begin
+      Inc(i, 2);                                   // past the opening "/'"
+      while (i < Length(S)) and not ((S[i] = '''') and (S[i + 1] = '/')) do Inc(i);
+      Inc(i, 2);                                   // past the closing "'/"
+      Continue;
+    end
     else if (S[i] = '''') and not InStr then
       Break;
     Inc(i);
@@ -2322,6 +2335,20 @@ var
             // manual writes it that way. Testing the very next character made such a macro OBJECT-like,
             // so an invocation expanded to the raw body and its arguments leaked out as code.
             while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
+            // ⛔ ...AND A BLOCK COMMENT MAY SIT BETWEEN THE NAME AND THE PARAMETER LIST.
+            // "#macro mac /' c '/ ( a, b )" is FreeBASIC, and its own pp tests are written that way.
+            // Only SPACES were skipped, so the '(' was not where the reader looked and the macro came
+            // out OBJECT-like: its body expanded with the parameters unsubstituted and the arguments
+            // leaked out as code, which the SSA then met as "Array not declared: B" - a diagnostic
+            // naming a macro PARAMETER, several stages away from the comment that caused it.
+            while (p + 1 <= Length(DRest)) and (DRest[p] = '/') and (DRest[p + 1] = '''') do
+            begin
+              Inc(p, 2);                                  // past the opening "/'"
+              while (p + 1 <= Length(DRest)) and
+                    not ((DRest[p] = '''') and (DRest[p + 1] = '/')) do Inc(p);
+              Inc(p, 2);                                  // past the closing "'/"
+              while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
+            end;
             // "#macro name ? ( params )": the '?' makes the PARENTHESES OPTIONAL at the call site, so
             // "repeat 3" invokes it with 3 and the arguments run to the end of the line. Without this
             // the '?' was not a '(' and the macro came out OBJECT-like: its body expanded with the

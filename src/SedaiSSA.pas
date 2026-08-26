@@ -119,6 +119,10 @@ type
                             // Len/SizeOf of the field answered 8 where fbc answers 1.
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
+    ArrayElemScalarType: string;      // declared element type of an array member when it is a SCALAR
+                            // ("a(0 To 2) As Byte" -> 'BYTE'). ⛔ ArrayElemType beside it means the
+                            // element UDT and is EMPTY for a scalar, so it cannot answer "how wide is
+                            // one element" - which is what a fixed member array's C SHAPE is made of.
     ArrayElemType: string;  // element UDT type name if the array member is an array-of-UDT ("verts(100) As Vertex"),
                             // else ''. Each element is a record handle: allocated per-instance in EmitRecordInit.
     ArrayElemPtrPointee: string;  // pointee UDT if the array member's elements are UDT POINTERS ("kids(Any) As N Ptr"),
@@ -685,7 +689,10 @@ type
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
-    function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;  // fbc's C layout of a UDT
+    function FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;  // n*SizeOf(elem) for a fixed array member
+    procedure UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);  // what fbc SAYS a field measures
+    function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64;
+                       ReportOnly: Boolean = False): Boolean;  // fbc's C layout of a UDT
     procedure AssignBitFieldRuns(UDTIdx: Integer);   // pack a run of "name : n As T" members into one unit
     function UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;   // a field's index in its type
     function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
@@ -6738,7 +6745,7 @@ begin
             begin
               if FUDTs[RecUDTIdx].IsUnion then
                 ValCode := 0                        // every member of a union begins at byte 0
-              else if UDTCLayout(RecUDTIdx, RecLayoutOfs, RecLayoutSize) then
+              else if UDTCLayout(RecUDTIdx, RecLayoutOfs, RecLayoutSize, True) then   // OFFSETOF reports
                 ValCode := RecLayoutOfs[RecFieldIdx]
               else
                 ValCode := RecFieldIdx * 8;         // shape we cannot image: the answer we used to give
@@ -21790,6 +21797,12 @@ begin
     Size := F.StrCapacity; Align := 1; Exit;        // ZSTRING * n: the terminator is inside the n
   end;
   if F.Bank = srtString then begin Size := 24; Align := 8; Exit; end;   // string descriptor
+  // ⛔ AN ARRAY MEMBER IS EIGHT BYTES HERE AND THAT IS NOT NEGOTIABLE: this is the shape of the LIVE
+  // field, the one ComputeUDTLiveLayout builds the record image from, and our storage keeps a handle
+  // there. Reporting the inline size from here put a 1 MB member array into LiveBytes, which is packed
+  // into a SIXTEEN-BIT immediate - 1048576 and $FFFF is 0 - so a plain "Dim As T v" on such a type
+  // allocated nothing and died with an access violation at exactly 2^20 and not one byte below.
+  // What fbc SAYS the field measures is a different question, and UDTFieldReportShape answers it.
   if F.IsArray or (F.NestedType <> '') or (F.PtrPointee <> '') or
      (F.RawPtrPointee <> '') or (F.FuncPtrSig <> '') then
   begin
@@ -21805,9 +21818,84 @@ begin
   Align := Size;
 end;
 
-function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
+procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);
+// What fbc SAYS a field measures, as against what our live image holds for it (UDTFieldCShape).
+// The two differ in exactly one place: a FIXED-LENGTH array member, which fbc lays out inline and we
+// back with a handle. Used by SizeOf, OffsetOf and by UDTCLayout in its reporting mode - never by
+// anything that allocates, copies or writes an image.
+begin
+  if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then Exit;
+  UDTFieldCShape(UDTIdx, FieldIdx, Size, Align);
+end;
+
+function TSSAGenerator.FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;
+// The C shape of a FIXED-LENGTH array member: element count * element size, aligned like the element.
+// Answers False - and touches nothing - for a member whose image we do not reproduce: a dynamic array
+// (no concrete bounds), an array of RECORDS or of POINTERS (the elements are handles), or an element
+// type we cannot size.
+var
+  F: TUDTField;
+  D, UbExpr, LbExpr: TASTNode;
+  di: Integer;
+  Lb, Ub, Count, ElemSz: Int64;
+begin
+  Result := False;
+  Size := 8; Align := 8;
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  if GetEnvironmentVariable('UDTSIZE_DIAG') = '1' then
+    WriteLn(StdErr, 'UDTSIZE: ', FUDTs[UDTIdx].Name, '.', F.Name,
+            ' IsArray=', F.IsArray, ' bounds=', Assigned(F.ArrayBounds),
+            ' elem="', F.ArrayElemType, '" scalar="', F.ArrayElemScalarType,
+            '" elemptr="', F.ArrayElemPtrPointee, '"');
+  if (not F.IsArray) or (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount < 1) then Exit;
+  if F.ArrayElemType <> '' then Exit;                                       // element is a record
+  if F.ArrayElemPtrPointee <> '' then Exit;                                 // element is a pointer
+  if F.ArrayElemScalarType = '' then Exit;
+  if (Length(F.ArrayElemScalarType) >= 4) and
+     (Copy(F.ArrayElemScalarType, Length(F.ArrayElemScalarType) - 3, 4) = ' PTR') then Exit;
+  ElemSz := TypeSizeBytes(F.ArrayElemScalarType);
+  if ElemSz <= 0 then Exit;
+  Count := 1;
+  D := F.ArrayBounds;
+  for di := 0 to D.ChildCount - 1 do
+  begin
+    if D.GetChild(di).NodeType = antDimRange then
+    begin
+      LbExpr := D.GetChild(di).GetChild(0);
+      UbExpr := D.GetChild(di).GetChild(1);
+      if not TryFoldConstIntExpr(LbExpr, Lb) then Exit;
+    end
+    else
+    begin
+      LbExpr := nil;
+      UbExpr := D.GetChild(di);
+      Lb := 0;
+    end;
+    if not TryFoldConstIntExpr(UbExpr, Ub) then Exit;
+    if Ub < Lb then Exit;
+    Count := Count * (Ub - Lb + 1);
+  end;
+  if Count <= 0 then Exit;
+  Size := Count * ElemSz;
+  Align := ElemSz;
+  if Align > 8 then Align := 8;
+  Result := True;
+end;
+
+function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64;
+                                  ReportOnly: Boolean = False): Boolean;
 // The C byte layout of a UDT: the offset of every field plus the type's total size, exactly as fbc
-// lays it out. Each field starts at the next multiple of its own alignment (capped by "FIELD = n"),
+// lays it out.
+//
+// ⛔⛔ TWO QUESTIONS, AND THEY ARE NOT THE SAME ONE. By default this answers "is there an image we can
+// REPRODUCE", and its callers act on that: the binary GET/PUT of a whole record walks the fields and
+// writes them, and the layout AUDIT checks the invariant "where a C image exists, it IS the live
+// image". ReportOnly asks the other question - "what does fbc SAY this type measures" - which is all
+// SizeOf and OffsetOf need. A FIXED-LENGTH ARRAY MEMBER separates them: fbc lays its elements out
+// inline and we keep a handle there, so its SIZE is reportable and its IMAGE is not.
+// ⚠️ Answering the reporting question everywhere is what broke first: with the C layout suddenly
+// available, the RAW allocation path took over for such a type and "New T" on a type with a 1 MB member
+// array died with an access violation. Each field starts at the next multiple of its own alignment (capped by "FIELD = n"),
 // and the whole type is rounded up to the largest alignment used -- which is why "String * 32 + Double"
 // is 48 bytes (33 + 7 padding + 8) while the same pair under "Field = 1" is 41.
 // Returns False when the type has a shape whose image we cannot reproduce (a variable-length string,
@@ -21834,9 +21922,13 @@ begin
       Offsets[i] := Offsets[i - 1];
       Continue;
     end;
+    // ...and the ARRAY exclusion is now narrower: a FIXED-length array of scalars is reproducible
+    // (see UDTFieldCShape), so only a dynamic one - or an array of records/pointers - still declines.
     with FUDTs[UDTIdx].Fields[i] do
-      if IsArray or (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
-    UDTFieldCShape(UDTIdx, i, Sz, Al);
+      if (IsArray and not (ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2))) or
+         (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+    if ReportOnly then UDTFieldReportShape(UDTIdx, i, Sz, Al)
+    else UDTFieldCShape(UDTIdx, i, Sz, Al);
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
@@ -23871,6 +23963,7 @@ var
   Bank, ArrElemBank: TSSARegisterType;
   cInt, cFloat, cStr, ArrDims: Integer;
   TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, ArrElemPtrPointeeT, FuncPtrSigVal: string;
+  ArrElemScalarType: string;
   RawPtrPointeeT, PointeeScalarT: string;
   IsArrayField: Boolean;
 begin
@@ -23955,6 +24048,7 @@ begin
       ArrElemBank := srtInt;
       ArrDims := 1;
       ArrElemType := '';
+      ArrElemScalarType := '';
       ArrElemPtrPointeeT := '';
       if IsArrayField then
       begin
@@ -23963,6 +24057,10 @@ begin
         // Array-of-UDT member ("verts(100) As Vertex"): remember the element UDT type (NestedT held it)
         // so EmitRecordInit can allocate a record per element and access resolves obj.field(i) to a handle.
         if NestedT <> '' then ArrElemType := NestedT;
+        // ...and the SCALAR element type, which nothing recorded: ArrElemType is the element UDT and
+        // stays empty here, so the field knew its element's BANK and not its WIDTH. That is why the C
+        // shape of a fixed member array could not be computed at all (see FixedArrayMemberCShape).
+        if (NestedT = '') and (PtrPointeeT = '') then ArrElemScalarType := UpperCase(TypeName);
         // Array-of-UDT-POINTER member ("kids(Any) As N Ptr"): the elements are handles to records owned
         // elsewhere. Kept separate from ArrElemType so no record is allocated per element -- only the
         // pointee TYPE is needed, to resolve "obj.field(i)->x". PtrPointeeT is cleared just below.
@@ -24002,6 +24100,7 @@ begin
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
+      FUDTs[Idx].Fields[n].ArrayElemScalarType := ArrElemScalarType;
       FUDTs[Idx].Fields[n].ArrayElemPtrPointee := ArrElemPtrPointeeT;
       FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
       FUDTs[Idx].Fields[n].FuncPtrSig := FuncPtrSigVal;
@@ -29615,7 +29714,7 @@ begin
       // SizeOf(T) of a UDT is the size fbc's C layout gives it (alignment padding included, "FIELD = n"
       // honoured) whenever every member has a reproducible shape; a type holding a variable-length
       // string / array / nested record falls back to the historic one-slot-per-field sum.
-      if UDTCLayout(u, LayoutOffsets, LayoutSize) then
+      if UDTCLayout(u, LayoutOffsets, LayoutSize, True) then   // SizeOf reports; it does not promise an image
         Result := LayoutSize
       else if FUDTs[u].LiveBytes > 0 then
         // A3-i: where the C layout declines - a UNION, or a type holding an array, a nested record or
