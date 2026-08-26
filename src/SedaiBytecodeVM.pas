@@ -13365,6 +13365,15 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Ctx.IntRegs[Instr.Dest] := RecFieldInt(Rec, RecSlot);
         end
+        // ⛔ ...AND A RAW ADDRESS IS A THIRD KIND. An @-taken LOCAL is a raw byte slot (RAWPTR_TAG,
+        // bit 62), and the deref lowered from a NAME knows that; the one lowered from a VALUE cannot,
+        // because there is no name left to ask. So "*p" worked and "**pp" did not: the inner deref
+        // handed back p's value - a correctly tagged raw address - and this arm decoded it as a packed
+        // array pointer, whose array id is then nonsense ("Null or invalid pointer dereference,
+        // address 4611686018427387920"). The tag is IN the value, so the question is answered here,
+        // where every path that produces one arrives.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, 0)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -13382,6 +13391,9 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
         end
+        // The raw-address kind - see the note in bcRefLoadInt above.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -13416,6 +13428,10 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           RecSetFieldInt(Rec, RecSlot, Ctx.IntRegs[Instr.Src2]);
         end
+        // The raw-address kind - see the note in bcRefLoadInt above. The WRITE half must know it too,
+        // or "**pp = 5" stores into a nonexistent array while "*p = 5" works.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreInt(PtrAddr, 0, Ctx.IntRegs[Instr.Src2])
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -13433,6 +13449,9 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
         end
+        // The raw-address kind - see the note in bcRefLoadInt above.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
