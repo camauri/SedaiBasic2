@@ -13378,9 +13378,24 @@ begin
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+          // ⛔ ...AND THE BANK OF THE POINTER NEED NOT BE THE BANK OF THE STORAGE. These six arms chose
+          // which vector to read from the OPCODE, while a TArrayStorage populates exactly ONE of
+          // IntData / FloatData / StringData - so "*CPtr(ULongInt Ptr, @d)" over a Double reached an
+          // INT arm, found IntData empty and reported the FLOAT bank's tag as a bad address. Type
+          // punning is the idiom fbc's own suite uses everywhere, and it was impossible by
+          // construction. The vector that IS populated is the discriminator, so no extra field is
+          // needed: fall through to it and REINTERPRET the eight bytes, which is what fbc does.
+          // ⚠️ DECLARED LIMIT: a SINGLE is stored here as an 8-byte Double, so punning one through a
+          // ULong Ptr still differs from fbc's 4-byte IEEE754 image (DIVERGENZE 55). Double <-> Int64,
+          // which is what numbers/infnan and numbers/limits use, is exact.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset];
+          if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset]
+          else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
     14: // bcRefLoadFloat
@@ -13398,9 +13413,15 @@ begin
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset];
+          if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset]
+          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            Ctx.FloatRegs[Instr.Dest] := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
     15: // bcRefLoadString
@@ -13436,9 +13457,16 @@ begin
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above. The
+          // WRITE half needs it too, or "*Cast(ULongInt Ptr, @d) = bits" raises where the read works.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2];
+          if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2]
+          else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
     17: // bcRefStoreFloat
@@ -13456,9 +13484,15 @@ begin
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2];
+          if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2]
+          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Ctx.FloatRegs[Instr.Src2]
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
     18: // bcRefStoreString
