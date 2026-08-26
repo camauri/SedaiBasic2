@@ -446,6 +446,7 @@ type
     procedure CollectUDTNames(Node: TASTNode);     // pass 1: register type names (empty)
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
+    function SoleOverloadLabel(const TypeU, MethNm: string): string;   // T.m when it has exactly ONE overload, else ''
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
     function MethAttrKey(const MethNm: string): string;   // the name a type-decl decorator is filed under
     function MethodIsVirtual(const TypeName, MethNm: string): Boolean;      // OOP: "Declare Virtual ..." (Abstract implies it)
@@ -2272,6 +2273,28 @@ begin
                           ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
                                              VarToStr(Node.GetChild(0).Value)))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      // ⭐ "@T.member" WHERE member IS A STATIC DATA MEMBER. A static member is not a field of any
+      // instance - it is backed by its own storage under the single name "TYPE.MEMBER"
+      // (CollectStaticMembers), which is exactly how the DEFINITION outside the type spells it
+      // ("Dim ByRef As T1 T2.R1 = t"). The chain has a branch for "@T.method" and none for this, so a
+      // static DATA member fell to the field path, where ObjectTypeName is handed a TYPE NAME, answers
+      // '' and raises "object is not a record" - a message about a record when the operand names a
+      // variable. Rewritten to that one name so the whole chain below applies, IsRefVar included.
+      else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) and
+              (Node.GetChild(0).ChildCount >= 1) and
+              (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+              (FindUDT(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) and
+              (IsSharedScalar(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.' +
+                              UpperCase(VarToStr(Node.GetChild(0).Value))) or
+               IsRefVar(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.' +
+                        UpperCase(VarToStr(Node.GetChild(0).Value)))) then
+      begin
+        Node.Value := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.' +
+                      UpperCase(VarToStr(Node.GetChild(0).Value));
+        Node.RemoveChildAt(0);          // frees it: FChildren owns its children
+        ProcessExpression(Node, Result);
+        Exit;
       end
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) then
         EmitFieldAddress(Node.GetChild(0), Result)
@@ -9408,6 +9431,14 @@ begin
     antIdentifier:
       Result := (FModuleConstVals <> nil) and
                 TryStrToInt64(FModuleConstVals.Values[UpperCase(VarToStr(Node.Value))], Val);
+    // ⛔ PARENTHESES ARE TRANSPARENT TO A CONSTANT. Without this case "(3) - 1" is not a constant at
+    // all - the fold declines on the left operand - and every caller that asks "is this bound / this
+    // initialiser a compile-time integer?" answers no for a shape a program actually writes. fbc's own
+    // odd-arg test declares "a(0 To (N)-1) As Byte" from a macro parameter, which is the normal way to
+    // write it; SizeOf of that type answered 8 instead of 3 because the BOUND would not fold, not
+    // because the layout was wrong.
+    antParentheses:
+      Result := (Node.ChildCount >= 1) and TryFoldConstIntExpr(Node.GetChild(0), Val);
     antUnaryOp:
       begin
         if (Node.ChildCount < 1) or (Node.Token = nil) then Exit;
@@ -24571,6 +24602,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.SoleOverloadLabel(const TypeU, MethNm: string): string;
+// The label of "TypeU.MethNm" when the name has exactly ONE overload declaration, else ''.
+// An overload's key carries its signature after a '~'; nothing else in FProcDecls does, so an
+// OVERLOAD-marked method is invisible to an exact lookup even when it is the only one of its name.
+// ⛔ EXACTLY ONE, and that restriction is the point. Answering the first of SEVERAL would be a guess -
+// and a guess here is a WRONG ANSWER where the code previously refused, which is the wrong direction:
+// "@T.bar" has no argument list to choose with, so the choice would have to come from the DESTINATION
+// type ("Dim As Function(ByVal As Integer) As Integer fn = @T.bar"), which this lookup cannot see.
+// Measured: picking one anyway answered the Double overload where fbc answers the Integer one.
+var
+  Prefix, K: string;
+  N: Integer;
+begin
+  Result := '';
+  N := 0;
+  Prefix := TypeU + '.' + UpperCase(MethNm) + '~';
+  for K in FProcDecls.Keys do
+    if (Length(K) > Length(Prefix)) and (Copy(K, 1, Length(Prefix)) = Prefix) then
+    begin
+      Inc(N);
+      if N > 1 then Exit('');
+      Result := K;
+    end;
+end;
+
 function TSSAGenerator.ResolveMethodLabel(const TypeName, MethNm: string): string;
 // Find a method by walking up the inheritance chain: Child.method, then Parent.method, ...
 var
@@ -24584,6 +24640,17 @@ begin
   begin
     Lbl := T + '.' + UpperCase(MethNm);
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    // ⛔ AN OVERLOADED METHOD IS NOT FILED UNDER ITS BARE NAME. RegisterOverloadLabel decorates it
+    // with its signature ("T.BAR~II"), so an exact lookup finds every non-overloaded method and NONE
+    // of the overloaded ones - the same shape as the constructor sigil. The visible cost was "@Foo.bar"
+    // on an overloaded STATIC member: the "@Type.method" branch is gated on this answering non-empty,
+    // so it fell through to the FIELD path and reported "object is not a record", a message about a
+    // record where the question was about a procedure. The same program with ONE bar compiles.
+    // ⚠️ Only when there is exactly ONE: with several, "@T.m" has no argument list to choose with and
+    // the choice belongs to the DESTINATION type, which this lookup cannot see. It keeps refusing
+    // there, on purpose - a guess would turn a refusal into a wrong answer.
+    Lbl := SoleOverloadLabel(T, MethNm);
+    if Lbl <> '' then Exit(Lbl);
     Lbl := NestedQualifiedMethod(T, MethNm);
     if (Lbl <> '') and FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     Idx := FindUDT(T);
