@@ -123,6 +123,13 @@ type
     // and taking its address (@T.f) yields a procedure whose arity does not match the call.
     // FreeBASIC requires the declaration to precede the definition, so a single forward pass suffices.
     FTypeStaticMethods: TStringList;
+    FStaticMemberProcs: TStringList;   // "TYPE.NAME" of every "Declare Static Sub|Function" seen in a TYPE body.
+                                       // ⛔ DELIBERATELY SEPARATE from FTypeStaticMethods, which decides whether a
+                                       // definition gets an implicit THIS: that mechanism is written but DORMANT
+                                       // (the set is never filled), and the CALL SITE passes a dummy THIS to match.
+                                       // Filling it turned three corpus programs to zero - m153, m374, m606 - because
+                                       // only one half of the pair moved. This set answers "is the member static?"
+                                       // and nothing else.
     // OOP: the DEFAULT ARGUMENTS a TYPE body's "Declare ..." line gave a method, keyed "TYPE.METHOD".
     // FreeBASIC states them on the DECLARATION, never on the out-of-line definition — so a definition
     // read on its own looks like it has none, and "Dim v As T" then found no constructor callable with
@@ -456,6 +463,8 @@ begin
   FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
+  FStaticMemberProcs := TStringList.Create;
+  FStaticMemberProcs.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
   FTypeMethodDefaults.CaseSensitive := False;
 end;
@@ -473,6 +482,7 @@ begin
   FConstTypes.Free;
   FConstIntValues.Free;
   FTypeStaticMethods.Free;
+  FStaticMemberProcs.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
 
@@ -803,6 +813,7 @@ begin
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
 
   try
@@ -872,6 +883,7 @@ begin
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
 
   try
@@ -3201,7 +3213,14 @@ begin
   // writes a startup routine that belongs to a type. The "MethodType = ''" here refused it, so the word
   // was left standing and the file died at "Expected a name after CONSTRUCTOR". A member sub with no
   // THIS is a plain procedure with a dotted label as far as the startup list is concerned.
+  // ⛔⛔ STATIC ONLY, and that is a MEASURED line. fbc REFUSES the modifier on an INSTANCE method
+  // ("error 17: Syntax error in 'sub T.m() constructor'"): a routine that needs a THIS cannot run
+  // before there is one. Accepting it for every member cost SEVEN COMPILE_ONLY_FAIL tests of the fbc
+  // suite in one run - functions/module-{ctor,dtor}-method-body and the four visibility/*-module-*
+  // - against the ONE (functions/module-ctor-staticmemberproc) it was meant to open. The type's own
+  // declaration is what says which it is, and the parser already records it in FTypeStaticMethods.
   if (Context.CurrentToken <> nil) and
+     ((MethodType = '') or (FStaticMemberProcs.IndexOf(QualName) >= 0)) and
      ((UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR) or
       (UpperCase(VarToStr(Context.CurrentToken.Value)) = kDESTRUCTOR)) then
   begin
@@ -3970,7 +3989,13 @@ begin
   IsOverride := False;
   IsFinal := False;
   // Decorators sit between DECLARE and the SUB/FUNCTION/... keyword and arrive as plain identifiers.
-  while Context.Check(ttIdentifier) do
+  // ⛔ ...EXCEPT STATIC, WHICH IS A RESERVED WORD AND SO NOT AN IDENTIFIER. The loop's own test kept it
+  // out, so "Declare Static Sub m( )" recorded nothing and FTypeStaticMethods stayed EMPTY - which
+  // showed only when something finally asked (the trailing "Sub UDT.m( ) Constructor", whose whole
+  // legality is that the member is static). Every other decorator here is a non-reserved word, which is
+  // why the test read as sufficient until something needed the answer.
+  while Context.Check(ttIdentifier) or
+        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC') do
   begin
     DecoU := UpperCase(VarToStr(Context.CurrentToken.Value));
     if DecoU = 'ABSTRACT' then IsAbstract := True
@@ -4032,8 +4057,12 @@ begin
       TypeNode.Attributes.Values['FINAL' + MethName] := '1';
     if Assigned(TypeNode) and (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
       TypeNode.Attributes.Values['ACCESS' + MethName] := CurAccess;
-    if IsStatic and Assigned(TypeNode) then
-      FTypeStaticMethods.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
+    // ⛔ PUBLIC ONLY, and that too is measured. A module constructor runs before the program does, so
+    // fbc refuses to let a PRIVATE or PROTECTED member be one - "visibility/{private,protected}-module-
+    // {ctor,dtor}" are four COMPILE_ONLY_FAIL tests of its suite, and accepting them cost exactly those
+    // four. The access of this very declaration is in hand here; nothing else has to be asked.
+    if IsStatic and Assigned(TypeNode) and ((CurAccess = '') or (CurAccess = 'PUBLIC')) then
+      FStaticMemberProcs.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
   end;
   // Walk what is left of the declaration, collecting the parameters' DEFAULT values on the way — they
   // are stated here and nowhere else, and the definition needs them. Parenthesis depth is tracked so a
