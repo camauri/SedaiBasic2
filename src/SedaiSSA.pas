@@ -376,6 +376,8 @@ type
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
     FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
+    FBlockDeclVars: TStringList;         // "@B@<serial>@NAME" for every SCALAR a block declared: the "did THIS
+                                         //   block declare it?" test that stops a flat fallback (DIVERGENZE 56)
     FScopeSerial: Integer;               // FB scope: monotonic id for unique scoped internal names (NAME@serial)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
@@ -456,6 +458,7 @@ type
     function BlockArrayMangle(Serial: Integer; const ArrName: string): string;  // per-BLOCK name for an array DIM'd inside a Scope/If/loop body
     function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
     function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
+    function BlockScalarName(const Name: string): string;    // the innermost OPEN block that declared this @-taken SCALAR, or ''
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
                                 const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
@@ -1365,6 +1368,8 @@ begin
   FZeroLbArrays := TStringList.Create;
   FZeroLbPoisoned := TStringList.Create;
   FDynamicArrays.CaseSensitive := False;
+  FBlockDeclVars := TStringList.Create;
+  FBlockDeclVars.CaseSensitive := False;
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
   FZStringVars := TStringList.Create;
@@ -1472,6 +1477,7 @@ begin
   FDynamicArrays.Free;
   FZeroLbArrays.Free;
   FZeroLbPoisoned.Free;
+  FBlockDeclVars.Free;
   FFixedLenVars.Free;
   FZStringVars.Free;
   FByrefRetFuncs.Free;
@@ -10162,7 +10168,7 @@ end;
 
 procedure TSSAGenerator.ProcessDim(Node: TASTNode);
 var
-  ArrName, DeclArrName, RefTgtType: string;
+  ArrName, DeclArrName, RefTgtType, BlkScalarKey: string;
   RefTgt: TASTNode;
   ElementType: TSSARegisterType;
   DimsNode, DimExpr, DimChild, ArrayDeclNode: TASTNode;
@@ -10345,6 +10351,52 @@ begin
     if DimsNode.NodeType = antIdentifier then
     begin
       RecTypeName := UpperCase(VarToStr(DimsNode.Value));
+      // ⭐ FILE THIS DECLARATION'S BACKING UNDER THE BLOCK THAT MADE IT, beside the bare-name entry.
+      // The @-taken marking is retroactive BY NAME (see MarkAddressTaken), so two sibling Scopes each
+      // declaring "a" both carry a mark and both read the SAME bare entry - and the first one's plain
+      // String was read through the second one's raw ZString backing, killing the program in the scope
+      // ABOVE the one with the pointer. The mark itself is already per-declaration; only the lookup
+      // was not. The bare entry is left exactly as it was, so anything without a block reads as before
+      // (BlockScalarName, DIVERGENZE 56).
+      if (InnermostBlockFrameIdx >= 0) and (FindUDT(RecTypeName) < 0) then
+      begin
+        BlkScalarKey := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, UpperCase(ArrName));
+        // "THIS block declared this name": the test that stops every one of the lookups below from
+        // falling back to a flat entry another declaration wrote. It is registered for EVERY builtin
+        // scalar a block declares, marked or not - a block that declares "a" and records nothing else
+        // about it must still answer "not raw, no capacity of mine" rather than borrow someone's.
+        if FBlockDeclVars.IndexOf(BlkScalarKey) < 0 then FBlockDeclVars.Add(BlkScalarKey);
+        // ...and the DECLARED CAPACITY of a fixed-length string is the block's too, by the same rule
+        // CollectWStringVars applies per PROCEDURE: "ZString * n" / "WString * n" hold n-1 characters
+        // plus the terminator, "String * n" holds n. Without this a "ZString * 10" in one Scope read
+        // the capacity of a "ZString * 1" in another and printed nothing at all.
+        if StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], -1) > 0 then
+        begin
+          if (RecTypeName = 'ZSTRING') or (RecTypeName = 'WSTRING') then
+            FZStringVars.Values[BlkScalarKey] :=
+              IntToStr(StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 1) - 1)
+          else
+            FFixedLenVars.Values[BlkScalarKey] := ArrayDeclNode.Attributes.Values['FIXEDLEN'];
+        end;
+        if (ArrayDeclNode.Attributes.Values['ADDRLOCAL'] = '1') and FInProcedure then
+        begin
+          if FAddrLocalVars.IndexOfName(BlkScalarKey) < 0 then
+            FAddrLocalVars.Add(BlkScalarKey + '=' + RecTypeName);
+        end
+        else if ArrayDeclNode.Attributes.Values['RAWMODULE'] = '1' then
+        begin
+          if FRawModuleScalars.IndexOfName(BlkScalarKey) < 0 then
+            FRawModuleScalars.Add(BlkScalarKey + '=' + RecTypeName);
+        end
+        else if (ArrayDeclNode.Attributes.Values['SHARED'] = '1') and
+                (FAddrSharedScalars.IndexOfName(UpperCase(ArrName)) >= 0) then
+        begin
+          // Marked SHARED by the @-taken pass: record it so this block's reads answer "not raw" even
+          // while another block's declaration of the name is on the raw list.
+          if FAddrSharedScalars.IndexOfName(BlkScalarKey) < 0 then
+            FAddrSharedScalars.Add(BlkScalarKey + '=' + RecTypeName);
+        end;
+      end;
       // @-taken LOCAL scalar: back it with a per-frame 1-field record (reclaimed at frame exit, distinct
       // per recursion). Allocate the record, store its handle in the hidden "<name>$REC", apply any
       // "= expr" through it; reads/writes/@ of the name route through the handle (recursion-safe @local).
@@ -31818,10 +31870,18 @@ end;
 function TSSAGenerator.StrCapOf(L: TStringList; const Name: string; Def: Integer): Integer;
 // The declared capacity recorded for this name, asking THIS procedure's entry before the flat one.
 // See the note in CollectWStringVars: the flat entry is last-declaration-wins across the program.
+// ⭐ ...and a BLOCK is asked before the procedure, for the same reason and with the same shape: two
+// sibling Scopes each declaring the name with a different capacity are two variables (DIVERGENZE 56).
+// Where the block declared the name there is NO fallback at all - not to the procedure's entry and not
+// to the flat one - because a block that declared it and recorded no capacity here HAS no capacity.
 const
   NOENTRY = Low(Integer);
+var
+  BlkKey: string;
 begin
   Result := NOENTRY;
+  BlkKey := BlockScalarName(Name);
+  if BlkKey <> '' then Exit(StrToIntDef(L.Values[BlkKey], Def));
   if FCurrentProcName <> '' then
   begin
     Result := StrToIntDef(L.Values[FCurrentProcName + '|' + UpperCase(Name)], NOENTRY);
@@ -32100,16 +32160,28 @@ function TSSAGenerator.IsAddrLocal(const Name: string): Boolean;
 // An @-taken variable declared inside the CURRENT SUB/FUNCTION: backed by a per-frame 1-field record so
 // its address is distinct per recursion level. FAddrLocalVars is rebuilt per procedure (populated by
 // ProcessDim, cleared at the prologue), so a module-level @-taken var of the same name is never matched.
+// ⭐ ...and an OPEN BLOCK that declared this name answers first: the marking is retroactive by name,
+// so a bare-name lookup would hand this block the backing of a same-named declaration in another one
+// (BlockScalarName, DIVERGENZE 56). Where a block declared it, there is NO fallback to the bare entry:
+// a block that declared the name and did not put it here has it backed some other way, and that is the
+// answer, not a reason to go and read another declaration's.
+var
+  m: string;
 begin
+  m := BlockScalarName(Name);
+  if m <> '' then Exit(FAddrLocalVars.IndexOfName(m) >= 0);
   Result := FAddrLocalVars.IndexOfName(UpperCase(Name)) >= 0;
 end;
 
 function TSSAGenerator.AddrLocalBank(const Name: string): TSSARegisterType;
 var
   idx: Integer;
+  m: string;
 begin
   Result := srtInt;
-  idx := FAddrLocalVars.IndexOfName(UpperCase(Name));
+  m := BlockScalarName(Name);
+  if m = '' then m := UpperCase(Name);
+  idx := FAddrLocalVars.IndexOfName(m);
   if idx >= 0 then Result := TypeNameToBank(FAddrLocalVars.ValueFromIndex[idx], Name);
 end;
 
@@ -32130,9 +32202,12 @@ end;
 function TSSAGenerator.AddrLocalType(const Name: string): string;
 var
   idx: Integer;
+  m: string;
 begin
   Result := 'INTEGER';
-  idx := FAddrLocalVars.IndexOfName(UpperCase(Name));
+  m := BlockScalarName(Name);          // this block's own declaration, if it made one (DIVERGENZE 56)
+  if m = '' then m := UpperCase(Name);
+  idx := FAddrLocalVars.IndexOfName(m);
   if idx >= 0 then Result := UpperCase(FAddrLocalVars.ValueFromIndex[idx]);
 end;
 
@@ -32182,16 +32257,23 @@ function TSSAGenerator.IsRawModuleScalar(const Name: string): Boolean;
 // A MODULE-level @-taken builtin scalar (not STRING): backed by a raw byte slot whose address is kept in
 // a SHARED int array, so its @/deref are bit-exact (type-punnable) and visible in every procedure. Never
 // matched for a name shadowed by a local/param (those resolve first), like IsSharedScalar.
+var
+  m: string;
 begin
-  Result := (FRawModuleScalars.IndexOfName(UpperCase(Name)) >= 0) and not SharedScalarShadowed(Name);
+  m := BlockScalarName(Name);          // this block's own declaration, if it made one (DIVERGENZE 56)
+  if m = '' then m := UpperCase(Name);
+  Result := (FRawModuleScalars.IndexOfName(m) >= 0) and not SharedScalarShadowed(Name);
 end;
 
 function TSSAGenerator.RawModuleScalarType(const Name: string): string;
 var
   idx: Integer;
+  m: string;
 begin
   Result := 'INTEGER';
-  idx := FRawModuleScalars.IndexOfName(UpperCase(Name));
+  m := BlockScalarName(Name);
+  if m = '' then m := UpperCase(Name);
+  idx := FRawModuleScalars.IndexOfName(m);
   if idx >= 0 then Result := UpperCase(FRawModuleScalars.ValueFromIndex[idx]);
 end;
 
@@ -35886,6 +35968,38 @@ begin
   Result := '@B@' + IntToStr(Serial) + '@' + ArrName;
 end;
 
+function TSSAGenerator.BlockScalarName(const Name: string): string;
+// The mangled name under which one of the OPEN block scopes declared this @-TAKEN SCALAR, innermost
+// first, or '' when none did. The same walk BlockArrayName does, over the three registries that decide
+// how an @-taken scalar is BACKED - a per-frame raw slot (FAddrLocalVars), a raw module slot
+// (FRawModuleScalars), a shared 1-element array (FAddrSharedScalars).
+//
+// ⛔ It exists because the @-taken marking applies RETROACTIVELY BY NAME, and those registries are
+// keyed by the bare name: two sibling Scopes each declaring "a", the second taking "@a" of a
+// "ZString * 5", and the FIRST one's plain String is read through the second's backing - the program
+// died on its first executable line, in the scope ABOVE the one with the pointer in it. The MARK is
+// already per-declaration (it is an attribute on the DIM node); it was only the lookup that was not.
+// DIVERGENZE 56.
+//
+// ⚠️ Two attempts at narrowing the MARKING instead were measured and withdrawn on 26 Aug 2026 (fbc
+// suite CUPASS 273 -> 263, then 264): an "@" taken outside a block reaches a variable declared inside
+// it in plenty of shapes, so a block dictionary loses those. Nothing here narrows the marking - every
+// declaration is still marked, and it is the READ that now knows which declaration it is standing in.
+var
+  k: Integer;
+  nameU, mangled: string;
+begin
+  Result := '';
+  nameU := UpperCase(Name);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    if FBlockDeclVars.IndexOf(mangled) >= 0 then Exit(mangled);
+  end;
+end;
+
 function TSSAGenerator.ArrayBareName(const SlotName: string): string;
 // The USER'S name of an array slot: "@P@S1@DYN", "@L@S1@DYN" and "@B@3@DYN" all answer "DYN".
 //
@@ -37689,6 +37803,7 @@ begin
   until not FRawCollectChanged;
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
+  FBlockDeclVars.Clear;
   FFixedLenVars.Clear;
   FZStringVars.Clear;
   FRawFixedLenNode := nil;
