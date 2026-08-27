@@ -279,6 +279,13 @@ var
   i: Integer;
 begin
   if Node = nil then Exit;
+  // ⛔ A REDIM IS NOT A DECLARATION. Its target is an antArrayDecl exactly like a DIM's, so a
+  // module-level "ReDim arr1(0 To 5)" put ARR1 in the list of names the program declares itself - and
+  // that list is what BEATS a "Using" import. The reference then resolved to a fresh module array
+  // while "nx.arr1" named the imported one: two arrays under one name, and the qualified spelling
+  // answered -1 where the unqualified one answered 5. ⭐ The FIXED-size case never showed it, because
+  // nothing REDIMs one.
+  if Node.NodeType = antRedim then Exit;
   if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 1) and
      (Node.GetChild(0).NodeType = antIdentifier) then
     Shadow.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));

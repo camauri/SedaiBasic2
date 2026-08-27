@@ -6596,7 +6596,9 @@ begin
           EmitRawAlloc(Node, Result);
           Exit;
         end;
-        if (UpperCase(ArrName) = 'DEALLOCATE') and (ArrayIndexOf(ArrName) < 0) and
+        if ((UpperCase(ArrName) = 'DEALLOCATE') or
+            ((UpperCase(ArrName) = 'FREE') and (FProcedureNames.IndexOf('FREE') < 0))) and
+           (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), Left);
@@ -30605,6 +30607,20 @@ begin
   if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
   FuncU := UpperCase(VarToStr(Node.GetChild(0).Value));
+  // ⭐ ...AND THE C SPELLINGS ARE THE SAME THREE FUNCTIONS. A program that includes <crt.bi> to get at
+  // memory writes malloc/calloc/realloc/free, and those are OURS to the byte: calloc(count, size) is
+  // exactly the two-argument CAllocate, and the other two are byte-granular like ours. Only the FILE*
+  // half of the C runtime is a declared divergence; memory is not, and "Array not declared: MALLOC"
+  // said otherwise. ⛔ A procedure the program declares ITSELF under one of these names wins - the
+  // alias is a fallback, not a reservation.
+  if (FuncU = 'MALLOC') or (FuncU = 'CALLOC') or (FuncU = 'REALLOC') then
+    if (ArrayIndexOf(FuncU) < 0) and (FProcedureNames.IndexOf(FuncU) < 0) then
+    begin
+      if FuncU = 'MALLOC' then FuncU := 'ALLOCATE'
+      else if FuncU = 'CALLOC' then FuncU := 'CALLOCATE'
+      else FuncU := 'REALLOCATE';
+      Exit(True);
+    end;
   if (FuncU = 'ALLOCATE') or (FuncU = 'CALLOCATE') or (FuncU = 'REALLOCATE') then
     Result := ArrayIndexOf(FuncU) < 0;
 end;
@@ -35598,7 +35614,9 @@ begin
   if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) then
     ArgList := Node.GetChild(0);
   // FreeBASIC "Deallocate(p)": free the raw byte block p points at. (Not a declared SUB; intercepted.)
-  if (UpperCase(VarToStr(Node.Value)) = 'DEALLOCATE') and Assigned(ArgList) and (ArgList.ChildCount >= 1) then
+  if ((UpperCase(VarToStr(Node.Value)) = 'DEALLOCATE') or
+      ((UpperCase(VarToStr(Node.Value)) = 'FREE') and (FProcedureNames.IndexOf('FREE') < 0))) and
+     Assigned(ArgList) and (ArgList.ChildCount >= 1) then
   begin
     ProcessExpression(ArgList.GetChild(0), PtrVal);
     EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(PtrVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));

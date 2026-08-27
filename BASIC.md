@@ -238,6 +238,14 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
+- ⚠️ **The C standard library is not here, and only its I/O half is a divergence.** A program that
+  includes `<crt.bi>` for MEMORY gets what it asked for: `malloc`, `calloc`, `realloc` and `free` are
+  aliases of `Allocate`, `CAllocate`, `Reallocate` and `Deallocate`, byte for byte (`calloc(count,
+  size)` is exactly the two-argument `CAllocate`). A procedure the program declares itself under one
+  of those names still wins — the alias is a fallback, not a reservation. Everything else in `crt.bi`
+  — `FILE*`, `printf`/`snprintf`, the string and formatting entry points — stays unsupported: this VM
+  owns its own memory and its own file handles, and handing a BASIC program a real `FILE*` is the one
+  thing the memory-safety design exists to prevent.
 - ⚠️ **`Load` is a reserved word here and not in fbc**, so `Sub Load()` is refused. Every other
   Commodore word in that position was checked: `run`, `new`, `delete`, `poke`, `wait`, `close`,
   `open`, `get`, `put`, `print` and `input` are refused by fbc too (in its own words, "Duplicated

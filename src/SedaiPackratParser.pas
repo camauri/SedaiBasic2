@@ -2817,6 +2817,21 @@ begin
       // CONSTRUCTOR/DESTRUCTOR Type(...) — the identifier is the owner type; the method is
       // "Type.CONSTRUCTOR" / "Type.DESTRUCTOR" with an implicit THIS AS Type. Auto-called at
       // instance allocation (M4.4) / scope exit (V5).
+      // ⛔ ...AND THE OWNER MAY BE QUALIFIED. "Constructor n.U2()" written OUTSIDE the namespace that
+      // declares U2 is how FreeBASIC's own suite writes it, and only the FIRST identifier was taken:
+      // the body became the constructor of a type called "N" and ".U2()" was left standing in the
+      // token stream, read as a reference to an array ("Array not declared: U2"). At two levels it was
+      // worse than a refusal - the constructor was silently never called and the field stayed 0.
+      // ⭐ The METHOD spelling beside it ("Sub n.U2.sh()") already read the whole dotted run; the rule
+      // lived in one of the two arms of the same "if".
+      while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+            (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+            (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+      begin
+        Context.Advance;                          // '.'
+        QualName := QualName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+        Context.Advance;                          // the next name of the owner
+      end;
       MethodType := QualName;
       QualName := MethodType + '.' + Kind;
     end
