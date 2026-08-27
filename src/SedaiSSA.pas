@@ -165,6 +165,7 @@ type
   TScopeKind = (skModule, skProcRoot, skBlock);
   TScopeFrame = record
     Kind: TScopeKind;
+    Serial: Integer;         // unique per PUSHED frame: the block's identity for BlockArrayMangle
     Bindings: TStringList;   // NAME(UPPER) -> packed (RegType<<16 | RegIndex), like FVarMap entries
     Dtors: TStringList;      // "VAR|TYPE" UDT instances to destruct at frame exit (block frames)
     RecMarkEmitted: Boolean; // ssaRecMarkPush emitted for this frame (block frames only)
@@ -374,6 +375,7 @@ type
                                           //   (module or proc). A GOTO to one of them exits every open block scope.
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
+    FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
     FScopeSerial: Integer;               // FB scope: monotonic id for unique scoped internal names (NAME@serial)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
@@ -451,9 +453,13 @@ type
     function MemberArrayArgHandle(MemberNode: TASTNode; Emit: Boolean; out HandleReg: TSSAValue): Boolean;
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
     function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
+    function BlockArrayMangle(Serial: Integer; const ArrName: string): string;  // per-BLOCK name for an array DIM'd inside a Scope/If/loop body
+    function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
+    function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
                                 const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
+    function ArrayFactKey(const ArrName: string): string;   // the key the ELEMENT FACTS of that array are filed under
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
@@ -1396,6 +1402,7 @@ begin
   FDeclaredNames.Duplicates := dupIgnore;
   FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
   SetLength(FScopeStack, 0);
+  FNextScopeSerial := 1;
   for DefCh := 'A' to 'Z' do begin FDefTypeBank[DefCh] := -1; FDefTypeName[DefCh] := ''; end;  // DEFtype: no default-by-letter initially
 end;
 
@@ -2676,7 +2683,7 @@ begin
         end
         else
         begin
-          TempStr := UpperCase(FArrayScalarPointee.Values[UpperCase(VarToStr(DerefTarget.GetChild(0).Value))]);
+          TempStr := UpperCase(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(DerefTarget.GetChild(0).Value))]);
           if TempStr = '' then
             TempStr := UpperCase(ArrayPointerUDTType(VarToStr(DerefTarget.GetChild(0).Value)));
         end;
@@ -6408,9 +6415,9 @@ begin
         if (Node.GetChild(0).NodeType = antArrayAccess) and
            (Node.GetChild(0).ChildCount >= 1) and
            (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-           (FArrayFuncPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))] <> '') then
+           (FArrayFuncPtrSig.Values[ArrayFactKey(VarToStr(Node.GetChild(0).GetChild(0).Value))] <> '') then
         begin
-          TempStr := FArrayFuncPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))];
+          TempStr := FArrayFuncPtrSig.Values[ArrayFactKey(VarToStr(Node.GetChild(0).GetChild(0).Value))];
           ProcessExpression(Node.GetChild(0), Left);   // arr(i) -> the funcptr value (int)
           Result := EmitIndirectCall(Left, TempStr, Node.GetChild(1));
           Exit;
@@ -10030,7 +10037,7 @@ begin
   ProcessExpression(ExprNode, ExprValue);
 
   // B1.5: a narrow element type (DIM a(n) AS BYTE/SHORT/.../SINGLE) wraps/rounds the value on store.
-  j := FArrayElemWidth.IndexOf(UpperCase(ArrName));
+  j := FArrayElemWidth.IndexOf(ArrayFactKey(ArrName));
   if j >= 0 then
     ExprValue := ApplyNarrowCode(PtrInt(FArrayElemWidth.Objects[j]), ExprValue);
 
@@ -10678,6 +10685,42 @@ begin
       Continue;
     end;
 
+    // ⭐ THE NAME THE SLOT WILL BE DECLARED UNDER, computed here rather than just before DeclareArray,
+    // because the ELEMENT FACTS recorded below have to be filed under exactly that name - see
+    // ArrayFactKey and DIVERGENZE 61. The rule itself is unchanged; only the place moved.
+    //
+    // A local array (DIM inside a proc) gets its own slot: DeclareArray otherwise REUSES the slot of
+    // the same name (REDIM semantics), resizing/clearing it — and corrupting a same-name ByRef
+    // parameter aliased to it. ArrayIndexOf resolves references through LocalArrayMangle, so the
+    // procedure's own code still finds it. A SHARED array is module-visible and never mangled; a name
+    // that is this proc's own array parameter is left alone.
+    //
+    // ⛔ IT USED TO MANGLE ONLY WHEN A MODULE ARRAY OF THAT NAME ALREADY EXISTED, and that made the
+    // identity depend on DECLARATION ORDER. Two SUBS each declaring "c" and no module "c": the first
+    // declared a GLOBAL slot called C, and the second then found it and mangled - so with DIM the two
+    // were separate by luck, while with REDIM the second took the RESIZE path over the FIRST sub's
+    // array and the program died on an access violation nine lines in. A local is local whether or not
+    // something else happens to share its name.
+    // ⚠️ MODERN only. CLASSIC has no procedure scope at all - in Commodore BASIC every name is global -
+    // so there the old collision-only rule is the right one and stays.
+    DeclArrName := UpperCase(ArrName);
+    if FInProcedure and (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+       (FModernMode or (FProgram.FindArray(UpperCase(ArrName)) >= 0)) and
+       (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
+      DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
+    // ...AND A BLOCK IS A SCOPE TOO. An array DIM'd inside a Scope / If branch / loop body belongs to
+    // THAT block, not to the procedure and not to the module: two sibling "Scope" blocks declaring the
+    // same name are two arrays. It is the innermost identity, so it wins over the per-proc one.
+    // ⛔ SHARED and STATIC are module-lifetime by definition and keep the plain name.
+    // ⚠️ This was tried and withdrawn on 27 Aug 2026 because the slot moved and the element FACTS did
+    // not; ArrayFactKey now resolves those facts through the same walk, which is what makes it safe.
+    if FModernMode and (InnermostBlockFrameIdx >= 0) and
+       (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+       (ArrayDeclNode.Attributes.Values['STATIC'] <> '1') and
+       (not (FInProcedure and
+             (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) >= 0))) then
+      DeclArrName := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, UpperCase(ArrName));
+
     // Element type of "DIM name(dims) [AS type]". child[2] (if present) is the AS-type identifier.
     //   - AS <udt>      → an array of record handles (element type int); element UDT tracked below.
     //   - AS <builtin>  → use the DECLARED type (STRING/INTEGER/DOUBLE/...), NOT the name suffix —
@@ -10697,34 +10740,42 @@ begin
     else
       ElementType := GetVariableType(ArrName);
 
+    // ⭐ AN ARRAY OF UDT records its element type HERE as well, which it never used to. The only
+    // writers were the pre-scan (bare name, no procedure in hand) and RegisterArrayParams (mangled),
+    // so a proc-local "Dim a(2) As T" had NO entry under its own declaration name and the reader had
+    // to fall back to the flat one - which is precisely the fallback ArrayFactKey must not take.
+    // Recording it here is what lets the reader stop guessing. See DIVERGENZE 61.
+    if RecArrUDTIdx >= 0 then
+      FArrayRecordType.Values[DeclArrName] := ArrElemTypeName;
+
     // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
     // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FFuncPtrTypes.IndexOfName(ArrElemTypeName) >= 0) then
-      FArrayFuncPtrSig.Values[UpperCase(ArrName)] := FFuncPtrTypes.Values[ArrElemTypeName];
+      FArrayFuncPtrSig.Values[DeclArrName] := FFuncPtrTypes.Values[ArrElemTypeName];
 
     // Array of UDT POINTERS ("Dim As T Ptr a(..)"): the element is an int holding a record handle.
     // Record the pointee so "a(i)->field" resolves to record access on the loaded element.
     if (RecArrUDTIdx < 0) and (PointeeOfPtrTypeName(ArrElemTypeName) <> '') then
-      FArrayPtrPointee.Values[UpperCase(ArrName)] := PointeeOfPtrTypeName(ArrElemTypeName);
+      FArrayPtrPointee.Values[DeclArrName] := PointeeOfPtrTypeName(ArrElemTypeName);
     // ...and the SCALAR pointee, which the map above declines by design (its readers all expect a UDT
     // record handle). "Dim names(0 To 2) As ZString Ptr" is a table of C strings, and "*names(i)" has
     // to know it dereferences to CHARACTERS and not to eight bytes read as a number.
     if (RecArrUDTIdx < 0) and (Length(ArrElemTypeName) >= 5) and
        (Copy(ArrElemTypeName, Length(ArrElemTypeName) - 3, 4) = ' PTR') and
        (PointeeOfPtrTypeName(ArrElemTypeName) = '') then
-      FArrayScalarPointee.Values[UpperCase(ArrName)] :=
+      FArrayScalarPointee.Values[DeclArrName] :=
         Trim(Copy(ArrElemTypeName, 1, Length(ArrElemTypeName) - 4));
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
     begin
-      WIdx := FArrayElemWidth.IndexOf(UpperCase(ArrName));
+      WIdx := FArrayElemWidth.IndexOf(DeclArrName);
       if TypeNameWidthCode(ArrElemTypeName) <> 0 then
       begin
         if WIdx >= 0 then
           FArrayElemWidth.Objects[WIdx] := TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName)))
         else
-          FArrayElemWidth.AddObject(UpperCase(ArrName), TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName))));
+          FArrayElemWidth.AddObject(DeclArrName, TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName))));
       end
       else if WIdx >= 0 then
         FArrayElemWidth.Delete(WIdx);  // re-DIM to a wide element type clears prior narrowing
@@ -10733,12 +10784,12 @@ begin
       // so the block above records nothing — this is a separate set.
       if (ArrElemTypeName = 'UINTEGER') or (ArrElemTypeName = 'ULONGINT') then
       begin
-        if FUnsigned64Arrays.IndexOf(UpperCase(ArrName)) < 0 then
-          FUnsigned64Arrays.Add(UpperCase(ArrName));
+        if FUnsigned64Arrays.IndexOf(DeclArrName) < 0 then
+          FUnsigned64Arrays.Add(DeclArrName);
       end
       else
       begin
-        WIdx := FUnsigned64Arrays.IndexOf(UpperCase(ArrName));   // re-DIM to a signed element type clears it
+        WIdx := FUnsigned64Arrays.IndexOf(DeclArrName);   // re-DIM to a signed element type clears it
         if WIdx >= 0 then FUnsigned64Arrays.Delete(WIdx);
       end;
     end;
@@ -10747,34 +10798,10 @@ begin
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('Invalid array dimensions for: %s', [ArrName]);
 
-    // A local array (DIM inside a proc) gets its own slot: DeclareArray otherwise REUSES the slot of
-    // the same name (REDIM semantics), resizing/clearing it — and corrupting a same-name ByRef
-    // parameter aliased to it. ArrayIndexOf resolves references through LocalArrayMangle, so the
-    // procedure's own code still finds it. A SHARED array is module-visible and never mangled; a name
-    // that is this proc's own array parameter is left alone.
-    //
-    // ⛔ IT USED TO MANGLE ONLY WHEN A MODULE ARRAY OF THAT NAME ALREADY EXISTED, and that made the
-    // identity depend on DECLARATION ORDER. Two SUBS each declaring "c" and no module "c": the first
-    // declared a GLOBAL slot called C, and the second then found it and mangled - so with DIM the two
-    // were separate by luck, while with REDIM the second took the RESIZE path over the FIRST sub's
-    // array and the program died on an access violation nine lines in. A local is local whether or not
-    // something else happens to share its name.
-    // ⚠️ MODERN only. CLASSIC has no procedure scope at all - in Commodore BASIC every name is global -
-    // so there the old collision-only rule is the right one and stays.
-    DeclArrName := ArrName;
-    if FInProcedure and (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
-       (FModernMode or (FProgram.FindArray(UpperCase(ArrName)) >= 0)) and
-       (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
-      DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
-    // ⚠️ AND A BLOCK IS A SCOPE TOO, but giving a block-local array its own slot HERE was TRIED AND
-    // WITHDRAWN on 27 Aug 2026, measured: the slot moved and the FACTS did not. Every question about
-    // an array's ELEMENTS - is it an array of UDT, of pointers, of function pointers, what narrow
-    // width, is it unsigned - lives in a registry keyed by the BARE name (FArrayRecordType,
-    // FArrayPtrPointee, FArrayScalarPointee, FArrayFuncPtrSig, FArrayElemWidth, FUnsigned64Arrays),
-    // written here and read from about twenty places. A block-local array with its own storage and
-    // ANOTHER array's element facts is a silent wrong answer where today the two at least agree, and
-    // the change was INERT on every net (corpus, sweep, the test it was aimed at). Closing it means
-    // keying those facts by the DECLARATION, not by the name. DIVERGENZE 61.
+    // ⚠️ AND A BLOCK IS A SCOPE TOO. Giving a block-local array its own slot here was tried and
+    // WITHDRAWN on 27 Aug 2026 because the slot moved and the element FACTS did not; those facts are
+    // now filed under DeclArrName and read back through ArrayFactKey, which is the half that was
+    // missing. Still open: the block itself has no name to mangle with. DIVERGENZE 61.
 
     // Extract dimension sizes
     DimCount := DimsNode.ChildCount;
@@ -22347,7 +22374,7 @@ begin
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
-        idx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+        idx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
         if idx >= 0 then Result := PtrInt(FArrayElemWidth.Objects[idx]);
       end;
     antMemberAccess:
@@ -22675,7 +22702,7 @@ begin
     if (NIdx = 0) and (ArrIdx >= 0) then
     begin
       W := 0;
-      WIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(ValueNode.GetChild(0).Value)));
+      WIdx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(ValueNode.GetChild(0).Value)));
       if WIdx >= 0 then W := PtrInt(FArrayElemWidth.Objects[WIdx]);
       Bank := 0;
       if FProgram.GetArray(ArrIdx).ElementType = srtFloat then Bank := 1;
@@ -23169,7 +23196,7 @@ begin
     antArrayAccess:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
-        idx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+        idx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
         if idx >= 0 then Result := PtrInt(FArrayElemWidth.Objects[idx]);
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
@@ -23344,7 +23371,7 @@ begin
           Result := PrintKindOf(VarToStr(Node.GetChild(0).Value)) = 4;
           if not Result then
           begin
-            AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+            AwIdx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
             Result := (AwIdx >= 0) and (PtrInt(FArrayElemWidth.Objects[AwIdx]) = 7);
           end;
           // A call to an intrinsic parses as an array access too ("Sqr(s)" is name + argument list).
@@ -23523,7 +23550,7 @@ begin
         // reach the unsigned-64 compare/div/mod opcodes.
         if Result = 0 then
         begin
-          AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+          AwIdx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
           if AwIdx >= 0 then
           begin
             AwCode := PtrInt(FArrayElemWidth.Objects[AwIdx]);
@@ -23826,7 +23853,7 @@ begin
   // as the JIT: a bare "Dim dyn()" registers ONE dimension and a later "ReDim dyn(1 To 3, 4 To 9)"
   // never revisits it, so both engines answered 18 for UBound(dyn,1) where fbc says 3. The pre-pass
   // is the second half of the question.
-  if FMultiDimArrays.IndexOf(UpperCase(FProgram.GetArray(ArrayIdx).Name)) >= 0 then Exit;
+  if FMultiDimArrays.IndexOf(ArrayBareName(UpperCase(FProgram.GetArray(ArrayIdx).Name))) >= 0 then Exit;
   Result := MakeSSAConstInt(1);
 end;
 
@@ -28991,6 +29018,8 @@ var
   F: TScopeFrame;
 begin
   F.Kind := Kind;
+  F.Serial := FNextScopeSerial;
+  Inc(FNextScopeSerial);
   F.Bindings := TStringList.Create;
   F.Bindings.CaseSensitive := False;
   F.Dtors := TStringList.Create;
@@ -31312,7 +31341,7 @@ var
       ElemName := UpperCase(VarToStr(ArgNode.GetChild(0).Value));
       if ArrayIndexOf(ElemName) >= 0 then
       begin
-        WIdx := FArrayElemWidth.IndexOf(ElemName);
+        WIdx := FArrayElemWidth.IndexOf(ArrayFactKey(ElemName));
         if WIdx >= 0 then
           raise Exception.CreateFmt(
             '%s over the array "%s" is refused: its elements are declared NARROW, and this VM stores ' +
@@ -33422,35 +33451,25 @@ end;
 
 function TSSAGenerator.ArrayPointerUDTType(const ArrName: string): string;
 // The pointee UDT of an array whose ELEMENTS are UDT pointers ("Dim As T Ptr a(n)", or an
-// "a() As T Ptr" parameter). Scope-aware exactly like ArrayRecordTypeOf: a parameter is recorded under
-// its per-proc mangled name, a DIM under its plain name. Empty when the elements are not UDT pointers.
+// "a() As T Ptr" parameter). The key comes from ArrayFactKey, so it is the DECLARATION's, whichever
+// scope declared it. Empty when the elements are not UDT pointers.
 var
-  nameU, mangled: string;
+  nameU: string;
 begin
   Result := '';
-  nameU := UpperCase(ArrName);
-  if FInProcedure then
-  begin
-    mangled := ParamArrayMangle(FCurrentProcName, nameU);
-    if FArrayPtrPointee.IndexOfName(mangled) >= 0 then Exit(FArrayPtrPointee.Values[mangled]);
-  end;
+  nameU := ArrayFactKey(ArrName);
   if FArrayPtrPointee.IndexOfName(nameU) >= 0 then Result := FArrayPtrPointee.Values[nameU];
 end;
 
 function TSSAGenerator.ArrayRecordTypeOf(const ArrName: string): string;
-// The UDT element type of an array-of-UDT, resolved scope-aware: an array PARAMETER's placeholder is
-// registered under its per-proc mangled name (RegisterArrayParams), so inside a proc body try that name
-// first, then fall back to the module/global array name. Empty if the array is not an array-of-UDT.
+// The UDT element type of an array-of-UDT, keyed by the DECLARATION (ArrayFactKey): a parameter under
+// its placeholder's mangled name, a proc-local DIM under its own, a module array under its plain name.
+// Empty if the array is not an array-of-UDT.
 var
-  nameU, mangled: string;
+  nameU: string;
 begin
   Result := '';
-  nameU := UpperCase(ArrName);
-  if FInProcedure then
-  begin
-    mangled := ParamArrayMangle(FCurrentProcName, nameU);
-    if FArrayRecordType.IndexOfName(mangled) >= 0 then Exit(FArrayRecordType.Values[mangled]);
-  end;
+  nameU := ArrayFactKey(ArrName);
   if FArrayRecordType.IndexOfName(nameU) >= 0 then Result := FArrayRecordType.Values[nameU];
 end;
 
@@ -33574,7 +33593,7 @@ begin
           // An element read of an array declared "AS UInteger/ULongInt" is unsigned too (antArrayAccess
           // with the array name in child 0, which is exactly how U was derived above).
           if not Result and (Node.NodeType = antArrayAccess) then
-            Result := FUnsigned64Arrays.IndexOf(U) >= 0;
+            Result := FUnsigned64Arrays.IndexOf(ArrayFactKey(U)) >= 0;
         end;
       end;
   end;
@@ -35857,6 +35876,58 @@ begin
   Result := '@L@' + ProcName + '@' + ArrName;
 end;
 
+function TSSAGenerator.BlockArrayMangle(Serial: Integer; const ArrName: string): string;
+// Per-BLOCK name for an array declared inside a Scope / If branch / loop body. A block is a scope in
+// FreeBASIC exactly as a procedure is, and until now only the procedure half had an identity: two
+// sibling "Scope" blocks each declaring "localarray" shared ONE slot, so the first reported the
+// second's bounds (DIVERGENZE 61). The serial comes from the frame itself, so nested and repeated
+// blocks never collide, and '@' cannot occur in a user array name.
+begin
+  Result := '@B@' + IntToStr(Serial) + '@' + ArrName;
+end;
+
+function TSSAGenerator.ArrayBareName(const SlotName: string): string;
+// The USER'S name of an array slot: "@P@S1@DYN", "@L@S1@DYN" and "@B@3@DYN" all answer "DYN".
+//
+// ⛔ It exists because two halves of one question were asking it differently. The pre-scans that
+// record an array's SHAPE (ScanMultiDimArrays, CollectDynamicArrays, CollectRedimMultiArrays) walk the
+// raw AST with no scope in hand, so they file under the bare name; ArrayRank1Flag then looked the fact
+// up under the SLOT's name, which for anything proc-local or block-local is mangled and never matched.
+// The flag then said "this array is one-dimensional" about a matrix: "Dim dyn() : ReDim dyn(1 To 3,
+// 4 To 9) : Print UBound(dyn)" inside a Sub answered 18 under --aot where fbc and the interpreter
+// answer 3. A mangle is an identity for the COMPILER's tables, never for a table keyed by what the
+// user wrote.
+var
+  k: Integer;
+begin
+  Result := SlotName;
+  if (Length(Result) < 3) or (Result[1] <> '@') then Exit;
+  for k := Length(Result) downto 1 do
+    if Result[k] = '@' then Exit(Copy(Result, k + 1, MaxInt));
+end;
+
+function TSSAGenerator.BlockArrayName(const ArrName: string): string;
+// The mangled name under which one of the OPEN block scopes declared this array, innermost first, or
+// '' when none did. Resolution walks the LIVE scope stack, which is what gives the block its lifetime
+// for free: once the block is closed its frame is gone, the name stops resolving here, and a reference
+// after "End Scope" falls through to the enclosing declaration - which is precisely what FreeBASIC
+// means by block scope. The walk stops at the procedure root: a procedure's blocks are not the
+// module's.
+var
+  k: Integer;
+  nameU, mangled: string;
+begin
+  Result := '';
+  nameU := UpperCase(ArrName);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    if FProgram.FindArray(mangled) >= 0 then Exit(mangled);
+  end;
+end;
+
 procedure TSSAGenerator.RegisterArrayParams;
 // MODERN array parameters: a "name() AS type" parameter is passed ByRef by aliasing a VM array slot
 // (bcArrayBind) at the call site. Pre-register a placeholder array (0-size, the element type from the
@@ -35930,7 +36001,13 @@ function TSSAGenerator.ArrayIndexOf(const ArrName: string): Integer;
 // of the current proc's array parameters resolves to that proc's placeholder slot (ParamArrayMangle);
 // otherwise it falls back to the global/module array table. This is what keeps a SUB's "a()" parameter
 // distinct from a module array "a" (see RegisterArrayParams). ArrName is expected UpperCase.
+var
+  BlkName: string;
 begin
+  // An OPEN block scope that declared this name owns it, innermost first: a block is nested INSIDE the
+  // procedure, so it is asked before the procedure's own parameters and locals.
+  BlkName := BlockArrayName(ArrName);
+  if BlkName <> '' then Exit(FProgram.FindArray(BlkName));
   if FInProcedure then
   begin
     Result := FProgram.FindArray(ParamArrayMangle(FCurrentProcName, ArrName));
@@ -35941,6 +36018,38 @@ begin
     if Result >= 0 then Exit;
   end;
   Result := FProgram.FindArray(ArrName);
+end;
+
+function TSSAGenerator.ArrayFactKey(const ArrName: string): string;
+// The key under which the ELEMENT FACTS of the array this name reaches are filed - is it an array of
+// UDT, of UDT pointers, of scalar pointers, of function pointers, what narrow element width, is the
+// element unsigned-64. It resolves EXACTLY as ArrayIndexOf resolves the STORAGE: the proc's array
+// PARAMETER placeholder first, then the proc's own LOCAL mangle, then the plain module name.
+//
+// ⛔ That "exactly" is the whole point, and it is what DIVERGENZE 61 is about. The slot of a local
+// array has been per-procedure since m593 (LocalArrayMangle) while these facts stayed keyed by the
+// BARE name, so two procedures each declaring "a" shared one set of element facts and the LAST DIM
+// won: "Sub one: Dim a(2) As SomeUDT" left "Sub two: Dim a(2) As Short" taking the record-element
+// store path, and "a(1) = 40000" died on an access violation (job/tests/bas/m614_*).
+// A fact and the storage it describes can no longer come from two different declarations.
+//
+// ⚠️ The fallback to the flat entry is NOT taken once the name resolves to a slot of this procedure's
+// own: absence of a fact there means "this array is not one of those", which is the right answer, not
+// a reason to go and read another declaration's. It is the second of the two conditions in
+// job/markdown/REGISTRI.md, and it is what makes the change monotone at module level - a name with no
+// per-proc slot reads precisely as it did before.
+var
+  nameU, mangled: string;
+begin
+  nameU := UpperCase(ArrName);
+  Result := nameU;
+  mangled := BlockArrayName(nameU);
+  if mangled <> '' then Exit(mangled);
+  if not FInProcedure then Exit;
+  mangled := ParamArrayMangle(FCurrentProcName, nameU);
+  if FProgram.FindArray(mangled) >= 0 then Exit(mangled);
+  mangled := LocalArrayMangle(FCurrentProcName, nameU);
+  if FProgram.FindArray(mangled) >= 0 then Exit(mangled);
 end;
 
 function TSSAGenerator.IsArrayParamSlot(Idx: Integer): Boolean;
@@ -37763,7 +37872,7 @@ begin
   // it had the same defect as the JIT for exactly the same reason: it trusted DimCount, which a bare
   // "Dim dyn()" leaves at 1 however the REDIM later shapes the array.
   for LastArr := 0 to FProgram.GetArrayCount - 1 do
-    if FMultiDimArrays.IndexOf(UpperCase(FProgram.GetArray(LastArr).Name)) >= 0 then
+    if FMultiDimArrays.IndexOf(ArrayBareName(UpperCase(FProgram.GetArray(LastArr).Name))) >= 0 then
       FProgram.SetArrayMultiDim(LastArr);
 
   Result := FProgram;
