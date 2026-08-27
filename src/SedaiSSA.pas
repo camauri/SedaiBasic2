@@ -26942,6 +26942,15 @@ begin
   if FModuleOnlyVars = nil then Exit;
   if FModuleOnlyVars.IndexOf(NameU) < 0 then Exit;     // not a module-only declaration
   if IsSharedScalar(NameU) then Exit;                  // DIM SHARED is visible everywhere
+  // ⛔ ...AND SO IS A RAW-BACKED ONE. Taking a module scalar's address moves it OUT of the shared-scalar
+  // registry and into the raw one - whose own note says "visible in every procedure" - and this test
+  // knew only the first of the two. A STATIC local is hoisted into a module DIM SHARED, so
+  // "Static As ZString * 32 z" whose @ is taken became module-only-and-HIDDEN: inside its own procedure
+  // the bank fell back to the NAME SUFFIX (float), and "z[0]" - which asks this very question - dropped
+  // onto the array ladder as "Array not declared: STATIC.0.Z". Three neighbouring spellings all worked
+  // (z[0] alone, @z alone, the same pair on a plain local), which is what said the defect was the
+  // VISIBILITY question and not the index.
+  if IsRawModuleScalar(NameU) then Exit;
   if (FCurrentProcDeclNames <> nil) and (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then Exit;
   Result := True;
 end;
@@ -31751,7 +31760,20 @@ const
 begin
   Result := NOENTRY;
   if FCurrentProcName <> '' then
+  begin
     Result := StrToIntDef(L.Values[FCurrentProcName + '|' + UpperCase(Name)], NOENTRY);
+    // ⛔ ...AND WHEN THIS PROCEDURE DECLARES THE NAME ITSELF, THE FLAT ENTRY MUST NOT APPLY AT ALL.
+    // Falling back to it made a "Dim s As Double" take the FIXED-LENGTH STRING store path because
+    // ANOTHER procedure had declared an "s As ZString * 16" - the double was stored as text and read
+    // back 0, silently - and it went on doing the same thing BETWEEN the two string kinds: a
+    // "Dim s As String * 8" beside that ZString took the ZSTRING path and was never padded.
+    // ⭐ The test is "did THIS procedure declare the name", asked of the scoped BANK map, which holds
+    // an entry exactly when the declaration was one we could resolve. A name this procedure does not
+    // declare still falls through to the flat entry, so nothing that used to resolve stops resolving.
+    if (Result = NOENTRY) and
+       (FVarExplicitType.IndexOf(FCurrentProcName + '|' + UpperCase(Name)) >= 0) then
+      Exit(Def);
+  end;
   if Result = NOENTRY then Result := StrToIntDef(L.Values[UpperCase(Name)], Def);
 end;
 
