@@ -264,6 +264,7 @@ type
                                             //   Per-proc (not global FPointerVars) so same-named ptr params of different
                                             //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
+    FModuleFuncPtrSigs: TStringList;        // ...of those, the MODULE-level ones: they survive every procedure prologue
     FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
                                             //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
@@ -1310,6 +1311,7 @@ begin
   FCurrentProcPtrLocals := TStringList.Create;
   FCurrentProcPtrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
+  FModuleFuncPtrSigs := TStringList.Create;
   FFuncPtrTypes := TStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
   FModuleRecordVars := TStringList.Create;
@@ -1446,6 +1448,7 @@ begin
   FCurrentProcPtrLocals.Free;
   FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
+  FModuleFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
   FModuleCtors.Free;
@@ -10364,15 +10367,23 @@ begin
     // holds a procedure entry PC (assigned via "= @func"); record its signature so "fp(args)" lowers to
     // an indirect call. Falls through to the typed-scalar path below (element type INTEGER).
     if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
+    begin
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
         ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
-        Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'))
+        Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
+      if not FInProcedure then
+        FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FFuncPtrSigs.Values[UpperCase(ArrName)];
+    end
     // "DIM f AS X" where X is a named function-pointer type ("Type X As Function(...)"): f is a funcptr
     // with X's signature (X aliases to INTEGER, so the typed-scalar path below gives it the int bank).
     else if (DimsNode.NodeType = antIdentifier) and
             (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
+    begin
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
         FFuncPtrTypes.Values[UpperCase(VarToStr(DimsNode.Value))];
+      if not FInProcedure then
+        FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FFuncPtrSigs.Values[UpperCase(ArrName)];
+    end;
 
     // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
     // ordinary "DIM x AS T = expr" — no VAR-specific handling needed.)
@@ -36558,7 +36569,13 @@ begin
     FCurrentProcPtrParams.Clear;                          // "param AS T PTR" of this proc (filled in prologue)
     FCurrentProcPtrLocals.Clear;
     CollectProcPtrLocals(Proc);                           // "DIM x AS T PTR" in THIS body (see the method)
-    FFuncPtrSigs.Clear;                                   // function-pointer params/locals of THIS proc (filled in prologue / ProcessDim)
+    // ⛔ ...AND A MODULE-LEVEL FUNCTION POINTER IS VISIBLE IN EVERY PROCEDURE, so wiping the registry
+    // here threw its signature away: "Dim Shared pf As Function() As Integer = @foo" called from
+    // module level lowered to an indirect call and the IDENTICAL call one line inside a Sub lowered to
+    // a plain READ of the pointer - it PRINTED the entry PC (46, 21) instead of calling through it, in
+    // silence. Re-seeded rather than cleared; a local or parameter of the same name overwrites its
+    // entry, so it still shadows the module one exactly as before.
+    FFuncPtrSigs.Assign(FModuleFuncPtrSigs);              // function-pointer params/locals of THIS proc, over the module's
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);

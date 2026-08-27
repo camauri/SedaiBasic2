@@ -221,9 +221,15 @@ var
         D := Child.GetChild(k);
         // Two shapes reach here: a typed scalar (child[1] = type identifier) and an array
         // (child[1] = antDimensions, child[2] = element type). Both hoist the same way.
+        // ⭐ ...and a THIRD shape: "Static Var n = 0", where child[1] is the INITIALIZER and the type is
+        // inferred from it. It was rejected here, so it was never hoisted and never persisted - the
+        // variable was reborn on every call and "n += 1" printed 1, 1, 1 where fbc prints 1, 2, 3.
+        // STATIC says WHERE the storage lives and VAR says where the TYPE comes from; the two are
+        // orthogonal, and only this guard said otherwise.
         if (D.NodeType = antArrayDecl) and (D.Attributes.Values['STATIC'] = '1') and
            (D.ChildCount >= 2) and (D.GetChild(0).NodeType = antIdentifier) and
-           ((D.GetChild(1).NodeType = antIdentifier) or (D.GetChild(1).NodeType = antDimensions)) then
+           ((D.GetChild(1).NodeType = antIdentifier) or (D.GetChild(1).NodeType = antDimensions) or
+            (D.Attributes.Values['INFER'] = '1')) then
         begin
           Decls.Add(D);
           Parents.Add(Child);
@@ -272,6 +278,17 @@ begin
       GrandNode := TASTNode(Grands[i]);
       NameNode := Decl.GetChild(0);
       TypeNode := Decl.GetChild(1);
+      // An INFER declaration hoists WHOLE: cloning keeps child[1] as the initializer and carries the
+      // INFER mark with it, which is exactly what the module-level VAR needs to type itself. Rebuilding
+      // it as "name AS type" (the scalar path below) would have to invent the type this shape exists
+      // not to name.
+      if Decl.Attributes.Values['INFER'] = '1' then
+      begin
+        Hoisted.Add(BuildSharedArrayDecl(Decl, Mangled));
+        RenameRefs(Proc, UpperCase(VarToStr(NameNode.Value)), Mangled);
+        DimNode.Children.Remove(Decl);
+        Continue;
+      end;
       VName := UpperCase(VarToStr(NameNode.Value));
       Mangled := 'STATIC.' + IntToStr(ProcIdx) + '.' + VName;
       if TypeNode.NodeType = antDimensions then
@@ -303,7 +320,14 @@ begin
         TName := UpperCase(VarToStr(TypeNode.Value));
         // A constant initializer (child[2], an expression, not a ctor argument list) is kept and moved to
         // the module-level DIM SHARED so it runs once at program start.
-        if (Decl.ChildCount >= 3) and (Decl.GetChild(2).NodeType <> antArgumentList) then
+        // ⛔ ...AND AN AGGREGATE TUPLE IS NOT CTOR ARGUMENTS, though it wears the same node type. The
+        // parser answers "= (11, 22)" as an antArgumentList marked TUPLEINIT, so this test threw it
+        // away and "Static As T v = (11, 22)" hoisted a declaration with NO initializer: the fields
+        // read 0 in silence, while the identical "Dim Shared" one line above was right. The mark is
+        // what tells the two apart, and it was already there to be asked.
+        if (Decl.ChildCount >= 3) and
+           ((Decl.GetChild(2).NodeType <> antArgumentList) or
+            (Decl.GetChild(2).Attributes.Values['TUPLEINIT'] = '1')) then
           InitClone := Decl.GetChild(2).Clone
         else
           InitClone := nil;

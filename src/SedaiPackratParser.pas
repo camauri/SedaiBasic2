@@ -10281,6 +10281,8 @@ var
   StaticAddrNd: TASTNode;
   IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
   IsByrefStatic: Boolean;  // ...and "Static Shared ByRef As T r = target"
+  StaticVarIdx: Integer;   // "Static Var v = e": stamping the modifiers onto what VAR produced
+  StaticFpNode: TASTNode;  // "Static f As Function(...) As ret": the signature, read as DIM reads it
 
   // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
   // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
@@ -10349,12 +10351,48 @@ begin
   // it was not an identifier either, so the statement died with "Expected a variable name after STATIC".
   IsByrefStatic := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
   if IsByrefStatic then Context.Advance;             // consume BYREF
+  // ⭐ "STATIC VAR n = 0": VAR is a DECLARATION KEYWORD, not a name, and the loop below wanted an
+  // identifier - so the whole statement died as "Expected a variable name after STATIC". STATIC says
+  // WHERE the storage lives and VAR says where the TYPE comes from; they are orthogonal, and DIM has
+  // read VAR by delegating to the same routine all along (ParseDimStatement's first line). One reader,
+  // both spellings: the modifiers are stamped onto what it produced.
+  if UpperCase(VarToStr(Context.CurrentToken.Value)) = kVAR then
+  begin
+    Result.Free;
+    Result := ParseVarStatement;
+    if Assigned(Result) then
+      for StaticVarIdx := 0 to Result.ChildCount - 1 do
+      begin
+        Result.GetChild(StaticVarIdx).Attributes.Values['STATIC'] := '1';
+        if IsShared then Result.GetChild(StaticVarIdx).Attributes.Values['SHARED'] := '1';
+      end;
+    Exit;
+  end;
   // FreeBASIC AS-first form: "STATIC AS type name1 [= init] [, name2 ...]" — the shared type precedes the
   // names (like "DIM AS type name"). Distinct from the "STATIC name AS type" form handled below.
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
+    // ⭐ ...and the type may be a PROCEDURE POINTER, "Static As Function() As Integer pf = @foo".
+    // AtDottedTypeName says no to the word FUNCTION, so the declaration died as "Expected type name
+    // after AS" - while DIM has read exactly this since it was written. Same routine, same shape.
+    StaticFpNode := nil;
+    if Context.Check(ttProcedureStart) then
+    begin
+      StaticFpNode := TASTNode.Create(antArrayDecl, Context.CurrentToken);
+      if TryParseProcPtrType(StaticFpNode) then
+      begin
+        StaticTypeName := 'INTEGER';       // a funcptr holds an entry PC: int-banked, like DIM's
+        TypeTok := Token;
+      end
+      else
+      begin
+        StaticFpNode.Free; StaticFpNode := nil;
+      end;
+    end;
+    if not Assigned(StaticFpNode) then
+    begin
     if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
@@ -10364,6 +10402,7 @@ begin
     StaticTypeName := ParseDottedName;
     while AtPointerSuffix do
     begin StaticTypeName := StaticTypeName + ' PTR'; Context.Advance; end;
+    end;
     StaticFixedLen := ParseStaticFixedLen;   // "Static As String * n a, b": one capacity, every name
     repeat
       if not Context.Check(ttIdentifier) then Break;
@@ -10413,10 +10452,18 @@ begin
       DeclNode.Attributes.Values['STATIC'] := '1';
       if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
       if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
+      if Assigned(StaticFpNode) then
+      begin
+        DeclNode.Attributes.Values['FUNCPTR'] := '1';
+        DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
+        DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
+        DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
+      end;
       DoNodeCreated(DeclNode);
       Result.AddChild(DeclNode);
       if Context.Check(ttSeparParam) then Context.Advance else Break;
     until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
+    StaticFpNode.Free;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -10453,6 +10500,24 @@ begin
     end;
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
+    // ...and the PROCEDURE POINTER type here too: "Static pf As Function() As Integer = @foo".
+    // The leading-AS spelling above and this one are one rule, and it kept being taught to one of them.
+    StaticFpNode := nil;
+    if Context.Check(ttProcedureStart) then
+    begin
+      StaticFpNode := TASTNode.Create(antArrayDecl, Context.CurrentToken);
+      if TryParseProcPtrType(StaticFpNode) then
+      begin
+        StaticTypeName := 'INTEGER';
+        TypeTok := NameTok;
+      end
+      else
+      begin
+        StaticFpNode.Free; StaticFpNode := nil;
+      end;
+    end;
+    if not Assigned(StaticFpNode) then
+    begin
     if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
@@ -10464,6 +10529,7 @@ begin
     begin
       StaticTypeName := StaticTypeName + ' PTR';
       Context.Advance;                               // consume PTR
+    end;
     end;
     StaticFixedLen := ParseStaticFixedLen;           // "Static z As String * n"
     DeclNode := TASTNode.Create(antArrayDecl, NameTok);
@@ -10483,7 +10549,12 @@ begin
       if Context.Check(ttOpEq) then
       begin
         Context.Advance;                             // =
-        Init := FExpressionParser.ParseExpression;
+        // ⛔ ...AND SO DOES THE AGGREGATE TUPLE. "Static As T v = (1, 2)" was taught to the leading-AS
+        // spelling and this one was not, so "Static v As T = (1, 2)" - the same declaration written
+        // the other way - read the parentheses as an expression and failed at the comma. The third
+        // rule in this routine that lived in one of two sibling paths; the note below is the second.
+        Init := TryParseAggregateTuple(StaticTypeName);
+        if not Assigned(Init) then Init := FExpressionParser.ParseExpression;
         // ⛔ The BYREF wrapping belongs to BOTH spellings. "Static ByRef As T r = x" was taught it and
         // "Static ByRef r As T = x" was not, so the name-first form declared an ordinary variable and
         // read 0 - the same rule in one path and not its sibling, one edit later in the same routine.
@@ -10509,6 +10580,14 @@ begin
     DeclNode.Attributes.Values['STATIC'] := '1';
     if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
     if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
+    if Assigned(StaticFpNode) then
+    begin
+      DeclNode.Attributes.Values['FUNCPTR'] := '1';
+      DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
+      DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
+      DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
+      FreeAndNil(StaticFpNode);
+    end;
     DoNodeCreated(DeclNode);
     Result.AddChild(DeclNode);
     if Context.Check(ttSeparParam) then
