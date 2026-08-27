@@ -665,6 +665,9 @@ type
     function TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
     function TryEmitDerefTargetAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;   // "*<expr>" as a place
     function UDTWritableStringCast(Node: TASTNode; out ObjType: string): string;   // assignable "Cast() ByRef As Z/WString"
+    function StrConversionOperand(Node: TASTNode): TASTNode;   // "Str(x)" in an LVALUE position -> x (borrowed)
+    function WrapInStrConversion(Node: TASTNode): TASTNode;    // ...and the reverse, for the mixed SWAP
+    function TryStoreThroughStringCast(TgtNode, ExprNode: TASTNode): Boolean;   // "<udt> = <string>" through its Cast
     function UDTDerivesFromStringType(const TypeName: string): Boolean;   // EXTENDS chain reaches ZSTRING/WSTRING?
     function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
     function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
@@ -7846,6 +7849,26 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // ⭐ "Str(x) = expr" / "WStr(x) = expr". Str of something that is ALREADY a string is the identity,
+  // and fbc accepts it where an lvalue is expected - its own suite writes "Swap Str(u1), Str(u2)" over
+  // a UDT that converts to a zstring, and the whole statement fell out here as "Array not declared:
+  // STR". A UDT target is written THROUGH its Cast; anything else is the place itself.
+  // ⛔ The UDT case is NOT reached by unwrapping to "u = expr": fbc REFUSES that spelling, and turning
+  // it into a write would accept a program the oracle rejects.
+  SharedAssign := StrConversionOperand(VarNode);
+  if SharedAssign <> nil then
+  begin
+    if TryStoreThroughStringCast(SharedAssign, ExprNode) then Exit;
+    UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+    try
+      UnwrapAssign.AddChild(SharedAssign.Clone);
+      UnwrapAssign.AddChild(ExprNode.Clone);
+      ProcessAssignment(UnwrapAssign);
+    finally
+      UnwrapAssign.Free;
+    end;
+    Exit;
+  end;
   // ⭐ "UDT.a(i) = v" / "x.a(i) = v" where a is a STATIC ARRAY member: the target is the backing global
   // array under its dotted name. Asked here rather than in ProcessMemberStore because this shape is an
   // antArrayAccess over the member access and never reaches that routine at all - the READ half went
@@ -11499,6 +11522,24 @@ begin
   HoistIn(Result);
 end;
 
+function TSSAGenerator.WrapInStrConversion(Node: TASTNode): TASTNode;
+// Wrap a UDT that converts to a string in the "Str( ... )" the program wrote on the other operand, so
+// the mixed spellings of SWAP reach the one string path. Frees Node and answers the wrapper when the
+// type has an assignable string Cast; otherwise leaves Node exactly as it was.
+var
+  CastType: string;
+  Args: TASTNode;
+begin
+  Result := Node;
+  if Node = nil then Exit;
+  if UDTWritableStringCast(Node, CastType) = '' then Exit;
+  Result := TASTNode.Create(antArrayAccess, Node.Token);
+  Result.AddChild(TASTNode.CreateWithValue(antIdentifier, kSTR, Node.Token));
+  Args := TASTNode.Create(antExpressionList, Node.Token);
+  Args.AddChild(Node);            // adopted: the wrapper owns it now
+  Result.AddChild(Args);
+end;
+
 procedure TSSAGenerator.ProcessSwap(Node: TASTNode);
 // SWAP a, b (FreeBASIC): exchange the values of two lvalues. We snapshot a's current value
 // into a freshly-named typed temp, then reuse ProcessAssignment for "a = b" and "b = tmp" so
@@ -11517,6 +11558,18 @@ begin
   LeftNode := HoistLValueSubscripts(Node.GetChild(0));
   RightNode := HoistLValueSubscripts(Node.GetChild(1));
   try
+  // ⭐ "Swap Str(u1), u2" IS A STRING SWAP, not a record swap. When exactly ONE side is written
+  // "Str(...)", fbc takes the OTHER through its string conversion too - the udt-zstring/swap suite
+  // asserts that the UDT's other fields (its id) are left alone by all three mixed spellings and moved
+  // only by the bare "Swap u1, u2". Expressed by wrapping the bare side in the same Str() the program
+  // wrote on the first, so one path serves every combination instead of four.
+  if (StrConversionOperand(LeftNode) <> nil) <> (StrConversionOperand(RightNode) <> nil) then
+  begin
+    if StrConversionOperand(LeftNode) <> nil then
+      RightNode := WrapInStrConversion(RightNode)
+    else
+      LeftNode := WrapInStrConversion(LeftNode);
+  end;
 
   // Snapshot the current value of the first operand (scalar / array / member read).
   ProcessExpression(LeftNode, ValA);
@@ -12580,6 +12633,20 @@ var
 begin
   Val := MakeSSAValue(svkNone);
   if Node = nil then Exit;
+  // ⭐ "= Type( )" AS A DEFAULT: the bare Type() carries no <T>, and its type comes from the
+  // PARAMETER's declared type - exactly as "Function = Type(...)" fills it from the return type and
+  // "Dim v As T = Type(...)" from the declared one. Three spellings of the same rule already had it
+  // and this fourth did not, so the node reached the SSA with an EMPTY type name and was read as an
+  // array access: "Array not declared: " - a message naming nothing at all.
+  if (Node.NodeType = antArrayAccess) and (Node.Attributes.Values['INFERTYPE'] = '1') and
+     (Node.ChildCount >= 1) and (ParamNode <> nil) and (ParamNode.ChildCount >= 1) and
+     (ParamNode.GetChild(0).NodeType = antIdentifier) and
+     not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) and
+     (FindUDT(UpperCase(VarToStr(ParamNode.GetChild(0).Value))) >= 0) then
+  begin
+    Node.GetChild(0).Value := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+    Node.Attributes.Values['INFERTYPE'] := '';
+  end;
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) and
      (FindUDT(UpperCase(VarToStr(Node.Value))) >= 0) and
      (VarRecordTypeName(VarToStr(Node.Value)) = '') then     // a TYPE name, not a variable of that type
@@ -12901,6 +12968,48 @@ begin
       EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
     end;
   end;
+  Result := True;
+end;
+
+function TSSAGenerator.StrConversionOperand(Node: TASTNode): TASTNode;
+// "Str(x)" / "WStr(x)" applied to something that is ALREADY a string is the identity, and fbc lets it
+// stand where an LVALUE is expected - its own suite writes "Swap Str(u1), Str(u2)" over a UDT that
+// converts to a zstring. Answers the operand NODE (borrowed from the tree), or nil.
+var
+  Nm: string;
+  Args: TASTNode;
+begin
+  Result := nil;
+  if (Node = nil) or (Node.ChildCount < 2) then Exit;
+  if not (Node.NodeType in [antArrayAccess, antFunctionCall]) then Exit;
+  if Node.GetChild(0) = nil then Exit;
+  if Node.GetChild(0).NodeType = antIdentifier then Nm := UpperCase(VarToStr(Node.GetChild(0).Value))
+  else Exit;
+  if (Nm <> kSTR) and (Nm <> kSTRS) and (Nm <> kWSTR) and (Nm <> kWSTR + '$') then Exit;
+  Args := Node.GetChild(1);
+  if (Args = nil) or not (Args.NodeType in [antExpressionList, antArgumentList]) or
+     (Args.ChildCount <> 1) then Exit;
+  Result := Args.GetChild(0);
+end;
+
+function TSSAGenerator.TryStoreThroughStringCast(TgtNode, ExprNode: TASTNode): Boolean;
+// "<UDT with an assignable string Cast> = <string expression>": write through the reference the cast
+// hands back, which is the same protocol LSET/RSET uses on such a destination. Answers False, emitting
+// nothing, when the target is not one - so a plain "u = "abc"", which fbc REFUSES, keeps its old path.
+var
+  CastLbl, CastType: string;
+  Node: TASTNode;
+  AddrVal, StrVal: TSSAValue;
+begin
+  Result := False;
+  if TgtNode = nil then Exit;
+  Node := TgtNode;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  CastLbl := UDTWritableStringCast(Node, CastType);
+  if CastLbl = '' then Exit;
+  ProcessStringExpression(ExprNode, StrVal);
+  ProcessMethodCall(Node, CastType, 'OPERATORCAST$', nil, AddrVal, False, True);
+  EmitByrefRetStore(EnsureIntRegister(AddrVal), EnsureStringRegister(StrVal), CastLbl);
   Result := True;
 end;
 
@@ -32063,6 +32172,22 @@ begin
     try EmitArrayElementAddress(AddrNd, Result); finally AddrNd.Free; end;
     Exit;
   end;
+  // ⭐ "@x[1]" where x is a UDT with a BYREF index operator: the operator IS what names the place, and
+  // it hands its address back already - the very protocol "x[1] = v" uses. Every rung of the ladder
+  // below is indexed by an array NAME, so this fell off the end as "Cannot take address of element of
+  // undeclared array: X" while the assignment through the same operator worked.
+  RecTypeName := IndexOperatorLabel(Node, BaseTypeName);
+  if (RecTypeName <> '') and ByrefRetByAddress(RecTypeName) and (Node.ChildCount >= 2) then
+  begin
+    // ⛔ ...and when the referenced thing is a UDT, its "address" IS ITS RECORD HANDLE - that is what
+    // the managed model means by a "T Ptr", and what "@x" of a UDT variable answers. Asking for the
+    // raw staged address instead handed back the packed address of the callee's THIS slot, so
+    // "@x[1] = @x" was false where fbc says true. The deref is the handle: WantAddress stays off.
+    ProcessMethodCall(Node.GetChild(0), BaseTypeName, 'OPERATOR[]', Node.GetChild(1), Result, False,
+                      FindUDT(ByrefRetPointeeType(RecTypeName)) < 0);
+    Result := EnsureIntRegister(Result);
+    Exit;
+  end;
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
   // not a declared-array identifier, so the name-based path below would fail).
@@ -33896,6 +34021,13 @@ begin
     MethodLabel := AnyOverrideLabel(ObjType, MethNm);
   if MethodLabel = '' then Exit;
   RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
+  // ⛔ A BYREF UDT RESULT IS STILL TREATED AS A VALUE RETURN, and that is a MODEL gap, not an
+  // oversight: the caller allocates a copy, so "@x[1] = @x" answers false where fbc says true and a
+  // mutation the operator made to THIS is invisible afterwards. ⚠️ TRIED AND WITHDRAWN 27 Aug:
+  // clearing RetRecType here to take the reference path instead makes the callee stage NOTHING - an
+  // OPERATOR body's "Operator = This" does not reach the byref-address arm - and the very next
+  // dereference dies on address 0. Closing it means giving the callee side that arm, which is a
+  // different piece of work. DIVERGENZE 72.
 
   // Build an argument list with the object (THIS) prepended.
   TmpArgs := TASTNode.Create(antArgumentList, ObjNode.Token);
