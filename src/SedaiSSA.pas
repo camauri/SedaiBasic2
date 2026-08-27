@@ -285,6 +285,9 @@ type
     // still declared and initialised, so anything else that resolves through it is unaffected.
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
+    FStaticMemberArrays: TStringList;    // ...and the ones that are ARRAYS: "TYPE.FIELD" -> the global array's id.
+                                        // ⛔ Kept OUT of FSharedScalarArr on purpose: a shared SCALAR is a one-element
+                                        // array, and every reader of IsSharedScalar would read element 0 as the value.
     FEnumMembers: TStringList;
     FTypeEnumMembers: TStringList;       // ENUM members declared INSIDE a TYPE: "TYPE.MEMBER" (UPPER)
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
@@ -564,6 +567,8 @@ type
     function DimBoundsAreConstant(DimsNode: TASTNode): Boolean;  // every subscript written as a literal
     function AnyHoistedDim(DimNode: TASTNode): Boolean;          // ...this antDim holds one such declaration
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
+    function StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;    // ...the ARRAY backing, or ''
+    function RewriteStaticMemberArray(Node: TASTNode): TASTNode;   // a static-array member reference -> the backing array node
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)? False when shadowed by a param/local
@@ -1298,6 +1303,8 @@ begin
   FModuleConstVals.CaseSensitive := False;
   FStaticMembers := TStringList.Create;
   FStaticMembers.CaseSensitive := False;
+  FStaticMemberArrays := TStringList.Create;
+  FStaticMemberArrays.CaseSensitive := False;
   FEnumMembers := TStringList.Create;
   FTypeEnumMembers := TStringList.Create;
   FTypeEnumMembers.CaseSensitive := False;
@@ -1422,6 +1429,7 @@ begin
   FSharedScalarArr.Free;
   FModuleConstVals.Free;
   FStaticMembers.Free;
+  FStaticMemberArrays.Free;
   FEnumMembers.Free;
   FTypeEnumMembers.Free;
   FEnumNames.Free;
@@ -2118,6 +2126,7 @@ var
   MethodObjNode: TASTNode;        // M4.1: object of a method call
   DerefTarget: TASTNode;          // "*expr": the operand, with any parentheses stripped
   CancelNode: TASTNode;           // "*@x": the inner lvalue the pair cancels to (owned here)
+  StaticArrNode: TASTNode;        // a static ARRAY member rewritten to its backing global array
   ExprList2: TASTNode;            // synthesized empty argument list for "Cast(T, T)"
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
@@ -4880,8 +4889,21 @@ begin
           // UDT array member: LBOUND/UBOUND(obj.field [, dim]) — resolve via the field's FArrays handle.
           if TryMemberArrayBound(IndicesNode, ArgListNode, FuncName = 'LBOUND', Result) then
             Exit;
+          // ...and a STATIC array member is one global array under a dotted name, so it answers through
+          // the ordinary path below - by its backing NAME. Without this the member name alone was read
+          // and the bound was refused as "array not declared: A".
+          StaticArrNode := RewriteStaticMemberArray(IndicesNode);
+          if StaticArrNode <> nil then
+          begin
+            try
+              if StaticArrNode.NodeType = antArrayAccess then ArrName := VarToStr(StaticArrNode.GetChild(0).Value)
+              else ArrName := VarToStr(StaticArrNode.Value);
+            finally
+              StaticArrNode.Free;
+            end;
+          end
           // The array name may arrive as a bare identifier or wrapped in an array-access node.
-          if IndicesNode.NodeType = antArrayAccess then
+          else if IndicesNode.NodeType = antArrayAccess then
             ArrName := VarToStr(IndicesNode.GetChild(0).Value)
           else
             ArrName := VarToStr(IndicesNode.Value);
@@ -6272,6 +6294,15 @@ begin
       // Structure: antArrayAccess
       //   antIdentifier: array name
       //   antExpressionList: indices
+
+      // ⭐ ...unless the "array" is a STATIC MEMBER: it is a global array under a dotted name, and every
+      // path below works on it once the reference is rewritten. See RewriteStaticMemberArray.
+      StaticArrNode := RewriteStaticMemberArray(Node);
+      if StaticArrNode <> nil then
+      begin
+        try ProcessExpression(StaticArrNode, Result); finally StaticArrNode.Free; end;
+        Exit;
+      end;
 
       if Node.ChildCount < 2 then
         begin
@@ -7809,6 +7840,27 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // ⭐ "UDT.a(i) = v" / "x.a(i) = v" where a is a STATIC ARRAY member: the target is the backing global
+  // array under its dotted name. Asked here rather than in ProcessMemberStore because this shape is an
+  // antArrayAccess over the member access and never reaches that routine at all - the READ half went
+  // through the expression path and the WRITE half did not, which is how the member kept answering 0.
+  SharedAssign := RewriteStaticMemberArray(VarNode);
+  if SharedAssign <> nil then
+  begin
+    try
+      UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+      try
+        UnwrapAssign.AddChild(SharedAssign.Clone);
+        UnwrapAssign.AddChild(ExprNode.Clone);
+        ProcessAssignment(UnwrapAssign);
+      finally
+        UnwrapAssign.Free;
+      end;
+    finally
+      SharedAssign.Free;
+    end;
+    Exit;
+  end;
   // ⛔ A TEMPORARY IS NOT AN LVALUE. "type<UDT>( 1 ) = x" and its "*@type<UDT>( 1 ) = x" spelling are
   // errors in fbc (sf.net #801), while "type<UDT>( 0 ).i = 1" is legal - the difference is whether the
   // target is the temporary ITSELF or a member of it, which is why the test is on the target node and
@@ -9682,6 +9734,7 @@ begin
   ArgList := Node.GetChild(0);
   if ArgList.ChildCount < 1 then Exit;
   NameNode := ArgList.GetChild(0);
+  if NameNode.NodeType = antMemberAccess then Exit;   // a member: not a compile-time constant here
   if NameNode.NodeType = antArrayAccess then
   begin
     if NameNode.ChildCount < 1 then Exit;
@@ -11090,7 +11143,7 @@ procedure TSSAGenerator.ProcessErase(Node: TASTNode);
 var
   j, ArrayIdx, RecUDT: Integer;
   ArrName: string;
-  Child: TASTNode;
+  Child, StaticArr: TASTNode;
   DynFlag: Int64;
 begin
   for j := 0 to Node.ChildCount - 1 do
@@ -11103,8 +11156,26 @@ begin
     // ⛔ A member access used to be SKIPPED here in silence: the statement parsed and erased nothing.
     if Child.NodeType = antMemberAccess then
     begin
-      if EmitMemberArrayErase(Child) then Continue;
-      raise Exception.Create('ERASE: not an array member');
+      // ...unless it is a STATIC member: one global array under a dotted name, erased by NAME below.
+      // ⛔ REDIM and ERASE are two sites with the same dependency, and closing one leaves the other
+      // raising where its twin works.
+      StaticArr := RewriteStaticMemberArray(Child);
+      if StaticArr <> nil then
+      begin
+        try
+          Node.Children.Extract(Child);
+          Node.Children.Insert(j, StaticArr.Clone);
+          Child.Free;
+          Child := Node.GetChild(j);
+        finally
+          StaticArr.Free;
+        end;
+      end
+      else
+      begin
+        if EmitMemberArrayErase(Child) then Continue;
+        raise Exception.Create('ERASE: not an array member');
+      end;
     end;
     if Child.NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(Child.Value));
@@ -11148,7 +11219,7 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 var
   j, di, ArrayIdx, MSlot, MDimCount, UdtIdx, MElemUDT: Integer;
   ArrName, MTypeName, ElemUdtName: string;
-  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode: TASTNode;
+  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode, StaticArr: TASTNode;
   UbValue, UbReg, MHandle, LbVal, MArrHandle: TSSAValue;
   MElemBank: TSSARegisterType;
   PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
@@ -11162,9 +11233,27 @@ begin
     if ArrayDeclNode.ChildCount < 2 then Continue;
     // REDIM of a UDT array member ("Redim this.m(x,y)"): resolve the object's record handle and the
     // field's array slot, then emit a member REDIM that allocates the FArrays entry lazily and sizes it.
-    if ArrayDeclNode.GetChild(0).NodeType = antMemberAccess then
+    // ⭐ A STATIC ARRAY MEMBER is not a per-instance array in a record slot: it is ONE global array
+    // under a dotted name, and the ordinary paths below resize it once the target names it. Asked for
+    // every spelling at once - "UDT.a", "x.a", "px->a", and the BARE field name inside a method, which
+    // is the implicit THIS. ⛔ The bare one is the dangerous spelling: it used to declare a FRESH array
+    // of that name and resize THAT, with no diagnostic, while "this.a" beside it worked.
+    MemberNode := ArrayDeclNode.GetChild(0);
+    StaticArr := RewriteStaticMemberArray(MemberNode);
+    if StaticArr <> nil then
+    begin
+      try
+        ArrayDeclNode.Children.Extract(MemberNode);
+        ArrayDeclNode.Children.Insert(0, StaticArr.Clone);
+        MemberNode.Free;
+      finally
+        StaticArr.Free;
+      end;
+    end
+    else if ArrayDeclNode.GetChild(0).NodeType = antMemberAccess then
     begin
       MemberNode := ArrayDeclNode.GetChild(0);
+      begin
       DimsNode := ArrayDeclNode.GetChild(1);
       if (DimsNode.NodeType <> antDimensions) or (DimsNode.ChildCount < 1) then Continue;
       MTypeName := ObjectTypeName(MemberNode.GetChild(0));
@@ -11199,6 +11288,7 @@ begin
                         MakeSSAValue(svkNone));
       end;
       Continue;
+      end;
     end;
     if ArrayDeclNode.GetChild(0).NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value));
@@ -28947,10 +29037,12 @@ procedure TSSAGenerator.CollectStaticMembers(Node: TASTNode);
 // instance. Back each with a 1-element global array named "TYPE.FIELD" (reusing the DIM SHARED scalar
 // machinery, so it is visible from methods/threads). v1 supports builtin scalar static members.
 var
-  i, k, ai: Integer;
-  FieldNode: TASTNode;
+  i, k, ai, di: Integer;
+  FieldNode, DimsN: TASTNode;
   tn, fn, ftype, backing: string;
   bank: TSSARegisterType;
+  StatDims, StatLbs: array of Integer;
+  LbV, UbV: Int64;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antTypeDecl then
@@ -28966,6 +29058,48 @@ begin
         if FieldNode.ChildCount > 0 then ftype := UpperCase(VarToStr(FieldNode.GetChild(0).Value));
         bank := TypeNameToBank(ftype, fn);                 // builtin scalar bank (int/float/string)
         backing := tn + '.' + fn;
+        // ⛔ ...AND A STATIC MEMBER CAN BE AN ARRAY. The parser reads "(dims)" for any field, static or
+        // not, so "Static a() As Integer" arrives here carrying BOTH flags - and this routine ignored
+        // ARRAYFIELD outright and synthesised a ONE-ELEMENT SCALAR backing for it. Nothing raised: the
+        // reads went to element 0 and answered a number that was simply wrong ("UDT.a(0)" printed 0
+        // where fbc prints 7), which is worse than the REDIM that did raise. It gets a REAL global array
+        // under the same dotted name, so every array path - element, ReDim, Erase, LBound/UBound - works
+        // on it unchanged, and it is deliberately NOT registered as a shared scalar.
+        if FieldNode.Attributes.Values['ARRAYFIELD'] = '1' then
+        begin
+          if FStaticMemberArrays.IndexOf(backing) < 0 then
+          begin
+            // A fixed-shape "Static a(0 To 1)" is sized here; an "Any"/empty one starts EMPTY and waits
+            // for a ReDim, which is the state fbc reports as LBound 0 / UBound -1.
+            SetLength(StatDims, 0);
+            SetLength(StatLbs, 0);
+            DimsN := ConcreteArrayBounds(FieldNode);
+            if DimsN <> nil then
+              for di := 0 to DimsN.ChildCount - 1 do
+              begin
+                LbV := 0;
+                if DimsN.GetChild(di).NodeType = antDimRange then
+                begin
+                  if not FoldIntNode(DimsN.GetChild(di).GetChild(0), LbV) then begin SetLength(StatDims, 0); Break; end;
+                  if not FoldIntNode(DimsN.GetChild(di).GetChild(1), UbV) then begin SetLength(StatDims, 0); Break; end;
+                end
+                else if not FoldIntNode(DimsN.GetChild(di), UbV) then begin SetLength(StatDims, 0); Break; end;
+                SetLength(StatDims, Length(StatDims) + 1);
+                SetLength(StatLbs, Length(StatLbs) + 1);
+                StatDims[High(StatDims)] := Integer(UbV - LbV + 1);
+                StatLbs[High(StatLbs)] := Integer(LbV);
+              end;
+            if Length(StatDims) = 0 then
+            begin
+              SetLength(StatDims, 1);
+              StatDims[0] := 0;          // 0 = "variable": EmitStaticMemberAllocs supplies the register
+            end;
+            ai := FProgram.DeclareArray(backing, bank, StatDims);
+            if Length(StatLbs) = Length(StatDims) then FProgram.SetArrayLowerBounds(ai, StatLbs);
+            FStaticMemberArrays.AddObject(backing, TObject(PtrInt(ai)));
+          end;
+          Continue;
+        end;
         if FStaticMembers.IndexOf(backing) < 0 then
         begin
           ai := FProgram.DeclareArray(backing, bank, [1]);  // 1-element global array, same dotted name
@@ -28983,7 +29117,8 @@ procedure TSSAGenerator.EmitStaticMemberAllocs;
 // Allocate the static members' backing 1-element arrays once at program start (they have no DIM).
 var
   i, ai: Integer;
-  ArrayRef: TSSAValue;
+  ArrayRef, UbV: TSSAValue;
+  DimInstr: TSSAInstruction;
 begin
   if FStaticMembers = nil then Exit;
   for i := 0 to FStaticMembers.Count - 1 do
@@ -28992,6 +29127,38 @@ begin
     ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
     EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+  // ...and an ARRAY static member starts EMPTY, which fbc reports as LBound 0 / UBound -1 until a
+  // ReDim gives it bounds. A concrete "Static a(0 To 1)" is sized by the DIM that defines it.
+  if FStaticMemberArrays = nil then Exit;
+  for i := 0 to FStaticMemberArrays.Count - 1 do
+  begin
+    ai := PtrInt(FStaticMemberArrays.Objects[i]);
+    ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+    // ⛔ A dimension of 0 in the metadata means VARIABLE, not empty, and bcArrayDim then reads the
+    // array's DimRegisters - not this instruction's operand. So an empty static member is expressed
+    // as an upper bound of -1 in a register (size = ub - lb + 1 = 0), which is exactly what fbc
+    // reports for one that has not been ReDim'd: LBound 0, UBound -1.
+    if (FProgram.GetArray(ai).DimCount = 1) and (FProgram.GetArray(ai).Dimensions[0] = 0) then
+    begin
+      UbV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, UbV, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      FProgram.SetArrayDimRegisters(ai, [UbV.RegIndex], [srtInt]);
+      EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // ⛔ ...and the register has to be KEPT ALIVE. ssaArrayDim names it only through the array's
+      // METADATA, so DCE sees a constant nobody reads, removes it, and the bound read back is 0 - the
+      // array reported UBound 0 where fbc reports -1. The DIM path carries the same note for the same
+      // reason; this is the second place that needs it.
+      if Assigned(FCurrentBlock) and (FCurrentBlock.Instructions.Count > 0) then
+      begin
+        DimInstr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+        SetLength(DimInstr.PhiSources, 1);
+        DimInstr.PhiSources[0].Value := UbV;
+        DimInstr.PhiSources[0].FromBlock := nil;
+      end;
+      Continue;
+    end;
+    EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
 
@@ -29224,6 +29391,116 @@ begin
     idx := FindUDT(t);
     if idx < 0 then Break;
     t := UpperCase(FUDTs[idx].Parent);
+  end;
+end;
+
+function TSSAGenerator.StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;
+// The mirror of StaticMemberBackingName for a static member that is an ARRAY: the name of the global
+// array backing it, walking the EXTENDS chain, or ''.
+var
+  at, t, key: string;
+  idx: Integer;
+begin
+  Result := '';
+  if (ObjNode = nil) or (FStaticMemberArrays = nil) or (FStaticMemberArrays.Count = 0) then Exit;
+  if (ObjNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
+    at := UpperCase(VarToStr(ObjNode.Value))     // TypeName.field (no instance)
+  else
+    at := ObjectTypeName(ObjNode);               // instance.field
+  if at = '' then Exit;
+  t := at;
+  while t <> '' do
+  begin
+    key := t + '.' + UpperCase(FieldName);
+    if FStaticMemberArrays.IndexOf(key) >= 0 then Exit(key);
+    idx := FindUDT(t);
+    if idx < 0 then Break;
+    t := UpperCase(FUDTs[idx].Parent);
+  end;
+end;
+
+function TSSAGenerator.RewriteStaticMemberArray(Node: TASTNode): TASTNode;
+// A reference to a static member that is an ARRAY is a reference to its backing GLOBAL ARRAY, under the
+// dotted name. Answers a FRESH node the CALLER OWNS, or nil when Node names no such thing.
+//
+// Both shapes are handled here, because both reach several different dispatch points and each carries
+// its own idea of what an array reference looks like:
+//   "UDT.a" / "x.a" / "p->a"        (antMemberAccess)        -> antIdentifier "UDT.A"
+//   "UDT.a(i)" / "x.a(i)"           (antArrayAccess over it) -> antArrayAccess(antIdentifier, indices)
+// Rewriting instead of teaching each path is what makes ReDim, Erase, LBound/UBound, the element read
+// and the element write work without one of them being left behind - the failure this family already
+// has a name for.
+var
+  Mem: TASTNode;
+  Backing: string;
+  i: Integer;
+
+  function BackingOfBase(Base: TASTNode): string;
+  // The backing name for "<base>.<field>" - and for the BARE field name inside a method, which is the
+  // implicit THIS. ⛔ A bare "Redim b(...)" inside a method used to declare a FRESH array called B and
+  // resize that: no diagnostic, and the member kept its old bounds. The explicit "this.b" spelling
+  // worked, which is the usual tell.
+  var
+    T, Key: string;
+    Idx, Guard: Integer;
+    Dummy: TSSAValue;
+  begin
+    Result := '';
+    if Base <> nil then Exit(StaticMemberArrayName(Base, VarToStr(Mem.Value)));
+    if FCurrentThisType = '' then Exit;
+    if ResolveExisting(VarToStr(Mem.Value), Dummy) then Exit;     // a param / local DIM shadows it
+    if ArrayIndexOf(UpperCase(VarToStr(Mem.Value))) >= 0 then Exit;   // a real array of that name wins
+    T := UpperCase(FCurrentThisType);
+    Guard := 0;
+    while (T <> '') and (Guard < 64) do
+    begin
+      Key := T + '.' + UpperCase(VarToStr(Mem.Value));
+      if FStaticMemberArrays.IndexOf(Key) >= 0 then Exit(Key);
+      Idx := FindUDT(T);
+      if Idx < 0 then Break;
+      T := UpperCase(FUDTs[Idx].Parent);
+      Inc(Guard);
+    end;
+  end;
+
+begin
+  Result := nil;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType in [antMemberAccess, antIdentifier] then
+  begin
+    Mem := Node;
+    if Node.NodeType = antMemberAccess then
+    begin
+      if Node.ChildCount < 1 then Exit;
+      Backing := BackingOfBase(Node.GetChild(0));
+    end
+    else
+      Backing := BackingOfBase(nil);
+    if Backing = '' then Exit;
+    Result := TASTNode.CreateWithValue(antIdentifier, Backing, Node.Token);
+    Exit;
+  end;
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) then
+  begin
+    Mem := Node.GetChild(0);
+    while (Mem <> nil) and (Mem.NodeType = antParentheses) and (Mem.ChildCount >= 1) do Mem := Mem.GetChild(0);
+    if Mem = nil then Exit;
+    if Mem.NodeType = antMemberAccess then
+    begin
+      if Mem.ChildCount < 1 then Exit;
+      Backing := BackingOfBase(Mem.GetChild(0));
+    end
+    else if Mem.NodeType = antIdentifier then
+      Backing := BackingOfBase(nil)
+    else
+      Exit;
+    if Backing = '' then Exit;
+    Result := TASTNode.Create(antArrayAccess, Node.Token);
+    Result.Attributes.Assign(Node.Attributes);
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Backing, Mem.Token));
+    for i := 1 to Node.ChildCount - 1 do
+      Result.AddChild(Node.GetChild(i).Clone);
   end;
 end;
 
@@ -31703,6 +31980,16 @@ var
   MArrBank: TSSARegisterType;
   ElemSz: Int64;
 begin
+  // ⭐ "@UDT.a(i)" / "@x.a(i)" where a is a STATIC ARRAY member: the element belongs to the backing
+  // global array, so the whole ladder below works once the reference names it. Every rung here is
+  // indexed by the array NAME, and the member spelling arrived with the FIELD name alone: "Cannot take
+  // address of element of undeclared array: A0".
+  AddrNd := RewriteStaticMemberArray(Node);
+  if AddrNd <> nil then
+  begin
+    try EmitArrayElementAddress(AddrNd, Result); finally AddrNd.Free; end;
+    Exit;
+  end;
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
   // not a declared-array identifier, so the name-based path below would fail).
@@ -34001,6 +34288,14 @@ begin
     try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
     Exit;
   end;
+  // ...and the ARRAY kind of static member, named WHOLE (an argument, "UBound(UDT.a)"): the backing
+  // global array under its dotted name.
+  AccNode := RewriteStaticMemberArray(Node);
+  if AccNode <> nil then
+  begin
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
   if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
   TypeName := ObjectTypeName(Node.GetChild(0));
@@ -34218,6 +34513,24 @@ var
   SetterArgs, StoreAssign: TASTNode;
 begin
   if MemberNode.ChildCount < 1 then Exit;
+  // ...and a static member that is an ARRAY is written through its backing global array.
+  StoreAssign := RewriteStaticMemberArray(MemberNode);
+  if StoreAssign <> nil then
+  begin
+    try
+      SetterArgs := TASTNode.Create(antAssignment, MemberNode.Token);
+      try
+        SetterArgs.AddChild(StoreAssign.Clone);
+        SetterArgs.AddChild(ExprNode.Clone);
+        ProcessAssignment(SetterArgs);
+      finally
+        SetterArgs.Free;
+      end;
+    finally
+      StoreAssign.Free;
+    end;
+    Exit;
+  end;
   // OOP static member variable (via type name or instance): store to its shared global scalar.
   SMBack := StaticMemberBackingName(MemberNode.GetChild(0), VarToStr(MemberNode.Value));
   if SMBack <> '' then
@@ -36651,6 +36964,7 @@ var
   LastBlock: TSSABasicBlock;
   LastInstr: TSSAInstruction;
   LastArr: Integer;
+  PsI: Integer;          // pre-scan cursor over the static ARRAY members
   DefCh: Char;
   {$IFDEF DEBUG_SSAPROF}
   ProfT0, ProfFreq: Int64;
@@ -36817,6 +37131,7 @@ begin
   CollectSharedVars(AST);
   // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
   FStaticMembers.Clear;
+  FStaticMemberArrays.Clear;
   CollectStaticMembers(AST);
   // FreeBASIC ENUM members: back each module-level member with a shared global int scalar so it is
   // visible inside SUB/FUNCTION bodies (MODERN only; CLASSIC has no procedure scope).
@@ -36853,6 +37168,15 @@ begin
   // element access subtracts the RUNTIME lower bound instead of the compile-time DIM one.
   FDynamicArrays.Clear;
   CollectDynamicArrays(AST);
+  // ...and an EMPTY static ARRAY member ("Static a()") is dynamic too: ERASE frees it and it reports
+  // LBound 0 / UBound -1 afterwards. The pre-scan above reads DIM/REDIM nodes and a static member has
+  // neither in a shape it recognises, so its backing is added here - AFTER the Clear that would
+  // otherwise drop it.
+  for PsI := 0 to FStaticMemberArrays.Count - 1 do
+    if (FProgram.GetArray(PtrInt(FStaticMemberArrays.Objects[PsI])).DimCount = 1) and
+       (FProgram.GetArray(PtrInt(FStaticMemberArrays.Objects[PsI])).Dimensions[0] = 0) and
+       (FDynamicArrays.IndexOf(FStaticMemberArrays[PsI]) < 0) then
+      FDynamicArrays.Add(FStaticMemberArrays[PsI]);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;
