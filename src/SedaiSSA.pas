@@ -285,6 +285,7 @@ type
     // still declared and initialised, so anything else that resolves through it is unaffected.
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
+    FStaticMemberTypes: TStringList;     // ...and the ones whose type is a UDT: "TYPE.FIELD" -> that UDT's name
     FStaticMemberArrays: TStringList;    // ...and the ones that are ARRAYS: "TYPE.FIELD" -> the global array's id.
                                         // ⛔ Kept OUT of FSharedScalarArr on purpose: a shared SCALAR is a one-element
                                         // array, and every reader of IsSharedScalar would read element 0 as the value.
@@ -558,6 +559,7 @@ type
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
+    procedure EmitStaticMemberRecords;                  // ...and construct the ones whose type is a UDT (after the ctor labels exist)
     procedure CollectEnumNames(Node: TASTNode);    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
@@ -568,6 +570,7 @@ type
     function AnyHoistedDim(DimNode: TASTNode): Boolean;          // ...this antDim holds one such declaration
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     function StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;    // ...the ARRAY backing, or ''
+    function StaticMemberAddrName(MemberNode: TASTNode): string;   // the name "@<static member>" resolves to, or ''
     function RewriteStaticMemberArray(Node: TASTNode): TASTNode;   // a static-array member reference -> the backing array node
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
@@ -1305,6 +1308,8 @@ begin
   FStaticMembers.CaseSensitive := False;
   FStaticMemberArrays := TStringList.Create;
   FStaticMemberArrays.CaseSensitive := False;
+  FStaticMemberTypes := TStringList.Create;
+  FStaticMemberTypes.CaseSensitive := False;
   FEnumMembers := TStringList.Create;
   FTypeEnumMembers := TStringList.Create;
   FTypeEnumMembers.CaseSensitive := False;
@@ -1430,6 +1435,7 @@ begin
   FModuleConstVals.Free;
   FStaticMembers.Free;
   FStaticMemberArrays.Free;
+  FStaticMemberTypes.Free;
   FEnumMembers.Free;
   FTypeEnumMembers.Free;
   FEnumNames.Free;
@@ -2325,17 +2331,17 @@ begin
       // static DATA member fell to the field path, where ObjectTypeName is handed a TYPE NAME, answers
       // '' and raises "object is not a record" - a message about a record when the operand names a
       // variable. Rewritten to that one name so the whole chain below applies, IsRefVar included.
+      // ⛔ ...AND ASKED THROUGH THE ONE FUNNEL, not by building the key here. This branch tested
+      // "the base is a TYPE NAME" and composed "TYPE.FIELD" itself, so "@UDT.a" worked and "@x.a" -
+      // the SAME member reached through an INSTANCE - fell to the field path and raised
+      // "Cannot take address of unknown field". StaticMemberBackingName answers for both bases and
+      // walks the EXTENDS chain besides; it existed already and this was the one place that went round
+      // it. The usual shape: two sites ask the same question and only one goes through the funnel.
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) and
               (Node.GetChild(0).ChildCount >= 1) and
-              (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-              (FindUDT(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) and
-              (IsSharedScalar(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.' +
-                              UpperCase(VarToStr(Node.GetChild(0).Value))) or
-               IsRefVar(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.' +
-                        UpperCase(VarToStr(Node.GetChild(0).Value)))) then
+              (StaticMemberAddrName(Node.GetChild(0)) <> '') then
       begin
-        Node.Value := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.' +
-                      UpperCase(VarToStr(Node.GetChild(0).Value));
+        Node.Value := StaticMemberAddrName(Node.GetChild(0));
         Node.RemoveChildAt(0);          // frees it: FChildren owns its children
         ProcessExpression(Node, Result);
         Exit;
@@ -29100,6 +29106,24 @@ begin
           end;
           Continue;
         end;
+        // ⛔ ...AND A STATIC MEMBER CAN BE OF A UDT TYPE, which this never asked. TypeNameToBank does
+        // not know a UDT name, so the backing landed in whatever bank the fallback chose and no record
+        // was ever allocated for it: "UDT.a.a = 3 : Print UDT.a.a" printed 0, silently. A UDT scalar is
+        // an int HANDLE, exactly as a DIM SHARED one is - the two paths now say the same thing.
+        if FindUDT(ftype) >= 0 then
+        begin
+          bank := srtInt;
+          FStaticMemberTypes.Values[backing] := UpperCase(ftype);
+          FVarRecordType.Values[backing] := UpperCase(ftype);   // so "UDT.a.b" resolves through the backing
+        end
+        // ...and a POINTER-typed one is a managed pointer under that same name, so "UDT.p->a" resolves
+        // through the registry every other pointer uses. Without the entry the arrow read the packed
+        // handle as the value: 4611686018427387904 where fbc prints the field.
+        else if (Length(ftype) > 4) and (Copy(ftype, Length(ftype) - 3, 4) = ' PTR') then
+        begin
+          bank := srtInt;
+          FPointerVars.Values[backing] := Trim(Copy(ftype, 1, Length(ftype) - 4));
+        end;
         if FStaticMembers.IndexOf(backing) < 0 then
         begin
           ai := FProgram.DeclareArray(backing, bank, [1]);  // 1-element global array, same dotted name
@@ -29159,6 +29183,38 @@ begin
       Continue;
     end;
     EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+procedure TSSAGenerator.EmitStaticMemberRecords;
+// A static member whose type is a UDT needs an INSTANCE behind its handle: allocated in the shared
+// region, initialised and constructed - the same three steps a "Dim Shared v As T" takes.
+//
+// ⛔ IT CANNOT BE DONE BESIDE THE BACKING ALLOCATION, for two independent reasons, and both were
+// measured rather than reasoned about:
+//  - EmitSharedScalarAllocs re-sizes EVERY shared-scalar backing when the program has module
+//    constructors, which ZEROES a handle stored before it. The whole fbcunit shim registers its tests
+//    from module constructors, so every test file has them: the record was allocated, wiped, and the
+//    first field written died on an access violation.
+//  - a CONSTRUCTOR label does not exist yet at that point: PreCollectProcedures has not run.
+// So it happens here, after both.
+var
+  i, RecIdx: Integer;
+  RecH: TSSAValue;
+begin
+  if (FStaticMembers = nil) or (FStaticMemberTypes = nil) then Exit;
+  for i := 0 to FStaticMembers.Count - 1 do
+  begin
+    RecIdx := FindUDT(FStaticMemberTypes.Values[FStaticMembers[i]]);
+    if RecIdx < 0 then Continue;
+    RecH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNew, RecH,
+                    MakeSSAConstInt(FUDTs[RecIdx].LiveBytes),
+                    MakeSSAConstInt(0),
+                    MakeSSAConstInt(FUDTs[RecIdx].NStr or (Int64(RecIdx) shl 32) or (Int64(1) shl 48)));
+    EmitRecordInit(RecH, RecIdx);
+    EmitSharedScalarStoreVal(FStaticMembers[i], RecH);
+    EmitConstructorCall(RecH, FUDTs[RecIdx].Name);
   end;
 end;
 
@@ -29392,6 +29448,23 @@ begin
     if idx < 0 then Break;
     t := UpperCase(FUDTs[idx].Parent);
   end;
+end;
+
+function TSSAGenerator.StaticMemberAddrName(MemberNode: TASTNode): string;
+// The single name a static DATA member's storage lives under, for "@<member>" - asked of the ONE funnel
+// so the instance spelling and the type-name spelling cannot disagree. '' when the member is not static.
+var
+  Base: TASTNode;
+begin
+  Result := '';
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  Base := MemberNode.GetChild(0);
+  Result := StaticMemberBackingName(Base, VarToStr(MemberNode.Value));
+  if Result <> '' then Exit;
+  // ...and a "Static ByRef" member, which is a reference variable under the same dotted name.
+  if (Base.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(Base.Value))) >= 0) and
+     IsRefVar(UpperCase(VarToStr(Base.Value)) + '.' + UpperCase(VarToStr(MemberNode.Value))) then
+    Result := UpperCase(VarToStr(Base.Value)) + '.' + UpperCase(VarToStr(MemberNode.Value));
 end;
 
 function TSSAGenerator.StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;
@@ -33387,7 +33460,10 @@ begin
        (ObjNode.GetChild(0).NodeType = antNew) then
       Result := UpperCase(VarToStr(ObjNode.GetChild(0).Value))
     else
-      Result := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));        // (*p).field
+      // ⛔ ...asked of DerefPointeeUDTType, not of a NAME. This site read the operand's Value directly,
+      // so a pointer with no variable name - a STATIC MEMBER, a Cast - answered nothing: "UDT.p->a"
+      // resolved and "(*UDT.p).a", the same access in FreeBASIC's other spelling, did not.
+      Result := DerefPointeeUDTType(ObjNode.GetChild(0));                   // (*p).field
     if FindUDT(Result) < 0 then Result := '';
   end
   else if ObjNode.NodeType = antArrayAccess then
@@ -33469,6 +33545,21 @@ begin
   end
   else if ObjNode.NodeType = antMemberAccess then
   begin
+    // ⛔ ...AND A STATIC MEMBER IS NOT A FIELD OF ANY INSTANCE, so it is not in the type's field list -
+    // by construction. "UDT.a.a" therefore resolved to nothing and read the backing HANDLE as if it
+    // were the value: 4611686018427387904 where fbc prints 3, in silence. The static registry is asked
+    // first, for the same two spellings the funnel already serves (type name and instance).
+    ParentType := StaticMemberBackingName(ObjNode.GetChild(0), VarToStr(ObjNode.Value));
+    if ParentType <> '' then
+    begin
+      NestedT := FStaticMemberTypes.Values[ParentType];
+      if NestedT <> '' then Exit(NestedT);
+      // ...and a POINTER-typed static member carries a record handle, so the object is its POINTEE -
+      // the same answer PointerUDTType gives for an ordinary "T Ptr" variable, asked under the backing
+      // NAME because the node is a member access and has none.
+      NestedT := PointerUDTType(ParentType);
+      if NestedT <> '' then Exit(NestedT);
+    end;
     ParentType := ObjectTypeName(ObjNode.GetChild(0));
     if UDTFieldBankSlot(FindUDT(ParentType), VarToStr(ObjNode.Value), Bank, Slot, NestedT) then
     begin
@@ -33600,6 +33691,15 @@ begin
   case Node.NodeType of
     antIdentifier:
       Result := PointerUDTType(VarToStr(Node.Value));
+    // ...and a STATIC MEMBER of pointer type, which has no variable name to ask about: its storage
+    // lives under one dotted name. "UDT.p->a" resolved and "(*UDT.p).a" - the same access in
+    // FreeBASIC's other spelling - did not.
+    antMemberAccess:
+      if Node.ChildCount >= 1 then
+      begin
+        TN := StaticMemberBackingName(Node.GetChild(0), VarToStr(Node.Value));
+        if TN <> '' then Result := PointerUDTType(TN);
+      end;
     antCast:
       begin
         U := UpperCase(VarToStr(Node.Value));   // target type, e.g. "LIST PTR"
@@ -33986,6 +34086,29 @@ begin
     end;
     Exit;
   end;
+  // ...and a STATIC member whose type is a UDT: its instance lives under the single dotted name, not in
+  // a slot of any record. ObjectTypeName learned the same thing; both halves need it, or the type
+  // resolves and the handle does not ("unresolved record object" where the read used to answer the
+  // handle itself).
+  if ObjNode.NodeType = antMemberAccess then
+  begin
+    NestedT := StaticMemberBackingName(ObjNode.GetChild(0), VarToStr(ObjNode.Value));
+    if (NestedT <> '') and ((FStaticMemberTypes.Values[NestedT] <> '') or (PointerUDTType(NestedT) <> '')) then
+    begin
+      if FStaticMemberTypes.Values[NestedT] <> '' then
+        TypeName := FStaticMemberTypes.Values[NestedT]     // the member IS the record
+      else
+        TypeName := PointerUDTType(NestedT);               // ...or holds a handle to one
+      CancelObj := MakeSharedScalarAccess(NestedT, ObjNode.Token);
+      try
+        ProcessExpression(CancelObj, HandleVal);
+      finally
+        CancelObj.Free;
+      end;
+      HandleVal := EnsureIntRegister(HandleVal);
+      Exit(True);
+    end;
+  end;
   // CPtr/Cast(T Ptr, x)->field: the CAST names the record type outright, and a UDT-pointer
   // cast is a value passthrough, so the cast's int value IS the record handle. Without this
   // branch the base matched nothing, the field read fell to the generic path and yielded
@@ -34053,6 +34176,25 @@ begin
   end
   else if ObjNode.NodeType = antDeref then
   begin
+    // ...and the pointer may be a STATIC MEMBER, which has no variable NAME to ask about: every rung of
+    // this branch is keyed by one. "UDT.p->a" worked while "(*UDT.p).a" - the same access in FreeBASIC's
+    // other spelling - read the handle. Resolved recursively, so the member path answers once.
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
+    begin
+      NestedT := StaticMemberBackingName(ObjNode.GetChild(0).GetChild(0), VarToStr(ObjNode.GetChild(0).Value));
+      if (NestedT <> '') and (PointerUDTType(NestedT) <> '') then
+      begin
+        TypeName := PointerUDTType(NestedT);
+        CancelObj := MakeSharedScalarAccess(NestedT, ObjNode.Token);
+        try
+          ProcessExpression(CancelObj, HandleVal);
+        finally
+          CancelObj.Free;
+        end;
+        HandleVal := EnsureIntRegister(HandleVal);
+        Exit(True);
+      end;
+    end;
     // (*p).field where p is a UDT pointer: the deref yields p's handle directly.
     TypeName := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));
     if TypeName = '' then Exit;
@@ -37132,6 +37274,7 @@ begin
   // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
   FStaticMembers.Clear;
   FStaticMemberArrays.Clear;
+  FStaticMemberTypes.Clear;
   CollectStaticMembers(AST);
   // FreeBASIC ENUM members: back each module-level member with a shared global int scalar so it is
   // visible inside SUB/FUNCTION bodies (MODERN only; CLASSIC has no procedure scope).
@@ -37255,6 +37398,9 @@ begin
   // after static-member allocation). No-op when the program defines none. Pre-size SHARED-scalar backings
   // first so a constructor can touch module globals before their DIM statement runs.
   EmitSharedScalarAllocs;
+  // ...and only NOW can a UDT-typed static member get its instance: the line above would have zeroed a
+  // handle stored earlier, and a constructor label did not exist before PreCollectProcedures.
+  EmitStaticMemberRecords;
   EmitSharedScalarConstInits(AST);
   EmitSharedArrayAllocs(AST);
   EmitModuleConstructors;

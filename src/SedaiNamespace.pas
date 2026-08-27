@@ -440,9 +440,9 @@ end;
 function RewriteRefs(Node: TASTNode; const ActivePrefix: string;
                      Shadow: TStringList; Ctx: TNsContext; Using: TStringList): TASTNode;
 var
-  i: Integer;
+  i, k: Integer;
   ChildPrefix, BaseName, Mangled, V, Qual: string;
-  NewNode, BaseId: TASTNode;
+  NewNode, BaseId, FieldNd: TASTNode;
   UseShadow, UseUsing: TStringList;
   Drop: array of Integer;
   UsingNs: string;
@@ -505,6 +505,24 @@ begin
         if Shadow <> nil then UseShadow.Assign(Shadow);
       end;
       AddDeclaredNames(Node.GetChild(i), UseShadow);
+    end;
+    // ⛔ A FIELD'S NAME IS NOT A REFERENCE TO ANYTHING. This walk is bottom-up, so a TYPE's field nodes
+    // were rewritten before the antTypeDecl guard further down could Exit - and a namespace that
+    // declares both "Dim Shared As Long i1" and a TYPE with a field "i1" had the FIELD renamed to
+    // "NS.I1". The type then had no field called I1 at all: "@UDT.x.i1" answered "unknown field", and
+    // without the module-level name of the same spelling the very same program worked. Its TYPE child
+    // still has to be resolved (a field declared "As UDT" inside a namespace means "NS.UDT"), so the
+    // field node is stepped OVER, not skipped.
+    if (Node.NodeType = antTypeDecl) and (Node.GetChild(i).NodeType = antIdentifier) then
+    begin
+      FieldNd := Node.GetChild(i);
+      for k := 0 to FieldNd.ChildCount - 1 do
+      begin
+        NewNode := RewriteRefs(FieldNd.GetChild(k), ChildPrefix, UseShadow, Ctx, UseUsing);
+        if NewNode <> FieldNd.GetChild(k) then
+          ReplaceChildAt(FieldNd, k, NewNode);
+      end;
+      Continue;
     end;
     NewNode := RewriteRefs(Node.GetChild(i), ChildPrefix, UseShadow, Ctx, UseUsing);
     if NewNode <> Node.GetChild(i) then
