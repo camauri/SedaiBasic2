@@ -33609,7 +33609,18 @@ begin
   Resolved := ResolveCallLabel(Name, ArgsNode);
   if Resolved <> '' then Name := Resolved;
   RecType := VarRecordTypeName(Name);
-  if RecType <> '' then
+  // ⛔ ...BUT A BYREF RESULT IS NOT A VALUE RETURN, WHATEVER ITS TYPE, AND THIS TEST USED TO COME
+  // FIRST. A "Function pt() ByRef As T" took the by-value branch below because its return type is a
+  // UDT: the caller allocated a fresh record, staged it as the destination, and read the FIELD out of
+  // that throwaway - so "pt().n" answered 0 (or, with another UDT-returning call nearby, whatever that
+  // one had left behind), and "pt().n = 7" wrote into it and vanished.
+  // ⭐ The CALLEE was right all along - the disassembly is what said so: it stages the address of g in
+  // XFER_RESULT_SLOT exactly as the scalar case does, and the caller never looked. So this is an
+  // ORDER, not a missing branch, and the ledger's own note ("the branch must be given to the callee")
+  // was wrong. DIVERGENZE 72/47/44.
+  // ⚠️ ByrefRetByAddress is already false for a body that returns something with no address
+  // (FByrefRetValue), so those keep the value protocol, which is the only thing they can use.
+  if (RecType <> '') and not ByrefRetByAddress(Name) then
   begin
     UDTIdx := FindUDT(RecType);
     RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -33636,6 +33647,10 @@ begin
     AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitXferLoad(srtInt, XFER_RESULT_SLOT, AddrVal);
     FuncRetType := ByrefRetPointeeBank(Name);
+    // ⛔ A UDT pointee is an INT - a record handle - and ByrefRetPointeeBank cannot say so: it asks
+    // TypeNameToBank, which answers FLOAT for a name it does not recognise, and a UDT name is exactly
+    // that. Asked here, of FindUDT, which answers "no" instead of guessing.
+    if FindUDT(ByrefRetPointeeType(Name)) >= 0 then FuncRetType := srtInt;
     Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
     case FuncRetType of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
