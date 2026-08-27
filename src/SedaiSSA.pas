@@ -670,6 +670,9 @@ type
     procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
     procedure EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);    // @obj.field → record-field pointer
     procedure EmitNewObject(Node: TASTNode; out Result: TSSAValue);             // NEW T [(args)] → heap record handle
+    function AllocOperatorLabel(const TypeName, OpName: string): string;        // "Operator T.New/Delete", or ''
+    function TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;  // ...asked before FProcDecls exists
+    function TypeHasMemberProc(const TypeName: string): Boolean;               // ...anything that takes a THIS
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
@@ -31918,8 +31921,15 @@ var
       // ...and NOT when the elements have a constructor or a destructor: then "New T[n]" allocates
       // MANAGED records (EmitNewObject says why), the value IS a handle, and marking it raw would send
       // "p[i].field" onto the byte heap - the exact mirror of the accident this branch exists to prevent.
+      // ...and "New T" WHERE T DECLARES ITS OWN "Operator New". Then the storage is whatever that
+      // operator answered - raw bytes it allocated itself - and not a record this compiler owns, so the
+      // value is an ADDRESS like every other one in this list. Without it "p->i = 3" read a byte
+      // address through the managed record path and faulted on the first store.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
          IsRawPtrFieldExpr(Rhs) or
+         ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
+          TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
+          (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
           (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
@@ -33004,13 +33014,75 @@ begin
   EmitInstruction(ssaAddInt, Result, BaseVal, LinearIndex, MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.AllocOperatorLabel(const TypeName, OpName: string): string;
+// The label of a type's own allocation operator - "Operator T.New(size) As T Ptr" / "Operator
+// T.Delete(p)" - walking the inheritance chain, or '' when the type has none.
+//
+// ⛔ These were PARSED, DEFINED and never CALLED: "New T" used the built-in allocator and the operator's
+// body was compiled unreachable, so a program that pools its objects allocated from the pool never, and
+// its "Deallocate" never ran. A silent gap, with no diagnostic anywhere.
+// ⭐ What made it fixable is a MEASUREMENT that contradicted the comment beside the placement-new
+// refusal ("our records are managed handles, not objects at an address the program chose"): a "T Ptr"
+// pointed at CAllocate'd memory KEEPS that address, lays the type over those bytes, and construction,
+// field access, method calls and destruction on it all match fbc byte for byte - a String member
+// included. So the operator really can own the storage, and does.
+begin
+  Result := '';
+  if TypeName = '' then Exit;
+  Result := ResolveMethodLabel(TypeName, OpName);
+end;
+
+function TSSAGenerator.TypeHasMemberProc(const TypeName: string): Boolean;
+// Does an object of this type have anything to RUN on it - a constructor, a destructor, a method, a
+// property, an operator other than New/Delete? Walks the chain: an inherited method is still a method.
+//
+// ⛔ THIS IS THE GATE ON A CUSTOM ALLOCATOR, and it is the honest half of it. "Operator T.New" answers
+// raw bytes, and an object living in raw bytes cannot run a method: a method body is compiled ONCE
+// against record SLOTS and its THIS is a record handle, so "p->Show()" on a raw address faults.
+// Measured, and the measurement is what narrowed the change: "Dim As T Ptr p = CAllocate(...)" appears
+// to run methods fine, but only because that spelling does NOT mark p raw - a managed record is
+// allocated and the address is dropped. The genuinely raw spelling faults, with or without an operator.
+// ⇒ Where the type has nothing to run, the operator owns the storage and the program matches fbc.
+//   Where it has, the built-in allocator is used and the operator is not called - the gap that remains,
+//   whose cure is "a method must be able to take a raw THIS", not "call the operator".
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Idx := FindUDT(T);
+    if Idx < 0 then Exit;
+    if Assigned(FUDTs[Idx].Node) and
+       (FUDTs[Idx].Node.Attributes.Values['HASMEMBERPROC'] = '1') then Exit(True);
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;
+// The same question as AllocOperatorLabel, asked from a PRE-PASS that runs before the procedure table
+// exists. CollectRawPtrVars has to know whether "New T" will answer an address or a record handle, and
+// it runs at 38312 while PreCollectProcedures fills FProcDecls at 38391 - so a label lookup there is
+// always empty and the mark was never applied ("p->i = 3" then faulted on the first store).
+// The DECLARATION inside the TYPE is already recorded by then, under the access stamp every member
+// carries since visibility became a rule; walking the chain is what MemberAccessLevel does.
+var
+  Owner: string;
+begin
+  Result := (TypeName <> '') and (MemberAccessLevel(TypeName, OpName, Owner) <> '');
+end;
+
 procedure TSSAGenerator.EmitNewObject(Node: TASTNode; out Result: TSSAValue);
 // FreeBASIC "NEW T" / "NEW T(args)": allocate a record on the heap and run its constructor; evaluates
 // to the record handle (int), assignable to a "T PTR". The record is allocated in the SHARED region
 // (immediate bit 48) so it is NOT reclaimed at the allocating frame's exit — the pointer keeps it
 // alive until DELETE. Member access through the pointer (p->field) routes via the handle as usual.
 var
-  NewType: string;
+  NewType, OpLbl: string;
   UDTIdx: Integer;
   CountVal, ElemVal, BytesVal: TSSAValue;
 begin
@@ -33089,6 +33161,27 @@ begin
   if Node.Attributes.Values['PLACEMENT'] = '1' then
     ProcessExpression(Node.GetChild(Node.ChildCount - 1), CountVal);
   CheckInstantiable(FUDTs[UDTIdx].Name);           // OOP: NEW of an abstract type refuses here
+  // The type's OWN allocator, if it declares one. fbc hands it SizeOf(T) and builds the object on what
+  // it answers; the operator has no THIS of its own (it is implicitly static), so the slot is passed 0.
+  // Construction then runs on that address exactly as an explicit "p->Constructor()" on allocated
+  // memory does - which is the sequence this was measured against.
+  OpLbl := AllocOperatorLabel(NewType, 'OPERATORNEW');
+  if OpLbl <> '' then CheckMemberAccess(NewType, 'OPERATORNEW');   // reaching it is reaching it
+  if (OpLbl <> '') and (not TypeHasMemberProc(NewType)) then
+  begin
+    ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ElemVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Result := EmitIterOperatorCall(OpLbl, MakeSSAConstInt(0), ElemVal, MakeSSAValue(svkNone));
+    if Result.Kind = svkNone then
+      raise Exception.CreateFmt('Operator %s.New must be a FUNCTION returning a pointer', [NewType]);
+    EmitRecordInit(Result, UDTIdx);
+    if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArgumentList) then
+      EmitConstructorCall(Result, NewType, Node.GetChild(0))
+    else
+      EmitConstructorCall(Result, NewType);
+    Exit;
+  end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Result,
                   MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
@@ -33104,7 +33197,7 @@ procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
 // FreeBASIC "DELETE p": run the pointee's destructor (if any), then release the heap record and
 // recycle its slot (ssaRecordFree). Node child0 = the pointer expression (must be a UDT pointer).
 var
-  PtrName, PtrType: string;
+  PtrName, PtrType, OpLbl: string;
   HandleReg, CountReg: TSSAValue;
 begin
   if Node.ChildCount < 1 then Exit;
@@ -33220,6 +33313,20 @@ begin
     raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
   HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
   EmitDestructorCall(HandleReg, PtrType);
+  // The type's OWN deallocator, if it declares one: fbc runs the destructor and then hands the POINTER
+  // to "Operator T.Delete(p)", which owns the release. It must be the same pointer its "Operator New"
+  // answered - which it is, because that is what the variable holds. Emitting ssaRecordFree as well
+  // would free storage the operator is about to free again.
+  OpLbl := AllocOperatorLabel(PtrType, 'OPERATORDELETE');
+  if OpLbl <> '' then CheckMemberAccess(PtrType, 'OPERATORDELETE');
+  // ...and it releases the storage only where it OWNED it: the same gate "New" used, so the two halves
+  // of one allocation cannot disagree. Handing a managed handle to a user's "Deallocate" would be a
+  // free of memory this compiler owns - strictly worse than not calling the operator at all.
+  if (OpLbl <> '') and (not TypeHasMemberProc(PtrType)) then
+  begin
+    EmitIterOperatorCall(OpLbl, MakeSSAConstInt(0), HandleReg, MakeSSAValue(svkNone));
+    Exit;
+  end;
   EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 

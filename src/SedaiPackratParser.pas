@@ -4132,6 +4132,15 @@ begin
     // an OPERATOR's name can carry a '=' that the name=value store would tear the key in half on, and a
     // bank sigil / arity code the SSA composes and the parser cannot. One spelling, one function.
     MethKey := MemberDecoratorKey(MethName);
+    // ⭐ Does this TYPE have anything that takes a THIS? The allocation operators do not - fbc makes
+    // "Operator New"/"Delete" implicitly static - so they are the exception, and the flag means exactly
+    // "an object of this type has something to RUN on it". The SSA needs the answer in a PRE-PASS, long
+    // before the procedure table exists, to decide whether "New T" can hand back the address a custom
+    // allocator returned: an object at a raw address cannot run a method, because a method body is
+    // compiled once against record SLOTS and its THIS is a record handle.
+    if Assigned(TypeNode) and (MethKey <> 'OPERATORNEW') and (MethKey <> 'OPERATORDELETE') and
+       (MethKey <> 'OPERATORNEW[]') and (MethKey <> 'OPERATORDELETE[]') then
+      TypeNode.Attributes.Values['HASMEMBERPROC'] := '1';
     if IsAbstract and Assigned(TypeNode) then
       TypeNode.Attributes.Values['ABSTRACT' + MethKey] := '1';
     // ABSTRACT implies VIRTUAL: the only implementations an abstract method can ever have are the
@@ -4622,6 +4631,10 @@ begin
     // and choke on its "()" parameter list (which ParseDimensionList reads as empty array dimensions).
     if (TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) or (TokU = kOPERATOR) or (TokU = kPROPERTY) then
     begin
+      // Conservative on purpose: the line is skipped whole, so which operator it is cannot be told
+      // apart here. Saying "this type has something that takes a THIS" costs at most the raw-storage
+      // shortcut; saying the opposite by mistake would cost an object that cannot run its own methods.
+      Result.Attributes.Values['HASMEMBERPROC'] := '1';
       while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
         Context.Advance;
       Continue;
