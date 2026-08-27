@@ -20369,6 +20369,13 @@ begin
   k := FirstOwn;
   while (t < Targets.ChildCount) and (k <= High(FUDTs[SrcUDT].Fields)) do
   begin
+    // ⭐ An EMPTY slot ("Let( foo, , baz ) = f()") holds its POSITION and receives nothing: the third
+    // target still takes the third field, which is the only reason the placeholder exists.
+    if Targets.GetChild(t).Attributes.Values['LETSKIP'] = '1' then
+    begin
+      Inc(t); Inc(k);
+      Continue;
+    end;
     Asg := TASTNode.Create(antAssignment, Node.Token);
     Asg.AddChild(Targets.GetChild(t).Clone);
     Asg.AddChild(MakeFieldAccess(SrcNode, FUDTs[SrcUDT].Fields[k].Name, Node.Token));

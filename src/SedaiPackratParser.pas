@@ -2379,7 +2379,18 @@ begin
     Context.Advance;                                     // (
     Targets := TASTNode.Create(antExpressionList, SavedToken);
     repeat
-      Tgt := FExpressionParser.ParseExpression;
+      // ⭐ AN EMPTY SLOT SKIPS ITS FIELD: "Let( foo, , baz ) = f()" leaves the second one alone, and
+      // FreeBASIC's own suite writes it. ParseExpression answers nil at the comma, the loop broke, and
+      // the ')' matcher then met that comma - "Expected \")\" after the LET target list". A placeholder
+      // keeps the POSITION, which is the whole point: the third target must still receive the third
+      // field. The SSA skips a target marked this way.
+      if Context.Check(ttSeparParam) or Context.Check(ttDelimParClose) then
+      begin
+        Tgt := TASTNode.CreateWithValue(antIdentifier, '', Context.CurrentToken);
+        Tgt.Attributes.Values['LETSKIP'] := '1';
+      end
+      else
+        Tgt := FExpressionParser.ParseExpression;
       if not Assigned(Tgt) then Break;
       Targets.AddChild(Tgt);
       if Context.Check(ttSeparParam) then Context.Advance else Break;
@@ -7933,7 +7944,13 @@ begin
   if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttOpSub)) and
      (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
   begin
-    TargetNode := ParseExpression;                          // image handle
+    // ⛔ AT precCall, NOT at the default precedence. The target is a HANDLE and nothing more; read at
+    // full precedence a member access swallowed what came after the comma as UNPARENTHESISED CALL
+    // ARGUMENTS, so "Line x.p, (0,0)-(31,31)" died inside the first point at "Expected \")\" after
+    // expression" while the identical statement with a plain variable target was fine - the tell that
+    // it was the READING of the target and not the statement. REDIM reads its own target at a low
+    // precedence for the mirror-image reason.
+    TargetNode := FExpressionParser.ParseExpression(precCall);   // image handle
     if Context.Check(ttSeparParam) then Context.Advance;    // ','
   end;
   // FreeBASIC "LINE -(x2,y2)": the start point is omitted, so the line runs from the current graphics
@@ -8224,19 +8241,36 @@ end;
 
 function TPackratParser.LooksLikeImageTarget: Boolean;
 // At a graphics command token (PSET/LINE/CIRCLE/PAINT): does the FreeBASIC "cmd img, (x,y)..." image
-// draw-target form follow? Heuristic for a single-token target (image handle): the next token is not '('
-// or STEP, the one after is ',', and the one after that is '(' — which cleanly separates the target form
-// from the C128 forms ("CIRCLE src,x,y") and the plain "(x,y)" / "STEP(x,y)" screen forms. A multi-token
-// target expression in this position is not recognised (rare; image handles are simple variables).
+// draw-target form follow? The target is not '(' or STEP, and after it come ',' then '(' — which cleanly
+// separates the target form from the C128 forms ("CIRCLE src,x,y") and the plain "(x,y)" / "STEP(x,y)"
+// screen forms.
+//
+// ⛔ IT USED TO REQUIRE THE TARGET TO BE ONE TOKEN, with the note "rare; image handles are simple
+// variables". A handle kept in a FIELD is not rare - it is how an image is carried inside a UDT - and
+// "Line x.p, (0,0)-(31,31)" then failed this test, was never dispatched to the graphics statement at
+// all, and reported "Expected \")\" after expression" from inside the first point. The DOTTED chain is
+// walked here, so "x.p" and "a.b.c" reach the same statement a bare name always did.
 var
-  T1, T2, T3: TLexerToken;
+  T1, T2: TLexerToken;
+  k: Integer;
 begin
+  Result := False;
   T1 := Context.PeekToken(1);
-  T2 := Context.PeekToken(2);
-  T3 := Context.PeekToken(3);
-  Result := Assigned(T1) and Assigned(T2) and Assigned(T3) and
-            (T1.TokenType <> ttDelimParOpen) and (UpperCase(T1.Value) <> kSTEP) and
-            (T2.TokenType = ttSeparParam) and (T3.TokenType = ttDelimParOpen);
+  if (T1 = nil) or (T1.TokenType = ttDelimParOpen) or (UpperCase(VarToStr(T1.Value)) = kSTEP) then Exit;
+  // Walk "name ( '.' name )*": k lands on the token after the target.
+  k := 2;
+  while True do
+  begin
+    T2 := Context.PeekToken(k);
+    if (T2 <> nil) and (T2.TokenType = ttOpDot) and Assigned(Context.PeekToken(k + 1)) then
+      Inc(k, 2)                                     // '.' and the segment after it
+    else
+      Break;
+  end;
+  T2 := Context.PeekToken(k);
+  Result := Assigned(T2) and (T2.TokenType = ttSeparParam) and
+            Assigned(Context.PeekToken(k + 1)) and
+            (Context.PeekToken(k + 1).TokenType = ttDelimParOpen);
 end;
 
 function TPackratParser.AsmStatementFollows: Boolean;

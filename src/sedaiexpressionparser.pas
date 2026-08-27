@@ -1225,6 +1225,8 @@ end;
 function TExpressionParser.ParseMathFunction(Token: TLexerToken): TASTNode;
 var
   Args: TASTNode;
+  SizedBits: Integer;   // "CInt<8>(x)": the width in bits between the angle brackets
+  SizedName: string;    // ...and the fixed-width conversion it is another spelling of
 begin
   {$IFDEF DEBUG}
   LogVerbose(Format('ParseMathFunction: %s', [Token.Value]));
@@ -1274,6 +1276,41 @@ begin
     Args.AddChild(TASTNode.CreateWithValue(antLiteral, 1, Token));
     Result.AddChild(Args);
     Exit;
+  end;
+
+  // ⭐ "CInt<8>(x)" / "CUInt<16>(x)": FreeBASIC's SIZED conversions, where the angle brackets name the
+  // WIDTH IN BITS. They are exactly the fixed-width conversions this parser already has, under another
+  // spelling - measured against fbc 1.10.1 value by value: cint<8>(300)=44 like CByte, cuint<8>(300)=44
+  // like CUByte, cint<16>(70000)=4464 like CShort, cuint<32>(-1)=4294967295 like CULng, and <64> is the
+  // full-width pair. So the '<n>' is read here and the NAME is rewritten; nothing downstream has to
+  // learn a second spelling of one conversion. An unknown width is left alone and fails as before.
+  if ((UpperCase(VarToStr(Token.Value)) = 'CINT') or (UpperCase(VarToStr(Token.Value)) = 'CUINT')) and
+     Context.Check(ttOpLt) and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    SizedBits := StrToIntDef(VarToStr(Context.PeekNext.Value), 0);
+    SizedName := '';
+    if UpperCase(VarToStr(Token.Value)) = 'CINT' then
+      case SizedBits of
+        8:  SizedName := 'CBYTE';
+        16: SizedName := 'CSHORT';
+        32: SizedName := 'CLNG';
+        64: SizedName := 'CLNGINT';
+      end
+    else
+      case SizedBits of
+        8:  SizedName := 'CUBYTE';
+        16: SizedName := 'CUSHORT';
+        32: SizedName := 'CULNG';
+        64: SizedName := 'CULNGINT';
+      end;
+    if SizedName <> '' then
+    begin
+      Context.Advance;                              // '<'
+      Context.Advance;                              // the width
+      if Context.Check(ttOpGt) then Context.Advance;   // '>'
+      Result.Value := SizedName;
+    end;
   end;
 
   // Consume opening parenthesis
