@@ -200,7 +200,7 @@ difference is stated rather than left to be discovered.
 | `Virtual` | `Declare Virtual Sub F()` | FB. **Required for dynamic dispatch.** Without it a redeclaration in a child *shadows*, and the call resolves on the static type - as fbc does. |
 | `Abstract` | `Declare Abstract Sub F()` | FB. No body here; implies `Virtual`. A type that inherits one and does not implement it **cannot be instantiated**. |
 | `Static` | `Declare Static Sub F()`, `Static n As Integer` | FB. No implicit `This`; one storage shared by all instances. |
-| `Private:` `Protected:` `Public:` | section labels in the type body | FB. **Enforced.** `Private` reaches only the declaring type's own methods, `Protected` also its descendants. |
+| `Private:` `Protected:` `Public:` | section labels in the type body | FB. **Enforced** at every member site: a field, a method, a static method, a static data member, a constructor and a destructor. `Private` reaches only the declaring type's own methods, `Protected` also its descendants; a constructor or destructor a derived type reaches implicitly is judged from that derived type, not from where the declaration stands. **Divergence:** the access level is recorded per NAME, while FreeBASIC decides it per OVERLOAD - a name declared at two levels is treated as unenforced, so `Public: Constructor(n)` beside `Private: Constructor(ByRef rhs)` lets both through. |
 | `Property` | `Property T.Length()` | FB. Getter and setter forms. |
 | `Operator` | `Operator T.+ (…)` | FB. Including the compound (`*=`) and `Cast` forms. |
 | `Implements` | `Type T Implements I1, I2` | **MODERN extension.** fbc reserves the word and never implemented it. Here it is a *checked contract*. |

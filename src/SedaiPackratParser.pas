@@ -3981,6 +3981,34 @@ begin
   end;
 end;
 
+procedure StampMemberAccess(TypeNode: TASTNode; const MemberName, CurAccess: string);
+// Record the access level of ONE member of a TYPE, as "ACCESS<NAME>" on the antTypeDecl. The SSA reads
+// it back at every site that touches the member and refuses the ones FreeBASIC refuses.
+//
+// ⛔⛔ THE KEY IS THE NAME, AND A NAME CAN BE DECLARED TWICE AT TWO DIFFERENT LEVELS. FreeBASIC decides
+// visibility per OVERLOAD, and the FreeBASIC manual's own examples rest on it: udt/operator3 declares a
+// PUBLIC "Constructor(size)" beside a PRIVATE copy constructor, udt/type4 a PRIVATE default constructor
+// beside a PUBLIC "Constructor(name)", udt/protected2 a PUBLIC property getter beside a PROTECTED
+// setter. A single stamp per name cannot express that, and answering with either of the two levels is a
+// GUESS - which here means refusing a program the manual prints.
+// So the honest answer is the third one: a name declared at more than one level is stamped MIXED, and
+// MIXED enforces NOTHING. It costs the mixed cases (fbc rejects some of them and we accept them) and it
+// cannot cost a valid program, which is the direction that matters on a rule that adds REFUSALS.
+// ⚠️ PUBLIC is recorded too, and that is not decoration: without it a public re-declaration in a derived
+// type could not stop the walk at a private member of the base, and a public overload beside a private
+// one would leave the private stamp standing alone and look unmixed.
+var
+  Key, Level, Prev: string;
+begin
+  if (TypeNode = nil) or (MemberName = '') then Exit;
+  Level := UpperCase(CurAccess);
+  if Level = '' then Level := 'PUBLIC';
+  Key := 'ACCESS' + MemberName;
+  Prev := TypeNode.Attributes.Values[Key];
+  if (Prev <> '') and (Prev <> Level) then Level := 'MIXED';
+  TypeNode.Attributes.Values[Key] := Level;
+end;
+
 procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = ''; ForceAbstract: Boolean = False);
 // One "Declare [Virtual|Abstract|Static|Const] Sub|Function|Property|Operator|Constructor|Destructor
 // name(...) [As ret]" line inside a TYPE body, with DECLARE already consumed. Nothing is emitted: the
@@ -4066,8 +4094,7 @@ begin
       TypeNode.Attributes.Values['OVERRIDE' + MethName] := '1';
     if IsFinal and Assigned(TypeNode) then
       TypeNode.Attributes.Values['FINAL' + MethName] := '1';
-    if Assigned(TypeNode) and (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
-      TypeNode.Attributes.Values['ACCESS' + MethName] := CurAccess;
+    if Assigned(TypeNode) then StampMemberAccess(TypeNode, MethName, CurAccess);
     // ⛔ PUBLIC ONLY, and that too is measured. A module constructor runs before the program does, so
     // fbc refuses to let a PRIVATE or PROTECTED member be one - "visibility/{private,protected}-module-
     // {ctor,dtor}" are four COMPILE_ONLY_FAIL tests of its suite, and accepting them cost exactly those
@@ -4643,8 +4670,7 @@ begin
       if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
       if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
       Result.AddChild(FieldNode);
-      if (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
-        Result.Attributes.Values['ACCESS' + UpperCase(VarToStr(FieldNode.Value))] := CurAccess;
+      StampMemberAccess(Result, UpperCase(VarToStr(FieldNode.Value)), CurAccess);
       // FreeBASIC "As <type> a, b, c": the leading-AS type is shared by every comma-separated name
       // (e.g. "As String name, value" -> both String). Only the As-first form shares this way; a
       // name-first field carries its own trailing "As type", so its comma is handled by re-parsing.
@@ -9978,6 +10004,12 @@ begin
                               UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
             MemberAccess.AddChild(TASTNode.CreateWithValue(antIdentifier,
                               UpperCase(VarToStr(NameTok.Value)), NameTok));
+            // ⛔ THIS IS THE DEFINITION, NOT AN ACCESS. It lowers to a store through the member, and the
+            // visibility rule would then refuse "Dim T.x As Integer = 123" for a PRIVATE static member -
+            // which is how FreeBASIC's own suite writes the storage of one ("visibility/private-var-
+            // public-init" is a COMPILE_ONLY_OK). The mark rides on the BASE identifier, which is the
+            // node the lowering's funnel is handed.
+            MemberAccess.GetChild(0).Attributes.Values['STATICMEMBERDEF'] := '1';
             Context.Advance;                   // field name
             if Context.Check(ttOpEq) then
             begin
@@ -10017,6 +10049,7 @@ begin
         Context.Advance;                       // owner name
         MemberAccess := TASTNode.CreateWithValue(antIdentifier,
                           UpperCase(VarToStr(NameTok.Value)), NameTok);
+        MemberAccess.Attributes.Values['STATICMEMBERDEF'] := '1';   // see the leading-AS twin above
         while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
               (Length(VarToStr(Context.PeekNext.Value)) > 0) and
               (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do

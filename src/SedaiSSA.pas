@@ -272,6 +272,7 @@ type
     FModuleCtors: TStringList;           // FB module constructors (proc labels), in definition order
     FModuleDtors: TStringList;           // FB module destructors (proc labels), in definition order
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
+    FStaticLocalOwner: TStringList;      // OOP: hoisted STATIC local (mangled name) -> the TYPE whose method declared it
                                           //      holds its handle frame-independently so an END inside a SUB can
                                           //      still destroy it (its module register is saved/hidden by the frame).
     FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot); also the "is shared" marker for scope resolution
@@ -719,6 +720,7 @@ type
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
     procedure CheckMemberAccess(const TypeName, MemberName: string);        // OOP: refuse an illegal member access
+    procedure CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);  // ...for the one a DERIVED type reaches implicitly
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
@@ -876,6 +878,7 @@ type
     procedure ProcessPrint(Node: TASTNode);
     procedure ProcessInput(Node: TASTNode);
     procedure ProcessDim(Node: TASTNode);
+    procedure ProcessDimBody(Node: TASTNode);   // ProcessDim's body; the wrapper restores a hoisted STATIC's owning type
     function EmitMemberArrayErase(MemberNode: TASTNode): Boolean;
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
@@ -1320,6 +1323,8 @@ begin
   FTypeAliases := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
+  FStaticLocalOwner := TStringList.Create;
+  FStaticLocalOwner.CaseSensitive := False;
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
@@ -1455,6 +1460,7 @@ begin
   FModuleDtors.Free;
   FTypeAliases.Free;
   FModuleDtorSlots.Free;
+  FStaticLocalOwner.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
   FModuleConstVals.Free;
@@ -10280,6 +10286,37 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessDim(Node: TASTNode);
+// ⭐ A STATIC local declared inside a METHOD is lowered to a module-level DIM SHARED, and arrives here
+// with the whole module's context - no THIS type - though the declaration was written inside a method
+// and FreeBASIC judges it there. LowerStaticLocals leaves the owning type on the node; it is put back
+// for the length of this declaration, so a construction the method is entitled to perform (a PRIVATE
+// constructor of its own type) is not refused for standing at module scope.
+// ⚠️ Only when there is no THIS in force: a real module-level DIM must not borrow one.
+var
+  SavedThis: string;
+  i: Integer;
+begin
+  SavedThis := FCurrentThisType;
+  if (Node <> nil) and (Node.Attributes.Values['STATICTHISTYPE'] <> '') then
+  begin
+    // ...and the same declaration is destroyed at PROGRAM EXIT, long after this walk: remember which
+    // type it belonged to, under the mangled name the teardown will see.
+    for i := 0 to Node.ChildCount - 1 do
+      if (Node.GetChild(i).NodeType = antArrayDecl) and (Node.GetChild(i).ChildCount > 0) and
+         (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+        FStaticLocalOwner.Values[UpperCase(VarToStr(Node.GetChild(i).GetChild(0).Value))] :=
+          Node.Attributes.Values['STATICTHISTYPE'];
+    if FCurrentThisType = '' then
+      FCurrentThisType := Node.Attributes.Values['STATICTHISTYPE'];
+  end;
+  try
+    ProcessDimBody(Node);
+  finally
+    FCurrentThisType := SavedThis;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessDimBody(Node: TASTNode);
 var
   ArrName, DeclArrName, RefTgtType, BlkScalarKey: string;
   RefTgt: TASTNode;
@@ -24404,6 +24441,34 @@ begin
             ' and "' + UpperCase(FCurrentThisType) + '" may not reach it')]);
 end;
 
+procedure TSSAGenerator.CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);
+// The permission on a CONSTRUCTOR or DESTRUCTOR the type does not declare itself.
+//
+// ⛔ NEITHER IS INHERITED. "Dim As Child c" where Child declares no constructor does not CALL Parent's
+// constructor from where the Dim stands: it calls Child's IMPLICIT one, which is public, and THAT calls
+// Parent's. So the question is not "may this code reach Parent's constructor" but "may CHILD reach it" -
+// and the two answers differ for exactly the level that exists to make them differ. The FreeBASIC
+// manual's udt/protected2 is built on it: user_right's constructors are Protected precisely so that only
+// admin_right can construct one, and "Dim As admin_right ar" at module level is its first line of code.
+// ⭐ When the type declares the member itself, Owner is the type and this is the ordinary check.
+var
+  Level, Owner, SavedThis: string;
+begin
+  Level := MemberAccessLevel(TypeName, MemberName, Owner);
+  if (Level = '') or (Owner = '') or (UpperCase(Owner) = UpperCase(TypeName)) then
+  begin
+    CheckMemberAccess(TypeName, MemberName);
+    Exit;
+  end;
+  SavedThis := FCurrentThisType;
+  FCurrentThisType := UpperCase(TypeName);
+  try
+    CheckMemberAccess(TypeName, MemberName);
+  finally
+    FCurrentThisType := SavedThis;
+  end;
+end;
+
 function TSSAGenerator.UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
   out Bank: TSSARegisterType; out Slot: Integer; out NestedType: string): Boolean;
 // Find a field by name. BACKWARDS -- and so does every other by-name field lookup in this family.
@@ -28272,6 +28337,13 @@ var
   ArgVals: array of TSSAValue;
   DefVal: TSSAValue;
 begin
+  // OOP: the permission, on the CONSTRUCTOR. Every way of bringing an instance into being - "Dim As T x",
+  // a local array of T, "Static As T x", "New T", "New T[n]" - lands here, so the rule is asked once
+  // instead of at six sites. ⭐ And it reads correctly from INSIDE a derived constructor, which is the
+  // case that decides whether this belongs here at all: lowering "Type Child Extends Parent" runs this
+  // for Parent's ctor with FCurrentThisType = CHILD, and fbc's answer is exactly ours - a PROTECTED base
+  // constructor is reachable from the derived type and a PRIVATE one is not.
+  CheckInheritedCtorDtorAccess(TypeName, kCONSTRUCTOR);
   if Assigned(ArgsNode) then ArgCount := ArgsNode.ChildCount else ArgCount := 0;
   // Evaluate each argument once and accumulate its bank signature.
   SetLength(ArgVals, ArgCount);
@@ -28423,6 +28495,9 @@ var
   UDTIdx, i, Slot: Integer;
   NestedHandle: TSSAValue;
 begin
+  // OOP: the permission, on the DESTRUCTOR - the mirror of the constructor check, and reached by the
+  // same six shapes plus "Delete p" and "Erase a".
+  CheckInheritedCtorDtorAccess(TypeName, kDESTRUCTOR);
   UDTIdx := FindUDT(UpperCase(TypeName));
   // 1) the object's own destructor body first (so it still sees its members alive).
   Lbl := ResolveMethodLabel(TypeName, 'DESTRUCTOR');
@@ -28973,17 +29048,23 @@ procedure TSSAGenerator.EmitModuleDestructors(UseSlots: Boolean = False);
 // slot (slot space exhausted) is skipped on this path.
 var
   i, bar, slotIdx: Integer;
-  VName, TName: string;
+  VName, TName, SavedThis: string;
   H: TSSAValue;
   AccessNode: TASTNode;
 begin
   if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
+  SavedThis := FCurrentThisType;
+  try
   for i := FModuleRecordVars.Count - 1 downto 0 do
   begin
     bar := Pos('|', FModuleRecordVars[i]);
     if bar <= 0 then Continue;
     VName := Copy(FModuleRecordVars[i], 1, bar - 1);
     TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    // A hoisted STATIC local is torn down HERE, at module scope, though it was declared inside a method
+    // and FreeBASIC judges its access there. Put the owning type back for this one teardown, so a type
+    // whose own method keeps a "Static As T x" is not refused its own PRIVATE destructor.
+    FCurrentThisType := FStaticLocalOwner.Values[VName];
     // M8: already destructed at its block's exit -- CLASSIC only, as in EmitFrameDestructors. Module
     // scope has the empty procedure name, spelled out because this emitter can run from an END inside a
     // SUB (where FCurrentProcName is that SUB's).
@@ -29017,6 +29098,9 @@ begin
     end
     else
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+  end;
+  finally
+    FCurrentThisType := SavedThis;
   end;
 end;
 
@@ -29876,7 +29960,22 @@ begin
   while t <> '' do
   begin
     key := t + '.' + UpperCase(FieldName);
-    if FStaticMembers.IndexOf(key) >= 0 then Exit(key);
+    if FStaticMembers.IndexOf(key) >= 0 then
+    begin
+      // OOP: the permission, on the STATIC DATA MEMBER half. A "Static x As Integer" written under
+      // "Private:" is stamped by the same parser line an ordinary field is, but it never reaches
+      // UDTFieldBankSlot - it has no per-instance slot at all - so the one place the rule lived could
+      // not see it. This is the funnel every read and every write of such a member passes (eight
+      // callers, both spellings: through the type name and through an instance).
+      // ⚠️ Not the DEFINITION: "Dim T.x As Integer = 123" at module level is how FreeBASIC gives the
+      // member its storage, and fbc accepts it whatever the access level (two COMPILE_ONLY_OK tests of
+      // its own suite are exactly that). With an initialiser it lowers to a store through the member and
+      // so arrives here like any other write; the parser marks its base identifier so the two can be
+      // told apart, because nothing in the shape of the store distinguishes them.
+      if ObjNode.Attributes.Values['STATICMEMBERDEF'] <> '1' then
+        CheckMemberAccess(at, FieldName);
+      Exit(key);
+    end;
     idx := FindUDT(t);
     if idx < 0 then Break;
     t := UpperCase(FUDTs[idx].Parent);
@@ -34459,6 +34558,15 @@ begin
   if MethodLabel = '' then
     MethodLabel := AnyOverrideLabel(ObjType, MethNm);
   if MethodLabel = '' then Exit;
+  // OOP: the permission, on the METHOD half of the rule. Until now CheckMemberAccess was reached from
+  // exactly one place - the by-name FIELD lookup - so "Private: Declare Sub foo()" was stamped by the
+  // parser and never asked about: "x.foo()" from module level ran the body. fbc answers "error 202:
+  // Illegal member access" for it, and for a static member's "T.foo()" and for a word-named OPERATOR
+  // (Cast, For, Next, Step, New, Delete), all of which arrive HERE - TryStaticMethodCall lowers a
+  // static call through this same funnel, and the operator sites name their method the same way.
+  // ⚠️ AFTER the label resolves, not before: a site that probes for an operator the type does not have
+  // must keep falling through, and a name with no method behind it is not an access at all.
+  CheckMemberAccess(ObjType, MethNm);
   RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
   // ⛔ A BYREF UDT RESULT IS STILL TREATED AS A VALUE RETURN, and that is a MODEL gap, not an
   // oversight: the caller allocates a copy, so "@x[1] = @x" answers false where fbc says true and a
@@ -35216,13 +35324,39 @@ var
   Bank: TSSARegisterType;
   NestedT: string;
   tmp: TSSAValue;
+  TypeIdent: TASTNode;
 begin
   Result := False;
   MemberNode := nil;
+  TypeIdent := nil;
   if FCurrentThisType = '' then Exit;                          // not lowering a method body
   UDTIdx := FindUDT(FCurrentThisType);
   if UDTIdx < 0 then Exit;
-  if not UDTFieldBankSlot(UDTIdx, UpperCase(VarName), Bank, Slot, NestedT) then Exit;   // not a field
+  if not UDTFieldBankSlot(UDTIdx, UpperCase(VarName), Bank, Slot, NestedT) then
+  begin
+    // ⛔ A STATIC MEMBER IS NOT A FIELD, so the lookup above cannot see it - it has no per-instance slot
+    // at all - and a BARE reference to one inside the type's own method fell through to an ordinary
+    // variable of that name: "Return tally" answered 0 where fbc answers 100, and "tally += 5" wrote to
+    // a local nothing ever read. The QUALIFIED spelling "T.tally" was right all along, which is the tell
+    // that the gap was in the RESOLUTION and not in static members.
+    // ⭐ The member ARRAY half of this was already closed (RewriteStaticMemberArray.BackingOfBase carries
+    // the same note about a bare ReDim); the SCALAR half was left behind - the shape this codebase keeps
+    // meeting, a rule one path has and its sibling does not.
+    // The rewrite names the TYPE, not THIS: a static member is reached through the type name, and a
+    // STATIC method has no THIS to offer.
+    TypeIdent := TASTNode.CreateWithValue(antIdentifier, UpperCase(FCurrentThisType), Tok);
+    try
+      if StaticMemberBackingName(TypeIdent, VarName) = '' then Exit;   // not a static member either
+      if ResolveExisting(VarName, tmp) then Exit;                // a param / local DIM shadows it
+      MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarName), Tok);
+      MemberNode.AddChild(TypeIdent);
+      TypeIdent := nil;                                          // owned by MemberNode now
+      Result := True;
+    finally
+      TypeIdent.Free;
+    end;
+    Exit;
+  end;
   if ResolveExisting(VarName, tmp) then Exit;                  // a param / local DIM shadows the field
   MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarName), Tok);
   MemberNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'THIS', Tok));
