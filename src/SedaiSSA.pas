@@ -667,7 +667,12 @@ type
     procedure EmitNewObject(Node: TASTNode; out Result: TSSAValue);             // NEW T [(args)] → heap record handle
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
-    function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;  // "Cast(T Ptr, e)[i]" read
+    function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
+    function EmitPointerValueIndexRead(BaseNode: TASTNode; const Pointee: string;
+                                       RawSrcNode, IndicesNode: TASTNode): TSSAValue;
+    function EmitPointerValueIndexAddress(BaseNode: TASTNode; const Pointee: string;
+                                          RawSrcNode, IndicesNode: TASTNode;
+                                          out IsRaw: Boolean): TSSAValue;  // "Cast(T Ptr, e)[i]" read
     function EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue; // obj.field[i] → raw address
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     // FreeBASIC index operator "v[i]" on a UDT, and the addressable element a BYREF one returns.
@@ -6386,6 +6391,25 @@ begin
           Exit;
         end;
 
+        // ⛔ "( expr )[i]" - A PARENTHESISED BASE. Every branch here keys off the NAME of a declared
+        // pointer, and a parenthesised expression has none, so "(*pp)[0]" with "pp As Integer Ptr Ptr"
+        // fell through to a shape that answered the PACKED ADDRESS of pp itself (8589934592) where fbc
+        // answers the value; the same thing written in two steps through a variable was right all along,
+        // which is what said it was the missing SHAPE and not the pointers. DIVERGENZE 54.
+        // ⚠️ This is the FOURTH such shape (a cast, a chained index, now this one), and it is written
+        // GENERICALLY on purpose: parentheses never change what an expression means, DerefedType already
+        // strips them and already answers the element type of "*base" for every base it knows, and
+        // "base[i]" IS "*(base + i)". Adding a fifth named shape would keep the list growing on the
+        // side that cannot be finished.
+        if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antParentheses) and
+           (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+           (Node.GetChild(1).ChildCount = 1) and (DerefedType(Node.GetChild(0)) <> '') then
+        begin
+          Result := EmitPointerValueIndexRead(Node.GetChild(0), DerefedType(Node.GetChild(0)),
+                                              Node.GetChild(0), Node.GetChild(1));
+          Exit;
+        end;
+
         // "p[i][j]" - a raw pointer-to-pointer walked twice. Asked EARLY, like the cast above and for
         // the same reason: every branch below keys off the NAME of a declared pointer, and the base of
         // the second index is not a name but the pointer the FIRST index loaded. Without it the node
@@ -8760,6 +8784,7 @@ var
   VarName, RawFieldPointee, DstRecType: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
+  PtrIdxRaw: Boolean;           // "(expr)[i] = v": is the base a RAW address or a managed one?
 begin
   // "(*p)[i] = c" where p is a ZSTRING/WSTRING pointer: one character at that address.
   if (VarNode.ChildCount >= 2) and (VarNode.GetChild(1).ChildCount = 1) and
@@ -8840,6 +8865,48 @@ begin
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawFieldPointee)));
     end;
+    Exit;
+  end;
+
+  // ⛔ "( expr )[i] = value" - A PARENTHESISED BASE, the WRITE half of the read branch in the
+  // antArrayAccess dispatcher. Both store branches below key off the NAME of a declared pointer, so
+  // "(*pp)[0] = 99" with "pp As Integer Ptr Ptr" wrote NOTHING and said nothing - and a lost write is
+  // worse than the wrong read that named the defect. Asked first, for the same reason the read branch
+  // is: nothing further down recognises the shape. DIVERGENZE 54.
+  if (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0) <> nil) and (VarNode.GetChild(0).NodeType = antParentheses) and
+     (VarNode.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+     (VarNode.GetChild(1).ChildCount = 1) and
+     (DerefedType(VarNode.GetChild(0)) <> '') then
+  begin
+    DstRecType := UpperCase(DerefedType(VarNode.GetChild(0)));
+    VarReg := EmitPointerValueIndexAddress(VarNode.GetChild(0), DstRecType,
+                                           VarNode.GetChild(0), VarNode.GetChild(1), PtrIdxRaw);
+    ProcessExpression(ExprNode, ExprValue);
+    // A UDT pointee: base+i IS element i's record handle, so the store is a value copy, exactly as it
+    // is for a named pointer to UDT.
+    if (FindUDT(DstRecType) >= 0) and (ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtInt) then
+    begin
+      EmitRecordCopy(VarReg, ExprValue, FindUDT(DstRecType));
+      Exit;
+    end;
+    DerefBank := TypeNameToBank(DstRecType, '');
+    if PtrIdxRaw then
+    begin
+      if DerefBank = srtFloat then
+        EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(DstRecType)))
+      else
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(DstRecType)));
+    end
+    else
+      case DerefBank of
+        srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue), MakeSSAValue(svkNone));
+        srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue), MakeSSAValue(svkNone));
+      else
+        EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue), MakeSSAValue(svkNone));
+      end;
     Exit;
   end;
 
@@ -32414,6 +32481,17 @@ begin
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
   end
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    // An element of an ARRAY OF POINTERS: "*(arr(i))" reads what that element points to. The element's
+    // pointee is recorded by the DIM - a UDT one and a scalar one in two registries, kept apart because
+    // their readers assume different things - and both are asked through ArrayFactKey, so the answer
+    // belongs to the declaration this scope can see.
+    T := UpperCase(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(Node.GetChild(0).Value))]);
+    if T = '' then T := UpperCase(FArrayPtrPointee.Values[ArrayFactKey(VarToStr(Node.GetChild(0).Value))]);
+    Result := T;
+  end
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
   begin
     if (Node.GetChild(0).NodeType = antIdentifier) and
@@ -33018,26 +33096,32 @@ begin
 end;
 
 function TSSAGenerator.EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
-// "Cast(T Ptr, expr)[i]" read in place. Same two address families as EmitPointerIndexAddress, but the
-// base is a VALUE and the pointee comes from the cast's own type instead of a declaration:
-//   RAW     (a byte-heap / framebuffer address): index scaled by SizeOf(pointee), raw load.
-//   MANAGED (an FArrays-backed packed address):  index advances one ELEMENT, ref load.
-// The family is decided by the OPERAND, exactly as it is for a named pointer - a cast reinterprets the
-// type, never the kind of address.
+// "Cast(T Ptr, expr)[i]" read in place: the pointee comes from the cast's own type, and the address
+// family from its OPERAND - a cast reinterprets the type, never the kind of address. The work itself
+// is EmitPointerValueIndexRead's, which every base that is a VALUE rather than a NAME shares.
 var
-  Pointee, TName: string;
-  BaseVal, IdxVal, SzVal, ScaledIdx, AddrVal: TSSAValue;
-  Sz: Int64;
-  Bank: TSSARegisterType;
-  IsRaw: Boolean;
+  TName: string;
 begin
   TName := UpperCase(VarToStr(CastNode.Value));
-  Pointee := Trim(Copy(TName, 1, Length(TName) - 4));    // drop the trailing " PTR"
-  ProcessExpression(CastNode, BaseVal);                  // a pointer cast is a value passthrough
+  Result := EmitPointerValueIndexRead(CastNode, Trim(Copy(TName, 1, Length(TName) - 4)),
+                                      CastNode.GetChild(0), IndicesNode);
+end;
+
+function TSSAGenerator.EmitPointerValueIndexAddress(BaseNode: TASTNode; const Pointee: string;
+                                                    RawSrcNode, IndicesNode: TASTNode;
+                                                    out IsRaw: Boolean): TSSAValue;
+// "<expr>[i]" as an ADDRESS, for the read and the write alike. RawSrcNode is the expression whose
+// address FAMILY decides the arithmetic: a raw byte-heap address scales the index by SizeOf(pointee),
+// a managed (FArrays-backed, packed) one advances by one ELEMENT.
+var
+  BaseVal, IdxVal, SzVal, ScaledIdx: TSSAValue;
+  Sz: Int64;
+begin
+  ProcessExpression(BaseNode, BaseVal);
   BaseVal := EnsureIntRegister(BaseVal);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxVal := EnsureIntRegister(IdxVal);
-  IsRaw := (RawPtrExprName(CastNode.GetChild(0)) <> '') or IsStrDataPtrExpr(CastNode.GetChild(0));
+  IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode);
   if IsRaw then
   begin
     Sz := RawElemSizeOfPointee(Pointee);
@@ -33050,8 +33134,24 @@ begin
       IdxVal := ScaledIdx;
     end;
   end;
-  AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaAddInt, AddrVal, BaseVal, IdxVal, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Result, BaseVal, IdxVal, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitPointerValueIndexRead(BaseNode: TASTNode; const Pointee: string;
+                                                 RawSrcNode, IndicesNode: TASTNode): TSSAValue;
+// "<expr>[i]" where the base is a pointer VALUE rather than a declared pointer NAME. Same two address
+// families as EmitPointerIndexAddress:
+//   RAW     (a byte-heap / framebuffer address): index scaled by SizeOf(pointee), raw load.
+//   MANAGED (an FArrays-backed packed address):  index advances one ELEMENT, ref load.
+// RawSrcNode is the expression whose ADDRESS FAMILY decides between them (for a cast, the operand it
+// reinterprets; for a plain expression, itself).
+var
+  AddrVal: TSSAValue;
+  Bank: TSSARegisterType;
+  IsRaw: Boolean;
+begin
+  AddrVal := EmitPointerValueIndexAddress(BaseNode, Pointee, RawSrcNode, IndicesNode, IsRaw);
 
   // A UDT pointee: the record's VALUE is its handle, and base+i IS that handle for a managed block.
   if FindUDT(Pointee) >= 0 then
@@ -33885,6 +33985,21 @@ begin
       // so a pointer with no variable name - a STATIC MEMBER, a Cast - answered nothing: "UDT.p->a"
       // resolved and "(*UDT.p).a", the same access in FreeBASIC's other spelling, did not.
       Result := DerefPointeeUDTType(ObjNode.GetChild(0));                   // (*p).field
+    // ⛔ ...and DerefPointeeUDTType is itself a LIST OF SHAPES (a name, a static member, a cast), so a
+    // deref of anything else answered nothing: "(*tpp)->n" with "tpp As T Ptr Ptr" read the packed
+    // address of tpp (4611686018427387904 / 8589934592) where fbc reads the field, while the identical
+    // access written in two steps through a variable was right. DIVERGENZE 45.
+    // ⭐ Asked here of DerefedType, which answers the type of "*operand" for EVERY base it knows -- a
+    // nested deref, pointer arithmetic, a parenthesised expression -- and covers both spellings at
+    // once: the deref of a "T Ptr Ptr" is a "T PTR" and the member access derefs it, the deref of a
+    // "T Ptr" is a "T" and the access is direct.
+    if (Result = '') and (ObjNode.ChildCount >= 1) then
+    begin
+      NestedT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+      if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') then
+        NestedT := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+      if FindUDT(NestedT) >= 0 then Result := NestedT;
+    end;
     if FindUDT(Result) < 0 then Result := '';
   end
   else if ObjNode.NodeType = antArrayAccess then
@@ -34625,8 +34740,25 @@ begin
     end;
     // (*p).field where p is a UDT pointer: the deref yields p's handle directly.
     TypeName := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));
-    if TypeName = '' then Exit;
-    HandleVal := RecordHandleOfVar(VarToStr(ObjNode.GetChild(0).Value));
+    if TypeName <> '' then
+    begin
+      HandleVal := RecordHandleOfVar(VarToStr(ObjNode.GetChild(0).Value));
+      Exit(True);
+    end;
+    // ⛔ ...and that rung is keyed by a NAME once more, so a deref of anything else fell out with
+    // Result False and the field read answered the base itself: "(*tpp)->n" with "tpp As T Ptr Ptr"
+    // printed a packed address where fbc prints the field, while the same access written in two steps
+    // through a variable was right. DIVERGENZE 45 - the twin of 54, and the same cure.
+    // ⭐ DerefedType answers the type of "*operand" for every base it knows, and covers both spellings:
+    // the deref of a "T Ptr Ptr" is a "T PTR" that the member access then dereferences, the deref of a
+    // "T Ptr" is a "T" the access reaches directly.
+    DerefT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+    if (Length(DerefT) > 4) and (Copy(DerefT, Length(DerefT) - 3, 4) = ' PTR') then
+      DerefT := Trim(Copy(DerefT, 1, Length(DerefT) - 4));
+    if FindUDT(DerefT) < 0 then Exit;
+    TypeName := DerefT;
+    ProcessExpression(ObjNode, HandleVal);
+    HandleVal := EnsureIntRegister(HandleVal);
     Result := True;
   end
   else if ObjNode.NodeType = antArrayAccess then  begin
