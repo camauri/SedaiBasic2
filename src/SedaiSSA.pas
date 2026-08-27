@@ -295,6 +295,7 @@ type
                                         // array, and every reader of IsSharedScalar would read element 0 as the value.
     FEnumMembers: TStringList;
     FTypeEnumMembers: TStringList;       // ENUM members declared INSIDE a TYPE: "TYPE.MEMBER" (UPPER)
+    FTypeConstMembers: TStringList;      // CONST declared INSIDE a TYPE: "TYPE.NAME" (UPPER)
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
@@ -574,6 +575,8 @@ type
     procedure EmitStaticMemberRecords;                  // ...and construct the ones whose type is a UDT (after the ctor labels exist)
     procedure CollectEnumNames(Node: TASTNode);    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
+    procedure CollectTypeConsts(Node: TASTNode);        // FB: record each CONST declared inside a TYPE as "TYPE.NAME"
+    function TypeScopedConstAccess(const TypeName, MemberName: string; const Tok: TLexerToken): TASTNode;  // the node that READS one
     procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
     procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
     procedure EmitSharedScalarConstInits(Node: TASTNode); // ...and apply their CONSTANT initialisers, which fbc does statically
@@ -1339,6 +1342,8 @@ begin
   FEnumMembers := TStringList.Create;
   FTypeEnumMembers := TStringList.Create;
   FTypeEnumMembers.CaseSensitive := False;
+  FTypeConstMembers := TStringList.Create;
+  FTypeConstMembers.CaseSensitive := False;
   FEnumMembers.CaseSensitive := False;
   FEnumNames := TStringList.Create;
   FEnumNames.CaseSensitive := False;
@@ -1469,6 +1474,7 @@ begin
   FStaticMemberTypes.Free;
   FEnumMembers.Free;
   FTypeEnumMembers.Free;
+  FTypeConstMembers.Free;
   FEnumNames.Free;
   FEnumMemberType.Free;
   FVarEnumType.Free;
@@ -2356,6 +2362,11 @@ begin
          (ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
                              VarToStr(Node.GetChild(0).Value)) <> '') then
       begin
+        // Pointing AT a method is reaching it: fbc refuses "@T.foo" and "ProcPtr(T.foo)" on a private
+        // member exactly as it refuses the call ("visibility/*-staticmethod-*-addrof*" and "*-procptr*"
+        // are eight COMPILE_ONLY_FAIL tests of its suite). ProcPtr lowers to this same node.
+        CheckMemberAccess(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                          VarToStr(Node.GetChild(0).Value));
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadProcAddr, Result,
                         MakeSSALabel(ProcedureLabelName(
@@ -29491,8 +29502,10 @@ end;
 
 function TSSAGenerator.TypeEnumMemberOwner(const TypeName, MemberName: string): string;
 // The type - TypeName itself or an ancestor - that declares MemberName as a member of an ENUM inside
-// its body, or '' when none does. Walks the chain, because a member declared in a base is nameable
-// through a derived instance exactly as a field is.
+// its body, OR as a CONST inside its body, or '' when none does. Walks the chain, because a member
+// declared in a base is nameable through a derived instance exactly as a field is.
+// ⭐ ONE question for both, because the two are the same thing to every caller: a name the TYPE gives
+// to a module-wide constant. Asking them separately is how a rule ends up in one path and not its twin.
 var
   T: string;
   Idx, Guard: Integer;
@@ -29503,7 +29516,9 @@ begin
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
-    if FTypeEnumMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0 then Exit(T);
+    if (FTypeEnumMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0) or
+       ((FTypeConstMembers <> nil) and
+        (FTypeConstMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0)) then Exit(T);
     Idx := FindUDT(T);
     if Idx < 0 then Exit;
     T := FUDTs[Idx].Parent;
@@ -29733,6 +29748,66 @@ begin
     EmitSharedScalarStoreVal(FStaticMembers[i], RecH);
     EmitConstructorCall(RecH, FUDTs[RecIdx].Name);
   end;
+end;
+
+function TSSAGenerator.TypeScopedConstAccess(const TypeName, MemberName: string;
+  const Tok: TLexerToken): TASTNode;
+// The node that READS a name the TYPE scopes - a member of an ENUM declared in its body, or a CONST
+// declared in its body. The two are backed differently and that is the whole reason this exists: an
+// enum member gets a shared 1-element global (so a procedure can see it through MODERN's scope), while
+// a CONST is an ordinary module constant that folds to its value. Reading a CONST through the shared
+// path would look up an array that was never declared.
+// The CALLER owns the node.
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) and (FTypeConstMembers <> nil) do
+  begin
+    if FTypeConstMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0 then
+      Exit(TASTNode.CreateWithValue(antIdentifier, UpperCase(MemberName), Tok));
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+  Result := MakeSharedScalarAccess(UpperCase(MemberName), Tok);
+end;
+
+procedure TSSAGenerator.CollectTypeConsts(Node: TASTNode);
+// FreeBASIC lets a TYPE give a name to a module-wide constant: "Type T : Const MYCONST = 123 : End Type",
+// read as "T.MYCONST" from anywhere and bare inside T's own methods. The VALUE is an ordinary module
+// CONST (the declaration is lowered where the type stands); only the NAMING is per type, which is
+// exactly the arrangement an ENUM declared inside a TYPE already has.
+var
+  i, k: Integer;
+  Dim_, Decl: TASTNode;
+  OwnerU, NameU: string;
+begin
+  if (Node = nil) or (FTypeConstMembers = nil) then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    OwnerU := UpperCase(VarToStr(Node.Value));
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      Dim_ := Node.GetChild(i);
+      if (Dim_.NodeType <> antDim) or (Dim_.Attributes.Values['TYPECONST'] <> '1') then Continue;
+      for k := 0 to Dim_.ChildCount - 1 do
+      begin
+        Decl := Dim_.GetChild(k);
+        if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) or
+           (Decl.GetChild(0).NodeType <> antIdentifier) then Continue;
+        NameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (NameU <> '') and (OwnerU <> '') and
+           (FTypeConstMembers.IndexOf(OwnerU + '.' + NameU) < 0) then
+          FTypeConstMembers.Add(OwnerU + '.' + NameU);
+      end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectTypeConsts(Node.GetChild(i));
 end;
 
 procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');
@@ -35142,7 +35217,8 @@ begin
   if (TypeName = '') and (Node.GetChild(0).NodeType = antIdentifier) and
      (TypeEnumMemberOwner(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value)) <> '') then
   begin
-    AccNode := MakeSharedScalarAccess(UpperCase(VarToStr(Node.Value)), Node.Token);
+    CheckMemberAccess(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value));
+    AccNode := TypeScopedConstAccess(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value), Node.Token);
     try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
     Exit;
   end;
@@ -35164,7 +35240,8 @@ begin
     // with; only the NAMING is per type.
     if TypeEnumMemberOwner(TypeName, VarToStr(Node.Value)) <> '' then
     begin
-      AccNode := MakeSharedScalarAccess(UpperCase(VarToStr(Node.Value)), Node.Token);
+      CheckMemberAccess(TypeName, VarToStr(Node.Value));
+      AccNode := TypeScopedConstAccess(TypeName, VarToStr(Node.Value), Node.Token);
       try
         ProcessExpression(AccNode, Result);
       finally
@@ -37109,9 +37186,12 @@ begin
     antProcedureCall: ProcessProcedureCall(Node);
     antTypeDecl:
       // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit — except a nested
-      // ENUM, whose members are module constants and still need their values assigned.
+      // ENUM, whose members are module constants and still need their values assigned, and a nested
+      // CONST, which is the same arrangement under another keyword.
       for i := 0 to Node.ChildCount - 1 do
-        if Node.GetChild(i).NodeType = antEnum then
+        if (Node.GetChild(i).NodeType = antEnum) or
+           ((Node.GetChild(i).NodeType = antDim) and
+            (Node.GetChild(i).Attributes.Values['TYPECONST'] = '1')) then
           ProcessStatement(Node.GetChild(i));
     antProgram, antStatement, antThen, antElse:
       for i := 0 to Node.ChildCount - 1 do
@@ -37264,9 +37344,12 @@ begin
       ProcessProcedureCall(Node);
     antTypeDecl:
       // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here — except a
-      // nested ENUM, whose members are module constants and still need their values assigned.
+      // nested ENUM, whose members are module constants and still need their values assigned, and a
+      // nested CONST, which is the same arrangement under another keyword.
       for i := 0 to Node.ChildCount - 1 do
-        if Node.GetChild(i).NodeType = antEnum then
+        if (Node.GetChild(i).NodeType = antEnum) or
+           ((Node.GetChild(i).NodeType = antDim) and
+            (Node.GetChild(i).Attributes.Values['TYPECONST'] = '1')) then
           ProcessStatement(Node.GetChild(i));
     antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction:
       // Statement-level call for side effects (e.g. obj.method(args), a function/array expression used
@@ -38147,6 +38230,7 @@ begin
   // visible inside SUB/FUNCTION bodies (MODERN only; CLASSIC has no procedure scope).
   FEnumMembers.Clear;
   CollectEnumMembers(AST);
+  CollectTypeConsts(AST);
   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate (and CAST/copies of raw).
   // Iterate to a fixpoint so raw-ness propagates through copies regardless of statement order.
   // (Stage 2 byte-backing of address-taken arrays was withdrawn: a managed/raw mix is unsound at function

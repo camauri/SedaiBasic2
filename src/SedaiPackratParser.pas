@@ -4187,7 +4187,8 @@ end;
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum, NestedRec: TASTNode;
+  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum, NestedRec, NestedConst: TASTNode;
+  EnumIdx: Integer;
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
@@ -4496,7 +4497,43 @@ begin
     if Context.Check(ttEnum) then
     begin
       NestedEnum := ParseEnumStatement;
-      if Assigned(NestedEnum) then Result.AddChild(NestedEnum);
+      if Assigned(NestedEnum) then
+      begin
+        // Each member carries the access level in force, exactly as a field does - fbc scopes an ENUM
+        // declared under "Private:" to the type's own methods.
+        for EnumIdx := 0 to NestedEnum.ChildCount - 1 do
+          if (NestedEnum.GetChild(EnumIdx).NodeType = antAssignment) and
+             (NestedEnum.GetChild(EnumIdx).ChildCount >= 1) and
+             (NestedEnum.GetChild(EnumIdx).GetChild(0).NodeType = antIdentifier) then
+            StampMemberAccess(Result,
+              UpperCase(VarToStr(NestedEnum.GetChild(EnumIdx).GetChild(0).Value)), CurAccess);
+        Result.AddChild(NestedEnum);
+      end;
+      Continue;
+    end;
+    // ⛔ ...AND A "Const" INSIDE A TYPE, WHICH WAS PARSED AS A FIELD AND ANSWERED ZERO. "Const MYCONST =
+    // 123" fell into the field grammar below, which read CONST as a field name and MYCONST as a second,
+    // typeless one: the type came out with two members it does not have, and "T.MYCONST" printed 0 where
+    // fbc prints 123 - a WRONG ANSWER in silence, no diagnostic anywhere. It is not a field at all: like
+    // a nested ENUM's members it is a module-wide constant that the TYPE gives a name to, so it is parsed
+    // as the statement it is (every form CONST has - integer, float, string, "Const As T name") and hung
+    // on the type node for the lowering to hoist.
+    if Context.Check(ttConstant) then
+    begin
+      NestedConst := ParseConstStatement;
+      if Assigned(NestedConst) then
+      begin
+        NestedConst.Attributes.Values['TYPECONST'] := '1';
+        for EnumIdx := 0 to NestedConst.ChildCount - 1 do
+          if (NestedConst.GetChild(EnumIdx).NodeType = antArrayDecl) and
+             (NestedConst.GetChild(EnumIdx).ChildCount >= 1) and
+             (NestedConst.GetChild(EnumIdx).GetChild(0).NodeType = antIdentifier) then
+            StampMemberAccess(Result,
+              UpperCase(VarToStr(NestedConst.GetChild(EnumIdx).GetChild(0).Value)), CurAccess);
+        Result.AddChild(NestedConst);
+      end
+      else
+        Context.Advance;                              // malformed: do not spin on the token
       Continue;
     end;
     PrevIdx := Context.CurrentIndex;
