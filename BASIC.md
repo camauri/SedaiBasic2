@@ -195,14 +195,14 @@ difference is stated rather than left to be discovered.
 | `Object` | `Type T Extends Object` | FB. The built-in RTTI base; `x Is Object` is true for any derived type. |
 | `This` | `This.field`, `This.Method()` | FB. Implicit inside a method, for fields *and* calls. |
 | `Base` | `Base.Method()`, `Base.field` | FB. The super call, dispatched **non**-virtually against the parent. |
-| `Constructor` / `Destructor` | `Constructor T()` | FB. The base is constructed first and destroyed last; `Base(args)` chains explicitly. |
+| `Constructor` / `Destructor` | `Constructor T()` | FB. The base is constructed first and destroyed last; `Base(args)` chains explicitly. **Gap:** the elements of an ARRAY of UDT are constructed but never destroyed - `Dim As P x(0 To 1)` runs `P`'s constructor twice and its destructor zero times, where FreeBASIC runs both twice. |
 | `Declare` | `Declare Sub F()` | FB. Methods are defined out of line (`Sub T.F()`). |
 | `Virtual` | `Declare Virtual Sub F()` | FB. **Required for dynamic dispatch.** Without it a redeclaration in a child *shadows*, and the call resolves on the static type - as fbc does. |
 | `Abstract` | `Declare Abstract Sub F()` | FB. No body here; implies `Virtual`. A type that inherits one and does not implement it **cannot be instantiated**. |
 | `Static` | `Declare Static Sub F()`, `Static n As Integer` | FB. No implicit `This`; one storage shared by all instances. |
 | `Private:` `Protected:` `Public:` | section labels in the type body | FB. **Enforced** at every member site: a field, a method, a static method, a static data member, a constructor and a destructor. `Private` reaches only the declaring type's own methods, `Protected` also its descendants; a constructor or destructor a derived type reaches implicitly is judged from that derived type, not from where the declaration stands. **Divergence:** the access level is recorded per NAME, while FreeBASIC decides it per OVERLOAD - a name declared at two levels is treated as unenforced, so `Public: Constructor(n)` beside `Private: Constructor(ByRef rhs)` lets both through. |
 | `Property` | `Property T.Length()` | FB. Getter and setter forms. |
-| `Operator` | `Operator T.+ (…)` | FB. Including the compound (`*=`) and `Cast` forms. |
+| `Operator` | `Operator T.+ (…)` | FB. Including the compound (`*=`), `Cast`, `[]`, `Let`, `@` and the `For`/`Next`/`Step` iteration forms; the access level on the declaration is enforced for all of them. **Gap:** `Operator New` / `Operator Delete` are parsed and defined but never called - `New T` uses the built-in allocator and the operator's body does not run. |
 | `Implements` | `Type T Implements I1, I2` | **MODERN extension.** fbc reserves the word and never implemented it. Here it is a *checked contract*. |
 | `Interface` … `End Interface` | `Interface I` / `End Interface` | **MODERN extension.** Does not exist in fbc. Sugar for a type whose every method is implicitly `Abstract` (hence `Virtual`) and which carries no fields. A type may implement several. |
 | `Override` | `Declare Override Sub F()` | **MODERN extension.** Verified: an ancestor must declare that method `Virtual`. Catches the mistyped override, which would otherwise become a new method in silence. Optional - requiring it would reject FreeBASIC source. |

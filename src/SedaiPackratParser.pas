@@ -4003,7 +4003,7 @@ begin
   if (TypeNode = nil) or (MemberName = '') then Exit;
   Level := UpperCase(CurAccess);
   if Level = '' then Level := 'PUBLIC';
-  Key := 'ACCESS' + MemberName;
+  Key := 'ACCESS' + MemberDecoratorKey(MemberName);   // ONE spelling; see the note on the helper
   Prev := TypeNode.Attributes.Values[Key];
   if (Prev <> '') and (Prev <> Level) then Level := 'MIXED';
   TypeNode.Attributes.Values[Key] := Level;
@@ -4072,13 +4072,58 @@ begin
         // answer through a Parent pointer, while a virtual Sub next to it dispatched correctly - the
         // tell that the defect was in the NAME and not in the dispatcher.
         if MethName = kOPERATOR then
-          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value))
+        begin
+          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value));
+          Context.Advance;
+          // ...and the tail some WORD-named operators carry, spelled exactly as the DEFINITION side
+          // spells it: "Mod=" and its family stop at the '=' (the lexer yields two tokens), and
+          // "New[]" / "Delete[]" are a different operator from "New" / "Delete".
+          if ((MethName = kOPERATOR + kMOD) or (MethName = kOPERATOR + 'SHL') or
+              (MethName = kOPERATOR + 'SHR') or (MethName = kOPERATOR + 'AND') or
+              (MethName = kOPERATOR + 'OR') or (MethName = kOPERATOR + 'XOR') or
+              (MethName = kOPERATOR + 'EQV') or (MethName = kOPERATOR + 'IMP')) and
+             Context.Check(ttOpEq) then
+          begin
+            MethName := MethName + '=';
+            Context.Advance;
+          end
+          else if ((MethName = kOPERATOR + kNEW) or (MethName = kOPERATOR + kDELETE)) and
+                  Context.Check(ttDelimBrackOpen) and Assigned(Context.PeekNext) and
+                  (Context.PeekNext.TokenType = ttDelimBrackClose) then
+          begin
+            MethName := MethName + '[]';
+            Context.Advance; Context.Advance;
+          end;
+        end
         else
+        begin
           MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+          Context.Advance;
+        end;
+      end
+      // ⛔ "OPERATOR <symbol>" USED TO BE UNTRACKED, and the note said so: "not a name we track here".
+      // That was true of the decorators, and it stopped being harmless the day VISIBILITY started
+      // reading them - "Private: Declare Operator +=(...)" was stamped with nothing, so the rule had
+      // no way to refuse "x += x" from outside. Fifteen COMPILE_ONLY_FAIL tests of fbc's own suite are
+      // exactly that (selfbop, selfuop, and the FOR/NEXT/STEP family). The symbol is spelled the way
+      // the DEFINITION side spells it, because the two must produce ONE name or the stamp is filed
+      // where nothing looks it up - the same trap the CAST comment above records.
+      else if MethName = kOPERATOR then
+      begin
+        MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value));
+        // A self-operator arrives as the lexer's compound-assign token, whose value is the BARE symbol
+        // ("*", not "*="): spell the '=' back in, or it is labelled exactly like the binary operator.
+        if Context.Check(ttCompoundAssign) then MethName := MethName + '=';
         Context.Advance;
+        // The index operator is two delimiter tokens, not one name.
+        if (MethName = kOPERATOR + '[') and Context.Check(ttDelimBrackClose) then
+        begin
+          MethName := kOPERATOR + '[]';
+          Context.Advance;
+        end;
       end
       else
-        MethName := '';       // OPERATOR <symbol>: not a name we track here
+        MethName := '';
     end;
   end;
   if MethName <> '' then

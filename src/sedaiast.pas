@@ -124,6 +124,18 @@ function CreateBinaryOpNode(OpType: TTokenType; Left, Right: TASTNode; Token: TL
 function CreateUnaryOpNode(OpType: TTokenType; Operand: TASTNode; Token: TLexerToken = nil): TASTNode;
 function CreateFunctionCallNode(const FuncName: string; Args: TASTNode; Token: TLexerToken = nil): TASTNode;
 
+// === MEMBER DECORATORS ===
+// The key a member's decorator (ACCESS / VIRTUAL / ABSTRACT / ...) is filed under on the antTypeDecl.
+// Both sides of that question call it, and they MUST agree: the parser writes the stamp from the name
+// as WRITTEN, the SSA reads it from the name the pipeline COMPOSED, and the two differ in three ways.
+//
+// ⛔⛔ AND ONE OF THE THREE IS THE ATTRIBUTE STORE ITSELF. Attributes is a name=value list, so a key
+// that CONTAINS '=' is torn in half: "ACCESSOPERATOR+=" was written as the line "ACCESSOPERATOR+==..."
+// and read back under the name "ACCESSOPERATOR+", which matches nothing. Every self-operator ("+=",
+// "*=", "Mod=") was stamped and then invisible - written and read in good faith, agreeing on the name,
+// and still missing each other. The '=' is spelled out; no operator's own name contains "_EQ".
+function MemberDecoratorKey(const MethNm: string): string;
+
 // === CONSTANT FOLDING HELPERS ===
 function IsConstantNode(Node: TASTNode): Boolean;
 function TryFoldBinaryOp(OpType: TTokenType; Left, Right: TASTNode; Token: TLexerToken; out FoldedNode: TASTNode): Boolean;
@@ -504,6 +516,30 @@ begin
 end;
 
 // === CONSTANT FOLDING ===
+
+function MemberDecoratorKey(const MethNm: string): string;
+var
+  i: Integer;
+begin
+  Result := UpperCase(MethNm);
+  if Copy(Result, 1, 8) <> 'OPERATOR' then Exit;    // only an OPERATOR's name needs any of this
+  // The RETURN BANK sigil: a type may declare several casts differing in nothing else, so the label
+  // carries "$"/"%"/"#". The parser has no return type in hand when it records the decorator.
+  if (Result <> '') and (Result[Length(Result)] in ['$', '%', '#']) then
+    Result := Copy(Result, 1, Length(Result) - 1);
+  // The ARITY code, which keeps a unary and a binary overload of one symbol apart ("OPERATOR-@1") and
+  // rides on the iteration operators too ("OPERATORFOR@1"). ⚠️ Only "@" FOLLOWED BY DIGITS: the
+  // address-of operator IS "OPERATOR@" and must survive whole.
+  if Length(Result) > 9 then
+  begin
+    i := Length(Result);
+    while (i > 1) and (Result[i] in ['0'..'9']) do Dec(i);
+    if (i < Length(Result)) and (i > 9) and (Result[i] = '@') then
+      Result := Copy(Result, 1, i - 1);
+  end;
+  // ...and the separator of the store this key lives in.
+  Result := StringReplace(Result, '=', '_EQ', [rfReplaceAll]);
+end;
 
 function IsConstantNode(Node: TASTNode): Boolean;
 begin

@@ -13489,6 +13489,11 @@ function TSSAGenerator.IterOperatorLabel(const TypeName, OpName: string; NArgs: 
 // a type may declare either or both, so a loop written WITH Step still works against a type that only
 // implements the implicit form, and the other way round.
 begin
+  // OOP: the permission on an ITERATION operator. A "For i As T = a To b" loop reaches FOR / NEXT / STEP
+  // through this label and never through ProcessMethodCall, so the rule that covers every other member
+  // could not see them - and fbc's suite has nine COMPILE_ONLY_FAIL tests that are exactly this.
+  // Asked HERE because this is the one funnel all four call sites go through.
+  CheckMemberAccess(TypeName, 'OPERATOR' + OpName);
   Result := TypeName + '.OPERATOR' + OpName + '@' + IntToStr(NArgs);
   if FProcDecls.ContainsKey(Result) then Exit;
   if NArgs > 0 then Result := TypeName + '.OPERATOR' + OpName + '@' + IntToStr(NArgs - 1)
@@ -25734,15 +25739,11 @@ end;
 
 function TSSAGenerator.MethAttrKey(const MethNm: string): string;
 // The name a DECLARE's decorator (VIRTUAL / ABSTRACT / ACCESS...) is filed under on the antTypeDecl.
-// It is the method name as the PARSER saw it, and for one family that is not the name the rest of the
-// pipeline uses: an OPERATOR CAST is labelled with its RETURN BANK ("TYPE.OPERATORCAST$"), because a
-// type may declare several casts that differ in nothing else. The parser has no return type in hand
-// when it records the decorator, so it files "OPERATORCAST" and this drops the sigil back off.
+// ⛔ ONE spelling, shared with the parser that WRITES it (SedaiAST.MemberDecoratorKey) - a key composed
+// twice is a key filed where nothing looks it up, which this family has now paid for three times: the
+// OPERATOR CAST sigil, the operator ARITY code, and the '=' inside a self-operator's own name.
 begin
-  Result := UpperCase(MethNm);
-  if (Copy(Result, 1, 8) = 'OPERATOR') and (Result <> '') and
-     (Result[Length(Result)] in ['$', '%', '#']) then
-    Result := Copy(Result, 1, Length(Result) - 1);
+  Result := MemberDecoratorKey(MethNm);
 end;
 
 function TSSAGenerator.MethodIsVirtual(const TypeName, MethNm: string): Boolean;
@@ -28223,6 +28224,11 @@ begin
           (FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup = FUDTs[UDTIdx].Fields[FieldIdx - 1].UnionGroup) do
       Inc(FieldIdx);                       // the rest of a union block shares the value already written
     if FieldIdx > High(FUDTs[UDTIdx].Fields) then Break;
+    // OOP: an aggregate initialiser WRITES these fields, and writing one is reaching it. This path
+    // walks the field array by INDEX, so it never asks the by-name lookup where the rule lives, and
+    // "Dim As T x = (3)" filled a Private field from module level in silence. fbc refuses it
+    // ("visibility/{private,protected}-field-public-init", plus dim/anon_no_access).
+    CheckMemberAccess(FUDTs[UDTIdx].Name, FUDTs[UDTIdx].Fields[FieldIdx].Name);
     // ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives the
     // middle field - an array - its elements one by one; the field's slot holds the member array's
     // FArrays handle, so the values go in through the same indirect store "v.field(j) = x" uses.
@@ -28403,6 +28409,9 @@ begin
       for i := 0 to ArgCount - 1 do
       begin
         if i > High(FUDTs[AggUDT].Fields) then Break;
+        // ...and the PERMISSION, which is the other rule the loop above carries and this copy did not:
+        // writing a field is reaching it, and "Dim As T x = (3)" filled a Private one from module level.
+        CheckMemberAccess(FUDTs[AggUDT].Name, FUDTs[AggUDT].Fields[i].Name);
         // A brace list initialises an ARRAY member - the same rule the aggregate-init path carries,
         // asked here because "v = Type( 1, 2, {3, 4}, 5 )" reaches the field list through THIS path.
         if (ArgsNode <> nil) and (i < ArgsNode.ChildCount) and
