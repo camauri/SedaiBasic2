@@ -5902,13 +5902,37 @@ function TPackratParser.ParseFBPokeStatement(Token: TLexerToken): TASTNode;
 var
   Saved: Integer;
   TypeStr: string;
-  PtrExpr, ValExpr, CastNode, DerefNode: TASTNode;
+  PtrExpr, ValExpr, CastNode, DerefNode, TypeOfExpr: TASTNode;
 begin
   Result := nil;
   Context.SavePosition(Saved);
   Context.Advance;                                    // consume POKE
   TypeStr := '';
-  if Context.Check(ttIdentifier) and IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) and
+  TypeOfExpr := nil;
+  // ⭐ "Poke TypeOf(b), p, 123": the type is ASKED, not written - the same shape CAST, "type<>" and now
+  // PEEK read, with the operand kept as a CHILD for the SSA to resolve. Both halves of the pair need it
+  // or one spelling of the same test compiles and the other does not.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                                  // TypeOf
+    Context.Advance;                                  // (
+    TypeOfExpr := ParseExpression;
+    if not Assigned(TypeOfExpr) then begin Context.RestorePosition(Saved); Exit; end;
+    if not Context.Check(ttDelimParClose) then
+    begin TypeOfExpr.Free; Context.RestorePosition(Saved); Exit; end;
+    Context.Advance;                                  // )
+    TypeStr := 'TYPEOF';
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                 // consume ',' after the datatype
+    else
+    begin
+      TypeOfExpr.Free;
+      Context.RestorePosition(Saved);
+      Exit;
+    end;
+  end
+  else if Context.Check(ttIdentifier) and IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) and
      (UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'STRING') then
   begin
     TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
@@ -5923,19 +5947,32 @@ begin
   end;
   if TypeStr = '' then TypeStr := 'UBYTE';
   PtrExpr := ParseExpression;
-  if not Assigned(PtrExpr) then begin Context.RestorePosition(Saved); Exit; end;
+  if not Assigned(PtrExpr) then
+  begin
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
+  end;
   if not Context.Check(ttSeparParam) then
   begin
-    PtrExpr.Free; Context.RestorePosition(Saved); Exit;
+    PtrExpr.Free;
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
   end;
   Context.Advance;                                    // consume ',' before the value
   ValExpr := ParseExpression;
   if not Assigned(ValExpr) then
   begin
-    PtrExpr.Free; Context.RestorePosition(Saved); Exit;
+    PtrExpr.Free;
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
   end;
   CastNode := TASTNode.CreateWithValue(antCast, TypeStr + ' PTR', Token);
   CastNode.AddChild(PtrExpr);
+  if Assigned(TypeOfExpr) then
+  begin
+    CastNode.Attributes.Values['TYPEOFEXPR'] := '1';
+    CastNode.AddChild(TypeOfExpr);                    // child1 = the operand, resolved in the SSA
+  end;
   DerefNode := TASTNode.Create(antDeref, Token);
   DerefNode.AddChild(CastNode);
   Result := TASTNode.Create(antAssignment, Token);

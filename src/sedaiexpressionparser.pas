@@ -2767,15 +2767,41 @@ function TExpressionParser.ParsePeekFB(Token: TLexerToken): TASTNode;
 var
   Saved: Integer;
   TypeStr: string;
-  PtrExpr, CastNode: TASTNode;
+  PtrExpr, CastNode, TypeOfExpr: TASTNode;
 begin
   Result := nil;
   Context.SavePosition(Saved);
   Context.Advance;                                   // consume '('
   TypeStr := '';
+  TypeOfExpr := nil;
+  // ⭐ "Peek(TypeOf(b), p)": the type is not written, it is ASKED - exactly as CAST and "type<>" already
+  // read it, and with the same shape (the operand stays a CHILD and the SSA resolves it, being the only
+  // place that knows what a name was DECLARED as). Without this arm "TYPEOF" was read as an ordinary
+  // type NAME, IsFBScalarTypeName declined it, and the whole call fell through to the function-call path
+  // with "( b )" still standing beside it: "Array not declared: TYPEOF".
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                                 // TypeOf
+    Context.Advance;                                 // (
+    TypeOfExpr := ParseExpression(precNone);
+    if not Assigned(TypeOfExpr) then begin Context.RestorePosition(Saved); Exit; end;
+    if not Context.Match(ttDelimParClose) then
+    begin TypeOfExpr.Free; Context.RestorePosition(Saved); Exit; end;
+    TypeStr := 'TYPEOF';
+    while AtPointerSuffix do begin TypeStr := TypeStr + ' PTR'; Context.Advance; end;
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                // consume ','
+    else
+    begin
+      TypeOfExpr.Free;
+      Context.RestorePosition(Saved);                // "Peek(TypeOf(x))" -- not our form
+      Exit;
+    end;
+  end
   // A leading built-in type name followed by ',' is the typed form. Anything else is an address
   // expression, and the pointee is UBYTE.
-  if Context.Check(ttIdentifier) and IsFBScalarTypeName(VarToStr(Context.CurrentToken.Value)) then
+  else if Context.Check(ttIdentifier) and IsFBScalarTypeName(VarToStr(Context.CurrentToken.Value)) then
   begin
     TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
     Context.Advance;
@@ -2790,15 +2816,27 @@ begin
   end;
   if TypeStr = '' then TypeStr := 'UBYTE';
   PtrExpr := ParseExpression(precNone);
-  if not Assigned(PtrExpr) then begin Context.RestorePosition(Saved); Exit; end;
+  if not Assigned(PtrExpr) then
+  begin
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
+  end;
   if not Context.Match(ttDelimParClose) then
   begin
     PtrExpr.Free;
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
     Context.RestorePosition(Saved);
     Exit;
   end;
   CastNode := TASTNode.CreateWithValue(antCast, TypeStr + ' PTR', Token);
   CastNode.AddChild(PtrExpr);
+  // The asked-for type travels as child 1 with the TYPEOFEXPR mark, the shape the SSA already resolves
+  // for "Cast(TypeOf(x), v)" - one resolution, not two.
+  if Assigned(TypeOfExpr) then
+  begin
+    CastNode.Attributes.Values['TYPEOFEXPR'] := '1';
+    CastNode.AddChild(TypeOfExpr);
+  end;
   Result := TASTNode.Create(antDeref, Token);
   Result.AddChild(CastNode);
   DoNodeCreated(Result);

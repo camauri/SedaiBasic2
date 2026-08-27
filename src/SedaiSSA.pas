@@ -10766,6 +10766,15 @@ begin
        (FModernMode or (FProgram.FindArray(UpperCase(ArrName)) >= 0)) and
        (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
       DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
+    // ⚠️ AND A BLOCK IS A SCOPE TOO, but giving a block-local array its own slot HERE was TRIED AND
+    // WITHDRAWN on 27 Aug 2026, measured: the slot moved and the FACTS did not. Every question about
+    // an array's ELEMENTS - is it an array of UDT, of pointers, of function pointers, what narrow
+    // width, is it unsigned - lives in a registry keyed by the BARE name (FArrayRecordType,
+    // FArrayPtrPointee, FArrayScalarPointee, FArrayFuncPtrSig, FArrayElemWidth, FUnsigned64Arrays),
+    // written here and read from about twenty places. A block-local array with its own storage and
+    // ANOTHER array's element facts is a silent wrong answer where today the two at least agree, and
+    // the change was INERT on every net (corpus, sweep, the test it was aimed at). Closing it means
+    // keying those facts by the DECLARATION, not by the name. DIVERGENZE 61.
 
     // Extract dimension sizes
     DimCount := DimsNode.ChildCount;
@@ -32224,7 +32233,12 @@ begin
     // *CPtr(T Ptr, x) / *Cast(T Ptr, x): the cast names the pointee outright - the deref must
     // read at T's width and signedness, not at the width of x's original declaration
     // ("*CPtr(Byte Ptr, @int32val)" reads ONE signed byte: fbc prints -128 for &h80).
-    T := UpperCase(VarToStr(Node.Value));
+    // ⛔ ...and an UNRESOLVED "Cast(TypeOf(x), ...)" still carries the MARKER as its type. This is
+    // asked for the PRINT KIND, which runs before the cast is lowered, so "Peek(TypeOf(b), pb)" on a
+    // UByte printed with a sign column where "Peek(UByte, pb)" beside it did not. DeclaredTypeNameOf
+    // already resolves that shape and says so in its own note; this is the second reader of the same
+    // question, and it had the first half of the rule only.
+    T := UpperCase(DeclaredTypeNameOf(Node));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
   end
