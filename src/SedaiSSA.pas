@@ -3109,7 +3109,13 @@ begin
             EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
           end
         else   // STRING keeps the managed record handle
+        begin
           EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          // ...and a "String * n" among them is padded on store now, so this read converts at the first
+          // NUL exactly as the plain-register read does. The two halves ask the same question or the
+          // storage and the value part company (DIVERGENZE 77).
+          if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
+        end;
       end
       // Module-level @-taken scalar: read the declared-width value from its raw slot (address in the shared
       // "<name>$RA" array). Bit-exact, so a type-punning read through @x sees the same bytes.
@@ -3137,6 +3143,11 @@ begin
         ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
         ProcessExpression(ArgListNode, Result);
         ArgListNode.Free;
+        // ⛔ The conversion has to be asked of the ORIGINAL node, not of the array access this rewrote
+        // it into: FixedLenCapOfNode classifies a NAME, and the element form carries none. A
+        // "Dim Shared f As String * 10" is padded on store, so without this its comparison against ""
+        // saw ten NULs and answered NOT EQUAL where fbc answers equal (fbc's own string/comp_null).
+        if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
       end
       // FreeBASIC implicit THIS: a bare field name in a method body reads "this.<field>".
       else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
@@ -9115,7 +9126,12 @@ begin
     Result := StrCapOf(FFixedLenVars, VarName, 0);
     if Result > 0 then
     begin
-      if IsSharedScalar(VarName) or IsAddrLocal(VarName) or IsRefVar(VarName) or IsAddrParam(VarName) then
+      // ⭐ A SHARED or @-taken "String * n" is padded on store now (see TryFixedLenStore), so its read
+      // converts like any other fixed-length string: the two halves have to keep asking the same
+      // question. A RAW-backed one is a byte buffer with no padding, and a reference / parameter is
+      // somebody else's storage - those still decline.
+      if IsRefVar(VarName) or IsAddrParam(VarName) or IsRawModuleScalar(VarName) or
+         IsRawAddrLocal(VarName) or (VarRecordTypeName(VarName) <> '') then
         Result := 0
       else
         Wide := IsWStringVar(VarName);
@@ -9268,8 +9284,35 @@ var
   ExprValue, FixedCapReg, FixedTrunc: TSSAValue;
 begin
   Result := False;
-  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) then Exit;
-  if IsAddrLocal(VarName) and (RawZStringBufBytes(VarName) <= 0) then Exit;
+  // ⛔ A "String * n" WHOSE ADDRESS IS TAKEN IS STILL A "String * n". These two lines used to send it
+  // away unpadded - "Dim As String * 6 s : s = "ab" : Dim p As Any Ptr = @s" left LEN 2 where fbc
+  // leaves 6, at MODULE level and inside a procedure alike, and the identical program without the "@"
+  // was right. Taking an address is not a change of type; it only changes where the value LIVES, and
+  // padding it is the same three instructions wherever that is. DIVERGENZE 52 and 77 - one defect seen
+  // from its two sides, which is why they are cured in one place.
+  // ⚠️ The two backings still have to be written the way THEY are read: a SHARED scalar through
+  // element 0 of its array, an @-taken local through its per-frame record. Writing the variable's own
+  // register - what the tail of this routine does - would leave both of them untouched, which is the
+  // trap m617 had just been through with the MID statement.
+  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) then
+  begin
+    FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
+    if (FixedCap <= 0) or (VarRecordTypeName(VarName) <> '') then Exit;
+    ProcessStringExpression(ExprNode, ExprValue);
+    EmitSharedScalarStoreVal(VarName,
+      EmitFixedLenPad(EnsureStringRegister(ExprValue), FixedCap, IsWStringVar(VarName)));
+    Exit(True);
+  end;
+  if IsAddrLocal(VarName) and (RawZStringBufBytes(VarName) <= 0) then
+  begin
+    FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
+    if (FixedCap <= 0) or IsRawAddrLocal(VarName) then Exit;
+    ProcessStringExpression(ExprNode, ExprValue);
+    EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), AddrLocalHandle(VarName),
+                    EmitFixedLenPad(EnsureStringRegister(ExprValue), FixedCap, IsWStringVar(VarName)),
+                    MakeSSAConstInt(0));
+    Exit(True);
+  end;
   // "ZSTRING/WSTRING * n": truncate to n-1 characters (the nth cell is the terminator) and store as an
   // ordinary variable-length string — no padding, so LEN stays the content length as fbc reports it.
   // Codepoints for a WSTRING, bytes for a ZSTRING.
