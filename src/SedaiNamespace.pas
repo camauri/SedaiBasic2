@@ -620,9 +620,18 @@ begin
   // antProcedureCall, which carries its name in Value with an ARGUMENT LIST as its child - so neither
   // arm above ever saw it, and the name stayed bare while the very same call written as an EXPRESSION
   // ("print p1(7)") was prefixed and worked. antProcedureCall appeared nowhere in this unit.
+  // ⛔ ...AND A CAST CARRIES A TYPE NAME IN Value TOO. "Cast(Byte1, i2) = ..." inside a namespace kept
+  // the bare "BYTE1", which after flattening is a type that exists nowhere: the upcast-slice branch in
+  // the SSA asks FindUDT for it, gets -1, and the statement was refused with a message about a missing
+  // "Operator Cast() ByRef" - while the SAME PROGRAM WITHOUT THE NAMESPACE worked. It is the third
+  // name-in-Value node, after "@x" and a statement call, and each was found the same way: by a test
+  // rather than by reading this list. A cast's type may carry a " PTR" tail, which rides along
+  // untouched exactly as an overload's signature does.
   if (Node.NodeType = antIdentifier) or
      ((Node.NodeType = antProcAddress) and (Node.ChildCount = 0)) or
-     (Node.NodeType = antProcedureCall) then
+     (Node.NodeType = antProcedureCall) or
+     (Node.NodeType = antCast) or
+     ((Node.NodeType = antNew) and (VarToStr(Node.Value) <> '')) then
   begin
     V := UpperCase(VarToStr(Node.Value));
     // ⛔ ...and GLOBALSCOPE is a request NOT to resolve against the enclosing namespace: ".v" inside a
@@ -656,6 +665,16 @@ begin
     begin
       BaseV := V;
       SigV := '';
+    end;
+    // ⛔ ...AND A TYPE NAME CAN CARRY A " PTR" TAIL, which is not part of the name to resolve. It rides
+    // along untouched, exactly as an overload's signature does. Without this "Dim As Byte1 Ptr p = @i2"
+    // inside a namespace kept the bare "BYTE1 PTR" - a type that exists nowhere after flattening - and
+    // "p->b1" answered 1 instead of the field, while the same two lines outside a namespace were right.
+    // A space cannot occur in a variable name, so this can only ever peel a type.
+    while (Length(BaseV) > 4) and (Copy(BaseV, Length(BaseV) - 3, 4) = ' PTR') do
+    begin
+      SigV := ' PTR' + SigV;
+      BaseV := TrimRight(Copy(BaseV, 1, Length(BaseV) - 4));
     end;
     // ⛔ ...or a USING has brought a namespace into scope. The test used to be "we are INSIDE a
     // namespace" (ActivePrefix <> ''), which is right for the enclosing-chain rule and wrong the moment

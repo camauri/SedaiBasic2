@@ -238,6 +238,11 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
+- ⚠️ **`Load` is a reserved word here and not in fbc**, so `Sub Load()` is refused. Every other
+  Commodore word in that position was checked: `run`, `new`, `delete`, `poke`, `wait`, `close`,
+  `open`, `get`, `put`, `print` and `input` are refused by fbc too (in its own words, "Duplicated
+  definition"), and `list`, `save`, `verify`, `sys`, `cont` and `clr` are accepted by both. `Load` is
+  the only one that is ours alone.
 - ⚠️ **`Asc(w, i)` and `w[i]` on a `WSTRING` answer the UTF-8 BYTE, not the codepoint.** A WSTRING is
   stored here as UTF-8, and the wide family that counts codepoints is complete and correct everywhere
   else — `Len`, `Left`, `Right`, `Mid`, `Instr`, `InstrRev` all have wide twins, and `LSet`/`RSet` use

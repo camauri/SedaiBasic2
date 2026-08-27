@@ -793,6 +793,8 @@ type
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function CastReturnCode(const RetTypeName: string): string;  // OPERATOR CAST label suffix by return bank
     function DerefPointeeUDTType(Node: TASTNode): string;  // UDT a "*expr" points to (var or Cast(T Ptr,..))
+    function DerefOfAddrOfTarget(Node: TASTNode): TASTNode;  // "*@x" names x: the inner lvalue, or nil
+    function OverloadsAddressOf(Node: TASTNode): Boolean;   // ...unless the type declares "Operator @"
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
@@ -2115,6 +2117,7 @@ var
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
   DerefTarget: TASTNode;          // "*expr": the operand, with any parentheses stripped
+  CancelNode: TASTNode;           // "*@x": the inner lvalue the pair cancels to (owned here)
   ExprList2: TASTNode;            // synthesized empty argument list for "Cast(T, T)"
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
@@ -2551,6 +2554,21 @@ begin
 
     antDeref:
     begin
+      // ⭐ "*@x" IS x. A "*" learns what it points at from the DECLARED type of a pointer, so
+      // "Dim p As String Ptr = @s : *p" was right and "*@s" - the same place with no name in between -
+      // read the packed handle as a raw address ("Null or invalid pointer dereference" for a String,
+      // the BITS for a Double). Cancelling the pair is asked FIRST, before every shape below, because
+      // it makes the question go away instead of answering it. DIVERGENZE #48.
+      CancelNode := DerefOfAddrOfTarget(Node);
+      if CancelNode <> nil then
+      begin
+        try
+          ProcessExpression(CancelNode, Result);
+        finally
+          CancelNode.Free;
+        end;
+        Exit;
+      end;
       // FreeBASIC declares Erfn/Ermn as "Function () As ZString Ptr", so real FB sources write
       // "*Erfn()" to get at the characters. SedaiBasic has no ZSTRING PTR: ssaLoadERFN/ssaLoadERMN
       // already yield the name as a STRING, so the dereference is the identity here. Deliberately
@@ -8446,8 +8464,27 @@ var
   RawFieldPointee, RawPtrName: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
-  DerefTgt: TASTNode;
+  DerefTgt, CancelTgt: TASTNode;
 begin
+  // "*@x = expr" is "x = expr" - see the note in the antDeref arm of ProcessExpression. Both halves
+  // need it, or the read of a place works and the write to the same place does not.
+  CancelTgt := DerefOfAddrOfTarget(VarNode);
+  if CancelTgt <> nil then
+  begin
+    try
+      DerefTgt := TASTNode.Create(antAssignment, VarNode.Token);
+      try
+        DerefTgt.AddChild(CancelTgt.Clone);
+        DerefTgt.AddChild(ExprNode.Clone);
+        ProcessAssignment(DerefTgt);
+      finally
+        DerefTgt.Free;
+      end;
+    finally
+      CancelTgt.Free;
+    end;
+    Exit;
+  end;
   // FreeBASIC RAW pointer-deref store through a FIELD: "*obj.field = expr" / "*(@obj.field[i]) = expr"
   // where the field is a raw "<scalar> PTR". Store SizeOf(pointee) bytes to the raw heap. Type-based (a
   // field has no pointer name, so the name-based RawPtrExprName branch below cannot resolve it).
@@ -33005,6 +33042,7 @@ var
   Bank: TSSARegisterType;
   Slot: Integer;
   Lvl, BaseIdx: Integer;
+  CancelObj: TASTNode;
 begin
   Result := '';
   if ObjNode = nil then Exit;
@@ -33012,6 +33050,17 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ...and "(*@u)" is u - see ResolveRecordObject, which asks the same question about the same node.
+  CancelObj := DerefOfAddrOfTarget(ObjNode);
+  if CancelObj <> nil then
+  begin
+    try
+      Result := ObjectTypeName(CancelObj);
+    finally
+      CancelObj.Free;
+    end;
+    Exit;
+  end;
   // FreeBASIC BASE (and BASE.BASE...): `base` names the base SUBOBJECT of the type being compiled, not a
   // field of it. The parser lowers it to THIS carrying a BASEREF DEPTH, so climb that many EXTENDS levels
   // from the current type. The record HANDLE stays THIS's, and that is exactly what makes this work: the
@@ -33196,6 +33245,57 @@ procedure TSSAGenerator.ProcessStringExpression(Node: TASTNode; out Val: TSSAVal
 begin
   if TryEmitUDTCastToString(Node, Val) then Exit;
   ProcessExpression(Node, Val);
+end;
+
+function TSSAGenerator.DerefOfAddrOfTarget(Node: TASTNode): TASTNode;
+// "*@x" names exactly x, whatever x is. Answers a FRESH node for that inner lvalue - the CALLER owns
+// it and must free it - or nil when Node is not of that shape.
+//
+// ⛔ WHY IT IS NEEDED AT ALL: a "*" learns what it points at from the DECLARED type of a pointer, so
+// "Dim p As String Ptr = @s : *p" is right and "*@s" - the same place with no name in between - was
+// not. It read the packed handle as a raw address: "Null or invalid pointer dereference" for a String,
+// the Double's BITS for a Double. Cancelling the pair costs no analysis and cannot be wrong: the
+// address-of has nothing else to hand back.
+//
+// ⛔ A PROCEDURE NAME IS EXCLUDED. "@f" is a procedure pointer and "*@f" is not a call; unwrapping it
+// would turn the address of a SUB into an attempt to read a variable of that name.
+var
+  Inner: TASTNode;
+begin
+  Result := nil;
+  if (Node = nil) or (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
+  Inner := Node.GetChild(0);
+  while (Inner <> nil) and (Inner.NodeType = antParentheses) and (Inner.ChildCount >= 1) do
+    Inner := Inner.GetChild(0);
+  if (Inner = nil) or (Inner.NodeType <> antProcAddress) then Exit;
+  // ⛔ ...AND THE "@" ITSELF CAN BE OVERLOADED. A type declaring "Operator @ () As Integer Ptr" means
+  // something else by "@u", so "*@u" is a call and a dereference, not a cancellation - m568 prints the
+  // field that operator points at (-1234) and read 5, the handle, once the pair was cancelled here.
+  // The unary "*" arm carries the mirror of this note for the same reason.
+  if Inner.ChildCount >= 1 then
+  begin
+    if OverloadsAddressOf(Inner.GetChild(0)) then Exit;
+    Result := Inner.GetChild(0).Clone;
+    Exit;
+  end;
+  // The bare-name spelling carries the name in Value and has no child, so the identifier is built here.
+  // ⚠️ Built, never grafted onto the address-of node: several sites tell "@name" from "@expr" by its
+  // CHILD COUNT, and adding one would change how the address-of itself is lowered.
+  if VarType(Inner.Value) = varNull then Exit;
+  if FProcedureNames.IndexOf(UpperCase(VarToStr(Inner.Value))) >= 0 then Exit;   // "@f": a procedure
+  if ResolveMethodLabel(VarRecordTypeName(VarToStr(Inner.Value)), 'OPERATOR@') <> '' then Exit;
+  Result := TASTNode.CreateWithValue(antIdentifier, VarToStr(Inner.Value), Inner.Token);
+end;
+
+function TSSAGenerator.OverloadsAddressOf(Node: TASTNode): Boolean;
+// Does the type of this expression declare "Operator @"? Then "@it" is a call, not an address.
+var
+  T: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  T := ObjectTypeName(Node);
+  Result := (T <> '') and (ResolveMethodLabel(T, 'OPERATOR@') <> '');
 end;
 
 function TSSAGenerator.DerefPointeeUDTType(Node: TASTNode): string;
@@ -33575,7 +33675,7 @@ var
   ParentHandle, NestedHandle: TSSAValue;
   ParentUDT, Slot: Integer;
   Bank: TSSARegisterType;
-  SharedTmp, ChainIdx: TASTNode;
+  SharedTmp, ChainIdx, CancelObj: TASTNode;
 begin
   Result := False;
   TypeName := '';
@@ -33587,6 +33687,18 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ...and "(*@u)" is u - the same cancellation the expression path makes, asked here because a record
+  // BASE does not go through it: "(*@u).a" answered 1 while "*@i" of an Integer was already right.
+  CancelObj := DerefOfAddrOfTarget(ObjNode);
+  if CancelObj <> nil then
+  begin
+    try
+      Result := ResolveRecordObject(CancelObj, HandleVal, TypeName);
+    finally
+      CancelObj.Free;
+    end;
+    Exit;
+  end;
   // CPtr/Cast(T Ptr, x)->field: the CAST names the record type outright, and a UDT-pointer
   // cast is a value passthrough, so the cast's int value IS the record handle. Without this
   // branch the base matched nothing, the field read fell to the generic path and yielded
