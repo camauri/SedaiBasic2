@@ -13424,7 +13424,7 @@ begin
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
-    15: // bcRefLoadString
+    15: // bcRefLoadString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
         if PtrAddr < 0 then
@@ -13432,6 +13432,14 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
         end
+        // ⛔ THE RAW THIRD KIND, WHICH THIS ARM ALONE DID NOT KNOW. bcRefLoadInt/Float learned it and
+        // say so in the note above - "the tag is IN the value, so the question is answered here, where
+        // every path that produces one arrives" - and the STRING arm was never visited. A BYREF cast
+        // written "Operator = *This.p" over a CAllocate'd ZString hands back a correctly tagged raw
+        // address, and this decoded it as a packed array pointer: "Null or invalid pointer
+        // dereference, address 4611686018427387944". Text at a raw address is a C string.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -13495,7 +13503,7 @@ begin
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
-    18: // bcRefStoreString
+    18: // bcRefStoreString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
         if PtrAddr < 0 then
@@ -13503,6 +13511,10 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
         end
+        // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
+        // or LSET on such a UDT reads its buffer and then stores into a nonexistent array.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);

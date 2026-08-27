@@ -598,7 +598,8 @@ type
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
     procedure CollectRawPtrRetFuncs(Node: TASTNode);                            // pre-scan: FUNCTIONs returning a raw "<scalar> PTR"
     function IsRawReturnExpr(Node: TASTNode): Boolean;                          // a FUNCTION-return expr that yields a raw byte-heap pointer?
-    procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
+    procedure CollectWStringVars(Node: TASTNode; const Owner: string = '');    // pre-scan: mark DIM ... AS WSTRING vars
+    function StrCapOf(L: TStringList; const Name: string; Def: Integer): Integer;  // fixed-length capacity, THIS scope first
     procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
     function DeclLowerBoundKind(Decl: TASTNode): Integer;
     procedure CollectDynamicArrays(Node: TASTNode);                             // pre-scan: dynamic arrays (empty-declared / REDIM target)
@@ -654,6 +655,9 @@ type
     // FreeBASIC index operator "v[i]" on a UDT, and the addressable element a BYREF one returns.
     function IsMemberArrayField(MemberNode: TASTNode): Boolean;
     function TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
+    function TryEmitDerefTargetAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;   // "*<expr>" as a place
+    function UDTWritableStringCast(Node: TASTNode; out ObjType: string): string;   // assignable "Cast() ByRef As Z/WString"
+    function UDTDerivesFromStringType(const TypeName: string): Boolean;   // EXTENDS chain reaches ZSTRING/WSTRING?
     function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
     function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
     function ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
@@ -8171,6 +8175,12 @@ begin
       EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
       Exit;
     end;
+    // ...and "Operator = *<expr>", where the address is the pointer and nothing is taken.
+    if FCurrentProcByrefRet and TryEmitDerefTargetAddress(ExprNode, ExprValue) then
+    begin
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
+      Exit;
+    end;
     // ...and "Operator = This.I": a FIELD, whose address is a record-field pointer. Same rule as the
     // RETURN spelling, and it has to be in both or one form of the same operator works and the other
     // hands back the field's VALUE where the caller expects a reference.
@@ -8945,7 +8955,7 @@ begin
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
   begin
     VarName := VarToStr(Node.Value);
-    Result := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+    Result := StrCapOf(FFixedLenVars, VarName, 0);
     if Result > 0 then
     begin
       if IsSharedScalar(VarName) or IsAddrLocal(VarName) or IsRefVar(VarName) or IsAddrParam(VarName) then
@@ -9106,7 +9116,7 @@ begin
   // "ZSTRING/WSTRING * n": truncate to n-1 characters (the nth cell is the terminator) and store as an
   // ordinary variable-length string — no padding, so LEN stays the content length as fbc reports it.
   // Codepoints for a WSTRING, bytes for a ZSTRING.
-  FixedCap := StrToIntDef(FZStringVars.Values[UpperCase(VarName)], -1);
+  FixedCap := StrCapOf(FZStringVars, VarName, -1);
   if FixedCap >= 0 then
   begin
     ProcessStringExpression(ExprNode, ExprValue);
@@ -9147,7 +9157,7 @@ begin
       EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit(True);
   end;
-  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+  FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
   if FixedCap > 0 then
   begin
     ProcessStringExpression(ExprNode, ExprValue);
@@ -9531,7 +9541,7 @@ begin
           // fixed-length target must still end up padded/cut to its capacity.
           if AnyFixedLen and not (IsSharedScalar(VarName) or IsAddrLocal(VarName)) then
           begin
-            InFixCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+            InFixCap := StrCapOf(FFixedLenVars, VarName, 0);
             if InFixCap > 0 then
               EmitInstruction(ssaCopyString, VarReg, EmitFixedLenPad(VarReg, InFixCap, False),
                               MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -10476,7 +10486,7 @@ begin
           RecordVarWidth(UpperCase(ArrName), RecTypeName);  // B1.5 phase 2: narrow on store to a sub-64-bit type
           // "DIM s AS STRING * n" with no initializer starts as n NULs — fbc's buffer is allocated at its
           // full capacity, so LEN is n and PRINT emits all n bytes before anything is ever assigned.
-          FixLenCap := StrToIntDef(FFixedLenVars.Values[UpperCase(ArrName)], 0);
+          FixLenCap := StrCapOf(FFixedLenVars, ArrName, 0);
           if (FixLenCap > 0) and not IsSharedScalar(UpperCase(ArrName)) and not IsAddrLocal(UpperCase(ArrName)) then
             EmitFixedLenInit(GetOrAllocateVariable(UpperCase(ArrName)), FixLenCap, IsWStringVar(ArrName))
           // A local declared WITHOUT an initializer is zero in FreeBASIC, and it must be zero again on
@@ -12184,7 +12194,7 @@ begin
   // value back into the variable: "Dim t As String * 8 : Mid(t,1,1) = "C"" left LEN 0 where fbc leaves
   // 8 with a C in front. The variable's own register IS the padded buffer; only the READ was lossy.
   if (TargetNode.NodeType = antIdentifier) and
-     (StrToIntDef(FFixedLenVars.Values[UpperCase(VarToStr(TargetNode.Value))], 0) > 0) and
+     (StrCapOf(FFixedLenVars, VarToStr(TargetNode.Value), 0) > 0) and
      (not IsSharedScalar(VarToStr(TargetNode.Value))) then
     TextReg := EnsureStringRegister(GetOrAllocateVariable(UpperCase(VarToStr(TargetNode.Value))))
   else
@@ -12761,6 +12771,47 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.UDTWritableStringCast(Node: TASTNode; out ObjType: string): string;
+// Does Node name a UDT instance whose string Cast operator returns a WRITABLE reference? That is the
+// question LSET/RSET has to ask about its destination: such a UDT *is* a string for this statement -
+// fbc justifies into the buffer the cast refers to - and the answer is the label to call for its
+// address. A cast that returns BY VALUE hands back a copy, which cannot be justified into, so it
+// answers '' and the caller leaves the statement alone.
+begin
+  Result := '';
+  ObjType := '';
+  if Node = nil then Exit;
+  ObjType := ObjectTypeName(Node);
+  if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
+  Result := ResolveMethodLabel(ObjType, 'OPERATORCAST$');   // '$' = string-returning cast
+  if (Result <> '') and (not ByrefRetByAddress(Result)) then Result := '';
+  // ⛔ ...AND THE TYPE MUST DERIVE FROM ZSTRING/WSTRING. An assignable string Cast on its own is not
+  // enough for fbc: a type that only declares one answers "error 24: Invalid data types" to LSET/RSET
+  // (verified). The suite's reference type is "... Extends UZSTRING_FIXED_BASE Extends ZString" with
+  // the Cast on the leaf, so the chain is walked rather than the immediate parent read.
+  if (Result <> '') and (not UDTDerivesFromStringType(ObjType)) then Result := '';
+  if Result = '' then ObjType := '';
+end;
+
+function TSSAGenerator.UDTDerivesFromStringType(const TypeName: string): Boolean;
+// Does this UDT reach ZSTRING or WSTRING through its EXTENDS chain?
+var
+  Nm: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  Nm := UpperCase(TypeName);
+  Guard := 0;
+  while (Nm <> '') and (Guard < 64) do
+  begin
+    if (Nm = 'ZSTRING') or (Nm = 'WSTRING') then Exit(True);
+    Idx := FindUDT(Nm);
+    if Idx < 0 then Exit;
+    Nm := UpperCase(FUDTs[Idx].Parent);
+    Inc(Guard);
+  end;
+end;
+
 procedure TSSAGenerator.ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
 // LSET/RSET dst, src (FreeBASIC/QBasic): justify src into dst's string buffer, preserving dst's
 // current length. src is truncated from the right if longer than the buffer, else padded with
@@ -12785,7 +12836,10 @@ var
   TmpName: string;
   NoneV: TSSAValue;
   FixedCap: Integer;
-  FixedWide: Boolean;
+  FixedWide, Wide: Boolean;
+  CastLbl, CastType: string;
+  CastNode: TASTNode;
+  AddrVal: TSSAValue;
 begin
   if Node.ChildCount < 2 then Exit;
   NoneV := MakeSSAValue(svkNone);
@@ -12797,7 +12851,13 @@ begin
   // first, because falling through to the string path below converts the record HANDLES with
   // IntToString and then assigns one handle to the other - which only ever produced the right
   // answer because the int and string banks happened to hand out matching numbers.
-  if IsLeft and TryLRSetRecord(DstNode, SrcNode) then Exit;
+  // ⛔ ...but a UDT that converts to a STRING through an assignable Cast is NOT a record overlay: for
+  // fbc, LSET/RSET on it is the ordinary string justification performed on the buffer the cast refers
+  // to, with the DESTINATION's current length preserved. The suite's reference zstring UDT is exactly
+  // that, and taking the overlay there answered "XY" where fbc answers "XY     ". Asked FIRST, because
+  // the type has fields and would otherwise satisfy the overlay test.
+  CastLbl := UDTWritableStringCast(DstNode, CastType);
+  if (CastLbl = '') and IsLeft and TryLRSetRecord(DstNode, SrcNode) then Exit;
 
   // Read inputs.
   ProcessStringExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
@@ -12810,17 +12870,33 @@ begin
   // "xy". The capacity is a compile-time fact - the same one Len(s) already reports as 8 - so it is
   // asked for here; a variable-length destination keeps the runtime LEN, which is what QB's LSET means.
   FixedCap := FixedLenCapOfNode(DstNode, FixedWide);
+  // ⛔ ...AND FOR A WIDE DESTINATION EVERY COUNT HERE IS A CODEPOINT COUNT, not a byte count. WSTRING
+  // is stored as UTF-8, so ssaStrLen answered 3 for a destination holding ONE Japanese character and
+  // the justification padded it to three: the suite's own sweep (wstring/lrset, ucs2) reported
+  // "len 3, want 1". The three ops have wide twins and only the FIXED-capacity read ever asked for
+  // them - the runtime-length path, which is the one a WSTRING actually takes, did not.
+  // ...and a UDT destination is wide when the reference its Cast hands back is a WSTRING: the node
+  // itself is a record, so IsWStringExpr cannot see it.
+  Wide := FixedWide or IsWStringExpr(DstNode) or
+          ((CastLbl <> '') and (Pos('WSTRING', ByrefRetPointeeType(CastLbl)) > 0));
   NReg := NI;
   if FixedCap > 0 then
     EmitInstruction(ssaLoadConstInt, NReg, MakeSSAConstInt(FixedCap), NoneV, NoneV)
+  else if Wide then
+    EmitInstruction(ssaStrLenW, NReg, DstReg, NoneV, NoneV)
   else
     EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
 
   // capped = LEFT$(src, N): truncate from the right when src is longer than the buffer.
-  CappedReg := NS; EmitInstruction(ssaStrLeft, CappedReg, SrcReg, NReg, NoneV);
+  CappedReg := NS;
+  if Wide then EmitInstruction(ssaStrLeftW, CappedReg, SrcReg, NReg, NoneV)
+  else EmitInstruction(ssaStrLeft, CappedReg, SrcReg, NReg, NoneV);
 
   // pad = SPACE$(N - LEN(capped)).  LEN(capped) = min(LEN(src), N) so the count is always >= 0.
-  LCapReg := NI;  EmitInstruction(ssaStrLen, LCapReg, CappedReg, NoneV, NoneV);
+  // (A space is one codepoint and one UTF-8 byte, so SPACE$ itself needs no wide twin.)
+  LCapReg := NI;
+  if Wide then EmitInstruction(ssaStrLenW, LCapReg, CappedReg, NoneV, NoneV)
+  else EmitInstruction(ssaStrLen, LCapReg, CappedReg, NoneV, NoneV);
   PadNReg := NI;  EmitInstruction(ssaSubInt, PadNReg, NReg, LCapReg, NoneV);
   PadReg := NS;   EmitInstruction(ssaStrSpace, PadReg, PadNReg, NoneV, NoneV);
 
@@ -12832,6 +12908,18 @@ begin
     EmitInstruction(ssaStrConcat, ResultReg, CappedReg, PadReg, NoneV)
   else
     EmitInstruction(ssaStrConcat, ResultReg, PadReg, CappedReg, NoneV);
+
+  // A string-convertible UDT destination is written THROUGH the reference its Cast operator hands
+  // back: it has no assignment from a string, and the ordinary path below silently dropped the store.
+  if CastLbl <> '' then
+  begin
+    CastNode := DstNode;
+    while (CastNode.NodeType = antParentheses) and (CastNode.ChildCount >= 1) do
+      CastNode := CastNode.GetChild(0);
+    ProcessMethodCall(CastNode, CastType, 'OPERATORCAST$', nil, AddrVal, False, True);
+    EmitByrefRetStore(EnsureIntRegister(AddrVal), ResultReg, CastLbl);
+    Exit;
+  end;
 
   // dst = result  (dispatches on the dst lvalue kind via the existing assignment machinery)
   AsnNode := TASTNode.Create(antAssignment, Node.Token);
@@ -20201,6 +20289,22 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryEmitDerefTargetAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
+// "*<expr>" as an ADDRESSABLE place: the address is the pointer itself, so nothing has to be taken -
+// the operand is evaluated and handed back. The shape a BYREF cast operator over a fixed-length buffer
+// is written in ("Operator = *Cast(ZString Ptr, @_data)"), and the one IsAddressableReturn used to
+// reject, which turned such an operator into a VALUE return: readable, never writable.
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
+  ProcessExpression(Node.GetChild(0), Addr);
+  Addr := EnsureIntRegister(Addr);
+  Result := True;
+end;
+
 function TSSAGenerator.ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
 // "v[i] = expr" through a UDT's BYREF index operator: call it for the element's address, then store the
 // value through that address. Answers False (emitting nothing) when this is not such an assignment.
@@ -20488,7 +20592,10 @@ begin
   end;
   case Bank of
     srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // The immediate carries the WIDTH of the pointee, which only a RAW address needs: text there is a C
+    // string and a WSTRING one is UCS-2. A packed address ignores it.
+    srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
+                               MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
   else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
@@ -20511,7 +20618,8 @@ begin
   end;
   case Bank of
     srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), MakeSSAValue(svkNone));
-    srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val), MakeSSAValue(svkNone));
+    srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val),
+                               MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
   else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), MakeSSAValue(svkNone));
   end;
 end;
@@ -22420,12 +22528,12 @@ begin
   Result := -1;
   if not FModernMode then Exit;
   Nm := UpperCase(Name);
-  Cap := StrToIntDef(FFixedLenVars.Values[Nm], 0);
+  Cap := StrCapOf(FFixedLenVars, Nm, 0);
   if Cap <= 0 then
   begin
     // ZSTRING and WSTRING vars share one registry, and it holds CHARACTERS (n-1), so the declared n is
     // Cap+1 - bytes for a ZSTRING, 2-byte units for a WSTRING.
-    Cap := StrToIntDef(FZStringVars.Values[Nm], 0);
+    Cap := StrCapOf(FZStringVars, Nm, 0);
     if Cap <= 0 then Exit;
     if IsWStringVar(Nm) then Exit((Cap + 1) * 2) else Exit(Cap + 1);
   end;
@@ -30974,7 +31082,7 @@ begin
     CollectRawPtrRetFuncs(Node.GetChild(i));
 end;
 
-procedure TSSAGenerator.CollectWStringVars(Node: TASTNode);
+procedure TSSAGenerator.CollectWStringVars(Node: TASTNode; const Owner: string);
 // Pre-scan: record every variable, parameter or FUNCTION result declared AS WSTRING (by name, into the
 // flat FWStringVars). These share the srtString bank (UTF-8 byte storage) but their LEN/MID/LEFT/RIGHT
 // count/index by Unicode codepoint. Declaration shapes: DIM scalar = antArrayDecl(name, "WSTRING"); a
@@ -31020,9 +31128,17 @@ begin
       begin
         FZStringVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] :=
           IntToStr(StrToIntDef(Node.Attributes.Values['FIXEDLEN'], 1) - 1);
+        if Owner <> '' then
+          FZStringVars.Values[Owner + '|' + UpperCase(VarToStr(Node.GetChild(0).Value))] :=
+            IntToStr(StrToIntDef(Node.Attributes.Values['FIXEDLEN'], 1) - 1);
       end
       else
+      begin
         FFixedLenVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] := Node.Attributes.Values['FIXEDLEN'];
+        if Owner <> '' then
+          FFixedLenVars.Values[Owner + '|' + UpperCase(VarToStr(Node.GetChild(0).Value))] :=
+            Node.Attributes.Values['FIXEDLEN'];
+      end;
     end;
   end;
   // FUNCTION ... AS WSTRING : child0 = name node, its child0 = return-type identifier.
@@ -31044,8 +31160,30 @@ begin
          (UpperCase(VarToStr(P.GetChild(0).Value)) = 'WSTRING') then
         MarkW(VarToStr(P.Value));
     end;
+  // ⛔ A DECLARED CAPACITY IS A FACT ABOUT ONE SCOPE, and this registry is keyed by NAME alone: two
+  // SUBs that each declare "Dim src As WString * n" with a DIFFERENT n left the LAST declaration's n
+  // in force for both, so the first one truncated its own contents. The fbc suite's wstring/lrset does
+  // exactly that - TEST(ascii) sizes by MAX=8 and TEST(ucs2) by MAX=5 - and its 8-character strings
+  // came back 5 characters long. The scoped entry is written BESIDE the bare one, never instead of it,
+  // so a module-level declaration and every lookup that has no procedure context read as before.
   for i := 0 to Node.ChildCount - 1 do
-    CollectWStringVars(Node.GetChild(i));
+    if (Node.GetChild(i) <> nil) and (Node.GetChild(i).NodeType = antProcedureDecl) and
+       (Node.GetChild(i).ChildCount >= 1) and (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+      CollectWStringVars(Node.GetChild(i), UpperCase(VarToStr(Node.GetChild(i).GetChild(0).Value)))
+    else
+      CollectWStringVars(Node.GetChild(i), Owner);
+end;
+
+function TSSAGenerator.StrCapOf(L: TStringList; const Name: string; Def: Integer): Integer;
+// The declared capacity recorded for this name, asking THIS procedure's entry before the flat one.
+// See the note in CollectWStringVars: the flat entry is last-declaration-wins across the program.
+const
+  NOENTRY = Low(Integer);
+begin
+  Result := NOENTRY;
+  if FCurrentProcName <> '' then
+    Result := StrToIntDef(L.Values[FCurrentProcName + '|' + UpperCase(Name)], NOENTRY);
+  if Result = NOENTRY then Result := StrToIntDef(L.Values[UpperCase(Name)], Def);
 end;
 
 function TSSAGenerator.IsWStringVar(const Name: string): Boolean;
@@ -31366,7 +31504,7 @@ begin
   Nm := UpperCase(Name);
   if not IsAddrLocal(Nm) then Exit;
   if (AddrLocalType(Nm) <> 'ZSTRING') and (AddrLocalType(Nm) <> 'WSTRING') then Exit;
-  Chars := StrToIntDef(FZStringVars.Values[Nm], 0);       // stored as n-1 characters
+  Chars := StrCapOf(FZStringVars, Nm, 0);                 // stored as n-1 characters
   if Chars <= 0 then Exit;
   if AddrLocalType(Nm) = 'WSTRING' then Result := (Chars + 1) * 2 else Result := Chars + 1;
 end;
@@ -32177,6 +32315,12 @@ begin
   // pointer, and the very ssaRefLoad/ssaRefStore the byref-return machinery uses know how to follow one -
   // so calling it non-addressable made the operator a VALUE return and the assignment was refused.
   if N.NodeType = antMemberAccess then Exit(True);
+  // ...and a DEREFERENCE, "*<expr>", whose address is the pointer itself - nothing has to be taken.
+  // ⛔ This is the shape the fbc suite's reference zstring UDT is written in:
+  // "Operator UZSTRING_FIXED_MUTABLE.Cast() ByRef As ZString : Operator = *Cast(ZString Ptr, @_data)".
+  // Judged non-addressable, the operator became a VALUE return, so the READ half worked and every
+  // write through it was refused - which is what made LSET/RSET on such a UDT unrepresentable.
+  if N.NodeType = antDeref then Exit(True);
   // ...and an INDEXED element, in EITHER bracketing. "p[i]" is a pointer element and "this.v(i)" is a
   // member ARRAY element; both have an address now that EmitArrayElementAddress builds a member array's
   // base from the handle at run time. Only the square bracket used to qualify, so
@@ -35955,6 +36099,10 @@ begin
           // operator, and only a bare name was ever recognised here.
           else if FCurrentProcByrefRet and
                   TryEmitIndexedElementAddress(Node.GetChild(0), RetVal) then
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
+          // ...and "Return *<expr>", the same place in its other spelling.
+          else if FCurrentProcByrefRet and
+                  TryEmitDerefTargetAddress(Node.GetChild(0), RetVal) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
           // ...and a FIELD, which is what an assignable "Operator Cast() ByRef As T" hands back:
           // "Return This.I". Its address is a record-field pointer, and the ssaRefLoad/ssaRefStore the

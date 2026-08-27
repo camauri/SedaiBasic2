@@ -238,6 +238,18 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
+- ⚠️ **`Asc(w, i)` and `w[i]` on a `WSTRING` answer the UTF-8 BYTE, not the codepoint.** A WSTRING is
+  stored here as UTF-8, and the wide family that counts codepoints is complete and correct everywhere
+  else — `Len`, `Left`, `Right`, `Mid`, `Instr`, `InstrRev` all have wide twins, and `LSet`/`RSet` use
+  them — but `Asc` and indexed reads go through `ssaStrMid` + `ssaStrAsc`, which take the first byte.
+  On `!"\u3041Z\u3045"` fbc answers `12353 90 12357` and we answer `227 129 129`. Closing it needs a
+  new opcode, not a branch.
+- ⚠️ **`LSet` / `RSet` on a string-convertible UDT is accepted in one case fbc rejects.** fbc requires
+  both an `Extends ZString`/`WString` chain *and* an `Operator Cast() ByRef As Z/WString` declared on
+  the type itself; we require the chain and a cast that merely *resolves*, which an ancestor may
+  supply. Where fbc accepts the statement, the result is byte-identical: the destination's current
+  length is preserved, the source is cut from the right when longer and padded when shorter, and the
+  counts are codepoints for a wide destination.
 - ⚠️ **Overload resolution does not tell `Integer` from `LongInt`, nor `UInteger` from `ULongInt`.**
   On this target all four are 64 bits and all four sign the same register bank, and no registry records
   which of the four a name was *declared* as — so given `f(ByVal x As Integer)` and
