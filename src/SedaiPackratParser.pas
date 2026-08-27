@@ -372,6 +372,7 @@ type
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseNameStatement: TASTNode;         // FreeBASIC NAME old AS new (rename)
     function PeekNameHasAs: Boolean;               // lookahead: NAME ... AS ... on this statement
+    function AsmStatementFollows: Boolean;         // lookahead: "Asm <instruction>" on ONE line
     function LooksLikeImageTarget: Boolean;        // lookahead: "cmd img, (x,y)..." FB image draw-target form
     function ParseRaiseErrorStatement: TASTNode;   // FreeBASIC ERROR <n> (raise runtime error)
     function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
@@ -1546,15 +1547,27 @@ begin
         // x86 assembly has no meaning in a bytecode VM whose engines include an interpreter, so this is
         // structural and declared (BASIC.md, "Declared unsupported"); saying so is the whole fix.
         // ⚠️ MODERN only, and only when ASM opens the statement: "asm" stays usable as a name elsewhere.
+        // ⭐ ...and the ONE-LINE spelling, "Asm <instruction>", which FreeBASIC accepts beside the block.
+        // Only the block form was recognised, so the single line fell through to the assignment path and
+        // reported "Expected \"=\" in assignment" - a message about a statement the program never wrote,
+        // where the refusal below says what is actually going on. Same declared limitation, one message.
         else if FModernMode and (UpperCase(Token.Value) = 'ASM') and
                 ((Context.PeekNext = nil) or
-                 (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile])) then
+                 (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) or
+                 AsmStatementFollows) then
         begin
           HandleError('Inline assembly (ASM ... END ASM) is not supported: this is a bytecode VM, ' +
                       'and one of its engines is an interpreter. Rewrite the block in BASIC.',
                       Token);
           // Swallow the block so the "End Asm" that closes it is not read as "END" - which is what
           // silently terminated the program - and so one refusal is reported instead of a cascade.
+          // The one-line form ends at the end of the line and must NOT eat the rest of the file.
+          if (Context.PeekNext <> nil) and
+             not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+          begin
+            while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+          end
+          else
           while not Context.CheckAny([ttEndOfFile]) do
           begin
             if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
@@ -3042,7 +3055,14 @@ begin
     //
     // Read as a setter, the getter became a SUB and its "As Integer" then had nowhere to go:
     // "Unexpected token in statement: As". FreeBASIC's own rule is the presence of a result type.
-    if Context.Check(ttAsType) then
+    // ⭐ ...and a getter may return a REFERENCE: "Property p( ) ByRef As Integer", which is how an
+    // ASSIGNABLE property is written. The word BYREF stands between the parameter list and the AS, so
+    // the test above saw no result type, called it a SETTER, and the leftover "byref as integer" ended
+    // the file as "Unexpected token in statement: byref". A setter never has BYREF there - its own
+    // byref is on the parameter, inside the parentheses - so the two stay unambiguous. The BYREF itself
+    // is consumed by the function-result reader further down, which is where that rule lives.
+    if Context.Check(ttAsType) or
+       (Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kBYREF)) then
     begin
       Kind := kFUNCTION;                           // getter returns the property value
       Result.Value := kFUNCTION;
@@ -3177,7 +3197,11 @@ begin
   // module-level code; "Destructor [priority]" runs after it (at program end). Only on a plain SUB (not a
   // Type.method — MethodType = ''); the optional integer priority (101..65535) orders multiple ctors/dtors
   // (lower = earlier for ctors). Marked on the node for the SSA to collect and call at program start/end.
-  if (Context.CurrentToken <> nil) and (MethodType = '') and
+  // ⭐ ...and a STATIC MEMBER sub may carry it too: "Sub UDT.ctor2( ) Constructor" is how FreeBASIC
+  // writes a startup routine that belongs to a type. The "MethodType = ''" here refused it, so the word
+  // was left standing and the file died at "Expected a name after CONSTRUCTOR". A member sub with no
+  // THIS is a plain procedure with a dotted label as far as the startup list is concerned.
+  if (Context.CurrentToken <> nil) and
      ((UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR) or
       (UpperCase(VarToStr(Context.CurrentToken.Value)) = kDESTRUCTOR)) then
   begin
@@ -7407,6 +7431,34 @@ begin
       end;
     end;
 
+    // ⭐ "Close #1, #2": ONE statement, SEVERAL channels. FreeBASIC's own suite writes it, and without
+    // the loop the comma ended the statement and the next '#' was "Unexpected token in statement".
+    // MODERN only: Commodore BASIC closes one channel per statement.
+    if FModernMode and (CmdName <> 'DOPEN') and (CmdName <> 'OPEN') then
+      while Context.Check(ttSeparParam) do
+      begin
+        Context.Advance;                              // ','
+        if Context.Check(ttFileHandlePrefix) then Context.Advance
+        else if Context.CurrentToken.Value = '#' then Context.Advance;
+        if Context.Check(ttNumber) or Context.Check(ttInteger) then
+        begin
+          Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value),
+                                                   Context.CurrentToken));
+          Context.Advance;
+        end
+        else if Context.Check(ttIdentifier) then
+        begin
+          HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+          Context.Advance;
+          Result.AddChild(FoldFileHandlePostfix(HandleNode));
+        end
+        else
+        begin
+          HandleError('Expected a file handle after "," in CLOSE', Token);
+          Break;
+        end;
+      end;
+
     // For DOPEN/OPEN, parse filename and optional mode
     if (CmdName = 'DOPEN') or (CmdName = 'OPEN') then
     begin
@@ -8158,6 +8210,19 @@ begin
             (T2.TokenType = ttSeparParam) and (T3.TokenType = ttDelimParOpen);
 end;
 
+function TPackratParser.AsmStatementFollows: Boolean;
+// Lookahead for the ONE-LINE "Asm <instruction>" spelling: the word ASM opens the statement and what
+// follows it on the SAME line is not an operator that would make ASM an ordinary name ("asm = 1",
+// "asm.f", "asm(0)"). Used only to route it to the same declared refusal the block form gets, so the
+// program is told what is wrong instead of "Expected \"=\" in assignment".
+begin
+  Result := False;
+  if Context.PeekNext = nil then Exit;
+  Result := not (Context.PeekNext.TokenType in
+                 [ttOpEq, ttOpDot, ttDelimParOpen, ttDelimBrackOpen, ttAsType,
+                  ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse, ttSeparParam]);
+end;
+
 function TPackratParser.PeekNameHasAs: Boolean;
 // True when the statement starting at NAME is the FreeBASIC "NAME old AS new" rename form: an AS
 // (ttAsType) appears before end-of-statement, and NAME is not immediately followed by '=' / '.' /
@@ -8776,6 +8841,43 @@ begin
   // statement and the declaration failed with "Expected variable name in array declaration" - a message
   // about the very thing the WITH block is there to leave out. The expression parser's own leading-dot
   // rule builds the member access, which is the same node the "obj.field" walk below produces.
+  // ⭐ "Redim ..outer.arr( ... )": the DOUBLE dot is FreeBASIC's explicit global scope, and what follows
+  // it is an ordinary namespace-qualified name - which this statement already reads when it is written
+  // without them ("Redim outer.arr(0 To 2)" works). Only the WITH form below knew a leading dot, so the
+  // first '.' ended the statement as "Expected \"(\" after array name". Consumed here, and the name
+  // path takes it from there.
+  // ⚠️ The scope MARK itself is not honoured beyond this: a local named "outer" would still win, which
+  // is DIVERGENZE 39 and not this statement's to fix.
+  else if Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+          (Context.PeekNext.TokenType = ttOpDot) then
+  begin
+    Context.Advance;                                  // '.'
+    Context.Advance;                                  // '.'
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected a name after ".." in REDIM', Context.CurrentToken);
+      Result := nil; Exit;
+    end;
+    VarName := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Context.CurrentToken.Value)),
+                                        Context.CurrentToken);
+    Context.Advance;                                  // name
+    while Context.Check(ttOpDot) do
+    begin
+      Context.Advance;                                // '.'
+      if not (Context.Check(ttIdentifier) or
+              ((Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+               (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']))) then
+      begin
+        HandleError('Expected a name after "." in REDIM target', Context.CurrentToken);
+        VarName.Free; Result := nil; Exit;
+      end;
+      MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarToStr(Context.CurrentToken.Value)),
+                                             Context.CurrentToken);
+      MemberNode.AddChild(VarName);
+      VarName := MemberNode;
+      Context.Advance;                                // segment
+    end;
+  end
   else if Context.Check(ttOpDot) then
   begin
     // ⛔ At precPRIMARY, not precCall: the dimensions that follow are REDIM's own "( 0 To 2 )" and must
@@ -11206,7 +11308,7 @@ var
   var
     ItemName, ItemTypeTok: TLexerToken;
     ItemType: string;
-    ItemValue, Decl: TASTNode;
+    ItemValue, Decl, ItemTypeOfExpr: TASTNode;
   begin
     while Context.Check(ttSeparParam) do
     begin
@@ -11220,13 +11322,26 @@ var
       Context.Advance;                                // name
       ItemType := '';
       ItemTypeTok := ItemName;
+      ItemTypeOfExpr := nil;
       if AllowItemType and Context.Check(ttAsType) then
       begin
         Context.Advance;                              // AS
         SkipTypeQualifiers;                     // FB: "As Const <type>"
         ItemTypeTok := Context.CurrentToken;
         ItemType := 'INTEGER';
-        if Context.Check(ttIdentifier) then
+        // ⛔ ...AND "As TypeOf(x)" HERE TOO. The leading-AS spelling of CONST learned it and this list
+        // tail did not, so "Const a As Integer = 1, b As TypeOf(a) = 2" read the type as the ordinary
+        // name TYPEOF, left "( a )" in the stream and reported "Expected \"=\" after CONST name" - a
+        // message about the wrong thing entirely. The same rule, in the sibling path that did not have it.
+        if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+           (Context.PeekNext.TokenType = ttDelimParOpen) then
+        begin
+          Context.Advance;                            // TYPEOF
+          Context.Advance;                            // '('
+          ItemTypeOfExpr := FExpressionParser.ParseExpression;
+          if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+        end
+        else if Context.Check(ttIdentifier) then
         begin
           ItemType := UpperCase(ParseDottedName);     // element type
           // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
@@ -11255,7 +11370,15 @@ var
       end;
       Decl := TASTNode.Create(antArrayDecl, ItemName);
       Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ItemName.Value), ItemName));
-      Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, ItemType, ItemTypeTok));
+      if Assigned(ItemTypeOfExpr) then
+      begin
+        // child[1] is the EXPRESSION; the SSA pre-pass infers the concrete type from it, exactly as the
+        // leading-AS spelling does.
+        Decl.AddChild(ItemTypeOfExpr);
+        Decl.Attributes.Values['TYPEOF'] := '1';
+      end
+      else
+        Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, ItemType, ItemTypeTok));
       Decl.AddChild(ItemValue);
       if FModernMode then Decl.Attributes.Values['SHARED'] := '1';
       DimNode.AddChild(Decl);

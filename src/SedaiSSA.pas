@@ -18933,78 +18933,73 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessDclose(Node: TASTNode);
+// DCLOSE/CLOSE #h [, #h ...]: close each named channel.
+//
+// ⛔ IT READ CHILD 0 AND NOTHING ELSE. FreeBASIC writes "Close #1, #2" - one statement, several
+// channels - and the parser had no comma loop, so the second handle ended the statement as
+// "Unexpected token in statement: #". Every handle is a child now, and each gets its own close; a
+// statement with none still closes channel 0, as it did.
 var
-  HandleVal: TSSAValue;
-  HandleReg: TSSAValue;
+  HandleVal, HandleReg: TSSAValue;
   HandleChild: TASTNode;
   HandleStr: string;
-  HandleNum: Integer;
-begin
-  if FCurrentBlock = nil then Exit;
+  HandleNum, ChildIdx: Integer;
 
-  { DCLOSE #handle
-    AST structure:
-      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
-
-    SSA encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
-      Dest = none
-      Src1 = handle register (int) }
-
-  // Parse handle (first child)
-  if Node.ChildCount > 0 then
+  function HandleRegOf(N: TASTNode): TSSAValue;
   begin
-    HandleChild := Node.GetChild(0);
-    if HandleChild.NodeType = antLiteral then
+    if N.NodeType = antLiteral then
     begin
-      // Numeric handle: #1, #2, etc.
-      ProcessExpression(HandleChild, HandleVal);
-      HandleReg := EnsureIntRegister(HandleVal);
-    end
-    else if HandleChild.NodeType = antIdentifier then
+      ProcessExpression(N, HandleVal);
+      Result := EnsureIntRegister(HandleVal);
+      Exit;
+    end;
+    if N.NodeType = antIdentifier then
     begin
-      // Check if this is a "#N" style handle (lexer merged # and number)
-      HandleStr := VarToStr(HandleChild.Value);
-      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
-         (HandleStr[2] in ['0'..'9']) then
+      // A "#N" style handle (the lexer merged '#' and the number into one identifier).
+      HandleStr := VarToStr(N.Value);
+      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and (HandleStr[2] in ['0'..'9']) then
       begin
-        // Extract numeric handle from "#N" format
         HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
-        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      end
-      else if FModernMode then
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(HandleNum),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
+      if FModernMode then
       begin
         // FreeBASIC: the handle is a variable holding the file number; evaluate it.
-        ProcessExpression(HandleChild, HandleVal);
-        HandleReg := EnsureIntRegister(HandleVal);
-      end
-      else
-      begin
-        // Legacy named handle: #MYFILE - placeholder 0.
-        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        ProcessExpression(N, HandleVal);
+        Result := EnsureIntRegister(HandleVal);
+        Exit;
       end;
-    end
-    else
-    begin
-      ProcessExpression(HandleChild, HandleVal);
-      HandleReg := EnsureIntRegister(HandleVal);
+      // Legacy named handle: #MYFILE - placeholder 0.
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
     end;
-  end
-  else
-  begin
-    // No handle - close all? Use handle 0
-    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ProcessExpression(N, HandleVal);
+    Result := EnsureIntRegister(HandleVal);
   end;
 
-  // Emit DCLOSE instruction
-  // Dest = none, Src1 = handle
-  EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
-                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount = 0 then
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  for ChildIdx := 0 to Node.ChildCount - 1 do
+  begin
+    HandleChild := Node.GetChild(ChildIdx);
+    HandleReg := HandleRegOf(HandleChild);
+    EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
 end;
 
 procedure TSSAGenerator.ProcessFileSetEof(Node: TASTNode);
