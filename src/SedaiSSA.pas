@@ -239,6 +239,10 @@ type
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
     FCurrentProcLocalRecs: TStringList;
+    FCurrentProcNonRecs: TStringList;    // ...and the NON-record locals of the same procedure. A local
+                                         // "Dim As Integer stp" has to SCREEN a same-named record just as
+                                         // a local UDT screens a module one - and it cannot go in the list
+                                         // above, which also drives EmitFrameDestructors.
     FDefinedLabels: TStringList;         // named labels already DEFINED in the current procedure  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
     // Names DECLARED at module level and not SHARED, and the names this procedure declares of its
     // own. A module DIM is invisible inside a SUB, so its declared TYPE must be invisible too.
@@ -1257,6 +1261,8 @@ begin
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
   FCurrentProcLocalRecs := TStringList.Create;
+  FCurrentProcNonRecs := TStringList.Create;
+  FCurrentProcNonRecs.CaseSensitive := False;
   FDefinedLabels := TStringList.Create;
   FDefinedLabels.CaseSensitive := False;
   FConstVars := TStringList.Create;
@@ -1389,6 +1395,7 @@ begin
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
+  FCurrentProcNonRecs.Free;
   FDefinedLabels.Free;
   FModuleOnlyVars.Free;
   FConstVars.Free;
@@ -26772,6 +26779,10 @@ begin
   ParamUDT := CurrentProcLocalRecType(VarName);
   if ParamUDT <> '' then
     Exit(ParamUDT);
+  // ...and a local of this procedure that is NOT a record screens the bare-name map outright: it is
+  // that declaration the code means, whatever another procedure's parameter of the same name is.
+  if (FCurrentProcNonRecs <> nil) and (FCurrentProcNonRecs.IndexOf(UpperCase(VarName)) >= 0) then
+    Exit('');
   if FVarRecordType.IndexOfName(UpperCase(VarName)) < 0 then
     Result := ''
   else
@@ -27828,11 +27839,23 @@ begin
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
         if FindUDT(TName) >= 0 then
-        begin
-          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          Into.Add(VName + '|' + TName);
-        end;
+          Into.Add(VName + '|' + TName)
+        // ⛔ ...AND A LOCAL THAT IS **NOT** A RECORD HAS TO SCREEN ONE. The list above is filled only
+        // for a UDT, so a local "Dim As Integer stp" never shadowed the bare-name record map - and a
+        // parameter "ByRef stp As foo" declared in ANOTHER procedure of the same file made that local
+        // a record, so "stp = 1" ran that type's Operator Let on a handle that does not exist: an
+        // access violation inside an operator the failing procedure never mentions. The module-level
+        // half of exactly this was closed on 26 Aug (m597); this is the per-procedure half.
+        // ⚠️ It cannot go in the list above: that one also drives EmitFrameDestructors, and a
+        // destructor call on an Integer is the next defect along.
+        // ⛔ ...EXCEPT BIGINT, which is a HANDLE type exactly like a UDT and deliberately answers < 0
+        // to FindUDT (it is not a user type). RegisterTypedVar has that same arm and says so; screening
+        // a "Dim b As BigInt" here took its record-ness away and four corpus programs went red at once.
+        else if (FCurrentProcNonRecs <> nil) and (TName <> 'BIGINT') and
+                (FCurrentProcNonRecs.IndexOf(VName) < 0) then
+          FCurrentProcNonRecs.Add(VName);
       end;
     end;
   // Only the transparent wrappers are followed. Everything else (antIf / antBlock / antDoLoop / ...) is a
@@ -27868,11 +27891,20 @@ begin
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
         if FindUDT(TName) >= 0 then
-        begin
-          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          FCurrentProcLocalRecs.Add(VName + '|' + TName);
-        end;
+          FCurrentProcLocalRecs.Add(VName + '|' + TName)
+        // ⛔ ...AND A LOCAL THAT IS **NOT** A RECORD HAS TO SCREEN ONE. The list above is filled only
+        // for a UDT, so a local "Dim As Integer stp" never shadowed the bare-name record map - and a
+        // parameter "ByRef stp As foo" declared in ANOTHER procedure of the same file made that local
+        // a record: printing it dereferenced the integer 1 as a handle and the program died on an
+        // access violation, with no UDT anywhere near the line that failed. The module-level half of
+        // exactly this was closed on 26 Aug (m597); this is the per-procedure half.
+        // ⚠️ It cannot go in the list above: that one also drives EmitFrameDestructors, and a
+        // destructor call on an Integer is the next defect along.
+        else if (FCurrentProcNonRecs <> nil) and (TName <> 'BIGINT') and
+                (FCurrentProcNonRecs.IndexOf(VName) < 0) then
+          FCurrentProcNonRecs.Add(VName);
       end;
     end;
   for c := 0 to Node.ChildCount - 1 do
@@ -35094,6 +35126,7 @@ begin
     FResultExits := 0;
     FResultExitsStaged := 0;
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
+    FCurrentProcNonRecs.Clear;                            // ...and the non-record locals that SCREEN one
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
     FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
@@ -35391,6 +35424,7 @@ begin
     FCurrentProcRetRecType := '';
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FCurrentProcLocalRecs.Clear;
+    FCurrentProcNonRecs.Clear;
     // SSAPROF
     {$IFDEF DEBUG_SSAPROF}
     if GetEnvironmentVariable('SSA_PROF') <> '' then

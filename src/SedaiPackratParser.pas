@@ -416,9 +416,17 @@ uses
 // The MODERN extensions that FreeBASIC does NOT reserve: a program may use any of them as the name
 // of its own procedure, and then that name is the program's, not ours.
 function IsShadowableExtensionName(const NameU: string): Boolean;
+// ⭐ ...AND "VAL" IS A LIBRARY FUNCTION, NOT A KEYWORD. fbc accepts "Sub val()" and calls it; we
+// refused the declaration outright. ⚠️ The WIDTH of this was MEASURED rather than assumed: over the
+// 1131 distinct TEST(...) names and the 1187 Sub/Function/TEST_GROUP names of the whole fbc suite,
+// VAL is the ONLY name we refuse - so this is one entry, not a campaign. It still costs a whole test
+// (functions/fixstr_arg). Everything the declaration needs is already in place: SedaiSSA consults
+// FProcedureNames BEFORE the intrinsic chain, so a program that declares one wins at every call site
+// and every program that does not keeps the intrinsic.
 begin
   Result := (NameU = 'MIN') or (NameU = 'MAX') or (NameU = 'CEIL') or (NameU = 'ROUND') or
-            (NameU = 'COPYSIGN') or (NameU = 'SINGLEBITS') or (NameU = 'BITSTOSINGLE');
+            (NameU = 'COPYSIGN') or (NameU = 'SINGLEBITS') or (NameU = 'BITSTOSINGLE') or
+            (NameU = 'VAL');
 end;
 
 { TPackratParser }
@@ -1589,6 +1597,13 @@ begin
                                                 ttSystemFunction, ttInputFunction, ttUsrFunction,
                                                 ttErrorHandlingFunction, ttOutputFunction,
                                                 ttGraphicsFunction, ttSpriteFunction, ttSoundFunction,
+                                                // ...or an anonymous TEMPORARY: "proc1 type<Integer>3, 3"
+                                                // begins its first argument with the word TYPE, which is
+                                                // as much a value token as a function name is. Without it
+                                                // the statement fell to "Expected "=" in assignment",
+                                                // naming the token that IS there rather than the one
+                                                // that is not.
+                                                ttTypeDecl,
                                                 // ...or with its PASSING MODE written on it:
                                                 // "test_const ByVal 1234" is FreeBASIC's per-argument
                                                 // override, and it can only be a bare call - an

@@ -1449,14 +1449,22 @@ begin
 
   Result := TASTNode.CreateWithValue(antGraphicsFunction, Token.Value, Token);
 
-  // Consume opening parenthesis
-  if not Context.Match(ttDelimParOpen) then
+  // ⛔ THE PARENTHESES ARE OPTIONAL, as they are on every other statement of this family. FreeBASIC
+  // writes "GetMouse x, y" as readily as "GetMouse( x, y )" - the call is made for its BY-REFERENCE
+  // writes and the status is discarded - and SETMOUSE has accepted the bare form all along. Demanding
+  // "(" here made the whole statement a syntax error. Without them the argument list simply runs to
+  // the end of the statement, which is what ParseArgumentList already stops at.
+  if not Context.Check(ttDelimParOpen) then
   begin
-    HandleError('Expected "(" after graphics function', Context.CurrentToken);
-    Result.Free;
-    Result := nil;
+    if not (Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt) or Context.IsAtEnd) then
+    begin
+      Args := ParseArgumentList;
+      if Assigned(Args) then Result.AddChild(Args);
+    end;
+    DoNodeCreated(Result);
     Exit;
   end;
+  Context.Advance;                                  // '('
 
   // Parse arguments if any
   if not Context.Check(ttDelimParClose) then
@@ -1738,6 +1746,11 @@ begin
     Param.Free; Exit;
   end;
   LenExpr := nil;
+  // ⛔ ...AND THE COMMA BEFORE IT HAS TO BE STEPPED OVER, like every other clause's. Five of the six
+  // optional clauses of this function form call SkipClauseComma; LEN was the one that did not, so
+  // "Open( f, For Random, As #1, Len = 8 )" stopped at the comma and the whole call failed to parse.
+  // The STATEMENT form reads the same clause correctly, which is what said it was this reader.
+  SkipClauseComma;
   if AtWord(kLEN) then                              // optional "LEN = reclen" (RANDOM)
   begin
     Context.Advance;

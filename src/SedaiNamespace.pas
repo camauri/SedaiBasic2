@@ -315,6 +315,56 @@ begin
       if Ctx.IsMember(Using[u], V) then Exit(Using[u] + '.' + V);
 end;
 
+// Re-resolve the TYPE NAMES carried in an overload signature's tail against the enclosing namespace
+// and the USING imports. The tail is everything after the first ':' of a "~<banks><widths>:<names>"
+// decoration; the names are COMMA-SEPARATED and POSITIONAL, with '-' where a parameter contributes no
+// type name, so splitting on the commas and rebuilding is exact.
+//
+// ⛔ WHY IT HAS TO HAPPEN HERE. ProcSigFromParams writes that tail while the file is being PARSED,
+// long before a namespace exists, so it holds the source's LITERAL spelling. This pass is where the
+// active prefix and the imports are known, and it is the last place the name is still a string that
+// anyone rewrites. ⭐ ResolveUnqualified answers '' for a name it does not own, so a builtin, a
+// pointer spelling, a placeholder and a type declared OUTSIDE the namespace are all left untouched -
+// which is what keeps a program whose overloads take no UDT byte-identical.
+function ResolveSigTypeNames(const Sig, ActivePrefix: string; Ctx: TNsContext;
+                             Using: TStringList): string;
+var
+  ColonPos, i: Integer;
+  Head, Tail, Part, Res, Acc: string;
+  Parts: TStringList;
+begin
+  Result := Sig;
+  ColonPos := Pos(':', Sig);
+  if ColonPos = 0 then Exit;
+  Head := Copy(Sig, 1, ColonPos);
+  Tail := Copy(Sig, ColonPos + 1, MaxInt);
+  if Tail = '' then Exit;
+  Parts := TStringList.Create;
+  try
+    Parts.StrictDelimiter := True;
+    Parts.Delimiter := ',';
+    Parts.DelimitedText := Tail;
+    Acc := '';
+    for i := 0 to Parts.Count - 1 do
+    begin
+      Part := UpperCase(Trim(Parts[i]));
+      // '-' is the placeholder for a parameter with no type name; a dotted name is already qualified;
+      // a pointer spelling ("T PTR") is left whole, since the tail records it as one token and the
+      // call side spells it the same way.
+      if (Part <> '') and (Part <> '-') and (Pos('.', Part) = 0) and (Pos(' ', Part) = 0) then
+      begin
+        Res := ResolveUnqualified(ActivePrefix, Part, Ctx, Using);
+        if Res <> '' then Part := Res;
+      end;
+      if Acc <> '' then Acc := Acc + ',';
+      Acc := Acc + Part;
+    end;
+    Result := Head + Acc;
+  finally
+    Parts.Free;
+  end;
+end;
+
 function FlattenDottedName(Node: TASTNode): string;
 // Render a member-access chain "A.B.C" as the dotted string a namespace prefix is spelled with, or ''
 // when the chain is not made of plain names. Used to read "Using Outer.Inner".
@@ -588,6 +638,19 @@ begin
     begin
       BaseV := Copy(V, 1, SigPos - 1);
       SigV := Copy(V, SigPos, MaxInt);
+      // ⛔⛔ ...AND THE TYPE NAMES INSIDE THAT SIGNATURE ARE NOT DEAD TEXT. The tail after ':' is the
+      // list of the parameters' TYPE names, written by ProcSigFromParams while the file is being
+      // PARSED - long before a namespace exists - so it holds the LITERAL spelling of the source. The
+      // base was resolved here and the tail was copied back verbatim, which is why a declaration
+      // inside a namespace kept "~I:T1" while the CALL side, built after flattening, asked for
+      // "~I:FOO.T1". The two then named different things, and ResolveCallLabel does NOT raise when no
+      // tail matches: it falls back to ARITY and takes the first candidate of the right count, so two
+      // overloads on two imported types both ran the FIRST one - a wrong answer, silently.
+      // ⭐ Resolved with ResolveUnqualified, the very function that already resolves ordinary
+      // identifiers here: it answers '' for anything it does not own, so a type declared OUTSIDE the
+      // namespace (and every builtin, and every '-' placeholder) is left exactly as it was. The tail
+      // is comma-separated and positional, so splitting and rebuilding it is exact.
+      SigV := ResolveSigTypeNames(SigV, ActivePrefix, Ctx, Using);
     end
     else
     begin

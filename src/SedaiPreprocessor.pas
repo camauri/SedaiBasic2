@@ -1175,6 +1175,25 @@ begin
   Rest := Trim(Copy(s, p, MaxInt));
 end;
 
+function PPMacroHeaderComplete(const S: string): Boolean;
+// True when S is a "#macro" directive whose parameter list is already finished: either it has a
+// balanced "( ... )", or it has no '(' at all (a parameterless macro). Only then does a trailing '_'
+// stop meaning "the header goes on" - see the note at the join.
+var
+  i, Depth: Integer;
+  DName, DRest: string;
+  SawOpen: Boolean;
+begin
+  Result := False;
+  SplitDirective(TrimRight(S), DName, DRest);
+  if DName <> 'macro' then Exit;
+  Depth := 0; SawOpen := False;
+  for i := 1 to Length(DRest) do
+    if DRest[i] = '(' then begin Inc(Depth); SawOpen := True; end
+    else if DRest[i] = ')' then Dec(Depth);
+  Result := (not SawOpen) or (SawOpen and (Depth <= 0));
+end;
+
 var
   // The full source text of the module being preprocessed, for SourceDeclaresSymbol below.
   // Set by PreprocessSource before Expand; the preprocessor is single-threaded by design.
@@ -2225,7 +2244,13 @@ var
         // "PRINT# error 64 writing to file: 0", a complaint about a file handle for a line nobody
         // wrote. Every line swallowed here leaves a blank behind, exactly as #macro does, so the line
         // numbers the rest of the pipeline reports stay the source's own.
+        // ⛔ ...BUT A #macro WHOSE PARAMETER LIST IS ALREADY CLOSED DOES NOT CONTINUE. The '_' there
+        // continues the HEADER while the header is still being written - that is how a long parameter
+        // list is split - and fbc stops honouring it once the ')' has been seen: "#macro M(x) _"
+        // followed by two body lines runs BOTH of them. Joined generically, the first body line was
+        // swallowed into the header and lost, so the macro ran one statement short and said nothing.
         while (Length(Trimmed) > 0) and (Trimmed[1] = '#') and PPDirectiveContinues(Trimmed) and
+              (not PPMacroHeaderComplete(Trimmed)) and
               (li + 1 < Lines.Count) do
         begin
           Trimmed := TrimRight(StripDirectiveComment(Trimmed));
@@ -2412,10 +2437,18 @@ var
                 SplitDirective(BodyTrim, EName, ERest);
                 if EName = 'endmacro' then begin Output.Add(''); Break; end;
               end;
-              if Trim(Lines[li]) <> '' then
+              // ⛔ A COMMENT IN A #macro BODY IS STILL A COMMENT. The #define path strips one from the
+              // value it stores (StripDirectiveComment, twice, a hundred lines up); the #macro path
+              // never did, so the comment text was carried into the body and re-emitted at every
+              // expansion site - and a multi-line macro whose body is a single comment, expanded
+              // inside a one-line "If ... Then", left that comment where a statement had to be:
+              // "Parsing failed". ⭐ The discriminator is exact: a body that is genuinely EMPTY works,
+              // and the same file with one comment in it does not.
+              BodyTrim := Trim(StripDirectiveComment(Lines[li]));
+              if BodyTrim <> '' then
               begin
                 if MacroBody <> '' then MacroBody := MacroBody + cVirtualEOL;
-                MacroBody := MacroBody + Trim(Lines[li]);
+                MacroBody := MacroBody + BodyTrim;
               end;
               Output.Add('');   // blank placeholder preserves line numbers
               Inc(li);
