@@ -565,6 +565,7 @@ begin
     // === GROUP 1: String operations ===
     bcStrLen,      // String length returns int
     bcStrLenW,     // LEN(wstring) returns int codepoint count
+    bcStrAscW,     // ASC(wstring) returns the int codepoint
     bcStrSAdd,     // SADD(s) returns int (raw pointer)
     bcFileExists,  // FILEEXISTS(path) returns int (-1/0)
     bcFileLen,     // FILELEN(path) returns int (size in bytes)
@@ -907,7 +908,7 @@ begin
     // String comparison (first operand)
     bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
     // === GROUP 1: String operations ===
-    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrAscMid, bcStrSAdd,
+    bcStrConcat, bcStrLeft, bcStrRight, bcStrMid, bcStrLen, bcStrLenW, bcStrAsc, bcStrAscW, bcStrAscMid, bcStrSAdd,
     bcStrConcatCharAt,  // "acc + tab[k]" fused: Src1 = the accumulator
     bcStrAppendMapped,  // "acc += tab[Asc(s[i])+1]" fused: Src1 = the SOURCE string
     bcStrMidAssign,     // "Mid(t,start)=src": Src1 = the incoming t

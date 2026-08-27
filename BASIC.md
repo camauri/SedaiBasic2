@@ -251,12 +251,6 @@ difference is stated rather than left to be discovered.
   `open`, `get`, `put`, `print` and `input` are refused by fbc too (in its own words, "Duplicated
   definition"), and `list`, `save`, `verify`, `sys`, `cont` and `clr` are accepted by both. `Load` is
   the only one that is ours alone.
-- ⚠️ **`Asc(w, i)` and `w[i]` on a `WSTRING` answer the UTF-8 BYTE, not the codepoint.** A WSTRING is
-  stored here as UTF-8, and the wide family that counts codepoints is complete and correct everywhere
-  else — `Len`, `Left`, `Right`, `Mid`, `Instr`, `InstrRev` all have wide twins, and `LSet`/`RSet` use
-  them — but `Asc` and indexed reads go through `ssaStrMid` + `ssaStrAsc`, which take the first byte.
-  On `!"\u3041Z\u3045"` fbc answers `12353 90 12357` and we answer `227 129 129`. Closing it needs a
-  new opcode, not a branch.
 - ⚠️ **`LSet` / `RSet` on a string-convertible UDT is accepted in one case fbc rejects.** fbc requires
   both an `Extends ZString`/`WString` chain *and* an `Operator Cast() ByRef As Z/WString` declared on
   the type itself; we require the chain and a cast that merely *resolves*, which an ancestor may

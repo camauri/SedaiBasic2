@@ -304,6 +304,8 @@ begin
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrConcat', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcStrLen:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrLen', Instr.Dest, Instr.Src1]);
+    bcStrAscW:
+      Result := Format('AscW R%d, S%d', [Instr.Dest, Instr.Src1]);
     bcStrLenW:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrLenW', Instr.Dest, Instr.Src1]);
     bcStrLeft:

@@ -4603,6 +4603,15 @@ begin
         begin
           // FreeBASIC ASC(str [, pos]) - the code of the char at 1-based position pos (default 1). With a
           // position, take MID(str, pos, 1) first; then ASC of that single character.
+          // ⭐ FOR A WSTRING BOTH HALVES COUNT CODEPOINTS, and the answer IS a codepoint. WSTRING is
+          // stored as UTF-8, so ssaStrMid took a BYTE and ssaStrAsc reported that byte: on
+          // !"\u3041Z\u3045" fbc answers 12353 90 12357 and we answered 227 129 129 - the lead bytes.
+          // The wide family already had Mid; Asc is the twin that was missing (bcStrAscW).
+          IsAny := False;
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            IsAny := IsWStringExpr(ArgListNode.GetChild(0))
+          else if ArgListNode <> nil then
+            IsAny := IsWStringExpr(ArgListNode);
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
             ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue);  // str (raw buffer if fixed-length)
@@ -4612,7 +4621,10 @@ begin
             Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaLoadConstInt, Arg3Reg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone)); // length 1
             TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-            EmitInstruction(ssaStrMid, TempVal, ArgReg, Arg2Reg, Arg3Reg);   // MID(str, pos, 1)
+            if IsAny then
+              EmitInstruction(ssaStrMidW, TempVal, ArgReg, Arg2Reg, Arg3Reg)   // MID(wstr, pos, 1) by codepoint
+            else
+              EmitInstruction(ssaStrMid, TempVal, ArgReg, Arg2Reg, Arg3Reg);   // MID(str, pos, 1)
             ArgReg := EnsureStringRegister(TempVal);
           end
           else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -4628,7 +4640,10 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          EmitInstruction(ssaStrAsc, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          if IsAny then
+            EmitInstruction(ssaStrAscW, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaStrAsc, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'CHR$') then
         begin
@@ -12705,6 +12720,7 @@ var
   SVal, IdxVal, SReg, IdxReg, OneReg, StartReg, LenReg, MidReg: TSSAValue;
   NoneV, BufAddr2, ByteAddr2: TSSAValue;
   ElemBytes: Integer;
+  WideIdx: Boolean;      // a WSTRING is indexed by CODEPOINT, and the element IS a codepoint
 begin
   NoneV := MakeSSAValue(svkNone);
   // The mirror of the write: a raw-backed buffer is READ from the byte heap. Without it the read
@@ -12732,6 +12748,9 @@ begin
       EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
     Exit;
   end;
+  // ⭐ A WSTRING IS INDEXED BY CODEPOINT and each element IS a codepoint - the same rule ASC follows,
+  // and the same reason: the storage is UTF-8, so the byte-based pair answered the lead byte.
+  WideIdx := IsWStringExpr(SNode);
   ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
   ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
   OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -12741,9 +12760,15 @@ begin
   LenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, LenReg, MakeSSAConstInt(1), NoneV, NoneV);
   MidReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrMid, MidReg, SReg, StartReg, LenReg);          // MID$(s, i+1, 1)
+  if WideIdx then
+    EmitInstruction(ssaStrMidW, MidReg, SReg, StartReg, LenReg)        // MID$(w, i+1, 1) by codepoint
+  else
+    EmitInstruction(ssaStrMid, MidReg, SReg, StartReg, LenReg);        // MID$(s, i+1, 1)
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaStrAsc, Result, MidReg, NoneV, NoneV);            // ASC(...)
+  if WideIdx then
+    EmitInstruction(ssaStrAscW, Result, MidReg, NoneV, NoneV)          // ASC(...) as a codepoint
+  else
+    EmitInstruction(ssaStrAsc, Result, MidReg, NoneV, NoneV);          // ASC(...)
 end;
 
 function TSSAGenerator.DerefedZStringIndexBase(BaseNode: TASTNode): string;

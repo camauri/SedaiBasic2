@@ -6780,7 +6780,7 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists, bcFileLen:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrAscW, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists, bcFileLen:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -12061,6 +12061,28 @@ begin
               Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
 end;
 
+// Decode the FIRST codepoint of a UTF-8 string (FreeBASIC ASC on a WSTRING); 0 for an empty string.
+// The mirror of Utf8EncodeCP, and the reason bcStrAsc cannot answer for a wide string: that one takes
+// the first BYTE, which for anything above U+007F is only the lead byte of the sequence.
+function Utf8FirstCP(const S: string): Integer;
+var
+  b, n, i, need: Integer;
+begin
+  if S = '' then Exit(0);
+  b := Ord(S[1]);
+  if b < $80 then Exit(b);
+  if (b and $E0) = $C0 then begin Result := b and $1F; need := 1; end
+  else if (b and $F0) = $E0 then begin Result := b and $0F; need := 2; end
+  else if (b and $F8) = $F0 then begin Result := b and $07; need := 3; end
+  else Exit(b);                                  // a stray continuation byte: report it as it stands
+  n := Length(S);
+  for i := 2 to need + 1 do
+  begin
+    if (i > n) or ((Ord(S[i]) and $C0) <> $80) then Exit(b);   // truncated: the lead byte, as bcStrAsc
+    Result := (Result shl 6) or (Ord(S[i]) and $3F);
+  end;
+end;
+
 // Map a 1-based BYTE position in a UTF-8 string to a 1-based CODEPOINT position (0 stays 0 = not found).
 function Utf8BytePosToCP(const S: string; BytePos: Integer): Integer;
 var
@@ -12119,6 +12141,8 @@ begin
         Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
     1: // bcStrLen
       Ctx.IntRegs[Instr.Dest] := Length(Ctx.StringRegs[Instr.Src1]);
+    52: // bcStrAscW - ASC(wstring): the Unicode CODEPOINT of the first character.
+      Ctx.IntRegs[Instr.Dest] := Utf8FirstCP(Ctx.StringRegs[Instr.Src1]);
     25: // bcStrLenW - LEN(wstring): Unicode codepoint count of the UTF-8 byte storage.
       Ctx.IntRegs[Instr.Dest] := Utf8CPCount(Ctx.StringRegs[Instr.Src1]);
     26: // bcStrLeftW - LEFT$(wstring, n): first n codepoints.

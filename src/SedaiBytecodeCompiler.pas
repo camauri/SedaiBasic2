@@ -175,6 +175,7 @@ begin
     ssaStrConcat: Result := bcStrConcat;
     ssaStrLen: Result := bcStrLen;
     ssaStrLenW: Result := bcStrLenW;
+    ssaStrAscW: Result := bcStrAscW;
     ssaStrLeftW: Result := bcStrLeftW;
     ssaStrRightW: Result := bcStrRightW;
     ssaStrMidW: Result := bcStrMidW;
