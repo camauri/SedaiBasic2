@@ -256,7 +256,7 @@ var
   FirstB, LastB, b, j, i: Integer;
   rt: TSSARegisterType;
   CallBlk, ContBlk, ProcEntry, Anchor, NewBlk, OrigBlk, SuccBlk: TSSABasicBlock;
-  LabelMap: TStringList;             // origLabel=newLabel per cloned block
+  LabelMap: TStringList;             // origLabel<sep>newLabel per cloned block (see the note at Create)
   // Callee blocks captured as OBJECTS before any insertion: CreateBlockBefore
   // shifts every index at or after the insertion point, so [FirstB..LastB]
   // stops being valid the moment the first clone lands.
@@ -301,12 +301,20 @@ begin
     Origs[b - FirstB] := FProgram.Blocks[b];
 
   LabelMap := TStringList.Create;
+  // ⛔⛔ A LABEL CAN CONTAIN '=', AND THIS LIST IS A name=value ONE. A self-operator's procedure label
+  // IS "PROC_T.OPERATOR+=", so "LabelMap.Values[ProcLabel]" looked for the name "PROC_T.OPERATOR+" and
+  // answered '' - the call was then rewritten to a jump to NO label, which the emitter resolved to -1
+  // and the program spun forever on "Jump -1". It bit exactly the operators whose body has no RECORD
+  // instruction (Inlinable refuses the rest), so "Operator T.+=" that touched This worked and one that
+  // only printed hung: the tell that the defect was in the INLINER and not in the operator.
+  // A block label cannot contain #1, so the separator is moved out of the alphabet the keys use.
+  LabelMap.NameValueSeparator := #1;
   try
     // Fresh labels for every cloned block ('inl' prefix: must NOT look like PROC_).
     for b := 0 to High(Origs) do
     begin
       NewLabel := Format('inl%d_%s', [si, Origs[b].LabelName]);
-      LabelMap.Add(Origs[b].LabelName + '=' + NewLabel);
+      LabelMap.Add(Origs[b].LabelName + LabelMap.NameValueSeparator + NewLabel);
     end;
     // Clone blocks in order, inserted contiguously before the anchor so the
     // callee's internal fall-throughs keep their relative emission order.

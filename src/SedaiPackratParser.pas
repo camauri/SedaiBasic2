@@ -4017,7 +4017,7 @@ procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAcce
 //   ABSTRACT<NAME> on the antTypeDecl -> the type declares NAME with no body of its own.
 //   FTypeStaticMethods "TYPE.NAME"    -> NAME is a static member (no implicit THIS).
 var
-  DecoU, MethName, Key: string;
+  DecoU, MethName, MethKey, Key: string;
   IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
@@ -4128,17 +4128,21 @@ begin
   end;
   if MethName <> '' then
   begin
+    // ⛔ Every decorator of a member is filed under the SAME key ACCESS uses, and for the same reason:
+    // an OPERATOR's name can carry a '=' that the name=value store would tear the key in half on, and a
+    // bank sigil / arity code the SSA composes and the parser cannot. One spelling, one function.
+    MethKey := MemberDecoratorKey(MethName);
     if IsAbstract and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['ABSTRACT' + MethName] := '1';
+      TypeNode.Attributes.Values['ABSTRACT' + MethKey] := '1';
     // ABSTRACT implies VIRTUAL: the only implementations an abstract method can ever have are the
     // overrides, so a call on it must dispatch. fbc requires the word on the base declaration only;
     // an override may repeat it or not, and either way the method stays virtual from there down.
     if (IsVirtual or IsAbstract) and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['VIRTUAL' + MethName] := '1';
+      TypeNode.Attributes.Values['VIRTUAL' + MethKey] := '1';
     if IsOverride and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['OVERRIDE' + MethName] := '1';
+      TypeNode.Attributes.Values['OVERRIDE' + MethKey] := '1';
     if IsFinal and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['FINAL' + MethName] := '1';
+      TypeNode.Attributes.Values['FINAL' + MethKey] := '1';
     if Assigned(TypeNode) then StampMemberAccess(TypeNode, MethName, CurAccess);
     // ⛔ PUBLIC ONLY, and that too is measured. A module constructor runs before the program does, so
     // fbc refuses to let a PRIVATE or PROTECTED member be one - "visibility/{private,protected}-module-
