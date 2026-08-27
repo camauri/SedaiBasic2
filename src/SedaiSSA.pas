@@ -223,6 +223,7 @@ type
     // the one name that legitimately owns the bare-name entry in FVarExplicitType -- apart from a
     // procedure-local one. See RegisterTypedVar.
     FPreScanInProc: Boolean;
+    FPreScanProcName: string;            // ...and WHICH procedure, so a declared bank can be keyed by scope
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
     // The default-initialisation of the scalar result slot, emitted at the top of every FUNCTION
@@ -428,7 +429,7 @@ type
     procedure CollectProcedureDecl(Node: TASTNode);
     procedure ProcessProcedureCall(Node: TASTNode);
     // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
-    procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+    procedure EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
     function TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode; out Val: TSSAValue): Boolean;
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode);   // raw-ness crosses the call here
@@ -716,6 +717,7 @@ type
     function UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;  // B1.5: field narrow width
     function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
     function TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean; out Size: Int64): Boolean;
+    function TypeNameIsKnownBank(const TypeName: string): Boolean;   // ...does it resolve WITHOUT the suffix fallback?
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
@@ -1496,6 +1498,13 @@ begin
   // int handles; builtin-typed vars use their declared bank).
   if Assigned(FVarExplicitType) then
   begin
+    // THIS procedure's own declaration of the name first - see the note in RegisterTypedVar. A name
+    // the procedure declares itself is never the module's, and never another procedure's.
+    if FCurrentProcName <> '' then
+    begin
+      Idx := FVarExplicitType.IndexOf(FCurrentProcName + '|' + UpperCase(VarName));
+      if Idx >= 0 then Exit(TSSARegisterType(PtrInt(FVarExplicitType.Objects[Idx])));
+    end;
     Idx := FVarExplicitType.IndexOf(UpperCase(VarName));
     // ...unless the only declaration is a plain module DIM and we are inside a procedure that does not
     // declare this name itself. That declaration is invisible here (FreeBASIC scope), so its TYPE is too.
@@ -23974,6 +23983,28 @@ begin
   end;
 end;
 
+function TSSAGenerator.TypeNameIsKnownBank(const TypeName: string): Boolean;
+// Does this declared type name resolve to a bank on its OWN, without falling back to the name-suffix
+// default? The question TypeNameToBank cannot answer, because it always answers something.
+var
+  T: string;
+begin
+  T := UpperCase(TypeName);
+  if T = '' then Exit(False);
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(True);
+  T := CanonicalType(T);
+  Result := (T = kCVALIST) or
+            (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
+            (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+            (T = 'INT32') or (T = 'UINT32') or
+            (T = 'SINGLE') or (T = 'DOUBLE') or
+            (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') or
+            (T = 'BIGINT') or
+            ((FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0)) or
+            (FindUDT(T) >= 0);
+end;
+
 function TSSAGenerator.TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
 // Map a declared field/var type name to a register bank. Empty type => infer by name suffix.
 var
@@ -26442,6 +26473,7 @@ var
   Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand: TASTNode;
   VarName, TypeName, NestedTypeName: string;
   SavedInProc: Boolean;
+  SavedProcName: string;
 begin
   if Node = nil then Exit;
   // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
@@ -26694,7 +26726,10 @@ begin
     // belongs to a PROCEDURE, not to the module, and so must not seize the bare-name bank entry of a
     // module variable that merely shares its name (see RegisterTypedVar).
     SavedInProc := FPreScanInProc;
+    SavedProcName := FPreScanProcName;
     FPreScanInProc := True;
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      FPreScanProcName := UpperCase(VarToStr(Node.GetChild(0).Value));
     // FUNCTION return type (M3.2): the name node (child 0) may carry a type child
     // ("FUNCTION f(...) AS rettype") — type the function name so its result slot is correct.
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
@@ -26789,6 +26824,7 @@ begin
     for i := 0 to Node.ChildCount - 1 do
       RegisterRecordVars(Node.GetChild(i));
     FPreScanInProc := SavedInProc;
+    FPreScanProcName := SavedProcName;
     Exit;
   end;
   for i := 0 to Node.ChildCount - 1 do
@@ -26865,6 +26901,27 @@ begin
     FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))))
   else if not FPreScanInProc then
     FVarExplicitType.Objects[Idx] := TObject(PtrInt(Ord(Bank)));
+  // ⛔ ...AND THE PROCEDURE-AGAINST-PROCEDURE CASE, which the note above does not cover. The bare-name
+  // entry is add-if-absent inside a procedure, so the FIRST procedure in the file that declares a name
+  // owns its bank for EVERY procedure: "Sub g(ByVal s As Integer)" written above "Sub t() : Dim s As
+  // ZString * 16" made t's s an INT, and "s[0] = 65" - whose lowering asks this very map whether s is
+  // a string - fell onto the array ladder as "Array not declared: S". It depended on the ORDER of two
+  // unrelated procedures. A SCOPED entry is written beside the bare one, never instead of it, so
+  // module level and every lookup with no procedure context read exactly as before.
+  // ⛔ ...AND ONLY WHEN THE TYPE IS ONE WE ACTUALLY KNOW. TypeNameToBank ANSWERS FOR EVERYTHING: an
+  // unknown name falls back to the name-suffix default, which for a bare name is FLOAT. Writing that
+  // guess as a SCOPED entry makes it authoritative inside the procedure and it then beats a
+  // better-informed bare entry - the manual's defines/fbquerysymbol2 has a parameter declared
+  // "As fbc.FB_DATACLASS", a dotted enum this map does not resolve, and every call came back
+  // "integer" because the parameter had been banked float. A registry must decline, not guess.
+  if FPreScanInProc and (FPreScanProcName <> '') and TypeNameIsKnownBank(TypeName) then
+  begin
+    Idx := FVarExplicitType.IndexOf(FPreScanProcName + '|' + VarName);
+    if Idx < 0 then
+      FVarExplicitType.AddObject(FPreScanProcName + '|' + VarName, TObject(PtrInt(Ord(Bank))))
+    else
+      FVarExplicitType.Objects[Idx] := TObject(PtrInt(Ord(Bank)));
+  end;
   // A declaration made at MODULE level is remembered as such. FreeBASIC hides a plain module DIM from
   // every procedure - resolution already stops at the procedure root for a non-shared name, which is why
   // the VALUE is right - but its declared TYPE lived in this map, keyed by bare name, and leaked in
@@ -35587,9 +35644,24 @@ begin
   if not FInDispatcher then EmitSharedSyncIn;
 end;
 
-procedure TSSAGenerator.EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+procedure TSSAGenerator.EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
 // Static call: stage args then ssaCallSub to the named procedure.
+//
+// ⛔ AN OVERLOADED NAME HAS NO BARE LABEL - the parser gives every member of the set a "~<sig>"
+// suffix - so the label has to be RESOLVED here, exactly as the expression form and the method form
+// already do. This one did not, and it showed the day two procedures came to share a name WITHOUT
+// the program overloading anything: two namespaces each declaring "Sub f()" are decorated as one
+// overload set at PARSE time, long before the namespace pass gives them different names, so the
+// STATEMENT call "f" asked for "N1.F" while the definition was "N1.F~". "Undefined procedure: N1.F",
+// and with a MODULE-level f beside them the GLOBAL call died too. ⭐ ResolveCallLabel answers the
+// name itself when it is not overloaded, so a program with no overload set is untouched.
+var
+  Name: string;
+  Resolved: string;
 begin
+  Name := Name0;
+  Resolved := ResolveCallLabel(Name, ArgListNode);
+  if Resolved <> '' then Name := Resolved;
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
   StageCallArgs(Name, ArgListNode);
