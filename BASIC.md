@@ -10,13 +10,22 @@
 
 **FreeBASIC compatibility — 566 / 645 of FreeBASIC's keywords (88%)**. ⚠️ Read this as a
 *compatibility measure*, not a completion score: MODERN is SedaiBasic's own dialect, and this number
-says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists. **69** of the unimplemented
-entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
-build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
-`Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
-bytecode VM. Of the
-**576 applicable** keywords, **563 (98%)** are implemented, and **5** are partial. See the
-[FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
+says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists. **58** of the
+unimplemented entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C
+calling, dynamic linking, build/platform directives) — not runnable keywords for a portable bytecode
+VM, and every one of them is a property of the TARGET, not a decision about a feature. Of the
+**587 applicable** keywords, **17** are still ✗ and **6** are partial (◐).
+
+> ⛔⛔ **N/A IS THE EASIEST SHELF TO PUT SOMETHING ON, AND IT REMOVES IT FROM THE DENOMINATOR.** Three
+> rows sat there — `New Overload`, `Delete Overload`, `Placement New` — behind one sentence: "records
+> live in the VM's managed table, not at raw addresses". On 28 Aug 2026 a measurement disproved it (a
+> `T Ptr` does keep a raw address, and the type can own its allocator), the first two were implemented
+> and the third turned out to compile and run all along. A row marked N/A is a *decision*, and a
+> decision written as a fact stops being re-examined — which is precisely what a percentage that
+> excludes it will never tell you. When a section here says 100%, read the denominator first.
+
+See the [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for
+the full breakdown.
 
 > ⚠️ **This table is a hand-kept census and it drifts — in both directions.** Four ticks were withdrawn
 > on 5 Aug 2026 (`DRAW STRING`, `OPEN PIPE`, `OPEN COM`, `OPEN LPT`) after the FreeBASIC-examples sweep
@@ -1654,7 +1663,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 > matters because it means unmodified FreeBASIC programs run here. A -- below means "FreeBASIC code
 > using this will not run", not "SedaiBasic is missing something it owes anyone" -- and several
 > entries are marked N/A precisely because they are artefacts of being a native compiler rather than
-> features a language needs. It catalogues the **complete FreeBASIC keyword
+> features a language needs.
+> ⛔ **That shelf has to earn its place, every time.** Three rows on it (`New Overload`, `Delete
+> Overload`, `Placement New`) were not artefacts of the target at all: they were a design decision
+> about our own object model, written as though it were a fact about the machine, and it was wrong.
+> N/A belongs to what the TARGET cannot do, never to what we have not done. It catalogues the **complete FreeBASIC keyword
 > set**, organized exactly as in the official FreeBASIC manual
 > ([DocToc](https://www.freebasic.net/wiki/DocToc)), together with SedaiBasic's current support.
 > Sourced from the FreeBASIC wiki (Language Documentation + Runtime Library Reference), June 2026.
@@ -1986,10 +1999,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame. `NEW T[n]` allocates **n** contiguous elements and `DELETE[] p` releases them: when `T` has a constructor or a destructor each element gets its own, in element order; when it has neither the block is plain bytes, so a program may lay a byte view over it or `memcopy` it. `NEW T PTR [n]` allocates an array of POINTERS, which is how a 2-dimensional object array is built — `p[i] = NEW T[m]`, then `p[i][j].field` and `DELETE[] p[i]`. |
-| `New Overload` | N/A | A member `OPERATOR NEW` replaces the *allocation* step with user code returning a raw address. `NEW T` here yields a managed record handle — a slot in the VM's record table, not an address the program could have allocated — so a user allocator cannot be honoured. Constructor overloads do apply. |
-| `Placement New` | N/A | `NEW(address) T` constructs an object at a caller-supplied address. Records live in the VM's managed table, not at raw addresses; the all-raw object model was evaluated and rejected because it conflicts with value semantics, RAII, virtual dispatch and threading. |
+| `New Overload` | ◐ | ⛔ **This row said N/A until 28 Aug 2026, and the reason it gave was false.** It read: "`NEW T` here yields a managed record handle … so a user allocator cannot be honoured" — a DECISION written as a fact, and it kept the keyword out of the denominator. A `T Ptr` does keep a raw address and lays the type over those bytes, so the operator can own the storage, and now does: it is handed `SizeOf(T)` and the object is built on what it answers. **The real limit is narrower and was never the one written here:** an object in raw bytes cannot run a METHOD, because a method body is compiled once against record slots and its `This` is a record handle. So the operator owns the allocation where the type has nothing to run on an object, and does not where it has. |
+| `Placement New` | ◐ | `NEW(address) T` constructs an object at a caller-supplied address. It COMPILES and RUNS: the address expression is evaluated (its side effects happen) and an ordinary instance is constructed, so the program is right in everything except the object's ADDRESS. ⚠️ It was filed N/A on the strength of the same sentence `New Overload` carried, and N/A is the wrong shelf for something that compiles and runs — this is a divergence, and it is one the same missing piece would close: a method that can take a raw `This`. |
 | `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor and frees the heap record (slot recycled via a free list) |
-| `Delete Overload` | N/A | The counterpart of `New Overload`: a member `OPERATOR DELETE` replacing the *deallocation* step. `DELETE p` frees a managed record slot, so there is no allocation for user code to take over. Destructors do run. |
+| `Delete Overload` | ◐ | The counterpart of `New Overload`, and it carried the same false reason. `DELETE p` now runs the destructor and hands the operator back the SAME pointer its `New` answered — under the same gate, so the two halves of one allocation cannot disagree. |
 
 #### Iteration Operators
 
