@@ -12525,8 +12525,26 @@ begin
   // ⚠️ It also FIXES fbc fidelity at the edges, verified against the local oracle: fbc leaves the string
   // untouched for a start below 1 or past the end, while the rebuild PREPENDED there and grew the
   // string ("Mid(t,0,2) = "xy"" gave [xyBCDEFGH] against fbc's [ABCDEFGH]).
+  // ⛔ ...AND NOT A RAW-BACKED ZSTRING BUFFER EITHER, for exactly the reason the SHARED case is
+  // excluded: its value does not live in the variable's register, it lives in a byte slot the register
+  // only names. The fast path wrote into that register and nothing ever read it again, so
+  // "Clear s, 0, SizeOf(s)" - which takes the address of s and therefore makes it RAW - silently
+  // turned every later "Mid(s, i) = x" into a no-op. The general rebuild below writes back through
+  // ProcessAssignment, which has known how to reach a raw slot all along.
+  //
+  // ⚠️ ZSTRING ONLY, and that is a measured line, not a cautious one. fbc reads a "ZString * n" target
+  // at its CONTENT length (a C string ends at the NUL), which is what the general path already does;
+  // it reads a "WString * n" at its DECLARED CELL COUNT, so there "Mid(w, 3) = "XY"" on a 3-character
+  // buffer answers 4 where the content-length reading answers 3. Sending the wide form down this path
+  // too made the fbc suite's wstring/midstmt go from 12 390 failing assertions to 17 386 - writing
+  // something wrong scores worse than writing nothing - and completing it needs a read of the buffer
+  // at capacity, whose value carries embedded NULs and therefore needs the NUL cut on every read.
+  // That is DIVERGENZE 37, and it is the same job. Measured 28 Aug 2026 with an A/B knob on one binary.
   if (TargetNode.NodeType = antIdentifier) and
-     (not IsSharedScalar(VarToStr(TargetNode.Value))) then
+     (not IsSharedScalar(VarToStr(TargetNode.Value))) and
+     (IsWStringVar(VarToStr(TargetNode.Value)) or
+      ((not IsRawModuleScalar(VarToStr(TargetNode.Value))) and
+       (RawZStringBufBytes(VarToStr(TargetNode.Value)) <= 0))) then
   begin
     // ⚠️ The variable's CANONICAL register (what an ordinary scalar assignment writes), NOT the value
     // ProcessStringExpression returned: that one is a versioned USE, and emitting it as Dest gets a
