@@ -535,7 +535,8 @@ type
     procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
-    function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
+    function VarRecordTypeName(const VarName: string): string;
+    function InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;    // '' if not a record var
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
@@ -10798,7 +10799,8 @@ begin
                              // Without such a ctor the old path is still right - a plain field copy is
                              // exactly what a type that declares none should get.
                              or (ResolveConstructorLabel(RecTypeName, 'I', UpperCase(RecTypeName)) <> '')) and
-                            (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
+                            (ResolveConstructorLabel(RecTypeName, '?') <> '') and   // a 1-parameter ctor exists
+                            (not InitIsCallToKnownProc(ArrayDeclNode.GetChild(2), RecTypeName));
           // ⛔ THE HANDLE IS PUBLISHED BEFORE THE CONSTRUCTOR RUNS. An object exists at its address
           // before its constructor is called - fbc's own suite relies on it ("if @this <> @u0"), and
           // with the publish AFTER, "@u0" read an element 0 that was still 0 inside the very ctor that
@@ -10921,7 +10923,8 @@ begin
                            // Same rule as the SHARED path above: the same type still runs a COPY ctor
                            // when one is declared. ⛔ Two sites, and both have to say it.
                            or (ResolveConstructorLabel(RecTypeName, 'I', UpperCase(RecTypeName)) <> '')) and
-                          (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
+                          (ResolveConstructorLabel(RecTypeName, '?') <> '') and   // a 1-parameter ctor exists
+                            (not InitIsCallToKnownProc(ArrayDeclNode.GetChild(2), RecTypeName));
         // M4.4: run the constructor (if any). M4.4b: a "DIM v AS T(args)" attaches the ctor
         // argument list as child[2] (antArgumentList).
         if ScalarCtorInit then
@@ -27679,6 +27682,42 @@ begin
     if Result then
       Result := IsBigIntExpr(Node.GetChild(0)) or IsBigIntExpr(Node.GetChild(1));
   end;
+end;
+
+function TSSAGenerator.InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;
+// Is this initializer a call to a procedure that RETURNS THE RECORD TYPE BEING DECLARED? A call and an
+// array element are the same node at this level, so the procedure table is what separates them, and the
+// declaration node it holds is what carries the return type.
+//
+// ⛔ WHY IT IS ASKED. "Dim a As T = mk(7)", where mk RETURNS a T, was routed through T's one-argument
+// CONSTRUCTOR and handed it the returned HANDLE: a.v came out 2 and 6 - allocation indices - where fbc
+// answers 7. The plain assignment "b = mk(7)" was right all along, so only the initializer path was
+// wrong. The routing test is "is the initializer's type DIFFERENT from the declared one", and it asks
+// ObjectTypeName, which answers '' for a call - and '' compares as different. A registry that answers a
+// DEFAULT instead of "I do not know" is the whole defect: '' meant both "not a record" and "no idea".
+//
+// ⛔⛔ AND IT MUST ASK WHICH TYPE, NOT MERELY "IS IT A CALL". Excluding every call broke m627: a call
+// that returns a SCALAR is exactly what the one-argument constructor is for, and skipping it there left
+// the conversion undone. Only a call returning THIS type takes the value-copy path.
+// ⭐ The return type is read from the DECLARATION node, not from the variable registry: that registry
+// has not been written yet when a MODULE-LEVEL declaration is lowered - the writer has not run - while
+// the procedure table is filled by a pre-pass. The declared type comes in as a PARAMETER for the same
+// reason: a field set at the call site is one more ordering to get right, and the first attempt got it
+// wrong in exactly that way (the helper read an empty string and quietly did nothing).
+var
+  Nm: string;
+  Decl, NameNode: TASTNode;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 1) then Exit;
+  if (Node.GetChild(0) = nil) or (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  if not FProcDecls.TryGetValue(Nm, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 1) then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.NodeType <> antIdentifier) or (NameNode.ChildCount < 1) then Exit;
+  if NameNode.GetChild(0).NodeType <> antIdentifier then Exit;
+  Result := UpperCase(VarToStr(NameNode.GetChild(0).Value)) = UpperCase(DeclRecType);
 end;
 
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;
