@@ -2118,7 +2118,12 @@ var
   PathStr: string;       // module directory for __PATH__
   FileStr: string;       // top-level source path, in the platform's own spelling
   EscapeOn: Boolean;     // OPTION ESCAPE seen: plain "..." strings become escaped from here on
-  IncOnce: TStringList;  // full paths already spliced by an "#include Once" (that is what ONCE means)
+  IncOnce: TStringList;  // full paths ALREADY SPLICED, by any form of #include. ⛔ A PLAIN "#include"
+                         // registers the file too: fbc's own pp/inc_once1 includes a header twice
+                         // plainly and then asks for it "once", and the once is SKIPPED - "once" means
+                         // "if this file has not been included yet", not "if no earlier ONCE took it".
+  PragmaOnce: TStringList;  // full paths of files that asked for it themselves, with "#pragma once".
+                         // Those are skipped by EVERY later include, plain or once.
   ExpandedLine: string;  // a source line after macro substitution
   FReprocessDepth: Integer;   // guard against a macro whose expansion expands to itself
   UidK: Integer;         // scratch: clearing the __FB_UNIQUEID_* stacks at entry
@@ -2129,7 +2134,7 @@ var
   end;
 
   // Forward: ReprocessExpansion feeds a macro expansion back through Expand, which is declared below.
-  procedure Expand(const Text, Dir: string); forward;
+  procedure Expand(const Text, Dir: string; const SrcPath: string = ''); forward;
 
   function ExpandedLineHasDirective(const S: string): Boolean;
   // Does this expanded line hold a preprocessor directive in one of its cVirtualEOL segments? Only a
@@ -2236,10 +2241,14 @@ var
     Result := (Copy(U, 1, 6) = 'OPTION') and (Pos('ESCAPE', U) > 0) and (Pos('"', U) = 0);
   end;
 
-  procedure Expand(const Text, Dir: string);
+  procedure Expand(const Text, Dir: string; const SrcPath: string = '');
+  // SrcPath = the full path of the file THIS text came from ('' for the top-level source and for a
+  // macro expansion fed back through here). It exists for one reason: "#pragma once" is a statement a
+  // file makes ABOUT ITSELF, so the directive has to know which file it is standing in.
   var
     Lines: TStringList;
     li, p, q: Integer;
+    Canon: string;   // the include path, canonicalised - the identity every "once" question asks about
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
     Params, MacroBody, BodyTrim, EName, ERest, LineFile: string;
     LineNum: Integer;
@@ -2571,15 +2580,22 @@ var
             if not FileExists(FullPath) then FullPath := IncludeTrailingPathDelimiter(Dir) + FileName;
             if FileExists(FullPath) then
             begin
-              if IncludeOnce and (IncOnce.IndexOf(UpperCase(ExpandFileName(FullPath))) >= 0) then
-                IncText := nil                                  // already spliced: ONCE means once
+              // ⛔ THE IDENTITY IS THE CANONICAL PATH, NOT THE SPELLING. fbc's own pp/inc_once1 reaches
+              // one header as "inc1.bi" and as "../pp/inc1.bi" and treats the two as the SAME file.
+              Canon := UpperCase(ExpandFileName(FullPath));
+              if (PragmaOnce.IndexOf(Canon) >= 0) or
+                 (IncludeOnce and (IncOnce.IndexOf(Canon) >= 0)) then
+                IncText := nil                                  // already spliced, or it asked to be once
               else
               begin
-                if IncludeOnce then IncOnce.Add(UpperCase(ExpandFileName(FullPath)));
+                // ⛔ EVERY splice registers the file, not only a "once" one: what "once" asks is "has
+                // this file been included yet", and a plain #include is exactly that. Registering only
+                // the ONCE form made "#include" twice followed by "#include once" splice a THIRD time.
+                if IncOnce.IndexOf(Canon) < 0 then IncOnce.Add(Canon);
                 IncText := TStringList.Create;
                 try
                   IncText.LoadFromFile(FullPath);
-                  Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)));
+                  Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)), FullPath);
                 finally
                   IncText.Free;
                 end;
@@ -2587,6 +2603,19 @@ var
             end
             else
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
+          end
+          else if (DName = 'pragma') and Emitting then
+          begin
+            // #pragma once — the FILE says "include me at most once", whichever form asks for it.
+            // ⛔ It was not handled at all, and being dropped in silence is what made it look handled:
+            // the first include of such a header was right, and every later one spliced it again
+            // (fbc's own pp/inc_once2 counts 1 where we counted 3).
+            // Every other pragma (reserve, push/pop) stays ignored, exactly as before.
+            if (UpperCase(Trim(StripDirectiveComment(DRest))) = 'ONCE') and (SrcPath <> '') then
+            begin
+              Canon := UpperCase(ExpandFileName(SrcPath));
+              if PragmaOnce.IndexOf(Canon) < 0 then PragmaOnce.Add(Canon);
+            end;
           end
           else if (DName = 'print') and Emitting then
             // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. What exactly gets
@@ -2727,6 +2756,7 @@ begin
 
   SetLength(GPPLineDirectives, 0);   // per COMPILATION, like the unique-id stacks above
   IncOnce := TStringList.Create;
+  PragmaOnce := TStringList.Create;
   FReprocessDepth := 0;
   FnDefs := TStringList.Create;
   Output := TStringList.Create;
@@ -2761,6 +2791,7 @@ begin
   finally
     Defs.Free;
     IncOnce.Free;
+    PragmaOnce.Free;
     FnDefs.Free;
     Output.Free;
   end;
