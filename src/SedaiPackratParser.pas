@@ -212,6 +212,7 @@ type
     procedure RefuseUnwritableTarget(Node: TASTNode; const What: string);
     procedure CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
                                               NameTok: TLexerToken);
+    procedure CheckByRefReturn(ProcNode: TASTNode);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -3518,6 +3519,7 @@ begin
   end;
 
   ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
+  CheckByRefReturn(Result);                       // ...and what a BYREF one is allowed to hand back
   ConsumeEndProcedure;
   DoNodeCreated(Result);
 end;
@@ -10502,6 +10504,152 @@ begin
     else
       Exit;
     end;
+end;
+
+procedure TPackratParser.CheckByRefReturn(ProcNode: TASTNode);
+// ⭐ A BYREF FUNCTION MAY NOT RETURN A REFERENCE TO SOMETHING THAT DIES WITH THE CALL. fbc: "error 272:
+// Local symbols can't be referenced". A "Function name(...) ByRef As T" hands the CALLER an address,
+// so what it names must outlive the frame: a plain local, a local ARRAY's element, a FIELD of a local,
+// a BYVAL parameter (a copy on this frame) and a CALL's RESULT (a temporary) are all refused.
+//
+// ⛔ AND TODAY THREE OF THOSE FIVE CRASH INSTEAD. Measured before writing this: "Function = i" on a
+// local ran to a null-pointer dereference at RUN TIME on our engine, in both the "Function =" and the
+// "Return" spellings. So this does not tighten a working program - it replaces a crash with a
+// diagnostic, which is the direction a refusal is allowed to move.
+//
+// The five shapes that stay LEGAL were probed one at a time, because the rule is about LIFETIME and
+// nothing else: a SHARED global, an element of a SHARED array, a BYREF parameter (the caller's own
+// storage), a STATIC local (static storage, not the frame) and a DEREF of a pointer.
+// ⛔ Which is why the walk to the root does NOT pass through an antDeref: "*p" names whatever p points
+// at, and that is the caller's business, not this frame's. Same boundary ConstRootOfTarget draws for a
+// different reason, and drawn the same way here on purpose.
+var
+  Locals: TStringList;
+  ProcName: string;
+
+  procedure CollectLocals(N: TASTNode);
+  var i, k: Integer; D, Decl: TASTNode;
+  begin
+    if N = nil then Exit;
+    for i := 0 to N.ChildCount - 1 do
+    begin
+      D := N.GetChild(i);
+      if D = nil then Continue;
+      if D.NodeType = antDim then
+        for k := 0 to D.ChildCount - 1 do
+        begin
+          Decl := D.GetChild(k);
+          // ⛔ A STATIC local is NOT one of these: it has static storage and outlives the frame, so
+          // returning a reference to it is legal and fbc compiles it.
+          if (Decl <> nil) and (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 1) and
+             (Decl.GetChild(0).NodeType = antIdentifier) and
+             (Decl.Attributes.Values['STATIC'] <> '1') then
+            Locals.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+        end;
+      CollectLocals(D);   // a Scope, an If or a loop body holds locals of this frame too
+    end;
+  end;
+
+  // The name the returned expression is ROOTED at, and whether the expression is a CALL. A call and an
+  // array element are the SAME node at parse time ("f1()" and "arr(0)" are both an antArrayAccess), so
+  // the procedure set the parser already keeps is what tells them apart.
+  function RootOfRef(N: TASTNode; out IsCall: Boolean): string;
+  var Cur: TASTNode;
+  begin
+    Result := ''; IsCall := False;
+    Cur := N;
+    while Cur <> nil do
+      case Cur.NodeType of
+        antParentheses, antMemberAccess:
+          if Cur.ChildCount >= 1 then Cur := Cur.GetChild(0) else Exit;
+        antArrayAccess:
+          begin
+            if Cur.ChildCount < 1 then Exit;
+            if (Cur.GetChild(0).NodeType = antIdentifier) and
+               (FProcSeen.IndexOf(UpperCase(VarToStr(Cur.GetChild(0).Value))) >= 0) then
+            begin
+              IsCall := True;
+              Exit(UpperCase(VarToStr(Cur.GetChild(0).Value)));
+            end;
+            Cur := Cur.GetChild(0);
+          end;
+        antIdentifier:
+          Exit(UpperCase(VarToStr(Cur.Value)));
+      else
+        Exit;   // ⛔ an antDeref lands here, and stopping IS the answer: "*p" is not this frame's
+      end;
+  end;
+
+  procedure CheckOne(Expr: TASTNode; Tok: TLexerToken);
+  var Nm: string; IsCall: Boolean;
+  begin
+    if Expr = nil then Exit;
+    Nm := RootOfRef(Expr, IsCall);
+    if Nm = '' then Exit;
+    if IsCall then
+      HandleError(Format('a BYREF function cannot return the result of %s: a call''s result is a ' +
+        'temporary that dies with the call', [Nm]), Tok)
+    else if Locals.IndexOf(Nm) >= 0 then
+      HandleError(Format('a BYREF function cannot return a reference to %s: it is local to this ' +
+        'frame and does not outlive the call', [Nm]), Tok);
+  end;
+
+  procedure Walk(N: TASTNode);
+  var i: Integer; C, Tgt: TASTNode;
+  begin
+    if N = nil then Exit;
+    for i := 0 to N.ChildCount - 1 do
+    begin
+      C := N.GetChild(i);
+      if C = nil then Continue;
+      if C.NodeType = antReturn then
+      begin
+        if C.ChildCount >= 1 then CheckOne(C.GetChild(0), C.Token);
+      end
+      else if (C.NodeType = antAssignment) and (C.ChildCount >= 2) then
+      begin
+        Tgt := C.GetChild(0);
+        // "Function = expr" and the older "<the function's own name> = expr" are the same statement.
+        if (Tgt <> nil) and (Tgt.NodeType = antIdentifier) and
+           ((UpperCase(VarToStr(Tgt.Value)) = 'FUNCTION') or
+            ((ProcName <> '') and (UpperCase(VarToStr(Tgt.Value)) = ProcName))) then
+          CheckOne(C.GetChild(1), C.Token);
+      end;
+      Walk(C);
+    end;
+  end;
+
+var
+  i, k: Integer;
+  PL, Prm: TASTNode;
+begin
+  if (ProcNode = nil) or (not FModernMode) then Exit;
+  if ProcNode.Attributes.Values['BYREFRET'] <> '1' then Exit;
+  ProcName := '';
+  if (ProcNode.ChildCount >= 1) and (ProcNode.GetChild(0).NodeType = antIdentifier) then
+    ProcName := UpperCase(VarToStr(ProcNode.GetChild(0).Value));
+  Locals := TStringList.Create;
+  try
+    Locals.CaseSensitive := False;
+    CollectLocals(ProcNode);
+    // ⛔ A BYVAL parameter is a LOCAL: it is a copy made on this frame. A BYREF one is the CALLER's
+    // storage and is exactly what a BYREF function is for, so only the BYVAL ones go in.
+    for i := 0 to ProcNode.ChildCount - 1 do
+    begin
+      PL := ProcNode.GetChild(i);
+      if (PL = nil) or (PL.NodeType <> antParameterList) then Continue;
+      for k := 0 to PL.ChildCount - 1 do
+      begin
+        Prm := PL.GetChild(k);
+        if (Prm <> nil) and (Prm.NodeType = antIdentifier) and
+           (Prm.Attributes.Values['BYVAL'] = '1') then
+          Locals.Add(UpperCase(VarToStr(Prm.Value)));
+      end;
+    end;
+    Walk(ProcNode);
+  finally
+    Locals.Free;
+  end;
 end;
 
 procedure TPackratParser.CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
