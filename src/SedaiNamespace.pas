@@ -608,6 +608,24 @@ begin
      (Node.Attributes.Values['GLOBALSCOPE'] <> '1') then
   begin
     V := UpperCase(VarToStr(Node.GetChild(0).Value));
+    // ⛔⛔ ...AND A CONSTRUCTOR'S TYPE TAIL IS NOT DEAD TEXT EITHER. A method's label carries its
+    // parameter signature after a '#' ("TU.CONSTRUCTOR#I:TV"), written by ProcSigFromParams while the
+    // file is being PARSED - so it holds the source's LITERAL spelling. The '~' half of exactly this
+    // rule has been resolved through ResolveSigTypeNames since the overload work; the '#' half was
+    // not, so a constructor declared inside a namespace kept "#I:TV" while the CALL side, built after
+    // flattening, asked for "#I:NS1.TV". The two named different things and ResolveConstructorLabel
+    // found nothing: "Sub s( ByVal u As TU )" called with a TV ran no constructor at all INSIDE a
+    // namespace while the identical program outside one ran it. fbc's structs/udt-ops-1..3 and
+    // udt-init-ops-* declare every one of their types inside one.
+    SigPos := Pos('#', V);
+    if SigPos > 0 then
+    begin
+      SigV := ResolveSigTypeNames(Copy(V, SigPos, MaxInt), ActivePrefix, Ctx, Using);
+      V := Copy(V, 1, SigPos - 1);
+      Node.GetChild(0).Value := V + SigV;
+    end
+    else
+      SigV := '';
     DotPos := Pos('.', V);
     if DotPos > 1 then
     begin
@@ -622,7 +640,7 @@ begin
       // name here.
       if Ctx.IsMember(ActivePrefix, BaseV) or
          (Ctx.NamespaceNames.IndexOf(ActivePrefix + '.' + BaseV) >= 0) then
-        Node.GetChild(0).Value := ActivePrefix + '.' + V;
+        Node.GetChild(0).Value := ActivePrefix + '.' + V + SigV;
     end;
   end;
 

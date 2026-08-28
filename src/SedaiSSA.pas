@@ -37257,16 +37257,37 @@ begin
        // owner type> - so an object reached through a BASE-class pointer looks like "not a subtype of
        // the parameter" and was CONSTRUCTED AFRESH: the manual's udt/extends2 then dispatched every
        // virtual call on the new temporary and answered "animal" for a dog. A THIS is never converted.
-       not ((i = 0) and (Pos('.', ParamOwnerName) > 0)) and
+       // ⛔⛔ ...AND "A METHOD" IS NOT "A NAME WITH A DOT IN IT". A SUB declared inside a NAMESPACE has
+       // a dotted label too ("NS1.S1"), so this guard silently switched the whole implicit conversion
+       // off for the FIRST parameter of every namespaced procedure - and fbc's structs/udt-ops family
+       // declares all of its types and subs inside one. The implicit THIS is asked for by NAME, which
+       // is what the parser really inserts, and the dotted test is kept beside it so the method case
+       // is bit-for-bit the one that was there.
+       not ((i = 0) and (Pos('.', ParamOwnerName) > 0) and
+            (UpperCase(VarToStr(ParamI.Value)) = 'THIS')) and
        not ((ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount = 1)) then
     begin
       ParamUdtU := UpperCase(VarToStr(ParamI.GetChild(0).Value));
-      // ...and only from something that is NOT already an object: a RECORD is an up/down-cast and a
-      // POINTER is an address, neither of which is a construction. What crashes - and what fbc really
-      // converts here - is a SCALAR or a string.
+      // ...and only from something that is NOT already an object OF THAT FAMILY: a POINTER is an
+      // address, and a record whose type IS the parameter's - or DERIVES from it - is an up-cast, and
+      // neither of those is a construction.
+      // ⛔ BUT AN UNRELATED RECORD IS ONE. The test used to be "the argument is a record at all", and
+      // that is the whole of fbc's structs/udt-ops family: "Sub s( ByVal u As TU )" called with a TV,
+      // where TU declares "Constructor( ByRef As TV )", runs that constructor. We ran nothing - the TV
+      // handle was staged straight into a slot the callee reads as a TU - so the conversion the seven
+      // udt-ops files exist to measure never happened even once.
+      // ⚠️ The narrowing that made the old test right is kept, and it is IsSubtypeOf: an object reached
+      // through its base is still never reconstructed. And TryEmitImplicitUDTArg still requires a
+      // constructor that really MATCHES, so an unrelated record with no such ctor stages as before.
       if (Pos(' PTR', ParamUdtU) > 0) or (FindUDT(ParamUdtU) < 0) or
-         (ObjectTypeName(ArgExpr) <> '') or (DeclaredPointerTypeOfArg(ArgExpr) <> '') then
-        ParamUdtU := '';
+         (DeclaredPointerTypeOfArg(ArgExpr) <> '') then
+        ParamUdtU := ''
+      else if ObjectTypeName(ArgExpr) <> '' then
+      begin
+        if IsSubtypeOf(UpperCase(ObjectTypeName(ArgExpr)), ParamUdtU) or
+           IsSubtypeOf(ParamUdtU, UpperCase(ObjectTypeName(ArgExpr))) then
+          ParamUdtU := '';
+      end;
     end;
     if (ParamUdtU <> '') and TryEmitImplicitUDTArg(ParamUdtU, ArgExpr, ArgVal) then
       // handled: ArgVal holds the temporary's record handle
