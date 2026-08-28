@@ -409,6 +409,11 @@ type
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
+    // V5f: the RESULT TEMPORARIES of this statement - one per call to a function returning a UDT BY
+    // VALUE. The caller allocates that record (ssaRecordNew below), the callee copies its result into
+    // it, and until now NOTHING destroyed it: fbc runs one destructor MORE than we did for every such
+    // call, and exactly one. Strings[] is the type name, Objects[] the handle register's index.
+    FResultTemps: TStringList;
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
@@ -571,6 +576,9 @@ type
     procedure EmitByrefWriteback(const ParamOwnerName: string; ArgListNode: TASTNode);  // BYREF: caller — copy slots back into variable args
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
     function TypeNeedsDestruction(const TypeName: string): Boolean;  // V5e: type (recursively) has a DESTRUCTOR
+    procedure RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string);  // V5f
+    procedure FlushResultTemps(Depth: Integer);                                        // V5f
+    function BodyHasReturnStatement(Proc: TASTNode): Boolean;                          // V5f
     procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
     procedure EmitModuleDestructors(UseSlots: Boolean = False);  // V5b/V5e: dtor calls for globals at program end
     procedure CollectModuleCtorDtors(Node: TASTNode);  // FB module constructor/destructor procs
@@ -1319,6 +1327,7 @@ begin
   FVarRecordType.CaseSensitive := False;
   FPreFuncRetType := TStringList.Create;
   FPreFuncRetType.CaseSensitive := False;
+  FResultTemps := TStringList.Create;
   FVarExplicitType := TStringList.Create;
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TStringList.Create;
@@ -1480,6 +1489,7 @@ begin
   FVarRecordType.Free;
   FVarExplicitType.Free;
   FPreFuncRetType.Free;
+  FResultTemps.Free;
   FArrayRecordType.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
@@ -28642,6 +28652,11 @@ begin
   // Runs the matching constructor if the type declares one; a constructor-less type is aggregate-
   // initialized field-by-field from the args (EmitConstructorCall handles that fallback).
   EmitConstructorCall(Handle, UpperCase(TypeName), ArgsNode);
+  // V5f: it is a TEMPORARY, and fbc destroys it at the end of the statement that built it. Every use
+  // copies out of it, so nothing else owns it. fbc's own suite asserts this and the result temporary
+  // together: functions/return-non-trivial builds "Type( (123) )" inside a function whose result is a
+  // UDT and requires TWO destructor runs - one for this temporary, one for the result.
+  RegisterResultTemp(Handle, UpperCase(TypeName));
   Result := True;
 end;
 
@@ -29432,6 +29447,67 @@ function TSSAGenerator.TypeNeedsDestruction(const TypeName: string): Boolean;
   end;
 begin
   Result := Rec(TypeName, 0);
+end;
+
+procedure TSSAGenerator.RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string);
+// V5f: remember the record a UDT-returning call left in HandleVal, so the end of this STATEMENT
+// destroys it. It is a genuine temporary - every consumer copies out of it (EmitRecordCopy) - and
+// nothing owned it: fbc destroys it and we did not, so we ran one destructor fewer per call.
+//   "x = f()"        fbc nc=2 nd=1 at the assignment   we nc=1 nd=0
+//   "g()" discarded  fbc nd=2                          we nd=1
+//   "g().i"          fbc nd=2                          we nd=1
+// ⛔ Only when the type has observable destruction: TypeNeedsDestruction is the same predicate the
+// frame exit uses, so a plain data UDT emits nothing at all and every existing program keeps its
+// byte-identical instruction stream.
+begin
+  if HandleVal.Kind <> svkRegister then Exit;
+  if (TypeName = '') or not TypeNeedsDestruction(TypeName) then Exit;
+  FResultTemps.AddObject(UpperCase(TypeName), TObject(PtrInt(HandleVal.RegIndex)));
+end;
+
+function TSSAGenerator.BodyHasReturnStatement(Proc: TASTNode): Boolean;
+// V5f: does this procedure body contain a "RETURN <expr>" anywhere? (The body starts at child 2;
+// antReturn also carries EXIT and CONTINUE, told apart by the node's VALUE, as elsewhere.)
+//
+// ⛔ IT IS A SYNTACTIC QUESTION, AND THAT IS THE ORACLE'S ANSWER, NOT A SHORTCUT. fbc default-
+// constructs a UDT function RESULT at entry when the body assigns it with "Function = ..." (or never
+// sets it at all), and does NOT when the body uses RETURN - which constructs the result in place from
+// the returned value. Measured: a body whose ONLY return sits inside "If k = 1 Then Return r" counts
+// ONE constructor for k=1 AND for k=0, so the decision is taken on the TEXT, not on the path.
+  function Scan(N: TASTNode): Boolean;
+  var
+    i: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.NodeType = antReturn) and (UpperCase(VarToStr(N.Value)) = 'RETURN') and (N.ChildCount >= 1) then
+      Exit(True);
+    for i := 0 to N.ChildCount - 1 do
+      if Scan(N.GetChild(i)) then Exit(True);
+  end;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Proc = nil then Exit;
+  for i := 2 to Proc.ChildCount - 1 do
+    if Scan(Proc.GetChild(i)) then Exit(True);
+end;
+
+procedure TSSAGenerator.FlushResultTemps(Depth: Integer);
+// V5f: destroy every result temporary recorded since Depth, most recent first, and forget them.
+// ⛔ DEPTH, NOT "CLEAR". ProcessStatement is RE-ENTRANT - a For body, an If branch and a Scope all
+// lower their statements through it - so an outer statement must destroy only what its OWN
+// expressions allocated. An inner statement has already flushed its own by then, which is why a
+// count taken on entry is the whole bookkeeping.
+var
+  i: Integer;
+begin
+  for i := FResultTemps.Count - 1 downto Depth do
+  begin
+    EmitDestructorCall(MakeSSARegister(srtInt, PtrInt(FResultTemps.Objects[i])), FResultTemps[i]);
+    FResultTemps.Delete(i);
+  end;
 end;
 
 procedure TSSAGenerator.AssignModuleDtorSlots;
@@ -34729,6 +34805,7 @@ begin
     EmitArrayArgBinds(Name, ArgsNode, False);         // restore the aliased array slots after the call returns
     EmitVarArgClose(Name);
     EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
+    RegisterResultTemp(RcHandle, RecType);   // V5f: the end of the statement destroys this temporary
     Result := RcHandle;
   end
   else if ByrefRetByAddress(Name) then
@@ -35626,6 +35703,7 @@ begin
 
   if RetRecType <> '' then
   begin
+    RegisterResultTemp(RcHandle, RetRecType);   // V5f: the end of the statement destroys this temporary
     Result := RcHandle;   // UDT result: the caller-allocated copy
     Exit;
   end;
@@ -37898,6 +37976,16 @@ begin
     begin
       FCurrentResultHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitXferLoad(srtInt, XFER_RESULT_HANDLE_SLOT, FCurrentResultHandle);
+      // V5f: ...AND THE RESULT IS DEFAULT-CONSTRUCTED, unless the body uses RETURN. fbc constructs the
+      // result object of a UDT-returning function exactly once; "Return expr" constructs it FROM that
+      // expression (a copy, which counts no default ctor), while "Function = expr" assigns to an
+      // already-constructed object and a body that sets nothing still hands back a constructed one.
+      // fbc's own suite asserts it: functions/udt-result's "default" test calls a function with an
+      // EMPTY body and requires the constructor count to have gone up ("result should still be
+      // constructed"). The caller allocated the storage and ran EmitRecordInit on it; what was missing
+      // is the ctor BODY.
+      if not BodyHasReturnStatement(Proc) then
+        EmitConstructorCall(FCurrentResultHandle, FCurrentProcRetRecType, nil);
     end;
 
     // Default-initialise the scalar result slot (FreeBASIC: an unset function result is 0 / "" ). The
@@ -38080,8 +38168,10 @@ procedure TSSAGenerator.ProcessStatement(Node: TASTNode);
 // runs HERE for every statement; ProcessStatementFull must only be called from this wrapper.
 var
   i: Integer;
+  TempDepth: Integer;   // V5f: result temporaries owned by THIS statement start here
 begin
   if Node = nil then Exit;
+  TempDepth := FResultTemps.Count;
 
   // MODERN (FreeBASIC, no line numbers): stamp each statement's physical source line into
   // FCurrentLineNumber so emitted instructions carry it in the source map. This makes ERL and
@@ -38145,6 +38235,11 @@ begin
   else
     ProcessStatementFull(Node);
   end;
+  // V5f: a call to a function returning a UDT BY VALUE leaves a caller-allocated record behind, and
+  // fbc destroys it at the end of the statement that made the call. Every consumer copies OUT of that
+  // record (EmitRecordCopy), so nothing else owns it; without this we ran exactly one destructor
+  // fewer per such call. Emitted here, in the ONE funnel every statement goes through.
+  if FResultTemps.Count > TempDepth then FlushResultTemps(TempDepth);
 end;
 
 procedure TSSAGenerator.ProcessStatementFull(Node: TASTNode);
