@@ -4386,6 +4386,8 @@ end;
 function TBytecodeVM.AllocRecord(Ctx: TExecutionContext; ByteSize, StrC, TypeId: Integer): Integer;
 // Allocate a record instance (heap block of typed slot arrays) in Ctx's per-thread heap and
 // return its handle (an index into Ctx.Records).
+var
+  RecClr: Integer;   // clearing a REUSED slot's string vector; see the note below
 begin
   // Reserve handle 0 as the null-pointer sentinel: a real record handle must never be 0, or a pointer
   // to the first-allocated record ("Dim As T b : Dim As T Ptr p = @b") would carry the value 0 and a
@@ -4399,12 +4401,36 @@ begin
   if Ctx.RecordCount >= Length(Ctx.Records) then
     SetLength(Ctx.Records, (Ctx.RecordCount + 1) * 2);
   Ctx.Records[Ctx.RecordCount].TypeId := TypeId;
-  // A3-i: one byte image plus the string vector. SetLength zero-fills a fresh block, which is the
+  // A3-i: one byte image plus the string vector. SetLength zero-fills a FRESH block, which is the
   // initial state a record must have.
-  SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
-  SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+  // ⛔⛔ ...AND "FRESH" IS THE WHOLE CLAIM, which held only for a slot never used before. A block or a
+  // frame reclaim rolls RecordCount BACK (bcRecMarkPop, PopFrame), so the next allocation lands on a
+  // slot that already holds the previous occupant's data - and SetLength on an array ALREADY that
+  // length does nothing at all. Every UDT local declared in a Scope, in a loop body or in a Sub was
+  // therefore handed its PREVIOUS value instead of zero, on all four engines and in silence:
+  //     Sub f() : Dim As A a : Print a.x : a.x = 11 : End Sub
+  //     f() : f()          ' FreeBASIC prints 0 and 0; we printed 0 and 11
+  // Below the high-water mark the slot is reused and is cleared here; at or above it, SetLength has
+  // just zero-filled and there is nothing to do - which is what keeps this off the growing path.
+  if Ctx.RecordCount < Ctx.RecordHigh then
+  begin
+    SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
+    if ByteSize > 0 then
+      FillChar(Ctx.Records[Ctx.RecordCount].Bytes[0], ByteSize, 0);
+    SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+    // ⚠️ The strings need their OWN clear: they are managed, so FillChar over them would leak the old
+    // reference and hand the next reader a dangling one. Assigning '' releases it properly.
+    for RecClr := 0 to StrC - 1 do
+      Ctx.Records[Ctx.RecordCount].StringData[RecClr] := '';
+  end
+  else
+  begin
+    SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
+    SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+  end;
   Result := Ctx.RecordCount;
   Inc(Ctx.RecordCount);
+  if Ctx.RecordCount > Ctx.RecordHigh then Ctx.RecordHigh := Ctx.RecordCount;
 end;
 
 procedure TBytecodeVM.GrowSharedRecords(NeedLen: Integer);

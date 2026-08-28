@@ -329,6 +329,13 @@ type
     // per-thread because each thread owns its heap (no cross-thread reclamation, S16.4).
     Records: array of TRecordStorage;
     RecordCount: Integer;
+    // ⛔ THE HIGH-WATER MARK, and it exists for CORRECTNESS, not for accounting. RecordCount is rolled
+    // BACK by a block or frame reclaim, so the next AllocRecord hands out a slot that has been used
+    // before - and a slot that has been used before still holds the previous occupant's bytes and
+    // strings. Everything below RecordHigh is a REUSED slot and must be cleared; everything at or
+    // above it is fresh from SetLength, which zero-fills on its own. Keeping the two apart is what
+    // keeps the clear off the growing path, where records are allocated in the millions.
+    RecordHigh: Integer;
 
     // --- BigInt heap (per-context, exactly as the record heap above) ---
     // A BigInt VALUE is a handle into this array, which is why it is here and not
