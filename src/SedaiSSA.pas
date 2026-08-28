@@ -21798,6 +21798,15 @@ begin
     ChainNode := ObjNode;
     Exit(True);
   end;
+  // ⭐ "(*p).field" IS "p->field", and it used to reach here as a shape this routine did not know:
+  // an antDeref, possibly parenthesised, instead of the bare name. So the raw byte-offset path
+  // declined, the managed record path took the raw address for a table index, and the VM died - on
+  // the FIELD as much as on a method call. Unwrapped here, at the ONE predicate both halves ask,
+  // rather than at either caller.
+  while (ObjNode <> nil) and (ObjNode.ChildCount >= 1) and
+        (ObjNode.NodeType in [antParentheses, antDeref]) do
+    ObjNode := ObjNode.GetChild(0);
+  if ObjNode = nil then Exit;
   if ObjNode.NodeType = antIdentifier then
     BaseNode := ObjNode
   else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
@@ -35246,7 +35255,11 @@ var
   RT: TSSARegisterType;
   DestVal, RcHandle: TSSAValue;
   IsFunc, IsByrefRet: Boolean;
-  MethodLabel, RetRecType: string;
+  MethodLabel, RetRecType, RawTypeName: string;
+  RawUDTIdx: Integer;
+  RawOffsets: TInt64Array;
+  RawTotal: Int64;
+  RawBaseNode, RawIdxNode, RawChainNode: TASTNode;
 begin
   Result := MakeSSAValue(svkNone);
   // "obj.Constructor()" / "obj.Destructor()" called EXPLICITLY on an existing instance. FreeBASIC
@@ -35280,6 +35293,27 @@ begin
   if MethodLabel = '' then
     MethodLabel := AnyOverrideLabel(ObjType, MethNm);
   if MethodLabel = '' then Exit;
+  // ⛔ A METHOD ON A TRULY RAW POINTER IS AN ACCESS VIOLATION, AND A NAMED REFUSAL IS BETTER THAN THAT.
+  // "Dim As T Ptr p = CAllocate(SizeOf(T)) : p->Method()" passes THIS as a RAW ADDRESS (RAWPTR_TAG),
+  // and the method body was compiled once, for a record HANDLE - so its first field access dereferenced
+  // an address as a table index and the VM died. The FIELD half works ("p->i" takes the byte-offset
+  // path), which is why nothing pointed at this; "New T" and "@v" work too, because neither is marked
+  // raw. fbc runs all three.
+  // ⚠️ Closing it for real is a MODEL change: the record accessor would have to tell a handle from a
+  // raw base AT RUNTIME, and that test lands on bcRecordLoad/Store - four of the hottest opcodes in
+  // the VM, the ones the C hot loop covers and that are worth -12.7% on binary-trees. That is a
+  // decision with a price, not a quiet edit, and it is written up in job/markdown/DIVERGENZE.md.
+  // ⛔ Until it is made, this refuses instead of crashing. Replacing a crash with a message is the
+  // only move here that is not "an error swapped for a wrong answer".
+  // ⛔ Asked with the SAME predicate the field half uses (ResolveRawUDTBase), not a second opinion:
+  // "p->i" works precisely because that one answers True here, and the two halves must agree about
+  // what a raw base is.
+  if (ObjNode <> nil) and
+     ResolveRawUDTBase(ObjNode, RawTypeName, RawUDTIdx, RawOffsets, RawTotal,
+                       RawBaseNode, RawIdxNode, RawChainNode) then
+    raise Exception.CreateFmt('Calling method %s on a RAW pointer to %s is not supported: it holds an ' +
+      'Allocate/CAllocate address and a method needs a managed record. Its FIELDS can be read and ' +
+      'written; use "New %s" when you need methods.', [MethNm, RawTypeName, RawTypeName]);
   // OOP: the permission, on the METHOD half of the rule. Until now CheckMemberAccess was reached from
   // exactly one place - the by-name FIELD lookup - so "Private: Declare Sub foo()" was stamped by the
   // parser and never asked about: "x.foo()" from module level ran the body. fbc answers "error 202:
