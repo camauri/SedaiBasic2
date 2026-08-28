@@ -7120,14 +7120,28 @@ begin
     Exit;
   end;
 
-  // FreeBASIC IMAGEINFO handle, w, h  (writes width/height into the w and h variables)
+  // FreeBASIC IMAGEINFO handle [, w, h, bpp, pitch, pixeldata] — writes the image's info into the
+  // variables. ⭐ THE SAME SHAPE SCREENINFO ALREADY HAD, and the rule was written only there: any
+  // destination may be left out and the POSITION still selects the field, so an omitted slot has to be
+  // FILLED with a placeholder or the sixth argument would arrive as the second. And the trailing ones
+  // may simply be ABSENT - "imageinfo img" alone is legal. Only the fixed three-argument form was
+  // parsed, so "imageinfo img, , , , , pixels" died on the second comma and "imageinfo img" on the end
+  // of the line. fbc's gfx/imageinfo-params writes both. One more of
+  // [[a-rule-one-path-has-and-the-other-does-not]], between two statements that are the same statement.
   if Result.NodeType = antImageInfo then
   begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;       // '(' of the parenthesised spelling
     Result.AddChild(ParseExpression);                            // handle
-    if Context.Check(ttSeparParam) then Context.Advance;          // ','
-    Result.AddChild(ParseExpression);                            // w variable
-    if Context.Check(ttSeparParam) then Context.Advance;          // ','
-    Result.AddChild(ParseExpression);                            // h variable
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                                          // ','
+      if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                           ttDelimParClose]) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))
+      else
+        Result.AddChild(ParseExpression);                       // next destination
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
     DoNodeCreated(Result);
     Exit;
   end;
