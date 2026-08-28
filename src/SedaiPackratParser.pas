@@ -2015,8 +2015,23 @@ begin
 
     else
     begin
+      // ⭐ A FUNCTION CALLED AS A STATEMENT, WITH ITS RESULT DISCARDED. FreeBASIC allows it for any
+      // function, builtin included: "threadcreate( @proc )" on a line of its own is fbc's own
+      // typedef/procptr-temp-name, and the same shape is what m659 found for HEX/BIN/OCT (right inside
+      // an expression, refused as a statement). The word lexes as a KEYWORD, so no arm above claims it
+      // and the dispatcher fell through to the refusal below - while the identical call written
+      // "dim h = threadcreate( @proc )" worked, which is what says the gap is in the STATEMENT form.
+      // ⛔ Tried only HERE, where nothing else matched, and only when a '(' follows: a keyword that
+      // really opens a statement has already been claimed by its own arm, so no existing shape changes.
+      if Assigned(Context.CurrentToken) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType = ttDelimParOpen) then
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        if Assigned(Result) then Exit;
+        Context.CurrentIndex := SavedIndex;
+      end;
       ErrorToken := Context.CurrentToken;  // ← errore sul TOKEN CORRENTE, non quello catturato all'inizio
-      //WriteLn('DEBUG: ERROR on token "', ErrorToken.Value, '" at line=', ErrorToken.Line);
       HandleError(Format('Unexpected token in statement: "%s"', [ErrorToken.Value]), ErrorToken);
       Result := nil;
     end;
@@ -12243,6 +12258,40 @@ begin
     Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, VarDottedName, NameTok));
     if DeclIsByref then
     begin
+      // ⛔ ...UNLESS THE INITIALISER HAS NO ADDRESS. "Var ByRef i = ""abc""" binds a reference to a
+      // TEMPORARY: fbc compiles it (its dim/byref-bad-init-2-var is a COMPILE_ONLY_OK test), we wrapped
+      // the literal in "@" and the SSA died on "Undefined procedure (address-of @): " - with an EMPTY
+      // name, which is the tell that nothing nameable was there. A literal has a VALUE and no storage,
+      // so the declaration degrades to the ordinary VAR it is indistinguishable from: same value, and a
+      // reference to a temporary is exactly what has no second observer.
+      // ⛔⛔ AND A NUMERIC LITERAL IS NOT THE SAME AS A STRING ONE. fbc ACCEPTS a BYREF Var initialised
+      // from a string literal and REFUSES one initialised from a number, with «error 24: Invalid data
+      // types» - its dim/byref-bad-init-1-var and -2-var are that pair, one COMPILE_ONLY_FAIL and one
+      // COMPILE_ONLY_OK. Degrading both cost the refusal, and the nets said so on the same run: B1 rose
+      // and B2 FELL by one. A string literal has a descriptor to refer to; a number is a value and
+      // nothing else.
+      if (InitExpr.NodeType = antLiteral) and VarIsNumeric(InitExpr.Value) then
+      begin
+        HandleError('Invalid data types: a BYREF initialiser needs something with an address, ' +
+                    'and a numeric literal has none', NameTok);
+        InitExpr.Free;
+        Decl.Free;
+        Exit(Result);
+      end;
+      if InitExpr.NodeType = antLiteral then
+      begin
+        Decl.AddChild(InitExpr);
+        Decl.Attributes.Values['INFER'] := '1';
+        if VarIsShared then Decl.Attributes.Values['SHARED'] := '1';
+        DoNodeCreated(Decl);
+        Result.AddChild(Decl);
+        if Context.Check(ttSeparParam) then
+        begin
+          Context.Advance;
+          Continue;
+        end;
+        Break;
+      end;
       // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
       if InitExpr.NodeType = antIdentifier then
       begin

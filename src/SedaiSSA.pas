@@ -38554,9 +38554,14 @@ begin
            ((Node.GetChild(i).NodeType = antDim) and
             (Node.GetChild(i).Attributes.Values['TYPECONST'] = '1')) then
           ProcessStatement(Node.GetChild(i));
-    antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction:
+    antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction, antThreadCreate:
       // Statement-level call for side effects (e.g. obj.method(args), a function/array expression used
       // as a statement, or GETMOUSE(x,y) called for its by-reference writes). Lower and discard the result.
+      // ⛔ antThreadCreate had to be named here EXPLICITLY. The parser now reaches "threadcreate( @p )"
+      // written as a statement, and without this arm the node fell off the dispatcher and the call was
+      // DROPPED: the thread never started, "n" stayed 0, and the program exited 0. That is a refusal
+      // traded for a silent wrong answer - measured with a side-effecting probe, not assumed, because
+      // the file COMPILED either way and a COMPILE_ONLY test cannot tell the two apart.
       ProcessExpression(Node, RetVal);
     antIdentifier:
       // ⭐ A NAMESPACE-QUALIFIED SUB CALLED AS A BARE STATEMENT: "ns3.dotest", no parentheses. It parses
