@@ -1822,6 +1822,20 @@ begin
   else Result := 0;
 end;
 
+function FixedStrTypeBytes(const TypeName: string; N: Int64): Int64;
+// SizeOf of a FIXED-LENGTH string TYPE, measured against fbc 1.10.1 and not deduced - the three answer
+// three different things and we answered 8 (a descriptor) for all of them:
+//     ZString * n  ->  n          (the bytes, no terminator counted)
+//     String  * n  ->  n + 1      (the terminator is part of it)
+//     WString * n  ->  n * 4      (a wide character is four bytes here)
+begin
+  Result := 0;
+  if N <= 0 then Exit;
+  if TypeName = 'ZSTRING' then Result := N
+  else if TypeName = 'STRING' then Result := N + 1
+  else if TypeName = 'WSTRING' then Result := N * 4;
+end;
+
 function OperatorArityCode(NParams: Integer): string;
 // Label suffix that keeps a unary and a binary overload of the SAME operator symbol apart ("@1"/"@2").
 // Declared parameter count, so a free "Operator -(a AS T, b AS T)" is @2 and "Operator -(c AS T)" is @1.
@@ -6759,6 +6773,24 @@ begin
           // "SizeOf(CULng(0))" took the float arm and said 8 where fbc says 4; CByte and CShort the
           // same. OperandWidthCode is the registry that DOES know them (and the narrow variables, the
           // narrow fields, RGB), so it decides whenever it has an answer and the bank only fills in.
+          // ⛔ ...AND A FIXED-LENGTH STRING TYPE IS NOT A DESCRIPTOR. "SizeOf(ZString * 16)" arrives as
+          // an antBinaryOp of the type name and the capacity, which no width registry knows: all six
+          // spellings answered 8, the size of a handle, where fbc answers 16 / 9 / 16. Asked FIRST,
+          // because the registries below have a default and a default here is a wrong answer.
+          if (Node.GetChild(1).GetChild(0).NodeType = antBinaryOp) and
+             (Node.GetChild(1).GetChild(0).ChildCount = 2) and
+             (Node.GetChild(1).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+             (Node.GetChild(1).GetChild(0).GetChild(1).NodeType = antLiteral) then
+          begin
+            FieldSzConst := FixedStrTypeBytes(
+              UpperCase(VarToStr(Node.GetChild(1).GetChild(0).GetChild(0).Value)),
+              StrToInt64Def(VarToStr(Node.GetChild(1).GetChild(0).GetChild(1).Value), 0));
+            if FieldSzConst > 0 then
+            begin
+              Result := MakeSSAConstInt(FieldSzConst);
+              Exit;
+            end;
+          end;
           FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(Node.GetChild(1).GetChild(0)));
           if OperandWidthCode(Node.GetChild(1).GetChild(0)) = 0 then
           case InferExprBank(Node.GetChild(1).GetChild(0)) of
@@ -9900,7 +9932,8 @@ begin
           Val := TypeSizeBytes(UpperCase(VarToStr(Op.Value)))
         else if (Op.NodeType = antBinaryOp) and (Op.ChildCount = 2) and
                 (Op.GetChild(0).NodeType = antIdentifier) and (Op.GetChild(1).NodeType = antLiteral) then
-          Val := StrToInt64Def(VarToStr(Op.GetChild(1).Value), 0)     // "ZString * n" is n bytes wide
+          Val := FixedStrTypeBytes(UpperCase(VarToStr(Op.GetChild(0).Value)),
+                                   StrToInt64Def(VarToStr(Op.GetChild(1).Value), 0))
         else
           Exit;
         Result := Val > 0;
