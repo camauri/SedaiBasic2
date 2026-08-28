@@ -26259,7 +26259,17 @@ begin
         Continue;
       end;
     end;
-    W := OperandWidthCode(ArgsNode.GetChild(i));
+    // ⛔⛔ THE DECLARED CODE IS ASKED FIRST, AND OperandWidthCode ONLY AS A FALLBACK. This tail has
+    // to reproduce what the DECLARATION wrote (WidthCharOf), and OperandWidthCode cannot: it ends by
+    // clamping everything outside 1..6 to 0 and by folding 9/10 onto 5/6, because its own callers
+    // (CSIGN/CUNSG) mean "the narrow INTEGER width to reinterpret at". So a ULongInt argument reported
+    // no width at all where the declaration signed '8', an Int32 one reported '5' where the declaration
+    // signed '9', and a Boolean one reported nothing where the declaration signed 'B' - three of the
+    // five specific codes were unreachable through the tail, and their overloads with them
+    // ("h(As ULongInt)" beside "h(As Integer)" answered "integer" where fbc answers "ulongint").
+    // Declared32Code is the same registry read WITHOUT that clamp, and it is scoped by procedure.
+    W := Declared32Code(ArgsNode.GetChild(i));
+    if W = 0 then W := OperandWidthCode(ArgsNode.GetChild(i));
     // ⛔ A SINGLE IS NOT IN THAT REGISTRY. OperandWidthCode answers the narrow-INTEGER width, and a
     // Single is tracked by its own predicate (IsSingleExpr) - which is why "h(As Single)" against
     // "h(As Double)" still picked the first declaration after the width tail was in place: the two
@@ -26514,10 +26524,34 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 //      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, UdtSig, ConstSig, WidthSig, Pref, Cand, Tail: string;
+  Sig, UdtSig, ConstSig, WidthSig, LegacySig, Pref, Cand, Tail: string;
   k, j, Extra, BestExtra: Integer;
   DeclN, ParamsN: TASTNode;
   OkDef: Boolean;
+
+  // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
+  function WidthTailLabel(const WT: string): string;
+  begin
+    if ConstSig <> '' then
+    begin
+      if UdtSig <> '' then
+      begin
+        Result := BaseLabel + '~' + Sig + ':' + UdtSig + '!' + ConstSig + '%' + WT;
+        if FProcDecls.ContainsKey(Result) then Exit;
+      end;
+      Result := BaseLabel + '~' + Sig + '!' + ConstSig + '%' + WT;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    if UdtSig <> '' then
+    begin
+      Result := BaseLabel + '~' + Sig + ':' + UdtSig + '%' + WT;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    Result := BaseLabel + '~' + Sig + '%' + WT;
+    if FProcDecls.ContainsKey(Result) then Exit;
+    Result := '';
+  end;
+
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
@@ -26525,31 +26559,38 @@ begin
   ConstSig := ArgConstSigFromArgs(ArgsNode);
   WidthSig := ArgWidthSigFromArgs(ArgsNode);
   if GetEnvironmentVariable('OVL_DIAG') = '1' then
+  begin
     WriteLn(ErrOutput, 'OVL: ', BaseLabel, ' sig="', Sig, '" udt="', UdtSig, '" const="', ConstSig,
             '" width="', WidthSig, '"');
+    // ...and the CANDIDATES, because "the call site says 8" only becomes an answer next to what the
+    // declarations actually signed: a tail that matches nothing and a tail that matches the wrong
+    // member read identically without them.
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(BaseLabel) + 1) = BaseLabel + '~' then
+        WriteLn(ErrOutput, 'OVL:   cand ', FProcedureNames[k]);
+  end;
   // ⭐ THE DECLARED WIDTH FIRST, when there is one. It is the only thing that tells "g(As Long)" from
   // "g(As Integer)": both sign the bank 'I', so before this the two collided and the FIRST declaration
   // won every call. Tried ahead of the other tails and then abandoned, so an overload set without a
   // narrow parameter takes exactly the path it took before.
   if WidthSig <> '' then
   begin
-    if ConstSig <> '' then
+    Result := WidthTailLabel(WidthSig);
+    if Result <> '' then Exit;
+    // ⚠️ ...AND THE SAME ATTEMPT WITH THE FIVE SPECIFIC CODES DEGRADED TO "unknown". The tail learned to
+    // say '8'/'9'/'A'/'B' (ULongInt, Int32, UInt32, Boolean) only after it had spent a while saying
+    // nothing for them, and a set that has no member of those types would now MISS where it used to
+    // match the all-placeholder form and go on to the arity fallback - which is precisely where the
+    // wrong overload lives. Asking twice keeps every call that resolved before resolving the same way,
+    // and resolves the new ones on the first attempt.
+    LegacySig := WidthSig;
+    for k := 1 to Length(LegacySig) do
+      if not (LegacySig[k] in ['1'..'7', 'Z', 'W']) then LegacySig[k] := '-';
+    if LegacySig <> WidthSig then
     begin
-      if UdtSig <> '' then
-      begin
-        Result := BaseLabel + '~' + Sig + ':' + UdtSig + '!' + ConstSig + '%' + WidthSig;
-        if FProcDecls.ContainsKey(Result) then Exit;
-      end;
-      Result := BaseLabel + '~' + Sig + '!' + ConstSig + '%' + WidthSig;
-      if FProcDecls.ContainsKey(Result) then Exit;
+      Result := WidthTailLabel(LegacySig);
+      if Result <> '' then Exit;
     end;
-    if UdtSig <> '' then
-    begin
-      Result := BaseLabel + '~' + Sig + ':' + UdtSig + '%' + WidthSig;
-      if FProcDecls.ContainsKey(Result) then Exit;
-    end;
-    Result := BaseLabel + '~' + Sig + '%' + WidthSig;
-    if FProcDecls.ContainsKey(Result) then Exit;
   end;
   // ⚠️ AND THE ALL-PLACEHOLDER FORM. An argument of full width contributes '-', and a set that has ANY
   // narrow member carries a tail on EVERY member - so the Integer overload of a Long/Integer pair signs

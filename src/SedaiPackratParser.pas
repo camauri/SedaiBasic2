@@ -743,7 +743,13 @@ begin
     // type; it can, for the shape that matters: a declared pointer VARIABLE or PARAMETER, which is what
     // such a call passes. When it cannot, it writes '-' and the resolver treats that as "any" (see
     // ResolveCallLabel), so nothing that resolved before stops resolving.
-    if (T <> '') and ((not IsBuiltinTypeName(T)) or (Pos(' PTR', T) > 0)) then
+    // ⛔ INT32 / UINT32 ARE NOT UDTs, and IsBuiltinTypeName does not know them (it is also the guard
+    // that keeps "Dim v As T = T(...)" from reading as a constructor, and a program is still free to
+    // declare a TYPE by those names). Left to fall through here they signed a NAME tail - "H~I:INT32%9" -
+    // which no call site can reproduce: an Int32 argument has no UDT name, so the width tail it now
+    // does produce ('9') could never be reached and the call fell onto the first declaration.
+    if (T <> '') and ((not IsBuiltinTypeName(T)) or (Pos(' PTR', T) > 0)) and
+       (T <> 'INT32') and (T <> 'UINT32') then
     begin
       Names := Names + T;
       AnyUDT := True;
