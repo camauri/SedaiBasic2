@@ -511,10 +511,50 @@ function IsShadowableExtensionName(const NameU: string): Boolean;
 // (functions/fixstr_arg). Everything the declaration needs is already in place: SedaiSSA consults
 // FProcedureNames BEFORE the intrinsic chain, so a program that declares one wins at every call site
 // and every program that does not keeps the intrinsic.
+//
+// ⭐⭐ 28 Aug 2026: THE LIST IS NOW THE MEASURED SET, not a hand-written one. The note above measured
+// the WIDTH over the names the fbc suite actually DECLARES, and answered "VAL is the only one" - a
+// true answer to a narrower question. The question that decides what we refuse is the other one:
+// which of OUR reserved words does fbc leave free to a program? Asked mechanically - every one of our
+// 531 keywords compiled by fbc as "Sub <name>() : End Sub : <name>()" - the answer is 47.
+// Two kinds, and both are ours to give back:
+//   - names fbc HAS NO IDEA ABOUT because they are our own MODERN extensions (CORECOUNT, REGEXREPLACE,
+//     VALINT, THREADSELF, FILECOPY, EXPNOTATION, ...): reserving them makes a valid FreeBASIC program
+//     fail to compile on a word FreeBASIC leaves alone;
+//   - intrinsics fbc lets a program SHADOW anyway (HEX, OCT, BIN, SINH, NOW, LOG10, ...).
+// ⛔ And this is the COMMODORE/FreeBASIC tables mixing, which this project's own rule forbids: a word
+// that is a keyword in Commodore BASIC v7 is not thereby a keyword in FreeBASIC. Every call site is
+// already gated on FModernMode, so CLASSIC keeps every one of them reserved.
+// ⭐ Nothing else is needed: SedaiSSA consults FProcedureNames BEFORE the intrinsic chain, so a program
+// that declares one wins at every call site and every program that does not keeps the intrinsic.
+// ⛔⛔ AND THE 47 DID NOT ALL SURVIVE THE NETS - 14 had to come back out, each with a reproduction:
+//   - FILECOPY, FILEFLUSH, FILESETEOF, GETMOUSE, IMAGEINFO, SCREENCONTROL, SETCOLOR, THREADDETACH,
+//     GSHAPE, SSHAPE: OUR OWN extensions are dispatched by KEYWORD TOKEN, so reading the name as an
+//     identifier loses the builtin outright ("Undefined procedure: THREADDETACH", and an omitted
+//     graphics argument stops parsing);
+//   - HEX, BIN, OCT, WBIN, WHEX, WOCT: safe in an expression, but called AS A STATEMENT with the
+//     result discarded - which is exactly what functions/ignore-result.bas does - the call reads as an
+//     ARRAY ACCESS ("Array not declared: WHEX").
+// ⇒ 39 ship. The discriminator is not "is it ours" but "does the builtin survive being read as an
+// identifier at EVERY use site", and only the nets could answer it: the corpus named ten, the fbc
+// suite's CUERR named the eleventh, and a probe over all 44 remaining names in the statement-call
+// shape named the last five at once.
+// ⚠️ The measured set is UNIONED with the original eight, not substituted for them: the census asks
+// "which names does fbc accept and WE refuse", so a name we already let through (MIN, VAL, ...) can
+// never appear in it. Replacing the list with the census would have taken those eight back out.
+const
+  SHADOWABLE: array[0..38] of string = (
+    'ACOSH', 'ASINH', 'ATAN', 'ATANH', 'BITSTOSINGLE', 'BSAVE', 'CEIL', 'COPYSIGN',
+    'CORECOUNT', 'COSH', 'CPUCOUNT', 'DEFLNGINT', 'EXPNOTATION', 'GETCOLOR', 'LOAD', 'LOG10',
+    'LOG2', 'LOGN', 'MAX', 'MIN', 'NOW', 'PLOAD', 'PROCESSORCOUNT', 'PRST', 'PSAVE',
+    'REGEXCOUNT', 'REGEXREPLACE', 'ROUND', 'SINGLEBITS', 'SINH', 'STICK', 'STRIG', 'TANH',
+    'THREADSELF', 'VAL', 'VALINT', 'VALLNG', 'VALUINT', 'VALULNG');
+var
+  i: Integer;
 begin
-  Result := (NameU = 'MIN') or (NameU = 'MAX') or (NameU = 'CEIL') or (NameU = 'ROUND') or
-            (NameU = 'COPYSIGN') or (NameU = 'SINGLEBITS') or (NameU = 'BITSTOSINGLE') or
-            (NameU = 'VAL');
+  Result := False;
+  for i := Low(SHADOWABLE) to High(SHADOWABLE) do
+    if NameU = SHADOWABLE[i] then Exit(True);
 end;
 
 { TPackratParser }

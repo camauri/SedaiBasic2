@@ -11429,6 +11429,24 @@ begin
       // Each element record is flat; if the element type has member arrays / nested-UDT fields, give every
       // element that per-instance backing too (else "arr(i).member(j)" hits a handle-0 array).
       EmitRecordArrayInit(ArrayIdx, RecArrUDTIdx);
+      // ⛔⛔ ...AND IF THE DIM IS INSIDE A BLOCK, THE ELEMENTS MUST BE DESTROYED WHEN THE BLOCK CLOSES.
+      // m642 gave the FRAME collector both shapes (CollectRecordVars marks an array "|A"), so an array
+      // of UDT declared in a Sub is torn down correctly - but the BLOCK path registers incrementally,
+      // right here at the lowering, and only the SCALAR arm ever did it. So "Scope : Dim v(0 To 1) As T
+      // : End Scope" ran ZERO destructors where fbc runs two, silently, while the same declaration one
+      // level up in a Sub ran both. Measured: scalar-in-a-Scope 1/1, array-in-a-Sub 2/2, array-in-a-
+      // Scope 0/2.
+      // ⭐ Nothing else is needed: EmitBlockScopeCleanup already splits the "|A" form and walks the
+      // elements - the teardown knew about arrays, the registration did not.
+      BlkIdx := InnermostBlockFrameIdx;
+      if BlkIdx >= 0 then
+      begin
+        FScopeStack[BlkIdx].Dtors.Add(UpperCase(ArrName) + '|' + FUDTs[RecArrUDTIdx].Name + '|A');
+        // ...and take it off the frame/module teardown, which would otherwise destroy it a second time
+        // on a handle the block has already reclaimed. The scalar arm does exactly this.
+        if FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, ArrName)) < 0 then
+          FBlockHandledVars.Add(BlockHandledKey(FCurrentProcName, ArrName));
+      end;
     end;
 
     // FreeBASIC array initializer "=> { v0, v1, ... }": store each value into element k (0-based flat
