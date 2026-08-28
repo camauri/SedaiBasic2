@@ -458,6 +458,8 @@ type
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseNameStatement: TASTNode;         // FreeBASIC NAME old AS new (rename)
     function PeekNameHasAs: Boolean;               // lookahead: NAME ... AS ... on this statement
+    function AsmBlockIsEmpty: Boolean;
+    procedure SkipAsmBlock;
     function AsmStatementFollows: Boolean;         // lookahead: "Asm <instruction>" on ONE line
     function LooksLikeImageTarget: Boolean;        // lookahead: "cmd img, (x,y)..." FB image draw-target form
     function ParseRaiseErrorStatement: TASTNode;   // FreeBASIC ERROR <n> (raise runtime error)
@@ -1836,6 +1838,19 @@ begin
                  (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) or
                  AsmStatementFollows) then
         begin
+          // ⭐ ...BUT A BLOCK WITH NO INSTRUCTION IN IT HAS NOTHING TO TRANSLATE. The comment above
+          // names the distinction ("a block that emits nothing would be one thing") and it is a real
+          // program: fbc's pp/pragma-reserve-7 writes "asm / #if defined(symbol) / #error / #endif /
+          // end asm" - a block whose whole content is PREPROCESSOR directives, which are consumed
+          // before the parser ever sees them. The test is about the reserved-symbol lists, not about
+          // assembly. Refusing it declared a limitation the program does not use.
+          // ⛔ The moment there is a TOKEN between the two, the refusal stands: a block that does real
+          // work must not be silently dropped, which would put a wrong answer where a diagnostic was.
+          if AsmBlockIsEmpty then
+          begin
+            SkipAsmBlock;
+            Exit(nil);
+          end;
           HandleError('Inline assembly (ASM ... END ASM) is not supported: this is a bytecode VM, ' +
                       'and one of its engines is an interpreter. Rewrite the block in BASIC.',
                       Token);
@@ -4050,6 +4065,17 @@ var
   k: Integer;
 begin
   if Context.Check(ttIdentifier) then Exit(True);
+  // ⭐ ...AND A TYPE THE PROGRAM HAS ALREADY DECLARED, whatever KIND of token its name lexes as. A
+  // quirk keyword may name a type ("Type print As Integer", fbc's typedef/identifiers), and the
+  // declaration side learned that first: without the same rule here, "Dim p As print" then answered
+  // "Expected type name after AS" - the DECLARING half taught and the USING half not, one more of
+  // [[a-rule-one-path-has-and-the-other-does-not]]. This funnel is where every AS gate asks, so the
+  // rule is written once.
+  // ⛔ Only a name the program has actually DECLARED as a type: nothing else about the token's kind is
+  // relaxed, so "As Const Integer" and "As Function(...)" keep meaning what they mean.
+  if Assigned(Context.CurrentToken) and (VarToStr(Context.CurrentToken.Value) <> '') and
+     (FTypeNamesSeen.IndexOf(UpperCase(VarToStr(Context.CurrentToken.Value))) >= 0) then
+    Exit(True);
   Result := False;
   if not Context.Check(ttOpDot) then Exit;
   k := 1;
@@ -4666,7 +4692,18 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
-  if not Context.Check(ttIdentifier) then
+  // ⭐ A QUIRK KEYWORD CAN NAME A TYPE. fbc's typedef/identifiers writes "type print as integer" and
+  // says why in its own comment: "typedefs can be named after quirk keywords, just like UDTs". A quirk
+  // keyword is a keyword only where a STATEMENT can start - PRINT, CLOSE, DIR - and right after the
+  // word TYPE no statement can start, so the name position is unambiguous and the token's KIND is not
+  // the question. The refusal is kept for what really cannot name a type.
+  // ⛔ A BUILTIN TYPE NAME still cannot: "Type Integer" is not a declaration fbc accepts, and letting
+  // it through would turn a refusal into an acceptance. The leading-AS form ("Type As Integer a, b")
+  // is consumed above, so AS never reaches here.
+  if (not Context.Check(ttIdentifier)) and
+     ((Context.CurrentToken = nil) or (VarToStr(Context.CurrentToken.Value) = '') or
+      IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) or
+      not (UpperCase(VarToStr(Context.CurrentToken.Value))[1] in ['A'..'Z', '_'])) then
   begin
     HandleError(Format('"%s" is a reserved word and cannot be used as a type name',
                        [Context.CurrentToken.Value]), Context.CurrentToken);
@@ -8772,6 +8809,52 @@ begin
   Result := Assigned(T2) and (T2.TokenType = ttSeparParam) and
             Assigned(Context.PeekToken(k + 1)) and
             (Context.PeekToken(k + 1).TokenType = ttDelimParOpen);
+end;
+
+function TPackratParser.AsmBlockIsEmpty: Boolean;
+// True when "Asm ... End Asm" holds no TOKEN at all between the two - only line ends. Such a block has
+// nothing to translate, so it is dropped instead of refused: fbc's own pp/pragma-reserve-7 writes one
+// whose entire content is PREPROCESSOR directives, and those are consumed before the parser sees them.
+// ⛔ Lookahead only - the token position is not moved. Any real token, on any line, answers False and
+// the declared refusal stands: a block that does work must never be silently dropped.
+var
+  k: Integer;
+  T, N: TLexerToken;
+begin
+  Result := False;
+  if (Context.PeekNext <> nil) and
+     not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then Exit;  // one-line form
+  k := 1;
+  while True do
+  begin
+    T := Context.PeekToken(k);
+    if (T = nil) or (T.TokenType = ttEndOfFile) then Exit;      // unterminated: leave it to the refusal
+    if T.TokenType in [ttEndOfLine, ttSeparStmt] then begin Inc(k); Continue; end;
+    if T.TokenType = ttProgramEnd then
+    begin
+      N := Context.PeekToken(k + 1);
+      if (N <> nil) and (N.TokenType = ttIdentifier) and
+         (UpperCase(VarToStr(N.Value)) = 'ASM') then Exit(True);   // END ASM reached, nothing between
+      Exit;
+    end;
+    Exit;                                                       // a real token: not empty
+  end;
+end;
+
+procedure TPackratParser.SkipAsmBlock;
+// Consume "Asm ... End Asm". Only ever called for a block AsmBlockIsEmpty has approved.
+begin
+  while not Context.CheckAny([ttEndOfFile]) do
+  begin
+    if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttIdentifier) and
+       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ASM') then
+    begin
+      Context.Advance; Context.Advance;      // END ASM
+      Break;
+    end;
+    Context.Advance;
+  end;
 end;
 
 function TPackratParser.AsmStatementFollows: Boolean;
