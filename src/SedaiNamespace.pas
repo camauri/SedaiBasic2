@@ -676,7 +676,31 @@ begin
       end;
       if Ctx.NamespaceNames.IndexOf(BaseName) >= 0 then
       begin
-        Mangled := BaseName + '.' + UpperCase(VarToStr(Node.Value));
+        // ⛔ ...AND A QUALIFIED NAME REACHES WHAT THAT NAMESPACE CAN SEE, NOT ONLY WHAT IT DECLARES.
+        // "Namespace B : Using A : End Namespace" makes "B.x" name A's x - fbc's own namespace/using2,
+        // using_reimp2 and using all read a member through one or two USING hops. ResolveUnqualified
+        // has had that closure since m661 and this path did not: the very shape of
+        // [[a-rule-one-path-has-and-the-other-does-not]]. Worse than a refusal - the name was mangled
+        // to "B.X", which exists nowhere, and the read answered 0 in silence.
+        // ⚠️ Only when B does NOT declare the name itself: a namespace's own member always wins over an
+        // imported one, which is the order ResolveUnqualified already keeps.
+        V := UpperCase(VarToStr(Node.Value));
+        if not Ctx.IsMember(BaseName, V) then
+        begin
+          UseUsing := TStringList.Create;
+          try
+            Ctx.AddUsingClosure(BaseName, UseUsing);
+            for k := 0 to UseUsing.Count - 1 do
+              if Ctx.IsMember(UseUsing[k], V) then
+              begin
+                BaseName := UseUsing[k];
+                Break;
+              end;
+          finally
+            UseUsing.Free;
+          end;
+        end;
+        Mangled := BaseName + '.' + V;
         NewNode := TASTNode.CreateWithValue(antIdentifier, Mangled, BaseId.Token);
         Result := NewNode;          // caller frees old Node
         Exit;
@@ -762,6 +786,22 @@ begin
        ((Shadow = nil) or (Shadow.IndexOf(BaseV) < 0)) then
     begin
       Mangled := ResolveUnqualified(ActivePrefix, BaseV, Ctx, Using);
+      if Mangled <> '' then Node.Value := Mangled + SigV;
+    end
+    // ⭐ ...AND A GLOBALSCOPE NAME STILL REACHES WHAT A "USING" IMPORTED. A leading '.' asks not to be
+    // resolved against the ENCLOSING namespace; it does not ask to ignore the imports, because a
+    // module-level "Using N" puts N's members into exactly the scope the dot names. fbc's own
+    // namespace/using reads ".bar" of a namespace imported at module level, and namespace/global and
+    // dups2/dups3 do the same. Without this the dot resolved to nothing and the read answered 0.
+    // ⚠️ ResolveUnqualified declines any name the program declares at module level (GlobalNames), so
+    // ".v" beside a "Dim Shared v" still means the module-level v - the rule the dot was written for.
+    // The enclosing chain is passed as '' on purpose: the dot asked for none of it.
+    else if (Pos('.', BaseV) = 0) and (BaseV <> '') and
+            (Node.Attributes.Values['GLOBALSCOPE'] = '1') and
+            (Using <> nil) and (Using.Count > 0) and
+            ((Shadow = nil) or (Shadow.IndexOf(BaseV) < 0)) then
+    begin
+      Mangled := ResolveUnqualified('', BaseV, Ctx, Using);
       if Mangled <> '' then Node.Value := Mangled + SigV;
     end;
   end;

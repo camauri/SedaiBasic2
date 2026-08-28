@@ -430,14 +430,16 @@ type
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
-    function GetOrAllocateVariable(const VarName: string): TSSAValue;
+    function GetOrAllocateVariable(const VarName: string; ModuleOnly: Boolean = False): TSSAValue;
     // FB lexical scope (MODERN). ResolveExisting walks FScopeStack innermost->outermost (stopping at a
     // proc-root for non-shared names) then falls back to the module namespace (FVarMap). BindOrResolve
     // resolves a use, or binds a new register: explicit DIM in the innermost frame (shadowing), implicit
     // first-use at the nearest proc-root/module. DeclareVariable is the explicit-declaration entry point.
-    function ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
+    function ResolveExisting(const VarName: string; out Reg: TSSAValue;
+      ModuleOnly: Boolean = False): Boolean;
     function BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
-                           UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt): TSSAValue;
+                           UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt;
+                           ModuleOnly: Boolean = False): TSSAValue;
     function DeclareVariable(const VarName: string): TSSAValue;
     function DeclareVariableTyped(const VarName: string; RegType: TSSARegisterType): TSSAValue;  // explicit DIM with a known bank
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
@@ -621,6 +623,7 @@ type
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)? False when shadowed by a param/local
     function TypeEnumMemberOwner(const TypeName, MemberName: string): string;   // ENUM member declared inside a TYPE
+    function ModuleConstIntRaw(const Name: string; out V: Int64): Boolean;
     function ModuleConstInt(const Name: string; out V: Int64): Boolean;         // name is a module CONST with an integer literal value? (folds to an immediate)
     function IsSharedScalarRaw(const Name: string): Boolean;                    // ...as DECLARED, ignoring shadowing (the slot-sync asks HOW it is stored, not WHICH variable is meant)
     function SharedScalarShadowed(const Name: string): Boolean;                 // ...is a param/local of the procedure being lowered hiding it? (MODERN)
@@ -893,6 +896,7 @@ type
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue); overload;
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue); overload;
+    function TryGlobalScopeRead(Node: TASTNode; out Res: TSSAValue): Boolean;   // ".x" = the module-level x
     function TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
     function IsTypeCtorTemporary(Node: TASTNode): Boolean;   // "type<T>(args)" / "T(args)" anonymous temporary
@@ -1616,11 +1620,18 @@ begin
   end;
 end;
 
-function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
+function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue;
+  ModuleOnly: Boolean): Boolean;
 // FB lexical scope (MODERN): find an existing binding for VarName. Walk the scope stack
 // innermost->outermost; stop at a proc-root for a non-shared name (so a plain module DIM is invisible
 // inside a SUB), but let DIM SHARED globals fall through to the module namespace. The module namespace
 // is FVarMap (case-insensitive). Returns False if the name is not yet bound anywhere visible here.
+//
+// ⭐ ModuleOnly = a LEADING DOT: ".x" names the MODULE-LEVEL x and nothing else - past every local,
+// past every enclosing scope, past every namespace and every import. fbc's namespace/global3 asserts
+// it at four nesting depths and namespace/global spells it three ways ('.x', '..x' and a "#define
+// global ." macro). Without it ".x" resolved like a bare name and answered the innermost local: a
+// WRONG ANSWER, not a refusal.
 var
   f, idx: Integer;
   nameU: string;
@@ -1629,6 +1640,33 @@ var
 begin
   Result := False;
   nameU := UpperCase(VarName);
+  if ModuleOnly then
+  begin
+    // The MODULE frames first (everything before the first proc-root), outermost inwards, then the
+    // module namespace itself. ⛔ Both halves are needed: a module-level DIM binds in skModule frame 0
+    // when one is open and in FVarMap when none is, so asking only FVarMap answered 0 - the name
+    // resolved to nothing and a fresh register was allocated, which is a wrong answer wearing the
+    // shape of a right one.
+    for f := 0 to High(FScopeStack) do
+    begin
+      if FScopeStack[f].Kind = skProcRoot then Break;
+      idx := FScopeStack[f].Bindings.IndexOf(nameU);
+      if idx >= 0 then
+      begin
+        pk := PtrInt(FScopeStack[f].Bindings.Objects[idx]);
+        Reg := MakeSSARegister(TSSARegisterType(pk shr 16), pk and $FFFF);
+        Exit(True);
+      end;
+    end;
+    idx := FVarMap.IndexOf(VarName);
+    if idx >= 0 then
+    begin
+      pk := PtrInt(FVarMap.Objects[idx]);
+      Reg := MakeSSARegister(TSSARegisterType(pk shr 16), pk and $FFFF);
+      Result := True;
+    end;
+    Exit;
+  end;
   isShared := FSharedVars.IndexOf(nameU) >= 0;
   for f := High(FScopeStack) downto 0 do
   begin
@@ -1652,7 +1690,8 @@ begin
 end;
 
 function TSSAGenerator.BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
-  UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt): TSSAValue;
+  UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt;
+  ModuleOnly: Boolean = False): TSSAValue;
 // FB lexical scope (MODERN): resolve a use, or allocate+bind a new register. An explicit DIM binds in
 // the innermost scope frame (shadowing any outer same-name binding); an implicit first-use (or an
 // explicit DIM at pure module level) resolves if already present, else binds at the nearest proc-root,
@@ -1669,12 +1708,15 @@ var
   pk: PtrInt;
 begin
   // A use, or an explicit declaration at module level, first tries to resolve an existing binding.
-  if (not IsExplicitDecl) or (Length(FScopeStack) = 0) then
-    if ResolveExisting(VarName, Result) then Exit;
-
+  if (not IsExplicitDecl) or (Length(FScopeStack) = 0) or ModuleOnly then
+    if ResolveExisting(VarName, Result, ModuleOnly) then Exit;
   nameU := UpperCase(VarName);
   // Choose the binding frame: explicit DIM -> innermost frame; implicit -> nearest proc-root (else module).
-  if IsExplicitDecl and (Length(FScopeStack) > 0) then
+  // ⛔ ...unless a LEADING DOT asked for the module namespace: ".x" cannot mean a local, so a first use
+  // of it must create the MODULE-level one and never a scope-frame binding.
+  if ModuleOnly then
+    targetIdx := -1
+  else if IsExplicitDecl and (Length(FScopeStack) > 0) then
     targetIdx := High(FScopeStack)
   else
   begin
@@ -1731,7 +1773,8 @@ begin
   Result := BindOrResolve(VarName, True, True, RegType);
 end;
 
-function TSSAGenerator.GetOrAllocateVariable(const VarName: string): TSSAValue;
+function TSSAGenerator.GetOrAllocateVariable(const VarName: string;
+  ModuleOnly: Boolean = False): TSSAValue;
 var
   Idx: Integer;
   RegType: TSSARegisterType;
@@ -1741,7 +1784,7 @@ begin
   // MODERN: route through the scope-aware resolver (a use / implicit first-use).
   if FModernMode then
   begin
-    Result := BindOrResolve(VarName, False);
+    Result := BindOrResolve(VarName, False, False, srtInt, ModuleOnly);
     Exit;
   end;
   // CLASSIC: legacy global-by-name (unchanged BASIC v7 semantics).
@@ -2203,6 +2246,47 @@ begin
   ProcessExpressionFull(Node, Result, DestHint);
 end;
 
+function TSSAGenerator.TryGlobalScopeRead(Node: TASTNode; out Res: TSSAValue): Boolean;
+// ⭐ A LEADING DOT NAMES THE MODULE-LEVEL VARIABLE, AND NOTHING ELSE. ".x" reaches past every local,
+// every enclosing scope, every namespace and every import - fbc's namespace/global3 asserts it at four
+// nesting depths, and namespace/global spells the same request three ways ('.x', '..x', and a
+// "#define global ." macro). We resolved it like a bare name and answered the innermost binding: a
+// WRONG ANSWER, silently, wherever a local happened to share the spelling.
+//
+// ⛔ AND IT HAS TO SKIP THE SHADOW TEST, NOT ONLY THE SCOPE STACK. A "Dim Shared" scalar is backed by a
+// one-element global array and IsSharedScalar asks IsSharedScalarRaw AND NOT SharedScalarShadowed - so
+// inside a SUB with a local of the same name the shared route switched itself off and the read fell
+// through to a register. Asking the RAW half here is what makes ".x" find the global's storage.
+var
+  AccNode: TASTNode;
+  ConstIntVal: Int64;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antIdentifier) then Exit;
+  if Node.Attributes.Values['GLOBALSCOPE'] <> '1' then Exit;
+  if VarToStr(Node.Value) = '' then Exit;
+  // A module CONST is not a variable: the dot names its value, exactly as the bare name would.
+  if ModuleConstIntRaw(VarToStr(Node.Value), ConstIntVal) then
+  begin
+    Res := MakeSSAConstInt(ConstIntVal);
+    Exit(True);
+  end;
+  if IsSharedScalarRaw(VarToStr(Node.Value)) and not IsRawModuleScalar(VarToStr(Node.Value)) then
+  begin
+    AccNode := MakeSharedScalarAccess(VarToStr(Node.Value), Node.Token);
+    try
+      ProcessExpression(AccNode, Res);
+    finally
+      AccNode.Free;
+    end;
+    if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
+    Exit(True);
+  end;
+  Res := GetOrAllocateVariable(VarToStr(Node.Value), True);
+  if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
+  Result := True;
+end;
+
 function TSSAGenerator.TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
 // Second dispatcher fast path: a bare identifier the program DECLARED, resolved without entering
 // the big frame. Mirrors the full antIdentifier branch: a declared name disables every bare-name
@@ -2215,6 +2299,11 @@ var
 begin
   Result := False;
   VarName := VarToStr(Node.Value);
+  // ⭐ A LEADING DOT is asked HERE as well as in the full branch, through the one funnel both share.
+  // This fast path is where a DECLARED name is resolved - which is exactly what ".x" is - so with the
+  // rule only in the full branch it never ran at all: [[a-rule-one-path-has-and-the-other-does-not]],
+  // and the second dispatcher is where that keeps happening.
+  if TryGlobalScopeRead(Node, Res) then Exit(True);
   if not IsDeclaredName(VarName) then Exit;
   if FCurrentThisType <> '' then Exit;
   if IsAddrParam(VarName) or IsRefVar(VarName) or IsAddrLocal(VarName) or
@@ -3030,6 +3119,8 @@ begin
     antIdentifier:
     begin
       VarName := VarToStr(Node.Value);
+      // ⭐ A LEADING DOT: the MODULE-LEVEL name, through the funnel the fast path shares.
+      if TryGlobalScopeRead(Node, Result) then Exit;
       // The bare-name intercepts below give a builtin meaning to a name used without parentheses.
       // They stand aside for any name the program declared explicitly (DIM/VAR/STATIC/CONST/parameter),
       // so "Dim As Integer curdir" is the variable it plainly asks for rather than being dropped in
@@ -3248,7 +3339,9 @@ begin
       begin
         // Return the register assigned to this variable. A fixed-length string converts to its
         // variable-length form here (see TryFixedLenStore's header); no-op for every other variable.
-        Result := GetOrAllocateVariable(VarName);
+        // ⭐ A LEADING DOT asks for the MODULE-LEVEL variable: past every local, every enclosing
+        // scope and every import. See ResolveExisting.
+        Result := GetOrAllocateVariable(VarName, Node.Attributes.Values['GLOBALSCOPE'] = '1');
         if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
       end;
     end;
@@ -30037,10 +30130,10 @@ begin
   end;
 end;
 
-function TSSAGenerator.ModuleConstInt(const Name: string; out V: Int64): Boolean;
-// A module-level CONST whose value is an integer literal. Reads of it fold to that immediate instead
-// of loading element 0 of the SHARED backing array it is otherwise stored in. Shadowing is asked the
-// same way IsSharedScalar asks it: a parameter or local DIM of the same name is a different variable.
+function TSSAGenerator.ModuleConstIntRaw(const Name: string; out V: Int64): Boolean;
+// The same question as ModuleConstInt, WITHOUT the shadow test - the ".x" form asks for the module
+// entity by name and a local of that spelling is exactly what it is reaching past. Split so the two
+// callers cannot drift: ModuleConstInt is this plus the shadow test.
 var idx: Integer; sv: string;
 begin
   V := 0;
@@ -30048,10 +30141,20 @@ begin
   if FModuleConstVals = nil then Exit;
   idx := FModuleConstVals.IndexOfName(UpperCase(Name));
   if idx < 0 then Exit;
-  if SharedScalarShadowed(Name) then Exit;
   sv := FModuleConstVals.ValueFromIndex[idx];
   if not TryStrToInt64(sv, V) then Exit;
   Result := True;
+end;
+
+function TSSAGenerator.ModuleConstInt(const Name: string; out V: Int64): Boolean;
+// A module-level CONST whose value is an integer literal. Reads of it fold to that immediate instead
+// of loading element 0 of the SHARED backing array it is otherwise stored in. Shadowing is asked the
+// same way IsSharedScalar asks it: a parameter or local DIM of the same name is a different variable.
+begin
+  V := 0;
+  Result := False;
+  if SharedScalarShadowed(Name) then Exit;
+  Result := ModuleConstIntRaw(Name, V);
 end;
 
 function TSSAGenerator.IsSharedScalarRaw(const Name: string): Boolean;
@@ -38267,6 +38370,7 @@ var
   ExitLoopKind: TLoopKind;
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
   ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
+  TmpCallNode: TASTNode;        // a bare qualified name used as a statement call (we free it)
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
   if Node = nil then Exit;
@@ -38396,6 +38500,28 @@ begin
       // Statement-level call for side effects (e.g. obj.method(args), a function/array expression used
       // as a statement, or GETMOUSE(x,y) called for its by-reference writes). Lower and discard the result.
       ProcessExpression(Node, RetVal);
+    antIdentifier:
+      // ⭐ A NAMESPACE-QUALIFIED SUB CALLED AS A BARE STATEMENT: "ns3.dotest", no parentheses. It parses
+      // as an antMemberAccess - which the arm just above lowers - but the NAMESPACE pass collapses a
+      // qualified name into ONE mangled identifier, and a bare identifier was no statement at all: the
+      // call fell off the end of this dispatcher, was DROPPED IN SILENCE (one warning on stderr, which
+      // no net reads) and the program ran on without it. fbc's own namespace/dups2 calls its test
+      // procedure exactly that way. ⛔ The same call WITH parentheses always worked, which is what said
+      // the defect was in the statement form and not in the name.
+      // Only a name that really is a procedure: a bare variable name is not a statement, and turning
+      // one into a call would invent a program. Routed through the very node the parser builds for an
+      // unqualified "s", so there is ONE lowering for a bare call and not two.
+      if (VarToStr(Node.Value) <> '') and
+         (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) >= 0) then
+      begin
+        TmpCallNode := TASTNode.CreateWithValue(antProcedureCall, VarToStr(Node.Value), Node.Token);
+        try
+          TmpCallNode.AddChild(TASTNode.Create(antArgumentList, Node.Token));
+          ProcessProcedureCall(TmpCallNode);
+        finally
+          TmpCallNode.Free;
+        end;
+      end;
     antLabel:
     begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
