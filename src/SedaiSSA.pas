@@ -338,6 +338,16 @@ type
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
                                          // (push/resolve), since REDIM changes the strides; others stay const-folded.
+    // ⭐ Array names (UPPER) whose DIM STATED a rank - "a(Any)", "a(Any,Any)", "a(0 To 1, 0 To 2)".
+    // ⛔ NOT the same as "has a DimCount": a bare "Dim a()" states NO rank and its first ReDim fixes
+    // one, so the rank rule may not be asked of it. This set is what tells the two apart, and it is
+    // filled from the DECLARATION's own dimension list, which is the only place that knows.
+    FRankStatedArrays: TStringList;
+    // ⛔ ...and the names DECLARED MORE THAN ONCE, which leave the set for good. This registry is keyed
+    // on a bare NAME with no scope - the trap this codebase has paid for repeatedly - and the fbc
+    // suite's overload/bydesc declares "array2" in eight sibling TEST blocks with FOUR different ranks.
+    // One name, one rank, or no opinion: a name declared twice is never asked about again.
+    FRankPoisoned: TStringList;
     FDynamicArrays: TStringList;         // array names (UPPER) that are dynamic (declared empty "()" or a REDIM
     // Fra gli array DINAMICI, quelli in cui OGNI Dim/ReDim del programma dichiara il limite
     // inferiore come lo zero LETTERALE (o lo omette, che vuol dire zero). Per questi l'accesso non
@@ -1406,6 +1416,10 @@ begin
   FWStringVars.CaseSensitive := False;
   FRedimMultiArrays := TStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
+  FRankStatedArrays := TStringList.Create;
+  FRankStatedArrays.CaseSensitive := False;
+  FRankPoisoned := TStringList.Create;
+  FRankPoisoned.CaseSensitive := False;
   FDynamicArrays := TStringList.Create;
   FZeroLbArrays := TStringList.Create;
   FZeroLbPoisoned := TStringList.Create;
@@ -1521,6 +1535,8 @@ begin
   FVarPtrQuals.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
+  FRankStatedArrays.Free;
+  FRankPoisoned.Free;
   FDynamicArrays.Free;
   FZeroLbArrays.Free;
   FZeroLbPoisoned.Free;
@@ -7786,6 +7802,23 @@ begin
         ArrInfo := FProgram.GetArray(ArrayIdx);
         IndicesNode := Node.GetChild(1);  // antExpressionList
 
+        // ⭐ AN INDEX LIST MUST HAVE AS MANY INDICES AS THE ARRAY HAS DIMENSIONS. fbc: "error 36:
+        // Wrong number of dimensions". "Dim a(Any)" is rank 1 and "a(0, 0)" is an error; so is "a(0)"
+        // on a rank-2 one - and we answered 0 for both, silently, because the linear index folded to
+        // something in range. ⛔ An array PARAMETER is exempt: it aliases whatever the caller passed
+        // and its local DimCount is a placeholder, not a promise.
+        // ⛔ A name that reached here MANGLED - a block-scoped or STATIC-hoisted array carries a dotted
+        // key - is not the name the registry was written under, and asking anyway applies a fact keyed
+        // on the BARE name to another declaration's array. fbc's own dim/array_ellipsis_init declares
+        // "static array(...)" in four sibling Scopes and was refused for it. Not our question: skip.
+        if (Pos('.', ArrName) = 0) and
+           (FRankStatedArrays.IndexOf(UpperCase(ArrName)) >= 0) and
+           (ArrInfo.DimCount >= 1) and (IndicesNode.ChildCount >= 1) and
+           (IndicesNode.ChildCount <> ArrInfo.DimCount) and
+           (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+          raise Exception.CreateFmt('Wrong number of dimensions for %s: it has %d, this access ' +
+            'gives %d', [ArrName, ArrInfo.DimCount, IndicesNode.ChildCount]);
+
         // Evaluate each index expression
         SetLength(Indices, IndicesNode.ChildCount);
         for i := 0 to IndicesNode.ChildCount - 1 do
@@ -10043,6 +10076,18 @@ begin
   ArrInfoTmp := FProgram.GetArray(ArrayIdx);
   ArrInfo := ArrInfoTmp;
   IndicesNode := TargetNode.GetChild(1);  // antExpressionList
+  // ...and the WRITE half of the rule above: "a(0, 0) = x" on a rank-1 array is the same error 36.
+  // ⛔ A name that reached here MANGLED - a block-scoped or STATIC-hoisted array carries a dotted
+  // key - is not the name the registry was written under, and asking anyway applies a fact keyed
+  // on the BARE name to another declaration's array. fbc's own dim/array_ellipsis_init declares
+  // "static array(...)" in four sibling Scopes and was refused for it. Not our question: skip.
+  if (Pos('.', ArrName) = 0) and
+     (FRankStatedArrays.IndexOf(UpperCase(ArrName)) >= 0) and
+     (ArrInfo.DimCount >= 1) and (IndicesNode.ChildCount >= 1) and
+     (IndicesNode.ChildCount <> ArrInfo.DimCount) and
+     (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+    raise Exception.CreateFmt('Wrong number of dimensions for %s: it has %d, this access gives %d',
+      [ArrName, ArrInfo.DimCount, IndicesNode.ChildCount]);
 
   // Evaluate each index expression
   SetLength(Indices, IndicesNode.ChildCount);
@@ -11704,6 +11749,23 @@ begin
       raise Exception.CreateFmt('REDIM: invalid dimensions for %s', [ArrName]);
     if DimsNode.ChildCount < 1 then
       raise Exception.CreateFmt('REDIM: missing dimensions for %s', [ArrName]);
+    // ⭐ AN ARRAY'S RANK IS FIXED BY ITS DECLARATION, and a REDIM may change the SIZE and not the
+    // number of dimensions. fbc: "error 36: Wrong number of dimensions". "Dim a(Any)" states rank 1
+    // and "ReDim a(0 To 0, 0 To 0)" is an error; so is the second of two REDIMs that disagree.
+    // ⛔ An array PARAMETER is exempt: it aliases whatever the caller passed and its local DimCount is
+    // a placeholder, not a promise (UsesRuntimeLBound is the same test the index lowering uses to tell
+    // one apart).
+    // ⛔ A name that reached here MANGLED - a block-scoped or STATIC-hoisted array carries a dotted
+    // key - is not the name the registry was written under, and asking anyway applies a fact keyed
+    // on the BARE name to another declaration's array. fbc's own dim/array_ellipsis_init declares
+    // "static array(...)" in four sibling Scopes and was refused for it. Not our question: skip.
+    if (Pos('.', ArrName) = 0) and
+       (FRankStatedArrays.IndexOf(ArrName) >= 0) and
+       (FProgram.GetArray(ArrayIdx).DimCount >= 1) and
+       (DimsNode.ChildCount <> FProgram.GetArray(ArrayIdx).DimCount) and
+       (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+      raise Exception.CreateFmt('Wrong number of dimensions for %s: it was declared with %d, ' +
+        'this ReDim gives %d', [ArrName, FProgram.GetArray(ArrayIdx).DimCount, DimsNode.ChildCount]);
 
     if DimsNode.ChildCount = 1 then
     begin
@@ -32648,9 +32710,9 @@ procedure TSSAGenerator.CollectDynamicArrays(Node: TASTNode);
 // writeback can carry a changed bound back to the caller's array), so its element access must subtract the
 // current lower bound rather than the one fixed at DIM time.
 var
-  i, k, k2: Integer;
+  i, k, k2, RankIdx: Integer;
   Decl, Dims: TASTNode;
-  Nm: string;
+  Nm, RankNm: string;
 begin
   if Node = nil then Exit;
   if (Node.NodeType = antRedim) or (Node.NodeType = antDim) then
@@ -32659,6 +32721,22 @@ begin
       Decl := Node.GetChild(k);
       if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) or
          (Decl.GetChild(0).NodeType <> antIdentifier) then Continue;
+      // ⭐ A DIM whose dimension list is NOT empty STATES the array's rank, and everything after it -
+      // a ReDim, an access - must agree. A "Dim a()" states none.
+      if Node.NodeType = antDim then
+      begin
+        RankNm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (FRankStatedArrays.IndexOf(RankNm) >= 0) or (FRankPoisoned.IndexOf(RankNm) >= 0) then
+        begin
+          // Declared before: one name with two declarations has no single rank we may speak for.
+          RankIdx := FRankStatedArrays.IndexOf(RankNm);
+          if RankIdx >= 0 then FRankStatedArrays.Delete(RankIdx);
+          if FRankPoisoned.IndexOf(RankNm) < 0 then FRankPoisoned.Add(RankNm);
+        end
+        else if (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antDimensions) and
+                (Decl.GetChild(1).ChildCount > 0) then
+          FRankStatedArrays.Add(RankNm);
+      end;
       // A REDIM target is always dynamic. A DIM is dynamic only when declared empty (no subscripts).
       if Node.NodeType = antDim then
       begin
@@ -38961,6 +39039,8 @@ begin
   // Dynamic arrays (declared empty "()" or any REDIM target): a REDIM can change the lower bound at run
   // time (and a ByRef writeback can propagate that changed bound back to a caller's array), so their
   // element access subtracts the RUNTIME lower bound instead of the compile-time DIM one.
+  FRankStatedArrays.Clear;
+  FRankPoisoned.Clear;
   FDynamicArrays.Clear;
   CollectDynamicArrays(AST);
   // ...and an EMPTY static ARRAY member ("Static a()") is dynamic too: ERASE frees it and it reports
