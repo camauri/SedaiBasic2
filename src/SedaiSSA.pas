@@ -534,6 +534,8 @@ type
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
+    function SplitRecordVar(const S: string; out VName, TName: string; out IsArray: Boolean): Boolean;
+    procedure EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
     procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
                                        FromFlatIndex: Integer;
                                        RunDtor: Boolean = False);  // ...and the CONSTRUCTOR (or the DESTRUCTOR) on each element
@@ -27640,18 +27642,17 @@ function TSSAGenerator.CurrentProcLocalRecType(const VarName: string): string;
 // FCurrentProcLocalRecs "VARNAME|TYPENAME"), or '' if VarName is not such a local. Lets a local shadow a
 // same-named module UDT variable in the global name->type map.
 var
-  i, bar: Integer;
-  VNameU: string;
+  i: Integer;
+  VNameU, EVName, ETName: string;
+  EIsArr: Boolean;
 begin
   Result := '';
   if FCurrentProcLocalRecs = nil then Exit;
   VNameU := UpperCase(VarName);
   for i := 0 to FCurrentProcLocalRecs.Count - 1 do
-  begin
-    bar := Pos('|', FCurrentProcLocalRecs[i]);
-    if (bar > 0) and (UpperCase(Copy(FCurrentProcLocalRecs[i], 1, bar - 1)) = VNameU) then
-      Exit(Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt));
-  end;
+    if SplitRecordVar(FCurrentProcLocalRecs[i], EVName, ETName, EIsArr) and
+       (UpperCase(EVName) = VNameU) then
+      Exit(ETName);
 end;
 
 procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
@@ -27999,6 +28000,53 @@ begin
   FCurrentBlock := FProgram.CreateBlock(EndLabel);
   EndBlock := FCurrentBlock;
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
+end;
+
+function TSSAGenerator.SplitRecordVar(const S: string; out VName, TName: string;
+  out IsArray: Boolean): Boolean;
+// Read one entry of the record-variable lists: "VARNAME|TYPENAME" for a scalar, and the same with a
+// trailing "|A" for an ARRAY of that type.
+// ⛔ ONE FUNNEL, because the six places that read these lists all spelled the split out by hand with
+// Pos('|') and Copy(...MaxInt) - so a third field appended to the entry would have arrived inside the
+// TYPE NAME at every one of them, and a key torn in half by its own store's separator is a defect this
+// codebase has already paid for twice.
+var
+  b1, b2: Integer;
+begin
+  Result := False; VName := ''; TName := ''; IsArray := False;
+  b1 := Pos('|', S);
+  if b1 <= 0 then Exit;
+  VName := Copy(S, 1, b1 - 1);
+  b2 := Pos('|', S, b1 + 1);
+  if b2 > 0 then
+  begin
+    TName := Copy(S, b1 + 1, b2 - b1 - 1);
+    IsArray := UpperCase(Copy(S, b2 + 1, MaxInt)) = 'A';
+  end
+  else
+    TName := Copy(S, b1 + 1, MaxInt);
+  Result := True;
+end;
+
+procedure TSSAGenerator.EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
+// Destroy one record variable of a scope that is ending: a scalar through its handle, an ARRAY through
+// every one of its elements.
+// ⭐ The element loop is NOT new - EmitRecordArrayConstruct already runs a destructor over every
+// element, which is what ERASE uses. The half that was missing was the CALL: an array of a type with a
+// destructor was constructed element by element and then torn down not at all, so
+// "Dim As P a(0 To 1)" printed two ctors and zero dtors where fbc prints two of each. A withdrawal
+// note that names the missing half is the map to the cure, and this was that half.
+var
+  ArrayIdx: Integer;
+begin
+  if not IsArray then
+  begin
+    EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+    Exit;
+  end;
+  ArrayIdx := ArrayIndexOf(VName);
+  if ArrayIdx < 0 then Exit;
+  EmitRecordArrayConstruct(ArrayIdx, TName, 0, True);
 end;
 
 procedure TSSAGenerator.EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);
@@ -28738,7 +28786,24 @@ begin
         else if (FCurrentProcNonRecs <> nil) and (TName <> 'BIGINT') and
                 (FCurrentProcNonRecs.IndexOf(VName) < 0) then
           FCurrentProcNonRecs.Add(VName);
+      end
+      // ⭐ ...AND AN ARRAY OF THAT TYPE IS N OBJECTS, EACH OF WHICH IS DESTROYED. The test above wants
+      // child[1] to be the TYPE, which is the SCALAR shape - an array has its antDimensions there - so
+      // "Dim As P a(0 To 1)" was collected by nobody and torn down by nobody: two constructors ran and
+      // ZERO destructors, where fbc runs two of each. It is marked "|A" so the teardown walks the
+      // elements; the ORDER is why it goes in the SAME list as the scalars - fbc destroys a scope's
+      // records in reverse DECLARATION order, interleaving the two kinds (measured against the oracle).
+      else if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 3) and
+              (Decl.Attributes.Values['BYREF'] <> '1') and
+              (Decl.GetChild(1).NodeType = antDimensions) and
+              (Decl.GetChild(2).NodeType = antIdentifier) then     // DIM a(dims) AS T
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(2).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if FindUDT(TName) >= 0 then
+          Into.Add(VName + '|' + TName + '|A');
       end;
+
     end;
   // Only the transparent wrappers are followed. Everything else (antIf / antBlock / antDoLoop / ...) is a
   // block scope of its own, and a procedure declaration collects its locals separately.
@@ -28787,7 +28852,24 @@ begin
         else if (FCurrentProcNonRecs <> nil) and (TName <> 'BIGINT') and
                 (FCurrentProcNonRecs.IndexOf(VName) < 0) then
           FCurrentProcNonRecs.Add(VName);
+      end
+      // ⭐ ...AND AN ARRAY OF THAT TYPE IS N OBJECTS, EACH OF WHICH IS DESTROYED. The test above wants
+      // child[1] to be the TYPE, which is the SCALAR shape - an array has its antDimensions there - so
+      // "Dim As P a(0 To 1)" was collected by nobody and torn down by nobody: two constructors ran and
+      // ZERO destructors, where fbc runs two of each. It is marked "|A" so the teardown walks the
+      // elements; the ORDER is why it goes in the SAME list as the scalars - fbc destroys a scope's
+      // records in reverse DECLARATION order, interleaving the two kinds (measured against the oracle).
+      else if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 3) and
+              (Decl.Attributes.Values['BYREF'] <> '1') and
+              (Decl.GetChild(1).NodeType = antDimensions) and
+              (Decl.GetChild(2).NodeType = antIdentifier) then     // DIM a(dims) AS T
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(2).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if FindUDT(TName) >= 0 then
+          FCurrentProcLocalRecs.Add(VName + '|' + TName + '|A');
       end;
+
     end;
   for c := 0 to Node.ChildCount - 1 do
     CollectLocalRecordVars(Node.GetChild(c));   // recurse into nested blocks (IF/FOR/...)
@@ -28799,16 +28881,14 @@ procedure TSSAGenerator.EmitFrameDestructors;
 // V5d: BYVAL UDT parameter copies (V4) are destroyed too — after the locals (they were "constructed"
 // first, at entry, so they die last), also in reverse order.
 var
-  i, bar: Integer;
+  i: Integer;
   VName, TName: string;
+  IsArr: Boolean;
 begin
   if (FCurrentProcLocalRecs <> nil) then
     for i := FCurrentProcLocalRecs.Count - 1 downto 0 do
     begin
-      bar := Pos('|', FCurrentProcLocalRecs[i]);
-      if bar <= 0 then Continue;
-      VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
-      TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
+      if not SplitRecordVar(FCurrentProcLocalRecs[i], VName, TName, IsArr) then Continue;
       // M8: already destructed at its BLOCK's exit. In MODERN the collector no longer hands us a
       // block-scoped DIM at all (it is a separate binding, owned by the block), so there is nothing to
       // exclude -- and excluding by NAME is what used to silence a same-named variable of THIS scope.
@@ -28816,16 +28896,13 @@ begin
       // exclusion is what stops it being destructed twice.
       if (not FModernMode) and
          (FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, VName)) >= 0) then Continue;
-      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+      EmitRecordVarDestruction(VName, TName, IsArr);
     end;
   if (FCurrentProcByvalRecs <> nil) then
     for i := FCurrentProcByvalRecs.Count - 1 downto 0 do
     begin
-      bar := Pos('|', FCurrentProcByvalRecs[i]);
-      if bar <= 0 then Continue;
-      VName := Copy(FCurrentProcByvalRecs[i], 1, bar - 1);
-      TName := Copy(FCurrentProcByvalRecs[i], bar + 1, MaxInt);
-      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+      if not SplitRecordVar(FCurrentProcByvalRecs[i], VName, TName, IsArr) then Continue;
+      EmitDestructorCall(GetOrAllocateVariable(VName), TName);   // a BYVAL copy is never an array
     end;
   EmitBaseDestructorChain;
 end;
@@ -29200,8 +29277,9 @@ procedure TSSAGenerator.AssignModuleDtorSlots;
 // destructor is skipped, exactly as before this feature). Module-end destruction is unaffected (it reads
 // the live module register directly).
 var
-  i, bar, sharedIntCount, nextSlot: Integer;
+  i, sharedIntCount, nextSlot: Integer;
   VName, TName: string;
+  IsArr: Boolean;
 begin
   FModuleDtorSlots.Clear;
   if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
@@ -29212,10 +29290,8 @@ begin
   nextSlot := XFER_RESULT_HANDLE_SLOT - 1;           // 253, growing down
   for i := 0 to FModuleRecordVars.Count - 1 do       // construction order (assignment order is irrelevant)
   begin
-    bar := Pos('|', FModuleRecordVars[i]);
-    if bar <= 0 then Continue;
-    VName := Copy(FModuleRecordVars[i], 1, bar - 1);
-    TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    if not SplitRecordVar(FModuleRecordVars[i], VName, TName, IsArr) then Continue;
+    if IsArr then Continue;                                  // an array is reached by its own handle
     if FModuleDtorSlots.IndexOf(VName) >= 0 then Continue;   // one slot per name
     if not TypeNeedsDestruction(TName) then Continue;        // no destructor anywhere -> no slot needed
     if nextSlot <= SHARED_SLOT_BASE + sharedIntCount - 1 then Break;  // would collide with SHARED region
@@ -29234,8 +29310,9 @@ procedure TSSAGenerator.EmitModuleDestructors(UseSlots: Boolean = False);
 // handle from its reserved frame-independent slot (FModuleDtorSlots) instead. A global with no reserved
 // slot (slot space exhausted) is skipped on this path.
 var
-  i, bar, slotIdx: Integer;
+  i, slotIdx: Integer;
   VName, TName, SavedThis: string;
+  IsArr: Boolean;
   H: TSSAValue;
   AccessNode: TASTNode;
 begin
@@ -29244,10 +29321,7 @@ begin
   try
   for i := FModuleRecordVars.Count - 1 downto 0 do
   begin
-    bar := Pos('|', FModuleRecordVars[i]);
-    if bar <= 0 then Continue;
-    VName := Copy(FModuleRecordVars[i], 1, bar - 1);
-    TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    if not SplitRecordVar(FModuleRecordVars[i], VName, TName, IsArr) then Continue;
     // A hoisted STATIC local is torn down HERE, at module scope, though it was declared inside a method
     // and FreeBASIC judges its access there. Put the owning type back for this one teardown, so a type
     // whose own method keeps a "Static As T x" is not refused its own PRIVATE destructor.
@@ -29257,6 +29331,13 @@ begin
     // SUB (where FCurrentProcName is that SUB's).
     if (not FModernMode) and
        (FBlockHandledVars.IndexOf(BlockHandledKey('', VName)) >= 0) then Continue;
+    // An ARRAY of records is torn down element by element, through its own array handle - there is no
+    // single handle to read from a register or a reserved slot.
+    if IsArr then
+    begin
+      EmitRecordVarDestruction(VName, TName, True);
+      Continue;
+    end;
     if UseSlots then
     begin
       slotIdx := FModuleDtorSlots.IndexOf(VName);
@@ -29377,20 +29458,18 @@ procedure TSSAGenerator.EmitBlockScopeCleanup(Idx: Integer);
 // to reclaim its records. Does NOT drop the scope — used both by the normal exit (which then drops)
 // and by early exits (EXIT loop / EXIT SUB / RETURN), which only emit cleanup for the path taken.
 var
-  i, bar: Integer;
+  i: Integer;
   L: TStringList;
   VName, TName: string;
+  IsArr: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FScopeStack)) or (FScopeStack[Idx].Kind <> skBlock) then Exit;
   L := FScopeStack[Idx].Dtors;
   if L <> nil then
     for i := L.Count - 1 downto 0 do
     begin
-      bar := Pos('|', L[i]);
-      if bar <= 0 then Continue;
-      VName := Copy(L[i], 1, bar - 1);
-      TName := Copy(L[i], bar + 1, MaxInt);
-      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+      if not SplitRecordVar(L[i], VName, TName, IsArr) then Continue;
+      EmitRecordVarDestruction(VName, TName, IsArr);
     end;
   if FScopeStack[Idx].RecMarkEmitted then
   begin
