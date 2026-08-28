@@ -161,6 +161,12 @@ type
     // block may not HAVE one, nor a field of such a type, nor extend one - fbc's "error 263: Objects
     // with default [con|de]structors or methods are only allowed in the module level".
     FTypesWithCtorDtor: TStringList;
+    // ⭐ Names declared as a pointer whose POINTEE is const ("Dim As Const Integer Ptr p"): writing
+    // THROUGH one - "*p = x", "p[i] = x", "p->f = x" - is fbc's "error 119: Cannot modify a constant".
+    // ⛔ NOT the same set as FConstNames, which holds names that are not lvalues THEMSELVES: for this
+    // pointer "p = @other" is perfectly legal and only "*p = ..." is not. The two halves of the word
+    // CONST on a pointer type, kept apart - m632 established which is which, this is the other one.
+    FConstPointeeNames: TStringList;
     FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
     function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer;
                              const Flags: string): string;
@@ -175,6 +181,8 @@ type
     procedure CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
     procedure NoteTypeCtorDtor(Node: TASTNode);
     procedure RefuseNonModuleLevelType(Node: TASTNode);
+    function WritesThroughConstPointee(Node: TASTNode): string;
+    function ConstRootOfTarget(Node: TASTNode): string;
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -513,6 +521,8 @@ begin
   FModuleLocalNames.CaseSensitive := False;
   FTypesWithCtorDtor := TStringList.Create;
   FTypesWithCtorDtor.CaseSensitive := False;
+  FConstPointeeNames := TStringList.Create;
+  FConstPointeeNames.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -534,6 +544,7 @@ begin
   FExternShapes.Free;
   FModuleLocalNames.Free;
   FTypesWithCtorDtor.Free;
+  FConstPointeeNames.Free;
 
   inherited Destroy;
 end;
@@ -867,6 +878,7 @@ begin
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
   FModuleLocalNames.Clear;
   FTypesWithCtorDtor.Clear;
+  FConstPointeeNames.Clear;
   FTopLevelStmt := False;
 
   try
@@ -941,6 +953,7 @@ begin
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
   FModuleLocalNames.Clear;
   FTypesWithCtorDtor.Clear;
+  FConstPointeeNames.Clear;
   FTopLevelStmt := False;
 
   try
@@ -1846,6 +1859,7 @@ var
  LhsIsExpr: Boolean;   // LHS built by the expression parser (member/array): may be a call stmt
  OpSym: string;        // compound-assignment operator symbol ('+','-','*','/','^')
  OpType: TTokenType;   // its arithmetic binary-op token type
+ ConstPointeeNm: string;   // the pointer-to-const this target would write through, if any
 begin
  Token := Context.CurrentToken;
  SavedToken := Token;   // default (member/array LHS branches don't set it; avoids nil on error)
@@ -1963,6 +1977,34 @@ begin
     HandleError('Expected variable name in assignment', Context.CurrentToken);  // ← Token corrente
     Result := nil;
     Exit;
+  end;
+
+  // ⭐ ...AND A CONSTANT IS NOT AN LVALUE, in every shape of target the chain above can build.
+  // ⛔ ONLY WHEN AN ASSIGNMENT REALLY FOLLOWS. This routine is also how a bare "baz.bar()" arrives -
+  // it builds the target, finds no '=', and hands the statement back as a CALL - so asking before the
+  // operator is in sight refused a METHOD CALL on a const object ("Dim As Const Foo b : b.bar()"),
+  // which fbc runs. Found by the terna: B2 rose, B1 held, and CUERR went up by one.
+  if FModernMode and (LeftSide <> nil) and
+     (Context.Check(ttOpEq) or Context.Check(ttCompoundAssign)) then
+  begin
+    ConstPointeeNm := ConstRootOfTarget(LeftSide);
+    if ConstPointeeNm <> '' then
+    begin
+      HandleError(Format('Cannot modify a constant: %s', [ConstPointeeNm]), Context.CurrentToken);
+      LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
+    ConstPointeeNm := WritesThroughConstPointee(LeftSide);
+    if ConstPointeeNm <> '' then
+    begin
+      HandleError(Format('Cannot modify a constant: %s points to a constant, so what it points at ' +
+        'cannot be written (the pointer itself can be reassigned)', [ConstPointeeNm]),
+        Context.CurrentToken);
+      LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
   end;
 
   // FreeBASIC keyword-operator compound assignment: "lhs MOD= rhs", "lhs AND/OR/XOR= rhs",
@@ -10207,6 +10249,82 @@ begin
       FTypesWithCtorDtor.Add(UpperCase(VarToStr(Node.Value)));
 end;
 
+function TPackratParser.WritesThroughConstPointee(Node: TASTNode): string;
+// The name of the pointer-to-const this assignment TARGET writes through, or '' when it writes through
+// none. The three spellings are the same write: "*p = x", "p[i] = x" and "p->f = x" - closing one and
+// not the others is the shape this codebase keeps paying for, so all three are asked here.
+var
+  Base: TASTNode;
+  Nm: string;
+begin
+  Result := '';
+  // ⛔ NOT "and FConstPointeeNames.Count = 0" here: the CAST form below needs no registry at all, and
+  // an early-out on the empty set silently switched it off for every program that declares no
+  // pointer-to-const of its own - which is most of them, and exactly the ones the cast is written in.
+  if Node = nil then Exit;
+  Base := nil;
+  case Node.NodeType of
+    antDeref:       if Node.ChildCount >= 1 then Base := Node.GetChild(0);
+    antParentheses: if Node.ChildCount >= 1 then Exit(WritesThroughConstPointee(Node.GetChild(0)));
+    antMemberAccess: if Node.ChildCount >= 1 then Base := Node.GetChild(0);
+    antArrayAccess:
+      // "p[i] = x" is "*(p + i) = x". The array spelling "a(i)" is NOT a pointer write, so only the
+      // bracket form counts - and an array of const elements is a different question.
+      if (Node.Attributes.Values['BRACKET'] = '1') and (Node.ChildCount >= 1) then
+        Base := Node.GetChild(0);
+  else
+    Exit;
+  end;
+  if Base = nil then Exit;
+  while (Base <> nil) and (Base.NodeType = antParentheses) and (Base.ChildCount >= 1) do
+    Base := Base.GetChild(0);
+  if Base = nil then Exit;
+  // ⭐ A CAST CARRIES ITS OWN QUALIFIER, and it is the same question asked of a different carrier:
+  // "*CPtr(Const Integer Ptr, p) = 5" writes through a pointer-to-const that has no name at all. The
+  // cast node's value is the type TEXT, and the word order is what tells the two meanings apart -
+  // "CONST INTEGER PTR" is a pointer TO const, "INTEGER CONST PTR" is a CONST pointer and writing
+  // through it is legal. fbc refuses the first and accepts the second; so does this.
+  if Base.NodeType = antCast then
+  begin
+    Nm := UpperCase(Trim(VarToStr(Base.Value)));
+    if (Copy(Nm, 1, 6) = 'CONST ') and (Pos(' PTR', Nm) > 0) then
+      Result := Nm;
+    Exit;
+  end;
+  if Base.NodeType <> antIdentifier then Exit;
+  Nm := UpperCase(VarToStr(Base.Value));
+  if FConstPointeeNames.IndexOf(Nm) >= 0 then Result := Nm;
+end;
+
+function TPackratParser.ConstRootOfTarget(Node: TASTNode): string;
+// ⭐ ...AND A CONSTANT IS NOT AN LVALUE THROUGH A FIELD EITHER. "Dim As Const Foo k : k.i = 69" and
+// "k.a(1) = 69" are fbc's "error 119" as much as a bare "k = ...", and the guard that already refuses
+// the bare form fires only on a target that IS the identifier. Walk the target down to the name it is
+// rooted at and ask the same set.
+// ⛔ A DEREF is NOT walked through: "*p = x" where p is a const POINTER (not a pointer to const) is
+// legal - the pointer may not be reseated, what it points at may be written. That is the other half of
+// the word, and m632 measured which is which.
+var
+  Cur: TASTNode;
+begin
+  Result := '';
+  if (Node = nil) or (FConstNames.Count = 0) then Exit;
+  Cur := Node;
+  while Cur <> nil do
+    case Cur.NodeType of
+      antParentheses, antMemberAccess, antArrayAccess:
+        if Cur.ChildCount >= 1 then Cur := Cur.GetChild(0) else Exit;
+      antIdentifier:
+        begin
+          if (Cur <> Node) and (FConstNames.IndexOf(UpperCase(VarToStr(Cur.Value))) >= 0) then
+            Result := UpperCase(VarToStr(Cur.Value));
+          Exit;
+        end;
+    else
+      Exit;
+    end;
+end;
+
 procedure TPackratParser.RefuseNonModuleLevelType(Node: TASTNode);
 // ⛔ A TYPE DECLARED INSIDE A PROCEDURE OR A BLOCK MAY NOT NEED A CONSTRUCTOR, A DESTRUCTOR OR A
 // METHOD. fbc: "error 263: Objects with default [con|de]structors or methods are only allowed in the
@@ -10712,6 +10830,7 @@ var
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
+  Idx: Integer;                 // scratch: the const-pointee registry entry for a redeclared name
 begin
   Token := Context.CurrentToken;
   SharedFpNode := nil;
@@ -11057,8 +11176,19 @@ begin
           FConstNames.Add(UpperCase(VarToStr(NameTok.Value)))
         else
       else if (FPtrQualChain <> '') and (FPtrQualChain[Length(FPtrQualChain)] = '1') then
+      begin
         if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
           FConstNames.Add(UpperCase(VarToStr(NameTok.Value)));
+      end
+      else
+      begin
+        // ⛔ ...AND A REDECLARATION WITHOUT THE QUALIFIER TAKES THE NAME BACK OUT. This set is keyed on
+        // a bare NAME, and a CONST POINTER can legally be redeclared in a sibling scope where the same
+        // name is a plain pointer - the manual's datatype/const-ptr does exactly that, four times. A
+        // plain CONST cannot be redeclared at all, which is why the hole sat here unexercised.
+        Idx := FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value)));
+        if (Idx >= 0) and (not FInConstDecl) then FConstNames.Delete(Idx);
+      end;
       // The type's CONST chain, kept whole: character 0 is the BASE ("As Const <type>"), then one per
       // pointer level in source order. "Const UByte Const Ptr Ptr" -> "110". FreeBASIC's rule for
       // assigning one pointer to another is written on exactly this - and on nothing else, which is
@@ -11066,6 +11196,31 @@ begin
       if (NameIsConst or (FPtrQualChain <> '')) then
         ArrayDecl.Attributes.Values['PTRQUALS'] :=
           Copy('10', 1 + Ord(not NameIsConst), 1) + FPtrQualChain;
+      // ⭐ ...AND CHARACTER 1 OF THAT CHAIN IS THE POINTEE. "As Const Integer Ptr" gives "10": the BASE
+      // is const and the one pointer level is not, so the NAME may be reassigned and what it points at
+      // may not be written. That is the half m632 deliberately left alone, and it is 57 of the fbc
+      // suite's remaining "error 119" refusals - the largest single group left.
+      // ⛔ ...AND A REDECLARATION OF THE SAME NAME TAKES IT BACK OUT. This set is keyed on a BARE NAME,
+      // and the manual's own datatype/const-ptr writes all four combinations as four "Dim p" in four
+      // sibling Scopes: the "As Const Integer Ptr" one put P in, and the "As Integer Const Ptr" one -
+      // where "*p = z" is LEGAL and the example says so in a comment - found it still there. Parsing is
+      // sequential, so the newest declaration of a name is the one in force at every later use of it.
+      // (The parser has no scope stack; this is what it can honestly answer, and it answers the shape
+      // that actually occurs.)
+      // ⛔ ...AND ONLY WITH EXACTLY ONE POINTER LEVEL. "As Const Integer Ptr Ptr c" is a pointer to a
+      // pointer to const: "*c" is the INNER POINTER, which is perfectly writable, and only "**c" is
+      // not. fbc's own const/ptrassign writes "*c = @a" and expects it to compile. Refusing on the
+      // base qualifier alone, whatever the depth, is the shape that got that test wrong.
+      if NameIsConst and (Length(FPtrQualChain) = 1) then
+      begin
+        if FConstPointeeNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+          FConstPointeeNames.Add(UpperCase(VarToStr(NameTok.Value)));
+      end
+      else
+      begin
+        Idx := FConstPointeeNames.IndexOf(UpperCase(VarToStr(NameTok.Value)));
+        if Idx >= 0 then FConstPointeeNames.Delete(Idx);
+      end;
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
       ArrayDecl.AddChild(VarNameNode);
       if LeadingAS and Assigned(LeadingTypeOfExpr) then
