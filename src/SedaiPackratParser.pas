@@ -196,6 +196,7 @@ type
     function ConstRootOfTarget(Node: TASTNode): string;
     procedure CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
     procedure CheckDeclStatesItsType(Node: TASTNode);
+    procedure RefuseUnwritableTarget(Node: TASTNode; const What: string);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -2543,6 +2544,7 @@ end;
 function TPackratParser.ParseLetStatement: TASTNode;
 var
   Assignment, Targets, Tgt: TASTNode;
+  TgtK: Integer;
   SavedToken: TLexerToken;
 begin
   SavedToken := Context.CurrentToken;
@@ -2591,6 +2593,11 @@ begin
     Result := TASTNode.Create(antLetList, SavedToken);
     Result.AddChild(Targets);
     Result.AddChild(Assignment);
+    // ⛔ EVERY target of the destructuring is WRITTEN, so every one must be writable. The empty slot
+    // is not a target at all - it names a field to leave alone - so it is skipped, not judged.
+    for TgtK := 0 to Targets.ChildCount - 1 do
+      if Targets.GetChild(TgtK).Attributes.Values['LETSKIP'] <> '1' then
+        RefuseUnwritableTarget(Targets.GetChild(TgtK), 'a LET() target');
     Exit;
   end;
 
@@ -10364,6 +10371,43 @@ begin
     end;
 end;
 
+procedure TPackratParser.RefuseUnwritableTarget(Node: TASTNode; const What: string);
+// ⭐ A THING BEING WRITTEN MUST BE WRITABLE - and this is the SECOND PLACE that has to say so. The
+// assignment path has refused "Cannot modify a constant" since m632/m648; SWAP, LET(...) destructuring,
+// MID() = and LSET/RSET all write their target too, and not one of them ever asked. fbc refuses every
+// one ("error 119: Cannot modify a constant", or "error 24: Invalid data types" when the operand is a
+// literal), so five writers were agreeing with each other by never posing the question.
+//
+// It asks EXACTLY the question the assignment site asks, through the same two readers, so a name that
+// is unassignable is unswappable by construction and the two can never drift apart:
+//   - a LITERAL is not a variable at all ("Swap a, 0", "Let(0) = x");
+//   - a name in FConstNames - which holds both a CONST statement's name and a "Dim As Const" one;
+//   - a constant reached through a field or an array element, via ConstRootOfTarget.
+// ⛔ AND A DEREF IS STILL NOT WALKED THROUGH: "Swap *pa, *pb" is legal even when the POINTERS are
+// const, because a const pointer may not be reseated while what it points at may be written. That is
+// m632's half of the word, and ConstRootOfTarget already stops there - which is why this reuses it
+// rather than walking the target again.
+var
+  Nm: string;
+begin
+  if (Node = nil) or (not FModernMode) then Exit;
+  if Node.NodeType = antLiteral then
+  begin
+    HandleError(Format('%s must be a variable that can be written, and a literal is not one', [What]),
+                Node.Token);
+    Exit;
+  end;
+  if Node.NodeType = antIdentifier then
+  begin
+    Nm := UpperCase(VarToStr(Node.Value));
+    if FConstNames.IndexOf(Nm) < 0 then Nm := '';
+  end
+  else
+    Nm := ConstRootOfTarget(Node);
+  if Nm <> '' then
+    HandleError(Format('Cannot modify a constant: %s cannot be %s', [Nm, What]), Node.Token);
+end;
+
 procedure TPackratParser.RefuseNonModuleLevelType(Node: TASTNode);
 // ⛔ A TYPE DECLARED INSIDE A PROCEDURE OR A BLOCK MAY NOT NEED A CONSTRUCTOR, A DESTRUCTOR OR A
 // METHOD. fbc: "error 263: Objects with default [con|de]structors or methods are only allowed in the
@@ -12185,6 +12229,10 @@ begin
     Exit;
   end;
   Result.AddChild(Right);
+  // ⛔ BOTH operands of a SWAP are WRITTEN, so both must be writable - the check the assignment path
+  // has always had, asked here for the first time.
+  RefuseUnwritableTarget(Left, 'a SWAP operand');
+  RefuseUnwritableTarget(Right, 'a SWAP operand');
   DoNodeCreated(Result);
 end;
 
@@ -12210,6 +12258,7 @@ begin
     Exit;
   end;
   Result.AddChild(Dst);
+  RefuseUnwritableTarget(Dst, 'an LSET/RSET destination');   // it justifies INTO dst's buffer
   if Context.Check(ttOpEq) or Context.Check(ttSeparParam) then
     Context.Advance                      // "=" (QBasic) or "," (FreeBASIC)
   else
@@ -12273,6 +12322,7 @@ begin
   end;
   Result := TASTNode.Create(antMidStatement, Token);
   Result.AddChild(TargetNode);
+  RefuseUnwritableTarget(TargetNode, 'the target of a MID() assignment');
   Result.AddChild(StartNode);
   if Assigned(LenNode) then Result.AddChild(LenNode);
   Result.AddChild(SourceNode);
