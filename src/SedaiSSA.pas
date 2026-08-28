@@ -33139,6 +33139,7 @@ function TSSAGenerator.DerefedType(Node: TASTNode): string;
 // is not dereferenceable.
 var
   T: string;
+  OwnerIdx: Integer;
 begin
   Result := '';
   if Node = nil then Exit;
@@ -33166,6 +33167,24 @@ begin
     T := UpperCase(DeclaredTypeNameOf(Node));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
+  end
+  else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
+  begin
+    // ⭐ "*obj.field" WHERE THE FIELD IS THE POINTER. Every arm above asks a registry keyed on a
+    // VARIABLE - a DIM'd pointer, a pointer parameter, an array element - and a field's pointee is
+    // recorded on the TYPE, so none of them could see it. The result was '' and the member read fell
+    // through to a path that answered a stale register: "(*b.aptr).x" printed 1 where fbc prints 1234,
+    // while "b.aptr->x" and "(*p).x" through a local both printed it correctly. Same defect the fbc
+    // suite carries as pointers/field_deref.
+    // The two registries are asked in the order their readers already use: the RAW scalar pointee
+    // first (that helper resolves the owner itself, nested "a.b.field" included), then the UDT one.
+    Result := UpperCase(MemberRawPtrPointee(Node));
+    if Result = '' then
+    begin
+      OwnerIdx := FindUDT(UpperCase(ObjectTypeName(Node.GetChild(0))));
+      if OwnerIdx >= 0 then
+        Result := UpperCase(UDTFieldPtrPointee(OwnerIdx, VarToStr(Node.Value)));
+    end;
   end
   else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
           (Node.GetChild(0).NodeType = antIdentifier) then

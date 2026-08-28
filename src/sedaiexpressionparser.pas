@@ -3376,6 +3376,33 @@ begin
     Result := Left;
     Exit;
   end;
+  // ⭐ "(*X).field" IS "X->field", so it becomes the SAME TREE here and stops being a second shape every
+  // reader downstream has to know about. The arrow spelling already produced a plain chain
+  // (antMemberAccess <- antMemberAccess <- ...) with the dereference implicit; the parenthesised one
+  // carried an antParentheses/antDeref in between, and the readers that walk the chain saw a node they
+  // had no arm for. Through a LOCAL pointer it happened to work; through a POINTER FIELD
+  // "(*b.aptr).x" answered 1 where fbc answers 1234 - the fbc suite's pointers/field_deref.
+  // ⛔⛔ AND ONLY WHEN THE DEREFERENCED THING IS ITSELF A MEMBER ACCESS. Unwrapping every base looked
+  // like the same rule and broke two guards at once, which is how narrow this is:
+  //   - m604 "(*@u).s": the operand is an ADDRESS-OF, and "*@u" is u ITSELF - unwrapping to "@u" made
+  //     the field read run on the address instead of the place;
+  //   - m619 "(*tpp)->n": the operand is a POINTER TO POINTER and the arrow is a SECOND dereference,
+  //     which the tree no longer distinguishes from a dot - unwrapping took one level away.
+  // Neither shape was broken to begin with; only the pointer FIELD was. So the rewrite is confined to
+  // it, and the other two keep the path they already had.
+  // "(*p)[i]" is an array access and keeps its own path (a ZString pointer indexes bytes there), and
+  // "*p.f" without the parentheses parses as "*(p.f)" and never reaches this shape at all.
+  // ⚠️ The two wrapper nodes are ORPHANED, not freed, and that is deliberate: TASTNode's child list is
+  // created with OwnsObjects=True, so RemoveChild/RemoveChildAt FREE what they remove - taking the base
+  // with them - and the unit has no detach-without-free. Two small nodes per "(*X).f" in the source,
+  // at parse time. Freeing them wants a DetachChildAt on TASTNode, which is a change to a shared unit
+  // and a separate decision.
+  if (Left <> nil) and (Left.NodeType = antParentheses) and (Left.ChildCount = 1) and
+     (Left.GetChild(0) <> nil) and (Left.GetChild(0).NodeType = antDeref) and
+     (Left.GetChild(0).ChildCount = 1) and
+     (Left.GetChild(0).GetChild(0) <> nil) and
+     (Left.GetChild(0).GetChild(0).NodeType = antMemberAccess) then
+    Left := Left.GetChild(0).GetChild(0);
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
   Result.AddChild(Left);
   DoNodeCreated(Result);
