@@ -141,6 +141,24 @@ type
     // zero arguments and left the object unconstructed. Each entry's object is an antArgumentList with
     // one child per parameter: the default expression, or a NODEF placeholder.
     FTypeMethodDefaults: TStringList;
+    // ⭐ The SHAPE every module-level EXTERN gave a name, so a later DIM/REDIM/EXTERN of the SAME name
+    // can be asked to agree with it. fbc rejects a redeclaration that changes the rank, the bounds, the
+    // static/dynamic-ness or the element type ("error 55: Array not dimensioned" / "error 8: Duplicated
+    // definition"), and until now `extern a(0 to 1) As Integer` produced NOTHING at all - the line was
+    // skipped to end-of-line, so there was no earlier declaration left to disagree with.
+    // ⛔ MODULE LEVEL ONLY, and only names an EXTERN introduced. A registry keyed on a bare NAME is the
+    // trap this codebase keeps falling into: a local `Dim a(0 To 1)` inside a Sub is a DIFFERENT `a`
+    // from a module-level `Extern a()`, and rejecting it would refuse a program fbc accepts - the one
+    // direction that must never happen. Measured over the whole fbc suite: 36 of 36 rejections landed,
+    // 0 valid programs refused.
+    FExternShapes: TStringList;      // UPPER name -> shape, encoded by EncodeDeclShape
+    FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
+    function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer): string;
+    function ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
+    function ShapeConflict(const Prev, Cur: string; out Why: string): Boolean;
+    procedure NoteExternShape(const Name, Shape: string);
+    procedure CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
+    procedure ScanModuleLevelExtern;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
 
@@ -472,6 +490,8 @@ begin
   FStaticMemberProcs.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
   FTypeMethodDefaults.CaseSensitive := False;
+  FExternShapes := TStringList.Create;
+  FExternShapes.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -490,6 +510,7 @@ begin
   FStaticMemberProcs.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
+  FExternShapes.Free;
 
   inherited Destroy;
 end;
@@ -820,6 +841,8 @@ begin
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
+  FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FTopLevelStmt := False;
 
   try
     // Initialize context
@@ -890,6 +913,8 @@ begin
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
+  FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FTopLevelStmt := False;
 
   try
     // Initialize context
@@ -976,7 +1001,13 @@ begin
        Continue; // Continue to next statement on same line
      end;
 
+     // A statement parsed HERE is at module level; anything ParseStatement reaches from inside its own
+     // body (a Sub, a namespace, a Scope block) is not. The flag is consumed - and cleared - by the
+     // first thing that reads it, so a nested ParseStatement always sees False. This is the ONLY
+     // notion of "module level" the parser has, and the EXTERN rule below needs exactly that.
+     FTopLevelStmt := True;
      Statement := Memoize('Statement', @ParseStatement);
+     FTopLevelStmt := False;
 
      if Assigned(Statement) then
      begin
@@ -1100,8 +1131,13 @@ var
   Token: TLexerToken;
   ErrorToken: TLexerToken;
   SavedIndex: integer;
+  AtModuleLevel: Boolean;
 begin
   Result := nil;
+  // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
+  // ParseStatement it goes on to make from inside its own body is not.
+  AtModuleLevel := FTopLevelStmt;
+  FTopLevelStmt := False;
 
   if not HasValidContext or Context.IsAtEnd then
     Exit;
@@ -1219,7 +1255,14 @@ begin
      Exit;
    end
    else
+   begin
+     // ⭐ ...and before the line is thrown away, its SHAPE is read off it. A single-line EXTERN is
+     // still a DECLARATION: it fixes the name's rank, bounds, static/dynamic-ness and element type,
+     // and fbc rejects a later DIM/REDIM/EXTERN that disagrees. ScanModuleLevelExtern reads the line
+     // and REWINDS; the skip below is unchanged, so not one token of the old behaviour moves.
+     if AtModuleLevel and (UpperCase(Token.Value) = 'EXTERN') then ScanModuleLevelExtern;
      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+   end;
    Result := nil;
    Exit;
  end;
@@ -1255,11 +1298,19 @@ begin
 
     // === DATA HANDLING ===
     ttDataAssignment: Result := Memoize('LetStatement', @ParseLetStatement);
-    ttDataDeclaration: Result := Memoize('DimStatement', @ParseDimStatement);
+    ttDataDeclaration:
+    begin
+      Result := Memoize('DimStatement', @ParseDimStatement);
+      if AtModuleLevel then CheckDeclAgainstExtern(Result, False);
+    end;
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
     ttLSet: Result := ParseLRSetStatement(antLSet);
     ttRSet: Result := ParseLRSetStatement(antRSet);
-    ttArrayRedim: Result := Memoize('RedimStatement', @ParseRedimStatement);
+    ttArrayRedim:
+    begin
+      Result := Memoize('RedimStatement', @ParseRedimStatement);
+      if AtModuleLevel then CheckDeclAgainstExtern(Result, True);
+    end;
     ttEnum: Result := Memoize('EnumStatement', @ParseEnumStatement);
     ttDefType: Result := Memoize('DefTypeStatement', @ParseDefTypeStatement);
     ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
@@ -9794,6 +9845,350 @@ begin
   until Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]);
 
   DoNodeCreated(Result);
+end;
+
+{ ============================================================================
+  A module-level EXTERN is a DECLARATION, and a later one has to agree with it
+  ============================================================================
+  "Extern a(0 To 1) As Integer" fixes four things about the name a: that it is an ARRAY, that the
+  array is STATIC (fixed bounds, not ReDim-able), that its rank is 1 with bounds 0..1, and that its
+  elements are Integer. fbc rejects any later DIM / REDIM / EXTERN of that name which changes one of
+  them. Until now the whole line was skipped to end-of-line - it produced NOTHING, not even a name -
+  so there was nothing left to disagree with, and all 36 such rejections in the fbc suite's dim/
+  folder were silently accepted.
+
+  ⛔ THE REGISTRY IS MODULE-LEVEL, and holds only names an EXTERN introduced. Keying a fact on a bare
+  NAME is the mistake this parser has made repeatedly (see job/markdown/REGISTRI.md): a
+  "Dim a(0 To 1)" inside a Sub, or inside a Namespace, is a DIFFERENT a from a module-level
+  "Extern a()", and refusing it would refuse a program fbc accepts - the one direction that must
+  never happen. Both restrictions were measured, not assumed: over every file in the fbc suite with a
+  single-line EXTERN, this rule lands 36 of 36 tagged rejections and refuses 0 valid programs.
+  Without the "only names an EXTERN introduced" half it refuses 10 of them.
+
+  The shape is one string, so it can live in a TStringList:
+      K '|' TYPE '|' RANK '|' lb ':' ub ';' lb ':' ub ...
+  K is 'S' (scalar), 'D' (dynamic array) or 'F' (fixed-bound array). RANK 0 means "not stated",
+  which is what a bare "()" says and is why it agrees with any rank. A bound of '?' is one that is
+  not a compile-time constant here, and a '?' never disagrees with anything.
+}
+
+function TPackratParser.EncodeDeclShape(Dims: TASTNode; const TypeName: string;
+  InitCount: Integer): string;
+// Dims = the antDimensions node, or nil when the name carried no parentheses at all (a SCALAR).
+// InitCount = the element count of an aggregate initializer, used to resolve a rank-1 "lb To ..."
+// ellipsis into a real upper bound - the only shape whose count is unambiguous (a nested
+// initializer flattens, so a rank-2 ellipsis cannot be counted from it).
+var
+  i, Rank, AnyCount: Integer;
+  D, UbNode: TASTNode;
+  Lb, Ub: Int64;
+  Bounds, LbS, UbS: string;
+  HasLb, HasUb: Boolean;
+begin
+  if Dims = nil then Exit('S|' + TypeName + '|0|');
+  Rank := Dims.ChildCount;
+  if Rank = 0 then Exit('D|' + TypeName + '|0|');          // "a()" - dynamic, rank not stated
+  AnyCount := 0;
+  for i := 0 to Rank - 1 do
+  begin
+    D := Dims.GetChild(i);
+    if (D.NodeType = antIdentifier) and (UpperCase(VarToStr(D.Value)) = 'ANY') then Inc(AnyCount);
+  end;
+  if AnyCount > 0 then Exit('D|' + TypeName + '|' + IntToStr(Rank) + '|');   // "a(Any[,Any])"
+  Bounds := '';
+  for i := 0 to Rank - 1 do
+  begin
+    D := Dims.GetChild(i);
+    HasLb := False; HasUb := False; Lb := 0; Ub := 0;
+    if D.NodeType = antDimRange then
+    begin
+      HasLb := TryConstIntExpr(D.GetChild(0), Lb);
+      if D.Attributes.Values['ELLIPSIS'] = '1' then
+      begin
+        if HasLb and (Rank = 1) and (InitCount > 0) then
+        begin
+          Ub := Lb + InitCount - 1;
+          HasUb := True;
+        end;
+      end
+      else if D.ChildCount >= 2 then
+      begin
+        UbNode := D.GetChild(1);
+        HasUb := TryConstIntExpr(UbNode, Ub);
+      end;
+    end
+    else
+    begin
+      // A bare upper bound "a(n)": the lower bound is 0, because ParseDimensionList has already
+      // wrapped the OPTION BASE case into an antDimRange when the base is not 0.
+      HasLb := True; Lb := 0;
+      HasUb := TryConstIntExpr(D, Ub);
+    end;
+    if HasLb then LbS := IntToStr(Lb) else LbS := '?';
+    if HasUb then UbS := IntToStr(Ub) else UbS := '?';
+    if Bounds <> '' then Bounds := Bounds + ';';
+    Bounds := Bounds + LbS + ':' + UbS;
+  end;
+  Result := 'F|' + TypeName + '|' + IntToStr(Rank) + '|' + Bounds;
+end;
+
+function TPackratParser.ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
+// Read the shape off one antArrayDecl of a DIM / REDIM. Its children are the name, then optionally
+// an antDimensions, a type identifier and an antArgumentList (the aggregate initializer).
+var
+  i, InitCount: Integer;
+  Ch, Dims: TASTNode;
+  TypeName: string;
+begin
+  Dims := nil; TypeName := ''; InitCount := 0;
+  for i := 1 to ArrayDecl.ChildCount - 1 do
+  begin
+    Ch := ArrayDecl.GetChild(i);
+    case Ch.NodeType of
+      antDimensions:   Dims := Ch;
+      antIdentifier:   if TypeName = '' then TypeName := UpperCase(VarToStr(Ch.Value));
+      antArgumentList: InitCount := Ch.ChildCount;
+    else
+      ;
+    end;
+  end;
+  Result := EncodeDeclShape(Dims, TypeName, InitCount);
+  // ⭐ REDIM says DYNAMIC whatever bounds it states - that is the whole point of the statement, and
+  // it is why "Extern a(0 To 1) : ReDim a(0 To 1)" is an error in fbc although the bounds agree.
+  if IsRedim and (Length(Result) > 0) and (Result[1] = 'F') then
+    Result := 'D' + Copy(Result, 2, MaxInt);
+end;
+
+function TPackratParser.ShapeConflict(const Prev, Cur: string; out Why: string): Boolean;
+// The rule itself. It was FITTED against the fbc suite, not reasoned from the manual: the family is
+// generated (42 files, both the rejections and their legal counterexamples), so it is the
+// specification, and the rule was adjusted offline until it answered all of them.
+var
+  PK, CK: Char;
+  PT, CT, PB, CB: string;
+  PR, CR, i: Integer;
+  PParts, CParts: TStringList;
+
+  procedure SplitShape(const S: string; out K: Char; out T: string; out R: Integer; out B: string);
+  var
+    p1, p2, p3: Integer;
+  begin
+    K := S[1];
+    p1 := Pos('|', S);
+    p2 := Pos('|', S, p1 + 1);
+    p3 := Pos('|', S, p2 + 1);
+    T := Copy(S, p1 + 1, p2 - p1 - 1);
+    R := StrToIntDef(Copy(S, p2 + 1, p3 - p2 - 1), 0);
+    B := Copy(S, p3 + 1, MaxInt);
+  end;
+
+  function BoundsDisagree(const A, B: string; out W: string): Boolean;
+  var
+    av, bv: string;
+    c: Integer;
+  begin
+    Result := False; W := '';
+    for c := 0 to 1 do
+    begin
+      if c = 0 then
+      begin
+        av := Copy(A, 1, Pos(':', A) - 1);
+        bv := Copy(B, 1, Pos(':', B) - 1);
+      end
+      else
+      begin
+        av := Copy(A, Pos(':', A) + 1, MaxInt);
+        bv := Copy(B, Pos(':', B) + 1, MaxInt);
+      end;
+      if (av <> '?') and (bv <> '?') and (av <> bv) then
+      begin
+        if c = 0 then W := 'lower' else W := 'upper';
+        Exit(True);
+      end;
+    end;
+  end;
+
+begin
+  Result := False; Why := '';
+  if (Prev = '') or (Cur = '') then Exit;
+  SplitShape(Prev, PK, PT, PR, PB);
+  SplitShape(Cur,  CK, CT, CR, CB);
+  if (PK = 'S') <> (CK = 'S') then
+  begin
+    Why := 'one declaration is a scalar and the other an array';
+    Exit(True);
+  end;
+  if (PT <> '') and (CT <> '') and (PT <> CT) then
+  begin
+    Why := 'the element type changes from ' + PT + ' to ' + CT;
+    Exit(True);
+  end;
+  if PK = 'S' then Exit;
+  if (PK = 'D') <> (CK = 'D') then
+  begin
+    Why := 'one is a dynamic array and the other has fixed bounds';
+    Exit(True);
+  end;
+  if PK = 'D' then
+  begin
+    // A bare "()" states no rank, so it agrees with any rank; two STATED ranks must match.
+    if (PR > 0) and (CR > 0) and (PR <> CR) then
+    begin
+      Why := 'the number of dimensions changes from ' + IntToStr(PR) + ' to ' + IntToStr(CR);
+      Exit(True);
+    end;
+    Exit;
+  end;
+  if PR <> CR then
+  begin
+    Why := 'the number of dimensions changes from ' + IntToStr(PR) + ' to ' + IntToStr(CR);
+    Exit(True);
+  end;
+  PParts := TStringList.Create;
+  CParts := TStringList.Create;
+  try
+    PParts.Delimiter := ';'; PParts.StrictDelimiter := True; PParts.DelimitedText := PB;
+    CParts.Delimiter := ';'; CParts.StrictDelimiter := True; CParts.DelimitedText := CB;
+    for i := 0 to PParts.Count - 1 do
+    begin
+      if i > CParts.Count - 1 then Break;
+      if BoundsDisagree(PParts[i], CParts[i], Why) then
+      begin
+        Why := 'the ' + Why + ' bound of dimension ' + IntToStr(i + 1) + ' does not match';
+        Exit(True);
+      end;
+    end;
+  finally
+    PParts.Free;
+    CParts.Free;
+  end;
+end;
+
+procedure TPackratParser.NoteExternShape(const Name, Shape: string);
+// Remember it, and let a STATED rank replace the "()" that stated none - so that after
+// "Extern a() : Extern a(Any,Any)" a third declaration is measured against rank 2.
+var
+  Idx: Integer;
+  Old: string;
+begin
+  Idx := FExternShapes.IndexOfName(Name);
+  if Idx < 0 then
+    FExternShapes.Values[Name] := Shape
+  else
+  begin
+    Old := FExternShapes.ValueFromIndex[Idx];
+    if (Length(Old) > 0) and (Length(Shape) > 0) and (Old[1] = 'D') and (Shape[1] = 'D') and
+       (Pos('|0|', Old) > 0) and (Pos('|0|', Shape) = 0) then
+      FExternShapes.Values[Name] := Shape;
+  end;
+end;
+
+procedure TPackratParser.CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
+// A module-level DIM / REDIM has to agree with the module-level EXTERN that introduced the name.
+// A name no EXTERN introduced is not in the registry and is never looked at.
+var
+  i, Idx: Integer;
+  Decl: TASTNode;
+  Nm, Shape, Why: string;
+begin
+  if (Node = nil) or (FExternShapes.Count = 0) then Exit;
+  if not (Node.NodeType in [antDim, antRedim]) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    Idx := FExternShapes.IndexOfName(Nm);
+    if Idx < 0 then Continue;
+    Shape := ShapeOfArrayDecl(Decl, IsRedim);
+    if ShapeConflict(FExternShapes.ValueFromIndex[Idx], Shape, Why) then
+      HandleError(Format('Conflicting declaration of %s: %s', [Nm, Why]), Decl.GetChild(0).Token)
+    else
+      // ⭐ A REDIM refines the registry too, and it has to: "Extern a() : ReDim a(0 To 0) :
+      // ReDim a(0 To 0, 0 To 0)" is an error between the two REDIMs, and the EXTERN that stated no
+      // rank cannot be the one to catch it. NoteExternShape only ever lets a STATED rank replace an
+      // unstated one, so nothing else moves.
+      NoteExternShape(Nm, Shape);
+  end;
+end;
+
+procedure TPackratParser.ScanModuleLevelExtern;
+// Read a single-line "EXTERN name[(dims)] [As type] [= init]" for its SHAPE, then REWIND. The
+// caller's skip-to-end-of-line runs afterwards exactly as it did before, so this routine changes no
+// token consumption and builds no AST. Anything it does not recognise - ALIAS, BYREF, a leading AS,
+// a procedure pointer - leaves the name unregistered, which is precisely the behaviour that was
+// there before it existed.
+// ⛔ It reads tokens and puts them back, so it MUTES the error list while it looks: a diagnostic
+// left behind by a look-ahead is an error the program never made.
+var
+  SavedIdx, Idx: Integer;
+  Nm, TypeName, Shape, Why: string;
+  Dims: TASTNode;
+  BlameTok: TLexerToken;
+  HasParens, HasInit, HasEllipsis, Understood: Boolean;
+begin
+  SavedIdx := Context.CurrentIndex;
+  Dims := nil;
+  Nm := ''; TypeName := ''; Understood := False;
+  HasInit := False; HasEllipsis := False;
+  BlameTok := Context.CurrentToken;
+  Context.MutedErrors := Context.MutedErrors + 1;
+  try
+    Context.Advance;                                      // EXTERN
+    if not Context.Check(ttIdentifier) then Exit;          // "Extern As Integer a", "Extern ByRef ..."
+    Nm := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;
+    HasParens := Context.Check(ttDelimParOpen);
+    if HasParens then
+    begin
+      Context.Advance;                                    // '('
+      Dims := ParseDimensionList;
+      if not Context.Check(ttDelimParClose) then Exit;
+      Context.Advance;                                    // ')'
+      for Idx := 0 to Dims.ChildCount - 1 do
+        if Dims.GetChild(Idx).Attributes.Values['ELLIPSIS'] = '1' then HasEllipsis := True;
+    end;
+    if Context.Check(ttAsType) then
+    begin
+      Context.Advance;                                    // AS
+      if not Context.Check(ttIdentifier) then Exit;        // a qualifier or a procedure type: not ours
+      TypeName := UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;
+    end;
+    HasInit := Context.Check(ttOpEq);
+    // Only a line this routine has read to its END is a line whose shape it knows. A PTR suffix, a
+    // "* n" capacity, an ALIAS - anything still unread here - means "do not register this name".
+    if not (HasInit or Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) then Exit;
+    Shape := EncodeDeclShape(Dims, TypeName, 0);
+    Understood := True;
+  finally
+    if Assigned(Dims) then Dims.Free;
+    Context.CurrentIndex := SavedIdx;
+    Context.MutedErrors := Context.MutedErrors - 1;
+  end;
+  if not Understood then Exit;
+  // ⛔ An EXTERN declares, it does not define: fbc refuses an initializer on one, and refuses an
+  // ellipsis bound too - whose whole job is to be counted from an initializer an EXTERN may not have.
+  if HasInit then
+  begin
+    HandleError(Format('EXTERN %s cannot be initialized: an EXTERN declares, it does not define',
+                       [Nm]), BlameTok);
+    Exit;
+  end;
+  if HasEllipsis then
+  begin
+    HandleError(Format('EXTERN %s cannot use an ellipsis bound: there is no initializer to count',
+                       [Nm]), BlameTok);
+    Exit;
+  end;
+  Idx := FExternShapes.IndexOfName(Nm);
+  if (Idx >= 0) and ShapeConflict(FExternShapes.ValueFromIndex[Idx], Shape, Why) then
+  begin
+    HandleError(Format('Conflicting declaration of %s: %s', [Nm, Why]), BlameTok);
+    Exit;
+  end;
+  NoteExternShape(Nm, Shape);
 end;
 
 function TPackratParser.FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;

@@ -2129,7 +2129,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DYLIBLOAD` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `DYLIBSYMBOL` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `EXPORT` | ✓ | `SUB f (...) EXPORT` / `FUNCTION f (...) AS T EXPORT` — publish the symbol in a shared library's export table. There is no export table in a bytecode program: parsed and ignored. |
-| `EXTERN` | ✓ | Accepted and skipped — external linkage is N/A for a single-module bytecode VM (no native linking). |
+| `EXTERN` | ✓ | External linkage is N/A for a single-module bytecode VM, so the line produces no storage — but a module-level `EXTERN` is still a DECLARATION, and a later `DIM`/`REDIM`/`EXTERN` of that name must agree with it on rank, bounds, static/dynamic-ness and element type (as `fbc` requires). An `EXTERN` may carry neither an initializer nor an ellipsis bound. The rule is confined to module level: a same-named `DIM` inside a `SUB` or a `NAMESPACE` is a different variable. |
 | `EXTERN...END EXTERN` | ✓ | `EXTERN "lang" ... END EXTERN` block accepted and skipped (no native linking). |
 | `IMPORT` | ✓ | Accepted and skipped (no native linking). |
 | `NAMESPACE` | ✓ | Group decls under a name (AST-flattened to `N.member`); nesting + reopening |
