@@ -124,6 +124,11 @@ type
     // FreeBASIC requires the declaration to precede the definition, so a single forward pass suffices.
     FTypeStaticMethods: TStringList;
     FStaticMemberProcs: TStringList;   // "TYPE.NAME" of every "Declare Static Sub|Function" seen in a TYPE body.
+    // The CONST-ness of each pointer level of the type being parsed, in SOURCE order, one character
+    // per level ('1' = that level is a constant pointer). AtPointerSuffix appends to it, because that
+    // predicate is the ONE place the inner CONST is recognised - all fifteen loops share it. A caller
+    // that wants the chain clears it before the type and reads it after.
+    FPtrQualChain: string;
                                        // ⛔ DELIBERATELY SEPARATE from FTypeStaticMethods, which decides whether a
                                        // definition gets an implicit THIS: that mechanism is written but DORMANT
                                        // (the set is never filled), and the CALL SITE passes a dummy THIS to match.
@@ -9502,6 +9507,12 @@ function TPackratParser.SkipTypeQualifiersConst: Boolean;
 // them. Dropping the word silently made the two collide on one label and the second was discarded.
 begin
   Result := False;
+  // ⛔ A TYPE STARTS HERE, so the pointer-qualifier chain starts here too. Clearing it only in the
+  // branch that reads it let the chain ACCUMULATE across declarations: "Dim As Byte Ptr b1 = b0" was
+  // refused for a const two levels down that belonged to the PREVIOUS statement's type. Every "As
+  // <type>" site goes through this function - twenty-eight of them - which is why the reset belongs
+  // here and not at the one caller that happens to ask for the answer.
+  FPtrQualChain := '';
   while Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
         (UpperCase(Context.CurrentToken.Value) = 'CONST') do
   begin
@@ -9691,12 +9702,14 @@ begin
     if (W = kPTR) or (FModernMode and (W = kPOINTER)) then
     begin
       Context.Advance;                   // consume CONST; the caller consumes the PTR that follows
+      FPtrQualChain := FPtrQualChain + '1';   // ...and this level is CONST; see the field's note
       Exit(True);
     end;
   end;
   if not Context.Check(ttIdentifier) then Exit;
   W := UpperCase(VarToStr(Context.CurrentToken.Value));
   Result := (W = kPTR) or (FModernMode and (W = kPOINTER));
+  if Result then FPtrQualChain := FPtrQualChain + '0';
 end;
 
 function TPackratParser.ParseDimensionList: TASTNode;
@@ -10200,7 +10213,7 @@ begin
         NameTok := Context.CurrentToken;
         Context.Advance;                       // name
         Context.Advance;                       // AS
-        NameIsConst := SkipTypeQualifiersConst;   // see the leading-AS note above
+        NameIsConst := SkipTypeQualifiersConst;   // ...which also starts this type's qualifier chain
         // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": int-banked (holds an
         // entry PC); the signature is captured on a scratch node and copied onto the decl below.
         FuncPtrSigNode := nil;
@@ -10250,6 +10263,13 @@ begin
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       if NameIsConst then ArrayDecl.Attributes.Values['CONSTV'] := '1';
+      // The type's CONST chain, kept whole: character 0 is the BASE ("As Const <type>"), then one per
+      // pointer level in source order. "Const UByte Const Ptr Ptr" -> "110". FreeBASIC's rule for
+      // assigning one pointer to another is written on exactly this - and on nothing else, which is
+      // what its own 183 const/assign-* tests say when they are read as the specification they are.
+      if (NameIsConst or (FPtrQualChain <> '')) then
+        ArrayDecl.Attributes.Values['PTRQUALS'] :=
+          Copy('10', 1 + Ord(not NameIsConst), 1) + FPtrQualChain;
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
       ArrayDecl.AddChild(VarNameNode);
       if LeadingAS and Assigned(LeadingTypeOfExpr) then

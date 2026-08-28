@@ -314,6 +314,7 @@ type
                                          // address); reads/writes auto-dereference, like a BYREF-return param.
     FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
     FRawUDTPtrs: TStringList;            // "T PTR" vars holding a RAW address (a UDT laid over bytes) -> T
+    FVarPtrQuals: TStringList;           // var (UPPER) -> its type's CONST chain: base, then one char per pointer level
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
@@ -673,6 +674,7 @@ type
     function AllocOperatorLabel(const TypeName, OpName: string): string;        // "Operator T.New/Delete", or ''
     function TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;  // ...asked before FProcDecls exists
     function TypeHasMemberProc(const TypeName: string): Boolean;               // ...anything that takes a THIS
+    procedure CheckPointerConstAssign(Decl: TASTNode);   // FB: a pointer assignment may not DROP a const
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
@@ -1371,6 +1373,8 @@ begin
   FRefVars := TStringList.Create;
   FRawUDTPtrs := TStringList.Create;
   FRawUDTPtrs.CaseSensitive := False;
+  FVarPtrQuals := TStringList.Create;
+  FVarPtrQuals.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
   FBlockManagedTypes := TStringList.Create;
   FConstStrBytes := TStringList.Create;
@@ -1495,6 +1499,7 @@ begin
   FConstDeclSeen.Free;
   FConstStrBytes.Free;
   FRawUDTPtrs.Free;
+  FVarPtrQuals.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
   FDynamicArrays.Free;
@@ -10413,6 +10418,13 @@ begin
 
     ArrName := VarToStr(ArrayDeclNode.GetChild(0).Value);
     DimsNode := ArrayDeclNode.GetChild(1);
+    // FB const-correctness on POINTERS. The check is asked BEFORE the name is recorded, so the source
+    // side is one of the declarations already seen and the destination is not yet itself.
+    if ArrayDeclNode.Attributes.Values['PTRQUALS'] <> '' then
+    begin
+      CheckPointerConstAssign(ArrayDeclNode);
+      FVarPtrQuals.Values[UpperCase(ArrName)] := ArrayDeclNode.Attributes.Values['PTRQUALS'];
+    end;
 
     // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": an ordinary int scalar that
     // holds a procedure entry PC (assigned via "= @func"); record its signature so "fp(args)" lowers to
@@ -33030,6 +33042,55 @@ begin
   Result := '';
   if TypeName = '' then Exit;
   Result := ResolveMethodLabel(TypeName, OpName);
+end;
+
+procedure TSSAGenerator.CheckPointerConstAssign(Decl: TASTNode);
+// FreeBASIC's rule for initialising one pointer from another, and it is ONE rule: **a const may not be
+// dropped at any dereference level**. Not the base type - "Byte Ptr = UByte Ptr" is legal - and not the
+// depth - "Byte Ptr = UByte Ptr Ptr" is legal too. Only the qualifiers.
+//
+// ⭐ THE RULE WAS NOT REASONED OUT, IT WAS FITTED. fbc's own suite carries 183 "const/assign-<lhs>-from-
+// <rhs>" tests, 123 of them COMPILE_ONLY_OK and 60 COMPILE_ONLY_FAIL: read as a specification instead of
+// as a scoreboard, they ARE the rule, with both directions given. A first attempt modelled C++'s
+// qualification conversion (base types, depths, the const-ification clause) and disagreed with fbc on
+// 46 of the 183. This one agrees on 183 of 183.
+//
+// The chain is stored per level, base first, as the parser wrote it ("Const UByte Const Ptr Ptr" ->
+// "110"). Level j counts dereferences from the variable: quals[0] is the variable itself (irrelevant
+// here - it says whether the NAME may be reassigned, which is a different diagnostic), quals[j>=1] is
+// what j dereferences reach. In source order the chain is base-first, so it is read backwards.
+var
+  LName, RName, LQ, RQ: string;
+  j, n: Integer;
+
+  function LevelConst(const Chain: string; Depth, Level: Integer): Boolean;
+  // Chain[1] is the BASE, Chain[2..] the pointer levels in SOURCE order. Level 1 is one dereference
+  // from the variable, i.e. the OUTERMOST pointer's pointee, i.e. the LAST character; level Depth is
+  // the base.
+  begin
+    if Level >= Depth then Exit(Chain[1] = '1');
+    Result := Chain[1 + Depth - Level] = '1';
+  end;
+
+begin
+  if (FVarPtrQuals = nil) or (Decl = nil) or (Decl.ChildCount < 3) then Exit;
+  if Decl.GetChild(0).NodeType <> antIdentifier then Exit;
+  if Decl.GetChild(2).NodeType <> antIdentifier then Exit;     // only "= <another variable>" for now
+  LName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+  RName := UpperCase(VarToStr(Decl.GetChild(2).Value));
+  // ⛔ The DESTINATION is the declaration being lowered right now, so its chain is on the NODE - it is
+  // not in the registry yet, and must not be: registering it first would let a name shadow itself.
+  LQ := Decl.Attributes.Values['PTRQUALS'];
+  RQ := FVarPtrQuals.Values[RName];
+  if (LQ = '') or (RQ = '') then Exit;                          // one side is not a declared pointer
+  n := Length(LQ) - 1;                                          // the destination's pointer depth
+  if Length(RQ) - 1 < n then n := Length(RQ) - 1;               // ...or the source's, whichever is less
+  for j := 1 to n do
+    if LevelConst(RQ, Length(RQ) - 1, j) and not LevelConst(LQ, Length(LQ) - 1, j) then
+      raise Exception.CreateFmt(
+        'Invalid assignment/conversion: "%s" would drop the CONST that "%s" carries %d dereference(s) ' +
+        'down. FreeBASIC lets a pointer assignment ADD a const at any level and never remove one.',
+        [LName, RName, j]);
 end;
 
 function TSSAGenerator.TypeHasMemberProc(const TypeName: string): Boolean;
