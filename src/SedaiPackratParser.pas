@@ -10263,6 +10263,20 @@ begin
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       if NameIsConst then ArrayDecl.Attributes.Values['CONSTV'] := '1';
+      // ⛔ ...AND THE VARIABLE ITSELF IS THEN NOT AN LVALUE. "Dim As Const Integer i = 0 : i = 0" is
+      // fbc's error 119, and the refusal already exists one function away - it is what a module CONST
+      // gets - but only names declared with the CONST STATEMENT were ever put in the set.
+      // ⚠️ "Const" on a POINTER type says which of two different things is immutable: "As Const Integer
+      // Ptr" is a pointer TO const (assigning to the pointer is legal) and "As Integer Const Ptr" is a
+      // CONST pointer (it is not). The variable's own qualifier is the OUTERMOST level - the last one
+      // written - and only that one makes the name unassignable.
+      if (FPtrQualChain = '') and NameIsConst then
+        if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+          FConstNames.Add(UpperCase(VarToStr(NameTok.Value)))
+        else
+      else if (FPtrQualChain <> '') and (FPtrQualChain[Length(FPtrQualChain)] = '1') then
+        if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+          FConstNames.Add(UpperCase(VarToStr(NameTok.Value)));
       // The type's CONST chain, kept whole: character 0 is the BASE ("As Const <type>"), then one per
       // pointer level in source order. "Const UByte Const Ptr Ptr" -> "110". FreeBASIC's rule for
       // assigning one pointer to another is written on exactly this - and on nothing else, which is
