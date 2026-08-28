@@ -914,6 +914,7 @@ type
     function UDTFieldBankOf(MemberNode: TASTNode): TSSARegisterType;   // bank of the field a member access names
     function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
+    function PointeeOfDerefTarget(Node: TASTNode): string;   // ...of the EXPRESSION a "*" is applied to
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
     function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a UCS-2 temporary
@@ -2901,45 +2902,22 @@ begin
       else
         EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
-      // *Cast/CPtr(T Ptr, x) over a MANAGED (packed-slot) address: the slot is read whole, but the
-      // cast asks for T's view of it - reinterpret the LOW bytes at T's width and signedness, like
-      // little-endian memory would ("*CPtr(Byte Ptr, @int32holding_&h80)": fbc prints -128, the
-      // whole-slot read said 128). Int-family pointees only; a cross-bank pun needs a raw backing
-      // (the @-taken-scalar raw path) and keeps the whole-slot behavior here.
-      if (DerefTarget.NodeType = antCast) and (FuncRetType = srtInt) then
+      // ⭐ A VALUE READ THROUGH A POINTER HAS THE POINTER'S DECLARED POINTEE TYPE. A managed address
+      // reads its slot WHOLE - 64 bits - so a narrow or differently-signed pointee saw the wrong
+      // number: "Dim As UByte u = 200 : Dim As Byte Ptr b = Cast(Byte Ptr, @u) : Print *b" answered
+      // 200 where fbc answers -56, and a Short Ptr over a Long answered the whole Long.
+      // ⛔ THE RULE EXISTED AND ONE PATH HAD IT. It was keyed on the deref target being SYNTACTICALLY
+      // a Cast ("*CPtr(Byte Ptr, x)"), so putting the very same cast in a variable first - which is
+      // how anyone writes it - lost it. The question is not how the pointer was spelled, it is what
+      // it was DECLARED to point at.
+      // ⛔ And it went through ApplyNarrowCode instead of a hand-rolled SHL/SHR/AND ladder, which was
+      // a second copy of a conversion this compiler already owns - and the copy knew six types where
+      // the original knows eleven.
+      if FuncRetType = srtInt then
       begin
-        TempStr := DerefedType(DerefTarget);
-        DestReg := 0;   // reused as the shift width for the sign-extending pointee views
-        TempVal2 := MakeSSAValue(svkNone);
-        case TempStr of
-          'BYTE':  DestReg := 56;
-          'SHORT': DestReg := 48;
-          'LONG':  DestReg := 32;
-          'UBYTE', 'USHORT', 'ULONG':
-          begin
-            // Binary-op constants must live in registers (the translator has no Src2 immediates).
-            TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            if TempStr = 'UBYTE' then
-              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FF), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-            else if TempStr = 'USHORT' then
-              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FFFF), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-            else
-              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FFFFFFFF), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaBitwiseAnd, Left, Result, TempVal2, MakeSSAValue(svkNone));
-            Result := Left;
-          end;
-        end;
-        if DestReg > 0 then
-        begin
-          // Sign extension: (v SHL n) SHR n - our integer SHR is arithmetic on the int bank.
-          TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt(DestReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-          Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaShl, Left, Result, TempVal2, MakeSSAValue(svkNone));
-          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaShr, Result, Left, TempVal2, MakeSSAValue(svkNone));
-        end;
+        TempStr := PointeeOfDerefTarget(DerefTarget);
+        if TempStr <> '' then
+          Result := ApplyNarrowCode(TypeNameWidthCode(TempStr), Result);
       end;
     end;
 
@@ -7731,6 +7709,11 @@ begin
           else
             EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
+          // ⛔ "p[i]" IS "*(p + i)" and owes the pointee's width and sign exactly as much. Closing the
+          // rule on "*p" alone would have left the subscript spelling of the same read still wrong -
+          // one path having a rule its sibling does not is the shape this codebase keeps paying for.
+          if FuncRetType = srtInt then
+            Result := ApplyNarrowCode(TypeNameWidthCode(UpperCase(PointeeTypeOf(ArrName))), Result);
           Exit;
         end;
 
@@ -31661,6 +31644,24 @@ begin
   else if T = 'SINGLE' then Result := RTC_SINGLE
   else if T = 'DOUBLE' then Result := RTC_DOUBLE
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
+end;
+
+function TSSAGenerator.PointeeOfDerefTarget(Node: TASTNode): string;
+// What the expression a "*" is applied to was DECLARED to point at, whatever shape it was written in:
+// a cast ("*CPtr(Byte Ptr, x)"), a name ("*b"), an arithmetic step ("*(b + 1)") or a parenthesised
+// one. ⛔ It exists because the narrowing rule below used to be keyed on the target being
+// SYNTACTICALLY a Cast - so assigning the very same cast to a variable first, which is how anyone
+// writes it, lost the rule. The question is not how the pointer was spelled.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antCast:        Result := DerefedType(Node);
+    antIdentifier:  Result := UpperCase(PointeeTypeOf(VarToStr(Node.Value)));
+    antParentheses: if Node.ChildCount >= 1 then Result := PointeeOfDerefTarget(Node.GetChild(0));
+    // "p + n" / "p - n": the POINTER is the left operand - the right one is a count of elements.
+    antBinaryOp:    if Node.ChildCount >= 1 then Result := PointeeOfDerefTarget(Node.GetChild(0));
+  end;
 end;
 
 function TSSAGenerator.PointeeTypeOf(const PtrName: string): string;
