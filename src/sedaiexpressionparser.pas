@@ -1606,7 +1606,15 @@ begin
   begin
     while not Context.Check(ttDelimParClose) do
     begin
-      Result.AddChild(ParseExpression);
+      // ⭐ AN OMITTED ARGUMENT IS A REAL ONE. FreeBASIC lets a middle argument be left out and takes
+      // the parameter's default: "dir( ""*"", , attrib )" is its own file/dir-overloads, and the
+      // position is what carries the meaning - so the slot must still be FILLED, with a placeholder,
+      // or the third argument would arrive as the second. ParseExpression on a bare ',' consumed
+      // nothing and the loop then met the comma where it wanted ')'.
+      if Context.Check(ttSeparParam) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, Unassigned, Context.CurrentToken))
+      else
+        Result.AddChild(ParseExpression);
       if not Context.Check(ttSeparParam) then Break;
       Context.Advance;                                // ','
     end;
