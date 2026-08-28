@@ -677,6 +677,8 @@ type
     procedure CheckPointerConstAssign(Decl: TASTNode);   // FB: a pointer assignment may not DROP a const
     procedure CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);  // FB: too many values in a (...) init
     procedure CheckArrayByteSize(const ArrName, ElemTypeName: string; Elems, ElemBytes: Int64);  // FB error 50
+    procedure CheckFieldArrayByteSize(const FieldName: string; Bounds: TASTNode; ElemSz: Int64);  // ...for a UDT FIELD array
+    procedure CheckAllFieldArraySizes;   // ...over every type, once the module CONSTs are known
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
@@ -9855,6 +9857,7 @@ function TSSAGenerator.TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Bool
 // FreeBASIC's FLOATING division, so "Const HALF = 1 / 2" must stay 0.5 and not become 0.
 var
   L, R: Int64;
+  Op: TASTNode;
 begin
   Result := False;
   Val := 0;
@@ -9877,6 +9880,31 @@ begin
     // because the layout was wrong.
     antParentheses:
       Result := (Node.ChildCount >= 1) and TryFoldConstIntExpr(Node.GetChild(0), Val);
+    // ⛔ SIZEOF IS A CONSTANT AND THIS FOLDER DID NOT KNOW IT. Every "array too big" test of fbc's
+    // suite writes its bound as "LIMIT \ SizeOf(T)", and the fold declined on the right operand - so
+    // the bound was not constant, the array was sized at run time, and no rule keyed on constant bounds
+    // ever saw it. Two spellings reach here: "SizeOf(T)" and "SizeOf(ZString * n)", the second an
+    // antBinaryOp of the type name and the capacity, whose size IS that capacity.
+    antArrayAccess, antFunctionCall:
+      begin
+        if UpperCase(VarToStr(Node.Value)) <> 'SIZEOF' then
+          if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antIdentifier) or
+             (UpperCase(VarToStr(Node.GetChild(0).Value)) <> 'SIZEOF') then Exit;
+        Op := Node;
+        while (Op.ChildCount > 0) and
+              (Op.GetChild(Op.ChildCount - 1).NodeType in [antExpressionList, antArgumentList]) do
+          Op := Op.GetChild(Op.ChildCount - 1);
+        if Op.ChildCount <> 1 then Exit;
+        Op := Op.GetChild(0);
+        if Op.NodeType = antIdentifier then
+          Val := TypeSizeBytes(UpperCase(VarToStr(Op.Value)))
+        else if (Op.NodeType = antBinaryOp) and (Op.ChildCount = 2) and
+                (Op.GetChild(0).NodeType = antIdentifier) and (Op.GetChild(1).NodeType = antLiteral) then
+          Val := StrToInt64Def(VarToStr(Op.GetChild(1).Value), 0)     // "ZString * n" is n bytes wide
+        else
+          Exit;
+        Result := Val > 0;
+      end;
     antUnaryOp:
       begin
         if (Node.ChildCount < 1) or (Node.Token = nil) then Exit;
@@ -11189,8 +11217,19 @@ begin
           if TotalElements > MAX_ARRAY_ELEMENTS then
             raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
           if ArrElemTypeName <> '' then
-            CheckArrayByteSize(ArrName, ArrElemTypeName, TotalElements,
-                               TypeSizeBytes(ArrElemTypeName));
+            // ...and a "ZString * n" element is as wide as its declared CAPACITY, not as the bare
+            // type name (which sizes a descriptor). Same three-way question the field pass asks.
+            // ⛔ READ FROM THE NODE, NOT FROM FixLenCap: that local is assigned LATER in this same
+            // procedure, so here it still holds the previous declaration's value - or nothing at all.
+            // The corpus caught it as a FAIL *and* an OPTDIFF, the element width differing between the
+            // two builds (32602 bytes against 32732): two different readings of uninitialised memory,
+            // which is the signature the differential exists to show.
+            if StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) > 0 then
+              CheckArrayByteSize(ArrName, ArrElemTypeName, TotalElements,
+                                 StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0))
+            else
+              CheckArrayByteSize(ArrName, ArrElemTypeName, TotalElements,
+                                 TypeSizeBytes(ArrElemTypeName));
         end;
       end
       else if DimValue.Kind = svkConstFloat then
@@ -25079,7 +25118,9 @@ begin
       // is auto-sized at construction; an "Any" member has no concrete bound and waits for an explicit REDIM.
       FUDTs[Idx].Fields[n].ArrayBounds := nil;
       if IsArrayField then
+      begin
         FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
+      end;   // the SIZE of it is checked by CheckAllFieldArraySizes, once the CONSTs exist
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       FUDTs[Idx].Fields[n].IsZString := (TypeName = 'ZSTRING');  // variable-length, n bytes in C
       FUDTs[Idx].Fields[n].IsBoolean := (CanonicalType(TypeName) = 'BOOLEAN');
@@ -33079,6 +33120,73 @@ begin
       [ArrName, Elems, ElemTypeName, ElemBytes]);
 end;
 
+procedure TSSAGenerator.CheckAllFieldArraySizes;
+// ⛔ WHY THIS IS A PASS OF ITS OWN AND NOT A LINE INSIDE RegisterUDTs. The bound of a field array is
+// routinely written over a module CONST - "Const LIMIT = &h7FFFFFFF : Type C : As Byte t(0 To LIMIT)" -
+// and RegisterUDTs runs BEFORE the constants are collected, so the fold there declines and the check
+// never fires. Asked with a literal bound it worked, asked with a CONST it did not: the same shape of
+// mistake as a registry consulted before it is filled. So the types are walked again, here, once
+// FModuleConstVals holds what a program actually writes.
+var
+  u, f: Integer;
+  ElemW: Int64;
+begin
+  for u := 0 to High(FUDTs) do
+    for f := 0 to High(FUDTs[u].Fields) do
+      if FUDTs[u].Fields[f].ArrayBounds <> nil then
+      begin
+        // ⛔ THREE KINDS OF ELEMENT, THREE PLACES THE WIDTH LIVES. A scalar names its type; an
+        // array-of-UDT leaves ArrayElemScalarType EMPTY and names the type in ArrayElemType; and a
+        // "ZString * n" element is neither - its width is the declared CAPACITY, and TypeSizeBytes of
+        // the bare name answers for a descriptor. Asking only the first left six of fbc's eighteen
+        // array-too-big tests standing, which is how the other two were found.
+        ElemW := 0;
+        if FUDTs[u].Fields[f].StrCapacity > 0 then
+          ElemW := FUDTs[u].Fields[f].StrCapacity
+        else if FUDTs[u].Fields[f].ArrayElemType <> '' then
+          ElemW := TypeSizeBytes(FUDTs[u].Fields[f].ArrayElemType)
+        else if FUDTs[u].Fields[f].ArrayElemScalarType <> '' then
+          ElemW := TypeSizeBytes(FUDTs[u].Fields[f].ArrayElemScalarType);
+        CheckFieldArrayByteSize(FUDTs[u].Name + '.' + FUDTs[u].Fields[f].Name,
+                                FUDTs[u].Fields[f].ArrayBounds, ElemW);
+      end;
+end;
+
+procedure TSSAGenerator.CheckFieldArrayByteSize(const FieldName: string; Bounds: TASTNode;
+  ElemSz: Int64);
+// The byte cap of CheckArrayByteSize, asked of an array declared as a FIELD of a TYPE. That is a
+// different declaration path from a DIM and had no size check at all: ten of fbc's eighteen
+// array-too-big tests are written that way.
+// Bounds are folded with the same evaluator the field LAYOUT uses (TryFoldConstIntExpr), so a bound
+// this routine cannot fold is one the layout cannot fold either - and it declines instead of guessing.
+var
+  di: Integer;
+  Lb, Ub, Count: Int64;
+  D: TASTNode;
+begin
+  if (Bounds = nil) or (Bounds.ChildCount = 0) or (ElemSz <= 0) then Exit;
+  Count := 1;
+  for di := 0 to Bounds.ChildCount - 1 do
+  begin
+    D := Bounds.GetChild(di);
+    if D.NodeType = antDimRange then
+    begin
+      if D.ChildCount < 2 then Exit;
+      if not TryFoldConstIntExpr(D.GetChild(0), Lb) then Exit;
+      if not TryFoldConstIntExpr(D.GetChild(1), Ub) then Exit;
+    end
+    else
+    begin
+      Lb := 0;
+      if not TryFoldConstIntExpr(D, Ub) then Exit;
+    end;
+    if Ub < Lb then Exit;
+    Count := Count * (Ub - Lb + 1);
+    if Count <= 0 then Exit;                       // overflowed the fold itself: not our diagnostic
+  end;
+  CheckArrayByteSize(FieldName, IntToStr(ElemSz) + ' bytes', Count, ElemSz);
+end;
+
 procedure TSSAGenerator.CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);
 // FreeBASIC counts the values of an aggregate initialiser against the SLOTS the type actually has and
 // answers "error 67: Too many expressions" when there are more.
@@ -38491,6 +38599,9 @@ begin
   CollectBlockManagedTypes(AST);   // before the raw-pointer fixpoint: it asks whether New T[n] is managed
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
+  // ...and only NOW can a field ARRAY be sized: its bound is routinely a module CONST, and those
+  // are collected by the walk just above. See the note on the pass.
+  CheckAllFieldArraySizes;
   // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
   FStaticMembers.Clear;
   FStaticMemberArrays.Clear;
