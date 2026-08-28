@@ -167,7 +167,18 @@ type
     // pointer "p = @other" is perfectly legal and only "*p = ..." is not. The two halves of the word
     // CONST on a pointer type, kept apart - m632 established which is which, this is the other one.
     FConstPointeeNames: TStringList;
+    // ⭐ Module-level declared names -> the element/scalar TYPE they were declared with. A second
+    // declaration of the same name AT MODULE LEVEL is fbc's "error 4: Duplicated definition"; a
+    // declaration inside a Sub, a Scope or an If SHADOWS and is perfectly legal, and so is a ReDim of
+    // an array a Dim already declared. Only module level, which is the one scope this parser can name.
+    FModuleDeclared: TStringList;
     FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
+    // ⛔ A FOR BODY IS A FLAT RUN OF SIBLINGS, not a child node - so a "Dim" inside a module-level FOR
+    // arrives at ParseProgram's own loop and looks like a module-level declaration. It is not: it is a
+    // BLOCK-local one, and it shadows. The same pair the SSA's own scope collector counts (antForLoop
+    // opens, antNext closes), for the same reason.
+    FFlatBlockDepth: Integer;
+    FInNamespaceBody: Boolean;       // a NAMESPACE body is module level for TYPEs and NOT for names
     function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer;
                              const Flags: string): string;
     function ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
@@ -183,6 +194,7 @@ type
     procedure RefuseNonModuleLevelType(Node: TASTNode);
     function WritesThroughConstPointee(Node: TASTNode): string;
     function ConstRootOfTarget(Node: TASTNode): string;
+    procedure CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -523,6 +535,8 @@ begin
   FTypesWithCtorDtor.CaseSensitive := False;
   FConstPointeeNames := TStringList.Create;
   FConstPointeeNames.CaseSensitive := False;
+  FModuleDeclared := TStringList.Create;
+  FModuleDeclared.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -545,6 +559,7 @@ begin
   FModuleLocalNames.Free;
   FTypesWithCtorDtor.Free;
   FConstPointeeNames.Free;
+  FModuleDeclared.Free;
 
   inherited Destroy;
 end;
@@ -879,7 +894,10 @@ begin
   FModuleLocalNames.Clear;
   FTypesWithCtorDtor.Clear;
   FConstPointeeNames.Clear;
+  FModuleDeclared.Clear;
   FTopLevelStmt := False;
+  FFlatBlockDepth := 0;
+  FInNamespaceBody := False;
 
   try
     // Initialize context
@@ -954,7 +972,10 @@ begin
   FModuleLocalNames.Clear;
   FTypesWithCtorDtor.Clear;
   FConstPointeeNames.Clear;
+  FModuleDeclared.Clear;
   FTopLevelStmt := False;
+  FFlatBlockDepth := 0;
+  FInNamespaceBody := False;
 
   try
     // Initialize context
@@ -1046,9 +1067,16 @@ begin
      // body (a Sub, a namespace, a Scope block) is not. The flag is consumed - and cleared - by the
      // first thing that reads it, so a nested ParseStatement always sees False. This is the ONLY
      // notion of "module level" the parser has, and the EXTERN rule below needs exactly that.
-     FTopLevelStmt := True;
+     FTopLevelStmt := (FFlatBlockDepth = 0);
      Statement := Memoize('Statement', @ParseStatement);
      FTopLevelStmt := False;
+     if Assigned(Statement) then
+       case Statement.NodeType of
+         antForLoop: Inc(FFlatBlockDepth);
+         antNext:    if FFlatBlockDepth > 0 then Dec(FFlatBlockDepth);
+       else
+         ;
+       end;
 
      if Assigned(Statement) then
      begin
@@ -1348,6 +1376,7 @@ begin
     begin
       Result := Memoize('DimStatement', @ParseDimStatement);
       if AtModuleLevel then CheckDeclAgainstExtern(Result, False);
+      if AtModuleLevel then CheckDuplicateModuleDecl(Result, False);
     end;
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
     ttLSet: Result := ParseLRSetStatement(antLSet);
@@ -1356,9 +1385,14 @@ begin
     begin
       Result := Memoize('RedimStatement', @ParseRedimStatement);
       if AtModuleLevel then CheckDeclAgainstExtern(Result, True);
+      if AtModuleLevel then CheckDuplicateModuleDecl(Result, True);
     end;
     ttEnum: Result := Memoize('EnumStatement', @ParseEnumStatement);
     ttDefType: Result := Memoize('DefTypeStatement', @ParseDefTypeStatement);
+    // ⛔ NO duplicate check on a CONST. fbc ALLOWS a constant to be redeclared with the SAME value -
+    // its own const/redundant-constants declares "Const I1 = 0" twice on purpose - and only a
+    // CONFLICTING redefinition is an error. Refusing on the name alone cost that test; telling the two
+    // apart needs the folded value on both sides, which is a separate piece of work.
     ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
     ttDataConstant: Result := Memoize('DataStatement', @ParseDataStatement);
     ttDataRead: Result := Memoize('ReadStatement', @ParseReadStatement);
@@ -4010,8 +4044,10 @@ begin
     // body or a BLOCK (Scope, If, a loop) refuses them. Marking it here is what keeps the rule in
     // RefuseNonModuleLevelType from refusing a program fbc compiles.
     FTopLevelStmt := True;
+    FInNamespaceBody := True;
     Stmt := ParseStatement;
     FTopLevelStmt := False;
+    FInNamespaceBody := False;
     if Assigned(Stmt) then
       Result.AddChild(Stmt)
     else if Context.CurrentIndex = PrevIdx then
@@ -10378,6 +10414,69 @@ begin
     HandleError(Format('Type %s cannot be declared here: %s, and a type that needs a constructor, ' +
       'a destructor or a method is only allowed at module level',
       [UpperCase(VarToStr(Node.Value)), Why]), Node.Token);
+end;
+
+procedure TPackratParser.CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
+// ⭐ A NAME MAY BE DECLARED ONCE AT MODULE LEVEL. fbc: "error 4: Duplicated definition". Two "Dim a",
+// a "Common i" beside a "Dim i", a "Dim foo" beside a "Const foo", and an array declared twice are all
+// the same refusal - and a "Dim a() As Integer" followed by a "ReDim a(...) As Double" is one too,
+// because the second states a different ELEMENT TYPE for a name that already has one.
+//
+// ⛔ MODULE LEVEL ONLY, and the caller decides that with the one flag this parser has. A declaration
+// inside a Sub, a Scope or an If SHADOWS the module one and is legal - all three measured against the
+// oracle before this was written - and a ReDim of an array a Dim already declared is the normal idiom,
+// so a ReDim neither registers a name nor is refused for finding one.
+var
+  i, k, Idx: Integer;
+  Decl, Ch: TASTNode;
+  Nm, TypeNm: string;
+begin
+  if Node = nil then Exit;
+  if not (Node.NodeType in [antDim, antRedim]) then Exit;
+  // ⛔ ...AND NOT INSIDE A NAMESPACE. A namespace body is module level for the TYPE rule (m646) and is
+  // NOT one scope for NAMES: two namespaces may each declare their own "v", and fbc compiles that.
+  // The two questions look alike and have different answers, so they are asked separately.
+  if FInNamespaceBody then Exit;
+  // ⛔ ...AND NOT A "COMMON". A COMMON DECLARES a name that a later DIM may then SIZE: fbc's own
+  // dim/dim-common-dynamic writes "Common array() As Integer" followed by "Dim array(1 To 2)" and
+  // compiles it. ⚠️ For a SCALAR the same pair IS an error ("Common i" + "Dim i"), so this exemption
+  // gives up two tests to keep two others - telling them apart wants the array/scalar shape of BOTH
+  // declarations, which is the EXTERN machinery next door and a separate piece of work.
+  if (Node.Token <> nil) and (UpperCase(VarToStr(Node.Token.Value)) = 'COMMON') then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    if (Nm = '') or (Pos('.', Nm) > 0) then Continue;   // a member definition is a different rule
+    // the declared type: the FIRST bare identifier after the name (an antDimensions may sit between)
+    TypeNm := '';
+    for k := 1 to Decl.ChildCount - 1 do
+    begin
+      Ch := Decl.GetChild(k);
+      if (Ch <> nil) and (Ch.NodeType = antIdentifier) then
+      begin
+        TypeNm := UpperCase(VarToStr(Ch.Value));
+        Break;
+      end;
+    end;
+    Idx := FModuleDeclared.IndexOfName(Nm);
+    if IsRedim then
+    begin
+      // A ReDim does not declare the name; it may not contradict the type the Dim gave it.
+      if (Idx >= 0) and (TypeNm <> '') and (FModuleDeclared.ValueFromIndex[Idx] <> '') and
+         (FModuleDeclared.ValueFromIndex[Idx] <> TypeNm) then
+        HandleError(Format('Duplicated definition: %s was declared As %s and this ReDim says As %s',
+          [Nm, FModuleDeclared.ValueFromIndex[Idx], TypeNm]), Decl.GetChild(0).Token);
+      Continue;
+    end;
+    if Idx >= 0 then
+      HandleError(Format('Duplicated definition: %s is already declared at module level', [Nm]),
+                  Decl.GetChild(0).Token)
+    else
+      FModuleDeclared.Values[Nm] := TypeNm;
+  end;
 end;
 
 procedure TPackratParser.CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
