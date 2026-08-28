@@ -414,6 +414,13 @@ type
     // it, and until now NOTHING destroyed it: fbc runs one destructor MORE than we did for every such
     // call, and exactly one. Strings[] is the type name, Objects[] the handle register's index.
     FResultTemps: TStringList;
+    // ⭐ ELISION. fbc builds a "Type( ... )" temporary DIRECTLY into its destination when that
+    // destination is being INITIALISED - the initialiser of a DIM, or a BYVAL UDT parameter - so there
+    // is only ONE object and only one destructor. Measured, and it is exactly those two positions: an
+    // ASSIGNMENT from a literal, a BYREF argument, and a FUNCTION RESULT in either position all keep
+    // their temporary. Raised around the one expression whose value is about to initialise something,
+    // and read by RegisterResultTemp.
+    FElidingLiteralTemp: Integer;
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
@@ -578,7 +585,8 @@ type
     procedure EmitByrefWriteback(const ParamOwnerName: string; ArgListNode: TASTNode);  // BYREF: caller — copy slots back into variable args
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
     function TypeNeedsDestruction(const TypeName: string): Boolean;  // V5e: type (recursively) has a DESTRUCTOR
-    procedure RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string);  // V5f
+    procedure RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string;
+                                 IsLiteral: Boolean = False);                       // V5f
     procedure FlushResultTemps(Depth: Integer);                                        // V5f
     function BodyHasReturnStatement(Proc: TASTNode): Boolean;                          // V5f
     procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
@@ -11122,7 +11130,15 @@ begin
         InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
                                                      ArrayDeclNode.GetChild(0).Token));
         InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
-        ProcessAssignment(InitAssign);
+        // ⭐ A DIM's initialiser INITIALISES: a "Type( ... )" literal here is built straight into the
+        // variable by fbc, so it has no temporary of its own and no second destructor. The same
+        // expression in an ASSIGNMENT does keep one - measured, and the two spellings differ.
+        Inc(FElidingLiteralTemp);
+        try
+          ProcessAssignment(InitAssign);
+        finally
+          Dec(FElidingLiteralTemp);
+        end;
         InitAssign.Free;
       end;
       Continue;
@@ -28749,7 +28765,7 @@ begin
   // copies out of it, so nothing else owns it. fbc's own suite asserts this and the result temporary
   // together: functions/return-non-trivial builds "Type( (123) )" inside a function whose result is a
   // UDT and requires TWO destructor runs - one for this temporary, one for the result.
-  RegisterResultTemp(Handle, UpperCase(TypeName));
+  RegisterResultTemp(Handle, UpperCase(TypeName), True);
   Result := True;
 end;
 
@@ -29542,7 +29558,8 @@ begin
   Result := Rec(TypeName, 0);
 end;
 
-procedure TSSAGenerator.RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string);
+procedure TSSAGenerator.RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string;
+  IsLiteral: Boolean);
 // V5f: remember the record a UDT-returning call left in HandleVal, so the end of this STATEMENT
 // destroys it. It is a genuine temporary - every consumer copies out of it (EmitRecordCopy) - and
 // nothing owned it: fbc destroys it and we did not, so we ran one destructor fewer per call.
@@ -29555,6 +29572,10 @@ procedure TSSAGenerator.RegisterResultTemp(const HandleVal: TSSAValue; const Typ
 begin
   if HandleVal.Kind <> svkRegister then Exit;
   if (TypeName = '') or not TypeNeedsDestruction(TypeName) then Exit;
+  // ⭐ ...unless this is a "Type( ... )" literal standing where fbc builds it straight into its
+  // destination. See FElidingLiteralTemp. A FUNCTION RESULT temporary is never elided, in any
+  // position - measured: "byval_p( mk() )" runs THREE destructors in fbc, not two.
+  if IsLiteral and (FElidingLiteralTemp > 0) then Exit;
   FResultTemps.AddObject(UpperCase(TypeName), TObject(PtrInt(HandleVal.RegIndex)));
 end;
 
@@ -37279,6 +37300,22 @@ begin
       // The parameter wants a STRING, so a UDT argument carrying "Operator T.Cast() As String" converts
       // through it. Without this the record handle was staged into the string slot and the callee saw "0".
       ProcessStringExpression(ArgExpr, ArgVal)
+    // ⭐ A BYVAL UDT PARAMETER IS INITIALISED TOO: fbc builds a "Type( ... )" argument straight into
+    // the parameter's own copy, so "byval_p( Type(1) )" runs ONE destructor, not two. A BYREF parameter
+    // does not - the temporary stays a temporary - and neither does a function result in either
+    // position. All three measured.
+    else if (ParamList.GetChild(i).Attributes.Values['BYVAL'] = '1') and
+            (ParamList.GetChild(i).ChildCount >= 1) and
+            (ParamList.GetChild(i).GetChild(0).NodeType = antIdentifier) and
+            (FindUDT(UpperCase(VarToStr(ParamList.GetChild(i).GetChild(0).Value))) >= 0) then
+    begin
+      Inc(FElidingLiteralTemp);
+      try
+        ProcessExpression(ArgExpr, ArgVal);
+      finally
+        Dec(FElidingLiteralTemp);
+      end;
+    end
     else
       ProcessExpression(ArgExpr, ArgVal);
     // Materialize into the parameter's bank register now, so the value survives a nested call in a later
