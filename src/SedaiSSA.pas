@@ -4571,9 +4571,7 @@ begin
             TempStr := UpperCase(VarToStr(ArgNode.Value));
           if (TempStr <> '') and (FindUDT(TempStr) >= 0) then
           begin
-            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
             Exit;
           end;
 
@@ -4587,9 +4585,7 @@ begin
             TempStr := UpperCase(VarToStr(ArgNode.Value));
             if (not IsDeclaredVariable(TempStr)) and IsTypeNameForLen(TempStr) then
             begin
-              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
-                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
               Exit;
             end;
             // LEN of a declared NUMERIC/pointer variable is the SIZE of its declared type
@@ -6740,9 +6736,7 @@ begin
           TempStr := DeclaredTypeNameOf(Node.GetChild(1).GetChild(0));
           if TempStr <> '' then
           begin
-            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
             Exit;
           end;
         end;
@@ -6788,39 +6782,36 @@ begin
           // the value's length; the two forms are distinguished in TryUDTFieldSizeConst.
           if TryUDTFieldSizeConst(Node.GetChild(1).GetChild(0), True, FieldSzConst) then
           begin
-            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(FieldSzConst);             // a CONSTANT, not a loaded register
             Exit;
           end;
           if Node.GetChild(1).GetChild(0).NodeType <> antIdentifier then
             Exit;    // a member access we cannot size: fall out rather than answer nonsense
           ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
-          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (see FConstStrBytes).
+          // ⛔⛔ SIZEOF ANSWERS A CONSTANT, AND IT HAS TO *BE* ONE. Every branch below already computes
+          // a number at compile time; loading it into a REGISTER made the result an svkRegister, so
+          // every caller that asks "is this a compile-time integer?" answered NO. The one that showed
+          // it: an array bound. "Dim a(0 To LIMIT \ SizeOf(T))" was not seen as constant at all - the
+          // array was sized at RUN TIME where fbc sizes it statically, and every rule keyed on constant
+          // bounds stepped over it, the "Array too big" cap included ("LIMIT \ 32" folded; the same
+          // expression with SizeOf did not).
           if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
-          begin
-            EmitInstruction(ssaLoadConstInt, Result,
-                            MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Exit;
-          end;
-          if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
+            // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (FConstStrBytes).
+            Result := MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8))
+          else if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
              ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(8)
           // SIZEOF of a VARIABLE is the size of its declared type, not of the handle/slot holding it:
           // a UDT instance answers its type's C size (fbc: SizeOf(q1) = SizeOf(Q)), a declared numeric
           // or pointer scalar its declared width. A type NAME still wins over a same-named variable.
           else if (FindUDT(ArrName2) < 0) and (VarRecordTypeName(ArrName2) <> '') then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(VarRecordTypeName(ArrName2))),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(TypeSizeBytes(VarRecordTypeName(ArrName2)))
           else if (FindUDT(ArrName2) < 0) and (DeclaredScalarLenBytes(ArrName2) >= 0) then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2))
           else if (FindUDT(ArrName2) < 0) and (FixedLenVarSizeBytes(ArrName2) >= 0) then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FixedLenVarSizeBytes(ArrName2)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(FixedLenVarSizeBytes(ArrName2))
           else
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(TypeSizeBytes(ArrName2));
           Exit;
         end;
 
