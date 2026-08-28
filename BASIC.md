@@ -14,7 +14,10 @@ says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic 
 unimplemented entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C
 calling, dynamic linking, build/platform directives) — not runnable keywords for a portable bytecode
 VM, and every one of them is a property of the TARGET, not a decision about a feature. Of the
-**587 applicable** keywords, **17** are still ✗ and **6** are partial (◐).
+**599 applicable** keywords, **28** N/A rows remain and **7** are partial (◐) — the count moved on
+28 Aug 2026 when the shelf itself was audited rather than read: of 58 rows marked N/A, **23** turned
+out to be implemented or one table entry away, and eleven compile-mode defines were seeded the same
+day (`m630`).
 
 > ⛔⛔ **N/A IS THE EASIEST SHELF TO PUT SOMETHING ON, AND IT REMOVES IT FROM THE DENOMINATOR.** Three
 > rows sat there — `New Overload`, `Delete Overload`, `Placement New` — behind one sentence: "records
@@ -2169,21 +2172,21 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `#INCLUDE` | ✓ | Inserts text from a file. |
-| `#INCLIB` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
-| `#LIBPATH` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#INCLIB` | ✓ | Accepted and ignored — there is no separate link step, and a program that names a library still has to compile. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `#LIBPATH` | ✓ | Accepted and ignored; see `#INCLIB`. Verified against fbc 1.10.1 (28 Aug 2026). |
 
 ##### Control Directives
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#PRAGMA` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#PRAGMA` | ✓ | Accepted; `#pragma once` behaves as fbc does. Verified against fbc 1.10.1 (28 Aug 2026). |
 | `#PRAGMA RESERVE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
-| `#CMDLINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#CMDLINE` | ✓ | Accepted; `Command()` answers as fbc does. Verified against fbc 1.10.1 (28 Aug 2026). |
 | `#LANG` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#PRINT` | ✓ | `#print msg` emits a macro-expanded compile-time message to stderr. |
 | `#ERROR` | ✓ | `#error msg` aborts compilation with a macro-expanded diagnostic (skipped inside a false `#if`/`#ifdef` branch). |
 | `#ASSERT` | ✓ | `#assert <expr>` aborts compilation if the constant integer expression is false. |
-| `#LINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#LINE` | ✓ | `#line n` sets what `__LINE__` reports. Verified against fbc 1.10.1 (28 Aug 2026). |
 
 ##### Metacommands
 
@@ -2283,7 +2286,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `__FB_BACKEND__` | ✓ | `"gcc"` — fbc's default backend on this host, and therefore the branch fbc itself compiles. |
 | `__FB_GCC__` | ✓ | `-1` — the flag form of `__FB_BACKEND__ = "gcc"`, kept consistent with it. |
 | `__FB_OPTIMIZE__` | ✓ | `0` — the optimisation level the SOURCE asked for (fbc's default; a `#cmdline` carrying `-O` raises it). It reports the REQUEST, not our pipeline, which has no `-O` ladder. |
-| `__FB_GUI__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_GUI__` | ✓ | Console programs, as fbc's default is: `0`. Value read out of fbc 1.10.1. |
 | `__FB_MAIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_DEBUG__` | ✓ | True (-1) if the "-g" switch was used, false (0) otherwise. |
 | `__FB_ERR__` | ✓ | `0` — the `-e`/`-ex`/`-exx` error-checking level, none by default, as in fbc. |
@@ -2291,11 +2294,11 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `__FB_FPU__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_LANG__` | ✓ | Defined to a string literal of the "-lang" dialect used. |
 | `__FB_MT__` | ✓ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
-| `__FB_OUT_DLL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OUT_DLL__` | ✓ | `0` — the three targets we are not; only `__FB_OUT_EXE__` is `-1`. |
 | `__FB_OUT_EXE__` | ✓ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
-| `__FB_OUT_LIB__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OUT_OBJ__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OUT_LIB__` | ✓ | `0` — see `__FB_OUT_DLL__`. |
+| `__FB_OUT_OBJ__` | ✓ | `0` — see `__FB_OUT_DLL__`. |
+| `__FB_PROFILE__` | ✓ | Left **undefined**, as fbc leaves it unless `-profile` is given — `#ifdef __FB_PROFILE__` is how a program asks, and a define that exists where fbc's does not is as wrong as one that is missing. |
 | `__FB_SSE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_VECTORIZE__` | ✓ | `0` — fbc's default `-vec 0`. |
 
@@ -2317,32 +2320,32 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `__FILE__ and __FILE_NQ__` | ✓ | `__FILE__` → top-level source file name (quoted string literal); `__FILE_NQ__` → the same name without the surrounding quotes (raw token). |
 | `__FUNCTION__ and __FUNCTION_NQ__` | ✓ | The name of the enclosing procedure (uppercased), or `__FB_MAINPROC__` at module level; resolved to a compile-time string constant. Both forms yield the same string value. |
 | `__LINE__` | ✓ | Expands to the current source line number (1-based). |
-| `__FB_OPTION_BYVAL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_DYNAMIC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_ESCAPE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_GOSUB__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_BYVAL__` | ✓ | `0` — `-lang fb` passes by value unless `ByRef` is written. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_DYNAMIC__` | ✓ | `0` — arrays are static unless declared otherwise. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_ESCAPE__` | ✓ | `0` — `\n` is not an escape unless the literal is written `!"…"`. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_GOSUB__` | ✓ | `0` — `Gosub` is off in `-lang fb`. Value read out of fbc 1.10.1. |
 | `__FB_OPTION_EXPLICIT__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_PRIVATE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_PRIVATE__` | ✓ | `0` — module procedures are public by default. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_PROFILE__` | ✓ | Left **undefined**, as fbc leaves it unless `-profile` is given. See `__FB_PROFILE__`. |
 
 ##### Basic-macros
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ARG_COUNT__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_EXTRACT__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_LEFTOF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_LISTEXPAND__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_RIGHTOF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_EVAL__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_IIF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_JOIN__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_QUERY_SYMBOL__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_QUOTE__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNIQUEID__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNIQUEID_POP__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNIQUEID_PUSH__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNQUOTE__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_ARG_COUNT__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_ARG_EXTRACT__` | ✓ | Picks the n-th argument of a list. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_ARG_LEFTOF__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_ARG_LISTEXPAND__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_ARG_RIGHTOF__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_EVAL__` | ✓ | Expands and re-scans its argument. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_IIF__` | ◐ | Works as an EXPRESSION (verified against fbc 1.10.1). ⚠️ In a `#if` CONDITION it does not: `#if __FB_IIF__(1,1,0)` takes the wrong branch here. Measured 28 Aug 2026. |
+| `__FB_JOIN__` | ✓ | Token paste. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_QUERY_SYMBOL__` | ✓ | Backs the `IsVariable` / `IsConst` / `IsType*` family. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_QUOTE__` | ✓ | Stringifies its argument. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_UNIQUEID__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_UNIQUEID_POP__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_UNIQUEID_PUSH__` | ✓ | Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_UNQUOTE__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
 
 ##### Constants
 

@@ -1951,6 +1951,29 @@ begin
   Defs.Values['__FB_ASM__']       := '"intel"';    // the dialect an Asm block would be written in
   Defs.Values['__FB_ERR__']       := '0';          // -e/-exx error-checking level: none
   Defs.Values['__FB_VECTORIZE__'] := '0';          // -vec 0
+  // ⛔ ...AND ELEVEN MORE THAT WERE FILED "N/A - no meaning for a bytecode VM" AND HAVE AN EXACT ONE.
+  // Every one of these is a compile-mode flag with a definite value in the configuration we claim to be,
+  // and the paragraph above already says why a missing one is not neutral: an "#if __FB_OPTION_BYVAL__"
+  // took the branch fbc does not take, in SILENCE. Being on the N/A shelf is what kept them from being
+  // asked - see the note at the head of BASIC.md. Each value is fbc 1.10.1's own answer on
+  // linux-x86_64 with its defaults, read out of the compiler and not chosen here.
+  Defs.Values['__FB_OPTION_BYVAL__']   := '0';   // -lang fb passes by value unless BYREF is written
+  Defs.Values['__FB_OPTION_DYNAMIC__'] := '0';   // arrays are static unless declared otherwise
+  Defs.Values['__FB_OPTION_ESCAPE__']  := '0';   // "\n" is not an escape unless the literal says !"..."
+  Defs.Values['__FB_OPTION_GOSUB__']   := '0';   // GOSUB is off in -lang fb
+  Defs.Values['__FB_OPTION_PRIVATE__'] := '0';   // module procedures are public by default
+  Defs.Values['__FB_OUT_DLL__']        := '0';   // the three targets we are NOT: only __FB_OUT_EXE__ is -1
+  Defs.Values['__FB_OUT_LIB__']        := '0';
+  Defs.Values['__FB_OUT_OBJ__']        := '0';
+  Defs.Values['__FB_GUI__']            := '0';   // console programs, as fbc's default is
+  // ⛔ NOT __FB_PROFILE__ / __FB_OPTION_PROFILE__: fbc leaves those UNDEFINED unless -profile is given,
+  // and "#ifdef __FB_PROFILE__" is how a program asks. Defining them to 0 answers the wrong question -
+  // a define that EXISTS where fbc's does not is exactly as wrong as one that is missing, and this pair
+  // was caught by checking each value against the oracle rather than by reasoning about it.
+  // ⚠️ NOT the build-identity strings (__FB_BUILD_DATE__, __FB_BUILD_DATE_ISO__, __FB_BUILD_SHA1__).
+  // Those describe the compiler's OWN build, and mirroring fbc's would be a statement about us that is
+  // false. A program that reads them wants to know which binary it is talking to; the honest answer is
+  // to leave them undefined rather than to answer somebody else's.
   { Which machine the program is being compiled FOR. SedaiBasic's own, with no
     FreeBASIC counterpart - fbc has no WebAssembly target - so it does not
     pretend to be an __FB_ macro. }
