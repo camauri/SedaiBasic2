@@ -153,12 +153,15 @@ type
     // 0 valid programs refused.
     FExternShapes: TStringList;      // UPPER name -> shape, encoded by EncodeDeclShape
     FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
-    function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer): string;
+    function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer;
+                             const Flags: string): string;
     function ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
     function ShapeConflict(const Prev, Cur: string; out Why: string): Boolean;
     procedure NoteExternShape(const Name, Shape: string);
     procedure CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
     procedure ScanModuleLevelExtern;
+    procedure RejectEmptyAliasNames;
+    function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
 
@@ -955,6 +958,7 @@ var
  LineNum: Integer;
 begin
  Result := TASTNode.Create(antProgram);
+ RejectEmptyAliasNames;
 
  while not Context.IsAtEnd do
  begin
@@ -3912,6 +3916,7 @@ begin
     Exit;
   end;
   NsName := ParseDottedName;                          // dotted nested specifier allowed
+  SkipAliasClause;                                    // "Namespace ns Alias \"n\"" - a LINKER name
   Result := TASTNode.CreateWithValue(antNamespace, NsName, Token);
 
   while not Context.Check(ttEndOfFile) do
@@ -9873,7 +9878,7 @@ end;
 }
 
 function TPackratParser.EncodeDeclShape(Dims: TASTNode; const TypeName: string;
-  InitCount: Integer): string;
+  InitCount: Integer; const Flags: string): string;
 // Dims = the antDimensions node, or nil when the name carried no parentheses at all (a SCALAR).
 // InitCount = the element count of an aggregate initializer, used to resolve a rank-1 "lb To ..."
 // ellipsis into a real upper bound - the only shape whose count is unambiguous (a nested
@@ -9885,16 +9890,17 @@ var
   Bounds, LbS, UbS: string;
   HasLb, HasUb: Boolean;
 begin
-  if Dims = nil then Exit('S|' + TypeName + '|0|');
+  if Dims = nil then Exit('S|' + TypeName + '|0||' + Flags);
   Rank := Dims.ChildCount;
-  if Rank = 0 then Exit('D|' + TypeName + '|0|');          // "a()" - dynamic, rank not stated
+  if Rank = 0 then Exit('D|' + TypeName + '|0||' + Flags);  // "a()" - dynamic, rank not stated
   AnyCount := 0;
   for i := 0 to Rank - 1 do
   begin
     D := Dims.GetChild(i);
     if (D.NodeType = antIdentifier) and (UpperCase(VarToStr(D.Value)) = 'ANY') then Inc(AnyCount);
   end;
-  if AnyCount > 0 then Exit('D|' + TypeName + '|' + IntToStr(Rank) + '|');   // "a(Any[,Any])"
+  if AnyCount > 0 then
+    Exit('D|' + TypeName + '|' + IntToStr(Rank) + '||' + Flags);   // "a(Any[,Any])"
   Bounds := '';
   for i := 0 to Rank - 1 do
   begin
@@ -9929,7 +9935,7 @@ begin
     if Bounds <> '' then Bounds := Bounds + ';';
     Bounds := Bounds + LbS + ':' + UbS;
   end;
-  Result := 'F|' + TypeName + '|' + IntToStr(Rank) + '|' + Bounds;
+  Result := 'F|' + TypeName + '|' + IntToStr(Rank) + '|' + Bounds + '|' + Flags;
 end;
 
 function TPackratParser.ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
@@ -9938,7 +9944,7 @@ function TPackratParser.ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean):
 var
   i, InitCount: Integer;
   Ch, Dims: TASTNode;
-  TypeName: string;
+  TypeName, Flags, Cap: string;
 begin
   Dims := nil; TypeName := ''; InitCount := 0;
   for i := 1 to ArrayDecl.ChildCount - 1 do
@@ -9952,7 +9958,15 @@ begin
       ;
     end;
   end;
-  Result := EncodeDeclShape(Dims, TypeName, InitCount);
+  // ⭐ BYREF-ness and a fixed-length CAPACITY are part of the declaration's identity too: fbc answers
+  // "error 20: Type mismatch" for "Extern ByRef ri As Integer : Dim Shared ri As Integer" and for
+  // "Extern s As String * 5 : Dim Shared s As String * 2". A capacity of -1 means "present but not a
+  // compile-time constant here", which is a capacity nobody can disagree with.
+  Flags := '';
+  if ArrayDecl.Attributes.Values['BYREF'] = '1' then Flags := Flags + '&';
+  Cap := ArrayDecl.Attributes.Values['FIXEDLEN'];
+  if (Cap <> '') and (Cap <> '-1') then Flags := Flags + '*' + Cap;
+  Result := EncodeDeclShape(Dims, TypeName, InitCount, Flags);
   // ⭐ REDIM says DYNAMIC whatever bounds it states - that is the whole point of the statement, and
   // it is why "Extern a(0 To 1) : ReDim a(0 To 1)" is an error in fbc although the bounds agree.
   if IsRedim and (Length(Result) > 0) and (Result[1] = 'F') then
@@ -9965,21 +9979,32 @@ function TPackratParser.ShapeConflict(const Prev, Cur: string; out Why: string):
 // specification, and the rule was adjusted offline until it answered all of them.
 var
   PK, CK: Char;
-  PT, CT, PB, CB: string;
+  PT, CT, PB, CB, PF, CF: string;
   PR, CR, i: Integer;
   PParts, CParts: TStringList;
 
-  procedure SplitShape(const S: string; out K: Char; out T: string; out R: Integer; out B: string);
+  procedure SplitShape(const S: string; out K: Char; out T: string; out R: Integer;
+                       out B, F: string);
   var
-    p1, p2, p3: Integer;
+    p1, p2, p3, p4: Integer;
   begin
     K := S[1];
     p1 := Pos('|', S);
     p2 := Pos('|', S, p1 + 1);
     p3 := Pos('|', S, p2 + 1);
+    p4 := Pos('|', S, p3 + 1);
     T := Copy(S, p1 + 1, p2 - p1 - 1);
     R := StrToIntDef(Copy(S, p2 + 1, p3 - p2 - 1), 0);
-    B := Copy(S, p3 + 1, MaxInt);
+    if p4 > 0 then
+    begin
+      B := Copy(S, p3 + 1, p4 - p3 - 1);
+      F := Copy(S, p4 + 1, MaxInt);
+    end
+    else
+    begin
+      B := Copy(S, p3 + 1, MaxInt);
+      F := '';
+    end;
   end;
 
   function BoundsDisagree(const A, B: string; out W: string): Boolean;
@@ -10011,11 +10036,25 @@ var
 begin
   Result := False; Why := '';
   if (Prev = '') or (Cur = '') then Exit;
-  SplitShape(Prev, PK, PT, PR, PB);
-  SplitShape(Cur,  CK, CT, CR, CB);
+  SplitShape(Prev, PK, PT, PR, PB, PF);
+  SplitShape(Cur,  CK, CT, CR, CB, CF);
   if (PK = 'S') <> (CK = 'S') then
   begin
     Why := 'one declaration is a scalar and the other an array';
+    Exit(True);
+  end;
+  // BYREF-ness: an alias for someone else's storage is not the same declaration as storage of its own.
+  if (Pos('&', PF) > 0) <> (Pos('&', CF) > 0) then
+  begin
+    Why := 'one declaration is BYREF and the other is not';
+    Exit(True);
+  end;
+  // A fixed-length capacity, when BOTH state one: "String * 5" and "String * 2" are different types.
+  if (Pos('*', PF) > 0) and (Pos('*', CF) > 0) and
+     (Copy(PF, Pos('*', PF) + 1, MaxInt) <> Copy(CF, Pos('*', CF) + 1, MaxInt)) then
+  begin
+    Why := 'the fixed length changes from ' + Copy(PF, Pos('*', PF) + 1, MaxInt) +
+           ' to ' + Copy(CF, Pos('*', CF) + 1, MaxInt);
     Exit(True);
   end;
   if (PT <> '') and (CT <> '') and (PT <> CT) then
@@ -10113,30 +10152,82 @@ begin
   end;
 end;
 
+function TPackratParser.SkipAliasClause: Boolean;
+// ⭐ ALIAS "name" IS ACCEPTED IN FIVE STATEMENTS, and it was skipped in three. A linkage alias is a
+// name for the LINKER, which a bytecode VM has none of, so every one of the five is entitled to
+// throw it away - but NAMESPACE read the word as the start of a statement ("Undefined procedure:
+// ALIAS") and ENUM read it as the enum's own name, and then read the string as the first member
+// ("Expected enum member name"). Both refused a program fbc compiles, which is the direction that
+// must never happen. One funnel now, asked wherever the clause is legal.
+begin
+  Result := False;
+  if not Context.Check(ttIdentifier) then Exit;
+  if UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'ALIAS' then Exit;
+  if not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral)) then Exit;
+  Context.Advance;      // ALIAS
+  Context.Advance;      // "name"   (an EMPTY one is refused by RejectEmptyAliasNames, before parsing)
+  Result := True;
+end;
+
+procedure TPackratParser.RejectEmptyAliasNames;
+// ⭐ ALIAS "" IS AN ERROR WHEREVER IT IS WRITTEN. fbc answers "error 304: ALIAS name string is
+// empty" for a procedure, a variable, a NAMESPACE, a TYPE and an ENUM alike - five different
+// statements, one rule. The alias is a LINKER name and SedaiBasic does no external linking, so every
+// one of those five parsers is entitled to skip it; the consequence was that none of them could
+// refuse it, and the rule had no home.
+// ⛔ It is a rule about two adjacent TOKENS, so it is asked of the token stream once, before parsing,
+// instead of being written into five statement parsers - the shape this codebase has been bitten by
+// repeatedly is a rule one path has and its siblings do not. An empty alias name is never valid
+// anywhere, so a token-level answer cannot over-refuse: for the word to be followed directly by a
+// string literal with no operator between them, it has to BE the ALIAS clause.
+var
+  i: Integer;
+  T, N: TLexerToken;
+begin
+  if not HasValidContext then Exit;
+  if Context.TokenList = nil then Exit;
+  for i := 0 to Context.TokenList.Count - 2 do
+  begin
+    T := Context.TokenList.GetTokenDirect(i);
+    if (T = nil) or (UpperCase(VarToStr(T.Value)) <> 'ALIAS') then Continue;
+    N := Context.TokenList.GetTokenDirect(i + 1);
+    if (N <> nil) and (N.TokenType = ttStringLiteral) and (VarToStr(N.Value) = '') then
+      HandleError('ALIAS name string is empty', N);
+  end;
+end;
+
 procedure TPackratParser.ScanModuleLevelExtern;
-// Read a single-line "EXTERN name[(dims)] [As type] [= init]" for its SHAPE, then REWIND. The
-// caller's skip-to-end-of-line runs afterwards exactly as it did before, so this routine changes no
-// token consumption and builds no AST. Anything it does not recognise - ALIAS, BYREF, a leading AS,
-// a procedure pointer - leaves the name unregistered, which is precisely the behaviour that was
+// Read a single-line "EXTERN [ByRef] name[(dims)] [As type [* n]] [= init]" for its SHAPE, then
+// REWIND. The caller's skip-to-end-of-line runs afterwards exactly as it did before, so this routine
+// changes no token consumption and builds no AST. Anything it does not recognise - ALIAS, a leading
+// AS, a procedure pointer - leaves the name unregistered, which is precisely the behaviour that was
 // there before it existed.
 // ⛔ It reads tokens and puts them back, so it MUTES the error list while it looks: a diagnostic
 // left behind by a look-ahead is an error the program never made.
 var
   SavedIdx, Idx: Integer;
-  Nm, TypeName, Shape, Why: string;
-  Dims: TASTNode;
+  Nm, TypeName, Shape, Why, Flags: string;
+  Dims, CapExpr: TASTNode;
   BlameTok: TLexerToken;
+  CapVal: Int64;
   HasParens, HasInit, HasEllipsis, Understood: Boolean;
 begin
   SavedIdx := Context.CurrentIndex;
   Dims := nil;
-  Nm := ''; TypeName := ''; Understood := False;
+  Nm := ''; TypeName := ''; Flags := ''; Understood := False;
   HasInit := False; HasEllipsis := False;
   BlameTok := Context.CurrentToken;
   Context.MutedErrors := Context.MutedErrors + 1;
   try
     Context.Advance;                                      // EXTERN
-    if not Context.Check(ttIdentifier) then Exit;          // "Extern As Integer a", "Extern ByRef ..."
+    // "Extern ByRef ri As Integer" declares an ALIAS for someone else's storage, and that is part of
+    // the declaration: fbc answers "error 20: Type mismatch" when the DIM that follows is not ByRef.
+    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    begin
+      Flags := Flags + '&';
+      Context.Advance;
+    end;
+    if not Context.Check(ttIdentifier) then Exit;          // "Extern As Integer a" and friends
     Nm := UpperCase(VarToStr(Context.CurrentToken.Value));
     Context.Advance;
     HasParens := Context.Check(ttDelimParOpen);
@@ -10155,12 +10246,21 @@ begin
       if not Context.Check(ttIdentifier) then Exit;        // a qualifier or a procedure type: not ours
       TypeName := UpperCase(VarToStr(Context.CurrentToken.Value));
       Context.Advance;
+      // "As String * 5" - a fixed-length capacity, which is part of the type, not a decoration.
+      if Context.Check(ttOpMul) then
+      begin
+        Context.Advance;                                  // '*'
+        CapExpr := ParseExpression;
+        if CapExpr = nil then Exit;
+        if TryConstIntExpr(CapExpr, CapVal) then Flags := Flags + '*' + IntToStr(CapVal);
+        CapExpr.Free;
+      end;
     end;
     HasInit := Context.Check(ttOpEq);
-    // Only a line this routine has read to its END is a line whose shape it knows. A PTR suffix, a
-    // "* n" capacity, an ALIAS - anything still unread here - means "do not register this name".
+    // Only a line this routine has read to its END is a line whose shape it knows. A PTR suffix, an
+    // ALIAS - anything still unread here - means "do not register this name".
     if not (HasInit or Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) then Exit;
-    Shape := EncodeDeclShape(Dims, TypeName, 0);
+    Shape := EncodeDeclShape(Dims, TypeName, 0, Flags);
     Understood := True;
   finally
     if Assigned(Dims) then Dims.Free;
@@ -11592,10 +11692,12 @@ begin
   // declared width. The NAME is not: FreeBASIC lets a member be reached through it ("MyEnum.option1"), so
   // keep it on the node. It may be a reserved word (a type/colour keyword), so don't require ttIdentifier;
   // exclude AS so a nameless "Enum As Integer" is not mistaken for a name.
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) then
+  if not (Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) or
+          SkipAliasClause) then                       // a nameless "Enum Alias \"n\""
   begin
     Result.Value := UpperCase(VarToStr(Context.CurrentToken.Value));   // enum type name
     Context.Advance;
+    SkipAliasClause;                                  // "Enum E Alias \"n\"" - a LINKER name
     // FreeBASIC "Enum <name> Explicit": the members are reachable ONLY through the enum's name. Left
     // unconsumed, the word was read as the FIRST MEMBER and the real members stayed plain globals - so
     // an explicit enum's B shadowed the B of an ordinary one declared beside it.

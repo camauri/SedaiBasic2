@@ -1822,7 +1822,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
 | `UNSIGNED` | ✓ | `AS UNSIGNED <basetype>` modifier → maps to the unsigned variant (INTEGER→UINTEGER, BYTE→UBYTE, SHORT→USHORT, LONG→ULONG, LONGINT→ULONGINT). Bare `UNSIGNED` == UNSIGNED INTEGER. |
 | `INTEGER<n>` / `UINTEGER<n>` | ✓ | Explicit-width integer type names: `<8>` → BYTE/UBYTE, `<16>` → SHORT/USHORT, `<32>` → LONG/ULONG, `<64>` → LONGINT/ULONGINT. Accepted in a declaration (`Dim As Integer<8> b`) and in expression position (`SizeOf(Integer<8>)`, `Cast(Integer<8>, e)`). |
-| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. |
+| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. Accepted in all five places `fbc` accepts one (procedure, variable, `NAMESPACE`, `TYPE`, `ENUM`); an EMPTY alias name (`ALIAS ""`) is refused everywhere, as `fbc` does. |
 
 ##### String types
 
@@ -2074,7 +2074,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `Public` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
 | `Private` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
-| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name and ignored (no external linking). |
+| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name, a variable, a `NAMESPACE`, a `TYPE` or an `ENUM`, and ignored (no external linking). An empty name is refused. |
 | `Export` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 | `Lib` | ✓ | `LIB "name"` accepted after a procedure name and ignored (no external linking). |
 
