@@ -2474,8 +2474,17 @@ var
           begin
             ParentEmit := Emitting;
             // ...and a FUNCTION-LIKE macro is defined too (FnDefs); see the note on defined() above.
+            // ⛔ ...AND THE RESERVED SET, which "#if defined(X)" already consults. "#ifdef X" and
+            // "defined(X)" are ONE question in fbc, and its pp/defined-udt asks both of the same names
+            // expecting the same answer; here they were two, and __FUNCTION__ - defined but never
+            // substitutable - answered yes to one and no to the other.
+            // ⚠️ Only the reserved set is added. SourceDeclaresSymbol (a Const, a Dim, a Sub) is the
+            // OTHER half of that same asymmetry and is NOT closed here: every #ifdef of such a name
+            // would flip at once, which is a measurement of its own. Written up in DIVERGENZE.
             Cond := ParentEmit and ((Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
-                                    (FnDefs.IndexOfName(UpperCase(Trim(DRest))) >= 0));
+                                    (FnDefs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
+                                    ((GPPReserved <> nil) and
+                                     (GPPReserved.IndexOf(UpperCase(Trim(DRest))) >= 0)));
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -2483,7 +2492,9 @@ var
           begin
             ParentEmit := Emitting;
             Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
-                                   (FnDefs.IndexOfName(UpperCase(Trim(DRest))) < 0);
+                                   (FnDefs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
+                                   ((GPPReserved = nil) or
+                                    (GPPReserved.IndexOf(UpperCase(Trim(DRest))) < 0));
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -2967,6 +2978,12 @@ begin
   if GPPReserved = nil then GPPReserved := TStringList.Create;
   GPPReserved.Clear;            // per PROGRAM: a reservation must not survive into the next one
   GPPReserved.CaseSensitive := False;
+  // ⭐ __FUNCTION__ / __FUNCTION_NQ__ are DEFINED but must NOT be substituted here: their value is the
+  // name of the ENCLOSING PROCEDURE, which only the parser knows, and it already substitutes them.
+  // They belong in the reserved set for exactly that reason - "#ifndef __FUNCTION__ : #error" is in
+  // fbc's own pp/intrinsic, a program it accepts, and we refused it.
+  GPPReserved.Add('__FUNCTION__');
+  GPPReserved.Add('__FUNCTION_NQ__');
     Expand(Src, BaseDir);
     Result := Output.Text;
   finally
