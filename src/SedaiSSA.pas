@@ -675,6 +675,7 @@ type
     function TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;  // ...asked before FProcDecls exists
     function TypeHasMemberProc(const TypeName: string): Boolean;               // ...anything that takes a THIS
     procedure CheckPointerConstAssign(Decl: TASTNode);   // FB: a pointer assignment may not DROP a const
+    procedure CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);  // FB: too many values in a (...) init
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
@@ -28231,6 +28232,7 @@ begin
   //  - a BIT FIELD is part of a shared unit, so a plain store writes the WHOLE unit and the members of
   //    a run overwrote each other: "(1, 2, 3)" answered 3, 0, 0.
   // ⇒ Walk the FIELDS and the VALUES with two cursors, and let the field decide how it is written.
+  CheckAggregateInitArity(UDTIdx, ArgsNode);
   FieldIdx := 0;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
@@ -28420,6 +28422,7 @@ begin
       EmitUDTAggregateInit(HandleVal, AggUDT, ArgsNode);
       Exit;
     end;
+    if AggUDT >= 0 then CheckAggregateInitArity(AggUDT, ArgsNode);   // the same rule, the second copy
     if AggUDT >= 0 then
       for i := 0 to ArgCount - 1 do
       begin
@@ -33042,6 +33045,54 @@ begin
   Result := '';
   if TypeName = '' then Exit;
   Result := ResolveMethodLabel(TypeName, OpName);
+end;
+
+procedure TSSAGenerator.CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);
+// FreeBASIC counts the values of an aggregate initialiser against the SLOTS the type actually has,
+// and answers "error 67: Too many expressions" when there are more. A UNION contributes exactly ONE
+// slot however many members it holds - they share the storage, so only the first can be initialised -
+// which is what makes "Dim As U x = (1, 2)" wrong on a union of two integers and right on a struct of
+// two. Twenty-nine tests of fbc's dim/union-init-bad family are that one rule.
+//
+// ⭐ The slot walk is the SAME one EmitUDTAggregateInit uses to place the values: a union group is
+// entered once and skipped to its end. Counting them any other way would let the check and the
+// placement disagree, which is how a diagnostic ends up refusing what the emitter would have got right.
+// ⚠️ Only TOO MANY. Too few is legal everywhere - the remaining fields keep their defaults - and
+// refusing it would reject "Dim As V3 v = (1)", which fbc accepts.
+var
+  i, Slots: Integer;
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (ArgsNode = nil) then Exit;
+  // ⛔ A WHOLE-TYPE UNION IS NOT A UNION GROUP. "Union U : a : b : End Union" overlaps its fields
+  // through IsUnion and leaves UnionGroup at 0 - the group number exists for a "Union ... End Union"
+  // block written INSIDE a Type, and predates the other. Counting only the groups answered 2 slots for
+  // a union of two integers and let "Dim As U x = (1, 2)" through: 5 of the family's 29 instead of all
+  // of them. The two spellings of the same fact have to be asked together.
+  if FUDTs[UDTIdx].IsUnion then
+  begin
+    if ArgsNode.ChildCount > 1 then
+      raise Exception.CreateFmt(
+        'Too many expressions: the initialiser gives %d values to the UNION "%s", which takes ONE - ' +
+        'its members share the storage, so only the first can be initialised.',
+        [ArgsNode.ChildCount, FUDTs[UDTIdx].Name]);
+    Exit;
+  end;
+  Slots := 0;
+  i := 0;
+  while i <= High(FUDTs[UDTIdx].Fields) do
+  begin
+    Inc(Slots);
+    Inc(i);
+    while (i <= High(FUDTs[UDTIdx].Fields)) and
+          (FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) and
+          (FUDTs[UDTIdx].Fields[i].UnionGroup = FUDTs[UDTIdx].Fields[i - 1].UnionGroup) do
+      Inc(i);                                  // the rest of a union block shares the slot just counted
+  end;
+  if (Slots > 0) and (ArgsNode.ChildCount > Slots) then
+    raise Exception.CreateFmt(
+      'Too many expressions: the initialiser gives %d values to "%s", which has %d slot(s) to fill. ' +
+      'A UNION counts as ONE however many members it holds - they share the storage.',
+      [ArgsNode.ChildCount, FUDTs[UDTIdx].Name, Slots]);
 end;
 
 procedure TSSAGenerator.CheckPointerConstAssign(Decl: TASTNode);
