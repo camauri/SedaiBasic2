@@ -911,6 +911,17 @@ begin
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
+  // ⛔⛔ ...AND THEIR FOLDED VALUES, which was the one registry of fifteen this reset had forgotten.
+  // TryConstIntExpr reads FConstIntValues by BARE NAME and with no other gate, so a "Const MAXLEN = 8"
+  // in one program went on supplying a capacity to the NEXT one: "f As ZString * MAXLEN" in a program
+  // that never declares MAXLEN was folded to 8 instead of declining, and SizeOf answered 8 where it
+  // must answer the string descriptor's 24. Reproduced by parsing two sources through one parser.
+  // ⭐ The comment on the read site claims "a name used before its declaration still declines, exactly
+  // as it does in fbc" - true WITHIN one program, and the registry outlived the program. Same shape as
+  // m656: an invariant that holds only in the case the author had in hand.
+  // The reuse is real and shipped: TSedaiNewConsole (the sbv console) holds ONE TProgramMemory, and
+  // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
+  FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   FTypeNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FStaticMemberProcs.Clear;
@@ -923,6 +934,10 @@ begin
   FTopLevelStmt := False;
   FFlatBlockDepth := 0;
   FInNamespaceBody := False;
+  // ...and the DO nesting depth, for the same reason: it is Inc'd around ParseLoopBody and Dec'd after,
+  // so a program abandoned inside a DO leaves it standing, and a CLASSIC "LOOP" in the NEXT program is
+  // then read as the terminator of a loop that no longer exists.
+  FDoParseDepth := 0;
 
   try
     // Initialize context
@@ -990,6 +1005,17 @@ begin
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
+  // ⛔⛔ ...AND THEIR FOLDED VALUES, which was the one registry of fifteen this reset had forgotten.
+  // TryConstIntExpr reads FConstIntValues by BARE NAME and with no other gate, so a "Const MAXLEN = 8"
+  // in one program went on supplying a capacity to the NEXT one: "f As ZString * MAXLEN" in a program
+  // that never declares MAXLEN was folded to 8 instead of declining, and SizeOf answered 8 where it
+  // must answer the string descriptor's 24. Reproduced by parsing two sources through one parser.
+  // ⭐ The comment on the read site claims "a name used before its declaration still declines, exactly
+  // as it does in fbc" - true WITHIN one program, and the registry outlived the program. Same shape as
+  // m656: an invariant that holds only in the case the author had in hand.
+  // The reuse is real and shipped: TSedaiNewConsole (the sbv console) holds ONE TProgramMemory, and
+  // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
+  FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   FTypeNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FStaticMemberProcs.Clear;
@@ -1002,6 +1028,10 @@ begin
   FTopLevelStmt := False;
   FFlatBlockDepth := 0;
   FInNamespaceBody := False;
+  // ...and the DO nesting depth, for the same reason: it is Inc'd around ParseLoopBody and Dec'd after,
+  // so a program abandoned inside a DO leaves it standing, and a CLASSIC "LOOP" in the NEXT program is
+  // then read as the terminator of a loop that no longer exists.
+  FDoParseDepth := 0;
 
   try
     // Initialize context

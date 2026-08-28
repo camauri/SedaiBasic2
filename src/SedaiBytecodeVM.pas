@@ -1446,6 +1446,7 @@ begin
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
   FCtx.RecordCount := 0;
+  FCtx.RecordHigh := 0;   // the slots are GONE, so nothing below the mark is reused any more
   FCtx.CursorCol := 0;
   FCtx.CursorRow := 0;
   // Initialize time tracking
@@ -5887,6 +5888,7 @@ begin
   BindArrayMap(WCtx);
   SetLength(WCtx.Records, 0);
   WCtx.RecordCount := 0;
+  WCtx.RecordHigh := 0;   // the slots are GONE, so nothing below the mark is reused any more
   WCtx.CursorCol := 0;
   WCtx.CursorRow := 0;
   WCtx.TrapLine := 0;
@@ -7702,6 +7704,7 @@ begin
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
   FCtx.RecordCount := 0;
+  FCtx.RecordHigh := 0;   // the slots are GONE, so nothing below the mark is reused any more
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
