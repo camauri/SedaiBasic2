@@ -1966,6 +1966,13 @@ begin
   Defs.Values['__FB_OUT_LIB__']        := '0';
   Defs.Values['__FB_OUT_OBJ__']        := '0';
   Defs.Values['__FB_GUI__']            := '0';   // console programs, as fbc's default is
+  // fbc defines this to 0 in a normal build (it is not gated on -g, which only RAISES it), so
+  // "#ifdef __FB_DEBUG__" is TRUE there and was false here. Found by na_audit.sh --all, which is what
+  // that tool is for. Measured, not assumed.
+  Defs.Values['__FB_DEBUG__']          := '0';
+  Defs.Values['__FB_FPU__']            := '"x87"';  // fbc 1.10.1 linux-x86_64 answers this; same
+                                                    // policy as __FB_BACKEND__ - the oracle's word,
+                                                    // not a preference of ours
   // ⛔ NOT __FB_PROFILE__ / __FB_OPTION_PROFILE__: fbc leaves those UNDEFINED unless -profile is given,
   // and "#ifdef __FB_PROFILE__" is how a program asks. Defining them to 0 answers the wrong question -
   // a define that EXISTS where fbc's does not is exactly as wrong as one that is missing, and this pair

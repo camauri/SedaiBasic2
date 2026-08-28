@@ -2238,7 +2238,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `__FB_WIN32__` | ✓ | Defined if compiling for Windows. |
-| `__FB_LINUX__` | ✓ | Defined if compiling for Linux. |
+| `__FB_LINUX__` | ✓ | Defined on Linux. **DICHIARATA**: `-1` here, empty expansion in fbc; see `__FB_64BIT__`. |
 | `__FB_DOS__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_CYGWIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_FREEBSD__` | ✓ | Defined if compiling for FreeBSD. |
@@ -2248,11 +2248,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_XBOX__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_BIGENDIAN__` | ✓ | Defined if compiling on a system using big-endian byte-order. |
 | `__FB_PCOS__` | ✓ | Defined if compiling for a common PC OS (e.g. DOS, Windows, OS/2). |
-| `__FB_UNIX__` | ✓ | Defined if compiling for a Unix-like OS. |
-| `__FB_64BIT__` | ✓ | Defined if compiling for a 64bit target. |
+| `__FB_UNIX__` | ✓ | Defined on a unix host. **DICHIARATA**: `-1` here, empty expansion in fbc; see `__FB_64BIT__`. |
+| `__FB_64BIT__` | ✓ | Defined. **DICHIARATA**: we give it `-1`, fbc gives it an EMPTY expansion — `#ifdef` (the form a program uses) agrees, `#if`/`Print` do not. Same for `__FB_LINUX__`, `__FB_UNIX__`, `__FB_X86__`, `__FB_MAIN__`. |
 | `__FB_ARM__` | ✓ | Defined if compiling for the ARM architecture. |
 | `__FB_PPC__` | ✓ | Defined if compiling for the PowerPC architecture. |
-| `__FB_X86__` | ✓ | Defined if compiling for the X86 / X86_64 architecture. |
+| `__FB_X86__` | ✓ | Defined on x86. **DICHIARATA**: `-1` here, empty expansion in fbc; see `__FB_64BIT__`. |
 | `__FB_JS__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_ANDROID__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
@@ -2265,10 +2265,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_VER_MINOR__` | ✓ | Defined as an integral literal of the compiler minor version number. |
 | `__FB_VER_PATCH__` | ✓ | Defined as an integral literal of the compiler patch number. |
 | `__FB_MIN_VERSION__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_BUILD_DATE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_BUILD_DATE_ISO__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_SIGNATURE__` | ✓ | Defined as a string literal of the compiler signature. |
-| `__FB_BUILD_SHA1__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_BUILD_DATE__` | ◐ | **DICHIARATA**: left undefined on purpose. It describes the COMPILER's own build, and answering fbc's date would be a statement about us that is false. |
+| `__FB_BUILD_DATE_ISO__` | ◐ | **DICHIARATA**: left undefined on purpose; see `__FB_BUILD_DATE__`. |
+| `__FB_SIGNATURE__` | ✓ | `"SedaiBasic (FreeBASIC-compatible)"`. **DICHIARATA**: naming ourselves fbc would be false. |
+| `__FB_BUILD_SHA1__` | ◐ | **DICHIARATA**: left undefined on purpose; see `__FB_BUILD_DATE__`. |
 | `__FB_BUILD_FORK_ID__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 ##### Command-line switches
@@ -2287,13 +2287,13 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `__FB_GCC__` | ✓ | `-1` — the flag form of `__FB_BACKEND__ = "gcc"`, kept consistent with it. |
 | `__FB_OPTIMIZE__` | ✓ | `0` — the optimisation level the SOURCE asked for (fbc's default; a `#cmdline` carrying `-O` raises it). It reports the REQUEST, not our pipeline, which has no `-O` ladder. |
 | `__FB_GUI__` | ✓ | Console programs, as fbc's default is: `0`. Value read out of fbc 1.10.1. |
-| `__FB_MAIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_MAIN__` | ◐ | **DICHIARATA**: defined as `-1` where fbc defines it to an empty expansion. `#ifdef __FB_MAIN__` — the form a program actually uses — agrees; `Print __FB_MAIN__` does not. |
 | `__FB_DEBUG__` | ✓ | True (-1) if the "-g" switch was used, false (0) otherwise. |
 | `__FB_ERR__` | ✓ | `0` — the `-e`/`-ex`/`-exx` error-checking level, none by default, as in fbc. |
 | `__FB_FPMODE__` | ✓ | `"precise"` — fbc's default `-fpmode`. |
 | `__FB_FPU__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_LANG__` | ✓ | Defined to a string literal of the "-lang" dialect used. |
-| `__FB_MT__` | ✓ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
+| `__FB_MT__` | ✓ | `-1`. **DICHIARATA**: fbc answers `0` without `-mt`; we always have the threading runtime, and a program guarding a `ThreadCreate` behind `#if __FB_MT__` must find it. |
 | `__FB_OUT_DLL__` | ✓ | `0` — the three targets we are not; only `__FB_OUT_EXE__` is `-1`. |
 | `__FB_OUT_EXE__` | ✓ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
 | `__FB_OUT_LIB__` | ✓ | `0` — see `__FB_OUT_DLL__`. |
@@ -2307,7 +2307,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | Keyword | Status | Description |
 |---|---|---|
 | `__FB_ARGC__` | ✓ | The number of command-line arguments passed to the program (matches `COMMAND$` handling). |
-| `__FB_ARGV__` | ~ | Defined (returns 0 — a real ZSTRING PTR PTR argument vector is not exposed; use `COMMAND$(n)`). |
+| `__FB_ARGV__` | ~ | Defined. **DICHIARATA**: it is an ADDRESS, so it cannot equal fbc's and comparing the two values says nothing. A real `ZString Ptr Ptr` argument vector is not exposed; use `Command$(n)`. |
 | `__DATE__` | ✓ | String literal of the compilation date in "mm-dd-yyyy" format (captured at compile time). |
 | `__DATE_ISO__` | ✓ | String literal of the compilation date in "yyyy-mm-dd" format. |
 | `__TIME__` | ✓ | String literal of the compilation time in "hh:mm:ss" format. |
