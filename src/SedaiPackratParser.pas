@@ -152,6 +152,11 @@ type
     // direction that must never happen. Measured over the whole fbc suite: 36 of 36 rejections landed,
     // 0 valid programs refused.
     FExternShapes: TStringList;      // UPPER name -> shape, encoded by EncodeDeclShape
+    // ⭐ Module-level names that are LOCALS of the implicit main: a bare "Dim" and a bare "Static" at
+    // module level. fbc will not let a STATIC-STORAGE initialiser reference one ("error 272: Local
+    // symbols can't be referenced" for its address, "error 11: Expected constant" for its value),
+    // because the global is set up before that main runs and the local does not exist yet.
+    FModuleLocalNames: TStringList;
     FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
     function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer;
                              const Flags: string): string;
@@ -163,6 +168,8 @@ type
     procedure RejectEmptyAliasNames;
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
     procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
+    procedure CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
+    function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
 
@@ -496,6 +503,8 @@ begin
   FTypeMethodDefaults.CaseSensitive := False;
   FExternShapes := TStringList.Create;
   FExternShapes.CaseSensitive := False;
+  FModuleLocalNames := TStringList.Create;
+  FModuleLocalNames.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -515,6 +524,7 @@ begin
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
   FExternShapes.Free;
+  FModuleLocalNames.Free;
 
   inherited Destroy;
 end;
@@ -846,6 +856,7 @@ begin
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FModuleLocalNames.Clear;
   FTopLevelStmt := False;
 
   try
@@ -918,6 +929,7 @@ begin
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FModuleLocalNames.Clear;
   FTopLevelStmt := False;
 
   try
@@ -1037,6 +1049,7 @@ begin
 
  // ...and only now, with the whole tree in hand and every module-level EXTERN registered, can the
  // static-storage question be asked: it needs to know whether a declaration sits inside a NAMESPACE.
+ CollectModuleLocalNames(Result, False);
  RejectStaticVarLenStringInit(Result, False);
 
  DoNodeCreated(Result);
@@ -10157,6 +10170,73 @@ begin
   end;
 end;
 
+procedure TPackratParser.CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
+// The module-level names that are LOCALS of the implicit main: a bare "Dim" and a bare "Static", with
+// no SHARED, outside any NAMESPACE. ⛔ They are what a STATIC-STORAGE initialiser may not reference -
+// see InitReferencesModuleLocal. A CONST is not one of them (it is folded, not stored), and neither is
+// anything inside a procedure: that is a different scope, and a name there cannot be reached from a
+// module-level initialiser at all.
+var
+  i, j: Integer;
+  Ch, Decl: TASTNode;
+begin
+  if Node = nil then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Ch := Node.GetChild(i);
+    if Ch = nil then Continue;
+    if Ch.NodeType = antProcedureDecl then Continue;      // another scope entirely
+    if Ch.NodeType = antNamespace then
+    begin
+      CollectModuleLocalNames(Ch, True);
+      Continue;
+    end;
+    if Ch.NodeType <> antDim then
+    begin
+      CollectModuleLocalNames(Ch, InNamespace);
+      Continue;
+    end;
+    if InNamespace then Continue;                         // a namespace member has static storage
+    for j := 0 to Ch.ChildCount - 1 do
+    begin
+      Decl := Ch.GetChild(j);
+      if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+      if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+      if Decl.Attributes.Values['CONSTDECL'] = '1' then Continue;
+      if Decl.Attributes.Values['SHARED'] = '1' then Continue;
+      // ⚠️ STATIC ONLY, deliberately. fbc treats a module-level bare "Dim" as a local of the implicit
+      // main too, and refuses "Dim As Integer i : Dim Shared As Integer v = i" with "error 11: Expected
+      // constant" - measured. We ACCEPT that shape, and one of our own guards (m393) is built on
+      // accepting it, so closing that half is a decision about m393 and not about this rule. Written
+      // down in job/markdown/DIVERGENZE.md rather than half-done here.
+      if Decl.Attributes.Values['STATIC'] <> '1' then Continue;
+      FModuleLocalNames.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+    end;
+  end;
+end;
+
+function TPackratParser.InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
+// Does this initializer expression name one of them, at any depth? "@i", "i", "i + 1" and
+// "UDT(@i)" are all the same answer.
+var
+  i: Integer;
+begin
+  Result := False; Which := '';
+  if (Node = nil) or (FModuleLocalNames.Count = 0) then Exit;
+  // ⛔ TWO NODE KINDS CARRY THE NAME, and the interesting one is the SECOND. "@i" is an antProcAddress
+  // whose VALUE is the name - it has no antIdentifier child at all - and that is the very spelling the
+  // family is about ("Dim Shared As Integer Ptr p = @i"). Matching antIdentifier alone caught one test
+  // of six and left five looking like a rule that does not work.
+  if Node.NodeType in [antIdentifier, antProcAddress] then
+  begin
+    Which := UpperCase(VarToStr(Node.Value));
+    if FModuleLocalNames.IndexOf(Which) >= 0 then Exit(True);
+    Which := '';
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    if InitReferencesModuleLocal(Node.GetChild(i), Which) then Exit(True);
+end;
+
 procedure TPackratParser.RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
 // ⭐ A VAR-LEN STRING WITH STATIC STORAGE CANNOT BE INITIALIZED - fbc's "error 87". A string
 // descriptor with static storage is filled by the runtime before main runs, and there is no place to
@@ -10172,7 +10252,7 @@ procedure TPackratParser.RejectStaticVarLenStringInit(Node: TASTNode; InNamespac
 var
   i, j, k, TypeIdx, InitIdx: Integer;
   Ch, Decl, Sub: TASTNode;
-  TypeName, Nm: string;
+  TypeName, Nm, LocalNm: string;
   IsStatic, IsVarLenStr, HasDims: Boolean;
 begin
   if Node = nil then Exit;
@@ -10183,6 +10263,19 @@ begin
     if Ch.NodeType = antNamespace then
     begin
       RejectStaticVarLenStringInit(Ch, True);
+      Continue;
+    end;
+    // ⛔ A STATIC MEMBER'S DEFINITION IS NOT AN antDim. "Dim UDT.pi As Integer Ptr = @i" comes out of
+    // the parser as an antAssignment whose target is a member access marked STATICMEMBERDEF - it is a
+    // DEFINITION of storage that is static by construction, and the rule below owes it the same answer.
+    if (Ch.NodeType = antAssignment) and (Ch.ChildCount >= 2) and
+       (Ch.GetChild(0).NodeType = antMemberAccess) and (Ch.GetChild(0).ChildCount >= 1) and
+       (Ch.GetChild(0).GetChild(0).Attributes.Values['STATICMEMBERDEF'] = '1') then
+    begin
+      if InitReferencesModuleLocal(Ch.GetChild(1), LocalNm) then
+        HandleError(Format('%s.%s has static storage and its initializer references the local symbol %s',
+                           [UpperCase(VarToStr(Ch.GetChild(0).GetChild(0).Value)),
+                            UpperCase(VarToStr(Ch.GetChild(0).Value)), LocalNm]), Ch.Token);
       Continue;
     end;
     if Ch.NodeType <> antDim then
@@ -10205,7 +10298,6 @@ begin
       HasDims := False;
       for k := 1 to Decl.ChildCount - 1 do
         if Decl.GetChild(k).NodeType = antDimensions then HasDims := True;
-      if HasDims then Continue;
       Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
       IsStatic := (Decl.Attributes.Values['SHARED'] = '1') or
                   (Decl.Attributes.Values['STATIC'] = '1') or
@@ -10235,12 +10327,22 @@ begin
         TypeName := '';
       // A declared STRING with no "* n" capacity is var-len; with no declared type at all (VAR), the
       // initializer being a string LITERAL is what makes it one.
-      IsVarLenStr := ((TypeName = 'STRING') and (Decl.Attributes.Values['FIXEDLEN'] = '')) or
-                     ((TypeName = '') and (Sub.NodeType = antLiteral) and Assigned(Sub.Token) and
-                      (Sub.Token.TokenType = ttStringLiteral));
+      IsVarLenStr := (not HasDims) and
+                     (((TypeName = 'STRING') and (Decl.Attributes.Values['FIXEDLEN'] = '')) or
+                      ((TypeName = '') and (Sub.NodeType = antLiteral) and Assigned(Sub.Token) and
+                       (Sub.Token.TokenType = ttStringLiteral)));
       if IsVarLenStr then
         HandleError(Format('Var-len string %s cannot be initialized: it has static storage', [Nm]),
                     Decl.GetChild(0).Token);
+      // ⭐ ...AND WHATEVER IT IS, ITS INITIALIZER MAY NOT NAME A LOCAL OF THE IMPLICIT MAIN. A
+      // static-storage variable is set up before that main runs, so a module-level bare "Dim" or
+      // "Static" does not exist yet: fbc answers "error 272: Local symbols can't be referenced" for its
+      // address and "error 11: Expected constant" for its value. Measured one spelling at a time -
+      // a literal, a CONST and the address of another SHARED are all fine, and a bare "Dim v = i" with
+      // no static storage of its own is fine too.
+      if InitReferencesModuleLocal(Sub, LocalNm) then
+        HandleError(Format('%s has static storage and its initializer references the local symbol %s',
+                           [Nm, LocalNm]), Decl.GetChild(0).Token);
     end;
   end;
 end;
