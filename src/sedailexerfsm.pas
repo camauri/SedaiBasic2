@@ -1384,6 +1384,28 @@ begin
   // Full keyword lookup
   Match := ResolveKeyword(TokenText);
 
+  // ⭐ A TYPE SUFFIX ON A KEYWORD IS IGNORED, and the keyword stands. FreeBASIC says so in its own
+  // words - "warning 44: Suffix ignored in 'if$'" - and compiles "if$ 1 then ... end if" as an
+  // ordinary IF. Its quirk/keyword-suffix is exactly that program. The suffix character is part of the
+  // identifier here (it is a SpecialChar), so the lookup missed and the word came out a plain name.
+  // ⛔ Only when the SUFFIXED spelling is not a keyword in its own right: "LEFT$" and its family must
+  // keep resolving to themselves, so the retry runs only after the full lookup has failed.
+  if (not Match.Found) and (Length(TokenText) > 1) and
+     (TokenText[Length(TokenText)] in ['$', '%', '&', '!', '#']) then
+  begin
+    Match := ResolveKeyword(Copy(TokenText, 1, Length(TokenText) - 1));
+    if Match.Found then
+    begin
+      // Shorten the token's TEXT to the bare keyword - everything downstream compares on that text,
+      // and a keyword carrying a stray '$' would match nothing.
+      // ⛔ The suffix is CONSUMED, not handed back: giving the character to the input made it a token
+      // of its own and the parser met a lone '$' it had no statement for ("Unhandled node type 0" on
+      // stderr, on a program that otherwise ran). fbc's word for this is "Suffix IGNORED".
+      Dec(FTokenLength);
+      TokenText := Copy(TokenText, 1, Length(TokenText) - 1);
+    end;
+  end;
+
   if Match.Found then
   begin
     // Dialect-pluggable filter: a keyword tagged for the OTHER dialect is not a keyword here — emit a

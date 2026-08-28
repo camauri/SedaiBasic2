@@ -1419,6 +1419,57 @@ begin
   end;
 end;
 
+function SourceConstValue(const Nm: string; out V: Int64): Boolean;
+// The VALUE of a module-level "Const <Nm> = <integer literal>" written in the source, for a #if / #assert
+// that names it. fbc's preprocessor can read a Const because its symbol table is being built as it goes;
+// this one runs on TEXT, so it asks the same declaration-shaped scan Defined() already stands on.
+//
+// ⛔ WHY IT IS NEEDED AT ALL: an identifier the evaluator does not know becomes 0, so "#assert N = 5"
+// on a Const N answered "0 = 5" and refused the program. fbc's pp/macro-no-params is exactly that, and
+// it is a COMPILE_ONLY_OK test. ⚠️ The 0 default is kept for everything else - "#if undeclaredid1 =
+// undeclaredid2" depends on it - so only a name a Const really declares changes answer.
+var
+  L: TStringList;
+  i, p, q: Integer;
+  U, W, Rest: string;
+begin
+  Result := False;
+  V := 0;
+  if Nm = '' then Exit;
+  L := TStringList.Create;
+  try
+    L.Text := GPPSourceForDefined;
+    for i := 0 to L.Count - 1 do
+    begin
+      U := UpperCase(Trim(L[i]));
+      p := 1;
+      while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
+      W := Copy(U, 1, p - 1);
+      if W <> 'CONST' then Continue;
+      Rest := Trim(Copy(U, p, MaxInt));
+      // "Const AS <type> name = v" names the type first; step over it.
+      if Copy(Rest, 1, 3) = 'AS ' then
+      begin
+        Rest := Trim(Copy(Rest, 4, MaxInt));
+        q := 1;
+        while (q <= Length(Rest)) and IsIdentChar(Rest[q]) do Inc(q);
+        Rest := Trim(Copy(Rest, q, MaxInt));
+      end;
+      q := 1;
+      while (q <= Length(Rest)) and IsIdentChar(Rest[q]) do Inc(q);
+      if Trim(Copy(Rest, 1, q - 1)) <> Nm then Continue;
+      Rest := Trim(Copy(Rest, q, MaxInt));
+      if (Rest = '') or (Rest[1] <> '=') then Continue;
+      Rest := Trim(Copy(Rest, 2, MaxInt));
+      // Only a plain integer literal: anything else is an expression this stage cannot fold, and
+      // answering it wrongly would be worse than leaving the old 0.
+      if TryStrToInt64(Rest, V) then Exit(True);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
 function SourceDeclaresSymbol(const Nm: string): Boolean;
 // fbc's Defined() answers TRUE for COMPILER-level symbols too, not only #defines: a Const, a
 // Dim/Redim/Static variable, a Sub/Function name (fbc-verified: examples/manual/prepro/defined
@@ -1609,7 +1660,7 @@ var
   // re-tokenized (depth-guarded) rather than added as one token, so values like "-1" (-> '-' '1'),
   // "&HFF", or "1 + 2" parse correctly and nested macros expand.
   procedure Tokenize(const S: string; Depth: Integer);
-  var p, q: Integer; id, two: string; nm: string;
+  var p, q: Integer; id, two: string; nm: string; ConstV: Int64;
   begin
     p := 1;
     while p <= Length(S) do
@@ -1733,6 +1784,9 @@ var
           if Depth < 32 then Tokenize(Trim(Defs.Values[id]), Depth + 1)
           else Toks.Add('0');
         end
+        // ⭐ ...unless the SOURCE declares it as a Const with an integer value. See SourceConstValue.
+        else if SourceConstValue(id, ConstV) then
+          Toks.Add(IntToStr(ConstV))
         else
           Toks.Add('0');                       // undefined identifier -> 0
         Continue;
