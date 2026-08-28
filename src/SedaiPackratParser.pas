@@ -213,6 +213,7 @@ type
     procedure CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
                                               NameTok: TLexerToken);
     procedure CheckByRefReturn(ProcNode: TASTNode);
+    procedure CheckRedimTargetIsAName(Node: TASTNode);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -1459,6 +1460,7 @@ begin
     ttArrayRedim:
     begin
       Result := Memoize('RedimStatement', @ParseRedimStatement);
+      CheckRedimTargetIsAName(Result);   // ⛔ not gated on module level: fbc refuses it everywhere
       if AtModuleLevel then CheckDeclAgainstExtern(Result, True);
       if AtModuleLevel then CheckDuplicateModuleDecl(Result, True);
     end;
@@ -10504,6 +10506,60 @@ begin
     else
       Exit;
     end;
+end;
+
+procedure TPackratParser.CheckRedimTargetIsAName(Node: TASTNode);
+// ⭐ A REDIM RESIZES STORAGE, so its target must be able to NAME some. fbc: "error 54: Expected var-len
+// array". Its dim/redim-expression-* family parenthesises the target and puts something inside that
+// names nothing resizable: a literal ("ReDim (1)(0 To 0)"), a constant expression, a binary op, a CALL,
+// a dereference.
+//
+// ⛔⛔ WRITTEN ON THE CLOSED SIDE, AND THE FIRST ATTEMPT WAS NOT. "The target must be an identifier"
+// looks like the same rule and is a WHITELIST OF SHAPES, which cannot be finished: it refused
+// "ReDim this.m(r-1, c-1)" and "ReDim v.buf(0 To 2)" - an ordinary member array - and it refused the
+// spelling FreeBASIC's own manual PRESCRIBES, "ReDim (u(0).array)(0 To 9)", which is parenthesised
+// precisely because the bare form is ambiguous (our guard m503 exists for it, blessed against fbc).
+// Nine corpus programs and five fbcunit files said so: CUERR 111 -> 116 and the sweep below its floor.
+// ⇒ The rule names what can NEVER denote storage and leaves everything else alone.
+//
+// ⚠️ It does NOT ask whether the name is a VAR-LEN array, which is the other half of fbc's message and
+// the rest of the family (a fixed-size var or field, a ReDim of a name nothing declared). That half
+// needs the shape registries, and those are the five that are still FLAT - keyed on a bare name with no
+// scope - so a refusal built on them would fire on the wrong declaration.
+var
+  i: Integer;
+  Decl, Tgt: TASTNode;
+  Bad: string;
+begin
+  if (Node = nil) or (not FModernMode) then Exit;
+  if Node.NodeType <> antRedim then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    Tgt := Decl.GetChild(0);
+    if Tgt = nil then Continue;
+    Bad := '';
+    case Tgt.NodeType of
+      antLiteral:   Bad := 'a literal';
+      antBinaryOp:  Bad := 'an arithmetic expression';
+      antUnaryOp:   Bad := 'an expression';
+      // ⛔ A DEREF is not storage THIS statement may resize: "*p" names whatever p points at, and an
+      // array's storage is not reachable that way.
+      antDeref:     Bad := 'a dereferenced pointer';
+      // A CALL and an ARRAY ELEMENT are the same node here, so the procedure set tells them apart -
+      // and only a call is refused: "ReDim (u(0).array)(...)" is legal and is the manual's own form.
+      antArrayAccess:
+        if (Tgt.ChildCount >= 1) and (Tgt.GetChild(0) <> nil) and
+           (Tgt.GetChild(0).NodeType = antIdentifier) and
+           (FProcSeen.IndexOf(UpperCase(VarToStr(Tgt.GetChild(0).Value))) >= 0) then
+          Bad := 'the result of a function call';
+    else
+      ;
+    end;
+    if Bad <> '' then
+      HandleError(Format('a REDIM resizes storage, and %s names none', [Bad]), Decl.Token);
+  end;
 end;
 
 procedure TPackratParser.CheckByRefReturn(ProcNode: TASTNode);
