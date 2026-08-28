@@ -48,13 +48,24 @@ type
                                    // imported ones, so "Dim Shared v" beside "Using A" (which also
                                    // has a v) means the global v. Without this the import silently
                                    // took over a name the program had declared itself.
+    // ⭐ What each namespace ITSELF imports, as "PREFIX|IMPORTED". A "Using N" brings in what N can
+    // SEE, not only what N declares: fbc's namespace/using2 nests three deep (ns3 uses ns2, ns2 uses
+    // ns1) and reads a name of ns1 through ns3. Without this the import stopped one level down and the
+    // name resolved to nothing - it printed 0.
+    NsUsings: TStringList;
     constructor Create;
     destructor Destroy; override;
     function IsMember(const Prefix, Name: string): Boolean;
+    // The imports of Prefix, its imports' imports, and so on. Cycle-safe: a namespace already in Acc
+    // is never expanded twice, which is what makes a mutual "using" terminate.
+    procedure AddUsingClosure(const Prefix: string; Acc: TStringList);
   end;
 
 constructor TNsContext.Create;
 begin
+  NsUsings := TStringList.Create;
+  NsUsings.Duplicates := dupIgnore;
+  NsUsings.Sorted := True;
   NamespaceNames := TStringList.Create;
   NamespaceNames.Duplicates := dupIgnore;
   NamespaceNames.Sorted := True;
@@ -71,12 +82,35 @@ begin
   NamespaceNames.Free;
   MemberKeys.Free;
   GlobalNames.Free;
+  NsUsings.Free;
   inherited Destroy;
 end;
 
 function TNsContext.IsMember(const Prefix, Name: string): Boolean;
 begin
   Result := MemberKeys.IndexOf(Prefix + '|' + Name) >= 0;
+end;
+
+procedure TNsContext.AddUsingClosure(const Prefix: string; Acc: TStringList);
+// Every namespace Prefix can SEE through its own USING directives, transitively. Acc doubles as the
+// visited set, so a cycle ("namespace a : using b : end namespace" and the mirror) terminates on the
+// first repeat instead of recursing for ever.
+var
+  i: Integer;
+  Key, Imported: string;
+begin
+  if (Acc = nil) or (Prefix = '') then Exit;
+  Key := UpperCase(Prefix) + '|';
+  for i := 0 to NsUsings.Count - 1 do
+    if Copy(NsUsings[i], 1, Length(Key)) = Key then
+    begin
+      Imported := Copy(NsUsings[i], Length(Key) + 1, MaxInt);
+      if Acc.IndexOf(Imported) < 0 then
+      begin
+        Acc.Add(Imported);
+        AddUsingClosure(Imported, Acc);
+      end;
+    end;
 end;
 
 // Forward declarations (mutual references in pass 1).
@@ -304,6 +338,7 @@ function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext;
 var
   P: string;
   DotPos, u: Integer;
+  Closure: TStringList;
 begin
   Result := '';
   P := ActivePrefix;
@@ -317,9 +352,22 @@ begin
   // ⛔ ...but a MODULE-LEVEL name of the program's own wins over every import: fbc resolves an
   // unqualified reference against the global scope first. "Dim Shared v" beside a "Using A" that also
   // has a v means the global v, and without this test the import silently took the name over.
+  // ⭐ ...AND THROUGH WHAT THOSE NAMESPACES THEMSELVES IMPORT. A "Using N" brings in what N can SEE,
+  // not only what N declares - fbc's namespace/using2 nests three deep and reads a name of the
+  // innermost through the outermost. The closure is built here rather than when the directive is seen,
+  // because a namespace may be REOPENED after the import and gain more imports later.
   if (Using <> nil) and (Ctx.GlobalNames.IndexOf(V) < 0) then
-    for u := 0 to Using.Count - 1 do
-      if Ctx.IsMember(Using[u], V) then Exit(Using[u] + '.' + V);
+  begin
+    Closure := TStringList.Create;
+    try
+      Closure.Assign(Using);
+      for u := 0 to Using.Count - 1 do Ctx.AddUsingClosure(Using[u], Closure);
+      for u := 0 to Closure.Count - 1 do
+        if Ctx.IsMember(Closure[u], V) then Exit(Closure[u] + '.' + V);
+    finally
+      Closure.Free;
+    end;
+  end;
 end;
 
 // Re-resolve the TYPE NAMES carried in an overload signature's tail against the enclosing namespace
@@ -491,6 +539,9 @@ begin
         if Using <> nil then UseUsing.Assign(Using);
       end;
       if UseUsing.IndexOf(UsingNs) < 0 then UseUsing.Add(UsingNs);
+      // ...and remember that THIS namespace imports it, so importing THIS one later brings it along.
+      if (Ctx <> nil) and (ChildPrefix <> '') then
+        Ctx.NsUsings.Add(UpperCase(ChildPrefix) + '|' + UsingNs);
       SetLength(Drop, Length(Drop) + 1);
       Drop[High(Drop)] := i;
       Continue;
