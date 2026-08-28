@@ -925,6 +925,7 @@ type
     function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function PointeeOfDerefTarget(Node: TASTNode): string;   // ...of the EXPRESSION a "*" is applied to
+    procedure RequireStringArg(const FuncName: string; ArgsNode: TASTNode);
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
     function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a UCS-2 temporary
@@ -4886,6 +4887,7 @@ begin
         end
         else if (FuncName = 'VAL') then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // VAL(str) - returns float from string
           // ...through "Operator Cast() As String" for a UDT, as STR$ above: read as an ordinary
           // expression the argument is an int HANDLE, EnsureStringRegister rendered THAT, and VAL
@@ -4945,6 +4947,7 @@ begin
         else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') or
                 (FuncName = kVALULNG) then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // VALINT/VALLNG/VALUINT(s) - parse leading integer from a string (0 if none).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
@@ -5170,6 +5173,7 @@ begin
         end
         else if (FuncName = 'LEFT$') then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // LEFT$(str, n) - returns leftmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
@@ -5188,6 +5192,7 @@ begin
         end
         else if (FuncName = 'RIGHT$') then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // RIGHT$(str, n) - returns rightmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
@@ -31715,6 +31720,40 @@ begin
   else if T = 'SINGLE' then Result := RTC_SINGLE
   else if T = 'DOUBLE' then Result := RTC_DOUBLE
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
+end;
+
+procedure TSSAGenerator.RequireStringArg(const FuncName: string; ArgsNode: TASTNode);
+// ⭐ VAL / VALINT / VALLNG / VALUINT / VALULNG / LEFT / RIGHT take a STRING. fbc answers "error 99: No
+// matching overloaded function" for "Val(0)" and for "Val(p)" where p is a ZString Ptr or a WString
+// Ptr - there is no overload of these that takes a number or an address, and passing one is a
+// mistake, not a conversion. We rendered the number and parsed it back, or read a pointer VALUE as
+// text: "Val(0)" answered 0 and looked right.
+//
+// ⛔ IT REFUSES ONLY WHAT IT CAN PROVE, and that is the whole design. This compiler has a bank
+// inference that answers a DEFAULT when it does not know (see REGISTRI.md), and building a REFUSAL on
+// something that guesses is how a valid program gets rejected. Two proofs, both local and certain:
+// a numeric LITERAL, and an identifier the parser recorded as a POINTER. Anything else - a UDT with a
+// Cast operator, a function result, an expression - is left alone.
+var
+  Arg: TASTNode;
+begin
+  if (ArgsNode = nil) then Exit;
+  Arg := ArgsNode;
+  if Arg.NodeType in [antArgumentList, antExpressionList] then
+  begin
+    if Arg.ChildCount < 1 then Exit;
+    Arg := Arg.GetChild(0);
+  end;
+  if Arg = nil then Exit;
+  while (Arg.NodeType = antParentheses) and (Arg.ChildCount >= 1) do Arg := Arg.GetChild(0);
+  if (Arg.NodeType = antLiteral) and Assigned(Arg.Token) and
+     (Arg.Token.TokenType <> ttStringLiteral) then
+    raise Exception.CreateFmt('%s takes a string: it was given the number %s. There is no overload ' +
+      'of %s that takes a number.', [FuncName, VarToStr(Arg.Value), FuncName]);
+  if (Arg.NodeType = antIdentifier) and (PointeeTypeOf(UpperCase(VarToStr(Arg.Value))) <> '') then
+    raise Exception.CreateFmt('%s takes a string: %s is a POINTER. Dereference it (*%s) if you mean ' +
+      'the text it points at.',
+      [FuncName, UpperCase(VarToStr(Arg.Value)), UpperCase(VarToStr(Arg.Value))]);
 end;
 
 function TSSAGenerator.PointeeOfDerefTarget(Node: TASTNode): string;
