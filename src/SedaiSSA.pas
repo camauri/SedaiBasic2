@@ -23919,7 +23919,11 @@ begin
       if (Result = 0) and FModernMode then
       begin
         AwCode := OperandWidthCode(Node);
-        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        // ⛔ ...AND CODE 8, the 64-bit unsigned pair (UINTEGER/ULONGINT), which this list did not have.
+        // It is print kind 2, not 3 - a full-width unsigned needs the wider form - and PrintKindOfType
+        // has answered 2 for those two names all along: only the DERIVED path was missing them.
+        else if AwCode = 8 then Result := 2;
       end;
     end;
     antGraphicsFunction:
@@ -24066,7 +24070,12 @@ begin
       if FModernMode then
       begin
         AwCode := TypeNameWidthCode(UpperCase(VarToStr(Node.Value)));
-        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        // ⛔ ...AND CODE 8, the 64-bit unsigned pair. "Print Cast(ULongInt, 1)" printed " 1" with a sign
+        // column where fbc prints "1". Kind 2, not 3: a FULL-WIDTH unsigned is not the narrow case above
+        // (which promotes to a signed expression). The arm two branches up - the deref of an unsigned
+        // pointer - already had this line; this one is its twin and did not.
+        else if AwCode = 8 then Result := 2;
       end;
     antLiteral:
       // FreeBASIC gives a DECIMAL integer literal the first type on the ladder Long -> ULong -> LongInt ->
@@ -33238,7 +33247,14 @@ begin
   end
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
   begin
-    if (Node.GetChild(0).NodeType = antIdentifier) and
+    // ⛔ ...AND THE POINTER OPERAND MAY BE A CAST, not only a name. "*(Cast(UByte Ptr, @i) + 1)" is the
+    // spelling FreeBASIC's own examples use for walking bytes, and this arm asked only about an
+    // IDENTIFIER - so the pointee came back '' and the read printed with a sign column ("  200" for
+    // "200"). The cast arm above already resolves a cast's declared type; this follows it through the
+    // arithmetic, which is what the arm's own header says it does.
+    if (Node.GetChild(0).NodeType = antCast) and (DerefedType(Node.GetChild(0)) <> '') then
+      Result := DerefedType(Node.GetChild(0))
+    else if (Node.GetChild(0).NodeType = antIdentifier) and
        (ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)) <> '') then
       Result := DerefedType(Node.GetChild(0))
     else if (Node.GetChild(1).NodeType = antIdentifier) and
