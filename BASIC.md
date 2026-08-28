@@ -225,6 +225,20 @@ difference is stated rather than left to be discovered.
 
 ### Declared divergences from FreeBASIC
 
+- ⚠️ **A declaration must state its type, and that narrows what we used to accept.** In `-lang fb`
+  there are no default types and no inference from a type sigil, so `Dim a`, `Dim a$`, `Dim a(0 To 1)`,
+  `Common a` and `Dim a = 5` are all refused, exactly as fbc refuses them (`error 147`). The check is
+  per NAME: `Dim a, b As Integer` leaves `a` untyped and is refused, while the leading-AS spelling
+  `Dim As Integer a, b` types both. The suffix itself is never the offence — `Dim a$ As String` is
+  accepted and the sigil is simply ignored, which also means `a$` **is** `a` (a `Dim a$` beside a
+  `Dim a` is a duplicate definition).
+  ⛔ **Why it is a divergence and not only conformance gained**: the dialect is chosen from the
+  program's content — line numbers mean CLASSIC, their absence means MODERN — so a Commodore-style
+  program written without line numbers is MODERN, and from now on it wants its types.
+  ⭐ **The way out is fbc's own, and the rule reads it**: a source may ask for another language with
+  `#lang "fblite"` / `'$lang: "qb"` / `"deprecated"`, and there the default types and the sigils are
+  legal again. `Var`, `As TypeOf(expr)` and `Const` are unaffected — each carries its type somewhere
+  other than a type name.
 - `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
   there. That is the point of an extension.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that

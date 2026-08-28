@@ -61,6 +61,14 @@ procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string
 
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 function DetectQBLang(const Src: string): Boolean;
+// ⭐ Did the source ask for a dialect that is NOT -lang fb? fbc honours '#lang "qb"' / '#lang "fblite"'
+// / '#lang "deprecated"' (and the '$lang: spelling) from INSIDE the file, and several rules - default
+// types, type suffixes, the DEFxxx letter rule - are legal there and refused in -lang fb. A check that
+// enforces the -lang fb rule has to know which language the file asked for, or it refuses a program
+// fbc compiles. Set by PreprocessSource, which is the ONE funnel every front end passes a source
+// through before lexing; read through SourceDeclaresNonFbDialect.
+function DetectNonFbLang(const Src: string): Boolean;
+function SourceDeclaresNonFbDialect: Boolean;
 
 implementation
 
@@ -96,6 +104,41 @@ begin
   finally
     L.Free;
   end;
+end;
+
+var
+  GDeclaredNonFbDialect: Boolean = False;   // last source handed to PreprocessSource asked for qb/fblite/deprecated
+
+function DetectNonFbLang(const Src: string): Boolean;
+// The same line-anchored scan DetectQBLang does, and anchored for the same reason: a header comment
+// that MENTIONS the directive is not the directive. Three languages, because fbc's own message names
+// three - "only valid in -lang deprecated or fblite or qb".
+var
+  L: TStringList;
+  i: Integer;
+  T: string;
+begin
+  Result := False;
+  L := TStringList.Create;
+  try
+    L.Text := Src;
+    for i := 0 to L.Count - 1 do
+    begin
+      T := UpperCase(TrimLeft(L[i]));
+      if (Length(T) > 0) and (T[1] = '''') then T := TrimLeft(Copy(T, 2, MaxInt));   // '$lang metacommand
+      T := StringReplace(T, ' ', '', [rfReplaceAll]);
+      if (Copy(T, 1, 5) = '#LANG') or (Copy(T, 1, 6) = '$LANG:') then
+        if (Pos('"QB"', T) > 0) or (Pos('"FBLITE"', T) > 0) or (Pos('"DEPRECATED"', T) > 0) then
+          Exit(True);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+function SourceDeclaresNonFbDialect: Boolean;
+begin
+  Result := GDeclaredNonFbDialect;
 end;
 
 function IsIdentChar(C: Char): Boolean; inline;
@@ -2658,6 +2701,12 @@ var
   end;
 
 begin
+  // ⭐ WHICH LANGUAGE DID THIS FILE ASK FOR? Recorded here and nowhere else: this routine is the one
+  // funnel every front end (sb, sbc, the web server, the runner, immediate mode) passes a source
+  // through before lexing, so a rule that must only apply to -lang fb can read the answer without
+  // seven callers each having to remember to pass it. Set BEFORE the fast path below, so a file with
+  // no directives at all clears a previous file's answer instead of inheriting it.
+  GDeclaredNonFbDialect := DetectNonFbLang(Src);
   // Fast path: no preprocessor directive and no intrinsic-define usage -> return unchanged (zero
   // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic
   // macros; '$ covers the QuickBASIC '$INCLUDE metacommand; 'scape'/'SCAPE' covers OPTION

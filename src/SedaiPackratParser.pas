@@ -195,6 +195,7 @@ type
     function WritesThroughConstPointee(Node: TASTNode): string;
     function ConstRootOfTarget(Node: TASTNode): string;
     procedure CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
+    procedure CheckDeclStatesItsType(Node: TASTNode);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -478,7 +479,8 @@ function CreatePackratParser: TPackratParser;
 implementation
 
 uses
-  Math, StrUtils, TypInfo;
+  Math, StrUtils, TypInfo,
+  SedaiPreprocessor;   // SourceDeclaresNonFbDialect: which -lang the source asked for
 
 
 // The MODERN extensions that FreeBASIC does NOT reserve: a program may use any of them as the name
@@ -1377,6 +1379,7 @@ begin
       Result := Memoize('DimStatement', @ParseDimStatement);
       if AtModuleLevel then CheckDeclAgainstExtern(Result, False);
       if AtModuleLevel then CheckDuplicateModuleDecl(Result, False);
+      CheckDeclStatesItsType(Result);
     end;
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
     ttLSet: Result := ParseLRSetStatement(antLSet);
@@ -10414,6 +10417,67 @@ begin
     HandleError(Format('Type %s cannot be declared here: %s, and a type that needs a constructor, ' +
       'a destructor or a method is only allowed at module level',
       [UpperCase(VarToStr(Node.Value)), Why]), Node.Token);
+end;
+
+procedure TPackratParser.CheckDeclStatesItsType(Node: TASTNode);
+// ⭐ A DECLARATION STATES ITS TYPE. fbc: "error 147: Default types or suffixes are only valid in
+// -lang deprecated or fblite or qb". In -lang fb there is no implicit type and no DEFxxx letter rule,
+// so "Dim a", "Dim a(0 To 1)", "Common a" and "Dim a = 5" are all refused: a name with no AS has no
+// type at all.
+//
+// ⛔ AND THE SUFFIX IS NOT THE OFFENCE, which is the opposite of how the family reads. "Dim a$"
+// is refused and "Dim a$ As String" is ACCEPTED - fbc only emits "warning 44: Suffix ignored" for the
+// second. So the question asked here is never "does the name carry a sigil"; it is only ever "did this
+// declaration state a type". Measured on the oracle before the rule was written, because reasoning
+// from the test names (type-suffix-*) gives the wrong rule.
+//
+// ⚠ It is PER NAME, not per statement: fbc refuses "Dim a, b As Integer" because the AS binds to
+// "b" alone and "a" is left untyped, while the leading-AS spelling "Dim As Integer a, b" types both.
+// Our parser already writes exactly that distinction into the tree - an untyped name gets an empty
+// type identifier - so the check reads the tree and needs no state and no scope of its own. fbc
+// refuses a bare Dim at module level, in a Sub, in a Scope and in an If alike (all four probed), so
+// this is not gated on AtModuleLevel.
+var
+  i, k: Integer;
+  Decl, Ch: TASTNode;
+  Nm: string;
+  TypeSeen: Boolean;
+begin
+  if Node = nil then Exit;
+  if not FModernMode then Exit;   // ⛔ CLASSIC IS THE DIALECT WHERE "A$" AND A BARE DIM ARE THE NORM
+  // ⛔ ...AND SO ARE qb, fblite AND deprecated, which fbc's own message names: a file that asks for one
+  // of them with '#lang "fblite"' gets the default types and the suffixes, and refusing it would be a
+  // program fbc compiles that we do not. 17 of the FreeBASIC manual's own examples declare exactly that.
+  if SourceDeclaresNonFbDialect then Exit;
+  if Node.NodeType <> antDim then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+    // The three spellings that carry their type somewhere other than a type name, and are legal:
+    // VAR infers it from the initializer, "As TypeOf(expr)" from an expression the SSA resolves, and a
+    // CONST from its value ("Const K = 5" needs no AS - fbc compiles it).
+    if (Decl.Attributes.Values['INFER'] = '1') or (Decl.Attributes.Values['TYPEOF'] = '1') or
+       (Decl.Attributes.Values['CONSTDECL'] = '1') then Continue;
+    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    // A DOTTED name is the static-member definition "Dim UDT.m As T", which fbc judges by whether the
+    // member was declared STATIC in the type - a different question with a different answer, and it
+    // needs the type's member table. Left to its own rule.
+    if (Nm = '') or (Pos('.', Nm) > 0) then Continue;
+    TypeSeen := False;
+    for k := 1 to Decl.ChildCount - 1 do
+    begin
+      Ch := Decl.GetChild(k);
+      if Ch = nil then Continue;
+      if Ch.NodeType = antDimensions then Continue;   // the bounds sit between the name and the type
+      TypeSeen := (Ch.NodeType = antIdentifier) and (VarToStr(Ch.Value) <> '');
+      Break;                                          // whatever comes first decides; an initializer
+    end;                                              // reached before a type name means there is none
+    if not TypeSeen then
+      HandleError(Format('%s has no type: in the FreeBASIC dialect a declaration must say AS <type> ' +
+        '(there are no default types and no type suffixes)', [Nm]), Decl.GetChild(0).Token);
+  end;
 end;
 
 procedure TPackratParser.CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
