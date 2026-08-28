@@ -722,6 +722,17 @@ type
     procedure RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
+    // ⭐ The THREE POINTER DOMAINS, answered in one place each. A pointer VALUE is one of: a record-field
+    // pointer (RECPTR_TAG, bit 63, so NEGATIVE), a raw heap address (RAWPTR_TAG, bit 62) or a packed
+    // array pointer. The bcRefLoad*/bcRefStore* arms spelled all three out inline, and the bcRawLoad*/
+    // bcRawStore* arms knew only the raw one - so "@obj.field" kept in a POINTER FIELD of another UDT
+    // (which the compiler classifies as raw) died on a dereference that worked from a pointer VARIABLE.
+    // ⛔ Extracted rather than copied: this would have been the THIRD written-out copy of the same
+    // decode, and every earlier copy of it in this VM has cost a defect.
+    function PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64): Int64;
+    function PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
+    procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
+    procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure UpdateScreenModelGate;          // decide whether the modelled screen must be kept
     procedure RecCacheAdopt(C: PRecCache);    // bind this thread's free-index cache to this VM
@@ -5196,6 +5207,102 @@ begin
     raise ERangeError.CreateFmt('Raw pointer dereference out of bounds: offset %d + %d > %d bytes',
                                 [Int64(ofs), Int64(NeedBytes), Int64(Length(FRawHeap))]);
   Result := @FRawHeap[ofs];
+end;
+
+function TBytecodeVM.PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64): Int64;
+// A pointer value that is NOT a raw heap address: a record-field pointer or a packed array pointer.
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Exit(RecFieldInt(Rec, RecSlot));
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  // The vector that IS populated is the discriminator - see the note in bcRefLoadInt.
+  if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    Result := FArrays[ArrayIdx].IntData[PtrOffset]
+  else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    Result := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
+function TBytecodeVM.PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Exit(RecFieldFloat(Rec, RecSlot));
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    Result := FArrays[ArrayIdx].FloatData[PtrOffset]
+  else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    Result := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
+procedure TBytecodeVM.PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    RecSetFieldInt(Rec, RecSlot, Value);
+    Exit;
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    FArrays[ArrayIdx].IntData[PtrOffset] := Value
+  else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Value
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
+procedure TBytecodeVM.PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    RecSetFieldFloat(Rec, RecSlot, Value);
+    Exit;
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    FArrays[ArrayIdx].FloatData[PtrOffset] := Value
+  else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Value
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
 end;
 
 function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
@@ -13559,10 +13666,48 @@ begin
     20: Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                              // bcRawAlloc
     21: RawFree(Ctx.IntRegs[Instr.Src1]);                                                          // bcRawFree
     22: Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);   // bcRawRealloc
-    23: Ctx.IntRegs[Instr.Dest] := RawLoadInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate);           // bcRawLoadInt
-    24: Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate);       // bcRawLoadFloat
-    25: RawStoreInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.IntRegs[Instr.Src2]);            // bcRawStoreInt
-    26: RawStoreFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);        // bcRawStoreFloat
+    // ⛔ A NEGATIVE ADDRESS IS NOT RAW MEMORY: it is a RECORD-FIELD pointer (RECPTR_TAG, bit 63), what
+    // "@obj.field" yields for a managed record. bcRefLoadInt has told the three domains apart for a
+    // while - its own comment says "the tag is IN the value, so the question is answered here, where
+    // every path that produces one arrives" - and the RAW arm never learnt the same thing. So
+    // "@a.i" put in a pointer VARIABLE worked and the same address put in a pointer FIELD of another
+    // UDT died on "Null or invalid raw pointer dereference": the compiler classifies a pointer FIELD as
+    // raw and emits this opcode, and only the value knows better. Measured with a 5-variant deck: the
+    // combination "record-field pointer inside a record field" was the only one that broke.
+    23: // bcRawLoadInt
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)   // a real raw address: it carries the WIDTH
+        else
+          Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr);
+      end;
+    24: // bcRawLoadFloat
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)
+        else
+          Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr);
+      end;
+    // The WRITE half of the same rule, and it must be here too - "*g.pi = 33" through a pointer FIELD
+    // holding "@obj.field" wrote into a nonexistent raw block while the READ, once fixed, worked.
+    25: // bcRawStoreInt
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
+        else
+          PtrDomainStoreInt(Ctx, PtrAddr, Ctx.IntRegs[Instr.Src2]);
+      end;
+    26: // bcRawStoreFloat
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])
+        else
+          PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2]);
+      end;
     31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
       begin
         RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
