@@ -3348,6 +3348,8 @@ function TExpressionParser.ParseMemberAccess(Left: TASTNode; Token: TLexerToken)
 // field name and build antMemberAccess(value=fieldName, child0=object expr). Chaining
 // (a.b.c) works because Left may itself be an antMemberAccess.
 var
+  Inner: TASTNode;   // the bottom of a deref chain under a parenthesised base
+  Levels: Integer;   // how many dereferences that chain has
   FieldName: string;
 begin
   if not HasValidContext then Exit(nil);
@@ -3399,10 +3401,30 @@ begin
   // and a separate decision.
   if (Left <> nil) and (Left.NodeType = antParentheses) and (Left.ChildCount = 1) and
      (Left.GetChild(0) <> nil) and (Left.GetChild(0).NodeType = antDeref) and
-     (Left.GetChild(0).ChildCount = 1) and
-     (Left.GetChild(0).GetChild(0) <> nil) and
-     (Left.GetChild(0).GetChild(0).NodeType = antMemberAccess) then
-    Left := Left.GetChild(0).GetChild(0);
+     (Left.GetChild(0).ChildCount = 1) and (Left.GetChild(0).GetChild(0) <> nil) then
+  begin
+    // ⛔ ...and the test is on what the deref CHAIN bottoms out at, not on its immediate child:
+    // "(**x.ppp).a" is a member pointer dereferenced TWICE (fbc's structs/self-ref writes it), and
+    // asking only about the first child left it out - it answered 1 for 123 exactly as the single
+    // level did. Exactly ONE deref is removed either way, the one the dot itself implies; any further
+    // derefs stay, which is the shape "(*x.ppp)->a" already parses to and already works.
+    Inner := Left.GetChild(0).GetChild(0);
+    Levels := 1;
+    while (Inner <> nil) and (Inner.NodeType = antDeref) and (Inner.ChildCount = 1) do
+    begin
+      Inner := Inner.GetChild(0);
+      Inc(Levels);
+    end;
+    // Exactly ONE dereference is removed - the one the dot itself implies - and only when doing so
+    // cannot change what the base means:
+    //   - the chain bottoms out at a MEMBER ACCESS: "(*b.aptr).x" is "b.aptr->x" (m660);
+    //   - or there is MORE THAN ONE dereference: "(**q).a" is "(*q)->a" whatever q is, and that second
+    //     spelling already worked while this one died on a null pointer. fbc's structs/self-ref.
+    // ⛔ A SINGLE deref over an identifier or an address-of is left alone: m619's "(*tpp)->n" needs
+    // both levels and m604's "(*@u).s" names u itself, and neither was broken to begin with.
+    if ((Inner <> nil) and (Inner.NodeType = antMemberAccess)) or (Levels >= 2) then
+      Left := Left.GetChild(0).GetChild(0);
+  end;
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
   Result.AddChild(Left);
   DoNodeCreated(Result);
