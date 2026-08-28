@@ -157,6 +157,10 @@ type
     // symbols can't be referenced" for its address, "error 11: Expected constant" for its value),
     // because the global is set up before that main runs and the local does not exist yet.
     FModuleLocalNames: TStringList;
+    // ⭐ Type names that declare a CONSTRUCTOR or a DESTRUCTOR. A type declared inside a procedure or a
+    // block may not HAVE one, nor a field of such a type, nor extend one - fbc's "error 263: Objects
+    // with default [con|de]structors or methods are only allowed in the module level".
+    FTypesWithCtorDtor: TStringList;
     FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
     function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer;
                              const Flags: string): string;
@@ -169,6 +173,8 @@ type
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
     procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
     procedure CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
+    procedure NoteTypeCtorDtor(Node: TASTNode);
+    procedure RefuseNonModuleLevelType(Node: TASTNode);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -505,6 +511,8 @@ begin
   FExternShapes.CaseSensitive := False;
   FModuleLocalNames := TStringList.Create;
   FModuleLocalNames.CaseSensitive := False;
+  FTypesWithCtorDtor := TStringList.Create;
+  FTypesWithCtorDtor.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -525,6 +533,7 @@ begin
   FTypeMethodDefaults.Free;
   FExternShapes.Free;
   FModuleLocalNames.Free;
+  FTypesWithCtorDtor.Free;
 
   inherited Destroy;
 end;
@@ -857,6 +866,7 @@ begin
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
   FModuleLocalNames.Clear;
+  FTypesWithCtorDtor.Clear;
   FTopLevelStmt := False;
 
   try
@@ -930,6 +940,7 @@ begin
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
   FModuleLocalNames.Clear;
+  FTypesWithCtorDtor.Clear;
   FTopLevelStmt := False;
 
   try
@@ -1462,8 +1473,17 @@ begin
         end;
       end
       else
+      begin
         Result := Memoize('TypeDecl', @ParseTypeDecl);
-    ttUnionDecl: Result := Memoize('UnionDecl', @ParseUnionDecl);
+        NoteTypeCtorDtor(Result);
+        if not AtModuleLevel then RefuseNonModuleLevelType(Result);
+      end;
+    ttUnionDecl:
+    begin
+      Result := Memoize('UnionDecl', @ParseUnionDecl);
+      NoteTypeCtorDtor(Result);
+      if not AtModuleLevel then RefuseNonModuleLevelType(Result);
+    end;
     ttRandomize: Result := Memoize('RandomizeStatement', @ParseRandomizeStatement);
     ttWithBlock: Result := ParseWith;
     ttNamespaceBlock: Result := Memoize('NamespaceDecl', @ParseNamespaceDecl);
@@ -3943,7 +3963,13 @@ begin
     if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
     if AtEndNamespace then Break;
     PrevIdx := Context.CurrentIndex;
+    // ⭐ A NAMESPACE BODY IS MODULE LEVEL. It is not a block: fbc lets a TYPE declared inside one have
+    // methods, a constructor and a destructor, exactly as at the top of the file - only a PROCEDURE
+    // body or a BLOCK (Scope, If, a loop) refuses them. Marking it here is what keeps the rule in
+    // RefuseNonModuleLevelType from refusing a program fbc compiles.
+    FTopLevelStmt := True;
     Stmt := ParseStatement;
+    FTopLevelStmt := False;
     if Assigned(Stmt) then
       Result.AddChild(Stmt)
     else if Context.CurrentIndex = PrevIdx then
@@ -10168,6 +10194,72 @@ begin
       // unstated one, so nothing else moves.
       NoteExternShape(Nm, Shape);
   end;
+end;
+
+procedure TPackratParser.NoteTypeCtorDtor(Node: TASTNode);
+// Remember a type that declares a constructor or a destructor, so a LATER type declared inside a
+// procedure can be refused for having a field of it, or extending it.
+begin
+  if (Node = nil) or (Node.NodeType <> antTypeDecl) then Exit;
+  if (Node.Attributes.Values['ACCESSCONSTRUCTOR'] <> '') or
+     (Node.Attributes.Values['ACCESSDESTRUCTOR'] <> '') then
+    if FTypesWithCtorDtor.IndexOf(UpperCase(VarToStr(Node.Value))) < 0 then
+      FTypesWithCtorDtor.Add(UpperCase(VarToStr(Node.Value)));
+end;
+
+procedure TPackratParser.RefuseNonModuleLevelType(Node: TASTNode);
+// ⛔ A TYPE DECLARED INSIDE A PROCEDURE OR A BLOCK MAY NOT NEED A CONSTRUCTOR, A DESTRUCTOR OR A
+// METHOD. fbc: "error 263: Objects with default [con|de]structors or methods are only allowed in the
+// module level" - such a member would be a nested procedure, and FreeBASIC has none. A plain POD is
+// fine and stays fine, and so is a type declared inside a NAMESPACE, which IS module level.
+//
+// The five triggers, read off the fbc suite's own 15-test family and then checked against the oracle
+// one spelling at a time:
+//   - any method at all: Sub, Function, Static Sub/Function, Constructor, Destructor, Property, Operator
+//   - a var-len STRING field (it is what gives the type an implicit ctor/dtor); a FIXED-length string,
+//     an array field, a pointer field and a nested POD are all fine
+//   - a field whose type declares a constructor or a destructor
+//   - EXTENDS a type that declares one, or EXTENDS OBJECT
+var
+  i: Integer;
+  Fld: TASTNode;
+  Ext, TypeNm, Why: string;
+begin
+  if (Node = nil) or (Node.NodeType <> antTypeDecl) then Exit;
+  Why := '';
+  if Node.Attributes.Values['HASMEMBERPROC'] = '1' then
+    Why := 'it declares a method'
+  else
+  begin
+    Ext := UpperCase(Node.Attributes.Values['EXTENDS']);
+    if Ext = 'OBJECT' then
+      Why := 'it extends OBJECT'
+    else if (Ext <> '') and (FTypesWithCtorDtor.IndexOf(Ext) >= 0) then
+      Why := 'it extends ' + Ext + ', which declares a constructor or a destructor'
+    else
+      for i := 0 to Node.ChildCount - 1 do
+      begin
+        Fld := Node.GetChild(i);
+        if (Fld = nil) or (Fld.NodeType <> antIdentifier) or (Fld.ChildCount < 1) then Continue;
+        if Fld.GetChild(0).NodeType <> antIdentifier then Continue;
+        TypeNm := UpperCase(VarToStr(Fld.GetChild(0).Value));
+        if (TypeNm = 'STRING') and (Fld.Attributes.Values['FIXEDLEN'] = '') then
+        begin
+          Why := 'its field ' + UpperCase(VarToStr(Fld.Value)) + ' is a var-len string';
+          Break;
+        end;
+        if FTypesWithCtorDtor.IndexOf(TypeNm) >= 0 then
+        begin
+          Why := 'its field ' + UpperCase(VarToStr(Fld.Value)) + ' is a ' + TypeNm +
+                 ', which declares a constructor or a destructor';
+          Break;
+        end;
+      end;
+  end;
+  if Why <> '' then
+    HandleError(Format('Type %s cannot be declared here: %s, and a type that needs a constructor, ' +
+      'a destructor or a method is only allowed at module level',
+      [UpperCase(VarToStr(Node.Value)), Why]), Node.Token);
 end;
 
 procedure TPackratParser.CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
