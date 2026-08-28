@@ -298,6 +298,13 @@ type
     FTypeConstMembers: TStringList;      // CONST declared INSIDE a TYPE: "TYPE.NAME" (UPPER)
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
+    // ⭐ "ENUM.MEMBER" (UPPER) -> the member's VALUE. An enum member is a compile-time CONSTANT in
+    // FreeBASIC, and this VM backed it with a global scalar under its BARE name: "E.B" was rewritten
+    // to a bare "B" and read whatever that name meant by then. So an ordinary "Dim B" shadowed it
+    // ("Print E.B" answered 1 for a member worth 7) and a SECOND enum declaring the same member name
+    // took the first one's storage ("E1.X, E2.X" answered 5 5 for 3 and 5). Qualified by the enum it
+    // belongs to, and folded to an immediate, both stop being possible.
+    FEnumQualVals: TStringList;
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
     FFixedStrNames: TStringList;         // names DIM'd as a FIXED-LENGTH ZSTRING/WSTRING ("ZString * n").
                                          // Collected before the @-taken pass so STRPTR/SADD of one can be
@@ -787,6 +794,7 @@ type
     function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode;
                              ToSingle: Boolean = False);   // Src3 bits: 1=unsigned src, 2=to binary32
+    function FoldEnumMemberExpr(Node: TASTNode; const EnumName: string; out V: Int64): Boolean;
     function ApplyNarrowCode(W: Integer; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow by an explicit width code
     procedure ElideRedundantNarrows;                         // a narrowing that cannot change its operand
     procedure ScanMultiDimArrays(Node: TASTNode);            // names ever given >1 dimension
@@ -1357,6 +1365,8 @@ begin
   FEnumNames := TStringList.Create;
   FEnumNames.CaseSensitive := False;
   FEnumMemberType := TStringList.Create;
+  FEnumQualVals := TStringList.Create;
+  FEnumQualVals.CaseSensitive := False;
   FEnumMemberType.CaseSensitive := False;
   FVarEnumType := TStringList.Create;
   FVarEnumType.CaseSensitive := False;
@@ -1488,6 +1498,7 @@ begin
   FTypeConstMembers.Free;
   FEnumNames.Free;
   FEnumMemberType.Free;
+  FEnumQualVals.Free;
   FVarEnumType.Free;
   FFixedStrNames.Free;
   FVarDeclTypeName.Free;
@@ -29936,6 +29947,66 @@ begin
     CollectTypeConsts(Node.GetChild(i));
 end;
 
+function TSSAGenerator.FoldEnumMemberExpr(Node: TASTNode; const EnumName: string;
+  out V: Int64): Boolean;
+// Fold one ENUM member's value expression. It is either a literal or an expression over members of
+// the SAME enum already computed - "B" with no "=" is written by the parser as "A + 1".
+// ⛔ The identifiers are SUBSTITUTED and the ordinary folder is then asked, rather than a second
+// operator table being written here. A second copy of the same knowledge is how this VM has been
+// bitten before, and the operators an enum initialiser may use are exactly the ones it already knows.
+var
+  Work: TASTNode;
+
+  procedure Substitute(N: TASTNode);
+  var
+    j, Idx: Integer;
+    Ch: TASTNode;
+  begin
+    if N = nil then Exit;
+    for j := 0 to N.ChildCount - 1 do
+    begin
+      Ch := N.GetChild(j);
+      if (Ch <> nil) and (Ch.NodeType = antIdentifier) then
+      begin
+        Idx := FEnumQualVals.IndexOfName(EnumName + '.' + UpperCase(VarToStr(Ch.Value)));
+        if Idx >= 0 then
+        begin
+          Ch.NodeType := antLiteral;
+          // ⛔ AN INT64, NOT ITS TEXT. The folder's literal arm declines on "not VarIsNumeric", and a
+          // Variant holding the STRING '3' is not numeric - so every member written as an expression
+          // ("B" with no "=", which the parser emits as "A + 1") silently failed to fold and fell back
+          // to the bare-name read. It LOOKED right, because the bare name usually still holds the
+          // value; it only showed up with a second enum declaring the same member name.
+          Ch.Value := StrToInt64Def(FEnumQualVals.ValueFromIndex[Idx], 0);
+        end;
+      end
+      else
+        Substitute(Ch);
+    end;
+  end;
+
+var
+  Idx0: Integer;
+begin
+  Result := False;
+  V := 0;
+  if Node = nil then Exit;
+  if Node.NodeType = antIdentifier then
+  begin
+    Idx0 := FEnumQualVals.IndexOfName(EnumName + '.' + UpperCase(VarToStr(Node.Value)));
+    if Idx0 < 0 then Exit;
+    V := StrToInt64Def(FEnumQualVals.ValueFromIndex[Idx0], 0);
+    Exit(True);
+  end;
+  Work := Node.Clone;
+  try
+    Substitute(Work);
+    Result := TryFoldConstIntExpr(Work, V);
+  finally
+    Work.Free;
+  end;
+end;
+
 procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');
 // FreeBASIC ENUM members are module-wide integer constants: like a module-level CONST they must be
 // visible INSIDE SUB/FUNCTION bodies. The parser lowers an ENUM to a sequence of plain assignments
@@ -29947,7 +30018,8 @@ procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode; const OwnerType: stri
 var
   i, k, ai: Integer;
   Decl: TASTNode;
-  VNameU: string;
+  VNameU, QKey: string;
+  EnumVal: Int64;
 begin
   if Node = nil then Exit;
   // The enum's NAME is recorded in both dialects: it is what lets "MyEnum.option1" resolve to the member
@@ -29955,6 +30027,23 @@ begin
   if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') and
      (FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
     FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+  // ⭐ ...AND EACH MEMBER'S VALUE UNDER "ENUM.MEMBER". Members are evaluated in source order, because
+  // that is how the parser writes an implicit one: "B" with no "=" comes out as "A + 1", naming the
+  // PREVIOUS member. Both dialects, and before the CLASSIC exit below: the qualified spelling is read
+  // by the same routine in both.
+  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antAssignment) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(0).NodeType = antIdentifier) then
+      begin
+        QKey := UpperCase(VarToStr(Node.Value)) + '.' + UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (FEnumQualVals.IndexOfName(QKey) < 0) and
+           FoldEnumMemberExpr(Decl.GetChild(1), UpperCase(VarToStr(Node.Value)), EnumVal) then
+          FEnumQualVals.Values[QKey] := IntToStr(EnumVal);
+      end;
+    end;
   if not FModernMode then
   begin
     for i := 0 to Node.ChildCount - 1 do
@@ -35596,8 +35685,8 @@ procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValu
 // Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot). If the
 // member is not a field but a (no-arg) method of the object's type, lower a method call.
 var
-  TypeName, NestedT, MethodLbl, SMBack: string;
-  UDTIdx, Slot: Integer;
+  TypeName, NestedT, MethodLbl, SMBack, QualKey: string;
+  UDTIdx, Slot, QualIdx: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
   Op: TSSAOpCode;
@@ -35614,6 +35703,21 @@ begin
   if ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antMemberAccess)) and
      (FEnumNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
   begin
+    // ⛔ ...BUT "E.B" IS NOT "B". The comment above states the assumption this arm was built on - that
+    // a member is a module-wide constant under its bare name - and it is the assumption that fails:
+    // an ordinary "Dim B" takes that name (Print E.B answered 1 for a member worth 7) and a SECOND
+    // enum declaring the same member name takes the FIRST one's storage (E1.X / E2.X answered 5 5
+    // where fbc answers 3 5). A member is a compile-time CONSTANT in FreeBASIC, so the qualified
+    // spelling answers with the value the enum it names gave it, and nothing can shadow a constant.
+    QualKey := UpperCase(VarToStr(Node.GetChild(0).Value)) + '.' + UpperCase(VarToStr(Node.Value));
+    QualIdx := FEnumQualVals.IndexOfName(QualKey);
+    if QualIdx >= 0 then
+    begin
+      Result := MakeSSAConstInt(StrToInt64Def(FEnumQualVals.ValueFromIndex[QualIdx], 0));
+      Exit;
+    end;
+    // Not foldable (a member whose initialiser this pass could not evaluate): the bare name is still
+    // the historic answer, and it is right whenever nothing shadows it.
     AccNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
     try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
     Exit;
@@ -38544,6 +38648,7 @@ begin
   // registry. Moving it one pass later left an enum FIELD banked as a float while the enum VARIABLE
   // was already right - the guard found that, which is the whole point of writing one.
   FEnumNames.Clear;
+  FEnumQualVals.Clear;
   CollectEnumNames(AST);
   RegisterUDTs(AST);
   CheckOverrideAnnotations;   // MODERN: OVERRIDE/FINAL, once every TYPE is known

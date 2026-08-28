@@ -179,7 +179,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `type<T>(args)` / `T(args)` / `= (a,b,c)` | ✓ | Anonymous UDT temporary with an explicit type; aggregate/tuple initialisation of a constructor-less UDT, including array-of-UDT `{(a,b), (c,d)}` |
 | `OPTION BASE 1` | ✓ | Default lower bound for a bare-upper-bound array `DIM a(n)` → `a(1..n)` |
 | `OPTION DIGITS n\|EXACT` | ✓ | Significant digits `PRINT` shows for a float; `EXACT`/`ALL` = every digit the value has (**SedaiBasic extension**, no FreeBASIC equivalent — see [Numeric output](#numeric-output-and-option-digits-sedaibasic-extension)) |
-| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type |
+| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type. ⚠️ A SedaiBasic extension: `fbc` 1.10.1 refuses this spelling (`error 17`) — see `job/markdown/DIVERGENZE.md`. |
 | `LPRINT` / `LPOS(n)` | ✓ | Line-printer output (routed to stdout) / head column (always 1 — no printer) |
 | `SETENVIRON` / `ENVIRON$` | ✓ | Set / read an environment variable (SETENVIRON sets a VM-internal override) |
 | `SHELL cmd` | ✓ | Run a command via the platform shell (cmd.exe / /bin/sh); returns the exit code |
@@ -1736,7 +1736,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
+| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment). A member named through its enum (`E.member`) is a compile-time CONSTANT: an ordinary variable of the same name cannot shadow it, and two enums may declare the same member name. The BARE name stays an ordinary module-wide value, which an explicit `DIM` may shadow — as `fbc` does. |
 | `TYPE...END TYPE` | ✓ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). `EXTENDS Object` RTTI + `IS`. Static member methods & variables. Explicit `DECLARE [VIRTUAL\|ABSTRACT\|STATIC]` and `OVERRIDE` accepted (virtual dispatch is automatic via runtime type-id). Field default values (`x AS Integer = 10`, applied on every scalar/nested instantiation, overridden by aggregate init). Fixed-size array members (`DIM data(100) AS Integer`) are auto-sized at construction; `Any` members size via `REDIM`. `OPERATOR` overloads dispatch with a non-UDT right operand (`vec * scalar`). |
 | `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
