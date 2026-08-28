@@ -1682,7 +1682,8 @@ var
           // storages; every place that asks "is this name a macro?" has to ask both.
           if (Defs.IndexOfName(nm) >= 0) or
              ((FnDefs <> nil) and (FnDefs.IndexOfName(nm) >= 0)) or
-             ((GPPReserved <> nil) and (GPPReserved.IndexOf(nm) >= 0)) or
+             ((GPPReserved <> nil) and (GPPReserved.IndexOfName(nm) >= 0) and
+              (Pos('q', GPPReserved.Values[nm]) = 0)) or
              SourceDeclaresSymbol(nm) then
             Toks.Add('1')
           else
@@ -2330,8 +2331,29 @@ var
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
     BlockCmt, PrevBlockCmt: Integer;   // depth of the /' ... '/ block comment we are inside
+    ScopeDepth: Integer;    // block nesting, for the level a #pragma reserve was made at
+    DirWord: string;        // the leading word of the line, for that same counter
     SavedStackTop: Integer;
     ContJoin, CutPos: Integer;   // '_'-continued physical lines folded into this logical one
+  // The block-scope openers "#pragma reserve" counts levels with. Nothing else reads them.
+  function BlockCloser(const S: string): Boolean;
+  var W: string;
+  begin
+    W := Trim(S);
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    Result := (W = 'SCOPE') or (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
+              (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') or (W = 'NAMESPACE');
+  end;
+
+  function BlockOpener(const S: string): Boolean;
+  var W: string;
+  begin
+    W := Trim(S);
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    if Pos('(', W) > 0 then W := Copy(W, 1, Pos('(', W) - 1);
+    Result := BlockCloser(W);
+  end;
+
   // ⛔ A DIRECTIVE INSIDE A /' ... '/ BLOCK COMMENT IS NOT A DIRECTIVE. This preprocessor reads the
   // file LINE BY LINE and knew nothing about block comments, so an "#error" written inside one FIRED
   // and refused the program - fbc's own comments/multiline is built on exactly that, four times over.
@@ -2370,6 +2392,7 @@ var
   begin
     SavedStackTop := High(Active);   // remember depth so includes can't leak unbalanced conditionals
     BlockCmt := 0;
+    ScopeDepth := 0;
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
@@ -2383,6 +2406,22 @@ var
         // LEXER knows block comments and will drop them; what must not happen is a DIRECTIVE firing.
         PrevBlockCmt := BlockCmt;
         ScanBlockComment(Raw, BlockCmt);
+        // SCOPE nesting, for #pragma reserve: only that directive reads it, and only to tell a repeat
+        // at the SAME level from one made INSIDE a nested scope - which fbc accepts.
+        // BLOCK-SCOPE nesting, for "#pragma reserve" alone: it is the only directive that reads it,
+        // and only to tell a repeat at the SAME level (which fbc refuses) from one made INSIDE a
+        // nested block (which it accepts - its own pragma-reserve-3 re-reserves the same name in a
+        // SCOPE and again inside a SUB). ⛔ A procedure body is a nested block too: counting only
+        // SCOPE left the reserve inside "sub proc()" at level 0 and refused a legal program.
+        // A one-line "Sub s() : ... : End Sub" opens and closes on the same line, so the closing form
+        // is looked for on the line before deciding.
+        DirWord := UpperCase(Copy(Trimmed, 1, 20));
+        if (Copy(DirWord, 1, 4) = 'END ') then
+        begin
+          if BlockCloser(Copy(DirWord, 5, MaxInt)) and (ScopeDepth > 0) then Dec(ScopeDepth);
+        end
+        else if BlockOpener(DirWord) and (Pos(' : END ', ' ' + UpperCase(Trimmed) + ' ') = 0) then
+          Inc(ScopeDepth);
         if PrevBlockCmt > 0 then
         begin
           if Emitting then Output.Add(Raw) else Output.Add('');
@@ -2484,7 +2523,8 @@ var
             Cond := ParentEmit and ((Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
                                     (FnDefs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
                                     ((GPPReserved <> nil) and
-                                     (GPPReserved.IndexOf(UpperCase(Trim(DRest))) >= 0)));
+                                     (GPPReserved.IndexOfName(UpperCase(Trim(DRest))) >= 0) and
+                                     (Pos('q', GPPReserved.Values[UpperCase(Trim(DRest))]) = 0)));
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -2494,7 +2534,8 @@ var
             Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
                                    (FnDefs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
                                    ((GPPReserved = nil) or
-                                    (GPPReserved.IndexOf(UpperCase(Trim(DRest))) < 0));
+                                    (GPPReserved.IndexOfName(UpperCase(Trim(DRest))) < 0) or
+                                    (Pos('q', GPPReserved.Values[UpperCase(Trim(DRest))]) > 0));
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -2766,11 +2807,48 @@ var
             // themselves with #error otherwise. Reserving is ALL it does here: there is no symbol table
             // at this stage to keep the name out of, and the only observable half of the feature is
             // exactly the one defined() asks for.
-            else if Copy(MacroName, 1, 8) = 'RESERVE ' then
+            else if Copy(MacroName, 1, 7) = 'RESERVE' then
             begin
-              MacroVal := Trim(Copy(MacroName, 9, MaxInt));
-              if (MacroVal <> '') and (GPPReserved <> nil) and
-                 (GPPReserved.IndexOf(MacroVal) < 0) then GPPReserved.Add(MacroVal);
+              // "#pragma reserve [(qual,...)] NAME".
+              // ⛔⛔ A SECOND RESERVATION OF THE SAME NAME AT THE SAME LEVEL IS AN ERROR, WHATEVER THE
+              // LIST SAYS. The first attempt here compared the attribute lists as SETS and allowed an
+              // identical repeat - an invention: the ORACLE refuses "#pragma reserve N" twice at module
+              // level with "error 4: Duplicated definition", and refuses "(extern,asm)" followed by
+              // "(asm,extern)" just the same. It was found by blessing the guard, which is the only
+              // reason the rule is not still shipped for the wrong reason.
+              // ⭐ What test 3 of fbc's own family really shows is a NESTING rule: reserving the name
+              // again inside a SCOPE is accepted. So the reservation carries the scope DEPTH it was
+              // made at, and only a repeat at that depth or shallower is refused.
+              MacroVal := Trim(Copy(MacroName, 8, MaxInt));
+              DirWord := '';
+              // ⛔ AND ONLY AN UNQUALIFIED RESERVATION MAKES THE NAME defined(). A qualified one
+              // reserves it in ANOTHER namespace - the assembler's, the linker's - so the program can
+              // still declare it (fbc's pragma-reserve-12/13) and defined() answers FALSE for it. Said
+              // by the oracle while blessing this guard: the qualified pair printed nothing where we
+              // printed "defined". The mark rides in the stored value, so the duplicate check below
+              // still sees every reservation whatever its list.
+              if (MacroVal <> '') and (MacroVal[1] = '(') then
+              begin
+                q := Pos(')', MacroVal);
+                if q > 0 then
+                begin
+                  MacroVal := Trim(Copy(MacroVal, q + 1, MaxInt));
+                  DirWord := 'q';
+                end;
+              end;
+              if (MacroVal <> '') and (GPPReserved <> nil) then
+              begin
+                q := GPPReserved.IndexOfName(MacroVal);
+                if q >= 0 then
+                begin
+                  if StrToIntDef(StringReplace(GPPReserved.ValueFromIndex[q], 'q', '',
+                                 [rfReplaceAll]), 0) >= ScopeDepth then
+                    raise EPreprocessorError.Create('Duplicated definition, ' + MacroVal +
+                      ' is already reserved at this level');
+                end
+                else
+                  GPPReserved.Values[MacroVal] := DirWord + IntToStr(ScopeDepth);
+              end;
             end;
           end
           else if (DName = 'print') and Emitting then
@@ -2982,8 +3060,8 @@ begin
   // name of the ENCLOSING PROCEDURE, which only the parser knows, and it already substitutes them.
   // They belong in the reserved set for exactly that reason - "#ifndef __FUNCTION__ : #error" is in
   // fbc's own pp/intrinsic, a program it accepts, and we refused it.
-  GPPReserved.Add('__FUNCTION__');
-  GPPReserved.Add('__FUNCTION_NQ__');
+  GPPReserved.Values['__FUNCTION__'] := '';
+  GPPReserved.Values['__FUNCTION_NQ__'] := '';
     Expand(Src, BaseDir);
     Result := Output.Text;
   finally
