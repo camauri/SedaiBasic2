@@ -1209,6 +1209,7 @@ var
   ErrorToken: TLexerToken;
   SavedIndex: integer;
   AtModuleLevel: Boolean;
+  DeclDecoU: string;      // the word right after a module-level DECLARE, if it is a member decorator
 begin
   Result := nil;
   // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
@@ -1299,6 +1300,22 @@ begin
 
  if (Token.TokenType = ttIdentifier) and (UpperCase(Token.Value) = 'DECLARE') then
  begin
+   // ⛔ A DECLARE OUTSIDE A TYPE TAKES NO LEADING DECORATOR AT ALL. VIRTUAL, ABSTRACT, STATIC and a
+   // leading CONST describe a MEMBER of a type, and outside one fbc refuses every one of them on its
+   // own, not only in combination ("error 17: Syntax error, found 'virtual'"). Probed one word at a
+   // time against the oracle - and against SUB, FUNCTION, PROPERTY and CONSTRUCTOR alike, since the
+   // answer could have differed per procedure kind and does not.
+   // ⚠️ Only these four: OVERRIDE and FINAL are MODERN extensions of ours, so fbc has no opinion to
+   // copy and they are left alone. The forward declaration itself stays a no-op - our calls resolve
+   // from a pre-pass over the real definitions - so this adds a refusal and changes nothing else.
+   if FModernMode and Assigned(Context.PeekNext) then
+   begin
+     DeclDecoU := UpperCase(VarToStr(Context.PeekNext.Value));
+     if (DeclDecoU = 'VIRTUAL') or (DeclDecoU = 'ABSTRACT') or (DeclDecoU = 'STATIC') or
+        (DeclDecoU = 'CONST') then
+       HandleError(Format('"%s" describes a member of a TYPE: a DECLARE outside a type body cannot ' +
+         'carry it', [DeclDecoU]), Context.PeekNext);
+   end;
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
    Result := nil;
    Exit;
@@ -4211,11 +4228,13 @@ procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAcce
 //   FTypeStaticMethods "TYPE.NAME"    -> NAME is a static member (no implicit THIS).
 var
   DecoU, MethName, MethKey, Key: string;
+  DecoCount: Integer;   // how many of ABSTRACT/STATIC/VIRTUAL/leading-CONST this declaration carries
   IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
 begin
   IsAbstract := ForceAbstract;   // MODERN: every method of an INTERFACE is abstract by construction
+  DecoCount := 0;
   IsStatic := False;
   IsVirtual := False;
   IsOverride := False;
@@ -4230,6 +4249,18 @@ begin
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC') do
   begin
     DecoU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    // ⛔ AT MOST ONE OF THE FOUR. ABSTRACT, STATIC, VIRTUAL and a LEADING CONST each declare a
+    // different KIND of member, and fbc refuses every pair of them ("error 17"): abstract+virtual and
+    // virtual+static are contradictions, and a CONST qualifier belongs AFTER the parameter list, so a
+    // leading one beside another decorator is a syntax error rather than a redundancy. Each one ALONE
+    // stays legal - all four were probed alone before this counted them.
+    if (DecoU = 'ABSTRACT') or (DecoU = 'STATIC') or (DecoU = 'VIRTUAL') or (DecoU = 'CONST') then
+    begin
+      Inc(DecoCount);
+      if FModernMode and (DecoCount > 1) then
+        HandleError(Format('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and ' +
+          'a leading CONST, and this one also says "%s"', [DecoU]), Context.CurrentToken);
+    end;
     if DecoU = 'ABSTRACT' then IsAbstract := True
     else if DecoU = 'STATIC' then IsStatic := True
     // ⭐ VIRTUAL was read and thrown away, and that is what made every method virtual by default -
@@ -4243,6 +4274,15 @@ begin
     else if DecoU <> 'CONST' then Break;
     Context.Advance;
   end;
+  // ⛔ ...AND THE LEADING CONST DOES NOT REACH THE LOOP AT ALL: CONST is a RESERVED WORD, so it is not
+  // a ttIdentifier and the loop's own condition stops in front of it. The pair is therefore judged
+  // here, where the decorator run has ended and the word is still ahead - which is also why the
+  // "<> 'CONST'" arm above never fires. "Declare Const Sub f()" ALONE stays legal (fbc compiles it);
+  // it is only const BESIDE another decorator that is the syntax error.
+  if FModernMode and (DecoCount >= 1) and
+     (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') then
+    HandleError('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and a leading ' +
+      'CONST, and this one also says "CONST"', Context.CurrentToken);
   MethName := '';
   if Context.Check(ttProcedureStart) then
   begin
