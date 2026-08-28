@@ -561,6 +561,7 @@ type
     procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
     procedure EmitModuleDestructors(UseSlots: Boolean = False);  // V5b/V5e: dtor calls for globals at program end
     procedure CollectModuleCtorDtors(Node: TASTNode);  // FB module constructor/destructor procs
+    procedure OrderModuleCtorDtorList(L: TStringList);  // ...into the order fbc runs them in
     procedure EmitModuleConstructors;    // FB: call module constructors before module-level code
     procedure EmitModuleProcDestructors; // FB: call module destructors at program end
                                                         //   UseSlots=True (END-in-proc): read handles from reserved slots
@@ -29072,15 +29073,67 @@ begin
   begin
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
     begin
+      // ⭐ ...AND THE PRIORITY IT WAS GIVEN. "Sub f Constructor 101" states WHEN among the module
+      // constructors this one runs, and the number was parsed (MODPRIORITY) and read by nobody, so
+      // every module ctor ran in declaration order. See OrderModuleCtorDtorList for the rule.
       if Node.Attributes.Values['MODCTOR'] = '1' then
-        FModuleCtors.Add(VarToStr(Node.GetChild(0).Value))
+        FModuleCtors.AddObject(VarToStr(Node.GetChild(0).Value),
+                               TObject(PtrInt(StrToIntDef(Node.Attributes.Values['MODPRIORITY'], 0))))
       else if Node.Attributes.Values['MODDTOR'] = '1' then
-        FModuleDtors.Add(VarToStr(Node.GetChild(0).Value));
+        FModuleDtors.AddObject(VarToStr(Node.GetChild(0).Value),
+                               TObject(PtrInt(StrToIntDef(Node.Attributes.Values['MODPRIORITY'], 0))));
     end;
     Exit;   // do not descend into the procedure body
   end;
   for c := 0 to Node.ChildCount - 1 do
     CollectModuleCtorDtors(Node.GetChild(c));
+end;
+
+procedure TSSAGenerator.OrderModuleCtorDtorList(L: TStringList);
+// Put a module ctor/dtor list into the order fbc RUNS it in. Measured against fbc 1.10.1, one
+// spelling at a time, before a line of this was written:
+//   Constructor: the ones WITH a priority first, ASCENDING (101 before 105), then the ones WITHOUT a
+//                priority, in declaration order. Equal priorities keep declaration order.
+//   Destructor:  the exact REVERSE of that same list - which is what the caller already does, because
+//                EmitModuleProcDestructors walks the list backwards.
+// ⛔ The sort has to be STABLE (two ctors with priority 101 run in declaration order, checked), so it
+// is built by two passes rather than handed to CustomSort, which promises nothing about ties.
+var
+  Ordered: TStringList;
+  i, j, BestIdx, BestPrio, Prio: Integer;
+  Taken: array of Boolean;
+begin
+  if (L = nil) or (L.Count < 2) then Exit;
+  Ordered := TStringList.Create;
+  try
+    SetLength(Taken, L.Count);
+    for i := 0 to L.Count - 1 do Taken[i] := False;
+    // pass 1: everything WITH a priority, smallest first, declaration order among equals
+    repeat
+      BestIdx := -1; BestPrio := 0;
+      for j := 0 to L.Count - 1 do
+      begin
+        if Taken[j] then Continue;
+        Prio := Integer(PtrInt(L.Objects[j]));
+        if Prio <= 0 then Continue;                       // no priority stated
+        if (BestIdx < 0) or (Prio < BestPrio) then
+        begin
+          BestIdx := j; BestPrio := Prio;
+        end;
+      end;
+      if BestIdx >= 0 then
+      begin
+        Ordered.AddObject(L[BestIdx], L.Objects[BestIdx]);
+        Taken[BestIdx] := True;
+      end;
+    until BestIdx < 0;
+    // pass 2: everything WITHOUT one, in declaration order
+    for j := 0 to L.Count - 1 do
+      if not Taken[j] then Ordered.AddObject(L[j], L.Objects[j]);
+    L.Assign(Ordered);
+  finally
+    Ordered.Free;
+  end;
 end;
 
 procedure TSSAGenerator.EmitModuleConstructors;
@@ -38817,6 +38870,8 @@ begin
   FModuleCtors.Clear;
   FModuleDtors.Clear;
   CollectModuleCtorDtors(AST);
+  OrderModuleCtorDtorList(FModuleCtors);
+  OrderModuleCtorDtorList(FModuleDtors);
 
   // FreeBASIC DEFINT/DEFSTR...: collect default-type-by-initial BEFORE pre-allocating variables,
   // so a bare name gets its DEF bank (PreAllocateVariables binds via GetVariableType).
