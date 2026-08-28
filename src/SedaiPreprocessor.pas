@@ -2331,8 +2331,17 @@ var
         // list is split - and fbc stops honouring it once the ')' has been seen: "#macro M(x) _"
         // followed by two body lines runs BOTH of them. Joined generically, the first body line was
         // swallowed into the header and lost, so the macro ran one statement short and said nothing.
+        // ⛔ ...AND A "#macro" LINE CONTINUES LIKE ANY OTHER, WHATEVER ITS PARAMETER LIST IS DOING.
+        // This used to stop the join once the list was closed - or once it was clear there was none -
+        // because joining swallowed the first BODY line. That was the wrong half to fix: fbc's join is
+        // at TOKEN level, so what follows the parameter list on the joined line simply IS the first
+        // body line, and the #macro handler below now takes it as one. With the join stopped instead,
+        // a header whose parameter list is written on the NEXT line was never seen at all -
+        // "#macro gen _" / "( _" / "a, _" / ... - and fbc's own suite writes nine files that way
+        // (structs/udt-ops-*, udt-comp-ops-*, udt-*string/conversion): the macro came out OBJECT-like,
+        // its call "gen( 1, 2 )" was read as an expression, and the whole FILE died on
+        // 'Expected ")" after expression'. All three shapes now go through one rule.
         while (Length(Trimmed) > 0) and (Trimmed[1] = '#') and PPDirectiveContinues(Trimmed) and
-              (not PPMacroHeaderComplete(Trimmed)) and
               (li + 1 < Lines.Count) do
         begin
           Trimmed := TrimRight(StripDirectiveComment(Trimmed));
@@ -2509,7 +2518,13 @@ var
               while (q <= Length(DRest)) and (DRest[q] <> ')') do Inc(q);
               Params := Trim(Copy(DRest, p + 1, q - p - 1));
             end;
-            MacroBody := '';
+            // ⭐ WHAT IS LEFT ON THE HEADER LINE IS THE FIRST BODY LINE. fbc joins '_'-continued lines
+            // at token level, so "#macro m( x ) _" followed by a statement puts that statement on the
+            // macro's own line - and it belongs to the BODY, not to the header. Same for a
+            // parameterless "#macro m _" followed by one. Nothing is left over for a header written on
+            // one line, which is every ordinary macro.
+            if IsFn then MacroBody := Trim(StripDirectiveComment(Copy(DRest, q + 1, MaxInt)))
+            else MacroBody := Trim(StripDirectiveComment(Copy(DRest, p, MaxInt)));
             Inc(li);
             while li < Lines.Count do
             begin
