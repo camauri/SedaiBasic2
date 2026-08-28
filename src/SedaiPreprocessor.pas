@@ -2329,10 +2329,47 @@ var
     MappedModule: string;
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
+    BlockCmt, PrevBlockCmt: Integer;   // depth of the /' ... '/ block comment we are inside
     SavedStackTop: Integer;
     ContJoin, CutPos: Integer;   // '_'-continued physical lines folded into this logical one
+  // ⛔ A DIRECTIVE INSIDE A /' ... '/ BLOCK COMMENT IS NOT A DIRECTIVE. This preprocessor reads the
+  // file LINE BY LINE and knew nothing about block comments, so an "#error" written inside one FIRED
+  // and refused the program - fbc's own comments/multiline is built on exactly that, four times over.
+  // Block comments NEST, and a line comment neutralises an opener that follows it on the same line
+  // ("' /'" opens nothing - that file tests it too).
+  procedure ScanBlockComment(const S: string; var Depth: Integer);
+  var
+    k: Integer;
+    InStr: Boolean;
+  begin
+    InStr := False;
+    k := 1;
+    while k <= Length(S) do
+    begin
+      if Depth = 0 then
+      begin
+        if S[k] = '"' then InStr := not InStr
+        else if not InStr then
+        begin
+          if (k < Length(S)) and (S[k] = '/') and (S[k + 1] = '''') then
+          begin Inc(Depth); Inc(k, 2); Continue; end;
+          if S[k] = '''' then Exit;                       // a line comment: nothing after it opens one
+        end;
+      end
+      else
+      begin
+        if (k < Length(S)) and (S[k] = '/') and (S[k + 1] = '''') then
+        begin Inc(Depth); Inc(k, 2); Continue; end;
+        if (k < Length(S)) and (S[k] = '''') and (S[k + 1] = '/') then
+        begin Dec(Depth); Inc(k, 2); Continue; end;
+      end;
+      Inc(k);
+    end;
+  end;
+
   begin
     SavedStackTop := High(Active);   // remember depth so includes can't leak unbalanced conditionals
+    BlockCmt := 0;
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
@@ -2341,6 +2378,17 @@ var
       begin
         Raw := Lines[li];
         Trimmed := TrimLeft(Raw);
+        // The depth is updated for THIS line first, so a line that OPENS a comment is still read as
+        // code up to the "/'", and every line while we are inside is passed through untouched - the
+        // LEXER knows block comments and will drop them; what must not happen is a DIRECTIVE firing.
+        PrevBlockCmt := BlockCmt;
+        ScanBlockComment(Raw, BlockCmt);
+        if PrevBlockCmt > 0 then
+        begin
+          if Emitting then Output.Add(Raw) else Output.Add('');
+          Inc(li);
+          Continue;
+        end;
         // __LINE__ expands to the current source line number (1-based). Updated every line so it is
         // correct wherever it appears; __FILE__ is set once (top-level file) in the begin block below.
         // __LINE__ is the same question a diagnostic asks, so it follows #line too.
