@@ -162,6 +162,7 @@ type
     procedure ScanModuleLevelExtern;
     procedure RejectEmptyAliasNames;
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
+    procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
 
@@ -1033,6 +1034,10 @@ begin
  // C128 (typing the listing: last definition wins, at the number's slot). Without this both
  // versions were lowered and the duplicated LINE_<n> label crashed the dominator pass.
  DedupNumberedLines(Result);
+
+ // ...and only now, with the whole tree in hand and every module-level EXTERN registered, can the
+ // static-storage question be asked: it needs to know whether a declaration sits inside a NAMESPACE.
+ RejectStaticVarLenStringInit(Result, False);
 
  DoNodeCreated(Result);
 end;
@@ -10152,6 +10157,94 @@ begin
   end;
 end;
 
+procedure TPackratParser.RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
+// ⭐ A VAR-LEN STRING WITH STATIC STORAGE CANNOT BE INITIALIZED - fbc's "error 87". A string
+// descriptor with static storage is filled by the runtime before main runs, and there is no place to
+// run the copy that an initializer needs; a FIXED-length one ("String * 5", "ZString * n") is plain
+// bytes and initializes fine, and so does a LOCAL var-len string, which is built on entry to its
+// procedure.
+// ⛔ THE BOUNDARY IS "STATIC STORAGE", NOT "MODULE LEVEL", and the two are not the same: a bare
+// module-level "Dim s As String = ..." is a local of the implicit main and fbc ACCEPTS it, while a
+// "Static" one inside a Sub has static storage and is refused. Measured against the oracle, one
+// spelling at a time, before this was written - reading "module level" off the test names would have
+// refused a program fbc compiles. Static storage is SHARED, STATIC, a NAMESPACE member, a dotted
+// definition of someone's member, or a name a module-level EXTERN already declared.
+var
+  i, j, k, TypeIdx, InitIdx: Integer;
+  Ch, Decl, Sub: TASTNode;
+  TypeName, Nm: string;
+  IsStatic, IsVarLenStr, HasDims: Boolean;
+begin
+  if Node = nil then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Ch := Node.GetChild(i);
+    if Ch = nil then Continue;
+    if Ch.NodeType = antNamespace then
+    begin
+      RejectStaticVarLenStringInit(Ch, True);
+      Continue;
+    end;
+    if Ch.NodeType <> antDim then
+    begin
+      RejectStaticVarLenStringInit(Ch, InNamespace);
+      Continue;
+    end;
+    for j := 0 to Ch.ChildCount - 1 do
+    begin
+      Decl := Ch.GetChild(j);
+      if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
+      if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+      // ⛔ A CONST is not a variable - a module-level one carries SHARED because it is globally
+      // VISIBLE, not because it has a descriptor to fill, and fbc initializes it happily.
+      if Decl.Attributes.Values['CONSTDECL'] = '1' then Continue;
+      // ⚠️ SCALARS ONLY, on purpose. fbc refuses "Dim Shared a(0 To 1) As String = {...}" too, and we
+      // ACCEPT it - m203 is a guard built on that acceptance. Closing the array half means deciding
+      // what happens to that guard, which is a separate question from this one; it is written down in
+      // job/markdown/DIVERGENZE.md rather than half-done here.
+      HasDims := False;
+      for k := 1 to Decl.ChildCount - 1 do
+        if Decl.GetChild(k).NodeType = antDimensions then HasDims := True;
+      if HasDims then Continue;
+      Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      IsStatic := (Decl.Attributes.Values['SHARED'] = '1') or
+                  (Decl.Attributes.Values['STATIC'] = '1') or
+                  InNamespace or (Pos('.', Nm) > 0) or
+                  (FExternShapes.IndexOfName(Nm) >= 0);
+      if not IsStatic then Continue;
+      // Split the children into "the type" and "the initializer", exactly as ShapeOfArrayDecl does:
+      // the FIRST bare identifier after the name is the type, the first child after that is the value.
+      TypeIdx := -1; InitIdx := -1;
+      for k := 1 to Decl.ChildCount - 1 do
+      begin
+        Sub := Decl.GetChild(k);
+        if Sub.NodeType = antDimensions then Continue;
+        if (TypeIdx < 0) and (Sub.NodeType = antIdentifier) then
+        begin
+          TypeIdx := k;
+          Continue;
+        end;
+        InitIdx := k;
+        Break;
+      end;
+      if InitIdx < 0 then Continue;                     // no initializer: nothing to refuse
+      Sub := Decl.GetChild(InitIdx);
+      if TypeIdx >= 0 then
+        TypeName := UpperCase(VarToStr(Decl.GetChild(TypeIdx).Value))
+      else
+        TypeName := '';
+      // A declared STRING with no "* n" capacity is var-len; with no declared type at all (VAR), the
+      // initializer being a string LITERAL is what makes it one.
+      IsVarLenStr := ((TypeName = 'STRING') and (Decl.Attributes.Values['FIXEDLEN'] = '')) or
+                     ((TypeName = '') and (Sub.NodeType = antLiteral) and Assigned(Sub.Token) and
+                      (Sub.Token.TokenType = ttStringLiteral));
+      if IsVarLenStr then
+        HandleError(Format('Var-len string %s cannot be initialized: it has static storage', [Nm]),
+                    Decl.GetChild(0).Token);
+    end;
+  end;
+end;
+
 function TPackratParser.SkipAliasClause: Boolean;
 // ⭐ ALIAS "name" IS ACCEPTED IN FIVE STATEMENTS, and it was skipped in three. A linkage alias is a
 // name for the LINKER, which a bytecode VM has none of, so every one of the five is entitled to
@@ -12107,6 +12200,19 @@ var
         Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, ItemType, ItemTypeTok));
       Decl.AddChild(ItemValue);
       if FModernMode then Decl.Attributes.Values['SHARED'] := '1';
+      // ⛔ ...AND EVERYTHING ELSE THE FIRST ITEM OF THE LIST GETS. The three callers of this routine
+      // each stamp CONSTDECL on the item they built themselves and then hand the REST to here, which
+      // stamped only SHARED: so in "Const a = 1, b = 2" the b was a shared VARIABLE - the SSA would
+      // not fold it to an immediate (it reads CONSTDECL) and assigning to it was not refused (that
+      // reads FConstNames). One path had the rule and its sibling did not; found because a new check
+      // asked "is this a CONST?" and got the wrong answer for every item after the first.
+      Decl.Attributes.Values['CONSTDECL'] := '1';
+      if FConstNames.IndexOf(UpperCase(VarToStr(ItemName.Value))) < 0 then
+        FConstNames.Add(UpperCase(VarToStr(ItemName.Value)));
+      if not Assigned(ItemTypeOfExpr) then
+        FConstTypes.Values[UpperCase(VarToStr(ItemName.Value))] := ItemType;
+      if TryConstIntExpr(ItemValue, FConstFoldVal) then
+        FConstIntValues.Values[UpperCase(VarToStr(ItemName.Value))] := IntToStr(FConstFoldVal);
       DimNode.AddChild(Decl);
     end;
   end;

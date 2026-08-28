@@ -29476,6 +29476,7 @@ var
   VNameU, TypeNameU: string;
   ElemBank: TSSARegisterType;
   ConstFoldVal, ConstStrBytes: Int64;
+  ConstNarrowW: Integer;
   ConstIsInt: Boolean;
   ConstDupIdx: Integer;   // a CONST name declared twice: the entry to withdraw
 begin
@@ -29507,6 +29508,19 @@ begin
         // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
         ConstIsInt := (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
                       TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal);
+        // ⛔ ...AND THE FOLDED VALUE STILL HAS THE DECLARED TYPE'S WIDTH. "Const xd As Byte = 200"
+        // is -56 in fbc, and it was 200 here: the fold recorded the literal and every read took it
+        // straight, so the CONST path walked past the narrowing that the identical DIM ("Dim xd As
+        // Byte = 200", which does print -56) goes through on its store. A fold that skips a
+        // conversion is not a faster answer, it is a different one.
+        if ConstIsInt then
+        begin
+          ConstNarrowW := TypeNameWidthCode(UpperCase(VarToStr(Decl.GetChild(1).Value)));
+          if ConstNarrowW = 11 then
+            ConstFoldVal := Ord(ConstFoldVal <> 0) * -1        // BOOLEAN normalises, it does not truncate
+          else
+            ConstFoldVal := NarrowConstInt(ConstFoldVal, ConstNarrowW);
+        end;
         // ⛔ ...BUT ONLY WHEN THE NAME IS DECLARED ONCE. This map is keyed by NAME with no scope, and it
         // is filled by a pre-scan over the WHOLE program, so two sibling SCOPEs each declaring "Const k"
         // left the LAST value in it - and every read of k folded to that, retroactively, including the

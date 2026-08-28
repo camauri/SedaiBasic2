@@ -1723,7 +1723,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `DIM` | ✓ | Declares a variable at the current scope. Both `DIM name AS type [= init]` and the leading-AS form `DIM [SHARED] AS type name[, ...] [= init]` (type shared by every name) are supported. Array forms: fixed `DIM a(dims) AS type`, an initializer with either sign `DIM a(dims) AS type = { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (starts at `UBOUND = -1`, sized later with `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` (size deduced from the initializer). |
-| `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported (immutability is not enforced). |
+| `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported. A typed constant carries its declared WIDTH (`CONST b AS BYTE = 200` is -56, as `fbc` gives), and every item of a comma-separated list is a constant, not only the first. Assigning to one is refused. |
 | `SCOPE` | ✓ | Begins a new scope block. |
 | `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders, with the `SHARED` and `BYREF` modifiers (`STATIC SHARED BYREF AS T r = target`). |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
@@ -1831,6 +1831,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STRING` | ✓ | Variable-length strings (`DIM AS STRING`); fixed-length `STRING * n` is parsed (advisory length). |
 | `ZSTRING` | ✓ | Null-terminated string type (`DIM AS ZSTRING [* n]`); `ZSTRING PTR` is a raw pointer to a string's bytes (see `SADD`). |
 | `WSTRING` | ✓ | Wide-character strings (UTF-8 storage, codepoint-aware LEN/MID/LEFT$/RIGHT$). Fixed-length `* n` parsed but advisory (var-length storage). |
+| var-len `STRING` initializer | ✓ | A var-len `STRING` **scalar** with STATIC storage (`SHARED`, `STATIC`, a `NAMESPACE` member, a dotted member definition, or a name a module-level `EXTERN` declared) may not be initialized, as `fbc` requires (`error 87`). A bare module-level `DIM s AS STRING = ...` is a local of the implicit main and IS allowed, as in `fbc`. ⚠️ The ARRAY form is still accepted where `fbc` refuses it — see `job/markdown/DIVERGENZE.md`. |
 
 ##### Class types
 
