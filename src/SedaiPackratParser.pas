@@ -124,6 +124,19 @@ type
     // FreeBASIC requires the declaration to precede the definition, so a single forward pass suffices.
     FTypeStaticMethods: TStringList;
     FStaticMemberProcs: TStringList;   // "TYPE.NAME" of every "Declare Static Sub|Function" seen in a TYPE body.
+    // ⭐ Every TYPE name a TYPE/UNION/CLASS declaration introduced, and every MEMBER PROCEDURE each of
+    // them DECLARED, as "TYPE.MEMBERKEY". A member may only be DEFINED out of line if its type
+    // declared it - fbc refuses "Sub UDT.g()" for a type whose body never says "Declare Sub g()" - and
+    // the two sets are needed together: without the first, a type that declared NOTHING would have no
+    // entry at all and every definition on it would pass unasked, which is exactly the case fbc
+    // refuses. The member key is MemberDecoratorKey's, the one spelling an OPERATOR's '=' survives.
+    FTypeNamesSeen: TStringList;
+    FTypeDeclaredMembers: TStringList;
+    // ⛔ ...and the types declared INSIDE A NAMESPACE, which may not be named BARE at module level:
+    // "Constructor UDT()" for a UDT that lives in "ns" is fbc's "error 160: Expected class or UDT
+    // identifier" even when the type DID declare the constructor. A separate question from the one
+    // above, with a separate answer, so a separate set.
+    FTypesInNamespace: TStringList;
     // The CONST-ness of each pointer level of the type being parsed, in SOURCE order, one character
     // per level ('1' = that level is a constant pointer). AtPointerSuffix appends to it, because that
     // predicate is the ONE place the inner CONST is recognised - all fifteen loops share it. A caller
@@ -197,6 +210,8 @@ type
     procedure CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
     procedure CheckDeclStatesItsType(Node: TASTNode);
     procedure RefuseUnwritableTarget(Node: TASTNode; const What: string);
+    procedure CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
+                                              NameTok: TLexerToken);
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -526,6 +541,9 @@ begin
   FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
+  FTypeNamesSeen := TStringList.Create;       FTypeNamesSeen.CaseSensitive := False;
+  FTypeDeclaredMembers := TStringList.Create; FTypeDeclaredMembers.CaseSensitive := False;
+  FTypesInNamespace := TStringList.Create;    FTypesInNamespace.CaseSensitive := False;
   FStaticMemberProcs := TStringList.Create;
   FStaticMemberProcs.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
@@ -555,6 +573,9 @@ begin
   FConstTypes.Free;
   FConstIntValues.Free;
   FTypeStaticMethods.Free;
+  FTypeNamesSeen.Free;
+  FTypeDeclaredMembers.Free;
+  FTypesInNamespace.Free;
   FStaticMemberProcs.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
@@ -891,6 +912,7 @@ begin
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FTypeNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
@@ -969,6 +991,7 @@ begin
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FTypeNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
@@ -3100,6 +3123,7 @@ begin
         end;
       end;
     end;
+    CheckMemberDefinitionIsDeclared(MethodType, QualName, Kind, NameTok);
     NameNode := TASTNode.CreateWithValue(antIdentifier, QualName, NameTok);
     Result.AddChild(NameNode);
   end;
@@ -4283,6 +4307,12 @@ begin
      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') then
     HandleError('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and a leading ' +
       'CONST, and this one also says "CONST"', Context.CurrentToken);
+  // ⭐ ...and once judged, the leading CONST must be CONSUMED, or the name behind it is never read.
+  // "Declare Const Sub c()" left MethName empty, so the member was declared and REGISTERED NOWHERE -
+  // which showed only when something finally asked whether the type declares it.
+  if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType = ttProcedureStart) then
+    Context.Advance;
   MethName := '';
   if Context.Check(ttProcedureStart) then
   begin
@@ -4386,6 +4416,9 @@ begin
     if IsFinal and Assigned(TypeNode) then
       TypeNode.Attributes.Values['FINAL' + MethKey] := '1';
     if Assigned(TypeNode) then StampMemberAccess(TypeNode, MethName, CurAccess);
+    // ...and record that this TYPE DECLARED this member, under the same key, so a definition can ask.
+    if Assigned(TypeNode) and (VarToStr(TypeNode.Value) <> '') then
+      FTypeDeclaredMembers.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethKey);
     // ⛔ PUBLIC ONLY, and that too is measured. A module constructor runs before the program does, so
     // fbc refuses to let a PRIVATE or PROTECTED member be one - "visibility/{private,protected}-module-
     // {ctor,dtor}" are four COMPILE_ONLY_FAIL tests of its suite, and accepting them cost exactly those
@@ -4480,6 +4513,7 @@ var
   Token, NameTok, FieldTok: TLexerToken;
   FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum, NestedRec, NestedConst: TASTNode;
   EnumIdx: Integer;
+  NoDeclKey: string;    // the member key of a CONSTRUCTOR/DESTRUCTOR/OPERATOR/PROPERTY written with no DECLARE
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
@@ -4561,6 +4595,14 @@ begin
   NameTok := Context.CurrentToken;
   Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
   if IsUnion then Result.Attributes.Values['UNION'] := '1';
+  // ⭐ Remember the NAME - a definition of one of its members has to be able to ask whether the type
+  // exists at all, and a type that declares NOTHING would otherwise be indistinguishable from a type
+  // nobody wrote. And remember whether it lives in a NAMESPACE, which decides a different question:
+  // its constructor may not be defined naming it BARE from outside.
+  if FTypeNamesSeen.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+    FTypeNamesSeen.Add(UpperCase(VarToStr(NameTok.Value)));
+  if FInNamespaceBody and (FTypesInNamespace.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0) then
+    FTypesInNamespace.Add(UpperCase(VarToStr(NameTok.Value)));
   Context.Advance;                                  // consume type name
 
   // FreeBASIC type alias: "TYPE newname AS underlyingtype" — a one-line synonym with no field block
@@ -4868,6 +4910,27 @@ begin
       // apart here. Saying "this type has something that takes a THIS" costs at most the raw-storage
       // shortcut; saying the opposite by mistake would cost an object that cannot run its own methods.
       Result.Attributes.Values['HASMEMBERPROC'] := '1';
+      // ⭐ ...but the NAME is read after all, because a definition has to be able to ask whether this
+      // type declared this member. CONSTRUCTOR and DESTRUCTOR ARE the name; PROPERTY and OPERATOR name
+      // one next. Nothing else about the line is interpreted - it is still skipped whole.
+      if (VarToStr(Result.Value) <> '') then
+      begin
+        if (TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) then
+          NoDeclKey := TokU
+        else if Assigned(Context.PeekNext) and (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+                (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
+        begin
+          if TokU = kOPERATOR then
+            NoDeclKey := kOPERATOR + UpperCase(VarToStr(Context.PeekNext.Value))
+          else
+            NoDeclKey := UpperCase(VarToStr(Context.PeekNext.Value));
+        end
+        else
+          NoDeclKey := '';
+        if NoDeclKey <> '' then
+          FTypeDeclaredMembers.Add(UpperCase(VarToStr(Result.Value)) + '.' +
+                                   MemberDecoratorKey(NoDeclKey));
+      end;
       while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
         Context.Advance;
       Continue;
@@ -10409,6 +10472,67 @@ begin
     else
       Exit;
     end;
+end;
+
+procedure TPackratParser.CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
+                                                         NameTok: TLexerToken);
+// ⭐ A MEMBER MAY ONLY BE DEFINED IF ITS TYPE DECLARED IT. fbc refuses "Sub UDT.g()" for a type whose
+// body never says "Declare Sub g()" - and it refuses the same for a Constructor, a Destructor, a
+// Property and an Operator, in five different error codes (160, 168, 158, 3) that all say one thing.
+// The suite's namespace/outside-{ctor,dtor,prop,op}-* family is 16 tests of exactly this, and reading
+// them by their names suggests a rule about NAMESPACES; probing the oracle shows the namespace is not
+// in it at all - a plain module-level type answers the same way.
+//
+// ⛔ THE TWO SETS ARE NEEDED TOGETHER. A type that declared NOTHING has no entry in the member set, so
+// asking that set alone would let every definition on it pass unasked - which is the very case fbc
+// refuses. FTypeNamesSeen answers "is this a type we saw declared", and only then is the member set
+// asked. A name we never saw declared as a type is left alone: it may be a namespace, an alias, or
+// something a later pass resolves, and refusing it would be a guess.
+//
+// ⚠️ The owner may be QUALIFIED ("Constructor ns.UDT()"), and fbc ACCEPTS that spelling when the type
+// declared the member - so the comparison is on the LAST component of the owner, which is what the
+// type is called. Anything else would file the question under a name nothing looks up.
+//
+// ⛔ ...AND A TYPE THAT LIVES IN A NAMESPACE MAY NOT BE NAMED BARE. "Constructor UDT()" at module level
+// for a UDT declared inside "ns" is fbc's "error 160" EVEN WHEN the type did declare the constructor
+// (namespace/outside-dtor-5 declares its destructor and is still refused). A different question with a
+// different answer, so it is asked separately and from its own set.
+var
+  BareType, MemberKey: string;
+  DotPos: Integer;
+begin
+  if (not FModernMode) or (MethodType = '') then Exit;
+  BareType := MethodType;
+  DotPos := LastDelimiter('.', BareType);
+  if DotPos > 0 then BareType := Copy(BareType, DotPos + 1, MaxInt);
+  if FTypeNamesSeen.IndexOf(BareType) < 0 then Exit;   // not a type we saw: not our question
+  // the member's own name is what QualName carries after the owner
+  MemberKey := QualName;
+  if Length(MemberKey) > Length(MethodType) + 1 then
+    MemberKey := Copy(MemberKey, Length(MethodType) + 2, MaxInt)
+  else
+    MemberKey := Kind;
+  MemberKey := MemberDecoratorKey(MemberKey);
+  // ⛔ Naming a namespace's type BARE, from outside that namespace.
+  if (DotPos = 0) and (not FInNamespaceBody) and (FTypesInNamespace.IndexOf(BareType) >= 0) then
+  begin
+    HandleError(Format('"%s" is declared inside a NAMESPACE: name it through the namespace here, or ' +
+      'write the definition inside the namespace body', [BareType]), NameTok);
+    Exit;
+  end;
+  // ⛔⛔ ...AND ONLY FOR A TYPE THAT LIVES IN A NAMESPACE, which is a SCOPE on the rule and not a
+  // weakening of it. fbc refuses "Constructor PT()" for ANY type whose body never declared it, module
+  // level included - probed, and it does. But our own corpus has been writing exactly that since M4.4:
+  // 25 programs define a constructor or a destructor out of line with nothing declaring it, and they
+  // are right about our language and wrong about FreeBASIC. Refusing all of them here would replace a
+  // missing refusal with 25 wrong ones, which is the one outcome worse than not refusing at all.
+  // ⇒ What ships is the half the oracle and OUR corpus agree on: a type declared inside a NAMESPACE.
+  // The module-level half is written up in DIVERGENZE.md with the 25 programs it costs and what
+  // closing it needs - a decision about the language, taken once, not smuggled in with a refusal.
+  if (FTypesInNamespace.IndexOf(BareType) >= 0) and
+     (FTypeDeclaredMembers.IndexOf(BareType + '.' + MemberKey) < 0) then
+    HandleError(Format('type %s never declares %s: a member can only be DEFINED where its type ' +
+      'DECLARED it', [BareType, MemberKey]), NameTok);
 end;
 
 procedure TPackratParser.RefuseUnwritableTarget(Node: TASTNode; const What: string);
