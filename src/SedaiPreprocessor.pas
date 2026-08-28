@@ -1241,6 +1241,11 @@ var
   // The full source text of the module being preprocessed, for SourceDeclaresSymbol below.
   // Set by PreprocessSource before Expand; the preprocessor is single-threaded by design.
   GPPSourceForDefined: string = '';
+  // ⛔ "#pragma reserve NAME" makes NAME a SYMBOL and NOT A MACRO. Putting it in Defs was tried and is
+  // wrong: the name is then SUBSTITUTED in ordinary code, and fbc's own pp/pragma-reserve-4 goes on to
+  // write "dim symbol as integer" - which became "dim 0 as integer". Reserving is only observable
+  // through defined(), so it lives in its own set, which nothing substitutes from.
+  GPPReserved: TStringList = nil;
 
 function DeclaredNameOfLine(const U: string; out Kind, TypeName: string): string;
 // Read ONE upper-cased source line as a declaration and return the NAME it declares ('' if it declares
@@ -1421,26 +1426,56 @@ function SourceDeclaresSymbol(const Nm: string): Boolean;
 // exists, so the question is answered by a declaration-shaped scan: a line whose first word is
 // a declaring keyword and that contains Nm as a whole word. A name inside a same-line comment
 // or string can false-positive - accepted for a #if convenience predicate.
+//
+// ⛔ A MEMBER OF A TYPE IS NOT A SYMBOL. fbc's Defined() answers FALSE for a field, a static field, a
+// method or a property - they live in the type, not in the module - and its own pp/defined-udt asserts
+// exactly that, for the SAME names, both before the type is written and from inside its body. Scanning
+// every line of the file made "static staticfield as short" and "declare sub proc()" answer TRUE, and
+// the file refused itself with "#error" - a program fbc accepts.
+// ⚠️ An ENUM body is NOT skipped: its members ARE module-level constants in FreeBASIC.
+// A "Type mine As LongInt" alias opens no block and must not start one.
 var
   L: TStringList;
-  i, p, q: Integer;
-  U, W: string;
+  i, p, q, TypeDepth, EnumDepth: Integer;
+  U, W, Rest: string;
 begin
   Result := False;
   if Nm = '' then Exit;
   L := TStringList.Create;
   try
     L.Text := GPPSourceForDefined;
+    TypeDepth := 0;
+    EnumDepth := 0;
     for i := 0 to L.Count - 1 do
     begin
       U := UpperCase(TrimLeft(L[i]));
       p := 1;
       while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
       W := Copy(U, 1, p - 1);
-      if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
-         (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
-         (W = 'ENUM') or (W = 'COMMON') then
+      if W = 'END' then
       begin
+        Rest := Trim(Copy(U, p, MaxInt));
+        if (Copy(Rest, 1, 4) = 'TYPE') or (Copy(Rest, 1, 5) = 'UNION') or
+           (Copy(Rest, 1, 5) = 'CLASS') then
+          if TypeDepth > 0 then Dec(TypeDepth);
+      end;
+      if TypeDepth > 0 then Continue;              // inside a type body: these are MEMBERS
+      // ⭐ ...BUT AN ENUM BODY DECLARES MODULE CONSTANTS, one per line, and the member's own name is
+      // the FIRST word - so the declaring-keyword rule below cannot see it and defined() answered
+      // FALSE for every enum member. fbc answers TRUE. Verified against the oracle.
+      if EnumDepth > 0 then
+      begin
+        if (W <> '') and (W <> 'END') and (W = Nm) then Exit(True);
+        if W = 'END' then
+        begin
+          Rest := Trim(Copy(U, p, MaxInt));
+          if Copy(Rest, 1, 4) = 'ENUM' then Dec(EnumDepth);
+        end;
+        Continue;
+      end;
+      if (W = 'ENUM') and (Pos(' AS ', ' ' + Trim(Copy(U, p, MaxInt)) + ' ') = 0) then
+      begin
+        // the enum's own NAME is a symbol; its members are read on the following lines
         q := Pos(Nm, U);
         while q > 0 do
         begin
@@ -1449,6 +1484,34 @@ begin
             Exit(True);
           q := Pos(Nm, U, q + 1);
         end;
+        Inc(EnumDepth);
+        Continue;
+      end;
+      if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
+         (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
+         (W = 'ENUM') or (W = 'COMMON') then
+      begin
+        q := Pos(Nm, U);
+        while q > 0 do
+        begin
+          // ⛔ A QUALIFIED NAME DOES NOT DECLARE THE BARE ONE. "Sub T.proc()" and
+          // "Dim As Short T.staticfield" are the OUT-OF-LINE definitions of members, written at module
+          // level - and fbc still answers FALSE for "defined( proc )". A '.' immediately before the
+          // match is what says so, and it is the only thing that does at this stage.
+          if ((q = 1) or (not IsIdentChar(U[q - 1]) and (U[q - 1] <> '.'))) and
+             ((q + Length(Nm) > Length(U)) or
+              (not IsIdentChar(U[q + Length(Nm)]) and (U[q + Length(Nm)] <> '.'))) then
+            Exit(True);
+          q := Pos(Nm, U, q + 1);
+        end;
+      end;
+      // ...and only AFTER the line has been read: "Type T" declares T itself, which IS a symbol, and
+      // fbc's own test asks for it from inside the body ("check_Y( T )").
+      if (W = 'TYPE') or (W = 'UNION') or (W = 'CLASS') then
+      begin
+        Rest := Trim(Copy(U, p, MaxInt));
+        // "Type mine As LongInt" is an ALIAS - one line, no block. Anything else opens one.
+        if Pos(' AS ', ' ' + Rest + ' ') = 0 then Inc(TypeDepth);
       end;
     end;
   finally
@@ -1604,6 +1667,11 @@ var
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
           if (p <= Length(S)) and (S[p] = '(') then Inc(p);
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
+          // ⭐ A LEADING '.' (or '..') asks for the GLOBAL scope, and for defined() it names the same
+          // symbol: "defined( ..symbol )" is fbc's own spelling in pp/pragma-reserve-4. The dots are
+          // not identifier characters, so the name came out EMPTY and every such test answered "not
+          // defined" - and the file refused itself with #error.
+          while (p <= Length(S)) and (S[p] = '.') do Inc(p);
           q := p;
           while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
           nm := UpperCase(Copy(S, p, q - p)); p := q;
@@ -1613,7 +1681,9 @@ var
           // that had just been written three lines above. The two tables are one QUESTION with two
           // storages; every place that asks "is this name a macro?" has to ask both.
           if (Defs.IndexOfName(nm) >= 0) or
-             ((FnDefs <> nil) and (FnDefs.IndexOfName(nm) >= 0)) or SourceDeclaresSymbol(nm) then
+             ((FnDefs <> nil) and (FnDefs.IndexOfName(nm) >= 0)) or
+             ((GPPReserved <> nil) and (GPPReserved.IndexOf(nm) >= 0)) or
+             SourceDeclaresSymbol(nm) then
             Toks.Add('1')
           else
             Toks.Add('0');
@@ -2626,10 +2696,22 @@ var
             // the first include of such a header was right, and every later one spliced it again
             // (fbc's own pp/inc_once2 counts 1 where we counted 3).
             // Every other pragma (reserve, push/pop) stays ignored, exactly as before.
-            if (UpperCase(Trim(StripDirectiveComment(DRest))) = 'ONCE') and (SrcPath <> '') then
+            MacroName := UpperCase(Trim(StripDirectiveComment(DRest)));
+            if (MacroName = 'ONCE') and (SrcPath <> '') then
             begin
               Canon := UpperCase(ExpandFileName(SrcPath));
               if PragmaOnce.IndexOf(Canon) < 0 then PragmaOnce.Add(Canon);
+            end
+            // ⭐ "#pragma reserve NAME" makes NAME a SYMBOL: fbc reserves the identifier and defined()
+            // answers TRUE for it from that line on - its own pp/pragma-reserve-* files refuse
+            // themselves with #error otherwise. Reserving is ALL it does here: there is no symbol table
+            // at this stage to keep the name out of, and the only observable half of the feature is
+            // exactly the one defined() asks for.
+            else if Copy(MacroName, 1, 8) = 'RESERVE ' then
+            begin
+              MacroVal := Trim(Copy(MacroName, 9, MaxInt));
+              if (MacroVal <> '') and (GPPReserved <> nil) and
+                 (GPPReserved.IndexOf(MacroVal) < 0) then GPPReserved.Add(MacroVal);
             end;
           end
           else if (DName = 'print') and Emitting then
@@ -2661,6 +2743,39 @@ var
               while (q <= Length(DRest)) and (DRest[q] in ['0'..'9']) do
               begin MacroName := MacroName + DRest[q]; Inc(q); end;
               if MacroName <> '' then Defs.Values['__FB_OPTIMIZE__'] := MacroName;
+            end;
+            // ⭐ ...AND "-d NAME" / "-d NAME=VALUE" DEFINES A SYMBOL, observable on the very next line:
+            // fbc's own pp/cmdline asks for a symbol on the #cmdline line and then refuses itself with
+            // #error unless defined() sees it. The comment above says the switches "name a linker, an
+            // object format, a target" - true of the rest, and -d is the one that is not: it is the
+            // command-line spelling of #define, and it is our own front end's -d too.
+            p := 1;
+            while p > 0 do
+            begin
+              p := Pos('-d', DRest, p);
+              if p = 0 then Break;
+              if ((p = 1) or (DRest[p - 1] in [' ', #9, '"'])) and
+                 (p + 2 <= Length(DRest)) and (DRest[p + 2] in [' ', #9]) then
+              begin
+                q := p + 3;
+                while (q <= Length(DRest)) and (DRest[q] in [' ', #9]) do Inc(q);
+                MacroName := '';
+                while (q <= Length(DRest)) and IsIdentChar(DRest[q]) do
+                begin MacroName := MacroName + UpCase(DRest[q]); Inc(q); end;
+                if MacroName <> '' then
+                begin
+                  MacroVal := '';
+                  if (q <= Length(DRest)) and (DRest[q] = '=') then
+                  begin
+                    Inc(q);
+                    while (q <= Length(DRest)) and not (DRest[q] in [' ', #9, '"']) do
+                    begin MacroVal := MacroVal + DRest[q]; Inc(q); end;
+                  end;
+                  if MacroVal = '' then MacroVal := '-1';       // "-d NAME" alone: fbc gives it -1
+                  Defs.Values[MacroName] := MacroVal;
+                end;
+              end;
+              Inc(p, 2);
             end;
           end
           else if (DName = 'error') and Emitting then
@@ -2801,6 +2916,9 @@ begin
     SetLength(Taken, 0);
     EscapeOn := False;
     GPPSourceForDefined := Src;   // lets defined() see Const/Dim/proc declarations, like fbc
+  if GPPReserved = nil then GPPReserved := TStringList.Create;
+  GPPReserved.Clear;            // per PROGRAM: a reservation must not survive into the next one
+  GPPReserved.CaseSensitive := False;
     Expand(Src, BaseDir);
     Result := Output.Text;
   finally
