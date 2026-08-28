@@ -676,6 +676,7 @@ type
     function TypeHasMemberProc(const TypeName: string): Boolean;               // ...anything that takes a THIS
     procedure CheckPointerConstAssign(Decl: TASTNode);   // FB: a pointer assignment may not DROP a const
     procedure CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);  // FB: too many values in a (...) init
+    procedure CheckArrayByteSize(const ArrName, ElemTypeName: string; Elems, ElemBytes: Int64);  // FB error 50
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
@@ -11196,6 +11197,9 @@ begin
           TotalElements := TotalElements * Dimensions[i];   // element count (with overflow check)
           if TotalElements > MAX_ARRAY_ELEMENTS then
             raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
+          if ArrElemTypeName <> '' then
+            CheckArrayByteSize(ArrName, ArrElemTypeName, TotalElements,
+                               TypeSizeBytes(ArrElemTypeName));
         end;
       end
       else if DimValue.Kind = svkConstFloat then
@@ -33045,6 +33049,27 @@ begin
   Result := '';
   if TypeName = '' then Exit;
   Result := ResolveMethodLabel(TypeName, OpName);
+end;
+
+procedure TSSAGenerator.CheckArrayByteSize(const ArrName, ElemTypeName: string;
+  Elems, ElemBytes: Int64);
+// FreeBASIC's "error 50: Array too big", and the limit is on BYTES, not on elements: the whole array
+// must fit in a signed 32-bit size. Measured by bisecting fbc 1.10.1 rather than read anywhere -
+// 2147483647 bytes of BYTE are accepted and one more is not, 1073741823 SHORTs (2147483646 bytes) are
+// accepted and one more is not. ⚠️ For an 8-byte element fbc stops one element earlier than the byte
+// count alone predicts; being one element MORE permissive is the safe direction (it costs a test of
+// its suite, never a valid program), so the rule stays the plain byte cap.
+//
+// ⛔ The cap we already had counts ELEMENTS (MAX_ARRAY_ELEMENTS), which is a different question and
+// misses this one entirely: "Dim Shared As UDT test(0 To &h7FFFFFFF \ SizeOf(UDT))" is 67 million
+// elements - comfortably under - and two gigabytes of them.
+begin
+  if (Elems <= 0) or (ElemBytes <= 0) then Exit;
+  if Elems > (2147483647 div ElemBytes) then
+    raise Exception.CreateFmt(
+      'Array too big: "%s" declares %d elements of %s (%d bytes each), which is more than the ' +
+      '2147483647 bytes an array may occupy.',
+      [ArrName, Elems, ElemTypeName, ElemBytes]);
 end;
 
 procedure TSSAGenerator.CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);
