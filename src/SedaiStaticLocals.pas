@@ -204,9 +204,9 @@ var
   Decls: TFPList;                 // the STATIC antArrayDecl nodes found in this proc
   Parents: TFPList;               // the owning antDim of each
   Grands: TFPList;                // the block that owns the antDim (where a sizing guard is spliced in)
-  i, SlotIdx: Integer;
+  i, SlotIdx, HoistBase: Integer;
   DimNode, Decl, NameNode, TypeNode, InitClone, GrandNode, InitOne: TASTNode;
-  VName, TName, Mangled, FlagName: string;
+  VName, TName, Mangled, FlagName, OwnerType: string;
 
   procedure CollectStatics(N: TASTNode);
   var k, j: Integer; D, Child: TASTNode;
@@ -221,9 +221,15 @@ var
         D := Child.GetChild(k);
         // Two shapes reach here: a typed scalar (child[1] = type identifier) and an array
         // (child[1] = antDimensions, child[2] = element type). Both hoist the same way.
+        // ⭐ ...and a THIRD shape: "Static Var n = 0", where child[1] is the INITIALIZER and the type is
+        // inferred from it. It was rejected here, so it was never hoisted and never persisted - the
+        // variable was reborn on every call and "n += 1" printed 1, 1, 1 where fbc prints 1, 2, 3.
+        // STATIC says WHERE the storage lives and VAR says where the TYPE comes from; the two are
+        // orthogonal, and only this guard said otherwise.
         if (D.NodeType = antArrayDecl) and (D.Attributes.Values['STATIC'] = '1') and
            (D.ChildCount >= 2) and (D.GetChild(0).NodeType = antIdentifier) and
-           ((D.GetChild(1).NodeType = antIdentifier) or (D.GetChild(1).NodeType = antDimensions)) then
+           ((D.GetChild(1).NodeType = antIdentifier) or (D.GetChild(1).NodeType = antDimensions) or
+            (D.Attributes.Values['INFER'] = '1')) then
         begin
           Decls.Add(D);
           Parents.Add(Child);
@@ -265,6 +271,25 @@ begin
   try
     if Proc.Attributes.Values['ALLSTATIC'] = '1' then MarkAllScalarStatics(Proc);
     CollectStatics(Proc);
+    HoistBase := Hoisted.Count;
+    // ⭐ A STATIC local declared inside a METHOD leaves the method: it becomes a module-level DIM SHARED,
+    // and everything the module level does NOT know then applies to it. The one that bites is VISIBILITY:
+    // "Static As T x" inside "Sub T.test()" constructs a T, and if T's constructor is Private the check
+    // at the construction site sees module scope and refuses a program fbc accepts (its own
+    // visibility/private-ctor-private-usage is exactly that). So the owning type travels with the
+    // declaration and the lowering puts it back for the length of that construction.
+    // ⛔ THE NAME IS NOT ON THE NODE. An antProcedureDecl's Value is the KEYWORD ("SUB", "FUNCTION",
+    // "CONSTRUCTOR"); the qualified name "T.TEST" is child 0. Reading Value gave "SUB", so the owner
+    // came out empty and the whole thing was inert.
+    OwnerType := '';
+    if (Proc.ChildCount > 0) and (Proc.GetChild(0).NodeType = antIdentifier) then
+      OwnerType := UpperCase(VarToStr(Proc.GetChild(0).Value));
+    // Everything before the LAST dot is the owner: "T.TEST" -> "T", and a namespace-flattened
+    // "NS.T.TEST" -> "NS.T", which is the name FUDTs holds. A plain module SUB has no dot and no owner.
+    if LastDelimiter('.', OwnerType) > 0 then
+      OwnerType := Copy(OwnerType, 1, LastDelimiter('.', OwnerType) - 1)
+    else
+      OwnerType := '';
     for i := 0 to Decls.Count - 1 do
     begin
       Decl := TASTNode(Decls[i]);
@@ -272,6 +297,17 @@ begin
       GrandNode := TASTNode(Grands[i]);
       NameNode := Decl.GetChild(0);
       TypeNode := Decl.GetChild(1);
+      // An INFER declaration hoists WHOLE: cloning keeps child[1] as the initializer and carries the
+      // INFER mark with it, which is exactly what the module-level VAR needs to type itself. Rebuilding
+      // it as "name AS type" (the scalar path below) would have to invent the type this shape exists
+      // not to name.
+      if Decl.Attributes.Values['INFER'] = '1' then
+      begin
+        Hoisted.Add(BuildSharedArrayDecl(Decl, Mangled));
+        RenameRefs(Proc, UpperCase(VarToStr(NameNode.Value)), Mangled);
+        DimNode.Children.Remove(Decl);
+        Continue;
+      end;
       VName := UpperCase(VarToStr(NameNode.Value));
       Mangled := 'STATIC.' + IntToStr(ProcIdx) + '.' + VName;
       if TypeNode.NodeType = antDimensions then
@@ -303,7 +339,14 @@ begin
         TName := UpperCase(VarToStr(TypeNode.Value));
         // A constant initializer (child[2], an expression, not a ctor argument list) is kept and moved to
         // the module-level DIM SHARED so it runs once at program start.
-        if (Decl.ChildCount >= 3) and (Decl.GetChild(2).NodeType <> antArgumentList) then
+        // ⛔ ...AND AN AGGREGATE TUPLE IS NOT CTOR ARGUMENTS, though it wears the same node type. The
+        // parser answers "= (11, 22)" as an antArgumentList marked TUPLEINIT, so this test threw it
+        // away and "Static As T v = (11, 22)" hoisted a declaration with NO initializer: the fields
+        // read 0 in silence, while the identical "Dim Shared" one line above was right. The mark is
+        // what tells the two apart, and it was already there to be asked.
+        if (Decl.ChildCount >= 3) and
+           ((Decl.GetChild(2).NodeType <> antArgumentList) or
+            (Decl.GetChild(2).Attributes.Values['TUPLEINIT'] = '1')) then
           InitClone := Decl.GetChild(2).Clone
         else
           InitClone := nil;
@@ -314,6 +357,9 @@ begin
       RenameRefs(Proc, VName, Mangled);
       DimNode.Children.Remove(Decl);   // owns its children -> frees the declaration node
     end;
+    if OwnerType <> '' then
+      for i := HoistBase to Hoisted.Count - 1 do
+        TASTNode(Hoisted[i]).Attributes.Values['STATICTHISTYPE'] := OwnerType;
   finally
     Decls.Free;
     Parents.Free;

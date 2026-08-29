@@ -117,23 +117,130 @@ type
     // still un-renamed. A second declaration of the same name means an overload set, and both get a
     // parameter-bank signature appended to their labels (see ParseProcedureDecl).
     FProcSeen: TStringList;
+    // ⛔⛔ ...AND THE OVERLOAD DECISION IS ASKED PER NAMESPACE. Two procedures of the same name in two
+    // DIFFERENT namespaces are not an overload set - they are two names that only look alike until the
+    // namespace pass mangles them - and treating them as one gave both the SAME signature tail (a
+    // no-parameter pair signs "~" twice), so the second was silently discarded and both "ns1.bar" and
+    // "ns2.bar" answered 0. FProcSeen keeps the BARE names, because the two places that ask it ask
+    // "is this name a procedure at all"; this one keys on "PREFIX|BASE" and owns the decision.
+    FProcSeenNs: TStringList;
+    FNsPrefix: string;               // the namespace body being parsed ('' at module level)
+    // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
+    // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
+    // check asks about the expression it is handed.
+    FByrefRetProcs: TStringList;
     // OOP: methods a TYPE body declared STATIC ("Declare Static Sub f(...)"), as "TYPE.METHOD" keys.
     // A static member procedure has NO implicit THIS, so its out-of-line definition ("Sub T.f(...)")
     // must not be given one -- otherwise every call passes its arguments one position too far right,
     // and taking its address (@T.f) yields a procedure whose arity does not match the call.
     // FreeBASIC requires the declaration to precede the definition, so a single forward pass suffices.
     FTypeStaticMethods: TStringList;
+    FStaticMemberProcs: TStringList;   // "TYPE.NAME" of every "Declare Static Sub|Function" seen in a TYPE body.
+    // ⭐ Every TYPE name a TYPE/UNION/CLASS declaration introduced, and every MEMBER PROCEDURE each of
+    // them DECLARED, as "TYPE.MEMBERKEY". A member may only be DEFINED out of line if its type
+    // declared it - fbc refuses "Sub UDT.g()" for a type whose body never says "Declare Sub g()" - and
+    // the two sets are needed together: without the first, a type that declared NOTHING would have no
+    // entry at all and every definition on it would pass unasked, which is exactly the case fbc
+    // refuses. The member key is MemberDecoratorKey's, the one spelling an OPERATOR's '=' survives.
+    FTypeNamesSeen: TStringList;
+    // ...and the ENUM names, which are NOT type names for the aggregate-initialiser question: an
+    // enum has no fields, so parentheses around its initialiser are plain grouping.
+    FEnumNamesSeen: TStringList;
+    FTypeDeclaredMembers: TStringList;
+    // ⛔ ...and the types declared INSIDE A NAMESPACE, which may not be named BARE at module level:
+    // "Constructor UDT()" for a UDT that lives in "ns" is fbc's "error 160: Expected class or UDT
+    // identifier" even when the type DID declare the constructor. A separate question from the one
+    // above, with a separate answer, so a separate set.
+    FTypesInNamespace: TStringList;
+    // The CONST-ness of each pointer level of the type being parsed, in SOURCE order, one character
+    // per level ('1' = that level is a constant pointer). AtPointerSuffix appends to it, because that
+    // predicate is the ONE place the inner CONST is recognised - all fifteen loops share it. A caller
+    // that wants the chain clears it before the type and reads it after.
+    FPtrQualChain: string;
+                                       // ⛔ DELIBERATELY SEPARATE from FTypeStaticMethods, which decides whether a
+                                       // definition gets an implicit THIS: that mechanism is written but DORMANT
+                                       // (the set is never filled), and the CALL SITE passes a dummy THIS to match.
+                                       // Filling it turned three corpus programs to zero - m153, m374, m606 - because
+                                       // only one half of the pair moved. This set answers "is the member static?"
+                                       // and nothing else.
     // OOP: the DEFAULT ARGUMENTS a TYPE body's "Declare ..." line gave a method, keyed "TYPE.METHOD".
     // FreeBASIC states them on the DECLARATION, never on the out-of-line definition — so a definition
     // read on its own looks like it has none, and "Dim v As T" then found no constructor callable with
     // zero arguments and left the object unconstructed. Each entry's object is an antArgumentList with
     // one child per parameter: the default expression, or a NODEF placeholder.
     FTypeMethodDefaults: TStringList;
+    // ⭐ The SHAPE every module-level EXTERN gave a name, so a later DIM/REDIM/EXTERN of the SAME name
+    // can be asked to agree with it. fbc rejects a redeclaration that changes the rank, the bounds, the
+    // static/dynamic-ness or the element type ("error 55: Array not dimensioned" / "error 8: Duplicated
+    // definition"), and until now `extern a(0 to 1) As Integer` produced NOTHING at all - the line was
+    // skipped to end-of-line, so there was no earlier declaration left to disagree with.
+    // ⛔ MODULE LEVEL ONLY, and only names an EXTERN introduced. A registry keyed on a bare NAME is the
+    // trap this codebase keeps falling into: a local `Dim a(0 To 1)` inside a Sub is a DIFFERENT `a`
+    // from a module-level `Extern a()`, and rejecting it would refuse a program fbc accepts - the one
+    // direction that must never happen. Measured over the whole fbc suite: 36 of 36 rejections landed,
+    // 0 valid programs refused.
+    FExternShapes: TStringList;      // UPPER name -> shape, encoded by EncodeDeclShape
+    // The declaration a lone "Extern a() As Integer" owes the SSA, built by ScanModuleLevelExtern and
+    // handed back by the caller that would otherwise throw the whole line away.
+    FPendingExternArray: TASTNode;
+    // ⭐ Module-level names that are LOCALS of the implicit main: a bare "Dim" and a bare "Static" at
+    // module level. fbc will not let a STATIC-STORAGE initialiser reference one ("error 272: Local
+    // symbols can't be referenced" for its address, "error 11: Expected constant" for its value),
+    // because the global is set up before that main runs and the local does not exist yet.
+    FModuleLocalNames: TStringList;
+    // ⭐ Type names that declare a CONSTRUCTOR or a DESTRUCTOR. A type declared inside a procedure or a
+    // block may not HAVE one, nor a field of such a type, nor extend one - fbc's "error 263: Objects
+    // with default [con|de]structors or methods are only allowed in the module level".
+    FTypesWithCtorDtor: TStringList;
+    // ⭐ Names declared as a pointer whose POINTEE is const ("Dim As Const Integer Ptr p"): writing
+    // THROUGH one - "*p = x", "p[i] = x", "p->f = x" - is fbc's "error 119: Cannot modify a constant".
+    // ⛔ NOT the same set as FConstNames, which holds names that are not lvalues THEMSELVES: for this
+    // pointer "p = @other" is perfectly legal and only "*p = ..." is not. The two halves of the word
+    // CONST on a pointer type, kept apart - m632 established which is which, this is the other one.
+    FConstPointeeNames: TStringList;
+    // ⭐ Module-level declared names -> the element/scalar TYPE they were declared with. A second
+    // declaration of the same name AT MODULE LEVEL is fbc's "error 4: Duplicated definition"; a
+    // declaration inside a Sub, a Scope or an If SHADOWS and is perfectly legal, and so is a ReDim of
+    // an array a Dim already declared. Only module level, which is the one scope this parser can name.
+    FModuleDeclared: TStringList;
+    FTopLevelStmt: Boolean;          // set by ParseProgram before each top-level ParseStatement
+    // ⛔ A FOR BODY IS A FLAT RUN OF SIBLINGS, not a child node - so a "Dim" inside a module-level FOR
+    // arrives at ParseProgram's own loop and looks like a module-level declaration. It is not: it is a
+    // BLOCK-local one, and it shadows. The same pair the SSA's own scope collector counts (antForLoop
+    // opens, antNext closes), for the same reason.
+    FFlatBlockDepth: Integer;
+    FInNamespaceBody: Boolean;       // a NAMESPACE body is module level for TYPEs and NOT for names
+    function EncodeDeclShape(Dims: TASTNode; const TypeName: string; InitCount: Integer;
+                             const Flags: string): string;
+    function ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
+    function ShapeConflict(const Prev, Cur: string; out Why: string): Boolean;
+    procedure NoteExternShape(const Name, Shape: string);
+    procedure CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
+    procedure ScanModuleLevelExtern;
+    function  ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
+    procedure RejectEmptyAliasNames;
+    function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
+    procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
+    procedure CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
+    procedure NoteTypeCtorDtor(Node: TASTNode);
+    procedure RefuseNonModuleLevelType(Node: TASTNode);
+    function WritesThroughConstPointee(Node: TASTNode): string;
+    function ConstRootOfTarget(Node: TASTNode): string;
+    procedure CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
+    procedure CheckDeclStatesItsType(Node: TASTNode);
+    procedure RefuseUnwritableTarget(Node: TASTNode; const What: string);
+    procedure CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
+                                              NameTok: TLexerToken);
+    procedure CheckByRefReturn(ProcNode: TASTNode);
+    procedure CheckRedimTargetIsAName(Node: TASTNode);
+    function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
 
+    function ByrefRetKeyOf(const Nm: string): string;   // a procedure label without its overload/arity tail
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
-                               WithTypeNames: Boolean = False): string;
+                               WithTypeNames: Boolean = False;
+                               PtrKinds: Boolean = False): string;   // CONSTRUCTORS only: see the body
     procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 
     // Dialect profile application + the per-dialect statement handlers it installs.
@@ -150,6 +257,7 @@ type
     function ParseArrayDeclaration: TASTNode;
     function FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
     function ParseFileHandleIdent: TASTNode;
+    function ParseFileNumberOperand: TASTNode;
 
     // Helper methods for block parsing
     function ParseBlockUntil(EndTokens: array of TTokenType): TASTNode;
@@ -281,7 +389,7 @@ type
     procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
     function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
     // Optional "= { ... }" / "=> { ... }" array initializer on an already-built antArrayDecl.
-    function TryParseAggregateTuple(const DimTypeName: string): TASTNode;
+    function TryParseAggregateTuple(const DimTypeName: string; Nested: Boolean = False): TASTNode;
     procedure ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
     function AtEndType: Boolean;
     procedure ConsumeEndType;
@@ -298,6 +406,7 @@ type
     // Read a dotted name "ident(.ident)*" (e.g. a namespace-qualified type "Forms.Point"); returns
     // the joined UPPER-cased name and consumes all segments. The first token must already be checked.
     function ParseDottedName: string;
+    function AtDottedTypeName: Boolean;   // at a type NAME, leading global-scope dots included
     // FreeBASIC function-pointer type "FUNCTION(params) AS ret" / "SUB(params)" after AS. If the
     // current token is FUNCTION/SUB, consume the whole type and mark Node with FUNCPTR / FPPARAMS /
     // FPRET attributes (the variable holds a procedure entry PC, int-banked). Returns True if matched.
@@ -309,6 +418,7 @@ type
     function ParseGosubStatement: TASTNode;
     function ParseFunctionResultAssign: TASTNode;
     function ParseReturnStatement: TASTNode;
+    function IsStrayBlockCloser(const W: string): Boolean;   // a word that can only CLOSE a block
     function ParseEndStatement: TASTNode;
     function ParseFastStatement: TASTNode;
     function ParseSlowStatement: TASTNode;
@@ -368,6 +478,9 @@ type
     function ParseSeekStatement: TASTNode;         // FreeBASIC SEEK #n, pos (set position)
     function ParseNameStatement: TASTNode;         // FreeBASIC NAME old AS new (rename)
     function PeekNameHasAs: Boolean;               // lookahead: NAME ... AS ... on this statement
+    function AsmBlockIsEmpty: Boolean;
+    procedure SkipAsmBlock;
+    function AsmStatementFollows: Boolean;         // lookahead: "Asm <instruction>" on ONE line
     function LooksLikeImageTarget: Boolean;        // lookahead: "cmd img, (x,y)..." FB image draw-target form
     function ParseRaiseErrorStatement: TASTNode;   // FreeBASIC ERROR <n> (raise runtime error)
     function ParseBinaryFileTail(IsGet: Boolean; const Tok: TLexerToken): TASTNode;  // GET/PUT #n,[pos],var
@@ -406,15 +519,104 @@ function CreatePackratParser: TPackratParser;
 implementation
 
 uses
-  Math, StrUtils, TypInfo;
+  Math, StrUtils, TypInfo,
+  SedaiPreprocessor;   // SourceDeclaresNonFbDialect: which -lang the source asked for
 
 
 // The MODERN extensions that FreeBASIC does NOT reserve: a program may use any of them as the name
 // of its own procedure, and then that name is the program's, not ours.
-function IsShadowableExtensionName(const NameU: string): Boolean;
+function IsCastFunctionName(const NameU: string): Boolean;
+// The FreeBASIC conversion functions that may stand as the TARGET of an assignment: the value is
+// reinterpreted, operated on and written back through the same variable ("CUInt( i ) Shr= 1", fbc's own
+// quirk/casting). CPTR is here for the same reason CAST is - it converts a pointer in place.
+// ⛔ Only the CONVERSIONS. A math function is not an lvalue ("Abs( i ) = 3" is nonsense), and the list
+// is what keeps the assignment arm from claiming one.
+const
+  CASTFNS: array[0..12] of string = (
+    'CBYTE', 'CUBYTE', 'CSHORT', 'CUSHORT', 'CINT', 'CUINT', 'CLNG', 'CULNG',
+    'CLNGINT', 'CULNGINT', 'CSNG', 'CDBL', 'CBOOL');
+var
+  i: Integer;
 begin
-  Result := (NameU = 'MIN') or (NameU = 'MAX') or (NameU = 'CEIL') or (NameU = 'ROUND') or
-            (NameU = 'COPYSIGN') or (NameU = 'SINGLEBITS') or (NameU = 'BITSTOSINGLE');
+  Result := False;
+  for i := Low(CASTFNS) to High(CASTFNS) do
+    if NameU = CASTFNS[i] then Exit(True);
+end;
+
+function CastFunctionTypeName(const NameU: string): string;
+// The type "C<x>( v )" converts to, spelled as CAST would spell it. ⛔ CPTR, CSIGN and CUNSG are NOT
+// here and are not lvalue targets either: CPTR takes its type as an argument, and CSIGN/CUNSG name the
+// signed or unsigned partner of whatever the operand happens to be - there is no fixed name to rewrite
+// them to, and inventing one would be a wrong answer where a refusal is honest.
+begin
+  if NameU = 'CBYTE' then Result := 'BYTE'
+  else if NameU = 'CUBYTE' then Result := 'UBYTE'
+  else if NameU = 'CSHORT' then Result := 'SHORT'
+  else if NameU = 'CUSHORT' then Result := 'USHORT'
+  else if NameU = 'CINT' then Result := 'INTEGER'
+  else if NameU = 'CUINT' then Result := 'UINTEGER'
+  else if NameU = 'CLNG' then Result := 'LONG'
+  else if NameU = 'CULNG' then Result := 'ULONG'
+  else if NameU = 'CLNGINT' then Result := 'LONGINT'
+  else if NameU = 'CULNGINT' then Result := 'ULONGINT'
+  else if NameU = 'CSNG' then Result := 'SINGLE'
+  else if NameU = 'CDBL' then Result := 'DOUBLE'
+  else if NameU = 'CBOOL' then Result := 'BOOLEAN'
+  else Result := '';
+end;
+
+function IsShadowableExtensionName(const NameU: string): Boolean;
+// ⭐ ...AND "VAL" IS A LIBRARY FUNCTION, NOT A KEYWORD. fbc accepts "Sub val()" and calls it; we
+// refused the declaration outright. ⚠️ The WIDTH of this was MEASURED rather than assumed: over the
+// 1131 distinct TEST(...) names and the 1187 Sub/Function/TEST_GROUP names of the whole fbc suite,
+// VAL is the ONLY name we refuse - so this is one entry, not a campaign. It still costs a whole test
+// (functions/fixstr_arg). Everything the declaration needs is already in place: SedaiSSA consults
+// FProcedureNames BEFORE the intrinsic chain, so a program that declares one wins at every call site
+// and every program that does not keeps the intrinsic.
+//
+// ⭐⭐ 28 Aug 2026: THE LIST IS NOW THE MEASURED SET, not a hand-written one. The note above measured
+// the WIDTH over the names the fbc suite actually DECLARES, and answered "VAL is the only one" - a
+// true answer to a narrower question. The question that decides what we refuse is the other one:
+// which of OUR reserved words does fbc leave free to a program? Asked mechanically - every one of our
+// 531 keywords compiled by fbc as "Sub <name>() : End Sub : <name>()" - the answer is 47.
+// Two kinds, and both are ours to give back:
+//   - names fbc HAS NO IDEA ABOUT because they are our own MODERN extensions (CORECOUNT, REGEXREPLACE,
+//     VALINT, THREADSELF, FILECOPY, EXPNOTATION, ...): reserving them makes a valid FreeBASIC program
+//     fail to compile on a word FreeBASIC leaves alone;
+//   - intrinsics fbc lets a program SHADOW anyway (HEX, OCT, BIN, SINH, NOW, LOG10, ...).
+// ⛔ And this is the COMMODORE/FreeBASIC tables mixing, which this project's own rule forbids: a word
+// that is a keyword in Commodore BASIC v7 is not thereby a keyword in FreeBASIC. Every call site is
+// already gated on FModernMode, so CLASSIC keeps every one of them reserved.
+// ⭐ Nothing else is needed: SedaiSSA consults FProcedureNames BEFORE the intrinsic chain, so a program
+// that declares one wins at every call site and every program that does not keeps the intrinsic.
+// ⛔⛔ AND THE 47 DID NOT ALL SURVIVE THE NETS - 14 had to come back out, each with a reproduction:
+//   - FILECOPY, FILEFLUSH, FILESETEOF, GETMOUSE, IMAGEINFO, SCREENCONTROL, SETCOLOR, THREADDETACH,
+//     GSHAPE, SSHAPE: OUR OWN extensions are dispatched by KEYWORD TOKEN, so reading the name as an
+//     identifier loses the builtin outright ("Undefined procedure: THREADDETACH", and an omitted
+//     graphics argument stops parsing);
+//   - HEX, BIN, OCT, WBIN, WHEX, WOCT: safe in an expression, but called AS A STATEMENT with the
+//     result discarded - which is exactly what functions/ignore-result.bas does - the call reads as an
+//     ARRAY ACCESS ("Array not declared: WHEX").
+// ⇒ 39 ship. The discriminator is not "is it ours" but "does the builtin survive being read as an
+// identifier at EVERY use site", and only the nets could answer it: the corpus named ten, the fbc
+// suite's CUERR named the eleventh, and a probe over all 44 remaining names in the statement-call
+// shape named the last five at once.
+// ⚠️ The measured set is UNIONED with the original eight, not substituted for them: the census asks
+// "which names does fbc accept and WE refuse", so a name we already let through (MIN, VAL, ...) can
+// never appear in it. Replacing the list with the census would have taken those eight back out.
+const
+  SHADOWABLE: array[0..38] of string = (
+    'ACOSH', 'ASINH', 'ATAN', 'ATANH', 'BITSTOSINGLE', 'BSAVE', 'CEIL', 'COPYSIGN',
+    'CORECOUNT', 'COSH', 'CPUCOUNT', 'DEFLNGINT', 'EXPNOTATION', 'GETCOLOR', 'LOAD', 'LOG10',
+    'LOG2', 'LOGN', 'MAX', 'MIN', 'NOW', 'PLOAD', 'PROCESSORCOUNT', 'PRST', 'PSAVE',
+    'REGEXCOUNT', 'REGEXREPLACE', 'ROUND', 'SINGLEBITS', 'SINH', 'STICK', 'STRIG', 'TANH',
+    'THREADSELF', 'VAL', 'VALINT', 'VALLNG', 'VALUINT', 'VALULNG');
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := Low(SHADOWABLE) to High(SHADOWABLE) do
+    if NameU = SHADOWABLE[i] then Exit(True);
 end;
 
 { TPackratParser }
@@ -435,6 +637,11 @@ begin
 
   FProcSeen := TStringList.Create;
   FProcSeen.CaseSensitive := False;
+  FProcSeenNs := TStringList.Create;
+  FProcSeenNs.CaseSensitive := False;
+  FNsPrefix := '';
+  FByrefRetProcs := TStringList.Create;
+  FByrefRetProcs.CaseSensitive := False;
   FConstNames := TStringList.Create;
   FConstNames.CaseSensitive := False;
   FConstTypes := TStringList.Create;
@@ -443,8 +650,24 @@ begin
   FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
+  FTypeNamesSeen := TStringList.Create;       FTypeNamesSeen.CaseSensitive := False;
+  FEnumNamesSeen := TStringList.Create;       FEnumNamesSeen.CaseSensitive := False;
+  FTypeDeclaredMembers := TStringList.Create; FTypeDeclaredMembers.CaseSensitive := False;
+  FTypesInNamespace := TStringList.Create;    FTypesInNamespace.CaseSensitive := False;
+  FStaticMemberProcs := TStringList.Create;
+  FStaticMemberProcs.CaseSensitive := False;
   FTypeMethodDefaults := TStringList.Create;
   FTypeMethodDefaults.CaseSensitive := False;
+  FExternShapes := TStringList.Create;
+  FExternShapes.CaseSensitive := False;
+  FModuleLocalNames := TStringList.Create;
+  FModuleLocalNames.CaseSensitive := False;
+  FTypesWithCtorDtor := TStringList.Create;
+  FTypesWithCtorDtor.CaseSensitive := False;
+  FConstPointeeNames := TStringList.Create;
+  FConstPointeeNames.CaseSensitive := False;
+  FModuleDeclared := TStringList.Create;
+  FModuleDeclared.CaseSensitive := False;
 end;
 
 destructor TPackratParser.Destroy;
@@ -456,20 +679,45 @@ begin
     FExpressionParser.Free;
 
   FProcSeen.Free;
+  FProcSeenNs.Free;
+  FByrefRetProcs.Free;
   FConstNames.Free;
   FConstTypes.Free;
   FConstIntValues.Free;
   FTypeStaticMethods.Free;
+  FTypeNamesSeen.Free;
+  FEnumNamesSeen.Free;
+  FTypeDeclaredMembers.Free;
+  FTypesInNamespace.Free;
+  FStaticMemberProcs.Free;
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
+  FExternShapes.Free;
+  FModuleLocalNames.Free;
+  FTypesWithCtorDtor.Free;
+  FConstPointeeNames.Free;
+  FModuleDeclared.Free;
 
   inherited Destroy;
 end;
 
 function IsBuiltinTypeName(const N: string): Boolean; forward;
 
+function TPackratParser.ByrefRetKeyOf(const Nm: string): string;
+// The bare label of a procedure name: the overload tail ('~'), the constructor arity ('#') and the
+// operator arity ('@') are cut, so the name reads as the source writes it - which is the only
+// spelling a CALL SITE has to ask with.
+var
+  i: Integer;
+begin
+  Result := Nm;
+  for i := 1 to Length(Result) do
+    if (Result[i] = '~') or (Result[i] = '#') or (Result[i] = '@') then
+      Exit(Copy(Result, 1, i - 1));
+end;
+
 function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
-                                          WithTypeNames: Boolean): string;
+                                          WithTypeNames: Boolean; PtrKinds: Boolean): string;
 // One bank character per explicit parameter -- 'S' string, 'F' float, 'I' everything else (integers,
 // pointers and UDT handles, which are int handles). This is the scheme that tells "g(As Long)" from
 // "g(As Single)" apart, and the one a call site can reproduce from its arguments' banks.
@@ -512,6 +760,15 @@ var
     else if (TN = 'INT32') then Result := '9'
     else if (TN = 'UINT32') then Result := 'A'
     else if (TN = 'BOOLEAN') then Result := 'B'
+    // ⭐ 'Z' / 'W': a ZSTRING PTR and a WSTRING PTR parameter. Both sign the bank 'I' - every pointer
+    // does - so a type declaring one CONSTRUCTOR for each shared ONE label and the second was silently
+    // discarded; fbc's own udt-zstring reference implementation declares exactly that pair, and the
+    // argument then arrived as 0. ⛔ CONSTRUCTORS ONLY (PtrKinds), and that is the ORACLE's rule, not a
+    // shortcut: fbc REFUSES two SUBs that differ only this way ("error 4: Duplicated definition") while
+    // accepting the two constructors. Handing SUBs the same distinction would invent an overload set
+    // fbc does not have.
+    else if PtrKinds and (TN = 'ZSTRING PTR') then Result := 'Z'
+    else if PtrKinds and (TN = 'WSTRING PTR') then Result := 'W'
     else Result := '-';
   end;
 
@@ -563,7 +820,20 @@ begin
     if Names <> '' then Names := Names + ',';
     // A by-value UDT: not builtin, not a pointer, and named. Anything else contributes a placeholder --
     // the tail is POSITIONAL, so a "-" must hold the slot.
-    if (T <> '') and (not IsBuiltinTypeName(T)) and (Pos(' PTR', T) = 0) then
+    // ⭐ ...and a POINTER type names itself here too, with its full spelling ("INTEGER PTR",
+    // "BYTE PTR PTR"). Every pointer signs the bank 'I', so a set overloaded on pointee type - which is
+    // what fbc's own overload/pointers declares, 22 of them - collided on ONE label and every call went
+    // to the first. The comment that used to stand here said a call site cannot reconstruct a pointee
+    // type; it can, for the shape that matters: a declared pointer VARIABLE or PARAMETER, which is what
+    // such a call passes. When it cannot, it writes '-' and the resolver treats that as "any" (see
+    // ResolveCallLabel), so nothing that resolved before stops resolving.
+    // ⛔ INT32 / UINT32 ARE NOT UDTs, and IsBuiltinTypeName does not know them (it is also the guard
+    // that keeps "Dim v As T = T(...)" from reading as a constructor, and a program is still free to
+    // declare a TYPE by those names). Left to fall through here they signed a NAME tail - "H~I:INT32%9" -
+    // which no call site can reproduce: an Int32 argument has no UDT name, so the width tail it now
+    // does produce ('9') could never be reached and the call fell onto the first declaration.
+    if (T <> '') and ((not IsBuiltinTypeName(T)) or (Pos(' PTR', T) > 0)) and
+       (T <> 'INT32') and (T <> 'UINT32') then
     begin
       Names := Names + T;
       AnyUDT := True;
@@ -606,10 +876,17 @@ begin
   if (Base = '') or (Pos('.OPERATOR', Base) > 0) or
      (Pos('#', Base) > 0) or (Pos('@', Base) > 0) or (Pos('~', Base) > 0) then Exit;
 
-  Idx := FProcSeen.IndexOf(Base);
+  // ⛔⛔ TWO PROCEDURES OF ONE NAME IN TWO NAMESPACES ARE NOT AN OVERLOAD SET. They only look alike
+  // until the namespace pass mangles them, and a no-parameter pair signs the SAME empty tail - so the
+  // second was silently discarded and BOTH "ns1.bar" and "ns2.bar" answered 0, with no diagnostic.
+  // The decision is therefore keyed on the namespace body being parsed. FProcSeen keeps the BARE name
+  // beside it, because the two places that ask it ask "is this name a procedure at all" - a question
+  // the namespace does not change.
+  if FProcSeen.IndexOf(Base) < 0 then FProcSeen.Add(Base);
+  Idx := FProcSeenNs.IndexOf(FNsPrefix + '|' + Base);
   if Idx < 0 then
   begin
-    FProcSeen.AddObject(Base, DeclNode);       // first one: keep the bare label
+    FProcSeenNs.AddObject(FNsPrefix + '|' + Base, DeclNode);   // first one: keep the bare label
     Exit;
   end;
 
@@ -618,7 +895,7 @@ begin
 
   // ...and, the first time only, retroactively give one to the declaration already parsed. Its object is
   // cleared afterwards so a third overload does not rename it twice.
-  FirstDecl := TASTNode(FProcSeen.Objects[Idx]);
+  FirstDecl := TASTNode(FProcSeenNs.Objects[Idx]);
   if FirstDecl <> nil then
   begin
     if (FirstDecl.ChildCount >= 2) and (FirstDecl.GetChild(0).NodeType = antIdentifier) and
@@ -630,7 +907,7 @@ begin
       // when this one is (they share a qualified "TYPE.NAME" label).
       FirstName.Value := Base + '~' + ProcSigFromParams(FirstParams, IsMethod, True);
     end;
-    FProcSeen.Objects[Idx] := nil;
+    FProcSeenNs.Objects[Idx] := nil;
   end;
 end;
 
@@ -771,10 +1048,38 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FProcSeenNs.Clear;
+  FNsPrefix := '';
+  FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
+  // ⛔⛔ ...AND THEIR FOLDED VALUES, which was the one registry of fifteen this reset had forgotten.
+  // TryConstIntExpr reads FConstIntValues by BARE NAME and with no other gate, so a "Const MAXLEN = 8"
+  // in one program went on supplying a capacity to the NEXT one: "f As ZString * MAXLEN" in a program
+  // that never declares MAXLEN was folded to 8 instead of declining, and SizeOf answered 8 where it
+  // must answer the string descriptor's 24. Reproduced by parsing two sources through one parser.
+  // ⭐ The comment on the read site claims "a name used before its declaration still declines, exactly
+  // as it does in fbc" - true WITHIN one program, and the registry outlived the program. Same shape as
+  // m656: an invariant that holds only in the case the author had in hand.
+  // The reuse is real and shipped: TSedaiNewConsole (the sbv console) holds ONE TProgramMemory, and
+  // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
+  FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
+  FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
+  FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FModuleLocalNames.Clear;
+  FTypesWithCtorDtor.Clear;
+  FConstPointeeNames.Clear;
+  FModuleDeclared.Clear;
+  FTopLevelStmt := False;
+  FFlatBlockDepth := 0;
+  FInNamespaceBody := False;
+  // ...and the DO nesting depth, for the same reason: it is Inc'd around ParseLoopBody and Dec'd after,
+  // so a program abandoned inside a DO leaves it standing, and a CLASSIC "LOOP" in the NEXT program is
+  // then read as the terminator of a loop that no longer exists.
+  FDoParseDepth := 0;
 
   try
     // Initialize context
@@ -840,10 +1145,38 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FProcSeenNs.Clear;
+  FNsPrefix := '';
+  FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
+  // ⛔⛔ ...AND THEIR FOLDED VALUES, which was the one registry of fifteen this reset had forgotten.
+  // TryConstIntExpr reads FConstIntValues by BARE NAME and with no other gate, so a "Const MAXLEN = 8"
+  // in one program went on supplying a capacity to the NEXT one: "f As ZString * MAXLEN" in a program
+  // that never declares MAXLEN was folded to 8 instead of declining, and SizeOf answered 8 where it
+  // must answer the string descriptor's 24. Reproduced by parsing two sources through one parser.
+  // ⭐ The comment on the read site claims "a name used before its declaration still declines, exactly
+  // as it does in fbc" - true WITHIN one program, and the registry outlived the program. Same shape as
+  // m656: an invariant that holds only in the case the author had in hand.
+  // The reuse is real and shipped: TSedaiNewConsole (the sbv console) holds ONE TProgramMemory, and
+  // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
+  FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
+  FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
+  FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FModuleLocalNames.Clear;
+  FTypesWithCtorDtor.Clear;
+  FConstPointeeNames.Clear;
+  FModuleDeclared.Clear;
+  FTopLevelStmt := False;
+  FFlatBlockDepth := 0;
+  FInNamespaceBody := False;
+  // ...and the DO nesting depth, for the same reason: it is Inc'd around ParseLoopBody and Dec'd after,
+  // so a program abandoned inside a DO leaves it standing, and a CLASSIC "LOOP" in the NEXT program is
+  // then read as the terminator of a loop that no longer exists.
+  FDoParseDepth := 0;
 
   try
     // Initialize context
@@ -884,6 +1217,7 @@ var
  LineNum: Integer;
 begin
  Result := TASTNode.Create(antProgram);
+ RejectEmptyAliasNames;
 
  while not Context.IsAtEnd do
  begin
@@ -930,7 +1264,20 @@ begin
        Continue; // Continue to next statement on same line
      end;
 
+     // A statement parsed HERE is at module level; anything ParseStatement reaches from inside its own
+     // body (a Sub, a namespace, a Scope block) is not. The flag is consumed - and cleared - by the
+     // first thing that reads it, so a nested ParseStatement always sees False. This is the ONLY
+     // notion of "module level" the parser has, and the EXTERN rule below needs exactly that.
+     FTopLevelStmt := (FFlatBlockDepth = 0);
      Statement := Memoize('Statement', @ParseStatement);
+     FTopLevelStmt := False;
+     if Assigned(Statement) then
+       case Statement.NodeType of
+         antForLoop: Inc(FFlatBlockDepth);
+         antNext:    if FFlatBlockDepth > 0 then Dec(FFlatBlockDepth);
+       else
+         ;
+       end;
 
      if Assigned(Statement) then
      begin
@@ -952,6 +1299,11 @@ begin
  // C128 (typing the listing: last definition wins, at the number's slot). Without this both
  // versions were lowered and the duplicated LINE_<n> label crashed the dominator pass.
  DedupNumberedLines(Result);
+
+ // ...and only now, with the whole tree in hand and every module-level EXTERN registered, can the
+ // static-storage question be asked: it needs to know whether a declaration sits inside a NAMESPACE.
+ CollectModuleLocalNames(Result, False);
+ RejectStaticVarLenStringInit(Result, False);
 
  DoNodeCreated(Result);
 end;
@@ -1054,8 +1406,14 @@ var
   Token: TLexerToken;
   ErrorToken: TLexerToken;
   SavedIndex: integer;
+  AtModuleLevel: Boolean;
+  DeclDecoU: string;      // the word right after a module-level DECLARE, if it is a member decorator
 begin
   Result := nil;
+  // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
+  // ParseStatement it goes on to make from inside its own body is not.
+  AtModuleLevel := FTopLevelStmt;
+  FTopLevelStmt := False;
 
   if not HasValidContext or Context.IsAtEnd then
     Exit;
@@ -1068,8 +1426,19 @@ begin
   // "min(A, B) = 0" assigns through a ByRef result, and "myproc arg" calls the user's procedure.
   // The declaration site already accepts these names (see IsShadowableExtensionName); a statement
   // that begins with one has to as well, or the program parses its own function and then cannot
-  // call it. Nothing is lost: the extensions are FUNCTIONS, so none of them ever begins a statement.
+  // call it.
+  // ⛔ "None of them ever begins a statement" — the claim this rule used to carry — is FALSE for
+  // BSAVE, and the discriminator is not the token type but WHOSE word it is. Thirty-eight of the
+  // thirty-nine are OUR extensions, words fbc has never heard of, so a program that writes one at
+  // statement start can only mean its own procedure. BSAVE is fbc's OWN gfx statement, and reading it
+  // as a name lost the statement outright: "bsave(""foo.bmp"", 0)" became an array access and failed
+  // with "Array not declared: BSAVE" (fbc suite gfx/bsave-nullptr-fb, and its -lang qb twin).
+  // ⭐ It stays in the list all the same, because the DECLARATION door is where the name has to be
+  // free: fbc refuses "Dim bsave As Integer" ("Duplicated definition") but accepts
+  // "Function bsave Alias ""fb_GfxBsave""" (its own warnings/rtl-prototypes.bas overloads it twice).
+  // So: open where a NAME is expected, shut where a STATEMENT is.
   if FModernMode and (Token.TokenType <> ttIdentifier) and
+     (UpperCase(Token.Value) <> kBSAVE) and
      IsShadowableExtensionName(UpperCase(Token.Value)) then
     Token.TokenType := ttIdentifier;
 
@@ -1140,6 +1509,22 @@ begin
 
  if (Token.TokenType = ttIdentifier) and (UpperCase(Token.Value) = 'DECLARE') then
  begin
+   // ⛔ A DECLARE OUTSIDE A TYPE TAKES NO LEADING DECORATOR AT ALL. VIRTUAL, ABSTRACT, STATIC and a
+   // leading CONST describe a MEMBER of a type, and outside one fbc refuses every one of them on its
+   // own, not only in combination ("error 17: Syntax error, found 'virtual'"). Probed one word at a
+   // time against the oracle - and against SUB, FUNCTION, PROPERTY and CONSTRUCTOR alike, since the
+   // answer could have differed per procedure kind and does not.
+   // ⚠️ Only these four: OVERRIDE and FINAL are MODERN extensions of ours, so fbc has no opinion to
+   // copy and they are left alone. The forward declaration itself stays a no-op - our calls resolve
+   // from a pre-pass over the real definitions - so this adds a refusal and changes nothing else.
+   if FModernMode and Assigned(Context.PeekNext) then
+   begin
+     DeclDecoU := UpperCase(VarToStr(Context.PeekNext.Value));
+     if (DeclDecoU = 'VIRTUAL') or (DeclDecoU = 'ABSTRACT') or (DeclDecoU = 'STATIC') or
+        (DeclDecoU = 'CONST') then
+       HandleError(Format('"%s" describes a member of a TYPE: a DECLARE outside a type body cannot ' +
+         'carry it', [DeclDecoU]), Context.PeekNext);
+   end;
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
    Result := nil;
    Exit;
@@ -1173,7 +1558,24 @@ begin
      Exit;
    end
    else
+   begin
+     // ⭐ ...and before the line is thrown away, its SHAPE is read off it. A single-line EXTERN is
+     // still a DECLARATION: it fixes the name's rank, bounds, static/dynamic-ness and element type,
+     // and fbc rejects a later DIM/REDIM/EXTERN that disagrees. ScanModuleLevelExtern reads the line
+     // and REWINDS; the skip below is unchanged, so not one token of the old behaviour moves.
+     FPendingExternArray := nil;
+     if AtModuleLevel and (UpperCase(Token.Value) = 'EXTERN') then ScanModuleLevelExtern;
      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+     // ...and the ONE thing a lone EXTERN cannot throw away with the rest of the line: the storage an
+     // EXTERN ARRAY the module never defines still owes the SSA. See ScanModuleLevelExtern.
+     if Assigned(FPendingExternArray) then
+     begin
+       Result := FPendingExternArray;
+       FPendingExternArray := nil;
+       DoNodeCreated(Result);
+       Exit;
+     end;
+   end;
    Result := nil;
    Exit;
  end;
@@ -1209,13 +1611,29 @@ begin
 
     // === DATA HANDLING ===
     ttDataAssignment: Result := Memoize('LetStatement', @ParseLetStatement);
-    ttDataDeclaration: Result := Memoize('DimStatement', @ParseDimStatement);
+    ttDataDeclaration:
+    begin
+      Result := Memoize('DimStatement', @ParseDimStatement);
+      if AtModuleLevel then CheckDeclAgainstExtern(Result, False);
+      if AtModuleLevel then CheckDuplicateModuleDecl(Result, False);
+      CheckDeclStatesItsType(Result);
+    end;
     ttArrayErase: Result := Memoize('EraseStatement', @ParseEraseStatement);
     ttLSet: Result := ParseLRSetStatement(antLSet);
     ttRSet: Result := ParseLRSetStatement(antRSet);
-    ttArrayRedim: Result := Memoize('RedimStatement', @ParseRedimStatement);
+    ttArrayRedim:
+    begin
+      Result := Memoize('RedimStatement', @ParseRedimStatement);
+      CheckRedimTargetIsAName(Result);   // ⛔ not gated on module level: fbc refuses it everywhere
+      if AtModuleLevel then CheckDeclAgainstExtern(Result, True);
+      if AtModuleLevel then CheckDuplicateModuleDecl(Result, True);
+    end;
     ttEnum: Result := Memoize('EnumStatement', @ParseEnumStatement);
     ttDefType: Result := Memoize('DefTypeStatement', @ParseDefTypeStatement);
+    // ⛔ NO duplicate check on a CONST. fbc ALLOWS a constant to be redeclared with the SAME value -
+    // its own const/redundant-constants declares "Const I1 = 0" twice on purpose - and only a
+    // CONFLICTING redefinition is an error. Refusing on the name alone cost that test; telling the two
+    // apart needs the folded value on both sides, which is a separate piece of work.
     ttConstant: Result := Memoize('ConstStatement', @ParseConstStatement);
     ttDataConstant: Result := Memoize('DataStatement', @ParseDataStatement);
     ttDataRead: Result := Memoize('ReadStatement', @ParseReadStatement);
@@ -1322,8 +1740,38 @@ begin
     ttCondSignal, ttCondBroadcast, ttCondDestroy:
       Result := Memoize('CondOpStatement', @ParseCondOpStatement);
     ttSharedDecl: Result := ParseSharedError;   // SHARED is only the DIM SHARED modifier, not a statement
-    ttTypeDecl: Result := Memoize('TypeDecl', @ParseTypeDecl);
-    ttUnionDecl: Result := Memoize('UnionDecl', @ParseUnionDecl);
+    // ⛔ TYPE at statement start is not always a DECLARATION: "type<UDT>( ).method( )" is an anonymous
+    // temporary a method is called on, and fbc's own suite writes it that way. The declaration is always
+    // "Type <name>" or "Type As <t> <name>"; only the type-CONSTRUCTOR spellings put "<" or "(" there,
+    // which is a one-token look-ahead and cannot take a declaration away from ParseTypeDecl.
+    ttTypeDecl:
+      if Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType in [ttOpLt, ttDelimParOpen]) then
+      begin
+        // Assignment FIRST, exactly as the '(' case does: "type<UDT>( 0 ).i = 1" writes a member of the
+        // temporary and is legal, and only the assignment shape carries the check that refuses writing
+        // to the temporary ITSELF. Read as a plain expression it would be a discarded comparison, which
+        // is how "type<UDT>( 1 ) = x" - an ERROR in fbc - came out silently accepted.
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end
+      else
+      begin
+        Result := Memoize('TypeDecl', @ParseTypeDecl);
+        NoteTypeCtorDtor(Result);
+        if not AtModuleLevel then RefuseNonModuleLevelType(Result);
+      end;
+    ttUnionDecl:
+    begin
+      Result := Memoize('UnionDecl', @ParseUnionDecl);
+      NoteTypeCtorDtor(Result);
+      if not AtModuleLevel then RefuseNonModuleLevelType(Result);
+    end;
     ttRandomize: Result := Memoize('RandomizeStatement', @ParseRandomizeStatement);
     ttWithBlock: Result := ParseWith;
     ttNamespaceBlock: Result := Memoize('NamespaceDecl', @ParseNamespaceDecl);
@@ -1337,6 +1785,35 @@ begin
     // A graphics function at statement start is an expression statement (e.g. GETMOUSE(x,y) called for its
     // by-reference side effects, discarding the status). Mirrors ttSpriteFunction / ttInputFunction.
     ttGraphicsFunction: Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+
+    // ⭐ A BUILT-IN FUNCTION CALLED FOR NOTHING IS STILL A STATEMENT. FreeBASIC lets any function's
+    // result be discarded - "CUInt( f( 1, 2, 3 ) )" is written exactly to run f and throw the number
+    // away, and "Hex( i )" appears in fbc's own ignore-result test. Only the graphics/sprite/input
+    // families were routed here; the math and string ones fell to the generic dispatcher and came out
+    // as "Unexpected token in statement: "cuint"".
+    ttMathFunction, ttStringFunction, ttMemoryFunction, ttSystemFunction,
+    ttErrorHandlingFunction, ttOutputFunction:
+      // ⛔ ...AND A CONVERSION IS ALSO AN LVALUE. "CUInt( i ) Shr= 1" reinterprets i's bits, shifts
+      // them and writes them back - fbc's own quirk/casting is written that way - and "Cast( UInteger,
+      // i ) Shr= 1", the SAME operation, already worked: CAST is not a registered keyword, so it
+      // reached the assignment chain through the ordinary identifier arm while CUInt, a ttMathFunction,
+      // could not. One operation, two spellings, and the rule lived in one of them. Assignment FIRST,
+      // exactly as the ttTypeDecl and '(' cases do; with no assignment operator after it this returns
+      // nil and the expression statement below takes it, which is how "CUInt( f(1,2,3) )" - a call made
+      // for its side effects - keeps working.
+      if (Token.TokenType = ttMathFunction) and FModernMode and IsCastFunctionName(UpperCase(Token.Value)) and
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end
+      else
+        Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
 
     // === SPRITE COMMANDS ===
     ttSpriteCommand: Result := Memoize('SpriteStatement', @ParseSpriteStatement);
@@ -1467,10 +1944,11 @@ begin
         else if FModernMode and (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttIdentifier, ttNumber, ttInteger]) then
           Result := ParseSeekStatement
-        // FreeBASIC graphics "PUT (x,y), src [, mode]" — PUT is a bare identifier; the leading '('
-        // (vs '#') selects the graphics blit form.
+        // FreeBASIC graphics "PUT [img,] (x,y), src [, mode]" — PUT is a bare identifier; the leading
+        // '(' (vs '#') selects the graphics blit form, and so does the image-target form
+        // "PUT img, (x,y), src", which LINE/CIRCLE/PAINT/PSET have taken since the target work.
         else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
-                (Context.PeekNext.TokenType = ttDelimParOpen) then
+                ((Context.PeekNext.TokenType = ttDelimParOpen) or LooksLikeImageTarget) then
           Result := ParseGfxPutStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
         else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
@@ -1478,6 +1956,62 @@ begin
         begin
           Context.Advance;   // consume PUT
           Result := ParseBinaryFileTail(False, Token);
+        end
+        // ⛔⛔ INLINE ASSEMBLY IS REFUSED, and it has to be refused HERE rather than left alone. "ASM" is
+        // not a reserved word, so an "Asm ... End Asm" block parsed as a bare call to an undefined name
+        // followed by ordinary statements - and its closing "End Asm" was read as plain "END", which
+        // STOPS THE PROGRAM. A block that emits nothing would be one thing; a block that silently ends
+        // the program at the point it appears is a wrong answer with no diagnostic at all: "print" before
+        // it ran, "print" after it did not, and the exit code was 0.
+        // x86 assembly has no meaning in a bytecode VM whose engines include an interpreter, so this is
+        // structural and declared (BASIC.md, "Declared unsupported"); saying so is the whole fix.
+        // ⚠️ MODERN only, and only when ASM opens the statement: "asm" stays usable as a name elsewhere.
+        // ⭐ ...and the ONE-LINE spelling, "Asm <instruction>", which FreeBASIC accepts beside the block.
+        // Only the block form was recognised, so the single line fell through to the assignment path and
+        // reported "Expected \"=\" in assignment" - a message about a statement the program never wrote,
+        // where the refusal below says what is actually going on. Same declared limitation, one message.
+        else if FModernMode and (UpperCase(Token.Value) = 'ASM') and
+                ((Context.PeekNext = nil) or
+                 (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) or
+                 AsmStatementFollows) then
+        begin
+          // ⭐ ...BUT A BLOCK WITH NO INSTRUCTION IN IT HAS NOTHING TO TRANSLATE. The comment above
+          // names the distinction ("a block that emits nothing would be one thing") and it is a real
+          // program: fbc's pp/pragma-reserve-7 writes "asm / #if defined(symbol) / #error / #endif /
+          // end asm" - a block whose whole content is PREPROCESSOR directives, which are consumed
+          // before the parser ever sees them. The test is about the reserved-symbol lists, not about
+          // assembly. Refusing it declared a limitation the program does not use.
+          // ⛔ The moment there is a TOKEN between the two, the refusal stands: a block that does real
+          // work must not be silently dropped, which would put a wrong answer where a diagnostic was.
+          if AsmBlockIsEmpty then
+          begin
+            SkipAsmBlock;
+            Exit(nil);
+          end;
+          HandleError('Inline assembly (ASM ... END ASM) is not supported: this is a bytecode VM, ' +
+                      'and one of its engines is an interpreter. Rewrite the block in BASIC.',
+                      Token);
+          // Swallow the block so the "End Asm" that closes it is not read as "END" - which is what
+          // silently terminated the program - and so one refusal is reported instead of a cascade.
+          // The one-line form ends at the end of the line and must NOT eat the rest of the file.
+          if (Context.PeekNext <> nil) and
+             not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
+          begin
+            while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+          end
+          else
+          while not Context.CheckAny([ttEndOfFile]) do
+          begin
+            if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+               (Context.PeekNext.TokenType = ttIdentifier) and
+               (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ASM') then
+            begin
+              Context.Advance; Context.Advance;      // END ASM
+              Break;
+            end;
+            Context.Advance;
+          end;
+          Result := nil;
         end
         // FreeBASIC/QB "NAME old AS new" (rename). NAME is a bare identifier (not reserved, so it can
         // still be a variable/field); the trailing AS before end-of-statement disambiguates from an
@@ -1507,10 +2041,31 @@ begin
                                                 ttStringFunction, ttMathFunction, ttMemoryFunction,
                                                 ttSystemFunction, ttInputFunction, ttUsrFunction,
                                                 ttErrorHandlingFunction, ttOutputFunction,
-                                                ttGraphicsFunction, ttSpriteFunction, ttSoundFunction]) then
+                                                ttGraphicsFunction, ttSpriteFunction, ttSoundFunction,
+                                                // ...or an anonymous TEMPORARY: "proc1 type<Integer>3, 3"
+                                                // begins its first argument with the word TYPE, which is
+                                                // as much a value token as a function name is. Without it
+                                                // the statement fell to "Expected "=" in assignment",
+                                                // naming the token that IS there rather than the one
+                                                // that is not.
+                                                ttTypeDecl,
+                                                // ...or with its PASSING MODE written on it:
+                                                // "test_const ByVal 1234" is FreeBASIC's per-argument
+                                                // override, and it can only be a bare call - an
+                                                // assignment never has BYVAL where its '=' belongs.
+                                                ttParamMode]) and
+                // ⛔ ...UNLESS THE SIGN IS THE OPERATOR OF A COMPOUND ASSIGNMENT WRITTEN APART.
+                // FreeBASIC allows the operator and its '=' to be separated - "i + => 5" and "i - = 2"
+                // mean "i += 5" and "i -= 2", and fbc's own quirk/assignment-token is written that way.
+                // The note below says a compound assignment "uses a single ttCompoundAssign token, so
+                // it is unaffected": true of the FUSED spelling and false of the spaced one, which
+                // therefore came here and was parsed as a bare call with a signed first argument.
+                // ("=>" is folded into one ttOpEq by the lexer, so both spellings of the '=' are this
+                // one test.)
+                not ((Context.PeekNext.TokenType in [ttOpAdd, ttOpSub]) and
+                     Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttOpEq)) then
           // A value token (or a leading +/- sign of a signed numeric argument, e.g. "bitwise -15, 3")
-          // right after the name makes this a bare SUB call, never an assignment. Compound assignment
-          // ("name += ..." / "name -= ...") uses a single ttCompoundAssign token, so it is unaffected.
+          // right after the name makes this a bare SUB call, never an assignment.
           Result := Memoize('BareCallStatement', @ParseBareCallStatement)
         // FreeBASIC/QB bare parameterless SUB call: a lone "SubName" as a whole statement (nothing after
         // the name before the end of the statement). Parsed as an argument-less call; the SSA no-ops it
@@ -1597,8 +2152,23 @@ begin
 
     else
     begin
+      // ⭐ A FUNCTION CALLED AS A STATEMENT, WITH ITS RESULT DISCARDED. FreeBASIC allows it for any
+      // function, builtin included: "threadcreate( @proc )" on a line of its own is fbc's own
+      // typedef/procptr-temp-name, and the same shape is what m659 found for HEX/BIN/OCT (right inside
+      // an expression, refused as a statement). The word lexes as a KEYWORD, so no arm above claims it
+      // and the dispatcher fell through to the refusal below - while the identical call written
+      // "dim h = threadcreate( @proc )" worked, which is what says the gap is in the STATEMENT form.
+      // ⛔ Tried only HERE, where nothing else matched, and only when a '(' follows: a keyword that
+      // really opens a statement has already been claimed by its own arm, so no existing shape changes.
+      if Assigned(Context.CurrentToken) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType = ttDelimParOpen) then
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        if Assigned(Result) then Exit;
+        Context.CurrentIndex := SavedIndex;
+      end;
       ErrorToken := Context.CurrentToken;  // ← errore sul TOKEN CORRENTE, non quello catturato all'inizio
-      //WriteLn('DEBUG: ERROR on token "', ErrorToken.Value, '" at line=', ErrorToken.Line);
       HandleError(Format('Unexpected token in statement: "%s"', [ErrorToken.Value]), ErrorToken);
       Result := nil;
     end;
@@ -1607,12 +2177,15 @@ end;
 
 function TPackratParser.ParseAssignmentStatement: TASTNode;
 var
- LeftSide, Expression: TASTNode;
+ LeftSide, Expression, BareArgs, BareArg: TASTNode;
  Token: TLexerToken;
  SavedToken: TLexerToken;
  LhsIsExpr: Boolean;   // LHS built by the expression parser (member/array): may be a call stmt
  OpSym: string;        // compound-assignment operator symbol ('+','-','*','/','^')
  OpType: TTokenType;   // its arithmetic binary-op token type
+ ConstPointeeNm: string;   // the pointer-to-const this target would write through, if any
+ CastFnName: string;       // "CUInt( i ) Shr= 1": the conversion this target is written as
+ CastNode: TASTNode;
 begin
  Token := Context.CurrentToken;
  SavedToken := Token;   // default (member/array LHS branches don't set it; avoids nil on error)
@@ -1661,6 +2234,16 @@ begin
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
   end
+  else if Context.Check(ttTypeDecl) and Assigned(Context.PeekNext) and
+    (Context.PeekNext.TokenType in [ttOpLt, ttDelimParOpen]) then
+  begin
+    // "type<UDT>( 0 ).i = 1": a MEMBER of an anonymous temporary is a legal target (fbc's sf.net #801
+    // says so, and says the temporary itself is not). The statement dispatch sends every "Type <" /
+    // "Type (" here first; with no '=' this returns nil QUIETLY and the caller reads it as the
+    // expression statement it is ("type<UDT>( ).method( )").
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+  end
   else if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
     ((Context.PeekNext.TokenType = ttDelimParOpen) or
      (Context.PeekNext.TokenType = ttDelimBrackOpen) or
@@ -1670,6 +2253,30 @@ begin
     // build the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
+  end
+  // "CUInt( i ) Shr= 1": a CONVERSION of an lvalue is an lvalue - the value is reinterpreted, operated
+  // on and written back through the same variable. The dispatcher routes only these names here, and
+  // only when a '(' follows; see the note at ttMathFunction for why "Cast( UInteger, i )" needed no arm.
+  else if FModernMode and Context.Check(ttMathFunction) and
+    IsCastFunctionName(UpperCase(VarToStr(Token.Value))) and
+    Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    CastFnName := UpperCase(VarToStr(Token.Value));
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+    // ...and it is REWRITTEN into the CAST it means. "CUInt( i )" parses as an ordinary function call,
+    // and only antCast carries a store path; building the same node here is the whole of it, rather
+    // than teaching a second lowering the same thing. ⛔ Only the ONE-argument shape: anything else is
+    // not this operation, and it stays the call it was (the caller then reads it as an expression).
+    if (LeftSide <> nil) and (LeftSide.NodeType = antFunctionCall) and (LeftSide.ChildCount = 1) and
+       (LeftSide.GetChild(0).NodeType = antArgumentList) and (LeftSide.GetChild(0).ChildCount = 1) and
+       (CastFunctionTypeName(CastFnName) <> '') then
+    begin
+      CastNode := TASTNode.CreateWithValue(antCast, CastFunctionTypeName(CastFnName), LeftSide.Token);
+      CastNode.AddChild(LeftSide.GetChild(0).GetChild(0).Clone);
+      LeftSide.Free;
+      LeftSide := CastNode;
+    end;
   end
   else if Context.Check(ttBaseCall) then
   begin
@@ -1722,6 +2329,34 @@ begin
     Exit;
   end;
 
+  // ⭐ ...AND A CONSTANT IS NOT AN LVALUE, in every shape of target the chain above can build.
+  // ⛔ ONLY WHEN AN ASSIGNMENT REALLY FOLLOWS. This routine is also how a bare "baz.bar()" arrives -
+  // it builds the target, finds no '=', and hands the statement back as a CALL - so asking before the
+  // operator is in sight refused a METHOD CALL on a const object ("Dim As Const Foo b : b.bar()"),
+  // which fbc runs. Found by the terna: B2 rose, B1 held, and CUERR went up by one.
+  if FModernMode and (LeftSide <> nil) and
+     (Context.Check(ttOpEq) or Context.Check(ttCompoundAssign)) then
+  begin
+    ConstPointeeNm := ConstRootOfTarget(LeftSide);
+    if ConstPointeeNm <> '' then
+    begin
+      HandleError(Format('Cannot modify a constant: %s', [ConstPointeeNm]), Context.CurrentToken);
+      LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
+    ConstPointeeNm := WritesThroughConstPointee(LeftSide);
+    if ConstPointeeNm <> '' then
+    begin
+      HandleError(Format('Cannot modify a constant: %s points to a constant, so what it points at ' +
+        'cannot be written (the pointer itself can be reassigned)', [ConstPointeeNm]),
+        Context.CurrentToken);
+      LeftSide.Free;
+      Result := nil;
+      Exit;
+    end;
+  end;
+
   // FreeBASIC keyword-operator compound assignment: "lhs MOD= rhs", "lhs AND/OR/XOR= rhs",
   // "lhs SHL/SHR= rhs", "lhs EQV/IMP= rhs". Unlike the symbolic forms (+= &= ...), the keyword stops
   // at the '=', so the lexer yields the operator token (ttOpMod/ttBitwiseAND/...) followed by a
@@ -1734,12 +2369,31 @@ begin
       (Context.CurrentToken.TokenType = ttBitwiseOR) or
       (Context.CurrentToken.TokenType = ttBitwiseXOR) or
       (Context.CurrentToken.TokenType = ttOpEqv) or
+      // ...and the SHORT-CIRCUIT pair. "i OrElse= 1" and "i AndAlso= 0" are the same spelling with the
+      // same desugaring, and they were the only two keyword operators missing from this list - the
+      // statement fell through to "Expected "=" in assignment", which names the very token that IS there.
+      (Context.CurrentToken.TokenType = ttOpAndAlso) or
+      (Context.CurrentToken.TokenType = ttOpOrElse) or
+      // ⛔ ...AND THE SYMBOLIC OPERATORS BELONG IN THIS LIST TOO. FreeBASIC lets the operator and the
+      // '=' be written APART - "i + => 5" and "i - = 2" mean "i += 5" and "i -= 2", and its own
+      // quirk/assignment-token test is written that way. The symbolic forms relied entirely on the
+      // LEXER fusing "+=" into one token, so with a space between them the statement fell through and
+      // reported the '=>' it was left standing on. The keyword operators have carried this exact rule
+      // from the start; one more case of a rule living in one half of a pair.
+      (Context.CurrentToken.TokenType = ttOpAdd) or
+      (Context.CurrentToken.TokenType = ttOpSub) or
+      (Context.CurrentToken.TokenType = ttOpMul) or
+      (Context.CurrentToken.TokenType = ttOpDiv) or
+      (Context.CurrentToken.TokenType = ttOpIntDiv) or
+      (Context.CurrentToken.TokenType = ttOpPow) or
+      (Context.CurrentToken.TokenType = ttOpConcat) or
       (Context.CurrentToken.TokenType = ttOpImp)) then
   begin
     OpType := Context.CurrentToken.TokenType;
     OpSym := Context.CurrentToken.Value;
     Context.Advance;                                 // consume the operator keyword
     Context.Advance;                                 // consume the trailing "="
+    if Context.Check(ttOpGt) then Context.Advance;   // ...and the "=>" spelling of that '='
     Expression := FExpressionParser.ParseExpression;
     if not Assigned(Expression) then
     begin
@@ -1768,6 +2422,12 @@ begin
   begin
     OpSym := Context.CurrentToken.Value;
     Context.Advance;                                 // consume the "op=" token
+    // ⛔ ...AND THE "=>" SPELLING OF THE SAME OPERATOR. FreeBASIC accepts "i +=> 5" beside "i += 5",
+    // just as it accepts "i => 5" beside "i = 5"; the lexer answers a single ttCompoundAssign for the
+    // "+=" and leaves the '>' standing, which then read as a comparison and failed with 'Unexpected
+    // token ">"'. The plain "=>" form was already understood - only the COMPOUND one was not, which is
+    // the same one-spelling-of-two shape as everywhere else in this campaign.
+    if Context.Check(ttOpGt) then Context.Advance;    // the "op=>" spelling
     Expression := FExpressionParser.ParseExpression;
     if not Assigned(Expression) then
     begin
@@ -1821,6 +2481,27 @@ begin
         DoNodeCreated(Result);
         Exit;
       end;
+      // ...and the same statement with its FIRST argument in parentheses: "proc1 (3), 4". The expression
+      // parser reads "proc1 (3)" as a complete call - the two spellings are identical up to that point -
+      // and the arguments after the comma were ORPHANED: the call ran with one argument and the rest
+      // became statements of their own ("Unhandled node type"), so "proc1 (3), 4" printed "3 0".
+      // The group already parsed IS the first argument; the remaining ones join the same list.
+      if (LeftSide <> nil) and (LeftSide.NodeType = antArrayAccess) and Context.Check(ttSeparParam) and
+         (LeftSide.ChildCount >= 2) and
+         (LeftSide.GetChild(1).NodeType in [antExpressionList, antArgumentList]) then
+      begin
+        BareArgs := LeftSide.GetChild(1);
+        while Context.Check(ttSeparParam) do
+        begin
+          Context.Advance;                                     // ','
+          BareArg := FExpressionParser.ParseExpression;
+          if not Assigned(BareArg) then Break;
+          BareArgs.AddChild(BareArg);
+        end;
+        Result := LeftSide;
+        DoNodeCreated(Result);
+        Exit;
+      end;
       if Assigned(LeftSide) then LeftSide.Free;
       Result := nil;
       Exit;
@@ -1855,7 +2536,7 @@ end;
 function TPackratParser.ParsePrintStatement: TASTNode;
 var
   Token: TLexerToken;
-  Expr, FormatNode, UsingMarker: TASTNode;
+  Expr, FormatNode, UsingMarker, HandleNode: TASTNode;
   SeparatorNode: TASTNode;
   IsUsingFormat: Boolean;
 begin
@@ -1882,13 +2563,9 @@ begin
       Result.Free;
       Result := TASTNode.Create(antPrintFile, Token);
       Context.Advance;  // consume '#'
-      if Context.Check(ttNumber) or Context.Check(ttInteger) then
-      begin
-        Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-        Context.Advance;
-      end
-      else if Context.Check(ttIdentifier) then
-        Result.AddChild(ParseFileHandleIdent)
+      HandleNode := ParseFileNumberOperand;
+      if Assigned(HandleNode) then
+        Result.AddChild(HandleNode)
       else
         HandleError('Expected file number after PRINT #', Token);
       if Context.CheckAny([ttSeparParam, ttSeparOutput]) then
@@ -1989,7 +2666,7 @@ function TPackratParser.ParseInputStatement: TASTNode;
 var
   Token: TLexerToken;
   Expr: TASTNode;
-  SeparatorNode: TASTNode;
+  SeparatorNode, HandleNode: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antInput, Token);
@@ -2001,13 +2678,9 @@ begin
     Result.Free;
     Result := TASTNode.Create(antInputFile, Token);
     Context.Advance;  // consume '#'
-    if Context.Check(ttNumber) or Context.Check(ttInteger) then
-    begin
-      Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-      Context.Advance;
-    end
-    else if Context.Check(ttIdentifier) then
-      Result.AddChild(ParseFileHandleIdent)
+    HandleNode := ParseFileNumberOperand;
+    if Assigned(HandleNode) then
+      Result.AddChild(HandleNode)
     else
       HandleError('Expected file number after INPUT #', Token);
     if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after handle
@@ -2183,6 +2856,7 @@ end;
 function TPackratParser.ParseLetStatement: TASTNode;
 var
   Assignment, Targets, Tgt: TASTNode;
+  TgtK: Integer;
   SavedToken: TLexerToken;
 begin
   SavedToken := Context.CurrentToken;
@@ -2196,7 +2870,18 @@ begin
     Context.Advance;                                     // (
     Targets := TASTNode.Create(antExpressionList, SavedToken);
     repeat
-      Tgt := FExpressionParser.ParseExpression;
+      // ⭐ AN EMPTY SLOT SKIPS ITS FIELD: "Let( foo, , baz ) = f()" leaves the second one alone, and
+      // FreeBASIC's own suite writes it. ParseExpression answers nil at the comma, the loop broke, and
+      // the ')' matcher then met that comma - "Expected \")\" after the LET target list". A placeholder
+      // keeps the POSITION, which is the whole point: the third target must still receive the third
+      // field. The SSA skips a target marked this way.
+      if Context.Check(ttSeparParam) or Context.Check(ttDelimParClose) then
+      begin
+        Tgt := TASTNode.CreateWithValue(antIdentifier, '', Context.CurrentToken);
+        Tgt.Attributes.Values['LETSKIP'] := '1';
+      end
+      else
+        Tgt := FExpressionParser.ParseExpression;
       if not Assigned(Tgt) then Break;
       Targets.AddChild(Tgt);
       if Context.Check(ttSeparParam) then Context.Advance else Break;
@@ -2220,6 +2905,11 @@ begin
     Result := TASTNode.Create(antLetList, SavedToken);
     Result.AddChild(Targets);
     Result.AddChild(Assignment);
+    // ⛔ EVERY target of the destructuring is WRITTEN, so every one must be writable. The empty slot
+    // is not a target at all - it names a field to leave alone - so it is skipped, not judged.
+    for TgtK := 0 to Targets.ChildCount - 1 do
+      if Targets.GetChild(TgtK).Attributes.Values['LETSKIP'] <> '1' then
+        RefuseUnwritableTarget(Targets.GetChild(TgtK), 'a LET() target');
     Exit;
   end;
 
@@ -2542,6 +3232,7 @@ function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
   Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName, ParamTypeName, ParamNameU: string;
+  ProcPtrRet: TASTNode;
   OpSymbolForm: Boolean;   // "OPERATOR <sym>(...)" (arity goes in the label) vs "OPERATOR T.CAST/LET"
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
@@ -2658,6 +3349,21 @@ begin
       // CONSTRUCTOR/DESTRUCTOR Type(...) — the identifier is the owner type; the method is
       // "Type.CONSTRUCTOR" / "Type.DESTRUCTOR" with an implicit THIS AS Type. Auto-called at
       // instance allocation (M4.4) / scope exit (V5).
+      // ⛔ ...AND THE OWNER MAY BE QUALIFIED. "Constructor n.U2()" written OUTSIDE the namespace that
+      // declares U2 is how FreeBASIC's own suite writes it, and only the FIRST identifier was taken:
+      // the body became the constructor of a type called "N" and ".U2()" was left standing in the
+      // token stream, read as a reference to an array ("Array not declared: U2"). At two levels it was
+      // worse than a refusal - the constructor was silently never called and the field stayed 0.
+      // ⭐ The METHOD spelling beside it ("Sub n.U2.sh()") already read the whole dotted run; the rule
+      // lived in one of the two arms of the same "if".
+      while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+            (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+            (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+      begin
+        Context.Advance;                          // '.'
+        QualName := QualName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+        Context.Advance;                          // the next name of the owner
+      end;
       MethodType := QualName;
       QualName := MethodType + '.' + Kind;
     end
@@ -2689,6 +3395,7 @@ begin
         end;
       end;
     end;
+    CheckMemberDefinitionIsDeclared(MethodType, QualName, Kind, NameTok);
     NameNode := TASTNode.CreateWithValue(antIdentifier, QualName, NameTok);
     Result.AddChild(NameNode);
   end;
@@ -2788,7 +3495,11 @@ begin
           // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
           if TryParseProcPtrType(ParamNode) then
             ParamTypeName := ''
-          else if Context.Check(ttIdentifier) then
+          // ⛔ ...and a PARAMETER's type may carry the global-scope dots too ("ByVal p As ..r.foo.t1").
+          // Asking ttIdentifier alone did not fail here - it fell through with an EMPTY type name, so
+          // the parameter silently defaulted and the callee read a different object. Same spelling as
+          // the DIM gate, and the same reader now answers for both.
+          else if AtDottedTypeName then
           begin
             RetTok := Context.CurrentToken;
             ParamTypeName := UpperCase(ParseDottedName);
@@ -2864,7 +3575,14 @@ begin
     //
     // Read as a setter, the getter became a SUB and its "As Integer" then had nowhere to go:
     // "Unexpected token in statement: As". FreeBASIC's own rule is the presence of a result type.
-    if Context.Check(ttAsType) then
+    // ⭐ ...and a getter may return a REFERENCE: "Property p( ) ByRef As Integer", which is how an
+    // ASSIGNABLE property is written. The word BYREF stands between the parameter list and the AS, so
+    // the test above saw no result type, called it a SETTER, and the leftover "byref as integer" ended
+    // the file as "Unexpected token in statement: byref". A setter never has BYREF there - its own
+    // byref is on the parameter, inside the parentheses - so the two stay unambiguous. The BYREF itself
+    // is consumed by the function-result reader further down, which is where that rule lives.
+    if Context.Check(ttAsType) or
+       (Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kBYREF)) then
     begin
       Kind := kFUNCTION;                           // getter returns the property value
       Result.Value := kFUNCTION;
@@ -2913,6 +3631,11 @@ begin
      (UpperCase(Context.CurrentToken.Value) = kBYREF) and Assigned(NameNode) then
   begin
     Result.Attributes.Values['BYREFRET'] := '1';
+    // ⭐ ...and REMEMBERED BY NAME, because a CALL to it is the one call whose result is not a
+    // temporary. "Function f3() ByRef As Integer : Function = f2()" with f2 itself ByRef is a
+    // reference handed straight on, and fbc compiles it; refused without this, the whole file died
+    // at parse time (fbc suite functions/return-byref).
+    FByrefRetProcs.Add(ByrefRetKeyOf(UpperCase(VarToStr(NameNode.Value))));
     Context.Advance;                                // consume BYREF
   end;
 
@@ -2922,7 +3645,22 @@ begin
   begin
     Context.Advance;                              // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    // "Function f(...) As Sub()" / "As Function(...) As R": the return is a PROCEDURE POINTER, which is
+    // not an identifier - so this reader passed it by and the SUB keyword was met where a name was
+    // expected. A PARAMETER of that type has always been read (TryParseProcPtrType); the RETURN had not,
+    // the same rule in one path and not its sibling. What comes back is an entry address: int-banked.
+    if Context.Check(ttProcedureStart) then
+    begin
+      RetTok := Context.CurrentToken;
+      ProcPtrRet := TASTNode.Create(antArrayDecl, RetTok);
+      try
+        TryParseProcPtrType(ProcPtrRet);
+      finally
+        ProcPtrRet.Free;
+      end;
+      NameNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'INTEGER', RetTok));
+    end
+    else if AtDottedTypeName then
     begin
       RetTok := Context.CurrentToken;
       RetTypeName := ParseDottedName;               // dotted: namespace-qualified return type
@@ -2965,7 +3703,7 @@ begin
     ApplyDeclaredDefaults(QualName, ParamList, FTypeStaticMethods.IndexOf(QualName) < 0);
 
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
-    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True);   // True: skip the implicit THIS
+    NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True, True);   // True: skip the implicit THIS
 
   Result.AddChild(ParamList);
 
@@ -2984,7 +3722,18 @@ begin
   // module-level code; "Destructor [priority]" runs after it (at program end). Only on a plain SUB (not a
   // Type.method — MethodType = ''); the optional integer priority (101..65535) orders multiple ctors/dtors
   // (lower = earlier for ctors). Marked on the node for the SSA to collect and call at program start/end.
-  if (Context.CurrentToken <> nil) and (MethodType = '') and
+  // ⭐ ...and a STATIC MEMBER sub may carry it too: "Sub UDT.ctor2( ) Constructor" is how FreeBASIC
+  // writes a startup routine that belongs to a type. The "MethodType = ''" here refused it, so the word
+  // was left standing and the file died at "Expected a name after CONSTRUCTOR". A member sub with no
+  // THIS is a plain procedure with a dotted label as far as the startup list is concerned.
+  // ⛔⛔ STATIC ONLY, and that is a MEASURED line. fbc REFUSES the modifier on an INSTANCE method
+  // ("error 17: Syntax error in 'sub T.m() constructor'"): a routine that needs a THIS cannot run
+  // before there is one. Accepting it for every member cost SEVEN COMPILE_ONLY_FAIL tests of the fbc
+  // suite in one run - functions/module-{ctor,dtor}-method-body and the four visibility/*-module-*
+  // - against the ONE (functions/module-ctor-staticmemberproc) it was meant to open. The type's own
+  // declaration is what says which it is, and the parser already records it in FTypeStaticMethods.
+  if (Context.CurrentToken <> nil) and
+     ((MethodType = '') or (FStaticMemberProcs.IndexOf(QualName) >= 0)) and
      ((UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR) or
       (UpperCase(VarToStr(Context.CurrentToken.Value)) = kDESTRUCTOR)) then
   begin
@@ -3016,6 +3765,7 @@ begin
   end;
 
   ParseProcedureBody(Result);                     // statements up to END SUB/FUNCTION
+  CheckByRefReturn(Result);                       // ...and what a BYREF one is allowed to hand back
   ConsumeEndProcedure;
   DoNodeCreated(Result);
 end;
@@ -3413,7 +4163,63 @@ function TPackratParser.ParseDottedName: string;
 // must be on the first identifier. Segments after a '.' may be reserved words (member names).
 var
   BaseU: string;
+
+  // FreeBASIC EXPLICIT-WIDTH integer: "Integer<8>" / "UInteger<16>" name the same types BYTE..LONGINT
+  // by their bit count. Read at the central type-name reader, for the same reason UNSIGNED is: every
+  // declaration form asks this one question. Left unread, the '<' looked like a comparison and
+  // "Dim As Integer<8> b" failed as "Expected variable name".
+  // ⛔ ...AND "UNSIGNED INTEGER" IS THE SAME TYPE UNDER ANOTHER SPELLING. The UNSIGNED modifier is read
+  // in its own branch above and RETURNED from there, so the width suffix was never reached: fbc's own
+  // numbers/integer_n.bas writes both "UInteger<n>" and "unsigned integer<n>" for the same type, and
+  // only the first was read - the second left "<8>" in the stream and died on "Expected ")" after array
+  // indices". One funnel now, called from both spellings.
+  function ApplyWidthSuffix(var AName: string): Boolean;
+  var
+    Bits: string;
+  begin
+    Result := False;
+    if not (((AName = 'INTEGER') or (AName = 'UINTEGER')) and Context.Check(ttOpLt) and
+            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger])) then
+      Exit;
+    Context.Advance;                                 // '<'
+    Bits := VarToStr(Context.CurrentToken.Value);
+    Context.Advance;                                 // the bit count
+    // ⛔ THE CLOSER CAN BE HALF OF ANOTHER TOKEN. "Const MAX As Integer<8>= 5" - fbc's own spelling in
+    // numbers/integer_n.bas - lexes the last three characters as ">=", so the '>' never arrives and a
+    // tolerant test silently left the whole ">=" in the stream; the declaration then died on
+    // "Expected "=" after CONST type", a message about the '=' that WAS there. The token is split in
+    // place: its '>' half is consumed here by retyping it into the bare '=' the declaration wants.
+    if Context.Check(ttOpGe) then
+    begin
+      Context.CurrentToken.TokenType := ttOpEq;
+      Context.CurrentToken.Value := '=';
+    end
+    else if Context.Check(ttOpGt) then Context.Advance;   // '>'
+    if AName = 'INTEGER' then
+      case StrToIntDef(Bits, 0) of
+         8: AName := 'BYTE';
+        16: AName := 'SHORT';
+        32: AName := 'LONG';
+        64: AName := 'LONGINT';
+      end
+    else
+      case StrToIntDef(Bits, 0) of
+         8: AName := 'UBYTE';
+        16: AName := 'USHORT';
+        32: AName := 'ULONG';
+        64: AName := 'ULONGINT';
+      end;
+    Result := True;
+  end;
+
 begin
+  // ⛔ A TYPE NAME MAY BEGIN WITH DOTS. "Dim v As ..r.foo.t1" is FreeBASIC for "resolve r from the
+  // GLOBAL scope": the dots are part of the type-name SPELLING, not an operator, and the same program
+  // written "r.foo.t1" is accepted. Left unread they made the DIM path fail to parse outright and the
+  // PARAMETER path keep its default type in silence - one spelling, two different wrong answers.
+  // ⚠️ The dots are consumed and the name is resolved as written. Whether an explicit global-scope dot
+  // BEATS a local shadow is a separate, declared question (DIVERGENZE 39); this is about reading it.
+  while Context.Check(ttOpDot) do Context.Advance;
   // FreeBASIC "UNSIGNED <basetype>" modifier: map to the unsigned variant type name. A bare
   // "UNSIGNED" (no integer base type following) means UNSIGNED INTEGER. UNSIGNED is not a reserved
   // keyword (it tokenizes as an identifier), so handle it here at the central type-name reader.
@@ -3442,11 +4248,13 @@ begin
     end
     else
       Result := 'UINTEGER';                          // bare UNSIGNED = UNSIGNED INTEGER
+    ApplyWidthSuffix(Result);                        // "unsigned integer<16>"
     Exit;
   end;
 
   Result := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // first segment
+  if ApplyWidthSuffix(Result) then Exit;
   while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
         (Length(VarToStr(Context.PeekNext.Value)) > 0) and
         (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
@@ -3455,6 +4263,31 @@ begin
     Result := Result + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
     Context.Advance;                                 // segment
   end;
+end;
+
+function TPackratParser.AtDottedTypeName: Boolean;
+// Is the cursor at the start of a type NAME, counting FreeBASIC's leading global-scope dots?
+// One reader for every gate that used to ask "is this an identifier?" and so refused "..r.foo.t1".
+var
+  k: Integer;
+begin
+  if Context.Check(ttIdentifier) then Exit(True);
+  // ⭐ ...AND A TYPE THE PROGRAM HAS ALREADY DECLARED, whatever KIND of token its name lexes as. A
+  // quirk keyword may name a type ("Type print As Integer", fbc's typedef/identifiers), and the
+  // declaration side learned that first: without the same rule here, "Dim p As print" then answered
+  // "Expected type name after AS" - the DECLARING half taught and the USING half not, one more of
+  // [[a-rule-one-path-has-and-the-other-does-not]]. This funnel is where every AS gate asks, so the
+  // rule is written once.
+  // ⛔ Only a name the program has actually DECLARED as a type: nothing else about the token's kind is
+  // relaxed, so "As Const Integer" and "As Function(...)" keep meaning what they mean.
+  if Assigned(Context.CurrentToken) and (VarToStr(Context.CurrentToken.Value) <> '') and
+     (FTypeNamesSeen.IndexOf(UpperCase(VarToStr(Context.CurrentToken.Value))) >= 0) then
+    Exit(True);
+  Result := False;
+  if not Context.Check(ttOpDot) then Exit;
+  k := 1;
+  while Assigned(Context.PeekToken(k)) and (Context.PeekToken(k).TokenType = ttOpDot) do Inc(k);
+  Result := Assigned(Context.PeekToken(k)) and (Context.PeekToken(k).TokenType = ttIdentifier);
 end;
 
 function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
@@ -3473,6 +4306,17 @@ begin
   if (KindU <> kFUNCTION) and (KindU <> kSUB) then Exit;
   IsFunc := (KindU = kFUNCTION);
   Context.Advance;                                   // consume FUNCTION / SUB
+  // A CALLING CONVENTION may stand between the keyword and the parameter list here exactly as it may in
+  // a declaration ("Dim f As Sub CDecl ()"). The declaration path has skipped these all along; the TYPE
+  // did not, so the convention was read as the parameter list's opening name and the whole declaration
+  // fell apart. One internal convention here, so they are accepted and ignored - as in the other path.
+  while Context.Check(ttIdentifier) and
+        ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CDECL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STDCALL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PASCAL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'FASTCALL') or
+         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'THISCALL')) do
+    Context.Advance;
   ParamTypes := '';
   if Context.Check(ttDelimParOpen) then
   begin
@@ -3508,6 +4352,16 @@ begin
   Node.Attributes.Values['FUNCPTR'] := '1';
   Node.Attributes.Values['FPPARAMS'] := ParamTypes;
   Node.Attributes.Values['FPRET'] := '';
+  // "Function(...) ByRef As R": the RETURN may be a reference, and the word stands between the parameter
+  // list and AS. Unread, the '(' of the signature was parsed and then BYREF met where a variable name was
+  // expected. What the pointer HOLDS is the same entry address either way, so the modifier is recorded and
+  // the return type read as usual - a call through it dereferences by the callee's own protocol.
+  if IsFunc and Context.Check(ttParamMode) and
+     (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+  begin
+    Node.Attributes.Values['FPRETBYREF'] := '1';
+    Context.Advance;                                 // BYREF
+  end;
   if IsFunc and Context.Check(ttAsType) then
   begin
     Context.Advance;                                 // AS
@@ -3528,7 +4382,7 @@ function TPackratParser.ParseNamespaceDecl: TASTNode;
 var
   Token: TLexerToken;
   Stmt: TASTNode;
-  NsName: string;
+  NsName, PrevNs: string;
   PrevIdx: Integer;
 begin
   Token := Context.CurrentToken;
@@ -3540,7 +4394,15 @@ begin
     Exit;
   end;
   NsName := ParseDottedName;                          // dotted nested specifier allowed
+  SkipAliasClause;                                    // "Namespace ns Alias \"n\"" - a LINKER name
   Result := TASTNode.CreateWithValue(antNamespace, NsName, Token);
+
+  // ⭐ The prefix the OVERLOAD decision is keyed on. Two "Function bar()" in two namespaces are two
+  // names, not an overload set; without this both signed the same empty tail and one was discarded.
+  PrevNs := FNsPrefix;
+  if FNsPrefix = '' then FNsPrefix := UpperCase(NsName)
+  else FNsPrefix := FNsPrefix + '.' + UpperCase(NsName);
+  try
 
   while not Context.Check(ttEndOfFile) do
   begin
@@ -3548,7 +4410,15 @@ begin
     if Context.Check(ttSeparStmt) then begin Context.Advance; Continue; end;
     if AtEndNamespace then Break;
     PrevIdx := Context.CurrentIndex;
+    // ⭐ A NAMESPACE BODY IS MODULE LEVEL. It is not a block: fbc lets a TYPE declared inside one have
+    // methods, a constructor and a destructor, exactly as at the top of the file - only a PROCEDURE
+    // body or a BLOCK (Scope, If, a loop) refuses them. Marking it here is what keeps the rule in
+    // RefuseNonModuleLevelType from refusing a program fbc compiles.
+    FTopLevelStmt := True;
+    FInNamespaceBody := True;
     Stmt := ParseStatement;
+    FTopLevelStmt := False;
+    FInNamespaceBody := False;
     if Assigned(Stmt) then
       Result.AddChild(Stmt)
     else if Context.CurrentIndex = PrevIdx then
@@ -3559,6 +4429,10 @@ begin
   begin
     Context.Advance;   // END
     Context.Advance;   // NAMESPACE
+  end;
+
+  finally
+    FNsPrefix := PrevNs;
   end;
   DoNodeCreated(Result);
 end;
@@ -3637,7 +4511,7 @@ var
 // int handle), and an optional fixed-length "* n" (advisory in v1). Returns '' if no type token follows.
 begin
   Result := '';
-  if Context.Check(ttIdentifier) or
+  if AtDottedTypeName or
      ((Length(Context.CurrentToken.Value) > 0) and
       (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
   begin
@@ -3665,6 +4539,34 @@ begin
   end;
 end;
 
+procedure StampMemberAccess(TypeNode: TASTNode; const MemberName, CurAccess: string);
+// Record the access level of ONE member of a TYPE, as "ACCESS<NAME>" on the antTypeDecl. The SSA reads
+// it back at every site that touches the member and refuses the ones FreeBASIC refuses.
+//
+// ⛔⛔ THE KEY IS THE NAME, AND A NAME CAN BE DECLARED TWICE AT TWO DIFFERENT LEVELS. FreeBASIC decides
+// visibility per OVERLOAD, and the FreeBASIC manual's own examples rest on it: udt/operator3 declares a
+// PUBLIC "Constructor(size)" beside a PRIVATE copy constructor, udt/type4 a PRIVATE default constructor
+// beside a PUBLIC "Constructor(name)", udt/protected2 a PUBLIC property getter beside a PROTECTED
+// setter. A single stamp per name cannot express that, and answering with either of the two levels is a
+// GUESS - which here means refusing a program the manual prints.
+// So the honest answer is the third one: a name declared at more than one level is stamped MIXED, and
+// MIXED enforces NOTHING. It costs the mixed cases (fbc rejects some of them and we accept them) and it
+// cannot cost a valid program, which is the direction that matters on a rule that adds REFUSALS.
+// ⚠️ PUBLIC is recorded too, and that is not decoration: without it a public re-declaration in a derived
+// type could not stop the walk at a private member of the base, and a public overload beside a private
+// one would leave the private stamp standing alone and look unmixed.
+var
+  Key, Level, Prev: string;
+begin
+  if (TypeNode = nil) or (MemberName = '') then Exit;
+  Level := UpperCase(CurAccess);
+  if Level = '' then Level := 'PUBLIC';
+  Key := 'ACCESS' + MemberDecoratorKey(MemberName);   // ONE spelling; see the note on the helper
+  Prev := TypeNode.Attributes.Values[Key];
+  if (Prev <> '') and (Prev <> Level) then Level := 'MIXED';
+  TypeNode.Attributes.Values[Key] := Level;
+end;
+
 procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAccess: string = ''; ForceAbstract: Boolean = False);
 // One "Declare [Virtual|Abstract|Static|Const] Sub|Function|Property|Operator|Constructor|Destructor
 // name(...) [As ret]" line inside a TYPE body, with DECLARE already consumed. Nothing is emitted: the
@@ -3673,20 +4575,72 @@ procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAcce
 //   ABSTRACT<NAME> on the antTypeDecl -> the type declares NAME with no body of its own.
 //   FTypeStaticMethods "TYPE.NAME"    -> NAME is a static member (no implicit THIS).
 var
-  DecoU, MethName, Key: string;
+  DecoU, MethName, MethKey, Key: string;
+  DecoCount: Integer;   // how many of ABSTRACT/STATIC/VIRTUAL/leading-CONST this declaration carries
+  LeadingConst: Boolean;   // "Declare Const [Virtual|Abstract] Sub f()": the CONST that leads them
   IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
 begin
   IsAbstract := ForceAbstract;   // MODERN: every method of an INTERFACE is abstract by construction
+  DecoCount := 0;
+  LeadingConst := False;
   IsStatic := False;
   IsVirtual := False;
   IsOverride := False;
   IsFinal := False;
+  // ⛔ A LEADING CONST IS A DECORATOR THAT DOES NOT REACH THE LOOP. CONST is a RESERVED WORD, so it is
+  // not a ttIdentifier and the loop's own condition stops in front of it - and the only place that
+  // consumed it asked for the procedure keyword IMMEDIATELY after. So "Declare Const Virtual Function
+  // f()" - fbc's own virtual/virtual.bas writes eleven of them - left the cursor on CONST, the name was
+  // never read, and the member was declared and REGISTERED NOWHERE. Nothing said so at the DECLARATION;
+  // it surfaced 300 lines later as "type A never declares F04" on the DEFINITION, a refusal of a
+  // program fbc compiles. Consumed here, before the loop, so the decorator run that follows is read as
+  // usual. What CONST MEANS on a method is a promise about THIS, which this VM does not enforce.
+  if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') and Assigned(Context.PeekNext) and
+     ((Context.PeekNext.TokenType = ttProcedureStart) or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'VIRTUAL') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ABSTRACT') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'STATIC') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'OVERRIDE') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'FINAL')) then
+  begin
+    LeadingConst := True;
+    Inc(DecoCount);
+    Context.Advance;                                  // CONST
+  end;
+
   // Decorators sit between DECLARE and the SUB/FUNCTION/... keyword and arrive as plain identifiers.
-  while Context.Check(ttIdentifier) do
+  // ⛔ ...EXCEPT STATIC, WHICH IS A RESERVED WORD AND SO NOT AN IDENTIFIER. The loop's own test kept it
+  // out, so "Declare Static Sub m( )" recorded nothing and FTypeStaticMethods stayed EMPTY - which
+  // showed only when something finally asked (the trailing "Sub UDT.m( ) Constructor", whose whole
+  // legality is that the member is static). Every other decorator here is a non-reserved word, which is
+  // why the test read as sufficient until something needed the answer.
+  while Context.Check(ttIdentifier) or
+        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC') do
   begin
     DecoU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    // ⛔ AT MOST ONE OF THE FOUR. ABSTRACT, STATIC, VIRTUAL and a LEADING CONST each declare a
+    // different KIND of member, and fbc refuses every pair of them ("error 17"): abstract+virtual and
+    // virtual+static are contradictions, and a CONST qualifier belongs AFTER the parameter list, so a
+    // leading one beside another decorator is a syntax error rather than a redundancy. Each one ALONE
+    // stays legal - all four were probed alone before this counted them.
+    if (DecoU = 'ABSTRACT') or (DecoU = 'STATIC') or (DecoU = 'VIRTUAL') or (DecoU = 'CONST') then
+    begin
+      Inc(DecoCount);
+      // ⛔ THE PAIR RULE IS NOT "AT MOST ONE" - the oracle was asked for the whole matrix and it says
+      // otherwise. A LEADING CONST may be followed by exactly one of VIRTUAL or ABSTRACT ("Declare
+      // Const Virtual Sub g()" and "Declare Const Abstract Sub g()" both compile); everything else is
+      // fbc's "error 17": the reverse order (virtual const, abstract const, static const), const with
+      // STATIC in either order, virtual+abstract, and three of them together. Written as "at most one"
+      // this counted a legal pair as an error - and, worse, the legal pair never even got here,
+      // because the leading CONST was not consumed at all.
+      if FModernMode and (DecoCount > 1) and
+         not (LeadingConst and (DecoCount = 2) and ((DecoU = 'VIRTUAL') or (DecoU = 'ABSTRACT'))) then
+        HandleError(Format('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and ' +
+          'a leading CONST (a leading CONST may lead VIRTUAL or ABSTRACT), and this one also says ' +
+          '"%s"', [DecoU]), Context.CurrentToken);
+    end;
     if DecoU = 'ABSTRACT' then IsAbstract := True
     else if DecoU = 'STATIC' then IsStatic := True
     // ⭐ VIRTUAL was read and thrown away, and that is what made every method virtual by default -
@@ -3700,6 +4654,20 @@ begin
     else if DecoU <> 'CONST' then Break;
     Context.Advance;
   end;
+  // ⛔ A TRAILING CONST - one that comes AFTER a decorator - is fbc's "error 17" in every order
+  // measured ("virtual const", "abstract const", "static const"). A CONST qualifier belongs after the
+  // parameter list; a second one here is a syntax error, not a redundancy. The word is still ahead at
+  // this point, the decorator run having ended, which is why the "<> 'CONST'" arm in the loop above
+  // never fires.
+  if FModernMode and (DecoCount >= 1) and
+     (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') then
+    HandleError('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and a leading ' +
+      'CONST, and this one also says "CONST"', Context.CurrentToken);
+  // ⛔ ...and CONST beside STATIC is refused in BOTH orders. A static method has no THIS for a CONST to
+  // promise anything about, and fbc says error 17 for "Declare Const Static Sub g()" exactly as it does
+  // for the reverse.
+  if FModernMode and LeadingConst and IsStatic then
+    HandleError('a STATIC method has no THIS, so it cannot also be CONST', Context.CurrentToken);
   MethName := '';
   if Context.Check(ttProcedureStart) then
   begin
@@ -3722,32 +4690,96 @@ begin
         // answer through a Parent pointer, while a virtual Sub next to it dispatched correctly - the
         // tell that the defect was in the NAME and not in the dispatcher.
         if MethName = kOPERATOR then
-          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value))
+        begin
+          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value));
+          Context.Advance;
+          // ...and the tail some WORD-named operators carry, spelled exactly as the DEFINITION side
+          // spells it: "Mod=" and its family stop at the '=' (the lexer yields two tokens), and
+          // "New[]" / "Delete[]" are a different operator from "New" / "Delete".
+          if ((MethName = kOPERATOR + kMOD) or (MethName = kOPERATOR + 'SHL') or
+              (MethName = kOPERATOR + 'SHR') or (MethName = kOPERATOR + 'AND') or
+              (MethName = kOPERATOR + 'OR') or (MethName = kOPERATOR + 'XOR') or
+              (MethName = kOPERATOR + 'EQV') or (MethName = kOPERATOR + 'IMP')) and
+             Context.Check(ttOpEq) then
+          begin
+            MethName := MethName + '=';
+            Context.Advance;
+          end
+          else if ((MethName = kOPERATOR + kNEW) or (MethName = kOPERATOR + kDELETE)) and
+                  Context.Check(ttDelimBrackOpen) and Assigned(Context.PeekNext) and
+                  (Context.PeekNext.TokenType = ttDelimBrackClose) then
+          begin
+            MethName := MethName + '[]';
+            Context.Advance; Context.Advance;
+          end;
+        end
         else
+        begin
           MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+          Context.Advance;
+        end;
+      end
+      // ⛔ "OPERATOR <symbol>" USED TO BE UNTRACKED, and the note said so: "not a name we track here".
+      // That was true of the decorators, and it stopped being harmless the day VISIBILITY started
+      // reading them - "Private: Declare Operator +=(...)" was stamped with nothing, so the rule had
+      // no way to refuse "x += x" from outside. Fifteen COMPILE_ONLY_FAIL tests of fbc's own suite are
+      // exactly that (selfbop, selfuop, and the FOR/NEXT/STEP family). The symbol is spelled the way
+      // the DEFINITION side spells it, because the two must produce ONE name or the stamp is filed
+      // where nothing looks it up - the same trap the CAST comment above records.
+      else if MethName = kOPERATOR then
+      begin
+        MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value));
+        // A self-operator arrives as the lexer's compound-assign token, whose value is the BARE symbol
+        // ("*", not "*="): spell the '=' back in, or it is labelled exactly like the binary operator.
+        if Context.Check(ttCompoundAssign) then MethName := MethName + '=';
         Context.Advance;
+        // The index operator is two delimiter tokens, not one name.
+        if (MethName = kOPERATOR + '[') and Context.Check(ttDelimBrackClose) then
+        begin
+          MethName := kOPERATOR + '[]';
+          Context.Advance;
+        end;
       end
       else
-        MethName := '';       // OPERATOR <symbol>: not a name we track here
+        MethName := '';
     end;
   end;
   if MethName <> '' then
   begin
+    // ⛔ Every decorator of a member is filed under the SAME key ACCESS uses, and for the same reason:
+    // an OPERATOR's name can carry a '=' that the name=value store would tear the key in half on, and a
+    // bank sigil / arity code the SSA composes and the parser cannot. One spelling, one function.
+    MethKey := MemberDecoratorKey(MethName);
+    // ⭐ Does this TYPE have anything that takes a THIS? The allocation operators do not - fbc makes
+    // "Operator New"/"Delete" implicitly static - so they are the exception, and the flag means exactly
+    // "an object of this type has something to RUN on it". The SSA needs the answer in a PRE-PASS, long
+    // before the procedure table exists, to decide whether "New T" can hand back the address a custom
+    // allocator returned: an object at a raw address cannot run a method, because a method body is
+    // compiled once against record SLOTS and its THIS is a record handle.
+    if Assigned(TypeNode) and (MethKey <> 'OPERATORNEW') and (MethKey <> 'OPERATORDELETE') and
+       (MethKey <> 'OPERATORNEW[]') and (MethKey <> 'OPERATORDELETE[]') then
+      TypeNode.Attributes.Values['HASMEMBERPROC'] := '1';
     if IsAbstract and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['ABSTRACT' + MethName] := '1';
+      TypeNode.Attributes.Values['ABSTRACT' + MethKey] := '1';
     // ABSTRACT implies VIRTUAL: the only implementations an abstract method can ever have are the
     // overrides, so a call on it must dispatch. fbc requires the word on the base declaration only;
     // an override may repeat it or not, and either way the method stays virtual from there down.
     if (IsVirtual or IsAbstract) and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['VIRTUAL' + MethName] := '1';
+      TypeNode.Attributes.Values['VIRTUAL' + MethKey] := '1';
     if IsOverride and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['OVERRIDE' + MethName] := '1';
+      TypeNode.Attributes.Values['OVERRIDE' + MethKey] := '1';
     if IsFinal and Assigned(TypeNode) then
-      TypeNode.Attributes.Values['FINAL' + MethName] := '1';
-    if Assigned(TypeNode) and (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
-      TypeNode.Attributes.Values['ACCESS' + MethName] := CurAccess;
-    if IsStatic and Assigned(TypeNode) then
-      FTypeStaticMethods.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
+      TypeNode.Attributes.Values['FINAL' + MethKey] := '1';
+    if Assigned(TypeNode) then StampMemberAccess(TypeNode, MethName, CurAccess);
+    // ...and record that this TYPE DECLARED this member, under the same key, so a definition can ask.
+    if Assigned(TypeNode) and (VarToStr(TypeNode.Value) <> '') then
+      FTypeDeclaredMembers.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethKey);
+    // ⛔ PUBLIC ONLY, and that too is measured. A module constructor runs before the program does, so
+    // fbc refuses to let a PRIVATE or PROTECTED member be one - "visibility/{private,protected}-module-
+    // {ctor,dtor}" are four COMPILE_ONLY_FAIL tests of its suite, and accepting them cost exactly those
+    // four. The access of this very declaration is in hand here; nothing else has to be asked.
+    if IsStatic and Assigned(TypeNode) and ((CurAccess = '') or (CurAccess = 'PUBLIC')) then
+      FStaticMemberProcs.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
   end;
   // Walk what is left of the declaration, collecting the parameters' DEFAULT values on the way — they
   // are stated here and nowhere else, and the definition needs them. Parenthesis depth is tracked so a
@@ -3834,7 +4866,9 @@ end;
 function TPackratParser.ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
 var
   Token, NameTok, FieldTok: TLexerToken;
-  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum, NestedRec: TASTNode;
+  FieldNode, TypeNode, ArrDimNode, FieldDefault, FpTmp, NestedEnum, NestedRec, NestedConst: TASTNode;
+  EnumIdx: Integer;
+  NoDeclKey: string;    // the member key of a CONSTRUCTOR/DESTRUCTOR/OPERATOR/PROPERTY written with no DECLARE
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
@@ -3907,7 +4941,18 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
-  if not Context.Check(ttIdentifier) then
+  // ⭐ A QUIRK KEYWORD CAN NAME A TYPE. fbc's typedef/identifiers writes "type print as integer" and
+  // says why in its own comment: "typedefs can be named after quirk keywords, just like UDTs". A quirk
+  // keyword is a keyword only where a STATEMENT can start - PRINT, CLOSE, DIR - and right after the
+  // word TYPE no statement can start, so the name position is unambiguous and the token's KIND is not
+  // the question. The refusal is kept for what really cannot name a type.
+  // ⛔ A BUILTIN TYPE NAME still cannot: "Type Integer" is not a declaration fbc accepts, and letting
+  // it through would turn a refusal into an acceptance. The leading-AS form ("Type As Integer a, b")
+  // is consumed above, so AS never reaches here.
+  if (not Context.Check(ttIdentifier)) and
+     ((Context.CurrentToken = nil) or (VarToStr(Context.CurrentToken.Value) = '') or
+      IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) or
+      not (UpperCase(VarToStr(Context.CurrentToken.Value))[1] in ['A'..'Z', '_'])) then
   begin
     HandleError(Format('"%s" is a reserved word and cannot be used as a type name',
                        [Context.CurrentToken.Value]), Context.CurrentToken);
@@ -3916,6 +4961,14 @@ begin
   NameTok := Context.CurrentToken;
   Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
   if IsUnion then Result.Attributes.Values['UNION'] := '1';
+  // ⭐ Remember the NAME - a definition of one of its members has to be able to ask whether the type
+  // exists at all, and a type that declares NOTHING would otherwise be indistinguishable from a type
+  // nobody wrote. And remember whether it lives in a NAMESPACE, which decides a different question:
+  // its constructor may not be defined naming it BARE from outside.
+  if FTypeNamesSeen.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+    FTypeNamesSeen.Add(UpperCase(VarToStr(NameTok.Value)));
+  if FInNamespaceBody and (FTypesInNamespace.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0) then
+    FTypesInNamespace.Add(UpperCase(VarToStr(NameTok.Value)));
   Context.Advance;                                  // consume type name
 
   // FreeBASIC type alias: "TYPE newname AS underlyingtype" — a one-line synonym with no field block
@@ -3980,14 +5033,16 @@ begin
   end;
 
   // Optional single inheritance: TYPE Child EXTENDS Parent (M4.2). Stored as an attribute.
+  // ⛔ ...AND THE BASE IS A TYPE NAME, SO IT MAY BE QUALIFIED. "Type TW Extends ns1.TU" took ONE
+  // identifier token and recorded EXTENDS='NS1', leaving ".TU" to be read as the first member - so the
+  // derived type inherited NOTHING, in silence: sizeof answered its own fields only, the base's fields
+  // read rubbish and writes to them were lost. ParseDottedName is the reader every other type-name
+  // position uses; EXTENDS was one more that had never been told about it.
   if Context.Check(ttExtends) then
   begin
     Context.Advance;                                // consume EXTENDS
-    if Context.Check(ttIdentifier) then
-    begin
-      Result.Attributes.Values['EXTENDS'] := UpperCase(Context.CurrentToken.Value);
-      Context.Advance;                              // parent type name
-    end;
+    if Context.Check(ttIdentifier) or Context.Check(ttOpDot) then
+      Result.Attributes.Values['EXTENDS'] := UpperCase(ParseDottedName);
   end;
 
   // FreeBASIC field alignment header: "TYPE name [EXTENDS base] FIELD = n". Our record STORAGE is
@@ -4141,7 +5196,43 @@ begin
     if Context.Check(ttEnum) then
     begin
       NestedEnum := ParseEnumStatement;
-      if Assigned(NestedEnum) then Result.AddChild(NestedEnum);
+      if Assigned(NestedEnum) then
+      begin
+        // Each member carries the access level in force, exactly as a field does - fbc scopes an ENUM
+        // declared under "Private:" to the type's own methods.
+        for EnumIdx := 0 to NestedEnum.ChildCount - 1 do
+          if (NestedEnum.GetChild(EnumIdx).NodeType = antAssignment) and
+             (NestedEnum.GetChild(EnumIdx).ChildCount >= 1) and
+             (NestedEnum.GetChild(EnumIdx).GetChild(0).NodeType = antIdentifier) then
+            StampMemberAccess(Result,
+              UpperCase(VarToStr(NestedEnum.GetChild(EnumIdx).GetChild(0).Value)), CurAccess);
+        Result.AddChild(NestedEnum);
+      end;
+      Continue;
+    end;
+    // ⛔ ...AND A "Const" INSIDE A TYPE, WHICH WAS PARSED AS A FIELD AND ANSWERED ZERO. "Const MYCONST =
+    // 123" fell into the field grammar below, which read CONST as a field name and MYCONST as a second,
+    // typeless one: the type came out with two members it does not have, and "T.MYCONST" printed 0 where
+    // fbc prints 123 - a WRONG ANSWER in silence, no diagnostic anywhere. It is not a field at all: like
+    // a nested ENUM's members it is a module-wide constant that the TYPE gives a name to, so it is parsed
+    // as the statement it is (every form CONST has - integer, float, string, "Const As T name") and hung
+    // on the type node for the lowering to hoist.
+    if Context.Check(ttConstant) then
+    begin
+      NestedConst := ParseConstStatement;
+      if Assigned(NestedConst) then
+      begin
+        NestedConst.Attributes.Values['TYPECONST'] := '1';
+        for EnumIdx := 0 to NestedConst.ChildCount - 1 do
+          if (NestedConst.GetChild(EnumIdx).NodeType = antArrayDecl) and
+             (NestedConst.GetChild(EnumIdx).ChildCount >= 1) and
+             (NestedConst.GetChild(EnumIdx).GetChild(0).NodeType = antIdentifier) then
+            StampMemberAccess(Result,
+              UpperCase(VarToStr(NestedConst.GetChild(EnumIdx).GetChild(0).Value)), CurAccess);
+        Result.AddChild(NestedConst);
+      end
+      else
+        Context.Advance;                              // malformed: do not spin on the token
       Continue;
     end;
     PrevIdx := Context.CurrentIndex;
@@ -4181,6 +5272,31 @@ begin
     // and choke on its "()" parameter list (which ParseDimensionList reads as empty array dimensions).
     if (TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) or (TokU = kOPERATOR) or (TokU = kPROPERTY) then
     begin
+      // Conservative on purpose: the line is skipped whole, so which operator it is cannot be told
+      // apart here. Saying "this type has something that takes a THIS" costs at most the raw-storage
+      // shortcut; saying the opposite by mistake would cost an object that cannot run its own methods.
+      Result.Attributes.Values['HASMEMBERPROC'] := '1';
+      // ⭐ ...but the NAME is read after all, because a definition has to be able to ask whether this
+      // type declared this member. CONSTRUCTOR and DESTRUCTOR ARE the name; PROPERTY and OPERATOR name
+      // one next. Nothing else about the line is interpreted - it is still skipped whole.
+      if (VarToStr(Result.Value) <> '') then
+      begin
+        if (TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) then
+          NoDeclKey := TokU
+        else if Assigned(Context.PeekNext) and (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+                (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
+        begin
+          if TokU = kOPERATOR then
+            NoDeclKey := kOPERATOR + UpperCase(VarToStr(Context.PeekNext.Value))
+          else
+            NoDeclKey := UpperCase(VarToStr(Context.PeekNext.Value));
+        end
+        else
+          NoDeclKey := '';
+        if NoDeclKey <> '' then
+          FTypeDeclaredMembers.Add(UpperCase(VarToStr(Result.Value)) + '.' +
+                                   MemberDecoratorKey(NoDeclKey));
+      end;
       while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
         Context.Advance;
       Continue;
@@ -4300,7 +5416,12 @@ begin
       else if Context.Check(ttOpEq) then
       begin
         Context.Advance;                            // '='
-        FieldDefault := FExpressionParser.ParseExpression;
+        // ⛔ ...and the AGGREGATE TUPLE, "d As A = (4, 5, 6)", which sets the member UDT's fields in
+        // declaration order. DIM and STATIC both read it through TryParseAggregateTuple; a FIELD did not,
+        // so the parentheses were parsed as an expression and the declaration failed on the first comma.
+        // The third caller of the one grammar, for the same reason the second exists.
+        FieldDefault := TryParseAggregateTuple(FieldTypeName);
+        if not Assigned(FieldDefault) then FieldDefault := FExpressionParser.ParseExpression;
         if Assigned(FieldDefault) then
         begin
           FieldNode.AddChild(FieldDefault);
@@ -4310,8 +5431,7 @@ begin
       if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
       if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
       Result.AddChild(FieldNode);
-      if (CurAccess <> '') and (CurAccess <> 'PUBLIC') then
-        Result.Attributes.Values['ACCESS' + UpperCase(VarToStr(FieldNode.Value))] := CurAccess;
+      StampMemberAccess(Result, UpperCase(VarToStr(FieldNode.Value)), CurAccess);
       // FreeBASIC "As <type> a, b, c": the leading-AS type is shared by every comma-separated name
       // (e.g. "As String name, value" -> both String). Only the As-first form shares this way; a
       // name-first field carries its own trailing "As type", so its comma is handled by re-parsing.
@@ -4650,7 +5770,7 @@ begin
   begin
     Context.Advance;                              // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    if AtDottedTypeName then
     begin
       ForVarType := ParseDottedName;
       while AtPointerSuffix do
@@ -4928,6 +6048,17 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.IsStrayBlockCloser(const W: string): Boolean;
+// Is W a word that can only ever CLOSE a block, so that meeting it after END means the block was
+// never opened? A matched closer is consumed by its own block parser and never reaches END.
+// ⛔ EXTERN is not here: "End Extern" is handled a few lines up, where the linkage block's body is
+// parsed in place and there is genuinely nothing to end.
+begin
+  Result := (W = 'SCOPE') or (W = 'OPERATOR') or (W = 'MACRO') or (W = 'ANY') or
+            (W = 'WITH') or (W = 'SELECT') or (W = 'ENUM') or (W = 'UNION') or
+            (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'PROPERTY');
+end;
+
 function TPackratParser.ParseEndStatement: TASTNode;
 var
   Token: TLexerToken;
@@ -4957,6 +6088,28 @@ begin
   // ⚠️ Only a CONSTANT is honoured, and that is declared: the code rides in the opcode's IMMEDIATE, so
   // a computed one has nowhere to go without a register operand on an opcode that has none. "End n"
   // with a variable halts exactly as before and answers 0.
+  // ⛔⛔ AN UNMATCHED BLOCK CLOSER IS NOT A PROGRAM END. Reached here, "End Scope" / "End Operator" /
+  // "End Macro" / "End Any" - and any word this parser does not know - left the word behind and HALTED
+  // THE PROGRAM: a Print before it ran, a Print after it did not, and the exit code was 0. fbc reports
+  // an error on every one of them. A matched closer never arrives here at all (its own block parser
+  // consumes it), so a closer that DOES arrive has no opener and is exactly the thing to refuse.
+  // ⭐ Found by CENSUS after "End Asm" was fixed on its own: the question asked was which OTHER
+  // "End <word>" forms end the program in silence, and the answer was all of them.
+  // ⚠️ A reserved word only. "End n" takes an EXIT CODE, and an identifier there may be a variable -
+  // that stays exactly as it was, halting with 0, which is declared just above.
+  // ⚠️ NOT gated on ttIdentifier: SCOPE and OPERATOR carry token types of their own, so asking for an
+  // identifier caught MACRO and ANY and let exactly those two through - which is the shape of half a
+  // fix. The word itself is the test, and every word in the list is reserved, so no variable can
+  // answer to it.
+  if IsStrayBlockCloser(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+  begin
+    HandleError('"End ' + UpperCase(VarToStr(Context.CurrentToken.Value)) +
+                '" closes a block that is not open here.', Context.CurrentToken);
+    Context.Advance;
+    Result.Free;
+    Result := nil;
+    Exit;
+  end;
   ExitArg := nil;
   if (UpperCase(Token.Value) = kSYSTEM) and
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
@@ -5600,13 +6753,37 @@ function TPackratParser.ParseFBPokeStatement(Token: TLexerToken): TASTNode;
 var
   Saved: Integer;
   TypeStr: string;
-  PtrExpr, ValExpr, CastNode, DerefNode: TASTNode;
+  PtrExpr, ValExpr, CastNode, DerefNode, TypeOfExpr: TASTNode;
 begin
   Result := nil;
   Context.SavePosition(Saved);
   Context.Advance;                                    // consume POKE
   TypeStr := '';
-  if Context.Check(ttIdentifier) and IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) and
+  TypeOfExpr := nil;
+  // ⭐ "Poke TypeOf(b), p, 123": the type is ASKED, not written - the same shape CAST, "type<>" and now
+  // PEEK read, with the operand kept as a CHILD for the SSA to resolve. Both halves of the pair need it
+  // or one spelling of the same test compiles and the other does not.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                                  // TypeOf
+    Context.Advance;                                  // (
+    TypeOfExpr := ParseExpression;
+    if not Assigned(TypeOfExpr) then begin Context.RestorePosition(Saved); Exit; end;
+    if not Context.Check(ttDelimParClose) then
+    begin TypeOfExpr.Free; Context.RestorePosition(Saved); Exit; end;
+    Context.Advance;                                  // )
+    TypeStr := 'TYPEOF';
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                 // consume ',' after the datatype
+    else
+    begin
+      TypeOfExpr.Free;
+      Context.RestorePosition(Saved);
+      Exit;
+    end;
+  end
+  else if Context.Check(ttIdentifier) and IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) and
      (UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'STRING') then
   begin
     TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
@@ -5621,19 +6798,32 @@ begin
   end;
   if TypeStr = '' then TypeStr := 'UBYTE';
   PtrExpr := ParseExpression;
-  if not Assigned(PtrExpr) then begin Context.RestorePosition(Saved); Exit; end;
+  if not Assigned(PtrExpr) then
+  begin
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
+  end;
   if not Context.Check(ttSeparParam) then
   begin
-    PtrExpr.Free; Context.RestorePosition(Saved); Exit;
+    PtrExpr.Free;
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
   end;
   Context.Advance;                                    // consume ',' before the value
   ValExpr := ParseExpression;
   if not Assigned(ValExpr) then
   begin
-    PtrExpr.Free; Context.RestorePosition(Saved); Exit;
+    PtrExpr.Free;
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
   end;
   CastNode := TASTNode.CreateWithValue(antCast, TypeStr + ' PTR', Token);
   CastNode.AddChild(PtrExpr);
+  if Assigned(TypeOfExpr) then
+  begin
+    CastNode.Attributes.Values['TYPEOFEXPR'] := '1';
+    CastNode.AddChild(TypeOfExpr);                    // child1 = the operand, resolved in the SSA
+  end;
   DerefNode := TASTNode.Create(antDeref, Token);
   DerefNode.AddChild(CastNode);
   Result := TASTNode.Create(antAssignment, Token);
@@ -6164,14 +7354,28 @@ begin
     Exit;
   end;
 
-  // FreeBASIC IMAGEINFO handle, w, h  (writes width/height into the w and h variables)
+  // FreeBASIC IMAGEINFO handle [, w, h, bpp, pitch, pixeldata] — writes the image's info into the
+  // variables. ⭐ THE SAME SHAPE SCREENINFO ALREADY HAD, and the rule was written only there: any
+  // destination may be left out and the POSITION still selects the field, so an omitted slot has to be
+  // FILLED with a placeholder or the sixth argument would arrive as the second. And the trailing ones
+  // may simply be ABSENT - "imageinfo img" alone is legal. Only the fixed three-argument form was
+  // parsed, so "imageinfo img, , , , , pixels" died on the second comma and "imageinfo img" on the end
+  // of the line. fbc's gfx/imageinfo-params writes both. One more of
+  // [[a-rule-one-path-has-and-the-other-does-not]], between two statements that are the same statement.
   if Result.NodeType = antImageInfo then
   begin
+    if Context.Check(ttDelimParOpen) then Context.Advance;       // '(' of the parenthesised spelling
     Result.AddChild(ParseExpression);                            // handle
-    if Context.Check(ttSeparParam) then Context.Advance;          // ','
-    Result.AddChild(ParseExpression);                            // w variable
-    if Context.Check(ttSeparParam) then Context.Advance;          // ','
-    Result.AddChild(ParseExpression);                            // h variable
+    while Context.Check(ttSeparParam) do
+    begin
+      Context.Advance;                                          // ','
+      if Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                           ttDelimParClose]) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Token))
+      else
+        Result.AddChild(ParseExpression);                       // next destination
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
     DoNodeCreated(Result);
     Exit;
   end;
@@ -6705,13 +7909,15 @@ end;
 function TPackratParser.ParseFileOperationStatement: TASTNode;
 var
   Token: TLexerToken;
-  Param, HandleNode, LenExpr: TASTNode;
-  CmdName, ModeStr, MW, EncStr: string;
+  Param, HandleNode, LenExpr, EncExpr: TASTNode;
+  CmdName, ModeStr, MW, EncMark: string;
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
   C64CommaPos: Integer;
   AccessRead: Boolean;
   ClosedParen: Boolean;   // "Close(fileNum)": the FreeBASIC parenthesised handle
+  WrapParen: Boolean;     // "Bsave(name, src)": the whole ARGUMENT LIST in parentheses
+  WrapK, WrapDepth: Integer;
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
@@ -6900,23 +8106,31 @@ begin
       else HandleError('Expected INPUT/OUTPUT/APPEND/BINARY/RANDOM after FOR', Token);
       Context.Advance;            // mode word
     end;
-    // Optional "ENCODING <string>" clause (FreeBASIC text encoding). The width travels on the MODE
+    // Optional "ENCODING <expr>" clause (FreeBASIC text encoding). The width travels on the MODE
     // string as a trailing "~<bits>" - the same way "ACCESS READ" travels as '<' - so nothing between
-    // here and the file layer had to learn a new parameter. "ascii"/"utf8" need no marker: our strings
-    // are already UTF-8 bytes and that is what the file gets.
+    // here and the file layer had to learn a new parameter. "ascii" needs no marker: our strings are
+    // already UTF-8 bytes and that is what the file gets. The mapping is EncodingModeMarker, shared
+    // with the function form, which used to drop the clause entirely.
+    // ⛔ The marker is appended LAST, after ACCESS/LOCK - not here. It used to be appended on the spot,
+    // and "Encoding "utf16" Access Read" then built "R~16<": the '<' landed INSIDE the number and the
+    // handle read raw bytes. The same file without ACCESS decoded correctly, which is how a clause
+    // that changes nothing on its own changed the meaning of the one before it.
+    EncMark := '';
+    EncExpr := nil;
     if UpperCase(Context.CurrentToken.Value) = kENCODING then
     begin
       Context.Advance;            // ENCODING
       if Context.Check(ttStringLiteral) then
       begin
-        EncStr := UpperCase(StringReplace(StringReplace(VarToStr(Context.CurrentToken.Value),
-                                                        '-', '', [rfReplaceAll]), '_', '', [rfReplaceAll]));
-        if (EncStr = 'UTF16') or (EncStr = 'UTF16LE') then ModeStr := ModeStr + '~16'
-        else if EncStr = 'UTF32' then ModeStr := ModeStr + '~32'
-        // "utf8" needs no CONVERSION - our strings are already UTF-8 bytes - but it is not the same as
-        // no clause at all: fbc still writes the byte-order mark EF BB BF. So it gets a marker too.
-        else if (EncStr = 'UTF8') then ModeStr := ModeStr + '~8';
+        EncMark := EncodingModeMarker(VarToStr(Context.CurrentToken.Value));
         Context.Advance;   // "ascii" / "utf8" / "utf16" / ...
+      end
+      else
+      begin
+        // ⭐ The name need not be a LITERAL: fbc's own tests write "encoding encod" and
+        // "encoding files(i).encoding". Then the marker cannot be baked into the mode string here -
+        // it is appended at run time (SSA), and the file layer reads the NAME after the '~'.
+        EncExpr := ParseExpression;
       end;
     end;
     // Optional "ACCESS {READ | WRITE | READ WRITE}" clause (FreeBASIC). Only READ-alone changes anything
@@ -6935,6 +8149,9 @@ begin
       // marker in between would be read as part of the number.
       if AccessRead and (ModeStr <> 'L') then ModeStr := ModeStr + '<';
     end;
+    // The encoding marker goes on LAST, so '~' is always a suffix of the mode string (see above).
+    // Not on RANDOM, whose 'L' takes the record length appended in the SSA.
+    if (EncMark <> '') and (ModeStr <> 'L') then ModeStr := ModeStr + EncMark;
     // Optional lock_type clause (FreeBASIC): "SHARED" or "LOCK {READ|WRITE|READ WRITE}" — accepted and
     // ignored (single-process VM, no file locking).
     if UpperCase(Context.CurrentToken.Value) = kSHARED then
@@ -6950,18 +8167,9 @@ begin
       SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
       Context.Advance;            // optional '#'
-    if Context.Check(ttNumber) or Context.Check(ttInteger) then
-    begin
-      HandleNode := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
-      Context.Advance;
-    end
-    else if Context.Check(ttIdentifier) then
-    begin
-      HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-      Context.Advance;
-      HandleNode := FoldFileHandlePostfix(HandleNode);
-    end
-    else begin HandleError('Expected file number after AS', Token); Exit; end;
+    HandleNode := ParseFileNumberOperand;
+    if not Assigned(HandleNode) then
+    begin HandleError('Expected file number after AS', Token); Exit; end;
     LenExpr := nil;
     if UpperCase(Context.CurrentToken.Value) = kLEN then    // optional "LEN = reclen" (RANDOM)
     begin
@@ -6976,6 +8184,17 @@ begin
     if LenExpr <> nil then
     begin
       if ModeStr = 'L' then Result.AddChild(LenExpr) else LenExpr.Free;
+    end;
+    // A run-time ENCODING name rides as an extra child, at whatever index it lands on: the attribute
+    // says WHICH, so nothing has to count the optional ones.
+    if EncExpr <> nil then
+    begin
+      if ModeStr = 'L' then EncExpr.Free
+      else
+      begin
+        Result.Attributes.Values['ENCEXPR'] := IntToStr(Result.ChildCount);
+        Result.AddChild(EncExpr);
+      end;
     end;
     DoNodeCreated(Result);
     Exit;
@@ -7034,6 +8253,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after #', Token);
@@ -7050,6 +8273,34 @@ begin
         Exit;
       end;
     end;
+
+    // ⭐ "Close #1, #2": ONE statement, SEVERAL channels. FreeBASIC's own suite writes it, and without
+    // the loop the comma ended the statement and the next '#' was "Unexpected token in statement".
+    // MODERN only: Commodore BASIC closes one channel per statement.
+    if FModernMode and (CmdName <> 'DOPEN') and (CmdName <> 'OPEN') then
+      while Context.Check(ttSeparParam) do
+      begin
+        Context.Advance;                              // ','
+        if Context.Check(ttFileHandlePrefix) then Context.Advance
+        else if Context.CurrentToken.Value = '#' then Context.Advance;
+        if Context.Check(ttNumber) or Context.Check(ttInteger) then
+        begin
+          Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value),
+                                                   Context.CurrentToken));
+          Context.Advance;
+        end
+        else if Context.Check(ttIdentifier) then
+        begin
+          HandleNode := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
+          Context.Advance;
+          Result.AddChild(FoldFileHandlePostfix(HandleNode));
+        end
+        else
+        begin
+          HandleError('Expected a file handle after "," in CLOSE', Token);
+          Break;
+        end;
+      end;
 
     // For DOPEN/OPEN, parse filename and optional mode
     if (CmdName = 'DOPEN') or (CmdName = 'OPEN') then
@@ -7129,6 +8380,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after #', Token);
@@ -7180,6 +8435,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after #', Token);
@@ -7203,9 +8462,47 @@ begin
     Exit;
   end;
 
+  // ⭐ FreeBASIC writes a statement whose implementation is an RTL PROCEDURE in the call shape too:
+  // "Bsave(""foo.bmp"", 0)" is the same statement as "Bsave ""foo.bmp"", 0" (fbc suite
+  // gfx/bsave-nullptr-fb, and the -lang qb twin beside it). Without this the '(' opened an ordinary
+  // parenthesised EXPRESSION and the first comma ended it: "Expected "")"" after expression".
+  // ⛔ The parenthesis is only a WRAPPER when its match closes the statement. "Bsave (a), b" passes a
+  // parenthesised first argument and is not this form at all, so the match is walked out before
+  // anything is consumed. MODERN only: Commodore BASIC has no such spelling.
+  WrapParen := False;
+  if FModernMode and Context.Check(ttDelimParOpen) then
+  begin
+    WrapDepth := 0;
+    WrapK := 0;
+    while Assigned(Context.PeekToken(WrapK)) do
+    begin
+      if Context.PeekToken(WrapK).TokenType = ttDelimParOpen then Inc(WrapDepth)
+      else if Context.PeekToken(WrapK).TokenType = ttDelimParClose then
+      begin
+        Dec(WrapDepth);
+        if WrapDepth = 0 then Break;
+      end
+      else if Context.PeekToken(WrapK).TokenType in [ttEndOfLine, ttEndOfFile] then Break;
+      Inc(WrapK);
+    end;
+    if (WrapDepth = 0) and Assigned(Context.PeekToken(WrapK + 1)) and
+       (Context.PeekToken(WrapK + 1).TokenType in
+          [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      WrapParen := True;
+      Context.Advance;                                   // the wrapping '('
+    end;
+  end;
+
   // Parse ALL parameters until end of statement (for other file commands)
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
+    if WrapParen and Context.Check(ttDelimParClose) then
+    begin
+      Context.Advance;                                   // the wrapping ')'
+      Break;
+    end;
+
     // Skip commas
     if Context.Check(ttSeparParam) then
     begin
@@ -7222,6 +8519,11 @@ begin
     // Handle comma separator
     if Context.Check(ttSeparParam) then
       Context.Advance
+    else if WrapParen and Context.Check(ttDelimParClose) then
+    begin
+      Context.Advance;                                   // the wrapping ')'
+      Break;
+    end
     else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Break;
   end;
@@ -7318,6 +8620,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after GET#', Token);
@@ -7368,6 +8674,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after INPUT#', Token);
@@ -7446,17 +8756,9 @@ begin
   Result := TASTNode.Create(antInputFile, Tok);
   Result.Attributes.Values['LINEINPUT'] := '1';
   if not CombinedHash then Context.Advance;  // consume the separate '#' (combined 'INPUT#' already has it)
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-  begin
-    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-    Result.AddChild(FoldFileHandlePostfix(P));
-  end
+  P := ParseFileNumberOperand;
+  if Assigned(P) then
+    Result.AddChild(P)
   else
     HandleError('Expected file number after LINE INPUT #', Tok);
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after the handle
@@ -7488,7 +8790,13 @@ begin
   if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttOpSub)) and
      (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
   begin
-    TargetNode := ParseExpression;                          // image handle
+    // ⛔ AT precCall, NOT at the default precedence. The target is a HANDLE and nothing more; read at
+    // full precedence a member access swallowed what came after the comma as UNPARENTHESISED CALL
+    // ARGUMENTS, so "Line x.p, (0,0)-(31,31)" died inside the first point at "Expected \")\" after
+    // expression" while the identical statement with a plain variable target was fine - the tell that
+    // it was the READING of the target and not the statement. REDIM reads its own target at a low
+    // precedence for the mirror-image reason.
+    TargetNode := FExpressionParser.ParseExpression(precCall);   // image handle
     if Context.Check(ttSeparParam) then Context.Advance;    // ','
   end;
   // FreeBASIC "LINE -(x2,y2)": the start point is omitted, so the line runs from the current graphics
@@ -7582,10 +8890,24 @@ var
   Tok: TLexerToken;
   ModeStr: string;
   ModeOrd: Integer;
+  TargetNode: TASTNode;
 begin
   Tok := Context.CurrentToken;
   Result := TASTNode.Create(antGfxPut, Tok);
   Context.Advance;                                            // PUT
+  // FreeBASIC image draw target: "Put img, (x,y), src" — the surface the blit lands ON, before the
+  // coordinate. Same convention as PSET/LINE/CIRCLE/PAINT/DRAW STRING: appended LAST so no existing
+  // child index moves, with its position in TARGETIDX, which is all EmitDrawTargetBegin needs.
+  // ⛔ Until now PUT was the ONE draw statement of the family without it, so "Put img.buffer, (0,0), b"
+  // was never dispatched here at all and died inside the first coordinate ("Expected ')' after
+  // expression"): the rule the other five had, and this one did not (fbc suite
+  // quirk/gfx_propertiesasbuffers).
+  TargetNode := nil;
+  if (not Context.Check(ttDelimParOpen)) and (UpperCase(VarToStr(Context.CurrentToken.Value)) <> kSTEP) then
+  begin
+    TargetNode := ParseExpression;                            // image handle
+    if Context.Check(ttSeparParam) then Context.Advance;      // ','
+  end;
   if Context.Check(ttDelimParOpen) then Context.Advance;      // '('
   Result.AddChild(ParseExpression);                           // x
   if Context.Check(ttSeparParam) then Context.Advance;        // ','
@@ -7644,6 +8966,11 @@ begin
     end;
   end;
   Result.Attributes.Values['MODE'] := IntToStr(ModeOrd);
+  if Assigned(TargetNode) then   // image draw target appended last (TARGETIDX = its child index)
+  begin
+    Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+    Result.AddChild(TargetNode);
+  end;
   DoNodeCreated(Result);
 end;
 
@@ -7660,17 +8987,9 @@ begin
   Result.Attributes.Values['WRITE'] := '1';
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
     Context.Advance;  // '#'
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-  begin
-    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-    Result.AddChild(FoldFileHandlePostfix(P));
-  end
+  P := ParseFileNumberOperand;
+  if Assigned(P) then
+    Result.AddChild(P)
   else
     HandleError('Expected file number after WRITE #', Tok);
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma after the handle
@@ -7701,14 +9020,8 @@ begin
   end;
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
     Context.Advance;  // '#'
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    H := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-    H := ParseFileHandleIdent
-  else
+  H := ParseFileNumberOperand;
+  if not Assigned(H) then
   begin
     HandleError('Expected file number after GET/PUT #', Tok);
     H := TASTNode.CreateWithValue(antLiteral, 1, Tok);
@@ -7780,17 +9093,9 @@ begin
   Result.Attributes.Values['SEEK'] := '1';
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
     Context.Advance;  // '#'
-  if Context.Check(ttNumber) or Context.Check(ttInteger) then
-  begin
-    Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken));
-    Context.Advance;
-  end
-  else if Context.Check(ttIdentifier) then
-  begin
-    P := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
-    Context.Advance;
-    Result.AddChild(FoldFileHandlePostfix(P));
-  end
+  P := ParseFileNumberOperand;
+  if Assigned(P) then
+    Result.AddChild(P)
   else
     HandleError('Expected file number after SEEK #', Tok);
   if Context.CheckAny([ttSeparParam, ttSeparOutput]) then Context.Advance;  // comma
@@ -7801,19 +9106,95 @@ end;
 
 function TPackratParser.LooksLikeImageTarget: Boolean;
 // At a graphics command token (PSET/LINE/CIRCLE/PAINT): does the FreeBASIC "cmd img, (x,y)..." image
-// draw-target form follow? Heuristic for a single-token target (image handle): the next token is not '('
-// or STEP, the one after is ',', and the one after that is '(' — which cleanly separates the target form
-// from the C128 forms ("CIRCLE src,x,y") and the plain "(x,y)" / "STEP(x,y)" screen forms. A multi-token
-// target expression in this position is not recognised (rare; image handles are simple variables).
+// draw-target form follow? The target is not '(' or STEP, and after it come ',' then '(' — which cleanly
+// separates the target form from the C128 forms ("CIRCLE src,x,y") and the plain "(x,y)" / "STEP(x,y)"
+// screen forms.
+//
+// ⛔ IT USED TO REQUIRE THE TARGET TO BE ONE TOKEN, with the note "rare; image handles are simple
+// variables". A handle kept in a FIELD is not rare - it is how an image is carried inside a UDT - and
+// "Line x.p, (0,0)-(31,31)" then failed this test, was never dispatched to the graphics statement at
+// all, and reported "Expected \")\" after expression" from inside the first point. The DOTTED chain is
+// walked here, so "x.p" and "a.b.c" reach the same statement a bare name always did.
 var
-  T1, T2, T3: TLexerToken;
+  T1, T2: TLexerToken;
+  k: Integer;
 begin
+  Result := False;
   T1 := Context.PeekToken(1);
-  T2 := Context.PeekToken(2);
-  T3 := Context.PeekToken(3);
-  Result := Assigned(T1) and Assigned(T2) and Assigned(T3) and
-            (T1.TokenType <> ttDelimParOpen) and (UpperCase(T1.Value) <> kSTEP) and
-            (T2.TokenType = ttSeparParam) and (T3.TokenType = ttDelimParOpen);
+  if (T1 = nil) or (T1.TokenType = ttDelimParOpen) or (UpperCase(VarToStr(T1.Value)) = kSTEP) then Exit;
+  // Walk "name ( '.' name )*": k lands on the token after the target.
+  k := 2;
+  while True do
+  begin
+    T2 := Context.PeekToken(k);
+    if (T2 <> nil) and (T2.TokenType = ttOpDot) and Assigned(Context.PeekToken(k + 1)) then
+      Inc(k, 2)                                     // '.' and the segment after it
+    else
+      Break;
+  end;
+  T2 := Context.PeekToken(k);
+  Result := Assigned(T2) and (T2.TokenType = ttSeparParam) and
+            Assigned(Context.PeekToken(k + 1)) and
+            (Context.PeekToken(k + 1).TokenType = ttDelimParOpen);
+end;
+
+function TPackratParser.AsmBlockIsEmpty: Boolean;
+// True when "Asm ... End Asm" holds no TOKEN at all between the two - only line ends. Such a block has
+// nothing to translate, so it is dropped instead of refused: fbc's own pp/pragma-reserve-7 writes one
+// whose entire content is PREPROCESSOR directives, and those are consumed before the parser sees them.
+// ⛔ Lookahead only - the token position is not moved. Any real token, on any line, answers False and
+// the declared refusal stands: a block that does work must never be silently dropped.
+var
+  k: Integer;
+  T, N: TLexerToken;
+begin
+  Result := False;
+  if (Context.PeekNext <> nil) and
+     not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then Exit;  // one-line form
+  k := 1;
+  while True do
+  begin
+    T := Context.PeekToken(k);
+    if (T = nil) or (T.TokenType = ttEndOfFile) then Exit;      // unterminated: leave it to the refusal
+    if T.TokenType in [ttEndOfLine, ttSeparStmt] then begin Inc(k); Continue; end;
+    if T.TokenType = ttProgramEnd then
+    begin
+      N := Context.PeekToken(k + 1);
+      if (N <> nil) and (N.TokenType = ttIdentifier) and
+         (UpperCase(VarToStr(N.Value)) = 'ASM') then Exit(True);   // END ASM reached, nothing between
+      Exit;
+    end;
+    Exit;                                                       // a real token: not empty
+  end;
+end;
+
+procedure TPackratParser.SkipAsmBlock;
+// Consume "Asm ... End Asm". Only ever called for a block AsmBlockIsEmpty has approved.
+begin
+  while not Context.CheckAny([ttEndOfFile]) do
+  begin
+    if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttIdentifier) and
+       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ASM') then
+    begin
+      Context.Advance; Context.Advance;      // END ASM
+      Break;
+    end;
+    Context.Advance;
+  end;
+end;
+
+function TPackratParser.AsmStatementFollows: Boolean;
+// Lookahead for the ONE-LINE "Asm <instruction>" spelling: the word ASM opens the statement and what
+// follows it on the SAME line is not an operator that would make ASM an ordinary name ("asm = 1",
+// "asm.f", "asm(0)"). Used only to route it to the same declared refusal the block form gets, so the
+// program is told what is wrong instead of "Expected \"=\" in assignment".
+begin
+  Result := False;
+  if Context.PeekNext = nil then Exit;
+  Result := not (Context.PeekNext.TokenType in
+                 [ttOpEq, ttOpDot, ttDelimParOpen, ttDelimBrackOpen, ttAsType,
+                  ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse, ttSeparParam]);
 end;
 
 function TPackratParser.PeekNameHasAs: Boolean;
@@ -7918,6 +9299,10 @@ begin
       HandleNode := FoldFileHandlePostfix(HandleNode);
       Result.AddChild(HandleNode);
     end
+    // The PARENTHESISED handle: "Close #(1)" is the same spelling as "Print #(1)" - see
+    // ParseFileNumberOperand, which is where the three shapes live for the statements that share it.
+    else if Context.Check(ttDelimParOpen) then
+      Result.AddChild(FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall)))
     else
     begin
       HandleError('Expected file handle after PRINT#', Token);
@@ -8425,9 +9810,68 @@ begin
       VarName.Free; Result := nil; Exit;
     end;
   end
+  // ⭐ "Redim .field( ... )" INSIDE A WITH BLOCK: the leading dot names a member of the WITH object,
+  // exactly as it does in an assignment or a read. Only a NAME was accepted here, so the dot ended the
+  // statement and the declaration failed with "Expected variable name in array declaration" - a message
+  // about the very thing the WITH block is there to leave out. The expression parser's own leading-dot
+  // rule builds the member access, which is the same node the "obj.field" walk below produces.
+  // ⭐ "Redim ..outer.arr( ... )": the DOUBLE dot is FreeBASIC's explicit global scope, and what follows
+  // it is an ordinary namespace-qualified name - which this statement already reads when it is written
+  // without them ("Redim outer.arr(0 To 2)" works). Only the WITH form below knew a leading dot, so the
+  // first '.' ended the statement as "Expected \"(\" after array name". Consumed here, and the name
+  // path takes it from there.
+  // ⚠️ The scope MARK itself is not honoured beyond this: a local named "outer" would still win, which
+  // is DIVERGENZE 39 and not this statement's to fix.
+  else if Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+          (Context.PeekNext.TokenType = ttOpDot) then
+  begin
+    Context.Advance;                                  // '.'
+    Context.Advance;                                  // '.'
+    if not Context.Check(ttIdentifier) then
+    begin
+      HandleError('Expected a name after ".." in REDIM', Context.CurrentToken);
+      Result := nil; Exit;
+    end;
+    VarName := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Context.CurrentToken.Value)),
+                                        Context.CurrentToken);
+    Context.Advance;                                  // name
+    while Context.Check(ttOpDot) do
+    begin
+      Context.Advance;                                // '.'
+      if not (Context.Check(ttIdentifier) or
+              ((Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+               (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']))) then
+      begin
+        HandleError('Expected a name after "." in REDIM target', Context.CurrentToken);
+        VarName.Free; Result := nil; Exit;
+      end;
+      MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarToStr(Context.CurrentToken.Value)),
+                                             Context.CurrentToken);
+      MemberNode.AddChild(VarName);
+      VarName := MemberNode;
+      Context.Advance;                                // segment
+    end;
+  end
+  else if Context.Check(ttOpDot) then
+  begin
+    // ⛔ At precPRIMARY, not precCall: the dimensions that follow are REDIM's own "( 0 To 2 )" and must
+    // stay for the dimension parser. Read at call precedence they were swallowed as an array INDEX, and
+    // the "To" inside then failed as "Expected ")" after array indices".
+    VarName := FExpressionParser.ParseExpression(precPrimary);
+    if not Assigned(VarName) then
+    begin
+      HandleError('Expected a member name after "." in REDIM', Context.CurrentToken);
+      Result := nil; Exit;
+    end;
+  end
   else
   begin
   // Parse variable name
+  // ⭐ ...and a MODERN extension FreeBASIC does not reserve may be a VARIABLE'S name too. The same
+  // door the PROCEDURE and CONST declarations have; without it "Dim Round As Integer" refused.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected variable name in array declaration', Token);
@@ -8513,7 +9957,22 @@ begin
   begin
     Context.Advance;                                // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    // ⭐ "Dim arr(0 To 1) As Function(...) As T": an array whose ELEMENTS are procedure pointers. Every
+    // other declaration shape has routed a FUNCTION/SUB type through TryParseProcPtrType for a long
+    // time; the ARRAY one never did, so AtDottedTypeName met the FUNCTION keyword, refused it, and the
+    // whole declaration died with "ARR has no type" - a program fbc compiles. The element is an int
+    // holding an entry PC, so the type child says INTEGER and the signature rides on the node.
+    if Context.Check(ttProcedureStart) then
+    begin
+      if TryParseProcPtrType(Result) then
+      begin
+        Result.AddChild(TASTNode.CreateWithValue(antIdentifier, 'INTEGER', Context.CurrentToken));
+        ParseOptionalArrayInit(Result, Dimensions, Token);
+        DoNodeCreated(Result);
+        Exit;
+      end;
+    end;
+    if AtDottedTypeName then
     begin
       TypeTok := Context.CurrentToken;
       ElemTypeName := ParseDottedName;                // dotted: namespace-qualified element type
@@ -8543,7 +10002,7 @@ begin
   DoNodeCreated(Result);
 end;
 
-function TPackratParser.TryParseAggregateTuple(const DimTypeName: string): TASTNode;
+function TPackratParser.TryParseAggregateTuple(const DimTypeName: string; Nested: Boolean = False): TASTNode;
 // FreeBASIC aggregate init "= (a, b, c)": a parenthesised comma-tuple that sets a UDT's fields in
 // declaration order. Answers the antArgumentList (TUPLEINIT), or NIL with the stream left exactly where
 // it was - so the caller can fall through to an ordinary expression, which is what "= (x + y) \ 2" is.
@@ -8573,7 +10032,18 @@ begin
       // field. Requiring a comma made that one a parenthesised EXPRESSION, and a scalar stored
       // into a record variable left the record's handle showing (the manual's control/iif4).
       // The whole-initializer test keeps "= (x + y) \ 2" an expression, comma or not.
-      if (TupleDepth = 0) and (not IsBuiltinTypeName(DimTypeName)) then
+      // ⛔ ...and a POINTER type is never an aggregate: it has no fields to fill, so parentheses around
+      // its initializer are plain grouping. "Dim As ZString Ptr r = (StrPtr(s) + 1)" was read as a
+      // one-field tuple and the pointer arithmetic was stored as if it were a field value - the program
+      // then died dereferencing a null. IsBuiltinTypeName only matches BARE names, so "ZSTRING PTR"
+      // answered False and looked like a UDT.
+      // ⛔ ...and AN ENUM IS NEVER AN AGGREGATE EITHER, for the same reason a pointer is not: it has no
+      // fields to fill. "Dim As colours c = (colours.green)" was read as a one-field tuple and the
+      // variable got nothing - 0 where fbc answers the member, in silence - while the identical
+      // initialiser without the parentheses was right.
+      if (TupleDepth = 0) and (not Nested) and (not IsBuiltinTypeName(DimTypeName)) and
+         (FEnumNamesSeen.IndexOf(UpperCase(DimTypeName)) < 0) and
+         (Pos(' PTR', UpperCase(DimTypeName)) = 0) then
       begin
         Context.Advance;
         if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
@@ -8611,7 +10081,20 @@ begin
         ParseArrayInitBraceGroup(ArgExpr, ConstDimSizes(nil), 0);   // no shape: plain row-major
       end
       else
-        ArgExpr := FExpressionParser.ParseExpression;
+      begin
+        // ⭐ ...AND A TUPLE ELEMENT MAY BE A TUPLE, for a field whose type is itself a UDT:
+        //     type udt2 : dummy as integer : u as udt : end type
+        //     static as udt2 t1 = (0, (1, 2)), t2 = (0, (3, 4))
+        // is fbc's own spelling (swap/udt.bas is written that way). The BRACE nesting above has been
+        // understood for a while; the PARENTHESISED nesting reached ParseExpression, which read "(1"
+        // and wanted a ')' where the comma was - so the whole declaration failed on a diagnostic
+        // pointing at the comma. Read by THIS function, recursively, so one grammar describes both
+        // levels; in nested mode a top-level comma is the whole test, since there is no declared type
+        // to consult and no "spans the whole initializer" question to ask.
+        ArgExpr := TryParseAggregateTuple(DimTypeName, True);
+        if not Assigned(ArgExpr) then
+          ArgExpr := FExpressionParser.ParseExpression;
+      end;
       if not Assigned(ArgExpr) then Break;
       CtorArgs.AddChild(ArgExpr);
       if Context.Check(ttSeparParam) then Context.Advance else Break;
@@ -8825,6 +10308,12 @@ function TPackratParser.SkipTypeQualifiersConst: Boolean;
 // them. Dropping the word silently made the two collide on one label and the second was discarded.
 begin
   Result := False;
+  // ⛔ A TYPE STARTS HERE, so the pointer-qualifier chain starts here too. Clearing it only in the
+  // branch that reads it let the chain ACCUMULATE across declarations: "Dim As Byte Ptr b1 = b0" was
+  // refused for a const two levels down that belonged to the PREVIOUS statement's type. Every "As
+  // <type>" site goes through this function - twenty-eight of them - which is why the reset belongs
+  // here and not at the one caller that happens to ask for the answer.
+  FPtrQualChain := '';
   while Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
         (UpperCase(Context.CurrentToken.Value) = 'CONST') do
   begin
@@ -9014,12 +10503,14 @@ begin
     if (W = kPTR) or (FModernMode and (W = kPOINTER)) then
     begin
       Context.Advance;                   // consume CONST; the caller consumes the PTR that follows
+      FPtrQualChain := FPtrQualChain + '1';   // ...and this level is CONST; see the field's note
       Exit(True);
     end;
   end;
   if not Context.Check(ttIdentifier) then Exit;
   W := UpperCase(VarToStr(Context.CurrentToken.Value));
   Result := (W = kPTR) or (FModernMode and (W = kPOINTER));
+  if Result then FPtrQualChain := FPtrQualChain + '0';
 end;
 
 function TPackratParser.ParseDimensionList: TASTNode;
@@ -9027,6 +10518,14 @@ var
   Dimension, UpperExpr, RangeNode: TASTNode;
 begin
   Result := TASTNode.Create(antDimensions);
+
+  // ⛔ AN EMPTY DIMENSION LIST IS STILL A DIMENSION LIST: "a()" declares a DYNAMIC array, and the
+  // caller has already consumed the '('. This went straight into ParseExpression, which has nothing to
+  // read at a ')', so "Static a() As Integer" as a FIELD of a Type died on 'Unexpected token ")"' -
+  // while the identical "Dim a() As Integer" at module level was accepted, because THAT path spells
+  // the empty case out for itself. One more rule that one path had and its sibling did not; answered
+  // here, once, where every caller asks.
+  if Context.Check(ttDelimParClose) then Exit;
 
   repeat
     // FreeBASIC bare ellipsis dimension "(...)": no lower bound (defaults to 0), the upper bound is deduced
@@ -9098,6 +10597,1299 @@ begin
   DoNodeCreated(Result);
 end;
 
+{ ============================================================================
+  A module-level EXTERN is a DECLARATION, and a later one has to agree with it
+  ============================================================================
+  "Extern a(0 To 1) As Integer" fixes four things about the name a: that it is an ARRAY, that the
+  array is STATIC (fixed bounds, not ReDim-able), that its rank is 1 with bounds 0..1, and that its
+  elements are Integer. fbc rejects any later DIM / REDIM / EXTERN of that name which changes one of
+  them. Until now the whole line was skipped to end-of-line - it produced NOTHING, not even a name -
+  so there was nothing left to disagree with, and all 36 such rejections in the fbc suite's dim/
+  folder were silently accepted.
+
+  ⛔ THE REGISTRY IS MODULE-LEVEL, and holds only names an EXTERN introduced. Keying a fact on a bare
+  NAME is the mistake this parser has made repeatedly (see job/markdown/REGISTRI.md): a
+  "Dim a(0 To 1)" inside a Sub, or inside a Namespace, is a DIFFERENT a from a module-level
+  "Extern a()", and refusing it would refuse a program fbc accepts - the one direction that must
+  never happen. Both restrictions were measured, not assumed: over every file in the fbc suite with a
+  single-line EXTERN, this rule lands 36 of 36 tagged rejections and refuses 0 valid programs.
+  Without the "only names an EXTERN introduced" half it refuses 10 of them.
+
+  The shape is one string, so it can live in a TStringList:
+      K '|' TYPE '|' RANK '|' lb ':' ub ';' lb ':' ub ...
+  K is 'S' (scalar), 'D' (dynamic array) or 'F' (fixed-bound array). RANK 0 means "not stated",
+  which is what a bare "()" says and is why it agrees with any rank. A bound of '?' is one that is
+  not a compile-time constant here, and a '?' never disagrees with anything.
+}
+
+function TPackratParser.EncodeDeclShape(Dims: TASTNode; const TypeName: string;
+  InitCount: Integer; const Flags: string): string;
+// Dims = the antDimensions node, or nil when the name carried no parentheses at all (a SCALAR).
+// InitCount = the element count of an aggregate initializer, used to resolve a rank-1 "lb To ..."
+// ellipsis into a real upper bound - the only shape whose count is unambiguous (a nested
+// initializer flattens, so a rank-2 ellipsis cannot be counted from it).
+var
+  i, Rank, AnyCount: Integer;
+  D, UbNode: TASTNode;
+  Lb, Ub: Int64;
+  Bounds, LbS, UbS: string;
+  HasLb, HasUb: Boolean;
+begin
+  if Dims = nil then Exit('S|' + TypeName + '|0||' + Flags);
+  Rank := Dims.ChildCount;
+  if Rank = 0 then Exit('D|' + TypeName + '|0||' + Flags);  // "a()" - dynamic, rank not stated
+  AnyCount := 0;
+  for i := 0 to Rank - 1 do
+  begin
+    D := Dims.GetChild(i);
+    if (D.NodeType = antIdentifier) and (UpperCase(VarToStr(D.Value)) = 'ANY') then Inc(AnyCount);
+  end;
+  if AnyCount > 0 then
+    Exit('D|' + TypeName + '|' + IntToStr(Rank) + '||' + Flags);   // "a(Any[,Any])"
+  Bounds := '';
+  for i := 0 to Rank - 1 do
+  begin
+    D := Dims.GetChild(i);
+    HasLb := False; HasUb := False; Lb := 0; Ub := 0;
+    if D.NodeType = antDimRange then
+    begin
+      HasLb := TryConstIntExpr(D.GetChild(0), Lb);
+      if D.Attributes.Values['ELLIPSIS'] = '1' then
+      begin
+        if HasLb and (Rank = 1) and (InitCount > 0) then
+        begin
+          Ub := Lb + InitCount - 1;
+          HasUb := True;
+        end;
+      end
+      else if D.ChildCount >= 2 then
+      begin
+        UbNode := D.GetChild(1);
+        HasUb := TryConstIntExpr(UbNode, Ub);
+      end;
+    end
+    else
+    begin
+      // A bare upper bound "a(n)": the lower bound is 0, because ParseDimensionList has already
+      // wrapped the OPTION BASE case into an antDimRange when the base is not 0.
+      HasLb := True; Lb := 0;
+      HasUb := TryConstIntExpr(D, Ub);
+    end;
+    if HasLb then LbS := IntToStr(Lb) else LbS := '?';
+    if HasUb then UbS := IntToStr(Ub) else UbS := '?';
+    if Bounds <> '' then Bounds := Bounds + ';';
+    Bounds := Bounds + LbS + ':' + UbS;
+  end;
+  Result := 'F|' + TypeName + '|' + IntToStr(Rank) + '|' + Bounds + '|' + Flags;
+end;
+
+function TPackratParser.ShapeOfArrayDecl(ArrayDecl: TASTNode; IsRedim: Boolean): string;
+// Read the shape off one antArrayDecl of a DIM / REDIM. Its children are the name, then optionally
+// an antDimensions, a type identifier and an antArgumentList (the aggregate initializer).
+var
+  i, InitCount: Integer;
+  Ch, Dims: TASTNode;
+  TypeName, Flags, Cap: string;
+begin
+  Dims := nil; TypeName := ''; InitCount := 0;
+  for i := 1 to ArrayDecl.ChildCount - 1 do
+  begin
+    Ch := ArrayDecl.GetChild(i);
+    case Ch.NodeType of
+      antDimensions:   Dims := Ch;
+      antIdentifier:   if TypeName = '' then TypeName := UpperCase(VarToStr(Ch.Value));
+      antArgumentList: InitCount := Ch.ChildCount;
+    else
+      ;
+    end;
+  end;
+  // ⭐ BYREF-ness and a fixed-length CAPACITY are part of the declaration's identity too: fbc answers
+  // "error 20: Type mismatch" for "Extern ByRef ri As Integer : Dim Shared ri As Integer" and for
+  // "Extern s As String * 5 : Dim Shared s As String * 2". A capacity of -1 means "present but not a
+  // compile-time constant here", which is a capacity nobody can disagree with.
+  Flags := '';
+  if ArrayDecl.Attributes.Values['BYREF'] = '1' then Flags := Flags + '&';
+  Cap := ArrayDecl.Attributes.Values['FIXEDLEN'];
+  if (Cap <> '') and (Cap <> '-1') then Flags := Flags + '*' + Cap;
+  Result := EncodeDeclShape(Dims, TypeName, InitCount, Flags);
+  // ⭐ REDIM says DYNAMIC whatever bounds it states - that is the whole point of the statement, and
+  // it is why "Extern a(0 To 1) : ReDim a(0 To 1)" is an error in fbc although the bounds agree.
+  if IsRedim and (Length(Result) > 0) and (Result[1] = 'F') then
+    Result := 'D' + Copy(Result, 2, MaxInt);
+end;
+
+function TPackratParser.ShapeConflict(const Prev, Cur: string; out Why: string): Boolean;
+// The rule itself. It was FITTED against the fbc suite, not reasoned from the manual: the family is
+// generated (42 files, both the rejections and their legal counterexamples), so it is the
+// specification, and the rule was adjusted offline until it answered all of them.
+var
+  PK, CK: Char;
+  PT, CT, PB, CB, PF, CF: string;
+  PR, CR, i: Integer;
+  PParts, CParts: TStringList;
+
+  procedure SplitShape(const S: string; out K: Char; out T: string; out R: Integer;
+                       out B, F: string);
+  var
+    p1, p2, p3, p4: Integer;
+  begin
+    K := S[1];
+    p1 := Pos('|', S);
+    p2 := Pos('|', S, p1 + 1);
+    p3 := Pos('|', S, p2 + 1);
+    p4 := Pos('|', S, p3 + 1);
+    T := Copy(S, p1 + 1, p2 - p1 - 1);
+    R := StrToIntDef(Copy(S, p2 + 1, p3 - p2 - 1), 0);
+    if p4 > 0 then
+    begin
+      B := Copy(S, p3 + 1, p4 - p3 - 1);
+      F := Copy(S, p4 + 1, MaxInt);
+    end
+    else
+    begin
+      B := Copy(S, p3 + 1, MaxInt);
+      F := '';
+    end;
+  end;
+
+  function BoundsDisagree(const A, B: string; out W: string): Boolean;
+  var
+    av, bv: string;
+    c: Integer;
+  begin
+    Result := False; W := '';
+    for c := 0 to 1 do
+    begin
+      if c = 0 then
+      begin
+        av := Copy(A, 1, Pos(':', A) - 1);
+        bv := Copy(B, 1, Pos(':', B) - 1);
+      end
+      else
+      begin
+        av := Copy(A, Pos(':', A) + 1, MaxInt);
+        bv := Copy(B, Pos(':', B) + 1, MaxInt);
+      end;
+      if (av <> '?') and (bv <> '?') and (av <> bv) then
+      begin
+        if c = 0 then W := 'lower' else W := 'upper';
+        Exit(True);
+      end;
+    end;
+  end;
+
+begin
+  Result := False; Why := '';
+  if (Prev = '') or (Cur = '') then Exit;
+  SplitShape(Prev, PK, PT, PR, PB, PF);
+  SplitShape(Cur,  CK, CT, CR, CB, CF);
+  if (PK = 'S') <> (CK = 'S') then
+  begin
+    Why := 'one declaration is a scalar and the other an array';
+    Exit(True);
+  end;
+  // BYREF-ness: an alias for someone else's storage is not the same declaration as storage of its own.
+  if (Pos('&', PF) > 0) <> (Pos('&', CF) > 0) then
+  begin
+    Why := 'one declaration is BYREF and the other is not';
+    Exit(True);
+  end;
+  // A fixed-length capacity, when BOTH state one: "String * 5" and "String * 2" are different types.
+  if (Pos('*', PF) > 0) and (Pos('*', CF) > 0) and
+     (Copy(PF, Pos('*', PF) + 1, MaxInt) <> Copy(CF, Pos('*', CF) + 1, MaxInt)) then
+  begin
+    Why := 'the fixed length changes from ' + Copy(PF, Pos('*', PF) + 1, MaxInt) +
+           ' to ' + Copy(CF, Pos('*', CF) + 1, MaxInt);
+    Exit(True);
+  end;
+  if (PT <> '') and (CT <> '') and (PT <> CT) then
+  begin
+    Why := 'the element type changes from ' + PT + ' to ' + CT;
+    Exit(True);
+  end;
+  if PK = 'S' then Exit;
+  if (PK = 'D') <> (CK = 'D') then
+  begin
+    Why := 'one is a dynamic array and the other has fixed bounds';
+    Exit(True);
+  end;
+  if PK = 'D' then
+  begin
+    // A bare "()" states no rank, so it agrees with any rank; two STATED ranks must match.
+    if (PR > 0) and (CR > 0) and (PR <> CR) then
+    begin
+      Why := 'the number of dimensions changes from ' + IntToStr(PR) + ' to ' + IntToStr(CR);
+      Exit(True);
+    end;
+    Exit;
+  end;
+  if PR <> CR then
+  begin
+    Why := 'the number of dimensions changes from ' + IntToStr(PR) + ' to ' + IntToStr(CR);
+    Exit(True);
+  end;
+  PParts := TStringList.Create;
+  CParts := TStringList.Create;
+  try
+    PParts.Delimiter := ';'; PParts.StrictDelimiter := True; PParts.DelimitedText := PB;
+    CParts.Delimiter := ';'; CParts.StrictDelimiter := True; CParts.DelimitedText := CB;
+    for i := 0 to PParts.Count - 1 do
+    begin
+      if i > CParts.Count - 1 then Break;
+      if BoundsDisagree(PParts[i], CParts[i], Why) then
+      begin
+        Why := 'the ' + Why + ' bound of dimension ' + IntToStr(i + 1) + ' does not match';
+        Exit(True);
+      end;
+    end;
+  finally
+    PParts.Free;
+    CParts.Free;
+  end;
+end;
+
+procedure TPackratParser.NoteExternShape(const Name, Shape: string);
+// Remember it, and let a STATED rank replace the "()" that stated none - so that after
+// "Extern a() : Extern a(Any,Any)" a third declaration is measured against rank 2.
+var
+  Idx: Integer;
+  Old: string;
+begin
+  Idx := FExternShapes.IndexOfName(Name);
+  if Idx < 0 then
+    FExternShapes.Values[Name] := Shape
+  else
+  begin
+    Old := FExternShapes.ValueFromIndex[Idx];
+    if (Length(Old) > 0) and (Length(Shape) > 0) and (Old[1] = 'D') and (Shape[1] = 'D') and
+       (Pos('|0|', Old) > 0) and (Pos('|0|', Shape) = 0) then
+      FExternShapes.Values[Name] := Shape;
+  end;
+end;
+
+procedure TPackratParser.CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
+// A module-level DIM / REDIM has to agree with the module-level EXTERN that introduced the name.
+// A name no EXTERN introduced is not in the registry and is never looked at.
+var
+  i, Idx: Integer;
+  Decl: TASTNode;
+  Nm, Shape, Why: string;
+begin
+  if (Node = nil) or (FExternShapes.Count = 0) then Exit;
+  if not (Node.NodeType in [antDim, antRedim]) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    Idx := FExternShapes.IndexOfName(Nm);
+    if Idx < 0 then Continue;
+    Shape := ShapeOfArrayDecl(Decl, IsRedim);
+    if ShapeConflict(FExternShapes.ValueFromIndex[Idx], Shape, Why) then
+      HandleError(Format('Conflicting declaration of %s: %s', [Nm, Why]), Decl.GetChild(0).Token)
+    else
+      // ⭐ A REDIM refines the registry too, and it has to: "Extern a() : ReDim a(0 To 0) :
+      // ReDim a(0 To 0, 0 To 0)" is an error between the two REDIMs, and the EXTERN that stated no
+      // rank cannot be the one to catch it. NoteExternShape only ever lets a STATED rank replace an
+      // unstated one, so nothing else moves.
+      NoteExternShape(Nm, Shape);
+  end;
+end;
+
+procedure TPackratParser.NoteTypeCtorDtor(Node: TASTNode);
+// Remember a type that declares a constructor or a destructor, so a LATER type declared inside a
+// procedure can be refused for having a field of it, or extending it.
+begin
+  if (Node = nil) or (Node.NodeType <> antTypeDecl) then Exit;
+  if (Node.Attributes.Values['ACCESSCONSTRUCTOR'] <> '') or
+     (Node.Attributes.Values['ACCESSDESTRUCTOR'] <> '') then
+    if FTypesWithCtorDtor.IndexOf(UpperCase(VarToStr(Node.Value))) < 0 then
+      FTypesWithCtorDtor.Add(UpperCase(VarToStr(Node.Value)));
+end;
+
+function TPackratParser.WritesThroughConstPointee(Node: TASTNode): string;
+// The name of the pointer-to-const this assignment TARGET writes through, or '' when it writes through
+// none. The three spellings are the same write: "*p = x", "p[i] = x" and "p->f = x" - closing one and
+// not the others is the shape this codebase keeps paying for, so all three are asked here.
+var
+  Base: TASTNode;
+  Nm: string;
+begin
+  Result := '';
+  // ⛔ NOT "and FConstPointeeNames.Count = 0" here: the CAST form below needs no registry at all, and
+  // an early-out on the empty set silently switched it off for every program that declares no
+  // pointer-to-const of its own - which is most of them, and exactly the ones the cast is written in.
+  if Node = nil then Exit;
+  Base := nil;
+  case Node.NodeType of
+    antDeref:       if Node.ChildCount >= 1 then Base := Node.GetChild(0);
+    antParentheses: if Node.ChildCount >= 1 then Exit(WritesThroughConstPointee(Node.GetChild(0)));
+    antMemberAccess: if Node.ChildCount >= 1 then Base := Node.GetChild(0);
+    antArrayAccess:
+      // "p[i] = x" is "*(p + i) = x". The array spelling "a(i)" is NOT a pointer write, so only the
+      // bracket form counts - and an array of const elements is a different question.
+      if (Node.Attributes.Values['BRACKET'] = '1') and (Node.ChildCount >= 1) then
+        Base := Node.GetChild(0);
+  else
+    Exit;
+  end;
+  if Base = nil then Exit;
+  while (Base <> nil) and (Base.NodeType = antParentheses) and (Base.ChildCount >= 1) do
+    Base := Base.GetChild(0);
+  if Base = nil then Exit;
+  // ⭐ A CAST CARRIES ITS OWN QUALIFIER, and it is the same question asked of a different carrier:
+  // "*CPtr(Const Integer Ptr, p) = 5" writes through a pointer-to-const that has no name at all. The
+  // cast node's value is the type TEXT, and the word order is what tells the two meanings apart -
+  // "CONST INTEGER PTR" is a pointer TO const, "INTEGER CONST PTR" is a CONST pointer and writing
+  // through it is legal. fbc refuses the first and accepts the second; so does this.
+  if Base.NodeType = antCast then
+  begin
+    Nm := UpperCase(Trim(VarToStr(Base.Value)));
+    if (Copy(Nm, 1, 6) = 'CONST ') and (Pos(' PTR', Nm) > 0) then
+      Result := Nm;
+    Exit;
+  end;
+  if Base.NodeType <> antIdentifier then Exit;
+  Nm := UpperCase(VarToStr(Base.Value));
+  if FConstPointeeNames.IndexOf(Nm) >= 0 then Result := Nm;
+end;
+
+function TPackratParser.ConstRootOfTarget(Node: TASTNode): string;
+// ⭐ ...AND A CONSTANT IS NOT AN LVALUE THROUGH A FIELD EITHER. "Dim As Const Foo k : k.i = 69" and
+// "k.a(1) = 69" are fbc's "error 119" as much as a bare "k = ...", and the guard that already refuses
+// the bare form fires only on a target that IS the identifier. Walk the target down to the name it is
+// rooted at and ask the same set.
+// ⛔ A DEREF is NOT walked through: "*p = x" where p is a const POINTER (not a pointer to const) is
+// legal - the pointer may not be reseated, what it points at may be written. That is the other half of
+// the word, and m632 measured which is which.
+var
+  Cur: TASTNode;
+begin
+  Result := '';
+  if (Node = nil) or (FConstNames.Count = 0) then Exit;
+  Cur := Node;
+  while Cur <> nil do
+    case Cur.NodeType of
+      antParentheses, antMemberAccess, antArrayAccess:
+        if Cur.ChildCount >= 1 then Cur := Cur.GetChild(0) else Exit;
+      antIdentifier:
+        begin
+          if (Cur <> Node) and (FConstNames.IndexOf(UpperCase(VarToStr(Cur.Value))) >= 0) then
+            Result := UpperCase(VarToStr(Cur.Value));
+          Exit;
+        end;
+    else
+      Exit;
+    end;
+end;
+
+procedure TPackratParser.CheckRedimTargetIsAName(Node: TASTNode);
+// ⭐ A REDIM RESIZES STORAGE, so its target must be able to NAME some. fbc: "error 54: Expected var-len
+// array". Its dim/redim-expression-* family parenthesises the target and puts something inside that
+// names nothing resizable: a literal ("ReDim (1)(0 To 0)"), a constant expression, a binary op, a CALL,
+// a dereference.
+//
+// ⛔⛔ WRITTEN ON THE CLOSED SIDE, AND THE FIRST ATTEMPT WAS NOT. "The target must be an identifier"
+// looks like the same rule and is a WHITELIST OF SHAPES, which cannot be finished: it refused
+// "ReDim this.m(r-1, c-1)" and "ReDim v.buf(0 To 2)" - an ordinary member array - and it refused the
+// spelling FreeBASIC's own manual PRESCRIBES, "ReDim (u(0).array)(0 To 9)", which is parenthesised
+// precisely because the bare form is ambiguous (our guard m503 exists for it, blessed against fbc).
+// Nine corpus programs and five fbcunit files said so: CUERR 111 -> 116 and the sweep below its floor.
+// ⇒ The rule names what can NEVER denote storage and leaves everything else alone.
+//
+// ⚠️ It does NOT ask whether the name is a VAR-LEN array, which is the other half of fbc's message and
+// the rest of the family (a fixed-size var or field, a ReDim of a name nothing declared). That half
+// needs the shape registries, and those are the five that are still FLAT - keyed on a bare name with no
+// scope - so a refusal built on them would fire on the wrong declaration.
+var
+  i: Integer;
+  Decl, Tgt: TASTNode;
+  Bad: string;
+begin
+  if (Node = nil) or (not FModernMode) then Exit;
+  if Node.NodeType <> antRedim then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    Tgt := Decl.GetChild(0);
+    if Tgt = nil then Continue;
+    Bad := '';
+    case Tgt.NodeType of
+      antLiteral:   Bad := 'a literal';
+      antBinaryOp:  Bad := 'an arithmetic expression';
+      antUnaryOp:   Bad := 'an expression';
+      // ⛔ A DEREF is not storage THIS statement may resize: "*p" names whatever p points at, and an
+      // array's storage is not reachable that way.
+      antDeref:     Bad := 'a dereferenced pointer';
+      // A CALL and an ARRAY ELEMENT are the same node here, so the procedure set tells them apart -
+      // and only a call is refused: "ReDim (u(0).array)(...)" is legal and is the manual's own form.
+      antArrayAccess:
+        if (Tgt.ChildCount >= 1) and (Tgt.GetChild(0) <> nil) and
+           (Tgt.GetChild(0).NodeType = antIdentifier) and
+           (FProcSeen.IndexOf(UpperCase(VarToStr(Tgt.GetChild(0).Value))) >= 0) then
+          Bad := 'the result of a function call';
+    else
+      ;
+    end;
+    if Bad <> '' then
+      HandleError(Format('a REDIM resizes storage, and %s names none', [Bad]), Decl.Token);
+  end;
+end;
+
+procedure TPackratParser.CheckByRefReturn(ProcNode: TASTNode);
+// ⭐ A BYREF FUNCTION MAY NOT RETURN A REFERENCE TO SOMETHING THAT DIES WITH THE CALL. fbc: "error 272:
+// Local symbols can't be referenced". A "Function name(...) ByRef As T" hands the CALLER an address,
+// so what it names must outlive the frame: a plain local, a local ARRAY's element, a FIELD of a local,
+// a BYVAL parameter (a copy on this frame) and a CALL's RESULT (a temporary) are all refused.
+//
+// ⛔ AND TODAY THREE OF THOSE FIVE CRASH INSTEAD. Measured before writing this: "Function = i" on a
+// local ran to a null-pointer dereference at RUN TIME on our engine, in both the "Function =" and the
+// "Return" spellings. So this does not tighten a working program - it replaces a crash with a
+// diagnostic, which is the direction a refusal is allowed to move.
+//
+// The five shapes that stay LEGAL were probed one at a time, because the rule is about LIFETIME and
+// nothing else: a SHARED global, an element of a SHARED array, a BYREF parameter (the caller's own
+// storage), a STATIC local (static storage, not the frame) and a DEREF of a pointer.
+// ⛔ Which is why the walk to the root does NOT pass through an antDeref: "*p" names whatever p points
+// at, and that is the caller's business, not this frame's. Same boundary ConstRootOfTarget draws for a
+// different reason, and drawn the same way here on purpose.
+var
+  Locals: TStringList;
+  ProcName: string;
+
+  procedure CollectLocals(N: TASTNode);
+  var i, k: Integer; D, Decl: TASTNode;
+  begin
+    if N = nil then Exit;
+    for i := 0 to N.ChildCount - 1 do
+    begin
+      D := N.GetChild(i);
+      if D = nil then Continue;
+      if D.NodeType = antDim then
+        for k := 0 to D.ChildCount - 1 do
+        begin
+          Decl := D.GetChild(k);
+          // ⛔ A STATIC local is NOT one of these: it has static storage and outlives the frame, so
+          // returning a reference to it is legal and fbc compiles it.
+          if (Decl <> nil) and (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 1) and
+             (Decl.GetChild(0).NodeType = antIdentifier) and
+             (Decl.Attributes.Values['STATIC'] <> '1') then
+            Locals.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+        end;
+      CollectLocals(D);   // a Scope, an If or a loop body holds locals of this frame too
+    end;
+  end;
+
+  // The name the returned expression is ROOTED at, and whether the expression is a CALL. A call and an
+  // array element are the SAME node at parse time ("f1()" and "arr(0)" are both an antArrayAccess), so
+  // the procedure set the parser already keeps is what tells them apart.
+  function RootOfRef(N: TASTNode; out IsCall: Boolean): string;
+  var Cur: TASTNode;
+  begin
+    Result := ''; IsCall := False;
+    Cur := N;
+    while Cur <> nil do
+      case Cur.NodeType of
+        antParentheses, antMemberAccess:
+          if Cur.ChildCount >= 1 then Cur := Cur.GetChild(0) else Exit;
+        antArrayAccess:
+          begin
+            if Cur.ChildCount < 1 then Exit;
+            if (Cur.GetChild(0).NodeType = antIdentifier) and
+               (FProcSeen.IndexOf(UpperCase(VarToStr(Cur.GetChild(0).Value))) >= 0) then
+            begin
+              IsCall := True;
+              Exit(UpperCase(VarToStr(Cur.GetChild(0).Value)));
+            end;
+            Cur := Cur.GetChild(0);
+          end;
+        antIdentifier:
+          Exit(UpperCase(VarToStr(Cur.Value)));
+      else
+        Exit;   // ⛔ an antDeref lands here, and stopping IS the answer: "*p" is not this frame's
+      end;
+  end;
+
+  procedure CheckOne(Expr: TASTNode; Tok: TLexerToken);
+  var Nm: string; IsCall: Boolean;
+  begin
+    if Expr = nil then Exit;
+    // ⭐ "Function = ByVal p" SAYS THE VALUE IS THE ADDRESS. The explicit-BYVAL spelling of a
+    // byref-return names what p POINTS AT, not p, so the lifetime of p itself is not the question -
+    // exactly as "*p" is not (see the antDeref note above, the same boundary drawn twice).
+    // fbc suite functions/return-byref, TEST_GROUP( explicitByval ).
+    if UpperCase(Expr.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then Exit;
+    Nm := RootOfRef(Expr, IsCall);
+    if Nm = '' then Exit;
+    // ⭐ ...UNLESS THE CALLEE ITSELF RETURNS A REFERENCE. Then the "result" is not a temporary at all -
+    // it is an address of storage that already outlives the callee's frame, and handing it on is what
+    // fbc compiles (functions/return-byref, "Function = f2()" with f2 ByRef).
+    if IsCall and (FByrefRetProcs.IndexOf(Nm) >= 0) then Exit;
+    if IsCall then
+      HandleError(Format('a BYREF function cannot return the result of %s: a call''s result is a ' +
+        'temporary that dies with the call', [Nm]), Tok)
+    else if Locals.IndexOf(Nm) >= 0 then
+      HandleError(Format('a BYREF function cannot return a reference to %s: it is local to this ' +
+        'frame and does not outlive the call', [Nm]), Tok);
+  end;
+
+  procedure Walk(N: TASTNode);
+  var i: Integer; C, Tgt: TASTNode;
+  begin
+    if N = nil then Exit;
+    for i := 0 to N.ChildCount - 1 do
+    begin
+      C := N.GetChild(i);
+      if C = nil then Continue;
+      if C.NodeType = antReturn then
+      begin
+        if C.ChildCount >= 1 then CheckOne(C.GetChild(0), C.Token);
+      end
+      else if (C.NodeType = antAssignment) and (C.ChildCount >= 2) then
+      begin
+        Tgt := C.GetChild(0);
+        // "Function = expr" and the older "<the function's own name> = expr" are the same statement.
+        if (Tgt <> nil) and (Tgt.NodeType = antIdentifier) and
+           ((UpperCase(VarToStr(Tgt.Value)) = 'FUNCTION') or
+            ((ProcName <> '') and (UpperCase(VarToStr(Tgt.Value)) = ProcName))) then
+          CheckOne(C.GetChild(1), C.Token);
+      end;
+      Walk(C);
+    end;
+  end;
+
+var
+  i, k: Integer;
+  PL, Prm: TASTNode;
+begin
+  if (ProcNode = nil) or (not FModernMode) then Exit;
+  if ProcNode.Attributes.Values['BYREFRET'] <> '1' then Exit;
+  ProcName := '';
+  if (ProcNode.ChildCount >= 1) and (ProcNode.GetChild(0).NodeType = antIdentifier) then
+    ProcName := UpperCase(VarToStr(ProcNode.GetChild(0).Value));
+  Locals := TStringList.Create;
+  try
+    Locals.CaseSensitive := False;
+    CollectLocals(ProcNode);
+    // ⛔ A BYVAL parameter is a LOCAL: it is a copy made on this frame. A BYREF one is the CALLER's
+    // storage and is exactly what a BYREF function is for, so only the BYVAL ones go in.
+    for i := 0 to ProcNode.ChildCount - 1 do
+    begin
+      PL := ProcNode.GetChild(i);
+      if (PL = nil) or (PL.NodeType <> antParameterList) then Continue;
+      for k := 0 to PL.ChildCount - 1 do
+      begin
+        Prm := PL.GetChild(k);
+        if (Prm <> nil) and (Prm.NodeType = antIdentifier) and
+           (Prm.Attributes.Values['BYVAL'] = '1') then
+          Locals.Add(UpperCase(VarToStr(Prm.Value)));
+        // ⛔⛔ A "ByVal As String" PARAMETER IS THE ONE EXEMPTION fbc HAS AND WE DO NOT, AND LIFTING
+        // THE REFUSAL ALONE WAS TRIED AND WITHDRAWN (29 Aug 2026). fbc passes a var-len string byval
+        // as its DESCRIPTOR, so the storage is the caller's and "Function = s" compiles there, while
+        // ByVal Integer/Double/UDT are all error 272 - the exemption is the TYPE, not the mode, and it
+        // was probed one at a time. But our BYREF return hands back an ADDRESS, and the address of a
+        // var-len string PARAMETER does not exist: "@s" of one is refused outright ("Undefined
+        // procedure (address-of @): S"), because MarkAddressTaken excludes STRING - its slot holds a
+        // MANAGED handle, not raw bytes. Accepting the declaration therefore turned the refusal into a
+        // null-pointer dereference at run time, which is the one outcome worse than refusing.
+        // ⇒ THE MISSING HALF IS "@" ON A VAR-LEN STRING PARAMETER. Close that first, on its own, and
+        // this exemption is four lines. fbc suite functions/temp-strings. DIVERGENZE 85.
+      end;
+    end;
+    Walk(ProcNode);
+  finally
+    Locals.Free;
+  end;
+end;
+
+procedure TPackratParser.CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
+                                                         NameTok: TLexerToken);
+// ⭐ A MEMBER MAY ONLY BE DEFINED IF ITS TYPE DECLARED IT. fbc refuses "Sub UDT.g()" for a type whose
+// body never says "Declare Sub g()" - and it refuses the same for a Constructor, a Destructor, a
+// Property and an Operator, in five different error codes (160, 168, 158, 3) that all say one thing.
+// The suite's namespace/outside-{ctor,dtor,prop,op}-* family is 16 tests of exactly this, and reading
+// them by their names suggests a rule about NAMESPACES; probing the oracle shows the namespace is not
+// in it at all - a plain module-level type answers the same way.
+//
+// ⛔ THE TWO SETS ARE NEEDED TOGETHER. A type that declared NOTHING has no entry in the member set, so
+// asking that set alone would let every definition on it pass unasked - which is the very case fbc
+// refuses. FTypeNamesSeen answers "is this a type we saw declared", and only then is the member set
+// asked. A name we never saw declared as a type is left alone: it may be a namespace, an alias, or
+// something a later pass resolves, and refusing it would be a guess.
+//
+// ⚠️ The owner may be QUALIFIED ("Constructor ns.UDT()"), and fbc ACCEPTS that spelling when the type
+// declared the member - so the comparison is on the LAST component of the owner, which is what the
+// type is called. Anything else would file the question under a name nothing looks up.
+//
+// ⛔ ...AND A TYPE THAT LIVES IN A NAMESPACE MAY NOT BE NAMED BARE. "Constructor UDT()" at module level
+// for a UDT declared inside "ns" is fbc's "error 160" EVEN WHEN the type did declare the constructor
+// (namespace/outside-dtor-5 declares its destructor and is still refused). A different question with a
+// different answer, so it is asked separately and from its own set.
+var
+  BareType, MemberKey: string;
+  DotPos: Integer;
+begin
+  if (not FModernMode) or (MethodType = '') then Exit;
+  BareType := MethodType;
+  DotPos := LastDelimiter('.', BareType);
+  if DotPos > 0 then BareType := Copy(BareType, DotPos + 1, MaxInt);
+  if FTypeNamesSeen.IndexOf(BareType) < 0 then Exit;   // not a type we saw: not our question
+  // the member's own name is what QualName carries after the owner
+  MemberKey := QualName;
+  if Length(MemberKey) > Length(MethodType) + 1 then
+    MemberKey := Copy(MemberKey, Length(MethodType) + 2, MaxInt)
+  else
+    MemberKey := Kind;
+  MemberKey := MemberDecoratorKey(MemberKey);
+  // ⛔ Naming a namespace's type BARE, from outside that namespace.
+  if (DotPos = 0) and (not FInNamespaceBody) and (FTypesInNamespace.IndexOf(BareType) >= 0) then
+  begin
+    HandleError(Format('"%s" is declared inside a NAMESPACE: name it through the namespace here, or ' +
+      'write the definition inside the namespace body', [BareType]), NameTok);
+    Exit;
+  end;
+  // ⛔⛔ ...AND ONLY FOR A TYPE THAT LIVES IN A NAMESPACE, which is a SCOPE on the rule and not a
+  // weakening of it. fbc refuses "Constructor PT()" for ANY type whose body never declared it, module
+  // level included - probed, and it does. But our own corpus has been writing exactly that since M4.4:
+  // 25 programs define a constructor or a destructor out of line with nothing declaring it, and they
+  // are right about our language and wrong about FreeBASIC. Refusing all of them here would replace a
+  // missing refusal with 25 wrong ones, which is the one outcome worse than not refusing at all.
+  // ⇒ What ships is the half the oracle and OUR corpus agree on: a type declared inside a NAMESPACE.
+  // The module-level half is written up in DIVERGENZE.md with the 25 programs it costs and what
+  // closing it needs - a decision about the language, taken once, not smuggled in with a refusal.
+  if (FTypesInNamespace.IndexOf(BareType) >= 0) and
+     (FTypeDeclaredMembers.IndexOf(BareType + '.' + MemberKey) < 0) then
+    HandleError(Format('type %s never declares %s: a member can only be DEFINED where its type ' +
+      'DECLARED it', [BareType, MemberKey]), NameTok);
+end;
+
+procedure TPackratParser.RefuseUnwritableTarget(Node: TASTNode; const What: string);
+// ⭐ A THING BEING WRITTEN MUST BE WRITABLE - and this is the SECOND PLACE that has to say so. The
+// assignment path has refused "Cannot modify a constant" since m632/m648; SWAP, LET(...) destructuring,
+// MID() = and LSET/RSET all write their target too, and not one of them ever asked. fbc refuses every
+// one ("error 119: Cannot modify a constant", or "error 24: Invalid data types" when the operand is a
+// literal), so five writers were agreeing with each other by never posing the question.
+//
+// It asks EXACTLY the question the assignment site asks, through the same two readers, so a name that
+// is unassignable is unswappable by construction and the two can never drift apart:
+//   - a LITERAL is not a variable at all ("Swap a, 0", "Let(0) = x");
+//   - a name in FConstNames - which holds both a CONST statement's name and a "Dim As Const" one;
+//   - a constant reached through a field or an array element, via ConstRootOfTarget.
+// ⛔ AND A DEREF IS STILL NOT WALKED THROUGH: "Swap *pa, *pb" is legal even when the POINTERS are
+// const, because a const pointer may not be reseated while what it points at may be written. That is
+// m632's half of the word, and ConstRootOfTarget already stops there - which is why this reuses it
+// rather than walking the target again.
+var
+  Nm: string;
+begin
+  if (Node = nil) or (not FModernMode) then Exit;
+  if Node.NodeType = antLiteral then
+  begin
+    HandleError(Format('%s must be a variable that can be written, and a literal is not one', [What]),
+                Node.Token);
+    Exit;
+  end;
+  if Node.NodeType = antIdentifier then
+  begin
+    Nm := UpperCase(VarToStr(Node.Value));
+    if FConstNames.IndexOf(Nm) < 0 then Nm := '';
+  end
+  else
+    Nm := ConstRootOfTarget(Node);
+  if Nm <> '' then
+    HandleError(Format('Cannot modify a constant: %s cannot be %s', [Nm, What]), Node.Token);
+end;
+
+procedure TPackratParser.RefuseNonModuleLevelType(Node: TASTNode);
+// ⛔ A TYPE DECLARED INSIDE A PROCEDURE OR A BLOCK MAY NOT NEED A CONSTRUCTOR, A DESTRUCTOR OR A
+// METHOD. fbc: "error 263: Objects with default [con|de]structors or methods are only allowed in the
+// module level" - such a member would be a nested procedure, and FreeBASIC has none. A plain POD is
+// fine and stays fine, and so is a type declared inside a NAMESPACE, which IS module level.
+//
+// The five triggers, read off the fbc suite's own 15-test family and then checked against the oracle
+// one spelling at a time:
+//   - any method at all: Sub, Function, Static Sub/Function, Constructor, Destructor, Property, Operator
+//   - a var-len STRING field (it is what gives the type an implicit ctor/dtor); a FIXED-length string,
+//     an array field, a pointer field and a nested POD are all fine
+//   - a field whose type declares a constructor or a destructor
+//   - EXTENDS a type that declares one, or EXTENDS OBJECT
+var
+  i: Integer;
+  Fld: TASTNode;
+  Ext, TypeNm, Why: string;
+begin
+  if (Node = nil) or (Node.NodeType <> antTypeDecl) then Exit;
+  Why := '';
+  if Node.Attributes.Values['HASMEMBERPROC'] = '1' then
+    Why := 'it declares a method'
+  else
+  begin
+    Ext := UpperCase(Node.Attributes.Values['EXTENDS']);
+    if Ext = 'OBJECT' then
+      Why := 'it extends OBJECT'
+    else if (Ext <> '') and (FTypesWithCtorDtor.IndexOf(Ext) >= 0) then
+      Why := 'it extends ' + Ext + ', which declares a constructor or a destructor'
+    else
+      for i := 0 to Node.ChildCount - 1 do
+      begin
+        Fld := Node.GetChild(i);
+        if (Fld = nil) or (Fld.NodeType <> antIdentifier) or (Fld.ChildCount < 1) then Continue;
+        if Fld.GetChild(0).NodeType <> antIdentifier then Continue;
+        TypeNm := UpperCase(VarToStr(Fld.GetChild(0).Value));
+        if (TypeNm = 'STRING') and (Fld.Attributes.Values['FIXEDLEN'] = '') then
+        begin
+          Why := 'its field ' + UpperCase(VarToStr(Fld.Value)) + ' is a var-len string';
+          Break;
+        end;
+        if FTypesWithCtorDtor.IndexOf(TypeNm) >= 0 then
+        begin
+          Why := 'its field ' + UpperCase(VarToStr(Fld.Value)) + ' is a ' + TypeNm +
+                 ', which declares a constructor or a destructor';
+          Break;
+        end;
+      end;
+  end;
+  if Why <> '' then
+    HandleError(Format('Type %s cannot be declared here: %s, and a type that needs a constructor, ' +
+      'a destructor or a method is only allowed at module level',
+      [UpperCase(VarToStr(Node.Value)), Why]), Node.Token);
+end;
+
+procedure TPackratParser.CheckDeclStatesItsType(Node: TASTNode);
+// ⭐ A DECLARATION STATES ITS TYPE. fbc: "error 147: Default types or suffixes are only valid in
+// -lang deprecated or fblite or qb". In -lang fb there is no implicit type and no DEFxxx letter rule,
+// so "Dim a", "Dim a(0 To 1)", "Common a" and "Dim a = 5" are all refused: a name with no AS has no
+// type at all.
+//
+// ⛔ AND THE SUFFIX IS NOT THE OFFENCE, which is the opposite of how the family reads. "Dim a$"
+// is refused and "Dim a$ As String" is ACCEPTED - fbc only emits "warning 44: Suffix ignored" for the
+// second. So the question asked here is never "does the name carry a sigil"; it is only ever "did this
+// declaration state a type". Measured on the oracle before the rule was written, because reasoning
+// from the test names (type-suffix-*) gives the wrong rule.
+//
+// ⚠ It is PER NAME, not per statement: fbc refuses "Dim a, b As Integer" because the AS binds to
+// "b" alone and "a" is left untyped, while the leading-AS spelling "Dim As Integer a, b" types both.
+// Our parser already writes exactly that distinction into the tree - an untyped name gets an empty
+// type identifier - so the check reads the tree and needs no state and no scope of its own. fbc
+// refuses a bare Dim at module level, in a Sub, in a Scope and in an If alike (all four probed), so
+// this is not gated on AtModuleLevel.
+var
+  i, k: Integer;
+  Decl, Ch: TASTNode;
+  Nm: string;
+  TypeSeen: Boolean;
+begin
+  if Node = nil then Exit;
+  if not FModernMode then Exit;   // ⛔ CLASSIC IS THE DIALECT WHERE "A$" AND A BARE DIM ARE THE NORM
+  // ⛔ ...AND SO ARE qb, fblite AND deprecated, which fbc's own message names: a file that asks for one
+  // of them with '#lang "fblite"' gets the default types and the suffixes, and refusing it would be a
+  // program fbc compiles that we do not. 17 of the FreeBASIC manual's own examples declare exactly that.
+  if SourceDeclaresNonFbDialect then Exit;
+  if Node.NodeType <> antDim then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+    // The three spellings that carry their type somewhere other than a type name, and are legal:
+    // VAR infers it from the initializer, "As TypeOf(expr)" from an expression the SSA resolves, and a
+    // CONST from its value ("Const K = 5" needs no AS - fbc compiles it).
+    if (Decl.Attributes.Values['INFER'] = '1') or (Decl.Attributes.Values['TYPEOF'] = '1') or
+       (Decl.Attributes.Values['CONSTDECL'] = '1') then Continue;
+    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    // A DOTTED name is the static-member definition "Dim UDT.m As T", which fbc judges by whether the
+    // member was declared STATIC in the type - a different question with a different answer, and it
+    // needs the type's member table. Left to its own rule.
+    if (Nm = '') or (Pos('.', Nm) > 0) then Continue;
+    TypeSeen := False;
+    for k := 1 to Decl.ChildCount - 1 do
+    begin
+      Ch := Decl.GetChild(k);
+      if Ch = nil then Continue;
+      if Ch.NodeType = antDimensions then Continue;   // the bounds sit between the name and the type
+      TypeSeen := (Ch.NodeType = antIdentifier) and (VarToStr(Ch.Value) <> '');
+      Break;                                          // whatever comes first decides; an initializer
+    end;                                              // reached before a type name means there is none
+    if not TypeSeen then
+      HandleError(Format('%s has no type: in the FreeBASIC dialect a declaration must say AS <type> ' +
+        '(there are no default types and no type suffixes)', [Nm]), Decl.GetChild(0).Token);
+  end;
+end;
+
+procedure TPackratParser.CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
+// ⭐ A NAME MAY BE DECLARED ONCE AT MODULE LEVEL. fbc: "error 4: Duplicated definition". Two "Dim a",
+// a "Common i" beside a "Dim i", a "Dim foo" beside a "Const foo", and an array declared twice are all
+// the same refusal - and a "Dim a() As Integer" followed by a "ReDim a(...) As Double" is one too,
+// because the second states a different ELEMENT TYPE for a name that already has one.
+//
+// ⛔ MODULE LEVEL ONLY, and the caller decides that with the one flag this parser has. A declaration
+// inside a Sub, a Scope or an If SHADOWS the module one and is legal - all three measured against the
+// oracle before this was written - and a ReDim of an array a Dim already declared is the normal idiom,
+// so a ReDim neither registers a name nor is refused for finding one.
+var
+  i, k, Idx: Integer;
+  Decl, Ch: TASTNode;
+  Nm, TypeNm: string;
+begin
+  if Node = nil then Exit;
+  if not (Node.NodeType in [antDim, antRedim]) then Exit;
+  // ⛔ ...AND NOT INSIDE A NAMESPACE. A namespace body is module level for the TYPE rule (m646) and is
+  // NOT one scope for NAMES: two namespaces may each declare their own "v", and fbc compiles that.
+  // The two questions look alike and have different answers, so they are asked separately.
+  if FInNamespaceBody then Exit;
+  // ⛔ ...AND NOT A "COMMON". A COMMON DECLARES a name that a later DIM may then SIZE: fbc's own
+  // dim/dim-common-dynamic writes "Common array() As Integer" followed by "Dim array(1 To 2)" and
+  // compiles it. ⚠️ For a SCALAR the same pair IS an error ("Common i" + "Dim i"), so this exemption
+  // gives up two tests to keep two others - telling them apart wants the array/scalar shape of BOTH
+  // declarations, which is the EXTERN machinery next door and a separate piece of work.
+  if (Node.Token <> nil) and (UpperCase(VarToStr(Node.Token.Value)) = 'COMMON') then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Decl := Node.GetChild(i);
+    if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+    if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    if (Nm = '') or (Pos('.', Nm) > 0) then Continue;   // a member definition is a different rule
+    // the declared type: the FIRST bare identifier after the name (an antDimensions may sit between)
+    TypeNm := '';
+    for k := 1 to Decl.ChildCount - 1 do
+    begin
+      Ch := Decl.GetChild(k);
+      if (Ch <> nil) and (Ch.NodeType = antIdentifier) then
+      begin
+        TypeNm := UpperCase(VarToStr(Ch.Value));
+        Break;
+      end;
+    end;
+    Idx := FModuleDeclared.IndexOfName(Nm);
+    if IsRedim then
+    begin
+      // A ReDim does not declare the name; it may not contradict the type the Dim gave it.
+      if (Idx >= 0) and (TypeNm <> '') and (FModuleDeclared.ValueFromIndex[Idx] <> '') and
+         (FModuleDeclared.ValueFromIndex[Idx] <> TypeNm) then
+        HandleError(Format('Duplicated definition: %s was declared As %s and this ReDim says As %s',
+          [Nm, FModuleDeclared.ValueFromIndex[Idx], TypeNm]), Decl.GetChild(0).Token);
+      Continue;
+    end;
+    if Idx >= 0 then
+      HandleError(Format('Duplicated definition: %s is already declared at module level', [Nm]),
+                  Decl.GetChild(0).Token)
+    else
+      FModuleDeclared.Values[Nm] := TypeNm;
+  end;
+end;
+
+procedure TPackratParser.CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
+// The module-level names that are LOCALS of the implicit main: a bare "Dim" and a bare "Static", with
+// no SHARED, outside any NAMESPACE. ⛔ They are what a STATIC-STORAGE initialiser may not reference -
+// see InitReferencesModuleLocal. A CONST is not one of them (it is folded, not stored), and neither is
+// anything inside a procedure: that is a different scope, and a name there cannot be reached from a
+// module-level initialiser at all.
+var
+  i, j: Integer;
+  Ch, Decl: TASTNode;
+begin
+  if Node = nil then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Ch := Node.GetChild(i);
+    if Ch = nil then Continue;
+    if Ch.NodeType = antProcedureDecl then Continue;      // another scope entirely
+    if Ch.NodeType = antNamespace then
+    begin
+      CollectModuleLocalNames(Ch, True);
+      Continue;
+    end;
+    if Ch.NodeType <> antDim then
+    begin
+      CollectModuleLocalNames(Ch, InNamespace);
+      Continue;
+    end;
+    if InNamespace then Continue;                         // a namespace member has static storage
+    for j := 0 to Ch.ChildCount - 1 do
+    begin
+      Decl := Ch.GetChild(j);
+      if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
+      if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+      if Decl.Attributes.Values['CONSTDECL'] = '1' then Continue;
+      if Decl.Attributes.Values['SHARED'] = '1' then Continue;
+      // ⚠️ STATIC ONLY, deliberately. fbc treats a module-level bare "Dim" as a local of the implicit
+      // main too, and refuses "Dim As Integer i : Dim Shared As Integer v = i" with "error 11: Expected
+      // constant" - measured. We ACCEPT that shape, and one of our own guards (m393) is built on
+      // accepting it, so closing that half is a decision about m393 and not about this rule. Written
+      // down in job/markdown/DIVERGENZE.md rather than half-done here.
+      if Decl.Attributes.Values['STATIC'] <> '1' then Continue;
+      FModuleLocalNames.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+    end;
+  end;
+end;
+
+function TPackratParser.InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
+// Does this initializer expression name one of them, at any depth? "@i", "i", "i + 1" and
+// "UDT(@i)" are all the same answer.
+var
+  i: Integer;
+begin
+  Result := False; Which := '';
+  if (Node = nil) or (FModuleLocalNames.Count = 0) then Exit;
+  // ⛔ TWO NODE KINDS CARRY THE NAME, and the interesting one is the SECOND. "@i" is an antProcAddress
+  // whose VALUE is the name - it has no antIdentifier child at all - and that is the very spelling the
+  // family is about ("Dim Shared As Integer Ptr p = @i"). Matching antIdentifier alone caught one test
+  // of six and left five looking like a rule that does not work.
+  if Node.NodeType in [antIdentifier, antProcAddress] then
+  begin
+    Which := UpperCase(VarToStr(Node.Value));
+    if FModuleLocalNames.IndexOf(Which) >= 0 then Exit(True);
+    Which := '';
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    if InitReferencesModuleLocal(Node.GetChild(i), Which) then Exit(True);
+end;
+
+procedure TPackratParser.RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
+// ⭐ A VAR-LEN STRING WITH STATIC STORAGE CANNOT BE INITIALIZED - fbc's "error 87". A string
+// descriptor with static storage is filled by the runtime before main runs, and there is no place to
+// run the copy that an initializer needs; a FIXED-length one ("String * 5", "ZString * n") is plain
+// bytes and initializes fine, and so does a LOCAL var-len string, which is built on entry to its
+// procedure.
+// ⛔ THE BOUNDARY IS "STATIC STORAGE", NOT "MODULE LEVEL", and the two are not the same: a bare
+// module-level "Dim s As String = ..." is a local of the implicit main and fbc ACCEPTS it, while a
+// "Static" one inside a Sub has static storage and is refused. Measured against the oracle, one
+// spelling at a time, before this was written - reading "module level" off the test names would have
+// refused a program fbc compiles. Static storage is SHARED, STATIC, a NAMESPACE member, a dotted
+// definition of someone's member, or a name a module-level EXTERN already declared.
+var
+  i, j, k, TypeIdx, InitIdx: Integer;
+  Ch, Decl, Sub: TASTNode;
+  TypeName, Nm, LocalNm: string;
+  IsStatic, IsVarLenStr, HasDims: Boolean;
+begin
+  if Node = nil then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    Ch := Node.GetChild(i);
+    if Ch = nil then Continue;
+    if Ch.NodeType = antNamespace then
+    begin
+      RejectStaticVarLenStringInit(Ch, True);
+      Continue;
+    end;
+    // ⛔ A STATIC MEMBER'S DEFINITION IS NOT AN antDim. "Dim UDT.pi As Integer Ptr = @i" comes out of
+    // the parser as an antAssignment whose target is a member access marked STATICMEMBERDEF - it is a
+    // DEFINITION of storage that is static by construction, and the rule below owes it the same answer.
+    if (Ch.NodeType = antAssignment) and (Ch.ChildCount >= 2) and
+       (Ch.GetChild(0).NodeType = antMemberAccess) and (Ch.GetChild(0).ChildCount >= 1) and
+       (Ch.GetChild(0).GetChild(0).Attributes.Values['STATICMEMBERDEF'] = '1') then
+    begin
+      if InitReferencesModuleLocal(Ch.GetChild(1), LocalNm) then
+        HandleError(Format('%s.%s has static storage and its initializer references the local symbol %s',
+                           [UpperCase(VarToStr(Ch.GetChild(0).GetChild(0).Value)),
+                            UpperCase(VarToStr(Ch.GetChild(0).Value)), LocalNm]), Ch.Token);
+      Continue;
+    end;
+    // ⛔ A PROCEDURE BODY INSIDE A NAMESPACE IS NOT THE NAMESPACE. The flag was handed down through
+    // every child, procedure bodies included, so a plain LOCAL "Dim As String s = ..." written inside
+    // a Sub that happens to live in a namespace was refused as static storage - a program fbc compiles.
+    // fbcunit's TEST_GROUP opens a namespace, so this was latent over the whole suite: every var-len
+    // string a test initialises is inside one.
+    if Ch.NodeType <> antDim then
+    begin
+      RejectStaticVarLenStringInit(Ch, InNamespace and (Ch.NodeType <> antProcedureDecl));
+      Continue;
+    end;
+    for j := 0 to Ch.ChildCount - 1 do
+    begin
+      Decl := Ch.GetChild(j);
+      if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
+      if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+      // ⛔ A CONST is not a variable - a module-level one carries SHARED because it is globally
+      // VISIBLE, not because it has a descriptor to fill, and fbc initializes it happily.
+      if Decl.Attributes.Values['CONSTDECL'] = '1' then Continue;
+      // ⚠️ SCALARS ONLY, on purpose. fbc refuses "Dim Shared a(0 To 1) As String = {...}" too, and we
+      // ACCEPT it - m203 is a guard built on that acceptance. Closing the array half means deciding
+      // what happens to that guard, which is a separate question from this one; it is written down in
+      // job/markdown/DIVERGENZE.md rather than half-done here.
+      HasDims := False;
+      for k := 1 to Decl.ChildCount - 1 do
+        if Decl.GetChild(k).NodeType = antDimensions then HasDims := True;
+      Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      IsStatic := (Decl.Attributes.Values['SHARED'] = '1') or
+                  (Decl.Attributes.Values['STATIC'] = '1') or
+                  InNamespace or (Pos('.', Nm) > 0) or
+                  (FExternShapes.IndexOfName(Nm) >= 0);
+      if not IsStatic then Continue;
+      // Split the children into "the type" and "the initializer", exactly as ShapeOfArrayDecl does:
+      // the FIRST bare identifier after the name is the type, the first child after that is the value.
+      TypeIdx := -1; InitIdx := -1;
+      for k := 1 to Decl.ChildCount - 1 do
+      begin
+        Sub := Decl.GetChild(k);
+        if Sub.NodeType = antDimensions then Continue;
+        if (TypeIdx < 0) and (Sub.NodeType = antIdentifier) then
+        begin
+          TypeIdx := k;
+          Continue;
+        end;
+        InitIdx := k;
+        Break;
+      end;
+      if InitIdx < 0 then Continue;                     // no initializer: nothing to refuse
+      Sub := Decl.GetChild(InitIdx);
+      if TypeIdx >= 0 then
+        TypeName := UpperCase(VarToStr(Decl.GetChild(TypeIdx).Value))
+      else
+        TypeName := '';
+      // A declared STRING with no "* n" capacity is var-len; with no declared type at all (VAR), the
+      // initializer being a string LITERAL is what makes it one.
+      IsVarLenStr := (not HasDims) and
+                     (((TypeName = 'STRING') and (Decl.Attributes.Values['FIXEDLEN'] = '')) or
+                      ((TypeName = '') and (Sub.NodeType = antLiteral) and Assigned(Sub.Token) and
+                       (Sub.Token.TokenType = ttStringLiteral)));
+      // ⛔ A BYREF DECLARATION HAS NO DESCRIPTOR TO FILL. "Dim Shared ByRef rs As String = s" BINDS a
+      // reference to someone else's string; the "= s" is the referent, not a value copied into storage,
+      // and fbc compiles it (verified: with s a "Dim Shared As String", it is accepted - and refused
+      // only for reasons of its own, error 87 when s carries an initializer, error 11 when s is a local
+      // of the implicit main). Read as an ordinary initialization it refused the whole of fbc's own
+      // dim/byref.bas.
+      if IsVarLenStr and (Decl.Attributes.Values['BYREF'] <> '1') then
+        HandleError(Format('Var-len string %s cannot be initialized: it has static storage', [Nm]),
+                    Decl.GetChild(0).Token);
+      // ⭐ ...AND WHATEVER IT IS, ITS INITIALIZER MAY NOT NAME A LOCAL OF THE IMPLICIT MAIN. A
+      // static-storage variable is set up before that main runs, so a module-level bare "Dim" or
+      // "Static" does not exist yet: fbc answers "error 272: Local symbols can't be referenced" for its
+      // address and "error 11: Expected constant" for its value. Measured one spelling at a time -
+      // a literal, a CONST and the address of another SHARED are all fine, and a bare "Dim v = i" with
+      // no static storage of its own is fine too.
+      // ⛔ ...BUT A MODULE-LEVEL "STATIC" MAY NAME ANOTHER ONE - AS A REFERENT, NEVER AS A VALUE. What
+      // fbc asks of a static-storage initializer is a CONSTANT, and the address of a symbol that also
+      // has static storage is one. The oracle draws the line one spelling at a time:
+      //   Static mi : Static p = @mi            OK      (the ADDRESS of a module static)
+      //   Static mi : Static ByRef r = mi       OK      (a reference bound to it - the same address)
+      //   Static mi : Static v = mi             error 11 (its VALUE is not a constant)
+      //   Static u  : Static ByRef r = u.I      error 11 (a FIELD is not, whatever u is)
+      //   Static mi : Dim Shared p = @mi        error 272 (a SHARED may not reach a scope-local symbol)
+      // So the exemption is not "this declaration is STATIC" - that was written first and it dropped
+      // fbc's own dim/byref-static-from-static-field, which is exactly the field case above. It is
+      // "the initializer IS that referent, whole": a bare "@name", or the bare name of a BYREF binding.
+      // Anything nested - a member access, an expression - keeps the refusal.
+      if (Decl.Attributes.Values['STATIC'] = '1') and (Decl.Attributes.Values['SHARED'] <> '1') and
+         (not InNamespace) and (Pos('.', Nm) = 0) and
+         (Sub.ChildCount = 0) and
+         ((Sub.NodeType = antProcAddress) or
+          ((Sub.NodeType = antIdentifier) and (Decl.Attributes.Values['BYREF'] = '1'))) and
+         (FModuleLocalNames.IndexOf(UpperCase(VarToStr(Sub.Value))) >= 0) then
+        Continue;
+      if InitReferencesModuleLocal(Sub, LocalNm) then
+        HandleError(Format('%s has static storage and its initializer references the local symbol %s',
+                           [Nm, LocalNm]), Decl.GetChild(0).Token);
+    end;
+  end;
+end;
+
+function TPackratParser.SkipAliasClause: Boolean;
+// ⭐ ALIAS "name" IS ACCEPTED IN FIVE STATEMENTS, and it was skipped in three. A linkage alias is a
+// name for the LINKER, which a bytecode VM has none of, so every one of the five is entitled to
+// throw it away - but NAMESPACE read the word as the start of a statement ("Undefined procedure:
+// ALIAS") and ENUM read it as the enum's own name, and then read the string as the first member
+// ("Expected enum member name"). Both refused a program fbc compiles, which is the direction that
+// must never happen. One funnel now, asked wherever the clause is legal.
+begin
+  Result := False;
+  if not Context.Check(ttIdentifier) then Exit;
+  if UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'ALIAS' then Exit;
+  if not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral)) then Exit;
+  Context.Advance;      // ALIAS
+  Context.Advance;      // "name"   (an EMPTY one is refused by RejectEmptyAliasNames, before parsing)
+  Result := True;
+end;
+
+procedure TPackratParser.RejectEmptyAliasNames;
+// ⭐ ALIAS "" IS AN ERROR WHEREVER IT IS WRITTEN. fbc answers "error 304: ALIAS name string is
+// empty" for a procedure, a variable, a NAMESPACE, a TYPE and an ENUM alike - five different
+// statements, one rule. The alias is a LINKER name and SedaiBasic does no external linking, so every
+// one of those five parsers is entitled to skip it; the consequence was that none of them could
+// refuse it, and the rule had no home.
+// ⛔ It is a rule about two adjacent TOKENS, so it is asked of the token stream once, before parsing,
+// instead of being written into five statement parsers - the shape this codebase has been bitten by
+// repeatedly is a rule one path has and its siblings do not. An empty alias name is never valid
+// anywhere, so a token-level answer cannot over-refuse: for the word to be followed directly by a
+// string literal with no operator between them, it has to BE the ALIAS clause.
+var
+  i: Integer;
+  T, N: TLexerToken;
+begin
+  if not HasValidContext then Exit;
+  if Context.TokenList = nil then Exit;
+  for i := 0 to Context.TokenList.Count - 2 do
+  begin
+    T := Context.TokenList.GetTokenDirect(i);
+    if (T = nil) or (UpperCase(VarToStr(T.Value)) <> 'ALIAS') then Continue;
+    N := Context.TokenList.GetTokenDirect(i + 1);
+    if (N <> nil) and (N.TokenType = ttStringLiteral) and (VarToStr(N.Value) = '') then
+      HandleError('ALIAS name string is empty', N);
+  end;
+end;
+
+procedure TPackratParser.ScanModuleLevelExtern;
+// Read a single-line "EXTERN [ByRef] name[(dims)] [As type [* n]] [= init]" for its SHAPE, then
+// REWIND. The caller's skip-to-end-of-line runs afterwards exactly as it did before, so this routine
+// changes no token consumption and builds no AST. Anything it does not recognise - ALIAS, a leading
+// AS, a procedure pointer - leaves the name unregistered, which is precisely the behaviour that was
+// there before it existed.
+// ⛔ It reads tokens and puts them back, so it MUTES the error list while it looks: a diagnostic
+// left behind by a look-ahead is an error the program never made.
+var
+  SavedIdx, Idx: Integer;
+  Nm, TypeName, Shape, Why, Flags: string;
+  Dims, CapExpr, Decl: TASTNode;
+  BlameTok: TLexerToken;
+  CapVal: Int64;
+  HasParens, HasInit, HasEllipsis, Understood: Boolean;
+begin
+  SavedIdx := Context.CurrentIndex;
+  Dims := nil;
+  Nm := ''; TypeName := ''; Flags := ''; Understood := False;
+  HasInit := False; HasEllipsis := False;
+  BlameTok := Context.CurrentToken;
+  Context.MutedErrors := Context.MutedErrors + 1;
+  try
+    Context.Advance;                                      // EXTERN
+    // "Extern ByRef ri As Integer" declares an ALIAS for someone else's storage, and that is part of
+    // the declaration: fbc answers "error 20: Type mismatch" when the DIM that follows is not ByRef.
+    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    begin
+      Flags := Flags + '&';
+      Context.Advance;
+    end;
+    if not Context.Check(ttIdentifier) then Exit;          // "Extern As Integer a" and friends
+    Nm := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;
+    HasParens := Context.Check(ttDelimParOpen);
+    if HasParens then
+    begin
+      Context.Advance;                                    // '('
+      Dims := ParseDimensionList;
+      if not Context.Check(ttDelimParClose) then Exit;
+      Context.Advance;                                    // ')'
+      for Idx := 0 to Dims.ChildCount - 1 do
+        if Dims.GetChild(Idx).Attributes.Values['ELLIPSIS'] = '1' then HasEllipsis := True;
+    end;
+    if Context.Check(ttAsType) then
+    begin
+      Context.Advance;                                    // AS
+      if not Context.Check(ttIdentifier) then Exit;        // a qualifier or a procedure type: not ours
+      TypeName := UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;
+      // "As String * 5" - a fixed-length capacity, which is part of the type, not a decoration.
+      if Context.Check(ttOpMul) then
+      begin
+        Context.Advance;                                  // '*'
+        CapExpr := ParseExpression;
+        if CapExpr = nil then Exit;
+        if TryConstIntExpr(CapExpr, CapVal) then Flags := Flags + '*' + IntToStr(CapVal);
+        CapExpr.Free;
+      end;
+    end;
+    HasInit := Context.Check(ttOpEq);
+    // Only a line this routine has read to its END is a line whose shape it knows. A PTR suffix, an
+    // ALIAS - anything still unread here - means "do not register this name".
+    if not (HasInit or Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) then Exit;
+    Shape := EncodeDeclShape(Dims, TypeName, 0, Flags);
+    Understood := True;
+  finally
+    if Assigned(Dims) then Dims.Free;
+    Context.CurrentIndex := SavedIdx;
+    Context.MutedErrors := Context.MutedErrors - 1;
+  end;
+  if not Understood then Exit;
+  // ⛔ An EXTERN declares, it does not define: fbc refuses an initializer on one, and refuses an
+  // ellipsis bound too - whose whole job is to be counted from an initializer an EXTERN may not have.
+  if HasInit then
+  begin
+    HandleError(Format('EXTERN %s cannot be initialized: an EXTERN declares, it does not define',
+                       [Nm]), BlameTok);
+    Exit;
+  end;
+  if HasEllipsis then
+  begin
+    HandleError(Format('EXTERN %s cannot use an ellipsis bound: there is no initializer to count',
+                       [Nm]), BlameTok);
+    Exit;
+  end;
+  Idx := FExternShapes.IndexOfName(Nm);
+  if (Idx >= 0) and ShapeConflict(FExternShapes.ValueFromIndex[Idx], Shape, Why) then
+  begin
+    HandleError(Format('Conflicting declaration of %s: %s', [Nm, Why]), BlameTok);
+    Exit;
+  end;
+  NoteExternShape(Nm, Shape);
+  // ⛔ AND FOR AN ARRAY, READING THE SHAPE IS NOT ENOUGH. A scalar EXTERN costs the SSA nothing - an
+  // unknown name is a fresh variable - but an ARRAY needs a slot, so "Extern a() As Integer" followed
+  // by "a(0)" died with "Array not declared: A" on a program fbc compiles (fbc suite
+  // dim/all-kinds-of-vars, whose EXTERN array's only DIM sits inside a "#if 0"). fbc's EXTERN declares
+  // the array without defining it; here, where there is no linker to define it later, the declaration
+  // has to carry the storage.
+  // ⚠️ Only when the module does NOT declare the name anywhere else, because that same file writes
+  // "extern publicarray()" and "dim publicarray()" together and fbc answers "error 4: Duplicated
+  // definition" to two definitions. ModuleDeclaresNameElsewhere over-matches on purpose: a false
+  // "yes" leaves the behaviour exactly as it was, a false "no" would invent a duplicate.
+  if HasParens and (TypeName <> '') and not ModuleDeclaresNameElsewhere(Nm) then
+  begin
+    FPendingExternArray := TASTNode.Create(antDim, BlameTok);
+    Decl := TASTNode.Create(antArrayDecl, BlameTok);
+    Decl.Attributes.Values['VARLEN'] := '1';               // no bounds: the dynamic form "Dim a()"
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, Nm, BlameTok));
+    Decl.AddChild(TASTNode.Create(antDimensions, BlameTok));
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, BlameTok));
+    FPendingExternArray.AddChild(Decl);
+  end;
+end;
+
+function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
+// Does any DECLARATION STATEMENT in this module name Nm? Asked of the token stream, so what the
+// preprocessor removed (a "#if 0" block) is invisible here - which is the whole point: fbc's
+// dim/all-kinds-of-vars hides the DIM of its EXTERN array inside one and defines its other extern
+// arrays for real, and the two have to be told apart.
+// ⚠️ A whole declaration LINE is searched, not just the slot after the keyword, so the leading-AS
+// spelling ("Dim As Integer a") and a multi-name line are covered without parsing either. That
+// over-matches - a line that merely mentions the name counts - and over-matching is the safe
+// direction: it answers "already declared" and leaves the caller doing nothing.
+var
+  i: Integer;
+  T, P: TLexerToken;
+  W: string;
+  OnDeclLine: Boolean;
+begin
+  Result := False;
+  if not HasValidContext then Exit;
+  if Context.TokenList = nil then Exit;
+  OnDeclLine := False;
+  for i := 0 to Context.TokenList.Count - 1 do
+  begin
+    T := Context.TokenList.GetTokenDirect(i);
+    if T = nil then Continue;
+    if T.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile] then
+    begin
+      OnDeclLine := False;
+      Continue;
+    end;
+    if not OnDeclLine then
+    begin
+      // The first token of the statement decides whether this is a declaration line at all.
+      if i = 0 then P := nil else P := Context.TokenList.GetTokenDirect(i - 1);
+      if (P = nil) or (P.TokenType in [ttEndOfLine, ttSeparStmt]) then
+      begin
+        W := UpperCase(VarToStr(T.Value));
+        OnDeclLine := (W = 'DIM') or (W = 'REDIM') or (W = 'COMMON') or (W = 'STATIC') or (W = 'VAR');
+      end;
+      Continue;
+    end;
+    if UpperCase(VarToStr(T.Value)) = Nm then Exit(True);
+  end;
+end;
+
 function TPackratParser.FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
 // A file number can be a UDT member (e.g. "#bf.bw") — the handle identifier has
 // already been consumed; fold any trailing ".field" chain into antMemberAccess nodes
@@ -9129,6 +11921,26 @@ begin
   Result := TASTNode.CreateWithValue(antIdentifier, Context.CurrentToken.Value, Context.CurrentToken);
   Context.Advance;
   Result := FoldFileHandlePostfix(Result);
+end;
+
+function TPackratParser.ParseFileNumberOperand: TASTNode;
+// ⛔ ONE place decides what a file number may LOOK like; the '#' has already been consumed. Three
+// spellings: a literal, an identifier with its trailing ".field" chain, and a PARENTHESISED
+// expression. "Print #(1), x" is FreeBASIC's own spelling - its suite writes it that way inside a
+// macro, where the parentheses protect the argument - and it failed at SEVEN statements at once
+// because each of them re-listed the two spellings it happened to know.
+// Returns nil when the current token begins none of the three; the caller reports its own message.
+begin
+  Result := nil;
+  if Context.Check(ttNumber) or Context.Check(ttInteger) then
+  begin
+    Result := TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value), Context.CurrentToken);
+    Context.Advance;
+  end
+  else if Context.Check(ttIdentifier) then
+    Result := ParseFileHandleIdent
+  else if Context.Check(ttDelimParOpen) then
+    Result := FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall));
 end;
 
 function TPackratParser.ParseArrayAccess: TASTNode;
@@ -9206,11 +12018,15 @@ var
   FixedCapVal: Int64;   // folded "* n" capacity
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
+  TrailingTypeOfExpr: TASTNode;   // "name As TypeOf(expr)": the operand, consumed per declared name
   SharedFpNode: TASTNode;   // leading-AS "Dim As Sub(...) g": the shared funcptr signature
   MemberAccess, StaticDef: TASTNode;   // "Dim As T Type.member = init": static member definition
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
+  SavedTypeOf: Integer;         // scratch: rewind point for "As TypeOf( Sub(...) )"
+  TypeOfProcSig: Boolean;       // ...and whether that spelling is the one being read
+  Idx: Integer;                 // scratch: the const-pointee registry entry for a redeclared name
 begin
   Token := Context.CurrentToken;
   SharedFpNode := nil;
@@ -9235,6 +12051,7 @@ begin
   Result := TASTNode.Create(antDim, Token);
   Context.Advance; // Consume DIM
   LeadingTypeOfExpr := nil;   // set when the leading-AS type is "TypeOf(expr)" (inferred in the SSA pre-pass)
+  TrailingTypeOfExpr := nil;
   // M6: "DIM SHARED ..." — the declared variables are module globals visible (read/write) inside
   // SUB/FUNCTION bodies. Marked on each decl with the 'SHARED' attribute for the SSA pre-scan.
   IsShared := Context.Check(ttSharedDecl);
@@ -9267,10 +12084,35 @@ begin
       SharedTypeTok := Context.CurrentToken;
       Context.Advance;                        // TYPEOF
       Context.Advance;                        // '('
-      LeadingTypeOfExpr := FExpressionParser.ParseExpression;
-      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
-      SharedTypeName := 'INTEGER';            // placeholder; replaced by the inferred type in SSA
-      SharedFixedLen := '';
+      // ⭐ "TypeOf( Sub(...) )" IS "Sub(...)". The operand of TypeOf goes to the EXPRESSION parser,
+      // which reduces a bare signature to an antProcSig carrying only the parameter COUNT - so this
+      // declaration lost FPPARAMS/FPRET, no signature was recorded, and "p()" lowered as an array
+      // access ("Array not declared: P") while the explicit spelling worked. Routed into the SAME
+      // funnel the explicit one uses, the two spellings agree.
+      if Context.Check(ttProcedureStart) then
+      begin
+        SharedFpNode := TASTNode.Create(antArrayDecl, SharedTypeTok);
+        if TryParseProcPtrType(SharedFpNode) then
+        begin
+          if Context.Check(ttDelimParClose) then Context.Advance;   // ')' of TypeOf
+          SharedTypeName := 'INTEGER';        // a procedure entry PC, as the explicit spelling gives
+          SharedFixedLen := '';
+        end
+        else
+        begin
+          SharedFpNode.Free; SharedFpNode := nil;
+          HandleError('Expected type name after AS', Context.CurrentToken);
+          DoNodeCreated(Result);
+          Exit;
+        end;
+      end
+      else
+      begin
+        LeadingTypeOfExpr := FExpressionParser.ParseExpression;
+        if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+        SharedTypeName := 'INTEGER';          // placeholder; replaced by the inferred type in SSA
+        SharedFixedLen := '';
+      end;
     end
     else
     begin
@@ -9296,7 +12138,7 @@ begin
     end
     else
     begin
-    if not Context.Check(ttIdentifier) then
+    if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
       DoNodeCreated(Result);
@@ -9333,6 +12175,25 @@ begin
   //   AS typename name   -> leading-AS typed scalar (shared type parsed above)
   //   name ( dims )      -> array (classic)
   repeat
+    // "Dim ByRef a As T = x, ByRef b As T = y": BYREF may be repeated before EACH name, and fbc's own
+    // suite writes the list that way. Only the LEADING one was read, so the second died as "Expected
+    // variable name in array declaration". The modifier is list-wide here either way, so a repeat is
+    // consumed rather than tracked per name.
+    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    begin
+      IsByref := True;
+      Context.Advance;
+    end;
+    // ⭐ ...and the SAME door, for a MODERN extension used as a DECLARED name, has to open HERE - not
+    // only inside ParseArrayDeclaration. This test is what picks scalar from array, and it asks for an
+    // identifier: with the token still typed as our intrinsic, "Dim Min As Integer" fell past the
+    // scalar branch into the array one, where the door does exist - and died on "Expected "(" after
+    // array name", a message about a declaration nobody wrote. The leading-AS spelling ("Dim As
+    // Integer Min") reached its own name check with the same untouched token.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
+
     // Leading-AS array declaration: "DIM [SHARED] AS type name(dims)". Route to ParseArrayDeclaration
     // (which handles the dimension list, including "lo TO hi" ranges and negative lower bounds) and
     // inject the shared type when no explicit "AS type" follows the array.
@@ -9348,6 +12209,16 @@ begin
       if (ArrayDecl.ChildCount < 3) or (ArrayDecl.GetChild(2).NodeType <> antIdentifier) then
         ArrayDecl.InsertChild(2, TASTNode.CreateWithValue(antIdentifier, SharedTypeName, SharedTypeTok));
       if SharedFixedLen <> '' then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;  // AS STRING * n arr()
+      // ⭐ ...and the leading-AS spelling of a FUNCPTR ARRAY carries the shared signature too:
+      // "Dim As Function(...) As T arr(0 To 1)". The trailing spelling reads it in ParseArrayDeclaration;
+      // here the type was consumed before the name, so it rides on the shared node.
+      if Assigned(SharedFpNode) then
+      begin
+        ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
+        ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
+        ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
+      end;
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
       Result.AddChild(ArrayDecl);
       if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
@@ -9387,6 +12258,12 @@ begin
                               UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
             MemberAccess.AddChild(TASTNode.CreateWithValue(antIdentifier,
                               UpperCase(VarToStr(NameTok.Value)), NameTok));
+            // ⛔ THIS IS THE DEFINITION, NOT AN ACCESS. It lowers to a store through the member, and the
+            // visibility rule would then refuse "Dim T.x As Integer = 123" for a PRIVATE static member -
+            // which is how FreeBASIC's own suite writes the storage of one ("visibility/private-var-
+            // public-init" is a COMPILE_ONLY_OK). The mark rides on the BASE identifier, which is the
+            // node the lowering's funnel is handed.
+            MemberAccess.GetChild(0).Attributes.Values['STATICMEMBERDEF'] := '1';
             Context.Advance;                   // field name
             if Context.Check(ttOpEq) then
             begin
@@ -9426,6 +12303,7 @@ begin
         Context.Advance;                       // owner name
         MemberAccess := TASTNode.CreateWithValue(antIdentifier,
                           UpperCase(VarToStr(NameTok.Value)), NameTok);
+        MemberAccess.Attributes.Values['STATICMEMBERDEF'] := '1';   // see the leading-AS twin above
         while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
               (Length(VarToStr(Context.PeekNext.Value)) > 0) and
               (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
@@ -9477,32 +12355,61 @@ begin
         NameTok := Context.CurrentToken;
         Context.Advance;                       // name
         Context.Advance;                       // AS
-        NameIsConst := SkipTypeQualifiersConst;   // see the leading-AS note above
+        NameIsConst := SkipTypeQualifiersConst;   // ...which also starts this type's qualifier chain
         // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": int-banked (holds an
         // entry PC); the signature is captured on a scratch node and copied onto the decl below.
         FuncPtrSigNode := nil;
+        // ⭐ ...and the TRAILING spelling of that same thing: "Dim p As TypeOf( Sub(...) )".
+        // TYPEOF and its '(' are consumed here so the funcptr funnel below sees exactly what
+        // "Dim p As Sub(...)" gives it; anything else rewinds and reads as an ordinary TypeOf operand.
+        TypeOfProcSig := False;
+        SavedTypeOf := 0;
+        if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+           Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+        begin
+          Context.SavePosition(SavedTypeOf);
+          Context.Advance;                     // TYPEOF
+          Context.Advance;                     // '('
+          if Context.Check(ttProcedureStart) then TypeOfProcSig := True
+          else Context.RestorePosition(SavedTypeOf);
+        end;
         if Context.Check(ttProcedureStart) then
         begin
           FuncPtrSigNode := TASTNode.Create(antArrayDecl, NameTok);
           if TryParseProcPtrType(FuncPtrSigNode) then
           begin
+            if TypeOfProcSig and Context.Check(ttDelimParClose) then Context.Advance;   // ')' of TypeOf
             DimTypeName := 'INTEGER';
             TypeTok := NameTok;
           end
           else
           begin
             FuncPtrSigNode.Free; FuncPtrSigNode := nil;
+            if TypeOfProcSig then Context.RestorePosition(SavedTypeOf);
           end;
         end;
         if not Assigned(FuncPtrSigNode) then
         begin
-          if not Context.Check(ttIdentifier) then
+          if not AtDottedTypeName then
           begin
             HandleError('Expected type name after AS', Context.CurrentToken);
             Break;
           end;
           TypeTok := Context.CurrentToken;
           DimTypeName := ParseDottedName;          // dotted: namespace-qualified type ("Forms.Point")
+          // ⛔ ...AND THE TRAILING SPELLING OF TypeOf HAS TO CONSUME ITS OPERAND. "Dim b As TypeOf(a)"
+          // read the type as the ordinary name "TYPEOF" and left "( a )" standing in the token stream.
+          // With no initializer nothing noticed, because the statement ended there - which is exactly
+          // why the feature looked present - but "Dim b As TypeOf(a) = 5" then met the '=' with the
+          // parentheses unread and died on 'Unexpected token in statement: "="'. The leading-AS
+          // spelling consumes it; this one only marked the attribute.
+          if (UpperCase(DimTypeName) = 'TYPEOF') and Context.Check(ttDelimParOpen) then
+          begin
+            Context.Advance;                       // '('
+            if Assigned(TrailingTypeOfExpr) then TrailingTypeOfExpr.Free;
+            TrailingTypeOfExpr := FExpressionParser.ParseExpression;
+            if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+          end;
           // FreeBASIC pointer type: "<type> PTR" (one or more PTR). A pointer is stored as an int handle
           // (the address); the suffix is kept on the type name so the SSA records the pointee bank.
           while AtPointerSuffix do
@@ -9514,6 +12421,63 @@ begin
       end;
       ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
       if NameIsConst then ArrayDecl.Attributes.Values['CONSTV'] := '1';
+      // ⛔ ...AND THE VARIABLE ITSELF IS THEN NOT AN LVALUE. "Dim As Const Integer i = 0 : i = 0" is
+      // fbc's error 119, and the refusal already exists one function away - it is what a module CONST
+      // gets - but only names declared with the CONST STATEMENT were ever put in the set.
+      // ⚠️ "Const" on a POINTER type says which of two different things is immutable: "As Const Integer
+      // Ptr" is a pointer TO const (assigning to the pointer is legal) and "As Integer Const Ptr" is a
+      // CONST pointer (it is not). The variable's own qualifier is the OUTERMOST level - the last one
+      // written - and only that one makes the name unassignable.
+      if (FPtrQualChain = '') and NameIsConst then
+        if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+          FConstNames.Add(UpperCase(VarToStr(NameTok.Value)))
+        else
+      else if (FPtrQualChain <> '') and (FPtrQualChain[Length(FPtrQualChain)] = '1') then
+      begin
+        if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+          FConstNames.Add(UpperCase(VarToStr(NameTok.Value)));
+      end
+      else
+      begin
+        // ⛔ ...AND A REDECLARATION WITHOUT THE QUALIFIER TAKES THE NAME BACK OUT. This set is keyed on
+        // a bare NAME, and a CONST POINTER can legally be redeclared in a sibling scope where the same
+        // name is a plain pointer - the manual's datatype/const-ptr does exactly that, four times. A
+        // plain CONST cannot be redeclared at all, which is why the hole sat here unexercised.
+        Idx := FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value)));
+        if (Idx >= 0) and (not FInConstDecl) then FConstNames.Delete(Idx);
+      end;
+      // The type's CONST chain, kept whole: character 0 is the BASE ("As Const <type>"), then one per
+      // pointer level in source order. "Const UByte Const Ptr Ptr" -> "110". FreeBASIC's rule for
+      // assigning one pointer to another is written on exactly this - and on nothing else, which is
+      // what its own 183 const/assign-* tests say when they are read as the specification they are.
+      if (NameIsConst or (FPtrQualChain <> '')) then
+        ArrayDecl.Attributes.Values['PTRQUALS'] :=
+          Copy('10', 1 + Ord(not NameIsConst), 1) + FPtrQualChain;
+      // ⭐ ...AND CHARACTER 1 OF THAT CHAIN IS THE POINTEE. "As Const Integer Ptr" gives "10": the BASE
+      // is const and the one pointer level is not, so the NAME may be reassigned and what it points at
+      // may not be written. That is the half m632 deliberately left alone, and it is 57 of the fbc
+      // suite's remaining "error 119" refusals - the largest single group left.
+      // ⛔ ...AND A REDECLARATION OF THE SAME NAME TAKES IT BACK OUT. This set is keyed on a BARE NAME,
+      // and the manual's own datatype/const-ptr writes all four combinations as four "Dim p" in four
+      // sibling Scopes: the "As Const Integer Ptr" one put P in, and the "As Integer Const Ptr" one -
+      // where "*p = z" is LEGAL and the example says so in a comment - found it still there. Parsing is
+      // sequential, so the newest declaration of a name is the one in force at every later use of it.
+      // (The parser has no scope stack; this is what it can honestly answer, and it answers the shape
+      // that actually occurs.)
+      // ⛔ ...AND ONLY WITH EXACTLY ONE POINTER LEVEL. "As Const Integer Ptr Ptr c" is a pointer to a
+      // pointer to const: "*c" is the INNER POINTER, which is perfectly writable, and only "**c" is
+      // not. fbc's own const/ptrassign writes "*c = @a" and expects it to compile. Refusing on the
+      // base qualifier alone, whatever the depth, is the shape that got that test wrong.
+      if NameIsConst and (Length(FPtrQualChain) = 1) then
+      begin
+        if FConstPointeeNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
+          FConstPointeeNames.Add(UpperCase(VarToStr(NameTok.Value)));
+      end
+      else
+      begin
+        Idx := FConstPointeeNames.IndexOf(UpperCase(VarToStr(NameTok.Value)));
+        if Idx >= 0 then FConstPointeeNames.Delete(Idx);
+      end;
       VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
       ArrayDecl.AddChild(VarNameNode);
       if LeadingAS and Assigned(LeadingTypeOfExpr) then
@@ -9522,10 +12486,23 @@ begin
         ArrayDecl.AddChild(LeadingTypeOfExpr.Clone);
         ArrayDecl.Attributes.Values['TYPEOF'] := '1';
       end
+      else if Assigned(TrailingTypeOfExpr) then
+      begin
+        // "DIM name As TypeOf(expr)": the same shape, reached by the other spelling.
+        ArrayDecl.AddChild(TrailingTypeOfExpr.Clone);
+        ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+      end
       else
       begin
         TypeNode := TASTNode.CreateWithValue(antIdentifier, DimTypeName, TypeTok);
         ArrayDecl.AddChild(TypeNode);        // child[1] is antIdentifier (type) => typed scalar
+        // ⛔ ...and the TRAILING spelling of TypeOf is one of these. "Dim b As TypeOf(a)" reads its type
+        // as the ordinary name "TYPEOF" with the operand landing in the argument list beside it, so the
+        // SSA pre-pass that resolves TypeOf never fired and the variable was declared with an UNKNOWN
+        // type: a String answered the float default and printed 0. Only the leading-AS spelling
+        // ("Dim As TypeOf(a) b") was ever marked, which is why the feature looked present.
+        if UpperCase(DimTypeName) = 'TYPEOF' then
+          ArrayDecl.Attributes.Values['TYPEOF'] := '1';
       end;
       // Leading-AS fixed-length string capacity ("DIM AS STRING * n name") applies to each name.
       if LeadingAS and (SharedFixedLen <> '') then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;
@@ -9537,6 +12514,9 @@ begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := FuncPtrSigNode.Attributes.Values['FPPARAMS'];
         ArrayDecl.Attributes.Values['FPRET'] := FuncPtrSigNode.Attributes.Values['FPRET'];
+        // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
+        // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
+        ArrayDecl.Attributes.Values['FPRETBYREF'] := FuncPtrSigNode.Attributes.Values['FPRETBYREF'];
         FuncPtrSigNode.Free; FuncPtrSigNode := nil;
       end
       else if LeadingAS and Assigned(SharedFpNode) then
@@ -9544,6 +12524,9 @@ begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
         ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
+        // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
+        // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
+        ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
       end;
       // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
       // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;
@@ -9606,9 +12589,32 @@ begin
       if Context.Check(ttOpEq) then
       begin
         Context.Advance;                     // =
-        if Context.Check(ttIdentifier) and
+        // ⛔ "= Any" IS NOT AN INITIALIZER EXPRESSION, and letting it be one is not harmless. The array
+        // spelling is recognised explicitly and marks ANYINIT; the note there says the SCALAR spelling
+        // "has always gone through (it lands on the ordinary initializer path, where the bare name ANY
+        // reads as an undeclared identifier)". For a builtin scalar that undeclared name reads 0 and
+        // nothing shows. For a UDT it OVERWRITES THE HANDLE with 0, so the record allocated a moment
+        // earlier is lost and the first field access dereferences null: "Dim v As T = Any" died with an
+        // access violation while "Dim v As T" - the same declaration without the words that mean DO NOT
+        // INITIALISE - worked. Marked the same way as the array form, and no initializer is attached.
+        // ⚠️ The storage is still ZEROED, as it is for the array form: a defined state where fbc hands
+        // back whatever was there. Declared in BASIC.md.
+        if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY') then
+        begin
+          Context.Advance;                   // Any
+          ArrayDecl.Attributes.Values['ANYINIT'] := '1';
+        end
+        // ⛔ ...AND ONLY WHEN A '(' FOLLOWS IT. The name of the declared type on the right of '=' is the
+        // CONSTRUCTOR shorthand "Dim As T v = T( args )", and the block below reads that '('. Consuming
+        // the name without looking made every OTHER expression that merely BEGINS with the type name
+        // lose its head: "Dim As colours e = colours.green" swallowed "colours" and left ".green"
+        // standing, which then parsed as a leading-dot global reference and the variable was
+        // initialised with nothing at all - 0 where fbc answers the member. The assignment form
+        // "e = colours.green" beside it was right, which is what said the defect was in the DIM.
+        else if Context.Check(ttIdentifier) and
            (UpperCase(Context.CurrentToken.Value) = DimTypeName) and
-           (not IsBuiltinTypeName(DimTypeName)) then
+           (not IsBuiltinTypeName(DimTypeName)) and
+           Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
           Context.Advance                    // RHS == declared UDT: ctor form (block below reads '(')
         else if Context.Check(ttDelimParOpen) then
         begin
@@ -9687,6 +12693,7 @@ begin
   until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
 
   if Assigned(LeadingTypeOfExpr) then LeadingTypeOfExpr.Free;   // clones are on each decl; free the original
+  if Assigned(TrailingTypeOfExpr) then TrailingTypeOfExpr.Free;
   if Assigned(SharedFpNode) then SharedFpNode.Free;             // one signature shared by every name above
   DoNodeCreated(Result);
 end;
@@ -9699,7 +12706,8 @@ function TPackratParser.ParseVarStatement: TASTNode;
 var
   Token, NameTok: TLexerToken;
   Decl, InitExpr, AddrNode: TASTNode;
-  VarIsByref: Boolean;
+  VarDottedName: string;   // "Var UDT.i = ...": a static member DEFINED outside its type
+  VarIsByref, VarIsShared, DeclIsByref: Boolean;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
@@ -9709,9 +12717,31 @@ begin
   // failed with "Expected a variable name after VAR". The initializer is wrapped in "@" here, exactly
   // as DIM BYREF wraps it, so the two spellings reach the SSA in one shape; the TYPE is what VAR
   // leaves to be inferred, and the pre-pass reads it out of the referand.
-  VarIsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
-  if VarIsByref then Context.Advance;                // consume BYREF
+  // "Var Shared v = e": the module-global spelling, which DIM and STATIC both accept and this did not -
+  // "Var Shared" failed as "Expected a variable name after VAR", the word SHARED being where a name was
+  // expected. Either order is FreeBASIC's ("Var Shared ByRef r = t"), so both modifiers are read in a
+  // loop rather than in a fixed sequence.
+  VarIsByref := False;
+  VarIsShared := False;
+  while Context.Check(ttSharedDecl) or
+        (Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF')) do
+  begin
+    if Context.Check(ttSharedDecl) then VarIsShared := True else VarIsByref := True;
+    Context.Advance;
+  end;
   repeat
+    // ...and BYREF may also stand before EACH name: "Var Shared ByRef a = x, ByRef b = y". The leading
+    // modifier applies to the whole list, a per-name one only to its own declaration - so the flag is
+    // read here as well, into a copy, and the list-wide value survives for the names that omit it.
+    DeclIsByref := VarIsByref;
+    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    begin
+      DeclIsByref := True;
+      Context.Advance;
+    end;
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after VAR', Context.CurrentToken);
@@ -9720,7 +12750,21 @@ begin
       Break;
     end;
     NameTok := Context.CurrentToken;
+    // ⛔ ...AND THE NAME MAY BE DOTTED. "Var UDT.i = 456" DEFINES, outside the type, the static member
+    // declared "Static i As Integer" inside it - the same thing "Static Shared UDT.g As Integer" does,
+    // and that path already folds the dotted spelling into the single name a static member is backed
+    // by. VAR read ONE identifier, so it stopped on the '.' and reported "VAR requires an
+    // initializer" - a complaint about the '=' that is right there.
+    VarDottedName := UpperCase(VarToStr(NameTok.Value));
     Context.Advance;                                 // name
+    while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+          (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+          (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+    begin
+      Context.Advance;                               // '.'
+      VarDottedName := VarDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;                               // segment
+    end;
     if not Context.Check(ttOpEq) then
     begin
       HandleError('VAR requires an initializer: VAR name = expression', Context.CurrentToken);
@@ -9730,9 +12774,43 @@ begin
     InitExpr := FExpressionParser.ParseExpression;
     if not Assigned(InitExpr) then Break;
     Decl := TASTNode.Create(antArrayDecl, NameTok);
-    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    if VarIsByref then
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, VarDottedName, NameTok));
+    if DeclIsByref then
     begin
+      // ⛔ ...UNLESS THE INITIALISER HAS NO ADDRESS. "Var ByRef i = ""abc""" binds a reference to a
+      // TEMPORARY: fbc compiles it (its dim/byref-bad-init-2-var is a COMPILE_ONLY_OK test), we wrapped
+      // the literal in "@" and the SSA died on "Undefined procedure (address-of @): " - with an EMPTY
+      // name, which is the tell that nothing nameable was there. A literal has a VALUE and no storage,
+      // so the declaration degrades to the ordinary VAR it is indistinguishable from: same value, and a
+      // reference to a temporary is exactly what has no second observer.
+      // ⛔⛔ AND A NUMERIC LITERAL IS NOT THE SAME AS A STRING ONE. fbc ACCEPTS a BYREF Var initialised
+      // from a string literal and REFUSES one initialised from a number, with «error 24: Invalid data
+      // types» - its dim/byref-bad-init-1-var and -2-var are that pair, one COMPILE_ONLY_FAIL and one
+      // COMPILE_ONLY_OK. Degrading both cost the refusal, and the nets said so on the same run: B1 rose
+      // and B2 FELL by one. A string literal has a descriptor to refer to; a number is a value and
+      // nothing else.
+      if (InitExpr.NodeType = antLiteral) and VarIsNumeric(InitExpr.Value) then
+      begin
+        HandleError('Invalid data types: a BYREF initialiser needs something with an address, ' +
+                    'and a numeric literal has none', NameTok);
+        InitExpr.Free;
+        Decl.Free;
+        Exit(Result);
+      end;
+      if InitExpr.NodeType = antLiteral then
+      begin
+        Decl.AddChild(InitExpr);
+        Decl.Attributes.Values['INFER'] := '1';
+        if VarIsShared then Decl.Attributes.Values['SHARED'] := '1';
+        DoNodeCreated(Decl);
+        Result.AddChild(Decl);
+        if Context.Check(ttSeparParam) then
+        begin
+          Context.Advance;
+          Continue;
+        end;
+        Break;
+      end;
       // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
       if InitExpr.NodeType = antIdentifier then
       begin
@@ -9750,6 +12828,7 @@ begin
     else
       Decl.AddChild(InitExpr);                       // child[1] = initializer (NOT a type / dimensions)
     Decl.Attributes.Values['INFER'] := '1';
+    if VarIsShared then Decl.Attributes.Values['SHARED'] := '1';   // module-global, as DIM SHARED marks it
     DoNodeCreated(Decl);
     Result.AddChild(Decl);
     if Context.Check(ttSeparParam) then
@@ -9768,8 +12847,12 @@ function TPackratParser.ParseStaticStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
-  StaticTypeName, StaticFixedLen: string;
+  StaticTypeName, StaticFixedLen, StaticDottedName: string;
+  StaticAddrNd: TASTNode;
   IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
+  IsByrefStatic: Boolean;  // ...and "Static Shared ByRef As T r = target"
+  StaticVarIdx: Integer;   // "Static Var v = e": stamping the modifiers onto what VAR produced
+  StaticFpNode: TASTNode;  // "Static f As Function(...) As ret": the signature, read as DIM reads it
 
   // "name(dims)" on a STATIC declaration: a procedure-local array with persistent storage. Returns the
   // antDimensions node (nil when the name is not followed by '('), leaving the caller to attach it as
@@ -9833,13 +12916,54 @@ begin
   // identifier, and the whole statement died with "Expected a variable name after STATIC".
   IsShared := Context.Check(ttSharedDecl);
   if IsShared then Context.Advance;                  // consume SHARED
+  // ...and BYREF may stand between them and the type: "Static Shared ByRef As Integer r = target" is a
+  // module-level REFERENCE that persists, and DIM has accepted the same spelling all along. Left unread
+  // it was not an identifier either, so the statement died with "Expected a variable name after STATIC".
+  IsByrefStatic := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  if IsByrefStatic then Context.Advance;             // consume BYREF
+  // ⭐ "STATIC VAR n = 0": VAR is a DECLARATION KEYWORD, not a name, and the loop below wanted an
+  // identifier - so the whole statement died as "Expected a variable name after STATIC". STATIC says
+  // WHERE the storage lives and VAR says where the TYPE comes from; they are orthogonal, and DIM has
+  // read VAR by delegating to the same routine all along (ParseDimStatement's first line). One reader,
+  // both spellings: the modifiers are stamped onto what it produced.
+  if UpperCase(VarToStr(Context.CurrentToken.Value)) = kVAR then
+  begin
+    Result.Free;
+    Result := ParseVarStatement;
+    if Assigned(Result) then
+      for StaticVarIdx := 0 to Result.ChildCount - 1 do
+      begin
+        Result.GetChild(StaticVarIdx).Attributes.Values['STATIC'] := '1';
+        if IsShared then Result.GetChild(StaticVarIdx).Attributes.Values['SHARED'] := '1';
+      end;
+    Exit;
+  end;
   // FreeBASIC AS-first form: "STATIC AS type name1 [= init] [, name2 ...]" — the shared type precedes the
   // names (like "DIM AS type name"). Distinct from the "STATIC name AS type" form handled below.
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if not Context.Check(ttIdentifier) then
+    // ⭐ ...and the type may be a PROCEDURE POINTER, "Static As Function() As Integer pf = @foo".
+    // AtDottedTypeName says no to the word FUNCTION, so the declaration died as "Expected type name
+    // after AS" - while DIM has read exactly this since it was written. Same routine, same shape.
+    StaticFpNode := nil;
+    if Context.Check(ttProcedureStart) then
+    begin
+      StaticFpNode := TASTNode.Create(antArrayDecl, Context.CurrentToken);
+      if TryParseProcPtrType(StaticFpNode) then
+      begin
+        StaticTypeName := 'INTEGER';       // a funcptr holds an entry PC: int-banked, like DIM's
+        TypeTok := Token;
+      end
+      else
+      begin
+        StaticFpNode.Free; StaticFpNode := nil;
+      end;
+    end;
+    if not Assigned(StaticFpNode) then
+    begin
+    if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
       DoNodeCreated(Result); Exit;
@@ -9848,6 +12972,7 @@ begin
     StaticTypeName := ParseDottedName;
     while AtPointerSuffix do
     begin StaticTypeName := StaticTypeName + ' PTR'; Context.Advance; end;
+    end;
     StaticFixedLen := ParseStaticFixedLen;   // "Static As String * n a, b": one capacity, every name
     repeat
       if not Context.Check(ttIdentifier) then Break;
@@ -9874,20 +12999,48 @@ begin
           // STATIC parsed the parentheses as an expression and failed. One reader, both spellings.
           Init := TryParseAggregateTuple(StaticTypeName);
           if not Assigned(Init) then Init := FExpressionParser.ParseExpression;
+          // A BYREF declaration binds to the referand's ADDRESS, so the initializer is wrapped in "@" -
+          // the same shape DIM BYREF builds, so both spellings reach the SSA as one thing.
+          if IsByrefStatic and Assigned(Init) then
+          begin
+            if Init.NodeType = antIdentifier then
+            begin
+              StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Init.Value)), NameTok);
+              Init.Free;
+            end
+            else
+            begin
+              StaticAddrNd := TASTNode.Create(antProcAddress, NameTok);
+              StaticAddrNd.AddChild(Init);
+            end;
+            Init := StaticAddrNd;
+          end;
           if Assigned(Init) then DeclNode.AddChild(Init);
         end;
       end;
+      if IsByrefStatic then DeclNode.Attributes.Values['BYREF'] := '1';
       DeclNode.Attributes.Values['STATIC'] := '1';
       if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
       if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
+      if Assigned(StaticFpNode) then
+      begin
+        DeclNode.Attributes.Values['FUNCPTR'] := '1';
+        DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
+        DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
+        DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
+      end;
       DoNodeCreated(DeclNode);
       Result.AddChild(DeclNode);
       if Context.Check(ttSeparParam) then Context.Advance else Break;
     until Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]);
+    StaticFpNode.Free;
     DoNodeCreated(Result);
     Exit;
   end;
   repeat
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after STATIC', Context.CurrentToken);
@@ -9896,7 +13049,21 @@ begin
       Break;
     end;
     NameTok := Context.CurrentToken;
+    StaticDottedName := UpperCase(VarToStr(NameTok.Value));
     Context.Advance;                                 // name
+    // ⭐ "Static Shared UDT.g As Integer": the DEFINITION, outside the type, of a member declared
+    // "Static g As Integer" inside it. The two halves must name the SAME storage, and a static member is
+    // backed by a 1-element array called "TYPE.FIELD" (CollectStaticMembers) - so the dotted spelling is
+    // folded into that one name here. Read as a single identifier the '.' was left behind and the
+    // statement died as "STATIC requires a type".
+    while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+          (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+          (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+    begin
+      Context.Advance;                               // '.'
+      StaticDottedName := StaticDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;                               // segment
+    end;
     Dims := ParseStaticDims;                         // "STATIC a(dims) AS type": array with static storage
     if not Context.Check(ttAsType) then
     begin
@@ -9906,7 +13073,25 @@ begin
     end;
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if not Context.Check(ttIdentifier) then
+    // ...and the PROCEDURE POINTER type here too: "Static pf As Function() As Integer = @foo".
+    // The leading-AS spelling above and this one are one rule, and it kept being taught to one of them.
+    StaticFpNode := nil;
+    if Context.Check(ttProcedureStart) then
+    begin
+      StaticFpNode := TASTNode.Create(antArrayDecl, Context.CurrentToken);
+      if TryParseProcPtrType(StaticFpNode) then
+      begin
+        StaticTypeName := 'INTEGER';
+        TypeTok := NameTok;
+      end
+      else
+      begin
+        StaticFpNode.Free; StaticFpNode := nil;
+      end;
+    end;
+    if not Assigned(StaticFpNode) then
+    begin
+    if not AtDottedTypeName then
     begin
       HandleError('Expected type name after AS', Context.CurrentToken);
       Break;
@@ -9918,9 +13103,10 @@ begin
       StaticTypeName := StaticTypeName + ' PTR';
       Context.Advance;                               // consume PTR
     end;
+    end;
     StaticFixedLen := ParseStaticFixedLen;           // "Static z As String * n"
     DeclNode := TASTNode.Create(antArrayDecl, NameTok);
-    NameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+    NameNode := TASTNode.CreateWithValue(antIdentifier, StaticDottedName, NameTok);
     TypeNd := TASTNode.CreateWithValue(antIdentifier, StaticTypeName, TypeTok);
     DeclNode.AddChild(NameNode);
     if Assigned(Dims) then
@@ -9936,14 +13122,45 @@ begin
       if Context.Check(ttOpEq) then
       begin
         Context.Advance;                             // =
-        Init := FExpressionParser.ParseExpression;
+        // ⛔ ...AND SO DOES THE AGGREGATE TUPLE. "Static As T v = (1, 2)" was taught to the leading-AS
+        // spelling and this one was not, so "Static v As T = (1, 2)" - the same declaration written
+        // the other way - read the parentheses as an expression and failed at the comma. The third
+        // rule in this routine that lived in one of two sibling paths; the note below is the second.
+        Init := TryParseAggregateTuple(StaticTypeName);
+        if not Assigned(Init) then Init := FExpressionParser.ParseExpression;
+        // ⛔ The BYREF wrapping belongs to BOTH spellings. "Static ByRef As T r = x" was taught it and
+        // "Static ByRef r As T = x" was not, so the name-first form declared an ordinary variable and
+        // read 0 - the same rule in one path and not its sibling, one edit later in the same routine.
+        if IsByrefStatic and Assigned(Init) then
+        begin
+          if Init.NodeType = antIdentifier then
+          begin
+            StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Init.Value)), NameTok);
+            Init.Free;
+          end
+          else
+          begin
+            StaticAddrNd := TASTNode.Create(antProcAddress, NameTok);
+            StaticAddrNd.AddChild(Init);
+          end;
+          Init := StaticAddrNd;
+        end;
         if Assigned(Init) then
           DeclNode.AddChild(Init);                   // child[2] = once-only initializer expression
       end;
     end;
+    if IsByrefStatic then DeclNode.Attributes.Values['BYREF'] := '1';
     DeclNode.Attributes.Values['STATIC'] := '1';
     if IsShared then DeclNode.Attributes.Values['SHARED'] := '1';
     if StaticFixedLen <> '' then DeclNode.Attributes.Values['FIXEDLEN'] := StaticFixedLen;
+    if Assigned(StaticFpNode) then
+    begin
+      DeclNode.Attributes.Values['FUNCPTR'] := '1';
+      DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
+      DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
+      DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
+      FreeAndNil(StaticFpNode);
+    end;
     DoNodeCreated(DeclNode);
     Result.AddChild(DeclNode);
     if Context.Check(ttSeparParam) then
@@ -9958,11 +13175,36 @@ function TPackratParser.ParseEraseStatement: TASTNode;
 // ERASE arr [, arr ...] (FreeBASIC, B1.4) - reset each named array's elements to default.
 var
   Token, NameTok: TLexerToken;
+  EraseTarget: TASTNode;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antErase, Token);
   Context.Advance; // Consume ERASE
   repeat
+    // ⭐ "Erase .field" INSIDE A WITH BLOCK, the same leading dot REDIM reads a few pages above and an
+    // assignment reads everywhere: it names a member of the WITH object. Only a bare NAME was accepted,
+    // so the dot ended the statement - a third statement missing the rule its siblings have.
+    // ⛔ ...and the QUALIFIED spelling, "Erase obj.arr", which is the same member with its object written
+    // out. Fixing only the leading dot would have left the two halves of one rule in different states -
+    // "Erase e.meep" read "e" as the array and died as "ERASE: array not declared: E".
+    if Context.Check(ttOpDot) or
+       (Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+        (Context.PeekNext.TokenType = ttOpDot)) then
+    begin
+      // ⛔ At precCALL, not precPRIMARY: the ".field" postfix is what has to be read, and at primary the
+      // expression parser stopped at the bare name and left the dot behind - the statement then held the
+      // OBJECT where the array belonged ("ERASE: array not declared: E"). REDIM reads its own target at
+      // primary for the opposite reason: there the "(...)" that follows is its dimension list.
+      EraseTarget := FExpressionParser.ParseExpression(precCall);
+      if not Assigned(EraseTarget) then
+      begin
+        HandleError('Expected a member name after "." in ERASE', Context.CurrentToken);
+        Break;
+      end;
+      Result.AddChild(EraseTarget);
+      if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
+      Break;
+    end;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected array name after ERASE', Context.CurrentToken);
@@ -10019,7 +13261,7 @@ begin
   begin
     Context.Advance;                          // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then
+    if AtDottedTypeName then
     begin
       RedimTypeTok := Context.CurrentToken;
       RedimTypeName := UpperCase(ParseDottedName);
@@ -10085,6 +13327,10 @@ begin
     Exit;
   end;
   Result.AddChild(Right);
+  // ⛔ BOTH operands of a SWAP are WRITTEN, so both must be writable - the check the assignment path
+  // has always had, asked here for the first time.
+  RefuseUnwritableTarget(Left, 'a SWAP operand');
+  RefuseUnwritableTarget(Right, 'a SWAP operand');
   DoNodeCreated(Result);
 end;
 
@@ -10110,6 +13356,7 @@ begin
     Exit;
   end;
   Result.AddChild(Dst);
+  RefuseUnwritableTarget(Dst, 'an LSET/RSET destination');   // it justifies INTO dst's buffer
   if Context.Check(ttOpEq) or Context.Check(ttSeparParam) then
     Context.Advance                      // "=" (QBasic) or "," (FreeBASIC)
   else
@@ -10173,6 +13420,7 @@ begin
   end;
   Result := TASTNode.Create(antMidStatement, Token);
   Result.AddChild(TargetNode);
+  RefuseUnwritableTarget(TargetNode, 'the target of a MID() assignment');
   Result.AddChild(StartNode);
   if Assigned(LenNode) then Result.AddChild(LenNode);
   Result.AddChild(SourceNode);
@@ -10197,10 +13445,23 @@ begin
   // declared width. The NAME is not: FreeBASIC lets a member be reached through it ("MyEnum.option1"), so
   // keep it on the node. It may be a reserved word (a type/colour keyword), so don't require ttIdentifier;
   // exclude AS so a nameless "Enum As Integer" is not mistaken for a name.
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) then
+  if not (Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) or
+          SkipAliasClause) then                       // a nameless "Enum Alias \"n\""
   begin
     Result.Value := UpperCase(VarToStr(Context.CurrentToken.Value));   // enum type name
+    if FEnumNamesSeen.IndexOf(VarToStr(Result.Value)) < 0 then
+      FEnumNamesSeen.Add(VarToStr(Result.Value));
     Context.Advance;
+    SkipAliasClause;                                  // "Enum E Alias \"n\"" - a LINKER name
+    // FreeBASIC "Enum <name> Explicit": the members are reachable ONLY through the enum's name. Left
+    // unconsumed, the word was read as the FIRST MEMBER and the real members stayed plain globals - so
+    // an explicit enum's B shadowed the B of an ordinary one declared beside it.
+    if Context.Check(ttIdentifier) and
+       (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXPLICIT') then
+    begin
+      Result.Attributes.Values['EXPLICIT'] := '1';
+      Context.Advance;
+    end;
   end;
   if Context.Check(ttAsType) then
   begin
@@ -10422,7 +13683,9 @@ end;
 function TPackratParser.ParseConstStatement: TASTNode;
 var
   Token, NameTok, TypeTok: TLexerToken;
-  Assignment, ValueNode, ArrayDecl: TASTNode;
+  Assignment, ValueNode, ArrayDecl, ProcPtrScratch: TASTNode;
+  ConstTypeOfExpr: TASTNode;   // "Const ... As TypeOf(expr)": the operand, in either spelling
+  DecoK: Integer;              // how many OOP decorators sit between CONST and the procedure keyword
   TypeName: string;
 
   // Best-effort bank of an untyped CONST initializer that is NOT a plain literal — a string-returning
@@ -10443,9 +13706,15 @@ var
           Result := (Nm <> '') and (Nm[Length(Nm)] = '$');
         end;
       antArrayAccess, antFunctionCall:
-        if (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
         begin
-          Nm := UpperCase(VarToStr(N.GetChild(0).Value));
+          // ⛔ THE TWO NODE SHAPES KEEP THE NAME IN DIFFERENT PLACES: antArrayAccess in child 0,
+          // antFunctionCall in its own Value. Only child 0 was read, so every intrinsic that parses as
+          // a FUNCTION CALL failed the test - "Const w = WChr(65,66,67)" was typed DOUBLE and the string
+          // went into a float register, which is why it came back one character long. The list already
+          // named WCHR; the name simply never reached it.
+          Nm := UpperCase(VarToStr(N.Value));
+          if (Nm = '') and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+            Nm := UpperCase(VarToStr(N.GetChild(0).Value));
           Result := ((Nm <> '') and (Nm[Length(Nm)] = '$')) or
                     (Nm = 'CHR') or (Nm = 'MID') or (Nm = 'LEFT') or (Nm = 'RIGHT') or
                     (Nm = 'STRING') or (Nm = 'SPACE') or (Nm = 'STR') or (Nm = 'HEX') or
@@ -10520,7 +13789,7 @@ var
   var
     ItemName, ItemTypeTok: TLexerToken;
     ItemType: string;
-    ItemValue, Decl: TASTNode;
+    ItemValue, Decl, ItemTypeOfExpr: TASTNode;
   begin
     while Context.Check(ttSeparParam) do
     begin
@@ -10534,13 +13803,26 @@ var
       Context.Advance;                                // name
       ItemType := '';
       ItemTypeTok := ItemName;
+      ItemTypeOfExpr := nil;
       if AllowItemType and Context.Check(ttAsType) then
       begin
         Context.Advance;                              // AS
         SkipTypeQualifiers;                     // FB: "As Const <type>"
         ItemTypeTok := Context.CurrentToken;
         ItemType := 'INTEGER';
-        if Context.Check(ttIdentifier) then
+        // ⛔ ...AND "As TypeOf(x)" HERE TOO. The leading-AS spelling of CONST learned it and this list
+        // tail did not, so "Const a As Integer = 1, b As TypeOf(a) = 2" read the type as the ordinary
+        // name TYPEOF, left "( a )" in the stream and reported "Expected \"=\" after CONST name" - a
+        // message about the wrong thing entirely. The same rule, in the sibling path that did not have it.
+        if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+           (Context.PeekNext.TokenType = ttDelimParOpen) then
+        begin
+          Context.Advance;                            // TYPEOF
+          Context.Advance;                            // '('
+          ItemTypeOfExpr := FExpressionParser.ParseExpression;
+          if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+        end
+        else if Context.Check(ttIdentifier) then
         begin
           ItemType := UpperCase(ParseDottedName);     // element type
           // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
@@ -10569,14 +13851,36 @@ var
       end;
       Decl := TASTNode.Create(antArrayDecl, ItemName);
       Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ItemName.Value), ItemName));
-      Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, ItemType, ItemTypeTok));
+      if Assigned(ItemTypeOfExpr) then
+      begin
+        // child[1] is the EXPRESSION; the SSA pre-pass infers the concrete type from it, exactly as the
+        // leading-AS spelling does.
+        Decl.AddChild(ItemTypeOfExpr);
+        Decl.Attributes.Values['TYPEOF'] := '1';
+      end
+      else
+        Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, ItemType, ItemTypeTok));
       Decl.AddChild(ItemValue);
       if FModernMode then Decl.Attributes.Values['SHARED'] := '1';
+      // ⛔ ...AND EVERYTHING ELSE THE FIRST ITEM OF THE LIST GETS. The three callers of this routine
+      // each stamp CONSTDECL on the item they built themselves and then hand the REST to here, which
+      // stamped only SHARED: so in "Const a = 1, b = 2" the b was a shared VARIABLE - the SSA would
+      // not fold it to an immediate (it reads CONSTDECL) and assigning to it was not refused (that
+      // reads FConstNames). One path had the rule and its sibling did not; found because a new check
+      // asked "is this a CONST?" and got the wrong answer for every item after the first.
+      Decl.Attributes.Values['CONSTDECL'] := '1';
+      if FConstNames.IndexOf(UpperCase(VarToStr(ItemName.Value))) < 0 then
+        FConstNames.Add(UpperCase(VarToStr(ItemName.Value)));
+      if not Assigned(ItemTypeOfExpr) then
+        FConstTypes.Values[UpperCase(VarToStr(ItemName.Value))] := ItemType;
+      if TryConstIntExpr(ItemValue, FConstFoldVal) then
+        FConstIntValues.Values[UpperCase(VarToStr(ItemName.Value))] := IntToStr(FConstFoldVal);
       DimNode.AddChild(Decl);
     end;
   end;
 
 begin
+  ConstTypeOfExpr := nil;
   // FreeBASIC CONST METHOD DEFINITION: "Const Sub|Function|Operator|Property T.m(...)". The qualifier
   // sits in FRONT of the procedure keyword, so the statement opens with CONST and is not a constant
   // declaration at all - it was read as one and died on "Expected variable name in assignment". Same
@@ -10584,14 +13888,32 @@ begin
   // grammar read the rest. CONST on a method is a promise about THIS, and this VM does not enforce it
   // (as it does not enforce "As Const" on a variable), so nothing else is needed for the definition to
   // mean what it means.
-  if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
+  // ⛔ ...AND THE QUALIFIERS COME IN EITHER ORDER. "Const Virtual Function A.f()" is FreeBASIC, and
+  // this gate asked only whether the VERY NEXT token opens a procedure - so one decorator between
+  // CONST and FUNCTION sent the whole definition down the constant-declaration path, where it died on
+  // "Expected = in assignment", a message about a statement it never was. The decorators are read here
+  // only to LOOK PAST them; what they MEAN is already handled where a decorator leads the definition.
+  DecoK := 1;
+  while Assigned(Context.PeekToken(DecoK)) and (Context.PeekToken(DecoK).TokenType = ttIdentifier) and
+        ((UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'VIRTUAL') or
+         (UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'ABSTRACT') or
+         (UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'OVERRIDE')) do
+    Inc(DecoK);
+  if Assigned(Context.PeekToken(DecoK)) and (Context.PeekToken(DecoK).TokenType = ttProcedureStart) then
   begin
-    Context.Advance;                                   // consume CONST
+    while DecoK > 0 do begin Context.Advance; Dec(DecoK); end;   // CONST and any decorators after it
     Exit(ParseProcedureDecl);
   end;
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antConst, Token);
   Context.Advance; // Consume CONST
+  // ⭐ A MODERN extension FreeBASIC does NOT reserve may be a CONSTANT'S NAME. The rule already
+  // existed for a PROCEDURE name (IsShadowableExtensionName at ParseProcedureDecl) and for a
+  // statement that begins with one; a CONST had no such door, so "Const MAX = 8" - which fbc
+  // compiles - failed the whole file to parse. ⚠️ ABS/FIX/SGN stay reserved, as they are in fbc.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
 
   // FreeBASIC leading-AS typed constant: "CONST AS type name = value" (e.g. "Const As UInteger
   // children = 100"). The alternate spelling of the name-first form below; same lowering to a typed
@@ -10602,7 +13924,22 @@ begin
     SkipTypeQualifiers;                     // FB: "As Const <type>"
     TypeTok := Context.CurrentToken;
     TypeName := 'INTEGER';
-    if Context.Check(ttIdentifier) then
+    // ⛔ ...AND THE CONST PATHS HAD NO TypeOf BRANCH AT ALL, in either spelling. "Const a As TypeOf(x)
+    // = 1" and "Const As TypeOf(x) K = 5" are both FreeBASIC, and both read the type as the ordinary
+    // name "TYPEOF", leaving "( x )" in the stream - so the reader met '(' where it wanted a name or an
+    // '=' and reported the wrong thing entirely ("Expected constant name after CONST AS type"). DIM has
+    // carried this rule in its leading-AS spelling for a long time; the constant is lowered to a typed
+    // scalar DIM, so it wants exactly the same answer.
+    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttDelimParOpen) then
+    begin
+      Context.Advance;                                // TYPEOF
+      Context.Advance;                                // '('
+      if Assigned(ConstTypeOfExpr) then ConstTypeOfExpr.Free;
+      ConstTypeOfExpr := FExpressionParser.ParseExpression;
+      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    end
+    else if Context.Check(ttIdentifier) then
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
@@ -10610,6 +13947,9 @@ begin
             Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected constant name after CONST AS type', Context.CurrentToken);
@@ -10631,14 +13971,22 @@ begin
     Result.Free;                                      // discard the antConst; emit a typed DIM instead
     ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
+    // "Const ... As TypeOf(expr)": child[1] is the EXPRESSION and the SSA pre-pass infers the concrete
+    // type from it, exactly as the DIM path does. Its own registries keep the placeholder name, since
+    // there is no type name to record until that pass has run.
+    if Assigned(ConstTypeOfExpr) then
+    begin
+      ArrayDecl.AddChild(ConstTypeOfExpr.Clone);
+      ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+    end
+    else
+      ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
-      UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := TypeName;
     if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
       FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
@@ -10660,7 +14008,30 @@ begin
     SkipTypeQualifiers;                     // FB: "As Const <type>"
     TypeTok := Context.CurrentToken;
     TypeName := 'INTEGER';
-    if Context.Check(ttIdentifier) then
+    // "Const p As Sub() = 0" / "As Function(...) As R": the type is a PROCEDURE POINTER, which is not an
+    // identifier at all - so the reader below skipped it, the type stayed INTEGER and the '(' was met
+    // where '=' was expected. DIM has read this signature all along; a constant holds only the pointer
+    // VALUE (int-banked here), so the signature is consumed and its shape recorded on a scratch node.
+    // ...and the trailing spelling wants the very same TypeOf branch (see the note on the leading one).
+    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType = ttDelimParOpen) then
+    begin
+      Context.Advance;                                // TYPEOF
+      Context.Advance;                                // '('
+      if Assigned(ConstTypeOfExpr) then ConstTypeOfExpr.Free;
+      ConstTypeOfExpr := FExpressionParser.ParseExpression;
+      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    end
+    else if Context.Check(ttProcedureStart) then
+    begin
+      ProcPtrScratch := TASTNode.Create(antArrayDecl, TypeTok);
+      try
+        TryParseProcPtrType(ProcPtrScratch);
+      finally
+        ProcPtrScratch.Free;
+      end;
+    end
+    else if Context.Check(ttIdentifier) then
     begin
       TypeName := UpperCase(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
@@ -10682,14 +14053,22 @@ begin
     Result.Free;                                      // discard the antConst; emit a typed DIM instead
     ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
     ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
+    // "Const ... As TypeOf(expr)": child[1] is the EXPRESSION and the SSA pre-pass infers the concrete
+    // type from it, exactly as the DIM path does. Its own registries keep the placeholder name, since
+    // there is no type name to record until that pass has run.
+    if Assigned(ConstTypeOfExpr) then
+    begin
+      ArrayDecl.AddChild(ConstTypeOfExpr.Clone);
+      ArrayDecl.Attributes.Values['TYPEOF'] := '1';
+    end
+    else
+      ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, TypeTok));
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
     if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
       FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
-      UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := TypeName;
     if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
       FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);

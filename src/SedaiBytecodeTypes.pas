@@ -368,6 +368,9 @@ const
   // substring never has to exist. Same operands as bcStrMid (Src1=string, Src2=start reg,
   // Immediate=length reg) but an INT destination. Reading one character used to allocate a
   // one-character string, and that allocation - not the read - is what it cost.
+  bcStrAscW         = bcGroupString + 52;  // ASC(wstring) - Unicode CODEPOINT of the first character
+                                           // (Dest=int, Src1=string). bcStrAsc answers the first BYTE,
+                                           // which for UTF-8 storage is the first byte of the sequence.
   bcStrAscMid       = bcGroupString + 51;
   bcStrChr          = bcGroupString + 6;
   bcStrStr          = bcGroupString + 7;
@@ -2102,6 +2105,7 @@ begin
         3: Result := 'StrRight';
         4: Result := 'StrMid';
         5: Result := 'StrAsc';
+       52: Result := 'StrAscW';
        51: Result := 'StrAscMid';
         6: Result := 'StrChr';
         7: Result := 'StrStr';

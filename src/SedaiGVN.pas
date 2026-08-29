@@ -410,7 +410,7 @@ begin
     ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
     ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
     // Value-producing string builders (they allocate a result string, they never write user memory)
-    ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrLeft, ssaStrRight, ssaStrMid,
+    ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrAscW, ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN,
     ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr,
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase, ssaStrInstrRev,
@@ -928,7 +928,7 @@ begin
       Result := True;
 
     // String operations (pure functions)
-    ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrLeft, ssaStrRight, ssaStrMid,
+    ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrAscW, ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN,
     // FreeBASIC numeric serialization (B3): MK*/CV* are pure deterministic packers/unpackers.
     ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat:

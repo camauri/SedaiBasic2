@@ -29,7 +29,7 @@ unit SedaiFileIO;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeVM,
+  Classes, SysUtils, SedaiBytecodeVM, SedaiBasicKeywords,
   // TerminalOutFlush: the console keeps its OWN stdout buffer, so anything that writes through
   // System.Write has to drain it first or the two arrive out of order. See the SCRN/CONS device write.
   SedaiTerminalIO
@@ -295,12 +295,21 @@ function TVMFileHandler.TextEncodingOf(Handle: Integer): Integer;
 // travels as '<'. Carrying it on the mode meant nothing between the parser and here had to grow a
 // parameter, and a handle that was opened without an ENCODING clause reads exactly as it always did.
 var
-  p: Integer;
+  p, q: Integer;
 begin
   Result := 8;
   if (Handle < 1) or (Handle > 15) then Exit;
   p := Pos('~', FFileModes[Handle]);
-  if p > 0 then Result := StrToIntDef(Copy(FFileModes[Handle], p + 1, MaxInt), 8);
+  // ⛔ Only the DIGIT RUN, not "the rest of the string": the mode also carries '<' for ACCESS READ, and
+  // reading "16<" as a number answered the default 8 - so the same file decoded correctly without the
+  // ACCESS clause and byte-for-byte raw with it. (The marker is a suffix again now, but a reader that
+  // depends on clause ORDER is exactly what went wrong here.)
+  if p > 0 then
+  begin
+    q := p + 1;
+    while (q <= Length(FFileModes[Handle])) and (FFileModes[Handle][q] in ['0'..'9']) do Inc(q);
+    if q > p + 1 then Result := StrToIntDef(Copy(FFileModes[Handle], p + 1, q - p - 1), 8);
+  end;
 end;
 
 function EncodeTextUnits(const S: string; Bits: Integer): string;
@@ -355,8 +364,9 @@ end;
 procedure TVMFileHandler.DiskFile(Sender: TBytecodeVM; const Command: string; Handle: Integer;
   const HandleName, Filename, Mode: string; var ErrorCode: Integer);
 var
-  M: string;
+  M, EncMode, EncName: string;
   FileMode: Word;
+  TildePos: Integer;
   BomBuf: array[0..3] of Byte;
 begin
   ErrorCode := 0;
@@ -367,6 +377,18 @@ begin
 
   if Command = 'DOPEN' then
   begin
+    // ⭐ "ENCODING <expr>": when the name was only known at run time the SSA appended it RAW, as
+    // "~utf-16", because a parser cannot map what it cannot see. Turn it into the numeric marker HERE,
+    // once, before anything reads the mode - so every reader downstream (TextEncodingOf, the "~8" BOM
+    // test) keeps asking the one question it always asked instead of learning a second spelling.
+    EncMode := Mode;
+    TildePos := Pos('~', EncMode);
+    if (TildePos > 0) and (TildePos < Length(EncMode)) and
+       not (EncMode[TildePos + 1] in ['0'..'9']) then
+    begin
+      EncName := Copy(EncMode, TildePos + 1, MaxInt);
+      EncMode := Copy(EncMode, 1, TildePos - 1) + EncodingModeMarker(EncName);
+    end;
     // A FreeBASIC standard device, marked as such by the parser. No file is opened: the handle is bound
     // to the process's own streams. This must come BEFORE the reserved-name refusal below, which exists
     // to stop a PROGRAM from reaching the printer or a serial port by naming a DOS device in a string -
@@ -381,7 +403,7 @@ begin
       if Filename = 'CONS:' then FDeviceKind[Handle] := 1
       else if Filename = 'SCRN:' then FDeviceKind[Handle] := 2
       else FDeviceKind[Handle] := 3;
-      FFileModes[Handle] := UpperCase(Mode);
+      FFileModes[Handle] := UpperCase(EncMode);
       FRecordLens[Handle] := 0;
       Exit;
     end;
@@ -395,7 +417,7 @@ begin
       FFileModes[Handle] := '';
     end;
     FRecordLens[Handle] := 0;
-    M := UpperCase(Mode);
+    M := UpperCase(EncMode);
     // Relative file "L<reclen>": random-access, read+write, created if absent (never truncated).
     if (Length(M) >= 1) and (M[1] = 'L') then
     begin

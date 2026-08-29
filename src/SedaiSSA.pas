@@ -79,6 +79,16 @@ type
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
+    MultiPtrPointee: string;// ⛔ THE THIRD SHAPE, AND NOTHING RECORDED IT. A field declared "As T Ptr Ptr"
+                            // is neither of the two below: stripping one PTR leaves "T PTR", which is not
+                            // a UDT name (so PtrPointee stayed '') and is not a scalar (so RawPtrPointee
+                            // stayed '' too). Both empty means "this field is not a pointer", and every
+                            // dereference of it read a stale register - "(*b.lpp)->a" answered 1 where fbc
+                            // answers 55, on a field the same program reads correctly through a local copy.
+                            // Held BESIDE PtrPointee rather than in it: nine readers ask that one and all
+                            // of them FindUDT the answer, so a "T PTR" there would be filed under a name
+                            // none of them looks up. This one holds the FULL pointee spelling ("LEAF PTR")
+                            // and has exactly one reader, DerefedType, which strips levels for a living.
     RawPtrPointee: string;  // scalar pointee type if this field is a "<scalar> PTR" (e.g. "DOUBLE" for a
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
@@ -100,6 +110,12 @@ type
                             // string reserves its bytes here even while its characters still live in
                             // the side vector.
     ByteSize: Integer;      // how many bytes the field occupies at that offset
+    BitContinues: Boolean;  // a BIT FIELD that shares the storage unit of the member before it.
+                            // ⛔ A DURABLE mark, and it has to be: AssignBitFieldRuns used to say the
+                            // same thing with "ByteSize = -1", and ComputeUDTLiveLayout OVERWRITES
+                            // ByteSize with the unit's real size a few lines later - so by the time the
+                            // two C layout routines ran, the only record of the run was gone and they
+                            // gave every bit member a unit of its own.
     StrCapacity: Integer;   // declared capacity of a fixed-length string field ("As String * 20" -> 20;
                             // 0 = variable-length). Storage stays variable-length (advisory), but the
                             // C BYTE LAYOUT of the type needs it: fbc gives such a field n+1 bytes.
@@ -113,6 +129,10 @@ type
                             // Len/SizeOf of the field answered 8 where fbc answers 1.
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
+    ArrayElemScalarType: string;      // declared element type of an array member when it is a SCALAR
+                            // ("a(0 To 2) As Byte" -> 'BYTE'). ⛔ ArrayElemType beside it means the
+                            // element UDT and is EMPTY for a scalar, so it cannot answer "how wide is
+                            // one element" - which is what a fixed member array's C SHAPE is made of.
     ArrayElemType: string;  // element UDT type name if the array member is an array-of-UDT ("verts(100) As Vertex"),
                             // else ''. Each element is a record handle: allocated per-instance in EmitRecordInit.
     ArrayElemPtrPointee: string;  // pointee UDT if the array member's elements are UDT POINTERS ("kids(Any) As N Ptr"),
@@ -155,6 +175,7 @@ type
   TScopeKind = (skModule, skProcRoot, skBlock);
   TScopeFrame = record
     Kind: TScopeKind;
+    Serial: Integer;         // unique per PUSHED frame: the block's identity for BlockArrayMangle
     Bindings: TStringList;   // NAME(UPPER) -> packed (RegType<<16 | RegIndex), like FVarMap entries
     Dtors: TStringList;      // "VAR|TYPE" UDT instances to destruct at frame exit (block frames)
     RecMarkEmitted: Boolean; // ssaRecMarkPush emitted for this frame (block frames only)
@@ -184,7 +205,13 @@ type
     FLoopStack: array of TLoopInfo;  // Stack for nested loops
     FUserFunctions: specialize TDictionary<string, TUserFunctionDef>;  // User-defined functions (DEF FN)
     FConstFloatRegs: specialize TDictionary<Integer, Double>;   // Maps float register to constant value
-    FConstIntRegs: specialize TDictionary<Integer, Integer>;    // Maps int register to constant value
+    FConstIntRegs: specialize TDictionary<Integer, Int64>;      // Maps int register to constant value.
+                            // ⛔ Int64, and it has to be: an SSA int constant IS 64-bit, and a 32-bit
+                            // value type TRUNCATED it on the way in - silently in a release build, as a
+                            // range error in a debug one. What reads this map is CONSTANT FOLDING, so a
+                            // truncated constant is not a lost fact but a WRONG one. Found 25 Aug 2026
+                            // by running the whole corpus under the debug build; m289_unsigned64 and
+                            // m446_addr_scalar_raw_typepun were the two that reached it.
     // SUB/FUNCTION declarations (M2). Bodies are NOT lowered at their definition point
     // (they must not run as part of module flow); they are collected here and lowered
     // after the module's END, each into its own block region reachable only via ssaCallSub.
@@ -207,6 +234,7 @@ type
     // the one name that legitimately owns the bare-name entry in FVarExplicitType -- apart from a
     // procedure-local one. See RegisterTypedVar.
     FPreScanInProc: Boolean;
+    FPreScanProcName: string;            // ...and WHICH procedure, so a declared bank can be keyed by scope
     FCurrentProcRetType: TSSARegisterType;
     FCurrentProcIsFunction: Boolean;
     // The default-initialisation of the scalar result slot, emitted at the top of every FUNCTION
@@ -222,7 +250,12 @@ type
     FResultExitsStaged: Integer;          // ... of which staged the result on the same path
     FCurrentProcRetRecType: string;   // V3: UDT type the current FUNCTION returns by value (else '')
     FCurrentResultHandle: TSSAValue;  // V3: register holding the caller's result-instance handle
-    FCurrentProcLocalRecs: TStringList;  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
+    FCurrentProcLocalRecs: TStringList;
+    FCurrentProcNonRecs: TStringList;    // ...and the NON-record locals of the same procedure. A local
+                                         // "Dim As Integer stp" has to SCREEN a same-named record just as
+                                         // a local UDT screens a module one - and it cannot go in the list
+                                         // above, which also drives EmitFrameDestructors.
+    FDefinedLabels: TStringList;         // named labels already DEFINED in the current procedure  // V5: "VARNAME|TYPENAME" of the proc's DIM'd local UDTs
     // Names DECLARED at module level and not SHARED, and the names this procedure declares of its
     // own. A module DIM is invisible inside a SUB, so its declared TYPE must be invisible too.
     FModuleOnlyVars: TStringList;
@@ -241,6 +274,7 @@ type
                                             //   Per-proc (not global FPointerVars) so same-named ptr params of different
                                             //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
+    FModuleFuncPtrSigs: TStringList;        // ...of those, the MODULE-level ones: they survive every procedure prologue
     FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
                                             //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
@@ -248,6 +282,7 @@ type
     FModuleCtors: TStringList;           // FB module constructors (proc labels), in definition order
     FModuleDtors: TStringList;           // FB module destructors (proc labels), in definition order
     FModuleDtorSlots: TStringList;        // V5e: module global var (UPPER) -> reserved int xfer slot (Objects[]=slot)
+    FStaticLocalOwner: TStringList;      // OOP: hoisted STATIC local (mangled name) -> the TYPE whose method declared it
                                           //      holds its handle frame-independently so an END inside a SUB can
                                           //      still destroy it (its module register is saved/hidden by the frame).
     FSharedVars: TStringList;            // M6: DIM SHARED scalar names -> transfer slot (Objects[]=slot); also the "is shared" marker for scope resolution
@@ -264,16 +299,42 @@ type
     // still declared and initialised, so anything else that resolves through it is unaffected.
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
-    FEnumMembers: TStringList;           // FreeBASIC ENUM members (UPPER), backed by a shared global scalar so they are visible inside procedures
+    FStaticMemberTypes: TStringList;     // ...and the ones whose type is a UDT: "TYPE.FIELD" -> that UDT's name
+    FStaticMemberArrays: TStringList;    // ...and the ones that are ARRAYS: "TYPE.FIELD" -> the global array's id.
+                                        // ⛔ Kept OUT of FSharedScalarArr on purpose: a shared SCALAR is a one-element
+                                        // array, and every reader of IsSharedScalar would read element 0 as the value.
+    FEnumMembers: TStringList;
+    FTypeEnumMembers: TStringList;       // ENUM members declared INSIDE a TYPE: "TYPE.MEMBER" (UPPER)
+    FTypeConstMembers: TStringList;      // CONST declared INSIDE a TYPE: "TYPE.NAME" (UPPER)
     FEnumNames: TStringList;             // FreeBASIC ENUM type names (UPPER): lets "MyEnum.member" resolve to the member
     FEnumMemberType: TStringList;        // ENUM member name (UPPER) -> its enum type name (UPPER): for operator overloading on an enum operand
+    // ⭐ "ENUM.MEMBER" (UPPER) -> the member's VALUE. An enum member is a compile-time CONSTANT in
+    // FreeBASIC, and this VM backed it with a global scalar under its BARE name: "E.B" was rewritten
+    // to a bare "B" and read whatever that name meant by then. So an ordinary "Dim B" shadowed it
+    // ("Print E.B" answered 1 for a member worth 7) and a SECOND enum declaring the same member name
+    // took the first one's storage ("E1.X, E2.X" answered 5 5 for 3 and 5). Qualified by the enum it
+    // belongs to, and folded to an immediate, both stop being possible.
+    FEnumQualVals: TStringList;
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
+    FFixedStrNames: TStringList;         // names DIM'd as a FIXED-LENGTH ZSTRING/WSTRING ("ZString * n").
+                                         // Collected before the @-taken pass so STRPTR/SADD of one can be
+                                         // treated as the address-taking it is - see CollectFixedStrNames.
+    FVarDeclTypeName: TStringList;       // every DIM/VAR'd scalar: name (UPPER) -> the type NAME it was declared as
+                                         // ⛔ FVarExplicitType beside it holds only the BANK - three answers for ten
+                                         // types - and DeclaredTypeNameOf fell back to it, so "Dim s As Short" answered
+                                         // INTEGER and "Dim As TypeOf(s) w" gave w eight bytes instead of two. The name
+                                         // is what the declaration SAID; asking a registry that guesses a default
+                                         // instead of declining is how three defects were built on this one.
     FPointerVars: TStringList;           // FreeBASIC pointers: var name (UPPER) -> pointee type name (e.g. "INTEGER")
     FRefVars: TStringList;               // FreeBASIC reference variables (DIM BYREF r AS T = target): name
                                          // (UPPER) -> pointee type. r's register is int (it carries target's
                                          // address); reads/writes auto-dereference, like a BYREF-return param.
     FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
     FRawUDTPtrs: TStringList;            // "T PTR" vars holding a RAW address (a UDT laid over bytes) -> T
+    // WHY a pointer is raw, for the one case where it matters: it is "@x" of a raw-backed @-taken
+    // SCALAR, so it addresses a VARIABLE's slot rather than owning bytes of its own.
+    FRawFromAddrOf: TStringList;
+    FVarPtrQuals: TStringList;           // var (UPPER) -> its type's CONST chain: base, then one char per pointer level
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
@@ -290,6 +351,24 @@ type
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
                                          // (push/resolve), since REDIM changes the strides; others stay const-folded.
+    // ⭐ Array names (UPPER) whose DIM STATED a rank - "a(Any)", "a(Any,Any)", "a(0 To 1, 0 To 2)".
+    // ⛔ NOT the same as "has a DimCount": a bare "Dim a()" states NO rank and its first ReDim fixes
+    // one, so the rank rule may not be asked of it. This set is what tells the two apart, and it is
+    // filled from the DECLARATION's own dimension list, which is the only place that knows.
+    FRankStatedArrays: TStringList;
+    // ⛔ ...and the names DECLARED MORE THAN ONCE, which leave the set for good. This registry is keyed
+    // on a bare NAME with no scope - the trap this codebase has paid for repeatedly - and the fbc
+    // suite's overload/bydesc declares "array2" in eight sibling TEST blocks with FOUR different ranks.
+    // One name, one rank, or no opinion: a name declared twice is never asked about again.
+    FRankPoisoned: TStringList;
+    // ⛔ The SHAPE of an array, filed under the SLOT it was declared into rather than under its bare
+    // NAME. FDynamicArrays below is a PRE-SCAN over the raw AST with no scope in hand, so one
+    // procedure's "ReDim x(...)" made every other procedure's "Dim x(0 To 1)" dynamic - and ERASE
+    // reads that answer to decide whether to FREE the storage or to RESET the elements. These two are
+    // written at the point the slot is created, where the scope IS in hand, and the flat pre-scan
+    // stays as the fallback for a name that never reached one (see ArraySlotIsDynamic).
+    FArrShapeDyn: TStringList;           // slot names known DYNAMIC (declared "()" / an "Any" / a REDIM target)
+    FArrShapeFixed: TStringList;         // slot names known FIXED (declared with subscripts)
     FDynamicArrays: TStringList;         // array names (UPPER) that are dynamic (declared empty "()" or a REDIM
     // Fra gli array DINAMICI, quelli in cui OGNI Dim/ReDim del programma dichiara il limite
     // inferiore come lo zero LETTERALE (o lo omette, che vuol dire zero). Per questi l'accesso non
@@ -338,14 +417,32 @@ type
                                           //   (module or proc). A GOTO to one of them exits every open block scope.
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
+    FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
+    FBlockDeclVars: TStringList;         // "@B@<serial>@NAME" for every SCALAR a block declared: the "did THIS
+                                         //   block declare it?" test that stops a flat fallback (DIVERGENZE 56)
     FScopeSerial: Integer;               // FB scope: monotonic id for unique scoped internal names (NAME@serial)
     FCurrentThisType: string;   // M4.1: owner UDT type while lowering a method body (THIS's type)
     // UDT/record support (M3)
     FUDTs: array of TUDTType;            // declared record types
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
+    FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
+    FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
+    FPreProcSig: TStringList;            // procedure LABEL (UPPER, overload tail and all) -> "FPPARAMS|FPRET", same walk
+    // V5f: the RESULT TEMPORARIES of this statement - one per call to a function returning a UDT BY
+    // VALUE. The caller allocates that record (ssaRecordNew below), the callee copies its result into
+    // it, and until now NOTHING destroyed it: fbc runs one destructor MORE than we did for every such
+    // call, and exactly one. Strings[] is the type name, Objects[] the handle register's index.
+    FResultTemps: TStringList;
+    // ⭐ ELISION. fbc builds a "Type( ... )" temporary DIRECTLY into its destination when that
+    // destination is being INITIALISED - the initialiser of a DIM, or a BYVAL UDT parameter - so there
+    // is only ONE object and only one destructor. Measured, and it is exactly those two positions: an
+    // ASSIGNMENT from a literal, a BYREF argument, and a FUNCTION RESULT in either position all keep
+    // their temporary. Raised around the one expression whose value is about to initialise something,
+    // and read by RegisterResultTemp.
+    FElidingLiteralTemp: Integer;
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
@@ -362,14 +459,16 @@ type
 
     function GenerateUniqueLabel(const Prefix: string): string;
     function GetVariableType(const VarName: string): TSSARegisterType;
-    function GetOrAllocateVariable(const VarName: string): TSSAValue;
+    function GetOrAllocateVariable(const VarName: string; ModuleOnly: Boolean = False): TSSAValue;
     // FB lexical scope (MODERN). ResolveExisting walks FScopeStack innermost->outermost (stopping at a
     // proc-root for non-shared names) then falls back to the module namespace (FVarMap). BindOrResolve
     // resolves a use, or binds a new register: explicit DIM in the innermost frame (shadowing), implicit
     // first-use at the nearest proc-root/module. DeclareVariable is the explicit-declaration entry point.
-    function ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
+    function ResolveExisting(const VarName: string; out Reg: TSSAValue;
+      ModuleOnly: Boolean = False): Boolean;
     function BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
-                           UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt): TSSAValue;
+                           UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt;
+                           ModuleOnly: Boolean = False): TSSAValue;
     function DeclareVariable(const VarName: string): TSSAValue;
     function DeclareVariableTyped(const VarName: string; RegType: TSSARegisterType): TSSAValue;  // explicit DIM with a known bank
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
@@ -391,7 +490,8 @@ type
     procedure CollectProcedureDecl(Node: TASTNode);
     procedure ProcessProcedureCall(Node: TASTNode);
     // Stage arguments into transfer slots and emit ssaCallSub (shared by CALL and FUNCTION).
-    procedure EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+    procedure EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
+    function TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode; out Val: TSSAValue): Boolean;
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode);   // raw-ness crosses the call here
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -402,7 +502,12 @@ type
     procedure EmitCallSubLabel(const LabelName: string);  // ssaCallSub(label) + block split
     // OOP virtual dispatch (M4.3)
     function ImplementsInterface(const U, T: string): Boolean;             // MODERN: U names T in IMPLEMENTS
+    function IifArgs(Node: TASTNode): TASTNode;   // the argument list of an "IIf(c,a,b)" node, nil if it is not one
     function IsStrictSubtypeOf(const U, T: string): Boolean;                // the EXTENDS chain alone
+    function SameUDTName(const A, B: string): Boolean;      // ...one of the two may carry its NAMESPACE
+    function SubtypeDistance(const U, T: string): Integer;   // steps up the EXTENDS chain, -1 if U is not a T
+    function TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;  // ...summed over a type tail
+    function TypeTailMatchesCanonical(const A, B: string): Boolean;   // ...through TYPE ALIASES on both sides
     function IsSubtypeOf(const U, T: string): Boolean;
     function MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
     procedure GenerateDispatchers;
@@ -412,19 +517,29 @@ type
     function MemberArrayArgHandle(MemberNode: TASTNode; Emit: Boolean; out HandleReg: TSSAValue): Boolean;
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
     function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
+    function BlockArrayMangle(Serial: Integer; const ArrName: string): string;  // per-BLOCK name for an array DIM'd inside a Scope/If/loop body
+    function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
+    function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
+    function BlockScalarName(const Name: string): string;    // the innermost OPEN block that declared this @-taken SCALAR, or ''
+    procedure NoteArrayShape(const SlotName: string; Dynamic: Boolean);     // this SLOT is dynamic / fixed
+    function ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
                                 const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
+    function ArrayFactKey(const ArrName: string): string;   // the key the ELEMENT FACTS of that array are filed under
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
-    function OverloadNameForArity(const Name: string; Arity: Integer): string;  // @name of an OVERLOAD set
+    function OverloadNameForArity(const Name: string; Arity: Integer; const FPParams: string = ''): string;  // @name of an OVERLOAD set
+    function CondAsIntTruth(const V: TSSAValue): TSSAValue;   // a branchable 0/nonzero INT for any condition
+    procedure StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);   // tell "@f" what signature its destination wants
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
     procedure EnsureObjectBaseType;                // OOP: register the built-in empty OBJECT base type (RTTI root)
     procedure CollectUDTNames(Node: TASTNode);     // pass 1: register type names (empty)
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
+    function SoleOverloadLabel(const TypeU, MethNm: string): string;   // T.m when it has exactly ONE overload, else ''
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
     function MethAttrKey(const MethNm: string): string;   // the name a type-decl decorator is filed under
     function MethodIsVirtual(const TypeName, MethNm: string): Boolean;      // OOP: "Declare Virtual ..." (Abstract implies it)
@@ -449,17 +564,26 @@ type
     function MaskToDeclaredWidth(const Val: TSSAValue; ArgNode: TASTNode): TSSAValue;
     function BaseDigitsArg(ArgListNode: TASTNode): TSSAValue;   // HEX$/OCT/BIN optional "digits" width
     function ArgSigFromArgs(ArgsNode: TASTNode): string;        // bank signature of a call's arguments
-    function ArgWidthSigFromArgs(ArgsNode: TASTNode): string;  // declared-width tail of a call's arguments
+    function ArgWidthSigFromArgs(ArgsNode: TASTNode; PtrKinds: Boolean = False): string;
+    function ArgPtrKindChar(Node: TASTNode): Char;   // 'Z'/'W' for text a pointer parameter would receive  // declared-width tail of a call's arguments
+    function DeclaredPointerTypeOfArg(Node: TASTNode): string;  // the declared "T PTR" type of an argument, or ''
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
-    function SigBankPart(const Sig: string): string;            // the bank chars of a signature = its parameter count
+    function SigBankPart(const Sig: string): string;
+    function SigNamePart(const Sig: string): string;   // the type-name tail of a label signature
+    function TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
+    function SigWidthPart(const Sig: string): string;   // ...and the WIDTH tail after '%'            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
+    function RecordTypeOfAddrOfObject(Node: TASTNode): string;  // "(@X)" as the OBJECT of a member access -> X's UDT, else ''
     function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
     function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
+    procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
+    function PreProcPtrSigOf(Node: TASTNode): string;   // "ProcPtr(f[,sig])"/"@f" -> f's "FPPARAMS|FPRET", '' if none
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
-    function VarRecordTypeName(const VarName: string): string;    // '' if not a record var
+    function VarRecordTypeName(const VarName: string): string;
+    function InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;    // '' if not a record var
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
@@ -468,8 +592,11 @@ type
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
+    function SplitRecordVar(const S: string; out VName, TName: string; out IsArray: Boolean): Boolean;
+    procedure EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
     procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
-                                       FromFlatIndex: Integer);  // ...and the CONSTRUCTOR on each element
+                                       FromFlatIndex: Integer;
+                                       RunDtor: Boolean = False);  // ...and the CONSTRUCTOR (or the DESTRUCTOR) on each element
     procedure EmitSetDynamicType(const TypeName: string);  // OOP: THIS's runtime type-id := TypeName
     procedure EmitSetDynamicTypeOn(const HandleVal: TSSAValue; const TypeName: string);
     procedure EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
@@ -477,21 +604,29 @@ type
     // Anonymous temporary "TypeName(args)" as an expression -> allocate + construct; returns its handle.
     function EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode; out Handle: TSSAValue): Boolean;
     // FreeBASIC aggregate init "Dim As T v = (a,b,c)" / "Type<T>(a,b,c)": store args into fields in order.
+    procedure EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer; BraceNode: TASTNode);
     procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
+    function UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     // MODERN: gather the DIM'd UDTs of THIS scope only -- a DIM inside a block belongs to the block.
     procedure CollectRecordVarsAtThisLevel(Node: TASTNode; Into: TStringList; var Depth: Integer);
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
+    procedure CollectNonRecordLocalsDeep(Node: TASTNode);  // ...and the non-record names it declares, blocks included
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure EmitBaseDestructorChain;                  // OOP: ~Derived() ends by running ~Base()
     procedure EmitByrefParamStore;                      // BYREF: callee — write explicit-BYREF scalar params back to their slots
     procedure EmitByrefWriteback(const ParamOwnerName: string; ArgListNode: TASTNode);  // BYREF: caller — copy slots back into variable args
     procedure CollectModuleRecordVars(Node: TASTNode);  // V5b: gather module-scope DIM'd UDTs (skip procs)
     function TypeNeedsDestruction(const TypeName: string): Boolean;  // V5e: type (recursively) has a DESTRUCTOR
+    procedure RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string;
+                                 IsLiteral: Boolean = False);                       // V5f
+    procedure FlushResultTemps(Depth: Integer);                                        // V5f
+    function BodyHasReturnStatement(Proc: TASTNode): Boolean;                          // V5f
     procedure AssignModuleDtorSlots;                    // V5e: reserve an int xfer slot per destructor-bearing global
     procedure EmitModuleDestructors(UseSlots: Boolean = False);  // V5b/V5e: dtor calls for globals at program end
     procedure CollectModuleCtorDtors(Node: TASTNode);  // FB module constructor/destructor procs
+    procedure OrderModuleCtorDtorList(L: TStringList);  // ...into the order fbc runs them in
     procedure EmitModuleConstructors;    // FB: call module constructors before module-level code
     procedure EmitModuleProcDestructors; // FB: call module destructors at program end
                                                         //   UseSlots=True (END-in-proc): read handles from reserved slots
@@ -511,13 +646,26 @@ type
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
-    procedure CollectEnumMembers(Node: TASTNode);       // FB: back each module-level ENUM member with a shared global (proc-visible)
+    procedure EmitStaticMemberRecords;                  // ...and construct the ones whose type is a UDT (after the ctor labels exist)
+    procedure CollectEnumNames(Node: TASTNode; const Owner: string = '');    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
+    procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
+    procedure CollectTypeConsts(Node: TASTNode);        // FB: record each CONST declared inside a TYPE as "TYPE.NAME"
+    function TypeScopedConstAccess(const TypeName, MemberName: string; const Tok: TLexerToken): TASTNode;  // the node that READS one
     procedure EmitEnumMemberAllocs;                     // FB: allocate the ENUM members' backing arrays at program start
     procedure EmitSharedScalarAllocs;                   // FB module ctors: pre-size every SHARED-scalar backing array before ctors run
+    procedure EmitSharedScalarConstInits(Node: TASTNode); // ...and apply their CONSTANT initialisers, which fbc does statically
+    procedure EmitSharedArrayAllocs(Node: TASTNode);      // ...and DIM the module arrays whose bounds are constant
+    function DimBoundsAreConstant(DimsNode: TASTNode): Boolean;  // every subscript written as a literal
+    function AnyHoistedDim(DimNode: TASTNode): Boolean;          // ...this antDim holds one such declaration
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
+    function StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;    // ...the ARRAY backing, or ''
+    function StaticMemberAddrName(MemberNode: TASTNode): string;   // the name "@<static member>" resolves to, or ''
+    function RewriteStaticMemberArray(Node: TASTNode): TASTNode;   // a static-array member reference -> the backing array node
     procedure AddSharedVarSlot(const VName: string);    // M6: assign one shared scalar its transfer slot
     // Refinement #2: cross-thread SHARED scalars backed by a 1-element global array.
     function IsSharedScalar(const Name: string): Boolean;                       // name is a SHARED scalar (array-backed)? False when shadowed by a param/local
+    function TypeEnumMemberOwner(const TypeName, MemberName: string): string;   // ENUM member declared inside a TYPE
+    function ModuleConstIntRaw(const Name: string; out V: Int64): Boolean;
     function ModuleConstInt(const Name: string; out V: Int64): Boolean;         // name is a module CONST with an integer literal value? (folds to an immediate)
     function IsSharedScalarRaw(const Name: string): Boolean;                    // ...as DECLARED, ignoring shadowing (the slot-sync asks HOW it is stored, not WHICH variable is meant)
     function SharedScalarShadowed(const Name: string): Boolean;                 // ...is a param/local of the procedure being lowered hiding it? (MODERN)
@@ -525,6 +673,7 @@ type
     procedure EmitSharedScalarStoreVal(const Name: string; const Val: TSSAValue);  // store an SSA value into name(0)
     // FreeBASIC pointers: record pointer-var pointee types and back every address-taken (@x) scalar
     // with a 1-element global array (reusing the SHARED-scalar machinery), so it has a stable address.
+    procedure CollectFixedStrNames(Node: TASTNode);   // fills FFixedStrNames
     procedure CollectAddressTakenVars(Node: TASTNode);
     // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
     procedure CheckTypeNameShadowedByVar(Node: TASTNode);
@@ -547,7 +696,8 @@ type
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
     procedure CollectRawPtrRetFuncs(Node: TASTNode);                            // pre-scan: FUNCTIONs returning a raw "<scalar> PTR"
     function IsRawReturnExpr(Node: TASTNode): Boolean;                          // a FUNCTION-return expr that yields a raw byte-heap pointer?
-    procedure CollectWStringVars(Node: TASTNode);                               // pre-scan: mark DIM ... AS WSTRING vars
+    procedure CollectWStringVars(Node: TASTNode; const Owner: string = '');    // pre-scan: mark DIM ... AS WSTRING vars
+    function StrCapOf(L: TStringList; const Name: string; Def: Integer): Integer;  // fixed-length capacity, THIS scope first
     procedure CollectRedimMultiArrays(Node: TASTNode);                          // pre-scan: arrays in a multi-dim REDIM
     function DeclLowerBoundKind(Decl: TASTNode): Integer;
     procedure CollectDynamicArrays(Node: TASTNode);                             // pre-scan: dynamic arrays (empty-declared / REDIM target)
@@ -562,6 +712,7 @@ type
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
     function IsStrDataPtrExpr(Node: TASTNode): Boolean;                         // SADD(s)/STRPTR(s), and that ± an offset
+    function IsStringConstName(const Name: string): Boolean;                    // a declared STRING constant?
     function RawPtrExprPointee(Node: TASTNode): string;                         // scalar pointee of a raw FIELD ptr expr (obj.field, @obj.field[i]), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
@@ -586,6 +737,7 @@ type
     function RawModuleAddrArrayId(const Name: string): Integer;                 // shared int array "<name>$RA" holding the raw block address (declares on first use)
     function RawModuleAddrReg(const Name: string): TSSAValue;                   // load the raw block address from that shared array
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
+    function UDTFieldMultiPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // full pointee of a "T Ptr Ptr..." field ("T PTR"), else ''
     function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
     function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
     function UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;  // field declared AS WSTRING?
@@ -594,16 +746,37 @@ type
     procedure EmitArrayElementAddress(Node: TASTNode; out Result: TSSAValue);   // @arr(i) → packed element address
     procedure EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);    // @obj.field → record-field pointer
     procedure EmitNewObject(Node: TASTNode; out Result: TSSAValue);             // NEW T [(args)] → heap record handle
+    function AllocOperatorLabel(const TypeName, OpName: string): string;        // "Operator T.New/Delete", or ''
+    function TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;  // ...asked before FProcDecls exists
+    function TypeHasMemberProc(const TypeName: string): Boolean;               // ...anything that takes a THIS
+    procedure CheckPointerConstAssign(Decl: TASTNode);   // FB: a pointer assignment may not DROP a const
+    procedure CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);  // FB: too many values in a (...) init
+    procedure CheckArrayByteSize(const ArrName, ElemTypeName: string; Elems, ElemBytes: Int64);  // FB error 50
+    procedure CheckFieldArrayByteSize(const FieldName: string; Bounds: TASTNode; ElemSz: Int64);  // ...for a UDT FIELD array
+    procedure CheckAllFieldArraySizes;   // ...over every type, once the module CONSTs are known
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
-    function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;  // "Cast(T Ptr, e)[i]" read
+    function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
+    function EmitPointerValueIndexRead(BaseNode: TASTNode; const Pointee: string;
+                                       RawSrcNode, IndicesNode: TASTNode): TSSAValue;
+    function EmitPointerValueIndexAddress(BaseNode: TASTNode; const Pointee: string;
+                                          RawSrcNode, IndicesNode: TASTNode;
+                                          out IsRaw: Boolean): TSSAValue;  // "Cast(T Ptr, e)[i]" read
     function EmitRawFieldIndexAddress(MemberNode, IndicesNode: TASTNode; const PointeeType: string): TSSAValue; // obj.field[i] → raw address
     function EmitVarAddress(const Name: string): TSSAValue;                     // packed address of a backed scalar (0=NULL)
     // FreeBASIC index operator "v[i]" on a UDT, and the addressable element a BYREF one returns.
+    function IsMemberArrayField(MemberNode: TASTNode): Boolean;
     function TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
+    function TryEmitDerefTargetAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;   // "*<expr>" as a place
+    function UDTWritableStringCast(Node: TASTNode; out ObjType: string): string;   // assignable "Cast() ByRef As Z/WString"
+    function StrConversionOperand(Node: TASTNode): TASTNode;   // "Str(x)" in an LVALUE position -> x (borrowed)
+    function WrapInStrConversion(Node: TASTNode): TASTNode;    // ...and the reverse, for the mixed SWAP
+    function TryStoreThroughStringCast(TgtNode, ExprNode: TASTNode): Boolean;   // "<udt> = <string>" through its Cast
+    function UDTDerivesFromStringType(const TypeName: string): Boolean;   // EXTENDS chain reaches ZSTRING/WSTRING?
     function IndexOperatorLabel(Node: TASTNode; out ObjType: string): string;
     function TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
     function ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
+    function ProcessByrefMethodStore(VarNode, ExprNode: TASTNode): Boolean;   // "obj.m() = expr" through a BYREF result
     // "Cast(T, u) = expr" through a UDT's BYREF cast operator.
     function ProcessCastOperatorStore(CastNode, ExprNode: TASTNode): Boolean;
     // "u = expr" through a UDT's assignment operator ("Operator T.Let").
@@ -634,6 +807,7 @@ type
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
     procedure CheckMemberAccess(const TypeName, MemberName: string);        // OOP: refuse an illegal member access
+    procedure CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);  // ...for the one a DERIVED type reaches implicitly
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
                               out Bank: TSSARegisterType; out Slot: Integer;
                               out NestedType: string): Boolean;
@@ -647,6 +821,7 @@ type
     function UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;  // B1.5: field narrow width
     function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
     function TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean; out Size: Int64): Boolean;
+    function TypeNameIsKnownBank(const TypeName: string): Boolean;   // ...does it resolve WITHOUT the suffix fallback?
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
@@ -654,7 +829,10 @@ type
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
-    function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;  // fbc's C layout of a UDT
+    function FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;  // n*SizeOf(elem) for a fixed array member
+    procedure UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);  // what fbc SAYS a field measures
+    function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64;
+                       ReportOnly: Boolean = False): Boolean;  // fbc's C layout of a UDT
     procedure AssignBitFieldRuns(UDTIdx: Integer);   // pack a run of "name : n As T" members into one unit
     function UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;   // a field's index in its type
     function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
@@ -665,6 +843,8 @@ type
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
+    function CurrentProcParamTypeName(const Name: string): string;   // a PARAMETER's declared type, from its own declaration
+    function StringLiteralBytes(Node: TASTNode; out Bytes: Int64): Boolean;
     function DeclaredScalarLenBytes(const Name: string): Int64;
     function FixedLenVarSizeBytes(const Name: string): Int64;   // SizeOf of a "* n" string var, else -1         // Len(numeric var) = declared type size; -1 = keep the string path
     // Print form of a name declared INSIDE a procedure, recorded under "PROC|NAME" (kind 0 included).
@@ -682,6 +862,7 @@ type
     function IsSingleExpr(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode;
                              ToSingle: Boolean = False);   // Src3 bits: 1=unsigned src, 2=to binary32
+    function FoldEnumMemberExpr(Node: TASTNode; const EnumName: string; out V: Int64): Boolean;
     function ApplyNarrowCode(W: Integer; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow by an explicit width code
     procedure ElideRedundantNarrows;                         // a narrowing that cannot change its operand
     procedure ScanMultiDimArrays(Node: TASTNode);            // names ever given >1 dimension
@@ -692,6 +873,7 @@ type
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
     function TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
+    function ArraySlotIsModuleFlat(ArrIdx: Integer; const ArrName: string): Boolean;  // resolved to the BARE module entry?
     function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
     // FB: a builtin overloaded for a UDT under its own name ("Operator Abs (v As Vector2D) As Single").
     function UDTNamedOperatorLabel(const FuncName: string; ArgsNode: TASTNode): string;
@@ -713,6 +895,8 @@ type
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
     // handle register and UDT type name. False if it is not a record object.
+    function NameIsRealArray(const Name: string): Boolean;
+    function RecordHandleOfVar(const Name: string): TSSAValue;   // however that variable is stored
     function ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
                                  out TypeName: string): Boolean;
     // True if the expression is unsigned 64-bit (UInteger/ULongInt), selecting the QWord compare/
@@ -728,6 +912,8 @@ type
     // FreeBASIC "Operator T.Cast() As String": if Node is a UDT with a string cast, invoke it -> string.
     function CastReturnCode(const RetTypeName: string): string;  // OPERATOR CAST label suffix by return bank
     function DerefPointeeUDTType(Node: TASTNode): string;  // UDT a "*expr" points to (var or Cast(T Ptr,..))
+    function DerefOfAddrOfTarget(Node: TASTNode): TASTNode;  // "*@x" names x: the inner lvalue, or nil
+    function OverloadsAddressOf(Node: TASTNode): Boolean;   // ...unless the type declares "Operator @"
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
@@ -737,7 +923,8 @@ type
     function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
-                                ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
+                                ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False;
+                                WantAddress: Boolean = False);   // BYREF result: keep the ADDRESS (lvalue use)
     function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
                                  ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
@@ -753,14 +940,18 @@ type
     procedure FixForwardReferences;  // PHASE 3 TIER 3: Fix forward GOTO/GOSUB references
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue); overload;
     procedure ProcessExpression(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue); overload;
+    function TryGlobalScopeRead(Node: TASTNode; out Res: TSSAValue): Boolean;   // ".x" = the module-level x
     function TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
+    function IsTypeCtorTemporary(Node: TASTNode): Boolean;   // "type<T>(args)" / "T(args)" anonymous temporary
     procedure ProcessAssignment(Node: TASTNode);
     function TryCompoundSelfOp(Node, VarNode, ExprNode: TASTNode): Boolean;
     procedure FillInferredCtorType(VarNode, ExprNode: TASTNode);
     procedure ProcessDerefStore(VarNode, ExprNode: TASTNode);
     procedure ProcessIndexedStore(Node, VarNode, ExprNode: TASTNode);
     procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
+    function EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
+                                      ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     function AnyFixedLen: Boolean; inline;
@@ -777,20 +968,31 @@ type
     procedure ProcessPrint(Node: TASTNode);
     procedure ProcessInput(Node: TASTNode);
     procedure ProcessDim(Node: TASTNode);
+    procedure ProcessDimBody(Node: TASTNode);   // ProcessDim's body; the wrapper restores a hoisted STATIC's owning type
+    function EmitMemberArrayErase(MemberNode: TASTNode): Boolean;
     procedure ProcessErase(Node: TASTNode);
     procedure ProcessRedim(Node: TASTNode);
+    function HoistLValueSubscripts(Node: TASTNode): TASTNode;
     procedure ProcessSwap(Node: TASTNode);
     procedure ProcessDefType(Node: TASTNode);
     procedure CollectDefTypes(Node: TASTNode);
+    function EmitMidEffectiveLen(const LenVal, SrcReg: TSSAValue; WideTarget: Boolean): TSSAValue;
     procedure ProcessMidStatement(Node: TASTNode);
     function UDTFieldBankOf(MemberNode: TASTNode): TSSARegisterType;   // bank of the field a member access names
     function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
+    function PointeeOfDerefTarget(Node: TASTNode): string;   // ...of the EXPRESSION a "*" is applied to
+    procedure RequireStringArg(const FuncName: string; ArgsNode: TASTNode);
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
+    function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
+    function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a UCS-2 temporary
+    procedure ProcessDefaultValue(ParamNode, Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name and UDT conversion included
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
     function RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;   // byte address of an @-taken "ZSTRING * n"
+    function RawStringBufElemBytes(SNode: TASTNode): Integer;   // ...and how wide ONE character is in it
+    function IsRawStringBuf(SNode: TASTNode): Boolean;          // ...asked WITHOUT emitting anything
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -831,6 +1033,7 @@ type
     // Block label for a GOTO/GOSUB target: 'LABEL_<NAME>' for a named label
     // (identifier, case-insensitive), 'LINE_<n>' for a classic line number.
     function JumpLabelName(LabelNode: TASTNode): string;
+    function NamedLabelBlockName(const RawName: string): string;   // a named label belongs to its PROCEDURE
     procedure ProcessOnGosub(Node: TASTNode);
     procedure ProcessBox(Node: TASTNode);
     procedure ProcessCircle(Node: TASTNode);
@@ -1000,7 +1203,7 @@ type
     // Constant register tracking helpers
     procedure RecordConstantRegister(const Val: TSSAValue);
     function TryGetConstantFloat(RegIndex: Integer; out ConstValue: Double): Boolean;
-    function TryGetConstantInt(RegIndex: Integer; out ConstValue: Integer): Boolean;
+    function TryGetConstantInt(RegIndex: Integer; out ConstValue: Int64): Boolean;
     procedure InvalidateRegister(RegIndex: Integer; RegType: TSSARegisterType);
 
     // Type conversion helpers
@@ -1162,7 +1365,7 @@ begin
   SetLength(FLoopStack, 0);
   FUserFunctions := specialize TDictionary<string, TUserFunctionDef>.Create;
   FConstFloatRegs := specialize TDictionary<Integer, Double>.Create;
-  FConstIntRegs := specialize TDictionary<Integer, Integer>.Create;
+  FConstIntRegs := specialize TDictionary<Integer, Int64>.Create;
   SetLength(FDeferredProcs, 0);
   FProcedureNames := TStringList.Create;
   FProcedureNames.CaseSensitive := False;
@@ -1170,6 +1373,11 @@ begin
   SetLength(FUDTs, 0);
   FVarRecordType := TStringList.Create;
   FVarRecordType.CaseSensitive := False;
+  FPreFuncRetType := TStringList.Create;
+  FPreFuncRetType.CaseSensitive := False;
+  FPreProcSig := TStringList.Create;
+  FPreProcSig.CaseSensitive := False;
+  FResultTemps := TStringList.Create;
   FVarExplicitType := TStringList.Create;
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TStringList.Create;
@@ -1185,6 +1393,10 @@ begin
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
   FCurrentProcLocalRecs := TStringList.Create;
+  FCurrentProcNonRecs := TStringList.Create;
+  FCurrentProcNonRecs.CaseSensitive := False;
+  FDefinedLabels := TStringList.Create;
+  FDefinedLabels.CaseSensitive := False;
   FConstVars := TStringList.Create;
   FConstVars.CaseSensitive := False;
   FModuleOnlyVars := TStringList.Create;
@@ -1197,6 +1409,7 @@ begin
   FCurrentProcPtrLocals := TStringList.Create;
   FCurrentProcPtrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
+  FModuleFuncPtrSigs := TStringList.Create;
   FFuncPtrTypes := TStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
   FModuleRecordVars := TStringList.Create;
@@ -1205,6 +1418,8 @@ begin
   FTypeAliases := TStringList.Create;
   FModuleDtorSlots := TStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
+  FStaticLocalOwner := TStringList.Create;
+  FStaticLocalOwner.CaseSensitive := False;
   FSharedVars := TStringList.Create;
   FSharedVars.CaseSensitive := False;
   FSharedScalarArr := TStringList.Create;
@@ -1212,14 +1427,28 @@ begin
   FModuleConstVals.CaseSensitive := False;
   FStaticMembers := TStringList.Create;
   FStaticMembers.CaseSensitive := False;
+  FStaticMemberArrays := TStringList.Create;
+  FStaticMemberArrays.CaseSensitive := False;
+  FStaticMemberTypes := TStringList.Create;
+  FStaticMemberTypes.CaseSensitive := False;
   FEnumMembers := TStringList.Create;
+  FTypeEnumMembers := TStringList.Create;
+  FTypeEnumMembers.CaseSensitive := False;
+  FTypeConstMembers := TStringList.Create;
+  FTypeConstMembers.CaseSensitive := False;
   FEnumMembers.CaseSensitive := False;
   FEnumNames := TStringList.Create;
   FEnumNames.CaseSensitive := False;
   FEnumMemberType := TStringList.Create;
+  FEnumQualVals := TStringList.Create;
+  FEnumQualVals.CaseSensitive := False;
   FEnumMemberType.CaseSensitive := False;
   FVarEnumType := TStringList.Create;
   FVarEnumType.CaseSensitive := False;
+  FFixedStrNames := TStringList.Create;
+  FFixedStrNames.CaseSensitive := False;
+  FVarDeclTypeName := TStringList.Create;
+  FVarDeclTypeName.CaseSensitive := False;
   FPointerVars := TStringList.Create;
   FAddrTakenScalars := TStringList.Create;
   FAddrTakenScalars.CaseSensitive := False;
@@ -1231,10 +1460,16 @@ begin
   FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
+  FRawFromAddrOf := TStringList.Create;
+  FRawFromAddrOf.CaseSensitive := False;
   FRawUDTPtrs := TStringList.Create;
   FRawUDTPtrs.CaseSensitive := False;
+  FVarPtrQuals := TStringList.Create;
+  FVarPtrQuals.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
   FBlockManagedTypes := TStringList.Create;
+  FConstStrBytes := TStringList.Create;
+  FConstStrBytes.CaseSensitive := False;
   FConstDeclSeen := TStringList.Create;
   FConstDeclSeen.Sorted := True;
   FConstDeclSeen.Duplicates := dupIgnore;
@@ -1244,10 +1479,18 @@ begin
   FWStringVars.CaseSensitive := False;
   FRedimMultiArrays := TStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
+  FRankStatedArrays := TStringList.Create;
+  FRankStatedArrays.CaseSensitive := False;
+  FRankPoisoned := TStringList.Create;
+  FRankPoisoned.CaseSensitive := False;
+  FArrShapeDyn := TStringList.Create;   FArrShapeDyn.CaseSensitive := False;
+  FArrShapeFixed := TStringList.Create; FArrShapeFixed.CaseSensitive := False;
   FDynamicArrays := TStringList.Create;
   FZeroLbArrays := TStringList.Create;
   FZeroLbPoisoned := TStringList.Create;
   FDynamicArrays.CaseSensitive := False;
+  FBlockDeclVars := TStringList.Create;
+  FBlockDeclVars.CaseSensitive := False;
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
   FZStringVars := TStringList.Create;
@@ -1285,6 +1528,7 @@ begin
   FDeclaredNames.Duplicates := dupIgnore;
   FModernMode := False;            // default CLASSIC; the compile driver flips this for MODERN sources
   SetLength(FScopeStack, 0);
+  FNextScopeSerial := 1;
   for DefCh := 'A' to 'Z' do begin FDefTypeBank[DefCh] := -1; FDefTypeName[DefCh] := ''; end;  // DEFtype: no default-by-letter initially
 end;
 
@@ -1298,6 +1542,9 @@ begin
   FProcDecls.Free;
   FVarRecordType.Free;
   FVarExplicitType.Free;
+  FPreFuncRetType.Free;
+  FPreProcSig.Free;
+  FResultTemps.Free;
   FArrayRecordType.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
@@ -1306,6 +1553,8 @@ begin
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
+  FCurrentProcNonRecs.Free;
+  FDefinedLabels.Free;
   FModuleOnlyVars.Free;
   FConstVars.Free;
   FCurrentProcDeclNames.Free;
@@ -1315,20 +1564,29 @@ begin
   FCurrentProcPtrLocals.Free;
   FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
+  FModuleFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
   FModuleCtors.Free;
   FModuleDtors.Free;
   FTypeAliases.Free;
   FModuleDtorSlots.Free;
+  FStaticLocalOwner.Free;
   FSharedVars.Free;
   FSharedScalarArr.Free;
   FModuleConstVals.Free;
   FStaticMembers.Free;
+  FStaticMemberArrays.Free;
+  FStaticMemberTypes.Free;
   FEnumMembers.Free;
+  FTypeEnumMembers.Free;
+  FTypeConstMembers.Free;
   FEnumNames.Free;
   FEnumMemberType.Free;
+  FEnumQualVals.Free;
   FVarEnumType.Free;
+  FFixedStrNames.Free;
+  FVarDeclTypeName.Free;
   FPointerVars.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
@@ -1339,12 +1597,20 @@ begin
   FRawPtrVars.Free;
   FBlockManagedTypes.Free;
   FConstDeclSeen.Free;
+  FConstStrBytes.Free;
+  FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
+  FVarPtrQuals.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
+  FRankStatedArrays.Free;
+  FRankPoisoned.Free;
+  FArrShapeDyn.Free;
+  FArrShapeFixed.Free;
   FDynamicArrays.Free;
   FZeroLbArrays.Free;
   FZeroLbPoisoned.Free;
+  FBlockDeclVars.Free;
   FFixedLenVars.Free;
   FZStringVars.Free;
   FByrefRetFuncs.Free;
@@ -1378,6 +1644,13 @@ begin
   // int handles; builtin-typed vars use their declared bank).
   if Assigned(FVarExplicitType) then
   begin
+    // THIS procedure's own declaration of the name first - see the note in RegisterTypedVar. A name
+    // the procedure declares itself is never the module's, and never another procedure's.
+    if FCurrentProcName <> '' then
+    begin
+      Idx := FVarExplicitType.IndexOf(FCurrentProcName + '|' + UpperCase(VarName));
+      if Idx >= 0 then Exit(TSSARegisterType(PtrInt(FVarExplicitType.Objects[Idx])));
+    end;
     Idx := FVarExplicitType.IndexOf(UpperCase(VarName));
     // ...unless the only declaration is a plain module DIM and we are inside a procedure that does not
     // declare this name itself. That declaration is invisible here (FreeBASIC scope), so its TYPE is too.
@@ -1401,11 +1674,18 @@ begin
   end;
 end;
 
-function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue): Boolean;
+function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue;
+  ModuleOnly: Boolean): Boolean;
 // FB lexical scope (MODERN): find an existing binding for VarName. Walk the scope stack
 // innermost->outermost; stop at a proc-root for a non-shared name (so a plain module DIM is invisible
 // inside a SUB), but let DIM SHARED globals fall through to the module namespace. The module namespace
 // is FVarMap (case-insensitive). Returns False if the name is not yet bound anywhere visible here.
+//
+// ⭐ ModuleOnly = a LEADING DOT: ".x" names the MODULE-LEVEL x and nothing else - past every local,
+// past every enclosing scope, past every namespace and every import. fbc's namespace/global3 asserts
+// it at four nesting depths and namespace/global spells it three ways ('.x', '..x' and a "#define
+// global ." macro). Without it ".x" resolved like a bare name and answered the innermost local: a
+// WRONG ANSWER, not a refusal.
 var
   f, idx: Integer;
   nameU: string;
@@ -1414,6 +1694,33 @@ var
 begin
   Result := False;
   nameU := UpperCase(VarName);
+  if ModuleOnly then
+  begin
+    // The MODULE frames first (everything before the first proc-root), outermost inwards, then the
+    // module namespace itself. ⛔ Both halves are needed: a module-level DIM binds in skModule frame 0
+    // when one is open and in FVarMap when none is, so asking only FVarMap answered 0 - the name
+    // resolved to nothing and a fresh register was allocated, which is a wrong answer wearing the
+    // shape of a right one.
+    for f := 0 to High(FScopeStack) do
+    begin
+      if FScopeStack[f].Kind = skProcRoot then Break;
+      idx := FScopeStack[f].Bindings.IndexOf(nameU);
+      if idx >= 0 then
+      begin
+        pk := PtrInt(FScopeStack[f].Bindings.Objects[idx]);
+        Reg := MakeSSARegister(TSSARegisterType(pk shr 16), pk and $FFFF);
+        Exit(True);
+      end;
+    end;
+    idx := FVarMap.IndexOf(VarName);
+    if idx >= 0 then
+    begin
+      pk := PtrInt(FVarMap.Objects[idx]);
+      Reg := MakeSSARegister(TSSARegisterType(pk shr 16), pk and $FFFF);
+      Result := True;
+    end;
+    Exit;
+  end;
   isShared := FSharedVars.IndexOf(nameU) >= 0;
   for f := High(FScopeStack) downto 0 do
   begin
@@ -1437,7 +1744,8 @@ begin
 end;
 
 function TSSAGenerator.BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
-  UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt): TSSAValue;
+  UseForcedType: Boolean = False; ForcedType: TSSARegisterType = srtInt;
+  ModuleOnly: Boolean = False): TSSAValue;
 // FB lexical scope (MODERN): resolve a use, or allocate+bind a new register. An explicit DIM binds in
 // the innermost scope frame (shadowing any outer same-name binding); an implicit first-use (or an
 // explicit DIM at pure module level) resolves if already present, else binds at the nearest proc-root,
@@ -1454,12 +1762,15 @@ var
   pk: PtrInt;
 begin
   // A use, or an explicit declaration at module level, first tries to resolve an existing binding.
-  if (not IsExplicitDecl) or (Length(FScopeStack) = 0) then
-    if ResolveExisting(VarName, Result) then Exit;
-
+  if (not IsExplicitDecl) or (Length(FScopeStack) = 0) or ModuleOnly then
+    if ResolveExisting(VarName, Result, ModuleOnly) then Exit;
   nameU := UpperCase(VarName);
   // Choose the binding frame: explicit DIM -> innermost frame; implicit -> nearest proc-root (else module).
-  if IsExplicitDecl and (Length(FScopeStack) > 0) then
+  // ⛔ ...unless a LEADING DOT asked for the module namespace: ".x" cannot mean a local, so a first use
+  // of it must create the MODULE-level one and never a scope-frame binding.
+  if ModuleOnly then
+    targetIdx := -1
+  else if IsExplicitDecl and (Length(FScopeStack) > 0) then
     targetIdx := High(FScopeStack)
   else
   begin
@@ -1516,7 +1827,8 @@ begin
   Result := BindOrResolve(VarName, True, True, RegType);
 end;
 
-function TSSAGenerator.GetOrAllocateVariable(const VarName: string): TSSAValue;
+function TSSAGenerator.GetOrAllocateVariable(const VarName: string;
+  ModuleOnly: Boolean = False): TSSAValue;
 var
   Idx: Integer;
   RegType: TSSARegisterType;
@@ -1526,7 +1838,7 @@ begin
   // MODERN: route through the scope-aware resolver (a use / implicit first-use).
   if FModernMode then
   begin
-    Result := BindOrResolve(VarName, False);
+    Result := BindOrResolve(VarName, False, False, srtInt, ModuleOnly);
     Exit;
   end;
   // CLASSIC: legacy global-by-name (unchanged BASIC v7 semantics).
@@ -1640,8 +1952,28 @@ begin
   if TypeU = 'BOOLEAN' then Result := 1
   else if (TypeU = 'UINTEGER') or (TypeU = 'ULONGINT') then Result := 2
   else if (TypeU = 'UBYTE') or (TypeU = 'USHORT') or (TypeU = 'ULONG') or (TypeU = 'UINT32') then Result := 3
+  // ...and a POINTER, which is an address and therefore unsigned: fbc prints "0" for a null pointer
+  // where an Integer 0 prints " 0". Measured against fbc 1.10.1 on "Integer Ptr", "Any Ptr" and a
+  // procedure-pointer CONST - all three lose the sign space, and the plain Integer beside them keeps it.
+  // Kind 3, not 2: printing is all that changes, and letting a pointer taint the ARITHMETIC would make
+  // "p - q" answer an unsigned difference.
+  else if (Length(TypeU) >= 4) and (Copy(TypeU, Length(TypeU) - 3, 4) = ' PTR') then Result := 3
   else if TypeU = 'SINGLE' then Result := 4
   else Result := 0;
+end;
+
+function FixedStrTypeBytes(const TypeName: string; N: Int64): Int64;
+// SizeOf of a FIXED-LENGTH string TYPE, measured against fbc 1.10.1 and not deduced - the three answer
+// three different things and we answered 8 (a descriptor) for all of them:
+//     ZString * n  ->  n          (the bytes, no terminator counted)
+//     String  * n  ->  n + 1      (the terminator is part of it)
+//     WString * n  ->  n * 4      (a wide character is four bytes here)
+begin
+  Result := 0;
+  if N <= 0 then Exit;
+  if TypeName = 'ZSTRING' then Result := N
+  else if TypeName = 'STRING' then Result := N + 1
+  else if TypeName = 'WSTRING' then Result := N * 4;
 end;
 
 function OperatorArityCode(NParams: Integer): string;
@@ -1909,6 +2241,29 @@ begin
 end;
 
 // Overload without hint - creates empty hint internally
+function IsBuiltinStringTypeName(const N: string): Boolean;
+// The built-in STRING types, which convert through the string path and never through a cast.
+var
+  T: string;
+begin
+  T := UpperCase(N);
+  Result := (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING');
+end;
+
+function IsBuiltinScalarTypeName(const N: string): Boolean;
+// The built-in (non-UDT) type names a FreeBASIC "Type( value )" shorthand can infer. Used to tell a
+// CONVERSION from an anonymous UDT temporary once the inferred name is filled in.
+var
+  T: string;
+begin
+  T := UpperCase(N);
+  Result := (T = 'BYTE') or (T = 'UBYTE') or (T = 'SHORT') or (T = 'USHORT') or
+            (T = 'LONG') or (T = 'ULONG') or (T = 'INTEGER') or (T = 'UINTEGER') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+            (T = 'SINGLE') or (T = 'DOUBLE') or
+            (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING');
+end;
+
 procedure TSSAGenerator.ProcessExpression(Node: TASTNode; out Result: TSSAValue);
 var
   EmptyHint: TSSAValue;
@@ -1945,6 +2300,47 @@ begin
   ProcessExpressionFull(Node, Result, DestHint);
 end;
 
+function TSSAGenerator.TryGlobalScopeRead(Node: TASTNode; out Res: TSSAValue): Boolean;
+// ⭐ A LEADING DOT NAMES THE MODULE-LEVEL VARIABLE, AND NOTHING ELSE. ".x" reaches past every local,
+// every enclosing scope, every namespace and every import - fbc's namespace/global3 asserts it at four
+// nesting depths, and namespace/global spells the same request three ways ('.x', '..x', and a
+// "#define global ." macro). We resolved it like a bare name and answered the innermost binding: a
+// WRONG ANSWER, silently, wherever a local happened to share the spelling.
+//
+// ⛔ AND IT HAS TO SKIP THE SHADOW TEST, NOT ONLY THE SCOPE STACK. A "Dim Shared" scalar is backed by a
+// one-element global array and IsSharedScalar asks IsSharedScalarRaw AND NOT SharedScalarShadowed - so
+// inside a SUB with a local of the same name the shared route switched itself off and the read fell
+// through to a register. Asking the RAW half here is what makes ".x" find the global's storage.
+var
+  AccNode: TASTNode;
+  ConstIntVal: Int64;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antIdentifier) then Exit;
+  if Node.Attributes.Values['GLOBALSCOPE'] <> '1' then Exit;
+  if VarToStr(Node.Value) = '' then Exit;
+  // A module CONST is not a variable: the dot names its value, exactly as the bare name would.
+  if ModuleConstIntRaw(VarToStr(Node.Value), ConstIntVal) then
+  begin
+    Res := MakeSSAConstInt(ConstIntVal);
+    Exit(True);
+  end;
+  if IsSharedScalarRaw(VarToStr(Node.Value)) and not IsRawModuleScalar(VarToStr(Node.Value)) then
+  begin
+    AccNode := MakeSharedScalarAccess(VarToStr(Node.Value), Node.Token);
+    try
+      ProcessExpression(AccNode, Res);
+    finally
+      AccNode.Free;
+    end;
+    if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
+    Exit(True);
+  end;
+  Res := GetOrAllocateVariable(VarToStr(Node.Value), True);
+  if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
+  Result := True;
+end;
+
 function TSSAGenerator.TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
 // Second dispatcher fast path: a bare identifier the program DECLARED, resolved without entering
 // the big frame. Mirrors the full antIdentifier branch: a declared name disables every bare-name
@@ -1957,6 +2353,11 @@ var
 begin
   Result := False;
   VarName := VarToStr(Node.Value);
+  // ⭐ A LEADING DOT is asked HERE as well as in the full branch, through the one funnel both share.
+  // This fast path is where a DECLARED name is resolved - which is exactly what ".x" is - so with the
+  // rule only in the full branch it never ran at all: [[a-rule-one-path-has-and-the-other-does-not]],
+  // and the second dispatcher is where that keeps happening.
+  if TryGlobalScopeRead(Node, Res) then Exit(True);
   if not IsDeclaredName(VarName) then Exit;
   if FCurrentThisType <> '' then Exit;
   if IsAddrParam(VarName) or IsRefVar(VarName) or IsAddrLocal(VarName) or
@@ -1987,6 +2388,9 @@ var
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
   MethodObjNode: TASTNode;        // M4.1: object of a method call
   DerefTarget: TASTNode;          // "*expr": the operand, with any parentheses stripped
+  CancelNode: TASTNode;           // "*@x": the inner lvalue the pair cancels to (owned here)
+  StaticArrNode: TASTNode;        // a static ARRAY member rewritten to its backing global array
+  ExprList2: TASTNode;            // synthesized empty argument list for "Cast(T, T)"
   ArgNode: TASTNode;              // WSTRING: the source AST node of a string-function argument (width detect)
   MethodOwnerType, MethodLabelName: string;  // M4.1
   ArgValue, ArgReg: TSSAValue;
@@ -1994,8 +2398,10 @@ var
   TempReg, IntReg: Integer;
   IntRegVal, TempVal, TempVal2: TSSAValue;
   ArgListNode: TASTNode;
+  CtorValNode: TASTNode;   // "Type( v )" whose inferred type is BUILT-IN: the single value
   TempFloat: Double;
   TempInt: Integer;
+  TempInt64: Int64;   // an SSA int constant unwrapped from a register: 64-bit, never truncated
   TempStr: string;
   ValCode: Integer;
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
@@ -2030,6 +2436,7 @@ var
   OpArgs: TASTNode;
   AddrNode: TASTNode;          // VARPTR/PROCPTR: synthesized "@arg" node lowered via the address path
   TempNode: TASTNode;          // "@(*p)": the operand seen through its parentheses
+  ThisAddrNode: TASTNode;      // "@<bare field>": the implicit-THIS rewrite (we free it)
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
@@ -2061,6 +2468,41 @@ begin
       // intercept in the identifier path); only under "@" does the symbol matter. Without this the
       // name reached the procedure-address path unchanged and failed with "Undefined procedure
       // (address-of @): __FUNCTION_NQ__".
+      // ⭐ "@ns.member": the NAMESPACE pass collapses the qualified access into a single mangled
+      // IDENTIFIER, and it leaves it where it found it - as this node's CHILD. Every branch below
+      // reads the name from Value, and the chain has a case for a child that is a member access or an
+      // array access and none for a child that is a plain identifier, so the node fell off the end
+      // with an EMPTY name: "Undefined procedure (address-of @): ". Hoisted here, once, so the whole
+      // chain sees the name the program wrote - rather than teaching ten branches a second spelling.
+      // ⛔ An antIdentifier child at this point can only BE that collapse: an access on a record
+      // variable stays an antMemberAccess (the pass leaves it alone), which the branch below claims.
+      if (Node.ChildCount = 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+         (Trim(VarToStr(Node.Value)) = '') and (Node.GetChild(0).ChildCount = 0) then
+      begin
+        TempNode := Node.GetChild(0);
+        Node.Value := TempNode.Value;
+        // ⛔ RemoveChildAt FREES the child: FChildren is a TFPObjectList created OwnsObjects=True, so
+        // its Delete disposes of the node. Freeing it here as well is a DOUBLE FREE, and it answers
+        // with an access violation during SSA generation - which reads exactly like a defect in the
+        // lowering that was just added. The name is copied out FIRST, above, for the same reason.
+        Node.RemoveChildAt(0);
+      end;
+      // FreeBASIC ADDRESS-OF OPERATOR: a type may declare "Operator @() As T Ptr", and then "@obj" is
+      // that operator's result, not the object's storage address. Asked FIRST, because every path below
+      // answers with an address of its own and the operator would never be reached - "@x" handed back the
+      // record handle and "*(@x)" dereferenced a null.
+      if (Node.ChildCount = 0) and (VarRecordTypeName(VarToStr(Node.Value)) <> '') and
+         (ResolveMethodLabel(VarRecordTypeName(VarToStr(Node.Value)), 'OPERATOR@') <> '') then
+      begin
+        TempNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
+        try
+          ProcessMethodCall(TempNode, VarRecordTypeName(VarToStr(Node.Value)), 'OPERATOR@', nil, Result);
+        finally
+          TempNode.Free;
+        end;
+        Result := EnsureIntRegister(Result);
+        Exit;
+      end;
       if (Node.ChildCount = 0) and FInProcedure and
          ((UpperCase(VarToStr(Node.Value)) = kMACROFUNCTIONNQ) or
           (UpperCase(VarToStr(Node.Value)) = kMACROFUNCTION)) then
@@ -2073,14 +2515,54 @@ begin
       if (Node.ChildCount > 0) and (Node.GetChild(0) <> nil) then
       begin
         TempNode := Node.GetChild(0);
-        while (TempNode.NodeType = antParentheses) and (TempNode.ChildCount >= 1) do
-          TempNode := TempNode.GetChild(0);
+        // ⭐ ...AND A CAST IS TRANSPARENT TO "@" as well. "@Cast(UByte, b(0))" is the address of b(0):
+        // the cast says how to READ those bytes, and @ asks where they are. Only parentheses were seen
+        // through here, so the node reached the procedure-address branch with an EMPTY name and failed
+        // with "Undefined procedure (address-of @): " - the empty name being the standing signal for
+        // "right node, unrecognised shape". ⛔ ObjectTypeName, one door along, DOES read through an
+        // antCast: the rule was present in one path and missing in the other.
+        // A cast keeps its TYPE in Value and its operand as the LAST child - one child in the ordinary
+        // "Cast(T, e)", two in the "Cast(TypeOf(x), e)" spelling, which puts the type expression first.
+        while ((TempNode.NodeType = antParentheses) and (TempNode.ChildCount >= 1)) or
+              ((TempNode.NodeType = antCast) and (TempNode.ChildCount >= 1)) do
+          if TempNode.NodeType = antParentheses then TempNode := TempNode.GetChild(0)
+          else TempNode := TempNode.GetChild(TempNode.ChildCount - 1);
         if (TempNode.NodeType = antDeref) and (TempNode.ChildCount >= 1) then
         begin
           ProcessExpression(TempNode.GetChild(0), Result);
           Result := EnsureIntRegister(Result);
           Exit;
         end;
+        if TempNode <> Node.GetChild(0) then
+        begin
+          if TempNode.NodeType = antArrayAccess then
+          begin
+            EmitArrayElementAddress(TempNode, Result);
+            Exit;
+          end;
+          if TempNode.NodeType = antMemberAccess then
+          begin
+            EmitFieldAddress(TempNode, Result);
+            Exit;
+          end;
+          if (TempNode.NodeType = antIdentifier) and (TempNode.ChildCount = 0) and
+             (Trim(VarToStr(Node.Value)) = '') then
+            Node.Value := TempNode.Value;      // let the whole chain below see the name, as it does for @ns.member
+        end;
+      end;
+      // ⭐ "@r" WHERE r IS A REFERENCE VARIABLE ("Dim ByRef r As T = target"). Its register ALREADY
+      // HOLDS the target's address - that is the whole representation, and the read at ssaRefLoad* and
+      // the write at ssaRefStore* both use it that way - so the address of the alias IS that value.
+      // Without this branch the name fell through to IsSharedScalar/VarRecordTypeName and answered the
+      // address of the alias's OWN slot, so "@r = @target" was FALSE while reading and writing r
+      // behaved perfectly: an alias that is the same object for every purpose except its identity.
+      // IsRefVar was consulted everywhere the rule was needed - the read (2823), the write (7773), even
+      // the read fast-path's exclusion (2049) - and in the one path that answers "where is it".
+      // ⛔ It has to be tested FIRST: a shared ref-to-UDT matches the two branches below it as well.
+      if (Node.ChildCount = 0) and IsRefVar(VarToStr(Node.Value)) then
+      begin
+        Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))));
+        Exit;
       end;
       // "@Type.method": the entry PC of a member procedure named through its TYPE (a STATIC member sub
       // has no instance, so this is the only way to point at it). Tried before the field path, which
@@ -2092,6 +2574,11 @@ begin
          (ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
                              VarToStr(Node.GetChild(0).Value)) <> '') then
       begin
+        // Pointing AT a method is reaching it: fbc refuses "@T.foo" and "ProcPtr(T.foo)" on a private
+        // member exactly as it refuses the call ("visibility/*-staticmethod-*-addrof*" and "*-procptr*"
+        // are eight COMPILE_ONLY_FAIL tests of its suite). ProcPtr lowers to this same node.
+        CheckMemberAccess(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                          VarToStr(Node.GetChild(0).Value));
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadProcAddr, Result,
                         MakeSSALabel(ProcedureLabelName(
@@ -2099,10 +2586,47 @@ begin
                                              VarToStr(Node.GetChild(0).Value)))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      // ⭐ "@T.member" WHERE member IS A STATIC DATA MEMBER. A static member is not a field of any
+      // instance - it is backed by its own storage under the single name "TYPE.MEMBER"
+      // (CollectStaticMembers), which is exactly how the DEFINITION outside the type spells it
+      // ("Dim ByRef As T1 T2.R1 = t"). The chain has a branch for "@T.method" and none for this, so a
+      // static DATA member fell to the field path, where ObjectTypeName is handed a TYPE NAME, answers
+      // '' and raises "object is not a record" - a message about a record when the operand names a
+      // variable. Rewritten to that one name so the whole chain below applies, IsRefVar included.
+      // ⛔ ...AND ASKED THROUGH THE ONE FUNNEL, not by building the key here. This branch tested
+      // "the base is a TYPE NAME" and composed "TYPE.FIELD" itself, so "@UDT.a" worked and "@x.a" -
+      // the SAME member reached through an INSTANCE - fell to the field path and raised
+      // "Cannot take address of unknown field". StaticMemberBackingName answers for both bases and
+      // walks the EXTENDS chain besides; it existed already and this was the one place that went round
+      // it. The usual shape: two sites ask the same question and only one goes through the funnel.
+      else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) and
+              (Node.GetChild(0).ChildCount >= 1) and
+              (StaticMemberAddrName(Node.GetChild(0)) <> '') then
+      begin
+        Node.Value := StaticMemberAddrName(Node.GetChild(0));
+        Node.RemoveChildAt(0);          // frees it: FChildren owns its children
+        ProcessExpression(Node, Result);
+        Exit;
+      end
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) then
         EmitFieldAddress(Node.GetChild(0), Result)
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArrayAccess) then
         EmitArrayElementAddress(Node.GetChild(0), Result)
+      else if (VarRecordTypeName(VarToStr(Node.Value)) <> '') and IsSharedScalar(VarToStr(Node.Value)) then
+      begin
+        // ...and a SHARED one is ARRAY-BACKED: its handle is element 0 of a 1-element global array,
+        // never a register. Asking GetOrAllocateVariable gave a register the name was never bound to,
+        // so "@res" yielded 0 and the caller dereferenced it. ⚠️ This is the same defect m534 fixed at
+        // the program-end destructor, in a second path - and a STATIC local is exactly this case,
+        // because LowerStaticLocals hoists one into a uniquely-named DIM SHARED.
+        TempNode := MakeSharedScalarAccess(VarToStr(Node.Value), Node.Token);
+        try
+          ProcessExpression(TempNode, Result);
+          Result := EnsureIntRegister(Result);
+        finally
+          TempNode.Free;
+        end;
+      end
       else if VarRecordTypeName(VarToStr(Node.Value)) <> '' then
         // @obj where obj is a UDT value variable: its handle IS the pointer (managed-reference model).
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))))
@@ -2121,6 +2645,46 @@ begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaRefAddrField, Result, AddrLocalHandle(VarToStr(Node.Value)),
                         MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      end
+      else if IsStringConstName(VarToStr(Node.Value)) then
+      begin
+        // ⭐ "@C" WHERE C IS A STRING CONST. In FreeBASIC a string constant IS a ZString sitting in
+        // memory, so its address is the address of its CHARACTERS - the same thing SADD answers - and
+        // "Dim p As ZString Ptr = @C : Print *p" is how fbc's own tests reach one.
+        // ⛔ It was being claimed by the branch just below: a const is registered like a shared scalar,
+        // so @ handed back the PACKED SLOT address (2^32 for the first one) and dereferencing it raised
+        // "Null or invalid raw pointer dereference" - a diagnostic about the pointer that never
+        // mentions the const. STRPTR(C) on the very same name was right all along, which is the
+        // difference that named it.
+        // ⚠️ A string VARIABLE is deliberately NOT included: fbc answers its DESCRIPTOR there, not its
+        // characters, and that is a separate question about a model we do not have.
+        // Asked of FConstStrBytes, a registry that answers "no" for a name it does not hold, rather
+        // than of InferExprBank, whose default for the unrecognised is FLOAT.
+        // ⛔ The value is read through a fresh IDENTIFIER node. Handing THIS node to ProcessExpression
+        // re-enters the address-of case on the same node and recurses until the stack is gone - a
+        // SEGFAULT, not an exception, so nothing in the pipeline reports it.
+        TempNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
+        try
+          ProcessExpression(TempNode, TempVal);
+        finally
+          TempNode.Free;
+        end;
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      // ⛔ ...AND THE FIELD OF THIS COMES FIRST HERE TOO. "@gi" inside a method of a type that has a
+      // field "gi" answered the address of a module-shared "gi" of the same name - the third reader of
+      // the rule m706 put right for the read and ProcessAssignment has always had for the write.
+      // Asked as a bare name with no child, exactly as the branch further down does.
+      else if (Node.ChildCount = 0) and
+              TryImplicitThisField(VarToStr(Node.Value), Node.Token, ThisAddrNode) then
+      begin
+        try
+          EmitFieldAddress(ThisAddrNode, Result);
+        finally
+          ThisAddrNode.Free;
+        end;
       end
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
@@ -2151,6 +2715,21 @@ begin
                           ResolveMethodLabel(OwnerTypeOfLabel(FCurrentProcName), VarToStr(Node.Value)))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
+      else if (Node.ChildCount = 0) and
+              TryImplicitThisField(VarToStr(Node.Value), Node.Token, ThisAddrNode) then
+      begin
+        // "@_data" inside a method: a bare name that is a field of the owner type means "this.<field>",
+        // and only the spelled-out "@This._data" was understood. The bare spelling fell through to the
+        // PROCEDURE path below, so a module built on it failed outright with "Undefined procedure
+        // (address-of @): _DATA" - fbc's own udt-zstring reference implementation is written that way.
+        // Same rule the read, the write and the BYREF return already carry; the rewrite declines on its
+        // own when a parameter or a local DIM shadows the field, which is what fbc does too.
+        try
+          EmitFieldAddress(ThisAddrNode, Result);
+        finally
+          ThisAddrNode.Free;
+        end;
+      end
       else
       begin
         // @subname → the named SUB's entry PC. The PROC_<name> label resolves to a PC at bytecode
@@ -2159,7 +2738,8 @@ begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadProcAddr, Result,
                         MakeSSALabel(ProcedureLabelName(OverloadNameForArity(VarToStr(Node.Value),
-                                     StrToIntDef(Node.Attributes.Values['SIGARITY'], -1)))),
+                                     StrToIntDef(Node.Attributes.Values['SIGARITY'], -1),
+                                     Node.Attributes.Values['SIGPARAMS']))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;
@@ -2219,6 +2799,33 @@ begin
           Exit;
         end;
       end;
+      // ⛔ A POINTER TARGET IS LEFT A REINTERPRETATION HERE, AND THE ATTEMPT IS WRITTEN DOWN.
+      // "Cast(Integer Ptr, u)" over a UDT declaring "Operator Cast() As Integer Ptr" ought to run that
+      // operator, exactly as the implicit "Dim q As Integer Ptr = bar" already does. Routing it through
+      // TryEmitUDTCastToNumber was TRIED on 26 Aug 2026 and WITHDRAWN: a cast operator's label carries
+      // only its return BANK ('%' int, '#' float, '$' string), and an "Integer Ptr" and a "Double Ptr"
+      // are BOTH int-banked - so the two operators of that very test collide on one label, the second
+      // registration wins, and the explicit cast then answered 4662966031284069990, the bit pattern of
+      // the OTHER operator's Double. A wrong answer where there had been an error. The information is
+      // gone by the time this code runs; the fix is to key the label by the return TYPE for a pointer
+      // return, in PreCollectProcedures, and that is a change to the label scheme. DIVERGENZE 58.
+      // ⛔ ...AND A BARE TYPE NAME AS THE OPERAND IS A DEFAULT-CONSTRUCTED TEMPORARY. "Cast(P, P)" is
+      // FreeBASIC for "a default P, seen as a P"; lowered as an expression the second P was an
+      // undefined VARIABLE, which reads 0, and the receiving DIM then dereferenced handle 0 - an access
+      // violation on four lines. ProcessDefaultValue has known this spelling since the "= Foo" default
+      // was fixed, and asks it exactly this way; this is the second place that reads a value where a
+      // type name may stand.
+      if (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(0).ChildCount = 0) and
+         (FindUDT(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) and
+         (VarRecordTypeName(VarToStr(Node.GetChild(0).Value)) = '') then
+      begin
+        ExprList2 := TASTNode.Create(antExpressionList, Node.GetChild(0).Token);
+        try
+          if EmitUDTTemporary(UpperCase(VarToStr(Node.GetChild(0).Value)), ExprList2, Result) then Exit;
+        finally
+          ExprList2.Free;
+        end;
+      end;
       ProcessExpression(Node.GetChild(0), Left);
       if (Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR') then
         Result := EnsureIntRegister(Left)                   // pointer cast: value passthrough
@@ -2238,6 +2845,21 @@ begin
 
     antDeref:
     begin
+      // ⭐ "*@x" IS x. A "*" learns what it points at from the DECLARED type of a pointer, so
+      // "Dim p As String Ptr = @s : *p" was right and "*@s" - the same place with no name in between -
+      // read the packed handle as a raw address ("Null or invalid pointer dereference" for a String,
+      // the BITS for a Double). Cancelling the pair is asked FIRST, before every shape below, because
+      // it makes the question go away instead of answering it. DIVERGENZE #48.
+      CancelNode := DerefOfAddrOfTarget(Node);
+      if CancelNode <> nil then
+      begin
+        try
+          ProcessExpression(CancelNode, Result);
+        finally
+          CancelNode.Free;
+        end;
+        Exit;
+      end;
       // FreeBASIC declares Erfn/Ermn as "Function () As ZString Ptr", so real FB sources write
       // "*Erfn()" to get at the characters. SedaiBasic has no ZSTRING PTR: ssaLoadERFN/ssaLoadERMN
       // already yield the name as a STRING, so the dereference is the identity here. Deliberately
@@ -2246,6 +2868,31 @@ begin
       DerefTarget := Node.GetChild(0);
       while (DerefTarget.NodeType = antParentheses) and (DerefTarget.ChildCount >= 1) do
         DerefTarget := DerefTarget.GetChild(0);
+      // ⛔ A UNARY "*" CAN BE OVERLOADED, and the lookup for one lives in the antUnaryOp arm - which a
+      // deref never reaches, because "*f" parses as antDeref and not as a unary operator. So a type
+      // declaring "Operator *( ByRef lhs As foo ) As Integer" had that operator ignored and "*f" read
+      // the record HANDLE as an address, while "f->data" - dispatched elsewhere - worked on the very
+      // same line of the very same test. The list in that arm names "-" and "Not"; this is the third
+      // unary operator FreeBASIC lets a type declare, and it is the one with a node type of its own.
+      if FModernMode and Assigned(DerefTarget) then
+      begin
+        OpLhsType := ObjectTypeName(DerefTarget);
+        if OpLhsType <> '' then
+        begin
+          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR*' + OperatorArityCode(1));
+          if (OpLabel <> '') and ProcHasParamCount(OpLabel, 1) then
+          begin
+            OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+            try
+              OpArgs.AddChild(DerefTarget.Clone);
+              EmitUserFunctionCall(OpLabel, OpArgs, Result);
+            finally
+              OpArgs.Free;
+            end;
+            Exit;
+          end;
+        end;
+      end;
       // "Erfn" arrives as a bare antIdentifier; "Erfn()" as an antArrayAccess whose FIRST CHILD carries
       // the name (the node itself has no Value).
       if FModernMode and Assigned(DerefTarget) and
@@ -2293,7 +2940,7 @@ begin
         end
         else
         begin
-          TempStr := UpperCase(FArrayScalarPointee.Values[UpperCase(VarToStr(DerefTarget.GetChild(0).Value))]);
+          TempStr := UpperCase(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(DerefTarget.GetChild(0).Value))]);
           if TempStr = '' then
             TempStr := UpperCase(ArrayPointerUDTType(VarToStr(DerefTarget.GetChild(0).Value)));
         end;
@@ -2440,45 +3087,22 @@ begin
       else
         EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
-      // *Cast/CPtr(T Ptr, x) over a MANAGED (packed-slot) address: the slot is read whole, but the
-      // cast asks for T's view of it - reinterpret the LOW bytes at T's width and signedness, like
-      // little-endian memory would ("*CPtr(Byte Ptr, @int32holding_&h80)": fbc prints -128, the
-      // whole-slot read said 128). Int-family pointees only; a cross-bank pun needs a raw backing
-      // (the @-taken-scalar raw path) and keeps the whole-slot behavior here.
-      if (DerefTarget.NodeType = antCast) and (FuncRetType = srtInt) then
+      // ⭐ A VALUE READ THROUGH A POINTER HAS THE POINTER'S DECLARED POINTEE TYPE. A managed address
+      // reads its slot WHOLE - 64 bits - so a narrow or differently-signed pointee saw the wrong
+      // number: "Dim As UByte u = 200 : Dim As Byte Ptr b = Cast(Byte Ptr, @u) : Print *b" answered
+      // 200 where fbc answers -56, and a Short Ptr over a Long answered the whole Long.
+      // ⛔ THE RULE EXISTED AND ONE PATH HAD IT. It was keyed on the deref target being SYNTACTICALLY
+      // a Cast ("*CPtr(Byte Ptr, x)"), so putting the very same cast in a variable first - which is
+      // how anyone writes it - lost it. The question is not how the pointer was spelled, it is what
+      // it was DECLARED to point at.
+      // ⛔ And it went through ApplyNarrowCode instead of a hand-rolled SHL/SHR/AND ladder, which was
+      // a second copy of a conversion this compiler already owns - and the copy knew six types where
+      // the original knows eleven.
+      if FuncRetType = srtInt then
       begin
-        TempStr := DerefedType(DerefTarget);
-        DestReg := 0;   // reused as the shift width for the sign-extending pointee views
-        TempVal2 := MakeSSAValue(svkNone);
-        case TempStr of
-          'BYTE':  DestReg := 56;
-          'SHORT': DestReg := 48;
-          'LONG':  DestReg := 32;
-          'UBYTE', 'USHORT', 'ULONG':
-          begin
-            // Binary-op constants must live in registers (the translator has no Src2 immediates).
-            TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            if TempStr = 'UBYTE' then
-              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FF), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-            else if TempStr = 'USHORT' then
-              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FFFF), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
-            else
-              EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt($FFFFFFFF), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaBitwiseAnd, Left, Result, TempVal2, MakeSSAValue(svkNone));
-            Result := Left;
-          end;
-        end;
-        if DestReg > 0 then
-        begin
-          // Sign extension: (v SHL n) SHR n - our integer SHR is arithmetic on the int bank.
-          TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaLoadConstInt, TempVal2, MakeSSAConstInt(DestReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-          Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaShl, Left, Result, TempVal2, MakeSSAValue(svkNone));
-          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaShr, Result, Left, TempVal2, MakeSSAValue(svkNone));
-        end;
+        TempStr := PointeeOfDerefTarget(DerefTarget);
+        if TempStr <> '' then
+          Result := ApplyNarrowCode(TypeNameWidthCode(TempStr), Result);
       end;
     end;
 
@@ -2563,6 +3187,8 @@ begin
     antIdentifier:
     begin
       VarName := VarToStr(Node.Value);
+      // ⭐ A LEADING DOT: the MODULE-LEVEL name, through the funnel the fast path shares.
+      if TryGlobalScopeRead(Node, Result) then Exit;
       // The bare-name intercepts below give a builtin meaning to a name used without parentheses.
       // They stand aside for any name the program declared explicitly (DIM/VAR/STATIC/CONST/parameter),
       // so "Dim As Integer curdir" is the variable it plainly asks for rather than being dropped in
@@ -2713,7 +3339,13 @@ begin
             EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
           end
         else   // STRING keeps the managed record handle
+        begin
           EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          // ...and a "String * n" among them is padded on store now, so this read converts at the first
+          // NUL exactly as the plain-register read does. The two halves ask the same question or the
+          // storage and the value part company (DIVERGENZE 77).
+          if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
+        end;
       end
       // Module-level @-taken scalar: read the declared-width value from its raw slot (address in the shared
       // "<name>$RA" array). Bit-exact, so a type-punning read through @x sees the same bytes.
@@ -2736,17 +3368,28 @@ begin
       // test the shared-scalar path uses, so a parameter or local of the same name still wins.
       else if ModuleConstInt(VarName, ConstIntVal) then
         Result := MakeSSAConstInt(ConstIntVal)
+      // ⛔ FreeBASIC implicit THIS: a bare field name in a method body reads "this.<field>" - AND IT IS
+      // ASKED BEFORE THE SHARED SCALAR, not after. The STORE path has had that order all along
+      // (ProcessAssignment asks it first); the READ did not, so "Dim Shared dup" beside a type with a
+      // field "dup" made "Print dup" inside that type's own method print the GLOBAL while "dup = x"
+      // beside it wrote the FIELD - the two halves of one name disagreeing, which is worse than either
+      // answer. fbc suite structs/inherit-type-4, where the field is INHERITED and the global is a
+      // different string in every namespace of the file.
+      else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
+      begin
+        ProcessExpression(ArgListNode, Result);
+        ArgListNode.Free;
+      end
       else if IsSharedScalar(VarName) then
       begin
         ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
         ProcessExpression(ArgListNode, Result);
         ArgListNode.Free;
-      end
-      // FreeBASIC implicit THIS: a bare field name in a method body reads "this.<field>".
-      else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
-      begin
-        ProcessExpression(ArgListNode, Result);
-        ArgListNode.Free;
+        // ⛔ The conversion has to be asked of the ORIGINAL node, not of the array access this rewrote
+        // it into: FixedLenCapOfNode classifies a NAME, and the element form carries none. A
+        // "Dim Shared f As String * 10" is padded on store, so without this its comparison against ""
+        // saw ten NULs and answered NOT EQUAL where fbc answers equal (fbc's own string/comp_null).
+        if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
       end
       // ...and a bare name that is a no-argument METHOD or a PROPERTY of the owner type reads
       // "this.<name>" too -- which is how a property setter reads its own getter (FreeBASIC's own
@@ -2770,7 +3413,9 @@ begin
       begin
         // Return the register assigned to this variable. A fixed-length string converts to its
         // variable-length form here (see TryFixedLenStore's header); no-op for every other variable.
-        Result := GetOrAllocateVariable(VarName);
+        // ⭐ A LEADING DOT asks for the MODULE-LEVEL variable: past every local, every enclosing
+        // scope and every import. See ResolveExisting.
+        Result := GetOrAllocateVariable(VarName, Node.Attributes.Values['GLOBALSCOPE'] = '1');
         if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
       end;
     end;
@@ -3185,8 +3830,8 @@ begin
       end
       else if (Left.Kind = svkRegister) and (Left.RegType = srtInt) then
       begin
-        if TryGetConstantInt(Left.RegIndex, TempInt) then
-          Left := MakeSSAConstInt(TempInt);
+        if TryGetConstantInt(Left.RegIndex, TempInt64) then
+          Left := MakeSSAConstInt(TempInt64);
       end;
 
       // Same for Right operand
@@ -3197,8 +3842,8 @@ begin
       end
       else if (Right.Kind = svkRegister) and (Right.RegType = srtInt) then
       begin
-        if TryGetConstantInt(Right.RegIndex, TempInt) then
-          Right := MakeSSAConstInt(TempInt);
+        if TryGetConstantInt(Right.RegIndex, TempInt64) then
+          Right := MakeSSAConstInt(TempInt64);
       end;
 
       // ALWAYS perform basic algebraic simplification (even with optimizations disabled)
@@ -4129,9 +4774,7 @@ begin
             TempStr := UpperCase(VarToStr(ArgNode.Value));
           if (TempStr <> '') and (FindUDT(TempStr) >= 0) then
           begin
-            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
             Exit;
           end;
 
@@ -4145,10 +4788,38 @@ begin
             TempStr := UpperCase(VarToStr(ArgNode.Value));
             if (not IsDeclaredVariable(TempStr)) and IsTypeNameForLen(TempStr) then
             begin
-              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
-                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
               Exit;
+            end;
+            // ⭐ LEN OF AN ARRAY IS ITS ELEMENT'S SIZE. fbc answers 24 for "Len(foo)" on a
+            // "Dim Shared As String foo()" - the same number "Len(String)" gives - and 8 for an array
+            // of Integer. We fell through to the STRING path, coerced the array name to a string and
+            // answered 1, for every array of every type. The element type is asked of the registries
+            // that hold it (a UDT element first, then a scalar one) and only then the BANK, which is
+            // all a declared array is guaranteed to carry. fbc suite string/array_len.
+            // ⛔ ...AND A SHARED SCALAR IS NOT AN ARRAY, though it answers ArrayIndexOf: it is BACKED by
+            // a 1-element global array, and the note on the string-subscript branch says so in the same
+            // words. Without this exclusion "Len(s)" on a "Dim Shared As String s" answered the
+            // DESCRIPTOR size instead of the string's length - eight corpus programs and one sweep
+            // example went red at once, which is what the nets are for.
+            if (ArrayIndexOf(TempStr) >= 0) and (not IsSharedScalar(TempStr)) then
+            begin
+              ArrName2 := UpperCase(FArrayRecordType.Values[ArrayFactKey(TempStr)]);
+              if ArrName2 = '' then ArrName2 := UpperCase(FArrayScalarType.Values[TempStr]);
+              if ArrName2 <> '' then TempInt := TypeSizeBytes(ArrName2)
+              else
+                case FProgram.GetArray(ArrayIndexOf(TempStr)).ElementType of
+                  srtString: TempInt := TypeSizeBytes('STRING');
+                  srtFloat:  TempInt := TypeSizeBytes('DOUBLE');
+                else         TempInt := TypeSizeBytes('INTEGER');
+                end;
+              if TempInt > 0 then
+              begin
+                Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TempInt),
+                                MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                Exit;
+              end;
             end;
             // LEN of a declared NUMERIC/pointer variable is the SIZE of its declared type
             // (fbc: Byte->1, Short->2, Integer->8, Single->4, Ptr->8...), NOT a string length.
@@ -4163,6 +4834,27 @@ begin
             end;
           end;
 
+          // ⛔ LEN OF A NUMERIC EXPRESSION IS ITS SIZE, not a string length. fbc answers 4 for
+          // "Len(CULng(0))"; we coerced the number to a string and answered 0. Only the EXPRESSION
+          // shapes are taken here - a name has already been answered above, and a STRING keeps the
+          // string path, which is what LEN means for one.
+          // ⚠️ ONLY where the width is KNOWN. Asking InferExprBank to say "not a string" was tried and
+          // broke nine corpus programs: it answers its FLOAT default for every expression it does not
+          // recognise, so a string-valued call was sized as a number. OperandWidthCode never guesses -
+          // it answers 0 when it does not know - and that is exactly the guard this needs.
+          if FModernMode and (ArgNode <> nil) and
+             not (ArgNode.NodeType in [antIdentifier, antMemberAccess, antLiteral]) and
+             (OperandWidthCode(ArgNode) <> 0) then
+          begin
+            FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(ArgNode));
+            if FieldSzConst > 0 then
+            begin
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst),
+                              MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Exit;
+            end;
+          end;
           // LEN of a fixed-length string is its declared capacity: read the raw padded buffer.
           ProcessExprFixedRaw(ArgNode, ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
@@ -4199,6 +4891,15 @@ begin
         begin
           // FreeBASIC ASC(str [, pos]) - the code of the char at 1-based position pos (default 1). With a
           // position, take MID(str, pos, 1) first; then ASC of that single character.
+          // ⭐ FOR A WSTRING BOTH HALVES COUNT CODEPOINTS, and the answer IS a codepoint. WSTRING is
+          // stored as UTF-8, so ssaStrMid took a BYTE and ssaStrAsc reported that byte: on
+          // !"\u3041Z\u3045" fbc answers 12353 90 12357 and we answered 227 129 129 - the lead bytes.
+          // The wide family already had Mid; Asc is the twin that was missing (bcStrAscW).
+          IsAny := False;
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+            IsAny := IsWStringExpr(ArgListNode.GetChild(0))
+          else if ArgListNode <> nil then
+            IsAny := IsWStringExpr(ArgListNode);
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
             ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue);  // str (raw buffer if fixed-length)
@@ -4208,7 +4909,10 @@ begin
             Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaLoadConstInt, Arg3Reg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone)); // length 1
             TempVal := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-            EmitInstruction(ssaStrMid, TempVal, ArgReg, Arg2Reg, Arg3Reg);   // MID(str, pos, 1)
+            if IsAny then
+              EmitInstruction(ssaStrMidW, TempVal, ArgReg, Arg2Reg, Arg3Reg)   // MID(wstr, pos, 1) by codepoint
+            else
+              EmitInstruction(ssaStrMid, TempVal, ArgReg, Arg2Reg, Arg3Reg);   // MID(str, pos, 1)
             ArgReg := EnsureStringRegister(TempVal);
           end
           else if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -4224,7 +4928,10 @@ begin
           else begin Result := MakeSSAValue(svkNone); Exit; end;
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
-          EmitInstruction(ssaStrAsc, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          if IsAny then
+            EmitInstruction(ssaStrAscW, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          else
+            EmitInstruction(ssaStrAsc, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = 'CHR$') then
         begin
@@ -4336,10 +5043,17 @@ begin
         else if (FuncName = 'STR$') then
         begin
           // STR$(n) - returns string from number
+          // ⛔ ...and a UDT carrying "Operator Cast() As String" converts THROUGH IT. Read as an
+          // ordinary expression it is an int HANDLE, and the int branch below then rendered that
+          // handle - "1", "2", "3" - a number, and a believable one. It is the SAME trap the BigInt
+          // and BOOLEAN cases below are written to avoid, said twice already in this very branch, and
+          // a string-casting UDT is the third instance of it. ⚠️ PRINT, "&" and an assignment all
+          // took the cast; only Str did not, so a program printed one thing and Str'd another.
+          // ProcessStringExpression is exactly ProcessExpression for anything that is not such a UDT.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+            ProcessStringExpression(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           DestReg := FProgram.AllocRegister(srtString);
@@ -4381,11 +5095,16 @@ begin
         end
         else if (FuncName = 'VAL') then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // VAL(str) - returns float from string
+          // ...through "Operator Cast() As String" for a UDT, as STR$ above: read as an ordinary
+          // expression the argument is an int HANDLE, EnsureStringRegister rendered THAT, and VAL
+          // parsed a handle. Measured over eleven string builtins, STR$ and VAL were the only two
+          // that did not convert - UCASE, LCASE, LEFT, RIGHT, MID, INSTR, TRIM and ASC all did.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
-            ProcessExpression(ArgListNode, ArgValue)
+            ProcessStringExpression(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           ArgReg := EnsureStringRegister(ArgValue);
@@ -4436,6 +5155,7 @@ begin
         else if (FuncName = 'VALINT') or (FuncName = 'VALLNG') or (FuncName = 'VALUINT') or
                 (FuncName = kVALULNG) then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // VALINT/VALLNG/VALUINT(s) - parse leading integer from a string (0 if none).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
@@ -4492,8 +5212,21 @@ begin
           // UDT array member: LBOUND/UBOUND(obj.field [, dim]) — resolve via the field's FArrays handle.
           if TryMemberArrayBound(IndicesNode, ArgListNode, FuncName = 'LBOUND', Result) then
             Exit;
+          // ...and a STATIC array member is one global array under a dotted name, so it answers through
+          // the ordinary path below - by its backing NAME. Without this the member name alone was read
+          // and the bound was refused as "array not declared: A".
+          StaticArrNode := RewriteStaticMemberArray(IndicesNode);
+          if StaticArrNode <> nil then
+          begin
+            try
+              if StaticArrNode.NodeType = antArrayAccess then ArrName := VarToStr(StaticArrNode.GetChild(0).Value)
+              else ArrName := VarToStr(StaticArrNode.Value);
+            finally
+              StaticArrNode.Free;
+            end;
+          end
           // The array name may arrive as a bare identifier or wrapped in an array-access node.
-          if IndicesNode.NodeType = antArrayAccess then
+          else if IndicesNode.NodeType = antArrayAccess then
             ArrName := VarToStr(IndicesNode.GetChild(0).Value)
           else
             ArrName := VarToStr(IndicesNode.Value);
@@ -4648,6 +5381,7 @@ begin
         end
         else if (FuncName = 'LEFT$') then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // LEFT$(str, n) - returns leftmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
@@ -4666,6 +5400,7 @@ begin
         end
         else if (FuncName = 'RIGHT$') then
         begin
+          RequireStringArg(FuncName, ArgListNode);
           // RIGHT$(str, n) - returns rightmost n chars
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
@@ -4907,6 +5642,22 @@ begin
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             Exit;
           end;
+          // ⛔ ...AND A UDT WITH AN "Operator Cast" IS A NUMBER TOO. The IMPLICIT conversion runs it -
+          // "Dim i As Integer = t" answers 5 - and the EXPLICIT one did not: ProcessExpression handed
+          // back the record HANDLE and the narrowing below turned it into a small integer, so "CInt(t)"
+          // answered 1 while "Dim i As Integer = t" on the very same object answered 5. One rule, two
+          // conversion paths, present in one. TryEmitUDTCastToNumber is the reader the implicit path
+          // already uses; the width conversion below then applies to the value it returns, which is
+          // what makes "CByte(t)" narrow the OPERATOR'S result rather than a handle.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and
+             TryEmitUDTCastToNumber(ArgListNode.GetChild(0), ArgValue) then
+          begin
+            Result := ApplyNarrowCode(TypeNameWidthCode(Copy(FuncName, 2, MaxInt)),
+                                      EnsureIntRegister(ArgValue), nil);
+            if Result.Kind = svkNone then Result := EnsureIntRegister(ArgValue);
+            Exit;
+          end;
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
@@ -4987,6 +5738,24 @@ begin
         begin
           // FreeBASIC float conversion functions: produce a float value. CSNG rounds to true
           // single precision (held in the Double bank) via bcNarrowSingle (B1.5).
+          // ⛔ ...AND THE OTHER HALF OF THE SAME RULE. A UDT with an "Operator Cast" is a number here
+          // too, and this path handed back the record HANDLE: "CDbl(t)" answered 1 on a type whose Cast
+          // returns 3.75 - and fbc ACCEPTS that call, so this is a wrong answer, not permissiveness.
+          // The integer family a few lines up needed the same branch; writing it in one and not the
+          // other is what this whole campaign keeps meeting.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and
+             TryEmitUDTCastToNumber(ArgListNode.GetChild(0), ArgValue) then
+          begin
+            Result := EnsureFloatRegister(ArgValue);
+            if FuncName = 'CSNG' then
+            begin
+              TempVal := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaNarrowSingle, TempVal, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Result := TempVal;
+            end;
+            Exit;
+          end;
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
           else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
@@ -5399,6 +6168,18 @@ begin
           end
           else
             raise Exception.Create('MULTIKEY requires 1 argument: MULTIKEY(scancode)');
+        end
+        else if (FuncName = kSCREENRES) and (ArgListNode <> nil) and
+                (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
+                (ArgListNode.ChildCount >= 2) then
+        begin
+          // SCREENRES(w, h [, depth [, pages [, driver]]]) as a FUNCTION: fbc accepts both this and the
+          // statement form and answers 0 on success. The statement path already knows how to set the
+          // mode - it is handed the SAME argument list rather than a second copy of the lowering.
+          ProcessScreenRes(ArgListNode);
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else if (FuncName = kIMAGEINFO) and (ArgListNode <> nil) and
                 (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
@@ -5817,12 +6598,36 @@ begin
       // Record field read: obj.field (M3)
       ProcessMemberAccess(Node, Result);
 
+    // The FUNCTION forms of the binary GET / PUT, built by the expression parser into the very node
+    // their STATEMENT forms use (FUNCFORM). fbc answers 0 on success; the work is the statement's.
+    antGetFile:
+    begin
+      ProcessGetFile(Node);
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    antPrintFile:
+    begin
+      ProcessPrintFile(Node);
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+
     antArrayAccess:
     begin
       // Array element access: A(5) or M(I,J)
       // Structure: antArrayAccess
       //   antIdentifier: array name
       //   antExpressionList: indices
+
+      // ⭐ ...unless the "array" is a STATIC MEMBER: it is a global array under a dotted name, and every
+      // path below works on it once the reference is rewritten. See RewriteStaticMemberArray.
+      StaticArrNode := RewriteStaticMemberArray(Node);
+      if StaticArrNode <> nil then
+      begin
+        try ProcessExpression(StaticArrNode, Result); finally StaticArrNode.Free; end;
+        Exit;
+      end;
 
       if Node.ChildCount < 2 then
         begin
@@ -5846,6 +6651,25 @@ begin
                  Length(UpperCase(VarToStr(Node.GetChild(0).Value))) - 3, 4) = ' PTR') then
         begin
           Result := EmitCastPointerIndexRead(Node.GetChild(0), Node.GetChild(1));
+          Exit;
+        end;
+
+        // ⛔ "( expr )[i]" - A PARENTHESISED BASE. Every branch here keys off the NAME of a declared
+        // pointer, and a parenthesised expression has none, so "(*pp)[0]" with "pp As Integer Ptr Ptr"
+        // fell through to a shape that answered the PACKED ADDRESS of pp itself (8589934592) where fbc
+        // answers the value; the same thing written in two steps through a variable was right all along,
+        // which is what said it was the missing SHAPE and not the pointers. DIVERGENZE 54.
+        // ⚠️ This is the FOURTH such shape (a cast, a chained index, now this one), and it is written
+        // GENERICALLY on purpose: parentheses never change what an expression means, DerefedType already
+        // strips them and already answers the element type of "*base" for every base it knows, and
+        // "base[i]" IS "*(base + i)". Adding a fifth named shape would keep the list growing on the
+        // side that cannot be finished.
+        if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antParentheses) and
+           (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+           (Node.GetChild(1).ChildCount = 1) and (DerefedType(Node.GetChild(0)) <> '') then
+        begin
+          Result := EmitPointerValueIndexRead(Node.GetChild(0), DerefedType(Node.GetChild(0)),
+                                              Node.GetChild(0), Node.GetChild(1));
           Exit;
         end;
 
@@ -5889,15 +6713,38 @@ begin
         // object as an array or a call and answer with its handle.
         if TryEmitIndexOperator(Node, Result) then Exit;
 
+        // ⭐ ...and the same dispatch table as a UDT FIELD: "obj.arr(i)( args )" / "p->arr(i)( args )".
+        // The field already records its element signature (the parser marks an ARRAY field FUNCPTR
+        // exactly as it marks a scalar one) and reading obj.arr(i) already yielded the entry PC - what
+        // was missing was reading the SECOND subscript as a CALL. Without it the expression answered
+        // the element and the program printed a number; it looked right for as long as the callee
+        // happened to return the same value as the INDEX, which is how fbc's pointers/funptr_array1
+        // reads: "TEST_1 = 1" called with index 1. fbc suite pointers/funptr_array1, array_ptr_fn.
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(0).GetChild(0).ChildCount >= 1) then
+        begin
+          TempStr := UDTFuncPtrFieldSig(
+                       FindUDT(ObjectTypeName(Node.GetChild(0).GetChild(0).GetChild(0))),
+                       VarToStr(Node.GetChild(0).GetChild(0).Value), RecSlotK);
+          if TempStr <> '' then
+          begin
+            ProcessExpression(Node.GetChild(0), Left);      // obj.arr(i) -> the element's entry PC
+            Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
+            Exit;
+          end;
+        end;
+
         // Dispatch table "arr(i)(args)": child0 is itself an array access into an array of function
         // pointers ("Dim As <named funcptr type> arr(..)"). Evaluate arr(i) to the element's entry-PC
         // value and lower an indirect call through it with the array's recorded signature.
         if (Node.GetChild(0).NodeType = antArrayAccess) and
            (Node.GetChild(0).ChildCount >= 1) and
            (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-           (FArrayFuncPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))] <> '') then
+           (FArrayFuncPtrSig.Values[ArrayFactKey(VarToStr(Node.GetChild(0).GetChild(0).Value))] <> '') then
         begin
-          TempStr := FArrayFuncPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))];
+          TempStr := FArrayFuncPtrSig.Values[ArrayFactKey(VarToStr(Node.GetChild(0).GetChild(0).Value))];
           ProcessExpression(Node.GetChild(0), Left);   // arr(i) -> the funcptr value (int)
           Result := EmitIndirectCall(Left, TempStr, Node.GetChild(1));
           Exit;
@@ -6037,11 +6884,65 @@ begin
 
         ArrName := VarToStr(Node.GetChild(0).Value);
 
+        // FreeBASIC's "Type( value )" shorthand whose type was INFERRED from the target, and the target
+        // is a BUILT-IN type ("Dim x As Integer = Type( 1.5 )", "f = Type( 1.5 )"): there is no temporary
+        // to construct, the form is a CONVERSION - exactly what the explicit "type<Integer>( 1.5 )"
+        // lowers to. Rewritten IN PLACE, here, where the filled-in name is finally visible: four places
+        // fill that name (DIM, assignment, argument, RETURN) and each clears the INFERTYPE mark, so
+        // teaching them all the same rule is the shape that keeps going wrong. TYPECTOR survives the fill.
+        // ⛔ NUMERIC types only. A STRING type reaching antCast prints a number: fbc rejects
+        // "Cast(String, x)" outright and our cast has no string arm. The string spellings are the
+        // one-argument STRING(x) conversion further down, which is where they already worked.
+        if (Node.Attributes.Values['TYPECTOR'] = '1') and IsBuiltinScalarTypeName(ArrName) and
+           (not IsBuiltinStringTypeName(ArrName)) and
+           (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antExpressionList) and
+           (Node.GetChild(1).ChildCount = 1) then
+        begin
+          CtorValNode := Node.GetChild(1).GetChild(0);
+          Node.GetChild(1).Children.Extract(CtorValNode);   // detach WITHOUT freeing: the list owns its children
+          Node.ClearChildren;                               // frees the name node and the emptied list
+          Node.NodeType := antCast;
+          Node.Value := UpperCase(ArrName);
+          Node.Attributes.Values['TYPECTOR'] := '';         // done once; the optimizer visits this node again
+          Node.AddChild(CtorValNode);
+          ProcessExpression(Node, Result, DestHint);
+          Exit;
+        end;
+
+        // ...and the same shorthand whose type NOBODY filled in: every filling site knows how to answer
+        // "what UDT is the target?" and none of them knows how to answer "what BUILT-IN type is it?", so
+        // for a scalar target the name is still empty here ("i = Type( 456 )", "Return Type( 9 )"). It
+        // does not need one: a conversion to the target's own type is exactly what the store or the
+        // return already performs on any other value. Hand the value through.
+        // ⛔ One argument only - a field list with an unresolved type is a real failure and keeps its error.
+        // ...and the same for a written type that is neither a UDT nor a built-in scalar: an ENUM
+        // ("i = type<E>( B )") or a procedure type ("p = type<Sub( )>( 0 )"). Both convert to the
+        // value's own bank, so there is nothing to emit but the value.
+        // ⛔ ...but NOT a STRING type: "type<String>( x )" is a real CONVERSION, not the identity - on a
+        // UDT it runs that type's string Cast operator, and lowering it to its operand turned
+        // "Operator Len( v As VZ ) = Len( Type<String>( v ) )" into unbounded recursion. It already
+        // lowers to the one-argument STRING(x) conversion, which is where the string types belong.
+        if (Node.Attributes.Values['TYPECTOR'] = '1') and
+           ((Node.Attributes.Values['INFERTYPE'] = '1') or
+            ((FindUDT(UpperCase(ArrName)) < 0) and (not IsBuiltinScalarTypeName(ArrName)))) and
+           (Node.ChildCount >= 2) and
+           (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+        begin
+          ProcessExpression(Node.GetChild(1).GetChild(0), Result, DestHint);
+          Exit;
+        end;
+
         // FreeBASIC anonymous temporary construction "TypeName(args)" used as a VALUE (array-of-UDT
         // initializer element, assignment RHS, function argument): the "array name" is actually a declared
         // UDT type and not a real array. Construct a temporary instance (allocate + constructor) and return
         // its handle. Guarded by ArrayIndexOf < 0 so a genuine array of the same name still wins.
-        if (FindUDT(UpperCase(ArrName)) >= 0) and (ArrayIndexOf(UpperCase(ArrName)) < 0) and
+        // ⛔ ...AND A PROCEDURE OF THAT NAME WINS, which is why the test is the SHARED guard and not a
+        // FindUDT written out again here. "Type T ... End Type : Sub t() ... : t()" is legal in fbc and
+        // calls the SUB; the type name matched first here, so the call built an anonymous temporary and
+        // threw it away - it SILENTLY did not happen, with no diagnostic anywhere. Eight lines reproduce
+        // it, and it took a module constructor to notice, because there the missing call is all the
+        // constructor does. "type<T>( ... )" carries TYPECTOR and still names the type on purpose.
+        if IsTypeCtorTemporary(Node) and
            (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antExpressionList) then
           if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
 
@@ -6053,7 +6954,9 @@ begin
           EmitRawAlloc(Node, Result);
           Exit;
         end;
-        if (UpperCase(ArrName) = 'DEALLOCATE') and (ArrayIndexOf(ArrName) < 0) and
+        if ((UpperCase(ArrName) = 'DEALLOCATE') or
+            ((UpperCase(ArrName) = 'FREE') and (FProcedureNames.IndexOf('FREE') < 0))) and
+           (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount >= 1) then
         begin
           ProcessExpression(Node.GetChild(1).GetChild(0), Left);
@@ -6093,11 +6996,60 @@ begin
           TempStr := DeclaredTypeNameOf(Node.GetChild(1).GetChild(0));
           if TempStr <> '' then
           begin
-            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(TempStr)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
             Exit;
           end;
+        end;
+        // ⛔ ...and SIZEOF OF ANY OTHER EXPRESSION. fbc sizes the expression's TYPE and never evaluates
+        // it, so "SizeOf(p2 - p1)", "SizeOf(x + 1)" and "SizeOf(a(UBound(a)))" are all legal - and all
+        // of them fell past the two branches above, leaving the name SIZEOF to reach the ARRAY lookup:
+        // "Array not declared: SIZEOF". Six tests of the suite die on that one gap. Only the AST is
+        // inspected here, so nothing is evaluated, which is what SizeOf requires.
+        if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
+           not (Node.GetChild(1).GetChild(0).NodeType in [antIdentifier, antMemberAccess, antDeref, antCast]) then
+        begin
+          // ⛔ A STRING LITERAL IS NOT A "STRING". fbc types "123456" as a ZSTRING * 7 and answers its
+          // BYTES (length + 1 for the terminator); we answered the 24-byte string DESCRIPTOR. The same
+          // is true of a literal reached through parentheses, which is how a macro hands one over.
+          // ⛔ THE DECLARED WIDTH IS ASKED FIRST, before the bank. InferExprBank knows the string
+          // intrinsics and nothing else, so a CONVERSION answered its default - FLOAT - and
+          // "SizeOf(CULng(0))" took the float arm and said 8 where fbc says 4; CByte and CShort the
+          // same. OperandWidthCode is the registry that DOES know them (and the narrow variables, the
+          // narrow fields, RGB), so it decides whenever it has an answer and the bank only fills in.
+          // ⛔ ...AND A FIXED-LENGTH STRING TYPE IS NOT A DESCRIPTOR. "SizeOf(ZString * 16)" arrives as
+          // an antBinaryOp of the type name and the capacity, which no width registry knows: all six
+          // spellings answered 8, the size of a handle, where fbc answers 16 / 9 / 16. Asked FIRST,
+          // because the registries below have a default and a default here is a wrong answer.
+          if (Node.GetChild(1).GetChild(0).NodeType = antBinaryOp) and
+             (Node.GetChild(1).GetChild(0).ChildCount = 2) and
+             (Node.GetChild(1).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+             (Node.GetChild(1).GetChild(0).GetChild(1).NodeType = antLiteral) then
+          begin
+            FieldSzConst := FixedStrTypeBytes(
+              UpperCase(VarToStr(Node.GetChild(1).GetChild(0).GetChild(0).Value)),
+              StrToInt64Def(VarToStr(Node.GetChild(1).GetChild(0).GetChild(1).Value), 0));
+            if FieldSzConst > 0 then
+            begin
+              Result := MakeSSAConstInt(FieldSzConst);
+              Exit;
+            end;
+          end;
+          FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(Node.GetChild(1).GetChild(0)));
+          if OperandWidthCode(Node.GetChild(1).GetChild(0)) = 0 then
+          case InferExprBank(Node.GetChild(1).GetChild(0)) of
+            srtString: if StringLiteralBytes(Node.GetChild(1).GetChild(0), FieldSzConst) then
+                       else FieldSzConst := TypeSizeBytes('STRING');
+            srtFloat:  if IsSingleExpr(Node.GetChild(1).GetChild(0)) then FieldSzConst := 4
+                       else FieldSzConst := 8;
+          else
+            FieldSzConst := 8;
+          end;
+          if FieldSzConst <= 0 then FieldSzConst := 8;
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
         end;
         if (UpperCase(ArrName) = 'SIZEOF') and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and (Node.GetChild(1).ChildCount = 1) and
@@ -6108,37 +7060,49 @@ begin
           // the value's length; the two forms are distinguished in TryUDTFieldSizeConst.
           if TryUDTFieldSizeConst(Node.GetChild(1).GetChild(0), True, FieldSzConst) then
           begin
-            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FieldSzConst), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(FieldSzConst);             // a CONSTANT, not a loaded register
             Exit;
           end;
           if Node.GetChild(1).GetChild(0).NodeType <> antIdentifier then
             Exit;    // a member access we cannot size: fall out rather than answer nonsense
           ArrName2 := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
-          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
+          // ⛔⛔ SIZEOF ANSWERS A CONSTANT, AND IT HAS TO *BE* ONE. Every branch below already computes
+          // a number at compile time; loading it into a REGISTER made the result an svkRegister, so
+          // every caller that asks "is this a compile-time integer?" answered NO. The one that showed
+          // it: an array bound. "Dim a(0 To LIMIT \ SizeOf(T))" was not seen as constant at all - the
+          // array was sized at RUN TIME where fbc sizes it statically, and every rule keyed on constant
+          // bounds stepped over it, the "Array too big" cap included ("LIMIT \ 32" folded; the same
+          // expression with SizeOf did not).
+          if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
+            // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (FConstStrBytes).
+            Result := MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8))
+          else if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
              ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(8)
           // SIZEOF of a VARIABLE is the size of its declared type, not of the handle/slot holding it:
           // a UDT instance answers its type's C size (fbc: SizeOf(q1) = SizeOf(Q)), a declared numeric
           // or pointer scalar its declared width. A type NAME still wins over a same-named variable.
           else if (FindUDT(ArrName2) < 0) and (VarRecordTypeName(ArrName2) <> '') then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(VarRecordTypeName(ArrName2))),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(TypeSizeBytes(VarRecordTypeName(ArrName2)))
           else if (FindUDT(ArrName2) < 0) and (DeclaredScalarLenBytes(ArrName2) >= 0) then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2))
           else if (FindUDT(ArrName2) < 0) and (FixedLenVarSizeBytes(ArrName2) >= 0) then
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(FixedLenVarSizeBytes(ArrName2)),
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+            Result := MakeSSAConstInt(FixedLenVarSizeBytes(ArrName2))
           else
-            EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TypeSizeBytes(ArrName2)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSAConstInt(TypeSizeBytes(ArrName2));
           Exit;
         end;
 
         // FreeBASIC function pointer "fp(args)": an indirect call through the variable's entry-PC value.
         // Checked before the FUNCTION/array paths (the name is a local variable, not a declared proc).
-        if FFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0 then
+        // ⛔ ...BUT NOT WHEN THE NODE IS THE SYNTHETIC "name(0)" OF A SHARED SCALAR. A DIM SHARED is
+        // array-backed and every READ of it is rewritten to element 0 of that backing, which has the
+        // very shape of an indirect call: "Dim Shared cl As Sub()" then merely PRINTING cl called
+        // through it - and a null procptr calls PC 0, which is the start of the module, so the program
+        // silently restarted for ever. SHAREDELEM is the marker MakeSharedScalarAccess already puts
+        // there for the same reason on the string-subscript path.
+        if (FFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0) and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') then
         begin
           Result := EmitFuncPtrCall(UpperCase(ArrName), FFuncPtrSigs.Values[UpperCase(ArrName)], Node.GetChild(1));
           Exit;
@@ -6207,6 +7171,30 @@ begin
           Exit;
         end;
 
+        // ⭐ "Put(#f, pos, var)" as a FUNCTION - fbc answers 0 on success, and its own suite writes it.
+        // GET reaches the expression parser as a statement token and is built there; PUT is not a
+        // reserved word at all, so it arrives HERE as an ordinary call, exactly like NAME/RUN/CHAIN
+        // below. Built into the node the STATEMENT uses (child0 = handle, child1 = variable,
+        // child2 = position) so the one lowering runs, and answered with 0.
+        if FModernMode and (UpperCase(ArrName) = 'PUT') and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1) <> nil) and (Node.GetChild(1).ChildCount >= 3) then
+        begin
+          TempNode := TASTNode.Create(antPrintFile, Node.Token);
+          try
+            TempNode.Attributes.Values['PUTBIN'] := '1';
+            TempNode.Attributes.Values['HASPOS'] := '1';
+            TempNode.AddChild(Node.GetChild(1).GetChild(0).Clone);   // handle
+            TempNode.AddChild(Node.GetChild(1).GetChild(2).Clone);   // variable
+            TempNode.AddChild(Node.GetChild(1).GetChild(1).Clone);   // position
+            ProcessPrintFile(TempNode);
+          finally
+            TempNode.Free;
+          end;
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+
         // FreeBASIC variadic-argument macros: CVA_START/CVA_ARG/CVA_COPY/CVA_END. They parse as array
         // accesses (none is a registered keyword), and a statement-level one reaches here too - the
         // statement dispatcher lowers a bare call through ProcessExpression and discards the result.
@@ -6251,6 +7239,14 @@ begin
         if FModernMode and ((UpperCase(ArrName) = kSADD) or (UpperCase(ArrName) = kSTRPTR)) and
            (ArrayIndexOf(ArrName) < 0) and (Node.GetChild(1).ChildCount >= 1) then
         begin
+          // ⭐ ...unless the argument HAS a real buffer, in which case that address IS the answer and it
+          // is the same one every time. See the note beside VARPTR in CollectDimVarBanks for why a
+          // fixed-length string is backed at all.
+          if RawZStringBufAddr(Node.GetChild(1).GetChild(0), ArgValue) then
+          begin
+            Result := EnsureIntRegister(ArgValue);
+            Exit;
+          end;
           ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -6342,7 +7338,7 @@ begin
             begin
               if FUDTs[RecUDTIdx].IsUnion then
                 ValCode := 0                        // every member of a union begins at byte 0
-              else if UDTCLayout(RecUDTIdx, RecLayoutOfs, RecLayoutSize) then
+              else if UDTCLayout(RecUDTIdx, RecLayoutOfs, RecLayoutSize, True) then   // OFFSETOF reports
                 ValCode := RecLayoutOfs[RecFieldIdx]
               else
                 ValCode := RecFieldIdx * 8;         // shape we cannot image: the answer we used to give
@@ -6916,7 +7912,11 @@ begin
 
         // FreeBASIC RAW pointer indexing: "p[i]" where p is an Allocate'd raw pointer. The byte address
         // is p + i*SizeOf(pointee); load SizeOf(pointee) bytes from the raw heap with the pointee's type.
-        if (ArrayIndexOf(ArrName) < 0) and IsRawPtr(ArrName) and
+        // ⛔ ...and never on the SYNTHETIC element-0 access of a backing array (SHAREDELEM): that node
+        // is how the backing is READ, so re-reading it as a pointer index recurses forever. The
+        // marker exists for exactly this hazard on the string-byte branch - this is the second one.
+        if (not NameIsRealArray(ArrName)) and IsRawPtr(ArrName) and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));   // raw-scaled (see helper)
@@ -6935,7 +7935,11 @@ begin
 
         // FreeBASIC pointer indexing: "p[i]" (also "p(i)") where p is a declared pointer, not an array.
         // Lower to *(p + i): compute the address then load the pointee with p's declared bank.
-        if (ArrayIndexOf(ArrName) < 0) and (ManagedPtrPointee(ArrName) <> '') and
+        // ⛔ ...and never on the SYNTHETIC element-0 access of a backing array (SHAREDELEM): that node
+        // is how the backing is READ, so re-reading it as a pointer index recurses forever. The
+        // marker exists for exactly this hazard on the string-byte branch - this is the second one.
+        if (not NameIsRealArray(ArrName)) and (ManagedPtrPointee(ArrName) <> '') and
+           (Node.Attributes.Values['SHAREDELEM'] <> '1') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
@@ -6957,6 +7961,11 @@ begin
           else
             EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
+          // ⛔ "p[i]" IS "*(p + i)" and owes the pointee's width and sign exactly as much. Closing the
+          // rule on "*p" alone would have left the subscript spelling of the same read still wrong -
+          // one path having a rule its sibling does not is the shape this codebase keeps paying for.
+          if FuncRetType = srtInt then
+            Result := ApplyNarrowCode(TypeNameWidthCode(UpperCase(PointeeTypeOf(ArrName))), Result);
           Exit;
         end;
 
@@ -7012,6 +8021,16 @@ begin
         end;
 
         ArrayIdx := ArrayIndexOf(ArrName);
+        // ⛔ ...AND A MEMBER ARRAY OF THIS WINS OVER A MODULE ARRAY OF THE SAME NAME. The rewrite used
+        // to be tried only when NOTHING of that name existed, so "Dim Shared arr(0 To 3)" beside a type
+        // with an array field "arr" made "arr(1) = 9" inside that type's own method write the GLOBAL -
+        // the array half of the rule m706 put right for a scalar field. A LOCAL or block-scoped array
+        // still wins: it carries a MANGLED name, and only the flat module entry answers here.
+        if ArraySlotIsModuleFlat(ArrayIdx, ArrName) and TryImplicitThisArrayNode(Node, ThisFieldNode) then
+        begin
+          try ProcessExpression(ThisFieldNode, Result); finally ThisFieldNode.Free; end;
+          Exit;
+        end;
         // ⚠️ begin/end, not a bare "if ... then if ...": the raise below belongs to THIS test, and
         // leaving it dangling made it unconditional - every array access in the corpus raised
         // "Array not declared" and 205 programs went red at once.
@@ -7028,6 +8047,23 @@ begin
 
         ArrInfo := FProgram.GetArray(ArrayIdx);
         IndicesNode := Node.GetChild(1);  // antExpressionList
+
+        // ⭐ AN INDEX LIST MUST HAVE AS MANY INDICES AS THE ARRAY HAS DIMENSIONS. fbc: "error 36:
+        // Wrong number of dimensions". "Dim a(Any)" is rank 1 and "a(0, 0)" is an error; so is "a(0)"
+        // on a rank-2 one - and we answered 0 for both, silently, because the linear index folded to
+        // something in range. ⛔ An array PARAMETER is exempt: it aliases whatever the caller passed
+        // and its local DimCount is a placeholder, not a promise.
+        // ⛔ A name that reached here MANGLED - a block-scoped or STATIC-hoisted array carries a dotted
+        // key - is not the name the registry was written under, and asking anyway applies a fact keyed
+        // on the BARE name to another declaration's array. fbc's own dim/array_ellipsis_init declares
+        // "static array(...)" in four sibling Scopes and was refused for it. Not our question: skip.
+        if (Pos('.', ArrName) = 0) and
+           (FRankStatedArrays.IndexOf(UpperCase(ArrName)) >= 0) and
+           (ArrInfo.DimCount >= 1) and (IndicesNode.ChildCount >= 1) and
+           (IndicesNode.ChildCount <> ArrInfo.DimCount) and
+           (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+          raise Exception.CreateFmt('Wrong number of dimensions for %s: it has %d, this access ' +
+            'gives %d', [ArrName, ArrInfo.DimCount, IndicesNode.ChildCount]);
 
         // Evaluate each index expression
         SetLength(Indices, IndicesNode.ChildCount);
@@ -7177,14 +8213,35 @@ begin
   {$ENDIF}
 end;
 
+function TSSAGenerator.IsTypeCtorTemporary(Node: TASTNode): Boolean;
+// True when Node is an anonymous UDT temporary written as a type constructor - "type<T>( args )" or
+// the bare "T( args )" with no array of that name in scope. The same guard the temporary's own
+// lowering uses, asked as a question so the places that must REFUSE one ask it the same way.
+var
+  Nm: string;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 1) then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  // ⛔ ...AND A PROCEDURE OF THAT NAME WINS. "Type T ... End Type : Sub t() ... : t()" is legal in fbc
+  // and calls the SUB; here the type name matched first, so "t()" built an anonymous temporary and
+  // threw it away - the call SILENTLY did not happen, with no diagnostic anywhere. It took a module
+  // constructor to notice, because there the missing call is all the constructor did. The explicit
+  // "type<T>( ... )" spelling carries TYPECTOR and is unaffected: that one names a type on purpose.
+  Result := (Node.Attributes.Values['TYPECTOR'] = '1') or
+            ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0) and (FProcedureNames.IndexOf(Nm) < 0));
+end;
+
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // Frame diet (same disease as ProcessExpression/ProcessStatement): the rare lvalue shapes and
 // probes live in their own Try*/Process* frames below, so THIS frame — entered for every
 // assignment — keeps only the managed locals of the common scalar path.
 var
   VarNode, ExprNode, SharedAssign, CastNode, UnwrapAssign: TASTNode;
-  VarName: string;
-  ExprValue, VarReg: TSSAValue;
+  ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
+  VarName, CastTypeU, TgtTypeU: string;
+  ExprValue, VarReg, DstHandleV, SrcHandleV: TSSAValue;
   CopyOp: TSSAOpCode;
 begin
   // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
@@ -7197,6 +8254,57 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // ⭐ "Str(x) = expr" / "WStr(x) = expr". Str of something that is ALREADY a string is the identity,
+  // and fbc accepts it where an lvalue is expected - its own suite writes "Swap Str(u1), Str(u2)" over
+  // a UDT that converts to a zstring, and the whole statement fell out here as "Array not declared:
+  // STR". A UDT target is written THROUGH its Cast; anything else is the place itself.
+  // ⛔ The UDT case is NOT reached by unwrapping to "u = expr": fbc REFUSES that spelling, and turning
+  // it into a write would accept a program the oracle rejects.
+  SharedAssign := StrConversionOperand(VarNode);
+  if SharedAssign <> nil then
+  begin
+    if TryStoreThroughStringCast(SharedAssign, ExprNode) then Exit;
+    UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+    try
+      UnwrapAssign.AddChild(SharedAssign.Clone);
+      UnwrapAssign.AddChild(ExprNode.Clone);
+      ProcessAssignment(UnwrapAssign);
+    finally
+      UnwrapAssign.Free;
+    end;
+    Exit;
+  end;
+  // ⭐ "UDT.a(i) = v" / "x.a(i) = v" where a is a STATIC ARRAY member: the target is the backing global
+  // array under its dotted name. Asked here rather than in ProcessMemberStore because this shape is an
+  // antArrayAccess over the member access and never reaches that routine at all - the READ half went
+  // through the expression path and the WRITE half did not, which is how the member kept answering 0.
+  SharedAssign := RewriteStaticMemberArray(VarNode);
+  if SharedAssign <> nil then
+  begin
+    try
+      UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+      try
+        UnwrapAssign.AddChild(SharedAssign.Clone);
+        UnwrapAssign.AddChild(ExprNode.Clone);
+        ProcessAssignment(UnwrapAssign);
+      finally
+        UnwrapAssign.Free;
+      end;
+    finally
+      SharedAssign.Free;
+    end;
+    Exit;
+  end;
+  // ⛔ A TEMPORARY IS NOT AN LVALUE. "type<UDT>( 1 ) = x" and its "*@type<UDT>( 1 ) = x" spelling are
+  // errors in fbc (sf.net #801), while "type<UDT>( 0 ).i = 1" is legal - the difference is whether the
+  // target is the temporary ITSELF or a member of it, which is why the test is on the target node and
+  // not on the presence of a temporary anywhere in the statement.
+  if IsTypeCtorTemporary(VarNode) or
+     ((VarNode.NodeType = antDeref) and (VarNode.ChildCount >= 1) and
+      (VarNode.GetChild(0).NodeType = antProcAddress) and (VarNode.GetChild(0).ChildCount = 1) and
+      IsTypeCtorTemporary(VarNode.GetChild(0).GetChild(0))) then
+    raise Exception.Create(
+      'A type<T>(...) temporary is not assignable: it has no storage beyond the statement.');
   // Parentheses around an LVALUE are FreeBASIC's own spelling and carry no meaning of their own: the
   // manual wraps a byref-returning call that way and notes the enclosing parentheses are REQUIRED
   // there, to tell the assignment apart from a call whose result is discarded. Left wrapped, the target
@@ -7334,6 +8442,22 @@ begin
     // A UDT that could not be reached through an assignable cast operator must NOT fall through to the
     // plain path: the store would land on the object itself (or, if the type also declares one, run its
     // LET operator — a different operator answering for the one that was written). Say so instead.
+    // ⭐ "Cast(<Base>, <derived>) = <base value>": FreeBASIC's UPCAST SLICE assignment. It writes the
+    // BASE PART of the object and leaves the derived fields alone - the shape fbc's own suite uses for a
+    // constructor that takes its base by reference ("Cast( udt2, This ) = u2"). It is NOT the
+    // "Operator Cast() ByRef" case: there is no operator, the cast NAMES an ancestor of the target, and
+    // the slice is exactly what EmitRecordCopy already does when handed the ancestor's field set - it
+    // says so in its own comment. Asked BEFORE the refusal below, which was rejecting a legal program.
+    CastTypeU := UpperCase(Trim(VarToStr(VarNode.Value)));
+    TgtTypeU := UpperCase(ObjectTypeName(VarNode.GetChild(0)));
+    if (CastTypeU <> '') and (TgtTypeU <> '') and (FindUDT(CastTypeU) >= 0) and
+       IsSubtypeOf(TgtTypeU, CastTypeU) and
+       ResolveRecordObject(VarNode.GetChild(0), DstHandleV, TgtTypeU) and
+       ResolveRecordObject(ExprNode, SrcHandleV, CastTypeU) then
+    begin
+      EmitRecordCopy(DstHandleV, EnsureIntRegister(SrcHandleV), FindUDT(UpperCase(Trim(VarToStr(VarNode.Value)))));
+      Exit;
+    end;
     if (ObjectTypeName(VarNode.GetChild(0)) <> '') and
        (FindUDT(ObjectTypeName(VarNode.GetChild(0))) >= 0) then
       raise Exception.CreateFmt('Cannot assign through CAST to %s: it needs an "Operator Cast() BYREF ' +
@@ -7525,18 +8649,50 @@ begin
     // FreeBASIC BYREF result: return the ADDRESS of the named (address-backed) variable, not its
     // value, so the caller can read or write through it. The returned variable must be address-backed
     // (a SHARED/global scalar or one whose address is taken); a local would dangle (v1: not enforced).
+    // ⭐ "Function = ByVal p" SAYS THE VALUE IS THE ADDRESS. The explicit-BYVAL spelling of a
+    // byref-return names what p POINTS AT, so nothing is taken - p already holds where the reference
+    // goes. It is the one spelling that lets a LOCAL pointer be returned byref, and taking @p instead
+    // would hand back the address of a slot that dies with the frame. Asked FIRST: p is an identifier
+    // and would otherwise fall into the branch below. fbc suite functions/return-byref, explicitByval.
+    if FCurrentProcByrefRet and
+       (UpperCase(ExprNode.Attributes.Values['ARGPASSMODE']) = 'BYVAL') then
+    begin
+      ProcessExpression(ExprNode, ExprValue);
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
+      Exit;
+    end;
     if FCurrentProcByrefRet and (ExprNode.NodeType = antIdentifier) then
     begin
       // Returning an address-carrying BYREF param yields the address it already holds (a reference into
       // the caller's variable, the min(a,b)=0 idiom); any other named var returns its backing address.
       if IsAddrParam(VarToStr(ExprNode.Value)) then
         EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(ExprNode.Value))))
+      // ...and a bare FIELD name, which inside a method body means "this.<field>". Only the spelled-out
+      // "This.f" reached the field branch below, so "Operator Cast() ByRef As ZString : Function = _data"
+      // asked EmitVarAddress for a variable that does not exist and staged 0 - which the caller then
+      // dereferenced. The implicit-THIS rewrite stands aside on its own when a param or a local DIM
+      // shadows the field, so it is safe to try before the plain-variable reading.
+      else if TryImplicitThisField(VarToStr(ExprNode.Value), ExprNode.Token, ThisFieldNode) then
+      begin
+        try
+          EmitFieldAddress(ThisFieldNode, ExprValue);
+          EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
+        finally
+          ThisFieldNode.Free;
+        end;
+      end
       else
         EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
       Exit;
     end;
     // "Operator = This.buf[i]" — the same addressable element the RETURN form accepts.
     if FCurrentProcByrefRet and TryEmitIndexedElementAddress(ExprNode, ExprValue) then
+    begin
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
+      Exit;
+    end;
+    // ...and "Operator = *<expr>", where the address is the pointer and nothing is taken.
+    if FCurrentProcByrefRet and TryEmitDerefTargetAddress(ExprNode, ExprValue) then
     begin
       EmitXferStore(srtInt, XFER_RESULT_SLOT, ExprValue);
       Exit;
@@ -7549,6 +8705,22 @@ begin
       EmitFieldAddress(ExprNode, ExprValue);
       EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
       Exit;
+    end;
+    // FreeBASIC "Function = Type(args)": the bare Type() carries no <T>, so its type comes from the
+    // FUNCTION's UDT return type - exactly as the "Return Type(args)" spelling fills it, and as
+    // "Dim v As T = Type(args)" fills it from the declared type. ⛔ Without this the constructor kept
+    // an EMPTY type name and the SSA read it as an array access: "Array not declared:" with no name.
+    // ⚠️ THREE other spellings of the same thing already worked - "Return Type(...)", "<fname> =
+    // Type(...)" and the DIM - so only this one refused, and only when the result was written this way.
+    // ⛔ ONLY when the UDT result type is known HERE. This site is reached before the one that knows it
+    // for the "Function = ..." spelling, and a scalar fallback taken here answered "DOUBLE" for a
+    // function returning a UDT - the temporary then died as "Array not declared: DOUBLE". The scalar
+    // case is answered further down, at the RETURN site that does know.
+    if (FCurrentProcRetRecType <> '') and (ExprNode <> nil) and
+       (ExprNode.Attributes.Values['INFERTYPE'] = '1') and (ExprNode.ChildCount >= 1) then
+    begin
+      ExprNode.GetChild(0).Value := FCurrentProcRetRecType;
+      ExprNode.Attributes.Values['INFERTYPE'] := '';
     end;
     ProcessExpression(ExprNode, ExprValue);
     // V3: a UDT result is copied (by value) into the caller-allocated result instance; a scalar
@@ -7790,8 +8962,27 @@ var
   RawFieldPointee, RawPtrName: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
-  DerefTgt: TASTNode;
+  DerefTgt, CancelTgt: TASTNode;
 begin
+  // "*@x = expr" is "x = expr" - see the note in the antDeref arm of ProcessExpression. Both halves
+  // need it, or the read of a place works and the write to the same place does not.
+  CancelTgt := DerefOfAddrOfTarget(VarNode);
+  if CancelTgt <> nil then
+  begin
+    try
+      DerefTgt := TASTNode.Create(antAssignment, VarNode.Token);
+      try
+        DerefTgt.AddChild(CancelTgt.Clone);
+        DerefTgt.AddChild(ExprNode.Clone);
+        ProcessAssignment(DerefTgt);
+      finally
+        DerefTgt.Free;
+      end;
+    finally
+      CancelTgt.Free;
+    end;
+    Exit;
+  end;
   // FreeBASIC RAW pointer-deref store through a FIELD: "*obj.field = expr" / "*(@obj.field[i]) = expr"
   // where the field is a raw "<scalar> PTR". Store SizeOf(pointee) bytes to the raw heap. Type-based (a
   // field has no pointer name, so the name-based RawPtrExprName branch below cannot resolve it).
@@ -7936,6 +9127,7 @@ var
   VarName, RawFieldPointee, DstRecType: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
+  PtrIdxRaw: Boolean;           // "(expr)[i] = v": is the base a RAW address or a managed one?
 begin
   // "(*p)[i] = c" where p is a ZSTRING/WSTRING pointer: one character at that address.
   if (VarNode.ChildCount >= 2) and (VarNode.GetChild(1).ChildCount = 1) and
@@ -7957,6 +9149,12 @@ begin
   // lvalue below does. This is what the operator is FOR — without it the assignment fell through to the
   // array-store path, which had no array and dropped the write in silence.
   if ProcessIndexOperatorStore(VarNode, ExprNode) then Exit;
+
+  // ...and the same store through a BYREF-returning METHOD, "obj.m() = expr". The free-FUNCTION form
+  // just below has always worked; the method form matched no shape here and the write was dropped in
+  // SILENCE - "t.nref() = 99" left t.n untouched and said nothing. One more place where a rule lived in
+  // one path and not in the other beside it.
+  if ProcessByrefMethodStore(VarNode, ExprNode) then Exit;
 
   // FreeBASIC BYREF function result as an lvalue: "f(args) = expr". The call returns the address of
   // the referenced variable; store expr through it (parsed like an array access / call target).
@@ -8013,11 +9211,54 @@ begin
     Exit;
   end;
 
+  // ⛔ "( expr )[i] = value" - A PARENTHESISED BASE, the WRITE half of the read branch in the
+  // antArrayAccess dispatcher. Both store branches below key off the NAME of a declared pointer, so
+  // "(*pp)[0] = 99" with "pp As Integer Ptr Ptr" wrote NOTHING and said nothing - and a lost write is
+  // worse than the wrong read that named the defect. Asked first, for the same reason the read branch
+  // is: nothing further down recognises the shape. DIVERGENZE 54.
+  if (VarNode.ChildCount >= 2) and
+     (VarNode.GetChild(0) <> nil) and (VarNode.GetChild(0).NodeType = antParentheses) and
+     (VarNode.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+     (VarNode.GetChild(1).ChildCount = 1) and
+     (DerefedType(VarNode.GetChild(0)) <> '') then
+  begin
+    DstRecType := UpperCase(DerefedType(VarNode.GetChild(0)));
+    VarReg := EmitPointerValueIndexAddress(VarNode.GetChild(0), DstRecType,
+                                           VarNode.GetChild(0), VarNode.GetChild(1), PtrIdxRaw);
+    ProcessExpression(ExprNode, ExprValue);
+    // A UDT pointee: base+i IS element i's record handle, so the store is a value copy, exactly as it
+    // is for a named pointer to UDT.
+    if (FindUDT(DstRecType) >= 0) and (ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtInt) then
+    begin
+      EmitRecordCopy(VarReg, ExprValue, FindUDT(DstRecType));
+      Exit;
+    end;
+    DerefBank := TypeNameToBank(DstRecType, '');
+    if PtrIdxRaw then
+    begin
+      if DerefBank = srtFloat then
+        EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(DstRecType)))
+      else
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(DstRecType)));
+    end
+    else
+      case DerefBank of
+        srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue), MakeSSAValue(svkNone));
+        srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue), MakeSSAValue(svkNone));
+      else
+        EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue), MakeSSAValue(svkNone));
+      end;
+    Exit;
+  end;
+
   // FreeBASIC RAW pointer indexing as an lvalue: "p[i] = expr" where p is Allocate'd. Store SizeOf(T)
   // bytes at p + i*SizeOf(T) into the raw heap.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (not NameIsRealArray(VarToStr(VarNode.GetChild(0).Value))) and
+     (VarNode.Attributes.Values['SHAREDELEM'] <> '1') and
      IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
@@ -8040,7 +9281,8 @@ begin
   // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
-     (ArrayIndexOf(VarToStr(VarNode.GetChild(0).Value)) < 0) and
+     (not NameIsRealArray(VarToStr(VarNode.GetChild(0).Value))) and
+     (VarNode.Attributes.Values['SHAREDELEM'] <> '1') and
      (ManagedPtrPointee(VarToStr(VarNode.GetChild(0).Value)) <> '') and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
@@ -8101,6 +9343,79 @@ begin
     end;
     EmitInstruction(ssaStoreTIS, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
+end;
+
+function TSSAGenerator.EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
+  ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
+// The MANAGED-record half of "Allocate/CAllocate for a UDT pointer" (Option B), as a VALUE: allocate
+// the block, give every record its member-array / nested-UDT backing, and hand back the handle.
+//
+// ⛔ EXTRACTED because it had ONE caller and needed two. TryAllocAssign applied it when the target was
+// a VARIABLE; a FIELD target ("a->b = CAllocate(Len(uc))") never reached it and stored the RAW byte
+// address instead, so the very next "a->b->plain" read a byte offset through the managed record path
+// and faulted. Written with a temporary in between - "dim t As uc Ptr = CAllocate(...) : a->b = t" -
+// the same program worked, because THERE the conversion happened at the DIM.
+var
+  CountReg, BytesVal, ProdReg: TSSAValue;
+  UDTIdx: Integer;
+  AllocOffsets: TInt64Array;
+  AllocElemSize: Int64;
+begin
+  Result := False;
+  ExprValue := MakeSSAValue(svkNone);
+  if (RecType = '') or (AllocFuncU = 'REALLOCATE') then Exit;
+  if FindUDT(RecType) < 0 then Exit;
+    UDTIdx := FindUDT(RecType);
+    // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
+    // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
+    // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
+    // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
+    // How many records? FreeBASIC's CAllocate is calloc's shape with a DEFAULTED second argument
+    // (Declare Function CAllocate (ByVal count As UInteger, ByVal size As UInteger = 1)), so the
+    // manual's own idiom passes ONE argument holding the TOTAL BYTE COUNT:
+    //     the_rectangle = CAllocate( 5 * Len( rect_type ) )
+    // Reading that single argument as a record count gave 5*Len(T) records; ignoring it, as this did,
+    // gave exactly ONE - so p[0] worked and every other index walked off the end of the allocation
+    // into an Access Violation. That is the manual's udt/with-2, and any C-style array of UDTs.
+    //
+    // Both forms are the same question in bytes, so ask it that way: records = total bytes DIV the
+    // type's C-layout size, floored at 1. With "CAllocate(n, Len(T))" the division gives n back; with
+    // "CAllocate(n * Len(T))" it gives n; with Allocate's single byte count it gives the right number
+    // too instead of assuming one.
+    // TWO-argument "CAllocate(count, size)" keeps reading argument 0 as the count, exactly as before:
+    // that form was already right, and the guards m367/m428 pin it. Only the ONE-argument form is
+    // reinterpreted, because only it was wrong.
+    CountReg := MakeSSAConstInt(1);
+    if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
+       (ExprNode.GetChild(1).ChildCount >= 2) then
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)
+    else if (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount = 1) and
+       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize) and (AllocElemSize > 0) then
+    begin
+      ProcessExpression(ExprNode.GetChild(1).GetChild(0), BytesVal);
+      // Divide ROUNDING UP - "(bytes + size - 1) \ size" - so any non-zero request yields at least
+      // one usable instance. That matters for the linked-list idiom "p = Allocate(Len(T))" if Len ever
+      // rounds below the layout size, and it costs one add.
+      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
+      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, CountReg, ProdReg,
+                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
+    end;
+    ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
+                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                                    
+                                    or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
+                                    or ((Int64(UDTIdx) and $FFFF) shl 48)),
+                    MakeSSAValue(svkNone));
+    // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
+    // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
+    // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
+    // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
+  EmitRecordBlockInit(ExprValue, CountReg, UDTIdx, False);   // Allocate/CAllocate construct nothing
+  Result := True;
 end;
 
 function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
@@ -8166,62 +9481,12 @@ begin
       Exit;
     end;
   end;
-  if (LhsRecType <> '') and (AllocFuncU <> 'REALLOCATE') then
+  if EmitAllocRecordBlockValue(LhsRecType, AllocFuncU, ExprNode, ExprValue) then
   begin
-    UDTIdx := FindUDT(LhsRecType);
-    // Record COUNT: CALLOCATE(count, SizeOf(T)) allocates a block of `count` records (arg 0); ALLOCATE
-    // (single byte-count arg) allocates one. A block of N CONSECUTIVE shared records makes "p[i]" (p + i)
-    // index the i-th; a single record covers the linked-list/tree node case. Both live in the shared
-    // region (handle non-zero, honours "p <> 0"; persists past the frame like Allocate).
-    // How many records? FreeBASIC's CAllocate is calloc's shape with a DEFAULTED second argument
-    // (Declare Function CAllocate (ByVal count As UInteger, ByVal size As UInteger = 1)), so the
-    // manual's own idiom passes ONE argument holding the TOTAL BYTE COUNT:
-    //     the_rectangle = CAllocate( 5 * Len( rect_type ) )
-    // Reading that single argument as a record count gave 5*Len(T) records; ignoring it, as this did,
-    // gave exactly ONE - so p[0] worked and every other index walked off the end of the allocation
-    // into an Access Violation. That is the manual's udt/with-2, and any C-style array of UDTs.
-    //
-    // Both forms are the same question in bytes, so ask it that way: records = total bytes DIV the
-    // type's C-layout size, floored at 1. With "CAllocate(n, Len(T))" the division gives n back; with
-    // "CAllocate(n * Len(T))" it gives n; with Allocate's single byte count it gives the right number
-    // too instead of assuming one.
-    // TWO-argument "CAllocate(count, size)" keeps reading argument 0 as the count, exactly as before:
-    // that form was already right, and the guards m367/m428 pin it. Only the ONE-argument form is
-    // reinterpreted, because only it was wrong.
-    CountReg := MakeSSAConstInt(1);
-    if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
-       (ExprNode.GetChild(1).ChildCount >= 2) then
-      ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)
-    else if (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount = 1) and
-       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize) and (AllocElemSize > 0) then
-    begin
-      ProcessExpression(ExprNode.GetChild(1).GetChild(0), BytesVal);
-      // Divide ROUNDING UP - "(bytes + size - 1) \ size" - so any non-zero request yields at least
-      // one usable instance. That matters for the linked-list idiom "p = Allocate(Len(T))" if Len ever
-      // rounds below the layout size, and it costs one add.
-      ProdReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaAddInt, ProdReg, EnsureIntRegister(BytesVal),
-                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize - 1)), MakeSSAValue(svkNone));
-      CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaDivInt, CountReg, ProdReg,
-                      EnsureIntRegister(MakeSSAConstInt(AllocElemSize)), MakeSSAValue(svkNone));
-    end;
-    ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
-                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
-                                    
-                                    or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
-                                    or ((Int64(UDTIdx) and $FFFF) shl 48)),
-                    MakeSSAValue(svkNone));
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
     // deref from another procedure (or module level) sees the allocated record, not a stale 0.
     if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
-    // Give every record of the block its member-array/nested-UDT backing, as ssaRecordNew does for a
-    // plain instance -- AllocSharedRecordBlock only sizes the flat slots. Without this "p->item(i)"
-    // reaches an unallocated member array (handle 0) and faults. Allocate does NOT run the constructor
-    // (FreeBASIC gives raw, zeroed storage), so only the storage is set up.
-    EmitRecordBlockInit(GetOrAllocateVariable(VarName), CountReg, UDTIdx, False);   // Allocate/CAllocate construct nothing
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
@@ -8268,10 +9533,15 @@ begin
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
   begin
     VarName := VarToStr(Node.Value);
-    Result := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+    Result := StrCapOf(FFixedLenVars, VarName, 0);
     if Result > 0 then
     begin
-      if IsSharedScalar(VarName) or IsAddrLocal(VarName) or IsRefVar(VarName) or IsAddrParam(VarName) then
+      // ⭐ A SHARED or @-taken "String * n" is padded on store now (see TryFixedLenStore), so its read
+      // converts like any other fixed-length string: the two halves have to keep asking the same
+      // question. A RAW-backed one is a byte buffer with no padding, and a reference / parameter is
+      // somebody else's storage - those still decline.
+      if IsRefVar(VarName) or IsAddrParam(VarName) or IsRawModuleScalar(VarName) or
+         IsRawAddrLocal(VarName) or (VarRecordTypeName(VarName) <> '') then
         Result := 0
       else
         Wide := IsWStringVar(VarName);
@@ -8424,12 +9694,39 @@ var
   ExprValue, FixedCapReg, FixedTrunc: TSSAValue;
 begin
   Result := False;
-  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) then Exit;
-  if IsAddrLocal(VarName) and (RawZStringBufBytes(VarName) <= 0) then Exit;
+  // ⛔ A "String * n" WHOSE ADDRESS IS TAKEN IS STILL A "String * n". These two lines used to send it
+  // away unpadded - "Dim As String * 6 s : s = "ab" : Dim p As Any Ptr = @s" left LEN 2 where fbc
+  // leaves 6, at MODULE level and inside a procedure alike, and the identical program without the "@"
+  // was right. Taking an address is not a change of type; it only changes where the value LIVES, and
+  // padding it is the same three instructions wherever that is. DIVERGENZE 52 and 77 - one defect seen
+  // from its two sides, which is why they are cured in one place.
+  // ⚠️ The two backings still have to be written the way THEY are read: a SHARED scalar through
+  // element 0 of its array, an @-taken local through its per-frame record. Writing the variable's own
+  // register - what the tail of this routine does - would leave both of them untouched, which is the
+  // trap m617 had just been through with the MID statement.
+  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) then
+  begin
+    FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
+    if (FixedCap <= 0) or (VarRecordTypeName(VarName) <> '') then Exit;
+    ProcessStringExpression(ExprNode, ExprValue);
+    EmitSharedScalarStoreVal(VarName,
+      EmitFixedLenPad(EnsureStringRegister(ExprValue), FixedCap, IsWStringVar(VarName)));
+    Exit(True);
+  end;
+  if IsAddrLocal(VarName) and (RawZStringBufBytes(VarName) <= 0) then
+  begin
+    FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
+    if (FixedCap <= 0) or IsRawAddrLocal(VarName) then Exit;
+    ProcessStringExpression(ExprNode, ExprValue);
+    EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), AddrLocalHandle(VarName),
+                    EmitFixedLenPad(EnsureStringRegister(ExprValue), FixedCap, IsWStringVar(VarName)),
+                    MakeSSAConstInt(0));
+    Exit(True);
+  end;
   // "ZSTRING/WSTRING * n": truncate to n-1 characters (the nth cell is the terminator) and store as an
   // ordinary variable-length string — no padding, so LEN stays the content length as fbc reports it.
   // Codepoints for a WSTRING, bytes for a ZSTRING.
-  FixedCap := StrToIntDef(FZStringVars.Values[UpperCase(VarName)], -1);
+  FixedCap := StrCapOf(FZStringVars, VarName, -1);
   if FixedCap >= 0 then
   begin
     ProcessStringExpression(ExprNode, ExprValue);
@@ -8470,7 +9767,7 @@ begin
       EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit(True);
   end;
-  FixedCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+  FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
   if FixedCap > 0 then
   begin
     ProcessStringExpression(ExprNode, ExprValue);
@@ -8854,7 +10151,7 @@ begin
           // fixed-length target must still end up padded/cut to its capacity.
           if AnyFixedLen and not (IsSharedScalar(VarName) or IsAddrLocal(VarName)) then
           begin
-            InFixCap := StrToIntDef(FFixedLenVars.Values[UpperCase(VarName)], 0);
+            InFixCap := StrCapOf(FFixedLenVars, VarName, 0);
             if InFixCap > 0 then
               EmitInstruction(ssaCopyString, VarReg, EmitFixedLenPad(VarReg, InFixCap, False),
                               MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -8880,6 +10177,7 @@ function TSSAGenerator.TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Bool
 // FreeBASIC's FLOATING division, so "Const HALF = 1 / 2" must stay 0.5 and not become 0.
 var
   L, R: Int64;
+  Op: TASTNode;
 begin
   Result := False;
   Val := 0;
@@ -8894,6 +10192,40 @@ begin
     antIdentifier:
       Result := (FModuleConstVals <> nil) and
                 TryStrToInt64(FModuleConstVals.Values[UpperCase(VarToStr(Node.Value))], Val);
+    // ⛔ PARENTHESES ARE TRANSPARENT TO A CONSTANT. Without this case "(3) - 1" is not a constant at
+    // all - the fold declines on the left operand - and every caller that asks "is this bound / this
+    // initialiser a compile-time integer?" answers no for a shape a program actually writes. fbc's own
+    // odd-arg test declares "a(0 To (N)-1) As Byte" from a macro parameter, which is the normal way to
+    // write it; SizeOf of that type answered 8 instead of 3 because the BOUND would not fold, not
+    // because the layout was wrong.
+    antParentheses:
+      Result := (Node.ChildCount >= 1) and TryFoldConstIntExpr(Node.GetChild(0), Val);
+    // ⛔ SIZEOF IS A CONSTANT AND THIS FOLDER DID NOT KNOW IT. Every "array too big" test of fbc's
+    // suite writes its bound as "LIMIT \ SizeOf(T)", and the fold declined on the right operand - so
+    // the bound was not constant, the array was sized at run time, and no rule keyed on constant bounds
+    // ever saw it. Two spellings reach here: "SizeOf(T)" and "SizeOf(ZString * n)", the second an
+    // antBinaryOp of the type name and the capacity, whose size IS that capacity.
+    antArrayAccess, antFunctionCall:
+      begin
+        if UpperCase(VarToStr(Node.Value)) <> 'SIZEOF' then
+          if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antIdentifier) or
+             (UpperCase(VarToStr(Node.GetChild(0).Value)) <> 'SIZEOF') then Exit;
+        Op := Node;
+        while (Op.ChildCount > 0) and
+              (Op.GetChild(Op.ChildCount - 1).NodeType in [antExpressionList, antArgumentList]) do
+          Op := Op.GetChild(Op.ChildCount - 1);
+        if Op.ChildCount <> 1 then Exit;
+        Op := Op.GetChild(0);
+        if Op.NodeType = antIdentifier then
+          Val := TypeSizeBytes(UpperCase(VarToStr(Op.Value)))
+        else if (Op.NodeType = antBinaryOp) and (Op.ChildCount = 2) and
+                (Op.GetChild(0).NodeType = antIdentifier) and (Op.GetChild(1).NodeType = antLiteral) then
+          Val := FixedStrTypeBytes(UpperCase(VarToStr(Op.GetChild(0).Value)),
+                                   StrToInt64Def(VarToStr(Op.GetChild(1).Value), 0))
+        else
+          Exit;
+        Result := Val > 0;
+      end;
     antUnaryOp:
       begin
         if (Node.ChildCount < 1) or (Node.Token = nil) then Exit;
@@ -8950,6 +10282,7 @@ begin
   ArgList := Node.GetChild(0);
   if ArgList.ChildCount < 1 then Exit;
   NameNode := ArgList.GetChild(0);
+  if NameNode.NodeType = antMemberAccess then Exit;   // a member: not a compile-time constant here
   if NameNode.NodeType = antArrayAccess then
   begin
     if NameNode.ChildCount < 1 then Exit;
@@ -9001,6 +10334,18 @@ begin
   ArrInfoTmp := FProgram.GetArray(ArrayIdx);
   ArrInfo := ArrInfoTmp;
   IndicesNode := TargetNode.GetChild(1);  // antExpressionList
+  // ...and the WRITE half of the rule above: "a(0, 0) = x" on a rank-1 array is the same error 36.
+  // ⛔ A name that reached here MANGLED - a block-scoped or STATIC-hoisted array carries a dotted
+  // key - is not the name the registry was written under, and asking anyway applies a fact keyed
+  // on the BARE name to another declaration's array. fbc's own dim/array_ellipsis_init declares
+  // "static array(...)" in four sibling Scopes and was refused for it. Not our question: skip.
+  if (Pos('.', ArrName) = 0) and
+     (FRankStatedArrays.IndexOf(UpperCase(ArrName)) >= 0) and
+     (ArrInfo.DimCount >= 1) and (IndicesNode.ChildCount >= 1) and
+     (IndicesNode.ChildCount <> ArrInfo.DimCount) and
+     (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+    raise Exception.CreateFmt('Wrong number of dimensions for %s: it has %d, this access gives %d',
+      [ArrName, ArrInfo.DimCount, IndicesNode.ChildCount]);
 
   // Evaluate each index expression
   SetLength(Indices, IndicesNode.ChildCount);
@@ -9140,6 +10485,12 @@ begin
   if TargetNode.GetChild(0).NodeType <> antIdentifier then Exit;
   ArrName := VarToStr(TargetNode.GetChild(0).Value);
 
+  // ⭐ "arr(i) = @fun" where arr is an ARRAY OF PROCEDURE POINTERS: the fourth destination that knows
+  // which overload it wants (after a DIM, a funcptr FIELD and a funcptr PARAMETER). Without it the
+  // arity rule took the first of a same-arity pair, in silence.
+  if FArrayFuncPtrSig.Values[ArrayFactKey(ArrName)] <> '' then
+    StampFuncPtrTarget(ExprNode, FArrayFuncPtrSig.Values[ArrayFactKey(ArrName)]);
+
   // ...and inside a method body the same write with no object: "s[i] = c" means "this.s[i] = c".
   if (ArrayIndexOf(ArrName) < 0) and (TargetNode.GetChild(1).NodeType = antExpressionList) and
      (TargetNode.GetChild(1).ChildCount = 1) and
@@ -9171,7 +10522,8 @@ begin
   // The bare-name rule above covers a scalar FIELD (a string byte write); an array element never
   // reaches it, because the name sits INSIDE the subscript node. The explicit "This.arr(i) = v"
   // always worked, which is what said the defect was in the resolution and not in member arrays.
-  if (ArrayIndexOf(ArrName) < 0) and TryImplicitThisArrayNode(TargetNode, ThisFieldNode) then
+  if ((ArrayIndexOf(ArrName) < 0) or ArraySlotIsModuleFlat(ArrayIndexOf(ArrName), ArrName)) and
+     TryImplicitThisArrayNode(TargetNode, ThisFieldNode) then
   begin
     try
       PropArgs := TASTNode.Create(antAssignment, Node.Token);
@@ -9190,7 +10542,7 @@ begin
   ProcessExpression(ExprNode, ExprValue);
 
   // B1.5: a narrow element type (DIM a(n) AS BYTE/SHORT/.../SINGLE) wraps/rounds the value on store.
-  j := FArrayElemWidth.IndexOf(UpperCase(ArrName));
+  j := FArrayElemWidth.IndexOf(ArrayFactKey(ArrName));
   if j >= 0 then
     ExprValue := ApplyNarrowCode(PtrInt(FArrayElemWidth.Objects[j]), ExprValue);
 
@@ -9314,8 +10666,39 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessDim(Node: TASTNode);
+// ⭐ A STATIC local declared inside a METHOD is lowered to a module-level DIM SHARED, and arrives here
+// with the whole module's context - no THIS type - though the declaration was written inside a method
+// and FreeBASIC judges it there. LowerStaticLocals leaves the owning type on the node; it is put back
+// for the length of this declaration, so a construction the method is entitled to perform (a PRIVATE
+// constructor of its own type) is not refused for standing at module scope.
+// ⚠️ Only when there is no THIS in force: a real module-level DIM must not borrow one.
 var
-  ArrName, DeclArrName, RefTgtType: string;
+  SavedThis: string;
+  i: Integer;
+begin
+  SavedThis := FCurrentThisType;
+  if (Node <> nil) and (Node.Attributes.Values['STATICTHISTYPE'] <> '') then
+  begin
+    // ...and the same declaration is destroyed at PROGRAM EXIT, long after this walk: remember which
+    // type it belonged to, under the mangled name the teardown will see.
+    for i := 0 to Node.ChildCount - 1 do
+      if (Node.GetChild(i).NodeType = antArrayDecl) and (Node.GetChild(i).ChildCount > 0) and
+         (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+        FStaticLocalOwner.Values[UpperCase(VarToStr(Node.GetChild(i).GetChild(0).Value))] :=
+          Node.Attributes.Values['STATICTHISTYPE'];
+    if FCurrentThisType = '' then
+      FCurrentThisType := Node.Attributes.Values['STATICTHISTYPE'];
+  end;
+  try
+    ProcessDimBody(Node);
+  finally
+    FCurrentThisType := SavedThis;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessDimBody(Node: TASTNode);
+var
+  ArrName, DeclArrName, RefTgtType, BlkScalarKey, FPSig: string;
   RefTgt: TASTNode;
   ElementType: TSSARegisterType;
   DimsNode, DimExpr, DimChild, ArrayDeclNode: TASTNode;
@@ -9378,6 +10761,14 @@ begin
   begin
     ArrayDeclNode := Node.GetChild(j);
 
+    // ⭐ A DECLARATION HOISTED BEFORE THE MODULE CONSTRUCTORS IS LOWERED EXACTLY ONCE. The mark is set
+    // by EmitSharedArrayAllocs and turned to '2' the first time through, so the module walk that meets
+    // the very same node afterwards steps over it instead of re-declaring (which would resize the array
+    // and drop whatever a constructor had put in it).
+    if ArrayDeclNode.Attributes.Values['HOISTEDDIM'] = '2' then Continue;
+    if ArrayDeclNode.Attributes.Values['HOISTEDDIM'] = '1' then
+      ArrayDeclNode.Attributes.Values['HOISTEDDIM'] := '2';
+
     // Only process antArrayDecl nodes (modern AST format)
     if ArrayDeclNode.NodeType <> antArrayDecl then
       Continue;
@@ -9388,19 +10779,50 @@ begin
 
     ArrName := VarToStr(ArrayDeclNode.GetChild(0).Value);
     DimsNode := ArrayDeclNode.GetChild(1);
+    // FB const-correctness on POINTERS. The check is asked BEFORE the name is recorded, so the source
+    // side is one of the declarations already seen and the destination is not yet itself.
+    if ArrayDeclNode.Attributes.Values['PTRQUALS'] <> '' then
+    begin
+      CheckPointerConstAssign(ArrayDeclNode);
+      FVarPtrQuals.Values[UpperCase(ArrName)] := ArrayDeclNode.Attributes.Values['PTRQUALS'];
+    end;
 
     // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": an ordinary int scalar that
     // holds a procedure entry PC (assigned via "= @func"); record its signature so "fp(args)" lowers to
     // an indirect call. Falls through to the typed-scalar path below (element type INTEGER).
     if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
-      FFuncPtrSigs.Values[UpperCase(ArrName)] :=
-        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET']
+    begin
+      // ⭐ AN ARRAY OF THEM FILES THE SIGNATURE OF ITS ELEMENT, not of itself. "Dim arr(0 To 1) As
+      // Function(...) As T" is N procedure pointers; putting the ARRAY's name in the scalar map made
+      // "arr(i)" read as an indirect call on the array itself. Its own registry, asked only by the
+      // double-subscript form "arr(i)( args )".
+      FPSig := ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' +
+               ArrayDeclNode.Attributes.Values['FPRET'] +
+               Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
+      // ⛔ AN ARRAY OF THEM IS NOT A FUNCPTR SCALAR. "Dim arr(0 To 1) As Function(...) As T" is N
+      // procedure pointers, and putting the ARRAY's name in this map made "arr(i)" read as an indirect
+      // call on the array itself. Its ELEMENT's signature is filed further down, in FArrayFuncPtrSig,
+      // under the scoped key the reader asks with - the registry that already exists for the named-alias
+      // spelling of the very same declaration.
+      if not ((DimsNode <> nil) and (DimsNode.NodeType = antDimensions)) then
+      begin
+        FFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig;
+        if not FInProcedure then FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig;
+      end;
+      // ...and "Dim p As Function(ByRef As B) As T = @fun" tells @fun WHICH overload it wants.
+      if ArrayDeclNode.ChildCount >= 3 then
+        StampFuncPtrTarget(ArrayDeclNode.GetChild(2), ArrayDeclNode.Attributes.Values['FPPARAMS']);
+    end
     // "DIM f AS X" where X is a named function-pointer type ("Type X As Function(...)"): f is a funcptr
     // with X's signature (X aliases to INTEGER, so the typed-scalar path below gives it the int bank).
     else if (DimsNode.NodeType = antIdentifier) and
             (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
+    begin
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
         FFuncPtrTypes.Values[UpperCase(VarToStr(DimsNode.Value))];
+      if not FInProcedure then
+        FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FFuncPtrSigs.Values[UpperCase(ArrName)];
+    end;
 
     // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
     // ordinary "DIM x AS T = expr" — no VAR-specific handling needed.)
@@ -9415,6 +10837,23 @@ begin
     // then be a clone, and a virtual call through it would dispatch on the CLONE's type. It printed
     // nothing at all, because the scalar reference machinery had made r an INT holding an address and
     // "r.method()" found no record there.
+    // ⛔ ...but NOT to a TEMPORARY. "Var ByRef x = type<UDT>( 123 )" and "Var ByRef x = UDT( )" are
+    // errors in fbc, and rightly: the temporary dies at the end of the statement and the reference
+    // would outlive it. Taking its address is legal as an ARGUMENT (the callee runs inside the
+    // statement), which is why the check belongs here at the BIND and not in the address-of path.
+    if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and (ArrayDeclNode.ChildCount >= 3) and
+       (ArrayDeclNode.GetChild(2).NodeType = antProcAddress) and
+       (ArrayDeclNode.GetChild(2).ChildCount = 1) and
+       (ArrayDeclNode.GetChild(2).GetChild(0).NodeType = antArrayAccess) and
+       (ArrayDeclNode.GetChild(2).GetChild(0).ChildCount >= 1) and
+       (ArrayDeclNode.GetChild(2).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+       ((ArrayDeclNode.GetChild(2).GetChild(0).Attributes.Values['TYPECTOR'] = '1') or
+        ((FindUDT(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).GetChild(0).GetChild(0).Value))) >= 0) and
+         (ArrayIndexOf(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).GetChild(0).GetChild(0).Value))) < 0))) then
+      raise Exception.CreateFmt(
+        'Cannot bind the reference "%s" to a temporary: the temporary does not outlive the statement.',
+        [ArrName]);
+
     if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and (ArrayDeclNode.ChildCount >= 3) and
        (DimsNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
     begin
@@ -9471,7 +10910,59 @@ begin
     // handle in the variable; a builtin type needs no allocation (type already recorded).
     if DimsNode.NodeType = antIdentifier then
     begin
-      RecTypeName := UpperCase(VarToStr(DimsNode.Value));
+      // ⛔ THE TYPE, NOT ITS SPELLING - the same rule the module-level backing needed. Every question
+      // below is about what this declaration IS (a UDT? a string? which raw width?), and a TYPE alias
+      // answers none of them under its own name: an @-taken local declared "Dim q As p" where
+      // "Type p As UDT Ptr" got a raw slot sized from an unknown type, and reading a second level over
+      // it faulted. FindUDT resolved the alias on its own, which is why the UDT arm worked and the
+      // rest did not.
+      RecTypeName := CanonicalType(UpperCase(VarToStr(DimsNode.Value)));
+      // ⭐ FILE THIS DECLARATION'S BACKING UNDER THE BLOCK THAT MADE IT, beside the bare-name entry.
+      // The @-taken marking is retroactive BY NAME (see MarkAddressTaken), so two sibling Scopes each
+      // declaring "a" both carry a mark and both read the SAME bare entry - and the first one's plain
+      // String was read through the second one's raw ZString backing, killing the program in the scope
+      // ABOVE the one with the pointer. The mark itself is already per-declaration; only the lookup
+      // was not. The bare entry is left exactly as it was, so anything without a block reads as before
+      // (BlockScalarName, DIVERGENZE 56).
+      if (InnermostBlockFrameIdx >= 0) and (FindUDT(RecTypeName) < 0) then
+      begin
+        BlkScalarKey := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, UpperCase(ArrName));
+        // "THIS block declared this name": the test that stops every one of the lookups below from
+        // falling back to a flat entry another declaration wrote. It is registered for EVERY builtin
+        // scalar a block declares, marked or not - a block that declares "a" and records nothing else
+        // about it must still answer "not raw, no capacity of mine" rather than borrow someone's.
+        if FBlockDeclVars.IndexOf(BlkScalarKey) < 0 then FBlockDeclVars.Add(BlkScalarKey);
+        // ...and the DECLARED CAPACITY of a fixed-length string is the block's too, by the same rule
+        // CollectWStringVars applies per PROCEDURE: "ZString * n" / "WString * n" hold n-1 characters
+        // plus the terminator, "String * n" holds n. Without this a "ZString * 10" in one Scope read
+        // the capacity of a "ZString * 1" in another and printed nothing at all.
+        if StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], -1) > 0 then
+        begin
+          if (RecTypeName = 'ZSTRING') or (RecTypeName = 'WSTRING') then
+            FZStringVars.Values[BlkScalarKey] :=
+              IntToStr(StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 1) - 1)
+          else
+            FFixedLenVars.Values[BlkScalarKey] := ArrayDeclNode.Attributes.Values['FIXEDLEN'];
+        end;
+        if (ArrayDeclNode.Attributes.Values['ADDRLOCAL'] = '1') and FInProcedure then
+        begin
+          if FAddrLocalVars.IndexOfName(BlkScalarKey) < 0 then
+            FAddrLocalVars.Add(BlkScalarKey + '=' + RecTypeName);
+        end
+        else if ArrayDeclNode.Attributes.Values['RAWMODULE'] = '1' then
+        begin
+          if FRawModuleScalars.IndexOfName(BlkScalarKey) < 0 then
+            FRawModuleScalars.Add(BlkScalarKey + '=' + RecTypeName);
+        end
+        else if (ArrayDeclNode.Attributes.Values['SHARED'] = '1') and
+                (FAddrSharedScalars.IndexOfName(UpperCase(ArrName)) >= 0) then
+        begin
+          // Marked SHARED by the @-taken pass: record it so this block's reads answer "not raw" even
+          // while another block's declaration of the name is on the raw list.
+          if FAddrSharedScalars.IndexOfName(BlkScalarKey) < 0 then
+            FAddrSharedScalars.Add(BlkScalarKey + '=' + RecTypeName);
+        end;
+      end;
       // @-taken LOCAL scalar: back it with a per-frame 1-field record (reclaimed at frame exit, distinct
       // per recursion). Allocate the record, store its handle in the hidden "<name>$REC", apply any
       // "= expr" through it; reads/writes/@ of the name route through the handle (recursion-safe @local).
@@ -9588,7 +11079,14 @@ begin
                              // Without such a ctor the old path is still right - a plain field copy is
                              // exactly what a type that declares none should get.
                              or (ResolveConstructorLabel(RecTypeName, 'I', UpperCase(RecTypeName)) <> '')) and
-                            (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
+                            (ResolveConstructorLabel(RecTypeName, '?') <> '') and   // a 1-parameter ctor exists
+                            (not InitIsCallToKnownProc(ArrayDeclNode.GetChild(2), RecTypeName));
+          // ⛔ THE HANDLE IS PUBLISHED BEFORE THE CONSTRUCTOR RUNS. An object exists at its address
+          // before its constructor is called - fbc's own suite relies on it ("if @this <> @u0"), and
+          // with the publish AFTER, "@u0" read an element 0 that was still 0 inside the very ctor that
+          // was building u0: the test that asks "am I the shared instance?" always answered no.
+          // The value-copy of an "= expr" still runs after, and still needs the handle in place.
+          EmitSharedScalarStoreVal(UpperCase(ArrName), RecHandleVal);
           if ScalarCtorInit then
           begin
             CtorArgs := TASTNode.Create(antArgumentList, ArrayDeclNode.GetChild(2).Token);
@@ -9608,7 +11106,6 @@ begin
           end
           else
             EmitConstructorCall(RecHandleVal, RecTypeName);
-          EmitSharedScalarStoreVal(UpperCase(ArrName), RecHandleVal);  // publish the handle into name(0)
           // The "= expr" value-copy runs AFTER the handle is published: ProcessAssignment resolves a
           // SHARED record's destination from element 0 of the backing, which must already hold it.
           if (not ScalarCtorInit) and (ArrayDeclNode.ChildCount >= 3) and
@@ -9630,7 +11127,10 @@ begin
               EmitXferStore(srtInt, PtrInt(FModuleDtorSlots.Objects[MDtorSlotIdx]), RecHandleVal);
           end;
         end
-        else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        // PREINITED: the constant was already stored before the module constructors ran, and a
+        // constructor may have changed it since - re-running the initialiser here would undo that.
+        else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+                (ArrayDeclNode.Attributes.Values['PREINITED'] <> '1') then
         begin
           InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
           InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
@@ -9678,6 +11178,16 @@ begin
         // DIM'd with a different type in another scope (the global type table is first-declaration-wins).
         CheckInstantiable(FUDTs[RecUDTIdx].Name);     // OOP: an unimplemented ABSTRACT refuses here
         RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
+        // ⛔⛔ ...AND THE TYPE, not only the bank. The comment above named the hazard - "the global type
+        // table is first-declaration-wins" - and only the BANK was protected from it. The type table is
+        // what every FIELD ACCESS reads, so with two scopes declaring the same name as two different
+        // UDTs the record was ALLOCATED as one type and ACCESSED with the other's byte offsets: an
+        // eight-byte store at offset 10 into a four-byte record. In a release build that is a HEAP
+        // CORRUPTION - the program printed everything and died at exit with "Invalid pointer operation".
+        // Lowering runs in source order, so re-pointing the map AT THE DECLARATION gives each scope its
+        // own answer without a per-scope table.
+        // ⇒ A note that names a trap is not a check: the arm right beside it was never visited.
+        FVarRecordType.Values[UpperCase(ArrName)] := RecTypeName;
         EmitInstruction(ssaRecordNew, RecHandleVal,
                         MakeSSAConstInt(FUDTs[RecUDTIdx].LiveBytes),
                         MakeSSAConstInt(0),
@@ -9693,7 +11203,8 @@ begin
                            // Same rule as the SHARED path above: the same type still runs a COPY ctor
                            // when one is declared. ⛔ Two sites, and both have to say it.
                            or (ResolveConstructorLabel(RecTypeName, 'I', UpperCase(RecTypeName)) <> '')) and
-                          (ResolveConstructorLabel(RecTypeName, '?') <> '');   // a 1-parameter ctor exists
+                          (ResolveConstructorLabel(RecTypeName, '?') <> '') and   // a 1-parameter ctor exists
+                            (not InitIsCallToKnownProc(ArrayDeclNode.GetChild(2), RecTypeName));
         // M4.4: run the constructor (if any). M4.4b: a "DIM v AS T(args)" attaches the ctor
         // argument list as child[2] (antArgumentList).
         if ScalarCtorInit then
@@ -9747,7 +11258,7 @@ begin
           RecordVarWidth(UpperCase(ArrName), RecTypeName);  // B1.5 phase 2: narrow on store to a sub-64-bit type
           // "DIM s AS STRING * n" with no initializer starts as n NULs — fbc's buffer is allocated at its
           // full capacity, so LEN is n and PRINT emits all n bytes before anything is ever assigned.
-          FixLenCap := StrToIntDef(FFixedLenVars.Values[UpperCase(ArrName)], 0);
+          FixLenCap := StrCapOf(FFixedLenVars, ArrName, 0);
           if (FixLenCap > 0) and not IsSharedScalar(UpperCase(ArrName)) and not IsAddrLocal(UpperCase(ArrName)) then
             EmitFixedLenInit(GetOrAllocateVariable(UpperCase(ArrName)), FixLenCap, IsWStringVar(ArrName))
           // A local declared WITHOUT an initializer is zero in FreeBASIC, and it must be zero again on
@@ -9788,11 +11299,55 @@ begin
         InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
                                                      ArrayDeclNode.GetChild(0).Token));
         InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
-        ProcessAssignment(InitAssign);
+        // ⭐ A DIM's initialiser INITIALISES: a "Type( ... )" literal here is built straight into the
+        // variable by fbc, so it has no temporary of its own and no second destructor. The same
+        // expression in an ASSIGNMENT does keep one - measured, and the two spellings differ.
+        Inc(FElidingLiteralTemp);
+        try
+          ProcessAssignment(InitAssign);
+        finally
+          Dec(FElidingLiteralTemp);
+        end;
         InitAssign.Free;
       end;
       Continue;
     end;
+
+    // ⭐ THE NAME THE SLOT WILL BE DECLARED UNDER, computed here rather than just before DeclareArray,
+    // because the ELEMENT FACTS recorded below have to be filed under exactly that name - see
+    // ArrayFactKey and DIVERGENZE 61. The rule itself is unchanged; only the place moved.
+    //
+    // A local array (DIM inside a proc) gets its own slot: DeclareArray otherwise REUSES the slot of
+    // the same name (REDIM semantics), resizing/clearing it — and corrupting a same-name ByRef
+    // parameter aliased to it. ArrayIndexOf resolves references through LocalArrayMangle, so the
+    // procedure's own code still finds it. A SHARED array is module-visible and never mangled; a name
+    // that is this proc's own array parameter is left alone.
+    //
+    // ⛔ IT USED TO MANGLE ONLY WHEN A MODULE ARRAY OF THAT NAME ALREADY EXISTED, and that made the
+    // identity depend on DECLARATION ORDER. Two SUBS each declaring "c" and no module "c": the first
+    // declared a GLOBAL slot called C, and the second then found it and mangled - so with DIM the two
+    // were separate by luck, while with REDIM the second took the RESIZE path over the FIRST sub's
+    // array and the program died on an access violation nine lines in. A local is local whether or not
+    // something else happens to share its name.
+    // ⚠️ MODERN only. CLASSIC has no procedure scope at all - in Commodore BASIC every name is global -
+    // so there the old collision-only rule is the right one and stays.
+    DeclArrName := UpperCase(ArrName);
+    if FInProcedure and (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+       (FModernMode or (FProgram.FindArray(UpperCase(ArrName)) >= 0)) and
+       (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
+      DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
+    // ...AND A BLOCK IS A SCOPE TOO. An array DIM'd inside a Scope / If branch / loop body belongs to
+    // THAT block, not to the procedure and not to the module: two sibling "Scope" blocks declaring the
+    // same name are two arrays. It is the innermost identity, so it wins over the per-proc one.
+    // ⛔ SHARED and STATIC are module-lifetime by definition and keep the plain name.
+    // ⚠️ This was tried and withdrawn on 27 Aug 2026 because the slot moved and the element FACTS did
+    // not; ArrayFactKey now resolves those facts through the same walk, which is what makes it safe.
+    if FModernMode and (InnermostBlockFrameIdx >= 0) and
+       (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
+       (ArrayDeclNode.Attributes.Values['STATIC'] <> '1') and
+       (not (FInProcedure and
+             (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) >= 0))) then
+      DeclArrName := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, UpperCase(ArrName));
 
     // Element type of "DIM name(dims) [AS type]". child[2] (if present) is the AS-type identifier.
     //   - AS <udt>      → an array of record handles (element type int); element UDT tracked below.
@@ -9813,34 +11368,51 @@ begin
     else
       ElementType := GetVariableType(ArrName);
 
+    // ⭐ AN ARRAY OF UDT records its element type HERE as well, which it never used to. The only
+    // writers were the pre-scan (bare name, no procedure in hand) and RegisterArrayParams (mangled),
+    // so a proc-local "Dim a(2) As T" had NO entry under its own declaration name and the reader had
+    // to fall back to the flat one - which is precisely the fallback ArrayFactKey must not take.
+    // Recording it here is what lets the reader stop guessing. See DIVERGENZE 61.
+    if RecArrUDTIdx >= 0 then
+      FArrayRecordType.Values[DeclArrName] := ArrElemTypeName;
+
     // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
     // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FFuncPtrTypes.IndexOfName(ArrElemTypeName) >= 0) then
-      FArrayFuncPtrSig.Values[UpperCase(ArrName)] := FFuncPtrTypes.Values[ArrElemTypeName];
+      FArrayFuncPtrSig.Values[DeclArrName] := FFuncPtrTypes.Values[ArrElemTypeName]
+    // ⭐ ...AND THE INLINE SPELLING OF THE SAME THING. "Dim arr(0 To 1) As Function(...) As T" writes no
+    // type NAME at all - the signature rides on the declaration - so only the named-alias form was ever
+    // recorded, and the inline one fell through to an ordinary integer array: "arr(i)(args)" answered
+    // the element instead of calling it. ONE registry for one fact, under the SCOPED key the reader
+    // asks with (ArrayFactKey), which the bare name is not.
+    else if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
+      FArrayFuncPtrSig.Values[DeclArrName] :=
+        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
+        Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
 
     // Array of UDT POINTERS ("Dim As T Ptr a(..)"): the element is an int holding a record handle.
     // Record the pointee so "a(i)->field" resolves to record access on the loaded element.
     if (RecArrUDTIdx < 0) and (PointeeOfPtrTypeName(ArrElemTypeName) <> '') then
-      FArrayPtrPointee.Values[UpperCase(ArrName)] := PointeeOfPtrTypeName(ArrElemTypeName);
+      FArrayPtrPointee.Values[DeclArrName] := PointeeOfPtrTypeName(ArrElemTypeName);
     // ...and the SCALAR pointee, which the map above declines by design (its readers all expect a UDT
     // record handle). "Dim names(0 To 2) As ZString Ptr" is a table of C strings, and "*names(i)" has
     // to know it dereferences to CHARACTERS and not to eight bytes read as a number.
     if (RecArrUDTIdx < 0) and (Length(ArrElemTypeName) >= 5) and
        (Copy(ArrElemTypeName, Length(ArrElemTypeName) - 3, 4) = ' PTR') and
        (PointeeOfPtrTypeName(ArrElemTypeName) = '') then
-      FArrayScalarPointee.Values[UpperCase(ArrName)] :=
+      FArrayScalarPointee.Values[DeclArrName] :=
         Trim(Copy(ArrElemTypeName, 1, Length(ArrElemTypeName) - 4));
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
     begin
-      WIdx := FArrayElemWidth.IndexOf(UpperCase(ArrName));
+      WIdx := FArrayElemWidth.IndexOf(DeclArrName);
       if TypeNameWidthCode(ArrElemTypeName) <> 0 then
       begin
         if WIdx >= 0 then
           FArrayElemWidth.Objects[WIdx] := TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName)))
         else
-          FArrayElemWidth.AddObject(UpperCase(ArrName), TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName))));
+          FArrayElemWidth.AddObject(DeclArrName, TObject(PtrInt(TypeNameWidthCode(ArrElemTypeName))));
       end
       else if WIdx >= 0 then
         FArrayElemWidth.Delete(WIdx);  // re-DIM to a wide element type clears prior narrowing
@@ -9849,12 +11421,12 @@ begin
       // so the block above records nothing — this is a separate set.
       if (ArrElemTypeName = 'UINTEGER') or (ArrElemTypeName = 'ULONGINT') then
       begin
-        if FUnsigned64Arrays.IndexOf(UpperCase(ArrName)) < 0 then
-          FUnsigned64Arrays.Add(UpperCase(ArrName));
+        if FUnsigned64Arrays.IndexOf(DeclArrName) < 0 then
+          FUnsigned64Arrays.Add(DeclArrName);
       end
       else
       begin
-        WIdx := FUnsigned64Arrays.IndexOf(UpperCase(ArrName));   // re-DIM to a signed element type clears it
+        WIdx := FUnsigned64Arrays.IndexOf(DeclArrName);   // re-DIM to a signed element type clears it
         if WIdx >= 0 then FUnsigned64Arrays.Delete(WIdx);
       end;
     end;
@@ -9863,16 +11435,10 @@ begin
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('Invalid array dimensions for: %s', [ArrName]);
 
-    // A local array (DIM inside a proc) whose name matches an already-declared module/global array must
-    // get its own slot: DeclareArray otherwise REUSES that slot (REDIM semantics), resizing/clearing the
-    // module array — and corrupting a same-name ByRef parameter aliased to it. Mangle the DECLARED name on
-    // such a collision (ArrayIndexOf resolves references via LocalArrayMangle). A SHARED array is
-    // module-visible and never mangled; a name that is this proc's own array parameter is left alone.
-    DeclArrName := ArrName;
-    if FInProcedure and (ArrayDeclNode.Attributes.Values['SHARED'] <> '1') and
-       (FProgram.FindArray(UpperCase(ArrName)) >= 0) and
-       (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, UpperCase(ArrName))) < 0) then
-      DeclArrName := LocalArrayMangle(FCurrentProcName, UpperCase(ArrName));
+    // ⚠️ AND A BLOCK IS A SCOPE TOO. Giving a block-local array its own slot here was tried and
+    // WITHDRAWN on 27 Aug 2026 because the slot moved and the element FACTS did not; those facts are
+    // now filed under DeclArrName and read back through ArrayFactKey, which is the half that was
+    // missing. Still open: the block itself has no name to mangle with. DIVERGENZE 61.
 
     // Extract dimension sizes
     DimCount := DimsNode.ChildCount;
@@ -9881,11 +11447,23 @@ begin
     // it as one runtime-sized dimension whose upper bound is -1 (LBOUND 0, so the VM computes size
     // ub-lb+1 = 0); a later REDIM resizes it. Reusing the variable-dimension path (a register holding the
     // upper bound) needs no VM change: an empty array is just an array whose runtime upper bound is -1.
-    if (DimCount = 0) and (ArrayDeclNode.Attributes.Values['VARLEN'] = '1') then
+    // ⛔ ...AND "(Any)" IS THE SAME DECLARATION WRITTEN THE OTHER WAY. FreeBASIC's "Dim a(Any) As T"
+    // declares the same empty variable-length array as "Dim a()", and both answer UBOUND -1; here the
+    // ANY arrived as an ordinary dimension EXPRESSION, the bare name read 0, and UBOUND answered 0.
+    // The "()" spelling was right all along, which is what said it was the spelling and not the model.
+    // ⚠️ One dimension only: "(Any, Any)" declares a 2-D dynamic array and the empty form below models
+    // a single runtime-sized dimension, so that spelling is left to raise rather than answered wrong.
+    if (DimCount = 1) and (DimsNode.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(DimsNode.GetChild(0).Value)) = 'ANY') then
+      DimCount := 0;
+    if (DimCount = 0) and ((ArrayDeclNode.Attributes.Values['VARLEN'] = '1') or
+                           ((DimsNode.ChildCount = 1) and (DimsNode.GetChild(0).NodeType = antIdentifier) and
+                            (UpperCase(VarToStr(DimsNode.GetChild(0).Value)) = 'ANY'))) then
     begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
       ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
+      NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
@@ -10019,6 +11597,20 @@ begin
           TotalElements := TotalElements * Dimensions[i];   // element count (with overflow check)
           if TotalElements > MAX_ARRAY_ELEMENTS then
             raise Exception.CreateFmt('Array %s too large: %d elements (max %d)', [ArrName, TotalElements, MAX_ARRAY_ELEMENTS]);
+          if ArrElemTypeName <> '' then
+            // ...and a "ZString * n" element is as wide as its declared CAPACITY, not as the bare
+            // type name (which sizes a descriptor). Same three-way question the field pass asks.
+            // ⛔ READ FROM THE NODE, NOT FROM FixLenCap: that local is assigned LATER in this same
+            // procedure, so here it still holds the previous declaration's value - or nothing at all.
+            // The corpus caught it as a FAIL *and* an OPTDIFF, the element width differing between the
+            // two builds (32602 bytes against 32732): two different readings of uninitialised memory,
+            // which is the signature the differential exists to show.
+            if StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) > 0 then
+              CheckArrayByteSize(ArrName, ArrElemTypeName, TotalElements,
+                                 StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0))
+            else
+              CheckArrayByteSize(ArrName, ArrElemTypeName, TotalElements,
+                                 TypeSizeBytes(ArrElemTypeName));
         end;
       end
       else if DimValue.Kind = svkConstFloat then
@@ -10053,6 +11645,9 @@ begin
 
     // Declare array in SSA program
     ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
+    // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
+    // name never declared, which is a dynamic array however it is written.
+    NoteArrayShape(DeclArrName, ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1');
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -10138,6 +11733,24 @@ begin
       // Each element record is flat; if the element type has member arrays / nested-UDT fields, give every
       // element that per-instance backing too (else "arr(i).member(j)" hits a handle-0 array).
       EmitRecordArrayInit(ArrayIdx, RecArrUDTIdx);
+      // ⛔⛔ ...AND IF THE DIM IS INSIDE A BLOCK, THE ELEMENTS MUST BE DESTROYED WHEN THE BLOCK CLOSES.
+      // m642 gave the FRAME collector both shapes (CollectRecordVars marks an array "|A"), so an array
+      // of UDT declared in a Sub is torn down correctly - but the BLOCK path registers incrementally,
+      // right here at the lowering, and only the SCALAR arm ever did it. So "Scope : Dim v(0 To 1) As T
+      // : End Scope" ran ZERO destructors where fbc runs two, silently, while the same declaration one
+      // level up in a Sub ran both. Measured: scalar-in-a-Scope 1/1, array-in-a-Sub 2/2, array-in-a-
+      // Scope 0/2.
+      // ⭐ Nothing else is needed: EmitBlockScopeCleanup already splits the "|A" form and walks the
+      // elements - the teardown knew about arrays, the registration did not.
+      BlkIdx := InnermostBlockFrameIdx;
+      if BlkIdx >= 0 then
+      begin
+        FScopeStack[BlkIdx].Dtors.Add(UpperCase(ArrName) + '|' + FUDTs[RecArrUDTIdx].Name + '|A');
+        // ...and take it off the frame/module teardown, which would otherwise destroy it a second time
+        // on a handle the block has already reclaimed. The scalar arm does exactly this.
+        if FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, ArrName)) < 0 then
+          FBlockHandledVars.Add(BlockHandledKey(FCurrentProcName, ArrName));
+      end;
     end;
 
     // FreeBASIC array initializer "=> { v0, v1, ... }": store each value into element k (0-based flat
@@ -10203,7 +11816,14 @@ begin
           // "T(a, b, c)" temporary of the array's element type so the element-store path constructs and
           // copies it. A "T(...)" temporary element is already an expression — used as-is.
           InitElemNode := InitVals.GetChild(k);
-          if (InitElemNode.NodeType = antArgumentList) and (InitElemNode.Attributes.Values['TUPLEINIT'] = '1') then
+          // ⛔ ...and a ONE-VALUE group "(v)" is that same aggregate. The parser decides "tuple" by
+          // looking for a top-level COMMA, so "{ (a, b) }" was tagged TUPLEINIT and "{ (-1) }" came
+          // through as ordinary PARENTHESES - which this branch then missed, and the element store
+          // took the value for a record HANDLE and dereferenced -1. ⭐ Asked HERE, where the array is
+          // already known to hold RECORDS, so a scalar array's "{ (1), (2) }" keeps meaning the values
+          // 1 and 2 and nothing about it changes.
+          if ((InitElemNode.NodeType = antArgumentList) and (InitElemNode.Attributes.Values['TUPLEINIT'] = '1'))
+             or ((InitElemNode.NodeType = antParentheses) and (InitElemNode.ChildCount = 1)) then
           begin
             TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
             TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
@@ -10246,29 +11866,113 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitMemberArrayErase(MemberNode: TASTNode): Boolean;
+// "Erase obj.arr": re-dimension the member array to the bound it already has, with PRESERVE off. See the
+// call site for why that is the erase. Answers False (emitting nothing) when the node is not a UDT array
+// member, so the caller can report it rather than drop the statement.
+var
+  TypeName: string;
+  Slot, DimCount, di: Integer;
+  ElemBank: TSSARegisterType;
+  ObjHandle, ArrHandle, DimReg, UbVal: TSSAValue;
+begin
+  Result := False;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
+  if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
+  if DimCount < 1 then DimCount := 1;
+  ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, ArrHandle, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  for di := 0 to DimCount - 1 do
+  begin
+    DimReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(di), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    UbVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayUBoundInd, UbVal, ArrHandle, DimReg, MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+  // Immediate packs (slot<<8) | (elemType<<4) | preserve, the same encoding REDIM uses.
+  EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), ObjHandle, MakeSSAValue(svkNone),
+                  MakeSSAConstInt((Int64(Slot) shl 8) or (Int64(Ord(ElemBank)) shl 4) or 0));
+  Result := True;
+end;
+
 procedure TSSAGenerator.ProcessErase(Node: TASTNode);
 // ERASE arr [, arr ...] (B1.4). FreeBASIC erases the two array kinds differently: a STATIC (fixed-size)
 // array keeps its bounds and only resets its elements to zero/""; a DYNAMIC array (declared "()" or any
 // REDIM target) is FREED -- its storage goes away and it reports LBound 0 / UBound -1 until re-DIMmed.
 // The Immediate flag (1 = dynamic/deallocate, 0 = static/zero) tells the VM which.
 var
-  j, ArrayIdx: Integer;
+  j, ArrayIdx, RecUDT: Integer;
   ArrName: string;
-  Child: TASTNode;
+  Child, StaticArr: TASTNode;
   DynFlag: Int64;
 begin
   for j := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(j);
+    // "Erase obj.field" / "Erase .field" inside a WITH: a UDT ARRAY MEMBER. Its storage is a runtime
+    // FArrays handle, not a compile-time id, so ssaArrayErase cannot name it. Erasing it is a REDIM to
+    // its CURRENT upper bound with PRESERVE off - the reallocation is what zeroes the elements, which is
+    // exactly what fbc's ERASE does to a fixed-bound array (bounds kept, values reset).
+    // ⛔ A member access used to be SKIPPED here in silence: the statement parsed and erased nothing.
+    if Child.NodeType = antMemberAccess then
+    begin
+      // ...unless it is a STATIC member: one global array under a dotted name, erased by NAME below.
+      // ⛔ REDIM and ERASE are two sites with the same dependency, and closing one leaves the other
+      // raising where its twin works.
+      StaticArr := RewriteStaticMemberArray(Child);
+      if StaticArr <> nil then
+      begin
+        try
+          Node.Children.Extract(Child);
+          Node.Children.Insert(j, StaticArr.Clone);
+          Child.Free;
+          Child := Node.GetChild(j);
+        finally
+          StaticArr.Free;
+        end;
+      end
+      else
+      begin
+        if EmitMemberArrayErase(Child) then Continue;
+        raise Exception.Create('ERASE: not an array member');
+      end;
+    end;
     if Child.NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(Child.Value));
     ArrayIdx := ArrayIndexOf(ArrName);
     if ArrayIdx < 0 then
       raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
-    if FDynamicArrays.IndexOf(ArrName) >= 0 then DynFlag := 1 else DynFlag := 0;
+    if ArraySlotIsDynamic(ArrayIdx, ArrName) then DynFlag := 1 else DynFlag := 0;
+    // ...and its DESTRUCTOR runs on every element FIRST, before the storage goes: fbc's own suite counts
+    // the calls ("erase x2 '' dtors & clear"). Emitted here, ahead of the erase, for the obvious reason.
+    RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
+    if RecUDT >= 0 then EmitRecordArrayConstruct(ArrayIdx, FUDTs[RecUDT].Name, 0, True);
     EmitInstruction(ssaArrayErase, MakeSSAValue(svkNone),
                     MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
                     MakeSSAValue(svkNone), MakeSSAConstInt(DynFlag));
+    // ⛔ AN ARRAY OF UDT HOLDS HANDLES, and zeroing them leaves every element pointing at record 0: the
+    // very next "a(0).field" dereferenced it and died with an access violation. fbc's ERASE on a fixed
+    // array RESETS its elements, so a fresh record per element is what "reset" means here - the same
+    // allocation DIM does, and the same one REDIM re-runs. A DYNAMIC array is FREED by ERASE and has no
+    // elements to give records to, so it is left alone.
+    RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
+    if (DynFlag = 0) and (RecUDT >= 0) then
+    begin
+      EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
+                      MakeSSAArrayRef(ArrayIdx, srtInt),
+                      MakeSSAConstInt((Int64(FUDTs[RecUDT].LiveBytes) and $FFFF)
+                                      or ((Int64(FUDTs[RecUDT].NStr) and $FFFF) shl 32)
+                                      or ((Int64(RecUDT) and $FFFF) shl 48)),
+                      MakeSSAValue(svkNone));
+      EmitRecordArrayInit(ArrayIdx, RecUDT);   // member arrays / nested UDTs of each element
+      // ...and CONSTRUCT them: fbc's "erase x1" on an array of a type with a constructor runs it again
+      // on every element ("clear & ctors"), which is what makes ERASE a RESET rather than a wipe.
+      EmitRecordArrayConstruct(ArrayIdx, FUDTs[RecUDT].Name, 0);
+    end;
   end;
 end;
 
@@ -10279,7 +11983,7 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 var
   j, di, ArrayIdx, MSlot, MDimCount, UdtIdx, MElemUDT: Integer;
   ArrName, MTypeName, ElemUdtName: string;
-  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode: TASTNode;
+  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode, StaticArr: TASTNode;
   UbValue, UbReg, MHandle, LbVal, MArrHandle: TSSAValue;
   MElemBank: TSSARegisterType;
   PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
@@ -10293,9 +11997,27 @@ begin
     if ArrayDeclNode.ChildCount < 2 then Continue;
     // REDIM of a UDT array member ("Redim this.m(x,y)"): resolve the object's record handle and the
     // field's array slot, then emit a member REDIM that allocates the FArrays entry lazily and sizes it.
-    if ArrayDeclNode.GetChild(0).NodeType = antMemberAccess then
+    // ⭐ A STATIC ARRAY MEMBER is not a per-instance array in a record slot: it is ONE global array
+    // under a dotted name, and the ordinary paths below resize it once the target names it. Asked for
+    // every spelling at once - "UDT.a", "x.a", "px->a", and the BARE field name inside a method, which
+    // is the implicit THIS. ⛔ The bare one is the dangerous spelling: it used to declare a FRESH array
+    // of that name and resize THAT, with no diagnostic, while "this.a" beside it worked.
+    MemberNode := ArrayDeclNode.GetChild(0);
+    StaticArr := RewriteStaticMemberArray(MemberNode);
+    if StaticArr <> nil then
+    begin
+      try
+        ArrayDeclNode.Children.Extract(MemberNode);
+        ArrayDeclNode.Children.Insert(0, StaticArr.Clone);
+        MemberNode.Free;
+      finally
+        StaticArr.Free;
+      end;
+    end
+    else if ArrayDeclNode.GetChild(0).NodeType = antMemberAccess then
     begin
       MemberNode := ArrayDeclNode.GetChild(0);
+      begin
       DimsNode := ArrayDeclNode.GetChild(1);
       if (DimsNode.NodeType <> antDimensions) or (DimsNode.ChildCount < 1) then Continue;
       MTypeName := ObjectTypeName(MemberNode.GetChild(0));
@@ -10330,6 +12052,7 @@ begin
                         MakeSSAValue(svkNone));
       end;
       Continue;
+      end;
     end;
     if ArrayDeclNode.GetChild(0).NodeType <> antIdentifier then Continue;
     ArrName := UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value));
@@ -10343,16 +12066,62 @@ begin
       // fresh array. Then skip the normal resize path below.
       DimNode := TASTNode.Create(antDim, ArrayDeclNode.Token);
       DimNode.AddChild(ArrayDeclNode.Clone);
+      DimNode.GetChild(0).Attributes.Values['FROMREDIM'] := '1';   // a ReDim's array is dynamic, subscripts or not
       ProcessDim(DimNode);
       DimNode.Free;
       Continue;
     end;
 
+    // ⭐ A "REDIM x(...) AS T" INSIDE A PROCEDURE DECLARES A LOCAL WHEN T IS NOT THE ARRAY'S TYPE.
+    // fbc, probed one spelling at a time: "ReDim foo(...)" with no type and "ReDim foo(...) As Integer"
+    // both resize the module's Integer array (the VB and QB quirks the suite's own comments name), while
+    // "ReDim foo(0) As Double" declares a FRESH LOCAL and leaves the global alone - and "Dim" always
+    // declares, type or no type. Only the last of the four was wrong here: the module array was resized
+    // through, so a procedure that meant to make itself a scratch array destroyed the caller's
+    // (fbc suite namespace/redim-2).
+    // ⚠️ Judged on the BANK, which is what the array records. Two types of the SAME bank - "As LongInt"
+    // over an Integer array - still resize the global where fbc would declare a local: under-applying
+    // here keeps every case that worked working, and the element TYPE NAME lives only in the flat
+    // pre-scan registries this must not trust (see the ⚠️ on the shape registries in CLAUDE.md).
+    if FInProcedure and (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) and
+       (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) and
+       (FindUDT(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value))) < 0) and
+       (TypeNameToBank(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value)), ArrName)
+          <> FProgram.GetArray(ArrayIdx).ElementType) then
+    begin
+      DimNode := TASTNode.Create(antDim, ArrayDeclNode.Token);
+      DimNode.AddChild(ArrayDeclNode.Clone);
+      DimNode.GetChild(0).Attributes.Values['FROMREDIM'] := '1';   // a ReDim's array is dynamic
+      ProcessDim(DimNode);
+      DimNode.Free;
+      Continue;
+    end;
+
+    // Whatever a DIM said about this slot, a REDIM of it makes it dynamic from here on.
+    if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
+      NoteArrayShape(FProgram.GetArray(ArrayIdx).Name, True);
     DimsNode := ArrayDeclNode.GetChild(1);
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('REDIM: invalid dimensions for %s', [ArrName]);
     if DimsNode.ChildCount < 1 then
       raise Exception.CreateFmt('REDIM: missing dimensions for %s', [ArrName]);
+    // ⭐ AN ARRAY'S RANK IS FIXED BY ITS DECLARATION, and a REDIM may change the SIZE and not the
+    // number of dimensions. fbc: "error 36: Wrong number of dimensions". "Dim a(Any)" states rank 1
+    // and "ReDim a(0 To 0, 0 To 0)" is an error; so is the second of two REDIMs that disagree.
+    // ⛔ An array PARAMETER is exempt: it aliases whatever the caller passed and its local DimCount is
+    // a placeholder, not a promise (UsesRuntimeLBound is the same test the index lowering uses to tell
+    // one apart).
+    // ⛔ A name that reached here MANGLED - a block-scoped or STATIC-hoisted array carries a dotted
+    // key - is not the name the registry was written under, and asking anyway applies a fact keyed
+    // on the BARE name to another declaration's array. fbc's own dim/array_ellipsis_init declares
+    // "static array(...)" in four sibling Scopes and was refused for it. Not our question: skip.
+    if (Pos('.', ArrName) = 0) and
+       (FRankStatedArrays.IndexOf(ArrName) >= 0) and
+       (FProgram.GetArray(ArrayIdx).DimCount >= 1) and
+       (DimsNode.ChildCount <> FProgram.GetArray(ArrayIdx).DimCount) and
+       (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+      raise Exception.CreateFmt('Wrong number of dimensions for %s: it was declared with %d, ' +
+        'this ReDim gives %d', [ArrName, FProgram.GetArray(ArrayIdx).DimCount, DimsNode.ChildCount]);
 
     if DimsNode.ChildCount = 1 then
     begin
@@ -10493,6 +12262,65 @@ begin
     CollectDefTypes(Node.GetChild(i));
 end;
 
+function TSSAGenerator.HoistLValueSubscripts(Node: TASTNode): TASTNode;
+// ⛔ SWAP READS EACH OPERAND THREE TIMES - once for the snapshot and once in each of the two
+// assignments it lowers to - so any SIDE EFFECT inside a subscript ran three times:
+// "Swap arr(nextIdx()), arr(nextIdx())" advanced the counter six times and wrote to elements nobody
+// named. fbc evaluates each lvalue ONCE. Returns a CLONE of Node in which every subscript that is not
+// already a literal or a bare name has been evaluated into a fresh temp, with the temp's NAME left in
+// its place - so the three uses all name the same, already-computed index.
+// The caller owns the result.
+  procedure HoistIn(N: TASTNode);
+  var
+    i: Integer;
+    IdxList, Child: TASTNode;
+    Val, TmpReg: TSSAValue;
+    TmpName: string;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antArrayAccess) and (N.ChildCount >= 2) then
+    begin
+      IdxList := N.GetChild(1);
+      if (IdxList <> nil) and (IdxList.NodeType in [antExpressionList, antArgumentList]) then
+        for i := 0 to IdxList.ChildCount - 1 do
+        begin
+          Child := IdxList.GetChild(i);
+          if Child = nil then Continue;
+          if Child.NodeType in [antLiteral, antIdentifier] then Continue;   // nothing to run twice
+          ProcessExpression(Child, Val);
+          TmpName := '__SWPIX' + IntToStr(FSwapTempSeq) + '%';
+          Inc(FSwapTempSeq);
+          TmpReg := GetOrAllocateVariable(TmpName);
+          EmitInstruction(ssaCopyInt, TmpReg, EnsureIntRegister(Val), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          IdxList.RemoveChildAt(i);
+          IdxList.InsertChild(i, TASTNode.CreateWithValue(antIdentifier, TmpName, Child.Token));
+        end;
+    end;
+    for i := 0 to N.ChildCount - 1 do HoistIn(N.GetChild(i));
+  end;
+begin
+  Result := Node.Clone;
+  HoistIn(Result);
+end;
+
+function TSSAGenerator.WrapInStrConversion(Node: TASTNode): TASTNode;
+// Wrap a UDT that converts to a string in the "Str( ... )" the program wrote on the other operand, so
+// the mixed spellings of SWAP reach the one string path. Frees Node and answers the wrapper when the
+// type has an assignable string Cast; otherwise leaves Node exactly as it was.
+var
+  CastType: string;
+  Args: TASTNode;
+begin
+  Result := Node;
+  if Node = nil then Exit;
+  if UDTWritableStringCast(Node, CastType) = '' then Exit;
+  Result := TASTNode.Create(antArrayAccess, Node.Token);
+  Result.AddChild(TASTNode.CreateWithValue(antIdentifier, kSTR, Node.Token));
+  Args := TASTNode.Create(antExpressionList, Node.Token);
+  Args.AddChild(Node);            // adopted: the wrapper owns it now
+  Result.AddChild(Args);
+end;
+
 procedure TSSAGenerator.ProcessSwap(Node: TASTNode);
 // SWAP a, b (FreeBASIC): exchange the values of two lvalues. We snapshot a's current value
 // into a freshly-named typed temp, then reuse ProcessAssignment for "a = b" and "b = tmp" so
@@ -10506,8 +12334,23 @@ var
   SwapUDTIdx: Integer;
 begin
   if Node.ChildCount < 2 then Exit;
-  LeftNode := Node.GetChild(0);
-  RightNode := Node.GetChild(1);
+  // Evaluate any side-effecting subscript ONCE (see HoistLValueSubscripts): the three reads below all
+  // have to name the same element. The hoisted clones are owned here.
+  LeftNode := HoistLValueSubscripts(Node.GetChild(0));
+  RightNode := HoistLValueSubscripts(Node.GetChild(1));
+  try
+  // ⭐ "Swap Str(u1), u2" IS A STRING SWAP, not a record swap. When exactly ONE side is written
+  // "Str(...)", fbc takes the OTHER through its string conversion too - the udt-zstring/swap suite
+  // asserts that the UDT's other fields (its id) are left alone by all three mixed spellings and moved
+  // only by the bare "Swap u1, u2". Expressed by wrapping the bare side in the same Str() the program
+  // wrote on the first, so one path serves every combination instead of four.
+  if (StrConversionOperand(LeftNode) <> nil) <> (StrConversionOperand(RightNode) <> nil) then
+  begin
+    if StrConversionOperand(LeftNode) <> nil then
+      RightNode := WrapInStrConversion(RightNode)
+    else
+      LeftNode := WrapInStrConversion(LeftNode);
+  end;
 
   // Snapshot the current value of the first operand (scalar / array / member read).
   ProcessExpression(LeftNode, ValA);
@@ -10566,6 +12409,11 @@ begin
   AsnBTmp.AddChild(TmpRef);
   ProcessAssignment(AsnBTmp);
   AsnBTmp.Free;
+
+  finally
+    LeftNode.Free;
+    RightNode.Free;
+  end;
 end;
 
 procedure TSSAGenerator.EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -10621,13 +12469,35 @@ begin
     Exit;
   end;
   if ArgValue.RegType = srtString then
-    Result := EnsureStringRegister(ArgValue)      // already UTF-8 bytes: widen is a no-op on storage
+    // ...but a WSTRING IS A C STRING: it ENDS at the first NUL. "WStr("asd" + Chr(0) + "x")" is three
+    // characters in fbc and we kept five, so Instr over it answered a position fbc cannot see. Storing
+    // into a WSTRING VARIABLE already cut it (see TryFixedLenStore); the CONVERSION did not - the same
+    // rule in one path and not the other. EmitFixedLenToVarLen is that one implementation.
+    Result := EmitFixedLenToVarLen(EnsureStringRegister(ArgValue), True)
   else
   begin
     ArgReg := EnsureFloatRegister(ArgValue);
     Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
     EmitInstruction(ssaStrStr, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
+end;
+
+function TSSAGenerator.IifArgs(Node: TASTNode): TASTNode;
+// The argument list of an "IIf(cond, a, b)" expression, or nil when the node is not one. IIF is not a
+// registered keyword, so it PARSES as an array access on a name called IIF; the same three tests the
+// lowering uses are asked here, in one place, because two other questions have to recognise it too -
+// what BANK the expression has and what UDT TYPE it names.
+begin
+  Result := nil;
+  if (Node = nil) or (not FModernMode) then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  if UpperCase(VarToStr(Node.GetChild(0).Value)) <> 'IIF' then Exit;
+  if ArrayIndexOf('IIF') >= 0 then Exit;
+  if not (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then Exit;
+  if Node.GetChild(1).ChildCount < 3 then Exit;
+  Result := Node.GetChild(1);
 end;
 
 function TSSAGenerator.InferExprBank(Node: TASTNode): TSSARegisterType;
@@ -10657,9 +12527,25 @@ var
   Nm: string;
   ai: Integer;
   L, R: TSSARegisterType;
+  IfA: TASTNode;
+  BT, BF: TSSARegisterType;
 begin
   Result := srtFloat;
   if Node = nil then Exit;
+  // ⭐ AN IIF EXPRESSION HAS THE BANK ITS TWO BRANCHES AGREE ON, and this is the question every caller
+  // asks about it - VAR type inference, a DIM initialiser, a call argument. Unrecognised, an IIF fell
+  // to the FLOAT default and "Dim As <UDT> u = IIf(c, z, "lit")" picked a constructor by the wrong
+  // bank. Same order EmitIif uses for the temp: STRING over FLOAT over INT.
+  IfA := IifArgs(Node);
+  if IfA <> nil then
+  begin
+    BT := InferExprBank(IfA.GetChild(1));
+    BF := InferExprBank(IfA.GetChild(2));
+    if BT = BF then Exit(BT);
+    if (BT = srtString) or (BF = srtString) then Exit(srtString);
+    if (BT = srtFloat) or (BF = srtFloat) then Exit(srtFloat);
+    Exit(srtInt);
+  end;
   case Node.NodeType of
     antLiteral:
       if ((Node.Token <> nil) and (Node.Token.TokenType = ttStringLiteral)) or VarIsStr(Node.Value) then
@@ -10670,6 +12556,12 @@ begin
         Result := srtInt;
     antIdentifier:
       Result := GetVariableType(VarToStr(Node.Value));
+    // ⛔ AN ADDRESS IS AN INT, whatever it points at. "@d" over a Double answered the FLOAT bank - the
+    // bank of the pointee - so the call "f(@d)" signed "F" while every declaration of a pointer parameter
+    // signs "I": the exact overload match could never be tried and the first pointer overload won.
+    // The same wrong answer reached VAR type inference and the IIF result temp.
+    antProcAddress:
+      Result := srtInt;
     antFsFunction:
       // ChDir/MkDir/RmDir/Kill/FileCopy/Shell(...) function form: error/exit code, a Long.
       // DIR is the exception: it answers the matching entry's NAME.
@@ -10726,6 +12618,19 @@ begin
           else Result := srtInt;
         end;
       end;
+    antMemberAccess:
+      // The bank of a record FIELD is the field's DECLARED bank. There was no arm here at all, so a
+      // member access answered the float default below - and "f( h.n )" against f(As Integer)/f(As
+      // Double) picked the DOUBLE overload for an Integer field, the same way an enum-typed variable
+      // did before its type name was known to be an integer one.
+      // ⛔ Only when the field is really FOUND: UDTFieldBankOf answers srtInt for anything it cannot
+      // resolve, and a member this pass cannot resolve is exactly what the default is still for.
+      begin
+        ai := FindUDT(ObjectTypeName(Node.GetChild(0)));
+        if (Node.ChildCount >= 1) and (ai >= 0) and
+           (UDTFieldIndex(ai, UpperCase(VarToStr(Node.Value))) >= 0) then
+          Result := UDTFieldBankOf(Node);
+      end;
     antUnaryOp:
       if Node.ChildCount > 0 then Result := InferExprBank(Node.GetChild(0));
   end;
@@ -10735,15 +12640,31 @@ procedure TSSAGenerator.EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
 // IIF(cond, a, b) (FreeBASIC): short-circuit conditional expression — only the taken branch is
 // evaluated. Lowered by REUSING ProcessIfStatement (the proven IF path, with correct PHIs at the
 // merge): synthesize "IF cond THEN tmp = a ELSE tmp = b", process it, then read tmp. The result
-// bank is taken from the TRUE branch (FB widens to float if either is float — not modelled here).
+// ⭐ THE RESULT BANK IS DECIDED BY BOTH BRANCHES, NOT BY THE TRUE ONE. Taking the true branch
+// alone is wrong in two ways that both show as a NUMBER where a value was expected:
+//   - "IIf(0, 1, 2.5)" answered 2 where fbc answers 2.5 - the temp was an int because the true
+//     branch is one, and the float branch truncated into it. (The header used to say this was "not
+//     modelled"; it is now, and the note was the whole documentation of a wrong answer.)
+//   - A UDT with an "Operator Cast() As ZString" signs the INT bank (every UDT is a handle), so
+//     "IIf(c, u, LIT)" made an int temp and the assignment stored the HANDLE - printed as a small
+//     number. The mirror spelling "IIf(c, LIT, u)" worked, because there the true branch is a
+//     string and the store into a string temp runs the cast. fbc suite udt-zstring/iif, udt-wstring/iif.
+// STRING wins over FLOAT and FLOAT over INT, which is the order the two branches can disagree in:
+// fbc refuses a string/number pair outright, so that combination is a divergence either way.
 var
   IfNode, ThenNode, ElseNode, Asn: TASTNode;
-  Bank: TSSARegisterType;
+  Bank, BankF: TSSARegisterType;
   TmpName, Suffix: string;
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 3) then begin Result := MakeSSAValue(svkNone); Exit; end;
 
   Bank := InferExprBank(ArgsNode.GetChild(1));
+  BankF := InferExprBank(ArgsNode.GetChild(2));
+  if Bank <> BankF then
+  begin
+    if (Bank = srtString) or (BankF = srtString) then Bank := srtString
+    else if (Bank = srtFloat) or (BankF = srtFloat) then Bank := srtFloat;
+  end;
   case Bank of
     srtString: Suffix := '$';
     srtInt: Suffix := '%';
@@ -10849,6 +12770,24 @@ begin
       EmitInstruction(ssaCmpNeFloat, TmpNum, FVal,
                       EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone));
       EmitInstruction(ssaBitwiseOr, Result, Tmp, TmpNum, MakeSSAValue(svkNone));
+      Exit;
+    end;
+    // ⛔ A FLOAT IS COMPARED AS A FLOAT. The argument arrives converted to an int, so "CBool( 0.5 )"
+    // truncated to 0 and answered FALSE where fbc answers true - a value that is not zero read as zero,
+    // which is the same mistake the string path above already carries a note about.
+    if (ArgsNode.ChildCount >= 1) and (InferExprBank(ArgsNode.GetChild(0)) = srtFloat) then
+    begin
+      ProcessExpression(ArgsNode.GetChild(0), V0);
+      EmitInstruction(ssaCmpNeFloat, Result, EnsureFloatRegister(V0),
+                      EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone));
+      Exit;
+    end;
+    // ⛔ ...and a UDT goes through its own "Operator Cast() As Boolean". Without it the RECORD HANDLE
+    // was compared against zero - always true, whatever the object says about itself.
+    if (ArgsNode.ChildCount >= 1) and (ObjectTypeName(ArgsNode.GetChild(0)) <> '') and
+       TryEmitUDTCastToNumber(ArgsNode.GetChild(0), V0) then
+    begin
+      EmitInstruction(ssaCmpNeInt, Result, EnsureIntRegister(V0), IntConst(0), MakeSSAValue(svkNone));
       Exit;
     end;
     EmitInstruction(ssaCmpNeInt, Result, A0, IntConst(0), MakeSSAValue(svkNone));
@@ -11143,6 +13082,43 @@ begin
   EmitInstruction(ssaStrWStringN, Result, CountReg, CodeReg, MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.EmitMidEffectiveLen(const LenVal, SrcReg: TSSAValue; WideTarget: Boolean): TSSAValue;
+// ⛔ A NEGATIVE LENGTH IN THE MID STATEMENT MEANS "NO LIMIT", not "nothing". fbc writes as much of the
+// source as fits - "Mid(s, 2, -1) = "xy"" over "ABCD" answers "AxyD" - and capping the source with
+// LEFT$(src, -1) produced the empty string, so the statement did nothing at all. fbc's own suite sweeps
+// the length from -2 upward, which is why one rule costs thousands of assertions.
+// ⛔⛔ ...AND THE BOUNDARY IS NOT THE SAME FOR A WIDE TARGET. Over a WSTRING fbc treats a length of
+// ZERO as "no limit" too - "Mid(w, 1, 0) = "12"" over "ABCD" answers "12CD" - while over a String,
+// fixed or not, the identical statement writes NOTHING. fbc's own test writes the rule as
+// "length < 1", and that is what its expectation loop computes. Probed both kinds, both spellings of
+// the source, cleared and not: it is the TARGET's kind that decides.
+// Branch-free: a comparison yields -1 (all ones) or 0, so
+//     eff = len + (len < bound) AND (LEN(src) - len)
+// is LEN(src) below the bound and len otherwise.
+var
+  LenReg, ZeroReg, NegReg, SrcLenReg, DiffReg, MaskReg: TSSAValue;
+begin
+  LenReg := EnsureIntRegister(LenVal);
+  ZeroReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, ZeroReg, MakeSSAConstInt(Ord(WideTarget)),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  NegReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, NegReg, LenReg, ZeroReg, MakeSSAValue(svkNone));
+  SrcLenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  // ...and counted the way the CAP will cut: over a wide target the whole statement works in
+  // codepoints, so a byte count here made "no limit" mean "as many BYTES as the source has".
+  if WideTarget then
+    EmitInstruction(ssaStrLenW, SrcLenReg, EnsureStringRegister(SrcReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaStrLen, SrcLenReg, EnsureStringRegister(SrcReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  DiffReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, DiffReg, SrcLenReg, LenReg, MakeSSAValue(svkNone));
+  MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, MaskReg, NegReg, DiffReg, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Result, LenReg, MaskReg, MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessMidStatement(Node: TASTNode);
 // MID(target, start [, len]) = source (FreeBASIC, MODERN): overwrite a substring of target in
 // place; target's length is unchanged. Lowered with existing string ops (no new opcode):
@@ -11227,7 +13203,16 @@ begin
       begin
         ProcessExpression(LenNode, LenVal);
         SrcCapReg := NS;
-        EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg, EnsureIntRegister(LenVal), NoneV);
+        // ⛔ AND THE CAP ITSELF COUNTS IN THE TARGET'S UNITS. "Mid(w, s, n) = src" over a WSTRING takes
+        // n CODEPOINTS of the source; cut with the byte LEFT it took n bytes, which for anything above
+        // U+007F is a fragment of a character. fbc's own wstring/midstmt ucs2 test sweeps the length,
+        // so every value of it was wrong while the same sweep in ASCII was already right.
+        if IsWStringExpr(TargetNode) then
+          EmitInstruction(ssaStrLeftW, SrcCapReg, SrcReg,
+                          EmitMidEffectiveLen(LenVal, SrcReg, True), NoneV)
+        else
+          EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg,
+                          EmitMidEffectiveLen(LenVal, SrcReg, False), NoneV);
       end
       else
         SrcCapReg := SrcReg;
@@ -11246,13 +13231,30 @@ begin
   // value back into the variable: "Dim t As String * 8 : Mid(t,1,1) = "C"" left LEN 0 where fbc leaves
   // 8 with a C in front. The variable's own register IS the padded buffer; only the READ was lossy.
   if (TargetNode.NodeType = antIdentifier) and
-     (StrToIntDef(FFixedLenVars.Values[UpperCase(VarToStr(TargetNode.Value))], 0) > 0) and
+     (StrCapOf(FFixedLenVars, VarToStr(TargetNode.Value), 0) > 0) and
      (not IsSharedScalar(VarToStr(TargetNode.Value))) then
     TextReg := EnsureStringRegister(GetOrAllocateVariable(UpperCase(VarToStr(TargetNode.Value))))
   else
   begin
     ProcessStringExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
   end;
+  // ⭐ A "WSTRING * n" IS n CELLS, AND THE MID STATEMENT WRITES INTO ALL OF THEM. fbc's own
+  // wstring/midstmt is built on it: "Dim w As WString * 12 : w = "abc" : Mid(w,3) = "XY"" leaves LEN 4
+  // there, because cell 4 held a NUL and now holds 'Y'. Read at the CONTENT length there are only
+  // three cells to write into, so the 'Y' fell off and LEN stayed 3.
+  // The buffer is therefore materialised here - the value NUL-padded to its declared cell count -
+  // before the overwrite, and the padded result is what goes back. LEN cuts at the first NUL, so a
+  // value that did not grow reads exactly as it did before.
+  // ⚠️ WIDE ONLY, and that line is fbc's, not ours: a "ZString * n" is a C string that ENDS at its
+  // terminator and fbc leaves LEN 3 for the identical program (m617 closed that half), while a
+  // "String * n" already reads at its capacity. Verified one spelling at a time, all three kinds.
+  // ⛔ ...and the capacity of a "WString * n" is in FZStringVars, NOT in FFixedLenVars: the two
+  // fixed-length registries are split by KIND, "String * n" in one and the two C-shaped buffers
+  // (ZSTRING, WSTRING) in the other, holding n-1 - the cells a value may use with the terminator
+  // excluded. Asked of the wrong one this read 0 and padded nothing, silently.
+  if (TargetNode.NodeType = antIdentifier) and IsWStringVar(VarToStr(TargetNode.Value)) and
+     (StrCapOf(FZStringVars, VarToStr(TargetNode.Value), 0) > 0) then
+    TextReg := EmitFixedLenPad(TextReg, StrCapOf(FZStringVars, VarToStr(TargetNode.Value), 0), True);
   ProcessExpression(StartNode, StartVal); StartReg := EnsureIntRegister(StartVal);
   ProcessStringExpression(SourceNode, SrcVal);  SrcReg := EnsureStringRegister(SrcVal);
 
@@ -11261,7 +13263,12 @@ begin
   begin
     ProcessExpression(LenNode, LenVal);
     SrcCapReg := NS;
-    EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg, EnsureIntRegister(LenVal), NoneV);
+    if IsWStringExpr(TargetNode) then
+      EmitInstruction(ssaStrLeftW, SrcCapReg, SrcReg,
+                      EmitMidEffectiveLen(LenVal, SrcReg, True), NoneV)
+    else
+      EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg,
+                      EmitMidEffectiveLen(LenVal, SrcReg, False), NoneV);
   end
   else
     SrcCapReg := SrcReg;
@@ -11277,14 +13284,85 @@ begin
   // ⚠️ It also FIXES fbc fidelity at the edges, verified against the local oracle: fbc leaves the string
   // untouched for a start below 1 or past the end, while the rebuild PREPENDED there and grew the
   // string ("Mid(t,0,2) = "xy"" gave [xyBCDEFGH] against fbc's [ABCDEFGH]).
+  // ⛔ ...AND NOT A RAW-BACKED ZSTRING BUFFER EITHER, for exactly the reason the SHARED case is
+  // excluded: its value does not live in the variable's register, it lives in a byte slot the register
+  // only names. The fast path wrote into that register and nothing ever read it again, so
+  // "Clear s, 0, SizeOf(s)" - which takes the address of s and therefore makes it RAW - silently
+  // turned every later "Mid(s, i) = x" into a no-op. The general rebuild below writes back through
+  // ProcessAssignment, which has known how to reach a raw slot all along.
+  //
+  // ⚠️ ZSTRING ONLY, and that is a measured line, not a cautious one. fbc reads a "ZString * n" target
+  // at its CONTENT length (a C string ends at the NUL), which is what the general path already does;
+  // it reads a "WString * n" at its DECLARED CELL COUNT, so there "Mid(w, 3) = "XY"" on a 3-character
+  // buffer answers 4 where the content-length reading answers 3. Sending the wide form down this path
+  // too made the fbc suite's wstring/midstmt go from 12 390 failing assertions to 17 386 - writing
+  // something wrong scores worse than writing nothing - and completing it needs a read of the buffer
+  // at capacity, whose value carries embedded NULs and therefore needs the NUL cut on every read.
+  // That is DIVERGENZE 37, and it is the same job. Measured 28 Aug 2026 with an A/B knob on one binary.
   if (TargetNode.NodeType = antIdentifier) and
-     (not IsSharedScalar(VarToStr(TargetNode.Value))) then
+     (not IsSharedScalar(VarToStr(TargetNode.Value))) and
+     (IsWStringVar(VarToStr(TargetNode.Value)) or
+      ((not IsRawModuleScalar(VarToStr(TargetNode.Value))) and
+       (RawZStringBufBytes(VarToStr(TargetNode.Value)) <= 0))) then
   begin
     // ⚠️ The variable's CANONICAL register (what an ordinary scalar assignment writes), NOT the value
     // ProcessStringExpression returned: that one is a versioned USE, and emitting it as Dest gets a
     // fresh temporary plus a copy back -- which is exactly the whole-string copy this exists to avoid.
     // Verified on the disassembly: with the use-value it came out "Dest=2 Src1=0" followed by
     // "CopyString R0, R2"; with the canonical register Dest and Src1 are the same register.
+    // ⛔⛔ ...AND WHEN THE VARIABLE'S VALUE DOES NOT LIVE IN ITS REGISTER, THE WRITE MUST BE PUBLISHED.
+    // An @-taken variable is backed by a per-frame record field, and "Clear w, 0, SizeOf(w)" takes its
+    // address - so a WSTRING that had merely been CLEARED silently lost every later "Mid(w, i) = x".
+    // fbc's own wstring/midstmt clears every buffer it builds, which is why one test carried 12 390
+    // failing assertions, 61% of the suite's total.
+    // The ZSTRING half of this guard has excluded the raw case since it was written; the wide half
+    // never asked - and could not simply be excluded either, because the general rebuild below reads a
+    // "WString * n" at its CONTENT length where fbc reads it at its declared cell count, so sending it
+    // there writes something WRONG instead of nothing (DIVERGENZE 37; measured 28 Aug, 12 390 failing
+    // assertions became 17 386). So the overwrite is done HERE, where it is right, into a named temp,
+    // and assigned back through the machinery that has known how to reach a raw slot all along.
+    // ⛔ bcStrMidAssign WRITES AT A BYTE OFFSET, and over a wide target the start is a CELL index. On
+    // ASCII the two coincide, which is why the whole ASCII sweep was right while every non-ASCII case
+    // landed inside a UTF-8 sequence and produced a '?' - fbc's own wstring/midstmt has an ucs2 test
+    // beside its ascii one, on exactly the same parameter sweep.
+    // The byte start is the BYTE length of the first (start-1) CELLS of the target.
+    // ⚠️ A start below 1 must keep the value it had: the VM arm writes nothing for it, and a converted
+    // one would come out as 1 and write. Branch-free, as EmitMidEffectiveLen is: a comparison yields
+    // -1 or 0, so "byteStart + (start < 1) AND (start - byteStart)" is start below 1 and byteStart at
+    // or above it.
+    if IsWStringExpr(TargetNode) then
+    begin
+      OneReg := NI; EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), NoneV, NoneV);
+      StartM1Reg := NI; EmitInstruction(ssaSubInt, StartM1Reg, StartReg, OneReg, NoneV);
+      PrefixReg := NS; EmitInstruction(ssaStrLeftW, PrefixReg, TextReg, StartM1Reg, NoneV);
+      LenTextReg := NI; EmitInstruction(ssaStrLen, LenTextReg, PrefixReg, NoneV, NoneV);
+      SuffixStartReg := NI; EmitInstruction(ssaAddInt, SuffixStartReg, LenTextReg, OneReg, NoneV);
+      LenMidReg := NI; EmitInstruction(ssaCmpLtInt, LenMidReg, StartReg, OneReg, NoneV);
+      AvailTmpReg := NI; EmitInstruction(ssaSubInt, AvailTmpReg, StartReg, SuffixStartReg, NoneV);
+      AvailReg := NI; EmitInstruction(ssaBitwiseAnd, AvailReg, LenMidReg, AvailTmpReg, NoneV);
+      R1Reg := NI; EmitInstruction(ssaAddInt, R1Reg, SuffixStartReg, AvailReg, NoneV);
+      StartReg := R1Reg;
+    end;
+
+    // ...and a capacity-padded WSTRING joins them, for a different reason: the padding this statement
+    // materialises must be CUT BACK at the first NUL, and the store is where that cut lives. Written
+    // in place into the register, "Mid(w,4) = "Z"" on a "WString * 12" answered LEN 11 - the whole
+    // buffer - instead of 4.
+    if IsAddrLocal(VarToStr(TargetNode.Value)) or IsRawModuleScalar(VarToStr(TargetNode.Value)) or
+       (IsWStringVar(VarToStr(TargetNode.Value)) and
+        (StrCapOf(FZStringVars, VarToStr(TargetNode.Value), 0) > 0)) then
+    begin
+      TmpName := '__MID' + IntToStr(FSwapTempSeq) + '$';
+      Inc(FSwapTempSeq);
+      ResultReg := GetOrAllocateVariable(TmpName);
+      EmitInstruction(ssaStrMidAssign, ResultReg, TextReg, SrcCapReg, StartReg);
+      AsnNode := TASTNode.Create(antAssignment, Node.Token);
+      AsnNode.AddChild(TargetNode.Clone);
+      AsnNode.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token));
+      ProcessAssignment(AsnNode);
+      AsnNode.Free;
+      Exit;
+    end;
     TgtVarReg := EnsureStringRegister(GetOrAllocateVariable(VarToStr(TargetNode.Value)));
     if TgtVarReg.Kind = svkRegister then
     begin
@@ -11396,12 +13474,171 @@ begin
     Result := InferExprBank(ArgNode) = srtString;
 end;
 
+function TSSAGenerator.IsStringConstName(const Name: string): Boolean;
+// Is this name a declared STRING constant? FConstStrBytes holds exactly those, by name, and answers
+// nothing at all for a name it does not have - which is the property being asked for here.
+begin
+  Result := (Name <> '') and (FConstStrBytes.IndexOfName(UpperCase(Name)) >= 0);
+end;
+
+function TSSAGenerator.EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;
+// Materialise an addressable UCS-2 TEMPORARY holding this string's characters, and answer its address.
+//
+// ⭐ This is the WIDE half of what StrSAdd already is for bytes, and it is composed out of instructions
+// that already exist rather than by inventing an opcode: allocate, then store the characters WIDE
+// (ssaRawStoreZStr's Immediate 1 is exactly "encode as UCS-2 and NUL-terminate").
+//
+// The block is sized (byte length + 1) * 2, which is always enough: UTF8Decode never yields more
+// UTF-16 units than the string has bytes (ASCII is 1 byte -> 1 unit, and a supplementary character is
+// 4 bytes -> 2 units), and RawStoreZStrVal bounds-checks the store as a whole in any case.
+//
+// ⚠️ The temporary is not reclaimed - and neither is SADD's, which allocates a fresh raw block on
+// every call. That is the byte-heap model as it stands, not a new leak introduced here; the two halves
+// behave the same way, which is the property that matters.
+var
+  SReg, LenV, BytesV, AddrV: TSSAValue;
+begin
+  SReg := EnsureStringRegister(StrVal);
+  LenV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaStrLen, LenV, SReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BytesV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, BytesV, LenV, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaMulInt, BytesV, BytesV, EnsureIntRegister(MakeSSAConstInt(2)), MakeSSAValue(svkNone));
+  AddrV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRawAlloc, AddrV, BytesV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrV, SReg, MakeSSAConstInt(1));
+  Result := AddrV;
+end;
+
+function TSSAGenerator.TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;
+// A "WSTRING * n" variable given to a "WSTRING PTR" parameter: FreeBASIC passes its ADDRESS, and the
+// pointee is UCS-2 - which is the raw buffer MarkFixedWStringVars backs such a variable with.
+//
+// ⛔ IT IS NOT THE ZSTRING CONVERSION. That one (IsStringArgForBytePtrParam) hands over SADD, the byte
+// address of the MANAGED string, whose bytes are UTF-8; the callee's wide dereference reads them as
+// UCS-2 and gets nonsense - or, on an address the raw heap does not own, raises. "t(w)" died where the
+// same call written "t(@w)" worked, and that difference is the whole diagnosis.
+//
+// Lowered by building the "@name" the program could have written, so the address comes from the ONE
+// place that knows how to produce it rather than from a second opinion here. Answers False, emitting
+// nothing, for every other shape - so no other conversion changes.
+var
+  AddrNode: TASTNode;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
+  if (ParamNode.GetChild(0).NodeType <> antIdentifier) or
+     (UpperCase(VarToStr(ParamNode.GetChild(0).Value)) <> 'WSTRING PTR') then Exit;
+  if (ArgNode.NodeType = antIdentifier) and IsWStringVar(VarToStr(ArgNode.Value)) then
+  begin
+    AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(ArgNode.Value)), ArgNode.Token);
+    try
+      ProcessExpression(AddrNode, Val);
+    finally
+      AddrNode.Free;
+    end;
+    Result := (Val.Kind <> svkNone);
+    Exit;
+  end;
+  // ⛔ ...AND EVERY OTHER STRING-VALUED ARGUMENT, which is where this used to answer False and NOBODY
+  // ELSE CLAIMED THE CASE: IsStringArgForBytePtrParam - the ZSTRING half, which does take a literal, a
+  // Const, a plain String variable and any string EXPRESSION - excludes 'WSTRING PTR' from its list of
+  // parameter types on purpose, because SADD's bytes are UTF-8 and a wide dereference would misread
+  // them. So the else-if chain fell through to ProcessExpression, which staged the STRING REGISTER'S
+  // INDEX into an int slot and the callee dereferenced it: "hello" reached a "WString Ptr" parameter
+  // as NULL. The comment above used to say "answers False for every other shape - so no other
+  // conversion changes", which described the hole as though it were a design.
+  // The answer is not SADD, it is the WIDE equivalent of SADD: a UCS-2 temporary. 50 files of fbc's
+  // own suite declare a "wstring ptr" parameter.
+  if InferExprBank(ArgNode) <> srtString then Exit;
+  ProcessExpression(ArgNode, Val);
+  if Val.Kind = svkNone then Exit;
+  Val := EmitWStringTempAddr(Val);
+  Result := (Val.Kind <> svkNone);
+end;
+
+procedure TSSAGenerator.ProcessDefaultValue(ParamNode, Node: TASTNode; out Val: TSSAValue);
+// Evaluate a PARAMETER's default value. Everywhere else this is exactly ProcessExpression - the one
+// thing it adds is FreeBASIC's bare-type-name form.
+//
+// ⛔ "Sub s( ByRef p As foo = foo )" means "a default-CONSTRUCTED foo", and the parser hands the
+// default over as a bare antIdentifier holding the TYPE name. Lowered as an expression that is an
+// undefined VARIABLE, which reads 0, and the callee then dereferenced handle 0. Written "= foo()" the
+// same declaration worked - the parenthesised form parses as a call and takes the constructor - which
+// is what said the defect was in the SPELLING and not in the default machinery.
+//
+// ⚠️ Both places that fill an omitted argument call this: a SUB/FUNCTION's staging and a
+// CONSTRUCTOR's. One of them knowing the rule and the other not is how the same declaration comes to
+// behave two ways.
+var
+  CallNode: TASTNode;
+  ParamTypeU: string;
+begin
+  Val := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  // ⭐ "= Type( )" AS A DEFAULT: the bare Type() carries no <T>, and its type comes from the
+  // PARAMETER's declared type - exactly as "Function = Type(...)" fills it from the return type and
+  // "Dim v As T = Type(...)" from the declared one. Three spellings of the same rule already had it
+  // and this fourth did not, so the node reached the SSA with an EMPTY type name and was read as an
+  // array access: "Array not declared: " - a message naming nothing at all.
+  if (Node.NodeType = antArrayAccess) and (Node.Attributes.Values['INFERTYPE'] = '1') and
+     (Node.ChildCount >= 1) and (ParamNode <> nil) and (ParamNode.ChildCount >= 1) and
+     (ParamNode.GetChild(0).NodeType = antIdentifier) and
+     not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) and
+     (FindUDT(UpperCase(VarToStr(ParamNode.GetChild(0).Value))) >= 0) then
+  begin
+    Node.GetChild(0).Value := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+    Node.Attributes.Values['INFERTYPE'] := '';
+  end;
+  if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) and
+     (FindUDT(UpperCase(VarToStr(Node.Value))) >= 0) and
+     (VarRecordTypeName(VarToStr(Node.Value)) = '') then     // a TYPE name, not a variable of that type
+  begin
+    CallNode := TASTNode.Create(antArrayAccess, Node.Token);
+    try
+      CallNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token));
+      CallNode.AddChild(TASTNode.Create(antExpressionList, Node.Token));
+      ProcessExpression(CallNode, Val);
+    finally
+      CallNode.Free;
+    end;
+    Exit;
+  end;
+  // ⛔ ...AND "= 3344" ON A UDT PARAMETER IS A CONVERSION, not a number. FreeBASIC runs the type's
+  // one-argument constructor there, exactly as "Dim As T v = <non-T expr>" does - and THAT path has
+  // known it since the copy-constructor work (see ScalarCtorInit in ProcessDim). Here the 3344 was
+  // staged as a plain int into a slot the callee reads as a record HANDLE, and "x.i" dereferenced it:
+  // an access violation on eleven lines, with "= foo" and "= foo()" both working beside it. One rule,
+  // two places that fill an omitted argument, written in one of them.
+  ParamTypeU := '';
+  if (ParamNode <> nil) and (ParamNode.ChildCount >= 1) and
+     (ParamNode.GetChild(0).NodeType = antIdentifier) and
+     not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) then
+    ParamTypeU := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+  if (ParamTypeU <> '') and (FindUDT(ParamTypeU) >= 0) and
+     (UpperCase(ObjectTypeName(Node)) <> ParamTypeU) and
+     (ResolveConstructorLabel(ParamTypeU, '?') <> '') then
+  begin
+    CallNode := TASTNode.Create(antExpressionList, Node.Token);
+    try
+      CallNode.AddChild(Node.Clone);
+      if EmitUDTTemporary(ParamTypeU, CallNode, Val) then Exit;
+    finally
+      CallNode.Free;
+    end;
+  end;
+  ProcessExpression(Node, Val);
+end;
+
 function TSSAGenerator.EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
 // FreeBASIC "s[i]" on a scalar STRING: the byte (character code) at 0-based index i. Lowered to
 // ASC(MID$(s, i+1, 1)) with existing string ops (no new opcode). Out-of-range -> 0 (ASC of "").
 var
   SVal, IdxVal, SReg, IdxReg, OneReg, StartReg, LenReg, MidReg: TSSAValue;
   NoneV, BufAddr2, ByteAddr2: TSSAValue;
+  ElemBytes: Integer;
+  WideIdx: Boolean;      // a WSTRING is indexed by CODEPOINT, and the element IS a codepoint
 begin
   NoneV := MakeSSAValue(svkNone);
   // The mirror of the write: a raw-backed buffer is READ from the byte heap. Without it the read
@@ -11409,13 +13646,29 @@ begin
   // back got the old character and the two halves disagreed with each other, not just with fbc.
   if RawZStringBufAddr(SNode, BufAddr2) then
   begin
+    ElemBytes := RawStringBufElemBytes(SNode);   // 1 for a ZSTRING, 2 for a WSTRING's UCS-2 image
     ProcessExpression(IdxNode, IdxVal);
+    IdxReg := EnsureIntRegister(IdxVal);
+    if ElemBytes > 1 then
+    begin
+      OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(ElemBytes), NoneV, NoneV);
+      StartReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, StartReg, IdxReg, OneReg, NoneV);
+      IdxReg := StartReg;
+    end;
     ByteAddr2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaAddInt, ByteAddr2, EnsureIntRegister(BufAddr2), EnsureIntRegister(IdxVal), NoneV);
+    EmitInstruction(ssaAddInt, ByteAddr2, EnsureIntRegister(BufAddr2), IdxReg, NoneV);
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
+    if ElemBytes > 1 then
+      EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U16))
+    else
+      EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
     Exit;
   end;
+  // ⭐ A WSTRING IS INDEXED BY CODEPOINT and each element IS a codepoint - the same rule ASC follows,
+  // and the same reason: the storage is UTF-8, so the byte-based pair answered the lead byte.
+  WideIdx := IsWStringExpr(SNode);
   ProcessStringExpression(SNode, SVal);   SReg := EnsureStringRegister(SVal);
   ProcessExpression(IdxNode, IdxVal); IdxReg := EnsureIntRegister(IdxVal);
   OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -11425,9 +13678,15 @@ begin
   LenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, LenReg, MakeSSAConstInt(1), NoneV, NoneV);
   MidReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-  EmitInstruction(ssaStrMid, MidReg, SReg, StartReg, LenReg);          // MID$(s, i+1, 1)
+  if WideIdx then
+    EmitInstruction(ssaStrMidW, MidReg, SReg, StartReg, LenReg)        // MID$(w, i+1, 1) by codepoint
+  else
+    EmitInstruction(ssaStrMid, MidReg, SReg, StartReg, LenReg);        // MID$(s, i+1, 1)
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaStrAsc, Result, MidReg, NoneV, NoneV);            // ASC(...)
+  if WideIdx then
+    EmitInstruction(ssaStrAscW, Result, MidReg, NoneV, NoneV)          // ASC(...) as a codepoint
+  else
+    EmitInstruction(ssaStrAsc, Result, MidReg, NoneV, NoneV);          // ASC(...)
 end;
 
 function TSSAGenerator.DerefedZStringIndexBase(BaseNode: TASTNode): string;
@@ -11508,6 +13767,37 @@ begin
   end;
 end;
 
+function TSSAGenerator.IsRawStringBuf(SNode: TASTNode): Boolean;
+// Whether a fixed-length string variable keeps its characters in RAW BYTES because its address was
+// taken. The same two tests RawZStringBufAddr makes, asked without emitting the address register - a
+// predicate is needed where the answer only decides which LOWERING to take.
+var
+  Nm: string;
+begin
+  Result := False;
+  if (SNode = nil) or (SNode.NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(SNode.Value));
+  Result := (IsRawModuleScalar(Nm) and (TypeNameToBank(RawModuleScalarType(Nm), Nm) = srtString)) or
+            (RawZStringBufBytes(Nm) > 0);
+end;
+
+function TSSAGenerator.RawStringBufElemBytes(SNode: TASTNode): Integer;
+// How wide ONE character is in a raw-backed fixed-length string buffer: 1 byte for a ZSTRING, TWO for a
+// WSTRING, whose raw image is UCS-2.
+// ⛔ Both the indexed READ and the indexed WRITE used to assume one byte for either, so on a WSTRING
+// "w[2]" read the SECOND BYTE of the first character - "abcdef" answered 97, 0, 98, 0 instead of
+// 97, 98, 99, 100. Invisible until a program took the buffer's address (a "Clear w, 0, SizeOf(w)" is
+// enough), which is why fbc's own wstring/midstmt could not compile at all before today and now finds
+// it: 17540 failing assertions, the largest single item in the suite.
+var
+  Nm: string;
+begin
+  Result := 1;
+  if (SNode = nil) or (SNode.NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(SNode.Value));
+  if IsWStringVar(Nm) then Result := 2;
+end;
+
 procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
 // FreeBASIC "s[i] = c" on a scalar STRING: set the byte at 0-based index i to character code c.
 //
@@ -11523,7 +13813,8 @@ procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; T
 // (see the fast paths in ProcessMidStatement); this writing had simply never been routed there.
 var
   MidNode, ArgsNode: TASTNode;
-  BufAddr, IdxV, ByteAddr, ValV: TSSAValue;
+  BufAddr, IdxV, ByteAddr, ValV, ScaledIdx, WReg: TSSAValue;
+  ElemBytes: Integer;
 begin
   // A RAW-BACKED "ZSTRING * n" (its address has been taken) keeps its characters in the byte heap, so
   // one byte is written THERE. The MID$ lowering below writes the managed string register, which for
@@ -11531,12 +13822,26 @@ begin
   // silence, and the buffer still read as it was declared.
   if RawZStringBufAddr(SNode, BufAddr) then
   begin
+    ElemBytes := RawStringBufElemBytes(SNode);   // the mirror of the read: a WSTRING steps by two
     ProcessExpression(IdxNode, IdxV);
+    ScaledIdx := EnsureIntRegister(IdxV);
+    if ElemBytes > 1 then
+    begin
+      WReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, WReg, MakeSSAConstInt(ElemBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      ByteAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, ByteAddr, ScaledIdx, WReg, MakeSSAValue(svkNone));
+      ScaledIdx := ByteAddr;
+    end;
     ByteAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaAddInt, ByteAddr, EnsureIntRegister(BufAddr), EnsureIntRegister(IdxV), MakeSSAValue(svkNone));
+    EmitInstruction(ssaAddInt, ByteAddr, EnsureIntRegister(BufAddr), ScaledIdx, MakeSSAValue(svkNone));
     ProcessExpression(ValNode, ValV);
-    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
-                    MakeSSAConstInt(RTC_U8));
+    if ElemBytes > 1 then
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
+                      MakeSSAConstInt(RTC_U16))
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
+                      MakeSSAConstInt(RTC_U8));
     Exit;
   end;
   MidNode := TASTNode.Create(antMidStatement, Tok);
@@ -11620,6 +13925,89 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.StrConversionOperand(Node: TASTNode): TASTNode;
+// "Str(x)" / "WStr(x)" applied to something that is ALREADY a string is the identity, and fbc lets it
+// stand where an LVALUE is expected - its own suite writes "Swap Str(u1), Str(u2)" over a UDT that
+// converts to a zstring. Answers the operand NODE (borrowed from the tree), or nil.
+var
+  Nm: string;
+  Args: TASTNode;
+begin
+  Result := nil;
+  if (Node = nil) or (Node.ChildCount < 2) then Exit;
+  if not (Node.NodeType in [antArrayAccess, antFunctionCall]) then Exit;
+  if Node.GetChild(0) = nil then Exit;
+  if Node.GetChild(0).NodeType = antIdentifier then Nm := UpperCase(VarToStr(Node.GetChild(0).Value))
+  else Exit;
+  if (Nm <> kSTR) and (Nm <> kSTRS) and (Nm <> kWSTR) and (Nm <> kWSTR + '$') then Exit;
+  Args := Node.GetChild(1);
+  if (Args = nil) or not (Args.NodeType in [antExpressionList, antArgumentList]) or
+     (Args.ChildCount <> 1) then Exit;
+  Result := Args.GetChild(0);
+end;
+
+function TSSAGenerator.TryStoreThroughStringCast(TgtNode, ExprNode: TASTNode): Boolean;
+// "<UDT with an assignable string Cast> = <string expression>": write through the reference the cast
+// hands back, which is the same protocol LSET/RSET uses on such a destination. Answers False, emitting
+// nothing, when the target is not one - so a plain "u = "abc"", which fbc REFUSES, keeps its old path.
+var
+  CastLbl, CastType: string;
+  Node: TASTNode;
+  AddrVal, StrVal: TSSAValue;
+begin
+  Result := False;
+  if TgtNode = nil then Exit;
+  Node := TgtNode;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  CastLbl := UDTWritableStringCast(Node, CastType);
+  if CastLbl = '' then Exit;
+  ProcessStringExpression(ExprNode, StrVal);
+  ProcessMethodCall(Node, CastType, 'OPERATORCAST$', nil, AddrVal, False, True);
+  EmitByrefRetStore(EnsureIntRegister(AddrVal), EnsureStringRegister(StrVal), CastLbl);
+  Result := True;
+end;
+
+function TSSAGenerator.UDTWritableStringCast(Node: TASTNode; out ObjType: string): string;
+// Does Node name a UDT instance whose string Cast operator returns a WRITABLE reference? That is the
+// question LSET/RSET has to ask about its destination: such a UDT *is* a string for this statement -
+// fbc justifies into the buffer the cast refers to - and the answer is the label to call for its
+// address. A cast that returns BY VALUE hands back a copy, which cannot be justified into, so it
+// answers '' and the caller leaves the statement alone.
+begin
+  Result := '';
+  ObjType := '';
+  if Node = nil then Exit;
+  ObjType := ObjectTypeName(Node);
+  if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
+  Result := ResolveMethodLabel(ObjType, 'OPERATORCAST$');   // '$' = string-returning cast
+  if (Result <> '') and (not ByrefRetByAddress(Result)) then Result := '';
+  // ⛔ ...AND THE TYPE MUST DERIVE FROM ZSTRING/WSTRING. An assignable string Cast on its own is not
+  // enough for fbc: a type that only declares one answers "error 24: Invalid data types" to LSET/RSET
+  // (verified). The suite's reference type is "... Extends UZSTRING_FIXED_BASE Extends ZString" with
+  // the Cast on the leaf, so the chain is walked rather than the immediate parent read.
+  if (Result <> '') and (not UDTDerivesFromStringType(ObjType)) then Result := '';
+  if Result = '' then ObjType := '';
+end;
+
+function TSSAGenerator.UDTDerivesFromStringType(const TypeName: string): Boolean;
+// Does this UDT reach ZSTRING or WSTRING through its EXTENDS chain?
+var
+  Nm: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  Nm := UpperCase(TypeName);
+  Guard := 0;
+  while (Nm <> '') and (Guard < 64) do
+  begin
+    if (Nm = 'ZSTRING') or (Nm = 'WSTRING') then Exit(True);
+    Idx := FindUDT(Nm);
+    if Idx < 0 then Exit;
+    Nm := UpperCase(FUDTs[Idx].Parent);
+    Inc(Guard);
+  end;
+end;
+
 procedure TSSAGenerator.ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
 // LSET/RSET dst, src (FreeBASIC/QBasic): justify src into dst's string buffer, preserving dst's
 // current length. src is truncated from the right if longer than the buffer, else padded with
@@ -11643,6 +14031,11 @@ var
   DstReg, SrcReg, NReg, CappedReg, LCapReg, PadNReg, PadReg, ResultReg: TSSAValue;
   TmpName: string;
   NoneV: TSSAValue;
+  FixedCap: Integer;
+  FixedWide, Wide: Boolean;
+  CastLbl, CastType: string;
+  CastNode: TASTNode;
+  AddrVal: TSSAValue;
 begin
   if Node.ChildCount < 2 then Exit;
   NoneV := MakeSSAValue(svkNone);
@@ -11654,20 +14047,52 @@ begin
   // first, because falling through to the string path below converts the record HANDLES with
   // IntToString and then assigns one handle to the other - which only ever produced the right
   // answer because the int and string banks happened to hand out matching numbers.
-  if IsLeft and TryLRSetRecord(DstNode, SrcNode) then Exit;
+  // ⛔ ...but a UDT that converts to a STRING through an assignable Cast is NOT a record overlay: for
+  // fbc, LSET/RSET on it is the ordinary string justification performed on the buffer the cast refers
+  // to, with the DESTINATION's current length preserved. The suite's reference zstring UDT is exactly
+  // that, and taking the overlay there answered "XY" where fbc answers "XY     ". Asked FIRST, because
+  // the type has fields and would otherwise satisfy the overlay test.
+  CastLbl := UDTWritableStringCast(DstNode, CastType);
+  if (CastLbl = '') and IsLeft and TryLRSetRecord(DstNode, SrcNode) then Exit;
 
   // Read inputs.
   ProcessStringExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
   ProcessStringExpression(SrcNode, SrcVal); SrcReg := EnsureStringRegister(SrcVal);
 
-  // N = LEN(dst): the buffer size to preserve.
-  NReg := NI; EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
+  // N = the buffer size to preserve.
+  // ⛔ FOR A FIXED-LENGTH STRING THAT IS ITS DECLARED CAPACITY, not the length of the value just read.
+  // "Dim As String * 8 s = "ab" : LSet s, "xy"" must answer "xy      " (fbc), and reading LEN off the
+  // VALUE gave 2, so the justification had nothing to justify INTO and both LSET and RSET answered
+  // "xy". The capacity is a compile-time fact - the same one Len(s) already reports as 8 - so it is
+  // asked for here; a variable-length destination keeps the runtime LEN, which is what QB's LSET means.
+  FixedCap := FixedLenCapOfNode(DstNode, FixedWide);
+  // ⛔ ...AND FOR A WIDE DESTINATION EVERY COUNT HERE IS A CODEPOINT COUNT, not a byte count. WSTRING
+  // is stored as UTF-8, so ssaStrLen answered 3 for a destination holding ONE Japanese character and
+  // the justification padded it to three: the suite's own sweep (wstring/lrset, ucs2) reported
+  // "len 3, want 1". The three ops have wide twins and only the FIXED-capacity read ever asked for
+  // them - the runtime-length path, which is the one a WSTRING actually takes, did not.
+  // ...and a UDT destination is wide when the reference its Cast hands back is a WSTRING: the node
+  // itself is a record, so IsWStringExpr cannot see it.
+  Wide := FixedWide or IsWStringExpr(DstNode) or
+          ((CastLbl <> '') and (Pos('WSTRING', ByrefRetPointeeType(CastLbl)) > 0));
+  NReg := NI;
+  if FixedCap > 0 then
+    EmitInstruction(ssaLoadConstInt, NReg, MakeSSAConstInt(FixedCap), NoneV, NoneV)
+  else if Wide then
+    EmitInstruction(ssaStrLenW, NReg, DstReg, NoneV, NoneV)
+  else
+    EmitInstruction(ssaStrLen, NReg, DstReg, NoneV, NoneV);
 
   // capped = LEFT$(src, N): truncate from the right when src is longer than the buffer.
-  CappedReg := NS; EmitInstruction(ssaStrLeft, CappedReg, SrcReg, NReg, NoneV);
+  CappedReg := NS;
+  if Wide then EmitInstruction(ssaStrLeftW, CappedReg, SrcReg, NReg, NoneV)
+  else EmitInstruction(ssaStrLeft, CappedReg, SrcReg, NReg, NoneV);
 
   // pad = SPACE$(N - LEN(capped)).  LEN(capped) = min(LEN(src), N) so the count is always >= 0.
-  LCapReg := NI;  EmitInstruction(ssaStrLen, LCapReg, CappedReg, NoneV, NoneV);
+  // (A space is one codepoint and one UTF-8 byte, so SPACE$ itself needs no wide twin.)
+  LCapReg := NI;
+  if Wide then EmitInstruction(ssaStrLenW, LCapReg, CappedReg, NoneV, NoneV)
+  else EmitInstruction(ssaStrLen, LCapReg, CappedReg, NoneV, NoneV);
   PadNReg := NI;  EmitInstruction(ssaSubInt, PadNReg, NReg, LCapReg, NoneV);
   PadReg := NS;   EmitInstruction(ssaStrSpace, PadReg, PadNReg, NoneV, NoneV);
 
@@ -11679,6 +14104,18 @@ begin
     EmitInstruction(ssaStrConcat, ResultReg, CappedReg, PadReg, NoneV)
   else
     EmitInstruction(ssaStrConcat, ResultReg, PadReg, CappedReg, NoneV);
+
+  // A string-convertible UDT destination is written THROUGH the reference its Cast operator hands
+  // back: it has no assignment from a string, and the ordinary path below silently dropped the store.
+  if CastLbl <> '' then
+  begin
+    CastNode := DstNode;
+    while (CastNode.NodeType = antParentheses) and (CastNode.ChildCount >= 1) do
+      CastNode := CastNode.GetChild(0);
+    ProcessMethodCall(CastNode, CastType, 'OPERATORCAST$', nil, AddrVal, False, True);
+    EmitByrefRetStore(EnsureIntRegister(AddrVal), ResultReg, CastLbl);
+    Exit;
+  end;
 
   // dst = result  (dispatches on the dst lvalue kind via the existing assignment machinery)
   AsnNode := TASTNode.Create(antAssignment, Node.Token);
@@ -11695,6 +14132,11 @@ function TSSAGenerator.IterOperatorLabel(const TypeName, OpName: string; NArgs: 
 // a type may declare either or both, so a loop written WITH Step still works against a type that only
 // implements the implicit form, and the other way round.
 begin
+  // OOP: the permission on an ITERATION operator. A "For i As T = a To b" loop reaches FOR / NEXT / STEP
+  // through this label and never through ProcessMethodCall, so the rule that covers every other member
+  // could not see them - and fbc's suite has nine COMPILE_ONLY_FAIL tests that are exactly this.
+  // Asked HERE because this is the one funnel all four call sites go through.
+  CheckMemberAccess(TypeName, 'OPERATOR' + OpName);
   Result := TypeName + '.OPERATOR' + OpName + '@' + IntToStr(NArgs);
   if FProcDecls.ContainsKey(Result) then Exit;
   if NArgs > 0 then Result := TypeName + '.OPERATOR' + OpName + '@' + IntToStr(NArgs - 1)
@@ -11789,13 +14231,25 @@ var
 
 begin
   Result := False;
+  VarName := '';
+  if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+    VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
   TypeName := UpperCase(Node.Attributes.Values['VARTYPE']);
+  // ⛔ THE COUNTER DOES NOT HAVE TO BE DECLARED IN THE HEAD. VARTYPE is filled only by the
+  // "For i As T = a To b" spelling; fbc's own tests - and the manual's iterator examples - write
+  //     Dim i As T
+  //     For i = T(1) To T(3)
+  // and there the type comes from the VARIABLE. With only the first spelling understood, the whole
+  // type-driven expansion was skipped in silence and the loop fell through to the NUMERIC path: not
+  // one of Operator For, Step or Next was ever called, while the counter still advanced and the loop
+  // still terminated, so it looked like a STEP applied twice rather than like an iterator that had
+  // never run. ⭐ The tell is that the operators print NOTHING - the numbers alone do not say it.
+  if (TypeName = '') and (VarName <> '') then TypeName := UpperCase(VarRecordTypeName(VarName));
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   // A type with no iteration NEXT is not an iterator: leave it to the numeric path below.
   if (IterOperatorLabel(TypeName, kNEXT, 2) = '') then Exit;
   Result := True;
 
-  VarName := UpperCase(VarToStr(Node.GetChild(0).Value));
   HasStep := Node.ChildCount > 3;
   if HasStep then NArgs := 1 else NArgs := 0;
 
@@ -12413,6 +14867,7 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
+      CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
       // WHILE: continue if condition TRUE, exit if FALSE
       // UNTIL: continue if condition FALSE, exit if TRUE
       if IsWhileLoop then
@@ -12521,6 +14976,7 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
+      CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
       // WHILE: loop back if condition TRUE, exit if FALSE
       // UNTIL: loop back if condition FALSE, exit if TRUE
       if IsWhileLoop then
@@ -12789,6 +15245,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.CondAsIntTruth(const V: TSSAValue): TSSAValue;
+// A condition the branch opcodes can read. ssaJumpIfZero/ssaJumpIfNotZero take an INT register and read
+// their operand's INDEX in the int bank - so handing them a FLOAT register makes them test whatever
+// integer register happens to carry that number.
+//
+// ⛔ AND THAT IS WHAT EVERY FLOAT CONDITION DID. "Dim As Double d = 5.0 : If d Then" took the ELSE
+// branch, and "While d" did not terminate at all - it read an int register that never changed. The
+// CONSTANT case was handled where the IF materialises it ("If 1.5 Then" is folded), which is exactly
+// what hid this: every literal condition worked and every computed one was wrong. fbc suite
+// expressions/shortcutops, where the operands are functions returning DOUBLE.
+// A STRING condition is left alone: fbc refuses one outright, and inventing a truth value for it here
+// would be answering a question nobody asked.
+var
+  Zero: TSSAValue;
+begin
+  Result := V;
+  if V.Kind <> svkRegister then Exit;
+  if V.RegType <> srtFloat then Exit;
+  Zero := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+  EmitInstruction(ssaLoadConstFloat, Zero, MakeSSAConstFloat(0.0),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeFloat, Result, V, Zero, MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessIfStatement(Node: TASTNode);
 var
   CondValue, CondRegVal: TSSAValue;
@@ -12817,6 +15298,7 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     CondValue := CondRegVal;
   end;
+  CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0", not an int register index
 
   // Generate unique labels
   ThenLabel := GenerateUniqueLabel('then');
@@ -12960,10 +15442,27 @@ begin
   end;
 end;
 
+function TSSAGenerator.NamedLabelBlockName(const RawName: string): string;
+// The basic-block name of a NAMED label, QUALIFIED BY THE PROCEDURE that contains it.
+//
+// ⛔ A label belongs to its procedure, and without the qualifier two procedures that both used the
+// obvious name shared ONE block: "Sub uno(): GoTo skip: ... skip:" and an identically-written "Sub
+// due()" MERGED, so calling due() ran uno's body. Silently, and it is legal FreeBASIC - fbc compiles
+// it and prints two different lines. Nothing in the corpus paired two procedures that way.
+//
+// ⭐ A MODULE-LEVEL label keeps the bare "LABEL_<NAME>" it always had, so every program without a
+// procedure-local label produces byte-identical blocks.
+begin
+  if FCurrentProcName = '' then
+    Result := 'LABEL_' + UpperCase(RawName)
+  else
+    Result := 'LABEL_' + UpperCase(FCurrentProcName) + '.' + UpperCase(RawName);
+end;
+
 function TSSAGenerator.JumpLabelName(LabelNode: TASTNode): string;
 begin
   if LabelNode.NodeType = antIdentifier then
-    Result := 'LABEL_' + UpperCase(VarToStr(LabelNode.Value))   // named label (case-insensitive)
+    Result := NamedLabelBlockName(VarToStr(LabelNode.Value))    // named label (case-insensitive)
   else
     Result := 'LINE_' + VarToStr(LabelNode.Value);              // classic line number
 end;
@@ -14081,8 +16580,9 @@ var
   XV, YV, SV, VV, XR, YR, SR, VR: TSSAValue;
   Instr: TSSAInstruction;
   Mode: Int64;
+  HasTarget: Boolean;
 begin
-  if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
+  if (FCurrentBlock = nil) or (EffChildCount(Node) < 3) then Exit;
   Mode := StrToIntDef(Node.Attributes.Values['MODE'], 5);
   // CUSTOM is not a blend FORMULA, it is a user FUNCTION called once per pixel - so it cannot be a mode
   // ordinal handed to the backend, which knows nothing of the interpreter. It is lowered here instead,
@@ -14090,18 +16590,21 @@ begin
   // target, POINT on the work page, an indirect call, PSET). That keeps the whole thing inside the VM's
   // own dispatch: no callback from the graphics runtime back into the interpreter, which is the one
   // mechanism this design does not have.
-  if (Mode = 7) and (Node.ChildCount >= 4) then
+  if (Mode = 7) and (EffChildCount(Node) >= 4) then
   begin
     ProcessGfxPutCustom(Node);
     Exit;
   end;
+  // "Put img, (x,y), src": the blit lands on the IMAGE, not the work page. Same pair PSET/LINE/
+  // CIRCLE/PAINT already use, so the target rides on ssaGfxSetTarget with nothing new to lower.
+  HasTarget := EmitDrawTargetBegin(Node);
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
   ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
   if Mode = 7 then Mode := 0;                   // CUSTOM without a function: PSET, as the backend does
   // The 0..255 blend value ALPHA and ADD take. ⭐ -1 means "the statement named none", which is NOT the
   // same as 255: ALPHA reads it as "use the image's own per-pixel alpha", a different formula.
-  if (Node.Attributes.Values['HASVALUE'] = '1') and (Node.ChildCount >= 4) then
+  if (Node.Attributes.Values['HASVALUE'] = '1') and (EffChildCount(Node) >= 4) then
   begin
     ProcessExpression(Node.GetChild(3), VV);
     VR := EnsureIntRegister(VV);
@@ -14112,6 +16615,7 @@ begin
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(MakeSSAConstInt(Mode), nil);
   Instr.AddPhiSource(VR, nil);                  // PhiSources[1] = the blend-value REGISTER
+  if HasTarget then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessImageConvertRow(Node: TASTNode);
@@ -16990,6 +19494,8 @@ var
   HandleVal, FilenameVal, ModeVal: TSSAValue;
   HandleReg, FilenameReg, ModeReg: TSSAValue;
   RecLenVal, RecLenStr, RecLenTrim: TSSAValue;   // FOR RANDOM: "L" + LEN = <expr>
+  EncVal, EncVal2, EncTilde, EncCat: TSSAValue;  // ENCODING <expr>: "~" + the name, built at run time
+  EncIdx: Integer;
   HandleNameIdx: Integer;
   HandleChild: TASTNode;
   HandleStr: string;
@@ -17117,6 +19623,28 @@ begin
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
+  // ⭐ "ENCODING <expr>": a name that is only known at RUN time (fbc's own tests write
+  // "encoding encod" and "encoding files(i).encoding"). The parser could not bake a marker into the
+  // mode string, so it left the expression as a child and named its index; the marker is built here
+  // the same way the RANDOM record length is, by CONCATENATION, and the file layer maps the name.
+  // The '~' stays a SUFFIX of the mode string, which is what everything downstream reads.
+  if Node.Attributes.Values['ENCEXPR'] <> '' then
+  begin
+    EncIdx := StrToIntDef(Node.Attributes.Values['ENCEXPR'], -1);
+    if (EncIdx >= 0) and (EncIdx < Node.ChildCount) then
+    begin
+      ProcessStringExpression(Node.GetChild(EncIdx), EncVal);
+      EncTilde := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaLoadConstString, EncTilde, MakeSSAConstString('~'),
+                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EncCat := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrConcat, EncCat, ModeReg, EncTilde, MakeSSAValue(svkNone));
+      EncVal2 := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrConcat, EncVal2, EncCat, EnsureStringRegister(EncVal), MakeSSAValue(svkNone));
+      ModeReg := EncVal2;
+    end;
+  end;
+
   // Emit DOPEN instruction
   // Dest = none (statement) / int error code (function form), Src1 = handle, Src2 = filename, Src3 = mode
   ResultVal := MakeSSAValue(svkNone);
@@ -17134,78 +19662,73 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessDclose(Node: TASTNode);
+// DCLOSE/CLOSE #h [, #h ...]: close each named channel.
+//
+// ⛔ IT READ CHILD 0 AND NOTHING ELSE. FreeBASIC writes "Close #1, #2" - one statement, several
+// channels - and the parser had no comma loop, so the second handle ended the statement as
+// "Unexpected token in statement: #". Every handle is a child now, and each gets its own close; a
+// statement with none still closes channel 0, as it did.
 var
-  HandleVal: TSSAValue;
-  HandleReg: TSSAValue;
+  HandleVal, HandleReg: TSSAValue;
   HandleChild: TASTNode;
   HandleStr: string;
-  HandleNum: Integer;
-begin
-  if FCurrentBlock = nil then Exit;
+  HandleNum, ChildIdx: Integer;
 
-  { DCLOSE #handle
-    AST structure:
-      Child 0: Handle (antLiteral for numeric, antIdentifier for named)
-
-    SSA encoding (handle in Src1, not Dest, to avoid SSA versioning issues):
-      Dest = none
-      Src1 = handle register (int) }
-
-  // Parse handle (first child)
-  if Node.ChildCount > 0 then
+  function HandleRegOf(N: TASTNode): TSSAValue;
   begin
-    HandleChild := Node.GetChild(0);
-    if HandleChild.NodeType = antLiteral then
+    if N.NodeType = antLiteral then
     begin
-      // Numeric handle: #1, #2, etc.
-      ProcessExpression(HandleChild, HandleVal);
-      HandleReg := EnsureIntRegister(HandleVal);
-    end
-    else if HandleChild.NodeType = antIdentifier then
+      ProcessExpression(N, HandleVal);
+      Result := EnsureIntRegister(HandleVal);
+      Exit;
+    end;
+    if N.NodeType = antIdentifier then
     begin
-      // Check if this is a "#N" style handle (lexer merged # and number)
-      HandleStr := VarToStr(HandleChild.Value);
-      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and
-         (HandleStr[2] in ['0'..'9']) then
+      // A "#N" style handle (the lexer merged '#' and the number into one identifier).
+      HandleStr := VarToStr(N.Value);
+      if (Length(HandleStr) > 1) and (HandleStr[1] = '#') and (HandleStr[2] in ['0'..'9']) then
       begin
-        // Extract numeric handle from "#N" format
         HandleNum := StrToIntDef(Copy(HandleStr, 2, Length(HandleStr) - 1), 1);
-        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(HandleNum),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      end
-      else if FModernMode then
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(HandleNum),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
+      if FModernMode then
       begin
         // FreeBASIC: the handle is a variable holding the file number; evaluate it.
-        ProcessExpression(HandleChild, HandleVal);
-        HandleReg := EnsureIntRegister(HandleVal);
-      end
-      else
-      begin
-        // Legacy named handle: #MYFILE - placeholder 0.
-        HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        ProcessExpression(N, HandleVal);
+        Result := EnsureIntRegister(HandleVal);
+        Exit;
       end;
-    end
-    else
-    begin
-      ProcessExpression(HandleChild, HandleVal);
-      HandleReg := EnsureIntRegister(HandleVal);
+      // Legacy named handle: #MYFILE - placeholder 0.
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
     end;
-  end
-  else
-  begin
-    // No handle - close all? Use handle 0
-    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
-                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ProcessExpression(N, HandleVal);
+    Result := EnsureIntRegister(HandleVal);
   end;
 
-  // Emit DCLOSE instruction
-  // Dest = none, Src1 = handle
-  EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
-                 MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+begin
+  if FCurrentBlock = nil then Exit;
+  if Node.ChildCount = 0 then
+  begin
+    HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, HandleReg, MakeSSAConstInt(0),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  for ChildIdx := 0 to Node.ChildCount - 1 do
+  begin
+    HandleChild := Node.GetChild(ChildIdx);
+    HandleReg := HandleRegOf(HandleChild);
+    EmitInstruction(ssaDclose, MakeSSAValue(svkNone), HandleReg,
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
 end;
 
 procedure TSSAGenerator.ProcessFileSetEof(Node: TASTNode);
@@ -17640,8 +20163,13 @@ begin
         EmitInstruction(ssaInputFileLine, VarReg, HandleReg,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone))
       else
+        // ⛔ ...and with the READ KIND alongside it, the mirror of the one PRINT#/WRITE# carries.
+        // A file is not a lesser console in either direction: fbc's INPUT# knows the word "true"
+        // when the destination is a BOOLEAN, so a value WE had just written as "true" read back as
+        // 0. The kind is computed by the same FilePrintKind the writing side uses, off the same
+        // declared type, so the two halves cannot drift apart.
         EmitInstruction(ssaInputFile, VarReg, HandleReg,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                       MakeSSAConstInt(FilePrintKind(VarChild, VarReg)), MakeSSAValue(svkNone));
     end;
     // Skip separators and other nodes
     Inc(i);
@@ -18570,6 +21098,13 @@ begin
   k := FirstOwn;
   while (t < Targets.ChildCount) and (k <= High(FUDTs[SrcUDT].Fields)) do
   begin
+    // ⭐ An EMPTY slot ("Let( foo, , baz ) = f()") holds its POSITION and receives nothing: the third
+    // target still takes the third field, which is the only reason the placeholder exists.
+    if Targets.GetChild(t).Attributes.Values['LETSKIP'] = '1' then
+    begin
+      Inc(t); Inc(k);
+      Continue;
+    end;
     Asg := TASTNode.Create(antAssignment, Node.Token);
     Asg.AddChild(Targets.GetChild(t).Clone);
     Asg.AddChild(MakeFieldAccess(SrcNode, FUDTs[SrcUDT].Fields[k].Name, Node.Token));
@@ -18582,6 +21117,7 @@ end;
 procedure TSSAGenerator.ProcessDelete(Node: TASTNode);
 var
   StartVal, EndVal, StartReg, EndReg: TSSAValue;
+  DelTarget: TASTNode;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -18597,20 +21133,32 @@ begin
   // the statement fell into the line-delete path below and emitted a CLASSIC opcode the VM has no arm
   // for. ⚠️ Invisible with the optimizer ON, which dropped the dead statement: only --no-opt failed, so
   // the corpus caught it as an OPTDIFF rather than as an error.
-  if (Node.ChildCount >= 1) and
-     ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antProcAddress) or
-      ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
-       (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-       ((ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) >= 0) or
-        // ...and "Delete[] p[i]", a CELL of a pointer-to-pointer - the manual's own way of freeing the
-        // second dimension of a 2-dimensional object array (operator/nested_new). The base is a POINTER,
-        // not a declared array, so the array test alone sent it down the line-delete path and emitted
-        // bcDelete - the SAME classic opcode, the SAME silence with the optimizer on, one spelling later.
-        IsRawPtr(VarToStr(Node.GetChild(0).GetChild(0).Value)) or
-        (ManagedPtrPointee(VarToStr(Node.GetChild(0).GetChild(0).Value)) <> '')))) then
+  // ⛔⛔ THE RULE IS INVERTED, and that is the whole point of this rewrite. It used to be a WHITELIST of
+  // node kinds - an identifier, then "@r", then "a(i)", then "p[i]" - and the three comments above
+  // record three separate days on which a new SPELLING of the same statement fell through it, emitted
+  // the CLASSIC line-delete opcode and freed nothing. The fourth was "Delete (p)": parentheses.
+  // ⇒ A whitelist of shapes cannot be finished. The CLASSIC form is the closed one - it attaches
+  //   line-number LITERALS and nothing else - so in MODERN anything that is not a literal is the
+  //   FreeBASIC heap delete. One rule, and no fifth spelling to wait for.
+  // ⚠️ Every one of those days it was INVISIBLE with the optimizer on, which dropped the dead
+  //   instruction: only --no-opt failed. That is the whole reason to run the suite both ways.
+  if (Node.ChildCount >= 1) and FModernMode then
   begin
-    EmitDeleteObject(Node);
-    Exit;
+    DelTarget := Node.GetChild(0);
+    while (DelTarget.NodeType = antParentheses) and (DelTarget.ChildCount >= 1) do
+      DelTarget := DelTarget.GetChild(0);
+    if DelTarget.NodeType <> antLiteral then
+    begin
+      // Parentheses around the target carry no meaning: drop them so EmitDeleteObject sees the pointer.
+      if DelTarget <> Node.GetChild(0) then
+      begin
+        DelTarget := DelTarget.Clone;
+        Node.ClearChildren;
+        Node.AddChild(DelTarget);
+      end;
+      EmitDeleteObject(Node);
+      Exit;
+    end;
   end;
 
   // DELETE [start[-end]]
@@ -18921,6 +21469,21 @@ begin
   EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);
 end;
 
+function TSSAGenerator.IsMemberArrayField(MemberNode: TASTNode): Boolean;
+// "obj.name" where name is an ARRAY member of obj's type — asked WITHOUT emitting anything, so a caller
+// can decide which address family a "obj.name(i)" belongs to before it commits to one.
+var
+  TypeName: string;
+  Slot, DimCount: Integer;
+  Bank: TSSARegisterType;
+begin
+  Result := False;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  Result := UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, Bank, DimCount);
+end;
+
 function TSSAGenerator.TryEmitIndexedElementAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
 // "<raw pointer expression>[i]" as an ADDRESSABLE place: emit the element's address on the raw byte
 // heap and answer True. Two spellings reach here — "obj.field[i]" (a "<scalar> PTR" MEMBER, which is
@@ -18938,7 +21501,18 @@ begin
   if Node.GetChild(0).NodeType = antMemberAccess then
   begin
     Pointee := MemberRawPtrPointee(Node.GetChild(0));
-    if Pointee = '' then Exit;
+    // ...and a member ARRAY element, "this.v(i)", whose address is the packed one EmitArrayElementAddress
+    // builds from the field's run-time handle. It is not a raw byte address, so it must not go through the
+    // raw branch above - the two kinds are not interchangeable.
+    if Pointee = '' then
+    begin
+      if (Node.Attributes.Values['BRACKET'] <> '1') and IsMemberArrayField(Node.GetChild(0)) then
+      begin
+        EmitArrayElementAddress(Node, Addr);
+        Exit(True);
+      end;
+      Exit;
+    end;
     Addr := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), Pointee);
     Exit(True);
   end;
@@ -18949,6 +21523,22 @@ begin
     Addr := EmitPointerIndexAddress(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
     Exit(True);
   end;
+end;
+
+function TSSAGenerator.TryEmitDerefTargetAddress(Node: TASTNode; out Addr: TSSAValue): Boolean;
+// "*<expr>" as an ADDRESSABLE place: the address is the pointer itself, so nothing has to be taken -
+// the operand is evaluated and handed back. The shape a BYREF cast operator over a fixed-length buffer
+// is written in ("Operator = *Cast(ZString Ptr, @_data)"), and the one IsAddressableReturn used to
+// reject, which turned such an operator into a VALUE return: readable, never writable.
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
+  ProcessExpression(Node.GetChild(0), Addr);
+  Addr := EnsureIntRegister(Addr);
+  Result := True;
 end;
 
 function TSSAGenerator.ProcessIndexOperatorStore(VarNode, ExprNode: TASTNode): Boolean;
@@ -18963,7 +21553,35 @@ begin
   Result := False;
   Lbl := IndexOperatorLabel(VarNode, ObjType);
   if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
-  ProcessMethodCall(VarNode.GetChild(0), ObjType, 'OPERATOR[]', VarNode.GetChild(1), AddrVal);
+  ProcessMethodCall(VarNode.GetChild(0), ObjType, 'OPERATOR[]', VarNode.GetChild(1), AddrVal, False, True);
+  AddrVal := EnsureIntRegister(AddrVal);
+  ProcessExpression(ExprNode, ExprValue);
+  EmitByrefRetStore(AddrVal, ExprValue, Lbl);
+  Result := True;
+end;
+
+function TSSAGenerator.ProcessByrefMethodStore(VarNode, ExprNode: TASTNode): Boolean;
+// "obj.m(args) = expr" where m is declared "ByRef As T": the call yields the referenced variable's
+// ADDRESS and the value is stored through it - the protocol ProcessIndexOperatorStore already uses for
+// "v[i] = expr" and ProcessCastOperatorStore for "Cast(T, u) = expr". A method returning BY VALUE hands
+// back a copy, which is not assignable (fbc rejects it too), so this answers False and emits nothing.
+var
+  ObjType, MethNm, Lbl: string;
+  MemberNode, ArgsNode: TASTNode;
+  AddrVal, ExprValue: TSSAValue;
+begin
+  Result := False;
+  if (VarNode = nil) or (VarNode.NodeType <> antArrayAccess) or (VarNode.ChildCount < 1) then Exit;
+  MemberNode := VarNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  ObjType := ObjectTypeName(MemberNode.GetChild(0));
+  if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
+  MethNm := VarToStr(MemberNode.Value);
+  if VarNode.ChildCount >= 2 then ArgsNode := VarNode.GetChild(1) else ArgsNode := nil;
+  Lbl := ResolveMethodLabelArgs(ObjType, MethNm, ArgsNode);
+  if Lbl = '' then Lbl := ResolveMethodLabel(ObjType, MethNm);
+  if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
+  ProcessMethodCall(MemberNode.GetChild(0), ObjType, MethNm, ArgsNode, AddrVal, False, True);
   AddrVal := EnsureIntRegister(AddrVal);
   ProcessExpression(ExprNode, ExprValue);
   EmitByrefRetStore(AddrVal, ExprValue, Lbl);
@@ -19000,7 +21618,7 @@ begin
     Lbl := ResolveMethodLabel(ObjType, MethNm);
   end;
   if (Lbl = '') or not ByrefRetByAddress(Lbl) then Exit;
-  ProcessMethodCall(Inner, ObjType, MethNm, nil, AddrVal);
+  ProcessMethodCall(Inner, ObjType, MethNm, nil, AddrVal, False, True);
   AddrVal := EnsureIntRegister(AddrVal);
   ProcessExpression(ExprNode, ExprValue);
   EmitByrefRetStore(AddrVal, ExprValue, Lbl);
@@ -19186,9 +21804,7 @@ begin
   Lbl := IndexOperatorLabel(Node, ObjType);
   if Lbl = '' then Exit;
   ProcessMethodCall(Node.GetChild(0), ObjType, 'OPERATOR[]', Node.GetChild(1), Value);
-  if ByrefRetByAddress(Lbl) then
-    Value := EmitByrefRetDeref(EnsureIntRegister(Value), Lbl);
-  Result := True;
+  Result := True;   // the BYREF dereference happens inside ProcessMethodCall now
 end;
 
 function TSSAGenerator.EmitByrefRetDeref(const AddrVal: TSSAValue; const Lbl: string): TSSAValue;
@@ -19212,7 +21828,10 @@ begin
   end;
   case Bank of
     srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // The immediate carries the WIDTH of the pointee, which only a RAW address needs: text there is a C
+    // string and a WSTRING one is UCS-2. A packed address ignores it.
+    srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
+                               MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
   else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 end;
@@ -19235,7 +21854,8 @@ begin
   end;
   case Bank of
     srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), MakeSSAValue(svkNone));
-    srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val), MakeSSAValue(svkNone));
+    srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val),
+                               MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
   else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), MakeSSAValue(svkNone));
   end;
 end;
@@ -19341,6 +21961,20 @@ begin
   MaxAl := 1; Ofs := 0;
   for i := 0 to n - 1 do
   begin
+    // ⭐ A BIT-FIELD CONTINUATION SHARES THE UNIT BEFORE IT: same offset, and it advances nothing - and
+    // it contributes NO ALIGNMENT of its own, which is why the test stands before the shape work and
+    // not after it. Put after, a "Boolean b:1, Integer i:1" pair still rounded the type up to EIGHT
+    // bytes: the continuation was not given a slot but its alignment was still counted.
+    // AssignBitFieldRuns marks these members; the LIVE layout has honoured the mark from the start and
+    // these two C routines never did, so SizeOf and OffsetOf answered as if every bit member had a unit
+    // of its own ("Short a:3, Short b:8" said 4 where fbc says 2).
+    // ⛔ THE THIRD TIME a UDT rule lived in one of the three layout routines and was missing from the
+    // others; UDT_DIAG=1 had been printing the disagreement all along ("SIZE DISAGREES ... C=4 live=2").
+    if (i > 0) and FUDTs[UDTIdx].Fields[i].BitContinues then
+    begin
+      Offsets[i] := Offsets[i - 1];
+      Continue;
+    end;
     if FUDTs[UDTIdx].Fields[i].IsArray then
     begin
       if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB) then Exit;
@@ -19760,6 +22394,15 @@ begin
     ChainNode := ObjNode;
     Exit(True);
   end;
+  // ⭐ "(*p).field" IS "p->field", and it used to reach here as a shape this routine did not know:
+  // an antDeref, possibly parenthesised, instead of the bare name. So the raw byte-offset path
+  // declined, the managed record path took the raw address for a table index, and the VM died - on
+  // the FIELD as much as on a method call. Unwrapped here, at the ONE predicate both halves ask,
+  // rather than at either caller.
+  while (ObjNode <> nil) and (ObjNode.ChildCount >= 1) and
+        (ObjNode.NodeType in [antParentheses, antDeref]) do
+    ObjNode := ObjNode.GetChild(0);
+  if ObjNode = nil then Exit;
   if ObjNode.NodeType = antIdentifier then
     BaseNode := ObjNode
   else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
@@ -20497,19 +23140,58 @@ begin
   Result := 'PROC_' + UpperCase(Name);
 end;
 
-function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer): string;
+procedure TSSAGenerator.StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);
+// Record on an "@f" node the PARAMETER TYPES its destination declares, so an overload set can be told
+// apart by more than the parameter COUNT. Sig is the "FPPARAMS|FPRET" the declaration carries; only the
+// params half is used, and only a bare "@name" is stamped - anything else already names one procedure.
+var
+  P: Integer;
+begin
+  if (InitNode = nil) or (Sig = '') then Exit;
+  while (InitNode.NodeType = antParentheses) and (InitNode.ChildCount >= 1) do
+    InitNode := InitNode.GetChild(0);
+  if (InitNode.NodeType <> antProcAddress) or (InitNode.ChildCount <> 0) then Exit;
+  P := Pos('|', Sig);
+  if P > 1 then InitNode.Attributes.Values['SIGPARAMS'] := Copy(Sig, 1, P - 1)
+  else if P = 0 then InitNode.Attributes.Values['SIGPARAMS'] := Sig;
+end;
+
+function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer;
+  const FPParams: string): string;
 // The member of an OVERLOAD set to take the address of. An overload set has no bare label - every member
 // carries a "~<sig>" suffix - so "@s" / "ProcPtr(s)" had nothing to point at and died as an undefined
 // procedure. With a signature argument ("ProcPtr(s, Sub(ByVal i As Integer))", fbc 1.09+) the parameter
 // COUNT picks the member; without one, the first declared member, which is what a program with a single
 // candidate means. Returns Name unchanged when it is not an overload set.
+//
+// ⭐ ...AND THE DESTINATION'S OWN PARAMETER TYPES PICK IT WHEN THE COUNT CANNOT. Two overloads of one
+// arity - "fun(ByRef As A)" and "fun(ByRef As B)" - both signed the bank 'I' (every UDT is a handle),
+// so the count matched BOTH and the FIRST won every "@fun": a program assigning @fun to a
+// "function(ByRef As B)" pointer called the A one and answered its value, in silence. FPParams is the
+// DESTINATION's declared parameter-type list, and it is compared against the type tail the declaration
+// already carries - the same tail ResolveCallLabel matches, with the same namespace tolerance.
+// ⛔ Only a UNIQUE match is taken: two candidates that fit equally well leave the arity rule in place,
+// which is what it did before.
 var
-  Pref, BankPart: string;
-  k: Integer;
+  Pref, BankPart, Cand: string;
+  k, Hits: Integer;
 begin
   Result := Name;
   if FProcDecls.ContainsKey(UpperCase(Name)) then Exit;
   Pref := UpperCase(Name) + '~';
+  if FPParams <> '' then
+  begin
+    Cand := ''; Hits := 0;
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        if not TypeTailMatchesCanonical(UpperCase(FPParams),
+                 SigNamePart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) then Continue;
+        Inc(Hits);
+        Cand := FProcedureNames[k];
+      end;
+    if (Hits = 1) and (Cand <> '') then Exit(Cand);
+  end;
   for k := 0 to FProcedureNames.Count - 1 do
     if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
     begin
@@ -20662,11 +23344,18 @@ begin
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
-        idx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+        idx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
         if idx >= 0 then Result := PtrInt(FArrayElemWidth.Objects[idx]);
       end;
     antMemberAccess:
       Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
+    // RGB/RGBA answer a ULONG and PMAP a SINGLE. Their widths are registered under their own names
+    // beside their print forms; a graphics function is a node type of its own, so it has to ask.
+    antGraphicsFunction:
+    begin
+      idx := FVarWidthCode.IndexOf(UpperCase(VarToStr(Node.Value)));
+      if idx >= 0 then Result := PtrInt(FVarWidthCode.Objects[idx]);
+    end;
     antFunctionCall:
     begin
       // A nested fixed-width conversion carries its own result width, so "CSign(CUnsg(x))" round-trips: the
@@ -20731,6 +23420,12 @@ begin
     Size := F.StrCapacity; Align := 1; Exit;        // ZSTRING * n: the terminator is inside the n
   end;
   if F.Bank = srtString then begin Size := 24; Align := 8; Exit; end;   // string descriptor
+  // ⛔ AN ARRAY MEMBER IS EIGHT BYTES HERE AND THAT IS NOT NEGOTIABLE: this is the shape of the LIVE
+  // field, the one ComputeUDTLiveLayout builds the record image from, and our storage keeps a handle
+  // there. Reporting the inline size from here put a 1 MB member array into LiveBytes, which is packed
+  // into a SIXTEEN-BIT immediate - 1048576 and $FFFF is 0 - so a plain "Dim As T v" on such a type
+  // allocated nothing and died with an access violation at exactly 2^20 and not one byte below.
+  // What fbc SAYS the field measures is a different question, and UDTFieldReportShape answers it.
   if F.IsArray or (F.NestedType <> '') or (F.PtrPointee <> '') or
      (F.RawPtrPointee <> '') or (F.FuncPtrSig <> '') then
   begin
@@ -20746,9 +23441,84 @@ begin
   Align := Size;
 end;
 
-function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
+procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);
+// What fbc SAYS a field measures, as against what our live image holds for it (UDTFieldCShape).
+// The two differ in exactly one place: a FIXED-LENGTH array member, which fbc lays out inline and we
+// back with a handle. Used by SizeOf, OffsetOf and by UDTCLayout in its reporting mode - never by
+// anything that allocates, copies or writes an image.
+begin
+  if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then Exit;
+  UDTFieldCShape(UDTIdx, FieldIdx, Size, Align);
+end;
+
+function TSSAGenerator.FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;
+// The C shape of a FIXED-LENGTH array member: element count * element size, aligned like the element.
+// Answers False - and touches nothing - for a member whose image we do not reproduce: a dynamic array
+// (no concrete bounds), an array of RECORDS or of POINTERS (the elements are handles), or an element
+// type we cannot size.
+var
+  F: TUDTField;
+  D, UbExpr, LbExpr: TASTNode;
+  di: Integer;
+  Lb, Ub, Count, ElemSz: Int64;
+begin
+  Result := False;
+  Size := 8; Align := 8;
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  if GetEnvironmentVariable('UDTSIZE_DIAG') = '1' then
+    WriteLn(StdErr, 'UDTSIZE: ', FUDTs[UDTIdx].Name, '.', F.Name,
+            ' IsArray=', F.IsArray, ' bounds=', Assigned(F.ArrayBounds),
+            ' elem="', F.ArrayElemType, '" scalar="', F.ArrayElemScalarType,
+            '" elemptr="', F.ArrayElemPtrPointee, '"');
+  if (not F.IsArray) or (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount < 1) then Exit;
+  if F.ArrayElemType <> '' then Exit;                                       // element is a record
+  if F.ArrayElemPtrPointee <> '' then Exit;                                 // element is a pointer
+  if F.ArrayElemScalarType = '' then Exit;
+  if (Length(F.ArrayElemScalarType) >= 4) and
+     (Copy(F.ArrayElemScalarType, Length(F.ArrayElemScalarType) - 3, 4) = ' PTR') then Exit;
+  ElemSz := TypeSizeBytes(F.ArrayElemScalarType);
+  if ElemSz <= 0 then Exit;
+  Count := 1;
+  D := F.ArrayBounds;
+  for di := 0 to D.ChildCount - 1 do
+  begin
+    if D.GetChild(di).NodeType = antDimRange then
+    begin
+      LbExpr := D.GetChild(di).GetChild(0);
+      UbExpr := D.GetChild(di).GetChild(1);
+      if not TryFoldConstIntExpr(LbExpr, Lb) then Exit;
+    end
+    else
+    begin
+      LbExpr := nil;
+      UbExpr := D.GetChild(di);
+      Lb := 0;
+    end;
+    if not TryFoldConstIntExpr(UbExpr, Ub) then Exit;
+    if Ub < Lb then Exit;
+    Count := Count * (Ub - Lb + 1);
+  end;
+  if Count <= 0 then Exit;
+  Size := Count * ElemSz;
+  Align := ElemSz;
+  if Align > 8 then Align := 8;
+  Result := True;
+end;
+
+function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64;
+                                  ReportOnly: Boolean = False): Boolean;
 // The C byte layout of a UDT: the offset of every field plus the type's total size, exactly as fbc
-// lays it out. Each field starts at the next multiple of its own alignment (capped by "FIELD = n"),
+// lays it out.
+//
+// ⛔⛔ TWO QUESTIONS, AND THEY ARE NOT THE SAME ONE. By default this answers "is there an image we can
+// REPRODUCE", and its callers act on that: the binary GET/PUT of a whole record walks the fields and
+// writes them, and the layout AUDIT checks the invariant "where a C image exists, it IS the live
+// image". ReportOnly asks the other question - "what does fbc SAY this type measures" - which is all
+// SizeOf and OffsetOf need. A FIXED-LENGTH ARRAY MEMBER separates them: fbc lays its elements out
+// inline and we keep a handle there, so its SIZE is reportable and its IMAGE is not.
+// ⚠️ Answering the reporting question everywhere is what broke first: with the C layout suddenly
+// available, the RAW allocation path took over for such a type and "New T" on a type with a 1 MB member
+// array died with an access violation. Each field starts at the next multiple of its own alignment (capped by "FIELD = n"),
 // and the whole type is rounded up to the largest alignment used -- which is why "String * 32 + Double"
 // is 48 bytes (33 + 7 padding + 8) while the same pair under "Field = 1" is 41.
 // Returns False when the type has a shape whose image we cannot reproduce (a variable-length string,
@@ -20768,9 +23538,20 @@ begin
   MaxAl := 1; Ofs := 0;
   for i := 0 to n - 1 do
   begin
+    // A BIT-FIELD CONTINUATION shares the unit before it and contributes no alignment - the same guard
+    // UDTCLayoutRaw carries, and in the same position, before the shape work.
+    if (i > 0) and FUDTs[UDTIdx].Fields[i].BitContinues then
+    begin
+      Offsets[i] := Offsets[i - 1];
+      Continue;
+    end;
+    // ...and the ARRAY exclusion is now narrower: a FIXED-length array of scalars is reproducible
+    // (see UDTFieldCShape), so only a dynamic one - or an array of records/pointers - still declines.
     with FUDTs[UDTIdx].Fields[i] do
-      if IsArray or (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
-    UDTFieldCShape(UDTIdx, i, Sz, Al);
+      if (IsArray and not (ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2))) or
+         (NestedType <> '') or ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+    if ReportOnly then UDTFieldReportShape(UDTIdx, i, Sz, Al)
+    else UDTFieldCShape(UDTIdx, i, Sz, Al);
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
@@ -20891,7 +23672,7 @@ begin
     if (NIdx = 0) and (ArrIdx >= 0) then
     begin
       W := 0;
-      WIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(ValueNode.GetChild(0).Value)));
+      WIdx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(ValueNode.GetChild(0).Value)));
       if WIdx >= 0 then W := PtrInt(FArrayElemWidth.Objects[WIdx]);
       Bank := 0;
       if FProgram.GetArray(ArrIdx).ElementType = srtFloat then Bank := 1;
@@ -21031,16 +23812,59 @@ begin
   Result := -1;
   if not FModernMode then Exit;
   Nm := UpperCase(Name);
-  Cap := StrToIntDef(FFixedLenVars.Values[Nm], 0);
+  Cap := StrCapOf(FFixedLenVars, Nm, 0);
   if Cap <= 0 then
   begin
     // ZSTRING and WSTRING vars share one registry, and it holds CHARACTERS (n-1), so the declared n is
     // Cap+1 - bytes for a ZSTRING, 2-byte units for a WSTRING.
-    Cap := StrToIntDef(FZStringVars.Values[Nm], 0);
+    Cap := StrCapOf(FZStringVars, Nm, 0);
     if Cap <= 0 then Exit;
     if IsWStringVar(Nm) then Exit((Cap + 1) * 2) else Exit(Cap + 1);
   end;
   Result := Cap + 1;   // "String * n": the n characters plus the terminator fbc keeps
+end;
+
+function TSSAGenerator.CurrentProcParamTypeName(const Name: string): string;
+// The type a PARAMETER of the procedure being lowered was declared as, read off that procedure's OWN
+// declaration. '' when the name is not one of its parameters.
+// ⛔ It exists because the bare-name maps cannot answer for a parameter: they are keyed by NAME, so two
+// OVERLOADS that share a parameter name share the entry. With "Constructor W( ByVal v As Integer )"
+// declared beside "Constructor W( ByRef v As String )", "Len( v )" inside the STRING one answered 8 -
+// the size of an Integer. Renaming either parameter made the same program right, which is the
+// signature of a by-name collision and the same disease RegisterTypedVar's own comment describes.
+var
+  Decl, ParamList, Pm: TASTNode;
+  i: Integer;
+begin
+  Result := '';
+  if FCurrentProcName = '' then Exit;
+  if not (FProcDecls.TryGetValue(FCurrentProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    Pm := ParamList.GetChild(i);
+    if UpperCase(VarToStr(Pm.Value)) <> UpperCase(Name) then Continue;
+    if Pm.Attributes.Values['ARRAY'] = '1' then Exit;      // an array parameter is not a scalar
+    if (Pm.ChildCount >= 1) and (Pm.GetChild(0).NodeType = antIdentifier) and
+       not ((Pm.Attributes.Values['HASDEFAULT'] = '1') and (Pm.ChildCount = 1)) then
+      Result := UpperCase(VarToStr(Pm.GetChild(0).Value));
+    Exit;
+  end;
+end;
+
+function TSSAGenerator.StringLiteralBytes(Node: TASTNode; out Bytes: Int64): Boolean;
+// A STRING LITERAL's size in bytes as fbc reports it: the characters plus the NUL terminator, because a
+// literal has type "ZString * (n+1)" there and not the STRING descriptor. Answers False for anything
+// that is not (or does not wrap) a literal string.
+begin
+  Result := False;
+  Bytes := 0;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType <> antLiteral then Exit;
+  if VarType(Node.Value) <> varString then Exit;
+  Bytes := Length(VarToStr(Node.Value)) + 1;
+  Result := True;
 end;
 
 function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
@@ -21097,6 +23921,16 @@ begin
   end;
   if (Nm2 <> '') and (Nm2 <> 'STRING') and (Nm2 <> 'ZSTRING') and (Nm2 <> 'WSTRING') then
     Exit(TypeSizeBytes(Nm2));
+  // ⭐ A PARAMETER answers from its OWN declaration, before any bare-name map is consulted - see
+  // CurrentProcParamTypeName for what goes wrong when it does not.
+  Nm2 := CurrentProcParamTypeName(Nm);
+  if Nm2 <> '' then
+  begin
+    if (Nm2 = 'STRING') or (Nm2 = 'ZSTRING') or (Nm2 = 'WSTRING') then Exit(-1);   // the string path
+    if Pos(' PTR', Nm2) > 0 then Exit(8);
+    if FindUDT(Nm2) >= 0 then Exit(-1);   // a UDT parameter is handled above, by ObjectTypeName
+    if TypeSizeBytes(Nm2) > 0 then Exit(TypeSizeBytes(Nm2));
+  end;
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
   if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
   if GetVariableType(Nm) = srtString then Exit;
@@ -21332,7 +24166,7 @@ begin
     antArrayAccess:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
-        idx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+        idx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
         if idx >= 0 then Result := PtrInt(FArrayElemWidth.Objects[idx]);
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
@@ -21507,7 +24341,7 @@ begin
           Result := PrintKindOf(VarToStr(Node.GetChild(0).Value)) = 4;
           if not Result then
           begin
-            AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+            AwIdx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
             Result := (AwIdx >= 0) and (PtrInt(FArrayElemWidth.Objects[AwIdx]) = 7);
           end;
           // A call to an intrinsic parses as an array access too ("Sqr(s)" is name + argument list).
@@ -21632,7 +24466,11 @@ begin
       if (Result = 0) and FModernMode then
       begin
         AwCode := OperandWidthCode(Node);
-        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        // ⛔ ...AND CODE 8, the 64-bit unsigned pair (UINTEGER/ULONGINT), which this list did not have.
+        // It is print kind 2, not 3 - a full-width unsigned needs the wider form - and PrintKindOfType
+        // has answered 2 for those two names all along: only the DERIVED path was missing them.
+        else if AwCode = 8 then Result := 2;
       end;
     end;
     antGraphicsFunction:
@@ -21670,6 +24508,14 @@ begin
            (ArrayIndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0) then
           Exit(1);
         Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
+        // ⛔ ...but a POINTER's own print kind is not its ELEMENT's. "p[i]" reads the POINTEE, and the
+        // pointee's type is what decides the sign space - the pointer prints unsigned because an address
+        // is unsigned, which says nothing about the Integer it points at. Cleared here so the pointee
+        // rules just below answer instead; without it "Print p[0]" over an Integer array lost the space.
+        if (Result <> 0) and
+           (Pos(' PTR', UpperCase(PointeeTypeOf(UpperCase(VarToStr(Node.GetChild(0).Value))))) = 0) and
+           (PointeeTypeOf(UpperCase(VarToStr(Node.GetChild(0).Value))) <> '') then
+          Result := 0;
         // An element of an array declared AS a NARROW UNSIGNED type (UByte/UShort/ULong) prints unsigned
         // too -- without the leading sign space, like the scalar form. Array names are never in
         // FVarPrintKind (only scalars/params/returns), but the element's narrow width IS in FArrayElemWidth:
@@ -21678,7 +24524,7 @@ begin
         // reach the unsigned-64 compare/div/mod opcodes.
         if Result = 0 then
         begin
-          AwIdx := FArrayElemWidth.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value)));
+          AwIdx := FArrayElemWidth.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value)));
           if AwIdx >= 0 then
           begin
             AwCode := PtrInt(FArrayElemWidth.Objects[AwIdx]);
@@ -21761,7 +24607,13 @@ begin
       begin
         AwCode := TypeNameWidthCode(UpperCase(DerefedType(Node.GetChild(0))));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        // ⭐ ...AND A BOOLEAN POINTEE PRINTS true/false. This arm knew the WIDTH codes and not the
+        // print FORM: "*b" through a "Boolean Ptr" printed -1/0 where fbc prints true/false, while the
+        // variable it points at printed right. PrintKindOfType is the same answer the declaration side
+        // gives, and it says nothing about an ordinary numeric - so nothing else moves.
+        // fbc suite boolean/boolean_ptr.
+        else Result := PrintKindOfType(UpperCase(DerefedType(Node.GetChild(0))));
       end;
     antCast:
       // "Cast(UByte, -1)" is 255 with NO leading sign space: the cast gives the value an UNSIGNED type,
@@ -21771,7 +24623,12 @@ begin
       if FModernMode then
       begin
         AwCode := TypeNameWidthCode(UpperCase(VarToStr(Node.Value)));
-        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        // ⛔ ...AND CODE 8, the 64-bit unsigned pair. "Print Cast(ULongInt, 1)" printed " 1" with a sign
+        // column where fbc prints "1". Kind 2, not 3: a FULL-WIDTH unsigned is not the narrow case above
+        // (which promotes to a signed expression). The arm two branches up - the deref of an unsigned
+        // pointer - already had this line; this one is its twin and did not.
+        else if AwCode = 8 then Result := 2;
       end;
     antLiteral:
       // FreeBASIC gives a DECIMAL integer literal the first type on the ladder Long -> ULong -> LongInt ->
@@ -21981,7 +24838,7 @@ begin
   // as the JIT: a bare "Dim dyn()" registers ONE dimension and a later "ReDim dyn(1 To 3, 4 To 9)"
   // never revisits it, so both engines answered 18 for UBound(dyn,1) where fbc says 3. The pre-pass
   // is the second half of the question.
-  if FMultiDimArrays.IndexOf(UpperCase(FProgram.GetArray(ArrayIdx).Name)) >= 0 then Exit;
+  if FMultiDimArrays.IndexOf(ArrayBareName(UpperCase(FProgram.GetArray(ArrayIdx).Name))) >= 0 then Exit;
   Result := MakeSSAConstInt(1);
 end;
 
@@ -22172,6 +25029,28 @@ begin
   end;
 end;
 
+function TSSAGenerator.TypeNameIsKnownBank(const TypeName: string): Boolean;
+// Does this declared type name resolve to a bank on its OWN, without falling back to the name-suffix
+// default? The question TypeNameToBank cannot answer, because it always answers something.
+var
+  T: string;
+begin
+  T := UpperCase(TypeName);
+  if T = '' then Exit(False);
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(True);
+  T := CanonicalType(T);
+  Result := (T = kCVALIST) or
+            (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
+            (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
+            (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
+            (T = 'INT32') or (T = 'UINT32') or
+            (T = 'SINGLE') or (T = 'DOUBLE') or
+            (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') or
+            (T = 'BIGINT') or
+            ((FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0)) or
+            (FindUDT(T) >= 0);
+end;
+
 function TSSAGenerator.TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
 // Map a declared field/var type name to a register bank. Empty type => infer by name suffix.
 var
@@ -22196,17 +25075,31 @@ begin
     Result := srtFloat
   else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then
     Result := srtString
+  // ⭐ An ENUM is an INTEGER type. Without this it fell to the suffix fallback below, which for a bare
+  // name is the classic FLOAT default - so "Dim v As MyEnum" was banked as a float. The VALUES were
+  // right (the stores and the printing go their own way), which is what kept it out of sight; what it
+  // broke was every question asked ABOUT the declaration, and overload resolution first: two enum
+  // types both signed "F" and a call to "f( As MyEnum )" picked the Double overload instead.
+  else if (FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0) then
+    Result := srtInt
   else
     Result := GetVariableType(FieldName);  // unknown (e.g. nested UDT, deferred): fall back to suffix
 end;
 
 function TSSAGenerator.CanonicalType(const TypeName: string): string;
 // Resolve a FreeBASIC "TYPE alias AS underlying" chain to its base type name. A non-alias name is
-// returned unchanged (UPPER). Guarded against accidental alias cycles. PTR-suffixed names are not
-// aliased here (handle types are resolved at their own call sites).
+// returned unchanged (UPPER). Guarded against accidental alias cycles.
+//
+// ⛔ AND A "X PTR" WHOSE X IS ITSELF AN ALIAS IS ONE OF THOSE CHAINS. It used to be left alone with
+// the note "PTR-suffixed names are resolved at their own call sites", and the call sites resolve the
+// WHOLE name: "Type p As UDT Ptr : Type q As p Ptr" stored q -> "P PTR", which matches nothing, so
+// "Dim r As q : (*r)->z" stripped one PTR, got "P" - a name with no PTR in it - and read the FIRST
+// field of the UDT instead of the named one. A wrong answer, silently: 1 where fbc says 3.
+// The stars are counted off, the BASE is resolved, and they go back on - so "P PTR" becomes
+// "UDT PTR PTR" and the depth is preserved whichever spelling the program used.
 var
-  T, Next: string;
-  Guard, Idx: Integer;
+  T, Next, Base: string;
+  Guard, Idx, Stars: Integer;
 begin
   T := UpperCase(TypeName);
   if FTypeAliases.Count = 0 then Exit(T);
@@ -22219,6 +25112,28 @@ begin
     if (Next = '') or (Next = T) then Break;
     T := Next;
     Inc(Guard);
+  end;
+  if Guard >= 32 then Exit(T);
+  // Take the PTR suffixes off, resolve what is under them, put them back.
+  Stars := 0;
+  Base := T;
+  while (Length(Base) > 4) and (Copy(Base, Length(Base) - 3, 4) = ' PTR') do
+  begin
+    Base := Trim(Copy(Base, 1, Length(Base) - 4));
+    Inc(Stars);
+  end;
+  // ⛔ ...EXCEPT A FUNCTION-POINTER ALIAS, WHOSE UNDERLYING NAME IS A LIE. "Type As Function(...) As
+  // Integer f" is registered as an alias of INTEGER - that is only its STORAGE - with the real
+  // signature kept beside it in FFuncPtrTypes. Resolving "F PTR" to "INTEGER PTR" therefore threw the
+  // signature away, and "Dim As f Ptr pf : (*pf)(123)" stopped being an indirect call: 55 instead of
+  // 369 (guard m487). A name FFuncPtrTypes knows keeps its own spelling, which is what every call
+  // site looks it up by.
+  if (Stars > 0) and (FTypeAliases.IndexOfName(Base) >= 0) and
+     (FFuncPtrTypes.IndexOfName(Base) < 0) then
+  begin
+    Base := CanonicalType(Base);
+    while Stars > 0 do begin Base := Base + ' PTR'; Dec(Stars); end;
+    Exit(Base);
   end;
   Result := T;
 end;
@@ -22308,6 +25223,34 @@ begin
     [UpperCase(MemberName), LowerCase(Level), UpperCase(Owner),
      IfThen(FCurrentThisType = '', ' and this code is outside any of its methods',
             ' and "' + UpperCase(FCurrentThisType) + '" may not reach it')]);
+end;
+
+procedure TSSAGenerator.CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);
+// The permission on a CONSTRUCTOR or DESTRUCTOR the type does not declare itself.
+//
+// ⛔ NEITHER IS INHERITED. "Dim As Child c" where Child declares no constructor does not CALL Parent's
+// constructor from where the Dim stands: it calls Child's IMPLICIT one, which is public, and THAT calls
+// Parent's. So the question is not "may this code reach Parent's constructor" but "may CHILD reach it" -
+// and the two answers differ for exactly the level that exists to make them differ. The FreeBASIC
+// manual's udt/protected2 is built on it: user_right's constructors are Protected precisely so that only
+// admin_right can construct one, and "Dim As admin_right ar" at module level is its first line of code.
+// ⭐ When the type declares the member itself, Owner is the type and this is the ordinary check.
+var
+  Level, Owner, SavedThis: string;
+begin
+  Level := MemberAccessLevel(TypeName, MemberName, Owner);
+  if (Level = '') or (Owner = '') or (UpperCase(Owner) = UpperCase(TypeName)) then
+  begin
+    CheckMemberAccess(TypeName, MemberName);
+    Exit;
+  end;
+  SavedThis := FCurrentThisType;
+  FCurrentThisType := UpperCase(TypeName);
+  try
+    CheckMemberAccess(TypeName, MemberName);
+  finally
+    FCurrentThisType := SavedThis;
+  end;
 end;
 
 function TSSAGenerator.UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
@@ -22555,6 +25498,20 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].PtrPointee);
 end;
 
+function TSSAGenerator.UDTFieldMultiPtrPointee(UDTIdx: Integer; const FieldName: string): string;
+// The FULL pointee spelling of a MULTI-level UDT pointer field ("LEAF PTR" for "As Leaf Ptr Ptr"), or ''.
+// See the note on the record field: this is the shape neither PtrPointee nor RawPtrPointee could hold.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].MultiPtrPointee);
+end;
+
 function TSSAGenerator.UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string;
 // The scalar pointee type of a "<scalar> PTR" field (a raw byte-heap pointer), or '' — drives raw
 // indexing/deref of "obj.field" (obj.field[i], *obj.field, @obj.field[i]).
@@ -22600,6 +25557,36 @@ begin
   F := UpperCase(FieldName);
   for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsWString);
+end;
+
+procedure TSSAGenerator.CollectEnumNames(Node: TASTNode; const Owner: string);
+// Just the ENUM TYPE names, and nothing else. CollectEnumMembers records them too, but it runs far
+// later - after the DIM pre-scan - and by then "Dim v As MyEnum" has already been given a BANK.
+// ⛔ An enum is an INTEGER type; with the registry still empty the name fell through to the classic
+// FLOAT default, so the declaration was banked as a float. The VALUES were right (the stores and the
+// printing go their own way), which is what kept it invisible; what it broke was every question asked
+// ABOUT the declaration - overload resolution first, where two enum types both signed "F".
+var
+  i: Integer;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') then
+  begin
+    if FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0 then
+      FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+    // ⭐ ...AND UNDER ITS QUALIFIED NAME WHEN IT IS NESTED IN A TYPE. An enum declared inside a TYPE is
+    // named "Foo.Bar" everywhere it is USED ("Dim As foo.bar1 b"), and only the bare "BAR1" was ever
+    // recorded - so the declared type resolved to no known enum, fell through to the FLOAT default, and
+    // two nested enums of one type both signed "F" with an EMPTY type tail. Both overloads then looked
+    // identical and the first won every call (fbc suite structs/enum_decl).
+    if (Owner <> '') and (FEnumNames.IndexOf(Owner + '.' + UpperCase(VarToStr(Node.Value))) < 0) then
+      FEnumNames.Add(Owner + '.' + UpperCase(VarToStr(Node.Value)));
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    if (Node.NodeType = antTypeDecl) and (VarToStr(Node.Value) <> '') then
+      CollectEnumNames(Node.GetChild(i), UpperCase(VarToStr(Node.Value)))
+    else
+      CollectEnumNames(Node.GetChild(i), Owner);
 end;
 
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
@@ -22652,6 +25639,16 @@ begin
       if Node.Attributes.Values['FUNCPTR'] = '1' then
         FFuncPtrTypes.Values[Name] :=
           Node.Attributes.Values['FPPARAMS'] + '|' + Node.Attributes.Values['FPRET'];
+      // ⛔ ...AND THE REST OF A COMMA LIST STILL HAS TO BE READ. "Type a As Integer, d As UDT" carries
+      // its extra aliases as ALIASLIST children, and the loop that descends into them is at the BOTTOM
+      // of this branch's sibling - which this Exit never reaches, because the FIRST alias always sets
+      // ALIAS on the parent node. So every alias after the first was registered nowhere: "Dim x As d"
+      // found no type and "x.y" answered 0. The loop was there and UNREACHABLE, which reads exactly
+      // like a loop that does nothing.
+      for i := 0 to Node.ChildCount - 1 do
+        if (Node.GetChild(i).NodeType = antTypeDecl) and
+           (Node.GetChild(i).Attributes.Values['ALIASLIST'] = '1') then
+          CollectUDTNames(Node.GetChild(i));
       Exit;
     end;
     if FindUDT(Name) < 0 then
@@ -22719,7 +25716,8 @@ var
   Bank, ArrElemBank: TSSARegisterType;
   cInt, cFloat, cStr, ArrDims: Integer;
   TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, ArrElemPtrPointeeT, FuncPtrSigVal: string;
-  RawPtrPointeeT, PointeeScalarT: string;
+  ArrElemScalarType: string;
+  RawPtrPointeeT, PointeeScalarT, MultiPtrPointeeT, UltimateT: string;
   IsArrayField: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
@@ -22760,6 +25758,7 @@ begin
       NestedT := '';
       PtrPointeeT := '';
       RawPtrPointeeT := '';
+      MultiPtrPointeeT := '';
       if (TypeName <> '') and (FindUDT(TypeName) >= 0) then
       begin
         Bank := srtInt;        // nested record field: int handle to the nested instance
@@ -22778,7 +25777,16 @@ begin
           if FindUDT(PointeeScalarT) >= 0 then
             PtrPointeeT := PointeeScalarT
           else if (Pos(' PTR', PointeeScalarT) = 0) then   // single-level scalar pointer only
-            RawPtrPointeeT := PointeeScalarT;
+            RawPtrPointeeT := PointeeScalarT
+          else
+          begin
+            // "T Ptr Ptr [Ptr...]" where T is a UDT: neither of the two above can hold it. The FULL
+            // pointee spelling goes in its own field; DerefedType strips one level per dereference.
+            UltimateT := PointeeScalarT;
+            while (Length(UltimateT) > 4) and (Copy(UltimateT, Length(UltimateT) - 3, 4) = ' PTR') do
+              UltimateT := Trim(Copy(UltimateT, 1, Length(UltimateT) - 4));
+            if FindUDT(UltimateT) >= 0 then MultiPtrPointeeT := PointeeScalarT;
+          end;
         end;
       end
       else
@@ -22790,12 +25798,12 @@ begin
       if FieldNode.Attributes.Values['FUNCPTR'] = '1' then
       begin
         FuncPtrSigVal := FieldNode.Attributes.Values['FPPARAMS'] + '|' + FieldNode.Attributes.Values['FPRET'];
-        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := '';
+        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := ''; MultiPtrPointeeT := '';
       end
       else if (TypeName <> '') and (FFuncPtrTypes.IndexOfName(TypeName) >= 0) then
       begin
         FuncPtrSigVal := FFuncPtrTypes.Values[TypeName];
-        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := '';
+        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := ''; MultiPtrPointeeT := '';
       end;
       // Array member (e.g. "Dim As Double m(Any, Any)"): the field itself is an int handle into the
       // global FArrays table (allocated per instance on REDIM); the element bank comes from the type.
@@ -22803,6 +25811,7 @@ begin
       ArrElemBank := srtInt;
       ArrDims := 1;
       ArrElemType := '';
+      ArrElemScalarType := '';
       ArrElemPtrPointeeT := '';
       if IsArrayField then
       begin
@@ -22811,6 +25820,10 @@ begin
         // Array-of-UDT member ("verts(100) As Vertex"): remember the element UDT type (NestedT held it)
         // so EmitRecordInit can allocate a record per element and access resolves obj.field(i) to a handle.
         if NestedT <> '' then ArrElemType := NestedT;
+        // ...and the SCALAR element type, which nothing recorded: ArrElemType is the element UDT and
+        // stays empty here, so the field knew its element's BANK and not its WIDTH. That is why the C
+        // shape of a fixed member array could not be computed at all (see FixedArrayMemberCShape).
+        if (NestedT = '') and (PtrPointeeT = '') then ArrElemScalarType := UpperCase(TypeName);
         // Array-of-UDT-POINTER member ("kids(Any) As N Ptr"): the elements are handles to records owned
         // elsewhere. Kept separate from ArrElemType so no record is allocated per element -- only the
         // pointee TYPE is needed, to resolve "obj.field(i)->x". PtrPointeeT is cleared just below.
@@ -22823,6 +25836,7 @@ begin
         NestedT := '';       // not a nested record (the field itself is the array handle)
         PtrPointeeT := '';
         RawPtrPointeeT := '';
+        MultiPtrPointeeT := '';
       end;
       n := Length(FUDTs[Idx].Fields);
       SetLength(FUDTs[Idx].Fields, n + 1);
@@ -22835,12 +25849,23 @@ begin
       FUDTs[Idx].Fields[n].DefaultExpr := nil;
       if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT = '') and (not IsArrayField) and
          (FieldNode.ChildCount >= 2) then
+        FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1)
+      // ...and a NESTED member may carry the AGGREGATE TUPLE, "d As A = (4, 5, 6)", which sets that
+      // member's own fields. The nested case was excluded outright because a scalar store into a nested
+      // slot would overwrite the member's handle; a tuple is not a scalar, and EmitRecordInit hands it
+      // to EmitUDTAggregateInit against the member's handle instead.
+      else if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT <> '') and
+              (not IsArrayField) and (FieldNode.ChildCount >= 2) and
+              (FieldNode.GetChild(FieldNode.ChildCount - 1).NodeType in [antArgumentList, antExpressionList]) and
+              (FieldNode.GetChild(FieldNode.ChildCount - 1).Attributes.Values['TUPLEINIT'] = '1') then
         FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1);
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
       FUDTs[Idx].Fields[n].RawPtrPointee := RawPtrPointeeT;
+      FUDTs[Idx].Fields[n].MultiPtrPointee := MultiPtrPointeeT;
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
+      FUDTs[Idx].Fields[n].ArrayElemScalarType := ArrElemScalarType;
       FUDTs[Idx].Fields[n].ArrayElemPtrPointee := ArrElemPtrPointeeT;
       FUDTs[Idx].Fields[n].ArrayDimCount := ArrDims;
       FUDTs[Idx].Fields[n].FuncPtrSig := FuncPtrSigVal;
@@ -22849,7 +25874,9 @@ begin
       // is auto-sized at construction; an "Any" member has no concrete bound and waits for an explicit REDIM.
       FUDTs[Idx].Fields[n].ArrayBounds := nil;
       if IsArrayField then
+      begin
         FUDTs[Idx].Fields[n].ArrayBounds := ConcreteArrayBounds(FieldNode);
+      end;   // the SIZE of it is checked by CheckAllFieldArraySizes, once the CONSTs exist
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       FUDTs[Idx].Fields[n].IsZString := (TypeName = 'ZSTRING');  // variable-length, n bytes in C
       FUDTs[Idx].Fields[n].IsBoolean := (CanonicalType(TypeName) = 'BOOLEAN');
@@ -22962,22 +25989,36 @@ procedure TSSAGenerator.AssignBitFieldRuns(UDTIdx: Integer);
 // Marks continuation members with ByteSize = -1 so the layout below can recognise them without
 // re-deriving the runs: they take the unit's own offset and advance nothing.
 var
-  i, UnitBits, Used, UnitW: Integer;
+  i, UnitBits, Used, UnitW, UGrp, SGrp: Integer;
   Sz, Al: Int64;
 begin
-  UnitBits := 0; Used := 0; UnitW := -1;
+  UnitBits := 0; Used := 0; UnitW := -1; UGrp := 0; SGrp := 0;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    FUDTs[UDTIdx].Fields[i].BitContinues := False;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
+    // ⛔ A RUN NEVER CROSSES A UNION OR A NESTED-TYPE BOUNDARY. The alternatives of a union OVERLAP, so
+    // the second run must start its own unit at bit 0 - fbc's own boolean/boolean_bitfield declares two
+    // anonymous Type blocks of four one-bit members over the same UByte, and merged into one unit the
+    // second block's members read bits 4..7 of the first: 100 assertions instead of 68.
+    // ⚠️ Found only after the unit rule stopped keying on the declared TYPE, which had been hiding it.
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> UGrp) or (FUDTs[UDTIdx].Fields[i].StructGroup <> SGrp) then
+    begin
+      UGrp := FUDTs[UDTIdx].Fields[i].UnionGroup;
+      SGrp := FUDTs[UDTIdx].Fields[i].StructGroup;
+      UnitBits := 0; Used := 0; UnitW := -1;
+    end;
     if FUDTs[UDTIdx].Fields[i].BitWidth <= 0 then
     begin
       UnitBits := 0; Used := 0; UnitW := -1;
       Continue;
     end;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
-    // The unit's identity is its declared WIDTH CODE - that is what decides the storage width, and the
-    // field record keeps no type name to compare.
-    if (UnitW <> FUDTs[UDTIdx].Fields[i].WidthCode) or
-       (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
+    // ⛔ THE UNIT'S WIDTH IS THE FIRST MEMBER'S, and a later bit member of ANOTHER declared type still
+    // joins it as long as the bits fit. Opening a new unit on a type change is C's textbook rule and it
+    // is NOT what fbc does - measured 25 Aug 2026: "Short a:3, Integer b:8" is TWO bytes there (and was
+    // ten here), "Integer a:8, Short b:3" is eight. Only "the bits do not fit" opens a unit.
+    if (UnitW < 0) or (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
     begin
       // A new storage unit: this member starts it, and the layout treats it as an ordinary field.
       UnitW := FUDTs[UDTIdx].Fields[i].WidthCode;
@@ -22989,6 +26030,7 @@ begin
     begin
       FUDTs[UDTIdx].Fields[i].BitOffset := Used;
       FUDTs[UDTIdx].Fields[i].ByteSize := -1;        // continuation: shares the unit before it
+      FUDTs[UDTIdx].Fields[i].BitContinues := True;  // ...and this mark SURVIVES the live layout
     end;
     Inc(Used, FUDTs[UDTIdx].Fields[i].BitWidth);
   end;
@@ -23296,6 +26338,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.SoleOverloadLabel(const TypeU, MethNm: string): string;
+// The label of "TypeU.MethNm" when the name has exactly ONE overload declaration, else ''.
+// An overload's key carries its signature after a '~'; nothing else in FProcDecls does, so an
+// OVERLOAD-marked method is invisible to an exact lookup even when it is the only one of its name.
+// ⛔ EXACTLY ONE, and that restriction is the point. Answering the first of SEVERAL would be a guess -
+// and a guess here is a WRONG ANSWER where the code previously refused, which is the wrong direction:
+// "@T.bar" has no argument list to choose with, so the choice would have to come from the DESTINATION
+// type ("Dim As Function(ByVal As Integer) As Integer fn = @T.bar"), which this lookup cannot see.
+// Measured: picking one anyway answered the Double overload where fbc answers the Integer one.
+var
+  Prefix, K: string;
+  N: Integer;
+begin
+  Result := '';
+  N := 0;
+  Prefix := TypeU + '.' + UpperCase(MethNm) + '~';
+  for K in FProcDecls.Keys do
+    if (Length(K) > Length(Prefix)) and (Copy(K, 1, Length(Prefix)) = Prefix) then
+    begin
+      Inc(N);
+      if N > 1 then Exit('');
+      Result := K;
+    end;
+end;
+
 function TSSAGenerator.ResolveMethodLabel(const TypeName, MethNm: string): string;
 // Find a method by walking up the inheritance chain: Child.method, then Parent.method, ...
 var
@@ -23309,6 +26376,17 @@ begin
   begin
     Lbl := T + '.' + UpperCase(MethNm);
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    // ⛔ AN OVERLOADED METHOD IS NOT FILED UNDER ITS BARE NAME. RegisterOverloadLabel decorates it
+    // with its signature ("T.BAR~II"), so an exact lookup finds every non-overloaded method and NONE
+    // of the overloaded ones - the same shape as the constructor sigil. The visible cost was "@Foo.bar"
+    // on an overloaded STATIC member: the "@Type.method" branch is gated on this answering non-empty,
+    // so it fell through to the FIELD path and reported "object is not a record", a message about a
+    // record where the question was about a procedure. The same program with ONE bar compiles.
+    // ⚠️ Only when there is exactly ONE: with several, "@T.m" has no argument list to choose with and
+    // the choice belongs to the DESTINATION type, which this lookup cannot see. It keeps refusing
+    // there, on purpose - a guess would turn a refusal into a wrong answer.
+    Lbl := SoleOverloadLabel(T, MethNm);
+    if Lbl <> '' then Exit(Lbl);
     Lbl := NestedQualifiedMethod(T, MethNm);
     if (Lbl <> '') and FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     Idx := FindUDT(T);
@@ -23469,15 +26547,11 @@ end;
 
 function TSSAGenerator.MethAttrKey(const MethNm: string): string;
 // The name a DECLARE's decorator (VIRTUAL / ABSTRACT / ACCESS...) is filed under on the antTypeDecl.
-// It is the method name as the PARSER saw it, and for one family that is not the name the rest of the
-// pipeline uses: an OPERATOR CAST is labelled with its RETURN BANK ("TYPE.OPERATORCAST$"), because a
-// type may declare several casts that differ in nothing else. The parser has no return type in hand
-// when it records the decorator, so it files "OPERATORCAST" and this drops the sigil back off.
+// ⛔ ONE spelling, shared with the parser that WRITES it (SedaiAST.MemberDecoratorKey) - a key composed
+// twice is a key filed where nothing looks it up, which this family has now paid for three times: the
+// OPERATOR CAST sigil, the operator ARITY code, and the '=' inside a self-operator's own name.
 begin
-  Result := UpperCase(MethNm);
-  if (Copy(Result, 1, 8) = 'OPERATOR') and (Result <> '') and
-     (Result[Length(Result)] in ['$', '%', '#']) then
-    Result := Copy(Result, 1, Length(Result) - 1);
+  Result := MemberDecoratorKey(MethNm);
 end;
 
 function TSSAGenerator.MethodIsVirtual(const TypeName, MethNm: string): Boolean;
@@ -23738,7 +26812,43 @@ begin
     end;
 end;
 
-function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode): string;
+function TSSAGenerator.ArgPtrKindChar(Node: TASTNode): Char;
+// 'Z' or 'W' when the argument is - or points at - ZSTRING / WSTRING text, '-' when nothing here says.
+// It is the call site's half of the 'Z'/'W' width codes ProcSigFromParams writes for a CONSTRUCTOR's
+// pointer parameters, and the two must read the same fact: a declaration says "ZSTRING PTR", an
+// argument is a fixed-length ZSTRING variable, its address, or a pointer whose declared pointee is one.
+var
+  N: TASTNode;
+  Pt: string;
+begin
+  Result := '-';
+  if Node = nil then Exit;
+  N := Node;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  // "@x": what is judged is the thing whose address is taken, not the address.
+  if N.NodeType = antProcAddress then
+  begin
+    if N.ChildCount >= 1 then
+      N := N.GetChild(0)
+    else if VarToStr(N.Value) <> '' then
+    begin
+      if IsWStringVar(VarToStr(N.Value)) then Exit('W');
+      Exit('Z');                       // a byte-string variable, or the address of a literal
+    end;
+  end;
+  // A pointer VARIABLE or PARAMETER passed straight on ("Base(s)" inside a constructor): its declared
+  // pointee decides, and that is the only thing that can - the staged value is just an integer.
+  if N.NodeType = antIdentifier then
+  begin
+    Pt := UpperCase(PointeeTypeOf(VarToStr(N.Value)));
+    if Pt = 'WSTRING' then Exit('W');
+    if Pt = 'ZSTRING' then Exit('Z');
+  end;
+  if IsWStringExpr(N) then Exit('W');
+  if InferExprBank(N) = srtString then Exit('Z');
+end;
+
+function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode; PtrKinds: Boolean): string;
 // The DECLARED-WIDTH tail of a call's arguments, in the alphabet ProcSigFromParams uses: one character
 // per argument ('1'..'9','A','B' for the narrow/specific types, '-' for a full 64-bit one or for an
 // expression whose width cannot be derived). Returns '' when every argument is a placeholder - the case
@@ -23751,12 +26861,35 @@ function TSSAGenerator.ArgWidthSigFromArgs(ArgsNode: TASTNode): string;
 // which would happily pick a different overload of the same parameter count.
 var
   i, W: Integer;
+  PK: Char;
 begin
   Result := '';
   if ArgsNode = nil then Exit;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
-    W := OperandWidthCode(ArgsNode.GetChild(i));
+    // A CONSTRUCTOR's pointer parameters carry 'Z' / 'W' instead of a numeric width - see ArgPtrKindChar
+    // and the matching branch in ProcSigFromParams. Asked FIRST, because a text argument has no numeric
+    // width of its own and would otherwise report a placeholder.
+    if PtrKinds then
+    begin
+      PK := ArgPtrKindChar(ArgsNode.GetChild(i));
+      if PK <> '-' then
+      begin
+        Result := Result + PK;
+        Continue;
+      end;
+    end;
+    // ⛔⛔ THE DECLARED CODE IS ASKED FIRST, AND OperandWidthCode ONLY AS A FALLBACK. This tail has
+    // to reproduce what the DECLARATION wrote (WidthCharOf), and OperandWidthCode cannot: it ends by
+    // clamping everything outside 1..6 to 0 and by folding 9/10 onto 5/6, because its own callers
+    // (CSIGN/CUNSG) mean "the narrow INTEGER width to reinterpret at". So a ULongInt argument reported
+    // no width at all where the declaration signed '8', an Int32 one reported '5' where the declaration
+    // signed '9', and a Boolean one reported nothing where the declaration signed 'B' - three of the
+    // five specific codes were unreachable through the tail, and their overloads with them
+    // ("h(As ULongInt)" beside "h(As Integer)" answered "integer" where fbc answers "ulongint").
+    // Declared32Code is the same registry read WITHOUT that clamp, and it is scoped by procedure.
+    W := Declared32Code(ArgsNode.GetChild(i));
+    if W = 0 then W := OperandWidthCode(ArgsNode.GetChild(i));
     // ⛔ A SINGLE IS NOT IN THAT REGISTRY. OperandWidthCode answers the narrow-INTEGER width, and a
     // Single is tracked by its own predicate (IsSingleExpr) - which is why "h(As Single)" against
     // "h(As Double)" still picked the first declaration after the width tail was in place: the two
@@ -23773,6 +26906,93 @@ begin
   Result := '';                         // all placeholders: no tail, as declared
 end;
 
+function TSSAGenerator.DeclaredPointerTypeOfArg(Node: TASTNode): string;
+// The full declared POINTER type of an argument ("INTEGER PTR", "BYTE PTR PTR"), or '' when nothing
+// here says. It is the call site's half of the pointer names ProcSigFromParams writes into the type
+// tail, and only a DECLARED name can answer: a pointer variable or a pointer parameter. An expression
+// answers '' and the resolver reads that as "any", which is what every pointer argument used to be.
+var
+  Pt: string;
+  NameNd: TASTNode;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  // ⭐ "@x" NAMES A POINTER TYPE TOO: the address of a declared scalar is "<its type> PTR", and that is
+  // as DECLARED as a pointer variable's own type. Without it every "f(@d)" answered '' - "any pointer" -
+  // and the resolver took the first pointer overload: "Sub f(p As Double Ptr)" was unreachable through
+  // "f(@d)" while "f(@i)" worked, which reads as the overloads being wrong rather than the argument.
+  // ⛔ ...AND "@a(0)" NAMES ONE TOO. The branch below wants a BARE name; "@a(0)" is an antProcAddress
+  // WITH a child, so it fell straight through and answered '' - and the VAR pre-pass, taking that '',
+  // fell back to InferExprBank and made "Var p = @a(0)" an INTEGER, after which "p[3]" was lowered as an
+  // access to an array called P: "Array not declared: P". The explicit spelling
+  // "Dim p As Integer Ptr = @a(0)" has always worked, which is what said the gap was in the DEDUCTION.
+  // The element type is already recorded for exactly this pre-pass (FArrayScalarType, whose comment
+  // says so); FProgram's own table is asked first for everything declared by then.
+  // ⛔ THE MEMBER-ARRAY FORM, "Var p = @x.array(0)", IS NOT CLOSED HERE AND THE ATTEMPT IS WRITTEN
+  // DOWN: asking UDTArrayElemType off ObjectTypeName of the object answers nothing at this point -
+  // this pre-pass runs before the record variables are registered - so the branch was INERT and is
+  // not shipped. DIVERGENZE 64.
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 1) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    Pt := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+    if FArrayScalarType.IndexOfName(Pt) >= 0 then
+      Exit(UpperCase(FArrayScalarType.Values[Pt]) + ' PTR');
+    if ArrayIndexOf(Pt) >= 0 then
+      case FProgram.GetArray(ArrayIndexOf(Pt)).ElementType of
+        srtFloat:  Exit('DOUBLE PTR');
+        srtString: Exit('STRING PTR');
+      else         Exit('INTEGER PTR');
+      end;
+    Exit;
+  end;
+  // ...and so do the two other spellings that produce a pointer without naming one. "New T" IS a
+  // "T Ptr" - it says its own type - and "ProcPtr(f)" is the entry PC of f, which is what a procedure
+  // pointer holds. Both reached the VAR pre-pass as '' and became INTEGERs, so "p()" and "*p" were
+  // then lowered against a plain integer.
+  if (Node.NodeType = antNew) and (VarToStr(Node.Value) <> '') then
+    Exit(UpperCase(VarToStr(Node.Value)) + ' PTR');
+  // ⛔ "Var p = ProcPtr(f)" IS NOT ANSWERED HERE, and the reason is worth keeping: a procedure pointer
+  // is not carried by a name in this map at all, it is carried by its SIGNATURE in FFuncPtrSigs, so a
+  // type name answered here left "p()" lowering as an array access ("Array not declared: P1"). ✅ The
+  // half that was missing - registering the signature of f under p - is now PreProcPtrSigOf, asked by
+  // the VAR pre-pass BEFORE this function; DIVERGENZE 57 is closed, guard m694.
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) then
+  begin
+    NameNd := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
+    try
+      Pt := UpperCase(DeclaredTypeNameOf(NameNd));
+      // DeclaredTypeNameOf answers for a UDT, a pointer or a NARROW scalar; a plain "Dim As Double d"
+      // is none of those and used to answer nothing at all. The BANK still tells a Double from an
+      // Integer, and it is the same name the declaration side writes for that bank - so a wide scalar
+      // answers through it. A wrong guess (a Single named DOUBLE) simply misses the exact match and
+      // falls back exactly as it did before.
+      if Pt = '' then
+        case GetVariableType(UpperCase(VarToStr(Node.Value))) of
+          srtFloat:  Pt := 'DOUBLE';
+          srtString: Pt := 'STRING';
+        else         Pt := 'INTEGER';
+        end;
+    finally
+      NameNd.Free;
+    end;
+    if Pt <> '' then Exit(Pt + ' PTR');
+    Exit;
+  end;
+  if Node.NodeType <> antIdentifier then Exit;
+  // ⛔ TWO registries, and neither alone is enough: FPointerVars (through PointeeTypeOf) holds the raw
+  // scalar pointers and the parameters, while a pointer to a UDT is recorded elsewhere and only
+  // DeclaredTypeNameOf reaches it. Asking just the first answered "INTEGER PTR" for a "Pt Ptr" - the
+  // guard caught it, which is what a guard is for.
+  Pt := UpperCase(DeclaredTypeNameOf(Node));
+  if (Length(Pt) > 4) and (Copy(Pt, Length(Pt) - 3, 4) = ' PTR') then Exit(Pt);
+  Pt := UpperCase(PointeeTypeOf(VarToStr(Node.Value)));
+  if Pt = '' then Exit;
+  Result := Pt + ' ' + 'PTR';
+end;
+
 function TSSAGenerator.ArgUdtSigFromArgs(ArgsNode: TASTNode): string;
 // The UDT-type tail of a call's arguments, in the alphabet the declaration's label uses: the record type
 // name of each argument that IS a record, '-' for every other one (the tail is POSITIONAL). Returns ''
@@ -23785,13 +27005,175 @@ begin
   if ArgsNode = nil then Exit;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
-    T := UpperCase(ObjectTypeName(ArgsNode.GetChild(i)));   // '' when the argument is not a record
+    // ⛔ THE POINTER QUESTION COMES FIRST. In the managed model a "T PTR" IS the record handle, so
+    // ObjectTypeName answers "PT" for a "Pt Ptr" variable just as it does for a Pt one - and the call
+    // then asked for the by-value overload. Asked in this order, a UDT VALUE still answers '' here (it
+    // is not a pointer) and falls through to ObjectTypeName exactly as before.
+    T := DeclaredPointerTypeOfArg(ArgsNode.GetChild(i));
+    if T = '' then
+      T := UpperCase(ObjectTypeName(ArgsNode.GetChild(i)));   // '' when the argument is not a record
+    // ⭐ ...and an ENUM-typed argument names its type here too. The DECLARATION already puts it in this
+    // tail - ProcSigFromParams writes the name of any parameter type that is neither builtin nor a
+    // pointer, which an enum is - so "f( As enum_a )" and "f( As enum_b )" sign "~I:ENUM_A" and
+    // "~I:ENUM_B" and are correctly two labels. Only the CALL SITE could not say which one it wanted:
+    // ObjectTypeName answers for records alone, so the tail came out empty, no label matched, and the
+    // arity fallback handed every call to the FIRST of the pair.
+    if T = '' then T := UpperCase(EnumTypeOfOperand(ArgsNode.GetChild(i)));
     if Result <> '' then Result := Result + ',';
     if T <> '' then Result := Result + T else Result := Result + '-';
   end;
   for i := 1 to Length(Result) do
     if not (Result[i] in ['-', ',']) then Exit;             // at least one real type name: keep the tail
   Result := '';                                             // all placeholders: no tail, as declared
+end;
+
+function TSSAGenerator.SigNamePart(const Sig: string): string;
+// The TYPE-NAME tail of a label's signature - what stands between ':' and the next tail marker - or ''
+// when the label carries none. The mirror of SigBankPart and SigWidthPart.
+var
+  p, q, i: Integer;
+begin
+  Result := '';
+  p := Pos(':', Sig);
+  if p = 0 then Exit;
+  q := Length(Sig) + 1;
+  for i := p + 1 to Length(Sig) do
+    if (Sig[i] = '!') or (Sig[i] = '%') then begin q := i; Break; end;
+  Result := Copy(Sig, p + 1, q - p - 1);
+end;
+
+function TSSAGenerator.TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
+// Compare two positional, comma-separated type tails where a '-' ON THE CALL SIDE matches anything.
+// The declaration names every position it can; the call site names the ones it can derive. Same number
+// of positions or no match at all - the tail is positional, so a different length is a different arity.
+var
+  C, D: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  C := TStringList.Create;
+  D := TStringList.Create;
+  try
+    C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := CallTail;
+    D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
+    if C.Count <> D.Count then Exit;
+    for i := 0 to C.Count - 1 do
+      if (C[i] <> '-') and (not SameUDTName(C[i], D[i])) then Exit;
+    Result := True;
+  finally
+    C.Free; D.Free;
+  end;
+end;
+
+function TSSAGenerator.SameUDTName(const A, B: string): Boolean;
+// Do these two spellings name the same UDT? Equal is equal; beyond that, ONE of them may carry its
+// NAMESPACE and the other not.
+//
+// ⛔ WHY THAT HAPPENS. A declaration's type tail is written by ProcSigFromParams while the file is
+// being PARSED - before the namespace pass mangles anything - so "Function f(ByVal x As T1)" inside
+// "Namespace n" signs ":T1", while the call site asks ObjectTypeName, which answers the mangled
+// "N.T1". Nothing matched, and the call fell to the arity fallback: with "f(As T1)" and "f(As T2)"
+// declared in a namespace, EVERY call was answered by the first (fbc suite overload/byval-as-const).
+// ⚠️ Both qualified or both bare means they really are different names - "a.T" is not "b.T" - so the
+// tolerance applies in exactly one direction and nowhere else.
+var
+  pa, pb: Integer;
+begin
+  Result := SameText(A, B);
+  if Result or (A = '') or (B = '') then Exit;
+  pa := LastDelimiter('.', A);
+  pb := LastDelimiter('.', B);
+  if (pa > 0) = (pb > 0) then Exit(False);
+  Result := SameText(Copy(A, pa + 1, MaxInt), Copy(B, pb + 1, MaxInt));
+end;
+
+function TSSAGenerator.SubtypeDistance(const U, T: string): Integer;
+// How many EXTENDS steps separate U from T: 0 when they are the same type, n when T is the n-th
+// ancestor of U, and -1 when U is not a T at all. The mirror of IsStrictSubtypeOf, which answers the
+// same question without the DISTANCE - and the distance is the whole point when two ancestors both fit.
+var
+  cur, tu: string;
+  idx, guard: Integer;
+begin
+  Result := -1;
+  cur := UpperCase(U); tu := UpperCase(T);
+  guard := 0;
+  while (cur <> '') and (guard < 64) do
+  begin
+    if SameUDTName(cur, tu) then Exit(guard);
+    idx := FindUDT(cur);
+    if idx < 0 then Break;
+    cur := FUDTs[idx].Parent;
+    Inc(guard);
+  end;
+end;
+
+function TSSAGenerator.TypeTailMatchesCanonical(const A, B: string): Boolean;
+// Two positional, comma-separated type tails compared THROUGH THE ALIASES, with '-' on either side
+// meaning "unknown". A funcptr TYPE may name its parameter by an alias - "Type foo_ As foo" is the
+// forward-declaration idiom fbc's own suite uses - while the procedure's own label carries the type it
+// was DEFINED with, so an exact comparison sees "FOO_" against "FOO" and matches nothing.
+var
+  C, D: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  C := TStringList.Create;
+  D := TStringList.Create;
+  try
+    C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := A;
+    D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := B;
+    if C.Count <> D.Count then Exit;
+    for i := 0 to C.Count - 1 do
+    begin
+      if (C[i] = '-') or (D[i] = '-') then Continue;
+      if SameUDTName(C[i], D[i]) then Continue;
+      if not SameUDTName(CanonicalType(UpperCase(C[i])), CanonicalType(UpperCase(D[i]))) then Exit;
+    end;
+    Result := True;
+  finally
+    C.Free; D.Free;
+  end;
+end;
+
+function TSSAGenerator.TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;
+// The total number of EXTENDS steps needed to read a call's type tail as a declaration's, or -1 when
+// no reading exists. A '-' on EITHER side is "unknown" and costs nothing, exactly as the wildcard
+// comparison treats it; every other position must be the same type or a DESCENDANT of the declared one.
+var
+  C, D: TStringList;
+  i, d1: Integer;
+begin
+  Result := -1;
+  C := TStringList.Create;
+  D := TStringList.Create;
+  try
+    C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := CallTail;
+    D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
+    if C.Count <> D.Count then Exit;
+    Result := 0;
+    for i := 0 to C.Count - 1 do
+    begin
+      if (C[i] = '-') or (D[i] = '-') then Continue;
+      if SameUDTName(C[i], D[i]) then Continue;
+      d1 := SubtypeDistance(C[i], D[i]);
+      if d1 < 0 then Exit(-1);
+      Inc(Result, d1);
+    end;
+  finally
+    C.Free; D.Free;
+  end;
+end;
+
+function TSSAGenerator.SigWidthPart(const Sig: string): string;
+// The WIDTH tail of a label's signature - what follows '%' - or '' when the label carries none. The
+// mirror of SigBankPart, and it exists so the arity fallback can compare tails it cannot match exactly.
+var
+  p: Integer;
+begin
+  Result := '';
+  p := Pos('%', Sig);
+  if p > 0 then Result := Copy(Sig, p + 1, MaxInt);
 end;
 
 function TSSAGenerator.SigBankPart(const Sig: string): string;
@@ -23861,8 +27243,34 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 //      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, UdtSig, ConstSig, WidthSig, Pref, Cand: string;
-  k: Integer;
+  Sig, UdtSig, ConstSig, WidthSig, LegacySig, Pref, Cand, Tail: string;
+  k, j, Extra, BestExtra: Integer;
+  DeclN, ParamsN: TASTNode;
+  OkDef: Boolean;
+
+  // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
+  function WidthTailLabel(const WT: string): string;
+  begin
+    if ConstSig <> '' then
+    begin
+      if UdtSig <> '' then
+      begin
+        Result := BaseLabel + '~' + Sig + ':' + UdtSig + '!' + ConstSig + '%' + WT;
+        if FProcDecls.ContainsKey(Result) then Exit;
+      end;
+      Result := BaseLabel + '~' + Sig + '!' + ConstSig + '%' + WT;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    if UdtSig <> '' then
+    begin
+      Result := BaseLabel + '~' + Sig + ':' + UdtSig + '%' + WT;
+      if FProcDecls.ContainsKey(Result) then Exit;
+    end;
+    Result := BaseLabel + '~' + Sig + '%' + WT;
+    if FProcDecls.ContainsKey(Result) then Exit;
+    Result := '';
+  end;
+
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
@@ -23870,31 +27278,38 @@ begin
   ConstSig := ArgConstSigFromArgs(ArgsNode);
   WidthSig := ArgWidthSigFromArgs(ArgsNode);
   if GetEnvironmentVariable('OVL_DIAG') = '1' then
+  begin
     WriteLn(ErrOutput, 'OVL: ', BaseLabel, ' sig="', Sig, '" udt="', UdtSig, '" const="', ConstSig,
             '" width="', WidthSig, '"');
+    // ...and the CANDIDATES, because "the call site says 8" only becomes an answer next to what the
+    // declarations actually signed: a tail that matches nothing and a tail that matches the wrong
+    // member read identically without them.
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(BaseLabel) + 1) = BaseLabel + '~' then
+        WriteLn(ErrOutput, 'OVL:   cand ', FProcedureNames[k]);
+  end;
   // ⭐ THE DECLARED WIDTH FIRST, when there is one. It is the only thing that tells "g(As Long)" from
   // "g(As Integer)": both sign the bank 'I', so before this the two collided and the FIRST declaration
   // won every call. Tried ahead of the other tails and then abandoned, so an overload set without a
   // narrow parameter takes exactly the path it took before.
   if WidthSig <> '' then
   begin
-    if ConstSig <> '' then
+    Result := WidthTailLabel(WidthSig);
+    if Result <> '' then Exit;
+    // ⚠️ ...AND THE SAME ATTEMPT WITH THE FIVE SPECIFIC CODES DEGRADED TO "unknown". The tail learned to
+    // say '8'/'9'/'A'/'B' (ULongInt, Int32, UInt32, Boolean) only after it had spent a while saying
+    // nothing for them, and a set that has no member of those types would now MISS where it used to
+    // match the all-placeholder form and go on to the arity fallback - which is precisely where the
+    // wrong overload lives. Asking twice keeps every call that resolved before resolving the same way,
+    // and resolves the new ones on the first attempt.
+    LegacySig := WidthSig;
+    for k := 1 to Length(LegacySig) do
+      if not (LegacySig[k] in ['1'..'7', 'Z', 'W']) then LegacySig[k] := '-';
+    if LegacySig <> WidthSig then
     begin
-      if UdtSig <> '' then
-      begin
-        Result := BaseLabel + '~' + Sig + ':' + UdtSig + '!' + ConstSig + '%' + WidthSig;
-        if FProcDecls.ContainsKey(Result) then Exit;
-      end;
-      Result := BaseLabel + '~' + Sig + '!' + ConstSig + '%' + WidthSig;
-      if FProcDecls.ContainsKey(Result) then Exit;
+      Result := WidthTailLabel(LegacySig);
+      if Result <> '' then Exit;
     end;
-    if UdtSig <> '' then
-    begin
-      Result := BaseLabel + '~' + Sig + ':' + UdtSig + '%' + WidthSig;
-      if FProcDecls.ContainsKey(Result) then Exit;
-    end;
-    Result := BaseLabel + '~' + Sig + '%' + WidthSig;
-    if FProcDecls.ContainsKey(Result) then Exit;
   end;
   // ⚠️ AND THE ALL-PLACEHOLDER FORM. An argument of full width contributes '-', and a set that has ANY
   // narrow member carries a tail on EVERY member - so the Integer overload of a Long/Integer pair signs
@@ -23922,9 +27337,55 @@ begin
     Result := BaseLabel + '~' + Sig + ':' + UdtSig;
     if FProcDecls.ContainsKey(Result) then Exit;
   end;
+  // ⭐ A UDT ARGUMENT WITH NO EXACT OVERLOAD TAKES THE NEAREST BASE. With "B Extends A" and
+  // "C Extends B", a call "f(xc)" against declarations "f(As A)" and "f(As B)" is fbc's B - the
+  // CLOSEST ancestor, not the first declaration. Nothing here asked the EXTENDS chain: the tail "C"
+  // matched no label, the wildcard pass below matched none either (the declarations NAME their types,
+  // so no position is '-'), and the call fell to the arity fallback - which handed a UDT argument to
+  // "f(As Integer)", the first member of the set. fbc suite overload/derived.
+  // ⛔ THE WINNER MUST BE STRICTLY NEAREST. A tie is an ambiguity, and an ambiguity is left to the
+  // passes that follow, which is exactly what they were doing before this existed - so a set where
+  // two candidates fit equally well resolves as it always did.
+  if UdtSig <> '' then
+  begin
+    Pref := BaseLabel + '~';
+    Cand := ''; BestExtra := MaxInt; OkDef := False;    // OkDef: the best distance is shared -> ambiguous
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+        if SigBankPart(Tail) <> Sig then Continue;
+        Extra := TypeTailUpcastDistance(UdtSig, SigNamePart(Tail));
+        if Extra < 0 then Continue;
+        if Extra < BestExtra then begin BestExtra := Extra; Cand := FProcedureNames[k]; OkDef := False; end
+        else if Extra = BestExtra then OkDef := True;
+      end;
+    if (Cand <> '') and (not OkDef) then Exit(Cand);
+  end;
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
   Pref := BaseLabel + '~';
+  // ⭐ A '-' IN THE CALL'S TYPE TAIL MEANS "UNKNOWN", NOT "NONE". The tail is positional and the
+  // declaration fills every position it can name (a by-value UDT, an enum, a pointer type); the call
+  // site fills the ones it can DERIVE. Where it cannot, an exact comparison finds nothing and the call
+  // falls onto the arity fallback - which takes the first of that many parameters and is precisely
+  // where the wrong overload lives. Matching '-' against anything keeps every call that resolved by
+  // arity resolving, and resolves it more accurately: the bank part still has to match exactly, and a
+  // candidate is accepted only if it is the ONLY one that fits.
+  if UdtSig <> '' then
+  begin
+    Cand := '';
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+        if SigBankPart(Tail) <> Sig then Continue;
+        if not TypeTailMatchesWithWildcards(UdtSig, SigNamePart(Tail)) then Continue;
+        if Cand <> '' then begin Cand := ''; Break; end;   // ambiguous: leave it to the fallback
+        Cand := FProcedureNames[k];
+      end;
+    if Cand <> '' then Exit(Cand);
+  end;
   // ⭐ The arity fallback prefers a candidate whose BANK part matches exactly. It used to take the
   // first of the right parameter COUNT, which was fine while the bank signature was the whole key -
   // an exact bank match would have been found above. With a width tail in play a call can reach here
@@ -23936,6 +27397,32 @@ begin
       Cand := SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
       if Cand = Sig then Exit(FProcedureNames[k]);
     end;
+  // ⛔ ...and this AHEAD of the length-only fallback, not after it. "f(0, 0)" has two candidates of
+  // arity 2 by that measure - "f(Integer, String)" among them - and the first of them wins; the
+  // overload that actually FITS is the three-parameter one with two defaults, which the length test
+  // cannot see at all. fbc chooses by how well the types match, so a candidate whose bank prefix is
+  // exact must be preferred over one of the right COUNT and the wrong banks.
+  Cand := '';
+  BestExtra := MaxInt;
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
+    Tail := SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
+    if Length(Tail) <= Length(Sig) then Continue;                  // handled by the attempts above
+    if not (FProcDecls.TryGetValue(FProcedureNames[k], DeclN) and Assigned(DeclN) and
+            (DeclN.ChildCount >= 2)) then Continue;
+    ParamsN := DeclN.GetChild(1);
+    if (ParamsN = nil) or (ParamsN.NodeType <> antParameterList) then Continue;
+    if ParamsN.ChildCount <> Length(Tail) then Continue;
+    OkDef := True;
+    for j := Length(Sig) to ParamsN.ChildCount - 1 do              // every parameter past the call's
+      if ParamsN.GetChild(j).Attributes.Values['HASDEFAULT'] <> '1' then begin OkDef := False; Break; end;
+    if not OkDef then Continue;
+    Extra := (Length(Tail) - Length(Sig)) * 2;                     // fewer omitted parameters wins...
+    if Copy(Tail, 1, Length(Sig)) <> Sig then Inc(Extra);          // ...and an exact bank prefix wins a tie
+    if Extra < BestExtra then begin BestExtra := Extra; Cand := FProcedureNames[k]; end;
+  end;
+  if Cand <> '' then Exit(Cand);
   for k := 0 to FProcedureNames.Count - 1 do
     if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
        (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(Sig)) then
@@ -24020,6 +27507,16 @@ begin
       Lbl := T + '.CONSTRUCTOR#' + ArgSig + ':' + UdtSig;
       if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     end;
+    // ⛔⛔ AND A T BUILT FROM A T IS A COPY, NOT A CONVERSION. Once the exact copy constructor above
+    // has been asked for and is not there, the answer is "no constructor" - the caller then copies the
+    // record, which is what fbc's implicit copy does. Falling through instead handed the argument to a
+    // CONVERTING constructor, because a UDT handle signs the bank 'I' exactly like a pointer: with
+    // "Constructor(ByVal s As Const ZString Const Ptr)" declared, "Dim b As UB = u" called THAT with the
+    // handle as its pointer and dereferenced it - a null raw pointer dereference on fbc's own
+    // udt-zstring/iif and udt-wstring/iif, and a silently wrong field value where the ctor did not
+    // dereference. ⚠️ Only for a SINGLE argument of exactly this type: a subtype argument still resolves
+    // as before (fbc slices it through a constructor), and the type tail is the only thing that says so.
+    if (ArgSig = 'I') and (UdtSig <> '') and SameText(UdtSig, T) then Exit('');
     // 2) exact bank signature
     Lbl := T + '.CONSTRUCTOR#' + ArgSig;
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
@@ -24027,6 +27524,17 @@ begin
     //    reason ResolveMethodLabelArgs gives: with a width tail in play a call can arrive here knowing
     //    its bank and not its width, and "the first of that many parameters" may be another bank.
     Pref := T + '.CONSTRUCTOR#';
+    // ⭐ ...and BEFORE either of them, the WIDTH TAIL, when the call brought one. A text argument signs
+    //    the bank 'S' while a ZSTRING PTR parameter signs 'I', so a call like "Dim As T v = z" can NEVER
+    //    match by bank and always lands here - where "the first ctor of that many parameters" is a coin
+    //    toss between the ZSTRING and the WSTRING overload. The tail is the only thing that tells them
+    //    apart, so it is consulted here too and not only in the exact-match attempts above.
+    if WidthSig <> '' then
+      for k := 0 to FProcedureNames.Count - 1 do
+        if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
+           (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) and
+           (SigWidthPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = WidthSig) then
+          Exit(FProcedureNames[k]);
     for k := 0 to FProcedureNames.Count - 1 do
       if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
          (SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = ArgSig) then
@@ -24242,15 +27750,146 @@ begin
   FInDispatcher := False;
 end;
 
+procedure TSSAGenerator.PreCollectFuncRetTypes(Node: TASTNode);
+// Fill FPreFuncRetType (FUNCTION name -> declared return type name) with a single shallow walk. See the
+// call site for why this exists separately from PreCollectProcedures: it runs EARLIER, and it is all the
+// VAR type inference needs from it.
+var
+  i, j: Integer;
+  NameNode, PL: TASTNode;
+  Nm, Ps, Rt: string;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
+     (UpperCase(VarToStr(Node.Value)) = 'FUNCTION') then
+  begin
+    NameNode := Node.GetChild(0);
+    if (NameNode <> nil) and (NameNode.ChildCount >= 1) and
+       (NameNode.GetChild(0).NodeType = antIdentifier) then
+    begin
+      Nm := UpperCase(VarToStr(NameNode.Value));
+      // An overload's label carries its signature after '~'; the RETURN type is the same for the base
+      // name either way, and the inference only ever has the base name to ask with.
+      if Pos('~', Nm) > 0 then Nm := Copy(Nm, 1, Pos('~', Nm) - 1);
+      if (Nm <> '') and (FPreFuncRetType.IndexOfName(Nm) < 0) then
+        FPreFuncRetType.Values[Nm] := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+    end;
+  end;
+  // ⭐ ...and the SAME walk answers the other half a VAR needs: the full "FPPARAMS|FPRET" of every
+  // procedure, so "Var p = ProcPtr(f)" can be stamped with the signature the explicit spelling
+  // "Dim p As Sub(...)" carries. The parameter TYPE names are already in the shape FPPARAMS wants
+  // ("INTEGER PTR" is one identifier here), so nothing is rebuilt - it is read off.
+  // ⚠️ A METHOD is skipped: its label carries an implicit THIS that this list would then declare as
+  // a parameter of the pointer, and ProcPtr on a method is a different question (a vtable index).
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) then
+  begin
+    NameNode := Node.GetChild(0);
+    if (NameNode <> nil) and (NameNode.NodeType = antIdentifier) then
+    begin
+      Nm := UpperCase(VarToStr(NameNode.Value));
+      if (Nm <> '') and (Pos('.', Nm) = 0) and (FPreProcSig.IndexOfName(Nm) < 0) then
+      begin
+        Ps := '';
+        for i := 0 to Node.ChildCount - 1 do
+          if Node.GetChild(i).NodeType = antParameterList then
+          begin
+            PL := Node.GetChild(i);
+            for j := 0 to PL.ChildCount - 1 do
+              if (PL.GetChild(j).ChildCount >= 1) and
+                 (PL.GetChild(j).GetChild(0).NodeType = antIdentifier) then
+              begin
+                if Ps <> '' then Ps := Ps + ',';
+                Ps := Ps + UpperCase(VarToStr(PL.GetChild(j).GetChild(0).Value));
+              end;
+            Break;
+          end;
+        Rt := '';
+        if (UpperCase(VarToStr(Node.Value)) = 'FUNCTION') and (NameNode.ChildCount >= 1) and
+           (NameNode.GetChild(0).NodeType = antIdentifier) then
+          Rt := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+        FPreProcSig.Values[Nm] := Ps + '|' + Rt;
+      end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do PreCollectFuncRetTypes(Node.GetChild(i));
+end;
+
+function TSSAGenerator.PreProcPtrSigOf(Node: TASTNode): string;
+// The "FPPARAMS|FPRET" of the procedure a VAR initialiser NAMES - "Var p = ProcPtr(f)",
+// "Var p = ProcPtr(f, Sub(...))" or "Var p = @f" - and '' when it names none.
+// ⛔ WHY IT IS NOT A TYPE NAME. A procedure pointer is not carried by a POINTEE TYPE the way
+// "Var p = @d" is: it is carried by its SIGNATURE. Answering a type name here was TRIED and shipped
+// nothing (DIVERGENZE 57) - "p()" still lowered as an array access, "Array not declared: P1". The
+// signature is what the declaration has to say, and this is the half that says it.
+var
+  Args: TASTNode;
+  Base, Ps: string;
+  i, k, NP, Hit, NPos: Integer;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  Base := ''; NP := -1;
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) then
+    Base := UpperCase(VarToStr(Node.Value))
+  else if (Node.NodeType in [antArrayAccess, antFunctionCall]) then
+  begin
+    // "ProcPtr(f)" reaches this pre-pass as an ACCESS to a name called PROCPTR - the call it really
+    // is has not been resolved yet - which is exactly the shape that later died as an array access.
+    if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+       (Node.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(Node.GetChild(0).Value)) = 'PROCPTR') then
+      Args := Node.GetChild(1)
+    else if (Node.NodeType = antFunctionCall) and (Node.ChildCount >= 1) and
+            (UpperCase(VarToStr(Node.Value)) = 'PROCPTR') then
+      Args := Node.GetChild(0)
+    else
+      Exit;
+    if (Args = nil) or (Args.ChildCount < 1) then Exit;
+    if Args.GetChild(0).NodeType <> antIdentifier then Exit;
+    Base := UpperCase(VarToStr(Args.GetChild(0).Value));
+    // "ProcPtr(f, Sub(ByVal As Byte))" names ONE overload of f, and the only thing the bare signature
+    // node carries is the parameter COUNT - which is all that is needed to pick between them.
+    if (Args.ChildCount >= 2) and (Args.GetChild(1).NodeType = antProcSig) then
+      NP := StrToIntDef(VarToStr(Args.GetChild(1).Value), -1);
+  end;
+  if Base = '' then Exit;
+  Hit := -1;
+  for i := 0 to FPreProcSig.Count - 1 do
+  begin
+    if not SameText(Copy(FPreProcSig.Names[i], 1, Length(Base)), Base) then Continue;
+    if (Length(FPreProcSig.Names[i]) > Length(Base)) and
+       (FPreProcSig.Names[i][Length(Base) + 1] <> '~') then Continue;
+    if NP >= 0 then
+    begin
+      Ps := FPreProcSig.ValueFromIndex[i];
+      Ps := Copy(Ps, 1, Pos('|', Ps) - 1);          // the FPPARAMS half
+      NPos := 0;
+      if Ps <> '' then
+      begin
+        NPos := 1;
+        for k := 1 to Length(Ps) do
+          if Ps[k] = ',' then Inc(NPos);
+      end;
+      if NPos <> NP then Continue;
+    end;
+    Hit := i;
+    if NP >= 0 then Break;                 // the count picked it: that is the overload asked for
+    if Length(FPreProcSig.Names[i]) = Length(Base) then Break;   // the un-overloaded name: prefer it
+  end;
+  if Hit >= 0 then Result := FPreProcSig.ValueFromIndex[Hit];
+end;
+
 procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
 // Pre-scan DIM..AS declarations: record-typed vars hold an int handle (FVarRecordType),
 // builtin-typed vars get an explicit bank (FVarExplicitType). Runs before variable
 // pre-allocation so the handle/explicit type is honoured.
 var
   i, k: Integer;
-  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned: TASTNode;
-  VarName, TypeName: string;
+  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand: TASTNode;
+  VarName, TypeName, NestedTypeName: string;
   SavedInProc: Boolean;
+  SavedProcName: string;
 begin
   if Node = nil then Exit;
   // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
@@ -24347,7 +27986,63 @@ begin
           // A UDT-valued initializer (e.g. "Var v = C(5,2)" or "Var v = otherUdt") infers the UDT type,
           // not a scalar bank: its value is a record, and InferExprBank would see only the int handle and
           // make v an INTEGER holding that handle. ObjectTypeName reads the type without emitting code.
-          TypeName := ObjectTypeName(Decl.GetChild(1));
+          // ⛔ THE POINTER QUESTION COMES FIRST, as it does at every call site (see ArgUdtSigFromArgs).
+          // "Var p = @d" declares a "Double Ptr" and "Var pu = @u" a "VU Ptr"; asking ObjectTypeName
+          // first answered VU for the second - in the managed model a handle and a record read alike -
+          // so "pu->n" dereferenced a value instead of a pointer, and a FLOAT pointee had no type at all
+          // and faulted on "*p". The explicit "Dim As Double Ptr" spelling has always worked: one more
+          // rule that one path had and its sibling did not.
+          // ⭐ "Var f = T" WITH T A TYPE NAME IS "Dim f As T", DEFAULT-CONSTRUCTED. fbc's own dim/auto_var2
+          // writes it beside "Var f = T( args )", which always worked - the parenthesised form is a
+          // constructor CALL and this one is a bare name. Read as an ordinary initialiser it named a
+          // VARIABLE called T, which exists nowhere, so the record was built and then overwritten with
+          // nothing: every field answered 0 while the identical declaration with "()" answered right.
+          // The initialiser is DROPPED here, which is what makes the rest of the pipeline see the plain
+          // typed DIM it already handles.
+          if (Decl.GetChild(1).NodeType = antIdentifier) and (Decl.GetChild(1).ChildCount = 0) and
+             (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) >= 0) then
+          begin
+            TypeName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+            Decl.RemoveChildAt(1);              // the child list owns and frees it
+            Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
+            Decl.Attributes.Values['INFER'] := '0';
+            RegisterTypedVar(VarName, TypeName);
+            Continue;
+          end;
+          // ⭐ AND THE PROCEDURE-POINTER QUESTION COMES BEFORE BOTH. "Var p = ProcPtr(f)" and
+          // "Var p = @f" declare a procedure pointer, which is not carried by a pointee TYPE NAME at
+          // all but by its SIGNATURE - so every type name answered here left "p()" lowering as an
+          // array access ("Array not declared: P"), while "Dim p As Sub(...) = ProcPtr(f)" worked.
+          // The signature is stamped in the very attributes the explicit spelling writes, so the
+          // emit-time path that records FFuncPtrSigs is the SAME one for both spellings.
+          TypeName := '';
+          NestedTypeName := PreProcPtrSigOf(Decl.GetChild(1));
+          if NestedTypeName <> '' then
+          begin
+            Decl.Attributes.Values['FUNCPTR'] := '1';
+            Decl.Attributes.Values['FPPARAMS'] := Copy(NestedTypeName, 1, Pos('|', NestedTypeName) - 1);
+            Decl.Attributes.Values['FPRET'] := Copy(NestedTypeName, Pos('|', NestedTypeName) + 1, MaxInt);
+            TypeName := 'INTEGER';           // a procedure entry PC, int-banked as the explicit spelling
+          end;
+          if TypeName = '' then
+            TypeName := DeclaredPointerTypeOfArg(Decl.GetChild(1));
+          if TypeName = '' then
+            TypeName := ObjectTypeName(Decl.GetChild(1));
+          // ...and a call to a FUNCTION whose return type is a UDT, which ObjectTypeName cannot answer
+          // this early (see PreCollectFuncRetTypes).
+          if (TypeName = '') and (Decl.GetChild(1).NodeType in [antArrayAccess, antFunctionCall]) then
+          begin
+            if Decl.GetChild(1).NodeType = antFunctionCall then
+              NestedTypeName := UpperCase(VarToStr(Decl.GetChild(1).Value))
+            else if (Decl.GetChild(1).ChildCount >= 1) and
+                    (Decl.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+              NestedTypeName := UpperCase(VarToStr(Decl.GetChild(1).GetChild(0).Value))
+            else
+              NestedTypeName := '';
+            if (NestedTypeName <> '') and (FPreFuncRetType.IndexOfName(NestedTypeName) >= 0) and
+               (FindUDT(FPreFuncRetType.Values[NestedTypeName]) >= 0) then
+              TypeName := FPreFuncRetType.Values[NestedTypeName];
+          end;
           // ⛔⛔ THE BANK IS NOT THE TYPE. InferExprBank answers int/float/string, i.e. three
           // answers for ten types: "Var b = Cast(Short, 0)" became INTEGER and SizeOf(b) said 8
           // instead of 2. FIVE of ten types were wrong - Byte, Short, UByte, UShort and Single -
@@ -24396,12 +28091,25 @@ begin
         if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
         begin
           VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          case InferExprBank(Decl.GetChild(1)) of
-            srtString: TypeName := 'STRING';
-            srtInt:    TypeName := 'INTEGER';
-          else
-            TypeName := 'DOUBLE';
-          end;
+          // ⛔⛔ THE OPERAND IS NOT CHILD 1. "Dim b As TypeOf(a)" parses as the type identifier "TYPEOF"
+          // at child 1 with the ARGUMENT LIST at child 2, so this asked the bank of a name called
+          // "TYPEOF" - an unknown one - and always got the float default. It looked right only because
+          // an Integer stored in a Double register still prints as itself; a STRING printed 0.
+          TypeOfOperand := Decl.GetChild(1);
+          if (UpperCase(VarToStr(TypeOfOperand.Value)) = 'TYPEOF') and (Decl.ChildCount >= 3) and
+             (Decl.GetChild(2).NodeType in [antArgumentList, antExpressionList]) and
+             (Decl.GetChild(2).ChildCount >= 1) then
+            TypeOfOperand := Decl.GetChild(2).GetChild(0);
+          // ⭐ And then the DECLARED TYPE, with the bank only as the fallback: asking the bank alone is
+          // three answers for ten types.
+          TypeName := DeclaredTypeNameOf(TypeOfOperand);
+          if TypeName = '' then
+            case InferExprBank(TypeOfOperand) of
+              srtString: TypeName := 'STRING';
+              srtInt:    TypeName := 'INTEGER';
+            else
+              TypeName := 'DOUBLE';
+            end;
           Decl.RemoveChildAt(1);   // drop the type-of expression (the child list owns and frees it)
           Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
           Decl.Attributes.Values['TYPEOF'] := '0';
@@ -24467,7 +28175,10 @@ begin
     // belongs to a PROCEDURE, not to the module, and so must not seize the bare-name bank entry of a
     // module variable that merely shares its name (see RegisterTypedVar).
     SavedInProc := FPreScanInProc;
+    SavedProcName := FPreScanProcName;
     FPreScanInProc := True;
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      FPreScanProcName := UpperCase(VarToStr(Node.GetChild(0).Value));
     // FUNCTION return type (M3.2): the name node (child 0) may carry a type child
     // ("FUNCTION f(...) AS rettype") — type the function name so its result slot is correct.
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
@@ -24562,6 +28273,7 @@ begin
     for i := 0 to Node.ChildCount - 1 do
       RegisterRecordVars(Node.GetChild(i));
     FPreScanInProc := SavedInProc;
+    FPreScanProcName := SavedProcName;
     Exit;
   end;
   for i := 0 to Node.ChildCount - 1 do
@@ -24590,6 +28302,14 @@ var
   Idx: Integer;
 begin
   if VarName = '' then Exit;
+  // The type NAME the declaration said, kept beside the bank: see the note on FVarDeclTypeName.
+  // Module-level wins over a procedure-local of the same name, exactly as the bank map below does.
+  if TypeName <> '' then
+  begin
+    if not FPreScanInProc then FVarDeclTypeName.Values[VarName] := UpperCase(TypeName)
+    else if FVarDeclTypeName.IndexOfName(VarName) < 0 then
+      FVarDeclTypeName.Add(VarName + '=' + UpperCase(TypeName));
+  end;
   { ⭐ BIGINT is a HANDLE type, exactly like a UDT, and it has to be said HERE - the
     one place that decides which bank a declared name lives in. FindUDT('BIGINT') is
     < 0 by design (it is not a user type), so without this arm it fell to
@@ -24598,23 +28318,59 @@ begin
     DECLARATION ORDER. With "Dim b As BigInt" first the program was right; with the
     DIM after a statement, the declaration bound one register and every later use
     resolved another, and the value silently came out 0. }
+  // ⛔ AND FVarRecordType IS KEYED BY BARE NAME TOO. The note above says this for FVarExplicitType and
+  // gives the cure - a MODULE-level declaration owns the bare name, anything inside a procedure only
+  // adds if absent - and that cure was never replicated here. So "Sub touch( ByRef stp As foo )"
+  // anywhere in the file made the module's own "Dim As Integer stp = 1" a record: printing it
+  // dereferenced the integer 1 as a handle and the program died on an access violation, with no
+  // pointer and no UDT anywhere near the line that failed.
+  // ...and a module declaration that is NOT a record has to CLEAR the entry, not merely decline to
+  // write one: it is the authority on that name, and saying nothing would leave a procedure's earlier
+  // claim standing.
   if FindUDT(TypeName) >= 0 then
   begin
-    FVarRecordType.Values[VarName] := TypeName;
+    if not FPreScanInProc then FVarRecordType.Values[VarName] := TypeName
+    else if FVarRecordType.IndexOfName(VarName) < 0 then FVarRecordType.Add(VarName + '=' + TypeName);
     Bank := srtInt;   // a record var holds an int handle
   end
   else if FModernMode and (UpperCase(TypeName) = 'BIGINT') then
   begin
-    FVarRecordType.Values[VarName] := 'BIGINT';
+    if not FPreScanInProc then FVarRecordType.Values[VarName] := 'BIGINT'
+    else if FVarRecordType.IndexOfName(VarName) < 0 then FVarRecordType.Add(VarName + '=BIGINT');
     Bank := srtInt;   // a BigInt var holds an int handle too
   end
   else
+  begin
+    if (not FPreScanInProc) and (FVarRecordType.IndexOfName(VarName) >= 0) then
+      FVarRecordType.Delete(FVarRecordType.IndexOfName(VarName));
     Bank := TypeNameToBank(TypeName, VarName);
+  end;
   Idx := FVarExplicitType.IndexOf(VarName);
   if Idx < 0 then
     FVarExplicitType.AddObject(VarName, TObject(PtrInt(Ord(Bank))))
   else if not FPreScanInProc then
     FVarExplicitType.Objects[Idx] := TObject(PtrInt(Ord(Bank)));
+  // ⛔ ...AND THE PROCEDURE-AGAINST-PROCEDURE CASE, which the note above does not cover. The bare-name
+  // entry is add-if-absent inside a procedure, so the FIRST procedure in the file that declares a name
+  // owns its bank for EVERY procedure: "Sub g(ByVal s As Integer)" written above "Sub t() : Dim s As
+  // ZString * 16" made t's s an INT, and "s[0] = 65" - whose lowering asks this very map whether s is
+  // a string - fell onto the array ladder as "Array not declared: S". It depended on the ORDER of two
+  // unrelated procedures. A SCOPED entry is written beside the bare one, never instead of it, so
+  // module level and every lookup with no procedure context read exactly as before.
+  // ⛔ ...AND ONLY WHEN THE TYPE IS ONE WE ACTUALLY KNOW. TypeNameToBank ANSWERS FOR EVERYTHING: an
+  // unknown name falls back to the name-suffix default, which for a bare name is FLOAT. Writing that
+  // guess as a SCOPED entry makes it authoritative inside the procedure and it then beats a
+  // better-informed bare entry - the manual's defines/fbquerysymbol2 has a parameter declared
+  // "As fbc.FB_DATACLASS", a dotted enum this map does not resolve, and every call came back
+  // "integer" because the parameter had been banked float. A registry must decline, not guess.
+  if FPreScanInProc and (FPreScanProcName <> '') and TypeNameIsKnownBank(TypeName) then
+  begin
+    Idx := FVarExplicitType.IndexOf(FPreScanProcName + '|' + VarName);
+    if Idx < 0 then
+      FVarExplicitType.AddObject(FPreScanProcName + '|' + VarName, TObject(PtrInt(Ord(Bank))))
+    else
+      FVarExplicitType.Objects[Idx] := TObject(PtrInt(Ord(Bank)));
+  end;
   // A declaration made at MODULE level is remembered as such. FreeBASIC hides a plain module DIM from
   // every procedure - resolution already stops at the procedure root for a non-shared name, which is why
   // the VALUE is right - but its declared TYPE lived in this map, keyed by bare name, and leaked in
@@ -24635,6 +28391,15 @@ begin
   if FModuleOnlyVars = nil then Exit;
   if FModuleOnlyVars.IndexOf(NameU) < 0 then Exit;     // not a module-only declaration
   if IsSharedScalar(NameU) then Exit;                  // DIM SHARED is visible everywhere
+  // ⛔ ...AND SO IS A RAW-BACKED ONE. Taking a module scalar's address moves it OUT of the shared-scalar
+  // registry and into the raw one - whose own note says "visible in every procedure" - and this test
+  // knew only the first of the two. A STATIC local is hoisted into a module DIM SHARED, so
+  // "Static As ZString * 32 z" whose @ is taken became module-only-and-HIDDEN: inside its own procedure
+  // the bank fell back to the NAME SUFFIX (float), and "z[0]" - which asks this very question - dropped
+  // onto the array ladder as "Array not declared: STATIC.0.Z". Three neighbouring spellings all worked
+  // (z[0] alone, @z alone, the same pair on a plain local), which is what said the defect was the
+  // VISIBILITY question and not the index.
+  if IsRawModuleScalar(NameU) then Exit;
   if (FCurrentProcDeclNames <> nil) and (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then Exit;
   Result := True;
 end;
@@ -24858,6 +28623,42 @@ begin
   end;
 end;
 
+function TSSAGenerator.InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;
+// Is this initializer a call to a procedure that RETURNS THE RECORD TYPE BEING DECLARED? A call and an
+// array element are the same node at this level, so the procedure table is what separates them, and the
+// declaration node it holds is what carries the return type.
+//
+// ⛔ WHY IT IS ASKED. "Dim a As T = mk(7)", where mk RETURNS a T, was routed through T's one-argument
+// CONSTRUCTOR and handed it the returned HANDLE: a.v came out 2 and 6 - allocation indices - where fbc
+// answers 7. The plain assignment "b = mk(7)" was right all along, so only the initializer path was
+// wrong. The routing test is "is the initializer's type DIFFERENT from the declared one", and it asks
+// ObjectTypeName, which answers '' for a call - and '' compares as different. A registry that answers a
+// DEFAULT instead of "I do not know" is the whole defect: '' meant both "not a record" and "no idea".
+//
+// ⛔⛔ AND IT MUST ASK WHICH TYPE, NOT MERELY "IS IT A CALL". Excluding every call broke m627: a call
+// that returns a SCALAR is exactly what the one-argument constructor is for, and skipping it there left
+// the conversion undone. Only a call returning THIS type takes the value-copy path.
+// ⭐ The return type is read from the DECLARATION node, not from the variable registry: that registry
+// has not been written yet when a MODULE-LEVEL declaration is lowered - the writer has not run - while
+// the procedure table is filled by a pre-pass. The declared type comes in as a PARAMETER for the same
+// reason: a field set at the call site is one more ordering to get right, and the first attempt got it
+// wrong in exactly that way (the helper read an empty string and quietly did nothing).
+var
+  Nm: string;
+  Decl, NameNode: TASTNode;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 1) then Exit;
+  if (Node.GetChild(0) = nil) or (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  if not FProcDecls.TryGetValue(Nm, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 1) then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.NodeType <> antIdentifier) or (NameNode.ChildCount < 1) then Exit;
+  if NameNode.GetChild(0).NodeType <> antIdentifier then Exit;
+  Result := UpperCase(VarToStr(NameNode.GetChild(0).Value)) = UpperCase(DeclRecType);
+end;
+
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;
 // Returns the UDT type name of a record variable, or '' if it isn't a record variable.
 var
@@ -24881,6 +28682,10 @@ begin
   ParamUDT := CurrentProcLocalRecType(VarName);
   if ParamUDT <> '' then
     Exit(ParamUDT);
+  // ...and a local of this procedure that is NOT a record screens the bare-name map outright: it is
+  // that declaration the code means, whatever another procedure's parameter of the same name is.
+  if (FCurrentProcNonRecs <> nil) and (FCurrentProcNonRecs.IndexOf(UpperCase(VarName)) >= 0) then
+    Exit('');
   if FVarRecordType.IndexOfName(UpperCase(VarName)) < 0 then
     Result := ''
   else
@@ -24892,25 +28697,24 @@ function TSSAGenerator.CurrentProcLocalRecType(const VarName: string): string;
 // FCurrentProcLocalRecs "VARNAME|TYPENAME"), or '' if VarName is not such a local. Lets a local shadow a
 // same-named module UDT variable in the global name->type map.
 var
-  i, bar: Integer;
-  VNameU: string;
+  i: Integer;
+  VNameU, EVName, ETName: string;
+  EIsArr: Boolean;
 begin
   Result := '';
   if FCurrentProcLocalRecs = nil then Exit;
   VNameU := UpperCase(VarName);
   for i := 0 to FCurrentProcLocalRecs.Count - 1 do
-  begin
-    bar := Pos('|', FCurrentProcLocalRecs[i]);
-    if (bar > 0) and (UpperCase(Copy(FCurrentProcLocalRecs[i], 1, bar - 1)) = VNameU) then
-      Exit(Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt));
-  end;
+    if SplitRecordVar(FCurrentProcLocalRecs[i], EVName, ETName, EIsArr) and
+       (UpperCase(EVName) = VNameU) then
+      Exit(ETName);
 end;
 
 procedure TSSAGenerator.EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
 // After a record instance is allocated, recursively allocate one instance for each nested-UDT
 // field and link its handle into the parent's int slot (so a.b.c works without manual init).
 var
-  i, di, NestedUDT, ElemUDT: Integer;
+  i, di, j, NestedUDT, ElemUDT: Integer;
   NestedHandle, DefVal: TSSAValue;
   DimsN, UbExpr: TASTNode;
 begin
@@ -24992,6 +28796,21 @@ begin
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then
     begin
+      // A NESTED member's tuple default sets the member's OWN fields: load its handle (allocated just
+      // above) and run the same aggregate init a "Dim As T v = (a, b, c)" runs.
+      if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
+         (FUDTs[UDTIdx].Fields[i].DefaultExpr.NodeType in [antArgumentList, antExpressionList]) then
+      begin
+        j := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+        if j >= 0 then
+        begin
+          NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+          EmitUDTAggregateInit(NestedHandle, j, FUDTs[UDTIdx].Fields[i].DefaultExpr);
+        end;
+        Continue;
+      end;
       ProcessExpression(FUDTs[UDTIdx].Fields[i].DefaultExpr, DefVal);
       case FUDTs[UDTIdx].Fields[i].Bank of
         srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal,
@@ -25238,6 +29057,53 @@ begin
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
+function TSSAGenerator.SplitRecordVar(const S: string; out VName, TName: string;
+  out IsArray: Boolean): Boolean;
+// Read one entry of the record-variable lists: "VARNAME|TYPENAME" for a scalar, and the same with a
+// trailing "|A" for an ARRAY of that type.
+// ⛔ ONE FUNNEL, because the six places that read these lists all spelled the split out by hand with
+// Pos('|') and Copy(...MaxInt) - so a third field appended to the entry would have arrived inside the
+// TYPE NAME at every one of them, and a key torn in half by its own store's separator is a defect this
+// codebase has already paid for twice.
+var
+  b1, b2: Integer;
+begin
+  Result := False; VName := ''; TName := ''; IsArray := False;
+  b1 := Pos('|', S);
+  if b1 <= 0 then Exit;
+  VName := Copy(S, 1, b1 - 1);
+  b2 := Pos('|', S, b1 + 1);
+  if b2 > 0 then
+  begin
+    TName := Copy(S, b1 + 1, b2 - b1 - 1);
+    IsArray := UpperCase(Copy(S, b2 + 1, MaxInt)) = 'A';
+  end
+  else
+    TName := Copy(S, b1 + 1, MaxInt);
+  Result := True;
+end;
+
+procedure TSSAGenerator.EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
+// Destroy one record variable of a scope that is ending: a scalar through its handle, an ARRAY through
+// every one of its elements.
+// ⭐ The element loop is NOT new - EmitRecordArrayConstruct already runs a destructor over every
+// element, which is what ERASE uses. The half that was missing was the CALL: an array of a type with a
+// destructor was constructed element by element and then torn down not at all, so
+// "Dim As P a(0 To 1)" printed two ctors and zero dtors where fbc prints two of each. A withdrawal
+// note that names the missing half is the map to the cure, and this was that half.
+var
+  ArrayIdx: Integer;
+begin
+  if not IsArray then
+  begin
+    EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+    Exit;
+  end;
+  ArrayIdx := ArrayIndexOf(VName);
+  if ArrayIdx < 0 then Exit;
+  EmitRecordArrayConstruct(ArrayIdx, TName, 0, True);
+end;
+
 procedure TSSAGenerator.EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);
 // After an array-of-UDT is dimensioned and its element records allocated (ssaRecordNewArray), give each
 // element the per-instance setup EmitRecordInit provides: member-array backing, nested-UDT field instances,
@@ -25385,7 +29251,7 @@ begin
 end;
 
 procedure TSSAGenerator.EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
-  FromFlatIndex: Integer);
+  FromFlatIndex: Integer; RunDtor: Boolean = False);
 // Run the DEFAULT constructor on every element of a DIM'd array-of-UDT, from flat index FromFlatIndex on.
 // "Dim a(1 To 3) As T" declares THREE objects, and FreeBASIC constructs each one: only the scalar case
 // was ever constructed here, so every element of an array came up with its fields at 0 -- a member
@@ -25404,7 +29270,15 @@ begin
   // Nothing to run without a constructor callable with NO arguments — which includes one whose every
   // parameter carries a default ("Constructor(ht As handlertype = ht_default)"), the form this example
   // is built on. Testing the exact empty signature alone declared that type constructor-less.
-  if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
+  // ⭐ ...or the DESTRUCTOR, when the caller asks for that pass instead. ERASE on an array of a type
+  // that declares one must run it on every element before the storage is reset - fbc counts two dtors
+  // for "Erase x" over a two-element array - and writing a second loop for it would be a second copy of
+  // this whole shape. One loop, two methods.
+  if RunDtor then
+  begin
+    if ResolveMethodLabel(TypeName, 'DESTRUCTOR') = '' then Exit;
+  end
+  else if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
   ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
   DimCount := FProgram.GetArray(ArrayIdx).DimCount;
   if DimCount < 1 then DimCount := 1;
@@ -25454,7 +29328,10 @@ begin
   HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
-  EmitConstructorCall(HandleVal, TypeName, nil);
+  if RunDtor then
+    EmitDestructorCall(HandleVal, TypeName)
+  else
+    EmitConstructorCall(HandleVal, TypeName, nil);
   EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 
   FCurrentBlock := FProgram.CreateBlock(IncrLabel);
@@ -25471,14 +29348,53 @@ begin
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
+procedure TSSAGenerator.EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer;
+  BraceNode: TASTNode);
+// ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives that field -
+// an array - its elements one by one; the field's slot holds the member array's FArrays handle, so the
+// values go in through the same indirect store "v.field(j) = x" uses.
+// ⛔ ONE implementation, called from BOTH field-list paths: the aggregate init and the no-constructor
+// fallback inside EmitConstructorCall reach the very same "( a, { b, c }, d )" written two ways
+// ("Dim As T v = (...)" and "v = Type(...)"), and only the first knew about the braces - the second
+// stored nothing and the member array read back zeros.
+var
+  j: Integer;
+  ArgVal, ArrHandle: TSSAValue;
+begin
+  if (UDTIdx < 0) or (BraceNode = nil) then Exit;
+  // ⛔ A brace list belongs to an ARRAY member and to nothing else - fbc says "Expected array" when the
+  // field at that position is a scalar, and it is right: there is no meaning to give the values. Left
+  // unchecked the list was evaluated as an ordinary expression and the fields came out scrambled.
+  if not FUDTs[UDTIdx].Fields[FieldIdx].IsArray then
+    raise Exception.CreateFmt(
+      'A "{ ... }" initialiser needs an array member: field %d of %s is not an array.',
+      [FieldIdx + 1, FUDTs[UDTIdx].Name]);
+  ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
+                  MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+  for j := 0 to BraceNode.ChildCount - 1 do
+  begin
+    ProcessExpression(BraceNode.GetChild(j), ArgVal);
+    case FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank of
+      srtFloat:  EmitInstruction(ssaArrayStoreIndFloat, EnsureFloatRegister(ArgVal), ArrHandle,
+                   EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaArrayStoreIndString, EnsureStringRegister(ArgVal), ArrHandle,
+                   EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaArrayStoreIndInt, EnsureIntRegister(ArgVal), ArrHandle,
+                   EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+    end;
+  end;
+end;
+
 procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
 // FreeBASIC aggregate initialization "Dim As T v = (a, b, c)" and "Type<T>(a, b, c)": a UDT with no
 // constructor is initialized field-by-field — store each value into the field at the same position (in
 // declaration order). Extra values past the field count are ignored (FB would reject them; v1 is lenient).
 var
-  i, j, Slot: Integer;
-  ArgVal, ArrHandle: TSSAValue;
+  i, j, Slot, FieldIdx, UGrp, UFirst, USGrp: Integer;
+  ArgVal, ArrHandle, UnitVal: TSSAValue;
   SrcType: string;
+  NestedArgs: TASTNode;
   Bank: TSSARegisterType;
 begin
   if (UDTIdx < 0) or (ArgsNode = nil) then Exit;
@@ -25492,40 +29408,104 @@ begin
       EmitRecordCopy(HandleVal, ArgVal, UDTIdx);
     Exit;
   end;
+  // ⛔⛔ THE VALUES ARE POSITIONAL OVER *FIELDS THAT HAVE STORAGE OF THEIR OWN*, not over the field
+  // array. Two shapes break that one-to-one, and the LAYOUT knew about both while this did not:
+  //  - a UNION consumes ONE value between them all (its members share the storage), and the value
+  //    after it belongs to the field FOLLOWING the union. Writing one value per member made
+  //    "Dim As T x = (1, 2, 3)" put 2 and 3 into the same bytes and leave the field after the union 0;
+  //  - a BIT FIELD is part of a shared unit, so a plain store writes the WHOLE unit and the members of
+  //    a run overwrote each other: "(1, 2, 3)" answered 3, 0, 0.
+  // ⇒ Walk the FIELDS and the VALUES with two cursors, and let the field decide how it is written.
+  CheckAggregateInitArity(UDTIdx, ArgsNode);
+  FieldIdx := 0;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
-    if i > High(FUDTs[UDTIdx].Fields) then Break;
+    // ⛔ THE REST OF A UNION BLOCK SHARES THE VALUE ALREADY WRITTEN - but "the rest" starts after the
+    // block's FIRST MEMBER, and that member may be an anonymous "Type ... End Type" run of several
+    // fields. Skipping the whole block after ONE field gave "Dim As T x = (1, 2, 3, 4)" on
+    // "head : Union Type u : v End Type End Union : tail" the values 1, 2, 0, 3 where fbc writes
+    // 1, 2, 3, 4: v never received its own and tail took v's. The COUNT rule (CheckAggregateInitArity)
+    // learned this first; the placement had to learn the same thing or the two would disagree about
+    // how many values the type can hold - and it is the count that lets them through.
+    if (FieldIdx <= High(FUDTs[UDTIdx].Fields)) and (FieldIdx > 0) and
+       (FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup <> 0) and
+       (FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup = FUDTs[UDTIdx].Fields[FieldIdx - 1].UnionGroup) then
+    begin
+      UGrp := FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup;
+      UFirst := FieldIdx;
+      while (UFirst > 0) and (FUDTs[UDTIdx].Fields[UFirst - 1].UnionGroup = UGrp) do Dec(UFirst);
+      USGrp := FUDTs[UDTIdx].Fields[UFirst].StructGroup;      // the block's first member, if it is a run
+      if (USGrp = 0) or (FUDTs[UDTIdx].Fields[FieldIdx].StructGroup <> USGrp) then
+        while (FieldIdx <= High(FUDTs[UDTIdx].Fields)) and
+              (FUDTs[UDTIdx].Fields[FieldIdx].UnionGroup = UGrp) do
+          Inc(FieldIdx);
+    end;
+    if FieldIdx > High(FUDTs[UDTIdx].Fields) then Break;
+    // OOP: an aggregate initialiser WRITES these fields, and writing one is reaching it. This path
+    // walks the field array by INDEX, so it never asks the by-name lookup where the rule lives, and
+    // "Dim As T x = (3)" filled a Private field from module level in silence. fbc refuses it
+    // ("visibility/{private,protected}-field-public-init", plus dim/anon_no_access).
+    CheckMemberAccess(FUDTs[UDTIdx].Name, FUDTs[UDTIdx].Fields[FieldIdx].Name);
     // ⭐ A BRACE LIST INITIALISES AN ARRAY MEMBER. "Dim As T v = ( 1, { 2, 3, 4 }, 5 )" gives the
     // middle field - an array - its elements one by one; the field's slot holds the member array's
     // FArrays handle, so the values go in through the same indirect store "v.field(j) = x" uses.
-    if (ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1') and
-       FUDTs[UDTIdx].Fields[i].IsArray then
+    if ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1' then
     begin
+      EmitBraceArrayMemberInit(HandleVal, UDTIdx, FieldIdx, ArgsNode.GetChild(i));
+      Inc(FieldIdx);
+      Continue;
+    end;
+    // ⛔ A NESTED UDT FIELD OWNS A RECORD, and its slot holds that record's HANDLE. Storing the value
+    // over the handle left the nested instance unreachable: "Dim b As baz = (111)" - baz's only field
+    // being "f As foo" - printed garbage for b.f.bar and CRASHED the next program that did it. fbc lets
+    // the initializer reach through: the value (or the parenthesised group, "( (111) )") initialises the
+    // NESTED type, positionally, exactly as it does at this level. Recurse on the member's handle.
+    if (FUDTs[UDTIdx].Fields[FieldIdx].NestedType <> '') and
+       (not FUDTs[UDTIdx].Fields[FieldIdx].IsArray) and
+       (FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType) >= 0) and
+       (ObjectTypeName(ArgsNode.GetChild(i)) = '') then
+    begin
+      j := FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType);
       ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
-                      MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
-      for j := 0 to ArgsNode.GetChild(i).ChildCount - 1 do
+                      MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+      NestedArgs := ArgsNode.GetChild(i);
+      // "( (111) )" hands the nested type its own list; a bare value is that list with one element, and
+      // building the one-element list here keeps ONE recursion instead of two shapes of it.
+      if not (NestedArgs.NodeType in [antArgumentList, antExpressionList]) then
       begin
-        ProcessExpression(ArgsNode.GetChild(i).GetChild(j), ArgVal);
-        case FUDTs[UDTIdx].Fields[i].ArrayElemBank of
-          srtFloat:  EmitInstruction(ssaArrayStoreIndFloat, EnsureFloatRegister(ArgVal), ArrHandle,
-                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
-          srtString: EmitInstruction(ssaArrayStoreIndString, EnsureStringRegister(ArgVal), ArrHandle,
-                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
-        else         EmitInstruction(ssaArrayStoreIndInt, EnsureIntRegister(ArgVal), ArrHandle,
-                       EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+        NestedArgs := TASTNode.Create(antArgumentList, ArgsNode.GetChild(i).Token);
+        NestedArgs.AddChild(ArgsNode.GetChild(i).Clone);
+        try
+          EmitUDTAggregateInit(ArrHandle, j, NestedArgs);
+        finally
+          NestedArgs.Free;
         end;
-      end;
+      end
+      else
+        EmitUDTAggregateInit(ArrHandle, j, NestedArgs);
+      Inc(FieldIdx);
       Continue;
     end;
     ProcessExpression(ArgsNode.GetChild(i), ArgVal);
-    Bank := FUDTs[UDTIdx].Fields[i].Bank;
-    Slot := FUDTs[UDTIdx].Fields[i].Slot;
+    Bank := FUDTs[UDTIdx].Fields[FieldIdx].Bank;
+    Slot := FUDTs[UDTIdx].Fields[FieldIdx].Slot;
+    if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0 then
+    begin
+      // A bit field names part of a unit: read the unit, insert the bits, write it back.
+      UnitVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, UnitVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      UnitVal := EmitBitFieldInsert(UnitVal, EnsureIntRegister(ArgVal), UDTIdx, FieldIdx);
+      EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(UnitVal), MakeSSAConstInt(Slot));
+      Inc(FieldIdx);
+      Continue;
+    end;
     case Bank of
       srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVal), MakeSSAConstInt(Slot));
       srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, EnsureStringRegister(ArgVal), MakeSSAConstInt(Slot));
     else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVal), MakeSSAConstInt(Slot));
     end;
+    Inc(FieldIdx);
   end;
 end;
 
@@ -25551,7 +29531,28 @@ begin
   // Runs the matching constructor if the type declares one; a constructor-less type is aggregate-
   // initialized field-by-field from the args (EmitConstructorCall handles that fallback).
   EmitConstructorCall(Handle, UpperCase(TypeName), ArgsNode);
+  // V5f: it is a TEMPORARY, and fbc destroys it at the end of the statement that built it. Every use
+  // copies out of it, so nothing else owns it. fbc's own suite asserts this and the result temporary
+  // together: functions/return-non-trivial builds "Type( (123) )" inside a function whose result is a
+  // UDT and requires TWO destructor runs - one for this temporary, one for the result.
+  RegisterResultTemp(Handle, UpperCase(TypeName), True);
   Result := True;
+end;
+
+function TSSAGenerator.UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
+// Does this type have a field whose initialisation is NOT "store the value into the slot"? A union
+// member (one value between them all), a bit field (part of a shared unit), or a nested UDT (the slot
+// holds a handle). See the call site: these are the three shapes the constructor path's own field loop
+// does not know, and the reason it must defer to EmitUDTAggregateInit for them.
+var
+  i: Integer;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) or (FUDTs[UDTIdx].Fields[i].BitWidth > 0) or
+       ((FUDTs[UDTIdx].Fields[i].NestedType <> '') and (not FUDTs[UDTIdx].Fields[i].IsArray)) then
+      Exit(True);
 end;
 
 procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const TypeName: string;
@@ -25569,12 +29570,19 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 // call inside an argument expression.
 var
   Lbl, ArgSig, UdtSig: string;
-  Decl, ParamList, PNode: TASTNode;
+  Decl, ParamList, PNode, ArrayBindArgs: TASTNode;
   i, Slot, ArgCount, AggUDT: Integer;
   RT: TSSARegisterType;
   ArgVals: array of TSSAValue;
   DefVal: TSSAValue;
 begin
+  // OOP: the permission, on the CONSTRUCTOR. Every way of bringing an instance into being - "Dim As T x",
+  // a local array of T, "Static As T x", "New T", "New T[n]" - lands here, so the rule is asked once
+  // instead of at six sites. ⭐ And it reads correctly from INSIDE a derived constructor, which is the
+  // case that decides whether this belongs here at all: lowering "Type Child Extends Parent" runs this
+  // for Parent's ctor with FCurrentThisType = CHILD, and fbc's answer is exactly ours - a PROTECTED base
+  // constructor is reachable from the derived type and a PRIVATE one is not.
+  CheckInheritedCtorDtorAccess(TypeName, kCONSTRUCTOR);
   if Assigned(ArgsNode) then ArgCount := ArgsNode.ChildCount else ArgCount := 0;
   // Evaluate each argument once and accumulate its bank signature.
   SetLength(ArgVals, ArgCount);
@@ -25589,7 +29597,7 @@ begin
   // values. Without this, "Constructor(v As S)" and "Constructor(v As T)" both resolved to whichever was
   // declared first, and the ctor then read the wrong record's fields.
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
-  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig, ArgWidthSigFromArgs(ArgsNode));
+  Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig, ArgWidthSigFromArgs(ArgsNode, True));
   // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
   if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
   if Lbl = '' then
@@ -25606,10 +29614,35 @@ begin
       EmitRecordCopy(HandleVal, EnsureIntRegister(ArgVals[0]), AggUDT);
       Exit;
     end;
+    // ⛔ THE FIELD-WISE LOOP BELOW IS A SECOND COPY of EmitUDTAggregateInit, and it never learned what
+    // that one did: a UNION consumes ONE value, a BIT FIELD is part of a shared unit, and a NESTED UDT
+    // field holds a HANDLE that a positional store overwrites - which is how "Dim b As baz = (111)",
+    // baz's only field being a nested "foo", printed garbage and crashed the program after it.
+    // Where the type has any of those three shapes, ask the ONE routine that knows them.
+    // ⚠️ The arguments were already evaluated above (for the ctor signature) and this re-evaluates them;
+    // that is accepted deliberately and ONLY here, because these are exactly the types the loop below
+    // miscompiled. A type with none of the three shapes takes the loop, unchanged, as it always did.
+    if (AggUDT >= 0) and (ArgsNode <> nil) and UDTNeedsAggregateWalk(AggUDT) then
+    begin
+      EmitUDTAggregateInit(HandleVal, AggUDT, ArgsNode);
+      Exit;
+    end;
+    if AggUDT >= 0 then CheckAggregateInitArity(AggUDT, ArgsNode);   // the same rule, the second copy
     if AggUDT >= 0 then
       for i := 0 to ArgCount - 1 do
       begin
         if i > High(FUDTs[AggUDT].Fields) then Break;
+        // ...and the PERMISSION, which is the other rule the loop above carries and this copy did not:
+        // writing a field is reaching it, and "Dim As T x = (3)" filled a Private one from module level.
+        CheckMemberAccess(FUDTs[AggUDT].Name, FUDTs[AggUDT].Fields[i].Name);
+        // A brace list initialises an ARRAY member - the same rule the aggregate-init path carries,
+        // asked here because "v = Type( 1, 2, {3, 4}, 5 )" reaches the field list through THIS path.
+        if (ArgsNode <> nil) and (i < ArgsNode.ChildCount) and
+           (ArgsNode.GetChild(i).Attributes.Values['BRACEINIT'] = '1') then
+        begin
+          EmitBraceArrayMemberInit(HandleVal, AggUDT, i, ArgsNode.GetChild(i));
+          Continue;
+        end;
         Slot := FUDTs[AggUDT].Fields[i].Slot;
         case FUDTs[AggUDT].Fields[i].Bank of
           srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVals[i]), MakeSSAConstInt(Slot));
@@ -25626,10 +29659,19 @@ begin
     for i := 0 to ArgCount - 1 do
     begin
       if i + 1 >= ParamList.ChildCount then Break;  // defensive: arity already matched the resolution
+      // ⛔ AN ARRAY PARAMETER IS BOUND, NOT STAGED - it has no scalar transfer slot, so ParamBankAndSlot
+      // answers slot 0, which is where the implicit THIS handle already sits. Staging the argument there
+      // OVERWROTE THIS, and the constructor faulted on its very first field access. StageCallArgs skips
+      // such a parameter for exactly this reason and says so; the constructor's own staging did not.
+      if ParamList.GetChild(i + 1).Attributes.Values['ARRAY'] = '1' then Continue;
       Slot := ParamBankAndSlot(ParamList, i + 1, RT);  // +1: skip the implicit THIS parameter
       // A STRING argument for a byte-POINTER parameter is passed by ADDRESS (see StageCallArgs): the
       // constructor stages its own arguments, so the conversion has to be made here too.
-      if (RT = srtInt) and (ArgVals[i].RegType = srtString) and
+      // ...and the WSTRING half of it, which is a different address (see TryEmitWStringPtrArg). Both
+      // conversions have to be in BOTH staging paths, or a constructor converts where a SUB does not.
+      if (RT = srtInt) and TryEmitWStringPtrArg(ParamList.GetChild(i + 1), ArgsNode.GetChild(i), DefVal) then
+        ArgVals[i] := DefVal
+      else if (RT = srtInt) and (ArgVals[i].RegType = srtString) and
          IsStringArgForBytePtrParam(ParamList.GetChild(i + 1), ArgsNode.GetChild(i)) then
       begin
         DefVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -25647,13 +29689,30 @@ begin
       PNode := ParamList.GetChild(i);
       if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
       begin
-        ProcessExpression(PNode.GetChild(PNode.ChildCount - 1), DefVal);
+        ProcessDefaultValue(PNode, PNode.GetChild(PNode.ChildCount - 1), DefVal);
         Slot := ParamBankAndSlot(ParamList, i, RT);
         EmitXferStore(RT, Slot, DefVal);
       end;
     end;
   end;
-  EmitCallSubLabel(ProcedureLabelName(Lbl));
+  // ⛔ ARRAY PARAMETERS ARE BOUND, NOT STAGED. A "<T> Ptr"-free array parameter is passed by ALIASING
+  // the callee's placeholder slot to the caller's array, and every other call shape does it: a plain
+  // SUB/FUNCTION, a UDT-returning function, a METHOD. A CONSTRUCTOR did not, so
+  // "Constructor UDT1( a() As Integer )" ran against an unbound placeholder and UBOUND(a) faulted.
+  // ⚠️ ArrayBindArgs must line up 1:1 with the parameter list, which carries the implicit THIS at
+  // index 0 - so the list handed over gets a placeholder there, exactly as the method site does.
+  ArrayBindArgs := TASTNode.Create(antArgumentList, nil);
+  try
+    ArrayBindArgs.AddChild(TASTNode.CreateWithValue(antLiteral, 0, nil));      // stands in for THIS
+    if ArgsNode <> nil then
+      for i := 0 to ArgsNode.ChildCount - 1 do
+        ArrayBindArgs.AddChild(ArgsNode.GetChild(i).Clone);
+    EmitArrayArgBinds(Lbl, ArrayBindArgs, True);
+    EmitCallSubLabel(ProcedureLabelName(Lbl));
+    EmitArrayArgBinds(Lbl, ArrayBindArgs, False);        // restore the aliased slots after the call
+  finally
+    ArrayBindArgs.Free;
+  end;
   // ⛔ AND PUT THE DYNAMIC TYPE BACK. The constructor that just ran set it to ITS OWN level, which is
   // not necessarily TypeName: ResolveConstructorLabel walks UP the chain, so a derived type with no
   // constructor of its own runs the base's, and the object would stay typed as the BASE for the rest
@@ -25679,6 +29738,9 @@ var
   UDTIdx, i, Slot: Integer;
   NestedHandle: TSSAValue;
 begin
+  // OOP: the permission, on the DESTRUCTOR - the mirror of the constructor check, and reached by the
+  // same six shapes plus "Delete p" and "Erase a".
+  CheckInheritedCtorDtorAccess(TypeName, kDESTRUCTOR);
   UDTIdx := FindUDT(UpperCase(TypeName));
   // 1) the object's own destructor body first (so it still sees its members alive).
   Lbl := ResolveMethodLabel(TypeName, 'DESTRUCTOR');
@@ -25767,18 +29829,123 @@ begin
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
         if FindUDT(TName) >= 0 then
-        begin
-          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          Into.Add(VName + '|' + TName);
-        end;
+          Into.Add(VName + '|' + TName)
+        // ⛔ ...AND A LOCAL THAT IS **NOT** A RECORD HAS TO SCREEN ONE. The list above is filled only
+        // for a UDT, so a local "Dim As Integer stp" never shadowed the bare-name record map - and a
+        // parameter "ByRef stp As foo" declared in ANOTHER procedure of the same file made that local
+        // a record, so "stp = 1" ran that type's Operator Let on a handle that does not exist: an
+        // access violation inside an operator the failing procedure never mentions. The module-level
+        // half of exactly this was closed on 26 Aug (m597); this is the per-procedure half.
+        // ⚠️ It cannot go in the list above: that one also drives EmitFrameDestructors, and a
+        // destructor call on an Integer is the next defect along.
+        // ⛔ ...EXCEPT BIGINT, which is a HANDLE type exactly like a UDT and deliberately answers < 0
+        // to FindUDT (it is not a user type). RegisterTypedVar has that same arm and says so; screening
+        // a "Dim b As BigInt" here took its record-ness away and four corpus programs went red at once.
+        else if (FCurrentProcNonRecs <> nil) and (TName <> 'BIGINT') and
+                (FCurrentProcNonRecs.IndexOf(VName) < 0) then
+          FCurrentProcNonRecs.Add(VName);
+      end
+      // ⭐ ...AND AN ARRAY OF THAT TYPE IS N OBJECTS, EACH OF WHICH IS DESTROYED. The test above wants
+      // child[1] to be the TYPE, which is the SCALAR shape - an array has its antDimensions there - so
+      // "Dim As P a(0 To 1)" was collected by nobody and torn down by nobody: two constructors ran and
+      // ZERO destructors, where fbc runs two of each. It is marked "|A" so the teardown walks the
+      // elements; the ORDER is why it goes in the SAME list as the scalars - fbc destroys a scope's
+      // records in reverse DECLARATION order, interleaving the two kinds (measured against the oracle).
+      else if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 3) and
+              (Decl.Attributes.Values['BYREF'] <> '1') and
+              (Decl.GetChild(1).NodeType = antDimensions) and
+              (Decl.GetChild(2).NodeType = antIdentifier) then     // DIM a(dims) AS T
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(2).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if FindUDT(TName) >= 0 then
+          Into.Add(VName + '|' + TName + '|A');
       end;
+
     end;
   // Only the transparent wrappers are followed. Everything else (antIf / antBlock / antDoLoop / ...) is a
   // block scope of its own, and a procedure declaration collects its locals separately.
   if Node.NodeType in [antProgram, antStatement, antDim] then
     for c := 0 to Node.ChildCount - 1 do
       CollectRecordVarsAtThisLevel(Node.GetChild(c), Into, Depth);
+end;
+
+procedure TSSAGenerator.CollectNonRecordLocalsDeep(Node: TASTNode);
+// Add to FCurrentProcNonRecs every name this procedure declares as a NON-record - including inside a
+// Scope/If/loop BLOCK, which CollectRecordVarsAtThisLevel deliberately does not enter.
+//
+// ⛔ WHY THE BLOCKS HAVE TO BE SEEN HERE AND NOT THERE. That walk fills FCurrentProcLocalRecs, which
+// also drives EmitFrameDestructors: a record declared in a block belongs to the BLOCK's teardown, and
+// collecting it for the frame would destroy it twice. This list has no teardown duty at all - it is a
+// SCREEN, the thing that stops the program-wide name->type map from making a local a record because
+// some OTHER procedure declares that name as one. So the two halves need different depths.
+// The symptom was an access violation with no UDT anywhere near the failing line: "Sub tz(): Scope:
+// Dim a As ZString * 50 : Print a" died because another procedure declared "Dim a As <UDT>" in a
+// scope of its own, and PRINT ran that type's Cast operator on a handle that does not exist.
+// fbc suite udt-zstring/iif, udt-wstring/iif.
+//
+// ⛔⛔ A NAME THIS PROCEDURE ALSO DECLARES AS A RECORD IS NOT SCREENED. The screen is by NAME and
+// applies to the WHOLE procedure, so a block-local "Dim a As Integer" would otherwise take the
+// record-ness away from a "Dim a As <UDT>" in a sibling block - the retroactive-by-name hazard that
+// made the same idea fail for MarkAddressTaken (DIVERGENZE 56). Both kinds are gathered first and only
+// the names that are non-records EVERYWHERE in this procedure end up screening.
+var
+  UdtNames, PlainNames: TStringList;
+
+  procedure Walk(N: TASTNode; Top: Boolean);
+  var
+    i, k: Integer;
+    Decl: TASTNode;
+    VName, TName: string;
+  begin
+    if N = nil then Exit;
+    if (not Top) and (N.NodeType = antProcedureDecl) then Exit;   // a nested procedure owns its own
+    if N.NodeType = antDim then
+      for k := 0 to N.ChildCount - 1 do
+      begin
+        Decl := N.GetChild(k);
+        if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
+        if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        TName := '';
+        if Decl.GetChild(1).NodeType = antIdentifier then
+          TName := UpperCase(VarToStr(Decl.GetChild(1).Value))            // DIM v AS T
+        else if (Decl.ChildCount >= 3) and (Decl.GetChild(1).NodeType = antDimensions) and
+                (Decl.GetChild(2).NodeType = antIdentifier) then
+          TName := UpperCase(VarToStr(Decl.GetChild(2).Value));           // DIM v(dims) AS T
+        if TName = '' then Continue;
+        // BIGINT is a HANDLE type exactly like a UDT and answers < 0 to FindUDT by design - the two
+        // other collectors say so in the same words, and screening one took its record-ness away.
+        if (FindUDT(TName) >= 0) or (TName = 'BIGINT') then
+        begin
+          if UdtNames.IndexOf(VName) < 0 then UdtNames.Add(VName);
+        end
+        else if PlainNames.IndexOf(VName) < 0 then
+          PlainNames.Add(VName);
+      end;
+    for i := 0 to N.ChildCount - 1 do Walk(N.GetChild(i), False);
+  end;
+
+var
+  i: Integer;
+begin
+  if (Node = nil) or (FCurrentProcNonRecs = nil) or (not FModernMode) then Exit;
+  UdtNames := TStringList.Create;
+  PlainNames := TStringList.Create;
+  try
+    UdtNames.CaseSensitive := False;
+    PlainNames.CaseSensitive := False;
+    Walk(Node, True);
+    for i := 0 to PlainNames.Count - 1 do
+      if (UdtNames.IndexOf(PlainNames[i]) < 0) and
+         (FCurrentProcNonRecs.IndexOf(PlainNames[i]) < 0) then
+        FCurrentProcNonRecs.Add(PlainNames[i]);
+  finally
+    UdtNames.Free;
+    PlainNames.Free;
+  end;
 end;
 
 procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
@@ -25795,6 +29962,7 @@ begin
     Depth := 0;
     for c := 0 to Node.ChildCount - 1 do
       CollectRecordVarsAtThisLevel(Node.GetChild(c), FCurrentProcLocalRecs, Depth);
+    CollectNonRecordLocalsDeep(Node);   // ...and the SCREEN goes into the blocks the walk above skips
     Exit;
   end;
   // CLASSIC: no block scope -- a DIM anywhere in the body is this frame's variable.
@@ -25807,12 +29975,38 @@ begin
          (Decl.GetChild(1).NodeType = antIdentifier) then          // DIM v AS T (typed scalar)
       begin
         TName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
         if FindUDT(TName) >= 0 then
-        begin
-          VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          FCurrentProcLocalRecs.Add(VName + '|' + TName);
-        end;
+          FCurrentProcLocalRecs.Add(VName + '|' + TName)
+        // ⛔ ...AND A LOCAL THAT IS **NOT** A RECORD HAS TO SCREEN ONE. The list above is filled only
+        // for a UDT, so a local "Dim As Integer stp" never shadowed the bare-name record map - and a
+        // parameter "ByRef stp As foo" declared in ANOTHER procedure of the same file made that local
+        // a record: printing it dereferenced the integer 1 as a handle and the program died on an
+        // access violation, with no UDT anywhere near the line that failed. The module-level half of
+        // exactly this was closed on 26 Aug (m597); this is the per-procedure half.
+        // ⚠️ It cannot go in the list above: that one also drives EmitFrameDestructors, and a
+        // destructor call on an Integer is the next defect along.
+        else if (FCurrentProcNonRecs <> nil) and (TName <> 'BIGINT') and
+                (FCurrentProcNonRecs.IndexOf(VName) < 0) then
+          FCurrentProcNonRecs.Add(VName);
+      end
+      // ⭐ ...AND AN ARRAY OF THAT TYPE IS N OBJECTS, EACH OF WHICH IS DESTROYED. The test above wants
+      // child[1] to be the TYPE, which is the SCALAR shape - an array has its antDimensions there - so
+      // "Dim As P a(0 To 1)" was collected by nobody and torn down by nobody: two constructors ran and
+      // ZERO destructors, where fbc runs two of each. It is marked "|A" so the teardown walks the
+      // elements; the ORDER is why it goes in the SAME list as the scalars - fbc destroys a scope's
+      // records in reverse DECLARATION order, interleaving the two kinds (measured against the oracle).
+      else if (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 3) and
+              (Decl.Attributes.Values['BYREF'] <> '1') and
+              (Decl.GetChild(1).NodeType = antDimensions) and
+              (Decl.GetChild(2).NodeType = antIdentifier) then     // DIM a(dims) AS T
+      begin
+        TName := UpperCase(VarToStr(Decl.GetChild(2).Value));
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if FindUDT(TName) >= 0 then
+          FCurrentProcLocalRecs.Add(VName + '|' + TName + '|A');
       end;
+
     end;
   for c := 0 to Node.ChildCount - 1 do
     CollectLocalRecordVars(Node.GetChild(c));   // recurse into nested blocks (IF/FOR/...)
@@ -25824,16 +30018,14 @@ procedure TSSAGenerator.EmitFrameDestructors;
 // V5d: BYVAL UDT parameter copies (V4) are destroyed too — after the locals (they were "constructed"
 // first, at entry, so they die last), also in reverse order.
 var
-  i, bar: Integer;
+  i: Integer;
   VName, TName: string;
+  IsArr: Boolean;
 begin
   if (FCurrentProcLocalRecs <> nil) then
     for i := FCurrentProcLocalRecs.Count - 1 downto 0 do
     begin
-      bar := Pos('|', FCurrentProcLocalRecs[i]);
-      if bar <= 0 then Continue;
-      VName := Copy(FCurrentProcLocalRecs[i], 1, bar - 1);
-      TName := Copy(FCurrentProcLocalRecs[i], bar + 1, MaxInt);
+      if not SplitRecordVar(FCurrentProcLocalRecs[i], VName, TName, IsArr) then Continue;
       // M8: already destructed at its BLOCK's exit. In MODERN the collector no longer hands us a
       // block-scoped DIM at all (it is a separate binding, owned by the block), so there is nothing to
       // exclude -- and excluding by NAME is what used to silence a same-named variable of THIS scope.
@@ -25841,16 +30033,13 @@ begin
       // exclusion is what stops it being destructed twice.
       if (not FModernMode) and
          (FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, VName)) >= 0) then Continue;
-      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+      EmitRecordVarDestruction(VName, TName, IsArr);
     end;
   if (FCurrentProcByvalRecs <> nil) then
     for i := FCurrentProcByvalRecs.Count - 1 downto 0 do
     begin
-      bar := Pos('|', FCurrentProcByvalRecs[i]);
-      if bar <= 0 then Continue;
-      VName := Copy(FCurrentProcByvalRecs[i], 1, bar - 1);
-      TName := Copy(FCurrentProcByvalRecs[i], bar + 1, MaxInt);
-      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+      if not SplitRecordVar(FCurrentProcByvalRecs[i], VName, TName, IsArr) then Continue;
+      EmitDestructorCall(GetOrAllocateVariable(VName), TName);   // a BYVAL copy is never an array
     end;
   EmitBaseDestructorChain;
 end;
@@ -26098,15 +30287,67 @@ begin
   begin
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
     begin
+      // ⭐ ...AND THE PRIORITY IT WAS GIVEN. "Sub f Constructor 101" states WHEN among the module
+      // constructors this one runs, and the number was parsed (MODPRIORITY) and read by nobody, so
+      // every module ctor ran in declaration order. See OrderModuleCtorDtorList for the rule.
       if Node.Attributes.Values['MODCTOR'] = '1' then
-        FModuleCtors.Add(VarToStr(Node.GetChild(0).Value))
+        FModuleCtors.AddObject(VarToStr(Node.GetChild(0).Value),
+                               TObject(PtrInt(StrToIntDef(Node.Attributes.Values['MODPRIORITY'], 0))))
       else if Node.Attributes.Values['MODDTOR'] = '1' then
-        FModuleDtors.Add(VarToStr(Node.GetChild(0).Value));
+        FModuleDtors.AddObject(VarToStr(Node.GetChild(0).Value),
+                               TObject(PtrInt(StrToIntDef(Node.Attributes.Values['MODPRIORITY'], 0))));
     end;
     Exit;   // do not descend into the procedure body
   end;
   for c := 0 to Node.ChildCount - 1 do
     CollectModuleCtorDtors(Node.GetChild(c));
+end;
+
+procedure TSSAGenerator.OrderModuleCtorDtorList(L: TStringList);
+// Put a module ctor/dtor list into the order fbc RUNS it in. Measured against fbc 1.10.1, one
+// spelling at a time, before a line of this was written:
+//   Constructor: the ones WITH a priority first, ASCENDING (101 before 105), then the ones WITHOUT a
+//                priority, in declaration order. Equal priorities keep declaration order.
+//   Destructor:  the exact REVERSE of that same list - which is what the caller already does, because
+//                EmitModuleProcDestructors walks the list backwards.
+// ⛔ The sort has to be STABLE (two ctors with priority 101 run in declaration order, checked), so it
+// is built by two passes rather than handed to CustomSort, which promises nothing about ties.
+var
+  Ordered: TStringList;
+  i, j, BestIdx, BestPrio, Prio: Integer;
+  Taken: array of Boolean;
+begin
+  if (L = nil) or (L.Count < 2) then Exit;
+  Ordered := TStringList.Create;
+  try
+    SetLength(Taken, L.Count);
+    for i := 0 to L.Count - 1 do Taken[i] := False;
+    // pass 1: everything WITH a priority, smallest first, declaration order among equals
+    repeat
+      BestIdx := -1; BestPrio := 0;
+      for j := 0 to L.Count - 1 do
+      begin
+        if Taken[j] then Continue;
+        Prio := Integer(PtrInt(L.Objects[j]));
+        if Prio <= 0 then Continue;                       // no priority stated
+        if (BestIdx < 0) or (Prio < BestPrio) then
+        begin
+          BestIdx := j; BestPrio := Prio;
+        end;
+      end;
+      if BestIdx >= 0 then
+      begin
+        Ordered.AddObject(L[BestIdx], L.Objects[BestIdx]);
+        Taken[BestIdx] := True;
+      end;
+    until BestIdx < 0;
+    // pass 2: everything WITHOUT one, in declaration order
+    for j := 0 to L.Count - 1 do
+      if not Taken[j] then Ordered.AddObject(L[j], L.Objects[j]);
+    L.Assign(Ordered);
+  finally
+    Ordered.Free;
+  end;
 end;
 
 procedure TSSAGenerator.EmitModuleConstructors;
@@ -26164,6 +30405,72 @@ begin
   Result := Rec(TypeName, 0);
 end;
 
+procedure TSSAGenerator.RegisterResultTemp(const HandleVal: TSSAValue; const TypeName: string;
+  IsLiteral: Boolean);
+// V5f: remember the record a UDT-returning call left in HandleVal, so the end of this STATEMENT
+// destroys it. It is a genuine temporary - every consumer copies out of it (EmitRecordCopy) - and
+// nothing owned it: fbc destroys it and we did not, so we ran one destructor fewer per call.
+//   "x = f()"        fbc nc=2 nd=1 at the assignment   we nc=1 nd=0
+//   "g()" discarded  fbc nd=2                          we nd=1
+//   "g().i"          fbc nd=2                          we nd=1
+// ⛔ Only when the type has observable destruction: TypeNeedsDestruction is the same predicate the
+// frame exit uses, so a plain data UDT emits nothing at all and every existing program keeps its
+// byte-identical instruction stream.
+begin
+  if HandleVal.Kind <> svkRegister then Exit;
+  if (TypeName = '') or not TypeNeedsDestruction(TypeName) then Exit;
+  // ⭐ ...unless this is a "Type( ... )" literal standing where fbc builds it straight into its
+  // destination. See FElidingLiteralTemp. A FUNCTION RESULT temporary is never elided, in any
+  // position - measured: "byval_p( mk() )" runs THREE destructors in fbc, not two.
+  if IsLiteral and (FElidingLiteralTemp > 0) then Exit;
+  FResultTemps.AddObject(UpperCase(TypeName), TObject(PtrInt(HandleVal.RegIndex)));
+end;
+
+function TSSAGenerator.BodyHasReturnStatement(Proc: TASTNode): Boolean;
+// V5f: does this procedure body contain a "RETURN <expr>" anywhere? (The body starts at child 2;
+// antReturn also carries EXIT and CONTINUE, told apart by the node's VALUE, as elsewhere.)
+//
+// ⛔ IT IS A SYNTACTIC QUESTION, AND THAT IS THE ORACLE'S ANSWER, NOT A SHORTCUT. fbc default-
+// constructs a UDT function RESULT at entry when the body assigns it with "Function = ..." (or never
+// sets it at all), and does NOT when the body uses RETURN - which constructs the result in place from
+// the returned value. Measured: a body whose ONLY return sits inside "If k = 1 Then Return r" counts
+// ONE constructor for k=1 AND for k=0, so the decision is taken on the TEXT, not on the path.
+  function Scan(N: TASTNode): Boolean;
+  var
+    i: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.NodeType = antReturn) and (UpperCase(VarToStr(N.Value)) = 'RETURN') and (N.ChildCount >= 1) then
+      Exit(True);
+    for i := 0 to N.ChildCount - 1 do
+      if Scan(N.GetChild(i)) then Exit(True);
+  end;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Proc = nil then Exit;
+  for i := 2 to Proc.ChildCount - 1 do
+    if Scan(Proc.GetChild(i)) then Exit(True);
+end;
+
+procedure TSSAGenerator.FlushResultTemps(Depth: Integer);
+// V5f: destroy every result temporary recorded since Depth, most recent first, and forget them.
+// ⛔ DEPTH, NOT "CLEAR". ProcessStatement is RE-ENTRANT - a For body, an If branch and a Scope all
+// lower their statements through it - so an outer statement must destroy only what its OWN
+// expressions allocated. An inner statement has already flushed its own by then, which is why a
+// count taken on entry is the whole bookkeeping.
+var
+  i: Integer;
+begin
+  for i := FResultTemps.Count - 1 downto Depth do
+  begin
+    EmitDestructorCall(MakeSSARegister(srtInt, PtrInt(FResultTemps.Objects[i])), FResultTemps[i]);
+    FResultTemps.Delete(i);
+  end;
+end;
+
 procedure TSSAGenerator.AssignModuleDtorSlots;
 // V5e: reserve one int transfer slot per destructor-bearing module global, so its handle can be stored
 // at construction (module scope) and read back at an END inside a procedure — where the global's module
@@ -26173,8 +30480,9 @@ procedure TSSAGenerator.AssignModuleDtorSlots;
 // destructor is skipped, exactly as before this feature). Module-end destruction is unaffected (it reads
 // the live module register directly).
 var
-  i, bar, sharedIntCount, nextSlot: Integer;
+  i, sharedIntCount, nextSlot: Integer;
   VName, TName: string;
+  IsArr: Boolean;
 begin
   FModuleDtorSlots.Clear;
   if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
@@ -26185,10 +30493,8 @@ begin
   nextSlot := XFER_RESULT_HANDLE_SLOT - 1;           // 253, growing down
   for i := 0 to FModuleRecordVars.Count - 1 do       // construction order (assignment order is irrelevant)
   begin
-    bar := Pos('|', FModuleRecordVars[i]);
-    if bar <= 0 then Continue;
-    VName := Copy(FModuleRecordVars[i], 1, bar - 1);
-    TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    if not SplitRecordVar(FModuleRecordVars[i], VName, TName, IsArr) then Continue;
+    if IsArr then Continue;                                  // an array is reached by its own handle
     if FModuleDtorSlots.IndexOf(VName) >= 0 then Continue;   // one slot per name
     if not TypeNeedsDestruction(TName) then Continue;        // no destructor anywhere -> no slot needed
     if nextSlot <= SHARED_SLOT_BASE + sharedIntCount - 1 then Break;  // would collide with SHARED region
@@ -26207,22 +30513,34 @@ procedure TSSAGenerator.EmitModuleDestructors(UseSlots: Boolean = False);
 // handle from its reserved frame-independent slot (FModuleDtorSlots) instead. A global with no reserved
 // slot (slot space exhausted) is skipped on this path.
 var
-  i, bar, slotIdx: Integer;
-  VName, TName: string;
+  i, slotIdx: Integer;
+  VName, TName, SavedThis: string;
+  IsArr: Boolean;
   H: TSSAValue;
+  AccessNode: TASTNode;
 begin
   if (FModuleRecordVars = nil) or (FModuleRecordVars.Count = 0) then Exit;
+  SavedThis := FCurrentThisType;
+  try
   for i := FModuleRecordVars.Count - 1 downto 0 do
   begin
-    bar := Pos('|', FModuleRecordVars[i]);
-    if bar <= 0 then Continue;
-    VName := Copy(FModuleRecordVars[i], 1, bar - 1);
-    TName := Copy(FModuleRecordVars[i], bar + 1, MaxInt);
+    if not SplitRecordVar(FModuleRecordVars[i], VName, TName, IsArr) then Continue;
+    // A hoisted STATIC local is torn down HERE, at module scope, though it was declared inside a method
+    // and FreeBASIC judges its access there. Put the owning type back for this one teardown, so a type
+    // whose own method keeps a "Static As T x" is not refused its own PRIVATE destructor.
+    FCurrentThisType := FStaticLocalOwner.Values[VName];
     // M8: already destructed at its block's exit -- CLASSIC only, as in EmitFrameDestructors. Module
     // scope has the empty procedure name, spelled out because this emitter can run from an END inside a
     // SUB (where FCurrentProcName is that SUB's).
     if (not FModernMode) and
        (FBlockHandledVars.IndexOf(BlockHandledKey('', VName)) >= 0) then Continue;
+    // An ARRAY of records is torn down element by element, through its own array handle - there is no
+    // single handle to read from a register or a reserved slot.
+    if IsArr then
+    begin
+      EmitRecordVarDestruction(VName, TName, True);
+      Continue;
+    end;
     if UseSlots then
     begin
       slotIdx := FModuleDtorSlots.IndexOf(VName);
@@ -26231,8 +30549,29 @@ begin
       EmitXferLoad(srtInt, PtrInt(FModuleDtorSlots.Objects[slotIdx]), H);
       EmitDestructorCall(H, TName);
     end
+    else if IsSharedScalar(VName) then
+    begin
+      // ⛔ A "DIM SHARED" record does not live in a REGISTER: it is array-backed, and its handle is
+      // element 0 of its 1-element global array. GetOrAllocateVariable answers a register the name was
+      // never bound to here, so the destructor was called on a handle that had never been written -
+      // "XferStoreI R3 -> X0" with R3 undefined, and an Access violation at program exit before the
+      // destructor body ran at all. ⚠️ The very same declaration written "Dim As T g" worked, which is
+      // why nothing in the corpus caught it: at module level the two spellings read the same.
+      // Read through the ONE path that knows how a shared scalar is stored, rather than a second
+      // opinion here.
+      AccessNode := MakeSharedScalarAccess(VName, nil);
+      try
+        ProcessExpression(AccessNode, H);
+        EmitDestructorCall(H, TName);
+      finally
+        AccessNode.Free;
+      end;
+    end
     else
       EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+  end;
+  finally
+    FCurrentThisType := SavedThis;
   end;
 end;
 
@@ -26322,20 +30661,18 @@ procedure TSSAGenerator.EmitBlockScopeCleanup(Idx: Integer);
 // to reclaim its records. Does NOT drop the scope — used both by the normal exit (which then drops)
 // and by early exits (EXIT loop / EXIT SUB / RETURN), which only emit cleanup for the path taken.
 var
-  i, bar: Integer;
+  i: Integer;
   L: TStringList;
   VName, TName: string;
+  IsArr: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FScopeStack)) or (FScopeStack[Idx].Kind <> skBlock) then Exit;
   L := FScopeStack[Idx].Dtors;
   if L <> nil then
     for i := L.Count - 1 downto 0 do
     begin
-      bar := Pos('|', L[i]);
-      if bar <= 0 then Continue;
-      VName := Copy(L[i], 1, bar - 1);
-      TName := Copy(L[i], bar + 1, MaxInt);
-      EmitDestructorCall(GetOrAllocateVariable(VName), TName);
+      if not SplitRecordVar(L[i], VName, TName, IsArr) then Continue;
+      EmitRecordVarDestruction(VName, TName, IsArr);
     end;
   if FScopeStack[Idx].RecMarkEmitted then
   begin
@@ -26427,6 +30764,8 @@ var
   F: TScopeFrame;
 begin
   F.Kind := Kind;
+  F.Serial := FNextScopeSerial;
+  Inc(FNextScopeSerial);
   F.Bindings := TStringList.Create;
   F.Bindings.CaseSensitive := False;
   F.Dtors := TStringList.Create;
@@ -26482,7 +30821,8 @@ var
   Decl: TASTNode;
   VNameU, TypeNameU: string;
   ElemBank: TSSARegisterType;
-  ConstFoldVal: Int64;
+  ConstFoldVal, ConstStrBytes: Int64;
+  ConstNarrowW: Integer;
   ConstIsInt: Boolean;
   ConstDupIdx: Integer;   // a CONST name declared twice: the entry to withdraw
 begin
@@ -26514,6 +30854,19 @@ begin
         // ttStringLiteral token to avoid being re-read as a number ("5" is a string, not 5).
         ConstIsInt := (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
                       TryFoldConstIntExpr(Decl.GetChild(2), ConstFoldVal);
+        // ⛔ ...AND THE FOLDED VALUE STILL HAS THE DECLARED TYPE'S WIDTH. "Const xd As Byte = 200"
+        // is -56 in fbc, and it was 200 here: the fold recorded the literal and every read took it
+        // straight, so the CONST path walked past the narrowing that the identical DIM ("Dim xd As
+        // Byte = 200", which does print -56) goes through on its store. A fold that skips a
+        // conversion is not a faster answer, it is a different one.
+        if ConstIsInt then
+        begin
+          ConstNarrowW := TypeNameWidthCode(UpperCase(VarToStr(Decl.GetChild(1).Value)));
+          if ConstNarrowW = 11 then
+            ConstFoldVal := Ord(ConstFoldVal <> 0) * -1        // BOOLEAN normalises, it does not truncate
+          else
+            ConstFoldVal := NarrowConstInt(ConstFoldVal, ConstNarrowW);
+        end;
         // ⛔ ...BUT ONLY WHEN THE NAME IS DECLARED ONCE. This map is keyed by NAME with no scope, and it
         // is filled by a pre-scan over the WHOLE program, so two sibling SCOPEs each declaring "Const k"
         // left the LAST value in it - and every read of k folded to that, retroactively, including the
@@ -26537,11 +30890,26 @@ begin
           end;
         end
         else if Decl.Attributes.Values['CONSTDECL'] = '1' then
+        begin
           FConstDeclSeen.Add(VNameU);   // a non-int CONST still occupies the name
+          // ⭐ ...and a STRING const remembers how many BYTES it is. fbc types "Const S = "12345"" as a
+          // ZSTRING * 6 and SizeOf(S) is 6; without the length recorded here the name reached SizeOf as
+          // an ordinary variable and answered the 8-byte default. Only the byte COUNT is kept - the
+          // value itself is not folded, for the scoping reason above.
+          if (Decl.ChildCount >= 3) and StringLiteralBytes(Decl.GetChild(2), ConstStrBytes) then
+            FConstStrBytes.Values[VNameU] := IntToStr(ConstStrBytes);
+        end;
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
-        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ⛔ ...AND THE BANK IS DECIDED BY THE TYPE, NOT BY ITS SPELLING. TypeNameToBank answers FLOAT
+        // for a name it does not know, and a TYPE ALIAS is such a name - so "Type p As UDT Ptr :
+        // Dim q As p" got a FLOAT backing array while every read and write of q used the INT bank.
+        // The two storages then disagreed: "@q" addressed the float cell and the value sat in the
+        // integer one, so "*(@q)" was not q (EAccessViolation on the fbc suite's typedef/pointers,
+        // and the identical program spelled "Dim q As UDT Ptr" was right). FindUDT on the line below
+        // already resolved the alias on its own, which is what made the UDT case work and this one not.
+        TypeNameU := CanonicalType(UpperCase(VarToStr(Decl.GetChild(1).Value)));
         if FSharedScalarArr.IndexOf(VNameU) < 0 then
         begin
           if FindUDT(TypeNameU) >= 0 then
@@ -26580,7 +30948,14 @@ var
   nameU: string;
 begin
   Result := False;
-  if not (FModernMode and FInProcedure) then Exit;
+  // ⛔ NOT "and FInProcedure". A BLOCK frame shadows a shared scalar wherever it is opened, and a
+  // SCOPE / IF block at MODULE level opens one exactly as a block inside a procedure does. Requiring a
+  // procedure made the answer always False out there, so "Dim v As Integer = -2" inside a module-level
+  // Scope did not shadow the module's own v: it STORED INTO THE SHARED BACKING, and the value stayed
+  // changed after the block closed. ⚠️ The identical code inside a Sub was right, which is what
+  // isolated it. The walk still stops at a skProcRoot; at module level there is none, so it covers the
+  // block frames and stops - which is the whole stack there.
+  if not FModernMode then Exit;
   nameU := UpperCase(Name);
   for f := High(FScopeStack) downto 0 do
   begin
@@ -26604,10 +30979,41 @@ begin
   Result := IsSharedScalarRaw(Name) and not SharedScalarShadowed(Name);
 end;
 
-function TSSAGenerator.ModuleConstInt(const Name: string; out V: Int64): Boolean;
-// A module-level CONST whose value is an integer literal. Reads of it fold to that immediate instead
-// of loading element 0 of the SHARED backing array it is otherwise stored in. Shadowing is asked the
-// same way IsSharedScalar asks it: a parameter or local DIM of the same name is a different variable.
+function TSSAGenerator.TypeEnumMemberOwner(const TypeName, MemberName: string): string;
+// The type - TypeName itself or an ancestor - that declares MemberName as a member of an ENUM inside
+// its body, OR as a CONST inside its body, or '' when none does. Walks the chain, because a member
+// declared in a base is nameable through a derived instance exactly as a field is.
+// ⭐ ONE question for both, because the two are the same thing to every caller: a name the TYPE gives
+// to a module-wide constant. Asking them separately is how a rule ends up in one path and not its twin.
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  Result := '';
+  if (FTypeEnumMembers = nil) or (TypeName = '') or (MemberName = '') then Exit;
+  T := UpperCase(TypeName);
+  // ⭐ ...AND THE NAME MAY BE AN ALIAS OF THE TYPE. "Type foo As bar" makes "foo.MYCONST" the same
+  // constant as "bar.MYCONST" - fbc's const/typedef writes exactly that, forward-declared. Asked
+  // through CanonicalType, the funnel every other reader of an alias uses, and only when the written
+  // name is not itself a type. The same line is in TypeScopedConstAccess, which does the second half.
+  if FindUDT(T) < 0 then T := UpperCase(CanonicalType(T));
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    if (FTypeEnumMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0) or
+       ((FTypeConstMembers <> nil) and
+        (FTypeConstMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0)) then Exit(T);
+    Idx := FindUDT(T);
+    if Idx < 0 then Exit;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.ModuleConstIntRaw(const Name: string; out V: Int64): Boolean;
+// The same question as ModuleConstInt, WITHOUT the shadow test - the ".x" form asks for the module
+// entity by name and a local of that spelling is exactly what it is reaching past. Split so the two
+// callers cannot drift: ModuleConstInt is this plus the shadow test.
 var idx: Integer; sv: string;
 begin
   V := 0;
@@ -26615,10 +31021,20 @@ begin
   if FModuleConstVals = nil then Exit;
   idx := FModuleConstVals.IndexOfName(UpperCase(Name));
   if idx < 0 then Exit;
-  if SharedScalarShadowed(Name) then Exit;
   sv := FModuleConstVals.ValueFromIndex[idx];
   if not TryStrToInt64(sv, V) then Exit;
   Result := True;
+end;
+
+function TSSAGenerator.ModuleConstInt(const Name: string; out V: Int64): Boolean;
+// A module-level CONST whose value is an integer literal. Reads of it fold to that immediate instead
+// of loading element 0 of the SHARED backing array it is otherwise stored in. Shadowing is asked the
+// same way IsSharedScalar asks it: a parameter or local DIM of the same name is a different variable.
+begin
+  V := 0;
+  Result := False;
+  if SharedScalarShadowed(Name) then Exit;
+  Result := ModuleConstIntRaw(Name, V);
 end;
 
 function TSSAGenerator.IsSharedScalarRaw(const Name: string): Boolean;
@@ -26653,10 +31069,12 @@ procedure TSSAGenerator.CollectStaticMembers(Node: TASTNode);
 // instance. Back each with a 1-element global array named "TYPE.FIELD" (reusing the DIM SHARED scalar
 // machinery, so it is visible from methods/threads). v1 supports builtin scalar static members.
 var
-  i, k, ai: Integer;
-  FieldNode: TASTNode;
+  i, k, ai, di: Integer;
+  FieldNode, DimsN: TASTNode;
   tn, fn, ftype, backing: string;
   bank: TSSARegisterType;
+  StatDims, StatLbs: array of Integer;
+  LbV, UbV: Int64;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antTypeDecl then
@@ -26672,6 +31090,66 @@ begin
         if FieldNode.ChildCount > 0 then ftype := UpperCase(VarToStr(FieldNode.GetChild(0).Value));
         bank := TypeNameToBank(ftype, fn);                 // builtin scalar bank (int/float/string)
         backing := tn + '.' + fn;
+        // ⛔ ...AND A STATIC MEMBER CAN BE AN ARRAY. The parser reads "(dims)" for any field, static or
+        // not, so "Static a() As Integer" arrives here carrying BOTH flags - and this routine ignored
+        // ARRAYFIELD outright and synthesised a ONE-ELEMENT SCALAR backing for it. Nothing raised: the
+        // reads went to element 0 and answered a number that was simply wrong ("UDT.a(0)" printed 0
+        // where fbc prints 7), which is worse than the REDIM that did raise. It gets a REAL global array
+        // under the same dotted name, so every array path - element, ReDim, Erase, LBound/UBound - works
+        // on it unchanged, and it is deliberately NOT registered as a shared scalar.
+        if FieldNode.Attributes.Values['ARRAYFIELD'] = '1' then
+        begin
+          if FStaticMemberArrays.IndexOf(backing) < 0 then
+          begin
+            // A fixed-shape "Static a(0 To 1)" is sized here; an "Any"/empty one starts EMPTY and waits
+            // for a ReDim, which is the state fbc reports as LBound 0 / UBound -1.
+            SetLength(StatDims, 0);
+            SetLength(StatLbs, 0);
+            DimsN := ConcreteArrayBounds(FieldNode);
+            if DimsN <> nil then
+              for di := 0 to DimsN.ChildCount - 1 do
+              begin
+                LbV := 0;
+                if DimsN.GetChild(di).NodeType = antDimRange then
+                begin
+                  if not FoldIntNode(DimsN.GetChild(di).GetChild(0), LbV) then begin SetLength(StatDims, 0); Break; end;
+                  if not FoldIntNode(DimsN.GetChild(di).GetChild(1), UbV) then begin SetLength(StatDims, 0); Break; end;
+                end
+                else if not FoldIntNode(DimsN.GetChild(di), UbV) then begin SetLength(StatDims, 0); Break; end;
+                SetLength(StatDims, Length(StatDims) + 1);
+                SetLength(StatLbs, Length(StatLbs) + 1);
+                StatDims[High(StatDims)] := Integer(UbV - LbV + 1);
+                StatLbs[High(StatLbs)] := Integer(LbV);
+              end;
+            if Length(StatDims) = 0 then
+            begin
+              SetLength(StatDims, 1);
+              StatDims[0] := 0;          // 0 = "variable": EmitStaticMemberAllocs supplies the register
+            end;
+            ai := FProgram.DeclareArray(backing, bank, StatDims);
+            if Length(StatLbs) = Length(StatDims) then FProgram.SetArrayLowerBounds(ai, StatLbs);
+            FStaticMemberArrays.AddObject(backing, TObject(PtrInt(ai)));
+          end;
+          Continue;
+        end;
+        // ⛔ ...AND A STATIC MEMBER CAN BE OF A UDT TYPE, which this never asked. TypeNameToBank does
+        // not know a UDT name, so the backing landed in whatever bank the fallback chose and no record
+        // was ever allocated for it: "UDT.a.a = 3 : Print UDT.a.a" printed 0, silently. A UDT scalar is
+        // an int HANDLE, exactly as a DIM SHARED one is - the two paths now say the same thing.
+        if FindUDT(ftype) >= 0 then
+        begin
+          bank := srtInt;
+          FStaticMemberTypes.Values[backing] := UpperCase(ftype);
+          FVarRecordType.Values[backing] := UpperCase(ftype);   // so "UDT.a.b" resolves through the backing
+        end
+        // ...and a POINTER-typed one is a managed pointer under that same name, so "UDT.p->a" resolves
+        // through the registry every other pointer uses. Without the entry the arrow read the packed
+        // handle as the value: 4611686018427387904 where fbc prints the field.
+        else if (Length(ftype) > 4) and (Copy(ftype, Length(ftype) - 3, 4) = ' PTR') then
+        begin
+          bank := srtInt;
+          FPointerVars.Values[backing] := Trim(Copy(ftype, 1, Length(ftype) - 4));
+        end;
         if FStaticMembers.IndexOf(backing) < 0 then
         begin
           ai := FProgram.DeclareArray(backing, bank, [1]);  // 1-element global array, same dotted name
@@ -26689,7 +31167,8 @@ procedure TSSAGenerator.EmitStaticMemberAllocs;
 // Allocate the static members' backing 1-element arrays once at program start (they have no DIM).
 var
   i, ai: Integer;
-  ArrayRef: TSSAValue;
+  ArrayRef, UbV: TSSAValue;
+  DimInstr: TSSAInstruction;
 begin
   if FStaticMembers = nil then Exit;
   for i := 0 to FStaticMembers.Count - 1 do
@@ -26699,9 +31178,194 @@ begin
     EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
+  // ...and an ARRAY static member starts EMPTY, which fbc reports as LBound 0 / UBound -1 until a
+  // ReDim gives it bounds. A concrete "Static a(0 To 1)" is sized by the DIM that defines it.
+  if FStaticMemberArrays = nil then Exit;
+  for i := 0 to FStaticMemberArrays.Count - 1 do
+  begin
+    ai := PtrInt(FStaticMemberArrays.Objects[i]);
+    ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+    // ⛔ A dimension of 0 in the metadata means VARIABLE, not empty, and bcArrayDim then reads the
+    // array's DimRegisters - not this instruction's operand. So an empty static member is expressed
+    // as an upper bound of -1 in a register (size = ub - lb + 1 = 0), which is exactly what fbc
+    // reports for one that has not been ReDim'd: LBound 0, UBound -1.
+    if (FProgram.GetArray(ai).DimCount = 1) and (FProgram.GetArray(ai).Dimensions[0] = 0) then
+    begin
+      UbV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, UbV, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      FProgram.SetArrayDimRegisters(ai, [UbV.RegIndex], [srtInt]);
+      EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // ⛔ ...and the register has to be KEPT ALIVE. ssaArrayDim names it only through the array's
+      // METADATA, so DCE sees a constant nobody reads, removes it, and the bound read back is 0 - the
+      // array reported UBound 0 where fbc reports -1. The DIM path carries the same note for the same
+      // reason; this is the second place that needs it.
+      if Assigned(FCurrentBlock) and (FCurrentBlock.Instructions.Count > 0) then
+      begin
+        DimInstr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
+        SetLength(DimInstr.PhiSources, 1);
+        DimInstr.PhiSources[0].Value := UbV;
+        DimInstr.PhiSources[0].FromBlock := nil;
+      end;
+      Continue;
+    end;
+    EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
 end;
 
-procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode);
+procedure TSSAGenerator.EmitStaticMemberRecords;
+// A static member whose type is a UDT needs an INSTANCE behind its handle: allocated in the shared
+// region, initialised and constructed - the same three steps a "Dim Shared v As T" takes.
+//
+// ⛔ IT CANNOT BE DONE BESIDE THE BACKING ALLOCATION, for two independent reasons, and both were
+// measured rather than reasoned about:
+//  - EmitSharedScalarAllocs re-sizes EVERY shared-scalar backing when the program has module
+//    constructors, which ZEROES a handle stored before it. The whole fbcunit shim registers its tests
+//    from module constructors, so every test file has them: the record was allocated, wiped, and the
+//    first field written died on an access violation.
+//  - a CONSTRUCTOR label does not exist yet at that point: PreCollectProcedures has not run.
+// So it happens here, after both.
+var
+  i, RecIdx: Integer;
+  RecH: TSSAValue;
+begin
+  if (FStaticMembers = nil) or (FStaticMemberTypes = nil) then Exit;
+  for i := 0 to FStaticMembers.Count - 1 do
+  begin
+    RecIdx := FindUDT(FStaticMemberTypes.Values[FStaticMembers[i]]);
+    if RecIdx < 0 then Continue;
+    RecH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNew, RecH,
+                    MakeSSAConstInt(FUDTs[RecIdx].LiveBytes),
+                    MakeSSAConstInt(0),
+                    MakeSSAConstInt(FUDTs[RecIdx].NStr or (Int64(RecIdx) shl 32) or (Int64(1) shl 48)));
+    EmitRecordInit(RecH, RecIdx);
+    EmitSharedScalarStoreVal(FStaticMembers[i], RecH);
+    EmitConstructorCall(RecH, FUDTs[RecIdx].Name);
+  end;
+end;
+
+function TSSAGenerator.TypeScopedConstAccess(const TypeName, MemberName: string;
+  const Tok: TLexerToken): TASTNode;
+// The node that READS a name the TYPE scopes - a member of an ENUM declared in its body, or a CONST
+// declared in its body. The two are backed differently and that is the whole reason this exists: an
+// enum member gets a shared 1-element global (so a procedure can see it through MODERN's scope), while
+// a CONST is an ordinary module constant that folds to its value. Reading a CONST through the shared
+// path would look up an array that was never declared.
+// The CALLER owns the node.
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  T := UpperCase(TypeName);
+  if FindUDT(T) < 0 then T := UpperCase(CanonicalType(T));   // ...through an ALIAS, as the owner test does
+  Guard := 0;
+  while (T <> '') and (Guard < 64) and (FTypeConstMembers <> nil) do
+  begin
+    if FTypeConstMembers.IndexOf(T + '.' + UpperCase(MemberName)) >= 0 then
+      Exit(TASTNode.CreateWithValue(antIdentifier, UpperCase(MemberName), Tok));
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+  Result := MakeSharedScalarAccess(UpperCase(MemberName), Tok);
+end;
+
+procedure TSSAGenerator.CollectTypeConsts(Node: TASTNode);
+// FreeBASIC lets a TYPE give a name to a module-wide constant: "Type T : Const MYCONST = 123 : End Type",
+// read as "T.MYCONST" from anywhere and bare inside T's own methods. The VALUE is an ordinary module
+// CONST (the declaration is lowered where the type stands); only the NAMING is per type, which is
+// exactly the arrangement an ENUM declared inside a TYPE already has.
+var
+  i, k: Integer;
+  Dim_, Decl: TASTNode;
+  OwnerU, NameU: string;
+begin
+  if (Node = nil) or (FTypeConstMembers = nil) then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    OwnerU := UpperCase(VarToStr(Node.Value));
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      Dim_ := Node.GetChild(i);
+      if (Dim_.NodeType <> antDim) or (Dim_.Attributes.Values['TYPECONST'] <> '1') then Continue;
+      for k := 0 to Dim_.ChildCount - 1 do
+      begin
+        Decl := Dim_.GetChild(k);
+        if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) or
+           (Decl.GetChild(0).NodeType <> antIdentifier) then Continue;
+        NameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (NameU <> '') and (OwnerU <> '') and
+           (FTypeConstMembers.IndexOf(OwnerU + '.' + NameU) < 0) then
+          FTypeConstMembers.Add(OwnerU + '.' + NameU);
+      end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectTypeConsts(Node.GetChild(i));
+end;
+
+function TSSAGenerator.FoldEnumMemberExpr(Node: TASTNode; const EnumName: string;
+  out V: Int64): Boolean;
+// Fold one ENUM member's value expression. It is either a literal or an expression over members of
+// the SAME enum already computed - "B" with no "=" is written by the parser as "A + 1".
+// ⛔ The identifiers are SUBSTITUTED and the ordinary folder is then asked, rather than a second
+// operator table being written here. A second copy of the same knowledge is how this VM has been
+// bitten before, and the operators an enum initialiser may use are exactly the ones it already knows.
+var
+  Work: TASTNode;
+
+  procedure Substitute(N: TASTNode);
+  var
+    j, Idx: Integer;
+    Ch: TASTNode;
+  begin
+    if N = nil then Exit;
+    for j := 0 to N.ChildCount - 1 do
+    begin
+      Ch := N.GetChild(j);
+      if (Ch <> nil) and (Ch.NodeType = antIdentifier) then
+      begin
+        Idx := FEnumQualVals.IndexOfName(EnumName + '.' + UpperCase(VarToStr(Ch.Value)));
+        if Idx >= 0 then
+        begin
+          Ch.NodeType := antLiteral;
+          // ⛔ AN INT64, NOT ITS TEXT. The folder's literal arm declines on "not VarIsNumeric", and a
+          // Variant holding the STRING '3' is not numeric - so every member written as an expression
+          // ("B" with no "=", which the parser emits as "A + 1") silently failed to fold and fell back
+          // to the bare-name read. It LOOKED right, because the bare name usually still holds the
+          // value; it only showed up with a second enum declaring the same member name.
+          Ch.Value := StrToInt64Def(FEnumQualVals.ValueFromIndex[Idx], 0);
+        end;
+      end
+      else
+        Substitute(Ch);
+    end;
+  end;
+
+var
+  Idx0: Integer;
+begin
+  Result := False;
+  V := 0;
+  if Node = nil then Exit;
+  if Node.NodeType = antIdentifier then
+  begin
+    Idx0 := FEnumQualVals.IndexOfName(EnumName + '.' + UpperCase(VarToStr(Node.Value)));
+    if Idx0 < 0 then Exit;
+    V := StrToInt64Def(FEnumQualVals.ValueFromIndex[Idx0], 0);
+    Exit(True);
+  end;
+  Work := Node.Clone;
+  try
+    Substitute(Work);
+    Result := TryFoldConstIntExpr(Work, V);
+  finally
+    Work.Free;
+  end;
+end;
+
+procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');
 // FreeBASIC ENUM members are module-wide integer constants: like a module-level CONST they must be
 // visible INSIDE SUB/FUNCTION bodies. The parser lowers an ENUM to a sequence of plain assignments
 // (member = value); left as ordinary module variables, MODERN lexical scope hides them from procedures
@@ -26712,7 +31376,8 @@ procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode);
 var
   i, k, ai: Integer;
   Decl: TASTNode;
-  VNameU: string;
+  VNameU, QKey: string;
+  EnumVal: Int64;
 begin
   if Node = nil then Exit;
   // The enum's NAME is recorded in both dialects: it is what lets "MyEnum.option1" resolve to the member
@@ -26720,10 +31385,27 @@ begin
   if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') and
      (FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
     FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+  // ⭐ ...AND EACH MEMBER'S VALUE UNDER "ENUM.MEMBER". Members are evaluated in source order, because
+  // that is how the parser writes an implicit one: "B" with no "=" comes out as "A + 1", naming the
+  // PREVIOUS member. Both dialects, and before the CLASSIC exit below: the qualified spelling is read
+  // by the same routine in both.
+  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(k);
+      if (Decl.NodeType = antAssignment) and (Decl.ChildCount >= 2) and
+         (Decl.GetChild(0).NodeType = antIdentifier) then
+      begin
+        QKey := UpperCase(VarToStr(Node.Value)) + '.' + UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (FEnumQualVals.IndexOfName(QKey) < 0) and
+           FoldEnumMemberExpr(Decl.GetChild(1), UpperCase(VarToStr(Node.Value)), EnumVal) then
+          FEnumQualVals.Values[QKey] := IntToStr(EnumVal);
+      end;
+    end;
   if not FModernMode then
   begin
     for i := 0 to Node.ChildCount - 1 do
-      CollectEnumMembers(Node.GetChild(i));      // still walk, to reach every enum's name
+      CollectEnumMembers(Node.GetChild(i), OwnerType);   // still walk, to reach every enum's name
     Exit;                                        // CLASSIC has no procedure scope: members stay plain globals
   end;
   if Node.NodeType = antProcedureDecl then Exit; // an ENUM inside a SUB/FUNCTION is proc-local, not a global
@@ -26738,6 +31420,8 @@ begin
         if (VNameU = '') or (FSharedScalarArr.IndexOf(VNameU) >= 0) then Continue;
         ai := FProgram.DeclareArray(VNameU, srtInt, [1]);   // 1-element global int array, same name
         FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
+        if (OwnerType <> '') and (FTypeEnumMembers.IndexOf(OwnerType + '.' + VNameU) < 0) then
+          FTypeEnumMembers.Add(OwnerType + '.' + VNameU);
         FEnumMembers.Add(VNameU);
         // Remember which named enum this member belongs to, so an operand that is a bare enum member
         // ("F And i") resolves to the enum type for operator-overload dispatch.
@@ -26746,7 +31430,15 @@ begin
       end;
     end;
   for i := 0 to Node.ChildCount - 1 do
-    CollectEnumMembers(Node.GetChild(i));
+    // ⭐ An ENUM declared INSIDE a TYPE keeps its members reachable as "obj.member" - fbc scopes them
+    //    to the type, and reading one through an instance is what the suite's structs/const_access
+    //    does. The member itself is still backed globally (that is how the bare name resolves); this
+    //    only records WHICH TYPE may name it, so a member access can answer instead of falling
+    //    through to "not a field" and reading a register nobody wrote.
+    if Node.NodeType = antTypeDecl then
+      CollectEnumMembers(Node.GetChild(i), UpperCase(VarToStr(Node.Value)))
+    else
+      CollectEnumMembers(Node.GetChild(i), OwnerType);
 end;
 
 procedure TSSAGenerator.EmitEnumMemberAllocs;
@@ -26785,6 +31477,119 @@ begin
   end;
 end;
 
+function TSSAGenerator.AnyHoistedDim(DimNode: TASTNode): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  for i := 0 to DimNode.ChildCount - 1 do
+    if DimNode.GetChild(i).Attributes.Values['HOISTEDDIM'] = '1' then Exit(True);
+end;
+
+function TSSAGenerator.DimBoundsAreConstant(DimsNode: TASTNode): Boolean;
+// Every subscript of this declaration is written as a LITERAL (either "n" or "lb To ub"). Only such a
+// declaration can be hoisted before the module constructors: a bound that is an expression would move
+// an evaluation, which is a different question from allocating storage.
+var
+  i, k: Integer;
+  D: TASTNode;
+begin
+  Result := False;
+  if (DimsNode = nil) or (DimsNode.NodeType <> antDimensions) or (DimsNode.ChildCount = 0) then Exit;
+  for i := 0 to DimsNode.ChildCount - 1 do
+  begin
+    D := DimsNode.GetChild(i);
+    if D.NodeType = antLiteral then Continue;
+    if D.NodeType <> antDimRange then Exit;
+    if D.ChildCount < 2 then Exit;
+    for k := 0 to 1 do
+      if D.GetChild(k).NodeType <> antLiteral then Exit;
+  end;
+  Result := True;
+end;
+
+procedure TSSAGenerator.EmitSharedArrayAllocs(Node: TASTNode);
+// ⛔ AND A MODULE CONSTRUCTOR RUNS BEFORE THE MODULE'S ARRAYS EXIST. EmitSharedScalarAllocs pre-sizes
+// every SHARED SCALAR backing here for exactly this reason, and nobody ever did the same for a real
+// ARRAY: "Dim Shared procs(0 To 7) As Sub()" plus "procs(0) = ProcPtr(t)" inside a constructor wrote
+// into an array that had not been dimensioned yet, and the module body then called through it - an
+// access violation on eight lines of legal FreeBASIC. In fbc a constant-bounds Dim Shared is static
+// storage: it exists before any code runs.
+//
+// The whole declaration is lowered HERE, mark and all, and the module walk skips the node it has
+// already handled (HOISTEDDIM). Only module level, only SHARED, only CONSTANT bounds, and only when
+// the program defines a module constructor - without one nothing can observe the difference.
+var
+  i, k: Integer;
+  Decl: TASTNode;
+begin
+  if (Node = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    if Node.GetChild(i).NodeType <> antDim then Continue;
+    for k := 0 to Node.GetChild(i).ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(i).GetChild(k);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
+      if Decl.Attributes.Values['SHARED'] <> '1' then Continue;
+      if Decl.GetChild(1).NodeType <> antDimensions then Continue;      // a scalar: the allocs above have it
+      if not DimBoundsAreConstant(Decl.GetChild(1)) then Continue;
+      Decl.Attributes.Values['HOISTEDDIM'] := '1';
+    end;
+    if AnyHoistedDim(Node.GetChild(i)) then ProcessDim(Node.GetChild(i));
+  end;
+end;
+
+procedure TSSAGenerator.EmitSharedScalarConstInits(Node: TASTNode);
+// ⛔ A MODULE CONSTRUCTOR MUST SEE THE VALUE, NOT THE ZERO. "Dim Shared a As Integer = 7" is a STATIC
+// initialisation in fbc - it refuses a non-constant one outright ("error 11: Expected constant") - so
+// the value is in place before any constructor runs, and the declaration is never re-executed. Here the
+// "= expr" was lowered where the DIM stands, i.e. AFTER the ctors, so a constructor read 0; and worse,
+// re-running it at the DIM then OVERWROTE what the constructor had written ("a = 99" in the ctor, 7
+// afterwards, against fbc's 99).
+//
+// So the constant initialisers are applied HERE, beside the backing-array pre-sizing that already
+// exists for the same reason, and the DIM skips them (it asks the same PREINITED mark). Only CONSTANT
+// initialisers - a literal, or a sign in front of one - are hoisted: those are the ones fbc calls
+// static, and hoisting anything else would move an evaluation, which is a different question.
+// Module level only, and only when the program defines a module constructor: without one, nothing can
+// observe the difference and the DIM path stays exactly as it was.
+var
+  i, k: Integer;
+  Decl, InitNode, InitAssign: TASTNode;
+  NameU: string;
+begin
+  if (Node = nil) or (FModuleCtors = nil) or (FModuleCtors.Count = 0) then Exit;
+  for i := 0 to Node.ChildCount - 1 do
+  begin
+    if Node.GetChild(i).NodeType <> antDim then Continue;
+    for k := 0 to Node.GetChild(i).ChildCount - 1 do
+    begin
+      Decl := Node.GetChild(i).GetChild(k);
+      if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 3) then Continue;
+      if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+      InitNode := Decl.GetChild(2);
+      // A literal, or a unary +/- applied to one. Anything else is left where it was written.
+      if InitNode.NodeType = antUnaryOp then
+      begin
+        if (InitNode.ChildCount < 1) or (InitNode.GetChild(0).NodeType <> antLiteral) then Continue;
+      end
+      else if InitNode.NodeType <> antLiteral then Continue;
+      NameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      if not IsSharedScalar(NameU) then Continue;
+      if FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) >= 0 then Continue;   // a record is built at its DIM
+      InitAssign := TASTNode.Create(antAssignment, Decl.GetChild(0).Token);
+      InitAssign.AddChild(MakeSharedScalarAccess(NameU, Decl.GetChild(0).Token));
+      InitAssign.AddChild(InitNode.Clone);
+      try
+        ProcessArrayStore(InitAssign);
+        Decl.Attributes.Values['PREINITED'] := '1';
+      finally
+        InitAssign.Free;
+      end;
+    end;
+  end;
+end;
+
 function TSSAGenerator.StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;
 // If ObjNode.FieldName is a static member (accessed via the type name OR via an instance), return the
 // backing shared-scalar name "DECLTYPE.FIELD" (walking the inheritance chain); otherwise ''.
@@ -26803,10 +31608,152 @@ begin
   while t <> '' do
   begin
     key := t + '.' + UpperCase(FieldName);
-    if FStaticMembers.IndexOf(key) >= 0 then Exit(key);
+    if FStaticMembers.IndexOf(key) >= 0 then
+    begin
+      // OOP: the permission, on the STATIC DATA MEMBER half. A "Static x As Integer" written under
+      // "Private:" is stamped by the same parser line an ordinary field is, but it never reaches
+      // UDTFieldBankSlot - it has no per-instance slot at all - so the one place the rule lived could
+      // not see it. This is the funnel every read and every write of such a member passes (eight
+      // callers, both spellings: through the type name and through an instance).
+      // ⚠️ Not the DEFINITION: "Dim T.x As Integer = 123" at module level is how FreeBASIC gives the
+      // member its storage, and fbc accepts it whatever the access level (two COMPILE_ONLY_OK tests of
+      // its own suite are exactly that). With an initialiser it lowers to a store through the member and
+      // so arrives here like any other write; the parser marks its base identifier so the two can be
+      // told apart, because nothing in the shape of the store distinguishes them.
+      if ObjNode.Attributes.Values['STATICMEMBERDEF'] <> '1' then
+        CheckMemberAccess(at, FieldName);
+      Exit(key);
+    end;
     idx := FindUDT(t);
     if idx < 0 then Break;
     t := UpperCase(FUDTs[idx].Parent);
+  end;
+end;
+
+function TSSAGenerator.StaticMemberAddrName(MemberNode: TASTNode): string;
+// The single name a static DATA member's storage lives under, for "@<member>" - asked of the ONE funnel
+// so the instance spelling and the type-name spelling cannot disagree. '' when the member is not static.
+var
+  Base: TASTNode;
+begin
+  Result := '';
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  Base := MemberNode.GetChild(0);
+  Result := StaticMemberBackingName(Base, VarToStr(MemberNode.Value));
+  if Result <> '' then Exit;
+  // ...and a "Static ByRef" member, which is a reference variable under the same dotted name.
+  if (Base.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(Base.Value))) >= 0) and
+     IsRefVar(UpperCase(VarToStr(Base.Value)) + '.' + UpperCase(VarToStr(MemberNode.Value))) then
+    Result := UpperCase(VarToStr(Base.Value)) + '.' + UpperCase(VarToStr(MemberNode.Value));
+end;
+
+function TSSAGenerator.StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;
+// The mirror of StaticMemberBackingName for a static member that is an ARRAY: the name of the global
+// array backing it, walking the EXTENDS chain, or ''.
+var
+  at, t, key: string;
+  idx: Integer;
+begin
+  Result := '';
+  if (ObjNode = nil) or (FStaticMemberArrays = nil) or (FStaticMemberArrays.Count = 0) then Exit;
+  if (ObjNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
+    at := UpperCase(VarToStr(ObjNode.Value))     // TypeName.field (no instance)
+  else
+    at := ObjectTypeName(ObjNode);               // instance.field
+  if at = '' then Exit;
+  t := at;
+  while t <> '' do
+  begin
+    key := t + '.' + UpperCase(FieldName);
+    if FStaticMemberArrays.IndexOf(key) >= 0 then Exit(key);
+    idx := FindUDT(t);
+    if idx < 0 then Break;
+    t := UpperCase(FUDTs[idx].Parent);
+  end;
+end;
+
+function TSSAGenerator.RewriteStaticMemberArray(Node: TASTNode): TASTNode;
+// A reference to a static member that is an ARRAY is a reference to its backing GLOBAL ARRAY, under the
+// dotted name. Answers a FRESH node the CALLER OWNS, or nil when Node names no such thing.
+//
+// Both shapes are handled here, because both reach several different dispatch points and each carries
+// its own idea of what an array reference looks like:
+//   "UDT.a" / "x.a" / "p->a"        (antMemberAccess)        -> antIdentifier "UDT.A"
+//   "UDT.a(i)" / "x.a(i)"           (antArrayAccess over it) -> antArrayAccess(antIdentifier, indices)
+// Rewriting instead of teaching each path is what makes ReDim, Erase, LBound/UBound, the element read
+// and the element write work without one of them being left behind - the failure this family already
+// has a name for.
+var
+  Mem: TASTNode;
+  Backing: string;
+  i: Integer;
+
+  function BackingOfBase(Base: TASTNode): string;
+  // The backing name for "<base>.<field>" - and for the BARE field name inside a method, which is the
+  // implicit THIS. ⛔ A bare "Redim b(...)" inside a method used to declare a FRESH array called B and
+  // resize that: no diagnostic, and the member kept its old bounds. The explicit "this.b" spelling
+  // worked, which is the usual tell.
+  var
+    T, Key: string;
+    Idx, Guard: Integer;
+    Dummy: TSSAValue;
+  begin
+    Result := '';
+    if Base <> nil then Exit(StaticMemberArrayName(Base, VarToStr(Mem.Value)));
+    if FCurrentThisType = '' then Exit;
+    if ResolveExisting(VarToStr(Mem.Value), Dummy) then Exit;     // a param / local DIM shadows it
+    if ArrayIndexOf(UpperCase(VarToStr(Mem.Value))) >= 0 then Exit;   // a real array of that name wins
+    T := UpperCase(FCurrentThisType);
+    Guard := 0;
+    while (T <> '') and (Guard < 64) do
+    begin
+      Key := T + '.' + UpperCase(VarToStr(Mem.Value));
+      if FStaticMemberArrays.IndexOf(Key) >= 0 then Exit(Key);
+      Idx := FindUDT(T);
+      if Idx < 0 then Break;
+      T := UpperCase(FUDTs[Idx].Parent);
+      Inc(Guard);
+    end;
+  end;
+
+begin
+  Result := nil;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType in [antMemberAccess, antIdentifier] then
+  begin
+    Mem := Node;
+    if Node.NodeType = antMemberAccess then
+    begin
+      if Node.ChildCount < 1 then Exit;
+      Backing := BackingOfBase(Node.GetChild(0));
+    end
+    else
+      Backing := BackingOfBase(nil);
+    if Backing = '' then Exit;
+    Result := TASTNode.CreateWithValue(antIdentifier, Backing, Node.Token);
+    Exit;
+  end;
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) then
+  begin
+    Mem := Node.GetChild(0);
+    while (Mem <> nil) and (Mem.NodeType = antParentheses) and (Mem.ChildCount >= 1) do Mem := Mem.GetChild(0);
+    if Mem = nil then Exit;
+    if Mem.NodeType = antMemberAccess then
+    begin
+      if Mem.ChildCount < 1 then Exit;
+      Backing := BackingOfBase(Mem.GetChild(0));
+    end
+    else if Mem.NodeType = antIdentifier then
+      Backing := BackingOfBase(nil)
+    else
+      Exit;
+    if Backing = '' then Exit;
+    Result := TASTNode.Create(antArrayAccess, Node.Token);
+    Result.Attributes.Assign(Node.Attributes);
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, Backing, Mem.Token));
+    for i := 1 to Node.ChildCount - 1 do
+      Result.AddChild(Node.GetChild(i).Clone);
   end;
 end;
 
@@ -26837,7 +31784,7 @@ procedure TSSAGenerator.CollectDimVarBanks(Node: TASTNode; Dict: TStringList; In
 // pointer-typed DIMs ("type PTR") in FPointerVars (for typing "*p").
 var
   i, k: Integer;
-  Decl: TASTNode;
+  Decl, ArgsNd: TASTNode;
   VNameU, TypeNameU: string;
 begin
   if Node = nil then Exit;
@@ -26874,6 +31821,43 @@ begin
     VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
   end;
+  // ⛔⛔ ...AND SO DOES WRITING ONE THROUGH ITS SUBSCRIPT. "Dim s As ZString * 16 : s[0] = 65" is a
+  // store into the DECLARED BUFFER, and fbc has sixteen bytes there to store into (it zero-fills them:
+  // Len is 0 and s[0] is 0 before the write, measured). Our managed string has only the characters it
+  // HOLDS, which for an uninitialised one is none - so the store went nowhere and the whole thing read
+  // back EMPTY, in silence: fbc's own udt-wstring/asc builds its 255-character sample exactly that way.
+  // ⭐ The raw-buffer machinery this needs already exists and is complete (RawZStringBufBytes,
+  // ssaRawLoadZStr / ssaRawStoreZStr, and RawStringBufElemBytes which knows a WSTRING character is two
+  // bytes) - it was only ever reached by taking the string's ADDRESS. Writing an element IS addressing
+  // it, so this is one more POSITION on the list, not a new representation.
+  // ⚠️ Only a FIXED-LENGTH ZSTRING/WSTRING (FFixedStrNames). A var-length String has no declared buffer
+  // to write past its length, and marking one raw was tried and withdrawn on 26 Aug - see the note in
+  // MarkAddressTaken, which is where that decision lives.
+  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and
+     (Node.GetChild(0).Attributes.Values['BRACKET'] = '1') and
+     (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    VNameU := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+    if (FFixedStrNames.IndexOf(VNameU) >= 0) and (Dict.IndexOf(VNameU) < 0) then Dict.Add(VNameU);
+  end;
+  // ⛔ ...AND SO DOES STRPTR/SADD OF A FIXED-LENGTH STRING. fbc's StrPtr answers the variable's OWN
+  // buffer address, the same one every time; ours answered a fresh NUL-terminated COPY per call, which
+  // its own comment calls a snapshot - so "cint(strptr(s)) - cint(strptr(s))" was 16 where fbc says 0,
+  // and every program that indexes off StrPtr walked a different buffer each time it asked. A
+  // "ZString * n" HAS a stable buffer the moment it is backed, so taking StrPtr of one is exactly the
+  // address-taking VARPTR is treated as, three lines above. ⚠️ Only a FIXED-LENGTH one: a var-length
+  // String has no such buffer here, and there the copy is still the honest answer.
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     ((UpperCase(VarToStr(Node.GetChild(0).Value)) = kSTRPTR) or
+      (UpperCase(VarToStr(Node.GetChild(0).Value)) = kSADD)) and
+     (Node.GetChild(1).ChildCount >= 1) and (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) then
+  begin
+    VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
+    if (FFixedStrNames.IndexOf(VNameU) >= 0) and (Dict.IndexOf(VNameU) < 0) then Dict.Add(VNameU);
+  end;
   // ⛔⛔ AND THE **ByRef** POSITIONS OF fb_Mem*/Clear ARE THE SAME CASE. They take the address
   // of the lvalue they name, exactly as VARPTR does, so that variable must be backed with
   // stable storage - and if it is not registered HERE, the "@name" synthesized during SSA
@@ -26882,20 +31866,38 @@ begin
   // ⚠️ This is the defect that made it look as though the string MODEL were in the way: "@z" on
   // a ZString * n has always worked, writing through it included (verified against fbc). Only
   // the registration was missing - a list of positions, not a representation.
+  // ⛔ TWO SHAPES, ONE CALL. The parenthesised spelling "Clear( v, 0, n )" arrives as an array access
+  // (name in child 0, arguments in child 1); the bare STATEMENT "Clear v, 0, n" arrives as a procedure
+  // call (name in Value, arguments in child 0). The lowering already knows both - it says so in its own
+  // comment - and only THIS pass knew one, so a bare "Clear n, 0, 8" on a plain scalar was never
+  // registered as address-taken and died on the "@n" the lowering synthesises: "Undefined procedure
+  // (address-of @): N". The fix is to read the name and the arguments out of either shape, once.
+  ArgsNd := nil;
+  TypeNameU := '';
   if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
      (Node.GetChild(0).NodeType = antIdentifier) then
   begin
     TypeNameU := UpperCase(VarToStr(Node.GetChild(0).Value));
+    ArgsNd := Node.GetChild(1);
+  end
+  else if (Node.NodeType = antProcedureCall) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType in [antArgumentList, antExpressionList]) then
+  begin
+    TypeNameU := UpperCase(VarToStr(Node.Value));
+    ArgsNd := Node.GetChild(0);
+  end;
+  if Assigned(ArgsNd) then
+  begin
     if (TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or
        (TypeNameU = kFBMEMCOPYCLEAR) or (TypeNameU = kCLEAR) then
-      for k := 0 to Node.GetChild(1).ChildCount - 1 do
+      for k := 0 to ArgsNd.ChildCount - 1 do
       begin
         // Which positions are ADDRESSES: (dst, src) for copy/move; 0 and 2 for copyclear; only
         // dst for Clear. The rest are lengths and values, and are read by value.
         if ((TypeNameU = kFBMEMCOPY) or (TypeNameU = kFBMEMMOVE) or (TypeNameU = kCLEAR)) and
            (k > Ord((TypeNameU <> kCLEAR))) then Break;
         if (TypeNameU = kFBMEMCOPYCLEAR) and (k <> 0) and (k <> 2) then Continue;
-        Decl := Node.GetChild(1).GetChild(k);
+        Decl := ArgsNd.GetChild(k);
         // "*p" registers nothing: the address IS already the value of p.
         if Decl.NodeType = antDeref then Continue;
         // ⛔⛔ "q[4]": descend to mark the container ONLY IF IT IS NOT A POINTER. Marking a raw
@@ -26925,7 +31927,12 @@ begin
          (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ⛔ ...THROUGH ITS TYPEDEF. "Type y As Short Ptr : Dim f1 As y" declares a pointer as surely
+        // as "Dim f1 As Short Ptr" does, but the test below is on the SPELLING, so an aliased name
+        // never entered this map at all: f1 was not a pointer to anything, and "SizeOf(*f1)" fell off
+        // the end of DeclaredTypeNameOf and down to the array ladder as "Array not declared: SIZEOF".
+        // CanonicalType is the resolver the rest of the generator already uses for exactly this.
+        TypeNameU := CanonicalType(UpperCase(VarToStr(Decl.GetChild(1).Value)));
         if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
         begin
           // ⭐ A MODULE-LEVEL DECLARATION WINS. This map is keyed by NAME with no scope, so when two
@@ -26943,6 +31950,24 @@ begin
         end;
       end;
     end;
+  // ⛔ A FOR COUNTER DECLARED IN THE HEAD IS A DECLARATION TOO. "For i As T Ptr = a To b" gives i a
+  // pointer type exactly as a DIM would, and this pass only ever looked at antDim - so the counter
+  // never entered FPointerVars, PointerUDTType answered '' for it, and "@i->field" failed with
+  // "Cannot take address of field: object is not a record" while the WRITE "i->x = i" in the same
+  // loop went through. The type is on the node as VARTYPE, which is where the FOR head keeps it.
+  if (Node.NodeType = antForLoop) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    TypeNameU := UpperCase(Node.Attributes.Values['VARTYPE']);
+    if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
+    begin
+      VNameU := UpperCase(VarToStr(Node.GetChild(0).Value));
+      if not InProc then
+        FPointerVars.Values[VNameU] := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4))
+      else if FPointerVars.IndexOfName(VNameU) < 0 then
+        FPointerVars.Add(VNameU + '=' + Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4)));
+    end;
+  end;
   for i := 0 to Node.ChildCount - 1 do
     CollectDimVarBanks(Node.GetChild(i), Dict, InProc or (Node.GetChild(i).NodeType = antProcedureDecl));
 end;
@@ -27049,7 +32074,7 @@ var
   i, k: Integer;
   Decl: TASTNode;
   ProcDict: TStringList;
-  VNameU, VTypeU: string;
+  VNameU, VTypeU, VTypeC: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antDim then
@@ -27061,6 +32086,16 @@ begin
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
         VTypeU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ⛔ EVERY QUESTION BELOW IS ABOUT THE TYPE, NOT ABOUT ITS SPELLING. FindUDT resolves a TYPE
+        // alias on its own; the BANK question did not, and TypeNameToBank answers FLOAT for a name it
+        // does not know [see InferExprBank's own note]. So "Type p As UDT Ptr : Dim q As p = @x" made q
+        // a float-bank scalar, a pointer taking its @ looked like genuine type-punning, and q got a RAW
+        // byte slot where the same declaration spelled "Dim q As UDT Ptr" gets a managed SHARED cell.
+        // Reading through the second level then dereferenced a raw address as a handle:
+        // EAccessViolation, on a program fbc runs (fbc suite typedef/pointers).
+        // ⚠️ The canonical name answers the QUESTIONS; the declared spelling is what goes on RECORD,
+        // because LEN reads it back and the rewrite is what loses it.
+        VTypeC := CanonicalType(VTypeU);
         // Only builtin scalars need backing: a UDT variable is already a stable record handle, so @obj
         // just reads that handle (the backing machinery would wrongly turn the UDT into a 1-element array).
         if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) then
@@ -27068,21 +32103,30 @@ begin
           if InProc then
           begin
             Decl.Attributes.Values['ADDRLOCAL'] := '1';   // per-frame RAW byte slot (recursion-safe, bit-punnable)
-            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
           end
           // A fixed-length ZSTRING/WSTRING is a CHARACTER BUFFER: taking its address means "give me the
           // bytes", which only a raw slot can honour. It never looked type-punned - a pointer to it is
           // the same (string) bank - so it stayed a managed SHARED cell and "@z" answered a packed array
           // address instead of a byte pointer. The manual's udt/type2 starts exactly there.
-          else if ((VTypeU = 'ZSTRING') or (VTypeU = 'WSTRING')) and
+          // ⛔ ...AND ADDING "STRING" TO THIS LIST IS NOT THE CURE - it was TRIED and WITHDRAWN on
+          // 26 Aug 2026. Marking a fixed-length String RAWMODULE does give it a raw slot, and "@fs"
+          // stops answering a packed handle, but the slot is never WRITTEN: the size and the store go
+          // through RawZStringBufBytes, which reads FZStringVars, and a "String * n" is recorded in
+          // FFixedLenVars instead (n characters, not n-1 cells). The measured result was worse than
+          // the defect - "Dim As String * 8 fs : fs = "abc" : Print fs" printed nothing at all, len 0,
+          // the moment its address was taken. Two machineries, one taught: extending the OTHER one is
+          // the piece of work, and it is a model change (padding lives on the managed path), not a
+          // name added to a list. Costs 291 assertions of the fbc suite; see DIVERGENZE.md.
+          else if ((VTypeC = 'ZSTRING') or (VTypeC = 'WSTRING')) and
                   (StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0) > 0) then
           begin
             Decl.Attributes.Values['RAWMODULE'] := '1';
             if FRawModuleScalars.IndexOfName(VNameU) < 0 then
-              FRawModuleScalars.Add(VNameU + '=' + VTypeU);
+              FRawModuleScalars.Add(VNameU + '=' + VTypeC);
           end
-          else if (VTypeU <> 'STRING') and
-                  ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeU, VNameU)) then
+          else if (VTypeC <> 'STRING') and
+                  ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeC, VNameU)) then
           begin
             // TYPE-PUNNED module-level @-taken scalar (a DIFFERENT-bank pointer takes its @): a RAW byte slot
             // whose address lives in a shared int array, so @/deref are bit-exact just like the local case
@@ -27094,15 +32138,15 @@ begin
             // array makes it cross-procedure visible, exactly what DIM SHARED needs (a same-bank DIM SHARED
             // stays array-backed with the M6 slot below).
             Decl.Attributes.Values['RAWMODULE'] := '1';
-            if FRawModuleScalars.IndexOfName(VNameU) < 0 then FRawModuleScalars.Add(VNameU + '=' + VTypeU);
-            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+            if FRawModuleScalars.IndexOfName(VNameU) < 0 then FRawModuleScalars.Add(VNameU + '=' + VTypeC);
+            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
           end
           else
           begin
             Decl.Attributes.Values['SHARED'] := '1';      // module STRING / DIM SHARED / same-bank @: shared array
             // Keep the declared type: the rewrite is what loses it, and LEN needs it back.
             if FAddrSharedScalars.IndexOfName(VNameU) < 0 then
-              FAddrSharedScalars.Add(VNameU + '=' + VTypeU);
+              FAddrSharedScalars.Add(VNameU + '=' + VTypeC);
           end;
         end;
       end;
@@ -27135,12 +32179,22 @@ begin
             begin
               VNameU := UpperCase(VarToStr(Decl.Value));
               VTypeU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-              // Only a @-taken builtin SCALAR param (not a UDT, not a "T PTR", not a STRING -- raw bytes only).
-              if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
-                 (Pos(' PTR', VTypeU) = 0) and (VTypeU <> 'STRING') then
+              VTypeC := CanonicalType(VTypeU);      // a parameter is declared through a TYPE alias too
+              // Only a @-taken builtin SCALAR param (not a UDT, not a STRING -- raw bytes only).
+              // ⛔ A "T PTR" PARAMETER USED TO BE EXCLUDED HERE, and that one clause is the whole reason
+              // "@p" of "ByVal p As Integer Ptr" died with "Undefined procedure (address-of @): P". The
+              // exclusion reads as though pointers were a separate case with a path of their own; they
+              // are not. A pointer VALUE is raw bytes like any other scalar - RawTypeCodeOfPointee
+              // answers RTC_I64 for "INTEGER PTR", which is exactly a pointer's width - and the lowering
+              // chain was already sound: "@x" on a ByVal Integer/Single/UDT param works, so the hole was
+              // in the MARKING, not in @. It cost every "@" of a pointer parameter, BYVAL and BYREF
+              // alike, which is why it read as a defect of the BYREF protocol and is not one.
+              // STRING stays out: its slot holds a MANAGED handle, not bytes (see the prologue's note).
+              if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeC) < 0) and
+                 (VTypeC <> 'STRING') then
               begin
                 Decl.Attributes.Values['ADDRPARAM'] := '1';
-                if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+                if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
               end;
             end;
           end;
@@ -27149,8 +32203,72 @@ begin
     end;
   end;
   if Node.NodeType = antProcedureDecl then InProc := True;
+  // ⛔ A BLOCK IS A SCOPE TOO, AND MAKING THIS MARKING SEE THAT WAS TRIED TWICE AND WITHDRAWN
+  // (26 Aug 2026). The marking applies RETROACTIVELY BY NAME: two sibling Scopes each declaring "a",
+  // the second taking "@a" of a ZString * 5, and the FIRST one's plain String is turned into a raw slot
+  // too - so the program dies on its first executable line, in the scope ABOVE the one with the pointer
+  // in it. Reversing the two scopes makes it work, which is what says it is the marking and not the
+  // pointer.
+  // ⚠️ Judging each antBlock on the @s taken inside ITS OWN subtree fixes that repro and the corpus
+  // stays green - and the fbc suite goes CUPASS 273 -> 263. Narrowing it to names the program declares
+  // MORE THAN ONCE still reads 264. An @ taken outside a block reaches a variable declared inside it in
+  // plenty of shapes, and a block dictionary loses those; and the registries below (FRawModuleScalars,
+  // FAddrSharedScalars) are keyed by NAME with no scope anyway, so marking one declaration and not the
+  // other still leaves both reading the same entry. It is PER-DECLARATION IDENTITY that is missing -
+  // what LocalArrayMangle gives an array - and that is a model change, not a branch here. Worth 516
+  // assertions; DIVERGENZE 56.
   for i := 0 to Node.ChildCount - 1 do
     MarkAddressTaken(Node.GetChild(i), Dict, InProc);
+end;
+
+function AnyWStringPtrParam(Node: TASTNode): Boolean;
+// True if ANY procedure in the program declares a "WSTRING PTR" parameter. It is the gate on the
+// marking below, so a program without one keeps byte-identical output.
+var
+  i: Integer;
+  P: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  if Node.NodeType = antParameterList then
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      P := Node.GetChild(i);
+      if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) and
+         (UpperCase(VarToStr(P.GetChild(0).Value)) = 'WSTRING PTR') then Exit(True);
+    end;
+  for i := 0 to Node.ChildCount - 1 do
+    if AnyWStringPtrParam(Node.GetChild(i)) then Exit(True);
+end;
+
+procedure MarkFixedWStringVars(Node: TASTNode; Dict: TStringList);
+// Mark every "DIM w AS WSTRING * n" as address-taken, so it is backed by a real UCS-2 BUFFER.
+//
+// ⛔ WHY IT HAS TO BE THE BUFFER. FreeBASIC passes such a variable to a "WSTRING PTR" parameter by
+// ADDRESS, and the pointee is UCS-2. The conversion we do for a ZSTRING PTR - SADD, the byte address
+// of the managed string - hands over UTF-8 instead, and the callee's wide dereference read it as
+// UCS-2: "Sub t(ByVal s As Const WString Const Ptr)" called as "t(w)" died on the first "*s", while
+// the very same call written "t(@w)" worked, because THAT spelling makes the variable address-taken
+// and RawZStringBufBytes gives it (n+1)*2 bytes of exactly the right encoding.
+//
+// ⚠️ CONSERVATIVE ON PURPOSE, and the reason is the pipeline order: this pass runs BEFORE the
+// procedure declarations are collected, so an argument cannot be matched to its parameter's type here.
+// Rather than duplicate that collection, every fixed-length WSTRING in such a program is backed. The
+// cost is one raw buffer per variable and NOTHING observable - an @-taken WSTRING reads, writes, LENs
+// and MIDs exactly as a plain one - and the gate above keeps every other program untouched.
+var
+  i: Integer;
+begin
+  if (Node = nil) or (Dict = nil) then Exit;
+  if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (Node.GetChild(1).NodeType = antIdentifier) and
+     (UpperCase(VarToStr(Node.GetChild(1).Value)) = 'WSTRING') and
+     (StrToIntDef(Node.Attributes.Values['FIXEDLEN'], -1) > 0) then
+    if Dict.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0 then
+      Dict.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  for i := 0 to Node.ChildCount - 1 do
+    MarkFixedWStringVars(Node.GetChild(i), Dict);
 end;
 
 function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;
@@ -27262,6 +32380,32 @@ begin
     CheckTypeNameShadowedByVar(Node.GetChild(i));
 end;
 
+procedure TSSAGenerator.CollectFixedStrNames(Node: TASTNode);
+// Every name declared "AS ZSTRING * n" / "AS WSTRING * n". A whole-AST prescan rather than a running
+// note, because STRPTR may be written BEFORE the declaration inside a procedure body.
+var
+  i, k: Integer;
+  D: TASTNode;
+  T: string;
+begin
+  if Node = nil then Exit;
+  if Node.NodeType = antDim then
+    for k := 0 to Node.ChildCount - 1 do
+    begin
+      D := Node.GetChild(k);
+      if (D.NodeType = antArrayDecl) and (D.ChildCount >= 2) and
+         (D.GetChild(0).NodeType = antIdentifier) and (D.GetChild(1).NodeType = antIdentifier) and
+         (StrToIntDef(D.Attributes.Values['FIXEDLEN'], 0) > 0) then
+      begin
+        T := UpperCase(VarToStr(D.GetChild(1).Value));
+        if ((T = 'ZSTRING') or (T = 'WSTRING')) and
+           (FFixedStrNames.IndexOf(UpperCase(VarToStr(D.GetChild(0).Value))) < 0) then
+          FFixedStrNames.Add(UpperCase(VarToStr(D.GetChild(0).Value)));
+      end;
+    end;
+  for i := 0 to Node.ChildCount - 1 do CollectFixedStrNames(Node.GetChild(i));
+end;
+
 procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
 // Runs BEFORE CollectSharedVars: marks @-taken declared scalars SHARED so they become array-backed
 // (addressable). Also records pointer-var pointee types in FPointerVars. In addition, arguments passed
@@ -27273,11 +32417,17 @@ begin
   Dict := TStringList.Create;
   ByrefRetNames := TStringList.Create;
   try
+    FFixedStrNames.Clear;
+    CollectFixedStrNames(Node);       // which names are fixed-length character BUFFERS
     CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
     CollectScalarPtrBanks(Node);      // per @-taken scalar, the banks of pointers taking its @ (RAWMODULE gate)
     GatherByrefRetFuncNames(Node, ByrefRetNames);
     if ByrefRetNames.Count > 0 then
       MarkByrefRetCallArgs(Node, ByrefRetNames, Dict);   // back the args of byref-return calls
+    // ...and back every fixed-length WSTRING when the program has a WSTRING PTR parameter to pass one
+    // to: the pointee has to be the UCS-2 BUFFER, not the managed string's UTF-8 bytes.
+    if AnyWStringPtrParam(Node) then
+      MarkFixedWStringVars(Node, Dict);
     MarkAddressTaken(Node, Dict);     // mark their DIMs SHARED
   finally
     Dict.Free;
@@ -27364,6 +32514,7 @@ function TSSAGenerator.DeclaredTypeNameOf(Node: TASTNode): string;
 // bank, exactly as before.
 var
   NameU, T: string;
+  UDTIdx, FI: Integer;
 begin
   Result := '';
   if Node = nil then Exit;
@@ -27387,9 +32538,34 @@ begin
   if Node.NodeType = antDeref then
   begin
     // "*p" is p's type with one " PTR" taken off.
-    T := DeclaredTypeNameOf(Node.GetChild(0));
+    // ⛔ ...AFTER RESOLVING THE ALIAS, or the second star has nothing to take off. "Type y As z Ptr :
+    // Dim f2 As y Ptr" records the pointee as "Y", so "*f2" answered "Y" - a name with no " PTR" in it
+    // - and "**f2" then found nothing to strip and fell off the end as "Array not declared: SIZEOF".
+    // One star worked and two did not, which is what said it was the SPELLING of the intermediate type
+    // and not the depth. CanonicalType is the resolver the rest of the generator already uses.
+    T := CanonicalType(UpperCase(DeclaredTypeNameOf(Node.GetChild(0))));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
+    Exit;
+  end;
+  // ⛔ ...AND A FIELD HAS A DECLARED TYPE TOO. Only a NAME was asked here, so "SizeOf(*x.pz)" - the
+  // deref of a "ZString Ptr" FIELD - got '' from the arm above, propagated '' out of the antDeref arm,
+  // and the SIZEOF call slid down to the array ladder ("Array not declared: SIZEOF"). Both halves work
+  // separately: "SizeOf(*p)" on a declared pointer and "SizeOf(x.pz)" on the field itself. The record
+  // already carries the answer per field; nobody was asking it.
+  if Node.NodeType = antMemberAccess then
+  begin
+    if Node.ChildCount < 1 then Exit;
+    UDTIdx := FindUDT(ObjectTypeName(Node.GetChild(0)));
+    if UDTIdx < 0 then Exit;
+    FI := UDTFieldIndex(UDTIdx, UpperCase(VarToStr(Node.Value)));
+    if FI < 0 then Exit;
+    if FUDTs[UDTIdx].Fields[FI].PtrPointee <> '' then
+      Exit(UpperCase(FUDTs[UDTIdx].Fields[FI].PtrPointee) + ' PTR');
+    if FUDTs[UDTIdx].Fields[FI].RawPtrPointee <> '' then
+      Exit(UpperCase(FUDTs[UDTIdx].Fields[FI].RawPtrPointee) + ' PTR');
+    if FUDTs[UDTIdx].Fields[FI].NestedType <> '' then
+      Exit(UpperCase(FUDTs[UDTIdx].Fields[FI].NestedType));
     Exit;
   end;
   if Node.NodeType <> antIdentifier then Exit;
@@ -27407,6 +32583,12 @@ begin
     7: Result := 'SINGLE';
   end;
   if Result <> '' then Exit;
+  // ⭐ ...AND THE NAME THE DECLARATION ACTUALLY SAID, before the bank has to guess. Declared32Code
+  // above answers only once its own registry is filled, which is AFTER this pre-pass runs, so
+  // "Dim s As Short : Dim As TypeOf(s) w" fell straight through to the bank and made w an INTEGER -
+  // eight bytes against fbc's two. A type ALIAS is resolved, so "Type y As Short" answers SHORT.
+  T := UpperCase(FVarDeclTypeName.Values[NameU]);
+  if T <> '' then Exit(CanonicalType(T));
   if FVarExplicitType.IndexOf(NameU) >= 0 then
     case TSSARegisterType(PtrInt(FVarExplicitType.Objects[FVarExplicitType.IndexOf(NameU)])) of
       srtString: Result := 'STRING';
@@ -27526,6 +32708,20 @@ begin
   if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
   FuncU := UpperCase(VarToStr(Node.GetChild(0).Value));
+  // ⭐ ...AND THE C SPELLINGS ARE THE SAME THREE FUNCTIONS. A program that includes <crt.bi> to get at
+  // memory writes malloc/calloc/realloc/free, and those are OURS to the byte: calloc(count, size) is
+  // exactly the two-argument CAllocate, and the other two are byte-granular like ours. Only the FILE*
+  // half of the C runtime is a declared divergence; memory is not, and "Array not declared: MALLOC"
+  // said otherwise. ⛔ A procedure the program declares ITSELF under one of these names wins - the
+  // alias is a fallback, not a reservation.
+  if (FuncU = 'MALLOC') or (FuncU = 'CALLOC') or (FuncU = 'REALLOC') then
+    if (ArrayIndexOf(FuncU) < 0) and (FProcedureNames.IndexOf(FuncU) < 0) then
+    begin
+      if FuncU = 'MALLOC' then FuncU := 'ALLOCATE'
+      else if FuncU = 'CALLOC' then FuncU := 'CALLOCATE'
+      else FuncU := 'REALLOCATE';
+      Exit(True);
+    end;
   if (FuncU = 'ALLOCATE') or (FuncU = 'CALLOCATE') or (FuncU = 'REALLOCATE') then
     Result := ArrayIndexOf(FuncU) < 0;
 end;
@@ -27725,6 +32921,62 @@ begin
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
 end;
 
+procedure TSSAGenerator.RequireStringArg(const FuncName: string; ArgsNode: TASTNode);
+// ⭐ VAL / VALINT / VALLNG / VALUINT / VALULNG / LEFT / RIGHT take a STRING. fbc answers "error 99: No
+// matching overloaded function" for "Val(0)" and for "Val(p)" where p is a ZString Ptr or a WString
+// Ptr - there is no overload of these that takes a number or an address, and passing one is a
+// mistake, not a conversion. We rendered the number and parsed it back, or read a pointer VALUE as
+// text: "Val(0)" answered 0 and looked right.
+//
+// ⛔ IT REFUSES ONLY WHAT IT CAN PROVE, and that is the whole design. This compiler has a bank
+// inference that answers a DEFAULT when it does not know (see REGISTRI.md), and building a REFUSAL on
+// something that guesses is how a valid program gets rejected. Two proofs, both local and certain:
+// a numeric LITERAL, and an identifier the parser recorded as a POINTER. Anything else - a UDT with a
+// Cast operator, a function result, an expression - is left alone.
+var
+  Arg: TASTNode;
+begin
+  if (ArgsNode = nil) then Exit;
+  Arg := ArgsNode;
+  if Arg.NodeType in [antArgumentList, antExpressionList] then
+  begin
+    if Arg.ChildCount < 1 then Exit;
+    Arg := Arg.GetChild(0);
+  end;
+  if Arg = nil then Exit;
+  while (Arg.NodeType = antParentheses) and (Arg.ChildCount >= 1) do Arg := Arg.GetChild(0);
+  if (Arg.NodeType = antLiteral) and Assigned(Arg.Token) and
+     (Arg.Token.TokenType <> ttStringLiteral) then
+    raise Exception.CreateFmt('%s takes a string: it was given the number %s. There is no overload ' +
+      'of %s that takes a number.', [FuncName, VarToStr(Arg.Value), FuncName]);
+  if (Arg.NodeType = antIdentifier) and (PointeeTypeOf(UpperCase(VarToStr(Arg.Value))) <> '') then
+    raise Exception.CreateFmt('%s takes a string: %s is a POINTER. Dereference it (*%s) if you mean ' +
+      'the text it points at.',
+      [FuncName, UpperCase(VarToStr(Arg.Value)), UpperCase(VarToStr(Arg.Value))]);
+end;
+
+function TSSAGenerator.PointeeOfDerefTarget(Node: TASTNode): string;
+// What the expression a "*" is applied to was DECLARED to point at, whatever shape it was written in:
+// a cast ("*CPtr(Byte Ptr, x)"), a name ("*b"), an arithmetic step ("*(b + 1)") or a parenthesised
+// one. ⛔ It exists because the narrowing rule below used to be keyed on the target being
+// SYNTACTICALLY a Cast - so assigning the very same cast to a variable first, which is how anyone
+// writes it, lost the rule. The question is not how the pointer was spelled.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antCast:        Result := DerefedType(Node);
+    // "@Cast(T, x)" is a pointer to T written without a name, and this reader knew every OTHER shape.
+    // fbc's own optimizations/derefaddrof writes "*(@Cast(UByte, b(0)) + 1)": the value came back at
+    // the array's declared element type, signed, 234 read as -22.
+    antProcAddress: Result := DerefedType(Node);
+    antIdentifier:  Result := UpperCase(PointeeTypeOf(VarToStr(Node.Value)));
+    antParentheses: if Node.ChildCount >= 1 then Result := PointeeOfDerefTarget(Node.GetChild(0));
+    // "p + n" / "p - n": the POINTER is the left operand - the right one is a count of elements.
+    antBinaryOp:    if Node.ChildCount >= 1 then Result := PointeeOfDerefTarget(Node.GetChild(0));
+  end;
+end;
+
 function TSSAGenerator.PointeeTypeOf(const PtrName: string): string;
 // The declared pointee of a raw pointer, whether it arrived as a DIM or as a
 // PARAMETER. FPointerVars only ever held DIMs - the comment on ParamPointeeType
@@ -27805,6 +33057,11 @@ begin
   // 24-byte descriptor (pointer + length + capacity) and a WSTRING is one 2-byte wide character. Both
   // verified against fbc. Nothing here allocates by these numbers -- they are what SizeOf/LEN must SAY.
   if T = 'STRING' then Result := 24
+  // ⛔ ...AND A ZSTRING IS ONE BYTE. It was absent from this list, so it fell all the way to the
+  // "unknown type is pointer-sized" default and SizeOf(ZString) answered 8 against fbc's 1 - the same
+  // wrong number an unrecognised name gets, which is why nothing ever pointed at it. Its WSTRING
+  // neighbour was here from the start.
+  else if T = 'ZSTRING' then Result := 1
   else if T = 'WSTRING' then Result := 2
   else if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
   else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
@@ -27819,7 +33076,7 @@ begin
       // SizeOf(T) of a UDT is the size fbc's C layout gives it (alignment padding included, "FIELD = n"
       // honoured) whenever every member has a reproducible shape; a type holding a variable-length
       // string / array / nested record falls back to the historic one-slot-per-field sum.
-      if UDTCLayout(u, LayoutOffsets, LayoutSize) then
+      if UDTCLayout(u, LayoutOffsets, LayoutSize, True) then   // SizeOf reports; it does not promise an image
         Result := LayoutSize
       else if FUDTs[u].LiveBytes > 0 then
         // A3-i: where the C layout declines - a UNION, or a type holding an array, a nested record or
@@ -28112,7 +33369,7 @@ var
       ElemName := UpperCase(VarToStr(ArgNode.GetChild(0).Value));
       if ArrayIndexOf(ElemName) >= 0 then
       begin
-        WIdx := FArrayElemWidth.IndexOf(ElemName);
+        WIdx := FArrayElemWidth.IndexOf(ArrayFactKey(ElemName));
         if WIdx >= 0 then
           raise Exception.CreateFmt(
             '%s over the array "%s" is refused: its elements are declared NARROW, and this VM stores ' +
@@ -28160,6 +33417,15 @@ var
 
 begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  // ⛔ A CONST destination is not writable, and these operations WRITE. fbc refuses "Clear a, 0, n"
+  // on a "Dim As Const Integer a" (sf.net #642) and so does this: the ByRef positions are exactly the
+  // ones an assignment would refuse, so the rule is the assignment's, applied where the address is
+  // taken instead of where a value is stored.
+  if (ArgsNode <> nil) and (ArgsNode.ChildCount >= 1) and
+     (ArgsNode.GetChild(0).NodeType = antIdentifier) and
+     (FConstVars.IndexOf(UpperCase(VarToStr(ArgsNode.GetChild(0).Value))) >= 0) then
+    raise Exception.CreateFmt('Cannot modify a constant: %s is declared As Const.',
+                              [UpperCase(VarToStr(ArgsNode.GetChild(0).Value))]);
   if (FuncU = kFBMEMCOPY) or (FuncU = kFBMEMMOVE) then
   begin
     // ...over MANAGED storage first: a record or a fixed-length string field has no byte image, and
@@ -28240,12 +33506,50 @@ var
   begin
     Result := False;
     if (Rhs = nil) or (Rhs.NodeType <> antArrayAccess) then Exit;
+    // ⛔ ...and NOT when the base is raw only because it is "@x" of a raw-backed @-taken SCALAR. That
+    // pointer addresses a VARIABLE's slot, and the slot holds whatever the variable holds - for a UDT
+    // pointer, a managed record HANDLE. Marking the target raw then made "*t" read the handle as a byte
+    // address: "Dim q As T Ptr = @y : Dim qq As T Ptr Ptr = @q : t = qq[0] : t->i" died on
+    // "Null or invalid pointer dereference", while "t = *qq" - the same value, and it compares EQUAL -
+    // was right. Rawness of the CONTAINER is not rawness of the CONTENT.
+    if (Rhs.ChildCount >= 1) and (Rhs.GetChild(0).NodeType = antIdentifier) and
+       (FRawFromAddrOf.IndexOf(UpperCase(VarToStr(Rhs.GetChild(0).Value))) >= 0) then Exit;
     ET := RawChainElemType(Rhs);
     if (Length(ET) < 4) or (Copy(ET, Length(ET) - 3, 4) <> ' PTR') then Exit;
     // ...unless the cell holds a MANAGED block. Then its value is a record HANDLE, and marking the
     // target raw would send "q[j].field" onto the byte heap with a handle for an address.
     ET := Trim(Copy(ET, 1, Length(ET) - 4));
     Result := not ((FindUDT(ET) >= 0) and UDTBlockIsManaged(ET));
+  end;
+
+  function IsRawPtrFieldExpr(Rhs: TASTNode): Boolean;
+  // "q = a->b" where a is a RAW UDT pointer and b is a field declared "<T> Ptr": that field lives in
+  // RAW BYTES, so what it holds is a raw address - exactly as raw as the block it sits in.
+  //
+  // ⛔ The INDEXED form of the same fact ("q = p[i]", IsRawPtrCellExpr just above) has had this rule
+  // since the New[] case; the FIELD form never did. So "a->b = CAllocate(...)" followed by
+  // "a->b->plain" read a byte address through the MANAGED record path and faulted - while the very
+  // same program written with a temporary ("dim t as uc ptr = CAllocate(...) : a->b = t") worked,
+  // because there the temporary was marked raw by the ordinary Allocate rule.
+  var
+    ObjNode: TASTNode;
+    ObjT, FieldT: string;
+    UDTIdx: Integer;
+  begin
+    Result := False;
+    if (Rhs = nil) or (Rhs.NodeType <> antMemberAccess) or (Rhs.ChildCount < 1) then Exit;
+    ObjNode := Rhs.GetChild(0);
+    while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do ObjNode := ObjNode.GetChild(0);
+    if ObjNode.NodeType <> antIdentifier then Exit;
+    ObjT := RawUDTPtrType(VarToStr(ObjNode.Value));      // '' unless the object is a RAW UDT pointer
+    if ObjT = '' then Exit;
+    UDTIdx := FindUDT(ObjT);
+    if UDTIdx < 0 then Exit;
+    FieldT := UpperCase(UDTFieldPtrPointee(UDTIdx, UpperCase(VarToStr(Rhs.Value))));
+    if FieldT = '' then Exit;                            // not a "<UDT> Ptr" field
+    // ...unless that pointee's blocks are MANAGED: then the field holds a record HANDLE, and marking
+    // the target raw would send "q->field" onto the byte heap - the mirror of the accident above.
+    Result := not UDTBlockIsManaged(FieldT);
   end;
 
   procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
@@ -28274,7 +33578,15 @@ var
       // ...and NOT when the elements have a constructor or a destructor: then "New T[n]" allocates
       // MANAGED records (EmitNewObject says why), the value IS a handle, and marking it raw would send
       // "p[i].field" onto the byte heap - the exact mirror of the accident this branch exists to prevent.
+      // ...and "New T" WHERE T DECLARES ITS OWN "Operator New". Then the storage is whatever that
+      // operator answered - raw bytes it allocated itself - and not a record this compiler owns, so the
+      // value is an ADDRESS like every other one in this list. Without it "p->i = 3" read a byte
+      // address through the managed record path and faulted on the first store.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
+         IsRawPtrFieldExpr(Rhs) or
+         ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
+          TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
+          (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
           (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
@@ -28300,7 +33612,14 @@ var
     end
     else if (Rhs.NodeType = antProcAddress) and (Rhs.ChildCount = 0) and
             (FAddrTakenScalars.IndexOfName(UpperCase(VarToStr(Rhs.Value))) >= 0) then
-      MarkRaw(TargetU)   // p = @x where x is a raw-backed @-taken scalar: a real byte pointer
+    begin
+      MarkRaw(TargetU);  // p = @x where x is a raw-backed @-taken scalar: a real byte pointer
+      // ⛔ ...AND THAT RAWNESS IS THE CONTAINER'S, NOT THE CONTENT'S. This pointer addresses a
+      // VARIABLE's slot; what the slot HOLDS is whatever that variable holds, which for a UDT pointer
+      // is a managed record HANDLE. Every other raw source (Allocate, New[], ScreenPtr, SAdd) owns
+      // real bytes, and only for those is "p[i] is as raw as p" true. See IsRawPtrCellExpr.
+      if FRawFromAddrOf.IndexOf(TargetU) < 0 then FRawFromAddrOf.Add(TargetU);
+    end
     else if RawPtrExprName(Rhs) <> '' then
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
     else if IsRawPtrCellExpr(Rhs) then
@@ -28454,7 +33773,7 @@ begin
     CollectRawPtrRetFuncs(Node.GetChild(i));
 end;
 
-procedure TSSAGenerator.CollectWStringVars(Node: TASTNode);
+procedure TSSAGenerator.CollectWStringVars(Node: TASTNode; const Owner: string);
 // Pre-scan: record every variable, parameter or FUNCTION result declared AS WSTRING (by name, into the
 // flat FWStringVars). These share the srtString bank (UTF-8 byte storage) but their LEN/MID/LEFT/RIGHT
 // count/index by Unicode codepoint. Declaration shapes: DIM scalar = antArrayDecl(name, "WSTRING"); a
@@ -28500,9 +33819,17 @@ begin
       begin
         FZStringVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] :=
           IntToStr(StrToIntDef(Node.Attributes.Values['FIXEDLEN'], 1) - 1);
+        if Owner <> '' then
+          FZStringVars.Values[Owner + '|' + UpperCase(VarToStr(Node.GetChild(0).Value))] :=
+            IntToStr(StrToIntDef(Node.Attributes.Values['FIXEDLEN'], 1) - 1);
       end
       else
+      begin
         FFixedLenVars.Values[UpperCase(VarToStr(Node.GetChild(0).Value))] := Node.Attributes.Values['FIXEDLEN'];
+        if Owner <> '' then
+          FFixedLenVars.Values[Owner + '|' + UpperCase(VarToStr(Node.GetChild(0).Value))] :=
+            Node.Attributes.Values['FIXEDLEN'];
+      end;
     end;
   end;
   // FUNCTION ... AS WSTRING : child0 = name node, its child0 = return-type identifier.
@@ -28524,8 +33851,51 @@ begin
          (UpperCase(VarToStr(P.GetChild(0).Value)) = 'WSTRING') then
         MarkW(VarToStr(P.Value));
     end;
+  // ⛔ A DECLARED CAPACITY IS A FACT ABOUT ONE SCOPE, and this registry is keyed by NAME alone: two
+  // SUBs that each declare "Dim src As WString * n" with a DIFFERENT n left the LAST declaration's n
+  // in force for both, so the first one truncated its own contents. The fbc suite's wstring/lrset does
+  // exactly that - TEST(ascii) sizes by MAX=8 and TEST(ucs2) by MAX=5 - and its 8-character strings
+  // came back 5 characters long. The scoped entry is written BESIDE the bare one, never instead of it,
+  // so a module-level declaration and every lookup that has no procedure context read as before.
   for i := 0 to Node.ChildCount - 1 do
-    CollectWStringVars(Node.GetChild(i));
+    if (Node.GetChild(i) <> nil) and (Node.GetChild(i).NodeType = antProcedureDecl) and
+       (Node.GetChild(i).ChildCount >= 1) and (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+      CollectWStringVars(Node.GetChild(i), UpperCase(VarToStr(Node.GetChild(i).GetChild(0).Value)))
+    else
+      CollectWStringVars(Node.GetChild(i), Owner);
+end;
+
+function TSSAGenerator.StrCapOf(L: TStringList; const Name: string; Def: Integer): Integer;
+// The declared capacity recorded for this name, asking THIS procedure's entry before the flat one.
+// See the note in CollectWStringVars: the flat entry is last-declaration-wins across the program.
+// ⭐ ...and a BLOCK is asked before the procedure, for the same reason and with the same shape: two
+// sibling Scopes each declaring the name with a different capacity are two variables (DIVERGENZE 56).
+// Where the block declared the name there is NO fallback at all - not to the procedure's entry and not
+// to the flat one - because a block that declared it and recorded no capacity here HAS no capacity.
+const
+  NOENTRY = Low(Integer);
+var
+  BlkKey: string;
+begin
+  Result := NOENTRY;
+  BlkKey := BlockScalarName(Name);
+  if BlkKey <> '' then Exit(StrToIntDef(L.Values[BlkKey], Def));
+  if FCurrentProcName <> '' then
+  begin
+    Result := StrToIntDef(L.Values[FCurrentProcName + '|' + UpperCase(Name)], NOENTRY);
+    // ⛔ ...AND WHEN THIS PROCEDURE DECLARES THE NAME ITSELF, THE FLAT ENTRY MUST NOT APPLY AT ALL.
+    // Falling back to it made a "Dim s As Double" take the FIXED-LENGTH STRING store path because
+    // ANOTHER procedure had declared an "s As ZString * 16" - the double was stored as text and read
+    // back 0, silently - and it went on doing the same thing BETWEEN the two string kinds: a
+    // "Dim s As String * 8" beside that ZString took the ZSTRING path and was never padded.
+    // ⭐ The test is "did THIS procedure declare the name", asked of the scoped BANK map, which holds
+    // an entry exactly when the declaration was one we could resolve. A name this procedure does not
+    // declare still falls through to the flat entry, so nothing that used to resolve stops resolving.
+    if (Result = NOENTRY) and
+       (FVarExplicitType.IndexOf(FCurrentProcName + '|' + UpperCase(Name)) >= 0) then
+      Exit(Def);
+  end;
+  if Result = NOENTRY then Result := StrToIntDef(L.Values[UpperCase(Name)], Def);
 end;
 
 function TSSAGenerator.IsWStringVar(const Name: string): Boolean;
@@ -28597,9 +33967,9 @@ procedure TSSAGenerator.CollectDynamicArrays(Node: TASTNode);
 // writeback can carry a changed bound back to the caller's array), so its element access must subtract the
 // current lower bound rather than the one fixed at DIM time.
 var
-  i, k, k2: Integer;
+  i, k, k2, RankIdx: Integer;
   Decl, Dims: TASTNode;
-  Nm: string;
+  Nm, RankNm: string;
 begin
   if Node = nil then Exit;
   if (Node.NodeType = antRedim) or (Node.NodeType = antDim) then
@@ -28608,6 +33978,22 @@ begin
       Decl := Node.GetChild(k);
       if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) or
          (Decl.GetChild(0).NodeType <> antIdentifier) then Continue;
+      // ⭐ A DIM whose dimension list is NOT empty STATES the array's rank, and everything after it -
+      // a ReDim, an access - must agree. A "Dim a()" states none.
+      if Node.NodeType = antDim then
+      begin
+        RankNm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        if (FRankStatedArrays.IndexOf(RankNm) >= 0) or (FRankPoisoned.IndexOf(RankNm) >= 0) then
+        begin
+          // Declared before: one name with two declarations has no single rank we may speak for.
+          RankIdx := FRankStatedArrays.IndexOf(RankNm);
+          if RankIdx >= 0 then FRankStatedArrays.Delete(RankIdx);
+          if FRankPoisoned.IndexOf(RankNm) < 0 then FRankPoisoned.Add(RankNm);
+        end
+        else if (Decl.ChildCount >= 2) and (Decl.GetChild(1).NodeType = antDimensions) and
+                (Decl.GetChild(1).ChildCount > 0) then
+          FRankStatedArrays.Add(RankNm);
+      end;
       // A REDIM target is always dynamic. A DIM is dynamic only when declared empty (no subscripts).
       if Node.NodeType = antDim then
       begin
@@ -28759,6 +34145,12 @@ begin
   case Node.NodeType of
     antIdentifier:
       Result := IsWStringVar(VarToStr(Node.Value));
+    antLiteral:
+      // ⛔ AN ESCAPED LITERAL THAT NAMED A CODEPOINT IS WIDE, and this case had no arm at all - so
+      // "Left(!"\u3041\u3043\u3045", 2)" counted BYTES and answered one garbage codepoint where fbc
+      // answers two. The expanded value is UTF-8 and says nothing about how it was written; the lexer's
+      // WideLiteral mark on the token is what still does.
+      Result := Assigned(Node.Token) and Node.Token.WideLiteral;
     antParentheses:
       Result := (Node.ChildCount >= 1) and IsWStringExpr(Node.GetChild(0));
     antMemberAccess:
@@ -28788,16 +34180,28 @@ function TSSAGenerator.IsAddrLocal(const Name: string): Boolean;
 // An @-taken variable declared inside the CURRENT SUB/FUNCTION: backed by a per-frame 1-field record so
 // its address is distinct per recursion level. FAddrLocalVars is rebuilt per procedure (populated by
 // ProcessDim, cleared at the prologue), so a module-level @-taken var of the same name is never matched.
+// ⭐ ...and an OPEN BLOCK that declared this name answers first: the marking is retroactive by name,
+// so a bare-name lookup would hand this block the backing of a same-named declaration in another one
+// (BlockScalarName, DIVERGENZE 56). Where a block declared it, there is NO fallback to the bare entry:
+// a block that declared the name and did not put it here has it backed some other way, and that is the
+// answer, not a reason to go and read another declaration's.
+var
+  m: string;
 begin
+  m := BlockScalarName(Name);
+  if m <> '' then Exit(FAddrLocalVars.IndexOfName(m) >= 0);
   Result := FAddrLocalVars.IndexOfName(UpperCase(Name)) >= 0;
 end;
 
 function TSSAGenerator.AddrLocalBank(const Name: string): TSSARegisterType;
 var
   idx: Integer;
+  m: string;
 begin
   Result := srtInt;
-  idx := FAddrLocalVars.IndexOfName(UpperCase(Name));
+  m := BlockScalarName(Name);
+  if m = '' then m := UpperCase(Name);
+  idx := FAddrLocalVars.IndexOfName(m);
   if idx >= 0 then Result := TypeNameToBank(FAddrLocalVars.ValueFromIndex[idx], Name);
 end;
 
@@ -28818,9 +34222,12 @@ end;
 function TSSAGenerator.AddrLocalType(const Name: string): string;
 var
   idx: Integer;
+  m: string;
 begin
   Result := 'INTEGER';
-  idx := FAddrLocalVars.IndexOfName(UpperCase(Name));
+  m := BlockScalarName(Name);          // this block's own declaration, if it made one (DIVERGENZE 56)
+  if m = '' then m := UpperCase(Name);
+  idx := FAddrLocalVars.IndexOfName(m);
   if idx >= 0 then Result := UpperCase(FAddrLocalVars.ValueFromIndex[idx]);
 end;
 
@@ -28846,7 +34253,7 @@ begin
   Nm := UpperCase(Name);
   if not IsAddrLocal(Nm) then Exit;
   if (AddrLocalType(Nm) <> 'ZSTRING') and (AddrLocalType(Nm) <> 'WSTRING') then Exit;
-  Chars := StrToIntDef(FZStringVars.Values[Nm], 0);       // stored as n-1 characters
+  Chars := StrCapOf(FZStringVars, Nm, 0);                 // stored as n-1 characters
   if Chars <= 0 then Exit;
   if AddrLocalType(Nm) = 'WSTRING' then Result := (Chars + 1) * 2 else Result := Chars + 1;
 end;
@@ -28870,16 +34277,23 @@ function TSSAGenerator.IsRawModuleScalar(const Name: string): Boolean;
 // A MODULE-level @-taken builtin scalar (not STRING): backed by a raw byte slot whose address is kept in
 // a SHARED int array, so its @/deref are bit-exact (type-punnable) and visible in every procedure. Never
 // matched for a name shadowed by a local/param (those resolve first), like IsSharedScalar.
+var
+  m: string;
 begin
-  Result := (FRawModuleScalars.IndexOfName(UpperCase(Name)) >= 0) and not SharedScalarShadowed(Name);
+  m := BlockScalarName(Name);          // this block's own declaration, if it made one (DIVERGENZE 56)
+  if m = '' then m := UpperCase(Name);
+  Result := (FRawModuleScalars.IndexOfName(m) >= 0) and not SharedScalarShadowed(Name);
 end;
 
 function TSSAGenerator.RawModuleScalarType(const Name: string): string;
 var
   idx: Integer;
+  m: string;
 begin
   Result := 'INTEGER';
-  idx := FRawModuleScalars.IndexOfName(UpperCase(Name));
+  m := BlockScalarName(Name);
+  if m = '' then m := UpperCase(Name);
+  idx := FRawModuleScalars.IndexOfName(m);
   if idx >= 0 then Result := UpperCase(FRawModuleScalars.ValueFromIndex[idx]);
 end;
 
@@ -28931,6 +34345,7 @@ function TSSAGenerator.DerefedType(Node: TASTNode): string;
 // is not dereferenceable.
 var
   T: string;
+  OwnerIdx: Integer;
 begin
   Result := '';
   if Node = nil then Exit;
@@ -28950,28 +34365,100 @@ begin
     // *CPtr(T Ptr, x) / *Cast(T Ptr, x): the cast names the pointee outright - the deref must
     // read at T's width and signedness, not at the width of x's original declaration
     // ("*CPtr(Byte Ptr, @int32val)" reads ONE signed byte: fbc prints -128 for &h80).
-    T := UpperCase(VarToStr(Node.Value));
+    // ⛔ ...and an UNRESOLVED "Cast(TypeOf(x), ...)" still carries the MARKER as its type. This is
+    // asked for the PRINT KIND, which runs before the cast is lowered, so "Peek(TypeOf(b), pb)" on a
+    // UByte printed with a sign column where "Peek(UByte, pb)" beside it did not. DeclaredTypeNameOf
+    // already resolves that shape and says so in its own note; this is the second reader of the same
+    // question, and it had the first half of the rule only.
+    T := UpperCase(DeclaredTypeNameOf(Node));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
   end
+  else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antCast) then
+    // ⛔ "@Cast(T, x)" NAMES ITS POINTEE OUTRIGHT, and this reader had no arm for the address-of at all.
+    // "*(@Cast(UByte, b(0)) + 1)" - fbc's own optimizations/derefaddrof - read the byte SIGNED, at the
+    // array's declared element type, and answered -22 where fbc answers 234. The cast is there to say
+    // what width and signedness to read at; taking its address does not take that away.
+    Result := UpperCase(VarToStr(Node.GetChild(0).Value))
+  else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
+  begin
+    // ⭐ "*obj.field" WHERE THE FIELD IS THE POINTER. Every arm above asks a registry keyed on a
+    // VARIABLE - a DIM'd pointer, a pointer parameter, an array element - and a field's pointee is
+    // recorded on the TYPE, so none of them could see it. The result was '' and the member read fell
+    // through to a path that answered a stale register: "(*b.aptr).x" printed 1 where fbc prints 1234,
+    // while "b.aptr->x" and "(*p).x" through a local both printed it correctly. Same defect the fbc
+    // suite carries as pointers/field_deref.
+    // The two registries are asked in the order their readers already use: the RAW scalar pointee
+    // first (that helper resolves the owner itself, nested "a.b.field" included), then the UDT one.
+    Result := UpperCase(MemberRawPtrPointee(Node));
+    if Result = '' then
+    begin
+      OwnerIdx := FindUDT(UpperCase(ObjectTypeName(Node.GetChild(0))));
+      if OwnerIdx >= 0 then
+      begin
+        Result := UpperCase(UDTFieldPtrPointee(OwnerIdx, VarToStr(Node.Value)));
+        // ...and the MULTI-level shape, which neither of the two registries above can hold: "As T Ptr
+        // Ptr" points at a "T PTR", and answering '' for it made every dereference of such a field read
+        // a stale register. See the note on the MultiPtrPointee record field.
+        if Result = '' then
+          Result := UpperCase(UDTFieldMultiPtrPointee(OwnerIdx, VarToStr(Node.Value)));
+      end;
+    end;
+  end
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    // An element of an ARRAY OF POINTERS: "*(arr(i))" reads what that element points to. The element's
+    // pointee is recorded by the DIM - a UDT one and a scalar one in two registries, kept apart because
+    // their readers assume different things - and both are asked through ArrayFactKey, so the answer
+    // belongs to the declaration this scope can see.
+    T := UpperCase(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(Node.GetChild(0).Value))]);
+    if T = '' then T := UpperCase(FArrayPtrPointee.Values[ArrayFactKey(VarToStr(Node.GetChild(0).Value))]);
+    // ⛔⛔ ...AND WHEN NEITHER REGISTRY ANSWERS, THE NAME IS NOT AN ARRAY AT ALL - it is a MULTI-LEVEL
+    // POINTER, and "p[i]" is of p's pointee type, so dereferencing it strips one more PTR level. That
+    // rule was written, in its own arm at the bottom of this case - with the IDENTICAL guard, so this
+    // arm always won and the one below could never run. Dead since the day it was added: "(*pp[0]).i"
+    // on a "T Ptr Ptr" printed the packed address where fbc prints the field, while "pp[0]->i" beside
+    // it was right. Two arms for one shape is how it happened; there is one now.
+    if T = '' then
+    begin
+      T := UpperCase(ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)));
+      if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+        T := Trim(Copy(T, 1, Length(T) - 4))
+      else
+        T := '';
+    end;
+    Result := T;
+  end
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
   begin
-    if (Node.GetChild(0).NodeType = antIdentifier) and
+    // ⛔ ...AND THE POINTER OPERAND MAY BE A CAST, not only a name. "*(Cast(UByte Ptr, @i) + 1)" is the
+    // spelling FreeBASIC's own examples use for walking bytes, and this arm asked only about an
+    // IDENTIFIER - so the pointee came back '' and the read printed with a sign column ("  200" for
+    // "200"). The cast arm above already resolves a cast's declared type; this follows it through the
+    // arithmetic, which is what the arm's own header says it does.
+    // ⛔ ...AND IT MAY BE A FIELD. "*(b.lpp + 1)" walks a pointer held in a member, and this arm knew
+    // a cast and a name only - so the pointee came back '' and the read answered a stale register (1
+    // for 20), while "b.lpp[1]->a", the same walk in the other spelling, was right once its own rung
+    // existed. The member arm above resolves a field's pointee at any level; this follows it through
+    // the arithmetic, which is what this arm's own header says it does.
+    if (Node.GetChild(0).NodeType = antCast) and (DerefedType(Node.GetChild(0)) <> '') then
+      Result := DerefedType(Node.GetChild(0))
+    else if (Node.GetChild(0).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess,
+                                           antProcAddress]) and
+            (DerefedType(Node.GetChild(0)) <> '') then
+      Result := DerefedType(Node.GetChild(0))
+    else if (Node.GetChild(1).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess,
+                                           antProcAddress]) and
+            (DerefedType(Node.GetChild(1)) <> '') then
+      Result := DerefedType(Node.GetChild(1))
+    else if (Node.GetChild(0).NodeType = antIdentifier) and
        (ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)) <> '') then
       Result := DerefedType(Node.GetChild(0))
     else if (Node.GetChild(1).NodeType = antIdentifier) and
             (ManagedPtrPointee(VarToStr(Node.GetChild(1).Value)) <> '') then
       Result := DerefedType(Node.GetChild(1));
-  end
-  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
-          (Node.GetChild(0).NodeType = antIdentifier) then
-  begin
-    // "*p[i]" on a MULTI-LEVEL pointer: p[i] is itself of p's pointee type, so dereferencing it strips
-    // one more PTR level. Only the composed spelling was missing -- "q = p[i] : *q" already worked, in
-    // two statements, which is what made the gap look like a deref bug rather than a typing one.
-    T := UpperCase(ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)));
-    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
-      Result := Trim(Copy(T, 1, Length(T) - 4));
   end;
 end;
 
@@ -29002,9 +34489,38 @@ var
   Indices: array of TSSAValue;
   LinearIndex, TempVal, AddResult, StrideVal, MulResult, BaseVal: TSSAValue;
   TempReg, Stride: Integer;
-  RawFieldPointee, RecTypeName: string;
+  RawFieldPointee, RecTypeName, BaseTypeName: string;
   AddrNd: TASTNode;
+  MArrHandle, MArrIdx: TSSAValue;
+  MArrBank: TSSARegisterType;
+  ElemSz: Int64;
 begin
+  // ⭐ "@UDT.a(i)" / "@x.a(i)" where a is a STATIC ARRAY member: the element belongs to the backing
+  // global array, so the whole ladder below works once the reference names it. Every rung here is
+  // indexed by the array NAME, and the member spelling arrived with the FIELD name alone: "Cannot take
+  // address of element of undeclared array: A0".
+  AddrNd := RewriteStaticMemberArray(Node);
+  if AddrNd <> nil then
+  begin
+    try EmitArrayElementAddress(AddrNd, Result); finally AddrNd.Free; end;
+    Exit;
+  end;
+  // ⭐ "@x[1]" where x is a UDT with a BYREF index operator: the operator IS what names the place, and
+  // it hands its address back already - the very protocol "x[1] = v" uses. Every rung of the ladder
+  // below is indexed by an array NAME, so this fell off the end as "Cannot take address of element of
+  // undeclared array: X" while the assignment through the same operator worked.
+  RecTypeName := IndexOperatorLabel(Node, BaseTypeName);
+  if (RecTypeName <> '') and ByrefRetByAddress(RecTypeName) and (Node.ChildCount >= 2) then
+  begin
+    // ⛔ ...and when the referenced thing is a UDT, its "address" IS ITS RECORD HANDLE - that is what
+    // the managed model means by a "T Ptr", and what "@x" of a UDT variable answers. Asking for the
+    // raw staged address instead handed back the packed address of the callee's THIS slot, so
+    // "@x[1] = @x" was false where fbc says true. The deref is the handle: WantAddress stays off.
+    ProcessMethodCall(Node.GetChild(0), BaseTypeName, 'OPERATOR[]', Node.GetChild(1), Result, False,
+                      FindUDT(ByrefRetPointeeType(RecTypeName)) < 0);
+    Result := EnsureIntRegister(Result);
+    Exit;
+  end;
   // @obj.field[i] where obj.field is a raw "<scalar> PTR" field: FreeBASIC "@field[i]" ≡ "field + i", the
   // SizeOf-scaled byte address a "field[i]" deref computes. Return it directly (child0 is a member access,
   // not a declared-array identifier, so the name-based path below would fail).
@@ -29017,6 +34533,27 @@ begin
       Result := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), RawFieldPointee);
       Exit;
     end;
+  end;
+  // @obj.arr(i) where arr is a UDT ARRAY MEMBER. The packing is the same as a module array's below, with
+  // one difference that is the whole reason this branch exists: the array id is not known while compiling
+  // - a member array is allocated in FArrays per INSTANCE - so the base is built from the handle the field
+  // holds at RUN TIME instead of from a constant. Without it "@this.v(i)" raised "Cannot take address of
+  // element of undeclared array: V", and with it an "Operator [] ByRef" backed by a member array becomes
+  // assignable, which is the shape the operator is normally written in.
+  if (Node.GetChild(0).NodeType = antMemberAccess) and
+     IsMemberArrayAccess(Node, MArrHandle, MArrBank, MArrIdx) then
+  begin
+    TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, TempVal, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    AddResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, AddResult, MArrHandle, TempVal, MakeSSAValue(svkNone));
+    StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(POINTER_ARRAY_SHIFT), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaShl, MulResult, AddResult, StrideVal, MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Result, MulResult, MArrIdx, MakeSSAValue(svkNone));
+    Exit;
   end;
   ArrName := VarToStr(Node.GetChild(0).Value);
   ArrayIdx := ArrayIndexOf(ArrName);
@@ -29067,6 +34604,67 @@ begin
       Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitXferLoad(srtInt, XFER_RESULT_SLOT, Result);   // the address the function returned
       Exit;
+    end;
+    // "@type<T>( ... )" / "@T( ... )": the operand is not an array access at all, it is an anonymous
+    // TEMPORARY of a declared UDT - fbc's own suite passes one BYREF that way. In the managed model a
+    // "T Ptr" IS the record handle, so the address of the temporary is the temporary: build it and hand
+    // its handle back. Same guard as the temporary hook in ProcessExpression (a real array of that name
+    // still wins), so the two paths cannot disagree about what a name means.
+    if IsTypeCtorTemporary(Node) and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) then
+      if EmitUDTTemporary(ArrName, Node.GetChild(1), Result) then Exit;
+    // "@wstr(expr)": WSTR produces a WIDE string, and its address is the address of that UCS-2
+    // TEMPORARY - the very thing the WSTRING PTR argument conversion now materialises. It arrives here
+    // as an antArrayAccess named WSTR (that is how a call with no declaration parses) and fell out of
+    // the ladder with "Cannot take address of element of undeclared array: WSTR", which names the
+    // spelling rather than the problem. Evaluated as the call it is, then handed a temporary.
+    if (UpperCase(ArrName) = 'WSTR') and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 1) then
+    begin
+      ProcessExpression(Node, TempVal);
+      if TempVal.Kind <> svkNone then
+      begin
+        Result := EmitWStringTempAddr(TempVal);
+        Exit;
+      end;
+    end;
+    // ⛔ ...AND THE BASE NEED NOT BE A NAME AT ALL. Every rung of this ladder is indexed by ArrName, so
+    // "@(strptr(s)[1])" - whose base is a CALL - arrived with an EMPTY name and fell off the end with a
+    // message that names nothing ("undeclared array: "). The same thing through a variable,
+    // "q = strptr(s) : @(q[1])", has always worked, which is what said the gap was the NAME and not the
+    // indexing. Answered here for the bases whose pointee this generator can actually name: a string
+    // DATA pointer (SADD/STRPTR and that plus an offset), and any expression with a declared "T PTR"
+    // type. Anything else still raises - a wrong scale would be worse than a refusal.
+    if (Node.GetChild(0).NodeType <> antIdentifier) and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+    begin
+      BaseTypeName := UpperCase(DeclaredTypeNameOf(Node.GetChild(0)));
+      if IsStrDataPtrExpr(Node.GetChild(0)) then
+        ElemSz := 1                                  // a string's data pointer addresses BYTES
+      else if RawPtrExprName(Node.GetChild(0)) <> '' then
+        // "p ± n" over a raw pointer VARIABLE: the same name-based question the p[i] path asks.
+        ElemSz := RawElemSizeOf(RawPtrExprName(Node.GetChild(0)))
+      else if (Length(BaseTypeName) > 4) and (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') then
+        ElemSz := RawElemSizeOfPointee(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
+      else
+        ElemSz := 0;                                 // nothing here can name the pointee: refuse below
+      if ElemSz > 0 then
+      begin
+        ProcessExpression(Node.GetChild(0), BaseVal);
+        ProcessExpression(Node.GetChild(1).GetChild(0), TempVal);
+        TempVal := EnsureIntRegister(TempVal);
+        if ElemSz > 1 then
+        begin
+          StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(ElemSz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaMulInt, MulResult, TempVal, StrideVal, MakeSSAValue(svkNone));
+          TempVal := MulResult;
+        end;
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, Result, EnsureIntRegister(BaseVal), TempVal, MakeSSAValue(svkNone));
+        Exit;
+      end;
     end;
     raise Exception.CreateFmt('Cannot take address of element of undeclared array: %s', [ArrName]);
   end;
@@ -29159,13 +34757,270 @@ begin
   EmitInstruction(ssaAddInt, Result, BaseVal, LinearIndex, MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.AllocOperatorLabel(const TypeName, OpName: string): string;
+// The label of a type's own allocation operator - "Operator T.New(size) As T Ptr" / "Operator
+// T.Delete(p)" - walking the inheritance chain, or '' when the type has none.
+//
+// ⛔ These were PARSED, DEFINED and never CALLED: "New T" used the built-in allocator and the operator's
+// body was compiled unreachable, so a program that pools its objects allocated from the pool never, and
+// its "Deallocate" never ran. A silent gap, with no diagnostic anywhere.
+// ⭐ What made it fixable is a MEASUREMENT that contradicted the comment beside the placement-new
+// refusal ("our records are managed handles, not objects at an address the program chose"): a "T Ptr"
+// pointed at CAllocate'd memory KEEPS that address, lays the type over those bytes, and construction,
+// field access, method calls and destruction on it all match fbc byte for byte - a String member
+// included. So the operator really can own the storage, and does.
+begin
+  Result := '';
+  if TypeName = '' then Exit;
+  Result := ResolveMethodLabel(TypeName, OpName);
+end;
+
+procedure TSSAGenerator.CheckArrayByteSize(const ArrName, ElemTypeName: string;
+  Elems, ElemBytes: Int64);
+// FreeBASIC's "error 50: Array too big", and the limit is on BYTES, not on elements: the whole array
+// must fit in a signed 32-bit size. Measured by bisecting fbc 1.10.1 rather than read anywhere -
+// 2147483647 bytes of BYTE are accepted and one more is not, 1073741823 SHORTs (2147483646 bytes) are
+// accepted and one more is not. ⚠️ For an 8-byte element fbc stops one element earlier than the byte
+// count alone predicts; being one element MORE permissive is the safe direction (it costs a test of
+// its suite, never a valid program), so the rule stays the plain byte cap.
+//
+// ⛔ The cap we already had counts ELEMENTS (MAX_ARRAY_ELEMENTS), which is a different question and
+// misses this one entirely: "Dim Shared As UDT test(0 To &h7FFFFFFF \ SizeOf(UDT))" is 67 million
+// elements - comfortably under - and two gigabytes of them.
+begin
+  if (Elems <= 0) or (ElemBytes <= 0) then Exit;
+  if Elems > (2147483647 div ElemBytes) then
+    raise Exception.CreateFmt(
+      'Array too big: "%s" declares %d elements of %s (%d bytes each), which is more than the ' +
+      '2147483647 bytes an array may occupy.',
+      [ArrName, Elems, ElemTypeName, ElemBytes]);
+end;
+
+procedure TSSAGenerator.CheckAllFieldArraySizes;
+// ⛔ WHY THIS IS A PASS OF ITS OWN AND NOT A LINE INSIDE RegisterUDTs. The bound of a field array is
+// routinely written over a module CONST - "Const LIMIT = &h7FFFFFFF : Type C : As Byte t(0 To LIMIT)" -
+// and RegisterUDTs runs BEFORE the constants are collected, so the fold there declines and the check
+// never fires. Asked with a literal bound it worked, asked with a CONST it did not: the same shape of
+// mistake as a registry consulted before it is filled. So the types are walked again, here, once
+// FModuleConstVals holds what a program actually writes.
+var
+  u, f: Integer;
+  ElemW: Int64;
+begin
+  for u := 0 to High(FUDTs) do
+    for f := 0 to High(FUDTs[u].Fields) do
+      if FUDTs[u].Fields[f].ArrayBounds <> nil then
+      begin
+        // ⛔ THREE KINDS OF ELEMENT, THREE PLACES THE WIDTH LIVES. A scalar names its type; an
+        // array-of-UDT leaves ArrayElemScalarType EMPTY and names the type in ArrayElemType; and a
+        // "ZString * n" element is neither - its width is the declared CAPACITY, and TypeSizeBytes of
+        // the bare name answers for a descriptor. Asking only the first left six of fbc's eighteen
+        // array-too-big tests standing, which is how the other two were found.
+        ElemW := 0;
+        if FUDTs[u].Fields[f].StrCapacity > 0 then
+          ElemW := FUDTs[u].Fields[f].StrCapacity
+        else if FUDTs[u].Fields[f].ArrayElemType <> '' then
+          ElemW := TypeSizeBytes(FUDTs[u].Fields[f].ArrayElemType)
+        else if FUDTs[u].Fields[f].ArrayElemScalarType <> '' then
+          ElemW := TypeSizeBytes(FUDTs[u].Fields[f].ArrayElemScalarType);
+        CheckFieldArrayByteSize(FUDTs[u].Name + '.' + FUDTs[u].Fields[f].Name,
+                                FUDTs[u].Fields[f].ArrayBounds, ElemW);
+      end;
+end;
+
+procedure TSSAGenerator.CheckFieldArrayByteSize(const FieldName: string; Bounds: TASTNode;
+  ElemSz: Int64);
+// The byte cap of CheckArrayByteSize, asked of an array declared as a FIELD of a TYPE. That is a
+// different declaration path from a DIM and had no size check at all: ten of fbc's eighteen
+// array-too-big tests are written that way.
+// Bounds are folded with the same evaluator the field LAYOUT uses (TryFoldConstIntExpr), so a bound
+// this routine cannot fold is one the layout cannot fold either - and it declines instead of guessing.
+var
+  di: Integer;
+  Lb, Ub, Count: Int64;
+  D: TASTNode;
+begin
+  if (Bounds = nil) or (Bounds.ChildCount = 0) or (ElemSz <= 0) then Exit;
+  Count := 1;
+  for di := 0 to Bounds.ChildCount - 1 do
+  begin
+    D := Bounds.GetChild(di);
+    if D.NodeType = antDimRange then
+    begin
+      if D.ChildCount < 2 then Exit;
+      if not TryFoldConstIntExpr(D.GetChild(0), Lb) then Exit;
+      if not TryFoldConstIntExpr(D.GetChild(1), Ub) then Exit;
+    end
+    else
+    begin
+      Lb := 0;
+      if not TryFoldConstIntExpr(D, Ub) then Exit;
+    end;
+    if Ub < Lb then Exit;
+    Count := Count * (Ub - Lb + 1);
+    if Count <= 0 then Exit;                       // overflowed the fold itself: not our diagnostic
+  end;
+  CheckArrayByteSize(FieldName, IntToStr(ElemSz) + ' bytes', Count, ElemSz);
+end;
+
+procedure TSSAGenerator.CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);
+// FreeBASIC counts the values of an aggregate initialiser against the SLOTS the type actually has and
+// answers "error 67: Too many expressions" when there are more.
+//
+// ⛔⛔ A UNION IS AS WIDE AS ITS FIRST MEMBER, NOT ONE SLOT. The members share the storage, so only the
+// FIRST can be initialised - but that member may be an anonymous "Type ... End Type" block of several
+// fields, and then the union takes that many:
+//     Union U : Type : a : b : End Type : End Union      ->  "(1, 2)" is legal
+//     Union U : a : b : End Union                        ->  "(1, 2)" is not
+// The first shipped version of this said ONE, and refused two of fbc's own tests. ⛔ AND THEY SHOWED UP
+// AS **CUERR**, NOT AS A B1 FAILURE: dim/union-init and pointers/new-delete are fbcunit files, and a
+// wrong refusal inside one never reaches COMPILE_ONLY_OK at all - it just stops the file producing
+// assertions. So "B2 up and B1 flat" is not sufficient on its own; a rise in CUERR after adding a
+// refusal is a SUSPECT. That is how these two were found, and both times.
+//
+// ⭐ Two spellings of one fact, asked together: a WHOLE-TYPE union carries IsUnion and leaves
+// UnionGroup at 0, while a "Union ... End Union" block written inside a Type numbers its fields. The
+// walk below treats the whole type as one group in the first case and each block as a group in the
+// second, and asks the same question of both.
+// ⚠️ Only TOO MANY is refused. Too few is legal everywhere - the rest keep their defaults.
+var
+  i, Slots, Grp, SGrp: Integer;
+
+  function SameGroup(k: Integer): Boolean;
+  // Is field k still in the group the walk is inside? For a whole-type union that is "any field".
+  begin
+    Result := (k <= High(FUDTs[UDTIdx].Fields)) and
+              (FUDTs[UDTIdx].IsUnion or (FUDTs[UDTIdx].Fields[k].UnionGroup = Grp));
+  end;
+
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (ArgsNode = nil) then Exit;
+  Slots := 0;
+  i := 0;
+  while i <= High(FUDTs[UDTIdx].Fields) do
+  begin
+    if FUDTs[UDTIdx].IsUnion or (FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) then
+    begin
+      Grp := FUDTs[UDTIdx].Fields[i].UnionGroup;
+      // the group's FIRST member: a run sharing one anonymous-struct number, or a single field
+      SGrp := FUDTs[UDTIdx].Fields[i].StructGroup;
+      if SGrp <> 0 then
+        while SameGroup(i) and (FUDTs[UDTIdx].Fields[i].StructGroup = SGrp) do
+        begin Inc(Slots); Inc(i); end
+      else
+      begin Inc(Slots); Inc(i); end;
+      while SameGroup(i) do Inc(i);          // the other members share the storage: no slot of their own
+    end
+    else
+    begin Inc(Slots); Inc(i); end;
+  end;
+  if (Slots > 0) and (ArgsNode.ChildCount > Slots) then
+    raise Exception.CreateFmt(
+      'Too many expressions: the initialiser gives %d values to "%s", which has %d slot(s) to fill. ' +
+      'A UNION is as wide as its FIRST member however many it holds - they share the storage.',
+      [ArgsNode.ChildCount, FUDTs[UDTIdx].Name, Slots]);
+end;
+
+procedure TSSAGenerator.CheckPointerConstAssign(Decl: TASTNode);
+// FreeBASIC's rule for initialising one pointer from another, and it is ONE rule: **a const may not be
+// dropped at any dereference level**. Not the base type - "Byte Ptr = UByte Ptr" is legal - and not the
+// depth - "Byte Ptr = UByte Ptr Ptr" is legal too. Only the qualifiers.
+//
+// ⭐ THE RULE WAS NOT REASONED OUT, IT WAS FITTED. fbc's own suite carries 183 "const/assign-<lhs>-from-
+// <rhs>" tests, 123 of them COMPILE_ONLY_OK and 60 COMPILE_ONLY_FAIL: read as a specification instead of
+// as a scoreboard, they ARE the rule, with both directions given. A first attempt modelled C++'s
+// qualification conversion (base types, depths, the const-ification clause) and disagreed with fbc on
+// 46 of the 183. This one agrees on 183 of 183.
+//
+// The chain is stored per level, base first, as the parser wrote it ("Const UByte Const Ptr Ptr" ->
+// "110"). Level j counts dereferences from the variable: quals[0] is the variable itself (irrelevant
+// here - it says whether the NAME may be reassigned, which is a different diagnostic), quals[j>=1] is
+// what j dereferences reach. In source order the chain is base-first, so it is read backwards.
+var
+  LName, RName, LQ, RQ: string;
+  j, n: Integer;
+
+  function LevelConst(const Chain: string; Depth, Level: Integer): Boolean;
+  // Chain[1] is the BASE, Chain[2..] the pointer levels in SOURCE order. Level 1 is one dereference
+  // from the variable, i.e. the OUTERMOST pointer's pointee, i.e. the LAST character; level Depth is
+  // the base.
+  begin
+    if Level >= Depth then Exit(Chain[1] = '1');
+    Result := Chain[1 + Depth - Level] = '1';
+  end;
+
+begin
+  if (FVarPtrQuals = nil) or (Decl = nil) or (Decl.ChildCount < 3) then Exit;
+  if Decl.GetChild(0).NodeType <> antIdentifier then Exit;
+  if Decl.GetChild(2).NodeType <> antIdentifier then Exit;     // only "= <another variable>" for now
+  LName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+  RName := UpperCase(VarToStr(Decl.GetChild(2).Value));
+  // ⛔ The DESTINATION is the declaration being lowered right now, so its chain is on the NODE - it is
+  // not in the registry yet, and must not be: registering it first would let a name shadow itself.
+  LQ := Decl.Attributes.Values['PTRQUALS'];
+  RQ := FVarPtrQuals.Values[RName];
+  if (LQ = '') or (RQ = '') then Exit;                          // one side is not a declared pointer
+  n := Length(LQ) - 1;                                          // the destination's pointer depth
+  if Length(RQ) - 1 < n then n := Length(RQ) - 1;               // ...or the source's, whichever is less
+  for j := 1 to n do
+    if LevelConst(RQ, Length(RQ) - 1, j) and not LevelConst(LQ, Length(LQ) - 1, j) then
+      raise Exception.CreateFmt(
+        'Invalid assignment/conversion: "%s" would drop the CONST that "%s" carries %d dereference(s) ' +
+        'down. FreeBASIC lets a pointer assignment ADD a const at any level and never remove one.',
+        [LName, RName, j]);
+end;
+
+function TSSAGenerator.TypeHasMemberProc(const TypeName: string): Boolean;
+// Does an object of this type have anything to RUN on it - a constructor, a destructor, a method, a
+// property, an operator other than New/Delete? Walks the chain: an inherited method is still a method.
+//
+// ⛔ THIS IS THE GATE ON A CUSTOM ALLOCATOR, and it is the honest half of it. "Operator T.New" answers
+// raw bytes, and an object living in raw bytes cannot run a method: a method body is compiled ONCE
+// against record SLOTS and its THIS is a record handle, so "p->Show()" on a raw address faults.
+// Measured, and the measurement is what narrowed the change: "Dim As T Ptr p = CAllocate(...)" appears
+// to run methods fine, but only because that spelling does NOT mark p raw - a managed record is
+// allocated and the address is dropped. The genuinely raw spelling faults, with or without an operator.
+// ⇒ Where the type has nothing to run, the operator owns the storage and the program matches fbc.
+//   Where it has, the built-in allocator is used and the operator is not called - the gap that remains,
+//   whose cure is "a method must be able to take a raw THIS", not "call the operator".
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Idx := FindUDT(T);
+    if Idx < 0 then Exit;
+    if Assigned(FUDTs[Idx].Node) and
+       (FUDTs[Idx].Node.Attributes.Values['HASMEMBERPROC'] = '1') then Exit(True);
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;
+// The same question as AllocOperatorLabel, asked from a PRE-PASS that runs before the procedure table
+// exists. CollectRawPtrVars has to know whether "New T" will answer an address or a record handle, and
+// it runs at 38312 while PreCollectProcedures fills FProcDecls at 38391 - so a label lookup there is
+// always empty and the mark was never applied ("p->i = 3" then faulted on the first store).
+// The DECLARATION inside the TYPE is already recorded by then, under the access stamp every member
+// carries since visibility became a rule; walking the chain is what MemberAccessLevel does.
+var
+  Owner: string;
+begin
+  Result := (TypeName <> '') and (MemberAccessLevel(TypeName, OpName, Owner) <> '');
+end;
+
 procedure TSSAGenerator.EmitNewObject(Node: TASTNode; out Result: TSSAValue);
 // FreeBASIC "NEW T" / "NEW T(args)": allocate a record on the heap and run its constructor; evaluates
 // to the record handle (int), assignable to a "T PTR". The record is allocated in the SHARED region
 // (immediate bit 48) so it is NOT reclaimed at the allocating frame's exit — the pointer keeps it
 // alive until DELETE. Member access through the pointer (p->field) routes via the handle as usual.
 var
-  NewType: string;
+  NewType, OpLbl: string;
   UDTIdx: Integer;
   CountVal, ElemVal, BytesVal: TSSAValue;
 begin
@@ -29244,6 +35099,27 @@ begin
   if Node.Attributes.Values['PLACEMENT'] = '1' then
     ProcessExpression(Node.GetChild(Node.ChildCount - 1), CountVal);
   CheckInstantiable(FUDTs[UDTIdx].Name);           // OOP: NEW of an abstract type refuses here
+  // The type's OWN allocator, if it declares one. fbc hands it SizeOf(T) and builds the object on what
+  // it answers; the operator has no THIS of its own (it is implicitly static), so the slot is passed 0.
+  // Construction then runs on that address exactly as an explicit "p->Constructor()" on allocated
+  // memory does - which is the sequence this was measured against.
+  OpLbl := AllocOperatorLabel(NewType, 'OPERATORNEW');
+  if OpLbl <> '' then CheckMemberAccess(NewType, 'OPERATORNEW');   // reaching it is reaching it
+  if (OpLbl <> '') and (not TypeHasMemberProc(NewType)) then
+  begin
+    ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ElemVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Result := EmitIterOperatorCall(OpLbl, MakeSSAConstInt(0), ElemVal, MakeSSAValue(svkNone));
+    if Result.Kind = svkNone then
+      raise Exception.CreateFmt('Operator %s.New must be a FUNCTION returning a pointer', [NewType]);
+    EmitRecordInit(Result, UDTIdx);
+    if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArgumentList) then
+      EmitConstructorCall(Result, NewType, Node.GetChild(0))
+    else
+      EmitConstructorCall(Result, NewType);
+    Exit;
+  end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Result,
                   MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
@@ -29259,7 +35135,7 @@ procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
 // FreeBASIC "DELETE p": run the pointee's destructor (if any), then release the heap record and
 // recycle its slot (ssaRecordFree). Node child0 = the pointer expression (must be a UDT pointer).
 var
-  PtrName, PtrType: string;
+  PtrName, PtrType, OpLbl: string;
   HandleReg, CountReg: TSSAValue;
 begin
   if Node.ChildCount < 1 then Exit;
@@ -29316,6 +35192,35 @@ begin
       EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
+  // "Delete[] This.psbb" / "Delete obj.p": the target is a FIELD that holds the pointer. The field read
+  // yields the handle (or the block address), so destroy and free THAT - the same two shapes the array
+  // element above has, one spelling further out. ⛔ The FIFTH spelling of this statement to be found,
+  // and the first one the inverted rule in ProcessDelete surfaced: before it, this fell into the
+  // line-delete path and freed NOTHING, which is why the manual's udt/operator3 "matched" - the example
+  // does not print what the delete affects.
+  if Node.GetChild(0).NodeType = antMemberAccess then
+  begin
+    // What the field DENOTES: for a "T Ptr" field that is T, which is the same question every
+    // "obj.field->method" already asks. A scalar-pointer field answers '' and is freed as raw bytes.
+    PtrType := UpperCase(ObjectTypeName(Node.GetChild(0)));
+    ProcessExpression(Node.GetChild(0), HandleReg);
+    HandleReg := EnsureIntRegister(HandleReg);
+    if (PtrType <> '') and (FindUDT(PtrType) >= 0) then
+    begin
+      if (Node.Attributes.Values['NEWARRAY'] = '1') and UDTBlockIsManaged(PtrType) then
+      begin
+        CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+        Exit;
+      end;
+      EmitDestructorCall(HandleReg, PtrType);
+      EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end
+    else
+      EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if Node.GetChild(0).NodeType <> antIdentifier then
     raise Exception.Create('DELETE expects a pointer variable');
   PtrName := VarToStr(Node.GetChild(0).Value);
@@ -29346,6 +35251,20 @@ begin
     raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
   HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
   EmitDestructorCall(HandleReg, PtrType);
+  // The type's OWN deallocator, if it declares one: fbc runs the destructor and then hands the POINTER
+  // to "Operator T.Delete(p)", which owns the release. It must be the same pointer its "Operator New"
+  // answered - which it is, because that is what the variable holds. Emitting ssaRecordFree as well
+  // would free storage the operator is about to free again.
+  OpLbl := AllocOperatorLabel(PtrType, 'OPERATORDELETE');
+  if OpLbl <> '' then CheckMemberAccess(PtrType, 'OPERATORDELETE');
+  // ...and it releases the storage only where it OWNED it: the same gate "New" used, so the two halves
+  // of one allocation cannot disagree. Handing a managed handle to a user's "Deallocate" would be a
+  // free of memory this compiler owns - strictly worse than not calling the operator at all.
+  if (OpLbl <> '') and (not TypeHasMemberProc(PtrType)) then
+  begin
+    EmitIterOperatorCall(OpLbl, MakeSSAConstInt(0), HandleReg, MakeSSAValue(svkNone));
+    Exit;
+  end;
   EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
@@ -29363,6 +35282,21 @@ begin
   Result := MakeSSAValue(svkNone);
   if MemberNode.ChildCount < 1 then Exit;
   TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  // ⛔ ...AND "ProcPtr( B.proc1 )" ON AN ABSTRACT METHOD IS NOT A FIELD ADDRESS AT ALL. An abstract
+  // method has no body to point at, and fbc answers 0 for it rather than refusing - the base here is a
+  // TYPE NAME, so ObjectTypeName says nothing and the whole program was refused with a message about
+  // records. The concrete case ("ProcPtr(p, Virtual)") is a declared gap of its own: this VM has no
+  // indexable vtable, and that refusal names itself.
+  if (TypeName = '') and (MemberNode.ChildCount >= 1) and
+     (MemberNode.GetChild(0).NodeType = antIdentifier) and
+     (FindUDT(UpperCase(VarToStr(MemberNode.GetChild(0).Value))) >= 0) and
+     DeclaresAbstractMethod(UpperCase(VarToStr(MemberNode.GetChild(0).Value)),
+                            UpperCase(VarToStr(MemberNode.Value))) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if TypeName = '' then
     raise Exception.Create('Cannot take address of field: object is not a record');
   UDTIdx := FindUDT(TypeName);
@@ -29382,7 +35316,12 @@ function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNod
 var
   PtrReg, IdxVal, SzVal, ScaledIdx: TSSAValue;
 begin
-  PtrReg := EnsureIntRegister(GetOrAllocateVariable(PtrName));
+  // ⛔ The POINTER'S OWN VALUE, read the way that pointer is stored. Asking GetOrAllocateVariable gave
+  // a REGISTER, and an @-taken or SHARED pointer does not live in one - it is array-backed. The emitted
+  // code then added the index to an UNDEFINED register ("AddInt R4, R5, R7" with R5 never written), so
+  // "p[i].field" answered rubbish and p[0] and p[1] gave the SAME wrong answer. ⚠️ The identical program
+  // without "Dim pp As T Ptr Ptr = @p" worked, because without the @ the pointer does stay in a register.
+  PtrReg := RecordHandleOfVar(PtrName);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxVal := EnsureIntRegister(IdxVal);
   if IsRawPtr(PtrName) and (RawElemSizeOf(PtrName) > 1) then
@@ -29398,26 +35337,32 @@ begin
 end;
 
 function TSSAGenerator.EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
-// "Cast(T Ptr, expr)[i]" read in place. Same two address families as EmitPointerIndexAddress, but the
-// base is a VALUE and the pointee comes from the cast's own type instead of a declaration:
-//   RAW     (a byte-heap / framebuffer address): index scaled by SizeOf(pointee), raw load.
-//   MANAGED (an FArrays-backed packed address):  index advances one ELEMENT, ref load.
-// The family is decided by the OPERAND, exactly as it is for a named pointer - a cast reinterprets the
-// type, never the kind of address.
+// "Cast(T Ptr, expr)[i]" read in place: the pointee comes from the cast's own type, and the address
+// family from its OPERAND - a cast reinterprets the type, never the kind of address. The work itself
+// is EmitPointerValueIndexRead's, which every base that is a VALUE rather than a NAME shares.
 var
-  Pointee, TName: string;
-  BaseVal, IdxVal, SzVal, ScaledIdx, AddrVal: TSSAValue;
-  Sz: Int64;
-  Bank: TSSARegisterType;
-  IsRaw: Boolean;
+  TName: string;
 begin
   TName := UpperCase(VarToStr(CastNode.Value));
-  Pointee := Trim(Copy(TName, 1, Length(TName) - 4));    // drop the trailing " PTR"
-  ProcessExpression(CastNode, BaseVal);                  // a pointer cast is a value passthrough
+  Result := EmitPointerValueIndexRead(CastNode, Trim(Copy(TName, 1, Length(TName) - 4)),
+                                      CastNode.GetChild(0), IndicesNode);
+end;
+
+function TSSAGenerator.EmitPointerValueIndexAddress(BaseNode: TASTNode; const Pointee: string;
+                                                    RawSrcNode, IndicesNode: TASTNode;
+                                                    out IsRaw: Boolean): TSSAValue;
+// "<expr>[i]" as an ADDRESS, for the read and the write alike. RawSrcNode is the expression whose
+// address FAMILY decides the arithmetic: a raw byte-heap address scales the index by SizeOf(pointee),
+// a managed (FArrays-backed, packed) one advances by one ELEMENT.
+var
+  BaseVal, IdxVal, SzVal, ScaledIdx: TSSAValue;
+  Sz: Int64;
+begin
+  ProcessExpression(BaseNode, BaseVal);
   BaseVal := EnsureIntRegister(BaseVal);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxVal := EnsureIntRegister(IdxVal);
-  IsRaw := (RawPtrExprName(CastNode.GetChild(0)) <> '') or IsStrDataPtrExpr(CastNode.GetChild(0));
+  IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode);
   if IsRaw then
   begin
     Sz := RawElemSizeOfPointee(Pointee);
@@ -29430,8 +35375,24 @@ begin
       IdxVal := ScaledIdx;
     end;
   end;
-  AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaAddInt, AddrVal, BaseVal, IdxVal, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Result, BaseVal, IdxVal, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitPointerValueIndexRead(BaseNode: TASTNode; const Pointee: string;
+                                                 RawSrcNode, IndicesNode: TASTNode): TSSAValue;
+// "<expr>[i]" where the base is a pointer VALUE rather than a declared pointer NAME. Same two address
+// families as EmitPointerIndexAddress:
+//   RAW     (a byte-heap / framebuffer address): index scaled by SizeOf(pointee), raw load.
+//   MANAGED (an FArrays-backed packed address):  index advances one ELEMENT, ref load.
+// RawSrcNode is the expression whose ADDRESS FAMILY decides between them (for a cast, the operand it
+// reinterprets; for a plain expression, itself).
+var
+  AddrVal: TSSAValue;
+  Bank: TSSARegisterType;
+  IsRaw: Boolean;
+begin
+  AddrVal := EmitPointerValueIndexAddress(BaseNode, Pointee, RawSrcNode, IndicesNode, IsRaw);
 
   // A UDT pointee: the record's VALUE is its handle, and base+i IS that handle for a managed block.
   if FindUDT(Pointee) >= 0 then
@@ -29523,9 +35484,23 @@ begin
   // pointer, and the very ssaRefLoad/ssaRefStore the byref-return machinery uses know how to follow one -
   // so calling it non-addressable made the operator a VALUE return and the assignment was refused.
   if N.NodeType = antMemberAccess then Exit(True);
-  Result := (N.NodeType = antArrayAccess) and (N.Attributes.Values['BRACKET'] = '1') and
-            (N.ChildCount >= 2) and
-            (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]);
+  // ...and a DEREFERENCE, "*<expr>", whose address is the pointer itself - nothing has to be taken.
+  // ⛔ This is the shape the fbc suite's reference zstring UDT is written in:
+  // "Operator UZSTRING_FIXED_MUTABLE.Cast() ByRef As ZString : Operator = *Cast(ZString Ptr, @_data)".
+  // Judged non-addressable, the operator became a VALUE return, so the READ half worked and every
+  // write through it was refused - which is what made LSET/RSET on such a UDT unrepresentable.
+  if N.NodeType = antDeref then Exit(True);
+  // ...and an INDEXED element, in EITHER bracketing. "p[i]" is a pointer element and "this.v(i)" is a
+  // member ARRAY element; both have an address now that EmitArrayElementAddress builds a member array's
+  // base from the handle at run time. Only the square bracket used to qualify, so
+  // "Operator T.[]() ByRef As Integer : Return This.v(i)" - the shape an assignable index operator is
+  // normally written in - was judged a VALUE return and "a[2] = 7" fell through to the array store and
+  // died as "Array not declared: A", while the READ half worked. The usual tell of a rule one path has.
+  // ⛔ The round bracket is ambiguous - "f(i)" is also a CALL - so it qualifies only through a FIELD
+  // ("this.v(i)"), where the base cannot be a free function.
+  Result := (N.NodeType = antArrayAccess) and (N.ChildCount >= 2) and
+            (N.GetChild(0).NodeType in [antIdentifier, antMemberAccess]) and
+            ((N.Attributes.Values['BRACKET'] = '1') or (N.GetChild(0).NodeType = antMemberAccess));
 end;
 
 function TSSAGenerator.BodyReturnsRawIndexedElement(Decl: TASTNode): Boolean;
@@ -29782,12 +35757,21 @@ var
   ParamList: TStringList;
   Bar, i, NArgs, Slot, cInt, cFloat, cStr: Integer;
   RetPart: string;
+  RetIsByref: Boolean;
   RT, RetRT: TSSARegisterType;
-  ArgVal, PCVal: TSSAValue;
+  ArgVal, PCVal, AddrVal: TSSAValue;
 begin
   PCVal := PCValIn;
   Bar := Pos('|', Sig);
   RetPart := Copy(Sig, Bar + 1, MaxInt);
+  // "Function(...) ByRef As R": the signature carries a third field, and the call then hands back the
+  // ADDRESS of the referand rather than its value - the same protocol a named BYREF function uses.
+  RetIsByref := False;
+  if (Length(RetPart) > 6) and (Copy(RetPart, Length(RetPart) - 5, 6) = '|BYREF') then
+  begin
+    RetIsByref := True;
+    RetPart := Copy(RetPart, 1, Length(RetPart) - 6);
+  end;
   ParamList := TStringList.Create;
   try
     ParamList.StrictDelimiter := True;
@@ -29822,6 +35806,21 @@ begin
   // Read the result (FUNCTION); a SUB pointer used as a value yields int 0 harmlessly.
   RetRT := srtInt;
   if RetPart <> '' then RetRT := TypeNameToBank(RetPart, '');
+  // A BYREF return arrives as an ADDRESS in the INT result slot; load it there and dereference into the
+  // declared return bank. Read straight out of RetRT's slot it was the packed address itself, which is
+  // what "Print pb()" printed (4294967296) where fbc printed the referand.
+  if RetIsByref and (RetPart <> '') then
+  begin
+    AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitXferLoad(srtInt, XFER_RESULT_SLOT, AddrVal);
+    Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
+    case RetRT of
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    Exit;
+  end;
   Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
   if RetPart <> '' then
     EmitXferLoad(RetRT, XFER_RESULT_SLOT, Result)
@@ -29851,7 +35850,18 @@ begin
   Resolved := ResolveCallLabel(Name, ArgsNode);
   if Resolved <> '' then Name := Resolved;
   RecType := VarRecordTypeName(Name);
-  if RecType <> '' then
+  // ⛔ ...BUT A BYREF RESULT IS NOT A VALUE RETURN, WHATEVER ITS TYPE, AND THIS TEST USED TO COME
+  // FIRST. A "Function pt() ByRef As T" took the by-value branch below because its return type is a
+  // UDT: the caller allocated a fresh record, staged it as the destination, and read the FIELD out of
+  // that throwaway - so "pt().n" answered 0 (or, with another UDT-returning call nearby, whatever that
+  // one had left behind), and "pt().n = 7" wrote into it and vanished.
+  // ⭐ The CALLEE was right all along - the disassembly is what said so: it stages the address of g in
+  // XFER_RESULT_SLOT exactly as the scalar case does, and the caller never looked. So this is an
+  // ORDER, not a missing branch, and the ledger's own note ("the branch must be given to the callee")
+  // was wrong. DIVERGENZE 72/47/44.
+  // ⚠️ ByrefRetByAddress is already false for a body that returns something with no address
+  // (FByrefRetValue), so those keep the value protocol, which is the only thing they can use.
+  if (RecType <> '') and not ByrefRetByAddress(Name) then
   begin
     UDTIdx := FindUDT(RecType);
     RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -29867,6 +35877,7 @@ begin
     EmitArrayArgBinds(Name, ArgsNode, False);         // restore the aliased array slots after the call returns
     EmitVarArgClose(Name);
     EmitByrefWriteback(Name, ArgsNode);   // BYREF: copy explicit-BYREF scalar params back into variable args
+    RegisterResultTemp(RcHandle, RecType);   // V5f: the end of the statement destroys this temporary
     Result := RcHandle;
   end
   else if ByrefRetByAddress(Name) then
@@ -29878,6 +35889,10 @@ begin
     AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitXferLoad(srtInt, XFER_RESULT_SLOT, AddrVal);
     FuncRetType := ByrefRetPointeeBank(Name);
+    // ⛔ A UDT pointee is an INT - a record handle - and ByrefRetPointeeBank cannot say so: it asks
+    // TypeNameToBank, which answers FLOAT for a name it does not recognise, and a UDT name is exactly
+    // that. Asked here, of FindUDT, which answers "no" instead of guessing.
+    if FindUDT(ByrefRetPointeeType(Name)) >= 0 then FuncRetType := srtInt;
     Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
     case FuncRetType of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -29936,35 +35951,25 @@ end;
 
 function TSSAGenerator.ArrayPointerUDTType(const ArrName: string): string;
 // The pointee UDT of an array whose ELEMENTS are UDT pointers ("Dim As T Ptr a(n)", or an
-// "a() As T Ptr" parameter). Scope-aware exactly like ArrayRecordTypeOf: a parameter is recorded under
-// its per-proc mangled name, a DIM under its plain name. Empty when the elements are not UDT pointers.
+// "a() As T Ptr" parameter). The key comes from ArrayFactKey, so it is the DECLARATION's, whichever
+// scope declared it. Empty when the elements are not UDT pointers.
 var
-  nameU, mangled: string;
+  nameU: string;
 begin
   Result := '';
-  nameU := UpperCase(ArrName);
-  if FInProcedure then
-  begin
-    mangled := ParamArrayMangle(FCurrentProcName, nameU);
-    if FArrayPtrPointee.IndexOfName(mangled) >= 0 then Exit(FArrayPtrPointee.Values[mangled]);
-  end;
+  nameU := ArrayFactKey(ArrName);
   if FArrayPtrPointee.IndexOfName(nameU) >= 0 then Result := FArrayPtrPointee.Values[nameU];
 end;
 
 function TSSAGenerator.ArrayRecordTypeOf(const ArrName: string): string;
-// The UDT element type of an array-of-UDT, resolved scope-aware: an array PARAMETER's placeholder is
-// registered under its per-proc mangled name (RegisterArrayParams), so inside a proc body try that name
-// first, then fall back to the module/global array name. Empty if the array is not an array-of-UDT.
+// The UDT element type of an array-of-UDT, keyed by the DECLARATION (ArrayFactKey): a parameter under
+// its placeholder's mangled name, a proc-local DIM under its own, a module array under its plain name.
+// Empty if the array is not an array-of-UDT.
 var
-  nameU, mangled: string;
+  nameU: string;
 begin
   Result := '';
-  nameU := UpperCase(ArrName);
-  if FInProcedure then
-  begin
-    mangled := ParamArrayMangle(FCurrentProcName, nameU);
-    if FArrayRecordType.IndexOfName(mangled) >= 0 then Exit(FArrayRecordType.Values[mangled]);
-  end;
+  nameU := ArrayFactKey(ArrName);
   if FArrayRecordType.IndexOfName(nameU) >= 0 then Result := FArrayRecordType.Values[nameU];
 end;
 
@@ -30088,7 +36093,7 @@ begin
           // An element read of an array declared "AS UInteger/ULongInt" is unsigned too (antArrayAccess
           // with the array name in child 0, which is exactly how U was derived above).
           if not Result and (Node.NodeType = antArrayAccess) then
-            Result := FUnsigned64Arrays.IndexOf(U) >= 0;
+            Result := FUnsigned64Arrays.IndexOf(ArrayFactKey(U)) >= 0;
         end;
       end;
   end;
@@ -30168,6 +36173,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.RecordTypeOfAddrOfObject(Node: TASTNode): string;
+// "(@X)->f" IS "X.f". In the managed model the ADDRESS of a record is its HANDLE - the same value - so
+// an address-of cancels against the arrow exactly as it cancels against a "*" (DerefOfAddrOfTarget,
+// DIVERGENZE 48). fbc's own expressions/addrof-anon writes it over an ANONYMOUS temporary,
+// "(@Type<PodUdt>(111, 222))->a", where there is no name for any rung to key on: the field read
+// answered 0 for a POD and 1 for one with a constructor, in silence.
+// ⛔ TWO NODE SHAPES CARRY THE OPERAND, and only one of them is a CHILD: "@u" of a NAMED variable is an
+// antProcAddress whose VALUE is the name and which has no child at all; only an EXPRESSION operand
+// arrives as a child. Matching the child alone fixed the temporary and left the named one answering 1.
+// ⛔⛔ ASKED HERE AND NOT INSIDE ObjectTypeName, which was the first attempt and cost two tests: that
+// question has other readers, and to them the type of "@u" is a POINTER, not the record. Answering the
+// record there sent structs/udt-ops-2 and -3 from wrong-by-13-assertions to an ACCESS VIOLATION - named
+// by diffing the CUERR sets of the two binaries, not by reading the code. The cancellation belongs to
+// the ONE place that is resolving the object of a member access.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node = nil) or (Node.NodeType <> antProcAddress) then Exit;
+  if (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) then
+    Result := ObjectTypeName(Node.GetChild(0))
+  else
+    Result := VarRecordTypeName(VarToStr(Node.Value));
+end;
+
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
 // The UDT type name of an object expression, without emitting any code. Empty if not a record.
 var
@@ -30175,6 +36205,7 @@ var
   Bank: TSSARegisterType;
   Slot: Integer;
   Lvl, BaseIdx: Integer;
+  CancelObj, IfA: TASTNode;
 begin
   Result := '';
   if ObjNode = nil then Exit;
@@ -30182,6 +36213,29 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐ "IIf(c, u, v)" NAMES A UDT WHEN BOTH ITS BRANCHES DO. An IIF parses as an array access, so this
+  // answered '' for it, the call site's type tail came out empty, and "Dim As T x = IIf(c, u, v)"
+  // resolved its constructor by BANK alone - where a UDT handle is an 'I' exactly like a pointer, and
+  // a converting constructor took the handle as a pointer. The two branches have to AGREE: a mixed
+  // pair has no single record type and answering one of them would be a guess.
+  IfA := IifArgs(ObjNode);
+  if IfA <> nil then
+  begin
+    Result := ObjectTypeName(IfA.GetChild(1));
+    if (Result = '') or not SameText(Result, ObjectTypeName(IfA.GetChild(2))) then Result := '';
+    Exit;
+  end;
+  // ...and "(*@u)" is u - see ResolveRecordObject, which asks the same question about the same node.
+  CancelObj := DerefOfAddrOfTarget(ObjNode);
+  if CancelObj <> nil then
+  begin
+    try
+      Result := ObjectTypeName(CancelObj);
+    finally
+      CancelObj.Free;
+    end;
+    Exit;
+  end;
   // FreeBASIC BASE (and BASE.BASE...): `base` names the base SUBOBJECT of the type being compiled, not a
   // field of it. The parser lowers it to THIS carrying a BASEREF DEPTH, so climb that many EXTENDS levels
   // from the current type. The record HANDLE stays THIS's, and that is exactly what makes this work: the
@@ -30221,7 +36275,25 @@ begin
        (ObjNode.GetChild(0).NodeType = antNew) then
       Result := UpperCase(VarToStr(ObjNode.GetChild(0).Value))
     else
-      Result := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));        // (*p).field
+      // ⛔ ...asked of DerefPointeeUDTType, not of a NAME. This site read the operand's Value directly,
+      // so a pointer with no variable name - a STATIC MEMBER, a Cast - answered nothing: "UDT.p->a"
+      // resolved and "(*UDT.p).a", the same access in FreeBASIC's other spelling, did not.
+      Result := DerefPointeeUDTType(ObjNode.GetChild(0));                   // (*p).field
+    // ⛔ ...and DerefPointeeUDTType is itself a LIST OF SHAPES (a name, a static member, a cast), so a
+    // deref of anything else answered nothing: "(*tpp)->n" with "tpp As T Ptr Ptr" read the packed
+    // address of tpp (4611686018427387904 / 8589934592) where fbc reads the field, while the identical
+    // access written in two steps through a variable was right. DIVERGENZE 45.
+    // ⭐ Asked here of DerefedType, which answers the type of "*operand" for EVERY base it knows -- a
+    // nested deref, pointer arithmetic, a parenthesised expression -- and covers both spellings at
+    // once: the deref of a "T Ptr Ptr" is a "T PTR" and the member access derefs it, the deref of a
+    // "T Ptr" is a "T" and the access is direct.
+    if (Result = '') and (ObjNode.ChildCount >= 1) then
+    begin
+      NestedT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+      if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') then
+        NestedT := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+      if FindUDT(NestedT) >= 0 then Result := NestedT;
+    end;
     if FindUDT(Result) < 0 then Result := '';
   end
   else if ObjNode.NodeType = antArrayAccess then
@@ -30232,7 +36304,11 @@ begin
       Result := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
       // "arr(i)->field": the array's ELEMENTS are UDT pointers, so the element is a record of the
       // pointee type. Mirrors the branch ResolveRecordObject takes to load that element's handle.
-      if Result = '' then
+      // ⛔ ...but NOT when that "array" is a SCALAR'S BACKING: an @-taken pointer is made array-backed
+      // (one element, holding the pointer itself), and answering here made "p[i].field" read p's own
+      // backing instead of indexing what p points at - the index was ignored entirely, so p[0] and
+      // p[1] gave the same wrong answer. A scalar's backing is not a program array.
+      if (Result = '') and not (IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
         Result := ArrayPointerUDTType(ArrName);
       // "type<T>(...)"/"T(...)" anonymous temporary: the "array name" is a UDT type with no array of that
       // name in scope — the node constructs a temporary T (same guard as the codegen hook).
@@ -30240,8 +36316,31 @@ begin
         Result := ArrName;
       // "ptr[i].field": ptr is a pointer to a UDT (Callocate'd record block / managed handle); ptr[i] is a
       // record of the pointee type.
-      if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
+      // ⛔ "ArrayIndexOf >= 0" is meant to let a REAL array win over a pointer of the same name. An
+      // @-taken pointer, though, is made ARRAY-BACKED (one element, holding the pointer itself), so it
+      // answered yes and "p[i].field" stopped being pointer indexing: the type came out '' and the
+      // access read p's own backing. A scalar's backing is not a program array.
+      if (Result = '') and ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
         Result := PointerUDTType(ArrName);
+      // ...and one level further out: "pp[i]" of a "T PTR PTR" is a "T PTR", so the access that
+      // follows reaches T. PointerUDTType answers '' for it (its pointee is not a UDT), and without
+      // this rung the type came out '' and ProcessMemberAccess returned before ResolveRecordObject
+      // could lower the indirection - "pp[0]->f" printed a packed address where fbc prints the field.
+      if (Result = '') and ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
+      begin
+        // ⚠️ Over a pointer-to-pointer that owns REAL BYTES (a CAllocate'd block) this rung is only
+        // HALF right, and half is what it is kept for. The raw path has no rung for a "T Ptr Ptr"
+        // either - RawUDTPtrType declines, so "pp[i]->f" used to answer rubbish for EVERY i, silently
+        // (2 where fbc says 11 and 22). With this rung index 0 is correct and any other index FAULTS,
+        // because the managed reading adds i unscaled where the block wants i*8. Measured both ways:
+        // right-for-0-and-loud beats wrong-for-all-and-quiet, which is this project's rule. The
+        // missing half - a raw rung for a pointer-to-pointer block - is named in
+        // job/tests/bas/bug_an_addr_taken_pointer_inside_a_procedure.bas.
+        NestedT := UpperCase(ManagedPtrPointee(ArrName));
+        if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') and
+           (FindUDT(Trim(Copy(NestedT, 1, Length(NestedT) - 4))) >= 0) then
+          Result := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+      end;
       // "f(args).field" / "f(args).method()": a user FUNCTION whose return type is a UDT. Its return
       // type is registered under the function's own name (that is what makes "Dim As T x = f(...)" work).
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
@@ -30265,6 +36364,19 @@ begin
         ArrName := Trim(Copy(ArrName, 1, Length(ArrName) - 4));
         if (FindUDT(ArrName) >= 0) and UDTBlockIsManaged(ArrName) then Result := ArrName;
       end;
+    end
+    // ⛔ ...AND THE BASE OF AN INDEX MAY BE AN EXPRESSION, not a name. "(*pp)[0].i" is fbc's own
+    // expressions/memberderef, which writes the SAME access eight ways: seven of them resolved and this
+    // one answered the packed handle (4611686018427387904 for 123). Indexing is a dereference, so the
+    // element's type is the type of "*(base)" - which DerefedType answers for a parenthesised deref
+    // chain already, and has since m720 for a member base as well.
+    else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) and
+            (ObjNode.GetChild(0).NodeType in [antParentheses, antDeref]) then
+    begin
+      NestedT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+      if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') then
+        NestedT := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+      if FindUDT(NestedT) >= 0 then Result := NestedT;
     end
     // Array-of-UDT MEMBER element "obj.field(i)", or a method call "obj.method(args)": child 0 is a
     // member access. The element type is the field's ArrayElemType; a method call yields its return type.
@@ -30290,11 +36402,39 @@ begin
             NestedT := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), nil);
           if NestedT <> '' then Result := VarRecordTypeName(NestedT);
         end;
+        // ⛔ ...AND A POINTER FIELD INDEXED. "obj.ptrfield[i]" is a dereference - p[i] is *(p+i) - so the
+        // element's type is the field's pointee, computed as the antDeref arm above computes it.
+        // ⚠️ This rung was written once before and REMOVED as dead, correctly: the lowering gave up
+        // earlier, in ResolveRecordObject, which asked for a NAME as the index base. That half exists
+        // now, so the question finally gets asked. Last of the rungs, so a real array member and a
+        // method still win the name.
+        if Result = '' then
+        begin
+          NestedT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+          if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') then
+            NestedT := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+          if FindUDT(NestedT) >= 0 then Result := NestedT;
+        end;
       end;
     end;
   end
   else if ObjNode.NodeType = antMemberAccess then
   begin
+    // ⛔ ...AND A STATIC MEMBER IS NOT A FIELD OF ANY INSTANCE, so it is not in the type's field list -
+    // by construction. "UDT.a.a" therefore resolved to nothing and read the backing HANDLE as if it
+    // were the value: 4611686018427387904 where fbc prints 3, in silence. The static registry is asked
+    // first, for the same two spellings the funnel already serves (type name and instance).
+    ParentType := StaticMemberBackingName(ObjNode.GetChild(0), VarToStr(ObjNode.Value));
+    if ParentType <> '' then
+    begin
+      NestedT := FStaticMemberTypes.Values[ParentType];
+      if NestedT <> '' then Exit(NestedT);
+      // ...and a POINTER-typed static member carries a record handle, so the object is its POINTEE -
+      // the same answer PointerUDTType gives for an ordinary "T Ptr" variable, asked under the backing
+      // NAME because the node is a member access and has none.
+      NestedT := PointerUDTType(ParentType);
+      if NestedT <> '' then Exit(NestedT);
+    end;
     ParentType := ObjectTypeName(ObjNode.GetChild(0));
     if UDTFieldBankSlot(FindUDT(ParentType), VarToStr(ObjNode.Value), Bank, Slot, NestedT) then
     begin
@@ -30360,6 +36500,57 @@ begin
   ProcessExpression(Node, Val);
 end;
 
+function TSSAGenerator.DerefOfAddrOfTarget(Node: TASTNode): TASTNode;
+// "*@x" names exactly x, whatever x is. Answers a FRESH node for that inner lvalue - the CALLER owns
+// it and must free it - or nil when Node is not of that shape.
+//
+// ⛔ WHY IT IS NEEDED AT ALL: a "*" learns what it points at from the DECLARED type of a pointer, so
+// "Dim p As String Ptr = @s : *p" is right and "*@s" - the same place with no name in between - was
+// not. It read the packed handle as a raw address: "Null or invalid pointer dereference" for a String,
+// the Double's BITS for a Double. Cancelling the pair costs no analysis and cannot be wrong: the
+// address-of has nothing else to hand back.
+//
+// ⛔ A PROCEDURE NAME IS EXCLUDED. "@f" is a procedure pointer and "*@f" is not a call; unwrapping it
+// would turn the address of a SUB into an attempt to read a variable of that name.
+var
+  Inner: TASTNode;
+begin
+  Result := nil;
+  if (Node = nil) or (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
+  Inner := Node.GetChild(0);
+  while (Inner <> nil) and (Inner.NodeType = antParentheses) and (Inner.ChildCount >= 1) do
+    Inner := Inner.GetChild(0);
+  if (Inner = nil) or (Inner.NodeType <> antProcAddress) then Exit;
+  // ⛔ ...AND THE "@" ITSELF CAN BE OVERLOADED. A type declaring "Operator @ () As Integer Ptr" means
+  // something else by "@u", so "*@u" is a call and a dereference, not a cancellation - m568 prints the
+  // field that operator points at (-1234) and read 5, the handle, once the pair was cancelled here.
+  // The unary "*" arm carries the mirror of this note for the same reason.
+  if Inner.ChildCount >= 1 then
+  begin
+    if OverloadsAddressOf(Inner.GetChild(0)) then Exit;
+    Result := Inner.GetChild(0).Clone;
+    Exit;
+  end;
+  // The bare-name spelling carries the name in Value and has no child, so the identifier is built here.
+  // ⚠️ Built, never grafted onto the address-of node: several sites tell "@name" from "@expr" by its
+  // CHILD COUNT, and adding one would change how the address-of itself is lowered.
+  if VarType(Inner.Value) = varNull then Exit;
+  if FProcedureNames.IndexOf(UpperCase(VarToStr(Inner.Value))) >= 0 then Exit;   // "@f": a procedure
+  if ResolveMethodLabel(VarRecordTypeName(VarToStr(Inner.Value)), 'OPERATOR@') <> '' then Exit;
+  Result := TASTNode.CreateWithValue(antIdentifier, VarToStr(Inner.Value), Inner.Token);
+end;
+
+function TSSAGenerator.OverloadsAddressOf(Node: TASTNode): Boolean;
+// Does the type of this expression declare "Operator @"? Then "@it" is a call, not an address.
+var
+  T: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  T := ObjectTypeName(Node);
+  Result := (T <> '') and (ResolveMethodLabel(T, 'OPERATOR@') <> '');
+end;
+
 function TSSAGenerator.DerefPointeeUDTType(Node: TASTNode): string;
 // The UDT type a pointer expression points to, for "*expr": a bare UDT-pointer variable, or a
 // "Cast(T Ptr, x)". Empty if the pointee is not a UDT. Lets "*cast(T Ptr, x)" evaluate to the record
@@ -30375,6 +36566,15 @@ begin
   case Node.NodeType of
     antIdentifier:
       Result := PointerUDTType(VarToStr(Node.Value));
+    // ...and a STATIC MEMBER of pointer type, which has no variable name to ask about: its storage
+    // lives under one dotted name. "UDT.p->a" resolved and "(*UDT.p).a" - the same access in
+    // FreeBASIC's other spelling - did not.
+    antMemberAccess:
+      if Node.ChildCount >= 1 then
+      begin
+        TN := StaticMemberBackingName(Node.GetChild(0), VarToStr(Node.Value));
+        if TN <> '' then Result := PointerUDTType(TN);
+      end;
     antCast:
       begin
         U := UpperCase(VarToStr(Node.Value));   // target type, e.g. "LIST PTR"
@@ -30425,10 +36625,7 @@ begin
     ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
   end;
   // A cast declared BYREF hands back an ADDRESS - that is what makes "Cast(Integer, u) = 78" possible -
-  // so READING through it has to dereference, exactly as the index operator's read already does. Without
-  // this the value printed was the record-field POINTER itself.
-  if (Lbl <> '') and ByrefRetByAddress(Lbl) then
-    Val := EmitByrefRetDeref(EnsureIntRegister(Val), Lbl);
+  // so READING through it has to dereference. ProcessMethodCall does that for every rvalue now.
   Result := (Val.Kind <> svkNone);
 end;
 
@@ -30471,7 +36668,9 @@ begin
     Lbl := ResolveMethodLabel(SrcType, MethNm);
     if (Lbl <> '') and (UpperCase(CastRetRecType(Lbl)) = UpperCase(DstType)) then
     begin
-      ProcessMethodCall(Node, SrcType, MethNm, nil, Val);
+      // A UDT-returning cast yields the record HANDLE, which is already what the caller copies from:
+      // asking for the address keeps this site byte-identical to what it did before the default moved.
+      ProcessMethodCall(Node, SrcType, MethNm, nil, Val, False, True);
       Result := (Val.Kind <> svkNone);
       if Result then Val := EnsureIntRegister(Val);
       Exit;
@@ -30521,15 +36720,12 @@ begin
   TypeName := ObjectTypeName(Node);                       // UDT type, no code emitted
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   if ResolveMethodLabel(TypeName, 'OPERATORCAST$') = '' then Exit;   // '$' = string-returning cast
-  ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);
-  // ...and the same dereference for a BYREF string cast (see the numeric one).
-  if ByrefRetByAddress(ResolveMethodLabel(TypeName, 'OPERATORCAST$')) then
-    Val := EmitByrefRetDeref(EnsureIntRegister(Val), ResolveMethodLabel(TypeName, 'OPERATORCAST$'));
+  ProcessMethodCall(Node, TypeName, 'OPERATORCAST$', nil, Val);   // BYREF dereferenced inside
   Result := (Val.Kind <> svkNone);
 end;
 
 procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
-  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False);
+  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False; WantAddress: Boolean = False);
 // Lower obj.method(args): pass the object handle as the implicit THIS first argument, then the
 // declared args. A monomorphic call goes straight to the resolved method; a polymorphic one goes
 // through a generated virtual dispatcher (chosen by the instance's runtime type-id). Read the
@@ -30539,8 +36735,12 @@ var
   i, UDTIdx: Integer;
   RT: TSSARegisterType;
   DestVal, RcHandle: TSSAValue;
-  IsFunc: Boolean;
-  MethodLabel, RetRecType: string;
+  IsFunc, IsByrefRet: Boolean;
+  MethodLabel, RetRecType, RawTypeName: string;
+  RawUDTIdx: Integer;
+  RawOffsets: TInt64Array;
+  RawTotal: Int64;
+  RawBaseNode, RawIdxNode, RawChainNode: TASTNode;
 begin
   Result := MakeSSAValue(svkNone);
   // "obj.Constructor()" / "obj.Destructor()" called EXPLICITLY on an existing instance. FreeBASIC
@@ -30574,7 +36774,44 @@ begin
   if MethodLabel = '' then
     MethodLabel := AnyOverrideLabel(ObjType, MethNm);
   if MethodLabel = '' then Exit;
+  // ⛔ A METHOD ON A TRULY RAW POINTER IS AN ACCESS VIOLATION, AND A NAMED REFUSAL IS BETTER THAN THAT.
+  // "Dim As T Ptr p = CAllocate(SizeOf(T)) : p->Method()" passes THIS as a RAW ADDRESS (RAWPTR_TAG),
+  // and the method body was compiled once, for a record HANDLE - so its first field access dereferenced
+  // an address as a table index and the VM died. The FIELD half works ("p->i" takes the byte-offset
+  // path), which is why nothing pointed at this; "New T" and "@v" work too, because neither is marked
+  // raw. fbc runs all three.
+  // ⚠️ Closing it for real is a MODEL change: the record accessor would have to tell a handle from a
+  // raw base AT RUNTIME, and that test lands on bcRecordLoad/Store - four of the hottest opcodes in
+  // the VM, the ones the C hot loop covers and that are worth -12.7% on binary-trees. That is a
+  // decision with a price, not a quiet edit, and it is written up in job/markdown/DIVERGENZE.md.
+  // ⛔ Until it is made, this refuses instead of crashing. Replacing a crash with a message is the
+  // only move here that is not "an error swapped for a wrong answer".
+  // ⛔ Asked with the SAME predicate the field half uses (ResolveRawUDTBase), not a second opinion:
+  // "p->i" works precisely because that one answers True here, and the two halves must agree about
+  // what a raw base is.
+  if (ObjNode <> nil) and
+     ResolveRawUDTBase(ObjNode, RawTypeName, RawUDTIdx, RawOffsets, RawTotal,
+                       RawBaseNode, RawIdxNode, RawChainNode) then
+    raise Exception.CreateFmt('Calling method %s on a RAW pointer to %s is not supported: it holds an ' +
+      'Allocate/CAllocate address and a method needs a managed record. Its FIELDS can be read and ' +
+      'written; use "New %s" when you need methods.', [MethNm, RawTypeName, RawTypeName]);
+  // OOP: the permission, on the METHOD half of the rule. Until now CheckMemberAccess was reached from
+  // exactly one place - the by-name FIELD lookup - so "Private: Declare Sub foo()" was stamped by the
+  // parser and never asked about: "x.foo()" from module level ran the body. fbc answers "error 202:
+  // Illegal member access" for it, and for a static member's "T.foo()" and for a word-named OPERATOR
+  // (Cast, For, Next, Step, New, Delete), all of which arrive HERE - TryStaticMethodCall lowers a
+  // static call through this same funnel, and the operator sites name their method the same way.
+  // ⚠️ AFTER the label resolves, not before: a site that probes for an operator the type does not have
+  // must keep falling through, and a name with no method behind it is not an access at all.
+  CheckMemberAccess(ObjType, MethNm);
   RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
+  // ⛔ A BYREF UDT RESULT IS STILL TREATED AS A VALUE RETURN, and that is a MODEL gap, not an
+  // oversight: the caller allocates a copy, so "@x[1] = @x" answers false where fbc says true and a
+  // mutation the operator made to THIS is invisible afterwards. ⚠️ TRIED AND WITHDRAWN 27 Aug:
+  // clearing RetRecType here to take the reference path instead makes the callee stage NOTHING - an
+  // OPERATOR body's "Operator = This" does not reach the byref-address arm - and the very next
+  // dereference dies on address 0. Closing it means giving the callee side that arm, which is a
+  // different piece of work. DIVERGENZE 72.
 
   // Build an argument list with the object (THIS) prepended.
   TmpArgs := TASTNode.Create(antArgumentList, ObjNode.Token);
@@ -30620,6 +36857,7 @@ begin
 
   if RetRecType <> '' then
   begin
+    RegisterResultTemp(RcHandle, RetRecType);   // V5f: the end of the statement destroys this temporary
     Result := RcHandle;   // UDT result: the caller-allocated copy
     Exit;
   end;
@@ -30633,10 +36871,20 @@ begin
     // bank is, and the callee stages it in the int slot. Reading it back in the pointee's bank looked at
     // the float slot and found nothing: "Operator T.Cast() ByRef As Double" answered 0 while the same
     // operator declared "As Integer" was right, because there the two banks happen to coincide.
-    if ByrefRetByAddress(MethodLabel) then RT := srtInt;
+    IsByrefRet := ByrefRetByAddress(MethodLabel);
+    if IsByrefRet then RT := srtInt;
     DestVal := MakeSSARegister(RT, FProgram.AllocRegister(RT));
     EmitXferLoad(RT, XFER_RESULT_SLOT, DestVal);
-    Result := DestVal;
+    // ...and then READ through that address, because an rvalue wants the VALUE. This used to be left to
+    // the caller, and only THREE callers did it (the index operator and the two Cast helpers): every
+    // other site - a plain "obj.m()", a property GET, an implicit-THIS call - handed the raw pointer on.
+    // A method declared "ByRef As ZString" printed as an integer, and the whole udt-zstring family of the
+    // fbc suite rests on exactly that declaration. The address is still what the LVALUE sites need, so
+    // they ask for it: WantAddress is the opt-out, and the common case is the default.
+    if IsByrefRet and (not WantAddress) then
+      Result := EmitByrefRetDeref(DestVal, MethodLabel)
+    else
+      Result := DestVal;
   end;
 end;
 
@@ -30665,17 +36913,73 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.NameIsRealArray(const Name: string): Boolean;
+// Is this name a DECLARED ARRAY, as opposed to a scalar that merely has an array-shaped BACKING?
+//
+// ⛔ Taking a scalar's address backs it with a ONE-ELEMENT array registered under its own name, so
+// ArrayIndexOf answers YES for it - and every "not an array, therefore a pointer" guard then read the
+// wrong way. "Dim pp As Integer Ptr Ptr = @p" made "p[1]" compile to ArrayLoadInt ARR[p], 1: an element
+// of P'S OWN BACKING at index 1, which does not exist, so it read 0 while "*p" - a different path -
+// stayed right. The question every such guard means to ask is this one, so it is asked in one place.
+begin
+  Result := (ArrayIndexOf(Name) >= 0) and
+            (not IsSharedScalar(Name)) and (not IsRawModuleScalar(Name)) and (not IsRawAddrLocal(Name));
+end;
+
+function TSSAGenerator.RecordHandleOfVar(const Name: string): TSSAValue;
+// The HANDLE of a record variable, read the way that variable is actually stored.
+//
+// ⛔ THREE PLACES HAD ASKED GetOrAllocateVariable FOR IT and got a register the name was never bound
+// to when the variable is SHARED - which is array-backed, its handle in element 0 of a 1-element
+// global array. m534 fixed the program-end destructor, m537 fixed "@obj", and this is the third:
+// "(*p).field". A rule that keeps going missing belongs in ONE place, so here it is.
+//
+// ⛔ ...and SHARED is not the only storage that is not a register. Once a program takes the variable's
+// ADDRESS ("Dim pp As Integer Ptr Ptr = @p") it is RAW-BACKED, and the register it used to live in is
+// never written again: "p[1]" then added the index to an undefined register and read 0, while "*p" -
+// which asks a different path - stayed right. EmitFuncPtrCall had already learned all three storages
+// for its own reason; the fourth caller found the gap, so the knowledge moves HERE and that one now
+// asks this instead of carrying its own copy.
+var
+  AccNode: TASTNode;
+begin
+  if IsRawAddrLocal(Name) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(AddrLocalHandle(UpperCase(Name))),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+  end
+  else if IsRawModuleScalar(Name) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Result, RawModuleAddrReg(UpperCase(Name)),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+  end
+  else if IsSharedScalar(Name) then
+  begin
+    AccNode := MakeSharedScalarAccess(Name, nil);
+    try
+      ProcessExpression(AccNode, Result);
+      Result := EnsureIntRegister(Result);
+    finally
+      AccNode.Free;
+    end;
+  end
+  else
+    Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(Name)));
+end;
+
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
-  ArrName, ParentType, NestedT, MemberArrElemType, MethodLbl: string;
+  ArrName, ParentType, NestedT, MemberArrElemType, MethodLbl, DerefT, Pointee: string;
   MethodArgs: TASTNode;
   MemberArrHandle, MemberArrIdx: TSSAValue;
   MemberArrBank: TSSARegisterType;
   ParentHandle, NestedHandle: TSSAValue;
   ParentUDT, Slot: Integer;
   Bank: TSSARegisterType;
-  SharedTmp, ChainIdx: TASTNode;
+  SharedTmp, ChainIdx, CancelObj: TASTNode;
 begin
   Result := False;
   TypeName := '';
@@ -30687,6 +36991,61 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐ "(@X)->f" IS "X.f". In the managed model the ADDRESS of a record is its HANDLE - the same value
+  // - so an address-of cancels against the arrow exactly as it cancels against a "*"
+  // (DerefOfAddrOfTarget, DIVERGENZE 48). fbc's own expressions/addrof-anon writes it over an anonymous
+  // temporary, "(@Type<PodUdt>(111, 222))->a", and there is no name in it for any rung to key on: the
+  // field read answered 0 for a POD and 1 for one with a constructor, in silence.
+  // ⚠️ Only when the operand really is a RECORD: "@i" of an Integer is an address and nothing here.
+  // ⛔ TWO NODE SHAPES CARRY THE OPERAND, and only one of them is a CHILD - see the note at the twin
+  // in ObjectTypeName. "@u" of a NAMED variable keeps the name in its VALUE and has no child.
+  if ObjNode.NodeType = antProcAddress then
+  begin
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) and
+       (ObjectTypeName(ObjNode.GetChild(0)) <> '') then
+      ObjNode := ObjNode.GetChild(0)
+    else if (ObjNode.ChildCount = 0) and (VarRecordTypeName(VarToStr(ObjNode.Value)) <> '') then
+    begin
+      TypeName := VarRecordTypeName(VarToStr(ObjNode.Value));
+      HandleVal := RecordHandleOfVar(VarToStr(ObjNode.Value));
+      Exit(True);
+    end;
+  end;
+  // ...and "(*@u)" is u - the same cancellation the expression path makes, asked here because a record
+  // BASE does not go through it: "(*@u).a" answered 1 while "*@i" of an Integer was already right.
+  CancelObj := DerefOfAddrOfTarget(ObjNode);
+  if CancelObj <> nil then
+  begin
+    try
+      Result := ResolveRecordObject(CancelObj, HandleVal, TypeName);
+    finally
+      CancelObj.Free;
+    end;
+    Exit;
+  end;
+  // ...and a STATIC member whose type is a UDT: its instance lives under the single dotted name, not in
+  // a slot of any record. ObjectTypeName learned the same thing; both halves need it, or the type
+  // resolves and the handle does not ("unresolved record object" where the read used to answer the
+  // handle itself).
+  if ObjNode.NodeType = antMemberAccess then
+  begin
+    NestedT := StaticMemberBackingName(ObjNode.GetChild(0), VarToStr(ObjNode.Value));
+    if (NestedT <> '') and ((FStaticMemberTypes.Values[NestedT] <> '') or (PointerUDTType(NestedT) <> '')) then
+    begin
+      if FStaticMemberTypes.Values[NestedT] <> '' then
+        TypeName := FStaticMemberTypes.Values[NestedT]     // the member IS the record
+      else
+        TypeName := PointerUDTType(NestedT);               // ...or holds a handle to one
+      CancelObj := MakeSharedScalarAccess(NestedT, ObjNode.Token);
+      try
+        ProcessExpression(CancelObj, HandleVal);
+      finally
+        CancelObj.Free;
+      end;
+      HandleVal := EnsureIntRegister(HandleVal);
+      Exit(True);
+    end;
+  end;
   // CPtr/Cast(T Ptr, x)->field: the CAST names the record type outright, and a UDT-pointer
   // cast is a value passthrough, so the cast's int value IS the record handle. Without this
   // branch the base matched nothing, the field read fell to the generic path and yielded
@@ -30725,6 +37084,18 @@ begin
         SharedTmp.Free;
         HandleVal := EnsureIntRegister(HandleVal);
       end
+      // ⛔ ...AND A BACKED POINTER IS NOT IN ITS REGISTER EITHER. The SHARED case above is one of
+      // FOUR: an @-taken scalar is moved to a raw byte slot (module level) or to a per-frame one
+      // (inside a procedure), and its plain register is then stale. Reading it here gave "p->field"
+      // a garbage handle the moment anything took "@p" - EAccessViolation - while "(*p).field", the
+      // same thing by definition, went through ProcessExpression and was right. That funnel already
+      // knows all four backings; asking it is the whole fix.
+      else if IsRawModuleScalar(VarToStr(ObjNode.Value)) or
+              (FAddrLocalVars.IndexOfName(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
+      begin
+        ProcessExpression(ObjNode, HandleVal);
+        HandleVal := EnsureIntRegister(HandleVal);
+      end
       else
         HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value))));
       Result := True;
@@ -30754,14 +37125,63 @@ begin
   end
   else if ObjNode.NodeType = antDeref then
   begin
+    // ...and the pointer may be a STATIC MEMBER, which has no variable NAME to ask about: every rung of
+    // this branch is keyed by one. "UDT.p->a" worked while "(*UDT.p).a" - the same access in FreeBASIC's
+    // other spelling - read the handle. Resolved recursively, so the member path answers once.
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
+    begin
+      NestedT := StaticMemberBackingName(ObjNode.GetChild(0).GetChild(0), VarToStr(ObjNode.GetChild(0).Value));
+      if (NestedT <> '') and (PointerUDTType(NestedT) <> '') then
+      begin
+        TypeName := PointerUDTType(NestedT);
+        CancelObj := MakeSharedScalarAccess(NestedT, ObjNode.Token);
+        try
+          ProcessExpression(CancelObj, HandleVal);
+        finally
+          CancelObj.Free;
+        end;
+        HandleVal := EnsureIntRegister(HandleVal);
+        Exit(True);
+      end;
+    end;
     // (*p).field where p is a UDT pointer: the deref yields p's handle directly.
     TypeName := PointerUDTType(VarToStr(ObjNode.GetChild(0).Value));
-    if TypeName = '' then Exit;
-    HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.GetChild(0).Value))));
+    if TypeName <> '' then
+    begin
+      HandleVal := RecordHandleOfVar(VarToStr(ObjNode.GetChild(0).Value));
+      Exit(True);
+    end;
+    // ⛔ ...and that rung is keyed by a NAME once more, so a deref of anything else fell out with
+    // Result False and the field read answered the base itself: "(*tpp)->n" with "tpp As T Ptr Ptr"
+    // printed a packed address where fbc prints the field, while the same access written in two steps
+    // through a variable was right. DIVERGENZE 45 - the twin of 54, and the same cure.
+    // ⭐ DerefedType answers the type of "*operand" for every base it knows, and covers both spellings:
+    // the deref of a "T Ptr Ptr" is a "T PTR" that the member access then dereferences, the deref of a
+    // "T Ptr" is a "T" the access reaches directly.
+    DerefT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+    // ⛔ WHICH NODE CARRIES THE HANDLE DEPENDS ON HOW MANY LEVELS ARE LEFT. In the managed model a
+    // "T Ptr" VALUE *is* the record handle, so a "*" applied to one is the identity - and evaluating
+    // the DEREF then reads through a handle as if it were a raw address ("Raw pointer dereference out
+    // of bounds"). The stripping below is the test: when DerefedType still ends in ' PTR' the operand
+    // is a "T Ptr Ptr" and the deref itself yields the handle (the "(*tpp)->n" case this arm was
+    // written for); when it does not, the OPERAND already holds it - which is what "(*pp[0]).i" is.
+    if (Length(DerefT) > 4) and (Copy(DerefT, Length(DerefT) - 3, 4) = ' PTR') then
+    begin
+      DerefT := Trim(Copy(DerefT, 1, Length(DerefT) - 4));
+      if FindUDT(DerefT) < 0 then Exit;
+      TypeName := DerefT;
+      ProcessExpression(ObjNode, HandleVal);
+    end
+    else
+    begin
+      if FindUDT(DerefT) < 0 then Exit;
+      TypeName := DerefT;
+      ProcessExpression(ObjNode.GetChild(0), HandleVal);
+    end;
+    HandleVal := EnsureIntRegister(HandleVal);
     Result := True;
   end
-  else if ObjNode.NodeType = antArrayAccess then
-  begin
+  else if ObjNode.NodeType = antArrayAccess then  begin
     // Array-of-UDT MEMBER element: "obj.field(i)" where field is a UDT array member. The child-0 root is a
     // member access, not a plain identifier. IsMemberArrayAccess loads the member's FArrays handle and the
     // linear index; an indirect int load then yields the element's record handle. The element UDT type is
@@ -30847,6 +37267,39 @@ begin
         end;
       end;
     end;
+    // ⛔ THE BASE OF AN INDEX MAY BE AN EXPRESSION, and everything below asks for a NAME. fbc's own
+    // expressions/memberderef writes the same access eight ways and this was the one that failed:
+    // "(*pp)[0].i" answered the packed handle (4611686018427387904 for 123) while "(*pp)->i",
+    // "pp[0]->i", "(*pp[0]).i" and "(**pp).i" beside it were all right.
+    // Indexing a pointer IS a dereference - "b[i]" is "*(b + i)" - and the rung just above already
+    // rewrites "pp[i]->f" that way for a NAMED base. Written as the deref it is and handed back to
+    // this routine, which knows every base it knows. Last resort on purpose: a real member array,
+    // a method call and a p[i][j] chain are all matched above and keep their own path.
+    // ⚠️ The synthesised "+" carries the BASE's token, never an operator one - a binary-op node whose
+    // token is an operator is lowered from that TOKEN, and a "*" there would quietly become a multiply.
+    if (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+       (ObjNode.GetChild(0).NodeType in [antParentheses, antDeref, antMemberAccess]) and
+       (DerefedType(ObjNode.GetChild(0)) <> '') then
+    begin
+      ChainIdx := ObjNode.GetChild(1);
+      if (ChainIdx <> nil) and (ChainIdx.NodeType in [antArgumentList, antExpressionList]) and
+         (ChainIdx.ChildCount = 1) then
+        ChainIdx := ChainIdx.GetChild(0);
+      if ChainIdx <> nil then
+      begin
+        CancelObj := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
+        SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', ObjNode.GetChild(0).Token);
+        SharedTmp.AddChild(ObjNode.GetChild(0).Clone);
+        SharedTmp.AddChild(ChainIdx.Clone);
+        CancelObj.AddChild(SharedTmp);
+        try
+          Result := ResolveRecordObject(CancelObj, HandleVal, TypeName);
+        finally
+          CancelObj.Free;
+        end;
+        if Result then Exit;
+      end;
+    end;
     if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
     ArrName := UpperCase(VarToStr(ObjNode.GetChild(0).Value));
     // Anonymous temporary "T(args)": ArrName is a declared UDT type (not an array). Construct it so any
@@ -30859,6 +37312,22 @@ begin
       Result := True;
       Exit;
     end;
+    // ⛔ ...and a FREE FUNCTION returning a UDT, which the METHOD case above has handled all along and
+    // this one had not: "pick().n = 5" over "Function pick() ByRef As T" wrote nowhere and said nothing.
+    // Same two shapes as there - a UDT return, or a "T Ptr" whose value IS the handle.
+    if (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
+    begin
+      MemberArrElemType := VarRecordTypeName(ArrName);
+      if MemberArrElemType = '' then MemberArrElemType := ProcReturnPtrUDT(ArrName);
+      if MemberArrElemType <> '' then
+      begin
+        ProcessExpression(ObjNode, HandleVal);   // lowers the call; the result is the handle
+        HandleVal := EnsureIntRegister(HandleVal);
+        TypeName := MemberArrElemType;
+        Result := True;
+        Exit;
+      end;
+    end;
     // Array-of-UDT element: arr(i) evaluates to the element's record handle (int).
     TypeName := ArrayRecordTypeOf(ArrName);   // scope-aware (array-of-UDT parameter too)
     if TypeName = '' then
@@ -30869,7 +37338,13 @@ begin
       // Note this is the array-of-pointers case, NOT "ptr[i]" below (there the NAME is the pointer).
       // Without it the node matched no branch: reads yielded the raw tagged handle instead of the field
       // and stores were silently dropped.
+      // ⛔ ...and NOT when that "array" is a SCALAR'S BACKING. An @-taken pointer is made array-backed
+      // (one element, holding the pointer itself), so "p[i]" matched HERE and read element 0 of p's own
+      // backing instead of indexing what p POINTS AT: "p[0].i" answered the handle where 123 was meant.
+      // ⚠️ The very same program without "Dim pp As T Ptr Ptr = @p" worked, because without the @ the
+      // pointer stays in a register and no backing array exists - which is what isolated it.
       ParentType := ArrayPointerUDTType(ArrName);
+      if IsSharedScalar(ArrName) or IsAddrLocal(ArrName) then ParentType := '';
       if (ParentType <> '') and (ObjNode.ChildCount >= 2) then
       begin
         ProcessExpression(ObjNode, HandleVal);      // ordinary int element load (indices, lbounds, binds)
@@ -30877,6 +37352,39 @@ begin
         TypeName := ParentType;
         Result := True;
         Exit;
+      end;
+      // ⛔ "pp[i]->field" where pp is a "T PTR PTR": the element is not pp's value plus i, it is what
+      // LIVES at pp + i - one indirection more than the rung below performs. Every other spelling of
+      // the same access already worked ("(*pp)->f", "(**pp).f", "(*(pp+i))->f", and the two-step form
+      // through a variable), so this one shape answered a packed address where fbc answers the field:
+      // 1 instead of 55 (job/tests/bas/bug_an_addr_taken_pointer_inside_a_procedure.bas named it as
+      // the last knot of that family). Written as the deref it IS, and handed back to this routine -
+      // the deref arm above already knows that "*(T PTR PTR)" is a "T PTR" the access then follows.
+      // ⚠️ The synthesised "+" carries the IDENTIFIER's token, never an operator one: a binary-op node
+      // whose token is an operator is lowered from that TOKEN, and building it with a "*" quietly
+      // produced a multiply (see EmitVarArgGet, which learned this the hard way).
+      Pointee := UpperCase(ManagedPtrPointee(ArrName));
+      if (Length(Pointee) > 4) and (Copy(Pointee, Length(Pointee) - 3, 4) = ' PTR') and
+         (FindUDT(Trim(Copy(Pointee, 1, Length(Pointee) - 4))) >= 0) and (ObjNode.ChildCount >= 2) then
+      begin
+        ChainIdx := ObjNode.GetChild(1);
+        if (ChainIdx <> nil) and (ChainIdx.NodeType in [antArgumentList, antExpressionList]) and
+           (ChainIdx.ChildCount = 1) then
+          ChainIdx := ChainIdx.GetChild(0);
+        if ChainIdx <> nil then
+        begin
+          CancelObj := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
+          SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', ObjNode.GetChild(0).Token);
+          SharedTmp.AddChild(ObjNode.GetChild(0).Clone);
+          SharedTmp.AddChild(ChainIdx.Clone);
+          CancelObj.AddChild(SharedTmp);
+          try
+            Result := ResolveRecordObject(CancelObj, HandleVal, TypeName);
+          finally
+            CancelObj.Free;
+          end;
+          Exit;
+        end;
       end;
       // "ptr[i].field": ptr is a pointer to a UDT (a Callocate(n, SizeOf(T)) record block, or a single
       // managed handle). The i-th record's handle is ptr's value + i — records from one Callocate are
@@ -30938,8 +37446,8 @@ procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValu
 // Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot). If the
 // member is not a field but a (no-arg) method of the object's type, lower a method call.
 var
-  TypeName, NestedT, MethodLbl, SMBack: string;
-  UDTIdx, Slot: Integer;
+  TypeName, NestedT, MethodLbl, SMBack, QualKey, EnumQual: string;
+  UDTIdx, Slot, QualIdx: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
   Op: TSSAOpCode;
@@ -30953,9 +37461,31 @@ begin
   // no such type, and every "E.<member>" answered the same wrong value.
   // ...and an enum NESTED IN A TYPE is named through both ("Type.enumname.member"), so the qualifier may
   // itself be a member access whose last segment is the enum name. Same answer: the bare member.
+  // ⭐ ...AND THE QUALIFIER MAY BE AN ALIAS OF THE ENUM. "Type foo As bar" makes "foo.val2" the same
+  // member as "bar.val2" - fbc's const/typedef writes exactly that, and the forward form ("Type foo As
+  // bar" BEFORE the enum) is the point of the test. Asked through CanonicalType, the funnel every other
+  // reader of an alias already uses, and only when the written name is not itself an enum.
+  EnumQual := UpperCase(VarToStr(Node.GetChild(0).Value));
+  if (EnumQual <> '') and (FEnumNames.IndexOf(EnumQual) < 0) then
+    EnumQual := UpperCase(CanonicalType(EnumQual));
   if ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antMemberAccess)) and
-     (FEnumNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+     (FEnumNames.IndexOf(EnumQual) >= 0) then
   begin
+    // ⛔ ...BUT "E.B" IS NOT "B". The comment above states the assumption this arm was built on - that
+    // a member is a module-wide constant under its bare name - and it is the assumption that fails:
+    // an ordinary "Dim B" takes that name (Print E.B answered 1 for a member worth 7) and a SECOND
+    // enum declaring the same member name takes the FIRST one's storage (E1.X / E2.X answered 5 5
+    // where fbc answers 3 5). A member is a compile-time CONSTANT in FreeBASIC, so the qualified
+    // spelling answers with the value the enum it names gave it, and nothing can shadow a constant.
+    QualKey := EnumQual + '.' + UpperCase(VarToStr(Node.Value));
+    QualIdx := FEnumQualVals.IndexOfName(QualKey);
+    if QualIdx >= 0 then
+    begin
+      Result := MakeSSAConstInt(StrToInt64Def(FEnumQualVals.ValueFromIndex[QualIdx], 0));
+      Exit;
+    end;
+    // Not foldable (a member whose initialiser this pass could not evaluate): the bare name is still
+    // the historic answer, and it is right whenever nothing shadows it.
     AccNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
     try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
     Exit;
@@ -30968,9 +37498,28 @@ begin
     try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
     Exit;
   end;
+  // ...and the ARRAY kind of static member, named WHOLE (an argument, "UBound(UDT.a)"): the backing
+  // global array under its dotted name.
+  AccNode := RewriteStaticMemberArray(Node);
+  if AccNode <> nil then
+  begin
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
   if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
-  TypeName := ObjectTypeName(Node.GetChild(0));
+  TypeName := RecordTypeOfAddrOfObject(Node.GetChild(0));   // "(@X)->f" is "X.f"
+  if TypeName = '' then TypeName := ObjectTypeName(Node.GetChild(0));
+  // ...and an ENUM member named through the TYPE ITSELF ("T.member"), not through an instance. The
+  // object is a type NAME, so ObjectTypeName answers '' and the instance branch below never sees it.
+  if (TypeName = '') and (Node.GetChild(0).NodeType = antIdentifier) and
+     (TypeEnumMemberOwner(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value)) <> '') then
+  begin
+    CheckMemberAccess(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value));
+    AccNode := TypeScopedConstAccess(VarToStr(Node.GetChild(0).Value), VarToStr(Node.Value), Node.Token);
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   if TypeName = '' then
   begin
     // Static member method called with no args via the type name: "TypeName.method".
@@ -30982,6 +37531,23 @@ begin
   begin
     // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
     // Args-aware with a nil list, so an overload set is searched for its zero-parameter member.
+    // ...or an ENUM member declared INSIDE this type (or an ancestor). fbc scopes such a member to
+    // the type, so "obj.member" is how a program reads one; without this the access fell through as
+    // "not a field", nothing was emitted, and the caller read a register nobody had written - which
+    // printed a raw pointer tag. The VALUE lives in the ordinary global the enum collector backs it
+    // with; only the NAMING is per type.
+    if TypeEnumMemberOwner(TypeName, VarToStr(Node.Value)) <> '' then
+    begin
+      CheckMemberAccess(TypeName, VarToStr(Node.Value));
+      AccNode := TypeScopedConstAccess(TypeName, VarToStr(Node.Value), Node.Token);
+      try
+        ProcessExpression(AccNode, Result);
+      finally
+        AccNode.Free;
+      end;
+      Exit;
+    end;
+    // Not a field — try a no-argument method call obj.method (M4.1), walking inheritance (M4.2).
     if HasCallableMethod(TypeName, VarToStr(Node.Value), nil) then
       // "base.method" written WITHOUT parentheses is the same super call as "base.method()", and it
       // needs the same NON-VIRTUAL dispatch: ObjectTypeName has already resolved `base` to the parent
@@ -31086,6 +37652,16 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.ArraySlotIsModuleFlat(ArrIdx: Integer; const ArrName: string): Boolean;
+// Did this name resolve to the FLAT module array entry, rather than to a scoped one of this procedure
+// or block? A local or block-scoped array carries a MANGLED name (LocalArrayMangle / BlockArrayMangle);
+// the module's own keeps the bare spelling. It is the test that lets a member ARRAY of THIS win over a
+// module array of the same name without ever taking a LOCAL one's place.
+begin
+  Result := (ArrIdx >= 0) and (ArrIdx < FProgram.GetArrayCount) and
+            SameText(FProgram.GetArray(ArrIdx).Name, ArrName);
+end;
+
 function TSSAGenerator.TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
 // FreeBASIC implicit THIS, for a member ARRAY: inside a method body "arr(i)" means "this.arr(i)".
 //
@@ -31133,14 +37709,48 @@ var
   Bank: TSSARegisterType;
   NestedT: string;
   tmp: TSSAValue;
+  TypeIdent: TASTNode;
 begin
   Result := False;
   MemberNode := nil;
+  TypeIdent := nil;
   if FCurrentThisType = '' then Exit;                          // not lowering a method body
   UDTIdx := FindUDT(FCurrentThisType);
   if UDTIdx < 0 then Exit;
-  if not UDTFieldBankSlot(UDTIdx, UpperCase(VarName), Bank, Slot, NestedT) then Exit;   // not a field
-  if ResolveExisting(VarName, tmp) then Exit;                  // a param / local DIM shadows the field
+  if not UDTFieldBankSlot(UDTIdx, UpperCase(VarName), Bank, Slot, NestedT) then
+  begin
+    // ⛔ A STATIC MEMBER IS NOT A FIELD, so the lookup above cannot see it - it has no per-instance slot
+    // at all - and a BARE reference to one inside the type's own method fell through to an ordinary
+    // variable of that name: "Return tally" answered 0 where fbc answers 100, and "tally += 5" wrote to
+    // a local nothing ever read. The QUALIFIED spelling "T.tally" was right all along, which is the tell
+    // that the gap was in the RESOLUTION and not in static members.
+    // ⭐ The member ARRAY half of this was already closed (RewriteStaticMemberArray.BackingOfBase carries
+    // the same note about a bare ReDim); the SCALAR half was left behind - the shape this codebase keeps
+    // meeting, a rule one path has and its sibling does not.
+    // The rewrite names the TYPE, not THIS: a static member is reached through the type name, and a
+    // STATIC method has no THIS to offer.
+    TypeIdent := TASTNode.CreateWithValue(antIdentifier, UpperCase(FCurrentThisType), Tok);
+    try
+      if StaticMemberBackingName(TypeIdent, VarName) = '' then Exit;   // not a static member either
+      if ResolveExisting(VarName, tmp) then Exit;                // a param / local DIM shadows it
+      MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarName), Tok);
+      MemberNode.AddChild(TypeIdent);
+      TypeIdent := nil;                                          // owned by MemberNode now
+      Result := True;
+    finally
+      TypeIdent.Free;
+    end;
+    Exit;
+  end;
+  // ⛔ ...BUT A MODULE-SHARED VARIABLE IS NOT A SHADOW. ResolveExisting deliberately lets a
+  // "Dim Shared" fall through to the module namespace (its own header says so), so ANY global of the
+  // field's name silenced the implicit THIS: "Dim Shared As ZString * 32 dup" beside a type with a
+  // field "dup" made "Print dup" inside that type's own method print the GLOBAL - and so did an
+  // INHERITED field, which is the shape fbc's structs/inherit-type-4 asserts. fbc's order is the
+  // other way round: the field of THIS wins over every variable that is not local to this frame.
+  // ⚠️ A PARAMETER and a LOCAL DIM still win, which is what the guard was written for - those bind
+  // before the proc-root and IsSharedScalar does not claim them.
+  if ResolveExisting(VarName, tmp) and (not IsSharedScalar(VarName)) then Exit;
   MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarName), Tok);
   MemberNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'THIS', Tok));
   Result := True;
@@ -31150,8 +37760,8 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot). If the member is not a field
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
-  TypeName, NestedT, SMBack: string;
-  UDTIdx, Slot, FixCap, BitIdx: Integer;
+  TypeName, NestedT, SMBack, AllocFn: string;
+  UDTIdx, Slot, FixCap, BitIdx, FPSlot: Integer;
   BitUnit: TSSAValue;
   Bank: TSSARegisterType;
   FixWide: Boolean;
@@ -31160,6 +37770,24 @@ var
   SetterArgs, StoreAssign: TASTNode;
 begin
   if MemberNode.ChildCount < 1 then Exit;
+  // ...and a static member that is an ARRAY is written through its backing global array.
+  StoreAssign := RewriteStaticMemberArray(MemberNode);
+  if StoreAssign <> nil then
+  begin
+    try
+      SetterArgs := TASTNode.Create(antAssignment, MemberNode.Token);
+      try
+        SetterArgs.AddChild(StoreAssign.Clone);
+        SetterArgs.AddChild(ExprNode.Clone);
+        ProcessAssignment(SetterArgs);
+      finally
+        SetterArgs.Free;
+      end;
+    finally
+      StoreAssign.Free;
+    end;
+    Exit;
+  end;
   // OOP static member variable (via type name or instance): store to its shared global scalar.
   SMBack := StaticMemberBackingName(MemberNode.GetChild(0), VarToStr(MemberNode.Value));
   if SMBack <> '' then
@@ -31177,6 +37805,27 @@ begin
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
+  // ⭐ "obj.f = @fun" where f is a FUNCPTR FIELD tells @fun which overload it wants - the same hint the
+  // DIM form gives. Without it the arity rule picked the first, and two overloads of one arity that
+  // differ only in their UDT parameter type both sign the bank 'I': the wrong one was called in silence.
+  if UDTIdx >= 0 then
+    StampFuncPtrTarget(ExprNode, UDTFuncPtrFieldSig(UDTIdx, UpperCase(VarToStr(MemberNode.Value)), FPSlot));
+  // ⛔ "a->b = CAllocate( Len(T) )" where b is a "<T> Ptr" FIELD: FreeBASIC's linked-list idiom, and
+  // it has to take the SAME Option-B conversion a pointer VARIABLE takes - allocate a MANAGED record
+  // block and store its HANDLE. TryAllocAssign only ever saw a variable name, so a field kept the RAW
+  // byte address and the very next "a->b->plain" read it through the managed record path and faulted.
+  // ⚠️ Writing the same program with a temporary in between made it work, which is what said the
+  // defect was in the TARGET SHAPE and not in the allocation.
+  if (UDTIdx >= 0) and IsAllocCall(ExprNode, AllocFn) and
+     (UDTFieldPtrPointee(UDTIdx, UpperCase(VarToStr(MemberNode.Value))) <> '') and
+     EmitAllocRecordBlockValue(UpperCase(UDTFieldPtrPointee(UDTIdx, UpperCase(VarToStr(MemberNode.Value)))),
+                               AllocFn, ExprNode, ExprVal) then
+  begin
+    UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT);
+    EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ExprVal),
+                    MakeSSAConstInt(Slot));
+    Exit;
+  end;
   if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then
   begin
     // Not a field — a PROPERTY setter? obj.prop = expr -> SUB Type.prop.SET(expr).
@@ -31683,6 +38332,35 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode;
+  out Val: TSSAValue): Boolean;
+// FreeBASIC builds a TEMPORARY when an argument is not of the parameter's UDT type and that UDT
+// declares a constructor taking it: "Sub s( ByRef f As foo )" called as "s( 5 )" constructs "foo( 5 )"
+// and passes it. Without this the scalar was staged into the int slot AS IF IT WERE A RECORD HANDLE,
+// and the callee's first field access faulted - an access violation, not a diagnostic, which is the
+// worst way for a missing conversion to show.
+// ⛔ Only when a constructor really MATCHES. EmitUDTTemporary falls back to aggregate field init when
+// none does, and that would silently store the value into the first field of a type fbc would refuse
+// the call for.
+var
+  Args: TASTNode;
+  Lbl: string;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if (ArgExpr = nil) or (FindUDT(ParamTypeU) < 0) then Exit;
+  Args := TASTNode.Create(antExpressionList, ArgExpr.Token);
+  try
+    Args.AddChild(ArgExpr.Clone);
+    Lbl := ResolveConstructorLabel(ParamTypeU, ArgSigFromArgs(Args), ArgUdtSigFromArgs(Args),
+                                   ArgWidthSigFromArgs(Args, True));
+    if Lbl = '' then Exit;
+    Result := EmitUDTTemporary(ParamTypeU, Args, Val);
+  finally
+    Args.Free;
+  end;
+end;
+
 procedure TSSAGenerator.StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);
 // Evaluate each argument, coerce to the parameter's type, and stage it into the matching transfer slot.
 // The parameter layout is taken from ParamOwnerName's declaration (so a virtual call stages per the base
@@ -31697,6 +38375,7 @@ var
   Decl, ParamList, ArgExpr, ParamI: TASTNode;
   i, NArgs, Slot, NStage: Integer;
   RT: TSSARegisterType;
+  ParamUdtU: string;
   ArgVal, TempVal2: TSSAValue;
   StageSlots: array of Integer;
   StageRTs: array of TSSARegisterType;
@@ -31719,6 +38398,13 @@ begin
   for i := 0 to NArgs - 1 do
     MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i));
 
+  // ⭐ ...and so does the FUNCPTR SIGNATURE a parameter declares. "takeB( @fun )" against
+  // "Sub takeB( ByVal p As Function(ByRef As B) As T )" tells @fun which overload it wants, exactly as
+  // a DIM or a funcptr FIELD does - the third place a destination knows and the argument does not.
+  for i := 0 to NArgs - 1 do
+    if ParamList.GetChild(i).Attributes.Values['FUNCPTR'] = '1' then
+      StampFuncPtrTarget(ArgListNode.GetChild(i), ParamList.GetChild(i).Attributes.Values['FPPARAMS']);
+
   // Phase 1: evaluate every explicit argument (in source order, preserving side-effect order) into a
   // bank register, recording its target transfer slot.
   for i := 0 to NArgs - 1 do
@@ -31740,7 +38426,52 @@ begin
     // value, so the function can return a reference into the caller's variable (min(a,b)=0). Gated to
     // int-banked params (address and slot are both int). The arg was address-backed by
     // CollectAddressTakenVars; EmitVarAddress yields its stable packed address.
-    if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) and
+    // A UDT parameter given something that is NOT one: FreeBASIC constructs a temporary through the
+    // matching constructor. Asked FIRST, because the shapes below all assume the staged int already IS
+    // a record handle - and a scalar staged as one faults on the callee's first field access.
+    ParamUdtU := '';
+    ParamI := ParamList.GetChild(i);
+    if (ParamI.Attributes.Values['ARRAY'] <> '1') and (ParamI.ChildCount >= 1) and
+       (ParamI.GetChild(0).NodeType = antIdentifier) and
+       // ⛔ NEVER PARAMETER 0 OF A METHOD. That one is the implicit THIS, and it is declared As <the
+       // owner type> - so an object reached through a BASE-class pointer looks like "not a subtype of
+       // the parameter" and was CONSTRUCTED AFRESH: the manual's udt/extends2 then dispatched every
+       // virtual call on the new temporary and answered "animal" for a dog. A THIS is never converted.
+       // ⛔⛔ ...AND "A METHOD" IS NOT "A NAME WITH A DOT IN IT". A SUB declared inside a NAMESPACE has
+       // a dotted label too ("NS1.S1"), so this guard silently switched the whole implicit conversion
+       // off for the FIRST parameter of every namespaced procedure - and fbc's structs/udt-ops family
+       // declares all of its types and subs inside one. The implicit THIS is asked for by NAME, which
+       // is what the parser really inserts, and the dotted test is kept beside it so the method case
+       // is bit-for-bit the one that was there.
+       not ((i = 0) and (Pos('.', ParamOwnerName) > 0) and
+            (UpperCase(VarToStr(ParamI.Value)) = 'THIS')) and
+       not ((ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount = 1)) then
+    begin
+      ParamUdtU := UpperCase(VarToStr(ParamI.GetChild(0).Value));
+      // ...and only from something that is NOT already an object OF THAT FAMILY: a POINTER is an
+      // address, and a record whose type IS the parameter's - or DERIVES from it - is an up-cast, and
+      // neither of those is a construction.
+      // ⛔ BUT AN UNRELATED RECORD IS ONE. The test used to be "the argument is a record at all", and
+      // that is the whole of fbc's structs/udt-ops family: "Sub s( ByVal u As TU )" called with a TV,
+      // where TU declares "Constructor( ByRef As TV )", runs that constructor. We ran nothing - the TV
+      // handle was staged straight into a slot the callee reads as a TU - so the conversion the seven
+      // udt-ops files exist to measure never happened even once.
+      // ⚠️ The narrowing that made the old test right is kept, and it is IsSubtypeOf: an object reached
+      // through its base is still never reconstructed. And TryEmitImplicitUDTArg still requires a
+      // constructor that really MATCHES, so an unrelated record with no such ctor stages as before.
+      if (Pos(' PTR', ParamUdtU) > 0) or (FindUDT(ParamUdtU) < 0) or
+         (DeclaredPointerTypeOfArg(ArgExpr) <> '') then
+        ParamUdtU := ''
+      else if ObjectTypeName(ArgExpr) <> '' then
+      begin
+        if IsSubtypeOf(UpperCase(ObjectTypeName(ArgExpr)), ParamUdtU) or
+           IsSubtypeOf(ParamUdtU, UpperCase(ObjectTypeName(ArgExpr))) then
+          ParamUdtU := '';
+      end;
+    end;
+    if (ParamUdtU <> '') and TryEmitImplicitUDTArg(ParamUdtU, ArgExpr, ArgVal) then
+      // handled: ArgVal holds the temporary's record handle
+    else if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) and
        (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
        (ArgExpr.NodeType = antIdentifier) then
       ArgVal := EmitVarAddress(VarToStr(ArgExpr.Value))
@@ -31755,6 +38486,9 @@ begin
     // string's ADDRESS, which is what SADD/STRPTR yield here. Without it the string register's INDEX was
     // staged into the int slot and the callee dereferenced address 1. A FOR over a UDT iterator built
     // from string literals is exactly this conversion.
+    // A WSTRING variable for a WSTRING PTR parameter: its UCS-2 BUFFER's address, not SADD.
+    else if (RT = srtInt) and TryEmitWStringPtrArg(ParamList.GetChild(i), ArgExpr, ArgVal) then
+      // handled: ArgVal already holds the buffer address
     else if (RT = srtInt) and IsStringArgForBytePtrParam(ParamList.GetChild(i), ArgExpr) then
     begin
       ProcessStringExpression(ArgExpr, ArgVal);
@@ -31767,6 +38501,22 @@ begin
       // The parameter wants a STRING, so a UDT argument carrying "Operator T.Cast() As String" converts
       // through it. Without this the record handle was staged into the string slot and the callee saw "0".
       ProcessStringExpression(ArgExpr, ArgVal)
+    // ⭐ A BYVAL UDT PARAMETER IS INITIALISED TOO: fbc builds a "Type( ... )" argument straight into
+    // the parameter's own copy, so "byval_p( Type(1) )" runs ONE destructor, not two. A BYREF parameter
+    // does not - the temporary stays a temporary - and neither does a function result in either
+    // position. All three measured.
+    else if (ParamList.GetChild(i).Attributes.Values['BYVAL'] = '1') and
+            (ParamList.GetChild(i).ChildCount >= 1) and
+            (ParamList.GetChild(i).GetChild(0).NodeType = antIdentifier) and
+            (FindUDT(UpperCase(VarToStr(ParamList.GetChild(i).GetChild(0).Value))) >= 0) then
+    begin
+      Inc(FElidingLiteralTemp);
+      try
+        ProcessExpression(ArgExpr, ArgVal);
+      finally
+        Dec(FElidingLiteralTemp);
+      end;
+    end
     else
       ProcessExpression(ArgExpr, ArgVal);
     // Materialize into the parameter's bank register now, so the value survives a nested call in a later
@@ -31800,7 +38550,7 @@ begin
     ParamI := ParamList.GetChild(i);
     if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
     begin
-      ProcessExpression(ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      ProcessDefaultValue(ParamI, ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
       Slot := ParamBankAndSlot(ParamList, i, RT);
       case RT of
         srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
@@ -31853,9 +38603,24 @@ begin
   if not FInDispatcher then EmitSharedSyncIn;
 end;
 
-procedure TSSAGenerator.EmitProcedureCall(const Name: string; ArgListNode: TASTNode);
+procedure TSSAGenerator.EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
 // Static call: stage args then ssaCallSub to the named procedure.
+//
+// ⛔ AN OVERLOADED NAME HAS NO BARE LABEL - the parser gives every member of the set a "~<sig>"
+// suffix - so the label has to be RESOLVED here, exactly as the expression form and the method form
+// already do. This one did not, and it showed the day two procedures came to share a name WITHOUT
+// the program overloading anything: two namespaces each declaring "Sub f()" are decorated as one
+// overload set at PARSE time, long before the namespace pass gives them different names, so the
+// STATEMENT call "f" asked for "N1.F" while the definition was "N1.F~". "Undefined procedure: N1.F",
+// and with a MODULE-level f beside them the GLOBAL call died too. ⭐ ResolveCallLabel answers the
+// name itself when it is not overloaded, so a program with no overload set is untouched.
+var
+  Name: string;
+  Resolved: string;
 begin
+  Name := Name0;
+  Resolved := ResolveCallLabel(Name, ArgListNode);
+  if Resolved <> '' then Name := Resolved;
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('call'));
   StageCallArgs(Name, ArgListNode);
@@ -31880,7 +38645,9 @@ begin
   if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antArgumentList) then
     ArgList := Node.GetChild(0);
   // FreeBASIC "Deallocate(p)": free the raw byte block p points at. (Not a declared SUB; intercepted.)
-  if (UpperCase(VarToStr(Node.Value)) = 'DEALLOCATE') and Assigned(ArgList) and (ArgList.ChildCount >= 1) then
+  if ((UpperCase(VarToStr(Node.Value)) = 'DEALLOCATE') or
+      ((UpperCase(VarToStr(Node.Value)) = 'FREE') and (FProcedureNames.IndexOf('FREE') < 0))) and
+     Assigned(ArgList) and (ArgList.ChildCount >= 1) then
   begin
     ProcessExpression(ArgList.GetChild(0), PtrVal);
     EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), EnsureIntRegister(PtrVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -31899,6 +38666,20 @@ begin
       (UpperCase(VarToStr(Node.Value)) = kCLEAR) or (UpperCase(VarToStr(Node.Value)) = kFBMEMCOPYCLEAR)) then
   begin
     EmitRawMemOp(UpperCase(VarToStr(Node.Value)), ArgList, PtrVal);
+    Exit;
+  end;
+  // fbc's RUNTIME LIBRARY, declared by the program itself: "Declare Sub fb_I18nSet Alias "fb_I18nSet"
+  // ( ByVal on_off As Long )" and then called. fbc resolves it in libfb; here it named nothing and the
+  // whole module was refused with "Undefined procedure: FB_I18NSET" - three of fbc's own datetime tests
+  // die on that one line, and behind it are 80 assertions about DateSerial/DatePart/TimeSerial that
+  // nobody had ever seen. fb_I18nSet(0) turns localisation OFF, which is this VM's permanent state (we
+  // have no locale tables at all), so honouring it is a NO-OP and honouring it faithfully means
+  // evaluating the argument and doing nothing. Declared in BASIC.md.
+  if (UpperCase(VarToStr(Node.Value)) = 'FB_I18NSET') and
+     (FProcedureNames.IndexOf('FB_I18NSET') < 0) then
+  begin
+    if Assigned(ArgList) and (ArgList.ChildCount >= 1) then
+      ProcessExpression(ArgList.GetChild(0), PtrVal);   // the argument is still evaluated
     Exit;
   end;
   // M4.4f: BASE[(args)] inside a constructor body calls the owner type's parent constructor on THIS.
@@ -31924,6 +38705,13 @@ begin
   // (the parser routes any lone identifier statement here). Treat it as a no-op instead of emitting a
   // call to an undefined PROC_ label (which the CFG pass would reject). Calls WITH arguments, or to a
   // known procedure, fall through to the normal lowering.
+  // ⛔ ...AND THE IMPLICIT THIS IS MISSING IN THE STATEMENT FORM. Inside a method body "bar 7" means
+  // "this.bar 7", exactly as "print bar(7)" means "print this.bar(7)". TryImplicitThisMethod exists and
+  // had two callers, BOTH on the expression side, so the very same call written as a statement died as
+  // "Undefined procedure: BAR" one line below its working twin. Tried before the no-op rule below: a
+  // method of the owner type is not a stray identifier.
+  if (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) and
+     TryImplicitThisMethod(UpperCase(VarToStr(Node.Value)), ArgList, Node.Token, PtrVal) then Exit;
   if (not Assigned(ArgList) or (ArgList.ChildCount = 0)) and
      (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
     Exit;
@@ -31957,6 +38745,44 @@ begin
     FProgram.SetArrayPrivate(Result);
 end;
 
+procedure TSSAGenerator.NoteArrayShape(const SlotName: string; Dynamic: Boolean);
+// File this SLOT's shape. The last word wins: a REDIM of a slot a DIM declared with subscripts makes it
+// dynamic from then on, and nothing makes a dynamic slot fixed again.
+var k: Integer;
+begin
+  if SlotName = '' then Exit;
+  if Dynamic then
+  begin
+    k := FArrShapeFixed.IndexOf(SlotName);
+    if k >= 0 then FArrShapeFixed.Delete(k);
+    if FArrShapeDyn.IndexOf(SlotName) < 0 then FArrShapeDyn.Add(SlotName);
+  end
+  else
+  begin
+    if FArrShapeDyn.IndexOf(SlotName) >= 0 then Exit;      // already known dynamic: it stays so
+    if FArrShapeFixed.IndexOf(SlotName) < 0 then FArrShapeFixed.Add(SlotName);
+  end;
+end;
+
+function TSSAGenerator.ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
+// Is the array THIS name reaches dynamic? Asked of the SLOT, which ArrayIndexOf has already resolved
+// with the full scope walk, and only then of the flat pre-scan.
+//
+// ⛔ The flat one alone is wrong for the question ERASE asks. FDynamicArrays is keyed by the BARE name
+// and written by a pre-scan with no scope, so "Sub a2: ReDim x(0 To 1)" made "Sub a1: Dim x(0 To 1)"
+// dynamic too - and ERASE then FREED a1's fixed array instead of RESETTING its elements, which for an
+// array of UDT means the constructors are never re-run. fbc's own structs/obj-array-erase counts them.
+// ⚠️ The fallback stays for a slot nothing recorded (a module array created by another path); there
+// one name means one array anyway, which is exactly where the flat registry was never wrong.
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
+  begin
+    if FArrShapeDyn.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0 then Exit(True);
+    if FArrShapeFixed.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0 then Exit(False);
+  end;
+  Result := FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0;
+end;
+
 function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string;
 // Per-proc name for a LOCAL array (a DIM inside a SUB/FUNCTION) that shadows a module array of the same
 // name. Without this the local's DeclareArray would reuse the module array's slot (REDIM semantics),
@@ -31965,6 +38791,90 @@ function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string
 // array name, so the mangled name never collides.
 begin
   Result := '@L@' + ProcName + '@' + ArrName;
+end;
+
+function TSSAGenerator.BlockArrayMangle(Serial: Integer; const ArrName: string): string;
+// Per-BLOCK name for an array declared inside a Scope / If branch / loop body. A block is a scope in
+// FreeBASIC exactly as a procedure is, and until now only the procedure half had an identity: two
+// sibling "Scope" blocks each declaring "localarray" shared ONE slot, so the first reported the
+// second's bounds (DIVERGENZE 61). The serial comes from the frame itself, so nested and repeated
+// blocks never collide, and '@' cannot occur in a user array name.
+begin
+  Result := '@B@' + IntToStr(Serial) + '@' + ArrName;
+end;
+
+function TSSAGenerator.BlockScalarName(const Name: string): string;
+// The mangled name under which one of the OPEN block scopes declared this @-TAKEN SCALAR, innermost
+// first, or '' when none did. The same walk BlockArrayName does, over the three registries that decide
+// how an @-taken scalar is BACKED - a per-frame raw slot (FAddrLocalVars), a raw module slot
+// (FRawModuleScalars), a shared 1-element array (FAddrSharedScalars).
+//
+// ⛔ It exists because the @-taken marking applies RETROACTIVELY BY NAME, and those registries are
+// keyed by the bare name: two sibling Scopes each declaring "a", the second taking "@a" of a
+// "ZString * 5", and the FIRST one's plain String is read through the second's backing - the program
+// died on its first executable line, in the scope ABOVE the one with the pointer in it. The MARK is
+// already per-declaration (it is an attribute on the DIM node); it was only the lookup that was not.
+// DIVERGENZE 56.
+//
+// ⚠️ Two attempts at narrowing the MARKING instead were measured and withdrawn on 26 Aug 2026 (fbc
+// suite CUPASS 273 -> 263, then 264): an "@" taken outside a block reaches a variable declared inside
+// it in plenty of shapes, so a block dictionary loses those. Nothing here narrows the marking - every
+// declaration is still marked, and it is the READ that now knows which declaration it is standing in.
+var
+  k: Integer;
+  nameU, mangled: string;
+begin
+  Result := '';
+  nameU := UpperCase(Name);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    if FBlockDeclVars.IndexOf(mangled) >= 0 then Exit(mangled);
+  end;
+end;
+
+function TSSAGenerator.ArrayBareName(const SlotName: string): string;
+// The USER'S name of an array slot: "@P@S1@DYN", "@L@S1@DYN" and "@B@3@DYN" all answer "DYN".
+//
+// ⛔ It exists because two halves of one question were asking it differently. The pre-scans that
+// record an array's SHAPE (ScanMultiDimArrays, CollectDynamicArrays, CollectRedimMultiArrays) walk the
+// raw AST with no scope in hand, so they file under the bare name; ArrayRank1Flag then looked the fact
+// up under the SLOT's name, which for anything proc-local or block-local is mangled and never matched.
+// The flag then said "this array is one-dimensional" about a matrix: "Dim dyn() : ReDim dyn(1 To 3,
+// 4 To 9) : Print UBound(dyn)" inside a Sub answered 18 under --aot where fbc and the interpreter
+// answer 3. A mangle is an identity for the COMPILER's tables, never for a table keyed by what the
+// user wrote.
+var
+  k: Integer;
+begin
+  Result := SlotName;
+  if (Length(Result) < 3) or (Result[1] <> '@') then Exit;
+  for k := Length(Result) downto 1 do
+    if Result[k] = '@' then Exit(Copy(Result, k + 1, MaxInt));
+end;
+
+function TSSAGenerator.BlockArrayName(const ArrName: string): string;
+// The mangled name under which one of the OPEN block scopes declared this array, innermost first, or
+// '' when none did. Resolution walks the LIVE scope stack, which is what gives the block its lifetime
+// for free: once the block is closed its frame is gone, the name stops resolving here, and a reference
+// after "End Scope" falls through to the enclosing declaration - which is precisely what FreeBASIC
+// means by block scope. The walk stops at the procedure root: a procedure's blocks are not the
+// module's.
+var
+  k: Integer;
+  nameU, mangled: string;
+begin
+  Result := '';
+  nameU := UpperCase(ArrName);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    if FProgram.FindArray(mangled) >= 0 then Exit(mangled);
+  end;
 end;
 
 procedure TSSAGenerator.RegisterArrayParams;
@@ -32040,7 +38950,13 @@ function TSSAGenerator.ArrayIndexOf(const ArrName: string): Integer;
 // of the current proc's array parameters resolves to that proc's placeholder slot (ParamArrayMangle);
 // otherwise it falls back to the global/module array table. This is what keeps a SUB's "a()" parameter
 // distinct from a module array "a" (see RegisterArrayParams). ArrName is expected UpperCase.
+var
+  BlkName: string;
 begin
+  // An OPEN block scope that declared this name owns it, innermost first: a block is nested INSIDE the
+  // procedure, so it is asked before the procedure's own parameters and locals.
+  BlkName := BlockArrayName(ArrName);
+  if BlkName <> '' then Exit(FProgram.FindArray(BlkName));
   if FInProcedure then
   begin
     Result := FProgram.FindArray(ParamArrayMangle(FCurrentProcName, ArrName));
@@ -32051,6 +38967,38 @@ begin
     if Result >= 0 then Exit;
   end;
   Result := FProgram.FindArray(ArrName);
+end;
+
+function TSSAGenerator.ArrayFactKey(const ArrName: string): string;
+// The key under which the ELEMENT FACTS of the array this name reaches are filed - is it an array of
+// UDT, of UDT pointers, of scalar pointers, of function pointers, what narrow element width, is the
+// element unsigned-64. It resolves EXACTLY as ArrayIndexOf resolves the STORAGE: the proc's array
+// PARAMETER placeholder first, then the proc's own LOCAL mangle, then the plain module name.
+//
+// ⛔ That "exactly" is the whole point, and it is what DIVERGENZE 61 is about. The slot of a local
+// array has been per-procedure since m593 (LocalArrayMangle) while these facts stayed keyed by the
+// BARE name, so two procedures each declaring "a" shared one set of element facts and the LAST DIM
+// won: "Sub one: Dim a(2) As SomeUDT" left "Sub two: Dim a(2) As Short" taking the record-element
+// store path, and "a(1) = 40000" died on an access violation (job/tests/bas/m614_*).
+// A fact and the storage it describes can no longer come from two different declarations.
+//
+// ⚠️ The fallback to the flat entry is NOT taken once the name resolves to a slot of this procedure's
+// own: absence of a fact there means "this array is not one of those", which is the right answer, not
+// a reason to go and read another declaration's. It is the second of the two conditions in
+// job/markdown/REGISTRI.md, and it is what makes the change monotone at module level - a name with no
+// per-proc slot reads precisely as it did before.
+var
+  nameU, mangled: string;
+begin
+  nameU := UpperCase(ArrName);
+  Result := nameU;
+  mangled := BlockArrayName(nameU);
+  if mangled <> '' then Exit(mangled);
+  if not FInProcedure then Exit;
+  mangled := ParamArrayMangle(FCurrentProcName, nameU);
+  if FProgram.FindArray(mangled) >= 0 then Exit(mangled);
+  mangled := LocalArrayMangle(FCurrentProcName, nameU);
+  if FProgram.FindArray(mangled) >= 0 then Exit(mangled);
 end;
 
 function TSSAGenerator.IsArrayParamSlot(Idx: Integer): Boolean;
@@ -32194,7 +39142,7 @@ procedure TSSAGenerator.LowerDeferredProcedures;
 var
   i, j, Slot, PUDT, OwnerUDT, WIdx: Integer;
   Proc, NameNode, ParamList, ParamNodeJ, BaseCallNode: TASTNode;
-  Name, LabelName, ParentType: string;
+  Name, LabelName, ParentType, CopyCtorLbl: string;
   RT: TSSARegisterType;
   ParamReg, LcHandle, RetZeroReg: TSSAValue;
   TrailingReturnLive: Boolean;
@@ -32219,6 +39167,7 @@ begin
     // Establish procedure context (for "fname = expr" results, RETURN, EXIT SUB/FUNCTION).
     FInProcedure := True;
     FCurrentProcName := Name;
+    FDefinedLabels.Clear;                 // labels belong to the procedure being lowered
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = kFUNCTION);
     FCurrentProcRetType := GetVariableType(Name);
     FCurrentProcByrefRet := ByrefRetByAddress(Name);      // BYREF result: the function returns an address
@@ -32229,13 +39178,20 @@ begin
     FResultExits := 0;
     FResultExitsStaged := 0;
     FCurrentProcLocalRecs.Clear;                          // V5: gather DIM'd local UDTs for dtors
+    FCurrentProcNonRecs.Clear;                            // ...and the non-record locals that SCREEN one
     FCurrentProcByvalRecs.Clear;                          // V5d: BYVAL UDT param copies (filled in prologue)
     FCurrentProcByrefScalars.Clear;                       // BYREF: explicit-BYREF scalar params (filled in prologue)
     FCurrentProcAddrParams.Clear;                         // BYREF-return: address-carrying params (filled in prologue)
     FCurrentProcPtrParams.Clear;                          // "param AS T PTR" of this proc (filled in prologue)
     FCurrentProcPtrLocals.Clear;
     CollectProcPtrLocals(Proc);                           // "DIM x AS T PTR" in THIS body (see the method)
-    FFuncPtrSigs.Clear;                                   // function-pointer params/locals of THIS proc (filled in prologue / ProcessDim)
+    // ⛔ ...AND A MODULE-LEVEL FUNCTION POINTER IS VISIBLE IN EVERY PROCEDURE, so wiping the registry
+    // here threw its signature away: "Dim Shared pf As Function() As Integer = @foo" called from
+    // module level lowered to an indirect call and the IDENTICAL call one line inside a Sub lowered to
+    // a plain READ of the pointer - it PRINTED the entry PC (46, 21) instead of calling through it, in
+    // silence. Re-seeded rather than cleared; a local or parameter of the same name overwrites its
+    // entry, so it still shadows the module one exactly as before.
+    FFuncPtrSigs.Assign(FModuleFuncPtrSigs);              // function-pointer params/locals of THIS proc, over the module's
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
@@ -32346,7 +39302,28 @@ begin
                             MakeSSAConstInt(FUDTs[PUDT].LiveBytes), MakeSSAConstInt(0),
                             MakeSSAConstInt(FUDTs[PUDT].NStr or (Int64(PUDT) shl 32)));
             EmitRecordInit(LcHandle, PUDT);
-            EmitRecordCopy(LcHandle, ParamReg, PUDT);              // copy caller's record in
+            // ⛔ ...and a type that declares a COPY CONSTRUCTOR gets it CALLED. A BYVAL UDT parameter is
+            // a copy, and fbc builds that copy with "Constructor(ByRef As T)" when there is one: it
+            // counted one copy-ctor call where we counted none, because a plain field copy is what we
+            // always did. Without a copy constructor the field copy is still exactly right, and is what
+            // a type that declares none should get - the same rule "Dim As T b = a" already follows.
+            // ⛔ THE EXACT LABEL, not the resolver. ResolveConstructorLabel FALLS BACK - by bank, then by
+            // arity - so on a type whose only one-parameter constructor takes an Integer it answered
+            // THAT one, and a byval parameter was "constructed" from its own handle read as a number
+            // (m558 caught it at once). A copy constructor is the label that names the type itself.
+            CopyCtorLbl := UpperCase(FUDTs[PUDT].Name) + '.CONSTRUCTOR#I:' + UpperCase(FUDTs[PUDT].Name);
+            if not FProcDecls.ContainsKey(CopyCtorLbl) then CopyCtorLbl := '';
+            if CopyCtorLbl <> '' then
+            begin
+              // THIS in int slot 0, the source handle in slot 1 - the layout every one-parameter
+              // constructor call uses. The argument is already a VALUE here, so the AST-driven
+              // EmitConstructorCall cannot be reused as it stands.
+              EmitXferStore(srtInt, 0, LcHandle);
+              EmitXferStore(srtInt, 1, EnsureIntRegister(ParamReg));
+              EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
+            end
+            else
+              EmitRecordCopy(LcHandle, ParamReg, PUDT);            // copy caller's record in
             EmitInstruction(ssaCopyInt, ParamReg, LcHandle,        // param var := local copy handle
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             // V5d: this BYVAL copy is frame-owned -> destruct it at frame exit (after the locals).
@@ -32378,6 +39355,16 @@ begin
     begin
       FCurrentResultHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitXferLoad(srtInt, XFER_RESULT_HANDLE_SLOT, FCurrentResultHandle);
+      // V5f: ...AND THE RESULT IS DEFAULT-CONSTRUCTED, unless the body uses RETURN. fbc constructs the
+      // result object of a UDT-returning function exactly once; "Return expr" constructs it FROM that
+      // expression (a copy, which counts no default ctor), while "Function = expr" assigns to an
+      // already-constructed object and a body that sets nothing still hands back a constructed one.
+      // fbc's own suite asserts it: functions/udt-result's "default" test calls a function with an
+      // EMPTY body and requires the constructor count to have gone up ("result should still be
+      // constructed"). The caller allocated the storage and ran EmitRecordInit on it; what was missing
+      // is the ctor BODY.
+      if not BodyHasReturnStatement(Proc) then
+        EmitConstructorCall(FCurrentResultHandle, FCurrentProcRetRecType, nil);
     end;
 
     // Default-initialise the scalar result slot (FreeBASIC: an unset function result is 0 / "" ). The
@@ -32500,10 +39487,12 @@ begin
     FCurrentBlock := nil;   // procedure body terminated
     FInProcedure := False;
     FCurrentProcName := '';
+    FDefinedLabels.Clear;                 // back to module scope: its own labels, its own set
     FCurrentThisType := '';
     FCurrentProcRetRecType := '';
     FCurrentResultHandle := MakeSSAValue(svkNone);
     FCurrentProcLocalRecs.Clear;
+    FCurrentProcNonRecs.Clear;
     // SSAPROF
     {$IFDEF DEBUG_SSAPROF}
     if GetEnvironmentVariable('SSA_PROF') <> '' then
@@ -32558,8 +39547,10 @@ procedure TSSAGenerator.ProcessStatement(Node: TASTNode);
 // runs HERE for every statement; ProcessStatementFull must only be called from this wrapper.
 var
   i: Integer;
+  TempDepth: Integer;   // V5f: result temporaries owned by THIS statement start here
 begin
   if Node = nil then Exit;
+  TempDepth := FResultTemps.Count;
 
   // MODERN (FreeBASIC, no line numbers): stamp each statement's physical source line into
   // FCurrentLineNumber so emitted instructions carry it in the source map. This makes ERL and
@@ -32610,9 +39601,12 @@ begin
     antProcedureCall: ProcessProcedureCall(Node);
     antTypeDecl:
       // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit — except a nested
-      // ENUM, whose members are module constants and still need their values assigned.
+      // ENUM, whose members are module constants and still need their values assigned, and a nested
+      // CONST, which is the same arrangement under another keyword.
       for i := 0 to Node.ChildCount - 1 do
-        if Node.GetChild(i).NodeType = antEnum then
+        if (Node.GetChild(i).NodeType = antEnum) or
+           ((Node.GetChild(i).NodeType = antDim) and
+            (Node.GetChild(i).Attributes.Values['TYPECONST'] = '1')) then
           ProcessStatement(Node.GetChild(i));
     antProgram, antStatement, antThen, antElse:
       for i := 0 to Node.ChildCount - 1 do
@@ -32620,6 +39614,11 @@ begin
   else
     ProcessStatementFull(Node);
   end;
+  // V5f: a call to a function returning a UDT BY VALUE leaves a caller-allocated record behind, and
+  // fbc destroys it at the end of the statement that made the call. Every consumer copies OUT of that
+  // record (EmitRecordCopy), so nothing else owns it; without this we ran exactly one destructor
+  // fewer per such call. Emitted here, in the ONE funnel every statement goes through.
+  if FResultTemps.Count > TempDepth then FlushResultTemps(TempDepth);
 end;
 
 procedure TSSAGenerator.ProcessStatementFull(Node: TASTNode);
@@ -32640,11 +39639,14 @@ var
   ExprResult, LineNumReg: TSSAValue;  // For TRAP command
   AddrVal, AddrReg, ValueReg: TSSAValue;  // For POKE command
   ExitKind: string;       // M2: EXIT/RETURN kind
+  LabelScope: string;     // where a duplicated label was found, for the message
   IsExitStmt: Boolean;    // M2
   IsContinueStmt: Boolean; // FreeBASIC CONTINUE
   ExitLevels, ExitLoopIdx, ExitAllDepth: Integer;  // multi-level EXIT/CONTINUE
   ExitLoopKind: TLoopKind;
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
+  ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
+  TmpCallNode: TASTNode;        // a bare qualified name used as a statement call (we free it)
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
 begin
   if Node = nil then Exit;
@@ -32763,20 +39765,63 @@ begin
       ProcessProcedureCall(Node);
     antTypeDecl:
       // UDT declaration: registered in the pre-scan (RegisterUDTs); nothing to emit here — except a
-      // nested ENUM, whose members are module constants and still need their values assigned.
+      // nested ENUM, whose members are module constants and still need their values assigned, and a
+      // nested CONST, which is the same arrangement under another keyword.
       for i := 0 to Node.ChildCount - 1 do
-        if Node.GetChild(i).NodeType = antEnum then
+        if (Node.GetChild(i).NodeType = antEnum) or
+           ((Node.GetChild(i).NodeType = antDim) and
+            (Node.GetChild(i).Attributes.Values['TYPECONST'] = '1')) then
           ProcessStatement(Node.GetChild(i));
-    antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction:
+    antMemberAccess, antArrayAccess, antFunctionCall, antGraphicsFunction, antThreadCreate:
       // Statement-level call for side effects (e.g. obj.method(args), a function/array expression used
       // as a statement, or GETMOUSE(x,y) called for its by-reference writes). Lower and discard the result.
+      // ⛔ antThreadCreate had to be named here EXPLICITLY. The parser now reaches "threadcreate( @p )"
+      // written as a statement, and without this arm the node fell off the dispatcher and the call was
+      // DROPPED: the thread never started, "n" stayed 0, and the program exited 0. That is a refusal
+      // traded for a silent wrong answer - measured with a side-effecting probe, not assumed, because
+      // the file COMPILED either way and a COMPILE_ONLY test cannot tell the two apart.
       ProcessExpression(Node, RetVal);
+    antIdentifier:
+      // ⭐ A NAMESPACE-QUALIFIED SUB CALLED AS A BARE STATEMENT: "ns3.dotest", no parentheses. It parses
+      // as an antMemberAccess - which the arm just above lowers - but the NAMESPACE pass collapses a
+      // qualified name into ONE mangled identifier, and a bare identifier was no statement at all: the
+      // call fell off the end of this dispatcher, was DROPPED IN SILENCE (one warning on stderr, which
+      // no net reads) and the program ran on without it. fbc's own namespace/dups2 calls its test
+      // procedure exactly that way. ⛔ The same call WITH parentheses always worked, which is what said
+      // the defect was in the statement form and not in the name.
+      // Only a name that really is a procedure: a bare variable name is not a statement, and turning
+      // one into a call would invent a program. Routed through the very node the parser builds for an
+      // unqualified "s", so there is ONE lowering for a bare call and not two.
+      if (VarToStr(Node.Value) <> '') and
+         (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) >= 0) then
+      begin
+        TmpCallNode := TASTNode.CreateWithValue(antProcedureCall, VarToStr(Node.Value), Node.Token);
+        try
+          TmpCallNode.AddChild(TASTNode.Create(antArgumentList, Node.Token));
+          ProcessProcedureCall(TmpCallNode);
+        finally
+          TmpCallNode.Free;
+        end;
+      end;
     antLabel:
     begin
       // Named label "name:" — start a new basic block 'LABEL_<NAME>' (the GOTO/GOSUB
       // target), with a fall-through edge from the previous block. Mirrors the
       // antLineNumber handling above (case-insensitive name).
-      LabelName := 'LABEL_' + UpperCase(VarToStr(Node.Value));
+      LabelName := NamedLabelBlockName(VarToStr(Node.Value));
+      // ⛔ A label DEFINED TWICE in the same procedure is an error - fbc: "error 4: Duplicated
+      // definition". GetOrCreateBlock quietly reused the first block instead, so the second GoTo
+      // jumped to the FIRST label: two scopes each ending in "skip:" turned into an INFINITE LOOP
+      // that printed the first scope for ever. A silent miscompile is worse than a missing message,
+      // which is why this is a refusal and not a warning.
+      if FDefinedLabels.IndexOf(LabelName) >= 0 then
+      begin
+        if FCurrentProcName = '' then LabelScope := 'the module'
+        else LabelScope := UpperCase(FCurrentProcName);
+        raise Exception.CreateFmt('Duplicated definition: label "%s" is defined more than once in %s',
+          [UpperCase(VarToStr(Node.Value)), LabelScope]);
+      end;
+      FDefinedLabels.Add(LabelName);
       if not Assigned(FCurrentBlock) or (FCurrentBlock.LabelName <> LabelName) then
       begin
         PrevBlock := FCurrentBlock;
@@ -32997,9 +40042,28 @@ begin
           // FreeBASIC BYREF result: stage the ADDRESS of the returned variable. An address-carrying
           // BYREF param already holds the caller variable's address (min(a,b)=0); any other named var
           // returns its own backing address.
-          if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
+          // ...and "Return ByVal p" first of all: the value IS the address (see the "Function =" twin).
+          if FCurrentProcByrefRet and
+             (UpperCase(Node.GetChild(0).Attributes.Values['ARGPASSMODE']) = 'BYVAL') then
+          begin
+            ProcessExpression(Node.GetChild(0), RetVal);
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal));
+          end
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
              IsAddrParam(VarToStr(Node.GetChild(0).Value)) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(Node.GetChild(0).Value))))
+          // ...and the same field named WITHOUT "This." - see the "f = expr" spelling, which has to
+          // carry the identical rule or one form of an operator works and the other hands back 0.
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
+                  TryImplicitThisField(VarToStr(Node.GetChild(0).Value), Node.GetChild(0).Token, ThisFieldNode) then
+          begin
+            try
+              EmitFieldAddress(ThisFieldNode, RetVal);
+              EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal));
+            finally
+              ThisFieldNode.Free;
+            end;
+          end
           else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
           // ...and an INDEXED byte on the raw heap is just as addressable as a named variable:
@@ -33007,6 +40071,10 @@ begin
           // operator, and only a bare name was ever recognised here.
           else if FCurrentProcByrefRet and
                   TryEmitIndexedElementAddress(Node.GetChild(0), RetVal) then
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
+          // ...and "Return *<expr>", the same place in its other spelling.
+          else if FCurrentProcByrefRet and
+                  TryEmitDerefTargetAddress(Node.GetChild(0), RetVal) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, RetVal)
           // ...and a FIELD, which is what an assignable "Operator Cast() ByRef As T" hands back:
           // "Return This.I". Its address is a record-field pointer, and the ssaRefLoad/ssaRefStore the
@@ -33443,6 +40511,7 @@ var
   LastBlock: TSSABasicBlock;
   LastInstr: TSSAInstruction;
   LastArr: Integer;
+  PsI: Integer;          // pre-scan cursor over the static ARRAY members
   DefCh: Char;
   {$IFDEF DEBUG_SSAPROF}
   ProfT0, ProfFreq: Int64;
@@ -33500,6 +40569,13 @@ begin
   // UDT/record types (M3): register TYPE declarations and DIM..AS variable types BEFORE
   // variable pre-allocation, so record vars are allocated as int handles and DIM..AS builtin
   // vars use their declared bank.
+  // The ENUM type names FIRST: a declared name's BANK depends on them, and both the UDT FIELD layout
+  // (inside RegisterUDTs) and the DIM pre-scan ask that question before anything else fills the
+  // registry. Moving it one pass later left an enum FIELD banked as a float while the enum VARIABLE
+  // was already right - the guard found that, which is the whole point of writing one.
+  FEnumNames.Clear;
+  FEnumQualVals.Clear;
+  CollectEnumNames(AST);
   RegisterUDTs(AST);
   CheckOverrideAnnotations;   // MODERN: OVERRIDE/FINAL, once every TYPE is known
   // These must be cleared BEFORE RegisterRecordVars: that pre-pass records the print-kind of unsigned
@@ -33559,7 +40635,21 @@ begin
     // PMAP returns a SINGLE - kind 4 - so it shows 7 significant digits, not a double's 16:
     // fbc prints 9.90099 where the same mapping in double precision is 9.900990099009901.
     FVarPrintKind.AddObject(kPMAP, TObject(PtrInt(4)));
+    // ...and their WIDTHS, in the registry SizeOf reads. RGB/RGBA answer a ULONG - four bytes - and
+    // "SizeOf(RGB(0,0,0))" gave the 8-byte default because only the PRINT form of these names was
+    // recorded here. Code 6 is u32, the same one a "Dim As ULong" carries.
+    FVarWidthCode.AddObject(kRGB, TObject(PtrInt(6)));
+    FVarWidthCode.AddObject(kRGBA, TObject(PtrInt(6)));
+    FVarWidthCode.AddObject(kPMAP, TObject(PtrInt(7)));   // 7 = SINGLE
   end;
+  // ⛔ ONE FACT, COLLECTED EARLY. RegisterRecordVars is where "Var v = f()" infers its type, and it
+  // asked FProcedureNames - which PreCollectProcedures fills a hundred lines further down, so a VAR
+  // initialised from a UDT-returning FUNCTION inferred INTEGER and held the record's HANDLE ("Var f2 =
+  // mk2() : Print f2.bar" printed 1 where fbc prints 5678, while the explicit "Dim As T f3 = mk2()",
+  // which needs no inference, was right). ⚠️ Moving the whole collector up was tried and broke NINE
+  // corpus programs - other passes between the two depend on the order - so only the one fact this
+  // needs is gathered here.
+  PreCollectFuncRetTypes(AST);
   RegisterRecordVars(AST);
 
   // M6: collect DIM SHARED scalars and assign them dedicated transfer slots (runs after type
@@ -33567,17 +40657,20 @@ begin
   FSharedVars.Clear;
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
+  FVarDeclTypeName.Clear;
   FScalarPtrBanks.Clear;
   FAddrTakenScalars.Clear;
   FRawModuleScalars.Clear;
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
+  FRawFromAddrOf.Clear;   // beside FRawPtrVars: it records WHY one of them is raw
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
   FByrefRetValue.Clear;
   FRawPtrRetFuncs.Clear;
   FBlockManagedTypes.Clear;
   FConstDeclSeen.Clear;
+  FConstStrBytes.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
@@ -33585,13 +40678,19 @@ begin
   CollectBlockManagedTypes(AST);   // before the raw-pointer fixpoint: it asks whether New T[n] is managed
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
+  // ...and only NOW can a field ARRAY be sized: its bound is routinely a module CONST, and those
+  // are collected by the walk just above. See the note on the pass.
+  CheckAllFieldArraySizes;
   // OOP static member variables: back each "Static x AS t" type field with a shared global scalar.
   FStaticMembers.Clear;
+  FStaticMemberArrays.Clear;
+  FStaticMemberTypes.Clear;
   CollectStaticMembers(AST);
   // FreeBASIC ENUM members: back each module-level member with a shared global int scalar so it is
   // visible inside SUB/FUNCTION bodies (MODERN only; CLASSIC has no procedure scope).
   FEnumMembers.Clear;
   CollectEnumMembers(AST);
+  CollectTypeConsts(AST);
   // FreeBASIC raw pointers: vars assigned from Allocate/CAllocate/Reallocate (and CAST/copies of raw).
   // Iterate to a fixpoint so raw-ness propagates through copies regardless of statement order.
   // (Stage 2 byte-backing of address-taken arrays was withdrawn: a managed/raw mix is unsound at function
@@ -33609,6 +40708,7 @@ begin
   until not FRawCollectChanged;
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
+  FBlockDeclVars.Clear;
   FFixedLenVars.Clear;
   FZStringVars.Clear;
   FRawFixedLenNode := nil;
@@ -33621,8 +40721,21 @@ begin
   // Dynamic arrays (declared empty "()" or any REDIM target): a REDIM can change the lower bound at run
   // time (and a ByRef writeback can propagate that changed bound back to a caller's array), so their
   // element access subtracts the RUNTIME lower bound instead of the compile-time DIM one.
+  FRankStatedArrays.Clear;
+  FRankPoisoned.Clear;
+  FArrShapeDyn.Clear;
+  FArrShapeFixed.Clear;
   FDynamicArrays.Clear;
   CollectDynamicArrays(AST);
+  // ...and an EMPTY static ARRAY member ("Static a()") is dynamic too: ERASE frees it and it reports
+  // LBound 0 / UBound -1 afterwards. The pre-scan above reads DIM/REDIM nodes and a static member has
+  // neither in a shape it recognises, so its backing is added here - AFTER the Clear that would
+  // otherwise drop it.
+  for PsI := 0 to FStaticMemberArrays.Count - 1 do
+    if (FProgram.GetArray(PtrInt(FStaticMemberArrays.Objects[PsI])).DimCount = 1) and
+       (FProgram.GetArray(PtrInt(FStaticMemberArrays.Objects[PsI])).Dimensions[0] = 0) and
+       (FDynamicArrays.IndexOf(FStaticMemberArrays[PsI]) < 0) then
+      FDynamicArrays.Add(FStaticMemberArrays[PsI]);
 
   // M8: reset block-scope state (block-scoped record reclamation; the scope stack itself was reset above).
   FBlockHandledVars.Clear;
@@ -33635,6 +40748,8 @@ begin
   FModuleCtors.Clear;
   FModuleDtors.Clear;
   CollectModuleCtorDtors(AST);
+  OrderModuleCtorDtorList(FModuleCtors);
+  OrderModuleCtorDtorList(FModuleDtors);
 
   // FreeBASIC DEFINT/DEFSTR...: collect default-type-by-initial BEFORE pre-allocating variables,
   // so a bare name gets its DEF bank (PreAllocateVariables binds via GetVariableType).
@@ -33701,6 +40816,11 @@ begin
   // after static-member allocation). No-op when the program defines none. Pre-size SHARED-scalar backings
   // first so a constructor can touch module globals before their DIM statement runs.
   EmitSharedScalarAllocs;
+  // ...and only NOW can a UDT-typed static member get its instance: the line above would have zeroed a
+  // handle stored earlier, and a constructor label did not exist before PreCollectProcedures.
+  EmitStaticMemberRecords;
+  EmitSharedScalarConstInits(AST);
+  EmitSharedArrayAllocs(AST);
   EmitModuleConstructors;
 
   // Process AST (DATA statements will be skipped since they're already processed).
@@ -33778,7 +40898,7 @@ begin
   // it had the same defect as the JIT for exactly the same reason: it trusted DimCount, which a bare
   // "Dim dyn()" leaves at 1 however the REDIM later shapes the array.
   for LastArr := 0 to FProgram.GetArrayCount - 1 do
-    if FMultiDimArrays.IndexOf(UpperCase(FProgram.GetArray(LastArr).Name)) >= 0 then
+    if FMultiDimArrays.IndexOf(ArrayBareName(UpperCase(FProgram.GetArray(LastArr).Name))) >= 0 then
       FProgram.SetArrayMultiDim(LastArr);
 
   Result := FProgram;
@@ -33811,7 +40931,7 @@ begin
   Result := FConstFloatRegs.TryGetValue(RegIndex, ConstValue);
 end;
 
-function TSSAGenerator.TryGetConstantInt(RegIndex: Integer; out ConstValue: Integer): Boolean;
+function TSSAGenerator.TryGetConstantInt(RegIndex: Integer; out ConstValue: Int64): Boolean;
 begin
   Result := FConstIntRegs.TryGetValue(RegIndex, ConstValue);
 end;

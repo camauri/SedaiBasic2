@@ -81,13 +81,17 @@ type
     function ParseRunFunctionForm(Token: TLexerToken): TASTNode;  // FreeBASIC Run(prog) -> -1 if it cannot start
     function ParseSpriteFunction(Token: TLexerToken): TASTNode;
     function ParseInputFunction(Token: TLexerToken): TASTNode;
-    function ParseInputFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
+    function ParseInputFunctionForm(Token: TLexerToken): TASTNode;
+    function ParseBinaryFileFunctionForm(Token: TLexerToken): TASTNode;   // FreeBASIC INPUT(n [, [#]f])
     function ParseUsrFunction(Token: TLexerToken): TASTNode;
     function ParseUserFunction(Token: TLexerToken): TASTNode;
     function ParseProcAddress(Token: TLexerToken): TASTNode;   // @subname → antProcAddress (M5.2)
     function ParseNew(Token: TLexerToken): TASTNode;           // NEW T [(args)] → antNew (FreeBASIC)
     function ParseProcSignature(Token: TLexerToken): TASTNode; // bare "Sub(...)"/"Function(...) As T" signature
     function ParseTypeConstructor(Token: TLexerToken): TASTNode; // type<T>(args) → anonymous UDT temporary
+    function ParseConstQualifier(Token: TLexerToken): TASTNode; // CONST written where a TYPE is expected: step over it
+    function ParseBraceInitializer(Token: TLexerToken): TASTNode; // { a, b, ... } aggregate initialiser in expression position
+    function ParseArgPassMode(Token: TLexerToken): TASTNode;   // BYVAL/BYREF written on an ARGUMENT at a call site
     function ParseCast(Token: TLexerToken): TASTNode;          // CAST/CPTR(type, expr) → antCast
     function ParsePeekFB(Token: TLexerToken): TASTNode;        // FB PEEK([type,] ptr) → *CPtr(T Ptr, ptr); nil if not the FB form
     function ParseSizeOfPtrType(Token: TLexerToken): TASTNode; // SIZEOF(<type> PTR) → SIZEOF("T PTR"); nil if not a pointer type
@@ -146,6 +150,9 @@ function StaticParseUserFunction(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseProcAddress(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseConstQualifier(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
+function StaticParseArgPassMode(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseDeref(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadCreate(Parser: Pointer; Token: TLexerToken): TObject;
 function StaticParseThreadSelf(Parser: Pointer; Token: TLexerToken): TObject;
@@ -306,6 +313,21 @@ end;
 function StaticParseTypeConstructor(Parser: Pointer; Token: TLexerToken): TObject;
 begin
   Result := TExpressionParser(Parser).ParseTypeConstructor(Token);
+end;
+
+function StaticParseConstQualifier(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseConstQualifier(Token);
+end;
+
+function StaticParseBraceInitializer(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseBraceInitializer(Token);
+end;
+
+function StaticParseArgPassMode(Parser: Pointer; Token: TLexerToken): TObject;
+begin
+  Result := TExpressionParser(Parser).ParseArgPassMode(Token);
 end;
 
 function StaticParseNew(Parser: Pointer; Token: TLexerToken): TObject;
@@ -495,6 +517,24 @@ begin
   // FreeBASIC "type<T>(args)" anonymous temporary as a value expression. TYPE lexes as ttTypeDecl (its
   // statement role opens a record declaration); a prefix rule here only fires in expression position.
   Context.SetParseRule(ttTypeDecl, MakePrefixRule(@StaticParseTypeConstructor, precCall));
+  // ⛔ A TYPE MAY BE QUALIFIED "CONST" WHEREVER A TYPE NAME IS EXPECTED - and one is expected in
+  // EXPRESSION position too: "SizeOf(Const UDT)", "Len(Const Integer)", "New Const T". The statement
+  // parser has SkipTypeQualifiers and fourteen readers call it; the expression grammar had no rule for
+  // the keyword at all, so each of those spellings was a syntax error on the word "const" while the
+  // very same type worked in a DIM. CONST binds to the type and changes neither its SIZE nor its
+  // IDENTITY, so the rule is to step over it and read what follows - accepted, not enforced, exactly
+  // as the statement side documents. The prefix rule fires only where a value is expected, so the
+  // CONST STATEMENT, dispatched before the expression parser is ever asked, is untouched.
+  Context.SetParseRule(ttConstant, MakePrefixRule(@StaticParseConstQualifier, precCall));
+  // FreeBASIC "{ a, b, ... }" aggregate initialiser where an EXPRESSION is expected: an argument of a
+  // type constructor ("udt = type( -1, -2, {-3, -4}, -5 )") and a tuple element of an array-of-UDT
+  // initialiser. The DIM path has read those braces for a long time; the expression grammar had no rule
+  // for '{' at all, so the same braces one comma to the left failed the whole declaration.
+  Context.SetParseRule(ttDelimBraceOpen, MakePrefixRule(@StaticParseBraceInitializer, precCall));
+  // FreeBASIC lets an ARGUMENT carry its passing mode: "f( ByVal p )" / "test_const ByVal 1234"
+  // overrides a ByRef parameter for that one call. BYVAL/BYREF lex as ttParamMode, whose statement role
+  // is a parameter declaration; a prefix rule here only fires where an expression is expected.
+  Context.SetParseRule(ttParamMode, MakePrefixRule(@StaticParseArgPassMode, precUnary));
   Context.SetParseRule(ttThreadCreate, MakePrefixRule(@StaticParseThreadCreate, precCall));
   // M5.5: THREADSELF() value + THREADCALL sub(arg) (sugar that lowers to THREADCREATE).
   Context.SetParseRule(ttThreadSelf, MakePrefixRule(@StaticParseThreadSelf, precCall));
@@ -715,6 +755,10 @@ begin
   Result := ParseExpression(precPrimary);
 end;
 
+function FoldSizedIntegerTypeName(const S: string): string; forward;
+function FoldUnsignedTypeName(const S: string): string; forward;
+function IsFBScalarTypeName(const N: string): Boolean; forward;
+
 function TExpressionParser.ParseExpressionList(Delimiter: TTokenType = ttSeparParam): TASTNode;
 var
   Expr: TASTNode;
@@ -768,8 +812,13 @@ begin
         Context.Advance;
 
       WasAny := False;
+      // ⛔ ...but "ANY PTR" IS A TYPE, not the modifier followed by an expression. "Len(Any Ptr)" had its
+      // ANY eaten here and only "Ptr" reached LEN, which answered 1 where fbc answers 8. The exclusion is
+      // on the POINTER SUFFIX alone, so every real "Instr(s, Any t)" is untouched.
       if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY')
          and Assigned(Context.PeekNext)
+         and (UpperCase(VarToStr(Context.PeekNext.Value)) <> 'PTR')
+         and (UpperCase(VarToStr(Context.PeekNext.Value)) <> 'POINTER')
          and not (Context.PeekNext.TokenType in
                   [ttDelimParClose, ttDelimBrackClose, ttSeparParam, ttEndOfLine, ttEndOfFile]) then
       begin
@@ -876,6 +925,19 @@ begin
   // legitimate content that itself begins and ends with a quote (e.g. """x""" -> "x") would be corrupted.
   Value := Token.Value;
 
+  // ⭐ ADJACENT STRING LITERALS CONCATENATE, as they do in C and as FreeBASIC's own test suite writes
+  // them (`!"\32" "1"` is one three-character string). Two literals in a row are not two expressions:
+  // nothing separates them, so the second one was simply LEFT where an operator was expected - and the
+  // declaration it belonged to took only the first, silently. A wrong answer, not a refusal, which is
+  // why it survived: `Dim s As String = "ab" "cd"` said "ab" and complained about nothing.
+  // Done here rather than in the lexer so an ESCAPED literal (whose escapes the lexer has already
+  // resolved) joins a plain one on equal terms.
+  while Context.Check(ttStringLiteral) do
+  begin
+    Value := Value + VarToStr(Context.CurrentToken.Value);
+    Context.Advance;
+  end;
+
   Result := CreateLiteralNode(Value, Token);
   DoNodeCreated(Result);
 end;
@@ -884,6 +946,7 @@ function TExpressionParser.ParseIdentifier(Token: TLexerToken): TASTNode;
 var
   IdentName: string;
   FnName: string;
+  UnsName: string;   // "Unsigned <base>" folded to its one-word type name, '' when it is not that
   Args: TASTNode;
   NameNode: TASTNode;
 begin
@@ -898,6 +961,102 @@ begin
   end;
 
   IdentName := UpperCase(Token.Value);
+
+  // ⛔ ...AND "UNSIGNED <base>" IS A TYPE NAME IN EXPRESSION POSITION TOO. ParseDottedName has folded
+  // it for every DECLARATION since it was written ("Dim As Unsigned Integer x" is fine); no reader in
+  // expression position ever did, so the two words stayed two juxtaposed identifiers. SizeOf and Len
+  // failed to parse outright - and CAST was worse: "Cast(Unsigned Integer, -1)" PARSED and answered
+  // -1 where fbc answers 18446744073709551615, a wrong number with no diagnostic. Folded here, every
+  // reader downstream sees the plain type name it already knows, the width suffix included.
+  // ⚠️ Only when a BASE TYPE actually follows. UNSIGNED is not reserved in fbc, so a bare "unsigned"
+  // is left alone to be whatever the program declared it to be.
+  if IdentName = 'UNSIGNED' then
+  begin
+    UnsName := '';
+    if Context.Check(ttIdentifier) then
+      case UpperCase(VarToStr(Context.CurrentToken.Value)) of
+        'INTEGER':  UnsName := 'UINTEGER';
+        'BYTE':     UnsName := 'UBYTE';
+        'SHORT':    UnsName := 'USHORT';
+        'LONG':     UnsName := 'ULONG';
+        'LONGINT':  UnsName := 'ULONGINT';
+        'UINTEGER', 'UBYTE', 'USHORT', 'ULONG', 'ULONGINT':
+                    UnsName := UpperCase(VarToStr(Context.CurrentToken.Value));
+      end;
+    if UnsName <> '' then
+    begin
+      Context.Advance;                               // the base type
+      // ...and the width suffix rides on it: "unsigned integer<16>" is USHORT, exactly as UInteger<16> is.
+      if (UnsName = 'UINTEGER') and Context.Check(ttOpLt) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+      begin
+        FnName := UnsName + '<' + VarToStr(Context.PeekNext.Value) + '>';
+        if FoldSizedIntegerTypeName(FnName) <> FnName then
+        begin
+          UnsName := FoldSizedIntegerTypeName(FnName);
+          Context.Advance;                           // '<'
+          Context.Advance;                           // the bit count
+          if Context.Check(ttOpGt) then Context.Advance;   // '>'
+        end;
+      end;
+      Result := TASTNode.CreateWithValue(antIdentifier, UnsName, Token);
+      DoNodeCreated(Result);
+      Exit;
+    end;
+  end;
+
+  // "Integer<8>" in EXPRESSION position - SizeOf(Integer<8>), Type<Integer<8>>. Fold the three tokens
+  // into the ordinary type name of that width, so every reader downstream sees a plain type identifier.
+  // Unfolded, the '<' read as a comparison and the expression failed on the ')' that followed.
+  if ((IdentName = 'INTEGER') or (IdentName = 'UINTEGER')) and Context.Check(ttOpLt) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    FnName := IdentName + '<' + VarToStr(Context.PeekNext.Value) + '>';
+    IdentName := FoldSizedIntegerTypeName(FnName);
+    if IdentName <> FnName then
+    begin
+      Context.Advance;                               // '<'
+      Context.Advance;                               // the bit count
+      if Context.Check(ttOpGt) then Context.Advance; // '>'
+      Result := TASTNode.CreateWithValue(antIdentifier, IdentName, Token);
+      Exit;
+    end;
+    IdentName := UpperCase(Token.Value);
+  end;
+
+  // ⛔ ...AND "CVI<16>( s )" IS THE SAME FOLD, on the same three tokens. FreeBASIC parameterises the
+  // serialisation pair by BIT WIDTH - CVI<16>/<32>/<64> and MKI<16>/<32>/<64> - and each one already
+  // has a plain name here: CVSHORT / CVL / CVLONGINT and MKSHORT / MKL / MKLONGINT (verified against
+  // the oracle: "cvi<16>(s)" and "cvshort(s)" answer the same number). Unfolded, the '<' read as a
+  // comparison and "print cvi<16>( s )" quietly answered 0 - the '>' comparison of a boolean - which is
+  // a WRONG NUMBER with no diagnostic; fbc's own string/mkcv could not be parsed past it.
+  if ((IdentName = 'CVI') or (IdentName = 'MKI')) and Context.Check(ttOpLt) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    FnName := '';
+    if IdentName = 'CVI' then
+    begin
+      if VarToStr(Context.PeekNext.Value) = '16' then FnName := kCVSHORT
+      else if VarToStr(Context.PeekNext.Value) = '32' then FnName := kCVL
+      else if VarToStr(Context.PeekNext.Value) = '64' then FnName := kCVLONGINT;
+    end
+    else
+    begin
+      if VarToStr(Context.PeekNext.Value) = '16' then FnName := kMKSHORT
+      else if VarToStr(Context.PeekNext.Value) = '32' then FnName := kMKL
+      else if VarToStr(Context.PeekNext.Value) = '64' then FnName := kMKLONGINT;
+    end;
+    // ⚠️ Only a width that HAS a name. Anything else is left to read as it always did - a comparison -
+    // rather than folded into a guess.
+    if FnName <> '' then
+    begin
+      Context.Advance;                               // '<'
+      Context.Advance;                               // the bit count
+      if Context.Check(ttOpGt) then Context.Advance; // '>'
+      IdentName := FnName;
+      Token := TLexerToken.CreateSimple(Token.TokenType, FnName);
+    end;
+  end;
 
   // FreeBASIC CAST(type, expr) / CPTR(type, expr): the first argument is a TYPE (which the expression
   // parser cannot parse as an expression), so handle it specially. Lowers to antCast(value = type
@@ -919,6 +1078,18 @@ begin
   begin
     Result := ParseSizeOfPtrType(Token);
     if Assigned(Result) then Exit;
+  end;
+
+  // A POINTER TYPE written in expression position: "Integer Ptr" is two juxtaposed identifiers and every
+  // reader that meets one died on the second ("Len(Integer Ptr)" -> Expected ")"). SIZEOF had its own
+  // speculative parse for exactly this; folded here instead, the same spelling the rest of the pipeline
+  // uses ("INTEGER PTR") reaches EVERY function that takes a type - Len among them.
+  if IsFBScalarTypeName(IdentName) and AtPointerSuffix then
+  begin
+    while AtPointerSuffix do
+    begin IdentName := IdentName + ' PTR'; Context.Advance; end;
+    Result := TASTNode.CreateWithValue(antIdentifier, IdentName, Token);
+    Exit;
   end;
 
   // A call to a Commodore v7 one-line function: "DEF FNA(X) = ..." defines it and "FNA(7)" calls it, so
@@ -1133,6 +1304,8 @@ end;
 function TExpressionParser.ParseMathFunction(Token: TLexerToken): TASTNode;
 var
   Args: TASTNode;
+  SizedBits: Integer;   // "CInt<8>(x)": the width in bits between the angle brackets
+  SizedName: string;    // ...and the fixed-width conversion it is another spelling of
 begin
   {$IFDEF DEBUG}
   LogVerbose(Format('ParseMathFunction: %s', [Token.Value]));
@@ -1141,6 +1314,23 @@ begin
   if not HasValidContext then
   begin
     Result := nil;
+    Exit;
+  end;
+
+  // ⭐ A MODERN extension FreeBASIC does NOT reserve - MIN, MAX, CEIL, ROUND, COPYSIGN, SINGLEBITS,
+  // BITSTOSINGLE - used WITHOUT "(" is not a call: those are all FUNCTIONS, so a bare occurrence can
+  // only be the program's own name. fbc compiles "Const MAX = 8 : x = MAX + 1" (it REJECTS ABS/FIX/SGN,
+  // which are reserved there, and we must keep rejecting those); we refused it outright and the whole
+  // file failed to parse. ⚠️ The declaration site already accepted such a name for a PROCEDURE
+  // (IsShadowableExtensionName); a CONST or a variable had no such door, and neither did the USE.
+  if ((UpperCase(Token.Value) = 'MIN') or (UpperCase(Token.Value) = 'MAX') or
+      (UpperCase(Token.Value) = 'CEIL') or (UpperCase(Token.Value) = 'ROUND') or
+      (UpperCase(Token.Value) = 'COPYSIGN') or (UpperCase(Token.Value) = 'SINGLEBITS') or
+      (UpperCase(Token.Value) = 'BITSTOSINGLE'))
+     and not Context.Check(ttDelimParOpen) then
+  begin
+    Result := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
+    DoNodeCreated(Result);
     Exit;
   end;
 
@@ -1165,6 +1355,48 @@ begin
     Args.AddChild(TASTNode.CreateWithValue(antLiteral, 1, Token));
     Result.AddChild(Args);
     Exit;
+  end;
+
+  // ⭐ "CInt<8>(x)" / "CUInt<16>(x)": FreeBASIC's SIZED conversions, where the angle brackets name the
+  // WIDTH IN BITS. They are exactly the fixed-width conversions this parser already has, under another
+  // spelling - measured against fbc 1.10.1 value by value: cint<8>(300)=44 like CByte, cuint<8>(300)=44
+  // like CUByte, cint<16>(70000)=4464 like CShort, cuint<32>(-1)=4294967295 like CULng, and <64> is the
+  // full-width pair. So the '<n>' is read here and the NAME is rewritten; nothing downstream has to
+  // learn a second spelling of one conversion. An unknown width is left alone and fails as before.
+  if ((UpperCase(VarToStr(Token.Value)) = 'CINT') or (UpperCase(VarToStr(Token.Value)) = 'CUINT')) and
+     Context.Check(ttOpLt) and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    SizedBits := StrToIntDef(VarToStr(Context.PeekNext.Value), 0);
+    SizedName := '';
+    if UpperCase(VarToStr(Token.Value)) = 'CINT' then
+      case SizedBits of
+        8:  SizedName := 'CBYTE';
+        16: SizedName := 'CSHORT';
+        32: SizedName := 'CLNG';
+        64: SizedName := 'CLNGINT';
+      end
+    else
+      case SizedBits of
+        8:  SizedName := 'CUBYTE';
+        16: SizedName := 'CUSHORT';
+        32: SizedName := 'CULNG';
+        64: SizedName := 'CULNGINT';
+      end;
+    if SizedName <> '' then
+    begin
+      Context.Advance;                              // '<'
+      Context.Advance;                              // the width
+      // The closer can be the '>' half of a ">=" - see the same split at the type-name reader in
+      // SedaiPackratParser (ParseTypeName's explicit-width branch).
+      if Context.Check(ttOpGe) then
+      begin
+        Context.CurrentToken.TokenType := ttOpEq;
+        Context.CurrentToken.Value := '=';
+      end
+      else if Context.Check(ttOpGt) then Context.Advance;   // '>'
+      Result.Value := SizedName;
+    end;
   end;
 
   // Consume opening parenthesis
@@ -1340,14 +1572,22 @@ begin
 
   Result := TASTNode.CreateWithValue(antGraphicsFunction, Token.Value, Token);
 
-  // Consume opening parenthesis
-  if not Context.Match(ttDelimParOpen) then
+  // ⛔ THE PARENTHESES ARE OPTIONAL, as they are on every other statement of this family. FreeBASIC
+  // writes "GetMouse x, y" as readily as "GetMouse( x, y )" - the call is made for its BY-REFERENCE
+  // writes and the status is discarded - and SETMOUSE has accepted the bare form all along. Demanding
+  // "(" here made the whole statement a syntax error. Without them the argument list simply runs to
+  // the end of the statement, which is what ParseArgumentList already stops at.
+  if not Context.Check(ttDelimParOpen) then
   begin
-    HandleError('Expected "(" after graphics function', Context.CurrentToken);
-    Result.Free;
-    Result := nil;
+    if not (Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt) or Context.IsAtEnd) then
+    begin
+      Args := ParseArgumentList;
+      if Assigned(Args) then Result.AddChild(Args);
+    end;
+    DoNodeCreated(Result);
     Exit;
   end;
+  Context.Advance;                                  // '('
 
   // Parse arguments if any
   if not Context.Check(ttDelimParClose) then
@@ -1410,14 +1650,18 @@ begin
   // error. It keeps its ttGraphicsCommand token (the statement form is written without parentheses,
   // which a ttGraphicsFunction would not accept) and gains the function form HERE, which is exactly
   // what this routine exists for.
-  if (Cmd <> kSCREENGFX) and ((Cmd <> kIMAGEINFO) or not Context.Check(ttDelimParOpen)) or
-     not ModernMode or not Context.Check(ttDelimParOpen) then
+  // ⭐ ...and SCREENRES, whose function form answers 0 on success and an error code otherwise - which is
+  // how fbc's own graphics suite writes it ("CU_ASSERT( screenres(w, h, 32, , GFX_NULL) = 0 )"). The
+  // three commands with a function form are a CLOSED list, so an allow-list is finishable here; written
+  // as one, the condition also stops reading as a chain of exceptions to a rule.
+  if (not ModernMode) or (not Context.Check(ttDelimParOpen)) or
+     ((Cmd <> kSCREENGFX) and (Cmd <> kIMAGEINFO) and (Cmd <> kSCREENRES)) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
     Result := nil;
     Exit;
   end;
-  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN"/"IMAGEINFO" + argument list
+  Result := ParseGraphicsFunction(Token);   // antGraphicsFunction "SCREEN"/"IMAGEINFO"/"SCREENRES" + args
 end;
 
 function TExpressionParser.ParseFsFunctionForm(Token: TLexerToken): TASTNode;
@@ -1448,7 +1692,15 @@ begin
   begin
     while not Context.Check(ttDelimParClose) do
     begin
-      Result.AddChild(ParseExpression);
+      // ⭐ AN OMITTED ARGUMENT IS A REAL ONE. FreeBASIC lets a middle argument be left out and takes
+      // the parameter's default: "dir( ""*"", , attrib )" is its own file/dir-overloads, and the
+      // position is what carries the meaning - so the slot must still be FILLED, with a placeholder,
+      // or the third argument would arrive as the second. ParseExpression on a bare ',' consumed
+      // nothing and the loop then met the comma where it wanted ')'.
+      if Context.Check(ttSeparParam) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, Unassigned, Context.CurrentToken))
+      else
+        Result.AddChild(ParseExpression);
       if not Context.Check(ttSeparParam) then Break;
       Context.Advance;                                // ','
     end;
@@ -1524,8 +1776,8 @@ function TExpressionParser.ParseOpenFunctionForm(Token: TLexerToken): TASTNode;
 // MODERN only. OPEN lexes as ttFileOperation, a family that is otherwise all statements, so this rule
 // fires only in expression position and only for OPEN: every other member stays the syntax error it was.
 var
-  Param, HandleNode, LenExpr: TASTNode;
-  ModeStr, MW: string;
+  Param, HandleNode, LenExpr, EncExpr: TASTNode;
+  ModeStr, MW, EncMark: string;
   AccessRead: Boolean;
 
   procedure SkipClauseComma;
@@ -1571,12 +1823,25 @@ begin
     end;
     Context.Advance;                                // mode word
   end;
-  // ENCODING / ACCESS / lock clauses: accepted and ignored, exactly as the statement accepts them.
+  // ⛔ "ENCODING <expr>" USED TO BE CONSUMED AND THROWN AWAY here, while the STATEMENT form put it on
+  // the mode string: "Open(f, For Output, Encoding "utf16", As #1)" wrote UTF-8 bytes and the same
+  // clause one line above, written as a statement, wrote UTF-16. One rule, two paths, and only one of
+  // them had it. The mapping is now EncodingModeMarker, asked by BOTH.
   SkipClauseComma;
+  EncMark := '';
+  EncExpr := nil;
   if AtWord(kENCODING) then
   begin
     Context.Advance;
-    if Context.Check(ttStringLiteral) then Context.Advance;
+    if Context.Check(ttStringLiteral) then
+    begin
+      EncMark := EncodingModeMarker(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;
+    end
+    else
+      // The name need not be a LITERAL: fbc's own tests write "encoding encod". Then the marker is
+      // appended at RUN time (SSA) and the file layer reads the name after the '~'.
+      EncExpr := ParseExpression(precCall);
   end;
   SkipClauseComma;
   if AtWord(kACCESS) then
@@ -1589,6 +1854,9 @@ begin
     // record length appended in the SSA.
     if AccessRead and (ModeStr <> 'L') then ModeStr := ModeStr + '<';
   end;
+  // The encoding marker goes on LAST, so '~' is always a suffix: appended before ACCESS it would build
+  // "R~16<", with the '<' inside the number the file layer reads.
+  if (EncMark <> '') and (ModeStr <> 'L') then ModeStr := ModeStr + EncMark;
   SkipClauseComma;
   if AtWord(kSHARED) then
     Context.Advance
@@ -1609,6 +1877,11 @@ begin
     Param.Free; Exit;
   end;
   LenExpr := nil;
+  // ⛔ ...AND THE COMMA BEFORE IT HAS TO BE STEPPED OVER, like every other clause's. Five of the six
+  // optional clauses of this function form call SkipClauseComma; LEN was the one that did not, so
+  // "Open( f, For Random, As #1, Len = 8 )" stopped at the comma and the whole call failed to parse.
+  // The STATEMENT form reads the same clause correctly, which is what said it was this reader.
+  SkipClauseComma;
   if AtWord(kLEN) then                              // optional "LEN = reclen" (RANDOM)
   begin
     Context.Advance;
@@ -1623,6 +1896,17 @@ begin
   if Assigned(LenExpr) then
   begin
     if ModeStr = 'L' then Result.AddChild(LenExpr) else LenExpr.Free;     // 3 = reclen (RANDOM only)
+  end;
+  // A run-time ENCODING name rides as an extra child, at whatever index it lands on: the attribute
+  // says WHICH, so nothing has to count the optional ones.
+  if Assigned(EncExpr) then
+  begin
+    if ModeStr = 'L' then EncExpr.Free
+    else
+    begin
+      Result.Attributes.Values['ENCEXPR'] := IntToStr(Result.ChildCount);
+      Result.AddChild(EncExpr);
+    end;
   end;
   if not Context.Match(ttDelimParClose) then
   begin
@@ -1722,7 +2006,72 @@ begin
     DoNodeCreated(Result);
     Exit;
   end;
+  // ⭐ GET and PUT have FUNCTION forms too - "Get(#f, pos, var)" answers 0 on success, and fbc's own
+  // suite writes them that way ("CU_ASSERT( get( #f, 1, array4b() ) = 0 )"). They share this token type
+  // with INPUT, so in expression position they reached the string-function path and died as an
+  // undeclared array. Built here into the very node the STATEMENT builds - child0 = handle,
+  // child1 = variable, child2 = position when given - so there is ONE lowering, marked FUNCFORM for the
+  // SSA to answer 0 with.
+  if ((UpperCase(Token.Value) = 'GET') or (UpperCase(Token.Value) = 'PUT')) and
+     Context.Check(ttDelimParOpen) then
+  begin
+    Result := ParseBinaryFileFunctionForm(Token);
+    if Assigned(Result) then Exit;
+  end;
   Result := ParseStringFunction(Token);   // antFunctionCall "INPUT" + argument list
+end;
+
+function TExpressionParser.ParseBinaryFileFunctionForm(Token: TLexerToken): TASTNode;
+// "Get(#f [, [pos]] [, var])" / "Put(...)": the function form of the binary file statements. Answers nil
+// (having consumed nothing) when the shape is not that, so the caller falls back.
+var
+  Saved: Integer;
+  HandleE, PosE, VarE: TASTNode;
+  IsGet: Boolean;
+begin
+  Result := nil;
+  IsGet := UpperCase(Token.Value) = 'GET';
+  Context.SavePosition(Saved);
+  Context.Advance;                                   // '('
+  if Context.Check(ttFileHandlePrefix) then Context.Advance;   // the optional '#'
+  HandleE := ParseExpression(precNone);
+  if not Assigned(HandleE) then begin Context.RestorePosition(Saved); Exit; end;
+  PosE := nil; VarE := nil;
+  if Context.Check(ttSeparParam) then
+  begin
+    Context.Advance;                                 // ','
+    if not Context.Check(ttSeparParam) then PosE := ParseExpression(precNone);   // the position may be empty
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                               // ','
+      VarE := ParseExpression(precNone);
+    end;
+  end;
+  if not Context.Match(ttDelimParClose) then
+  begin
+    HandleE.Free; if Assigned(PosE) then PosE.Free; if Assigned(VarE) then VarE.Free;
+    Context.RestorePosition(Saved);
+    Exit;
+  end;
+  if IsGet then
+  begin
+    Result := TASTNode.Create(antGetFile, Token);
+    Result.Attributes.Values['BIN'] := '1';
+  end
+  else
+  begin
+    Result := TASTNode.Create(antPrintFile, Token);
+    Result.Attributes.Values['PUTBIN'] := '1';
+  end;
+  Result.Attributes.Values['FUNCFORM'] := '1';
+  Result.AddChild(HandleE);
+  if Assigned(VarE) then Result.AddChild(VarE);
+  if Assigned(PosE) then
+  begin
+    Result.AddChild(PosE);
+    Result.Attributes.Values['HASPOS'] := '1';
+  end;
+  DoNodeCreated(Result);
 end;
 
 function TExpressionParser.ParseInputFunction(Token: TLexerToken): TASTNode;
@@ -1904,6 +2253,7 @@ end;
 function TExpressionParser.ParseProcAddress(Token: TLexerToken): TASTNode;
 var
   Operand: TASTNode;
+  CtorTok: TLexerToken;   // "@type<T>(...)": the TYPE token handed to the type-constructor parser
 begin
   // '@' is already consumed. Parse the operand as a full postfix expression (precCall stops before
   // binary operators), so all of these are handled: @sub / @x (identifier), @arr(i) (array access),
@@ -1978,11 +2328,46 @@ begin
     end;
     while (Operand.NodeType = antParentheses) and (Operand.ChildCount >= 1) do
       Operand := Operand.GetChild(0);
-    Result := TASTNode.Create(antProcAddress, Token);
-    Result.AddChild(Operand.Clone);
+    // ⛔ "@( a )" WITH A BARE NAME INSIDE IS "@a", and it has to build the SAME node: the historical
+    // shape carries the name in Value with no child, and every scalar/proc address path downstream
+    // reads it there. Built as a child instead, the name was nowhere the SSA looks and the whole
+    // statement died as "Undefined procedure (address-of @): " with an EMPTY name - the tell that the
+    // node was the right kind and the wrong shape. The parentheses exist for "@(cast(T Ptr, n)->i)",
+    // where they make "->" bind first; around a name they carry no meaning at all.
+    if Operand.NodeType = antIdentifier then
+      Result := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Operand.Value)), Token)
+    else
+    begin
+      Result := TASTNode.Create(antProcAddress, Token);
+      Result.AddChild(Operand.Clone);
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
+  // "@type<T>( ... )": the address of an anonymous temporary, which fbc's own suite passes BYREF that
+  // way. TYPE lexes as ttTypeDecl and not as an identifier, so the name test below refused it and the
+  // whole argument failed - the operand is built by the same routine the expression grammar uses.
+  if Context.Check(ttTypeDecl) then
+  begin
+    CtorTok := Context.CurrentToken;
+    Context.Advance;                          // TYPE
+    Operand := ParseTypeConstructor(CtorTok);
+    if not Assigned(Operand) then Exit(nil);
+    Result := TASTNode.Create(antProcAddress, Token);
+    Result.AddChild(Operand);
+    DoNodeCreated(Result);
+    Exit;
+  end;
+  // ⛔ A NAME AFTER "@" CAN ONLY BE A NAME. In MODERN a field or variable may be spelled like a
+  // Commodore STATEMENT keyword - fbc's own suite declares "data As Integer" and writes "Return @data" -
+  // and the keyword token is not ttIdentifier, so the whole file failed with "Expected a name after @".
+  // Inverted here onto the CLOSED side: after "@" the operand can be a name, a "*expr", a "(...)" or a
+  // "Type<T>(...)", and the last three are already claimed above. Anything left that SPELLS like an
+  // identifier is one. (A whitelist of the keywords that may be shadowed cannot be finished.)
+  if (not Context.Check(ttIdentifier)) and ModernMode and
+     (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+     (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) then
+    Context.CurrentToken.TokenType := ttIdentifier;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a name after "@"', Context.CurrentToken);
@@ -2012,6 +2397,8 @@ begin
   DoNodeCreated(Result);
 end;
 
+function IsManagedNewElemType(const N: string): Boolean; forward;   // a "New T[n]" element that cannot be left uninitialised
+
 function TExpressionParser.ParseNew(Token: TLexerToken): TASTNode;
 // FreeBASIC "NEW T" / "NEW T(args)". The NEW token is already consumed (prefix rule). Read the type
 // name, then an optional parenthesised constructor argument list. Lowers to antNew(value = type name,
@@ -2034,6 +2421,15 @@ begin
       Result := nil; Exit;
     end;
   end;
+  // ⛔ ...AND IT MAY CARRY THE "CONST" QUALIFIER: "New Const T", "New Const T[n]". NEW reads its own
+  // type name rather than going through the expression grammar, so the rule registered there does not
+  // reach it - it is the one type reader of the whole compiler that calls neither SkipTypeQualifiers
+  // nor anything like it, and it answered "Expected a TYPE name after NEW" on the word const.
+  while Context.Check(ttConstant) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') do
+    Context.Advance;
+  // ⛔ ...AND A TYPE NAME MAY BEGIN WITH THE GLOBAL-SCOPE DOTS. "New ..ns.T" is FreeBASIC; asking
+  // ttIdentifier alone refused it outright. Fifth reader of a type name found by the same census.
+  while Context.Check(ttOpDot) do Context.Advance;
   if not Context.Check(ttIdentifier) then
   begin
     HandleError('Expected a TYPE name after NEW', Context.CurrentToken);
@@ -2107,6 +2503,34 @@ begin
     end;
     Result.Attributes.Values['NEWARRAY'] := '1';
     Result.AddChild(ArgList);                 // child0 = the element count
+    // FreeBASIC "New T[n] { Any }": the block is left UNINITIALISED. It is the only initialiser fbc
+    // accepts after an array NEW, and it accepts it only for a type that needs no initialising -
+    // "New String[10] { Any }" is an error, because a managed element without its header is unusable.
+    // ⛔ Without reading it here the braces stayed behind and PRINT took them for a second item: the
+    // statement printed an address and a stray number instead of failing.
+    if Context.Check(ttDelimBraceOpen) then
+    begin
+      Context.Advance;                        // {
+      if not (Context.Check(ttIdentifier) and
+              (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ANY')) then
+      begin
+        HandleError('Only "{ Any }" may follow "New T[n]"', Context.CurrentToken);
+        Result.Free; Result := nil; Exit;
+      end;
+      if IsManagedNewElemType(VarToStr(Result.Value)) then
+      begin
+        HandleError('"{ Any }" cannot leave a ' + VarToStr(Result.Value) +
+                    ' element uninitialised', Context.CurrentToken);
+        Result.Free; Result := nil; Exit;
+      end;
+      Context.Advance;                        // Any
+      if not Context.Match(ttDelimBraceClose) then
+      begin
+        HandleError('Expected "}" after "{ Any }"', Context.CurrentToken);
+        Result.Free; Result := nil; Exit;
+      end;
+      Result.Attributes.Values['ANYINIT'] := '1';
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2133,14 +2557,40 @@ begin
   DoNodeCreated(Result);
 end;
 
+function IsManagedNewElemType(const N: string): Boolean;
+// A "New T[n]" element that cannot be left uninitialised: a STRING carries a header the runtime writes.
+// A pointer to one is not managed - it is an address like any other.
+var
+  T: string;
+begin
+  T := UpperCase(Trim(N));
+  Result := (T = 'STRING') or (T = 'WSTRING') or (T = 'ZSTRING');
+end;
+
+function TExpressionParser.ParseConstQualifier(Token: TLexerToken): TASTNode;
+// The CONST token is already consumed. Skip any further qualifiers and read the thing being
+// qualified. See the note at the rule's registration for why this belongs in the expression grammar.
+begin
+  while Context.Check(ttConstant) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') do
+    Context.Advance;
+  Result := ParseExpression(precCall);
+end;
+
 function TExpressionParser.ParseTypeConstructor(Token: TLexerToken): TASTNode;
 // FreeBASIC "type<T>(args)": an anonymous temporary of UDT T initialised with args (via T's constructor,
 // or field-by-field when T has none). The TYPE token is already consumed. Lowers to the same shape the
 // SSA's UDT-temporary hook recognises for "T(args)": antArrayAccess(child0 = antIdentifier(T),
 // child1 = antExpressionList(args)). The angle brackets are the comparison tokens ttOpLt / ttOpGt.
+//
+// The type position is a full FreeBASIC type, not only a UDT name: "type<Integer>", "type<Integer Ptr>"
+// and "type<TypeOf(x)>" are all legal. Only a UDT builds a temporary — for a BUILT-IN type the form is a
+// CONVERSION, which is what Cast(T, v) already is, so it lowers to antCast and adds nothing downstream.
+// A conversion also has a parenthesis-less spelling ("x = type<Integer>1"); a UDT temporary does not,
+// its parentheses delimiting the field list.
 var
-  TypeName: TLexerToken;
-  NameNode, Args: TASTNode;
+  TypeStr: string;
+  NameNode, Args, ValExpr, TypeOfExpr: TASTNode;
+  IsConversion, HadParen: Boolean;
 begin
   if not Context.Check(ttOpLt) then
   begin
@@ -2162,6 +2612,10 @@ begin
       end;
       Result := TASTNode.Create(antArrayAccess, Token);
       Result.Attributes.Values['INFERTYPE'] := '1';     // type deduced by the DIM/assignment/return lowering
+      // ...and the deduced type may be a BUILT-IN one ("Dim x As Integer = Type( 1.5 )"), where there is
+      // no temporary to construct and the form is a conversion. INFERTYPE is CLEARED once filled, so the
+      // SSA cannot tell this node from a genuine "T(args)" afterwards: this marker survives the fill.
+      Result.Attributes.Values['TYPECTOR'] := '1';
       Result.AddChild(NameNode);
       Result.AddChild(Args);
       DoNodeCreated(Result);
@@ -2171,36 +2625,196 @@ begin
     Exit(nil);
   end;
   Context.Advance;   // consume '<'
-  if not Context.Check(ttIdentifier) then
+  TypeStr := '';
+  TypeOfExpr := nil;
+  // "type<TypeOf(expr)>": the type is not written, it is ASKED. Read exactly as CAST/CPTR reads it — the
+  // operand stays a CHILD and is resolved in the SSA, the only place that knows what a name was DECLARED as.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                          // TypeOf
+    Context.Advance;                          // (
+    TypeOfExpr := ParseExpression(precNone);
+    if not Assigned(TypeOfExpr) then
+    begin
+      HandleError('Expected an expression inside TypeOf(...)', Context.CurrentToken);
+      Exit(nil);
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" after TypeOf(...)', Context.CurrentToken);
+      TypeOfExpr.Free; Exit(nil);
+    end;
+    TypeStr := 'TYPEOF';
+    while AtPointerSuffix do
+    begin TypeStr := TypeStr + ' ' + kPTR; Context.Advance; end;
+  end
+  else
+    while (not Context.IsAtEnd) and (not Context.Check(ttOpGt)) do
+    begin
+      if Context.Check(ttOpDot) then TypeStr := TypeStr + '.'
+      else
+      begin
+        if (TypeStr <> '') and (TypeStr[Length(TypeStr)] <> '.') then TypeStr := TypeStr + ' ';
+        // "type<ZString Pointer>": POINTER is fbc's synonym of PTR and only "T PTR" is understood
+        // downstream. Normalise it here, where it can only be the suffix (a type name is already left of it).
+        if (TypeStr <> '') and AtPointerSuffix then
+          TypeStr := TypeStr + kPTR
+        else
+          TypeStr := TypeStr + UpperCase(VarToStr(Context.CurrentToken.Value));
+      end;
+      Context.Advance;
+    end;
+  // ⛔ ...AND THE GLOBAL-SCOPE DOTS ARE NOT PART OF THE NAME. "type<..n1.foo.t1>(x)" says "resolve n1
+  // from the global scope"; the reader above copies every '.' it meets, so the type came out as
+  // "..N1.FOO.T1", matched no declaration, and the temporary was built as though the type were unknown
+  // - an ACCESS VIOLATION at run time, with nothing said at compile time. ParseDottedName learned this
+  // for the DIM and PARAMETER positions; type<> is the third place that reads a type name, and it did
+  // not. fbc's own namespace/reimp1 and reimp2 are written this way.
+  while (TypeStr <> '') and (TypeStr[1] = '.') do Delete(TypeStr, 1, 1);
+  // ⛔ ...AND NEITHER IS THE "CONST" QUALIFIER. "type<Const UDT>( )" names the same type as
+  // "type<UDT>( )" - const says how the temporary may be USED, not which type it is - and the reader
+  // above copies it into the name, so FindUDT was asked for a type called "CONST UDT" and answered
+  // nothing: "Array not declared: CONST UDT". Leading only, the spelling fbc's own structs/anon-assign
+  // uses; "T Const Ptr" is a different question (a const POINTER) and is left alone.
+  if Copy(TypeStr, 1, 6) = 'CONST ' then Delete(TypeStr, 1, 6);
+  if TypeStr = '' then
   begin
     HandleError('Expected a TYPE name in a type<T>(...) expression', Context.CurrentToken);
     Exit(nil);
   end;
-  TypeName := Context.CurrentToken;
-  NameNode := TASTNode.CreateWithValue(antIdentifier, TypeName.Value, TypeName);
-  Context.Advance;   // consume the type name
   if not Context.Match(ttOpGt) then
   begin
     HandleError('Expected ">" after the type name in a type<T>(...) expression', Context.CurrentToken);
-    NameNode.Free; Exit(nil);
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Exit(nil);
   end;
-  if not Context.Match(ttDelimParOpen) then
+
+  // ⛔ A STRING type is NOT lowered to a cast: fbc itself rejects "Cast(String, x)" ("Type mismatch"),
+  // and our antCast has no string arm - routing it there gave 0 where the operand was already a string.
+  // "type<String>( s )" is the IDENTITY on a string, and it reaches the SSA's own pass-through below.
+  IsConversion := ((TypeStr = 'TYPEOF') or IsFBScalarTypeName(TypeStr) or
+                   (Pos(' ' + kPTR, TypeStr) > 0)) and
+                  (TypeStr <> 'ZSTRING') and (TypeStr <> 'WSTRING') and (TypeStr <> 'ANY');
+
+  if IsConversion then
   begin
-    HandleError('Expected "(" after type<T> in a type<T>(...) expression', Context.CurrentToken);
-    NameNode.Free; Exit(nil);
+    // "type<Integer>(v)", "type<Integer>v", "type<Integer>((v))" — one value, converted. The
+    // parenthesised form has to read the value at NO precedence floor (the parentheses close it);
+    // the bare form reads it at unary precedence, so "type<Integer>4 + 1" converts 4 and then adds.
+    HadParen := Context.Match(ttDelimParOpen);
+    if HadParen then
+      ValExpr := ParseExpression(precNone)
+    else
+      ValExpr := ParseExpression(precUnary);
+    if not Assigned(ValExpr) then
+    begin
+      HandleError('Expected a value in a type<T>(...) conversion', Context.CurrentToken);
+      if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+      Exit(nil);
+    end;
+    if HadParen and (not Context.Match(ttDelimParClose)) then
+    begin
+      HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
+      ValExpr.Free; if Assigned(TypeOfExpr) then TypeOfExpr.Free; Exit(nil);
+    end;
+    Result := TASTNode.CreateWithValue(antCast, TypeStr, Token);
+    Result.AddChild(ValExpr);
+    if Assigned(TypeOfExpr) then
+    begin
+      Result.Attributes.Values['TYPEOFEXPR'] := '1';
+      Result.AddChild(TypeOfExpr);       // child1 = the operand of TypeOf, resolved in the SSA
+    end;
+    DoNodeCreated(Result);
+    Exit;
   end;
-  if Context.Check(ttDelimParClose) then
-    Args := TASTNode.Create(antExpressionList, Token)   // type<T>() — no field values
+
+  // ⭐ UPPER-CASED, not as written: every other producer of this node puts the type name in upper case
+  // (the argument-fill site spells it "UpperCase(...)" too) and the readers compare it exactly. Handing
+  // the source spelling through made "type<string>( s )" a different name from "STRING(s)" - the very
+  // conversion it lowers to - and Print showed a number where the string was.
+  NameNode := TASTNode.CreateWithValue(antIdentifier, TypeStr, Token);
+  if Context.Match(ttDelimParOpen) then
+  begin
+    if Context.Check(ttDelimParClose) then
+      Args := TASTNode.Create(antExpressionList, Token)   // type<T>() — no field values
+    else
+      Args := ParseExpressionList(ttSeparParam);          // comma-separated field/ctor args
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
+      NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
+    end;
+  end
   else
-    Args := ParseExpressionList(ttSeparParam);          // comma-separated field/ctor args
-  if not Context.Match(ttDelimParClose) then
   begin
-    HandleError('Expected ")" to close a type<T>(...) expression', Context.CurrentToken);
-    NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
+    // "Dim As Parent p = type<Child>c": the parenthesis-less form works for a UDT too, where it is the
+    // ONE-value conversion (an upcast here) rather than a field list. Read at unary precedence, as the
+    // built-in conversion above does, so "type<Child>c.i" binds the value and not the whole expression.
+    ValExpr := ParseExpression(precUnary);
+    if not Assigned(ValExpr) then
+    begin
+      HandleError('Expected "(" or a value after type<T> in a type<T>(...) expression', Context.CurrentToken);
+      NameNode.Free; Exit(nil);
+    end;
+    Args := TASTNode.Create(antExpressionList, Token);
+    Args.AddChild(ValExpr);
   end;
   Result := TASTNode.Create(antArrayAccess, Token);
+  // The written type may be neither a UDT nor a built-in scalar - an ENUM, or a procedure type
+  // ("type<Sub( )>( 0 )"). There is no temporary to build for those either; the marker is what lets the
+  // SSA tell "a type constructor whose type is not a UDT" from a genuine call to an undeclared array.
+  Result.Attributes.Values['TYPECTOR'] := '1';
   Result.AddChild(NameNode);
   Result.AddChild(Args);
+  DoNodeCreated(Result);
+end;
+
+function TExpressionParser.ParseArgPassMode(Token: TLexerToken): TASTNode;
+// FreeBASIC's per-ARGUMENT passing mode: "f( ByVal p )", "test_const ByVal 1234". The keyword is
+// already consumed (prefix rule); read the value it qualifies and mark the node with the mode.
+// ⚠️ The mark is carried, not yet honoured: a "ByVal" argument to a ByRef parameter should bind a
+// TEMPORARY, and it currently binds the operand itself. Recorded in job/markdown/DIVERGENZE.md - what
+// this closes is the PARSE, which is what stood between these programs and being measured at all.
+var
+  ModeU: string;
+begin
+  ModeU := UpperCase(VarToStr(Token.Value));
+  Result := ParseExpression(precUnary);
+  if not Assigned(Result) then
+  begin
+    HandleError('Expected a value after ' + ModeU, Context.CurrentToken);
+    Exit(nil);
+  end;
+  Result.Attributes.Values['ARGPASSMODE'] := ModeU;
+end;
+
+function TExpressionParser.ParseBraceInitializer(Token: TLexerToken): TASTNode;
+// FreeBASIC "{ a, b, ... }" in EXPRESSION position. The '{' is already consumed (prefix rule). Builds
+// exactly the node the DIM path builds for the same braces - an antArgumentList marked BRACEINIT - so
+// the SSA keeps seeing ONE shape for an aggregate initialiser however it was reached. Nested braces
+// recurse through this same rule.
+var
+  Item: TASTNode;
+begin
+  Result := TASTNode.Create(antArgumentList, Token);
+  Result.Attributes.Values['BRACEINIT'] := '1';
+  if not Context.Check(ttDelimBraceClose) then
+    repeat
+      Item := ParseExpression(precNone);
+      if not Assigned(Item) then
+      begin
+        HandleError('Expected a value inside "{ ... }"', Context.CurrentToken);
+        Result.Free; Exit(nil);
+      end;
+      Result.AddChild(Item);
+      if Context.Check(ttSeparParam) then Context.Advance else Break;
+    until Context.CheckAny([ttDelimBraceClose, ttEndOfLine, ttEndOfFile]);
+  if not Context.Match(ttDelimBraceClose) then
+  begin
+    HandleError('Expected "}" to close an aggregate initialiser', Context.CurrentToken);
+    Result.Free; Exit(nil);
+  end;
   DoNodeCreated(Result);
 end;
 
@@ -2284,15 +2898,41 @@ function TExpressionParser.ParsePeekFB(Token: TLexerToken): TASTNode;
 var
   Saved: Integer;
   TypeStr: string;
-  PtrExpr, CastNode: TASTNode;
+  PtrExpr, CastNode, TypeOfExpr: TASTNode;
 begin
   Result := nil;
   Context.SavePosition(Saved);
   Context.Advance;                                   // consume '('
   TypeStr := '';
+  TypeOfExpr := nil;
+  // ⭐ "Peek(TypeOf(b), p)": the type is not written, it is ASKED - exactly as CAST and "type<>" already
+  // read it, and with the same shape (the operand stays a CHILD and the SSA resolves it, being the only
+  // place that knows what a name was DECLARED as). Without this arm "TYPEOF" was read as an ordinary
+  // type NAME, IsFBScalarTypeName declined it, and the whole call fell through to the function-call path
+  // with "( b )" still standing beside it: "Array not declared: TYPEOF".
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.Advance;                                 // TypeOf
+    Context.Advance;                                 // (
+    TypeOfExpr := ParseExpression(precNone);
+    if not Assigned(TypeOfExpr) then begin Context.RestorePosition(Saved); Exit; end;
+    if not Context.Match(ttDelimParClose) then
+    begin TypeOfExpr.Free; Context.RestorePosition(Saved); Exit; end;
+    TypeStr := 'TYPEOF';
+    while AtPointerSuffix do begin TypeStr := TypeStr + ' PTR'; Context.Advance; end;
+    if Context.Check(ttSeparParam) then
+      Context.Advance                                // consume ','
+    else
+    begin
+      TypeOfExpr.Free;
+      Context.RestorePosition(Saved);                // "Peek(TypeOf(x))" -- not our form
+      Exit;
+    end;
+  end
   // A leading built-in type name followed by ',' is the typed form. Anything else is an address
   // expression, and the pointee is UBYTE.
-  if Context.Check(ttIdentifier) and IsFBScalarTypeName(VarToStr(Context.CurrentToken.Value)) then
+  else if Context.Check(ttIdentifier) and IsFBScalarTypeName(VarToStr(Context.CurrentToken.Value)) then
   begin
     TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
     Context.Advance;
@@ -2307,18 +2947,100 @@ begin
   end;
   if TypeStr = '' then TypeStr := 'UBYTE';
   PtrExpr := ParseExpression(precNone);
-  if not Assigned(PtrExpr) then begin Context.RestorePosition(Saved); Exit; end;
+  if not Assigned(PtrExpr) then
+  begin
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
+    Context.RestorePosition(Saved); Exit;
+  end;
   if not Context.Match(ttDelimParClose) then
   begin
     PtrExpr.Free;
+    if Assigned(TypeOfExpr) then TypeOfExpr.Free;
     Context.RestorePosition(Saved);
     Exit;
   end;
   CastNode := TASTNode.CreateWithValue(antCast, TypeStr + ' PTR', Token);
   CastNode.AddChild(PtrExpr);
+  // The asked-for type travels as child 1 with the TYPEOFEXPR mark, the shape the SSA already resolves
+  // for "Cast(TypeOf(x), v)" - one resolution, not two.
+  if Assigned(TypeOfExpr) then
+  begin
+    CastNode.Attributes.Values['TYPEOFEXPR'] := '1';
+    CastNode.AddChild(TypeOfExpr);
+  end;
   Result := TASTNode.Create(antDeref, Token);
   Result.AddChild(CastNode);
   DoNodeCreated(Result);
+end;
+
+function FoldUnsignedTypeName(const S: string): string;
+// FreeBASIC's "UNSIGNED <base>" modifier collapsed to the one-word type name. ParseDottedName reads it
+// token-by-token for every DECLARATION; a reader that gathers a type as a STRING of tokens - CAST and
+// CPTR are the only ones - got "UNSIGNED INTEGER", which names nothing downstream, so the cast was a
+// no-op: "Cast(Unsigned Integer, -1)" answered -1 where fbc answers 18446744073709551615. A wrong
+// number with no diagnostic, which is why it survived. Anything that is not the modifier is returned
+// untouched, so a user type whose name merely starts with those letters is safe.
+var
+  Rest, BaseU: string;
+  P: Integer;
+begin
+  Result := S;
+  if UpperCase(Copy(Trim(S), 1, 9)) <> 'UNSIGNED ' then Exit;
+  Rest := Trim(Copy(Trim(S), 10, MaxInt));
+  P := Pos(' ', Rest);
+  if P > 0 then begin BaseU := UpperCase(Copy(Rest, 1, P - 1)); Rest := Trim(Copy(Rest, P + 1, MaxInt)); end
+  else begin BaseU := UpperCase(Rest); Rest := ''; end;
+  case BaseU of
+    'INTEGER':  BaseU := 'UINTEGER';
+    'BYTE':     BaseU := 'UBYTE';
+    'SHORT':    BaseU := 'USHORT';
+    'LONG':     BaseU := 'ULONG';
+    'LONGINT':  BaseU := 'ULONGINT';
+    'UINTEGER', 'UBYTE', 'USHORT', 'ULONG', 'ULONGINT': ;   // already unsigned: keep it
+  else
+    Exit;                                       // not the modifier - leave the name exactly as written
+  end;
+  if Rest <> '' then Result := BaseU + ' ' + Rest else Result := BaseU;
+end;
+
+function FoldSizedIntegerTypeName(const S: string): string;
+// FreeBASIC's EXPLICIT-WIDTH integer names, "Integer<8>" / "UInteger<16>", collapsed to the ordinary type
+// name of that width. The parser's type readers gather a type as a run of tokens, so the angle brackets
+// arrive spaced out ("INTEGER < 8 >"); both spellings are normalised here so there is ONE place that
+// knows the mapping. The declaration form is read token-by-token in ParseDottedName, which needs no
+// string at all - this is for the readers that build a type NAME.
+var
+  T: string;
+  P: Integer;
+  Base, Bits: string;
+begin
+  Result := S;
+  P := Pos('<', Result);
+  if P = 0 then Exit;
+  Base := UpperCase(Trim(Copy(Result, 1, P - 1)));
+  if (Base <> 'INTEGER') and (Base <> 'UINTEGER') then Exit;
+  T := Copy(Result, P + 1, MaxInt);
+  P := Pos('>', T);
+  if P = 0 then Exit;
+  Bits := Trim(Copy(T, 1, P - 1));
+  T := Trim(Copy(T, P + 1, MaxInt));            // whatever followed ">" (a PTR suffix, say)
+  if Base = 'INTEGER' then
+    case StrToIntDef(Bits, 0) of
+       8: Base := 'BYTE';
+      16: Base := 'SHORT';
+      32: Base := 'LONG';
+      64: Base := 'LONGINT';
+    else Exit;
+    end
+  else
+    case StrToIntDef(Bits, 0) of
+       8: Base := 'UBYTE';
+      16: Base := 'USHORT';
+      32: Base := 'ULONG';
+      64: Base := 'ULONGINT';
+    else Exit;
+    end;
+  if T <> '' then Result := Base + ' ' + T else Result := Base;
 end;
 
 function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
@@ -2327,6 +3049,7 @@ function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
 // value expression. Lowers to antCast(value = upper-case type string, child0 = value expr).
 var
   TypeStr: string;
+  Depth: Integer;
   ValExpr, TypeOfExpr: TASTNode;
 begin
   Context.Advance;   // consume '('
@@ -2360,6 +3083,38 @@ begin
     while AtPointerSuffix do
     begin TypeStr := TypeStr + ' ' + kPTR; Context.Advance; end;
   end;
+  // ⛔ "CPtr(Sub(), 0)" / "Cast(Function() As Integer, p)": a PROCEDURE-POINTER type contains its own
+  // parentheses, and the token run below ends at the first ')' - so the type swallowed half of itself and
+  // the comma was never found ("Expected "," after the type in CAST/CPTR"). The same shape TypeOf hit
+  // just above, and the cure is the same: let the reader that knows this grammar consume it. What the
+  // cast produces is an entry address, which is int-banked, so the type name recorded is INTEGER.
+  if (TypeOfExpr = nil) and (TypeStr = '') and Context.Check(ttProcedureStart) then
+  begin
+    begin
+      Context.Advance;                        // SUB / FUNCTION
+      if Context.Check(ttDelimParOpen) then
+      begin
+        Depth := 1;
+        Context.Advance;
+        while (Depth > 0) and (not Context.IsAtEnd) do
+        begin
+          if Context.Check(ttDelimParOpen) then Inc(Depth)
+          else if Context.Check(ttDelimParClose) then Dec(Depth);
+          Context.Advance;
+        end;
+      end;
+      // "Function(...) [ByRef] As R": the return type follows, and it is part of the TYPE, not the
+      // cast's second argument.
+      if Context.Check(ttParamMode) then Context.Advance;
+      if Context.Check(ttAsType) then
+      begin
+        Context.Advance;
+        if Context.Check(ttIdentifier) then Context.Advance;
+        while AtPointerSuffix do Context.Advance;
+      end;
+    end;
+    TypeStr := 'INTEGER';
+  end;
   while (TypeOfExpr = nil) and
         (not Context.IsAtEnd) and (not Context.Check(ttSeparParam)) and (not Context.Check(ttDelimParClose)) do
   begin
@@ -2377,6 +3132,15 @@ begin
     end;
     Context.Advance;
   end;
+  // ⛔ ...AND THE GLOBAL-SCOPE DOTS ARE NOT PART OF THE NAME HERE EITHER. This loop copies every '.' it
+  // meets, so "CPtr(..ns.T Ptr, p)" produced "..NS.T PTR", which names nothing: the pointee was unknown
+  // and "p->field" read the wrong place and answered a plausible small number rather than raising.
+  // ⭐ Found by CENSUS, not by a failing test - after the same hole turned up in a third reader, the
+  // question asked was "who ELSE reads a type name" instead of "does this test pass now". CAST spells
+  // its type the same way and shares this loop; DIM, PARAMETER and type<> are the other three.
+  while (TypeStr <> '') and (TypeStr[1] = '.') do Delete(TypeStr, 1, 1);
+  TypeStr := FoldUnsignedTypeName(TypeStr);       // "UNSIGNED INTEGER" -> "UINTEGER"
+  TypeStr := FoldSizedIntegerTypeName(TypeStr);   // "INTEGER < 8 >" -> "BYTE"
   if not Context.Match(ttSeparParam) then
   begin
     HandleError('Expected "," after the type in CAST/CPTR', Context.CurrentToken);
@@ -2709,6 +3473,8 @@ function TExpressionParser.ParseMemberAccess(Left: TASTNode; Token: TLexerToken)
 // field name and build antMemberAccess(value=fieldName, child0=object expr). Chaining
 // (a.b.c) works because Left may itself be an antMemberAccess.
 var
+  Inner: TASTNode;   // the bottom of a deref chain under a parenthesised base
+  Levels: Integer;   // how many dereferences that chain has
   FieldName: string;
 begin
   if not HasValidContext then Exit(nil);
@@ -2737,6 +3503,63 @@ begin
     Result := Left;
     Exit;
   end;
+  // ⭐ "(*X).field" IS "X->field", so it becomes the SAME TREE here and stops being a second shape every
+  // reader downstream has to know about. The arrow spelling already produced a plain chain
+  // (antMemberAccess <- antMemberAccess <- ...) with the dereference implicit; the parenthesised one
+  // carried an antParentheses/antDeref in between, and the readers that walk the chain saw a node they
+  // had no arm for. Through a LOCAL pointer it happened to work; through a POINTER FIELD
+  // "(*b.aptr).x" answered 1 where fbc answers 1234 - the fbc suite's pointers/field_deref.
+  // ⛔⛔ AND ONLY WHEN THE DEREFERENCED THING IS ITSELF A MEMBER ACCESS. Unwrapping every base looked
+  // like the same rule and broke two guards at once, which is how narrow this is:
+  //   - m604 "(*@u).s": the operand is an ADDRESS-OF, and "*@u" is u ITSELF - unwrapping to "@u" made
+  //     the field read run on the address instead of the place;
+  //   - m619 "(*tpp)->n": the operand is a POINTER TO POINTER and the arrow is a SECOND dereference,
+  //     which the tree no longer distinguishes from a dot - unwrapping took one level away.
+  // Neither shape was broken to begin with; only the pointer FIELD was. So the rewrite is confined to
+  // it, and the other two keep the path they already had.
+  // "(*p)[i]" is an array access and keeps its own path (a ZString pointer indexes bytes there), and
+  // "*p.f" without the parentheses parses as "*(p.f)" and never reaches this shape at all.
+  // ⚠️ The two wrapper nodes are ORPHANED, not freed, and that is deliberate: TASTNode's child list is
+  // created with OwnsObjects=True, so RemoveChild/RemoveChildAt FREE what they remove - taking the base
+  // with them - and the unit has no detach-without-free. Two small nodes per "(*X).f" in the source,
+  // at parse time. Freeing them wants a DetachChildAt on TASTNode, which is a change to a shared unit
+  // and a separate decision.
+  if (Left <> nil) and (Left.NodeType = antParentheses) and (Left.ChildCount = 1) and
+     (Left.GetChild(0) <> nil) and (Left.GetChild(0).NodeType = antDeref) and
+     (Left.GetChild(0).ChildCount = 1) and (Left.GetChild(0).GetChild(0) <> nil) then
+  begin
+    // ⛔ ...and the test is on what the deref CHAIN bottoms out at, not on its immediate child:
+    // "(**x.ppp).a" is a member pointer dereferenced TWICE (fbc's structs/self-ref writes it), and
+    // asking only about the first child left it out - it answered 1 for 123 exactly as the single
+    // level did. Exactly ONE deref is removed either way, the one the dot itself implies; any further
+    // derefs stay, which is the shape "(*x.ppp)->a" already parses to and already works.
+    Inner := Left.GetChild(0).GetChild(0);
+    Levels := 1;
+    while (Inner <> nil) and (Inner.NodeType = antDeref) and (Inner.ChildCount = 1) do
+    begin
+      Inner := Inner.GetChild(0);
+      Inc(Levels);
+    end;
+    // Exactly ONE dereference is removed - the one the dot itself implies - and only when doing so
+    // cannot change what the base means:
+    //   - the chain bottoms out at a MEMBER ACCESS: "(*b.aptr).x" is "b.aptr->x" (m660);
+    //   - or there is MORE THAN ONE dereference: "(**q).a" is "(*q)->a" whatever q is, and that second
+    //     spelling already worked while this one died on a null pointer. fbc's structs/self-ref.
+    // ⛔ A SINGLE deref over an identifier or an address-of is left alone: m619's "(*tpp)->n" needs
+    // both levels and m604's "(*@u).s" names u itself, and neither was broken to begin with.
+    // ⛔⛔ ...AND THE "MORE THAN ONE DEREFERENCE" HALF IS ABOUT THE DOT SPELLING ONLY. The arrow IS a
+    // dereference of its own, so "(**q)->a" is one level deeper than "(***q).a" - and this rewrite,
+    // which cannot see which was written, took a level off both. The dot answered 123 and the arrow
+    // answered 1 on the same data (fbc's structs/self-ref writes the arrow). "->" now keeps the '>' in
+    // its token value, which is the only thing that separates them.
+    // ⛔⛔ ...AND THE SPELLING DECIDES, FOR BOTH HALVES. The arrow IS a dereference of its own, so
+    // "(*b.lpp)->a" is one level deeper than "(*b.lpp).a" and this rewrite - which removes the level the
+    // DOT implies - takes one too many from it. The dot answered 55 and the arrow answered 1 on the same
+    // field. "->" now keeps the '>' in its token value, which is the only thing that separates them.
+    if (VarToStr(Token.Value) <> '->') and
+       (((Inner <> nil) and (Inner.NodeType = antMemberAccess)) or (Levels >= 2)) then
+      Left := Left.GetChild(0).GetChild(0);
+  end;
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
   Result.AddChild(Left);
   DoNodeCreated(Result);
@@ -2747,9 +3570,35 @@ function TExpressionParser.ParseWithMember(Token: TLexerToken): TASTNode;
 // already been consumed (prefix rule). Builds antMemberAccess(field, clone of the WITH object).
 var
   FieldName: string;
+  ExplicitGlobal: Boolean;
 begin
-  if (WithObject = nil) or not HasValidContext then
+  // ⭐ FreeBASIC's EXPLICIT global-scope operator, "..name". ONE leading dot means the WITH object
+  // whenever there is one; TWO dots always mean the GLOBAL namespace, and that is the only way to reach
+  // a module-level name from INSIDE a WITH block - where a single dot is already spoken for. fbc's own
+  // tests write it both ways: "..foo" and, via "#define global .", "global.foo" - the same two tokens.
+  ExplicitGlobal := False;
+  if Context.Check(ttOpDot) then
   begin
+    Context.Advance;   // consume the second '.'
+    ExplicitGlobal := True;
+  end;
+  // ⭐ FreeBASIC's GLOBAL-SCOPE operator. Outside a WITH block a leading '.' does not want an object:
+  // ".name" means "the name in the GLOBAL namespace", which is how code inside a NAMESPACE reaches a
+  // module-level declaration its own namespace shadows. Answered as the bare identifier, marked so the
+  // namespace flattener leaves it UNMANGLED - which is exactly what "global" means once namespaces are
+  // flattened into prefixed names. fbc's tests/namespace/ uses it throughout (15 of the suite's parse
+  // failures), and before this it was reported as an error.
+  if ExplicitGlobal or (WithObject = nil) or not HasValidContext then
+  begin
+    if Context.Check(ttIdentifier) then
+    begin
+      Result := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Context.CurrentToken.Value)),
+                                         Context.CurrentToken);
+      Result.Attributes.Values['GLOBALSCOPE'] := '1';
+      Context.Advance;
+      DoNodeCreated(Result);
+      Exit;
+    end;
     HandleError('"." with no object (outside a WITH block)', Token);
     Result := nil;
     Exit;

@@ -10,13 +10,25 @@
 
 **FreeBASIC compatibility — 566 / 645 of FreeBASIC's keywords (88%)**. ⚠️ Read this as a
 *compatibility measure*, not a completion score: MODERN is SedaiBasic's own dialect, and this number
-says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists. **69** of the unimplemented
-entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C calling,
-build/platform directives, FFI, and the raw-allocator operators — `New`/`Delete Overload`,
-`Placement New` — which a managed record model cannot honour) — not runnable keywords for a portable
-bytecode VM. Of the
-**576 applicable** keywords, **563 (98%)** are implemented, and **5** are partial. See the
-[FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for the full breakdown.
+says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists. **58** of the
+unimplemented entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C
+calling, dynamic linking, build/platform directives) — not runnable keywords for a portable bytecode
+VM, and every one of them is a property of the TARGET, not a decision about a feature. Of the
+**599 applicable** keywords, **28** N/A rows remain and **7** are partial (◐) — the count moved on
+28 Aug 2026 when the shelf itself was audited rather than read: of 58 rows marked N/A, **23** turned
+out to be implemented or one table entry away, and eleven compile-mode defines were seeded the same
+day (`m630`).
+
+> ⛔⛔ **N/A IS THE EASIEST SHELF TO PUT SOMETHING ON, AND IT REMOVES IT FROM THE DENOMINATOR.** Three
+> rows sat there — `New Overload`, `Delete Overload`, `Placement New` — behind one sentence: "records
+> live in the VM's managed table, not at raw addresses". On 28 Aug 2026 a measurement disproved it (a
+> `T Ptr` does keep a raw address, and the type can own its allocator), the first two were implemented
+> and the third turned out to compile and run all along. A row marked N/A is a *decision*, and a
+> decision written as a fact stops being re-examined — which is precisely what a percentage that
+> excludes it will never tell you. When a section here says 100%, read the denominator first.
+
+See the [FreeBASIC Keyword Reference](#freebasic-keyword-reference--implementation-status) section for
+the full breakdown.
 
 > ⚠️ **This table is a hand-kept census and it drifts — in both directions.** Four ticks were withdrawn
 > on 5 Aug 2026 (`DRAW STRING`, `OPEN PIPE`, `OPEN COM`, `OPEN LPT`) after the FreeBASIC-examples sweep
@@ -167,7 +179,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `type<T>(args)` / `T(args)` / `= (a,b,c)` | ✓ | Anonymous UDT temporary with an explicit type; aggregate/tuple initialisation of a constructor-less UDT, including array-of-UDT `{(a,b), (c,d)}` |
 | `OPTION BASE 1` | ✓ | Default lower bound for a bare-upper-bound array `DIM a(n)` → `a(1..n)` |
 | `OPTION DIGITS n\|EXACT` | ✓ | Significant digits `PRINT` shows for a float; `EXACT`/`ALL` = every digit the value has (**SedaiBasic extension**, no FreeBASIC equivalent — see [Numeric output](#numeric-output-and-option-digits-sedaibasic-extension)) |
-| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type |
+| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type. ⚠️ A SedaiBasic extension: `fbc` 1.10.1 refuses this spelling (`error 17`) — see `job/markdown/DIVERGENZE.md`. |
 | `LPRINT` / `LPOS(n)` | ✓ | Line-printer output (routed to stdout) / head column (always 1 — no printer) |
 | `SETENVIRON` / `ENVIRON$` | ✓ | Set / read an environment variable (SETENVIRON sets a VM-internal override) |
 | `SHELL cmd` | ✓ | Run a command via the platform shell (cmd.exe / /bin/sh); returns the exit code |
@@ -175,7 +187,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `INP(port)` / `OUT port, value` | ✗ | **Not implemented.** Accepted and inert: `INP` always answers `-8` and `OUT` performs no write. See *Declared divergences* — whether to implement them or withdraw the keywords is an open decision. |
 | `LOCK` / `UNLOCK` | ✓ | File record locking — no-op on a single-process VM |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
-| `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening (methods of a namespaced TYPE / `USING` / `..global` pending) |
+| `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening. Global-scope operator: `.name` reaches the module-level name from inside a namespace, and `..name` does the same EXPLICITLY — the only form that still means the global one from inside a `With` block, where a single dot is the WITH object (methods of a namespaced TYPE / `USING` pending) |
 | Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
@@ -195,14 +207,14 @@ difference is stated rather than left to be discovered.
 | `Object` | `Type T Extends Object` | FB. The built-in RTTI base; `x Is Object` is true for any derived type. |
 | `This` | `This.field`, `This.Method()` | FB. Implicit inside a method, for fields *and* calls. |
 | `Base` | `Base.Method()`, `Base.field` | FB. The super call, dispatched **non**-virtually against the parent. |
-| `Constructor` / `Destructor` | `Constructor T()` | FB. The base is constructed first and destroyed last; `Base(args)` chains explicitly. |
+| `Constructor` / `Destructor` | `Constructor T()` | FB. The base is constructed first and destroyed last; `Base(args)` chains explicitly. **Gap:** the elements of an ARRAY of UDT are constructed but never destroyed - `Dim As P x(0 To 1)` runs `P`'s constructor twice and its destructor zero times, where FreeBASIC runs both twice. |
 | `Declare` | `Declare Sub F()` | FB. Methods are defined out of line (`Sub T.F()`). |
 | `Virtual` | `Declare Virtual Sub F()` | FB. **Required for dynamic dispatch.** Without it a redeclaration in a child *shadows*, and the call resolves on the static type - as fbc does. |
 | `Abstract` | `Declare Abstract Sub F()` | FB. No body here; implies `Virtual`. A type that inherits one and does not implement it **cannot be instantiated**. |
 | `Static` | `Declare Static Sub F()`, `Static n As Integer` | FB. No implicit `This`; one storage shared by all instances. |
-| `Private:` `Protected:` `Public:` | section labels in the type body | FB. **Enforced.** `Private` reaches only the declaring type's own methods, `Protected` also its descendants. |
+| `Private:` `Protected:` `Public:` | section labels in the type body | FB. **Enforced** at every member site: a field, a method, a static method, a static data member, a constructor and a destructor. `Private` reaches only the declaring type's own methods, `Protected` also its descendants; a constructor or destructor a derived type reaches implicitly is judged from that derived type, not from where the declaration stands. **Divergence:** the access level is recorded per NAME, while FreeBASIC decides it per OVERLOAD - a name declared at two levels is treated as unenforced, so `Public: Constructor(n)` beside `Private: Constructor(ByRef rhs)` lets both through. |
 | `Property` | `Property T.Length()` | FB. Getter and setter forms. |
-| `Operator` | `Operator T.+ (…)` | FB. Including the compound (`*=`) and `Cast` forms. |
+| `Operator` | `Operator T.+ (…)` | FB. Including the compound (`*=`), `Cast`, `[]`, `Let`, `@` and the `For`/`Next`/`Step` iteration forms; the access level on the declaration is enforced for all of them. `Operator New` / `Operator Delete` are called: the type owns the allocation and `Delete` hands the same pointer back. **Gap:** only where the type has nothing to run on an object (no constructor, destructor, method, property or other operator) - an object in raw bytes cannot run a method, whose `This` is a record handle. Where it has, the built-in allocator is used and the operator is not called. |
 | `Implements` | `Type T Implements I1, I2` | **MODERN extension.** fbc reserves the word and never implemented it. Here it is a *checked contract*. |
 | `Interface` … `End Interface` | `Interface I` / `End Interface` | **MODERN extension.** Does not exist in fbc. Sugar for a type whose every method is implicitly `Abstract` (hence `Virtual`) and which carries no fields. A type may implement several. |
 | `Override` | `Declare Override Sub F()` | **MODERN extension.** Verified: an ancestor must declare that method `Virtual`. Catches the mistyped override, which would otherwise become a new method in silence. Optional - requiring it would reject FreeBASIC source. |
@@ -213,6 +225,25 @@ difference is stated rather than left to be discovered.
 
 ### Declared divergences from FreeBASIC
 
+- ⚠️ **A declaration must state its type, and that narrows what we used to accept.** In `-lang fb`
+  there are no default types and no inference from a type sigil, so `Dim a`, `Dim a$`, `Dim a(0 To 1)`,
+  `Common a` and `Dim a = 5` are all refused, exactly as fbc refuses them (`error 147`). The check is
+  per NAME: `Dim a, b As Integer` leaves `a` untyped and is refused, while the leading-AS spelling
+  `Dim As Integer a, b` types both. The suffix itself is never the offence — `Dim a$ As String` is
+  accepted and the sigil is simply ignored, which also means `a$` **is** `a` (a `Dim a$` beside a
+  `Dim a` is a duplicate definition).
+  ⛔ **Why it is a divergence and not only conformance gained**: the dialect is chosen from the
+  program's content — line numbers mean CLASSIC, their absence means MODERN — so a Commodore-style
+  program written without line numbers is MODERN, and from now on it wants its types.
+  ⭐ **The way out is fbc's own, and the rule reads it**: a source may ask for another language with
+  `#lang "fblite"` / `'$lang: "qb"` / `"deprecated"`, and there the default types and the sigils are
+  legal again. `Var`, `As TypeOf(expr)` and `Const` are unaffected — each carries its type somewhere
+  other than a type name.
+- ⚠️ **`f( x ) = v` where `f` is a `Function ... ByRef` assigns through the reference here.** fbc reads
+  that `=` as an EQUALITY operator and says so (`warning 34: '=' parsed as equality operator in function
+  argument, not assignment to BYREF function result`); the ambiguity only arises when the call carries
+  arguments, since `f() = v` assigns in both. We do not replicate the reading fbc itself flags as
+  ambiguous: a statement of the form `lvalue = value` is an assignment.
 - `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
   there. That is the point of an extension.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
@@ -238,6 +269,38 @@ difference is stated rather than left to be discovered.
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
   - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
     `As #90` is legal there and an error here.
+- ⚠️ **The C standard library is not here, and only its I/O half is a divergence.** A program that
+  includes `<crt.bi>` for MEMORY gets what it asked for: `malloc`, `calloc`, `realloc` and `free` are
+  aliases of `Allocate`, `CAllocate`, `Reallocate` and `Deallocate`, byte for byte (`calloc(count,
+  size)` is exactly the two-argument `CAllocate`). A procedure the program declares itself under one
+  of those names still wins — the alias is a fallback, not a reservation. Everything else in `crt.bi`
+  — `FILE*`, `printf`/`snprintf`, the string and formatting entry points — stays unsupported: this VM
+  owns its own memory and its own file handles, and handing a BASIC program a real `FILE*` is the one
+  thing the memory-safety design exists to prevent.
+- ⚠️ **`Load` is a reserved word here and not in fbc**, so `Sub Load()` is refused. Every other
+  Commodore word in that position was checked: `run`, `new`, `delete`, `poke`, `wait`, `close`,
+  `open`, `get`, `put`, `print` and `input` are refused by fbc too (in its own words, "Duplicated
+  definition"), and `list`, `save`, `verify`, `sys`, `cont` and `clr` are accepted by both. `Load` is
+  the only one that is ours alone.
+- ⚠️ **`LSet` / `RSet` on a string-convertible UDT is accepted in one case fbc rejects.** fbc requires
+  both an `Extends ZString`/`WString` chain *and* an `Operator Cast() ByRef As Z/WString` declared on
+  the type itself; we require the chain and a cast that merely *resolves*, which an ancestor may
+  supply. Where fbc accepts the statement, the result is byte-identical: the destination's current
+  length is preserved, the source is cut from the right when longer and padded when shorter, and the
+  counts are codepoints for a wide destination.
+- ⚠️ **Overload resolution does not tell `Integer` from `LongInt`, nor `UInteger` from `ULongInt`.**
+  On this target all four are 64 bits and all four sign the same register bank, and no registry records
+  which of the four a name was *declared* as — so given `f(ByVal x As Integer)` and
+  `f(ByVal x As UInteger)`, both `f(i)` and `f(u)` answer the first declaration. Everything the bank
+  and the declared width *can* separate is resolved exactly: `Byte`/`UByte`/`Short`/`UShort`/`Long`/
+  `ULong`/`Single`/`Double`/`Boolean`, each **enum** type, each **pointee** type (`Integer Ptr` from
+  `Double Ptr` from `T Ptr`, at any pointer depth), each by-value UDT, and `Const` against non-`Const`.
+  ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
+  an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
+  when exactly one fits.
+  An overload whose trailing parameters carry **defaults** is reachable with fewer arguments
+  (`f(0)` selecting `f(i As Integer, j As Integer = 0, k As Integer = 0)`); among the candidates the
+  one needing the fewest omissions wins, and an exact bank prefix breaks a tie.
 - ⚠️ **`PUT ..., Alpha`**: the blended RGB matches fbc exactly; the resulting **alpha byte** does not.
   fbc's is deterministic and fully characterised — with an explicit value it is the blend value when
   the destination's **green** exceeds the source's green and the destination's own alpha otherwise
@@ -447,7 +510,7 @@ overlap; `-lang fb`). A `.fb`/`.fbas` extension forces MODERN.
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `GET` | ✓ | Get character (non-blocking, returns empty string if no key) |
+| `GET` | ✓ | Get character (non-blocking, returns empty string if no key). The binary file form also has a FUNCTION spelling, `Get(#f, pos, target)`, which answers 0 — as `PUT` does. |
 | `GETKEY` | ✓ | Get keypress (blocking, waits for key) |
 | `INPUT` | ✓ | Input statement |
 | `CHAR` | ✓ | Displays text at specific position (mode, col, row, text [,reverse]) |
@@ -1622,7 +1685,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 > matters because it means unmodified FreeBASIC programs run here. A -- below means "FreeBASIC code
 > using this will not run", not "SedaiBasic is missing something it owes anyone" -- and several
 > entries are marked N/A precisely because they are artefacts of being a native compiler rather than
-> features a language needs. It catalogues the **complete FreeBASIC keyword
+> features a language needs.
+> ⛔ **That shelf has to earn its place, every time.** Three rows on it (`New Overload`, `Delete
+> Overload`, `Placement New`) were not artefacts of the target at all: they were a design decision
+> about our own object model, written as though it were a fact about the machine, and it was wrong.
+> N/A belongs to what the TARGET cannot do, never to what we have not done. It catalogues the **complete FreeBASIC keyword
 > set**, organized exactly as in the official FreeBASIC manual
 > ([DocToc](https://www.freebasic.net/wiki/DocToc)), together with SedaiBasic's current support.
 > Sourced from the FreeBASIC wiki (Language Documentation + Runtime Library Reference), June 2026.
@@ -1675,11 +1742,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `DIM` | ✓ | Declares a variable at the current scope. Both `DIM name AS type [= init]` and the leading-AS form `DIM [SHARED] AS type name[, ...] [= init]` (type shared by every name) are supported. Array forms: fixed `DIM a(dims) AS type`, an initializer with either sign `DIM a(dims) AS type = { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (starts at `UBOUND = -1`, sized later with `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` (size deduced from the initializer). |
-| `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported (immutability is not enforced). |
+| `CONST` | ✓ | Declares a non-modifiable variable. Both the untyped `CONST name = value` and the typed `CONST name AS type = value` forms are supported. A typed constant carries its declared WIDTH (`CONST b AS BYTE = 200` is -56, as `fbc` gives), and every item of a comma-separated list is a constant, not only the first. Assigning to one is refused. |
 | `SCOPE` | ✓ | Begins a new scope block. |
-| `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders. |
+| `STATIC` | ✓ | Declares local variables that retain their value between calls (initializer runs once). Both `STATIC name AS type` and the AS-first `STATIC AS type name [, ...]` orders, with the `SHARED` and `BYREF` modifiers (`STATIC SHARED BYREF AS T r = target`). |
 | `SHARED` | ✓ | Used with Dim allows variables to be visible throughout a module. |
-| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
+| `VAR` | ✓ | Declares variables where the data type is implied from an initializer. Takes the `SHARED` and `BYREF` modifiers in either order (`VAR SHARED v = e`, `VAR SHARED BYREF r = target`), and `BYREF` may be repeated before each name in the list. The bank is inferred from string literals, `+` concatenation, and string-returning function calls (`SPACE`, `LEFT`, `STR`, `CHR`, `UCASE`, `HEX`, …), as well as numeric expressions. |
 | `BYREF (variables)` | ✓ | Used with Dim or Static or Var allows to declare references. (DIM BYREF done; VAR/STATIC BYREF deferred.) |
 
 #### User Defined Types
@@ -1688,7 +1755,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment) |
+| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment). A member named through its enum (`E.member`) is a compile-time CONSTANT: an ordinary variable of the same name cannot shadow it, and two enums may declare the same member name. The BARE name stays an ordinary module-wide value, which an explicit `DIM` may shadow — as `fbc` does. |
 | `TYPE...END TYPE` | ✓ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). `EXTENDS Object` RTTI + `IS`. Static member methods & variables. Explicit `DECLARE [VIRTUAL\|ABSTRACT\|STATIC]` and `OVERRIDE` accepted (virtual dispatch is automatic via runtime type-id). Field default values (`x AS Integer = 10`, applied on every scalar/nested instantiation, overridden by aggregate init). Fixed-size array members (`DIM data(100) AS Integer`) are auto-sized at construction; `Any` members size via `REDIM`. `OPERATOR` overloads dispatch with a non-UDT right operand (`vec * scalar`). |
 | `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
@@ -1773,7 +1840,8 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `CONST` | ✓ | Specifies a read only type. |
 | `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
 | `UNSIGNED` | ✓ | `AS UNSIGNED <basetype>` modifier → maps to the unsigned variant (INTEGER→UINTEGER, BYTE→UBYTE, SHORT→USHORT, LONG→ULONG, LONGINT→ULONGINT). Bare `UNSIGNED` == UNSIGNED INTEGER. |
-| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. |
+| `INTEGER<n>` / `UINTEGER<n>` | ✓ | Explicit-width integer type names: `<8>` → BYTE/UBYTE, `<16>` → SHORT/USHORT, `<32>` → LONG/ULONG, `<64>` → LONGINT/ULONGINT. Accepted in a declaration (`Dim As Integer<8> b`) and in expression position (`SizeOf(Integer<8>)`, `Cast(Integer<8>, e)`). |
+| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. Accepted in all five places `fbc` accepts one (procedure, variable, `NAMESPACE`, `TYPE`, `ENUM`); an EMPTY alias name (`ALIAS ""`) is refused everywhere, as `fbc` does. |
 
 ##### String types
 
@@ -1782,6 +1850,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STRING` | ✓ | Variable-length strings (`DIM AS STRING`); fixed-length `STRING * n` is parsed (advisory length). |
 | `ZSTRING` | ✓ | Null-terminated string type (`DIM AS ZSTRING [* n]`); `ZSTRING PTR` is a raw pointer to a string's bytes (see `SADD`). |
 | `WSTRING` | ✓ | Wide-character strings (UTF-8 storage, codepoint-aware LEN/MID/LEFT$/RIGHT$). Fixed-length `* n` parsed but advisory (var-length storage). |
+| var-len `STRING` initializer | ✓ | A var-len `STRING` **scalar** with STATIC storage (`SHARED`, `STATIC`, a `NAMESPACE` member, a dotted member definition, or a name a module-level `EXTERN` declared) may not be initialized, as `fbc` requires (`error 87`). A bare module-level `DIM s AS STRING = ...` is a local of the implicit main and IS allowed, as in `fbc`. ⚠️ The ARRAY form is still accepted where `fbc` refuses it — see `job/markdown/DIVERGENZE.md`. |
 
 ##### Class types
 
@@ -1928,7 +1997,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `# (Argument stringize)` | ✓ | `#param` in a function-like macro body stringizes the argument into a string literal. |
 | `## (Argument concatenation)` | ✓ | `a ## b` in a macro body pastes the surrounding tokens together. |
-| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer). |
+| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer): `\a \b \f \n \l \r \t \v \\ \" \'`, `\DDD` decimal, `\xNN` hex, `\&hNN`/`\&oNNN`/`\&bNNNN`, `\uNNNN`. Every numeric escape but `\u` names one **byte**; `\u` names a codepoint and is UTF-8 encoded. |
 | `$ (Non-Escaped String Literal)` | ✓ | `$"..."` takes the body verbatim (our default for `"..."`). |
 
 #### Pointer Operators
@@ -1953,10 +2022,10 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `New Expression` | ✓ | `NEW T` / `NEW T(args)` allocates a heap record (runs its constructor) and yields a `T PTR`. Outlives the allocating frame. `NEW T[n]` allocates **n** contiguous elements and `DELETE[] p` releases them: when `T` has a constructor or a destructor each element gets its own, in element order; when it has neither the block is plain bytes, so a program may lay a byte view over it or `memcopy` it. `NEW T PTR [n]` allocates an array of POINTERS, which is how a 2-dimensional object array is built — `p[i] = NEW T[m]`, then `p[i][j].field` and `DELETE[] p[i]`. |
-| `New Overload` | N/A | A member `OPERATOR NEW` replaces the *allocation* step with user code returning a raw address. `NEW T` here yields a managed record handle — a slot in the VM's record table, not an address the program could have allocated — so a user allocator cannot be honoured. Constructor overloads do apply. |
-| `Placement New` | N/A | `NEW(address) T` constructs an object at a caller-supplied address. Records live in the VM's managed table, not at raw addresses; the all-raw object model was evaluated and rejected because it conflicts with value semantics, RAII, virtual dispatch and threading. |
+| `New Overload` | ◐ | ⛔ **This row said N/A until 28 Aug 2026, and the reason it gave was false.** It read: "`NEW T` here yields a managed record handle … so a user allocator cannot be honoured" — a DECISION written as a fact, and it kept the keyword out of the denominator. A `T Ptr` does keep a raw address and lays the type over those bytes, so the operator can own the storage, and now does: it is handed `SizeOf(T)` and the object is built on what it answers. **The real limit is narrower and was never the one written here:** an object in raw bytes cannot run a METHOD, because a method body is compiled once against record slots and its `This` is a record handle. So the operator owns the allocation where the type has nothing to run on an object, and does not where it has. |
+| `Placement New` | ◐ | `NEW(address) T` constructs an object at a caller-supplied address. It COMPILES and RUNS: the address expression is evaluated (its side effects happen) and an ordinary instance is constructed, so the program is right in everything except the object's ADDRESS. ⚠️ It was filed N/A on the strength of the same sentence `New Overload` carried, and N/A is the wrong shelf for something that compiles and runs — this is a divergence, and it is one the same missing piece would close: a method that can take a raw `This`. |
 | `Delete Statement` | ✓ | `DELETE p` runs the pointee's destructor and frees the heap record (slot recycled via a free list) |
-| `Delete Overload` | N/A | The counterpart of `New Overload`: a member `OPERATOR DELETE` replacing the *deallocation* step. `DELETE p` frees a managed record slot, so there is no allocation for user code to take over. Destructors do run. |
+| `Delete Overload` | ◐ | The counterpart of `New Overload`, and it carried the same false reason. `DELETE p` now runs the destructor and hands the operator back the SAME pointer its `New` answered — under the same gate, so the two halves of one allocation cannot disagree. |
 
 #### Iteration Operators
 
@@ -2025,7 +2094,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `Public` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
 | `Private` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
-| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name and ignored (no external linking). |
+| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name, a variable, a `NAMESPACE`, a `TYPE` or an `ENUM`, and ignored (no external linking). An empty name is refused. |
 | `Export` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 | `Lib` | ✓ | `LIB "name"` accepted after a procedure name and ignored (no external linking). |
 
@@ -2060,7 +2129,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Constructor (Module)` | ✓ | `Sub name [()] Constructor [priority]` runs before module-level code (definition order); a ctor may initialise SHARED globals. Priority parsed but not yet ordering. |
+| `Constructor (Module)` | ✓ | `Sub name [()] Constructor [priority]` runs before module-level code (definition order); a ctor may initialise SHARED globals. What it SEES is what fbc's static initialisation puts there first: a `Dim Shared x As <scalar> = <constant>` already holds its value (and is *not* re-run afterwards, so a value the ctor writes survives), and a `Dim Shared v(0 To n)` with constant bounds is already dimensioned. A non-constant initialiser is a declared divergence — fbc refuses one — and stays where it is written. Fixed 26 Aug 2026, guard `m589`. Priority parsed but not yet ordering. |
 | `Destructor (Module)` | ✓ | `Sub name [()] Destructor [priority]` runs after module-level code (reverse order), on fall-through and explicit `END`. |
 
 ##### Miscellaneous
@@ -2080,7 +2149,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `DYLIBLOAD` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `DYLIBSYMBOL` | ✗ | N/A — native dynamic linking is out of scope for the bytecode VM. |
 | `EXPORT` | ✓ | `SUB f (...) EXPORT` / `FUNCTION f (...) AS T EXPORT` — publish the symbol in a shared library's export table. There is no export table in a bytecode program: parsed and ignored. |
-| `EXTERN` | ✓ | Accepted and skipped — external linkage is N/A for a single-module bytecode VM (no native linking). |
+| `EXTERN` | ✓ | External linkage is N/A for a single-module bytecode VM, so the line produces no storage — but a module-level `EXTERN` is still a DECLARATION, and a later `DIM`/`REDIM`/`EXTERN` of that name must agree with it on rank, bounds, static/dynamic-ness and element type (as `fbc` requires). An `EXTERN` may carry neither an initializer nor an ellipsis bound. The rule is confined to module level: a same-named `DIM` inside a `SUB` or a `NAMESPACE` is a different variable. |
 | `EXTERN...END EXTERN` | ✓ | `EXTERN "lang" ... END EXTERN` block accepted and skipped (no native linking). |
 | `IMPORT` | ✓ | Accepted and skipped (no native linking). |
 | `NAMESPACE` | ✓ | Group decls under a name (AST-flattened to `N.member`); nesting + reopening |
@@ -2106,6 +2175,47 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `#ENDIF` | ✓ | Signifies the end of a code block. |
 | `DEFINED` | ✓ | `defined(NAME)` / `defined NAME` in `#if`/`#elif` evaluates to 1 if the symbol is defined, else 0. |
 
+`#IFDEF`, `#IFNDEF` and `DEFINED` ask **one question**, and it is a question about a **position**: a
+name counts as defined when it is an object- or function-like macro, a `#pragma reserve` reservation
+still in scope, a **reserved word of the language**, or a declaration the module makes **above this
+point** — a `Const`, a `Dim`/`Static`/`Common`, a `Sub`/`Function`, a `Type`/`Enum` and its members.
+So `defined(T)` is false above `Type T` and true below it, exactly as in fbc. A member of a type is a
+symbol only from inside that type's own body; a qualified name (`T.field`, and the operator spellings
+`T.+=`, `T.[]`, `T.new[]`) is one name, answered from that type's declarations so far.
+
+🎯 **A conversion of an lvalue is an lvalue** (29 August 2026): `CUInt( i ) Shr= 1` reinterprets `i`'s
+bits, operates on them and writes them back, as `Cast( UInteger, i ) Shr= 1` already did. ⚠️ More
+permissive than fbc by one step: fbc accepts only the conversion that REINTERPRETS and answers
+`error 24` when it changes the SIZE (`CLng( i ) *= 3`, `CByte( w ) += 0` on a 64-bit variable); we
+accept those and write back through the narrow width. `CPtr`, `CSign` and `CUnsg` are not lvalue
+targets in either. Declared in `job/markdown/DIVERGENZE.md`.
+
+🎯 **`#IF` reads a constant the SOURCE declares** — a module `Const` and, since 29 August 2026, an
+`Enum` member (numbered from 0, restarted by an explicit `= <integer literal>`). ⚠️ Conservative by one
+step: a member whose initialiser is an EXPRESSION (`M2 = M1 + 4`) is not folded here — fbc folds it,
+because its preprocessor and its parser are one pass — so it keeps the evaluator's `0` and the
+numbering of that enum stops there. Declared in `job/markdown/DIVERGENZE.md`.
+
+🕳️ **A second known gap, measured 29 August 2026:** two `Namespace` bodies that declare a type with
+the SAME simple name collide — the namespace is not part of the type's identity, so both destructors
+are filed under one label and *neither* runs (fbc runs both). Different type names in the two
+namespaces work. Reproduction and what it needs in `job/markdown/DIVERGENZE.md`.
+
+🕳️ **A known gap beside it, measured 29 August 2026:** inside a `Namespace` body, FreeBASIC lets
+**147** more of its own keywords name a procedure than we do (`Sub print()` is a duplicate definition
+at module level and legitimate inside a namespace, where it is called as `N.print`). We reserve
+keywords the same way everywhere. No test in fbc's suite depends on it yet; the census and the risk
+are written up in `job/markdown/DIVERGENZE.md`.
+
+🎯 **One declared divergence, and it is a step of lag we do not reproduce.** fbc answers
+`defined( field )` **false** on the line immediately after `field As Integer`, and true as soon as
+another member follows — while the qualified form `defined( T.field )` answers true straight away. We
+answer true in both. No fbc test depends on the lag; see `job/markdown/DIVERGENZE.md`.
+
+⚠️ The list of reserved words is an **inventory read off the oracle**, not a list reasoned out:
+`src/FbReservedWords.inc` (366 words) is regenerated by `job/tests/tools/fb_reserved_words.sh`, which
+asks fbc itself in a single compile. It moves the day the oracle moves.
+
 ##### Text Replacement
 
 | Keyword | Status | Description |
@@ -2122,22 +2232,22 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#INCLUDE` | ✓ | Inserts text from a file. |
-| `#INCLIB` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
-| `#LIBPATH` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#INCLUDE` | ✓ | Inserts text from a file. `#include once` splices a file only if it has not been included yet — and a PLAIN `#include` registers the file too, so “once” after two plain includes is skipped (29 Aug 2026, fbc's own `pp/inc_once1..5`). Identity is the canonical PATH, not the spelling. |
+| `#INCLIB` | ✓ | Accepted and ignored — there is no separate link step, and a program that names a library still has to compile. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `#LIBPATH` | ✓ | Accepted and ignored; see `#INCLIB`. Verified against fbc 1.10.1 (28 Aug 2026). |
 
 ##### Control Directives
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#PRAGMA` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#PRAGMA` | ✓ | `#pragma once` and `#pragma reserve` are implemented (29 Aug 2026); every other pragma is accepted and ignored, as before. ⚠️ The previous wording here — “`#pragma once` behaves as fbc does, verified 28 Aug 2026” — was **wrong**: the directive was not handled at all, it was dropped in silence, and the first include of such a header is right either way, which is what made it look verified. It is what a table entry asserting a behaviour nobody exercised costs. |
 | `#PRAGMA RESERVE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
-| `#CMDLINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#CMDLINE` | ✓ | Accepted; `Command()` answers as fbc does. Verified against fbc 1.10.1 (28 Aug 2026). |
 | `#LANG` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#PRINT` | ✓ | `#print msg` emits a macro-expanded compile-time message to stderr. |
 | `#ERROR` | ✓ | `#error msg` aborts compilation with a macro-expanded diagnostic (skipped inside a false `#if`/`#ifdef` branch). |
 | `#ASSERT` | ✓ | `#assert <expr>` aborts compilation if the constant integer expression is false. |
-| `#LINE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
+| `#LINE` | ✓ | `#line n` sets what `__LINE__` reports. Verified against fbc 1.10.1 (28 Aug 2026). |
 
 ##### Metacommands
 
@@ -2189,7 +2299,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | Keyword | Status | Description |
 |---|---|---|
 | `__FB_WIN32__` | ✓ | Defined if compiling for Windows. |
-| `__FB_LINUX__` | ✓ | Defined if compiling for Linux. |
+| `__FB_LINUX__` | ✓ | Defined on Linux. **DICHIARATA**: `-1` here, empty expansion in fbc; see `__FB_64BIT__`. |
 | `__FB_DOS__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_CYGWIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_FREEBSD__` | ✓ | Defined if compiling for FreeBSD. |
@@ -2199,11 +2309,11 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_XBOX__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_BIGENDIAN__` | ✓ | Defined if compiling on a system using big-endian byte-order. |
 | `__FB_PCOS__` | ✓ | Defined if compiling for a common PC OS (e.g. DOS, Windows, OS/2). |
-| `__FB_UNIX__` | ✓ | Defined if compiling for a Unix-like OS. |
-| `__FB_64BIT__` | ✓ | Defined if compiling for a 64bit target. |
+| `__FB_UNIX__` | ✓ | Defined on a unix host. **DICHIARATA**: `-1` here, empty expansion in fbc; see `__FB_64BIT__`. |
+| `__FB_64BIT__` | ✓ | Defined. **DICHIARATA**: we give it `-1`, fbc gives it an EMPTY expansion — `#ifdef` (the form a program uses) agrees, `#if`/`Print` do not. Same for `__FB_LINUX__`, `__FB_UNIX__`, `__FB_X86__`, `__FB_MAIN__`. |
 | `__FB_ARM__` | ✓ | Defined if compiling for the ARM architecture. |
 | `__FB_PPC__` | ✓ | Defined if compiling for the PowerPC architecture. |
-| `__FB_X86__` | ✓ | Defined if compiling for the X86 / X86_64 architecture. |
+| `__FB_X86__` | ✓ | Defined on x86. **DICHIARATA**: `-1` here, empty expansion in fbc; see `__FB_64BIT__`. |
 | `__FB_JS__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_ANDROID__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
@@ -2216,42 +2326,49 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FB_VER_MINOR__` | ✓ | Defined as an integral literal of the compiler minor version number. |
 | `__FB_VER_PATCH__` | ✓ | Defined as an integral literal of the compiler patch number. |
 | `__FB_MIN_VERSION__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_BUILD_DATE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_BUILD_DATE_ISO__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_SIGNATURE__` | ✓ | Defined as a string literal of the compiler signature. |
-| `__FB_BUILD_SHA1__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_BUILD_DATE__` | ◐ | **DICHIARATA**: left undefined on purpose. It describes the COMPILER's own build, and answering fbc's date would be a statement about us that is false. |
+| `__FB_BUILD_DATE_ISO__` | ◐ | **DICHIARATA**: left undefined on purpose; see `__FB_BUILD_DATE__`. |
+| `__FB_SIGNATURE__` | ✓ | `"SedaiBasic (FreeBASIC-compatible)"`. **DICHIARATA**: naming ourselves fbc would be false. |
+| `__FB_BUILD_SHA1__` | ◐ | **DICHIARATA**: left undefined on purpose; see `__FB_BUILD_DATE__`. |
 | `__FB_BUILD_FORK_ID__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 
 ##### Command-line switches
 
+⛔ **A define that describes the COMPILER still decides what gets COMPILED.** Six of these used to read
+"no meaning for a bytecode VM" and were left undefined, which is not neutral: a body wrapped in
+`#if __FB_BACKEND__ = "gas"` was compiled by us and skipped by fbc, and we then died inside code the
+oracle never builds. Each now answers what fbc 1.10.1 answers on linux-x86_64 with its own defaults —
+the value is the *oracle's*, not a preference of ours, because getting it wrong is worse than leaving
+it out. Fixed 26 Aug 2026, guard `m585`.
+
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ASM__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_BACKEND__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_GCC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTIMIZE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_GUI__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_MAIN__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ASM__` | ✓ | `"intel"` — fbc's own answer on linux-x86_64. Naming a dialect does not make inline `Asm` supported; that stays a declared gap (see divergence 51). |
+| `__FB_BACKEND__` | ✓ | `"gcc"` — fbc's default backend on this host, and therefore the branch fbc itself compiles. |
+| `__FB_GCC__` | ✓ | `-1` — the flag form of `__FB_BACKEND__ = "gcc"`, kept consistent with it. |
+| `__FB_OPTIMIZE__` | ✓ | `0` — the optimisation level the SOURCE asked for (fbc's default; a `#cmdline` carrying `-O` raises it). It reports the REQUEST, not our pipeline, which has no `-O` ladder. |
+| `__FB_GUI__` | ✓ | Console programs, as fbc's default is: `0`. Value read out of fbc 1.10.1. |
+| `__FB_MAIN__` | ◐ | **DICHIARATA**: defined as `-1` where fbc defines it to an empty expansion. `#ifdef __FB_MAIN__` — the form a program actually uses — agrees; `Print __FB_MAIN__` does not. |
 | `__FB_DEBUG__` | ✓ | True (-1) if the "-g" switch was used, false (0) otherwise. |
-| `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_FPMODE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ERR__` | ✓ | `0` — the `-e`/`-ex`/`-exx` error-checking level, none by default, as in fbc. |
+| `__FB_FPMODE__` | ✓ | `"precise"` — fbc's default `-fpmode`. |
 | `__FB_FPU__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
 | `__FB_LANG__` | ✓ | Defined to a string literal of the "-lang" dialect used. |
-| `__FB_MT__` | ✓ | True (-1) if the "-mt" switch was used, false (0) otherwise. |
-| `__FB_OUT_DLL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_MT__` | ✓ | `-1`. **DICHIARATA**: fbc answers `0` without `-mt`; we always have the threading runtime, and a program guarding a `ThreadCreate` behind `#if __FB_MT__` must find it. |
+| `__FB_OUT_DLL__` | ✓ | `0` — the three targets we are not; only `__FB_OUT_EXE__` is `-1`. |
 | `__FB_OUT_EXE__` | ✓ | True (-1) in a module being compiled and linked into an executable, false (0) otherwise. |
-| `__FB_OUT_LIB__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OUT_OBJ__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OUT_LIB__` | ✓ | `0` — see `__FB_OUT_DLL__`. |
+| `__FB_OUT_OBJ__` | ✓ | `0` — see `__FB_OUT_DLL__`. |
+| `__FB_PROFILE__` | ✓ | Left **undefined**, as fbc leaves it unless `-profile` is given — `#ifdef __FB_PROFILE__` is how a program asks, and a define that exists where fbc's does not is as wrong as one that is missing. |
 | `__FB_SSE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_VECTORIZE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_VECTORIZE__` | ✓ | `0` — fbc's default `-vec 0`. |
 
 ##### Environment Information
 
 | Keyword | Status | Description |
 |---|---|---|
 | `__FB_ARGC__` | ✓ | The number of command-line arguments passed to the program (matches `COMMAND$` handling). |
-| `__FB_ARGV__` | ~ | Defined (returns 0 — a real ZSTRING PTR PTR argument vector is not exposed; use `COMMAND$(n)`). |
+| `__FB_ARGV__` | ~ | Defined. **DICHIARATA**: it is an ADDRESS, so it cannot equal fbc's and comparing the two values says nothing. A real `ZString Ptr Ptr` argument vector is not exposed; use `Command$(n)`. |
 | `__DATE__` | ✓ | String literal of the compilation date in "mm-dd-yyyy" format (captured at compile time). |
 | `__DATE_ISO__` | ✓ | String literal of the compilation date in "yyyy-mm-dd" format. |
 | `__TIME__` | ✓ | String literal of the compilation time in "hh:mm:ss" format. |
@@ -2264,32 +2381,32 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `__FILE__ and __FILE_NQ__` | ✓ | `__FILE__` → top-level source file name (quoted string literal); `__FILE_NQ__` → the same name without the surrounding quotes (raw token). |
 | `__FUNCTION__ and __FUNCTION_NQ__` | ✓ | The name of the enclosing procedure (uppercased), or `__FB_MAINPROC__` at module level; resolved to a compile-time string constant. Both forms yield the same string value. |
 | `__LINE__` | ✓ | Expands to the current source line number (1-based). |
-| `__FB_OPTION_BYVAL__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_DYNAMIC__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_ESCAPE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_GOSUB__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_BYVAL__` | ✓ | `0` — `-lang fb` passes by value unless `ByRef` is written. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_DYNAMIC__` | ✓ | `0` — arrays are static unless declared otherwise. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_ESCAPE__` | ✓ | `0` — `\n` is not an escape unless the literal is written `!"…"`. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_GOSUB__` | ✓ | `0` — `Gosub` is off in `-lang fb`. Value read out of fbc 1.10.1. |
 | `__FB_OPTION_EXPLICIT__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_PRIVATE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
-| `__FB_OPTION_PROFILE__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_OPTION_PRIVATE__` | ✓ | `0` — module procedures are public by default. Value read out of fbc 1.10.1. |
+| `__FB_OPTION_PROFILE__` | ✓ | Left **undefined**, as fbc leaves it unless `-profile` is given. See `__FB_PROFILE__`. |
 
 ##### Basic-macros
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ARG_COUNT__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_EXTRACT__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_LEFTOF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_LISTEXPAND__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_ARG_RIGHTOF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_EVAL__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_IIF__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_JOIN__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_QUERY_SYMBOL__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_QUOTE__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNIQUEID__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNIQUEID_POP__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNIQUEID_PUSH__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
-| `__FB_UNQUOTE__` | ✗ | N/A — compiler metaprogramming macro; not modelled (would require a full preprocessor token engine). |
+| `__FB_ARG_COUNT__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_ARG_EXTRACT__` | ✓ | Picks the n-th argument of a list. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_ARG_LEFTOF__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_ARG_LISTEXPAND__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_ARG_RIGHTOF__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_EVAL__` | ✓ | Expands and re-scans its argument. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_IIF__` | ◐ | Works as an EXPRESSION (verified against fbc 1.10.1). ⚠️ In a `#if` CONDITION it does not: `#if __FB_IIF__(1,1,0)` takes the wrong branch here. Measured 28 Aug 2026. |
+| `__FB_JOIN__` | ✓ | Token paste. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_QUERY_SYMBOL__` | ✓ | Backs the `IsVariable` / `IsConst` / `IsType*` family. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_QUOTE__` | ✓ | Stringifies its argument. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_UNIQUEID__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_UNIQUEID_POP__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
+| `__FB_UNIQUEID_PUSH__` | ✓ | Verified against fbc 1.10.1 (28 Aug 2026). |
+| `__FB_UNQUOTE__` | ✗ | The preprocessor token engine EXISTS (its siblings in this group are verified against fbc); this one is not wired to it. Not N/A: measured 28 Aug 2026. |
 
 ##### Constants
 
@@ -2338,7 +2455,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `Local` | ✓ | `ON LOCAL ERROR GOTO label` installs a procedure-local error handler. |
 | `Resume` | ✓ |  |
 | `Resume Next` | ✓ |  |
-| `__FB_ERR__` | ✗ | N/A — FreeBASIC compiler-internal define; no meaning for a bytecode VM. |
+| `__FB_ERR__` | ✓ | `0` — the `-e`/`-ex`/`-exx` error-checking level, none by default, as in fbc. |
 
 #### Miscellaneous Keywords
 
@@ -2406,7 +2523,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
-| `SIZEOF` | ✓ | `SizeOf(scalar-type / UDT)` byte size; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`. |
+| `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The `#if TypeOf(a)=TypeOf(b)` form is **rejected with an error**, not silently evaluated: this preprocessor runs on text, before any declaration is seen, so it cannot answer the question — and answering it "false" (the undefined-identifier rule) would quietly take the wrong branch. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
@@ -2432,7 +2549,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ERASE` | ✓ | `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). |
+| `ERASE` | ✓ | `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). Also erases a UDT **array member**, written out (`Erase obj.arr`) or with the leading dot inside a `WITH` block (`Erase .arr`). |
 
 #### Retrieving Array Size
 
@@ -2690,7 +2807,7 @@ End Function
 | `OPEN LPT` | ✗ | Binds a file number to a printer device. **Not implemented**, same reason as `OPEN COM`. Deliberately never exercised by any net either: FreeBASIC's LPT support goes through the Windows print spooler, so running such an example queues a real job on a real printer. |
 | `OPEN PIPE` | ✗ | Binds a file number to the input and output streams of a process. **Not implemented**: the parser does not know `PIPE` at all, and the line is a syntax error. |
 | `OPEN SCRN` | ✓ | Binds a file number directly to the console. |
-| `CLOSE` | ✓ | Unbinds a file number from a file or device. |
+| `CLOSE` | ✓ | Unbinds a file number from a file or device. ⚠️ The **statement** only: `CLOSE #n` and the bare `CLOSE` (all channels). The FUNCTION form `Close(n)`, which answers an error code, is not implemented — see *Declared unsupported*. |
 | `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). |
 | `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
 | `OUTPUT` | ✓ | `OPEN "f" FOR OUTPUT AS #n` opens the file for writing (truncating). |
@@ -2701,18 +2818,18 @@ End Function
 | `READ (File Access)` | ✓ | Binary data can only be read from the file. |
 | `WRITE (File Access)` | ✓ | `WRITE #n, ...` writes quoted comma-separated (CSV) values to the file. |
 | `READ WRITE(File Access)` | ✓ | Binary data can be read from and written to the file. |
-| `ENCODING` | ~ | `OPEN ... ENCODING "ascii|utf8|..."` is parsed and accepted; v1 is an ASCII/UTF-8 byte passthrough (utf16/utf32 re-encoding of file I/O is not applied). |
+| `ENCODING` | ✓ | `OPEN ... ENCODING "ascii\|utf8\|utf16\|utf32"`, in the statement form and in the function form alike. The name need not be a literal — `ENCODING encod` and `ENCODING files(i).encoding` are evaluated at run time. `utf16`/`utf32` re-encode file I/O (little-endian, byte-order mark written on creation and skipped on read); `utf8` writes the BOM but needs no conversion, our strings being UTF-8 bytes already; `ascii` is the passthrough. ⚠️ Declared divergence: a file opened FOR INPUT with an explicit encoding is not validated against its byte-order mark, where fbc answers error 3. |
 
 #### Reading from and Writing to Files or Devices
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INPUT #` | ✓ | Reads a list of values from a file or device. |
+| `INPUT #` | ✓ | Reads a list of values from a file or device. A numeric field is read with the SAME grammar `VAL` uses — the `&H`/`&O`/`&B` base prefixes, a saturating magnitude, the full 64 bits — and a `BOOLEAN` destination takes the words `true`/`false` in either case, anything else through that grammar with non-zero meaning true. (Until 26 Aug 2026 it had its own conversion, 32-bit and prefix-blind: `Val("&h1F")` was 31 and `INPUT #` of the same text was 0. Guard `m584`.) |
 | `WRITE #` | ✓ | Writes a list of values to a file as quoted CSV (strings in `"`, comma-separated). |
 | `INPUT()` | ✓ | `INPUT(n, [#]filenum)` — reads n characters (BYTES; `WINPUT()` counts Unicode codepoints instead) from a file. A short read at end of file returns fewer characters, as in FreeBASIC. |
 | `WINPUT()` | ✓ | `WINPUT(n, [#]filenum)` — reads n wide characters (Unicode codepoints) from a file. A WSTRING is UTF-8 here, so a character may span several bytes; a short read at end of file returns fewer characters, as in FreeBASIC. |
 | `LINE INPUT #` | ✓ | `LINE INPUT #n, s` reads a whole line of text (commas not split). |
-| `PRINT #` | ✓ |  |
+| `PRINT #` | ✓ | The file number may be written parenthesised, `PRINT #(1), x` — as it may on every statement that takes one (`OPEN … AS`, `CLOSE`, `INPUT #`, `LINE INPUT #`, `WRITE #`, `GET`/`PUT`, `SEEK`). |
 | `? # (Shortcut for 'PRINT #')` | ✓ | `? #n, ...` is the shortcut for `PRINT #n, ...` (the lexer maps `?` to PRINT). |
 | `PUT #` | ✓ | Writes arbitrary data to a file or device. |
 | `GET #` | ✓ | Reads arbitrary data from a file or device. |
@@ -2846,7 +2963,7 @@ End Function
 | `WSTRING (Function)` | ✓ | `WSTRING(n, cp)` — n copies of the wide char for Unicode codepoint cp. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
 | `WSPACE` | ✓ | `WSPACE(n)` — a wide string of n spaces. |
-| `LEN` | ✓ | Returns the length of a string in characters. For a user-defined type it returns the size of the type in bytes, as FreeBASIC does when the type declares no `OPERATOR LEN` (which is not supported); in particular it does **not** route through `OPERATOR CAST() AS STRING`. |
+| `LEN` | ✓ | Returns the length of a string in characters. Takes a TYPE NAME too, including a pointer type (`Len(Integer Ptr)`, `Len(Any Ptr)`), and an expression of known declared width (`Len(CULng(0))` = 4). For a user-defined type it returns the size of the type in bytes, as FreeBASIC does when the type declares no `OPERATOR LEN` (which is not supported); in particular it does **not** route through `OPERATOR CAST() AS STRING`. |
 
 #### Character Conversion
 
@@ -2912,8 +3029,8 @@ End Function
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
 | `INSTRREV` | ✓ | Position of the last occurrence. `INSTRREV(str, sub [, start])` and `INSTRREV(str, Any set [, start])`. |
 | `MID (Statement)` | ✓ | Copies a substring to a substring of a string. |
-| `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
-| `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). |
+| `LSET` | ✓ | Left-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). Over a **fixed-length** destination the buffer is its DECLARED capacity, so the result is padded to it. |
+| `RSET` | ✓ | Right-justifies a string into a buffer (string lvalues; QBasic `=` and FreeBASIC `,` forms). Same declared-capacity rule as `LSET`. |
 
 ### Threading Support Functions
 
@@ -3052,7 +3169,7 @@ End Function
 | Keyword | Status | Description |
 |---|---|---|
 | `SCREENLIST` | ✓ | Enumerate fullscreen resolutions — returns 0 (no hardware modes on a portable/headless VM). |
-| `SCREEN (Graphics) and SCREENRES` | ✓ | `SCREENRES w,h[,depth[,num_pages]]` sets the graphics screen surface; `SCREEN n` selects a numbered QB/FB mode (1/7→320×200, 13→320×200, 18→640×480, 19→800×600, 20→1024×768, 21→1280×1024, …) mapped to a resolution. Both allocate pages and route through IGraphicsBackend (headless-testable via SCREENINFO). depth accepted-and-ignored. |
+| `SCREEN (Graphics) and SCREENRES` | ✓ | `SCREENRES w,h[,depth[,num_pages]]` sets the graphics screen surface; `SCREEN n` selects a numbered QB/FB mode (1/7→320×200, 13→320×200, 18→640×480, 19→800×600, 20→1024×768, 21→1280×1024, …) mapped to a resolution. Both allocate pages and route through IGraphicsBackend (headless-testable via SCREENINFO). depth accepted-and-ignored. `SCREENRES` also has the FUNCTION form fbc accepts, `r = ScreenRes(w, h, ...)`, which answers 0. |
 | `SCREENINFO` | ✓ | `SCREENINFO w, h [, depth, bpp, pitch, rate]` writes the current graphics surface's width/height (and depth=32, bpp=4, pitch=w*4) into the variables (via IGraphicsBackend; headless-testable). Desktop-info form deferred. |
 | `SCREENCONTROL` | ✓ | Get/set internal graphics settings — a no-op here (arguments parsed and discarded). |
 | `SCREENEVENT` | ✗ | Gets system events. |
@@ -3132,6 +3249,9 @@ Each of these is *refused with a message that names the reason*, never answered 
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
+- **`Close(n)` as a FUNCTION.** fbc lets `CLOSE` be called as an expression that answers an error
+  code (`0` when the channel was open, `1` = illegal function call otherwise). Only the STATEMENT
+  forms are implemented here — `Close #n` and the bare `Close`, which closes every channel.
 - **`ProcPtr(p, Virtual ...)`** (fbc 1.10+) asks for a member's **vtable index**, not its address.
   There is no vtable a program can index here: a virtual call goes through a generated dispatcher
   keyed on the instance's runtime type-id. Call the method directly — the dispatch is the same one.
@@ -3166,8 +3286,30 @@ Each of these is *refused with a message that names the reason*, never answered 
   the header is harmless — most programs that do never call into it — but a *call* fails, now with a
   message that says so rather than "Array not declared". Use the BASIC equivalents
   (`Open`/`Print #`/`Close`, `Print Using`).
-- **Inline assembly**: `Asm … End Asm`, `Naked` procedures, `#pragma reserve`, and `__FB_ASM__`
-  branches that select one. Machine code in the source is not something a bytecode VM can host.
+- **Inline assembly**: `Asm … End Asm`, `Naked` procedures, and `__FB_ASM__` branches that select one.
+  Machine code in the source is not something a bytecode VM can host — one of its engines is an
+  interpreter, and the interpreter is the *reference* the AOT and JIT validators demand MISMATCH 0
+  against, so a feature alive on two engines of four could not be verified at all. The targets are not
+  only x86 either (the WebAssembly backend, and the MCU work).
+  ⭐ **An `Asm … End Asm` block that holds NO INSTRUCTION is accepted** (29 August 2026): there is
+  nothing to translate. fbc's own `pp/pragma-reserve-7` writes one whose entire content is
+  preprocessor directives — consumed before the parser sees the block — and the test is about the
+  reserved-symbol lists, not about assembly. The moment there is one token between `Asm` and
+  `End Asm`, the refusal stands.
+  ⚠️ Until 26 August 2026 an `Asm … End Asm` block was worse than unsupported: `Asm` is not a reserved
+  word, so the block parsed as a bare call to an undefined name and its closing `End Asm` was read as
+  plain `End` — which **stops the program**. A `Print` before the block ran, a `Print` after it did
+  not, and the exit code was `0`. It is now refused by name, which is what this whole section promises.
+  ⛔ Accepting-and-ignoring is therefore *not* the fallback it looks like: it is that same bug in
+  another dress, which is why the empty-block rule above is drawn at "no instruction", not at "no
+  instruction we recognise".
+- **`#pragma reserve`** is **supported** as of 29 August 2026, in the half that is observable without a
+  symbol table: `defined(NAME)` answers TRUE for an unqualified reservation, a qualified one
+  (`#pragma reserve (asm) NAME`) reserves the name in another namespace and leaves `defined()` FALSE,
+  and reserving the same name twice at the same block level is refused. ⚠️ Still **not** enforced: fbc
+  also REFUSES a module-level declaration of an unqualified reserved name (`error 4` / `error 325`),
+  and `#pragma reserve (…)` outside module level. Both need the parser and are listed in
+  `job/markdown/DIVERGENZE.md`.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance

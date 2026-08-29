@@ -243,7 +243,7 @@ procedure PrintASTTree(Node: TASTNode; Indent: Integer = 0; TokenList: TTokenLis
 var
  i: Integer;
  Prefix: string;
- NodeInfo: string;
+ NodeInfo, AttrStr: string;
 begin
  if not Assigned(Node) then Exit;
 
@@ -257,6 +257,22 @@ begin
    ])
  else
    NodeInfo := GetEnumName(TypeInfo(TASTNodeType), Ord(Node.NodeType));
+
+ // ⭐ ...AND THE ATTRIBUTES, which is where half of what the parser decided actually lives. SHARED,
+ // STATIC, FIXEDLEN, BYREF, ELLIPSIS, CONSTDECL, ACCESS... none of it was shown, so reading a dump
+ // told you the SHAPE of a declaration and nothing about what the parser had CONCLUDED - and the
+ // answer had to be hunted for with a grep through 13.000 lines every single time. The vocabulary
+ // itself is indexed in job/markdown/GANCI.md; this prints what THIS program carries.
+ if Assigned(Node.Attributes) and (Node.Attributes.Count > 0) then
+ begin
+   AttrStr := '';
+   for i := 0 to Node.Attributes.Count - 1 do
+   begin
+     if AttrStr <> '' then AttrStr := AttrStr + ' ';
+     AttrStr := AttrStr + Node.Attributes[i];
+   end;
+   NodeInfo := NodeInfo + '   [' + AttrStr + ']';
+ end;
 
  WriteLn(Format('%s%s', [Prefix, NodeInfo]));
 

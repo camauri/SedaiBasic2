@@ -61,6 +61,10 @@ type
     Preorder: Integer;                  // Preorder DFS number (for dominance queries)
     Postorder: Integer;                 // Postorder DFS number (for dominance queries)
     Visited: Boolean;                   // Debug flag for traversal validation
+    IsRoot: Boolean;                    // A REGION ROOT: the entry, or the head of a region the entry
+                                        // DFS never reached (a procedure reached only through a
+                                        // procptr, a TRAP handler). Its idom is ITSELF and must stay
+                                        // that way - see ComputeIdoms.
   end;
 
   { TCFGValidationError - Error types for CFG validation }
@@ -269,6 +273,7 @@ begin
     Result.Preorder := -1;
     Result.Postorder := -1;
     Result.Visited := False;
+    Result.IsRoot := False;
     FNodes.Add(Block, Result);
   end;
 end;
@@ -426,6 +431,7 @@ begin
   // Initialize: Entry dominates itself (sentinel for algorithm)
   Node := GetNode(FEntry);
   Node.Idom := FEntry;
+  Node.IsRoot := True;
   SetNode(FEntry, Node);
 
   Iterations := 0;
@@ -445,6 +451,10 @@ begin
     begin
       Block := FPreorderList[i];
       Node := GetNode(Block);
+
+      // A REGION ROOT keeps the idom Build gave it (itself), exactly as the entry does by not being in
+      // this loop at all. See the note where the flag is set.
+      if Node.IsRoot then Continue;
 
       if not Assigned(Block.Predecessors) or (Block.Predecessors.Count = 0) then
       begin
@@ -654,6 +664,15 @@ begin
       InitialDFS(Block, PreNum);     // numbers Block AND everything reachable from it
       Node := GetNode(Block);
       Node.Idom := Block;            // only the region's root is its own idom
+      // ⛔ ...AND SAYING SO ONCE IS NOT ENOUGH. ComputeIdoms recomputes the idom of every block that
+      // HAS predecessors, and a region root normally has them - it is the head of a loop, or a
+      // procedure entry whose body branches back to it. So the self-root written here was overwritten
+      // on the first iteration by a predecessor INSIDE the region, and idom(root) and idom(latch) then
+      // pointed at each other: Intersect climbed that two-cycle for ever ("Infinite loop in b1 chain").
+      // The entry block is skipped by starting that loop at 1; a region root needs the same protection,
+      // and this flag is what says which blocks those are. Reproduced on 28 lines fbc compiles:
+      // a SUB reached ONLY through ProcPtr, containing "Exit Do, Do" out of a For over a UDT counter.
+      Node.IsRoot := True;
       SetNode(Block, Node);
     end;
   end;

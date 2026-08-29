@@ -61,6 +61,14 @@ procedure PPMapLine(Physical: Integer; out Reported: Integer; var Module: string
 
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
 function DetectQBLang(const Src: string): Boolean;
+// ⭐ Did the source ask for a dialect that is NOT -lang fb? fbc honours '#lang "qb"' / '#lang "fblite"'
+// / '#lang "deprecated"' (and the '$lang: spelling) from INSIDE the file, and several rules - default
+// types, type suffixes, the DEFxxx letter rule - are legal there and refused in -lang fb. A check that
+// enforces the -lang fb rule has to know which language the file asked for, or it refuses a program
+// fbc compiles. Set by PreprocessSource, which is the ONE funnel every front end passes a source
+// through before lexing; read through SourceDeclaresNonFbDialect.
+function DetectNonFbLang(const Src: string): Boolean;
+function SourceDeclaresNonFbDialect: Boolean;
 
 implementation
 
@@ -98,6 +106,41 @@ begin
   end;
 end;
 
+var
+  GDeclaredNonFbDialect: Boolean = False;   // last source handed to PreprocessSource asked for qb/fblite/deprecated
+
+function DetectNonFbLang(const Src: string): Boolean;
+// The same line-anchored scan DetectQBLang does, and anchored for the same reason: a header comment
+// that MENTIONS the directive is not the directive. Three languages, because fbc's own message names
+// three - "only valid in -lang deprecated or fblite or qb".
+var
+  L: TStringList;
+  i: Integer;
+  T: string;
+begin
+  Result := False;
+  L := TStringList.Create;
+  try
+    L.Text := Src;
+    for i := 0 to L.Count - 1 do
+    begin
+      T := UpperCase(TrimLeft(L[i]));
+      if (Length(T) > 0) and (T[1] = '''') then T := TrimLeft(Copy(T, 2, MaxInt));   // '$lang metacommand
+      T := StringReplace(T, ' ', '', [rfReplaceAll]);
+      if (Copy(T, 1, 5) = '#LANG') or (Copy(T, 1, 6) = '$LANG:') then
+        if (Pos('"QB"', T) > 0) or (Pos('"FBLITE"', T) > 0) or (Pos('"DEPRECATED"', T) > 0) then
+          Exit(True);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+function SourceDeclaresNonFbDialect: Boolean;
+begin
+  Result := GDeclaredNonFbDialect;
+end;
+
 function IsIdentChar(C: Char): Boolean; inline;
 begin
   Result := (C in ['A'..'Z', 'a'..'z', '0'..'9', '_']);
@@ -118,6 +161,19 @@ begin
   begin
     if S[i] = '"' then
       InStr := not InStr
+    // ⛔ ...AND A BLOCK COMMENT IS NOT A LINE COMMENT. "/' c '/" opens with a '/' followed by the very
+    // character this scanner treats as "the rest of the line is a comment", so a directive carrying one
+    // was truncated at the '/' - and since this is what decides whether a directive CONTINUES on the
+    // next line, "# macro create_macro /' c '/ _" stopped continuing and the parameter list that
+    // followed was left standing as code. The same line without the comment worked, which is the
+    // difference that named it.
+    else if (not InStr) and (S[i] = '/') and (i < Length(S)) and (S[i + 1] = '''') then
+    begin
+      Inc(i, 2);                                   // past the opening "/'"
+      while (i < Length(S)) and not ((S[i] = '''') and (S[i + 1] = '/')) do Inc(i);
+      Inc(i, 2);                                   // past the closing "'/"
+      Continue;
+    end
     else if (S[i] = '''') and not InStr then
       Break;
     Inc(i);
@@ -356,6 +412,37 @@ begin
       end;
       Result := Result + '#'; Inc(i); Continue;   // a lone '#' that is not a stringize
     end;
+    // ⛔⛔ A NUMERIC LITERAL IS ONE TOKEN, AND ITS EXPONENT IS NOT AN IDENTIFIER. The scan below starts
+    // an identifier at any letter, and after "1.1920929" the next character is an 'e' - so a macro
+    // whose parameter is named "e" had every float literal in its own body corrupted:
+    //     #macro m( a, e, u ) : Print 1.1920929e-7 : #endmacro
+    //     m( 1, 2, 3 )        ->  Print 1.19209292-7   ->  -5.80790708
+    // Not a parse error - a WRONG NUMBER, printed. It is fbcunit's own CU_ASSERT_SINGLE_APPROX and
+    // CU_ASSERT_DOUBLE_APPROX, whose parameters are (a, e, u) and whose bodies carry 1.1920929e-7 and
+    // 2.220446049250313e-16, so every test that used them read a nonsense tolerance - and fbc's
+    // udt-zstring/conversion and udt-wstring/conversion could not parse at all.
+    // ⚠️ Only a WELL-FORMED exponent is swallowed (e/E/d/D, an optional sign, then digits): "1e" with
+    // no digits after it is not one, and stays whatever it was. The type suffix ('!', '#') is left to
+    // the character path exactly as before.
+    if (Body[i] in ['0'..'9']) or
+       ((Body[i] = '.') and (i < Length(Body)) and (Body[i + 1] in ['0'..'9'])) then
+    begin
+      j := i;
+      while (j <= Length(Body)) and (Body[j] in ['0'..'9', '.']) do Inc(j);
+      if (j <= Length(Body)) and (Body[j] in ['e', 'E', 'd', 'D']) then
+      begin
+        k := j + 1;
+        if (k <= Length(Body)) and (Body[k] in ['+', '-']) then Inc(k);
+        if (k <= Length(Body)) and (Body[k] in ['0'..'9']) then
+        begin
+          while (k <= Length(Body)) and (Body[k] in ['0'..'9']) do Inc(k);
+          j := k;
+        end;
+      end;
+      Result := Result + Copy(Body, i, j - i);
+      i := j;
+      Continue;
+    end;
     if Body[i] in ['A'..'Z', 'a'..'z', '_'] then
     begin
       j := i;
@@ -548,6 +635,37 @@ begin
   T := TrimRight(StripDirectiveComment(S));
   Result := (T <> '') and (T[Length(T)] = '_') and
             ((Length(T) = 1) or not IsIdentChar(T[Length(T) - 1]));
+end;
+
+function LineContinuationCut(const S: string): Integer;
+// The position of FreeBASIC's '_' LINE CONTINUATION in an ordinary source line, or 0 when the line
+// does not continue.
+// ⛔ THE ANSWER HAS TO BE A POSITION, NOT A YES/NO: fbc drops everything that follows the '_', so
+// "check( 1, _ )" continues on the next line and that ')' is not part of the program at all. A
+// predicate that looked at the LAST character - which is what PPDirectiveContinues does, correctly,
+// for a directive - answers False for exactly that shape, and fbc's own wstring tests are written
+// with it.
+// A '_' inside a string literal, or after a "'" comment, is text. An identifier may hold '_' at
+// either end ("MAX_", "__FB_ARG__"), so the token has to stand alone on both sides.
+var
+  i: Integer;
+  InStr: Boolean;
+begin
+  Result := 0;
+  InStr := False;
+  for i := 1 to Length(S) do
+  begin
+    if S[i] = '"' then InStr := not InStr
+    else if InStr then Continue
+    else if S[i] = '''' then Break                     // a line comment: the rest is not code
+    else if (S[i] = '_') and
+            ((i = 1) or not IsIdentChar(S[i - 1])) and
+            ((i = Length(S)) or not IsIdentChar(S[i + 1])) then
+    begin
+      Result := i;
+      Break;
+    end;
+  end;
 end;
 
 function PPConstStrFold(const S: string; Defs: TStringList; out Res: string): Boolean;
@@ -852,6 +970,7 @@ var
   i, j, k, idx, ParenDepth: Integer;
   Word, ArgsStr, BuiltinVal: string;
   InStr: Boolean;
+  InArgStr: Boolean;   // inside a "..." while scanning a macro invocation's arguments
   InCmt: Boolean;   // inside a ' comment: copy verbatim to the end of the line
 begin
   Result := '';
@@ -894,6 +1013,31 @@ begin
     begin
       InStr := True; Result := Result + Line[i]; Inc(i); Continue;
     end;
+    // ⛔ A NUMERIC LITERAL IS ONE TOKEN HERE TOO, and this is the OBJECT-like half of the very same
+    // hole ExpandFnBody had: "the leading digit means a number" was noted, and then the scan resumed
+    // at the next LETTER - which for "1.5e-7" is the 'e'. So "#define e 5" turned it into "1.55-7"
+    // and the program printed -5.45. fbc prints 1.5e-07. One rule, two paths, and only one of them
+    // had it. See the long note in ExpandFnBody for the shape and for what is deliberately NOT
+    // swallowed (a bare "1e", the type suffix, &H/&O/&B).
+    if (Line[i] in ['0'..'9']) or
+       ((Line[i] = '.') and (i < Length(Line)) and (Line[i + 1] in ['0'..'9'])) then
+    begin
+      j := i;
+      while (j <= Length(Line)) and (Line[j] in ['0'..'9', '.']) do Inc(j);
+      if (j <= Length(Line)) and (Line[j] in ['e', 'E', 'd', 'D']) then
+      begin
+        k := j + 1;
+        if (k <= Length(Line)) and (Line[k] in ['+', '-']) then Inc(k);
+        if (k <= Length(Line)) and (Line[k] in ['0'..'9']) then
+        begin
+          while (k <= Length(Line)) and (Line[k] in ['0'..'9']) do Inc(k);
+          j := k;
+        end;
+      end;
+      Result := Result + Copy(Line, i, j - i);
+      i := j;
+      Continue;
+    end;
     // Identifier start (letter or underscore; a leading digit means a number, not a macro).
     if (Line[i] in ['A'..'Z', 'a'..'z', '_']) then
     begin
@@ -918,13 +1062,28 @@ begin
       end;
       // A BUILT-IN function-like macro is tried first: it is the preprocessor's own, and a program may
       // not shadow it with a #define.
-      if (j <= Length(Line)) and (Line[j] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
+      // ⛔ ...and a SPACE between the name and its parenthesis is ordinary FreeBASIC here too. The
+      // USER-macro path three dozen lines below skips the blanks, and the #if evaluator has an
+      // NextNonBlankIsOpenParen of its own; only this one demanded the '(' be glued to the name, so
+      // "__FB_QUOTE__ ( abc )" reached the parser as an undefined array called __FB_QUOTE__.
+      k := j;
+      while (k <= Length(Line)) and (Line[k] in [' ', #9]) do Inc(k);
+      if (k <= Length(Line)) and (Line[k] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
       begin
-        ParenDepth := 0; ArgsStr := '';
+        j := k;
+        // ⛔ AND A PARENTHESIS INSIDE A STRING LITERAL IS NOT A PARENTHESIS. This counted '(' and ')'
+        // with no in-string flag, so an argument like "2,(3" closed the list early and the macro was
+        // expanded with the arguments cut short - 'Unexpected token ")"'. SplitMacroArgs and
+        // GatherBalancedParens, downstream, DO carry the flag and are correct; they simply never
+        // receive the whole argument text. One more rule that lives in one path and not in the one
+        // ahead of it.
+        ParenDepth := 0; ArgsStr := ''; InArgStr := False;
         k := j + 1;
         while k <= Length(Line) do
         begin
-          if (Line[k] = '(') then Inc(ParenDepth)
+          if (Line[k] = '"') then InArgStr := not InArgStr
+          else if InArgStr then                     // text, not structure
+          else if (Line[k] = '(') then Inc(ParenDepth)
           else if (Line[k] = ')') then
           begin
             if ParenDepth = 0 then Break;
@@ -958,8 +1117,19 @@ begin
         ArgsStr := '';
         // A macro body is joined with cVirtualEOL, so "the end of the line" is that marker, not the end
         // of the buffer: a paren-less invocation INSIDE a macro body must not swallow the lines after it.
-        while (j <= Length(Line)) and (Line[j] <> cVirtualEOL) and (Line[j] <> ':') do
-        begin ArgsStr := ArgsStr + Line[j]; Inc(j); end;
+        // ⛔ AND A COLON INSIDE A STRING LITERAL IS NOT A STATEMENT SEPARATOR - the same
+        // rule the PARENTHESISED path three branches below already carries for its brackets, and the
+        // same shape: one path has it and the other does not. Without it a paren-less invocation whose
+        // argument is a string holding a colon cut that argument in half, and the orphaned tail was read
+        // as code: fbc's own structs/udt-ops-* die on "Undefined procedure: HERE", five files over, and
+        // udt-comp-ops-* with them. Five lines reproduce it (guard m691).
+        InArgStr := False;
+        while j <= Length(Line) do
+        begin
+          if Line[j] = '"' then InArgStr := not InArgStr
+          else if (not InArgStr) and ((Line[j] = cVirtualEOL) or (Line[j] = ':')) then Break;
+          ArgsStr := ArgsStr + Line[j]; Inc(j);
+        end;
         Result := Result + SubstituteMacros(ExpandFnBody(Copy(FnDefs.ValueFromIndex[idx], 2, MaxInt),
                                                          ArgsStr, Defs, FnDefs, Depth), Defs, FnDefs, Depth + 1);
         i := j;
@@ -968,11 +1138,19 @@ begin
       if (idx >= 0) and (k <= Length(Line)) and (Line[k] = '(') then
       begin
         j := k;
-        ParenDepth := 0; ArgsStr := '';
+        // ⛔ AND A PARENTHESIS INSIDE A STRING LITERAL IS NOT A PARENTHESIS. This counted '(' and ')'
+        // with no in-string flag, so an argument like "2,(3" closed the list early and the macro was
+        // expanded with the arguments cut short - 'Unexpected token ")"'. SplitMacroArgs and
+        // GatherBalancedParens, downstream, DO carry the flag and are correct; they simply never
+        // receive the whole argument text. One more rule that lives in one path and not in the one
+        // ahead of it.
+        ParenDepth := 0; ArgsStr := ''; InArgStr := False;
         Inc(j);   // skip '('
         while j <= Length(Line) do
         begin
-          if (Line[j] = '(') then Inc(ParenDepth)
+          if (Line[j] = '"') then InArgStr := not InArgStr
+          else if InArgStr then                     // text, not structure
+          else if (Line[j] = '(') then Inc(ParenDepth)
           else if (Line[j] = ')') then
           begin
             if ParenDepth = 0 then Break;
@@ -1107,10 +1285,70 @@ begin
   Rest := Trim(Copy(s, p, MaxInt));
 end;
 
+function PPMacroHeaderComplete(const S: string): Boolean;
+// True when S is a "#macro" directive whose parameter list is already finished: either it has a
+// balanced "( ... )", or it has no '(' at all (a parameterless macro). Only then does a trailing '_'
+// stop meaning "the header goes on" - see the note at the join.
+var
+  i, Depth: Integer;
+  DName, DRest: string;
+  SawOpen: Boolean;
+begin
+  Result := False;
+  SplitDirective(TrimRight(S), DName, DRest);
+  if DName <> 'macro' then Exit;
+  Depth := 0; SawOpen := False;
+  for i := 1 to Length(DRest) do
+    if DRest[i] = '(' then begin Inc(Depth); SawOpen := True; end
+    else if DRest[i] = ')' then Dec(Depth);
+  Result := (not SawOpen) or (SawOpen and (Depth <= 0));
+end;
+
 var
   // The full source text of the module being preprocessed, for SourceDeclaresSymbol below.
   // Set by PreprocessSource before Expand; the preprocessor is single-threaded by design.
   GPPSourceForDefined: string = '';
+  // The line of GPPSourceForDefined the current question is being asked FROM: defined() is answered
+  // from the symbol table as built so far, not from the whole file. -1 = no limit (every caller that
+  // has no position). Only the MODULE's own Expand pass moves it; an #include or a macro re-expansion
+  // inherits the outer position, because that is where the question really stands.
+  GPPDefinedLimit: Integer = -1;
+  // ⭐ ...and the better answer to the same question: the module AS EXPANDED SO FAR. A macro that
+  // DECLARES ("#macro f(id) : id as integer : check_Y( TRIVIAL.id ) : #endmacro" is fbc's own) puts
+  // nothing on the source line the scan can see, so a scan of the SOURCE cannot know the field
+  // exists. The output being built is the expansion, in order, up to exactly here - which is what
+  // fbc's symbol table is - so when it is available it is what gets scanned, and the source with a
+  // line limit is the fallback for a caller that has none.
+  GPPOutput: TStringList = nil;
+  // ⛔ "#pragma reserve NAME" makes NAME a SYMBOL and NOT A MACRO. Putting it in Defs was tried and is
+  // wrong: the name is then SUBSTITUTED in ordinary code, and fbc's own pp/pragma-reserve-4 goes on to
+  // write "dim symbol as integer" - which became "dim 0 as integer". Reserving is only observable
+  // through defined(), so it lives in its own set, which nothing substitutes from.
+  GPPReserved: TStringList = nil;
+  // ⭐ ...AND A WORD THE LANGUAGE RESERVES IS DEFINED TOO. fbc answers "#if defined( constructor )"
+  // TRUE, and its own pp/defined-udt asserts it for constructor / destructor / let / cast - the same
+  // names it asserts FALSE for as members of a type. Those two sets are asked the same way and stored
+  // apart: a language keyword must not land in GPPReserved, whose entries are "#pragma reserve"
+  // reservations carrying a SCOPE DEPTH, where a second reservation of the same name at the same level
+  // is an error (m674). This one is the fixed inventory in FbReservedWords.inc, and it is the ORACLE's
+  // answer, asked in one compile over an 11 000-word candidate universe - not a list reasoned out.
+  GPPKeywords: TStringList = nil;
+
+procedure SeedFbKeywords;
+// Fill GPPKeywords once with the inventory in FbReservedWords.inc. Sorted, so the lookups above are a
+// binary search and not a walk of 366 strings per "#ifdef".
+{$I FbReservedWords.inc}
+var
+  i: Integer;
+begin
+  if GPPKeywords <> nil then Exit;
+  GPPKeywords := TStringList.Create;
+  GPPKeywords.CaseSensitive := False;
+  GPPKeywords.Duplicates := dupIgnore;
+  for i := Low(FB_RESERVED_WORDS) to High(FB_RESERVED_WORDS) do
+    GPPKeywords.Add(FB_RESERVED_WORDS[i]);
+  GPPKeywords.Sorted := True;
+end;
 
 function DeclaredNameOfLine(const U: string; out Kind, TypeName: string): string;
 // Read ONE upper-cased source line as a declaration and return the NAME it declares ('' if it declares
@@ -1284,6 +1522,187 @@ begin
   end;
 end;
 
+function SourceConstValue(const Nm: string; out V: Int64): Boolean;
+// The VALUE of a module-level "Const <Nm> = <integer literal>" written in the source, for a #if / #assert
+// that names it. fbc's preprocessor can read a Const because its symbol table is being built as it goes;
+// this one runs on TEXT, so it asks the same declaration-shaped scan Defined() already stands on.
+//
+// ⛔ WHY IT IS NEEDED AT ALL: an identifier the evaluator does not know becomes 0, so "#assert N = 5"
+// on a Const N answered "0 = 5" and refused the program. fbc's pp/macro-no-params is exactly that, and
+// it is a COMPILE_ONLY_OK test. ⚠️ The 0 default is kept for everything else - "#if undeclaredid1 =
+// undeclaredid2" depends on it - so only a name a Const really declares changes answer.
+//
+// ⛔ ...AND AN ENUM MEMBER IS A CONSTANT TOO, by exactly the same argument, and it was the half that
+// was missing. "Enum E : A : B : C : End Enum" gives B the value 1, and fbc's "#if (B = 1)" says so;
+// here every member answered the 0 default, so ALL of them compared equal to each other. fbc's own
+// structs/udt-ops-* select which type to declare with "#if (TX_id = TX_as_integer)" over a five-member
+// enum: with every member 0, every branch was taken and the file declared its type five times over
+// ("Array not declared: S1" - five files behind one signature). SourceDeclaresSymbol already walks
+// enum bodies for the same reason; only the VALUE half was not asked.
+// ⚠️ The counting is the FreeBASIC one and no further: members number from 0 and an explicit
+// "= <integer literal>" restarts the count. A member whose initialiser this stage cannot fold stops
+// the walk of THAT enum - the numbers after it are no longer known, and guessing them would replace
+// the honest 0 with a confident wrong answer.
+var
+  L: TStringList;
+  i, p, q: Integer;
+  U, W, Rest, MemU: string;
+  EnumNext: Int64;
+  InEnum, EnumLost: Boolean;
+begin
+  Result := False;
+  V := 0;
+  if Nm = '' then Exit;
+  L := TStringList.Create;
+  try
+    L.Text := GPPSourceForDefined;
+    InEnum := False; EnumLost := False; EnumNext := 0;
+    for i := 0 to L.Count - 1 do
+    begin
+      U := UpperCase(Trim(L[i]));
+      p := 1;
+      while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
+      W := Copy(U, 1, p - 1);
+      // --- ENUM bodies: one member per line, numbered from 0, restarted by an explicit "= n" ---
+      if InEnum then
+      begin
+        if (W = 'END') and (Copy(Trim(Copy(U, p, MaxInt)), 1, 4) = 'ENUM') then
+        begin
+          InEnum := False;
+          Continue;
+        end;
+        if (W = '') or (Copy(U, 1, 1) = '''') or (Copy(U, 1, 1) = '#') then Continue;
+        MemU := W;
+        Rest := Trim(Copy(U, p, MaxInt));
+        if (Rest <> '') and (Rest[1] = ',') then Rest := Trim(Copy(Rest, 2, MaxInt));
+        if (Rest <> '') and (Rest[1] = '=') then
+        begin
+          Rest := Trim(Copy(Rest, 2, MaxInt));
+          q := Pos(',', Rest);
+          if q > 0 then Rest := Trim(Copy(Rest, 1, q - 1));
+          if not TryStrToInt64(Rest, EnumNext) then EnumLost := True;
+        end;
+        if EnumLost then Continue;             // the numbering is no longer known: answer nothing
+        if MemU = Nm then begin V := EnumNext; Exit(True); end;
+        Inc(EnumNext);
+        Continue;
+      end;
+      if (W = 'ENUM') and (Pos(' AS ', ' ' + Trim(Copy(U, p, MaxInt)) + ' ') = 0) then
+      begin
+        InEnum := True; EnumLost := False; EnumNext := 0;
+        Continue;
+      end;
+      if W <> 'CONST' then Continue;
+      Rest := Trim(Copy(U, p, MaxInt));
+      // "Const AS <type> name = v" names the type first; step over it.
+      if Copy(Rest, 1, 3) = 'AS ' then
+      begin
+        Rest := Trim(Copy(Rest, 4, MaxInt));
+        q := 1;
+        while (q <= Length(Rest)) and IsIdentChar(Rest[q]) do Inc(q);
+        Rest := Trim(Copy(Rest, q, MaxInt));
+      end;
+      q := 1;
+      while (q <= Length(Rest)) and IsIdentChar(Rest[q]) do Inc(q);
+      if Trim(Copy(Rest, 1, q - 1)) <> Nm then Continue;
+      Rest := Trim(Copy(Rest, q, MaxInt));
+      if (Rest = '') or (Rest[1] <> '=') then Continue;
+      Rest := Trim(Copy(Rest, 2, MaxInt));
+      // Only a plain integer literal: anything else is an expression this stage cannot fold, and
+      // answering it wrongly would be worse than leaving the old 0.
+      if TryStrToInt64(Rest, V) then Exit(True);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+function SourceConstStr(const Nm: string; out S: string): Boolean;
+// The STRING value of a "Const name = ..." the source declares, for the #if evaluator.
+//
+// ⛔ WHY IT IS NOT PART OF SourceConstValue. That one answers an Int64 and takes only a plain integer
+// literal - anything else it deliberately declines. So a STRING const resolved to the undefined-name
+// default, 0, and "#if A = ""abc""" with "Const A = ""abc""" above it was FALSE: fbc answers TRUE, and
+// its own string/case asserts four of them. The literal-against-literal form worked all along, which is
+// what said the gap was in the NAME and not in the comparison.
+//
+// ⭐ Two folds are recognised beside a bare literal, because fbc's test writes them into the CONST
+// itself: LCase("...") and UCase("..."). Both are pure text on a literal, and refusing to fold them
+// would leave the const unknown - the very thing this exists to stop.
+//
+// The scan reads the RAW line, not the upper-cased one the integer scanner walks: a string VALUE keeps
+// its case, and folding an already-upper-cased literal would answer "ABC" for every one of them.
+var
+  L: TStringList;
+  i, p, q: Integer;
+  Raw, U, W, Rest, RestU, Lit: string;
+
+  function TakeQuoted(const T: string; out Val: string): Boolean;
+  var k: Integer;
+  begin
+    Result := False; Val := '';
+    if (T = '') or (T[1] <> '"') then Exit;
+    k := 2;
+    while k <= Length(T) do
+    begin
+      if T[k] = '"' then
+      begin
+        if (k < Length(T)) and (T[k + 1] = '"') then begin Val := Val + '"'; Inc(k, 2); Continue; end;
+        Exit(True);                                  // closing quote
+      end;
+      Val := Val + T[k]; Inc(k);
+    end;
+  end;
+
+begin
+  Result := False; S := '';
+  if Nm = '' then Exit;
+  L := TStringList.Create;
+  try
+    L.Text := GPPSourceForDefined;
+    for i := 0 to L.Count - 1 do
+    begin
+      Raw := Trim(L[i]);
+      U := UpperCase(Raw);
+      p := 1;
+      while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
+      W := Copy(U, 1, p - 1);
+      if W <> 'CONST' then Continue;
+      Raw := Trim(Copy(Raw, p, MaxInt));
+      RestU := UpperCase(Raw);
+      // "Const AS <type> name = v" names the type first; step over it.
+      if Copy(RestU, 1, 3) = 'AS ' then
+      begin
+        Raw := Trim(Copy(Raw, 4, MaxInt));
+        q := 1;
+        while (q <= Length(Raw)) and IsIdentChar(Raw[q]) do Inc(q);
+        Raw := Trim(Copy(Raw, q, MaxInt));
+      end;
+      q := 1;
+      while (q <= Length(Raw)) and IsIdentChar(Raw[q]) do Inc(q);
+      if UpperCase(Trim(Copy(Raw, 1, q - 1))) <> Nm then Continue;
+      Rest := Trim(Copy(Raw, q, MaxInt));
+      if (Rest = '') or (Rest[1] <> '=') then Continue;
+      Rest := Trim(Copy(Rest, 2, MaxInt));
+      if TakeQuoted(Rest, S) then Exit(True);
+      RestU := UpperCase(Rest);
+      if (Copy(RestU, 1, 6) = 'LCASE(') or (Copy(RestU, 1, 6) = 'UCASE(') then
+      begin
+        Lit := Trim(Copy(Rest, 7, MaxInt));
+        if TakeQuoted(Lit, S) then
+        begin
+          if Copy(RestU, 1, 6) = 'LCASE(' then S := LowerCase(S) else S := UpperCase(S);
+          Exit(True);
+        end;
+      end;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean; forward;
+
 function SourceDeclaresSymbol(const Nm: string): Boolean;
 // fbc's Defined() answers TRUE for COMPILER-level symbols too, not only #defines: a Const, a
 // Dim/Redim/Static variable, a Sub/Function name (fbc-verified: examples/manual/prepro/defined
@@ -1291,39 +1710,229 @@ function SourceDeclaresSymbol(const Nm: string): Boolean;
 // exists, so the question is answered by a declaration-shaped scan: a line whose first word is
 // a declaring keyword and that contains Nm as a whole word. A name inside a same-line comment
 // or string can false-positive - accepted for a #if convenience predicate.
+//
+// ⛔⛔ AND IT IS A QUESTION ABOUT A POSITION, not about the file. fbc answers from the symbol table
+// as built SO FAR, so "defined( T )" is FALSE above "Type T" and TRUE below it - and its own
+// pp/defined-udt asserts BOTH, for the same name, in the same file. Scanning every line made the
+// first one TRUE and the file refused itself with "#error". GPPDefinedLimit is the line the question
+// is being asked FROM; -1 (the default) means the whole file, which is what every caller that has no
+// position gets.
+//
+// ⛔ A MEMBER OF A TYPE IS NOT A MODULE SYMBOL - and it IS a symbol from inside the type's own body.
+// fbc answers FALSE for a field / static field / method / property asked at module level, and TRUE
+// for the same name asked between "Type T" and "End Type" once it has been declared. So a member hit
+// is kept only while the body that made it is still OPEN at the asking position; a body that closed
+// before it takes its members with it.
+//
+// A QUALIFIED name is a third question again: "T.datafield" is TRUE only when T is a type declared so
+// far AND datafield has been declared inside its body so far. The member half accepts an OPERATOR
+// name too ("T.+=", "T.new[]"), which is why it is matched as text rather than as an identifier.
+//
+// ⚠️ An ENUM body is NOT skipped: its members ARE module-level constants in FreeBASIC.
+// A "Type mine As LongInt" alias opens no block and must not start one.
 var
   L: TStringList;
-  i, p, q: Integer;
-  U, W: string;
+  i, p, q, TypeDepth, EnumDepth, LastLine: Integer;
+  U, W, Rest, Qual, Member, Want: string;
+  MemberHit, QualIsType, QualMemberHit, InQualBody: Boolean;
+
+  function WholeWordAt(const Hay, Needle: string; At: Integer): Boolean;
+  // A match that is not glued to an identifier character - and not to a '.' either, because a
+  // QUALIFIED name does not declare the bare one: "Sub T.proc()" is the out-of-line definition of a
+  // member, written at module level, and fbc still answers FALSE for "defined( proc )".
+  begin
+    Result := ((At = 1) or (not IsIdentChar(Hay[At - 1]) and (Hay[At - 1] <> '.'))) and
+              ((At + Length(Needle) > Length(Hay)) or
+               (not IsIdentChar(Hay[At + Length(Needle)]) and (Hay[At + Length(Needle)] <> '.')));
+  end;
+
+  function LineMentions(const Hay, Needle: string): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    k := Pos(Needle, Hay);
+    while k > 0 do
+    begin
+      if WholeWordAt(Hay, Needle, k) then Exit(True);
+      k := Pos(Needle, Hay, k + 1);
+    end;
+  end;
+
+  function TokenAt(const Hay: string; var At: Integer): string;
+  // The next word of a member declaration, stopping at whitespace or '(' - so an OPERATOR name comes
+  // out whole ("+=", "[]", "NEW[]", "DELETE[]"), which no identifier scan would have reached.
+  var b: Integer;
+  begin
+    while (At <= Length(Hay)) and (Hay[At] in [' ', #9]) do Inc(At);
+    b := At;
+    while (At <= Length(Hay)) and not (Hay[At] in [' ', #9, '(']) do Inc(At);
+    Result := Copy(Hay, b, At - b);
+  end;
+
+  function MemberNameOfLine(const Hay: string): string;
+  // The member ONE line inside a type body declares, or ''. It has to be located POSITIONALLY: a
+  // member hit taken from any line that MENTIONS the name made "check_N( datafield )" - the very
+  // question - declare its own subject, and every check inside the body answered TRUE before a single
+  // field had been written.
+  var
+    At: Integer;
+    W1, W2: string;
+  begin
+    Result := '';
+    At := 1;
+    W1 := TokenAt(Hay, At);
+    if W1 = 'DECLARE' then
+    begin
+      W2 := TokenAt(Hay, At);                       // SUB / FUNCTION / PROPERTY / CTOR / DTOR / OPERATOR
+      if (W2 = 'CONSTRUCTOR') or (W2 = 'DESTRUCTOR') then Exit(W2);
+      Exit(TokenAt(Hay, At));                       // the name, or the operator's own token
+    end;
+    if (W1 = 'CONSTRUCTOR') or (W1 = 'DESTRUCTOR') then Exit(W1);
+    if (W1 = 'STATIC') or (W1 = 'DIM') or (W1 = 'CONST') or (W1 = 'AS') then Exit(TokenAt(Hay, At));
+    // "datafield as byte": the name first, its type after. Without the AS this is not a declaration
+    // at all - it is a macro invocation, a comment or a nested block header.
+    if (W1 <> '') and (Pos(' AS ', ' ' + Hay + ' ') > 0) then Exit(W1);
+  end;
+
 begin
   Result := False;
   if Nm = '' then Exit;
+  // Split a qualified name once: "T.DATAFIELD" -> Qual="T", Member="DATAFIELD". An operator member
+  // ("T.+=") leaves Member holding the operator text, matched as a substring below.
+  p := Pos('.', Nm);
+  if p > 0 then
+  begin
+    Qual := Copy(Nm, 1, p - 1);
+    Member := Copy(Nm, p + 1, MaxInt);
+    if (Qual = '') or (Member = '') then Exit;
+  end
+  else
+  begin
+    Qual := '';
+    Member := '';
+  end;
   L := TStringList.Create;
   try
-    L.Text := GPPSourceForDefined;
-    for i := 0 to L.Count - 1 do
+    // The expansion so far when there is one, the source truncated at the asking line otherwise.
+    if (GPPOutput <> nil) and (GPPOutput.Count > 0) then
+    begin
+      L.Assign(GPPOutput);
+      LastLine := L.Count - 1;
+    end
+    else
+    begin
+      L.Text := GPPSourceForDefined;
+      LastLine := L.Count - 1;
+      if (GPPDefinedLimit >= 0) and (GPPDefinedLimit < LastLine) then LastLine := GPPDefinedLimit;
+    end;
+    TypeDepth := 0;
+    EnumDepth := 0;
+    MemberHit := False;
+    QualIsType := False;
+    QualMemberHit := False;
+    InQualBody := False;
+    if Qual = '' then Want := Nm else Want := Qual;
+    for i := 0 to LastLine do
     begin
       U := UpperCase(TrimLeft(L[i]));
       p := 1;
       while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
       W := Copy(U, 1, p - 1);
-      if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
-         (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
-         (W = 'ENUM') or (W = 'COMMON') then
+      if W = 'END' then
       begin
-        q := Pos(Nm, U);
+        Rest := Trim(Copy(U, p, MaxInt));
+        if (Copy(Rest, 1, 4) = 'TYPE') or (Copy(Rest, 1, 5) = 'UNION') or
+           (Copy(Rest, 1, 5) = 'CLASS') then
+          if TypeDepth > 0 then
+          begin
+            Dec(TypeDepth);
+            if TypeDepth = 0 then
+            begin
+              MemberHit := False;      // the body closed: its members are not module symbols
+              InQualBody := False;
+            end;
+          end;
+      end;
+      if TypeDepth > 0 then
+      begin
+        // Inside a type body: these are MEMBERS. They answer only from in here, and only for a body
+        // that is still open where the question is asked - which is what the reset above enforces.
+        Rest := MemberNameOfLine(U);
+        if (Qual = '') and (Rest = Nm) then MemberHit := True;
+        if InQualBody and (Rest = Member) then QualMemberHit := True;
+        Continue;
+      end;
+      // ⭐ ...BUT AN ENUM BODY DECLARES MODULE CONSTANTS, one per line, and the member's own name is
+      // the FIRST word - so the declaring-keyword rule below cannot see it and defined() answered
+      // FALSE for every enum member. fbc answers TRUE. Verified against the oracle.
+      if EnumDepth > 0 then
+      begin
+        if (W <> '') and (W <> 'END') and (W = Want) and (Qual = '') then Exit(True);
+        if W = 'END' then
+        begin
+          Rest := Trim(Copy(U, p, MaxInt));
+          if Copy(Rest, 1, 4) = 'ENUM' then Dec(EnumDepth);
+        end;
+        Continue;
+      end;
+      if (W = 'ENUM') and (Pos(' AS ', ' ' + Trim(Copy(U, p, MaxInt)) + ' ') = 0) then
+      begin
+        // the enum's own NAME is a symbol; its members are read on the following lines
+        q := Pos(Want, U);
         while q > 0 do
         begin
           if ((q = 1) or not IsIdentChar(U[q - 1])) and
-             ((q + Length(Nm) > Length(U)) or not IsIdentChar(U[q + Length(Nm)])) then
-            Exit(True);
-          q := Pos(Nm, U, q + 1);
+             ((q + Length(Want) > Length(U)) or not IsIdentChar(U[q + Length(Want)])) then
+            if Qual = '' then Exit(True);
+          q := Pos(Want, U, q + 1);
+        end;
+        Inc(EnumDepth);
+        Continue;
+      end;
+      if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
+         (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
+         (W = 'ENUM') or (W = 'COMMON') then
+        if (Qual = '') and LineMentions(U, Nm) then Exit(True);
+      // ...and only AFTER the line has been read: "Type T" declares T itself, which IS a symbol, and
+      // fbc's own test asks for it from inside the body ("check_Y( T )").
+      if (W = 'TYPE') or (W = 'UNION') or (W = 'CLASS') then
+      begin
+        Rest := Trim(Copy(U, p, MaxInt));
+        // "Type mine As LongInt" is an ALIAS - one line, no block. Anything else opens one.
+        if Pos(' AS ', ' ' + Rest + ' ') = 0 then
+        begin
+          Inc(TypeDepth);
+          if (Qual <> '') and (TypeDepth = 1) and LineMentions(U, Qual) then
+          begin
+            QualIsType := True;
+            InQualBody := True;
+          end;
         end;
       end;
     end;
+    if Qual <> '' then
+      Result := QualIsType and QualMemberHit
+    else
+      Result := MemberHit and (TypeDepth > 0);
   finally
     L.Free;
   end;
+end;
+
+function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean;
+// Is this name DEFINED, in the sense fbc's Defined() and #ifdef both mean? Four storages, one
+// question: an object-like macro (Defs), a function-like macro (FnDefs - "#macro m(a)" and
+// "#define f(a)" live only there, and asking Defs alone answered 0 for a macro written three lines
+// above), a "#pragma reserve" reservation that is still in scope (GPPReserved; a 'q' in the value
+// marks one that has been un-reserved), a word the LANGUAGE reserves (GPPKeywords), or a declaration
+// the source itself makes above this point (SourceDeclaresSymbol).
+begin
+  Result := ((Defs <> nil) and (Defs.IndexOfName(Nm) >= 0)) or
+            ((FnDefs <> nil) and (FnDefs.IndexOfName(Nm) >= 0)) or
+            ((GPPReserved <> nil) and (GPPReserved.IndexOfName(Nm) >= 0) and
+             (Pos('q', GPPReserved.Values[Nm]) = 0)) or
+            ((GPPKeywords <> nil) and (GPPKeywords.IndexOf(Nm) >= 0)) or
+            SourceDeclaresSymbol(Nm);
 end;
 
 // Evaluate a #if / #elif constant integer expression. Supports: decimal and &H/&O/&B literals;
@@ -1416,7 +2025,7 @@ var
   // re-tokenized (depth-guarded) rather than added as one token, so values like "-1" (-> '-' '1'),
   // "&HFF", or "1 + 2" parse correctly and nested macros expand.
   procedure Tokenize(const S: string; Depth: Integer);
-  var p, q: Integer; id, two: string; nm: string;
+  var p, q: Integer; id, two: string; nm: string; ConstV: Int64; ConstS: string;
   begin
     p := 1;
     while p <= Length(S) do
@@ -1474,16 +2083,34 @@ var
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
           if (p <= Length(S)) and (S[p] = '(') then Inc(p);
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
+          // ⭐ A LEADING '.' (or '..') asks for the GLOBAL scope, and for defined() it names the same
+          // symbol: "defined( ..symbol )" is fbc's own spelling in pp/pragma-reserve-4. The dots are
+          // not identifier characters, so the name came out EMPTY and every such test answered "not
+          // defined" - and the file refused itself with #error.
+          while (p <= Length(S)) and (S[p] = '.') do Inc(p);
           q := p;
           while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
           nm := UpperCase(Copy(S, p, q - p)); p := q;
+          // ⛔ A QUALIFIED name is one name, and it was read as the BARE one with a tail left over.
+          // "defined( T.datafield )" answered whatever "defined( T )" answered - so every one of the
+          // fourteen "check_N( T.something )" in fbc's pp/defined-udt came out TRUE inside the type's
+          // own body, where T certainly is defined. The member half may be an OPERATOR name
+          // ("T.+=", "T.[]", "T.new[]"), which no identifier scan would ever reach: everything up to
+          // the closing parenthesis or the end belongs to the name.
+          if (p <= Length(S)) and (S[p] = '.') then
+          begin
+            Inc(p);                                  // the '.'
+            q := p;
+            while (q <= Length(S)) and (S[q] <> ')') and (S[q] <> ' ') and (S[q] <> #9) do Inc(q);
+            nm := nm + '.' + UpperCase(Trim(Copy(S, p, q - p)));
+            p := q;
+          end;
           while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
           // ⛔ A FUNCTION-LIKE MACRO IS DEFINED TOO. "#macro m(a)" and "#define f(a) ..." live in
           // FnDefs, not Defs, and only Defs was consulted - so "defined(m)" answered 0 for a macro
           // that had just been written three lines above. The two tables are one QUESTION with two
           // storages; every place that asks "is this name a macro?" has to ask both.
-          if (Defs.IndexOfName(nm) >= 0) or
-             ((FnDefs <> nil) and (FnDefs.IndexOfName(nm) >= 0)) or SourceDeclaresSymbol(nm) then
+          if PPNameIsDefined(nm, Defs, FnDefs) then
             Toks.Add('1')
           else
             Toks.Add('0');
@@ -1532,6 +2159,12 @@ var
           if Depth < 32 then Tokenize(Trim(Defs.Values[id]), Depth + 1)
           else Toks.Add('0');
         end
+        // ⭐ ...unless the SOURCE declares it as a Const with an integer value. See SourceConstValue.
+        else if SourceConstValue(id, ConstV) then
+          Toks.Add(IntToStr(ConstV))
+        // ...or with a STRING one, which that function declines by design. See SourceConstStr.
+        else if SourceConstStr(id, ConstS) then
+          Toks.Add(cPPStrTok + ConstS)
         else
           Toks.Add('0');                       // undefined identifier -> 0
         Continue;
@@ -1621,7 +2254,21 @@ var
     Result := ParseAdd;
     while (Peek='=') or (Peek='==') or (Peek='<>') or (Peek='!=') or (Peek='<') or (Peek='<=') or (Peek='>') or (Peek='>=') do
     begin
-      op := Peek; Inc(TPos); l := Result; r := ParseAdd;
+      op := Peek; Inc(TPos);
+      // ⛔ A NUMBER ON THE LEFT AND A STRING ON THE RIGHT IS NOT EQUAL - and the case matters because
+      // an UNDEFINED identifier tokenizes as 0. "#if __FB_BACKEND__ = "gas"" with the macro missing
+      // therefore read as 0 = 0 and came out TRUE, so we compiled the branch fbc does not: the string
+      // rule lived in the LEFT-hand path only, and ParsePrimary's discard arm answered 0 for the
+      // literal on the right. Measured against fbc 1.10.1: "UNKNOWN = "gas"" is FALSE, "UNKNOWN <>
+      // "gas"" is TRUE, and "0 = "0"" is a type-mismatch ERROR it refuses outright - the one case we
+      // are deliberately more permissive about, since a #if must still answer something.
+      if IsStrTok(Peek) then
+      begin
+        Inc(TPos);
+        if (op='<>') or (op='!=') then Result := 1 else Result := 0;
+        Continue;
+      end;
+      l := Result; r := ParseAdd;
       if (op='=') or (op='==') then b := l = r
       else if (op='<>') or (op='!=') then b := l <> r
       else if op='<' then b := l < r
@@ -1837,6 +2484,49 @@ begin
   // a #cmdline carrying -O raises it; a program reads it back to compile differently. It reports the
   // REQUEST, not our pipeline, which has no -O ladder to report.
   Defs.Values['__FB_OPTIMIZE__'] := '0';
+  // --- WHICH COMPILER THE PROGRAM THINKS IT IS TALKING TO. ⛔ These six were MISSING, and a missing
+  // one is not neutral: a program guarded by "#if __FB_BACKEND__ = "gas"" was compiled by us on the
+  // GAS side, where fbc itself takes the gcc side - so we then died inside a body the oracle never
+  // builds (functions/va_*, typedef/backpatch: four "defects" that were four wrong branches).
+  // Values measured from fbc 1.10.1 on linux-x86_64 with its own defaults, which is the configuration
+  // we claim to be; getting them WRONG would be worse than leaving them out, so each is the oracle's
+  // answer and not a preference of ours.
+  Defs.Values['__FB_BACKEND__']   := '"gcc"';      // -gen gcc is fbc's default here
+  Defs.Values['__FB_GCC__']       := '-1';         // ...and its flag form
+  Defs.Values['__FB_FPMODE__']    := '"precise"';  // -fpmode precise
+  Defs.Values['__FB_ASM__']       := '"intel"';    // the dialect an Asm block would be written in
+  Defs.Values['__FB_ERR__']       := '0';          // -e/-exx error-checking level: none
+  Defs.Values['__FB_VECTORIZE__'] := '0';          // -vec 0
+  // ⛔ ...AND ELEVEN MORE THAT WERE FILED "N/A - no meaning for a bytecode VM" AND HAVE AN EXACT ONE.
+  // Every one of these is a compile-mode flag with a definite value in the configuration we claim to be,
+  // and the paragraph above already says why a missing one is not neutral: an "#if __FB_OPTION_BYVAL__"
+  // took the branch fbc does not take, in SILENCE. Being on the N/A shelf is what kept them from being
+  // asked - see the note at the head of BASIC.md. Each value is fbc 1.10.1's own answer on
+  // linux-x86_64 with its defaults, read out of the compiler and not chosen here.
+  Defs.Values['__FB_OPTION_BYVAL__']   := '0';   // -lang fb passes by value unless BYREF is written
+  Defs.Values['__FB_OPTION_DYNAMIC__'] := '0';   // arrays are static unless declared otherwise
+  Defs.Values['__FB_OPTION_ESCAPE__']  := '0';   // "\n" is not an escape unless the literal says !"..."
+  Defs.Values['__FB_OPTION_GOSUB__']   := '0';   // GOSUB is off in -lang fb
+  Defs.Values['__FB_OPTION_PRIVATE__'] := '0';   // module procedures are public by default
+  Defs.Values['__FB_OUT_DLL__']        := '0';   // the three targets we are NOT: only __FB_OUT_EXE__ is -1
+  Defs.Values['__FB_OUT_LIB__']        := '0';
+  Defs.Values['__FB_OUT_OBJ__']        := '0';
+  Defs.Values['__FB_GUI__']            := '0';   // console programs, as fbc's default is
+  // fbc defines this to 0 in a normal build (it is not gated on -g, which only RAISES it), so
+  // "#ifdef __FB_DEBUG__" is TRUE there and was false here. Found by na_audit.sh --all, which is what
+  // that tool is for. Measured, not assumed.
+  Defs.Values['__FB_DEBUG__']          := '0';
+  Defs.Values['__FB_FPU__']            := '"x87"';  // fbc 1.10.1 linux-x86_64 answers this; same
+                                                    // policy as __FB_BACKEND__ - the oracle's word,
+                                                    // not a preference of ours
+  // ⛔ NOT __FB_PROFILE__ / __FB_OPTION_PROFILE__: fbc leaves those UNDEFINED unless -profile is given,
+  // and "#ifdef __FB_PROFILE__" is how a program asks. Defining them to 0 answers the wrong question -
+  // a define that EXISTS where fbc's does not is exactly as wrong as one that is missing, and this pair
+  // was caught by checking each value against the oracle rather than by reasoning about it.
+  // ⚠️ NOT the build-identity strings (__FB_BUILD_DATE__, __FB_BUILD_DATE_ISO__, __FB_BUILD_SHA1__).
+  // Those describe the compiler's OWN build, and mirroring fbc's would be a statement about us that is
+  // false. A program that reads them wants to know which binary it is talking to; the honest answer is
+  // to leave them undefined rather than to answer somebody else's.
   { Which machine the program is being compiled FOR. SedaiBasic's own, with no
     FreeBASIC counterpart - fbc has no WebAssembly target - so it does not
     pretend to be an __FB_ macro. }
@@ -1931,7 +2621,12 @@ var
   PathStr: string;       // module directory for __PATH__
   FileStr: string;       // top-level source path, in the platform's own spelling
   EscapeOn: Boolean;     // OPTION ESCAPE seen: plain "..." strings become escaped from here on
-  IncOnce: TStringList;  // full paths already spliced by an "#include Once" (that is what ONCE means)
+  IncOnce: TStringList;  // full paths ALREADY SPLICED, by any form of #include. ⛔ A PLAIN "#include"
+                         // registers the file too: fbc's own pp/inc_once1 includes a header twice
+                         // plainly and then asks for it "once", and the once is SKIPPED - "once" means
+                         // "if this file has not been included yet", not "if no earlier ONCE took it".
+  PragmaOnce: TStringList;  // full paths of files that asked for it themselves, with "#pragma once".
+                         // Those are skipped by EVERY later include, plain or once.
   ExpandedLine: string;  // a source line after macro substitution
   FReprocessDepth: Integer;   // guard against a macro whose expansion expands to itself
   UidK: Integer;         // scratch: clearing the __FB_UNIQUEID_* stacks at entry
@@ -1942,7 +2637,7 @@ var
   end;
 
   // Forward: ReprocessExpansion feeds a macro expansion back through Expand, which is declared below.
-  procedure Expand(const Text, Dir: string); forward;
+  procedure Expand(const Text, Dir: string; const SrcPath: string = ''); forward;
 
   function ExpandedLineHasDirective(const S: string): Boolean;
   // Does this expanded line hold a preprocessor directive in one of its cVirtualEOL segments? Only a
@@ -2049,10 +2744,14 @@ var
     Result := (Copy(U, 1, 6) = 'OPTION') and (Pos('ESCAPE', U) > 0) and (Pos('"', U) = 0);
   end;
 
-  procedure Expand(const Text, Dir: string);
+  procedure Expand(const Text, Dir: string; const SrcPath: string = '');
+  // SrcPath = the full path of the file THIS text came from ('' for the top-level source and for a
+  // macro expansion fed back through here). It exists for one reason: "#pragma once" is a statement a
+  // file makes ABOUT ITSELF, so the directive has to know which file it is standing in.
   var
     Lines: TStringList;
     li, p, q: Integer;
+    Canon: string;   // the include path, canonicalised - the identity every "once" question asks about
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
     Params, MacroBody, BodyTrim, EName, ERest, LineFile: string;
     LineNum: Integer;
@@ -2063,17 +2762,110 @@ var
     MappedModule: string;
     IncText: TStringList;
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
+    BlockCmt, PrevBlockCmt: Integer;   // depth of the /' ... '/ block comment we are inside
+    ScopeDepth: Integer;    // block nesting, for the level a #pragma reserve was made at
+    DirWord: string;        // the leading word of the line, for that same counter
     SavedStackTop: Integer;
+    ContJoin, CutPos: Integer;   // '_'-continued physical lines folded into this logical one
+    IsModuleText: Boolean;       // this pass is over the MODULE's own text: it carries the position
+  // The block-scope openers "#pragma reserve" counts levels with. Nothing else reads them.
+  function BlockCloser(const S: string): Boolean;
+  var W: string;
+  begin
+    W := Trim(S);
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    Result := (W = 'SCOPE') or (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
+              (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') or (W = 'NAMESPACE');
+  end;
+
+  function BlockOpener(const S: string): Boolean;
+  var W: string;
+  begin
+    W := Trim(S);
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    if Pos('(', W) > 0 then W := Copy(W, 1, Pos('(', W) - 1);
+    Result := BlockCloser(W);
+  end;
+
+  // ⛔ A DIRECTIVE INSIDE A /' ... '/ BLOCK COMMENT IS NOT A DIRECTIVE. This preprocessor reads the
+  // file LINE BY LINE and knew nothing about block comments, so an "#error" written inside one FIRED
+  // and refused the program - fbc's own comments/multiline is built on exactly that, four times over.
+  // Block comments NEST, and a line comment neutralises an opener that follows it on the same line
+  // ("' /'" opens nothing - that file tests it too).
+  procedure ScanBlockComment(const S: string; var Depth: Integer);
+  var
+    k: Integer;
+    InStr: Boolean;
+  begin
+    InStr := False;
+    k := 1;
+    while k <= Length(S) do
+    begin
+      if Depth = 0 then
+      begin
+        if S[k] = '"' then InStr := not InStr
+        else if not InStr then
+        begin
+          if (k < Length(S)) and (S[k] = '/') and (S[k + 1] = '''') then
+          begin Inc(Depth); Inc(k, 2); Continue; end;
+          if S[k] = '''' then Exit;                       // a line comment: nothing after it opens one
+        end;
+      end
+      else
+      begin
+        if (k < Length(S)) and (S[k] = '/') and (S[k + 1] = '''') then
+        begin Inc(Depth); Inc(k, 2); Continue; end;
+        if (k < Length(S)) and (S[k] = '''') and (S[k + 1] = '/') then
+        begin Dec(Depth); Inc(k, 2); Continue; end;
+      end;
+      Inc(k);
+    end;
+  end;
+
   begin
     SavedStackTop := High(Active);   // remember depth so includes can't leak unbalanced conditionals
+    BlockCmt := 0;
+    ScopeDepth := 0;
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
+      // Only the MODULE's own text carries a POSITION for defined(): an #include and a macro
+      // re-expansion are re-entered here with their own text, whose line numbers say nothing about
+      // where the question stands, so they leave the outer position alone. See GPPDefinedLimit.
+      IsModuleText := (Text = GPPSourceForDefined);
       li := 0;
       while li < Lines.Count do
       begin
+        if IsModuleText then GPPDefinedLimit := li;
         Raw := Lines[li];
         Trimmed := TrimLeft(Raw);
+        // The depth is updated for THIS line first, so a line that OPENS a comment is still read as
+        // code up to the "/'", and every line while we are inside is passed through untouched - the
+        // LEXER knows block comments and will drop them; what must not happen is a DIRECTIVE firing.
+        PrevBlockCmt := BlockCmt;
+        ScanBlockComment(Raw, BlockCmt);
+        // SCOPE nesting, for #pragma reserve: only that directive reads it, and only to tell a repeat
+        // at the SAME level from one made INSIDE a nested scope - which fbc accepts.
+        // BLOCK-SCOPE nesting, for "#pragma reserve" alone: it is the only directive that reads it,
+        // and only to tell a repeat at the SAME level (which fbc refuses) from one made INSIDE a
+        // nested block (which it accepts - its own pragma-reserve-3 re-reserves the same name in a
+        // SCOPE and again inside a SUB). ⛔ A procedure body is a nested block too: counting only
+        // SCOPE left the reserve inside "sub proc()" at level 0 and refused a legal program.
+        // A one-line "Sub s() : ... : End Sub" opens and closes on the same line, so the closing form
+        // is looked for on the line before deciding.
+        DirWord := UpperCase(Copy(Trimmed, 1, 20));
+        if (Copy(DirWord, 1, 4) = 'END ') then
+        begin
+          if BlockCloser(Copy(DirWord, 5, MaxInt)) and (ScopeDepth > 0) then Dec(ScopeDepth);
+        end
+        else if BlockOpener(DirWord) and (Pos(' : END ', ' ' + UpperCase(Trimmed) + ' ') = 0) then
+          Inc(ScopeDepth);
+        if PrevBlockCmt > 0 then
+        begin
+          if Emitting then Output.Add(Raw) else Output.Add('');
+          Inc(li);
+          Continue;
+        end;
         // __LINE__ expands to the current source line number (1-based). Updated every line so it is
         // correct wherever it appears; __FILE__ is set once (top-level file) in the begin block below.
         // __LINE__ is the same question a diagnostic asks, so it follows #line too.
@@ -2129,6 +2921,21 @@ var
         // "PRINT# error 64 writing to file: 0", a complaint about a file handle for a line nobody
         // wrote. Every line swallowed here leaves a blank behind, exactly as #macro does, so the line
         // numbers the rest of the pipeline reports stay the source's own.
+        // ⛔ ...BUT A #macro WHOSE PARAMETER LIST IS ALREADY CLOSED DOES NOT CONTINUE. The '_' there
+        // continues the HEADER while the header is still being written - that is how a long parameter
+        // list is split - and fbc stops honouring it once the ')' has been seen: "#macro M(x) _"
+        // followed by two body lines runs BOTH of them. Joined generically, the first body line was
+        // swallowed into the header and lost, so the macro ran one statement short and said nothing.
+        // ⛔ ...AND A "#macro" LINE CONTINUES LIKE ANY OTHER, WHATEVER ITS PARAMETER LIST IS DOING.
+        // This used to stop the join once the list was closed - or once it was clear there was none -
+        // because joining swallowed the first BODY line. That was the wrong half to fix: fbc's join is
+        // at TOKEN level, so what follows the parameter list on the joined line simply IS the first
+        // body line, and the #macro handler below now takes it as one. With the join stopped instead,
+        // a header whose parameter list is written on the NEXT line was never seen at all -
+        // "#macro gen _" / "( _" / "a, _" / ... - and fbc's own suite writes nine files that way
+        // (structs/udt-ops-*, udt-comp-ops-*, udt-*string/conversion): the macro came out OBJECT-like,
+        // its call "gen( 1, 2 )" was read as an expression, and the whole FILE died on
+        // 'Expected ")" after expression'. All three shapes now go through one rule.
         while (Length(Trimmed) > 0) and (Trimmed[1] = '#') and PPDirectiveContinues(Trimmed) and
               (li + 1 < Lines.Count) do
         begin
@@ -2144,16 +2951,26 @@ var
           begin
             ParentEmit := Emitting;
             // ...and a FUNCTION-LIKE macro is defined too (FnDefs); see the note on defined() above.
-            Cond := ParentEmit and ((Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
-                                    (FnDefs.IndexOfName(UpperCase(Trim(DRest))) >= 0));
+            // ⛔ ...AND THE RESERVED SET, which "#if defined(X)" already consults. "#ifdef X" and
+            // "defined(X)" are ONE question in fbc, and its pp/defined-udt asks both of the same names
+            // expecting the same answer; here they were two, and __FUNCTION__ - defined but never
+            // substitutable - answered yes to one and no to the other.
+            // ⚠️ Only the reserved set is added. SourceDeclaresSymbol (a Const, a Dim, a Sub) is the
+            // OTHER half of that same asymmetry and is NOT closed here: every #ifdef of such a name
+            // would flip at once, which is a measurement of its own. Written up in DIVERGENZE.
+            // ⭐ ONE QUESTION, ONE PREDICATE. "#ifdef X" and "#if defined( X )" are the same
+            // question in fbc, and its pp/defined-udt asks BOTH of every name it checks, expecting
+            // the same answer. Here they were two: only #if consulted the source's own declarations,
+            // so a Const, a Dim, a Sub - and a member of the enclosing type - answered yes to one and
+            // no to the other. PPNameIsDefined is now the single place either of them asks.
+            Cond := ParentEmit and PPNameIsDefined(UpperCase(Trim(DRest)), Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
           else if DName = 'ifndef' then
           begin
             ParentEmit := Emitting;
-            Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
-                                   (FnDefs.IndexOfName(UpperCase(Trim(DRest))) < 0);
+            Cond := ParentEmit and not PPNameIsDefined(UpperCase(Trim(DRest)), Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -2273,6 +3090,20 @@ var
             // manual writes it that way. Testing the very next character made such a macro OBJECT-like,
             // so an invocation expanded to the raw body and its arguments leaked out as code.
             while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
+            // ⛔ ...AND A BLOCK COMMENT MAY SIT BETWEEN THE NAME AND THE PARAMETER LIST.
+            // "#macro mac /' c '/ ( a, b )" is FreeBASIC, and its own pp tests are written that way.
+            // Only SPACES were skipped, so the '(' was not where the reader looked and the macro came
+            // out OBJECT-like: its body expanded with the parameters unsubstituted and the arguments
+            // leaked out as code, which the SSA then met as "Array not declared: B" - a diagnostic
+            // naming a macro PARAMETER, several stages away from the comment that caused it.
+            while (p + 1 <= Length(DRest)) and (DRest[p] = '/') and (DRest[p + 1] = '''') do
+            begin
+              Inc(p, 2);                                  // past the opening "/'"
+              while (p + 1 <= Length(DRest)) and
+                    not ((DRest[p] = '''') and (DRest[p + 1] = '/')) do Inc(p);
+              Inc(p, 2);                                  // past the closing "'/"
+              while (p <= Length(DRest)) and (DRest[p] in [' ', #9]) do Inc(p);
+            end;
             // "#macro name ? ( params )": the '?' makes the PARENTHESES OPTIONAL at the call site, so
             // "repeat 3" invokes it with 3 and the arguments run to the end of the line. Without this
             // the '?' was not a '(' and the macro came out OBJECT-like: its body expanded with the
@@ -2292,7 +3123,13 @@ var
               while (q <= Length(DRest)) and (DRest[q] <> ')') do Inc(q);
               Params := Trim(Copy(DRest, p + 1, q - p - 1));
             end;
-            MacroBody := '';
+            // ⭐ WHAT IS LEFT ON THE HEADER LINE IS THE FIRST BODY LINE. fbc joins '_'-continued lines
+            // at token level, so "#macro m( x ) _" followed by a statement puts that statement on the
+            // macro's own line - and it belongs to the BODY, not to the header. Same for a
+            // parameterless "#macro m _" followed by one. Nothing is left over for a header written on
+            // one line, which is every ordinary macro.
+            if IsFn then MacroBody := Trim(StripDirectiveComment(Copy(DRest, q + 1, MaxInt)))
+            else MacroBody := Trim(StripDirectiveComment(Copy(DRest, p, MaxInt)));
             Inc(li);
             while li < Lines.Count do
             begin
@@ -2302,10 +3139,18 @@ var
                 SplitDirective(BodyTrim, EName, ERest);
                 if EName = 'endmacro' then begin Output.Add(''); Break; end;
               end;
-              if Trim(Lines[li]) <> '' then
+              // ⛔ A COMMENT IN A #macro BODY IS STILL A COMMENT. The #define path strips one from the
+              // value it stores (StripDirectiveComment, twice, a hundred lines up); the #macro path
+              // never did, so the comment text was carried into the body and re-emitted at every
+              // expansion site - and a multi-line macro whose body is a single comment, expanded
+              // inside a one-line "If ... Then", left that comment where a statement had to be:
+              // "Parsing failed". ⭐ The discriminator is exact: a body that is genuinely EMPTY works,
+              // and the same file with one comment in it does not.
+              BodyTrim := Trim(StripDirectiveComment(Lines[li]));
+              if BodyTrim <> '' then
               begin
                 if MacroBody <> '' then MacroBody := MacroBody + cVirtualEOL;
-                MacroBody := MacroBody + Trim(Lines[li]);
+                MacroBody := MacroBody + BodyTrim;
               end;
               Output.Add('');   // blank placeholder preserves line numbers
               Inc(li);
@@ -2355,15 +3200,22 @@ var
             if not FileExists(FullPath) then FullPath := IncludeTrailingPathDelimiter(Dir) + FileName;
             if FileExists(FullPath) then
             begin
-              if IncludeOnce and (IncOnce.IndexOf(UpperCase(ExpandFileName(FullPath))) >= 0) then
-                IncText := nil                                  // already spliced: ONCE means once
+              // ⛔ THE IDENTITY IS THE CANONICAL PATH, NOT THE SPELLING. fbc's own pp/inc_once1 reaches
+              // one header as "inc1.bi" and as "../pp/inc1.bi" and treats the two as the SAME file.
+              Canon := UpperCase(ExpandFileName(FullPath));
+              if (PragmaOnce.IndexOf(Canon) >= 0) or
+                 (IncludeOnce and (IncOnce.IndexOf(Canon) >= 0)) then
+                IncText := nil                                  // already spliced, or it asked to be once
               else
               begin
-                if IncludeOnce then IncOnce.Add(UpperCase(ExpandFileName(FullPath)));
+                // ⛔ EVERY splice registers the file, not only a "once" one: what "once" asks is "has
+                // this file been included yet", and a plain #include is exactly that. Registering only
+                // the ONCE form made "#include" twice followed by "#include once" splice a THIRD time.
+                if IncOnce.IndexOf(Canon) < 0 then IncOnce.Add(Canon);
                 IncText := TStringList.Create;
                 try
                   IncText.LoadFromFile(FullPath);
-                  Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)));
+                  Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)), FullPath);
                 finally
                   IncText.Free;
                 end;
@@ -2371,6 +3223,68 @@ var
             end
             else
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
+          end
+          else if (DName = 'pragma') and Emitting then
+          begin
+            // #pragma once — the FILE says "include me at most once", whichever form asks for it.
+            // ⛔ It was not handled at all, and being dropped in silence is what made it look handled:
+            // the first include of such a header was right, and every later one spliced it again
+            // (fbc's own pp/inc_once2 counts 1 where we counted 3).
+            // Every other pragma (reserve, push/pop) stays ignored, exactly as before.
+            MacroName := UpperCase(Trim(StripDirectiveComment(DRest)));
+            if (MacroName = 'ONCE') and (SrcPath <> '') then
+            begin
+              Canon := UpperCase(ExpandFileName(SrcPath));
+              if PragmaOnce.IndexOf(Canon) < 0 then PragmaOnce.Add(Canon);
+            end
+            // ⭐ "#pragma reserve NAME" makes NAME a SYMBOL: fbc reserves the identifier and defined()
+            // answers TRUE for it from that line on - its own pp/pragma-reserve-* files refuse
+            // themselves with #error otherwise. Reserving is ALL it does here: there is no symbol table
+            // at this stage to keep the name out of, and the only observable half of the feature is
+            // exactly the one defined() asks for.
+            else if Copy(MacroName, 1, 7) = 'RESERVE' then
+            begin
+              // "#pragma reserve [(qual,...)] NAME".
+              // ⛔⛔ A SECOND RESERVATION OF THE SAME NAME AT THE SAME LEVEL IS AN ERROR, WHATEVER THE
+              // LIST SAYS. The first attempt here compared the attribute lists as SETS and allowed an
+              // identical repeat - an invention: the ORACLE refuses "#pragma reserve N" twice at module
+              // level with "error 4: Duplicated definition", and refuses "(extern,asm)" followed by
+              // "(asm,extern)" just the same. It was found by blessing the guard, which is the only
+              // reason the rule is not still shipped for the wrong reason.
+              // ⭐ What test 3 of fbc's own family really shows is a NESTING rule: reserving the name
+              // again inside a SCOPE is accepted. So the reservation carries the scope DEPTH it was
+              // made at, and only a repeat at that depth or shallower is refused.
+              MacroVal := Trim(Copy(MacroName, 8, MaxInt));
+              DirWord := '';
+              // ⛔ AND ONLY AN UNQUALIFIED RESERVATION MAKES THE NAME defined(). A qualified one
+              // reserves it in ANOTHER namespace - the assembler's, the linker's - so the program can
+              // still declare it (fbc's pragma-reserve-12/13) and defined() answers FALSE for it. Said
+              // by the oracle while blessing this guard: the qualified pair printed nothing where we
+              // printed "defined". The mark rides in the stored value, so the duplicate check below
+              // still sees every reservation whatever its list.
+              if (MacroVal <> '') and (MacroVal[1] = '(') then
+              begin
+                q := Pos(')', MacroVal);
+                if q > 0 then
+                begin
+                  MacroVal := Trim(Copy(MacroVal, q + 1, MaxInt));
+                  DirWord := 'q';
+                end;
+              end;
+              if (MacroVal <> '') and (GPPReserved <> nil) then
+              begin
+                q := GPPReserved.IndexOfName(MacroVal);
+                if q >= 0 then
+                begin
+                  if StrToIntDef(StringReplace(GPPReserved.ValueFromIndex[q], 'q', '',
+                                 [rfReplaceAll]), 0) >= ScopeDepth then
+                    raise EPreprocessorError.Create('Duplicated definition, ' + MacroVal +
+                      ' is already reserved at this level');
+                end
+                else
+                  GPPReserved.Values[MacroVal] := DirWord + IntToStr(ScopeDepth);
+              end;
+            end;
           end
           else if (DName = 'print') and Emitting then
             // #print msg — emit a compile-time diagnostic (macro-expanded) to stderr. What exactly gets
@@ -2402,6 +3316,39 @@ var
               begin MacroName := MacroName + DRest[q]; Inc(q); end;
               if MacroName <> '' then Defs.Values['__FB_OPTIMIZE__'] := MacroName;
             end;
+            // ⭐ ...AND "-d NAME" / "-d NAME=VALUE" DEFINES A SYMBOL, observable on the very next line:
+            // fbc's own pp/cmdline asks for a symbol on the #cmdline line and then refuses itself with
+            // #error unless defined() sees it. The comment above says the switches "name a linker, an
+            // object format, a target" - true of the rest, and -d is the one that is not: it is the
+            // command-line spelling of #define, and it is our own front end's -d too.
+            p := 1;
+            while p > 0 do
+            begin
+              p := Pos('-d', DRest, p);
+              if p = 0 then Break;
+              if ((p = 1) or (DRest[p - 1] in [' ', #9, '"'])) and
+                 (p + 2 <= Length(DRest)) and (DRest[p + 2] in [' ', #9]) then
+              begin
+                q := p + 3;
+                while (q <= Length(DRest)) and (DRest[q] in [' ', #9]) do Inc(q);
+                MacroName := '';
+                while (q <= Length(DRest)) and IsIdentChar(DRest[q]) do
+                begin MacroName := MacroName + UpCase(DRest[q]); Inc(q); end;
+                if MacroName <> '' then
+                begin
+                  MacroVal := '';
+                  if (q <= Length(DRest)) and (DRest[q] = '=') then
+                  begin
+                    Inc(q);
+                    while (q <= Length(DRest)) and not (DRest[q] in [' ', #9, '"']) do
+                    begin MacroVal := MacroVal + DRest[q]; Inc(q); end;
+                  end;
+                  if MacroVal = '' then MacroVal := '-1';       // "-d NAME" alone: fbc gives it -1
+                  Defs.Values[MacroName] := MacroVal;
+                end;
+              end;
+              Inc(p, 2);
+            end;
           end
           else if (DName = 'error') and Emitting then
             // #error msg — abort compilation with a macro-expanded diagnostic.
@@ -2409,7 +3356,19 @@ var
           else if (DName = 'assert') and Emitting then
           begin
             // #assert <expr> — abort compilation if the constant integer expression is false.
-            if not EvalPPExpr(DRest, Defs, FnDefs) then
+            // ⚠️ DECLARED DIVERGENCE, bounded on purpose. "#assert TypeOf(a) = TypeOf(b)" asks a
+            // question the preprocessor cannot answer - it has no type information - and until now the
+            // whole FILE was refused for it. But an #assert is a CHECK, not a choice: skipping one
+            // means "we did not verify this", which costs a diagnostic we do not emit anyway, while
+            // refusing costs the entire program. 14 tests of the fbc suite die on nothing else.
+            // ⛔ NOT the same for "#if TypeOf(...)": there the answer SELECTS A BRANCH, so guessing
+            // would compile different code. That one still refuses, and 6 tests still wait on real
+            // type information in the preprocessor.
+            if Pos('TYPEOF', UpperCase(DRest)) > 0 then
+            begin
+              // unevaluable here: left unchecked, deliberately
+            end
+            else if not EvalPPExpr(DRest, Defs, FnDefs) then
               raise EPreprocessorError.Create('assertion failed: ' + Trim(DRest));
           end;
           // All directive lines are dropped from the output; emit a blank to keep line numbers.
@@ -2417,6 +3376,24 @@ var
         end
         else if Emitting then
         begin
+          // ⛔ '_' CONTINUATION IS NOT A DIRECTIVE-ONLY RULE. The join further up is gated on
+          // Trimmed[1] = '#', and that looked sufficient because the LEXER folds a continued line of
+          // ordinary code on its own - a continued SUB call works. But SubstituteMacros takes ONE
+          // PHYSICAL LINE, so a macro whose ARGUMENT LIST is split across lines was expanded with the
+          // arguments TRUNCATED: "chk( 1, _" / "2 )" died on 'Unexpected token ")"' while the very
+          // same continuation in a plain call was fine. That difference is what named it, and nine
+          // tests of fbc's own suite are written this way.
+          // Folded HERE, before substitution, so the macro sees the whole argument list; every line
+          // swallowed leaves a blank behind, exactly as the directive join does, so the line numbers
+          // the rest of the pipeline reports stay the source's own.
+          ContJoin := 0;
+          CutPos := LineContinuationCut(Raw);
+          while (CutPos > 0) and (li + ContJoin + 1 < Lines.Count) do
+          begin
+            Raw := Copy(Raw, 1, CutPos - 1) + ' ' + TrimLeft(Lines[li + ContJoin + 1]);
+            Inc(ContJoin);
+            CutPos := LineContinuationCut(Raw);
+          end;
           if IsOptionEscapeLine(Trimmed) then EscapeOn := True;   // takes effect from THIS line on
           if EscapeOn then
             ExpandedLine := ApplyEscapeRewrite(SubstituteMacros(Raw, Defs, FnDefs, 0))
@@ -2432,6 +3409,12 @@ var
             Output.Add(ReprocessExpansion(ExpandedLine, Dir))
           else
             Output.Add(ExpandedLine);
+          while ContJoin > 0 do                       // one blank per swallowed line: keep numbering
+          begin
+            Output.Add('');
+            Inc(li);
+            Dec(ContJoin);
+          end;
         end
         else
           Output.Add('');   // excluded line — blank placeholder preserves line numbers
@@ -2449,6 +3432,12 @@ var
   end;
 
 begin
+  // ⭐ WHICH LANGUAGE DID THIS FILE ASK FOR? Recorded here and nowhere else: this routine is the one
+  // funnel every front end (sb, sbc, the web server, the runner, immediate mode) passes a source
+  // through before lexing, so a rule that must only apply to -lang fb can read the answer without
+  // seven callers each having to remember to pass it. Set BEFORE the fast path below, so a file with
+  // no directives at all clears a previous file's answer instead of inheriting it.
+  GDeclaredNonFbDialect := DetectNonFbLang(Src);
   // Fast path: no preprocessor directive and no intrinsic-define usage -> return unchanged (zero
   // overhead for normal code). '#' covers all directives; '__' covers bare __FB_*__ intrinsic
   // macros; '$ covers the QuickBASIC '$INCLUDE metacommand; 'scape'/'SCAPE' covers OPTION
@@ -2469,6 +3458,7 @@ begin
 
   SetLength(GPPLineDirectives, 0);   // per COMPILATION, like the unique-id stacks above
   IncOnce := TStringList.Create;
+  PragmaOnce := TStringList.Create;
   FReprocessDepth := 0;
   FnDefs := TStringList.Create;
   Output := TStringList.Create;
@@ -2498,12 +3488,25 @@ begin
     SetLength(Taken, 0);
     EscapeOn := False;
     GPPSourceForDefined := Src;   // lets defined() see Const/Dim/proc declarations, like fbc
+    GPPOutput := Output;          // ...positionally: the expansion so far IS the symbol table so far
+  if GPPReserved = nil then GPPReserved := TStringList.Create;
+  GPPReserved.Clear;            // per PROGRAM: a reservation must not survive into the next one
+  GPPReserved.CaseSensitive := False;
+  // ⭐ __FUNCTION__ / __FUNCTION_NQ__ are DEFINED but must NOT be substituted here: their value is the
+  // name of the ENCLOSING PROCEDURE, which only the parser knows, and it already substitutes them.
+  // They belong in the reserved set for exactly that reason - "#ifndef __FUNCTION__ : #error" is in
+  // fbc's own pp/intrinsic, a program it accepts, and we refused it.
+  GPPReserved.Values['__FUNCTION__'] := '';
+  GPPReserved.Values['__FUNCTION_NQ__'] := '';
+  SeedFbKeywords;
     Expand(Src, BaseDir);
     Result := Output.Text;
   finally
     Defs.Free;
     IncOnce.Free;
+    PragmaOnce.Free;
     FnDefs.Free;
+    GPPOutput := nil;             // it is about to be freed: nothing may scan it afterwards
     Output.Free;
   end;
 end;

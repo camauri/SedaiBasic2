@@ -744,7 +744,7 @@ begin
     //     reallocation that any append in the loop can cause.
     //   ssaStrStr, ssaStrFormat, ssaStrVal and the conversion family - formatting and parsing that
     //     read settings or can raise; left out until one of them is measured to be worth the audit.
-    ssaStrLen, ssaStrLenW,
+    ssaStrLen, ssaStrLenW, ssaStrAscW,
     ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrLeftW, ssaStrRightW, ssaStrMidW,
     ssaStrAsc, ssaStrAscMid,

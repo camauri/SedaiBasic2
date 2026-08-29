@@ -53,6 +53,13 @@ type
     FCurrentBasicLineNumber: Integer;
     FCurrentBasicSourceLine: string;
 
+    // ⭐ A LOOK-AHEAD THAT REWINDS MUST NOT LEAVE AN ERROR BEHIND. A caller that reads tokens only to
+    // learn their shape, and then puts the position back, has to put the diagnostics back too - and
+    // the error list keeps cached counts, so deleting entries afterwards would leave HasErrors True
+    // on a list with nothing in it. Muting at the ONE door every path goes through is the version
+    // that cannot be got wrong. Counted, not boolean, so nesting a look inside a look stays safe.
+    FMutedErrors: Integer;
+
   public
     constructor Create(ATokenList: TTokenList);
     destructor Destroy; override;
@@ -87,6 +94,7 @@ type
     procedure Synchronize; // Error recovery
     procedure EnterPanicMode; inline;
     procedure ExitPanicMode; inline;
+    property MutedErrors: Integer read FMutedErrors write FMutedErrors;
 
     // === PARSE RULES MANAGEMENT (hot path) ===
     procedure SetParseRule(TokenType: TTokenType; const Rule: TParseRule); inline;
@@ -372,6 +380,7 @@ procedure TParserContext.AddError(const Message: string; Token: TLexerToken);
 var
   ErrorIndex: Integer;
 begin
+  if FMutedErrors > 0 then Exit;
   ErrorIndex := FErrors.AddError(Message, Token);
   // Set BASIC line number if tracked
   if (ErrorIndex >= 0) and (FCurrentBasicLineNumber > 0) then
@@ -389,6 +398,7 @@ procedure TParserContext.AddError(const Message: string; Line, Column, Position:
 var
   ErrorIndex: Integer;
 begin
+  if FMutedErrors > 0 then Exit;
   ErrorIndex := FErrors.AddError(Message, Line, Column, Position);
   // Set BASIC line number if tracked
   if (ErrorIndex >= 0) and (FCurrentBasicLineNumber > 0) then

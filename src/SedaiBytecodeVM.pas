@@ -722,6 +722,17 @@ type
     procedure RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
+    // ⭐ The THREE POINTER DOMAINS, answered in one place each. A pointer VALUE is one of: a record-field
+    // pointer (RECPTR_TAG, bit 63, so NEGATIVE), a raw heap address (RAWPTR_TAG, bit 62) or a packed
+    // array pointer. The bcRefLoad*/bcRefStore* arms spelled all three out inline, and the bcRawLoad*/
+    // bcRawStore* arms knew only the raw one - so "@obj.field" kept in a POINTER FIELD of another UDT
+    // (which the compiler classifies as raw) died on a dereference that worked from a pointer VARIABLE.
+    // ⛔ Extracted rather than copied: this would have been the THIRD written-out copy of the same
+    // decode, and every earlier copy of it in this VM has cost a defect.
+    function PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64): Int64;
+    function PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
+    procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
+    procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure UpdateScreenModelGate;          // decide whether the modelled screen must be kept
     procedure RecCacheAdopt(C: PRecCache);    // bind this thread's free-index cache to this VM
@@ -1111,7 +1122,11 @@ begin
   begin
     if V - TWO63 >= TWO63 then Q := QWord(INDEFINITE)
     else Q := QWord(FloatToIntConv(V - TWO63, Modern));
+    {$PUSH}{$Q-}{$R-}
+    // "Take 2^63 off, convert, put it back": the addition wraps THROUGH the sign, which is the whole
+    // trick. Deliberate, and silenced here so a debug build stays usable.
     Result := Int64(Q + QWord(INDEFINITE));
+    {$POP}
   end
   else
     Result := FloatToIntConv(V, Modern);
@@ -1431,6 +1446,7 @@ begin
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
   FCtx.RecordCount := 0;
+  FCtx.RecordHigh := 0;   // the slots are GONE, so nothing below the mark is reused any more
   FCtx.CursorCol := 0;
   FCtx.CursorRow := 0;
   // Initialize time tracking
@@ -4371,6 +4387,8 @@ end;
 function TBytecodeVM.AllocRecord(Ctx: TExecutionContext; ByteSize, StrC, TypeId: Integer): Integer;
 // Allocate a record instance (heap block of typed slot arrays) in Ctx's per-thread heap and
 // return its handle (an index into Ctx.Records).
+var
+  RecClr: Integer;   // clearing a REUSED slot's string vector; see the note below
 begin
   // Reserve handle 0 as the null-pointer sentinel: a real record handle must never be 0, or a pointer
   // to the first-allocated record ("Dim As T b : Dim As T Ptr p = @b") would carry the value 0 and a
@@ -4384,12 +4402,36 @@ begin
   if Ctx.RecordCount >= Length(Ctx.Records) then
     SetLength(Ctx.Records, (Ctx.RecordCount + 1) * 2);
   Ctx.Records[Ctx.RecordCount].TypeId := TypeId;
-  // A3-i: one byte image plus the string vector. SetLength zero-fills a fresh block, which is the
+  // A3-i: one byte image plus the string vector. SetLength zero-fills a FRESH block, which is the
   // initial state a record must have.
-  SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
-  SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+  // ⛔⛔ ...AND "FRESH" IS THE WHOLE CLAIM, which held only for a slot never used before. A block or a
+  // frame reclaim rolls RecordCount BACK (bcRecMarkPop, PopFrame), so the next allocation lands on a
+  // slot that already holds the previous occupant's data - and SetLength on an array ALREADY that
+  // length does nothing at all. Every UDT local declared in a Scope, in a loop body or in a Sub was
+  // therefore handed its PREVIOUS value instead of zero, on all four engines and in silence:
+  //     Sub f() : Dim As A a : Print a.x : a.x = 11 : End Sub
+  //     f() : f()          ' FreeBASIC prints 0 and 0; we printed 0 and 11
+  // Below the high-water mark the slot is reused and is cleared here; at or above it, SetLength has
+  // just zero-filled and there is nothing to do - which is what keeps this off the growing path.
+  if Ctx.RecordCount < Ctx.RecordHigh then
+  begin
+    SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
+    if ByteSize > 0 then
+      FillChar(Ctx.Records[Ctx.RecordCount].Bytes[0], ByteSize, 0);
+    SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+    // ⚠️ The strings need their OWN clear: they are managed, so FillChar over them would leak the old
+    // reference and hand the next reader a dangling one. Assigning '' releases it properly.
+    for RecClr := 0 to StrC - 1 do
+      Ctx.Records[Ctx.RecordCount].StringData[RecClr] := '';
+  end
+  else
+  begin
+    SetLength(Ctx.Records[Ctx.RecordCount].Bytes, ByteSize);
+    SetLength(Ctx.Records[Ctx.RecordCount].StringData, StrC);
+  end;
   Result := Ctx.RecordCount;
   Inc(Ctx.RecordCount);
+  if Ctx.RecordCount > Ctx.RecordHigh then Ctx.RecordHigh := Ctx.RecordCount;
 end;
 
 procedure TBytecodeVM.GrowSharedRecords(NeedLen: Integer);
@@ -5194,6 +5236,102 @@ begin
   Result := @FRawHeap[ofs];
 end;
 
+function TBytecodeVM.PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64): Int64;
+// A pointer value that is NOT a raw heap address: a record-field pointer or a packed array pointer.
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Exit(RecFieldInt(Rec, RecSlot));
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  // The vector that IS populated is the discriminator - see the note in bcRefLoadInt.
+  if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    Result := FArrays[ArrayIdx].IntData[PtrOffset]
+  else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    Result := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
+function TBytecodeVM.PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Exit(RecFieldFloat(Rec, RecSlot));
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    Result := FArrays[ArrayIdx].FloatData[PtrOffset]
+  else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    Result := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
+procedure TBytecodeVM.PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    RecSetFieldInt(Rec, RecSlot, Value);
+    Exit;
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    FArrays[ArrayIdx].IntData[PtrOffset] := Value
+  else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Value
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
+procedure TBytecodeVM.PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
+var
+  Rec: PRecordStorage;
+  RecSlot, ArrayIdx: Integer;
+  PtrOffset: Int64;
+begin
+  if PtrAddr < 0 then
+  begin
+    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    RecSetFieldFloat(Rec, RecSlot, Value);
+    Exit;
+  end;
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+    FArrays[ArrayIdx].FloatData[PtrOffset] := Value
+  else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+    PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Value
+  else
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+end;
+
 function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
 begin
   case TypeCode of
@@ -5344,6 +5482,14 @@ var
   W: UnicodeString;
   PW: PWord;
 begin
+  // ⛔ A NULL ZSTRING/WSTRING POINTER READS AS THE EMPTY STRING, and that is fbc's rule rather than
+  // undefined behaviour it gets away with: its string runtime tests the pointer, so "Len(*pz)" answers
+  // 0 and "*pz" answers "" on a null "ZString Ptr". We went through RawAddr, which raises "Null or
+  // invalid raw pointer dereference" - correct for every NUMERIC view of a raw pointer and wrong for
+  // the STRING one, which is the only view with a defined answer at zero.
+  // ⚠️ EXACTLY zero. An invalid non-zero pointer still raises: that check is what keeps a raw pointer
+  // from addressing memory the VM does not own, and it is not being relaxed here.
+  if RawPtr = 0 then Exit('');
   P := PByte(RawAddr(RawPtr, 1));                      // validates region + at least one byte
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
   if (RawPtr and RAWPTR_REGION_FB) <> 0 then
@@ -5742,6 +5888,7 @@ begin
   BindArrayMap(WCtx);
   SetLength(WCtx.Records, 0);
   WCtx.RecordCount := 0;
+  WCtx.RecordHigh := 0;   // the slots are GONE, so nothing below the mark is reused any more
   WCtx.CursorCol := 0;
   WCtx.CursorRow := 0;
   WCtx.TrapLine := 0;
@@ -6768,7 +6915,7 @@ begin
         end;
 
         // String Src1 (source) -> int Dest
-        bcStrLen, bcStrLenW, bcStrAsc, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists, bcFileLen:
+        bcStrLen, bcStrLenW, bcStrAsc, bcStrAscW, bcStrDec, bcStrValInt, bcStrSAdd, bcStrCvInt, bcFileExists, bcFileLen:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
@@ -7557,6 +7704,7 @@ begin
   FCtx.BlockRecMarkTop := 0;
   SetLength(FCtx.Records, 0);
   FCtx.RecordCount := 0;
+  FCtx.RecordHigh := 0;   // the slots are GONE, so nothing below the mark is reused any more
   {$IFDEF ENABLE_INSTRUCTION_COUNTING}
   FInstructionsExecuted := 0;
   {$ENDIF}
@@ -11816,7 +11964,11 @@ begin
         else if (C >= 'A') and (C <= 'F') then D := Ord(C) - Ord('A') + 10
         else Break;
         if D >= Base then Break;
+        {$PUSH}{$Q-}{$R-}
+        // The UNSIGNED accumulation wraps by design - that is what parsing a full-width base literal
+        // means. Silenced here so a debug build can be used; see the lexer's twin.
         U := U * QWord(Base) + QWord(D);
+        {$POP}
         Inc(I);
       end;
       Result := Int64(U);
@@ -12045,6 +12197,28 @@ begin
               Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
 end;
 
+// Decode the FIRST codepoint of a UTF-8 string (FreeBASIC ASC on a WSTRING); 0 for an empty string.
+// The mirror of Utf8EncodeCP, and the reason bcStrAsc cannot answer for a wide string: that one takes
+// the first BYTE, which for anything above U+007F is only the lead byte of the sequence.
+function Utf8FirstCP(const S: string): Integer;
+var
+  b, n, i, need: Integer;
+begin
+  if S = '' then Exit(0);
+  b := Ord(S[1]);
+  if b < $80 then Exit(b);
+  if (b and $E0) = $C0 then begin Result := b and $1F; need := 1; end
+  else if (b and $F0) = $E0 then begin Result := b and $0F; need := 2; end
+  else if (b and $F8) = $F0 then begin Result := b and $07; need := 3; end
+  else Exit(b);                                  // a stray continuation byte: report it as it stands
+  n := Length(S);
+  for i := 2 to need + 1 do
+  begin
+    if (i > n) or ((Ord(S[i]) and $C0) <> $80) then Exit(b);   // truncated: the lead byte, as bcStrAsc
+    Result := (Result shl 6) or (Ord(S[i]) and $3F);
+  end;
+end;
+
 // Map a 1-based BYTE position in a UTF-8 string to a 1-based CODEPOINT position (0 stays 0 = not found).
 function Utf8BytePosToCP(const S: string; BytePos: Integer): Integer;
 var
@@ -12103,6 +12277,8 @@ begin
         Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Src1] + Ctx.StringRegs[Instr.Src2];
     1: // bcStrLen
       Ctx.IntRegs[Instr.Dest] := Length(Ctx.StringRegs[Instr.Src1]);
+    52: // bcStrAscW - ASC(wstring): the Unicode CODEPOINT of the first character.
+      Ctx.IntRegs[Instr.Dest] := Utf8FirstCP(Ctx.StringRegs[Instr.Src1]);
     25: // bcStrLenW - LEN(wstring): Unicode codepoint count of the UTF-8 byte storage.
       Ctx.IntRegs[Instr.Dest] := Utf8CPCount(Ctx.StringRegs[Instr.Src1]);
     26: // bcStrLeftW - LEFT$(wstring, n): first n codepoints.
@@ -12468,11 +12644,19 @@ begin
         // Src1 = haystack, Src2 = needle, Immediate = the int register holding the 1-based start position
         // (the 2-arg form passes a register holding 1).
         StartPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        if StartPos < 1 then StartPos := 1;
-        Ctx.IntRegs[Instr.Dest] := Pos(Ctx.StringRegs[Instr.Src2],
-          Copy(Ctx.StringRegs[Instr.Src1], StartPos, MaxInt));
-        if Ctx.IntRegs[Instr.Dest] > 0 then
-          Inc(Ctx.IntRegs[Instr.Dest], StartPos - 1);
+        // ⛔ A START BELOW 1 IS AN ERROR, NOT A CLAMP. fbc answers 0 for "Instr( 0, s, sub )" - the
+        // position is 1-based and 0 names nothing - while clamping it to 1 SEARCHED THE WHOLE STRING and
+        // answered a position the caller had asked not to look at. The 2-argument form passes a register
+        // holding 1, so it is unaffected.
+        if StartPos < 1 then
+          Ctx.IntRegs[Instr.Dest] := 0
+        else
+        begin
+          Ctx.IntRegs[Instr.Dest] := Pos(Ctx.StringRegs[Instr.Src2],
+            Copy(Ctx.StringRegs[Instr.Src1], StartPos, MaxInt));
+          if Ctx.IntRegs[Instr.Dest] > 0 then
+            Inc(Ctx.IntRegs[Instr.Dest], StartPos - 1);
+        end;
       end;
     48: // bcStrInstrAny - INSTR([start,] str, Any set) -> FIRST position of any char in the set (1-based, 0 if none)
       begin
@@ -13341,13 +13525,37 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Ctx.IntRegs[Instr.Dest] := RecFieldInt(Rec, RecSlot);
         end
+        // ⛔ ...AND A RAW ADDRESS IS A THIRD KIND. An @-taken LOCAL is a raw byte slot (RAWPTR_TAG,
+        // bit 62), and the deref lowered from a NAME knows that; the one lowered from a VALUE cannot,
+        // because there is no name left to ask. So "*p" worked and "**pp" did not: the inner deref
+        // handed back p's value - a correctly tagged raw address - and this arm decoded it as a packed
+        // array pointer, whose array id is then nonsense ("Null or invalid pointer dereference,
+        // address 4611686018427387920"). The tag is IN the value, so the question is answered here,
+        // where every path that produces one arrives.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, 0)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+          // ⛔ ...AND THE BANK OF THE POINTER NEED NOT BE THE BANK OF THE STORAGE. These six arms chose
+          // which vector to read from the OPCODE, while a TArrayStorage populates exactly ONE of
+          // IntData / FloatData / StringData - so "*CPtr(ULongInt Ptr, @d)" over a Double reached an
+          // INT arm, found IntData empty and reported the FLOAT bank's tag as a bad address. Type
+          // punning is the idiom fbc's own suite uses everywhere, and it was impossible by
+          // construction. The vector that IS populated is the discriminator, so no extra field is
+          // needed: fall through to it and REINTERPRET the eight bytes, which is what fbc does.
+          // ⚠️ DECLARED LIMIT: a SINGLE is stored here as an 8-byte Double, so punning one through a
+          // ULong Ptr still differs from fbc's 4-byte IEEE754 image (DIVERGENZE 55). Double <-> Int64,
+          // which is what numbers/infnan and numbers/limits use, is exact.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset];
+          if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset]
+          else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
     14: // bcRefLoadFloat
@@ -13358,16 +13566,25 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
         end
+        // The raw-address kind - see the note in bcRefLoadInt above.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset];
+          if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset]
+          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            Ctx.FloatRegs[Instr.Dest] := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
-    15: // bcRefLoadString
+    15: // bcRefLoadString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
         if PtrAddr < 0 then
@@ -13375,6 +13592,14 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
         end
+        // ⛔ THE RAW THIRD KIND, WHICH THIS ARM ALONE DID NOT KNOW. bcRefLoadInt/Float learned it and
+        // say so in the note above - "the tag is IN the value, so the question is answered here, where
+        // every path that produces one arrives" - and the STRING arm was never visited. A BYREF cast
+        // written "Operator = *This.p" over a CAllocate'd ZString hands back a correctly tagged raw
+        // address, and this decoded it as a packed array pointer: "Null or invalid pointer
+        // dereference, address 4611686018427387944". Text at a raw address is a C string.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -13392,13 +13617,24 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           RecSetFieldInt(Rec, RecSlot, Ctx.IntRegs[Instr.Src2]);
         end
+        // The raw-address kind - see the note in bcRefLoadInt above. The WRITE half must know it too,
+        // or "**pp = 5" stores into a nonexistent array while "*p = 5" works.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreInt(PtrAddr, 0, Ctx.IntRegs[Instr.Src2])
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].IntData)) then
+          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above. The
+          // WRITE half needs it too, or "*Cast(ULongInt Ptr, @d) = bits" raises where the read works.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2];
+          if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2]
+          else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
     17: // bcRefStoreFloat
@@ -13409,16 +13645,25 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
         end
+        // The raw-address kind - see the note in bcRefLoadInt above.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
           PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].FloatData)) then
+          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
+          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2];
+          if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2]
+          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+            PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Ctx.FloatRegs[Instr.Src2]
+          else
+            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
         end;
       end;
-    18: // bcRefStoreString
+    18: // bcRefStoreString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
       begin
         PtrAddr := Ctx.IntRegs[Instr.Src1];
         if PtrAddr < 0 then
@@ -13426,6 +13671,10 @@ begin
           Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
           Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
         end
+        // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
+        // or LSET on such a UDT reads its buffer and then stores into a nonexistent array.
+        else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
         else
         begin
           ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -13446,10 +13695,48 @@ begin
     20: Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                              // bcRawAlloc
     21: RawFree(Ctx.IntRegs[Instr.Src1]);                                                          // bcRawFree
     22: Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);   // bcRawRealloc
-    23: Ctx.IntRegs[Instr.Dest] := RawLoadInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate);           // bcRawLoadInt
-    24: Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate);       // bcRawLoadFloat
-    25: RawStoreInt(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.IntRegs[Instr.Src2]);            // bcRawStoreInt
-    26: RawStoreFloat(Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);        // bcRawStoreFloat
+    // ⛔ A NEGATIVE ADDRESS IS NOT RAW MEMORY: it is a RECORD-FIELD pointer (RECPTR_TAG, bit 63), what
+    // "@obj.field" yields for a managed record. bcRefLoadInt has told the three domains apart for a
+    // while - its own comment says "the tag is IN the value, so the question is answered here, where
+    // every path that produces one arrives" - and the RAW arm never learnt the same thing. So
+    // "@a.i" put in a pointer VARIABLE worked and the same address put in a pointer FIELD of another
+    // UDT died on "Null or invalid raw pointer dereference": the compiler classifies a pointer FIELD as
+    // raw and emits this opcode, and only the value knows better. Measured with a 5-variant deck: the
+    // combination "record-field pointer inside a record field" was the only one that broke.
+    23: // bcRawLoadInt
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)   // a real raw address: it carries the WIDTH
+        else
+          Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr);
+      end;
+    24: // bcRawLoadFloat
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)
+        else
+          Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr);
+      end;
+    // The WRITE half of the same rule, and it must be here too - "*g.pi = 33" through a pointer FIELD
+    // holding "@obj.field" wrote into a nonexistent raw block while the READ, once fixed, worked.
+    25: // bcRawStoreInt
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
+        else
+          PtrDomainStoreInt(Ctx, PtrAddr, Ctx.IntRegs[Instr.Src2]);
+      end;
+    26: // bcRawStoreFloat
+      begin
+        PtrAddr := Ctx.IntRegs[Instr.Src1];
+        if (PtrAddr and RAWPTR_TAG) <> 0 then
+          RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])
+        else
+          PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2]);
+      end;
     31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
       begin
         RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
@@ -13467,7 +13754,28 @@ begin
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
         // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
         // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
-      if Instr.Immediate = -1 then
+      // ⭐ A NEGATIVE address is not raw memory at all: it is a RECORD-FIELD pointer (RECPTR_TAG,
+      // bit 63), which is what "@obj.field" yields for a MANAGED record. A raw byte address carries
+      // RAWPTR_TAG (bit 62) and so is never negative - the two domains are told apart here exactly as
+      // bcRefLoad*/bcRefStore* already tell them apart. Without this "*Cast(ZString Ptr, @_data)",
+      // which is how fbc's OWN udt-zstring reference implementation reads a fixed-length field, took a
+      // field pointer for a heap offset and raised "Null or invalid raw pointer dereference".
+      // The exact-byte-count form still means "the field's DECLARED width", so the content is padded
+      // with NULs or cut to it; the managed slot holds the content and has no padding of its own.
+      if Ctx.IntRegs[Instr.Src1] < 0 then
+      begin
+        Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
+        Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
+        if Instr.Immediate >= 2 then
+        begin
+          if Length(Ctx.StringRegs[Instr.Dest]) > Instr.Immediate - 2 then
+            Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Dest], 1, Instr.Immediate - 2)
+          else if Length(Ctx.StringRegs[Instr.Dest]) < Instr.Immediate - 2 then
+            Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Dest] +
+              StringOfChar(#0, Instr.Immediate - 2 - Length(Ctx.StringRegs[Instr.Dest]));
+        end;
+      end
+      else if Instr.Immediate = -1 then
         Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
       else if Instr.Immediate >= 2 then
         Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
@@ -13475,7 +13783,14 @@ begin
         Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
     51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING,
         // Imm -1 a MANAGED STRING CELL ("String Ptr" - see RawStrCellSet).
-      if Instr.Immediate = -1 then
+      // ...and the write half of the same discrimination: a negative address is the MANAGED field
+      // itself, so the characters go into its slot rather than into bytes that do not exist.
+      if Ctx.IntRegs[Instr.Src1] < 0 then
+      begin
+        Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
+        Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
+      end
+      else if Instr.Immediate = -1 then
         RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
       else
         RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
@@ -14400,6 +14715,12 @@ var
   DrawMode: Integer;
   PalColor: UInt32;
   GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
+  // ⛔ A COLOUR DOES NOT FIT IN AN Integer. "Rgb(0, 255, 0)" is 4278255360 with its alpha byte set, and
+  // reading it into the 32-bit signed GetSx TRUNCATED it - silently in a release build (the bit pattern
+  // survives the later UInt32 cast, which is why nothing ever looked wrong) and as a range error in a
+  // debug one, where it made every graphics program undebuggable. Found 25 Aug 2026 by running the
+  // corpus under the debug build.
+  GfxColour: Int64;
   WinX1, WinY1, WinX2, WinY2, WinW, WinH: Integer;
   PMapVal: Double;                        // PMAP's answer before it is narrowed to a SINGLE
   JoyBtns, JoyDev, JoyLocal, JoyBtnIdx: Integer;
@@ -14811,11 +15132,14 @@ begin
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
               FGraphics.GetPixel(FGfxWorkSurface, GetX1 + GetSx, GetY1 + GetSy));
       end;
-    40: // bcGfxPut - PUT (x,y),src[,mode] : blit image src onto the work page (Immediate[0-15]=src handle
-        //  register, Immediate[16-31]=mode ordinal constant)
+    40: // bcGfxPut - PUT [img,] (x,y),src[,mode] : blit image src onto the DRAW SURFACE (Immediate[0-15]=
+        //  src handle register, Immediate[16-31]=mode ordinal constant)
+        // ⛔ It used to name FGfxWorkSurface outright, so "Put img,(x,y),src" evaluated its target, set
+        //  it, and blitted onto the screen anyway. DrawSurface is the same funnel PSET/LINE/CIRCLE/
+        //  PAINT/POINT read, and it is the work page whenever no target is active.
       if Assigned(FGraphics) then
         // Immediate [0-15]=src handle reg, [16-31]=mode ordinal, [32-47]=blend-value reg (-1 = none).
-        FGraphics.Blit(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.Blit(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                        Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
                        Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
@@ -15079,9 +15403,9 @@ begin
       begin
         GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src2]);
         GetY1 := GfxMapY(Ctx.IntRegs[Instr.Immediate and $FFFF]);
-        GetSx := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour
+        GfxColour := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour: 64-bit, see above
         FGraphics.DrawText(DrawSurface, GetX1, GetY1, Ctx.StringRegs[Instr.Src1],
-                           UInt32(GetSx), 0, False);
+                           UInt32(GfxColour and $FFFFFFFF), 0, False);
       end;
     58: // bcGfxPointCoord - POINTCOORD(n): the DRAW pen coordinate (Src1 selector: 0 = x, 1 = y).
       if Ctx.IntRegs[Instr.Src1] = 1 then
@@ -15132,18 +15456,18 @@ begin
       begin
         GetX1 := GfxMapX(Ctx.IntRegs[Instr.Src1]); GetY1 := GfxMapY(Ctx.IntRegs[Instr.Src2]);
         GetX2 := GfxMapX(Ctx.IntRegs[Instr.Dest]); GetY2 := GfxMapY(Ctx.IntRegs[(Instr.Immediate) and $FFFF]);
-        GetSx := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour
+        GfxColour := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];         // colour: 64-bit, see above
         GetSy := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF] and $FFFF;   // style mask (16-bit)
         if ((Instr.Immediate shr 48) and $3) = 1 then
         begin
           // B: styled box outline = four styled edges (pattern restarts on each edge).
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY1, UInt32(GetSx), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY1, GetX2, GetY2, UInt32(GetSx), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY2, GetX1, GetY2, UInt32(GetSx), Word(GetSy));
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX1, GetY1, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY1, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY1, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX2, GetY2, GetX1, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY2, GetX1, GetY1, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
         end
         else
-          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY2, UInt32(GetSx), Word(GetSy));
+          FGraphics.DrawLineStyled(DrawSurface, GetX1, GetY1, GetX2, GetY2, UInt32(GfxColour and $FFFFFFFF), Word(GetSy));
         FDrawPenX := Ctx.IntRegs[Instr.Dest]; FDrawPenY := Ctx.IntRegs[(Instr.Immediate) and $FFFF];
       end;
   else
@@ -16438,9 +16762,14 @@ begin
           FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
-          // Convert string to float and store in float register
+          // ⛔ THE SAME TEXT, READ BY TWO DIFFERENT PARSERS. VAL has known FreeBASIC's number
+          // grammar - the &H/&O/&B base prefixes, the saturating magnitude, the full 64 bits -
+          // since it was written, and INPUT# converted with the RTL's StrToFloatDef/StrToIntDef,
+          // which know none of it and follow the locale's decimal separator besides. So
+          // "&h1F" read back as 0 and 9223372036854775807 as -1, while VAL("&h1F") was 31.
+          // One grammar, one parser: file/large_int.bas alone reads 4116 numbers this way.
           if Instr.Dest >= 0 then
-            Ctx.FloatRegs[Instr.Dest] := StrToFloatDef(Trim(Data), 0.0);
+            Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(Trim(Data));
         end
         else
           raise Exception.Create('INPUT# command not supported: no handler assigned');
@@ -16458,9 +16787,26 @@ begin
           FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
-          // Convert string to integer and store in int register
+          // Same grammar as VAL - see the float arm above. StrToIntDef is a 32-BIT conversion
+          // (its result is a LongInt), so every value past 2^31 came back as the default 0 even
+          // when the register that holds it is 64 bits wide.
+          // Immediate carries the READ KIND the SSA worked out from the destination's declared type,
+          // the mirror of PRINT#'s: 1 = BOOLEAN. fbc reads the WORDS "true"/"false" (either case)
+          // there, and anything else through the numeric grammar with "non-zero" meaning true - so
+          // "1.7" is true and "abc" is false. Measured against fbc 1.10.1 for all nine forms.
           if Instr.Dest >= 0 then
-            Ctx.IntRegs[Instr.Dest] := StrToIntDef(Trim(Data), 0);
+          begin
+            if Instr.Immediate = 1 then
+            begin
+              Mode := UpperCase(Trim(Data));
+              if Mode = 'TRUE' then Ctx.IntRegs[Instr.Dest] := -1
+              else if Mode = 'FALSE' then Ctx.IntRegs[Instr.Dest] := 0
+              else if ParseLeadingFloat(Trim(Data)) <> 0.0 then Ctx.IntRegs[Instr.Dest] := -1
+              else Ctx.IntRegs[Instr.Dest] := 0;
+            end
+            else
+              Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Trim(Data), 64);
+          end;
         end
         else
           raise Exception.Create('INPUT# command not supported: no handler assigned');

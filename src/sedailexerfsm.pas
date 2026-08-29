@@ -113,6 +113,7 @@ type
     // onto the token it builds and clears it. The suffix is scanned before the token object exists, so the
     // mark cannot be written straight to the token.
     FPendingSingleSuffix: Boolean;
+    FPendingWideLiteral: Boolean;   // the escaped literal just expanded named a codepoint above 127
     FPendingUnsignedSuffix: Boolean;   // the 'U' of an integer literal's type suffix ("12u", "5UL")
 
     // Set while lexing an integer whose type suffix is '&' (Long, "3000000000&"). Long is a signed 32-bit
@@ -1315,6 +1316,7 @@ begin
   Result.KeywordInfo := KeywordInfo;
   Result.BasePrefixed := False;   // pooled object: clear it, or the previous token's "&H.." mark carries over
   Result.SingleSuffixed := False; // ditto for the "1.5f" mark (ProcessNumber sets it from FPendingSingleSuffix)
+  Result.WideLiteral := False;    // ...and for the wide-literal mark (the escaped-string scanner sets it)
   Result.UnsignedSuffixed := False;  // ...and for the "12u" mark
 
   Result.Line := ATokenLine;
@@ -1383,6 +1385,28 @@ begin
 
   // Full keyword lookup
   Match := ResolveKeyword(TokenText);
+
+  // ⭐ A TYPE SUFFIX ON A KEYWORD IS IGNORED, and the keyword stands. FreeBASIC says so in its own
+  // words - "warning 44: Suffix ignored in 'if$'" - and compiles "if$ 1 then ... end if" as an
+  // ordinary IF. Its quirk/keyword-suffix is exactly that program. The suffix character is part of the
+  // identifier here (it is a SpecialChar), so the lookup missed and the word came out a plain name.
+  // ⛔ Only when the SUFFIXED spelling is not a keyword in its own right: "LEFT$" and its family must
+  // keep resolving to themselves, so the retry runs only after the full lookup has failed.
+  if (not Match.Found) and (Length(TokenText) > 1) and
+     (TokenText[Length(TokenText)] in ['$', '%', '&', '!', '#']) then
+  begin
+    Match := ResolveKeyword(Copy(TokenText, 1, Length(TokenText) - 1));
+    if Match.Found then
+    begin
+      // Shorten the token's TEXT to the bare keyword - everything downstream compares on that text,
+      // and a keyword carrying a stray '$' would match nothing.
+      // ⛔ The suffix is CONSUMED, not handed back: giving the character to the input made it a token
+      // of its own and the parser met a lone '$' it had no statement for ("Unhandled node type 0" on
+      // stderr, on a program that otherwise ran). fbc's word for this is "Suffix IGNORED".
+      Dec(FTokenLength);
+      TokenText := Copy(TokenText, 1, Length(TokenText) - 1);
+    end;
+  end;
 
   if Match.Found then
   begin
@@ -1540,7 +1564,14 @@ begin
       'a'..'f': DigVal := Ord(Ch) - Ord('a') + 10;
     else        DigVal := 0;
     end;
+    {$PUSH}{$Q-}{$R-}
+    // ⛔ THE WRAP IS THE SEMANTICS. FreeBASIC lets a base literal fill all 64 bits - "&hFFFFFFFFFFFFFFFF"
+    // is a legal way to write -1 - so the accumulation overflows Int64 on purpose. A DEBUG build (-Co)
+    // stopped the LEXER on it, which killed the program before anything could be diagnosed.
+    // ⇒ A check that fires on an INTENTIONAL operation does not protect: it disables the tool. Same
+    //   family as the FNV-1a hashes; found the same way, by running the corpus under the debug build.
     Val := Val * Base + DigVal;
+    {$POP}
     TokenBufferAdd(Ch); AdvanceChar;
   end;
   ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: &hFFul, &b1010ULL, ... (dropped)
@@ -1566,8 +1597,9 @@ end;
 
 function TLexerFSM.ProcessEscapes(const Raw: string): string;
 // Expand the FreeBASIC escape sequences accepted inside an escaped string literal (!"...").
-// Recognised: \a \b \f \n \l \r \t \v \\ \" \' ; \DDD decimal (1-3 digits); \&hNN hex; \&oNNN octal;
-// \&bNNNNNNNN binary; \uNNNN unicode codepoint (1-4 hex digits, UTF-8 encoded). A produced NUL
+// Recognised: \a \b \f \n \l \r \t \v \\ \" \' ; \DDD decimal (1-3 digits); \xNN hex (1-2 digits);
+// \&hNN hex; \&oNNN octal; \&bNNNNNNNN binary; \uNNNN unicode codepoint (1-4 hex digits, UTF-8 encoded).
+// ⛔ Only \u names a CODEPOINT (and is UTF-8 encoded); every other numeric escape names one BYTE. A produced NUL
 // (\0 / \&h00 / ...) is the string terminator: only the bytes before it are kept (FB semantics).
 var
   i, n: Integer;
@@ -1582,6 +1614,12 @@ var
       'a'..'f': Result := Ord(ch) - Ord('a') + 10;
     else        Result := -1;
     end;
+  end;
+
+  procedure AppendByte(B: Integer);
+  // Append ONE raw byte. A numeric escape names a byte, not a codepoint - see EmitByte.
+  begin
+    Result := Result + Chr(B and $FF);
   end;
 
   procedure AppendCP(CP: Integer);
@@ -1610,12 +1648,33 @@ var
   end;
 
   // Emit a numeric escape result. Returns False when the value is NUL (truncate the string).
+  // ⛔ A NUMERIC escape names a BYTE, not a codepoint. "\128" is one byte 128 in fbc; encoded as UTF-8
+  // it became TWO (0xC2 0x80) and Len(!"\128\65\66") answered 4 where fbc answers 3. Only "\u" names a
+  // CODEPOINT and keeps the UTF-8 encoding - which is what AppendCP is for, and why the two are now
+  // separate calls instead of one.
   function EmitByte(Val: Integer): Boolean;
   begin
     if Val = 0 then
       Result := False
     else
     begin
+      AppendByte(Val);
+      Result := True;
+    end;
+  end;
+
+  function EmitCodepoint(Val: Integer): Boolean;
+  begin
+    if Val = 0 then
+      Result := False
+    else
+    begin
+      // ⭐ A "\uNNNN" ABOVE 127 IS WHAT MAKES THE LITERAL WIDE, and after expansion nothing says so:
+      // the value is UTF-8 bytes, indistinguishable from a byte string that happens to hold them. So
+      // the fact is remembered here and rides on the token. Without it "Left(!"\u3041\u3043", 2)"
+      // counted BYTES: one garbage codepoint instead of two, and fbc's own wstring/midstmt ucs2 test
+      // was built on exactly that shape.
+      if Val > 127 then FPendingWideLiteral := True;
       AppendCP(Val);
       Result := True;
     end;
@@ -1623,6 +1682,7 @@ var
 
 begin
   Result := '';
+  FPendingWideLiteral := False;
   i := 1;
   n := Length(Raw);
   while i <= n do
@@ -1669,6 +1729,24 @@ begin
             Val := Val * 16 + HexDigit(Raw[i]);
             Inc(i); Inc(Cnt);
           end;
+          if not EmitCodepoint(Val) then Exit;
+        end;
+      // FreeBASIC HEX escape "\xNN" - the spelling its own suite uses. It was not recognised at all, so
+      // "!\"\x41\"" came out as the three characters x, 4, 1.
+      'x', 'X':
+        begin
+          Inc(i);
+          Val := 0; Cnt := 0;
+          while (i <= n) and (Cnt < 2) and (HexDigit(Raw[i]) >= 0) do
+          begin
+            Val := Val * 16 + HexDigit(Raw[i]);
+            Inc(i); Inc(Cnt);
+          end;
+          if Cnt = 0 then
+          begin
+            Result := Result + c;          // "\x" with no digits: keep it literally
+            Continue;
+          end;
           if not EmitByte(Val) then Exit;
         end;
       '&':
@@ -1683,10 +1761,7 @@ begin
           else        Base := 0;
           end;
           if Base = 0 then
-          begin
-            Result := Result + '&';   // not a valid base prefix: keep literally
-            Continue;
-          end;
+            Continue;   // "\&" with no h/o/b prefix: fbc drops both characters (measured: !"\&101" is "101")
           Inc(i);
           Val := 0;
           while i <= n do
@@ -1748,8 +1823,10 @@ begin
     Ch := GetCurrentChar;
   end;
   if Ch = '"' then AdvanceChar;     // consume closing quote
+  FPendingWideLiteral := False;
   if DoEscape then Raw := ProcessEscapes(Raw);
   Result := CreateToken(ttStringLiteral);
+  Result.WideLiteral := FPendingWideLiteral;
   Result.SetExtractedValue(Raw);
 end;
 
@@ -2195,7 +2272,16 @@ begin
           if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
           // FreeBASIC pointer-to-member "->": lexes as the member-access operator (our UDT pointers
           // carry the record handle directly, so p->field is the same as p.field).
-          else if GetCurrentChar = '>' then begin AdvanceChar; Result := CreateToken(ttOpDot); end
+          // ⛔ ...BUT THE TWO SPELLINGS ARE NOT ALWAYS INTERCHANGEABLE, so the '>' is kept in the token's
+          // VALUE. Over a parenthesised deref CHAIN they mean different depths - "(**q)->a" is one level
+          // deeper than "(***q).a" - and the reader that rewrites that shape had no way to tell them
+          // apart. Nothing compares a ttOpDot's value for anything else (censused).
+          else if GetCurrentChar = '>' then
+          begin
+            TokenBufferAdd(GetCurrentChar);
+            AdvanceChar;
+            Result := CreateToken(ttOpDot);
+          end
           else Result := CreateToken(ttOpSub);
           {$IFDEF DEBUG}
           if FDebugMode then
