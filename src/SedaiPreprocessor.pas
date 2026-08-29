@@ -412,6 +412,37 @@ begin
       end;
       Result := Result + '#'; Inc(i); Continue;   // a lone '#' that is not a stringize
     end;
+    // ⛔⛔ A NUMERIC LITERAL IS ONE TOKEN, AND ITS EXPONENT IS NOT AN IDENTIFIER. The scan below starts
+    // an identifier at any letter, and after "1.1920929" the next character is an 'e' - so a macro
+    // whose parameter is named "e" had every float literal in its own body corrupted:
+    //     #macro m( a, e, u ) : Print 1.1920929e-7 : #endmacro
+    //     m( 1, 2, 3 )        ->  Print 1.19209292-7   ->  -5.80790708
+    // Not a parse error - a WRONG NUMBER, printed. It is fbcunit's own CU_ASSERT_SINGLE_APPROX and
+    // CU_ASSERT_DOUBLE_APPROX, whose parameters are (a, e, u) and whose bodies carry 1.1920929e-7 and
+    // 2.220446049250313e-16, so every test that used them read a nonsense tolerance - and fbc's
+    // udt-zstring/conversion and udt-wstring/conversion could not parse at all.
+    // ⚠️ Only a WELL-FORMED exponent is swallowed (e/E/d/D, an optional sign, then digits): "1e" with
+    // no digits after it is not one, and stays whatever it was. The type suffix ('!', '#') is left to
+    // the character path exactly as before.
+    if (Body[i] in ['0'..'9']) or
+       ((Body[i] = '.') and (i < Length(Body)) and (Body[i + 1] in ['0'..'9'])) then
+    begin
+      j := i;
+      while (j <= Length(Body)) and (Body[j] in ['0'..'9', '.']) do Inc(j);
+      if (j <= Length(Body)) and (Body[j] in ['e', 'E', 'd', 'D']) then
+      begin
+        k := j + 1;
+        if (k <= Length(Body)) and (Body[k] in ['+', '-']) then Inc(k);
+        if (k <= Length(Body)) and (Body[k] in ['0'..'9']) then
+        begin
+          while (k <= Length(Body)) and (Body[k] in ['0'..'9']) do Inc(k);
+          j := k;
+        end;
+      end;
+      Result := Result + Copy(Body, i, j - i);
+      i := j;
+      Continue;
+    end;
     if Body[i] in ['A'..'Z', 'a'..'z', '_'] then
     begin
       j := i;
