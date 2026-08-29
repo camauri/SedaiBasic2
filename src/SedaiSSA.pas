@@ -36479,11 +36479,29 @@ begin
     if (Result = '') and (ObjNode.ChildCount >= 2) and Assigned(ObjNode.Token) then
     begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0));
+      // ...and an ENUM operand does not report through ObjectTypeName (it is an int value), so its enum
+      // TYPE is tried as the owner too - the same order the emit path uses. "Operator +(a As thing,
+      // r As foo) As foo" lives under THING.OPERATOR+@2 (fbc's overload/implicit_ctor2).
+      if ParentType = '' then ParentType := EnumTypeOfOperand(ObjNode.GetChild(0));
       if ParentType = '' then ParentType := ObjectTypeName(ObjNode.GetChild(1));
       if ParentType <> '' then
       begin
         NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2));
         if NestedT <> '' then Result := VarRecordTypeName(NestedT);   // its UDT return type ('' if scalar)
+      end;
+      // ⛔ ...AND "scalar <op> UDT" IS OWNED BY THE SCALAR'S BUILTIN TYPE, which neither operand
+      // reports. "Operator *(n As Integer, r As foo) As foo" lives under INTEGER.OPERATOR*@2, so
+      // asking either operand's type finds nothing and the whole expression came out typeless: the
+      // EMIT path has had ResolveScalarLeftOperatorLabel for exactly this since it was written -
+      // "Dim As foo r = 2 * b" answered 314 - while "(2 * b).__" beside it answered 1, because THIS
+      // reader, which the member access asks first, gave up. Enum-left is the same shape
+      // (fbc's overload/implicit_ctor2 writes "one + b").
+      if (Result = '') and
+         ((ObjectTypeName(ObjNode.GetChild(1)) <> '') or (EnumTypeOfOperand(ObjNode.GetChild(1)) <> '')) then
+      begin
+        NestedT := ResolveScalarLeftOperatorLabel(ObjNode.GetChild(0),
+                     'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2));
+        if NestedT <> '' then Result := VarRecordTypeName(NestedT);
       end;
     end;
   end
