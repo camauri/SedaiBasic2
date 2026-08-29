@@ -521,6 +521,7 @@ type
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
     function OverloadNameForArity(const Name: string; Arity: Integer; const FPParams: string = ''): string;  // @name of an OVERLOAD set
+    function CondAsIntTruth(const V: TSSAValue): TSSAValue;   // a branchable 0/nonzero INT for any condition
     procedure StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);   // tell "@f" what signature its destination wants
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
@@ -14759,6 +14760,7 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
+      CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
       // WHILE: continue if condition TRUE, exit if FALSE
       // UNTIL: continue if condition FALSE, exit if TRUE
       if IsWhileLoop then
@@ -14867,6 +14869,7 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
+      CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
       // WHILE: loop back if condition TRUE, exit if FALSE
       // UNTIL: loop back if condition FALSE, exit if TRUE
       if IsWhileLoop then
@@ -15135,6 +15138,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.CondAsIntTruth(const V: TSSAValue): TSSAValue;
+// A condition the branch opcodes can read. ssaJumpIfZero/ssaJumpIfNotZero take an INT register and read
+// their operand's INDEX in the int bank - so handing them a FLOAT register makes them test whatever
+// integer register happens to carry that number.
+//
+// ⛔ AND THAT IS WHAT EVERY FLOAT CONDITION DID. "Dim As Double d = 5.0 : If d Then" took the ELSE
+// branch, and "While d" did not terminate at all - it read an int register that never changed. The
+// CONSTANT case was handled where the IF materialises it ("If 1.5 Then" is folded), which is exactly
+// what hid this: every literal condition worked and every computed one was wrong. fbc suite
+// expressions/shortcutops, where the operands are functions returning DOUBLE.
+// A STRING condition is left alone: fbc refuses one outright, and inventing a truth value for it here
+// would be answering a question nobody asked.
+var
+  Zero: TSSAValue;
+begin
+  Result := V;
+  if V.Kind <> svkRegister then Exit;
+  if V.RegType <> srtFloat then Exit;
+  Zero := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+  EmitInstruction(ssaLoadConstFloat, Zero, MakeSSAConstFloat(0.0),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeFloat, Result, V, Zero, MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessIfStatement(Node: TASTNode);
 var
   CondValue, CondRegVal: TSSAValue;
@@ -15163,6 +15191,7 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     CondValue := CondRegVal;
   end;
+  CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0", not an int register index
 
   // Generate unique labels
   ThenLabel := GenerateUniqueLabel('then');
