@@ -8545,6 +8545,18 @@ begin
     // FreeBASIC BYREF result: return the ADDRESS of the named (address-backed) variable, not its
     // value, so the caller can read or write through it. The returned variable must be address-backed
     // (a SHARED/global scalar or one whose address is taken); a local would dangle (v1: not enforced).
+    // ⭐ "Function = ByVal p" SAYS THE VALUE IS THE ADDRESS. The explicit-BYVAL spelling of a
+    // byref-return names what p POINTS AT, so nothing is taken - p already holds where the reference
+    // goes. It is the one spelling that lets a LOCAL pointer be returned byref, and taking @p instead
+    // would hand back the address of a slot that dies with the frame. Asked FIRST: p is an identifier
+    // and would otherwise fall into the branch below. fbc suite functions/return-byref, explicitByval.
+    if FCurrentProcByrefRet and
+       (UpperCase(ExprNode.Attributes.Values['ARGPASSMODE']) = 'BYVAL') then
+    begin
+      ProcessExpression(ExprNode, ExprValue);
+      EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue));
+      Exit;
+    end;
     if FCurrentProcByrefRet and (ExprNode.NodeType = antIdentifier) then
     begin
       // Returning an address-carrying BYREF param yields the address it already holds (a reference into
@@ -39170,7 +39182,14 @@ begin
           // FreeBASIC BYREF result: stage the ADDRESS of the returned variable. An address-carrying
           // BYREF param already holds the caller variable's address (min(a,b)=0); any other named var
           // returns its own backing address.
-          if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
+          // ...and "Return ByVal p" first of all: the value IS the address (see the "Function =" twin).
+          if FCurrentProcByrefRet and
+             (UpperCase(Node.GetChild(0).Attributes.Values['ARGPASSMODE']) = 'BYVAL') then
+          begin
+            ProcessExpression(Node.GetChild(0), RetVal);
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal));
+          end
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
              IsAddrParam(VarToStr(Node.GetChild(0).Value)) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(GetOrAllocateVariable(VarToStr(Node.GetChild(0).Value))))
           // ...and the same field named WITHOUT "This." - see the "f = expr" spelling, which has to

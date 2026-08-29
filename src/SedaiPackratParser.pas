@@ -117,6 +117,10 @@ type
     // still un-renamed. A second declaration of the same name means an overload set, and both get a
     // parameter-bank signature appended to their labels (see ParseProcedureDecl).
     FProcSeen: TStringList;
+    // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
+    // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
+    // check asks about the expression it is handed.
+    FByrefRetProcs: TStringList;
     // OOP: methods a TYPE body declared STATIC ("Declare Static Sub f(...)"), as "TYPE.METHOD" keys.
     // A static member procedure has NO implicit THIS, so its out-of-line definition ("Sub T.f(...)")
     // must not be given one -- otherwise every call passes its arguments one position too far right,
@@ -222,6 +226,7 @@ type
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
 
+    function ByrefRetKeyOf(const Nm: string): string;   // a procedure label without its overload/arity tail
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
                                WithTypeNames: Boolean = False;
                                PtrKinds: Boolean = False): string;   // CONSTRUCTORS only: see the body
@@ -621,6 +626,8 @@ begin
 
   FProcSeen := TStringList.Create;
   FProcSeen.CaseSensitive := False;
+  FByrefRetProcs := TStringList.Create;
+  FByrefRetProcs.CaseSensitive := False;
   FConstNames := TStringList.Create;
   FConstNames.CaseSensitive := False;
   FConstTypes := TStringList.Create;
@@ -657,6 +664,7 @@ begin
     FExpressionParser.Free;
 
   FProcSeen.Free;
+  FByrefRetProcs.Free;
   FConstNames.Free;
   FConstTypes.Free;
   FConstIntValues.Free;
@@ -677,6 +685,19 @@ begin
 end;
 
 function IsBuiltinTypeName(const N: string): Boolean; forward;
+
+function TPackratParser.ByrefRetKeyOf(const Nm: string): string;
+// The bare label of a procedure name: the overload tail ('~'), the constructor arity ('#') and the
+// operator arity ('@') are cut, so the name reads as the source writes it - which is the only
+// spelling a CALL SITE has to ask with.
+var
+  i: Integer;
+begin
+  Result := Nm;
+  for i := 1 to Length(Result) do
+    if (Result[i] = '~') or (Result[i] = '#') or (Result[i] = '@') then
+      Exit(Copy(Result, 1, i - 1));
+end;
 
 function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
                                           WithTypeNames: Boolean; PtrKinds: Boolean): string;
@@ -1003,6 +1024,7 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
   // ⛔⛔ ...AND THEIR FOLDED VALUES, which was the one registry of fifteen this reset had forgotten.
@@ -1097,6 +1119,7 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
   // ⛔⛔ ...AND THEIR FOLDED VALUES, which was the one registry of fifteen this reset had forgotten.
@@ -3580,6 +3603,11 @@ begin
      (UpperCase(Context.CurrentToken.Value) = kBYREF) and Assigned(NameNode) then
   begin
     Result.Attributes.Values['BYREFRET'] := '1';
+    // ⭐ ...and REMEMBERED BY NAME, because a CALL to it is the one call whose result is not a
+    // temporary. "Function f3() ByRef As Integer : Function = f2()" with f2 itself ByRef is a
+    // reference handed straight on, and fbc compiles it; refused without this, the whole file died
+    // at parse time (fbc suite functions/return-byref).
+    FByrefRetProcs.Add(ByrefRetKeyOf(UpperCase(VarToStr(NameNode.Value))));
     Context.Advance;                                // consume BYREF
   end;
 
@@ -10974,8 +11002,17 @@ var
   var Nm: string; IsCall: Boolean;
   begin
     if Expr = nil then Exit;
+    // ⭐ "Function = ByVal p" SAYS THE VALUE IS THE ADDRESS. The explicit-BYVAL spelling of a
+    // byref-return names what p POINTS AT, not p, so the lifetime of p itself is not the question -
+    // exactly as "*p" is not (see the antDeref note above, the same boundary drawn twice).
+    // fbc suite functions/return-byref, TEST_GROUP( explicitByval ).
+    if UpperCase(Expr.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then Exit;
     Nm := RootOfRef(Expr, IsCall);
     if Nm = '' then Exit;
+    // ⭐ ...UNLESS THE CALLEE ITSELF RETURNS A REFERENCE. Then the "result" is not a temporary at all -
+    // it is an address of storage that already outlives the callee's frame, and handing it on is what
+    // fbc compiles (functions/return-byref, "Function = f2()" with f2 ByRef).
+    if IsCall and (FByrefRetProcs.IndexOf(Nm) >= 0) then Exit;
     if IsCall then
       HandleError(Format('a BYREF function cannot return the result of %s: a call''s result is a ' +
         'temporary that dies with the call', [Nm]), Tok)
@@ -11034,6 +11071,17 @@ begin
         if (Prm <> nil) and (Prm.NodeType = antIdentifier) and
            (Prm.Attributes.Values['BYVAL'] = '1') then
           Locals.Add(UpperCase(VarToStr(Prm.Value)));
+        // ⛔⛔ A "ByVal As String" PARAMETER IS THE ONE EXEMPTION fbc HAS AND WE DO NOT, AND LIFTING
+        // THE REFUSAL ALONE WAS TRIED AND WITHDRAWN (29 Aug 2026). fbc passes a var-len string byval
+        // as its DESCRIPTOR, so the storage is the caller's and "Function = s" compiles there, while
+        // ByVal Integer/Double/UDT are all error 272 - the exemption is the TYPE, not the mode, and it
+        // was probed one at a time. But our BYREF return hands back an ADDRESS, and the address of a
+        // var-len string PARAMETER does not exist: "@s" of one is refused outright ("Undefined
+        // procedure (address-of @): S"), because MarkAddressTaken excludes STRING - its slot holds a
+        // MANAGED handle, not raw bytes. Accepting the declaration therefore turned the refusal into a
+        // null-pointer dereference at run time, which is the one outcome worse than refusing.
+        // ⇒ THE MISSING HALF IS "@" ON A VAR-LEN STRING PARAMETER. Close that first, on its own, and
+        // this exemption is four lines. fbc suite functions/temp-strings. DIVERGENZE 85.
       end;
     end;
     Walk(ProcNode);

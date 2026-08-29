@@ -239,6 +239,11 @@ difference is stated rather than left to be discovered.
   `#lang "fblite"` / `'$lang: "qb"` / `"deprecated"`, and there the default types and the sigils are
   legal again. `Var`, `As TypeOf(expr)` and `Const` are unaffected — each carries its type somewhere
   other than a type name.
+- ⚠️ **`f( x ) = v` where `f` is a `Function ... ByRef` assigns through the reference here.** fbc reads
+  that `=` as an EQUALITY operator and says so (`warning 34: '=' parsed as equality operator in function
+  argument, not assignment to BYREF function result`); the ambiguity only arises when the call carries
+  arguments, since `f() = v` assigns in both. We do not replicate the reading fbc itself flags as
+  ambiguous: a statement of the form `lvalue = value` is an assignment.
 - `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
   there. That is the point of an extension.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
