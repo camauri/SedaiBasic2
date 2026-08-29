@@ -39678,7 +39678,7 @@ procedure TSSAGenerator.LowerDeferredProcedures;
 var
   i, j, Slot, PUDT, OwnerUDT, WIdx: Integer;
   Proc, NameNode, ParamList, ParamNodeJ, BaseCallNode: TASTNode;
-  Name, LabelName, ParentType, CopyCtorLbl: string;
+  Name, LabelName, ParentType, CopyCtorLbl, BaseCtorLbl: string;
   RT: TSSARegisterType;
   ParamReg, LcHandle, RetZeroReg: TSSAValue;
   TrailingReturnLive: Boolean;
@@ -39862,7 +39862,25 @@ begin
               EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
             end
             else
+            begin
+              // ⛔ ...and with NO copy constructor, a type that EXTENDS one still runs the BASE's
+              // default constructor on the copy. That is what fbc's synthesised copy constructor does -
+              // construct the base sub-object, then copy the fields - and it is why fbc's
+              // structs/derived-param counts TWO constructor calls for one "d" passed byval where we
+              // counted one. ⚠️ Only the BASE: a FLAT type with a default constructor does NOT get it
+              // called on a byval copy (measured against the oracle both ways), so the walk starts at
+              // the parent. ResolveConstructorLabel already climbs from there to the nearest ancestor
+              // that declares one.
+              BaseCtorLbl := '';
+              if FUDTs[PUDT].Parent <> '' then
+                BaseCtorLbl := ResolveConstructorLabel(FUDTs[PUDT].Parent, '');
+              if BaseCtorLbl <> '' then
+              begin
+                EmitXferStore(srtInt, 0, LcHandle);                // THIS
+                EmitCallSubLabel(ProcedureLabelName(BaseCtorLbl));
+              end;
               EmitRecordCopy(LcHandle, ParamReg, PUDT);            // copy caller's record in
+            end;
             EmitInstruction(ssaCopyInt, ParamReg, LcHandle,        // param var := local copy handle
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             // V5d: this BYVAL copy is frame-owned -> destruct it at frame exit (after the locals).
