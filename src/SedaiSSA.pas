@@ -11942,6 +11942,31 @@ begin
       Continue;
     end;
 
+    // ⭐ A "REDIM x(...) AS T" INSIDE A PROCEDURE DECLARES A LOCAL WHEN T IS NOT THE ARRAY'S TYPE.
+    // fbc, probed one spelling at a time: "ReDim foo(...)" with no type and "ReDim foo(...) As Integer"
+    // both resize the module's Integer array (the VB and QB quirks the suite's own comments name), while
+    // "ReDim foo(0) As Double" declares a FRESH LOCAL and leaves the global alone - and "Dim" always
+    // declares, type or no type. Only the last of the four was wrong here: the module array was resized
+    // through, so a procedure that meant to make itself a scratch array destroyed the caller's
+    // (fbc suite namespace/redim-2).
+    // ⚠️ Judged on the BANK, which is what the array records. Two types of the SAME bank - "As LongInt"
+    // over an Integer array - still resize the global where fbc would declare a local: under-applying
+    // here keeps every case that worked working, and the element TYPE NAME lives only in the flat
+    // pre-scan registries this must not trust (see the ⚠️ on the shape registries in CLAUDE.md).
+    if FInProcedure and (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) and
+       (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) and
+       (FindUDT(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value))) < 0) and
+       (TypeNameToBank(UpperCase(VarToStr(ArrayDeclNode.GetChild(2).Value)), ArrName)
+          <> FProgram.GetArray(ArrayIdx).ElementType) then
+    begin
+      DimNode := TASTNode.Create(antDim, ArrayDeclNode.Token);
+      DimNode.AddChild(ArrayDeclNode.Clone);
+      DimNode.GetChild(0).Attributes.Values['FROMREDIM'] := '1';   // a ReDim's array is dynamic
+      ProcessDim(DimNode);
+      DimNode.Free;
+      Continue;
+    end;
+
     // Whatever a DIM said about this slot, a REDIM of it makes it dynamic from here on.
     if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
       NoteArrayShape(FProgram.GetArray(ArrayIdx).Name, True);
