@@ -2178,6 +2178,11 @@ So `defined(T)` is false above `Type T` and true below it, exactly as in fbc. A 
 symbol only from inside that type's own body; a qualified name (`T.field`, and the operator spellings
 `T.+=`, `T.[]`, `T.new[]`) is one name, answered from that type's declarations so far.
 
+🕳️ **A second known gap, measured 29 August 2026:** two `Namespace` bodies that declare a type with
+the SAME simple name collide — the namespace is not part of the type's identity, so both destructors
+are filed under one label and *neither* runs (fbc runs both). Different type names in the two
+namespaces work. Reproduction and what it needs in `job/markdown/DIVERGENZE.md`.
+
 🕳️ **A known gap beside it, measured 29 August 2026:** inside a `Namespace` body, FreeBASIC lets
 **147** more of its own keywords name a procedure than we do (`Sub print()` is a duplicate definition
 at module level and legitimate inside a namespace, where it is called as `N.print`). We reserve
