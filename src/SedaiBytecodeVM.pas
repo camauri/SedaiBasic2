@@ -15132,11 +15132,14 @@ begin
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
               FGraphics.GetPixel(FGfxWorkSurface, GetX1 + GetSx, GetY1 + GetSy));
       end;
-    40: // bcGfxPut - PUT (x,y),src[,mode] : blit image src onto the work page (Immediate[0-15]=src handle
-        //  register, Immediate[16-31]=mode ordinal constant)
+    40: // bcGfxPut - PUT [img,] (x,y),src[,mode] : blit image src onto the DRAW SURFACE (Immediate[0-15]=
+        //  src handle register, Immediate[16-31]=mode ordinal constant)
+        // ⛔ It used to name FGfxWorkSurface outright, so "Put img,(x,y),src" evaluated its target, set
+        //  it, and blitted onto the screen anyway. DrawSurface is the same funnel PSET/LINE/CIRCLE/
+        //  PAINT/POINT read, and it is the work page whenever no target is active.
       if Assigned(FGraphics) then
         // Immediate [0-15]=src handle reg, [16-31]=mode ordinal, [32-47]=blend-value reg (-1 = none).
-        FGraphics.Blit(FGfxWorkSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
+        FGraphics.Blit(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                        Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
                        Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate

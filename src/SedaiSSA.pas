@@ -16196,8 +16196,9 @@ var
   XV, YV, SV, VV, XR, YR, SR, VR: TSSAValue;
   Instr: TSSAInstruction;
   Mode: Int64;
+  HasTarget: Boolean;
 begin
-  if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
+  if (FCurrentBlock = nil) or (EffChildCount(Node) < 3) then Exit;
   Mode := StrToIntDef(Node.Attributes.Values['MODE'], 5);
   // CUSTOM is not a blend FORMULA, it is a user FUNCTION called once per pixel - so it cannot be a mode
   // ordinal handed to the backend, which knows nothing of the interpreter. It is lowered here instead,
@@ -16205,18 +16206,21 @@ begin
   // target, POINT on the work page, an indirect call, PSET). That keeps the whole thing inside the VM's
   // own dispatch: no callback from the graphics runtime back into the interpreter, which is the one
   // mechanism this design does not have.
-  if (Mode = 7) and (Node.ChildCount >= 4) then
+  if (Mode = 7) and (EffChildCount(Node) >= 4) then
   begin
     ProcessGfxPutCustom(Node);
     Exit;
   end;
+  // "Put img, (x,y), src": the blit lands on the IMAGE, not the work page. Same pair PSET/LINE/
+  // CIRCLE/PAINT already use, so the target rides on ssaGfxSetTarget with nothing new to lower.
+  HasTarget := EmitDrawTargetBegin(Node);
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
   ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
   if Mode = 7 then Mode := 0;                   // CUSTOM without a function: PSET, as the backend does
   // The 0..255 blend value ALPHA and ADD take. ⭐ -1 means "the statement named none", which is NOT the
   // same as 255: ALPHA reads it as "use the image's own per-pixel alpha", a different formula.
-  if (Node.Attributes.Values['HASVALUE'] = '1') and (Node.ChildCount >= 4) then
+  if (Node.Attributes.Values['HASVALUE'] = '1') and (EffChildCount(Node) >= 4) then
   begin
     ProcessExpression(Node.GetChild(3), VV);
     VR := EnsureIntRegister(VV);
@@ -16227,6 +16231,7 @@ begin
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(MakeSSAConstInt(Mode), nil);
   Instr.AddPhiSource(VR, nil);                  // PhiSources[1] = the blend-value REGISTER
+  if HasTarget then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessImageConvertRow(Node: TASTNode);

@@ -1331,8 +1331,19 @@ begin
   // "min(A, B) = 0" assigns through a ByRef result, and "myproc arg" calls the user's procedure.
   // The declaration site already accepts these names (see IsShadowableExtensionName); a statement
   // that begins with one has to as well, or the program parses its own function and then cannot
-  // call it. Nothing is lost: the extensions are FUNCTIONS, so none of them ever begins a statement.
+  // call it.
+  // ⛔ "None of them ever begins a statement" — the claim this rule used to carry — is FALSE for
+  // BSAVE, and the discriminator is not the token type but WHOSE word it is. Thirty-eight of the
+  // thirty-nine are OUR extensions, words fbc has never heard of, so a program that writes one at
+  // statement start can only mean its own procedure. BSAVE is fbc's OWN gfx statement, and reading it
+  // as a name lost the statement outright: "bsave(""foo.bmp"", 0)" became an array access and failed
+  // with "Array not declared: BSAVE" (fbc suite gfx/bsave-nullptr-fb, and its -lang qb twin).
+  // ⭐ It stays in the list all the same, because the DECLARATION door is where the name has to be
+  // free: fbc refuses "Dim bsave As Integer" ("Duplicated definition") but accepts
+  // "Function bsave Alias ""fb_GfxBsave""" (its own warnings/rtl-prototypes.bas overloads it twice).
+  // So: open where a NAME is expected, shut where a STATEMENT is.
   if FModernMode and (Token.TokenType <> ttIdentifier) and
+     (UpperCase(Token.Value) <> kBSAVE) and
      IsShadowableExtensionName(UpperCase(Token.Value)) then
     Token.TokenType := ttIdentifier;
 
@@ -1808,10 +1819,11 @@ begin
         else if FModernMode and (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttIdentifier, ttNumber, ttInteger]) then
           Result := ParseSeekStatement
-        // FreeBASIC graphics "PUT (x,y), src [, mode]" — PUT is a bare identifier; the leading '('
-        // (vs '#') selects the graphics blit form.
+        // FreeBASIC graphics "PUT [img,] (x,y), src [, mode]" — PUT is a bare identifier; the leading
+        // '(' (vs '#') selects the graphics blit form, and so does the image-target form
+        // "PUT img, (x,y), src", which LINE/CIRCLE/PAINT/PSET have taken since the target work.
         else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
-                (Context.PeekNext.TokenType = ttDelimParOpen) then
+                ((Context.PeekNext.TokenType = ttDelimParOpen) or LooksLikeImageTarget) then
           Result := ParseGfxPutStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
         else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
@@ -7682,6 +7694,8 @@ var
   C64CommaPos: Integer;
   AccessRead: Boolean;
   ClosedParen: Boolean;   // "Close(fileNum)": the FreeBASIC parenthesised handle
+  WrapParen: Boolean;     // "Bsave(name, src)": the whole ARGUMENT LIST in parentheses
+  WrapK, WrapDepth: Integer;
 begin
   Token := Context.CurrentToken;
   CmdName := UpperCase(Token.Value);
@@ -8226,9 +8240,47 @@ begin
     Exit;
   end;
 
+  // ⭐ FreeBASIC writes a statement whose implementation is an RTL PROCEDURE in the call shape too:
+  // "Bsave(""foo.bmp"", 0)" is the same statement as "Bsave ""foo.bmp"", 0" (fbc suite
+  // gfx/bsave-nullptr-fb, and the -lang qb twin beside it). Without this the '(' opened an ordinary
+  // parenthesised EXPRESSION and the first comma ended it: "Expected "")"" after expression".
+  // ⛔ The parenthesis is only a WRAPPER when its match closes the statement. "Bsave (a), b" passes a
+  // parenthesised first argument and is not this form at all, so the match is walked out before
+  // anything is consumed. MODERN only: Commodore BASIC has no such spelling.
+  WrapParen := False;
+  if FModernMode and Context.Check(ttDelimParOpen) then
+  begin
+    WrapDepth := 0;
+    WrapK := 0;
+    while Assigned(Context.PeekToken(WrapK)) do
+    begin
+      if Context.PeekToken(WrapK).TokenType = ttDelimParOpen then Inc(WrapDepth)
+      else if Context.PeekToken(WrapK).TokenType = ttDelimParClose then
+      begin
+        Dec(WrapDepth);
+        if WrapDepth = 0 then Break;
+      end
+      else if Context.PeekToken(WrapK).TokenType in [ttEndOfLine, ttEndOfFile] then Break;
+      Inc(WrapK);
+    end;
+    if (WrapDepth = 0) and Assigned(Context.PeekToken(WrapK + 1)) and
+       (Context.PeekToken(WrapK + 1).TokenType in
+          [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    begin
+      WrapParen := True;
+      Context.Advance;                                   // the wrapping '('
+    end;
+  end;
+
   // Parse ALL parameters until end of statement (for other file commands)
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
+    if WrapParen and Context.Check(ttDelimParClose) then
+    begin
+      Context.Advance;                                   // the wrapping ')'
+      Break;
+    end;
+
     // Skip commas
     if Context.Check(ttSeparParam) then
     begin
@@ -8245,6 +8297,11 @@ begin
     // Handle comma separator
     if Context.Check(ttSeparParam) then
       Context.Advance
+    else if WrapParen and Context.Check(ttDelimParClose) then
+    begin
+      Context.Advance;                                   // the wrapping ')'
+      Break;
+    end
     else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Break;
   end;
@@ -8611,10 +8668,24 @@ var
   Tok: TLexerToken;
   ModeStr: string;
   ModeOrd: Integer;
+  TargetNode: TASTNode;
 begin
   Tok := Context.CurrentToken;
   Result := TASTNode.Create(antGfxPut, Tok);
   Context.Advance;                                            // PUT
+  // FreeBASIC image draw target: "Put img, (x,y), src" — the surface the blit lands ON, before the
+  // coordinate. Same convention as PSET/LINE/CIRCLE/PAINT/DRAW STRING: appended LAST so no existing
+  // child index moves, with its position in TARGETIDX, which is all EmitDrawTargetBegin needs.
+  // ⛔ Until now PUT was the ONE draw statement of the family without it, so "Put img.buffer, (0,0), b"
+  // was never dispatched here at all and died inside the first coordinate ("Expected ')' after
+  // expression"): the rule the other five had, and this one did not (fbc suite
+  // quirk/gfx_propertiesasbuffers).
+  TargetNode := nil;
+  if (not Context.Check(ttDelimParOpen)) and (UpperCase(VarToStr(Context.CurrentToken.Value)) <> kSTEP) then
+  begin
+    TargetNode := ParseExpression;                            // image handle
+    if Context.Check(ttSeparParam) then Context.Advance;      // ','
+  end;
   if Context.Check(ttDelimParOpen) then Context.Advance;      // '('
   Result.AddChild(ParseExpression);                           // x
   if Context.Check(ttSeparParam) then Context.Advance;        // ','
@@ -8673,6 +8744,11 @@ begin
     end;
   end;
   Result.Attributes.Values['MODE'] := IntToStr(ModeOrd);
+  if Assigned(TargetNode) then   // image draw target appended last (TARGETIDX = its child index)
+  begin
+    Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+    Result.AddChild(TargetNode);
+  end;
   DoNodeCreated(Result);
 end;
 
