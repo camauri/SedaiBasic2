@@ -25969,7 +25969,12 @@ begin
     EmitInstruction(ssaShr, Shifted, Result, OfsReg, MakeSSAValue(svkNone));
     Result := Shifted;
   end;
-  Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
+  // ⛔ A 64-BIT-WIDE FIELD HAS NO SHIFT THAT BUILDS ITS MASK. "1 shl 64" on a 64-bit word shifts by
+  // 64 mod 64 = 0, so the mask came out 1-1 = 0 and every read and write of a ":64" member answered 0
+  // - fbc's own structs/bitfield-types declares one for LONGINT and one for ULONGINT and asserts
+  // &hFFFFFFFFFFFFFFFF for both. The full-width case is spelled out instead of computed.
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth >= 64 then Mask := -1
+  else Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
   MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -25988,7 +25993,12 @@ begin
   Result := NewVal;
   if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
-  Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
+  // ⛔ A 64-BIT-WIDE FIELD HAS NO SHIFT THAT BUILDS ITS MASK. "1 shl 64" on a 64-bit word shifts by
+  // 64 mod 64 = 0, so the mask came out 1-1 = 0 and every read and write of a ":64" member answered 0
+  // - fbc's own structs/bitfield-types declares one for LONGINT and one for ULONGINT and asserts
+  // &hFFFFFFFFFFFFFFFF for both. The full-width case is spelled out instead of computed.
+  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth >= 64 then Mask := -1
+  else Mask := (Int64(1) shl FUDTs[UDTIdx].Fields[FieldIdx].BitWidth) - 1;
   MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt(Mask), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Vm := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -28844,6 +28854,22 @@ begin
         Continue;
       end;
       ProcessExpression(FUDTs[UDTIdx].Fields[i].DefaultExpr, DefVal);
+      // ⛔ A BIT FIELD'S DEFAULT IS A READ-MODIFY-WRITE, like every other write to one. A run of bit
+      // fields SHARES one storage unit, and each member's Slot names that unit - so storing the value
+      // straight into it wrote over the whole run: "f1:8 = 11, f2:8 = 22, f3:8 = 33, f4:8 = 44" left
+      // f1 = 44 and the rest 0, the last default having overwritten the three before it. The ordinary
+      // ASSIGNMENT path has masked and shifted since bit fields were written (EmitBitFieldInsert);
+      // this one, which runs at construction, never asked. fbc's own structs/ctor_bitfield.
+      if FUDTs[UDTIdx].Fields[i].BitWidth > 0 then
+      begin
+        NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
+                        MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+        DefVal := EmitBitFieldInsert(NestedHandle, DefVal, UDTIdx, i);
+        EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
+                        EnsureIntRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+        Continue;
+      end;
       case FUDTs[UDTIdx].Fields[i].Bank of
         srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal,
                      EnsureFloatRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
