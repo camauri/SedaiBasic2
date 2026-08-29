@@ -4577,16 +4577,39 @@ procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAcce
 var
   DecoU, MethName, MethKey, Key: string;
   DecoCount: Integer;   // how many of ABSTRACT/STATIC/VIRTUAL/leading-CONST this declaration carries
+  LeadingConst: Boolean;   // "Declare Const [Virtual|Abstract] Sub f()": the CONST that leads them
   IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
 begin
   IsAbstract := ForceAbstract;   // MODERN: every method of an INTERFACE is abstract by construction
   DecoCount := 0;
+  LeadingConst := False;
   IsStatic := False;
   IsVirtual := False;
   IsOverride := False;
   IsFinal := False;
+  // ⛔ A LEADING CONST IS A DECORATOR THAT DOES NOT REACH THE LOOP. CONST is a RESERVED WORD, so it is
+  // not a ttIdentifier and the loop's own condition stops in front of it - and the only place that
+  // consumed it asked for the procedure keyword IMMEDIATELY after. So "Declare Const Virtual Function
+  // f()" - fbc's own virtual/virtual.bas writes eleven of them - left the cursor on CONST, the name was
+  // never read, and the member was declared and REGISTERED NOWHERE. Nothing said so at the DECLARATION;
+  // it surfaced 300 lines later as "type A never declares F04" on the DEFINITION, a refusal of a
+  // program fbc compiles. Consumed here, before the loop, so the decorator run that follows is read as
+  // usual. What CONST MEANS on a method is a promise about THIS, which this VM does not enforce.
+  if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') and Assigned(Context.PeekNext) and
+     ((Context.PeekNext.TokenType = ttProcedureStart) or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'VIRTUAL') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ABSTRACT') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'STATIC') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'OVERRIDE') or
+      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'FINAL')) then
+  begin
+    LeadingConst := True;
+    Inc(DecoCount);
+    Context.Advance;                                  // CONST
+  end;
+
   // Decorators sit between DECLARE and the SUB/FUNCTION/... keyword and arrive as plain identifiers.
   // ⛔ ...EXCEPT STATIC, WHICH IS A RESERVED WORD AND SO NOT AN IDENTIFIER. The loop's own test kept it
   // out, so "Declare Static Sub m( )" recorded nothing and FTypeStaticMethods stayed EMPTY - which
@@ -4605,9 +4628,18 @@ begin
     if (DecoU = 'ABSTRACT') or (DecoU = 'STATIC') or (DecoU = 'VIRTUAL') or (DecoU = 'CONST') then
     begin
       Inc(DecoCount);
-      if FModernMode and (DecoCount > 1) then
+      // ⛔ THE PAIR RULE IS NOT "AT MOST ONE" - the oracle was asked for the whole matrix and it says
+      // otherwise. A LEADING CONST may be followed by exactly one of VIRTUAL or ABSTRACT ("Declare
+      // Const Virtual Sub g()" and "Declare Const Abstract Sub g()" both compile); everything else is
+      // fbc's "error 17": the reverse order (virtual const, abstract const, static const), const with
+      // STATIC in either order, virtual+abstract, and three of them together. Written as "at most one"
+      // this counted a legal pair as an error - and, worse, the legal pair never even got here,
+      // because the leading CONST was not consumed at all.
+      if FModernMode and (DecoCount > 1) and
+         not (LeadingConst and (DecoCount = 2) and ((DecoU = 'VIRTUAL') or (DecoU = 'ABSTRACT'))) then
         HandleError(Format('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and ' +
-          'a leading CONST, and this one also says "%s"', [DecoU]), Context.CurrentToken);
+          'a leading CONST (a leading CONST may lead VIRTUAL or ABSTRACT), and this one also says ' +
+          '"%s"', [DecoU]), Context.CurrentToken);
     end;
     if DecoU = 'ABSTRACT' then IsAbstract := True
     else if DecoU = 'STATIC' then IsStatic := True
@@ -4622,21 +4654,20 @@ begin
     else if DecoU <> 'CONST' then Break;
     Context.Advance;
   end;
-  // ⛔ ...AND THE LEADING CONST DOES NOT REACH THE LOOP AT ALL: CONST is a RESERVED WORD, so it is not
-  // a ttIdentifier and the loop's own condition stops in front of it. The pair is therefore judged
-  // here, where the decorator run has ended and the word is still ahead - which is also why the
-  // "<> 'CONST'" arm above never fires. "Declare Const Sub f()" ALONE stays legal (fbc compiles it);
-  // it is only const BESIDE another decorator that is the syntax error.
+  // ⛔ A TRAILING CONST - one that comes AFTER a decorator - is fbc's "error 17" in every order
+  // measured ("virtual const", "abstract const", "static const"). A CONST qualifier belongs after the
+  // parameter list; a second one here is a syntax error, not a redundancy. The word is still ahead at
+  // this point, the decorator run having ended, which is why the "<> 'CONST'" arm in the loop above
+  // never fires.
   if FModernMode and (DecoCount >= 1) and
      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') then
     HandleError('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and a leading ' +
       'CONST, and this one also says "CONST"', Context.CurrentToken);
-  // ⭐ ...and once judged, the leading CONST must be CONSUMED, or the name behind it is never read.
-  // "Declare Const Sub c()" left MethName empty, so the member was declared and REGISTERED NOWHERE -
-  // which showed only when something finally asked whether the type declares it.
-  if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') and Assigned(Context.PeekNext) and
-     (Context.PeekNext.TokenType = ttProcedureStart) then
-    Context.Advance;
+  // ⛔ ...and CONST beside STATIC is refused in BOTH orders. A static method has no THIS for a CONST to
+  // promise anything about, and fbc says error 17 for "Declare Const Static Sub g()" exactly as it does
+  // for the reverse.
+  if FModernMode and LeadingConst and IsStatic then
+    HandleError('a STATIC method has no THIS, so it cannot also be CONST', Context.CurrentToken);
   MethName := '';
   if Context.Check(ttProcedureStart) then
   begin
