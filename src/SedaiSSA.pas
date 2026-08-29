@@ -10747,7 +10747,13 @@ begin
     // handle in the variable; a builtin type needs no allocation (type already recorded).
     if DimsNode.NodeType = antIdentifier then
     begin
-      RecTypeName := UpperCase(VarToStr(DimsNode.Value));
+      // ⛔ THE TYPE, NOT ITS SPELLING - the same rule the module-level backing needed. Every question
+      // below is about what this declaration IS (a UDT? a string? which raw width?), and a TYPE alias
+      // answers none of them under its own name: an @-taken local declared "Dim q As p" where
+      // "Type p As UDT Ptr" got a raw slot sized from an unknown type, and reading a second level over
+      // it faulted. FindUDT resolved the alias on its own, which is why the UDT arm worked and the
+      // rest did not.
+      RecTypeName := CanonicalType(UpperCase(VarToStr(DimsNode.Value)));
       // ⭐ FILE THIS DECLARATION'S BACKING UNDER THE BLOCK THAT MADE IT, beside the bare-name entry.
       // The @-taken marking is retroactive BY NAME (see MarkAddressTaken), so two sibling Scopes each
       // declaring "a" both carry a mark and both read the SAME bare entry - and the first one's plain
@@ -24659,11 +24665,18 @@ end;
 
 function TSSAGenerator.CanonicalType(const TypeName: string): string;
 // Resolve a FreeBASIC "TYPE alias AS underlying" chain to its base type name. A non-alias name is
-// returned unchanged (UPPER). Guarded against accidental alias cycles. PTR-suffixed names are not
-// aliased here (handle types are resolved at their own call sites).
+// returned unchanged (UPPER). Guarded against accidental alias cycles.
+//
+// ⛔ AND A "X PTR" WHOSE X IS ITSELF AN ALIAS IS ONE OF THOSE CHAINS. It used to be left alone with
+// the note "PTR-suffixed names are resolved at their own call sites", and the call sites resolve the
+// WHOLE name: "Type p As UDT Ptr : Type q As p Ptr" stored q -> "P PTR", which matches nothing, so
+// "Dim r As q : (*r)->z" stripped one PTR, got "P" - a name with no PTR in it - and read the FIRST
+// field of the UDT instead of the named one. A wrong answer, silently: 1 where fbc says 3.
+// The stars are counted off, the BASE is resolved, and they go back on - so "P PTR" becomes
+// "UDT PTR PTR" and the depth is preserved whichever spelling the program used.
 var
-  T, Next: string;
-  Guard, Idx: Integer;
+  T, Next, Base: string;
+  Guard, Idx, Stars: Integer;
 begin
   T := UpperCase(TypeName);
   if FTypeAliases.Count = 0 then Exit(T);
@@ -24676,6 +24689,28 @@ begin
     if (Next = '') or (Next = T) then Break;
     T := Next;
     Inc(Guard);
+  end;
+  if Guard >= 32 then Exit(T);
+  // Take the PTR suffixes off, resolve what is under them, put them back.
+  Stars := 0;
+  Base := T;
+  while (Length(Base) > 4) and (Copy(Base, Length(Base) - 3, 4) = ' PTR') do
+  begin
+    Base := Trim(Copy(Base, 1, Length(Base) - 4));
+    Inc(Stars);
+  end;
+  // ⛔ ...EXCEPT A FUNCTION-POINTER ALIAS, WHOSE UNDERLYING NAME IS A LIE. "Type As Function(...) As
+  // Integer f" is registered as an alias of INTEGER - that is only its STORAGE - with the real
+  // signature kept beside it in FFuncPtrTypes. Resolving "F PTR" to "INTEGER PTR" therefore threw the
+  // signature away, and "Dim As f Ptr pf : (*pf)(123)" stopped being an indirect call: 55 instead of
+  // 369 (guard m487). A name FFuncPtrTypes knows keeps its own spelling, which is what every call
+  // site looks it up by.
+  if (Stars > 0) and (FTypeAliases.IndexOfName(Base) >= 0) and
+     (FFuncPtrTypes.IndexOfName(Base) < 0) then
+  begin
+    Base := CanonicalType(Base);
+    while Stars > 0 do begin Base := Base + ' PTR'; Dec(Stars); end;
+    Exit(Base);
   end;
   Result := T;
 end;
@@ -30060,7 +30095,14 @@ begin
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
         // stores its (int) record handle — the record itself is allocated in the shared region at DIM.
-        TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ⛔ ...AND THE BANK IS DECIDED BY THE TYPE, NOT BY ITS SPELLING. TypeNameToBank answers FLOAT
+        // for a name it does not know, and a TYPE ALIAS is such a name - so "Type p As UDT Ptr :
+        // Dim q As p" got a FLOAT backing array while every read and write of q used the INT bank.
+        // The two storages then disagreed: "@q" addressed the float cell and the value sat in the
+        // integer one, so "*(@q)" was not q (EAccessViolation on the fbc suite's typedef/pointers,
+        // and the identical program spelled "Dim q As UDT Ptr" was right). FindUDT on the line below
+        // already resolved the alias on its own, which is what made the UDT case work and this one not.
+        TypeNameU := CanonicalType(UpperCase(VarToStr(Decl.GetChild(1).Value)));
         if FSharedScalarArr.IndexOf(VNameU) < 0 then
         begin
           if FindUDT(TypeNameU) >= 0 then
@@ -31198,7 +31240,7 @@ var
   i, k: Integer;
   Decl: TASTNode;
   ProcDict: TStringList;
-  VNameU, VTypeU: string;
+  VNameU, VTypeU, VTypeC: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antDim then
@@ -31210,6 +31252,16 @@ begin
       begin
         VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
         VTypeU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        // ⛔ EVERY QUESTION BELOW IS ABOUT THE TYPE, NOT ABOUT ITS SPELLING. FindUDT resolves a TYPE
+        // alias on its own; the BANK question did not, and TypeNameToBank answers FLOAT for a name it
+        // does not know [see InferExprBank's own note]. So "Type p As UDT Ptr : Dim q As p = @x" made q
+        // a float-bank scalar, a pointer taking its @ looked like genuine type-punning, and q got a RAW
+        // byte slot where the same declaration spelled "Dim q As UDT Ptr" gets a managed SHARED cell.
+        // Reading through the second level then dereferenced a raw address as a handle:
+        // EAccessViolation, on a program fbc runs (fbc suite typedef/pointers).
+        // ⚠️ The canonical name answers the QUESTIONS; the declared spelling is what goes on RECORD,
+        // because LEN reads it back and the rewrite is what loses it.
+        VTypeC := CanonicalType(VTypeU);
         // Only builtin scalars need backing: a UDT variable is already a stable record handle, so @obj
         // just reads that handle (the backing machinery would wrongly turn the UDT into a 1-element array).
         if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) then
@@ -31217,7 +31269,7 @@ begin
           if InProc then
           begin
             Decl.Attributes.Values['ADDRLOCAL'] := '1';   // per-frame RAW byte slot (recursion-safe, bit-punnable)
-            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
           end
           // A fixed-length ZSTRING/WSTRING is a CHARACTER BUFFER: taking its address means "give me the
           // bytes", which only a raw slot can honour. It never looked type-punned - a pointer to it is
@@ -31232,15 +31284,15 @@ begin
           // the moment its address was taken. Two machineries, one taught: extending the OTHER one is
           // the piece of work, and it is a model change (padding lives on the managed path), not a
           // name added to a list. Costs 291 assertions of the fbc suite; see DIVERGENZE.md.
-          else if ((VTypeU = 'ZSTRING') or (VTypeU = 'WSTRING')) and
+          else if ((VTypeC = 'ZSTRING') or (VTypeC = 'WSTRING')) and
                   (StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0) > 0) then
           begin
             Decl.Attributes.Values['RAWMODULE'] := '1';
             if FRawModuleScalars.IndexOfName(VNameU) < 0 then
-              FRawModuleScalars.Add(VNameU + '=' + VTypeU);
+              FRawModuleScalars.Add(VNameU + '=' + VTypeC);
           end
-          else if (VTypeU <> 'STRING') and
-                  ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeU, VNameU)) then
+          else if (VTypeC <> 'STRING') and
+                  ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeC, VNameU)) then
           begin
             // TYPE-PUNNED module-level @-taken scalar (a DIFFERENT-bank pointer takes its @): a RAW byte slot
             // whose address lives in a shared int array, so @/deref are bit-exact just like the local case
@@ -31252,15 +31304,15 @@ begin
             // array makes it cross-procedure visible, exactly what DIM SHARED needs (a same-bank DIM SHARED
             // stays array-backed with the M6 slot below).
             Decl.Attributes.Values['RAWMODULE'] := '1';
-            if FRawModuleScalars.IndexOfName(VNameU) < 0 then FRawModuleScalars.Add(VNameU + '=' + VTypeU);
-            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+            if FRawModuleScalars.IndexOfName(VNameU) < 0 then FRawModuleScalars.Add(VNameU + '=' + VTypeC);
+            if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
           end
           else
           begin
             Decl.Attributes.Values['SHARED'] := '1';      // module STRING / DIM SHARED / same-bank @: shared array
             // Keep the declared type: the rewrite is what loses it, and LEN needs it back.
             if FAddrSharedScalars.IndexOfName(VNameU) < 0 then
-              FAddrSharedScalars.Add(VNameU + '=' + VTypeU);
+              FAddrSharedScalars.Add(VNameU + '=' + VTypeC);
           end;
         end;
       end;
@@ -31293,6 +31345,7 @@ begin
             begin
               VNameU := UpperCase(VarToStr(Decl.Value));
               VTypeU := UpperCase(VarToStr(Decl.GetChild(0).Value));
+              VTypeC := CanonicalType(VTypeU);      // a parameter is declared through a TYPE alias too
               // Only a @-taken builtin SCALAR param (not a UDT, not a STRING -- raw bytes only).
               // ⛔ A "T PTR" PARAMETER USED TO BE EXCLUDED HERE, and that one clause is the whole reason
               // "@p" of "ByVal p As Integer Ptr" died with "Undefined procedure (address-of @): P". The
@@ -31303,11 +31356,11 @@ begin
               // in the MARKING, not in @. It cost every "@" of a pointer parameter, BYVAL and BYREF
               // alike, which is why it read as a defect of the BYREF protocol and is not one.
               // STRING stays out: its slot holds a MANAGED handle, not bytes (see the prologue's note).
-              if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
-                 (VTypeU <> 'STRING') then
+              if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeC) < 0) and
+                 (VTypeC <> 'STRING') then
               begin
                 Decl.Attributes.Values['ADDRPARAM'] := '1';
-                if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeU);
+                if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
               end;
             end;
           end;
