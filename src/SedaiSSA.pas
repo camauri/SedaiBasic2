@@ -10883,6 +10883,7 @@ var
   ArrElemTypeName: string; // declared "AS <type>" element type for an array (empty if none)
   RecPacked: Int64;        // M3.1: packed slot counts for bcRecordNewArray
   InitAssign: TASTNode;    // M4.4e: synthesized assignment for a "DIM v AS T = expr" initializer
+  InitSrc: TASTNode;       // one argument being MOVED out of a "Type<T>( args )" initializer
   UdtInitArrAccess, UdtInitIdxList: TASTNode;   // synthesized "arr(k) = elem" for an array-of-UDT init
   InitElemNode, TupleCtor, TupleArgs: TASTNode; // an array-of-UDT init element (a T(..) temporary or a bare tuple)
   m: Integer;
@@ -11329,6 +11330,39 @@ begin
         // is allocate-or-reuse. Forcing the int bank keeps the binding correct even if the same name is
         // DIM'd with a different type in another scope (the global type table is first-declaration-wins).
         CheckInstantiable(FUDTs[RecUDTIdx].Name);     // OOP: an unimplemented ABSTRACT refuses here
+        // ⛔ "Dim v As T = Type<T>( args )" IS THE CONSTRUCTOR FORM, and only its OTHER spelling said so.
+        // The parser normalises "Dim v As T = T( args )" into the argument-list shape below, and leaves
+        // "Type<T>( args )" as a temporary - so that one default-constructed v FIRST and then built the
+        // temporary: one constructor call too many on every such declaration ("cC" where fbc writes
+        // "C"), and a constructor with a side effect ran twice. Normalised HERE, into the one shape the
+        // working path already takes, rather than teaching a second path the same rule
+        // ([[a-whitelist-of-shapes-cannot-be-finished]]).
+        // ⚠️ Only when the temporary names THIS type: "Dim v As U = Type<T>( ... )" is a conversion.
+        if (ArrayDeclNode.ChildCount >= 3) and IsTypeCtorTemporary(ArrayDeclNode.GetChild(2)) and
+           (ArrayDeclNode.GetChild(2).ChildCount >= 2) and
+           (ArrayDeclNode.GetChild(2).GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+           (UpperCase(VarToStr(ArrayDeclNode.GetChild(2).GetChild(0).Value)) = UpperCase(RecTypeName)) then
+        begin
+          CtorArgs := TASTNode.Create(antArgumentList, ArrayDeclNode.GetChild(2).Token);
+          InitAssign := ArrayDeclNode.GetChild(2).GetChild(1);
+          while InitAssign.ChildCount > 0 do
+          begin
+            InitSrc := InitAssign.GetChild(0);
+            InitAssign.Children.Extract(InitSrc);     // detach WITHOUT freeing: it moves, it does not die
+            CtorArgs.AddChild(InitSrc);
+          end;
+          ArrayDeclNode.GetChild(2).ClearChildren;    // frees the type name node and the emptied list
+          ArrayDeclNode.GetChild(2).NodeType := antArgumentList;
+          ArrayDeclNode.GetChild(2).Attributes.Values['TYPECTOR'] := '';
+          while CtorArgs.ChildCount > 0 do
+          begin
+            InitSrc := CtorArgs.GetChild(0);
+            CtorArgs.Children.Extract(InitSrc);
+            ArrayDeclNode.GetChild(2).AddChild(InitSrc);
+          end;
+          CtorArgs.Free;
+          CtorArgs := nil;
+        end;
         RecHandleVal := DeclareVariableTyped(UpperCase(ArrName), srtInt);
         // ⛔⛔ ...AND THE TYPE, not only the bank. The comment above named the hazard - "the global type
         // table is first-declaration-wins" - and only the BANK was protected from it. The type table is
