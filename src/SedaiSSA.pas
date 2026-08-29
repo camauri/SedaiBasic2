@@ -493,6 +493,8 @@ type
     // OOP virtual dispatch (M4.3)
     function ImplementsInterface(const U, T: string): Boolean;             // MODERN: U names T in IMPLEMENTS
     function IsStrictSubtypeOf(const U, T: string): Boolean;                // the EXTENDS chain alone
+    function SubtypeDistance(const U, T: string): Integer;   // steps up the EXTENDS chain, -1 if U is not a T
+    function TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;  // ...summed over a type tail
     function IsSubtypeOf(const U, T: string): Boolean;
     function MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
     procedure GenerateDispatchers;
@@ -26649,6 +26651,56 @@ begin
   end;
 end;
 
+function TSSAGenerator.SubtypeDistance(const U, T: string): Integer;
+// How many EXTENDS steps separate U from T: 0 when they are the same type, n when T is the n-th
+// ancestor of U, and -1 when U is not a T at all. The mirror of IsStrictSubtypeOf, which answers the
+// same question without the DISTANCE - and the distance is the whole point when two ancestors both fit.
+var
+  cur, tu: string;
+  idx, guard: Integer;
+begin
+  Result := -1;
+  cur := UpperCase(U); tu := UpperCase(T);
+  guard := 0;
+  while (cur <> '') and (guard < 64) do
+  begin
+    if cur = tu then Exit(guard);
+    idx := FindUDT(cur);
+    if idx < 0 then Break;
+    cur := FUDTs[idx].Parent;
+    Inc(guard);
+  end;
+end;
+
+function TSSAGenerator.TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;
+// The total number of EXTENDS steps needed to read a call's type tail as a declaration's, or -1 when
+// no reading exists. A '-' on EITHER side is "unknown" and costs nothing, exactly as the wildcard
+// comparison treats it; every other position must be the same type or a DESCENDANT of the declared one.
+var
+  C, D: TStringList;
+  i, d1: Integer;
+begin
+  Result := -1;
+  C := TStringList.Create;
+  D := TStringList.Create;
+  try
+    C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := CallTail;
+    D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
+    if C.Count <> D.Count then Exit;
+    Result := 0;
+    for i := 0 to C.Count - 1 do
+    begin
+      if (C[i] = '-') or (D[i] = '-') then Continue;
+      if C[i] = D[i] then Continue;
+      d1 := SubtypeDistance(C[i], D[i]);
+      if d1 < 0 then Exit(-1);
+      Inc(Result, d1);
+    end;
+  finally
+    C.Free; D.Free;
+  end;
+end;
+
 function TSSAGenerator.SigWidthPart(const Sig: string): string;
 // The WIDTH tail of a label's signature - what follows '%' - or '' when the label carries none. The
 // mirror of SigBankPart, and it exists so the arity fallback can compare tails it cannot match exactly.
@@ -26820,6 +26872,31 @@ begin
   begin
     Result := BaseLabel + '~' + Sig + ':' + UdtSig;
     if FProcDecls.ContainsKey(Result) then Exit;
+  end;
+  // ⭐ A UDT ARGUMENT WITH NO EXACT OVERLOAD TAKES THE NEAREST BASE. With "B Extends A" and
+  // "C Extends B", a call "f(xc)" against declarations "f(As A)" and "f(As B)" is fbc's B - the
+  // CLOSEST ancestor, not the first declaration. Nothing here asked the EXTENDS chain: the tail "C"
+  // matched no label, the wildcard pass below matched none either (the declarations NAME their types,
+  // so no position is '-'), and the call fell to the arity fallback - which handed a UDT argument to
+  // "f(As Integer)", the first member of the set. fbc suite overload/derived.
+  // ⛔ THE WINNER MUST BE STRICTLY NEAREST. A tie is an ambiguity, and an ambiguity is left to the
+  // passes that follow, which is exactly what they were doing before this existed - so a set where
+  // two candidates fit equally well resolves as it always did.
+  if UdtSig <> '' then
+  begin
+    Pref := BaseLabel + '~';
+    Cand := ''; BestExtra := MaxInt; OkDef := False;    // OkDef: the best distance is shared -> ambiguous
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+        if SigBankPart(Tail) <> Sig then Continue;
+        Extra := TypeTailUpcastDistance(UdtSig, SigNamePart(Tail));
+        if Extra < 0 then Continue;
+        if Extra < BestExtra then begin BestExtra := Extra; Cand := FProcedureNames[k]; OkDef := False; end
+        else if Extra = BestExtra then OkDef := True;
+      end;
+    if (Cand <> '') and (not OkDef) then Exit(Cand);
   end;
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
