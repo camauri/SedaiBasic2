@@ -573,6 +573,7 @@ type
     function TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
     function SigWidthPart(const Sig: string): string;   // ...and the WIDTH tail after '%'            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
+    function RecordTypeOfAddrOfObject(Node: TASTNode): string;  // "(@X)" as the OBJECT of a member access -> X's UDT, else ''
     function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
     function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
@@ -36172,6 +36173,31 @@ begin
   end;
 end;
 
+function TSSAGenerator.RecordTypeOfAddrOfObject(Node: TASTNode): string;
+// "(@X)->f" IS "X.f". In the managed model the ADDRESS of a record is its HANDLE - the same value - so
+// an address-of cancels against the arrow exactly as it cancels against a "*" (DerefOfAddrOfTarget,
+// DIVERGENZE 48). fbc's own expressions/addrof-anon writes it over an ANONYMOUS temporary,
+// "(@Type<PodUdt>(111, 222))->a", where there is no name for any rung to key on: the field read
+// answered 0 for a POD and 1 for one with a constructor, in silence.
+// ⛔ TWO NODE SHAPES CARRY THE OPERAND, and only one of them is a CHILD: "@u" of a NAMED variable is an
+// antProcAddress whose VALUE is the name and which has no child at all; only an EXPRESSION operand
+// arrives as a child. Matching the child alone fixed the temporary and left the named one answering 1.
+// ⛔⛔ ASKED HERE AND NOT INSIDE ObjectTypeName, which was the first attempt and cost two tests: that
+// question has other readers, and to them the type of "@u" is a POINTER, not the record. Answering the
+// record there sent structs/udt-ops-2 and -3 from wrong-by-13-assertions to an ACCESS VIOLATION - named
+// by diffing the CUERR sets of the two binaries, not by reading the code. The cancellation belongs to
+// the ONE place that is resolving the object of a member access.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node = nil) or (Node.NodeType <> antProcAddress) then Exit;
+  if (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) then
+    Result := ObjectTypeName(Node.GetChild(0))
+  else
+    Result := VarRecordTypeName(VarToStr(Node.Value));
+end;
+
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
 // The UDT type name of an object expression, without emitting any code. Empty if not a record.
 var
@@ -36965,6 +36991,26 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐ "(@X)->f" IS "X.f". In the managed model the ADDRESS of a record is its HANDLE - the same value
+  // - so an address-of cancels against the arrow exactly as it cancels against a "*"
+  // (DerefOfAddrOfTarget, DIVERGENZE 48). fbc's own expressions/addrof-anon writes it over an anonymous
+  // temporary, "(@Type<PodUdt>(111, 222))->a", and there is no name in it for any rung to key on: the
+  // field read answered 0 for a POD and 1 for one with a constructor, in silence.
+  // ⚠️ Only when the operand really is a RECORD: "@i" of an Integer is an address and nothing here.
+  // ⛔ TWO NODE SHAPES CARRY THE OPERAND, and only one of them is a CHILD - see the note at the twin
+  // in ObjectTypeName. "@u" of a NAMED variable keeps the name in its VALUE and has no child.
+  if ObjNode.NodeType = antProcAddress then
+  begin
+    if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) and
+       (ObjectTypeName(ObjNode.GetChild(0)) <> '') then
+      ObjNode := ObjNode.GetChild(0)
+    else if (ObjNode.ChildCount = 0) and (VarRecordTypeName(VarToStr(ObjNode.Value)) <> '') then
+    begin
+      TypeName := VarRecordTypeName(VarToStr(ObjNode.Value));
+      HandleVal := RecordHandleOfVar(VarToStr(ObjNode.Value));
+      Exit(True);
+    end;
+  end;
   // ...and "(*@u)" is u - the same cancellation the expression path makes, asked here because a record
   // BASE does not go through it: "(*@u).a" answered 1 while "*@i" of an Integer was already right.
   CancelObj := DerefOfAddrOfTarget(ObjNode);
@@ -37462,7 +37508,8 @@ begin
   end;
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
   if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
-  TypeName := ObjectTypeName(Node.GetChild(0));
+  TypeName := RecordTypeOfAddrOfObject(Node.GetChild(0));   // "(@X)->f" is "X.f"
+  if TypeName = '' then TypeName := ObjectTypeName(Node.GetChild(0));
   // ...and an ENUM member named through the TYPE ITSELF ("T.member"), not through an instance. The
   // object is a type NAME, so ObjectTypeName answers '' and the instance branch below never sees it.
   if (TypeName = '') and (Node.GetChild(0).NodeType = antIdentifier) and
