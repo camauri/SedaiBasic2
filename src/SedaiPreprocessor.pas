@@ -1617,6 +1617,90 @@ begin
   end;
 end;
 
+function SourceConstStr(const Nm: string; out S: string): Boolean;
+// The STRING value of a "Const name = ..." the source declares, for the #if evaluator.
+//
+// ⛔ WHY IT IS NOT PART OF SourceConstValue. That one answers an Int64 and takes only a plain integer
+// literal - anything else it deliberately declines. So a STRING const resolved to the undefined-name
+// default, 0, and "#if A = ""abc""" with "Const A = ""abc""" above it was FALSE: fbc answers TRUE, and
+// its own string/case asserts four of them. The literal-against-literal form worked all along, which is
+// what said the gap was in the NAME and not in the comparison.
+//
+// ⭐ Two folds are recognised beside a bare literal, because fbc's test writes them into the CONST
+// itself: LCase("...") and UCase("..."). Both are pure text on a literal, and refusing to fold them
+// would leave the const unknown - the very thing this exists to stop.
+//
+// The scan reads the RAW line, not the upper-cased one the integer scanner walks: a string VALUE keeps
+// its case, and folding an already-upper-cased literal would answer "ABC" for every one of them.
+var
+  L: TStringList;
+  i, p, q: Integer;
+  Raw, U, W, Rest, RestU, Lit: string;
+
+  function TakeQuoted(const T: string; out Val: string): Boolean;
+  var k: Integer;
+  begin
+    Result := False; Val := '';
+    if (T = '') or (T[1] <> '"') then Exit;
+    k := 2;
+    while k <= Length(T) do
+    begin
+      if T[k] = '"' then
+      begin
+        if (k < Length(T)) and (T[k + 1] = '"') then begin Val := Val + '"'; Inc(k, 2); Continue; end;
+        Exit(True);                                  // closing quote
+      end;
+      Val := Val + T[k]; Inc(k);
+    end;
+  end;
+
+begin
+  Result := False; S := '';
+  if Nm = '' then Exit;
+  L := TStringList.Create;
+  try
+    L.Text := GPPSourceForDefined;
+    for i := 0 to L.Count - 1 do
+    begin
+      Raw := Trim(L[i]);
+      U := UpperCase(Raw);
+      p := 1;
+      while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
+      W := Copy(U, 1, p - 1);
+      if W <> 'CONST' then Continue;
+      Raw := Trim(Copy(Raw, p, MaxInt));
+      RestU := UpperCase(Raw);
+      // "Const AS <type> name = v" names the type first; step over it.
+      if Copy(RestU, 1, 3) = 'AS ' then
+      begin
+        Raw := Trim(Copy(Raw, 4, MaxInt));
+        q := 1;
+        while (q <= Length(Raw)) and IsIdentChar(Raw[q]) do Inc(q);
+        Raw := Trim(Copy(Raw, q, MaxInt));
+      end;
+      q := 1;
+      while (q <= Length(Raw)) and IsIdentChar(Raw[q]) do Inc(q);
+      if UpperCase(Trim(Copy(Raw, 1, q - 1))) <> Nm then Continue;
+      Rest := Trim(Copy(Raw, q, MaxInt));
+      if (Rest = '') or (Rest[1] <> '=') then Continue;
+      Rest := Trim(Copy(Rest, 2, MaxInt));
+      if TakeQuoted(Rest, S) then Exit(True);
+      RestU := UpperCase(Rest);
+      if (Copy(RestU, 1, 6) = 'LCASE(') or (Copy(RestU, 1, 6) = 'UCASE(') then
+      begin
+        Lit := Trim(Copy(Rest, 7, MaxInt));
+        if TakeQuoted(Lit, S) then
+        begin
+          if Copy(RestU, 1, 6) = 'LCASE(' then S := LowerCase(S) else S := UpperCase(S);
+          Exit(True);
+        end;
+      end;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
 function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean; forward;
 
 function SourceDeclaresSymbol(const Nm: string): Boolean;
@@ -1941,7 +2025,7 @@ var
   // re-tokenized (depth-guarded) rather than added as one token, so values like "-1" (-> '-' '1'),
   // "&HFF", or "1 + 2" parse correctly and nested macros expand.
   procedure Tokenize(const S: string; Depth: Integer);
-  var p, q: Integer; id, two: string; nm: string; ConstV: Int64;
+  var p, q: Integer; id, two: string; nm: string; ConstV: Int64; ConstS: string;
   begin
     p := 1;
     while p <= Length(S) do
@@ -2078,6 +2162,9 @@ var
         // ⭐ ...unless the SOURCE declares it as a Const with an integer value. See SourceConstValue.
         else if SourceConstValue(id, ConstV) then
           Toks.Add(IntToStr(ConstV))
+        // ...or with a STRING one, which that function declines by design. See SourceConstStr.
+        else if SourceConstStr(id, ConstS) then
+          Toks.Add(cPPStrTok + ConstS)
         else
           Toks.Add('0');                       // undefined identifier -> 0
         Continue;
