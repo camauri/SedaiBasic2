@@ -4163,6 +4163,55 @@ function TPackratParser.ParseDottedName: string;
 // must be on the first identifier. Segments after a '.' may be reserved words (member names).
 var
   BaseU: string;
+
+  // FreeBASIC EXPLICIT-WIDTH integer: "Integer<8>" / "UInteger<16>" name the same types BYTE..LONGINT
+  // by their bit count. Read at the central type-name reader, for the same reason UNSIGNED is: every
+  // declaration form asks this one question. Left unread, the '<' looked like a comparison and
+  // "Dim As Integer<8> b" failed as "Expected variable name".
+  // ⛔ ...AND "UNSIGNED INTEGER" IS THE SAME TYPE UNDER ANOTHER SPELLING. The UNSIGNED modifier is read
+  // in its own branch above and RETURNED from there, so the width suffix was never reached: fbc's own
+  // numbers/integer_n.bas writes both "UInteger<n>" and "unsigned integer<n>" for the same type, and
+  // only the first was read - the second left "<8>" in the stream and died on "Expected ")" after array
+  // indices". One funnel now, called from both spellings.
+  function ApplyWidthSuffix(var AName: string): Boolean;
+  var
+    Bits: string;
+  begin
+    Result := False;
+    if not (((AName = 'INTEGER') or (AName = 'UINTEGER')) and Context.Check(ttOpLt) and
+            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger])) then
+      Exit;
+    Context.Advance;                                 // '<'
+    Bits := VarToStr(Context.CurrentToken.Value);
+    Context.Advance;                                 // the bit count
+    // ⛔ THE CLOSER CAN BE HALF OF ANOTHER TOKEN. "Const MAX As Integer<8>= 5" - fbc's own spelling in
+    // numbers/integer_n.bas - lexes the last three characters as ">=", so the '>' never arrives and a
+    // tolerant test silently left the whole ">=" in the stream; the declaration then died on
+    // "Expected "=" after CONST type", a message about the '=' that WAS there. The token is split in
+    // place: its '>' half is consumed here by retyping it into the bare '=' the declaration wants.
+    if Context.Check(ttOpGe) then
+    begin
+      Context.CurrentToken.TokenType := ttOpEq;
+      Context.CurrentToken.Value := '=';
+    end
+    else if Context.Check(ttOpGt) then Context.Advance;   // '>'
+    if AName = 'INTEGER' then
+      case StrToIntDef(Bits, 0) of
+         8: AName := 'BYTE';
+        16: AName := 'SHORT';
+        32: AName := 'LONG';
+        64: AName := 'LONGINT';
+      end
+    else
+      case StrToIntDef(Bits, 0) of
+         8: AName := 'UBYTE';
+        16: AName := 'USHORT';
+        32: AName := 'ULONG';
+        64: AName := 'ULONGINT';
+      end;
+    Result := True;
+  end;
+
 begin
   // ⛔ A TYPE NAME MAY BEGIN WITH DOTS. "Dim v As ..r.foo.t1" is FreeBASIC for "resolve r from the
   // GLOBAL scope": the dots are part of the type-name SPELLING, not an operator, and the same program
@@ -4199,38 +4248,13 @@ begin
     end
     else
       Result := 'UINTEGER';                          // bare UNSIGNED = UNSIGNED INTEGER
+    ApplyWidthSuffix(Result);                        // "unsigned integer<16>"
     Exit;
   end;
 
   Result := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // first segment
-  // FreeBASIC EXPLICIT-WIDTH integer: "Integer<8>" / "UInteger<16>" name the same types BYTE..LONGINT
-  // by their bit count. Read here, at the central type-name reader, for the same reason UNSIGNED is:
-  // every declaration form asks this one question. Left unread, the '<' looked like a comparison and
-  // "Dim As Integer<8> b" failed as "Expected variable name".
-  if ((Result = 'INTEGER') or (Result = 'UINTEGER')) and Context.Check(ttOpLt) and
-     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
-  begin
-    Context.Advance;                                 // '<'
-    BaseU := VarToStr(Context.CurrentToken.Value);
-    Context.Advance;                                 // the bit count
-    if Context.Check(ttOpGt) then Context.Advance;   // '>'
-    if Result = 'INTEGER' then
-      case StrToIntDef(BaseU, 0) of
-         8: Result := 'BYTE';
-        16: Result := 'SHORT';
-        32: Result := 'LONG';
-        64: Result := 'LONGINT';
-      end
-    else
-      case StrToIntDef(BaseU, 0) of
-         8: Result := 'UBYTE';
-        16: Result := 'USHORT';
-        32: Result := 'ULONG';
-        64: Result := 'ULONGINT';
-      end;
-    Exit;
-  end;
+  if ApplyWidthSuffix(Result) then Exit;
   while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
         (Length(VarToStr(Context.PeekNext.Value)) > 0) and
         (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
@@ -12099,6 +12123,16 @@ begin
       IsByref := True;
       Context.Advance;
     end;
+    // ⭐ ...and the SAME door, for a MODERN extension used as a DECLARED name, has to open HERE - not
+    // only inside ParseArrayDeclaration. This test is what picks scalar from array, and it asks for an
+    // identifier: with the token still typed as our intrinsic, "Dim Min As Integer" fell past the
+    // scalar branch into the array one, where the door does exist - and died on "Expected "(" after
+    // array name", a message about a declaration nobody wrote. The leading-AS spelling ("Dim As
+    // Integer Min") reached its own name check with the same untouched token.
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
+
     // Leading-AS array declaration: "DIM [SHARED] AS type name(dims)". Route to ParseArrayDeclaration
     // (which handles the dimension list, including "lo TO hi" ranges and negative lower bounds) and
     // inject the shared type when no explicit "AS type" follows the array.
@@ -12644,6 +12678,9 @@ begin
       DeclIsByref := True;
       Context.Advance;
     end;
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after VAR', Context.CurrentToken);
@@ -12940,6 +12977,9 @@ begin
     Exit;
   end;
   repeat
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected a variable name after STATIC', Context.CurrentToken);
@@ -13846,6 +13886,9 @@ begin
             Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;
+  if FModernMode and (not Context.Check(ttIdentifier)) and
+     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
       HandleError('Expected constant name after CONST AS type', Context.CurrentToken);

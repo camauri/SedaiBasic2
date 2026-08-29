@@ -756,6 +756,7 @@ begin
 end;
 
 function FoldSizedIntegerTypeName(const S: string): string; forward;
+function FoldUnsignedTypeName(const S: string): string; forward;
 function IsFBScalarTypeName(const N: string): Boolean; forward;
 
 function TExpressionParser.ParseExpressionList(Delimiter: TTokenType = ttSeparParam): TASTNode;
@@ -945,6 +946,7 @@ function TExpressionParser.ParseIdentifier(Token: TLexerToken): TASTNode;
 var
   IdentName: string;
   FnName: string;
+  UnsName: string;   // "Unsigned <base>" folded to its one-word type name, '' when it is not that
   Args: TASTNode;
   NameNode: TASTNode;
 begin
@@ -959,6 +961,49 @@ begin
   end;
 
   IdentName := UpperCase(Token.Value);
+
+  // ⛔ ...AND "UNSIGNED <base>" IS A TYPE NAME IN EXPRESSION POSITION TOO. ParseDottedName has folded
+  // it for every DECLARATION since it was written ("Dim As Unsigned Integer x" is fine); no reader in
+  // expression position ever did, so the two words stayed two juxtaposed identifiers. SizeOf and Len
+  // failed to parse outright - and CAST was worse: "Cast(Unsigned Integer, -1)" PARSED and answered
+  // -1 where fbc answers 18446744073709551615, a wrong number with no diagnostic. Folded here, every
+  // reader downstream sees the plain type name it already knows, the width suffix included.
+  // ⚠️ Only when a BASE TYPE actually follows. UNSIGNED is not reserved in fbc, so a bare "unsigned"
+  // is left alone to be whatever the program declared it to be.
+  if IdentName = 'UNSIGNED' then
+  begin
+    UnsName := '';
+    if Context.Check(ttIdentifier) then
+      case UpperCase(VarToStr(Context.CurrentToken.Value)) of
+        'INTEGER':  UnsName := 'UINTEGER';
+        'BYTE':     UnsName := 'UBYTE';
+        'SHORT':    UnsName := 'USHORT';
+        'LONG':     UnsName := 'ULONG';
+        'LONGINT':  UnsName := 'ULONGINT';
+        'UINTEGER', 'UBYTE', 'USHORT', 'ULONG', 'ULONGINT':
+                    UnsName := UpperCase(VarToStr(Context.CurrentToken.Value));
+      end;
+    if UnsName <> '' then
+    begin
+      Context.Advance;                               // the base type
+      // ...and the width suffix rides on it: "unsigned integer<16>" is USHORT, exactly as UInteger<16> is.
+      if (UnsName = 'UINTEGER') and Context.Check(ttOpLt) and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+      begin
+        FnName := UnsName + '<' + VarToStr(Context.PeekNext.Value) + '>';
+        if FoldSizedIntegerTypeName(FnName) <> FnName then
+        begin
+          UnsName := FoldSizedIntegerTypeName(FnName);
+          Context.Advance;                           // '<'
+          Context.Advance;                           // the bit count
+          if Context.Check(ttOpGt) then Context.Advance;   // '>'
+        end;
+      end;
+      Result := TASTNode.CreateWithValue(antIdentifier, UnsName, Token);
+      DoNodeCreated(Result);
+      Exit;
+    end;
+  end;
 
   // "Integer<8>" in EXPRESSION position - SizeOf(Integer<8>), Type<Integer<8>>. Fold the three tokens
   // into the ordinary type name of that width, so every reader downstream sees a plain type identifier.
@@ -1342,7 +1387,14 @@ begin
     begin
       Context.Advance;                              // '<'
       Context.Advance;                              // the width
-      if Context.Check(ttOpGt) then Context.Advance;   // '>'
+      // The closer can be the '>' half of a ">=" - see the same split at the type-name reader in
+      // SedaiPackratParser (ParseTypeName's explicit-width branch).
+      if Context.Check(ttOpGe) then
+      begin
+        Context.CurrentToken.TokenType := ttOpEq;
+        Context.CurrentToken.Value := '=';
+      end
+      else if Context.Check(ttOpGt) then Context.Advance;   // '>'
       Result.Value := SizedName;
     end;
   end;
@@ -2921,6 +2973,36 @@ begin
   DoNodeCreated(Result);
 end;
 
+function FoldUnsignedTypeName(const S: string): string;
+// FreeBASIC's "UNSIGNED <base>" modifier collapsed to the one-word type name. ParseDottedName reads it
+// token-by-token for every DECLARATION; a reader that gathers a type as a STRING of tokens - CAST and
+// CPTR are the only ones - got "UNSIGNED INTEGER", which names nothing downstream, so the cast was a
+// no-op: "Cast(Unsigned Integer, -1)" answered -1 where fbc answers 18446744073709551615. A wrong
+// number with no diagnostic, which is why it survived. Anything that is not the modifier is returned
+// untouched, so a user type whose name merely starts with those letters is safe.
+var
+  Rest, BaseU: string;
+  P: Integer;
+begin
+  Result := S;
+  if UpperCase(Copy(Trim(S), 1, 9)) <> 'UNSIGNED ' then Exit;
+  Rest := Trim(Copy(Trim(S), 10, MaxInt));
+  P := Pos(' ', Rest);
+  if P > 0 then begin BaseU := UpperCase(Copy(Rest, 1, P - 1)); Rest := Trim(Copy(Rest, P + 1, MaxInt)); end
+  else begin BaseU := UpperCase(Rest); Rest := ''; end;
+  case BaseU of
+    'INTEGER':  BaseU := 'UINTEGER';
+    'BYTE':     BaseU := 'UBYTE';
+    'SHORT':    BaseU := 'USHORT';
+    'LONG':     BaseU := 'ULONG';
+    'LONGINT':  BaseU := 'ULONGINT';
+    'UINTEGER', 'UBYTE', 'USHORT', 'ULONG', 'ULONGINT': ;   // already unsigned: keep it
+  else
+    Exit;                                       // not the modifier - leave the name exactly as written
+  end;
+  if Rest <> '' then Result := BaseU + ' ' + Rest else Result := BaseU;
+end;
+
 function FoldSizedIntegerTypeName(const S: string): string;
 // FreeBASIC's EXPLICIT-WIDTH integer names, "Integer<8>" / "UInteger<16>", collapsed to the ordinary type
 // name of that width. The parser's type readers gather a type as a run of tokens, so the angle brackets
@@ -3057,6 +3139,7 @@ begin
   // question asked was "who ELSE reads a type name" instead of "does this test pass now". CAST spells
   // its type the same way and shares this loop; DIM, PARAMETER and type<> are the other three.
   while (TypeStr <> '') and (TypeStr[1] = '.') do Delete(TypeStr, 1, 1);
+  TypeStr := FoldUnsignedTypeName(TypeStr);       // "UNSIGNED INTEGER" -> "UINTEGER"
   TypeStr := FoldSizedIntegerTypeName(TypeStr);   // "INTEGER < 8 >" -> "BYTE"
   if not Context.Match(ttSeparParam) then
   begin
