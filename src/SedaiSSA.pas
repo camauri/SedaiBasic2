@@ -32965,6 +32965,10 @@ begin
   if Node = nil then Exit;
   case Node.NodeType of
     antCast:        Result := DerefedType(Node);
+    // "@Cast(T, x)" is a pointer to T written without a name, and this reader knew every OTHER shape.
+    // fbc's own optimizations/derefaddrof writes "*(@Cast(UByte, b(0)) + 1)": the value came back at
+    // the array's declared element type, signed, 234 read as -22.
+    antProcAddress: Result := DerefedType(Node);
     antIdentifier:  Result := UpperCase(PointeeTypeOf(VarToStr(Node.Value)));
     antParentheses: if Node.ChildCount >= 1 then Result := PointeeOfDerefTarget(Node.GetChild(0));
     // "p + n" / "p - n": the POINTER is the left operand - the right one is a count of elements.
@@ -34369,6 +34373,13 @@ begin
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
   end
+  else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antCast) then
+    // ⛔ "@Cast(T, x)" NAMES ITS POINTEE OUTRIGHT, and this reader had no arm for the address-of at all.
+    // "*(@Cast(UByte, b(0)) + 1)" - fbc's own optimizations/derefaddrof - read the byte SIGNED, at the
+    // array's declared element type, and answered -22 where fbc answers 234. The cast is there to say
+    // what width and signedness to read at; taking its address does not take that away.
+    Result := UpperCase(VarToStr(Node.GetChild(0).Value))
   else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
   begin
     // ⭐ "*obj.field" WHERE THE FIELD IS THE POINTER. Every arm above asks a registry keyed on a
@@ -34433,10 +34444,12 @@ begin
     // the arithmetic, which is what this arm's own header says it does.
     if (Node.GetChild(0).NodeType = antCast) and (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
-    else if (Node.GetChild(0).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess]) and
+    else if (Node.GetChild(0).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess,
+                                           antProcAddress]) and
             (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
-    else if (Node.GetChild(1).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess]) and
+    else if (Node.GetChild(1).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess,
+                                           antProcAddress]) and
             (DerefedType(Node.GetChild(1)) <> '') then
       Result := DerefedType(Node.GetChild(1))
     else if (Node.GetChild(0).NodeType = antIdentifier) and
