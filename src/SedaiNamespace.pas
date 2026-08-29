@@ -694,6 +694,25 @@ begin
     end;
   end;
 
+  // ⛔⛔ ...AND THE BASE MAY BE AN IMPORTED NAME, WITH NO NAMESPACE OF OUR OWN AROUND US. The block
+  // below is guarded on being INSIDE a namespace, so a type declared at module level (or in a Scope)
+  // that extends a name brought in by "Using N" was never looked at: the SSA searched for the parent
+  // by its bare name, found nothing, and the derived type inherited NOTHING with no diagnostic -
+  // "Type T2 Extends T1" after "Using N" gave T2 its own fields only, and the initialiser then said
+  // "too many expressions". The QUALIFIED spelling "Extends N.T1" worked, which is the pair that named
+  // it. fbc's own structs/scope-type-1 writes the imported form.
+  // Asked with TypeSlot=True, because a base IS a type slot: a module-level VARIABLE of the same
+  // spelling must not block the import (see ResolveUnqualified).
+  if (Node.NodeType = antTypeDecl) and (ActivePrefix = '') and (UseUsing <> nil) then
+  begin
+    BaseV := UpperCase(Node.Attributes.Values['EXTENDS']);
+    if (BaseV <> '') and (Pos('.', BaseV) = 0) then
+    begin
+      Qual := ResolveUnqualified(ActivePrefix, BaseV, Ctx, UseUsing, True);
+      if Qual <> '' then Node.Attributes.Values['EXTENDS'] := Qual;
+    end;
+  end;
+
   // antTypeDecl name lives in Value (not a child identifier): mangle it here.
   if (Node.NodeType = antTypeDecl) and (ActivePrefix <> '') then
   begin
@@ -709,8 +728,17 @@ begin
     // with no diagnostic at all: sizeof gave its own fields only and the base's fields read rubbish.
     // Same rule, same node, one of the two halves written.
     BaseV := UpperCase(Node.Attributes.Values['EXTENDS']);
-    if (BaseV <> '') and (Pos('.', BaseV) = 0) and Ctx.IsMember(ActivePrefix, BaseV) then
-      Node.Attributes.Values['EXTENDS'] := ActivePrefix + '.' + BaseV;
+    if (BaseV <> '') and (Pos('.', BaseV) = 0) then
+    begin
+      if Ctx.IsMember(ActivePrefix, BaseV) then
+        Node.Attributes.Values['EXTENDS'] := ActivePrefix + '.' + BaseV
+      else if UseUsing <> nil then
+      begin
+        // ...and a base the enclosing namespace does NOT declare may still be an IMPORTED one.
+        Qual := ResolveUnqualified(ActivePrefix, BaseV, Ctx, UseUsing, True);
+        if Qual <> '' then Node.Attributes.Values['EXTENDS'] := Qual;
+      end;
+    end;
     Exit;
   end;
 
