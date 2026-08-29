@@ -34325,8 +34325,17 @@ begin
     // IDENTIFIER - so the pointee came back '' and the read printed with a sign column ("  200" for
     // "200"). The cast arm above already resolves a cast's declared type; this follows it through the
     // arithmetic, which is what the arm's own header says it does.
+    // ⛔ ...AND IT MAY BE A FIELD. "*(b.lpp + 1)" walks a pointer held in a member, and this arm knew
+    // a cast and a name only - so the pointee came back '' and the read answered a stale register (1
+    // for 20), while "b.lpp[1]->a", the same walk in the other spelling, was right once its own rung
+    // existed. The member arm above resolves a field's pointee at any level; this follows it through
+    // the arithmetic, which is what this arm's own header says it does.
     if (Node.GetChild(0).NodeType = antCast) and (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
+    else if (Node.GetChild(0).NodeType = antMemberAccess) and (DerefedType(Node.GetChild(0)) <> '') then
+      Result := DerefedType(Node.GetChild(0))
+    else if (Node.GetChild(1).NodeType = antMemberAccess) and (DerefedType(Node.GetChild(1)) <> '') then
+      Result := DerefedType(Node.GetChild(1))
     else if (Node.GetChild(0).NodeType = antIdentifier) and
        (ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)) <> '') then
       Result := DerefedType(Node.GetChild(0))
