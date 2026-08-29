@@ -117,6 +117,14 @@ type
     // still un-renamed. A second declaration of the same name means an overload set, and both get a
     // parameter-bank signature appended to their labels (see ParseProcedureDecl).
     FProcSeen: TStringList;
+    // ⛔⛔ ...AND THE OVERLOAD DECISION IS ASKED PER NAMESPACE. Two procedures of the same name in two
+    // DIFFERENT namespaces are not an overload set - they are two names that only look alike until the
+    // namespace pass mangles them - and treating them as one gave both the SAME signature tail (a
+    // no-parameter pair signs "~" twice), so the second was silently discarded and both "ns1.bar" and
+    // "ns2.bar" answered 0. FProcSeen keeps the BARE names, because the two places that ask it ask
+    // "is this name a procedure at all"; this one keys on "PREFIX|BASE" and owns the decision.
+    FProcSeenNs: TStringList;
+    FNsPrefix: string;               // the namespace body being parsed ('' at module level)
     // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
     // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
     // check asks about the expression it is handed.
@@ -626,6 +634,9 @@ begin
 
   FProcSeen := TStringList.Create;
   FProcSeen.CaseSensitive := False;
+  FProcSeenNs := TStringList.Create;
+  FProcSeenNs.CaseSensitive := False;
+  FNsPrefix := '';
   FByrefRetProcs := TStringList.Create;
   FByrefRetProcs.CaseSensitive := False;
   FConstNames := TStringList.Create;
@@ -664,6 +675,7 @@ begin
     FExpressionParser.Free;
 
   FProcSeen.Free;
+  FProcSeenNs.Free;
   FByrefRetProcs.Free;
   FConstNames.Free;
   FConstTypes.Free;
@@ -859,10 +871,17 @@ begin
   if (Base = '') or (Pos('.OPERATOR', Base) > 0) or
      (Pos('#', Base) > 0) or (Pos('@', Base) > 0) or (Pos('~', Base) > 0) then Exit;
 
-  Idx := FProcSeen.IndexOf(Base);
+  // ⛔⛔ TWO PROCEDURES OF ONE NAME IN TWO NAMESPACES ARE NOT AN OVERLOAD SET. They only look alike
+  // until the namespace pass mangles them, and a no-parameter pair signs the SAME empty tail - so the
+  // second was silently discarded and BOTH "ns1.bar" and "ns2.bar" answered 0, with no diagnostic.
+  // The decision is therefore keyed on the namespace body being parsed. FProcSeen keeps the BARE name
+  // beside it, because the two places that ask it ask "is this name a procedure at all" - a question
+  // the namespace does not change.
+  if FProcSeen.IndexOf(Base) < 0 then FProcSeen.Add(Base);
+  Idx := FProcSeenNs.IndexOf(FNsPrefix + '|' + Base);
   if Idx < 0 then
   begin
-    FProcSeen.AddObject(Base, DeclNode);       // first one: keep the bare label
+    FProcSeenNs.AddObject(FNsPrefix + '|' + Base, DeclNode);   // first one: keep the bare label
     Exit;
   end;
 
@@ -871,7 +890,7 @@ begin
 
   // ...and, the first time only, retroactively give one to the declaration already parsed. Its object is
   // cleared afterwards so a third overload does not rename it twice.
-  FirstDecl := TASTNode(FProcSeen.Objects[Idx]);
+  FirstDecl := TASTNode(FProcSeenNs.Objects[Idx]);
   if FirstDecl <> nil then
   begin
     if (FirstDecl.ChildCount >= 2) and (FirstDecl.GetChild(0).NodeType = antIdentifier) and
@@ -883,7 +902,7 @@ begin
       // when this one is (they share a qualified "TYPE.NAME" label).
       FirstName.Value := Base + '~' + ProcSigFromParams(FirstParams, IsMethod, True);
     end;
-    FProcSeen.Objects[Idx] := nil;
+    FProcSeenNs.Objects[Idx] := nil;
   end;
 end;
 
@@ -1024,6 +1043,8 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FProcSeenNs.Clear;
+  FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
@@ -1119,6 +1140,8 @@ begin
   FStartTime := Now;
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
+  FProcSeenNs.Clear;
+  FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
   FConstTypes.Clear;
@@ -4330,7 +4353,7 @@ function TPackratParser.ParseNamespaceDecl: TASTNode;
 var
   Token: TLexerToken;
   Stmt: TASTNode;
-  NsName: string;
+  NsName, PrevNs: string;
   PrevIdx: Integer;
 begin
   Token := Context.CurrentToken;
@@ -4344,6 +4367,13 @@ begin
   NsName := ParseDottedName;                          // dotted nested specifier allowed
   SkipAliasClause;                                    // "Namespace ns Alias \"n\"" - a LINKER name
   Result := TASTNode.CreateWithValue(antNamespace, NsName, Token);
+
+  // ⭐ The prefix the OVERLOAD decision is keyed on. Two "Function bar()" in two namespaces are two
+  // names, not an overload set; without this both signed the same empty tail and one was discarded.
+  PrevNs := FNsPrefix;
+  if FNsPrefix = '' then FNsPrefix := UpperCase(NsName)
+  else FNsPrefix := FNsPrefix + '.' + UpperCase(NsName);
+  try
 
   while not Context.Check(ttEndOfFile) do
   begin
@@ -4370,6 +4400,10 @@ begin
   begin
     Context.Advance;   // END
     Context.Advance;   // NAMESPACE
+  end;
+
+  finally
+    FNsPrefix := PrevNs;
   end;
   DoNodeCreated(Result);
 end;
