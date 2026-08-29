@@ -164,6 +164,13 @@ type
     IsUnion: Boolean;              // UNION: all fields of the same bank overlap (share slot 0)
     FieldAlign: Integer;           // "TYPE t FIELD = n": max alignment of any member in the C layout
                                    // (1 = fully packed). 0 = not given, i.e. natural alignment.
+    // ⭐ THE SCOPE THE TYPE WAS DECLARED IN, as a path of stamped tags ("P3/B7/"); '' for a module
+    // type. A TYPE declared inside a SUB or a SCOPE belongs to THAT block - "sub a() : type T : x as
+    // integer : y as integer : ... : sub b() : type T : z as integer" is two types, and fbc answers
+    // 16 and 8 where a flat table answers 16 twice. Name stays BARE so every reader of .Name is
+    // unchanged; the path is what tells two same-named types apart. See DIVERGENZE 95, and m593 /
+    // m614 / m615, which are the same model for ARRAYS.
+    ScopePath: string;
   end;
 
   { Lexical scope frame (FreeBASIC -lang fb scoping, MODERN mode only). The scope stack runs
@@ -432,6 +439,13 @@ type
     FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
     FPreProcSig: TStringList;            // procedure LABEL (UPPER, overload tail and all) -> "FPPARAMS|FPRET", same walk
     FPreProcRetPtrSig: TStringList;      // FUNCTION name (UPPER) whose RETURN is a procedure pointer -> that pointer's "FPPARAMS|FPRET"
+    // ⭐ THE LEXICAL SCOPE A TYPE NAME IS RESOLVED IN. FTypeScopePath is the path of the block the
+    // generator is currently lowering ("P3/B7/", '' at module level); FTypeScopeSerial hands each
+    // scope node its tag ONCE, stamped on the node so the PRE-PASS that registers types and the
+    // GENERATOR that resolves them agree on it (the pre-pass walks lexically, the generator runs in
+    // execution order, so a counter alone would not match). DIVERGENZE 95.
+    FTypeScopePath: string;
+    FTypeScopeSerial: Integer;
     // V5f: the RESULT TEMPORARIES of this statement - one per call to a function returning a UDT BY
     // VALUE. The caller allocates that record (ssaRecordNew below), the callee copies its result into
     // it, and until now NOTHING destroyed it: fbc runs one destructor MORE than we did for every such
@@ -537,7 +551,7 @@ type
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
     procedure EnsureObjectBaseType;                // OOP: register the built-in empty OBJECT base type (RTTI root)
-    procedure CollectUDTNames(Node: TASTNode);     // pass 1: register type names (empty)
+    procedure CollectUDTNames(Node: TASTNode; const Path: string);  // pass 1: register type names (empty), under their lexical scope
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function SoleOverloadLabel(const TypeU, MethNm: string): string;   // T.m when it has exactly ONE overload, else ''
@@ -806,6 +820,13 @@ type
     function EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;  // indirect call through an already-loaded entry-PC value
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
     function CanonicalType(const TypeName: string): string;   // resolve FB TYPE-alias chain to its base
+    // DIVERGENZE 95 - the ONE funnel every type-name registry is read through, so a block-local type
+    // cannot inherit another declaration's facts (the half m614/m615 had to add for arrays).
+    function TypeScopeTag(Node: TASTNode; const Kind: string): string;  // stamp/read a scope node's tag
+    function ScopePathParent(const P: string): string;        // "P3/B7/" -> "P3/" -> ''
+    function PushTypeScope(Node: TASTNode): string;           // enter Node's children's type scope; returns the path to restore
+    function ScopedNameIndex(L: TStringList; const Name: string): Integer;  // IndexOfName over the live chain
+    function FuncPtrTypeSig(const TypeName: string): string;  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
     procedure CheckMemberAccess(const TypeName, MemberName: string);        // OOP: refuse an illegal member access
     procedure CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);  // ...for the one a DERIVED type reaches implicitly
@@ -1379,6 +1400,8 @@ begin
   FPreFuncRetType.CaseSensitive := False;
   FPreProcSig := TStringList.Create;
   FPreProcRetPtrSig := TStringList.Create;
+  FTypeScopePath := '';
+  FTypeScopeSerial := 0;
   FPreProcSig.CaseSensitive := False;
   FResultTemps := TStringList.Create;
   FVarExplicitType := TStringList.Create;
@@ -10927,10 +10950,10 @@ begin
     // "DIM f AS X" where X is a named function-pointer type ("Type X As Function(...)"): f is a funcptr
     // with X's signature (X aliases to INTEGER, so the typed-scalar path below gives it the int bank).
     else if (DimsNode.NodeType = antIdentifier) and
-            (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(DimsNode.Value))) >= 0) then
+            (FuncPtrTypeSig(VarToStr(DimsNode.Value)) <> '') then
     begin
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
-        FFuncPtrTypes.Values[UpperCase(VarToStr(DimsNode.Value))];
+        FuncPtrTypeSig(VarToStr(DimsNode.Value));
       if not FInProcedure then
         FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FFuncPtrSigs.Values[UpperCase(ArrName)];
     end;
@@ -11489,8 +11512,8 @@ begin
 
     // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
     // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
-    if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FFuncPtrTypes.IndexOfName(ArrElemTypeName) >= 0) then
-      FArrayFuncPtrSig.Values[DeclArrName] := FFuncPtrTypes.Values[ArrElemTypeName]
+    if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FuncPtrTypeSig(ArrElemTypeName) <> '') then
+      FArrayFuncPtrSig.Values[DeclArrName] := FuncPtrTypeSig(ArrElemTypeName)
     // ⭐ ...AND THE INLINE SPELLING OF THE SAME THING. "Dim arr(0 To 1) As Function(...) As T" writes no
     // type NAME at all - the signature rides on the declaration - so only the named-alias form was ever
     // recorded, and the inline one fell through to an ordinary integer array: "arr(i)(args)" answered
@@ -15142,13 +15165,22 @@ end;
 procedure TSSAGenerator.ProcessBlock(Node: TASTNode);
 var
   i: Integer;
+  SavedTypePath: string;
 begin
   // BEGIN/BEND compound block. FB lexical scope (MODERN): it is its own block scope — a DIM here is
   // block-local (shadowing) and its UDTs are destructed at the block end.
-  if FModernMode then BlockScopeEnter;
-  for i := 0 to Node.ChildCount - 1 do
-    ProcessStatement(Node.GetChild(i));
-  if FModernMode then BlockScopeExit;
+  // ...and so is a TYPE declared here: the block's stamped tag is pushed on the type-scope path so a
+  // name written in this block resolves to THIS block's declaration first (DIVERGENZE 95).
+  SavedTypePath := FTypeScopePath;
+  if FModernMode then FTypeScopePath := FTypeScopePath + TypeScopeTag(Node, 'B') + '/';
+  try
+    if FModernMode then BlockScopeEnter;
+    for i := 0 to Node.ChildCount - 1 do
+      ProcessStatement(Node.GetChild(i));
+    if FModernMode then BlockScopeExit;
+  finally
+    FTypeScopePath := SavedTypePath;
+  end;
 end;
 
 procedure TSSAGenerator.ProcessDefFn(Node: TASTNode);
@@ -25243,7 +25275,10 @@ begin
   Guard := 0;
   while Guard < 32 do
   begin
-    Idx := FTypeAliases.IndexOfName(T);
+    // The SAME funnel as FindUDT: "Type a As UDT" in one procedure and "Type a As Double" in another
+    // are two aliases, and the flat table answered the first for both (fbc suite typedef/backpatch,
+    // typedef/syntax - one assertion each, and a wrong TYPE for anything else).
+    Idx := ScopedNameIndex(FTypeAliases, T);
     if Idx < 0 then Break;
     Next := UpperCase(FTypeAliases.ValueFromIndex[Idx]);
     if (Next = '') or (Next = T) then Break;
@@ -25265,8 +25300,8 @@ begin
   // signature away, and "Dim As f Ptr pf : (*pf)(123)" stopped being an indirect call: 55 instead of
   // 369 (guard m487). A name FFuncPtrTypes knows keeps its own spelling, which is what every call
   // site looks it up by.
-  if (Stars > 0) and (FTypeAliases.IndexOfName(Base) >= 0) and
-     (FFuncPtrTypes.IndexOfName(Base) < 0) then
+  if (Stars > 0) and (ScopedNameIndex(FTypeAliases, Base) >= 0) and
+     (ScopedNameIndex(FFuncPtrTypes, Base) < 0) then
   begin
     Base := CanonicalType(Base);
     while Stars > 0 do begin Base := Base + ' PTR'; Dec(Stars); end;
@@ -25275,14 +25310,129 @@ begin
   Result := T;
 end;
 
+function TSSAGenerator.TypeScopeTag(Node: TASTNode; const Kind: string): string;
+// The tag that identifies one lexical scope NODE, stamped on the node the first time it is asked for.
+// ⛔ IT HAS TO LIVE ON THE NODE. The pre-pass that registers types walks the tree LEXICALLY and the
+// generator lowers it in EXECUTION order, so two independent counters would hand the same block two
+// different numbers and every scoped type would be invisible. The node is the one thing both see.
+begin
+  if Node = nil then Exit('');
+  Result := Node.Attributes.Values['TYPESCOPE'];
+  if Result = '' then
+  begin
+    Inc(FTypeScopeSerial);
+    Result := Kind + IntToStr(FTypeScopeSerial);
+    Node.Attributes.Values['TYPESCOPE'] := Result;
+  end;
+end;
+
+function TSSAGenerator.ScopePathParent(const P: string): string;
+// Drop the innermost tag of a scope path: "P3/B7/" -> "P3/" -> ''.
+var
+  i: Integer;
+begin
+  Result := '';
+  if P = '' then Exit;
+  for i := Length(P) - 1 downto 1 do
+    if P[i] = '/' then Exit(Copy(P, 1, i));
+end;
+
+function TSSAGenerator.PushTypeScope(Node: TASTNode): string;
+// Install the type scope Node's CHILDREN live in, and return the previous path so the caller can put
+// it back. ⛔⛔ THE OBVIOUS SHORTCUT DOES NOT WORK AND COST AN AFTERNOON: TASTNode carries a Parent
+// link, so the path of any node looks like it can be read straight off the parent CHAIN - one line at
+// the top of every walk instead of a save/restore at every recursion. It faults. Some node in a
+// program with a NAMESPACE has a Parent pointing at storage nobody owns any more (an AST rewrite that
+// moved a node without fixing the back-link), and "using N : type T2 extends T1" died with an access
+// violation the moment the chain was walked - a program that compiles fine at HEAD. The Parent link
+// is not a reliable reader here; the path has to be THREADED, which is what this does.
+// ⚠️ Only a PROCEDURE body and a SCOPE/compound BLOCK introduce a type scope. MODERN only.
+begin
+  Result := FTypeScopePath;
+  if not FModernMode then Exit;
+  case Node.NodeType of
+    antProcedureDecl: FTypeScopePath := Result + TypeScopeTag(Node, 'P') + '/';
+    antBlock:         FTypeScopePath := Result + TypeScopeTag(Node, 'B') + '/';
+  end;
+end;
+
+function TSSAGenerator.ScopedNameIndex(L: TStringList; const Name: string): Integer;
+// IndexOfName over the LIVE scope chain, innermost first, ending at the module ('' prefix, which is
+// the plain name a module-level declaration is filed under - so nothing about the flat case changes).
+// ⚠️ AND THEN ANY SCOPE AT ALL, on purpose. Several PRE-SCANS ask what a type name means with no path
+// in hand (they walk the raw AST before anything is lowered), and refusing them an answer would take
+// a block-local type's variable OFF the record-variable list - a regression, where today they simply
+// get the flat answer. The fallback is exactly today's behaviour; the chain above is the part that is
+// new, and it wins whenever the path IS live.
+var
+  P, Nm: string;
+  i, LN: Integer;
+begin
+  P := FTypeScopePath;
+  while True do
+  begin
+    Result := L.IndexOfName(P + Name);
+    if Result >= 0 then Exit;
+    if P = '' then Break;
+    P := ScopePathParent(P);
+  end;
+  // ...and INWARDS, but never SIDEWAYS. Several readers stand at a procedure's root while they answer
+  // a question about something written in a BLOCK inside it (the prologue that gathers a procedure's
+  // local UDTs walks the whole body with no block open), so refusing them the inner declaration breaks
+  // "Scope : type T2 extends T1 : dim x as T2". Reaching into ANOTHER procedure's scope is a different
+  // thing entirely and is exactly the bug: with a flat reach, "sub t1 : type c as integer ptr" got
+  // "sub t0"'s "type c as UDT ptr" and the program died taking the address of a procedure.
+  // ⛔ So the reach is limited to scopes NESTED INSIDE the current one, and at module level ('') there
+  // is no reach at all - a module reader has no business seeing a procedure's private type.
+  if FTypeScopePath <> '' then
+    for i := 0 to L.Count - 1 do
+    begin
+      Nm := L.Names[i];
+      if (Length(Nm) > Length(Name)) and (Nm[Length(Nm) - Length(Name)] = '/') and
+         SameText(Copy(Nm, Length(Nm) - Length(Name), Length(Name) + 1), '/' + Name) and
+         (Copy(Nm, 1, Length(FTypeScopePath)) = FTypeScopePath) then Exit(i);
+    end;
+  Result := -1;
+end;
+
+function TSSAGenerator.FuncPtrTypeSig(const TypeName: string): string;
+// The signature of a named function-pointer TYPE ("Type X As Function(...) As R"), asked through the
+// SAME funnel as every other type-name fact. ⛔ ALL of its readers go through here: a registry that is
+// WRITTEN under a scoped key and READ under a bare one answers another declaration's facts, which is
+// exactly the half that had to be added for arrays (m614/m615) and is the half this change would
+// otherwise repeat.
+var
+  Idx: Integer;
+begin
+  Result := '';
+  Idx := ScopedNameIndex(FFuncPtrTypes, UpperCase(TypeName));
+  if Idx >= 0 then Result := FFuncPtrTypes.ValueFromIndex[Idx];
+end;
+
 function TSSAGenerator.FindUDT(const TypeName: string): Integer;
 var
   i: Integer;
-  U: string;
+  U, P: string;
 begin
   U := CanonicalType(TypeName);
-  for i := 0 to High(FUDTs) do
-    if FUDTs[i].Name = U then Exit(i);
+  // ⭐ THE LIVE SCOPE CHAIN FIRST, innermost outwards, and the module ('' path) last - which is the
+  // pass the flat table always made, so nothing about a module-level type changes. A TYPE declared
+  // inside a SUB or a SCOPE belongs to that block: two procedures each declaring "T" are two types,
+  // and answering the first one for both is a WRONG SIZE, silently (DIVERGENZE 95).
+  P := FTypeScopePath;
+  while True do
+  begin
+    for i := 0 to High(FUDTs) do
+      if (FUDTs[i].Name = U) and (FUDTs[i].ScopePath = P) then Exit(i);
+    if P = '' then Break;
+    P := ScopePathParent(P);
+  end;
+  // ...and then INWARDS, into scopes NESTED inside this one, but never sideways into another
+  // procedure's. See ScopedNameIndex, which states the rule and what breaks on either side of it.
+  if FTypeScopePath <> '' then
+    for i := 0 to High(FUDTs) do
+      if (FUDTs[i].Name = U) and (FUDTs[i].ScopePath <> '') and
+         (Copy(FUDTs[i].ScopePath, 1, Length(FTypeScopePath)) = FTypeScopePath) then Exit(i);
   // A NESTED type is registered under its own simple name, and FreeBASIC also reaches it QUALIFIED:
   // "Union U" inside "Type T" is both U and T.U, and a method defined on it is written
   // "Sub T.U.proc". Try the last segment when the qualified spelling is not a type of its own.
@@ -25728,9 +25878,18 @@ end;
 
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
 // Two passes so a TYPE may reference another TYPE declared later (forward reference).
+var
+  DiagI: Integer;
 begin
   EnsureObjectBaseType;    // OOP: the built-in OBJECT base type must exist before TYPE names are collected
-  CollectUDTNames(Node);   // pass 1: all type names known
+  CollectUDTNames(Node, '');   // pass 1: all type names known, each under the scope it was written in
+  if GetEnvironmentVariable('TYPESCOPE_DIAG') <> '' then
+  begin
+    for DiagI := 0 to High(FUDTs) do
+      WriteLn(StdErr, '[TYPESCOPE] udt  ', FUDTs[DiagI].ScopePath, '#', FUDTs[DiagI].Name, '  extends=', FUDTs[DiagI].Parent);
+    for DiagI := 0 to FTypeAliases.Count - 1 do
+      WriteLn(StdErr, '[TYPESCOPE] alias ', FTypeAliases[DiagI]);
+  end;
   FillUDTFields(Node);     // pass 2: resolve fields (incl. nested-UDT fields)
 end;
 
@@ -25746,6 +25905,7 @@ begin
   n := Length(FUDTs);
   SetLength(FUDTs, n + 1);
   FUDTs[n].Name := 'OBJECT';
+  FUDTs[n].ScopePath := '';
   SetLength(FUDTs[n].Fields, 0);
   FUDTs[n].LiveBytes := 0; FUDTs[n].NStr := 0;
   FUDTs[n].Parent := '';
@@ -25755,10 +25915,18 @@ begin
   FUDTs[n].FieldAlign := 0;
 end;
 
-procedure TSSAGenerator.CollectUDTNames(Node: TASTNode);
+procedure TSSAGenerator.CollectUDTNames(Node: TASTNode; const Path: string);
+// ⭐ PASS 1 NOW CARRIES THE LEXICAL SCOPE IT IS WALKING IN. A TYPE (record OR alias) declared inside a
+// SUB/FUNCTION or a SCOPE block belongs to THAT block: two procedures declaring "T" are two types, and
+// the flat table registered the first and dropped the second in silence - "sub a() ... sizeof = 16"
+// and "sub b() ... sizeof = 8" both answered 16 (DIVERGENZE 95). This is m593 / m614 / m615 - the same
+// model already applied to ARRAYS - and the half that makes it safe is the SAME one: everything keyed
+// on a type NAME (records, aliases, funcptr signatures) is written under the scoped key and read back
+// through ONE funnel (FindUDT / ScopedNameIndex / FuncPtrTypeSig), never under the bare name.
+// ⚠️ MODERN only. CLASSIC (v7) has no procedure scope at all, so there every name is the module's.
 var
   i, n: Integer;
-  Name: string;
+  Name, Sub: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antTypeDecl then
@@ -25768,13 +25936,13 @@ begin
     // the alias map (resolved via CanonicalType at the type resolvers) and do not create a UDT.
     if Node.Attributes.Values['ALIAS'] <> '' then
     begin
-      if FTypeAliases.IndexOfName(Name) < 0 then
-        FTypeAliases.Values[Name] := UpperCase(Node.Attributes.Values['ALIAS']);
+      if FTypeAliases.IndexOfName(Path + Name) < 0 then
+        FTypeAliases.Values[Path + Name] := UpperCase(Node.Attributes.Values['ALIAS']);
       // FreeBASIC named function-pointer type "TYPE X As Function(params) As R": record its signature so a
       // var/param declared "As X" becomes an int-banked function pointer (aliased to INTEGER above) whose
       // "f(args)" lowers to an indirect call. The signature is copied into the per-proc FFuncPtrSigs.
       if Node.Attributes.Values['FUNCPTR'] = '1' then
-        FFuncPtrTypes.Values[Name] :=
+        FFuncPtrTypes.Values[Path + Name] :=
           Node.Attributes.Values['FPPARAMS'] + '|' + Node.Attributes.Values['FPRET'];
       // ⛔ ...AND THE REST OF A COMMA LIST STILL HAS TO BE READ. "Type a As Integer, d As UDT" carries
       // its extra aliases as ALIASLIST children, and the loop that descends into them is at the BOTTOM
@@ -25785,14 +25953,21 @@ begin
       for i := 0 to Node.ChildCount - 1 do
         if (Node.GetChild(i).NodeType = antTypeDecl) and
            (Node.GetChild(i).Attributes.Values['ALIASLIST'] = '1') then
-          CollectUDTNames(Node.GetChild(i));
+          CollectUDTNames(Node.GetChild(i), Path);
       Exit;
     end;
-    if FindUDT(Name) < 0 then
+    // ⛔ THE "ALREADY REGISTERED?" TEST IS EXACT, NOT THE CHAIN. FindUDT walks OUTWARD by design, so
+    // asking it here would find an ENCLOSING type of the same name and skip the declaration entirely -
+    // which is the very bug being fixed, reintroduced from the registration side.
+    n := -1;
+    for i := 0 to High(FUDTs) do
+      if (FUDTs[i].Name = Name) and (FUDTs[i].ScopePath = Path) then begin n := i; Break; end;
+    if n < 0 then
     begin
       n := Length(FUDTs);
       SetLength(FUDTs, n + 1);
       FUDTs[n].Name := Name;
+      FUDTs[n].ScopePath := Path;
       SetLength(FUDTs[n].Fields, 0);
       FUDTs[n].LiveBytes := 0; FUDTs[n].NStr := 0;
       FUDTs[n].Parent := UpperCase(Node.Attributes.Values['EXTENDS']);  // '' if none (M4.2)
@@ -25809,11 +25984,20 @@ begin
       if (Node.GetChild(i).NodeType = antTypeDecl) and
          ((Node.GetChild(i).Attributes.Values['NESTEDTYPE'] = '1') or
           (Node.GetChild(i).Attributes.Values['ALIASLIST'] = '1')) then
-        CollectUDTNames(Node.GetChild(i));
+        CollectUDTNames(Node.GetChild(i), Path);
     Exit;
   end;
+  // A PROCEDURE body and a SCOPE/compound BLOCK are the two lexical scopes a TYPE can be declared in.
+  // Each gets a tag stamped on its own node, so the generator - which lowers in EXECUTION order, not
+  // in this lexical one - reads back the SAME identity (TypeScopeTag).
+  Sub := Path;
+  if FModernMode then
+    case Node.NodeType of
+      antProcedureDecl: Sub := Path + TypeScopeTag(Node, 'P') + '/';
+      antBlock:         Sub := Path + TypeScopeTag(Node, 'B') + '/';
+    end;
   for i := 0 to Node.ChildCount - 1 do
-    CollectUDTNames(Node.GetChild(i));
+    CollectUDTNames(Node.GetChild(i), Sub);
 end;
 
 function ConcreteArrayBounds(FieldNode: TASTNode): TASTNode;
@@ -25856,10 +26040,20 @@ var
   ArrElemScalarType: string;
   RawPtrPointeeT, PointeeScalarT, MultiPtrPointeeT, UltimateT: string;
   IsArrayField: Boolean;
+  SavedTypePath: string;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
   if FUDTs[Idx].Filled then Exit;
   FUDTs[Idx].Filled := True;   // set before recursing to break any EXTENDS cycle
+
+  // ⭐ A TYPE'S OWN FIELDS AND ITS EXTENDS ARE RESOLVED IN THE SCOPE IT WAS WRITTEN IN, not in
+  // whatever scope happens to be open when the fill is demanded. "Scope : type T1 : ... : scope :
+  // type T2 extends T1" is three nested blocks deep in fbc's structs/scope-type-1, and its T1 is the
+  // block's, not the module's. This pass runs with no block open at all, so without it every nested
+  // type would inherit the outermost same-named one.
+  SavedTypePath := FTypeScopePath;
+  FTypeScopePath := FUDTs[Idx].ScopePath;
+  try
 
   cInt := 0; cFloat := 0; cStr := 0;
   SetLength(FUDTs[Idx].Fields, 0);
@@ -25937,9 +26131,9 @@ begin
         FuncPtrSigVal := FieldNode.Attributes.Values['FPPARAMS'] + '|' + FieldNode.Attributes.Values['FPRET'];
         Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := ''; MultiPtrPointeeT := '';
       end
-      else if (TypeName <> '') and (FFuncPtrTypes.IndexOfName(TypeName) >= 0) then
+      else if (TypeName <> '') and (FuncPtrTypeSig(TypeName) <> '') then
       begin
-        FuncPtrSigVal := FFuncPtrTypes.Values[TypeName];
+        FuncPtrSigVal := FuncPtrTypeSig(TypeName);
         Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := ''; MultiPtrPointeeT := '';
       end;
       // Array member (e.g. "Dim As Double m(Any, Any)"): the field itself is an int handle into the
@@ -26051,6 +26245,10 @@ begin
     end;
   FUDTs[Idx].NStr := cStr;
   ComputeUDTLiveLayout(Idx);
+
+  finally
+    FTypeScopePath := SavedTypePath;
+  end;
 end;
 
 function TSSAGenerator.EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
@@ -27902,6 +28100,7 @@ procedure TSSAGenerator.PreCollectFuncRetTypes(Node: TASTNode);
 // call site for why this exists separately from PreCollectProcedures: it runs EARLIER, and it is all the
 // VAR type inference needs from it.
 var
+  SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   i, j: Integer;
   NameNode, PL: TASTNode;
   Nm, Ps, Rt: string;
@@ -27967,7 +28166,9 @@ begin
       end;
     end;
   end;
+  SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do PreCollectFuncRetTypes(Node.GetChild(i));
+  FTypeScopePath := SavedTypePath;
 end;
 
 function TSSAGenerator.PreProcPtrSigOf(Node: TASTNode): string;
@@ -28058,7 +28259,7 @@ var
   Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand: TASTNode;
   VarName, TypeName, NestedTypeName: string;
   SavedInProc: Boolean;
-  SavedProcName: string;
+  SavedProcName, SavedTypePath: string;
 begin
   if Node = nil then Exit;
   // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
@@ -28439,14 +28640,23 @@ begin
       end;
     end;
     // Recurse into the body (local DIMs etc.) with the flag still set, then restore it.
+    // ...and with the TYPE SCOPE, because this is the pre-scan that decides what a DIM IS - a record
+    // handle, a pointer, a funcptr, a plain scalar - and it decides it by NAME. Asked with no path it
+    // answered ANOTHER procedure's "Type c As UDT Ptr" for this one's "Type c As Integer Ptr", and
+    // "Dim x3 As c = @x1" was lowered as the address of a PROCEDURE: "Undefined procedure
+    // (address-of @): X1". A registry WRITTEN scoped and READ flat is the whole failure mode.
+    SavedTypePath := PushTypeScope(Node);
     for i := 0 to Node.ChildCount - 1 do
       RegisterRecordVars(Node.GetChild(i));
+    FTypeScopePath := SavedTypePath;
     FPreScanInProc := SavedInProc;
     FPreScanProcName := SavedProcName;
     Exit;
   end;
+  SavedTypePath := PushTypeScope(Node);
   for i := 0 to Node.ChildCount - 1 do
     RegisterRecordVars(Node.GetChild(i));
+  FTypeScopePath := SavedTypePath;
 end;
 
 procedure TSSAGenerator.RegisterTypedVar(const VarName, TypeName: string);
@@ -31002,6 +31212,7 @@ procedure TSSAGenerator.CollectSharedVars(Node: TASTNode);
 // via the record heap). DIM SHARED is the only sharing mechanism (the QuickBASIC `SHARED x` statement
 // inside a procedure is not a -lang fb feature).
 var
+  SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   i, k, ai: Integer;
   Decl: TASTNode;
   VNameU, TypeNameU: string;
@@ -31113,8 +31324,10 @@ begin
         end;
       end;
     end;
+  SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     CollectSharedVars(Node.GetChild(i));
+  FTypeScopePath := SavedTypePath;
 end;
 
 function TSSAGenerator.SharedScalarShadowed(const Name: string): Boolean;
@@ -31970,7 +32183,7 @@ procedure TSSAGenerator.CollectDimVarBanks(Node: TASTNode; Dict: TStringList; In
 var
   i, k: Integer;
   Decl, ArgsNd: TASTNode;
-  VNameU, TypeNameU: string;
+  VNameU, TypeNameU, SavedTypePath: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antProcAddress then
@@ -32153,8 +32366,10 @@ begin
         FPointerVars.Add(VNameU + '=' + Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4)));
     end;
   end;
+  SavedTypePath := PushTypeScope(Node);
   for i := 0 to Node.ChildCount - 1 do
     CollectDimVarBanks(Node.GetChild(i), Dict, InProc or (Node.GetChild(i).NodeType = antProcedureDecl));
+  FTypeScopePath := SavedTypePath;
 end;
 
 procedure TSSAGenerator.CollectScalarPtrBanks(Node: TASTNode);
@@ -32164,6 +32379,7 @@ procedure TSSAGenerator.CollectScalarPtrBanks(Node: TASTNode);
 // type-punning, e.g. Rosetta signum's "Integer Ptr = @single"); a same-bank-only scalar stays SHARED so
 // @/VARPTR/BYREF/pointer-param keep flowing through the managed model (sound across call boundaries).
 var
+  SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   i: Integer;
 
   procedure AddBank(const ScalarU, PointeeType: string);
@@ -32231,8 +32447,10 @@ begin
         end;
       end;
     end;
+  SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     CollectScalarPtrBanks(Node.GetChild(i));
+  FTypeScopePath := SavedTypePath;
 end;
 
 function TSSAGenerator.ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;
@@ -32259,7 +32477,7 @@ var
   i, k: Integer;
   Decl: TASTNode;
   ProcDict: TStringList;
-  VNameU, VTypeU, VTypeC: string;
+  VNameU, VTypeU, VTypeC, SavedTypePath: string;
 begin
   if Node = nil then Exit;
   if Node.NodeType = antDim then
@@ -32402,8 +32620,10 @@ begin
   // other still leaves both reading the same entry. It is PER-DECLARATION IDENTITY that is missing -
   // what LocalArrayMangle gives an array - and that is a model change, not a branch here. Worth 516
   // assertions; DIVERGENZE 56.
+  SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     MarkAddressTaken(Node.GetChild(i), Dict, InProc);
+  FTypeScopePath := SavedTypePath;
 end;
 
 function AnyWStringPtrParam(Node: TASTNode): Boolean;
@@ -33666,6 +33886,7 @@ procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
 // ALLOCATE/CALLOCATE/REALLOCATE, from a pointer CAST/CPTR of a raw value, or copied from another raw
 // pointer. Raw-ness then drives deref/arithmetic onto the byte heap regardless of statement order.
 var
+  SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   i: Integer;
   Lhs, Rhs: TASTNode;
   LhsU: string;
@@ -33859,8 +34080,10 @@ begin
           (Node.GetChild(0).NodeType in [antArgumentList, antExpressionList]) then
     PropagateRawArgs(VarToStr(Node.Value), Node.GetChild(0));
 
+  SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
+  FTypeScopePath := SavedTypePath;
 end;
 
 procedure TSSAGenerator.PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);
@@ -33913,6 +34136,7 @@ procedure TSSAGenerator.CollectRawPtrRetFuncs(Node: TASTNode);
 // name identifier, whose child0 is the return-type identifier ("DOUBLE PTR"). Runs in the raw fixpoint, so
 // a function returning a raw LOCAL is caught once that local is marked raw.
 var
+  SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   i: Integer;
   NameNode: TASTNode;
   Nm, RetT, Pointee: string;
@@ -33954,8 +34178,10 @@ begin
       end;
     end;
   end;
+  SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrRetFuncs(Node.GetChild(i));
+  FTypeScopePath := SavedTypePath;
 end;
 
 procedure TSSAGenerator.CollectWStringVars(Node: TASTNode; const Owner: string);
@@ -35928,7 +36154,7 @@ begin
   if (Node = nil) or (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
   PtrName := UpperCase(VarToStr(Node.GetChild(0).Value));
-  Result := FFuncPtrTypes.Values[UpperCase(FPointerVars.Values[PtrName])];
+  Result := FuncPtrTypeSig(FPointerVars.Values[PtrName]);
 end;
 
 function TSSAGenerator.EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
@@ -39399,7 +39625,10 @@ begin
     LabelName := ProcedureLabelName(Name);
 
     // Establish procedure context (for "fname = expr" results, RETURN, EXIT SUB/FUNCTION).
+    // ...including the TYPE scope: a TYPE declared inside this procedure is this procedure's, and the
+    // path is read back from the stamp pass 1 left on the very same node (DIVERGENZE 95).
     FInProcedure := True;
+    if FModernMode then FTypeScopePath := TypeScopeTag(Proc, 'P') + '/';
     FCurrentProcName := Name;
     FDefinedLabels.Clear;                 // labels belong to the procedure being lowered
     FCurrentProcIsFunction := (UpperCase(VarToStr(Proc.Value)) = kFUNCTION);
@@ -39489,9 +39718,9 @@ begin
         // "param AS X" where X is a named function-pointer type ("Type X As Function(...)"): the param is
         // a funcptr with X's signature (X aliases to INTEGER, so ParamBankAndSlot already gave it int).
         else if (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
-                (FFuncPtrTypes.IndexOfName(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))) >= 0) then
+                (FuncPtrTypeSig(VarToStr(ParamNodeJ.GetChild(0).Value)) <> '') then
           FFuncPtrSigs.Values[UpperCase(VarToStr(ParamNodeJ.Value))] :=
-            FFuncPtrTypes.Values[UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value))];
+            FuncPtrTypeSig(VarToStr(ParamNodeJ.GetChild(0).Value));
         // FreeBASIC pointer parameter ("param AS T PTR"): record its pointee type PER-PROC, so "p[i]"/"*p"
         // in the body index/dereference through the parameter's address value (like a DIM'd pointer). The
         // param register holds the caller's address; without this, "buf[i]" fell through to the array
@@ -39720,6 +39949,7 @@ begin
     if FModernMode then ScopePopFrame;   // FB scope: close the procedure-root frame
     FCurrentBlock := nil;   // procedure body terminated
     FInProcedure := False;
+    FTypeScopePath := '';   // back to module scope: its types, not this procedure's
     FCurrentProcName := '';
     FDefinedLabels.Clear;                 // back to module scope: its own labels, its own set
     FCurrentThisType := '';
