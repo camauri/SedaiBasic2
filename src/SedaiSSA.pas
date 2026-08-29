@@ -31036,6 +31036,27 @@ begin
     VNameU := UpperCase(VarToStr(Node.GetChild(1).GetChild(0).Value));
     if Dict.IndexOf(VNameU) < 0 then Dict.Add(VNameU);
   end;
+  // ⛔⛔ ...AND SO DOES WRITING ONE THROUGH ITS SUBSCRIPT. "Dim s As ZString * 16 : s[0] = 65" is a
+  // store into the DECLARED BUFFER, and fbc has sixteen bytes there to store into (it zero-fills them:
+  // Len is 0 and s[0] is 0 before the write, measured). Our managed string has only the characters it
+  // HOLDS, which for an uninitialised one is none - so the store went nowhere and the whole thing read
+  // back EMPTY, in silence: fbc's own udt-wstring/asc builds its 255-character sample exactly that way.
+  // ⭐ The raw-buffer machinery this needs already exists and is complete (RawZStringBufBytes,
+  // ssaRawLoadZStr / ssaRawStoreZStr, and RawStringBufElemBytes which knows a WSTRING character is two
+  // bytes) - it was only ever reached by taking the string's ADDRESS. Writing an element IS addressing
+  // it, so this is one more POSITION on the list, not a new representation.
+  // ⚠️ Only a FIXED-LENGTH ZSTRING/WSTRING (FFixedStrNames). A var-length String has no declared buffer
+  // to write past its length, and marking one raw was tried and withdrawn on 26 Aug - see the note in
+  // MarkAddressTaken, which is where that decision lives.
+  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and
+     (Node.GetChild(0).Attributes.Values['BRACKET'] = '1') and
+     (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    VNameU := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+    if (FFixedStrNames.IndexOf(VNameU) >= 0) and (Dict.IndexOf(VNameU) < 0) then Dict.Add(VNameU);
+  end;
   // ⛔ ...AND SO DOES STRPTR/SADD OF A FIXED-LENGTH STRING. fbc's StrPtr answers the variable's OWN
   // buffer address, the same one every time; ours answered a fresh NUL-terminated COPY per call, which
   // its own comment calls a snapshot - so "cint(strptr(s)) - cint(strptr(s))" was 16 where fbc says 0,
