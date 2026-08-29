@@ -2178,6 +2178,12 @@ So `defined(T)` is false above `Type T` and true below it, exactly as in fbc. A 
 symbol only from inside that type's own body; a qualified name (`T.field`, and the operator spellings
 `T.+=`, `T.[]`, `T.new[]`) is one name, answered from that type's declarations so far.
 
+🎯 **`#IF` reads a constant the SOURCE declares** — a module `Const` and, since 29 August 2026, an
+`Enum` member (numbered from 0, restarted by an explicit `= <integer literal>`). ⚠️ Conservative by one
+step: a member whose initialiser is an EXPRESSION (`M2 = M1 + 4`) is not folded here — fbc folds it,
+because its preprocessor and its parser are one pass — so it keeps the evaluator's `0` and the
+numbering of that enum stops there. Declared in `job/markdown/DIVERGENZE.md`.
+
 🕳️ **A second known gap, measured 29 August 2026:** two `Namespace` bodies that declare a type with
 the SAME simple name collide — the namespace is not part of the type's identity, so both destructors
 are filed under one label and *neither* runs (fbc runs both). Different type names in the two

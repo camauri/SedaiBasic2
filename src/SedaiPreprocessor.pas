@@ -1117,8 +1117,19 @@ begin
         ArgsStr := '';
         // A macro body is joined with cVirtualEOL, so "the end of the line" is that marker, not the end
         // of the buffer: a paren-less invocation INSIDE a macro body must not swallow the lines after it.
-        while (j <= Length(Line)) and (Line[j] <> cVirtualEOL) and (Line[j] <> ':') do
-        begin ArgsStr := ArgsStr + Line[j]; Inc(j); end;
+        // ⛔ AND A COLON INSIDE A STRING LITERAL IS NOT A STATEMENT SEPARATOR - the same
+        // rule the PARENTHESISED path three branches below already carries for its brackets, and the
+        // same shape: one path has it and the other does not. Without it a paren-less invocation whose
+        // argument is a string holding a colon cut that argument in half, and the orphaned tail was read
+        // as code: fbc's own structs/udt-ops-* die on "Undefined procedure: HERE", five files over, and
+        // udt-comp-ops-* with them. Five lines reproduce it (guard m691).
+        InArgStr := False;
+        while j <= Length(Line) do
+        begin
+          if Line[j] = '"' then InArgStr := not InArgStr
+          else if (not InArgStr) and ((Line[j] = cVirtualEOL) or (Line[j] = ':')) then Break;
+          ArgsStr := ArgsStr + Line[j]; Inc(j);
+        end;
         Result := Result + SubstituteMacros(ExpandFnBody(Copy(FnDefs.ValueFromIndex[idx], 2, MaxInt),
                                                          ArgsStr, Defs, FnDefs, Depth), Defs, FnDefs, Depth + 1);
         i := j;
@@ -1520,10 +1531,24 @@ function SourceConstValue(const Nm: string; out V: Int64): Boolean;
 // on a Const N answered "0 = 5" and refused the program. fbc's pp/macro-no-params is exactly that, and
 // it is a COMPILE_ONLY_OK test. ⚠️ The 0 default is kept for everything else - "#if undeclaredid1 =
 // undeclaredid2" depends on it - so only a name a Const really declares changes answer.
+//
+// ⛔ ...AND AN ENUM MEMBER IS A CONSTANT TOO, by exactly the same argument, and it was the half that
+// was missing. "Enum E : A : B : C : End Enum" gives B the value 1, and fbc's "#if (B = 1)" says so;
+// here every member answered the 0 default, so ALL of them compared equal to each other. fbc's own
+// structs/udt-ops-* select which type to declare with "#if (TX_id = TX_as_integer)" over a five-member
+// enum: with every member 0, every branch was taken and the file declared its type five times over
+// ("Array not declared: S1" - five files behind one signature). SourceDeclaresSymbol already walks
+// enum bodies for the same reason; only the VALUE half was not asked.
+// ⚠️ The counting is the FreeBASIC one and no further: members number from 0 and an explicit
+// "= <integer literal>" restarts the count. A member whose initialiser this stage cannot fold stops
+// the walk of THAT enum - the numbers after it are no longer known, and guessing them would replace
+// the honest 0 with a confident wrong answer.
 var
   L: TStringList;
   i, p, q: Integer;
-  U, W, Rest: string;
+  U, W, Rest, MemU: string;
+  EnumNext: Int64;
+  InEnum, EnumLost: Boolean;
 begin
   Result := False;
   V := 0;
@@ -1531,12 +1556,42 @@ begin
   L := TStringList.Create;
   try
     L.Text := GPPSourceForDefined;
+    InEnum := False; EnumLost := False; EnumNext := 0;
     for i := 0 to L.Count - 1 do
     begin
       U := UpperCase(Trim(L[i]));
       p := 1;
       while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
       W := Copy(U, 1, p - 1);
+      // --- ENUM bodies: one member per line, numbered from 0, restarted by an explicit "= n" ---
+      if InEnum then
+      begin
+        if (W = 'END') and (Copy(Trim(Copy(U, p, MaxInt)), 1, 4) = 'ENUM') then
+        begin
+          InEnum := False;
+          Continue;
+        end;
+        if (W = '') or (Copy(U, 1, 1) = '''') or (Copy(U, 1, 1) = '#') then Continue;
+        MemU := W;
+        Rest := Trim(Copy(U, p, MaxInt));
+        if (Rest <> '') and (Rest[1] = ',') then Rest := Trim(Copy(Rest, 2, MaxInt));
+        if (Rest <> '') and (Rest[1] = '=') then
+        begin
+          Rest := Trim(Copy(Rest, 2, MaxInt));
+          q := Pos(',', Rest);
+          if q > 0 then Rest := Trim(Copy(Rest, 1, q - 1));
+          if not TryStrToInt64(Rest, EnumNext) then EnumLost := True;
+        end;
+        if EnumLost then Continue;             // the numbering is no longer known: answer nothing
+        if MemU = Nm then begin V := EnumNext; Exit(True); end;
+        Inc(EnumNext);
+        Continue;
+      end;
+      if (W = 'ENUM') and (Pos(' AS ', ' ' + Trim(Copy(U, p, MaxInt)) + ' ') = 0) then
+      begin
+        InEnum := True; EnumLost := False; EnumNext := 0;
+        Continue;
+      end;
       if W <> 'CONST' then Continue;
       Rest := Trim(Copy(U, p, MaxInt));
       // "Const AS <type> name = v" names the type first; step over it.
