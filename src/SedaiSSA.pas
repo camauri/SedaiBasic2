@@ -6670,6 +6670,29 @@ begin
         // object as an array or a call and answer with its handle.
         if TryEmitIndexOperator(Node, Result) then Exit;
 
+        // ⭐ ...and the same dispatch table as a UDT FIELD: "obj.arr(i)( args )" / "p->arr(i)( args )".
+        // The field already records its element signature (the parser marks an ARRAY field FUNCPTR
+        // exactly as it marks a scalar one) and reading obj.arr(i) already yielded the entry PC - what
+        // was missing was reading the SECOND subscript as a CALL. Without it the expression answered
+        // the element and the program printed a number; it looked right for as long as the callee
+        // happened to return the same value as the INDEX, which is how fbc's pointers/funptr_array1
+        // reads: "TEST_1 = 1" called with index 1. fbc suite pointers/funptr_array1, array_ptr_fn.
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(0).GetChild(0).ChildCount >= 1) then
+        begin
+          TempStr := UDTFuncPtrFieldSig(
+                       FindUDT(ObjectTypeName(Node.GetChild(0).GetChild(0).GetChild(0))),
+                       VarToStr(Node.GetChild(0).GetChild(0).Value), RecSlotK);
+          if TempStr <> '' then
+          begin
+            ProcessExpression(Node.GetChild(0), Left);      // obj.arr(i) -> the element's entry PC
+            Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
+            Exit;
+          end;
+        end;
+
         // Dispatch table "arr(i)(args)": child0 is itself an array access into an array of function
         // pointers ("Dim As <named funcptr type> arr(..)"). Evaluate arr(i) to the element's entry-PC
         // value and lower an indirect call through it with the array's recorded signature.
