@@ -12540,6 +12540,15 @@ var
 begin
   Result := srtFloat;
   if Node = nil then Exit;
+  // ⛔ A PARENTHESISED EXPRESSION HAS THE BANK OF WHAT IS INSIDE, and this reader had no arm for it -
+  // so it fell to the FLOAT default, which is this routine's way of saying "I do not know" while
+  // sounding like an answer. fbcunit's own CU_ASSERT_EQUAL wraps BOTH its arguments in parentheses, so
+  // "(l) = ("abc")" over a UDT with an "Operator Cast() As String" skipped the conversion entirely and
+  // compared a record HANDLE with a string: fbc's overload/op_concat, where the identical comparison
+  // written without the parentheses was right. Every other reader of a node - ObjectTypeName,
+  // DerefedType, ResolveRecordObject - has seen through parentheses since it was written.
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) do
+    Node := Node.GetChild(0);
   // ⭐ AN IIF EXPRESSION HAS THE BANK ITS TWO BRANCHES AGREE ON, and this is the question every caller
   // asks about it - VAR type inference, a DIM initialiser, a call argument. Unrecognised, an IIF fell
   // to the FLOAT default and "Dim As <UDT> u = IIf(c, z, "lit")" picked a constructor by the wrong
