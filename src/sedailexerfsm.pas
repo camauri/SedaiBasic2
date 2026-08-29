@@ -2261,7 +2261,16 @@ begin
           if GetCurrentChar = '=' then begin AdvanceChar; Result := CreateToken(ttCompoundAssign); end
           // FreeBASIC pointer-to-member "->": lexes as the member-access operator (our UDT pointers
           // carry the record handle directly, so p->field is the same as p.field).
-          else if GetCurrentChar = '>' then begin AdvanceChar; Result := CreateToken(ttOpDot); end
+          // ⛔ ...BUT THE TWO SPELLINGS ARE NOT ALWAYS INTERCHANGEABLE, so the '>' is kept in the token's
+          // VALUE. Over a parenthesised deref CHAIN they mean different depths - "(**q)->a" is one level
+          // deeper than "(***q).a" - and the reader that rewrites that shape had no way to tell them
+          // apart. Nothing compares a ttOpDot's value for anything else (censused).
+          else if GetCurrentChar = '>' then
+          begin
+            TokenBufferAdd(GetCurrentChar);
+            AdvanceChar;
+            Result := CreateToken(ttOpDot);
+          end
           else Result := CreateToken(ttOpSub);
           {$IFDEF DEBUG}
           if FDebugMode then

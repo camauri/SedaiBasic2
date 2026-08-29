@@ -3547,7 +3547,17 @@ begin
     //     spelling already worked while this one died on a null pointer. fbc's structs/self-ref.
     // ⛔ A SINGLE deref over an identifier or an address-of is left alone: m619's "(*tpp)->n" needs
     // both levels and m604's "(*@u).s" names u itself, and neither was broken to begin with.
-    if ((Inner <> nil) and (Inner.NodeType = antMemberAccess)) or (Levels >= 2) then
+    // ⛔⛔ ...AND THE "MORE THAN ONE DEREFERENCE" HALF IS ABOUT THE DOT SPELLING ONLY. The arrow IS a
+    // dereference of its own, so "(**q)->a" is one level deeper than "(***q).a" - and this rewrite,
+    // which cannot see which was written, took a level off both. The dot answered 123 and the arrow
+    // answered 1 on the same data (fbc's structs/self-ref writes the arrow). "->" now keeps the '>' in
+    // its token value, which is the only thing that separates them.
+    // ⛔⛔ ...AND THE SPELLING DECIDES, FOR BOTH HALVES. The arrow IS a dereference of its own, so
+    // "(*b.lpp)->a" is one level deeper than "(*b.lpp).a" and this rewrite - which removes the level the
+    // DOT implies - takes one too many from it. The dot answered 55 and the arrow answered 1 on the same
+    // field. "->" now keeps the '>' in its token value, which is the only thing that separates them.
+    if (VarToStr(Token.Value) <> '->') and
+       (((Inner <> nil) and (Inner.NodeType = antMemberAccess)) or (Levels >= 2)) then
       Left := Left.GetChild(0).GetChild(0);
   end;
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);

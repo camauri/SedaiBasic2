@@ -79,6 +79,16 @@ type
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
+    MultiPtrPointee: string;// ⛔ THE THIRD SHAPE, AND NOTHING RECORDED IT. A field declared "As T Ptr Ptr"
+                            // is neither of the two below: stripping one PTR leaves "T PTR", which is not
+                            // a UDT name (so PtrPointee stayed '') and is not a scalar (so RawPtrPointee
+                            // stayed '' too). Both empty means "this field is not a pointer", and every
+                            // dereference of it read a stale register - "(*b.lpp)->a" answered 1 where fbc
+                            // answers 55, on a field the same program reads correctly through a local copy.
+                            // Held BESIDE PtrPointee rather than in it: nine readers ask that one and all
+                            // of them FindUDT the answer, so a "T PTR" there would be filed under a name
+                            // none of them looks up. This one holds the FULL pointee spelling ("LEAF PTR")
+                            // and has exactly one reader, DerefedType, which strips levels for a living.
     RawPtrPointee: string;  // scalar pointee type if this field is a "<scalar> PTR" (e.g. "DOUBLE" for a
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
@@ -726,6 +736,7 @@ type
     function RawModuleAddrArrayId(const Name: string): Integer;                 // shared int array "<name>$RA" holding the raw block address (declares on first use)
     function RawModuleAddrReg(const Name: string): TSSAValue;                   // load the raw block address from that shared array
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
+    function UDTFieldMultiPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // full pointee of a "T Ptr Ptr..." field ("T PTR"), else ''
     function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
     function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
     function UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;  // field declared AS WSTRING?
@@ -25391,6 +25402,20 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].PtrPointee);
 end;
 
+function TSSAGenerator.UDTFieldMultiPtrPointee(UDTIdx: Integer; const FieldName: string): string;
+// The FULL pointee spelling of a MULTI-level UDT pointer field ("LEAF PTR" for "As Leaf Ptr Ptr"), or ''.
+// See the note on the record field: this is the shape neither PtrPointee nor RawPtrPointee could hold.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].MultiPtrPointee);
+end;
+
 function TSSAGenerator.UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string;
 // The scalar pointee type of a "<scalar> PTR" field (a raw byte-heap pointer), or '' — drives raw
 // indexing/deref of "obj.field" (obj.field[i], *obj.field, @obj.field[i]).
@@ -25596,7 +25621,7 @@ var
   cInt, cFloat, cStr, ArrDims: Integer;
   TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, ArrElemPtrPointeeT, FuncPtrSigVal: string;
   ArrElemScalarType: string;
-  RawPtrPointeeT, PointeeScalarT: string;
+  RawPtrPointeeT, PointeeScalarT, MultiPtrPointeeT, UltimateT: string;
   IsArrayField: Boolean;
 begin
   if (Idx < 0) or (Idx > High(FUDTs)) then Exit;
@@ -25637,6 +25662,7 @@ begin
       NestedT := '';
       PtrPointeeT := '';
       RawPtrPointeeT := '';
+      MultiPtrPointeeT := '';
       if (TypeName <> '') and (FindUDT(TypeName) >= 0) then
       begin
         Bank := srtInt;        // nested record field: int handle to the nested instance
@@ -25655,7 +25681,16 @@ begin
           if FindUDT(PointeeScalarT) >= 0 then
             PtrPointeeT := PointeeScalarT
           else if (Pos(' PTR', PointeeScalarT) = 0) then   // single-level scalar pointer only
-            RawPtrPointeeT := PointeeScalarT;
+            RawPtrPointeeT := PointeeScalarT
+          else
+          begin
+            // "T Ptr Ptr [Ptr...]" where T is a UDT: neither of the two above can hold it. The FULL
+            // pointee spelling goes in its own field; DerefedType strips one level per dereference.
+            UltimateT := PointeeScalarT;
+            while (Length(UltimateT) > 4) and (Copy(UltimateT, Length(UltimateT) - 3, 4) = ' PTR') do
+              UltimateT := Trim(Copy(UltimateT, 1, Length(UltimateT) - 4));
+            if FindUDT(UltimateT) >= 0 then MultiPtrPointeeT := PointeeScalarT;
+          end;
         end;
       end
       else
@@ -25667,12 +25702,12 @@ begin
       if FieldNode.Attributes.Values['FUNCPTR'] = '1' then
       begin
         FuncPtrSigVal := FieldNode.Attributes.Values['FPPARAMS'] + '|' + FieldNode.Attributes.Values['FPRET'];
-        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := '';
+        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := ''; MultiPtrPointeeT := '';
       end
       else if (TypeName <> '') and (FFuncPtrTypes.IndexOfName(TypeName) >= 0) then
       begin
         FuncPtrSigVal := FFuncPtrTypes.Values[TypeName];
-        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := '';
+        Bank := srtInt; NestedT := ''; PtrPointeeT := ''; RawPtrPointeeT := ''; MultiPtrPointeeT := '';
       end;
       // Array member (e.g. "Dim As Double m(Any, Any)"): the field itself is an int handle into the
       // global FArrays table (allocated per instance on REDIM); the element bank comes from the type.
@@ -25705,6 +25740,7 @@ begin
         NestedT := '';       // not a nested record (the field itself is the array handle)
         PtrPointeeT := '';
         RawPtrPointeeT := '';
+        MultiPtrPointeeT := '';
       end;
       n := Length(FUDTs[Idx].Fields);
       SetLength(FUDTs[Idx].Fields, n + 1);
@@ -25729,6 +25765,7 @@ begin
         FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1);
       FUDTs[Idx].Fields[n].PtrPointee := PtrPointeeT;
       FUDTs[Idx].Fields[n].RawPtrPointee := RawPtrPointeeT;
+      FUDTs[Idx].Fields[n].MultiPtrPointee := MultiPtrPointeeT;
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
@@ -34246,7 +34283,14 @@ begin
     begin
       OwnerIdx := FindUDT(UpperCase(ObjectTypeName(Node.GetChild(0))));
       if OwnerIdx >= 0 then
+      begin
         Result := UpperCase(UDTFieldPtrPointee(OwnerIdx, VarToStr(Node.Value)));
+        // ...and the MULTI-level shape, which neither of the two registries above can hold: "As T Ptr
+        // Ptr" points at a "T PTR", and answering '' for it made every dereference of such a field read
+        // a stale register. See the note on the MultiPtrPointee record field.
+        if Result = '' then
+          Result := UpperCase(UDTFieldMultiPtrPointee(OwnerIdx, VarToStr(Node.Value)));
+      end;
     end;
   end
   else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
