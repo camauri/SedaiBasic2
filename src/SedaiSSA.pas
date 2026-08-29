@@ -26526,12 +26526,11 @@ begin
   // then lowered against a plain integer.
   if (Node.NodeType = antNew) and (VarToStr(Node.Value) <> '') then
     Exit(UpperCase(VarToStr(Node.Value)) + ' PTR');
-  // ⛔ "Var p = ProcPtr(f)" is NOT closed by answering a type name here, and it was TRIED: a
-  // procedure pointer is not carried by a name in this map at all, it is carried by its SIGNATURE in
-  // FFuncPtrSigs, so "p()" still lowered as an array access ("Array not declared: P1"). Deducing it
-  // means registering the signature of f under p, which is a different piece of work from naming a
-  // pointee type - and shipping the branch that names one would have been a branch that does nothing.
-  // The explicit "Dim p As Sub() = ProcPtr(f)" works. DIVERGENZE 57.
+  // ⛔ "Var p = ProcPtr(f)" IS NOT ANSWERED HERE, and the reason is worth keeping: a procedure pointer
+  // is not carried by a name in this map at all, it is carried by its SIGNATURE in FFuncPtrSigs, so a
+  // type name answered here left "p()" lowering as an array access ("Array not declared: P1"). ✅ The
+  // half that was missing - registering the signature of f under p - is now PreProcPtrSigOf, asked by
+  // the VAR pre-pass BEFORE this function; DIVERGENZE 57 is closed, guard m694.
   if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) then
   begin
     NameNd := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Node.Value)), Node.Token);
