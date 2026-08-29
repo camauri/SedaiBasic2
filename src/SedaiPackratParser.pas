@@ -143,6 +143,9 @@ type
     // entry at all and every definition on it would pass unasked, which is exactly the case fbc
     // refuses. The member key is MemberDecoratorKey's, the one spelling an OPERATOR's '=' survives.
     FTypeNamesSeen: TStringList;
+    // ...and the ENUM names, which are NOT type names for the aggregate-initialiser question: an
+    // enum has no fields, so parentheses around its initialiser are plain grouping.
+    FEnumNamesSeen: TStringList;
     FTypeDeclaredMembers: TStringList;
     // ⛔ ...and the types declared INSIDE A NAMESPACE, which may not be named BARE at module level:
     // "Constructor UDT()" for a UDT that lives in "ns" is fbc's "error 160: Expected class or UDT
@@ -648,6 +651,7 @@ begin
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
   FTypeNamesSeen := TStringList.Create;       FTypeNamesSeen.CaseSensitive := False;
+  FEnumNamesSeen := TStringList.Create;       FEnumNamesSeen.CaseSensitive := False;
   FTypeDeclaredMembers := TStringList.Create; FTypeDeclaredMembers.CaseSensitive := False;
   FTypesInNamespace := TStringList.Create;    FTypesInNamespace.CaseSensitive := False;
   FStaticMemberProcs := TStringList.Create;
@@ -682,6 +686,7 @@ begin
   FConstIntValues.Free;
   FTypeStaticMethods.Free;
   FTypeNamesSeen.Free;
+  FEnumNamesSeen.Free;
   FTypeDeclaredMembers.Free;
   FTypesInNamespace.Free;
   FStaticMemberProcs.Free;
@@ -1060,7 +1065,7 @@ begin
   // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
   FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
-  FTypeNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
+  FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
@@ -1157,7 +1162,7 @@ begin
   // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
   FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
-  FTypeNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
+  FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
@@ -9977,7 +9982,12 @@ begin
       // one-field tuple and the pointer arithmetic was stored as if it were a field value - the program
       // then died dereferencing a null. IsBuiltinTypeName only matches BARE names, so "ZSTRING PTR"
       // answered False and looked like a UDT.
+      // ⛔ ...and AN ENUM IS NEVER AN AGGREGATE EITHER, for the same reason a pointer is not: it has no
+      // fields to fill. "Dim As colours c = (colours.green)" was read as a one-field tuple and the
+      // variable got nothing - 0 where fbc answers the member, in silence - while the identical
+      // initialiser without the parentheses was right.
       if (TupleDepth = 0) and (not Nested) and (not IsBuiltinTypeName(DimTypeName)) and
+         (FEnumNamesSeen.IndexOf(UpperCase(DimTypeName)) < 0) and
          (Pos(' PTR', UpperCase(DimTypeName)) = 0) then
       begin
         Context.Advance;
@@ -12499,9 +12509,17 @@ begin
           Context.Advance;                   // Any
           ArrayDecl.Attributes.Values['ANYINIT'] := '1';
         end
+        // ⛔ ...AND ONLY WHEN A '(' FOLLOWS IT. The name of the declared type on the right of '=' is the
+        // CONSTRUCTOR shorthand "Dim As T v = T( args )", and the block below reads that '('. Consuming
+        // the name without looking made every OTHER expression that merely BEGINS with the type name
+        // lose its head: "Dim As colours e = colours.green" swallowed "colours" and left ".green"
+        // standing, which then parsed as a leading-dot global reference and the variable was
+        // initialised with nothing at all - 0 where fbc answers the member. The assignment form
+        // "e = colours.green" beside it was right, which is what said the defect was in the DIM.
         else if Context.Check(ttIdentifier) and
            (UpperCase(Context.CurrentToken.Value) = DimTypeName) and
-           (not IsBuiltinTypeName(DimTypeName)) then
+           (not IsBuiltinTypeName(DimTypeName)) and
+           Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
           Context.Advance                    // RHS == declared UDT: ctor form (block below reads '(')
         else if Context.Check(ttDelimParOpen) then
         begin
@@ -13330,6 +13348,8 @@ begin
           SkipAliasClause) then                       // a nameless "Enum Alias \"n\""
   begin
     Result.Value := UpperCase(VarToStr(Context.CurrentToken.Value));   // enum type name
+    if FEnumNamesSeen.IndexOf(VarToStr(Result.Value)) < 0 then
+      FEnumNamesSeen.Add(VarToStr(Result.Value));
     Context.Advance;
     SkipAliasClause;                                  // "Enum E Alias \"n\"" - a LINKER name
     // FreeBASIC "Enum <name> Explicit": the members are reachable ONLY through the enum's name. Left

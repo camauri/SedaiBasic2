@@ -30777,6 +30777,11 @@ begin
   Result := '';
   if (FTypeEnumMembers = nil) or (TypeName = '') or (MemberName = '') then Exit;
   T := UpperCase(TypeName);
+  // ⭐ ...AND THE NAME MAY BE AN ALIAS OF THE TYPE. "Type foo As bar" makes "foo.MYCONST" the same
+  // constant as "bar.MYCONST" - fbc's const/typedef writes exactly that, forward-declared. Asked
+  // through CanonicalType, the funnel every other reader of an alias uses, and only when the written
+  // name is not itself a type. The same line is in TypeScopedConstAccess, which does the second half.
+  if FindUDT(T) < 0 then T := UpperCase(CanonicalType(T));
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
@@ -31037,6 +31042,7 @@ var
   Idx, Guard: Integer;
 begin
   T := UpperCase(TypeName);
+  if FindUDT(T) < 0 then T := UpperCase(CanonicalType(T));   // ...through an ALIAS, as the owner test does
   Guard := 0;
   while (T <> '') and (Guard < 64) and (FTypeConstMembers <> nil) do
   begin
@@ -37066,7 +37072,7 @@ procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValu
 // Lower a record field read "obj.field" to ssaRecordLoad<bank>(dest, handle, slot). If the
 // member is not a field but a (no-arg) method of the object's type, lower a method call.
 var
-  TypeName, NestedT, MethodLbl, SMBack, QualKey: string;
+  TypeName, NestedT, MethodLbl, SMBack, QualKey, EnumQual: string;
   UDTIdx, Slot, QualIdx: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal: TSSAValue;
@@ -37081,8 +37087,15 @@ begin
   // no such type, and every "E.<member>" answered the same wrong value.
   // ...and an enum NESTED IN A TYPE is named through both ("Type.enumname.member"), so the qualifier may
   // itself be a member access whose last segment is the enum name. Same answer: the bare member.
+  // ⭐ ...AND THE QUALIFIER MAY BE AN ALIAS OF THE ENUM. "Type foo As bar" makes "foo.val2" the same
+  // member as "bar.val2" - fbc's const/typedef writes exactly that, and the forward form ("Type foo As
+  // bar" BEFORE the enum) is the point of the test. Asked through CanonicalType, the funnel every other
+  // reader of an alias already uses, and only when the written name is not itself an enum.
+  EnumQual := UpperCase(VarToStr(Node.GetChild(0).Value));
+  if (EnumQual <> '') and (FEnumNames.IndexOf(EnumQual) < 0) then
+    EnumQual := UpperCase(CanonicalType(EnumQual));
   if ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antMemberAccess)) and
-     (FEnumNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+     (FEnumNames.IndexOf(EnumQual) >= 0) then
   begin
     // ⛔ ...BUT "E.B" IS NOT "B". The comment above states the assumption this arm was built on - that
     // a member is a module-wide constant under its bare name - and it is the assumption that fails:
@@ -37090,7 +37103,7 @@ begin
     // enum declaring the same member name takes the FIRST one's storage (E1.X / E2.X answered 5 5
     // where fbc answers 3 5). A member is a compile-time CONSTANT in FreeBASIC, so the qualified
     // spelling answers with the value the enum it names gave it, and nothing can shadow a constant.
-    QualKey := UpperCase(VarToStr(Node.GetChild(0).Value)) + '.' + UpperCase(VarToStr(Node.Value));
+    QualKey := EnumQual + '.' + UpperCase(VarToStr(Node.Value));
     QualIdx := FEnumQualVals.IndexOfName(QualKey);
     if QualIdx >= 0 then
     begin
