@@ -497,6 +497,7 @@ type
     function SameUDTName(const A, B: string): Boolean;      // ...one of the two may carry its NAMESPACE
     function SubtypeDistance(const U, T: string): Integer;   // steps up the EXTENDS chain, -1 if U is not a T
     function TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;  // ...summed over a type tail
+    function TypeTailMatchesCanonical(const A, B: string): Boolean;   // ...through TYPE ALIASES on both sides
     function IsSubtypeOf(const U, T: string): Boolean;
     function MethodNeedsDispatch(const TypeName, MethNm: string): Boolean;
     procedure GenerateDispatchers;
@@ -519,7 +520,8 @@ type
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
-    function OverloadNameForArity(const Name: string; Arity: Integer): string;  // @name of an OVERLOAD set
+    function OverloadNameForArity(const Name: string; Arity: Integer; const FPParams: string = ''): string;  // @name of an OVERLOAD set
+    procedure StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);   // tell "@f" what signature its destination wants
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
     procedure EnsureObjectBaseType;                // OOP: register the built-in empty OBJECT base type (RTTI root)
@@ -2723,7 +2725,8 @@ begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadProcAddr, Result,
                         MakeSSALabel(ProcedureLabelName(OverloadNameForArity(VarToStr(Node.Value),
-                                     StrToIntDef(Node.Attributes.Values['SIGARITY'], -1)))),
+                                     StrToIntDef(Node.Attributes.Values['SIGARITY'], -1),
+                                     Node.Attributes.Values['SIGPARAMS']))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;
@@ -10720,6 +10723,9 @@ begin
       FFuncPtrSigs.Values[UpperCase(ArrName)] :=
         ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
         Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
+      // ...and "Dim p As Function(ByRef As B) As T = @fun" tells @fun WHICH overload it wants.
+      if ArrayDeclNode.ChildCount >= 3 then
+        StampFuncPtrTarget(ArrayDeclNode.GetChild(2), ArrayDeclNode.Attributes.Values['FPPARAMS']);
       if not FInProcedure then
         FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FFuncPtrSigs.Values[UpperCase(ArrName)];
     end
@@ -22918,19 +22924,58 @@ begin
   Result := 'PROC_' + UpperCase(Name);
 end;
 
-function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer): string;
+procedure TSSAGenerator.StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);
+// Record on an "@f" node the PARAMETER TYPES its destination declares, so an overload set can be told
+// apart by more than the parameter COUNT. Sig is the "FPPARAMS|FPRET" the declaration carries; only the
+// params half is used, and only a bare "@name" is stamped - anything else already names one procedure.
+var
+  P: Integer;
+begin
+  if (InitNode = nil) or (Sig = '') then Exit;
+  while (InitNode.NodeType = antParentheses) and (InitNode.ChildCount >= 1) do
+    InitNode := InitNode.GetChild(0);
+  if (InitNode.NodeType <> antProcAddress) or (InitNode.ChildCount <> 0) then Exit;
+  P := Pos('|', Sig);
+  if P > 1 then InitNode.Attributes.Values['SIGPARAMS'] := Copy(Sig, 1, P - 1)
+  else if P = 0 then InitNode.Attributes.Values['SIGPARAMS'] := Sig;
+end;
+
+function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer;
+  const FPParams: string): string;
 // The member of an OVERLOAD set to take the address of. An overload set has no bare label - every member
 // carries a "~<sig>" suffix - so "@s" / "ProcPtr(s)" had nothing to point at and died as an undefined
 // procedure. With a signature argument ("ProcPtr(s, Sub(ByVal i As Integer))", fbc 1.09+) the parameter
 // COUNT picks the member; without one, the first declared member, which is what a program with a single
 // candidate means. Returns Name unchanged when it is not an overload set.
+//
+// ⭐ ...AND THE DESTINATION'S OWN PARAMETER TYPES PICK IT WHEN THE COUNT CANNOT. Two overloads of one
+// arity - "fun(ByRef As A)" and "fun(ByRef As B)" - both signed the bank 'I' (every UDT is a handle),
+// so the count matched BOTH and the FIRST won every "@fun": a program assigning @fun to a
+// "function(ByRef As B)" pointer called the A one and answered its value, in silence. FPParams is the
+// DESTINATION's declared parameter-type list, and it is compared against the type tail the declaration
+// already carries - the same tail ResolveCallLabel matches, with the same namespace tolerance.
+// ⛔ Only a UNIQUE match is taken: two candidates that fit equally well leave the arity rule in place,
+// which is what it did before.
 var
-  Pref, BankPart: string;
-  k: Integer;
+  Pref, BankPart, Cand: string;
+  k, Hits: Integer;
 begin
   Result := Name;
   if FProcDecls.ContainsKey(UpperCase(Name)) then Exit;
   Pref := UpperCase(Name) + '~';
+  if FPParams <> '' then
+  begin
+    Cand := ''; Hits := 0;
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        if not TypeTailMatchesCanonical(UpperCase(FPParams),
+                 SigNamePart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) then Continue;
+        Inc(Hits);
+        Cand := FProcedureNames[k];
+      end;
+    if (Hits = 1) and (Cand <> '') then Exit(Cand);
+  end;
   for k := 0 to FProcedureNames.Count - 1 do
     if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
     begin
@@ -26812,6 +26857,34 @@ begin
     if idx < 0 then Break;
     cur := FUDTs[idx].Parent;
     Inc(guard);
+  end;
+end;
+
+function TSSAGenerator.TypeTailMatchesCanonical(const A, B: string): Boolean;
+// Two positional, comma-separated type tails compared THROUGH THE ALIASES, with '-' on either side
+// meaning "unknown". A funcptr TYPE may name its parameter by an alias - "Type foo_ As foo" is the
+// forward-declaration idiom fbc's own suite uses - while the procedure's own label carries the type it
+// was DEFINED with, so an exact comparison sees "FOO_" against "FOO" and matches nothing.
+var
+  C, D: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  C := TStringList.Create;
+  D := TStringList.Create;
+  try
+    C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := A;
+    D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := B;
+    if C.Count <> D.Count then Exit;
+    for i := 0 to C.Count - 1 do
+    begin
+      if (C[i] = '-') or (D[i] = '-') then Continue;
+      if SameUDTName(C[i], D[i]) then Continue;
+      if not SameUDTName(CanonicalType(UpperCase(C[i])), CanonicalType(UpperCase(D[i]))) then Exit;
+    end;
+    Result := True;
+  finally
+    C.Free; D.Free;
   end;
 end;
 
@@ -37250,7 +37323,7 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
   TypeName, NestedT, SMBack, AllocFn: string;
-  UDTIdx, Slot, FixCap, BitIdx: Integer;
+  UDTIdx, Slot, FixCap, BitIdx, FPSlot: Integer;
   BitUnit: TSSAValue;
   Bank: TSSARegisterType;
   FixWide: Boolean;
@@ -37294,6 +37367,11 @@ begin
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
+  // ⭐ "obj.f = @fun" where f is a FUNCPTR FIELD tells @fun which overload it wants - the same hint the
+  // DIM form gives. Without it the arity rule picked the first, and two overloads of one arity that
+  // differ only in their UDT parameter type both sign the bank 'I': the wrong one was called in silence.
+  if UDTIdx >= 0 then
+    StampFuncPtrTarget(ExprNode, UDTFuncPtrFieldSig(UDTIdx, UpperCase(VarToStr(MemberNode.Value)), FPSlot));
   // ⛔ "a->b = CAllocate( Len(T) )" where b is a "<T> Ptr" FIELD: FreeBASIC's linked-list idiom, and
   // it has to take the SAME Option-B conversion a pointer VARIABLE takes - allocate a MANAGED record
   // block and store its HANDLE. TryAllocAssign only ever saw a variable name, so a field kept the RAW
