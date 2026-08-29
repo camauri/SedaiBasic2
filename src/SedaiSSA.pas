@@ -3338,6 +3338,18 @@ begin
       // test the shared-scalar path uses, so a parameter or local of the same name still wins.
       else if ModuleConstInt(VarName, ConstIntVal) then
         Result := MakeSSAConstInt(ConstIntVal)
+      // ⛔ FreeBASIC implicit THIS: a bare field name in a method body reads "this.<field>" - AND IT IS
+      // ASKED BEFORE THE SHARED SCALAR, not after. The STORE path has had that order all along
+      // (ProcessAssignment asks it first); the READ did not, so "Dim Shared dup" beside a type with a
+      // field "dup" made "Print dup" inside that type's own method print the GLOBAL while "dup = x"
+      // beside it wrote the FIELD - the two halves of one name disagreeing, which is worse than either
+      // answer. fbc suite structs/inherit-type-4, where the field is INHERITED and the global is a
+      // different string in every namespace of the file.
+      else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
+      begin
+        ProcessExpression(ArgListNode, Result);
+        ArgListNode.Free;
+      end
       else if IsSharedScalar(VarName) then
       begin
         ArgListNode := MakeSharedScalarAccess(VarName, Node.Token);
@@ -3348,12 +3360,6 @@ begin
         // "Dim Shared f As String * 10" is padded on store, so without this its comparison against ""
         // saw ten NULs and answered NOT EQUAL where fbc answers equal (fbc's own string/comp_null).
         if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
-      end
-      // FreeBASIC implicit THIS: a bare field name in a method body reads "this.<field>".
-      else if TryImplicitThisField(VarName, Node.Token, ArgListNode) then
-      begin
-        ProcessExpression(ArgListNode, Result);
-        ArgListNode.Free;
       end
       // ...and a bare name that is a no-argument METHOD or a PROPERTY of the owner type reads
       // "this.<name>" too -- which is how a property setter reads its own getter (FreeBASIC's own
@@ -37190,7 +37196,15 @@ begin
     end;
     Exit;
   end;
-  if ResolveExisting(VarName, tmp) then Exit;                  // a param / local DIM shadows the field
+  // ⛔ ...BUT A MODULE-SHARED VARIABLE IS NOT A SHADOW. ResolveExisting deliberately lets a
+  // "Dim Shared" fall through to the module namespace (its own header says so), so ANY global of the
+  // field's name silenced the implicit THIS: "Dim Shared As ZString * 32 dup" beside a type with a
+  // field "dup" made "Print dup" inside that type's own method print the GLOBAL - and so did an
+  // INHERITED field, which is the shape fbc's structs/inherit-type-4 asserts. fbc's order is the
+  // other way round: the field of THIS wins over every variable that is not local to this frame.
+  // ⚠️ A PARAMETER and a LOCAL DIM still win, which is what the guard was written for - those bind
+  // before the proc-root and IsSharedScalar does not claim them.
+  if ResolveExisting(VarName, tmp) and (not IsSharedScalar(VarName)) then Exit;
   MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarName), Tok);
   MemberNode.AddChild(TASTNode.CreateWithValue(antIdentifier, 'THIS', Tok));
   Result := True;
