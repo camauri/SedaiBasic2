@@ -2186,7 +2186,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#INCLUDE` | ✓ | Inserts text from a file. |
+| `#INCLUDE` | ✓ | Inserts text from a file. `#include once` splices a file only if it has not been included yet — and a PLAIN `#include` registers the file too, so “once” after two plain includes is skipped (29 Aug 2026, fbc's own `pp/inc_once1..5`). Identity is the canonical PATH, not the spelling. |
 | `#INCLIB` | ✓ | Accepted and ignored — there is no separate link step, and a program that names a library still has to compile. Verified against fbc 1.10.1 (28 Aug 2026). |
 | `#LIBPATH` | ✓ | Accepted and ignored; see `#INCLIB`. Verified against fbc 1.10.1 (28 Aug 2026). |
 
@@ -2194,7 +2194,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `#PRAGMA` | ✓ | Accepted; `#pragma once` behaves as fbc does. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `#PRAGMA` | ✓ | `#pragma once` and `#pragma reserve` are implemented (29 Aug 2026); every other pragma is accepted and ignored, as before. ⚠️ The previous wording here — “`#pragma once` behaves as fbc does, verified 28 Aug 2026” — was **wrong**: the directive was not handled at all, it was dropped in silence, and the first include of such a header is right either way, which is what made it look verified. It is what a table entry asserting a behaviour nobody exercised costs. |
 | `#PRAGMA RESERVE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#CMDLINE` | ✓ | Accepted; `Command()` answers as fbc does. Verified against fbc 1.10.1 (28 Aug 2026). |
 | `#LANG` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
@@ -3240,13 +3240,30 @@ Each of these is *refused with a message that names the reason*, never answered 
   the header is harmless — most programs that do never call into it — but a *call* fails, now with a
   message that says so rather than "Array not declared". Use the BASIC equivalents
   (`Open`/`Print #`/`Close`, `Print Using`).
-- **Inline assembly**: `Asm … End Asm`, `Naked` procedures, `#pragma reserve`, and `__FB_ASM__`
-  branches that select one. Machine code in the source is not something a bytecode VM can host —
-  one of its engines is an interpreter.
+- **Inline assembly**: `Asm … End Asm`, `Naked` procedures, and `__FB_ASM__` branches that select one.
+  Machine code in the source is not something a bytecode VM can host — one of its engines is an
+  interpreter, and the interpreter is the *reference* the AOT and JIT validators demand MISMATCH 0
+  against, so a feature alive on two engines of four could not be verified at all. The targets are not
+  only x86 either (the WebAssembly backend, and the MCU work).
+  ⭐ **An `Asm … End Asm` block that holds NO INSTRUCTION is accepted** (29 August 2026): there is
+  nothing to translate. fbc's own `pp/pragma-reserve-7` writes one whose entire content is
+  preprocessor directives — consumed before the parser sees the block — and the test is about the
+  reserved-symbol lists, not about assembly. The moment there is one token between `Asm` and
+  `End Asm`, the refusal stands.
   ⚠️ Until 26 August 2026 an `Asm … End Asm` block was worse than unsupported: `Asm` is not a reserved
   word, so the block parsed as a bare call to an undefined name and its closing `End Asm` was read as
   plain `End` — which **stops the program**. A `Print` before the block ran, a `Print` after it did
   not, and the exit code was `0`. It is now refused by name, which is what this whole section promises.
+  ⛔ Accepting-and-ignoring is therefore *not* the fallback it looks like: it is that same bug in
+  another dress, which is why the empty-block rule above is drawn at "no instruction", not at "no
+  instruction we recognise".
+- **`#pragma reserve`** is **supported** as of 29 August 2026, in the half that is observable without a
+  symbol table: `defined(NAME)` answers TRUE for an unqualified reservation, a qualified one
+  (`#pragma reserve (asm) NAME`) reserves the name in another namespace and leaves `defined()` FALSE,
+  and reserving the same name twice at the same block level is refused. ⚠️ Still **not** enforced: fbc
+  also REFUSES a module-level declaration of an unqualified reserved name (`error 4` / `error 325`),
+  and `#pragma reserve (…)` outside module level. Both need the parser and are listed in
+  `job/markdown/DIVERGENZE.md`.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance
