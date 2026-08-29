@@ -61,6 +61,7 @@ type
     // name = an ordinary numeric FOR.
     IterType: string;           // T, or '' when this is not a type-driven loop
     IterHasStep: Boolean;       // the source wrote STEP, so the one-argument operators are used
+    CounterScoped: Boolean;     // "For i As T": the counter got a scope frame of its own, popped at NEXT
   end;
 
   { User-defined function info for DEF FN }
@@ -14486,6 +14487,7 @@ var
   StepSignReg: Integer;  // Register to hold STEP sign check result
   UseLELabel, UseGELabel, CheckResultLabel: string;  // Labels for runtime step direction
   NeedRuntimeCheck: Boolean;  // True if STEP direction must be determined at runtime
+  CounterScoped: Boolean;     // "For i As T": a scope frame was opened for the counter
 begin
   if Node.ChildCount < 3 then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
@@ -14502,11 +14504,28 @@ begin
   // already present in the wanted bank: a second "FOR i AS Integer" in the same scope must reuse the first
   // one's register, else the freshly-bound counter and the body (which resolves the older binding) would
   // diverge — the loop would step one register while the body reads a stale one.
+  CounterScoped := False;
   if Node.Attributes.Values['VARTYPE'] <> '' then
   begin
     WantBank := TypeNameToBank(Node.Attributes.Values['VARTYPE'], VarName);
-    if not (ResolveExisting(VarName, VarReg) and (VarReg.RegType = WantBank)) then
-      VarReg := DeclareVariableTyped(VarName, WantBank);
+    // ⭐ "For i As T = ..." DECLARES i, and the declaration is a SCOPE OF ITS OWN that ends at NEXT.
+    // An outer "i" is untouched: fbc's scopes/fornext sets i = 100, runs "For i As Integer = 1 To 3",
+    // and asserts i = 100 afterwards - we answered 4, because the head bound the OUTER name. Worse
+    // than the leftover value: two NESTED loops both written "For i As Integer" shared one counter,
+    // so the inner loop reset the outer one and the outer body ran ONCE (3 and 9 iterations became
+    // 1 and 3). And it is not only the counter: a "Dim As Double i" outside came back as an INTEGER.
+    // ⛔ The counter is in scope for the START/END/STEP expressions too - the frame opens BEFORE they
+    // are evaluated, which is where fbc reads the (uninitialised) new i in "For i As Integer = i To 3".
+    // ⚠️ MODERN only; CLASSIC has no lexical scope and its FOR counter is the module's.
+    if FModernMode then
+    begin
+      ScopePushFrame(skBlock);
+      CounterScoped := True;
+    end;
+    // ...and it is bound ANEW, never reused. The old code reused an existing binding of the same bank
+    // "so a second FOR i As Integer in the same scope keeps one register"; with a frame per head that
+    // reuse is exactly what made two same-named loops one loop.
+    VarReg := DeclareVariableTyped(VarName, WantBank);
     // A "FOR i AS UInteger/ULongInt" counter prints unsigned (no leading sign space), and a narrow counter
     // type wraps on step -- record its width/print-kind like a DIM does, or "For i As UInteger ... Print i"
     // printed the sign space FreeBASIC omits (Rosetta's digit-count / Wilson's-theorem loops).
@@ -14917,6 +14936,9 @@ begin
   // if a CONTINUE actually references it, so loops without CONTINUE keep byte-identical bytecode).
   LoopInfo.ContLabel := GenerateUniqueLabel('for_cont');
   LoopInfo.ContUsed := False;
+  LoopInfo.IterType := '';
+  LoopInfo.IterHasStep := False;
+  LoopInfo.CounterScoped := CounterScoped;   // "For i As T": pop the counter's frame at NEXT
   SetLength(FLoopStack, Length(FLoopStack) + 1);
   FLoopStack[High(FLoopStack)] := LoopInfo;
 end;
@@ -15405,6 +15427,9 @@ begin
       WriteLn('[SSA] Edge: ', CondBlock.LabelName, ' → ', EndBlock.LabelName, ' (false)');
     {$ENDIF}
   end;
+  // "For i As T" opened a scope for its counter: it ends here, so the name goes back to whatever it
+  // meant before the loop (usually nothing, sometimes an outer variable of another type entirely).
+  if LoopInfo.CounterScoped then ScopePopFrame;
   // "Next j, i": close the next loop out with the same code, one fewer to go.
   if RemainingNext > 1 then
   begin
