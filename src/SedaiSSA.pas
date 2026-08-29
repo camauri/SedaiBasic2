@@ -37960,6 +37960,13 @@ begin
   for i := 0 to NArgs - 1 do
     MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i));
 
+  // ⭐ ...and so does the FUNCPTR SIGNATURE a parameter declares. "takeB( @fun )" against
+  // "Sub takeB( ByVal p As Function(ByRef As B) As T )" tells @fun which overload it wants, exactly as
+  // a DIM or a funcptr FIELD does - the third place a destination knows and the argument does not.
+  for i := 0 to NArgs - 1 do
+    if ParamList.GetChild(i).Attributes.Values['FUNCPTR'] = '1' then
+      StampFuncPtrTarget(ArgListNode.GetChild(i), ParamList.GetChild(i).Attributes.Values['FPPARAMS']);
+
   // Phase 1: evaluate every explicit argument (in source order, preserving side-effect order) into a
   // bank register, recording its target transfer slot.
   for i := 0 to NArgs - 1 do
