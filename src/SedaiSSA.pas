@@ -35417,6 +35417,17 @@ begin
       // access read p's own backing. A scalar's backing is not a program array.
       if (Result = '') and ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
         Result := PointerUDTType(ArrName);
+      // ...and one level further out: "pp[i]" of a "T PTR PTR" is a "T PTR", so the access that
+      // follows reaches T. PointerUDTType answers '' for it (its pointee is not a UDT), and without
+      // this rung the type came out '' and ProcessMemberAccess returned before ResolveRecordObject
+      // could lower the indirection - "pp[0]->f" printed a packed address where fbc prints the field.
+      if (Result = '') and ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
+      begin
+        NestedT := UpperCase(ManagedPtrPointee(ArrName));
+        if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') and
+           (FindUDT(Trim(Copy(NestedT, 1, Length(NestedT) - 4))) >= 0) then
+          Result := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+      end;
       // "f(args).field" / "f(args).method()": a user FUNCTION whose return type is a UDT. Its return
       // type is registered under the function's own name (that is what makes "Dim As T x = f(...)" work).
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
@@ -36022,7 +36033,7 @@ end;
 function TSSAGenerator.ResolveRecordObject(ObjNode: TASTNode; out HandleVal: TSSAValue;
   out TypeName: string): Boolean;
 var
-  ArrName, ParentType, NestedT, MemberArrElemType, MethodLbl, DerefT: string;
+  ArrName, ParentType, NestedT, MemberArrElemType, MethodLbl, DerefT, Pointee: string;
   MethodArgs: TASTNode;
   MemberArrHandle, MemberArrIdx: TSSAValue;
   MemberArrBank: TSSARegisterType;
@@ -36335,6 +36346,39 @@ begin
         TypeName := ParentType;
         Result := True;
         Exit;
+      end;
+      // ⛔ "pp[i]->field" where pp is a "T PTR PTR": the element is not pp's value plus i, it is what
+      // LIVES at pp + i - one indirection more than the rung below performs. Every other spelling of
+      // the same access already worked ("(*pp)->f", "(**pp).f", "(*(pp+i))->f", and the two-step form
+      // through a variable), so this one shape answered a packed address where fbc answers the field:
+      // 1 instead of 55 (job/tests/bas/bug_an_addr_taken_pointer_inside_a_procedure.bas named it as
+      // the last knot of that family). Written as the deref it IS, and handed back to this routine -
+      // the deref arm above already knows that "*(T PTR PTR)" is a "T PTR" the access then follows.
+      // ⚠️ The synthesised "+" carries the IDENTIFIER's token, never an operator one: a binary-op node
+      // whose token is an operator is lowered from that TOKEN, and building it with a "*" quietly
+      // produced a multiply (see EmitVarArgGet, which learned this the hard way).
+      Pointee := UpperCase(ManagedPtrPointee(ArrName));
+      if (Length(Pointee) > 4) and (Copy(Pointee, Length(Pointee) - 3, 4) = ' PTR') and
+         (FindUDT(Trim(Copy(Pointee, 1, Length(Pointee) - 4))) >= 0) and (ObjNode.ChildCount >= 2) then
+      begin
+        ChainIdx := ObjNode.GetChild(1);
+        if (ChainIdx <> nil) and (ChainIdx.NodeType in [antArgumentList, antExpressionList]) and
+           (ChainIdx.ChildCount = 1) then
+          ChainIdx := ChainIdx.GetChild(0);
+        if ChainIdx <> nil then
+        begin
+          CancelObj := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
+          SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', ObjNode.GetChild(0).Token);
+          SharedTmp.AddChild(ObjNode.GetChild(0).Clone);
+          SharedTmp.AddChild(ChainIdx.Clone);
+          CancelObj.AddChild(SharedTmp);
+          try
+            Result := ResolveRecordObject(CancelObj, HandleVal, TypeName);
+          finally
+            CancelObj.Free;
+          end;
+          Exit;
+        end;
       end;
       // "ptr[i].field": ptr is a pointer to a UDT (a Callocate(n, SizeOf(T)) record block, or a single
       // managed handle). The i-th record's handle is ptr's value + i — records from one Callocate are
