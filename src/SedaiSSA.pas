@@ -321,6 +321,9 @@ type
                                          // address); reads/writes auto-dereference, like a BYREF-return param.
     FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
     FRawUDTPtrs: TStringList;            // "T PTR" vars holding a RAW address (a UDT laid over bytes) -> T
+    // WHY a pointer is raw, for the one case where it matters: it is "@x" of a raw-backed @-taken
+    // SCALAR, so it addresses a VARIABLE's slot rather than owning bytes of its own.
+    FRawFromAddrOf: TStringList;
     FVarPtrQuals: TStringList;           // var (UPPER) -> its type's CONST chain: base, then one char per pointer level
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
@@ -1432,6 +1435,8 @@ begin
   FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TStringList.Create;
   FRefVars := TStringList.Create;
+  FRawFromAddrOf := TStringList.Create;
+  FRawFromAddrOf.CaseSensitive := False;
   FRawUDTPtrs := TStringList.Create;
   FRawUDTPtrs.CaseSensitive := False;
   FVarPtrQuals := TStringList.Create;
@@ -1567,6 +1572,7 @@ begin
   FBlockManagedTypes.Free;
   FConstDeclSeen.Free;
   FConstStrBytes.Free;
+  FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
   FVarPtrQuals.Free;
   FWStringVars.Free;
@@ -32690,6 +32696,14 @@ var
   begin
     Result := False;
     if (Rhs = nil) or (Rhs.NodeType <> antArrayAccess) then Exit;
+    // ⛔ ...and NOT when the base is raw only because it is "@x" of a raw-backed @-taken SCALAR. That
+    // pointer addresses a VARIABLE's slot, and the slot holds whatever the variable holds - for a UDT
+    // pointer, a managed record HANDLE. Marking the target raw then made "*t" read the handle as a byte
+    // address: "Dim q As T Ptr = @y : Dim qq As T Ptr Ptr = @q : t = qq[0] : t->i" died on
+    // "Null or invalid pointer dereference", while "t = *qq" - the same value, and it compares EQUAL -
+    // was right. Rawness of the CONTAINER is not rawness of the CONTENT.
+    if (Rhs.ChildCount >= 1) and (Rhs.GetChild(0).NodeType = antIdentifier) and
+       (FRawFromAddrOf.IndexOf(UpperCase(VarToStr(Rhs.GetChild(0).Value))) >= 0) then Exit;
     ET := RawChainElemType(Rhs);
     if (Length(ET) < 4) or (Copy(ET, Length(ET) - 3, 4) <> ' PTR') then Exit;
     // ...unless the cell holds a MANAGED block. Then its value is a record HANDLE, and marking the
@@ -32788,7 +32802,14 @@ var
     end
     else if (Rhs.NodeType = antProcAddress) and (Rhs.ChildCount = 0) and
             (FAddrTakenScalars.IndexOfName(UpperCase(VarToStr(Rhs.Value))) >= 0) then
-      MarkRaw(TargetU)   // p = @x where x is a raw-backed @-taken scalar: a real byte pointer
+    begin
+      MarkRaw(TargetU);  // p = @x where x is a raw-backed @-taken scalar: a real byte pointer
+      // ⛔ ...AND THAT RAWNESS IS THE CONTAINER'S, NOT THE CONTENT'S. This pointer addresses a
+      // VARIABLE's slot; what the slot HOLDS is whatever that variable holds, which for a UDT pointer
+      // is a managed record HANDLE. Every other raw source (Allocate, New[], ScreenPtr, SAdd) owns
+      // real bytes, and only for those is "p[i] is as raw as p" true. See IsRawPtrCellExpr.
+      if FRawFromAddrOf.IndexOf(TargetU) < 0 then FRawFromAddrOf.Add(TargetU);
+    end
     else if RawPtrExprName(Rhs) <> '' then
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
     else if IsRawPtrCellExpr(Rhs) then
@@ -35423,6 +35444,14 @@ begin
       // could lower the indirection - "pp[0]->f" printed a packed address where fbc prints the field.
       if (Result = '') and ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName)) then
       begin
+        // ⚠️ Over a pointer-to-pointer that owns REAL BYTES (a CAllocate'd block) this rung is only
+        // HALF right, and half is what it is kept for. The raw path has no rung for a "T Ptr Ptr"
+        // either - RawUDTPtrType declines, so "pp[i]->f" used to answer rubbish for EVERY i, silently
+        // (2 where fbc says 11 and 22). With this rung index 0 is correct and any other index FAULTS,
+        // because the managed reading adds i unscaled where the block wants i*8. Measured both ways:
+        // right-for-0-and-loud beats wrong-for-all-and-quiet, which is this project's rule. The
+        // missing half - a raw rung for a pointer-to-pointer block - is named in
+        // job/tests/bas/bug_an_addr_taken_pointer_inside_a_procedure.bas.
         NestedT := UpperCase(ManagedPtrPointee(ArrName));
         if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') and
            (FindUDT(Trim(Copy(NestedT, 1, Length(NestedT) - 4))) >= 0) then
