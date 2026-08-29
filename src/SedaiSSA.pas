@@ -492,6 +492,7 @@ type
     procedure EmitCallSubLabel(const LabelName: string);  // ssaCallSub(label) + block split
     // OOP virtual dispatch (M4.3)
     function ImplementsInterface(const U, T: string): Boolean;             // MODERN: U names T in IMPLEMENTS
+    function IifArgs(Node: TASTNode): TASTNode;   // the argument list of an "IIf(c,a,b)" node, nil if it is not one
     function IsStrictSubtypeOf(const U, T: string): Boolean;                // the EXTENDS chain alone
     function SubtypeDistance(const U, T: string): Integer;   // steps up the EXTENDS chain, -1 if U is not a T
     function TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;  // ...summed over a type tail
@@ -596,6 +597,7 @@ type
     // MODERN: gather the DIM'd UDTs of THIS scope only -- a DIM inside a block belongs to the block.
     procedure CollectRecordVarsAtThisLevel(Node: TASTNode; Into: TStringList; var Depth: Integer);
     procedure CollectLocalRecordVars(Node: TASTNode);  // V5: gather a proc body's DIM'd local UDTs
+    procedure CollectNonRecordLocalsDeep(Node: TASTNode);  // ...and the non-record names it declares, blocks included
     procedure EmitFrameDestructors;                     // V5: dtor calls for the current frame
     procedure EmitBaseDestructorChain;                  // OOP: ~Derived() ends by running ~Base()
     procedure EmitByrefParamStore;                      // BYREF: callee — write explicit-BYREF scalar params back to their slots
@@ -12324,6 +12326,24 @@ begin
   end;
 end;
 
+function TSSAGenerator.IifArgs(Node: TASTNode): TASTNode;
+// The argument list of an "IIf(cond, a, b)" expression, or nil when the node is not one. IIF is not a
+// registered keyword, so it PARSES as an array access on a name called IIF; the same three tests the
+// lowering uses are asked here, in one place, because two other questions have to recognise it too -
+// what BANK the expression has and what UDT TYPE it names.
+begin
+  Result := nil;
+  if (Node = nil) or (not FModernMode) then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
+  if UpperCase(VarToStr(Node.GetChild(0).Value)) <> 'IIF' then Exit;
+  if ArrayIndexOf('IIF') >= 0 then Exit;
+  if not (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then Exit;
+  if Node.GetChild(1).ChildCount < 3 then Exit;
+  Result := Node.GetChild(1);
+end;
+
 function TSSAGenerator.InferExprBank(Node: TASTNode): TSSARegisterType;
 // Best-effort, non-emitting type of an expression — used only to pick the bank/suffix of the IIF
 // result temp. Covers the realistic IIF branch shapes (literals, variables, string functions,
@@ -12351,9 +12371,25 @@ var
   Nm: string;
   ai: Integer;
   L, R: TSSARegisterType;
+  IfA: TASTNode;
+  BT, BF: TSSARegisterType;
 begin
   Result := srtFloat;
   if Node = nil then Exit;
+  // ⭐ AN IIF EXPRESSION HAS THE BANK ITS TWO BRANCHES AGREE ON, and this is the question every caller
+  // asks about it - VAR type inference, a DIM initialiser, a call argument. Unrecognised, an IIF fell
+  // to the FLOAT default and "Dim As <UDT> u = IIf(c, z, "lit")" picked a constructor by the wrong
+  // bank. Same order EmitIif uses for the temp: STRING over FLOAT over INT.
+  IfA := IifArgs(Node);
+  if IfA <> nil then
+  begin
+    BT := InferExprBank(IfA.GetChild(1));
+    BF := InferExprBank(IfA.GetChild(2));
+    if BT = BF then Exit(BT);
+    if (BT = srtString) or (BF = srtString) then Exit(srtString);
+    if (BT = srtFloat) or (BF = srtFloat) then Exit(srtFloat);
+    Exit(srtInt);
+  end;
   case Node.NodeType of
     antLiteral:
       if ((Node.Token <> nil) and (Node.Token.TokenType = ttStringLiteral)) or VarIsStr(Node.Value) then
@@ -27071,6 +27107,16 @@ begin
       Lbl := T + '.CONSTRUCTOR#' + ArgSig + ':' + UdtSig;
       if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     end;
+    // ⛔⛔ AND A T BUILT FROM A T IS A COPY, NOT A CONVERSION. Once the exact copy constructor above
+    // has been asked for and is not there, the answer is "no constructor" - the caller then copies the
+    // record, which is what fbc's implicit copy does. Falling through instead handed the argument to a
+    // CONVERTING constructor, because a UDT handle signs the bank 'I' exactly like a pointer: with
+    // "Constructor(ByVal s As Const ZString Const Ptr)" declared, "Dim b As UB = u" called THAT with the
+    // handle as its pointer and dereferenced it - a null raw pointer dereference on fbc's own
+    // udt-zstring/iif and udt-wstring/iif, and a silently wrong field value where the ctor did not
+    // dereference. ⚠️ Only for a SINGLE argument of exactly this type: a subtype argument still resolves
+    // as before (fbc slices it through a constructor), and the type tail is the only thing that says so.
+    if (ArgSig = 'I') and (UdtSig <> '') and SameText(UdtSig, T) then Exit('');
     // 2) exact bank signature
     Lbl := T + '.CONSTRUCTOR#' + ArgSig;
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
@@ -29409,6 +29455,82 @@ begin
       CollectRecordVarsAtThisLevel(Node.GetChild(c), Into, Depth);
 end;
 
+procedure TSSAGenerator.CollectNonRecordLocalsDeep(Node: TASTNode);
+// Add to FCurrentProcNonRecs every name this procedure declares as a NON-record - including inside a
+// Scope/If/loop BLOCK, which CollectRecordVarsAtThisLevel deliberately does not enter.
+//
+// ⛔ WHY THE BLOCKS HAVE TO BE SEEN HERE AND NOT THERE. That walk fills FCurrentProcLocalRecs, which
+// also drives EmitFrameDestructors: a record declared in a block belongs to the BLOCK's teardown, and
+// collecting it for the frame would destroy it twice. This list has no teardown duty at all - it is a
+// SCREEN, the thing that stops the program-wide name->type map from making a local a record because
+// some OTHER procedure declares that name as one. So the two halves need different depths.
+// The symptom was an access violation with no UDT anywhere near the failing line: "Sub tz(): Scope:
+// Dim a As ZString * 50 : Print a" died because another procedure declared "Dim a As <UDT>" in a
+// scope of its own, and PRINT ran that type's Cast operator on a handle that does not exist.
+// fbc suite udt-zstring/iif, udt-wstring/iif.
+//
+// ⛔⛔ A NAME THIS PROCEDURE ALSO DECLARES AS A RECORD IS NOT SCREENED. The screen is by NAME and
+// applies to the WHOLE procedure, so a block-local "Dim a As Integer" would otherwise take the
+// record-ness away from a "Dim a As <UDT>" in a sibling block - the retroactive-by-name hazard that
+// made the same idea fail for MarkAddressTaken (DIVERGENZE 56). Both kinds are gathered first and only
+// the names that are non-records EVERYWHERE in this procedure end up screening.
+var
+  UdtNames, PlainNames: TStringList;
+
+  procedure Walk(N: TASTNode; Top: Boolean);
+  var
+    i, k: Integer;
+    Decl: TASTNode;
+    VName, TName: string;
+  begin
+    if N = nil then Exit;
+    if (not Top) and (N.NodeType = antProcedureDecl) then Exit;   // a nested procedure owns its own
+    if N.NodeType = antDim then
+      for k := 0 to N.ChildCount - 1 do
+      begin
+        Decl := N.GetChild(k);
+        if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 2) then Continue;
+        if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
+        VName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+        TName := '';
+        if Decl.GetChild(1).NodeType = antIdentifier then
+          TName := UpperCase(VarToStr(Decl.GetChild(1).Value))            // DIM v AS T
+        else if (Decl.ChildCount >= 3) and (Decl.GetChild(1).NodeType = antDimensions) and
+                (Decl.GetChild(2).NodeType = antIdentifier) then
+          TName := UpperCase(VarToStr(Decl.GetChild(2).Value));           // DIM v(dims) AS T
+        if TName = '' then Continue;
+        // BIGINT is a HANDLE type exactly like a UDT and answers < 0 to FindUDT by design - the two
+        // other collectors say so in the same words, and screening one took its record-ness away.
+        if (FindUDT(TName) >= 0) or (TName = 'BIGINT') then
+        begin
+          if UdtNames.IndexOf(VName) < 0 then UdtNames.Add(VName);
+        end
+        else if PlainNames.IndexOf(VName) < 0 then
+          PlainNames.Add(VName);
+      end;
+    for i := 0 to N.ChildCount - 1 do Walk(N.GetChild(i), False);
+  end;
+
+var
+  i: Integer;
+begin
+  if (Node = nil) or (FCurrentProcNonRecs = nil) or (not FModernMode) then Exit;
+  UdtNames := TStringList.Create;
+  PlainNames := TStringList.Create;
+  try
+    UdtNames.CaseSensitive := False;
+    PlainNames.CaseSensitive := False;
+    Walk(Node, True);
+    for i := 0 to PlainNames.Count - 1 do
+      if (UdtNames.IndexOf(PlainNames[i]) < 0) and
+         (FCurrentProcNonRecs.IndexOf(PlainNames[i]) < 0) then
+        FCurrentProcNonRecs.Add(PlainNames[i]);
+  finally
+    UdtNames.Free;
+    PlainNames.Free;
+  end;
+end;
+
 procedure TSSAGenerator.CollectLocalRecordVars(Node: TASTNode);
 // V5: gather the DIM'd UDT (record) variables of a procedure body, in textual order, as
 // "VARNAME|TYPENAME" entries in FCurrentProcLocalRecs (used to emit destructor calls at exit).
@@ -29423,6 +29545,7 @@ begin
     Depth := 0;
     for c := 0 to Node.ChildCount - 1 do
       CollectRecordVarsAtThisLevel(Node.GetChild(c), FCurrentProcLocalRecs, Depth);
+    CollectNonRecordLocalsDeep(Node);   // ...and the SCREEN goes into the blocks the walk above skips
     Exit;
   end;
   // CLASSIC: no block scope -- a DIM anywhere in the body is this frame's variable.
@@ -35593,7 +35716,7 @@ var
   Bank: TSSARegisterType;
   Slot: Integer;
   Lvl, BaseIdx: Integer;
-  CancelObj: TASTNode;
+  CancelObj, IfA: TASTNode;
 begin
   Result := '';
   if ObjNode = nil then Exit;
@@ -35601,6 +35724,18 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐ "IIf(c, u, v)" NAMES A UDT WHEN BOTH ITS BRANCHES DO. An IIF parses as an array access, so this
+  // answered '' for it, the call site's type tail came out empty, and "Dim As T x = IIf(c, u, v)"
+  // resolved its constructor by BANK alone - where a UDT handle is an 'I' exactly like a pointer, and
+  // a converting constructor took the handle as a pointer. The two branches have to AGREE: a mixed
+  // pair has no single record type and answering one of them would be a guess.
+  IfA := IifArgs(ObjNode);
+  if IfA <> nil then
+  begin
+    Result := ObjectTypeName(IfA.GetChild(1));
+    if (Result = '') or not SameText(Result, ObjectTypeName(IfA.GetChild(2))) then Result := '';
+    Exit;
+  end;
   // ...and "(*@u)" is u - see ResolveRecordObject, which asks the same question about the same node.
   CancelObj := DerefOfAddrOfTarget(ObjNode);
   if CancelObj <> nil then
