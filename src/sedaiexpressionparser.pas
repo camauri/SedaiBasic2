@@ -979,6 +979,40 @@ begin
     IdentName := UpperCase(Token.Value);
   end;
 
+  // ⛔ ...AND "CVI<16>( s )" IS THE SAME FOLD, on the same three tokens. FreeBASIC parameterises the
+  // serialisation pair by BIT WIDTH - CVI<16>/<32>/<64> and MKI<16>/<32>/<64> - and each one already
+  // has a plain name here: CVSHORT / CVL / CVLONGINT and MKSHORT / MKL / MKLONGINT (verified against
+  // the oracle: "cvi<16>(s)" and "cvshort(s)" answer the same number). Unfolded, the '<' read as a
+  // comparison and "print cvi<16>( s )" quietly answered 0 - the '>' comparison of a boolean - which is
+  // a WRONG NUMBER with no diagnostic; fbc's own string/mkcv could not be parsed past it.
+  if ((IdentName = 'CVI') or (IdentName = 'MKI')) and Context.Check(ttOpLt) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType in [ttNumber, ttInteger]) then
+  begin
+    FnName := '';
+    if IdentName = 'CVI' then
+    begin
+      if VarToStr(Context.PeekNext.Value) = '16' then FnName := kCVSHORT
+      else if VarToStr(Context.PeekNext.Value) = '32' then FnName := kCVL
+      else if VarToStr(Context.PeekNext.Value) = '64' then FnName := kCVLONGINT;
+    end
+    else
+    begin
+      if VarToStr(Context.PeekNext.Value) = '16' then FnName := kMKSHORT
+      else if VarToStr(Context.PeekNext.Value) = '32' then FnName := kMKL
+      else if VarToStr(Context.PeekNext.Value) = '64' then FnName := kMKLONGINT;
+    end;
+    // ⚠️ Only a width that HAS a name. Anything else is left to read as it always did - a comparison -
+    // rather than folded into a guess.
+    if FnName <> '' then
+    begin
+      Context.Advance;                               // '<'
+      Context.Advance;                               // the bit count
+      if Context.Check(ttOpGt) then Context.Advance; // '>'
+      IdentName := FnName;
+      Token := TLexerToken.CreateSimple(Token.TokenType, FnName);
+    end;
+  end;
+
   // FreeBASIC CAST(type, expr) / CPTR(type, expr): the first argument is a TYPE (which the expression
   // parser cannot parse as an expression), so handle it specially. Lowers to antCast(value = type
   // string, child0 = value expr). In the raw-pointer model a pointer cast is a value passthrough (the
