@@ -12448,15 +12448,31 @@ procedure TSSAGenerator.EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
 // IIF(cond, a, b) (FreeBASIC): short-circuit conditional expression — only the taken branch is
 // evaluated. Lowered by REUSING ProcessIfStatement (the proven IF path, with correct PHIs at the
 // merge): synthesize "IF cond THEN tmp = a ELSE tmp = b", process it, then read tmp. The result
-// bank is taken from the TRUE branch (FB widens to float if either is float — not modelled here).
+// ⭐ THE RESULT BANK IS DECIDED BY BOTH BRANCHES, NOT BY THE TRUE ONE. Taking the true branch
+// alone is wrong in two ways that both show as a NUMBER where a value was expected:
+//   - "IIf(0, 1, 2.5)" answered 2 where fbc answers 2.5 - the temp was an int because the true
+//     branch is one, and the float branch truncated into it. (The header used to say this was "not
+//     modelled"; it is now, and the note was the whole documentation of a wrong answer.)
+//   - A UDT with an "Operator Cast() As ZString" signs the INT bank (every UDT is a handle), so
+//     "IIf(c, u, LIT)" made an int temp and the assignment stored the HANDLE - printed as a small
+//     number. The mirror spelling "IIf(c, LIT, u)" worked, because there the true branch is a
+//     string and the store into a string temp runs the cast. fbc suite udt-zstring/iif, udt-wstring/iif.
+// STRING wins over FLOAT and FLOAT over INT, which is the order the two branches can disagree in:
+// fbc refuses a string/number pair outright, so that combination is a divergence either way.
 var
   IfNode, ThenNode, ElseNode, Asn: TASTNode;
-  Bank: TSSARegisterType;
+  Bank, BankF: TSSARegisterType;
   TmpName, Suffix: string;
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 3) then begin Result := MakeSSAValue(svkNone); Exit; end;
 
   Bank := InferExprBank(ArgsNode.GetChild(1));
+  BankF := InferExprBank(ArgsNode.GetChild(2));
+  if Bank <> BankF then
+  begin
+    if (Bank = srtString) or (BankF = srtString) then Bank := srtString
+    else if (Bank = srtFloat) or (BankF = srtFloat) then Bank := srtFloat;
+  end;
   case Bank of
     srtString: Suffix := '$';
     srtInt: Suffix := '%';
