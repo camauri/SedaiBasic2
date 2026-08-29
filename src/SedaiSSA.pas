@@ -36092,6 +36092,18 @@ begin
         SharedTmp.Free;
         HandleVal := EnsureIntRegister(HandleVal);
       end
+      // ⛔ ...AND A BACKED POINTER IS NOT IN ITS REGISTER EITHER. The SHARED case above is one of
+      // FOUR: an @-taken scalar is moved to a raw byte slot (module level) or to a per-frame one
+      // (inside a procedure), and its plain register is then stale. Reading it here gave "p->field"
+      // a garbage handle the moment anything took "@p" - EAccessViolation - while "(*p).field", the
+      // same thing by definition, went through ProcessExpression and was right. That funnel already
+      // knows all four backings; asking it is the whole fix.
+      else if IsRawModuleScalar(VarToStr(ObjNode.Value)) or
+              (FAddrLocalVars.IndexOfName(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
+      begin
+        ProcessExpression(ObjNode, HandleVal);
+        HandleVal := EnsureIntRegister(HandleVal);
+      end
       else
         HandleVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value))));
       Result := True;
