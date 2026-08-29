@@ -2363,6 +2363,23 @@ begin
     if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
     Exit(True);
   end;
+  // ⛔ ...AND A MODULE-LEVEL FUNCTION NAMED WITHOUT PARENTHESES IS A CALL HERE TOO. The ordinary
+  // identifier path has asked BareCallableFunction since it was written; this one went straight to the
+  // variable, so ".bar" read an unbound register and printed 0 while ".bar()" - the SAME name, one
+  // pair of parentheses later - called it and printed 2. That is the tell for a rule one path has and
+  // its sibling does not. fbc's namespace/global2 writes the bare form three ways ('.func', '..func',
+  // and a "#define global ." macro). DIVERGENZE 89.
+  if (UpperCase(VarToStr(Node.Value)) <> FCurrentProcName) and
+     BareCallableFunction(UpperCase(VarToStr(Node.Value))) then
+  begin
+    AccNode := TASTNode.Create(antArgumentList, Node.Token);
+    try
+      EmitUserFunctionCall(UpperCase(VarToStr(Node.Value)), AccNode, Res);
+    finally
+      AccNode.Free;
+    end;
+    Exit(True);
+  end;
   Res := GetOrAllocateVariable(VarToStr(Node.Value), True);
   if AnyFixedLen then Res := MaybeFixedLenRead(Node, Res);
   Result := True;

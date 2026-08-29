@@ -43,6 +43,11 @@ type
     NamespaceNames: TStringList;   // every effective namespace prefix (UPPER), e.g. FORMS, OUTER.INNER
     MemberKeys: TStringList;       // "PREFIX|MEMBER" for each declared member (membership test)
     GlobalNames: TStringList;      // names declared at MODULE level, outside every namespace.
+                                   // ⭐ Each carries the TOP-LEVEL INDEX it was declared at, in
+                                   // Objects[]: fbc's screen on an imported name is POSITIONAL.
+    CurTopIndex: Integer;          // the module-level statement currently being rewritten (MaxInt = unknown)
+    CurNsPrefix: string;           // the namespace whose own children we are rewriting ('' = none)
+    CurNsIndex: Integer;           // ...and which of its children (MaxInt = unknown)
                                    // ⛔ They WIN over a name a USING imported: fbc resolves an
                                    // unqualified reference against the global scope before the
                                    // imported ones, so "Dim Shared v" beside "Using A" (which also
@@ -65,6 +70,7 @@ type
     // The imports of Prefix, its imports' imports, and so on. Cycle-safe: a namespace already in Acc
     // is never expanded twice, which is what makes a mutual "using" terminate.
     procedure AddUsingClosure(const Prefix: string; Acc: TStringList);
+    function MemberIndex(const Prefix, Name: string): Integer;
   end;
 
 constructor TNsContext.Create;
@@ -82,6 +88,9 @@ begin
   MemberKeys.Duplicates := dupIgnore;
   MemberKeys.Sorted := True;
   GlobalNames := TStringList.Create;
+  CurTopIndex := MaxInt;
+  CurNsPrefix := '';
+  CurNsIndex := MaxInt;
   GlobalNames.Duplicates := dupIgnore;
   GlobalNames.Sorted := True;
 end;
@@ -99,6 +108,16 @@ end;
 function TNsContext.IsMember(const Prefix, Name: string): Boolean;
 begin
   Result := MemberKeys.IndexOf(Prefix + '|' + Name) >= 0;
+end;
+
+function TNsContext.MemberIndex(const Prefix, Name: string): Integer;
+// Which child of its namespace declared this member. -1 if it is not a member at all.
+var
+  i: Integer;
+begin
+  Result := -1;
+  i := MemberKeys.IndexOf(Prefix + '|' + Name);
+  if i >= 0 then Result := Integer(PtrInt(MemberKeys.Objects[i]));
 end;
 
 procedure TNsContext.AddUsingClosure(const Prefix: string; Acc: TStringList);
@@ -230,7 +249,7 @@ begin
         else
         begin
           MemName := MemberDeclName(Decl);
-          if MemName <> '' then Ctx.MemberKeys.Add(ChildPrefix + '|' + MemName);
+          if MemName <> '' then Ctx.MemberKeys.AddObject(ChildPrefix + '|' + MemName, TObject(PtrInt(j)));
           // ⛔ AN ENUM'S MEMBERS ARE MEMBERS OF THE NAMESPACE TOO, and registering only the enum's own
           // NAME let them LEAK to module level: with an "E1.B = 2" outside and an "E1.B = 12" inside a
           // namespace, an unqualified B answered 12 - the namespace one - where fbc answers 2, and
@@ -318,7 +337,16 @@ end;
 
 // The names a DIM/declaration node binds locally, appended to Shadow. Called by the walk at the moment
 // the declaration is REACHED, so it shadows from there on and not before.
-procedure AddDeclaredNames(Node: TASTNode; Shadow: TStringList);
+procedure NoteDeclared(Shadow: TStringList; const N: string; AtIndex: Integer);
+// Record a declared name with the position it was declared at. ⛔ THE FIRST DECLARATION WINS, and it
+// is written out rather than left to the list: a SORTED TStringList with dupIgnore does NOT keep the
+// first entry's Object on a duplicate AddObject, so the LAST position silently won - which put a
+// module DIM's name at a later procedure's index and made it invisible where it should be seen.
+begin
+  if Shadow.IndexOf(N) < 0 then Shadow.AddObject(N, TObject(PtrInt(AtIndex)));
+end;
+
+procedure AddDeclaredNames(Node: TASTNode; Shadow: TStringList; AtIndex: Integer = 0);
 var
   i: Integer;
 begin
@@ -332,10 +360,51 @@ begin
   if Node.NodeType = antRedim then Exit;
   if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 1) and
      (Node.GetChild(0).NodeType = antIdentifier) then
-    Shadow.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+    NoteDeclared(Shadow, UpperCase(VarToStr(Node.GetChild(0).Value)), AtIndex);
+  // ⛔⛔ ...AND A MODULE-LEVEL SUB/FUNCTION IS A DECLARED NAME TOO, which this list did not know: it
+  // collected DIMs only. So "Function bar" of the program's own beside a "Using ns1" that also has a
+  // bar meant the IMPORTED one - "print bar" answered 1 where fbc answers 2 - while the same program
+  // written with "Dim Shared bar" resolved correctly, which is the pair that names it. The rule was in
+  // one path and not its sibling ([[a-rule-one-path-has-and-the-other-does-not]]).
+  // ⚠️ fbc goes further and REFUSES the program when the declaration comes AFTER the Using ("error 4:
+  // Duplicated definition"), so nothing it accepts is harmed by our list having no position: it only
+  // ever decides in favour of the program's own name, which is what fbc does whenever it compiles at
+  // all. DIVERGENZE 89. fbc suite namespace/global2.
+  // ⛔ A dotted name is a METHOD body ("Sub UDT.proc"), not a module-level name of its own.
+  // ⛔⛔ ...AND A PROCEDURE'S BODY IS NOT THE MODULE'S. The descent below follows every antDim it
+  // meets, and a procedure node's children ARE its body - so "Sub p() : Dim As Integer foo" put FOO in
+  // the list of names the MODULE declares. As a SET that was merely too generous; with a POSITION it
+  // is a wrong answer, because the position recorded is the procedure's and not the module DIM's.
+  // A procedure contributes its own NAME and nothing from inside it.
+  if (Node.NodeType = antProcedureDecl) then
+  begin
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+       (Pos('.', VarToStr(Node.GetChild(0).Value)) = 0) then
+      NoteDeclared(Shadow, UpperCase(VarToStr(Node.GetChild(0).Value)), AtIndex);
+    Exit;
+  end;
   for i := 0 to Node.ChildCount - 1 do
     if Node.GetChild(i).NodeType in [antArrayDecl, antDim] then
-      AddDeclaredNames(Node.GetChild(i), Shadow);
+      AddDeclaredNames(Node.GetChild(i), Shadow, AtIndex);
+end;
+
+function GlobalNameVisibleAt(Ctx: TNsContext; const V: string): Boolean;
+// ⭐ fbc's screen on an imported name is POSITIONAL, and this is where the position is spent. A name
+// the program declares at MODULE level beats an import - but only from the point it is DECLARED:
+//   "function bar : 2 : end function        : sub p() : using ns1 : print bar"   -> 2, the program's
+//   "sub p() : using ns1 : print bar : ...  : function bar : 2 : end function"   -> 1, the import's
+// Both compile under fbc and they answer differently, so a SET of names cannot express it: the entry
+// carries the top-level index it was declared at, and CurTopIndex says where we are now.
+// ⚠️ MaxInt means "position unknown" (a walk that is not the module's own children), and there every
+// declared name is treated as visible - which is the answer this test gave before it had a position.
+var
+  Idx: Integer;
+begin
+  Result := False;
+  if Ctx = nil then Exit;
+  Idx := Ctx.GlobalNames.IndexOf(V);
+  if Idx < 0 then Exit;
+  Result := Integer(PtrInt(Ctx.GlobalNames.Objects[Idx])) <= Ctx.CurTopIndex;
 end;
 
 // Resolve an unqualified member name V against the active prefix chain (innermost first). Returns
@@ -346,19 +415,35 @@ function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext;
 // so a name of the namespace one is written INSIDE always wins over an imported one - which is what
 // fbc does and the only order that keeps an existing program's meaning.
 var
-  P: string;
+  P, Member: string;
   DotPos, u: Integer;
   Closure: TStringList;
+  MemberIsLater: Boolean;
 begin
   Result := '';
   P := ActivePrefix;
+  Member := '';
+  MemberIsLater := False;
   while P <> '' do
   begin
-    if Ctx.IsMember(P, V) then Exit(P + '.' + V);
+    if Ctx.IsMember(P, V) then
+    begin
+      Member := P + '.' + V;
+      // ⭐ ...BUT ONLY IF IT IS DECLARED BY NOW. fbc's screen is POSITIONAL: a member of the namespace
+      // we are written inside, declared BELOW this point, does not shadow what a "Using" brought in.
+      //   namespace ns2 : sub p() : using ns1 : print bar : end sub : function bar : 2 : ...
+      // answers ns1's bar, not ns2's - fbc's own namespace/import_method asserts exactly that.
+      // ⛔ The screen is a TIE-BREAK against an import and NOTHING ELSE: with no import offering the
+      // name, a later member still resolves, or every forward reference inside a namespace would
+      // break. That is why Member is remembered here and returned below rather than being skipped.
+      MemberIsLater := (P = Ctx.CurNsPrefix) and (Ctx.MemberIndex(P, V) > Ctx.CurNsIndex);
+      Break;
+    end;
     DotPos := LastDelimiter('.', P);
     if DotPos = 0 then Break;
     P := Copy(P, 1, DotPos - 1);
   end;
+  if (Member <> '') and (not MemberIsLater) then Exit(Member);
   // ⛔ ...but a MODULE-LEVEL name of the program's own wins over every import: fbc resolves an
   // unqualified reference against the global scope first. "Dim Shared v" beside a "Using A" that also
   // has a v means the global v, and without this test the import silently took the name over.
@@ -374,7 +459,7 @@ begin
   // (fbc suite namespace/var-named-as-udt, which writes that pair on purpose). Only a module-level
   // TYPE can outrank an imported one.
   if (Using <> nil) and
-     (((not TypeSlot) and (Ctx.GlobalNames.IndexOf(V) < 0)) or
+     (((not TypeSlot) and (not GlobalNameVisibleAt(Ctx, V))) or
       (TypeSlot and (Ctx.GlobalTypeNames.IndexOf(V) < 0))) then
   begin
     Closure := TStringList.Create;
@@ -387,6 +472,8 @@ begin
       Closure.Free;
     end;
   end;
+  // No import offered the name: a member of an enclosing namespace stands, wherever it was declared.
+  if Member <> '' then Exit(Member);
 end;
 
 // Re-resolve the TYPE NAMES carried in an overload signature's tail against the enclosing namespace
@@ -521,7 +608,8 @@ var
   Drop: array of Integer;
   UsingNs: string;
   SigPos, DotPos: Integer;
-  BaseV, SigV: string;
+  BaseV, SigV, SavedNsPrefix: string;
+  SavedNsIndex: Integer;
 begin
   Result := Node;
 
@@ -547,8 +635,23 @@ begin
   // downstream ever sees a stray PRINT USING that would take the next PRINT's format with it.
   UseUsing := Using;
   SetLength(Drop, 0);
+  SavedNsPrefix := '';
+  SavedNsIndex := MaxInt;
+  if Ctx <> nil then
+  begin
+    SavedNsPrefix := Ctx.CurNsPrefix;
+    SavedNsIndex := Ctx.CurNsIndex;
+  end;
   for i := 0 to Node.ChildCount - 1 do
   begin
+    // Where we are, in module-level statements: what a "Using" is allowed to take over depends on it.
+    if (Node.NodeType = antProgram) and (Ctx <> nil) then Ctx.CurTopIndex := i;
+    // ...and the same question one level in: which child of THIS namespace we are rewriting.
+    if (Node.NodeType = antNamespace) and (Ctx <> nil) then
+    begin
+      Ctx.CurNsPrefix := ChildPrefix;
+      Ctx.CurNsIndex := i;
+    end;
     UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx, ChildPrefix);
     if UsingNs <> '' then
     begin
@@ -635,6 +738,13 @@ begin
     NewNode := RewriteRefs(Node.GetChild(i), ChildPrefix, UseShadow, Ctx, UseUsing);
     if NewNode <> Node.GetChild(i) then
       ReplaceChildAt(Node, i, NewNode);   // frees the old child, installs the rewritten one
+  end;
+  // The descent may have moved the "where we are" marker into a nested namespace; this node's own
+  // rewriting below belongs to the scope it started in.
+  if Ctx <> nil then
+  begin
+    Ctx.CurNsPrefix := SavedNsPrefix;
+    Ctx.CurNsIndex := SavedNsIndex;
   end;
   for i := High(Drop) downto 0 do
     Node.RemoveChildAt(Drop[i]);          // the directive has done its work; it is not a statement
@@ -961,7 +1071,7 @@ begin
     for gi := 0 to AST.ChildCount - 1 do
       if AST.GetChild(gi).NodeType <> antNamespace then
       begin
-        AddDeclaredNames(AST.GetChild(gi), Ctx.GlobalNames);
+        AddDeclaredNames(AST.GetChild(gi), Ctx.GlobalNames, gi);
         // ...and the module-level TYPE names on their own, for the type-slot question.
         if (AST.GetChild(gi).NodeType = antTypeDecl) and (VarToStr(AST.GetChild(gi).Value) <> '') then
           Ctx.GlobalTypeNames.Add(UpperCase(VarToStr(AST.GetChild(gi).Value)));
