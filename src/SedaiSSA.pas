@@ -3593,7 +3593,15 @@ begin
             end;
           end;
         end;
-        ProcessExpression(Node.GetChild(0), Left);
+        // ⛔ ...AND WHEN NO UNARY OPERATOR IS DECLARED, A NUMERIC "Operator Cast" STILL CONVERTS. The
+        // BINARY arm has taken that path since it was written - which is why "v + 1" answered 1235
+        // while "-v" beside it answered -1, the record HANDLE negated, and "Not v" answered -2. fbc's
+        // own overload/uop_coersion calls it "auto-coercion from UDT to integer using the op ovl" and
+        // tests exactly this pair. A type with no numeric Cast is unaffected: the helper declines and
+        // the operand is lowered as before.
+        if not ((Node.Token.TokenType in [ttOpSub, ttBitwiseNOT]) and
+                TryEmitUDTCastToNumber(Node.GetChild(0), Left)) then
+          ProcessExpression(Node.GetChild(0), Left);
 
         // Check if this is NOT (bitwise) or negation (-)
         if Node.Token.TokenType = ttBitwiseNOT then
@@ -37113,11 +37121,19 @@ begin
       HandleVal := GetOrAllocateVariable(UpperCase(VarToStr(ObjNode.Value)));
     Result := True;
   end
-  else if ObjNode.NodeType = antBinaryOp then
+  else if (ObjNode.NodeType = antBinaryOp) or (ObjNode.NodeType = antUnaryOp) then
   begin
     // "(p + k)->field": p is a managed UDT pointer, so p + k IS the k-th record's handle (unscaled, the
     // same value EmitPointerIndexAddress computes for "p[k]"). Evaluating the arithmetic yields it.
     TypeName := ManagedPtrArithUDT(ObjNode);
+    // ⛔ ...AND AN OVERLOADED OPERATOR RETURNING A UDT IS A RECORD OBJECT TOO, in both arities.
+    // ObjectTypeName has resolved "(a + b)" and "-a" to the operator's RETURN TYPE since those arms
+    // were written - which is why "Dim As T r = v + v : Print r.i" was right all along - but this
+    // routine, the one that produces the HANDLE, knew pointer arithmetic and nothing else and simply
+    // gave up: "(v + v).i" answered 1 for 34. Evaluating the expression yields the returned record's
+    // handle, exactly as it already does for a function call. The same rule one path had and the other
+    // did not, on two halves of one question.
+    if TypeName = '' then TypeName := ObjectTypeName(ObjNode);
     if TypeName = '' then Exit;
     ProcessExpression(ObjNode, HandleVal);
     HandleVal := EnsureIntRegister(HandleVal);
