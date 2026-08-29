@@ -920,6 +920,7 @@ type
     function HasUDTNumberCast(Node: TASTNode): Boolean;  // ...and its numeric mirror (emits nothing)
     // "Operator Cast() As <another UDT>": run it and hand back the RESULT's record handle.
     function TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string; out Val: TSSAValue): Boolean;
+    function UDTCastsToUDT(const SrcType, DstType: string): Boolean;   // ...asked without emitting
     function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
@@ -21768,7 +21769,7 @@ function TSSAGenerator.ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boo
 // the same overload-by-parameter gap the CAST operator has, and a separate piece of work.)
 var
   ObjType, Lbl, ParamType, RhsType: string;
-  TmpArgs, Decl, PList, P: TASTNode;
+  TmpArgs, Decl, PList, P, ConvNode: TASTNode;
   i: Integer;
   Dummy: TSSAValue;
 begin
@@ -21793,16 +21794,33 @@ begin
       end;
   end;
   RhsType := UpperCase(ObjectTypeName(ExprNode));
+  ConvNode := nil;
   if FindUDT(ParamType) >= 0 then
   begin
-    // A UDT operand: only an expression of that very type reaches it.
-    if RhsType <> ParamType then Exit;
+    // A UDT operand: an expression of that very type reaches it...
+    if RhsType <> ParamType then
+    begin
+      // ⛔ ...OR ONE THAT CONVERTS TO IT THROUGH ITS OWN CAST OPERATOR. fbc chains the two: "an = dg"
+      // runs "Dog.Cast() As LivingThing" and hands the result to "Animal.Let(LivingThing)" - its own
+      // structs/obj_cast_ovl2 spells that out in a comment. Read as "only that very type", the whole
+      // path declined and the assignment fell through to a memberwise copy that ran neither operator:
+      // an.b answered 0 for -1234. Both one-step forms were already right ("an = a LivingThing", and
+      // the EXPLICIT "an = Cast(LivingThing, dg)"), which is what showed the gap was the CHAIN.
+      // The machinery is TryEmitUDTCastToUDT, which the explicit spelling already reaches; the
+      // argument is wrapped in that cast and the ordinary call does the rest.
+      if (FindUDT(RhsType) < 0) or (not UDTCastsToUDT(RhsType, ParamType)) then Exit;
+      ConvNode := TASTNode.CreateWithValue(antCast, ParamType, VarNode.Token);
+      ConvNode.AddChild(ExprNode.Clone);
+    end;
   end
   else if RhsType <> '' then
     Exit;      // a builtin operand cannot take a record
   TmpArgs := TASTNode.Create(antArgumentList, VarNode.Token);
   try
-    TmpArgs.AddChild(ExprNode.Clone);        // ProcessMethodCall clones what it is given; keep the AST intact
+    if ConvNode <> nil then
+      TmpArgs.AddChild(ConvNode)             // the wrapper is OWNED by the argument list from here
+    else
+      TmpArgs.AddChild(ExprNode.Clone);      // ProcessMethodCall clones what it is given; keep the AST intact
     ProcessMethodCall(VarNode, ObjType, 'OPERATORLET', TmpArgs, Dummy);
   finally
     TmpArgs.Free;
@@ -36723,6 +36741,23 @@ begin
   Result := VarRecordTypeName(Lbl);
   if (Result = '') and (Lbl <> '') then
     Result := VarRecordTypeName(Copy(Lbl, 1, Length(Lbl) - 1));
+end;
+
+function TSSAGenerator.UDTCastsToUDT(const SrcType, DstType: string): Boolean;
+// Does SrcType declare an "Operator Cast() As DstType"? The same two labels TryEmitUDTCastToUDT tries,
+// asked WITHOUT emitting anything - a guard needs the answer before it decides to take the path.
+var
+  Lbl: string;
+  i: Integer;
+begin
+  Result := False;
+  if (FindUDT(SrcType) < 0) or (FindUDT(DstType) < 0) then Exit;
+  for i := 0 to 1 do
+  begin
+    if i = 0 then Lbl := ResolveMethodLabel(SrcType, 'OPERATORCAST#')
+    else Lbl := ResolveMethodLabel(SrcType, 'OPERATORCAST%');
+    if (Lbl <> '') and (UpperCase(CastRetRecType(Lbl)) = UpperCase(DstType)) then Exit(True);
+  end;
 end;
 
 function TSSAGenerator.TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string;
