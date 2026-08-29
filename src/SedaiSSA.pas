@@ -630,7 +630,7 @@ type
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
     procedure EmitStaticMemberRecords;                  // ...and construct the ones whose type is a UDT (after the ctor labels exist)
-    procedure CollectEnumNames(Node: TASTNode);    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
+    procedure CollectEnumNames(Node: TASTNode; const Owner: string = '');    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure CollectTypeConsts(Node: TASTNode);        // FB: record each CONST declared inside a TYPE as "TYPE.NAME"
     function TypeScopedConstAccess(const TypeName, MemberName: string; const Tok: TLexerToken): TASTNode;  // the node that READS one
@@ -25169,7 +25169,7 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsWString);
 end;
 
-procedure TSSAGenerator.CollectEnumNames(Node: TASTNode);
+procedure TSSAGenerator.CollectEnumNames(Node: TASTNode; const Owner: string);
 // Just the ENUM TYPE names, and nothing else. CollectEnumMembers records them too, but it runs far
 // later - after the DIM pre-scan - and by then "Dim v As MyEnum" has already been given a BANK.
 // ⛔ An enum is an INTEGER type; with the registry still empty the name fell through to the classic
@@ -25180,11 +25180,23 @@ var
   i: Integer;
 begin
   if Node = nil then Exit;
-  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') and
-     (FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
-    FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+  if (Node.NodeType = antEnum) and (VarToStr(Node.Value) <> '') then
+  begin
+    if FEnumNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0 then
+      FEnumNames.Add(UpperCase(VarToStr(Node.Value)));
+    // ⭐ ...AND UNDER ITS QUALIFIED NAME WHEN IT IS NESTED IN A TYPE. An enum declared inside a TYPE is
+    // named "Foo.Bar" everywhere it is USED ("Dim As foo.bar1 b"), and only the bare "BAR1" was ever
+    // recorded - so the declared type resolved to no known enum, fell through to the FLOAT default, and
+    // two nested enums of one type both signed "F" with an EMPTY type tail. Both overloads then looked
+    // identical and the first won every call (fbc suite structs/enum_decl).
+    if (Owner <> '') and (FEnumNames.IndexOf(Owner + '.' + UpperCase(VarToStr(Node.Value))) < 0) then
+      FEnumNames.Add(Owner + '.' + UpperCase(VarToStr(Node.Value)));
+  end;
   for i := 0 to Node.ChildCount - 1 do
-    CollectEnumNames(Node.GetChild(i));
+    if (Node.NodeType = antTypeDecl) and (VarToStr(Node.Value) <> '') then
+      CollectEnumNames(Node.GetChild(i), UpperCase(VarToStr(Node.Value)))
+    else
+      CollectEnumNames(Node.GetChild(i), Owner);
 end;
 
 procedure TSSAGenerator.RegisterUDTs(Node: TASTNode);
