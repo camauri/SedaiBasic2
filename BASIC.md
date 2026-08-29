@@ -2178,6 +2178,12 @@ So `defined(T)` is false above `Type T` and true below it, exactly as in fbc. A 
 symbol only from inside that type's own body; a qualified name (`T.field`, and the operator spellings
 `T.+=`, `T.[]`, `T.new[]`) is one name, answered from that type's declarations so far.
 
+🕳️ **A known gap beside it, measured 29 August 2026:** inside a `Namespace` body, FreeBASIC lets
+**147** more of its own keywords name a procedure than we do (`Sub print()` is a duplicate definition
+at module level and legitimate inside a namespace, where it is called as `N.print`). We reserve
+keywords the same way everywhere. No test in fbc's suite depends on it yet; the census and the risk
+are written up in `job/markdown/DIVERGENZE.md`.
+
 🎯 **One declared divergence, and it is a step of lag we do not reproduce.** fbc answers
 `defined( field )` **false** on the line immediately after `field As Integer`, and true as soon as
 another member follows — while the qualified form `defined( T.field )` answers true straight away. We
