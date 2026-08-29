@@ -2431,6 +2431,7 @@ var
   // String function handling
   Arg2Value, Arg3Value, Arg2Reg, Arg3Reg: TSSAValue;
   RevLen, RevSum, RevOne, RevCnt, RevPrefix: TSSAValue;  // INSTRREV(str,sub,start) lowering temps
+  RevHay, RevZero, RevOver, RevUnder, RevEff, RevDelta, RevAdj: TSSAValue;  // ...and its edge-case guards
   TrimMode: Integer;  // bcStrTrimSet mode: 0/1/2 side (both/left/right) | 4 = Any (char-set) form
   IsAny: Boolean;     // FreeBASIC "Any" modifier on the set/substring argument
   OpLhsType, OpRhsType, OpLabel: string;  // operator overloading: UDT operand types + resolved operator label
@@ -5287,8 +5288,21 @@ begin
           // lowered (like the MID statement, with existing ops, no new opcode) as
           //   INSTRREV( LEFT$(str, start + LEN(sub) - 1), sub )
           // so a match starting at position P survives iff P + LEN(sub) - 1 <= start + LEN(sub) - 1,
-          // i.e. P <= start. Assumes start >= 1 (the usual case); a non-positive runtime start narrows
-          // to a short prefix rather than searching from the end (use the 2-arg form for from-the-end).
+          // i.e. P <= start.
+          //
+          // ⛔ THE PREFIX TRICK ALONE GETS THE TWO ENDS WRONG, because LEFT$ CLAMPS and fbc does not.
+          //   - start > LEN(str) is 0 for fbc ("no such starting position"), while LEFT$ clamps the
+          //     count to the length and answers as if start = LEN(str).
+          //   - start < 0 is fbc's DEFAULT ("search from the end"), while a negative count narrows to
+          //     a short prefix and answers 0.
+          // Both ends are what "InstrRev(a, b, 23)" and "InstrRev(a, b, -1)" measure in the suite:
+          // 12 assertions over string/instrrev_x, wstring/instrrev_0 and wstring/instrrev_x, found by
+          // sweeping start from -2 to 26 against the oracle in one command.
+          // The guards are ARITHMETIC, not branches, so the whole thing stays one straight-line
+          // expression: eff = start + (LEN(str) - start) * (start < 0), and the count is multiplied by
+          // (start <= LEN(str)) so an out-of-range start searches the EMPTY prefix and yields 0.
+          // ⚠️ "AND 1" is what makes it dialect-proof: a comparison yields TrueValue, which is -1 in
+          // CLASSIC and 1 in MODERN, and (-1 and 1) = (1 and 1) = 1 while (0 and 1) = 0.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 2) then
           begin
             ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue); // str (raw if fixed-length)
@@ -5302,26 +5316,49 @@ begin
             begin
               ProcessExpression(ArgListNode.GetChild(2), Arg3Value);  // start (1-based)
               Arg3Reg := EnsureIntRegister(Arg3Value);
+              RevOne := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, RevOne, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              RevZero := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaLoadConstInt, RevZero, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              // LEN(str): the haystack's own length, in the same units LEFT$ counts.
+              RevHay := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrLen, RevHay, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              // under := (start < 0) and 1   -> 1 when start is fbc's "from the end" default
+              RevUnder := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaCmpLtInt, RevUnder, Arg3Reg, RevZero, MakeSSAValue(svkNone));
+              RevAdj := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaBitwiseAnd, RevAdj, RevUnder, RevOne, MakeSSAValue(svkNone));
+              // eff := start + (LEN(str) - start) * under
+              RevDelta := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, RevDelta, RevHay, Arg3Reg, MakeSSAValue(svkNone));
+              RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaMulInt, RevSum, RevDelta, RevAdj, MakeSSAValue(svkNone));
+              RevEff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, RevEff, Arg3Reg, RevSum, MakeSSAValue(svkNone));
               if IsAny then
               begin
-                // single-char matches: a match at P survives iff P <= start -> LEFT$(str, start)
-                RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-                EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, Arg3Reg, MakeSSAValue(svkNone));
+                // single-char matches: a match at P survives iff P <= start -> LEFT$(str, eff)
+                RevCnt := RevEff;
               end
               else
               begin
-                // substring: a match at P survives iff P <= start -> LEFT$(str, start + LEN(sub) - 1)
+                // substring: a match at P survives iff P <= start -> LEFT$(str, eff + LEN(sub) - 1)
                 RevLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
                 EmitInstruction(ssaStrLen, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
                 RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-                EmitInstruction(ssaAddInt, RevSum, Arg3Reg, RevLen, MakeSSAValue(svkNone));
-                RevOne := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-                EmitInstruction(ssaLoadConstInt, RevOne, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                EmitInstruction(ssaAddInt, RevSum, RevEff, RevLen, MakeSSAValue(svkNone));
                 RevCnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
                 EmitInstruction(ssaSubInt, RevCnt, RevSum, RevOne, MakeSSAValue(svkNone));
-                RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-                EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevCnt, MakeSSAValue(svkNone));
               end;
+              // ...and an out-of-range start searches NOTHING: count := count * ((start <= LEN(str)) and 1).
+              RevOver := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaCmpLeInt, RevOver, Arg3Reg, RevHay, MakeSSAValue(svkNone));
+              RevAdj := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaBitwiseAnd, RevAdj, RevOver, RevOne, MakeSSAValue(svkNone));
+              RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaMulInt, RevSum, RevCnt, RevAdj, MakeSSAValue(svkNone));
+              RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+              EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevSum, MakeSSAValue(svkNone));
               ArgReg := RevPrefix;   // search within the restricted prefix
             end;
             DestReg := FProgram.AllocRegister(srtInt);
