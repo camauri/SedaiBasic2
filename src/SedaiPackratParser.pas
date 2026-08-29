@@ -509,6 +509,46 @@ uses
 
 // The MODERN extensions that FreeBASIC does NOT reserve: a program may use any of them as the name
 // of its own procedure, and then that name is the program's, not ours.
+function IsCastFunctionName(const NameU: string): Boolean;
+// The FreeBASIC conversion functions that may stand as the TARGET of an assignment: the value is
+// reinterpreted, operated on and written back through the same variable ("CUInt( i ) Shr= 1", fbc's own
+// quirk/casting). CPTR is here for the same reason CAST is - it converts a pointer in place.
+// ⛔ Only the CONVERSIONS. A math function is not an lvalue ("Abs( i ) = 3" is nonsense), and the list
+// is what keeps the assignment arm from claiming one.
+const
+  CASTFNS: array[0..12] of string = (
+    'CBYTE', 'CUBYTE', 'CSHORT', 'CUSHORT', 'CINT', 'CUINT', 'CLNG', 'CULNG',
+    'CLNGINT', 'CULNGINT', 'CSNG', 'CDBL', 'CBOOL');
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := Low(CASTFNS) to High(CASTFNS) do
+    if NameU = CASTFNS[i] then Exit(True);
+end;
+
+function CastFunctionTypeName(const NameU: string): string;
+// The type "C<x>( v )" converts to, spelled as CAST would spell it. ⛔ CPTR, CSIGN and CUNSG are NOT
+// here and are not lvalue targets either: CPTR takes its type as an argument, and CSIGN/CUNSG name the
+// signed or unsigned partner of whatever the operand happens to be - there is no fixed name to rewrite
+// them to, and inventing one would be a wrong answer where a refusal is honest.
+begin
+  if NameU = 'CBYTE' then Result := 'BYTE'
+  else if NameU = 'CUBYTE' then Result := 'UBYTE'
+  else if NameU = 'CSHORT' then Result := 'SHORT'
+  else if NameU = 'CUSHORT' then Result := 'USHORT'
+  else if NameU = 'CINT' then Result := 'INTEGER'
+  else if NameU = 'CUINT' then Result := 'UINTEGER'
+  else if NameU = 'CLNG' then Result := 'LONG'
+  else if NameU = 'CULNG' then Result := 'ULONG'
+  else if NameU = 'CLNGINT' then Result := 'LONGINT'
+  else if NameU = 'CULNGINT' then Result := 'ULONGINT'
+  else if NameU = 'CSNG' then Result := 'SINGLE'
+  else if NameU = 'CDBL' then Result := 'DOUBLE'
+  else if NameU = 'CBOOL' then Result := 'BOOLEAN'
+  else Result := '';
+end;
+
 function IsShadowableExtensionName(const NameU: string): Boolean;
 // ⭐ ...AND "VAL" IS A LIBRARY FUNCTION, NOT A KEYWORD. fbc accepts "Sub val()" and calls it; we
 // refused the declaration outright. ⚠️ The WIDTH of this was MEASURED rather than assumed: over the
@@ -1702,7 +1742,27 @@ begin
     // as "Unexpected token in statement: "cuint"".
     ttMathFunction, ttStringFunction, ttMemoryFunction, ttSystemFunction,
     ttErrorHandlingFunction, ttOutputFunction:
-      Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+      // ⛔ ...AND A CONVERSION IS ALSO AN LVALUE. "CUInt( i ) Shr= 1" reinterprets i's bits, shifts
+      // them and writes them back - fbc's own quirk/casting is written that way - and "Cast( UInteger,
+      // i ) Shr= 1", the SAME operation, already worked: CAST is not a registered keyword, so it
+      // reached the assignment chain through the ordinary identifier arm while CUInt, a ttMathFunction,
+      // could not. One operation, two spellings, and the rule lived in one of them. Assignment FIRST,
+      // exactly as the ttTypeDecl and '(' cases do; with no assignment operator after it this returns
+      // nil and the expression statement below takes it, which is how "CUInt( f(1,2,3) )" - a call made
+      // for its side effects - keeps working.
+      if (Token.TokenType = ttMathFunction) and FModernMode and IsCastFunctionName(UpperCase(Token.Value)) and
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+      begin
+        SavedIndex := Context.CurrentIndex;
+        Result := Memoize('AssignmentStatement', @ParseAssignmentStatement);
+        if not Assigned(Result) then
+        begin
+          Context.CurrentIndex := SavedIndex;
+          Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
+        end;
+      end
+      else
+        Result := Memoize('ExpressionStatement', @ParseExpressionStatement);
 
     // === SPRITE COMMANDS ===
     ttSpriteCommand: Result := Memoize('SpriteStatement', @ParseSpriteStatement);
@@ -2073,6 +2133,8 @@ var
  OpSym: string;        // compound-assignment operator symbol ('+','-','*','/','^')
  OpType: TTokenType;   // its arithmetic binary-op token type
  ConstPointeeNm: string;   // the pointer-to-const this target would write through, if any
+ CastFnName: string;       // "CUInt( i ) Shr= 1": the conversion this target is written as
+ CastNode: TASTNode;
 begin
  Token := Context.CurrentToken;
  SavedToken := Token;   // default (member/array LHS branches don't set it; avoids nil on error)
@@ -2140,6 +2202,30 @@ begin
     // build the full target (antArrayAccess / antMemberAccess); it stops before '=' (lower prec).
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
+  end
+  // "CUInt( i ) Shr= 1": a CONVERSION of an lvalue is an lvalue - the value is reinterpreted, operated
+  // on and written back through the same variable. The dispatcher routes only these names here, and
+  // only when a '(' follows; see the note at ttMathFunction for why "Cast( UInteger, i )" needed no arm.
+  else if FModernMode and Context.Check(ttMathFunction) and
+    IsCastFunctionName(UpperCase(VarToStr(Token.Value))) and
+    Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    CastFnName := UpperCase(VarToStr(Token.Value));
+    LeftSide := FExpressionParser.ParseExpression(precCall);
+    LhsIsExpr := True;
+    // ...and it is REWRITTEN into the CAST it means. "CUInt( i )" parses as an ordinary function call,
+    // and only antCast carries a store path; building the same node here is the whole of it, rather
+    // than teaching a second lowering the same thing. ⛔ Only the ONE-argument shape: anything else is
+    // not this operation, and it stays the call it was (the caller then reads it as an expression).
+    if (LeftSide <> nil) and (LeftSide.NodeType = antFunctionCall) and (LeftSide.ChildCount = 1) and
+       (LeftSide.GetChild(0).NodeType = antArgumentList) and (LeftSide.GetChild(0).ChildCount = 1) and
+       (CastFunctionTypeName(CastFnName) <> '') then
+    begin
+      CastNode := TASTNode.CreateWithValue(antCast, CastFunctionTypeName(CastFnName), LeftSide.Token);
+      CastNode.AddChild(LeftSide.GetChild(0).GetChild(0).Clone);
+      LeftSide.Free;
+      LeftSide := CastNode;
+    end;
   end
   else if Context.Check(ttBaseCall) then
   begin

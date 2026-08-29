@@ -2178,6 +2178,13 @@ So `defined(T)` is false above `Type T` and true below it, exactly as in fbc. A 
 symbol only from inside that type's own body; a qualified name (`T.field`, and the operator spellings
 `T.+=`, `T.[]`, `T.new[]`) is one name, answered from that type's declarations so far.
 
+🎯 **A conversion of an lvalue is an lvalue** (29 August 2026): `CUInt( i ) Shr= 1` reinterprets `i`'s
+bits, operates on them and writes them back, as `Cast( UInteger, i ) Shr= 1` already did. ⚠️ More
+permissive than fbc by one step: fbc accepts only the conversion that REINTERPRETS and answers
+`error 24` when it changes the SIZE (`CLng( i ) *= 3`, `CByte( w ) += 0` on a 64-bit variable); we
+accept those and write back through the narrow width. `CPtr`, `CSign` and `CUnsg` are not lvalue
+targets in either. Declared in `job/markdown/DIVERGENZE.md`.
+
 🎯 **`#IF` reads a constant the SOURCE declares** — a module `Const` and, since 29 August 2026, an
 `Enum` member (numbered from 0, restarted by an explicit `= <integer literal>`). ⚠️ Conservative by one
 step: a member whose initialiser is an EXPRESSION (`M2 = M1 + 4`) is not folded here — fbc folds it,
