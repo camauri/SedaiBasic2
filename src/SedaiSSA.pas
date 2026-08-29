@@ -431,6 +431,7 @@ type
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
     FPreProcSig: TStringList;            // procedure LABEL (UPPER, overload tail and all) -> "FPPARAMS|FPRET", same walk
+    FPreProcRetPtrSig: TStringList;      // FUNCTION name (UPPER) whose RETURN is a procedure pointer -> that pointer's "FPPARAMS|FPRET"
     // V5f: the RESULT TEMPORARIES of this statement - one per call to a function returning a UDT BY
     // VALUE. The caller allocates that record (ssaRecordNew below), the callee copies its result into
     // it, and until now NOTHING destroyed it: fbc runs one destructor MORE than we did for every such
@@ -1377,6 +1378,7 @@ begin
   FPreFuncRetType := TStringList.Create;
   FPreFuncRetType.CaseSensitive := False;
   FPreProcSig := TStringList.Create;
+  FPreProcRetPtrSig := TStringList.Create;
   FPreProcSig.CaseSensitive := False;
   FResultTemps := TStringList.Create;
   FVarExplicitType := TStringList.Create;
@@ -1545,6 +1547,7 @@ begin
   FVarExplicitType.Free;
   FPreFuncRetType.Free;
   FPreProcSig.Free;
+  FPreProcRetPtrSig.Free;
   FResultTemps.Free;
   FArrayRecordType.Free;
   FArrayScalarType.Free;
@@ -6800,6 +6803,47 @@ begin
           ProcessExpression(Node.GetChild(0), Left);   // arr(i) -> the funcptr value (int)
           Result := EmitIndirectCall(Left, TempStr, Node.GetChild(1));
           Exit;
+        end;
+
+        // "f( args )( args )" - calling the procedure pointer a CALL RETURNS. child0 is itself a call
+        // to a FUNCTION whose declared return is "Function(...) As R" / "Sub(...)", so its value is an
+        // entry PC and this second argument list is the call THROUGH it. Nothing lowered it: the whole
+        // expression evaluated to nothing and "print f4( @f3 )( )" printed 0, silently - the same form
+        // through a named variable ("Dim q As Function( ) As Integer = f4( @f3 ) : q( )") has always
+        // worked, which is the tell that the gap is the RESOLVER asking for a NAME where there is an
+        // EXPRESSION. ⛔ Guarded on the name being a PROCEDURE, so an array or a UDT of that name is
+        // untouched. fbc suite pointers/funptr-expr.
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+           (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) and
+           (FPreProcRetPtrSig.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) then
+        begin
+          TempStr := FPreProcRetPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))];
+          ProcessExpression(Node.GetChild(0), Left);      // f(args) -> the returned entry PC
+          Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
+          Exit;
+        end;
+
+        // ...and "obj.m( args )( args )", the same thing through a METHOD. A method's label is
+        // "<TYPE>.<NAME>", so the registry answers under that key and the owner comes from the object -
+        // the third reader of a procedure-pointer RETURN, censused with the other two rather than left
+        // for the next test to find.
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(0).GetChild(0).ChildCount >= 1) then
+        begin
+          TempStr := ObjectTypeName(Node.GetChild(0).GetChild(0).GetChild(0));
+          if TempStr <> '' then
+            TempStr := UpperCase(TempStr) + '.' + UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+          if (TempStr <> '') and (FPreProcRetPtrSig.IndexOfName(TempStr) >= 0) then
+          begin
+            TempStr := FPreProcRetPtrSig.Values[TempStr];
+            ProcessExpression(Node.GetChild(0), Left);    // obj.m(args) -> the returned entry PC
+            Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
+            Exit;
+          end;
         end;
 
         // obj.field[i] where obj.field is a raw "<scalar> PTR" field: index onto the raw byte heap.
@@ -27876,6 +27920,15 @@ begin
       if Pos('~', Nm) > 0 then Nm := Copy(Nm, 1, Pos('~', Nm) - 1);
       if (Nm <> '') and (FPreFuncRetType.IndexOfName(Nm) < 0) then
         FPreFuncRetType.Values[Nm] := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+      // ⭐ ...and WHETHER that return is itself a CALLABLE. "Function f( ) As Function( ) As Integer"
+      // returns an entry PC, so its declared return type reads INTEGER above and nothing else said
+      // what it can be called with. The parser now keeps the signature on the name node; this is the
+      // one place that has to read it, and "f( args )( args )" is the one form that needs it.
+      if (Nm <> '') and (NameNode.Attributes.Values['FUNCPTR'] = '1') and
+         (FPreProcRetPtrSig.IndexOfName(Nm) < 0) then
+        FPreProcRetPtrSig.Values[Nm] :=
+          NameNode.Attributes.Values['FPPARAMS'] + '|' + NameNode.Attributes.Values['FPRET'] +
+          Copy('|BYREF', 1, 6 * Ord(NameNode.Attributes.Values['FPRETBYREF'] = '1'));
     end;
   end;
   // ⭐ ...and the SAME walk answers the other half a VAR needs: the full "FPPARAMS|FPRET" of every
@@ -27937,6 +27990,19 @@ begin
     Base := UpperCase(VarToStr(Node.Value))
   else if (Node.NodeType in [antArrayAccess, antFunctionCall]) then
   begin
+    // ⭐ ...AND A CALL WHOSE RETURN *IS* THE POINTER answers the same question. "Var q = f4( @f3 )"
+    // names no procedure at all: what it names is a call, and the callable is what that call GIVES
+    // BACK. Without this the VAR was left unsigned and "q( )" lowered as an array access - "Array not
+    // declared: Q", the exact failure DIVERGENZE 57 records for the sibling spelling. Censused here
+    // rather than waiting for the next test: this and the call-site branch are the two readers of a
+    // FUNCTION's procedure-pointer return.
+    if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+       (Node.GetChild(0).NodeType = antIdentifier) and
+       (FPreProcRetPtrSig.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) then
+      Exit(FPreProcRetPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).Value))]);
+    if (Node.NodeType = antFunctionCall) and
+       (FPreProcRetPtrSig.IndexOfName(UpperCase(VarToStr(Node.Value))) >= 0) then
+      Exit(FPreProcRetPtrSig.Values[UpperCase(VarToStr(Node.Value))]);
     // "ProcPtr(f)" reaches this pre-pass as an ACCESS to a name called PROCPTR - the call it really
     // is has not been resolved yet - which is exactly the shape that later died as an array access.
     if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and

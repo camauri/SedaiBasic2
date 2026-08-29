@@ -3655,6 +3655,17 @@ begin
       ProcPtrRet := TASTNode.Create(antArrayDecl, RetTok);
       try
         TryParseProcPtrType(ProcPtrRet);
+        // ⛔ ...AND THE SIGNATURE IT JUST READ WAS THROWN AWAY WITH THE SCRATCH NODE. Consuming the
+        // tokens is only half of reading a type: what comes back from "f4( ... ) As Function( ) As
+        // Integer" is a CALLABLE, and "f4( @f3 )( )" has to know what to call it with. Without the
+        // signature the second argument list found no callee, the call was lowered to nothing and the
+        // expression answered 0 in silence (fbc suite pointers/funptr-expr). A funcptr VARIABLE has
+        // carried FUNCPTR/FPPARAMS/FPRET since it was written; the RETURN is the sibling path that
+        // did not - the same shape the comment above already names for the parse.
+        NameNode.Attributes.Values['FUNCPTR']     := ProcPtrRet.Attributes.Values['FUNCPTR'];
+        NameNode.Attributes.Values['FPPARAMS']    := ProcPtrRet.Attributes.Values['FPPARAMS'];
+        NameNode.Attributes.Values['FPRET']       := ProcPtrRet.Attributes.Values['FPRET'];
+        NameNode.Attributes.Values['FPRETBYREF']  := ProcPtrRet.Attributes.Values['FPRETBYREF'];
       finally
         ProcPtrRet.Free;
       end;
