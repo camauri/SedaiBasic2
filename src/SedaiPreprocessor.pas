@@ -1241,11 +1241,47 @@ var
   // The full source text of the module being preprocessed, for SourceDeclaresSymbol below.
   // Set by PreprocessSource before Expand; the preprocessor is single-threaded by design.
   GPPSourceForDefined: string = '';
+  // The line of GPPSourceForDefined the current question is being asked FROM: defined() is answered
+  // from the symbol table as built so far, not from the whole file. -1 = no limit (every caller that
+  // has no position). Only the MODULE's own Expand pass moves it; an #include or a macro re-expansion
+  // inherits the outer position, because that is where the question really stands.
+  GPPDefinedLimit: Integer = -1;
+  // ⭐ ...and the better answer to the same question: the module AS EXPANDED SO FAR. A macro that
+  // DECLARES ("#macro f(id) : id as integer : check_Y( TRIVIAL.id ) : #endmacro" is fbc's own) puts
+  // nothing on the source line the scan can see, so a scan of the SOURCE cannot know the field
+  // exists. The output being built is the expansion, in order, up to exactly here - which is what
+  // fbc's symbol table is - so when it is available it is what gets scanned, and the source with a
+  // line limit is the fallback for a caller that has none.
+  GPPOutput: TStringList = nil;
   // ⛔ "#pragma reserve NAME" makes NAME a SYMBOL and NOT A MACRO. Putting it in Defs was tried and is
   // wrong: the name is then SUBSTITUTED in ordinary code, and fbc's own pp/pragma-reserve-4 goes on to
   // write "dim symbol as integer" - which became "dim 0 as integer". Reserving is only observable
   // through defined(), so it lives in its own set, which nothing substitutes from.
   GPPReserved: TStringList = nil;
+  // ⭐ ...AND A WORD THE LANGUAGE RESERVES IS DEFINED TOO. fbc answers "#if defined( constructor )"
+  // TRUE, and its own pp/defined-udt asserts it for constructor / destructor / let / cast - the same
+  // names it asserts FALSE for as members of a type. Those two sets are asked the same way and stored
+  // apart: a language keyword must not land in GPPReserved, whose entries are "#pragma reserve"
+  // reservations carrying a SCOPE DEPTH, where a second reservation of the same name at the same level
+  // is an error (m674). This one is the fixed inventory in FbReservedWords.inc, and it is the ORACLE's
+  // answer, asked in one compile over an 11 000-word candidate universe - not a list reasoned out.
+  GPPKeywords: TStringList = nil;
+
+procedure SeedFbKeywords;
+// Fill GPPKeywords once with the inventory in FbReservedWords.inc. Sorted, so the lookups above are a
+// binary search and not a walk of 366 strings per "#ifdef".
+{$I FbReservedWords.inc}
+var
+  i: Integer;
+begin
+  if GPPKeywords <> nil then Exit;
+  GPPKeywords := TStringList.Create;
+  GPPKeywords.CaseSensitive := False;
+  GPPKeywords.Duplicates := dupIgnore;
+  for i := Low(FB_RESERVED_WORDS) to High(FB_RESERVED_WORDS) do
+    GPPKeywords.Add(FB_RESERVED_WORDS[i]);
+  GPPKeywords.Sorted := True;
+end;
 
 function DeclaredNameOfLine(const U: string; out Kind, TypeName: string): string;
 // Read ONE upper-cased source line as a declaration and return the NAME it declares ('' if it declares
@@ -1470,6 +1506,8 @@ begin
   end;
 end;
 
+function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean; forward;
+
 function SourceDeclaresSymbol(const Nm: string): Boolean;
 // fbc's Defined() answers TRUE for COMPILER-level symbols too, not only #defines: a Const, a
 // Dim/Redim/Static variable, a Sub/Function name (fbc-verified: examples/manual/prepro/defined
@@ -1478,26 +1516,128 @@ function SourceDeclaresSymbol(const Nm: string): Boolean;
 // a declaring keyword and that contains Nm as a whole word. A name inside a same-line comment
 // or string can false-positive - accepted for a #if convenience predicate.
 //
-// ⛔ A MEMBER OF A TYPE IS NOT A SYMBOL. fbc's Defined() answers FALSE for a field, a static field, a
-// method or a property - they live in the type, not in the module - and its own pp/defined-udt asserts
-// exactly that, for the SAME names, both before the type is written and from inside its body. Scanning
-// every line of the file made "static staticfield as short" and "declare sub proc()" answer TRUE, and
-// the file refused itself with "#error" - a program fbc accepts.
+// ⛔⛔ AND IT IS A QUESTION ABOUT A POSITION, not about the file. fbc answers from the symbol table
+// as built SO FAR, so "defined( T )" is FALSE above "Type T" and TRUE below it - and its own
+// pp/defined-udt asserts BOTH, for the same name, in the same file. Scanning every line made the
+// first one TRUE and the file refused itself with "#error". GPPDefinedLimit is the line the question
+// is being asked FROM; -1 (the default) means the whole file, which is what every caller that has no
+// position gets.
+//
+// ⛔ A MEMBER OF A TYPE IS NOT A MODULE SYMBOL - and it IS a symbol from inside the type's own body.
+// fbc answers FALSE for a field / static field / method / property asked at module level, and TRUE
+// for the same name asked between "Type T" and "End Type" once it has been declared. So a member hit
+// is kept only while the body that made it is still OPEN at the asking position; a body that closed
+// before it takes its members with it.
+//
+// A QUALIFIED name is a third question again: "T.datafield" is TRUE only when T is a type declared so
+// far AND datafield has been declared inside its body so far. The member half accepts an OPERATOR
+// name too ("T.+=", "T.new[]"), which is why it is matched as text rather than as an identifier.
+//
 // ⚠️ An ENUM body is NOT skipped: its members ARE module-level constants in FreeBASIC.
 // A "Type mine As LongInt" alias opens no block and must not start one.
 var
   L: TStringList;
-  i, p, q, TypeDepth, EnumDepth: Integer;
-  U, W, Rest: string;
+  i, p, q, TypeDepth, EnumDepth, LastLine: Integer;
+  U, W, Rest, Qual, Member, Want: string;
+  MemberHit, QualIsType, QualMemberHit, InQualBody: Boolean;
+
+  function WholeWordAt(const Hay, Needle: string; At: Integer): Boolean;
+  // A match that is not glued to an identifier character - and not to a '.' either, because a
+  // QUALIFIED name does not declare the bare one: "Sub T.proc()" is the out-of-line definition of a
+  // member, written at module level, and fbc still answers FALSE for "defined( proc )".
+  begin
+    Result := ((At = 1) or (not IsIdentChar(Hay[At - 1]) and (Hay[At - 1] <> '.'))) and
+              ((At + Length(Needle) > Length(Hay)) or
+               (not IsIdentChar(Hay[At + Length(Needle)]) and (Hay[At + Length(Needle)] <> '.')));
+  end;
+
+  function LineMentions(const Hay, Needle: string): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    k := Pos(Needle, Hay);
+    while k > 0 do
+    begin
+      if WholeWordAt(Hay, Needle, k) then Exit(True);
+      k := Pos(Needle, Hay, k + 1);
+    end;
+  end;
+
+  function TokenAt(const Hay: string; var At: Integer): string;
+  // The next word of a member declaration, stopping at whitespace or '(' - so an OPERATOR name comes
+  // out whole ("+=", "[]", "NEW[]", "DELETE[]"), which no identifier scan would have reached.
+  var b: Integer;
+  begin
+    while (At <= Length(Hay)) and (Hay[At] in [' ', #9]) do Inc(At);
+    b := At;
+    while (At <= Length(Hay)) and not (Hay[At] in [' ', #9, '(']) do Inc(At);
+    Result := Copy(Hay, b, At - b);
+  end;
+
+  function MemberNameOfLine(const Hay: string): string;
+  // The member ONE line inside a type body declares, or ''. It has to be located POSITIONALLY: a
+  // member hit taken from any line that MENTIONS the name made "check_N( datafield )" - the very
+  // question - declare its own subject, and every check inside the body answered TRUE before a single
+  // field had been written.
+  var
+    At: Integer;
+    W1, W2: string;
+  begin
+    Result := '';
+    At := 1;
+    W1 := TokenAt(Hay, At);
+    if W1 = 'DECLARE' then
+    begin
+      W2 := TokenAt(Hay, At);                       // SUB / FUNCTION / PROPERTY / CTOR / DTOR / OPERATOR
+      if (W2 = 'CONSTRUCTOR') or (W2 = 'DESTRUCTOR') then Exit(W2);
+      Exit(TokenAt(Hay, At));                       // the name, or the operator's own token
+    end;
+    if (W1 = 'CONSTRUCTOR') or (W1 = 'DESTRUCTOR') then Exit(W1);
+    if (W1 = 'STATIC') or (W1 = 'DIM') or (W1 = 'CONST') or (W1 = 'AS') then Exit(TokenAt(Hay, At));
+    // "datafield as byte": the name first, its type after. Without the AS this is not a declaration
+    // at all - it is a macro invocation, a comment or a nested block header.
+    if (W1 <> '') and (Pos(' AS ', ' ' + Hay + ' ') > 0) then Exit(W1);
+  end;
+
 begin
   Result := False;
   if Nm = '' then Exit;
+  // Split a qualified name once: "T.DATAFIELD" -> Qual="T", Member="DATAFIELD". An operator member
+  // ("T.+=") leaves Member holding the operator text, matched as a substring below.
+  p := Pos('.', Nm);
+  if p > 0 then
+  begin
+    Qual := Copy(Nm, 1, p - 1);
+    Member := Copy(Nm, p + 1, MaxInt);
+    if (Qual = '') or (Member = '') then Exit;
+  end
+  else
+  begin
+    Qual := '';
+    Member := '';
+  end;
   L := TStringList.Create;
   try
-    L.Text := GPPSourceForDefined;
+    // The expansion so far when there is one, the source truncated at the asking line otherwise.
+    if (GPPOutput <> nil) and (GPPOutput.Count > 0) then
+    begin
+      L.Assign(GPPOutput);
+      LastLine := L.Count - 1;
+    end
+    else
+    begin
+      L.Text := GPPSourceForDefined;
+      LastLine := L.Count - 1;
+      if (GPPDefinedLimit >= 0) and (GPPDefinedLimit < LastLine) then LastLine := GPPDefinedLimit;
+    end;
     TypeDepth := 0;
     EnumDepth := 0;
-    for i := 0 to L.Count - 1 do
+    MemberHit := False;
+    QualIsType := False;
+    QualMemberHit := False;
+    InQualBody := False;
+    if Qual = '' then Want := Nm else Want := Qual;
+    for i := 0 to LastLine do
     begin
       U := UpperCase(TrimLeft(L[i]));
       p := 1;
@@ -1508,15 +1648,31 @@ begin
         Rest := Trim(Copy(U, p, MaxInt));
         if (Copy(Rest, 1, 4) = 'TYPE') or (Copy(Rest, 1, 5) = 'UNION') or
            (Copy(Rest, 1, 5) = 'CLASS') then
-          if TypeDepth > 0 then Dec(TypeDepth);
+          if TypeDepth > 0 then
+          begin
+            Dec(TypeDepth);
+            if TypeDepth = 0 then
+            begin
+              MemberHit := False;      // the body closed: its members are not module symbols
+              InQualBody := False;
+            end;
+          end;
       end;
-      if TypeDepth > 0 then Continue;              // inside a type body: these are MEMBERS
+      if TypeDepth > 0 then
+      begin
+        // Inside a type body: these are MEMBERS. They answer only from in here, and only for a body
+        // that is still open where the question is asked - which is what the reset above enforces.
+        Rest := MemberNameOfLine(U);
+        if (Qual = '') and (Rest = Nm) then MemberHit := True;
+        if InQualBody and (Rest = Member) then QualMemberHit := True;
+        Continue;
+      end;
       // ⭐ ...BUT AN ENUM BODY DECLARES MODULE CONSTANTS, one per line, and the member's own name is
       // the FIRST word - so the declaring-keyword rule below cannot see it and defined() answered
       // FALSE for every enum member. fbc answers TRUE. Verified against the oracle.
       if EnumDepth > 0 then
       begin
-        if (W <> '') and (W <> 'END') and (W = Nm) then Exit(True);
+        if (W <> '') and (W <> 'END') and (W = Want) and (Qual = '') then Exit(True);
         if W = 'END' then
         begin
           Rest := Trim(Copy(U, p, MaxInt));
@@ -1527,13 +1683,13 @@ begin
       if (W = 'ENUM') and (Pos(' AS ', ' ' + Trim(Copy(U, p, MaxInt)) + ' ') = 0) then
       begin
         // the enum's own NAME is a symbol; its members are read on the following lines
-        q := Pos(Nm, U);
+        q := Pos(Want, U);
         while q > 0 do
         begin
           if ((q = 1) or not IsIdentChar(U[q - 1])) and
-             ((q + Length(Nm) > Length(U)) or not IsIdentChar(U[q + Length(Nm)])) then
-            Exit(True);
-          q := Pos(Nm, U, q + 1);
+             ((q + Length(Want) > Length(U)) or not IsIdentChar(U[q + Length(Want)])) then
+            if Qual = '' then Exit(True);
+          q := Pos(Want, U, q + 1);
         end;
         Inc(EnumDepth);
         Continue;
@@ -1541,33 +1697,47 @@ begin
       if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
          (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
          (W = 'ENUM') or (W = 'COMMON') then
-      begin
-        q := Pos(Nm, U);
-        while q > 0 do
-        begin
-          // ⛔ A QUALIFIED NAME DOES NOT DECLARE THE BARE ONE. "Sub T.proc()" and
-          // "Dim As Short T.staticfield" are the OUT-OF-LINE definitions of members, written at module
-          // level - and fbc still answers FALSE for "defined( proc )". A '.' immediately before the
-          // match is what says so, and it is the only thing that does at this stage.
-          if ((q = 1) or (not IsIdentChar(U[q - 1]) and (U[q - 1] <> '.'))) and
-             ((q + Length(Nm) > Length(U)) or
-              (not IsIdentChar(U[q + Length(Nm)]) and (U[q + Length(Nm)] <> '.'))) then
-            Exit(True);
-          q := Pos(Nm, U, q + 1);
-        end;
-      end;
+        if (Qual = '') and LineMentions(U, Nm) then Exit(True);
       // ...and only AFTER the line has been read: "Type T" declares T itself, which IS a symbol, and
       // fbc's own test asks for it from inside the body ("check_Y( T )").
       if (W = 'TYPE') or (W = 'UNION') or (W = 'CLASS') then
       begin
         Rest := Trim(Copy(U, p, MaxInt));
         // "Type mine As LongInt" is an ALIAS - one line, no block. Anything else opens one.
-        if Pos(' AS ', ' ' + Rest + ' ') = 0 then Inc(TypeDepth);
+        if Pos(' AS ', ' ' + Rest + ' ') = 0 then
+        begin
+          Inc(TypeDepth);
+          if (Qual <> '') and (TypeDepth = 1) and LineMentions(U, Qual) then
+          begin
+            QualIsType := True;
+            InQualBody := True;
+          end;
+        end;
       end;
     end;
+    if Qual <> '' then
+      Result := QualIsType and QualMemberHit
+    else
+      Result := MemberHit and (TypeDepth > 0);
   finally
     L.Free;
   end;
+end;
+
+function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean;
+// Is this name DEFINED, in the sense fbc's Defined() and #ifdef both mean? Four storages, one
+// question: an object-like macro (Defs), a function-like macro (FnDefs - "#macro m(a)" and
+// "#define f(a)" live only there, and asking Defs alone answered 0 for a macro written three lines
+// above), a "#pragma reserve" reservation that is still in scope (GPPReserved; a 'q' in the value
+// marks one that has been un-reserved), a word the LANGUAGE reserves (GPPKeywords), or a declaration
+// the source itself makes above this point (SourceDeclaresSymbol).
+begin
+  Result := ((Defs <> nil) and (Defs.IndexOfName(Nm) >= 0)) or
+            ((FnDefs <> nil) and (FnDefs.IndexOfName(Nm) >= 0)) or
+            ((GPPReserved <> nil) and (GPPReserved.IndexOfName(Nm) >= 0) and
+             (Pos('q', GPPReserved.Values[Nm]) = 0)) or
+            ((GPPKeywords <> nil) and (GPPKeywords.IndexOf(Nm) >= 0)) or
+            SourceDeclaresSymbol(Nm);
 end;
 
 // Evaluate a #if / #elif constant integer expression. Supports: decimal and &H/&O/&B literals;
@@ -1726,16 +1896,26 @@ var
           q := p;
           while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
           nm := UpperCase(Copy(S, p, q - p)); p := q;
+          // ⛔ A QUALIFIED name is one name, and it was read as the BARE one with a tail left over.
+          // "defined( T.datafield )" answered whatever "defined( T )" answered - so every one of the
+          // fourteen "check_N( T.something )" in fbc's pp/defined-udt came out TRUE inside the type's
+          // own body, where T certainly is defined. The member half may be an OPERATOR name
+          // ("T.+=", "T.[]", "T.new[]"), which no identifier scan would ever reach: everything up to
+          // the closing parenthesis or the end belongs to the name.
+          if (p <= Length(S)) and (S[p] = '.') then
+          begin
+            Inc(p);                                  // the '.'
+            q := p;
+            while (q <= Length(S)) and (S[q] <> ')') and (S[q] <> ' ') and (S[q] <> #9) do Inc(q);
+            nm := nm + '.' + UpperCase(Trim(Copy(S, p, q - p)));
+            p := q;
+          end;
           while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
           // ⛔ A FUNCTION-LIKE MACRO IS DEFINED TOO. "#macro m(a)" and "#define f(a) ..." live in
           // FnDefs, not Defs, and only Defs was consulted - so "defined(m)" answered 0 for a macro
           // that had just been written three lines above. The two tables are one QUESTION with two
           // storages; every place that asks "is this name a macro?" has to ask both.
-          if (Defs.IndexOfName(nm) >= 0) or
-             ((FnDefs <> nil) and (FnDefs.IndexOfName(nm) >= 0)) or
-             ((GPPReserved <> nil) and (GPPReserved.IndexOfName(nm) >= 0) and
-              (Pos('q', GPPReserved.Values[nm]) = 0)) or
-             SourceDeclaresSymbol(nm) then
+          if PPNameIsDefined(nm, Defs, FnDefs) then
             Toks.Add('1')
           else
             Toks.Add('0');
@@ -2389,6 +2569,7 @@ var
     DirWord: string;        // the leading word of the line, for that same counter
     SavedStackTop: Integer;
     ContJoin, CutPos: Integer;   // '_'-continued physical lines folded into this logical one
+    IsModuleText: Boolean;       // this pass is over the MODULE's own text: it carries the position
   // The block-scope openers "#pragma reserve" counts levels with. Nothing else reads them.
   function BlockCloser(const S: string): Boolean;
   var W: string;
@@ -2450,9 +2631,14 @@ var
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
+      // Only the MODULE's own text carries a POSITION for defined(): an #include and a macro
+      // re-expansion are re-entered here with their own text, whose line numbers say nothing about
+      // where the question stands, so they leave the outer position alone. See GPPDefinedLimit.
+      IsModuleText := (Text = GPPSourceForDefined);
       li := 0;
       while li < Lines.Count do
       begin
+        if IsModuleText then GPPDefinedLimit := li;
         Raw := Lines[li];
         Trimmed := TrimLeft(Raw);
         // The depth is updated for THIS line first, so a line that OPENS a comment is still read as
@@ -2574,22 +2760,19 @@ var
             // ⚠️ Only the reserved set is added. SourceDeclaresSymbol (a Const, a Dim, a Sub) is the
             // OTHER half of that same asymmetry and is NOT closed here: every #ifdef of such a name
             // would flip at once, which is a measurement of its own. Written up in DIVERGENZE.
-            Cond := ParentEmit and ((Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
-                                    (FnDefs.IndexOfName(UpperCase(Trim(DRest))) >= 0) or
-                                    ((GPPReserved <> nil) and
-                                     (GPPReserved.IndexOfName(UpperCase(Trim(DRest))) >= 0) and
-                                     (Pos('q', GPPReserved.Values[UpperCase(Trim(DRest))]) = 0)));
+            // ⭐ ONE QUESTION, ONE PREDICATE. "#ifdef X" and "#if defined( X )" are the same
+            // question in fbc, and its pp/defined-udt asks BOTH of every name it checks, expecting
+            // the same answer. Here they were two: only #if consulted the source's own declarations,
+            // so a Const, a Dim, a Sub - and a member of the enclosing type - answered yes to one and
+            // no to the other. PPNameIsDefined is now the single place either of them asks.
+            Cond := ParentEmit and PPNameIsDefined(UpperCase(Trim(DRest)), Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
           else if DName = 'ifndef' then
           begin
             ParentEmit := Emitting;
-            Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
-                                   (FnDefs.IndexOfName(UpperCase(Trim(DRest))) < 0) and
-                                   ((GPPReserved = nil) or
-                                    (GPPReserved.IndexOfName(UpperCase(Trim(DRest))) < 0) or
-                                    (Pos('q', GPPReserved.Values[UpperCase(Trim(DRest))]) > 0));
+            Cond := ParentEmit and not PPNameIsDefined(UpperCase(Trim(DRest)), Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -3107,6 +3290,7 @@ begin
     SetLength(Taken, 0);
     EscapeOn := False;
     GPPSourceForDefined := Src;   // lets defined() see Const/Dim/proc declarations, like fbc
+    GPPOutput := Output;          // ...positionally: the expansion so far IS the symbol table so far
   if GPPReserved = nil then GPPReserved := TStringList.Create;
   GPPReserved.Clear;            // per PROGRAM: a reservation must not survive into the next one
   GPPReserved.CaseSensitive := False;
@@ -3116,6 +3300,7 @@ begin
   // fbc's own pp/intrinsic, a program it accepts, and we refused it.
   GPPReserved.Values['__FUNCTION__'] := '';
   GPPReserved.Values['__FUNCTION_NQ__'] := '';
+  SeedFbKeywords;
     Expand(Src, BaseDir);
     Result := Output.Text;
   finally
@@ -3123,6 +3308,7 @@ begin
     IncOnce.Free;
     PragmaOnce.Free;
     FnDefs.Free;
+    GPPOutput := nil;             // it is about to be freed: nothing may scan it afterwards
     Output.Free;
   end;
 end;
