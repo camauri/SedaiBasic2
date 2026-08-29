@@ -10464,8 +10464,7 @@ begin
   // that path would look for one and find nothing.
   if (TargetNode.GetChild(0).NodeType = antMemberAccess) and
      (TargetNode.GetChild(0).ChildCount >= 1) and
-     ResolveRecordObject(TargetNode.GetChild(0).GetChild(0), PropHandle, PropType) and
-     (ResolveMethodLabel(PropType, VarToStr(TargetNode.GetChild(0).Value) + '.SET') <> '') then
+     ResolveRecordObject(TargetNode.GetChild(0).GetChild(0), PropHandle, PropType) then
   begin
     PropArgs := TASTNode.Create(antArgumentList, TargetNode.Token);
     try
@@ -10475,12 +10474,28 @@ begin
       else
         PropArgs.AddChild(TargetNode.GetChild(1).Clone);
       PropArgs.AddChild(ExprNode.Clone);
-      ProcessMethodCall(TargetNode.GetChild(0).GetChild(0), PropType,
-                        VarToStr(TargetNode.GetChild(0).Value) + '.SET', PropArgs, PropDummy);
+      // ⛔ THE GUARD ASKED FOR THE BARE LABEL, AND AN OVERLOADED SETTER HAS NONE. A property may be
+      // overloaded on its INDEX ("Property bar(i As Integer, v As Integer)" beside "bar(i As String,
+      // v As Integer)"), and then both labels carry the "~<sig>" tail and the bare lookup answers ''.
+      // The whole branch was therefore skipped and the store fell through to the member-ARRAY path,
+      // which looks for a field of that name, finds none, and quietly does nothing: fbc's own
+      // structs/obj_property_idx assigned four values and read back four zeros. With ONE setter it
+      // worked, which is why it read as an indexing problem.
+      // The arguments are built first so the args-aware lookup can see them; ProcessMethodCall has
+      // picked the overload from them all along (the READ half at ProcessMemberAccess already does).
+      if (ResolveMethodLabel(PropType, VarToStr(TargetNode.GetChild(0).Value) + '.SET') <> '') or
+         (ResolveMethodLabelArgs(PropType, VarToStr(TargetNode.GetChild(0).Value) + '.SET',
+                                 PropArgs) <> '') then
+      begin
+        ProcessMethodCall(TargetNode.GetChild(0).GetChild(0), PropType,
+                          VarToStr(TargetNode.GetChild(0).Value) + '.SET', PropArgs, PropDummy);
+        PropArgs.Free;
+        PropArgs := nil;
+        Exit;
+      end;
     finally
-      PropArgs.Free;
+      if PropArgs <> nil then PropArgs.Free;
     end;
-    Exit;
   end;
 
   if TargetNode.GetChild(0).NodeType = antMemberAccess then
@@ -36418,6 +36433,12 @@ begin
           else
             NestedT := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), nil);
           if NestedT <> '' then Result := VarRecordTypeName(NestedT);
+          // ...and one that returns a "T PTR": the returned int IS the record handle, so the object is
+          // the POINTEE. That rung exists for a module-level FUNCTION (the identifier base above) and
+          // was missing here, so a chained "obj.prop(i)->prop(j)->field" - fbc's own
+          // structs/obj_property_idx2 - resolved each hop on its own and answered the packed handle
+          // when they were written as one chain.
+          if (Result = '') and (NestedT <> '') then Result := ProcReturnPtrUDT(NestedT);
         end;
         // ⛔ ...AND A POINTER FIELD INDEXED. "obj.ptrfield[i]" is a dereference - p[i] is *(p+i) - so the
         // element's type is the field's pointee, computed as the antDeref arm above computes it.
