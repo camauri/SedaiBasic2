@@ -348,6 +348,14 @@ type
     // suite's overload/bydesc declares "array2" in eight sibling TEST blocks with FOUR different ranks.
     // One name, one rank, or no opinion: a name declared twice is never asked about again.
     FRankPoisoned: TStringList;
+    // ⛔ The SHAPE of an array, filed under the SLOT it was declared into rather than under its bare
+    // NAME. FDynamicArrays below is a PRE-SCAN over the raw AST with no scope in hand, so one
+    // procedure's "ReDim x(...)" made every other procedure's "Dim x(0 To 1)" dynamic - and ERASE
+    // reads that answer to decide whether to FREE the storage or to RESET the elements. These two are
+    // written at the point the slot is created, where the scope IS in hand, and the flat pre-scan
+    // stays as the fallback for a name that never reached one (see ArraySlotIsDynamic).
+    FArrShapeDyn: TStringList;           // slot names known DYNAMIC (declared "()" / an "Any" / a REDIM target)
+    FArrShapeFixed: TStringList;         // slot names known FIXED (declared with subscripts)
     FDynamicArrays: TStringList;         // array names (UPPER) that are dynamic (declared empty "()" or a REDIM
     // Fra gli array DINAMICI, quelli in cui OGNI Dim/ReDim del programma dichiara il limite
     // inferiore come lo zero LETTERALE (o lo omette, che vuol dire zero). Per questi l'accesso non
@@ -494,6 +502,8 @@ type
     function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
     function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
     function BlockScalarName(const Name: string): string;    // the innermost OPEN block that declared this @-taken SCALAR, or ''
+    procedure NoteArrayShape(const SlotName: string; Dynamic: Boolean);     // this SLOT is dynamic / fixed
+    function ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
                                 const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
@@ -1443,6 +1453,8 @@ begin
   FRankStatedArrays.CaseSensitive := False;
   FRankPoisoned := TStringList.Create;
   FRankPoisoned.CaseSensitive := False;
+  FArrShapeDyn := TStringList.Create;   FArrShapeDyn.CaseSensitive := False;
+  FArrShapeFixed := TStringList.Create; FArrShapeFixed.CaseSensitive := False;
   FDynamicArrays := TStringList.Create;
   FZeroLbArrays := TStringList.Create;
   FZeroLbPoisoned := TStringList.Create;
@@ -1561,6 +1573,8 @@ begin
   FRedimMultiArrays.Free;
   FRankStatedArrays.Free;
   FRankPoisoned.Free;
+  FArrShapeDyn.Free;
+  FArrShapeFixed.Free;
   FDynamicArrays.Free;
   FZeroLbArrays.Free;
   FZeroLbPoisoned.Free;
@@ -11291,6 +11305,7 @@ begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
       ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
+      NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
@@ -11472,6 +11487,9 @@ begin
 
     // Declare array in SSA program
     ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
+    // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
+    // name never declared, which is a dynamic array however it is written.
+    NoteArrayShape(DeclArrName, ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1');
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -11770,7 +11788,7 @@ begin
     ArrayIdx := ArrayIndexOf(ArrName);
     if ArrayIdx < 0 then
       raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
-    if FDynamicArrays.IndexOf(ArrName) >= 0 then DynFlag := 1 else DynFlag := 0;
+    if ArraySlotIsDynamic(ArrayIdx, ArrName) then DynFlag := 1 else DynFlag := 0;
     // ...and its DESTRUCTOR runs on every element FIRST, before the storage goes: fbc's own suite counts
     // the calls ("erase x2 '' dtors & clear"). Emitted here, ahead of the erase, for the obvious reason.
     RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
@@ -11890,11 +11908,15 @@ begin
       // fresh array. Then skip the normal resize path below.
       DimNode := TASTNode.Create(antDim, ArrayDeclNode.Token);
       DimNode.AddChild(ArrayDeclNode.Clone);
+      DimNode.GetChild(0).Attributes.Values['FROMREDIM'] := '1';   // a ReDim's array is dynamic, subscripts or not
       ProcessDim(DimNode);
       DimNode.Free;
       Continue;
     end;
 
+    // Whatever a DIM said about this slot, a REDIM of it makes it dynamic from here on.
+    if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
+      NoteArrayShape(FProgram.GetArray(ArrayIdx).Name, True);
     DimsNode := ArrayDeclNode.GetChild(1);
     if DimsNode.NodeType <> antDimensions then
       raise Exception.CreateFmt('REDIM: invalid dimensions for %s', [ArrName]);
@@ -37635,6 +37657,44 @@ begin
     FProgram.SetArrayPrivate(Result);
 end;
 
+procedure TSSAGenerator.NoteArrayShape(const SlotName: string; Dynamic: Boolean);
+// File this SLOT's shape. The last word wins: a REDIM of a slot a DIM declared with subscripts makes it
+// dynamic from then on, and nothing makes a dynamic slot fixed again.
+var k: Integer;
+begin
+  if SlotName = '' then Exit;
+  if Dynamic then
+  begin
+    k := FArrShapeFixed.IndexOf(SlotName);
+    if k >= 0 then FArrShapeFixed.Delete(k);
+    if FArrShapeDyn.IndexOf(SlotName) < 0 then FArrShapeDyn.Add(SlotName);
+  end
+  else
+  begin
+    if FArrShapeDyn.IndexOf(SlotName) >= 0 then Exit;      // already known dynamic: it stays so
+    if FArrShapeFixed.IndexOf(SlotName) < 0 then FArrShapeFixed.Add(SlotName);
+  end;
+end;
+
+function TSSAGenerator.ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
+// Is the array THIS name reaches dynamic? Asked of the SLOT, which ArrayIndexOf has already resolved
+// with the full scope walk, and only then of the flat pre-scan.
+//
+// ⛔ The flat one alone is wrong for the question ERASE asks. FDynamicArrays is keyed by the BARE name
+// and written by a pre-scan with no scope, so "Sub a2: ReDim x(0 To 1)" made "Sub a1: Dim x(0 To 1)"
+// dynamic too - and ERASE then FREED a1's fixed array instead of RESETTING its elements, which for an
+// array of UDT means the constructors are never re-run. fbc's own structs/obj-array-erase counts them.
+// ⚠️ The fallback stays for a slot nothing recorded (a module array created by another path); there
+// one name means one array anyway, which is exactly where the flat registry was never wrong.
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
+  begin
+    if FArrShapeDyn.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0 then Exit(True);
+    if FArrShapeFixed.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0 then Exit(False);
+  end;
+  Result := FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0;
+end;
+
 function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string;
 // Per-proc name for a LOCAL array (a DIM inside a SUB/FUNCTION) that shadows a module array of the same
 // name. Without this the local's DeclareArray would reuse the module array's slot (REDIM semantics),
@@ -39567,6 +39627,8 @@ begin
   // element access subtracts the RUNTIME lower bound instead of the compile-time DIM one.
   FRankStatedArrays.Clear;
   FRankPoisoned.Clear;
+  FArrShapeDyn.Clear;
+  FArrShapeFixed.Clear;
   FDynamicArrays.Clear;
   CollectDynamicArrays(AST);
   // ...and an EMPTY static ARRAY member ("Static a()") is dynamic too: ERASE frees it and it reports
