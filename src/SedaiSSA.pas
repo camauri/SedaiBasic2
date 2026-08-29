@@ -13267,6 +13267,30 @@ begin
     // fresh temporary plus a copy back -- which is exactly the whole-string copy this exists to avoid.
     // Verified on the disassembly: with the use-value it came out "Dest=2 Src1=0" followed by
     // "CopyString R0, R2"; with the canonical register Dest and Src1 are the same register.
+    // ⛔⛔ ...AND WHEN THE VARIABLE'S VALUE DOES NOT LIVE IN ITS REGISTER, THE WRITE MUST BE PUBLISHED.
+    // An @-taken variable is backed by a per-frame record field, and "Clear w, 0, SizeOf(w)" takes its
+    // address - so a WSTRING that had merely been CLEARED silently lost every later "Mid(w, i) = x".
+    // fbc's own wstring/midstmt clears every buffer it builds, which is why one test carried 12 390
+    // failing assertions, 61% of the suite's total.
+    // The ZSTRING half of this guard has excluded the raw case since it was written; the wide half
+    // never asked - and could not simply be excluded either, because the general rebuild below reads a
+    // "WString * n" at its CONTENT length where fbc reads it at its declared cell count, so sending it
+    // there writes something WRONG instead of nothing (DIVERGENZE 37; measured 28 Aug, 12 390 failing
+    // assertions became 17 386). So the overwrite is done HERE, where it is right, into a named temp,
+    // and assigned back through the machinery that has known how to reach a raw slot all along.
+    if IsAddrLocal(VarToStr(TargetNode.Value)) or IsRawModuleScalar(VarToStr(TargetNode.Value)) then
+    begin
+      TmpName := '__MID' + IntToStr(FSwapTempSeq) + '$';
+      Inc(FSwapTempSeq);
+      ResultReg := GetOrAllocateVariable(TmpName);
+      EmitInstruction(ssaStrMidAssign, ResultReg, TextReg, SrcCapReg, StartReg);
+      AsnNode := TASTNode.Create(antAssignment, Node.Token);
+      AsnNode.AddChild(TargetNode.Clone);
+      AsnNode.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token));
+      ProcessAssignment(AsnNode);
+      AsnNode.Free;
+      Exit;
+    end;
     TgtVarReg := EnsureStringRegister(GetOrAllocateVariable(VarToStr(TargetNode.Value)));
     if TgtVarReg.Kind = svkRegister then
     begin
