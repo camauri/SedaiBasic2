@@ -34433,9 +34433,11 @@ begin
     // the arithmetic, which is what this arm's own header says it does.
     if (Node.GetChild(0).NodeType = antCast) and (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
-    else if (Node.GetChild(0).NodeType = antMemberAccess) and (DerefedType(Node.GetChild(0)) <> '') then
+    else if (Node.GetChild(0).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess]) and
+            (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
-    else if (Node.GetChild(1).NodeType = antMemberAccess) and (DerefedType(Node.GetChild(1)) <> '') then
+    else if (Node.GetChild(1).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess]) and
+            (DerefedType(Node.GetChild(1)) <> '') then
       Result := DerefedType(Node.GetChild(1))
     else if (Node.GetChild(0).NodeType = antIdentifier) and
        (ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)) <> '') then
@@ -36324,6 +36326,19 @@ begin
         if (FindUDT(ArrName) >= 0) and UDTBlockIsManaged(ArrName) then Result := ArrName;
       end;
     end
+    // ⛔ ...AND THE BASE OF AN INDEX MAY BE AN EXPRESSION, not a name. "(*pp)[0].i" is fbc's own
+    // expressions/memberderef, which writes the SAME access eight ways: seven of them resolved and this
+    // one answered the packed handle (4611686018427387904 for 123). Indexing is a dereference, so the
+    // element's type is the type of "*(base)" - which DerefedType answers for a parenthesised deref
+    // chain already, and has since m720 for a member base as well.
+    else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) and
+            (ObjNode.GetChild(0).NodeType in [antParentheses, antDeref]) then
+    begin
+      NestedT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+      if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') then
+        NestedT := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+      if FindUDT(NestedT) >= 0 then Result := NestedT;
+    end
     // Array-of-UDT MEMBER element "obj.field(i)", or a method call "obj.method(args)": child 0 is a
     // member access. The element type is the field's ArrayElemType; a method call yields its return type.
     else if (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
@@ -36347,6 +36362,19 @@ begin
           else
             NestedT := ResolveMethodLabelArgs(ParentType, VarToStr(ObjNode.GetChild(0).Value), nil);
           if NestedT <> '' then Result := VarRecordTypeName(NestedT);
+        end;
+        // ⛔ ...AND A POINTER FIELD INDEXED. "obj.ptrfield[i]" is a dereference - p[i] is *(p+i) - so the
+        // element's type is the field's pointee, computed as the antDeref arm above computes it.
+        // ⚠️ This rung was written once before and REMOVED as dead, correctly: the lowering gave up
+        // earlier, in ResolveRecordObject, which asked for a NAME as the index base. That half exists
+        // now, so the question finally gets asked. Last of the rungs, so a real array member and a
+        // method still win the name.
+        if Result = '' then
+        begin
+          NestedT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+          if (Length(NestedT) > 4) and (Copy(NestedT, Length(NestedT) - 3, 4) = ' PTR') then
+            NestedT := Trim(Copy(NestedT, 1, Length(NestedT) - 4));
+          if FindUDT(NestedT) >= 0 then Result := NestedT;
         end;
       end;
     end;
@@ -37178,6 +37206,39 @@ begin
             Exit;
           end;
         end;
+      end;
+    end;
+    // ⛔ THE BASE OF AN INDEX MAY BE AN EXPRESSION, and everything below asks for a NAME. fbc's own
+    // expressions/memberderef writes the same access eight ways and this was the one that failed:
+    // "(*pp)[0].i" answered the packed handle (4611686018427387904 for 123) while "(*pp)->i",
+    // "pp[0]->i", "(*pp[0]).i" and "(**pp).i" beside it were all right.
+    // Indexing a pointer IS a dereference - "b[i]" is "*(b + i)" - and the rung just above already
+    // rewrites "pp[i]->f" that way for a NAMED base. Written as the deref it is and handed back to
+    // this routine, which knows every base it knows. Last resort on purpose: a real member array,
+    // a method call and a p[i][j] chain are all matched above and keep their own path.
+    // ⚠️ The synthesised "+" carries the BASE's token, never an operator one - a binary-op node whose
+    // token is an operator is lowered from that TOKEN, and a "*" there would quietly become a multiply.
+    if (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+       (ObjNode.GetChild(0).NodeType in [antParentheses, antDeref, antMemberAccess]) and
+       (DerefedType(ObjNode.GetChild(0)) <> '') then
+    begin
+      ChainIdx := ObjNode.GetChild(1);
+      if (ChainIdx <> nil) and (ChainIdx.NodeType in [antArgumentList, antExpressionList]) and
+         (ChainIdx.ChildCount = 1) then
+        ChainIdx := ChainIdx.GetChild(0);
+      if ChainIdx <> nil then
+      begin
+        CancelObj := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
+        SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', ObjNode.GetChild(0).Token);
+        SharedTmp.AddChild(ObjNode.GetChild(0).Clone);
+        SharedTmp.AddChild(ChainIdx.Clone);
+        CancelObj.AddChild(SharedTmp);
+        try
+          Result := ResolveRecordObject(CancelObj, HandleVal, TypeName);
+        finally
+          CancelObj.Free;
+        end;
+        if Result then Exit;
       end;
     end;
     if (ObjNode.ChildCount < 1) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
