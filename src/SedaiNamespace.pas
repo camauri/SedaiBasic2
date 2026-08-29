@@ -53,6 +53,12 @@ type
     // ns1) and reads a name of ns1 through ns3. Without this the import stopped one level down and the
     // name resolved to nothing - it printed 0.
     NsUsings: TStringList;
+    // ⭐ ...and, separately, the TYPE names the program declares at MODULE level. GlobalNames above is
+    // the right authority for a VARIABLE reference and the wrong one for a TYPE SLOT: BASIC is
+    // case-insensitive, so "Dim p As P" names the variable and the type alike, and the variable's own
+    // name in GlobalNames blocked the import for the TYPE occurrence beside it. A type slot asks this
+    // set instead - only a module-level TYPE can outrank an imported one.
+    GlobalTypeNames: TStringList;
     constructor Create;
     destructor Destroy; override;
     function IsMember(const Prefix, Name: string): Boolean;
@@ -66,6 +72,9 @@ begin
   NsUsings := TStringList.Create;
   NsUsings.Duplicates := dupIgnore;
   NsUsings.Sorted := True;
+  GlobalTypeNames := TStringList.Create;
+  GlobalTypeNames.Duplicates := dupIgnore;
+  GlobalTypeNames.Sorted := True;
   NamespaceNames := TStringList.Create;
   NamespaceNames.Duplicates := dupIgnore;
   NamespaceNames.Sorted := True;
@@ -82,6 +91,7 @@ begin
   NamespaceNames.Free;
   MemberKeys.Free;
   GlobalNames.Free;
+  GlobalTypeNames.Free;
   NsUsings.Free;
   inherited Destroy;
 end;
@@ -331,7 +341,7 @@ end;
 // Resolve an unqualified member name V against the active prefix chain (innermost first). Returns
 // the mangled "PREFIX.V" if V is a member of some enclosing namespace, else ''.
 function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext;
-                            Using: TStringList): string;
+                            Using: TStringList; TypeSlot: Boolean = False): string;
 // ...and then against the namespaces a USING has brought into scope. Tried AFTER the enclosing chain,
 // so a name of the namespace one is written INSIDE always wins over an imported one - which is what
 // fbc does and the only order that keeps an existing program's meaning.
@@ -356,7 +366,16 @@ begin
   // not only what N declares - fbc's namespace/using2 nests three deep and reads a name of the
   // innermost through the outermost. The closure is built here rather than when the directive is seen,
   // because a namespace may be REOPENED after the import and gain more imports later.
-  if (Using <> nil) and (Ctx.GlobalNames.IndexOf(V) < 0) then
+  // ⛔ ...AND A TYPE SLOT ASKS A DIFFERENT SET. The guard just above is the right authority for a
+  // VARIABLE reference and the wrong one for the type of a declaration: BASIC is case-insensitive, so
+  // "Dim p As P" names the variable and the type alike, and the variable's own name in GlobalNames
+  // blocked the import for the TYPE beside it - the record was then built from a type that exists
+  // nowhere and every field read 0, while renaming the variable made the identical program work
+  // (fbc suite namespace/var-named-as-udt, which writes that pair on purpose). Only a module-level
+  // TYPE can outrank an imported one.
+  if (Using <> nil) and
+     (((not TypeSlot) and (Ctx.GlobalNames.IndexOf(V) < 0)) or
+      (TypeSlot and (Ctx.GlobalTypeNames.IndexOf(V) < 0))) then
   begin
     Closure := TStringList.Create;
     try
@@ -495,9 +514,9 @@ end;
 function RewriteRefs(Node: TASTNode; const ActivePrefix: string;
                      Shadow: TStringList; Ctx: TNsContext; Using: TStringList): TASTNode;
 var
-  i, k: Integer;
+  i, k, m: Integer;
   ChildPrefix, BaseName, Mangled, V, Qual: string;
-  NewNode, BaseId, FieldNd: TASTNode;
+  NewNode, BaseId, FieldNd, DeclNd: TASTNode;
   UseShadow, UseUsing: TStringList;
   Drop: array of Integer;
   UsingNs: string;
@@ -571,6 +590,37 @@ begin
     // without the module-level name of the same spelling the very same program worked. Its TYPE child
     // still has to be resolved (a field declared "As UDT" inside a namespace means "NS.UDT"), so the
     // field node is stepped OVER, not skipped.
+    // ⭐ A DECLARATION'S TYPE SLOT IS RESOLVED AS A TYPE, not as an ordinary identifier. The slot is
+    // child 1 of "Dim v As T" and child 2 of "Dim v(dims) As T" - the same two shapes the SSA tests -
+    // and it is asked with TypeSlot=True, which changes WHICH module-level set can outrank an import
+    // (see ResolveUnqualified). Everything else in the declaration keeps the ordinary rewrite.
+    if Node.NodeType = antArrayDecl then
+    begin
+      m := -1;
+      if (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antIdentifier) then m := 1
+      else if (Node.ChildCount >= 3) and (Node.GetChild(1).NodeType = antDimensions) and
+              (Node.GetChild(2).NodeType = antIdentifier) then m := 2;
+      if (i = m) and (UseUsing <> nil) then
+      begin
+        DeclNd := Node.GetChild(i);
+        V := UpperCase(VarToStr(DeclNd.Value));
+        SigV := '';
+        while (Length(V) > 4) and (Copy(V, Length(V) - 3, 4) = ' PTR') do
+        begin
+          SigV := ' PTR' + SigV;
+          V := TrimRight(Copy(V, 1, Length(V) - 4));
+        end;
+        if (V <> '') and (Pos('.', V) = 0) then
+        begin
+          Qual := ResolveUnqualified(ChildPrefix, V, Ctx, UseUsing, True);
+          if Qual <> '' then
+          begin
+            DeclNd.Value := Qual + SigV;
+            Continue;                       // resolved as a TYPE; the generic rewrite must not re-do it
+          end;
+        end;
+      end;
+    end;
     if (Node.NodeType = antTypeDecl) and (Node.GetChild(i).NodeType = antIdentifier) then
     begin
       FieldNd := Node.GetChild(i);
@@ -873,7 +923,12 @@ begin
     // The names the program declares at MODULE level, so an import cannot take one over.
     for gi := 0 to AST.ChildCount - 1 do
       if AST.GetChild(gi).NodeType <> antNamespace then
+      begin
         AddDeclaredNames(AST.GetChild(gi), Ctx.GlobalNames);
+        // ...and the module-level TYPE names on their own, for the type-slot question.
+        if (AST.GetChild(gi).NodeType = antTypeDecl) and (VarToStr(AST.GetChild(gi).Value) <> '') then
+          Ctx.GlobalTypeNames.Add(UpperCase(VarToStr(AST.GetChild(gi).Value)));
+      end;
     RewriteRefs(AST, '', nil, Ctx, nil);
     HoistNamespaces(AST);
   finally
