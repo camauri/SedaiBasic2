@@ -759,7 +759,16 @@ begin
           try
             Ctx.AddUsingClosure(BaseName, UseUsing);
             for k := 0 to UseUsing.Count - 1 do
-              if Ctx.IsMember(UseUsing[k], V) then
+              // ⛔ ...AND WHAT IT CAN SEE INCLUDES A NESTED NAMESPACE, not only a MEMBER. A nested
+              // namespace is recorded in NamespaceNames and NEVER in MemberKeys (CollectNamespaces
+              // says so, and the same trap is written down at the procedure-declaration branch above),
+              // so "Namespace ns_c : Using ns_b" left "ns_c.inner" - where inner is a namespace of
+              // ns_b - matching nothing: it mangled to "NS_C.INNER", which exists nowhere, and
+              // "ns_c.inner.foo" then read as a record field and answered 0. The direct spelling
+              // "ns_b.inner.foo" worked, which is what said the gap was in the IMPORT hop.
+              // fbc suite namespace/using_nested.
+              if Ctx.IsMember(UseUsing[k], V) or
+                 (Ctx.NamespaceNames.IndexOf(UseUsing[k] + '.' + V) >= 0) then
               begin
                 BaseName := UseUsing[k];
                 Break;
