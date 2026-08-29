@@ -165,6 +165,9 @@ type
     // direction that must never happen. Measured over the whole fbc suite: 36 of 36 rejections landed,
     // 0 valid programs refused.
     FExternShapes: TStringList;      // UPPER name -> shape, encoded by EncodeDeclShape
+    // The declaration a lone "Extern a() As Integer" owes the SSA, built by ScanModuleLevelExtern and
+    // handed back by the caller that would otherwise throw the whole line away.
+    FPendingExternArray: TASTNode;
     // ⭐ Module-level names that are LOCALS of the implicit main: a bare "Dim" and a bare "Static" at
     // module level. fbc will not let a STATIC-STORAGE initialiser reference one ("error 272: Local
     // symbols can't be referenced" for its address, "error 11: Expected constant" for its value),
@@ -199,6 +202,7 @@ type
     procedure NoteExternShape(const Name, Shape: string);
     procedure CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
     procedure ScanModuleLevelExtern;
+    function  ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
     procedure RejectEmptyAliasNames;
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
     procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
@@ -1468,8 +1472,18 @@ begin
      // still a DECLARATION: it fixes the name's rank, bounds, static/dynamic-ness and element type,
      // and fbc rejects a later DIM/REDIM/EXTERN that disagrees. ScanModuleLevelExtern reads the line
      // and REWINDS; the skip below is unchanged, so not one token of the old behaviour moves.
+     FPendingExternArray := nil;
      if AtModuleLevel and (UpperCase(Token.Value) = 'EXTERN') then ScanModuleLevelExtern;
      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+     // ...and the ONE thing a lone EXTERN cannot throw away with the rest of the line: the storage an
+     // EXTERN ARRAY the module never defines still owes the SSA. See ScanModuleLevelExtern.
+     if Assigned(FPendingExternArray) then
+     begin
+       Result := FPendingExternArray;
+       FPendingExternArray := nil;
+       DoNodeCreated(Result);
+       Exit;
+     end;
    end;
    Result := nil;
    Exit;
@@ -11451,7 +11465,7 @@ procedure TPackratParser.ScanModuleLevelExtern;
 var
   SavedIdx, Idx: Integer;
   Nm, TypeName, Shape, Why, Flags: string;
-  Dims, CapExpr: TASTNode;
+  Dims, CapExpr, Decl: TASTNode;
   BlameTok: TLexerToken;
   CapVal: Int64;
   HasParens, HasInit, HasEllipsis, Understood: Boolean;
@@ -11533,6 +11547,69 @@ begin
     Exit;
   end;
   NoteExternShape(Nm, Shape);
+  // ⛔ AND FOR AN ARRAY, READING THE SHAPE IS NOT ENOUGH. A scalar EXTERN costs the SSA nothing - an
+  // unknown name is a fresh variable - but an ARRAY needs a slot, so "Extern a() As Integer" followed
+  // by "a(0)" died with "Array not declared: A" on a program fbc compiles (fbc suite
+  // dim/all-kinds-of-vars, whose EXTERN array's only DIM sits inside a "#if 0"). fbc's EXTERN declares
+  // the array without defining it; here, where there is no linker to define it later, the declaration
+  // has to carry the storage.
+  // ⚠️ Only when the module does NOT declare the name anywhere else, because that same file writes
+  // "extern publicarray()" and "dim publicarray()" together and fbc answers "error 4: Duplicated
+  // definition" to two definitions. ModuleDeclaresNameElsewhere over-matches on purpose: a false
+  // "yes" leaves the behaviour exactly as it was, a false "no" would invent a duplicate.
+  if HasParens and (TypeName <> '') and not ModuleDeclaresNameElsewhere(Nm) then
+  begin
+    FPendingExternArray := TASTNode.Create(antDim, BlameTok);
+    Decl := TASTNode.Create(antArrayDecl, BlameTok);
+    Decl.Attributes.Values['VARLEN'] := '1';               // no bounds: the dynamic form "Dim a()"
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, Nm, BlameTok));
+    Decl.AddChild(TASTNode.Create(antDimensions, BlameTok));
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, BlameTok));
+    FPendingExternArray.AddChild(Decl);
+  end;
+end;
+
+function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
+// Does any DECLARATION STATEMENT in this module name Nm? Asked of the token stream, so what the
+// preprocessor removed (a "#if 0" block) is invisible here - which is the whole point: fbc's
+// dim/all-kinds-of-vars hides the DIM of its EXTERN array inside one and defines its other extern
+// arrays for real, and the two have to be told apart.
+// ⚠️ A whole declaration LINE is searched, not just the slot after the keyword, so the leading-AS
+// spelling ("Dim As Integer a") and a multi-name line are covered without parsing either. That
+// over-matches - a line that merely mentions the name counts - and over-matching is the safe
+// direction: it answers "already declared" and leaves the caller doing nothing.
+var
+  i: Integer;
+  T, P: TLexerToken;
+  W: string;
+  OnDeclLine: Boolean;
+begin
+  Result := False;
+  if not HasValidContext then Exit;
+  if Context.TokenList = nil then Exit;
+  OnDeclLine := False;
+  for i := 0 to Context.TokenList.Count - 1 do
+  begin
+    T := Context.TokenList.GetTokenDirect(i);
+    if T = nil then Continue;
+    if T.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile] then
+    begin
+      OnDeclLine := False;
+      Continue;
+    end;
+    if not OnDeclLine then
+    begin
+      // The first token of the statement decides whether this is a declaration line at all.
+      if i = 0 then P := nil else P := Context.TokenList.GetTokenDirect(i - 1);
+      if (P = nil) or (P.TokenType in [ttEndOfLine, ttSeparStmt]) then
+      begin
+        W := UpperCase(VarToStr(T.Value));
+        OnDeclLine := (W = 'DIM') or (W = 'REDIM') or (W = 'COMMON') or (W = 'STATIC') or (W = 'VAR');
+      end;
+      Continue;
+    end;
+    if UpperCase(VarToStr(T.Value)) = Nm then Exit(True);
+  end;
 end;
 
 function TPackratParser.FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
