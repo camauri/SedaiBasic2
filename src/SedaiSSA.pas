@@ -420,6 +420,7 @@ type
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
+    FPreProcSig: TStringList;            // procedure LABEL (UPPER, overload tail and all) -> "FPPARAMS|FPRET", same walk
     // V5f: the RESULT TEMPORARIES of this statement - one per call to a function returning a UDT BY
     // VALUE. The caller allocates that record (ssaRecordNew below), the callee copies its result into
     // it, and until now NOTHING destroyed it: fbc runs one destructor MORE than we did for every such
@@ -560,6 +561,7 @@ type
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
+    function PreProcPtrSigOf(Node: TASTNode): string;   // "ProcPtr(f[,sig])"/"@f" -> f's "FPPARAMS|FPRET", '' if none
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;
@@ -1352,6 +1354,8 @@ begin
   FVarRecordType.CaseSensitive := False;
   FPreFuncRetType := TStringList.Create;
   FPreFuncRetType.CaseSensitive := False;
+  FPreProcSig := TStringList.Create;
+  FPreProcSig.CaseSensitive := False;
   FResultTemps := TStringList.Create;
   FVarExplicitType := TStringList.Create;
   FVarExplicitType.CaseSensitive := False;
@@ -1518,6 +1522,7 @@ begin
   FVarRecordType.Free;
   FVarExplicitType.Free;
   FPreFuncRetType.Free;
+  FPreProcSig.Free;
   FResultTemps.Free;
   FArrayRecordType.Free;
   FArrayScalarType.Free;
@@ -27188,9 +27193,9 @@ procedure TSSAGenerator.PreCollectFuncRetTypes(Node: TASTNode);
 // call site for why this exists separately from PreCollectProcedures: it runs EARLIER, and it is all the
 // VAR type inference needs from it.
 var
-  i: Integer;
-  NameNode: TASTNode;
-  Nm: string;
+  i, j: Integer;
+  NameNode, PL: TASTNode;
+  Nm, Ps, Rt: string;
 begin
   if Node = nil then Exit;
   if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
@@ -27208,7 +27213,109 @@ begin
         FPreFuncRetType.Values[Nm] := UpperCase(VarToStr(NameNode.GetChild(0).Value));
     end;
   end;
+  // ⭐ ...and the SAME walk answers the other half a VAR needs: the full "FPPARAMS|FPRET" of every
+  // procedure, so "Var p = ProcPtr(f)" can be stamped with the signature the explicit spelling
+  // "Dim p As Sub(...)" carries. The parameter TYPE names are already in the shape FPPARAMS wants
+  // ("INTEGER PTR" is one identifier here), so nothing is rebuilt - it is read off.
+  // ⚠️ A METHOD is skipped: its label carries an implicit THIS that this list would then declare as
+  // a parameter of the pointer, and ProcPtr on a method is a different question (a vtable index).
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) then
+  begin
+    NameNode := Node.GetChild(0);
+    if (NameNode <> nil) and (NameNode.NodeType = antIdentifier) then
+    begin
+      Nm := UpperCase(VarToStr(NameNode.Value));
+      if (Nm <> '') and (Pos('.', Nm) = 0) and (FPreProcSig.IndexOfName(Nm) < 0) then
+      begin
+        Ps := '';
+        for i := 0 to Node.ChildCount - 1 do
+          if Node.GetChild(i).NodeType = antParameterList then
+          begin
+            PL := Node.GetChild(i);
+            for j := 0 to PL.ChildCount - 1 do
+              if (PL.GetChild(j).ChildCount >= 1) and
+                 (PL.GetChild(j).GetChild(0).NodeType = antIdentifier) then
+              begin
+                if Ps <> '' then Ps := Ps + ',';
+                Ps := Ps + UpperCase(VarToStr(PL.GetChild(j).GetChild(0).Value));
+              end;
+            Break;
+          end;
+        Rt := '';
+        if (UpperCase(VarToStr(Node.Value)) = 'FUNCTION') and (NameNode.ChildCount >= 1) and
+           (NameNode.GetChild(0).NodeType = antIdentifier) then
+          Rt := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+        FPreProcSig.Values[Nm] := Ps + '|' + Rt;
+      end;
+    end;
+  end;
   for i := 0 to Node.ChildCount - 1 do PreCollectFuncRetTypes(Node.GetChild(i));
+end;
+
+function TSSAGenerator.PreProcPtrSigOf(Node: TASTNode): string;
+// The "FPPARAMS|FPRET" of the procedure a VAR initialiser NAMES - "Var p = ProcPtr(f)",
+// "Var p = ProcPtr(f, Sub(...))" or "Var p = @f" - and '' when it names none.
+// ⛔ WHY IT IS NOT A TYPE NAME. A procedure pointer is not carried by a POINTEE TYPE the way
+// "Var p = @d" is: it is carried by its SIGNATURE. Answering a type name here was TRIED and shipped
+// nothing (DIVERGENZE 57) - "p()" still lowered as an array access, "Array not declared: P1". The
+// signature is what the declaration has to say, and this is the half that says it.
+var
+  Args: TASTNode;
+  Base, Ps: string;
+  i, k, NP, Hit, NPos: Integer;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  Base := ''; NP := -1;
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) then
+    Base := UpperCase(VarToStr(Node.Value))
+  else if (Node.NodeType in [antArrayAccess, antFunctionCall]) then
+  begin
+    // "ProcPtr(f)" reaches this pre-pass as an ACCESS to a name called PROCPTR - the call it really
+    // is has not been resolved yet - which is exactly the shape that later died as an array access.
+    if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+       (Node.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(Node.GetChild(0).Value)) = 'PROCPTR') then
+      Args := Node.GetChild(1)
+    else if (Node.NodeType = antFunctionCall) and (Node.ChildCount >= 1) and
+            (UpperCase(VarToStr(Node.Value)) = 'PROCPTR') then
+      Args := Node.GetChild(0)
+    else
+      Exit;
+    if (Args = nil) or (Args.ChildCount < 1) then Exit;
+    if Args.GetChild(0).NodeType <> antIdentifier then Exit;
+    Base := UpperCase(VarToStr(Args.GetChild(0).Value));
+    // "ProcPtr(f, Sub(ByVal As Byte))" names ONE overload of f, and the only thing the bare signature
+    // node carries is the parameter COUNT - which is all that is needed to pick between them.
+    if (Args.ChildCount >= 2) and (Args.GetChild(1).NodeType = antProcSig) then
+      NP := StrToIntDef(VarToStr(Args.GetChild(1).Value), -1);
+  end;
+  if Base = '' then Exit;
+  Hit := -1;
+  for i := 0 to FPreProcSig.Count - 1 do
+  begin
+    if not SameText(Copy(FPreProcSig.Names[i], 1, Length(Base)), Base) then Continue;
+    if (Length(FPreProcSig.Names[i]) > Length(Base)) and
+       (FPreProcSig.Names[i][Length(Base) + 1] <> '~') then Continue;
+    if NP >= 0 then
+    begin
+      Ps := FPreProcSig.ValueFromIndex[i];
+      Ps := Copy(Ps, 1, Pos('|', Ps) - 1);          // the FPPARAMS half
+      NPos := 0;
+      if Ps <> '' then
+      begin
+        NPos := 1;
+        for k := 1 to Length(Ps) do
+          if Ps[k] = ',' then Inc(NPos);
+      end;
+      if NPos <> NP then Continue;
+    end;
+    Hit := i;
+    if NP >= 0 then Break;                 // the count picked it: that is the overload asked for
+    if Length(FPreProcSig.Names[i]) = Length(Base) then Break;   // the un-overloaded name: prefer it
+  end;
+  if Hit >= 0 then Result := FPreProcSig.ValueFromIndex[Hit];
 end;
 
 procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
@@ -27323,7 +27430,23 @@ begin
           // so "pu->n" dereferenced a value instead of a pointer, and a FLOAT pointee had no type at all
           // and faulted on "*p". The explicit "Dim As Double Ptr" spelling has always worked: one more
           // rule that one path had and its sibling did not.
-          TypeName := DeclaredPointerTypeOfArg(Decl.GetChild(1));
+          // ⭐ AND THE PROCEDURE-POINTER QUESTION COMES BEFORE BOTH. "Var p = ProcPtr(f)" and
+          // "Var p = @f" declare a procedure pointer, which is not carried by a pointee TYPE NAME at
+          // all but by its SIGNATURE - so every type name answered here left "p()" lowering as an
+          // array access ("Array not declared: P"), while "Dim p As Sub(...) = ProcPtr(f)" worked.
+          // The signature is stamped in the very attributes the explicit spelling writes, so the
+          // emit-time path that records FFuncPtrSigs is the SAME one for both spellings.
+          TypeName := '';
+          NestedTypeName := PreProcPtrSigOf(Decl.GetChild(1));
+          if NestedTypeName <> '' then
+          begin
+            Decl.Attributes.Values['FUNCPTR'] := '1';
+            Decl.Attributes.Values['FPPARAMS'] := Copy(NestedTypeName, 1, Pos('|', NestedTypeName) - 1);
+            Decl.Attributes.Values['FPRET'] := Copy(NestedTypeName, Pos('|', NestedTypeName) + 1, MaxInt);
+            TypeName := 'INTEGER';           // a procedure entry PC, int-banked as the explicit spelling
+          end;
+          if TypeName = '' then
+            TypeName := DeclaredPointerTypeOfArg(Decl.GetChild(1));
           if TypeName = '' then
             TypeName := ObjectTypeName(Decl.GetChild(1));
           // ...and a call to a FUNCTION whose return type is a UDT, which ObjectTypeName cannot answer

@@ -11832,6 +11832,8 @@ var
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
+  SavedTypeOf: Integer;         // scratch: rewind point for "As TypeOf( Sub(...) )"
+  TypeOfProcSig: Boolean;       // ...and whether that spelling is the one being read
   Idx: Integer;                 // scratch: the const-pointee registry entry for a redeclared name
 begin
   Token := Context.CurrentToken;
@@ -11890,10 +11892,35 @@ begin
       SharedTypeTok := Context.CurrentToken;
       Context.Advance;                        // TYPEOF
       Context.Advance;                        // '('
-      LeadingTypeOfExpr := FExpressionParser.ParseExpression;
-      if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
-      SharedTypeName := 'INTEGER';            // placeholder; replaced by the inferred type in SSA
-      SharedFixedLen := '';
+      // ⭐ "TypeOf( Sub(...) )" IS "Sub(...)". The operand of TypeOf goes to the EXPRESSION parser,
+      // which reduces a bare signature to an antProcSig carrying only the parameter COUNT - so this
+      // declaration lost FPPARAMS/FPRET, no signature was recorded, and "p()" lowered as an array
+      // access ("Array not declared: P") while the explicit spelling worked. Routed into the SAME
+      // funnel the explicit one uses, the two spellings agree.
+      if Context.Check(ttProcedureStart) then
+      begin
+        SharedFpNode := TASTNode.Create(antArrayDecl, SharedTypeTok);
+        if TryParseProcPtrType(SharedFpNode) then
+        begin
+          if Context.Check(ttDelimParClose) then Context.Advance;   // ')' of TypeOf
+          SharedTypeName := 'INTEGER';        // a procedure entry PC, as the explicit spelling gives
+          SharedFixedLen := '';
+        end
+        else
+        begin
+          SharedFpNode.Free; SharedFpNode := nil;
+          HandleError('Expected type name after AS', Context.CurrentToken);
+          DoNodeCreated(Result);
+          Exit;
+        end;
+      end
+      else
+      begin
+        LeadingTypeOfExpr := FExpressionParser.ParseExpression;
+        if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+        SharedTypeName := 'INTEGER';          // placeholder; replaced by the inferred type in SSA
+        SharedFixedLen := '';
+      end;
     end
     else
     begin
@@ -12120,17 +12147,33 @@ begin
         // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": int-banked (holds an
         // entry PC); the signature is captured on a scratch node and copied onto the decl below.
         FuncPtrSigNode := nil;
+        // ⭐ ...and the TRAILING spelling of that same thing: "Dim p As TypeOf( Sub(...) )".
+        // TYPEOF and its '(' are consumed here so the funcptr funnel below sees exactly what
+        // "Dim p As Sub(...)" gives it; anything else rewinds and reads as an ordinary TypeOf operand.
+        TypeOfProcSig := False;
+        SavedTypeOf := 0;
+        if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+           Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+        begin
+          Context.SavePosition(SavedTypeOf);
+          Context.Advance;                     // TYPEOF
+          Context.Advance;                     // '('
+          if Context.Check(ttProcedureStart) then TypeOfProcSig := True
+          else Context.RestorePosition(SavedTypeOf);
+        end;
         if Context.Check(ttProcedureStart) then
         begin
           FuncPtrSigNode := TASTNode.Create(antArrayDecl, NameTok);
           if TryParseProcPtrType(FuncPtrSigNode) then
           begin
+            if TypeOfProcSig and Context.Check(ttDelimParClose) then Context.Advance;   // ')' of TypeOf
             DimTypeName := 'INTEGER';
             TypeTok := NameTok;
           end
           else
           begin
             FuncPtrSigNode.Free; FuncPtrSigNode := nil;
+            if TypeOfProcSig then Context.RestorePosition(SavedTypeOf);
           end;
         end;
         if not Assigned(FuncPtrSigNode) then
