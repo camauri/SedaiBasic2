@@ -494,6 +494,7 @@ type
     function ImplementsInterface(const U, T: string): Boolean;             // MODERN: U names T in IMPLEMENTS
     function IifArgs(Node: TASTNode): TASTNode;   // the argument list of an "IIf(c,a,b)" node, nil if it is not one
     function IsStrictSubtypeOf(const U, T: string): Boolean;                // the EXTENDS chain alone
+    function SameUDTName(const A, B: string): Boolean;      // ...one of the two may carry its NAMESPACE
     function SubtypeDistance(const U, T: string): Integer;   // steps up the EXTENDS chain, -1 if U is not a T
     function TypeTailUpcastDistance(const CallTail, DeclTail: string): Integer;  // ...summed over a type tail
     function IsSubtypeOf(const U, T: string): Boolean;
@@ -26708,11 +26709,33 @@ begin
     D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
     if C.Count <> D.Count then Exit;
     for i := 0 to C.Count - 1 do
-      if (C[i] <> '-') and (C[i] <> D[i]) then Exit;
+      if (C[i] <> '-') and (not SameUDTName(C[i], D[i])) then Exit;
     Result := True;
   finally
     C.Free; D.Free;
   end;
+end;
+
+function TSSAGenerator.SameUDTName(const A, B: string): Boolean;
+// Do these two spellings name the same UDT? Equal is equal; beyond that, ONE of them may carry its
+// NAMESPACE and the other not.
+//
+// ⛔ WHY THAT HAPPENS. A declaration's type tail is written by ProcSigFromParams while the file is
+// being PARSED - before the namespace pass mangles anything - so "Function f(ByVal x As T1)" inside
+// "Namespace n" signs ":T1", while the call site asks ObjectTypeName, which answers the mangled
+// "N.T1". Nothing matched, and the call fell to the arity fallback: with "f(As T1)" and "f(As T2)"
+// declared in a namespace, EVERY call was answered by the first (fbc suite overload/byval-as-const).
+// ⚠️ Both qualified or both bare means they really are different names - "a.T" is not "b.T" - so the
+// tolerance applies in exactly one direction and nowhere else.
+var
+  pa, pb: Integer;
+begin
+  Result := SameText(A, B);
+  if Result or (A = '') or (B = '') then Exit;
+  pa := LastDelimiter('.', A);
+  pb := LastDelimiter('.', B);
+  if (pa > 0) = (pb > 0) then Exit(False);
+  Result := SameText(Copy(A, pa + 1, MaxInt), Copy(B, pb + 1, MaxInt));
 end;
 
 function TSSAGenerator.SubtypeDistance(const U, T: string): Integer;
@@ -26728,7 +26751,7 @@ begin
   guard := 0;
   while (cur <> '') and (guard < 64) do
   begin
-    if cur = tu then Exit(guard);
+    if SameUDTName(cur, tu) then Exit(guard);
     idx := FindUDT(cur);
     if idx < 0 then Break;
     cur := FUDTs[idx].Parent;
@@ -26755,7 +26778,7 @@ begin
     for i := 0 to C.Count - 1 do
     begin
       if (C[i] = '-') or (D[i] = '-') then Continue;
-      if C[i] = D[i] then Continue;
+      if SameUDTName(C[i], D[i]) then Continue;
       d1 := SubtypeDistance(C[i], D[i]);
       if d1 < 0 then Exit(-1);
       Inc(Result, d1);
