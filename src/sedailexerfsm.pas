@@ -113,6 +113,7 @@ type
     // onto the token it builds and clears it. The suffix is scanned before the token object exists, so the
     // mark cannot be written straight to the token.
     FPendingSingleSuffix: Boolean;
+    FPendingWideLiteral: Boolean;   // the escaped literal just expanded named a codepoint above 127
     FPendingUnsignedSuffix: Boolean;   // the 'U' of an integer literal's type suffix ("12u", "5UL")
 
     // Set while lexing an integer whose type suffix is '&' (Long, "3000000000&"). Long is a signed 32-bit
@@ -1315,6 +1316,7 @@ begin
   Result.KeywordInfo := KeywordInfo;
   Result.BasePrefixed := False;   // pooled object: clear it, or the previous token's "&H.." mark carries over
   Result.SingleSuffixed := False; // ditto for the "1.5f" mark (ProcessNumber sets it from FPendingSingleSuffix)
+  Result.WideLiteral := False;    // ...and for the wide-literal mark (the escaped-string scanner sets it)
   Result.UnsignedSuffixed := False;  // ...and for the "12u" mark
 
   Result.Line := ATokenLine;
@@ -1667,6 +1669,12 @@ var
       Result := False
     else
     begin
+      // ⭐ A "\uNNNN" ABOVE 127 IS WHAT MAKES THE LITERAL WIDE, and after expansion nothing says so:
+      // the value is UTF-8 bytes, indistinguishable from a byte string that happens to hold them. So
+      // the fact is remembered here and rides on the token. Without it "Left(!"\u3041\u3043", 2)"
+      // counted BYTES: one garbage codepoint instead of two, and fbc's own wstring/midstmt ucs2 test
+      // was built on exactly that shape.
+      if Val > 127 then FPendingWideLiteral := True;
       AppendCP(Val);
       Result := True;
     end;
@@ -1674,6 +1682,7 @@ var
 
 begin
   Result := '';
+  FPendingWideLiteral := False;
   i := 1;
   n := Length(Raw);
   while i <= n do
@@ -1814,8 +1823,10 @@ begin
     Ch := GetCurrentChar;
   end;
   if Ch = '"' then AdvanceChar;     // consume closing quote
+  FPendingWideLiteral := False;
   if DoEscape then Raw := ProcessEscapes(Raw);
   Result := CreateToken(ttStringLiteral);
+  Result.WideLiteral := FPendingWideLiteral;
   Result.SetExtractedValue(Raw);
 end;
 

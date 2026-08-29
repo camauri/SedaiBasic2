@@ -975,7 +975,7 @@ type
     procedure ProcessSwap(Node: TASTNode);
     procedure ProcessDefType(Node: TASTNode);
     procedure CollectDefTypes(Node: TASTNode);
-    function EmitMidEffectiveLen(const LenVal, SrcReg: TSSAValue): TSSAValue;
+    function EmitMidEffectiveLen(const LenVal, SrcReg: TSSAValue; WideTarget: Boolean): TSSAValue;
     procedure ProcessMidStatement(Node: TASTNode);
     function UDTFieldBankOf(MemberNode: TASTNode): TSSARegisterType;   // bank of the field a member access names
     function ParamPointeeType(const Name: string): string;   // pointee of a "<T> Ptr" PARAMETER of the current proc
@@ -13081,24 +13081,35 @@ begin
   EmitInstruction(ssaStrWStringN, Result, CountReg, CodeReg, MakeSSAValue(svkNone));
 end;
 
-function TSSAGenerator.EmitMidEffectiveLen(const LenVal, SrcReg: TSSAValue): TSSAValue;
+function TSSAGenerator.EmitMidEffectiveLen(const LenVal, SrcReg: TSSAValue; WideTarget: Boolean): TSSAValue;
 // ⛔ A NEGATIVE LENGTH IN THE MID STATEMENT MEANS "NO LIMIT", not "nothing". fbc writes as much of the
 // source as fits - "Mid(s, 2, -1) = "xy"" over "ABCD" answers "AxyD" - and capping the source with
 // LEFT$(src, -1) produced the empty string, so the statement did nothing at all. fbc's own suite sweeps
 // the length from -2 upward, which is why one rule costs thousands of assertions.
+// ⛔⛔ ...AND THE BOUNDARY IS NOT THE SAME FOR A WIDE TARGET. Over a WSTRING fbc treats a length of
+// ZERO as "no limit" too - "Mid(w, 1, 0) = "12"" over "ABCD" answers "12CD" - while over a String,
+// fixed or not, the identical statement writes NOTHING. fbc's own test writes the rule as
+// "length < 1", and that is what its expectation loop computes. Probed both kinds, both spellings of
+// the source, cleared and not: it is the TARGET's kind that decides.
 // Branch-free: a comparison yields -1 (all ones) or 0, so
-//     eff = len + (len < 0) AND (LEN(src) - len)
-// is LEN(src) when the length is negative and len otherwise.
+//     eff = len + (len < bound) AND (LEN(src) - len)
+// is LEN(src) below the bound and len otherwise.
 var
   LenReg, ZeroReg, NegReg, SrcLenReg, DiffReg, MaskReg: TSSAValue;
 begin
   LenReg := EnsureIntRegister(LenVal);
   ZeroReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaLoadConstInt, ZeroReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitInstruction(ssaLoadConstInt, ZeroReg, MakeSSAConstInt(Ord(WideTarget)),
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   NegReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaCmpLtInt, NegReg, LenReg, ZeroReg, MakeSSAValue(svkNone));
   SrcLenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaStrLen, SrcLenReg, EnsureStringRegister(SrcReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ...and counted the way the CAP will cut: over a wide target the whole statement works in
+  // codepoints, so a byte count here made "no limit" mean "as many BYTES as the source has".
+  if WideTarget then
+    EmitInstruction(ssaStrLenW, SrcLenReg, EnsureStringRegister(SrcReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaStrLen, SrcLenReg, EnsureStringRegister(SrcReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   DiffReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaSubInt, DiffReg, SrcLenReg, LenReg, MakeSSAValue(svkNone));
   MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -13191,7 +13202,16 @@ begin
       begin
         ProcessExpression(LenNode, LenVal);
         SrcCapReg := NS;
-        EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg, EmitMidEffectiveLen(LenVal, SrcReg), NoneV);
+        // ⛔ AND THE CAP ITSELF COUNTS IN THE TARGET'S UNITS. "Mid(w, s, n) = src" over a WSTRING takes
+        // n CODEPOINTS of the source; cut with the byte LEFT it took n bytes, which for anything above
+        // U+007F is a fragment of a character. fbc's own wstring/midstmt ucs2 test sweeps the length,
+        // so every value of it was wrong while the same sweep in ASCII was already right.
+        if IsWStringExpr(TargetNode) then
+          EmitInstruction(ssaStrLeftW, SrcCapReg, SrcReg,
+                          EmitMidEffectiveLen(LenVal, SrcReg, True), NoneV)
+        else
+          EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg,
+                          EmitMidEffectiveLen(LenVal, SrcReg, False), NoneV);
       end
       else
         SrcCapReg := SrcReg;
@@ -13217,6 +13237,23 @@ begin
   begin
     ProcessStringExpression(TargetNode, TextVal); TextReg := EnsureStringRegister(TextVal);
   end;
+  // ⭐ A "WSTRING * n" IS n CELLS, AND THE MID STATEMENT WRITES INTO ALL OF THEM. fbc's own
+  // wstring/midstmt is built on it: "Dim w As WString * 12 : w = "abc" : Mid(w,3) = "XY"" leaves LEN 4
+  // there, because cell 4 held a NUL and now holds 'Y'. Read at the CONTENT length there are only
+  // three cells to write into, so the 'Y' fell off and LEN stayed 3.
+  // The buffer is therefore materialised here - the value NUL-padded to its declared cell count -
+  // before the overwrite, and the padded result is what goes back. LEN cuts at the first NUL, so a
+  // value that did not grow reads exactly as it did before.
+  // ⚠️ WIDE ONLY, and that line is fbc's, not ours: a "ZString * n" is a C string that ENDS at its
+  // terminator and fbc leaves LEN 3 for the identical program (m617 closed that half), while a
+  // "String * n" already reads at its capacity. Verified one spelling at a time, all three kinds.
+  // ⛔ ...and the capacity of a "WString * n" is in FZStringVars, NOT in FFixedLenVars: the two
+  // fixed-length registries are split by KIND, "String * n" in one and the two C-shaped buffers
+  // (ZSTRING, WSTRING) in the other, holding n-1 - the cells a value may use with the terminator
+  // excluded. Asked of the wrong one this read 0 and padded nothing, silently.
+  if (TargetNode.NodeType = antIdentifier) and IsWStringVar(VarToStr(TargetNode.Value)) and
+     (StrCapOf(FZStringVars, VarToStr(TargetNode.Value), 0) > 0) then
+    TextReg := EmitFixedLenPad(TextReg, StrCapOf(FZStringVars, VarToStr(TargetNode.Value), 0), True);
   ProcessExpression(StartNode, StartVal); StartReg := EnsureIntRegister(StartVal);
   ProcessStringExpression(SourceNode, SrcVal);  SrcReg := EnsureStringRegister(SrcVal);
 
@@ -13225,7 +13262,12 @@ begin
   begin
     ProcessExpression(LenNode, LenVal);
     SrcCapReg := NS;
-    EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg, EmitMidEffectiveLen(LenVal, SrcReg), NoneV);
+    if IsWStringExpr(TargetNode) then
+      EmitInstruction(ssaStrLeftW, SrcCapReg, SrcReg,
+                      EmitMidEffectiveLen(LenVal, SrcReg, True), NoneV)
+    else
+      EmitInstruction(ssaStrLeft, SrcCapReg, SrcReg,
+                      EmitMidEffectiveLen(LenVal, SrcReg, False), NoneV);
   end
   else
     SrcCapReg := SrcReg;
@@ -13278,7 +13320,36 @@ begin
     // there writes something WRONG instead of nothing (DIVERGENZE 37; measured 28 Aug, 12 390 failing
     // assertions became 17 386). So the overwrite is done HERE, where it is right, into a named temp,
     // and assigned back through the machinery that has known how to reach a raw slot all along.
-    if IsAddrLocal(VarToStr(TargetNode.Value)) or IsRawModuleScalar(VarToStr(TargetNode.Value)) then
+    // ⛔ bcStrMidAssign WRITES AT A BYTE OFFSET, and over a wide target the start is a CELL index. On
+    // ASCII the two coincide, which is why the whole ASCII sweep was right while every non-ASCII case
+    // landed inside a UTF-8 sequence and produced a '?' - fbc's own wstring/midstmt has an ucs2 test
+    // beside its ascii one, on exactly the same parameter sweep.
+    // The byte start is the BYTE length of the first (start-1) CELLS of the target.
+    // ⚠️ A start below 1 must keep the value it had: the VM arm writes nothing for it, and a converted
+    // one would come out as 1 and write. Branch-free, as EmitMidEffectiveLen is: a comparison yields
+    // -1 or 0, so "byteStart + (start < 1) AND (start - byteStart)" is start below 1 and byteStart at
+    // or above it.
+    if IsWStringExpr(TargetNode) then
+    begin
+      OneReg := NI; EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), NoneV, NoneV);
+      StartM1Reg := NI; EmitInstruction(ssaSubInt, StartM1Reg, StartReg, OneReg, NoneV);
+      PrefixReg := NS; EmitInstruction(ssaStrLeftW, PrefixReg, TextReg, StartM1Reg, NoneV);
+      LenTextReg := NI; EmitInstruction(ssaStrLen, LenTextReg, PrefixReg, NoneV, NoneV);
+      SuffixStartReg := NI; EmitInstruction(ssaAddInt, SuffixStartReg, LenTextReg, OneReg, NoneV);
+      LenMidReg := NI; EmitInstruction(ssaCmpLtInt, LenMidReg, StartReg, OneReg, NoneV);
+      AvailTmpReg := NI; EmitInstruction(ssaSubInt, AvailTmpReg, StartReg, SuffixStartReg, NoneV);
+      AvailReg := NI; EmitInstruction(ssaBitwiseAnd, AvailReg, LenMidReg, AvailTmpReg, NoneV);
+      R1Reg := NI; EmitInstruction(ssaAddInt, R1Reg, SuffixStartReg, AvailReg, NoneV);
+      StartReg := R1Reg;
+    end;
+
+    // ...and a capacity-padded WSTRING joins them, for a different reason: the padding this statement
+    // materialises must be CUT BACK at the first NUL, and the store is where that cut lives. Written
+    // in place into the register, "Mid(w,4) = "Z"" on a "WString * 12" answered LEN 11 - the whole
+    // buffer - instead of 4.
+    if IsAddrLocal(VarToStr(TargetNode.Value)) or IsRawModuleScalar(VarToStr(TargetNode.Value)) or
+       (IsWStringVar(VarToStr(TargetNode.Value)) and
+        (StrCapOf(FZStringVars, VarToStr(TargetNode.Value), 0) > 0)) then
     begin
       TmpName := '__MID' + IntToStr(FSwapTempSeq) + '$';
       Inc(FSwapTempSeq);
@@ -34069,6 +34140,12 @@ begin
   case Node.NodeType of
     antIdentifier:
       Result := IsWStringVar(VarToStr(Node.Value));
+    antLiteral:
+      // ⛔ AN ESCAPED LITERAL THAT NAMED A CODEPOINT IS WIDE, and this case had no arm at all - so
+      // "Left(!"\u3041\u3043\u3045", 2)" counted BYTES and answered one garbage codepoint where fbc
+      // answers two. The expanded value is UTF-8 and says nothing about how it was written; the lexer's
+      // WideLiteral mark on the token is what still does.
+      Result := Assigned(Node.Token) and Node.Token.WideLiteral;
     antParentheses:
       Result := (Node.ChildCount >= 1) and IsWStringExpr(Node.GetChild(0));
     antMemberAccess:

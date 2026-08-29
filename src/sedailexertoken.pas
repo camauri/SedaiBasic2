@@ -52,6 +52,10 @@ type
     FSourceFile: string;        // Source file name (optional)
     FBasePrefixed: Boolean;     // "&H../&O../&B.." literal (its value is rewritten to decimal -- see the property)
     FSingleSuffixed: Boolean;   // "1.5f" / "1.5!" literal: a SINGLE (the suffix is dropped -- see the property)
+    FWideLiteral: Boolean;      // !"..\u3041.." : an escaped literal that named a CODEPOINT above 127. The
+                                // expanded value is UTF-8 bytes and nothing in it says how it was written,
+                                // so this mark is the only thing that still tells a reader the literal is
+                                // WIDE -- which is what makes Left/Mid/Len count codepoints over it.
     FUnsignedSuffixed: Boolean; // "12u" / "5ul" literal: UNSIGNED (the suffix is dropped -- see the property)
 
     // Lazy evaluation flags for performance
@@ -158,6 +162,7 @@ type
     // "1.5", and FreeBASIC types them differently: the first is a Single (prints 7 significant digits and
     // keeps an expression single), the second a Double. This is the only surviving trace of the suffix.
     property SingleSuffixed: Boolean read FSingleSuffixed write FSingleSuffixed;
+    property WideLiteral: Boolean read FWideLiteral write FWideLiteral;
     // "12u"/"5UL": the U marks the literal UNSIGNED, and an unsigned prints with no leading sign space.
     // The suffix is consumed and dropped, so nothing downstream could tell "12u" from "12" without this.
     property UnsignedSuffixed: Boolean read FUnsignedSuffixed write FUnsignedSuffixed;
