@@ -3573,11 +3573,17 @@ begin
       // Handle unary operators (negation and NOT)
       if Node.ChildCount > 0 then
       begin
-        // Operator overloading: unary "-x" / "Not x" on a UDT with a matching one-parameter
+        // Operator overloading: unary "-x" / "+x" / "Not x" on a UDT with a matching one-parameter
         // "Operator -(a AS T)" / "Operator Not(a AS T)". Resolved by the operand's static type; the
         // arity-suffixed label ("@1") keeps it distinct from the binary operator of the same symbol.
+        // ⛔ UNARY "+" WAS NOT IN THE LIST. It is the identity on a NUMBER, which is presumably why -
+        // but FreeBASIC lets a type overload it like any other, and fbc's own structs/ops declares one
+        // for every unary operator it has and asserts each in turn: "+(a)" answered the operand where
+        // "-(a)" and "Not (a)" beside it, on the same type, ran the user's operator. The dispatch only
+        // fires when the operand's type actually declares the label, so plain "+x" is untouched.
         if Assigned(Node.Token) and
-           ((Node.Token.TokenType = ttOpSub) or (Node.Token.TokenType = ttBitwiseNOT)) then
+           ((Node.Token.TokenType = ttOpSub) or (Node.Token.TokenType = ttOpAdd) or
+            (Node.Token.TokenType = ttBitwiseNOT)) then
         begin
           OpLhsType := ObjectTypeName(Node.GetChild(0));
           if OpLhsType = '' then OpLhsType := EnumTypeOfOperand(Node.GetChild(0));   // unary op overloaded on an enum ("Not i")
