@@ -34229,6 +34229,20 @@ begin
     // belongs to the declaration this scope can see.
     T := UpperCase(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(Node.GetChild(0).Value))]);
     if T = '' then T := UpperCase(FArrayPtrPointee.Values[ArrayFactKey(VarToStr(Node.GetChild(0).Value))]);
+    // ⛔⛔ ...AND WHEN NEITHER REGISTRY ANSWERS, THE NAME IS NOT AN ARRAY AT ALL - it is a MULTI-LEVEL
+    // POINTER, and "p[i]" is of p's pointee type, so dereferencing it strips one more PTR level. That
+    // rule was written, in its own arm at the bottom of this case - with the IDENTICAL guard, so this
+    // arm always won and the one below could never run. Dead since the day it was added: "(*pp[0]).i"
+    // on a "T Ptr Ptr" printed the packed address where fbc prints the field, while "pp[0]->i" beside
+    // it was right. Two arms for one shape is how it happened; there is one now.
+    if T = '' then
+    begin
+      T := UpperCase(ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)));
+      if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+        T := Trim(Copy(T, 1, Length(T) - 4))
+      else
+        T := '';
+    end;
     Result := T;
   end
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
@@ -34246,16 +34260,6 @@ begin
     else if (Node.GetChild(1).NodeType = antIdentifier) and
             (ManagedPtrPointee(VarToStr(Node.GetChild(1).Value)) <> '') then
       Result := DerefedType(Node.GetChild(1));
-  end
-  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
-          (Node.GetChild(0).NodeType = antIdentifier) then
-  begin
-    // "*p[i]" on a MULTI-LEVEL pointer: p[i] is itself of p's pointee type, so dereferencing it strips
-    // one more PTR level. Only the composed spelling was missing -- "q = p[i] : *q" already worked, in
-    // two statements, which is what made the gap look like a deref bug rather than a typing one.
-    T := UpperCase(ManagedPtrPointee(VarToStr(Node.GetChild(0).Value)));
-    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
-      Result := Trim(Copy(T, 1, Length(T) - 4));
   end;
 end;
 
@@ -36885,11 +36889,25 @@ begin
     // the deref of a "T Ptr Ptr" is a "T PTR" that the member access then dereferences, the deref of a
     // "T Ptr" is a "T" the access reaches directly.
     DerefT := UpperCase(DerefedType(ObjNode.GetChild(0)));
+    // ⛔ WHICH NODE CARRIES THE HANDLE DEPENDS ON HOW MANY LEVELS ARE LEFT. In the managed model a
+    // "T Ptr" VALUE *is* the record handle, so a "*" applied to one is the identity - and evaluating
+    // the DEREF then reads through a handle as if it were a raw address ("Raw pointer dereference out
+    // of bounds"). The stripping below is the test: when DerefedType still ends in ' PTR' the operand
+    // is a "T Ptr Ptr" and the deref itself yields the handle (the "(*tpp)->n" case this arm was
+    // written for); when it does not, the OPERAND already holds it - which is what "(*pp[0]).i" is.
     if (Length(DerefT) > 4) and (Copy(DerefT, Length(DerefT) - 3, 4) = ' PTR') then
+    begin
       DerefT := Trim(Copy(DerefT, 1, Length(DerefT) - 4));
-    if FindUDT(DerefT) < 0 then Exit;
-    TypeName := DerefT;
-    ProcessExpression(ObjNode, HandleVal);
+      if FindUDT(DerefT) < 0 then Exit;
+      TypeName := DerefT;
+      ProcessExpression(ObjNode, HandleVal);
+    end
+    else
+    begin
+      if FindUDT(DerefT) < 0 then Exit;
+      TypeName := DerefT;
+      ProcessExpression(ObjNode.GetChild(0), HandleVal);
+    end;
     HandleVal := EnsureIntRegister(HandleVal);
     Result := True;
   end
