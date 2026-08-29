@@ -1013,6 +1013,31 @@ begin
     begin
       InStr := True; Result := Result + Line[i]; Inc(i); Continue;
     end;
+    // ⛔ A NUMERIC LITERAL IS ONE TOKEN HERE TOO, and this is the OBJECT-like half of the very same
+    // hole ExpandFnBody had: "the leading digit means a number" was noted, and then the scan resumed
+    // at the next LETTER - which for "1.5e-7" is the 'e'. So "#define e 5" turned it into "1.55-7"
+    // and the program printed -5.45. fbc prints 1.5e-07. One rule, two paths, and only one of them
+    // had it. See the long note in ExpandFnBody for the shape and for what is deliberately NOT
+    // swallowed (a bare "1e", the type suffix, &H/&O/&B).
+    if (Line[i] in ['0'..'9']) or
+       ((Line[i] = '.') and (i < Length(Line)) and (Line[i + 1] in ['0'..'9'])) then
+    begin
+      j := i;
+      while (j <= Length(Line)) and (Line[j] in ['0'..'9', '.']) do Inc(j);
+      if (j <= Length(Line)) and (Line[j] in ['e', 'E', 'd', 'D']) then
+      begin
+        k := j + 1;
+        if (k <= Length(Line)) and (Line[k] in ['+', '-']) then Inc(k);
+        if (k <= Length(Line)) and (Line[k] in ['0'..'9']) then
+        begin
+          while (k <= Length(Line)) and (Line[k] in ['0'..'9']) do Inc(k);
+          j := k;
+        end;
+      end;
+      Result := Result + Copy(Line, i, j - i);
+      i := j;
+      Continue;
+    end;
     // Identifier start (letter or underscore; a leading digit means a number, not a macro).
     if (Line[i] in ['A'..'Z', 'a'..'z', '_']) then
     begin
