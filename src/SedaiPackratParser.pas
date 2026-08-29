@@ -9897,6 +9897,21 @@ begin
   begin
     Context.Advance;                                // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
+    // ⭐ "Dim arr(0 To 1) As Function(...) As T": an array whose ELEMENTS are procedure pointers. Every
+    // other declaration shape has routed a FUNCTION/SUB type through TryParseProcPtrType for a long
+    // time; the ARRAY one never did, so AtDottedTypeName met the FUNCTION keyword, refused it, and the
+    // whole declaration died with "ARR has no type" - a program fbc compiles. The element is an int
+    // holding an entry PC, so the type child says INTEGER and the signature rides on the node.
+    if Context.Check(ttProcedureStart) then
+    begin
+      if TryParseProcPtrType(Result) then
+      begin
+        Result.AddChild(TASTNode.CreateWithValue(antIdentifier, 'INTEGER', Context.CurrentToken));
+        ParseOptionalArrayInit(Result, Dimensions, Token);
+        DoNodeCreated(Result);
+        Exit;
+      end;
+    end;
     if AtDottedTypeName then
     begin
       TypeTok := Context.CurrentToken;
@@ -12089,6 +12104,16 @@ begin
       if (ArrayDecl.ChildCount < 3) or (ArrayDecl.GetChild(2).NodeType <> antIdentifier) then
         ArrayDecl.InsertChild(2, TASTNode.CreateWithValue(antIdentifier, SharedTypeName, SharedTypeTok));
       if SharedFixedLen <> '' then ArrayDecl.Attributes.Values['FIXEDLEN'] := SharedFixedLen;  // AS STRING * n arr()
+      // ⭐ ...and the leading-AS spelling of a FUNCPTR ARRAY carries the shared signature too:
+      // "Dim As Function(...) As T arr(0 To 1)". The trailing spelling reads it in ParseArrayDeclaration;
+      // here the type was consumed before the name, so it rides on the shared node.
+      if Assigned(SharedFpNode) then
+      begin
+        ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
+        ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
+        ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
+      end;
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
       Result.AddChild(ArrayDecl);
       if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;

@@ -264,6 +264,7 @@ type
                                             //   Per-proc (not global FPointerVars) so same-named ptr params of different
                                             //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
+    FArrayFuncPtrSigs: TStringList;         // ...and ARRAYS of them: ARRNAME -> the ELEMENT's "paramtypes|rettype"
     FModuleFuncPtrSigs: TStringList;        // ...of those, the MODULE-level ones: they survive every procedure prologue
     FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
@@ -1396,6 +1397,8 @@ begin
   FCurrentProcPtrLocals := TStringList.Create;
   FCurrentProcPtrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
+  FArrayFuncPtrSigs := TStringList.Create;
+  FArrayFuncPtrSigs.CaseSensitive := False;
   FModuleFuncPtrSigs := TStringList.Create;
   FFuncPtrTypes := TStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
@@ -1551,6 +1554,7 @@ begin
   FCurrentProcPtrLocals.Free;
   FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
+  FArrayFuncPtrSigs.Free;
   FModuleFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
@@ -6809,6 +6813,24 @@ begin
           end;
         end;
 
+        // ⭐ "arr(i)( args )": a call through an element of an ARRAY OF PROCEDURE POINTERS. The base of
+        // this access is itself an access, so nothing here ever read it as a call - the double subscript
+        // folded into an array read and the result was a number nobody could use. The element's
+        // signature is recorded per ARRAY (FArrayFuncPtrSigs) because it belongs to the elements, not
+        // to the array; the element value IS the entry PC, so the ordinary indirect call takes it from
+        // there. fbc suite pointers/array_ptr_fn, pointers/funptr_array1.
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+           (FArrayFuncPtrSigs.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) then
+        begin
+          ProcessExpression(Node.GetChild(0), TempVal);
+          Result := EmitIndirectCall(EnsureIntRegister(TempVal),
+                      FArrayFuncPtrSigs.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))],
+                      Node.GetChild(1));
+          Exit;
+        end;
+
         // First child is array name
         if Node.GetChild(0).NodeType <> antIdentifier then
         begin
@@ -10419,6 +10441,12 @@ begin
   if TargetNode.GetChild(0).NodeType <> antIdentifier then Exit;
   ArrName := VarToStr(TargetNode.GetChild(0).Value);
 
+  // ⭐ "arr(i) = @fun" where arr is an ARRAY OF PROCEDURE POINTERS: the fourth destination that knows
+  // which overload it wants (after a DIM, a funcptr FIELD and a funcptr PARAMETER). Without it the
+  // arity rule took the first of a same-arity pair, in silence.
+  if FArrayFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0 then
+    StampFuncPtrTarget(ExprNode, FArrayFuncPtrSigs.Values[UpperCase(ArrName)]);
+
   // ...and inside a method body the same write with no object: "s[i] = c" means "this.s[i] = c".
   if (ArrayIndexOf(ArrName) < 0) and (TargetNode.GetChild(1).NodeType = antExpressionList) and
      (TargetNode.GetChild(1).ChildCount = 1) and
@@ -10626,7 +10654,7 @@ end;
 
 procedure TSSAGenerator.ProcessDimBody(Node: TASTNode);
 var
-  ArrName, DeclArrName, RefTgtType, BlkScalarKey: string;
+  ArrName, DeclArrName, RefTgtType, BlkScalarKey, FPSig: string;
   RefTgt: TASTNode;
   ElementType: TSSARegisterType;
   DimsNode, DimExpr, DimChild, ArrayDeclNode: TASTNode;
@@ -10720,14 +10748,23 @@ begin
     // an indirect call. Falls through to the typed-scalar path below (element type INTEGER).
     if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
     begin
-      FFuncPtrSigs.Values[UpperCase(ArrName)] :=
-        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
-        Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
+      // ⭐ AN ARRAY OF THEM FILES THE SIGNATURE OF ITS ELEMENT, not of itself. "Dim arr(0 To 1) As
+      // Function(...) As T" is N procedure pointers; putting the ARRAY's name in the scalar map made
+      // "arr(i)" read as an indirect call on the array itself. Its own registry, asked only by the
+      // double-subscript form "arr(i)( args )".
+      FPSig := ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' +
+               ArrayDeclNode.Attributes.Values['FPRET'] +
+               Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
+      if (DimsNode <> nil) and (DimsNode.NodeType = antDimensions) then
+        FArrayFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig
+      else
+      begin
+        FFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig;
+        if not FInProcedure then FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig;
+      end;
       // ...and "Dim p As Function(ByRef As B) As T = @fun" tells @fun WHICH overload it wants.
       if ArrayDeclNode.ChildCount >= 3 then
         StampFuncPtrTarget(ArrayDeclNode.GetChild(2), ArrayDeclNode.Attributes.Values['FPPARAMS']);
-      if not FInProcedure then
-        FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FFuncPtrSigs.Values[UpperCase(ArrName)];
     end
     // "DIM f AS X" where X is a named function-pointer type ("Type X As Function(...)"): f is a funcptr
     // with X's signature (X aliases to INTEGER, so the typed-scalar path below gives it the int bank).
