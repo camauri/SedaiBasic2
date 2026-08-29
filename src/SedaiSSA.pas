@@ -4778,6 +4778,36 @@ begin
               Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
               Exit;
             end;
+            // ⭐ LEN OF AN ARRAY IS ITS ELEMENT'S SIZE. fbc answers 24 for "Len(foo)" on a
+            // "Dim Shared As String foo()" - the same number "Len(String)" gives - and 8 for an array
+            // of Integer. We fell through to the STRING path, coerced the array name to a string and
+            // answered 1, for every array of every type. The element type is asked of the registries
+            // that hold it (a UDT element first, then a scalar one) and only then the BANK, which is
+            // all a declared array is guaranteed to carry. fbc suite string/array_len.
+            // ⛔ ...AND A SHARED SCALAR IS NOT AN ARRAY, though it answers ArrayIndexOf: it is BACKED by
+            // a 1-element global array, and the note on the string-subscript branch says so in the same
+            // words. Without this exclusion "Len(s)" on a "Dim Shared As String s" answered the
+            // DESCRIPTOR size instead of the string's length - eight corpus programs and one sweep
+            // example went red at once, which is what the nets are for.
+            if (ArrayIndexOf(TempStr) >= 0) and (not IsSharedScalar(TempStr)) then
+            begin
+              ArrName2 := UpperCase(FArrayRecordType.Values[ArrayFactKey(TempStr)]);
+              if ArrName2 = '' then ArrName2 := UpperCase(FArrayScalarType.Values[TempStr]);
+              if ArrName2 <> '' then TempInt := TypeSizeBytes(ArrName2)
+              else
+                case FProgram.GetArray(ArrayIndexOf(TempStr)).ElementType of
+                  srtString: TempInt := TypeSizeBytes('STRING');
+                  srtFloat:  TempInt := TypeSizeBytes('DOUBLE');
+                else         TempInt := TypeSizeBytes('INTEGER');
+                end;
+              if TempInt > 0 then
+              begin
+                Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(TempInt),
+                                MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                Exit;
+              end;
+            end;
             // LEN of a declared NUMERIC/pointer variable is the SIZE of its declared type
             // (fbc: Byte->1, Short->2, Integer->8, Single->4, Ptr->8...), NOT a string length.
             // The old fallthrough coerced the number to a string and answered 1.
@@ -27794,6 +27824,23 @@ begin
           // so "pu->n" dereferenced a value instead of a pointer, and a FLOAT pointee had no type at all
           // and faulted on "*p". The explicit "Dim As Double Ptr" spelling has always worked: one more
           // rule that one path had and its sibling did not.
+          // ⭐ "Var f = T" WITH T A TYPE NAME IS "Dim f As T", DEFAULT-CONSTRUCTED. fbc's own dim/auto_var2
+          // writes it beside "Var f = T( args )", which always worked - the parenthesised form is a
+          // constructor CALL and this one is a bare name. Read as an ordinary initialiser it named a
+          // VARIABLE called T, which exists nowhere, so the record was built and then overwritten with
+          // nothing: every field answered 0 while the identical declaration with "()" answered right.
+          // The initialiser is DROPPED here, which is what makes the rest of the pipeline see the plain
+          // typed DIM it already handles.
+          if (Decl.GetChild(1).NodeType = antIdentifier) and (Decl.GetChild(1).ChildCount = 0) and
+             (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) >= 0) then
+          begin
+            TypeName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+            Decl.RemoveChildAt(1);              // the child list owns and frees it
+            Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
+            Decl.Attributes.Values['INFER'] := '0';
+            RegisterTypedVar(VarName, TypeName);
+            Continue;
+          end;
           // ⭐ AND THE PROCEDURE-POINTER QUESTION COMES BEFORE BOTH. "Var p = ProcPtr(f)" and
           // "Var p = @f" declare a procedure pointer, which is not carried by a pointee TYPE NAME at
           // all but by its SIGNATURE - so every type name answered here left "p()" lowering as an
