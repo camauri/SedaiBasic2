@@ -264,7 +264,6 @@ type
                                             //   Per-proc (not global FPointerVars) so same-named ptr params of different
                                             //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
-    FArrayFuncPtrSigs: TStringList;         // ...and ARRAYS of them: ARRNAME -> the ELEMENT's "paramtypes|rettype"
     FModuleFuncPtrSigs: TStringList;        // ...of those, the MODULE-level ones: they survive every procedure prologue
     FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
@@ -1397,8 +1396,6 @@ begin
   FCurrentProcPtrLocals := TStringList.Create;
   FCurrentProcPtrParams := TStringList.Create;
   FFuncPtrSigs := TStringList.Create;
-  FArrayFuncPtrSigs := TStringList.Create;
-  FArrayFuncPtrSigs.CaseSensitive := False;
   FModuleFuncPtrSigs := TStringList.Create;
   FFuncPtrTypes := TStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
@@ -1554,7 +1551,6 @@ begin
   FCurrentProcPtrLocals.Free;
   FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
-  FArrayFuncPtrSigs.Free;
   FModuleFuncPtrSigs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
@@ -6813,24 +6809,6 @@ begin
           end;
         end;
 
-        // ⭐ "arr(i)( args )": a call through an element of an ARRAY OF PROCEDURE POINTERS. The base of
-        // this access is itself an access, so nothing here ever read it as a call - the double subscript
-        // folded into an array read and the result was a number nobody could use. The element's
-        // signature is recorded per ARRAY (FArrayFuncPtrSigs) because it belongs to the elements, not
-        // to the array; the element value IS the entry PC, so the ordinary indirect call takes it from
-        // there. fbc suite pointers/array_ptr_fn, pointers/funptr_array1.
-        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) and
-           (Node.GetChild(0).ChildCount >= 1) and
-           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-           (FArrayFuncPtrSigs.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) then
-        begin
-          ProcessExpression(Node.GetChild(0), TempVal);
-          Result := EmitIndirectCall(EnsureIntRegister(TempVal),
-                      FArrayFuncPtrSigs.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))],
-                      Node.GetChild(1));
-          Exit;
-        end;
-
         // First child is array name
         if Node.GetChild(0).NodeType <> antIdentifier then
         begin
@@ -10444,8 +10422,8 @@ begin
   // ⭐ "arr(i) = @fun" where arr is an ARRAY OF PROCEDURE POINTERS: the fourth destination that knows
   // which overload it wants (after a DIM, a funcptr FIELD and a funcptr PARAMETER). Without it the
   // arity rule took the first of a same-arity pair, in silence.
-  if FArrayFuncPtrSigs.IndexOfName(UpperCase(ArrName)) >= 0 then
-    StampFuncPtrTarget(ExprNode, FArrayFuncPtrSigs.Values[UpperCase(ArrName)]);
+  if FArrayFuncPtrSig.Values[ArrayFactKey(ArrName)] <> '' then
+    StampFuncPtrTarget(ExprNode, FArrayFuncPtrSig.Values[ArrayFactKey(ArrName)]);
 
   // ...and inside a method body the same write with no object: "s[i] = c" means "this.s[i] = c".
   if (ArrayIndexOf(ArrName) < 0) and (TargetNode.GetChild(1).NodeType = antExpressionList) and
@@ -10755,9 +10733,12 @@ begin
       FPSig := ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' +
                ArrayDeclNode.Attributes.Values['FPRET'] +
                Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
-      if (DimsNode <> nil) and (DimsNode.NodeType = antDimensions) then
-        FArrayFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig
-      else
+      // ⛔ AN ARRAY OF THEM IS NOT A FUNCPTR SCALAR. "Dim arr(0 To 1) As Function(...) As T" is N
+      // procedure pointers, and putting the ARRAY's name in this map made "arr(i)" read as an indirect
+      // call on the array itself. Its ELEMENT's signature is filed further down, in FArrayFuncPtrSig,
+      // under the scoped key the reader asks with - the registry that already exists for the named-alias
+      // spelling of the very same declaration.
+      if not ((DimsNode <> nil) and (DimsNode.NodeType = antDimensions)) then
       begin
         FFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig;
         if not FInProcedure then FModuleFuncPtrSigs.Values[UpperCase(ArrName)] := FPSig;
@@ -11332,7 +11313,16 @@ begin
     // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
     // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FFuncPtrTypes.IndexOfName(ArrElemTypeName) >= 0) then
-      FArrayFuncPtrSig.Values[DeclArrName] := FFuncPtrTypes.Values[ArrElemTypeName];
+      FArrayFuncPtrSig.Values[DeclArrName] := FFuncPtrTypes.Values[ArrElemTypeName]
+    // ⭐ ...AND THE INLINE SPELLING OF THE SAME THING. "Dim arr(0 To 1) As Function(...) As T" writes no
+    // type NAME at all - the signature rides on the declaration - so only the named-alias form was ever
+    // recorded, and the inline one fell through to an ordinary integer array: "arr(i)(args)" answered
+    // the element instead of calling it. ONE registry for one fact, under the SCOPED key the reader
+    // asks with (ArrayFactKey), which the bare name is not.
+    else if ArrayDeclNode.Attributes.Values['FUNCPTR'] = '1' then
+      FArrayFuncPtrSig.Values[DeclArrName] :=
+        ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
+        Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'));
 
     // Array of UDT POINTERS ("Dim As T Ptr a(..)"): the element is an int holding a record handle.
     // Record the pointee so "a(i)->field" resolves to record access on the loaded element.
