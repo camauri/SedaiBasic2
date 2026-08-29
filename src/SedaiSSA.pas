@@ -858,6 +858,7 @@ type
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
     function TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
+    function ArraySlotIsModuleFlat(ArrIdx: Integer; const ArrName: string): Boolean;  // resolved to the BARE module entry?
     function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
     // FB: a builtin overloaded for a UDT under its own name ("Operator Abs (v As Vector2D) As Single").
     function UDTNamedOperatorLabel(const FuncName: string; ArgsNode: TASTNode): string;
@@ -2656,6 +2657,19 @@ begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      // ⛔ ...AND THE FIELD OF THIS COMES FIRST HERE TOO. "@gi" inside a method of a type that has a
+      // field "gi" answered the address of a module-shared "gi" of the same name - the third reader of
+      // the rule m706 put right for the read and ProcessAssignment has always had for the write.
+      // Asked as a bare name with no child, exactly as the branch further down does.
+      else if (Node.ChildCount = 0) and
+              TryImplicitThisField(VarToStr(Node.Value), Node.Token, ThisAddrNode) then
+      begin
+        try
+          EmitFieldAddress(ThisAddrNode, Result);
+        finally
+          ThisAddrNode.Free;
+        end;
       end
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
@@ -7938,6 +7952,16 @@ begin
         end;
 
         ArrayIdx := ArrayIndexOf(ArrName);
+        // ⛔ ...AND A MEMBER ARRAY OF THIS WINS OVER A MODULE ARRAY OF THE SAME NAME. The rewrite used
+        // to be tried only when NOTHING of that name existed, so "Dim Shared arr(0 To 3)" beside a type
+        // with an array field "arr" made "arr(1) = 9" inside that type's own method write the GLOBAL -
+        // the array half of the rule m706 put right for a scalar field. A LOCAL or block-scoped array
+        // still wins: it carries a MANGLED name, and only the flat module entry answers here.
+        if ArraySlotIsModuleFlat(ArrayIdx, ArrName) and TryImplicitThisArrayNode(Node, ThisFieldNode) then
+        begin
+          try ProcessExpression(ThisFieldNode, Result); finally ThisFieldNode.Free; end;
+          Exit;
+        end;
         // ⚠️ begin/end, not a bare "if ... then if ...": the raise below belongs to THIS test, and
         // leaving it dangling made it unconditional - every array access in the corpus raised
         // "Array not declared" and 205 programs went red at once.
@@ -10423,7 +10447,8 @@ begin
   // The bare-name rule above covers a scalar FIELD (a string byte write); an array element never
   // reaches it, because the name sits INSIDE the subscript node. The explicit "This.arr(i) = v"
   // always worked, which is what said the defect was in the resolution and not in member arrays.
-  if (ArrayIndexOf(ArrName) < 0) and TryImplicitThisArrayNode(TargetNode, ThisFieldNode) then
+  if ((ArrayIndexOf(ArrName) < 0) or ArraySlotIsModuleFlat(ArrayIndexOf(ArrName), ArrName)) and
+     TryImplicitThisArrayNode(TargetNode, ThisFieldNode) then
   begin
     try
       PropArgs := TASTNode.Create(antAssignment, Node.Token);
@@ -37114,6 +37139,16 @@ begin
     ThisNode.Free;
   end;
   Result := True;
+end;
+
+function TSSAGenerator.ArraySlotIsModuleFlat(ArrIdx: Integer; const ArrName: string): Boolean;
+// Did this name resolve to the FLAT module array entry, rather than to a scoped one of this procedure
+// or block? A local or block-scoped array carries a MANGLED name (LocalArrayMangle / BlockArrayMangle);
+// the module's own keeps the bare spelling. It is the test that lets a member ARRAY of THIS win over a
+// module array of the same name without ever taking a LOCAL one's place.
+begin
+  Result := (ArrIdx >= 0) and (ArrIdx < FProgram.GetArrayCount) and
+            SameText(FProgram.GetArray(ArrIdx).Name, ArrName);
 end;
 
 function TSSAGenerator.TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
