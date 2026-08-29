@@ -24471,7 +24471,13 @@ begin
       begin
         AwCode := TypeNameWidthCode(UpperCase(DerefedType(Node.GetChild(0))));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        // ⭐ ...AND A BOOLEAN POINTEE PRINTS true/false. This arm knew the WIDTH codes and not the
+        // print FORM: "*b" through a "Boolean Ptr" printed -1/0 where fbc prints true/false, while the
+        // variable it points at printed right. PrintKindOfType is the same answer the declaration side
+        // gives, and it says nothing about an ordinary numeric - so nothing else moves.
+        // fbc suite boolean/boolean_ptr.
+        else Result := PrintKindOfType(UpperCase(DerefedType(Node.GetChild(0))));
       end;
     antCast:
       // "Cast(UByte, -1)" is 255 with NO leading sign space: the cast gives the value an UNSIGNED type,
