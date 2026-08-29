@@ -39641,6 +39641,7 @@ begin
   FRawModuleScalars.Clear;
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
+  FRawFromAddrOf.Clear;   // beside FRawPtrVars: it records WHY one of them is raw
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
   FByrefRetValue.Clear;
