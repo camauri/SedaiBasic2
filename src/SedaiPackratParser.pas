@@ -11558,9 +11558,14 @@ begin
                             UpperCase(VarToStr(Ch.GetChild(0).Value)), LocalNm]), Ch.Token);
       Continue;
     end;
+    // ⛔ A PROCEDURE BODY INSIDE A NAMESPACE IS NOT THE NAMESPACE. The flag was handed down through
+    // every child, procedure bodies included, so a plain LOCAL "Dim As String s = ..." written inside
+    // a Sub that happens to live in a namespace was refused as static storage - a program fbc compiles.
+    // fbcunit's TEST_GROUP opens a namespace, so this was latent over the whole suite: every var-len
+    // string a test initialises is inside one.
     if Ch.NodeType <> antDim then
     begin
-      RejectStaticVarLenStringInit(Ch, InNamespace);
+      RejectStaticVarLenStringInit(Ch, InNamespace and (Ch.NodeType <> antProcedureDecl));
       Continue;
     end;
     for j := 0 to Ch.ChildCount - 1 do
@@ -11611,7 +11616,13 @@ begin
                      (((TypeName = 'STRING') and (Decl.Attributes.Values['FIXEDLEN'] = '')) or
                       ((TypeName = '') and (Sub.NodeType = antLiteral) and Assigned(Sub.Token) and
                        (Sub.Token.TokenType = ttStringLiteral)));
-      if IsVarLenStr then
+      // ⛔ A BYREF DECLARATION HAS NO DESCRIPTOR TO FILL. "Dim Shared ByRef rs As String = s" BINDS a
+      // reference to someone else's string; the "= s" is the referent, not a value copied into storage,
+      // and fbc compiles it (verified: with s a "Dim Shared As String", it is accepted - and refused
+      // only for reasons of its own, error 87 when s carries an initializer, error 11 when s is a local
+      // of the implicit main). Read as an ordinary initialization it refused the whole of fbc's own
+      // dim/byref.bas.
+      if IsVarLenStr and (Decl.Attributes.Values['BYREF'] <> '1') then
         HandleError(Format('Var-len string %s cannot be initialized: it has static storage', [Nm]),
                     Decl.GetChild(0).Token);
       // ⭐ ...AND WHATEVER IT IS, ITS INITIALIZER MAY NOT NAME A LOCAL OF THE IMPLICIT MAIN. A
@@ -11620,6 +11631,25 @@ begin
       // address and "error 11: Expected constant" for its value. Measured one spelling at a time -
       // a literal, a CONST and the address of another SHARED are all fine, and a bare "Dim v = i" with
       // no static storage of its own is fine too.
+      // ⛔ ...BUT A MODULE-LEVEL "STATIC" MAY NAME ANOTHER ONE - AS A REFERENT, NEVER AS A VALUE. What
+      // fbc asks of a static-storage initializer is a CONSTANT, and the address of a symbol that also
+      // has static storage is one. The oracle draws the line one spelling at a time:
+      //   Static mi : Static p = @mi            OK      (the ADDRESS of a module static)
+      //   Static mi : Static ByRef r = mi       OK      (a reference bound to it - the same address)
+      //   Static mi : Static v = mi             error 11 (its VALUE is not a constant)
+      //   Static u  : Static ByRef r = u.I      error 11 (a FIELD is not, whatever u is)
+      //   Static mi : Dim Shared p = @mi        error 272 (a SHARED may not reach a scope-local symbol)
+      // So the exemption is not "this declaration is STATIC" - that was written first and it dropped
+      // fbc's own dim/byref-static-from-static-field, which is exactly the field case above. It is
+      // "the initializer IS that referent, whole": a bare "@name", or the bare name of a BYREF binding.
+      // Anything nested - a member access, an expression - keeps the refusal.
+      if (Decl.Attributes.Values['STATIC'] = '1') and (Decl.Attributes.Values['SHARED'] <> '1') and
+         (not InNamespace) and (Pos('.', Nm) = 0) and
+         (Sub.ChildCount = 0) and
+         ((Sub.NodeType = antProcAddress) or
+          ((Sub.NodeType = antIdentifier) and (Decl.Attributes.Values['BYREF'] = '1'))) and
+         (FModuleLocalNames.IndexOf(UpperCase(VarToStr(Sub.Value))) >= 0) then
+        Continue;
       if InitReferencesModuleLocal(Sub, LocalNm) then
         HandleError(Format('%s has static storage and its initializer references the local symbol %s',
                            [Nm, LocalNm]), Decl.GetChild(0).Token);
