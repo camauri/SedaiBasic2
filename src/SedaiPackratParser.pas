@@ -4119,16 +4119,41 @@ begin
             (Context.PeekNext.TokenType = ttWithBlock);
 end;
 
+function WithObjectNeedsTemp(Node: TASTNode): Boolean;
+// ⛔ THE SUBSTITUTION IS A CLONE, SO AN OBJECT THAT IS NOT AN LVALUE IS EVALUATED ONCE PER ".field".
+// "With Type<T>( 21, 22 )" built the temporary AGAIN for every dot - two references, two
+// constructors, two destructors - and "With mk( )" called mk() twice: "fCfCDD" where fbc writes
+// "fCD". Side effects REPEATED, which is the part that is not merely a counter. fbc evaluates the
+// object once, at WITH, and the temporary dies at END WITH (fbc suite compound/with-type).
+// An LVALUE is left alone on purpose: cloning it costs nothing, and materialising it into a variable
+// would COPY the record, so ".field = 9" would stop reaching the original.
+// ⚠️ A CALL WRITTEN "f( x )" PARSES AS AN ARRAY ACCESS and is indistinguishable from an element here -
+// the parser keeps no list of declared procedures - so that spelling still repeats. Declared as
+// DIVERGENZE 100; the split belongs where the two are told apart, which is the SSA.
+begin
+  Result := True;
+  if Node = nil then Exit(False);
+  case Node.NodeType of
+    antIdentifier, antMemberAccess, antDeref: Result := False;
+    antArrayAccess: Result := (Node.Attributes.Values['TYPECTOR'] = '1');
+    antParentheses: if Node.ChildCount >= 1 then Result := WithObjectNeedsTemp(Node.GetChild(0));
+  end;
+end;
+
 function TPackratParser.ParseWith: TASTNode;
 // WITH obj <newline> ... <newline> END WITH. Parse-time desugar: while parsing the body, the
 // expression parser substitutes the (cloned) object for any leading '.field'. The body is
 // returned as an antBlock — WITH itself emits nothing.
+// ...unless the object is not an LVALUE: then it is evaluated ONCE into a hidden VAR declared as the
+// block's first statement, and the dots clone that name instead. See WithObjectNeedsTemp.
 var
   Token: TLexerToken;
-  ObjExpr, Stmt, PrevWith: TASTNode;
-  PrevIdx: Integer;
+  ObjExpr, Stmt, PrevWith, DimNd, DeclNd, Substitute: TASTNode;
+  PrevIdx, WithTokIdx: Integer;
+  TmpName: string;
 begin
   Token := Context.CurrentToken;
+  WithTokIdx := Context.CurrentIndex;                // unique per WITH: names the hidden temporary
   Context.Advance;                                  // consume WITH
   ObjExpr := FExpressionParser.ParseExpression;
   Result := TASTNode.Create(antBlock, Token);
@@ -4136,6 +4161,24 @@ begin
   begin
     if AtEndWith then begin Context.Advance; Context.Advance; end;
     Exit;
+  end;
+
+  Substitute := nil;
+  if WithObjectNeedsTemp(ObjExpr) then
+  begin
+    TmpName := '__WITH_' + IntToStr(WithTokIdx);
+    // "Var <tmp> = <obj>": the VAR shape (antDim > antArrayDecl[name, init] marked INFER), so the
+    // bank/type is inferred from the object exactly as it is for any other VAR. Being the block's own
+    // DIM, a UDT temporary is destructed at END WITH - once.
+    DeclNd := TASTNode.Create(antArrayDecl, Token);
+    DeclNd.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Token));
+    DeclNd.AddChild(ObjExpr);                       // the block owns the expression from here on
+    DeclNd.Attributes.Values['INFER'] := '1';
+    DimNd := TASTNode.Create(antDim, Token);
+    DimNd.AddChild(DeclNd);
+    Result.AddChild(DimNd);
+    Substitute := TASTNode.CreateWithValue(antIdentifier, TmpName, Token);
+    ObjExpr := Substitute;
   end;
 
   PrevWith := FExpressionParser.WithObject;         // support nested WITH
@@ -4153,6 +4196,7 @@ begin
       Break;
   end;
   FExpressionParser.WithObject := PrevWith;         // restore outer WITH (or nil)
+  Substitute.Free;                                  // the clones own their copies; this one is ours
 
   if AtEndWith then
   begin
