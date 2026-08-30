@@ -487,6 +487,13 @@ type
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
+    FArrayElemBytes: TStringList;        // array DECLARATION name (ArrayFactKey) -> element BYTE size in Objects[].
+                                         //   What ARRAYSIZE and FB.ArraySize multiply the element count by. The bank
+                                         //   cannot answer it (the int bank covers 1..8 bytes and every pointer), and
+                                         //   the two element-type registries only half cover it (one holds UDT names,
+                                         //   the other scalar names, neither the "ZString * n" capacity). Filed as the
+                                         //   SIZE and not as a name because the capacity of a fixed-length string lives
+                                         //   in the declaration's FIXEDLEN attribute, not in its type name.
     FArrayScalarPointee: TStringList;    // array of NON-UDT pointers ("DIM a(..) As ZString Ptr") -> the pointee type name.
                                          //   Kept apart from FArrayPtrPointee, whose readers all assume a UDT (a record HANDLE);
                                          //   this one only says what "*a(i)" dereferences TO.
@@ -1078,6 +1085,8 @@ type
     // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);  // ARRAYSIZE = ARRAYLEN * element bytes
+    function ArrayElemSizeBytes(const ArrName: string): Int64;                   // one element of that array, in bytes
+    procedure NoteArrayElemBytes(const DeclArrName: string; Bytes: Int64);
     // FreeBASIC bare string functions (CHR/STR/LEFT/RIGHT) routed to their $-suffixed forms.
     procedure EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
@@ -1458,6 +1467,8 @@ begin
   FArrayFuncPtrSig.CaseSensitive := False;
   FArrayScalarPointee := TStringList.Create;
   FArrayScalarPointee.CaseSensitive := False;
+  FArrayElemBytes := TStringList.Create;
+  FArrayElemBytes.CaseSensitive := False;
   FArrayPtrPointee := TStringList.Create;
   FArrayPtrPointee.CaseSensitive := False;
   FNeededDispatchers := TStringList.Create;
@@ -1627,6 +1638,7 @@ begin
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
+  FArrayElemBytes.Free;
   FArrayPtrPointee.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
@@ -6991,6 +7003,33 @@ begin
           end;
         end;
 
+        // ⭐ "fb.ArrayLen( a() )" / "fb.ArraySize( a() )" - the NAMESPACE-QUALIFIED spelling, which is
+        // the ONLY one fbc has: both live in namespace FB, declared by fbc-int/array.bi. We had the bare
+        // names intercepted further down (they reach here as an antIdentifier) and nothing at all for the
+        // qualified one, so "fb.ArrayLen(a())" fell past every branch below to the bail-out that returns
+        // svkNone IN SILENCE and printed 0 - for all 510 assertions of fbc-int/array-size.
+        // ⚠️ Asked before the method-call branch on purpose: FB is a namespace, not an object, so
+        // ObjectTypeName answers '' and the branch below would drop it again.
+        if FModernMode and (Node.GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(0).ChildCount = 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+           (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'FB') and
+           (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) < 0) and
+           (ObjectTypeName(Node.GetChild(0).GetChild(0)) = '') and
+           (Node.ChildCount >= 2) then
+        begin
+          if UpperCase(VarToStr(Node.GetChild(0).Value)) = kARRAYLEN then
+          begin
+            EmitArrayLen(Node.GetChild(1), Result);
+            Exit;
+          end;
+          if UpperCase(VarToStr(Node.GetChild(0).Value)) = kARRAYSIZE then
+          begin
+            EmitArraySize(Node.GetChild(1), Result);
+            Exit;
+          end;
+        end;
+
         // "obj.s[i]" - the byte subscript on a STRING FIELD, which is neither a method call nor an
         // array member: it must be tested before both, or the subscript is read as an element index into
         // the field's (nonexistent) array handle and answers the HANDLE.
@@ -10981,6 +11020,7 @@ var
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
   FixLenCap: Integer;      // "DIM s AS STRING * n": declared capacity (0 = variable-length)
+  ElemBytes: Int64;        // one array element in bytes, filed for ARRAYSIZE (NoteArrayElemBytes)
   ScalarCtorInit: Boolean; // "DIM v AS T = <non-T expr>": an implicit conversion via a 1-arg constructor
   CopyCtorInit: Boolean;   // "DIM v AS T = <a T>": a COPY CONSTRUCTION, called by its exact label
   CopyCtorLbl: string;
@@ -11710,6 +11750,24 @@ begin
     if RecArrUDTIdx >= 0 then
       FArrayRecordType.Values[DeclArrName] := ArrElemTypeName;
 
+    // ...AND HOW MANY BYTES ONE ELEMENT TAKES. The two registries above split the element type in half
+    // by what their READERS wanted (a UDT name / a scalar name), so neither can answer the question that
+    // is about the type ITSELF. ARRAYSIZE used to answer element count * 8 because nothing here could
+    // tell it otherwise, which is right for exactly the 64-bit types. Filed under the SCOPED declaration
+    // name, so ArrayFactKey reads it back; and filed as the SIZE, because a "ZString * n" element is as
+    // wide as its declared CAPACITY and that number is not in the type name - the same three-way
+    // question CheckArrayByteSize asks a few lines below.
+    if ArrElemTypeName <> '' then
+    begin
+      if StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) > 0 then
+        ElemBytes := FixedStrTypeBytes(ArrElemTypeName,
+                                       StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0))
+      else
+        ElemBytes := TypeSizeBytes(ArrElemTypeName);
+      if ElemBytes > 0 then
+        NoteArrayElemBytes(DeclArrName, ElemBytes);
+    end;
+
     // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
     // Record the signature so "a(i)(args)" is lowered as an indirect call through the loaded element.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') and (FuncPtrTypeSig(ArrElemTypeName) <> '') then
@@ -11887,6 +11945,15 @@ begin
           raise Exception.CreateFmt('Ellipsis array bound "..." requires an initializer: %s', [ArrName]);
         DimValue := MakeSSAConstInt(LowerBounds[i] + EllipCount - 1);
       end
+      // ⭐ "Dim b(Any, Any)" - ANY IN A MULTI-DIMENSIONAL DECLARATION. The single-dimension spelling is
+      // answered far above (it IS "Dim b()"); this one used to fall through to ProcessExpression, where
+      // the identifier ANY names nothing, reads 0, and UBOUND then answered 0 for every dimension where
+      // fbc answers -1. The note above said the spelling was "left to raise rather than answered wrong";
+      // it was in fact answered wrong, silently, and fbc-int/array-size checks exactly this.
+      // Nothing new is needed to model it: an upper bound of -1 against a lower bound of 0 is a size of
+      // ZERO, and the branch below already materialises such a dimension into the runtime-sized path.
+      else if (DimChild.NodeType = antIdentifier) and (UpperCase(VarToStr(DimChild.Value)) = 'ANY') then
+        DimValue := MakeSSAConstInt(LowerBounds[i] - 1)
       else if TryConstFoldArrayBound(DimExpr, FoldedBound) then
         DimValue := MakeSSAConstInt(FoldedBound)   // Ubound(otherarray, d) as an upper bound
       else
@@ -13343,17 +13410,61 @@ begin
   Result := Acc;
 end;
 
-procedure TSSAGenerator.EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);
-// FreeBASIC ARRAYSIZE(arr): total size in bytes = element count * element size. Elements occupy 8 bytes
-// in the register banks (matches FB's 64-bit Integer/LongInt/Double); sub-width element types are not
-// modelled separately here, so the size is the element count times 8.
+procedure TSSAGenerator.NoteArrayElemBytes(const DeclArrName: string; Bytes: Int64);
+// File the element byte size under the name the slot was DECLARED with - the one ArrayFactKey resolves.
 var
-  Cnt, Prod: TSSAValue;
+  Idx: Integer;
 begin
+  Idx := FArrayElemBytes.IndexOf(DeclArrName);
+  if Idx >= 0 then FArrayElemBytes.Objects[Idx] := TObject(PtrInt(Bytes))
+  else FArrayElemBytes.AddObject(DeclArrName, TObject(PtrInt(Bytes)));
+end;
+
+function TSSAGenerator.ArrayElemSizeBytes(const ArrName: string): Int64;
+// The byte size of ONE element of the named array - the number ARRAYSIZE multiplies the element count
+// by, and the one FB.ArraySize reports.
+//
+// ⛔ THE BANK CANNOT ANSWER THIS. A register bank says int / float / string, and the int bank alone
+// carries Byte (1), Short (2), Long (4), Integer (8), every pointer (8) and a record handle. ARRAYSIZE
+// used to multiply by a hard-coded 8, which is right for exactly the 64-bit types and wrong for the
+// other eleven the suite checks. The element TYPE NAME is the only thing that knows, so it is filed at
+// the declaration (FArrayElemTypeName) under the scoped name ArrayFactKey resolves.
+//
+// The two older registries are still asked, in order, because a PARAMETER array records its element
+// UDT there and not here. 8 is the fallback, which is what every caller got before.
+var
+  ElemT, Key: string;
+  Idx: Integer;
+begin
+  Key := ArrayFactKey(ArrName);
+  Idx := FArrayElemBytes.IndexOf(Key);
+  if Idx >= 0 then Exit(PtrInt(FArrayElemBytes.Objects[Idx]));
+  // The two older registries are still asked, because a PARAMETER array records its element UDT there
+  // and never reaches the declaration site above. 8 is the fallback - what every caller got before.
+  ElemT := FArrayRecordType.Values[Key];
+  if ElemT = '' then ElemT := FArrayScalarType.Values[Key];
+  if ElemT = '' then Exit(8);
+  Result := TypeSizeBytes(ElemT);
+  if Result <= 0 then Result := 8;
+end;
+
+procedure TSSAGenerator.EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);
+// FreeBASIC ARRAYSIZE(arr): total size in bytes = element count * the element's own byte size
+// (ArrayElemSizeBytes - it is NOT always 8; see the note there).
+var
+  NameNode: TASTNode;
+  Cnt, Prod: TSSAValue;
+  ElemSz: Int64;
+begin
+  Result := MakeSSAValue(svkNone);
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+  NameNode := ArgsNode.GetChild(0);
+  if NameNode.NodeType = antArrayAccess then ElemSz := ArrayElemSizeBytes(VarToStr(NameNode.GetChild(0).Value))
+  else ElemSz := ArrayElemSizeBytes(VarToStr(NameNode.Value));
   EmitArrayLen(ArgsNode, Cnt);
-  if Cnt.Kind = svkNone then begin Result := MakeSSAValue(svkNone); Exit; end;
+  if Cnt.Kind = svkNone then Exit;
   Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaMulInt, Prod, EnsureIntRegister(Cnt), EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaMulInt, Prod, EnsureIntRegister(Cnt), EnsureIntRegister(MakeSSAConstInt(ElemSz)), MakeSSAValue(svkNone));
   Result := Prod;
 end;
 
@@ -37335,6 +37446,20 @@ begin
           U := UpperCase(VarToStr(Node.Value))
         else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
           U := UpperCase(VarToStr(Node.GetChild(0).Value))
+        // ⭐ "fb.ArrayLen( a() )" / "fb.ArraySize( a() )" are declared AS UINTEGER by fbc-int/array.bi,
+        // and unsignedness is visible in the OUTPUT: FreeBASIC prints no leading sign space for an
+        // unsigned value, so "Print fb.ArrayLen(a()); fb.ArraySize(a())" reads "1080" there and read
+        // " 10 80" here. The callee is a member access, which the two spellings above do not reach.
+        // ⚠️ The QUALIFIED spelling only. The bare ARRAYLEN/ARRAYSIZE are an extension of ours (fbc
+        // rejects them: "error 42, Variable not declared"), so there is no oracle to conform to and
+        // their existing signed rendering stands.
+        else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) and
+                (Node.GetChild(0).ChildCount = 1) and
+                (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+                (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'FB') and
+                ((UpperCase(VarToStr(Node.GetChild(0).Value)) = kARRAYLEN) or
+                 (UpperCase(VarToStr(Node.GetChild(0).Value)) = kARRAYSIZE)) then
+          Exit(True)
         else
           U := '';
         Result := (U = 'CUINT') or (U = 'CULNGINT') or (U = kCUNSG);

@@ -9951,7 +9951,11 @@ var
   Dimensions: TASTNode;
   Token, TypeTok: TLexerToken;
   MemberNode: TASTNode;
+  CapExpr: TASTNode;       // "AS ZString * n": the capacity operand, recorded as FIXEDLEN
+  FixedCapVal: Int64;
 begin
+  CapExpr := nil;
+  FixedCapVal := 0;
   // ⛔ INITIALISED, not left to the stack. FPC flags these as read-before-write, and a value a
   // parse takes from whatever the caller's frame held is a compiler whose OUTPUT depends on its
   // own call history - the class of defect that made wstring/write.bas flip verdict when one
@@ -10159,11 +10163,24 @@ begin
         Context.Advance;                              // consume PTR
       end;
       Result.AddChild(TASTNode.CreateWithValue(antIdentifier, ElemTypeName, TypeTok));
-      // FreeBASIC fixed-length string array: "AS STRING * n" / "AS WSTRING * n" (advisory in v1).
+      // FreeBASIC fixed-length string array: "DIM a(n) AS STRING * c" / "AS ZSTRING * c" / "AS WSTRING * c".
+      // ⛔ THE CAPACITY USED TO BE PARSED AND THROWN AWAY HERE, and the LEADING-AS spelling of the very
+      // same declaration ("Dim As ZString * 4 a(0 To 3)") stamps it on the node - so the two spellings of
+      // one declaration disagreed about the element's WIDTH. ARRAYSIZE read 4 bytes for a four-element
+      // ZString * 4 array written one way and 16 written the other, and "array too big" was measured
+      // against a one-byte element. Recorded exactly as the leading-AS path records it.
       if Context.Check(ttOpMul) then
       begin
         Context.Advance;                              // '*'
-        FExpressionParser.ParseExpression(precTerm).Free;   // length operand (discarded); an EXPRESSION
+        CapExpr := FExpressionParser.ParseExpression(precTerm);   // length operand: an EXPRESSION
+        if Assigned(CapExpr) then
+        begin
+          if TryConstIntExpr(CapExpr, FixedCapVal) then
+            Result.Attributes.Values['FIXEDLEN'] := IntToStr(FixedCapVal)
+          else
+            Result.Attributes.Values['FIXEDLEN'] := '-1';   // present but non-constant -> advisory
+          CapExpr.Free;
+        end;
       end;
     end;
   end;

@@ -244,6 +244,13 @@ difference is stated rather than left to be discovered.
   argument, not assignment to BYREF function result`); the ambiguity only arises when the call carries
   arguments, since `f() = v` assigns in both. We do not replicate the reading fbc itself flags as
   ambiguous: a statement of the form `lvalue = value` is an assignment.
+- ⚠️ **`ArrayLen(a())` and `ArraySize(a())` under bare names are ours.** FreeBASIC has no such names —
+  it rejects both with *error 42: Variable not declared* — and offers the values only as
+  `FB.ArrayLen` / `FB.ArraySize`, declared in `namespace FB` by `#include "fbc-int/array.bi"`. Both
+  qualified spellings are supported and agree with fbc on every element type its own suite checks; the
+  bare ones stay as an extension, so a MODERN source using them does not compile there. The qualified
+  pair is typed `UInteger` as fbc declares it (no sign column when printed); the bare pair, having no
+  oracle to conform to, keeps the ordinary signed rendering.
 - `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
   there. That is the point of an extension.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
@@ -2571,8 +2578,10 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ARRAYLEN` | ✓ | Total element count = product over dims of `(ubound-lbound+1)`; computed at runtime, correct for fixed, `lb TO ub`, multi-dim, and REDIM'd arrays. |
-| `ARRAYSIZE` | ✓ | `ARRAYSIZE(arr())` returns the total size in bytes = element count × element size (8-byte bank elements, matching FB Integer/LongInt/Double). |
+| `FB.ArrayLen` | ✓ | `#include "fbc-int/array.bi"`, then `FB.ArrayLen(arr())`: total element count = product over dims of `(ubound-lbound+1)`. Computed at runtime, so it is correct for fixed, `lb TO ub`, multi-dimensional and `REDIM`'d arrays alike, and answers 0 for a dynamic array that has not been dimensioned. Typed `UInteger`, as FreeBASIC declares it — so `PRINT` gives it no sign column. |
+| `FB.ArraySize` | ✓ | `FB.ArraySize(arr())`: total size in bytes = element count × the element's own byte size. Every element type FreeBASIC's own suite checks agrees, the fixed-length string capacities (`ZString * n`, `WString * n`, `String * n`) included. |
+| `ARRAYLEN` | ✓ | **Extension.** The same value under a bare name. FreeBASIC has no such name (it rejects it with *error 42: Variable not declared*), so a program using this form does not compile there — see *Declared divergences*. |
+| `ARRAYSIZE` | ✓ | **Extension.** As `FB.ArraySize`, under a bare name FreeBASIC does not have. |
 | `LBOUND` | ✓ | Returns the lower bound of an array's dimension. `LBOUND(arr[, dim])` (B1.4). |
 | `UBOUND` | ✓ | Returns the upper bound of an array's dimension. `UBOUND(arr[, dim])` (B1.4; honors explicit `lb TO ub` and dynamic sizes). |
 
@@ -2580,7 +2589,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Array[Const]DescriptorPtr` | ✗ | N/A — internal array descriptor pointer; not exposed. |
+| `Array[Const]DescriptorPtr` | ✗ | **Out of scope, declared.** `FBC.ArrayDescriptorPtr(arr())` hands back a pointer to an `FBC.FBARRAY` whose fields (`base_ptr`, `size`, `element_len`, `dimensions`, `flags`, `dimTb()`) are read directly. Its own header says *declarations must follow ./src/rtlib/fb_array.h* and binds the entry points to C symbols by alias (`extern "rtlib" ... alias "fb_ArrayGetDesc"`): it is the in-memory image of FreeBASIC's runtime library, not a feature of the language. This implementation has no such runtime — an array is a storage record in a table with one physical slot per execution context — so the descriptor is not exposed. `FB.ArrayLen` and `FB.ArraySize`, which are values rather than a memory layout, are supported (above). |
 
 ### Bit Manipulation
 
