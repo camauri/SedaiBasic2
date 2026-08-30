@@ -339,6 +339,13 @@ type
                                          // Collected before the @-taken pass so STRPTR/SADD of one can be
                                          // treated as the address-taking it is - see CollectFixedStrNames.
     FVarDeclTypeName: TStringList;       // every DIM/VAR'd scalar: name (UPPER) -> the type NAME it was declared as
+    // ⭐ The fixed-string CAPACITY as RegisterRecordVars walks, in source order: "NAME=<S|Z|W>:<n>".
+    // ⛔ It exists because the registries that hold this fact for the rest of the compiler
+    // (FFixedLenVars / FZStringVars) are filled by a LATER pre-scan, so "Dim y As TypeOf( x )" - which
+    // is resolved HERE - read them empty and gave y a plain descriptor. A value read before its writer
+    // has run answers, and answers wrong. Same walk, same order, so the last declaration seen wins,
+    // which is what lexical scope means. DIVERGENZE 126.
+    FPreFixedStrCap: TStringList;
     // ⭐ ...AND THE SAME FACT WITH A LEXICAL SCOPE, kept only while the declaration pre-scan is walking.
     // FVarDeclTypeName is flat and keyed on the bare name, and the pre-scan's rule is "a module-level
     // declaration owns it, anything inside a procedure only adds if absent" - so the FIRST of several
@@ -800,6 +807,7 @@ type
       out ArrayIdx: Integer; out ArrInfo: TSSAArrayInfo; out LinearIndex: TSSAValue): Boolean;
     function EmitArrayLinearIndex(const Indices: array of TSSAValue; const ArrInfo: TSSAArrayInfo;
                                   const ArrName: string): TSSAValue;            // row-major linear index (const or runtime)
+    function InheritFixedStrCapacity(DeclNode: TASTNode; const DestName, SrcName: string): string;
     function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
     function IsWStringExpr(Node: TASTNode): Boolean;                            // expression that yields a WSTRING value?
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
@@ -1576,6 +1584,8 @@ begin
   FFixedStrNames.CaseSensitive := False;
   FVarDeclTypeName := TStringList.Create;
   FVarDeclTypeName.CaseSensitive := False;
+  FPreFixedStrCap := TStringList.Create;
+  FPreFixedStrCap.CaseSensitive := False;
   FLexVarTypes := TStringList.Create;
   FLexVarTypes.CaseSensitive := False;
   SetLength(FLexVarFrames, 0);
@@ -1724,6 +1734,7 @@ begin
   FVarEnumType.Free;
   FFixedStrNames.Free;
   FVarDeclTypeName.Free;
+  FPreFixedStrCap.Free;
   FLexVarTypes.Free;
   FPointerVars.Free;
   FAddrTakenScalars.Free;
@@ -29754,6 +29765,16 @@ begin
             else
               TypeName := 'DOUBLE';
             end;
+          // ⭐ ...AND THE CAPACITY TRAVELS WITH THE TYPE. A type NAME cannot carry it: "String" is the
+          // answer for a "String * 11" too, so y came out a plain descriptor and SizeOf(y) said 24
+          // where fbc says 12. Three spellings of fbc's own checkVar macro failed on exactly this, and
+          // the other seventeen already agreed. DIVERGENZE 126.
+          if TypeOfOperand.NodeType = antIdentifier then
+          begin
+            NestedTypeName := InheritFixedStrCapacity(Decl, VarName,
+                                UpperCase(VarToStr(TypeOfOperand.Value)));
+            if NestedTypeName <> '' then TypeName := NestedTypeName;
+          end;
           Decl.RemoveChildAt(1);   // drop the type-of expression (the child list owns and frees it)
           Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
           Decl.Attributes.Values['TYPEOF'] := '0';
@@ -29790,6 +29811,22 @@ begin
       begin
         RegisterTypedVar(UpperCase(VarToStr(Decl.GetChild(0).Value)),
                          UpperCase(VarToStr(Decl.GetChild(1).Value)));
+        // ⭐ ...AND THE FIXED-STRING CAPACITY, HERE, in source order, because "Dim y As TypeOf( x )"
+        // is resolved in THIS walk and the registries that hold this fact for everyone else are
+        // filled by a LATER pre-scan. See FPreFixedStrCap. DIVERGENZE 126.
+        TypeName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+        if (StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0) > 0) and
+           ((TypeName = 'STRING') or (TypeName = 'ZSTRING') or (TypeName = 'WSTRING')) then
+          FPreFixedStrCap.Values[UpperCase(VarToStr(Decl.GetChild(0).Value))] :=
+            TypeName[1] + ':' + Decl.Attributes.Values['FIXEDLEN']
+        // ⛔⛔ AND A DECLARATION WITHOUT A CAPACITY *ERASES* THE ENTRY. The map is keyed on the bare
+        // name, so leaving it made a "ZString * 22" in one Scope give the plain "Dim x As Short" of the
+        // NEXT Scope a capacity of 22 - the flat-registry disease this whole family is about, and it
+        // showed up the moment the probes were put in ONE file instead of ten. Last declaration wins,
+        // and "no capacity" is an answer.
+        else if FPreFixedStrCap.IndexOfName(UpperCase(VarToStr(Decl.GetChild(0).Value))) >= 0 then
+          FPreFixedStrCap.Delete(
+            FPreFixedStrCap.IndexOfName(UpperCase(VarToStr(Decl.GetChild(0).Value))));
         // Remember a non-UDT declared type name (this pre-scan runs before CollectEnumMembers, so the
         // enum-ness is confirmed at the dispatch site via FEnumNames): a "Dim As <enum> v" operand then
         // resolves to its enum type for operator-overload dispatch.
@@ -36008,6 +36045,47 @@ begin
       Exit(Def);
   end;
   if Result = NOENTRY then Result := StrToIntDef(L.Values[UpperCase(Name)], Def);
+end;
+
+function TSSAGenerator.InheritFixedStrCapacity(DeclNode: TASTNode;
+  const DestName, SrcName: string): string;
+// "Dim y As TypeOf( x )" where x is a FIXED-LENGTH string: give y the same capacity and the same
+// wideness. The type NAME alone cannot carry it - DeclaredTypeNameOf answers "STRING" for both a
+// "String" and a "String * 11" - so y was declared a plain descriptor and SizeOf(y) answered 24 where
+// fbc answers 12. Measured on all three spellings: String * 11 -> 12, ZString * 22 -> 22,
+// WString * 33 -> 132, and every other type in fbc's own checkVar macro already agreed.
+// ⛔ Written into the SAME registries the DIM pre-scan writes, under the same keys, so every reader -
+// SizeOf, LEN, the padding store, the wide path - sees a declaration indistinguishable from a real one.
+// DIVERGENZE 126.
+var
+  Src, Dst, Cap, TypeOut: string;
+  Kind: Char;
+begin
+  Result := '';
+  Src := UpperCase(SrcName);
+  Dst := UpperCase(DestName);
+  if GetEnvironmentVariable('TYPEOFCAP_DIAG') = '1' then
+    WriteLn(StdErr, '[TYPEOFCAP] dst="', Dst, '" src="', Src, '" pre="', FPreFixedStrCap.Values[Src],
+            '" mappa=', FPreFixedStrCap.CommaText);
+  if (Src = '') or (Dst = '') then Exit;
+  Cap := FPreFixedStrCap.Values[Src];
+  if Cap = '' then Exit;
+  Kind := Cap[1];
+  Cap := Copy(Cap, 3, MaxInt);
+  if StrToIntDef(Cap, 0) <= 0 then Exit;
+  case Kind of
+    'Z': TypeOut := 'ZSTRING';
+    'W': TypeOut := 'WSTRING';
+  else   TypeOut := 'STRING';
+  end;
+  // ⛔ WRITTEN ON THE DECLARATION NODE, NOT INTO THE REGISTRIES. The registries that hold this fact are
+  // CLEARED and refilled by CollectWStringVars, which runs AFTER this walk - so a value written here
+  // would be wiped before anyone read it. Stamped as an ordinary FIXEDLEN declaration, the later
+  // pre-scan files it by itself and every reader downstream - SizeOf, LEN, the padding store, the wide
+  // path - sees a declaration indistinguishable from a real one. That is the whole cure.
+  DeclNode.Attributes.Values['FIXEDLEN'] := Cap;
+  FPreFixedStrCap.Values[Dst] := Kind + ':' + Cap;      // ...and TypeOf(y) answers it in turn
+  Result := TypeOut;
 end;
 
 function TSSAGenerator.IsWStringVar(const Name: string): Boolean;
@@ -43267,6 +43345,7 @@ begin
   FSharedScalarArr.Clear;
   FPointerVars.Clear;
   FVarDeclTypeName.Clear;
+  FPreFixedStrCap.Clear;
   FScalarPtrBanks.Clear;
   FAddrTakenScalars.Clear;
   FRawModuleScalars.Clear;
