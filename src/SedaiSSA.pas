@@ -842,6 +842,7 @@ type
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
     function UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;  // B1.5: field narrow width
+    function UDTFieldBitWidth(UDTIdx: Integer; const FieldName: string): Integer;  // 0 = not a bit field
     function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
     function TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean; out Size: Int64): Boolean;
     function TypeNameIsKnownBank(const TypeName: string): Boolean;   // ...does it resolve WITHOUT the suffix fallback?
@@ -24864,6 +24865,18 @@ begin
         // A Boolean has no width code - it is not a narrowed integer - so it is asked by name.
         if UDTFieldIsBoolean(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) then
           Exit(1);
+        // ⭐ ...and READING A BIT FIELD IS UNSIGNED, whatever the member was declared AS. The extraction
+        // is a mask and a shift - it cannot produce a negative - and fbc types it that way, so it
+        // prints with NO sign column: "w.l32 = &hFFFFFFFF : Print w.l32" writes 4294967295 flush left
+        // there and one space in from here, on EVERY bit field of every width and signedness. Kind 3,
+        // the narrow-unsigned form, so nothing reaches the unsigned-64 compare/divide opcodes.
+        // ⚠️ ...and a 64-BIT-WIDE field is unsigned-SIXTY-FOUR, kind 2: it has no mask and no shift
+        // (m731), so it is the whole storage unit read unsigned - fbc prints 18446744073709551615 for
+        // a "full : 64 As LongInt" holding -1. Excluding it (which looked right: no mask, so the plain
+        // type) was measured wrong against the oracle in the same run. DIVERGENZE 96.
+        AwCode := UDTFieldBitWidth(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
+        if AwCode >= 64 then Exit(2);
+        if AwCode > 0 then Exit(3);
         AwCode := UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
         // A UInteger/ULongInt FIELD is unsigned-SIXTY-FOUR, so kind 2 and not 3: it must reach the
@@ -25817,6 +25830,22 @@ begin
   F := UpperCase(FieldName);
   for i := High(FUDTs[UDTIdx].Fields) downto 0 do
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IsBoolean);
+end;
+
+function TSSAGenerator.UDTFieldBitWidth(UDTIdx: Integer; const FieldName: string): Integer;
+// The declared BIT WIDTH of a bit field ("l32 : 32 As Long"), or 0 when the field is an ordinary one.
+// It decides how the field PRINTS: reading a bit field is a MASK AND A SHIFT, which cannot produce a
+// negative, and fbc types the result UNSIGNED - so it prints with no leading sign column whatever the
+// member's declared type says. See DIVERGENZE 96.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].BitWidth);
 end;
 
 function TSSAGenerator.UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
