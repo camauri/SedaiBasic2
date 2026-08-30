@@ -477,6 +477,7 @@ type
     // their temporary. Raised around the one expression whose value is about to initialise something,
     // and read by RegisterResultTemp.
     FElidingLiteralTemp: Integer;
+    FElidedLiteralHit: Boolean;   // the elision above just fired: this argument IS the temporary
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
@@ -622,6 +623,9 @@ type
     function VarRecordTypeName(const VarName: string): string;
     // The EXACT copy-constructor label (both spellings), and "is this initialiser a copy of the
     // very type being declared?" - the pair DIVERGENZE 104 turns on.
+    // The private copy a BYVAL UDT parameter gets - made by the CALLER since m759.
+    function EmitByvalUdtCopyOf(const SrcHandle: TSSAValue; PUDT: Integer): TSSAValue;
+    function ByvalUdtParamIndex(ParamList: TASTNode; Idx: Integer): Integer;
     function ExactCopyCtorLabel(const TypeName: string): string;
     function InitIsCopyOfSameType(Node: TASTNode; const RecTypeName: string): Boolean;
     function InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;    // '' if not a record var
@@ -22045,7 +22049,7 @@ var
   RetT, RhsType, Lbl, ParamType: string;
   Decl, PList, P: TASTNode;
   i, UDTIdx: Integer;
-  RcHandle: TSSAValue;
+  RcHandle, OpndVal: TSSAValue;
 begin
   Result := False;
   if (not FModernMode) or (FCurrentProcRetRecType <> '') or (ExprNode = nil) then Exit;
@@ -22074,8 +22078,16 @@ begin
   EmitInstruction(ssaRecordNew, RcHandle, MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
                   MakeSSAConstInt(FUDTs[UDTIdx].NStr or (Int64(UDTIdx) shl 32)));
   EmitRecordInit(RcHandle, UDTIdx);
+  // ...and the same guard the twin staging below carries: a BYVAL UDT operand gets its private copy
+  // from the CALLER since m759, because the callee adopts what it is handed.
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) and
+     (Decl.GetChild(1).NodeType = antParameterList) and
+     (ByvalUdtParamIndex(Decl.GetChild(1), 1) >= 0) then
+    OpndVal := EmitByvalUdtCopyOf(ExprVal, ByvalUdtParamIndex(Decl.GetChild(1), 1))
+  else
+    OpndVal := ExprVal;
   EmitXferStore(srtInt, 0, RcHandle);                    // THIS = the new destination instance
-  EmitXferStore(srtInt, 1, EnsureIntRegister(ExprVal));  // the operand, by reference
+  EmitXferStore(srtInt, 1, EnsureIntRegister(OpndVal));  // the operand, by reference
   EmitCallSubLabel(ProcedureLabelName(Lbl));
   EmitXferStore(FCurrentProcRetType, XFER_RESULT_SLOT, RcHandle);   // the cast's result: its handle
   Result := True;
@@ -22097,6 +22109,7 @@ var
   Lbl, ParamType, RhsType: string;
   Decl, PList, P: TASTNode;
   i: Integer;
+  OpndVal: TSSAValue;
 begin
   Result := False;
   if (not FModernMode) or (RetRecType = '') or (ExprNode = nil) then Exit;
@@ -22120,8 +22133,18 @@ begin
       end;
   end;
   if ParamType <> RhsType then Exit;
+  // ⭐ ...and if that operand is declared BYVAL it gets its private copy here, like every other staging
+  // path: since m759 the callee ADOPTS what it is handed. "Operator Let" takes it BYREF in practice -
+  // which is why this line changes nothing today - but a path that stages by hand and forgets makes the
+  // callee alias, and destroy, the caller's record. Asked of the declaration, not assumed.
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) and
+     (Decl.GetChild(1).NodeType = antParameterList) and
+     (ByvalUdtParamIndex(Decl.GetChild(1), 1) >= 0) then
+    OpndVal := EmitByvalUdtCopyOf(ExprVal, ByvalUdtParamIndex(Decl.GetChild(1), 1))
+  else
+    OpndVal := ExprVal;
   EmitXferStore(srtInt, 0, EnsureIntRegister(FCurrentResultHandle));   // THIS = the result instance
-  EmitXferStore(srtInt, 1, EnsureIntRegister(ExprVal));                // the operand, by reference
+  EmitXferStore(srtInt, 1, EnsureIntRegister(OpndVal));                // the operand, by reference
   EmitCallSubLabel(ProcedureLabelName(Lbl));
   Result := True;
 end;
@@ -22142,7 +22165,7 @@ var
   ObjType, Lbl, ParamType, RhsType: string;
   TmpArgs, Decl, PList, P, ConvNode: TASTNode;
   i: Integer;
-  Dummy: TSSAValue;
+  Dummy, OpndVal: TSSAValue;
 begin
   Result := False;
   if (not FModernMode) or (VarNode = nil) or (ExprNode = nil) then Exit;
@@ -29467,6 +29490,69 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitByvalUdtCopyOf(const SrcHandle: TSSAValue; PUDT: Integer): TSSAValue;
+// The private copy a BYVAL UDT parameter gets: a fresh record, built from SrcHandle by the type's COPY
+// CONSTRUCTOR when it declares one, and by a base-constructor + field copy when it does not.
+//
+// ⭐⭐ IT IS THE CALLER'S JOB, and that is the whole point. It used to be the CALLEE's, and a callee
+// cannot know that its argument is a TEMPORARY nobody else owns - so "p( Type<C>( ) )" built the
+// literal AND copied it, two objects where fbc has ONE: fbc builds a "Type( ... )" argument straight
+// into the parameter's own copy. m669 measured the destructor side of that (ONE destructor, not two)
+// and we had been paying it by ELIDING the literal's destructor while still making the copy - so the
+// counts said three objects constructed and two destroyed.
+// Made here, the caller simply DOES NOT COPY when the argument is that temporary: it hands it over.
+// ⛔ Every path that stages arguments must call this - StageCallArgs, the constructor's own staging
+// and the operator/cast staging - because the callee now ADOPTS what it is given. A path that forgets
+// makes the callee alias (and destroy) the CALLER's variable.
+var
+  CopyCtorLbl, BaseCtorLbl: string;
+begin
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRecordNew, Result,
+                  MakeSSAConstInt(FUDTs[PUDT].LiveBytes), MakeSSAConstInt(0),
+                  MakeSSAConstInt(FUDTs[PUDT].NStr or (Int64(PUDT) shl 32)));
+  EmitRecordInit(Result, PUDT);
+  CopyCtorLbl := ExactCopyCtorLabel(FUDTs[PUDT].Name);
+  if CopyCtorLbl <> '' then
+  begin
+    // THIS in int slot 0, the source handle in slot 1 - the layout every one-parameter constructor
+    // call uses. The argument is already a VALUE here, so the AST-driven EmitConstructorCall cannot
+    // be reused as it stands.
+    EmitXferStore(srtInt, 0, Result);
+    EmitXferStore(srtInt, 1, EnsureIntRegister(SrcHandle));
+    EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
+  end
+  else
+  begin
+    // ⛔ ...and with NO copy constructor, a type that EXTENDS one still runs the BASE's default
+    // constructor on the copy. That is what fbc's synthesised copy constructor does - construct the
+    // base sub-object, then copy the fields - and it is why fbc's structs/derived-param counts TWO
+    // constructor calls for one "d" passed byval where we counted one. ⚠️ Only the BASE: a FLAT type
+    // with a default constructor does NOT get it called on a byval copy (measured against the oracle
+    // both ways), so the walk starts at the parent.
+    BaseCtorLbl := '';
+    if FUDTs[PUDT].Parent <> '' then
+      BaseCtorLbl := ResolveConstructorLabel(FUDTs[PUDT].Parent, '');
+    if BaseCtorLbl <> '' then
+    begin
+      EmitXferStore(srtInt, 0, Result);                 // THIS
+      EmitCallSubLabel(ProcedureLabelName(BaseCtorLbl));
+    end;
+    EmitRecordCopy(Result, SrcHandle, PUDT);            // copy the source record in
+  end;
+end;
+
+function TSSAGenerator.ByvalUdtParamIndex(ParamList: TASTNode; Idx: Integer): Integer;
+// The UDT index of parameter Idx when it is a BYVAL UDT one, else -1. Asked by every staging path.
+begin
+  Result := -1;
+  if (ParamList = nil) or (Idx < 0) or (Idx >= ParamList.ChildCount) then Exit;
+  if ParamList.GetChild(Idx).Attributes.Values['BYVAL'] <> '1' then Exit;
+  if (ParamList.GetChild(Idx).ChildCount < 1) or
+     (ParamList.GetChild(Idx).GetChild(0).NodeType <> antIdentifier) then Exit;
+  Result := FindUDT(UpperCase(VarToStr(ParamList.GetChild(Idx).GetChild(0).Value)));
+end;
+
 function TSSAGenerator.ExactCopyCtorLabel(const TypeName: string): string;
 // The label of T's COPY CONSTRUCTOR - "Constructor( ByRef As T )" or "Constructor( ByRef As Const T )" -
 // or '' when the type declares none. ⛔ EXACT, never the resolver: ResolveConstructorLabel falls back by
@@ -30545,6 +30631,24 @@ begin
       end;
     Exit;
   end;
+  // ⭐ A BYVAL UDT PARAMETER GETS ITS PRIVATE COPY HERE TOO: since m759 the callee ADOPTS what it is
+  // handed, so every staging path owes it a copy - and a constructor stages its own arguments. Without
+  // it the constructor would alias the CALLER's record and destroy it at its own frame exit.
+  // ⛔⛔ AND IT MUST RUN *BEFORE* THIS IS STAGED. EmitByvalUdtCopyOf calls the copy constructor, which
+  // writes int transfer slots 0 and 1 - so done inside the staging loop it OVERWROTE THIS, and the
+  // constructor ran on a handle that was really its own argument: fbc's overload/op_ctor_coercion_udt
+  // went from CUPASS to CUFAIL with the coercing constructor never taking effect. StageCallArgs is
+  // immune by construction (it evaluates every argument BEFORE writing any slot, and says so);
+  // this path interleaves, so the copies are hoisted into a pass of their own.
+  // ⚠️ ParamList is read from the DECLARATION here and not before: at this point in the routine it has
+  // not been assigned yet, and using it uninitialised is an access violation in SSA generation.
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) and
+     (Decl.GetChild(1).NodeType = antParameterList) then
+    for i := 0 to ArgCount - 1 do
+      if (i + 1 < Decl.GetChild(1).ChildCount) and
+         (Decl.GetChild(1).GetChild(i + 1).Attributes.Values['ARRAY'] <> '1') and
+         (ByvalUdtParamIndex(Decl.GetChild(1), i + 1) >= 0) then
+        ArgVals[i] := EmitByvalUdtCopyOf(ArgVals[i], ByvalUdtParamIndex(Decl.GetChild(1), i + 1));
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
   if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
   begin
@@ -31315,7 +31419,9 @@ begin
   // ⭐ ...unless this is a "Type( ... )" literal standing where fbc builds it straight into its
   // destination. See FElidingLiteralTemp. A FUNCTION RESULT temporary is never elided, in any
   // position - measured: "byval_p( mk() )" runs THREE destructors in fbc, not two.
-  if IsLiteral and (FElidingLiteralTemp > 0) then Exit;
+  // ⭐ ...and SAY SO. The caller staging a BYVAL UDT argument adopts exactly the temporary whose
+  // destructor was elided here - that pair is what makes the object count match fbc's.
+  if IsLiteral and (FElidingLiteralTemp > 0) then begin FElidedLiteralHit := True; Exit; end;
   FResultTemps.AddObject(UpperCase(TypeName), TObject(PtrInt(HandleVal.RegIndex)));
 end;
 
@@ -39487,6 +39593,7 @@ var
   i, NArgs, Slot, NStage: Integer;
   RT: TSSARegisterType;
   ParamUdtU: string;
+  CoercByval, HandledImplicit: Boolean;   // the coerced temporary IS the byval copy (m759)
   ArgVal, TempVal2: TSSAValue;
   StageSlots: array of Integer;
   StageRTs: array of TSSARegisterType;
@@ -39580,7 +39687,21 @@ begin
           ParamUdtU := '';
       end;
     end;
-    if (ParamUdtU <> '') and TryEmitImplicitUDTArg(ParamUdtU, ArgExpr, ArgVal) then
+    // ⛔⛔ ...AND FOR A BYVAL PARAMETER THAT TEMPORARY *IS* THE PARAMETER'S COPY, so it must not ALSO be
+    // registered as this statement's own. Since m759 the callee ADOPTS what it is handed: registered on
+    // both sides, the record was destroyed TWICE - once by the caller at the end of the statement and
+    // once by the callee at frame exit - and the callee then read a reclaimed record
+    // (fbc suite overload/op_ctor_coercion_udt went from CUPASS to CUFAIL, on the VALUE). The elision
+    // counter is exactly the "this one is handed over" signal the byval-UDT branch below already uses.
+    // ⚠️ A BYREF parameter keeps it: there the temporary stays the caller's and nothing adopts it.
+    CoercByval := (ParamUdtU <> '') and (ParamList.GetChild(i).Attributes.Values['BYVAL'] = '1');
+    if CoercByval then Inc(FElidingLiteralTemp);
+    try
+      HandledImplicit := (ParamUdtU <> '') and TryEmitImplicitUDTArg(ParamUdtU, ArgExpr, ArgVal);
+    finally
+      if CoercByval then Dec(FElidingLiteralTemp);
+    end;
+    if HandledImplicit then
       // handled: ArgVal holds the temporary's record handle
     else if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) and
        (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
@@ -39621,12 +39742,19 @@ begin
             (ParamList.GetChild(i).GetChild(0).NodeType = antIdentifier) and
             (FindUDT(UpperCase(VarToStr(ParamList.GetChild(i).GetChild(0).Value))) >= 0) then
     begin
+      FElidedLiteralHit := False;
       Inc(FElidingLiteralTemp);
       try
         ProcessExpression(ArgExpr, ArgVal);
       finally
         Dec(FElidingLiteralTemp);
       end;
+      // ...and the copy the parameter gets is made HERE, by the caller - unless the argument IS the
+      // temporary whose destructor was just elided, in which case it is handed over as it stands.
+      // That is the whole difference between "two objects" and fbc's one. See EmitByvalUdtCopyOf.
+      if not FElidedLiteralHit then
+        ArgVal := EmitByvalUdtCopyOf(ArgVal,
+                    FindUDT(UpperCase(VarToStr(ParamList.GetChild(i).GetChild(0).Value))));
     end
     else
       ProcessExpression(ArgExpr, ArgVal);
@@ -40476,64 +40604,12 @@ begin
           PUDT := FindUDT(UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
           if PUDT >= 0 then
           begin
-            LcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaRecordNew, LcHandle,
-                            MakeSSAConstInt(FUDTs[PUDT].LiveBytes), MakeSSAConstInt(0),
-                            MakeSSAConstInt(FUDTs[PUDT].NStr or (Int64(PUDT) shl 32)));
-            EmitRecordInit(LcHandle, PUDT);
-            // ⛔ ...and a type that declares a COPY CONSTRUCTOR gets it CALLED. A BYVAL UDT parameter is
-            // a copy, and fbc builds that copy with "Constructor(ByRef As T)" when there is one: it
-            // counted one copy-ctor call where we counted none, because a plain field copy is what we
-            // always did. Without a copy constructor the field copy is still exactly right, and is what
-            // a type that declares none should get - the same rule "Dim As T b = a" already follows.
-            // ⛔ THE EXACT LABEL, not the resolver. ResolveConstructorLabel FALLS BACK - by bank, then by
-            // arity - so on a type whose only one-parameter constructor takes an Integer it answered
-            // THAT one, and a byval parameter was "constructed" from its own handle read as a number
-            // (m558 caught it at once). A copy constructor is the label that names the type itself.
-            // ⛔⛔ ...AND "ByRef As CONST T" IS THE SAME COPY CONSTRUCTOR, under another LABEL. The const
-            // qualifier appends a positional '!C' tail to the signature, so the idiomatic spelling -
-            // the one fbc's own suite writes, and the only one that can take a temporary - signs
-            // "T.CONSTRUCTOR#I:T!C" and this exact lookup missed it: the copy constructor was simply
-            // never called. Measured on six shapes at once (var = a, dim = a, byval argument, byval
-            // call): with the CONST spelling fbc ran one copy-ctor and we ran none in ALL of them;
-            // rewriting the same program without CONST made four of the six match immediately.
-            // ⚠️ Still EXACT, two spellings and no resolver: the note above says why a resolver is
-            // wrong here, and both of these name the copy constructor and nothing else.
-            CopyCtorLbl := UpperCase(FUDTs[PUDT].Name) + '.CONSTRUCTOR#I:' + UpperCase(FUDTs[PUDT].Name);
-            if not FProcDecls.ContainsKey(CopyCtorLbl) then
-              CopyCtorLbl := CopyCtorLbl + '!C';
-            if not FProcDecls.ContainsKey(CopyCtorLbl) then CopyCtorLbl := '';
-            if CopyCtorLbl <> '' then
-            begin
-              // THIS in int slot 0, the source handle in slot 1 - the layout every one-parameter
-              // constructor call uses. The argument is already a VALUE here, so the AST-driven
-              // EmitConstructorCall cannot be reused as it stands.
-              EmitXferStore(srtInt, 0, LcHandle);
-              EmitXferStore(srtInt, 1, EnsureIntRegister(ParamReg));
-              EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
-            end
-            else
-            begin
-              // ⛔ ...and with NO copy constructor, a type that EXTENDS one still runs the BASE's
-              // default constructor on the copy. That is what fbc's synthesised copy constructor does -
-              // construct the base sub-object, then copy the fields - and it is why fbc's
-              // structs/derived-param counts TWO constructor calls for one "d" passed byval where we
-              // counted one. ⚠️ Only the BASE: a FLAT type with a default constructor does NOT get it
-              // called on a byval copy (measured against the oracle both ways), so the walk starts at
-              // the parent. ResolveConstructorLabel already climbs from there to the nearest ancestor
-              // that declares one.
-              BaseCtorLbl := '';
-              if FUDTs[PUDT].Parent <> '' then
-                BaseCtorLbl := ResolveConstructorLabel(FUDTs[PUDT].Parent, '');
-              if BaseCtorLbl <> '' then
-              begin
-                EmitXferStore(srtInt, 0, LcHandle);                // THIS
-                EmitCallSubLabel(ProcedureLabelName(BaseCtorLbl));
-              end;
-              EmitRecordCopy(LcHandle, ParamReg, PUDT);            // copy caller's record in
-            end;
-            EmitInstruction(ssaCopyInt, ParamReg, LcHandle,        // param var := local copy handle
-                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // ⭐⭐ THE COPY IS THE CALLER'S NOW (m759), and this side ADOPTS what it is handed. It used
+            // to be made here - a fresh record copy-constructed from the caller's handle - and a callee
+            // cannot know that its argument is a TEMPORARY nobody else owns: "p( Type<C>( ) )" then
+            // built the literal AND copied it, two objects where fbc has one. The caller does know, so
+            // it hands the temporary over and copies only when it must. See EmitByvalUdtCopyOf.
+            // ⚠️ The register already holds the copy's handle; only the OWNERSHIP has to be recorded.
             // V5d: this BYVAL copy is frame-owned -> destruct it at frame exit (after the locals).
             FCurrentProcByvalRecs.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '|' +
                                       UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
