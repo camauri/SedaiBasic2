@@ -12133,6 +12133,21 @@ begin
     if ArrayIdx < 0 then
       raise Exception.CreateFmt('ERASE: array not declared: %s', [ArrName]);
     if ArraySlotIsDynamic(ArrayIdx, ArrName) then DynFlag := 1 else DynFlag := 0;
+    // ⛔ ...BUT ON AN ARRAY PARAMETER THE COMPILER CANNOT TELL, AND IT IS NOT ITS QUESTION TO ANSWER.
+    // "Erase arg" inside a SUB must FREE the caller's array when the caller REDIM'd it and merely RESET
+    // the elements when the caller DIM'd it with fixed bounds - two callers, two answers, one body.
+    // Asked here it fell back to the flat pre-scan for the bare parameter NAME, which nothing REDIMs,
+    // so every such ERASE reset instead of freeing: "ubound(x0)" answered 1 where fbc answers -1
+    // (fbc suite string/string-array-erase-arg, and the same shape in structs/obj-array-erase-arg).
+    // Immediate 2 hands the question to the VM, where the storage carries its own answer.
+    // ⚠️ NOT for an array of UDT, and the reason is below: when ERASE only RESETS, the elements are
+    // RE-CONSTRUCTED by a run of instructions emitted here, at COMPILE time. With the decision deferred
+    // to the VM there is no way to emit that run conditionally, and skipping it left every element a
+    // zeroed handle - the next field access died on an access violation (structs/obj-array-erase-arg
+    // went straight from CUFAIL to CUERR, which is what the terna is for). Declared as DIVERGENZE 101.
+    if FInProcedure and (FindUDT(ArrayRecordTypeOf(ArrName)) < 0) and
+       (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, ArrName)) >= 0) then
+      DynFlag := 2;
     // ...and its DESTRUCTOR runs on every element FIRST, before the storage goes: fbc's own suite counts
     // the calls ("erase x2 '' dtors & clear"). Emitted here, ahead of the erase, for the obvious reason.
     RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
@@ -39284,9 +39299,12 @@ end;
 procedure TSSAGenerator.NoteArrayShape(const SlotName: string; Dynamic: Boolean);
 // File this SLOT's shape. The last word wins: a REDIM of a slot a DIM declared with subscripts makes it
 // dynamic from then on, and nothing makes a dynamic slot fixed again.
+// ⭐ ...and the same fact travels to the VM on the array's own declaration, because ERASE asks it again
+// at RUNTIME for an array PARAMETER, where the answer belongs to the CALLER's array.
 var k: Integer;
 begin
   if SlotName = '' then Exit;
+  if Dynamic then FProgram.SetArrayDynamicShape(FProgram.FindArray(SlotName), True);
   if Dynamic then
   begin
     k := FArrShapeFixed.IndexOf(SlotName);

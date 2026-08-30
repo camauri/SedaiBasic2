@@ -703,6 +703,11 @@ type
     // same SUB overwrote each other. Marked here, at the only place that knows the scope, and carried
     // through to the VM, which gives every execution context its own block of private slots.
     IsPrivate: Boolean;
+    // ⭐ FIXED OR DYNAMIC, carried to the VM. The compiler settles it per SLOT (NoteArrayShape), and
+    // ERASE needs it at RUNTIME as well: "Erase arg" inside a SUB is asked of an array PARAMETER, whose
+    // fixed-or-dynamic nature belongs to the CALLER's array and may differ between two calls. The VM
+    // stamps it on the storage at DIM, a REDIM sets it, and a bind carries it into the parameter.
+    IsDynamicShape: Boolean;
   end;
 
   TSSAProgram = class
@@ -744,6 +749,7 @@ type
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
+    procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
     procedure BuildDominatorTree;  // PHASE 3 TIER 2: Build dominator tree for optimizations
@@ -1488,6 +1494,14 @@ procedure TSSAProgram.SetArrayPrivate(ArrayIdx: Integer);
 begin
   if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then
     FArrays[ArrayIdx].IsPrivate := True;
+end;
+
+procedure TSSAProgram.SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);
+// Record whether this slot is a DYNAMIC array, so the VM can stamp it on the storage at DIM. Only ever
+// SET: a slot known dynamic stays dynamic, exactly as NoteArrayShape rules it in the compiler.
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) and Dynamic then
+    FArrays[ArrayIdx].IsDynamicShape := True;
 end;
 
 function TSSAProgram.GetArray(Index: Integer): TSSAArrayInfo;

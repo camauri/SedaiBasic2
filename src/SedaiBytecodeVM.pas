@@ -13216,6 +13216,7 @@ var
   Lb, NewSize, k: Integer;
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  FArrays[ArrayIdx].IsDynamic := True;   // a REDIM'd array is DYNAMIC: ERASE frees it (see EraseArray)
   Lb := 0;
   if Length(FArrays[ArrayIdx].LowerBounds) > 0 then Lb := FArrays[ArrayIdx].LowerBounds[0];
   // An explicit "REDIM a(lb TO ub)" sets the lower bound too (FreeBASIC); a bare "REDIM a(ub)" keeps the
@@ -13259,6 +13260,8 @@ procedure TBytecodeVM.RedimArrayN(ArrayIdx: Integer; const Uppers: array of Inte
 var
   d, NewSize, k, Lb: Integer;
 begin
+  if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
+    FArrays[ArrayIdx].IsDynamic := True;   // as RedimArray: a REDIM'd array is DYNAMIC
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) or (Length(Uppers) = 0) then Exit;
   NewSize := 1;
   SetLength(FArrays[ArrayIdx].Dimensions, Length(Uppers));
@@ -13413,6 +13416,9 @@ begin
         end;
         FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
         FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
+        // Fixed or dynamic, stamped on the STORAGE: ERASE through an array PARAMETER asks the storage,
+        // because the answer is the CALLER's (see EraseArray and the Immediate-2 case).
+        FArrays[ArrayIdx].IsDynamic := ArrInfo.IsDynamicShape;
         SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
         SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
         for i := 0 to ArrInfo.DimCount - 1 do
@@ -13497,7 +13503,13 @@ begin
       end;
     11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
         // 0 = static array (keep bounds, zero the elements).
-      EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
+      // Immediate 2 = "the compiler could not tell": the name is an array PARAMETER, and whether ERASE
+      // frees or merely resets is the CALLER's array's property. The bind copied the storage record
+      // whole, so the answer travels with it. fbc suite string/string-array-erase-arg.
+      if Instr.Immediate = 2 then
+        EraseArray(Ctx.ArrMap[Instr.Src1], FArrays[Ctx.ArrMap[Instr.Src1]].IsDynamic)
+      else
+        EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
     12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
         // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
         // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
