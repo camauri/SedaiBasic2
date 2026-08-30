@@ -17188,7 +17188,8 @@ begin
         if Assigned(FOnFileData) then
         begin
           BinWidth := Instr.Immediate;
-          if BinWidth <= 0 then
+          if BinWidth < 0 then BinWidth := -BinWidth        // ZSTRING * n: read |n|, keep all of it
+          else if BinWidth = 0 then
           begin
             if Instr.Dest >= 0 then BinWidth := Length(Ctx.StringRegs[Instr.Dest]) else BinWidth := 0;
           end;
@@ -17202,6 +17203,11 @@ begin
           // A fixed-width field is "n characters + NUL terminator" on file (fbc's C layout for a
           // "String * n" member): keep the n characters, padding included — the destination is a
           // fixed-length buffer, which holds exactly n bytes.
+          // ⛔ A "ZSTRING * n" DESTINATION IS THE OTHER CONVENTION, and it needed saying: fbc reads
+          // n-1 bytes there and KEEPS ALL OF THEM ("Dim z6 As ZString * 6" over "1234567890" leaves
+          // "12345" and the file position at 6, not 7). A NEGATIVE immediate is that request - read
+          // |n| bytes, drop nothing - because the two differ in what they KEEP, not in what they read,
+          // so no width can express both. DIVERGENZE 125.
           if (Instr.Immediate > 0) and (Length(Data) > 0) then
             SetLength(Data, Length(Data) - 1);
           if Instr.Dest >= 0 then Ctx.StringRegs[Instr.Dest] := Data;

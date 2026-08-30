@@ -21067,7 +21067,7 @@ var
   HandleChild, VarChild, CountChild: TASTNode;
   VarName: string;
   HandleStr: string;
-  HandleNum: Integer;
+  HandleNum, GetStrCap: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -21107,8 +21107,23 @@ begin
       EmitInstruction(ssaGetBinFloat, VarReg, HandleReg, MakeSSAValue(svkNone),
                       MakeSSAConstInt(BinaryElemBytes(string(VarChild.Value))))
     else if VarReg.RegType = srtString then
+    begin
       // FreeBASIC reads Len(s) RAW bytes into a variable-length string: width 0 = "its current length".
-      EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(0))
+      // ⛔ ...WHICH IS ZERO FOR A "ZSTRING * n", AND THAT IS ITS CAPACITY, NOT ITS LENGTH. A
+      // "String * n" already worked because its Len IS n, but a Z-string starts empty: fbc reads n-1
+      // bytes into "Dim z6 As ZString * 6" and leaves "12345" there, and we read NOTHING and left it
+      // empty (fbc's own file/get, which matches on all ten numeric types and only failed here).
+      // ⚠️ A WSTRING is deliberately left alone: how many BYTES its n cells occupy is DIVERGENZE 110,
+      // where our UTF-8 image and fbc's 4-byte cells disagree, and reading a byte count off that
+      // disagreement would put the file position somewhere neither of us means.
+      GetStrCap := 0;
+      if not IsWStringVar(UpperCase(string(VarChild.Value))) then
+        GetStrCap := StrCapOf(FZStringVars, UpperCase(string(VarChild.Value)), 0);
+      // NEGATIVE = "read that many bytes and keep them all", which is the ZSTRING rule; a positive
+      // width is the "String * n" one, where the last byte on file is the terminator.
+      EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(-GetStrCap));
+    end
     else
       // Read exactly the variable's declared width (BYTE=1, SHORT=2, LONG=4, else 8); Immediate = byte count.
       EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone),
