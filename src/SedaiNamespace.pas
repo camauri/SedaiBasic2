@@ -64,6 +64,13 @@ type
     // name in GlobalNames blocked the import for the TYPE occurrence beside it. A type slot asks this
     // set instead - only a module-level TYPE can outrank an imported one.
     GlobalTypeNames: TStringList;
+    // ⭐ ...and the FIELD names of every TYPE the program declares, "TYPE=F1,F2,...". Inside a member
+    // procedure a bare field name is an implicit-THIS reference and SHADOWS a namespace member exactly
+    // as a parameter does - and nothing here knew it: a namespace declaring "Type foo" with a field
+    // "bar" AND a "Type bar" beside it had "bar = 1234" inside foo's constructor rewritten to
+    // "NS.BAR", so the field was never written and every read of it answered 0. fbc's dim/auto_var2
+    // writes that cross-shadowed pair on purpose.
+    TypeFieldNames: TStringList;
     constructor Create;
     destructor Destroy; override;
     function IsMember(const Prefix, Name: string): Boolean;
@@ -79,6 +86,8 @@ begin
   NsUsings.Duplicates := dupIgnore;
   NsUsings.Sorted := True;
   GlobalTypeNames := TStringList.Create;
+  TypeFieldNames := TStringList.Create;
+  TypeFieldNames.CaseSensitive := False;
   GlobalTypeNames.Duplicates := dupIgnore;
   GlobalTypeNames.Sorted := True;
   NamespaceNames := TStringList.Create;
@@ -97,6 +106,7 @@ end;
 
 destructor TNsContext.Destroy;
 begin
+  TypeFieldNames.Free;
   NamespaceNames.Free;
   MemberKeys.Free;
   GlobalNames.Free;
@@ -315,6 +325,66 @@ end;
 // assertions on exactly this shape.
 // ⇒ The DIM'd locals are therefore added AS THE WALK REACHES THEM (see RewriteRefs), and this routine
 //   now collects only what is in scope for the WHOLE body: the parameters.
+procedure CollectTypeFieldNames(Node: TASTNode; Ctx: TNsContext);
+// Every TYPE's field names, at any depth, filed as "TYPE=F1,F2,...". See TNsContext.TypeFieldNames.
+var
+  i: Integer;
+  Nm, Acc: string;
+  Fld: TASTNode;
+begin
+  if (Node = nil) or (Ctx = nil) then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    Nm := UpperCase(VarToStr(Node.Value));
+    if Nm <> '' then
+    begin
+      Acc := Ctx.TypeFieldNames.Values[Nm];
+      for i := 0 to Node.ChildCount - 1 do
+      begin
+        Fld := Node.GetChild(i);
+        if (Fld <> nil) and (Fld.NodeType in [antIdentifier, antArrayDecl]) then
+        begin
+          if (Fld.NodeType = antArrayDecl) and (Fld.ChildCount >= 1) and
+             (Fld.GetChild(0).NodeType = antIdentifier) then
+            Acc := Acc + ',' + UpperCase(VarToStr(Fld.GetChild(0).Value))
+          else if Fld.NodeType = antIdentifier then
+            Acc := Acc + ',' + UpperCase(VarToStr(Fld.Value));
+        end;
+      end;
+      Ctx.TypeFieldNames.Values[Nm] := Acc;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do CollectTypeFieldNames(Node.GetChild(i), Ctx);
+end;
+
+procedure CollectOwnerFieldNames(Node: TASTNode; Ctx: TNsContext; Shadow: TStringList);
+// A member procedure "T.m" is written inside T's scope: T's FIELDS shadow namespace members there,
+// because a bare one of them means "this.<field>". Added beside the parameters, for the same reason.
+var
+  Nm, Owner, Acc, One: string;
+  P: Integer;
+begin
+  if (Node = nil) or (Ctx = nil) or (Shadow = nil) then Exit;
+  // ⛔ The NAME is child 0, not the node's own Value - and by now it may carry an overload signature
+  // ("~II") or a constructor's parameter tail ("#I:TV"), both written during parsing. Cut them off:
+  // the owner is what stands before the LAST dot of the bare name.
+  if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  P := Pos('#', Nm); if P > 0 then Nm := Copy(Nm, 1, P - 1);
+  P := Pos('~', Nm); if P > 0 then Nm := Copy(Nm, 1, P - 1);
+  P := LastDelimiter('.', Nm);
+  if P <= 1 then Exit;
+  Owner := Copy(Nm, 1, P - 1);
+  Acc := Ctx.TypeFieldNames.Values[Owner];
+  while Acc <> '' do
+  begin
+    P := Pos(',', Acc);
+    if P = 0 then begin One := Acc; Acc := ''; end
+    else begin One := Copy(Acc, 1, P - 1); Acc := Copy(Acc, P + 1, MaxInt); end;
+    if (One <> '') and (Shadow.IndexOf(One) < 0) then Shadow.Add(One);
+  end;
+end;
+
 procedure CollectParamNames(Node: TASTNode; Shadow: TStringList);
 var
   i: Integer;
@@ -626,6 +696,7 @@ begin
     UseShadow.Duplicates := dupIgnore;
     UseShadow.Sorted := True;
     CollectParamNames(Node, UseShadow);
+    CollectOwnerFieldNames(Node, Ctx, UseShadow);
   end;
 
   // Recurse into children first (bottom-up), replacing each in place if needed.
@@ -730,7 +801,15 @@ begin
         end;
       end;
     end;
-    if (Node.NodeType = antTypeDecl) and (Node.GetChild(i).NodeType = antIdentifier) then
+    // ⛔ ...AND A FIELD IS NOT ALWAYS AN antIdentifier. A member declared with the DIM shape arrives as
+    // an antArrayDecl, and this guard did not cover it: a namespace declaring "Type foo" with a field
+    // "bar" AND a "Type bar" beside it had foo's FIELD renamed to "NS.BAR", so foo had no field called
+    // BAR at all and "f.bar" read 0 - while "g.foo" on the mirror pair worked, which is what said the
+    // guard was keyed on the node's SHAPE and not on its meaning. fbc's dim/auto_var2 writes that
+    // cross-shadowed pair on purpose. Its children are still rewritten: a field declared "As UDT"
+    // inside a namespace means "NS.UDT".
+    if (Node.NodeType = antTypeDecl) and
+       (Node.GetChild(i).NodeType in [antIdentifier, antArrayDecl]) then
     begin
       FieldNd := Node.GetChild(i);
       for k := 0 to FieldNd.ChildCount - 1 do
@@ -1101,6 +1180,7 @@ begin
         if (AST.GetChild(gi).NodeType = antTypeDecl) and (VarToStr(AST.GetChild(gi).Value) <> '') then
           Ctx.GlobalTypeNames.Add(UpperCase(VarToStr(AST.GetChild(gi).Value)));
       end;
+    CollectTypeFieldNames(AST, Ctx);
     RewriteRefs(AST, '', nil, Ctx, nil);
     HoistNamespaces(AST);
   finally
