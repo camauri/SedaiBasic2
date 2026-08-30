@@ -34605,7 +34605,15 @@ var
            (Decl.GetChild(0).NodeType = antIdentifier) and (Decl.GetChild(1).NodeType = antIdentifier) then
         begin
           VNameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
-          TypeNameU := UpperCase(VarToStr(Decl.GetChild(1).Value));
+          // ⛔ THE ALIAS IS EXPANDED FIRST, and the depth is what it costs. "Type y As z Ptr" then
+          // "Dim f3 As y Ptr Ptr" is THREE levels; taken raw, one ' PTR' comes off and the pointee is
+          // recorded as "Y PTR" - a name the next level strips to "Y", which is not a pointer at all,
+          // so the chain died at the third dereference with "Null or invalid pointer dereference".
+          // ⚠️ The same program at MODULE level was right, and SizeOf was right at every level inside
+          // the procedure too: only this registry kept the unexpanded spelling. CanonicalType is the
+          // one funnel that counts the stars off, resolves the base and puts them back - and it knows
+          // the function-pointer alias whose underlying name is a lie. DIVERGENZE 128.
+          TypeNameU := UpperCase(CanonicalType(UpperCase(VarToStr(Decl.GetChild(1).Value))));
           if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
             FCurrentProcPtrLocals.Values[VNameU] := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4));
         end;
