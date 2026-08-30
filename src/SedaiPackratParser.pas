@@ -4171,15 +4171,30 @@ function WithObjectNeedsTemp(Node: TASTNode): Boolean;
 // object once, at WITH, and the temporary dies at END WITH (fbc suite compound/with-type).
 // An LVALUE is left alone on purpose: cloning it costs nothing, and materialising it into a variable
 // would COPY the record, so ".field = 9" would stop reaching the original.
-// ⚠️ A CALL WRITTEN "f( x )" PARSES AS AN ARRAY ACCESS and is indistinguishable from an element here -
-// the parser keeps no list of declared procedures - so that spelling still repeats. Declared as
-// DIVERGENZE 100; the split belongs where the two are told apart, which is the SSA.
+// ⭐ AND ONE SIGN TELLS A CALL FROM AN ELEMENT WITH CERTAINTY: EMPTY PARENTHESES. "With mk( )" parses
+// as an antArrayAccess with an empty index list, and an array element access always carries at least
+// one index - so that shape is a call and nothing else. It is what closes "With mk( )" calling mk twice.
+//
+// ⛔⛔ AND THE OTHER SIGN - "the name is in the parser's procedure list" - WAS TRIED AND MEASURED AND
+// WITHDRAWN (31 Aug). It is a correct test (a name cannot be a procedure and an array at once), and it
+// makes things WORSE, because the cure is not free: materialising the object into a hidden "Var tmp ="
+// CONSTRUCTS A COPY, and fbc binds the temporary itself. fbc's own compound/with.bas counts the
+// constructors and destructors around "with f( 123 )" to the unit, and the extra pair took it from 36
+// failing assertions to 63 (structs/temp-var-dtors +3 beside it). ⇒ A call WITH ARGUMENTS still
+// evaluates once per dot; that residue stays DIVERGENZE 100, and closing it wants a temporary the WITH
+// BINDS rather than copies - which is the SSA's question, not the parser's.
+//
+// ⛔ An LVALUE is left alone on purpose, and an array ELEMENT is one: materialising it would COPY the
+// record and ".field = 9" would stop reaching the original - the shape the fbc suite uses everywhere
+// ("fbcu_suites(i)", "bar(0)"). That is why the sign may not be relaxed to "it has parentheses".
 begin
   Result := True;
   if Node = nil then Exit(False);
   case Node.NodeType of
     antIdentifier, antMemberAccess, antDeref: Result := False;
-    antArrayAccess: Result := (Node.Attributes.Values['TYPECTOR'] = '1');
+    antArrayAccess:
+      Result := (Node.Attributes.Values['TYPECTOR'] = '1') or
+                ((Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 0));
     antParentheses: if Node.ChildCount >= 1 then Result := WithObjectNeedsTemp(Node.GetChild(0));
   end;
 end;
