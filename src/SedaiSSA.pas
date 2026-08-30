@@ -687,6 +687,8 @@ type
     procedure EmitSharedArrayAllocs(Node: TASTNode);      // ...and DIM the module arrays whose bounds are constant
     function DimBoundsAreConstant(DimsNode: TASTNode): Boolean;  // every subscript written as a literal
     function AnyHoistedDim(DimNode: TASTNode): Boolean;          // ...this antDim holds one such declaration
+    // The TYPE a static-member access names - written directly, through an instance, or through an ALIAS.
+    function StaticMemberOwnerType(ObjNode: TASTNode): string;
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     function StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;    // ...the ARRAY backing, or ''
     function StaticMemberAddrName(MemberNode: TASTNode): string;   // the name "@<static member>" resolves to, or ''
@@ -31733,9 +31735,14 @@ begin
   T := UpperCase(TypeName);
   // ⭐ ...AND THE NAME MAY BE AN ALIAS OF THE TYPE. "Type foo As bar" makes "foo.MYCONST" the same
   // constant as "bar.MYCONST" - fbc's const/typedef writes exactly that, forward-declared. Asked
-  // through CanonicalType, the funnel every other reader of an alias uses, and only when the written
-  // name is not itself a type. The same line is in TypeScopedConstAccess, which does the second half.
-  if FindUDT(T) < 0 then T := UpperCase(CanonicalType(T));
+  // through CanonicalType, the funnel every other reader of an alias uses.
+  // ⛔⛔ IT USED TO READ "if FindUDT(T) < 0 then ...", AND THAT GUARD IS DEAD: FindUDT CANONICALISES
+  // ITSELF, so an alias of a real type answers >= 0 and the line never ran. The walk then tested
+  // "FOO.MYCONST", found nothing, asked FindUDT('FOO') - which answered BAR's index - and stepped to
+  // BAR's PARENT, skipping BAR entirely: "foo.val2" answered zero while "bar.val2" answered 2. A
+  // guard written against a helper that already does the same resolution reads as a rule and is
+  // none - m711 added this line and it has never once been taken. DIVERGENZE 90.
+  T := UpperCase(CanonicalType(T));
   Guard := 0;
   while (T <> '') and (Guard < 64) do
   begin
@@ -31996,7 +32003,7 @@ var
   Idx, Guard: Integer;
 begin
   T := UpperCase(TypeName);
-  if FindUDT(T) < 0 then T := UpperCase(CanonicalType(T));   // ...through an ALIAS, as the owner test does
+  T := UpperCase(CanonicalType(T));   // ...through an ALIAS, unconditionally: see TypeEnumMemberOwner
   Guard := 0;
   while (T <> '') and (Guard < 64) and (FTypeConstMembers <> nil) do
   begin
@@ -32329,6 +32336,28 @@ begin
   end;
 end;
 
+function TSSAGenerator.StaticMemberOwnerType(ObjNode: TASTNode): string;
+// The TYPE whose static members "ObjNode.<something>" names: the type name written directly, the
+// declared type of an instance, or - and this is the half that was missing - the type an ALIAS stands
+// for. ⭐ ONE funnel, because StaticMemberBackingName and StaticMemberArrayName asked it in two
+// identical copies and a rule added to either would have lived in one of them.
+//
+// ⛔ "Type foo As bar" makes "foo.val2" the same entity as "bar.val2". TypeEnumMemberOwner and
+// TypeScopedConstAccess have canonicalised the alias since m711; this pair never did, so a CONST
+// declared inside a TYPE - which is backed by a static member's shared scalar - answered 2 through
+// "bar" and ZERO through "foo": the alias fell past the static arm, reached the type-scoped path, and
+// was handed the BARE member name, which nothing declares. DIVERGENZE 90.
+// The alias is asked LAST, only when nothing else answered, so no existing resolution moves.
+begin
+  Result := '';
+  if ObjNode = nil then Exit;
+  if (ObjNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
+    // ⛔ CANONICALISED, not taken as written: a static member is registered under the name of the type
+    // that DECLARES it, so an alias asking with its own spelling looks up a key nobody wrote.
+    Exit(UpperCase(CanonicalType(UpperCase(VarToStr(ObjNode.Value)))));   // TypeName.field (no instance)
+  Result := ObjectTypeName(ObjNode);             // instance.field
+end;
+
 function TSSAGenerator.StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;
 // If ObjNode.FieldName is a static member (accessed via the type name OR via an instance), return the
 // backing shared-scalar name "DECLTYPE.FIELD" (walking the inheritance chain); otherwise ''.
@@ -32338,10 +32367,7 @@ var
 begin
   Result := '';
   if ObjNode = nil then Exit;
-  if (ObjNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
-    at := UpperCase(VarToStr(ObjNode.Value))     // TypeName.field (no instance)
-  else
-    at := ObjectTypeName(ObjNode);               // instance.field
+  at := StaticMemberOwnerType(ObjNode);
   if at = '' then Exit;
   t := at;
   while t <> '' do
@@ -32395,10 +32421,7 @@ var
 begin
   Result := '';
   if (ObjNode = nil) or (FStaticMemberArrays = nil) or (FStaticMemberArrays.Count = 0) then Exit;
-  if (ObjNode.NodeType = antIdentifier) and (FindUDT(UpperCase(VarToStr(ObjNode.Value))) >= 0) then
-    at := UpperCase(VarToStr(ObjNode.Value))     // TypeName.field (no instance)
-  else
-    at := ObjectTypeName(ObjNode);               // instance.field
+  at := StaticMemberOwnerType(ObjNode);
   if at = '' then Exit;
   t := at;
   while t <> '' do
