@@ -28992,6 +28992,12 @@ begin
           // ⭐ And then the DECLARED TYPE, with the bank only as the fallback: asking the bank alone is
           // three answers for ten types.
           TypeName := DeclaredTypeNameOf(TypeOfOperand);
+          // ⭐ ...and then the UDT the expression NAMES, which DeclaredTypeNameOf cannot answer for an
+          // anonymous "T( )" temporary or an IIF over two of them. Without it the bank fallback below
+          // said INTEGER and "Dim x As TypeOf( C( ) )" declared x an INTEGER: its constructor never
+          // ran, so fbc counts one construction there and we counted NONE - and x was not a C at all.
+          // ObjectTypeName is the no-emit query, so nothing is evaluated to ask. DIVERGENZE 104.
+          if TypeName = '' then TypeName := ObjectTypeName(TypeOfOperand);
           if TypeName = '' then
             case InferExprBank(TypeOfOperand) of
               srtString: TypeName := 'STRING';
