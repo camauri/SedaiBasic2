@@ -1031,6 +1031,8 @@ type
     function DerefOfAddrOfTarget(Node: TASTNode): TASTNode;  // "*@x" names x: the inner lvalue, or nil
     function OverloadsAddressOf(Node: TASTNode): Boolean;   // ...unless the type declares "Operator @"
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
+    function SolePtrCastLabel(const TypeName: string): string;        // the ONE pointer-returning cast, or ''
+    function TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
     function UDTStringCastIsWide(Node: TASTNode): Boolean;  // ...and does that Cast return a WSTRING?
@@ -1038,6 +1040,8 @@ type
     // "Operator Cast() As <another UDT>": run it and hand back the RESULT's record handle.
     function TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string; out Val: TSSAValue): Boolean;
     function UDTCastsToUDT(const SrcType, DstType: string): Boolean;   // ...asked without emitting
+    function ProcRetTypeName(const Lbl: string): string;   // the type a procedure was DECLARED to return
+    function CalleeRetTypeName(Node: TASTNode): string;    // ...of the CALL this node is (function or method)
     function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
@@ -2979,16 +2983,24 @@ begin
           Exit;
         end;
       end;
-      // ⛔ A POINTER TARGET IS LEFT A REINTERPRETATION HERE, AND THE ATTEMPT IS WRITTEN DOWN.
-      // "Cast(Integer Ptr, u)" over a UDT declaring "Operator Cast() As Integer Ptr" ought to run that
-      // operator, exactly as the implicit "Dim q As Integer Ptr = bar" already does. Routing it through
-      // TryEmitUDTCastToNumber was TRIED on 26 Aug 2026 and WITHDRAWN: a cast operator's label carries
-      // only its return BANK ('%' int, '#' float, '$' string), and an "Integer Ptr" and a "Double Ptr"
-      // are BOTH int-banked - so the two operators of that very test collide on one label, the second
-      // registration wins, and the explicit cast then answered 4662966031284069990, the bit pattern of
-      // the OTHER operator's Double. A wrong answer where there had been an error. The information is
-      // gone by the time this code runs; the fix is to key the label by the return TYPE for a pointer
-      // return, in PreCollectProcedures, and that is a change to the label scheme. DIVERGENZE 58.
+      // ⭐ A POINTER TARGET GOES THROUGH THE CAST OPERATOR TOO, once the label can tell two of them
+      // apart. "Cast(Integer Ptr, u)" over a UDT declaring "Operator Cast() As Integer Ptr" runs that
+      // operator, exactly as the implicit "Dim q As Integer Ptr = bar" already did - and the TARGET
+      // type is what chooses when the type declares several. DIVERGENZE 58, closed.
+      if FModernMode and (Length(ArrName2) >= 4) and
+         (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR') and
+         TryEmitUDTCastToPtr(Node.GetChild(0), ArrName2, Left) then
+      begin
+        Result := EnsureIntRegister(Left);
+        Exit;
+      end;
+      // ⛔ THE HISTORY, kept because it names why the label carries the return TYPE for a pointer.
+      // Routing it through TryEmitUDTCastToNumber was TRIED on 26 Aug 2026 and WITHDRAWN: a cast
+      // operator's label carried only its return BANK ('%' int, '#' float, '$' string), and an
+      // "Integer Ptr" and a "Double Ptr" are BOTH int-banked - so the two operators of fbc's own
+      // overload/op_to_ptr collided on one label, the second registration won, and the explicit cast
+      // answered 4662966031284069990, the bit pattern of the OTHER operator's Double. The cure named
+      // there is the one now in place: CastReturnCode gives a POINTER return its whole type.
       // ⛔ ...AND A BARE TYPE NAME AS THE OPERAND IS A DEFAULT-CONSTRUCTED TEMPORARY. "Cast(P, P)" is
       // FreeBASIC for "a default P, seen as a P"; lowered as an expression the second P was an
       // undefined VARIABLE, which reads 0, and the receiving DIM then dereferenced handle 0 - an access
@@ -9254,6 +9266,18 @@ begin
   // the value and stored 0: "Dim As Double d = myRational" silently produced 0 while "d = r + 0.0" (the
   // arithmetic path) gave the right value. (A type declaring BOTH an int and a float cast still prefers the
   // int one here -- the overload-by-return-type case is a separate, rarer gap, already noted on the helper.)
+  // ⭐ ...and a POINTER destination chooses the cast operator by its OWN declared type, which is the
+  // only thing that can tell an "Integer Ptr" cast from a "Double Ptr" one. Asked before the numeric
+  // one, which knows nothing of the destination. DIVERGENZE 58.
+  if (VarRecordTypeName(VarName) = '') and (GetVariableType(VarName) = srtInt) and
+     (ObjectTypeName(ExprNode) <> '') and (ManagedPtrPointee(VarName) <> '') and
+     TryEmitUDTCastToPtr(ExprNode, ManagedPtrPointee(VarName) + ' PTR', ExprValue) then
+  begin
+    VarReg := GetOrAllocateVariable(VarName);
+    EmitInstruction(ssaCopyInt, VarReg, EnsureIntRegister(ExprValue),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if (VarRecordTypeName(VarName) = '') and (GetVariableType(VarName) in [srtInt, srtFloat]) and
      (ObjectTypeName(ExprNode) <> '') and TryEmitUDTCastToNumber(ExprNode, ExprValue) then
   begin
@@ -36648,6 +36672,16 @@ begin
       end;
     end;
   end
+  else if (Node.NodeType = antArrayAccess) and (CalleeRetTypeName(Node) <> '') then
+  begin
+    // ⭐ A CALL whose declared return type is a pointer: "*f( )" reads what f returned, at the
+    // POINTEE's width and bank. Asked before the array arm below, which is the other reading of an
+    // antArrayAccess - and asked as a QUESTION about the declaration, so a call that returns no
+    // pointer answers '' and nothing changes. See CalleeRetTypeName.
+    T := CalleeRetTypeName(Node);
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Result := Trim(Copy(T, 1, Length(T) - 4));
+  end
   else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
           (Node.GetChild(0).NodeType = antIdentifier) then
   begin
@@ -38939,15 +38973,107 @@ begin
 end;
 
 function TSSAGenerator.CastReturnCode(const RetTypeName: string): string;
-// The one-character suffix that encodes an OPERATOR CAST's return bank in its label (see the
-// re-encoding in PreCollectProcedures): '$' string, '#' float, '%' int.
+// The suffix that encodes an OPERATOR CAST's return type in its label (see the re-encoding in
+// PreCollectProcedures): '$' string, '#' float, '%' int.
+//
+// ⛔⛔ A POINTER RETURN CARRIES THE WHOLE TYPE, NOT JUST THE BANK, and that is the difference between
+// a wrong answer and a right one. An "Integer Ptr" and a "Double Ptr" are BOTH int-banked, so a type
+// declaring both cast operators - fbc's own overload/op_to_ptr does - collided on ONE label: the
+// second registration won and "Cast(Integer Ptr, u)" answered the bit pattern of the OTHER operator's
+// Double. The parameters cannot tell two casts apart (they share only THIS), so the return type is
+// the only thing that can. DIVERGENZE 58.
+// ⚠️ The space is replaced because a label is compared and concatenated everywhere, and the '%' stays
+// LAST so every reader that takes the bank off the classic suffix still answers INT.
+var
+  T: string;
 begin
+  T := UpperCase(RetTypeName);
+  // ⛔⛔ AND THE BANK SIGIL STAYS LAST. The return bank of a procedure is read off the LABEL's classic
+  // suffix when the pre-scan's entry is missing - and the pre-scan files a cast under the label BEFORE
+  // this suffix is appended, so the sigil is all that is left. Written '%*TYPE' the label ended in 'R',
+  // the fallback answered the FLOAT default, and the callee staged the ADDRESS through a Double: the
+  // caller got a pointer 128 bytes off, and the deref read -nan. The type goes in the MIDDLE.
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+    Exit('*' + StringReplace(T, ' ', '_', [rfReplaceAll]) + '%');
   case TypeNameToBank(RetTypeName, '') of
     srtString: Result := '$';
     srtFloat:  Result := '#';
   else
     Result := '%';
   end;
+end;
+
+function TSSAGenerator.SolePtrCastLabel(const TypeName: string): string;
+// The label of the type's ONLY pointer-returning cast operator, or '' when it has none or several.
+// ⚠️ "Several" answers '' on purpose: with two, the choice belongs to the DESTINATION type and a
+// caller that has no destination in hand must not guess - a guess turns a refusal into a wrong answer,
+// which is exactly what the collided label used to do. Walks the inheritance chain like every other
+// method lookup.
+var
+  T, Pref: string;
+  i, Idx, Guard, Found: Integer;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Pref := T + '.OPERATORCAST*';
+    Found := 0;
+    for i := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[i], 1, Length(Pref)) = Pref then
+      begin
+        Inc(Found);
+        Result := FProcedureNames[i];
+      end;
+    if Found = 1 then Exit;
+    if Found > 1 then Exit('');
+    Result := '';
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string;
+  out Val: TSSAValue): Boolean;
+// FreeBASIC "Operator T.Cast() As <something> Ptr": if Node is a UDT of type T declaring one, invoke it
+// and hand back the address it returns.
+//
+// ⭐ WantedType is the DESTINATION's declared pointer type and it is what CHOOSES the operator when the
+// type declares more than one - "Integer Ptr" and "Double Ptr" are both int-banked, so nothing else
+// can tell them apart. With no destination in hand ('') only a SOLE pointer cast is taken. DIVERGENZE 58.
+var
+  TypeName, MethNm, Lbl: string;
+begin
+  Result := False;
+  Val := MakeSSAValue(svkNone);
+  if (not FModernMode) or (Node = nil) then Exit;
+  TypeName := ObjectTypeName(Node);
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  MethNm := '';
+  if (Length(WantedType) >= 4) and
+     (Copy(UpperCase(WantedType), Length(WantedType) - 3, 4) = ' PTR') then
+  begin
+    MethNm := 'OPERATORCAST' + CastReturnCode(WantedType);
+    if ResolveMethodLabel(TypeName, MethNm) = '' then MethNm := '';
+  end;
+  if MethNm = '' then
+  begin
+    Lbl := SolePtrCastLabel(TypeName);
+    if Lbl = '' then Exit;
+    MethNm := Copy(Lbl, Pos('.', Lbl) + 1, MaxInt);
+    // the label is "<OWNER>.OPERATORCAST*...%"; a nested owner keeps dots, so take the LAST one
+    while Pos('.', MethNm) > 0 do MethNm := Copy(MethNm, Pos('.', MethNm) + 1, MaxInt);
+  end;
+  // ⛔ NOT WantAddress. A cast operator returning a POINTER hands back a VALUE - the address it
+  // computed - not an lvalue whose address the caller wants. Asked for the address, the "Double Ptr"
+  // one answered -nan while the "Integer Ptr" one happened to survive: the flag is for a BYREF result,
+  // and this is not one.
+  ProcessMethodCall(Node, TypeName, MethNm, nil, Val, False, False);
+  Result := (Val.Kind <> svkNone);
+  if Result then Val := EnsureIntRegister(Val);
 end;
 
 function TSSAGenerator.TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;
@@ -38972,12 +39098,60 @@ begin
   else
   begin
     Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST#');
-    if Lbl = '' then Exit;
+    if Lbl = '' then
+      // ⭐ ...and a POINTER-returning cast is a numeric value here too - an address. It no longer
+      // answers to the bare '%' label (see CastReturnCode), so every context that has no destination
+      // to choose with asks for the SOLE one. With several, this declines, which is the honest answer.
+      Exit(TryEmitUDTCastToPtr(Node, '', Val));
     ProcessMethodCall(Node, TypeName, 'OPERATORCAST#', nil, Val);
   end;
   // A cast declared BYREF hands back an ADDRESS - that is what makes "Cast(Integer, u) = 78" possible -
   // so READING through it has to dereference. ProcessMethodCall does that for every rvalue now.
   Result := (Val.Kind <> svkNone);
+end;
+
+function TSSAGenerator.ProcRetTypeName(const Lbl: string): string;
+// The type a procedure was DECLARED to return, read off its own declaration node - the same place
+// PreCollectProcedures reads it for a BYREF result. '' when the label names nothing, or a SUB.
+var
+  Decl, NameNode: TASTNode;
+begin
+  Result := '';
+  if (Lbl = '') or not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 1) then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.ChildCount < 1) then Exit;
+  if NameNode.GetChild(0).NodeType <> antIdentifier then Exit;
+  Result := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+end;
+
+function TSSAGenerator.CalleeRetTypeName(Node: TASTNode): string;
+// The declared return type of the CALL this node is, function or method. '' when it is not a call.
+// ⛔ It exists because DerefedType had an arm for every pointer SHAPE except a call: "*f( )" where f
+// returns "Double Ptr" fell to the generic scalar load and read the pointee with the INT bank, so it
+// printed 4662966031284069990 - the bit pattern of the double - where fbc prints 5678.9. The same
+// expression through a variable ("Dim p As Double Ptr = f( ) : *p") was right, which is the tell for
+// a rule one path has and its sibling does not.
+var
+  Nm, OwnerT: string;
+  Callee: TASTNode;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 1) then Exit;
+  Callee := Node.GetChild(0);
+  if Callee = nil then Exit;
+  if Callee.NodeType = antIdentifier then
+  begin
+    Nm := UpperCase(VarToStr(Callee.Value));
+    if ArrayIndexOf(Nm) >= 0 then Exit;         // an array access, not a call
+    Result := ProcRetTypeName(Nm);
+  end
+  else if (Callee.NodeType = antMemberAccess) and (Callee.ChildCount >= 1) then
+  begin
+    OwnerT := ObjectTypeName(Callee.GetChild(0));
+    if OwnerT = '' then Exit;
+    Result := ProcRetTypeName(ResolveMethodLabel(OwnerT, UpperCase(VarToStr(Callee.Value))));
+  end;
 end;
 
 function TSSAGenerator.CastRetRecType(const Lbl: string): string;
@@ -38988,9 +39162,15 @@ function TSSAGenerator.CastRetRecType(const Lbl: string): string;
 // like it had no return type at all. (Same shape as the note on CONSTRUCTOR labels in
 // PreCollectProcedures: re-encoding a label after the pre-scans keys their entries under a name
 // nobody looks up.)
+// ⛔ ...and the suffix is not always ONE character: a POINTER return carries its whole type
+// ('*INTEGER_PTR%'), so the undo cuts at the '*' that starts it when there is one. Written the day that
+// suffix appeared, because "strip one char" would otherwise answer for a label nobody has.
 begin
   Result := VarRecordTypeName(Lbl);
-  if (Result = '') and (Lbl <> '') then
+  if (Result <> '') or (Lbl = '') then Exit;
+  if Pos('.OPERATORCAST*', Lbl) > 0 then
+    Result := VarRecordTypeName(Copy(Lbl, 1, Pos('.OPERATORCAST*', Lbl) + Length('.OPERATORCAST') - 1))
+  else
     Result := VarRecordTypeName(Copy(Lbl, 1, Length(Lbl) - 1));
 end;
 
