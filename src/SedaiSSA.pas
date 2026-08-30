@@ -2515,6 +2515,7 @@ var
   TempStr: string;
   ValCode: Integer;
   ConvW: Integer;   // B1.5: integer-narrowing width code for a Cxxx conversion (0 = full width)
+  CastArgDone: Boolean;  // the Cxxx operand came from the UDT's "Operator Cast() As String"
   SelImm: Integer;  // date/time function selector encoded in the opcode Immediate
   FieldSzConst: Int64;   // LEN/SIZEOF of a UDT field: compile-time byte size
   NarrowReg: TSSAValue;
@@ -5847,11 +5848,26 @@ begin
             if Result.Kind = svkNone then Result := EnsureIntRegister(ArgValue);
             Exit;
           end;
-          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
-          else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
-            ProcessExpression(ArgListNode, ArgValue)
-          else begin Result := MakeSSAValue(svkNone); Exit; end;
+          // ⭐ ...AND A CAST TO A *STRING* IS A CONVERSION TOO, asked second so a numeric Cast still
+          // wins where a type declares both. A type whose Cast returns a STRING (fbc's own suite builds
+          // one over a "WString * n" buffer, in udt-wstring/ and udt-zstring/) reached the ordinary
+          // expression path, which hands back the record HANDLE: "CByte( u )" on an object rendering
+          // "-128" answered the handle's small integer. The string branch further down already parses a
+          // string operand - "CInt("-128")" has always answered -128 - so all that was missing was
+          // producing the string.
+          CastArgDone := False;
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and HasUDTStringCast(ArgListNode.GetChild(0)) and
+             TryEmitUDTCastToString(ArgListNode.GetChild(0), ArgValue) then
+            CastArgDone := True;
+          if not CastArgDone then
+          begin
+            if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+              ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
+              ProcessExpression(ArgListNode, ArgValue)
+            else begin Result := MakeSSAValue(svkNone); Exit; end;
+          end;
 
           // Width code for the narrowing: signed/unsigned 8/16/32-bit; 0 = full 64-bit (CINT/CUINT/CLNGINT).
           if FuncName = 'CBYTE' then ConvW := 1
@@ -5904,8 +5920,26 @@ begin
             else
               EmitInstruction(ssaFloatRound, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end
+          // ⛔ A STRING OPERAND IS PARSED AS AN INTEGER, NOT CONVERTED THROUGH A DOUBLE. It used to
+          // reach EnsureIntRegister, which renders a string through VAL - a float - and that is a
+          // different function, measured against fbc 1.10.1 in three separate ways:
+          //     CInt("3.7")                    fbc 3 (it stops at the '.'), we answered 4 (rounded)
+          //     CInt("1e3")                    fbc 1 (it stops at the 'e'), we answered 1000
+          //     CInt("9223372036854775807")    fbc the number, we answered its NEGATIVE - 2^63-1 has
+          //                                    no exact double, so the round trip lands on -2^63
+          // ...and CULngInt("18446744073709551615") answered 9223372036854775808, the saturated
+          // double. ssaStrValInt is the parser ValLng already uses (Src3 empty = the full 64 bits);
+          // the narrowing below then applies to ITS result, which is where CByte("300") = 44 comes
+          // from and that half was right all along.
+          else if (ArgValue.Kind = svkConstString) or
+                  ((ArgValue.Kind = svkRegister) and (ArgValue.RegType = srtString)) then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaStrValInt, Result, EnsureStringRegister(ArgValue),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end
           else
-            // Already an integer value (register or string-coerced) - pass through.
+            // Already an integer value - pass through.
             Result := EnsureIntRegister(ArgValue);
 
           // Narrow to the declared width: fold constants, else emit bcNarrowInt.
@@ -5945,11 +5979,21 @@ begin
             end;
             Exit;
           end;
-          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessExpression(ArgListNode.GetChild(0), ArgValue)
-          else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
-            ProcessExpression(ArgListNode, ArgValue)
-          else begin Result := MakeSSAValue(svkNone); Exit; end;
+          // ...and the STRING cast, exactly as for the integer family above: the branch below already
+          // parses a string operand with VAL semantics, so producing the string is the whole fix.
+          CastArgDone := False;
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and
+             (ArgListNode.ChildCount >= 1) and HasUDTStringCast(ArgListNode.GetChild(0)) and
+             TryEmitUDTCastToString(ArgListNode.GetChild(0), ArgValue) then
+            CastArgDone := True;
+          if not CastArgDone then
+          begin
+            if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+              ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
+              ProcessExpression(ArgListNode, ArgValue)
+            else begin Result := MakeSSAValue(svkNone); Exit; end;
+          end;
 
           if ArgValue.Kind = svkConstInt then
             Result := MakeSSAConstFloat(ArgValue.ConstInt)
@@ -13211,9 +13255,21 @@ begin
     // "true"/"TrUe" -> true, "false"/"abc" -> false, "2"/"-1"/"0.5" -> true, and " true " -> FALSE,
     // because nothing is trimmed. We converted the string REGISTER to an int, which is not a number
     // at all: every string answered false except the ones VAL happened to like.
-    if (ArgsNode.ChildCount >= 1) and (InferExprBank(ArgsNode.GetChild(0)) = srtString) then
+    // ⭐ ...AND A UDT WHOSE Cast RETURNS A STRING IS A STRING HERE. Asked beside the bank test and not
+    // instead of it: InferExprBank sees the record HANDLE, so such an object took the numeric arm at
+    // the bottom and compared the handle against zero - always true, whatever word the object renders.
+    // fbc's udt-wstring/conversion and udt-zstring/conversion assert exactly "CBool(u) = false" on an
+    // object rendering "false".
+    if (ArgsNode.ChildCount >= 1) and
+       ((InferExprBank(ArgsNode.GetChild(0)) = srtString) or HasUDTStringCast(ArgsNode.GetChild(0))) then
     begin
-      ProcessStringExpression(ArgsNode.GetChild(0), V0);
+      if HasUDTStringCast(ArgsNode.GetChild(0)) then
+      begin
+        if not TryEmitUDTCastToString(ArgsNode.GetChild(0), V0) then
+          ProcessStringExpression(ArgsNode.GetChild(0), V0);
+      end
+      else
+        ProcessStringExpression(ArgsNode.GetChild(0), V0);
       SArg := EnsureStringRegister(V0);
       SLow := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
       EmitInstruction(ssaStrLCase, SLow, SArg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
