@@ -339,6 +339,16 @@ type
                                          // Collected before the @-taken pass so STRPTR/SADD of one can be
                                          // treated as the address-taking it is - see CollectFixedStrNames.
     FVarDeclTypeName: TStringList;       // every DIM/VAR'd scalar: name (UPPER) -> the type NAME it was declared as
+    // ⭐ ...AND THE SAME FACT WITH A LEXICAL SCOPE, kept only while the declaration pre-scan is walking.
+    // FVarDeclTypeName is flat and keyed on the bare name, and the pre-scan's rule is "a module-level
+    // declaration owns it, anything inside a procedure only adds if absent" - so the FIRST of several
+    // same-named declarations in a procedure wins for all of them. That is what "Dim y As TypeOf(x)"
+    // reads, and two sibling Scopes each declaring x with its own type gave y the OTHER one's.
+    // A stack of frames, pushed and popped along the walk, in source order: the innermost declaration
+    // seen SO FAR wins, which is what lexical scope means. Empty outside the pre-scan, so every other
+    // caller of DeclaredTypeNameOf reads exactly as it did.
+    FLexVarTypes: TStringList;           // "NAME=TYPENAME", used as a stack
+    FLexVarFrames: array of Integer;     // where each open frame starts in FLexVarTypes
                                          // ⛔ FVarExplicitType beside it holds only the BANK - three answers for ten
                                          // types - and DeclaredTypeNameOf fell back to it, so "Dim s As Short" answered
                                          // INTEGER and "Dim As TypeOf(s) w" gave w eight bytes instead of two. The name
@@ -572,7 +582,9 @@ type
     function BlockRecordTypeOf(const Name: string; out Declared: Boolean): string;
     function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
     function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
-    function BlockScalarName(const Name: string): string;    // the innermost OPEN block that declared this @-taken SCALAR, or ''
+    function BlockScalarName(const Name: string): string;
+    function NameIsPointerHere(const Name: string): Boolean;   // ...and is it a POINTER in this scope?
+    function NameIsStringHere(const Name: string): Boolean;    // ...and is it a STRING in this scope?    // the innermost OPEN block that declared this @-taken SCALAR, or ''
     procedure NoteArrayShape(const SlotName: string; Dynamic: Boolean);     // this SLOT is dynamic / fixed
     function ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
@@ -635,6 +647,9 @@ type
     function PreProcPtrSigOf(Node: TASTNode): string;   // "ProcPtr(f[,sig])"/"@f" -> f's "FPPARAMS|FPRET", '' if none
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
+    procedure PushLexFrame;                                       // declaration pre-scan: open a lexical frame
+    procedure PopLexFrame;
+    function LexDeclaredTypeName(const NameU: string): string;    // innermost declaration of that name, or ''
     function VarRecordTypeName(const VarName: string): string;
     // The EXACT copy-constructor label (both spellings), and "is this initialiser a copy of the
     // very type being declared?" - the pair DIVERGENZE 104 turns on.
@@ -928,6 +943,7 @@ type
     procedure SetPrintKindScoped(const ProcName, VarName, TypeName: string);
     // ...and its declared narrowing width, same key shape (a PARAMETER's, so a store to it wraps).
     procedure SetVarWidthScoped(const ProcName, VarName, TypeName: string);
+    procedure SetVarWidthUnderKey(const Key, TypeName: string);   // ...under a block's own mangled key
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
@@ -1544,6 +1560,9 @@ begin
   FFixedStrNames.CaseSensitive := False;
   FVarDeclTypeName := TStringList.Create;
   FVarDeclTypeName.CaseSensitive := False;
+  FLexVarTypes := TStringList.Create;
+  FLexVarTypes.CaseSensitive := False;
+  SetLength(FLexVarFrames, 0);
   FPointerVars := TStringList.Create;
   FAddrTakenScalars := TStringList.Create;
   FAddrTakenScalars.CaseSensitive := False;
@@ -1689,6 +1708,7 @@ begin
   FVarEnumType.Free;
   FFixedStrNames.Free;
   FVarDeclTypeName.Free;
+  FLexVarTypes.Free;
   FPointerVars.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
@@ -7465,7 +7485,12 @@ begin
           if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
             // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (FConstStrBytes).
             Result := MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8))
-          else if (FPointerVars.IndexOfName(ArrName2) >= 0) or IsRawPtr(ArrName2) or
+          // ⛔ THE POINTER QUESTION UNDER THE BLOCK'S OWN KEY. FPointerVars answers by BARE NAME and
+          // this rung short-circuits the whole ladder, so ONE "Dim x As Any Ptr" in a sibling Scope
+          // made SizeOf(x) answer 8 in every other scope that declared x - twelve of them, in fbc's
+          // quirk/typeof. Where a block declared the name there is NO fallback to the flat entry: its
+          // absence means "this declaration is not a pointer", which is the answer.
+          else if NameIsPointerHere(ArrName2) or IsRawPtr(ArrName2) or
              ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
             Result := MakeSSAConstInt(8)
           // SIZEOF of a VARIABLE is the size of its declared type, not of the handle/slot holding it:
@@ -7490,9 +7515,8 @@ begin
           // carrying a width code) is DIVERGENZE 115 - it wants a type registry keyed per DECLARATION,
           // which is the class-B work REGISTRI.md names.
           else if (FindUDT(ArrName2) < 0) and IsDeclaredVariable(ArrName2) and
-                  (ArrayIndexOf(ArrName2) < 0) and (GetVariableType(ArrName2) = srtString) and
-                  (FPointerVars.IndexOfName(ArrName2) < 0) and
-                  (FVarWidthCode.IndexOf(ArrName2) < 0) and (FVarPrintKind.IndexOf(ArrName2) < 0) then
+                  (ArrayIndexOf(ArrName2) < 0) and NameIsStringHere(ArrName2) and
+                  (not NameIsPointerHere(ArrName2)) then
             Result := MakeSSAConstInt(TypeSizeBytes('STRING'))
           else
             Result := MakeSSAConstInt(TypeSizeBytes(ArrName2));
@@ -11374,6 +11398,23 @@ begin
         // scalar a block declares, marked or not - a block that declares "a" and records nothing else
         // about it must still answer "not raw, no capacity of mine" rather than borrow someone's.
         if FBlockDeclVars.IndexOf(BlkScalarKey) < 0 then FBlockDeclVars.Add(BlkScalarKey);
+        // ...and the DECLARED NARROW WIDTH is the block's too. FVarWidthCode answers by BARE NAME, and
+        // it is what SizeOf(v) reads through DeclaredScalarLenBytes - so thirteen sibling Scopes each
+        // declaring "x" with its own type (fbc's quirk/typeof is one macro expanded once per type)
+        // shared ONE width, and SizeOf(x) answered the same number in all of them. Recorded under the
+        // block's key with the same rule as the capacity above; only a NON-ZERO code is filed, because
+        // the reader's "no entry" already means the full 64-bit slot.
+        if TypeNameWidthCode(RecTypeName) <> 0 then
+          SetVarWidthUnderKey(BlkScalarKey, RecTypeName);
+        // ...and WHETHER IT IS A POINTER, for the same reason and with more force: FPointerVars is
+        // consulted FIRST by DeclaredScalarLenBytes and answers 8 outright, so ONE "Dim x As Any Ptr"
+        // in a later sibling Scope made SizeOf(x) answer 8 in every EARLIER scope that declared x as
+        // something narrow. Bisected on fbc's quirk/typeof: the file passed up to checkVar(double) and
+        // failed from checkVar(any ptr) on - and it was the FIRST assertion, 12 expansions above, that
+        // fell. A pointer is not a width, so it needs its own filing here.
+        if (Length(RecTypeName) >= 4) and (Copy(RecTypeName, Length(RecTypeName) - 3, 4) = ' PTR') and
+           (FPointerVars.IndexOfName(BlkScalarKey) < 0) then
+          FPointerVars.Add(BlkScalarKey + '=' + Trim(Copy(RecTypeName, 1, Length(RecTypeName) - 4)));
         // ...and the DECLARED CAPACITY of a fixed-length string is the block's too, by the same rule
         // CollectWStringVars applies per PROCEDURE: "ZString * n" / "WString * n" hold n-1 characters
         // plus the terminator, "String * n" holds n. Without this a "ZString * 10" in one Scope read
@@ -24829,7 +24870,7 @@ function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
 var
   Nm, Nm2: string;
   idx, Idx2: Integer;
-  ScopedReg: TSSAValue;   // this scope's binding for the name, when it has one
+  WKey: string;           // the key the WIDTH is filed under: a block's own, else the bare name
 begin
   Result := -1;
   if not FModernMode then Exit;
@@ -24884,19 +24925,23 @@ begin
     if TypeSizeBytes(Nm2) > 0 then Exit(TypeSizeBytes(Nm2));
   end;
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
-  if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
+  // ⛔ WHERE A BLOCK DECLARED THE NAME, EVERY REGISTRY BELOW IS ASKED UNDER *ITS* KEY AND NOTHING FALLS
+  // BACK TO THE FLAT ENTRY - that absence means "this declaration is not one of those", not "go and
+  // read another declaration's". All three of them answer by BARE NAME, and fbc's quirk/typeof is one
+  // macro expanded once per type, each expansion a Scope of its own declaring "x": one pointer
+  // expansion made SizeOf(x) answer 8 in the twelve scopes above it. Same walk, same rule, as
+  // ArrayFactKey applies to an array's element facts.
+  WKey := BlockScalarName(Nm);
+  if WKey = '' then WKey := Nm;
+  if NameIsPointerHere(Nm) then Exit(8);
   // ⛔ "IS THIS NAME A STRING" ASKED IN SCOPE, not flat. GetVariableType is one verdict per NAME, so two
   // sibling Scopes declaring "x" - one As Byte, one As String - gave the Byte one the String answer and
   // this bailed out of the numeric ladder below for BOTH. fbc's quirk/typeof is written exactly that
   // way: one macro expanded once per type, each expansion a Scope of its own declaring "x".
   // ResolveExisting walks the LIVE scope stack, so its register's bank is THIS declaration's bank; the
   // flat map answers only when the name resolves to nothing here (a name used before its DIM).
-  if ResolveExisting(Nm, ScopedReg) then
-  begin
-    if ScopedReg.RegType = srtString then Exit;
-  end
-  else if GetVariableType(Nm) = srtString then Exit;
-  idx := FVarWidthCode.IndexOf(Nm);
+  if NameIsStringHere(Nm) then Exit;
+  idx := FVarWidthCode.IndexOf(WKey);
   if idx >= 0 then
     case PtrInt(FVarWidthCode.Objects[idx]) of
       1, 2: Exit(1);       // Byte / UByte
@@ -24906,7 +24951,7 @@ begin
       7:    Exit(4);       // Single
       8:    Exit(8);       // UInteger / ULongInt - a full slot, as the fallthrough below also says
     end;
-  idx := FVarPrintKind.IndexOf(Nm);
+  idx := FVarPrintKind.IndexOf(WKey);
   if (idx >= 0) and (PtrInt(FVarPrintKind.Objects[idx]) = 1) then Exit(1);   // Boolean
   // DEFtype fallback: a suffix-less name whose initial carries a DEFLNG/DEFSNG/... default is
   // that type's size (DefLng x -> 4). Keyed on the def-letter table alone: an explicit
@@ -25003,6 +25048,20 @@ begin
     FVarPrintKind.Objects[Idx] := TObject(PtrInt(PK))
   else
     FVarPrintKind.AddObject(Key, TObject(PtrInt(PK)));
+end;
+
+procedure TSSAGenerator.SetVarWidthUnderKey(const Key, TypeName: string);
+// File a declared narrowing width under an ALREADY-BUILT key - a block's mangled scalar name, as
+// BlockScalarName resolves it. SetVarWidthScoped builds a "PROC|NAME" key for a parameter; a BLOCK
+// needs its own serial in the key, and that mangling belongs to the caller.
+var
+  Idx: Integer;
+begin
+  Idx := FVarWidthCode.IndexOf(Key);
+  if Idx >= 0 then
+    FVarWidthCode.Objects[Idx] := TObject(PtrInt(TypeNameWidthCode(TypeName)))
+  else
+    FVarWidthCode.AddObject(Key, TObject(PtrInt(TypeNameWidthCode(TypeName))));
 end;
 
 procedure TSSAGenerator.SetVarWidthScoped(const ProcName, VarName, TypeName: string);
@@ -29618,17 +29677,58 @@ begin
     // "Dim x3 As c = @x1" was lowered as the address of a PROCEDURE: "Undefined procedure
     // (address-of @): X1". A registry WRITTEN scoped and READ flat is the whole failure mode.
     SavedTypePath := PushTypeScope(Node);
+    PushLexFrame;                       // a procedure's locals die with it
     for i := 0 to Node.ChildCount - 1 do
       RegisterRecordVars(Node.GetChild(i));
+    PopLexFrame;
     FTypeScopePath := SavedTypePath;
     FPreScanInProc := SavedInProc;
     FPreScanProcName := SavedProcName;
     Exit;
   end;
+  // ⭐ ONE LEXICAL FRAME PER LEVEL, and the declarations of a node go into the frame of the list that
+  // CONTAINS it - RegisterTypedVar runs above, before this push. So a "Dim" is visible to the siblings
+  // that follow it and dies with the block, which is what a Scope means; and a name declared in two
+  // sibling Scopes is two declarations, not one. The frames cost a mark each.
   SavedTypePath := PushTypeScope(Node);
+  PushLexFrame;
   for i := 0 to Node.ChildCount - 1 do
     RegisterRecordVars(Node.GetChild(i));
+  PopLexFrame;
   FTypeScopePath := SavedTypePath;
+end;
+
+procedure TSSAGenerator.PushLexFrame;
+begin
+  SetLength(FLexVarFrames, Length(FLexVarFrames) + 1);
+  FLexVarFrames[High(FLexVarFrames)] := FLexVarTypes.Count;
+end;
+
+procedure TSSAGenerator.PopLexFrame;
+var
+  Mark: Integer;
+begin
+  if Length(FLexVarFrames) = 0 then Exit;
+  Mark := FLexVarFrames[High(FLexVarFrames)];
+  while FLexVarTypes.Count > Mark do FLexVarTypes.Delete(FLexVarTypes.Count - 1);
+  SetLength(FLexVarFrames, Length(FLexVarFrames) - 1);
+end;
+
+function TSSAGenerator.LexDeclaredTypeName(const NameU: string): string;
+// The type of the INNERMOST declaration of NameU seen so far by the declaration pre-scan, or ''.
+// Walked from the end, so a later declaration in the same frame - and any inner frame - wins over an
+// outer one. Answers '' outside the pre-scan (the stack is empty there), which is what keeps every
+// other reader of DeclaredTypeNameOf unchanged.
+var
+  i, e: Integer;
+begin
+  Result := '';
+  for i := FLexVarTypes.Count - 1 downto 0 do
+  begin
+    e := Pos('=', FLexVarTypes[i]);
+    if (e > 1) and (UpperCase(Copy(FLexVarTypes[i], 1, e - 1)) = NameU) then
+      Exit(Copy(FLexVarTypes[i], e + 1, MaxInt));
+  end;
 end;
 
 procedure TSSAGenerator.RegisterTypedVar(const VarName, TypeName: string);
@@ -29653,6 +29753,10 @@ var
   Idx: Integer;
 begin
   if VarName = '' then Exit;
+  // ...and the same fact in the LEXICAL stack, if the pre-scan is walking. Appended, never merged: the
+  // reader takes the last match, so a second declaration of the name shadows the first from here on.
+  if (TypeName <> '') and (Length(FLexVarFrames) > 0) then
+    FLexVarTypes.Add(UpperCase(VarName) + '=' + UpperCase(TypeName));
   // The type NAME the declaration said, kept beside the bank: see the note on FVarDeclTypeName.
   // Module-level wins over a procedure-local of the same name, exactly as the bank map below does.
   if TypeName <> '' then
@@ -34273,6 +34377,18 @@ begin
   end;
   if Node.NodeType <> antIdentifier then Exit;
   NameU := UpperCase(VarToStr(Node.Value));
+  // ⛔ THE LEXICALLY INNERMOST DECLARATION FIRST, while the declaration pre-scan is walking. Every
+  // registry below is keyed on the BARE NAME, and the pre-scan's own rule is "a module declaration owns
+  // the name, one inside a procedure only adds if absent" - so the FIRST of several same-named
+  // declarations answered for all of them. That is exactly what "Dim y As TypeOf(x)" reads, and fbc's
+  // quirk/typeof declares x once per type, each in a Scope of its own: y came out INTEGER for every one
+  // of them. Outside the pre-scan the stack is empty and this line answers '' - so no other caller of
+  // DeclaredTypeNameOf changes at all.
+  if Length(FLexVarFrames) > 0 then
+  begin
+    T := LexDeclaredTypeName(NameU);
+    if T <> '' then Exit(CanonicalType(T));
+  end;
   Result := VarRecordTypeName(NameU);                       // a UDT instance
   if Result <> '' then Exit;
   T := ManagedPtrPointee(NameU);                            // a declared "T PTR"
@@ -40834,6 +40950,49 @@ function TSSAGenerator.BlockArrayMangle(Serial: Integer; const ArrName: string):
 // blocks never collide, and '@' cannot occur in a user array name.
 begin
   Result := '@B@' + IntToStr(Serial) + '@' + ArrName;
+end;
+
+function TSSAGenerator.NameIsPointerHere(const Name: string): Boolean;
+// Is this name a POINTER *in the scope that is open right now*?
+//
+// ⛔ FPointerVars answers by BARE NAME, and both readers of it that matter here short-circuit whole
+// ladders. One "Dim x As Any Ptr" in a sibling Scope therefore made SizeOf(x) answer 8 in every OTHER
+// scope that declared x - twelve of them in fbc's quirk/typeof, and the failure showed up twelve
+// expansions ABOVE the pointer one, which is why it read as a defect of the byte case.
+//
+// Where an open BLOCK declared the name - as a scalar (FBlockDeclVars) or as a record (FBlockDeclRecs),
+// because a block that declared it a record has said it is not a pointer - the block's own entry is the
+// whole answer and there is NO fallback to the flat one. Same walk and same rule as BlockRecordTypeOf.
+var
+  k, idx: Integer;
+  nameU, mangled: string;
+begin
+  nameU := UpperCase(Name);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    idx := FPointerVars.IndexOfName(mangled);
+    if idx >= 0 then Exit(True);
+    if (FBlockDeclRecs.IndexOfName(mangled) >= 0) or (FBlockDeclVars.IndexOf(mangled) >= 0) then
+      Exit(False);          // this block declared it, and not as a pointer
+  end;
+  Result := FPointerVars.IndexOfName(nameU) >= 0;
+end;
+
+function TSSAGenerator.NameIsStringHere(const Name: string): Boolean;
+// Is this name a STRING *in the scope that is open right now*? GetVariableType is one verdict per NAME,
+// so a sibling Scope declaring it a string answered for the numeric ones too. ResolveExisting walks the
+// LIVE scope stack, so its register's bank is THIS declaration's; the flat map answers only when the
+// name resolves to nothing here.
+var
+  R: TSSAValue;
+begin
+  if ResolveExisting(Name, R) then
+    Result := R.RegType = srtString
+  else
+    Result := GetVariableType(Name) = srtString;
 end;
 
 function TSSAGenerator.BlockScalarName(const Name: string): string;
