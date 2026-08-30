@@ -687,12 +687,38 @@ var
   SigPos, DotPos: Integer;
   BaseV, SigV, SavedNsPrefix: string;
   SavedNsIndex: Integer;
+  AliasV, AliasSig, AliasQ: string;
 begin
   Result := Node;
 
   // Determine the prefix/shadow for descending into children.
   ChildPrefix := ActivePrefix;
   UseShadow := Shadow;
+
+  // ⛔⛔ A TYPE ALIAS'S TARGET LIVES IN AN ATTRIBUTE, AND THIS WALK ONLY EVER SAW CHILD NODES.
+  // "Type A As A_" inside a namespace kept the bare "A_", so the alias pointed at a type that exists
+  // nowhere and every use of A fell back to the default width: SizeOf(A) answered 8 where fbc answers
+  // 24, and a field read through it answered the handle. The identical program outside a namespace was
+  // right - the tell for a rule one path has and its sibling does not. It is a TYPE SLOT, so it asks
+  // with TypeSlot=True, and a FORWARD target resolves too: members are collected in a pre-pass, so a
+  // type declared further down is a member already. fbc's typedef/incomplete asserts the qualified
+  // spelling by name.
+  if (Node <> nil) and (Node.NodeType = antTypeDecl) and (Ctx <> nil) and
+     (Node.Attributes.Values['ALIAS'] <> '') then
+  begin
+    AliasV := UpperCase(Node.Attributes.Values['ALIAS']);
+    AliasSig := '';
+    while (Length(AliasV) > 4) and (Copy(AliasV, Length(AliasV) - 3, 4) = ' PTR') do
+    begin
+      AliasSig := ' PTR' + AliasSig;
+      AliasV := TrimRight(Copy(AliasV, 1, Length(AliasV) - 4));
+    end;
+    if (AliasV <> '') and (Pos('.', AliasV) = 0) then
+    begin
+      AliasQ := ResolveUnqualified(ActivePrefix, AliasV, Ctx, Using, True);
+      if AliasQ <> '' then Node.Attributes.Values['ALIAS'] := AliasQ + AliasSig;
+    end;
+  end;
 
   if Node.NodeType = antNamespace then
     ChildPrefix := CombinePrefix(ActivePrefix, VarToStr(Node.Value))
