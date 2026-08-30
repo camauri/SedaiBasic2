@@ -492,6 +492,17 @@ type
     // and read by RegisterResultTemp.
     FElidingLiteralTemp: Integer;
     FElidedLiteralHit: Boolean;   // the elision above just fired: this argument IS the temporary
+    // ⭐ THE COPY AN IIF OWES IS DECIDED PER BRANCH, so it is recorded against the branch's own AST
+    // node and made when THAT node is lowered - inside the branch, where the source is still live and
+    // where the untaken branch never runs. fbc copy-constructs the IIF's result from the branch it
+    // took, EXCEPT when that branch is a "Type( )" literal, which it builds straight into the result.
+    // A post-merge copy cannot express that: which branch ran is a RUN-TIME fact. DIVERGENZE 105.
+    // FIifCopySites is the cheap gate - zero for every program that has no IIF over UDTs in flight.
+    FIifCopyNodes: array of TASTNode;
+    FIifCopyUDTs: array of Integer;
+    FIifCopyDest: array of TSSAValue;    // the ONE result record both branches build into
+    FIifCopyLit: array of Boolean;       // this branch is a "Type( )" literal: CONSTRUCT into it, do not copy
+    FIifCopySites: Integer;
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
@@ -1101,6 +1112,8 @@ type
     procedure EmitWStringFill(ArgsNode: TASTNode; out Result: TSSAValue);  // WSTRING(n,cp) -> n wide chars
     function InferExprBank(Node: TASTNode): TSSARegisterType;
     procedure EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
+    procedure NoteIifCopySite(Node: TASTNode; PUDT: Integer; const Dest: TSSAValue; Literal: Boolean);
+    function TryIifBranchCopy(Node: TASTNode; const DestHint: TSSAValue; out Res: TSSAValue): Boolean;
     // FreeBASIC bit/byte macros (LOBYTE/HIBYTE/LOWORD/HIWORD/BIT/BITSET/BITRESET) and CBOOL,
     // lowered to existing integer bitwise/shift/compare SSA ops (no new opcodes).
     procedure EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
@@ -2410,6 +2423,10 @@ procedure TSSAGenerator.ProcessExpression(Node: TASTNode; out Result: TSSAValue;
 begin
   if Node <> nil then
   begin
+    // A branch of an IIF over two UDTs owes the result a COPY (DIVERGENZE 105). The gate is an
+    // integer that is zero for every program with no such IIF in flight, so the common path is one
+    // comparison; the search itself lives in its own frame, out of this one.
+    if (FIifCopySites > 0) and TryIifBranchCopy(Node, DestHint, Result) then Exit;
     if (Node.NodeType = antLiteral) and VarIsNumeric(Node.Value) then
     begin
       // Same rule as the full body's antLiteral branch: bank keyed off the Variant type, not the
@@ -13358,9 +13375,11 @@ procedure TSSAGenerator.EmitIif(ArgsNode: TASTNode; out Result: TSSAValue);
 // STRING wins over FLOAT and FLOAT over INT, which is the order the two branches can disagree in:
 // fbc refuses a string/number pair outright, so that combination is a divergence either way.
 var
-  IfNode, ThenNode, ElseNode, Asn: TASTNode;
+  IfNode, ThenNode, ElseNode, Asn, TrueClone, FalseClone: TASTNode;
   Bank, BankF: TSSARegisterType;
-  TmpName, Suffix: string;
+  TmpName, Suffix, UdtT, UdtF: string;
+  PUDT, SavedSites: Integer;
+  ResRec: TSSAValue;
 begin
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 3) then begin Result := MakeSSAValue(svkNone); Exit; end;
 
@@ -13393,21 +13412,76 @@ begin
   ThenNode := TASTNode.Create(antThen, ArgsNode.Token);
   Asn := TASTNode.Create(antAssignment, ArgsNode.Token);
   Asn.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgsNode.Token));
-  Asn.AddChild(ArgsNode.GetChild(1).Clone);       // true value
+  TrueClone := ArgsNode.GetChild(1).Clone;
+  Asn.AddChild(TrueClone);                        // true value
   ThenNode.AddChild(Asn);
   IfNode.AddChild(ThenNode);
 
   ElseNode := TASTNode.Create(antElse, ArgsNode.Token);
   Asn := TASTNode.Create(antAssignment, ArgsNode.Token);
   Asn.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgsNode.Token));
-  Asn.AddChild(ArgsNode.GetChild(2).Clone);       // false value
+  FalseClone := ArgsNode.GetChild(2).Clone;
+  Asn.AddChild(FalseClone);                       // false value
   ElseNode.AddChild(Asn);
   IfNode.AddChild(ElseNode);
 
+  // ⭐⭐ THE RESULT OF AN IIF OVER TWO UDTs IS A COPY, AND WHICH BRANCH PAYS FOR IT IS DECIDED PER
+  // BRANCH. Measured against the oracle, one shape at a time, with a type that counts its own
+  // constructors / copy constructors / destructors:
+  //     iif( k, a, b )                  both branches variables   fbc 2 1 3   (we were 2 0 2)
+  //     iif( k, a, type<C>( ) ), k true takes the VARIABLE        fbc 1 1 2   (we were 1 0 1)
+  //     iif( k, a, type<C>( ) ), k false takes the LITERAL        fbc 2 0 2   (we already matched)
+  //     iif( k, type<C>( ), type<C>( ) )                          fbc 1 0 1   (we already matched)
+  //     iif( k, a, mk( ) ), k false     takes the CALL            fbc 2 2 4   (we were 2 0 3)
+  // ⇒ Every branch owes a copy EXCEPT an anonymous "Type( )" literal, which fbc builds straight into
+  // the result exactly as it does for a byval parameter. The two mixed rows are the proof that the
+  // decision cannot be taken after the merge: the same expression owes a copy or does not depending
+  // on which branch RUNS. That is why the copy is recorded against the branch NODE here and made when
+  // that node is lowered, inside its own branch - where the source is still live, and where the
+  // untaken branch emits nothing at all.
+  // ⛔ Three earlier attempts put the copy after the merge and were withdrawn, the last one taking
+  // structs/temp-var-dtors from 90 failing assertions to 591. The note that named the cure is the
+  // sub-shape that stayed wrong in all three: the "Type( )" literal branch. DIVERGENZE 105.
+  // ⚠️ Only when BOTH branches name the SAME UDT and that type has observable copying or destruction:
+  // a plain data UDT emits exactly what it emitted before.
+  SavedSites := FIifCopySites;
+  ResRec := MakeSSAValue(svkNone);
+  UdtT := ObjectTypeName(ArgsNode.GetChild(1));
+  UdtF := ObjectTypeName(ArgsNode.GetChild(2));
+  PUDT := -1;
+  if (UdtT <> '') and SameText(UdtT, UdtF) then
+  begin
+    PUDT := FindUDT(UdtT);
+    if (PUDT >= 0) and
+       (TypeNeedsDestruction(UdtT) or (ExactCopyCtorLabel(FUDTs[PUDT].Name) <> '')) then
+    begin
+      // ⛔⛔ ALLOCATED HERE, BEFORE THE BRANCHES, and that is a measurement. A record allocated after
+      // them REUSES the slot the taken branch's own temporary has just released, and initialising it
+      // ZEROES the record the copy is about to read - which is how three earlier attempts at this all
+      // produced a right count and a wrong value. Emitted in the block that dominates both branches,
+      // it is one register live across the merge and one object to destroy.
+      ResRec := EmitFreshRecord(PUDT);
+      NoteIifCopySite(TrueClone,  PUDT, ResRec, IsTypeCtorTemporary(ArgsNode.GetChild(1)));
+      NoteIifCopySite(FalseClone, PUDT, ResRec, IsTypeCtorTemporary(ArgsNode.GetChild(2)));
+    end
+    else
+      PUDT := -1;
+  end;
+
   ProcessIfStatement(IfNode);
+  // ⛔ THE SITES DIE WITH THE NODES THEY NAME. IfNode.Free frees the clones, so a site left behind
+  // would hold a dangling pointer that a later node could accidentally match. Truncating to the count
+  // saved above is also what makes nested IIFs a proper stack.
+  FIifCopySites := SavedSites;
   IfNode.Free;
 
   Result := GetOrAllocateVariable(TmpName);
+  // ⭐ ...AND THE RESULT IS ONE TEMPORARY, REGISTERED ONCE, HERE. Both branches built into the same
+  // record, so there is exactly one object to destroy and it exists on every path - which is what a
+  // per-branch registration could not give: the untaken branch's handle register is never written.
+  // It dies with the enclosing STATEMENT, not with the branch's synthesized assignment, so a byval
+  // argument or an outer assignment still reads a live record.
+  if PUDT >= 0 then RegisterResultTemp(ResRec, FUDTs[PUDT].Name, False);
   // ⭐ AN IIF OVER TWO UDTs YIELDS A TEMPORARY OF ITS OWN, not the branch it chose: fbc builds the
   // result by COPY CONSTRUCTION and assigns THAT, so "a = iif( k, a, b )" counts 2 constructors, 1
   // copy and 3 destructors there against our 2 0 2. Registered as this statement's own temporary, so
@@ -13436,6 +13510,66 @@ begin
   // does for a byval parameter. So the copy is PER BRANCH, decided inside each one, and cannot be emitted
   // after the merge at all - which is where this lowering necessarily stands. Closing it means giving the
   // IIF its own lowering rather than reusing the IF. DIVERGENZE 105.
+end;
+
+procedure TSSAGenerator.NoteIifCopySite(Node: TASTNode; PUDT: Integer; const Dest: TSSAValue;
+  Literal: Boolean);
+// Record how THIS branch of an IIF must fill the result record Dest. See EmitIif.
+begin
+  if Node = nil then Exit;
+  if FIifCopySites >= Length(FIifCopyNodes) then
+  begin
+    SetLength(FIifCopyNodes, FIifCopySites + 8);
+    SetLength(FIifCopyUDTs,  FIifCopySites + 8);
+    SetLength(FIifCopyDest,  FIifCopySites + 8);
+    SetLength(FIifCopyLit,   FIifCopySites + 8);
+  end;
+  FIifCopyNodes[FIifCopySites] := Node;
+  FIifCopyUDTs[FIifCopySites] := PUDT;
+  FIifCopyDest[FIifCopySites] := Dest;
+  FIifCopyLit[FIifCopySites] := Literal;
+  Inc(FIifCopySites);
+end;
+
+function TSSAGenerator.TryIifBranchCopy(Node: TASTNode; const DestHint: TSSAValue;
+  out Res: TSSAValue): Boolean;
+// A branch of an IIF over two UDTs, filling the result record the IIF allocated before the branches:
+//   - a "Type( )" LITERAL is CONSTRUCTED straight into it - one object, no copy, which is what fbc
+//     does and the only shape where it makes no copy;
+//   - anything else is lowered as it stands and COPY-CONSTRUCTED into it.
+// Either way the branch yields the SAME record, so the merge has one handle to carry and the result
+// is one temporary, registered once by EmitIif after the merge.
+// ⛔ The site is CLEARED before the recursion, not after: the second lowering of the same node would
+// otherwise match again and copy the copy, forever.
+var
+  k, PUDT: Integer;
+  Dest: TSSAValue;
+  IsLit: Boolean;
+  ArgsNode: TASTNode;
+begin
+  Result := False;
+  for k := FIifCopySites - 1 downto 0 do
+    if FIifCopyNodes[k] = Node then
+    begin
+      PUDT := FIifCopyUDTs[k];
+      Dest := FIifCopyDest[k];
+      IsLit := FIifCopyLit[k];
+      FIifCopyNodes[k] := nil;
+      if IsLit then
+      begin
+        // "type<T>( args )" / "T( args )": the args are the node's second child when it has one.
+        ArgsNode := nil;
+        if Node.ChildCount >= 2 then ArgsNode := Node.GetChild(1);
+        EmitConstructorCall(Dest, UpperCase(FUDTs[PUDT].Name), ArgsNode);
+      end
+      else
+      begin
+        ProcessExpressionFull(Node, Res, DestHint);
+        if Res.Kind = svkRegister then EmitCopyCtorInto(Dest, Res, PUDT);
+      end;
+      Res := Dest;
+      Exit(True);
+    end;
 end;
 
 procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
@@ -40692,12 +40826,18 @@ begin
             (ParamList.GetChild(i).GetChild(0).NodeType = antIdentifier) and
             (FindUDT(UpperCase(VarToStr(ParamList.GetChild(i).GetChild(0).Value))) >= 0) then
     begin
+      // ⛔⛔ THE ELISION IS FOR AN ARGUMENT THAT *IS* THE LITERAL, NOT ONE THAT CONTAINS ONE. Raised
+      // around the whole argument it also fired for a "Type( )" buried inside a sub-expression, and
+      // then nothing owned that temporary at all: "fByvalUdtToStr( iif( c, ClassUdt( ), ClassUdt( ) ) )"
+      // counted 1 constructor, 0 copies, 1 destructor where fbc counts 1, 1, 2 - the IIF's result is a
+      // temporary of its OWN, and passing it byval copies it like any other value
+      // (fbc structs/temp-var-dtors, testLen). The top-level test is the whole rule.
       FElidedLiteralHit := False;
-      Inc(FElidingLiteralTemp);
+      if IsTypeCtorTemporary(ArgExpr) then Inc(FElidingLiteralTemp);
       try
         ProcessExpression(ArgExpr, ArgVal);
       finally
-        Dec(FElidingLiteralTemp);
+        if IsTypeCtorTemporary(ArgExpr) then Dec(FElidingLiteralTemp);
       end;
       // ...and the copy the parameter gets is made HERE, by the caller - unless the argument IS the
       // temporary whose destructor was just elided, in which case it is handed over as it stands.
