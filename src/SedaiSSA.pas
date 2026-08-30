@@ -21146,7 +21146,8 @@ end;
 procedure TSSAGenerator.ProcessInputFile(Node: TASTNode);
 var
   HandleVal, HandleReg, VarReg: TSSAValue;
-  LineTmp, CutTmp, LenVal, LenReg, OneReg, AddrVal2: TSSAValue;
+  LineTmp, CutTmp, LenVal, LenReg, OneReg, AddrVal2, NarrowedIn: TSSAValue;
+  InCopyOp: TSSAOpCode;
   HandleChild, VarChild: TASTNode;
   VarName: string;
   i: Integer;
@@ -21249,13 +21250,37 @@ begin
         EmitInstruction(ssaInputFileLine, VarReg, HandleReg,
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone))
       else
-        // ⛔ ...and with the READ KIND alongside it, the mirror of the one PRINT#/WRITE# carries.
+      begin
         // A file is not a lesser console in either direction: fbc's INPUT# knows the word "true"
         // when the destination is a BOOLEAN, so a value WE had just written as "true" read back as
         // 0. The kind is computed by the same FilePrintKind the writing side uses, off the same
         // declared type, so the two halves cannot drift apart.
+        // ⛔ ...and with the READ KIND alongside it, the mirror of the one PRINT#/WRITE# carries.
         EmitInstruction(ssaInputFile, VarReg, HandleReg,
                        MakeSSAConstInt(FilePrintKind(VarChild, VarReg)), MakeSSAValue(svkNone));
+        // ⭐⭐ AND READING INTO A NARROW VARIABLE IS A STORE TO IT: fbc wraps the parsed value to the
+        // DECLARED width exactly as an assignment does - "Dim n As Byte : Input #1, n" over a line
+        // holding 999 leaves -25 there, not 999. We kept the parsed width, so every narrow type read
+        // back a value the variable cannot hold: fbc's own file/large_int reads one CSV into all
+        // twelve numeric types and 1 494 of its reads disagreed, across byte, ubyte, short, ushort,
+        // long, ulong, integer, uinteger and ulongint. The same funnel every other store uses, so the
+        // two cannot drift apart. DIVERGENZE 123.
+        // ⛔ AND THE COPY BACK IS PER BANK. Written as a bare ssaCopyInt it copied a SINGLE
+        // destination's rounded value with the INT opcode - "Input #1, a, b, c" with c As Single
+        // then wrote a float register's contents over int register a, and a read 0. One statement,
+        // three destinations, and the one that broke was not the one being narrowed.
+        NarrowedIn := ApplyScalarNarrow(VarName, VarReg, nil);
+        if (NarrowedIn.Kind = svkRegister) and (NarrowedIn.RegType = VarReg.RegType) and
+           (NarrowedIn.RegIndex <> VarReg.RegIndex) then
+        begin
+          case VarReg.RegType of
+            srtFloat:  InCopyOp := ssaCopyFloat;
+            srtString: InCopyOp := ssaCopyString;
+          else         InCopyOp := ssaCopyInt;
+          end;
+          EmitInstruction(InCopyOp, VarReg, NarrowedIn, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end;
     end;
     // Skip separators and other nodes
     Inc(i);

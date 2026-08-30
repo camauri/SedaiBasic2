@@ -11923,6 +11923,30 @@ procedure TBytecodeVM.RunDebug;
 // first non-numeric character - matches FreeBASIC VALINT/VALLNG/VALUINT/VALULNG.
 // A "&H"/"&O"/"&B" prefix selects hexadecimal/octal/binary parsing. Returns 0 when
 // no digits are present.
+function InputFieldIsFloat(const S: string): Boolean;
+// Does this INPUT field spell a FLOATING-POINT number? A '.' or an exponent letter after at least one
+// digit. ⛔ A base-prefixed literal is never one: 'd' and 'e' are hex DIGITS there, and "&h1d1" is 465
+// and not 1 x 10^1. Used only to choose which grammar INPUT parses the field with - see bcInputFileInt.
+var
+  I, Len: Integer;
+  HasDigit: Boolean;
+begin
+  Result := False;
+  Len := Length(S);
+  I := 1;
+  while (I <= Len) and (S[I] = ' ') do Inc(I);
+  if (I <= Len) and ((S[I] = '+') or (S[I] = '-')) then Inc(I);
+  if (I <= Len) and (S[I] = '&') then Exit;          // a base literal, whatever letters follow
+  HasDigit := False;
+  while I <= Len do
+  begin
+    if (S[I] >= '0') and (S[I] <= '9') then begin HasDigit := True; Inc(I); end
+    else if S[I] = '.' then Exit(True)
+    else if HasDigit and (UpCase(S[I]) in ['E', 'D']) then Exit(True)
+    else Break;
+  end;
+end;
+
 function ParseLeadingInt64(const S: string; DecWidth: Integer): Int64;
 var
   I, Len, Base, D: Integer;
@@ -11955,8 +11979,20 @@ begin
     else if C = 'O' then Base := 8
     else if C = 'B' then Base := 2;
     if Base > 0 then
+      Inc(I, 2)   // skip the "&X" prefix
+    // ⭐ A BARE "&" IS OCTAL TOO, and it is the spelling nothing here knew: fbc reads "&77" as 63
+    // through VAL, VALINT, VALLNG, VALUINT and INPUT alike (measured on all five), while we answered
+    // 0 for every one of them - the prefix was not recognised, the decimal scan then found no digits.
+    // Its own line of fbc's file/large_int asserts it beside "&O77", which we already had.
+    // ⚠️ Only when an OCTAL DIGIT follows: "&x" stays 0, and "&8" reads as 0 the same way "&o78"
+    // stops at the 8 - the digit test below is what does both.
+    else if (S[I + 1] >= '0') and (S[I + 1] <= '7') then
     begin
-      Inc(I, 2);  // skip the "&X" prefix
+      Base := 8;
+      Inc(I);     // skip the "&" alone
+    end;
+    if Base > 0 then
+    begin
       U := 0;
       while I <= Len do
       begin
@@ -16902,6 +16938,19 @@ begin
               else if ParseLeadingFloat(Trim(Data)) <> 0.0 then Ctx.IntRegs[Instr.Dest] := -1
               else Ctx.IntRegs[Instr.Dest] := 0;
             end
+            // ⭐⭐ AN INTEGER DESTINATION READS THE *FLOAT* GRAMMAR AND ROUNDS, and that is NOT what
+            // VALINT does with the same text: fbc answers VALINT("1d1") = 1 and reads the very same
+            // field into an Integer as 10. INPUT parses a NUMBER and then converts it, so a fraction
+            // and an exponent both count - measured against fbc: "1.9" -> 2, "-1.9" -> -2, "2.5" -> 2,
+            // "3.5" -> 4 (ties to even, the implicit conversion everywhere else), "1d1" -> 10,
+            // "1.23d+2" -> 123, "1e18" -> 1000000000000000000.
+            // ⛔ AND ONLY THEN. A plain integer must NOT go through a Double: fbc reads
+            // "9223372036854775807" back exactly, and a Double cannot hold it. So the float path is
+            // taken only for a field that actually IS one - a '.' or an exponent letter - and never
+            // for a base-prefixed literal, where 'd'/'e' are HEX DIGITS ("&h1d1" is 465).
+            // DIVERGENZE 123.
+            else if InputFieldIsFloat(Trim(Data)) then
+              Ctx.IntRegs[Instr.Dest] := FloatToIntConv(ParseLeadingFloat(Trim(Data)), True)
             else
               Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Trim(Data), 64);
           end;
