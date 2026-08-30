@@ -15156,6 +15156,7 @@ var
   HasCondition: Boolean;
   IsOpenEnded: Boolean;
   i: Integer;
+  CondTempDepth: Integer;   // the condition's own temporaries die at the branch (m761)
   LoopInfo: TLoopInfo;
 begin
   // DO/LOOP structure:
@@ -15234,6 +15235,12 @@ begin
     // Evaluate condition
     if Assigned(ConditionNode) then
     begin
+      // ⭐ A LOOP CONDITION IS EVALUATED ONCE PER ITERATION, AND ITS TEMPORARIES DIE THERE. The
+      // statement-level flush (ProcessStatement) sees the whole loop as ONE statement, so a UDT-
+      // returning call in the condition left one record per turn alive and destroyed it once at the
+      // end: "While mkn( k ).i" over six turns built twelve objects and destroyed SEVEN, where fbc
+      // destroys twelve. The flush belongs where the value dies - after the branch has read it.
+      CondTempDepth := FResultTemps.Count;
       ProcessExpression(ConditionNode, CondValue);
 
       // Ensure condition is in a register
@@ -15250,6 +15257,7 @@ begin
       end;
 
       CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
+      if FResultTemps.Count > CondTempDepth then FlushResultTemps(CondTempDepth);
       // WHILE: continue if condition TRUE, exit if FALSE
       // UNTIL: continue if condition FALSE, exit if TRUE
       if IsWhileLoop then
@@ -15343,6 +15351,7 @@ begin
     if HasCondition and Assigned(ConditionNode) then
     begin
       // Evaluate condition at bottom
+      CondTempDepth := FResultTemps.Count;      // ...and the same per-iteration flush (see the top)
       ProcessExpression(ConditionNode, CondValue);
 
       // Ensure condition is in a register
@@ -15359,6 +15368,7 @@ begin
       end;
 
       CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
+      if FResultTemps.Count > CondTempDepth then FlushResultTemps(CondTempDepth);
       // WHILE: loop back if condition TRUE, exit if FALSE
       // UNTIL: loop back if condition FALSE, exit if TRUE
       if IsWhileLoop then
@@ -30554,6 +30564,10 @@ var
   RT: TSSARegisterType;
   ArgVals: array of TSSAValue;
   DefVal: TSSAValue;
+  ParamUdtDef, NDefStage: Integer;          // a BYVAL UDT default owes its private copy too (m760)
+  DefSlots: array[0..63] of Integer;
+  DefRTs: array[0..63] of TSSARegisterType;
+  DefVals: array[0..63] of TSSAValue;
 begin
   // OOP: the permission, on the CONSTRUCTOR. Every way of bringing an instance into being - "Dim As T x",
   // a local array of T, "Static As T x", "New T", "New T[n]" - lands here, so the rule is asked once
@@ -30681,16 +30695,32 @@ begin
     // M4.4h: fill any trailing parameters the call omitted with their default values (evaluated here,
     // in the caller's context), coerced to each parameter's bank — like M7 for SUB/FUNCTION. The
     // parameter at ParamList index k corresponds to the (k-1)-th explicit argument (THIS is index 0).
+    // ⛔ TWO PASSES, and the reason is the same one that hoisted the argument copies above THIS: a
+    // BYVAL UDT default owes its private copy (m760), the copy constructor writes int slots 0 and 1,
+    // and THIS plus the explicit arguments are already sitting in them. Evaluate and copy first, store
+    // afterwards - which is what StageCallArgs does for every argument and says so.
+    NDefStage := 0;
     for i := ArgCount + 1 to ParamList.ChildCount - 1 do
     begin
       PNode := ParamList.GetChild(i);
       if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
       begin
+        // Unconditional, for the reason the SUB/FUNCTION twin gives: a counter held across the whole
+        // default expression is set by a literal INSIDE it, and the default's value is this statement's
+        // own temporary either way.
+        ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
         ProcessDefaultValue(PNode, PNode.GetChild(PNode.ChildCount - 1), DefVal);
-        Slot := ParamBankAndSlot(ParamList, i, RT);
-        EmitXferStore(RT, Slot, DefVal);
+        if ParamUdtDef >= 0 then
+          DefVal := EmitByvalUdtCopyOf(DefVal, ParamUdtDef);
+        if NDefStage > High(DefSlots) then Break;   // defensive: no procedure has 64 defaulted parameters
+        DefSlots[NDefStage] := ParamBankAndSlot(ParamList, i, RT);
+        DefRTs[NDefStage] := RT;
+        DefVals[NDefStage] := DefVal;
+        Inc(NDefStage);
       end;
     end;
+    for i := 0 to NDefStage - 1 do
+      EmitXferStore(DefRTs[i], DefSlots[i], DefVals[i]);
   end;
   // ⛔ ARRAY PARAMETERS ARE BOUND, NOT STAGED. A "<T> Ptr"-free array parameter is passed by ALIASING
   // the callee's placeholder slot to the caller's array, and every other call shape does it: a plain
@@ -39594,6 +39624,7 @@ var
   RT: TSSARegisterType;
   ParamUdtU: string;
   CoercByval, HandledImplicit: Boolean;   // the coerced temporary IS the byval copy (m759)
+  ParamUdtDef: Integer;                   // ...and a DEFAULT value is an argument too (m760)
   ArgVal, TempVal2: TSSAValue;
   StageSlots: array of Integer;
   StageRTs: array of TSSARegisterType;
@@ -39789,7 +39820,26 @@ begin
     ParamI := ParamList.GetChild(i);
     if (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) then
     begin
+      // ⭐ A DEFAULT VALUE IS AN ARGUMENT, and a BYVAL UDT parameter filled from one owes the same
+      // private copy every other staging path owes since m759 - the callee ADOPTS what it is handed.
+      // Without it, "Sub s( ByVal x As T = f( ) )" called bare handed the callee the statement's OWN
+      // result temporary: destroyed by the caller at the end of the statement AND by the callee at
+      // frame exit, so the destructor ran on a record already reclaimed. fbc's structs/temp-var-dtors
+      // opens with exactly that shape, and it is the FIRST assertion it fails.
+      // Safe here: this loop is phase ONE (evaluation); the slots are written afterwards, so the copy
+      // constructor's own use of slots 0 and 1 cannot clobber anything.
+      // ⛔ AND THE COPY IS UNCONDITIONAL HERE, unlike the argument branch. The "hand it over instead of
+      // copying" signal is the elision counter, and a counter held across a WHOLE expression is set by
+      // a literal that merely appears INSIDE it: "ByVal x As C = test1( C( ) )" raised it on the inner
+      // C( ) - which is test1's argument, not the default's value - and we then adopted a temporary the
+      // caller still owned, destroying it twice (fbc 2 ctors 1 copy 3 dtors, we 2 0 3: three
+      // destructions for two constructions). It is the same shape as the DIM-initialiser elision that
+      // m758 removed. The default's value is this statement's own temporary, so the parameter's copy is
+      // always a real copy.
+      ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
       ProcessDefaultValue(ParamI, ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      if ParamUdtDef >= 0 then
+        ArgVal := EmitByvalUdtCopyOf(ArgVal, ParamUdtDef);
       Slot := ParamBankAndSlot(ParamList, i, RT);
       case RT of
         srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
