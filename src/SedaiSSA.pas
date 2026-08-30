@@ -10502,7 +10502,8 @@ var
   i: Integer;
   Child: TASTNode;
   PromptStr: string;
-  PromptReg, VarReg: TSSAValue;
+  PromptReg, VarReg, NarrowedIn: TSSAValue;
+  InCopyOp: TSSAOpCode;
   PromptRegIdx: Integer;
   VarName: string;
   VarNames: array of string;
@@ -10619,6 +10620,21 @@ begin
                               MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
         end;
+    end;
+    // ⭐ ...AND A NARROW NUMERIC DESTINATION IS NARROWED HERE TOO. INPUT writes the variable's
+    // register directly, bypassing the assignment path, so nothing had applied the declared width:
+    // "Dim a As Byte : Input a" over 999 left 999 where fbc leaves -25. Same funnel and same per-bank
+    // copy as INPUT #; the fixed-length STRING case just above is the string half of exactly this.
+    // DIVERGENZE 124.
+    if VarReg.RegType in [srtInt, srtFloat] then
+    begin
+      NarrowedIn := ApplyScalarNarrow(VarName, VarReg, nil);
+      if (NarrowedIn.Kind = svkRegister) and (NarrowedIn.RegType = VarReg.RegType) and
+         (NarrowedIn.RegIndex <> VarReg.RegIndex) then
+      begin
+        if VarReg.RegType = srtFloat then InCopyOp := ssaCopyFloat else InCopyOp := ssaCopyInt;
+        EmitInstruction(InCopyOp, VarReg, NarrowedIn, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end;
     end;
   end;
 end;

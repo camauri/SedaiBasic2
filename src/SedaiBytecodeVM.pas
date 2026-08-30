@@ -14422,7 +14422,9 @@ begin
       if Assigned(FInputDevice) then
       begin
         // Print initial prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // ⛔ ...and in MODERN only when a person is there: see GStdinIsTerminal below.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
@@ -14456,11 +14458,44 @@ begin
       if Assigned(FInputDevice) then
       begin
         // Print initial prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // ⛔ ...and in MODERN only when a person is there: see GStdinIsTerminal below.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
+        // ⭐⭐ MODERN NEVER REFUSES AN INPUT. fbc parses what it can and leaves 0 for the rest - there
+        // is no "?REDO FROM START" and no re-prompt there, and no character filter either: "&77" and
+        // "1d1" are legal fields it reads as 63 and 10, and we REFUSED both ("?SYNTAX ERROR - Number
+        // expected", then asked again). The Commodore validation below is v7's and stays v7's.
+        // The grammar is the one INPUT # uses, for the same reason and through the same helpers.
+        // DIVERGENZE 124.
+        if Assigned(FProgram) and FProgram.ModernMode then
+        begin
+          // ⛔ AND NO PROMPT AT ALL WHEN NOBODY IS THERE TO READ IT. fbc writes neither the user's
+          // prompt string nor the "? " when standard input is redirected - measured: its own program
+          // "Print "start" : Input "enter n"; n" emits just "start" under < /dev/null, while we
+          // wrote "enter n? " into the captured output. See GStdinIsTerminal.
+          if GStdinIsTerminal then
+            InputStr := Trim(FInputDevice.ReadLine('? ', False, False, True))
+          else
+            InputStr := Trim(FInputDevice.ReadLine('', False, False, True));
+          // ⛔ EXHAUSTED INPUT IS A VALUE, NOT AN END. fbc leaves 0 in the variable and runs on -
+          // "Dim a As Integer = 7 : Input a : Print a" prints 0 and then the rest of the program -
+          // while we STOPPED the program mid-line. Only a STOP request (Ctrl+End, window closed)
+          // ends it. ⚠️ A program that LOOPS on INPUT will spin at EOF, exactly as it does under fbc.
+          if FInputDevice.ShouldStop then
+          begin
+            Ctx.Running := False;
+            FInputDevice.ClearStopRequest;
+          end
+          else if InputFieldIsFloat(InputStr) then
+            Ctx.IntRegs[Instr.Dest] := FloatToIntConv(ParseLeadingFloat(InputStr), True)
+          else
+            Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(InputStr, 64);
+        end
+        else
         repeat
           // C128 mode: accept all, validate after; Mask mode: filter invalid chars (no decimal for int)
           InputStr := Trim(FInputDevice.ReadLine('? ', False, not FC128InputMode, False));
@@ -14501,11 +14536,30 @@ begin
       if Assigned(FInputDevice) then
       begin
         // Print initial prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // ⛔ ...and in MODERN only when a person is there: see GStdinIsTerminal below.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
+        // ⭐ MODERN never refuses - see the integer arm above.
+        if Assigned(FProgram) and FProgram.ModernMode then
+        begin
+          if GStdinIsTerminal then
+            InputStr := Trim(FInputDevice.ReadLine('? ', False, False, True))
+          else
+            InputStr := Trim(FInputDevice.ReadLine('', False, False, True));
+          // Exhausted input is a VALUE - see the integer arm.
+          if FInputDevice.ShouldStop then
+          begin
+            Ctx.Running := False;
+            FInputDevice.ClearStopRequest;
+          end
+          else
+            Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(InputStr);
+        end
+        else
         repeat
           // C128 mode: accept all, validate after; Mask mode: filter invalid chars
           InputStr := Trim(FInputDevice.ReadLine('? ', False, not FC128InputMode, True));
