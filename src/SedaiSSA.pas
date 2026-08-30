@@ -11608,15 +11608,18 @@ begin
         InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
                                                      ArrayDeclNode.GetChild(0).Token));
         InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
-        // ⭐ A DIM's initialiser INITIALISES: a "Type( ... )" literal here is built straight into the
-        // variable by fbc, so it has no temporary of its own and no second destructor. The same
-        // expression in an ASSIGNMENT does keep one - measured, and the two spellings differ.
-        Inc(FElidingLiteralTemp);
-        try
-          ProcessAssignment(InitAssign);
-        finally
-          Dec(FElidingLiteralTemp);
-        end;
+        // ⛔⛔ THE "Type( ... )" LITERAL ELISION USED TO BE HELD HERE, AND IT IS GONE (31 Aug 2026).
+        // It suppressed the temporary's DESTRUCTOR across the whole initialiser, so a literal that
+        // merely APPEARED inside one was elided too - and there nothing else owns it:
+        // "Dim q As Integer = Type<C>( ).i" built the C and never destroyed it, where fbc runs one
+        // destructor. The destination is an Integer; there was nothing for the literal to be built into.
+        // ⭐ And the elision is not needed even in the case it was written for: with it removed,
+        // "Dim y As C = Type<C>( )" still counts 1 constructor and 1 destructor, exactly as fbc does -
+        // the declaration builds into the variable through the constructor route, not by hiding a
+        // destructor. Measured on the whole net: every one stays green and the fbc suite loses 4 more
+        // failing assertions. The BYVAL-PARAMETER elision is a different site and a different
+        // measurement, and stays.
+        ProcessAssignment(InitAssign);
         InitAssign.Free;
       end;
       Continue;
