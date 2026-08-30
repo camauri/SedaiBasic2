@@ -583,6 +583,8 @@ type
     function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
     function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
     function BlockScalarName(const Name: string): string;
+    function BlockDeclaredHere(const Name: string; out Mangled: string): Boolean;  // did an OPEN block declare it?
+    function BlockPtrPointeeIdx(const Name: string): Integer;  // the open block's own pointer entry (-1 no, -2 none)
     function NameIsPointerHere(const Name: string): Boolean;   // ...and is it a POINTER in this scope?
     function NameIsStringHere(const Name: string): Boolean;    // ...and is it a STRING in this scope?    // the innermost OPEN block that declared this @-taken SCALAR, or ''
     procedure NoteArrayShape(const SlotName: string; Dynamic: Boolean);     // this SLOT is dynamic / fixed
@@ -11415,6 +11417,18 @@ begin
         if (Length(RecTypeName) >= 4) and (Copy(RecTypeName, Length(RecTypeName) - 3, 4) = ' PTR') and
            (FPointerVars.IndexOfName(BlkScalarKey) < 0) then
           FPointerVars.Add(BlkScalarKey + '=' + Trim(Copy(RecTypeName, 1, Length(RecTypeName) - 4)));
+        // ...and WHETHER IT IS WIDE. FWStringVars is a flat SET of names, so a "Dim x As WString * 10"
+        // in a sibling Scope made the other one's plain "Dim x As String" read as UTF-8: LEN of three
+        // Japanese characters answered 3 where fbc answers 9 - a silent wrong answer, and the loudest
+        // kind of silent, because it is the LENGTH every other string operation is measured in.
+        if (RecTypeName = 'WSTRING') and (FWStringVars.IndexOf(BlkScalarKey) < 0) then
+          FWStringVars.Add(BlkScalarKey);
+        // ...and WHETHER IT IS A REFERENCE. Same flat map, and here the failure is not silent: a plain
+        // "Dim x As Integer" beside a sibling "Dim ByRef x As Integer = t" was auto-dereferenced, and
+        // the program died on "Null or invalid pointer dereference" at its first assignment.
+        if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and
+           (FRefVars.IndexOfName(BlkScalarKey) < 0) then
+          FRefVars.Add(BlkScalarKey + '=' + RecTypeName);
         // ...and the DECLARED CAPACITY of a fixed-length string is the block's too, by the same rule
         // CollectWStringVars applies per PROCEDURE: "ZString * n" / "WString * n" hold n-1 characters
         // plus the terminator, "String * n" holds n. Without this a "ZString * 10" in one Scope read
@@ -34424,6 +34438,15 @@ var
   idx: Integer;
 begin
   Result := '';
+  // ⛔ THE OPEN BLOCK FIRST, and where one declared the name there is NO fallback. This map is keyed by
+  // bare NAME and its own header already says a proc-local shadow is what the per-proc twins exist for -
+  // but a BLOCK is a scope too, and two sibling Scopes are two declarations. Measured: "Scope : Dim x As
+  // T Ptr = New T ... Delete x : End Scope" beside a "Scope : Dim x As Any Ptr" was REFUSED at compile
+  // time - "DELETE expects a UDT pointer, X is not one" - on a program fbc compiles. A refusal, not a
+  // wrong answer, which is the loudest way this family fails.
+  idx := BlockPtrPointeeIdx(Name);
+  if idx >= -1 then                      // -1 = "this block declared it and it is NOT a pointer"
+    if idx >= 0 then Exit(FPointerVars.ValueFromIndex[idx]) else Exit('');
   if FCurrentProcPtrParams <> nil then
   begin
     idx := FCurrentProcPtrParams.IndexOfName(UpperCase(Name));
@@ -34471,7 +34494,14 @@ end;
 function TSSAGenerator.IsRefVar(const Name: string): Boolean;
 // A FreeBASIC reference variable (DIM BYREF r AS T = target): its register carries target's address, so
 // reads/writes auto-dereference (like a BYREF-return address param, but bound at its declaration).
+var
+  BlkKey: string;
 begin
+  // ⛔ THE OPEN BLOCK FIRST, with no fallback. FRefVars is flat, so a sibling Scope's
+  // "Dim ByRef x As Integer = t" made a plain "Dim x As Integer" auto-dereference, and the program
+  // died on "Null or invalid pointer dereference" at its first assignment. See BlockDeclaredHere.
+  if BlockDeclaredHere(Name, BlkKey) then
+    Exit(FRefVars.IndexOfName(BlkKey) >= 0);
   Result := FRefVars.IndexOfName(UpperCase(Name)) >= 0;
 end;
 
@@ -34804,7 +34834,17 @@ function TSSAGenerator.PointeeTypeOf(const PtrName: string): string;
 // and the dereference failed on an address that was off by a factor of four.
 // That is the whole reason drawing primitives could not be written as SUBs, and
 // SUBs are the only shape a primitive has.
+// ⛔ ...AND THE OPEN BLOCK OWNS THE ANSWER WHERE ONE DECLARED THE NAME. This reads FPointerVars
+// DIRECTLY, so it kept the flat entry while ManagedPtrPointee had learnt to walk the blocks - and two
+// readers of one fact disagreeing is worse than both being wrong: "Scope: Dim As Byte Ptr p =
+// CAllocate(3)" beside "Scope: Dim As Double Ptr p = CAllocate(24)" indexed the second with the
+// FIRST's element size. Same walk, same veto, as BlockPtrPointeeIdx.
+var
+  idx: Integer;
 begin
+  idx := BlockPtrPointeeIdx(PtrName);
+  if idx >= 0 then Exit(FPointerVars.ValueFromIndex[idx]);
+  if idx = -1 then Exit('');
   Result := FPointerVars.Values[UpperCase(PtrName)];
   if Result = '' then Result := ParamPointeeType(PtrName);
 end;
@@ -35742,7 +35782,13 @@ begin
 end;
 
 function TSSAGenerator.IsWStringVar(const Name: string): Boolean;
+var
+  BlkKey: string;
 begin
+  // ⛔ THE OPEN BLOCK FIRST, with no fallback: this is a flat SET of names, so one "Dim x As WString * n"
+  // made every other declaration of x read as UTF-8. See BlockDeclaredHere.
+  if BlockDeclaredHere(Name, BlkKey) then
+    Exit(FWStringVars.IndexOf(BlkKey) >= 0);
   Result := FWStringVars.IndexOf(UpperCase(Name)) >= 0;
 end;
 
@@ -40952,6 +40998,53 @@ begin
   Result := '@B@' + IntToStr(Serial) + '@' + ArrName;
 end;
 
+function TSSAGenerator.BlockDeclaredHere(const Name: string; out Mangled: string): Boolean;
+// Did one of the OPEN blocks declare this name? Answers the mangled key of the innermost that did.
+// It is the veto every flat scalar registry needs: where a block declared the name, ITS entry is the
+// whole answer and the flat one belongs to another declaration.
+var
+  k: Integer;
+  nameU, m: string;
+begin
+  Result := False;
+  Mangled := '';
+  nameU := UpperCase(Name);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    m := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    if (FBlockDeclVars.IndexOf(m) >= 0) or (FBlockDeclRecs.IndexOfName(m) >= 0) then
+    begin
+      Mangled := m;
+      Exit(True);
+    end;
+  end;
+end;
+
+function TSSAGenerator.BlockPtrPointeeIdx(const Name: string): Integer;
+// Walk the OPEN blocks, innermost first, and answer for the one that declared this name:
+//   >= 0  its entry in FPointerVars (the pointee)
+//   -1    it declared the name and NOT as a pointer - the answer is "not a pointer", not "ask on"
+//   -2    no open block declared it: the callers' own maps decide, exactly as before
+var
+  k, idx: Integer;
+  nameU, mangled: string;
+begin
+  Result := -2;
+  nameU := UpperCase(Name);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    idx := FPointerVars.IndexOfName(mangled);
+    if idx >= 0 then Exit(idx);
+    if (FBlockDeclRecs.IndexOfName(mangled) >= 0) or (FBlockDeclVars.IndexOf(mangled) >= 0) then
+      Exit(-1);
+  end;
+end;
+
 function TSSAGenerator.NameIsPointerHere(const Name: string): Boolean;
 // Is this name a POINTER *in the scope that is open right now*?
 //
@@ -40967,18 +41060,10 @@ var
   k, idx: Integer;
   nameU, mangled: string;
 begin
-  nameU := UpperCase(Name);
-  for k := High(FScopeStack) downto 0 do
-  begin
-    if FScopeStack[k].Kind = skProcRoot then Break;
-    if FScopeStack[k].Kind <> skBlock then Continue;
-    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
-    idx := FPointerVars.IndexOfName(mangled);
-    if idx >= 0 then Exit(True);
-    if (FBlockDeclRecs.IndexOfName(mangled) >= 0) or (FBlockDeclVars.IndexOf(mangled) >= 0) then
-      Exit(False);          // this block declared it, and not as a pointer
-  end;
-  Result := FPointerVars.IndexOfName(nameU) >= 0;
+  idx := BlockPtrPointeeIdx(Name);
+  if idx >= 0 then Exit(True);
+  if idx = -1 then Exit(False);
+  Result := FPointerVars.IndexOfName(UpperCase(Name)) >= 0;
 end;
 
 function TSSAGenerator.NameIsStringHere(const Name: string): Boolean;
