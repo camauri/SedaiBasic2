@@ -3675,15 +3675,27 @@ begin
           if OpLhsType = '' then OpLhsType := EnumTypeOfOperand(Node.GetChild(0));   // unary op overloaded on an enum ("Not i")
           if OpLhsType <> '' then
           begin
-            OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(1));
+            // ⭐ THE ARGUMENT PICKS, exactly as it does on the binary arm since m746. A unary operator
+            // is GLOBAL and its label is owned by its ONE parameter's type, so that operand IS the
+            // argument. With a single declaration SoleOverloadLabel answered on its own, which is why
+            // this stayed on the bare lookup; with TWO of one symbol on one owner - "Operator -(byref
+            // As Const UDT1)" beside "Operator -(byref As UDT1)" - the bare label matched neither
+            // signature and the dispatch fell through ENTIRELY: "-a" answered the record HANDLE
+            // negated (-1), with no diagnostic. DIVERGENZE 93.
+            OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+            OpArgs.AddChild(Node.GetChild(0).Clone);
+            OpLabel := ResolveMethodLabelArgs(OpLhsType,
+                         'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(1), OpArgs);
+            if OpLabel = '' then
+              OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(1));
             if (OpLabel <> '') and ProcHasParamCount(OpLabel, 1) then
             begin
-              OpArgs := TASTNode.Create(antArgumentList, Node.Token);
-              OpArgs.AddChild(Node.GetChild(0).Clone);
               EmitUserFunctionCall(OpLabel, OpArgs, Result);
               OpArgs.Free;
               Exit;
             end;
+            OpArgs.Free;
+            OpArgs := nil;
           end;
         end;
         // ⛔ ...AND WHEN NO UNARY OPERATOR IS DECLARED, A NUMERIC "Operator Cast" STILL CONVERTS. The
@@ -37124,7 +37136,7 @@ var
   Bank: TSSARegisterType;
   Slot: Integer;
   Lvl, BaseIdx: Integer;
-  CancelObj, IfA: TASTNode;
+  CancelObj, IfA, OpArgsQ: TASTNode;
 begin
   Result := '';
   if ObjNode = nil then Exit;
@@ -37394,7 +37406,23 @@ begin
       if ParentType = '' then ParentType := ObjectTypeName(ObjNode.GetChild(1));
       if ParentType <> '' then
       begin
-        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2));
+        // ⭐ ASKED WITH THE OPERANDS, like the emit path since m746: two operators of one symbol and
+        // arity are told apart by their SIGNATURE, and the bare label matches neither - so this reader
+        // answered the wrong RETURN TYPE (or none) exactly where the dispatch would have picked the
+        // right operator. Falls back to the bare lookup, which is what a sole overload answers.
+        // DIVERGENZE 93. ⚠️ No emission here: ObjectTypeName is a no-emit query and the clones are
+        // only read for their shape.
+        OpArgsQ := TASTNode.Create(antArgumentList, ObjNode.Token);
+        try
+          OpArgsQ.AddChild(ObjNode.GetChild(0).Clone);
+          OpArgsQ.AddChild(ObjNode.GetChild(1).Clone);
+          NestedT := ResolveMethodLabelArgs(ParentType,
+                       'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2), OpArgsQ);
+        finally
+          OpArgsQ.Free;
+        end;
+        if NestedT = '' then
+          NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(2));
         if NestedT <> '' then Result := VarRecordTypeName(NestedT);   // its UDT return type ('' if scalar)
       end;
       // ⛔ ...AND "scalar <op> UDT" IS OWNED BY THE SCALAR'S BUILTIN TYPE, which neither operand
@@ -37423,7 +37451,17 @@ begin
       ParentType := ObjectTypeName(ObjNode.GetChild(0));
       if ParentType <> '' then
       begin
-        NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(1));
+        // ...and the unary one asked with its single operand, for the same reason. DIVERGENZE 93.
+        OpArgsQ := TASTNode.Create(antArgumentList, ObjNode.Token);
+        try
+          OpArgsQ.AddChild(ObjNode.GetChild(0).Clone);
+          NestedT := ResolveMethodLabelArgs(ParentType,
+                       'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(1), OpArgsQ);
+        finally
+          OpArgsQ.Free;
+        end;
+        if NestedT = '' then
+          NestedT := ResolveMethodLabel(ParentType, 'OPERATOR' + VarToStr(ObjNode.Token.Value) + OperatorArityCode(1));
         if (NestedT <> '') and ProcHasParamCount(NestedT, 1) then Result := VarRecordTypeName(NestedT);
       end;
     end;
