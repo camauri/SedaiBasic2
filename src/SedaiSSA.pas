@@ -314,6 +314,10 @@ type
     // still declared and initialised, so anything else that resolves through it is unaffected.
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
+    // ...and the static member PROCEDURES, "TYPE.NAME" (UPPER). The parser stamps the definition
+    // with STATICMETH (it is the only place that sees "Declare STATIC Sub" in the type body);
+    // gathered here so a call through an OBJECT EXPRESSION can skip evaluating the object.
+    FStaticMemberProcs: TStringList;
     FStaticMemberTypes: TStringList;     // ...and the ones whose type is a UDT: "TYPE.FIELD" -> that UDT's name
     FStaticMemberArrays: TStringList;    // ...and the ones that are ARRAYS: "TYPE.FIELD" -> the global array's id.
                                         // ⛔ Kept OUT of FSharedScalarArr on purpose: a shared SCALAR is a one-element
@@ -1493,6 +1497,8 @@ begin
   FModuleConstVals := TStringList.Create;
   FModuleConstVals.CaseSensitive := False;
   FStaticMembers := TStringList.Create;
+  FStaticMemberProcs := TStringList.Create;
+  FStaticMemberProcs.CaseSensitive := False;
   FStaticMembers.CaseSensitive := False;
   FStaticMemberArrays := TStringList.Create;
   FStaticMemberArrays.CaseSensitive := False;
@@ -1647,6 +1653,7 @@ begin
   FSharedScalarArr.Free;
   FModuleConstVals.Free;
   FStaticMembers.Free;
+  FStaticMemberProcs.Free;
   FStaticMemberArrays.Free;
   FStaticMemberTypes.Free;
   FEnumMembers.Free;
@@ -7028,6 +7035,15 @@ begin
                                 UpperCase(VarToStr(Node.GetChild(0).Value)), Node.GetChild(1), Result);
               Exit;
             end;
+            // ⭐ A STATIC METHOD FIRST, because it must NOT EVALUATE THE OBJECT. Reached through an
+            // object EXPRESSION - "( Type<C>( ) ).staticsub( )" - the ordinary path below resolves the
+            // object and builds the temporary; fbc builds none and counts zero constructors. The
+            // object's TYPE is still what selects the method, and asking it emits nothing.
+            if (FStaticMemberProcs.IndexOf(UpperCase(MethodOwnerType) + '.' +
+                                           UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) and
+               TryStaticMethodCall(MethodObjNode, VarToStr(Node.GetChild(0).Value),
+                                   Node.GetChild(1), Result) then
+              Exit;
             // Overload-aware: an overloaded method has no bare label, so this test must be able to see
             // the "~<sig>" members too -- otherwise "b.g(5)" fell through as if the type had no g at all.
             if HasCallableMethod(MethodOwnerType, VarToStr(Node.GetChild(0).Value), Node.GetChild(1)) then
@@ -32140,6 +32156,13 @@ var
   StatDims, StatLbs: array of Integer;
   LbV, UbV: Int64;
 begin
+  // ⭐ ...and the static member PROCEDURES, from the stamp the parser put on their DEFINITION.
+  if (Node <> nil) and (Node.NodeType = antProcedureDecl) and
+     (Node.Attributes.Values['STATICMETH'] = '1') and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (FStaticMemberProcs.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0) then
+    FStaticMemberProcs.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+
   if Node = nil then Exit;
   if Node.NodeType = antTypeDecl then
   begin
@@ -38166,9 +38189,25 @@ var
 begin
   Result := False;
   CallResult := MakeSSAValue(svkNone);
-  if (ObjNode = nil) or (ObjNode.NodeType <> antIdentifier) then Exit;
-  TypeName := UpperCase(VarToStr(ObjNode.Value));
-  if FindUDT(TypeName) < 0 then Exit;                        // not a declared type name
+  if ObjNode = nil then Exit;
+  // ⭐ AN OBJECT EXPRESSION REACHES A STATIC METHOD TOO, AND MUST NOT BE EVALUATED TO DO IT.
+  // "( Type<C>( ) ).staticsub( )" is legal FreeBASIC and fbc builds NO temporary for it - it counts
+  // zero constructors where we counted one, because the ordinary method path resolved the object
+  // first. The CONST and the static DATA member were already right; only the METHOD had nowhere to
+  // read "this one is static" from, because the fact lives in the PARSER. It now travels on the
+  // definition (STATICMETH) and is gathered into FStaticMemberProcs.
+  // ⚠️ The object's TYPE is still asked - ObjectTypeName does not emit - so only the VALUE is skipped.
+  if ObjNode.NodeType <> antIdentifier then
+  begin
+    TypeName := UpperCase(ObjectTypeName(ObjNode));
+    if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+    if FStaticMemberProcs.IndexOf(TypeName + '.' + UpperCase(MethNm)) < 0 then Exit;
+  end
+  else
+  begin
+    TypeName := UpperCase(VarToStr(ObjNode.Value));
+    if FindUDT(TypeName) < 0 then Exit;                      // not a declared type name
+  end;
   if ResolveMethodLabelArgs(TypeName, MethNm, ArgsNode) = '' then Exit;   // type has no such method
   DummyThis := TASTNode.CreateWithValue(antLiteral, 0, ObjNode.Token);
   try

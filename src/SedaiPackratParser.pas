@@ -3757,6 +3757,14 @@ begin
   if MethodType <> '' then
     ApplyDeclaredDefaults(QualName, ParamList, FTypeStaticMethods.IndexOf(QualName) < 0);
 
+  // ⭐ "Declare STATIC Sub|Function" IN A TYPE BODY: stamp the DEFINITION with it. The fact lives here,
+  // in FStaticMemberProcs, and the SSA had no way to learn it - so calling a static method through an
+  // OBJECT EXPRESSION ("( Type<C>( ) ).ss( )") evaluated the object, and fbc does not: it counts zero
+  // constructors there where we counted one. The CONST and the static DATA member were already right;
+  // only the METHOD had nowhere to read the answer from.
+  if (MethodType <> '') and Assigned(Result) and (FStaticMemberProcs.IndexOf(QualName) >= 0) then
+    Result.Attributes.Values['STATICMETH'] := '1';
+
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
     NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True, True);   // True: skip the implicit THIS
 
