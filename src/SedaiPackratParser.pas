@@ -9940,6 +9940,12 @@ var
   Token, TypeTok: TLexerToken;
   MemberNode: TASTNode;
 begin
+  // ⛔ INITIALISED, not left to the stack. FPC flags these as read-before-write, and a value a
+  // parse takes from whatever the caller's frame held is a compiler whose OUTPUT depends on its
+  // own call history - the class of defect that made wstring/write.bas flip verdict when one
+  // UNUSED local was added elsewhere (DIVERGENZE 103). Determinism first; if a path really does
+  // read one of these before writing it, it now fails the same way every time.
+  TypeTok := nil;
   Token := Context.CurrentToken;
 
   // "REDIM (<array expression>)(dims)" - the target in PARENTHESES. FreeBASIC's own manual prescribes
@@ -12193,6 +12199,13 @@ var
   TypeOfProcSig: Boolean;       // ...and whether that spelling is the one being read
   Idx: Integer;                 // scratch: the const-pointee registry entry for a redeclared name
 begin
+  // ⛔ INITIALISED, not left to the stack. FPC flags these as read-before-write, and a value a
+  // parse takes from whatever the caller's frame held is a compiler whose OUTPUT depends on its
+  // own call history - the class of defect that made wstring/write.bas flip verdict when one
+  // UNUSED local was added elsewhere (DIVERGENZE 103). Determinism first; if a path really does
+  // read one of these before writing it, it now fails the same way every time.
+  DimTypeName := ''; SharedTypeName := ''; SharedFixedLen := '';
+  TypeTok := nil; SharedTypeTok := nil;
   Token := Context.CurrentToken;
   SharedFpNode := nil;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
@@ -13071,6 +13084,12 @@ var
   end;
 
 begin
+  // ⛔ INITIALISED, not left to the stack. FPC flags these as read-before-write, and a value a
+  // parse takes from whatever the caller's frame held is a compiler whose OUTPUT depends on its
+  // own call history - the class of defect that made wstring/write.bas flip verdict when one
+  // UNUSED local was added elsewhere (DIVERGENZE 103). Determinism first; if a path really does
+  // read one of these before writing it, it now fails the same way every time.
+  StaticTypeName := ''; StaticFixedLen := ''; StaticDottedName := '';
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antDim, Token);
   Context.Advance;                                   // consume STATIC
