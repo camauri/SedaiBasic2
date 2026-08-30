@@ -582,6 +582,13 @@ begin
       // '-' is the placeholder for a parameter with no type name; a dotted name is already qualified;
       // a pointer spelling ("T PTR") is left whole, since the tail records it as one token and the
       // call side spells it the same way.
+      // ⚠️ MISURATO IL 31 AGO E NON E' QUI. Un tipo ANNIDATO dentro un namespace ("foo.bar1", un Enum
+      // dentro Type foo) non e' qualificato malgrado il punto, e qualificarne la TESTA qui e' un ramo
+      // MORTO: la suite non si muove di un test. La riduzione dice dov'e' il confine, e sono tre
+      // sonde: enum annidati FUORI da un namespace ✅, enum NON annidati DENTRO ✅, annidati + dentro ❌
+      // (fbc structs/enum_decl: il secondo overload non viene mai chiamato, la scelta cade sull'ARITA').
+      // ⇒ Il disaccordo sta fra la firma e cio' che il SITO DI CHIAMATA chiede del tipo dichiarato
+      // dell'argomento, non nella firma da sola. Prossima mossa: stampare le due stringhe.
       if (Part <> '') and (Part <> '-') and (Pos('.', Part) = 0) and (Pos(' ', Part) = 0) then
       begin
         Res := ResolveUnqualified(ActivePrefix, Part, Ctx, Using);
