@@ -12653,6 +12653,21 @@ begin
       Continue;
     end;
 
+    // ⚠️⚠️ A "REDIM x(...) AS T" OVER A *FIXED* ARRAY IS A DECLARATION IN fbc, AND HERE IT IS A RESIZE.
+    // The rule above only fires when the TYPE differs; the shape of what the name already reaches is
+    // not asked at all. fbc will not re-dimension a fixed array - "Dim x(1 To 1) As Integer : ReDim
+    // x(2 To 2) As Integer" at the same level is "error 4: Duplicated definition" there - so inside a
+    // Scope the ReDim declares a NEW block-local array and the enclosing one keeps its bounds:
+    // dim/shadowing asserts 2,2 inside the block and 1,1 after, and we answer 2,2 for both.
+    // ⛔ TRIED AND WITHDRAWN, 30 Aug 2026. Routing it to ProcessDim when ArraySlotIsDynamic says the
+    // slot is fixed costs FAR more than the two assertions it buys: the suite went from 3 416 to
+    // 3 482 failing assertions, with fbc-int/array-size back from 0 to 68, udt-wstring/instr and
+    // instrrev from 0 to 68 each, dim/redim 0 -> 20, dim/redim-2d-udt -> 17, structs/obj_redim and
+    // str_redim -> 9. ⇒ ArraySlotIsDynamic answers FIXED for slots that are dynamic, so a plain
+    // "Dim a( ) : ReDim a(0 To 9) As T" declared a fresh array on every ReDim. The shape registry has
+    // to be right before this rule can use it - see the ⚠️ on the flat pre-scans in CLAUDE.md.
+    // ⚠️ And there is a REFUSAL half: we ACCEPT the same-level spelling fbc rejects (B2).
+
     // Whatever a DIM said about this slot, a REDIM of it makes it dynamic from here on.
     if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
       NoteArrayShape(FProgram.GetArray(ArrayIdx).Name, True);
