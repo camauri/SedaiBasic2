@@ -28226,6 +28226,18 @@ begin
     begin
       Lbl := T + '.CONSTRUCTOR#' + ArgSig + ':' + UdtSig;
       if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+      // ⛔ ...AND THE SAME SIGNATURE WITH THE PARAMETERS DECLARED **CONST**, which is a different LABEL:
+      // the qualifier appends a positional tail ('C' per parameter). ResolveMethodLabelArgs has known
+      // about that tail since it was added (ArgConstSigFromArgs); THIS resolver never did - the rule in
+      // one path and not its twin. The cost was the copy constructor: "Constructor( ByRef As Const T )"
+      // is the idiomatic spelling, and it is the ONLY one that can bind a temporary, so "Dim b As T = a"
+      // found nothing, fell to the copy-is-not-a-conversion cut just below, and copied the record
+      // silently - fbc ran one copy constructor there and we ran none, on every shape at once.
+      // ⚠️ Tried AFTER the non-const label, so a type that declares BOTH keeps the exact match; and
+      // all-'C' because a const parameter accepts a non-const argument, which is the only direction
+      // that is always sound.
+      Lbl := T + '.CONSTRUCTOR#' + ArgSig + ':' + UdtSig + '!' + StringOfChar('C', Length(ArgSig));
+      if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     end;
     // ⛔⛔ AND A T BUILT FROM A T IS A COPY, NOT A CONVERSION. Once the exact copy constructor above
     // has been asked for and is not there, the answer is "no constructor" - the caller then copies the
@@ -40397,7 +40409,18 @@ begin
             // arity - so on a type whose only one-parameter constructor takes an Integer it answered
             // THAT one, and a byval parameter was "constructed" from its own handle read as a number
             // (m558 caught it at once). A copy constructor is the label that names the type itself.
+            // ⛔⛔ ...AND "ByRef As CONST T" IS THE SAME COPY CONSTRUCTOR, under another LABEL. The const
+            // qualifier appends a positional '!C' tail to the signature, so the idiomatic spelling -
+            // the one fbc's own suite writes, and the only one that can take a temporary - signs
+            // "T.CONSTRUCTOR#I:T!C" and this exact lookup missed it: the copy constructor was simply
+            // never called. Measured on six shapes at once (var = a, dim = a, byval argument, byval
+            // call): with the CONST spelling fbc ran one copy-ctor and we ran none in ALL of them;
+            // rewriting the same program without CONST made four of the six match immediately.
+            // ⚠️ Still EXACT, two spellings and no resolver: the note above says why a resolver is
+            // wrong here, and both of these name the copy constructor and nothing else.
             CopyCtorLbl := UpperCase(FUDTs[PUDT].Name) + '.CONSTRUCTOR#I:' + UpperCase(FUDTs[PUDT].Name);
+            if not FProcDecls.ContainsKey(CopyCtorLbl) then
+              CopyCtorLbl := CopyCtorLbl + '!C';
             if not FProcDecls.ContainsKey(CopyCtorLbl) then CopyCtorLbl := '';
             if CopyCtorLbl <> '' then
             begin
