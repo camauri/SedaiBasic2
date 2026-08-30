@@ -36734,6 +36734,18 @@ begin
           ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR:
             Result := IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1));
         end;
+    antMemberAccess:
+      // A FIELD carries its own unsignedness, exactly as a scalar does - and the member arm was the
+      // one this question never had, so "rec.u - 100" on a UInteger field answered -91 where fbc
+      // answers 18446744073709551525, and "(rec.u - 100) > 0" answered 0 where fbc answers -1.
+      // ⭐ A BIT FIELD is unsigned WHATEVER it was declared as: fbc types the extraction (a mask and
+      // a shift) as UINTEGER, and the oracle says so on the VALUE and not only on the sign column -
+      // "w.u5 - 100" on a "u5 : 5 As ULong" holding 9 prints 18446744073709551525 there, and
+      // "w.b3 - 100" does too on a field declared As BYTE. That is the arithmetic half of
+      // DIVERGENZE 96: m744 closed the RENDERING of a bare read, this closes the TYPE.
+      if FModernMode and (Node.ChildCount >= 1) then
+        Result := (UDTFieldBitWidth(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) > 0) or
+                  (UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) = 8);
     antFunctionCall, antArrayAccess:
       begin
         // A "name(args)" call is parsed as antArrayAccess (callee = child 0), disambiguated to a user
