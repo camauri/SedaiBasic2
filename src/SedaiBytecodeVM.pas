@@ -692,6 +692,10 @@ type
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
     // that NeedBytes bytes fit. Every raw access goes through it.
+    function PtrDomainLoadZStr(Ctx: TExecutionContext; PtrAddr: Int64; Wide: Boolean;
+                               ExactBytes: Integer): AnsiString;
+    procedure PtrDomainStoreZStr(Ctx: TExecutionContext; PtrAddr: Int64; const Value: AnsiString;
+                                 Wide: Boolean);
     function RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
@@ -5198,6 +5202,77 @@ begin
   if PtrUInt((@FRawHeap[newOfs - 8])^) < copySz then copySz := PtrUInt((@FRawHeap[newOfs - 8])^);
   Move(FRawHeap[oldOfs], FRawHeap[newOfs], copySz);
   RawFree(RawPtr);
+end;
+
+function TBytecodeVM.PtrDomainLoadZStr(Ctx: TExecutionContext; PtrAddr: Int64;
+  Wide: Boolean; ExactBytes: Integer): AnsiString;
+// A C STRING read at a PACKED ARRAY pointer - the third domain, beside the raw heap and the
+// record-field one this opcode already told apart.
+// ⛔ It was missing, and the shape that wanted it is fbc's own idiom for a byte buffer:
+// "Dim As UByte foo(...)" then "*Cast(ZString Ptr, @foo(0))". Reading a single element through the
+// same address worked ("*Cast(UByte Ptr, @foo(0))" answers 65), because the SCALAR loads have their
+// packed arm; only the string pair went straight to RawAddr and raised "Null or invalid raw pointer
+// dereference" on a perfectly good array address. DIVERGENZE 127.
+var
+  ArrayIdx: Integer;
+  PtrOffset, Lim: Int64;
+  Ch: Int64;
+begin
+  Result := '';
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  Lim := High(FArrays[ArrayIdx].IntData);
+  while PtrOffset <= Lim do
+  begin
+    Ch := FArrays[ArrayIdx].IntData[PtrOffset];
+    // ⚠️ A WIDE cell is one ELEMENT here, not two bytes: the array holds one code unit per element,
+    // which is the same image the scalar loads see through this address.
+    if Ch = 0 then Break;
+    if Wide then Result := Result + UTF8Encode(WideChar(Word(Ch)))
+    else Result := Result + AnsiChar(Byte(Ch));
+    Inc(PtrOffset);
+    if (ExactBytes > 0) and (Length(Result) >= ExactBytes) then Break;
+  end;
+  if (ExactBytes > 0) and (Length(Result) < ExactBytes) then
+    Result := Result + StringOfChar(#0, ExactBytes - Length(Result));
+end;
+
+procedure TBytecodeVM.PtrDomainStoreZStr(Ctx: TExecutionContext; PtrAddr: Int64;
+  const Value: AnsiString; Wide: Boolean);
+// The write half of PtrDomainLoadZStr: the characters plus the terminator, one per element.
+var
+  ArrayIdx, i: Integer;
+  PtrOffset, Lim: Int64;
+  W: WideString;
+begin
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if GetEnvironmentVariable('ZPTR_DIAG') = '1' then
+    WriteLn(StdErr, '[ZPTR] store addr=', PtrAddr, ' idx=', ArrayIdx, ' off=', PtrOffset,
+            ' highArr=', High(FArrays), ' limInt=', High(FArrays[ArrayIdx].IntData));
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  Lim := High(FArrays[ArrayIdx].IntData);
+  if Wide then
+  begin
+    W := UTF8Decode(Value);
+    for i := 1 to Length(W) do
+    begin
+      if PtrOffset > Lim then Exit;
+      FArrays[ArrayIdx].IntData[PtrOffset] := Ord(W[i]);
+      Inc(PtrOffset);
+    end;
+  end
+  else
+    for i := 1 to Length(Value) do
+    begin
+      if PtrOffset > Lim then Exit;
+      FArrays[ArrayIdx].IntData[PtrOffset] := Ord(Value[i]);
+      Inc(PtrOffset);
+    end;
+  if PtrOffset <= Lim then FArrays[ArrayIdx].IntData[PtrOffset] := 0;   // the terminator
 end;
 
 function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
@@ -13911,6 +13986,15 @@ begin
       end
       else if Instr.Immediate = -1 then
         Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
+      // ⭐ ...and the THIRD domain: a positive address with no RAWPTR_TAG is a PACKED ARRAY pointer,
+      // which is what "@foo(0)" yields. See PtrDomainLoadZStr. DIVERGENZE 127.
+      // ⚠️ ...and NOT for address 0, which has a DEFINED answer of its own further down (fbc's string
+      // runtime tests the pointer, so a null ZSTRING reads as the empty string). Gated on non-zero so
+      // that rule keeps its own path, exactly as it had it.
+      else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
+        Ctx.StringRegs[Instr.Dest] := PtrDomainLoadZStr(Ctx, Ctx.IntRegs[Instr.Src1],
+                                        Instr.Immediate = 1,
+                                        Ord(Instr.Immediate >= 2) * (Instr.Immediate - 2))
       else if Instr.Immediate >= 2 then
         Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
       else
@@ -13926,6 +14010,9 @@ begin
       end
       else if Instr.Immediate = -1 then
         RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+      else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
+        PtrDomainStoreZStr(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
+                           Instr.Immediate = 1)
       else
         RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
     34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],

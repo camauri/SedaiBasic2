@@ -9456,7 +9456,7 @@ procedure TSSAGenerator.ProcessDerefStore(VarNode, ExprNode: TASTNode);
 // "*<expr> = expr" in all its shapes. Probe order preserved from the historical inline cascade:
 // raw FIELD pointee (type-based), raw pointer by NAME (Allocate'd), then the managed deref.
 var
-  RawFieldPointee, RawPtrName: string;
+  RawFieldPointee, RawPtrName, TgtPointee: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
   DerefTgt, CancelTgt: TASTNode;
@@ -9593,6 +9593,34 @@ begin
     Exit;
   end;
 
+  // ⭐ A ZSTRING/WSTRING POINTEE IS TEXT AT AN ADDRESS, whatever domain the address belongs to, and
+  // this last rung had no arm for it. The READ half has asked DerefedType since it was written; the
+  // WRITE half only knew the RAW-pointer ladders above, so "Dim z As ZString Ptr = Cast(ZString Ptr,
+  // @foo(0)) : *z = "ciao"" fell to the scalar store and wrote a string register through a numeric
+  // cell - "Null or invalid pointer dereference", on an address the READ had just used. The same
+  // question, asked with the same helper, on the same node. DIVERGENZE 127.
+  // ⛔ ZSTRING / WSTRING ONLY. A plain "String Ptr" is a MANAGED descriptor cell, not text at an
+  // address: sending it here wrote its characters as raw bytes and "Dim ps As String Ptr = @s :
+  // *ps = "world"" died on "Null or invalid raw pointer dereference" - four corpus guards said so in
+  // one run. The raw ladders above do accept STRING because there the pointer IS raw; this rung is
+  // the managed one.
+  TgtPointee := UpperCase(DerefedType(VarNode.GetChild(0)));
+  if (TgtPointee = 'ZSTRING') or (TgtPointee = 'WSTRING') then
+  begin
+    ProcessExpression(VarNode.GetChild(0), VarReg);
+    VarReg := EnsureIntRegister(VarReg);
+    ProcessExpression(ExprNode, ExprValue);
+    // ...and a NUMERIC value through such a pointer is ONE CHARACTER, exactly as the raw ladder above
+    // already says: "*(pz + 11) = Asc("0")" sets one byte and does not write the digits "48".
+    if (ExprValue.Kind = svkConstString) or
+       ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString)) then
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(TgtPointee)))
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(TgtPointee)));
+    Exit;
+  end;
   // FreeBASIC pointer-deref store: *p = expr. Store the value into the pointee cell at p's address
   // (= p's int value). The pointee bank comes from p's declared pointer type.
   ProcessExpression(VarNode.GetChild(0), VarReg);
