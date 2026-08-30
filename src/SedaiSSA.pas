@@ -433,6 +433,11 @@ type
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
     FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
+    // ...and the same key for every UDT a block declared, with the TYPE as its value. The pair is what
+    // gives the record question per-DECLARATION identity inside ONE procedure: two sibling Scopes may
+    // declare one name as a UDT and as an Integer, and the flat per-procedure map answered whichever
+    // was gathered first - the second block then ran the FIRST one's Operator Cast and died (DIVERGENZE 87).
+    FBlockDeclRecs: TStringList;         // "@B@<serial>@NAME=TYPE" for every UDT a block declared
     FBlockDeclVars: TStringList;         // "@B@<serial>@NAME" for every SCALAR a block declared: the "did THIS
                                          //   block declare it?" test that stops a flat fallback (DIVERGENZE 56)
     FScopeSerial: Integer;               // FB scope: monotonic id for unique scoped internal names (NAME@serial)
@@ -547,6 +552,8 @@ type
     function ParamArrayMangle(const ProcName, ParamName: string): string;  // per-proc placeholder array name
     function LocalArrayMangle(const ProcName, ArrName: string): string;    // per-proc name for a local array shadowing a module array
     function BlockArrayMangle(Serial: Integer; const ArrName: string): string;  // per-BLOCK name for an array DIM'd inside a Scope/If/loop body
+    // The record question asked of the OPEN blocks: identity per DECLARATION (DIVERGENZE 87).
+    function BlockRecordTypeOf(const Name: string; out Declared: Boolean): string;
     function BlockArrayName(const ArrName: string): string;  // the innermost OPEN block that declared this array, or ''
     function ArrayBareName(const SlotName: string): string;  // a slot's name with its scope mangle taken off
     function BlockScalarName(const Name: string): string;    // the innermost OPEN block that declared this @-taken SCALAR, or ''
@@ -1543,6 +1550,8 @@ begin
   FDynamicArrays.CaseSensitive := False;
   FBlockDeclVars := TStringList.Create;
   FBlockDeclVars.CaseSensitive := False;
+  FBlockDeclRecs := TStringList.Create;
+  FBlockDeclRecs.CaseSensitive := False;
   FFixedLenVars := TStringList.Create;
   FFixedLenVars.CaseSensitive := False;
   FZStringVars := TStringList.Create;
@@ -1665,6 +1674,7 @@ begin
   FZeroLbArrays.Free;
   FZeroLbPoisoned.Free;
   FBlockDeclVars.Free;
+  FBlockDeclRecs.Free;
   FFixedLenVars.Free;
   FZStringVars.Free;
   FByrefRetFuncs.Free;
@@ -11119,6 +11129,14 @@ begin
       // ABOVE the one with the pointer. The mark itself is already per-declaration; only the lookup
       // was not. The bare entry is left exactly as it was, so anything without a block reads as before
       // (BlockScalarName, DIVERGENZE 56).
+      // ...and the UDT half of the same filing. Only the NON-record case was registered, so the record
+      // question had nothing per-block to ask and kept answering out of the procedure-wide map.
+      if (InnermostBlockFrameIdx >= 0) and (FindUDT(RecTypeName) >= 0) then
+      begin
+        BlkScalarKey := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, UpperCase(ArrName));
+        if FBlockDeclRecs.IndexOfName(BlkScalarKey) < 0 then
+          FBlockDeclRecs.Add(BlkScalarKey + '=' + RecTypeName);
+      end;
       if (InnermostBlockFrameIdx >= 0) and (FindUDT(RecTypeName) < 0) then
       begin
         BlkScalarKey := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, UpperCase(ArrName));
@@ -29398,12 +29416,18 @@ end;
 function TSSAGenerator.VarRecordTypeName(const VarName: string): string;
 // Returns the UDT type name of a record variable, or '' if it isn't a record variable.
 var
-  ParamUDT: string;
+  ParamUDT, BlkRec: string;
+  BlkDeclared: Boolean;
 begin
   // THIS is method-local: its type is the owner of the method currently being lowered, not the
   // single global "THIS" entry (which different methods would otherwise overwrite).
   if (FCurrentThisType <> '') and (UpperCase(VarName) = 'THIS') then
     Exit(FCurrentThisType);
+  // ...then the OPEN BLOCKS, innermost first: a block declaration shadows a parameter and a
+  // procedure-wide local alike, and it is the only answer that is per-DECLARATION rather than per-name.
+  // See BlockRecordTypeOf. DIVERGENZE 87.
+  BlkRec := BlockRecordTypeOf(VarName, BlkDeclared);
+  if BlkDeclared then Exit(BlkRec);
   // A parameter of the CURRENT procedure resolves to ITS OWN declared type, shadowing the global
   // name→type map: that map is keyed by bare name and keeps one registration, so a param "a As Edge"
   // here would otherwise collide with a param "a As Pt" of another procedure — mis-typing "a.field"
@@ -39782,6 +39806,46 @@ begin
   end;
 end;
 
+function TSSAGenerator.BlockRecordTypeOf(const Name: string; out Declared: Boolean): string;
+// Walks the OPEN block frames innermost-outwards and answers with the declaration the code is standing
+// in: the UDT type when that block declared the name as a record, '' when it declared it as a plain
+// scalar. Declared says whether any open block declared it at all - which is the half that matters,
+// because "declared here and NOT a record" has to STOP the lookup, not fall through to a flat entry
+// another declaration wrote.
+//
+// ⛔ It is the record twin of BlockScalarName, and it exists for the same reason: identity per
+// DECLARATION, not per name. Two sibling Scopes in ONE procedure, one declaring "b As T" and the other
+// "b As Integer", both read the procedure-wide FCurrentProcLocalRecs - gathered at the prologue and
+// keyed by bare name - so "Print b" in the second block ran the FIRST block's Operator Cast on an
+// integer and died in an access violation. The per-procedure screen (FCurrentProcNonRecs) could not
+// help: it is by name and covers the whole procedure, so it stands down for a name the procedure also
+// declares as a record - which is exactly this shape. DIVERGENZE 87, the model m736 set for TYPEs.
+var
+  k, idx: Integer;
+  nameU, mangled: string;
+begin
+  Result := '';
+  Declared := False;
+  nameU := UpperCase(Name);
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[k].Kind = skProcRoot then Break;
+    if FScopeStack[k].Kind <> skBlock then Continue;
+    mangled := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    idx := FBlockDeclRecs.IndexOfName(mangled);
+    if idx >= 0 then
+    begin
+      Declared := True;
+      Exit(FBlockDeclRecs.ValueFromIndex[idx]);
+    end;
+    if FBlockDeclVars.IndexOf(mangled) >= 0 then
+    begin
+      Declared := True;     // declared HERE and not a record: the answer is "not a record", not "ask on"
+      Exit('');
+    end;
+  end;
+end;
+
 function TSSAGenerator.ArrayBareName(const SlotName: string): string;
 // The USER'S name of an array slot: "@P@S1@DYN", "@L@S1@DYN" and "@B@3@DYN" all answer "DYN".
 //
@@ -41700,6 +41764,7 @@ begin
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
   FBlockDeclVars.Clear;
+  FBlockDeclRecs.Clear;
   FFixedLenVars.Clear;
   FZStringVars.Clear;
   FRawFixedLenNode := nil;
