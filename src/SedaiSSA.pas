@@ -11168,6 +11168,7 @@ var
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
   FixLenCap: Integer;      // "DIM s AS STRING * n": declared capacity (0 = variable-length)
   ElemBytes: Int64;        // one array element in bytes, filed for ARRAYSIZE (NoteArrayElemBytes)
+  HasAnyDim: Boolean;      // a subscript written "Any": the slot is DYNAMIC, whatever the rest says
   ScalarCtorInit: Boolean; // "DIM v AS T = <non-T expr>": an implicit conversion via a 1-arg constructor
   CopyCtorInit: Boolean;   // "DIM v AS T = <a T>": a COPY CONSTRUCTION, called by its exact label
   CopyCtorLbl: string;
@@ -11876,6 +11877,7 @@ begin
     //                     otherwise "DIM a(n) AS STRING" (no $ suffix) was mis-typed as numeric.
     //   - no AS-type    → infer from the array name suffix ("DIM a$(n)", "DIM a%(n)", ...).
     RecArrUDTIdx := -1;
+    HasAnyDim := False;
     ArrElemTypeName := '';
     if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) then
     begin
@@ -12108,7 +12110,10 @@ begin
       // Nothing new is needed to model it: an upper bound of -1 against a lower bound of 0 is a size of
       // ZERO, and the branch below already materialises such a dimension into the runtime-sized path.
       else if (DimChild.NodeType = antIdentifier) and (UpperCase(VarToStr(DimChild.Value)) = 'ANY') then
-        DimValue := MakeSSAConstInt(LowerBounds[i] - 1)
+      begin
+        DimValue := MakeSSAConstInt(LowerBounds[i] - 1);
+        HasAnyDim := True;        // "Any" means DYNAMIC: see the NoteArrayShape below
+      end
       else if TryConstFoldArrayBound(DimExpr, FoldedBound) then
         DimValue := MakeSSAConstInt(FoldedBound)   // Ubound(otherarray, d) as an upper bound
       else
@@ -12203,7 +12208,15 @@ begin
     ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
     // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
     // name never declared, which is a dynamic array however it is written.
-    NoteArrayShape(DeclArrName, ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1');
+    // ⛔ ...OR ONE OF THE SUBSCRIPTS IS "Any", WHICH *IS* THE WORD FOR DYNAMIC. "Dim b(Any, Any)" reaches
+    // this general path (the one-dimensional spelling is answered far above, where it files itself
+    // dynamic), and it was filed FIXED - a slot whose whole point is that it will be ReDim'd.
+    // ⚠️ It was LATENT, and measured so: ERASE is the registry's other reader and it agreed with fbc
+    // either way (it asks the storage's runtime stamp, which a ReDim sets). It became visible the
+    // moment a SECOND reader appeared - the "ReDim x(...) As T over a fixed array is a declaration"
+    // rule below - which then declared a fresh array on every ReDim of such a slot and cost 66 failing
+    // assertions across six tests. A registry that nothing reads is not right; it is unobserved.
+    NoteArrayShape(DeclArrName, (ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1') or HasAnyDim);
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -12682,6 +12695,22 @@ begin
     // "Dim a( ) : ReDim a(0 To 9) As T" declared a fresh array on every ReDim. The shape registry has
     // to be right before this rule can use it - see the ⚠️ on the flat pre-scans in CLAUDE.md.
     // ⚠️ And there is a REFUSAL half: we ACCEPT the same-level spelling fbc rejects (B2).
+
+    // ⭐ A "REDIM x(...) AS T" over a FIXED array is a DECLARATION - see DIVERGENZE 117.
+    if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) and
+       (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) and
+       (not ArraySlotIsDynamic(ArrayIdx, ArrName)) then
+    begin
+      if GetEnvironmentVariable('ARRSHAPE_DIAG') = '1' then
+        WriteLn(StdErr, '[ARRSHAPE] REDIM-AS-DECL name="', ArrName, '" slot=', ArrayIdx,
+                ' slotname="', FProgram.GetArray(ArrayIdx).Name, '"');
+      DimNode := TASTNode.Create(antDim, ArrayDeclNode.Token);
+      DimNode.AddChild(ArrayDeclNode.Clone);
+      DimNode.GetChild(0).Attributes.Values['FROMREDIM'] := '1';
+      ProcessDim(DimNode);
+      DimNode.Free;
+      Continue;
+    end;
 
     // Whatever a DIM said about this slot, a REDIM of it makes it dynamic from here on.
     if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
@@ -40743,6 +40772,8 @@ procedure TSSAGenerator.NoteArrayShape(const SlotName: string; Dynamic: Boolean)
 var k: Integer;
 begin
   if SlotName = '' then Exit;
+  if GetEnvironmentVariable('ARRSHAPE_DIAG') = '1' then
+    WriteLn(StdErr, '[ARRSHAPE] note slotname="', SlotName, '" dynamic=', Dynamic);
   if Dynamic then FProgram.SetArrayDynamicShape(FProgram.FindArray(SlotName), True);
   if Dynamic then
   begin
@@ -40770,9 +40801,18 @@ function TSSAGenerator.ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: stri
 begin
   if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
   begin
+    if GetEnvironmentVariable('ARRSHAPE_DIAG') = '1' then
+      WriteLn(StdErr, '[ARRSHAPE] ask name="', UpperCase(ArrName), '" slot=', ArrayIdx,
+              ' slotname="', FProgram.GetArray(ArrayIdx).Name, '"',
+              ' dyn=', FArrShapeDyn.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0,
+              ' fixed=', FArrShapeFixed.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0,
+              ' flat=', FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0);
     if FArrShapeDyn.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0 then Exit(True);
     if FArrShapeFixed.IndexOf(FProgram.GetArray(ArrayIdx).Name) >= 0 then Exit(False);
-  end;
+  end
+  else if GetEnvironmentVariable('ARRSHAPE_DIAG') = '1' then
+    WriteLn(StdErr, '[ARRSHAPE] ask name="', UpperCase(ArrName), '" NO SLOT (idx=', ArrayIdx, ')',
+            ' flat=', FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0);
   Result := FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0;
 end;
 
