@@ -13035,6 +13035,17 @@ begin
   IfNode.Free;
 
   Result := GetOrAllocateVariable(TmpName);
+  // ⛔⛔ AN IIF OVER TWO UDTs YIELDING A TEMPORARY OF ITS OWN WAS TRIED HERE AND WITHDRAWN (31 Aug).
+  // fbc builds the result by COPY CONSTRUCTION and assigns THAT: "a = iif( k, a, b )" counts 2
+  // constructors, 1 copy, 3 destructors there and 2 0 2 here, and copying the chosen branch into a
+  // fresh record at this point makes that ONE shape match exactly. It makes the POPULATION worse:
+  // fbc's structs/temp-var-dtors went from 713 failing assertions to 1125.
+  // ⚠️ The reason is that this is not the only route an IIF over UDTs takes - "iif( k, a, b ).i" is
+  // resolved through ObjectTypeName's own IIF arm and never reaches here, and it reads the field out
+  // of a record that is already wrong: it prints 0 where fbc prints 123, with a branch that is a CALL
+  // or a LITERAL counting one constructor against fbc's three. ⇒ The temporary is the SECOND half of
+  // that defect, and adding it while the first half is broken only moves objects around.
+  // ⇒ Close "iif over UDTs" as ONE piece: the value first, the temporary after. DIVERGENZE 104.
 end;
 
 procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
