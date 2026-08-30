@@ -1202,6 +1202,7 @@ type
     function TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
     function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
       out Offsets: TInt64Array; out TotalSize: Int64; out BaseNode, IdxNode, ChainNode: TASTNode): Boolean;
+    function TryRawUDTFieldAddress(MemberNode: TASTNode; out Value: TSSAValue): Boolean;  // @h->field over a RAW address
     function TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string; out Value: TSSAValue): Boolean;
     function TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string; ExprNode: TASTNode): Boolean;
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
@@ -2654,6 +2655,11 @@ begin
         ProcessExpression(Node, Result);
         Exit;
       end
+      // ...over RAW memory the address of a field is a BYTE ADDRESS, not a packed record-field pointer.
+      // Asked before the managed path, exactly as the read and the store halves ask it before theirs.
+      else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) and
+              TryRawUDTFieldAddress(Node.GetChild(0), Result) then
+        // TryRawUDTFieldAddress produced the byte address
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antMemberAccess) then
         EmitFieldAddress(Node.GetChild(0), Result)
       else if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArrayAccess) then
@@ -22687,6 +22693,39 @@ begin
   if UDTIdx < 0 then Exit;
   if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
   if (IdxNode <> nil) and (TotalSize <= 0) then Exit;   // no stride, no element
+  Result := True;
+end;
+
+function TSSAGenerator.TryRawUDTFieldAddress(MemberNode: TASTNode; out Value: TSSAValue): Boolean;
+// "@h->field" where h holds a RAW ADDRESS: the answer is a BYTE ADDRESS, base + the field's C-layout
+// offset - the same address the READ half already computes (TryEmitRawUDTField) and the STORE half
+// already writes through (TryEmitRawUDTFieldStore).
+//
+// ⛔ THE ADDRESS-OF HALF HAD NO SUCH RULE and always packed a record-field pointer (RECPTR_TAG | handle
+// | slot). Over raw memory that is not an address at all: "@bar->l" did not even COMPARE equal to
+// "bar" (fbc says they are the same address), and "*Cast(Byte Ptr, @bar->l) = &h11" then wrote the
+// FIELD - all eight bytes - instead of one byte, so &hDEADBEEFDEADC0DE became &h11 where fbc leaves
+// &hDEADBEEFDEADC011. Read and write agreed with each other and both disagreed with @ (fbc suite
+// pointers/casting3).
+var
+  TypeName: string;
+  UDTIdx, FieldIdx, i: Integer;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+  BaseNode, IdxNode, ChainNode: TASTNode;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  if not ResolveRawUDTBase(MemberNode.GetChild(0), TypeName, UDTIdx, Offsets, TotalSize,
+                           BaseNode, IdxNode, ChainNode) then Exit;
+  FieldIdx := -1;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    if UpperCase(FUDTs[UDTIdx].Fields[i].Name) = UpperCase(VarToStr(MemberNode.Value)) then
+    begin FieldIdx := i; Break; end;
+  if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not addressed
+  Value := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FieldIdx]);
   Result := True;
 end;
 
