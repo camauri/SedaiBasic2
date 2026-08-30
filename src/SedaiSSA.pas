@@ -37747,11 +37747,33 @@ begin
   Sz := RawElemSizeOfPointee(PointeeType);
   if Sz > 1 then
   begin
+    // ⛔⛔ THE SCALE IS A RUN-TIME QUESTION, because the FIELD is not the thing that decides it. A
+    // "<scalar> Ptr" field is classified raw at compile time, and it may hold either family: ALLOCATE
+    // gives a RAW byte offset (index scaled by SizeOf) while "@arr(i)" gives a PACKED address whose
+    // low bits count ELEMENTS (index scaled by ONE). fbc's structs/ctor_bydesc stores "@arr(lbound)"
+    // in exactly such a field, and "f.array[2]" then reached offset 16 where the element is at 2 -
+    // "Null or invalid pointer dereference", while "f.array[0]" worked because 0 scales to 0.
+    // ⭐ This is the second of the two honest ways out named in IsRawPtrPtrParam's note: test
+    // RAWPTR_TAG at run time and scale accordingly. Four integer ops, on this path only.
+    // scale = 1 when the tag is absent, SizeOf(pointee) when it is present:
+    //   nz = (base AND RAWPTR_TAG) <> 0   -> -1 raw / 0 packed (this VM's boolean)
+    //   scale = 1 - nz * (Sz - 1)         -> Sz raw / 1 packed
+    // DIVERGENZE 129.
     SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(Sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaBitwiseAnd, SzVal, BaseVal,
+                    EnsureIntRegister(MakeSSAConstInt(RAWPTR_TAG)), MakeSSAValue(svkNone));
     ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
-    IdxVal := ScaledIdx;
+    EmitInstruction(ssaCmpNeInt, ScaledIdx, SzVal,
+                    EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+    SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, SzVal, ScaledIdx,
+                    EnsureIntRegister(MakeSSAConstInt(Sz - 1)), MakeSSAValue(svkNone));
+    ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, ScaledIdx, EnsureIntRegister(MakeSSAConstInt(1)), SzVal,
+                    MakeSSAValue(svkNone));
+    SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, SzVal, IdxVal, ScaledIdx, MakeSSAValue(svkNone));
+    IdxVal := SzVal;
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Result, BaseVal, IdxVal, MakeSSAValue(svkNone));
