@@ -15009,6 +15009,7 @@ begin
   ProcessExpression(Node.GetChild(2), EndValue);
 
   // Check if STEP is negative by examining AST node
+  GEBlock := nil;          // only assigned when the step's sign is a runtime question
   StepIsNegative := False;
   NeedRuntimeCheck := False;
   if Node.ChildCount > 3 then
@@ -15382,6 +15383,23 @@ begin
   if DebugSSA then
     WriteLn('[SSA] Edge: ', CondBlock.LabelName, ' → ', BodyBlock.LabelName, ' (true)');
   {$ENDIF}
+  // ⛔ ...AND THE *OTHER* CONDITION BLOCK REACHES THE BODY TOO, by FALLING THROUGH. A step whose sign
+  // is only known at run time compiles to two condition blocks, and this edge - GE -> body - was never
+  // registered, so every pass that reasons on the CFG was reasoning about a loop that does not exist.
+  // LICM is where it showed: it saw ONE loop, put a pre-header in front of the ascending condition, and
+  // hoisted two constants there; the DESCENDING path enters past that block and read both registers
+  // uninitialised. "For i = 20 To 10 Step s" with s = -1 printed 0 where fbc prints 11, and --no-opt
+  // printed 11 - a miscompilation of the optimizer that no corpus program carried, because none of
+  // them steps by a variable that is negative.
+  if NeedRuntimeCheck and Assigned(GEBlock) then
+  begin
+    GEBlock.AddSuccessor(BodyBlock);
+    BodyBlock.AddPredecessor(GEBlock);
+    {$IFDEF DEBUG_SSA}
+    if DebugSSA then
+      WriteLn('[SSA] Edge: ', GEBlock.LabelName, ' → ', BodyBlock.LabelName, ' (fallthrough)');
+    {$ENDIF}
+  end;
 
   // M8: open a block scope for this loop body (mark push at body entry; UDT DIMs in the body are
   // destructed and reclaimed each iteration). Paired with BlockScopeExit in ProcessNext.
@@ -15753,6 +15771,7 @@ var
   TempReg: Integer;
   TempVal: TSSAValue;
   BodyBlock, CondBlock, EndBlock, ContBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
+  GECondBlock: TSSABasicBlock;   // the DESCENDING condition block of a runtime-signed step
 begin
   // NEXT with no active FOR: on a C128 this raises ?NEXT WITHOUT FOR ERROR when executed (and
   // it is trappable). Compiled code has no runtime FOR stack, so the orphan NEXT lowers to the
@@ -15896,6 +15915,22 @@ begin
     if DebugSSA then
       WriteLn('[SSA] Edge: ', BodyBlock.LabelName, ' → ', CondBlock.LabelName, ' (BACK-EDGE)');
     {$ENDIF}
+  end;
+  // ⛔ ...AND THE SECOND BACK EDGE, for the same reason as the fallthrough above: with a runtime step
+  // the tail emits TWO jumps - one to the GE condition and one to the LE condition - and only the LE
+  // one was ever registered. See the long note beside the GE -> body edge in ProcessForLoop.
+  if LoopInfo.NeedRuntimeCheck and (LoopInfo.CondLabelGE <> '') and Assigned(BodyBlock) then
+  begin
+    GECondBlock := FProgram.FindBlock(LoopInfo.CondLabelGE);
+    if Assigned(GECondBlock) then
+    begin
+      BodyBlock.AddSuccessor(GECondBlock);
+      GECondBlock.AddPredecessor(BodyBlock);
+      {$IFDEF DEBUG_SSA}
+      if DebugSSA then
+        WriteLn('[SSA] Edge: ', BodyBlock.LabelName, ' → ', GECondBlock.LabelName, ' (BACK-EDGE, GE)');
+      {$ENDIF}
+    end;
   end;
 
   // Create end block for code after the loop
