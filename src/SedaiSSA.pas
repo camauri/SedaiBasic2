@@ -7462,6 +7462,23 @@ begin
             Result := MakeSSAConstInt(DeclaredScalarLenBytes(ArrName2))
           else if (FindUDT(ArrName2) < 0) and (FixedLenVarSizeBytes(ArrName2) >= 0) then
             Result := MakeSSAConstInt(FixedLenVarSizeBytes(ArrName2))
+          // ⛔ A VARIABLE-LENGTH STRING VARIABLE IS ITS DESCRIPTOR, and this ladder had no rung for it:
+          // every branch above declines a string (DeclaredScalarLenBytes hands LEN back its own path,
+          // FixedLenVarSizeBytes wants a capacity), so "Dim s As String : SizeOf(s)" fell to the last
+          // line, where the name is not a type either, and answered the unknown-type default 8. fbc
+          // answers 24 - the same number SizeOf(String) already answered here, on the TYPE.
+          // ⚠️ ...and only when NO declaration of that name is a narrow numeric. GetVariableType is a FLAT
+          // map on the name, so two sibling Scopes declaring "x" - one As Byte, one As String - give it
+          // ONE verdict for both, and answering 24 for the Byte one would trade a wrong number for
+          // another wrong number. Where a width code exists the flat verdict is known to be unreliable
+          // and the old answer stands. The collision that remains (Integer against String, neither
+          // carrying a width code) is DIVERGENZE 115 - it wants a type registry keyed per DECLARATION,
+          // which is the class-B work REGISTRI.md names.
+          else if (FindUDT(ArrName2) < 0) and IsDeclaredVariable(ArrName2) and
+                  (ArrayIndexOf(ArrName2) < 0) and (GetVariableType(ArrName2) = srtString) and
+                  (FPointerVars.IndexOfName(ArrName2) < 0) and
+                  (FVarWidthCode.IndexOf(ArrName2) < 0) and (FVarPrintKind.IndexOf(ArrName2) < 0) then
+            Result := MakeSSAConstInt(TypeSizeBytes('STRING'))
           else
             Result := MakeSSAConstInt(TypeSizeBytes(ArrName2));
           Exit;
@@ -24753,6 +24770,7 @@ function TSSAGenerator.DeclaredScalarLenBytes(const Name: string): Int64;
 var
   Nm, Nm2: string;
   idx, Idx2: Integer;
+  ScopedReg: TSSAValue;   // this scope's binding for the name, when it has one
 begin
   Result := -1;
   if not FModernMode then Exit;
@@ -24808,7 +24826,17 @@ begin
   end;
   if (not IsDeclaredVariable(Nm)) or (ArrayIndexOf(Nm) >= 0) then Exit;
   if FPointerVars.IndexOfName(Nm) >= 0 then Exit(8);
-  if GetVariableType(Nm) = srtString then Exit;
+  // ⛔ "IS THIS NAME A STRING" ASKED IN SCOPE, not flat. GetVariableType is one verdict per NAME, so two
+  // sibling Scopes declaring "x" - one As Byte, one As String - gave the Byte one the String answer and
+  // this bailed out of the numeric ladder below for BOTH. fbc's quirk/typeof is written exactly that
+  // way: one macro expanded once per type, each expansion a Scope of its own declaring "x".
+  // ResolveExisting walks the LIVE scope stack, so its register's bank is THIS declaration's bank; the
+  // flat map answers only when the name resolves to nothing here (a name used before its DIM).
+  if ResolveExisting(Nm, ScopedReg) then
+  begin
+    if ScopedReg.RegType = srtString then Exit;
+  end
+  else if GetVariableType(Nm) = srtString then Exit;
   idx := FVarWidthCode.IndexOf(Nm);
   if idx >= 0 then
     case PtrInt(FVarWidthCode.Objects[idx]) of
