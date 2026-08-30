@@ -703,7 +703,13 @@ begin
       if (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antIdentifier) then m := 1
       else if (Node.ChildCount >= 3) and (Node.GetChild(1).NodeType = antDimensions) and
               (Node.GetChild(2).NodeType = antIdentifier) then m := 2;
-      if (i = m) and (UseUsing <> nil) then
+      // ⛔⛔ AND NOT ONLY WHEN THERE IS AN IMPORT. This was gated on "UseUsing <> nil", so a namespace
+      // with no "Using" at all never asked the question - and then the generic rewrite below decided,
+      // which asks the VARIABLE authority: "Dim As Integer foo" beside "Type foo" in the same
+      // namespace left the type slot unqualified, the record was built from a type that exists
+      // nowhere, and every field read 0. A declaration's type slot is a TYPE SLOT whether or not
+      // anything was imported; ResolveUnqualified already handles a nil import list.
+      if i = m then
       begin
         DeclNd := Node.GetChild(i);
         V := UpperCase(VarToStr(DeclNd.Value));
