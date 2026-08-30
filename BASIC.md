@@ -2207,6 +2207,22 @@ at module level and legitimate inside a namespace, where it is called as `N.prin
 keywords the same way everywhere. No test in fbc's suite depends on it yet; the census and the risk
 are written up in `job/markdown/DIVERGENZE.md`.
 
+🕳️ **Five gaps measured and named on 30 August 2026**, each reduced to a probe and written up in
+`job/markdown/DIVERGENZE.md`:
+* a forward `Declare` **above** a `Using` does not claim the name for the program (the parser emits no
+  node for a forward declare, so the only position the name has is its body's, below the import);
+* an outer variable of another BANK comes back with a typed `For` counter's print form
+  (`Dim i As Double = 1.5` prints `2` after an `Integer` counter — the VALUE is right, the column is
+  not);
+* `With f( )` calls `f` **once per dot**: a call written `f(x)` parses as an array access and the
+  parser keeps no list of declared procedures, so it repeats the SIDE EFFECTS. `With <lvalue>` — every
+  spelling the fbc suite uses — is unaffected;
+* `Erase` on an array parameter whose elements are a **UDT** stays a compile-time decision (the
+  element re-construction is a run of instructions emitted at compile time);
+* `Allocate( Len(T) )` on a `T Ptr` builds a MANAGED record rather than raw bytes — a model choice,
+  and it is what gives the type its member-array and nested-UDT backing. `New T[n]` and a type with
+  its own `Operator New` are raw and correct in all three halves (read, write and `@`).
+
 🎯 **One declared divergence, and it is a step of lag we do not reproduce.** fbc answers
 `defined( field )` **false** on the line immediately after `field As Integer`, and true as soon as
 another member follows — while the qualified form `defined( T.field )` answers true straight away. We
