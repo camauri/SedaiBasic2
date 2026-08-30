@@ -7464,6 +7464,18 @@ begin
               Exit;
             end;
           end;
+          // ⛔ AN EXPRESSION OF UDT TYPE IS SIZED BY ITS TYPE, NOT BY THE HANDLE THAT CARRIES IT.
+          // "SizeOf( ClassUdt( ) )" answered 8 - every UDT is an int-bank handle here, so the bank
+          // ladder below reached its wide default - where fbc answers SizeOf(ClassUdt). ⭐ And LEN of
+          // the very same expression was already right: one path had the rule and its twin did not.
+          // Asked before the width and bank registries because both of those have a DEFAULT, and a
+          // default here is a wrong answer. Nothing is evaluated: it is a question about the AST.
+          TempStr := ObjectTypeName(Node.GetChild(1).GetChild(0));
+          if (TempStr <> '') and (FindUDT(TempStr) >= 0) then
+          begin
+            Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
+            Exit;
+          end;
           FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(Node.GetChild(1).GetChild(0)));
           if OperandWidthCode(Node.GetChild(1).GetChild(0)) = 0 then
           case InferExprBank(Node.GetChild(1).GetChild(0)) of
