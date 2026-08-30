@@ -12205,7 +12205,7 @@ begin
     // to the VM there is no way to emit that run conditionally, and skipping it left every element a
     // zeroed handle - the next field access died on an access violation (structs/obj-array-erase-arg
     // went straight from CUFAIL to CUERR, which is what the terna is for). Declared as DIVERGENZE 101.
-    if FInProcedure and (FindUDT(ArrayRecordTypeOf(ArrName)) < 0) and
+    if FInProcedure and
        (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, ArrName)) >= 0) then
       DynFlag := 2;
     // ...and its DESTRUCTOR runs on every element FIRST, before the storage goes: fbc's own suite counts
@@ -12221,7 +12221,7 @@ begin
     // allocation DIM does, and the same one REDIM re-runs. A DYNAMIC array is FREED by ERASE and has no
     // elements to give records to, so it is left alone.
     RecUDT := FindUDT(ArrayRecordTypeOf(ArrName));
-    if (DynFlag = 0) and (RecUDT >= 0) then
+    if (DynFlag <> 1) and (RecUDT >= 0) then
     begin
       EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, srtInt),
