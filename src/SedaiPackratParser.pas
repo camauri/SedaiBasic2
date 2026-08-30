@@ -4175,14 +4175,18 @@ function WithObjectNeedsTemp(Node: TASTNode): Boolean;
 // as an antArrayAccess with an empty index list, and an array element access always carries at least
 // one index - so that shape is a call and nothing else. It is what closes "With mk( )" calling mk twice.
 //
-// ⛔⛔ AND THE OTHER SIGN - "the name is in the parser's procedure list" - WAS TRIED AND MEASURED AND
-// WITHDRAWN (31 Aug). It is a correct test (a name cannot be a procedure and an array at once), and it
-// makes things WORSE, because the cure is not free: materialising the object into a hidden "Var tmp ="
-// CONSTRUCTS A COPY, and fbc binds the temporary itself. fbc's own compound/with.bas counts the
-// constructors and destructors around "with f( 123 )" to the unit, and the extra pair took it from 36
-// failing assertions to 63 (structs/temp-var-dtors +3 beside it). ⇒ A call WITH ARGUMENTS still
-// evaluates once per dot; that residue stays DIVERGENZE 100, and closing it wants a temporary the WITH
-// BINDS rather than copies - which is the SSA's question, not the parser's.
+// ⛔⛔ AND THE OTHER SIGN - "the name is in the parser's procedure list" - WAS TRIED, MEASURED AND
+// WITHDRAWN TWICE (31 Aug), and the SECOND measurement corrected the first. It is a correct test (a
+// name cannot be a procedure and an array at once) and it still loses, but not for the reason first
+// written here: the hidden "Var tmp =" does NOT construct a copy (our Var takes the record's handle -
+// probed against fbc, which DOES copy). Of the 27 extra failing assertions it caused in fbc's own
+// compound/with.bas, THIRTEEN were a defect of ours that had nothing to do with WITH - "Var t =
+// ( f( 333 ) )", a PARENTHESISED initialiser, bypassed every type-inference question and declared t an
+// INTEGER holding the handle - and that one is fixed. The remaining fourteen are all CONSTRUCTOR and
+// DESTRUCTOR COUNTS inside f itself: fbc constructs the result object BEFORE entering the function and
+// we do not, so materialising the call makes the difference visible where cloning it hid it.
+// ⇒ A call WITH ARGUMENTS still evaluates once per dot; that residue stays DIVERGENZE 100, and what it
+// waits on is the CALL PROTOCOL's construction point, not this test and not the parser.
 //
 // ⛔ An LVALUE is left alone on purpose, and an array ELEMENT is one: materialising it would COPY the
 // record and ".field = 9" would stop reaching the original - the shape the fbc suite uses everywhere

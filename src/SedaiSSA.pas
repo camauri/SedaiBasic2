@@ -28631,7 +28631,7 @@ procedure TSSAGenerator.RegisterRecordVars(Node: TASTNode);
 // pre-allocation so the handle/explicit type is honoured.
 var
   i, k: Integer;
-  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand: TASTNode;
+  Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand, InitNode: TASTNode;
   VarName, TypeName, NestedTypeName: string;
   SavedInProc: Boolean;
   SavedProcName, SavedTypePath: string;
@@ -28740,6 +28740,18 @@ begin
         if (Decl.ChildCount >= 2) and (Decl.GetChild(0).NodeType = antIdentifier) then
         begin
           VarName := UpperCase(VarToStr(Decl.GetChild(0).Value));
+          // ⛔ THE INITIALISER MAY BE PARENTHESISED, and every question below reads the child NODE, so
+          // one pair of brackets made all of them miss: "Var t = ( f( 333 ) )" declared t an INTEGER
+          // holding the record's HANDLE and "t.i" answered 1 where fbc answers 333, while the identical
+          // declaration without the brackets was right. Found from the other end - the WITH rewrite
+          // materialises "with( f( 333 ) )" into exactly this shape, so it read as a defect of the WITH.
+          // Unwrapped for the QUESTIONS only: the child stays what it is, brackets included, because the
+          // assignment below evaluates it and knows how.
+          InitNode := Decl.GetChild(1);
+          while (InitNode <> nil) and (InitNode.NodeType = antParentheses) and
+                (InitNode.ChildCount >= 1) do
+            InitNode := InitNode.GetChild(0);
+          if InitNode = nil then InitNode := Decl.GetChild(1);
           // A UDT-valued initializer (e.g. "Var v = C(5,2)" or "Var v = otherUdt") infers the UDT type,
           // not a scalar bank: its value is a record, and InferExprBank would see only the int handle and
           // make v an INTEGER holding that handle. ObjectTypeName reads the type without emitting code.
@@ -28756,10 +28768,10 @@ begin
           // nothing: every field answered 0 while the identical declaration with "()" answered right.
           // The initialiser is DROPPED here, which is what makes the rest of the pipeline see the plain
           // typed DIM it already handles.
-          if (Decl.GetChild(1).NodeType = antIdentifier) and (Decl.GetChild(1).ChildCount = 0) and
-             (FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) >= 0) then
+          if (InitNode.NodeType = antIdentifier) and (InitNode.ChildCount = 0) and
+             (FindUDT(UpperCase(VarToStr(InitNode.Value))) >= 0) then
           begin
-            TypeName := UpperCase(VarToStr(Decl.GetChild(1).Value));
+            TypeName := UpperCase(VarToStr(InitNode.Value));
             Decl.RemoveChildAt(1);              // the child list owns and frees it
             Decl.InsertChild(1, TASTNode.CreateWithValue(antIdentifier, TypeName, Decl.GetChild(0).Token));
             Decl.Attributes.Values['INFER'] := '0';
@@ -28773,7 +28785,7 @@ begin
           // The signature is stamped in the very attributes the explicit spelling writes, so the
           // emit-time path that records FFuncPtrSigs is the SAME one for both spellings.
           TypeName := '';
-          NestedTypeName := PreProcPtrSigOf(Decl.GetChild(1));
+          NestedTypeName := PreProcPtrSigOf(InitNode);
           if NestedTypeName <> '' then
           begin
             Decl.Attributes.Values['FUNCPTR'] := '1';
@@ -28782,18 +28794,18 @@ begin
             TypeName := 'INTEGER';           // a procedure entry PC, int-banked as the explicit spelling
           end;
           if TypeName = '' then
-            TypeName := DeclaredPointerTypeOfArg(Decl.GetChild(1));
+            TypeName := DeclaredPointerTypeOfArg(InitNode);
           if TypeName = '' then
-            TypeName := ObjectTypeName(Decl.GetChild(1));
+            TypeName := ObjectTypeName(InitNode);
           // ...and a call to a FUNCTION whose return type is a UDT, which ObjectTypeName cannot answer
           // this early (see PreCollectFuncRetTypes).
-          if (TypeName = '') and (Decl.GetChild(1).NodeType in [antArrayAccess, antFunctionCall]) then
+          if (TypeName = '') and (InitNode.NodeType in [antArrayAccess, antFunctionCall]) then
           begin
-            if Decl.GetChild(1).NodeType = antFunctionCall then
-              NestedTypeName := UpperCase(VarToStr(Decl.GetChild(1).Value))
-            else if (Decl.GetChild(1).ChildCount >= 1) and
-                    (Decl.GetChild(1).GetChild(0).NodeType = antIdentifier) then
-              NestedTypeName := UpperCase(VarToStr(Decl.GetChild(1).GetChild(0).Value))
+            if InitNode.NodeType = antFunctionCall then
+              NestedTypeName := UpperCase(VarToStr(InitNode.Value))
+            else if (InitNode.ChildCount >= 1) and
+                    (InitNode.GetChild(0).NodeType = antIdentifier) then
+              NestedTypeName := UpperCase(VarToStr(InitNode.GetChild(0).Value))
             else
               NestedTypeName := '';
             if (NestedTypeName <> '') and (FPreFuncRetType.IndexOfName(NestedTypeName) >= 0) and
@@ -28810,7 +28822,7 @@ begin
           // knows - an explicit cast, a typed variable, a UDT field, a function result.
           if TypeName = '' then
           begin
-            case Declared32Code(Decl.GetChild(1)) of
+            case Declared32Code(InitNode) of
               1: TypeName := 'BYTE';
               2: TypeName := 'UBYTE';
               3: TypeName := 'SHORT';
@@ -28826,7 +28838,7 @@ begin
             // concatenation, a mixed expression have no DECLARED type to inherit, and there the
             // 64-bit default is the right answer - the same one fbc gives.
             if TypeName = '' then
-              case InferExprBank(Decl.GetChild(1)) of
+              case InferExprBank(InitNode) of
                 srtString: TypeName := 'STRING';
                 srtInt:    TypeName := 'INTEGER';
               else
