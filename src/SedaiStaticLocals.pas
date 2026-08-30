@@ -39,6 +39,39 @@ uses
 // Rename every antIdentifier named FromU (UPPER) to ToName, recursively — but never the field name of
 // a member access (that lives in the antMemberAccess node's Value, and names a record field, not the
 // static variable).
+// Does this node DECLARE FromU itself (a Dim/Var of that name that is not the STATIC being lowered)?
+// Such a declaration shadows the static for that whole subtree, and renaming through it hands two
+// different variables one storage.
+function DeclaresName(N: TASTNode; const FromU: string): Boolean;
+var
+  k: Integer;
+  D: TASTNode;
+begin
+  Result := False;
+  if (N = nil) or (N.NodeType <> antDim) then Exit;
+  for k := 0 to N.ChildCount - 1 do
+  begin
+    D := N.GetChild(k);
+    if (D.NodeType = antArrayDecl) and (D.ChildCount >= 1) and
+       (D.GetChild(0).NodeType = antIdentifier) and
+       (UpperCase(VarToStr(D.GetChild(0).Value)) = FromU) and
+       (D.Attributes.Values['STATIC'] <> '1') then
+      Exit(True);
+  end;
+end;
+
+// True when this block re-declares FromU with an ordinary Dim: the block is a scope of its own and
+// the name inside it is a DIFFERENT variable.
+function BlockShadows(N: TASTNode; const FromU: string): Boolean;
+var
+  k: Integer;
+begin
+  Result := False;
+  if N = nil then Exit;
+  for k := 0 to N.ChildCount - 1 do
+    if DeclaresName(N.GetChild(k), FromU) then Exit(True);
+end;
+
 procedure RenameRefs(Node: TASTNode; const FromU, ToName: string);
 var
   i: Integer;
@@ -53,6 +86,11 @@ begin
   end;
   if (Node.NodeType = antIdentifier) and (UpperCase(VarToStr(Node.Value)) = FromU) then
     Node.Value := ToName;
+  // ⛔ AND STOP AT A BLOCK THAT DECLARES THE NAME ITSELF. A Scope with its own "Dim d" is a different
+  // variable, and renaming through it gave the two ONE global: two sibling Scopes in a Sub, one
+  // "Dim d As Double" and one "Static d As Double", both read 0 - and so did the plain values, with no
+  // pointer in sight. The rename is per PROCEDURE and FreeBASIC's scoping is per BLOCK.
+  if (Node.NodeType = antBlock) and BlockShadows(Node, FromU) then Exit;
   // ⭐ "@z" DOES NOT HOLD AN IDENTIFIER. The parser keeps the historical shape for the bare form -
   // an antProcAddress whose VALUE is the name and which has no children - so walking only
   // antIdentifier left it naming a variable this pass had just renamed away, and the SSA failed with
@@ -304,7 +342,7 @@ begin
       if Decl.Attributes.Values['INFER'] = '1' then
       begin
         Hoisted.Add(BuildSharedArrayDecl(Decl, Mangled));
-        RenameRefs(Proc, UpperCase(VarToStr(NameNode.Value)), Mangled);
+        RenameRefs(GrandNode, UpperCase(VarToStr(NameNode.Value)), Mangled);
         DimNode.Children.Remove(Decl);
         Continue;
       end;
@@ -352,9 +390,15 @@ begin
           InitClone := nil;
         Hoisted.Add(BuildSharedDecl(Decl, Mangled, TName, InitClone, NameNode.Token));
       end;
-      // Rename references to the static in the procedure body, then drop the declaration. An antDim
-      // left empty afterwards is harmless (ProcessDim exits early when it has no children).
-      RenameRefs(Proc, VName, Mangled);
+      // Rename references to the static, then drop the declaration. An antDim left empty afterwards is
+      // harmless (ProcessDim exits early when it has no children).
+      // ⛔ OVER THE BLOCK THAT OWNS THE DECLARATION, not over the whole procedure. A STATIC declared
+      // inside a Scope is visible only there, and renaming the procedure gave a same-named "Dim" in a
+      // SIBLING Scope the static's global: both variables then read 0, values and pointers alike, and
+      // fbc's numbers/infnan is written exactly that way (three sibling scopes, "dim d" / "static d" /
+      // "static d = ...", all called d). A static at the top of the procedure has the body as its
+      // block, so nothing changes for the ordinary case.
+      RenameRefs(GrandNode, VName, Mangled);
       DimNode.Children.Remove(Decl);   // owns its children -> frees the declaration node
     end;
     if OwnerType <> '' then
