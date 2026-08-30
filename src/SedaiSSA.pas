@@ -487,6 +487,10 @@ type
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
+    FArrayFixedStr: TStringList;         // array DECLARATION name (ArrayFactKey) -> "<STRING|ZSTRING|WSTRING>=<n>"
+                                         //   for a fixed-length string ELEMENT. A store into one truncates
+                                         //   exactly as the scalar spelling does; without it an element kept
+                                         //   whatever it was given, whatever its declared capacity said.
     FArrayElemBytes: TStringList;        // array DECLARATION name (ArrayFactKey) -> element BYTE size in Objects[].
                                          //   What ARRAYSIZE and FB.ArraySize multiply the element count by. The bank
                                          //   cannot answer it (the int bank covers 1..8 bytes and every pointer), and
@@ -1089,6 +1093,7 @@ type
     procedure EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);  // ARRAYSIZE = ARRAYLEN * element bytes
     function ArrayElemSizeBytes(const ArrName: string): Int64;                   // one element of that array, in bytes
     procedure NoteArrayElemBytes(const DeclArrName: string; Bytes: Int64);
+    function EmitFixedStrElemStore(const FactKey: string; Value: TSSAValue): TSSAValue;  // "ZString * n" element truncation
     // FreeBASIC bare string functions (CHR/STR/LEFT/RIGHT) routed to their $-suffixed forms.
     procedure EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
@@ -1471,6 +1476,8 @@ begin
   FArrayScalarPointee.CaseSensitive := False;
   FArrayElemBytes := TStringList.Create;
   FArrayElemBytes.CaseSensitive := False;
+  FArrayFixedStr := TStringList.Create;
+  FArrayFixedStr.CaseSensitive := False;
   FArrayPtrPointee := TStringList.Create;
   FArrayPtrPointee.CaseSensitive := False;
   FNeededDispatchers := TStringList.Create;
@@ -1641,6 +1648,7 @@ begin
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
   FArrayElemBytes.Free;
+  FArrayFixedStr.Free;
   FArrayPtrPointee.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
@@ -10927,6 +10935,13 @@ begin
   if j >= 0 then
     ExprValue := ApplyNarrowCode(PtrInt(FArrayElemWidth.Objects[j]), ExprValue);
 
+  // ⛔ ...AND A FIXED-LENGTH STRING ELEMENT TRUNCATES, which is the same rule the SCALAR spelling has
+  // carried all along and this one never had: "Dim a(0 To 1) As ZString * 3 : a(0) = "abcde"" kept all
+  // five characters where "Dim s As ZString * 3" keeps two, and fbc keeps two in both. Measured over
+  // the three kinds: ZString * n and WString * n keep n-1 (the last cell is the terminator), String * n
+  // keeps n and PADS to it.
+  ExprValue := EmitFixedStrElemStore(ArrayFactKey(ArrName), ExprValue);
+
   {$IFNDEF DISABLE_CONSTANT_FOLDING}
   // OPTIMIZATION: Constant folding for type conversions
   // Convert constants at compile-time instead of emitting runtime instructions
@@ -11866,6 +11881,14 @@ begin
         ElemBytes := TypeSizeBytes(ArrElemTypeName);
       if ElemBytes > 0 then
         NoteArrayElemBytes(DeclArrName, ElemBytes);
+      // ⭐ ...and a FIXED-LENGTH STRING element carries its capacity, because a store into one
+      // TRUNCATES. The scalar spelling has always done it ("Dim s As ZString * 3 : s = "abcde"" leaves
+      // two characters, as fbc leaves two); the array element did not truncate at all, and kept all
+      // five. fbc's optimizations/const_idx asserts the whole ladder, ZString * 1 to * 10.
+      if (StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) > 0) and
+         ((ArrElemTypeName = 'STRING') or (ArrElemTypeName = 'ZSTRING') or (ArrElemTypeName = 'WSTRING')) then
+        FArrayFixedStr.Values[DeclArrName] :=
+          ArrElemTypeName + ':' + ArrayDeclNode.Attributes.Values['FIXEDLEN'];
     end;
 
     // Array of function pointers ("Dim As <named funcptr type> a(..)"): the element is an int entry PC.
@@ -13520,6 +13543,36 @@ begin
     Acc := NewAcc;
   end;
   Result := Acc;
+end;
+
+function TSSAGenerator.EmitFixedStrElemStore(const FactKey: string; Value: TSSAValue): TSSAValue;
+// Apply the fixed-length-string truncation an ARRAY ELEMENT owes, if its array declared one. The rule
+// is the scalar one, unchanged: "String * n" pads/truncates to n, "ZString * n" and "WString * n" keep
+// n-1 (the nth cell is the terminator) and stay variable-length so LEN reports the content.
+var
+  Spec, Kind: string;
+  Cap, P: Integer;
+  CapReg, Cut: TSSAValue;
+begin
+  Result := Value;
+  Spec := FArrayFixedStr.Values[FactKey];
+  if Spec = '' then Exit;
+  P := Pos(':', Spec);
+  if P <= 0 then Exit;
+  Kind := Copy(Spec, 1, P - 1);
+  Cap := StrToIntDef(Copy(Spec, P + 1, MaxInt), 0);
+  if Cap <= 0 then Exit;
+  Value := EnsureStringRegister(Value);
+  if Kind = 'STRING' then Exit(EmitFixedLenPad(Value, Cap, False));
+  CapReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, CapReg, MakeSSAConstInt(Cap - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Cut := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  if Kind = 'WSTRING' then
+    EmitInstruction(ssaStrLeftW, Cut, Value, CapReg, MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaStrLeft, Cut, Value, CapReg, MakeSSAValue(svkNone));
+  // ...and a ZSTRING/WSTRING ends at the first NUL, exactly as the scalar store cuts it.
+  Result := EmitFixedLenToVarLen(Cut, Kind = 'WSTRING');
 end;
 
 procedure TSSAGenerator.NoteArrayElemBytes(const DeclArrName: string; Bytes: Int64);
