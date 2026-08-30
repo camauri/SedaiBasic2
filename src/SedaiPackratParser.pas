@@ -873,8 +873,21 @@ begin
   // SSA collector appends ("T.OPERATORCAST$" / "%"). Two casts of one type share a label HERE, at parse
   // time, and have no parameters at all, so treating them as an overload set would give both the same
   // empty signature and break the return-bank scheme. A constructor likewise carries "#<arity>".
-  if (Base = '') or (Pos('.OPERATOR', Base) > 0) or
-     (Pos('#', Base) > 0) or (Pos('@', Base) > 0) or (Pos('~', Base) > 0) then Exit;
+  // ⛔⛔ ...AND "@<arity>" IS NOT A DISCRIMINATOR BETWEEN TWO OPERATORS OF THE SAME ARITY. The note
+  // above is right about the NAMED form and wrong about the symbol one: three global operators
+  //   operator +( l as single, r as const UDT1 )
+  //   operator +( l as single, r as UDT3 )
+  //   operator +( l as single, r as const UDT3 )
+  // all sign "SINGLE.OPERATOR+@2", so two of the three were discarded WITHOUT A DIAGNOSTIC and
+  // "2.0 + u" called whichever survived - a silently wrong answer on a program fbc compiles
+  // (fbc suite overload/op-constonlydiff). The arity stays in the label and the parameter SIGNATURE is
+  // appended beside it, exactly as for any other overload set. DIVERGENZE 93.
+  // ⚠️ The NAMED form (CAST / LET / FOR / STEP / NEXT) is still excluded: a CAST takes no explicit
+  // parameters at all, so every one of them would sign the same empty tail and the RETURN-BANK scheme
+  // the SSA collector appends ("T.OPERATORCAST$") would break.
+  if (Base = '') or (Pos('#', Base) > 0) or (Pos('~', Base) > 0) or
+     ((Pos('.OPERATOR', Base) > 0) and (Pos('@', Base) = 0)) or
+     ((Pos('.OPERATOR', Base) = 0) and (Pos('@', Base) > 0)) then Exit;
 
   // ⛔⛔ TWO PROCEDURES OF ONE NAME IN TWO NAMESPACES ARE NOT AN OVERLOAD SET. They only look alike
   // until the namespace pass mangles them, and a no-parameter pair signs the SAME empty tail - so the

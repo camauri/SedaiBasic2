@@ -921,7 +921,8 @@ type
                                  out BoundVal: TSSAValue): Boolean;  // LBOUND/UBOUND(obj.field[, dim])
     // Fold LBOUND/UBOUND(arr[,dim]) to a compile-time constant when arr's target dimension is static.
     function EnumTypeOfOperand(Node: TASTNode): string;   // enum type name of an enum operand (member/var/param), else '' — for operator overloading
-    function ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string): string; // "2.0 * udt": operator label owned by a builtin scalar type
+    function ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string;
+                                            ArgsNode: TASTNode = nil): string; // "2.0 * udt": operator label owned by a builtin scalar type
     function TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
@@ -3818,8 +3819,20 @@ begin
         // through to the normal numeric path, so plain enum arithmetic is unaffected.
         if OpLhsType = '' then OpLhsType := EnumTypeOfOperand(Node.GetChild(0));
         OpLabel := '';
+        // ⭐ THE ARGUMENTS PICK, when the label carries a signature. A binary operator is GLOBAL in
+        // FreeBASIC and its label is owned by the FIRST parameter's type, so both operands are its
+        // parameters - the argument list is built here, once, and reused by the emission below.
+        // Since DIVERGENZE 93 two operators of one symbol and arity are told apart by that signature.
+        OpArgs := TASTNode.Create(antArgumentList, Node.Token);
+        OpArgs.AddChild(Node.GetChild(0).Clone);
+        OpArgs.AddChild(Node.GetChild(1).Clone);
         if OpLhsType <> '' then
-          OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2))
+        begin
+          OpLabel := ResolveMethodLabelArgs(OpLhsType,
+                       'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2), OpArgs);
+          if OpLabel = '' then
+            OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
+        end
         else
         begin
           // "scalar <op> UDT" ("2.0 * v"): the matching operator's first parameter is the SCALAR, so
@@ -3832,17 +3845,16 @@ begin
           if OpRhsType = '' then OpRhsType := EnumTypeOfOperand(Node.GetChild(1));
           if OpRhsType <> '' then
             OpLabel := ResolveScalarLeftOperatorLabel(Node.GetChild(0),
-                         'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
+                         'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2), OpArgs);
         end;
         if OpLabel <> '' then
         begin
-          OpArgs := TASTNode.Create(antArgumentList, Node.Token);
-          OpArgs.AddChild(Node.GetChild(0).Clone);
-          OpArgs.AddChild(Node.GetChild(1).Clone);
           EmitUserFunctionCall(OpLabel, OpArgs, Result);
           OpArgs.Free;
           Exit;
         end;
+        OpArgs.Free;
+        OpArgs := nil;
       end;
 
       // FreeBASIC "&" is unambiguous string concatenation: a UDT operand that defines a string Cast
@@ -36776,7 +36788,8 @@ begin
   end;
 end;
 
-function TSSAGenerator.ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string): string;
+function TSSAGenerator.ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string;
+  ArgsNode: TASTNode = nil): string;
 // "2.0 * v" with "Operator *(c As Double, a As vec)": an operator's label is owned by its FIRST
 // parameter's declared type, so this one lives under DOUBLE.OPERATOR*@2 and dispatching by the left
 // operand's UDT type can never find it. Resolve a scalar left operand by trying the builtin type
@@ -36788,23 +36801,38 @@ const
   FloatOwners: array[0..1] of string = ('DOUBLE', 'SINGLE');
   IntOwners: array[0..10] of string = ('INTEGER', 'LONG', 'LONGINT', 'UINTEGER', 'ULONGINT',
                                        'ULONG', 'SHORT', 'USHORT', 'BYTE', 'UBYTE', 'BOOLEAN');
+// ⭐ ...AND WITH THE ARGUMENTS, WHEN IT HAS THEM. Since DIVERGENZE 93 a symbol operator's label may
+// carry a parameter SIGNATURE beside its arity ("SINGLE.OPERATOR+@2~..."), because "@2" cannot tell
+// two binary operators apart. The bare lookup then finds nothing (or, with exactly one overload,
+// SoleOverloadLabel rescues it) - so the argument list, when the caller has one, is what picks.
 var
   i: Integer;
+
+  function Own(const T: string): string;
+  begin
+    if ArgsNode <> nil then
+    begin
+      Result := ResolveMethodLabelArgs(T, OpMeth, ArgsNode);
+      if Result <> '' then Exit;
+    end;
+    Result := ResolveMethodLabel(T, OpMeth);
+  end;
+
 begin
   Result := '';
   case InferExprBank(LeftNode) of
     srtString:
-      Result := ResolveMethodLabel('STRING', OpMeth);
+      Result := Own('STRING');
     srtFloat:
       begin
         for i := 0 to High(FloatOwners) do
         begin
-          Result := ResolveMethodLabel(FloatOwners[i], OpMeth);
+          Result := Own(FloatOwners[i]);
           if Result <> '' then Exit;
         end;
         for i := 0 to High(IntOwners) do
         begin
-          Result := ResolveMethodLabel(IntOwners[i], OpMeth);
+          Result := Own(IntOwners[i]);
           if Result <> '' then Exit;
         end;
       end;
@@ -36812,12 +36840,12 @@ begin
     begin
       for i := 0 to High(IntOwners) do
       begin
-        Result := ResolveMethodLabel(IntOwners[i], OpMeth);
+        Result := Own(IntOwners[i]);
         if Result <> '' then Exit;
       end;
       for i := 0 to High(FloatOwners) do
       begin
-        Result := ResolveMethodLabel(FloatOwners[i], OpMeth);
+        Result := Own(FloatOwners[i]);
         if Result <> '' then Exit;
       end;
     end;
