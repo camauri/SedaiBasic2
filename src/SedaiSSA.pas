@@ -665,6 +665,7 @@ type
     procedure EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer; BraceNode: TASTNode);
     procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
     function UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
+    function AggregateArgsSpreadABase(UDTIdx: Integer; ArgsNode: TASTNode): Boolean;  // an element that is a BASE value
     procedure EmitDestructorCall(const HandleVal: TSSAValue; const TypeName: string);  // V5
     function FindBaseCall(Node: TASTNode): TASTNode;    // M4.4f: the body's explicit BASE call node (or nil)
     // MODERN: gather the DIM'd UDTs of THIS scope only -- a DIM inside a block belongs to the block.
@@ -30807,6 +30808,49 @@ begin
       Inc(FieldIdx);
       Continue;
     end;
+    // ⛔⛔ AN ELEMENT THAT IS A VALUE OF A *BASE* TYPE FILLS THE WHOLE INHERITED PART, and consumes as
+    // many field positions as that base has fields. FreeBASIC's own initialiser for a derived type is
+    // written both ways - "Type<udt2>( 1, 2, 3, 4, 5, 6 )" flat, and "Type<udt2>( Type<udt1>(1, 2), 3,
+    // 4, 5, 6 )" or "Type<udt2>( u1, 3, 4, 5, 6 )" with the base part as ONE element - and the second
+    // form used to store the record HANDLE into the first inherited field and shift everything after it
+    // by one, so the last field stayed 0: fbc writes 1 2 3 4 5 6 and we wrote 6 3 4 5 6 0.
+    // ⚠️ Only a PROPER ancestor. The whole-value copy at the top of this routine already answers the
+    // one-element list whose element is the type itself; here the element is a PREFIX of the fields and
+    // the values after it continue where the base's fields end.
+    if (ObjectTypeName(ArgsNode.GetChild(i)) <> '') and
+       (UpperCase(ObjectTypeName(ArgsNode.GetChild(i))) <> UpperCase(FUDTs[UDTIdx].Name)) and
+       IsSubtypeOf(FUDTs[UDTIdx].Name, ObjectTypeName(ArgsNode.GetChild(i))) and
+       (FindUDT(ObjectTypeName(ArgsNode.GetChild(i))) >= 0) and
+       ResolveRecordObject(ArgsNode.GetChild(i), ArgVal, SrcType) then
+    begin
+      j := FindUDT(ObjectTypeName(ArgsNode.GetChild(i)));
+      for Slot := 0 to High(FUDTs[j].Fields) do
+      begin
+        if FieldIdx + Slot > High(FUDTs[UDTIdx].Fields) then Break;
+        Bank := FUDTs[j].Fields[Slot].Bank;
+        UnitVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
+        case Bank of
+          srtFloat:  EmitInstruction(ssaRecordLoadFloat, UnitVal, ArgVal, MakeSSAValue(svkNone),
+                                     MakeSSAConstInt(FUDTs[j].Fields[Slot].Slot));
+          srtString: EmitInstruction(ssaRecordLoadString, UnitVal, ArgVal, MakeSSAValue(svkNone),
+                                     MakeSSAConstInt(FUDTs[j].Fields[Slot].Slot));
+        else
+          EmitInstruction(ssaRecordLoadInt, UnitVal, ArgVal, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(FUDTs[j].Fields[Slot].Slot));
+        end;
+        case FUDTs[UDTIdx].Fields[FieldIdx + Slot].Bank of
+          srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, UnitVal,
+                                     MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx + Slot].Slot));
+          srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, UnitVal,
+                                     MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx + Slot].Slot));
+        else
+          EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, UnitVal,
+                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx + Slot].Slot));
+        end;
+      end;
+      Inc(FieldIdx, Length(FUDTs[j].Fields));
+      Continue;
+    end;
     // ⛔ A NESTED UDT FIELD OWNS A RECORD, and its slot holds that record's HANDLE. Storing the value
     // over the handle left the nested instance unreachable: "Dim b As baz = (111)" - baz's only field
     // being "f As foo" - printed garbage for b.f.bar and CRASHED the next program that did it. fbc lets
@@ -30889,6 +30933,27 @@ begin
   // UDT and requires TWO destructor runs - one for this temporary, one for the result.
   RegisterResultTemp(Handle, UpperCase(TypeName), True);
   Result := True;
+end;
+
+function TSSAGenerator.AggregateArgsSpreadABase(UDTIdx: Integer; ArgsNode: TASTNode): Boolean;
+// Does any element of this initialiser list name a value of a PROPER ANCESTOR of UDTIdx? Such an
+// element is not one field's value: it fills the whole inherited part and consumes that many positions.
+// The question is about the ARGUMENTS, so it cannot live in UDTNeedsAggregateWalk beside the three
+// shapes that are about the TYPE - but it has the same consequence, and the same answer: hand the list
+// to EmitUDTAggregateInit, the one routine that knows.
+var
+  i: Integer;
+  ArgT: string;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (ArgsNode = nil) then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+  begin
+    ArgT := ObjectTypeName(ArgsNode.GetChild(i));
+    if (ArgT <> '') and (UpperCase(ArgT) <> UpperCase(FUDTs[UDTIdx].Name)) and
+       (FindUDT(ArgT) >= 0) and IsSubtypeOf(FUDTs[UDTIdx].Name, ArgT) then
+      Exit(True);
+  end;
 end;
 
 function TSSAGenerator.UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
@@ -30978,7 +31043,14 @@ begin
     // ⚠️ The arguments were already evaluated above (for the ctor signature) and this re-evaluates them;
     // that is accepted deliberately and ONLY here, because these are exactly the types the loop below
     // miscompiled. A type with none of the three shapes takes the loop, unchanged, as it always did.
-    if (AggUDT >= 0) and (ArgsNode <> nil) and UDTNeedsAggregateWalk(AggUDT) then
+    // ⛔ ...AND A FOURTH SHAPE, which is a property of the ARGUMENTS and not of the type: an element
+    // that is a value of a BASE type fills the whole inherited part and consumes as many positions as
+    // that base has fields. The loop below is positional over arguments, so it stored the record HANDLE
+    // into the first inherited field and shifted the rest by one - "Type<udt2>( u1, 3, 4, 5, 6 )" wrote
+    // 1 3 4 5 6 0 where fbc writes 1 2 3 4 5 6, and the PARENTHESISED spelling of the same
+    // initialiser was right because it goes to the routine that knows.
+    if (AggUDT >= 0) and (ArgsNode <> nil) and
+       (UDTNeedsAggregateWalk(AggUDT) or AggregateArgsSpreadABase(AggUDT, ArgsNode)) then
     begin
       EmitUDTAggregateInit(HandleVal, AggUDT, ArgsNode);
       Exit;
