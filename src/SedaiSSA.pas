@@ -62,6 +62,13 @@ type
     IterType: string;           // T, or '' when this is not a type-driven loop
     IterHasStep: Boolean;       // the source wrote STEP, so the one-argument operators are used
     CounterScoped: Boolean;     // "For i As T": the counter got a scope frame of its own, popped at NEXT
+    // ...and what the counter's NAME meant in the flat width / print-form maps BEFORE the head wrote
+    // over it (-1 = it had no entry). Those maps are keyed by bare name and outlive the scope frame,
+    // so without putting these back "Dim i As Double : For i As Integer ... : Print i" printed 2 for
+    // 1.5 - the frame gave the name back, the FACTS about the name stayed the counter's. DIVERGENZE 99.
+    CounterName: string;
+    CounterProc: string;        // the procedure whose "PROC|NAME" entry was overwritten ('' = module level)
+    SavedWidth, SavedPrintKind, SavedScopedPrintKind: Integer;
   end;
 
   { User-defined function info for DEF FN }
@@ -874,6 +881,10 @@ type
     function BuiltinFuncPtrOpId(const NameU: string): Integer;          // @Sin/@Cos/... math-builtin funcptr op id (0 if not a builtin)
     function MathConstValue(const NameU: string; out V: Double): Boolean;  // crt/math.bi constants (M_PI, M_E, ...)
     procedure RecordVarWidth(const VarName, TypeName: string);          // B1.5 phase 2: remember a var's width
+    // A "For i As T" counter's width/print form is written into the FLAT maps, which outlive its scope
+    // frame: these two read an entry out and put it back, so NEXT can restore what the name meant before.
+    function NameEntryValue(L: TStringList; const Key: string): Integer;         // -1 = no entry
+    procedure SetNameEntryValue(L: TStringList; const Key: string; Value: Integer);  // -1 = remove it
     function CurrentProcParamTypeName(const Name: string): string;   // a PARAMETER's declared type, from its own declaration
     function StringLiteralBytes(Node: TASTNode; out Bytes: Int64): Boolean;
     function DeclaredScalarLenBytes(const Name: string): Int64;
@@ -14566,6 +14577,8 @@ var
   UseLELabel, UseGELabel, CheckResultLabel: string;  // Labels for runtime step direction
   NeedRuntimeCheck: Boolean;  // True if STEP direction must be determined at runtime
   CounterScoped: Boolean;     // "For i As T": a scope frame was opened for the counter
+  CtrKey, CtrProc: string;    // ...and what its NAME meant in the flat maps before the head (DIVERGENZE 99)
+  SavedW, SavedPK, SavedSPK: Integer;
 begin
   if Node.ChildCount < 3 then Exit;
   if Node.GetChild(0).NodeType <> antIdentifier then Exit;
@@ -14583,6 +14596,7 @@ begin
   // one's register, else the freshly-bound counter and the body (which resolves the older binding) would
   // diverge — the loop would step one register while the body reads a stale one.
   CounterScoped := False;
+  CtrKey := ''; CtrProc := ''; SavedW := -1; SavedPK := -1; SavedSPK := -1;
   if Node.Attributes.Values['VARTYPE'] <> '' then
   begin
     WantBank := TypeNameToBank(Node.Attributes.Values['VARTYPE'], VarName);
@@ -14607,6 +14621,19 @@ begin
     // A "FOR i AS UInteger/ULongInt" counter prints unsigned (no leading sign space), and a narrow counter
     // type wraps on step -- record its width/print-kind like a DIM does, or "For i As UInteger ... Print i"
     // printed the sign space FreeBASIC omits (Rosetta's digit-count / Wilson's-theorem loops).
+    // ⛔ ...but those two maps are keyed by BARE NAME and know nothing of the frame just pushed, so the
+    // counter's facts outlived the counter: "Dim gu As UInteger : For gu As Integer ... : Print gu - 100"
+    // printed -91 where fbc prints 18446744073709551525, and a "Dim n As UByte" stopped wrapping. Read
+    // out what the name meant here and hand it to NEXT, which puts it back with the frame. DIVERGENZE 99.
+    if CounterScoped then
+    begin
+      CtrKey := UpperCase(VarName);
+      if FInProcedure then CtrProc := UpperCase(FCurrentProcName) else CtrProc := '';
+      SavedW   := NameEntryValue(FVarWidthCode, CtrKey);
+      SavedPK  := NameEntryValue(FVarPrintKind, CtrKey);
+      if CtrProc <> '' then SavedSPK := NameEntryValue(FVarPrintKind, CtrProc + '|' + CtrKey)
+      else SavedSPK := -1;
+    end;
     RecordVarWidth(VarName, Node.Attributes.Values['VARTYPE']);
   end
   else
@@ -15017,6 +15044,11 @@ begin
   LoopInfo.IterType := '';
   LoopInfo.IterHasStep := False;
   LoopInfo.CounterScoped := CounterScoped;   // "For i As T": pop the counter's frame at NEXT
+  LoopInfo.CounterName := CtrKey;            // ...and put the NAME's facts back with it (DIVERGENZE 99)
+  LoopInfo.CounterProc := CtrProc;
+  LoopInfo.SavedWidth := SavedW;
+  LoopInfo.SavedPrintKind := SavedPK;
+  LoopInfo.SavedScopedPrintKind := SavedSPK;
   SetLength(FLoopStack, Length(FLoopStack) + 1);
   FLoopStack[High(FLoopStack)] := LoopInfo;
 end;
@@ -15507,7 +15539,21 @@ begin
   end;
   // "For i As T" opened a scope for its counter: it ends here, so the name goes back to whatever it
   // meant before the loop (usually nothing, sometimes an outer variable of another type entirely).
-  if LoopInfo.CounterScoped then ScopePopFrame;
+  if LoopInfo.CounterScoped then
+  begin
+    ScopePopFrame;
+    // ...and the NAME's facts go back with the frame: the width and print-form maps are keyed by bare
+    // name, so the counter's declaration had overwritten whatever an outer variable of that name meant.
+    // DIVERGENZE 99.
+    if LoopInfo.CounterName <> '' then
+    begin
+      SetNameEntryValue(FVarWidthCode, LoopInfo.CounterName, LoopInfo.SavedWidth);
+      SetNameEntryValue(FVarPrintKind, LoopInfo.CounterName, LoopInfo.SavedPrintKind);
+      if LoopInfo.CounterProc <> '' then
+        SetNameEntryValue(FVarPrintKind, LoopInfo.CounterProc + '|' + LoopInfo.CounterName,
+                          LoopInfo.SavedScopedPrintKind);
+    end;
+  end;
   // "Next j, i": close the next loop out with the same code, one fewer to go.
   if RemainingNext > 1 then
   begin
@@ -24315,6 +24361,37 @@ begin
     SetPrintKindScoped(FCurrentProcName, Nm, T);
 end;
 
+function TSSAGenerator.NameEntryValue(L: TStringList; const Key: string): Integer;
+// The Objects[] payload of a name→code map, or -1 when the name has no entry at all. The two are
+// different answers and the caller must be able to put back the one it found: writing a 0 where there
+// was NOTHING is [[putting-a-default-back-is-data-loss]] - kind 0 is "declared signed", which STOPS the
+// lookup, and no entry is "ask the next map".
+var
+  Idx: Integer;
+begin
+  Result := -1;
+  if not Assigned(L) then Exit;
+  Idx := L.IndexOf(Key);
+  if Idx >= 0 then Result := PtrInt(L.Objects[Idx]);
+end;
+
+procedure TSSAGenerator.SetNameEntryValue(L: TStringList; const Key: string; Value: Integer);
+// Put a NameEntryValue back: -1 removes the entry, anything else writes it.
+var
+  Idx: Integer;
+begin
+  if not Assigned(L) then Exit;
+  Idx := L.IndexOf(Key);
+  if Value < 0 then
+  begin
+    if Idx >= 0 then L.Delete(Idx);
+  end
+  else if Idx >= 0 then
+    L.Objects[Idx] := TObject(PtrInt(Value))
+  else
+    L.AddObject(Key, TObject(PtrInt(Value)));
+end;
+
 procedure TSSAGenerator.SetPrintKindScoped(const ProcName, VarName, TypeName: string);
 // Record a name's print form under "PROC|NAME". FVarPrintKind is keyed by bare name, so an unsigned
 // declaration in ONE procedure leaked into every same-named variable in the program: Rosetta "Bitwise
@@ -28517,9 +28594,21 @@ begin
   // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
   // pre-allocated there instead of defaulting to float — a float integer-loop counter is slower, and its
   // int comparison result can be allocated over an int accumulator in the loop body (silent wrong sums).
+  // ⛔ ...but it must not OWN the bare name. RegisterTypedVar treats a module-level declaration as
+  // AUTHORITATIVE, and a typed counter at module level is not one: it is its own scope (m738), so
+  // "Dim i As Double = 1.5 : For i As Integer = 1 To 2 : Next : Print i" re-typed the module's i as
+  // INTEGER and printed 2 - and a "Dim s As String" outside printed 2 as well, reading the wrong bank
+  // entirely. Registering it as if in a procedure is exactly add-if-absent: a counter whose name no
+  // one else declared still gets its int bank (which is why this call exists), and a name that IS
+  // declared outside keeps the declaration's. DIVERGENZE 99.
   if (Node.NodeType = antForLoop) and (Node.Attributes.Values['VARTYPE'] <> '') and
      (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    SavedInProc := FPreScanInProc;
+    FPreScanInProc := True;
     RegisterTypedVar(UpperCase(VarToStr(Node.GetChild(0).Value)), Node.Attributes.Values['VARTYPE']);
+    FPreScanInProc := SavedInProc;
+  end;
   // antRedim as well as antDim: in FreeBASIC a REDIM may be an array's FIRST and only declaration
   // ("Redim As block hufflist(0)"), and it parses to the very same antArrayDecl children. Gating on
   // antDim alone left such an array with no recorded element type, so "r(i).field" never resolved as a
