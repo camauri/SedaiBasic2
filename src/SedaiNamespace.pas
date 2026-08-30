@@ -1061,6 +1061,7 @@ procedure FlattenNamespaces(AST: TASTNode);
 var
   Ctx: TNsContext;
   gi: Integer;
+  FwdList: TStringList;
 begin
   if AST = nil then Exit;
   Ctx := TNsContext.Create;
@@ -1068,6 +1069,24 @@ begin
     CollectNamespaces(AST, '', Ctx);
     if Ctx.NamespaceNames.Count = 0 then Exit;   // no namespaces: nothing to do
     // The names the program declares at MODULE level, so an import cannot take one over.
+    // ⭐ FIRST the FORWARD declarations, at position 0. A "Declare Function bar" emits no node, so the
+    // only position BAR had was its BODY's - and a body written under the "Using" lost to the import:
+    // "print bar" answered the namespace's 1 where fbc answers the program's 2. Position 0 = visible
+    // from the top, which is what the oracle does: fbc answers 2 whether the Declare stands before the
+    // Using or after it. (Without any Declare at all fbc REFUSES the program - "error 4: Duplicated
+    // definition" - so nothing it compiles is harmed by this being unconditional.) NoteDeclared keeps
+    // the FIRST entry, so a later real definition does not push the position back down. DIVERGENZE 98.
+    FwdList := TStringList.Create;
+    try
+      FwdList.Delimiter := ',';
+      FwdList.StrictDelimiter := True;
+      FwdList.DelimitedText := AST.Attributes.Values['FWDDECL'];
+      for gi := 0 to FwdList.Count - 1 do
+        if Trim(FwdList[gi]) <> '' then
+          NoteDeclared(Ctx.GlobalNames, UpperCase(Trim(FwdList[gi])), 0);
+    finally
+      FwdList.Free;
+    end;
     for gi := 0 to AST.ChildCount - 1 do
       if AST.GetChild(gi).NodeType <> antNamespace then
       begin

@@ -116,6 +116,13 @@ type
     // Overloading: procedure label (UPPER) -> the FIRST declaration seen with that label, while it is
     // still un-renamed. A second declaration of the same name means an overload set, and both get a
     // parameter-bank signature appended to their labels (see ParseProcedureDecl).
+    // Module-level FORWARD declarations ("Declare Function bar As Integer"). The statement itself is a
+    // no-op for us - calls resolve from a pre-pass over the real definitions - but the NAME it declares
+    // is one of the program's own, and a name of the program's own BEATS a "Using" import. With no node
+    // emitted, the only position BAR had was its BODY's, which sits under the Using: the import won and
+    // "print bar" answered the namespace's 1 where fbc answers the program's 2. Written onto the program
+    // root as an attribute so the namespace pass can read it. DIVERGENZE 98.
+    FForwardDeclNames: TStringList;
     FProcSeen: TStringList;
     // ⛔⛔ ...AND THE OVERLOAD DECISION IS ASKED PER NAMESPACE. Two procedures of the same name in two
     // DIFFERENT namespaces are not an overload set - they are two names that only look alike until the
@@ -635,6 +642,8 @@ begin
   MemoizationMode := mmAdaptive;
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
+  FForwardDeclNames := TStringList.Create;
+  FForwardDeclNames.CaseSensitive := False;
   FProcSeen := TStringList.Create;
   FProcSeen.CaseSensitive := False;
   FProcSeenNs := TStringList.Create;
@@ -678,6 +687,7 @@ begin
   if Assigned(FExpressionParser) then
     FExpressionParser.Free;
 
+  FForwardDeclNames.Free;
   FProcSeen.Free;
   FProcSeenNs.Free;
   FByrefRetProcs.Free;
@@ -1318,6 +1328,16 @@ begin
  CollectModuleLocalNames(Result, False);
  RejectStaticVarLenStringInit(Result, False);
 
+ // The module-level FORWARD declarations, handed to the namespace pass on the root: a name the program
+ // declares that way is one of its own and beats a "Using" import, and it emitted no node to say so.
+ // DIVERGENZE 98.
+ if FForwardDeclNames.Count > 0 then
+ begin
+   FForwardDeclNames.Delimiter := ',';
+   FForwardDeclNames.StrictDelimiter := True;
+   Result.Attributes.Values['FWDDECL'] := FForwardDeclNames.DelimitedText;
+ end;
+
  DoNodeCreated(Result);
 end;
 
@@ -1538,6 +1558,17 @@ begin
        HandleError(Format('"%s" describes a member of a TYPE: a DECLARE outside a type body cannot ' +
          'carry it', [DeclDecoU]), Context.PeekNext);
    end;
+   // ⭐ ...BUT RECORD THE NAME BEFORE SKIPPING THE LINE. The DECLARE is a no-op for call resolution and
+   // is NOT one for NAME resolution: a name the program declares at module level beats a "Using"
+   // import, and with no node emitted the only position this name had was its BODY's - which may sit
+   // under the Using, so the import won. "Declare Function bar : Using ns1 : ... : Function bar = 2"
+   // answered ns1's 1 where fbc answers 2. The shape is "DECLARE SUB|FUNCTION|PROPERTY <name>";
+   // a DOTTED name is a method of a type, not a module-level name. DIVERGENZE 98.
+   if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
+      Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
+      (Pos('.', VarToStr(Context.PeekToken(2).Value)) = 0) then
+     if FForwardDeclNames.IndexOf(UpperCase(VarToStr(Context.PeekToken(2).Value))) < 0 then
+       FForwardDeclNames.Add(UpperCase(VarToStr(Context.PeekToken(2).Value)));
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
    Result := nil;
    Exit;
