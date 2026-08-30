@@ -5468,7 +5468,7 @@ begin
             // place of their byte twins. Without it the three-argument form had no wide branch at all
             // and answered BYTE positions on a wide haystack (4 where fbc answers 2), while the
             // two-argument form beside it was right.
-            IsW := IsWStringExpr(ArgListNode.GetChild(0)) and not IsAny;
+            IsW := IsWStringExpr(ArgListNode.GetChild(0));
             if ArgListNode.ChildCount >= 3 then
             begin
               ProcessExpression(ArgListNode.GetChild(2), Arg3Value);  // start (1-based)
@@ -5529,7 +5529,15 @@ begin
             end;
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            if IsAny then
+            if IsAny and IsW then
+              // ⭐ The "Any set" form of a WIDE haystack: a set MEMBER is a codepoint, and so is the
+              // answer. The byte twin compares single BYTES against the set's bytes, so it matches a
+              // CONTINUATION byte and answers a byte offset - 8 where fbc answers 2 on a
+              // three-codepoint Japanese string. All 68 remaining assertions of udt-wstring/instrrev
+              // are this one form. The restricted-prefix arithmetic above is already read in
+              // codepoints, so the start argument comes out right with it.
+              EmitInstruction(ssaStrInstrRevAnyW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
+            else if IsAny then
               EmitInstruction(ssaStrInstrRevAny, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
             else if IsW then
               // WSTRING haystack: codepoint position of the last occurrence, with or without a start.
@@ -5700,14 +5708,17 @@ begin
             // ⚠️ The start-below-1 case comes out on its own: MID$ of a WSTRING with a start below 1
             // is EMPTY (fbc, and now us), so the search finds nothing and the AND with (pos<>0)
             // answers 0 - which is fbc's answer for Instr(0, ...) and Instr(-1, ...).
-            if (not IsAny) and IsWStringExpr(ArgListNode.GetChild(1)) then
+            if IsWStringExpr(ArgListNode.GetChild(1)) then
             begin
               InsHayLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
               EmitInstruction(ssaStrLenW, InsHayLen, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
               InsSuffix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
               EmitInstruction(ssaStrMidW, InsSuffix, ArgReg, Arg3Reg, InsHayLen);
               InsPos := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaStrInstrW, InsPos, InsSuffix, Arg2Reg, MakeSSAValue(svkNone));
+              if IsAny then
+                EmitInstruction(ssaStrInstrAnyW, InsPos, InsSuffix, Arg2Reg, MakeSSAValue(svkNone))
+              else
+                EmitInstruction(ssaStrInstrW, InsPos, InsSuffix, Arg2Reg, MakeSSAValue(svkNone));
               InsSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
               EmitInstruction(ssaAddInt, InsSum, InsPos, Arg3Reg, MakeSSAValue(svkNone));
               InsAdj := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -5741,7 +5752,11 @@ begin
             Arg2Reg := EnsureStringRegister(Arg2Value);
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            if IsAny then
+            if IsAny and IsWStringExpr(ArgListNode.GetChild(0)) then
+              // WSTRING haystack, "Any set": a codepoint position, and a per-CODEPOINT comparison -
+              // see the note on the INSTRREV twin.
+              EmitInstruction(ssaStrInstrAnyW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
+            else if IsAny then
             begin
               Arg3Reg := EnsureIntRegister(MakeSSAConstInt(1));      // start = 1 in a register
               EmitInstruction(ssaStrInstrAny, Result, ArgReg, Arg2Reg, Arg3Reg);

@@ -629,6 +629,16 @@ type
                             //   Src2=new element count reg, Src3 const=packed slot counts
     ssaRecordBlockLen,      // Dest := how many CONSECUTIVE records the block at Src1 holds (1 for a lone
                             //   record). "Delete[] p" needs it to run one destructor per element.
+    // ⛔⛔ AND THERE IS A SECOND REASON TO ADD AT THE END, found on 30 Aug 2026: this enum has passed
+    // 256 MEMBERS, and Free Pascal's "in [...]" builds a SET, whose elements must fit in a byte.
+    // Fourteen sites test an opcode that way; the ones near the boundary are the array-bound reads in
+    // GVN, and inserting two string opcodes in the MIDDLE pushed them past 255 - "range check error in
+    // set constructor", at compile time, in a unit that was not touched. Appending leaves every
+    // existing ordinal exactly where it is.
+    ssaStrInstrAnyW,        // INSTR(wstring, Any set) -> int CODEPOINT position of the FIRST codepoint of
+                            //   Src1 that belongs to the set Src2 (0 if none). The byte twin compares
+                            //   BYTES and so matches a UTF-8 continuation byte.
+    ssaStrInstrRevAnyW,     // INSTRREV(wstring, Any set) -> the LAST such codepoint
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

@@ -578,6 +578,7 @@ begin
     // register to something else -- a miscompile waiting for a program that uses INSTRREV(..., Any ...).
     bcStrInstrRevAny, bcStrInstrAny,
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV return int codepoint position
+    bcStrInstrAnyW, bcStrInstrRevAnyW,  // ...and so do the "Any set" forms of both
     bcStrValInt,   // VALINT/VALLNG/VALUINT(str) returns int (B1.3)
     bcRegexCount,  // REGEXCOUNT(s, pattern) returns an int count
     bcStrCvInt,    // CVI/CVL/CVSHORT/CVLONGINT(str) returns int (B3 serialization)
@@ -933,6 +934,7 @@ begin
     bcStrInstr,  // INSTR(haystack, needle) - haystack is Src1
     bcStrInstrRev,  // INSTRREV(str, sub) - str is Src1
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - haystack is Src1
+    bcStrInstrAnyW, bcStrInstrRevAnyW,  // ...and their "Any set" forms
     bcStrInstrRevAny, // INSTRREV(str, Any set) - str is Src1
     bcStrInstrAny,    // INSTR(str, Any set) - str is Src1
     bcRegexCount, bcRegexReplace,   // REGEX*(s, pattern, ...) - the subject is Src1
@@ -987,6 +989,7 @@ begin
     bcStrInstr,   // INSTR(haystack, needle) - needle is Src2
     bcStrInstrRev, // INSTRREV(str, sub) - sub is Src2
     bcStrInstrW, bcStrInstrRevW,  // WSTRING INSTR/INSTRREV - needle is Src2
+    bcStrInstrAnyW, bcStrInstrRevAnyW,  // ...and their "Any set" forms - the SET is Src2
     bcStrInstrRevAny, // INSTRREV(str, Any set) - set is Src2
     bcStrInstrAny,    // INSTR(str, Any set) - set is Src2
     bcRegexCount, bcRegexReplace,   // REGEX*(s, pattern, ...) - the pattern is Src2

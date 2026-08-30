@@ -369,6 +369,10 @@ const
   // Immediate=length reg) but an INT destination. Reading one character used to allocate a
   // one-character string, and that allocation - not the read - is what it cost.
   bcStrAscW         = bcGroupString + 52;  // ASC(wstring) - Unicode CODEPOINT of the first character
+  bcStrInstrAnyW    = bcGroupString + 53;  // INSTR(wstring, Any set) - CODEPOINT position of the first codepoint of str
+                                           //   that belongs to the set (Dest=int, Src1/Src2=string). The byte twin
+                                           //   cannot answer it: it compares BYTES, so it matches a CONTINUATION byte.
+  bcStrInstrRevAnyW = bcGroupString + 54;  // INSTRREV(wstring, Any set) - the LAST such codepoint (same operands)
                                            // (Dest=int, Src1=string). bcStrAsc answers the first BYTE,
                                            // which for UTF-8 storage is the first byte of the sequence.
   bcStrAscMid       = bcGroupString + 51;
@@ -2106,6 +2110,8 @@ begin
         4: Result := 'StrMid';
         5: Result := 'StrAsc';
        52: Result := 'StrAscW';
+       53: Result := 'StrInstrAnyW';
+       54: Result := 'StrInstrRevAnyW';
        51: Result := 'StrAscMid';
         6: Result := 'StrChr';
         7: Result := 'StrStr';

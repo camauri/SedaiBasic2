@@ -412,6 +412,7 @@ begin
     // Value-producing string builders (they allocate a result string, they never write user memory)
     ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrAscW, ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN,
+    ssaStrInstrAnyW, ssaStrInstrRevAnyW,
     ssaStrAsc, ssaStrChr, ssaStrStr, ssaStrVal, ssaStrHex, ssaStrInstr,
     ssaStrLTrim, ssaStrRTrim, ssaStrTrim, ssaStrUCase, ssaStrLCase, ssaStrInstrRev,
     ssaStrSpace, ssaStrString, ssaStrTrimSet, ssaStrInstrRevAny, ssaStrInstrAny,
@@ -930,6 +931,7 @@ begin
     // String operations (pure functions)
     ssaStrConcat, ssaStrLen, ssaStrLenW, ssaStrAscW, ssaStrLeft, ssaStrRight, ssaStrMid,
     ssaStrLeftW, ssaStrRightW, ssaStrMidW, ssaStrInstrW, ssaStrInstrRevW, ssaStrWChr, ssaStrWStringN,
+    ssaStrInstrAnyW, ssaStrInstrRevAnyW,
     // FreeBASIC numeric serialization (B3): MK*/CV* are pure deterministic packers/unpackers.
     ssaStrMkInt, ssaStrMkFloat, ssaStrCvInt, ssaStrCvFloat:
       Result := True;

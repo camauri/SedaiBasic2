@@ -6962,7 +6962,8 @@ begin
         end;
 
         // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
-        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrAny, bcStrInstrW, bcStrInstrRevW:
+        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrAny, bcStrInstrW, bcStrInstrRevW,
+        bcStrInstrAnyW, bcStrInstrRevAnyW:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
@@ -12160,6 +12161,25 @@ begin
 end;
 
 // Return the substring covering CPCount codepoints starting at the 1-based codepoint CPStart, clamped.
+function Utf8ContainsCP(const CPSet, Ch: string): Boolean;
+// Does the UTF-8 string CPSet contain the single codepoint Ch as one of ITS codepoints? A plain Pos()
+// would answer yes for a byte sequence that merely OVERLAPS one - the reason the byte "Any" form is
+// wrong here - so the set is walked codepoint by codepoint.
+var
+  i, n, cs: Integer;
+begin
+  Result := False;
+  n := Length(CPSet);
+  cs := 0;
+  for i := 1 to n do
+    if (Ord(CPSet[i]) and $C0) <> $80 then
+    begin
+      if (cs > 0) and (Copy(CPSet, cs, i - cs) = Ch) then Exit(True);
+      cs := i;
+    end;
+  if (cs > 0) and (Copy(CPSet, cs, n - cs + 1) = Ch) then Exit(True);
+end;
+
 function Utf8SubCP(const S: string; CPStart, CPCount: Integer): string;
 var
   i, n, cp, bStart, bEnd: Integer;
@@ -12179,6 +12199,42 @@ begin
     end;
   if bStart > n then Exit('');
   Result := Copy(S, bStart, bEnd - bStart);
+end;
+
+function Utf8FindAnyCP(const S, CPSet: string; Last: Boolean): Integer;
+// The 1-based CODEPOINT position of the first (or last) codepoint of S that also occurs in CPSet, or 0.
+// Both strings are UTF-8, and the comparison is per CODEPOINT on both sides: comparing bytes matches a
+// CONTINUATION byte and answers nonsense on anything outside ASCII.
+var
+  i, n, cp, cs, ce: Integer;
+  Ch: string;
+begin
+  Result := 0;
+  n := Length(S);
+  if (n = 0) or (CPSet = '') then Exit;
+  cp := 0;
+  cs := 0;
+  for i := 1 to n do
+    if (Ord(S[i]) and $C0) <> $80 then          // byte i begins a codepoint
+    begin
+      if cs > 0 then
+      begin
+        // the codepoint that started at cs ends just before i
+        Ch := Copy(S, cs, i - cs);
+        if Utf8ContainsCP(CPSet, Ch) then
+        begin
+          Result := cp;
+          if not Last then Exit;
+        end;
+      end;
+      Inc(cp);
+      cs := i;
+    end;
+  if cs > 0 then                                 // the final codepoint
+  begin
+    Ch := Copy(S, cs, n - cs + 1);
+    if Utf8ContainsCP(CPSet, Ch) then Result := cp;
+  end;
 end;
 
 // Encode a single Unicode codepoint as its UTF-8 byte sequence (FreeBASIC WCHR). Invalid codepoints
@@ -12327,6 +12383,25 @@ begin
           for StartPos := 1 to Length(S) - Length(SubStr) + 1 do
             if Copy(S, StartPos, Length(SubStr)) = SubStr then Len := StartPos;  // last byte match
         Ctx.IntRegs[Instr.Dest] := Utf8BytePosToCP(S, Len);
+      end;
+    53: // bcStrInstrAnyW - INSTR(wstring, Any set): the CODEPOINT position of the first codepoint of
+        // Src1 that belongs to the set Src2, or 0.
+        //
+        // ⛔ THE BYTE TWIN CANNOT ANSWER THIS. bcStrInstrAny compares single BYTES against the set's
+        // bytes, so on UTF-8 it matches a CONTINUATION byte of a multi-byte character and answers a
+        // BYTE offset: on a three-codepoint Japanese string it said 1 where fbc says 2. The comparison
+        // has to be per CODEPOINT on both sides, which is what these two arms are for. (The ASCII case
+        // agreed all along, which is exactly why it looked like it worked.)
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];   // the character set, itself UTF-8
+        Ctx.IntRegs[Instr.Dest] := Utf8FindAnyCP(S, SubStr, False);
+      end;
+    54: // bcStrInstrRevAnyW - INSTRREV(wstring, Any set): the LAST such codepoint, or 0.
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];
+        Ctx.IntRegs[Instr.Dest] := Utf8FindAnyCP(S, SubStr, True);
       end;
     31: // bcStrWChr - WCHR(n): UTF-8 byte sequence for Unicode codepoint n.
       Ctx.StringRegs[Instr.Dest] := Utf8EncodeCP(Ctx.IntRegs[Instr.Src1]);
