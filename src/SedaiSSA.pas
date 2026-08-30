@@ -990,6 +990,7 @@ type
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
+    function UDTStringCastIsWide(Node: TASTNode): Boolean;  // ...and does that Cast return a WSTRING?
     function HasUDTNumberCast(Node: TASTNode): Boolean;  // ...and its numeric mirror (emits nothing)
     // "Operator Cast() As <another UDT>": run it and hand back the RESULT's record handle.
     function TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string; out Val: TSSAValue): Boolean;
@@ -2544,6 +2545,8 @@ var
   RevHay, RevZero, RevOver, RevUnder, RevEff, RevDelta, RevAdj: TSSAValue;  // ...and its edge-case guards
   TrimMode: Integer;  // bcStrTrimSet mode: 0/1/2 side (both/left/right) | 4 = Any (char-set) form
   IsAny: Boolean;     // FreeBASIC "Any" modifier on the set/substring argument
+  IsW: Boolean;       // INSTRREV over a WIDE haystack: the same composition, read in codepoints
+  InsHayLen, InsSuffix, InsPos, InsSum, InsAdj, InsFound, InsMask, InsNeg: TSSAValue;  // INSTR(start, wstring, sub)
   OpLhsType, OpRhsType, OpLabel: string;  // operator overloading: UDT operand types + resolved operator label
   OpArgs: TASTNode;
   AddrNode: TASTNode;          // VARPTR/PROCPTR: synthesized "@arg" node lowered via the address path
@@ -5450,6 +5453,13 @@ begin
             // FreeBASIC "Any" form: the 2nd argument is a character SET; find the last single char in
             // it (ssaStrInstrRevAny) rather than the whole substring.
             IsAny := ArgListNode.GetChild(1).Attributes.Values['ANYSET'] = '1';
+            // ⭐ AND THE WHOLE COMPOSITION HAS A WIDE READING, which is all the wide haystack needed.
+            // Every step below is expressed "in the same units LEFT$ counts" - the comment above says
+            // so - so counting CODEPOINTS is the same arithmetic with LenW / LeftW / InstrRevW in
+            // place of their byte twins. Without it the three-argument form had no wide branch at all
+            // and answered BYTE positions on a wide haystack (4 where fbc answers 2), while the
+            // two-argument form beside it was right.
+            IsW := IsWStringExpr(ArgListNode.GetChild(0)) and not IsAny;
             if ArgListNode.ChildCount >= 3 then
             begin
               ProcessExpression(ArgListNode.GetChild(2), Arg3Value);  // start (1-based)
@@ -5460,7 +5470,10 @@ begin
               EmitInstruction(ssaLoadConstInt, RevZero, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
               // LEN(str): the haystack's own length, in the same units LEFT$ counts.
               RevHay := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaStrLen, RevHay, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              if IsW then
+                EmitInstruction(ssaStrLenW, RevHay, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+              else
+                EmitInstruction(ssaStrLen, RevHay, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
               // under := (start < 0) and 1   -> 1 when start is fbc's "from the end" default
               RevUnder := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
               EmitInstruction(ssaCmpLtInt, RevUnder, Arg3Reg, RevZero, MakeSSAValue(svkNone));
@@ -5482,7 +5495,10 @@ begin
               begin
                 // substring: a match at P survives iff P <= start -> LEFT$(str, eff + LEN(sub) - 1)
                 RevLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-                EmitInstruction(ssaStrLen, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                if IsW then
+                  EmitInstruction(ssaStrLenW, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+                else
+                  EmitInstruction(ssaStrLen, RevLen, Arg2Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
                 RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
                 EmitInstruction(ssaAddInt, RevSum, RevEff, RevLen, MakeSSAValue(svkNone));
                 RevCnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -5496,15 +5512,18 @@ begin
               RevSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
               EmitInstruction(ssaMulInt, RevSum, RevCnt, RevAdj, MakeSSAValue(svkNone));
               RevPrefix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-              EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevSum, MakeSSAValue(svkNone));
+              if IsW then
+                EmitInstruction(ssaStrLeftW, RevPrefix, ArgReg, RevSum, MakeSSAValue(svkNone))
+              else
+                EmitInstruction(ssaStrLeft, RevPrefix, ArgReg, RevSum, MakeSSAValue(svkNone));
               ArgReg := RevPrefix;   // search within the restricted prefix
             end;
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
             if IsAny then
               EmitInstruction(ssaStrInstrRevAny, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
-            else if (ArgListNode.ChildCount = 2) and IsWStringExpr(ArgListNode.GetChild(0)) then
-              // WSTRING haystack (no start arg): codepoint position of the last occurrence.
+            else if IsW then
+              // WSTRING haystack: codepoint position of the last occurrence, with or without a start.
               EmitInstruction(ssaStrInstrRevW, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone))
             else
               EmitInstruction(ssaStrInstrRev, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
@@ -5663,7 +5682,43 @@ begin
             Arg3Reg := EnsureIntRegister(Arg3Value);                 // start in an int register (Src3)
             DestReg := FProgram.AllocRegister(srtInt);
             Result := MakeSSARegister(srtInt, DestReg);
-            if IsAny then
+            // ⭐ A WIDE HAYSTACK WITH A START had no branch here at all, so the three-argument form
+            // answered BYTE positions and read the START as a byte index (4 where fbc answers 2),
+            // while the two-argument form below was right. There is no wide INSTR opcode that takes a
+            // start - and it does not need one: searching from codepoint N is searching the SUFFIX
+            // that begins there, and MID$ already cuts a wide suffix.
+            //   pos := InstrW( MidW(w, start, LenW(w)), sub );  result := (pos + start - 1) if pos<>0
+            // ⚠️ The start-below-1 case comes out on its own: MID$ of a WSTRING with a start below 1
+            // is EMPTY (fbc, and now us), so the search finds nothing and the AND with (pos<>0)
+            // answers 0 - which is fbc's answer for Instr(0, ...) and Instr(-1, ...).
+            if (not IsAny) and IsWStringExpr(ArgListNode.GetChild(1)) then
+            begin
+              InsHayLen := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrLenW, InsHayLen, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              InsSuffix := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+              EmitInstruction(ssaStrMidW, InsSuffix, ArgReg, Arg3Reg, InsHayLen);
+              InsPos := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrInstrW, InsPos, InsSuffix, Arg2Reg, MakeSSAValue(svkNone));
+              InsSum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, InsSum, InsPos, Arg3Reg, MakeSSAValue(svkNone));
+              InsAdj := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, InsAdj, InsSum,
+                              EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+              // ...and NOT FOUND stays not found. The mask is a comparison, whose true value is -1 in
+              // MODERN and in CLASSIC alike here because it is used as ALL BITS: (x and -1) = x,
+              // (x and 0) = 0.
+              InsFound := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaCmpNeInt, InsFound, InsPos,
+                              EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+              InsMask := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, InsMask, EnsureIntRegister(MakeSSAConstInt(0)),
+                              InsFound, MakeSSAValue(svkNone));           // 0 - (-1) = 1 / 0 - 0 = 0
+              InsNeg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, InsNeg, EnsureIntRegister(MakeSSAConstInt(0)),
+                              InsMask, MakeSSAValue(svkNone));            // -1 / 0, whatever TRUE was
+              EmitInstruction(ssaBitwiseAnd, Result, InsAdj, InsNeg, MakeSSAValue(svkNone));
+            end
+            else if IsAny then
               EmitInstruction(ssaStrInstrAny, Result, ArgReg, Arg2Reg, Arg3Reg)
             else
               EmitInstruction(ssaStrInstr, Result, ArgReg, Arg2Reg, Arg3Reg);
@@ -35534,6 +35589,12 @@ var
 begin
   Result := False;
   if Node = nil then Exit;
+  // ⭐ AN OBJECT WHOSE "Operator Cast" RETURNS A WSTRING *IS* A WIDE STRING, whatever node shape names
+  // it. Asked before the shapes below because it is a question about the VALUE and not about how it is
+  // written: the conversion runs wherever a string is wanted, so Instr / Left / Right / Mid / Len of
+  // that object must count CODEPOINTS. Without it they counted bytes on the object while counting
+  // codepoints on the very buffer the cast hands back.
+  if UDTStringCastIsWide(Node) then Exit(True);
   case Node.NodeType of
     antIdentifier:
       begin
@@ -38245,6 +38306,37 @@ begin
   TypeName := ObjectTypeName(Node);
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   Result := ResolveMethodLabel(TypeName, 'OPERATORCAST$') <> '';   // '$' = string-returning cast
+end;
+
+function TSSAGenerator.UDTStringCastIsWide(Node: TASTNode): Boolean;
+// Does this UDT's string-returning Cast operator return a WSTRING rather than a STRING?
+//
+// ⛔ THE LABEL CANNOT SAY. A cast's label carries its return BANK ('$' string, '#' float, '%' int) and
+// WSTRING shares the string bank with STRING - our wide strings are UTF-8 in the ordinary string bank,
+// which is the whole design. So the DECLARED return type has to be read off the declaration, which
+// FProcDecls holds under exactly the label ResolveMethodLabel answers.
+//
+// What it is for: fbc's own suite (udt-wstring/) builds a type over a "WString * n" buffer whose Cast
+// hands the buffer back, and then asks Instr / Left / Mid / Len of the OBJECT. Without this the object
+// converted to a string correctly and every one of those questions then counted BYTES: Instr answered
+// 4 where fbc answers 2, and Left(u, 2) gave one codepoint of two.
+var
+  TypeName, Lbl, RetT: string;
+  Decl, NameNode: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  TypeName := ObjectTypeName(Node);
+  if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  Lbl := ResolveMethodLabel(TypeName, 'OPERATORCAST$');
+  if Lbl = '' then Exit;
+  if not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 1) then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.ChildCount < 1) or
+     (NameNode.GetChild(0).NodeType <> antIdentifier) then Exit;
+  RetT := UpperCase(Trim(VarToStr(NameNode.GetChild(0).Value)));
+  Result := (RetT = 'WSTRING') or (Copy(RetT, 1, 8) = 'WSTRING ');
 end;
 
 function TSSAGenerator.HasUDTNumberCast(Node: TASTNode): Boolean;
