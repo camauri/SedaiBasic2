@@ -24217,6 +24217,13 @@ procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size,
 // anything that allocates, copies or writes an image.
 begin
   if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then Exit;
+  // ⚠️ A "WString * n" MEMBER IS STILL REPORTED n+1 HERE, and fbc says n*4 - "b As WString * 13" is 52
+  // there and 14 here, and a type holding one comes out 41 against 84. An arm answering the honest
+  // number was written and WITHDRAWN on 30 Aug 2026: this shape also bounds the RAW write of a MID
+  // statement into that member, so the bigger number ran past the end of storage that is UTF-8 and
+  // shorter, and wstring/midstmt and udt-wstring/midstmt went from CUPASS to "Raw pointer dereference
+  // out of bounds". The scalar and the type spellings ARE fixed (FixedLenVarSizeBytes, TypeSizeBytes);
+  // the member wants the image and the report separated along the whole wide path first.
   UDTFieldCShape(UDTIdx, FieldIdx, Size, Align);
 end;
 
@@ -24578,7 +24585,7 @@ function TSSAGenerator.FixedLenVarSizeBytes(const Name: string): Int64;
 // The three families differ, and all three were answering 8 - the width of the slot that HOLDS the
 // string, which is exactly what SizeOf is not asking about. Measured against fbc:
 //   Dim As ZString * 13   ->  13   (n bytes; the capacity is n-1 characters plus the NUL)
-//   Dim As WString * 13   ->  26   (n wide units, 2 bytes each)
+//   Dim As WString * 13   ->  26   (n wide cells, 2 bytes each - fbc on Linux says 52; DIVERGENZE 110)
 //   Dim As String  * 13   ->  14   (n characters plus the terminator fbc keeps)
 // Len is unaffected: it measures the CONTENT and already agreed.
 var
@@ -24595,6 +24602,9 @@ begin
     // Cap+1 - bytes for a ZSTRING, 2-byte units for a WSTRING.
     Cap := StrCapOf(FZStringVars, Nm, 0);
     if Cap <= 0 then Exit;
+    // ⚠️ The wide cell is TWO bytes here and FOUR to the Linux fbc - see the long note in
+    // TypeSizeBytes: answering 52 for "Dim As WString * 13" is correct and costs two CUPASS, because
+    // a program that walks the buffer with SizeOf then runs past the end of our UTF-8 storage.
     if IsWStringVar(Nm) then Exit((Cap + 1) * 2) else Exit(Cap + 1);
   end;
   Result := Cap + 1;   // "String * n": the n characters plus the terminator fbc keeps
@@ -26416,6 +26426,13 @@ begin
     begin
       if CLayoutSize then
       begin
+        // ⚠️ THE LIVE SHAPE, and a WSTRING member is where that is WRONG: fbc measures "b As WString * n"
+        // as n*4 and this answers n+1. Routing it to UDTFieldReportShape - which is what its own header
+        // says SizeOf should use - was TRIED and WITHDRAWN on 30 Aug 2026: the reported layout is also
+        // what bounds the RAW write of a MID statement into that member's buffer, so the honest number
+        // sent it past the end of storage that is UTF-8 and shorter. wstring/midstmt and
+        // udt-wstring/midstmt went from CUPASS to "Raw pointer dereference out of bounds". Separating
+        // the image from the report along the WHOLE wide-member path is the work; this is not it.
         UDTFieldCShape(UIdx, k, Size, Align);
         Exit(True);
       end;
@@ -34493,8 +34510,26 @@ begin
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(8);
   T := CanonicalType(T);   // resolve FB TYPE-alias before the builtin/UDT size match
   // The string types are what FreeBASIC reports for them, not what our model stores: a STRING is its
-  // 24-byte descriptor (pointer + length + capacity) and a WSTRING is one 2-byte wide character. Both
-  // verified against fbc. Nothing here allocates by these numbers -- they are what SizeOf/LEN must SAY.
+  // 24-byte descriptor (pointer + length + capacity) and a WSTRING is one wide character.
+  //
+  // ⚠️⚠️ AND THE WIDE CHARACTER HERE IS TWO BYTES WHERE THE LINUX fbc SAYS FOUR - a known divergence,
+  // measured and DELIBERATELY not closed on 30 Aug 2026. The note that used to sit here said "verified
+  // against fbc"; that is true of the WINDOWS fbc, whose wchar_t is 16-bit, and false of the oracle we
+  // actually measure against. FixedStrTypeBytes had the right number all along ("WString * n -> n * 4"),
+  // so the two neighbours disagree: SizeOf(WString * 4) is 16 and SizeOf(WString) is 2.
+  //
+  // ⛔ WHY IT STAYS. Answering 4 is correct in isolation and LOSES on the suite, three ways measured:
+  //     SizeOf(WString) = 4 alone .................. CUPASS 408 -> 407, CUERR 88 (wstring/len fell:
+  //                                                  its TEST_SIZ moved and SizeOf(s) did not)
+  //     + FixedLenVarSizeBytes (n*4 for a var) ..... CUPASS 406, CUERR 90 - wstring/midstmt and
+  //                                                  udt-wstring/midstmt went from PASS to "Raw
+  //                                                  pointer dereference out of bounds"
+  //     + the WString MEMBER reported n*4 .......... the same 406 / 90
+  // The reason is not arithmetic: a program that WALKS a wide buffer with SizeOf gets an offset our
+  // storage cannot honour, because our WSTRING is UTF-8 in the ordinary string bank and fbc's is an
+  // array of 4-byte cells. Reporting fbc's number over our image turns a wrong ANSWER into an out of
+  // bounds. Closing it means separating the reported layout from the live image along the whole wide
+  // path - the work DIVERGENZE 110 names - not changing this constant.
   if T = 'STRING' then Result := 24
   // ⛔ ...AND A ZSTRING IS ONE BYTE. It was absent from this list, so it fell all the way to the
   // "unknown type is pointer-sized" default and SizeOf(ZString) answered 8 against fbc's 1 - the same
