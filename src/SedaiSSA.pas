@@ -436,6 +436,12 @@ type
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
+    // ⭐ TWO MEMBERS OF ONE TYPE THAT CARRY THE SAME "ALIAS" STRING ARE ONE PROCEDURE. Maps the label
+    // the call site builds for the LATER member ("UDT.V.SET") to the one that owns the body
+    // ("UDT.SETV"). Filled from the ordinal MEMALIAS entries the parser leaves on the antTypeDecl,
+    // read in ONE place (the tail of ResolveMethodLabel), and only ever able to turn a '' into a real
+    // label - never to change an answer that already resolved. DIVERGENZE 94.
+    FMemberAliasLabel: TStringList;
     FVarRecordType: TStringList;         // var name (UPPER) -> UDT type name (UPPER)
     FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
     FPreProcSig: TStringList;            // procedure LABEL (UPPER, overload tail and all) -> "FPPARAMS|FPRET", same walk
@@ -553,6 +559,7 @@ type
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
     procedure EnsureObjectBaseType;                // OOP: register the built-in empty OBJECT base type (RTTI root)
     procedure CollectUDTNames(Node: TASTNode; const Path: string);  // pass 1: register type names (empty), under their lexical scope
+    procedure CollectMemberAliasLabels;            // two members sharing an ALIAS string are one procedure
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function SoleOverloadLabel(const TypeU, MethNm: string): string;   // T.m when it has exactly ONE overload, else ''
@@ -1445,6 +1452,8 @@ begin
   FModuleCtors := TStringList.Create;
   FModuleDtors := TStringList.Create;
   FTypeAliases := TStringList.Create;
+  FMemberAliasLabel := TStringList.Create;
+  FMemberAliasLabel.CaseSensitive := False;
   FModuleDtorSlots := TStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
   FStaticLocalOwner := TStringList.Create;
@@ -1600,6 +1609,7 @@ begin
   FModuleCtors.Free;
   FModuleDtors.Free;
   FTypeAliases.Free;
+  FMemberAliasLabel.Free;
   FModuleDtorSlots.Free;
   FStaticLocalOwner.Free;
   FSharedVars.Free;
@@ -26049,7 +26059,62 @@ begin
     for DiagI := 0 to FTypeAliases.Count - 1 do
       WriteLn(StdErr, '[TYPESCOPE] alias ', FTypeAliases[DiagI]);
   end;
+  CollectMemberAliasLabels;   // two members sharing an ALIAS string are one procedure (DIVERGENZE 94)
   FillUDTFields(Node);     // pass 2: resolve fields (incl. nested-UDT fields)
+end;
+
+procedure TSSAGenerator.CollectMemberAliasLabels;
+// Pair up the members of each type that carry the SAME "ALIAS" string. The parser files one ordinal
+// entry per declaration - "<KIND>|<NAME>|<0|1 has a parameter>|<alias string>" - because the feature
+// exists precisely for two members that SHARE a name ("property v" declared twice, setter and getter),
+// which a per-name key cannot express.
+//
+// The label the CALL SITE builds is what has to be mapped: "TYPE.NAME" for a Sub/Function and for a
+// property GETTER alike, "TYPE.NAME.SET" for a property SETTER (the parameter tells the two apart, as
+// it does in fbc). The FIRST member to carry a string owns the body; every later one points at it.
+var
+  u, k, p1, p2, p3: Integer;
+  Ent, KindU, Nm, HasP, AliasS, Suffix, FirstKey: string;
+  Firsts: TStringList;
+begin
+  FMemberAliasLabel.Clear;
+  Firsts := TStringList.Create;
+  try
+    Firsts.CaseSensitive := False;
+    for u := 0 to High(FUDTs) do
+    begin
+      if FUDTs[u].Node = nil then Continue;
+      k := 0;
+      while True do
+      begin
+        Ent := FUDTs[u].Node.Attributes.Values['MEMALIAS' + IntToStr(k)];
+        if Ent = '' then Break;
+        Inc(k);
+        p1 := Pos('|', Ent); if p1 = 0 then Continue;
+        KindU := Copy(Ent, 1, p1 - 1);
+        p2 := PosEx('|', Ent, p1 + 1); if p2 = 0 then Continue;
+        Nm := Copy(Ent, p1 + 1, p2 - p1 - 1);
+        p3 := PosEx('|', Ent, p2 + 1); if p3 = 0 then Continue;
+        HasP := Copy(Ent, p2 + 1, p3 - p2 - 1);
+        AliasS := Copy(Ent, p3 + 1, MaxInt);
+        if (Nm = '') or (AliasS = '') then Continue;
+        // ⛔ ONLY THE SETTER CARRIES A SUFFIX. A property's GETTER is labelled "TYPE.NAME" flat - the
+        // parser renames only the setter to "TYPE.NAME.SET" (a getter is a FUNCTION of that name) -
+        // so keying the getter under ".GET" filed it where nothing looks, and "print x.v" read a
+        // register nobody had written while "x.v = 1" worked. The parameter is what tells them apart.
+        if (KindU = 'PROPERTY') and (HasP = '1') then Suffix := Nm + '.SET'
+        else Suffix := Nm;
+        FirstKey := FUDTs[u].Name + '|' + AliasS;
+        if Firsts.IndexOfName(FirstKey) < 0 then
+          Firsts.Values[FirstKey] := Suffix
+        else if not SameText(Firsts.Values[FirstKey], Suffix) then
+          FMemberAliasLabel.Values[FUDTs[u].Name + '.' + Suffix] :=
+            FUDTs[u].Name + '.' + Firsts.Values[FirstKey];
+      end;
+    end;
+  finally
+    Firsts.Free;
+  end;
 end;
 
 procedure TSSAGenerator.EnsureObjectBaseType;
@@ -26835,6 +26900,16 @@ begin
       Lbl := ResolveCallLabel(NestedQualifiedMethod(T, MethNm), ArgsNode);
       if Lbl <> '' then Exit(Lbl);
     end;
+    // ...and the ALIAS identity, for the same reason and with the same discipline as in
+    // ResolveMethodLabel: asked LAST, so it can only turn a '' into a real label. ⛔ BOTH halves need
+    // it, and only fixing the name-based one is what left "print x.v" right and "x.v = 1" silent - the
+    // store path asks with the ARGUMENTS (DIVERGENZE 94).
+    Lbl := FMemberAliasLabel.Values[T + '.' + UpperCase(MethNm)];
+    if Lbl <> '' then
+    begin
+      Lbl := ResolveCallLabel(Lbl, ArgsNode);
+      if Lbl <> '' then Exit(Lbl);
+    end;
     Idx := FindUDT(T);
     if Idx < 0 then Break;
     T := FUDTs[Idx].Parent;
@@ -26892,6 +26967,12 @@ begin
     Lbl := SoleOverloadLabel(T, MethNm);
     if Lbl <> '' then Exit(Lbl);
     Lbl := NestedQualifiedMethod(T, MethNm);
+    if (Lbl <> '') and FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    // ⭐ ...and a member declared with the SAME "ALIAS" string as another member of this type IS that
+    // member: fbc gives it no body of its own. Asked LAST, so it can only turn a '' into a real label
+    // and never change an answer that already resolved - which is what keeps it out of the trap a
+    // rule added to a shared query fell into on 30 Aug. DIVERGENZE 94.
+    Lbl := FMemberAliasLabel.Values[T + '.' + UpperCase(MethNm)];
     if (Lbl <> '') and FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
     Idx := FindUDT(T);
     if Idx < 0 then Break;

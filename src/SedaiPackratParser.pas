@@ -4630,7 +4630,9 @@ procedure TPackratParser.ParseInTypeMethodDecl(TypeNode: TASTNode; const CurAcce
 //   ABSTRACT<NAME> on the antTypeDecl -> the type declares NAME with no body of its own.
 //   FTypeStaticMethods "TYPE.NAME"    -> NAME is a static member (no implicit THIS).
 var
-  DecoU, MethName, MethKey, Key: string;
+  DecoU, MethName, MethKey, Key, KindU, AliasStr: string;
+  SawParam: Boolean;    // any token inside the parameter parentheses: a PROPERTY with one is the SETTER
+  MemAliasN: Integer;   // ordinal of the MEMALIAS entry being written (see the note at the loop)
   DecoCount: Integer;   // how many of ABSTRACT/STATIC/VIRTUAL/leading-CONST this declaration carries
   LeadingConst: Boolean;   // "Declare Const [Virtual|Abstract] Sub f()": the CONST that leads them
   IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
@@ -4724,9 +4726,13 @@ begin
   if FModernMode and LeadingConst and IsStatic then
     HandleError('a STATIC method has no THIS, so it cannot also be CONST', Context.CurrentToken);
   MethName := '';
+  KindU := '';
+  AliasStr := '';
+  SawParam := False;
   if Context.Check(ttProcedureStart) then
   begin
     MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+    KindU := MethName;                                // the KIND word, before the name overwrites it
     Context.Advance;                                  // SUB / FUNCTION / PROPERTY / ...
     // CONSTRUCTOR and DESTRUCTOR ARE the method name; everything else names one next. A method name
     // may be a reserved word (LEN, TYPE, NAME...), so accept any alphabetic token — but not '(', which
@@ -4848,9 +4854,29 @@ begin
     if Context.Check(ttDelimParOpen) then Inc(Depth)
     else if Context.Check(ttDelimParClose) then Dec(Depth)
     else if (Depth <= 0) and (Context.CheckAny([ttEndOfLine, ttSeparStmt]) or AtEndType) then Break
+    // ⛔⛔ ON A MEMBER, "ALIAS" IS NOT ONLY A LINKER NAME: IT IS AN IDENTITY. Two members of the SAME
+    // type carrying the SAME alias string are ONE procedure for fbc -
+    //   declare sub      setv alias "setv"( byval new_v as integer )
+    //   declare property v    alias "setv"( byval new_v as integer )
+    // gives the property no body of its own: its body IS UDT.setv. This line is SKIPPED wholesale (a
+    // member is defined out of line), so the string went with it and "x.v = 1" called an empty label -
+    // p_v stayed 0, with no diagnostic anywhere. DIVERGENZE 94, fbc suite structs/obj_property_alias.
+    // ⛔ THE ENTRY IS ORDINAL, NOT KEYED ON THE NAME, and that is the whole difficulty: the feature
+    // exists for two members that SHARE a name ("property v" declared twice, setter and getter), so a
+    // per-name attribute cannot express it - the same wall ACCESS<NAME> above hits and answers MIXED to.
+    else if (Depth <= 1) and Context.Check(ttIdentifier) and
+            (UpperCase(VarToStr(Context.CurrentToken.Value)) = kALIAS) and
+            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral) then
+    begin
+      AliasStr := UpperCase(VarToStr(Context.PeekNext.Value));
+      Context.Advance;                                // ALIAS
+      Context.Advance;                                // "name"
+      Continue;
+    end
     else if (Depth = 1) and Context.Check(ttSeparParam) then Inc(ParamIdx)
     else if (Depth = 1) and Context.Check(ttOpEq) and (MethName <> '') then
     begin
+      SawParam := True;
       Context.Advance;                              // '='
       DefExpr := FExpressionParser.ParseExpression;
       if Assigned(DefExpr) then
@@ -4861,8 +4887,21 @@ begin
         if Defs.ChildCount = ParamIdx then Defs.AddChild(DefExpr) else DefExpr.Free;
       end;
       Continue;                                     // ParseExpression already consumed the value
-    end;
+    end
+    else if Depth = 1 then
+      SawParam := True;                             // a PROPERTY with a parameter is the SETTER
     Context.Advance;
+  end;
+  // The alias identity, filed ORDINALLY so two members of one name can both be recorded. The value is
+  // "<KIND>|<NAME>|<0|1 has a parameter>|<alias string>": the SSA turns it into the LABEL the call site
+  // will build ("TYPE.NAME", or "TYPE.NAME.SET"/".GET" for a property) and pairs the ones that share a
+  // string. Only inside a TYPE, and only for ALIAS - a LIB name stays what it was.
+  if (AliasStr <> '') and Assigned(TypeNode) and (MethName <> '') then
+  begin
+    MemAliasN := 0;
+    while TypeNode.Attributes.Values['MEMALIAS' + IntToStr(MemAliasN)] <> '' do Inc(MemAliasN);
+    TypeNode.Attributes.Values['MEMALIAS' + IntToStr(MemAliasN)] :=
+      KindU + '|' + MethName + '|' + IntToStr(Ord(SawParam)) + '|' + AliasStr;
   end;
   if Assigned(Defs) then
   begin
