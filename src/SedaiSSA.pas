@@ -42158,6 +42158,7 @@ var
   ExitLevels, ExitLoopIdx, ExitAllDepth: Integer;  // multi-level EXIT/CONTINUE
   ExitLoopKind: TLoopKind;
   RetVal: TSSAValue;      // M2: RETURN expr / FUNCTION result
+  RetTempDepth: Integer;  // result temporaries this RETURN statement made (flushed before the frame exit)
   ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
   TmpCallNode: TASTNode;        // a bare qualified name used as a statement call (we free it)
   OpCode: TSSAOpCode;     // M5.4: selected mutex op
@@ -42610,6 +42611,7 @@ begin
               Node.GetChild(0).GetChild(0).Value := FCurrentProcRetRecType;
               Node.GetChild(0).Attributes.Values['INFERTYPE'] := '';
             end;
+            RetTempDepth := FResultTemps.Count;
             ProcessExpression(Node.GetChild(0), RetVal);
             // V3: UDT result copied by value into the caller's result instance; scalar via xfer slot.
             // ...unless the returned UDT is of ANOTHER type and the result type declares a Let for it:
@@ -42619,6 +42621,32 @@ begin
               // handled by the operator
             else if TryLetOperatorOnCastResult(Node.GetChild(0), RetVal) then
               // ...and the OPERATOR CAST shape of the same conversion
+            // ⭐⭐ "RETURN <value>" CONSTRUCTS THE RESULT FROM THAT VALUE - it does not assign to it.
+            // fbc builds the result IN PLACE by COPY CONSTRUCTION, which is why it does NOT default-
+            // construct the result at entry when the body uses RETURN (BodyHasReturnStatement is the
+            // half of this that was already modelled). Measured, one shape at a time:
+            //     return <a local>            fbc 1 ctor 1 copy 2 dtors   we were 1 0 2
+            //     return <a byref parameter>  fbc 1 ctor 1 copy 2 dtors   we were 1 0 2
+            //     return <another call>       fbc 1 ctor 2 copy 3 dtors   we were 1 0 2
+            //     return type<T>( )           fbc 1 ctor 0 copy 1 dtor    we already matched
+            // ⇒ The same rule the IIF obeys: every value owes the copy EXCEPT a "Type( )" literal,
+            // which is built straight into the destination. DIVERGENZE 121.
+            // ⛔ "Function = <value>" is NOT this statement: there fbc default-constructs the result at
+            // entry and the assignment is a plain field copy (0 copy constructors, measured beside
+            // this). The two spellings differ, so only this site changes.
+            else if (FCurrentProcRetRecType <> '') and
+                    (not IsTypeCtorTemporary(Node.GetChild(0))) then
+            begin
+              EmitCopyCtorInto(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType));
+              // ⛔ AND THE STATEMENT'S OWN TEMPORARIES DIE HERE, NOT WHERE EVERY OTHER STATEMENT'S DO.
+              // The one funnel that flushes them runs AFTER ProcessStatementFull, which for a RETURN is
+              // after the frame return has already been emitted - dead code, in a block that no longer
+              // exists. "Return f( )" therefore ran one destructor fewer than fbc for the inner call's
+              // result record. Flushed here, between the copy that reads it and the frame exit.
+              // ⚠️ Same guard as the copy above: a "Type( )" literal is not copied and its record IS the
+              // result, so flushing it would destroy what the caller is about to be handed.
+              if FResultTemps.Count > RetTempDepth then FlushResultTemps(RetTempDepth);
+            end
             else if FCurrentProcRetRecType <> '' then
               EmitRecordCopy(FCurrentResultHandle, RetVal, FindUDT(FCurrentProcRetRecType))
             else
