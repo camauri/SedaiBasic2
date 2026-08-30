@@ -620,6 +620,10 @@ type
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
     procedure RegisterTypedVar(const VarName, TypeName: string);  // record var or explicit-bank var
     function VarRecordTypeName(const VarName: string): string;
+    // The EXACT copy-constructor label (both spellings), and "is this initialiser a copy of the
+    // very type being declared?" - the pair DIVERGENZE 104 turns on.
+    function ExactCopyCtorLabel(const TypeName: string): string;
+    function InitIsCopyOfSameType(Node: TASTNode; const RecTypeName: string): Boolean;
     function InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;    // '' if not a record var
     procedure EmitRecordInit(const HandleVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function TypeNeedsRecordInit(UDTIdx: Integer): Boolean;   // has member arrays / nested-UDT fields?
@@ -10956,6 +10960,9 @@ var
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
   FixLenCap: Integer;      // "DIM s AS STRING * n": declared capacity (0 = variable-length)
   ScalarCtorInit: Boolean; // "DIM v AS T = <non-T expr>": an implicit conversion via a 1-arg constructor
+  CopyCtorInit: Boolean;   // "DIM v AS T = <a T>": a COPY CONSTRUCTION, called by its exact label
+  CopyCtorLbl: string;
+  CopySrcVal: TSSAValue;
   HasScalarInit: Boolean;  // the declaration carries "= expr" (so no implicit zero is needed)
   ZeroDest: TSSAValue;     // destination of the implicit zero for an uninitialised builtin scalar
   CtorArgs: TASTNode;      // synthesized single-argument list wrapping that initializer
@@ -11293,7 +11300,20 @@ begin
           // value-copy — exactly as in the non-SHARED UDT branch below. This branch handled neither:
           // it ran the default constructor and dropped the initializer on the floor, so "DIM SHARED
           // AS T v = other" (or "= f()") left v zeroed, silently.
-          ScalarCtorInit := (ArrayDeclNode.ChildCount >= 3) and
+          // ⭐ A DECLARATION WHOSE INITIALISER IS A VALUE OF THIS VERY TYPE IS A COPY CONSTRUCTION, and
+          // the copy constructor is called DIRECTLY by its exact label - never through the argument
+          // resolver. That is what lets the FUNCTION-RESULT case in at last: "Dim v As T = f( )" was
+          // excluded on purpose (InitIsCallToKnownProc), because routing it through the one-argument
+          // constructor handed that constructor the returned HANDLE and the fields came out allocation
+          // indices. Nothing is resolved here, so nothing can be mis-resolved: if the type declares no
+          // copy constructor the flag is False and the plain field copy below runs, exactly as before.
+          // fbc runs one copy constructor for every copy - probed on six shapes - and we ran none on the
+          // two whose source is a call. DIVERGENZE 104.
+          CopyCtorLbl := ExactCopyCtorLabel(RecTypeName);
+          CopyCtorInit := (CopyCtorLbl <> '') and (ArrayDeclNode.ChildCount >= 3) and
+                          (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+                          InitIsCopyOfSameType(ArrayDeclNode.GetChild(2), RecTypeName);
+          ScalarCtorInit := (not CopyCtorInit) and (ArrayDeclNode.ChildCount >= 3) and
                             (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
                             ((UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName))
                              // ⛔ ...OR the same type WITH A COPY CONSTRUCTOR. Excluding the same type
@@ -11312,7 +11332,16 @@ begin
           // was building u0: the test that asks "am I the shared instance?" always answered no.
           // The value-copy of an "= expr" still runs after, and still needs the handle in place.
           EmitSharedScalarStoreVal(UpperCase(ArrName), RecHandleVal);
-          if ScalarCtorInit then
+          if CopyCtorInit then
+          begin
+            // THIS in int slot 0, the source handle in slot 1 - the layout every one-parameter
+            // constructor call uses, and the one the BYVAL-parameter copy already stages by hand.
+            ProcessExpression(ArrayDeclNode.GetChild(2), CopySrcVal);
+            EmitXferStore(srtInt, 0, RecHandleVal);
+            EmitXferStore(srtInt, 1, EnsureIntRegister(CopySrcVal));
+            EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
+          end
+          else if ScalarCtorInit then
           begin
             CtorArgs := TASTNode.Create(antArgumentList, ArrayDeclNode.GetChild(2).Token);
             CtorArgs.AddChild(ArrayDeclNode.GetChild(2).Clone);
@@ -11333,7 +11362,7 @@ begin
             EmitConstructorCall(RecHandleVal, RecTypeName);
           // The "= expr" value-copy runs AFTER the handle is published: ProcessAssignment resolves a
           // SHARED record's destination from element 0 of the backing, which must already hold it.
-          if (not ScalarCtorInit) and (ArrayDeclNode.ChildCount >= 3) and
+          if (not ScalarCtorInit) and (not CopyCtorInit) and (ArrayDeclNode.ChildCount >= 3) and
              (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
           begin
             InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
@@ -11366,6 +11395,7 @@ begin
         Continue;
       end;
       ScalarCtorInit := False;   // set only in the UDT branch below; keep the builtin path deterministic
+      CopyCtorInit := False;
       // Does this declaration carry its own initializer? Same test the initializer store below uses, read
       // once here so the builtin-scalar path can tell "Dim x As Integer" (needs the implicit zero) from
       // "Dim x As Integer = e" (the store IS the initialisation, and a zero before it would be dead).
@@ -11455,7 +11485,20 @@ begin
         // one-argument constructor: FreeBASIC treats this as the implicit conversion "DIM v AS T = T(expr)".
         // Route the initializer through the constructor. Without this it fell to the "= expr" assignment
         // below, which stored the scalar straight into the handle register and corrupted it (AV on use).
-        ScalarCtorInit := (ArrayDeclNode.ChildCount >= 3) and
+        // ⭐ A DECLARATION WHOSE INITIALISER IS A VALUE OF THIS VERY TYPE IS A COPY CONSTRUCTION, and
+        // the copy constructor is called DIRECTLY by its exact label - never through the argument
+        // resolver. That is what lets the FUNCTION-RESULT case in at last: "Dim v As T = f( )" was
+        // excluded on purpose (InitIsCallToKnownProc), because routing it through the one-argument
+        // constructor handed that constructor the returned HANDLE and the fields came out allocation
+        // indices. Nothing is resolved here, so nothing can be mis-resolved: if the type declares no
+        // copy constructor the flag is False and the plain field copy below runs, exactly as before.
+        // fbc runs one copy constructor for every copy - probed on six shapes - and we ran none on the
+        // two whose source is a call. DIVERGENZE 104.
+        CopyCtorLbl := ExactCopyCtorLabel(RecTypeName);
+        CopyCtorInit := (CopyCtorLbl <> '') and (ArrayDeclNode.ChildCount >= 3) and
+                        (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+                        InitIsCopyOfSameType(ArrayDeclNode.GetChild(2), RecTypeName);
+        ScalarCtorInit := (not CopyCtorInit) and (ArrayDeclNode.ChildCount >= 3) and
                           (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
                           ((UpperCase(ObjectTypeName(ArrayDeclNode.GetChild(2))) <> UpperCase(RecTypeName))
                            // Same rule as the SHARED path above: the same type still runs a COPY ctor
@@ -11465,7 +11508,14 @@ begin
                             (not InitIsCallToKnownProc(ArrayDeclNode.GetChild(2), RecTypeName));
         // M4.4: run the constructor (if any). M4.4b: a "DIM v AS T(args)" attaches the ctor
         // argument list as child[2] (antArgumentList).
-        if ScalarCtorInit then
+        if CopyCtorInit then
+        begin
+          ProcessExpression(ArrayDeclNode.GetChild(2), CopySrcVal);
+          EmitXferStore(srtInt, 0, RecHandleVal);
+          EmitXferStore(srtInt, 1, EnsureIntRegister(CopySrcVal));
+          EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
+        end
+        else if ScalarCtorInit then
         begin
           CtorArgs := TASTNode.Create(antArgumentList, ArrayDeclNode.GetChild(2).Token);
           CtorArgs.AddChild(ArrayDeclNode.GetChild(2).Clone);
@@ -11551,7 +11601,8 @@ begin
       // value-copy when both sides are UDTs (reuses ProcessAssignment's existing semantics). The
       // synthesized node is transient and freed here; its cloned expression is owned by it.
       if (ArrayDeclNode.ChildCount >= 3) and
-         (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and (not ScalarCtorInit) then
+         (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and (not ScalarCtorInit) and
+         (not CopyCtorInit) then
       begin
         InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
         InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ArrName),
@@ -29411,6 +29462,33 @@ begin
     if Result then
       Result := IsBigIntExpr(Node.GetChild(0)) or IsBigIntExpr(Node.GetChild(1));
   end;
+end;
+
+function TSSAGenerator.ExactCopyCtorLabel(const TypeName: string): string;
+// The label of T's COPY CONSTRUCTOR - "Constructor( ByRef As T )" or "Constructor( ByRef As Const T )" -
+// or '' when the type declares none. ⛔ EXACT, never the resolver: ResolveConstructorLabel falls back by
+// bank and then by arity, so on a type whose only one-parameter constructor takes an Integer it answers
+// THAT one and a copy is "constructed" from its own handle read as a number.
+// ⭐ Two spellings, because CONST is a different LABEL: the qualifier appends a positional '!C' tail, and
+// the const form is the idiomatic one - the only one that can bind a temporary. Written once here
+// because three sites ask it and two of them used to ask only the bare form (DIVERGENZE 104).
+begin
+  Result := UpperCase(TypeName) + '.CONSTRUCTOR#I:' + UpperCase(TypeName);
+  if FProcDecls.ContainsKey(Result) then Exit;
+  Result := Result + '!C';
+  if FProcDecls.ContainsKey(Result) then Exit;
+  Result := '';
+end;
+
+function TSSAGenerator.InitIsCopyOfSameType(Node: TASTNode; const RecTypeName: string): Boolean;
+// Does this DIM initialiser hand over a value of the very type being declared - so that the declaration
+// is a COPY CONSTRUCTION and not a conversion? Two ways to know, and the second is the one that was
+// missing: a plain expression whose type ObjectTypeName can read, or a CALL to a function declared to
+// return this type, which ObjectTypeName cannot type at all and InitIsCallToKnownProc can.
+begin
+  Result := (Node <> nil) and
+            (SameText(ObjectTypeName(Node), RecTypeName) or
+             InitIsCallToKnownProc(Node, RecTypeName));
 end;
 
 function TSSAGenerator.InitIsCallToKnownProc(Node: TASTNode; const DeclRecType: string): Boolean;
