@@ -589,6 +589,7 @@ type
     function NameIsStringHere(const Name: string): Boolean;    // ...and is it a STRING in this scope?    // the innermost OPEN block that declared this @-taken SCALAR, or ''
     procedure NoteArrayShape(const SlotName: string; Dynamic: Boolean);     // this SLOT is dynamic / fixed
     function ArraySlotIsDynamic(ArrayIdx: Integer; const ArrName: string): Boolean;
+    function RedimTargetSameScope(const ArrName: string; ArrayIdx: Integer): Boolean;  // was it declared at THIS level?
     function DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
                                 const Dims: array of Integer; ArrayDeclNode: TASTNode): Integer;
     function ArrayIndexOf(const ArrName: string): Integer;  // scope-aware array lookup (proc param placeholder first)
@@ -12752,6 +12753,20 @@ begin
     // ⚠️ And there is a REFUSAL half: we ACCEPT the same-level spelling fbc rejects (B2).
 
     // ⭐ A "REDIM x(...) AS T" over a FIXED array is a DECLARATION - see DIVERGENZE 117.
+    // ...AND AT THE SAME LEVEL IT IS A REFUSAL: there is no enclosing scope for the new declaration to
+    // shadow, so fbc reports "error 4: Duplicated definition". Measured one spelling at a time - module
+    // level, inside one Scope, in a Sub, and a STATIC inside a Sub all refuse; an enclosing declaration
+    // (module + Scope, module + Sub, Scope + nested Scope, Scope + If body) declares. The five things
+    // that must keep compiling are a var-len target (Dim x(), Dim x(Any), a ReDim-declared array), no
+    // prior declaration at all, and an array PARAMETER.
+    if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) and FModernMode and
+       (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) and
+       (not IsArrayParamSlot(ArrayIdx)) and
+       (not ArraySlotIsDynamic(ArrayIdx, ArrName)) and
+       RedimTargetSameScope(ArrName, ArrayIdx) then
+      raise Exception.CreateFmt('Duplicated definition: %s is already declared at this level as a ' +
+        'fixed-size array, and "ReDim %s(...) As <type>" declares it again', [ArrName, ArrName]);
+
     if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) and
        (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier) and
        (not ArraySlotIsDynamic(ArrayIdx, ArrName)) then
@@ -12766,6 +12781,18 @@ begin
       DimNode.Free;
       Continue;
     end;
+
+    // ⭐ AND A "REDIM x(...)" WITH NO TYPE OVER A FIXED ARRAY IS A REFUSAL AT EVERY LEVEL: with no type
+    // there is nothing to declare, so fbc has only the resize to attempt and a fixed array cannot be
+    // resized - "error 54: Expected var-len array". Unlike the rule above this one does not care where
+    // the declaration is: module + Scope refuses too (only a SUB turns it into an implicit declaration,
+    // which -lang fb refuses for another reason). Exempt: a var-len target and an array PARAMETER.
+    if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) and FModernMode and
+       (not ((ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType = antIdentifier))) and
+       (not IsArrayParamSlot(ArrayIdx)) and
+       (not ArraySlotIsDynamic(ArrayIdx, ArrName)) then
+      raise Exception.CreateFmt('Expected var-len array: %s is a fixed-size array and ReDim can only ' +
+        're-dimension one declared with empty or "Any" bounds', [ArrName]);
 
     // Whatever a DIM said about this slot, a REDIM of it makes it dynamic from here on.
     if (ArrayIdx >= 0) and (ArrayIdx < FProgram.GetArrayCount) then
@@ -40976,6 +41003,32 @@ begin
     WriteLn(StdErr, '[ARRSHAPE] ask name="', UpperCase(ArrName), '" NO SLOT (idx=', ArrayIdx, ')',
             ' flat=', FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0);
   Result := FDynamicArrays.IndexOf(UpperCase(ArrName)) >= 0;
+end;
+
+function TSSAGenerator.RedimTargetSameScope(const ArrName: string; ArrayIdx: Integer): Boolean;
+// Was the array this name reaches declared at THIS scope level, or at an enclosing one? It is the
+// question that separates a REFUSAL from a DECLARATION for "ReDim x(...) As T" over a fixed array
+// (DIVERGENZE 117): fbc answers "error 4: Duplicated definition" for the SAME level and declares a
+// fresh block-local for an enclosing one - measured one spelling at a time, module/Scope/nested
+// Scope/If body/Sub, and the boundary is always the level, never the kind of block.
+//
+// ⭐ It is asked by CONSTRUCTING the name a DIM would declare here and comparing it with the name the
+// slot actually carries. That reuses ProcessDim's own three-way mangle instead of re-deriving the rule,
+// so the two cannot drift apart: whatever ProcessDim would create, this is the test for "already there".
+var
+  nameU, declName: string;
+begin
+  Result := False;
+  if (ArrayIdx < 0) or (ArrayIdx >= FProgram.GetArrayCount) then Exit;
+  nameU := UpperCase(ArrName);
+  declName := nameU;
+  if FInProcedure and (FModernMode or (FProgram.FindArray(nameU) >= 0)) and
+     (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, nameU)) < 0) then
+    declName := LocalArrayMangle(FCurrentProcName, nameU);
+  if FModernMode and (InnermostBlockFrameIdx >= 0) and
+     (not (FInProcedure and (FProgram.FindArray(ParamArrayMangle(FCurrentProcName, nameU)) >= 0))) then
+    declName := BlockArrayMangle(FScopeStack[InnermostBlockFrameIdx].Serial, nameU);
+  Result := SameText(declName, FProgram.GetArray(ArrayIdx).Name);
 end;
 
 function TSSAGenerator.LocalArrayMangle(const ProcName, ArrName: string): string;
