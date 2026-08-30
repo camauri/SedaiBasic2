@@ -12296,10 +12296,21 @@ begin
       begin
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        // Negative length = the rest of the string, exactly as for the byte-string MID (see above).
-        if (Count < 0) and Assigned(FProgram) and FProgram.ModernMode then
-          Count := Utf8CPCount(Ctx.StringRegs[Instr.Src1]) - StartPos + 1;
-        Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
+        // ⛔ A START BELOW 1 YIELDS AN EMPTY STRING - the rule the BYTE MID above has carried since it
+        // was written, and its wide twin did not. Utf8SubCP CLAMPS the start to 1, so "Mid(w, 0)" and
+        // "Mid(w, -1)" answered the WHOLE string where fbc answers "" (measured over start -2..5 on a
+        // WString, a String and a ZString: the two byte paths were already right, only the wide one was
+        // not). CLASSIC v7 keeps the clamp exactly as the byte path does - its MID$ has no such rule.
+        // The test is HERE and not inside Utf8SubCP because that clamp is what LEFT$/RIGHT$ rely on.
+        if (StartPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.StringRegs[Instr.Dest] := ''
+        else
+        begin
+          // Negative length = the rest of the string, exactly as for the byte-string MID (see above).
+          if (Count < 0) and Assigned(FProgram) and FProgram.ModernMode then
+            Count := Utf8CPCount(Ctx.StringRegs[Instr.Src1]) - StartPos + 1;
+          Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
+        end;
       end;
     29: // bcStrInstrW - INSTR(wstring, sub): codepoint position of first occurrence (0 if none).
       begin

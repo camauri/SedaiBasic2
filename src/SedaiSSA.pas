@@ -35473,12 +35473,26 @@ function TSSAGenerator.IsWStringExpr(Node: TASTNode): Boolean;
 // '&' on wide data is still wide). Conservative: anything else is treated as a plain (byte) STRING.
 var
   NameU: string;
+  ArgsW: TASTNode;
+  WideTmp: TSSAValue;
 begin
   Result := False;
   if Node = nil then Exit;
   case Node.NodeType of
     antIdentifier:
-      Result := IsWStringVar(VarToStr(Node.Value));
+      begin
+        Result := IsWStringVar(VarToStr(Node.Value));
+        // ⭐ ...AND A BARE FIELD NAME INSIDE A METHOD BODY IS "this.<field>". The member-access arm
+        // below has always answered for the QUALIFIED spelling, so "Len( this.d )" was right while
+        // "Len( d )" - the same field, written the way one writes it inside its own type - counted
+        // BYTES: 9 against 3 on a three-codepoint WString field. The shadowing rule is the one
+        // TryImplicitThisField applies, and for the same reason: a parameter or a local DIM wins,
+        // a module-shared global does not.
+        if (not Result) and (FCurrentThisType <> '') then
+          if not (ResolveExisting(VarToStr(Node.Value), WideTmp) and
+                  (not IsSharedScalar(VarToStr(Node.Value)))) then
+            Result := UDTFieldIsWString(FindUDT(FCurrentThisType), VarToStr(Node.Value));
+      end;
     antLiteral:
       // ⛔ AN ESCAPED LITERAL THAT NAMED A CODEPOINT IS WIDE, and this case had no arm at all - so
       // "Left(!"\u3041\u3043\u3045", 2)" counted BYTES and answered one garbage codepoint where fbc
@@ -35506,6 +35520,32 @@ begin
           NameU := UpperCase(VarToStr(Node.Value));
         Result := (NameU = kWSTR) or (NameU = kWCHR) or (NameU = kWSTRING) or (NameU = kWINPUT) or
                   IsWStringVar(NameU);
+        // ⛔ ...AND WIDENESS FLOWS THROUGH THE BUILTINS THAT RETURN A PIECE OF THEIR ARGUMENT. Each of
+        // these was lowered to its WIDE form correctly - "r = Mid(w, 2)" puts two codepoints in r - and
+        // then the RESULT was not known to be wide, so the very next question about it counted bytes:
+        // Len(Mid(w,2)) answered 6 where fbc answers 2, and so did Left, Right, Trim, LTrim, RTrim,
+        // UCase and LCase (all measured against fbc on a three-codepoint WString). The set is closed:
+        // it is the builtins whose result IS their string argument, cut or mapped.
+        if not Result then
+        begin
+          ArgsW := nil;
+          if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) then ArgsW := Node.GetChild(1)
+          else if (Node.NodeType = antFunctionCall) and (Node.ChildCount >= 1) then ArgsW := Node.GetChild(0);
+          if Assigned(ArgsW) and (ArgsW.NodeType in [antArgumentList, antExpressionList]) and
+             (ArgsW.ChildCount >= 1) then
+          begin
+            if (NameU = 'MID') or (NameU = 'MID$') or
+               (NameU = kLEFT) or (NameU = 'LEFT$') or (NameU = kRIGHT) or (NameU = 'RIGHT$') or
+               (NameU = kTRIM) or (NameU = 'TRIM$') or (NameU = kLTRIM) or (NameU = 'LTRIM$') or
+               (NameU = kRTRIM) or (NameU = 'RTRIM$') or
+               (NameU = kUCASE) or (NameU = 'UCASE$') or (NameU = kLCASE) or (NameU = 'LCASE$') then
+              Result := IsWStringExpr(ArgsW.GetChild(0))
+            // IIF hands back ONE OF ITS TWO BRANCHES, so it is wide if either is - the branch taken is
+            // a runtime question and the answer has to hold for both.
+            else if (NameU = 'IIF') and (ArgsW.ChildCount >= 3) then
+              Result := IsWStringExpr(ArgsW.GetChild(1)) or IsWStringExpr(ArgsW.GetChild(2));
+          end;
+        end;
       end;
   end;
 end;

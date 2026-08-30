@@ -8718,19 +8718,29 @@ begin
 
     { MID$ of a wide string. ⚠️ A NEGATIVE length means "the rest", and the
       interpreter makes that rule conditional on MODERN - which is the only
-      dialect this target accepts, so it applies unconditionally here. }
+      dialect this target accepts, so it applies unconditionally here.
+      ⛔ And a START BELOW 1 yields an EMPTY string. wSub CLAMPS the start to 1
+      (it mirrors Utf8SubCP, whose clamp LEFT$/RIGHT$ rely on), so the rule has
+      to be stated here - the same place, and for the same reason, as in the
+      interpreter's bcStrMidW arm. A count of ZERO makes wSub answer "". }
     ssaStrMidW:
       begin
         LoadReg(B, Instr.Src1);
         LoadReg(B, Instr.Src2);
-        LoadReg(B, Instr.Src3);
-        B.I64Const(0); B.Op(wopI64LtS);
+        LoadReg(B, Instr.Src2);
+        B.I64Const(1); B.Op(wopI64LtS);
         B.BlockStart(wopIf, WASM_TYPE_I64);
-          LoadReg(B, Instr.Src1); B.Call(FWLenFunc);
-          LoadReg(B, Instr.Src2); B.Op(wopI64Sub);
-          B.I64Const(1); B.Op(wopI64Add);
+          B.I64Const(0);                        { start < 1 -> take zero codepoints }
         B.Op(wopElse);
           LoadReg(B, Instr.Src3);
+          B.I64Const(0); B.Op(wopI64LtS);
+          B.BlockStart(wopIf, WASM_TYPE_I64);
+            LoadReg(B, Instr.Src1); B.Call(FWLenFunc);
+            LoadReg(B, Instr.Src2); B.Op(wopI64Sub);
+            B.I64Const(1); B.Op(wopI64Add);
+          B.Op(wopElse);
+            LoadReg(B, Instr.Src3);
+          B.EndOp;
         B.EndOp;
         B.Call(FWSubFunc);
         StoreReg(B, Instr.Dest);
