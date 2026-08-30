@@ -11289,8 +11289,20 @@ begin
       for k := 0 to PL.ChildCount - 1 do
       begin
         Prm := PL.GetChild(k);
+        // ⭐ ...EXCEPT A "ByVal As String" ONE, WHICH IS THE ONE EXEMPTION fbc HAS. A var-len string is
+        // passed BYVAL as its DESCRIPTOR, so the characters are the CALLER's storage and outlive the
+        // call: fbc compiles "Function f( ByVal s As String ) ByRef As String : Function = s", while
+        // ByVal Integer / Double / <UDT> are all error 272 (probed one at a time). Only the VAR-LEN
+        // spelling: "ByVal z As ZString * n" is refused by fbc before the return is even reached
+        // (error 59), so a fixed-length buffer stays on the refused side.
+        // ⛔ THIS WAS TRIED ALONE ON 29 AUG AND WITHDRAWN, because accepting the declaration then died
+        // at RUN TIME on a null pointer: "@" of a var-len string PARAMETER did not exist. That half is
+        // m750; this is the four lines it unblocks. DIVERGENZE 85.
         if (Prm <> nil) and (Prm.NodeType = antIdentifier) and
-           (Prm.Attributes.Values['BYVAL'] = '1') then
+           (Prm.Attributes.Values['BYVAL'] = '1') and
+           not ((Prm.ChildCount >= 1) and (Prm.GetChild(0).NodeType = antIdentifier) and
+                (UpperCase(VarToStr(Prm.GetChild(0).Value)) = 'STRING') and
+                (StrToIntDef(Prm.Attributes.Values['FIXEDLEN'], 0) = 0)) then
           Locals.Add(UpperCase(VarToStr(Prm.Value)));
         // ⛔⛔ A "ByVal As String" PARAMETER IS THE ONE EXEMPTION fbc HAS AND WE DO NOT, AND LIFTING
         // THE REFUSAL ALONE WAS TRIED AND WITHDRAWN (29 Aug 2026). fbc passes a var-len string byval

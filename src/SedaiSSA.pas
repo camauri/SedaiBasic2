@@ -22290,6 +22290,13 @@ var
 begin
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
+  // ⛔ ...AND THE ANONYMOUS-STRUCT PAIR, which two of the three layout routines did NOT initialise:
+  // the first field of a nested "Type ... End Type" compares its group against a SGrpCur that is
+  // whatever the stack held, and when the two happen to match the offset accumulator is not reset
+  // either - so the layout of a UDT depended on the CALLER'S STACK. Measured, not deduced: adding one
+  // UNUSED local to LowerDeferredProcedures moved wstring/write.bas from CUFAIL to CUERR. The third
+  // routine (UDTCLayout) had the two lines all along; this is the same rule in the two that lacked it.
+  SGrpCur := 0; SGrpOfs := 0;
   SetLength(Offsets, 0); TotalSize := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   if FUDTs[UDTIdx].IsUnion then Exit;
@@ -23900,6 +23907,13 @@ var
 begin
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
+  // ⛔ ...AND THE ANONYMOUS-STRUCT PAIR, which two of the three layout routines did NOT initialise:
+  // the first field of a nested "Type ... End Type" compares its group against a SGrpCur that is
+  // whatever the stack held, and when the two happen to match the offset accumulator is not reset
+  // either - so the layout of a UDT depended on the CALLER'S STACK. Measured, not deduced: adding one
+  // UNUSED local to LowerDeferredProcedures moved wstring/write.bas from CUFAIL to CUERR. The third
+  // routine (UDTCLayout) had the two lines all along; this is the same rule in the two that lacked it.
+  SGrpCur := 0; SGrpOfs := 0;
   SetLength(Offsets, 0); TotalSize := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   if FUDTs[UDTIdx].IsUnion then Exit;   // overlapping members: not a sequential image
@@ -32832,13 +32846,45 @@ begin
     if banks[j] <> own then Exit(True);
 end;
 
+procedure CollectByrefReturnedNames(N: TASTNode; L: TStringList);
+// The plain NAMES a "Function f() ByRef As T" hands back - "Return s" or "Function = s". A byref
+// return IS an address-of: the caller is given the storage, not a copy, so the name it reaches must be
+// backed by something that HAS an address. Nothing in the AST spells "@s" there, so the @-taken
+// dictionary never heard of it, and returning a var-len STRING parameter handed back a null pointer -
+// which is why lifting the refusal alone was withdrawn on 29 Aug. DIVERGENZE 85.
+// Does not descend into a NESTED procedure: those are their own frame and their own returns.
+var
+  i: Integer;
+  Tgt, Ch: TASTNode;
+begin
+  if (N = nil) or (L = nil) then Exit;
+  if (N.NodeType = antReturn) and (N.ChildCount >= 1) and
+     (N.GetChild(0).NodeType = antIdentifier) then
+  begin
+    if L.IndexOf(UpperCase(VarToStr(N.GetChild(0).Value))) < 0 then
+      L.Add(UpperCase(VarToStr(N.GetChild(0).Value)));
+  end
+  else if (N.NodeType = antAssignment) and (N.ChildCount >= 2) then
+  begin
+    Tgt := N.GetChild(0);
+    Ch := N.GetChild(1);
+    if (Tgt.NodeType = antIdentifier) and (Ch.NodeType = antIdentifier) and
+       ((UpperCase(VarToStr(Tgt.Value)) = kFUNCTION) or (UpperCase(VarToStr(Tgt.Value)) = kOPERATOR)) then
+      if L.IndexOf(UpperCase(VarToStr(Ch.Value))) < 0 then
+        L.Add(UpperCase(VarToStr(Ch.Value)));
+  end;
+  for i := 0 to N.ChildCount - 1 do
+    if (N.GetChild(i) <> nil) and (N.GetChild(i).NodeType <> antProcedureDecl) then
+      CollectByrefReturnedNames(N.GetChild(i), L);
+end;
+
 procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean);
 // Pass 2: route each typed-scalar DIM whose variable is @-taken. A MODULE-level var is marked SHARED
 // (CollectSharedVars backs it with a 1-element global array — one stable cell, correct lifetime). A var
 // declared INSIDE a SUB/FUNCTION is instead recorded in FAddrLocalVars: it gets a per-frame 1-field
 // record (ProcessDim), so its address is distinct per recursion level (a shared cell would collide).
 var
-  i, k: Integer;
+  i, k, i2: Integer;
   Decl: TASTNode;
   ProcDict: TStringList;
   VNameU, VTypeU, VTypeC, SavedTypePath: string;
@@ -32936,6 +32982,28 @@ begin
       // InProc: everything under here IS a procedure body, so its pointer DIMs must not overwrite a
       // module declaration of the same name in the global map (see the ⭐ note at the registration).
       CollectDimVarBanks(Node, ProcDict, True);  // the @-taken names of this procedure's own subtree
+      // ...and a BYREF-return function's returned NAMES are address-taken by definition (see the note
+      // on CollectByrefReturnedNames): the caller is handed their storage.
+      // ⛔ EXCEPT AN EXPLICIT-BYREF PARAMETER, WHICH ALREADY CARRIES THE CALLER'S ADDRESS. Giving it a
+      // per-frame slot as well makes "Function = n" hand back THIS frame's copy, and the caller's
+      // variable stops changing: m482's power2(power2(i)) answered 2 2 2 for 4 16 256. IsAddrParam is
+      // the branch that reads such a parameter, and it wants the parameter untouched.
+      if Node.Attributes.Values['BYREFRET'] = '1' then
+      begin
+        CollectByrefReturnedNames(Node, ProcDict);
+        for k := 0 to Node.ChildCount - 1 do
+          if Node.GetChild(k).NodeType = antParameterList then
+            for i := 0 to Node.GetChild(k).ChildCount - 1 do
+            begin
+              Decl := Node.GetChild(k).GetChild(i);
+              if (Decl <> nil) and (Decl.NodeType = antIdentifier) and
+                 (Decl.Attributes.Values['BYREF'] = '1') then
+              begin
+                i2 := ProcDict.IndexOf(UpperCase(VarToStr(Decl.Value)));
+                if i2 >= 0 then ProcDict.Delete(i2);
+              end;
+            end;
+      end;
       for k := 0 to Node.ChildCount - 1 do
         if Node.GetChild(k).NodeType = antParameterList then
           for i := 0 to Node.GetChild(k).ChildCount - 1 do
@@ -32956,9 +33024,16 @@ begin
               // chain was already sound: "@x" on a ByVal Integer/Single/UDT param works, so the hole was
               // in the MARKING, not in @. It cost every "@" of a pointer parameter, BYVAL and BYREF
               // alike, which is why it read as a defect of the BYREF protocol and is not one.
-              // STRING stays out: its slot holds a MANAGED handle, not bytes (see the prologue's note).
+              // ⭐ AND STRING IS IN, since m750. It used to be excluded here "because its slot holds a
+              // MANAGED handle, not bytes" - which is true of the RAW backing and says nothing about
+              // whether the address exists: a @-taken local "Dim s As String" has had a record-backed
+              // cell (and a real "@s") since the ADDRLOCAL path was written, and every reader downstream
+              // already splits the two (IsRawAddrLocal excludes STRING, "@" emits ssaRefAddrField). Only
+              // the PROLOGUE was missing the string half of the pair, so a parameter could not be marked
+              // at all and "Dim q As String Ptr = @s" died as "Undefined procedure (address-of @): S".
+              // DIVERGENZE 85.
               if (ProcDict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeC) < 0) and
-                 (VTypeC <> 'STRING') then
+                 ((VTypeC <> 'STRING') or (GetEnvironmentVariable('NOSTRPARAM') = '')) then
               begin
                 Decl.Attributes.Values['ADDRPARAM'] := '1';
                 if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
@@ -36224,9 +36299,26 @@ function TSSAGenerator.EmitVarAddress(const Name: string): TSSAValue;
 // The packed address of an address-backed scalar (its 1-element backing array, offset 0). The id is
 // folded into the high bits: ((arrayId+1) shl POINTER_ARRAY_SHIFT); 0 stays NULL. Emits a constant
 // load. Returns a 0 constant when the variable is not backed (a deref would then fault).
+//
+// ⛔ IT USED TO KNOW ONLY THE SHARED BACKING, and answered a 0 constant for every OTHER kind of backed
+// scalar - so "Function f( ByVal s As String ) ByRef As String : Function = s" staged a null and the
+// caller dereferenced it. An @-taken LOCAL or PARAMETER is backed too, by the per-frame slot the "@"
+// lowering already reads; the two spellings of one question have to give one answer. DIVERGENZE 85.
 var
   idx: Integer;
 begin
+  // A raw-backed local/param: the hidden handle already HOLDS the byte address, exactly as "@x" reads it.
+  if IsRawAddrLocal(Name) then
+    Exit(EnsureIntRegister(AddrLocalHandle(Name)));
+  // ...and a STRING one is a record cell: its address is a record-field pointer at slot 0, again the
+  // same thing "@s" emits.
+  if IsAddrLocal(Name) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRefAddrField, Result, AddrLocalHandle(Name),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(0));
+    Exit;
+  end;
   idx := FSharedScalarArr.IndexOf(UpperCase(Name));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   if idx >= 0 then
@@ -39999,7 +40091,7 @@ var
   Proc, NameNode, ParamList, ParamNodeJ, BaseCallNode: TASTNode;
   Name, LabelName, ParentType, CopyCtorLbl, BaseCtorLbl: string;
   RT: TSSARegisterType;
-  ParamReg, LcHandle, RetZeroReg: TSSAValue;
+  ParamReg, LcHandle, RetZeroReg, RecHandleVal: TSSAValue;
   TrailingReturnLive: Boolean;
   {$IFDEF DEBUG_SSAPROF}
   ProfProcT0, ProfProcT1, ProfProcFq: Int64;
@@ -40099,11 +40191,33 @@ begin
         begin
           if FAddrLocalVars.IndexOfName(UpperCase(VarToStr(ParamNodeJ.Value))) < 0 then
             FAddrLocalVars.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '=' + UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)));
+          // ⭐ A STRING PARAMETER IS BACKED BY A RECORD CELL, NOT BY RAW BYTES - the same split the
+          // @-taken local DIM has made since it was written: a var-len string is a MANAGED handle, and a
+          // raw slot holding it is read back as an address and dereferenced (EAccessViolation on the
+          // first "@s", measured). One string field, seeded with the incoming value; from there the
+          // body's reads, writes and "@" route through the record exactly as a local's do. DIVERGENZE 85.
+          // ⛔ THE TEST IS THE DECLARED TYPE, NOT THE BANK. A "ZString * n" / "WString * n" parameter
+          // is in the STRING bank too and is a CHARACTER BUFFER: it belongs on the RAW path, which is
+          // where it already was. Written as "RT = srtString" this took the record branch as well and
+          // wstring/write.bas went from CUFAIL to CUERR in the same run - the terna saying so
+          // immediately. IsRawAddrLocal draws the line the same way, on AddrLocalType.
+          if AddrLocalType(UpperCase(VarToStr(ParamNodeJ.Value))) = 'STRING' then
+          begin
+            RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(0), MakeSSAConstInt(1));
+            EmitInstruction(ssaCopyInt, AddrLocalHandle(UpperCase(VarToStr(ParamNodeJ.Value))), RecHandleVal,
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone),
+                            AddrLocalHandle(UpperCase(VarToStr(ParamNodeJ.Value))), ParamReg, MakeSSAConstInt(0));
+          end
+          else
+          begin
           EmitRawAddrScalarAlloc(UpperCase(VarToStr(ParamNodeJ.Value)));
           if RT = srtFloat then
             EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(UpperCase(VarToStr(ParamNodeJ.Value)))), ParamReg, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(UpperCase(VarToStr(ParamNodeJ.Value))))))
           else
             EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(UpperCase(VarToStr(ParamNodeJ.Value)))), ParamReg, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(UpperCase(VarToStr(ParamNodeJ.Value))))));
+          end;
         end;
         // FreeBASIC function-pointer parameter: record its signature so "name(args)" in the body is
         // lowered as an indirect call through the parameter's entry-PC value (int).
