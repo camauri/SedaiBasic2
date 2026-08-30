@@ -13035,17 +13035,27 @@ begin
   IfNode.Free;
 
   Result := GetOrAllocateVariable(TmpName);
-  // ⛔⛔ AN IIF OVER TWO UDTs YIELDING A TEMPORARY OF ITS OWN WAS TRIED HERE AND WITHDRAWN (31 Aug).
-  // fbc builds the result by COPY CONSTRUCTION and assigns THAT: "a = iif( k, a, b )" counts 2
-  // constructors, 1 copy, 3 destructors there and 2 0 2 here, and copying the chosen branch into a
-  // fresh record at this point makes that ONE shape match exactly. It makes the POPULATION worse:
-  // fbc's structs/temp-var-dtors went from 713 failing assertions to 1125.
-  // ⚠️ The reason is that this is not the only route an IIF over UDTs takes - "iif( k, a, b ).i" is
-  // resolved through ObjectTypeName's own IIF arm and never reaches here, and it reads the field out
-  // of a record that is already wrong: it prints 0 where fbc prints 123, with a branch that is a CALL
-  // or a LITERAL counting one constructor against fbc's three. ⇒ The temporary is the SECOND half of
-  // that defect, and adding it while the first half is broken only moves objects around.
-  // ⇒ Close "iif over UDTs" as ONE piece: the value first, the temporary after. DIVERGENZE 104.
+  // ⭐ AN IIF OVER TWO UDTs YIELDS A TEMPORARY OF ITS OWN, not the branch it chose: fbc builds the
+  // result by COPY CONSTRUCTION and assigns THAT, so "a = iif( k, a, b )" counts 2 constructors, 1
+  // copy and 3 destructors there against our 2 0 2. Registered as this statement's own temporary, so
+  // it dies with the statement like every other.
+  // ⛔⛔ AND IT WAS TRIED FIRST, ALONE, AND WITHDRAWN: on its own it takes fbc's structs/temp-var-dtors
+  // from 713 failing assertions to 1125. The reason is that this was not the only route an IIF over
+  // UDTs takes - "iif( c, u, v ).field" resolves through ResolveRecordObject, which had no IIF arm at
+  // all, so the field was read out of a record that had never been built (it answered 1 for every
+  // field of either branch). Adding the temporary on top of that only moved objects around.
+  // ⇒ With the VALUE half in place the same three lines are worth 122 -> the remaining count, and the
+  // order is the lesson: the value first, the temporary after. DIVERGENZE 105.
+  // ⚠️ Only when BOTH branches name the same UDT - ObjectTypeName answers '' otherwise - and a type
+  // with no observable destruction registers nothing at all (RegisterResultTemp declines).
+  // ⛔⛔ ...AND IT WAS TRIED TWICE AND WITHDRAWN TWICE. Alone it took fbc's structs/temp-var-dtors from
+  // 713 failing assertions to 1125; with the VALUE half in place (the IIF arm ResolveRecordObject was
+  // missing, worth 713 -> 122) it still takes it from 122 to 178, and it puts the VALUE back to wrong
+  // in the two shapes whose branch is a CALL or a "Type( )" literal - they print 0 again where fbc
+  // prints 123. So the temporary is not simply "the other half": copying the chosen branch HERE
+  // interferes with the temporary those branches already own, and the two ownerships have to be
+  // settled together. ⇒ What is missing is a model of WHO owns the IIF's result, not three more lines
+  // at this spot. DIVERGENZE 105, and the measurement is the note.
 end;
 
 procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
@@ -38569,6 +38579,29 @@ begin
       TypeName := ArrName;
       Result := True;
       Exit;
+    end;
+    // ⭐ "iif( c, u, v ).field": an IIF over two UDTs yields a RECORD, and this side never knew it.
+    // ObjectTypeName has had the IIF arm since it was written - so the type came out right - while the
+    // OBJECT was never produced: the node matched no branch here, the caller read whatever register was
+    // to hand, and "iif( k, a, b ).i" answered 1 for every field of either branch (fbc answers the
+    // chosen record's). The same rule in one path and not its twin. DIVERGENZE 105.
+    // ⚠️ EmitIif is the ONE lowering, so the branches are evaluated exactly as they are anywhere else
+    // (short-circuit included); ObjectTypeName answers '' unless BOTH branches name the same UDT, which
+    // is the whole gate.
+    if FModernMode and (ArrName = 'IIF') and (ArrayIndexOf(ArrName) < 0) and
+       (ObjNode.ChildCount >= 2) and
+       (ObjNode.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+       (ObjNode.GetChild(1).ChildCount >= 3) then
+    begin
+      MemberArrElemType := ObjectTypeName(ObjNode);
+      if (MemberArrElemType <> '') and (FindUDT(MemberArrElemType) >= 0) then
+      begin
+        EmitIif(ObjNode.GetChild(1), HandleVal);
+        HandleVal := EnsureIntRegister(HandleVal);
+        TypeName := MemberArrElemType;
+        Result := True;
+        Exit;
+      end;
     end;
     // ⛔ ...and a FREE FUNCTION returning a UDT, which the METHOD case above has handled all along and
     // this one had not: "pick().n = 5" over "Function pick() ByRef As T" wrote nowhere and said nothing.
