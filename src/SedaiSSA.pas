@@ -629,6 +629,8 @@ type
     // very type being declared?" - the pair DIVERGENZE 104 turns on.
     // The private copy a BYVAL UDT parameter gets - made by the CALLER since m759.
     function EmitByvalUdtCopyOf(const SrcHandle: TSSAValue; PUDT: Integer): TSSAValue;
+    function EmitFreshRecord(PUDT: Integer): TSSAValue;
+    procedure EmitCopyCtorInto(const Dest, SrcHandle: TSSAValue; PUDT: Integer);
     function ByvalUdtParamIndex(ParamList: TASTNode; Idx: Integer): Integer;
     function ExactCopyCtorLabel(const TypeName: string): string;
     function InitIsCopyOfSameType(Node: TASTNode; const RecTypeName: string): Boolean;
@@ -13030,6 +13032,13 @@ begin
   TmpName := '__IIF' + IntToStr(FSwapTempSeq) + Suffix;
   Inc(FSwapTempSeq);
 
+  // ⭐ AN IIF OVER TWO UDTs YIELDS A TEMPORARY OF ITS OWN, and it is ALLOCATED HERE, before the
+  // branches run. fbc builds the result by COPY CONSTRUCTION and assigns THAT, so "a = iif( k, a, b )"
+  // counts 2 constructors, 1 copy and 3 destructors.
+  // ⛔⛔ THE ALLOCATION MUST PRECEDE THE BRANCHES. Allocated afterwards it REUSES the slot the taken
+  // branch's own temporary has just released, and initialising it ZEROES the record the copy is about
+  // to read: "iif( k, a, mk0( ) ).i" answered 0 while the same expression over two plain VARIABLES was
+  // right. That is what made this look, twice, like a defect of the copy itself. DIVERGENZE 105.
   IfNode := TASTNode.Create(antIf, ArgsNode.Token);
   IfNode.AddChild(ArgsNode.GetChild(0).Clone);   // condition
 
@@ -13064,14 +13073,21 @@ begin
   // order is the lesson: the value first, the temporary after. DIVERGENZE 105.
   // ⚠️ Only when BOTH branches name the same UDT - ObjectTypeName answers '' otherwise - and a type
   // with no observable destruction registers nothing at all (RegisterResultTemp declines).
-  // ⛔⛔ ...AND IT WAS TRIED TWICE AND WITHDRAWN TWICE. Alone it took fbc's structs/temp-var-dtors from
-  // 713 failing assertions to 1125; with the VALUE half in place (the IIF arm ResolveRecordObject was
-  // missing, worth 713 -> 122) it still takes it from 122 to 178, and it puts the VALUE back to wrong
-  // in the two shapes whose branch is a CALL or a "Type( )" literal - they print 0 again where fbc
-  // prints 123. So the temporary is not simply "the other half": copying the chosen branch HERE
-  // interferes with the temporary those branches already own, and the two ownerships have to be
-  // settled together. ⇒ What is missing is a model of WHO owns the IIF's result, not three more lines
-  // at this spot. DIVERGENZE 105, and the measurement is the note.
+  // ⛔⛔⛔ THE RESULT TEMPORARY IS NOT MADE HERE, AND THAT IS A MEASUREMENT, NOT AN OMISSION.
+  // fbc builds the result of an IIF over two UDTs by COPY CONSTRUCTION and assigns THAT: 2 constructors,
+  // 1 copy, 3 destructors for "a = iif( k, a, b )" against our 2 0 2. Emitting that copy here was tried
+  // THREE times (31 Aug), each time with the previous obstacle removed:
+  //   1. after the merge, before the value half of DIVERGENZE 105 - fbc's structs/temp-var-dtors 713 -> 1125;
+  //   2. after the merge, with the value right                     - 122 -> 178, and the VALUE broke again;
+  //   3. with the destination allocated BEFORE the branches (which cures 2: a record allocated after them
+  //      reuses the slot the taken branch's temporary just released, and initialising it zeroes what the
+  //      copy is about to read) - every probe of ours then matches fbc, and the test goes 90 -> 591.
+  // ⇒ Three shapes agreeing while the population triples is the standing signal that the RULE is wrong,
+  // not the code. And the sub-shape that still disagreed in (3) says which rule: with a "Type( )" LITERAL
+  // as the taken branch fbc makes NO copy - it builds the literal straight into the result, exactly as it
+  // does for a byval parameter. So the copy is PER BRANCH, decided inside each one, and cannot be emitted
+  // after the merge at all - which is where this lowering necessarily stands. Closing it means giving the
+  // IIF its own lowering rather than reusing the IF. DIVERGENZE 105.
 end;
 
 procedure TSSAGenerator.EmitBitMacro(const FuncName: string; ArgsNode: TASTNode; out Result: TSSAValue);
@@ -29559,20 +29575,50 @@ function TSSAGenerator.EmitByvalUdtCopyOf(const SrcHandle: TSSAValue; PUDT: Inte
 // makes the callee alias (and destroy) the CALLER's variable.
 var
   CopyCtorLbl, BaseCtorLbl: string;
+  SrcReg: TSSAValue;
+begin
+  // ⛔ THE SOURCE IS READ FIRST, BEFORE ANYTHING IS EMITTED. Allocating and initialising the
+  // destination can emit calls of its own (a nested UDT field constructs), and the source may be a
+  // COMPILER TEMPORARY whose register does not survive one - "iif( k, a, mk0( ) ).i" then copied from
+  // a register the allocation had already reused and answered 0 where fbc answers 123, while the same
+  // expression with two plain VARIABLES as branches was right. Materialised here, the value is in a
+  // register the allocator must keep live across everything below.
+  SrcReg := EnsureIntRegister(SrcHandle);
+  Result := EmitFreshRecord(PUDT);
+  EmitCopyCtorInto(Result, SrcReg, PUDT);
+end;
+
+function TSSAGenerator.EmitFreshRecord(PUDT: Integer): TSSAValue;
+// A newly allocated, member-initialised instance of PUDT - no constructor run yet.
 begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, Result,
                   MakeSSAConstInt(FUDTs[PUDT].LiveBytes), MakeSSAConstInt(0),
                   MakeSSAConstInt(FUDTs[PUDT].NStr or (Int64(PUDT) shl 32)));
   EmitRecordInit(Result, PUDT);
+end;
+
+procedure TSSAGenerator.EmitCopyCtorInto(const Dest, SrcHandle: TSSAValue; PUDT: Integer);
+// Build Dest from SrcHandle: the type's COPY CONSTRUCTOR when it declares one, a base-constructor plus
+// field copy when it does not. Dest must already exist (EmitFreshRecord).
+// ⛔ SPLIT FROM THE ALLOCATION because the two cannot always be adjacent: an IIF over two UDTs has to
+// allocate its result BEFORE the branches run - a record allocated after them REUSES the slot the
+// taken branch's temporary has just released, and initialising it then ZEROES the very record the copy
+// is about to read. "iif( k, a, mk0( ) ).i" answered 0 for exactly that reason, while the same
+// expression with two plain VARIABLES as branches was right (nothing was released, nothing reused).
+var
+  SrcReg: TSSAValue;
+  CopyCtorLbl, BaseCtorLbl: string;
+begin
+  SrcReg := EnsureIntRegister(SrcHandle);
   CopyCtorLbl := ExactCopyCtorLabel(FUDTs[PUDT].Name);
   if CopyCtorLbl <> '' then
   begin
     // THIS in int slot 0, the source handle in slot 1 - the layout every one-parameter constructor
     // call uses. The argument is already a VALUE here, so the AST-driven EmitConstructorCall cannot
     // be reused as it stands.
-    EmitXferStore(srtInt, 0, Result);
-    EmitXferStore(srtInt, 1, EnsureIntRegister(SrcHandle));
+    EmitXferStore(srtInt, 0, Dest);
+    EmitXferStore(srtInt, 1, SrcReg);
     EmitCallSubLabel(ProcedureLabelName(CopyCtorLbl));
   end
   else
@@ -29588,10 +29634,10 @@ begin
       BaseCtorLbl := ResolveConstructorLabel(FUDTs[PUDT].Parent, '');
     if BaseCtorLbl <> '' then
     begin
-      EmitXferStore(srtInt, 0, Result);                 // THIS
+      EmitXferStore(srtInt, 0, Dest);                   // THIS
       EmitCallSubLabel(ProcedureLabelName(BaseCtorLbl));
     end;
-    EmitRecordCopy(Result, SrcHandle, PUDT);            // copy the source record in
+    EmitRecordCopy(Dest, SrcReg, PUDT);                 // copy the source record in
   end;
 end;
 
