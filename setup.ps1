@@ -867,16 +867,24 @@ function Build-SedaiBasic {
     }
 
     Show-Status "Building SedaiBasic2 using build.ps1 -Clean..."
-    Show-Status "Targets: sb, sbc, sbd, sbv"
+    # build.ps1's default target is 'all', and 'all' is FIVE: sbw was missing from this line.
+    Show-Status "Targets: sb, sbc, sbd, sbv, sbw"
     Show-Status "Output: $BinDir\"
 
     Push-Location $ProjectRoot
     try {
         Write-Host ""
 
-        # Use build.ps1 -Clean to compile all targets (suppress banner as setup shows its own)
-        $buildArgs = @('-Clean', '-NoBanner')
-        if ($Fpc) { $buildArgs += @('-Fpc', $Fpc) }
+        # Use build.ps1 -Clean to compile all targets (suppress banner as setup shows its own).
+        #
+        # A HASHTABLE, not an array. Splatting an ARRAY passes its elements as POSITIONAL arguments,
+        # so "-Clean" was bound to build.ps1's first positional parameter - $Target, which carries a
+        # ValidateSet - and setup died with 'The argument "-Clean" does not belong to the set
+        # "all,sb,sbc,sbd,sbv,sbw"'. Reported from a clean Windows checkout, and it stopped setup at
+        # its last step, [7/7]. The five installer calls above this one have always splatted a
+        # hashtable; this was the only array left.
+        $buildArgs = @{ Clean = $true; NoBanner = $true }
+        if ($Fpc) { $buildArgs['Fpc'] = $Fpc }
         & $buildScript @buildArgs
         $exitCode = $LASTEXITCODE
 
