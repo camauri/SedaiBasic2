@@ -32162,6 +32162,39 @@ begin
          (Decl.GetChild(1).GetChild(i + 1).Attributes.Values['ARRAY'] <> '1') and
          (ByvalUdtParamIndex(Decl.GetChild(1), i + 1) >= 0) then
         ArgVals[i] := EmitByvalUdtCopyOf(ArgVals[i], ByvalUdtParamIndex(Decl.GetChild(1), i + 1));
+  // ⛔⛔⛔ ...AND THE OMITTED ARGUMENTS ARE EVALUATED HERE, ABOVE THIS, FOR THE THIRD TIME THE SAME
+  // REASON. A default may itself be a CALL - "Constructor UDT2( ByVal x As UDT1 = UDT1( 456 ) )" - and
+  // a call stages its OWN this and arguments into int transfer slots 0 and 1. Evaluated after THIS had
+  // been written to slot 0, the nested constructor overwrote it, and the outer constructor then ran
+  // against its own argument: fbc's functions/paraminit answered 0 where it asks 456, and its ctors1 /
+  // ctors2 groups died with an Access Violation. ⚠️ The SAME default written as a plain global
+  // ("= g") worked, which is what said the defect was in the ORDER and not in the default machinery.
+  // Two passes, exactly as StageCallArgs does for every argument: evaluate, then write.
+  NDefStage := 0;
+  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) and
+     (Decl.GetChild(1).NodeType = antParameterList) then
+  begin
+    ParamList := Decl.GetChild(1);
+    for i := ArgCount + 1 to ParamList.ChildCount - 1 do
+    begin
+      PNode := ParamList.GetChild(i);
+      if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
+      begin
+        // Unconditional, for the reason the SUB/FUNCTION twin gives: a counter held across the whole
+        // default expression is set by a literal INSIDE it, and the default's value is this statement's
+        // own temporary either way.
+        ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
+        ProcessDefaultValue(PNode, PNode.GetChild(PNode.ChildCount - 1), DefVal);
+        if ParamUdtDef >= 0 then
+          DefVal := EmitByvalUdtCopyOf(DefVal, ParamUdtDef);
+        if NDefStage > High(DefSlots) then Break;   // defensive: no procedure has 64 defaulted parameters
+        DefSlots[NDefStage] := ParamBankAndSlot(ParamList, i, RT);
+        DefRTs[NDefStage] := RT;
+        DefVals[NDefStage] := DefVal;
+        Inc(NDefStage);
+      end;
+    end;
+  end;
   EmitXferStore(srtInt, 0, HandleVal);              // THIS handle -> int xfer slot 0
   if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
   begin
@@ -32191,33 +32224,9 @@ begin
       end;
       EmitXferStore(RT, Slot, ArgVals[i]);          // coerced to the parameter's bank
     end;
-    // M4.4h: fill any trailing parameters the call omitted with their default values (evaluated here,
-    // in the caller's context), coerced to each parameter's bank — like M7 for SUB/FUNCTION. The
-    // parameter at ParamList index k corresponds to the (k-1)-th explicit argument (THIS is index 0).
-    // ⛔ TWO PASSES, and the reason is the same one that hoisted the argument copies above THIS: a
-    // BYVAL UDT default owes its private copy (m760), the copy constructor writes int slots 0 and 1,
-    // and THIS plus the explicit arguments are already sitting in them. Evaluate and copy first, store
-    // afterwards - which is what StageCallArgs does for every argument and says so.
-    NDefStage := 0;
-    for i := ArgCount + 1 to ParamList.ChildCount - 1 do
-    begin
-      PNode := ParamList.GetChild(i);
-      if (PNode.Attributes.Values['HASDEFAULT'] = '1') and (PNode.ChildCount >= 1) then
-      begin
-        // Unconditional, for the reason the SUB/FUNCTION twin gives: a counter held across the whole
-        // default expression is set by a literal INSIDE it, and the default's value is this statement's
-        // own temporary either way.
-        ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
-        ProcessDefaultValue(PNode, PNode.GetChild(PNode.ChildCount - 1), DefVal);
-        if ParamUdtDef >= 0 then
-          DefVal := EmitByvalUdtCopyOf(DefVal, ParamUdtDef);
-        if NDefStage > High(DefSlots) then Break;   // defensive: no procedure has 64 defaulted parameters
-        DefSlots[NDefStage] := ParamBankAndSlot(ParamList, i, RT);
-        DefRTs[NDefStage] := RT;
-        DefVals[NDefStage] := DefVal;
-        Inc(NDefStage);
-      end;
-    end;
+    // M4.4h: the omitted parameters' defaults, evaluated ABOVE (see the note beside the THIS store),
+    // written here. The parameter at ParamList index k corresponds to the (k-1)-th explicit argument,
+    // THIS being index 0.
     for i := 0 to NDefStage - 1 do
       EmitXferStore(DefRTs[i], DefSlots[i], DefVals[i]);
   end;
@@ -38115,6 +38124,16 @@ end;
 procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
 // FreeBASIC "DELETE p": run the pointee's destructor (if any), then release the heap record and
 // recycle its slot (ssaRecordFree). Node child0 = the pointer expression (must be a UDT pointer).
+//
+// ⛔⛔ THE POINTER IS READ AS AN EXPRESSION, NOT AS A REGISTER, and all four arms below used to take
+// it with GetOrAllocateVariable - which hands back the name's register WITHOUT emitting the load. For
+// an ordinary local that is the same thing; for a **SHARED** (or @-taken) scalar it is not, because
+// such a name is backed by a one-element ARRAY and the value does not live in the register at all.
+// "Dim Shared p As T Ptr : p = New T : Delete p" therefore walked a register nothing had written:
+// the nested-member walk of EmitDestructorCall read RecordLoadInt off it and faulted, while the same
+// program with a plain "Dim p" beside it was right. ⚠️ It needed a type THREE levels deep to show:
+// with two levels the walk loads once from the (garbage) handle and happens not to fault.
+// fbc's own functions/paraminit, groups ctors1 and ctors2.
 var
   PtrName, PtrType, OpLbl: string;
   HandleReg, CountReg: TSSAValue;
@@ -38130,7 +38149,8 @@ begin
   begin
     PtrName := VarToStr(Node.GetChild(0).Value);
     PtrType := VarRecordTypeName(PtrName);
-    HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+    ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
+  HandleReg := EnsureIntRegister(HandleReg);
     EmitDestructorCall(HandleReg, PtrType);
     EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
@@ -38211,7 +38231,8 @@ begin
      (PointerUDTType(PtrName) <> '') and UDTBlockIsManaged(PointerUDTType(PtrName)) then
   begin
     PtrType := PointerUDTType(PtrName);
-    HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+    ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
+  HandleReg := EnsureIntRegister(HandleReg);
     CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
@@ -38223,14 +38244,16 @@ begin
   if (Node.Attributes.Values['NEWARRAY'] = '1') or
      ((PointerUDTType(PtrName) = '') and IsRawPtr(PtrName)) then
   begin
-    HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+    ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
+  HandleReg := EnsureIntRegister(HandleReg);
     EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
   PtrType := PointerUDTType(PtrName);
   if PtrType = '' then
     raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
-  HandleReg := EnsureIntRegister(GetOrAllocateVariable(UpperCase(PtrName)));
+  ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
+  HandleReg := EnsureIntRegister(HandleReg);
   EmitDestructorCall(HandleReg, PtrType);
   // The type's OWN deallocator, if it declares one: fbc runs the destructor and then hands the POINTER
   // to "Operator T.Delete(p)", which owns the release. It must be the same pointer its "Operator New"
