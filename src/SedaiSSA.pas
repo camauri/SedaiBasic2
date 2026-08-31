@@ -12930,7 +12930,7 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 var
   j, di, ArrayIdx, MSlot, MDimCount, UdtIdx, MElemUDT: Integer;
   ArrName, MTypeName, ElemUdtName: string;
-  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode, StaticArr: TASTNode;
+  ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode, StaticArr, ThisArrNode: TASTNode;
   UbValue, UbReg, MHandle, LbVal, MArrHandle: TSSAValue;
   MElemBank: TSSARegisterType;
   PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
@@ -12949,6 +12949,29 @@ begin
     // every spelling at once - "UDT.a", "x.a", "px->a", and the BARE field name inside a method, which
     // is the implicit THIS. ⛔ The bare one is the dangerous spelling: it used to declare a FRESH array
     // of that name and resize THAT, with no diagnostic, while "this.a" beside it worked.
+    // ⛔⛔ ...AND THE BARE NAME OF A NON-STATIC MEMBER ARRAY, which only the ELEMENT path knew.
+    // Inside a method "a(i)" resolves to "this.a(i)" through TryImplicitThisArrayNode; "ReDim a(...)"
+    // did not ask, so it fell to the flat array lookup and resized whatever slot carried that NAME.
+    // With a LOCAL "Dim a(Any)" later in the same method - fbc resolves by declaration ORDER, so the
+    // ReDim before it is the member's - the redim hit the local's slot instead and died on a range
+    // check. ⚠️ "a(4) = 7" one line below was RIGHT the whole time, which is what said the rule lived
+    // in one path and not its twin: fbc's structs/dynamic-array-fields, group "scoping".
+    // ⚠️ AND ONLY WHEN NO LOCAL ARRAY OF THAT NAME IS IN SCOPE. TryImplicitThisArrayNode's own guard
+    // asks ResolveExisting, which answers for a SCALAR: an array local is invisible to it, so without
+    // this test the rewrite stole a genuine "Dim a(Any) : ReDim a(...)" from the local and gave it to
+    // the field. ArraySlotIsModuleFlat is the question already asked elsewhere: a slot that is NOT the
+    // bare module entry belongs to this scope, and then the local wins - which is what fbc does.
+    if (ArrayDeclNode.GetChild(0) <> nil) and (ArrayDeclNode.GetChild(0).NodeType = antIdentifier) and
+       ((ArrayIndexOf(UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value))) < 0) or
+        ArraySlotIsModuleFlat(ArrayIndexOf(UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value))),
+                              UpperCase(VarToStr(ArrayDeclNode.GetChild(0).Value)))) and
+       TryImplicitThisArrayNode(ArrayDeclNode, ThisArrNode) then
+      try
+        ArrayDeclNode.RemoveChildAt(0);
+        ArrayDeclNode.InsertChild(0, ThisArrNode.GetChild(0).Clone);
+      finally
+        ThisArrNode.Free;
+      end;
     MemberNode := ArrayDeclNode.GetChild(0);
     StaticArr := RewriteStaticMemberArray(MemberNode);
     if StaticArr <> nil then
@@ -41419,6 +41442,7 @@ var
   Slot, DimCount: Integer;
   ElemBank: TSSARegisterType;
   ObjHandle, HandleReg, DimReg, ArgValue, IntRegVal, OneVal: TSSAValue;
+  OwnedThis, RewrittenThis: TASTNode;
 begin
   Result := False;
   // FreeBASIC spells an array reference either way: "Ubound(o.f)" and "Ubound(o.f())" both mean the whole
@@ -41428,6 +41452,30 @@ begin
      (ArrNameNode.GetChild(0).NodeType = antMemberAccess) and
      ((ArrNameNode.ChildCount < 2) or (ArrNameNode.GetChild(1).ChildCount = 0)) then
     ArrNameNode := ArrNameNode.GetChild(0);
+  // ⛔ ...AND THE BARE NAME INSIDE A METHOD IS THE THIRD SPELLING. "UBound(a)" on a member array meant
+  // "UBound(this.a)" everywhere else - the element access has had TryImplicitThisArrayNode since it was
+  // written - and this path had never asked, so it fell through to the plain-array lookup: "UBOUND:
+  // array not declared". It only became reachable once ReDim stopped creating a flat slot of that name
+  // as a side effect, which is how a masked gap comes to light.
+  if (ArrNameNode <> nil) and (ArrNameNode.NodeType = antIdentifier) and (FCurrentThisType <> '') and
+     (ArrayIndexOf(UpperCase(VarToStr(ArrNameNode.Value))) < 0) then
+  begin
+    OwnedThis := TASTNode.Create(antArrayAccess, ArrNameNode.Token);
+    OwnedThis.AddChild(ArrNameNode.Clone);
+    try
+      if TryImplicitThisArrayNode(OwnedThis, RewrittenThis) then
+      begin
+        try
+          Result := TryMemberArrayBound(RewrittenThis.GetChild(0), ArgListNode, IsLBound, BoundVal);
+        finally
+          RewrittenThis.Free;
+        end;
+        Exit;
+      end;
+    finally
+      OwnedThis.Free;
+    end;
+  end;
   if (ArrNameNode = nil) or (ArrNameNode.NodeType <> antMemberAccess) then Exit;
   TypeName := ObjectTypeName(ArrNameNode.GetChild(0));
   if TypeName = '' then Exit;
