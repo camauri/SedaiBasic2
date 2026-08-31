@@ -956,6 +956,7 @@ var
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
   GArrDescFast: Boolean = True;
   GArrPrivDiag: Boolean = False;   // ARRPRIV_DIAG=1: trace the private-array mapping
+  GRecDiag: Boolean = False;       // RECDIAG=1: name a record handle that is out of its context's range
   // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
   // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
   GNoExcFrame: Boolean = True;
@@ -1413,6 +1414,7 @@ begin
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GArrPrivDiag := GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
+  GRecDiag := GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
   GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
   // PAIR_DIAG=1 (the old spelling, top 20) | PAIR_DIAG=all | PAIR_DIAG=<n>
@@ -4683,8 +4685,9 @@ begin
   end
   else
   begin
-    if (GetEnvironmentVariable('RECDIAG') = '1') and
-       ((Handle < 0) or (Handle > High(Ctx.Records))) then
+    // ⛔ THE RANGE TEST FIRST, and the flag is a GLOBAL read once at startup: this runs on EVERY
+    // per-thread record resolution, so a GetEnvironmentVariable here would be a lookup per field access.
+    if ((Handle < 0) or (Handle > High(Ctx.Records))) and GRecDiag then
       WriteLn(ErrOutput, Format('[rec] FUORI RANGE handle=%d alto=%d pc=%d',
               [Handle, High(Ctx.Records), Ctx.PC]));
     Result := @Ctx.Records[Handle];
