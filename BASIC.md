@@ -225,6 +225,21 @@ difference is stated rather than left to be discovered.
 
 ### Declared divergences from FreeBASIC
 
+**Pointer arithmetic and the numeric value of a pointer.** A pointer obtained from `Allocate`,
+`SAdd`, `StrPtr` or `ScreenPtr` is a byte address and steps by `SizeOf(pointee)`, exactly as in
+FreeBASIC. A pointer obtained with `@` on a variable or an array element is a packed
+(array, element) pair instead, so its numeric value counts ELEMENTS: `CInt(p + 1) - CInt(p)` answers
+1 where FreeBASIC answers `SizeOf(pointee)`. Dereferencing, indexing and pointer subtraction are
+unaffected — `*p`, `p[i]`, `p2 - p1` and `For p = @a(0) To @a(n)` all answer what FreeBASIC answers,
+because both sides of those speak the same unit.
+
+**Reinterpreting memory across element boundaries is not supported.** An array here is a vector of
+typed elements, not a flat byte image, so a pointer cast that lands part-way into an element — for
+example advancing a `Long Ptr` by one `Short` and then reading a `Long` — has no memory to read. The
+same limit applies to reading a UDT as raw bytes and to punning a `Single` (stored as an 8-byte
+double) through an integer pointer.
+
+
 - ⚠️ **A declaration must state its type, and that narrows what we used to accept.** In `-lang fb`
   there are no default types and no inference from a type sigil, so `Dim a`, `Dim a$`, `Dim a(0 To 1)`,
   `Common a` and `Dim a = 5` are all refused, exactly as fbc refuses them (`error 147`). The check is
