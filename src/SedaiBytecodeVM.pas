@@ -45,7 +45,8 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt
+  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiOpcodeBanks,
+  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -6450,6 +6451,18 @@ var
   i: Integer;
   Instr: TBytecodeInstruction;
   MaxIntReg, MaxFloatReg, MaxStringReg: Integer;
+
+  procedure CreditField(Bank: TRegBank; Reg: Integer);
+  // Credit one operand field to the bank SedaiOpcodeBanks says it names. rbUnknown credits nothing:
+  // no list claims the field, and guessing a bank here is what sizes the wrong one.
+  begin
+    case Bank of
+      rbInt:    if Reg > MaxIntReg then MaxIntReg := Reg;
+      rbFloat:  if Reg > MaxFloatReg then MaxFloatReg := Reg;
+      rbString: if Reg > MaxStringReg then MaxStringReg := Reg;
+    end;
+  end;
+
 begin
   FProgram := Program_;
 
@@ -7486,6 +7499,46 @@ begin
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
+
+        { ⛔⛔⛔ THE TRANSFER BANK, AND EVERY PROCEDURE PROLOGUE EMITS ONE. bcXferLoad<bank> writes
+          its DEST into a register bank (the Immediate is the transfer SLOT, not a register), and
+          bcXferStore<bank> reads its Src1 from one - and none of the six was listed here, so a
+          procedure whose only use of a high register was its own parameter load sized the bank
+          from nothing and the load wrote past the end. fbc's structs/derived-cast died on exactly
+          that: "XferLoadInt Dest=20" as the first instruction of a prologue, in a program whose
+          int registers otherwise stopped below 20. }
+        bcXferLoadInt:    if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+        bcXferLoadFloat:  if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+        bcXferLoadString: if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+        bcXferStoreInt:    if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        bcXferStoreFloat:  if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+        bcXferStoreString: if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+      else
+        { ⛔⛔⛔ THE SAFETY NET THE FOURTH COUNTER NEVER HAD, and it is what makes the omission above
+          impossible to repeat. This case is hand-written and every arm names its banks; an opcode
+          nobody listed used to contribute ZERO, so the bank was created too small and the
+          interpreter wrote past the end - a heap corruption that surfaces at teardown, three steps
+          from its cause (see the GROUP 12 note above, which paid for it once, and
+          structs/derived-cast, which paid for it again with the TRANSFER opcodes).
+          ⭐⭐ IT DELEGATES TO SedaiOpcodeBanks, the unit that exists to be the ONE answer to
+          "which bank does this opcode use for this field". That unit's own header names this scan
+          as the third copy still to be reconciled, and its note asks for the case that proves it
+          FIRST: structs/derived-cast is that case. Answering here through the single source means
+          an opcode nobody listed above is sized CORRECTLY rather than conservatively - which
+          matters, because a census run under REGSCAN_DIAG names over a hundred of them, the whole
+          RECORD family included, and crediting a record register to the STRING bank would inflate
+          FrameSaveStrCount (refcounted string copies, per call).
+          ⚠️ rbUnknown credits nothing, which is the old behaviour: this arm narrows the blind spot
+          to the fields NO list claims, and REGSCAN_DIAG names them. }
+        begin
+          CreditField(BankOfDest(TBytecodeOp(Instr.OpCode)), Instr.Dest);
+          CreditField(BankOfSrc1(TBytecodeOp(Instr.OpCode)), Instr.Src1);
+          CreditField(BankOfSrc2(TBytecodeOp(Instr.OpCode)), Instr.Src2);
+          if GetEnvironmentVariable('REGSCAN_DIAG') = '1' then
+            WriteLn(ErrOutput, '[regscan] opcode NON ELENCATO nella scansione dei banchi: ',
+                    BytecodeOpToString(TBytecodeOp(Instr.OpCode)),
+                    ' (dest=', Instr.Dest, ' src1=', Instr.Src1, ' src2=', Instr.Src2, ')');
         end;
       end;
     end;
