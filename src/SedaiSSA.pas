@@ -915,6 +915,7 @@ type
     function PushTypeScope(Node: TASTNode): string;           // enter Node's children's type scope; returns the path to restore
     function ScopedNameIndex(L: TStringList; const Name: string): Integer;  // IndexOfName over the live chain
     function FuncPtrTypeSig(const TypeName: string): string;  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
+    function IndexedFuncPtrSig(BaseNode: TASTNode): string;   // signature of the funcptr at "p[j]" / "a(i)[j]", '' if none
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
     procedure CheckMemberAccess(const TypeName, MemberName: string);        // OOP: refuse an illegal member access
     procedure CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);  // ...for the one a DERIVED type reaches implicitly
@@ -7152,7 +7153,30 @@ begin
         // strips them and already answers the element type of "*base" for every base it knows, and
         // "base[i]" IS "*(base + i)". Adding a fifth named shape would keep the list growing on the
         // side that cannot be finished.
-        if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antParentheses) and
+        // ⛔⛔ THE GENERIC FORM WAS TRIED TWICE ON 31 AUG AND WITHDRAWN, AND THE MEASUREMENT IS THE
+        // POINT: this note argues for asking DerefedType ALONE and letting the shape go, and that is
+        // right in principle and premature in fact. This branch runs BEFORE the arms that own the named
+        // bases, so widening it SHADOWS them:
+        //     no shape test at all ................. CUPASS 420 -> 426, corpus 913/**27 FAIL**/1 OPTDIFF
+        //     ...excluding a bare identifier ....... CUPASS 420 -> 419, corpus 936/**4 FAIL**
+        // ⭐ The first line is the interesting one: the generic path is worth SIX tests, so where it
+        // shadows an arm it is usually the BETTER answer - the arms it hides are the ones to repair
+        // (m371, m431, m515, m790 name four of them precisely). ⇒ Repair those, then delete the shape
+        // test; not the other way round. [[a-whitelist-of-shapes-cannot-be-finished]] still applies to
+        // the END STATE, not to a widening that arrives before the paths it swallows are correct.
+        //
+        // ⭐ VarPtr/Pointer are named here for now because they are the spelling fbc's own
+        // pointers/indexing-syntax uses ("VarPtr(i)[0]"), and without an arm the read answered the
+        // ADDRESS, 8, instead of the value - while the same address stored in a variable first read
+        // correctly. DerefedType learnt to answer for them in the same change, which is the half that
+        // survives whichever way the guard goes.
+        if (Node.GetChild(0) <> nil) and
+           ((Node.GetChild(0).NodeType = antParentheses) or
+            ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 2) and
+             (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+             ((UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = kVARPTR) or
+              (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = kPOINTER)) and
+             (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) < 0))) and
            (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
            (Node.GetChild(1).ChildCount = 1) and (DerefedType(Node.GetChild(0)) <> '') then
         begin
@@ -7257,6 +7281,24 @@ begin
           ProcessExpression(Node.GetChild(0), Left);      // f(args) -> the returned entry PC
           Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
           Exit;
+        end;
+
+        // ..."p[i]( args )" where p is a POINTER whose POINTEE is a named function-pointer TYPE.
+        // ⛔ It answered the ADDRESS: with no arm for the shape, "p[3](7)" printed 32 - the byte offset
+        // of the element - and the argument list was dropped in silence. Everything around it worked,
+        // which is what kept it hidden: "Dim g As fn = p[3] : g(7)" calls, "(*q)(7)" calls, and even
+        // "arr(i)(args)" over a declared ARRAY of function pointers has had its own arm (FArrayFuncPtrSig)
+        // for a while. This is the RAW-BLOCK spelling of the same thing, and it is the one fbc's own
+        // pointers/array_ptr_fn is written in.
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antArrayAccess) then
+        begin
+          TempStr := IndexedFuncPtrSig(Node.GetChild(0));
+          if TempStr <> '' then
+          begin
+            ProcessExpression(Node.GetChild(0), Left);     // p[i] -> the entry PC held there
+            Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
+            Exit;
+          end;
         end;
 
         // ...and "obj.m( args )( args )", the same thing through a METHOD. A method's label is
@@ -26774,6 +26816,38 @@ begin
   Result := -1;
 end;
 
+function TSSAGenerator.IndexedFuncPtrSig(BaseNode: TASTNode): string;
+// The signature of the function pointer held at "<something>[j]", or '' when that is not what it is.
+// Two bases reach here and they are the same fact filed in two registries:
+//   p[j]     - p is a POINTER whose pointee is a named funcptr TYPE      -> PointeeTypeOf
+//   a(i)[j]  - a is a declared ARRAY of "<named funcptr type> Ptr"       -> FArrayScalarPointee
+// Written as one funnel because the call site needs both and they must agree: fbc's own
+// pointers/array_ptr_fn uses the second, and every reduction of it uses the first.
+var
+  Inner: TASTNode;
+  Nm: string;
+begin
+  Result := '';
+  if (BaseNode = nil) or (BaseNode.NodeType <> antArrayAccess) or (BaseNode.ChildCount < 2) then Exit;
+  Inner := BaseNode.GetChild(0);
+  if Inner.NodeType = antIdentifier then
+  begin
+    Nm := UpperCase(VarToStr(Inner.Value));
+    if ArrayIndexOf(Nm) < 0 then
+      Result := FuncPtrTypeSig(PointeeTypeOf(Nm));
+    Exit;
+  end;
+  // ⛔ "a(i)[j]" - the element of a DECLARED array holding the raw block - is deliberately NOT here,
+  // and the note is the measurement: the arm was written, and it turned an error into an INFINITE LOOP,
+  // because the value read at "a(i)[j]" is not the function pointer to begin with. The whole family is
+  // broken one level down and independently of calls: "Dim a(10) As Integer Ptr : a(5) = Allocate(...)
+  // : a(5)[3] = 777 : Print a(5)[3]" answers 32 - the byte address, unloaded - and the store never
+  // reaches the block either. An element of a declared array is never marked RAW (CollectRawPtrVars
+  // walks pointer VARIABLES), so every access through one falls to the managed path.
+  // ⇒ Curing THAT is what unblocks fbc's pointers/array_ptr_fn; a call arm on top of a wrong value only
+  // makes the failure worse. [[a-parse-error-is-better-than-a-wrong-answer]]
+end;
+
 function TSSAGenerator.FuncPtrTypeSig(const TypeName: string): string;
 // The signature of a named function-pointer TYPE ("Type X As Function(...) As R"), asked through the
 // SAME funnel as every other type-name fact. ⛔ ALL of its readers go through here: a registry that is
@@ -36965,6 +37039,19 @@ begin
     // array's declared element type, and answered -22 where fbc answers 234. The cast is there to say
     // what width and signedness to read at; taking its address does not take that away.
     Result := UpperCase(VarToStr(Node.GetChild(0).Value))
+  // ⭐ "VarPtr(v)" / "Pointer(v)" NAME THEIR POINTEE THROUGH THEIR ARGUMENT: they are "@v" written as a
+  // call, so what they dereference to is v's own declared type. Without this arm the reader answered ''
+  // for them and "VarPtr(i)[0]" - fbc's own pointers/indexing-syntax - fell off the indexed-read branch
+  // and printed the ADDRESS, 8, where fbc prints 123. The very same address stored in a variable first
+  // and dereferenced worked, which is the usual tell.
+  // ⛔ PROCPTR is deliberately NOT here: a procedure's entry point is not a value to read at.
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+          (Node.GetChild(0).NodeType = antIdentifier) and
+          ((UpperCase(VarToStr(Node.GetChild(0).Value)) = kVARPTR) or
+           (UpperCase(VarToStr(Node.GetChild(0).Value)) = kPOINTER)) and
+          (ArrayIndexOf(VarToStr(Node.GetChild(0).Value)) < 0) and
+          (Node.GetChild(1).ChildCount >= 1) then
+    Result := UpperCase(DeclaredTypeNameOf(Node.GetChild(1).GetChild(0)))
   else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
   begin
     // ⭐ "*obj.field" WHERE THE FIELD IS THE POINTER. Every arm above asks a registry keyed on a
