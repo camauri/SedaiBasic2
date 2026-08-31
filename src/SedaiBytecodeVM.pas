@@ -45,7 +45,8 @@ uses
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
-  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt
+  SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiOpcodeBanks,
+  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -692,6 +693,10 @@ type
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
     // that NeedBytes bytes fit. Every raw access goes through it.
+    function PtrDomainLoadZStr(Ctx: TExecutionContext; PtrAddr: Int64; Wide: Boolean;
+                               ExactBytes: Integer): AnsiString;
+    procedure PtrDomainStoreZStr(Ctx: TExecutionContext; PtrAddr: Int64; const Value: AnsiString;
+                                 Wide: Boolean);
     function RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
@@ -951,6 +956,7 @@ var
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
   GArrDescFast: Boolean = True;
   GArrPrivDiag: Boolean = False;   // ARRPRIV_DIAG=1: trace the private-array mapping
+  GRecDiag: Boolean = False;       // RECDIAG=1: name a record handle that is out of its context's range
   // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
   // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
   GNoExcFrame: Boolean = True;
@@ -1408,6 +1414,7 @@ begin
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GArrPrivDiag := GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
+  GRecDiag := GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
   GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
   // PAIR_DIAG=1 (the old spelling, top 20) | PAIR_DIAG=all | PAIR_DIAG=<n>
@@ -4677,7 +4684,14 @@ begin
     end;
   end
   else
+  begin
+    // ⛔ THE RANGE TEST FIRST, and the flag is a GLOBAL read once at startup: this runs on EVERY
+    // per-thread record resolution, so a GetEnvironmentVariable here would be a lookup per field access.
+    if ((Handle < 0) or (Handle > High(Ctx.Records))) and GRecDiag then
+      WriteLn(ErrOutput, Format('[rec] FUORI RANGE handle=%d alto=%d pc=%d',
+              [Handle, High(Ctx.Records), Ctx.PC]));
     Result := @Ctx.Records[Handle];
+  end;
 end;
 
 function TBytecodeVM.RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage;
@@ -5200,6 +5214,77 @@ begin
   RawFree(RawPtr);
 end;
 
+function TBytecodeVM.PtrDomainLoadZStr(Ctx: TExecutionContext; PtrAddr: Int64;
+  Wide: Boolean; ExactBytes: Integer): AnsiString;
+// A C STRING read at a PACKED ARRAY pointer - the third domain, beside the raw heap and the
+// record-field one this opcode already told apart.
+// ⛔ It was missing, and the shape that wanted it is fbc's own idiom for a byte buffer:
+// "Dim As UByte foo(...)" then "*Cast(ZString Ptr, @foo(0))". Reading a single element through the
+// same address worked ("*Cast(UByte Ptr, @foo(0))" answers 65), because the SCALAR loads have their
+// packed arm; only the string pair went straight to RawAddr and raised "Null or invalid raw pointer
+// dereference" on a perfectly good array address. DIVERGENZE 127.
+var
+  ArrayIdx: Integer;
+  PtrOffset, Lim: Int64;
+  Ch: Int64;
+begin
+  Result := '';
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  Lim := High(FArrays[ArrayIdx].IntData);
+  while PtrOffset <= Lim do
+  begin
+    Ch := FArrays[ArrayIdx].IntData[PtrOffset];
+    // ⚠️ A WIDE cell is one ELEMENT here, not two bytes: the array holds one code unit per element,
+    // which is the same image the scalar loads see through this address.
+    if Ch = 0 then Break;
+    if Wide then Result := Result + UTF8Encode(WideChar(Word(Ch)))
+    else Result := Result + AnsiChar(Byte(Ch));
+    Inc(PtrOffset);
+    if (ExactBytes > 0) and (Length(Result) >= ExactBytes) then Break;
+  end;
+  if (ExactBytes > 0) and (Length(Result) < ExactBytes) then
+    Result := Result + StringOfChar(#0, ExactBytes - Length(Result));
+end;
+
+procedure TBytecodeVM.PtrDomainStoreZStr(Ctx: TExecutionContext; PtrAddr: Int64;
+  const Value: AnsiString; Wide: Boolean);
+// The write half of PtrDomainLoadZStr: the characters plus the terminator, one per element.
+var
+  ArrayIdx, i: Integer;
+  PtrOffset, Lim: Int64;
+  W: WideString;
+begin
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+  if GetEnvironmentVariable('ZPTR_DIAG') = '1' then
+    WriteLn(StdErr, '[ZPTR] store addr=', PtrAddr, ' idx=', ArrayIdx, ' off=', PtrOffset,
+            ' highArr=', High(FArrays), ' limInt=', High(FArrays[ArrayIdx].IntData));
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  Lim := High(FArrays[ArrayIdx].IntData);
+  if Wide then
+  begin
+    W := UTF8Decode(Value);
+    for i := 1 to Length(W) do
+    begin
+      if PtrOffset > Lim then Exit;
+      FArrays[ArrayIdx].IntData[PtrOffset] := Ord(W[i]);
+      Inc(PtrOffset);
+    end;
+  end
+  else
+    for i := 1 to Length(Value) do
+    begin
+      if PtrOffset > Lim then Exit;
+      FArrays[ArrayIdx].IntData[PtrOffset] := Ord(Value[i]);
+      Inc(PtrOffset);
+    end;
+  if PtrOffset <= Lim then FArrays[ArrayIdx].IntData[PtrOffset] := 0;   // the terminator
+end;
+
 function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
 // Resolve a tagged raw pointer to a real address inside whichever REGION it names, after checking that
 // NeedBytes bytes starting there actually fit. Every raw load, store and block operation goes through
@@ -5475,12 +5560,14 @@ function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
 // "*p" where p is a ZSTRING PTR (Wide=False) or WSTRING PTR (Wide=True): the C string AT the
 // pointed address, read up to the NUL terminator - never past the end of the byte heap (a block
 // missing its NUL yields the bytes to the region end instead of walking off it). WSTRING is
-// stored as UCS-2 units and converted to the VM's uniform UTF-8 managed string.
+// stored as WIDE_CELL_BYTES-wide cells, one per codepoint, and converted to the VM's uniform UTF-8
+// managed string.
 var
   P: PByte;
   ofs, Limit, n: PtrUInt;
+  i: Integer;
   W: UnicodeString;
-  PW: PWord;
+  PW: PLongWord;
 begin
   // ⛔ A NULL ZSTRING/WSTRING POINTER READS AS THE EMPTY STRING, and that is fbc's rule rather than
   // undefined behaviour it gets away with: its string runtime tests the pointer, so "Len(*pz)" answers
@@ -5505,11 +5592,14 @@ begin
   end
   else
   begin
-    PW := PWord(P);
+    // ⭐ ONE CELL IS WIDE_CELL_BYTES, and the cell is WIDER than the UnicodeString unit it decodes
+    // into, so this cannot be a Move: each cell is read whole and narrowed. A codepoint above the BMP
+    // fits one cell here and TWO UTF-16 units in W, which is why W is built by appending.
+    PW := PLongWord(P);
     n := 0;
-    while (n * 2 + 1 < Limit) and (PW[n] <> 0) do Inc(n);
-    SetLength(W, n);
-    if n > 0 then Move(PW^, W[1], n * 2);
+    while ((n + 1) * WIDE_CELL_BYTES <= Limit) and (PW[n] <> 0) do Inc(n);
+    W := '';
+    for i := 0 to Integer(n) - 1 do W := W + UCS4CellToUnicode(PW[i]);
     Result := UTF8Encode(W);
   end;
 end;
@@ -5520,7 +5610,8 @@ procedure TBytecodeVM.RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Bool
 // instead of corrupting the heap (fbc would silently overrun).
 var
   P: PByte;
-  W: UnicodeString;
+  i: Integer;
+  U: TUCS4Cells;
 begin
   if not Wide then
   begin
@@ -5530,10 +5621,13 @@ begin
   end
   else
   begin
-    W := UTF8Decode(S);
-    P := PByte(RawAddr(RawPtr, PtrUInt(Length(W)) * 2 + 2));
-    if Length(W) > 0 then Move(W[1], P^, PtrUInt(Length(W)) * 2);
-    PWord(P)[Length(W)] := 0;
+    // The mirror: one CELL per codepoint, a surrogate PAIR folded back into the single cell it came
+    // from - so a round trip through the buffer is the identity, which the UCS-2 image could not
+    // promise above the BMP.
+    U := UnicodeToUCS4Cells(UTF8Decode(S));
+    P := PByte(RawAddr(RawPtr, (PtrUInt(Length(U)) + 1) * WIDE_CELL_BYTES));
+    for i := 0 to Length(U) - 1 do PLongWord(P)[i] := U[i];
+    PLongWord(P)[Length(U)] := 0;
   end;
 end;
 
@@ -6366,6 +6460,18 @@ var
   i: Integer;
   Instr: TBytecodeInstruction;
   MaxIntReg, MaxFloatReg, MaxStringReg: Integer;
+
+  procedure CreditField(Bank: TRegBank; Reg: Integer);
+  // Credit one operand field to the bank SedaiOpcodeBanks says it names. rbUnknown credits nothing:
+  // no list claims the field, and guessing a bank here is what sizes the wrong one.
+  begin
+    case Bank of
+      rbInt:    if Reg > MaxIntReg then MaxIntReg := Reg;
+      rbFloat:  if Reg > MaxFloatReg then MaxFloatReg := Reg;
+      rbString: if Reg > MaxStringReg then MaxStringReg := Reg;
+    end;
+  end;
+
 begin
   FProgram := Program_;
 
@@ -6962,7 +7068,8 @@ begin
         end;
 
         // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
-        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrAny, bcStrInstrW, bcStrInstrRevW:
+        bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrAny, bcStrInstrW, bcStrInstrRevW,
+        bcStrInstrAnyW, bcStrInstrRevAnyW:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;  // haystack
@@ -7401,6 +7508,46 @@ begin
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+        end;
+
+        { ⛔⛔⛔ THE TRANSFER BANK, AND EVERY PROCEDURE PROLOGUE EMITS ONE. bcXferLoad<bank> writes
+          its DEST into a register bank (the Immediate is the transfer SLOT, not a register), and
+          bcXferStore<bank> reads its Src1 from one - and none of the six was listed here, so a
+          procedure whose only use of a high register was its own parameter load sized the bank
+          from nothing and the load wrote past the end. fbc's structs/derived-cast died on exactly
+          that: "XferLoadInt Dest=20" as the first instruction of a prologue, in a program whose
+          int registers otherwise stopped below 20. }
+        bcXferLoadInt:    if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+        bcXferLoadFloat:  if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
+        bcXferLoadString: if Instr.Dest > MaxStringReg then MaxStringReg := Instr.Dest;
+        bcXferStoreInt:    if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        bcXferStoreFloat:  if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
+        bcXferStoreString: if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
+      else
+        { ⛔⛔⛔ THE SAFETY NET THE FOURTH COUNTER NEVER HAD, and it is what makes the omission above
+          impossible to repeat. This case is hand-written and every arm names its banks; an opcode
+          nobody listed used to contribute ZERO, so the bank was created too small and the
+          interpreter wrote past the end - a heap corruption that surfaces at teardown, three steps
+          from its cause (see the GROUP 12 note above, which paid for it once, and
+          structs/derived-cast, which paid for it again with the TRANSFER opcodes).
+          ⭐⭐ IT DELEGATES TO SedaiOpcodeBanks, the unit that exists to be the ONE answer to
+          "which bank does this opcode use for this field". That unit's own header names this scan
+          as the third copy still to be reconciled, and its note asks for the case that proves it
+          FIRST: structs/derived-cast is that case. Answering here through the single source means
+          an opcode nobody listed above is sized CORRECTLY rather than conservatively - which
+          matters, because a census run under REGSCAN_DIAG names over a hundred of them, the whole
+          RECORD family included, and crediting a record register to the STRING bank would inflate
+          FrameSaveStrCount (refcounted string copies, per call).
+          ⚠️ rbUnknown credits nothing, which is the old behaviour: this arm narrows the blind spot
+          to the fields NO list claims, and REGSCAN_DIAG names them. }
+        begin
+          CreditField(BankOfDest(TBytecodeOp(Instr.OpCode)), Instr.Dest);
+          CreditField(BankOfSrc1(TBytecodeOp(Instr.OpCode)), Instr.Src1);
+          CreditField(BankOfSrc2(TBytecodeOp(Instr.OpCode)), Instr.Src2);
+          if GetEnvironmentVariable('REGSCAN_DIAG') = '1' then
+            WriteLn(ErrOutput, '[regscan] opcode NON ELENCATO nella scansione dei banchi: ',
+                    BytecodeOpToString(TBytecodeOp(Instr.OpCode)),
+                    ' (dest=', Instr.Dest, ' src1=', Instr.Src1, ' src2=', Instr.Src2, ')');
         end;
       end;
     end;
@@ -11922,6 +12069,30 @@ procedure TBytecodeVM.RunDebug;
 // first non-numeric character - matches FreeBASIC VALINT/VALLNG/VALUINT/VALULNG.
 // A "&H"/"&O"/"&B" prefix selects hexadecimal/octal/binary parsing. Returns 0 when
 // no digits are present.
+function InputFieldIsFloat(const S: string): Boolean;
+// Does this INPUT field spell a FLOATING-POINT number? A '.' or an exponent letter after at least one
+// digit. ⛔ A base-prefixed literal is never one: 'd' and 'e' are hex DIGITS there, and "&h1d1" is 465
+// and not 1 x 10^1. Used only to choose which grammar INPUT parses the field with - see bcInputFileInt.
+var
+  I, Len: Integer;
+  HasDigit: Boolean;
+begin
+  Result := False;
+  Len := Length(S);
+  I := 1;
+  while (I <= Len) and (S[I] = ' ') do Inc(I);
+  if (I <= Len) and ((S[I] = '+') or (S[I] = '-')) then Inc(I);
+  if (I <= Len) and (S[I] = '&') then Exit;          // a base literal, whatever letters follow
+  HasDigit := False;
+  while I <= Len do
+  begin
+    if (S[I] >= '0') and (S[I] <= '9') then begin HasDigit := True; Inc(I); end
+    else if S[I] = '.' then Exit(True)
+    else if HasDigit and (UpCase(S[I]) in ['E', 'D']) then Exit(True)
+    else Break;
+  end;
+end;
+
 function ParseLeadingInt64(const S: string; DecWidth: Integer): Int64;
 var
   I, Len, Base, D: Integer;
@@ -11954,8 +12125,20 @@ begin
     else if C = 'O' then Base := 8
     else if C = 'B' then Base := 2;
     if Base > 0 then
+      Inc(I, 2)   // skip the "&X" prefix
+    // ⭐ A BARE "&" IS OCTAL TOO, and it is the spelling nothing here knew: fbc reads "&77" as 63
+    // through VAL, VALINT, VALLNG, VALUINT and INPUT alike (measured on all five), while we answered
+    // 0 for every one of them - the prefix was not recognised, the decimal scan then found no digits.
+    // Its own line of fbc's file/large_int asserts it beside "&O77", which we already had.
+    // ⚠️ Only when an OCTAL DIGIT follows: "&x" stays 0, and "&8" reads as 0 the same way "&o78"
+    // stops at the 8 - the digit test below is what does both.
+    else if (S[I + 1] >= '0') and (S[I + 1] <= '7') then
     begin
-      Inc(I, 2);  // skip the "&X" prefix
+      Base := 8;
+      Inc(I);     // skip the "&" alone
+    end;
+    if Base > 0 then
+    begin
       U := 0;
       while I <= Len do
       begin
@@ -12160,6 +12343,25 @@ begin
 end;
 
 // Return the substring covering CPCount codepoints starting at the 1-based codepoint CPStart, clamped.
+function Utf8ContainsCP(const CPSet, Ch: string): Boolean;
+// Does the UTF-8 string CPSet contain the single codepoint Ch as one of ITS codepoints? A plain Pos()
+// would answer yes for a byte sequence that merely OVERLAPS one - the reason the byte "Any" form is
+// wrong here - so the set is walked codepoint by codepoint.
+var
+  i, n, cs: Integer;
+begin
+  Result := False;
+  n := Length(CPSet);
+  cs := 0;
+  for i := 1 to n do
+    if (Ord(CPSet[i]) and $C0) <> $80 then
+    begin
+      if (cs > 0) and (Copy(CPSet, cs, i - cs) = Ch) then Exit(True);
+      cs := i;
+    end;
+  if (cs > 0) and (Copy(CPSet, cs, n - cs + 1) = Ch) then Exit(True);
+end;
+
 function Utf8SubCP(const S: string; CPStart, CPCount: Integer): string;
 var
   i, n, cp, bStart, bEnd: Integer;
@@ -12179,6 +12381,42 @@ begin
     end;
   if bStart > n then Exit('');
   Result := Copy(S, bStart, bEnd - bStart);
+end;
+
+function Utf8FindAnyCP(const S, CPSet: string; Last: Boolean): Integer;
+// The 1-based CODEPOINT position of the first (or last) codepoint of S that also occurs in CPSet, or 0.
+// Both strings are UTF-8, and the comparison is per CODEPOINT on both sides: comparing bytes matches a
+// CONTINUATION byte and answers nonsense on anything outside ASCII.
+var
+  i, n, cp, cs, ce: Integer;
+  Ch: string;
+begin
+  Result := 0;
+  n := Length(S);
+  if (n = 0) or (CPSet = '') then Exit;
+  cp := 0;
+  cs := 0;
+  for i := 1 to n do
+    if (Ord(S[i]) and $C0) <> $80 then          // byte i begins a codepoint
+    begin
+      if cs > 0 then
+      begin
+        // the codepoint that started at cs ends just before i
+        Ch := Copy(S, cs, i - cs);
+        if Utf8ContainsCP(CPSet, Ch) then
+        begin
+          Result := cp;
+          if not Last then Exit;
+        end;
+      end;
+      Inc(cp);
+      cs := i;
+    end;
+  if cs > 0 then                                 // the final codepoint
+  begin
+    Ch := Copy(S, cs, n - cs + 1);
+    if Utf8ContainsCP(CPSet, Ch) then Result := cp;
+  end;
 end;
 
 // Encode a single Unicode codepoint as its UTF-8 byte sequence (FreeBASIC WCHR). Invalid codepoints
@@ -12296,10 +12534,21 @@ begin
       begin
         StartPos := Ctx.IntRegs[Instr.Src2];
         Count := Ctx.IntRegs[Instr.Immediate and $FFFF];
-        // Negative length = the rest of the string, exactly as for the byte-string MID (see above).
-        if (Count < 0) and Assigned(FProgram) and FProgram.ModernMode then
-          Count := Utf8CPCount(Ctx.StringRegs[Instr.Src1]) - StartPos + 1;
-        Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
+        // ⛔ A START BELOW 1 YIELDS AN EMPTY STRING - the rule the BYTE MID above has carried since it
+        // was written, and its wide twin did not. Utf8SubCP CLAMPS the start to 1, so "Mid(w, 0)" and
+        // "Mid(w, -1)" answered the WHOLE string where fbc answers "" (measured over start -2..5 on a
+        // WString, a String and a ZString: the two byte paths were already right, only the wide one was
+        // not). CLASSIC v7 keeps the clamp exactly as the byte path does - its MID$ has no such rule.
+        // The test is HERE and not inside Utf8SubCP because that clamp is what LEFT$/RIGHT$ rely on.
+        if (StartPos < 1) and Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.StringRegs[Instr.Dest] := ''
+        else
+        begin
+          // Negative length = the rest of the string, exactly as for the byte-string MID (see above).
+          if (Count < 0) and Assigned(FProgram) and FProgram.ModernMode then
+            Count := Utf8CPCount(Ctx.StringRegs[Instr.Src1]) - StartPos + 1;
+          Ctx.StringRegs[Instr.Dest] := Utf8SubCP(Ctx.StringRegs[Instr.Src1], StartPos, Count);
+        end;
       end;
     29: // bcStrInstrW - INSTR(wstring, sub): codepoint position of first occurrence (0 if none).
       begin
@@ -12316,6 +12565,25 @@ begin
           for StartPos := 1 to Length(S) - Length(SubStr) + 1 do
             if Copy(S, StartPos, Length(SubStr)) = SubStr then Len := StartPos;  // last byte match
         Ctx.IntRegs[Instr.Dest] := Utf8BytePosToCP(S, Len);
+      end;
+    53: // bcStrInstrAnyW - INSTR(wstring, Any set): the CODEPOINT position of the first codepoint of
+        // Src1 that belongs to the set Src2, or 0.
+        //
+        // ⛔ THE BYTE TWIN CANNOT ANSWER THIS. bcStrInstrAny compares single BYTES against the set's
+        // bytes, so on UTF-8 it matches a CONTINUATION byte of a multi-byte character and answers a
+        // BYTE offset: on a three-codepoint Japanese string it said 1 where fbc says 2. The comparison
+        // has to be per CODEPOINT on both sides, which is what these two arms are for. (The ASCII case
+        // agreed all along, which is exactly why it looked like it worked.)
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];   // the character set, itself UTF-8
+        Ctx.IntRegs[Instr.Dest] := Utf8FindAnyCP(S, SubStr, False);
+      end;
+    54: // bcStrInstrRevAnyW - INSTRREV(wstring, Any set): the LAST such codepoint, or 0.
+      begin
+        S := Ctx.StringRegs[Instr.Src1];
+        SubStr := Ctx.StringRegs[Instr.Src2];
+        Ctx.IntRegs[Instr.Dest] := Utf8FindAnyCP(S, SubStr, True);
       end;
     31: // bcStrWChr - WCHR(n): UTF-8 byte sequence for Unicode codepoint n.
       Ctx.StringRegs[Instr.Dest] := Utf8EncodeCP(Ctx.IntRegs[Instr.Src1]);
@@ -13216,6 +13484,7 @@ var
   Lb, NewSize, k: Integer;
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  FArrays[ArrayIdx].IsDynamic := True;   // a REDIM'd array is DYNAMIC: ERASE frees it (see EraseArray)
   Lb := 0;
   if Length(FArrays[ArrayIdx].LowerBounds) > 0 then Lb := FArrays[ArrayIdx].LowerBounds[0];
   // An explicit "REDIM a(lb TO ub)" sets the lower bound too (FreeBASIC); a bare "REDIM a(ub)" keeps the
@@ -13259,6 +13528,8 @@ procedure TBytecodeVM.RedimArrayN(ArrayIdx: Integer; const Uppers: array of Inte
 var
   d, NewSize, k, Lb: Integer;
 begin
+  if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
+    FArrays[ArrayIdx].IsDynamic := True;   // as RedimArray: a REDIM'd array is DYNAMIC
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) or (Length(Uppers) = 0) then Exit;
   NewSize := 1;
   SetLength(FArrays[ArrayIdx].Dimensions, Length(Uppers));
@@ -13413,6 +13684,9 @@ begin
         end;
         FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
         FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
+        // Fixed or dynamic, stamped on the STORAGE: ERASE through an array PARAMETER asks the storage,
+        // because the answer is the CALLER's (see EraseArray and the Immediate-2 case).
+        FArrays[ArrayIdx].IsDynamic := ArrInfo.IsDynamicShape;
         SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
         SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
         for i := 0 to ArrInfo.DimCount - 1 do
@@ -13497,7 +13771,13 @@ begin
       end;
     11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
         // 0 = static array (keep bounds, zero the elements).
-      EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
+      // Immediate 2 = "the compiler could not tell": the name is an array PARAMETER, and whether ERASE
+      // frees or merely resets is the CALLER's array's property. The bind copied the storage record
+      // whole, so the answer travels with it. fbc suite string/string-array-erase-arg.
+      if Instr.Immediate = 2 then
+        EraseArray(Ctx.ArrMap[Instr.Src1], FArrays[Ctx.ArrMap[Instr.Src1]].IsDynamic)
+      else
+        EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
     12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
         // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
         // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
@@ -13749,7 +14029,7 @@ begin
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx, Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2).
+    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (wide cells).
         // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
         // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
@@ -13777,6 +14057,15 @@ begin
       end
       else if Instr.Immediate = -1 then
         Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
+      // ⭐ ...and the THIRD domain: a positive address with no RAWPTR_TAG is a PACKED ARRAY pointer,
+      // which is what "@foo(0)" yields. See PtrDomainLoadZStr. DIVERGENZE 127.
+      // ⚠️ ...and NOT for address 0, which has a DEFINED answer of its own further down (fbc's string
+      // runtime tests the pointer, so a null ZSTRING reads as the empty string). Gated on non-zero so
+      // that rule keeps its own path, exactly as it had it.
+      else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
+        Ctx.StringRegs[Instr.Dest] := PtrDomainLoadZStr(Ctx, Ctx.IntRegs[Instr.Src1],
+                                        Instr.Immediate = 1,
+                                        Ord(Instr.Immediate >= 2) * (Instr.Immediate - 2))
       else if Instr.Immediate >= 2 then
         Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
       else
@@ -13792,6 +14081,9 @@ begin
       end
       else if Instr.Immediate = -1 then
         RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+      else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
+        PtrDomainStoreZStr(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
+                           Instr.Immediate = 1)
       else
         RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
     34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
@@ -13919,7 +14211,16 @@ begin
     //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
     37: // bcArrayLoadIndInt
       begin
+        // ⛔ AN ELEMENT INDEX IS RELATIVE TO THE ARRAY'S LOWER BOUND, and a member array used to be
+        // documented as "0-based (v1), so no lower-bound subtraction is needed" - true only while
+        // nothing could give one a non-zero bound. "ReDim obj.field(3 To 5)" now can (the member arm
+        // of ProcessRedim threw its lower bound away until 1 Sep 2026), so the subtraction is real.
+        // ⭐ It belongs HERE and not in the SSA: this opcode already holds the descriptor, so it costs
+        // one read and one subtract instead of two extra instructions per access - and it is the
+        // identity for every array whose lower bound is 0, which is all of them today.
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].IntData[LinearIdx]
         else
@@ -13928,6 +14229,8 @@ begin
     38: // bcArrayLoadIndFloat
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
         else
@@ -13936,6 +14239,8 @@ begin
     39: // bcArrayLoadIndString
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
         else
@@ -13944,18 +14249,24 @@ begin
     40: // bcArrayStoreIndInt (Dest = value register, READ)
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
       end;
     41: // bcArrayStoreIndFloat (Dest = value register, READ)
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
       end;
     42: // bcArrayStoreIndString (Dest = value register, READ)
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
       end;
@@ -13969,7 +14280,11 @@ begin
             ProdDims := 1;
             for ArrLowerBound := i + 1 to High(FArrays[PtrAddr].Dimensions) do
               ProdDims := ProdDims * FArrays[PtrAddr].Dimensions[ArrLowerBound];
-            LinearIdx := LinearIdx + FIdxPending[i] * ProdDims;
+            // ...and the same subtraction per dimension, for the same reason as the element opcodes.
+            ArrLowerBound := 0;
+            if i <= High(FArrays[PtrAddr].LowerBounds) then
+              ArrLowerBound := FArrays[PtrAddr].LowerBounds[i];
+            LinearIdx := LinearIdx + (FIdxPending[i] - ArrLowerBound) * ProdDims;
           end;
         Ctx.IntRegs[Instr.Dest] := LinearIdx;
         SetLength(FIdxPending, 0);
@@ -13995,7 +14310,13 @@ begin
             RecSetFieldInt(Rec, RecSlot, PtrAddr);
           end;
           RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
-        end;
+          if GArrPrivDiag then
+            WriteLn(ErrOutput, Format('[arrpriv] MEMBRO rec=%p slot=%d -> phys %d size=%d',
+                    [Pointer(Rec), RecSlot, PtrAddr, FArrays[PtrAddr].TotalSize]));
+        end
+        else if GArrPrivDiag then
+          WriteLn(ErrOutput, Format('[arrpriv] MEMBRO ⛔ record NULLO (handle=%d slot=%d)',
+                  [Ctx.IntRegs[Instr.Src1], RecSlot]));
         SetLength(FRedimPendingUBs, 0);
         SetLength(FRedimPendingLBs, 0);
       end;
@@ -14288,7 +14609,9 @@ begin
       if Assigned(FInputDevice) then
       begin
         // Print initial prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // ⛔ ...and in MODERN only when a person is there: see GStdinIsTerminal below.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
@@ -14322,11 +14645,44 @@ begin
       if Assigned(FInputDevice) then
       begin
         // Print initial prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // ⛔ ...and in MODERN only when a person is there: see GStdinIsTerminal below.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
+        // ⭐⭐ MODERN NEVER REFUSES AN INPUT. fbc parses what it can and leaves 0 for the rest - there
+        // is no "?REDO FROM START" and no re-prompt there, and no character filter either: "&77" and
+        // "1d1" are legal fields it reads as 63 and 10, and we REFUSED both ("?SYNTAX ERROR - Number
+        // expected", then asked again). The Commodore validation below is v7's and stays v7's.
+        // The grammar is the one INPUT # uses, for the same reason and through the same helpers.
+        // DIVERGENZE 124.
+        if Assigned(FProgram) and FProgram.ModernMode then
+        begin
+          // ⛔ AND NO PROMPT AT ALL WHEN NOBODY IS THERE TO READ IT. fbc writes neither the user's
+          // prompt string nor the "? " when standard input is redirected - measured: its own program
+          // "Print "start" : Input "enter n"; n" emits just "start" under < /dev/null, while we
+          // wrote "enter n? " into the captured output. See GStdinIsTerminal.
+          if GStdinIsTerminal then
+            InputStr := Trim(FInputDevice.ReadLine('? ', False, False, True))
+          else
+            InputStr := Trim(FInputDevice.ReadLine('', False, False, True));
+          // ⛔ EXHAUSTED INPUT IS A VALUE, NOT AN END. fbc leaves 0 in the variable and runs on -
+          // "Dim a As Integer = 7 : Input a : Print a" prints 0 and then the rest of the program -
+          // while we STOPPED the program mid-line. Only a STOP request (Ctrl+End, window closed)
+          // ends it. ⚠️ A program that LOOPS on INPUT will spin at EOF, exactly as it does under fbc.
+          if FInputDevice.ShouldStop then
+          begin
+            Ctx.Running := False;
+            FInputDevice.ClearStopRequest;
+          end
+          else if InputFieldIsFloat(InputStr) then
+            Ctx.IntRegs[Instr.Dest] := FloatToIntConv(ParseLeadingFloat(InputStr), True)
+          else
+            Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(InputStr, 64);
+        end
+        else
         repeat
           // C128 mode: accept all, validate after; Mask mode: filter invalid chars (no decimal for int)
           InputStr := Trim(FInputDevice.ReadLine('? ', False, not FC128InputMode, False));
@@ -14367,11 +14723,30 @@ begin
       if Assigned(FInputDevice) then
       begin
         // Print initial prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // ⛔ ...and in MODERN only when a person is there: see GStdinIsTerminal below.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
+        // ⭐ MODERN never refuses - see the integer arm above.
+        if Assigned(FProgram) and FProgram.ModernMode then
+        begin
+          if GStdinIsTerminal then
+            InputStr := Trim(FInputDevice.ReadLine('? ', False, False, True))
+          else
+            InputStr := Trim(FInputDevice.ReadLine('', False, False, True));
+          // Exhausted input is a VALUE - see the integer arm.
+          if FInputDevice.ShouldStop then
+          begin
+            Ctx.Running := False;
+            FInputDevice.ClearStopRequest;
+          end
+          else
+            Ctx.FloatRegs[Instr.Dest] := ParseLeadingFloat(InputStr);
+        end
+        else
         repeat
           // C128 mode: accept all, validate after; Mask mode: filter invalid chars
           InputStr := Trim(FInputDevice.ReadLine('? ', False, not FC128InputMode, True));
@@ -16804,6 +17179,19 @@ begin
               else if ParseLeadingFloat(Trim(Data)) <> 0.0 then Ctx.IntRegs[Instr.Dest] := -1
               else Ctx.IntRegs[Instr.Dest] := 0;
             end
+            // ⭐⭐ AN INTEGER DESTINATION READS THE *FLOAT* GRAMMAR AND ROUNDS, and that is NOT what
+            // VALINT does with the same text: fbc answers VALINT("1d1") = 1 and reads the very same
+            // field into an Integer as 10. INPUT parses a NUMBER and then converts it, so a fraction
+            // and an exponent both count - measured against fbc: "1.9" -> 2, "-1.9" -> -2, "2.5" -> 2,
+            // "3.5" -> 4 (ties to even, the implicit conversion everywhere else), "1d1" -> 10,
+            // "1.23d+2" -> 123, "1e18" -> 1000000000000000000.
+            // ⛔ AND ONLY THEN. A plain integer must NOT go through a Double: fbc reads
+            // "9223372036854775807" back exactly, and a Double cannot hold it. So the float path is
+            // taken only for a field that actually IS one - a '.' or an exponent letter - and never
+            // for a base-prefixed literal, where 'd'/'e' are HEX DIGITS ("&h1d1" is 465).
+            // DIVERGENZE 123.
+            else if InputFieldIsFloat(Trim(Data)) then
+              Ctx.IntRegs[Instr.Dest] := FloatToIntConv(ParseLeadingFloat(Trim(Data)), True)
             else
               Ctx.IntRegs[Instr.Dest] := ParseLeadingInt64(Trim(Data), 64);
           end;
@@ -16987,7 +17375,8 @@ begin
         if Assigned(FOnFileData) then
         begin
           BinWidth := Instr.Immediate;
-          if BinWidth <= 0 then
+          if BinWidth < 0 then BinWidth := -BinWidth        // ZSTRING * n: read |n|, keep all of it
+          else if BinWidth = 0 then
           begin
             if Instr.Dest >= 0 then BinWidth := Length(Ctx.StringRegs[Instr.Dest]) else BinWidth := 0;
           end;
@@ -17001,6 +17390,11 @@ begin
           // A fixed-width field is "n characters + NUL terminator" on file (fbc's C layout for a
           // "String * n" member): keep the n characters, padding included — the destination is a
           // fixed-length buffer, which holds exactly n bytes.
+          // ⛔ A "ZSTRING * n" DESTINATION IS THE OTHER CONVENTION, and it needed saying: fbc reads
+          // n-1 bytes there and KEEPS ALL OF THEM ("Dim z6 As ZString * 6" over "1234567890" leaves
+          // "12345" and the file position at 6, not 7). A NEGATIVE immediate is that request - read
+          // |n| bytes, drop nothing - because the two differ in what they KEEP, not in what they read,
+          // so no width can express both. DIVERGENZE 125.
           if (Instr.Immediate > 0) and (Length(Data) > 0) then
             SetLength(Data, Length(Data) - 1);
           if Instr.Dest >= 0 then Ctx.StringRegs[Instr.Dest] := Data;

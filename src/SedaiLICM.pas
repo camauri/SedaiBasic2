@@ -121,6 +121,7 @@ type
 
     { Create and wire pre-header into CFG }
     procedure CreatePreHeader(Loop: TLoopInfo);
+    function LoopIsSingleEntry(Loop: TLoopInfo): Boolean;
 
     { Check if instruction can be safely hoisted }
     function IsSafeToHoist(const Instr: TSSAInstruction): Boolean;
@@ -173,6 +174,7 @@ var
   GLicmLoops: Integer = 0;
   GLicmMapCalls: Integer = 0;
   GLicmMapInstrs: Int64 = 0;      // instructions visited by BuildLoopMaps, summed over all calls
+  GLicmMultiEntry: Integer = 0;   // loops declined because something outside enters them past the header
   GLicmTFind, GLicmTSort, GLicmTMaps, GLicmTHoist: QWord;
 
 function LicmDiagOn: Boolean;
@@ -327,6 +329,18 @@ begin
       WriteLn('[LICM] Processing loop: ', Loop.Header.LabelName, ' (', Loop.Blocks.Count, ' blocks)');
     {$ENDIF}
 
+    // ⛔ A LOOP WITH MORE THAN ONE ENTRANCE IS NOT ONE, and hoisting into its pre-header writes
+    // registers that one of the entrances never runs. See LoopIsSingleEntry.
+    if not LoopIsSingleEntry(Loop) then
+    begin
+      {$IFDEF DEBUG_LICM}
+      if DebugLICM then
+        WriteLn('[LICM] Loop ', Loop.Header.LabelName, ' has an entrance that is not its header - skipping');
+      {$ENDIF}
+      if LicmDiagOn then Inc(GLicmMultiEntry);
+      Continue;
+    end;
+
     // Create pre-header with proper CFG wiring
     // NB: the pre-header is NOT created here. It used to be, for every loop, before anything knew
     // whether there would be a single instruction to put in it - and on a 14k-line program that
@@ -346,8 +360,8 @@ begin
     WriteLn('[LICM] Hoisted ', FHoistedCount, ' instructions');
   {$ENDIF}
   if LicmDiagOn then
-    WriteLn(ErrOutput, Format('[LICM_DIAG] loops=%d  BuildLoopMaps calls=%d  instructions visited=%d  hoisted=%d  (program has %d blocks)',
-                              [GLicmLoops, GLicmMapCalls, GLicmMapInstrs, FHoistedCount, FProgram.Blocks.Count]));
+    WriteLn(ErrOutput, Format('[LICM_DIAG] loops=%d  multi-entry declined=%d  BuildLoopMaps calls=%d  instructions visited=%d  hoisted=%d  (program has %d blocks)',
+                              [GLicmLoops, GLicmMultiEntry, GLicmMapCalls, GLicmMapInstrs, FHoistedCount, FProgram.Blocks.Count]));
   Result := FHoistedCount;
 end;
 
@@ -532,6 +546,59 @@ begin
   end;
 end;
 
+function TLoopInvariantCodeMotion.LoopIsSingleEntry(Loop: TLoopInfo): Boolean;
+// Is every edge from outside this loop into it an edge to its HEADER?
+//
+// ⛔⛔ THE WHOLE PASS IS BUILT ON THE ANSWER BEING YES, and nothing was asking. A pre-header is placed
+// in front of the header and every outside edge is redirected through it, so what is hoisted there runs
+// exactly once before the loop - but only if the header is the ONLY way in. A block of the loop that
+// something outside jumps to DIRECTLY is a second entrance, and on that path the hoisted instructions
+// are never executed at all: the registers they write are read inside the loop, uninitialised.
+//
+// It is not a theoretical shape. A FreeBASIC "For i = 20 To 10 Step s" with a RUNTIME step compiles to
+// exactly it: the sign of the step is tested once, and the test jumps to one of TWO condition blocks,
+// the ascending one and the descending one. Each is a back-edge target, so each is a loop header, and
+// each loop contains the other's header - entered straight from outside. LICM hoisted "n += 1"'s
+// constant 1 and the failsafe's 30 into the ASCENDING path's pre-header, and the descending path -
+// the one this loop actually takes - added an uninitialised register to n and stopped at once.
+// The loop printed 0 where fbc prints 11, and --no-opt printed 11: an OPTDIFF that no corpus program
+// carried because none of them steps by a variable that is negative.
+//
+// Declining is the whole cure: such a loop is not a natural loop, and there is nowhere to put a value
+// that both entrances would reach.
+//
+// ⚠️ MEASURED: with the CFG telling the truth this check declines NOTHING on the corpus - 0 of 766
+// loops - and it is kept anyway, deliberately. It is not what fixed the bug above (registering the two
+// missing edges is; the loop then has no dominating back edge at all and LICM finds no loop there). It
+// is the invariant the pass is built on, stated where it can be checked, so a CFG shape that breaks it
+// again costs a missed hoist instead of a wrong answer. LICM_DIAG=1 counts and NAMES every decline.
+// ⛔ The first version of it declined 154 loops, and every one was a FALSE positive: a pre-header LICM
+// had just created for an inner loop is a block no outer loop's membership list knew about. That is
+// fixed where it belongs, in CreatePreHeader.
+var
+  b, p: Integer;
+  Blk, Pred: TSSABasicBlock;
+begin
+  Result := True;
+  for b := 0 to Loop.Blocks.Count - 1 do
+  begin
+    Blk := TSSABasicBlock(Loop.Blocks[b]);
+    if Blk = Loop.Header then Continue;
+    for p := 0 to Blk.Predecessors.Count - 1 do
+    begin
+      Pred := TSSABasicBlock(Blk.Predecessors[p]);
+      if not Loop.ContainsBlock(Pred) then
+      begin
+        if LicmDiagOn then
+          WriteLn(ErrOutput, '[LICM_DIAG] multi-entry: loop header=', Loop.Header.LabelName,
+                  ' block=', Blk.LabelName, ' entered from ', Pred.LabelName,
+                  ' (loop has ', Loop.Blocks.Count, ' blocks)');
+        Exit(False);
+      end;
+    end;
+  end;
+end;
+
 procedure TLoopInvariantCodeMotion.CreatePreHeader(Loop: TLoopInfo);
 var
   PreHeader: TSSABasicBlock;
@@ -597,6 +664,16 @@ begin
     // Wire pre-header -> header
     PreHeader.AddSuccessor(Loop.Header);
     Loop.Header.AddPredecessor(PreHeader);
+
+    // ⛔ AND EVERY ENCLOSING LOOP NOW CONTAINS THIS BLOCK. Loops are found once, up front, and then
+    // processed innermost-first - so a pre-header created for an inner loop is a block no outer loop's
+    // membership list knows about, while sitting squarely inside it. Anything that later asks "is this
+    // predecessor inside the loop?" gets NO for a block LICM itself put there: on fasta-modern that
+    // read as two loops with a second entrance where there is none.
+    for i := 0 to FLoops.Count - 1 do
+      if (TLoopInfo(FLoops[i]) <> Loop) and TLoopInfo(FLoops[i]).ContainsBlock(Loop.Header) and
+         (not TLoopInfo(FLoops[i]).ContainsBlock(PreHeader)) then
+        TLoopInfo(FLoops[i]).Blocks.Add(Pointer(PreHeader));
 
     // Redirect entry predecessors to pre-header
     for i := 0 to EntryPreds.Count - 1 do

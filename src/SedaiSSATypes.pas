@@ -102,6 +102,22 @@ const
   // interpreter rather than correcting it" - so the note was right and the behaviour it copied was not.
   RTC_U8 = 7; RTC_U16 = 8; RTC_U32 = 9;
 
+  { The width of ONE wide character in the byte IMAGE of a WSTRING - the raw-heap buffer an @-taken
+    "WString * n" is backed with, what "Clear w, 0, SizeOf(w)" writes over, and what a UByte or UShort
+    pointer sees when it walks that buffer.
+
+    It is FOUR, because that is what the oracle we measure against says: on Linux fbc's wchar_t is a
+    32-bit cell, and a program that walks a wide buffer with SizeOf gets offsets in those cells.
+
+    ⛔ IT IS ONE CONSTANT BECAUSE THE REPORT AND THE IMAGE MUST NOT DISAGREE. An attempt on 30 Aug 2026
+    moved the REPORT to fbc's number and left the image at two bytes, and that turned a wrong answer
+    into an out-of-bounds: SizeOf said 4n, the buffer held 2n, and the CLEAR that every fbcunit
+    fixed-string macro opens with ran past the end. Both halves read this, so they cannot drift apart.
+
+    ⚠️ It is NOT the file encoding. An OPEN with ENCODING "utf16" writes 2-byte units because the
+    ENCODING says so; that path has its own width (EncodeTextUnits) and does not consult this. }
+  WIDE_CELL_BYTES = 4;
+
 var
   // Runtime master switch for the SSA optimization passes (the `--no-opt` CLI flag clears it). The
   // structural passes (SSA construction, dominator tree, PHI elimination) ignore it and always run;
@@ -124,6 +140,9 @@ var
   GJitWillRun: Boolean = False;
 
 type
+  { One WSTRING byte-image cell per CODEPOINT - see WIDE_CELL_BYTES. }
+  TUCS4Cells = array of LongWord;
+
   TSSARegisterType = (srtInt, srtFloat, srtString);
 
   TSSAValueKind = (
@@ -330,8 +349,8 @@ type
     // FreeBASIC raw byte heap (Allocate family).
     ssaRawAlloc, ssaRawFree, ssaRawRealloc,
     ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
-    ssaRawLoadZStr,    // *p (ZSTRING/WSTRING PTR): Dest(str) = C string at the raw address; Src3 const: 0=bytes, 1=UCS-2
-    ssaRawStoreZStr,   // *p = s: write StringRegs bytes + NUL at the raw address; Src3 const: 0=bytes, 1=UCS-2
+    ssaRawLoadZStr,    // *p (ZSTRING/WSTRING PTR): Dest(str) = C string at the raw address; Src3 const: 0=bytes, 1=wide cells
+    ssaRawStoreZStr,   // *p = s: write StringRegs bytes + NUL at the raw address; Src3 const: 0=bytes, 1=wide cells
     ssaRawMemCopy, ssaRawMemMove, ssaRawClear,   // FB_MEMCOPY/FB_MEMMOVE/CLEAR raw-memory block ops
     ssaArrayBind, ssaArrayUnbind,   // array BYREF param: alias/restore a param array slot to a caller's array
     ssaArrayBindApply,              // commit the pending array binds of one call (two-phase: snapshot args, then alias) — Immediate=count
@@ -629,6 +648,16 @@ type
                             //   Src2=new element count reg, Src3 const=packed slot counts
     ssaRecordBlockLen,      // Dest := how many CONSECUTIVE records the block at Src1 holds (1 for a lone
                             //   record). "Delete[] p" needs it to run one destructor per element.
+    // ⛔⛔ AND THERE IS A SECOND REASON TO ADD AT THE END, found on 30 Aug 2026: this enum has passed
+    // 256 MEMBERS, and Free Pascal's "in [...]" builds a SET, whose elements must fit in a byte.
+    // Fourteen sites test an opcode that way; the ones near the boundary are the array-bound reads in
+    // GVN, and inserting two string opcodes in the MIDDLE pushed them past 255 - "range check error in
+    // set constructor", at compile time, in a unit that was not touched. Appending leaves every
+    // existing ordinal exactly where it is.
+    ssaStrInstrAnyW,        // INSTR(wstring, Any set) -> int CODEPOINT position of the FIRST codepoint of
+                            //   Src1 that belongs to the set Src2 (0 if none). The byte twin compares
+                            //   BYTES and so matches a UTF-8 continuation byte.
+    ssaStrInstrRevAnyW,     // INSTRREV(wstring, Any set) -> the LAST such codepoint
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 
@@ -703,6 +732,11 @@ type
     // same SUB overwrote each other. Marked here, at the only place that knows the scope, and carried
     // through to the VM, which gives every execution context its own block of private slots.
     IsPrivate: Boolean;
+    // ⭐ FIXED OR DYNAMIC, carried to the VM. The compiler settles it per SLOT (NoteArrayShape), and
+    // ERASE needs it at RUNTIME as well: "Erase arg" inside a SUB is asked of an array PARAMETER, whose
+    // fixed-or-dynamic nature belongs to the CALLER's array and may differ between two calls. The VM
+    // stamps it on the storage at DIM, a REDIM sets it, and a bind carries it into the parameter.
+    IsDynamicShape: Boolean;
   end;
 
   TSSAProgram = class
@@ -744,6 +778,7 @@ type
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
+    procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
     function GetArray(Index: Integer): TSSAArrayInfo;
     function GetArrayCount: Integer;
     procedure BuildDominatorTree;  // PHASE 3 TIER 2: Build dominator tree for optimizations
@@ -841,6 +876,14 @@ function BitPopcnt(V: Int64; Width: Int64): Int64;
 function BitRotl(V, Count: Int64; Width: Int64): Int64;
 function BitRotr(V, Count: Int64; Width: Int64): Int64;
 
+// The WSTRING byte image is a vector of WIDE_CELL_BYTES-wide CELLS, one per CODEPOINT, and the VM's
+// managed strings are UTF-8 (decoded through UnicodeString, which is UTF-16). The two disagree above
+// the BMP - one cell there is a surrogate PAIR - so the conversion is these two funnels and never a
+// Move. ⛔ The UCS-2 image this replaced could not represent a supplementary codepoint in one cell at
+// all, so "w[0]" on an emoji answered half of it; that is fixed by the widening, not despite it.
+function UCS4CellToUnicode(Cell: LongWord): UnicodeString;
+function UnicodeToUCS4Cells(const W: UnicodeString): TUCS4Cells;
+
 implementation
 
 
@@ -849,6 +892,61 @@ uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiG
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
      SedaiSubInlining, SedaiXferForward
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
+
+function UCS4CellToUnicode(Cell: LongWord): UnicodeString;
+// One wide CELL -> the UTF-16 units that spell it. A cell above the BMP becomes a surrogate pair; an
+// out-of-range cell becomes U+FFFD rather than a malformed unit, because the buffer is program-writable
+// memory and any 32-bit value can be sitting in it.
+begin
+  if Cell <= $FFFF then
+  begin
+    // ⚠️ A lone surrogate stored in the buffer is passed through as itself: it is not a valid
+    // codepoint, but re-encoding it as U+FFFD would make a round trip through the buffer lossy for a
+    // program that only ever writes and reads back its own bytes.
+    SetLength(Result, 1);
+    Result[1] := WideChar(Word(Cell));
+  end
+  else if Cell <= $10FFFF then
+  begin
+    SetLength(Result, 2);
+    Result[1] := WideChar($D800 + ((Cell - $10000) shr 10));
+    Result[2] := WideChar($DC00 + ((Cell - $10000) and $3FF));
+  end
+  else
+  begin
+    SetLength(Result, 1);
+    Result[1] := WideChar($FFFD);
+  end;
+end;
+
+function UnicodeToUCS4Cells(const W: UnicodeString): TUCS4Cells;
+// The inverse: UTF-16 units -> one cell per CODEPOINT, a well-formed surrogate pair folded into the
+// single cell it spells. The result is exactly as long as the codepoint count, which is what LEN of a
+// WSTRING already answers - so the buffer's cell count and LEN agree by construction.
+var
+  i, n: Integer;
+  Hi, Lo: Word;
+begin
+  SetLength(Result, Length(W));
+  i := 1; n := 0;
+  while i <= Length(W) do
+  begin
+    Hi := Word(W[i]);
+    if (Hi >= $D800) and (Hi <= $DBFF) and (i < Length(W)) then
+    begin
+      Lo := Word(W[i + 1]);
+      if (Lo >= $DC00) and (Lo <= $DFFF) then
+      begin
+        Result[n] := $10000 + ((LongWord(Hi - $D800) shl 10) or LongWord(Lo - $DC00));
+        Inc(n); Inc(i, 2);
+        System.Continue;
+      end;
+    end;
+    Result[n] := Hi;      // a BMP unit, or an unpaired surrogate kept as itself (see above)
+    Inc(n); Inc(i);
+  end;
+  SetLength(Result, n);
+end;
 
 function DestIsPureDef(Op: TSSAOpCode): Boolean;
 // Does this opcode's Dest field WRITE a value and never read one?
@@ -1488,6 +1586,14 @@ procedure TSSAProgram.SetArrayPrivate(ArrayIdx: Integer);
 begin
   if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then
     FArrays[ArrayIdx].IsPrivate := True;
+end;
+
+procedure TSSAProgram.SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);
+// Record whether this slot is a DYNAMIC array, so the VM can stamp it on the storage at DIM. Only ever
+// SET: a slot known dynamic stays dynamic, exactly as NoteArrayShape rules it in the compiler.
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) and Dynamic then
+    FArrays[ArrayIdx].IsDynamicShape := True;
 end;
 
 function TSSAProgram.GetArray(Index: Integer): TSSAArrayInfo;

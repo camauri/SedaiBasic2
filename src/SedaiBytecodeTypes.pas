@@ -369,6 +369,10 @@ const
   // Immediate=length reg) but an INT destination. Reading one character used to allocate a
   // one-character string, and that allocation - not the read - is what it cost.
   bcStrAscW         = bcGroupString + 52;  // ASC(wstring) - Unicode CODEPOINT of the first character
+  bcStrInstrAnyW    = bcGroupString + 53;  // INSTR(wstring, Any set) - CODEPOINT position of the first codepoint of str
+                                           //   that belongs to the set (Dest=int, Src1/Src2=string). The byte twin
+                                           //   cannot answer it: it compares BYTES, so it matches a CONTINUATION byte.
+  bcStrInstrRevAnyW = bcGroupString + 54;  // INSTRREV(wstring, Any set) - the LAST such codepoint (same operands)
                                            // (Dest=int, Src1=string). bcStrAsc answers the first BYTE,
                                            // which for UTF-8 storage is the first byte of the sequence.
   bcStrAscMid       = bcGroupString + 51;
@@ -554,7 +558,8 @@ const
   bcArrayBindInd       = bcGroupArray + 49;  // Array BYREF param bind whose ARG is a UDT array member: Src1=param array id (immediate), Src2=int reg holding the member's runtime FArrays handle. Otherwise identical to bcArrayBind (pushes the same save-stack entry, committed by bcArrayBindApply, popped by bcArrayUnbind).
   // C-string view of the raw byte heap: "*p" where p is a ZSTRING PTR (or WSTRING PTR) reads/writes a
   // NUL-terminated string AT the pointed address, FreeBASIC-style. Immediate: 0 = ZSTRING (bytes),
-  // 1 = WSTRING (UCS-2 units, converted from/to our uniform UTF-8 managed strings).
+  // 1 = WSTRING (WIDE_CELL_BYTES-wide cells, one per CODEPOINT, converted from/to our uniform UTF-8
+  // managed strings). The cell is four bytes, as fbc's wchar_t is on Linux - see WIDE_CELL_BYTES.
   bcRawLoadZStr        = bcGroupArray + 50;  // Dest(str) = C string at RawAddr(IntRegs[Src1]) up to NUL
   bcRawStoreZStr       = bcGroupArray + 51;  // bytes of StringRegs[Src2] + NUL -> RawAddr(IntRegs[Src1])
 
@@ -2106,6 +2111,8 @@ begin
         4: Result := 'StrMid';
         5: Result := 'StrAsc';
        52: Result := 'StrAscW';
+       53: Result := 'StrInstrAnyW';
+       54: Result := 'StrInstrRevAnyW';
        51: Result := 'StrAscMid';
         6: Result := 'StrChr';
         7: Result := 'StrStr';

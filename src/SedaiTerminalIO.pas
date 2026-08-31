@@ -294,6 +294,7 @@ var
   GGfxTextMirror: Boolean = True;
 
 function StdoutIsTerminal: Boolean; forward;
+function StdinIsTerminal: Boolean; forward;
 
 procedure TerminalOutFlush;
 // Public within the unit: drains our buffer AND the RTL's, so a caller that is about to write
@@ -369,6 +370,7 @@ begin
   GCellRotate := SysUtils.GetEnvironmentVariable('SB_CELLROT') <> '0';
   GOutBuffered := SysUtils.GetEnvironmentVariable('SB_OUTBUF') <> '0';
   GOutIsTerminal := StdoutIsTerminal;
+  GStdinIsTerminal := StdinIsTerminal;
   GGfxTextMirror := SysUtils.GetEnvironmentVariable('GFXTEXT') <> '0';
   if not GOutExitRegistered then
   begin
@@ -578,6 +580,17 @@ begin
   CellNextRow;
   FCursorX := 0;
   Inc(FCursorY);
+end;
+
+function StdinIsTerminal: Boolean;
+// The twin of StdoutIsTerminal, for the INPUT prompt: fbc writes no prompt at all - neither the user's
+// prompt string nor the "? " - when standard input is not a console. See GStdinIsTerminal.
+begin
+  {$IFDEF WINDOWS}
+  Result := GetFileType(GetStdHandle(STD_INPUT_HANDLE)) = FILE_TYPE_CHAR;
+  {$ELSE}
+  Result := IsATTY(StdInputHandle) <> 0;
+  {$ENDIF}
 end;
 
 function StdoutIsTerminal: Boolean;

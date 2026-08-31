@@ -1522,6 +1522,40 @@ begin
   end;
 end;
 
+function PPSplitDeclarators(const S: string): TStringList;
+// ⛔⛔ "Const a = 1, b = 1" DECLARES TWO CONSTANTS, and both readers below saw only the first. fbc's own
+// pp/assert-false is that line and then "#assert (a <> b)", which must be REFUSED: with b unknown the
+// comparison came out true and we accepted a program fbc rejects. The caller hands the text AFTER the
+// Const keyword and its optional "As <type>"; this splits it into one "name = value" per declarator.
+// Commas inside quotes or parentheses belong to a value ("Const a = f(1,2), b = 3"), so only a
+// TOP-LEVEL comma separates.
+var
+  i, Depth: Integer;
+  Cur: string;
+  InStr: Boolean;
+begin
+  Result := TStringList.Create;
+  Cur := ''; Depth := 0; InStr := False;
+  for i := 1 to Length(S) do
+  begin
+    if S[i] = '"' then InStr := not InStr
+    else if not InStr then
+    begin
+      // ⛔ A TRAILING COMMENT IS NOT PART OF THE VALUE, and it was reaching it: "Const N = 1  '' note"
+      // handed "1  '' note" to the integer fold, which declined - so a Const with a comment beside it
+      // read as an undefined name. Pre-existing, and the guard that put the two facts on ONE line is
+      // what found it.
+      if S[i] = '''' then Break;
+      if (S[i] = '(') or (S[i] = '[') then Inc(Depth)
+      else if (S[i] = ')') or (S[i] = ']') then Dec(Depth)
+      else if (S[i] = ',') and (Depth <= 0) then
+      begin Result.Add(Trim(Cur)); Cur := ''; Continue; end;
+    end;
+    Cur := Cur + S[i];
+  end;
+  if Trim(Cur) <> '' then Result.Add(Trim(Cur));
+end;
+
 function SourceConstValue(const Nm: string; out V: Int64): Boolean;
 // The VALUE of a module-level "Const <Nm> = <integer literal>" written in the source, for a #if / #assert
 // that names it. fbc's preprocessor can read a Const because its symbol table is being built as it goes;
@@ -1544,9 +1578,9 @@ function SourceConstValue(const Nm: string; out V: Int64): Boolean;
 // the walk of THAT enum - the numbers after it are no longer known, and guessing them would replace
 // the honest 0 with a confident wrong answer.
 var
-  L: TStringList;
-  i, p, q: Integer;
-  U, W, Rest, MemU: string;
+  L, Decls: TStringList;
+  i, p, q, d: Integer;
+  U, W, Rest, MemU, Dcl: string;
   EnumNext: Int64;
   InEnum, EnumLost: Boolean;
 begin
@@ -1602,19 +1636,92 @@ begin
         while (q <= Length(Rest)) and IsIdentChar(Rest[q]) do Inc(q);
         Rest := Trim(Copy(Rest, q, MaxInt));
       end;
-      q := 1;
-      while (q <= Length(Rest)) and IsIdentChar(Rest[q]) do Inc(q);
-      if Trim(Copy(Rest, 1, q - 1)) <> Nm then Continue;
-      Rest := Trim(Copy(Rest, q, MaxInt));
-      if (Rest = '') or (Rest[1] <> '=') then Continue;
-      Rest := Trim(Copy(Rest, 2, MaxInt));
-      // Only a plain integer literal: anything else is an expression this stage cannot fold, and
-      // answering it wrongly would be worse than leaving the old 0.
-      if TryStrToInt64(Rest, V) then Exit(True);
+      Decls := PPSplitDeclarators(Rest);
+      try
+        for d := 0 to Decls.Count - 1 do
+        begin
+          Dcl := Decls[d];
+          q := 1;
+          while (q <= Length(Dcl)) and IsIdentChar(Dcl[q]) do Inc(q);
+          if Trim(Copy(Dcl, 1, q - 1)) <> Nm then Continue;
+          Dcl := Trim(Copy(Dcl, q, MaxInt));
+          if (Dcl = '') or (Dcl[1] <> '=') then Continue;
+          Dcl := Trim(Copy(Dcl, 2, MaxInt));
+          // Only a plain integer literal: anything else is an expression this stage cannot fold, and
+          // answering it wrongly would be worse than leaving the old 0.
+          if TryStrToInt64(Dcl, V) then Exit(True);
+        end;
+      finally
+        Decls.Free;
+      end;
     end;
   finally
     L.Free;
   end;
+end;
+
+function PPFoldStrConst(const Expr: string; out S: string): Boolean;
+// A constant STRING expression as fbc's preprocessor folds it: a literal, or a nesting of the
+// TEXT-ONLY intrinsics LCase / UCase / WStr / Str around one.
+//
+// ⛔ IT HAS TO NEST, and reading only one level is what cost string/case. That test writes
+// "const CONSTW1 = lcase( wstr( "XYZ123" ), 1 )" and then asks "#if CONSTW1 <> wstr( "xyz123" )";
+// a fold that took LCase("...") but not LCase(WStr("..."),1) left the const unknown, and the
+// comparison came out equal by the coincidence that BOTH sides read as 0.
+// ⚠️ The trailing ", 1" is LCase/UCase's locale argument: it selects the mapping, not the text, so it
+// is stepped over rather than folded.
+var
+  T, Fn, Inner: string;
+  i, Depth: Integer;
+  InStr: Boolean;
+
+  function TakeQuoted(const Q: string; out Val: string): Boolean;
+  var k: Integer;
+  begin
+    Result := False; Val := '';
+    if (Q = '') or (Q[1] <> '"') then Exit;
+    k := 2;
+    while k <= Length(Q) do
+    begin
+      if Q[k] = '"' then
+      begin
+        if (k < Length(Q)) and (Q[k + 1] = '"') then begin Val := Val + '"'; Inc(k, 2); Continue; end;
+        Exit(True);                                  // closing quote
+      end;
+      Val := Val + Q[k]; Inc(k);
+    end;
+  end;
+
+begin
+  Result := False; S := '';
+  T := Trim(Expr);
+  if T = '' then Exit;
+  if TakeQuoted(T, S) then Exit(True);
+  i := 1;
+  while (i <= Length(T)) and IsIdentChar(T[i]) do Inc(i);
+  Fn := UpperCase(Copy(T, 1, i - 1));
+  if (Fn <> 'LCASE') and (Fn <> 'UCASE') and (Fn <> 'WSTR') and (Fn <> 'STR') then Exit;
+  T := Trim(Copy(T, i, MaxInt));
+  if (T = '') or (T[1] <> '(') then Exit;
+  // the FIRST argument: up to the top-level comma, or the matching close
+  Inner := ''; Depth := 0; InStr := False;
+  for i := 1 to Length(T) do
+  begin
+    if T[i] = '"' then InStr := not InStr
+    else if not InStr then
+    begin
+      if T[i] = '(' then
+      begin Inc(Depth); if Depth = 1 then Continue; end
+      else if T[i] = ')' then
+      begin Dec(Depth); if Depth = 0 then Break; end
+      else if (T[i] = ',') and (Depth = 1) then Break;
+    end;
+    Inner := Inner + T[i];
+  end;
+  if not PPFoldStrConst(Inner, S) then Exit;
+  if Fn = 'LCASE' then S := LowerCase(S)
+  else if Fn = 'UCASE' then S := UpperCase(S);
+  Result := True;
 end;
 
 function SourceConstStr(const Nm: string; out S: string): Boolean;
@@ -1626,33 +1733,17 @@ function SourceConstStr(const Nm: string; out S: string): Boolean;
 // its own string/case asserts four of them. The literal-against-literal form worked all along, which is
 // what said the gap was in the NAME and not in the comparison.
 //
-// ⭐ Two folds are recognised beside a bare literal, because fbc's test writes them into the CONST
-// itself: LCase("...") and UCase("..."). Both are pure text on a literal, and refusing to fold them
-// would leave the const unknown - the very thing this exists to stop.
+// ⭐ The VALUE is folded by PPFoldStrConst, the same funnel a #if condition folds an inline
+// LCase/UCase/WStr/Str through - so a const and the expression it is compared against cannot answer
+// differently. It used to hold its own one-level copy of that fold, which is why
+// "Const CW = LCase( WStr( "XYZ123" ), 1 )" left CW unknown.
 //
 // The scan reads the RAW line, not the upper-cased one the integer scanner walks: a string VALUE keeps
 // its case, and folding an already-upper-cased literal would answer "ABC" for every one of them.
 var
-  L: TStringList;
-  i, p, q: Integer;
-  Raw, U, W, Rest, RestU, Lit: string;
-
-  function TakeQuoted(const T: string; out Val: string): Boolean;
-  var k: Integer;
-  begin
-    Result := False; Val := '';
-    if (T = '') or (T[1] <> '"') then Exit;
-    k := 2;
-    while k <= Length(T) do
-    begin
-      if T[k] = '"' then
-      begin
-        if (k < Length(T)) and (T[k + 1] = '"') then begin Val := Val + '"'; Inc(k, 2); Continue; end;
-        Exit(True);                                  // closing quote
-      end;
-      Val := Val + T[k]; Inc(k);
-    end;
-  end;
+  L, Decls: TStringList;
+  i, p, q, d: Integer;
+  Raw, U, W, Rest, RestU, Dcl: string;
 
 begin
   Result := False; S := '';
@@ -1678,22 +1769,21 @@ begin
         while (q <= Length(Raw)) and IsIdentChar(Raw[q]) do Inc(q);
         Raw := Trim(Copy(Raw, q, MaxInt));
       end;
-      q := 1;
-      while (q <= Length(Raw)) and IsIdentChar(Raw[q]) do Inc(q);
-      if UpperCase(Trim(Copy(Raw, 1, q - 1))) <> Nm then Continue;
-      Rest := Trim(Copy(Raw, q, MaxInt));
-      if (Rest = '') or (Rest[1] <> '=') then Continue;
-      Rest := Trim(Copy(Rest, 2, MaxInt));
-      if TakeQuoted(Rest, S) then Exit(True);
-      RestU := UpperCase(Rest);
-      if (Copy(RestU, 1, 6) = 'LCASE(') or (Copy(RestU, 1, 6) = 'UCASE(') then
-      begin
-        Lit := Trim(Copy(Rest, 7, MaxInt));
-        if TakeQuoted(Lit, S) then
+      Decls := PPSplitDeclarators(Raw);
+      try
+        for d := 0 to Decls.Count - 1 do
         begin
-          if Copy(RestU, 1, 6) = 'LCASE(' then S := LowerCase(S) else S := UpperCase(S);
-          Exit(True);
+          Dcl := Decls[d];
+          q := 1;
+          while (q <= Length(Dcl)) and IsIdentChar(Dcl[q]) do Inc(q);
+          if UpperCase(Trim(Copy(Dcl, 1, q - 1))) <> Nm then Continue;
+          Rest := Trim(Copy(Dcl, q, MaxInt));
+          if (Rest = '') or (Rest[1] <> '=') then Continue;
+          Rest := Trim(Copy(Rest, 2, MaxInt));
+          if PPFoldStrConst(Rest, S) then Exit(True);
         end;
+      finally
+        Decls.Free;
       end;
     end;
   finally
@@ -1935,21 +2025,107 @@ begin
             SourceDeclaresSymbol(Nm);
 end;
 
-// Evaluate a #if / #elif constant integer expression. Supports: decimal and &H/&O/&B literals;
-// defined(NAME) / defined NAME; bare macro names (-> their integer value, or 0 if undefined or
-// non-numeric); parentheses; unary "-"/"+" and NOT/"!"; "*" "/" "\" MOD; "+" "-"; comparisons
+// ⭐⭐ A PREPROCESSOR CONSTANT EXPRESSION HAS A TYPE, and this is it. It used to be evaluated wholly as
+// an Int64, which is not one defect but a family of them - every one of the five below was a separate
+// entry until the probe deck of 1 Sep 2026 showed they are the SAME missing fact, measured against
+// fbc 1.10.1:
+//
+//   #if (1/2) > .49          '/' is FLOAT division in fbc ('\' is the integer one); as Int64 it was 0
+//   #if defined(N) = -1      a preprocessor BOOLEAN is -1, not 1 - and so are "=", "<", Not
+//   #if (not 5) = -6         Not / And / Or are BITWISE, not logical
+//   #if "a" + "b" = "ab"     '+' and '&' CONCATENATE two strings
+//   #if 0.5                  a float condition is true; truncating it to an Int64 made it false
+//
+// Three kinds, then, exactly as fbc has: integer, float, string. A number keeps its Int64 exactness
+// (a Double cannot hold every Int64, and __FB_ARG_EXTRACT__ asks this evaluator for an INDEX) and only
+// becomes a Double where the expression makes it one.
+type
+  TPPValKind = (ppvInt, ppvFloat, ppvStr);
+  TPPVal = record
+    Kind: TPPValKind;
+    I: Int64;
+    F: Double;
+    S: string;
+    Uns: Boolean;      // an INTEGER carrying a 'u' suffix: compared and divided unsigned
+  end;
+
+function PPInt(const A: Int64): TPPVal;
+begin Result.Kind := ppvInt; Result.I := A; Result.F := 0; Result.S := ''; Result.Uns := False; end;
+
+function PPUInt(const A: Int64; const U: Boolean): TPPVal;
+// ⛔ SIGNEDNESS IS PART OF THE VALUE, exactly as in C: a 'u' suffix makes the literal unsigned, and a
+// comparison where EITHER side is unsigned is decided unsigned. "&hFFFFFFFFFFFFFFFFull > 0" is TRUE in
+// fbc and the same literal WITHOUT the suffix is negative - measured, both are in fbc's own pp/assert.
+begin Result := PPInt(A); Result.Uns := U; end;
+
+function PPFlt(const A: Double): TPPVal;
+begin Result.Kind := ppvFloat; Result.I := 0; Result.F := A; Result.S := ''; Result.Uns := False; end;
+
+function PPStr(const A: string): TPPVal;
+begin Result.Kind := ppvStr; Result.I := 0; Result.F := 0; Result.S := A; Result.Uns := False; end;
+
+function PPBool(const B: Boolean): TPPVal;
+// ⛔ -1, not 1: FreeBASIC's true is all-bits-set, and "#assert defined(N1) = -1" is in fbc's own
+// pp/assert. It matters beyond the literal comparison because And/Or are BITWISE below.
+begin if B then Result := PPInt(-1) else Result := PPInt(0); end;
+
+function PPAsFloat(const A: TPPVal): Double;
+begin
+  case A.Kind of
+    ppvFloat: Result := A.F;
+    ppvStr:   Result := 0;
+  else        if A.Uns then Result := QWord(A.I) else Result := A.I;
+  end;
+end;
+
+function PPAsInt(const A: TPPVal): Int64;
+begin
+  case A.Kind of
+    ppvFloat: Result := Trunc(A.F);
+    ppvStr:   Result := 0;
+  else        Result := A.I;
+  end;
+end;
+
+function PPTruthy(const A: TPPVal): Boolean;
+// A STRING is false whatever it holds - measured: fbc takes the #else branch for both "" and "abc".
+begin
+  case A.Kind of
+    ppvFloat: Result := A.F <> 0;
+    ppvStr:   Result := False;
+  else        Result := A.I <> 0;
+  end;
+end;
+
+function PPAsText(const A: TPPVal): string;
+begin
+  case A.Kind of
+    ppvFloat: Result := FormatDoubleFB(A.F, 16);
+    ppvStr:   Result := A.S;
+  else        if A.Uns then Result := UIntToStr(QWord(A.I)) else Result := IntToStr(A.I);
+  end;
+end;
+
+// Evaluate a #if / #elif constant expression. Supports: decimal, float and &H/&O/&B literals;
+// defined(NAME) / defined NAME; bare macro names (-> their value, or 0 if undefined or
+// non-numeric); parentheses; unary "-"/"+" and NOT/"!"; "*" "/" "\" MOD; "+" "-" "&"; comparisons
 // "=" "==" "<>" "!=" "<" "<=" ">" ">="; AND/"&&"; OR/"||". Nonzero result => take the branch. On any
 // problem it returns False (safe default: branch not taken).
+function EvalPPExprAny(const RawExpr: string; Defs: TStringList; out R: TPPVal;
+  FnDefs: TStringList = nil): Boolean; forward;
+
 function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64;
   FnDefs: TStringList = nil): Boolean; forward;
 
 function EvalPPExpr(const RawExpr: string; Defs: TStringList;
   FnDefs: TStringList = nil): Boolean;
-// #if / #elseif: the expression as a CONDITION.
+// #if / #elseif / #assert: the expression as a CONDITION.
+// ⛔ It asks for the TYPED value, not the integer one: "#if 0.5" is TRUE in fbc and truncating the
+// value to an Int64 before testing it made it false.
 var
-  V: Int64;
+  R: TPPVal;
 begin
-  Result := EvalPPExprInt(RawExpr, Defs, V, FnDefs) and (V <> 0);
+  Result := EvalPPExprAny(RawExpr, Defs, R, FnDefs) and PPTruthy(R);
 end;
 
 const
@@ -2000,25 +2176,54 @@ begin
   end;
 end;
 
-function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64;
+function EvalPPExprAny(const RawExpr: string; Defs: TStringList; out R: TPPVal;
   FnDefs: TStringList = nil): Boolean;
 // ...and as a VALUE, which is what "__FB_EVAL__(expr)" needs: it substitutes the RESULT of a constant
-// integer expression, so another macro can take it as an argument. False when there is nothing to
-// evaluate. The two entry points share one parser - the condition is simply "the value is non-zero".
+// expression, so another macro can take it as an argument. False when there is nothing to
+// evaluate. Every entry point shares this ONE parser - the condition is "the value is truthy", the
+// integer one is "the value truncated" - so a #if and a __FB_EVAL__ of the same text cannot drift.
 var
   Toks: TStringList;
   TPos: Integer;
 
-  function NumOf(const S: string): Int64;
+  function NumOf(const S: string): TPPVal;
+  // ⛔ A LITERAL'S OWN SPELLING SAYS WHICH KIND IT IS. A based literal and a plain run of digits are
+  // INTEGER and stay exact; a point or an exponent makes it a FLOAT. The trailing type suffix
+  // ("0u", "&hFFFFFFFFull", "1.0f") is consumed here rather than left to the identifier scan, which
+  // would otherwise read "ull" as a name of its own.
+  var
+    Body, Suffix: string;
+    n: Integer;
+    U: Boolean;
   begin
-    if (Length(S) >= 2) and (S[1] = '&') then
-      case UpCase(S[2]) of
-        'H': Result := StrToInt64Def('$' + Copy(S, 3, MaxInt), 0);
-        'O': Result := StrToInt64Def('&' + Copy(S, 3, MaxInt), 0);   // FPC octal prefix '&'
-        'B': Result := StrToInt64Def('%' + Copy(S, 3, MaxInt), 0);   // FPC binary prefix '%'
-      else Result := 0;
-      end
-    else Result := StrToInt64Def(S, 0);
+    Body := S;
+    n := Length(Body);
+    if (Length(Body) >= 2) and (Body[1] = '&') then
+    begin
+      while (n > 2) and (UpCase(Body[n]) in ['U', 'L']) do Dec(n);
+      Suffix := Copy(Body, n + 1, MaxInt);
+      Body := Copy(Body, 1, n);
+      U := Pos('U', UpperCase(Suffix)) > 0;
+      case UpCase(Body[2]) of
+        'H': Result := PPUInt(StrToInt64Def('$' + Copy(Body, 3, MaxInt), 0), U);
+        'O': Result := PPUInt(StrToInt64Def('&' + Copy(Body, 3, MaxInt), 0), U);  // FPC octal prefix
+        'B': Result := PPUInt(StrToInt64Def('%' + Copy(Body, 3, MaxInt), 0), U);  // FPC binary prefix
+      else Result := PPInt(0);
+      end;
+      Exit;
+    end;
+    while (n > 1) and (UpCase(Body[n]) in ['U', 'L', 'F']) do Dec(n);
+    Suffix := Copy(Body, n + 1, MaxInt);
+    Body := Copy(Body, 1, n);
+    U := Pos('U', UpperCase(Suffix)) > 0;
+    if (Pos('.', Body) > 0) or (Pos('e', Body) > 0) or (Pos('E', Body) > 0) or
+       (Pos('d', Body) > 0) or (Pos('D', Body) > 0) then
+      Result := PPFlt(StrToFloatDef(StringReplace(StringReplace(Body, 'd', 'e', [rfReplaceAll]),
+                                                  'D', 'E', [rfReplaceAll]), 0, PPFloatFmt))
+    else if U then
+      Result := PPUInt(Int64(StrToQWordDef(Body, 0)), True)
+    else
+      Result := PPInt(StrToInt64Def(Body, 0));
   end;
 
   // Tokenize, substituting defined()/macros into numeric tokens as we go. A macro's value is
@@ -2064,11 +2269,45 @@ var
       end;
       if S[p] in ['=', '<', '>', '(', ')', '+', '-', '*', '/', '\', '!'] then
       begin Toks.Add(S[p]); Inc(p); Continue; end;
-      // number (decimal or &H/&O/&B)
-      if (S[p] in ['0'..'9']) or ((S[p] = '&') and (p < Length(S))) then
+      // ⛔ '&' IS TWO THINGS AND ONLY ONE OF THEM WAS READ. It opens a based literal ONLY before an
+      // H/O/B; everywhere else it is FreeBASIC's CONCATENATION operator, and "&" followed by a space
+      // used to be swallowed as a two-character number ("& ") worth 0 - so '"a" & "b"' compared
+      // nothing against nothing.
+      if (S[p] = '&') and ((p >= Length(S)) or not (UpCase(S[p + 1]) in ['H', 'O', 'B'])) then
+      begin Toks.Add('&'); Inc(p); Continue; end;
+      // number: a based literal (&H/&O/&B), or a decimal that may carry a point and an exponent
+      if (S[p] in ['0'..'9']) or (S[p] = '&') or
+         ((S[p] = '.') and (p < Length(S)) and (S[p + 1] in ['0'..'9'])) then
       begin
-        q := p; if S[q] = '&' then Inc(q, 2);
-        while (q <= Length(S)) and (UpCase(S[q]) in ['0'..'9', 'A'..'F']) do Inc(q);
+        q := p;
+        if S[q] = '&' then
+        begin
+          Inc(q, 2);
+          while (q <= Length(S)) and (UpCase(S[q]) in ['0'..'9', 'A'..'F']) do Inc(q);
+        end
+        else
+        begin
+          while (q <= Length(S)) and (S[q] in ['0'..'9']) do Inc(q);
+          if (q <= Length(S)) and (S[q] = '.') then
+          begin
+            Inc(q);
+            while (q <= Length(S)) and (S[q] in ['0'..'9']) do Inc(q);
+          end;
+          // an exponent, and its sign - but only when a digit actually follows, so that the 'e' of an
+          // identifier glued to a number is not eaten
+          if (q < Length(S)) and (UpCase(S[q]) in ['E', 'D']) and
+             ((S[q + 1] in ['0'..'9']) or
+              ((S[q + 1] in ['+', '-']) and (q + 1 < Length(S)) and (S[q + 2] in ['0'..'9']))) then
+          begin
+            Inc(q);
+            if (q <= Length(S)) and (S[q] in ['+', '-']) then Inc(q);
+            while (q <= Length(S)) and (S[q] in ['0'..'9']) do Inc(q);
+          end;
+        end;
+        // the type SUFFIX belongs to the literal, not to the identifier scan
+        while (q <= Length(S)) and (UpCase(S[q]) in ['U', 'L']) do Inc(q);
+        if (q <= Length(S)) and (UpCase(S[q]) in ['F', 'D']) and
+           ((q = Length(S)) or not IsIdentChar(S[q + 1])) then Inc(q);
         Toks.Add(Copy(S, p, q - p)); p := q; Continue;
       end;
       // identifier / keyword
@@ -2110,8 +2349,10 @@ var
           // FnDefs, not Defs, and only Defs was consulted - so "defined(m)" answered 0 for a macro
           // that had just been written three lines above. The two tables are one QUESTION with two
           // storages; every place that asks "is this name a macro?" has to ask both.
+          // ⛔ -1, and it is two tokens because that is how a macro's "-1" value is re-tokenized above.
+          // fbc's own pp/assert asserts "defined( N1 ) = -1" and "-1 = defined( N1 )".
           if PPNameIsDefined(nm, Defs, FnDefs) then
-            Toks.Add('1')
+          begin Toks.Add('-'); Toks.Add('1'); end
           else
             Toks.Add('0');
         end
@@ -2125,6 +2366,20 @@ var
             'TypeOf() in a #if condition is not supported: the preprocessor has no type information')
         else if (id = 'AND') or (id = 'OR') or (id = 'NOT') or (id = 'MOD') then
           Toks.Add(id)
+        // ⭐ The TEXT-ONLY intrinsics fold here as well as in a Const declaration, and it is the same
+        // funnel that folds them there: fbc's string/case compares a const against "wstr( "xyz123" )"
+        // written inline in the #if. Without this the name read as an undefined identifier and the
+        // argument list was parsed as arithmetic.
+        else if ((id = 'LCASE') or (id = 'UCASE') or (id = 'WSTR') or (id = 'STR')) and
+                NextNonBlankIsOpenParen(S, p) then
+        begin
+          q := p;
+          while (q <= Length(S)) and (S[q] in [' ', #9]) do Inc(q);
+          nm := GatherBalancedParens(S, q);          // q lands past the closing ')'
+          p := q;
+          if PPFoldStrConst(id + nm, ConstS) then Toks.Add(cPPStrTok + ConstS)
+          else Toks.Add('0');
+        end
         // A FUNCTION-LIKE macro INVOCATION: "__FB_MIN_VERSION__(0, 18, 2)". Only object-like macros
         // were substituted here, so a call like that read as an undefined identifier (0) followed by a
         // parenthesised list - and the condition came out FALSE whatever the arguments. fbc defines
@@ -2166,7 +2421,18 @@ var
         else if SourceConstStr(id, ConstS) then
           Toks.Add(cPPStrTok + ConstS)
         else
-          Toks.Add('0');                       // undefined identifier -> 0
+          // ⛔⛔ AN UNDEFINED IDENTIFIER IS ITS OWN NAME, AS TEXT - it is not 0, and reading it as 0
+          // is what made "undeclaredid1 <> undeclaredid2" answer FALSE in fbc's own pp/assert while
+          // "undeclaredid = UNDECLAREDID" answered TRUE by coincidence. The name is uppercased, which
+          // is why the case-crossed pair holds. As TEXT it is still FALSY on its own, so
+          // "#if NOT_DEFINED_ANYWHERE" keeps taking the #else branch exactly as before.
+          // ⚠️ fbc REFUSES "#if pippo = 0" outright (error 20, type mismatch); a #if must still answer
+          // something here, and text-against-a-number answers "not equal".
+          // 📊 Measured with an A/B knob on ONE binary, sets diffed rather than totals: this line alone
+          // moves THREE tests and every one of them was a defect it uncovered, not a loss.
+          // pp/assert CUERR -> runs · pp/assert-false (a multi-declarator Const nobody read) ·
+          // string/case (a nested LCase(WStr()) const, whose two sides used to read 0 and 0).
+          Toks.Add(cPPStrTok + id);
         Continue;
       end;
       Inc(p);   // skip anything else
@@ -2177,46 +2443,8 @@ var
   begin if TPos < Toks.Count then Result := Toks[TPos] else Result := ''; end;
 
   function IsNum(const S: string): Boolean;
-  begin Result := (S <> '') and ((S[1] in ['0'..'9']) or (S[1] = '&')); end;
-
-  function ParseOr: Int64; forward;
-
-  function ParsePrimary: Int64;
-  var t: string;
-  begin
-    t := Peek;
-    // NB: the recursive self-calls MUST use parentheses — in {$mode objfpc} a bare `ParsePrimary`
-    // refers to this function's Result variable (TP/Delphi compatibility), not a recursive call, so
-    // `not`/unary `-`/`+` would read an uninitialised Result instead of their operand.
-    if t = '(' then begin Inc(TPos); Result := ParseOr; if Peek = ')' then Inc(TPos); end
-    else if (t = 'NOT') or (t = '!') then begin Inc(TPos); if ParsePrimary() <> 0 then Result := 0 else Result := 1; end
-    else if t = '-' then begin Inc(TPos); Result := -ParsePrimary(); end
-    else if t = '+' then begin Inc(TPos); Result := ParsePrimary(); end
-    else if IsNum(t) then begin Result := NumOf(t); Inc(TPos); end
-    else begin Inc(TPos); Result := 0; end;
-  end;
-
-  function ParseMul: Int64;
-  var op: string; r: Int64;
-  begin
-    Result := ParsePrimary;
-    while (Peek = '*') or (Peek = '/') or (Peek = '\') or (Peek = 'MOD') do
-    begin
-      op := Peek; Inc(TPos); r := ParsePrimary;
-      if op = '*' then Result := Result * r
-      else if r = 0 then Result := 0
-      else if op = 'MOD' then Result := Result mod r
-      else Result := Result div r;
-    end;
-  end;
-
-  function ParseAdd: Int64;
-  var op: string; r: Int64;
-  begin
-    Result := ParseMul;
-    while (Peek = '+') or (Peek = '-') do
-    begin op := Peek; Inc(TPos); r := ParseMul; if op = '+' then Result := Result + r else Result := Result - r; end;
-  end;
+  begin Result := (S <> '') and ((S[1] in ['0'..'9']) or (S[1] = '&') or
+                                 ((S[1] = '.') and (Length(S) > 1))); end;
 
   function IsStrTok(const T: string): Boolean;
   begin Result := (T <> '') and (T[1] = cPPStrTok); end;
@@ -2224,34 +2452,121 @@ var
   function StrTokText(const T: string): string;
   begin Result := Copy(T, 2, MaxInt); end;
 
-  function ParseCmp: Int64;
-  var op, ls, rs: string; l, r: Int64; b: Boolean;
+  function ParseOr: TPPVal; forward;
+
+  function ParsePrimary: TPPVal;
+  var t: string;
   begin
-    // A comparison whose LEFT side is a string literal is decided on the TEXT. Tested before ParseAdd
-    // is asked for a number, because a string has no number to give. FreeBASIC's own idiom for "was
-    // this variadic argument passed?" compares the stringized argument against an EMPTY literal, and
-    // it can only work this way.
-    if IsStrTok(Peek) then
+    t := Peek;
+    // NB: the recursive self-calls MUST use parentheses — in {$mode objfpc} a bare `ParsePrimary`
+    // refers to this function's Result variable (TP/Delphi compatibility), not a recursive call, so
+    // `not`/unary `-`/`+` would read an uninitialised Result instead of their operand.
+    if t = '(' then begin Inc(TPos); Result := ParseOr; if Peek = ')' then Inc(TPos); end
+    // ⛔ FreeBASIC's Not is BITWISE: "Not 5" is -6, not 0. On the canonical booleans (-1 / 0) the two
+    // readings agree, which is why the logical one survived until an assert asked for -6.
+    else if t = 'NOT' then begin Inc(TPos); Result := PPInt(not PPAsInt(ParsePrimary())); end
+    else if t = '!' then begin Inc(TPos); Result := PPBool(not PPTruthy(ParsePrimary())); end
+    else if t = '-' then
     begin
-      ls := StrTokText(Peek); Inc(TPos);
-      Result := 0;
+      Inc(TPos); Result := ParsePrimary();
+      if Result.Kind = ppvFloat then Result := PPFlt(-Result.F)
+      else Result := PPUInt(-Result.I, Result.Uns);
+    end
+    else if t = '+' then begin Inc(TPos); Result := ParsePrimary(); end
+    else if IsStrTok(t) then begin Result := PPStr(StrTokText(t)); Inc(TPos); end
+    else if IsNum(t) then begin Result := NumOf(t); Inc(TPos); end
+    else begin Inc(TPos); Result := PPInt(0); end;
+  end;
+
+  function ParseMul: TPPVal;
+  var op: string; r: TPPVal;
+  begin
+    Result := ParsePrimary;
+    while (Peek = '*') or (Peek = '/') or (Peek = '\') or (Peek = 'MOD') do
+    begin
+      op := Peek; Inc(TPos); r := ParsePrimary;
+      if op = '*' then
+      begin
+        if (Result.Kind = ppvFloat) or (r.Kind = ppvFloat) then
+          Result := PPFlt(PPAsFloat(Result) * PPAsFloat(r))
+        else Result := PPUInt(Result.I * r.I, Result.Uns or r.Uns);
+      end
+      // ⛔ '/' IS FLOAT DIVISION IN FREEBASIC, whatever its operands are; '\' is the integer one.
+      // Read as an Int64 division, "(1/2) > .49" answered 0 > 0 and fbc's own assert failed.
+      else if op = '/' then
+      begin
+        if PPAsFloat(r) = 0 then Result := PPInt(0)
+        else Result := PPFlt(PPAsFloat(Result) / PPAsFloat(r));
+      end
+      else if PPAsInt(r) = 0 then Result := PPInt(0)
+      else if op = 'MOD' then Result := PPUInt(PPAsInt(Result) mod PPAsInt(r), Result.Uns or r.Uns)
+      else Result := PPUInt(PPAsInt(Result) div PPAsInt(r), Result.Uns or r.Uns);
+    end;
+  end;
+
+  function ParseAdd: TPPVal;
+  var op: string; r: TPPVal;
+  begin
+    Result := ParseMul;
+    while (Peek = '+') or (Peek = '-') or (Peek = '&') do
+    begin
+      op := Peek; Inc(TPos); r := ParseMul;
+      // '&' always concatenates; '+' concatenates only when BOTH sides are text, which is what keeps
+      // "1 + 2" a number.
+      if (op = '&') or ((op = '+') and (Result.Kind = ppvStr) and (r.Kind = ppvStr)) then
+        Result := PPStr(PPAsText(Result) + PPAsText(r))
+      else if (Result.Kind = ppvFloat) or (r.Kind = ppvFloat) then
+      begin
+        if op = '+' then Result := PPFlt(PPAsFloat(Result) + PPAsFloat(r))
+        else Result := PPFlt(PPAsFloat(Result) - PPAsFloat(r));
+      end
+      else
+      begin
+        if op = '+' then Result := PPUInt(Result.I + r.I, Result.Uns or r.Uns)
+        else Result := PPUInt(Result.I - r.I, Result.Uns or r.Uns);
+      end;
+    end;
+  end;
+
+  function ParseCmp: TPPVal;
+  var op, ls, rs: string; lf, rf: Double; l, r: TPPVal; b: Boolean;
+  begin
+    // A comparison whose LEFT side is TEXT is decided on the TEXT. FreeBASIC's own idiom for "was this
+    // variadic argument passed?" compares the stringized argument against an EMPTY literal, and it can
+    // only work this way. ⭐ The left side reaches here through ParseAdd now, so a CONCATENATION
+    // ('"a" + "b" = "ab"', fbc's own assert) is compared, not just a bare literal.
+    l := ParseAdd;
+    if l.Kind = ppvStr then
+    begin
+      ls := l.S;
+      // ⛔ THE VALUE, not False: a comparison level that finds no comparison operator must hand its
+      // operand back unchanged. Answering False here made '("a" & "b") = "ab"' - the PARENTHESISED
+      // form only - compare the boolean 0 against "ab", while the bare form was right.
+      Result := l;
       while (Peek='=') or (Peek='==') or (Peek='<>') or (Peek='!=') or (Peek='<') or (Peek='<=') or (Peek='>') or (Peek='>=') do
       begin
         op := Peek; Inc(TPos);
-        if IsStrTok(Peek) then begin rs := StrTokText(Peek); Inc(TPos); end
-        else begin rs := ''; Inc(TPos); end;
+        r := ParseAdd;
+        // ⛔ TEXT AGAINST A NUMBER IS NOT EQUAL - fbc calls it a type mismatch and refuses, and a #if
+        // must still answer something. "UNKNOWN = "gas"" is FALSE and "UNKNOWN <> "gas"" is TRUE.
+        if r.Kind <> ppvStr then
+        begin
+          if (op='<>') or (op='!=') then Result := PPBool(True) else Result := PPBool(False);
+          Exit;
+        end;
+        rs := r.S;
         if (op='=') or (op='==') then b := ls = rs
         else if (op='<>') or (op='!=') then b := ls <> rs
         else if op='<' then b := ls < rs
         else if op='<=' then b := ls <= rs
         else if op='>' then b := ls > rs
         else b := ls >= rs;
-        if b then Result := 1 else Result := 0;
+        Result := PPBool(b);
         ls := rs;
       end;
       Exit;
     end;
-    Result := ParseAdd;
+    Result := l;
     while (Peek='=') or (Peek='==') or (Peek='<>') or (Peek='!=') or (Peek='<') or (Peek='<=') or (Peek='>') or (Peek='>=') do
     begin
       op := Peek; Inc(TPos);
@@ -2262,52 +2577,87 @@ var
       // literal on the right. Measured against fbc 1.10.1: "UNKNOWN = "gas"" is FALSE, "UNKNOWN <>
       // "gas"" is TRUE, and "0 = "0"" is a type-mismatch ERROR it refuses outright - the one case we
       // are deliberately more permissive about, since a #if must still answer something.
-      if IsStrTok(Peek) then
+      l := Result; r := ParseAdd;
+      if r.Kind = ppvStr then
       begin
-        Inc(TPos);
-        if (op='<>') or (op='!=') then Result := 1 else Result := 0;
+        if (op='<>') or (op='!=') then Result := PPBool(True) else Result := PPBool(False);
         Continue;
       end;
-      l := Result; r := ParseAdd;
-      if (op='=') or (op='==') then b := l = r
-      else if (op='<>') or (op='!=') then b := l <> r
-      else if op='<' then b := l < r
-      else if op='<=' then b := l <= r
-      else if op='>' then b := l > r
-      else b := l >= r;
-      if b then Result := 1 else Result := 0;
+      lf := PPAsFloat(l); rf := PPAsFloat(r);
+      if (l.Kind <> ppvFloat) and (r.Kind <> ppvFloat) and (l.Uns or r.Uns) then
+      begin
+        // ⛔ EITHER SIDE UNSIGNED MAKES THE COMPARISON UNSIGNED, C's rule and fbc's: "-1 > 0ull" is TRUE.
+        if (op='=') or (op='==') then b := QWord(l.I) = QWord(r.I)
+        else if (op='<>') or (op='!=') then b := QWord(l.I) <> QWord(r.I)
+        else if op='<' then b := QWord(l.I) < QWord(r.I)
+        else if op='<=' then b := QWord(l.I) <= QWord(r.I)
+        else if op='>' then b := QWord(l.I) > QWord(r.I)
+        else b := QWord(l.I) >= QWord(r.I);
+      end
+      else if (l.Kind <> ppvFloat) and (r.Kind <> ppvFloat) then
+      begin
+        // both integral and signed: compare the Int64s, so a value a Double cannot hold stays exact
+        if (op='=') or (op='==') then b := l.I = r.I
+        else if (op='<>') or (op='!=') then b := l.I <> r.I
+        else if op='<' then b := l.I < r.I
+        else if op='<=' then b := l.I <= r.I
+        else if op='>' then b := l.I > r.I
+        else b := l.I >= r.I;
+      end
+      else
+      begin
+        if (op='=') or (op='==') then b := lf = rf
+        else if (op='<>') or (op='!=') then b := lf <> rf
+        else if op='<' then b := lf < rf
+        else if op='<=' then b := lf <= rf
+        else if op='>' then b := lf > rf
+        else b := lf >= rf;
+      end;
+      Result := PPBool(b);
     end;
   end;
 
-  function ParseAnd: Int64;
-  var r: Int64;
+  // ⛔ And / Or are BITWISE in FreeBASIC, like Not above. On the canonical booleans they agree with the
+  // logical reading, which is why "(6 And 3) = 2" was the assert that named it.
+  function ParseAnd: TPPVal;
+  var r: TPPVal;
   begin
     Result := ParseCmp;
     while (Peek = 'AND') or (Peek = '&&') do
-    begin Inc(TPos); r := ParseCmp; if (Result <> 0) and (r <> 0) then Result := 1 else Result := 0; end;
+    begin Inc(TPos); r := ParseCmp; Result := PPInt(PPAsInt(Result) and PPAsInt(r)); end;
   end;
 
-  function ParseOr: Int64;
-  var r: Int64;
+  function ParseOr: TPPVal;
+  var r: TPPVal;
   begin
     Result := ParseAnd;
     while (Peek = 'OR') or (Peek = '||') do
-    begin Inc(TPos); r := ParseAnd; if (Result <> 0) or (r <> 0) then Result := 1 else Result := 0; end;
+    begin Inc(TPos); r := ParseAnd; Result := PPInt(PPAsInt(Result) or PPAsInt(r)); end;
   end;
 
 begin
   Result := False;
-  V := 0;
+  R := PPInt(0);
   Toks := TStringList.Create;
   try
     Tokenize(RawExpr, 0);
     if Toks.Count = 0 then Exit;
     TPos := 0;
-    V := ParseOr;
+    R := ParseOr;
     Result := True;
   finally
     Toks.Free;
   end;
+end;
+
+function EvalPPExprInt(const RawExpr: string; Defs: TStringList; out V: Int64;
+  FnDefs: TStringList = nil): Boolean;
+// The same expression as an INTEGER, which is what __FB_ARG_EXTRACT__ asks for an index.
+var
+  R: TPPVal;
+begin
+  Result := EvalPPExprAny(RawExpr, Defs, R, FnDefs);
+  V := PPAsInt(R);
 end;
 
 function PPConstIntStr(const Expr: string; Defs: TStringList): string;

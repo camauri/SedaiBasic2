@@ -376,6 +376,15 @@ type
     function GetSpriteInfo(Num: Integer): TSpriteInfo;
   end;
 
+var
+  // ⭐ IS STANDARD INPUT A TERMINAL? FreeBASIC's INPUT prints its prompt only when a person is there
+  // to read it: with stdin redirected fbc emits NOTHING - not the user's prompt string and not the
+  // "? " - and our prompt was landing in the captured output of every redirected run. It lives here,
+  // in the interface unit both the terminal front end and the VM already see, because the VM must
+  // read it and computing it needs the platform units the terminal front end already has.
+  // ⚠️ Default TRUE: a build with no terminal front end (sbv, sbw) behaves exactly as before.
+  GStdinIsTerminal: Boolean = True;
+
 implementation
 
 end.

@@ -43,6 +43,11 @@ type
     NamespaceNames: TStringList;   // every effective namespace prefix (UPPER), e.g. FORMS, OUTER.INNER
     MemberKeys: TStringList;       // "PREFIX|MEMBER" for each declared member (membership test)
     GlobalNames: TStringList;      // names declared at MODULE level, outside every namespace.
+                                   // ⭐ Each carries the TOP-LEVEL INDEX it was declared at, in
+                                   // Objects[]: fbc's screen on an imported name is POSITIONAL.
+    CurTopIndex: Integer;          // the module-level statement currently being rewritten (MaxInt = unknown)
+    CurNsPrefix: string;           // the namespace whose own children we are rewriting ('' = none)
+    CurNsIndex: Integer;           // ...and which of its children (MaxInt = unknown)
                                    // ⛔ They WIN over a name a USING imported: fbc resolves an
                                    // unqualified reference against the global scope before the
                                    // imported ones, so "Dim Shared v" beside "Using A" (which also
@@ -59,12 +64,20 @@ type
     // name in GlobalNames blocked the import for the TYPE occurrence beside it. A type slot asks this
     // set instead - only a module-level TYPE can outrank an imported one.
     GlobalTypeNames: TStringList;
+    // ⭐ ...and the FIELD names of every TYPE the program declares, "TYPE=F1,F2,...". Inside a member
+    // procedure a bare field name is an implicit-THIS reference and SHADOWS a namespace member exactly
+    // as a parameter does - and nothing here knew it: a namespace declaring "Type foo" with a field
+    // "bar" AND a "Type bar" beside it had "bar = 1234" inside foo's constructor rewritten to
+    // "NS.BAR", so the field was never written and every read of it answered 0. fbc's dim/auto_var2
+    // writes that cross-shadowed pair on purpose.
+    TypeFieldNames: TStringList;
     constructor Create;
     destructor Destroy; override;
     function IsMember(const Prefix, Name: string): Boolean;
     // The imports of Prefix, its imports' imports, and so on. Cycle-safe: a namespace already in Acc
     // is never expanded twice, which is what makes a mutual "using" terminate.
     procedure AddUsingClosure(const Prefix: string; Acc: TStringList);
+    function MemberIndex(const Prefix, Name: string): Integer;
   end;
 
 constructor TNsContext.Create;
@@ -73,6 +86,8 @@ begin
   NsUsings.Duplicates := dupIgnore;
   NsUsings.Sorted := True;
   GlobalTypeNames := TStringList.Create;
+  TypeFieldNames := TStringList.Create;
+  TypeFieldNames.CaseSensitive := False;
   GlobalTypeNames.Duplicates := dupIgnore;
   GlobalTypeNames.Sorted := True;
   NamespaceNames := TStringList.Create;
@@ -82,12 +97,16 @@ begin
   MemberKeys.Duplicates := dupIgnore;
   MemberKeys.Sorted := True;
   GlobalNames := TStringList.Create;
+  CurTopIndex := MaxInt;
+  CurNsPrefix := '';
+  CurNsIndex := MaxInt;
   GlobalNames.Duplicates := dupIgnore;
   GlobalNames.Sorted := True;
 end;
 
 destructor TNsContext.Destroy;
 begin
+  TypeFieldNames.Free;
   NamespaceNames.Free;
   MemberKeys.Free;
   GlobalNames.Free;
@@ -99,6 +118,16 @@ end;
 function TNsContext.IsMember(const Prefix, Name: string): Boolean;
 begin
   Result := MemberKeys.IndexOf(Prefix + '|' + Name) >= 0;
+end;
+
+function TNsContext.MemberIndex(const Prefix, Name: string): Integer;
+// Which child of its namespace declared this member. -1 if it is not a member at all.
+var
+  i: Integer;
+begin
+  Result := -1;
+  i := MemberKeys.IndexOf(Prefix + '|' + Name);
+  if i >= 0 then Result := Integer(PtrInt(MemberKeys.Objects[i]));
 end;
 
 procedure TNsContext.AddUsingClosure(const Prefix: string; Acc: TStringList);
@@ -230,7 +259,7 @@ begin
         else
         begin
           MemName := MemberDeclName(Decl);
-          if MemName <> '' then Ctx.MemberKeys.Add(ChildPrefix + '|' + MemName);
+          if MemName <> '' then Ctx.MemberKeys.AddObject(ChildPrefix + '|' + MemName, TObject(PtrInt(j)));
           // ⛔ AN ENUM'S MEMBERS ARE MEMBERS OF THE NAMESPACE TOO, and registering only the enum's own
           // NAME let them LEAK to module level: with an "E1.B = 2" outside and an "E1.B = 12" inside a
           // namespace, an unqualified B answered 12 - the namespace one - where fbc answers 2, and
@@ -296,6 +325,66 @@ end;
 // assertions on exactly this shape.
 // ⇒ The DIM'd locals are therefore added AS THE WALK REACHES THEM (see RewriteRefs), and this routine
 //   now collects only what is in scope for the WHOLE body: the parameters.
+procedure CollectTypeFieldNames(Node: TASTNode; Ctx: TNsContext);
+// Every TYPE's field names, at any depth, filed as "TYPE=F1,F2,...". See TNsContext.TypeFieldNames.
+var
+  i: Integer;
+  Nm, Acc: string;
+  Fld: TASTNode;
+begin
+  if (Node = nil) or (Ctx = nil) then Exit;
+  if Node.NodeType = antTypeDecl then
+  begin
+    Nm := UpperCase(VarToStr(Node.Value));
+    if Nm <> '' then
+    begin
+      Acc := Ctx.TypeFieldNames.Values[Nm];
+      for i := 0 to Node.ChildCount - 1 do
+      begin
+        Fld := Node.GetChild(i);
+        if (Fld <> nil) and (Fld.NodeType in [antIdentifier, antArrayDecl]) then
+        begin
+          if (Fld.NodeType = antArrayDecl) and (Fld.ChildCount >= 1) and
+             (Fld.GetChild(0).NodeType = antIdentifier) then
+            Acc := Acc + ',' + UpperCase(VarToStr(Fld.GetChild(0).Value))
+          else if Fld.NodeType = antIdentifier then
+            Acc := Acc + ',' + UpperCase(VarToStr(Fld.Value));
+        end;
+      end;
+      Ctx.TypeFieldNames.Values[Nm] := Acc;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do CollectTypeFieldNames(Node.GetChild(i), Ctx);
+end;
+
+procedure CollectOwnerFieldNames(Node: TASTNode; Ctx: TNsContext; Shadow: TStringList);
+// A member procedure "T.m" is written inside T's scope: T's FIELDS shadow namespace members there,
+// because a bare one of them means "this.<field>". Added beside the parameters, for the same reason.
+var
+  Nm, Owner, Acc, One: string;
+  P: Integer;
+begin
+  if (Node = nil) or (Ctx = nil) or (Shadow = nil) then Exit;
+  // ⛔ The NAME is child 0, not the node's own Value - and by now it may carry an overload signature
+  // ("~II") or a constructor's parameter tail ("#I:TV"), both written during parsing. Cut them off:
+  // the owner is what stands before the LAST dot of the bare name.
+  if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+  P := Pos('#', Nm); if P > 0 then Nm := Copy(Nm, 1, P - 1);
+  P := Pos('~', Nm); if P > 0 then Nm := Copy(Nm, 1, P - 1);
+  P := LastDelimiter('.', Nm);
+  if P <= 1 then Exit;
+  Owner := Copy(Nm, 1, P - 1);
+  Acc := Ctx.TypeFieldNames.Values[Owner];
+  while Acc <> '' do
+  begin
+    P := Pos(',', Acc);
+    if P = 0 then begin One := Acc; Acc := ''; end
+    else begin One := Copy(Acc, 1, P - 1); Acc := Copy(Acc, P + 1, MaxInt); end;
+    if (One <> '') and (Shadow.IndexOf(One) < 0) then Shadow.Add(One);
+  end;
+end;
+
 procedure CollectParamNames(Node: TASTNode; Shadow: TStringList);
 var
   i: Integer;
@@ -318,7 +407,16 @@ end;
 
 // The names a DIM/declaration node binds locally, appended to Shadow. Called by the walk at the moment
 // the declaration is REACHED, so it shadows from there on and not before.
-procedure AddDeclaredNames(Node: TASTNode; Shadow: TStringList);
+procedure NoteDeclared(Shadow: TStringList; const N: string; AtIndex: Integer);
+// Record a declared name with the position it was declared at. ⛔ THE FIRST DECLARATION WINS, and it
+// is written out rather than left to the list: a SORTED TStringList with dupIgnore does NOT keep the
+// first entry's Object on a duplicate AddObject, so the LAST position silently won - which put a
+// module DIM's name at a later procedure's index and made it invisible where it should be seen.
+begin
+  if Shadow.IndexOf(N) < 0 then Shadow.AddObject(N, TObject(PtrInt(AtIndex)));
+end;
+
+procedure AddDeclaredNames(Node: TASTNode; Shadow: TStringList; AtIndex: Integer = 0);
 var
   i: Integer;
 begin
@@ -332,10 +430,51 @@ begin
   if Node.NodeType = antRedim then Exit;
   if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 1) and
      (Node.GetChild(0).NodeType = antIdentifier) then
-    Shadow.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+    NoteDeclared(Shadow, UpperCase(VarToStr(Node.GetChild(0).Value)), AtIndex);
+  // ⛔⛔ ...AND A MODULE-LEVEL SUB/FUNCTION IS A DECLARED NAME TOO, which this list did not know: it
+  // collected DIMs only. So "Function bar" of the program's own beside a "Using ns1" that also has a
+  // bar meant the IMPORTED one - "print bar" answered 1 where fbc answers 2 - while the same program
+  // written with "Dim Shared bar" resolved correctly, which is the pair that names it. The rule was in
+  // one path and not its sibling ([[a-rule-one-path-has-and-the-other-does-not]]).
+  // ⚠️ fbc goes further and REFUSES the program when the declaration comes AFTER the Using ("error 4:
+  // Duplicated definition"), so nothing it accepts is harmed by our list having no position: it only
+  // ever decides in favour of the program's own name, which is what fbc does whenever it compiles at
+  // all. DIVERGENZE 89. fbc suite namespace/global2.
+  // ⛔ A dotted name is a METHOD body ("Sub UDT.proc"), not a module-level name of its own.
+  // ⛔⛔ ...AND A PROCEDURE'S BODY IS NOT THE MODULE'S. The descent below follows every antDim it
+  // meets, and a procedure node's children ARE its body - so "Sub p() : Dim As Integer foo" put FOO in
+  // the list of names the MODULE declares. As a SET that was merely too generous; with a POSITION it
+  // is a wrong answer, because the position recorded is the procedure's and not the module DIM's.
+  // A procedure contributes its own NAME and nothing from inside it.
+  if (Node.NodeType = antProcedureDecl) then
+  begin
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+       (Pos('.', VarToStr(Node.GetChild(0).Value)) = 0) then
+      NoteDeclared(Shadow, UpperCase(VarToStr(Node.GetChild(0).Value)), AtIndex);
+    Exit;
+  end;
   for i := 0 to Node.ChildCount - 1 do
     if Node.GetChild(i).NodeType in [antArrayDecl, antDim] then
-      AddDeclaredNames(Node.GetChild(i), Shadow);
+      AddDeclaredNames(Node.GetChild(i), Shadow, AtIndex);
+end;
+
+function GlobalNameVisibleAt(Ctx: TNsContext; const V: string): Boolean;
+// ⭐ fbc's screen on an imported name is POSITIONAL, and this is where the position is spent. A name
+// the program declares at MODULE level beats an import - but only from the point it is DECLARED:
+//   "function bar : 2 : end function        : sub p() : using ns1 : print bar"   -> 2, the program's
+//   "sub p() : using ns1 : print bar : ...  : function bar : 2 : end function"   -> 1, the import's
+// Both compile under fbc and they answer differently, so a SET of names cannot express it: the entry
+// carries the top-level index it was declared at, and CurTopIndex says where we are now.
+// ⚠️ MaxInt means "position unknown" (a walk that is not the module's own children), and there every
+// declared name is treated as visible - which is the answer this test gave before it had a position.
+var
+  Idx: Integer;
+begin
+  Result := False;
+  if Ctx = nil then Exit;
+  Idx := Ctx.GlobalNames.IndexOf(V);
+  if Idx < 0 then Exit;
+  Result := Integer(PtrInt(Ctx.GlobalNames.Objects[Idx])) <= Ctx.CurTopIndex;
 end;
 
 // Resolve an unqualified member name V against the active prefix chain (innermost first). Returns
@@ -346,19 +485,35 @@ function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext;
 // so a name of the namespace one is written INSIDE always wins over an imported one - which is what
 // fbc does and the only order that keeps an existing program's meaning.
 var
-  P: string;
+  P, Member: string;
   DotPos, u: Integer;
   Closure: TStringList;
+  MemberIsLater: Boolean;
 begin
   Result := '';
   P := ActivePrefix;
+  Member := '';
+  MemberIsLater := False;
   while P <> '' do
   begin
-    if Ctx.IsMember(P, V) then Exit(P + '.' + V);
+    if Ctx.IsMember(P, V) then
+    begin
+      Member := P + '.' + V;
+      // ⭐ ...BUT ONLY IF IT IS DECLARED BY NOW. fbc's screen is POSITIONAL: a member of the namespace
+      // we are written inside, declared BELOW this point, does not shadow what a "Using" brought in.
+      //   namespace ns2 : sub p() : using ns1 : print bar : end sub : function bar : 2 : ...
+      // answers ns1's bar, not ns2's - fbc's own namespace/import_method asserts exactly that.
+      // ⛔ The screen is a TIE-BREAK against an import and NOTHING ELSE: with no import offering the
+      // name, a later member still resolves, or every forward reference inside a namespace would
+      // break. That is why Member is remembered here and returned below rather than being skipped.
+      MemberIsLater := (P = Ctx.CurNsPrefix) and (Ctx.MemberIndex(P, V) > Ctx.CurNsIndex);
+      Break;
+    end;
     DotPos := LastDelimiter('.', P);
     if DotPos = 0 then Break;
     P := Copy(P, 1, DotPos - 1);
   end;
+  if (Member <> '') and (not MemberIsLater) then Exit(Member);
   // ⛔ ...but a MODULE-LEVEL name of the program's own wins over every import: fbc resolves an
   // unqualified reference against the global scope first. "Dim Shared v" beside a "Using A" that also
   // has a v means the global v, and without this test the import silently took the name over.
@@ -374,7 +529,7 @@ begin
   // (fbc suite namespace/var-named-as-udt, which writes that pair on purpose). Only a module-level
   // TYPE can outrank an imported one.
   if (Using <> nil) and
-     (((not TypeSlot) and (Ctx.GlobalNames.IndexOf(V) < 0)) or
+     (((not TypeSlot) and (not GlobalNameVisibleAt(Ctx, V))) or
       (TypeSlot and (Ctx.GlobalTypeNames.IndexOf(V) < 0))) then
   begin
     Closure := TStringList.Create;
@@ -387,6 +542,8 @@ begin
       Closure.Free;
     end;
   end;
+  // No import offered the name: a member of an enclosing namespace stands, wherever it was declared.
+  if Member <> '' then Exit(Member);
 end;
 
 // Re-resolve the TYPE NAMES carried in an overload signature's tail against the enclosing namespace
@@ -425,6 +582,13 @@ begin
       // '-' is the placeholder for a parameter with no type name; a dotted name is already qualified;
       // a pointer spelling ("T PTR") is left whole, since the tail records it as one token and the
       // call side spells it the same way.
+      // ⚠️ MISURATO IL 31 AGO E NON E' QUI. Un tipo ANNIDATO dentro un namespace ("foo.bar1", un Enum
+      // dentro Type foo) non e' qualificato malgrado il punto, e qualificarne la TESTA qui e' un ramo
+      // MORTO: la suite non si muove di un test. La riduzione dice dov'e' il confine, e sono tre
+      // sonde: enum annidati FUORI da un namespace ✅, enum NON annidati DENTRO ✅, annidati + dentro ❌
+      // (fbc structs/enum_decl: il secondo overload non viene mai chiamato, la scelta cade sull'ARITA').
+      // ⇒ Il disaccordo sta fra la firma e cio' che il SITO DI CHIAMATA chiede del tipo dichiarato
+      // dell'argomento, non nella firma da sola. Prossima mossa: stampare le due stringhe.
       if (Part <> '') and (Part <> '-') and (Pos('.', Part) = 0) and (Pos(' ', Part) = 0) then
       begin
         Res := ResolveUnqualified(ActivePrefix, Part, Ctx, Using);
@@ -521,13 +685,68 @@ var
   Drop: array of Integer;
   UsingNs: string;
   SigPos, DotPos: Integer;
-  BaseV, SigV: string;
+  BaseV, SigV, SavedNsPrefix: string;
+  SavedNsIndex: Integer;
+  AliasV, AliasSig, AliasQ: string;
 begin
   Result := Node;
 
   // Determine the prefix/shadow for descending into children.
   ChildPrefix := ActivePrefix;
   UseShadow := Shadow;
+
+  // ⛔⛔ A TYPE ALIAS'S TARGET LIVES IN AN ATTRIBUTE, AND THIS WALK ONLY EVER SAW CHILD NODES.
+  // "Type A As A_" inside a namespace kept the bare "A_", so the alias pointed at a type that exists
+  // nowhere and every use of A fell back to the default width: SizeOf(A) answered 8 where fbc answers
+  // 24, and a field read through it answered the handle. The identical program outside a namespace was
+  // right - the tell for a rule one path has and its sibling does not. It is a TYPE SLOT, so it asks
+  // with TypeSlot=True, and a FORWARD target resolves too: members are collected in a pre-pass, so a
+  // type declared further down is a member already. fbc's typedef/incomplete asserts the qualified
+  // spelling by name.
+  if (Node <> nil) and (Node.NodeType = antTypeDecl) and (Ctx <> nil) and
+     (Node.Attributes.Values['ALIAS'] <> '') then
+  begin
+    AliasV := UpperCase(Node.Attributes.Values['ALIAS']);
+    AliasSig := '';
+    while (Length(AliasV) > 4) and (Copy(AliasV, Length(AliasV) - 3, 4) = ' PTR') do
+    begin
+      AliasSig := ' PTR' + AliasSig;
+      AliasV := TrimRight(Copy(AliasV, 1, Length(AliasV) - 4));
+    end;
+    if (AliasV <> '') and (Pos('.', AliasV) = 0) then
+    begin
+      AliasQ := ResolveUnqualified(ActivePrefix, AliasV, Ctx, Using, True);
+      if AliasQ <> '' then Node.Attributes.Values['ALIAS'] := AliasQ + AliasSig;
+    end;
+  end;
+
+  // ⛔ ...AND SO IS THE TYPE A "FOR" HEAD DECLARES, which is the SECOND attribute this rewrite could
+  // not see. "For cnt As T = a To b" keeps T in the VARTYPE attribute, not in a child node, so inside a
+  // namespace it stayed spelled the way it was written while the type is registered as "NS.T".
+  // FindUDT then answered -1, the whole Operator For/Step/Next expansion was skipped in SILENCE, and
+  // the loop fell to the numeric path: the counter became an ordinary integer and "cnt.x" in the body
+  // read whatever register happened to be there.
+  // ⭐ The OTHER spelling of the same loop was right the whole time - "Dim As T c : For c = a To b"
+  // takes its type from the variable, which the declaration rewrite had already qualified. One loop,
+  // two spellings, and only the one that names the type in the head was wrong.
+  // ⚠️ Same shape as the ALIAS attribute just above, found the same day: when a rewrite cannot find a
+  // name, ask whether that name is an ATTRIBUTE rather than a child.
+  if (Node <> nil) and (Node.NodeType = antForLoop) and (Ctx <> nil) and
+     (Node.Attributes.Values['VARTYPE'] <> '') then
+  begin
+    AliasV := UpperCase(Node.Attributes.Values['VARTYPE']);
+    AliasSig := '';
+    while (Length(AliasV) > 4) and (Copy(AliasV, Length(AliasV) - 3, 4) = ' PTR') do
+    begin
+      AliasSig := ' PTR' + AliasSig;
+      AliasV := TrimRight(Copy(AliasV, 1, Length(AliasV) - 4));
+    end;
+    if (AliasV <> '') and (Pos('.', AliasV) = 0) then
+    begin
+      AliasQ := ResolveUnqualified(ActivePrefix, AliasV, Ctx, Using, True);
+      if AliasQ <> '' then Node.Attributes.Values['VARTYPE'] := AliasQ + AliasSig;
+    end;
+  end;
 
   if Node.NodeType = antNamespace then
     ChildPrefix := CombinePrefix(ActivePrefix, VarToStr(Node.Value))
@@ -538,6 +757,7 @@ begin
     UseShadow.Duplicates := dupIgnore;
     UseShadow.Sorted := True;
     CollectParamNames(Node, UseShadow);
+    CollectOwnerFieldNames(Node, Ctx, UseShadow);
   end;
 
   // Recurse into children first (bottom-up), replacing each in place if needed.
@@ -547,8 +767,23 @@ begin
   // downstream ever sees a stray PRINT USING that would take the next PRINT's format with it.
   UseUsing := Using;
   SetLength(Drop, 0);
+  SavedNsPrefix := '';
+  SavedNsIndex := MaxInt;
+  if Ctx <> nil then
+  begin
+    SavedNsPrefix := Ctx.CurNsPrefix;
+    SavedNsIndex := Ctx.CurNsIndex;
+  end;
   for i := 0 to Node.ChildCount - 1 do
   begin
+    // Where we are, in module-level statements: what a "Using" is allowed to take over depends on it.
+    if (Node.NodeType = antProgram) and (Ctx <> nil) then Ctx.CurTopIndex := i;
+    // ...and the same question one level in: which child of THIS namespace we are rewriting.
+    if (Node.NodeType = antNamespace) and (Ctx <> nil) then
+    begin
+      Ctx.CurNsPrefix := ChildPrefix;
+      Ctx.CurNsIndex := i;
+    end;
     UsingNs := UsingDirectiveName(Node.GetChild(i), Ctx, ChildPrefix);
     if UsingNs <> '' then
     begin
@@ -600,7 +835,13 @@ begin
       if (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antIdentifier) then m := 1
       else if (Node.ChildCount >= 3) and (Node.GetChild(1).NodeType = antDimensions) and
               (Node.GetChild(2).NodeType = antIdentifier) then m := 2;
-      if (i = m) and (UseUsing <> nil) then
+      // ⛔⛔ AND NOT ONLY WHEN THERE IS AN IMPORT. This was gated on "UseUsing <> nil", so a namespace
+      // with no "Using" at all never asked the question - and then the generic rewrite below decided,
+      // which asks the VARIABLE authority: "Dim As Integer foo" beside "Type foo" in the same
+      // namespace left the type slot unqualified, the record was built from a type that exists
+      // nowhere, and every field read 0. A declaration's type slot is a TYPE SLOT whether or not
+      // anything was imported; ResolveUnqualified already handles a nil import list.
+      if i = m then
       begin
         DeclNd := Node.GetChild(i);
         V := UpperCase(VarToStr(DeclNd.Value));
@@ -618,10 +859,53 @@ begin
             DeclNd.Value := Qual + SigV;
             Continue;                       // resolved as a TYPE; the generic rewrite must not re-do it
           end;
+        end
+        // ⛔⛔ ...AND A PARTIALLY QUALIFIED SLOT IS STILL A TYPE SLOT. The test above is "no dot at
+        // all", so "Dim As ns_a.shape v" written from the ENCLOSING namespace was handed to the generic
+        // rewrite - which asks the VARIABLE authority - and came out as "NS_A.SHAPE", a type that
+        // exists nowhere: the real one is "Q.NS_A.SHAPE". The variable then got no record at all, so
+        // "v.x = 99 : Print v.x" answered 0 and passing it to a SUB that reads a field was an
+        // ACCESS VIOLATION. ⭐ The very same declaration written OUT IN FULL worked, which is what said
+        // it was the spelling and not the nesting (fbc's own namespace/dups_qkwd, reduced to fifteen
+        // lines). [[two-spellings-of-one-thing-that-disagree-name-the-missing-path]]
+        //
+        // The HEAD is what needs resolving, and ResolveNamespacePrefix is the funnel that already does
+        // it for every other partially qualified reference: enclosing chain first, then the imports.
+        // ⚠️ A nested TYPE ("T.U") is a dotted spelling too, and it must NOT be touched - the head is
+        // not a namespace, so that helper answers '' and this arm declines, which is the closed side.
+        else if (V <> '') and (Pos('.', V) > 0) then
+        begin
+          Qual := ResolveNamespacePrefix(ChildPrefix, Copy(V, 1, Pos('.', V) - 1), Ctx, UseUsing);
+          if Qual <> '' then
+          begin
+            DeclNd.Value := Qual + Copy(V, Pos('.', V), MaxInt) + SigV;
+            Continue;
+          end;
+          // ⛔ ...AND THE HEAD MAY BE A TYPE RATHER THAN A NAMESPACE. "Dim As T1.T2 x" names a NESTED
+          // type, and ResolveNamespacePrefix answers '' for it - T1 is not a namespace - so the slot
+          // stayed spelled T1.T2 while the type is registered as NS.T1.T2. The METHOD path one screen
+          // down has always asked both questions (IsMember for a type, NamespaceNames for a namespace);
+          // this one asked only the second. The cost: inside a namespace, every method of a NESTED type
+          // was a silent NO-OP - "x2.p1( y1 )" ran nothing at all while the outer type's methods ran -
+          // because the object's type and the method's owner were two different names.
+          if (ChildPrefix <> '') and
+             Ctx.IsMember(ChildPrefix, Copy(V, 1, Pos('.', V) - 1)) then
+          begin
+            DeclNd.Value := ChildPrefix + '.' + V + SigV;
+            Continue;
+          end;
         end;
       end;
     end;
-    if (Node.NodeType = antTypeDecl) and (Node.GetChild(i).NodeType = antIdentifier) then
+    // ⛔ ...AND A FIELD IS NOT ALWAYS AN antIdentifier. A member declared with the DIM shape arrives as
+    // an antArrayDecl, and this guard did not cover it: a namespace declaring "Type foo" with a field
+    // "bar" AND a "Type bar" beside it had foo's FIELD renamed to "NS.BAR", so foo had no field called
+    // BAR at all and "f.bar" read 0 - while "g.foo" on the mirror pair worked, which is what said the
+    // guard was keyed on the node's SHAPE and not on its meaning. fbc's dim/auto_var2 writes that
+    // cross-shadowed pair on purpose. Its children are still rewritten: a field declared "As UDT"
+    // inside a namespace means "NS.UDT".
+    if (Node.NodeType = antTypeDecl) and
+       (Node.GetChild(i).NodeType in [antIdentifier, antArrayDecl]) then
     begin
       FieldNd := Node.GetChild(i);
       for k := 0 to FieldNd.ChildCount - 1 do
@@ -635,6 +919,13 @@ begin
     NewNode := RewriteRefs(Node.GetChild(i), ChildPrefix, UseShadow, Ctx, UseUsing);
     if NewNode <> Node.GetChild(i) then
       ReplaceChildAt(Node, i, NewNode);   // frees the old child, installs the rewritten one
+  end;
+  // The descent may have moved the "where we are" marker into a nested namespace; this node's own
+  // rewriting below belongs to the scope it started in.
+  if Ctx <> nil then
+  begin
+    Ctx.CurNsPrefix := SavedNsPrefix;
+    Ctx.CurNsIndex := SavedNsIndex;
   end;
   for i := High(Drop) downto 0 do
     Node.RemoveChildAt(Drop[i]);          // the directive has done its work; it is not a statement
@@ -694,6 +985,25 @@ begin
     end;
   end;
 
+  // ⛔⛔ ...AND THE BASE MAY BE AN IMPORTED NAME, WITH NO NAMESPACE OF OUR OWN AROUND US. The block
+  // below is guarded on being INSIDE a namespace, so a type declared at module level (or in a Scope)
+  // that extends a name brought in by "Using N" was never looked at: the SSA searched for the parent
+  // by its bare name, found nothing, and the derived type inherited NOTHING with no diagnostic -
+  // "Type T2 Extends T1" after "Using N" gave T2 its own fields only, and the initialiser then said
+  // "too many expressions". The QUALIFIED spelling "Extends N.T1" worked, which is the pair that named
+  // it. fbc's own structs/scope-type-1 writes the imported form.
+  // Asked with TypeSlot=True, because a base IS a type slot: a module-level VARIABLE of the same
+  // spelling must not block the import (see ResolveUnqualified).
+  if (Node.NodeType = antTypeDecl) and (ActivePrefix = '') and (UseUsing <> nil) then
+  begin
+    BaseV := UpperCase(Node.Attributes.Values['EXTENDS']);
+    if (BaseV <> '') and (Pos('.', BaseV) = 0) then
+    begin
+      Qual := ResolveUnqualified(ActivePrefix, BaseV, Ctx, UseUsing, True);
+      if Qual <> '' then Node.Attributes.Values['EXTENDS'] := Qual;
+    end;
+  end;
+
   // antTypeDecl name lives in Value (not a child identifier): mangle it here.
   if (Node.NodeType = antTypeDecl) and (ActivePrefix <> '') then
   begin
@@ -709,8 +1019,17 @@ begin
     // with no diagnostic at all: sizeof gave its own fields only and the base's fields read rubbish.
     // Same rule, same node, one of the two halves written.
     BaseV := UpperCase(Node.Attributes.Values['EXTENDS']);
-    if (BaseV <> '') and (Pos('.', BaseV) = 0) and Ctx.IsMember(ActivePrefix, BaseV) then
-      Node.Attributes.Values['EXTENDS'] := ActivePrefix + '.' + BaseV;
+    if (BaseV <> '') and (Pos('.', BaseV) = 0) then
+    begin
+      if Ctx.IsMember(ActivePrefix, BaseV) then
+        Node.Attributes.Values['EXTENDS'] := ActivePrefix + '.' + BaseV
+      else if UseUsing <> nil then
+      begin
+        // ...and a base the enclosing namespace does NOT declare may still be an IMPORTED one.
+        Qual := ResolveUnqualified(ActivePrefix, BaseV, Ctx, UseUsing, True);
+        if Qual <> '' then Node.Attributes.Values['EXTENDS'] := Qual;
+      end;
+    end;
     Exit;
   end;
 
@@ -923,6 +1242,7 @@ procedure FlattenNamespaces(AST: TASTNode);
 var
   Ctx: TNsContext;
   gi: Integer;
+  FwdList: TStringList;
 begin
   if AST = nil then Exit;
   Ctx := TNsContext.Create;
@@ -930,14 +1250,33 @@ begin
     CollectNamespaces(AST, '', Ctx);
     if Ctx.NamespaceNames.Count = 0 then Exit;   // no namespaces: nothing to do
     // The names the program declares at MODULE level, so an import cannot take one over.
+    // ⭐ FIRST the FORWARD declarations, at position 0. A "Declare Function bar" emits no node, so the
+    // only position BAR had was its BODY's - and a body written under the "Using" lost to the import:
+    // "print bar" answered the namespace's 1 where fbc answers the program's 2. Position 0 = visible
+    // from the top, which is what the oracle does: fbc answers 2 whether the Declare stands before the
+    // Using or after it. (Without any Declare at all fbc REFUSES the program - "error 4: Duplicated
+    // definition" - so nothing it compiles is harmed by this being unconditional.) NoteDeclared keeps
+    // the FIRST entry, so a later real definition does not push the position back down. DIVERGENZE 98.
+    FwdList := TStringList.Create;
+    try
+      FwdList.Delimiter := ',';
+      FwdList.StrictDelimiter := True;
+      FwdList.DelimitedText := AST.Attributes.Values['FWDDECL'];
+      for gi := 0 to FwdList.Count - 1 do
+        if Trim(FwdList[gi]) <> '' then
+          NoteDeclared(Ctx.GlobalNames, UpperCase(Trim(FwdList[gi])), 0);
+    finally
+      FwdList.Free;
+    end;
     for gi := 0 to AST.ChildCount - 1 do
       if AST.GetChild(gi).NodeType <> antNamespace then
       begin
-        AddDeclaredNames(AST.GetChild(gi), Ctx.GlobalNames);
+        AddDeclaredNames(AST.GetChild(gi), Ctx.GlobalNames, gi);
         // ...and the module-level TYPE names on their own, for the type-slot question.
         if (AST.GetChild(gi).NodeType = antTypeDecl) and (VarToStr(AST.GetChild(gi).Value) <> '') then
           Ctx.GlobalTypeNames.Add(UpperCase(VarToStr(AST.GetChild(gi).Value)));
       end;
+    CollectTypeFieldNames(AST, Ctx);
     RewriteRefs(AST, '', nil, Ctx, nil);
     HoistNamespaces(AST);
   finally

@@ -233,6 +233,8 @@ begin
     ssaStrTrimSet: Result := bcStrTrimSet;
     ssaStrInstrRevAny: Result := bcStrInstrRevAny;
     ssaStrInstrAny: Result := bcStrInstrAny;
+    ssaStrInstrAnyW: Result := bcStrInstrAnyW;
+    ssaStrInstrRevAnyW: Result := bcStrInstrRevAnyW;
     ssaStrOct: Result := bcStrOct;       // B1.3 numeric<->string conversions
     ssaStrBin: Result := bcStrBin;
     ssaStrValInt: Result := bcStrValInt;

@@ -109,6 +109,12 @@ type
     IntData: array of Int64;
     FloatData: array of Double;
     StringData: array of string;
+    // ⭐ FIXED-OR-DYNAMIC, AS A FACT OF THE STORAGE. The compiler answers that question for a name it
+    // can see declared, and for an array PARAMETER it cannot: "Erase arg" inside a SUB must FREE the
+    // caller's array when the caller REDIM'd it and merely RESET the elements when the caller DIM'd it
+    // with fixed bounds, and the two callers may be in different files. The flag rides on the storage,
+    // so a bind - which copies this record WHOLE - carries the caller's answer into the parameter.
+    IsDynamic: Boolean;
   end;
 
   { One suspended invocation's copy of a proc-local array. The storage record is copied WHOLE, which
