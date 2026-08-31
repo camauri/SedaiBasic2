@@ -1842,6 +1842,15 @@ begin
  // address-of a variable (POINTER(v) == VARPTR(v) == @v). Registering it would route it to the generic
  // memory-function path (which returns 0).
 
+ // ⛔⛔ THESE TWO ARE STRING FUNCTIONS AND THEY USED TO SIT INSIDE THE GRAPHICS BLOCK BELOW, so a
+ // WEB_MODE build did not register them at all: REGEXCOUNT / REGEXREPLACE read as bare identifiers,
+ // the call was classified as an array access, and sbw answered "Array not declared: REGEXCOUNT" -
+ // which, on top of an uninitialised local in SedaiWebServer, surfaced as "Access violation".
+ // ⇒ A registration's POSITION in this file is a gate. Anything that is not graphics or sound must
+ // stay OUTSIDE the {$IFNDEF WEB_MODE} block, whatever line it was convenient to add it on.
+ RegisterKeyword(kREGEXCOUNT,   ttStringFunction, 'Regular-expression match count',   kcStringFunctions);
+ RegisterKeyword(kREGEXREPLACE, ttStringFunction, 'Regular-expression replace all',   kcStringFunctions);
+
  {$IFNDEF WEB_MODE}
  // === GRAPHICS HANDLING (COMMANDS AND FUNCTION) ===
  // Note: These keywords are NOT available in WEB_MODE (sbw.exe)
@@ -1883,8 +1892,6 @@ begin
  RegisterKeyword(kIMAGECREATE,  ttGraphicsFunction, 'FreeBASIC: allocate an image surface -> handle', kcGraphicsHandling);
  RegisterKeyword(kIMAGEDESTROY, ttGraphicsCommand,  'FreeBASIC: free an image surface',               kcGraphicsHandling);
  RegisterKeyword(kIMAGEINFO,    ttGraphicsCommand,  'FreeBASIC: query an image surface width/height', kcGraphicsHandling);
- RegisterKeyword(kREGEXCOUNT,   ttStringFunction, 'Regular-expression match count',   kcStringFunctions);
- RegisterKeyword(kREGEXREPLACE, ttStringFunction, 'Regular-expression replace all',   kcStringFunctions);
  RegisterKeyword(kIMAGECONVERTROW, ttGraphicsCommand, 'FreeBASIC: convert a pixel row between colour depths', kcGraphicsHandling);
  RegisterKeyword(kSCREENINFO,   ttGraphicsCommand,  'FreeBASIC: query the graphics screen width/height/depth', kcGraphicsHandling);
  RegisterKeyword(kSCREENLOCK,   ttGraphicsCommand,  'FreeBASIC: begin direct screen access (no-op)',  kcGraphicsHandling);

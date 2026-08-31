@@ -2499,11 +2499,18 @@ begin
     // Diagnostic only; prints the summary and exits without touching the dispatch path.
     if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--verify-opcodes') then
     begin
+      // ⛔ 1 (not 0) on failure. This used to Halt(0) either way, so a script that trusted the exit
+      // code got a green net from a broken map; only a human reading the last LINE could tell.
       if VerifyOpcodeTable(VerifyMsg) then
-        WriteLn('opcode-table OK: ', VerifyMsg)
+      begin
+        WriteLn('opcode-table OK: ', VerifyMsg);
+        Halt(0);
+      end
       else
+      begin
         WriteLn('opcode-table FAIL: ', VerifyMsg);
-      Halt(0);
+        Halt(1);
+      end;
     end;
 
     // Every opcode the compiler can emit, with the name the disassembler would print for it. One line

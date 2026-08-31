@@ -33,7 +33,8 @@ curl "http://localhost:8080/hello.wbas?nome=Mario"
 | `--host <address>` | Bind address | 0.0.0.0 |
 | `--basedir <path>` | Script directory | (required) |
 | `--cache` | Enable bytecode caching | disabled |
-| `--verbose` | Verbose logging | disabled |
+| `--verbose` | Verbose logging (adds the real compile diagnostic and a stack trace on a fault) | disabled |
+| `--verify-opcodes` | Self-check the dense opcode map, then exit (0 OK / 1 FAIL) | - |
 | `--help` | Show help | - |
 
 ## File Extensions
@@ -43,6 +44,31 @@ curl "http://localhost:8080/hello.wbas?nome=Mario"
 | `.bas` | Standard BASIC (console) | sb.exe, sbv.exe |
 | `.wbas` | Web BASIC | sbw.exe |
 | `.basc` | Compiled bytecode | sb.exe, sbv.exe |
+
+## Dialects
+
+A `.wbas` script may be written in either dialect, and `sbw` chooses per script from the source
+itself - exactly as `sb` and `sbc` do:
+
+| the source | dialect | what follows from it |
+|---|---|---|
+| some line begins with a number | **CLASSIC** (Commodore BASIC v7) | global-by-name variables, a trailing space after a printed number, `TAB`/`SPC` always emit their spaces |
+| no line numbers | **MODERN** (FreeBASIC) | a `Sub` has its own locals, FreeBASIC number formatting, the preprocessor (`#define`, `#if`, `#include`, `#macro`) |
+
+The detection is the same comment- and string-aware heuristic the other front ends use, so a number at
+the start of a line inside a comment or a string does not change the dialect.
+
+> **Before 1 September 2026 `sbw` was CLASSIC-only**, and forced every script through the Commodore
+> rules regardless of how it was written. A MODERN script therefore got Commodore scoping, no
+> preprocessor, unmasked floating-point exceptions and no `OPTION DIGITS`. If you have `.wbas` files
+> written against that behaviour and they rely on a `Sub` sharing a module variable by name, add line
+> numbers to keep them CLASSIC.
+
+### What is still CLASSIC-only, on purpose
+
+`TAB` and `SPC` are cursor movements. In MODERN, FreeBASIC emits them only onto a visible screen, and an
+HTTP response body is a redirected stream - so in a MODERN `.wbas` they produce nothing, which is what
+`fbc` does. In a CLASSIC `.wbas` the spaces are emitted as always.
 
 ## Web BASIC Instructions
 
@@ -160,6 +186,17 @@ The following instructions are **not available** in sbw.exe and will cause synta
 
 ### PEEK/POKE
 Only "safe" memory operations. Video/audio memory mapping will cause errors.
+
+### Not excluded, despite where they used to live
+`REGEXCOUNT` and `REGEXREPLACE` are string functions and work in `sbw`. Until 1 September 2026 their two
+registrations sat inside the block of graphics keywords that `WEB_MODE` compiles out, so `sbw` did not
+know the names at all.
+
+### How a refusal reports itself
+A script `sbw` cannot compile answers `500 Internal Server Error: Compilation failed`. Run the server
+with `--verbose` to get the real reason in the log (`SSA generation error: ...`, `Parser error: ...`,
+`Preprocessor error: ...`). Before 1 September 2026 every such refusal surfaced as `Access violation`,
+which named nothing.
 
 ## Security Considerations
 

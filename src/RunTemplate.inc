@@ -543,7 +543,7 @@ begin
     // The group-0 and superinstruction BODIES below are byte-identical to the previous nested cases.
     case DenseOp of
       // === Superinstructions (dense DENSE_SUPER_BASE + sub, sub = Op and $FF) ===
-      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + 71:
+      DENSE_SUPER_BASE + 0 .. DENSE_SUPER_BASE + DENSE_SUPER_SIZE - 1:
       case Op and $FF of
         // Fused compare-and-branch (Int) - sub-opcodes 0-5
         0: if IntRegs[Instr^.Src1] = IntRegs[Instr^.Src2] then CurPC := Instr^.Immediate else Inc(CurPC);  // bcCmpBranchEqInt
@@ -899,9 +899,9 @@ begin
       end;
 
       // === Delegated families (each a contiguous dense range) ===
-      DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + 54:
+      DENSE_STRING_BASE + 0 .. DENSE_STRING_BASE + DENSE_STRING_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteStringOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
-      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + 42:
+      DENSE_MATH_BASE + 0 .. DENSE_MATH_BASE + DENSE_MATH_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
       // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.
@@ -918,40 +918,38 @@ begin
           end;
           Inc(CurPC);
         end;
-      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 51:
+      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + DENSE_ARRAY_SIZE - 1:
         // Cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store; the
         // descriptor rebuild is triggered inside ExecuteArrayOp itself (it has two callers now - here
         // and the AOT helper - so the flag lives with the op, not the call site).
         begin Ctx.PC := CurPC; ExecuteArrayOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
-      DENSE_IO_BASE + 0 .. DENSE_IO_BASE + 22:
+      DENSE_IO_BASE + 0 .. DENSE_IO_BASE + DENSE_IO_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteIOOp(Ctx, Instr^); if not Ctx.Running then Break; CurPC := Ctx.PC + 1; end;
-      DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + 17:
+      DENSE_SPECIAL_BASE + 0 .. DENSE_SPECIAL_BASE + DENSE_SPECIAL_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteSpecialVarOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
-      DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + 36:
+      DENSE_FILEIO_BASE + 0 .. DENSE_FILEIO_BASE + DENSE_FILEIO_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteFileIOOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
-      DENSE_SPRITE_BASE + 0 .. DENSE_SPRITE_BASE + 16:
+      DENSE_SPRITE_BASE + 0 .. DENSE_SPRITE_BASE + DENSE_SPRITE_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteSpriteOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       {$IFDEF WEB_MODE}
-      DENSE_WEB_BASE + 0 .. DENSE_WEB_BASE + 12:
+      DENSE_WEB_BASE + 0 .. DENSE_WEB_BASE + DENSE_WEB_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteWebOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       {$ENDIF}
-      // ⚠️ 65, not 64: bcGfxDrawString. This range has NO compile-time check of any kind - leave it too
-      // narrow and everything builds, then the program dies at run time with "Unknown/illegal opcode".
-      // ⛔ THE UPPER BOUND IS WRITTEN OUT AND NOTHING CHECKS IT. It was 65 until SCREENLOCK and
-      // SCREENUNLOCK became real opcodes (subs 66/67), and the failure is not a compile error - it is
-      // "Unknown/illegal opcode $0A42" the first time a program executes one.
-      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + 68:   // ⚠️ +68 since bcGfxCircleExF; the range
-                                                             // is written out, so a new sub-op needs it
+      // ✅ 1 Sep 2026: these upper bounds are no longer written out here. Every range ends at its
+      // group's DENSE_*_SIZE, the same constant the dense base ladder is built from, so widening a
+      // group is ONE edit in SedaiOpcodeTable.pas and this dispatch follows. It used to be a second
+      // hand-kept counter with NO compile-time check of any kind: too narrow and everything built,
+      // then the program died at run time with "Unknown/illegal opcode $0A42" - which is how
+      // SCREENLOCK/SCREENUNLOCK (subs 66/67) and bcGfxCircleExF (sub 68) each cost a debugging round.
+      DENSE_GRAPHICS_BASE + 0 .. DENSE_GRAPHICS_BASE + DENSE_GRAPHICS_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteGraphicsOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
-      DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + 5:
+      DENSE_SOUND_BASE + 0 .. DENSE_SOUND_BASE + DENSE_SOUND_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteSoundOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
-      // ⚠️ Same warning as the graphics range above: nothing checks this at compile time. Widen it
-      // whenever group 12 grows, or the new opcode builds fine and dies at run time.
-      DENSE_BIGINT_BASE + 0 .. DENSE_BIGINT_BASE + 12:
+      DENSE_BIGINT_BASE + 0 .. DENSE_BIGINT_BASE + DENSE_BIGINT_SIZE - 1:
         begin Ctx.PC := CurPC; ExecuteBigIntOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
 
       // === Core VM operations (group 0, dense == 16-bit value) - inline for performance ===
-      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + 170:
+      DENSE_CORE_BASE + 0 .. DENSE_CORE_BASE + DENSE_CORE_SIZE - 1:
           case Op of
         // Load constants - very common
         bcLoadConstInt: begin IntRegs[Instr^.Dest] := Instr^.Immediate; Inc(CurPC); end;
