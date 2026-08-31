@@ -14202,7 +14202,16 @@ begin
     //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
     37: // bcArrayLoadIndInt
       begin
+        // ⛔ AN ELEMENT INDEX IS RELATIVE TO THE ARRAY'S LOWER BOUND, and a member array used to be
+        // documented as "0-based (v1), so no lower-bound subtraction is needed" - true only while
+        // nothing could give one a non-zero bound. "ReDim obj.field(3 To 5)" now can (the member arm
+        // of ProcessRedim threw its lower bound away until 1 Sep 2026), so the subtraction is real.
+        // ⭐ It belongs HERE and not in the SSA: this opcode already holds the descriptor, so it costs
+        // one read and one subtract instead of two extra instructions per access - and it is the
+        // identity for every array whose lower bound is 0, which is all of them today.
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].IntData[LinearIdx]
         else
@@ -14211,6 +14220,8 @@ begin
     38: // bcArrayLoadIndFloat
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
         else
@@ -14219,6 +14230,8 @@ begin
     39: // bcArrayLoadIndString
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
         else
@@ -14227,18 +14240,24 @@ begin
     40: // bcArrayStoreIndInt (Dest = value register, READ)
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
       end;
     41: // bcArrayStoreIndFloat (Dest = value register, READ)
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
       end;
     42: // bcArrayStoreIndString (Dest = value register, READ)
       begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
           FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
       end;
@@ -14252,7 +14271,11 @@ begin
             ProdDims := 1;
             for ArrLowerBound := i + 1 to High(FArrays[PtrAddr].Dimensions) do
               ProdDims := ProdDims * FArrays[PtrAddr].Dimensions[ArrLowerBound];
-            LinearIdx := LinearIdx + FIdxPending[i] * ProdDims;
+            // ...and the same subtraction per dimension, for the same reason as the element opcodes.
+            ArrLowerBound := 0;
+            if i <= High(FArrays[PtrAddr].LowerBounds) then
+              ArrLowerBound := FArrays[PtrAddr].LowerBounds[i];
+            LinearIdx := LinearIdx + (FIdxPending[i] - ArrLowerBound) * ProdDims;
           end;
         Ctx.IntRegs[Instr.Dest] := LinearIdx;
         SetLength(FIdxPending, 0);

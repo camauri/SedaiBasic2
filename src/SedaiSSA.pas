@@ -12974,7 +12974,20 @@ begin
       for di := 0 to DimsNode.ChildCount - 1 do
       begin
         DimChild := DimsNode.GetChild(di);
-        if DimChild.NodeType = antDimRange then DimExpr := DimChild.GetChild(1) else DimExpr := DimChild;
+        // ⛔ THE LOWER BOUND OF A MEMBER ARRAY WAS THROWN AWAY. "ReDim obj.field(3 To 5)" pushed only
+        // child 1 - the upper bound - so LBound answered 0 and every index was off by the lower bound.
+        // The module-array arm beside it has read both since it was written; this is the same rule in
+        // one path and not its twin. Pushed with bit0 set, which is how bcArrayRedimPush files a
+        // RUNTIME lower bound for bcMemberArrayRedim to consume.
+        if DimChild.NodeType = antDimRange then
+        begin
+          ProcessExpression(DimChild.GetChild(0), UbValue);
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(UbValue),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(1));
+          DimExpr := DimChild.GetChild(1);
+        end
+        else
+          DimExpr := DimChild;
         ProcessExpression(DimExpr, UbValue);
         UbReg := EnsureIntRegister(UbValue);
         EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -38706,9 +38719,9 @@ procedure TSSAGenerator.EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; U
 // source. Using UDTIdx's field set (the static LHS type) gives correct slicing when the source is a
 // subtype: only the LHS type's prefix fields are copied.
 var
-  i, NestedUDT, Slot: Integer;
+  i, NestedUDT, Slot, d, ArrDims: Integer;
   Bank: TSSARegisterType;
-  Tmp, DNest, SNest: TSSAValue;
+  Tmp, DNest, SNest, DimReg, BndReg: TSSAValue;
   LoadOp, StoreOp: TSSAOpCode;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
@@ -38725,6 +38738,42 @@ begin
       EmitInstruction(ssaRecordLoadInt, DNest, DestHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
       SNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordLoadInt, SNest, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      // ⛔⛔ A DYNAMIC MEMBER ARRAY HAS NO STORAGE UNTIL SOMETHING SIZES IT, and the copy below has
+      // nowhere to put the source's elements: "array(Any) As MyClass" gives the destination record a
+      // field holding handle 0, so "b = a" copied nothing and left UBound(b.array) at -1 where fbc
+      // answers the source's bound - and the first "b.array(0).i" was an Access Violation.
+      // ⚠️ A FIXED-bound member array does not show it: EmitRecordInit allocated the destination's
+      // storage at construction, so that half worked and the two halves read as one working rule.
+      // ⇒ Give the destination the SOURCE's shape first, with the machinery a "ReDim obj.field(...)"
+      // already uses: push the source's bounds (read by HANDLE, so they are the runtime ones), then
+      // ssaMemberArrayRedim, which allocates the field's FArrays entry lazily and sizes it.
+      // ⚠️ THE RANK, NOT THE BOUNDS. ArrayBounds is nil for an "Any"-bounded member (ConcreteArrayBounds
+      // declines what it cannot fold), and an "Any" member is exactly the case that needs this - so
+      // gating on the bounds made the whole arm dead. ArrayDimCount is the declared rank and is there
+      // for both.
+      begin
+        ArrDims := FUDTs[UDTIdx].Fields[i].ArrayDimCount;
+        if ArrDims < 1 then ArrDims := 1;
+        for d := 0 to ArrDims - 1 do
+        begin
+          DimReg := EnsureIntRegister(MakeSSAConstInt(d));
+          BndReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaArrayLBoundInd, BndReg, SNest, DimReg, MakeSSAValue(svkNone));
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), BndReg,
+                          MakeSSAValue(svkNone), MakeSSAConstInt(1));   // bit0 = it is a LOWER bound
+          BndReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaArrayUBoundInd, BndReg, SNest, DimReg, MakeSSAValue(svkNone));
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), BndReg,
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        // Immediate packs (slot<<8) | (elemType<<4) | preserve, as ProcessRedim's member arm does.
+        EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), DestHandle, MakeSSAValue(svkNone),
+                        MakeSSAConstInt((Int64(Slot) shl 8) or
+                                        (Int64(Ord(FUDTs[UDTIdx].Fields[i].ArrayElemBank)) shl 4)));
+        // The redim may have CREATED the entry, so the handle loaded above is stale: read it back.
+        DNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordLoadInt, DNest, DestHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      end;
       NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].ArrayElemType);
       if NestedUDT >= 0 then
         // Array-of-UDT member: copy element-wise into the destination's OWN element records (each element
