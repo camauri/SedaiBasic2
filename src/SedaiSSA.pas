@@ -936,6 +936,8 @@ type
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
+    function IsFieldAddrExpr(Node: TASTNode): Boolean;                  // "@obj.field" over a MANAGED record (no emit)
+    function RecPtrWireWidth(const Pointee: string): Integer;           // record-field pointer's low 4 bits for this pointee (-1 = leave alone)
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
@@ -2118,6 +2120,61 @@ begin
   else Result := 0;
 end;
 
+function TSSAGenerator.IsFieldAddrExpr(Node: TASTNode): Boolean;
+// Is this expression "@obj.field" over a MANAGED record - the one shape that produces a RECORD-FIELD
+// pointer at a place the compiler can see it? Parentheses and pointer CASTS are transparent: a cast
+// reinterprets the type, it never changes which kind of address the value is.
+//
+// ⛔ AND IT MUST EXCLUDE THE RAW BASE, which is the same question the "@" lowering itself asks one
+// line before it reaches EmitFieldAddress. "@h->field" where h holds a RAW address is a BYTE address,
+// not a packed (handle, offset|width) pair - m743 gave that half its own rule - so re-stamping a width
+// code into it ORs one into a byte address. Measured immediately: the m743 guard answered 0 where it
+// must answer 127. ⇒ The predicate asks ResolveRawUDTBase, the same no-emit resolver
+// TryRawUDTFieldAddress gates on, so the two cannot disagree about which kind of address this is.
+var
+  TypeName: string;
+  UDTIdx: Integer;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+  BaseNode, IdxNode, ChainNode: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while ((Node.NodeType = antParentheses) or (Node.NodeType = antCast)) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if not ((Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antMemberAccess)) then Exit;
+  if ResolveRawUDTBase(Node.GetChild(0).GetChild(0), TypeName, UDTIdx, Offsets, TotalSize,
+                       BaseNode, IdxNode, ChainNode) then Exit;      // raw base: a byte address
+  Result := True;
+end;
+
+function TSSAGenerator.RecPtrWireWidth(const Pointee: string): Integer;
+// The 4-bit WIRE width code a record-field pointer carries in its low bits, for this pointee type, or
+// -1 when the pointee says nothing about storage width (a UDT, a string, a pointer).
+//
+// ⭐ It is the same B1.5 code ComputeUDTLiveLayout stamps into TUDTField.Slot, put through the same
+// three-line normalisation: 8 (unsigned-64) is not on the wire because it says something about the
+// declared TYPE and nothing about the storage, and 9/10 are INT32/UINT32 by another name.
+//   0 = the full eight bytes · 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 7=single
+var
+  T: string;
+  W: Integer;
+begin
+  Result := -1;
+  T := UpperCase(Trim(Pointee));
+  if T = '' then Exit;
+  // A pointee that is not a builtin scalar leaves the field's own width alone.
+  if (T = 'INTEGER') or (T = 'UINTEGER') or (T = 'LONGINT') or (T = 'ULONGINT') or
+     (T = 'DOUBLE') or (T = 'ANY') then Exit(0);
+  W := TypeNameWidthCode(T);
+  if W = 0 then Exit(-1);
+  if W = 8 then W := 0
+  else if W = 9 then W := 5
+  else if W = 10 then W := 6;
+  Result := W and $F;
+end;
+
 function RawCodeOfWidth(Bytes: Integer): Integer;
 // The unsigned raw element-type code for an access of this many bytes. It exists so that a site which
 // SCALES an index by a width cannot then read or write a DIFFERENT width - the two used to be written
@@ -2565,6 +2622,8 @@ end;
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
   DerefElemBytes: Integer;   // width of one element behind "(*p)[i]" - see DerefZStringByteAddr
+  CastW: Integer;            // record-field pointer width code a pointer CAST re-stamps (DIVERGENZE 102)
+  CastMasked, TempV: TSSAValue;
   ThisFieldNode: TASTNode;   // synthesized "this.<field>" for an implicit-THIS subscript
   ImplicitCallNode: TASTNode;  // synthesized "this.<field>(args)" for an implicit-THIS funcptr call
   Left, Right: TSSAValue;
@@ -3038,7 +3097,35 @@ begin
       end;
       ProcessExpression(Node.GetChild(0), Left);
       if (Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR') then
-        Result := EnsureIntRegister(Left)                   // pointer cast: value passthrough
+      begin
+        Result := EnsureIntRegister(Left);                  // pointer cast: value passthrough
+        // ⛔ ...EXCEPT OVER A RECORD-FIELD POINTER, WHERE THE WIDTH IS PART OF THE VALUE. Such a
+        // pointer is (handle, byteOffset<<4 | widthCode), and the width code is the FIELD's - so
+        // "*Cast(Byte Ptr, @rec.l) = 0" wrote all eight bytes of a LongInt field where fbc writes one.
+        // A record's storage IS a flat byte image (TRecordStorage.Bytes, fields at their true offsets)
+        // and RecFieldInt/RecSetFieldInt already read and write at the code's width, so nothing was
+        // missing but the cast telling them which width it meant. DIVERGENZE 102.
+        // ⚠️ The READ looked right and was right by ACCIDENT: "*Cast(Byte Ptr, @rec.l)" narrowed the
+        // eight-byte VALUE to a byte, which equals byte 0 on a little-endian image and equals nothing
+        // at any other offset. [[a-probe-whose-numbers-can-coincide-is-not-a-probe]]
+        if IsFieldAddrExpr(Node.GetChild(0)) then
+        begin
+          CastW := RecPtrWireWidth(Trim(Copy(ArrName2, 1, Length(ArrName2) - 4)));
+          if CastW >= 0 then
+          begin
+            TempV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, TempV, MakeSSAConstInt(not Int64($F)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            CastMasked := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseAnd, CastMasked, Result, TempV, MakeSSAValue(svkNone));
+            TempV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, TempV, MakeSSAConstInt(CastW),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseOr, Result, CastMasked, TempV, MakeSSAValue(svkNone));
+          end;
+        end;
+      end
       else if (ArrName2 = 'DOUBLE') then
         Result := EnsureFloatRegister(Left)
       else if (ArrName2 = 'SINGLE') then
@@ -25922,6 +26009,23 @@ begin
           ((Node.GetChild(0).NodeType = antMemberAccess) and
            (UDTFieldBankOf(Node.GetChild(0)) = srtString))) then
         Result := 3
+      // ⭐ "Cast(<T> Ptr, x)[i]": the ELEMENT is a T, so an unsigned narrow one prints with no sign
+      // column - the same rule the deref "*Cast(UByte Ptr, x)" and the value cast "Cast(UByte, x)"
+      // already follow. Written out, this spelling reached none of them: the cast's own type is
+      // "UBYTE PTR", whose width code is 0, and the array-access arm asked only about strings and
+      // member arrays. So the same byte printed " 222" here and "222" through a pointer VARIABLE
+      // declared As UByte Ptr - two spellings of one read disagreeing about a column.
+      else if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+              (Node.GetChild(0).NodeType = antCast) then
+      begin
+        Txt := UpperCase(Trim(VarToStr(Node.GetChild(0).Value)));
+        if (Length(Txt) >= 4) and (Copy(Txt, Length(Txt) - 3, 4) = ' PTR') then
+        begin
+          AwCode := TypeNameWidthCode(Trim(Copy(Txt, 1, Length(Txt) - 4)));
+          if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+          else if AwCode = 8 then Result := 2;
+        end;
+      end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
         // obj.field(i) member-array element: the field's own narrow width says whether it prints unsigned
@@ -37876,17 +37980,36 @@ begin
   BaseVal := EnsureIntRegister(BaseVal);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxVal := EnsureIntRegister(IdxVal);
-  IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode);
-  if IsRaw then
+  // ⛔ A RECORD-FIELD POINTER INDEXES INTO ITS BYTE OFFSET, NOT INTO ITS VALUE. Its low four bits are
+  // the WIDTH CODE, so adding the index raw walked the width instead of the address:
+  // "Cast(UByte Ptr, @rec.l)[1]" moved the code from u8 to s16 and answered a 16-bit read of the same
+  // two bytes (-16162) where fbc answers byte 1 (192). The step is i * SizeOf(pointee) shifted into the
+  // OFFSET field, which leaves the width code exactly where the cast put it. DIVERGENZE 102.
+  if IsFieldAddrExpr(RawSrcNode) then
   begin
+    IsRaw := False;
     Sz := RawElemSizeOfPointee(Pointee);
-    if Sz > 1 then
+    if Sz < 1 then Sz := 1;
+    SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(Sz * 16), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
+    IdxVal := ScaledIdx;
+  end
+  else
+  begin
+    IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode);
+    if IsRaw then
     begin
-      SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(Sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
-      IdxVal := ScaledIdx;
+      Sz := RawElemSizeOfPointee(Pointee);
+      if Sz > 1 then
+      begin
+        SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(Sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
+        IdxVal := ScaledIdx;
+      end;
     end;
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
