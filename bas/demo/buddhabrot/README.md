@@ -76,13 +76,15 @@ Measured on this machine (AMD, Linux, single thread), tracing two million orbits
 | JIT | 0.92 | 2 180 000 | 2.7× |
 | AOT | 0.61 | 3 260 000 | **4.1×** |
 
-Live, in a five-second run with the picture being repainted twenty times a second:
+Live, in a six-second run. The left-hand column is the point: it does **not** move.
 
-| engine | orbits traced in 5 s |
-|---|---:|
-| bytecode interpreter | 3 739 904 |
-| JIT | 10 027 008 |
-| AOT | 12 442 368 |
+| engine | frames per second | orbits traced in 6 s |
+|---|---:|---:|
+| bytecode interpreter | 19 | 4 467 712 |
+| JIT | 19 | 12 109 568 |
+| AOT | 19 | 14 884 608 |
+
+The demo prints both numbers when it exits, so this table can be reproduced rather than believed.
 
 The live ratio is smaller than 4.1× on purpose and not by accident: repainting the window costs about
 the same in every engine — it is one `PSet` per pixel, and `PSet` is not where the engines differ —
