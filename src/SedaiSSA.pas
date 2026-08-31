@@ -928,6 +928,7 @@ type
     function FuncPtrTypeSig(const TypeName: string): string;  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
     function IndexedFuncPtrSig(BaseNode: TASTNode): string;   // signature of the funcptr at "p[j]" / "a(i)[j]", '' if none
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
+    function UDTExtendsUDT(const DerivedName, BaseName: string): Boolean;  // reaches it through EXTENDS
     procedure CheckMemberAccess(const TypeName, MemberName: string);        // OOP: refuse an illegal member access
     procedure CheckInheritedCtorDtorAccess(const TypeName, MemberName: string);  // ...for the one a DERIVED type reaches implicitly
     function UDTFieldBankSlot(UDTIdx: Integer; const FieldName: string;
@@ -23342,9 +23343,21 @@ begin
       // the EXPLICIT "an = Cast(LivingThing, dg)"), which is what showed the gap was the CHAIN.
       // The machinery is TryEmitUDTCastToUDT, which the explicit spelling already reaches; the
       // argument is wrapped in that cast and the ordinary call does the rest.
-      if (FindUDT(RhsType) < 0) or (not UDTCastsToUDT(RhsType, ParamType)) then Exit;
-      ConvNode := TASTNode.CreateWithValue(antCast, ParamType, VarNode.Token);
-      ConvNode.AddChild(ExprNode.Clone);
+      // ⛔ ...AND A DERIVED TYPE REACHES ITS BASE WITH NO CONVERSION AT ALL, which is what EXTENDS
+      // means: "Type TW Extends TU" makes a TW an acceptable operand for "Operator TU.Let( ByRef As TU )".
+      // Read as "that very type, or one with a CAST to it", the whole path declined and the assignment
+      // fell through to a memberwise copy that never ran the user's Let - and where the Let is what
+      // keeps an owned buffer unshared, that is a silent aliasing bug rather than a wrong number.
+      // ⚠️ It hides behind the SAME-type case: "w = w2" between two TWs also lands on the inherited
+      // TU.Let, so the operator LOOKS reachable from a derived type while it is not.
+      if UDTExtendsUDT(RhsType, ParamType) then
+        ConvNode := nil                                 // no wrapper: the handle is already acceptable
+      else
+      begin
+        if (FindUDT(RhsType) < 0) or (not UDTCastsToUDT(RhsType, ParamType)) then Exit;
+        ConvNode := TASTNode.CreateWithValue(antCast, ParamType, VarNode.Token);
+        ConvNode.AddChild(ExprNode.Clone);
+      end;
     end;
   end
   else if RhsType <> '' then
@@ -27075,6 +27088,27 @@ begin
       Exit(FUDTs[Idx].Node.Attributes.Values['ACCESS' + m]);
     end;
     T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.UDTExtendsUDT(const DerivedName, BaseName: string): Boolean;
+// Does DerivedName reach BaseName through EXTENDS? An implicit up-conversion needs no operator at all:
+// a derived instance IS a base one, the base fields sitting at the same offsets by the prefix layout.
+var
+  T: string;
+  Idx, Guard: Integer;
+begin
+  Result := False;
+  if (DerivedName = '') or (BaseName = '') then Exit;
+  T := UpperCase(DerivedName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    if T = UpperCase(BaseName) then Exit(True);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := UpperCase(FUDTs[Idx].Parent);
     Inc(Guard);
   end;
 end;
