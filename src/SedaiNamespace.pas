@@ -881,6 +881,19 @@ begin
             DeclNd.Value := Qual + Copy(V, Pos('.', V), MaxInt) + SigV;
             Continue;
           end;
+          // ⛔ ...AND THE HEAD MAY BE A TYPE RATHER THAN A NAMESPACE. "Dim As T1.T2 x" names a NESTED
+          // type, and ResolveNamespacePrefix answers '' for it - T1 is not a namespace - so the slot
+          // stayed spelled T1.T2 while the type is registered as NS.T1.T2. The METHOD path one screen
+          // down has always asked both questions (IsMember for a type, NamespaceNames for a namespace);
+          // this one asked only the second. The cost: inside a namespace, every method of a NESTED type
+          // was a silent NO-OP - "x2.p1( y1 )" ran nothing at all while the outer type's methods ran -
+          // because the object's type and the method's owner were two different names.
+          if (ChildPrefix <> '') and
+             Ctx.IsMember(ChildPrefix, Copy(V, 1, Pos('.', V) - 1)) then
+          begin
+            DeclNd.Value := ChildPrefix + '.' + V + SigV;
+            Continue;
+          end;
         end;
       end;
     end;
