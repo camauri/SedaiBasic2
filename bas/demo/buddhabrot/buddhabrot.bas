@@ -452,10 +452,12 @@ Dim As Double paintSeconds = 0.010
 Dim As Double startedAt = Timer
 Dim As Double orbitsPerSecond = 0.0
 Dim As Integer paused = 0
+Dim As LongInt framesDrawn = 0
 Dim As String  key
 
 Do
   Dim As Double frameStart = Timer
+  framesDrawn = framesDrawn + 1
 
   If paused = 0 Then
     Dim As Double sampleBudget = TARGET_FRAME_SECONDS - paintSeconds
@@ -504,8 +506,13 @@ Loop
 
 WritePortablePixmap(outputName)
 Print
+Dim As Double ranFor = Timer - startedAt
 Print "orbits traced     : "; orbitsTraced
 Print "orbits per second : "; Int(orbitsPerSecond)
+'' The frame rate is the thing this demo holds CONSTANT, so it is worth printing: it should come out
+'' near the same number on every engine, while the orbit count above should not.
+Print "frames drawn      : "; framesDrawn
+If ranFor > 0.0 Then Print "frames per second : "; Int(framesDrawn / ranFor)
 Print "written           : "; outputName
 
 
