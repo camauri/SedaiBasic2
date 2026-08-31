@@ -41,10 +41,13 @@ SedaiBasic2 began as a reimplementation of Commodore BASIC v7 and is now a langu
   so the palette is 256 RGBA entries where v7 had sixteen fixed colours, sprites go to 256×256 and
   full colour against the C128's fixed 24×21, there are twelve video modes plus a dynamic one, and
   the audio is our own engine, in the reSID lineage, well past the chip it descends from.
-- **MODERN**: line-number-free, from FreeBASIC. Compatibility is measured (**566 / 645** of
-  FreeBASIC's keywords; 60+ unmodified Rosetta Code programs run as-is) and it is worth a great deal,
-  but it is a *property, not a definition*: MODERN has commands FreeBASIC does not, and departs from
-  it where FreeBASIC is demonstrably wrong.
+- **MODERN**: line-number-free, from FreeBASIC. Compatibility is measured (**567 / 567** of the
+  keywords a bytecode VM can implement — of the 634 in FreeBASIC's manual, 63 are properties of a
+  native compiler and 4 are punctuation-only names; 60+ unmodified Rosetta Code programs run as-is).
+  ⚠️ That figure counts which keywords EXIST here, not how each behaves: FreeBASIC's own test suite
+  and the manual-example sweep measure that, and BASIC.md carries both alongside it.
+  It is worth a great deal, but it is a *property, not a definition*: MODERN has commands FreeBASIC
+  does not, and departs from it where FreeBASIC is demonstrably wrong.
 
 > **Neither dialect is a clone, and the two are not the same kind of thing.** CLASSIC keeps a
 > language and replaces the machine, necessarily, since the machine is gone. MODERN keeps a language

@@ -8,16 +8,52 @@
 [████████████████████████████████████████████████··] 96%
 ```
 
-**FreeBASIC compatibility — 566 / 645 of FreeBASIC's keywords (88%)**. ⚠️ Read this as a
-*compatibility measure*, not a completion score: MODERN is SedaiBasic's own dialect, and this number
-says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists. **58** of the
-unimplemented entries are **N/A** (compiler-internal `__FB_*` defines, native linkage/ABI, variadic C
-calling, dynamic linking, build/platform directives) — not runnable keywords for a portable bytecode
-VM, and every one of them is a property of the TARGET, not a decision about a feature. Of the
-**599 applicable** keywords, **28** N/A rows remain and **7** are partial (◐) — the count moved on
-28 Aug 2026 when the shelf itself was audited rather than read: of 58 rows marked N/A, **23** turned
-out to be implemented or one table entry away, and eleven compile-mode defines were seeded the same
-day (`m630`).
+**FreeBASIC compatibility — 567 / 567 of the keywords a bytecode VM can implement (100%)**
+
+```
+[##################################################] 100%   keywords implementable on a VM
+```
+
+Of the **634** keywords in FreeBASIC's manual index, **63** are properties of a NATIVE COMPILER rather
+than of the language — build identity, linkage and calling conventions, the C varargs ABI, x86
+assembly, linker and platform directives — and have no counterpart on a portable bytecode VM; **4**
+more are punctuation-only names that no recognition pass can probe, only an example can. That leaves
+**567 genuinely implementable, and all 567 are implemented.**
+
+⚠️⚠️ **AND THAT NUMBER COUNTS NAME RECOGNITION, NOT BEHAVIOUR — read it with the next three.** Of the
+567, the manual's own example says:
+
+| | | |
+|---:|---|---|
+| **331** | verified | its example's output matches `fbc` |
+| **199** | **unverified** | NO example has ever exercised it — the blind spot |
+| **32** | differs | the example does NOT match: a bug, or a divergence declared below |
+
+So "100%" answers *which keywords exist here*, and nothing else. How exactly each one behaves is the
+open work, and it is measured elsewhere: the manual-example sweep and FreeBASIC's own test suite.
+
+⚠️ Read the headline as a *compatibility measure*, not a completion score: MODERN is SedaiBasic's own
+dialect, and it says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists.
+
+### How each keyword BEHAVES — the two nets that measure it (1 Sep 2026)
+
+**The FreeBASIC manual's own examples**, compiled and run side by side with `fbc` and diffed:
+**545 match** byte for byte, **3 differ** (all three declared below), 15 are missing a feature that is
+structural here, 10 declare another dialect.
+
+**FreeBASIC's own test suite** — 2 466 files, at the tag matching the oracle. It answers three
+different questions and they do not add up, so they are kept apart:
+
+| question | today |
+|---|---|
+| accept what `fbc` accepts | **319 / 320** |
+| of the runtime tests, pass EVERY assertion | **427 / 655** |
+| reject what `fbc` rejects | **572 / 1 238** |
+
+⛔ **There is no single percentage here, and one must not be invented.** The suite's own target is one
+executable that exits 0 only if every assertion of every test holds, so a sum of "passes" and "runs but
+answers wrong" is nobody's measure. The third row is the weakest on purpose: every refusal added risks
+refusing a VALID program too, so one is added only where the oracle proves it.
 
 > ⛔⛔ **N/A IS THE EASIEST SHELF TO PUT SOMETHING ON, AND IT REMOVES IT FROM THE DENOMINATOR.** Three
 > rows sat there — `New Overload`, `Delete Overload`, `Placement New` — behind one sentence: "records
@@ -179,7 +215,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `type<T>(args)` / `T(args)` / `= (a,b,c)` | ✓ | Anonymous UDT temporary with an explicit type; aggregate/tuple initialisation of a constructor-less UDT, including array-of-UDT `{(a,b), (c,d)}` |
 | `OPTION BASE 1` | ✓ | Default lower bound for a bare-upper-bound array `DIM a(n)` → `a(1..n)` |
 | `OPTION DIGITS n\|EXACT` | ✓ | Significant digits `PRINT` shows for a float; `EXACT`/`ALL` = every digit the value has (**SedaiBasic extension**, no FreeBASIC equivalent — see [Numeric output](#numeric-output-and-option-digits-sedaibasic-extension)) |
-| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type. ⚠️ A SedaiBasic extension: `fbc` 1.10.1 refuses this spelling (`error 17`) — see `job/markdown/DIVERGENZE.md`. |
+| `ENUM [name] AS <type>` | ✓ | ENUM with an explicit (advisory) underlying integer type. ⚠️ A SedaiBasic extension: `fbc` 1.10.1 refuses this spelling (`error 17`) — a declared divergence. |
 | `LPRINT` / `LPOS(n)` | ✓ | Line-printer output (routed to stdout) / head column (always 1 — no printer) |
 | `SETENVIRON` / `ENVIRON$` | ✓ | Set / read an environment variable (SETENVIRON sets a VM-internal override) |
 | `SHELL cmd` | ✓ | Run a command via the platform shell (cmd.exe / /bin/sh); returns the exit code |
@@ -224,6 +260,12 @@ difference is stated rather than left to be discovered.
 | `With` … `End With` | `With This.FEnv` / `.Attack = 0.001` | FB. Member access shorthand, in read and write. |
 
 ### Declared divergences from FreeBASIC
+
+> This section is the published list: what SedaiBasic does differently from FreeBASIC on purpose, and
+> why. The project also keeps an internal working ledger of every difference still under investigation
+> — one entry per defect, with its measurement and its next move — but that is a work file and is not
+> part of the repository. Anything settled enough to rely on is written here.
+
 
 **Pointer arithmetic and the numeric value of a pointer.** A pointer obtained from `Allocate`,
 `SAdd`, `StrPtr` or `ScreenPtr` is a byte address and steps by `SizeOf(pointee)`, exactly as in
@@ -376,14 +418,14 @@ double) through an integer pointer.
   program cannot silently use something inert. Two things bear on it:
   - `INP`/`OUT` are the **x86** `in`/`out` instructions. On ARM — a Raspberry Pi, an RP2040 — there is
     no separate I/O space at all: hardware is memory-mapped, so the seam there is `PEEK`/`POKE`
-    through `IMemoryMapper`, which already exists and is what `job/docs/PICO_ARCHITECTURE.md` plans.
+    through `IMemoryMapper`, which already exists and is what the MCU-target design calls for.
     Implementing `INP` for those targets would mean *inventing* a meaning the CPU has not.
   - the only part of this family that **is** portable is the emulated palette below, and that one is
     specified rather than guessed.
   ⛔ Also not implemented: `fbc`'s graphics library hooks `&h3C7`/`&h3C8`/`&h3C9` while a graphics
   mode is up, to emulate QB's VGA palette — those three are not hardware. The manual calls that use
   deprecated and no example in the FreeBASIC distribution uses it; the measured protocol is written
-  out in `job/tests/bas/hw_ports_no_access.bas` so implementing it later needs no new measurement.
+  out in the project's own probe corpus, so implementing it later needs no new measurement.
 - ⚠️ **Keyboard input on the headless Linux build**: `TTerminalInput.ProcessEvents` is implemented for
   Windows only, so under `sb` on Unix no key can ever reach `INKEY` / `GETKEY` from a real terminal.
   ⭐ This is *not* observable as a divergence — fbc's `INKEY` reads the console, not stdin, so with
@@ -1872,7 +1914,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `STRING` | ✓ | Variable-length strings (`DIM AS STRING`); fixed-length `STRING * n` is parsed (advisory length). |
 | `ZSTRING` | ✓ | Null-terminated string type (`DIM AS ZSTRING [* n]`); `ZSTRING PTR` is a raw pointer to a string's bytes (see `SADD`). |
 | `WSTRING` | ✓ | Wide-character strings (UTF-8 storage, codepoint-aware LEN/MID/LEFT$/RIGHT$). Fixed-length `* n` parsed but advisory (var-length storage). |
-| var-len `STRING` initializer | ✓ | A var-len `STRING` **scalar** with STATIC storage (`SHARED`, `STATIC`, a `NAMESPACE` member, a dotted member definition, or a name a module-level `EXTERN` declared) may not be initialized, as `fbc` requires (`error 87`). A bare module-level `DIM s AS STRING = ...` is a local of the implicit main and IS allowed, as in `fbc`. ⚠️ The ARRAY form is still accepted where `fbc` refuses it — see `job/markdown/DIVERGENZE.md`. |
+| var-len `STRING` initializer | ✓ | A var-len `STRING` **scalar** with STATIC storage (`SHARED`, `STATIC`, a `NAMESPACE` member, a dotted member definition, or a name a module-level `EXTERN` declared) may not be initialized, as `fbc` requires (`error 87`). A bare module-level `DIM s AS STRING = ...` is a local of the implicit main and IS allowed, as in `fbc`. ⚠️ The ARRAY form is still accepted where `fbc` refuses it — a declared permissiveness. |
 
 ##### Class types
 
@@ -2210,27 +2252,27 @@ bits, operates on them and writes them back, as `Cast( UInteger, i ) Shr= 1` alr
 permissive than fbc by one step: fbc accepts only the conversion that REINTERPRETS and answers
 `error 24` when it changes the SIZE (`CLng( i ) *= 3`, `CByte( w ) += 0` on a 64-bit variable); we
 accept those and write back through the narrow width. `CPtr`, `CSign` and `CUnsg` are not lvalue
-targets in either. Declared in `job/markdown/DIVERGENZE.md`.
+targets in either. Declared.
 
 🎯 **`#IF` reads a constant the SOURCE declares** — a module `Const` and, since 29 August 2026, an
 `Enum` member (numbered from 0, restarted by an explicit `= <integer literal>`). ⚠️ Conservative by one
 step: a member whose initialiser is an EXPRESSION (`M2 = M1 + 4`) is not folded here — fbc folds it,
 because its preprocessor and its parser are one pass — so it keeps the evaluator's `0` and the
-numbering of that enum stops there. Declared in `job/markdown/DIVERGENZE.md`.
+numbering of that enum stops there. Declared.
 
 🕳️ **A second known gap, measured 29 August 2026:** two `Namespace` bodies that declare a type with
 the SAME simple name collide — the namespace is not part of the type's identity, so both destructors
 are filed under one label and *neither* runs (fbc runs both). Different type names in the two
-namespaces work. Reproduction and what it needs in `job/markdown/DIVERGENZE.md`.
+namespaces work. Its reproduction and what it would take are kept with the project's internal ledger.
 
 🕳️ **A known gap beside it, measured 29 August 2026:** inside a `Namespace` body, FreeBASIC lets
 **147** more of its own keywords name a procedure than we do (`Sub print()` is a duplicate definition
 at module level and legitimate inside a namespace, where it is called as `N.print`). We reserve
 keywords the same way everywhere. No test in fbc's suite depends on it yet; the census and the risk
-are written up in `job/markdown/DIVERGENZE.md`.
+are kept with the project's internal ledger.
 
 🕳️ **Five gaps measured and named on 30 August 2026**, each reduced to a probe and written up in
-`job/markdown/DIVERGENZE.md`:
+the internal ledger:
 * a forward `Declare` **above** a `Using` does not claim the name for the program (the parser emits no
   node for a forward declare, so the only position the name has is its body's, below the import);
 * an outer variable of another BANK comes back with a typed `For` counter's print form
@@ -2248,10 +2290,10 @@ are written up in `job/markdown/DIVERGENZE.md`.
 🎯 **One declared divergence, and it is a step of lag we do not reproduce.** fbc answers
 `defined( field )` **false** on the line immediately after `field As Integer`, and true as soon as
 another member follows — while the qualified form `defined( T.field )` answers true straight away. We
-answer true in both. No fbc test depends on the lag; see `job/markdown/DIVERGENZE.md`.
+answer true in both. No fbc test depends on the lag.
 
 ⚠️ The list of reserved words is an **inventory read off the oracle**, not a list reasoned out:
-`src/FbReservedWords.inc` (366 words) is regenerated by `job/tests/tools/fb_reserved_words.sh`, which
+`src/FbReservedWords.inc` (366 words) is regenerated by a project tool, which
 asks fbc itself in a single compile. It moves the day the oracle moves.
 
 ##### Text Replacement
@@ -3349,7 +3391,7 @@ Each of these is *refused with a message that names the reason*, never answered 
   and reserving the same name twice at the same block level is refused. ⚠️ Still **not** enforced: fbc
   also REFUSES a module-level declaration of an unqualified reserved name (`error 4` / `error 325`),
   and `#pragma reserve (…)` outside module level. Both need the parser and are listed in
-  `job/markdown/DIVERGENZE.md`.
+  the project's internal ledger.
 - **Reading fbc's own RTTI block through raw pointers**, as the manual's `proguide/*rtti_info`
   examples do (`CPtr(Any Ptr Ptr Ptr, po)[0][-1]` walks the vtable to the type-info record, then its
   base chain and mangled name). That is fbc's object ABI, and this VM has none to expose: an instance
