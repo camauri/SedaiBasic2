@@ -720,6 +720,34 @@ begin
     end;
   end;
 
+  // ⛔ ...AND SO IS THE TYPE A "FOR" HEAD DECLARES, which is the SECOND attribute this rewrite could
+  // not see. "For cnt As T = a To b" keeps T in the VARTYPE attribute, not in a child node, so inside a
+  // namespace it stayed spelled the way it was written while the type is registered as "NS.T".
+  // FindUDT then answered -1, the whole Operator For/Step/Next expansion was skipped in SILENCE, and
+  // the loop fell to the numeric path: the counter became an ordinary integer and "cnt.x" in the body
+  // read whatever register happened to be there.
+  // ⭐ The OTHER spelling of the same loop was right the whole time - "Dim As T c : For c = a To b"
+  // takes its type from the variable, which the declaration rewrite had already qualified. One loop,
+  // two spellings, and only the one that names the type in the head was wrong.
+  // ⚠️ Same shape as the ALIAS attribute just above, found the same day: when a rewrite cannot find a
+  // name, ask whether that name is an ATTRIBUTE rather than a child.
+  if (Node <> nil) and (Node.NodeType = antForLoop) and (Ctx <> nil) and
+     (Node.Attributes.Values['VARTYPE'] <> '') then
+  begin
+    AliasV := UpperCase(Node.Attributes.Values['VARTYPE']);
+    AliasSig := '';
+    while (Length(AliasV) > 4) and (Copy(AliasV, Length(AliasV) - 3, 4) = ' PTR') do
+    begin
+      AliasSig := ' PTR' + AliasSig;
+      AliasV := TrimRight(Copy(AliasV, 1, Length(AliasV) - 4));
+    end;
+    if (AliasV <> '') and (Pos('.', AliasV) = 0) then
+    begin
+      AliasQ := ResolveUnqualified(ActivePrefix, AliasV, Ctx, Using, True);
+      if AliasQ <> '' then Node.Attributes.Values['VARTYPE'] := AliasQ + AliasSig;
+    end;
+  end;
+
   if Node.NodeType = antNamespace then
     ChildPrefix := CombinePrefix(ActivePrefix, VarToStr(Node.Value))
   else if Node.NodeType = antProcedureDecl then

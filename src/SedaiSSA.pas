@@ -15509,6 +15509,16 @@ begin
   // never run. ⭐ The tell is that the operators print NOTHING - the numbers alone do not say it.
   if (TypeName = '') and (VarName <> '') then TypeName := UpperCase(VarRecordTypeName(VarName));
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
+  // ⛔ AND THE NAME MUST BE THE REGISTERED ONE, not the one the head happens to spell. VARTYPE carries
+  // the type AS WRITTEN, so inside a namespace "For cnt As foo = ..." says FOO while the type is
+  // registered - and its operators labelled - as TESTS.Q.FOO. IterOperatorLabel then found no NEXT,
+  // the whole iterator expansion was skipped in SILENCE, and the loop fell to the numeric path: the
+  // counter was an ordinary integer and "cnt.x" in the body read whatever register happened to be
+  // there (-1, the step temporary). ⭐ The other spelling of the same loop was right, because there the
+  // type comes from VarRecordTypeName, which answers the REGISTERED name - two readers of one fact,
+  // one asking the funnel and one not. FindUDT already canonicalises and walks the scope chain, so
+  // taking its answer costs nothing and cannot disagree with itself.
+  TypeName := FUDTs[FindUDT(TypeName)].Name;
   // A type with no iteration NEXT is not an iterator: leave it to the numeric path below.
   if (IterOperatorLabel(TypeName, kNEXT, 2) = '') then Exit;
   Result := True;
@@ -15517,8 +15527,37 @@ begin
   if HasStep then NArgs := 1 else NArgs := 0;
 
   IterH := MakeBound(Node.GetChild(1));
-  VarReg := DeclareVariableTyped(VarName, srtInt);      // the loop variable IS the iterator instance
-  EmitInstruction(ssaCopyInt, VarReg, IterH, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ⛔ A COUNTER THE HEAD DID NOT DECLARE IS AN EXISTING VARIABLE, AND THE LOOP MUST WRITE INTO IT.
+  // Both spellings came through here and both got a FRESH declaration plus an aliasing CopyInt, which
+  // is right for "For cnt As T = ..." (the head declares cnt) and wrong for
+  //     Dim As foo bar
+  //     For bar = 0 To 2
+  // where the BODY reads the variable it already had. Inside a procedure the two are different
+  // registers, so the operators ran - For, Next and Step all printed - the counter advanced inside the
+  // loop's own instance, and every "bar.x" in the body answered whatever bar held BEFORE the loop.
+  // ⚠️ At MODULE level the two happened to be the same register, so the same program was right there:
+  // one loop, two spellings, and only the one inside a Sub was wrong. That is what said it was the
+  // BINDING and not the iterator protocol.
+  // ⇒ Assign it the way an assignment does - a record VALUE copy into the variable's own handle, which
+  // is what "bar = T(0)" means in FreeBASIC - and then iterate THAT handle.
+  if (UpperCase(Node.Attributes.Values['VARTYPE']) = '') and (VarName <> '') and
+     (UpperCase(VarRecordTypeName(VarName)) = TypeName) then
+  begin
+    VarReg := EnsureIntRegister(RecordHandleOfVar(VarName));
+    EmitRecordCopy(VarReg, IterH, FindUDT(TypeName));
+  end
+  else
+  begin
+    // ⛔ DECLARE IT, THEN RESOLVE IT THE WAY THE BODY WILL. DeclareVariableTyped BINDS a new scoped
+    // variable, and a SECOND "For cnt As T = ..." in the same procedure binds a second one - while
+    // "cnt.x" in the body still resolves to the FIRST. The constructors ran with the right bounds
+    // ([ctor 5] [ctor 7] printed) and the body read the previous loop's leftover, three times over.
+    // ⚠️ At MODULE level the two bindings are the same register, so the identical pair of loops was
+    // right there: two loops, one procedure, and only the second one wrong.
+    DeclareVariableTyped(VarName, srtInt);              // the loop variable IS the iterator instance
+    VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));
+    EmitInstruction(ssaCopyInt, VarReg, IterH, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
   CondH := MakeBound(Node.GetChild(2));
   if HasStep then StepH := MakeBound(Node.GetChild(3)) else StepH := MakeSSAValue(svkNone);
 
@@ -29483,10 +29522,30 @@ begin
            (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) and
            (SigWidthPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = WidthSig) then
           Exit(FProcedureNames[k]);
+    // ⛔⛔ AND NEITHER FALLBACK MAY PICK A CTOR THAT TAKES A UDT WHEN THE ARGUMENT IS NOT ONE. A UDT
+    // parameter signs the bank 'I' - it is a handle - so "Constructor( ByRef rhs As T )" and
+    // "Constructor( ByVal n As Integer )" are both '#I' to a bank-exact search, and the type TAIL is
+    // the only thing that tells them apart. With a FLOAT field the value constructor signs '#F', so an
+    // integer literal matched neither exactly, fell here, and bound to the COPY constructor - which
+    // then read the number 7 as a record handle: EAccessViolation on thirteen lines. ⭐ The same type
+    // with an INTEGER field was right, because there the value ctor signs '#I' and the exact match wins
+    // before this - which is what made it look like a float bug rather than an overload one.
+    // ⇒ A candidate whose signature carries a type tail is a candidate for a UDT ARGUMENT. When the
+    // call brought none, it is not a conversion that exists, and skipping it lets the honest one
+    // (a numeric conversion to the '#F' ctor) be found by the length-only pass below.
     for k := 0 to FProcedureNames.Count - 1 do
       if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
-         (SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = ArgSig) then
+         (SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = ArgSig) and
+         ((UdtSig <> '') or (Pos(':', Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = 0)) then
         Exit(FProcedureNames[k]);
+    for k := 0 to FProcedureNames.Count - 1 do
+      if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
+         (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) and
+         ((UdtSig <> '') or (Pos(':', Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = 0)) then
+        Exit(FProcedureNames[k]);
+    // ...and only if THAT finds nothing does a UDT-taking ctor get its turn: a type whose only
+    // constructor takes another UDT must still be reachable, or a program that has always worked stops
+    // compiling. The order is the whole change; nothing is removed.
     for k := 0 to FProcedureNames.Count - 1 do
       if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and
          (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) then
