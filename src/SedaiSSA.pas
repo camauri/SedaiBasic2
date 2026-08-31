@@ -821,6 +821,7 @@ type
     function RawTypeCodeOfPointee(const PointeeType: string): Integer;           // raw element type code for a given scalar pointee
     function RawStrModeOf(const PointeeType: string): Integer;                  // ssaRaw*ZStr mode: 0 zstring, 1 wstring, -1 managed String cell
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
+    function StrDataPtrPointee(Node: TASTNode): string;                          // 'WSTRING'/'ZSTRING' pointee of SADD/STRPTR, '' if not one
     function RawElemSizeOfPointee(const PointeeType: string): Int64;             // SizeOf(scalar pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
@@ -1111,7 +1112,8 @@ type
     procedure ProcessDefaultValue(ParamNode, Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name and UDT conversion included
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
-    function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
+    function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue;
+                                  out ElemBytes: Integer): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
     function RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;   // byte address of an @-taken "ZSTRING * n"
     function RawStringBufElemBytes(SNode: TASTNode): Integer;   // ...and how wide ONE character is in it
     function IsRawStringBuf(SNode: TASTNode): Boolean;          // ...asked WITHOUT emitting anything
@@ -2562,6 +2564,7 @@ end;
 // Main implementation with destination hint
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
+  DerefElemBytes: Integer;   // width of one element behind "(*p)[i]" - see DerefZStringByteAddr
   ThisFieldNode: TASTNode;   // synthesized "this.<field>" for an implicit-THIS subscript
   ImplicitCallNode: TASTNode;  // synthesized "this.<field>(args)" for an implicit-THIS funcptr call
   Left, Right: TSSAValue;
@@ -3939,9 +3942,17 @@ begin
       // FreeBASIC raw pointer arithmetic: "p + n" / "p - n" (and "n + p") where p is a raw pointer.
       // The index is scaled by SizeOf(pointee) — the result is a raw byte pointer. (Managed pointers
       // keep element-unit arithmetic via the normal numeric lowering below.)
+      // ⛔ ...AND THE POINTER NEED NOT HAVE A NAME. The gate asked RawPtrExprName alone, so
+      // "Dim p As WString Ptr = StrPtr(s) : p + 1" scaled by SizeOf(pointee) and the identical step
+      // written "StrPtr(s) + 1" did not open the gate at all and fell through to plain integer
+      // arithmetic - one BYTE where fbc advances four. IsStrDataPtrExpr already recognised the
+      // anonymous form for the INDEXED spelling (EmitPointerValueIndexAddress asks it); the arithmetic
+      // one never did. DIVERGENZE 111.
       if (Node.ChildCount >= 2) and Assigned(Node.Token) and
          ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) and
-         (RawPtrExprName(Node) <> '') then
+         ((RawPtrExprName(Node) <> '') or
+          (StrDataPtrPointee(Node.GetChild(0)) <> '') or
+          ((Node.Token.TokenType = ttOpAdd) and (StrDataPtrPointee(Node.GetChild(1)) <> ''))) then
       begin
         EmitRawPtrArith(Node, Result);
         Exit;
@@ -7091,10 +7102,11 @@ begin
 
         // "(*p)[i]" where p is a ZSTRING/WSTRING pointer: the i-th character, as a number.
         if (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
-           DerefZStringByteAddr(Node.GetChild(0), Node.GetChild(1).GetChild(0), TempVal) then
+           DerefZStringByteAddr(Node.GetChild(0), Node.GetChild(1).GetChild(0), TempVal, DerefElemBytes) then
         begin
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaRawLoadInt, Result, TempVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U8));
+          EmitInstruction(ssaRawLoadInt, Result, TempVal, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RawCodeOfWidth(DerefElemBytes)));
           Exit;
         end;
 
@@ -9667,20 +9679,23 @@ var
   VarName, RawFieldPointee, DstRecType: string;
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
+  DerefElemBytes: Integer;      // width of one element behind "(*p)[i]" - see DerefZStringByteAddr
   PtrIdxRaw: Boolean;           // "(expr)[i] = v": is the base a RAW address or a managed one?
 begin
   // "(*p)[i] = c" where p is a ZSTRING/WSTRING pointer: one character at that address.
   if (VarNode.ChildCount >= 2) and (VarNode.GetChild(1).ChildCount = 1) and
-     DerefZStringByteAddr(VarNode.GetChild(0), VarNode.GetChild(1).GetChild(0), VarReg) then
+     DerefZStringByteAddr(VarNode.GetChild(0), VarNode.GetChild(1).GetChild(0), VarReg, DerefElemBytes) then
   begin
     ProcessExpression(ExprNode, ExprValue);
     if (ExprValue.Kind = svkConstString) or
        ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString)) then
+      // ...and a STRING written at that address encodes in the pointee's own units: bytes for a
+      // ZSTRING, wide cells for a WSTRING. Mode 0 outright wrote UTF-8 bytes into a wide buffer.
       EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
-                      MakeSSAConstInt(0))
+                      MakeSSAConstInt(Ord(DerefElemBytes = WIDE_CELL_BYTES)))
     else
       EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue),
-                      MakeSSAConstInt(RTC_U8));
+                      MakeSSAConstInt(RawCodeOfWidth(DerefElemBytes)));
     Exit;
   end;
 
@@ -14774,7 +14789,8 @@ begin
   if (T = 'ZSTRING') or (T = 'WSTRING') then Result := T;
 end;
 
-function TSSAGenerator.DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue): Boolean;
+function TSSAGenerator.DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue;
+                                            out ElemBytes: Integer): Boolean;
 // "(*p)[i]" where p is a ZSTRING/WSTRING pointer: the i-th CHARACTER of the string at that address.
 // Answers the byte address (p + i*SizeOf(char)) so the caller can load or store one character there.
 //
@@ -14790,6 +14806,12 @@ var
 begin
   Result := False;
   Addr := MakeSSAValue(svkNone);
+  // ⛔ THE ACCESS WIDTH IS AN OUTPUT, and it has to be: both callers used to name RTC_U8 outright
+  // while this routine scaled the offset by the pointee's width. For a ZSTRING the two agree at 1 and
+  // nothing showed; for a WSTRING the index stepped a CELL and the load took a BYTE. Handing the
+  // width back is what keeps the pair together - the same repair RawCodeOfWidth made for the
+  // fixed-length buffer's indexed access.
+  ElemBytes := 1;
   if (BaseNode = nil) or (IdxNode = nil) then Exit;
   Inner := BaseNode;
   while (Inner.NodeType = antParentheses) and (Inner.ChildCount >= 1) do Inner := Inner.GetChild(0);
@@ -14798,10 +14820,15 @@ begin
   if (Pointee <> 'ZSTRING') and (Pointee <> 'WSTRING') then Exit;
   ProcessExpression(Inner.GetChild(0), BaseVal);      // the pointer's own value = the byte address
   ProcessExpression(IdxNode, IdxVal);
+  // ⛔ THE THIRD PLACE THAT SPELLED THE WIDE CELL OUT AS A LITERAL, and the pass that introduced
+  // WIDE_CELL_BYTES missed it: it steps a CELL, not a pair of bytes. Left at 2 while the image moved to
+  // four, "(*p)[i]" on a WString Ptr answered 49, 0, 50, 0 for "1234" - every other byte - which is
+  // exactly what fbc's own wstring/strptr checks with its byte-by-byte loop.
   if Pointee = 'WSTRING' then
   begin
+    ElemBytes := WIDE_CELL_BYTES;
     ElemSz := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, ElemSz, MakeSSAConstInt(2), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaLoadConstInt, ElemSz, MakeSSAConstInt(WIDE_CELL_BYTES), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaMulInt, ScaledIdx, EnsureIntRegister(IdxVal), ElemSz, MakeSSAValue(svkNone));
   end
@@ -35043,15 +35070,20 @@ var
   PtrVal, IntVal, SzVal, Scaled: TSSAValue;
   sz: Int64;
 begin
-  // Decide which child is the raw pointer (left for +/-, or right only for +).
-  if RawPtrExprName(Node.GetChild(0)) <> '' then
+  // Decide which child is the raw pointer (left for +/-, or right only for +). ⭐ A SADD/STRPTR call
+  // is a raw pointer with no NAME, so the side test asks both questions - and the scale then has to
+  // come from the same second source, or the anonymous side would advance one byte per step.
+  if (RawPtrExprName(Node.GetChild(0)) <> '') or (StrDataPtrPointee(Node.GetChild(0)) <> '') then
   begin PtrSide := Node.GetChild(0); IntSide := Node.GetChild(1); end
   else
   begin PtrSide := Node.GetChild(1); IntSide := Node.GetChild(0); end;
   PtrName := RawPtrExprName(PtrSide);
   ProcessExpression(PtrSide, PtrVal); PtrVal := EnsureIntRegister(PtrVal);
   ProcessExpression(IntSide, IntVal); IntVal := EnsureIntRegister(IntVal);
-  sz := RawElemSizeOf(PtrName);
+  if PtrName <> '' then
+    sz := RawElemSizeOf(PtrName)
+  else
+    sz := RawElemSizeOfPointee(StrDataPtrPointee(PtrSide));
   if sz > 1 then
   begin
     SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -35114,6 +35146,41 @@ begin
            (RawZStringBufBytes(VarToStr(Node.GetChild(0).GetChild(0).Value)) > 0) or
            IsRawAddrLocal(VarToStr(Node.GetChild(0).GetChild(0).Value))) then
     Result := UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
+end;
+
+function TSSAGenerator.StrDataPtrPointee(Node: TASTNode): string;
+// The POINTEE of a SADD/STRPTR expression: 'WSTRING' when its argument is wide, 'ZSTRING' otherwise.
+// fbc types these the same way - StrPtr of a WString is a WString Ptr, of a String a ZString Ptr - and
+// the pointee is what scales the arithmetic on the result.
+//
+// ⛔ IT EXISTS BECAUSE THE SCALE WAS LOOKED UP BY NAME. EmitRawPtrArith asks RawPtrExprName, so
+// "p1 + 1" scaled correctly for a declared "Dim p1 As WString Ptr = StrPtr(s)" and the very same step
+// written "StrPtr(s) + 1" did not - an anonymous expression has no name, the gate did not open at all,
+// and the add fell through to plain integer arithmetic, one BYTE. fbc's own wstring/strptr and
+// udt-zstring/strptr are written entirely in the second spelling. DIVERGENZE 111, the first of its
+// three halves. [[a-rule-one-path-has-and-the-other-does-not]]
+var
+  N: TASTNode;
+begin
+  Result := '';
+  N := Node;
+  if N = nil then Exit;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  // "StrPtr(s) + n" / "n + StrPtr(s)": the pointee is the string side's, whichever side that is.
+  if (N.NodeType = antBinaryOp) and (N.ChildCount >= 2) and Assigned(N.Token) and
+     ((N.Token.TokenType = ttOpAdd) or (N.Token.TokenType = ttOpSub)) then
+  begin
+    Result := StrDataPtrPointee(N.GetChild(0));
+    if (Result = '') and (N.Token.TokenType = ttOpAdd) then Result := StrDataPtrPointee(N.GetChild(1));
+    Exit;
+  end;
+  if not ((N.NodeType = antArrayAccess) and (N.ChildCount >= 2) and
+          (N.GetChild(0).NodeType = antIdentifier) and
+          ((UpperCase(VarToStr(N.GetChild(0).Value)) = kSADD) or
+           (UpperCase(VarToStr(N.GetChild(0).Value)) = kSTRPTR)) and
+          (ArrayIndexOf(VarToStr(N.GetChild(0).Value)) < 0) and
+          (N.GetChild(1).ChildCount >= 1)) then Exit;
+  if IsWStringExpr(N.GetChild(1).GetChild(0)) then Result := 'WSTRING' else Result := 'ZSTRING';
 end;
 
 function TSSAGenerator.IsStrDataPtrExpr(Node: TASTNode): Boolean;
@@ -36976,6 +37043,30 @@ begin
     EmitInstruction(ssaShl, MulResult, AddResult, StrideVal, MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaAddInt, Result, MulResult, MArrIdx, MakeSSAValue(svkNone));
+    Exit;
+  end;
+  // @StrPtr(s)[i] / @SAdd(s)[i]: the base is a raw byte-heap pointer with NO NAME, so neither the
+  // declared-array path nor the pointer path below can reach it - and it fell through to an UNSCALED
+  // add, one byte per step. fbc's own wstring/strptr writes exactly this ("p2 = @(strptr(s1)[1])")
+  // beside the arithmetic spelling, and expects the two to agree. DIVERGENZE 111.
+  if (StrDataPtrPointee(Node.GetChild(0)) <> '') and
+     (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
+  begin
+    ProcessExpression(Node.GetChild(0), TempVal);
+    ProcessExpression(Node.GetChild(1).GetChild(0), StrideVal);
+    AddResult := EnsureIntRegister(StrideVal);
+    RawFieldPointee := StrDataPtrPointee(Node.GetChild(0));
+    if RawElemSizeOfPointee(RawFieldPointee) > 1 then
+    begin
+      MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, MulResult, MakeSSAConstInt(RawElemSizeOfPointee(RawFieldPointee)),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, StrideVal, AddResult, MulResult, MakeSSAValue(svkNone));
+      AddResult := StrideVal;
+    end;
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Result, EnsureIntRegister(TempVal), AddResult, MakeSSAValue(svkNone));
     Exit;
   end;
   ArrName := VarToStr(Node.GetChild(0).Value);
