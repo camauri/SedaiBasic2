@@ -527,6 +527,11 @@ type
                                          //   SIZE and not as a name because the capacity of a fixed-length string lives
                                          //   in the declaration's FIXEDLEN attribute, not in its type name.
     FArrayScalarPointee: TStringList;    // array of NON-UDT pointers ("DIM a(..) As ZString Ptr") -> the pointee type name.
+    // ⛔ An array whose ELEMENTS hold a RAW address ("Dim a(10) As Integer Ptr : a(5) = Allocate(...)").
+    // CollectRawPtrVars walks pointer VARIABLES, so nothing marked an element: "a(5)[3] = 777" never
+    // reached the block and "a(5)[3]" answered 32 - the byte address, unloaded. Keyed by ArrayFactKey,
+    // like every other fact about an array's elements.
+    FRawElemArrays: TStringList;
                                          //   Kept apart from FArrayPtrPointee, whose readers all assume a UDT (a record HANDLE);
                                          //   this one only says what "*a(i)" dereferences TO.
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
@@ -1118,6 +1123,8 @@ type
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue;
                                   out ElemBytes: Integer): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
     function RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;   // byte address of an @-taken "ZSTRING * n"
+    function RawElemArrayName(Node: TASTNode): string;                   // ...asked without FProgram: safe in the pre-scan
+    function IsRawElemArrayAccess(Node: TASTNode): Boolean;             // "a(i)" whose element holds a RAW address
     function RawStringBufElemBytes(SNode: TASTNode): Integer;   // ...and how wide ONE character is in it
     function IsRawStringBuf(SNode: TASTNode): Boolean;          // ...asked WITHOUT emitting anything
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
@@ -1522,6 +1529,8 @@ begin
   FArrayFuncPtrSig := TStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
   FArrayScalarPointee := TStringList.Create;
+  FRawElemArrays := TStringList.Create;
+  FRawElemArrays.CaseSensitive := False;
   FArrayScalarPointee.CaseSensitive := False;
   FArrayElemBytes := TStringList.Create;
   FArrayElemBytes.CaseSensitive := False;
@@ -1701,6 +1710,7 @@ begin
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
+  FRawElemArrays.Free;
   FArrayElemBytes.Free;
   FArrayFixedStr.Free;
   FArrayPtrPointee.Free;
@@ -7170,8 +7180,12 @@ begin
         // ADDRESS, 8, instead of the value - while the same address stored in a variable first read
         // correctly. DerefedType learnt to answer for them in the same change, which is the half that
         // survives whichever way the guard goes.
+        // ⭐ ...and "a(i)[j]" where the ELEMENT of a declared array holds a raw block. The base has a
+        // name, but it is the ARRAY's, not a pointer's, so every name-keyed branch declined it and the
+        // read answered 32 - the byte address of the element, unloaded.
         if (Node.GetChild(0) <> nil) and
            ((Node.GetChild(0).NodeType = antParentheses) or
+            IsRawElemArrayAccess(Node.GetChild(0)) or
             ((Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 2) and
              (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
              ((UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = kVARPTR) or
@@ -9900,8 +9914,13 @@ begin
   // "(*pp)[0] = 99" with "pp As Integer Ptr Ptr" wrote NOTHING and said nothing - and a lost write is
   // worse than the wrong read that named the defect. Asked first, for the same reason the read branch
   // is: nothing further down recognises the shape. DIVERGENZE 54.
+  // ⭐ ...and "a(i)[j] = value" where the ELEMENT of a declared array holds a raw block. The base has a
+  // name, but it is the ARRAY's, so the name-keyed branches below decline it and the store was LOST in
+  // silence - the read answered 32, the byte address, and the write reached nothing at all. The write
+  // half is the one that matters: a lost write is worse than a wrong read.
   if (VarNode.ChildCount >= 2) and
-     (VarNode.GetChild(0) <> nil) and (VarNode.GetChild(0).NodeType = antParentheses) and
+     (VarNode.GetChild(0) <> nil) and
+     ((VarNode.GetChild(0).NodeType = antParentheses) or IsRawElemArrayAccess(VarNode.GetChild(0))) and
      (VarNode.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
      (VarNode.GetChild(1).ChildCount = 1) and
      (DerefedType(VarNode.GetChild(0)) <> '') then
@@ -15004,6 +15023,28 @@ begin
   Nm := UpperCase(VarToStr(SNode.Value));
   Result := (IsRawModuleScalar(Nm) and (TypeNameToBank(RawModuleScalarType(Nm), Nm) = srtString)) or
             (RawZStringBufBytes(Nm) > 0);
+end;
+
+function TSSAGenerator.RawElemArrayName(Node: TASTNode): string;
+// "a(i)" where the name a was recorded as holding RAW addresses in its elements - asked WITHOUT
+// consulting FProgram's array table, so it is safe inside the pre-scan, where that table is still empty.
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) or
+     (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  if FRawElemArrays.IndexOf(ArrayFactKey(VarToStr(Node.GetChild(0).Value))) >= 0 then
+    Result := UpperCase(VarToStr(Node.GetChild(0).Value));
+end;
+
+function TSSAGenerator.IsRawElemArrayAccess(Node: TASTNode): Boolean;
+// "a(i)" where a is a DECLARED array whose elements hold a RAW address (CollectRawPtrVars marked it).
+// The element is then a byte pointer, so "a(i)[j]" indexes the BLOCK it points at - scaled by
+// SizeOf(pointee) - instead of advancing the packed pointer the managed path assumes.
+// ⚠️ For LOWERING only: it asks whether the name really is an array, which is a question FProgram can
+// only answer once the DIM has been lowered. Inside the pre-scan use RawElemArrayName.
+begin
+  Result := (RawElemArrayName(Node) <> '') and
+            (ArrayIndexOf(VarToStr(Node.GetChild(0).Value)) >= 0);
 end;
 
 function TSSAGenerator.RawStringBufElemBytes(SNode: TASTNode): Integer;
@@ -26837,15 +26878,19 @@ begin
       Result := FuncPtrTypeSig(PointeeTypeOf(Nm));
     Exit;
   end;
-  // ⛔ "a(i)[j]" - the element of a DECLARED array holding the raw block - is deliberately NOT here,
-  // and the note is the measurement: the arm was written, and it turned an error into an INFINITE LOOP,
-  // because the value read at "a(i)[j]" is not the function pointer to begin with. The whole family is
-  // broken one level down and independently of calls: "Dim a(10) As Integer Ptr : a(5) = Allocate(...)
-  // : a(5)[3] = 777 : Print a(5)[3]" answers 32 - the byte address, unloaded - and the store never
-  // reaches the block either. An element of a declared array is never marked RAW (CollectRawPtrVars
-  // walks pointer VARIABLES), so every access through one falls to the managed path.
-  // ⇒ Curing THAT is what unblocks fbc's pointers/array_ptr_fn; a call arm on top of a wrong value only
-  // makes the failure worse. [[a-parse-error-is-better-than-a-wrong-answer]]
+  // "a(i)[j]": the element of a declared array is itself the raw block.
+  // ⛔ THIS ARM WAS WRITTEN, WITHDRAWN, AND PUT BACK IN THE SAME SESSION, and the order is the lesson.
+  // First time it turned an error into an INFINITE LOOP, because the value read at "a(i)[j]" was not
+  // the function pointer to begin with: an element of a declared array was never marked RAW
+  // (CollectRawPtrVars walks pointer VARIABLES), so the read answered the byte ADDRESS and the store
+  // reached nothing. A call arm on top of a wrong value only makes the failure louder.
+  // ⇒ FRawElemArrays fixed the value first; only then is this arm meaningful.
+  // [[a-parse-error-is-better-than-a-wrong-answer]]
+  if (Inner.NodeType = antArrayAccess) and (Inner.ChildCount >= 2) and
+     (Inner.GetChild(0).NodeType = antIdentifier) and
+     (ArrayIndexOf(VarToStr(Inner.GetChild(0).Value)) >= 0) then
+    Result := FuncPtrTypeSig(
+      UpperCase(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(Inner.GetChild(0).Value))]));
 end;
 
 function TSSAGenerator.FuncPtrTypeSig(const TypeName: string): string;
@@ -36042,7 +36087,7 @@ var
   SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   i: Integer;
   Lhs, Rhs: TASTNode;
-  LhsU: string;
+  LhsU, TU: string;
 
   procedure MarkRaw(const N: string);
   begin
@@ -36189,7 +36234,14 @@ var
             (FRawPtrRetFuncs.IndexOfName(UpperCase(VarToStr(Rhs.GetChild(0).Value))) >= 0) then
       MarkRaw(TargetU)   // p = f(...) where f returns a raw <scalar> pointer
     else if IsStrDataPtrExpr(Rhs) then
-      MarkRaw(TargetU);   // p = SADD(s)/STRPTR(s), or that ± n: a raw byte-heap pointer -> deref onto the byte heap
+      MarkRaw(TargetU)   // p = SADD(s)/STRPTR(s), or that ± n: a raw byte-heap pointer -> deref onto the byte heap
+    // ⭐ p = a(i) where a's ELEMENTS hold raw addresses. Without it the element read correctly in place
+    // ("a(5)[3]") and lost its rawness the moment it was copied into a variable, so the very next line
+    // read the block through the managed path and answered 0.
+    // ⚠️ RawElemArrayName, not IsRawElemArrayAccess: this runs in the pre-scan, where FProgram's array
+    // table is still empty and "is this an array?" answers NO for every array in the program.
+    else if RawElemArrayName(Rhs) <> '' then
+      MarkRaw(TargetU);
   end;
 
 begin
@@ -36210,6 +36262,38 @@ begin
     LhsU := UpperCase(VarToStr(Node.GetChild(0).Value));
     ConsiderRaw(LhsU, Node.GetChild(2));
   end;
+
+  // ⭐ "a(i) = Allocate(...)": the ELEMENT of a declared array holds a raw address, and nothing marked
+  // it. ConsiderRaw files a VARIABLE name into FRawPtrVars, and an element has no variable name - so
+  // every access through one fell to the managed path: "Dim a(10) As Integer Ptr : a(5) = Allocate(...)
+  // : a(5)[3] = 777" never wrote to the block, and reading it back answered 32, the byte address.
+  // ⛔ Written as a READER of the same predicates rather than a copy of the rule: the four helpers below
+  // are exactly the raw sources ConsiderRaw recognises, so the two cannot drift into disagreeing about
+  // what "raw" means - which is the failure mode this file has hit again and again.
+  // ⛔⛔ AND IT MUST NOT ASK ArrayIndexOf HERE. This is a PRE-SCAN: it runs before any DIM has been
+  // lowered, so FProgram's array table is still empty and "is this name an array?" answers NO for every
+  // array in the program. The first version asked, and marked exactly nothing.
+  // ⇒ Record the NAME; the reader (IsRawElemArrayAccess) asks whether it is an array, by which time it
+  // is. [[a-value-read-before-its-writer-has-run]]
+  if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 2) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    Rhs := Node.GetChild(1);
+    if IsAllocCall(Rhs, TU) or IsScreenPtrExpr(Rhs) or IsStrDataPtrExpr(Rhs) or
+       (RawPtrExprName(Rhs) <> '') or
+       ((Rhs.NodeType = antCast) and (Rhs.ChildCount >= 1) and IsAllocCall(Rhs.GetChild(0), TU)) or
+       ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1')) then
+    begin
+      LhsU := ArrayFactKey(VarToStr(Node.GetChild(0).GetChild(0).Value));
+      if FRawElemArrays.IndexOf(LhsU) < 0 then
+      begin
+        FRawElemArrays.Add(LhsU);
+        FRawCollectChanged := True;
+      end;
+    end;
+  end;
+
 
   // A CALL: raw-ness crosses into the callee's pointer PARAMETERS. It has to be
   // decided HERE, in the fixpoint, and not while the call is lowered - a
@@ -38085,7 +38169,10 @@ begin
   end
   else
   begin
-    IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode);
+    // ...and an ELEMENT of an array whose elements hold raw addresses is a raw base too. Its rawness
+    // is a fact about the ARRAY, not about a variable, so neither of the two tests beside it can see it.
+    IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode) or
+             IsRawElemArrayAccess(RawSrcNode);
     if IsRaw then
     begin
       Sz := RawElemSizeOfPointee(Pointee);
