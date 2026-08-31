@@ -649,6 +649,7 @@ type
     function OwnerTypeOfLabel(const Name: string): string;   // THIS's type inside a method body
     function NestedQualifiedMethod(const TypeName, MethNm: string): string;  // "Sub T.U.proc" label of a nested type's method
     function ResolveMethodLabelArgs(const TypeName, MethNm: string; ArgsNode: TASTNode): string;  // + overloads
+    function CallArgsCanReachParams(const Lbl: string; ArgsNode: TASTNode): Boolean;  // a non-UDT arg for a UDT param needs a ctor
     function ResolveConstructorLabel(const TypeName, ArgSig: string;
       const UdtSig: string = ''; const WidthSig: string = ''): string;
     function BankToChar(Bank: TSSARegisterType): Char;          // M4.4g: I/F/S bank code for a ctor signature
@@ -4104,8 +4105,15 @@ begin
         begin
           OpLabel := ResolveMethodLabelArgs(OpLhsType,
                        'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2), OpArgs);
+          if (OpLabel <> '') and (not CallArgsCanReachParams(OpLabel, OpArgs)) then OpLabel := '';
+          // ⛔ THE SIGNATURE-BLIND FALLBACK MUST STILL BE REACHABLE BY THE ARGUMENTS. It exists for the
+          // shapes the matcher above cannot rank, and it took an operator whose parameters do not match
+          // at all: see CallArgsCanReachParams.
           if OpLabel = '' then
+          begin
             OpLabel := ResolveMethodLabel(OpLhsType, 'OPERATOR' + VarToStr(Node.Token.Value) + OperatorArityCode(2));
+            if (OpLabel <> '') and (not CallArgsCanReachParams(OpLabel, OpArgs)) then OpLabel := '';
+          end;
         end
         else
         begin
@@ -29583,6 +29591,39 @@ begin
       Result := Result + 'I'                          // UDT handle
     else
       Result := Result + BankToChar(TypeNameToBank(tname, VarToStr(p.Value)));
+  end;
+end;
+
+function TSSAGenerator.CallArgsCanReachParams(const Lbl: string; ArgsNode: TASTNode): Boolean;
+// Can every argument REACH its parameter? A non-UDT argument for a UDT parameter needs a converting
+// CONSTRUCTOR; without one the value is staged into a slot the callee reads as a record HANDLE, and
+// the first field access is an Access Violation - not a diagnostic.
+//
+// ⛔ WHY IT IS ASKED. The binary-operator dispatch resolves by signature and then falls back to a
+// signature-BLIND lookup, which takes an operator whose parameters do not match at all. With
+// "Operator <>( ByRef As UDT, ByRef As UDT )" and no constructor from a number, "u <> 0" took that
+// operator and handed it the integer 0 as a record handle. fbc ranks the conversions: an exact
+// operator first, then a converting CONSTRUCTOR, then the type's CAST - and with only a cast the
+// answer is to convert the UDT, not the number. Declining here is what lets the numeric path, and
+// its cast, have the expression. fbc's own structs/udt-comp-ops-1 spells the ranking out in its head.
+var
+  Decl, PL: TASTNode;
+  i: Integer;
+  PT: string;
+begin
+  Result := True;
+  if (ArgsNode = nil) or (Lbl = '') then Exit;
+  if not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) or (Decl.GetChild(1).NodeType <> antParameterList) then Exit;
+  PL := Decl.GetChild(1);
+  for i := 0 to PL.ChildCount - 1 do
+  begin
+    if i >= ArgsNode.ChildCount then Break;
+    if (PL.GetChild(i).ChildCount < 1) or (PL.GetChild(i).GetChild(0).NodeType <> antIdentifier) then Continue;
+    PT := UpperCase(VarToStr(PL.GetChild(i).GetChild(0).Value));
+    if FindUDT(PT) < 0 then Continue;                       // not a UDT parameter: nothing to convert
+    if ObjectTypeName(ArgsNode.GetChild(i)) <> '' then Continue;   // a UDT argument: a different question
+    if ResolveConstructorLabel(PT, '?') = '' then Exit(False);     // ...and nothing to convert it WITH
   end;
 end;
 
