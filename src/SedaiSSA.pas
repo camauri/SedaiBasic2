@@ -479,6 +479,11 @@ type
     FPreFuncRetType: TStringList;        // FUNCTION name (UPPER) -> declared return type name, collected before RegisterRecordVars
     FPreProcSig: TStringList;            // procedure LABEL (UPPER, overload tail and all) -> "FPPARAMS|FPRET", same walk
     FPreProcRetPtrSig: TStringList;      // FUNCTION name (UPPER) whose RETURN is a procedure pointer -> that pointer's "FPPARAMS|FPRET"
+    FPreVarDeclType: TStringList;        // var name (UPPER) -> its DECLARED type name, collected in the SAME early walk as
+                                         // FPreFuncRetType. ⛔ FVarRecordType answers the same question and is filled by
+                                         // RegisterRecordVars, which runs LATER: that is precisely why the member-array
+                                         // branch of DeclaredPointerTypeOfArg was inert when it was first tried (the
+                                         // withdrawal note is on it). DIVERGENZE 64.
     // ⭐ THE LEXICAL SCOPE A TYPE NAME IS RESOLVED IN. FTypeScopePath is the path of the block the
     // generator is currently lowering ("P3/B7/", '' at module level); FTypeScopeSerial hands each
     // scope node its tag ONCE, stamped on the node so the PRE-PASS that registers types and the
@@ -931,6 +936,7 @@ type
                            out Slot: Integer; out ElemBank: TSSARegisterType;
                            out DimCount: Integer): Boolean;   // array member (obj.field(i,j))
     function UDTArrayElemType(UDTIdx: Integer; const FieldName: string): string;  // element UDT type of an array-of-UDT member (else '')
+    function UDTArrayElemScalarTypeOf(UDTIdx: Integer; const FieldName: string): string;  // declared SCALAR element type of an array member (else the UDT one, else '')
     function UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT when an array member's elements are UDT POINTERS (else '')
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
@@ -1517,6 +1523,8 @@ begin
   FPreFuncRetType.CaseSensitive := False;
   FPreProcSig := TStringList.Create;
   FPreProcRetPtrSig := TStringList.Create;
+  FPreVarDeclType := TStringList.Create;
+  FPreVarDeclType.CaseSensitive := False;
   FTypeScopePath := '';
   FTypeScopeSerial := 0;
   FPreProcSig.CaseSensitive := False;
@@ -1705,6 +1713,7 @@ begin
   FPreFuncRetType.Free;
   FPreProcSig.Free;
   FPreProcRetPtrSig.Free;
+  FPreVarDeclType.Free;
   FResultTemps.Free;
   FArrayRecordType.Free;
   FArrayScalarType.Free;
@@ -27151,6 +27160,26 @@ begin
       Exit(FUDTs[UDTIdx].Fields[i].ArrayElemType);
 end;
 
+function TSSAGenerator.UDTArrayElemScalarTypeOf(UDTIdx: Integer; const FieldName: string): string;
+// The declared SCALAR element type of an array member ("arr(0 To 3) As Integer" -> "INTEGER"), else ''.
+// The twin of UDTArrayElemType, which answers for an array of UDT: a member array is one or the other,
+// and a reader that asks only the UDT one is blind to every scalar member array.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if (FUDTs[UDTIdx].Fields[i].Name = F) and FUDTs[UDTIdx].Fields[i].IsArray then
+    begin
+      if FUDTs[UDTIdx].Fields[i].ArrayElemScalarType <> '' then
+        Exit(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType);
+      Exit(FUDTs[UDTIdx].Fields[i].ArrayElemType);
+    end;
+end;
+
 function TSSAGenerator.UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;
 // The pointee UDT of an array member whose elements are UDT pointers ("kids(Any) As N Ptr" -> "N"), else
 // ''. Distinct from UDTArrayElemType (array-of-UDT VALUES): here an element is a handle to a record owned
@@ -28928,10 +28957,28 @@ begin
   // "Dim p As Integer Ptr = @a(0)" has always worked, which is what said the gap was in the DEDUCTION.
   // The element type is already recorded for exactly this pre-pass (FArrayScalarType, whose comment
   // says so); FProgram's own table is asked first for everything declared by then.
-  // ⛔ THE MEMBER-ARRAY FORM, "Var p = @x.array(0)", IS NOT CLOSED HERE AND THE ATTEMPT IS WRITTEN
-  // DOWN: asking UDTArrayElemType off ObjectTypeName of the object answers nothing at this point -
-  // this pre-pass runs before the record variables are registered - so the branch was INERT and is
-  // not shipped. DIVERGENZE 64.
+  // ⭐ ...AND THE MEMBER-ARRAY FORM, "Var p = @x.arr(0)", WHOSE FIRST ATTEMPT WAS INERT AND SAID WHY.
+  // It asked ObjectTypeName for the object's type and this pre-pass runs before the record variables
+  // are registered, so the answer was always ''. The half that was missing is a table filled EARLIER -
+  // FPreVarDeclType, in the same walk as FPreFuncRetType - and with it the element type is read off
+  // the field exactly as the simple-array branch reads it off FArrayScalarType.
+  // ⚠️ "*p" WORKED ALL ALONG and only "p[i]" failed, which is what said the gap was in the DEDUCTION
+  // and not in the address: the crossed pair (simple array + index ✅ / member array + deref ✅ /
+  // member array + index ⛔ / member array with the type spelled out + index ✅) names it exactly.
+  // DIVERGENZE 64.
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount = 1) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) and
+     (Node.GetChild(0).GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    Pt := FPreVarDeclType.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).GetChild(0).Value))];
+    if Pt = '' then Exit;
+    NameNd := nil;                                   // (unused here; kept out of the way)
+    Pt := UDTArrayElemScalarTypeOf(FindUDT(Pt), VarToStr(Node.GetChild(0).GetChild(0).Value));
+    if Pt <> '' then Exit(UpperCase(Pt) + ' PTR');
+    Exit;
+  end;
   if (Node.NodeType = antProcAddress) and (Node.ChildCount = 1) and
      (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
      (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
@@ -29852,6 +29899,20 @@ begin
       end;
     end;
   end;
+  // ⭐ ...and the DECLARED TYPE of every "Dim x As T", in this same early walk and for the same reason
+  // FPreFuncRetType is here: the VAR type inference runs before RegisterRecordVars, so FVarRecordType
+  // has nothing to say yet. It is what lets "Var p = @x.arr(0)" find the element type of a MEMBER
+  // array - DIVERGENZE 64, whose first attempt asked ObjectTypeName here and got '' every time.
+  // Last declaration wins, as it does for the other flat pre-scans beside it.
+  if Node.NodeType in [antDim, antRedim] then
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      PL := Node.GetChild(i);
+      if (PL <> nil) and (PL.NodeType = antArrayDecl) and (PL.ChildCount >= 2) and
+         (PL.GetChild(0).NodeType = antIdentifier) and (PL.GetChild(1).NodeType = antIdentifier) then
+        FPreVarDeclType.Values[UpperCase(VarToStr(PL.GetChild(0).Value))] :=
+          UpperCase(VarToStr(PL.GetChild(1).Value));
+    end;
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do PreCollectFuncRetTypes(Node.GetChild(i));
   FTypeScopePath := SavedTypePath;
