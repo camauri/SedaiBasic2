@@ -236,6 +236,7 @@ type
     procedure CheckDuplicateModuleDecl(Node: TASTNode; IsRedim: Boolean);
     procedure CheckDeclStatesItsType(Node: TASTNode);
     procedure RefuseUnwritableTarget(Node: TASTNode; const What: string);
+    function OwnerNamesADeclaredType(const MethodType: string): Boolean;  // a dot does not make a method
     procedure CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
                                               NameTok: TLexerToken);
     procedure CheckByRefReturn(ProcNode: TASTNode);
@@ -3470,7 +3471,18 @@ begin
   // ...except for a STATIC member procedure, which is called WITHOUT an instance: the TYPE body declared
   // it "Declare Static Sub f(...)", so giving its definition a THIS would shift every argument one slot
   // to the right and give @Type.f an arity no call site matches.
-  if (MethodType <> '') and (FTypeStaticMethods.IndexOf(QualName) < 0) then
+  // ⛔⛔⛔ ...AND A DOT DOES NOT MAKE A METHOD. "Private Function procA.procB.f2( ) As Integer" is a
+  // NAMESPACE-qualified function written outside its namespace - fbc's own namespace/outside is built
+  // on that spelling - and it was read as a method of a type called PROCB. It then got an implicit
+  // THIS typed with the NAMESPACE name, which is not a UDT, so ParamDeclaredBank fell through to the
+  // FLOAT default: the prologue loaded the record handle with XferLoadFloat and the first field store
+  // faulted. ⚠️ The bank is what made it an Access Violation rather than a wrong answer, and it is
+  // also what made it invisible in every reduction: a namespace with ONE level, or a body inside the
+  // namespace, takes another path.
+  // ⇒ The owner must NAME A TYPE. FTypeNamesSeen is the set the member-declaration check already
+  // stands on, and it answers by the LAST segment, which is what a nested type is called.
+  if (MethodType <> '') and (FTypeStaticMethods.IndexOf(QualName) < 0) and
+     OwnerNamesADeclaredType(MethodType) then
   begin
     ThisNode := TASTNode.CreateWithValue(antIdentifier, 'THIS', Token);
     ThisNode.AddChild(TASTNode.CreateWithValue(antIdentifier, MethodType, Token));
@@ -11402,6 +11414,21 @@ begin
   finally
     Locals.Free;
   end;
+end;
+
+function TPackratParser.OwnerNamesADeclaredType(const MethodType: string): Boolean;
+// Does this dotted owner name a TYPE we have seen declared, or is it a NAMESPACE qualification?
+// It is what decides whether a definition written "Sub a.b.c( )" gets an implicit THIS. Asked by the
+// LAST segment, which is what a nested type is called - the same reading CheckMemberDefinitionIsDeclared
+// takes, and for the same reason: a qualified owner ("ns.UDT") is one name whose type is its tail.
+var
+  BareType: string;
+  DotPos: Integer;
+begin
+  BareType := MethodType;
+  DotPos := LastDelimiter('.', BareType);
+  if DotPos > 0 then BareType := Copy(BareType, DotPos + 1, MaxInt);
+  Result := FTypeNamesSeen.IndexOf(BareType) >= 0;
 end;
 
 procedure TPackratParser.CheckMemberDefinitionIsDeclared(const MethodType, QualName, Kind: string;
