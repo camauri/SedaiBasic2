@@ -4682,7 +4682,13 @@ begin
     end;
   end
   else
+  begin
+    if (GetEnvironmentVariable('RECDIAG') = '1') and
+       ((Handle < 0) or (Handle > High(Ctx.Records))) then
+      WriteLn(ErrOutput, Format('[rec] FUORI RANGE handle=%d alto=%d pc=%d',
+              [Handle, High(Ctx.Records), Ctx.PC]));
     Result := @Ctx.Records[Handle];
+  end;
 end;
 
 function TBytecodeVM.RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage;

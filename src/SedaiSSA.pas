@@ -38762,13 +38762,23 @@ begin
 end;
 
 function TSSAGenerator.ByrefRetPointeeBank(const Name: string): TSSARegisterType;
+// ⛔ A UDT POINTEE IS AN INT: a record travels as a HANDLE. TypeNameToBank does not know a record type
+// name and falls back to the classic FLOAT default, so "Operator T.Cast( ) ByRef As U" had its result
+// read out of the FLOAT bank and then used as a record handle - an Access Violation, and a Range check
+// error under the debug build, which is what said the handle was an INDEX gone wild rather than a null.
+// ⚠️ The same FLOAT default has now been the cause twice in one day (see the implicit THIS of a
+// namespace-qualified procedure, m809): an unknown TYPE NAME reaching TypeNameToBank is worth
+// suspecting wherever a bank is decided from a name.
 var
   idx: Integer;
+  PointeeT: string;
 begin
   Result := srtInt;
   idx := FByrefRetFuncs.IndexOfName(UpperCase(Name));
-  if idx >= 0 then
-    Result := TypeNameToBank(FByrefRetFuncs.ValueFromIndex[idx], Name);
+  if idx < 0 then Exit;
+  PointeeT := FByrefRetFuncs.ValueFromIndex[idx];
+  if FindUDT(UpperCase(PointeeT)) >= 0 then Exit;      // a record handle: the INT bank
+  Result := TypeNameToBank(PointeeT, Name);
 end;
 
 procedure TSSAGenerator.EmitSharedSyncOut;
@@ -40135,9 +40145,15 @@ begin
     Lbl := ResolveMethodLabel(SrcType, MethNm);
     if (Lbl <> '') and (UpperCase(CastRetRecType(Lbl)) = UpperCase(DstType)) then
     begin
-      // A UDT-returning cast yields the record HANDLE, which is already what the caller copies from:
-      // asking for the address keeps this site byte-identical to what it did before the default moved.
-      ProcessMethodCall(Node, SrcType, MethNm, nil, Val, False, True);
+      // A UDT-returning cast yields the record HANDLE, which is already what the caller copies from -
+      // so asking for the ADDRESS keeps a BYVAL cast byte-identical to what it did before the default
+      // moved. ⛔ BUT NOT A BYREF ONE: there what travels is a real address, and for a SHARED record
+      // target that is the address of its BACKING, not the record's handle. The caller then read a
+      // record at a wild index - an Access Violation, and a Range check error under the debug build,
+      // which is what said it was an INDEX and not a null. The plain "Function f( ) ByRef As T" beside
+      // it was right all along, because THAT path takes the deref: the opt-out is what differed.
+      // fbc's own structs/udt-init-ops-2 declares its conversion exactly this way.
+      ProcessMethodCall(Node, SrcType, MethNm, nil, Val, False, not ByrefRetByAddress(Lbl));
       Result := (Val.Kind <> svkNone);
       if Result then Val := EnsureIntRegister(Val);
       Exit;
