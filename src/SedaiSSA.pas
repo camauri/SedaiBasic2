@@ -1107,7 +1107,7 @@ type
     procedure RequireStringArg(const FuncName: string; ArgsNode: TASTNode);
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
-    function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a UCS-2 temporary
+    function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a wide-cell temporary
     procedure ProcessDefaultValue(ParamNode, Node: TASTNode; out Val: TSSAValue);   // a parameter's default, bare type name and UDT conversion included
     function EmitStringByteRead(SNode, IdxNode: TASTNode): TSSAValue;
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
@@ -2114,6 +2114,21 @@ begin
   else if (Length(TypeU) >= 4) and (Copy(TypeU, Length(TypeU) - 3, 4) = ' PTR') then Result := 3
   else if TypeU = 'SINGLE' then Result := 4
   else Result := 0;
+end;
+
+function RawCodeOfWidth(Bytes: Integer): Integer;
+// The unsigned raw element-type code for an access of this many bytes. It exists so that a site which
+// SCALES an index by a width cannot then read or write a DIFFERENT width - the two used to be written
+// out separately, and the wide buffer is where they came apart (see the indexed read of a raw-backed
+// fixed-length string).
+begin
+  case Bytes of
+    1: Result := RTC_U8;
+    2: Result := RTC_U16;
+    4: Result := RTC_U32;
+  else
+    Result := RTC_I64;
+  end;
 end;
 
 function FixedStrTypeBytes(const TypeName: string; N: Int64): Int64;
@@ -3243,8 +3258,8 @@ begin
         ProcessExpression(Node.GetChild(0), Left);   // raw byte address (arithmetic already scaled)
         Left := EnsureIntRegister(Left);
         // ZSTRING/WSTRING pointee: "*p" IS the C string at the pointed address (read to the NUL),
-        // FreeBASIC-style - not an 8-byte scalar load. WSTRING stores UCS-2 units on the heap and
-        // converts to/from our uniform UTF-8 managed strings (Src3: 0 = bytes, 1 = UCS-2).
+        // FreeBASIC-style - not an 8-byte scalar load. WSTRING stores WIDE_CELL_BYTES-wide cells on
+        // the heap and converts to/from our uniform UTF-8 managed strings (Src3: 0 = bytes, 1 = wide).
         TempStr := UpperCase(FPointerVars.Values[UpperCase(ArrName2)]);
         if TempStr = '' then TempStr := UpperCase(PointeeTypeOf(ArrName2));
         if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') or (TempStr = 'STRING') then
@@ -9561,7 +9576,7 @@ begin
     VarReg := EnsureIntRegister(VarReg);
     ProcessExpression(ExprNode, ExprValue);
     // ZSTRING/WSTRING pointee: "*p = s" writes the string's characters + NUL at the pointed
-    // address (WSTRING as UCS-2 units), FreeBASIC-style - not a scalar store.
+    // address (WSTRING as wide cells), FreeBASIC-style - not a scalar store.
     RawFieldPointee := UpperCase(FPointerVars.Values[UpperCase(RawPtrName)]);
     if RawFieldPointee = '' then RawFieldPointee := UpperCase(PointeeTypeOf(RawPtrName));
     // The same rule as the FIELD path above: a NUMERIC value through a ZSTRING/WSTRING pointer is ONE
@@ -11617,7 +11632,7 @@ begin
         InitBytes := StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0);
         if InitBytes > 0 then
         begin
-          if UpperCase(VarToStr(ArrayDeclNode.GetChild(1).Value)) = 'WSTRING' then InitBytes := InitBytes * 2;
+          if UpperCase(VarToStr(ArrayDeclNode.GetChild(1).Value)) = 'WSTRING' then InitBytes := InitBytes * WIDE_CELL_BYTES;
         end
         else
           InitBytes := 8;
@@ -14534,11 +14549,11 @@ begin
 end;
 
 function TSSAGenerator.EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;
-// Materialise an addressable UCS-2 TEMPORARY holding this string's characters, and answer its address.
+// Materialise an addressable WIDE-CELL TEMPORARY holding this string's characters, and answer its address.
 //
 // ⭐ This is the WIDE half of what StrSAdd already is for bytes, and it is composed out of instructions
 // that already exist rather than by inventing an opcode: allocate, then store the characters WIDE
-// (ssaRawStoreZStr's Immediate 1 is exactly "encode as UCS-2 and NUL-terminate").
+// (ssaRawStoreZStr's Immediate 1 is exactly "encode as wide cells and NUL-terminate").
 //
 // The block is sized (byte length + 1) * 2, which is always enough: UTF8Decode never yields more
 // UTF-16 units than the string has bytes (ASCII is 1 byte -> 1 unit, and a supplementary character is
@@ -14555,7 +14570,7 @@ begin
   EmitInstruction(ssaStrLen, LenV, SReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   BytesV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, BytesV, LenV, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
-  EmitInstruction(ssaMulInt, BytesV, BytesV, EnsureIntRegister(MakeSSAConstInt(2)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaMulInt, BytesV, BytesV, EnsureIntRegister(MakeSSAConstInt(WIDE_CELL_BYTES)), MakeSSAValue(svkNone));
   AddrV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRawAlloc, AddrV, BytesV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrV, SReg, MakeSSAConstInt(1));
@@ -14564,11 +14579,11 @@ end;
 
 function TSSAGenerator.TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;
 // A "WSTRING * n" variable given to a "WSTRING PTR" parameter: FreeBASIC passes its ADDRESS, and the
-// pointee is UCS-2 - which is the raw buffer MarkFixedWStringVars backs such a variable with.
+// pointee is a wide CELL - which is the raw buffer MarkFixedWStringVars backs such a variable with.
 //
 // ⛔ IT IS NOT THE ZSTRING CONVERSION. That one (IsStringArgForBytePtrParam) hands over SADD, the byte
 // address of the MANAGED string, whose bytes are UTF-8; the callee's wide dereference reads them as
-// UCS-2 and gets nonsense - or, on an address the raw heap does not own, raises. "t(w)" died where the
+// wide cells and gets nonsense - or, on an address the raw heap does not own, raises. "t(w)" died where the
 // same call written "t(@w)" worked, and that difference is the whole diagnosis.
 //
 // Lowered by building the "@name" the program could have written, so the address comes from the ONE
@@ -14601,7 +14616,7 @@ begin
   // INDEX into an int slot and the callee dereferenced it: "hello" reached a "WString Ptr" parameter
   // as NULL. The comment above used to say "answers False for every other shape - so no other
   // conversion changes", which described the hole as though it were a design.
-  // The answer is not SADD, it is the WIDE equivalent of SADD: a UCS-2 temporary. 50 files of fbc's
+  // The answer is not SADD, it is the WIDE equivalent of SADD: a wide-cell temporary. 50 files of fbc's
   // own suite declare a "wstring ptr" parameter.
   if InferExprBank(ArgNode) <> srtString then Exit;
   ProcessExpression(ArgNode, Val);
@@ -14698,7 +14713,7 @@ begin
   // back got the old character and the two halves disagreed with each other, not just with fbc.
   if RawZStringBufAddr(SNode, BufAddr2) then
   begin
-    ElemBytes := RawStringBufElemBytes(SNode);   // 1 for a ZSTRING, 2 for a WSTRING's UCS-2 image
+    ElemBytes := RawStringBufElemBytes(SNode);   // 1 for a ZSTRING, WIDE_CELL_BYTES for a WSTRING
     ProcessExpression(IdxNode, IdxVal);
     IdxReg := EnsureIntRegister(IdxVal);
     if ElemBytes > 1 then
@@ -14712,10 +14727,12 @@ begin
     ByteAddr2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaAddInt, ByteAddr2, EnsureIntRegister(BufAddr2), IdxReg, NoneV);
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    if ElemBytes > 1 then
-      EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U16))
-    else
-      EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RTC_U8));
+    // ⛔ THE WIDTH OF THE ACCESS MUST BE THE WIDTH THE OFFSET WAS SCALED BY. This read used to name
+    // RTC_U16 outright while the offset above came from ElemBytes: the moment the cell grew to
+    // WIDE_CELL_BYTES the index stepped four bytes and the load still took two, so a wide buffer
+    // written whole answered its first BYTE per element (GET into a "WString * 6" read 49 50 51 52 53
+    // where fbc reads cvl("1234")). One funnel, so the two can never disagree again.
+    EmitInstruction(ssaRawLoadInt, Result, ByteAddr2, NoneV, MakeSSAConstInt(RawCodeOfWidth(ElemBytes)));
     Exit;
   end;
   // ⭐ A WSTRING IS INDEXED BY CODEPOINT and each element IS a codepoint - the same rule ASC follows,
@@ -14834,8 +14851,8 @@ begin
 end;
 
 function TSSAGenerator.RawStringBufElemBytes(SNode: TASTNode): Integer;
-// How wide ONE character is in a raw-backed fixed-length string buffer: 1 byte for a ZSTRING, TWO for a
-// WSTRING, whose raw image is UCS-2.
+// How wide ONE character is in a raw-backed fixed-length string buffer: 1 byte for a ZSTRING,
+// WIDE_CELL_BYTES for a WSTRING - the same constant that sized the block.
 // ⛔ Both the indexed READ and the indexed WRITE used to assume one byte for either, so on a WSTRING
 // "w[2]" read the SECOND BYTE of the first character - "abcdef" answered 97, 0, 98, 0 instead of
 // 97, 98, 99, 100. Invisible until a program took the buffer's address (a "Clear w, 0, SizeOf(w)" is
@@ -14847,7 +14864,7 @@ begin
   Result := 1;
   if (SNode = nil) or (SNode.NodeType <> antIdentifier) then Exit;
   Nm := UpperCase(VarToStr(SNode.Value));
-  if IsWStringVar(Nm) then Result := 2;
+  if IsWStringVar(Nm) then Result := WIDE_CELL_BYTES;
 end;
 
 procedure TSSAGenerator.EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
@@ -14888,12 +14905,9 @@ begin
     ByteAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaAddInt, ByteAddr, EnsureIntRegister(BufAddr), ScaledIdx, MakeSSAValue(svkNone));
     ProcessExpression(ValNode, ValV);
-    if ElemBytes > 1 then
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
-                      MakeSSAConstInt(RTC_U16))
-    else
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
-                      MakeSSAConstInt(RTC_U8));
+    // The write half of the same rule - see the read for what a mismatch costs.
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), ByteAddr, EnsureIntRegister(ValV),
+                    MakeSSAConstInt(RawCodeOfWidth(ElemBytes)));
     Exit;
   end;
   MidNode := TASTNode.Create(antMidStatement, Tok);
@@ -21126,11 +21140,11 @@ end;
 
 procedure TSSAGenerator.ProcessGetFile(Node: TASTNode);
 var
-  HandleVal, HandleReg, VarReg: TSSAValue;
+  HandleVal, HandleReg, VarReg, BytesReg, BufAddr: TSSAValue;
   HandleChild, VarChild, CountChild: TASTNode;
   VarName: string;
   HandleStr: string;
-  HandleNum, GetStrCap: Integer;
+  HandleNum, GetStrCap, WideBytes: Integer;
 begin
   if FCurrentBlock = nil then Exit;
 
@@ -21176,12 +21190,40 @@ begin
       // "String * n" already worked because its Len IS n, but a Z-string starts empty: fbc reads n-1
       // bytes into "Dim z6 As ZString * 6" and leaves "12345" there, and we read NOTHING and left it
       // empty (fbc's own file/get, which matches on all ten numeric types and only failed here).
-      // ⚠️ A WSTRING is deliberately left alone: how many BYTES its n cells occupy is DIVERGENZE 110,
-      // where our UTF-8 image and fbc's 4-byte cells disagree, and reading a byte count off that
-      // disagreement would put the file position somewhere neither of us means.
-      GetStrCap := 0;
-      if not IsWStringVar(UpperCase(string(VarChild.Value))) then
-        GetStrCap := StrCapOf(FZStringVars, UpperCase(string(VarChild.Value)), 0);
+      // ⭐ A "WSTRING * n" READS ITS CELLS AS RAW BYTES, straight into the buffer that backs it - not
+      // through the string register, which would re-encode them. fbc reads (n-1) * SizeOf(WString)
+      // bytes and leaves the terminating cell alone, so "Dim w6 As WString * 6" over "1234567890"
+      // takes 20 bytes (10 of them at EOF, zero-filled) and w6[0] answers cvl("1234").
+      //
+      // ⛔ THIS BRANCH WAS BLOCKED BY DIVERGENZE 110 and the note that stood here said so: "how many
+      // BYTES its n cells occupy is where our image and fbc's 4-byte cells disagree, and reading a byte
+      // count off that disagreement would put the file position somewhere neither of us means". The
+      // disagreement is gone - the image IS cells of WIDE_CELL_BYTES - so the count is now the same
+      // number on both sides and the file position lands where fbc leaves it.
+      // ⛔ TWO BACKINGS, ONE QUESTION. RawZStringBufBytes answers only for a LOCAL (it asks
+      // IsAddrLocal first), so testing it alone left every MODULE-level "WString * n" on the old path -
+      // which read the bytes into the managed register while the raw buffer this variable is actually
+      // stored in stayed zero, and the two halves of the same variable disagreed. The store side asks
+      // both (IsRawModuleScalar, then RawZStringBufBytes) and this has to ask the same pair.
+      VarName := UpperCase(string(VarChild.Value));
+      if IsWStringVar(VarName) and
+         (IsRawModuleScalar(VarName) or (RawZStringBufBytes(VarName) > 0)) then
+      begin
+        WideBytes := StrCapOf(FZStringVars, VarName, 0) * WIDE_CELL_BYTES;
+        if WideBytes > 0 then
+        begin
+          BytesReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, BytesReg, MakeSSAConstInt(WideBytes),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          if IsRawModuleScalar(VarName) then
+            BufAddr := RawModuleAddrReg(VarName)
+          else
+            BufAddr := EnsureIntRegister(AddrLocalHandle(VarName));
+          EmitInstruction(ssaGetBinMem, MakeSSAValue(svkNone), HandleReg, BufAddr, BytesReg);
+          Exit;
+        end;
+      end;
+      GetStrCap := StrCapOf(FZStringVars, VarName, 0);
       // NEGATIVE = "read that many bytes and keep them all", which is the ZSTRING rule; a positive
       // width is the "String * n" one, where the last byte on file is the terminator.
       EmitInstruction(ssaGetBinStr, VarReg, HandleReg, MakeSSAValue(svkNone),
@@ -23070,7 +23112,7 @@ begin
   case Bank of
     srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // The immediate carries the WIDTH of the pointee, which only a RAW address needs: text there is a C
-    // string and a WSTRING one is UCS-2. A packed address ignores it.
+    // string and a WSTRING one is wide cells. A packed address ignores it.
     srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
                                MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
   else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -24727,15 +24769,19 @@ procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size,
 // The two differ in exactly one place: a FIXED-LENGTH array member, which fbc lays out inline and we
 // back with a handle. Used by SizeOf, OffsetOf and by UDTCLayout in its reporting mode - never by
 // anything that allocates, copies or writes an image.
+var
+  F: TUDTField;
 begin
   if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then Exit;
-  // ⚠️ A "WString * n" MEMBER IS STILL REPORTED n+1 HERE, and fbc says n*4 - "b As WString * 13" is 52
-  // there and 14 here, and a type holding one comes out 41 against 84. An arm answering the honest
-  // number was written and WITHDRAWN on 30 Aug 2026: this shape also bounds the RAW write of a MID
-  // statement into that member, so the bigger number ran past the end of storage that is UTF-8 and
-  // shorter, and wstring/midstmt and udt-wstring/midstmt went from CUPASS to "Raw pointer dereference
-  // out of bounds". The scalar and the type spellings ARE fixed (FixedLenVarSizeBytes, TypeSizeBytes);
-  // the member wants the image and the report separated along the whole wide path first.
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  // ⭐ A "WString * n" MEMBER measures n cells, not n+1 bytes, and fbc says 52 for "b As WString * 13".
+  // This arm was written and WITHDRAWN on 30 Aug 2026 because the report was moving while the IMAGE
+  // stayed two bytes wide, so the bigger number ran past the end of storage. WIDE_CELL_BYTES now sizes
+  // both halves, so the report has an image to match.
+  if (F.Bank = srtString) and (F.StrCapacity > 0) and F.IsWString then
+  begin
+    Size := F.StrCapacity * WIDE_CELL_BYTES; Align := WIDE_CELL_BYTES; Exit;
+  end;
   UDTFieldCShape(UDTIdx, FieldIdx, Size, Align);
 end;
 
@@ -25097,7 +25143,7 @@ function TSSAGenerator.FixedLenVarSizeBytes(const Name: string): Int64;
 // The three families differ, and all three were answering 8 - the width of the slot that HOLDS the
 // string, which is exactly what SizeOf is not asking about. Measured against fbc:
 //   Dim As ZString * 13   ->  13   (n bytes; the capacity is n-1 characters plus the NUL)
-//   Dim As WString * 13   ->  26   (n wide cells, 2 bytes each - fbc on Linux says 52; DIVERGENZE 110)
+//   Dim As WString * 13   ->  52   (n cells of WIDE_CELL_BYTES; DIVERGENZE 110, closed 31 Aug 2026)
 //   Dim As String  * 13   ->  14   (n characters plus the terminator fbc keeps)
 // Len is unaffected: it measures the CONTENT and already agreed.
 var
@@ -25111,13 +25157,14 @@ begin
   if Cap <= 0 then
   begin
     // ZSTRING and WSTRING vars share one registry, and it holds CHARACTERS (n-1), so the declared n is
-    // Cap+1 - bytes for a ZSTRING, 2-byte units for a WSTRING.
+    // Cap+1 - bytes for a ZSTRING, wide CELLS for a WSTRING.
     Cap := StrCapOf(FZStringVars, Nm, 0);
     if Cap <= 0 then Exit;
-    // ⚠️ The wide cell is TWO bytes here and FOUR to the Linux fbc - see the long note in
-    // TypeSizeBytes: answering 52 for "Dim As WString * 13" is correct and costs two CUPASS, because
-    // a program that walks the buffer with SizeOf then runs past the end of our UTF-8 storage.
-    if IsWStringVar(Nm) then Exit((Cap + 1) * 2) else Exit(Cap + 1);
+    // ⭐ The width comes from WIDE_CELL_BYTES, the same constant the raw BUFFER is allocated and
+    // indexed with (RawZStringBufBytes, RawStringBufElemBytes) - so what SizeOf reports for this
+    // variable is exactly how many bytes a CLEAR sized by it may write. See TypeSizeBytes for why
+    // that identity is the whole cure and moving this number alone was not.
+    if IsWStringVar(Nm) then Exit((Cap + 1) * WIDE_CELL_BYTES) else Exit(Cap + 1);
   end;
   Result := Cap + 1;   // "String * n": the n characters plus the terminator fbc keeps
 end;
@@ -26967,14 +27014,13 @@ begin
     begin
       if CLayoutSize then
       begin
-        // ⚠️ THE LIVE SHAPE, and a WSTRING member is where that is WRONG: fbc measures "b As WString * n"
-        // as n*4 and this answers n+1. Routing it to UDTFieldReportShape - which is what its own header
-        // says SizeOf should use - was TRIED and WITHDRAWN on 30 Aug 2026: the reported layout is also
-        // what bounds the RAW write of a MID statement into that member's buffer, so the honest number
-        // sent it past the end of storage that is UTF-8 and shorter. wstring/midstmt and
-        // udt-wstring/midstmt went from CUPASS to "Raw pointer dereference out of bounds". Separating
-        // the image from the report along the WHOLE wide-member path is the work; this is not it.
-        UDTFieldCShape(UIdx, k, Size, Align);
+        // ⭐ THE REPORTED SHAPE, which is what this function's own header says SizeOf asks for. It used
+        // to call UDTFieldCShape - the LIVE one - and a WSTRING member came out n+1 where fbc says n*4.
+        // Routing it here was TRIED and WITHDRAWN on 30 Aug 2026, because the report was moving while
+        // the wide IMAGE stayed two bytes wide and the honest number ran past the end of storage
+        // (wstring/midstmt from CUPASS to "Raw pointer dereference out of bounds"). WIDE_CELL_BYTES now
+        // sizes the image and the report from ONE constant, so the two cannot disagree again.
+        UDTFieldReportShape(UIdx, k, Size, Align);
         Exit(True);
       end;
       // LEN of an instance field: the value's length.
@@ -34380,13 +34426,66 @@ begin
     if AnyWStringPtrParam(Node.GetChild(i)) then Exit(True);
 end;
 
+procedure CollectFixedWStringNames(Node: TASTNode; Names: TStringList);
+// Every "DIM w AS WSTRING * n" name in the program, as a set. Same shape test MarkFixedWStringVars
+// uses; kept separate because the binary-I/O gate needs the SET before it can decide anything.
+var
+  i: Integer;
+begin
+  if (Node = nil) or (Names = nil) then Exit;
+  if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (Node.GetChild(1).NodeType = antIdentifier) and
+     (UpperCase(VarToStr(Node.GetChild(1).Value)) = 'WSTRING') and
+     (StrToIntDef(Node.Attributes.Values['FIXEDLEN'], -1) > 0) then
+    if Names.IndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0 then
+      Names.Add(UpperCase(VarToStr(Node.GetChild(0).Value)));
+  for i := 0 to Node.ChildCount - 1 do
+    CollectFixedWStringNames(Node.GetChild(i), Names);
+end;
+
+procedure MarkBinaryIOFixedWStrings(Node: TASTNode; Fixed, Dict: TStringList);
+// Back a fixed-length WSTRING that a BINARY "Get #" or "Put #" NAMES - and only that one. fbc reads the
+// file's bytes straight into the wide CELLS, so the variable must have those cells to read into.
+//
+// ⛔ IT IS NAMED, NOT PROGRAM-WIDE, and the difference cost three assertions before it was narrowed.
+// The first version backed EVERY fixed WSTRING as soon as the program contained any binary Get/Put -
+// the same conservative shape MarkFixedWStringVars uses for the WSTRING PTR case. But this Dict is keyed
+// by BARE NAME and MarkAddressTaken then marks every DIM of that name SHARED: fbc's own
+// boolean/boolean_file declares "x" THREE times - twice As WString * 80 and once As String - so backing
+// "x" for the wstring ones reached the plain STRING one in another block, and an assertion twenty lines
+// above the first wide line started failing. Naming the target keeps the two "x" apart in every program
+// where they are not both file targets. (The general cure is a scoped key - REGISTRI.md class B.)
+//
+// ⚠️ "Put #" is not a node of its own: it is lowered inside ProcessPrintFile, so it arrives as
+// antPrintFile with BIN=1. The target is child 1 in both.
+var
+  i: Integer;
+  Tgt: TASTNode;
+  Nm: string;
+begin
+  if (Node = nil) or (Fixed = nil) or (Dict = nil) then Exit;
+  if (Node.NodeType in [antGetFile, antPrintFile]) and (Node.Attributes.Values['BIN'] = '1') and
+     (Node.ChildCount >= 2) then
+  begin
+    Tgt := Node.GetChild(1);
+    if Tgt.NodeType = antIdentifier then
+    begin
+      Nm := UpperCase(VarToStr(Tgt.Value));
+      if (Fixed.IndexOf(Nm) >= 0) and (Dict.IndexOf(Nm) < 0) then Dict.Add(Nm);
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    MarkBinaryIOFixedWStrings(Node.GetChild(i), Fixed, Dict);
+end;
+
 procedure MarkFixedWStringVars(Node: TASTNode; Dict: TStringList);
-// Mark every "DIM w AS WSTRING * n" as address-taken, so it is backed by a real UCS-2 BUFFER.
+// Mark every "DIM w AS WSTRING * n" as address-taken, so it is backed by a real WIDE-CELL BUFFER.
 //
 // ⛔ WHY IT HAS TO BE THE BUFFER. FreeBASIC passes such a variable to a "WSTRING PTR" parameter by
-// ADDRESS, and the pointee is UCS-2. The conversion we do for a ZSTRING PTR - SADD, the byte address
+// ADDRESS, and the pointee is a wide CELL. The conversion we do for a ZSTRING PTR - SADD, the byte address
 // of the managed string - hands over UTF-8 instead, and the callee's wide dereference read it as
-// UCS-2: "Sub t(ByVal s As Const WString Const Ptr)" called as "t(w)" died on the first "*s", while
+// wide cells: "Sub t(ByVal s As Const WString Const Ptr)" called as "t(w)" died on the first "*s", while
 // the very same call written "t(@w)" worked, because THAT spelling makes the variable address-taken
 // and RawZStringBufBytes gives it (n+1)*2 bytes of exactly the right encoding.
 //
@@ -34550,11 +34649,12 @@ procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
 // (addressable). Also records pointer-var pointee types in FPointerVars. In addition, arguments passed
 // to a BYREF-return function are address-backed so it can return a reference to them (min(a,b)=0).
 var
-  Dict, ByrefRetNames: TStringList;
+  Dict, ByrefRetNames, WFixed: TStringList;
 begin
   if Node = nil then Exit;
   Dict := TStringList.Create;
   ByrefRetNames := TStringList.Create;
+  WFixed := nil;
   try
     FFixedStrNames.Clear;
     CollectFixedStrNames(Node);       // which names are fixed-length character BUFFERS
@@ -34567,6 +34667,18 @@ begin
     // to: the pointee has to be the UCS-2 BUFFER, not the managed string's UTF-8 bytes.
     if AnyWStringPtrParam(Node) then
       MarkFixedWStringVars(Node, Dict);
+    // ...and, one NAME at a time, every fixed WSTRING a binary Get/Put actually names: fbc reads the
+    // file's bytes straight into the wide CELLS, so the variable must have those cells to read into.
+    // Without this the same program read the bytes into the managed register while the buffer stayed
+    // zero, and which of the two a later "w(i)" answered depended on whether the program happened to
+    // take the variable's address somewhere else.
+    WFixed := TStringList.Create;
+    try
+      CollectFixedWStringNames(Node, WFixed);
+      if WFixed.Count > 0 then MarkBinaryIOFixedWStrings(Node, WFixed, Dict);
+    finally
+      WFixed.Free;
+    end;
     MarkAddressTaken(Node, Dict);     // mark their DIMs SHARED
   finally
     Dict.Free;
@@ -35085,7 +35197,12 @@ begin
   // near where it meant to. (The whole-string reading of "*p" is decided before the type code is ever
   // consulted, so this does not disturb it.)
   if (T = 'ZSTRING') or (T = 'UBYTE') then Result := RTC_U8
-  else if T = 'WSTRING' then Result := RTC_U16
+  // ⭐ The pointee width follows WIDE_CELL_BYTES rather than naming a code of its own, so the
+  // arithmetic on a WSTRING PTR and the IMAGE it walks can never be sized differently.
+  else if T = 'WSTRING' then
+  begin
+    if WIDE_CELL_BYTES = 4 then Result := RTC_U32 else Result := RTC_U16;
+  end
   else if T = 'USHORT' then Result := RTC_U16
   else if T = 'ULONG' then Result := RTC_U32
   else if (T = 'BYTE') or (T = 'BOOLEAN') then Result := RTC_I8
@@ -35241,31 +35358,24 @@ begin
   // The string types are what FreeBASIC reports for them, not what our model stores: a STRING is its
   // 24-byte descriptor (pointer + length + capacity) and a WSTRING is one wide character.
   //
-  // ⚠️⚠️ AND THE WIDE CHARACTER HERE IS TWO BYTES WHERE THE LINUX fbc SAYS FOUR - a known divergence,
-  // measured and DELIBERATELY not closed on 30 Aug 2026. The note that used to sit here said "verified
-  // against fbc"; that is true of the WINDOWS fbc, whose wchar_t is 16-bit, and false of the oracle we
-  // actually measure against. FixedStrTypeBytes had the right number all along ("WString * n -> n * 4"),
-  // so the two neighbours disagree: SizeOf(WString * 4) is 16 and SizeOf(WString) is 2.
+  // ✅ AND THE WIDE CHARACTER IS FOUR BYTES, which is what the Linux fbc says (DIVERGENZE 110, closed
+  // 31 Aug 2026). It answered 2 for a long time behind a note claiming to be "verified against fbc" -
+  // true of the WINDOWS fbc, whose wchar_t is 16-bit, and false of the oracle we measure against.
   //
-  // ⛔ WHY IT STAYS. Answering 4 is correct in isolation and LOSES on the suite, three ways measured:
-  //     SizeOf(WString) = 4 alone .................. CUPASS 408 -> 407, CUERR 88 (wstring/len fell:
-  //                                                  its TEST_SIZ moved and SizeOf(s) did not)
-  //     + FixedLenVarSizeBytes (n*4 for a var) ..... CUPASS 406, CUERR 90 - wstring/midstmt and
-  //                                                  udt-wstring/midstmt went from PASS to "Raw
-  //                                                  pointer dereference out of bounds"
-  //     + the WString MEMBER reported n*4 .......... the same 406 / 90
-  // The reason is not arithmetic: a program that WALKS a wide buffer with SizeOf gets an offset our
-  // storage cannot honour, because our WSTRING is UTF-8 in the ordinary string bank and fbc's is an
-  // array of 4-byte cells. Reporting fbc's number over our image turns a wrong ANSWER into an out of
-  // bounds. Closing it means separating the reported layout from the live image along the whole wide
-  // path - the work DIVERGENZE 110 names - not changing this constant.
+  // ⛔ WHY THE FIRST ATTEMPT LOST, and it is the lesson worth keeping: on 30 Aug 2026 this constant was
+  // moved to 4 ALONE. CUPASS went 408 -> 406 and two tests from PASS to "Raw pointer dereference out of
+  // bounds", because SizeOf is not only an answer - it SIZES the CLEAR that every fbcunit fixed-string
+  // macro opens with. The report said 4n while the image still held 2n, and the memset ran past the end.
+  // ⇒ The cure was never this constant. It was ONE constant, WIDE_CELL_BYTES, read by the report and by
+  // the byte IMAGE alike (the raw buffer's allocation, its indexed access, and the load/store that
+  // encode it), so the two halves cannot drift apart. Guard m794.
   if T = 'STRING' then Result := 24
   // ⛔ ...AND A ZSTRING IS ONE BYTE. It was absent from this list, so it fell all the way to the
   // "unknown type is pointer-sized" default and SizeOf(ZString) answered 8 against fbc's 1 - the same
   // wrong number an unrecognised name gets, which is why nothing ever pointed at it. Its WSTRING
   // neighbour was here from the start.
   else if T = 'ZSTRING' then Result := 1
-  else if T = 'WSTRING' then Result := 2
+  else if T = 'WSTRING' then Result := WIDE_CELL_BYTES
   else if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
   else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
   else if (T = 'LONG') or (T = 'ULONG') then Result := 4
@@ -36541,8 +36651,9 @@ begin
 end;
 
 function TSSAGenerator.RawZStringBufBytes(const Name: string): Integer;
-// An @-taken "ZSTRING * n" / "WSTRING * n" is a CHARACTER BUFFER, not a scalar: n bytes (n wide units
-// for a WSTRING) that another pointer may read as raw memory. Answers its size in bytes, or 0.
+// An @-taken "ZSTRING * n" / "WSTRING * n" is a CHARACTER BUFFER, not a scalar: n bytes (n cells of
+// WIDE_CELL_BYTES for a WSTRING) that another pointer may read as raw memory. Answers its size in
+// bytes, or 0. ⭐ This is the ALLOCATION half of the identity SizeOf reports - see WIDE_CELL_BYTES.
 //
 // Without this such a variable got the same 8-byte slot every @-taken scalar gets, and its value was
 // stored there as an 8-byte INTEGER - so "@z" pointed at eight bytes of nothing and anything reading
@@ -36557,7 +36668,7 @@ begin
   if (AddrLocalType(Nm) <> 'ZSTRING') and (AddrLocalType(Nm) <> 'WSTRING') then Exit;
   Chars := StrCapOf(FZStringVars, Nm, 0);                 // stored as n-1 characters
   if Chars <= 0 then Exit;
-  if AddrLocalType(Nm) = 'WSTRING' then Result := (Chars + 1) * 2 else Result := Chars + 1;
+  if AddrLocalType(Nm) = 'WSTRING' then Result := (Chars + 1) * WIDE_CELL_BYTES else Result := Chars + 1;
 end;
 
 procedure TSSAGenerator.EmitRawAddrScalarAlloc(const Name: string);

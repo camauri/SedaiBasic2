@@ -5550,12 +5550,14 @@ function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
 // "*p" where p is a ZSTRING PTR (Wide=False) or WSTRING PTR (Wide=True): the C string AT the
 // pointed address, read up to the NUL terminator - never past the end of the byte heap (a block
 // missing its NUL yields the bytes to the region end instead of walking off it). WSTRING is
-// stored as UCS-2 units and converted to the VM's uniform UTF-8 managed string.
+// stored as WIDE_CELL_BYTES-wide cells, one per codepoint, and converted to the VM's uniform UTF-8
+// managed string.
 var
   P: PByte;
   ofs, Limit, n: PtrUInt;
+  i: Integer;
   W: UnicodeString;
-  PW: PWord;
+  PW: PLongWord;
 begin
   // ⛔ A NULL ZSTRING/WSTRING POINTER READS AS THE EMPTY STRING, and that is fbc's rule rather than
   // undefined behaviour it gets away with: its string runtime tests the pointer, so "Len(*pz)" answers
@@ -5580,11 +5582,14 @@ begin
   end
   else
   begin
-    PW := PWord(P);
+    // ⭐ ONE CELL IS WIDE_CELL_BYTES, and the cell is WIDER than the UnicodeString unit it decodes
+    // into, so this cannot be a Move: each cell is read whole and narrowed. A codepoint above the BMP
+    // fits one cell here and TWO UTF-16 units in W, which is why W is built by appending.
+    PW := PLongWord(P);
     n := 0;
-    while (n * 2 + 1 < Limit) and (PW[n] <> 0) do Inc(n);
-    SetLength(W, n);
-    if n > 0 then Move(PW^, W[1], n * 2);
+    while ((n + 1) * WIDE_CELL_BYTES <= Limit) and (PW[n] <> 0) do Inc(n);
+    W := '';
+    for i := 0 to Integer(n) - 1 do W := W + UCS4CellToUnicode(PW[i]);
     Result := UTF8Encode(W);
   end;
 end;
@@ -5595,7 +5600,8 @@ procedure TBytecodeVM.RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Bool
 // instead of corrupting the heap (fbc would silently overrun).
 var
   P: PByte;
-  W: UnicodeString;
+  i: Integer;
+  U: TUCS4Cells;
 begin
   if not Wide then
   begin
@@ -5605,10 +5611,13 @@ begin
   end
   else
   begin
-    W := UTF8Decode(S);
-    P := PByte(RawAddr(RawPtr, PtrUInt(Length(W)) * 2 + 2));
-    if Length(W) > 0 then Move(W[1], P^, PtrUInt(Length(W)) * 2);
-    PWord(P)[Length(W)] := 0;
+    // The mirror: one CELL per codepoint, a surrogate PAIR folded back into the single cell it came
+    // from - so a round trip through the buffer is the identity, which the UCS-2 image could not
+    // promise above the BMP.
+    U := UnicodeToUCS4Cells(UTF8Decode(S));
+    P := PByte(RawAddr(RawPtr, (PtrUInt(Length(U)) + 1) * WIDE_CELL_BYTES));
+    for i := 0 to Length(U) - 1 do PLongWord(P)[i] := U[i];
+    PLongWord(P)[Length(U)] := 0;
   end;
 end;
 
@@ -13958,7 +13967,7 @@ begin
       end;
     33: // bcRawClear - CLEAR(dst, value, bytes)
       RawClear(Ctx, Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (UCS-2).
+    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (wide cells).
         // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
         // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
         // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or

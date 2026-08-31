@@ -2984,7 +2984,7 @@ End Function
 | `STRING` | ✓ | 8-bit character string data type. |
 | `STRING (Function)` | ✓ | `STRING(count, ch)` returns `count` copies of a character (a char code or the first character of a string). |
 | `ZSTRING` | ✓ | Null-terminated 8-bit character string data type. |
-| `WSTRING` | ✓ | Standard data type: wide character string (UTF-8 storage, codepoint-aware LEN/slice). |
+| `WSTRING` | ✓ | Standard data type: wide character string (codepoint-aware LEN/slice). The managed value is held as UTF-8; the BYTE IMAGE a program can see — what `SizeOf` reports, what `@w` points at, what `Clear w, 0, SizeOf(w)` writes over and what `Get #`/`Put #` transfer — is a vector of **4-byte cells**, one per codepoint, matching `fbc` on Linux (`SizeOf(WString)` = 4, `SizeOf(WString * 13)` = 52, and a `b As WString * 13` member measures 52). |
 | `WSTRING (Function)` | ✓ | `WSTRING(n, cp)` — n copies of the wide char for Unicode codepoint cp. |
 | `SPACE` | ✓ | Returns a String of N spaces. `SPACE(n)` / `SPACE$(n)` (B1.2). |
 | `WSPACE` | ✓ | `WSPACE(n)` — a wide string of n spaces. |

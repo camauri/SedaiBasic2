@@ -558,7 +558,8 @@ const
   bcArrayBindInd       = bcGroupArray + 49;  // Array BYREF param bind whose ARG is a UDT array member: Src1=param array id (immediate), Src2=int reg holding the member's runtime FArrays handle. Otherwise identical to bcArrayBind (pushes the same save-stack entry, committed by bcArrayBindApply, popped by bcArrayUnbind).
   // C-string view of the raw byte heap: "*p" where p is a ZSTRING PTR (or WSTRING PTR) reads/writes a
   // NUL-terminated string AT the pointed address, FreeBASIC-style. Immediate: 0 = ZSTRING (bytes),
-  // 1 = WSTRING (UCS-2 units, converted from/to our uniform UTF-8 managed strings).
+  // 1 = WSTRING (WIDE_CELL_BYTES-wide cells, one per CODEPOINT, converted from/to our uniform UTF-8
+  // managed strings). The cell is four bytes, as fbc's wchar_t is on Linux - see WIDE_CELL_BYTES.
   bcRawLoadZStr        = bcGroupArray + 50;  // Dest(str) = C string at RawAddr(IntRegs[Src1]) up to NUL
   bcRawStoreZStr       = bcGroupArray + 51;  // bytes of StringRegs[Src2] + NUL -> RawAddr(IntRegs[Src1])
 
