@@ -831,6 +831,28 @@ begin
             DeclNd.Value := Qual + SigV;
             Continue;                       // resolved as a TYPE; the generic rewrite must not re-do it
           end;
+        end
+        // ⛔⛔ ...AND A PARTIALLY QUALIFIED SLOT IS STILL A TYPE SLOT. The test above is "no dot at
+        // all", so "Dim As ns_a.shape v" written from the ENCLOSING namespace was handed to the generic
+        // rewrite - which asks the VARIABLE authority - and came out as "NS_A.SHAPE", a type that
+        // exists nowhere: the real one is "Q.NS_A.SHAPE". The variable then got no record at all, so
+        // "v.x = 99 : Print v.x" answered 0 and passing it to a SUB that reads a field was an
+        // ACCESS VIOLATION. ⭐ The very same declaration written OUT IN FULL worked, which is what said
+        // it was the spelling and not the nesting (fbc's own namespace/dups_qkwd, reduced to fifteen
+        // lines). [[two-spellings-of-one-thing-that-disagree-name-the-missing-path]]
+        //
+        // The HEAD is what needs resolving, and ResolveNamespacePrefix is the funnel that already does
+        // it for every other partially qualified reference: enclosing chain first, then the imports.
+        // ⚠️ A nested TYPE ("T.U") is a dotted spelling too, and it must NOT be touched - the head is
+        // not a namespace, so that helper answers '' and this arm declines, which is the closed side.
+        else if (V <> '') and (Pos('.', V) > 0) then
+        begin
+          Qual := ResolveNamespacePrefix(ChildPrefix, Copy(V, 1, Pos('.', V) - 1), Ctx, UseUsing);
+          if Qual <> '' then
+          begin
+            DeclNd.Value := Qual + Copy(V, Pos('.', V), MaxInt) + SigV;
+            Continue;
+          end;
         end;
       end;
     end;
