@@ -14225,7 +14225,13 @@ begin
             RecSetFieldInt(Rec, RecSlot, PtrAddr);
           end;
           RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
-        end;
+          if GArrPrivDiag then
+            WriteLn(ErrOutput, Format('[arrpriv] MEMBRO rec=%p slot=%d -> phys %d size=%d',
+                    [Pointer(Rec), RecSlot, PtrAddr, FArrays[PtrAddr].TotalSize]));
+        end
+        else if GArrPrivDiag then
+          WriteLn(ErrOutput, Format('[arrpriv] MEMBRO ⛔ record NULLO (handle=%d slot=%d)',
+                  [Ctx.IntRegs[Instr.Src1], RecSlot]));
         SetLength(FRedimPendingUBs, 0);
         SetLength(FRedimPendingLBs, 0);
       end;

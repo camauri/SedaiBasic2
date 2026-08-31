@@ -940,6 +940,7 @@ type
     function UDTArrayElemPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT when an array member's elements are UDT POINTERS (else '')
     function UDTFuncPtrFieldSig(UDTIdx: Integer; const FieldName: string; out Slot: Integer): string;  // funcptr field signature + slot (else '')
     function UDTFieldWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
+    function UDTFieldArrayElemWidthCode(UDTIdx: Integer; const FieldName: string): Integer;  // ...and of an array member's ELEMENT
     function UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;  // B1.5: field narrow width
     function UDTFieldBitWidth(UDTIdx: Integer; const FieldName: string): Integer;  // 0 = not a bit field
     function UDTFieldStrCapacity(UDTIdx: Integer; const FieldName: string; out Wide: Boolean): Integer;
@@ -10101,8 +10102,19 @@ begin
     if (UpperCase(AllocFuncU) = 'CALLOCATE') and (ExprNode.ChildCount >= 2) and
        (ExprNode.GetChild(1).ChildCount >= 2) then
       ProcessExpression(ExprNode.GetChild(1).GetChild(0), CountReg)
+    // ⛔⛔ THE COUNT IS THE REPORTING QUESTION, NOT THE IMAGE ONE, and asking the image one silently
+    // allocated ONE record. "How many records fit in these bytes" is answered by what the type
+    // MEASURES - the same number SizeOf gives - and UDTCLayout declines by default for a type whose
+    // image we cannot reproduce: a FIXED-LENGTH ARRAY MEMBER is exactly that case (fbc lays its
+    // elements out inline, we keep a handle there). So "CAllocate( SizeOf(T) * 8 )" on
+    // "Type T : a(0 To 2) As Byte : End Type" fell past this test, CountReg stayed 1, and p[0] worked
+    // while p[1] was an Access Violation - fbc's own functions/odd-arg, and the two-argument spelling
+    // "CAllocate( 8, SizeOf(T) )" of the same allocation was right all along.
+    // ⚠️ ReportOnly HERE and nowhere else: UDTBlockIsManaged still asks UDTCLayoutRaw, so a type with
+    // an array member stays a block of MANAGED records. Handing the raw path a size it can now compute
+    // is the failure this comment's own warning records.
     else if (ExprNode.ChildCount >= 2) and (ExprNode.GetChild(1).ChildCount = 1) and
-       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize) and (AllocElemSize > 0) then
+       UDTCLayout(UDTIdx, AllocOffsets, AllocElemSize, True) and (AllocElemSize > 0) then
     begin
       ProcessExpression(ExprNode.GetChild(1).GetChild(0), BytesVal);
       // Divide ROUNDING UP - "(bytes + size - 1) \ size" - so any non-zero request yields at least
@@ -23463,9 +23475,12 @@ begin
   else if not FoldIntNode(D, Ub) then Exit;
   if Ub < Lb then Exit;
   Count := Ub - Lb + 1;
-  ElemBytes := BinaryElemBytesOfWidthCode(F.WidthCode);
+  // ⛔ THE ELEMENT'S WIDTH, NOT THE SLOT'S. This read F.WidthCode, which is the store-narrowing width
+  // of the FIELD - and the field is a handle. The two were the same number only because the field was
+  // being given its element's width by mistake; ArrayElemScalarType is where the element's type lives.
+  ElemBytes := BinaryElemBytesOfWidthCode(TypeNameWidthCode(F.ArrayElemScalarType));
   if F.ArrayElemBank = srtFloat then
-    if F.WidthCode <> 7 then ElemBytes := 8;
+    if TypeNameWidthCode(F.ArrayElemScalarType) <> 7 then ElemBytes := 8;
   Result := (Count > 0) and (ElemBytes > 0);
 end;
 
@@ -24906,9 +24921,10 @@ begin
     antArrayAccess:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
-        // obj.field(i): a narrow member-array element carries the field's own width.
+        // obj.field(i): a narrow member-array element carries the ELEMENT's width - the field itself
+        // is a handle, and asking for ITS width used to work only because the field wrongly held it.
         MNode := Node.GetChild(0);
-        Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
+        Result := UDTFieldArrayElemWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
@@ -25822,7 +25838,7 @@ begin
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
         MNode := Node.GetChild(0);
-        Result := UDTFieldWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
+        Result := UDTFieldArrayElemWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
       end;
     antMemberAccess:
       if Node.ChildCount >= 1 then
@@ -26159,10 +26175,10 @@ begin
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
-        // obj.field(i) member-array element: the field's own narrow width says whether it prints unsigned
+        // obj.field(i) member-array element: the ELEMENT's narrow width says whether it prints unsigned
         // (UByte/UShort/ULong member array -> no sign space). ObjectTypeName is the no-emit type query.
         MNode := Node.GetChild(0);
-        AwCode := UDTFieldWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
+        AwCode := UDTFieldArrayElemWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
@@ -27241,6 +27257,27 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
 end;
 
+function TSSAGenerator.UDTFieldArrayElemWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
+// The narrow width code of an ARRAY member's ELEMENT ("a(0 To 3) As UByte" -> the UByte code), which is
+// what "obj.field(i)" is worth. ⛔ Its twin UDTFieldWidthCode answers for the FIELD, and for an array
+// member the field is a HANDLE whose width is full - so the two questions have different answers and
+// only one storage used to hold them. The element's declared type has its own: ArrayElemScalarType.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then
+    begin
+      if FUDTs[UDTIdx].Fields[i].IsArray then
+        Exit(TypeNameWidthCode(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType));
+      Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
+    end;
+end;
+
 function TSSAGenerator.UDTFieldIsBoolean(UDTIdx: Integer; const FieldName: string): Boolean;
 // Was this field declared AS BOOLEAN? It decides how the field PRINTS ("true"/"false") and what
 // LEN/SIZEOF of it answer (1). A Boolean carries no width code, so there is nothing else to ask.
@@ -27888,7 +27925,18 @@ begin
       if (FUDTs[Idx].Fields[n].Bank = srtString) and (FUDTs[Idx].Fields[n].StrCapacity > 0) and
          (not FUDTs[Idx].Fields[n].IsWString) and (not FUDTs[Idx].Fields[n].IsZString) then
         FHasFixedLenFields := True;
-      if NestedT = '' then
+      // ⛔⛔ AN ARRAY MEMBER'S SLOT HOLDS A HANDLE, SO ITS WIDTH IS FULL - and this is the same rule the
+      // three lines above apply to the BANK ("the field slot holds the FArrays handle") and did not
+      // apply to the WIDTH. "a(0 To 2) As Byte" gave the SLOT the byte width, so the FArrays id stored
+      // there was sign-extended from 8 bits: handle 132 read back as -124 and every "arr(i).a(j)"
+      // silently answered 0.
+      // ⚠️ IT ONLY SHOWED ABOVE 127, which is why it looked like something else entirely: the handle
+      // is an index into FArrays, and how big it gets depends on how many PRIVATE arrays the program
+      // reserved blocks for. One proc-local array anywhere else in the program was the difference
+      // between 66 (right) and 132 (wrong) - fbc's own functions/odd-arg, and eight probes built from
+      // the bottom were all green because their handles were small.
+      // ⭐ The ELEMENT's width is a different question and has its own storage, ArrayElemScalarType.
+      if (NestedT = '') and (not IsArrayField) then
         FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
       else
         FUDTs[Idx].Fields[n].WidthCode := 0;
