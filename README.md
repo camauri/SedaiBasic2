@@ -12,6 +12,28 @@
   |____/ \___|\__,_|\__,_|_|____/ \__,_|___/_|\___|_____|
 ```
 
+## See it running
+
+<p align="center">
+  <a href="bas/demo/buddhabrot/README.md">
+    <img src="bas/demo/buddhabrot/buddhabrot.png" alt="Buddhabrot rendered by SedaiBasic" width="420">
+  </a>
+</p>
+
+**[Buddhabrot](bas/demo/buddhabrot/README.md)** — a density map of the orbits that escape the
+Mandelbrot set, converging out of noise in real time. It is the demo to look at first, because it is
+the one that shows what the engines do: the same program, the same seed and the same frame rate under
+the bytecode interpreter, the JIT and the AOT compiler, and **about four times as much picture per
+second** on the last of them. The source is meant to be read — the whole algorithm is one subroutine
+that fits on a screen.
+
+```bash
+./build.sh sb --window
+bash bas/demo/buddhabrot/compare_engines.sh     # all three engines, side by side
+```
+
+Also in [`bas/demo/`](bas/demo/): `bubble_universe.bas`, `voxel_landscape.bas`, `sedai_lbm.bas`.
+
 ## ⚠️ Branch Information
 
 | Branch | Status | Description |

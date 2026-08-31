@@ -1,0 +1,37 @@
+Buddhabrot demo for SedaiBasic
+Copyright (C) 2026 Maurizio Cammalleri
+
+Licensed under the GNU General Public License, version 3 or (at your option) any
+later version. The full text is in the LICENSE file at the root of this repository,
+and at <https://www.gnu.org/licenses/gpl-3.0.html>.
+
+    This program is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free Software
+    Foundation, either version 3 of the License, or (at your option) any later
+    version.
+
+    This program is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+    PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along with
+    this program. If not, see <https://www.gnu.org/licenses/>.
+
+-------------------------------------------------------------------------------
+WHY THIS FILE IS HERE AND NOT ONLY AT THE REPOSITORY ROOT
+
+Because this directory sits next to IMPLEMENTATIONS.md, which lists other people's
+Buddhabrot implementations under half a dozen different licences - two of them under
+no licence at all. When licences are being compared a few lines away, the licence of
+the thing being compared should not have to be inferred.
+
+-------------------------------------------------------------------------------
+WHAT IS AND IS NOT COVERED
+
+Covered: buddhabrot.bas, the two shell scripts, README.md, IMPLEMENTATIONS.md and
+the rendered image in this directory. All of them are original work.
+
+Not applicable: the Buddhabrot rendering technique itself, which is Melinda Green's
+and is not ours to license. This implementation was written from the published
+mathematical description of the algorithm and contains no code from any other
+Buddhabrot implementation. See IMPLEMENTATIONS.md for the genealogy of the idea.
