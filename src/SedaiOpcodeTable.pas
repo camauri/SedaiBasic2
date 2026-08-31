@@ -156,8 +156,10 @@ const
   // Compile-time dense base of each group, for the flat dispatch case labels (milestone M2). These
   // MUST match GGroupBase computed at init from OPCODES; VerifyOpcodeTable asserts it, so a new opcode
   // that grows a group (or enabling WEB_MODE) fails the self-check LOUDLY instead of miscompiling.
-  // Values below are for the default (no-WEB_MODE) build: web opcodes are gated out, so group 8 takes
-  // no dense range and graphics/sound/super sit where they do here.
+  // ⇒ Since 1 Sep 2026 there is ONE ladder for both builds: the sizes below are the only numbers
+  // written by hand, and WEB_MODE changes exactly one of them (group 8, 13 or 0).
+  // The notes that follow are the history of the groups that grew - kept because each names the
+  // symptom a wrong number produced.
   // ⚠️ bcRecordSetTypeId (core sub 168) made group 0 one wider on 18 Aug 2026, which shifts EVERY
   // base below and DENSE_TOTAL by one, in BOTH branches - and the core range in RunTemplate.inc.
   // ⚠️ The five bit intrinsics (core subs 163..167) made group 0 five wider, which shifts EVERY base
@@ -181,42 +183,48 @@ const
   // one, in BOTH branches, and so did DENSE_TOTAL. ⭐ `sb --verify-opcodes` earned its keep again - the
   // opcode compiled, disassembled and had its arm, and the interpreter ran it as a MATH op ("Unknown
   // math opcode 308"). The self-check printed every number to use.
-  DENSE_CORE_BASE     = 0;    // group 0  (171 opcodes) -> dense 0..170
-  DENSE_STRING_BASE   = 171;  // group 1  (53)          -> 171..223 (bcStrInstrRevAnyW = sub 54)
-  DENSE_MATH_BASE     = 226;  // group 2  (43)          -> 220..262
-                              // ⚠️ CEIL/ROUND/MIN/MAX/COPYSIGN and the two bit-casts took this group
-                              // from 36 to 43, and every base below moved with it. ⛔ HEADROOM IS NOT
-                              // ALLOWED: the runtime map is built from the actual opcode counts, so a
-                              // base with slack fails `--verify-opcodes` immediately - which it did,
-                              // and it printed the right numbers to use.
-  DENSE_ARRAY_BASE    = 269;  // group 3  (52)          -> 254..305 (bcRawLoad/StoreZStr = subs 50/51)
-  DENSE_IO_BASE       = 321;  // group 4  (23)          -> 306..328
-  // ⚠️ bcCpuCount (sub 17) made group 5 one wider, which shifts FILEIO and everything below it -
-  // and DENSE_TOTAL - by one, in BOTH branches. Nothing checks these at compile time;
-  // `sb --verify-opcodes` is what says so, and it prints the right numbers when they are wrong.
-  DENSE_SPECIAL_BASE  = 344;  // group 5  (18)          -> 338..355
-  DENSE_FILEIO_BASE   = 362;  // group 6  (37)
-  DENSE_SPRITE_BASE   = 399;  // group 7  (17)
+  // ⭐⭐ ONE hand-written number per group: its SIZE. Every base is DERIVED by summing the sizes above
+  // it, and DENSE_TOTAL is the sum of them all, so the chain can no longer go out of step with
+  // ITSELF - only with the opcode list, which is exactly what `sb --verify-opcodes` compares it to.
+  // ⛔ This replaces two hand-maintained ladders (one per WEB_MODE branch) that had to be edited in
+  // lockstep and were not: DENSE_WEB_BASE sat one slot INSIDE the sprite group for months, and the
+  // only thing that ever said so was "duplicate case label" in a WEB_MODE build nothing compiles.
+  // ⛔ HEADROOM IS NOT ALLOWED: the runtime map is built from the actual opcode counts, so a size
+  // with slack fails `--verify-opcodes` immediately - and it prints the right numbers to use.
+  // ⇒ Growing a group is now ONE edit: its size. The base ladder, DENSE_TOTAL and the dispatch
+  //   ranges in RunTemplate.inc all follow from it.
+  DENSE_CORE_SIZE     = 171;  // group 0
+  DENSE_STRING_SIZE   = 55;   // group 1   (bcStrInstrRevAnyW = sub 54)
+  DENSE_MATH_SIZE     = 43;   // group 2   (CEIL/ROUND/MIN/MAX/COPYSIGN + the two bit-casts)
+  DENSE_ARRAY_SIZE    = 52;   // group 3   (bcRawLoad/StoreZStr = subs 50/51)
+  DENSE_IO_SIZE       = 23;   // group 4
+  DENSE_SPECIAL_SIZE  = 18;   // group 5   (bcCpuCount = sub 17)
+  DENSE_FILEIO_SIZE   = 37;   // group 6
+  DENSE_SPRITE_SIZE   = 17;   // group 7
   {$IFDEF WEB_MODE}
-  // group 8 (web, subs 1..12) inserts a 13-slot block, shifting graphics/sound/super up by 13.
-  DENSE_WEB_BASE      = 415;  // 12 used, slot 0 a hole
-  // bcGfxDrawString made group 10 one wider (65 -> 66), which pushes SOUND, SUPER and TOTAL up by one
-  // in BOTH branches. Nothing checks these at compile time; `sb --verify-opcodes` is what says so, and
-  // it did - immediately, with "sound=463/462 super=469/468 N=725/724".
-  DENSE_GRAPHICS_BASE = 429;  // group 10 (69)
-  DENSE_SOUND_BASE    = 498;  // group 11 (6)
-  // group 12 (bigint, 4 subs) sits between sound and super, so it shifts SUPER
-  // and TOTAL by 4 in BOTH branches - and nothing checks that at compile time.
-  DENSE_BIGINT_BASE   = 504;  // group 12 (13)
-  DENSE_SUPER_BASE    = 517;  // group 200 (72 slots: DENSE 0..71)
-  DENSE_TOTAL         = 589;  // N (with web)
+  DENSE_WEB_SIZE      = 13;   // group 8   subs 1..12, slot 0 a hole
   {$ELSE}
-  DENSE_GRAPHICS_BASE = 416;  // group 10 (69)
-  DENSE_SOUND_BASE    = 485;  // group 11 (6)
-  DENSE_BIGINT_BASE   = 491;  // group 12 (13)
-  DENSE_SUPER_BASE    = 504;  // group 200 (72 slots, no holes: DENSE 0..71)
-  DENSE_TOTAL         = 576;  // N
+  DENSE_WEB_SIZE      = 0;    // group 8 is gated out: it takes NO dense range
   {$ENDIF}
+  DENSE_GRAPHICS_SIZE = 69;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK)
+  DENSE_SOUND_SIZE    = 6;    // group 11
+  DENSE_BIGINT_SIZE   = 13;   // group 12
+  DENSE_SUPER_SIZE    = 72;   // group 200 keeps its whole block, holes included
+
+  DENSE_CORE_BASE     = 0;
+  DENSE_STRING_BASE   = DENSE_CORE_BASE     + DENSE_CORE_SIZE;
+  DENSE_MATH_BASE     = DENSE_STRING_BASE   + DENSE_STRING_SIZE;
+  DENSE_ARRAY_BASE    = DENSE_MATH_BASE     + DENSE_MATH_SIZE;
+  DENSE_IO_BASE       = DENSE_ARRAY_BASE    + DENSE_ARRAY_SIZE;
+  DENSE_SPECIAL_BASE  = DENSE_IO_BASE       + DENSE_IO_SIZE;
+  DENSE_FILEIO_BASE   = DENSE_SPECIAL_BASE  + DENSE_SPECIAL_SIZE;
+  DENSE_SPRITE_BASE   = DENSE_FILEIO_BASE   + DENSE_FILEIO_SIZE;
+  DENSE_WEB_BASE      = DENSE_SPRITE_BASE   + DENSE_SPRITE_SIZE;
+  DENSE_GRAPHICS_BASE = DENSE_WEB_BASE      + DENSE_WEB_SIZE;   // web contributes 0 outside WEB_MODE
+  DENSE_SOUND_BASE    = DENSE_GRAPHICS_BASE + DENSE_GRAPHICS_SIZE;
+  DENSE_BIGINT_BASE   = DENSE_SOUND_BASE    + DENSE_SOUND_SIZE;
+  DENSE_SUPER_BASE    = DENSE_BIGINT_BASE   + DENSE_BIGINT_SIZE;
+  DENSE_TOTAL         = DENSE_SUPER_BASE    + DENSE_SUPER_SIZE; // N: 576, or 589 with web
 
 var
   // Derived at initialization from OPCODES (see InitOpcodeTable).
@@ -375,9 +383,15 @@ begin
      (GGroupBase[bcGroupSuper    shr 8] <> DENSE_SUPER_BASE)    or
      (GDenseCount <> DENSE_TOTAL) then
   begin
+    // The comparison above tests web too, so the message has to PRINT web too - otherwise a
+    // WEB_MODE build reports "out of sync" with every printed pair equal, and the one number that
+    // is wrong is the only one not on the line. That is exactly how DENSE_WEB_BASE stayed one too
+    // low: the check fired and named nothing.
     Msg := Format('compile-time DENSE_*_BASE constants out of sync with runtime map '
                 + '(core=%d/%d string=%d/%d math=%d/%d array=%d/%d io=%d/%d special=%d/%d '
-                + 'fileio=%d/%d sprite=%d/%d graphics=%d/%d sound=%d/%d super=%d/%d N=%d/%d)',
+                + 'fileio=%d/%d sprite=%d/%d '
+                {$IFDEF WEB_MODE} + 'web=%d/%d ' {$ENDIF}
+                + 'graphics=%d/%d sound=%d/%d super=%d/%d N=%d/%d)',
       [GGroupBase[bcGroupCore shr 8], DENSE_CORE_BASE,
        GGroupBase[bcGroupString shr 8], DENSE_STRING_BASE,
        GGroupBase[bcGroupMath shr 8], DENSE_MATH_BASE,
@@ -386,6 +400,9 @@ begin
        GGroupBase[bcGroupSpecial shr 8], DENSE_SPECIAL_BASE,
        GGroupBase[bcGroupFileIO shr 8], DENSE_FILEIO_BASE,
        GGroupBase[bcGroupSprite shr 8], DENSE_SPRITE_BASE,
+       {$IFDEF WEB_MODE}
+       GGroupBase[bcGroupWeb shr 8], DENSE_WEB_BASE,
+       {$ENDIF}
        GGroupBase[bcGroupGraphics shr 8], DENSE_GRAPHICS_BASE,
        GGroupBase[bcGroupSound shr 8], DENSE_SOUND_BASE,
        GGroupBase[bcGroupSuper shr 8], DENSE_SUPER_BASE,

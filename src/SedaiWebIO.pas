@@ -520,25 +520,58 @@ begin
   Result := FInitialized;
 end;
 
+procedure AdvanceWebColumn(var Col: Integer; const Text: string);
+// PRINT's column, which Tab() and Spc() read back through GetCursorX.
+// ⛔ Print/PrintLn used to leave FCursorX at 0 forever - it only ever moved on an explicit
+// SetCursor/MoveCursor - so every Tab(n) padded from column 0 and sbw's output drifted from sb's on
+// any program that uses Tab or Spc (found by sweeping 250 MODERN corpus programs on 1 Sep 2026:
+// aot_c3_helper_print was the single remaining non-timing divergence).
+// ⚠️ Counts CHARACTERS, not bytes: a UTF-8 continuation byte ($80..$BF) is part of the character
+// before it, and counting bytes would make an accented letter cost two columns.
+var
+  i: Integer;
+  LastBreak: Integer;
+begin
+  LastBreak := 0;
+  for i := 1 to Length(Text) do
+    if Text[i] = #10 then LastBreak := i;
+  if LastBreak > 0 then
+    Col := 0;                       // everything before the last newline is off the current line
+  for i := LastBreak + 1 to Length(Text) do
+    if (Byte(Text[i]) and $C0) <> $80 then
+      Inc(Col);
+end;
+
 procedure TWebOutput.Print(const Text: string; ClearBackground: Boolean);
 begin
   FContent.Append(Text);
+  AdvanceWebColumn(FCursorX, Text);
 end;
 
 procedure TWebOutput.PrintLn(const Text: string; ClearBackground: Boolean);
 begin
   FContent.Append(Text);
   FContent.AppendLine;
+  FCursorX := 0;
 end;
 
 procedure TWebOutput.NewLine;
 begin
   FContent.AppendLine;
+  FCursorX := 0;
 end;
 
 function TWebOutput.IsScreenVisible: Boolean;
 begin
-  Result := True;   // the web canvas is a visible screen
+  // ⛔ FALSE, and the reason is TAB/SPC. In MODERN they are cursor MOVEMENTS that FreeBASIC emits
+  // only onto a visible screen - to a redirected stream it writes nothing, because there are no
+  // cells to skip over (see bcPrintTab in SedaiBytecodeVM, and SedaiWasmBackend, which already calls
+  // its host "a byte sink"). An HTTP response body IS that redirected stream.
+  // ⚠️ This answered TRUE ("the web canvas is a visible screen") from the days when sbw only ever ran
+  // CLASSIC, where the gate cannot fire because CLASSIC always emits the spaces. The moment MODERN
+  // started working here (1 Sep 2026) the wrong answer became visible: `Print Tab(i*2); i` padded,
+  // where fbc and sb both print no padding at all.
+  Result := False;
 end;
 
 procedure TWebOutput.Clear;

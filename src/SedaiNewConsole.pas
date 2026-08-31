@@ -9277,29 +9277,31 @@ begin
 end;
 
 function TSedaiNewConsole.SourceHasLineNumbers(const AFileName: string): Boolean;
-// A classic line-numbered BASIC source has a leading integer on its lines; a FreeBASIC (MODERN) source
-// never does. Scan the non-empty lines: if the first whitespace-delimited token is a non-negative
-// integer on any line, treat the file as classic.
+// The dialect of a startup file, and it is THE SAME ANSWER sb, sbc and sbw get: this delegates to
+// TSedaiRunner.SourceHasLineNumbers rather than deciding for itself.
+//
+// ⛔⛔ It used to be a SECOND, naive copy - "trim the line, is the first token a non-negative
+// integer" - and it disagreed with the shared one on two shapes that this codebase has already paid
+// for once, measured 1 Sep 2026 (2 disagreements in a 6-file probe):
+//   - a FreeBASIC LINE CONTINUATION: "a = 1 + _" / "    2 + _" / "    3" - the copy read that 2 as a
+//     line number. The shared one restored this rule after m214_linecont caught its absence;
+//   - a trailing BLOCK COMMENT, which is how dozens of the FreeBASIC manual's examples show their
+//     output:  /' Output:  /  0  /  1  /  '/  - that " 0" made the whole program CLASSIC. Ten of the
+//     manual's examples were affected the last time this happened
+//     (see [[a-comment-could-change-the-dialect]] and the comment on the shared function).
+// Only sbv reached this path, so only sbv was wrong; sb/sbc/sbw were already right.
+// ⇒ Two spellings of one decision is one spelling too many. There is now one.
 var
-  Lines: TStringList;
-  i, SpacePos, N: Integer;
-  L, Tok: string;
+  Src: TStringList;
 begin
   Result := False;
   if not FileExists(AFileName) then Exit;
-  Lines := TStringList.Create;
+  Src := TStringList.Create;
   try
-    try Lines.LoadFromFile(AFileName); except Exit; end;
-    for i := 0 to Lines.Count - 1 do
-    begin
-      L := Trim(Lines[i]);
-      if L = '' then Continue;
-      SpacePos := Pos(' ', L);
-      if SpacePos > 0 then Tok := Copy(L, 1, SpacePos - 1) else Tok := L;
-      if TryStrToInt(Tok, N) and (N >= 0) then Exit(True);
-    end;
+    try Src.LoadFromFile(AFileName); except Exit; end;
+    Result := TSedaiRunner.SourceHasLineNumbers(Src.Text);
   finally
-    Lines.Free;
+    Src.Free;
   end;
 end;
 

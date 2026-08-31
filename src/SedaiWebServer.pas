@@ -38,6 +38,15 @@ uses
   SedaiRegAlloc,
   SedaiPeephole, SedaiSuperinstructions, SedaiNopCompaction, SedaiRegisterCompaction,
   SedaiExecutorContext, SedaiExecutorTypes, SedaiOutputInterface,
+  // ⛔ The dialect heuristic must be the SAME function sb and sbc call, not a second copy:
+  // it is comment- and string-aware for reasons that cost ten of the manual's examples
+  // once already (see TSedaiRunner.SourceHasLineNumbers).
+  SedaiRunner,
+  // ⛔ sbw NEVER ran the preprocessor. #define / #if / #include / macros are MODERN-only
+  // machinery that did not exist when this server was written, so a .wbas using any of them
+  // reached the lexer as raw text and died: 7 of the 15 Access Violations in the 1 Sep 2026
+  // sweep of 250 MODERN corpus programs were this one omission.
+  SedaiPreprocessor,
   // Web I/O
   SedaiWebIO;
 
@@ -127,6 +136,32 @@ begin
 
   FServer.Free;
   inherited Destroy;
+end;
+
+var
+  GWebDiag: Integer = -1;
+
+procedure WebStage(const S: string);
+// WEBDIAG=1: name each stage of CompileScript as it is entered. ⛔ Written to ErrOutput in ONE
+// WriteLn: the server's Log interleaves between request threads and truncates, which cost an hour
+// once already - a partial "[2026-09-01 00:" looked like a crash mid-message and was two threads.
+begin
+  if GWebDiag < 0 then
+    if GetEnvironmentVariable('WEBDIAG') = '1' then GWebDiag := 1 else GWebDiag := 0;
+  if GWebDiag = 1 then
+    WriteLn(ErrOutput, 'WEBDIAG ' + S);
+end;
+
+function DumpExceptionCallStack(E: Exception): string;
+// The frames FPC recorded for the exception, one per line. Only ever written to the LOG.
+var
+  i: Integer;
+  Frames: PPointer;
+begin
+  Result := '';
+  Frames := ExceptFrames;
+  for i := 0 to ExceptFrameCount - 1 do
+    Result := Result + '    ' + BackTraceStrFunc(Frames[i]) + LineEnding;
 end;
 
 procedure TSedaiWebServer.Log(const Msg: string);
@@ -357,17 +392,48 @@ var
   {$IFNDEF DISABLE_REG_ALLOC}
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
+  ProgIsModern: Boolean;
+  QBLangDetected: Boolean;
 begin
   Result := nil;
 
   Source := TStringList.Create;
   try
     Source.LoadFromFile(ScriptPath);
+    WebStage('loaded ' + ScriptPath);
 
+    // ⛔⛔ THE DIALECT IS DECIDED ONCE, HERE, AND THREE PLACES BELOW READ THIS ONE ANSWER.
+    // sbw was written when CLASSIC was the only dialect and hard-wired SetHasLineNumbers(TRUE),
+    // never setting SSAGen.ModernMode nor the program's ModernMode. A MODERN .wbas therefore got a
+    // CLASSIC lexer AND Commodore global-by-name scoping: the probe that isolates it is a `Sub` with
+    // a local of the same name as a module variable - sb and fbc both answer x=100, sbw died with an
+    // Access Violation. Auto-selection mirrors sb (SedaiBasicVM.lpr) and sbc (SedaiBasicCompiler.lpr)
+    // exactly: line numbers => CLASSIC, otherwise FreeBASIC/MODERN.
+    ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+
+    // Text -> text, BEFORE lexing and before the dialect is used, exactly as sb and sbc do it.
+    // ⚠️ -lang qb is detected on the RAW text: the preprocessor strips both directive forms.
+    // #include resolves relative to the SCRIPT's directory, not the server's working directory.
+    WebStage('preprocess');
+    QBLangDetected := DetectQBLang(Source.Text);
+    try
+      Source.Text := PreprocessSource(Source.Text,
+                       ExtractFilePath(ExpandFileName(ScriptPath)), ScriptPath);
+    except
+      on E: EPreprocessorError do
+      begin
+        // ⛔ No Source.Free here: the enclosing try..finally owns it. The other early exits in
+        // this function free the LEXER/PARSER they created, never Source.
+        Log('Preprocessor error: ' + E.Message);
+        Exit;
+      end;
+    end;
+
+    WebStage('lex');
     // Lexing
     Lexer := TLexerFSM.Create;
     try
-      Lexer.SetHasLineNumbers(True);
+      Lexer.SetHasLineNumbers(not ProgIsModern);
       Lexer.SetRequireSpacesBetweenTokens(True);
       Lexer.SetCaseSensitive(False);
       Lexer.Source := Source.Text;
@@ -382,6 +448,7 @@ begin
       end;
     end;
 
+    WebStage('parse');
     // Parsing
     Parser := CreatePackratParser;
     try
@@ -390,7 +457,10 @@ begin
       begin
         if ParserResult.Errors.Count > 0 then
           Log('Parser error: ' + ParserResult.Errors[0].ToString);
-        Parser.Free;
+        // ⛔ No Parser.Free here: the finally below already owns it. It used to be freed TWICE on
+        // this path - the same shape as the SSA block under it, and the same shape as the
+        // Source.Free that was written here once too. A cleanup written beside an Exit inside a
+        // try..finally is a double free, every time.
         Lexer.Free;
         Exit;
       end;
@@ -398,20 +468,42 @@ begin
       Parser.Free;
     end;
 
+    WebStage('ssa');
     // SSA Generation
     SSAGen := TSSAGenerator.Create;
+    // ⛔⛔ nil FIRST. The `finally` at the bottom of this block frees SSAProgram unconditionally, and
+    // Generate RAISES on a program the compiler rejects ("Array not declared: FOO" is what sb prints
+    // for an undefined function call). With SSAProgram left uninitialised, that finally freed a
+    // garbage pointer and the REAL diagnostic was replaced by "Access violation" - which is why every
+    // rejected .wbas looked like a crash in whatever builtin it happened to name.
+    SSAProgram := nil;
     try
-      SSAProgram := SSAGen.Generate(ParserResult.AST);
+      // Dialect gate for FB lexical scope: MODERN gives a Sub its own locals, CLASSIC keeps BASIC v7
+      // global-by-name. Same line as sb's, from the same answer.
+      SSAGen.ModernMode := ProgIsModern;
+      try
+        SSAProgram := SSAGen.Generate(ParserResult.AST);
+      except
+        on E: Exception do
+        begin
+          // sb prints this same message and exits 1; a server has to SAY it, not fault.
+          Log('SSA generation error: ' + E.ClassName + ': ' + E.Message);
+          ParserResult.Free;
+          Lexer.Free;
+          Exit;
+        end;
+      end;
       if not Assigned(SSAProgram) then
       begin
+        // ⛔ No SSAGen.Free here either: the finally below owns it (it was a double free).
         Log('SSA generation failed');
-        SSAGen.Free;
         ParserResult.Free;
         Lexer.Free;
         Exit;
       end;
 
       // Run optimization passes (simplified for web)
+      WebStage('optimise');
       {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
       try
         {$IFNDEF DISABLE_DBE}
@@ -470,12 +562,25 @@ begin
       end;
       {$ENDIF}
 
+      WebStage('bytecode');
       // Bytecode Compilation
       Compiler := TBytecodeCompiler.Create;
       try
         Result := Compiler.Compile(SSAProgram);
         if Assigned(Result) then
         begin
+          // Runtime dialect: it is what picks FreeBASIC vs Commodore behaviour at execution time
+          // (error codes, number formatting, the bounds-check default). Mirrors SSAGen.ModernMode.
+          // ⛔ FOUR program-level facts, and sbw used to set NONE of them. They are exactly the
+          // four sb sets (SedaiBasicVM.lpr) and sbc sets (SedaiBasicCompiler.lpr); a fifth added
+          // there and not here is the next instance of this same defect.
+          Result.ModernMode := ProgIsModern;
+          Result.QBLang := QBLangDetected;
+          // "OPTION DIGITS n" rides out on the PARSE RESULT and the VM applies it before running.
+          // Without it `Option Digits Exact` printed 0.1 where sb prints all 55 digits.
+          Result.OptionDigits := ParserResult.OptionDigits;
+          // ERMN / Assert's "path(line):" prefix report the module an error came from.
+          Result.ModuleName := ScriptPath;
           // Post-compilation optimizations
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_PEEPHOLE}
@@ -530,7 +635,13 @@ begin
       except
         on E: Exception do
         begin
-          Log('VM execution error: ' + E.Message);
+          // ⛔ "Access violation" with no location is not operable. The HTTP response stays generic
+          // on purpose (it is public), but the LOG gets the class and, under --verbose, the stack:
+          // a script fault inside a server is otherwise a fault with no site at all.
+          Log('VM execution error: ' + E.ClassName + ': ' + E.Message);
+          if FVerbose then
+            Log('  at ' + BackTraceStrFunc(ExceptAddr) + LineEnding +
+                BackTraceStrFunc(ExceptAddr) + LineEnding + DumpExceptionCallStack(E));
           Result := '<html><body><h1>500 Internal Server Error</h1><p>' +
                     HtmlEncode(E.Message) + '</p></body></html>';
           WebContext.ResponseStatus := 500;

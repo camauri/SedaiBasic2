@@ -36,6 +36,7 @@ uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   SedaiConsoleState,
+  SedaiOpcodeTable,
   Classes, SysUtils, Variants, TypInfo, Math,
   // HTTP Server
   fphttpserver,
@@ -74,6 +75,7 @@ var
   AllowDirListing: Boolean;
   i: Integer;
   Param, ParamLower: string;
+  VerifyMsg: string;
 
 { Get system architecture string }
 function GetSystemArchitecture: string;
@@ -131,6 +133,7 @@ begin
   WriteLn('  --verbose           Enable verbose logging');
   WriteLn('  --no-dir-listing    Disable directory listing (403 Forbidden)');
   WriteLn('  --help              Show this help message');
+  WriteLn('  --verify-opcodes    Self-check the dense opcode map, then exit (0 OK / 1 FAIL)');
   WriteLn;
   WriteLn('File extension:');
   WriteLn('  .wbas               Web BASIC scripts (executed via HTTP)');
@@ -163,6 +166,13 @@ end;
 
 begin
   try
+    // Mask the FPU/SSE exceptions so floating-point overflow/invalid/div-by-zero produce IEEE Inf/NaN
+    // (FreeBASIC/C semantics) instead of raising a Pascal exception. Same line, same reason, as sb -
+    // ⛔ and sbw did not have it: FPC leaves these UNMASKED, so a MODERN script that overflows a
+    // double or takes Sqr of a negative answered "500 Internal Server Error: Invalid floating point
+    // operation" where sb prints inf / nan. Two of the 15 failures in the 1 Sep 2026 sweep were this.
+    SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide, exOverflow, exUnderflow, exPrecision]);
+
     // Set console code page to UTF-8
     {$IFDEF WINDOWS}
     SetupConsoleUTF8;   // saves + restores the parent console's code pages; no-op when redirected
@@ -174,6 +184,25 @@ begin
 
     // Initialize debug flags
     InitDebugFlags;
+
+    // The dense-opcode-table self-check, same one `sb --verify-opcodes` runs. ⛔ It has to exist HERE
+    // too, because sbw is the ONLY binary built with WEB_MODE, and WEB_MODE is the branch where the
+    // dense map differs: group 8 takes 13 slots that no other build allocates. Without this the one
+    // net that validates the map was unreachable exactly where the map was unique - which is how
+    // DENSE_WEB_BASE stayed one slot inside the sprite group until a `case` label collision said so.
+    if (ParamCount >= 1) and (LowerCase(ParamStr(1)) = '--verify-opcodes') then
+    begin
+      if VerifyOpcodeTable(VerifyMsg) then
+      begin
+        WriteLn('opcode-table OK: ', VerifyMsg);
+        Halt(0);
+      end
+      else
+      begin
+        WriteLn('opcode-table FAIL: ', VerifyMsg);
+        Halt(1);
+      end;
+    end;
 
     // Default values
     Port := 8080;
