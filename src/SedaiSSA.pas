@@ -27280,13 +27280,37 @@ function TSSAGenerator.TryUDTFieldSizeConst(Node: TASTNode; CLayoutSize: Boolean
 // looked self-contradictory here: two programs declaring the same type disagreed only because one
 // named its variable after the type.)
 var
-  UIdx, k: Integer;
+  UIdx, k, j: Integer;
   BaseName, FieldU: string;
   Align: Int64;
 begin
   Result := False;
   Size := 0;
   if (Node = nil) or (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  // ⛔ "T1.T2" IS A TYPE NAME, NOT A FIELD. A nested type is written with a dot, so it parses as a
+  // MEMBER ACCESS and arrived here as "the field T2 of T1" - which does not exist, so SizeOf answered
+  // 0 and Len answered the historic per-field sum, 18. Both wrong, both silent, and both right the
+  // moment the same type was reached any other way: "SizeOf(T2)" (the simple name a nested type is
+  // also registered under) and "SizeOf(v)" on a variable of it were correct all along. DIVERGENZE 130.
+  // ⚠️ The guard is what keeps it from swallowing an ordinary "obj.field": the BASE must be a TYPE and
+  // not a declared variable, the member must NOT be a field of it, and the whole dotted spelling must
+  // itself name a type. Only then is there no field reading to steal.
+  if (Node.GetChild(0).NodeType = antIdentifier) and
+     (FindUDT(UpperCase(VarToStr(Node.GetChild(0).Value))) >= 0) and
+     (not IsDeclaredVariable(VarToStr(Node.GetChild(0).Value))) then
+  begin
+    BaseName := UpperCase(VarToStr(Node.GetChild(0).Value));
+    FieldU := UpperCase(VarToStr(Node.Value));
+    UIdx := FindUDT(BaseName);
+    k := -1;
+    for j := 0 to High(FUDTs[UIdx].Fields) do
+      if FUDTs[UIdx].Fields[j].Name = FieldU then begin k := j; Break; end;
+    if (k < 0) and (FindUDT(BaseName + '.' + FieldU) >= 0) then
+    begin
+      Size := TypeSizeBytes(BaseName + '.' + FieldU);
+      Exit(True);
+    end;
+  end;
   UIdx := -1;
   if Node.GetChild(0).NodeType = antIdentifier then
   begin
