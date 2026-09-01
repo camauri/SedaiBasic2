@@ -14,8 +14,8 @@
 #       native demo takes a FIXED phase as its third argument, which is what makes the
 #       comparison possible at all - by default it advances by real elapsed time and no
 #       two runs agree;
-#    3. both published copies of the page carry THAT module and not an older one - a
-#       page carrying a stale module looks perfectly fine and is showing something else.
+#    3. the published page carries THAT module and not an older one - a page carrying a
+#       stale module looks perfectly fine and is showing something else.
 #
 #  Usage:  bash bas/demo/verify_bubble_wasm.sh
 #          bash bas/demo/verify_bubble_wasm.sh --bless    re-embed the module in the pages
@@ -24,7 +24,10 @@ set -u
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
 demo="$here/bubble_universe.bas"
-pages=("$here/bubble_universe.html" "$here/buddhabrot/site/bubble_universe.html")
+# ⛔ ONE page, beside its own source. It briefly had a second copy inside the Buddhabrot's site
+# folder, which was wrong: that folder is one demo's, and two demos mixed into one page make both
+# of them worse.
+pages=("$here/bubble_universe.html")
 
 bless=0
 [ "${1:-}" = "--bless" ] && bless=1
@@ -118,7 +121,7 @@ if [ "$bad" != 0 ]; then
 fi
 
 if [ "$bless" = 1 ]; then
-  echo "✅ compiles · same frame as sb · pages re-embedded"
+  echo "✅ compiles · same frame as sb · page re-embedded"
 else
-  echo "✅ compiles · same frame as sb · both pages carry this exact module"
+  echo "✅ compiles · same frame as sb · the page carries this exact module"
 fi
