@@ -63,8 +63,9 @@ Keys while it runs:
 
 | | |
 |---|---|
+| **H** the key list, on the picture — any key closes it, and it pauses while it is up | |
 | **SPACE** pause · **R** restart · **P** save a still · **Q** quit | |
-| **C** cycle the reading · **[** **]** move the tone curve · **+** **−** halve or double the iteration ceiling | |
+| **C** cycle the reading · **,** **.** move the tone curve · **−** **+** halve or double the iteration ceiling | |
 | **Z** **X** zoom · **W A S D** pan · **0** back to the whole figure | |
 | **left click** or **wheel up** zoom in on the pointer · **right click** or **wheel down** zoom out | |
 
@@ -72,6 +73,23 @@ The pointer is the one that matters. `W A S D` walk the view half a window at a 
 keyboard can do — to reach a filament you can *see*, you walk towards it and correct, and every
 correction throws the picture away and starts it again. Clicking on it is one move. The overlay
 prints the complex coordinate under the pointer as you go.
+
+### How big a window, and which engine can hold it
+
+The frame rate is a budget covering sampling *and* painting, so the picture size is really a question
+about the paint. Measured on this machine, milliseconds per frame and the rate held:
+
+| | interpreter | JIT | AOT |
+|---|---|---|---|
+| 400×400 | 9 ms · **53 fps** | 9 ms · **58 fps** | 1 ms · **58 fps** |
+| 600×600 | 20 ms · 25 fps | 21 ms · 36 fps | 2 ms · **58 fps** |
+| 800×800 | 36 ms · 14 fps | 37 ms · 21 fps | 3 ms · **58 fps** |
+
+400 is the default because it is the largest window where *every* engine holds the rate, which is the
+demo's whole claim: the frame rate does not move, only the amount of picture does. `size=800` is
+worth trying under `--aot`, where it still holds 58 — but there the demo becomes a different one,
+because the frame rate starts separating the engines instead of the orbit count. Note also that the
+JIT does not accelerate the paint at all: it compiles hot loops, and the paint loop's body is a call.
 
 ### The three readings
 
@@ -139,6 +157,12 @@ Measured, ten million orbits at each step, brightest pixel in the red channel:
 
 (Click where you want to go: each click centres the view on the point under the pointer and halves
 the span, which is how that table was collected.)
+
+**And it is the algorithm, not the implementation** — which is worth separating, because from the
+outside they look the same. Measured at each zoom, 400 000 orbits: the orbits per second do not move
+(338 000 at ×1, 364 000 at ×16 — slightly *faster*, because fewer points land in the window and there
+is less to write), and the orbits accepted are identical to the last one. What collapses is only how
+much of that work lands where you are looking.
 
 About a quarter of the signal survives each doubling. Four or five steps in, the picture stops
 converging in any useful time — and that is the whole reason Metropolis-Hastings sampling was

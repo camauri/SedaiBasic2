@@ -89,7 +89,7 @@
 ''    sb          bas/demo/buddhabrot/buddhabrot.bas still=4000000 out=/tmp/b.ppm
 ''
 ''  Arguments are name=value in any order; run with help=1 for the list.
-''  Keys while it runs:  SPACE pause · R restart · C reading · [ ] gamma · + - iterations
+''  Keys while it runs:  H help · SPACE pause · R restart · C reading · , . gamma · - + iterations
 ''                       Z X zoom · W A S D pan · 0 home · P save a still · Q quit
 ''                       click or wheel on the picture: zoom in on the point you are looking at
 '' ================================================================================================
@@ -239,6 +239,22 @@ Dim Shared As Integer maximumIterations
 Dim Shared As LongInt histogram()          '' three planes, one per channel, each row by row
 Dim Shared As Integer pixelsPerPlane
 Dim Shared As Integer greenCeiling, blueCeiling
+
+''  ⛔⛔ THE BANDS ARE FRACTIONS OF THE CEILING, SO THEY HAVE TO MOVE WITH IT. They were computed
+''  once at startup and the +/- keys changed `maximumIterations` without them, which is a defect you
+''  can watch happen: drop the ceiling from 5 000 to 624 and RED EMPTIES, because red is still
+''  "lived longer than 500 steps" while nothing can now live longer than 624. Reported as "lower the
+''  iterations and the red stops appearing, and the composition is softer" - and softer it is, but
+''  it was showing two thirds of a picture. One Sub, called from every place that sets the ceiling.
+Sub SetIterationCeiling( ByVal n As Integer )
+  If n < 50 Then n = 50
+  If n > ITERATION_CEILING Then n = ITERATION_CEILING
+  maximumIterations = n
+  greenCeiling = maximumIterations \ 10
+  blueCeiling  = maximumIterations \ 100
+  If greenCeiling < 2 Then greenCeiling = 2
+  If blueCeiling  < 1 Then blueCeiling  = 1
+End Sub
 Dim Shared As Double  orbitReal(ITERATION_CEILING)
 Dim Shared As Double  orbitImaginary(ITERATION_CEILING)
 Dim Shared As Double  pixelsPerImaginaryUnit, pixelsPerRealUnit
@@ -625,6 +641,53 @@ Function Fits( ByVal line As String, ByVal extra As String ) As String
   Return line
 End Function
 
+#if __SB_WASM__
+  '' The browser build's help is the page around it - `Draw String` is not covered by the WASM
+  '' backend, and the backend refuses an opcode for being PRESENT rather than for being reached.
+#else
+Dim Shared As Integer helpVisible
+
+''  ⭐ THE KEYS ARE CHOSEN FOR THE KEYBOARD, NOT FOR THE ALPHABET. The tone curve used to be on
+''  `[` and `]`, which on an Italian layout need AltGr - a chord for something you nudge back and
+''  forth while looking at the picture. `,` and `.` are unshifted on both an Italian and a US
+''  layout, and so is `-`; `+` is unshifted on Italian and shifted on US, so `=` does the same job
+''  on the key it shares there. The old brackets still work, because someone has learnt them.
+''  The longest line below, in characters. `Draw String` clips without saying so - the same silent
+''  cut that was taking the ends off the overlay - so a window too narrow to hold the list gets a
+''  sentence that fits instead of a list that does not.
+Const HELP_WIDEST = 38
+
+Sub DrawHelp()
+  Dim As Integer w = imageSize - 24
+  Dim As Integer h = 158
+  Dim As Integer x0 = 12
+  Dim As Integer y0 = TEXT_BAND_HEIGHT + 14
+  If w < 8 Then Exit Sub
+  If (w - 16) \ 8 < HELP_WIDEST Then
+    Line (x0, y0)-(x0 + w - 1, y0 + 20), RGB(0, 0, 0), BF
+    Line (x0, y0)-(x0 + w - 1, y0 + 20), RGB(90, 90, 100), B
+    Draw String (x0 + 6, y0 + 7), "keys: run with help=1", RGB(224, 129, 63)
+    Exit Sub
+  End If
+  Line (x0, y0)-(x0 + w - 1, y0 + h - 1), RGB(0, 0, 0), BF
+  Line (x0, y0)-(x0 + w - 1, y0 + h - 1), RGB(90, 90, 100), B
+  Dim As Integer ln = y0 + 8
+  Draw String (x0 + 8, ln), "KEYS", RGB(224, 129, 63) : ln += 14
+  Draw String (x0 + 8, ln), "H         this help - any key closes it", RGB(220, 220, 220) : ln += 10
+  Draw String (x0 + 8, ln), "SPACE     pause / resume", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "R         restart, same seed", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "P         save a still", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "Q         quit", RGB(200, 200, 200) : ln += 14
+  Draw String (x0 + 8, ln), "C         reading: NEBULA AURORA EMBER", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), ",  .      tone curve down / up", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "-  +      iterations halve / double", RGB(200, 200, 200) : ln += 14
+  Draw String (x0 + 8, ln), "Z  X      zoom in / out", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "W A S D   pan     0  whole figure", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "mouse     click zooms in, right out", RGB(200, 200, 200) : ln += 10
+  Draw String (x0 + 8, ln), "          the wheel does both", RGB(150, 150, 150)
+End Sub
+#endif
+
 Sub PaintFrame( ByVal topLine As String, ByVal middleLine As String, ByVal bottomLine As String )
   RebuildLevelTables()
   Dim As Integer x, y
@@ -646,6 +709,9 @@ Sub PaintFrame( ByVal topLine As String, ByVal middleLine As String, ByVal botto
   Draw String (4, 2),  topLine,    RGB(255, 255, 255)
   Draw String (4, 11), middleLine, RGB(170, 170, 170)
   Draw String (4, 20), bottomLine, RGB(140, 140, 140)
+  '' Inside the lock, like the rest of the overlay: drawing it after the unlock would present the
+  '' frame twice and show the picture and the panel as two different instants.
+  If helpVisible <> 0 Then DrawHelp()
   ScreenUnlock
 #endif
 End Sub
@@ -686,9 +752,9 @@ Sub PrintUsage()
   Print "  re=N im=N   centre of the view                       (default -0.65, 0)"
   Print "  zoom=N      how many times to magnify                 (default 1)"
   Print
-  Print "Keys while running:"
+  Print "Keys while running (H shows them on the picture too):"
   Print "  SPACE pause    R restart    P save a still    Q quit"
-  Print "  C reading      [ ] gamma    + - iterations"
+  Print "  C reading      , . gamma    - + iterations"
   Print "  Z X zoom       W A S D pan  0 back to the whole figure"
   Print "  left click or wheel up: zoom in on the pointer   right click or wheel down: zoom out"
 End Sub
@@ -749,9 +815,7 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
   ElseIf command = 5 Then
     moved = 1
   ElseIf command = 6 Then
-    maximumIterations = a
-    If maximumIterations < 50 Then maximumIterations = 50
-    If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
+    SetIterationCeiling(a)
     moved = 1
   End If
   If viewHalfSpan > HOME_HALF_SPAN Then viewHalfSpan = HOME_HALF_SPAN
@@ -804,10 +868,7 @@ If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEIL
 '' The two inner ceilings, a decade apart, which is the proportion the classic three-pass version
 '' uses (5000 / 500 / 50). Deriving them from max= keeps one knob instead of three: raising the
 '' ceiling deepens all three channels together, which is what anyone turning that dial means.
-greenCeiling = maximumIterations \ 10
-blueCeiling  = maximumIterations \ 100
-If greenCeiling < 2 Then greenCeiling = 2
-If blueCeiling  < 1 Then blueCeiling  = 1
+SetIterationCeiling(maximumIterations)
 
 pixelsPerPlane = imageSize * imageSize
 ReDim histogram(3 * pixelsPerPlane - 1)
@@ -923,7 +984,7 @@ Do
   Dim As Double frameStart = Timer
   framesDrawn = framesDrawn + 1
 
-  If paused = 0 Then
+  If paused = 0 And helpVisible = 0 Then
     Dim As Double sampleBudget = targetFrameSeconds - paintSeconds
     If sampleBudget < 0.002 Then sampleBudget = 0.002
     Dim As Double sampleStart = Timer
@@ -962,7 +1023,7 @@ Do
   '' REPLACES the view on the last line while the pointer is over the picture, rather than being
   '' appended to it: two coordinate pairs on one line is what pushed the old overlay off the edge.
   '' Most important first: whichever fields a narrow window cannot hold are the ones dropped.
-  Dim As String line1 = label + IIf(paused, " [PAUSED]", "")
+  Dim As String line1 = label + IIf(paused, " [PAUSED]", "") + IIf(helpVisible, " [HELP]", "")
   line1 = Fits(line1, " " + Str(Int(orbitsPerSecond)) + "/s")
   line1 = Fits(line1, "  " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0"))
   line1 = Fits(line1, " iter " + Str(maximumIterations))
@@ -985,6 +1046,18 @@ Do
   paintSeconds = Timer - paintStart
 
   key = LCase(InKey)
+
+  '' ⛔ WHILE THE HELP IS UP, EVERY KEY MEANS "CLOSE IT" AND NOTHING ELSE. Letting the keys through
+  '' would have you changing the gamma of a picture you cannot see, and finding it changed when the
+  '' panel goes away.
+  If helpVisible <> 0 Then
+    If key <> "" Then helpVisible = 0
+    key = ""
+  ElseIf key = "h" Then
+    helpVisible = 1
+    key = ""
+  End If
+
   If key = "q" Or key = Chr(27) Then Exit Do
   If key = " " Then paused = 1 - paused
   '' Every move throws the counts away and starts the seed again, so what you see after a move is a
@@ -1042,11 +1115,10 @@ Do
   '' because both are judgements about what you want to SEE and neither costs a recomputation - the
   '' orbits are already counted, only the tables are rebuilt.
   If key = "c" Then colourReading = (colourReading + 1) Mod READING_COUNT
-  If key = "[" And toneGamma > 1.2 Then toneGamma = toneGamma - 0.5
-  If key = "]" And toneGamma < 12.0 Then toneGamma = toneGamma + 0.5
-  If key = "+" Then maximumIterations = maximumIterations * 2
-  If key = "-" And maximumIterations > 50 Then maximumIterations = maximumIterations \ 2
-  If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
+  If (key = "," Or key = "[") And toneGamma > 1.2  Then toneGamma = toneGamma - 0.5
+  If (key = "." Or key = "]") And toneGamma < 12.0 Then toneGamma = toneGamma + 0.5
+  If key = "+" Or key = "=" Then SetIterationCeiling(maximumIterations * 2)
+  If key = "-" Then SetIterationCeiling(maximumIterations \ 2)
 
   If runSeconds > 0.0 And Timer - startedAt >= runSeconds Then Exit Do
 Loop
