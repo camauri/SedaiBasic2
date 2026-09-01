@@ -89,7 +89,8 @@
 ''    sb          bas/demo/buddhabrot/buddhabrot.bas still=4000000 out=/tmp/b.ppm
 ''
 ''  Arguments are name=value in any order; run with help=1 for the list.
-''  Keys while it runs:  SPACE pause · R restart · C palette · [ ] gamma · + - iterations · S save · Q quit
+''  Keys while it runs:  SPACE pause · R restart · C reading · [ ] gamma · + - iterations
+''                       Z X zoom · W A S D pan · 0 home · S save a still · Q quit
 '' ================================================================================================
 
 
@@ -103,10 +104,14 @@
 ''  axis runs ACROSS it. This is not a stylistic flourish and it is not free: it is what stands the
 ''  figure upright. Drawn the other way it lies on its side and reads as nothing in particular.
 
-Const REAL_AXIS_MIN      = -2.0      '' maps to screen Y (top of the window)
-Const REAL_AXIS_MAX      =  0.7      '' maps to screen Y (bottom)
-Const IMAGINARY_AXIS_MIN = -1.35     '' maps to screen X (left)
-Const IMAGINARY_AXIS_MAX =  1.35     '' maps to screen X (right)
+''  The view is a SQUARE centred somewhere on the plane, so it needs three numbers rather than four.
+''  The whole figure sits in a square 2.7 across centred at (-0.65, 0).
+Const HOME_CENTRE_REAL      = -0.65
+Const HOME_CENTRE_IMAGINARY =  0.0
+Const HOME_HALF_SPAN        =  1.35
+
+Dim Shared As Double viewCentreReal, viewCentreImaginary, viewHalfSpan
+Dim Shared As Double viewRealMin, viewImaginaryMin
 
 ''  Where the random points c are drawn from. Slightly wider than the view: an orbit that starts
 ''  just outside the window can still wander through it, and dropping those would shave the edges.
@@ -225,10 +230,32 @@ Dim Shared As LongInt orbitsTraced, orbitsAccumulated
 ''  One orbit point becomes one increment. Points that fall outside the window are dropped: the
 ''  orbit is free to wander anywhere in the disc of radius 2, and the window is smaller than that.
 
+''  ⛔⛔ MOVING THE VIEW THROWS THE PICTURE AWAY, and it has to. Every counter in the histogram is a
+''  count of visits to a PIXEL, and a pixel means a different piece of the plane the moment the view
+''  changes. Keeping the counts and moving the frame would smear the old picture into the new one.
+''
+''  ⚠️ AND ZOOMING DOES NOT MAKE THE PICTURE SMALLER TO COMPUTE - it makes it far larger. This is the
+''  one place where the Buddhabrot behaves unlike every other fractal zoom, and it is worth watching
+''  happen. A Mandelbrot zoom narrows both what you draw AND what you compute: fewer pixels, same
+''  work each. Here the view narrows but the SAMPLING cannot, because an orbit that crosses your
+''  zoomed window may have started anywhere - so you go on tracing the whole plane and throw away
+''  everything that misses. Halve the span and about three quarters of the remaining hits go away
+''  with it.
+''  ⇒ That collapse is exactly what Metropolis-Hastings sampling exists to fix, and why this demo
+''    declares itself uniform: watch the peak stop growing at four or five zoom steps in and you have
+''    seen the reason for the technique, which is more convincing than being told.
+
+Sub RecomputeView()
+  viewRealMin      = viewCentreReal      - viewHalfSpan
+  viewImaginaryMin = viewCentreImaginary - viewHalfSpan
+  pixelsPerImaginaryUnit = imageSize / (2.0 * viewHalfSpan)
+  pixelsPerRealUnit      = imageSize / (2.0 * viewHalfSpan)
+End Sub
+
 Sub AccumulateOrbitPoint( ByVal zReal As Double, ByVal zImaginary As Double, _
                           ByVal planeBase As Integer )
-  Dim As Integer column = Int( (zImaginary - IMAGINARY_AXIS_MIN) * pixelsPerImaginaryUnit )
-  Dim As Integer row    = Int( (zReal      - REAL_AXIS_MIN)      * pixelsPerRealUnit )
+  Dim As Integer column = Int( (zImaginary - viewImaginaryMin) * pixelsPerImaginaryUnit )
+  Dim As Integer row    = Int( (zReal      - viewRealMin)      * pixelsPerRealUnit )
   If column >= 0 And column < imageSize And row >= 0 And row < imageSize Then
     Dim As Integer at = planeBase + row * imageSize + column
     histogram(at) = histogram(at) + 1
@@ -503,8 +530,13 @@ Sub PrintUsage()
   Print "  gamma=N     tone curve applied after the log        (default 4.5)"
   Print "  palette=X   nebula | aurora | ember                  (default nebula)"
   Print "  fps=N       frames per second to hold                 (default 60)"
+  Print "  re=N im=N   centre of the view                       (default -0.65, 0)"
+  Print "  zoom=N      how many times to magnify                 (default 1)"
   Print
-  Print "Keys while running:  SPACE pause   R restart   C palette   [ ] gamma   + - iterations   S save   Q quit"
+  Print "Keys while running:"
+  Print "  SPACE pause    R restart    S save a still    Q quit"
+  Print "  C reading      [ ] gamma    + - iterations"
+  Print "  Z X zoom       W A S D pan  0 back to the whole figure"
 End Sub
 
 
@@ -544,8 +576,10 @@ If blueCeiling  < 1 Then blueCeiling  = 1
 pixelsPerPlane = imageSize * imageSize
 ReDim histogram(3 * pixelsPerPlane - 1)
 ReDim levelOfCount(2, 4095)
-pixelsPerImaginaryUnit = imageSize / (IMAGINARY_AXIS_MAX - IMAGINARY_AXIS_MIN)
-pixelsPerRealUnit      = imageSize / (REAL_AXIS_MAX - REAL_AXIS_MIN)
+viewCentreReal      = CDbl( ArgumentValue("re",   Str(HOME_CENTRE_REAL)) )
+viewCentreImaginary = CDbl( ArgumentValue("im",   Str(HOME_CENTRE_IMAGINARY)) )
+viewHalfSpan        = HOME_HALF_SPAN / CDbl( ArgumentValue("zoom", "1") )
+RecomputeView()
 SeedRandom(seed)
 orbitsTraced = 0
 orbitsAccumulated = 0
@@ -611,13 +645,34 @@ Do
                 IIf(paused, "   [PAUSED]", ""), _
               "traced " + Str(orbitsTraced) + "    drawn " + Str(orbitsAccumulated) + _
                 "    iter " + Str(maximumIterations) + _
-                "    " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0") )
+                "    " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0") + _
+                "    x" + Format(HOME_HALF_SPAN / viewHalfSpan, "0.#") + _
+                " @ " + Format(viewCentreReal, "0.0000") + " " + Format(viewCentreImaginary, "0.0000") + _
+                "    peak " + Str(PeakRedCount()) )
   paintSeconds = Timer - paintStart
 
   key = LCase(InKey)
   If key = "q" Or key = Chr(27) Then Exit Do
   If key = " " Then paused = 1 - paused
-  If key = "r" Then
+  '' Every move throws the counts away and starts the seed again, so what you see after a move is a
+  '' fresh picture of the new window rather than the old one dragged into it.
+  Dim As Integer moved = 0
+  If key = "r" Then moved = 1
+  If key = "z" Then viewHalfSpan = viewHalfSpan / 2.0 : moved = 1
+  If key = "x" Then viewHalfSpan = viewHalfSpan * 2.0 : moved = 1
+  '' The picture is turned a quarter turn, so the keys are too: W and S walk the REAL axis, which
+  '' runs down the screen, and A and D walk the IMAGINARY one, which runs across it.
+  If key = "w" Then viewCentreReal      = viewCentreReal      - viewHalfSpan / 2.0 : moved = 1
+  If key = "s" Then viewCentreReal      = viewCentreReal      + viewHalfSpan / 2.0 : moved = 1
+  If key = "a" Then viewCentreImaginary = viewCentreImaginary - viewHalfSpan / 2.0 : moved = 1
+  If key = "d" Then viewCentreImaginary = viewCentreImaginary + viewHalfSpan / 2.0 : moved = 1
+  If key = "0" Then
+    viewCentreReal = HOME_CENTRE_REAL : viewCentreImaginary = HOME_CENTRE_IMAGINARY
+    viewHalfSpan = HOME_HALF_SPAN : moved = 1
+  End If
+  If viewHalfSpan > HOME_HALF_SPAN Then viewHalfSpan = HOME_HALF_SPAN
+  If moved <> 0 Then
+    RecomputeView()
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer

@@ -44,8 +44,45 @@ Or all three at once, on the same seed, to watch them diverge:
 bash bas/demo/buddhabrot/compare_engines.sh
 ```
 
-Keys while it runs: **SPACE** pause · **R** restart · **S** save a still · **+ / −** halve or double
-the iteration ceiling · **Q** quit.
+Keys while it runs:
+
+| | |
+|---|---|
+| **SPACE** pause · **R** restart · **S** save a still · **Q** quit | |
+| **C** cycle the reading · **[** **]** move the tone curve · **+** **−** halve or double the iteration ceiling | |
+| **Z** **X** zoom · **W A S D** pan · **0** back to the whole figure | |
+
+### The three readings
+
+The colour is a third question about the data, not a palette. **NEBULA** (the default) sends
+long-lived orbits to red and short-lived ones to blue — the structure is red because only the red
+plane holds it, the haze is blue because blue holds nothing else. **AURORA** exchanges those two: a
+warm haze around a cold figure, an inversion of *which lifetime you are looking at* rather than of
+the picture. **EMBER** adds the three planes back together through one warm ramp, which is the
+single-channel Buddhabrot everyone has seen, and loses the lifetime along with the colour.
+`palette=nebula|aurora|ember` and `gamma=` do the same from the command line.
+
+### Zooming shows you why Metropolis-Hastings exists
+
+⚠️ **A Buddhabrot zoom is not like any other fractal zoom, and this is the most interesting thing in
+the demo.** A Mandelbrot zoom narrows both what you draw and what you compute. Here the view narrows
+but the sampling cannot, because an orbit that crosses your zoomed window may have started anywhere —
+so you go on tracing the whole plane and throw away everything that misses.
+
+Measured, ten million orbits at each step, brightest pixel in the red channel:
+
+| zoom | peak count |
+|---:|---:|
+| ×1 | 3 108 |
+| ×2 | 711 |
+| ×4 | 188 |
+| ×8 | 111 |
+
+About a quarter of the signal survives each doubling. Four or five steps in, the picture stops
+converging in any useful time — and that is the whole reason Metropolis-Hastings sampling was
+invented: instead of drawing points uniformly, mutate one already known to produce a long orbit
+through your window. This demo is deliberately uniform, so what you are watching is the problem
+rather than the solution.
 
 ### Without a window
 
