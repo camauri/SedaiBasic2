@@ -955,6 +955,13 @@ WindowTitle "SedaiBasic - Buddhabrot - " + label
 '' frame: the orbits AND the painting. Sampling for a fixed time and then painting on top of it
 '' would make the frame rate depend on how fast the painting is, which differs between engines - and
 '' the one thing this demo must not do is let the frame rate become the measurement.
+''  Four times a second: fast enough that a change you caused feels immediate, slow enough that a
+''  six-digit number stands still long enough to be read.
+Const OVERLAY_SECONDS = 0.25
+Dim As String  overlayLine1, overlayLine2
+Dim As Double  overlayAt = 0.0
+Dim As LongInt overlayOrbits = 0
+
 Dim As Double paintSeconds = 0.010
 Dim As Double startedAt = Timer
 Dim As Double orbitsPerSecond = 0.0
@@ -988,7 +995,6 @@ Do
     Dim As Double sampleBudget = targetFrameSeconds - paintSeconds
     If sampleBudget < 0.002 Then sampleBudget = 0.002
     Dim As Double sampleStart = Timer
-    Dim As LongInt before = orbitsTraced
     '' Timer is read once per batch, not once per orbit: at these speeds the clock call would
     '' otherwise be a measurable share of the work it is timing.
     Do
@@ -997,8 +1003,7 @@ Do
         TraceOneOrbit()
       Next batch
     Loop Until Timer - sampleStart >= sampleBudget
-    Dim As Double sampleSeconds = Timer - sampleStart
-    If sampleSeconds > 0.0 Then orbitsPerSecond = (orbitsTraced - before) / sampleSeconds
+    '' (the rate the overlay shows is measured over the DISPLAY interval instead - see below)
   End If
 
   '' Where is the pointer, and what does it point AT? The picture is a window on the complex plane,
@@ -1023,14 +1028,30 @@ Do
   '' REPLACES the view on the last line while the pointer is over the picture, rather than being
   '' appended to it: two coordinate pairs on one line is what pushed the old overlay off the edge.
   '' Most important first: whichever fields a narrow window cannot hold are the ones dropped.
-  Dim As String line1 = label + IIf(paused, " [PAUSED]", "") + IIf(helpVisible, " [HELP]", "")
-  line1 = Fits(line1, " " + Str(Int(orbitsPerSecond)) + "/s")
-  line1 = Fits(line1, "  " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0"))
-  line1 = Fits(line1, " iter " + Str(maximumIterations))
+  '' ⛔⛔ THE PICTURE RUNS AT FIFTY-EIGHT FRAMES A SECOND; THE NUMBERS MUST NOT. A rate rewritten
+  '' every seventeen milliseconds is not a rate you can read - it is a blur where a number should be,
+  '' and a figure nobody can read is worse than no figure, because it takes the space of one.
+  '' So the strings are rebuilt four times a second and held in between, and the rate is averaged
+  '' over exactly that interval rather than over the last frame's sampling slice - which makes it
+  '' both steadier AND more honest, since it is then the rate over the period it is displayed for.
+  '' ⚠️ The pointer line is the exception and is rebuilt every frame: it is not a measurement, it is
+  '' where your hand is, and a readout that lags a quarter of a second behind the mouse reads as
+  '' broken rather than as calm.
+  If Timer - overlayAt >= OVERLAY_SECONDS Then
+    Dim As Double overlaySeconds = Timer - overlayAt
+    If overlaySeconds > 0.0 Then orbitsPerSecond = (orbitsTraced - overlayOrbits) / overlaySeconds
+    overlayAt = Timer
+    overlayOrbits = orbitsTraced
 
-  Dim As String line2 = "traced " + Str(orbitsTraced)
-  line2 = Fits(line2, "  drawn " + Str(orbitsAccumulated))
-  line2 = Fits(line2, "  peak " + Str(PeakRedCount()))
+    overlayLine1 = label + IIf(paused, " [PAUSED]", "") + IIf(helpVisible, " [HELP]", "")
+    overlayLine1 = Fits(overlayLine1, " " + Str(Int(orbitsPerSecond)) + "/s")
+    overlayLine1 = Fits(overlayLine1, "  " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0"))
+    overlayLine1 = Fits(overlayLine1, " iter " + Str(maximumIterations))
+
+    overlayLine2 = "traced " + Str(orbitsTraced)
+    overlayLine2 = Fits(overlayLine2, "  drawn " + Str(orbitsAccumulated))
+    overlayLine2 = Fits(overlayLine2, "  peak " + Str(PeakRedCount()))
+  End If
 
   '' The pointer readout REPLACES the view while the pointer is over the picture: two coordinate
   '' pairs on one line is what pushed the old overlay off the edge in the first place.
@@ -1042,7 +1063,7 @@ Do
     line3 = Fits(line3, " @ " + Format(viewCentreReal, "0.0000") + " " + Format(viewCentreImaginary, "0.0000"))
   End If
 
-  PaintFrame(line1, line2, line3)
+  PaintFrame(overlayLine1, overlayLine2, line3)
   paintSeconds = Timer - paintStart
 
   key = LCase(InKey)
@@ -1057,6 +1078,11 @@ Do
     helpVisible = 1
     key = ""
   End If
+
+  '' ⭐ A key you pressed refreshes the readout at once. Holding the numbers for a quarter of a second
+  '' is right for the ones that stream past on their own; making a change YOU asked for wait that long
+  '' before it is acknowledged is a different thing, and reads as the key having missed.
+  If key <> "" Then overlayAt = 0.0
 
   If key = "q" Or key = Chr(27) Then Exit Do
   If key = " " Then paused = 1 - paused
