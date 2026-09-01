@@ -5,9 +5,10 @@
 <title>Buddhabrot in BASIC — SedaiBasic</title>
 <meta name="description" content="A Buddhabrot written in BASIC, compiled to bytecode, to machine code and to WebAssembly. One source, the same picture byte for byte.">
 <style>
-  /* The page speaks the same visual language as the demo it introduces: dark ground, monospace for
-     the data, and a single accent taken from the picture itself - the orange of the orbits that
-     lived longest. Single-theme on purpose: the subject is a figure drawn in light on black. */
+  /* One design for every page in this site: dark ground, monospace for headings and data, a reading
+     face for prose, and a single warm accent. Single-theme on purpose - every demo here draws light
+     on black, and a light ground would put a white frame around a black photograph - so each colour
+     is painted explicitly rather than inherited from the host. */
   :root {
     color-scheme: dark;
     --ground:  #0b0d10;
@@ -15,9 +16,9 @@
     --edge:    #232a33;
     --ink:     #c9d1d9;
     --ink-dim: #8b949e;
-    --accent:  #e0813f;   /* red: the orbits that live longest */
-    --mid:     #6fbf8b;   /* green: the middle lifetimes */
-    --short:   #5b9dd9;   /* blue: the ones that die at once */
+    --accent:  #e0813f;
+    --alt:     #6fbf8b;
+    --cool:    #5b9dd9;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
@@ -25,40 +26,35 @@
   body { margin: 0; background: var(--ground); color: var(--ink);
          font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%; }
   .wrap { max-width: 760px; margin: 0 auto; padding: 0 20px 72px; }
-
-  header { padding: 56px 0 8px; }
-  h1 { font: 600 30px/1.2 var(--mono); margin: 0 0 10px; letter-spacing: -.01em;
-       text-wrap: balance; }
+  .top { padding: 18px 0 0; font: 12.5px var(--mono); }
+  .top a { color: var(--ink-dim); text-decoration: none; }
+  .top a:hover { color: var(--accent); }
+  header { padding: 26px 0 8px; }
+  h1 { font: 600 30px/1.2 var(--mono); margin: 0 0 10px; letter-spacing: -.01em; text-wrap: balance; }
   .kicker { font: 500 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
             color: var(--accent); margin: 0 0 18px; }
-  .lede { font-size: 18px; color: var(--ink); margin: 0 0 26px; text-wrap: pretty; }
-
+  .lede { font-size: 18px; margin: 0 0 26px; text-wrap: pretty; }
   figure { margin: 28px 0; }
   figure img { display: block; width: 100%; height: auto; border: 1px solid var(--edge);
                border-radius: 8px; background: #000; }
   figure.small img { max-width: 380px; margin: 0 auto; }
   figcaption { color: var(--ink-dim); font-size: 13.5px; margin-top: 10px; text-align: center; }
-
   h2 { font: 600 20px/1.3 var(--mono); margin: 46px 0 12px; text-wrap: balance; }
   h2::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 2px;
                background: var(--accent); margin-right: 10px; vertical-align: 3px; }
-  h2.mid::before   { background: var(--mid); }
-  h2.short::before { background: var(--short); }
+  h2.alt::before  { background: var(--alt); }
+  h2.cool::before { background: var(--cool); }
   p { margin: 0 0 16px; }
   strong { color: #fff; font-weight: 600; }
-  em { color: var(--ink); }
-
   a { color: var(--accent); text-underline-offset: 3px; }
   a:hover { color: #f0a06b; }
-
-  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 30px 0 10px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 26px 0 10px; }
   .cta a { display: inline-block; font: 600 14px/1 var(--mono); text-decoration: none;
            padding: 14px 20px; border-radius: 8px; border: 1px solid var(--edge);
            background: var(--panel); color: var(--ink); transition: border-color .15s, background .15s; }
   .cta a:hover { border-color: var(--accent); background: #171d25; }
   .cta a.primary { background: var(--accent); border-color: var(--accent); color: #1a0d04; }
   .cta a.primary:hover { background: #f0a06b; }
-
   table { width: 100%; border-collapse: collapse; margin: 20px 0 8px;
           font: 13.5px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
   th, td { padding: 9px 10px; border-bottom: 1px solid var(--edge); text-align: right; }
@@ -66,36 +62,56 @@
   thead th { color: var(--ink-dim); font-weight: 500; font-size: 12px;
              letter-spacing: .06em; text-transform: uppercase; }
   tbody tr:last-child td { border-bottom: none; }
-  td.win { color: var(--accent); }
+  td.win  { color: var(--accent); }
+  td.lose { color: #d97a6c; }
   .tablewrap { overflow-x: auto; }
   .note { color: var(--ink-dim); font-size: 13.5px; }
-
-  .bands { display: grid; gap: 10px; margin: 18px 0 22px; padding: 0; list-style: none; }
-  .bands li { display: grid; grid-template-columns: 12px 1fr; gap: 12px; align-items: start;
-              font-size: 15.5px; }
-  .bands i { width: 12px; height: 12px; border-radius: 3px; margin-top: 6px; }
-  .bands .b1 { background: var(--short); }
-  .bands .b2 { background: var(--mid); }
-  .bands .b3 { background: var(--accent); }
-
+  pre { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font: 13.5px/1.6 var(--mono); color: var(--ink); }
+  code { font: 13.5px var(--mono); color: var(--accent); }
+  pre code { color: inherit; }
   blockquote { margin: 20px 0; padding: 14px 18px; border-left: 2px solid var(--edge);
                background: var(--panel); border-radius: 0 8px 8px 0; color: var(--ink-dim);
                font-size: 15px; }
   blockquote strong { color: var(--ink); }
-  code { font: 13.5px var(--mono); color: var(--accent); }
-
+  .bands { display: grid; gap: 10px; margin: 18px 0 22px; padding: 0; list-style: none; }
+  .bands li { display: grid; grid-template-columns: 12px 1fr; gap: 12px; align-items: start;
+              font-size: 15.5px; }
+  .bands i { width: 12px; height: 12px; border-radius: 3px; margin-top: 6px; }
+  .bands .b1 { background: var(--cool); }
+  .bands .b2 { background: var(--alt); }
+  .bands .b3 { background: var(--accent); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;
+           margin: 30px 0 10px; }
+  .card { border: 1px solid var(--edge); border-radius: 10px; overflow: hidden;
+          background: var(--panel); display: flex; flex-direction: column;
+          transition: border-color .15s; }
+  .card:hover { border-color: var(--accent); }
+  .card img { display: block; width: 100%; height: 190px; object-fit: cover; background: #000;
+              border-bottom: 1px solid var(--edge); }
+  .card .body { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .card h3 { margin: 0; font: 600 16px/1.3 var(--mono); }
+  .card h3 a { text-decoration: none; color: var(--ink); }
+  .card:hover h3 a { color: var(--accent); }
+  .card p { margin: 0; font-size: 14.5px; color: var(--ink-dim); flex: 1; }
+  .card .links { display: flex; gap: 14px; font: 12.5px var(--mono); padding-top: 4px; }
   footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--edge);
            color: var(--ink-dim); font-size: 13.5px; }
   footer a { color: var(--ink-dim); }
 </style>
 
 <div class="wrap">
+<p class="top"><a href="../index.html">&larr; all the demos</a></p>
 <header>
   <p class="kicker">SedaiBasic · demo</p>
   <h1>A Buddhabrot written in BASIC</h1>
   <p class="lede">The same source compiled to bytecode, to machine code and to WebAssembly.
   The three of them draw the <em>same</em> picture, byte for byte. The WebAssembly one runs
   right here, in the browser, with nothing to install.</p>
+  <div class="cta">
+    <a class="primary" href="buddhabrot.html">▶ Run it in your browser</a>
+    <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+  </div>
 </header>
 
 <figure>
@@ -211,6 +227,7 @@ made, with the reason for each.</p>
 </div>
 
 <footer>
+  <p><a href="../index.html">&larr; all the demos</a></p>
   <p>The technique is Melinda Green's, first described in 1993; the name is Lori Gardi's. This
   implementation is independent, written from the mathematical description of the algorithm.</p>
   <p>SedaiBasic — Maurizio Cammalleri · GPL-3.0-or-later ·
