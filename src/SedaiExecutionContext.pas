@@ -301,6 +301,21 @@ type
     ArrPrivSave: array of TArrayPrivSave;
     ArrPrivSaveTop: Integer;
 
+    // --- Runtime multi-dim index: the indices pushed by bcArrayIdxPush, consumed by the resolves ---
+    // ⛔ THIS USED TO BE ONE `array of Int64` ON THE VM, GROWN AND FREED PER ACCESS. Every element of
+    // an array whose dimension SIZES are not known at compile time (a REDIM'd matrix, an array
+    // parameter, "Dim a(n, m)") reaches its storage through push-push-resolve, and each push did a
+    // SetLength(+1) and each resolve a SetLength(0): two heap reallocations and a free for ONE
+    // element read. Measured 2 Sep 2026 on a million reads of a 2-D REDIM'd table: 279 ns each
+    // against 5 ns for the same read on a fixed-size array - fifty times, and it is the reason the
+    // Buddhabrot demo's repaint cost 469 ms a frame where its own probe said 15.
+    // ⇒ The buffer is kept and only ever GROWN; the count says how much of it is live. And it lives
+    // on the CONTEXT rather than on the VM, for the reason ArrMap does below: two threads indexing
+    // runtime-sized matrices shared one accumulator, so their pushes interleaved into each other's
+    // resolve.
+    IdxPending: array of Int64;
+    IdxPendingCount: Integer;
+
     // --- Array identity (M?, 21 Aug 2026): logical array id -> PHYSICAL slot in the VM's array table ---
     // ⛔ A proc-local array used to be ONE storage for the whole program: the slot id is an immediate
     // baked into the bytecode, so two threads inside the same SUB addressed the same elements and

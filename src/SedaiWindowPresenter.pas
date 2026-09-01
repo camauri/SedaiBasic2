@@ -42,6 +42,7 @@ type
     FTexW, FTexH: Integer;
     FClosed: Boolean;
     procedure EnsureTexture(W, H: Integer);
+    procedure HandleEvent(const Event: TSDL_Event);
   public
     constructor Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
     destructor Destroy; override;
@@ -88,18 +89,37 @@ var
   sx, sy, w, h: Integer;
   st: UInt32;
   Focus: PSDL_Window;
+  Diag: Boolean;
 begin
   X := -1; Y := -1; Wheel := 0; Buttons := 0;
   Result := False;
+  // MOUSE_DIAG=1 names WHICH gate answered "no mouse". A GETMOUSE that reports -1 has four
+  // different reasons to do so - no window, the pointer over somebody else's window, the pointer
+  // outside our rectangle - and from BASIC they are the same answer. Verifying the presenter's
+  // mouse without this meant guessing which of them had fired.
+  Diag := GetEnvironmentVariable('MOUSE_DIAG') = '1';
   SDL_PumpEvents;
   Focus := SDL_GetMouseFocus();
-  if Focus = nil then Exit;
-  if (GActiveWindow <> nil) and (Focus <> GActiveWindow) then Exit;
+  if Focus = nil then
+  begin
+    if Diag then WriteLn(ErrOutput, '[mouse] SDL_GetMouseFocus = nil (pointer over no SDL window of ours)');
+    Exit;
+  end;
+  if (GActiveWindow <> nil) and (Focus <> GActiveWindow) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[mouse] focus is another window of this process');
+    Exit;
+  end;
   st := SDL_GetMouseState(@sx, @sy);
   w := 0; h := 0;
   SDL_GetWindowSize(Focus, @w, @h);
+  if Diag then WriteLn(ErrOutput, Format('[mouse] sx=%d sy=%d window=%dx%d buttons=%.2x', [sx, sy, w, h, st]));
   if (sx < 0) or (sy < 0) or (sx >= w) or (sy >= h) then Exit;   // pointer off the window
   X := sx; Y := sy;
+  // The wheel is a COUNTER, not a position: SDL delivers it as discrete events, so an event watch
+  // accumulates the notches and GETMOUSE reports the running total - which is what FreeBASIC's
+  // wheel field is. Reading SDL_GetMouseState alone can never see it.
+  Wheel := SedaiMouseWheelTotal;
   // SDL mask (L=1,M=2,R=4) -> FB bitmask (bit0=left, bit1=right, bit2=middle).
   if (st and SDL_BUTTON_LMASK) <> 0 then Buttons := Buttons or 1;
   if (st and SDL_BUTTON_RMASK) <> 0 then Buttons := Buttons or 2;
@@ -171,6 +191,7 @@ begin
   GActiveWindow := FWindow;
   GKeyDownProvider := @WindowKeyDown;    // MULTIKEY reads the live SDL keyboard state
   GGetMouseProvider := @WindowGetMouse;  // GETMOUSE reads the live SDL mouse state
+  SedaiInstallMouseWheelWatch;           // ...and its wheel field, which only an event can fill
   GSetMouseProvider := @WindowSetMouse;  // SETMOUSE warps / toggles the cursor
   GGetJoystickProvider := @WindowGetJoystick;  // GETJOYSTICK/STICK/STRIG read SDL gaming devices
 end;
@@ -181,6 +202,7 @@ var
 begin
   GKeyDownProvider := nil;
   GGetMouseProvider := nil;
+  SedaiRemoveMouseWheelWatch;
   GSetMouseProvider := nil;
   GGetJoystickProvider := nil;
   GActiveWindow := nil;
@@ -207,6 +229,19 @@ begin
   if Assigned(FWindow) then SDL_SetWindowSize(FWindow, W, H);
 end;
 
+procedure TWindowPresenter.HandleEvent(const Event: TSDL_Event);
+// ⛔ ONE reader for the SDL queue, called by BOTH pumps. There were two copies of this loop - the
+// cheap PollEvents on the instruction counter and the full Pump at the frame boundary - and a rule
+// added to one of them is a rule the other does not have.
+// ⇒ The wheel deliberately does NOT live here even though it is an event: it is counted by the
+// watch in SedaiSDL2Dyn, which SDL calls whoever pumps, so the console's fifteen other drain loops
+// get it for free (see SedaiInstallMouseWheelWatch).
+begin
+  if Event.type_ = SDL_QUITEV then FClosed := True
+  else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
+    FClosed := True;
+end;
+
 function TWindowPresenter.PollEvents: Boolean;
 // ⛔ THE CHEAP HALF, AND THE ONE THE RUN LOOP MUST CALL. The VM polls for events every 10 000
 // instructions so a window stays responsive while a program computes. Presenting on that schedule is
@@ -218,11 +253,7 @@ var
   Event: TSDL_Event;
 begin
   while SDL_PollEvent(@Event) <> 0 do
-  begin
-    if Event.type_ = SDL_QUITEV then FClosed := True
-    else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
-      FClosed := True;
-  end;
+    HandleEvent(Event);
   Result := FClosed;
 end;
 
@@ -241,13 +272,9 @@ begin
   // answered that: this project has measured 14% from code alignment alone.
   if GetEnvironmentVariable('SB_NO_PUMP') = '1' then begin Result := FClosed; Exit; end;
   GPumpT0 := GetTickCount64;
-  // Drain the SDL event queue (quit / window close -> request abort).
+  // Drain the SDL event queue (quit / window close -> request abort, wheel notches accumulate).
   while SDL_PollEvent(@Event) <> 0 do
-  begin
-    if Event.type_ = SDL_QUITEV then FClosed := True
-    else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
-      FClosed := True;
-  end;
+    HandleEvent(Event);
 
   // Mirror the software framebuffer (ARGB) into the texture and present it.
   if Assigned(FRenderer) and Assigned(FBackend) then

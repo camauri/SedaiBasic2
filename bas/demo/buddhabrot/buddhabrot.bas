@@ -90,7 +90,8 @@
 ''
 ''  Arguments are name=value in any order; run with help=1 for the list.
 ''  Keys while it runs:  SPACE pause · R restart · C reading · [ ] gamma · + - iterations
-''                       Z X zoom · W A S D pan · 0 home · S save a still · Q quit
+''                       Z X zoom · W A S D pan · 0 home · P save a still · Q quit
+''                       click or wheel on the picture: zoom in on the point you are looking at
 '' ================================================================================================
 
 
@@ -128,8 +129,15 @@ Const ITERATION_CEILING = 20000      '' hard cap: sizes the scratch orbit array
 Const TEXT_BAND_HEIGHT  = 24         '' pixels reserved at the top for the overlay
 ''  The frame rate is a BUDGET, not a limit. Every frame is given the same slice of wall-clock time
 ''  whatever engine is underneath, and the sampling stops when the slice is spent - so this number
-''  is what the demo runs at, not what it can manage. With no sampling at all the same loop reaches
-''  227 frames a second interpreted and 317 under AOT, so 60 leaves plenty of room. fps= moves it.
+''  is what the demo runs at, not what it can manage. fps= moves it.
+''
+''  📊 Measured 2 Sep 2026 at the default 400x400, holding 60: the interpreter and the JIT both hold
+''  58 frames a second, the AOT holds 44. The budget covers BOTH halves of the frame, so an engine
+''  that cannot hold the rate is one whose PAINTING is over budget - and under --aot the pixel loop
+''  costs 20.2 ms a frame against the interpreter's 7.3. ⛔ That is the engine losing where it should
+''  win, not a property of the demo: it is a call to ColourAt per pixel, and a call the AOT does not
+''  inline is a helper round-trip that flushes and reloads every allocated register. Logged as open
+''  AOT work; the same family as C5-C9 in job/markdown/AOT-PRESTAZIONI.md.
 ''
 ''  ⚠️ IT USED TO BE 20, AND THE REASON IT COULD NOT BE HIGHER IS WORTH KNOWING. Painting is one
 ''  PSet per pixel, and PSet had no native lowering in the AOT backend: every pixel became a
@@ -359,7 +367,18 @@ End Function
 ''  One table per channel, because each has its own peak. The screen and the exported file both read
 ''  these tables, so the two cannot disagree.
 
-Dim Shared As Integer levelOfCount(Any, Any)    '' [channel, count] -> 0..255
+''  ⛔⛔ AND IT IS ONE FLAT TABLE WITH A STRIDE, NOT A TWO-DIMENSIONAL ONE - which is the same shape
+''  `histogram` above already uses, and here it is worth 30x. Written as `levelOfCount(channel, count)`
+''  over a REDIM'd matrix, this demo ran at 2 frames a second where it now runs at 58: an element of an
+''  array whose dimension SIZES are only known at run time is reached through a push-push-resolve
+''  sequence that leaves the C hot loop on every access, and a repaint does three of them per pixel.
+''  📊 Measured 2 Sep 2026, one million reads: 5 ns from a fixed-size matrix, 236 ns from a REDIM'd one.
+''  ⇒ This is a DEFECT of the engine and it is written down as one (job/markdown/AOT-PRESTAZIONI.md,
+''  and the probe that isolates it is job/tests/bench/multidim_index.bas). The demo is flattened here
+''  rather than left slow because a showcase that stutters teaches the wrong thing - but the flattening
+''  is declared, not quiet, and it comes out when the engine is fixed.
+Dim Shared As Integer levelOfCount()   '' channel * levelStride + count -> 0..255
+Dim Shared As Integer levelStride = 0  '' entries per channel
 
 Sub RebuildLevelTables()
   Dim As Integer channel, biggest = 1
@@ -374,17 +393,21 @@ Sub RebuildLevelTables()
     If peak(channel) > biggest Then biggest = peak(channel)
   Next channel
 
-  If UBound(levelOfCount, 2) < biggest Then ReDim levelOfCount(2, biggest + biggest \ 2)
+  If levelStride < biggest + 1 Then
+    levelStride = biggest + biggest \ 2 + 1
+    ReDim levelOfCount(3 * levelStride - 1)
+  End If
   For channel = 0 To 2
     Dim As Double inverseLogOfPeak = 1.0 / Log(1.0 + peak(channel))
-    levelOfCount(channel, 0) = 0
+    Dim As Integer channelBase = channel * levelStride
+    levelOfCount(channelBase) = 0
     Dim As LongInt count
     For count = 1 To peak(channel)
-      levelOfCount(channel, count) = Int( 255.0 * ClampUnit( BrightnessOf(count, inverseLogOfPeak) ) )
+      levelOfCount(channelBase + count) = Int( 255.0 * ClampUnit( BrightnessOf(count, inverseLogOfPeak) ) )
     Next count
     '' Anything above this channel's own peak cannot occur in it, but the table is shared in size.
-    For count = peak(channel) + 1 To UBound(levelOfCount, 2)
-      levelOfCount(channel, count) = 255
+    For count = peak(channel) + 1 To levelStride - 1
+      levelOfCount(channelBase + count) = 255
     Next count
   Next channel
 End Sub
@@ -416,9 +439,9 @@ Function ReadingName( ByVal which As Integer ) As String
 End Function
 
 Function ColourAt( ByVal pixel As Integer ) As Integer
-  Dim As Integer longLived  = levelOfCount(0, histogram(pixel))
-  Dim As Integer midLived   = levelOfCount(1, histogram(pixelsPerPlane + pixel))
-  Dim As Integer shortLived = levelOfCount(2, histogram(2 * pixelsPerPlane + pixel))
+  Dim As Integer longLived  = levelOfCount(histogram(pixel))
+  Dim As Integer midLived   = levelOfCount(levelStride + histogram(pixelsPerPlane + pixel))
+  Dim As Integer shortLived = levelOfCount(2 * levelStride + histogram(2 * pixelsPerPlane + pixel))
 
   If colourReading = READING_AURORA Then Return RGB( shortLived, midLived, longLived )
 
@@ -535,9 +558,10 @@ Sub PrintUsage()
   Print "  zoom=N      how many times to magnify                 (default 1)"
   Print
   Print "Keys while running:"
-  Print "  SPACE pause    R restart    S save a still    Q quit"
+  Print "  SPACE pause    R restart    P save a still    Q quit"
   Print "  C reading      [ ] gamma    + - iterations"
   Print "  Z X zoom       W A S D pan  0 back to the whole figure"
+  Print "  left click or wheel up: zoom in on the pointer   right click or wheel down: zoom out"
 End Sub
 
 
@@ -576,7 +600,8 @@ If blueCeiling  < 1 Then blueCeiling  = 1
 
 pixelsPerPlane = imageSize * imageSize
 ReDim histogram(3 * pixelsPerPlane - 1)
-ReDim levelOfCount(2, 4095)
+levelStride = 4096
+ReDim levelOfCount(3 * levelStride - 1)
 viewCentreReal      = CDbl( ArgumentValue("re",   Str(HOME_CENTRE_REAL)) )
 viewCentreImaginary = CDbl( ArgumentValue("im",   Str(HOME_CENTRE_IMAGINARY)) )
 viewHalfSpan        = HOME_HALF_SPAN / CDbl( ArgumentValue("zoom", "1") )
@@ -651,6 +676,24 @@ Dim As Integer paused = 0
 Dim As LongInt framesDrawn = 0
 Dim As String  key
 
+'' ---- the pointer -------------------------------------------------------------------------------
+'' GETMOUSE answers a STATUS (0 = there is a mouse over our window, 1 = there is not) and fills the
+'' fields by reference. Everything below is guarded on that status, so the demo behaves exactly as
+'' it always did when it is run without a pointer over it - which is also how the determinism guard
+'' runs it.
+''
+'' ⚠️ THE BUTTONS ARE A LEVEL, NOT AN EVENT. Read once a frame at sixty frames a second, a button
+'' held down for a fifth of a second is twelve readings: acting on the level would zoom twelve times
+'' and land on a window a four-thousandth of the one you clicked in. So the previous reading is kept
+'' and only the RISING EDGE counts - press once, zoom once. The wheel is the opposite kind of thing:
+'' it is a running COUNTER of notches, so what matters is the difference since the last frame.
+Dim As Integer pointerX, pointerY, pointerWheel, pointerButtons, pointerStatus
+Dim As Integer previousButtons = 0, previousWheel = 0
+Dim As Integer pointerOverPicture = 0
+Dim As Double  pointerReal = 0.0, pointerImaginary = 0.0
+pointerStatus = GetMouse(pointerX, pointerY, pointerWheel, pointerButtons)
+If pointerStatus = 0 Then previousWheel = pointerWheel
+
 Do
   Dim As Double frameStart = Timer
   framesDrawn = framesDrawn + 1
@@ -672,12 +715,28 @@ Do
     If sampleSeconds > 0.0 Then orbitsPerSecond = (orbitsTraced - before) / sampleSeconds
   End If
 
+  '' Where is the pointer, and what does it point AT? The picture is a window on the complex plane,
+  '' so a pixel has a coordinate: this is the inverse of the mapping AccumulateOrbitPoint uses to put
+  '' an orbit point into the histogram, with the text band's height taken off the row.
+  '' ⚠️ The window is sized to the framebuffer by the presenter, so a mouse pixel IS a picture pixel -
+  '' there is no scale factor to undo here, and if the window is ever made resizable there will be.
+  pointerStatus = GetMouse(pointerX, pointerY, pointerWheel, pointerButtons)
+  pointerOverPicture = 0
+  If pointerStatus = 0 And pointerY >= TEXT_BAND_HEIGHT And pointerX >= 0 _
+     And pointerX < imageSize And pointerY - TEXT_BAND_HEIGHT < imageSize Then
+    pointerOverPicture = 1
+    pointerImaginary = viewImaginaryMin + pointerX / pixelsPerImaginaryUnit
+    pointerReal      = viewRealMin + (pointerY - TEXT_BAND_HEIGHT) / pixelsPerRealUnit
+  End If
+
   '' Draw String writes into the framebuffer and nowhere else. LOCATE + PRINT would also work, but
   '' PRINT echoes to standard output as well, and a demo that scrolls a thousand lines up the
   '' terminal it was launched from is not one anybody runs twice.
   Dim As Double paintStart = Timer
   PaintFrame( label + "   " + Str(Int(orbitsPerSecond)) + " orbits/s" + _
-                IIf(paused, "   [PAUSED]", ""), _
+                IIf(paused, "   [PAUSED]", "") + _
+                IIf(pointerOverPicture, "   pointer " + Format(pointerReal, "0.0000") + _
+                                        " " + Format(pointerImaginary, "0.0000"), ""), _
               "traced " + Str(orbitsTraced) + "    drawn " + Str(orbitsAccumulated) + _
                 "    iter " + Str(maximumIterations) + _
                 "    " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0") + _
@@ -705,6 +764,31 @@ Do
     viewCentreReal = HOME_CENTRE_REAL : viewCentreImaginary = HOME_CENTRE_IMAGINARY
     viewHalfSpan = HOME_HALF_SPAN : moved = 1
   End If
+
+  '' ---- the same three moves, from the pointer ----------------------------------------------
+  '' W A S D walk the view by half a window at a time, which is the only thing a keyboard can do:
+  '' to reach a filament you can SEE you have to walk towards it and correct, and each correction
+  '' throws the picture away and starts it again. Pointing at it is one move instead of six.
+  ''
+  '' Zooming IN takes the pointer as the new centre - that is the whole point of it. Zooming OUT
+  '' leaves the centre alone: the interesting thing is already in the middle, and pulling it towards
+  '' the pointer as you widen would walk the view off it.
+  Dim As Integer pressed = pointerButtons And (Not previousButtons)   '' rising edges only
+  Dim As Integer wheelStep = pointerWheel - previousWheel
+  If pointerStatus = 0 Then
+    previousButtons = pointerButtons
+    previousWheel = pointerWheel
+  End If
+  If pointerOverPicture <> 0 Then
+    If (pressed And 1) <> 0 Or wheelStep > 0 Then
+      viewCentreReal = pointerReal : viewCentreImaginary = pointerImaginary
+      viewHalfSpan = viewHalfSpan / 2.0 : moved = 1
+    End If
+    If (pressed And 2) <> 0 Or wheelStep < 0 Then
+      viewHalfSpan = viewHalfSpan * 2.0 : moved = 1
+    End If
+  End If
+
   If viewHalfSpan > HOME_HALF_SPAN Then viewHalfSpan = HOME_HALF_SPAN
   If moved <> 0 Then
     RecomputeView()
@@ -712,7 +796,9 @@ Do
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer
   End If
-  If key = "s" Then WritePortablePixmap(outputName)
+  '' ⚠️ This used to be S, which is also the key that pans DOWN: one press did both, so every save
+  '' wrote a picture of the view you had just left. P for picture.
+  If key = "p" Then WritePortablePixmap(outputName)
   '' The tone curve and the reading are the two things worth changing while looking at the picture,
   '' because both are judgements about what you want to SEE and neither costs a recomputation - the
   '' orbits are already counted, only the tables are rebuilt.
