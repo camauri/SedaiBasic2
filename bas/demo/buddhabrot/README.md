@@ -63,9 +63,15 @@ Keys while it runs:
 
 | | |
 |---|---|
-| **SPACE** pause · **R** restart · **S** save a still · **Q** quit | |
+| **SPACE** pause · **R** restart · **P** save a still · **Q** quit | |
 | **C** cycle the reading · **[** **]** move the tone curve · **+** **−** halve or double the iteration ceiling | |
 | **Z** **X** zoom · **W A S D** pan · **0** back to the whole figure | |
+| **left click** or **wheel up** zoom in on the pointer · **right click** or **wheel down** zoom out | |
+
+The pointer is the one that matters. `W A S D` walk the view half a window at a time, which is all a
+keyboard can do — to reach a filament you can *see*, you walk towards it and correct, and every
+correction throws the picture away and starts it again. Clicking on it is one move. The overlay
+prints the complex coordinate under the pointer as you go.
 
 ### The three readings
 
@@ -93,6 +99,9 @@ Measured, ten million orbits at each step, brightest pixel in the red channel:
 | ×4 | 188 |
 | ×8 | 111 |
 
+(Click where you want to go: each click centres the view on the point under the pointer and halves
+the span, which is how that table was collected.)
+
 About a quarter of the signal survives each doubling. Four or five steps in, the picture stops
 converging in any useful time — and that is the whole reason Metropolis-Hastings sampling was
 invented: instead of drawing points uniformly, mutate one already known to produce a long orbit
@@ -116,8 +125,8 @@ select which engine runs the loaded program:
 
 | build | size |
 |---|---|
-| `./build.sh sb` (headless, the regression target) | 4 134 024 bytes |
-| `./build.sh sb --window` (adds the SDL2 presenter) | 4 143 016 bytes |
+| `./build.sh sb` (headless, the regression target) | 4 142 376 bytes |
+| `./build.sh sb --window` (adds the SDL2 presenter) | 4 151 400 bytes |
 
 The engine is bound when the program is **loaded** — the JIT builds its native loops and the AOT
 compiler compiles its functions before the first instruction runs — so it cannot be changed by a
@@ -127,54 +136,51 @@ three windows are computing an identical image and the only difference is how fa
 
 ## What it actually does
 
-Measured on this machine (AMD, Linux, single thread), tracing two million orbits with `still=`:
+Measured 2 September 2026 on an Intel Core Ultra 9 185H (Linux, single thread, pinned to one
+performance core), tracing two million orbits with `still=` — computing only, nothing painted:
 
 | engine | seconds | orbits per second | against the interpreter |
 |---|---:|---:|---:|
-| bytecode interpreter | 2.51 | 798 000 | — |
-| JIT | 0.92 | 2 180 000 | 2.7× |
-| AOT | 0.61 | 3 260 000 | **4.1×** |
+| bytecode interpreter | 5.11 | 391 000 | — |
+| JIT | 1.43 | 1 401 000 | 3.6× |
+| AOT | 1.45 | 1 381 000 | 3.5× |
 
-Live, in a six-second run at the default 60 frames a second. The left-hand column is the point: it
-does **not** move.
+Live, in a six-second run at the default 60 frames a second and 400×400. The left-hand column is the
+point: it does **not** move.
 
-| engine | frames per second | orbits traced in 6 s |
-|---|---:|---:|
-| bytecode interpreter | 58 | ~4.0 million |
-| AOT | 58 | ~17.3 million |
+| engine | frames per second | orbits traced in 6 s | against the interpreter |
+|---|---:|---:|---:|
+| bytecode interpreter | 58 | ~730 000 | — |
+| JIT | 58 | ~4 070 000 | 5.6× |
+| AOT | 58 | ~7 400 000 | **10.1×** |
 
 The demo prints both numbers when it exits, so this table can be reproduced rather than believed.
 The orbit counts move by a percent or two between runs; the frame rate does not move at all, which
 is the whole claim.
 
-**The frame rate is a budget, not a limit.** With no sampling at all the same loop reaches 227 frames
-a second interpreted and 317 under AOT, so 60 leaves room to spare.
+**The live ratio is bigger than the compute-only one, and that is not a contradiction.** A frame is
+sampling *plus* painting inside one budget, so an engine that paints faster has more of the budget
+left to sample with. A full 400×400 repaint costs **7.4 ms interpreted and 0.76 ms under AOT** — so
+of a 16.6 ms frame the interpreter has 9 ms left to trace orbits in and the AOT has 15.8.
 
-> **This used to be a much sadder table, and it is worth keeping the before.** Until 1 September 2026
-> the AOT backend had no native lowering for `PSet`: every pixel became a runtime-helper call that
-> flushed and reloaded every allocated register, 60 ns against the interpreter's 4. Painting was
-> therefore a tax that fell hardest on the *fastest* engine, and asking for more frames made the
-> compiled engine look worse — at 20 fps the AOT traced 3.31× the interpreter's orbits, at 30 fps
-> 2.97×, at 60 fps **1.83×**. The demo was reporting a defect in the engine as if it were a property
-> of compilation. `PSet` is now an inline store (SedaiAot C8) at 1.1 ns per call, the tax is gone,
-> and the same measurements read 4.13× at 30 fps and 4.32× at 60.
+> **Both halves of that were defects, and both were found by building this demo.**
+>
+> Until 1 September the AOT had no native lowering for `PSet`: every pixel was a runtime-helper call
+> that flushed and reloaded every allocated register, 60 ns against the interpreter's 4. Painting was
+> a tax that fell hardest on the *fastest* engine — at 60 fps the AOT's advantage collapsed to 1.83×.
+> `PSet` became an inline store (SedaiAot C8) at 1.1 ns a call.
+>
+> That fixed less than it looked, and the reason is worth knowing. On 2 September the AOT still held
+> only **43** frames a second where the interpreter and the JIT held 58, and traced *fewer* orbits
+> than the interpreter. `RGB()` was still a helper call — and a helper call zeroes the surface
+> descriptor that C8's inline store is gated on, so an `RGB` immediately before a `PSet` took the
+> `PSet` off its fast path too, **on every pixel**. `PSet (x, y), RGB(r, g, b)` is how every graphics
+> program in this language paints: the two are one hot pair, and covering only one of them covered
+> neither. `RGB` is now four masks and three shifts of inline code (C10), and the pixel loop went from
+> 20.5 ms a frame to 0.76 — with `AOT_GFXRGB=0` on the same binary to prove which change did it.
 
-The live ratio is smaller than 4.1×, and the reason is worth stating plainly because it works
-*against* the demo's own headline. Painting the window is one `PSet` per pixel, and `PSet` costs
-about **4 ns per call under the interpreter, about the same under the JIT, and about 60 ns under
-AOT** — measured flat at 100×100, 200×200 and 400×400, so it is a per-call cost rather than a fixed
-overhead per frame. A full 400×400 repaint is about 0.75 ms, 0.75 ms and 9.5 ms respectively.
-
-The live ratio now matches the compute-only one, because painting costs all three engines about the
-same share of a frame. Per `PSet` call: 4.4 ns interpreted, 4.8 ns under the JIT, **1.1 ns under
-AOT**. A full 400×400 repaint is 0.70 ms, 0.78 ms and 0.17 ms.
-
-Getting there is the demo's other story. `PSet` used to cost 60 ns under AOT — the compiled engine
-was fifteen times *slower* than the interpreter at the one thing it does most often here — because it
-had no native lowering and every pixel went through the runtime helper. Building this demo is what
-measured it; fixing it was the same move this project had already made three times, for strings,
-records and `PRINT`. The interpreter's speed, for its part, is not the interpreter: it is the C hot
-dispatch loop. Run it with `HOTC_OFF=1` and a pixel costs 32 ns.
+The interpreter's own speed, for its part, is not the interpreter: it is the C hot dispatch loop. Run
+it with `HOTC_OFF=1` and a pixel costs 32 ns instead of 4.4.
 
 ## The same image, four ways of computing it
 
