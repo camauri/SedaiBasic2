@@ -332,6 +332,23 @@ var
   // Loop-weighted operand accesses the EMITTED code sends to the banks, counted where the decision
   // is actually made (FAlloc/IAlloc answering "no home"). This is the number that compares two
   // allocators honestly - the residency figures elsewhere model a policy, this counts instructions.
+  // Loop-weighted split between ops with a native descent and ops routed to the runtime helper.
+  //
+  // ⛔⛔ READ THIS BEFORE USING EITHER NUMBER TO DECIDE ANYTHING. Weighting by loop depth was the
+  // obvious repair for the static NativeOps/HelperOps counts, and MEASURING IT DISPROVED IT. On a
+  // 400x400 paint loop the static share is 5.0% and the loop-weighted share is 5.4% - because the
+  // helper op and the seventeen native ops around it sit in the SAME block and get the SAME weight.
+  // Meanwhile that region runs 14.6x slower compiled than interpreted (9500 us against 650 us per
+  // repaint).
+  // ⇒ Neither number can settle profitability, because both count INSTRUCTIONS and the question is
+  //   COST: one helper call is ~60 ns (AotHelperCall flushes every allocated register and reloads
+  //   them) against ~1 ns for a native op, and against ~4 ns for the whole loop body when the C hot
+  //   loop covers it. A single helper call in an innermost loop decides the region on its own,
+  //   whatever share of the instructions it is.
+  // These two are kept because that is worth SEEING: a region can be 5% helper and 15x slower, and
+  // the printed share is the evidence for it rather than a criterion against it.
+  AotDiagWHelper: Int64 = 0;
+  AotDiagWTotal: Int64 = 0;
   AotDiagMemAccI: Int64 = 0;
   AotDiagMemAccF: Int64 = 0;
   AotDiagCodeW: Int64 = 0;      // loop-weighted bytes of emitted code
@@ -4680,6 +4697,7 @@ var
     // all (CountVal rejects those outright).
     procedure NoteHelperOp;
     begin
+      Inc(AotDiagWHelper, UseW);          // loop-weighted: what this helper call really costs
       if not AotHelperRoutable(Prog, o) then
         Fail('helper:' + OpName(Ins.OpCode))
       else
@@ -4701,6 +4719,8 @@ var
       for j := 0 to Blk.Instructions.Count - 1 do
       begin
         Ins := Blk.Instructions[j];
+        if (Ins.OpCode <> ssaLabel) and (Ins.OpCode <> ssaNop) then
+          Inc(AotDiagWTotal, UseW);
         case Ins.OpCode of
           ssaLabel, ssaNop: ;
           ssaRecMarkPush, ssaRecMarkPop:
@@ -6701,6 +6721,7 @@ begin
   FillChar(SaveGpr, SizeOf(SaveGpr), 0);
 
   CurOrd := Region.FirstOrdinal;   // Prescan uses its own ordinal; keep for NeedPC in emission
+  AotDiagWHelper := 0; AotDiagWTotal := 0;   // per region: Prescan is what fills them
   Prescan;
   if not OK then Exit;
 
@@ -7252,6 +7273,11 @@ begin
         // really live at once fits the machine pool at all.
         WriteLn(ErrOutput, Format('[AOT]   emitted bank traffic (loop-weighted): int=%d float=%d  code bytes=%d',
           [AotDiagMemAccI, AotDiagMemAccF, AotDiagCodeW]));
+        // ⚠️ A SMALL SHARE HERE DOES NOT MEAN A PROFITABLE REGION - see the declaration of these two
+        // counters. Measured: 5.4% on a paint loop that runs 14.6x slower compiled than interpreted.
+        if AotDiagWTotal > 0 then
+          WriteLn(ErrOutput, Format('[AOT]   helper share (loop-weighted): %d / %d = %.1f%%',
+            [AotDiagWHelper, AotDiagWTotal, 100.0 * AotDiagWHelper / AotDiagWTotal]));
         // C7: how many div/mod sites got the multiply-high and how many stayed on idiv. Without this
         // the only evidence is the stopwatch, and a lowering that never fires reads exactly like one
         // that fires and does not pay.
