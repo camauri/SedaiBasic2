@@ -42,11 +42,25 @@ them that way.
 > rather than what any particular author chose, which would be a fact about their code.
 > Our own source, on the other hand, is in this directory in full and in the clear.
 
+**And the sampling stays UNIFORM, which is a declaration and not an omission.** Section 4 compares
+languages along axes that only mean something if every implementation is answering the same question,
+and Metropolis-Hastings sampling answers a different one — it converges far faster at depth by
+mutating a `c` already known to produce a long orbit, which is why the zoom in this demo visibly
+stops converging four steps in. If a Metropolis-Hastings variant is added here it will be added as a
+**separate, declared variant**, never as a change to the default: two sampling strategies mixed into
+one table make the comparison unreadable.
+
+**The WebAssembly build is the same source, not a second implementation.** `sbc --target wasm`
+compiles `buddhabrot.bas` to a module that runs in a browser; what differs is compiled out with
+`#if __SB_WASM__` — the text band, the file writer, the key loop — and nothing that decides a pixel
+is among it. The module's framebuffer hashes the same as the native one on the same orbits
+(`verify_wasm.sh`), which is what makes that claim checkable rather than merely stated.
+
 ## 3. The implementations
 
 | Language | Author | Licence (checked 1 Sep 2026) | Sampling | Runs on | Link |
 |---|---|---|---|---|---|
-| SedaiBasic | Maurizio Cammalleri | GPL-3.0-or-later | uniform | CPU, single thread | [`buddhabrot.bas`](buddhabrot.bas) |
+| SedaiBasic | Maurizio Cammalleri | GPL-3.0-or-later | uniform | CPU, single thread; also WebAssembly | [`buddhabrot.bas`](buddhabrot.bas) |
 | C | Paul Bourke | not stated on the page | uniform | CPU | [paulbourke.net](https://paulbourke.net/fractals/buddhabrot/) |
 | Go | karlek | Unlicense (public domain) | uniform | CPU, multi-threaded | [karlek/wasabi](https://github.com/karlek/wasabi) |
 | JavaScript | Albert Lobo (llop) | MIT | uniform | browser | [llop/buddhabrot-4d-viewer-js](https://github.com/llop/buddhabrot-4d-viewer-js) |

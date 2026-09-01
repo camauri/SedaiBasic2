@@ -118,6 +118,48 @@ bin/x86_64-linux/sb bas/demo/buddhabrot/buddhabrot.bas --aot still=20000000 out=
 made that way; `series=N` adds N numbered stills along the route, which is how the film above was
 made — one run, so every frame comes from the same orbits as the last one. Run `... buddhabrot.bas help=1` for the full argument list.
 
+## In the browser
+
+<p align="center"><code>buddhabrot.html</code> — open it, nothing to install.</p>
+
+`sbc --target wasm` compiles **the same `buddhabrot.bas`** to a WebAssembly module, and
+`buddhabrot.html` carries that module inside it as base64: one file, no server, no toolchain, no
+runtime library. Click the picture to zoom in on what you clicked, right-click to zoom out; the
+buttons do what the keys do natively.
+
+```bash
+sbc bas/demo/buddhabrot/buddhabrot.bas --target wasm buddhabrot.wasm
+bash bas/demo/buddhabrot/verify_wasm.sh          # compiles it, runs it, checks the picture
+```
+
+**It is the same source, not a port.** The browser build differs by what is *compiled out* of it —
+`#if __SB_WASM__` — and the list is short and each entry has a reason:
+
+| compiled out | because |
+|---|---|
+| the 24-pixel text band, `Draw String` | the overlay is HTML in the browser |
+| `ScreenLock` / `ScreenUnlock` | there is no presenter to hold back; the page reads the framebuffer when it is ready |
+| `WritePortablePixmap` | a module has no filesystem, and the backend says so rather than emitting something that runs and lies |
+| the still mode and the live `InKey` loop | the page owns the clock — a module that looped until Q would freeze the tab |
+
+Everything that decides a *pixel* — the sampler, the three planes, the tone curve, the three
+readings, the zoom — is the same code compiled twice. Which is checkable, and is checked:
+`verify_wasm.sh` runs the module under Node for the same orbits `sb` traces and requires the two
+framebuffers to hash the same. They do, byte for byte. It also refuses to pass if `buddhabrot.html`
+carries an older module than the source compiles to, because a stale page looks perfectly fine and is
+showing something else.
+
+Measured on the same machine, the same two million orbits:
+
+| | orbits per second | against the interpreter |
+|---|---:|---:|
+| bytecode interpreter | 391 000 | — |
+| **WebAssembly (Node 20, V8)** | **923 000** | **2.4×** |
+| JIT | 1 401 000 | 3.6× |
+| AOT | 1 381 000 | 3.5× |
+
+The module is 25 KB; the page that carries it is 43 KB.
+
 ## The three engines are one binary
 
 There are no three executables to build. SedaiBasic ships a single `sb`, and `--jit` and `--aot`
@@ -190,7 +232,8 @@ bash bas/demo/buddhabrot/verify_determinism.sh
 
 Traces the same orbits under the interpreter, the JIT, the AOT compiler and the interpreter with the
 optimiser switched off, then compares SHA-256 hashes of the four output files. They must be
-identical, and they are.
+identical, and they are. `verify_wasm.sh` adds a fifth: the WebAssembly module's framebuffer, from
+the same orbits, hashes the same as all four.
 
 This matters more than it sounds. The image depends on a floating-point comparison — *has this orbit
 passed radius 2 yet?* — made tens of millions of times. If any engine rounded differently anywhere,

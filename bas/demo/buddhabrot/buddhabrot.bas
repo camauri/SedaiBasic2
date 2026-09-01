@@ -126,7 +126,15 @@ Const SAMPLE_IMAGINARY_SPAN = 2.8
 Const ESCAPE_RADIUS_SQUARED = 4.0
 
 Const ITERATION_CEILING = 20000      '' hard cap: sizes the scratch orbit array
+#if __SB_WASM__
+  '' ⛔ IN THE BROWSER THE OVERLAY IS THE PAGE'S, NOT THE FRAMEBUFFER'S. `Draw String` is not covered
+  '' by the WASM backend, and the backend refuses an opcode for being PRESENT in the program rather
+  '' than for being reached - so the band, and everything drawn in it, is absent from the source the
+  '' module is compiled from. The picture is the same picture; only the strip above it is gone.
+  Const TEXT_BAND_HEIGHT = 0
+#else
 Const TEXT_BAND_HEIGHT  = 24         '' pixels reserved at the top for the overlay
+#endif
 ''  The frame rate is a BUDGET, not a limit. Every frame is given the same slice of wall-clock time
 ''  whatever engine is underneath, and the sampling stops when the slice is spent - so this number
 ''  is what the demo runs at, not what it can manage. fps= moves it.
@@ -480,6 +488,11 @@ End Function
 ''  execution engines is a comparison of the arithmetic and nothing else.
 
 Sub WritePortablePixmap( ByVal fileName As String )
+#if __SB_WASM__
+  '' ⛔ A module has no filesystem, and the backend says so itself rather than emitting something
+  '' that runs and lies: "WebAssembly has no filesystem: a module cannot open, inspect or change
+  '' files". So the body is absent here, not merely unreached. The browser build never calls it.
+#else
   RebuildLevelTables()
 
   Dim As Integer handle = FreeFile
@@ -497,6 +510,7 @@ Sub WritePortablePixmap( ByVal fileName As String )
     Put #handle, , row
   Next y
   Close #handle
+#endif
 End Sub
 
 ''  ⛔⛔ EVERYTHING THAT BELONGS TO ONE FRAME HAPPENS INSIDE ONE LOCK, the overlay included.
@@ -507,19 +521,32 @@ End Sub
 ''  The band is cleared before it is written, because a number that gets shorter would otherwise
 ''  leave the tail of the longer one it replaced standing behind it.
 
+''  ⭐ ONE painting routine, not two. The browser build differs from the native one by what is
+''  COMPILED OUT of it - the lock and the two lines of text - and by nothing else, so the loop that
+''  decides every pixel cannot drift between them. That is the same discipline the voxel demo keeps
+''  for its camera path, and for the same reason: two descriptions of one thing become two things.
 Sub PaintFrame( ByVal topLine As String, ByVal bottomLine As String )
   RebuildLevelTables()
   Dim As Integer x, y
+#if __SB_WASM__
+  '' No lock: there is no presenter to hold back. The page reads the framebuffer out of linear
+  '' memory when it is ready, which is after this returns.
+#else
   ScreenLock
+#endif
   For y = 0 To imageSize - 1
     For x = 0 To imageSize - 1
       PSet (x, y + TEXT_BAND_HEIGHT), ColourAt( y * imageSize + x )
     Next x
   Next y
+#if __SB_WASM__
+  '' The overlay is HTML in the browser build - see TEXT_BAND_HEIGHT.
+#else
   Line (0, 0)-(imageSize - 1, TEXT_BAND_HEIGHT - 1), RGB(0, 0, 0), BF
   Draw String (4, 2),  topLine,    RGB(255, 255, 255)
   Draw String (4, 12), bottomLine, RGB(160, 160, 160)
   ScreenUnlock
+#endif
 End Sub
 
 
@@ -563,6 +590,79 @@ Sub PrintUsage()
   Print "  Z X zoom       W A S D pan  0 back to the whole figure"
   Print "  left click or wheel up: zoom in on the pointer   right click or wheel down: zoom out"
 End Sub
+
+
+#if __SB_WASM__
+'' ================================================================================================
+''  9b. THE BROWSER BUILD - the same program, driven by the page instead of by a keyboard
+'' ================================================================================================
+''  ⛔ THE MODULE MUST NOT OWN THE LOOP. A module that ran until Q was pressed would freeze the tab:
+''  there is no Q, and nothing else gets to run while a wasm call is on the stack. So `main` sets up
+''  and draws ONE frame, and the page calls PROC_STEPFRAME once per animation tick - which is also
+''  what makes the browser's own frame clock, rather than a Timer inside BASIC, the thing that paces
+''  it. The voxel-landscape demo is driven the same way, for the same reason.
+''
+''  ⭐ AND THE PAGE PASSES THE ORBIT COUNT rather than a time budget. Natively the budget is a slice
+''  of wall clock because the point there is to hold the frame rate CONSTANT across three engines;
+''  here there is one engine, and a count the page chose is a count the page can divide by its own
+''  measured milliseconds. The honest number in a browser is orbits per second, and this is how it
+''  is computed without the module timing itself.
+Dim Shared As LongInt browserSeed
+
+Sub StepFrame( ByVal orbitsThisFrame As Integer )
+  Dim As Integer i
+  For i = 1 To orbitsThisFrame
+    TraceOneOrbit()
+  Next i
+  PaintFrame("", "")
+End Sub
+
+''  Everything the keyboard and the mouse do natively, as one entry point. It is ONE Sub and not six
+''  because a Sub small enough to be inlined is a Sub that does not survive as an exported function -
+''  and the page can only call what the module exports.
+''    0 reading (a = 0..2)   1 gamma in tenths   2 zoom in at pixel (a, b)   3 zoom out
+''    4 home                 5 restart           6 iteration ceiling = a
+Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
+  Dim As Integer moved = 0
+  If command = 0 Then
+    colourReading = a Mod READING_COUNT
+  ElseIf command = 1 Then
+    toneGamma = a / 10.0
+    If toneGamma < 1.2  Then toneGamma = 1.2
+    If toneGamma > 12.0 Then toneGamma = 12.0
+  ElseIf command = 2 Then
+    '' The inverse of the mapping AccumulateOrbitPoint uses, exactly as the native mouse zoom does:
+    '' a pixel of the canvas IS a point of the complex plane.
+    If a >= 0 And a < imageSize And b >= 0 And b < imageSize Then
+      viewCentreImaginary = viewImaginaryMin + a / pixelsPerImaginaryUnit
+      viewCentreReal      = viewRealMin + b / pixelsPerRealUnit
+      viewHalfSpan = viewHalfSpan / 2.0
+      moved = 1
+    End If
+  ElseIf command = 3 Then
+    viewHalfSpan = viewHalfSpan * 2.0 : moved = 1
+  ElseIf command = 4 Then
+    viewCentreReal = HOME_CENTRE_REAL : viewCentreImaginary = HOME_CENTRE_IMAGINARY
+    viewHalfSpan = HOME_HALF_SPAN : moved = 1
+  ElseIf command = 5 Then
+    moved = 1
+  ElseIf command = 6 Then
+    maximumIterations = a
+    If maximumIterations < 50 Then maximumIterations = 50
+    If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
+    moved = 1
+  End If
+  If viewHalfSpan > HOME_HALF_SPAN Then viewHalfSpan = HOME_HALF_SPAN
+  '' Every move throws the counts away and starts the seed again, so what appears after a move is a
+  '' fresh picture of the new window rather than the old one dragged into it. Same rule as natively.
+  If moved <> 0 Then
+    RecomputeView()
+    Dim As Integer i
+    For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
+    SeedRandom(browserSeed) : orbitsTraced = 0 : orbitsAccumulated = 0
+  End If
+End Sub
+#endif
 
 
 '' ================================================================================================
@@ -609,6 +709,20 @@ RecomputeView()
 SeedRandom(seed)
 orbitsTraced = 0
 orbitsAccumulated = 0
+
+#if __SB_WASM__
+'' ---- the browser build: set up, draw one frame, hand back ---------------------------------------
+''  There is no still mode here (no file to write) and no live loop (the page owns the clock).
+browserSeed = seed
+ScreenRes imageSize, imageSize + TEXT_BAND_HEIGHT, 32
+''  ⛔ AND THIS CALL IS NOT DECORATION. A Sub that nothing calls does not survive as a function -
+''  it is eliminated before the backend sees it - so the page would have nothing to call. Command -1
+''  matches no branch and does nothing; what it does is give Control a call site. Verified by
+''  looking at the module's export list, which is where its absence showed.
+Control(-1, 0, 0)
+StepFrame(20000)          '' one frame, so the canvas is never blank before the first tick
+End
+#endif
 
 '' ---- still mode: no window, fixed work, one file. This is what the determinism check runs. -----
 If stillOrbits > 0 Then

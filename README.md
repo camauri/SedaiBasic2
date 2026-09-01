@@ -32,6 +32,10 @@ that fits on a screen.
 bash bas/demo/buddhabrot/compare_engines.sh     # all three engines, side by side
 ```
 
+The same source also compiles to WebAssembly — `bas/demo/buddhabrot/buddhabrot.html` is one file with
+the module inside it, no server and nothing to install, and it draws a framebuffer that hashes the
+same as the native one.
+
 Also in [`bas/demo/`](bas/demo/): `bubble_universe.bas`, `voxel_landscape.bas`, `sedai_lbm.bas`.
 
 ## ⚠️ Branch Information
