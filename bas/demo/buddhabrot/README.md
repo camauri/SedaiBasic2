@@ -76,17 +76,31 @@ Measured on this machine (AMD, Linux, single thread), tracing two million orbits
 | JIT | 0.92 | 2 180 000 | 2.7× |
 | AOT | 0.61 | 3 260 000 | **4.1×** |
 
-Live, in a six-second run. The left-hand column is the point: it does **not** move.
+Live, in a six-second run at the default 30 frames a second. The left-hand column is the point: it
+does **not** move.
 
 | engine | frames per second | orbits traced in 6 s |
 |---|---:|---:|
-| bytecode interpreter | 19 | ~4.5 million |
-| JIT | 19 | ~12 million |
-| AOT | 19 | ~14.8 million |
+| bytecode interpreter | 29 | ~4.3 million |
+| JIT | 29 | ~11.7 million |
+| AOT | 29 | ~12.9 million |
 
 The demo prints both numbers when it exits, so this table can be reproduced rather than believed.
 The orbit counts move by a percent or two between runs; the frame rate does not move at all, which
 is the whole claim.
+
+**The frame rate is a budget, not a limit.** With no sampling at all the same loop reaches 230 frames
+a second interpreted, 269 under the JIT and 81 under AOT. `fps=` moves it, and moving it shows you
+something the demo would rather not have to admit:
+
+| `fps=` | interpreter orbits in 6 s | AOT orbits in 6 s | ratio |
+|---:|---:|---:|---:|
+| 20 | ~4.5 M | ~14.8 M | **3.31×** |
+| 30 (default) | ~4.3 M | ~12.9 M | **2.97×** |
+| 60 | ~4.0 M | ~7.3 M | **1.83×** |
+
+The faster the frame rate, the worse the AOT engine looks — which is the opposite of what a demo
+about compiled code should show. The next section says why.
 
 The live ratio is smaller than 4.1×, and the reason is worth stating plainly because it works
 *against* the demo's own headline. Painting the window is one `PSet` per pixel, and `PSet` costs
@@ -94,10 +108,20 @@ about **4 ns per call under the interpreter, about the same under the JIT, and a
 AOT** — measured flat at 100×100, 200×200 and 400×400, so it is a per-call cost rather than a fixed
 overhead per frame. A full 400×400 repaint is about 0.75 ms, 0.75 ms and 9.5 ms respectively.
 
-So the painting is a tax on the sampling budget, and it falls hardest on the fastest engine: this
-demo **understates** how much quicker AOT is. Frames are 50 ms rather than 33 ms to keep that tax
-down to roughly a fifth. It is written here rather than left out because a demo that quietly picked
-the flattering number would not be worth showing.
+The interpreter is quick here because `PSet` has an arm in the C hot dispatch loop. The AOT has **no
+native lowering for it**, so every pixel becomes a runtime-helper call, and a helper call in this
+engine flushes every allocated register to memory and reloads them all afterwards. Switch the C loop
+off (`HOTC_OFF=1`) and the interpreter costs 32 ns per pixel — that is the same Pascal arm the AOT is
+paying for, without the call around it.
+
+So the painting is a tax on the sampling budget and it falls hardest on the fastest engine: this demo
+**understates** how much quicker AOT is, and the faster you ask it to run, the more it understates.
+It is written here rather than left out because a demo that quietly picked the flattering number
+would not be worth showing.
+
+This is a defect in the engine, not in the demo, and it is the kind this project has fixed three
+times before — strings, records and `PRINT` each began as helper calls in a hot loop and each got a
+native lowering once measured. `PSet` has not had that done to it yet.
 
 ## The same image, four ways of computing it
 

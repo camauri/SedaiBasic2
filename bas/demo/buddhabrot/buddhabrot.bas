@@ -121,20 +121,25 @@ Const ESCAPE_RADIUS_SQUARED = 4.0
 
 Const ITERATION_CEILING = 20000      '' hard cap: sizes the scratch orbit array
 Const TEXT_BAND_HEIGHT  = 24         '' pixels reserved at the top for the overlay
-''  The equal slice of wall-clock time every frame gets, whatever engine is underneath.
-''  ⚠️ 20 frames a second rather than 30, and the reason is a measured cost, not a preference.
-''  Painting the window is one PSet per pixel, and PSet costs about 4 ns per call under the
-''  interpreter and about the same under the JIT - but about 60 ns under AOT. (Measured flat across
-''  100x100, 200x200 and 400x400, so it is a per-call cost and not a fixed overhead per frame.) A
-''  full 400x400 repaint is therefore about 0.75 ms interpreted, 0.75 ms under the JIT and 9.5 ms
-''  under AOT.
-''  So the painting is a tax on the sampling budget, and - this is the awkward part - it is heaviest
-''  on the FASTEST engine, which means this demo UNDERSTATES how much quicker AOT is. The shorter
-''  the frame the worse that gets: at 33 ms the AOT engine spent about 30% of each frame painting
-''  and traced 3.0x the interpreter's orbits; at 50 ms it spends about a fifth and the ratio moves
-''  back towards the 4.1x the two engines actually differ by when nothing but arithmetic is timed.
-''  Longer frames would be fairer still and would also look like a slideshow.
-Const TARGET_FRAME_SECONDS = 0.050
+''  The frame rate is a BUDGET, not a limit. Every frame is given the same slice of wall-clock time
+''  whatever engine is underneath, and the sampling stops when the slice is spent - so this number
+''  is what the demo runs at, not what it can manage. With no sampling at all the same loop reaches
+''  230 frames a second interpreted, 269 under the JIT and 81 under AOT, so 30 is a long way inside
+''  what the machine will do.
+''
+''  ⚠️ WHY THE CEILING IS SO MUCH LOWER UNDER AOT, WHICH IS THE FAST ENGINE. Painting is one PSet
+''  per pixel, and PSet costs about 4 ns per call under the interpreter and the JIT but about 60 ns
+''  under AOT - measured flat at 100x100, 200x200 and 400x400, so it is a per-call cost and not a
+''  fixed overhead per frame. A full 400x400 repaint is 0.65 ms interpreted, 0.75 ms under the JIT
+''  and 9.5 ms under AOT.
+''  The interpreter is quick here because PSet has an arm in the C hot dispatch loop; the AOT has no
+''  native lowering for it, so every pixel is a runtime-helper call that flushes and reloads every
+''  allocated register. Turn the C loop off and the interpreter costs 32 ns per pixel, which is the
+''  same arm the AOT is paying for plus the call around it.
+''  ⇒ So the painting is a tax on the sampling budget and it falls HARDEST on the fastest engine,
+''  which means this demo UNDERSTATES how much quicker AOT is. Raise the frame rate and it gets
+''  worse; lower it and the demo looks like a slideshow. 30 is the compromise, and fps= moves it.
+Const DEFAULT_FRAMES_PER_SECOND = 30
 
 
 '' ================================================================================================
@@ -404,6 +409,7 @@ Sub PrintUsage()
   Print "  still=N     compute N orbits, write a file, exit   (no window)"
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
   Print "  gamma=N     tone curve applied after the log        (default 2.2)"
+  Print "  fps=N       frames per second to hold                 (default 30)"
   Print
   Print "Keys while running:  SPACE pause   R restart   S save a still   Q quit"
 End Sub
@@ -427,6 +433,7 @@ Dim As LongInt stillOrbits = CLngInt( ArgumentValue("still", "0") )
 Dim As String  outputName  = ArgumentValue("out", "buddhabrot.ppm")
 Dim As Double  runSeconds  = CDbl( ArgumentValue("secs", "0") )
 toneGamma = CDbl( ArgumentValue("gamma", "2.2") )
+Dim As Double targetFrameSeconds = 1.0 / CDbl( ArgumentValue("fps", Str(DEFAULT_FRAMES_PER_SECOND)) )
 
 If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
 
@@ -475,7 +482,7 @@ Do
   framesDrawn = framesDrawn + 1
 
   If paused = 0 Then
-    Dim As Double sampleBudget = TARGET_FRAME_SECONDS - paintSeconds
+    Dim As Double sampleBudget = targetFrameSeconds - paintSeconds
     If sampleBudget < 0.002 Then sampleBudget = 0.002
     Dim As Double sampleStart = Timer
     Dim As LongInt before = orbitsTraced
