@@ -429,29 +429,63 @@ Dim Shared As Integer levelStride = 0  '' entries per channel
 ''  a freak pixel above the reference simply clips - which is what photo software does and what this
 ''  file's own list of "improvements deliberately left out" proposed and dismissed as not needed.
 ''  ⭐ `norm=peak` restores the old behaviour exactly, which is how the two are compared on one run.
-''  How many counts in the brightest pixel are "enough evidence" to measure the rate from. Below it
-''  the rate would be set by where the first handful of orbits happened to land.
-Const NORM_EVIDENCE = 64
-Dim Shared As Double  refRate(2)       '' counts per accumulated orbit, per channel
-Dim Shared As Integer refFrozen(2)     '' 0 until that channel has enough evidence to measure it
-Dim Shared As Integer stableNormalise  '' 1 = the smooth reference (default), 0 = the old maximum
+''  The exposure the picture starts from, before there is enough of it to measure one.
+Const NORM_FLOOR = 64.0
+''  ⭐ AND IT IS A FUNCTION OF THE DATA ALONE - the plane's MEAN, times a constant per channel.
+''  That last part is the whole difference between this and the first attempt, which measured a rate
+''  once and kept it: WHEN it measured depended on how often the picture was repainted, so still mode
+''  and the browser chose different exposures from the same orbits and their pictures parted company
+''  (17% of the bytes, up to 149 levels - caught by the net that compares the two). A statistic of
+''  the histogram has no such dependence: the same counts give the same reference, always.
+''
+''  📊 Why the MEAN and not the maximum or a percentile, measured over 120 frames on the red plane:
+''      worst one-frame jump   max x1.75   ·   99.9th percentile x1.65   ·   MEAN x1.46
+''      frames where it FELL   max 0       ·   99.9th percentile 3       ·   MEAN 0
+''  The percentile is not even monotone. The mean is a sum over 40 000 pixels, so it is the quietest
+''  statistic available, and it is proportional to the orbits drawn to within 3% across a
+''  twenty-five-fold range - which is what makes a constant multiple of it a stable exposure.
+''
+''  ⚠️ The maximum grows SLOWER than the mean (max/mean falls from 102 to 36 between 200 000 and
+''  5 000 000 orbits on the red plane), so this reference drifts against it - and that is fine, and
+''  worth knowing why: the tone curve takes a logarithm and then a 1/4.5 power, so a reference 2.8
+''  times too high costs under 4% of brightness. The compression that makes the picture readable is
+''  the same compression that makes the exposure forgiving.
+''  ⭐ CALIBRATED, not chosen: these are max/mean measured on a two-million-orbit still, per channel,
+''  which is the exposure the published picture was made at. They differ by a factor of seven between
+''  the channels because the three planes have very different shapes - the blue one is a haze whose
+''  brightest pixel is only five times its mean, the red one is structure standing out of almost
+''  nothing.
+Const NORM_K_RED   = 40.4     '' reference = K * the plane's mean
+Const NORM_K_GREEN = 19.5
+Const NORM_K_BLUE  =  5.5
+Dim Shared As Integer stableNormalise  '' 1 = the reference above, 0 = the old per-channel maximum
 
-''  A view change throws the counts away, so the rate measured for the old view means nothing for
-''  the new one: it is measured again from the new window's own evidence.
-Sub ForgetNormalisation()
-  Dim As Integer c
-  For c = 0 To 2 : refFrozen(c) = 0 : refRate(c) = 0.0 : Next c
-End Sub
+Function NormaliseAgainst( ByVal channel As Integer, ByVal planeTotal As LongInt, _
+                           ByVal planePeak As LongInt ) As Double
+  If stableNormalise = 0 Then Return planePeak
+  Dim As Double k = NORM_K_RED
+  If channel = 1 Then k = NORM_K_GREEN
+  If channel = 2 Then k = NORM_K_BLUE
+  Dim As Double reference = k * planeTotal / pixelsPerPlane
+  '' ⛔ AND A FLOOR, because early on the mean is a fraction of one count and every pixel would clip
+  '' to white and then resolve downwards - which is the same "shows up and then vanishes" the
+  '' maximum produced, arrived at from the other side. Below the floor the picture starts DARK and
+  '' only ever brightens, which is what the evidence itself does.
+  If reference < NORM_FLOOR Then reference = NORM_FLOOR
+  Return reference
+End Function
 
 Sub RebuildLevelTables()
   Dim As Integer channel, biggest = 1
-  Dim As LongInt peak(2)
+  Dim As LongInt peak(2), planeTotal(2)
   Dim As Integer i
   For channel = 0 To 2
     peak(channel) = 1
+    planeTotal(channel) = 0
     For i = 0 To pixelsPerPlane - 1
-      If histogram(channel * pixelsPerPlane + i) > peak(channel) Then _
-        peak(channel) = histogram(channel * pixelsPerPlane + i)
+      Dim As LongInt cnt = histogram(channel * pixelsPerPlane + i)
+      planeTotal(channel) = planeTotal(channel) + cnt
+      If cnt > peak(channel) Then peak(channel) = cnt
     Next i
     If peak(channel) > biggest Then biggest = peak(channel)
   Next channel
@@ -461,28 +495,7 @@ Sub RebuildLevelTables()
     ReDim levelOfCount(3 * levelStride - 1)
   End If
   For channel = 0 To 2
-    '' The reference this channel is divided by: its own maximum, or the smooth rate-times-orbits.
-    Dim As Double reference = peak(channel)
-    If stableNormalise <> 0 Then
-      '' 64 is "enough evidence": below it the rate is dominated by where the first few orbits
-      '' happened to land, and freezing it there would set the exposure from noise.
-      If refFrozen(channel) = 0 And peak(channel) >= NORM_EVIDENCE And orbitsAccumulated > 0 Then
-        refRate(channel) = peak(channel) / orbitsAccumulated
-        refFrozen(channel) = 1
-      End If
-      If refFrozen(channel) <> 0 Then
-        reference = refRate(channel) * orbitsAccumulated
-      Else
-        '' ⛔ AND BEFORE THERE IS EVIDENCE, A FIXED EXPOSURE - not the maximum. Dividing by a maximum
-        '' of 2 or 3 puts an almost empty channel at full brightness, and the collapse when the real
-        '' range appears is the "red parts that show up and then suddenly vanish". Starting from a
-        '' fixed reference means the picture starts DARK and only ever brightens, which is what the
-        '' evidence actually does. Measured: the frames with thousands of pixels dropping more than
-        '' twelve levels are exactly the frames before this freezes.
-        reference = NORM_EVIDENCE
-      End If
-      If reference < 1.0 Then reference = 1.0
-    End If
+    Dim As Double reference = NormaliseAgainst(channel, planeTotal(channel), peak(channel))
     Dim As Double inverseLogOfPeak = 1.0 / Log(1.0 + reference)
     Dim As Integer channelBase = channel * levelStride
     levelOfCount(channelBase) = 0
@@ -667,7 +680,7 @@ Sub PrintUsage()
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
   Print "  series=N    also write N numbered stills on the way, spaced geometrically"
   Print "  gamma=N     tone curve applied after the log        (default 4.5)"
-  Print "  norm=X      peak | stable - what each channel is divided by (default peak)"
+  Print "  norm=X      stable | peak - what each channel is divided by (default stable)"
   Print "  palette=X   nebula | aurora | ember                  (default nebula)"
   Print "  fps=N       frames per second to hold                 (default 60)"
   Print "  re=N im=N   centre of the view                       (default -0.65, 0)"
@@ -749,7 +762,6 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(browserSeed) : orbitsTraced = 0 : orbitsAccumulated = 0
-    ForgetNormalisation()
   End If
   '' ⛔ AND THE MODULE SAYS WHERE THE VIEW IS, rather than letting the page work it out. The page has
   '' no other way to know - a Sub returns nothing - and the alternative is for the page to keep its
@@ -779,17 +791,9 @@ Dim As LongInt stillOrbits = CLngInt( ArgumentValue("still", "0") )
 Dim As String  outputName  = ArgumentValue("out", "buddhabrot.ppm")
 Dim As Double  runSeconds  = CDbl( ArgumentValue("secs", "0") )
 toneGamma = CDbl( ArgumentValue("gamma", "4.5") )
-'' ⛔⛔ THE DEFAULT IS STILL `peak`, AND THE REASON IS A DEFECT IN THE CURE, NOT IN THE MEASUREMENT.
-'' `norm=stable` removes the flicker - measured below - but it freezes its exposure the first time a
-'' channel has enough evidence, and WHEN that happens depends on how often the picture is repainted.
-'' Still mode rebuilds the tables once, at the end; the browser rebuilds them every frame. So the two
-'' pick different exposures from the SAME orbits, and the module's picture stopped matching `sb`'s -
-'' 17% of the bytes, up to 149 levels apart. That is the demo's central claim broken, and the wasm
-'' net caught it within a minute of the change.
-'' ⇒ A reference that is a function of the DATA ALONE (a percentile, or a multiple of the plane's
-'' mean) has no such dependence, and that is the shape the cure has to take. Until it does, the
-'' default stays where every engine agrees, and `norm=stable` is there to be measured against.
-stableNormalise = IIf( LCase(ArgumentValue("norm", "peak")) = "stable", 1, 0 )
+'' `norm=peak` is the old behaviour - each channel divided by its own brightest pixel - kept so the
+'' two can be compared on one run. The default is the reference described beside NormaliseAgainst.
+stableNormalise = IIf( LCase(ArgumentValue("norm", "stable")) = "peak", 0, 1 )
 colourReading = READING_NEBULA
 If LCase(ArgumentValue("palette", "")) = "aurora" Then colourReading = READING_AURORA
 If LCase(ArgumentValue("palette", "")) = "ember"  Then colourReading = READING_EMBER
@@ -1030,7 +1034,6 @@ Do
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer
-    ForgetNormalisation()
   End If
   '' ⚠️ This used to be S, which is also the key that pans DOWN: one press did both, so every save
   '' wrote a picture of the view you had just left. P for picture.

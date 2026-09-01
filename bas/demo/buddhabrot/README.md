@@ -89,17 +89,37 @@ single-channel Buddhabrot everyone has seen, and loses the lifetime along with t
 > collecting them. Two halves that each explained the other's absence, and between them every
 > documented key of every windowed demo did nothing. The presenter collects them now.
 
-> **`norm=stable` is an experiment, and `peak` is still the default.** Each channel is divided by its
-> own brightest pixel, and that single pixel is the noisiest statistic in the picture: measured at
-> 200×200, the red maximum went 166 → 280 → 412 → 803 over twenty frames, and every jump renormalises
-> every pixel downwards at once — 23 240 pixels of 40 000 got darker on one frame. That is the "red
-> parts that show up and then vanish". `norm=stable` divides by a reference that grows smoothly
-> instead, and it works: pixels dropping more than twelve levels fall from 5 302 to 320 over 68
-> frames. It is not the default because it freezes its exposure at the first frame with enough
-> evidence, and *when* that happens depends on how often the picture is repainted — so still mode and
-> the browser pick different exposures from the same orbits, and the module stopped matching `sb`.
-> A reference computed from the data alone has no such dependence; that is the shape the fix has to
-> take, and until it does the default stays where every engine agrees.
+### The picture used to go backwards, and now it does not
+
+Watching it converge, red structure would appear and then **suddenly vanish**, and the brightness
+would move back and forth as if the evolution were running both ways. It was real and it is
+measurable: each channel was divided by its own brightest pixel, and that single pixel is the
+noisiest statistic in the whole picture. Measured at 200×200, the red maximum went 166 → 280 → 412 →
+803 over twenty frames, and **every jump renormalises every pixel downwards at once** — on one frame
+23 240 pixels of 40 000 got darker while 13 372 got brighter. Early on it is worse: a channel with
+almost no data has a maximum of 2 or 3, so everything in it sits at full brightness and then
+collapses when the real range appears.
+
+Each channel is now divided by **a constant times the plane's mean**, and the three parts of that are
+each load-bearing:
+
+- **The mean, not the maximum or a percentile.** Measured over 120 frames on the red plane, the worst
+  one-frame jump is ×1.75 for the maximum, ×1.65 for the 99.9th percentile and ×1.46 for the mean —
+  and the percentile is not even monotone, falling on 3 frames of 119. The mean is a sum over 40 000
+  pixels, so it is the quietest statistic available, and it tracks the orbits drawn to within 3%
+  across a twenty-five-fold range.
+- **A function of the data alone**, which is what makes still mode and the browser agree. The first
+  attempt measured a rate once and kept it, and *when* it measured depended on how often the picture
+  was repainted — so the module's picture stopped matching `sb`'s, 17% of the bytes and up to 149
+  levels apart. The net caught that within a minute.
+- **A floor**, because early on the mean is a fraction of one count and every pixel would clip to
+  white and then resolve downwards — the same disappearing act arrived at from the other side.
+
+Measured over 90 frames: pixels dropping more than twelve levels in a single frame fall from **6 522
+to 1 108**, and the frames that used to collapse (2 704 pixels in one step) now move by single
+figures. The converged picture is the same picture: at two million orbits it differs from the old
+one on 3.7% of its bytes and **by exactly one level** everywhere it differs. `norm=peak` restores the
+old behaviour for comparison.
 
 ### Zooming shows you why Metropolis-Hastings exists
 
