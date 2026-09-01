@@ -111,7 +111,11 @@ function mk(id) {
     addEventListener(t, f) { this._h[t] = f; },
     getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 400 }),
     getContext: () => ({ createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
-                         putImageData: () => {} }) };
+                         // What was actually painted, cheaply: the check for a frozen canvas needs
+                         // to know the pixels CHANGED, not merely that blit() was called.
+                         putImageData: (im) => { let h = 0;
+                           for (let i = 0; i < im.data.length; i += 997) h = (h * 31 + im.data[i]) | 0;
+                           global.__frameHash = h; } }) };
 }
 ['hud','hud2','note','screen','ping','toggle','reading','zoomout','home','restart',
  'gdown','gup','idown','iup','hint'].forEach(mk);
@@ -155,6 +159,22 @@ setTimeout(() => {
   say(view() === tapped, 'a drag counted as a tap');
   els.home.onclick(); global.__pump(1);
   say(view() === home, 'the whole-figure button did not go home');
+
+  // ⛔⛔ AND THE ONE THAT LOOKS LIKE NOTHING AT ALL: run PAST the point where the module's memory
+  // grows. A typed array over memory.buffer is DETACHED when that happens - length 0, no exception -
+  // so the page copies nothing and the canvas freezes on its last frame while every counter goes on
+  // rising and every control still works underneath. On this program the memory grows at about
+  // 1 240 000 orbits, when the brightest pixel passes 4 095 and the level table is re-dimensioned;
+  // a check that stops before that sees a page in perfect health.
+  const grown = () => { let n = 0; while (n < 1600000) { global.__pump(1); n += 30000; } };
+  const before = global.__frameHash;
+  grown();
+  say(global.__frameHash !== undefined, 'the page never painted a frame at all');
+  say(global.__frameHash !== before, 'the picture STOPPED CHANGING past the memory growth ' +
+      '(the framebuffer view was detached and never rebuilt)');
+  const mid = global.__frameHash;
+  global.__pump(4);
+  say(global.__frameHash !== mid, 'the picture stopped changing after the memory growth');
   process.exit(bad);
 }, 300);
 DRIVE_JS

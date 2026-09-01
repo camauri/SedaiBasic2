@@ -223,11 +223,28 @@ function start(exports, byteLength) {
   requestAnimationFrame(tick);
 }
 
+// ⛔⛔ THE VIEW IS REBUILT WHEN THE MODULE'S MEMORY GROWS, and this is the failure that looks like
+// nothing at all. A typed array over memory.buffer is DETACHED the moment the WebAssembly memory
+// grows: its length becomes 0, no exception is raised, and the loop below simply copies nothing - so
+// the canvas freezes on the last frame it managed while the counters go on rising and every control
+// still works underneath. Measured on this program: the memory grows at about 1 240 000 orbits, when
+// the brightest pixel passes 4 095 and the level table is re-dimensioned. The page then never
+// changed again, which is exactly what it looked like from a phone.
+// ⭐ Comparing .buffer catches it whatever the cause; screen_ptr is re-read with it because a
+// reallocation is free to move the framebuffer even when this one does not.
+function refreshFrameView() {
+  if (fb32.length === 0 || fb32.buffer !== memory.buffer) {
+    FB = X.screen_ptr.value;
+    fb32 = new Uint32Array(memory.buffer, FB, W * H);
+  }
+}
+
 // ⚠️ ARGB -> RGBA, a WORD at a time. A framebuffer word is 0xAARRGGBB, so in little-endian memory the
 // bytes run B,G,R,A while ImageData wants R,G,B,A: red and blue have to be exchanged. A straight copy
 // renders this figure's blue haze ORANGE - and no numeric test can see it, because the pixel VALUES
 // are right either way.
 function blit() {
+  refreshFrameView();
   for (let i = 0; i < fb32.length; i++) {
     const v = fb32[i];
     px32[i] = 0xFF000000 | ((v & 0xFF) << 16) | (v & 0xFF00) | ((v >>> 16) & 0xFF);
