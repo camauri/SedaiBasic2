@@ -89,7 +89,7 @@
 ''    sb          bas/demo/buddhabrot/buddhabrot.bas still=4000000 out=/tmp/b.ppm
 ''
 ''  Arguments are name=value in any order; run with help=1 for the list.
-''  Keys while it runs:  SPACE pause   R restart   S save a still   Q quit
+''  Keys while it runs:  SPACE pause · R restart · C palette · [ ] gamma · + - iterations · S save · Q quit
 '' ================================================================================================
 
 
@@ -362,10 +362,50 @@ Sub RebuildLevelTables()
   Next channel
 End Sub
 
+''  ---- THE THREE READINGS -----------------------------------------------------------------------
+''  The three planes hold three different facts, so there is more than one honest way to show them.
+''  These are readings of the same data, not decoration - each one answers a different question, and
+''  none of them invents anything the histogram does not already contain.
+''
+''    NEBULA   long-lived orbits to red, short-lived to blue. The structure is red because only the
+''             red plane holds it, and the haze is blue because blue holds nothing else. The default.
+''    AURORA   the same three planes with red and blue exchanged - a warm haze around a cold figure.
+''             Not an inversion of the picture: an inversion of which lifetime you are looking at.
+''    EMBER    the three planes added back together and put through one warm ramp, which is the
+''             single-channel Buddhabrot everyone has seen. Losing the colour loses the lifetime.
+
+Const READING_NEBULA = 0
+Const READING_AURORA = 1
+Const READING_EMBER  = 2
+Const READING_COUNT  = 3
+
+'' ⚠️ Not called `palette`: PALETTE is a graphics statement, so the name is taken.
+Dim Shared As Integer colourReading
+
+Function ReadingName( ByVal which As Integer ) As String
+  If which = READING_AURORA Then Return "AURORA"
+  If which = READING_EMBER  Then Return "EMBER"
+  Return "NEBULA"
+End Function
+
 Function ColourAt( ByVal pixel As Integer ) As Integer
-  Return RGB( levelOfCount(0, histogram(pixel)), _
-              levelOfCount(1, histogram(pixelsPerPlane + pixel)), _
-              levelOfCount(2, histogram(2 * pixelsPerPlane + pixel)) )
+  Dim As Integer longLived  = levelOfCount(0, histogram(pixel))
+  Dim As Integer midLived   = levelOfCount(1, histogram(pixelsPerPlane + pixel))
+  Dim As Integer shortLived = levelOfCount(2, histogram(2 * pixelsPerPlane + pixel))
+
+  If colourReading = READING_AURORA Then Return RGB( shortLived, midLived, longLived )
+
+  If colourReading = READING_EMBER Then
+    '' One brightness from all three, then a warm ramp in equal thirds: black to red, red to orange,
+    '' orange to white. Each channel is the same straight line shifted by a third, which is why it
+    '' reads as one continuous heat scale rather than three colours meeting at seams.
+    Dim As Double heat = (longLived + midLived + shortLived) / 765.0
+    Return RGB( Int(255.0 * ClampUnit(heat * 3.0)), _
+                Int(255.0 * ClampUnit((heat - 0.3333) * 3.0)), _
+                Int(255.0 * ClampUnit((heat - 0.6667) * 3.0)) )
+  End If
+
+  Return RGB( longLived, midLived, shortLived )
 End Function
 
 '' Only the summary line uses this now - the tone mapping finds all three peaks in one pass while
@@ -461,9 +501,10 @@ Sub PrintUsage()
   Print "  still=N     compute N orbits, write a file, exit   (no window)"
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
   Print "  gamma=N     tone curve applied after the log        (default 4.5)"
+  Print "  palette=X   nebula | aurora | ember                  (default nebula)"
   Print "  fps=N       frames per second to hold                 (default 60)"
   Print
-  Print "Keys while running:  SPACE pause   R restart   S save a still   Q quit"
+  Print "Keys while running:  SPACE pause   R restart   C palette   [ ] gamma   + - iterations   S save   Q quit"
 End Sub
 
 
@@ -485,6 +526,9 @@ Dim As LongInt stillOrbits = CLngInt( ArgumentValue("still", "0") )
 Dim As String  outputName  = ArgumentValue("out", "buddhabrot.ppm")
 Dim As Double  runSeconds  = CDbl( ArgumentValue("secs", "0") )
 toneGamma = CDbl( ArgumentValue("gamma", "4.5") )
+colourReading = READING_NEBULA
+If LCase(ArgumentValue("palette", "")) = "aurora" Then colourReading = READING_AURORA
+If LCase(ArgumentValue("palette", "")) = "ember"  Then colourReading = READING_EMBER
 Dim As Double targetFrameSeconds = 1.0 / CDbl( ArgumentValue("fps", Str(DEFAULT_FRAMES_PER_SECOND)) )
 
 If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
@@ -566,7 +610,8 @@ Do
   PaintFrame( label + "   " + Str(Int(orbitsPerSecond)) + " orbits/s" + _
                 IIf(paused, "   [PAUSED]", ""), _
               "traced " + Str(orbitsTraced) + "    drawn " + Str(orbitsAccumulated) + _
-                "    iter " + Str(maximumIterations) )
+                "    iter " + Str(maximumIterations) + _
+                "    " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0") )
   paintSeconds = Timer - paintStart
 
   key = LCase(InKey)
@@ -578,6 +623,12 @@ Do
     SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer
   End If
   If key = "s" Then WritePortablePixmap(outputName)
+  '' The tone curve and the reading are the two things worth changing while looking at the picture,
+  '' because both are judgements about what you want to SEE and neither costs a recomputation - the
+  '' orbits are already counted, only the tables are rebuilt.
+  If key = "c" Then colourReading = (colourReading + 1) Mod READING_COUNT
+  If key = "[" And toneGamma > 1.2 Then toneGamma = toneGamma - 0.5
+  If key = "]" And toneGamma < 12.0 Then toneGamma = toneGamma + 0.5
   If key = "+" Then maximumIterations = maximumIterations * 2
   If key = "-" And maximumIterations > 50 Then maximumIterations = maximumIterations \ 2
   If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
