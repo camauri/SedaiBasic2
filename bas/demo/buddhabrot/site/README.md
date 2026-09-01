@@ -1,18 +1,16 @@
-# La coppia da pubblicare
+# The pair that gets published
 
-Due file e due immagini, da caricare **così come sono** in una cartella qualunque di un server:
+Two pages and two images, uploaded **as they are** into any folder of any server:
 
-    index.html        la pagina che racconta com'è fatto, con i numeri
-    buddhabrot.html   la demo che gira nel browser, col modulo dentro
-    buddhabrot.png    l'immagine di apertura
-    convergence.gif   il filmato della convergenza
+    index.html        what it is, how it is built, and the numbers
+    buddhabrot.html   the demo that runs in the browser, module inside
+    buddhabrot.png    the opening picture
+    convergence.gif   the convergence film
 
-Non serve altro: nessun server applicativo, nessuna configurazione, nessuna dipendenza esterna.
-I collegamenti fra le due pagine sono **relativi**, quindi la cartella funziona a qualunque
-indirizzo la si metta, sottocartella compresa.
+Nothing else is needed: no application server, no configuration, no external dependency. The links
+between the two pages are **relative**, so the folder works at any address, subfolder included.
 
-⛔ `buddhabrot.html` qui è una **copia** di quella accanto al sorgente, con in più il link di
-ritorno a `index.html`. Il modulo WebAssembly che porta dentro viene riallineato da
-`bash bas/demo/buddhabrot/verify_wasm.sh --bless`, e la stessa rete **rifiuta di passare** se la
-copia porta un modulo diverso da quello che il sorgente compila oggi: una pagina che pubblica il
-modulo della settimana scorsa sembra perfetta e mostra un'altra cosa.
+⛔ `buddhabrot.html` here is a **copy** of the one beside the source, with the way back added. The
+WebAssembly module it carries is realigned by `bash bas/demo/buddhabrot/verify_wasm.sh --bless`, and
+the same net **refuses to pass** when this copy carries a different module than the source compiles
+to today: a page publishing last week's module looks perfectly fine and is showing something else.

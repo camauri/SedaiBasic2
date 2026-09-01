@@ -1,13 +1,13 @@
 <!doctype html>
-<html lang="it">
+<html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Buddhabrot in BASIC — SedaiBasic</title>
-<meta name="description" content="Un Buddhabrot scritto in BASIC, compilato in bytecode, in codice macchina e in WebAssembly. Stesso sorgente, stessa immagine byte per byte.">
+<meta name="description" content="A Buddhabrot written in BASIC, compiled to bytecode, to machine code and to WebAssembly. One source, the same picture byte for byte.">
 <style>
-  /* La pagina parla la stessa lingua visiva della demo che presenta: fondo scuro, monospazio per i
-     dati, e un solo accento preso dall'immagine stessa - l'arancio delle orbite vissute piu' a
-     lungo. Tema unico di proposito: il soggetto e' una figura disegnata in luce sul nero. */
+  /* The page speaks the same visual language as the demo it introduces: dark ground, monospace for
+     the data, and a single accent taken from the picture itself - the orange of the orbits that
+     lived longest. Single-theme on purpose: the subject is a figure drawn in light on black. */
   :root {
     color-scheme: dark;
     --ground:  #0b0d10;
@@ -15,9 +15,9 @@
     --edge:    #232a33;
     --ink:     #c9d1d9;
     --ink-dim: #8b949e;
-    --accent:  #e0813f;   /* rosso/arancio: le orbite che vivono di piu' */
-    --mid:     #6fbf8b;   /* verde: le durate intermedie */
-    --short:   #5b9dd9;   /* blu: quelle che muoiono subito */
+    --accent:  #e0813f;   /* red: the orbits that live longest */
+    --mid:     #6fbf8b;   /* green: the middle lifetimes */
+    --short:   #5b9dd9;   /* blue: the ones that die at once */
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
@@ -92,130 +92,127 @@
 <div class="wrap">
 <header>
   <p class="kicker">SedaiBasic · demo</p>
-  <h1>Un Buddhabrot scritto in BASIC</h1>
-  <p class="lede">Lo stesso sorgente compilato in bytecode, in codice macchina e in
-  WebAssembly. Le tre versioni disegnano la <em>stessa</em> immagine, byte per byte.
-  Quella in WebAssembly gira qui sotto, nel browser, senza installare niente.</p>
+  <h1>A Buddhabrot written in BASIC</h1>
+  <p class="lede">The same source compiled to bytecode, to machine code and to WebAssembly.
+  The three of them draw the <em>same</em> picture, byte for byte. The WebAssembly one runs
+  right here, in the browser, with nothing to install.</p>
 </header>
 
 <figure>
-  <img src="buddhabrot.png" alt="Il Buddhabrot: una figura seduta in blu, verde e arancio su nero" width="1000" height="1000">
-  <figcaption>150 milioni di orbite, 1000×1000, in meno di due minuti.</figcaption>
+  <img src="buddhabrot.png" alt="The Buddhabrot: a seated figure in blue, green and orange on black" width="1000" height="1000">
+  <figcaption>150 million orbits, 1000×1000, in under two minutes.</figcaption>
 </figure>
 
 <div class="cta">
-  <a class="primary" href="buddhabrot.html">▶ Provalo nel browser</a>
-  <a href="https://github.com/camauri/SedaiBasic2">Il codice su GitHub</a>
+  <a class="primary" href="buddhabrot.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
 </div>
-<p class="note">La pagina interattiva è un file solo: porta dentro di sé il modulo WebAssembly
-da 27&nbsp;KB. Tocca l'immagine per zoomare sul punto che hai toccato.</p>
+<p class="note">The interactive page is a single file: it carries the 27&nbsp;KB WebAssembly module
+inside it. Tap the picture to zoom in on what you tapped.</p>
 
-<h2>Che cosa stai guardando</h2>
-<p>L'immagine di Mandelbrot che tutti conoscono colora ogni punto in base a quanto ci mette a
-scappare. Questa fa una domanda diversa — <strong>dove passano</strong> le orbite che scappano,
-mentre se ne vanno — e risponde lanciando milioni di punti a caso sul piano, seguendo quelli che
-sfuggono e contando quante volte ogni pixel viene attraversato. Il risultato è una mappa di densità.
-Girata di un quarto di giro, somiglia a una figura seduta: da lì il nome.</p>
+<h2>What you are looking at</h2>
+<p>The Mandelbrot picture everyone knows colours each point by how long it takes to escape. This one
+asks a different question — <strong>where do the escaping orbits go</strong> on their way out — and
+answers it by throwing millions of random points at the plane, following the ones that escape, and
+counting how often each pixel is passed through. The result is a density map. Turned a quarter turn,
+it looks like a seated figure, which is where the name comes from.</p>
 
 <figure class="small">
-  <img src="convergence.gif" alt="Il Buddhabrot che emerge dal rumore" width="380" height="380">
-  <figcaption>Una sola corsa, 80 milioni di orbite, 48 fotogrammi presi lungo la strada —
-  il primo a un cinquemillesimo del traguardo.</figcaption>
+  <img src="convergence.gif" alt="The Buddhabrot emerging out of noise" width="380" height="380">
+  <figcaption>One run, 80 million orbits, 48 frames taken along the way —
+  the first at a five-thousandth of the finish.</figcaption>
 </figure>
 
-<h2 class="short">Il colore è una terza domanda, non una tavolozza</h2>
-<p>Ogni canale conta una <em>durata</em> diversa dell'orbita, e le tre soglie sono frazioni del
-tetto di iterazioni:</p>
+<h2 class="short">The colour is a third question, not a palette</h2>
+<p>Each channel counts a different <em>lifetime</em>, and the three thresholds are fractions of the
+iteration ceiling:</p>
 <ul class="bands">
-  <li><i class="b1"></i><span><strong>Blu</strong> — le orbite morte entro un centesimo del tetto.
-      Nove su dieci finiscono qui: sono poco più del punto casuale da cui sono partite, ed è per
-      questo che la foschia è blu.</span></li>
-  <li><i class="b2"></i><span><strong>Verde</strong> — le durate intermedie.</span></li>
-  <li><i class="b3"></i><span><strong>Arancio</strong> — tutto ciò che vive più a lungo.
-      La struttura è arancio perché solo quel canale la contiene.</span></li>
+  <li><i class="b1"></i><span><strong>Blue</strong> — orbits dead within a hundredth of the ceiling.
+      Nine in ten end here: they are barely more than the random point they started from, which is
+      why the haze is blue.</span></li>
+  <li><i class="b2"></i><span><strong>Green</strong> — the middle lifetimes.</span></li>
+  <li><i class="b3"></i><span><strong>Orange</strong> — everything that lives longer.
+      The structure is orange because only that channel holds it.</span></li>
 </ul>
-<p>Non è una decorazione: è una lettura dei dati. Premendo <code>C</code> si scambiano i canali
-e si guarda la stessa immagine chiedendole un'altra cosa.</p>
+<p>It is not decoration, it is a reading of the data. Press <code>C</code> and the channels swap:
+the same picture, asked something else.</p>
 
-<h2>Un solo sorgente, quattro modi di eseguirlo</h2>
-<p>SedaiBasic compila lo stesso file in bytecode e lo esegue con un interprete, oppure compila i
-cicli caldi in codice macchina mentre gira (<em>JIT</em>), oppure compila le funzioni intere prima
-di partire (<em>AOT</em>), oppure emette un modulo <em>WebAssembly</em> che gira nel browser senza
-interprete e senza libreria di supporto.</p>
-<p>Che siano davvero la stessa cosa non è un'affermazione: è un controllo. Le quattro versioni
-tracciano le stesse orbite e i file che producono hanno <strong>lo stesso hash SHA-256</strong>.
-Basterebbe che un motore arrotondasse diversamente in un punto, e un'orbita supererebbe il raggio
-di fuga un passo prima: le immagini si separerebbero.</p>
+<h2>One source, four ways of running it</h2>
+<p>SedaiBasic compiles the same file to bytecode and runs it with an interpreter; or compiles the
+hot loops to machine code while it runs (<em>JIT</em>); or compiles whole functions before it starts
+(<em>AOT</em>); or emits a <em>WebAssembly</em> module that runs in a browser with no interpreter and
+no runtime library.</p>
+<p>That these really are the same thing is not a claim, it is a check. The four versions trace the
+same orbits and the files they write have <strong>the same SHA-256 hash</strong>. It would take one
+engine rounding differently in one place for an orbit to cross the escape radius a step early, and
+the pictures would part company.</p>
 
 <div class="tablewrap">
 <table>
-  <thead><tr><th>due milioni di orbite</th><th>secondi</th><th>orbite/s</th><th>contro l'interprete</th></tr></thead>
+  <thead><tr><th>two million orbits</th><th>seconds</th><th>orbits/s</th><th>against the interpreter</th></tr></thead>
   <tbody>
-    <tr><td>interprete bytecode</td><td>5,11</td><td>391 000</td><td>—</td></tr>
-    <tr><td>WebAssembly (browser)</td><td>2,17</td><td>923 000</td><td>2,4×</td></tr>
-    <tr><td>JIT</td><td>1,43</td><td>1 401 000</td><td>3,6×</td></tr>
-    <tr><td>AOT</td><td>1,45</td><td>1 381 000</td><td class="win">3,5×</td></tr>
+    <tr><td>bytecode interpreter</td><td>5.11</td><td>391,000</td><td>—</td></tr>
+    <tr><td>WebAssembly (browser)</td><td>2.17</td><td>923,000</td><td>2.4×</td></tr>
+    <tr><td>JIT</td><td>1.43</td><td>1,401,000</td><td>3.6×</td></tr>
+    <tr><td>AOT</td><td>1.45</td><td>1,381,000</td><td class="win">3.5×</td></tr>
   </tbody>
 </table>
 </div>
-<p class="note">Solo calcolo, niente da disegnare. Dal vivo il vantaggio è più grande, e il motivo
-è che il ritmo dei fotogrammi è un <strong>budget</strong>: chi dipinge in fretta ha più tempo che
-avanza per calcolare. A 400×400 un ridisegno costa 9&nbsp;ms interpretato e 1&nbsp;ms compilato, e in
-sei secondi l'interprete traccia 730&nbsp;000 orbite dove l'AOT ne traccia <strong>7&nbsp;400&nbsp;000</strong>:
-dieci volte tanto, allo stesso identico numero di fotogrammi al secondo.</p>
+<p class="note">Computing only, nothing painted. Live, the gap is wider, and the reason is that the
+frame rate is a <strong>budget</strong>: an engine that paints quickly has more of it left to
+compute with. At 400×400 a repaint costs 9&nbsp;ms interpreted and 1&nbsp;ms compiled, and in six
+seconds the interpreter traces 730,000 orbits where the AOT traces
+<strong>7,400,000</strong> — ten times as much, at exactly the same frames per second.</p>
 
-<h2 class="mid">Costruire la demo ha trovato due difetti nel compilatore</h2>
-<p>Ed è la parte più utile della storia, perché nessuno dei due si vedeva leggendo il codice.</p>
-<blockquote><strong>Il primo.</strong> <code>PSet</code> — accendere un pixel — non aveva una
-discesa in codice macchina nel compilatore AOT: ogni pixel passava da una chiamata di servizio che
-svuotava e ricaricava tutti i registri. <strong>60 nanosecondi contro i 4 dell'interprete</strong>:
-il disegno era una tassa che colpiva più duramente il motore <em>più veloce</em>. Ora è una
-scrittura in linea, 1,1&nbsp;ns.</blockquote>
-<blockquote><strong>Il secondo, e più istruttivo.</strong> Chiuso il primo, l'AOT teneva ancora 43
-fotogrammi al secondo dove gli altri due ne tenevano 58 — e tracciava <em>meno</em> orbite
-dell'interprete. La causa era l'opcode <strong>accanto</strong>: <code>RGB()</code> era rimasta una
-chiamata di servizio, e una chiamata di servizio invalida il descrittore su cui la <code>PSet</code>
-appoggia la sua scrittura veloce. Le due sono una coppia — <code>PSet (x,y), RGB(r,g,b)</code> è
-come dipinge qualunque programma grafico — e coprirne una sola non ne copriva nessuna. Il ciclo dei
-pixel è passato da 20,5&nbsp;ms a <strong>0,76&nbsp;ms</strong> per fotogramma.</blockquote>
+<h2 class="mid">Building this demo found two defects in the compiler</h2>
+<p>And that is the most useful part of the story, because neither was visible by reading the code.</p>
+<blockquote><strong>The first.</strong> <code>PSet</code> — lighting one pixel — had no machine-code
+lowering in the AOT backend: every pixel went through a runtime helper that flushed and reloaded
+every allocated register. <strong>60 nanoseconds against the interpreter's 4</strong>, so painting
+was a tax that fell hardest on the <em>fastest</em> engine. It is an inline store now, 1.1&nbsp;ns.</blockquote>
+<blockquote><strong>The second, and the instructive one.</strong> With that closed, the AOT still
+held 43 frames a second where the other two held 58 — and traced <em>fewer</em> orbits than the
+interpreter. The cause was the opcode <strong>next door</strong>: <code>RGB()</code> was still a
+helper call, and a helper call invalidates the descriptor that <code>PSet</code>'s fast store hangs
+on. The two are one pair — <code>PSet (x,y), RGB(r,g,b)</code> is how any graphics program paints —
+and covering only one of them covered neither. The pixel loop went from 20.5&nbsp;ms to
+<strong>0.76&nbsp;ms</strong> a frame.</blockquote>
 
-<h2 class="short">Perché lo zoom smette di convergere</h2>
-<p>Uno zoom sul Mandelbrot restringe sia quello che disegni sia quello che calcoli. Qui no: la
-finestra si restringe ma il campionamento non può, perché un'orbita che attraversa la tua finestra
-può essere partita da qualunque punto del piano. Continui a tracciare tutto e butti via quello che
-manca il bersaglio.</p>
+<h2 class="short">Why zooming stops converging</h2>
+<p>A Mandelbrot zoom narrows both what you draw and what you compute. Here it does not: the window
+narrows but the sampling cannot, because an orbit crossing your window may have started anywhere on
+the plane. You go on tracing everything and throw away what misses.</p>
 <div class="tablewrap">
 <table>
-  <thead><tr><th>zoom</th><th>orbite/s</th><th>orbite accettate</th><th>pixel più luminoso</th></tr></thead>
+  <thead><tr><th>zoom</th><th>orbits/s</th><th>orbits accepted</th><th>brightest pixel</th></tr></thead>
   <tbody>
-    <tr><td>×1</td><td>338 123</td><td>328 270</td><td>621</td></tr>
-    <tr><td>×4</td><td>338 983</td><td>328 270</td><td>34</td></tr>
-    <tr><td>×16</td><td>364 298</td><td>328 270</td><td class="win">7</td></tr>
+    <tr><td>×1</td><td>338,123</td><td>328,270</td><td>621</td></tr>
+    <tr><td>×4</td><td>338,983</td><td>328,270</td><td>34</td></tr>
+    <tr><td>×16</td><td>364,298</td><td>328,270</td><td class="win">7</td></tr>
   </tbody>
 </table>
 </div>
-<p>Il programma fa <strong>esattamente lo stesso lavoro</strong> a ogni livello di zoom — anzi, un
-filo di più in fretta, perché meno punti atterrano e c'è meno da scrivere. Crolla solo quanto di
-quel lavoro finisce dove stai guardando. È il problema che il campionamento di Metropolis-Hastings
-esiste per risolvere, e questa demo è deliberatamente uniforme: quello che vedi è il problema,
-non la soluzione.</p>
+<p>The program does <strong>exactly the same work</strong> at every zoom — slightly faster, in fact,
+because fewer points land and there is less to write. What collapses is only how much of that work
+lands where you are looking. It is the problem Metropolis-Hastings sampling exists to solve, and
+this demo is deliberately uniform: what you are watching is the problem, not the solution.</p>
 
-<h2>Il sorgente è fatto per essere letto</h2>
-<p>L'algoritmo intero è una sola subroutine e sta in una schermata; tutto quello che c'è sopra è
-preparazione e tutto quello che c'è sotto è presentazione. L'intestazione elenca le cinque cose
-facili da sbagliare — l'orbita che va tenuta in sospeso prima di essere accumulata, le due regioni
-che non scappano mai, la simmetria speculare, la soglia minima e la curva dei toni — e ognuna è
-richiamata alla riga dove conta. In fondo c'è l'elenco delle ottimizzazioni <em>non</em> fatte, con
-il motivo di ciascuna.</p>
+<h2>The source is meant to be read</h2>
+<p>The whole algorithm is one subroutine and it fits on a screen; everything above it is preparation
+and everything below it is presentation. The header lists the five things that are easy to get wrong
+— the orbit that must be buffered before it is accumulated, the two regions that never escape, the
+mirror symmetry, the iteration floor and the tone curve — and each is called out again at the line
+where it matters. At the foot of the file is the list of optimisations deliberately <em>not</em>
+made, with the reason for each.</p>
 
 <div class="cta">
-  <a class="primary" href="buddhabrot.html">▶ Provalo nel browser</a>
-  <a href="https://github.com/camauri/SedaiBasic2">Il codice su GitHub</a>
+  <a class="primary" href="buddhabrot.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
 </div>
 
 <footer>
-  <p>La tecnica è di Melinda Green, descritta per la prima volta nel 1993; il nome è di Lori Gardi.
-  Questa implementazione è indipendente, scritta dalla descrizione matematica dell'algoritmo.</p>
+  <p>The technique is Melinda Green's, first described in 1993; the name is Lori Gardi's. This
+  implementation is independent, written from the mathematical description of the algorithm.</p>
   <p>SedaiBasic — Maurizio Cammalleri · GPL-3.0-or-later ·
   <a href="https://github.com/camauri/SedaiBasic2">github.com/camauri/SedaiBasic2</a></p>
 </footer>
