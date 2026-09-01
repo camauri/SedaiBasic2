@@ -901,6 +901,99 @@ function Clean-Build {
     }
 }
 
+# ============================================================================
+#  C HOT LOOP
+#
+#  ⭐ The hot arithmetic/branch/array dispatch arms are compiled by a C compiler
+#  rather than by FPC (src/hotdisp.c). Measured on the same dispatch loop, gcc -O2
+#  runs it in 253 ms against FPC's 443, and no FPC optimisation level closes any of
+#  that. Worth 27-45% wherever it applies.
+#
+#  ⛔ GCC, not "a C compiler". The flags are GCC's and are not decoration:
+#  -fno-crossjumping alone is worth spectral-norm -16.1%, because it stops the
+#  compiler merging the replicated dispatch tails that give every arm its own
+#  branch-predictor history. MSVC has no equivalent spelling. clang takes most of
+#  the rest but not that one, so it is accepted with a warning, not preferred.
+#
+#  ⭐ ONLY THE COMPILER PROPER IS NEEDED - the build never LINKS with it. It runs
+#  "gcc -c" and hands the object to FPC's {$L}, so no linker, no CRT and no import
+#  libraries are involved.
+#
+#  A machine with no C compiler still builds: the loop is simply left out and the
+#  build says so. Asking for it explicitly (-HotC) turns that into an error, which
+#  is the difference between "it is the default" and "I asked for it".
+#
+#  ⛔⛔ THIS BLOCK MUST STAY ABOVE "# Main script", AND THAT IS NOT A MATTER OF TASTE.
+#  PowerShell does not hoist functions: a `function` statement takes effect when execution
+#  REACHES it, not when the file is parsed. These two lived below the top-level code that
+#  calls them, so every Windows build died at the call site with
+#      Find-CCompiler : The term 'Find-CCompiler' is not recognized ...
+#  and setup.ps1 reported SETUP FAILED. Reported by a user 2 Sep 2026; it had never been
+#  seen here because the day-to-day build is build.sh on Linux, so no net ever ran this file.
+#  The net that now refuses the shape is scripts/lib/check-forward-refs.ps1.
+# ============================================================================
+
+function Find-CCompiler {
+    param([string]$ProjectRoot)
+
+    if ($env:SEDAI_CC -and (Test-Path $env:SEDAI_CC)) { return $env:SEDAI_CC }
+    # Whatever setup.ps1 recorded, then the one it installs: a CONFIGURED or project-local toolchain
+    # must beat whatever happens to be on the PATH, or two machines with the same repo build
+    # differently. The order is the same one setup.ps1's Test-GccInstallation uses, so the setup and
+    # the build can never disagree about which compiler is "the" one.
+    if ($UserConfig -and $UserConfig.GccPath) {
+        $cfg = Join-Path $UserConfig.GccPath 'bin\gcc.exe'
+        if (Test-Path $cfg) { return $cfg }
+    }
+    $local = Join-Path $ProjectRoot 'deps\gcc\bin\gcc.exe'
+    if (Test-Path $local) { return $local }
+    foreach ($n in @('gcc.exe', 'clang.exe')) {
+        $found = Get-Command $n -ErrorAction SilentlyContinue
+        if ($found) { return $found.Source }
+    }
+    return $null
+}
+
+function Build-HotDisp {
+    param([string]$Cc, [string]$ProjectRoot)
+
+    $src = Join-Path $ProjectRoot 'src\hotdisp.c'
+    $obj = Join-Path $ProjectRoot 'src\hotdisp.o'
+    if (!(Test-Path $src)) { return $false }
+
+    # The SAME flags build.sh uses. They are measured, and the alignment ones are
+    # machine-specific by nature - see the notes in CLAUDE.md before changing any of them.
+    $ccArgs = @('-O2', '-ffreestanding', '-fno-math-errno',
+                '-falign-labels=32', '-falign-jumps=32', '-fno-crossjumping',
+                '-c', '-o', $obj, $src)
+    $log = Join-Path ([System.IO.Path]::GetTempPath()) ("sedai_hotc_" + [Guid]::NewGuid().ToString('N') + ".log")
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # ⛔ THE COMPILER'S OWN bin MUST BE ON THE PATH, and calling gcc.exe by absolute path is not
+    # enough. gcc.exe hands the work to cc1.exe, which lives in libexec\ while the DLLs both of them
+    # import live in bin\ - and Windows resolves a DLL against the directory of the EXECUTABLE that
+    # needs it, not against the one that launched it. So an install into deps\gcc, on a machine with
+    # no other gcc, failed with cc1 unable to start and gcc reporting nothing at all.
+    # Measured under wine: same command, same files - fails without this, produces a byte-identical
+    # object with it.
+    $ccDir = Split-Path -Parent $Cc
+    $savedPath = $env:PATH
+    if ($ccDir -and ($env:PATH -notlike "*$ccDir*")) { $env:PATH = "$ccDir;$env:PATH" }
+    $global:LASTEXITCODE = 0
+    & $Cc @ccArgs > $log 2>&1
+    $ok = (($LASTEXITCODE -eq 0) -and (Test-Path $obj))
+    $env:PATH = $savedPath
+    $ErrorActionPreference = $prev
+    if (-not $ok) {
+        Write-Host "ERROR: could not compile src/hotdisp.c" -ForegroundColor Red
+        if (Test-Path $log) {
+            Get-Content $log | Select-Object -First 6 | ForEach-Object { Write-Host "       $_" -ForegroundColor Yellow }
+        }
+    }
+    Remove-Item $log -Force -ErrorAction SilentlyContinue
+    return $ok
+}
+
 # Main script
 if (-not $NoBanner) {
     Write-Host ""
@@ -1065,91 +1158,6 @@ if (-not $hotCEnabled) {
 #  outside a real, digitally signed installer. The report says what to fetch and
 #  from where, and the person fetching it knows what they are running.
 # ============================================================================
-
-
-# ============================================================================
-#  C HOT LOOP
-#
-#  ⭐ The hot arithmetic/branch/array dispatch arms are compiled by a C compiler
-#  rather than by FPC (src/hotdisp.c). Measured on the same dispatch loop, gcc -O2
-#  runs it in 253 ms against FPC's 443, and no FPC optimisation level closes any of
-#  that. Worth 27-45% wherever it applies.
-#
-#  ⛔ GCC, not "a C compiler". The flags are GCC's and are not decoration:
-#  -fno-crossjumping alone is worth spectral-norm -16.1%, because it stops the
-#  compiler merging the replicated dispatch tails that give every arm its own
-#  branch-predictor history. MSVC has no equivalent spelling. clang takes most of
-#  the rest but not that one, so it is accepted with a warning, not preferred.
-#
-#  ⭐ ONLY THE COMPILER PROPER IS NEEDED - the build never LINKS with it. It runs
-#  "gcc -c" and hands the object to FPC's {$L}, so no linker, no CRT and no import
-#  libraries are involved.
-#
-#  A machine with no C compiler still builds: the loop is simply left out and the
-#  build says so. Asking for it explicitly (-HotC) turns that into an error, which
-#  is the difference between "it is the default" and "I asked for it".
-# ============================================================================
-
-function Find-CCompiler {
-    param([string]$ProjectRoot)
-
-    if ($env:SEDAI_CC -and (Test-Path $env:SEDAI_CC)) { return $env:SEDAI_CC }
-    # Whatever setup.ps1 recorded, then the one it installs: a CONFIGURED or project-local toolchain
-    # must beat whatever happens to be on the PATH, or two machines with the same repo build
-    # differently. The order is the same one setup.ps1's Test-GccInstallation uses, so the setup and
-    # the build can never disagree about which compiler is "the" one.
-    if ($UserConfig -and $UserConfig.GccPath) {
-        $cfg = Join-Path $UserConfig.GccPath 'bin\gcc.exe'
-        if (Test-Path $cfg) { return $cfg }
-    }
-    $local = Join-Path $ProjectRoot 'deps\gcc\bin\gcc.exe'
-    if (Test-Path $local) { return $local }
-    foreach ($n in @('gcc.exe', 'clang.exe')) {
-        $found = Get-Command $n -ErrorAction SilentlyContinue
-        if ($found) { return $found.Source }
-    }
-    return $null
-}
-
-function Build-HotDisp {
-    param([string]$Cc, [string]$ProjectRoot)
-
-    $src = Join-Path $ProjectRoot 'src\hotdisp.c'
-    $obj = Join-Path $ProjectRoot 'src\hotdisp.o'
-    if (!(Test-Path $src)) { return $false }
-
-    # The SAME flags build.sh uses. They are measured, and the alignment ones are
-    # machine-specific by nature - see the notes in CLAUDE.md before changing any of them.
-    $ccArgs = @('-O2', '-ffreestanding', '-fno-math-errno',
-                '-falign-labels=32', '-falign-jumps=32', '-fno-crossjumping',
-                '-c', '-o', $obj, $src)
-    $log = Join-Path ([System.IO.Path]::GetTempPath()) ("sedai_hotc_" + [Guid]::NewGuid().ToString('N') + ".log")
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    # ⛔ THE COMPILER'S OWN bin MUST BE ON THE PATH, and calling gcc.exe by absolute path is not
-    # enough. gcc.exe hands the work to cc1.exe, which lives in libexec\ while the DLLs both of them
-    # import live in bin\ - and Windows resolves a DLL against the directory of the EXECUTABLE that
-    # needs it, not against the one that launched it. So an install into deps\gcc, on a machine with
-    # no other gcc, failed with cc1 unable to start and gcc reporting nothing at all.
-    # Measured under wine: same command, same files - fails without this, produces a byte-identical
-    # object with it.
-    $ccDir = Split-Path -Parent $Cc
-    $savedPath = $env:PATH
-    if ($ccDir -and ($env:PATH -notlike "*$ccDir*")) { $env:PATH = "$ccDir;$env:PATH" }
-    $global:LASTEXITCODE = 0
-    & $Cc @ccArgs > $log 2>&1
-    $ok = (($LASTEXITCODE -eq 0) -and (Test-Path $obj))
-    $env:PATH = $savedPath
-    $ErrorActionPreference = $prev
-    if (-not $ok) {
-        Write-Host "ERROR: could not compile src/hotdisp.c" -ForegroundColor Red
-        if (Test-Path $log) {
-            Get-Content $log | Select-Object -First 6 | ForEach-Object { Write-Host "       $_" -ForegroundColor Yellow }
-        }
-    }
-    Remove-Item $log -Force -ErrorAction SilentlyContinue
-    return $ok
-}
 
 $Script:Deps = @()
 
