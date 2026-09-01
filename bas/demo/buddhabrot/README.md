@@ -222,6 +222,15 @@ Measured on the same machine, the same two million orbits:
 
 The module is 25 KB; the page that carries it is 43 KB.
 
+### Publishing it
+
+`site/` is the pair as it goes on a server: `index.html` (what it is, and the numbers),
+`buddhabrot.html` (the demo, module inside), and the two images. The links between them are
+relative, so the folder works at any address. Nothing else is needed — no application server, no
+configuration, no external dependency. `verify_wasm.sh` refuses to pass if that copy carries a
+different module than the source compiles to, because a page publishing last week's module looks
+perfectly fine and is showing something else.
+
 ## The three engines are one binary
 
 There are no three executables to build. SedaiBasic ships a single `sb`, and `--jit` and `--aot`
