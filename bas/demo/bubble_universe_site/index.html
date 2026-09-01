@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bubble Universe in BASIC — SedaiBasic</title>
+<meta name="description" content="Bubble Universe written in BASIC and compiled to WebAssembly: 62,500 points a frame, each one placed by a pair of fed-back phasors.">
+<style>
+  /* The same visual language as the other pages in this family: dark ground, monospace for the data,
+     a single accent taken from the picture. Single-theme on purpose - the subject is light drawn on
+     black - so every colour is painted explicitly rather than inherited from the host. */
+  :root {
+    color-scheme: dark;
+    --ground:  #0b0d10;
+    --panel:   #12161c;
+    --edge:    #232a33;
+    --ink:     #c9d1d9;
+    --ink-dim: #8b949e;
+    --accent:  #d8b24a;   /* the gold the arms run through */
+    --alt:     #6fbf8b;   /* and the green they come from */
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ground); color: var(--ink);
+         font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 20px 72px; }
+  header { padding: 56px 0 8px; }
+  h1 { font: 600 30px/1.2 var(--mono); margin: 0 0 10px; letter-spacing: -.01em; text-wrap: balance; }
+  .kicker { font: 500 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
+            color: var(--accent); margin: 0 0 18px; }
+  .lede { font-size: 18px; margin: 0 0 26px; text-wrap: pretty; }
+  figure { margin: 28px 0; }
+  figure img { display: block; width: 100%; height: auto; border: 1px solid var(--edge);
+               border-radius: 8px; background: #000; }
+  figcaption { color: var(--ink-dim); font-size: 13.5px; margin-top: 10px; text-align: center; }
+  h2 { font: 600 20px/1.3 var(--mono); margin: 46px 0 12px; text-wrap: balance; }
+  h2::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+               background: var(--accent); margin-right: 10px; vertical-align: 3px; }
+  h2.alt::before { background: var(--alt); }
+  p { margin: 0 0 16px; }
+  strong { color: #fff; font-weight: 600; }
+  a { color: var(--accent); text-underline-offset: 3px; }
+  a:hover { color: #e8c877; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 30px 0 10px; }
+  .cta a { display: inline-block; font: 600 14px/1 var(--mono); text-decoration: none;
+           padding: 14px 20px; border-radius: 8px; border: 1px solid var(--edge);
+           background: var(--panel); color: var(--ink); transition: border-color .15s, background .15s; }
+  .cta a:hover { border-color: var(--accent); background: #171d25; }
+  .cta a.primary { background: var(--accent); border-color: var(--accent); color: #1a1404; }
+  .cta a.primary:hover { background: #e8c877; }
+  table { width: 100%; border-collapse: collapse; margin: 20px 0 8px;
+          font: 13.5px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
+  th, td { padding: 9px 10px; border-bottom: 1px solid var(--edge); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--ink-dim); font-weight: 500; font-size: 12px;
+             letter-spacing: .06em; text-transform: uppercase; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.win { color: var(--accent); }
+  td.lose { color: #d97a6c; }
+  .tablewrap { overflow-x: auto; }
+  .note { color: var(--ink-dim); font-size: 13.5px; }
+  pre { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font: 13.5px/1.6 var(--mono); color: var(--ink); }
+  code { font: 13.5px var(--mono); color: var(--accent); }
+  pre code { color: inherit; }
+  blockquote { margin: 20px 0; padding: 14px 18px; border-left: 2px solid var(--edge);
+               background: var(--panel); border-radius: 0 8px 8px 0; color: var(--ink-dim);
+               font-size: 15px; }
+  blockquote strong { color: var(--ink); }
+  footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--edge);
+           color: var(--ink-dim); font-size: 13.5px; }
+  footer a { color: var(--ink-dim); }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="kicker">SedaiBasic · demo</p>
+  <h1>Bubble Universe, written in BASIC</h1>
+  <p class="lede">Sixty-two thousand five hundred points a frame, each one placed by a pair of
+  phasors fed back from the point before it. Nothing is stored between frames. It compiles to a
+  9&nbsp;KB WebAssembly module that runs in the browser with nothing to install.</p>
+</header>
+
+<figure>
+  <img src="bubble_universe.png" alt="Bubble Universe: interleaved spirals in green and gold on black" width="500" height="500">
+  <figcaption>250 spirals, 250 points along each, one frame.</figcaption>
+</figure>
+
+<div class="cta">
+  <a class="primary" href="bubble_universe.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+</div>
+<p class="note">There is no animated preview on this page on purpose: the thing itself is one click
+away and it moves at sixty frames a second. A film of it would have been a megabyte and a half of
+worse.</p>
+
+<h2>What you are looking at</h2>
+<p>Despite the name there are no bubbles and no physics. 250 spirals are traced at once. Each spiral
+walks 250 points, and every point is the sum of two unit-length phasors — points on the unit circle —
+whose phases are <strong>fed back from the point produced immediately before it</strong>.</p>
+<pre><code>Z  = e^(j·a) + e^(j·b)        so  Re Z = cos a + cos b,  Im Z = sin a + sin b
+plot Z
+a := col + K · Re Z           re-modulate the CARRIERS,
+b := phi + K · Im Z           not the previous phases</code></pre>
+<p>That feedback is the entire effect. Without it, two phasors with phases advancing linearly draw
+two circles and nothing else. With it, each point displaces the phases that generate the next one,
+the trace winds into a spiral whose curvature varies along its own length, and 250 of them from
+evenly spaced start phases interleave into the figure.</p>
+
+<blockquote><strong>The one line most likely to be mistranslated.</strong> Both updates start again
+from the spiral's fixed constants: the point only <em>perturbs</em> them. Written
+<code>a := a + K·Re Z</code> instead, the phases drift without bound, the figure loses its 250-fold
+symmetry within a few dozen steps and then diverges. It does not fail loudly — it fails by slowly
+becoming noise, which is the hardest kind of wrong to notice.</blockquote>
+
+<h2 class="alt">Why it runs in real time</h2>
+<p>Not because it does little arithmetic: it makes four transcendental calls per point, 250,000 a
+frame. It is the <strong>working set</strong>. A spiral carries exactly two numbers from one step to
+the next, so the live state of the whole figure is 500 doubles — four kilobytes at 250 spirals, which
+sits in the first-level cache and never leaves it. The figure is redrawn from scratch every frame and
+nothing is stored between them.</p>
+<p>A second consequence of the mathematics pays for itself in the plotting: each phasor has length
+exactly 1, so their sum cannot exceed 2. The whole universe lives inside a disc of radius 2, and the
+plotting needs no clipping test at all.</p>
+
+<h2>In the browser</h2>
+<p><code>sbc --target wasm</code> compiles the same source to a module the page carries inside
+itself. Four things are compiled <em>out</em> of that build and each has a reason: the frame dump (a
+module has no filesystem, and the compiler says so rather than emitting something that runs and
+lies), the screen lock (there is no presenter to hold back), the on-screen frame counter (in a
+browser the frame rate is the page's to measure, and the page owns the clock the frames arrive on),
+and the loop itself — a module that ran until a key was pressed would freeze the tab.</p>
+<p><strong>And the phase comes from the frame number, not from the clock.</strong> Natively it
+advances by real elapsed time, which is right on a screen — the figure turns at one speed whatever
+the frame rate — and wrong on a page anyone can open, where it would make the animation depend on
+how fast your machine happens to be. Counted in frames, everyone sees the same thing.</p>
+<p class="note">Checked, not asserted: the module draws the frame <code>sb</code> draws for the same
+phase, byte for byte — at two phases, because at the first frame the phase is zero whatever formula
+produced it, so a wrong one still draws the right first frame.</p>
+
+<h2 class="alt">This demo does not separate the engines, and that is the interesting part</h2>
+<p>SedaiBasic runs the same file with a bytecode interpreter, with a JIT that compiles hot loops
+while it runs, or with an AOT compiler that compiles whole functions before it starts. On some
+programs that is worth ten times. Here, measured over 300 frames at 500×500:</p>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>engine</th><th>frames per second</th><th>ms a frame</th><th>against the interpreter</th></tr></thead>
+  <tbody>
+    <tr><td>bytecode interpreter</td><td>275</td><td>3.6</td><td>—</td></tr>
+    <tr><td>JIT</td><td>249</td><td>4.0</td><td class="lose">0.9×</td></tr>
+    <tr><td>WebAssembly (Node)</td><td>343</td><td>2.9</td><td>1.2×</td></tr>
+    <tr><td>AOT</td><td>366</td><td>2.7</td><td class="win">1.3×</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Four transcendental calls per point dominate everything else, and every engine hands those to the
+same library — so there is very little left for a compiler to win. What an engine buys you is a fact
+about <em>your program</em>, not about the engine, and a demo that says so is worth as much as one
+that shows a tenfold gap.</p>
+<p class="note">⚠️ The JIT being <em>slower</em> than the interpreter here is not a fact of life, it
+is a defect, and it is logged as one. Reproducible across runs, about 10%.</p>
+
+<div class="cta">
+  <a class="primary" href="bubble_universe.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+</div>
+
+<footer>
+  <p>None of the mathematics is ours. The algorithm is yuruyura's, posted in February 2020; Paul Dunn
+  ported it to BASIC and gave it the name; Mike Markowski rewrote it in Python using complex phasors
+  with an explicit feedback term, and this follows his formulation — verified identical to
+  <code>spirals.py</code>, pixel for pixel. What is ours is the translation into SedaiBasic, the
+  tabulated palette and the real-time loop.</p>
+  <p>SedaiBasic — Maurizio Cammalleri · GPL-3.0-or-later ·
+  <a href="https://github.com/camauri/SedaiBasic2">github.com/camauri/SedaiBasic2</a></p>
+</footer>
+</div>
+</html>
