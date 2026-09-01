@@ -80,17 +80,24 @@ Live, in a six-second run. The left-hand column is the point: it does **not** mo
 
 | engine | frames per second | orbits traced in 6 s |
 |---|---:|---:|
-| bytecode interpreter | 19 | 4 467 712 |
-| JIT | 19 | 12 109 568 |
-| AOT | 19 | 14 884 608 |
+| bytecode interpreter | 19 | ~4.5 million |
+| JIT | 19 | ~12 million |
+| AOT | 19 | ~14.8 million |
 
 The demo prints both numbers when it exits, so this table can be reproduced rather than believed.
+The orbit counts move by a percent or two between runs; the frame rate does not move at all, which
+is the whole claim.
 
-The live ratio is smaller than 4.1× on purpose and not by accident: repainting the window costs about
-the same in every engine — it is one `PSet` per pixel, and `PSet` is not where the engines differ —
-so that fixed cost is a tax that eats a larger share of the faster engine's frame. The frame length
-is 50 ms rather than 33 ms precisely to keep that tax down to roughly a fifth. This is stated here
-because a demo that quietly picked the flattering number would not be worth showing.
+The live ratio is smaller than 4.1×, and the reason is worth stating plainly because it works
+*against* the demo's own headline. Painting the window is one `PSet` per pixel, and `PSet` costs
+about **4 ns per call under the interpreter, about the same under the JIT, and about 60 ns under
+AOT** — measured flat at 100×100, 200×200 and 400×400, so it is a per-call cost rather than a fixed
+overhead per frame. A full 400×400 repaint is about 0.75 ms, 0.75 ms and 9.5 ms respectively.
+
+So the painting is a tax on the sampling budget, and it falls hardest on the fastest engine: this
+demo **understates** how much quicker AOT is. Frames are 50 ms rather than 33 ms to keep that tax
+down to roughly a fifth. It is written here rather than left out because a demo that quietly picked
+the flattering number would not be worth showing.
 
 ## The same image, four ways of computing it
 
