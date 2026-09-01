@@ -42,6 +42,7 @@ type
     FTexW, FTexH: Integer;
     FClosed: Boolean;
     procedure EnsureTexture(W, H: Integer);
+    procedure HandleEvent(const Event: TSDL_Event);
   public
     constructor Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
     destructor Destroy; override;
@@ -65,7 +66,39 @@ var
 
 var
   GActiveWindow: PSDL_Window = nil;   // the presenter's window while open (for SetMouse warp / bounds)
+  // The keys typed into the window, oldest first. A ring would be tidier; a plain queue of 64 is
+  // enough for a human typing at a program that reads with INKEY, and it drops the oldest rather
+  // than the newest so a burst never blocks the ones that follow.
+  GKeyQ: array[0..63] of Char;
+  GKeyQHead: Integer = 0;
+  GKeyQTail: Integer = 0;
   GJoy: array[0..15] of PSDL_Joystick;   // lazily-opened gaming devices (GETJOYSTICK/STICK/STRIG)
+
+// INKEY: the next character typed into the window, or #0 when none is waiting.
+// ⛔ THIS EXISTS BECAUSE `sb --window` HAD NO KEYBOARD AT ALL ON LINUX, and the reason is in two
+// halves that hide each other. TTerminalInput.ProcessEvents - the CLI's only key source - is one
+// big {$IFDEF WINDOWS}, so on Unix it can never report a keypress; and once a window has the focus
+// the keystrokes are going to SDL anyway, where the presenter's pump was dropping them. So every
+// documented key of every windowed demo did nothing, and the two halves each explained the other's
+// absence. The pump collects them now and this hands them to INKEY.
+function WindowNextChar: Char;
+begin
+  Result := #0;
+  if GKeyQHead = GKeyQTail then Exit;
+  Result := GKeyQ[GKeyQHead];
+  GKeyQHead := (GKeyQHead + 1) mod Length(GKeyQ);
+end;
+
+procedure PushKey(C: Char);
+var NextTail: Integer;
+begin
+  if C = #0 then Exit;
+  NextTail := (GKeyQTail + 1) mod Length(GKeyQ);
+  if NextTail = GKeyQHead then                       // full: drop the OLDEST, keep what was just typed
+    GKeyQHead := (GKeyQHead + 1) mod Length(GKeyQ);
+  GKeyQ[GKeyQTail] := C;
+  GKeyQTail := NextTail;
+end;
 
 // Real-time key state for MULTIKEY (installed as GKeyDownProvider while the window is open).
 function WindowKeyDown(ATScanCode: Integer): Boolean;
@@ -88,18 +121,37 @@ var
   sx, sy, w, h: Integer;
   st: UInt32;
   Focus: PSDL_Window;
+  Diag: Boolean;
 begin
   X := -1; Y := -1; Wheel := 0; Buttons := 0;
   Result := False;
+  // MOUSE_DIAG=1 names WHICH gate answered "no mouse". A GETMOUSE that reports -1 has four
+  // different reasons to do so - no window, the pointer over somebody else's window, the pointer
+  // outside our rectangle - and from BASIC they are the same answer. Verifying the presenter's
+  // mouse without this meant guessing which of them had fired.
+  Diag := GetEnvironmentVariable('MOUSE_DIAG') = '1';
   SDL_PumpEvents;
   Focus := SDL_GetMouseFocus();
-  if Focus = nil then Exit;
-  if (GActiveWindow <> nil) and (Focus <> GActiveWindow) then Exit;
+  if Focus = nil then
+  begin
+    if Diag then WriteLn(ErrOutput, '[mouse] SDL_GetMouseFocus = nil (pointer over no SDL window of ours)');
+    Exit;
+  end;
+  if (GActiveWindow <> nil) and (Focus <> GActiveWindow) then
+  begin
+    if Diag then WriteLn(ErrOutput, '[mouse] focus is another window of this process');
+    Exit;
+  end;
   st := SDL_GetMouseState(@sx, @sy);
   w := 0; h := 0;
   SDL_GetWindowSize(Focus, @w, @h);
+  if Diag then WriteLn(ErrOutput, Format('[mouse] sx=%d sy=%d window=%dx%d buttons=%.2x', [sx, sy, w, h, st]));
   if (sx < 0) or (sy < 0) or (sx >= w) or (sy >= h) then Exit;   // pointer off the window
   X := sx; Y := sy;
+  // The wheel is a COUNTER, not a position: SDL delivers it as discrete events, so an event watch
+  // accumulates the notches and GETMOUSE reports the running total - which is what FreeBASIC's
+  // wheel field is. Reading SDL_GetMouseState alone can never see it.
+  Wheel := SedaiMouseWheelTotal;
   // SDL mask (L=1,M=2,R=4) -> FB bitmask (bit0=left, bit1=right, bit2=middle).
   if (st and SDL_BUTTON_LMASK) <> 0 then Buttons := Buttons or 1;
   if (st and SDL_BUTTON_RMASK) <> 0 then Buttons := Buttons or 2;
@@ -170,7 +222,10 @@ begin
     FRenderer := nil;
   GActiveWindow := FWindow;
   GKeyDownProvider := @WindowKeyDown;    // MULTIKEY reads the live SDL keyboard state
+  GWindowCharProvider := @WindowNextChar;  // ...and INKEY reads the keys typed into the window
+  SDL_StartTextInput;                      // without this SDL sends no SDL_TEXTINPUT at all
   GGetMouseProvider := @WindowGetMouse;  // GETMOUSE reads the live SDL mouse state
+  SedaiInstallMouseWheelWatch;           // ...and its wheel field, which only an event can fill
   GSetMouseProvider := @WindowSetMouse;  // SETMOUSE warps / toggles the cursor
   GGetJoystickProvider := @WindowGetJoystick;  // GETJOYSTICK/STICK/STRIG read SDL gaming devices
 end;
@@ -180,7 +235,9 @@ var
   i: Integer;
 begin
   GKeyDownProvider := nil;
+  GWindowCharProvider := nil;
   GGetMouseProvider := nil;
+  SedaiRemoveMouseWheelWatch;
   GSetMouseProvider := nil;
   GGetJoystickProvider := nil;
   GActiveWindow := nil;
@@ -207,6 +264,36 @@ begin
   if Assigned(FWindow) then SDL_SetWindowSize(FWindow, W, H);
 end;
 
+procedure TWindowPresenter.HandleEvent(const Event: TSDL_Event);
+// ⛔ ONE reader for the SDL queue, called by BOTH pumps. There were two copies of this loop - the
+// cheap PollEvents on the instruction counter and the full Pump at the frame boundary - and a rule
+// added to one of them is a rule the other does not have.
+// ⇒ The wheel deliberately does NOT live here even though it is an event: it is counted by the
+// watch in SedaiSDL2Dyn, which SDL calls whoever pumps, so the console's fifteen other drain loops
+// get it for free (see SedaiInstallMouseWheelWatch).
+begin
+  if Event.type_ = SDL_QUITEV then FClosed := True
+  else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
+    FClosed := True
+  // ⭐ TEXT INPUT, not the keycode, for anything printable: SDL has already applied the layout and
+  // the modifiers, so `[`, `]`, `+` and `-` arrive as themselves on every keyboard - which a
+  // keycode-to-character table would get wrong on the first non-US layout it met.
+  else if Event.type_ = SDL_TEXTINPUT then
+  begin
+    // UTF-8 in, one byte out: INKEY is a byte-string function and the keys programs read are ASCII.
+    if Event.text.text[0] <> #0 then PushKey(Event.text.text[0]);
+  end
+  // The three that produce no text and that programs do read.
+  else if Event.type_ = SDL_KEYDOWN then
+  begin
+    case Event.key.keysym.sym of
+      SDLK_RETURN, SDLK_KP_ENTER: PushKey(#13);
+      SDLK_ESCAPE:                PushKey(#27);
+      SDLK_BACKSPACE:             PushKey(#8);
+    end;
+  end;
+end;
+
 function TWindowPresenter.PollEvents: Boolean;
 // ⛔ THE CHEAP HALF, AND THE ONE THE RUN LOOP MUST CALL. The VM polls for events every 10 000
 // instructions so a window stays responsive while a program computes. Presenting on that schedule is
@@ -218,11 +305,7 @@ var
   Event: TSDL_Event;
 begin
   while SDL_PollEvent(@Event) <> 0 do
-  begin
-    if Event.type_ = SDL_QUITEV then FClosed := True
-    else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
-      FClosed := True;
-  end;
+    HandleEvent(Event);
   Result := FClosed;
 end;
 
@@ -241,13 +324,9 @@ begin
   // answered that: this project has measured 14% from code alignment alone.
   if GetEnvironmentVariable('SB_NO_PUMP') = '1' then begin Result := FClosed; Exit; end;
   GPumpT0 := GetTickCount64;
-  // Drain the SDL event queue (quit / window close -> request abort).
+  // Drain the SDL event queue (quit / window close -> request abort, wheel notches accumulate).
   while SDL_PollEvent(@Event) <> 0 do
-  begin
-    if Event.type_ = SDL_QUITEV then FClosed := True
-    else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
-      FClosed := True;
-  end;
+    HandleEvent(Event);
 
   // Mirror the software framebuffer (ARGB) into the texture and present it.
   if Assigned(FRenderer) and Assigned(FBackend) then

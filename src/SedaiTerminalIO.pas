@@ -47,7 +47,8 @@ interface
 
 uses
   Classes, SysUtils, SedaiOutputInterface, SedaiGraphicsTypes,
-  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState, SedaiGraphicsBackend
+  SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState, SedaiGraphicsBackend,
+  SedaiInputState                       // GWindowCharProvider: the keys typed into the graphics window
   {$IFDEF WINDOWS}
   , Windows
   {$ELSE}
@@ -1364,7 +1365,24 @@ var
   InputRec: TInputRecord;
   Ch: Char;
 {$ENDIF}
+var
+  WinCh: Char;
 begin
+  // ⛔ THE GRAPHICS WINDOW FIRST, AND ON UNIX IT IS THE ONLY SOURCE THERE IS. Everything below this
+  // is inside {$IFDEF WINDOWS}, so without this block a Linux build could never report a keypress -
+  // and `sb --window` gives the focus to an SDL window, where the console would not have seen the
+  // keys anyway. The presenter collects them; this is where INKEY finds them.
+  if not FHasPendingChar and Assigned(GWindowCharProvider) then
+  begin
+    WinCh := GWindowCharProvider();
+    if WinCh <> #0 then
+    begin
+      FPendingChar := WinCh;
+      FHasPendingChar := True;
+      Exit;
+    end;
+  end;
+
   // Check global CTRL+C flag first
   {$IFDEF WINDOWS}
   if GCtrlCPressed then

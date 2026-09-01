@@ -1058,6 +1058,9 @@ begin
   SDL_GetWindowSize(Focus, @w, @h);
   if (sx < 0) or (sy < 0) or (sx >= w) or (sy >= h) then Exit;
   X := sx; Y := sy;
+  // The wheel exists only as an EVENT, and this console drains the SDL queue in fifteen separate
+  // loops - so it is counted by the shared watch in SedaiSDL2Dyn instead of in any one of them.
+  Wheel := SedaiMouseWheelTotal;
   if (st and SDL_BUTTON_LMASK) <> 0 then Buttons := Buttons or 1;
   if (st and SDL_BUTTON_RMASK) <> 0 then Buttons := Buttons or 2;
   if (st and SDL_BUTTON_MMASK) <> 0 then Buttons := Buttons or 4;
@@ -1383,6 +1386,11 @@ begin
     WriteLn('SDL_Init failed: ', SDL_GetError);
     Exit;
   end;
+
+  // GETMOUSE's wheel field. ⚠️ It goes HERE and not beside the other providers in the constructor:
+  // the watch is an SDL call, and at construction time SDL2 is not bound yet - the pointer would
+  // still be nil and the install would silently do nothing.
+  SedaiInstallMouseWheelWatch;
 
   if not SDL2DynTTFAvailable then
   begin

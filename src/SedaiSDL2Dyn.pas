@@ -123,6 +123,8 @@ var
   SDL_GetMouseState: function(x: pcint; y: pcint): cuint32; cdecl;
   SDL_WarpMouseInWindow: procedure(window: PSDL_Window; x: cint; y: cint); cdecl;
   SDL_ShowCursor: function(toggle: cint): cint; cdecl;
+  SDL_AddEventWatch: procedure(filter: TSDL_EventFilter; userdata: Pointer); cdecl;
+  SDL_DelEventWatch: procedure(filter: TSDL_EventFilter; userdata: Pointer); cdecl;
 
   { joystick }
   SDL_NumJoysticks: function(): cint; cdecl;
@@ -151,6 +153,22 @@ function EnsureSDL2Bound: Boolean;
 
 { True when SDL2_ttf was found and its pointers are bound. }
 function SDL2DynTTFAvailable: Boolean;
+
+{ ---- the mouse wheel, counted in ONE place -----------------------------------------------------
+  ⛔ The wheel is the one part of the mouse state SDL does NOT expose as state: SDL_GetMouseState
+  reports position and buttons, but a notch of the wheel exists only as an EVENT. So whoever drains
+  the queue has to count it - and this program drains the queue in SEVENTEEN places (the window
+  presenter's two pumps and fifteen loops in the console). A rule added to one of them is a rule the
+  other sixteen do not have, which is how GETMOUSE came to answer 0 for its wheel field on BOTH
+  front ends while every other field worked.
+
+  ⇒ An SDL event WATCH is called by SDL itself as each event enters the queue, whoever pumps and
+  whoever polls, so the count lives here and nowhere else. Install it once beside the other input
+  providers; SedaiMouseWheelTotal is the running notch total GETMOUSE reports (positive away from
+  the user), which is what FreeBASIC's wheel field is - a counter, not a delta. }
+procedure SedaiInstallMouseWheelWatch;
+procedure SedaiRemoveMouseWheelWatch;
+function  SedaiMouseWheelTotal: Integer;
 
 implementation
 
@@ -221,6 +239,8 @@ begin
   Pointer(SDL_GetMouseState) := GetProcedureAddress(GSDL2, 'SDL_GetMouseState');
   Pointer(SDL_WarpMouseInWindow) := GetProcedureAddress(GSDL2, 'SDL_WarpMouseInWindow');
   Pointer(SDL_ShowCursor) := GetProcedureAddress(GSDL2, 'SDL_ShowCursor');
+  Pointer(SDL_AddEventWatch) := GetProcedureAddress(GSDL2, 'SDL_AddEventWatch');
+  Pointer(SDL_DelEventWatch) := GetProcedureAddress(GSDL2, 'SDL_DelEventWatch');
   Pointer(SDL_NumJoysticks) := GetProcedureAddress(GSDL2, 'SDL_NumJoysticks');
   Pointer(SDL_JoystickOpen) := GetProcedureAddress(GSDL2, 'SDL_JoystickOpen');
   Pointer(SDL_JoystickUpdate) := GetProcedureAddress(GSDL2, 'SDL_JoystickUpdate');
@@ -250,6 +270,48 @@ end;
 function SDL2DynTTFAvailable: Boolean;
 begin
   Result := GTTF <> NilHandle;
+end;
+
+{ ---- the mouse wheel ---------------------------------------------------------------------- }
+
+var
+  GWheelTotal: Integer = 0;
+  GWheelWatchOn: Boolean = False;
+
+// SDL calls this for every event as it enters the queue. Returning 1 leaves the event in the
+// queue: this watch only OBSERVES - the front ends' own loops still see everything they saw.
+function SedaiWheelWatch(userdata: Pointer; event: PSDL_Event): cint; cdecl;
+begin
+  Result := 1;
+  if (event <> nil) and (event^.type_ = SDL_MOUSEWHEEL) then
+  begin
+    // SDL_MOUSEWHEEL_FLIPPED means "natural scrolling": X and Y arrive with the opposite sign, and
+    // a demo that zooms the wrong way for half its users reads as a broken wheel rather than as a
+    // setting. Undo it here so GETMOUSE always answers in SDL's unflipped convention.
+    if event^.wheel.direction = SDL_MOUSEWHEEL_FLIPPED then
+      Dec(GWheelTotal, event^.wheel.y)
+    else
+      Inc(GWheelTotal, event^.wheel.y);
+  end;
+end;
+
+procedure SedaiInstallMouseWheelWatch;
+begin
+  if GWheelWatchOn or not Assigned(SDL_AddEventWatch) then Exit;
+  SDL_AddEventWatch(@SedaiWheelWatch, nil);
+  GWheelWatchOn := True;
+end;
+
+procedure SedaiRemoveMouseWheelWatch;
+begin
+  if not GWheelWatchOn then Exit;
+  if Assigned(SDL_DelEventWatch) then SDL_DelEventWatch(@SedaiWheelWatch, nil);
+  GWheelWatchOn := False;
+end;
+
+function SedaiMouseWheelTotal: Integer;
+begin
+  Result := GWheelTotal;
 end;
 
 end.

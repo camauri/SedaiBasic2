@@ -456,7 +456,6 @@ type
     // The array BYREF bind save-stack moved to TExecutionContext (per-context since 21 Aug 2026).
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
     FRedimPendingLBs: array of Integer;   // REDIM "lb TO ub" with a RUNTIME lb: lower bounds accumulated (immediate flag on the push)
-    FIdxPending: array of Int64;          // runtime multi-dim index: indices accumulated by bcArrayIdxPush, consumed by bcArrayIdxResolve
 
     // UDT/record heap is per-context (FCtx.Records / FCtx.RecordCount) since M5.2b.
     // DATA pool for DATA/READ/RESTORE statements (the read cursor FCtx.DataIndex is per-context)
@@ -14277,8 +14276,14 @@ begin
       end;
     29: // bcArrayIdxPush - push one (already lower-bound-adjusted) index for a runtime multi-dim access
       begin
-        SetLength(FIdxPending, Length(FIdxPending) + 1);
-        FIdxPending[High(FIdxPending)] := Ctx.IntRegs[Instr.Src1];
+        // ⛔ GROW, NEVER SHRINK. This was SetLength(+1) per push and SetLength(0) per resolve - a
+        // reallocation and a free on every element access of a runtime-sized matrix, which measured
+        // 279 ns against 5 ns for the same read on a fixed-size array. The buffer now reaches the
+        // program's widest access on its first use and is never touched again. See TExecutionContext.
+        if Ctx.IdxPendingCount >= Length(Ctx.IdxPending) then
+          SetLength(Ctx.IdxPending, 8 + 2 * Length(Ctx.IdxPending));
+        Ctx.IdxPending[Ctx.IdxPendingCount] := Ctx.IntRegs[Instr.Src1];
+        Inc(Ctx.IdxPendingCount);
       end;
     30: // bcArrayIdxResolve - linear row-major index from the array's CURRENT dimensions: Dest=int, Src1=array id.
         // Matches the compile-time formula Σ idx[d] * (Π Dimensions[d+1..]) but with runtime sizes (REDIM).
@@ -14286,15 +14291,15 @@ begin
         ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
         LinearIdx := 0;
         if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
-          for i := 0 to High(FIdxPending) do
+          for i := 0 to Ctx.IdxPendingCount - 1 do
           begin
             ProdDims := 1;
             for ArrLowerBound := i + 1 to High(FArrays[ArrayIdx].Dimensions) do
               ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[ArrLowerBound];
-            LinearIdx := LinearIdx + FIdxPending[i] * ProdDims;
+            LinearIdx := LinearIdx + Ctx.IdxPending[i] * ProdDims;
           end;
         Ctx.IntRegs[Instr.Dest] := LinearIdx;
-        SetLength(FIdxPending, 0);
+        Ctx.IdxPendingCount := 0;   // the buffer stays allocated: see bcArrayIdxPush
       end;
     // --- UDT array members: indirect access, array handle read from a register (Src1). A handle < 1
     //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
@@ -14364,7 +14369,7 @@ begin
         PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]);
         LinearIdx := 0;
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
-          for i := 0 to High(FIdxPending) do
+          for i := 0 to Ctx.IdxPendingCount - 1 do
           begin
             ProdDims := 1;
             for ArrLowerBound := i + 1 to High(FArrays[PtrAddr].Dimensions) do
@@ -14373,10 +14378,10 @@ begin
             ArrLowerBound := 0;
             if i <= High(FArrays[PtrAddr].LowerBounds) then
               ArrLowerBound := FArrays[PtrAddr].LowerBounds[i];
-            LinearIdx := LinearIdx + (FIdxPending[i] - ArrLowerBound) * ProdDims;
+            LinearIdx := LinearIdx + (Ctx.IdxPending[i] - ArrLowerBound) * ProdDims;
           end;
         Ctx.IntRegs[Instr.Dest] := LinearIdx;
-        SetLength(FIdxPending, 0);
+        Ctx.IdxPendingCount := 0;   // the buffer stays allocated: see bcArrayIdxPush
       end;
     44: // bcMemberArrayRedim - REDIM obj.field(...): allocate the member's FArrays entry lazily, size it
       begin

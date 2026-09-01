@@ -730,6 +730,12 @@ begin
   Result := GetEnvironmentVariable('AOT_GFXPSET') <> '0';
 end;
 
+function AotGfxRgbNative: Boolean;
+// AOT_GFXRGB=0 sends RGB/RGBA back to the runtime helper: the A/B for C10 on one binary.
+begin
+  Result := GetEnvironmentVariable('AOT_GFXRGB') <> '0';
+end;
+
 function AotPrintStrNative: Boolean;
 begin
   if GPrintStrState < 0 then
@@ -1152,6 +1158,14 @@ begin
     // It is a conditional native form - when the gate is shut it falls back to the helper - so like
     // the print item it still needs a PC and still carries a deopt hazard.
     ssaGfxPset,
+    // C10: RGB/RGBA. Four masks, three shifts and three ors - UNCONDITIONALLY native, with no PC and
+    // no deopt, because it touches nothing but registers.
+    // ⛔⛔ AND ITS REAL COST WAS NOT ITS OWN. A helper call zeroes ctx.GfxDesc (AotExecOne does it on
+    // every call), which is what shuts C8's gate - so an RGB left on the helper immediately before a
+    // PSET took the PSET off its inline store as well, on EVERY pixel. `PSet (x, y), RGB(r,g,b)` is
+    // how every graphics program in this language paints, so the two opcodes are one hot pair and
+    // covering only the second of them covers neither.
+    ssaGraphicRGBA,
     // C9: the math family that can be a leaf call - see AotMathKind for what is deliberately absent.
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
     ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh,
@@ -1359,6 +1373,15 @@ begin
     ssaGfxPset:
       Result := AotGfxPsetNative and (Ins.Src1.Kind = svkRegister) and
                 (Ins.Src2.Kind = svkRegister);
+    // C10. R, G and B are Src1..Src3; the ALPHA is PhiSources[0] - the operand vector this
+    // instruction has used since it was written, because three source slots are not four. All four
+    // must be registers: the all-constant call never reaches here (the SSA folds it to a literal),
+    // so a non-register operand is a shape this lowering has not seen and it takes the helper road.
+    ssaGraphicRGBA:
+      Result := AotGfxRgbNative and (Ins.Dest.Kind = svkRegister) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src2.Kind = svkRegister) and
+                (Ins.Src3.Kind = svkRegister) and (Length(Ins.PhiSources) > 0) and
+                (Ins.PhiSources[0].Value.Kind = svkRegister);
     // C9. One float in, one float out - or two in for ATAN2. A constant operand falls back to the
     // helper rather than have the emitter learn to materialise one.
     ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
@@ -5115,6 +5138,17 @@ var
               CountVal(Ins.Src1); CountVal(Ins.Src2); CountVal(Ins.Src3);
             end;
           end;
+          // C10: RGB/RGBA. A plain register op - no call, no PC, no deopt - but its FOURTH operand
+          // lives in PhiSources, which the default arm below does not look at.
+          ssaGraphicRGBA:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              CountVal(Ins.Dest); CountVal(Ins.Src1); CountVal(Ins.Src2); CountVal(Ins.Src3);
+              CountVal(Ins.PhiSources[0].Value);
+            end;
+          end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
           ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -6376,6 +6410,33 @@ var
       begin
         apc := NeedPC; if not OK then Exit;
         EmitGfxPsetNative(apc);
+      end;
+
+      // C10: RGB/RGBA = ((a and 255) shl 24) or ((r and 255) shl 16) or ((g and 255) shl 8) or (b and 255).
+      // ⭐ Every AND is a 32-bit operand-size instruction, so each one zero-extends into the full
+      // register for free and the result cannot go negative - which is what the interpreter's arm
+      // produces too, since it masks each byte before shifting. No PC, no spill, no call.
+      ssaGraphicRGBA:
+      begin
+        p1 := IReg(Cur.PhiSources[0].Value); if not OK then Exit;
+        ILoad(RAX, p1);
+        E.EmitBytes([$25, $FF, $00, $00, $00]);            // and eax, 0xFF
+        E.EmitBytes([$C1, $E0, $18]);                      // shl eax, 24
+        p1 := IReg(Cur.Src1); if not OK then Exit;
+        ILoad(RCX, p1);
+        E.EmitBytes([$81, $E1, $FF, $00, $00, $00]);       // and ecx, 0xFF
+        E.EmitBytes([$C1, $E1, $10]);                      // shl ecx, 16
+        E.EmitBytes([$09, $C8]);                           // or  eax, ecx
+        p1 := IReg(Cur.Src2); if not OK then Exit;
+        ILoad(RCX, p1);
+        E.EmitBytes([$81, $E1, $FF, $00, $00, $00]);       // and ecx, 0xFF
+        E.EmitBytes([$C1, $E1, $08]);                      // shl ecx, 8
+        E.EmitBytes([$09, $C8]);                           // or  eax, ecx
+        p1 := IReg(Cur.Src3); if not OK then Exit;
+        ILoad(RCX, p1);
+        E.EmitBytes([$81, $E1, $FF, $00, $00, $00]);       // and ecx, 0xFF
+        E.EmitBytes([$09, $C8]);                           // or  eax, ecx
+        IStore(IReg(Cur.Dest), RAX);
       end;
 
 

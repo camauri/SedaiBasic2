@@ -63,9 +63,33 @@ Keys while it runs:
 
 | | |
 |---|---|
-| **SPACE** pause · **R** restart · **S** save a still · **Q** quit | |
-| **C** cycle the reading · **[** **]** move the tone curve · **+** **−** halve or double the iteration ceiling | |
+| **H** the key list, on the picture — any key closes it, and it pauses while it is up | |
+| **SPACE** pause · **R** restart · **P** save a still · **Q** quit | |
+| **C** cycle the reading · **,** **.** move the tone curve · **−** **+** halve or double the iteration ceiling | |
 | **Z** **X** zoom · **W A S D** pan · **0** back to the whole figure | |
+| **left click** or **wheel up** zoom in on the pointer · **right click** or **wheel down** zoom out | |
+
+The pointer is the one that matters. `W A S D` walk the view half a window at a time, which is all a
+keyboard can do — to reach a filament you can *see*, you walk towards it and correct, and every
+correction throws the picture away and starts it again. Clicking on it is one move. The overlay
+prints the complex coordinate under the pointer as you go.
+
+### How big a window, and which engine can hold it
+
+The frame rate is a budget covering sampling *and* painting, so the picture size is really a question
+about the paint. Measured on this machine, milliseconds per frame and the rate held:
+
+| | interpreter | JIT | AOT |
+|---|---|---|---|
+| 400×400 | 9 ms · **53 fps** | 9 ms · **58 fps** | 1 ms · **58 fps** |
+| 600×600 | 20 ms · 25 fps | 21 ms · 36 fps | 2 ms · **58 fps** |
+| 800×800 | 36 ms · 14 fps | 37 ms · 21 fps | 3 ms · **58 fps** |
+
+400 is the default because it is the largest window where *every* engine holds the rate, which is the
+demo's whole claim: the frame rate does not move, only the amount of picture does. `size=800` is
+worth trying under `--aot`, where it still holds 58 — but there the demo becomes a different one,
+because the frame rate starts separating the engines instead of the orbit count. Note also that the
+JIT does not accelerate the paint at all: it compiles hot loops, and the paint loop's body is a call.
 
 ### The three readings
 
@@ -76,6 +100,44 @@ warm haze around a cold figure, an inversion of *which lifetime you are looking 
 the picture. **EMBER** adds the three planes back together through one warm ramp, which is the
 single-channel Buddhabrot everyone has seen, and loses the lifetime along with the colour.
 `palette=nebula|aurora|ember` and `gamma=` do the same from the command line.
+
+> **The keys work in a window now, and on Linux they never had.** `TTerminalInput` — the only key
+> source the CLI has — is one big `{$IFDEF WINDOWS}`, so on Unix it could never report a keypress;
+> and once an SDL window has the focus the keystrokes are going there anyway, where nothing was
+> collecting them. Two halves that each explained the other's absence, and between them every
+> documented key of every windowed demo did nothing. The presenter collects them now.
+
+### The picture used to go backwards, and now it does not
+
+Watching it converge, red structure would appear and then **suddenly vanish**, and the brightness
+would move back and forth as if the evolution were running both ways. It was real and it is
+measurable: each channel was divided by its own brightest pixel, and that single pixel is the
+noisiest statistic in the whole picture. Measured at 200×200, the red maximum went 166 → 280 → 412 →
+803 over twenty frames, and **every jump renormalises every pixel downwards at once** — on one frame
+23 240 pixels of 40 000 got darker while 13 372 got brighter. Early on it is worse: a channel with
+almost no data has a maximum of 2 or 3, so everything in it sits at full brightness and then
+collapses when the real range appears.
+
+Each channel is now divided by **a constant times the plane's mean**, and the three parts of that are
+each load-bearing:
+
+- **The mean, not the maximum or a percentile.** Measured over 120 frames on the red plane, the worst
+  one-frame jump is ×1.75 for the maximum, ×1.65 for the 99.9th percentile and ×1.46 for the mean —
+  and the percentile is not even monotone, falling on 3 frames of 119. The mean is a sum over 40 000
+  pixels, so it is the quietest statistic available, and it tracks the orbits drawn to within 3%
+  across a twenty-five-fold range.
+- **A function of the data alone**, which is what makes still mode and the browser agree. The first
+  attempt measured a rate once and kept it, and *when* it measured depended on how often the picture
+  was repainted — so the module's picture stopped matching `sb`'s, 17% of the bytes and up to 149
+  levels apart. The net caught that within a minute.
+- **A floor**, because early on the mean is a fraction of one count and every pixel would clip to
+  white and then resolve downwards — the same disappearing act arrived at from the other side.
+
+Measured over 90 frames: pixels dropping more than twelve levels in a single frame fall from **6 522
+to 1 108**, and the frames that used to collapse (2 704 pixels in one step) now move by single
+figures. The converged picture is the same picture: at two million orbits it differs from the old
+one on 3.7% of its bytes and **by exactly one level** everywhere it differs. `norm=peak` restores the
+old behaviour for comparison.
 
 ### Zooming shows you why Metropolis-Hastings exists
 
@@ -93,6 +155,15 @@ Measured, ten million orbits at each step, brightest pixel in the red channel:
 | ×4 | 188 |
 | ×8 | 111 |
 
+(Click where you want to go: each click centres the view on the point under the pointer and halves
+the span, which is how that table was collected.)
+
+**And it is the algorithm, not the implementation** — which is worth separating, because from the
+outside they look the same. Measured at each zoom, 400 000 orbits: the orbits per second do not move
+(338 000 at ×1, 364 000 at ×16 — slightly *faster*, because fewer points land in the window and there
+is less to write), and the orbits accepted are identical to the last one. What collapses is only how
+much of that work lands where you are looking.
+
 About a quarter of the signal survives each doubling. Four or five steps in, the picture stops
 converging in any useful time — and that is the whole reason Metropolis-Hastings sampling was
 invented: instead of drawing points uniformly, mutate one already known to produce a long orbit
@@ -109,6 +180,57 @@ bin/x86_64-linux/sb bas/demo/buddhabrot/buddhabrot.bas --aot still=20000000 out=
 made that way; `series=N` adds N numbered stills along the route, which is how the film above was
 made — one run, so every frame comes from the same orbits as the last one. Run `... buddhabrot.bas help=1` for the full argument list.
 
+## In the browser
+
+<p align="center"><code>buddhabrot.html</code> — open it, nothing to install.</p>
+
+`sbc --target wasm` compiles **the same `buddhabrot.bas`** to a WebAssembly module, and
+`buddhabrot.html` carries that module inside it as base64: one file, no server, no toolchain, no
+runtime library. Click the picture to zoom in on what you clicked, right-click to zoom out; the
+buttons do what the keys do natively.
+
+```bash
+sbc bas/demo/buddhabrot/buddhabrot.bas --target wasm buddhabrot.wasm
+bash bas/demo/buddhabrot/verify_wasm.sh          # compiles it, runs it, checks the picture
+```
+
+**It is the same source, not a port.** The browser build differs by what is *compiled out* of it —
+`#if __SB_WASM__` — and the list is short and each entry has a reason:
+
+| compiled out | because |
+|---|---|
+| the 24-pixel text band, `Draw String` | the overlay is HTML in the browser |
+| `ScreenLock` / `ScreenUnlock` | there is no presenter to hold back; the page reads the framebuffer when it is ready |
+| `WritePortablePixmap` | a module has no filesystem, and the backend says so rather than emitting something that runs and lies |
+| the still mode and the live `InKey` loop | the page owns the clock — a module that looped until Q would freeze the tab |
+
+Everything that decides a *pixel* — the sampler, the three planes, the tone curve, the three
+readings, the zoom — is the same code compiled twice. Which is checkable, and is checked:
+`verify_wasm.sh` runs the module under Node for the same orbits `sb` traces and requires the two
+framebuffers to hash the same. They do, byte for byte. It also refuses to pass if `buddhabrot.html`
+carries an older module than the source compiles to, because a stale page looks perfectly fine and is
+showing something else.
+
+Measured on the same machine, the same two million orbits:
+
+| | orbits per second | against the interpreter |
+|---|---:|---:|
+| bytecode interpreter | 391 000 | — |
+| **WebAssembly (Node 20, V8)** | **923 000** | **2.4×** |
+| JIT | 1 401 000 | 3.6× |
+| AOT | 1 381 000 | 3.5× |
+
+The module is 25 KB; the page that carries it is 43 KB.
+
+### Publishing it
+
+`site/` is the pair as it goes on a server: `index.html` (what it is, and the numbers),
+`buddhabrot.html` (the demo, module inside), and the two images. The links between them are
+relative, so the folder works at any address. Nothing else is needed — no application server, no
+configuration, no external dependency. `verify_wasm.sh` refuses to pass if that copy carries a
+different module than the source compiles to, because a page publishing last week's module looks
+perfectly fine and is showing something else.
+
 ## The three engines are one binary
 
 There are no three executables to build. SedaiBasic ships a single `sb`, and `--jit` and `--aot`
@@ -116,8 +238,8 @@ select which engine runs the loaded program:
 
 | build | size |
 |---|---|
-| `./build.sh sb` (headless, the regression target) | 4 134 024 bytes |
-| `./build.sh sb --window` (adds the SDL2 presenter) | 4 143 016 bytes |
+| `./build.sh sb` (headless, the regression target) | 4 142 376 bytes |
+| `./build.sh sb --window` (adds the SDL2 presenter) | 4 151 400 bytes |
 
 The engine is bound when the program is **loaded** — the JIT builds its native loops and the AOT
 compiler compiles its functions before the first instruction runs — so it cannot be changed by a
@@ -127,54 +249,51 @@ three windows are computing an identical image and the only difference is how fa
 
 ## What it actually does
 
-Measured on this machine (AMD, Linux, single thread), tracing two million orbits with `still=`:
+Measured 2 September 2026 on an Intel Core Ultra 9 185H (Linux, single thread, pinned to one
+performance core), tracing two million orbits with `still=` — computing only, nothing painted:
 
 | engine | seconds | orbits per second | against the interpreter |
 |---|---:|---:|---:|
-| bytecode interpreter | 2.51 | 798 000 | — |
-| JIT | 0.92 | 2 180 000 | 2.7× |
-| AOT | 0.61 | 3 260 000 | **4.1×** |
+| bytecode interpreter | 5.11 | 391 000 | — |
+| JIT | 1.43 | 1 401 000 | 3.6× |
+| AOT | 1.45 | 1 381 000 | 3.5× |
 
-Live, in a six-second run at the default 60 frames a second. The left-hand column is the point: it
-does **not** move.
+Live, in a six-second run at the default 60 frames a second and 400×400. The left-hand column is the
+point: it does **not** move.
 
-| engine | frames per second | orbits traced in 6 s |
-|---|---:|---:|
-| bytecode interpreter | 58 | ~4.0 million |
-| AOT | 58 | ~17.3 million |
+| engine | frames per second | orbits traced in 6 s | against the interpreter |
+|---|---:|---:|---:|
+| bytecode interpreter | 58 | ~730 000 | — |
+| JIT | 58 | ~4 070 000 | 5.6× |
+| AOT | 58 | ~7 400 000 | **10.1×** |
 
 The demo prints both numbers when it exits, so this table can be reproduced rather than believed.
 The orbit counts move by a percent or two between runs; the frame rate does not move at all, which
 is the whole claim.
 
-**The frame rate is a budget, not a limit.** With no sampling at all the same loop reaches 227 frames
-a second interpreted and 317 under AOT, so 60 leaves room to spare.
+**The live ratio is bigger than the compute-only one, and that is not a contradiction.** A frame is
+sampling *plus* painting inside one budget, so an engine that paints faster has more of the budget
+left to sample with. A full 400×400 repaint costs **7.4 ms interpreted and 0.76 ms under AOT** — so
+of a 16.6 ms frame the interpreter has 9 ms left to trace orbits in and the AOT has 15.8.
 
-> **This used to be a much sadder table, and it is worth keeping the before.** Until 1 September 2026
-> the AOT backend had no native lowering for `PSet`: every pixel became a runtime-helper call that
-> flushed and reloaded every allocated register, 60 ns against the interpreter's 4. Painting was
-> therefore a tax that fell hardest on the *fastest* engine, and asking for more frames made the
-> compiled engine look worse — at 20 fps the AOT traced 3.31× the interpreter's orbits, at 30 fps
-> 2.97×, at 60 fps **1.83×**. The demo was reporting a defect in the engine as if it were a property
-> of compilation. `PSet` is now an inline store (SedaiAot C8) at 1.1 ns per call, the tax is gone,
-> and the same measurements read 4.13× at 30 fps and 4.32× at 60.
+> **Both halves of that were defects, and both were found by building this demo.**
+>
+> Until 1 September the AOT had no native lowering for `PSet`: every pixel was a runtime-helper call
+> that flushed and reloaded every allocated register, 60 ns against the interpreter's 4. Painting was
+> a tax that fell hardest on the *fastest* engine — at 60 fps the AOT's advantage collapsed to 1.83×.
+> `PSet` became an inline store (SedaiAot C8) at 1.1 ns a call.
+>
+> That fixed less than it looked, and the reason is worth knowing. On 2 September the AOT still held
+> only **43** frames a second where the interpreter and the JIT held 58, and traced *fewer* orbits
+> than the interpreter. `RGB()` was still a helper call — and a helper call zeroes the surface
+> descriptor that C8's inline store is gated on, so an `RGB` immediately before a `PSet` took the
+> `PSet` off its fast path too, **on every pixel**. `PSet (x, y), RGB(r, g, b)` is how every graphics
+> program in this language paints: the two are one hot pair, and covering only one of them covered
+> neither. `RGB` is now four masks and three shifts of inline code (C10), and the pixel loop went from
+> 20.5 ms a frame to 0.76 — with `AOT_GFXRGB=0` on the same binary to prove which change did it.
 
-The live ratio is smaller than 4.1×, and the reason is worth stating plainly because it works
-*against* the demo's own headline. Painting the window is one `PSet` per pixel, and `PSet` costs
-about **4 ns per call under the interpreter, about the same under the JIT, and about 60 ns under
-AOT** — measured flat at 100×100, 200×200 and 400×400, so it is a per-call cost rather than a fixed
-overhead per frame. A full 400×400 repaint is about 0.75 ms, 0.75 ms and 9.5 ms respectively.
-
-The live ratio now matches the compute-only one, because painting costs all three engines about the
-same share of a frame. Per `PSet` call: 4.4 ns interpreted, 4.8 ns under the JIT, **1.1 ns under
-AOT**. A full 400×400 repaint is 0.70 ms, 0.78 ms and 0.17 ms.
-
-Getting there is the demo's other story. `PSet` used to cost 60 ns under AOT — the compiled engine
-was fifteen times *slower* than the interpreter at the one thing it does most often here — because it
-had no native lowering and every pixel went through the runtime helper. Building this demo is what
-measured it; fixing it was the same move this project had already made three times, for strings,
-records and `PRINT`. The interpreter's speed, for its part, is not the interpreter: it is the C hot
-dispatch loop. Run it with `HOTC_OFF=1` and a pixel costs 32 ns.
+The interpreter's own speed, for its part, is not the interpreter: it is the C hot dispatch loop. Run
+it with `HOTC_OFF=1` and a pixel costs 32 ns instead of 4.4.
 
 ## The same image, four ways of computing it
 
@@ -184,7 +303,8 @@ bash bas/demo/buddhabrot/verify_determinism.sh
 
 Traces the same orbits under the interpreter, the JIT, the AOT compiler and the interpreter with the
 optimiser switched off, then compares SHA-256 hashes of the four output files. They must be
-identical, and they are.
+identical, and they are. `verify_wasm.sh` adds a fifth: the WebAssembly module's framebuffer, from
+the same orbits, hashes the same as all four.
 
 This matters more than it sounds. The image depends on a floating-point comparison — *has this orbit
 passed radius 2 yet?* — made tens of millions of times. If any engine rounded differently anywhere,

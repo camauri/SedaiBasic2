@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buddhabrot in BASIC — SedaiBasic</title>
+<meta name="description" content="A Buddhabrot written in BASIC, compiled to bytecode, to machine code and to WebAssembly. One source, the same picture byte for byte.">
+<style>
+  /* The page speaks the same visual language as the demo it introduces: dark ground, monospace for
+     the data, and a single accent taken from the picture itself - the orange of the orbits that
+     lived longest. Single-theme on purpose: the subject is a figure drawn in light on black. */
+  :root {
+    color-scheme: dark;
+    --ground:  #0b0d10;
+    --panel:   #12161c;
+    --edge:    #232a33;
+    --ink:     #c9d1d9;
+    --ink-dim: #8b949e;
+    --accent:  #e0813f;   /* red: the orbits that live longest */
+    --mid:     #6fbf8b;   /* green: the middle lifetimes */
+    --short:   #5b9dd9;   /* blue: the ones that die at once */
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ground); color: var(--ink);
+         font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 20px 72px; }
+
+  header { padding: 56px 0 8px; }
+  h1 { font: 600 30px/1.2 var(--mono); margin: 0 0 10px; letter-spacing: -.01em;
+       text-wrap: balance; }
+  .kicker { font: 500 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
+            color: var(--accent); margin: 0 0 18px; }
+  .lede { font-size: 18px; color: var(--ink); margin: 0 0 26px; text-wrap: pretty; }
+
+  figure { margin: 28px 0; }
+  figure img { display: block; width: 100%; height: auto; border: 1px solid var(--edge);
+               border-radius: 8px; background: #000; }
+  figure.small img { max-width: 380px; margin: 0 auto; }
+  figcaption { color: var(--ink-dim); font-size: 13.5px; margin-top: 10px; text-align: center; }
+
+  h2 { font: 600 20px/1.3 var(--mono); margin: 46px 0 12px; text-wrap: balance; }
+  h2::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+               background: var(--accent); margin-right: 10px; vertical-align: 3px; }
+  h2.mid::before   { background: var(--mid); }
+  h2.short::before { background: var(--short); }
+  p { margin: 0 0 16px; }
+  strong { color: #fff; font-weight: 600; }
+  em { color: var(--ink); }
+
+  a { color: var(--accent); text-underline-offset: 3px; }
+  a:hover { color: #f0a06b; }
+
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 30px 0 10px; }
+  .cta a { display: inline-block; font: 600 14px/1 var(--mono); text-decoration: none;
+           padding: 14px 20px; border-radius: 8px; border: 1px solid var(--edge);
+           background: var(--panel); color: var(--ink); transition: border-color .15s, background .15s; }
+  .cta a:hover { border-color: var(--accent); background: #171d25; }
+  .cta a.primary { background: var(--accent); border-color: var(--accent); color: #1a0d04; }
+  .cta a.primary:hover { background: #f0a06b; }
+
+  table { width: 100%; border-collapse: collapse; margin: 20px 0 8px;
+          font: 13.5px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
+  th, td { padding: 9px 10px; border-bottom: 1px solid var(--edge); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--ink-dim); font-weight: 500; font-size: 12px;
+             letter-spacing: .06em; text-transform: uppercase; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.win { color: var(--accent); }
+  .tablewrap { overflow-x: auto; }
+  .note { color: var(--ink-dim); font-size: 13.5px; }
+
+  .bands { display: grid; gap: 10px; margin: 18px 0 22px; padding: 0; list-style: none; }
+  .bands li { display: grid; grid-template-columns: 12px 1fr; gap: 12px; align-items: start;
+              font-size: 15.5px; }
+  .bands i { width: 12px; height: 12px; border-radius: 3px; margin-top: 6px; }
+  .bands .b1 { background: var(--short); }
+  .bands .b2 { background: var(--mid); }
+  .bands .b3 { background: var(--accent); }
+
+  blockquote { margin: 20px 0; padding: 14px 18px; border-left: 2px solid var(--edge);
+               background: var(--panel); border-radius: 0 8px 8px 0; color: var(--ink-dim);
+               font-size: 15px; }
+  blockquote strong { color: var(--ink); }
+  code { font: 13.5px var(--mono); color: var(--accent); }
+
+  footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--edge);
+           color: var(--ink-dim); font-size: 13.5px; }
+  footer a { color: var(--ink-dim); }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="kicker">SedaiBasic · demo</p>
+  <h1>A Buddhabrot written in BASIC</h1>
+  <p class="lede">The same source compiled to bytecode, to machine code and to WebAssembly.
+  The three of them draw the <em>same</em> picture, byte for byte. The WebAssembly one runs
+  right here, in the browser, with nothing to install.</p>
+</header>
+
+<figure>
+  <img src="buddhabrot.png" alt="The Buddhabrot: a seated figure in blue, green and orange on black" width="1000" height="1000">
+  <figcaption>150 million orbits, 1000×1000, in under two minutes.</figcaption>
+</figure>
+
+<div class="cta">
+  <a class="primary" href="buddhabrot.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+</div>
+<p class="note">The interactive page is a single file: it carries the 27&nbsp;KB WebAssembly module
+inside it. Tap the picture to zoom in on what you tapped.</p>
+
+<h2>What you are looking at</h2>
+<p>The Mandelbrot picture everyone knows colours each point by how long it takes to escape. This one
+asks a different question — <strong>where do the escaping orbits go</strong> on their way out — and
+answers it by throwing millions of random points at the plane, following the ones that escape, and
+counting how often each pixel is passed through. The result is a density map. Turned a quarter turn,
+it looks like a seated figure, which is where the name comes from.</p>
+
+<figure class="small">
+  <img src="convergence.gif" alt="The Buddhabrot emerging out of noise" width="380" height="380">
+  <figcaption>One run, 80 million orbits, 48 frames taken along the way —
+  the first at a five-thousandth of the finish.</figcaption>
+</figure>
+
+<h2 class="short">The colour is a third question, not a palette</h2>
+<p>Each channel counts a different <em>lifetime</em>, and the three thresholds are fractions of the
+iteration ceiling:</p>
+<ul class="bands">
+  <li><i class="b1"></i><span><strong>Blue</strong> — orbits dead within a hundredth of the ceiling.
+      Nine in ten end here: they are barely more than the random point they started from, which is
+      why the haze is blue.</span></li>
+  <li><i class="b2"></i><span><strong>Green</strong> — the middle lifetimes.</span></li>
+  <li><i class="b3"></i><span><strong>Orange</strong> — everything that lives longer.
+      The structure is orange because only that channel holds it.</span></li>
+</ul>
+<p>It is not decoration, it is a reading of the data. Press <code>C</code> and the channels swap:
+the same picture, asked something else.</p>
+
+<h2>One source, four ways of running it</h2>
+<p>SedaiBasic compiles the same file to bytecode and runs it with an interpreter; or compiles the
+hot loops to machine code while it runs (<em>JIT</em>); or compiles whole functions before it starts
+(<em>AOT</em>); or emits a <em>WebAssembly</em> module that runs in a browser with no interpreter and
+no runtime library.</p>
+<p>That these really are the same thing is not a claim, it is a check. The four versions trace the
+same orbits and the files they write have <strong>the same SHA-256 hash</strong>. It would take one
+engine rounding differently in one place for an orbit to cross the escape radius a step early, and
+the pictures would part company.</p>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>two million orbits</th><th>seconds</th><th>orbits/s</th><th>against the interpreter</th></tr></thead>
+  <tbody>
+    <tr><td>bytecode interpreter</td><td>5.11</td><td>391,000</td><td>—</td></tr>
+    <tr><td>WebAssembly (browser)</td><td>2.17</td><td>923,000</td><td>2.4×</td></tr>
+    <tr><td>JIT</td><td>1.43</td><td>1,401,000</td><td>3.6×</td></tr>
+    <tr><td>AOT</td><td>1.45</td><td>1,381,000</td><td class="win">3.5×</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="note">Computing only, nothing painted. Live, the gap is wider, and the reason is that the
+frame rate is a <strong>budget</strong>: an engine that paints quickly has more of it left to
+compute with. At 400×400 a repaint costs 9&nbsp;ms interpreted and 1&nbsp;ms compiled, and in six
+seconds the interpreter traces 730,000 orbits where the AOT traces
+<strong>7,400,000</strong> — ten times as much, at exactly the same frames per second.</p>
+
+<h2 class="mid">Building this demo found two defects in the compiler</h2>
+<p>And that is the most useful part of the story, because neither was visible by reading the code.</p>
+<blockquote><strong>The first.</strong> <code>PSet</code> — lighting one pixel — had no machine-code
+lowering in the AOT backend: every pixel went through a runtime helper that flushed and reloaded
+every allocated register. <strong>60 nanoseconds against the interpreter's 4</strong>, so painting
+was a tax that fell hardest on the <em>fastest</em> engine. It is an inline store now, 1.1&nbsp;ns.</blockquote>
+<blockquote><strong>The second, and the instructive one.</strong> With that closed, the AOT still
+held 43 frames a second where the other two held 58 — and traced <em>fewer</em> orbits than the
+interpreter. The cause was the opcode <strong>next door</strong>: <code>RGB()</code> was still a
+helper call, and a helper call invalidates the descriptor that <code>PSet</code>'s fast store hangs
+on. The two are one pair — <code>PSet (x,y), RGB(r,g,b)</code> is how any graphics program paints —
+and covering only one of them covered neither. The pixel loop went from 20.5&nbsp;ms to
+<strong>0.76&nbsp;ms</strong> a frame.</blockquote>
+
+<h2 class="short">Why zooming stops converging</h2>
+<p>A Mandelbrot zoom narrows both what you draw and what you compute. Here it does not: the window
+narrows but the sampling cannot, because an orbit crossing your window may have started anywhere on
+the plane. You go on tracing everything and throw away what misses.</p>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>zoom</th><th>orbits/s</th><th>orbits accepted</th><th>brightest pixel</th></tr></thead>
+  <tbody>
+    <tr><td>×1</td><td>338,123</td><td>328,270</td><td>621</td></tr>
+    <tr><td>×4</td><td>338,983</td><td>328,270</td><td>34</td></tr>
+    <tr><td>×16</td><td>364,298</td><td>328,270</td><td class="win">7</td></tr>
+  </tbody>
+</table>
+</div>
+<p>The program does <strong>exactly the same work</strong> at every zoom — slightly faster, in fact,
+because fewer points land and there is less to write. What collapses is only how much of that work
+lands where you are looking. It is the problem Metropolis-Hastings sampling exists to solve, and
+this demo is deliberately uniform: what you are watching is the problem, not the solution.</p>
+
+<h2>The source is meant to be read</h2>
+<p>The whole algorithm is one subroutine and it fits on a screen; everything above it is preparation
+and everything below it is presentation. The header lists the five things that are easy to get wrong
+— the orbit that must be buffered before it is accumulated, the two regions that never escape, the
+mirror symmetry, the iteration floor and the tone curve — and each is called out again at the line
+where it matters. At the foot of the file is the list of optimisations deliberately <em>not</em>
+made, with the reason for each.</p>
+
+<div class="cta">
+  <a class="primary" href="buddhabrot.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+</div>
+
+<footer>
+  <p>The technique is Melinda Green's, first described in 1993; the name is Lori Gardi's. This
+  implementation is independent, written from the mathematical description of the algorithm.</p>
+  <p>SedaiBasic — Maurizio Cammalleri · GPL-3.0-or-later ·
+  <a href="https://github.com/camauri/SedaiBasic2">github.com/camauri/SedaiBasic2</a></p>
+</footer>
+</div>
+</html>

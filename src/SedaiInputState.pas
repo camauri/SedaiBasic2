@@ -34,9 +34,18 @@ type
   // or -1000 if the axis is absent). Axes points at a caller-owned Single[MaxAxes]. Returns False if the
   // device is not attached (FB GetJoystick then returns 1). Used by GETJOYSTICK, STICK and STRIG.
   TGetJoystickFn = function(Id: Integer; out Buttons: Integer; Axes: PSingle; MaxAxes: Integer): Boolean;
+  // Take the next character typed into the graphics WINDOW, or #0 if none is waiting. This is what
+  // INKEY reads when a window has the focus.
+  // ⛔ WITHOUT IT, EVERY KEY IS DEAD ON LINUX. TTerminalInput.ProcessEvents - the only key source the
+  // CLI has - is one big {$IFDEF WINDOWS}, so on Unix that class can never report a keypress; and
+  // when `sb --window` is running, the keystrokes are going to the SDL window anyway, where nothing
+  // was collecting them. A demo whose keys are all documented and none of them work is what that
+  // looked like from outside.
+  TWindowCharFn = function: Char;
 
 var
   GKeyDownProvider: TKeyDownFn = nil;
+  GWindowCharProvider: TWindowCharFn = nil;
   GGetMouseProvider: TGetMouseFn = nil;
   GSetMouseProvider: TSetMouseFn = nil;
   GGetJoystickProvider: TGetJoystickFn = nil;
