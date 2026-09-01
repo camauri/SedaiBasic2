@@ -114,6 +114,21 @@ type
     // redirection is active, which is the one branch of the arm that can RAISE; the emitted code
     // then falls through to the ordinary helper call.
     PrintStr: Pointer;     // offset 272: @AotPrintString (VMSelf, CtxObj, srcSlot, withNewline) -> 0/1
+    // C8: PSET as an INLINE store, the one op this backend was measurably slower than the
+    // interpreter at. Five Int64, the same shape and the same gate as the C hot loop's gfxdesc:
+    //   [0] framebuffer base of the draw surface, 0 = the fast path may NOT be taken
+    //   [1] width   [2] height   [3] address of FDrawPenX   [4] address of FDrawPenY
+    // ⛔ THE GATE IS THE WHOLE OF THE CORRECTNESS ARGUMENT and it is not ours: [0] is left 0
+    // whenever PSET does more than one store - palette mode, a clip, a WINDOW transform, a VIEW
+    // offset, or a draw target that is not the plain work page. The emitted code tests [0] and
+    // nothing else, exactly as hotdisp.c's arm does.
+    // ⛔⛔ AND IT IS INVALIDATED DIFFERENTLY FROM THE C LOOP'S. There the descriptor is rebuilt per
+    // loop ENTRY, which is safe only because every statement that could invalidate it is uncovered
+    // and therefore ends the stay first. A compiled region contains those statements, so entry is
+    // not a boundary here: AotExecOne zeroes [0] on EVERY helper call instead, and the slow path
+    // rebuilds it afterwards. Conservative, one store per helper call, and it cannot go stale.
+    GfxDesc: PInt64;       // offset 280: @<per-context 5-Int64 block>, nil = never take the fast path
+    GfxRefresh: Pointer;   // offset 288: @AotGfxRefresh (VMSelf, CtxObj, desc) - rebuilds it
   end;
   PAotCtx = ^TAotCtx;
 
@@ -144,6 +159,8 @@ const
   AOTCTX_PRINTEND    = 256;
   AOTCTX_XFERSTR     = 264;
   AOTCTX_PRINTSTR    = 272;
+  AOTCTX_GFXDESC     = 280;
+  AOTCTX_GFXREFRESH  = 288;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -646,6 +663,12 @@ end;
 
 // C7b: the PRINT ITEM as a conditional leaf (fast path inline, CMD redirection back to the helper).
 // AOT_PRINTSTR=0 puts it back on AotExecOne unconditionally.
+function AotGfxPsetNative: Boolean;
+// AOT_GFXPSET=0 sends PSET back to the runtime helper: the A/B for the C8 inline store on one binary.
+begin
+  Result := GetEnvironmentVariable('AOT_GFXPSET') <> '0';
+end;
+
 function AotPrintStrNative: Boolean;
 begin
   if GPrintStrState < 0 then
@@ -1064,6 +1087,10 @@ begin
     // C7b: and the print ITEM, whose native form is a CONDITIONAL leaf - it falls back to the
     // helper for CMD redirection, so it still needs a PC and still carries a deopt hazard.
     ssaPrintString, ssaPrintStringLn,
+    // C8: PSET as an INLINE store, gated on a surface descriptor exactly like the C hot loop's arm.
+    // It is a conditional native form - when the gate is shut it falls back to the helper - so like
+    // the print item it still needs a PC and still carries a deopt hazard.
+    ssaGfxPset,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     // C7: and the STRING pair, which had been left behind. Both are one AotStrAssign between two
@@ -1263,6 +1290,10 @@ begin
       Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
+    // C8. Three int operands, all of them registers: x, y and - in the IMMEDIATE - the colour.
+    ssaGfxPset:
+      Result := AotGfxPsetNative and (Ins.Src1.Kind = svkRegister) and
+                (Ins.Src2.Kind = svkRegister);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
       // Needs the record layout AND a constant slot: the slot is baked into the displacement.
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
@@ -1701,6 +1732,12 @@ var
                                         // register in ascending order (-1 = none)
   SlotCtxSave: Integer;                 // [rsp+SlotCtxSave] the TAotCtx pointer (r8 is volatile)
   SlotFltSave: Integer;                 // [rsp+SlotFltSave] the FloatRegs base (rsi is volatile in SysV)
+  SlotGfx: Integer;                     // [rsp+SlotGfx] 16 bytes: C8 keeps PSET's x and y here.
+                                        // Three scratch GPRs (rax/rcx/rdx) is one short of what the
+                                        // sequence needs, and spilling to the frame is cheaper than
+                                        // spilling a POOL register - which is what asking for a
+                                        // fourth would really mean.
+  HasGfxPset: Boolean;                  // the region contains a PSET with a native lowering
   Cur: TSSAInstruction;
   CurOrd: Integer;                      // ordinal of Cur (indexes the SSA->PC map)
   CurBlkIdx: Integer;                   // absolute block index of Cur (set by the emit loop)
@@ -2880,6 +2917,86 @@ var
     E.EmitBytes([$0F, $84]); pDone := E.Len; E.Emit32(0); // jz done   (0 = handled natively)
     EmitHelperCall(apc);                                  // 1 = CMD redirection: the old road
     E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));      // @done
+  end;
+
+  // ================================================================================================
+  //  C8: PSET (x,y),colour as an INLINE STORE
+  // ================================================================================================
+  //  The one op this backend was measurably SLOWER than the interpreter at, and by a lot: 60 ns per
+  //  call against 4 ns, because every pixel went through AotExecOne and AotHelperCall flushes every
+  //  allocated register to its bank slot and reloads them afterwards. A 400x400 repaint cost 9.5 ms
+  //  compiled against 0.65 ms interpreted. The interpreter is quick because hotdisp.c has an arm for
+  //  it; this is that same arm, emitted.
+  //
+  //  ⛔ THE GATE IS ctx.GfxDesc[0] AND NOTHING ELSE, which is only sound because AotGfxRefresh
+  //  leaves it zero under every condition where PSET does more than one store. That predicate is
+  //  written once, next to the interpreter's own, and both arms trust it - see the comment there.
+  //
+  //  ⛔⛔ AND THE COLD PATH RE-ARMS IT AFTER the helper call, never before: AotExecOne zeroes the
+  //  descriptor on its way through, so refreshing first would be undone by the very call it is
+  //  preparing for. One slow pixel per invalidation, then the rest of the loop is inline.
+  //
+  //  Registers: rax/rcx/rdx are the only GPRs outside the allocation pool, and the sequence wants
+  //  four live values, so x and y are parked in the frame slot. The bounds test is UNSIGNED on
+  //  purpose - a negative coordinate becomes a huge unsigned and fails the same compare, which is
+  //  what lets one test do the work of two, exactly as the C arm does it.
+  //  ⚠️ The pen is written even when the point falls OUTSIDE the surface, because the interpreter
+  //  writes it unconditionally after SetPixel and POINTCOORD reads it back.
+  procedure EmitGfxPsetNative(apc: Integer);
+  var xr, yr, cr, pNilDesc, pColdBase, pNoStore1, pNoStore2, pDone: Integer;
+  begin
+    xr := IReg(Cur.Src1); yr := IReg(Cur.Src2); cr := IReg(Cur.Src3);
+    if not OK then Exit;
+    if SlotGfx < 0 then begin Fail('gfxpset-no-slot'); Exit; end;
+
+    ILoad(RCX, xr);                                        // rcx = x
+    ILoad(RDX, yr);                                        // rdx = y
+    FrameStore(RCX, SlotGfx);                              // [rsp+SlotGfx]   = x
+    FrameStore(RDX, SlotGfx + 8);                          // [rsp+SlotGfx+8] = y
+
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_GFXDESC);          // rax = ctx.GfxDesc
+    E.EmitBytes([$48, $85, $C0]);                          // test rax, rax
+    E.EmitBytes([$0F, $84]); pNilDesc := E.Len; E.Emit32(0);   // jz  cold (no descriptor at all)
+    E.EmitBytes([$48, $83, $38, $00]);                     // cmp qword [rax], 0
+    E.EmitBytes([$0F, $84]); pColdBase := E.Len; E.Emit32(0);  // je  cold (gate shut / stale)
+
+    E.EmitBytes([$48, $3B, $48, $08]);                     // cmp rcx, [rax+8]      x vs width
+    E.EmitBytes([$0F, $83]); pNoStore1 := E.Len; E.Emit32(0);  // jae nostore
+    E.EmitBytes([$48, $3B, $50, $10]);                     // cmp rdx, [rax+16]     y vs height
+    E.EmitBytes([$0F, $83]); pNoStore2 := E.Len; E.Emit32(0);  // jae nostore
+
+    E.EmitBytes([$48, $0F, $AF, $50, $08]);                // imul rdx, [rax+8]     rdx = y*width
+    E.EmitBytes([$48, $01, $CA]);                          // add  rdx, rcx         rdx += x
+    E.EmitBytes([$48, $8B, $08]);                          // mov  rcx, [rax]       rcx = base
+    E.EmitBytes([$48, $8D, $0C, $91]);                     // lea  rcx, [rcx+rdx*4]
+    ILoad(RDX, cr);                                        // rdx = colour
+    E.EmitBytes([$89, $11]);                               // mov  [rcx], edx       32-bit pixel
+
+    E.Patch32(pNoStore1, LongWord(E.Len - (pNoStore1 + 4)));   // @nostore
+    E.Patch32(pNoStore2, LongWord(E.Len - (pNoStore2 + 4)));
+    // The pen, from the frame rather than from registers: the store path clobbered both.
+    E.EmitBytes([$48, $8B, $48, $18]);                     // mov rcx, [rax+24]     &FDrawPenX
+    FrameLoad(RDX, SlotGfx);                               // rdx = x
+    E.EmitBytes([$89, $11]);                               // mov [rcx], edx
+    E.EmitBytes([$48, $8B, $48, $20]);                     // mov rcx, [rax+32]     &FDrawPenY
+    FrameLoad(RDX, SlotGfx + 8);                           // rdx = y
+    E.EmitBytes([$89, $11]);                               // mov [rcx], edx
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);       // jmp done
+
+    E.Patch32(pNilDesc,  LongWord(E.Len - (pNilDesc + 4)));    // @cold
+    E.Patch32(pColdBase, LongWord(E.Len - (pColdBase + 4)));
+    EmitHelperCall(apc);                                   // draw THIS pixel the old way...
+    // ...then re-arm, so the next one takes the fast path. arg2 is r8 on Win64 - the ctx itself -
+    // so it is written LAST, after every read from r8 is done. MovLoad, not MemOp: MemOp bakes a
+    // REX that cannot name an extended destination.
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_GFXREFRESH);       // r11 = @AotGfxRefresh
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);      // arg0 = VMSelf
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);      // arg1 = CtxObj
+    MovLoad(ABI_ARG2, R8, AOTCTX_GFXDESC);                 // arg2 = the descriptor
+    E.EmitBytes([$41, $FF, $D3]);                          // call r11
+    StrCallEpilogue;
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));       // @done
   end;
 
   procedure EmitPrintEnd;
@@ -4867,6 +4984,21 @@ var
               if Prog.GetSsaPc(o) < 0 then Fail('no-pc-printstr');
             end;
           end;
+          // C8: PSET. Same shape as the print item above - a native form that can still fall back -
+          // so it needs the same three things: a call-ready frame, a deopt hazard, and a PC.
+          ssaGfxPset:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasGfxPset := True;
+              HasHelperCall := True;
+              HasDeopt := True;
+              if not AotHelperRoutable(Prog, o) then Fail('gfxpset-not-routable');
+              if Prog.GetSsaPc(o) < 0 then Fail('no-pc-gfxpset');
+              CountVal(Ins.Src1); CountVal(Ins.Src2); CountVal(Ins.Src3);
+            end;
+          end;
           ssaCmpEqString, ssaCmpNeString, ssaCmpLtString, ssaCmpGtString,
           ssaCopyString, ssaLoadConstString, ssaStrConcat, ssaStrLen,
           ssaStrLeft, ssaStrRight, ssaStrMid, ssaStrAsc, ssaStrAscMid, ssaStrConcatCharAt, ssaStrAppendMapped, ssaStrChr, ssaStrInstr,
@@ -6115,6 +6247,13 @@ var
         EmitPrintStringNative(apc, Cur.OpCode = ssaPrintStringLn);
       end;
 
+      // C8: PSET. A PC is needed for the same reason - the cold path IS the helper call.
+      ssaGfxPset:
+      begin
+        apc := NeedPC; if not OK then Exit;
+        EmitGfxPsetNative(apc);
+      end;
+
 
       ssaLoadConstInt:
       begin
@@ -6707,6 +6846,7 @@ begin
   OK := True;
   ArrClassic := not AllowUnsafe;
   HasRecMark := False; HasDeopt := False; HasHelperCall := False; NHelperCalls := 0;
+  HasGfxPset := False;
   RecMarkRoutable := True;
   HasNativeRecAlloc := False; RecMarkNative := False;
   MaxIReg := -1; MaxFReg := -1; MaxArrId := -1;
@@ -6833,7 +6973,12 @@ begin
     // the callee's shadow space, a slot for each base register the ABI lets a callee clobber,
     // and enough padding that rsp is 16-byte aligned at the call.
     if HasHelperCall then FrameSize := ABI_SHADOW_SPACE else FrameSize := 0;
-    SlotXmm := -1; SlotCtxSave := -1; SlotFltSave := -1;
+    SlotXmm := -1; SlotCtxSave := -1; SlotFltSave := -1; SlotGfx := -1;
+    if HasGfxPset then
+    begin
+      SlotGfx := FrameSize;
+      Inc(FrameSize, 16);                             // x and y; already 16-byte aligned
+    end;
     w := 0;
     for k := 6 to 15 do if SaveXmm[k] then Inc(w);
     if w > 0 then

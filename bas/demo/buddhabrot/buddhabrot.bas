@@ -124,22 +124,18 @@ Const TEXT_BAND_HEIGHT  = 24         '' pixels reserved at the top for the overl
 ''  The frame rate is a BUDGET, not a limit. Every frame is given the same slice of wall-clock time
 ''  whatever engine is underneath, and the sampling stops when the slice is spent - so this number
 ''  is what the demo runs at, not what it can manage. With no sampling at all the same loop reaches
-''  230 frames a second interpreted, 269 under the JIT and 81 under AOT, so 30 is a long way inside
-''  what the machine will do.
+''  227 frames a second interpreted and 317 under AOT, so 60 leaves plenty of room. fps= moves it.
 ''
-''  ⚠️ WHY THE CEILING IS SO MUCH LOWER UNDER AOT, WHICH IS THE FAST ENGINE. Painting is one PSet
-''  per pixel, and PSet costs about 4 ns per call under the interpreter and the JIT but about 60 ns
-''  under AOT - measured flat at 100x100, 200x200 and 400x400, so it is a per-call cost and not a
-''  fixed overhead per frame. A full 400x400 repaint is 0.65 ms interpreted, 0.75 ms under the JIT
-''  and 9.5 ms under AOT.
-''  The interpreter is quick here because PSet has an arm in the C hot dispatch loop; the AOT has no
-''  native lowering for it, so every pixel is a runtime-helper call that flushes and reloads every
-''  allocated register. Turn the C loop off and the interpreter costs 32 ns per pixel, which is the
-''  same arm the AOT is paying for plus the call around it.
-''  ⇒ So the painting is a tax on the sampling budget and it falls HARDEST on the fastest engine,
-''  which means this demo UNDERSTATES how much quicker AOT is. Raise the frame rate and it gets
-''  worse; lower it and the demo looks like a slideshow. 30 is the compromise, and fps= moves it.
-Const DEFAULT_FRAMES_PER_SECOND = 30
+''  ⚠️ IT USED TO BE 20, AND THE REASON IT COULD NOT BE HIGHER IS WORTH KNOWING. Painting is one
+''  PSet per pixel, and PSet had no native lowering in the AOT backend: every pixel became a
+''  runtime-helper call that flushed and reloaded every allocated register, 60 ns against the
+''  interpreter's 4. A 400x400 repaint cost 9.5 ms compiled against 0.65 ms interpreted, so the
+''  painting was a tax that fell HARDEST on the fastest engine, and asking for more frames made the
+''  compiled engine look WORSE: at 60 frames a second the AOT advantage collapsed from 3.3x to 1.8x.
+''  That was a defect in the engine rather than in the demo, and it is fixed (SedaiAot C8): PSet is
+''  now an inline store gated on the same surface descriptor the C hot loop uses, 1.1 ns per call.
+''  The tax is gone, and with it the reason to keep the frame rate down.
+Const DEFAULT_FRAMES_PER_SECOND = 60
 
 
 '' ================================================================================================
@@ -409,7 +405,7 @@ Sub PrintUsage()
   Print "  still=N     compute N orbits, write a file, exit   (no window)"
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
   Print "  gamma=N     tone curve applied after the log        (default 2.2)"
-  Print "  fps=N       frames per second to hold                 (default 30)"
+  Print "  fps=N       frames per second to hold                 (default 60)"
   Print
   Print "Keys while running:  SPACE pause   R restart   S save a still   Q quit"
 End Sub

@@ -25,6 +25,10 @@ var
   AotFuncs: PExecMemA;     // @FNativeFuncs[0]
   AotFromPC: Integer;      // entry PC of the AOT call in flight, to detect a no-progress return
   LocalAotCtx: TAotCtx;    // per-Run transfer-bank bases of the ACTIVE context (worker-safe)
+  // C8: the compiled PSET fast path's view of the draw surface. Per-RUN like the ctx that points at
+  // it, for the same reason: a worker must see its own. Left zeroed here - the first PSET in
+  // compiled code finds base 0, takes the slow path once and rebuilds it.
+  LocalGfxDesc: array[0..4] of Int64;
   ArrDescPtr: Pointer;     // array-descriptor table for this native entry (AcquireArrDesc: locked)
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
@@ -174,6 +178,8 @@ begin
     // things for the same opcode. Only what is per-CONTEXT stays here.
     SetAotPrimitives(LocalAotCtx);
     LocalAotCtx.CtxObj := Ctx;
+    FillChar(LocalGfxDesc, SizeOf(LocalGfxDesc), 0);
+    LocalAotCtx.GfxDesc := @LocalGfxDesc[0];
     if Length(Ctx.StringRegs) > 0 then LocalAotCtx.StrRegs := @Ctx.StringRegs[0]
     else LocalAotCtx.StrRegs := nil;
     // C7: the STRING transfer bank, alongside the int and float bases set above. Same lifetime as

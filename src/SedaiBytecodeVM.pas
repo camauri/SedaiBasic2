@@ -10057,6 +10057,41 @@ end;
 
   Emitted code reaches it through TAotCtx.ExecOne - never a baked address, so a worker
   thread running the same compiled function passes its own VM/context pair. }
+function AotGfxRefresh(VMSelf, CtxObj, Desc: Pointer): PtrInt; cdecl;
+{ C8: rebuild the compiled PSET fast path's view of the draw surface, and answer whether the fast
+  path may be taken at all.
+
+  ⛔ THIS IS THE SAME GATE AS RunTemplate.inc's HotGfxDesc, AND IT HAS TO STAY THE SAME ONE. Every
+  condition under which PSET does more than one store must appear in BOTH, because both emitted
+  arms test the base and nothing else. If a condition is added there and not here, compiled code
+  keeps drawing through a transform it was supposed to refuse - and it will look right on most
+  programs, which is what makes it the dangerous kind of divergence.
+  The list, from that comment: palette mode searches for the nearest index and writes a second
+  buffer; a clip, a WINDOW transform or a VIEW offset all change WHERE the pixel lands; a draw
+  target that is not the work page is a different surface entirely. }
+var
+  VM: TBytecodeVM;
+  D: PInt64;
+  Base: Pointer;
+  W, H: Integer;
+begin
+  D := PInt64(Desc);
+  D[0] := 0;
+  Result := 0;
+  if D = nil then Exit;
+  VM := TBytecodeVM(VMSelf);
+  if not Assigned(VM.FGraphics) then Exit;
+  if VM.FGfxWinActive then Exit;
+  if (VM.FGfxViewOffsetX <> 0) or (VM.FGfxViewOffsetY <> 0) then Exit;
+  if not VM.FGraphics.PixelStoreTarget(VM.DrawSurface, Base, W, H) then Exit;
+  D[0] := PtrInt(Base);
+  D[1] := W;
+  D[2] := H;
+  D[3] := PtrInt(@VM.FDrawPenX);
+  D[4] := PtrInt(@VM.FDrawPenY);
+  Result := D[0];
+end;
+
 function AotExecOne(VMSelf, CtxObj: Pointer; PC: PtrInt; AotCtx: PAotCtx): PtrInt; cdecl;
 type
   PInstr = ^TBytecodeInstruction;
@@ -10066,6 +10101,11 @@ var
 begin
   VM := TBytecodeVM(VMSelf);
   C := TExecutionContext(CtxObj);
+  // C8: whatever this instruction turns out to be, the compiled PSET fast path may not trust its
+  // cached surface afterwards. SCREEN, VIEW, WINDOW, a palette change and a draw-target switch all
+  // arrive here, and enumerating them is exactly the list that would go stale - so every helper
+  // call invalidates, and the PSET slow path rebuilds. One store against a helper round trip.
+  if (AotCtx <> nil) and (AotCtx^.GfxDesc <> nil) then AotCtx^.GfxDesc[0] := 0;
   try
     C.PC := PC;
     {$IFDEF DEBUG_AOTTRACE}
@@ -11441,6 +11481,8 @@ begin
   // owns the compiled code. The per-WORKER half of the triple is CtxObj, which is not set here.
   C.ExecOne := @AotExecOne;
   C.VMSelf := Self;
+  // C8: PSET's inline store rebuilds its surface view through this when the cache is cold.
+  C.GfxRefresh := @AotGfxRefresh;
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
   C.StrCmp := @AotStrCmp;
