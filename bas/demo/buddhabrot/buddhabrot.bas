@@ -133,7 +133,12 @@ Const ITERATION_CEILING = 20000      '' hard cap: sizes the scratch orbit array
   '' module is compiled from. The picture is the same picture; only the strip above it is gone.
   Const TEXT_BAND_HEIGHT = 0
 #else
-Const TEXT_BAND_HEIGHT  = 24         '' pixels reserved at the top for the overlay
+''  ⛔ THE OVERLAY HAS A WIDTH BUDGET, AND IT WAS BEING SPENT WITHOUT COUNTING. `Draw String` uses the
+''  built-in 8x8 font, so a 400-pixel window holds exactly FIFTY characters and everything past the
+''  fiftieth is simply not drawn - silently. Two lines were carrying seven fields between them and
+''  the ends were being cut off. Three shorter lines now, and each field is chosen to fit the
+''  narrowest window the demo is run at rather than the widest.
+Const TEXT_BAND_HEIGHT  = 30         '' three 8-pixel lines at y = 2, 11, 20, with room to breathe
 #endif
 ''  The frame rate is a BUDGET, not a limit. Every frame is given the same slice of wall-clock time
 ''  whatever engine is underneath, and the sampling stops when the slice is spent - so this number
@@ -260,6 +265,25 @@ Dim Shared As LongInt orbitsTraced, orbitsAccumulated
 ''  ⇒ That collapse is exactly what Metropolis-Hastings sampling exists to fix, and why this demo
 ''    declares itself uniform: watch the peak stop growing at four or five zoom steps in and you have
 ''    seen the reason for the technique, which is more convincing than being told.
+
+''  ⛔ ZOOMING OUT HAS TO END WHERE ZOOMING IN STARTED. Doubling the span and leaving the centre
+''  alone is what a map does, and it is wrong here: back at the full span you are looking at the
+''  whole figure through a window centred on wherever you last went, so the figure sits off to one
+''  side and only "0" puts it right. Each step out halves the distance to the home centre, which
+''  retraces the walk in; and reaching the full span snaps exactly, because "almost centred" is
+''  precisely what the eye notices at x1.
+''  ⭐ It lives in ONE Sub because three callers zoom out - the X key, the right mouse button and
+''  the browser page - and a rule that is written three times is a rule that will be three rules.
+Sub ZoomOut()
+  viewHalfSpan = viewHalfSpan * 2.0
+  viewCentreReal      = HOME_CENTRE_REAL      + (viewCentreReal      - HOME_CENTRE_REAL)      * 0.5
+  viewCentreImaginary = HOME_CENTRE_IMAGINARY + (viewCentreImaginary - HOME_CENTRE_IMAGINARY) * 0.5
+  If viewHalfSpan >= HOME_HALF_SPAN Then
+    viewHalfSpan        = HOME_HALF_SPAN
+    viewCentreReal      = HOME_CENTRE_REAL
+    viewCentreImaginary = HOME_CENTRE_IMAGINARY
+  End If
+End Sub
 
 Sub RecomputeView()
   viewRealMin      = viewCentreReal      - viewHalfSpan
@@ -388,6 +412,37 @@ End Function
 Dim Shared As Integer levelOfCount()   '' channel * levelStride + count -> 0..255
 Dim Shared As Integer levelStride = 0  '' entries per channel
 
+''  ⛔⛔ WHAT THE PICTURE IS NORMALISED AGAINST, AND WHY IT IS NO LONGER THE MAXIMUM.
+''  Each channel used to be divided by its own brightest pixel. That single pixel is the noisiest
+''  statistic in the whole picture: it JUMPS - measured over twenty frames at 200x200 the red
+''  maximum went 166, 280, 412, 803, 946 - and every jump renormalises EVERY pixel downwards at
+''  once. What that looks like is the thing to understand, because it is not subtle: on frame 12 of
+''  that run 23 240 pixels of 40 000 got DARKER while 13 372 got brighter, and in the first frames
+''  thousands dropped by more than twelve levels in one step. Early on it is worse still - a channel
+''  with almost no data has a maximum of 2 or 3, so everything in it is at full brightness and then
+''  collapses as the real range appears. Reported from the demo as "the red parts show up and then
+''  suddenly vanish", and "the evolution goes backwards and forwards", which is exactly what it is.
+''
+''  ⇒ The reference is now a quantity that GROWS SMOOTHLY: counts accumulate in proportion to the
+''  orbits drawn, so once a channel has enough evidence its counts-per-orbit is measured ONCE and
+''  the reference is that rate times the orbits so far. Nothing is ever renormalised downwards, and
+''  a freak pixel above the reference simply clips - which is what photo software does and what this
+''  file's own list of "improvements deliberately left out" proposed and dismissed as not needed.
+''  ⭐ `norm=peak` restores the old behaviour exactly, which is how the two are compared on one run.
+''  How many counts in the brightest pixel are "enough evidence" to measure the rate from. Below it
+''  the rate would be set by where the first handful of orbits happened to land.
+Const NORM_EVIDENCE = 64
+Dim Shared As Double  refRate(2)       '' counts per accumulated orbit, per channel
+Dim Shared As Integer refFrozen(2)     '' 0 until that channel has enough evidence to measure it
+Dim Shared As Integer stableNormalise  '' 1 = the smooth reference (default), 0 = the old maximum
+
+''  A view change throws the counts away, so the rate measured for the old view means nothing for
+''  the new one: it is measured again from the new window's own evidence.
+Sub ForgetNormalisation()
+  Dim As Integer c
+  For c = 0 To 2 : refFrozen(c) = 0 : refRate(c) = 0.0 : Next c
+End Sub
+
 Sub RebuildLevelTables()
   Dim As Integer channel, biggest = 1
   Dim As LongInt peak(2)
@@ -406,7 +461,29 @@ Sub RebuildLevelTables()
     ReDim levelOfCount(3 * levelStride - 1)
   End If
   For channel = 0 To 2
-    Dim As Double inverseLogOfPeak = 1.0 / Log(1.0 + peak(channel))
+    '' The reference this channel is divided by: its own maximum, or the smooth rate-times-orbits.
+    Dim As Double reference = peak(channel)
+    If stableNormalise <> 0 Then
+      '' 64 is "enough evidence": below it the rate is dominated by where the first few orbits
+      '' happened to land, and freezing it there would set the exposure from noise.
+      If refFrozen(channel) = 0 And peak(channel) >= NORM_EVIDENCE And orbitsAccumulated > 0 Then
+        refRate(channel) = peak(channel) / orbitsAccumulated
+        refFrozen(channel) = 1
+      End If
+      If refFrozen(channel) <> 0 Then
+        reference = refRate(channel) * orbitsAccumulated
+      Else
+        '' ⛔ AND BEFORE THERE IS EVIDENCE, A FIXED EXPOSURE - not the maximum. Dividing by a maximum
+        '' of 2 or 3 puts an almost empty channel at full brightness, and the collapse when the real
+        '' range appears is the "red parts that show up and then suddenly vanish". Starting from a
+        '' fixed reference means the picture starts DARK and only ever brightens, which is what the
+        '' evidence actually does. Measured: the frames with thousands of pixels dropping more than
+        '' twelve levels are exactly the frames before this freezes.
+        reference = NORM_EVIDENCE
+      End If
+      If reference < 1.0 Then reference = 1.0
+    End If
+    Dim As Double inverseLogOfPeak = 1.0 / Log(1.0 + reference)
     Dim As Integer channelBase = channel * levelStride
     levelOfCount(channelBase) = 0
     Dim As LongInt count
@@ -525,7 +602,17 @@ End Sub
 ''  COMPILED OUT of it - the lock and the two lines of text - and by nothing else, so the loop that
 ''  decides every pixel cannot drift between them. That is the same discipline the voxel demo keeps
 ''  for its camera path, and for the same reason: two descriptions of one thing become two things.
-Sub PaintFrame( ByVal topLine As String, ByVal bottomLine As String )
+''  ⭐ THE OVERLAY IS BUILT TO FIT, FIELD BY FIELD, instead of being written out and then cut off.
+''  `Draw String` uses the built-in 8x8 font, so the window holds imageSize\8 characters - fifty at
+''  the default 400, twenty-five at size=200 - and anything past that is silently not drawn. Adding a
+''  field only when it still fits means a narrow window loses whole fields, in order of importance,
+''  rather than losing the end of whatever happened to be last.
+Function Fits( ByVal line As String, ByVal extra As String ) As String
+  If Len(line) + Len(extra) <= imageSize \ 8 Then Return line + extra
+  Return line
+End Function
+
+Sub PaintFrame( ByVal topLine As String, ByVal middleLine As String, ByVal bottomLine As String )
   RebuildLevelTables()
   Dim As Integer x, y
 #if __SB_WASM__
@@ -544,7 +631,8 @@ Sub PaintFrame( ByVal topLine As String, ByVal bottomLine As String )
 #else
   Line (0, 0)-(imageSize - 1, TEXT_BAND_HEIGHT - 1), RGB(0, 0, 0), BF
   Draw String (4, 2),  topLine,    RGB(255, 255, 255)
-  Draw String (4, 12), bottomLine, RGB(160, 160, 160)
+  Draw String (4, 11), middleLine, RGB(170, 170, 170)
+  Draw String (4, 20), bottomLine, RGB(140, 140, 140)
   ScreenUnlock
 #endif
 End Sub
@@ -579,6 +667,7 @@ Sub PrintUsage()
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
   Print "  series=N    also write N numbered stills on the way, spaced geometrically"
   Print "  gamma=N     tone curve applied after the log        (default 4.5)"
+  Print "  norm=X      peak | stable - what each channel is divided by (default peak)"
   Print "  palette=X   nebula | aurora | ember                  (default nebula)"
   Print "  fps=N       frames per second to hold                 (default 60)"
   Print "  re=N im=N   centre of the view                       (default -0.65, 0)"
@@ -614,7 +703,7 @@ Sub StepFrame( ByVal orbitsThisFrame As Integer )
   For i = 1 To orbitsThisFrame
     TraceOneOrbit()
   Next i
-  PaintFrame("", "")
+  PaintFrame("", "", "")
 End Sub
 
 ''  Everything the keyboard and the mouse do natively, as one entry point. It is ONE Sub and not six
@@ -640,7 +729,7 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
       moved = 1
     End If
   ElseIf command = 3 Then
-    viewHalfSpan = viewHalfSpan * 2.0 : moved = 1
+    ZoomOut() : moved = 1
   ElseIf command = 4 Then
     viewCentreReal = HOME_CENTRE_REAL : viewCentreImaginary = HOME_CENTRE_IMAGINARY
     viewHalfSpan = HOME_HALF_SPAN : moved = 1
@@ -660,6 +749,7 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(browserSeed) : orbitsTraced = 0 : orbitsAccumulated = 0
+    ForgetNormalisation()
   End If
   '' ⛔ AND THE MODULE SAYS WHERE THE VIEW IS, rather than letting the page work it out. The page has
   '' no other way to know - a Sub returns nothing - and the alternative is for the page to keep its
@@ -689,6 +779,17 @@ Dim As LongInt stillOrbits = CLngInt( ArgumentValue("still", "0") )
 Dim As String  outputName  = ArgumentValue("out", "buddhabrot.ppm")
 Dim As Double  runSeconds  = CDbl( ArgumentValue("secs", "0") )
 toneGamma = CDbl( ArgumentValue("gamma", "4.5") )
+'' ⛔⛔ THE DEFAULT IS STILL `peak`, AND THE REASON IS A DEFECT IN THE CURE, NOT IN THE MEASUREMENT.
+'' `norm=stable` removes the flicker - measured below - but it freezes its exposure the first time a
+'' channel has enough evidence, and WHEN that happens depends on how often the picture is repainted.
+'' Still mode rebuilds the tables once, at the end; the browser rebuilds them every frame. So the two
+'' pick different exposures from the SAME orbits, and the module's picture stopped matching `sb`'s -
+'' 17% of the bytes, up to 149 levels apart. That is the demo's central claim broken, and the wasm
+'' net caught it within a minute of the change.
+'' ⇒ A reference that is a function of the DATA ALONE (a percentile, or a multiple of the plane's
+'' mean) has no such dependence, and that is the shape the cure has to take. Until it does, the
+'' default stays where every engine agrees, and `norm=stable` is there to be measured against.
+stableNormalise = IIf( LCase(ArgumentValue("norm", "peak")) = "stable", 1, 0 )
 colourReading = READING_NEBULA
 If LCase(ArgumentValue("palette", "")) = "aurora" Then colourReading = READING_AURORA
 If LCase(ArgumentValue("palette", "")) = "ember"  Then colourReading = READING_EMBER
@@ -853,16 +954,30 @@ Do
   '' PRINT echoes to standard output as well, and a demo that scrolls a thousand lines up the
   '' terminal it was launched from is not one anybody runs twice.
   Dim As Double paintStart = Timer
-  PaintFrame( label + "   " + Str(Int(orbitsPerSecond)) + " orbits/s" + _
-                IIf(paused, "   [PAUSED]", "") + _
-                IIf(pointerOverPicture, "   pointer " + Format(pointerReal, "0.0000") + _
-                                        " " + Format(pointerImaginary, "0.0000"), ""), _
-              "traced " + Str(orbitsTraced) + "    drawn " + Str(orbitsAccumulated) + _
-                "    iter " + Str(maximumIterations) + _
-                "    " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0") + _
-                "    x" + Format(HOME_HALF_SPAN / viewHalfSpan, "0.#") + _
-                " @ " + Format(viewCentreReal, "0.0000") + " " + Format(viewCentreImaginary, "0.0000") + _
-                "    peak " + Str(PeakRedCount()) )
+  '' Three lines, each inside the fifty characters a 400-pixel window holds. The pointer readout
+  '' REPLACES the view on the last line while the pointer is over the picture, rather than being
+  '' appended to it: two coordinate pairs on one line is what pushed the old overlay off the edge.
+  '' Most important first: whichever fields a narrow window cannot hold are the ones dropped.
+  Dim As String line1 = label + IIf(paused, " [PAUSED]", "")
+  line1 = Fits(line1, " " + Str(Int(orbitsPerSecond)) + "/s")
+  line1 = Fits(line1, "  " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0"))
+  line1 = Fits(line1, " iter " + Str(maximumIterations))
+
+  Dim As String line2 = "traced " + Str(orbitsTraced)
+  line2 = Fits(line2, "  drawn " + Str(orbitsAccumulated))
+  line2 = Fits(line2, "  peak " + Str(PeakRedCount()))
+
+  '' The pointer readout REPLACES the view while the pointer is over the picture: two coordinate
+  '' pairs on one line is what pushed the old overlay off the edge in the first place.
+  Dim As String line3
+  If pointerOverPicture <> 0 Then
+    line3 = "pointer " + Format(pointerReal, "0.0000") + " " + Format(pointerImaginary, "0.0000")
+  Else
+    line3 = "x" + Format(HOME_HALF_SPAN / viewHalfSpan, "0.#")
+    line3 = Fits(line3, " @ " + Format(viewCentreReal, "0.0000") + " " + Format(viewCentreImaginary, "0.0000"))
+  End If
+
+  PaintFrame(line1, line2, line3)
   paintSeconds = Timer - paintStart
 
   key = LCase(InKey)
@@ -873,7 +988,7 @@ Do
   Dim As Integer moved = 0
   If key = "r" Then moved = 1
   If key = "z" Then viewHalfSpan = viewHalfSpan / 2.0 : moved = 1
-  If key = "x" Then viewHalfSpan = viewHalfSpan * 2.0 : moved = 1
+  If key = "x" Then ZoomOut() : moved = 1
   '' The picture is turned a quarter turn, so the keys are too: W and S walk the REAL axis, which
   '' runs down the screen, and A and D walk the IMAGINARY one, which runs across it.
   If key = "w" Then viewCentreReal      = viewCentreReal      - viewHalfSpan / 2.0 : moved = 1
@@ -905,7 +1020,7 @@ Do
       viewHalfSpan = viewHalfSpan / 2.0 : moved = 1
     End If
     If (pressed And 2) <> 0 Or wheelStep < 0 Then
-      viewHalfSpan = viewHalfSpan * 2.0 : moved = 1
+      ZoomOut() : moved = 1
     End If
   End If
 
@@ -915,6 +1030,7 @@ Do
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer
+    ForgetNormalisation()
   End If
   '' ⚠️ This used to be S, which is also the key that pans DOWN: one press did both, so every save
   '' wrote a picture of the view you had just left. P for picture.

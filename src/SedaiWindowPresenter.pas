@@ -66,7 +66,39 @@ var
 
 var
   GActiveWindow: PSDL_Window = nil;   // the presenter's window while open (for SetMouse warp / bounds)
+  // The keys typed into the window, oldest first. A ring would be tidier; a plain queue of 64 is
+  // enough for a human typing at a program that reads with INKEY, and it drops the oldest rather
+  // than the newest so a burst never blocks the ones that follow.
+  GKeyQ: array[0..63] of Char;
+  GKeyQHead: Integer = 0;
+  GKeyQTail: Integer = 0;
   GJoy: array[0..15] of PSDL_Joystick;   // lazily-opened gaming devices (GETJOYSTICK/STICK/STRIG)
+
+// INKEY: the next character typed into the window, or #0 when none is waiting.
+// ⛔ THIS EXISTS BECAUSE `sb --window` HAD NO KEYBOARD AT ALL ON LINUX, and the reason is in two
+// halves that hide each other. TTerminalInput.ProcessEvents - the CLI's only key source - is one
+// big {$IFDEF WINDOWS}, so on Unix it can never report a keypress; and once a window has the focus
+// the keystrokes are going to SDL anyway, where the presenter's pump was dropping them. So every
+// documented key of every windowed demo did nothing, and the two halves each explained the other's
+// absence. The pump collects them now and this hands them to INKEY.
+function WindowNextChar: Char;
+begin
+  Result := #0;
+  if GKeyQHead = GKeyQTail then Exit;
+  Result := GKeyQ[GKeyQHead];
+  GKeyQHead := (GKeyQHead + 1) mod Length(GKeyQ);
+end;
+
+procedure PushKey(C: Char);
+var NextTail: Integer;
+begin
+  if C = #0 then Exit;
+  NextTail := (GKeyQTail + 1) mod Length(GKeyQ);
+  if NextTail = GKeyQHead then                       // full: drop the OLDEST, keep what was just typed
+    GKeyQHead := (GKeyQHead + 1) mod Length(GKeyQ);
+  GKeyQ[GKeyQTail] := C;
+  GKeyQTail := NextTail;
+end;
 
 // Real-time key state for MULTIKEY (installed as GKeyDownProvider while the window is open).
 function WindowKeyDown(ATScanCode: Integer): Boolean;
@@ -190,6 +222,8 @@ begin
     FRenderer := nil;
   GActiveWindow := FWindow;
   GKeyDownProvider := @WindowKeyDown;    // MULTIKEY reads the live SDL keyboard state
+  GWindowCharProvider := @WindowNextChar;  // ...and INKEY reads the keys typed into the window
+  SDL_StartTextInput;                      // without this SDL sends no SDL_TEXTINPUT at all
   GGetMouseProvider := @WindowGetMouse;  // GETMOUSE reads the live SDL mouse state
   SedaiInstallMouseWheelWatch;           // ...and its wheel field, which only an event can fill
   GSetMouseProvider := @WindowSetMouse;  // SETMOUSE warps / toggles the cursor
@@ -201,6 +235,7 @@ var
   i: Integer;
 begin
   GKeyDownProvider := nil;
+  GWindowCharProvider := nil;
   GGetMouseProvider := nil;
   SedaiRemoveMouseWheelWatch;
   GSetMouseProvider := nil;
@@ -239,7 +274,24 @@ procedure TWindowPresenter.HandleEvent(const Event: TSDL_Event);
 begin
   if Event.type_ = SDL_QUITEV then FClosed := True
   else if (Event.type_ = SDL_WINDOWEVENT) and (Event.window.event = SDL_WINDOWEVENT_CLOSE) then
-    FClosed := True;
+    FClosed := True
+  // ⭐ TEXT INPUT, not the keycode, for anything printable: SDL has already applied the layout and
+  // the modifiers, so `[`, `]`, `+` and `-` arrive as themselves on every keyboard - which a
+  // keycode-to-character table would get wrong on the first non-US layout it met.
+  else if Event.type_ = SDL_TEXTINPUT then
+  begin
+    // UTF-8 in, one byte out: INKEY is a byte-string function and the keys programs read are ASCII.
+    if Event.text.text[0] <> #0 then PushKey(Event.text.text[0]);
+  end
+  // The three that produce no text and that programs do read.
+  else if Event.type_ = SDL_KEYDOWN then
+  begin
+    case Event.key.keysym.sym of
+      SDLK_RETURN, SDLK_KP_ENTER: PushKey(#13);
+      SDLK_ESCAPE:                PushKey(#27);
+      SDLK_BACKSPACE:             PushKey(#8);
+    end;
+  end;
 end;
 
 function TWindowPresenter.PollEvents: Boolean;

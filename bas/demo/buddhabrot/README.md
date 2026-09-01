@@ -83,6 +83,24 @@ the picture. **EMBER** adds the three planes back together through one warm ramp
 single-channel Buddhabrot everyone has seen, and loses the lifetime along with the colour.
 `palette=nebula|aurora|ember` and `gamma=` do the same from the command line.
 
+> **The keys work in a window now, and on Linux they never had.** `TTerminalInput` — the only key
+> source the CLI has — is one big `{$IFDEF WINDOWS}`, so on Unix it could never report a keypress;
+> and once an SDL window has the focus the keystrokes are going there anyway, where nothing was
+> collecting them. Two halves that each explained the other's absence, and between them every
+> documented key of every windowed demo did nothing. The presenter collects them now.
+
+> **`norm=stable` is an experiment, and `peak` is still the default.** Each channel is divided by its
+> own brightest pixel, and that single pixel is the noisiest statistic in the picture: measured at
+> 200×200, the red maximum went 166 → 280 → 412 → 803 over twenty frames, and every jump renormalises
+> every pixel downwards at once — 23 240 pixels of 40 000 got darker on one frame. That is the "red
+> parts that show up and then vanish". `norm=stable` divides by a reference that grows smoothly
+> instead, and it works: pixels dropping more than twelve levels fall from 5 302 to 320 over 68
+> frames. It is not the default because it freezes its exposure at the first frame with enough
+> evidence, and *when* that happens depends on how often the picture is repainted — so still mode and
+> the browser pick different exposures from the same orbits, and the module stopped matching `sb`.
+> A reference computed from the data alone has no such dependence; that is the shape the fix has to
+> take, and until it does the default stays where every engine agrees.
+
 ### Zooming shows you why Metropolis-Hastings exists
 
 ⚠️ **A Buddhabrot zoom is not like any other fractal zoom, and this is the most interesting thing in
