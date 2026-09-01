@@ -122,14 +122,18 @@ Const ESCAPE_RADIUS_SQUARED = 4.0
 Const ITERATION_CEILING = 20000      '' hard cap: sizes the scratch orbit array
 Const TEXT_BAND_HEIGHT  = 24         '' pixels reserved at the top for the overlay
 ''  The equal slice of wall-clock time every frame gets, whatever engine is underneath.
-''  ⚠️ 20 frames a second rather than 30, and the reason is arithmetic. Painting the window costs
-''  roughly the same every frame no matter which engine is running - it is one PSet per pixel and
-''  PSet is not where the engines differ. That fixed cost is a tax on the sampling budget, and the
-''  shorter the frame the larger a share of it the tax takes. Measured here: at 33 ms the AOT engine
-''  spent about 30% of each frame painting and traced 3.0x the interpreter's orbits; at 50 ms it
-''  spends about 20% and the ratio moves closer to the 4.1x the two engines actually differ by when
-''  nothing but arithmetic is being timed. Longer frames would be fairer still and would also look
-''  like a slideshow.
+''  ⚠️ 20 frames a second rather than 30, and the reason is a measured cost, not a preference.
+''  Painting the window is one PSet per pixel, and PSet costs about 4 ns per call under the
+''  interpreter and about the same under the JIT - but about 60 ns under AOT. (Measured flat across
+''  100x100, 200x200 and 400x400, so it is a per-call cost and not a fixed overhead per frame.) A
+''  full 400x400 repaint is therefore about 0.75 ms interpreted, 0.75 ms under the JIT and 9.5 ms
+''  under AOT.
+''  So the painting is a tax on the sampling budget, and - this is the awkward part - it is heaviest
+''  on the FASTEST engine, which means this demo UNDERSTATES how much quicker AOT is. The shorter
+''  the frame the worse that gets: at 33 ms the AOT engine spent about 30% of each frame painting
+''  and traced 3.0x the interpreter's orbits; at 50 ms it spends about a fifth and the ratio moves
+''  back towards the 4.1x the two engines actually differ by when nothing but arithmetic is timed.
+''  Longer frames would be fairer still and would also look like a slideshow.
 Const TARGET_FRAME_SECONDS = 0.050
 
 
@@ -348,7 +352,15 @@ Sub WritePortablePixmap( ByVal fileName As String )
   Close #handle
 End Sub
 
-Sub PaintFrame()
+''  ⛔⛔ EVERYTHING THAT BELONGS TO ONE FRAME HAPPENS INSIDE ONE LOCK, the overlay included.
+''  While a lock is held nothing is presented; the unlock presents once. Drawing the text after the
+''  unlock - which is where it was first written - presents the frame THREE times, once for the
+''  image and once for each line of text, and the picture and the numbers written over it are never
+''  shown as the same instant.
+''  The band is cleared before it is written, because a number that gets shorter would otherwise
+''  leave the tail of the longer one it replaced standing behind it.
+
+Sub PaintFrame( ByVal topLine As String, ByVal bottomLine As String )
   RebuildColourTable( PeakCount() )
   Dim As Integer x, y
   ScreenLock
@@ -357,6 +369,9 @@ Sub PaintFrame()
       PSet (x, y + TEXT_BAND_HEIGHT), colourOfCount( histogram(y * imageSize + x) )
     Next x
   Next y
+  Line (0, 0)-(imageSize - 1, TEXT_BAND_HEIGHT - 1), RGB(0, 0, 0), BF
+  Draw String (4, 2),  topLine,    RGB(255, 255, 255)
+  Draw String (4, 12), bottomLine, RGB(160, 160, 160)
   ScreenUnlock
 End Sub
 
@@ -476,17 +491,15 @@ Do
     If sampleSeconds > 0.0 Then orbitsPerSecond = (orbitsTraced - before) / sampleSeconds
   End If
 
-  Dim As Double paintStart = Timer
-  PaintFrame()
-  paintSeconds = Timer - paintStart
-
   '' Draw String writes into the framebuffer and nowhere else. LOCATE + PRINT would also work, but
   '' PRINT echoes to standard output as well, and a demo that scrolls a thousand lines up the
   '' terminal it was launched from is not one anybody runs twice.
-  Draw String (4, 2), label + "   " + Str(Int(orbitsPerSecond)) + " orbits/s" + _
-                      IIf(paused, "   [PAUSED]", ""), RGB(255, 255, 255)
-  Draw String (4, 12), "traced " + Str(orbitsTraced) + "    drawn " + Str(orbitsAccumulated) + _
-                       "    iter " + Str(maximumIterations), RGB(160, 160, 160)
+  Dim As Double paintStart = Timer
+  PaintFrame( label + "   " + Str(Int(orbitsPerSecond)) + " orbits/s" + _
+                IIf(paused, "   [PAUSED]", ""), _
+              "traced " + Str(orbitsTraced) + "    drawn " + Str(orbitsAccumulated) + _
+                "    iter " + Str(maximumIterations) )
+  paintSeconds = Timer - paintStart
 
   key = LCase(InKey)
   If key = "q" Or key = Chr(27) Then Exit Do
@@ -522,9 +535,9 @@ Print "written           : "; outputName
 ''
 ''  * REPAINT ONLY WHAT CHANGED. PaintFrame writes every pixel every frame. Keeping a shadow copy of
 ''    the last colour drawn and skipping unchanged pixels would cut most of that, and it matters
-''    more than it looks: measured on this machine a full 400x400 repaint costs about 1 ms under the
-''    interpreter and the JIT but about 10 ms under AOT, which is a large share of a 33 ms frame.
-''    It needs a second full-size buffer and a comparison in the inner loop.
+''    more than it looks: a full 400x400 repaint costs about 0.75 ms under the interpreter and the
+''    JIT but about 9.5 ms under AOT, which is a fifth of a 50 ms frame. It needs a second full-size
+''    buffer and a comparison in the inner loop.
 ''
 ''  * INCREMENTAL PEAK. PeakCount rescans the whole histogram once per frame to find the brightest
 ''    pixel. The peak only ever grows, so it could be maintained as orbits are accumulated. Left
