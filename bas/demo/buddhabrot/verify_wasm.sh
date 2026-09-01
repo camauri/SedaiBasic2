@@ -90,7 +90,109 @@ if [ "$nh" != "$wh" ]; then
   echo "⛔ the module draws a DIFFERENT picture from sb on the same $orbits orbits"; exit 1
 fi
 
-# ---- 3. the page carries THIS module ------------------------------------------------
+# ---- 3. the page's own script runs, and a tap zooms ---------------------------------
+# ⛔ THIS CHECK EXISTS BECAUSE THE PAGE BROKE WHERE THE MODULE WAS FINE. Tapping the picture did
+# nothing on a phone for three independent reasons: the module was compiled SYNCHRONOUSLY (a browser
+# refuses that for a buffer over 4 KB on the main thread, and this one is 25 KB); the canvas listened
+# only for `click`, which a touch browser does not always synthesise on something that is not a
+# control; and switching to async instantiation left `const step = X['PROC_STEPFRAME']` at top level,
+# reading exports that did not exist yet. None of the three is visible to `node --check`, and the
+# picture-for-picture check above passes with every one of them present - the MODULE was never wrong.
+# So the page's own script is RUN here, against a DOM small enough to fit beside it, and driven.
+cat > "$work/shim.js" <<'SHIM_JS'
+// A DOM small enough to run the page's own script, and no smaller. It exists so the checks below
+// can DRIVE the page - tap, drag, the click a touch browser synthesises afterwards - instead of
+// only parsing it.
+const els = {};
+function mk(id) {
+  return els[id] = { id, textContent: '', innerHTML: '', style: {}, offsetLeft: 0, offsetTop: 0,
+    offsetWidth: 1, width: 0, height: 0, onclick: null, _h: {},
+    classList: { add(){}, remove(){} },
+    addEventListener(t, f) { this._h[t] = f; },
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 400 }),
+    getContext: () => ({ createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+                         putImageData: () => {} }) };
+}
+['hud','hud2','note','screen','ping','toggle','reading','zoomout','home','restart',
+ 'gdown','gup','idown','iup','hint'].forEach(mk);
+global.document = { getElementById: (id) => els[id] || mk(id), addEventListener: () => {},
+  hidden: false,
+  body: { set innerHTML(v) { global.__BODY_HTML = v; }, get innerHTML() { return global.__BODY_HTML; } } };
+let rafs = [];
+global.requestAnimationFrame = (f) => { rafs.push(f); return rafs.length; };
+global.performance = { now: () => Date.now() };
+global.__els = els;
+global.__pump = (n) => { for (let i = 0; i < n; i++) { const q = rafs; rafs = []; q.forEach(f => f(Date.now())); } };
+SHIM_JS
+cat > "$work/drive.js" <<'DRIVE_JS'
+require('./shim.js');
+const fs = require('fs');
+eval(fs.readFileSync(__dirname + '/page_body.js', 'utf8'));
+let bad = 0;
+const say = (ok, what) => { if (!ok) { bad = 1; console.log('  ⛔ ' + what); } };
+setTimeout(() => {
+  const els = global.__els, s = els.screen;
+  const view = () => (els.hud.textContent.split('·').pop() || '').trim();
+  if (global.__BODY_HTML) {
+    console.log('  ⛔ the page reported: ' + String(global.__BODY_HTML).slice(0, 200));
+    process.exit(1);
+  }
+  global.__pump(2);
+  const home = view();
+  say(/^×1 /.test(home), 'the page did not start at the whole figure (read "' + home + '")');
+  s._h.pointerdown({ clientX: 100, clientY: 300, button: 0 });
+  s._h.pointerup  ({ clientX: 100, clientY: 300, button: 0 });
+  global.__pump(1);
+  const tapped = view();
+  say(/^×2 /.test(tapped) && tapped !== home, 'a tap did not zoom (read "' + tapped + '")');
+  say(els.ping.style.left === '100px', 'the tap marker was not placed where the tap was');
+  s._h.click({ clientX: 100, clientY: 300, button: 0 });
+  global.__pump(1);
+  say(view() === tapped, 'the click a touch browser synthesises zoomed a SECOND time');
+  s._h.pointerdown({ clientX: 100, clientY: 100, button: 0 });
+  s._h.pointerup  ({ clientX: 180, clientY: 140, button: 0 });
+  global.__pump(1);
+  say(view() === tapped, 'a drag counted as a tap');
+  els.home.onclick(); global.__pump(1);
+  say(view() === home, 'the whole-figure button did not go home');
+  process.exit(bad);
+}, 300);
+DRIVE_JS
+if ! python3 - "$page" "$work/page_body.js" <<'EXTRACT_PY'
+import re, sys
+s = open(sys.argv[1], encoding='utf-8').read()
+m = re.search(r"<script>\n(.*)</script>", s, re.S)
+if not m:
+    print('no <script> block in the page'); raise SystemExit(1)
+body = m.group(1)
+
+# ⛔ ONE THING node CANNOT SEE, so it is checked in the text instead: a browser refuses SYNCHRONOUS
+# compilation of a buffer larger than 4 KB on the main thread, and this module is 25 KB. node has no
+# such rule, so `new WebAssembly.Module(...)` runs perfectly here and fails on every phone.
+# ⚠️ And the comments come off FIRST. The page's own comment EXPLAINS the trap by naming the
+# forbidden call, and a check that grepped the raw text would be satisfied by that comment alone -
+# which is a way this project has already fooled itself twice.
+code = re.sub(r'//[^\n]*', '', body)
+code = re.sub(r'/\*.*?\*/', '', code, flags=re.S)
+if re.search(r'new\s+WebAssembly\.(Module|Instance)\s*\(', code):
+    print('  ⛔ the page compiles the module SYNCHRONOUSLY (new WebAssembly.Module/Instance).')
+    print('     A browser refuses that over 4 KB on the main thread; use WebAssembly.instantiate.')
+    raise SystemExit(1)
+if 'WebAssembly.instantiate(' not in code:
+    print('  ⛔ the page never calls WebAssembly.instantiate'); raise SystemExit(1)
+
+open(sys.argv[2], 'w', encoding='utf-8').write(body.replace("'use strict';", "", 1))
+EXTRACT_PY
+then
+  echo "⛔ the page does not instantiate the module the way a browser requires"; exit 1
+fi
+
+if ! ( cd "$work" && node drive.js ); then
+  echo "⛔ the page's script does not drive the module (see above)"; exit 1
+fi
+echo "  page: starts at the whole figure, a tap zooms, a drag does not, no double zoom"
+
+# ---- 4. the page carries THIS module ------------------------------------------------
 b64=$(base64 -w0 "$work/buddhabrot.wasm")
 if [ "$bless" = 1 ]; then
   python3 - "$page" "$b64" <<'PY'
