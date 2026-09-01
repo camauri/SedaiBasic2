@@ -188,7 +188,31 @@ End Function
 Dim Shared As Integer imageSize
 Dim Shared As Integer minimumEscapeIterations
 Dim Shared As Integer maximumIterations
-Dim Shared As LongInt histogram()          '' one counter per pixel, laid out row by row
+'' ⭐ THREE counters per pixel, not one, and this is where the colour comes from.
+''
+''  The classic Buddhabrot is grey. The colour version - the one most people have seen - is three
+''  Buddhabrots at three different iteration ceilings, laid into the red, green and blue channels.
+''  Rendering it as three passes would cost three times the orbits; it does not have to, because the
+''  three sets are NESTED. An orbit that escapes in n steps would escape under any ceiling at or
+''  above n, so one pass at the largest ceiling knows every channel that orbit belongs to:
+''
+''        n <= RED ceiling    -> red     (always true: RED is the largest)
+''        n <= GREEN ceiling  -> green too
+''        n <= BLUE ceiling   -> blue as well
+''
+''  ⭐ And that nesting is what separates the colours, without any of the channels being told to look
+''  different. Nine escaping orbits in ten die within a few steps, and those short ones are barely
+''  more than the random point c - a flat haze. They land in ALL THREE channels, so the haze is
+''  white-ish; but the red channel also holds every long-lived orbit, so ITS peak is far higher and
+''  the same haze, normalised against it, comes out dim. The structure is red because only red has
+''  it; the outer glow is blue because blue has nothing else.
+''  ⇒ No "ignore orbits shorter than N" rule is needed any more. The old single-channel version had
+''    one, because without it the picture was a flat grey field. Here the flatness has somewhere to
+''    go.
+
+Dim Shared As LongInt histogram()          '' three planes, one per channel, each row by row
+Dim Shared As Integer pixelsPerPlane
+Dim Shared As Integer greenCeiling, blueCeiling
 Dim Shared As Double  orbitReal(ITERATION_CEILING)
 Dim Shared As Double  orbitImaginary(ITERATION_CEILING)
 Dim Shared As Double  pixelsPerImaginaryUnit, pixelsPerRealUnit
@@ -201,11 +225,13 @@ Dim Shared As LongInt orbitsTraced, orbitsAccumulated
 ''  One orbit point becomes one increment. Points that fall outside the window are dropped: the
 ''  orbit is free to wander anywhere in the disc of radius 2, and the window is smaller than that.
 
-Sub AccumulateOrbitPoint( ByVal zReal As Double, ByVal zImaginary As Double )
+Sub AccumulateOrbitPoint( ByVal zReal As Double, ByVal zImaginary As Double, _
+                          ByVal planeBase As Integer )
   Dim As Integer column = Int( (zImaginary - IMAGINARY_AXIS_MIN) * pixelsPerImaginaryUnit )
   Dim As Integer row    = Int( (zReal      - REAL_AXIS_MIN)      * pixelsPerRealUnit )
   If column >= 0 And column < imageSize And row >= 0 And row < imageSize Then
-    histogram(row * imageSize + column) = histogram(row * imageSize + column) + 1
+    Dim As Integer at = planeBase + row * imageSize + column
+    histogram(at) = histogram(at) + 1
   End If
 End Sub
 
@@ -247,18 +273,28 @@ Sub TraceOneOrbit()
     stepsTaken = stepsTaken + 1
   Loop
 
-  '' Did it get out, and did it take long enough to be interesting? (Traps 1 and 4.)
+  '' Did it get out at all? (Trap 1: this is the moment we are finally allowed to know.)
   If zRealSquared + zImaginarySquared <= ESCAPE_RADIUS_SQUARED Then Exit Sub   '' still bounded
   If stepsTaken < minimumEscapeIterations Then Exit Sub                        '' escaped too fast
+
+  '' How many channels does this orbit belong to? The ceilings are nested - blue inside green inside
+  '' red - so the answer is a count, decided once, before the replay rather than inside it.
+  Dim As Integer channels = 1
+  Dim As Integer firstChannel = 0
+  If stepsTaken <= greenCeiling Then firstChannel = 1
+  If stepsTaken <= blueCeiling  Then firstChannel = 2
 
   '' Now replay the path into the picture. Trap 3: each point counts twice, once mirrored, because
   '' the conjugate of an escaping point escapes along the mirrored path.
   orbitsAccumulated = orbitsAccumulated + 1
-  Dim As Integer i
-  For i = 0 To stepsTaken - 1
-    AccumulateOrbitPoint( orbitReal(i),  orbitImaginary(i) )
-    AccumulateOrbitPoint( orbitReal(i), -orbitImaginary(i) )
-  Next i
+  Dim As Integer i, channel, planeBase
+  For channel = firstChannel To firstChannel + channels - 1
+    planeBase = channel * pixelsPerPlane
+    For i = 0 To stepsTaken - 1
+      AccumulateOrbitPoint( orbitReal(i),  orbitImaginary(i), planeBase )
+      AccumulateOrbitPoint( orbitReal(i), -orbitImaginary(i), planeBase )
+    Next i
+  Next channel
 End Sub
 
 
@@ -266,9 +302,14 @@ End Sub
 ''  7. TONE MAPPING
 '' ================================================================================================
 ''  Trap 5. Counts span roughly three orders of magnitude across one frame, so a logarithm is what
-''  turns them into something an eye can read. The palette is a warm ramp: dark red through orange
-''  into white, which is a reasonable convention for a density map and keeps the faint outer
-''  filaments visible instead of crushing them to black.
+''  turns them into something an eye can read; a linear mapping gives a black picture with a few
+''  burnt pixels. The gamma on top of it decides how much of the faint outer structure survives.
+''
+''  ⭐ EACH CHANNEL IS NORMALISED AGAINST ITS OWN PEAK, and that is not a detail - it is the whole
+''  colour scheme. The three channels hold very different totals: red has every escaping orbit,
+''  blue only the shortest. Normalising them together would make blue almost black and throw the
+''  colour away; normalising each to itself is what turns "how long did the orbits here live?" into
+''  a hue.
 
 Dim Shared As Double toneGamma
 
@@ -283,42 +324,57 @@ Function BrightnessOf( ByVal count As LongInt, ByVal inverseLogOfPeak As Double 
   Return (Log(1.0 + count) * inverseLogOfPeak) ^ toneGamma
 End Function
 
-'' A fire ramp in three equal thirds: black to red, red to orange, orange to white. Each channel is
-'' the same straight line shifted by a third, which is why it reads as one continuous heat scale
-'' rather than three colours meeting at seams.
-Function ColourFor( ByVal brightness As Double ) As Integer
-  If brightness <= 0.0 Then Return RGB(0, 0, 0)
-  Dim As Integer red   = Int( 255.0 * ClampUnit( brightness * 3.0 ) )
-  Dim As Integer green = Int( 255.0 * ClampUnit( (brightness - 0.3333) * 3.0 ) )
-  Dim As Integer blue  = Int( 255.0 * ClampUnit( (brightness - 0.6667) * 3.0 ) )
-  Return RGB(red, green, blue)
-End Function
-
-''  ⚠️ THE COLOUR IS COMPUTED PER DISTINCT COUNT, NOT PER PIXEL, and that is a load-bearing choice
-''  rather than a micro-optimisation. Colouring pixel by pixel costs one logarithm per PIXEL, which
-''  is 160 000 of them at 400x400 - measured, that alone was larger than the whole frame budget, and
-''  it hurt the compiled engines worst, because 160 000 logarithms is also 160 000 calls. Building a
-''  table indexed by the count costs one logarithm per DISTINCT COUNT, a few thousand at most.
+''  ⚠️ THE BRIGHTNESS IS COMPUTED PER DISTINCT COUNT, NOT PER PIXEL, and that is a load-bearing
+''  choice rather than a micro-optimisation. Doing it pixel by pixel costs one logarithm per PIXEL -
+''  480 000 of them at 400x400 across three channels, measured larger than the whole frame budget.
+''  A table indexed by the count costs one logarithm per DISTINCT COUNT, a few thousand at most.
 ''  Same arithmetic, same picture, two orders of magnitude less of it.
-''  The screen and the exported file both read this table, so the two cannot disagree.
+''  One table per channel, because each has its own peak. The screen and the exported file both read
+''  these tables, so the two cannot disagree.
 
-Dim Shared As Integer colourOfCount()
+Dim Shared As Integer levelOfCount(Any, Any)    '' [channel, count] -> 0..255
 
-Sub RebuildColourTable( ByVal peak As LongInt )
-  If peak < 1 Then peak = 1
-  If UBound(colourOfCount) < peak Then ReDim colourOfCount(peak + peak \ 2)
-  Dim As Double inverseLogOfPeak = 1.0 / Log(1.0 + peak)
-  colourOfCount(0) = RGB(0, 0, 0)
-  Dim As LongInt count
-  For count = 1 To peak
-    colourOfCount(count) = ColourFor( BrightnessOf(count, inverseLogOfPeak) )
-  Next count
+Sub RebuildLevelTables()
+  Dim As Integer channel, biggest = 1
+  Dim As LongInt peak(2)
+  Dim As Integer i
+  For channel = 0 To 2
+    peak(channel) = 1
+    For i = 0 To pixelsPerPlane - 1
+      If histogram(channel * pixelsPerPlane + i) > peak(channel) Then _
+        peak(channel) = histogram(channel * pixelsPerPlane + i)
+    Next i
+    If peak(channel) > biggest Then biggest = peak(channel)
+  Next channel
+
+  If UBound(levelOfCount, 2) < biggest Then ReDim levelOfCount(2, biggest + biggest \ 2)
+  For channel = 0 To 2
+    Dim As Double inverseLogOfPeak = 1.0 / Log(1.0 + peak(channel))
+    levelOfCount(channel, 0) = 0
+    Dim As LongInt count
+    For count = 1 To peak(channel)
+      levelOfCount(channel, count) = Int( 255.0 * ClampUnit( BrightnessOf(count, inverseLogOfPeak) ) )
+    Next count
+    '' Anything above this channel's own peak cannot occur in it, but the table is shared in size.
+    For count = peak(channel) + 1 To UBound(levelOfCount, 2)
+      levelOfCount(channel, count) = 255
+    Next count
+  Next channel
 End Sub
 
-Function PeakCount() As LongInt
+Function ColourAt( ByVal pixel As Integer ) As Integer
+  Return RGB( levelOfCount(0, histogram(pixel)), _
+              levelOfCount(1, histogram(pixelsPerPlane + pixel)), _
+              levelOfCount(2, histogram(2 * pixelsPerPlane + pixel)) )
+End Function
+
+'' Only the summary line uses this now - the tone mapping finds all three peaks in one pass while
+'' it is building the tables. It reports the RED plane, which is the one holding the long-lived
+'' orbits and therefore the one whose growth says the picture is still converging.
+Function PeakRedCount() As LongInt
   Dim As LongInt peak = 0
   Dim As Integer i
-  For i = 0 To imageSize * imageSize - 1
+  For i = 0 To pixelsPerPlane - 1
     If histogram(i) > peak Then peak = histogram(i)
   Next i
   Return peak
@@ -334,7 +390,7 @@ End Function
 ''  execution engines is a comparison of the arithmetic and nothing else.
 
 Sub WritePortablePixmap( ByVal fileName As String )
-  RebuildColourTable( PeakCount() )
+  RebuildLevelTables()
 
   Dim As Integer handle = FreeFile
   Open fileName For Binary Access Write As #handle
@@ -345,7 +401,7 @@ Sub WritePortablePixmap( ByVal fileName As String )
   For y = 0 To imageSize - 1
     row = ""
     For x = 0 To imageSize - 1
-      Dim As Integer colour = colourOfCount( histogram(y * imageSize + x) )
+      Dim As Integer colour = ColourAt( y * imageSize + x )
       row += Chr((colour Shr 16) And 255) + Chr((colour Shr 8) And 255) + Chr(colour And 255)
     Next x
     Put #handle, , row
@@ -362,12 +418,12 @@ End Sub
 ''  leave the tail of the longer one it replaced standing behind it.
 
 Sub PaintFrame( ByVal topLine As String, ByVal bottomLine As String )
-  RebuildColourTable( PeakCount() )
+  RebuildLevelTables()
   Dim As Integer x, y
   ScreenLock
   For y = 0 To imageSize - 1
     For x = 0 To imageSize - 1
-      PSet (x, y + TEXT_BAND_HEIGHT), colourOfCount( histogram(y * imageSize + x) )
+      PSet (x, y + TEXT_BAND_HEIGHT), ColourAt( y * imageSize + x )
     Next x
   Next y
   Line (0, 0)-(imageSize - 1, TEXT_BAND_HEIGHT - 1), RGB(0, 0, 0), BF
@@ -398,13 +454,13 @@ Sub PrintUsage()
   Print
   Print "  seed=N      random seed                            (default 2463534242)"
   Print "  size=N      image is N by N pixels                 (default 400)"
-  Print "  min=N       ignore orbits escaping in under N steps (default 20)"
-  Print "  max=N       iteration ceiling                      (default 2000)"
+  Print "  min=N       ignore orbits escaping in under N steps (default 0)"
+  Print "  max=N       red channel ceiling; green is a tenth, blue a hundredth (default 5000)"
   Print "  label=TEXT  name shown in the overlay              (default ENGINE)"
   Print "  secs=N      live mode: stop after N seconds        (default 0 = until Q)"
   Print "  still=N     compute N orbits, write a file, exit   (no window)"
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
-  Print "  gamma=N     tone curve applied after the log        (default 2.2)"
+  Print "  gamma=N     tone curve applied after the log        (default 4.5)"
   Print "  fps=N       frames per second to hold                 (default 60)"
   Print
   Print "Keys while running:  SPACE pause   R restart   S save a still   Q quit"
@@ -421,22 +477,31 @@ If ArgumentValue("help", "") <> "" Then
 End If
 
 imageSize               = CInt( ArgumentValue("size", "400") )
-minimumEscapeIterations = CInt( ArgumentValue("min",  "20") )
-maximumIterations       = CInt( ArgumentValue("max",  "2000") )
+minimumEscapeIterations = CInt( ArgumentValue("min",  "0") )
+maximumIterations       = CInt( ArgumentValue("max",  "5000") )
 Dim As LongInt seed     = CLngInt( ArgumentValue("seed", "2463534242") )
 Dim As String  label    = ArgumentValue("label", "ENGINE")
 Dim As LongInt stillOrbits = CLngInt( ArgumentValue("still", "0") )
 Dim As String  outputName  = ArgumentValue("out", "buddhabrot.ppm")
 Dim As Double  runSeconds  = CDbl( ArgumentValue("secs", "0") )
-toneGamma = CDbl( ArgumentValue("gamma", "2.2") )
+toneGamma = CDbl( ArgumentValue("gamma", "4.5") )
 Dim As Double targetFrameSeconds = 1.0 / CDbl( ArgumentValue("fps", Str(DEFAULT_FRAMES_PER_SECOND)) )
 
 If maximumIterations > ITERATION_CEILING Then maximumIterations = ITERATION_CEILING
 
-ReDim histogram(imageSize * imageSize - 1)
+'' The two inner ceilings, a decade apart, which is the proportion the classic three-pass version
+'' uses (5000 / 500 / 50). Deriving them from max= keeps one knob instead of three: raising the
+'' ceiling deepens all three channels together, which is what anyone turning that dial means.
+greenCeiling = maximumIterations \ 10
+blueCeiling  = maximumIterations \ 100
+If greenCeiling < 2 Then greenCeiling = 2
+If blueCeiling  < 1 Then blueCeiling  = 1
+
+pixelsPerPlane = imageSize * imageSize
+ReDim histogram(3 * pixelsPerPlane - 1)
+ReDim levelOfCount(2, 4095)
 pixelsPerImaginaryUnit = imageSize / (IMAGINARY_AXIS_MAX - IMAGINARY_AXIS_MIN)
 pixelsPerRealUnit      = imageSize / (REAL_AXIS_MAX - REAL_AXIS_MIN)
-ReDim colourOfCount(4095)
 SeedRandom(seed)
 orbitsTraced = 0
 orbitsAccumulated = 0
@@ -451,7 +516,7 @@ If stillOrbits > 0 Then
   WritePortablePixmap(outputName)
   Print "orbits traced      : "; orbitsTraced
   Print "orbits accumulated : "; orbitsAccumulated
-  Print "peak pixel count   : "; PeakCount()
+  Print "peak pixel count   : "; PeakRedCount()
   Print "seconds            : "; took
   Print "orbits per second  : "; Int(orbitsTraced / took)
   Print "written            : "; outputName
@@ -509,7 +574,7 @@ Do
   If key = " " Then paused = 1 - paused
   If key = "r" Then
     Dim As Integer i
-    For i = 0 To imageSize * imageSize - 1 : histogram(i) = 0 : Next i
+    For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer
   End If
   If key = "s" Then WritePortablePixmap(outputName)
@@ -537,14 +602,18 @@ Print "written           : "; outputName
 '' ================================================================================================
 ''
 ''  * REPAINT ONLY WHAT CHANGED. PaintFrame writes every pixel every frame. Keeping a shadow copy of
-''    the last colour drawn and skipping unchanged pixels would cut most of that, and it matters
-''    more than it looks: a full 400x400 repaint costs about 0.75 ms under the interpreter and the
-''    JIT but about 9.5 ms under AOT, which is a fifth of a 50 ms frame. It needs a second full-size
-''    buffer and a comparison in the inner loop.
+''    the last colour drawn and skipping unchanged pixels would cut most of that. It needs a second
+''    full-size buffer and a comparison in the inner loop, and since PSet became an inline store in
+''    the AOT backend a full 400x400 repaint is 0.17 ms - there is not much left to win.
 ''
-''  * INCREMENTAL PEAK. PeakCount rescans the whole histogram once per frame to find the brightest
-''    pixel. The peak only ever grows, so it could be maintained as orbits are accumulated. Left
-''    out because the rescan is a plain loop anyone can read and the saving is under a millisecond.
+''  * INCREMENTAL PEAKS. RebuildLevelTables rescans all three planes once per frame to find each
+''    channel's brightest pixel. A peak only ever grows, so it could be maintained as orbits are
+''    accumulated. Left out because the rescan is a plain loop anyone can read.
+''
+''  * A PERCENTILE INSTEAD OF THE PEAK. Each channel is normalised against its own maximum, so one
+''    freakishly bright pixel would dim everything else. Normalising against, say, the 99.9th
+''    percentile and clipping above it is more robust and is what photo software does. It has not
+''    been needed: the log curve already compresses the top end hard.
 ''
 ''  * METROPOLIS-HASTINGS SAMPLING. Instead of drawing c uniformly, mutate a c that is known to
 ''    produce a long orbit and accept or reject the mutation. It converges far faster at deep zoom.
