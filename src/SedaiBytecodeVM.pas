@@ -968,6 +968,35 @@ var
   // a loop costs nothing at all.
   GHotCDiag: Boolean = False;
   GHotCReported: Boolean = False;
+  // AOTC_DIAG=1 is the AOT's counterpart, and the plan in job/markdown/AOT-PRESTAZIONI.md asks for
+  // it BEFORE any further lowering: it counts, per opcode, how many times a COMPILED region handed
+  // the instruction back through AotExecOne. Every one of those costs the ~22-27 ns of flushing
+  // every allocated register and reloading it (AotHelperCall), so the ranking is the work list,
+  // ordered - and it is the only honest way to pick the next opcode. A STATIC census cannot answer
+  // it: measured 1 Sep 2026, the helper share of a pixel loop read 5.0% statically and 5.4%
+  // loop-weighted on a region that ran 14.6x SLOWER compiled. The question is never how many
+  // instructions, it is how much they COST, and only a runtime count knows.
+  // ⛔ The JIT calls this same helper (its J14 route) and is counted APART: it passes nil for the
+  // AOT context where the AOT passes its record, which is what tells the two callers apart. Mixing
+  // them would rank an opcode the AOT never leaves on.
+  // ⚠️ Increments are not atomic, exactly as HOTC_DIAG's are not. With worker threads running the
+  // total can be short by a few; a RANKING survives that, an exact count does not, and the report
+  // says so rather than letting the number be trusted.
+  GAotcDiag: Boolean = False;
+  GAotcReported: Boolean = False;
+  GAotcCalls: Int64 = 0;      // helper calls out of AOT-compiled code
+  GAotcJitCalls: Int64 = 0;   // ...and out of JIT-compiled loops, ranked separately (see above)
+  GAotcNoProg: Int64 = 0;     // counted but unattributable (no program loaded) - a self-check
+  GAotcHelp: array[0..65535] of Int64;
+  // ⛔⛔ THE DENOMINATOR, and without it a zero MEANS TWO OPPOSITE THINGS. A counter sitting on the
+  // helper sees an instruction LEAVING compiled code; it cannot see one that stopped the region from
+  // being compiled at all, because a refused region calls no helper. Measured 2 Sep 2026 on
+  // job/tests/bench/multidim_index.bas - the very program this campaign has open as "48x too slow" -
+  // the census printed ZERO exits, and the reason is that SedaiAot REFUSES the whole region that
+  // contains a runtime multi-dimensional index. Read alone, that zero says "nothing left to do" on
+  // the one program where there is most to do. So the report prints how many regions were compiled,
+  // and names AOT_DIAG=1 - which reports the BAILS - as the other half of the question.
+  GAotcRegions: Int64 = 0;
   GHotCCalls: Int64 = 0;    // how many times the C loop was entered
   GHotCBudgetExits: Int64 = 0;  // ...of which returned because the BACK-EDGE BUDGET ran out, which
                                 // is NOT an uncovered opcode and must not be ranked as one
@@ -1415,6 +1444,7 @@ begin
   GArrPrivDiag := GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
   GRecDiag := GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
+  GAotcDiag := GetEnvironmentVariable('AOTC_DIAG') = '1';
   GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
   // PAIR_DIAG=1 (the old spelling, top 20) | PAIR_DIAG=all | PAIR_DIAG=<n>
   PairDiagEnv := LowerCase(Trim(GetEnvironmentVariable('PAIR_DIAG')));
@@ -10149,6 +10179,19 @@ begin
   // arrive here, and enumerating them is exactly the list that would go stale - so every helper
   // call invalidates, and the PSET slow path rebuilds. One store against a helper round trip.
   if (AotCtx <> nil) and (AotCtx^.GfxDesc <> nil) then AotCtx^.GfxDesc[0] := 0;
+  // AOTC_DIAG=1: charge this exit to the opcode that caused it. Read BEFORE ExecuteInstruction,
+  // because the instruction may change the PC. Off by default, and the test costs a predicted
+  // branch against a round trip that already costs ~25 ns.
+  if GAotcDiag then
+  begin
+    if AotCtx = nil then Inc(GAotcJitCalls)          // the JIT's J14 route - not this census
+    else if VM.FProgram = nil then Inc(GAotcNoProg)  // cannot name the opcode: counted, not ranked
+    else
+    begin
+      Inc(GAotcCalls);
+      Inc(GAotcHelp[PInstr(VM.FProgram.GetInstructionsPtr)[PC].OpCode]);
+    end;
+  end;
   try
     C.PC := PC;
     {$IFDEF DEBUG_AOTTRACE}
@@ -11493,6 +11536,7 @@ begin
     Mem.Free;
     Exit;
   end;
+  Inc(GAotcRegions);   // AOTC_DIAG's denominator - see the note on GAotcRegions
   if Length(FNativeFuncs) <> FProgram.GetInstructionCount then
   begin
     for i := 0 to High(FNativeFuncs) do FNativeFuncs[i].Free;
@@ -18488,6 +18532,84 @@ begin
     WriteLn(ErrOutput, '[HOTC]   ', GHotCExit[Idx[i]]:12, '  ', OpcodeToString(Word(Idx[i])));
 end;
 
+procedure ReportAotHelperExits;
+// The AOTC_DIAG census: which opcode makes COMPILED code leave, and how often. Printed once at
+// shutdown so it covers every engine and every thread that ran, to stderr so it never mixes with a
+// program's own output.
+//
+// ⭐ THE RANKING IS THE ANSWER, and the yield column is what turns a count into a decision: it is
+// what covering that opcode would give back, not what the opcode costs.
+//
+// ⛔ THE CONSTANT IS 55 ns, AND IT IS NOT THE 22-27 ns THIS PROJECT HAD WRITTEN DOWN. That figure is
+// the flush-and-reload SURROUND alone; a closure also stops paying the re-entry into the interpreter
+// and the arm itself, so it gives back about twice as much. Measured 2 Sep 2026 on two independent
+// families, with this very counter naming the call count and the clock naming the time:
+//   math    (leaf lowering, AOT_MATH=0 vs on)      8 000 000 calls, 430 ms  ->  54 ns/call
+//   PSet    (inline lowering, AOT_GFXPSET=0 vs on) 3 750 000 calls, 237 ms  ->  63 ns/call
+// ⚠️ IT IS AN UPPER BOUND, and only for an opcode whose own work is SMALL. Cover something whose
+// real work is a file write or an allocation and the work stays: what you get back is the surround,
+// not the whole 55 ns. That is the same question §3 of AOT-PRESTAZIONI.md asks as INLINE-or-LEAF,
+// and this column does not answer it - it says which opcodes are worth ASKING it about.
+// ⭐ AOTC_NS=<n> overrides the constant, so a different machine can re-calibrate without a rebuild.
+var
+  i, j, n: Integer;
+  Idx: array of Integer;
+  t: Integer;
+  Tot, NsPer: Int64;
+begin
+  if (not GAotcDiag) or GAotcReported then Exit;
+  GAotcReported := True;
+  NsPer := StrToInt64Def(Trim(GetEnvironmentVariable('AOTC_NS')), 55);
+  if NsPer <= 0 then NsPer := 55;
+  SetLength(Idx, 0);
+  Tot := 0;
+  for i := 0 to High(GAotcHelp) do
+    if GAotcHelp[i] > 0 then
+    begin
+      n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i;
+      Tot := Tot + GAotcHelp[i];
+    end;
+  WriteLn(ErrOutput, '[AOTC] AOT-compiled regions = ', GAotcRegions,
+          ' | helper calls out of AOT code = ', GAotcCalls,
+          '  (up to ', (GAotcCalls * NsPer) div 1000, ' us to win back, at ~', NsPer, ' ns each)');
+  if GAotcJitCalls > 0 then
+    WriteLn(ErrOutput, '[AOTC] ...plus ', GAotcJitCalls,
+            ' from the JIT J14 route: NOT in this ranking (the JIT passes no AOT context)');
+  if GAotcNoProg > 0 then
+    WriteLn(ErrOutput, '[AOTC] !! ', GAotcNoProg, ' calls with no program loaded: counted, not attributable');
+  // ⛔ The self-check. Two counters filled at the same site must agree, or the census is reading a
+  // different thing from what it counts - and a ranking nobody can cross-check is a ranking nobody
+  // should act on. With worker threads a small shortfall is the non-atomic Inc, not a defect.
+  if Tot <> GAotcCalls then
+    WriteLn(ErrOutput, '[AOTC] !! per-opcode sum ', Tot, ' <> total ', GAotcCalls,
+            ' (short by ', GAotcCalls - Tot, ': the non-atomic Inc across threads, or a defect)');
+  if Length(Idx) = 0 then
+  begin
+    if GAotcRegions = 0 then
+      WriteLn(ErrOutput, '[AOTC] !! NO REGION WAS COMPILED: the exits are zero because there is no ',
+              'compiled code to exit FROM, not because everything went native. AOT_DIAG=1 prints the BAIL reason.')
+    else
+      WriteLn(ErrOutput, '[AOTC] no exits: every instruction of the ', GAotcRegions,
+              ' compiled regions went native');
+    Exit;
+  end;
+  // ⚠️ Even with exits to show, this ranking covers only what was COMPILED. An opcode that makes the
+  // region BAIL appears here at no count at all - that half of the question is AOT_DIAG=1.
+  WriteLn(ErrOutput, '[AOTC] !! this ranking only sees what the AOT COMPILED: an opcode that makes ',
+          'the region BAIL never appears here at any count (AOT_DIAG=1 prints the bails).');
+  for i := 0 to High(Idx) - 1 do
+    for j := i + 1 to High(Idx) do
+      if GAotcHelp[Idx[j]] > GAotcHelp[Idx[i]] then
+      begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
+  WriteLn(ErrOutput, '[AOTC] exits to the interpreter per opcode (', Length(Idx), ' distinct opcodes):');
+  WriteLn(ErrOutput, '[AOTC]            count   share   ~max win  opcode');
+  for i := 0 to High(Idx) do
+    WriteLn(ErrOutput, '[AOTC]   ', GAotcHelp[Idx[i]]:12,
+            '  ', ((GAotcHelp[Idx[i]] * 1000) div Tot) / 10:5:1, '%',
+            '  ', ((GAotcHelp[Idx[i]] * NsPer) div 1000):8, ' us  ',
+            OpcodeToString(Word(Idx[i])));
+end;
+
 
 initialization
   if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
@@ -18506,6 +18628,7 @@ initialization
   StrCapacityInit;
   if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
   AddExitProc(@ReportHotCExits);
+  AddExitProc(@ReportAotHelperExits);
   AddExitProc(@ReportSuperCounts);
   AddExitProc(@ReportPairCounts);
 
