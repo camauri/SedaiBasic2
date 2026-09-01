@@ -264,6 +264,11 @@ End Sub
 '' all of it has bitten this project before. A still is a sanity check that the maths is not garbage.
 '' It is never a sign-off on a visual phase: for that, render the video.
 Sub DumpFrame( ByVal fname As String )
+#if __SB_WASM__
+  '' ⛔ A module has no filesystem, and the backend says so itself rather than emitting
+  '' something that runs and lies. The body is ABSENT here, not merely unreached: an opcode
+  '' is refused for being present in the program, not for being executed.
+#else
   Dim As Integer fh = FreeFile
   Open fname For Binary Access Write As #fh
   Dim As String hdr = "P6" + Chr(10) + Str(N) + " " + Str(N) + Chr(10) + "255" + Chr(10)
@@ -278,7 +283,29 @@ Sub DumpFrame( ByVal fname As String )
     Put #fh, , row
   Next y
   Close #fh
+#endif
 End Sub
+
+#if __SB_WASM__
+'' ---- the browser build ---------------------------------------------------------------------------
+''  ⛔ THE MODULE MUST NOT OWN THE LOOP. A module that ran until a key was pressed would freeze the
+''  tab: there is no key, and nothing else gets to run while a WebAssembly call is on the stack. So
+''  `main` builds the palette, opens the screen and draws ONE frame, and the page calls
+''  PROC_STEPFRAME once per animation tick. The voxel-landscape and Buddhabrot demos are driven the
+''  same way, for the same reason.
+''
+''  ⭐ AND THE PHASE COMES FROM THE FRAME NUMBER, not from the clock. Natively `t` advances by real
+''  elapsed time, which is right on a screen - the figure turns at the same speed whatever the frame
+''  rate - and wrong here for a reason worth stating: it would make the render depend on how fast the
+''  machine happens to be, and the whole point of a page anyone can open is that everyone sees the
+''  same thing. A frame index makes it reproducible, and the sixtieth is the rate the native demo is
+''  tuned against, so the figure turns at the speed it was designed to turn at.
+Sub StepFrame( ByVal f As Integer )
+  Dim As Double t = PHASE_RATE * f / 60.0
+  Line (0, 0)-(N - 1, N - 1), 0, BF     '' ⛔ NOT Cls - see the note in the main loop below
+  DrawFrame(t)
+End Sub
+#endif
 
 '' ---- main --------------------------------------------------------------------------------------
 Dim As Integer maxFrames = 0            '' 0 = run until a key is pressed
@@ -290,6 +317,12 @@ If Len(Command(4)) > 0 Then phaseRate = Val(Command(4))
 
 BuildPalette()
 ScreenRes N, N, 32
+
+#if __SB_WASM__
+'' One frame so the canvas is never blank, then hand back to the page, which owns the clock.
+StepFrame(0)
+End
+#endif
 
 '' t starts wherever the clock happens to be. The figure has no privileged phase, and seeding it to a
 '' constant would make every run of the demo open on the same picture - which looks like a still.
@@ -311,7 +344,11 @@ Do
   '' ScreenLock/ScreenUnlock brackets the whole frame so the display is updated once, not 62 500
   '' times. Without it the demo is not slower - it TEARS, and tearing is one of the defects a still
   '' cannot show.
+  '' ⛔ Compiled OUT of the browser build: there is no presenter to hold back, and the page reads the
+  '' framebuffer out of linear memory when it is ready - which is after the frame returns.
+#if __SB_WASM__ = 0
   ScreenLock
+#endif
   '' ⛔ NOT Cls. In this dialect Cls clears to the CURRENT background colour, and in a Commodore-
   '' derived BASIC that default is blue - which is exactly what the first render of this demo showed:
   '' a blue disc on a blue field. The reference builds its frame over a zeroed buffer, i.e. BLACK, and
@@ -323,11 +360,15 @@ Do
   '' own background, so anything already drawn underneath it is erased. Drawn first, it would simply
   '' disappear under the next Cls-and-draw.
   '' It is also suppressed for the first few frames, while the smoothed average is still meaningless.
+  '' ⛔ And the readout with it: in a browser the frame rate is the PAGE's to measure and to show,
+  '' and it can measure it better - it owns the clock the frames are actually delivered on.
+#if __SB_WASM__ = 0
   If frame > 8 Then
     Locate 1, 1
     Print Using "###.# fps   worst ##.# ms"; fps; worst
   End If
   ScreenUnlock
+#endif
 
   Dim As Double t1 = Timer
   Dim As Double dt = t1 - tPrev          '' wall time this frame really took, including the display
