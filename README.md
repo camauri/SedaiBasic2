@@ -23,7 +23,7 @@
 **[Buddhabrot](bas/demo/buddhabrot/README.md)** — a density map of the orbits that escape the
 Mandelbrot set, converging out of noise in real time (that is the demo above, sped up). It is the demo to look at first, because it is
 the one that shows what the engines do: the same program, the same seed and the same frame rate under
-the bytecode interpreter, the JIT and the AOT compiler, and **about four times as much picture per
+the bytecode interpreter, the JIT and the AOT compiler, and **about ten times as much picture per
 second** on the last of them. The source is meant to be read — the whole algorithm is one subroutine
 that fits on a screen.
 
