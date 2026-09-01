@@ -593,16 +593,24 @@ If stillOrbits > 0 Then
   '' how the convergence recording is made: one run, every frame from the same orbits, so the film
   '' is the SAME computation the final picture came from rather than N runs that happen to agree.
   ''
-  '' ⚠️ The frames are spaced GEOMETRICALLY, not evenly. Convergence is fast at the start and slow
-  '' at the end - a picture at two million orbits differs from one at one million far more than
-  '' twenty million differs from nineteen. Evenly spaced frames spend most of the film on the part
-  '' where nothing visibly changes.
+  '' ⚠️ THE SPACING IS THE DIFFERENCE BETWEEN A FILM AND A SLIDESHOW, and evenly spaced frames are
+  '' the wrong answer twice over. Convergence is fast at the start and slow at the end: a picture at
+  '' two million orbits differs from one at one million far more than twenty million differs from
+  '' nineteen, so even spacing spends nearly its whole length on the part where nothing changes.
+  ''
+  '' Frame k of N is taken at  still * (k/N)^p , with p chosen so the first frame lands at a
+  '' FIVE-THOUSANDTH of the finish. ⚠️ A five-hundredth was the first try and it starts the film with
+  '' the figure already recognisable - which throws away the best part, the emergence out of noise. Two things follow, and both are what the eye wants:
+  ''   - early frames are close together in ORBITS and far apart in appearance;
+  ''   - the relative step is p/k, so it shrinks as the film runs and the picture SETTLES rather
+  ''     than being cut off mid-climb. A purely geometric ratio - which is what this did first -
+  ''     keeps the step constant to the last frame, and the film ends still visibly moving.
   Dim As Integer frameCount = CInt( ArgumentValue("series", "0") )
   Dim As Integer frameIndex = 0
-  Dim As Double  frameRatio = 0.0, nextFrameAt = 0.0
+  Dim As Double  framePower = 1.0, nextFrameAt = 0.0
   If frameCount > 0 Then
-    frameRatio  = (500.0) ^ (1.0 / frameCount)      '' first frame at a five-hundredth of the finish
-    nextFrameAt = stillOrbits / 500.0
+    framePower  = Log(5000.0) / Log(CDbl(frameCount))
+    nextFrameAt = stillOrbits * ((1.0 / CDbl(frameCount)) ^ framePower)
   End If
 
   Do While orbitsTraced < stillOrbits
@@ -610,8 +618,11 @@ If stillOrbits > 0 Then
     If frameCount > 0 And orbitsTraced >= nextFrameAt Then
       frameIndex = frameIndex + 1
       WritePortablePixmap( outputName + "_" + Right("000" + Str(frameIndex), 3) + ".ppm" )
-      nextFrameAt = nextFrameAt * frameRatio
-      If frameIndex >= frameCount Then nextFrameAt = stillOrbits * 2.0   '' no more
+      If frameIndex >= frameCount Then
+        nextFrameAt = stillOrbits * 2.0                                  '' no more
+      Else
+        nextFrameAt = stillOrbits * ((CDbl(frameIndex + 1) / CDbl(frameCount)) ^ framePower)
+      End If
     End If
   Loop
   Dim As Double took = Timer - startedAt

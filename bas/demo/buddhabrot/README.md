@@ -16,9 +16,16 @@ a seated figure, which is where the name comes from.
   <img src="convergence.gif" alt="The Buddhabrot converging out of noise" width="380">
 </p>
 
-<p align="center"><em>One run, 60 million orbits, 28 frames taken along the way. The spacing is
-geometric because convergence is not: the first half of the film covers the first two per cent of
-the work.</em></p>
+<p align="center"><em>One run, 80 million orbits, 48 frames taken along the way — the first at a
+five-thousandth of the finish.</em></p>
+
+The frames are spaced so that frame <em>k</em> of <em>N</em> falls at <code>(k/N)<sup>p</sup></code>
+of the total, and that shape is doing two jobs. Convergence is fast at the start and slow at the
+end, so evenly spaced frames would spend nearly the whole film on the part where nothing changes.
+And the relative step shrinks as it runs, so the picture **settles** instead of being cut off
+mid-climb: measured, the mean brightness moves by about +6 per frame at the start and +0.3 at the
+end. A constant ratio — which is what this did first — keeps the step even to the last frame, and
+the film ends still visibly moving.
 
 **The colour is a third question, not a palette.** Each channel counts a different band of orbit
 lifetime: blue holds the ones that died within fifty steps, green fifty to five hundred, red
