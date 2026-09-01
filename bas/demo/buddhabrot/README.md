@@ -1,7 +1,7 @@
 # Buddhabrot
 
 <p align="center">
-  <img src="buddhabrot.png" alt="Buddhabrot rendered by SedaiBasic: a seated figure in red and yellow on black" width="600">
+  <img src="buddhabrot.png" alt="Buddhabrot rendered by SedaiBasic: a seated figure in blue, green and orange on black" width="600">
 </p>
 
 <p align="center"><em>150 million orbits, 1000×1000, rendered by <code>buddhabrot.bas</code> in under two minutes.</em></p>
@@ -11,6 +11,14 @@ different question — **where do the escaping orbits go on their way out?** —
 throwing millions of random points at the plane, following the ones that escape, and counting how
 often each pixel is passed through. The result is a density map. Turned a quarter turn, it looks like
 a seated figure, which is where the name comes from.
+
+<p align="center">
+  <img src="convergence.gif" alt="The Buddhabrot converging out of noise" width="380">
+</p>
+
+<p align="center"><em>One run, 60 million orbits, 28 frames taken along the way. The spacing is
+geometric because convergence is not: the first half of the film covers the first two per cent of
+the work.</em></p>
 
 **The colour is a third question, not a palette.** Each channel counts a different band of orbit
 lifetime: blue holds the ones that died within fifty steps, green fifty to five hundred, red
@@ -91,7 +99,8 @@ bin/x86_64-linux/sb bas/demo/buddhabrot/buddhabrot.bas --aot still=20000000 out=
 ```
 
 `still=` traces a fixed number of orbits, writes a binary PPM and exits. Every image on this page was
-made that way. Run `... buddhabrot.bas help=1` for the full argument list.
+made that way; `series=N` adds N numbered stills along the route, which is how the film above was
+made — one run, so every frame comes from the same orbits as the last one. Run `... buddhabrot.bas help=1` for the full argument list.
 
 ## The three engines are one binary
 

@@ -527,6 +527,7 @@ Sub PrintUsage()
   Print "  secs=N      live mode: stop after N seconds        (default 0 = until Q)"
   Print "  still=N     compute N orbits, write a file, exit   (no window)"
   Print "  out=FILE    where still= writes                    (default buddhabrot.ppm)"
+  Print "  series=N    also write N numbered stills on the way, spaced geometrically"
   Print "  gamma=N     tone curve applied after the log        (default 4.5)"
   Print "  palette=X   nebula | aurora | ember                  (default nebula)"
   Print "  fps=N       frames per second to hold                 (default 60)"
@@ -587,8 +588,31 @@ orbitsAccumulated = 0
 '' ---- still mode: no window, fixed work, one file. This is what the determinism check runs. -----
 If stillOrbits > 0 Then
   Dim As Double startedAt = Timer
+
+  '' series=N writes N numbered stills on the way to the finish instead of one at the end, which is
+  '' how the convergence recording is made: one run, every frame from the same orbits, so the film
+  '' is the SAME computation the final picture came from rather than N runs that happen to agree.
+  ''
+  '' ⚠️ The frames are spaced GEOMETRICALLY, not evenly. Convergence is fast at the start and slow
+  '' at the end - a picture at two million orbits differs from one at one million far more than
+  '' twenty million differs from nineteen. Evenly spaced frames spend most of the film on the part
+  '' where nothing visibly changes.
+  Dim As Integer frameCount = CInt( ArgumentValue("series", "0") )
+  Dim As Integer frameIndex = 0
+  Dim As Double  frameRatio = 0.0, nextFrameAt = 0.0
+  If frameCount > 0 Then
+    frameRatio  = (500.0) ^ (1.0 / frameCount)      '' first frame at a five-hundredth of the finish
+    nextFrameAt = stillOrbits / 500.0
+  End If
+
   Do While orbitsTraced < stillOrbits
     TraceOneOrbit()
+    If frameCount > 0 And orbitsTraced >= nextFrameAt Then
+      frameIndex = frameIndex + 1
+      WritePortablePixmap( outputName + "_" + Right("000" + Str(frameIndex), 3) + ".ppm" )
+      nextFrameAt = nextFrameAt * frameRatio
+      If frameIndex >= frameCount Then nextFrameAt = stillOrbits * 2.0   '' no more
+    End If
   Loop
   Dim As Double took = Timer - startedAt
   WritePortablePixmap(outputName)

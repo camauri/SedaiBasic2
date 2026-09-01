@@ -16,12 +16,12 @@
 
 <p align="center">
   <a href="bas/demo/buddhabrot/README.md">
-    <img src="bas/demo/buddhabrot/buddhabrot.png" alt="Buddhabrot rendered by SedaiBasic" width="420">
+    <img src="bas/demo/buddhabrot/convergence.gif" alt="A Buddhabrot converging out of noise, rendered by SedaiBasic" width="380">
   </a>
 </p>
 
 **[Buddhabrot](bas/demo/buddhabrot/README.md)** — a density map of the orbits that escape the
-Mandelbrot set, converging out of noise in real time. It is the demo to look at first, because it is
+Mandelbrot set, converging out of noise in real time (that is the demo above, sped up). It is the demo to look at first, because it is
 the one that shows what the engines do: the same program, the same seed and the same frame rate under
 the bytecode interpreter, the JIT and the AOT compiler, and **about four times as much picture per
 second** on the last of them. The source is meant to be read — the whole algorithm is one subroutine
