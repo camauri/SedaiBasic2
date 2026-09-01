@@ -4,13 +4,19 @@
   <img src="buddhabrot.png" alt="Buddhabrot rendered by SedaiBasic: a seated figure in red and yellow on black" width="600">
 </p>
 
-<p align="center"><em>60 million orbits, 800×800, rendered by <code>buddhabrot.bas</code> in about 19 seconds.</em></p>
+<p align="center"><em>150 million orbits, 1000×1000, rendered by <code>buddhabrot.bas</code> in under two minutes.</em></p>
 
 The usual Mandelbrot picture colours each point by how long it takes to escape. This one asks a
 different question — **where do the escaping orbits go on their way out?** — and answers it by
 throwing millions of random points at the plane, following the ones that escape, and counting how
 often each pixel is passed through. The result is a density map. Turned a quarter turn, it looks like
 a seated figure, which is where the name comes from.
+
+**The colour is a third question, not a palette.** Each channel counts a different band of orbit
+lifetime: blue holds the ones that died within fifty steps, green fifty to five hundred, red
+everything longer. Nine escaping orbits in ten die young and are barely more than the random point
+they started from — so the flat haze that used to swamp a single-channel render now has somewhere to
+go, and it goes to blue. The structure is red because only red has it.
 
 The demo exists to make one thing visible: **how much faster SedaiBasic's compiled engines are than
 its bytecode interpreter.** Every frame gets the same slice of wall-clock time whichever engine is
