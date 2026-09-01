@@ -661,6 +661,12 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
     SeedRandom(browserSeed) : orbitsTraced = 0 : orbitsAccumulated = 0
   End If
+  '' ⛔ AND THE MODULE SAYS WHERE THE VIEW IS, rather than letting the page work it out. The page has
+  '' no other way to know - a Sub returns nothing - and the alternative is for the page to keep its
+  '' own copy of the mapping from a pixel to the plane, which is a SECOND description of the one
+  '' thing this file is careful to describe once. Printing it costs a line per command, and it is
+  '' also what tells the reader that a tap landed at all when the fresh window is still nearly empty.
+  Print "view "; HOME_HALF_SPAN / viewHalfSpan; " "; viewCentreReal; " "; viewCentreImaginary
 End Sub
 #endif
 
