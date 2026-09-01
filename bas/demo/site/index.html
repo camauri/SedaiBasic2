@@ -87,8 +87,12 @@
           background: var(--panel); display: flex; flex-direction: column;
           transition: border-color .15s; }
   .card:hover { border-color: var(--accent); }
-  .card img { display: block; width: 100%; height: 190px; object-fit: cover; background: #000;
-              border-bottom: 1px solid var(--edge); }
+  /* ⛔ Each card image is ALREADY the card's aspect ratio, framed where its own subject is - so
+     this crops nothing. Letting CSS take a band out of the middle of a square is how Bubble
+     Universe's card came out 72% black: on a sparse figure the centre is the emptiest place there
+     is, and the demo it was meant to advertise looked like an empty rectangle. */
+  .card img { display: block; width: 100%; aspect-ratio: 700 / 420; object-fit: cover;
+              background: #000; border-bottom: 1px solid var(--edge); }
   .card .body { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
   .card h3 { margin: 0; font: 600 16px/1.3 var(--mono); }
   .card h3 a { text-decoration: none; color: var(--ink); }
@@ -113,7 +117,7 @@
 <div class="cards">
 
   <div class="card">
-    <img src="buddhabrot/buddhabrot.png" alt="The Buddhabrot: a seated figure in blue, green and orange on black">
+    <img src="buddhabrot/card.png" alt="The Buddhabrot: the seated figure in blue, green and gold on black">
     <div class="body">
       <h3><a href="buddhabrot/index.html">Buddhabrot</a></h3>
       <p>Where do the escaping orbits <em>go</em> on their way out? Millions of random points, a
@@ -126,7 +130,7 @@
   </div>
 
   <div class="card">
-    <img src="bubble_universe/bubble_universe.png" alt="Bubble Universe: interleaved spirals in green and gold on black">
+    <img src="bubble_universe/card.png" alt="Bubble Universe: dense interleaved spirals in green, blue and magenta on black">
     <div class="body">
       <h3><a href="bubble_universe/index.html">Bubble Universe</a></h3>
       <p>62,500 points a frame, each placed by a pair of phasors fed back from the point before it.
@@ -139,7 +143,7 @@
   </div>
 
   <div class="card">
-    <img src="voxel_landscape/voxel_landscape.png" alt="A voxel-rendered landscape under a hazy horizon">
+    <img src="voxel_landscape/card.png" alt="A voxel-rendered landscape: green ridges under a hazy blue horizon">
     <div class="body">
       <h3><a href="voxel_landscape/index.html">Voxel Landscape</a></h3>
       <p>No polygons, no depth buffer. A heightmap drawn one column at a time, front to back, with
