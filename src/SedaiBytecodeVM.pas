@@ -10057,6 +10057,50 @@ end;
 
   Emitted code reaches it through TAotCtx.ExecOne - never a baked address, so a worker
   thread running the same compiled function passes its own VM/context pair. }
+{ ================================================================================================
+  C9: the MATH family as leaf calls.
+
+  ⛔ THESE ARE SHIMS, NOT IMPLEMENTATIONS. Each one calls the SAME function ExecuteMathOp's own arm
+  calls, on purpose: the comment on c_sin/c_cos/c_tan above says every entry point must use these or
+  the same program answers differently depending on which engine ran it, and this is now the FOURTH
+  entry point (the interpreter's arm, ComputeBuiltinFP, hotdisp.c, and here). A shim that reached
+  for FPC's Sin instead of c_sin would be exactly that divergence, and it would be silent.
+
+  ⛔ Only arms that are ONE unguarded call are here. ACOS, ASIN, ACOSH, ATANH and ROUND carry domain
+  tests, and a shim would be a second copy of the guard - they stay on the runtime helper.
+
+  Guard: job/tests/bas/math_aot_native.bas compares every one of them across all four engine
+  configurations, which is what catches a wrong table index - a wrong ANSWER, not a crash.
+  ================================================================================================ }
+function AotMathSin  (x: Double): Double; cdecl; begin Result := c_sin(x); end;
+function AotMathCos  (x: Double): Double; cdecl; begin Result := c_cos(x); end;
+function AotMathTan  (x: Double): Double; cdecl; begin Result := c_tan(x); end;
+function AotMathAtn  (x: Double): Double; cdecl; begin Result := ArcTan(x); end;
+function AotMathExp  (x: Double): Double; cdecl; begin Result := Exp(x); end;
+function AotMathSinh (x: Double): Double; cdecl; begin Result := Math.Sinh(x); end;
+function AotMathCosh (x: Double): Double; cdecl; begin Result := Math.Cosh(x); end;
+function AotMathTanh (x: Double): Double; cdecl; begin Result := Math.Tanh(x); end;
+function AotMathAsinh(x: Double): Double; cdecl; begin Result := Math.ArcSinh(x); end;
+// CEIL is written as -floor(-x) in the arm so the whole double range is covered; same here.
+function AotMathCeil (x: Double): Double; cdecl; begin Result := -FloorDouble(-x); end;
+function AotMathFrac (x: Double): Double; cdecl; begin Result := FracDouble(x); end;
+// ⚠️ ATAN2's arm reads Src1 as y and Src2 as x and calls ArcTan2(Src1, Src2) - the emitter passes
+// them in that same order, and this keeps it. Swapping them answers a different angle, quietly.
+function AotMathAtan2(x, y: Double): Double; cdecl; begin Result := ArcTan2(x, y); end;
+
+var
+  GAotMathFns: array[0..AOTMATH_COUNT - 1] of Pointer;
+
+procedure InitAotMathFns;
+begin
+  GAotMathFns[AOTMATH_SIN]   := @AotMathSin;    GAotMathFns[AOTMATH_COS]   := @AotMathCos;
+  GAotMathFns[AOTMATH_TAN]   := @AotMathTan;    GAotMathFns[AOTMATH_ATN]   := @AotMathAtn;
+  GAotMathFns[AOTMATH_EXP]   := @AotMathExp;    GAotMathFns[AOTMATH_SINH]  := @AotMathSinh;
+  GAotMathFns[AOTMATH_COSH]  := @AotMathCosh;   GAotMathFns[AOTMATH_TANH]  := @AotMathTanh;
+  GAotMathFns[AOTMATH_ASINH] := @AotMathAsinh;  GAotMathFns[AOTMATH_CEIL]  := @AotMathCeil;
+  GAotMathFns[AOTMATH_FRAC]  := @AotMathFrac;   GAotMathFns[AOTMATH_ATAN2] := @AotMathAtan2;
+end;
+
 function AotGfxRefresh(VMSelf, CtxObj, Desc: Pointer): PtrInt; cdecl;
 { C8: rebuild the compiled PSET fast path's view of the draw surface, and answer whether the fast
   path may be taken at all.
@@ -11483,6 +11527,9 @@ begin
   C.VMSelf := Self;
   // C8: PSET's inline store rebuilds its surface view through this when the cache is cold.
   C.GfxRefresh := @AotGfxRefresh;
+  // C9: the math table. Filled once; the pointer is stable for the process.
+  InitAotMathFns;
+  C.MathFns := @GAotMathFns[0];
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
   C.StrCmp := @AotStrCmp;

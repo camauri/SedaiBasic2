@@ -129,6 +129,13 @@ type
     // rebuilds it afterwards. Conservative, one store per helper call, and it cannot go stale.
     GfxDesc: PInt64;       // offset 280: @<per-context 5-Int64 block>, nil = never take the fast path
     GfxRefresh: Pointer;   // offset 288: @AotGfxRefresh (VMSelf, CtxObj, desc) - rebuilds it
+    // C9: the MATH family. One pointer to a TABLE rather than one ctx slot per function - there are
+    // sixteen of them and a slot each would be sixteen offsets to keep in step for no gain. The
+    // emitted code loads table[kind] and calls it: one extra load, no branch.
+    // ⛔ THE INDEX SET BELOW IS THE ONLY COPY. SedaiBytecodeVM fills the table BY THOSE CONSTANTS,
+    // so the mapping from opcode to function exists once. Getting one wrong would be a silent wrong
+    // ANSWER, not a crash - which is what job/tests/bas/math_aot_native.bas is there to catch.
+    MathFns: Pointer;      // offset 296: @GAotMathFns[0], sixteen cdecl Double->Double(,Double)
   end;
   PAotCtx = ^TAotCtx;
 
@@ -161,6 +168,29 @@ const
   AOTCTX_PRINTSTR    = 272;
   AOTCTX_GFXDESC     = 280;
   AOTCTX_GFXREFRESH  = 288;
+  AOTCTX_MATHFNS     = 296;
+
+  // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
+  // SedaiBytecodeVM fills the table at those indices.
+  //
+  // ⛔⛔ WHAT IS *NOT* HERE, AND WHY - the list is short on purpose and each omission was read out
+  // of the interpreter's own arm rather than guessed:
+  //   LOG, LOG10, LOG2, LOGN   RAISE on a non-positive argument (and LOG's answer depends on the
+  //                            DIALECT: FreeBASIC returns -Inf/NaN where Commodore errors). An
+  //                            exception unwinding out of a leaf call would pass through a frame
+  //                            this backend emits by hand and gives no unwind information for.
+  //   ACOS, ASIN, ACOSH, ATANH, ROUND, SGN, MIN, MAX, COPYSIGN
+  //                            carry a domain test or a multi-way choice; a shim would be a SECOND
+  //                            copy of that guard, which is the divergence this file keeps warning
+  //                            about. They stay on the runtime helper, where the one copy lives.
+  //   RND                      is stateful.
+  // ⇒ Only arms that are a single call that cannot raise are lowered. That is twelve of them, and
+  //   it is the twelve that appear in loops.
+  AOTMATH_SIN   = 0;   AOTMATH_COS   = 1;   AOTMATH_TAN   = 2;   AOTMATH_ATN   = 3;
+  AOTMATH_EXP   = 4;   AOTMATH_SINH  = 5;   AOTMATH_COSH  = 6;   AOTMATH_TANH  = 7;
+  AOTMATH_ASINH = 8;   AOTMATH_CEIL  = 9;   AOTMATH_FRAC  = 10;
+  AOTMATH_ATAN2 = 11;                        // the only two-argument one that cannot raise
+  AOTMATH_COUNT = 12;
   AOTCTX_CALLSUB   = 96;
   AOTCTX_STRLEFT   = 104;
   AOTCTX_STRRIGHT  = 112;
@@ -663,6 +693,37 @@ end;
 
 // C7b: the PRINT ITEM as a conditional leaf (fast path inline, CMD redirection back to the helper).
 // AOT_PRINTSTR=0 puts it back on AotExecOne unconditionally.
+// C9: the ONE place that says which math opcode becomes which table entry. A case rather than a
+// scattered set of `if`s, so adding a function is one line here plus one shim in the VM - and so
+// that "is it lowered?" and "which entry?" cannot answer differently, which is what two parallel
+// lists would eventually do.
+// Answers -1 for an op with no native form.
+function AotMathKind(Op: TSSAOpCode): Integer;
+begin
+  case Op of
+    ssaMathSin:   Result := AOTMATH_SIN;
+    ssaMathCos:   Result := AOTMATH_COS;
+    ssaMathTan:   Result := AOTMATH_TAN;
+    ssaMathAtn:   Result := AOTMATH_ATN;
+    ssaMathExp:   Result := AOTMATH_EXP;
+    ssaMathSinh:  Result := AOTMATH_SINH;
+    ssaMathCosh:  Result := AOTMATH_COSH;
+    ssaMathTanh:  Result := AOTMATH_TANH;
+    ssaMathAsinh: Result := AOTMATH_ASINH;
+    ssaMathCeil:  Result := AOTMATH_CEIL;
+    ssaMathFrac:  Result := AOTMATH_FRAC;
+    ssaMathAtan2: Result := AOTMATH_ATAN2;
+  else
+    Result := -1;
+  end;
+end;
+
+function AotMathNative: Boolean;
+// AOT_MATH=0 sends the whole family back to the runtime helper: the A/B on one binary.
+begin
+  Result := GetEnvironmentVariable('AOT_MATH') <> '0';
+end;
+
 function AotGfxPsetNative: Boolean;
 // AOT_GFXPSET=0 sends PSET back to the runtime helper: the A/B for the C8 inline store on one binary.
 begin
@@ -1091,6 +1152,10 @@ begin
     // It is a conditional native form - when the gate is shut it falls back to the helper - so like
     // the print item it still needs a PC and still carries a deopt hazard.
     ssaGfxPset,
+    // C9: the math family that can be a leaf call - see AotMathKind for what is deliberately absent.
+    ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
+    ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh,
+    ssaMathCeil, ssaMathFrac, ssaMathAtan2,
     ssaLabel, ssaNop, ssaJump, ssaJumpIfZero, ssaJumpIfNotZero,
     ssaXferLoadInt, ssaXferLoadFloat, ssaXferStoreInt, ssaXferStoreFloat,
     // C7: and the STRING pair, which had been left behind. Both are one AotStrAssign between two
@@ -1294,6 +1359,18 @@ begin
     ssaGfxPset:
       Result := AotGfxPsetNative and (Ins.Src1.Kind = svkRegister) and
                 (Ins.Src2.Kind = svkRegister);
+    // C9. One float in, one float out - or two in for ATAN2. A constant operand falls back to the
+    // helper rather than have the emitter learn to materialise one.
+    ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
+    ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh, ssaMathCeil, ssaMathFrac:
+      Result := AotMathNative and (AotMathKind(Ins.OpCode) >= 0) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtFloat) and
+                (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtFloat);
+    ssaMathAtan2:
+      Result := AotMathNative and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtFloat) and
+                (Ins.Src2.Kind = svkRegister) and (Ins.Src2.RegType = srtFloat) and
+                (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtFloat);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
       // Needs the record layout AND a constant slot: the slot is baked into the displacement.
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
@@ -3236,6 +3313,30 @@ var
     StrCallEpilogue;       // reloads volatile xmm2..5 from the banks; xmm0 (the result) survives
     FStore(d, XMM0);
   end;
+  // C9: FloatRegs[dest] := f(FloatRegs[src1] [, FloatRegs[src2]]), through the math table.
+  //
+  //  ⚠️ The ARGUMENT is loaded BEFORE the table pointer, while every operand is still where the
+  //  allocator left it: FLoad reads an allocated xmm when there is one, and SpillVolatiles has
+  //  already made the bank authoritative for the rest. Loading it after would read a register the
+  //  pointer load had not touched - true today, and exactly the kind of ordering nothing checks.
+  //  ⚠️ StrCallEpilogue reloads the volatile xmm from the banks but leaves xmm0 alone, which is why
+  //  the result can be stored after it - the same contract EmitStrVal relies on.
+  procedure EmitMathCall(Kind: Integer; TwoArgs: Boolean);
+  var d, a, b: Integer;
+  begin
+    d := FReg(Cur.Dest); a := FReg(Cur.Src1);
+    b := 0; if TwoArgs then b := FReg(Cur.Src2);
+    if not OK then Exit;
+    SpillVolatiles;
+    FLoad(XMM0, a);                                        // xmm0 = first argument
+    if TwoArgs then FLoad(XMM1, b);                        // xmm1 = second
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_MATHFNS);          // rax = &table[0]
+    MovLoad(RAX, RAX, LongWord(Kind) * 8);                 // rax = table[Kind]
+    E.EmitBytes([$FF, $D0]);                               // call rax
+    StrCallEpilogue;
+    FStore(d, XMM0);
+  end;
+
   procedure EmitStrValInt; // IntRegs[dest] := ParseLeadingInt64(StringRegs[src], Immediate)
   var d, s: Integer;
   begin
@@ -4984,6 +5085,21 @@ var
               if Prog.GetSsaPc(o) < 0 then Fail('no-pc-printstr');
             end;
           end;
+          // C9: the math family as leaf calls. Like the C5 string primitives they need a
+          // call-ready frame but ALWAYS complete natively - none of the twelve can raise - so the
+          // frame flag is set WITHOUT a deopt hazard and no PC is needed.
+          ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
+          ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh, ssaMathCeil, ssaMathFrac,
+          ssaMathAtan2:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              CountVal(Ins.Dest); CountVal(Ins.Src1);
+              if Ins.OpCode = ssaMathAtan2 then CountVal(Ins.Src2);
+            end;
+          end;
           // C8: PSET. Same shape as the print item above - a native form that can still fall back -
           // so it needs the same three things: a call-ready frame, a deopt hazard, and a PC.
           ssaGfxPset:
@@ -6246,6 +6362,14 @@ var
         apc := NeedPC; if not OK then Exit;
         EmitPrintStringNative(apc, Cur.OpCode = ssaPrintStringLn);
       end;
+
+      // C9: the math family. No PC is needed - none of these can raise, which is precisely the
+      // property that decided which ones are in the table (see AotMathKind).
+      ssaMathSin, ssaMathCos, ssaMathTan, ssaMathAtn, ssaMathExp,
+      ssaMathSinh, ssaMathCosh, ssaMathTanh, ssaMathAsinh, ssaMathCeil, ssaMathFrac:
+        EmitMathCall(AotMathKind(Cur.OpCode), False);
+      ssaMathAtan2:
+        EmitMathCall(AOTMATH_ATAN2, True);
 
       // C8: PSET. A PC is needed for the same reason - the cold path IS the helper call.
       ssaGfxPset:
