@@ -225,34 +225,15 @@ if s == s2 and 'const B64' in s:
 open(page, 'w', encoding='utf-8').write(s2)
 print('re-embedded')
 PY
-  # the uploadable copy is rebuilt from the page it mirrors, so the two cannot drift
-  site="$here/site/buddhabrot.html"
-  if [ -f "$site" ]; then
-    python3 - "$page" "$site" <<'SITE_PY'
-import re, sys
-page, site = sys.argv[1], sys.argv[2]
-src = open(page, encoding='utf-8').read()
-dst = open(site, encoding='utf-8').read()
-b64 = re.search(r'const B64 = "([^"]*)";', src).group(1)
-dst = re.sub(r'const B64 = "[^"]*";', 'const B64 = "' + b64 + '";', dst, count=1)
-open(site, 'w', encoding='utf-8').write(dst)
-print('  site copy refreshed too')
-SITE_PY
-  fi
   echo "✅ compiles · same picture · page re-embedded"
   exit 0
 fi
 
 if grep -qF "const B64 = \"$b64\";" "$page"; then
-  # ⛔ AND THE COPY THAT GETS UPLOADED, which is a second place the same module lives and therefore a
-  # second place it can go stale. A site carrying last week's module looks perfectly fine.
-  site="$here/site/buddhabrot.html"
-  if [ -f "$site" ] && ! grep -qF "const B64 = \"$b64\";" "$site"; then
-    echo "⛔ site/buddhabrot.html carries a DIFFERENT module than this source compiles to."
-    echo "   Refresh it:  bash bas/demo/buddhabrot/verify_wasm.sh --bless"
-    exit 1
-  fi
-  echo "✅ compiles · same picture as sb · the page and the site copy carry this exact module"
+  # ⭐ The copy that gets PUBLISHED lives in bas/demo/site/ and is checked by verify_site.sh, which
+  # owns the whole tree - its links, its reachability and every module in it. This net owns the page
+  # beside the source.
+  echo "✅ compiles · same picture as sb · the page carries this exact module"
   exit 0
 else
   echo "⛔ buddhabrot.html embeds a DIFFERENT module than the one this source compiles to."

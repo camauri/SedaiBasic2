@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Landscape in BASIC — SedaiBasic</title>
+<meta name="description" content="A voxel-space landscape written in BASIC and compiled to WebAssembly: no polygons, no depth buffer, two nested loops and a comparison.">
+<style>
+  /* One design for every page in this site: dark ground, monospace for headings and data, a reading
+     face for prose, and a single warm accent. Single-theme on purpose - every demo here draws light
+     on black, and a light ground would put a white frame around a black photograph - so each colour
+     is painted explicitly rather than inherited from the host. */
+  :root {
+    color-scheme: dark;
+    --ground:  #0b0d10;
+    --panel:   #12161c;
+    --edge:    #232a33;
+    --ink:     #c9d1d9;
+    --ink-dim: #8b949e;
+    --accent:  #e0813f;
+    --alt:     #6fbf8b;
+    --cool:    #5b9dd9;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ground); color: var(--ink);
+         font: 16px/1.65 var(--sans); -webkit-text-size-adjust: 100%; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 20px 72px; }
+  .top { padding: 18px 0 0; font: 12.5px var(--mono); }
+  .top a { color: var(--ink-dim); text-decoration: none; }
+  .top a:hover { color: var(--accent); }
+  header { padding: 26px 0 8px; }
+  h1 { font: 600 30px/1.2 var(--mono); margin: 0 0 10px; letter-spacing: -.01em; text-wrap: balance; }
+  .kicker { font: 500 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
+            color: var(--accent); margin: 0 0 18px; }
+  .lede { font-size: 18px; margin: 0 0 26px; text-wrap: pretty; }
+  figure { margin: 28px 0; }
+  figure img { display: block; width: 100%; height: auto; border: 1px solid var(--edge);
+               border-radius: 8px; background: #000; }
+  figure.small img { max-width: 380px; margin: 0 auto; }
+  figcaption { color: var(--ink-dim); font-size: 13.5px; margin-top: 10px; text-align: center; }
+  h2 { font: 600 20px/1.3 var(--mono); margin: 46px 0 12px; text-wrap: balance; }
+  h2::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+               background: var(--accent); margin-right: 10px; vertical-align: 3px; }
+  h2.alt::before  { background: var(--alt); }
+  h2.cool::before { background: var(--cool); }
+  p { margin: 0 0 16px; }
+  strong { color: #fff; font-weight: 600; }
+  a { color: var(--accent); text-underline-offset: 3px; }
+  a:hover { color: #f0a06b; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 26px 0 10px; }
+  .cta a { display: inline-block; font: 600 14px/1 var(--mono); text-decoration: none;
+           padding: 14px 20px; border-radius: 8px; border: 1px solid var(--edge);
+           background: var(--panel); color: var(--ink); transition: border-color .15s, background .15s; }
+  .cta a:hover { border-color: var(--accent); background: #171d25; }
+  .cta a.primary { background: var(--accent); border-color: var(--accent); color: #1a0d04; }
+  .cta a.primary:hover { background: #f0a06b; }
+  table { width: 100%; border-collapse: collapse; margin: 20px 0 8px;
+          font: 13.5px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
+  th, td { padding: 9px 10px; border-bottom: 1px solid var(--edge); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--ink-dim); font-weight: 500; font-size: 12px;
+             letter-spacing: .06em; text-transform: uppercase; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.win  { color: var(--accent); }
+  td.lose { color: #d97a6c; }
+  .tablewrap { overflow-x: auto; }
+  .note { color: var(--ink-dim); font-size: 13.5px; }
+  pre { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font: 13.5px/1.6 var(--mono); color: var(--ink); }
+  code { font: 13.5px var(--mono); color: var(--accent); }
+  pre code { color: inherit; }
+  blockquote { margin: 20px 0; padding: 14px 18px; border-left: 2px solid var(--edge);
+               background: var(--panel); border-radius: 0 8px 8px 0; color: var(--ink-dim);
+               font-size: 15px; }
+  blockquote strong { color: var(--ink); }
+  .bands { display: grid; gap: 10px; margin: 18px 0 22px; padding: 0; list-style: none; }
+  .bands li { display: grid; grid-template-columns: 12px 1fr; gap: 12px; align-items: start;
+              font-size: 15.5px; }
+  .bands i { width: 12px; height: 12px; border-radius: 3px; margin-top: 6px; }
+  .bands .b1 { background: var(--cool); }
+  .bands .b2 { background: var(--alt); }
+  .bands .b3 { background: var(--accent); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;
+           margin: 30px 0 10px; }
+  .card { border: 1px solid var(--edge); border-radius: 10px; overflow: hidden;
+          background: var(--panel); display: flex; flex-direction: column;
+          transition: border-color .15s; }
+  .card:hover { border-color: var(--accent); }
+  .card img { display: block; width: 100%; height: 190px; object-fit: cover; background: #000;
+              border-bottom: 1px solid var(--edge); }
+  .card .body { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .card h3 { margin: 0; font: 600 16px/1.3 var(--mono); }
+  .card h3 a { text-decoration: none; color: var(--ink); }
+  .card:hover h3 a { color: var(--accent); }
+  .card p { margin: 0; font-size: 14.5px; color: var(--ink-dim); flex: 1; }
+  .card .links { display: flex; gap: 14px; font: 12.5px var(--mono); padding-top: 4px; }
+  footer { margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--edge);
+           color: var(--ink-dim); font-size: 13.5px; }
+  footer a { color: var(--ink-dim); }
+</style>
+
+<div class="wrap">
+<p class="top"><a href="../index.html">&larr; all the demos</a></p>
+<header>
+  <p class="kicker">SedaiBasic · demo</p>
+  <h1>A voxel landscape, written in BASIC</h1>
+  <p class="lede">No polygons, no depth buffer, no matrix. A heightmap drawn one screen column at a
+  time, front to back, with an occlusion line that only ever rises — the whole renderer is two
+  nested loops and a comparison. It compiles to a 19&nbsp;KB WebAssembly module.</p>
+  <div class="cta">
+    <a class="primary" href="voxel_landscape.html">▶ Run it in your browser</a>
+    <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+  </div>
+</header>
+
+<figure>
+  <img src="voxel_landscape.png" alt="A voxel-rendered landscape: banded terrain under a hazy horizon" width="640" height="480">
+  <figcaption>640×480, one frame, drawn column by column.</figcaption>
+</figure>
+
+<h2>How it draws</h2>
+<p>For each column of the screen the renderer walks outwards from the camera along one ray, sampling
+the heightmap at increasing distance. Each sample projects to a height on the screen; a single
+number per column remembers <strong>how high that column has already been filled</strong>, and a
+sample that does not reach above it is discarded without drawing anything. Because the walk goes
+from near to far, that number only ever rises — so a ridge close to the camera silently hides
+everything behind it, and nothing is ever drawn twice.</p>
+<p>That is the entire hidden-surface algorithm: one comparison per sample, no depth buffer, no
+sorting, no polygons. It is what voxel-space renderers did on machines that had none of those, and
+it is still the reason this runs in real time in a browser.</p>
+
+<h2 class="alt">What the terrain is made of</h2>
+<p>Value noise at several frequencies gives the heights. The colours come from altitude bands, and
+the sun is cast <strong>once</strong>, before the first frame, into a shadow map. Neither of those
+costs anything per frame: both fold into a colormap that is built at startup and then only read.</p>
+<p>The fog is the one enrichment that depends on where the camera is, and it is about a millisecond
+of a 640×480 frame — which is why it is the only one that had to be measured before it was kept.</p>
+
+<h2 class="cool">In the browser</h2>
+<p><code>sbc --target wasm</code> compiles the same source to a module the page carries inside
+itself. The offline mode — the one that writes raw frames to a file for encoding into video —
+<strong>excludes itself here with no special case at all</strong>: a module has no filesystem, so
+the compiler refuses the opcode rather than emit something that runs and lies, and the branch is
+simply absent from the build. Writing 3.7&nbsp;GB of raw frames from a browser tab was never going
+to be the point.</p>
+<p class="note">⚠️ This page replaces an earlier one that had two faults worth naming, because both
+are invisible until they are not. It compiled the module <em>synchronously</em>, which a browser
+refuses for any buffer over 4&nbsp;KB on the main thread — it ran on the desktop it was written on
+and would have failed on a phone. And it never rebuilt its view of the module's memory: a typed
+array over that memory is detached the moment the memory grows, its length becomes zero, no
+exception is raised, and the canvas freezes on its last frame while every counter goes on rising.</p>
+
+<h2>What it costs</h2>
+<div class="tablewrap">
+<table>
+  <thead><tr><th>640×480 frame</th><th>milliseconds</th></tr></thead>
+  <tbody>
+    <tr><td>render, WebAssembly under Node</td><td>8.7</td></tr>
+    <tr><td>blit to the canvas</td><td class="win">1.3</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="note">The blit is a word at a time rather than four bytes: a framebuffer word is 0xAARRGGBB
+and ImageData wants the bytes the other way round, so the swap is two shifts and a mask per pixel
+instead of four loads and four stores. Measured at this size, that took the blit from 6.2&nbsp;ms to
+under 2. And a straight copy — no swap at all — renders a blue sky <em>orange</em>, which no numeric
+test can catch, because the pixel values are right either way.</p>
+
+<div class="cta">
+  <a class="primary" href="voxel_landscape.html">▶ Run it in your browser</a>
+  <a href="https://github.com/camauri/SedaiBasic2">The code on GitHub</a>
+</div>
+
+<footer>
+  <p><a href="../index.html">&larr; all the demos</a></p>
+  <p>SedaiBasic — Maurizio Cammalleri · GPL-3.0-or-later ·
+  <a href="https://github.com/camauri/SedaiBasic2">github.com/camauri/SedaiBasic2</a></p>
+</footer>
+</div>
+</html>

@@ -224,12 +224,11 @@ The module is 25 KB; the page that carries it is 43 KB.
 
 ### Publishing it
 
-`site/` is the pair as it goes on a server: `index.html` (what it is, and the numbers),
-`buddhabrot.html` (the demo, module inside), and the two images. The links between them are
-relative, so the folder works at any address. Nothing else is needed — no application server, no
-configuration, no external dependency. `verify_wasm.sh` refuses to pass if that copy carries a
-different module than the source compiles to, because a page publishing last week's module looks
-perfectly fine and is showing something else.
+The published site lives in [`bas/demo/site/`](../site/) — an index of the demos and one folder per
+demo, this one included. `verify_site.sh` owns that tree: every relative link has to resolve, every
+page has to be reachable from the index and able to get back, every page has to instantiate its
+module asynchronously and rebuild its view when the memory grows, and every page has to carry the
+module its source compiles to today.
 
 ## The three engines are one binary
 
