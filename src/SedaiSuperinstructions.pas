@@ -2464,7 +2464,18 @@ begin
   // fannkuch --jit went from 178 ms to 4378, a factor of 24 - not slower, SWITCHED OFF. The AOT
   // loses through the regions it declines and runs interpreted. Fusion and the compilers compete for
   // the same representation, so the pass runs only when no compiler will.
-  if GAotWillRun or GJitWillRun then begin Result := 0; Exit; end;
+  // ⚡ SUPERINSTR_AOT=1 lifts the gate FOR THE AOT ONLY, and it is the A/B on one binary for the
+  // question this gate never separated: the JIT CONSUMES bytecode, so a superinstruction really can
+  // switch a hot loop off (fannkuch x24, above) - but line 273 of this same file records that the
+  // AOT compiles from SSA, NOT from bytecode. If that holds, fusion cannot cost the AOT a region; it
+  // can only pay it back in the regions the AOT DECLINES and leaves interpreted.
+  // 📊 Measured 2 Sep 2026 with AOTC_DIAG and the pair census: on a program whose MAIN bails
+  // (recfield_fb, BAIL ssaLoadProcAddr) --aot executed 15 541 126 instructions against the
+  // interpreter's 10 340 999 - +50%, and the whole difference is AddIntToBranchLe unfusing back into
+  // AddInt/CopyInt/Jump + CmpLeInt/JumpIfZero. That made --aot 0.83x the INTERPRETER, which the
+  // standing rule calls a defect.
+  if GJitWillRun then begin Result := 0; Exit; end;
+  if GAotWillRun and (GetEnvironmentVariable('SUPERINSTR_AOT') <> '1') then begin Result := 0; Exit; end;
   // ⚡ SUPERMASK: bisect WHICH fusion is wrong. Every TryFuseXxx call is guarded by KindOn(n), and
   // SUPERMASK is a comma-separated list of the kinds to ENABLE (empty = all). The family was off for
   // a month, so it has rotted: with all of it on, run_regress gives 16 FAIL and 16 OPTDIFF. This is
