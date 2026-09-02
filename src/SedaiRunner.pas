@@ -122,6 +122,8 @@ uses
   SedaiRegAlloc,
   // Optimizations
   SedaiPeephole, SedaiSuperinstructions,
+  // SedaiAot: only for RunSuperinstructionsAot - the fusion pass told where the AOT will go.
+  SedaiAot,
   SedaiNopCompaction, SedaiRegisterCompaction;
 
 { ⛔ PERCHE' ESISTE (20 ago 2026). I ventidue passi di ottimizzazione erano invocati come
@@ -629,7 +631,7 @@ begin
           {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
           // The engine gate lives inside RunSuperinstructions - four callers, one place.
           if not FSkipSuperinstructions then
-            try RunSuperinstructions(Result); except on E: Exception do OptPassFailed('Superinstructions', E); end;
+            try RunSuperinstructionsAot(Result, SSAProgram); except on E: Exception do OptPassFailed('Superinstructions', E); end;
           {$ENDIF}
 
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}

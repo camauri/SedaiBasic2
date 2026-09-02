@@ -273,6 +273,7 @@ type
     HelperOps: Integer;
   end;
   TAotRegions = array of TAotRegion;
+  TBoolArray = array of Boolean;
 
 // Slice into regions and classify against the B1 scalar set. Prog supplies the
 // SSA->PC map (entry PCs and the cross-check that the map lines up with ProcMap).
@@ -280,6 +281,32 @@ function AotSliceAndClassify(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TAot
 
 // AOT_DIAG=1 printout: per-region verdict + summary + map cross-check warnings.
 procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
+
+// True at every bytecode PC owned by a region the AOT will COMPILE - i.e. exactly where the
+// superinstruction pass must keep its hands off.
+//
+// ⛔⛔ WHY THIS EXISTS. Fusion and this backend compete for the same bytecode, so the pass used to
+// be refused OUTRIGHT whenever a compiler would run (SedaiSuperinstructions, GAotWillRun). That is
+// correct where the AOT compiles and a PURE LOSS everywhere else: a region the AOT DECLINES runs
+// interpreted, and it then runs UNFUSED bytecode for no reason at all. Measured 2 Sep 2026 over 77
+// programs, --aot against the interpreter: eight programs were SLOWER compiled than interpreted, led
+// by render_probe at 0.47x and recfield_fb at 0.80x, and the whole of it was this.
+// ⛔ And lifting the gate outright is NOT the cure - measured too: apmap_ceiling 944 -> 1691 ms,
+// pairs_probe 1120 -> 2564, because with superinstructions in the stream the AOT's emitter refuses
+// the region it had accepted (AOT_DIAG still says "1/1 eligible" while AOTC_DIAG says
+// "regions = 0" - the survey and the compiler disagree). So the answer is neither on nor off: fuse
+// where the AOT will not go, and nowhere else.
+//
+// Regions are contiguous in the emitted bytecode, so a region owns [EntryPC, next EntryPC - 1]. The
+// mask is consulted DURING the pass, where indices are stable: fusion writes the fused op in place
+// and NOPs its partner, and NOP compaction is a LATER pass. Afterwards the PCs shift and this mask
+// is dead - which is safe, because the AOT re-derives everything at load, an untouched eligible
+// region is still eligible, and a declined one cannot become less declined by gaining an opcode.
+function AotEligiblePCMask(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TBoolArray;
+
+// The superinstruction pass, told where the AOT will go. Every front end that both fuses and may run
+// the AOT calls THIS, not RunSuperinstructions - so the two can never disagree about the map.
+function RunSuperinstructionsAot(Prog: TBytecodeProgram; SSAProg: TSSAProgram): Integer;
 
 // Diagnostics from the last region compiled (liveness, C1). Not thread-safe; reporting only.
 var
@@ -478,7 +505,7 @@ procedure AotMagicSigned(d: Int64; out M: Int64; out s: Integer; out NeedAdd, Ne
 implementation
 
 
-uses TypInfo, Cpu;
+uses TypInfo, Cpu, SedaiSuperinstructions;
 
 var
   GArrAddrState: Integer = -1;   // AOT_ARRADDR=0 restores the rcx/rax-staged element addressing
@@ -1625,6 +1652,118 @@ begin
   until Ordinal = 0;
 
   Result := Regions;
+end;
+
+procedure AotPrepareClassification(SSAProg: TSSAProgram; AllowUnsafe: Boolean);
+// ⛔⛔ THE FOUR GLOBALS THE CLASSIFIER READS, SET IN ONE PLACE. They were written out inline in
+// AotCompileProgram, with a comment saying GArrStrNative "must be set BEFORE AotSliceAndClassify ...
+// if the two saw different values a region would be accepted and then fail at emit time". The
+// superinstruction mask (AotEligiblePCMask) classifies too, and a second hand-written copy of this
+// preamble is exactly how the two would drift - measured: without it the mask called a region
+// ineligible that the compiler then took, so the pass fused inside it and the AOT refused what it
+// had accepted (apmap_ceiling 944 -> 1702 ms, pairs_probe 1120 -> 2552).
+var
+  b, i: Integer;
+begin
+  GNoThreads := True;
+  // The condition compiled code actually answers to. Not a thread census: the interpreter's own
+  // resolve of a shared handle is unlocked by default (TBytecodeVM.FSharedRecLockFree, same env var),
+  // so emitting the native path adds no exposure that the interpreter does not already have - and
+  // when the lock is put back, both stand down together. Read here rather than threaded through the
+  // signature; FSharedRecLockFree is the source of truth and this must not outlive a change to it.
+  GSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GAotRecNative := GetEnvironmentVariable('AOT_RECDEOPT') <> '1';
+  if SSAProg <> nil then
+    for b := 0 to SSAProg.Blocks.Count - 1 do
+    begin
+      for i := 0 to SSAProg.Blocks[b].Instructions.Count - 1 do
+        if SSAProg.Blocks[b].Instructions[i].OpCode in [ssaThreadCreate, ssaCallSubIndirect] then
+        begin
+          GNoThreads := False;
+          Break;
+        end;
+      if not GNoThreads then Break;
+    end;
+  GArrStrNative := AllowUnsafe;
+end;
+
+function AotEligiblePCMask(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TBoolArray;
+var
+  Regions: TAotRegions;
+  Starts: array of Integer;
+  Elig: array of Boolean;
+  i, j, n, t: Integer;
+  b: Boolean;
+  Stop: Integer;
+begin
+  SetLength(Result, 0);
+  if (SSAProg = nil) or (Prog = nil) then Exit;
+  n := Prog.GetInstructionCount;
+  if n <= 0 then Exit;
+  // ⛔ CLASSIFIED TWICE, AND THE ANSWER IS THE UNION. The real gate is
+  // "ModernMode and not bounds-check", a value this pass does not have and must not guess: guessing
+  // it wrong in the permissive direction lets the fusion into a region the AOT then takes, and the
+  // AOT refuses at emit time what its own survey accepted. So both values are asked and a PC counts
+  // as the AOT's if EITHER says so - conservative in the only direction that is safe, at the cost of
+  // a handful of fusions in regions that were never going to be compiled anyway.
+  AotPrepareClassification(SSAProg, True);
+  Regions := AotSliceAndClassify(SSAProg, Prog);
+  if Length(Regions) = 0 then Exit;
+  SetLength(Starts, 0); SetLength(Elig, 0);
+  for i := 0 to High(Regions) do
+    if Regions[i].EntryPC >= 0 then
+    begin
+      t := Length(Starts);
+      SetLength(Starts, t + 1); SetLength(Elig, t + 1);
+      Starts[t] := Regions[i].EntryPC; Elig[t] := Regions[i].Eligible;
+    end;
+  AotPrepareClassification(SSAProg, False);
+  Regions := AotSliceAndClassify(SSAProg, Prog);
+  for i := 0 to High(Regions) do
+    if Regions[i].EntryPC >= 0 then
+      for j := 0 to High(Starts) do
+        if Starts[j] = Regions[i].EntryPC then
+        begin
+          Elig[j] := Elig[j] or Regions[i].Eligible;
+          Break;
+        end;
+  if Length(Starts) = 0 then Exit;
+  for i := 0 to High(Starts) - 1 do
+    for j := i + 1 to High(Starts) do
+      if Starts[j] < Starts[i] then
+      begin
+        t := Starts[i]; Starts[i] := Starts[j]; Starts[j] := t;
+        b := Elig[i]; Elig[i] := Elig[j]; Elig[j] := b;
+      end;
+  SetLength(Result, n);
+  for i := 0 to n - 1 do Result[i] := False;
+  for i := 0 to High(Starts) do
+  begin
+    if not Elig[i] then System.Continue;
+    if i < High(Starts) then Stop := Starts[i + 1] - 1 else Stop := n - 1;
+    for j := Starts[i] to Stop do
+      if (j >= 0) and (j < n) then Result[j] := True;
+  end;
+end;
+
+function RunSuperinstructionsAot(Prog: TBytecodeProgram; SSAProg: TSSAProgram): Integer;
+var
+  Opt: TSuperinstructionOptimizer;
+  Mask: TBoolArray;
+begin
+  Opt := TSuperinstructionOptimizer.Create(Prog);
+  try
+    // Only ask when the AOT will actually run: classifying costs a pass over the SSA, and with no
+    // compiler in the picture the optimizer's own gate lets everything through anyway.
+    if GAotWillRun and (not GJitWillRun) then
+    begin
+      Mask := AotEligiblePCMask(SSAProg, Prog);
+      if Length(Mask) > 0 then Opt.SetAotOwnedPCs(Mask);
+    end;
+    Result := Opt.Run;
+  finally
+    Opt.Free;
+  end;
 end;
 
 procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
@@ -7506,31 +7645,10 @@ begin
   //
   // ⛔ And the lesson under the lesson: a cost verdict has a DATE on it. This one was honest when
   // written and false eight weeks later, because a defect somewhere else was inside the measurement.
-  GNoThreads := True;
-  // The condition compiled code actually answers to. Not a thread census: the interpreter's own
-  // resolve of a shared handle is unlocked by default (TBytecodeVM.FSharedRecLockFree, same env var),
-  // so emitting the native path adds no exposure that the interpreter does not already have - and
-  // when the lock is put back, both stand down together. Read here rather than threaded through the
-  // signature; FSharedRecLockFree is the source of truth and this must not outlive a change to it.
-  GSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
-  GAotRecNative := GetEnvironmentVariable('AOT_RECDEOPT') <> '1';
+  AotPrepareClassification(SSAProg, AllowUnsafe);
   if AotDumpDir <> '' then
     WriteLn(ErrOutput, '[AOT] AOT_DUMP: region dumps go to ', AotDumpDir,
             ' (disassemble with job/tests/tools/aot_disasm.ps1)');
-  for r := 0 to SSAProg.Blocks.Count - 1 do
-  begin
-    for n := 0 to SSAProg.Blocks[r].Instructions.Count - 1 do
-      if SSAProg.Blocks[r].Instructions[n].OpCode in [ssaThreadCreate, ssaCallSubIndirect] then
-      begin
-        GNoThreads := False;
-        Break;
-      end;
-    if not GNoThreads then Break;
-  end;
-  // Must be set BEFORE AotSliceAndClassify: the classifier reads it through AotArrayNativeOK, and
-  // the emitter reads the same global later. If the two saw different values a region would be
-  // accepted and then fail at emit time.
-  GArrStrNative := AllowUnsafe;
   n := 0;
   Regions := AotSliceAndClassify(SSAProg, Prog);
   SetLength(Result, Length(Regions));
