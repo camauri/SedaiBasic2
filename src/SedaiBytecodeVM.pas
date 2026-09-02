@@ -11561,6 +11561,51 @@ end;
   the Xfer bases, ArrDesc) are supplied by whoever is about to run. Shared by RunTemplate's per-Run
   ctx and by BuildJitLoops: two hand-maintained copies of this list is exactly how the two backends
   would begin calling different functions for the same opcode. }
+{ C11: the two regex builtins as leaf calls. Each is an EXACT transcription of its interpreter arm -
+  one line, a call into RegexCountMatches / RegexReplaceAll - so the interpreter stays the definition
+  of the behaviour and this is only a cheaper way to reach it. Neither raises, neither has a domain
+  guard, neither carries state, and neither can hand the invocation back: the three properties that
+  make a leaf call safe here (see the C5 string note).
+
+  ⛔ The operands arrive as VALUES (the AnsiString pointer) and are cast inside the expression rather
+  than assigned to locals: a local managed variable costs a reference count up and down per call, and
+  these run once per iteration of a hot loop. Same rule as AotStrConcatCharAt, where the local-variable
+  version measured SLOWER than the two instructions it replaced. }
+
+function AotRegexCount(sVal, patVal: Pointer): PtrInt; cdecl;
+begin
+  Result := PtrInt(RegexCountMatches(AnsiString(sVal), AnsiString(patVal)));
+end;
+
+procedure AotRegexReplace(dstSlot, sVal, patVal, replVal: Pointer); cdecl;
+begin
+  PAnsiString(dstSlot)^ := RegexReplaceAll(AnsiString(sVal), AnsiString(patVal), AnsiString(replVal));
+end;
+
+procedure AotGfxSetTarget(VMSelf: Pointer; Handle, Active: PtrInt; Desc: PInt64); cdecl;
+// C12: an EXACT transcription of RunTemplate's graphics sub-op 61 - two field stores - plus the one
+// thing the interpreter gets for free and native code does not: the C8 PSet descriptor now describes
+// a surface that is no longer the target, so it has to be shut. AotExecOne did this for every helper
+// call; a native arm has to do it for itself, and only the arms that can actually change the surface
+// need to (see the AotGfxRefresh list, which is the other half of this contract).
+begin
+  if Active <> 0 then
+  begin
+    TBytecodeVM(VMSelf).FGfxDrawTargetActive := True;
+    TBytecodeVM(VMSelf).FGfxDrawTargetHandle := Handle;
+  end
+  else
+    TBytecodeVM(VMSelf).FGfxDrawTargetActive := False;
+  // ⛔⛔ REBUILT, NOT ZEROED, and the difference is the whole win. Zeroing is correct - it shuts the
+  // fast path - but SetTarget is emitted around EVERY PSet in the double-buffered idiom, so the next
+  // PSet always found a shut gate and took the cold path: 1 310 721 helper calls, i.e. every single
+  // one. AotGfxRefresh answers the SAME question for the NEW surface (it reads VM.DrawSurface, which
+  // is target-aware), so the descriptor is simply correct again and PSet stays native.
+  // ⭐ And it is the one gate, not a second copy: this calls the function that owns the condition
+  // list, so a condition added there reaches here for free.
+  if Desc <> nil then AotGfxRefresh(VMSelf, nil, Desc);
+end;
+
 procedure TBytecodeVM.SetAotPrimitives(var C: TAotCtx);
 begin
   // C3: the runtime-helper pair. Compiled code calls back into the interpreter for an op with no
@@ -11573,6 +11618,9 @@ begin
   // C9: the math table. Filled once; the pointer is stable for the process.
   InitAotMathFns;
   C.MathFns := @GAotMathFns[0];
+  C.RegexCount := @AotRegexCount;
+  C.RegexReplace := @AotRegexReplace;
+  C.GfxSetTarget := @AotGfxSetTarget;
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
   C.StrCmp := @AotStrCmp;

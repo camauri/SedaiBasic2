@@ -136,6 +136,21 @@ type
     // so the mapping from opcode to function exists once. Getting one wrong would be a silent wrong
     // ANSWER, not a crash - which is what job/tests/bas/math_aot_native.bas is there to catch.
     MathFns: Pointer;      // offset 296: @GAotMathFns[0], sixteen cdecl Double->Double(,Double)
+    // C11: REGEXCOUNT / REGEXREPLACE as leaf calls. Both interpreter arms are ONE LINE - a call to
+    // RegexCountMatches / RegexReplaceAll - so there is no raise, no domain guard and no state: the
+    // §3 "the work IS the call" case, where a leaf leaves only noise behind. Measured 2 Sep 2026,
+    // AOTC_DIAG: regex_scale made 700 003 helper calls on RegexCount alone and ran 0.86x the
+    // INTERPRETER; regex_short 782 400 + 384 000 and 0.95x.
+    RegexCount: Pointer;   // offset 304: @AotRegexCount   (sVal, patVal) -> Int64
+    RegexReplace: Pointer; // offset 312: @AotRegexReplace (dstSlot, sVal, patVal, replVal)
+    // C12: the image DRAW TARGET. Two field stores in the interpreter - ~2 ns of real work behind a
+    // ~55 ns helper round trip - and `PSet img, (x, y), c`, the double-buffered idiom, emits the pair
+    // SetTarget/PSet/SetTarget PER PIXEL. Measured 2 Sep 2026 on job/tests/bench/render_probe.bas,
+    // AOTC_DIAG: 2 621 440 helper calls on GfxSetTarget alone, and --aot ran 0.45x the INTERPRETER.
+    // ⛔ It takes the descriptor because it MUST invalidate it: the surface just changed, and C8's
+    // fast PSet caches the work page. A native arm that forgot this would paint into the wrong
+    // surface - silently, and only when a draw target is active.
+    GfxSetTarget: Pointer; // offset 320: @AotGfxSetTarget (VMSelf, handle, active, desc)
   end;
   PAotCtx = ^TAotCtx;
 
@@ -169,6 +184,9 @@ const
   AOTCTX_GFXDESC     = 280;
   AOTCTX_GFXREFRESH  = 288;
   AOTCTX_MATHFNS     = 296;
+  AOTCTX_REGEXCOUNT  = 304;
+  AOTCTX_REGEXREPL   = 312;
+  AOTCTX_GFXSETTGT   = 320;
 
   // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
   // SedaiBytecodeVM fills the table at those indices.
@@ -1159,6 +1177,10 @@ begin
     // Str() of an int and Val(): dialect-independent leaf primitives (float Str() stays on
     // the helper - it needs the console-behavior object).
     ssaIntToString, ssaStrVal, ssaStrValInt,
+    // C11: the two regex builtins - see the note on TAotCtx.RegexCount.
+    ssaRegexCount, ssaRegexReplace,
+    // C12: the image draw target - see the note on TAotCtx.GfxSetTarget.
+    ssaGfxSetTarget,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
     // The MODERN bit intrinsics. Whether each is REALLY native is decided in AotIsNative
@@ -1360,6 +1382,11 @@ begin
     ssaIntToString:     Result := IsStr(Ins.Dest) and IsInt(Ins.Src1);
     ssaStrVal:          Result := IsFlt(Ins.Dest) and IsStr(Ins.Src1);
     ssaStrValInt:       Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
+    // The flag is a compile-time constant in every form the parser emits; anything else takes the
+    // helper rather than being guessed at.
+    ssaGfxSetTarget:    Result := IsInt(Ins.Src1) and (Ins.Src3.Kind = svkConstInt);
+    ssaRegexCount:      Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2);
+    ssaRegexReplace:    Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2) and IsStr(Ins.Src3);
   else
     Result := False;
   end;
@@ -3450,6 +3477,54 @@ var
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
     IStore(d, RAX);
+  end;
+  procedure EmitGfxSetTarget;  // FGfxDrawTargetActive/Handle := ...; and invalidate the PSet cache
+  var h, act: Integer;
+  begin
+    if Cur.Src3.Kind <> svkConstInt then begin Fail('gfxtarget-flag'); Exit; end;
+    act := Integer(Cur.Src3.ConstInt);
+    h := IReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    // ⛔ Everything read from r8 comes FIRST: on Win64 ABI_ARG2 IS r8, so writing it destroys the
+    // context pointer. Same order, and the same reason, as EmitStrInstr.
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);      // arg0 = ctx.VMSelf
+    E.MemOp([$49, $8B], ABI_ARG3, R8, AOTCTX_GFXDESC);     // arg3 = ctx.GfxDesc (may be nil)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_GFXSETTGT);        // rax  = the primitive
+    ILoadArgSpilled(ABI_ARG1, h);                          // arg1 = the image handle
+    if ABI_ARG2 >= 8 then E.Emit8($49) else E.Emit8($48);  // arg2 = the active flag (constant)
+    E.Emit8($C7); E.Emit8($C0 or (ABI_ARG2 and 7)); E.Emit32(LongWord(act));
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+  end;
+  procedure EmitRegexCount;   // IntRegs[dest] := RegexCountMatches(StringRegs[s1], StringRegs[s2])
+  var d, sv, pv: Integer;
+  begin
+    d := IReg(Cur.Dest); sv := SReg(Cur.Src1); pv := SReg(Cur.Src2); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    MovLoad(ABI_ARG0, RAX, LongWord(sv) * 8);
+    MovLoad(ABI_ARG1, RAX, LongWord(pv) * 8);
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_REGEXCOUNT);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+    IStore(d, RAX);
+  end;
+  procedure EmitRegexReplace; // StringRegs[dest] := RegexReplaceAll(s1, s2, s3)
+  var d, sv, pv, rv: Integer;
+  begin
+    d := SReg(Cur.Dest); sv := SReg(Cur.Src1); pv := SReg(Cur.Src2); rv := SReg(Cur.Src3);
+    if not OK then Exit;
+    SpillVolatiles;
+    // ⛔ The three VALUES are read before arg0 takes the address of the destination slot: dest may BE
+    // one of the sources ("s = RegexReplace(s, ...)"), and the primitive assigns to the slot last.
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    MovLoad(ABI_ARG1, RAX, LongWord(sv) * 8);
+    MovLoad(ABI_ARG2, RAX, LongWord(pv) * 8);
+    MovLoad(ABI_ARG3, RAX, LongWord(rv) * 8);
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_REGEXREPL);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
   end;
   procedure EmitIntToStr;  // StringRegs[dest] := IntToStr(IntRegs[src]) - Str() of an int
   var d, v: Integer;
@@ -6947,6 +7022,9 @@ var
       ssaStrVal:      EmitStrVal;
       ssaStrValInt:   EmitStrValInt;
       ssaStrInstr: EmitStrInstr;
+      ssaGfxSetTarget: EmitGfxSetTarget;
+      ssaRegexCount: EmitRegexCount;
+      ssaRegexReplace: EmitRegexReplace;
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
       begin
