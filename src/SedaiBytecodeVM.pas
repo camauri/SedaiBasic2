@@ -11606,6 +11606,28 @@ begin
   if Desc <> nil then AotGfxRefresh(VMSelf, nil, Desc);
 end;
 
+function AotIntToFloatFlags(V, Flags: PtrInt): Double; cdecl;
+// C13: an EXACT transcription of RunTemplate's bcIntToFloat, whose Immediate carries BITS and not a
+// choice of three: bit 0 = the SOURCE is unsigned, bit 1 = the result goes straight to binary32 with
+// ONE rounding. They are independent and the combination is real ("Dim As Single s = u"), which is
+// why this is a four-way and not a two-way.
+begin
+  if (Flags and 2) <> 0 then
+  begin
+    if (Flags and 1) <> 0 then Result := Single(QWord(V)) else Result := Single(V);
+  end
+  else if (Flags and 1) <> 0 then Result := QWord(V)
+  else Result := V;
+end;
+
+function AotFloatRoundU(D: Double): PtrInt; cdecl;
+// C13: bcFloatRound with an unsigned-64 destination. It passes True unconditionally - unlike
+// bcFloatToInt, which reads the runtime dialect - so this shim carries no decision of its own and
+// calls the same converter the interpreter's arm calls.
+begin
+  Result := PtrInt(FloatToUIntConv(D, True));
+end;
+
 procedure TBytecodeVM.SetAotPrimitives(var C: TAotCtx);
 begin
   // C3: the runtime-helper pair. Compiled code calls back into the interpreter for an op with no
@@ -11621,6 +11643,8 @@ begin
   C.RegexCount := @AotRegexCount;
   C.RegexReplace := @AotRegexReplace;
   C.GfxSetTarget := @AotGfxSetTarget;
+  C.IntToFloatU := @AotIntToFloatFlags;
+  C.FloatRoundU := @AotFloatRoundU;
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
   C.StrCmp := @AotStrCmp;

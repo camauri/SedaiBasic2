@@ -151,6 +151,17 @@ type
     // fast PSet caches the work page. A native arm that forgot this would paint into the wrong
     // surface - silently, and only when a draw target is active.
     GfxSetTarget: Pointer; // offset 320: @AotGfxSetTarget (VMSelf, handle, active, desc)
+    // C13: the UNSIGNED conversions. cvtsi2sd/cvtsd2si read and write SIGNED, so these were refused
+    // outright - correctly, since a wrong lowering here is a silent wrong ANSWER above 2^63, not a
+    // crash. But refusing them makes an unsigned-heavy program pay a full helper round trip per
+    // conversion: measured 2 Sep 2026 on bas/rosetta/sequence_of_non_squares.bas (UInteger
+    // throughout), 2 000 020 FloatRound + 1 000 021 IntToFloat helper calls and 0.49x the
+    // INTERPRETER. A leaf call keeps the interpreter's own arithmetic and drops the surround.
+    // ⛔ ssaFloatToInt unsigned is NOT here: its arm reads ModernConv, a RUNTIME dialect value, and
+    // a shim carrying its own copy of a dialect decision is the divergence this file warns about
+    // everywhere. FloatRound's unsigned arm passes True unconditionally, so it has no such tie.
+    IntToFloatU: Pointer;  // offset 328: @AotIntToFloatFlags (v, flags) -> Double
+    FloatRoundU: Pointer;  // offset 336: @AotFloatRoundU (d) -> Int64
   end;
   PAotCtx = ^TAotCtx;
 
@@ -187,6 +198,8 @@ const
   AOTCTX_REGEXCOUNT  = 304;
   AOTCTX_REGEXREPL   = 312;
   AOTCTX_GFXSETTGT   = 320;
+  AOTCTX_INTTOFLTU   = 328;
+  AOTCTX_FLTROUNDU   = 336;
 
   // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
   // SedaiBytecodeVM fills the table at those indices.
@@ -1412,15 +1425,22 @@ begin
     // every such conversion printed 0; refusing it in AotStringNativeOK was simply inert, because
     // that predicate is the STRING family's, not the general one. Two wrong hooks before the right
     // one, and aot_validate found both - which is the whole reason that net exists.
+    // C13: the unsigned/binary32 forms now take a leaf call instead of being refused. A NON-constant
+    // flag still goes to the helper: the emitter would have to branch on it at run time, and that is
+    // a shape this lowering has not seen.
     ssaIntToFloat:
-      Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
+      Result := (Ins.Src3.Kind = svkConstInt) or (Ins.Src3.Kind = svkNone);
     // ⛔ The mirror image, and refused for the mirror reason: with Src3 = 1 the DESTINATION is
     // unsigned 64-bit, and cvttsd2si answers the "integer indefinite" for everything at or above
     // 2^63 instead of the value fbc produces there. Reproducing it natively is a compare and a
     // second conversion around a biased operand, not one instruction - so it takes the helper road
     // and the interpreter's own arm answers, which is where the measured semantics lives.
-    ssaFloatToInt, ssaFloatRound:
+    ssaFloatToInt:
       Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
+    // C13: CINT to an unsigned 64-bit destination is a leaf call; every other flag value is refused
+    // exactly as before.
+    ssaFloatRound:
+      Result := (Ins.Src3.Kind <> svkConstInt) or (Ins.Src3.ConstInt = 0) or (Ins.Src3.ConstInt = 1);
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
     // C8. Three int operands, all of them registers: x, y and - in the IMMEDIATE - the colour.
@@ -6852,6 +6872,20 @@ var
       ssaIntToFloat:
       begin
         d := FReg(Cur.Dest); if not OK then Exit;
+        // C13: any flag set (unsigned source, binary32 result, or both) takes the leaf that
+        // transcribes the interpreter's four-way; only the plain signed 64 -> double is one
+        // instruction.
+        if (Cur.Src3.Kind = svkConstInt) and (Cur.Src3.ConstInt <> 0) then
+        begin
+          SpillVolatiles;
+          ILoadArgSpilled(ABI_ARG0, IReg(Cur.Src1));
+          MovImm64(ABI_ARG1, Cur.Src3.ConstInt);
+          E.MemOp([$49, $8B], RAX, R8, AOTCTX_INTTOFLTU);
+          E.EmitBytes([$FF, $D0]);
+          StrCallEpilogue;
+          FStore(d, XMM0);
+          Exit;
+        end;
         Hd := FAlloc(d);
         ILoad(RAX, IReg(Cur.Src1));
         if Hd >= 0 then
@@ -6864,7 +6898,22 @@ var
         if Modern then CvtFloatToInt([$0F, $2D])       // cvtsd2si (round-to-even)
         else CvtFloatToInt([$0F, $2C]);                // cvttsd2si (truncate)
       end;
-      ssaFloatRound: CvtFloatToInt([$0F, $2D]);        // CINT: round-to-even
+      ssaFloatRound:
+      begin
+        // C13: an UNSIGNED 64-bit destination takes the leaf; the signed form stays one instruction.
+        if (Cur.Src3.Kind = svkConstInt) and (Cur.Src3.ConstInt = 1) then
+        begin
+          d := IReg(Cur.Dest); if not OK then Exit;
+          SpillVolatiles;
+          FLoad(XMM0, FReg(Cur.Src1));
+          E.MemOp([$49, $8B], RAX, R8, AOTCTX_FLTROUNDU);
+          E.EmitBytes([$FF, $D0]);
+          StrCallEpilogue;
+          IStore(d, RAX);
+        end
+        else
+          CvtFloatToInt([$0F, $2D]);                  // CINT: round-to-even
+      end;
       ssaNarrowSingle:
       begin
         FLoad(XMM0, FReg(Cur.Src1));
