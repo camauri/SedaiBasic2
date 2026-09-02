@@ -71,8 +71,13 @@ type
     FProgram: TBytecodeProgram;
     FFusedCount: Integer;
     FKindMask: string;
+    FAotOwns: array of Boolean;
     function KindOn(Kind: Integer): Boolean;
     function KindOptIn(Kind: Integer): Boolean;
+    // ⛔ True where the AOT WILL compile: fusion is refused there and allowed everywhere else.
+    // Empty means "nobody told us", and with a compiler running that has to mean OFF - the same
+    // conservative answer this pass gave before the mask existed.
+    function MayFuseAt(Index: Integer): Boolean;
 
     { Try to fuse instruction at index i with following instructions }
     function TryFuseCompareAndBranch(Index: Integer): Boolean;
@@ -119,6 +124,8 @@ type
 
   public
     constructor Create(AProgram: TBytecodeProgram);
+    // The AOT's PC mask (see AotEligiblePCMask). Set it before Run when a compiler will run.
+    procedure SetAotOwnedPCs(const Mask: array of Boolean);
     function Run: Integer;
   end;
 
@@ -2441,6 +2448,23 @@ begin
   Result := (FKindMask <> '') and (Pos(',' + IntToStr(Kind) + ',', ',' + FKindMask + ',') > 0);
 end;
 
+procedure TSuperinstructionOptimizer.SetAotOwnedPCs(const Mask: array of Boolean);
+var i: Integer;
+begin
+  SetLength(FAotOwns, Length(Mask));
+  for i := 0 to High(Mask) do FAotOwns[i] := Mask[i];
+end;
+
+function TSuperinstructionOptimizer.MayFuseAt(Index: Integer): Boolean;
+// ⛔ A fusion consumes TWO instructions, so BOTH have to be outside the AOT's regions: fusing across
+// the boundary would put a superinstruction at the last PC of a declined region and NOP the first
+// of a compiled one, which is precisely the stream the AOT's emitter then refuses.
+begin
+  if Length(FAotOwns) = 0 then Exit(True);          // no compiler will run: the gate above decided
+  if (Index < 0) or (Index + 1 > High(FAotOwns)) then Exit(False);
+  Result := (not FAotOwns[Index]) and (not FAotOwns[Index + 1]);
+end;
+
 function TSuperinstructionOptimizer.Run: Integer;
 var
   i, Pass: Integer;
@@ -2474,8 +2498,21 @@ begin
   // interpreter's 10 340 999 - +50%, and the whole difference is AddIntToBranchLe unfusing back into
   // AddInt/CopyInt/Jump + CmpLeInt/JumpIfZero. That made --aot 0.83x the INTERPRETER, which the
   // standing rule calls a defect.
+  // ⛔⛔ THE JIT AND THE AOT ARE NOT THE SAME QUESTION, and treating them as one cost eight programs.
+  // The JIT declines a hot loop holding an opcode it cannot lower, and it picks its loops at RUN
+  // time, so nothing static can say where it will go: it stays a whole-program refusal (fannkuch
+  // --jit went 178 -> 4378 ms with fusion on, a factor of 24 - not slower, SWITCHED OFF).
+  // The AOT's regions ARE known statically, so it gets a mask instead of a veto: fusion is refused
+  // inside a region the AOT will compile and allowed in one it declines - which runs interpreted,
+  // and had been running UNFUSED bytecode for nothing. 📊 2 Sep 2026, 77 programs, --aot against the
+  // interpreter: eight were slower COMPILED, led by render_probe 0.47x and recfield_fb 0.80x.
+  // ⛔ SUPERINSTR_AOT=1 forces fusion everywhere even under the AOT - the A/B that PROVED the mask
+  // is needed rather than a plain lift: lifting it outright reads apmap_ceiling 944 -> 1691 ms and
+  // pairs_probe 1120 -> 2564, because the AOT's emitter then refuses regions its own survey accepts.
   if GJitWillRun then begin Result := 0; Exit; end;
-  if GAotWillRun and (GetEnvironmentVariable('SUPERINSTR_AOT') <> '1') then begin Result := 0; Exit; end;
+  if GAotWillRun and (Length(FAotOwns) = 0) and (GetEnvironmentVariable('SUPERINSTR_AOT') <> '1') then
+    begin Result := 0; Exit; end;
+  if GetEnvironmentVariable('SUPERINSTR_AOT') = '1' then SetLength(FAotOwns, 0);
   // ⚡ SUPERMASK: bisect WHICH fusion is wrong. Every TryFuseXxx call is guarded by KindOn(n), and
   // SUPERMASK is a comma-separated list of the kinds to ENABLE (empty = all). The family was off for
   // a month, so it has rotted: with all of it on, run_regress gives 16 FAIL and 16 OPTDIFF. This is
@@ -2493,6 +2530,15 @@ begin
     begin
       // Skip NOPs
       if TBytecodeOp(FProgram.GetInstruction(i).OpCode) = bcNop then
+      begin
+        Inc(i);
+        Continue;
+      end;
+
+      // ⛔ ONE test for every fusion below, on purpose: a per-pattern gate is a parallel list, and a
+      // parallel list has no moment at which it is complete. Here the AOT owns this stretch and the
+      // pass keeps out; everywhere else it fuses exactly as it does with no compiler at all.
+      if not MayFuseAt(i) then
       begin
         Inc(i);
         Continue;

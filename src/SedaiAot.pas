@@ -136,6 +136,32 @@ type
     // so the mapping from opcode to function exists once. Getting one wrong would be a silent wrong
     // ANSWER, not a crash - which is what job/tests/bas/math_aot_native.bas is there to catch.
     MathFns: Pointer;      // offset 296: @GAotMathFns[0], sixteen cdecl Double->Double(,Double)
+    // C11: REGEXCOUNT / REGEXREPLACE as leaf calls. Both interpreter arms are ONE LINE - a call to
+    // RegexCountMatches / RegexReplaceAll - so there is no raise, no domain guard and no state: the
+    // §3 "the work IS the call" case, where a leaf leaves only noise behind. Measured 2 Sep 2026,
+    // AOTC_DIAG: regex_scale made 700 003 helper calls on RegexCount alone and ran 0.86x the
+    // INTERPRETER; regex_short 782 400 + 384 000 and 0.95x.
+    RegexCount: Pointer;   // offset 304: @AotRegexCount   (sVal, patVal) -> Int64
+    RegexReplace: Pointer; // offset 312: @AotRegexReplace (dstSlot, sVal, patVal, replVal)
+    // C12: the image DRAW TARGET. Two field stores in the interpreter - ~2 ns of real work behind a
+    // ~55 ns helper round trip - and `PSet img, (x, y), c`, the double-buffered idiom, emits the pair
+    // SetTarget/PSet/SetTarget PER PIXEL. Measured 2 Sep 2026 on job/tests/bench/render_probe.bas,
+    // AOTC_DIAG: 2 621 440 helper calls on GfxSetTarget alone, and --aot ran 0.45x the INTERPRETER.
+    // ⛔ It takes the descriptor because it MUST invalidate it: the surface just changed, and C8's
+    // fast PSet caches the work page. A native arm that forgot this would paint into the wrong
+    // surface - silently, and only when a draw target is active.
+    GfxSetTarget: Pointer; // offset 320: @AotGfxSetTarget (VMSelf, handle, active, desc)
+    // C13: the UNSIGNED conversions. cvtsi2sd/cvtsd2si read and write SIGNED, so these were refused
+    // outright - correctly, since a wrong lowering here is a silent wrong ANSWER above 2^63, not a
+    // crash. But refusing them makes an unsigned-heavy program pay a full helper round trip per
+    // conversion: measured 2 Sep 2026 on bas/rosetta/sequence_of_non_squares.bas (UInteger
+    // throughout), 2 000 020 FloatRound + 1 000 021 IntToFloat helper calls and 0.49x the
+    // INTERPRETER. A leaf call keeps the interpreter's own arithmetic and drops the surround.
+    // ⛔ ssaFloatToInt unsigned is NOT here: its arm reads ModernConv, a RUNTIME dialect value, and
+    // a shim carrying its own copy of a dialect decision is the divergence this file warns about
+    // everywhere. FloatRound's unsigned arm passes True unconditionally, so it has no such tie.
+    IntToFloatU: Pointer;  // offset 328: @AotIntToFloatFlags (v, flags) -> Double
+    FloatRoundU: Pointer;  // offset 336: @AotFloatRoundU (d) -> Int64
   end;
   PAotCtx = ^TAotCtx;
 
@@ -169,6 +195,11 @@ const
   AOTCTX_GFXDESC     = 280;
   AOTCTX_GFXREFRESH  = 288;
   AOTCTX_MATHFNS     = 296;
+  AOTCTX_REGEXCOUNT  = 304;
+  AOTCTX_REGEXREPL   = 312;
+  AOTCTX_GFXSETTGT   = 320;
+  AOTCTX_INTTOFLTU   = 328;
+  AOTCTX_FLTROUNDU   = 336;
 
   // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
   // SedaiBytecodeVM fills the table at those indices.
@@ -273,6 +304,7 @@ type
     HelperOps: Integer;
   end;
   TAotRegions = array of TAotRegion;
+  TBoolArray = array of Boolean;
 
 // Slice into regions and classify against the B1 scalar set. Prog supplies the
 // SSA->PC map (entry PCs and the cross-check that the map lines up with ProcMap).
@@ -280,6 +312,32 @@ function AotSliceAndClassify(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TAot
 
 // AOT_DIAG=1 printout: per-region verdict + summary + map cross-check warnings.
 procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
+
+// True at every bytecode PC owned by a region the AOT will COMPILE - i.e. exactly where the
+// superinstruction pass must keep its hands off.
+//
+// ⛔⛔ WHY THIS EXISTS. Fusion and this backend compete for the same bytecode, so the pass used to
+// be refused OUTRIGHT whenever a compiler would run (SedaiSuperinstructions, GAotWillRun). That is
+// correct where the AOT compiles and a PURE LOSS everywhere else: a region the AOT DECLINES runs
+// interpreted, and it then runs UNFUSED bytecode for no reason at all. Measured 2 Sep 2026 over 77
+// programs, --aot against the interpreter: eight programs were SLOWER compiled than interpreted, led
+// by render_probe at 0.47x and recfield_fb at 0.80x, and the whole of it was this.
+// ⛔ And lifting the gate outright is NOT the cure - measured too: apmap_ceiling 944 -> 1691 ms,
+// pairs_probe 1120 -> 2564, because with superinstructions in the stream the AOT's emitter refuses
+// the region it had accepted (AOT_DIAG still says "1/1 eligible" while AOTC_DIAG says
+// "regions = 0" - the survey and the compiler disagree). So the answer is neither on nor off: fuse
+// where the AOT will not go, and nowhere else.
+//
+// Regions are contiguous in the emitted bytecode, so a region owns [EntryPC, next EntryPC - 1]. The
+// mask is consulted DURING the pass, where indices are stable: fusion writes the fused op in place
+// and NOPs its partner, and NOP compaction is a LATER pass. Afterwards the PCs shift and this mask
+// is dead - which is safe, because the AOT re-derives everything at load, an untouched eligible
+// region is still eligible, and a declined one cannot become less declined by gaining an opcode.
+function AotEligiblePCMask(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TBoolArray;
+
+// The superinstruction pass, told where the AOT will go. Every front end that both fuses and may run
+// the AOT calls THIS, not RunSuperinstructions - so the two can never disagree about the map.
+function RunSuperinstructionsAot(Prog: TBytecodeProgram; SSAProg: TSSAProgram): Integer;
 
 // Diagnostics from the last region compiled (liveness, C1). Not thread-safe; reporting only.
 var
@@ -478,7 +536,7 @@ procedure AotMagicSigned(d: Int64; out M: Int64; out s: Integer; out NeedAdd, Ne
 implementation
 
 
-uses TypInfo, Cpu;
+uses TypInfo, Cpu, SedaiSuperinstructions;
 
 var
   GArrAddrState: Integer = -1;   // AOT_ARRADDR=0 restores the rcx/rax-staged element addressing
@@ -1132,6 +1190,10 @@ begin
     // Str() of an int and Val(): dialect-independent leaf primitives (float Str() stays on
     // the helper - it needs the console-behavior object).
     ssaIntToString, ssaStrVal, ssaStrValInt,
+    // C11: the two regex builtins - see the note on TAotCtx.RegexCount.
+    ssaRegexCount, ssaRegexReplace,
+    // C12: the image draw target - see the note on TAotCtx.GfxSetTarget.
+    ssaGfxSetTarget,
     ssaBitwiseAnd, ssaBitwiseOr, ssaBitwiseXor, ssaBitwiseNot,
     ssaShl, ssaShr, ssaShrUInt,
     // The MODERN bit intrinsics. Whether each is REALLY native is decided in AotIsNative
@@ -1333,6 +1395,11 @@ begin
     ssaIntToString:     Result := IsStr(Ins.Dest) and IsInt(Ins.Src1);
     ssaStrVal:          Result := IsFlt(Ins.Dest) and IsStr(Ins.Src1);
     ssaStrValInt:       Result := IsInt(Ins.Dest) and IsStr(Ins.Src1);
+    // The flag is a compile-time constant in every form the parser emits; anything else takes the
+    // helper rather than being guessed at.
+    ssaGfxSetTarget:    Result := IsInt(Ins.Src1) and (Ins.Src3.Kind = svkConstInt);
+    ssaRegexCount:      Result := IsInt(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2);
+    ssaRegexReplace:    Result := IsStr(Ins.Dest) and IsStr(Ins.Src1) and IsStr(Ins.Src2) and IsStr(Ins.Src3);
   else
     Result := False;
   end;
@@ -1358,15 +1425,22 @@ begin
     // every such conversion printed 0; refusing it in AotStringNativeOK was simply inert, because
     // that predicate is the STRING family's, not the general one. Two wrong hooks before the right
     // one, and aot_validate found both - which is the whole reason that net exists.
+    // C13: the unsigned/binary32 forms now take a leaf call instead of being refused. A NON-constant
+    // flag still goes to the helper: the emitter would have to branch on it at run time, and that is
+    // a shape this lowering has not seen.
     ssaIntToFloat:
-      Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
+      Result := (Ins.Src3.Kind = svkConstInt) or (Ins.Src3.Kind = svkNone);
     // ⛔ The mirror image, and refused for the mirror reason: with Src3 = 1 the DESTINATION is
     // unsigned 64-bit, and cvttsd2si answers the "integer indefinite" for everything at or above
     // 2^63 instead of the value fbc produces there. Reproducing it natively is a compare and a
     // second conversion around a biased operand, not one instruction - so it takes the helper road
     // and the interpreter's own arm answers, which is where the measured semantics lives.
-    ssaFloatToInt, ssaFloatRound:
+    ssaFloatToInt:
       Result := not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0));
+    // C13: CINT to an unsigned 64-bit destination is a leaf call; every other flag value is refused
+    // exactly as before.
+    ssaFloatRound:
+      Result := (Ins.Src3.Kind <> svkConstInt) or (Ins.Src3.ConstInt = 0) or (Ins.Src3.ConstInt = 1);
     ssaArrayLoad, ssaArrayStore, ssaArrayLBound, ssaArrayUBound:
       Result := AotArrayNativeOK(SSAProg, Ins);
     // C8. Three int operands, all of them registers: x, y and - in the IMMEDIATE - the colour.
@@ -1625,6 +1699,118 @@ begin
   until Ordinal = 0;
 
   Result := Regions;
+end;
+
+procedure AotPrepareClassification(SSAProg: TSSAProgram; AllowUnsafe: Boolean);
+// ⛔⛔ THE FOUR GLOBALS THE CLASSIFIER READS, SET IN ONE PLACE. They were written out inline in
+// AotCompileProgram, with a comment saying GArrStrNative "must be set BEFORE AotSliceAndClassify ...
+// if the two saw different values a region would be accepted and then fail at emit time". The
+// superinstruction mask (AotEligiblePCMask) classifies too, and a second hand-written copy of this
+// preamble is exactly how the two would drift - measured: without it the mask called a region
+// ineligible that the compiler then took, so the pass fused inside it and the AOT refused what it
+// had accepted (apmap_ceiling 944 -> 1702 ms, pairs_probe 1120 -> 2552).
+var
+  b, i: Integer;
+begin
+  GNoThreads := True;
+  // The condition compiled code actually answers to. Not a thread census: the interpreter's own
+  // resolve of a shared handle is unlocked by default (TBytecodeVM.FSharedRecLockFree, same env var),
+  // so emitting the native path adds no exposure that the interpreter does not already have - and
+  // when the lock is put back, both stand down together. Read here rather than threaded through the
+  // signature; FSharedRecLockFree is the source of truth and this must not outlive a change to it.
+  GSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GAotRecNative := GetEnvironmentVariable('AOT_RECDEOPT') <> '1';
+  if SSAProg <> nil then
+    for b := 0 to SSAProg.Blocks.Count - 1 do
+    begin
+      for i := 0 to SSAProg.Blocks[b].Instructions.Count - 1 do
+        if SSAProg.Blocks[b].Instructions[i].OpCode in [ssaThreadCreate, ssaCallSubIndirect] then
+        begin
+          GNoThreads := False;
+          Break;
+        end;
+      if not GNoThreads then Break;
+    end;
+  GArrStrNative := AllowUnsafe;
+end;
+
+function AotEligiblePCMask(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TBoolArray;
+var
+  Regions: TAotRegions;
+  Starts: array of Integer;
+  Elig: array of Boolean;
+  i, j, n, t: Integer;
+  b: Boolean;
+  Stop: Integer;
+begin
+  SetLength(Result, 0);
+  if (SSAProg = nil) or (Prog = nil) then Exit;
+  n := Prog.GetInstructionCount;
+  if n <= 0 then Exit;
+  // ⛔ CLASSIFIED TWICE, AND THE ANSWER IS THE UNION. The real gate is
+  // "ModernMode and not bounds-check", a value this pass does not have and must not guess: guessing
+  // it wrong in the permissive direction lets the fusion into a region the AOT then takes, and the
+  // AOT refuses at emit time what its own survey accepted. So both values are asked and a PC counts
+  // as the AOT's if EITHER says so - conservative in the only direction that is safe, at the cost of
+  // a handful of fusions in regions that were never going to be compiled anyway.
+  AotPrepareClassification(SSAProg, True);
+  Regions := AotSliceAndClassify(SSAProg, Prog);
+  if Length(Regions) = 0 then Exit;
+  SetLength(Starts, 0); SetLength(Elig, 0);
+  for i := 0 to High(Regions) do
+    if Regions[i].EntryPC >= 0 then
+    begin
+      t := Length(Starts);
+      SetLength(Starts, t + 1); SetLength(Elig, t + 1);
+      Starts[t] := Regions[i].EntryPC; Elig[t] := Regions[i].Eligible;
+    end;
+  AotPrepareClassification(SSAProg, False);
+  Regions := AotSliceAndClassify(SSAProg, Prog);
+  for i := 0 to High(Regions) do
+    if Regions[i].EntryPC >= 0 then
+      for j := 0 to High(Starts) do
+        if Starts[j] = Regions[i].EntryPC then
+        begin
+          Elig[j] := Elig[j] or Regions[i].Eligible;
+          Break;
+        end;
+  if Length(Starts) = 0 then Exit;
+  for i := 0 to High(Starts) - 1 do
+    for j := i + 1 to High(Starts) do
+      if Starts[j] < Starts[i] then
+      begin
+        t := Starts[i]; Starts[i] := Starts[j]; Starts[j] := t;
+        b := Elig[i]; Elig[i] := Elig[j]; Elig[j] := b;
+      end;
+  SetLength(Result, n);
+  for i := 0 to n - 1 do Result[i] := False;
+  for i := 0 to High(Starts) do
+  begin
+    if not Elig[i] then System.Continue;
+    if i < High(Starts) then Stop := Starts[i + 1] - 1 else Stop := n - 1;
+    for j := Starts[i] to Stop do
+      if (j >= 0) and (j < n) then Result[j] := True;
+  end;
+end;
+
+function RunSuperinstructionsAot(Prog: TBytecodeProgram; SSAProg: TSSAProgram): Integer;
+var
+  Opt: TSuperinstructionOptimizer;
+  Mask: TBoolArray;
+begin
+  Opt := TSuperinstructionOptimizer.Create(Prog);
+  try
+    // Only ask when the AOT will actually run: classifying costs a pass over the SSA, and with no
+    // compiler in the picture the optimizer's own gate lets everything through anyway.
+    if GAotWillRun and (not GJitWillRun) then
+    begin
+      Mask := AotEligiblePCMask(SSAProg, Prog);
+      if Length(Mask) > 0 then Opt.SetAotOwnedPCs(Mask);
+    end;
+    Result := Opt.Run;
+  finally
+    Opt.Free;
+  end;
 end;
 
 procedure AotSurvey(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
@@ -3311,6 +3497,54 @@ var
     E.EmitBytes([$FF, $D0]);
     StrCallEpilogue;
     IStore(d, RAX);
+  end;
+  procedure EmitGfxSetTarget;  // FGfxDrawTargetActive/Handle := ...; and invalidate the PSet cache
+  var h, act: Integer;
+  begin
+    if Cur.Src3.Kind <> svkConstInt then begin Fail('gfxtarget-flag'); Exit; end;
+    act := Integer(Cur.Src3.ConstInt);
+    h := IReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    // ⛔ Everything read from r8 comes FIRST: on Win64 ABI_ARG2 IS r8, so writing it destroys the
+    // context pointer. Same order, and the same reason, as EmitStrInstr.
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);      // arg0 = ctx.VMSelf
+    E.MemOp([$49, $8B], ABI_ARG3, R8, AOTCTX_GFXDESC);     // arg3 = ctx.GfxDesc (may be nil)
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_GFXSETTGT);        // rax  = the primitive
+    ILoadArgSpilled(ABI_ARG1, h);                          // arg1 = the image handle
+    if ABI_ARG2 >= 8 then E.Emit8($49) else E.Emit8($48);  // arg2 = the active flag (constant)
+    E.Emit8($C7); E.Emit8($C0 or (ABI_ARG2 and 7)); E.Emit32(LongWord(act));
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+  end;
+  procedure EmitRegexCount;   // IntRegs[dest] := RegexCountMatches(StringRegs[s1], StringRegs[s2])
+  var d, sv, pv: Integer;
+  begin
+    d := IReg(Cur.Dest); sv := SReg(Cur.Src1); pv := SReg(Cur.Src2); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    MovLoad(ABI_ARG0, RAX, LongWord(sv) * 8);
+    MovLoad(ABI_ARG1, RAX, LongWord(pv) * 8);
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_REGEXCOUNT);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
+    IStore(d, RAX);
+  end;
+  procedure EmitRegexReplace; // StringRegs[dest] := RegexReplaceAll(s1, s2, s3)
+  var d, sv, pv, rv: Integer;
+  begin
+    d := SReg(Cur.Dest); sv := SReg(Cur.Src1); pv := SReg(Cur.Src2); rv := SReg(Cur.Src3);
+    if not OK then Exit;
+    SpillVolatiles;
+    // ⛔ The three VALUES are read before arg0 takes the address of the destination slot: dest may BE
+    // one of the sources ("s = RegexReplace(s, ...)"), and the primitive assigns to the slot last.
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_STRREGS);
+    MovLoad(ABI_ARG1, RAX, LongWord(sv) * 8);
+    MovLoad(ABI_ARG2, RAX, LongWord(pv) * 8);
+    MovLoad(ABI_ARG3, RAX, LongWord(rv) * 8);
+    Lea(ABI_ARG0, RAX, LongWord(d) * 8);                  // arg0 = &StringRegs[dest]
+    E.MemOp([$49, $8B], RAX, R8, AOTCTX_REGEXREPL);
+    E.EmitBytes([$FF, $D0]);
+    StrCallEpilogue;
   end;
   procedure EmitIntToStr;  // StringRegs[dest] := IntToStr(IntRegs[src]) - Str() of an int
   var d, v: Integer;
@@ -6638,6 +6872,20 @@ var
       ssaIntToFloat:
       begin
         d := FReg(Cur.Dest); if not OK then Exit;
+        // C13: any flag set (unsigned source, binary32 result, or both) takes the leaf that
+        // transcribes the interpreter's four-way; only the plain signed 64 -> double is one
+        // instruction.
+        if (Cur.Src3.Kind = svkConstInt) and (Cur.Src3.ConstInt <> 0) then
+        begin
+          SpillVolatiles;
+          ILoadArgSpilled(ABI_ARG0, IReg(Cur.Src1));
+          MovImm64(ABI_ARG1, Cur.Src3.ConstInt);
+          E.MemOp([$49, $8B], RAX, R8, AOTCTX_INTTOFLTU);
+          E.EmitBytes([$FF, $D0]);
+          StrCallEpilogue;
+          FStore(d, XMM0);
+          Exit;
+        end;
         Hd := FAlloc(d);
         ILoad(RAX, IReg(Cur.Src1));
         if Hd >= 0 then
@@ -6650,7 +6898,22 @@ var
         if Modern then CvtFloatToInt([$0F, $2D])       // cvtsd2si (round-to-even)
         else CvtFloatToInt([$0F, $2C]);                // cvttsd2si (truncate)
       end;
-      ssaFloatRound: CvtFloatToInt([$0F, $2D]);        // CINT: round-to-even
+      ssaFloatRound:
+      begin
+        // C13: an UNSIGNED 64-bit destination takes the leaf; the signed form stays one instruction.
+        if (Cur.Src3.Kind = svkConstInt) and (Cur.Src3.ConstInt = 1) then
+        begin
+          d := IReg(Cur.Dest); if not OK then Exit;
+          SpillVolatiles;
+          FLoad(XMM0, FReg(Cur.Src1));
+          E.MemOp([$49, $8B], RAX, R8, AOTCTX_FLTROUNDU);
+          E.EmitBytes([$FF, $D0]);
+          StrCallEpilogue;
+          IStore(d, RAX);
+        end
+        else
+          CvtFloatToInt([$0F, $2D]);                  // CINT: round-to-even
+      end;
       ssaNarrowSingle:
       begin
         FLoad(XMM0, FReg(Cur.Src1));
@@ -6808,6 +7071,9 @@ var
       ssaStrVal:      EmitStrVal;
       ssaStrValInt:   EmitStrValInt;
       ssaStrInstr: EmitStrInstr;
+      ssaGfxSetTarget: EmitGfxSetTarget;
+      ssaRegexCount: EmitRegexCount;
+      ssaRegexReplace: EmitRegexReplace;
 
       ssaJump, ssaJumpIfZero, ssaJumpIfNotZero:
       begin
@@ -7506,31 +7772,10 @@ begin
   //
   // ⛔ And the lesson under the lesson: a cost verdict has a DATE on it. This one was honest when
   // written and false eight weeks later, because a defect somewhere else was inside the measurement.
-  GNoThreads := True;
-  // The condition compiled code actually answers to. Not a thread census: the interpreter's own
-  // resolve of a shared handle is unlocked by default (TBytecodeVM.FSharedRecLockFree, same env var),
-  // so emitting the native path adds no exposure that the interpreter does not already have - and
-  // when the lock is put back, both stand down together. Read here rather than threaded through the
-  // signature; FSharedRecLockFree is the source of truth and this must not outlive a change to it.
-  GSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
-  GAotRecNative := GetEnvironmentVariable('AOT_RECDEOPT') <> '1';
+  AotPrepareClassification(SSAProg, AllowUnsafe);
   if AotDumpDir <> '' then
     WriteLn(ErrOutput, '[AOT] AOT_DUMP: region dumps go to ', AotDumpDir,
             ' (disassemble with job/tests/tools/aot_disasm.ps1)');
-  for r := 0 to SSAProg.Blocks.Count - 1 do
-  begin
-    for n := 0 to SSAProg.Blocks[r].Instructions.Count - 1 do
-      if SSAProg.Blocks[r].Instructions[n].OpCode in [ssaThreadCreate, ssaCallSubIndirect] then
-      begin
-        GNoThreads := False;
-        Break;
-      end;
-    if not GNoThreads then Break;
-  end;
-  // Must be set BEFORE AotSliceAndClassify: the classifier reads it through AotArrayNativeOK, and
-  // the emitter reads the same global later. If the two saw different values a region would be
-  // accepted and then fail at emit time.
-  GArrStrNative := AllowUnsafe;
   n := 0;
   Regions := AotSliceAndClassify(SSAProg, Prog);
   SetLength(Result, Length(Regions));

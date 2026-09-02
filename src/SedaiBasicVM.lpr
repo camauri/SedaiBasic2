@@ -1775,7 +1775,7 @@ begin
       WriteLn('=== SUPERINSTRUCTIONS ===');
     {$ENDIF}
     try
-      if GSSAOptimizationsEnabled then RunSuperinstructions(BytecodeProgram);
+      if GSSAOptimizationsEnabled then RunSuperinstructionsAot(BytecodeProgram, SSAProgram);
       {$IFDEF DEBUG_SUPERINSTR}
       if DebugSuperinstr then
         WriteLn(Format('  Instructions after fusion: %d', [BytecodeProgram.GetInstructionCount]));
