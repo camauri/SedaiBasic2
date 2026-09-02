@@ -548,36 +548,62 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
   L_XferLoadInt: ireg[I->dest] = xi[I->imm];                                        pc++; NEXT;
   L_XferLoadFloat: freg[I->dest] = xf[I->imm];                                        pc++; NEXT;
 
-    /* ---- fused array forms. MODERN only, for the same reason as the plain accessors. ---- */
+    /* ---- fused array forms. ----
+       ⛔⛔ THIS BLOCK IS THE TWIN THAT WAS LEFT BEHIND ON 21 AUG 2026, and its header used to say
+       "MODERN only, for the same reason as the plain accessors" - citing a reason that had been
+       CORRECTED four hundred lines above and never re-read here. The plain accessors' note now
+       states it exactly: THE FLAG GUARDS THE OUT-OF-BOUNDS CASE, NOT THE ACCESS. HF_MODERN_ARRAYS
+       means "MODERN dialect AND bounds checking off", so a leading `if (!flag) return pc` hands the
+       PC back on the FIRST element of every CLASSIC program - which is what it did here, for these
+       six, for eleven days after the four next door were fixed.
+
+       📊 Measured 2 Sep 2026, job/tests/bench/nbody_v7.bas (CLASSIC), HOTC_DIAG=1: superinstruction
+       kind 15 fuses ArrayLoadFloat + AddFloat into bcArrayLoadSubFloat, and that took C-loop entries
+       from 2 000 004 to 62 000 124 - 60 000 120 exits on that one opcode, every element - and the
+       program from 1151 ms to 1707. ⇒ The FUSION read as the pessimisation; the fusion was fine and
+       the arm it fused into was closed. A pass that mints an opcode this loop refuses is the easiest
+       way there is to break a covered run, so a fusion and its arm are one change, never two.
+
+       In bounds the two dialects do exactly the same thing through exactly the same descriptor; they
+       differ only out of range, where MODERN yields the element default (a load reads 0, a store is
+       dropped, NZ does not branch, Z branches - RunTemplate.inc sub-ops 41/42/58/30/48/49) and
+       CLASSIC has to RAISE, which this loop cannot do: there it hands the PC back, an error path.
+       The in-bounds test is ONE unsigned compare - a negative index wraps to a huge unsigned value
+       and fails the same test - as in the plain accessors above. */
   L_ArrayLoadAddFloat:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        freg[I->dest] = freg[I->imm] + ((li >= 0 && li < d[2]) ? ((const double *)(intptr_t)d[1])[li] : 0.0); }
+        if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = freg[I->imm] + ((const double *)(intptr_t)d[1])[li];
+        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = freg[I->imm];
+        else return pc; }
       pc++; NEXT;
   L_ArrayLoadSubFloat:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        freg[I->dest] = freg[I->imm] - ((li >= 0 && li < d[2]) ? ((const double *)(intptr_t)d[1])[li] : 0.0); }
+        if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = freg[I->imm] - ((const double *)(intptr_t)d[1])[li];
+        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = freg[I->imm];
+        else return pc; }
       pc++; NEXT;
   L_ArrayLoadIntTo:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        ireg[I->dest] = (li >= 0 && li < d[2]) ? ((const int64_t *)(intptr_t)d[0])[li] : 0; }
+        if ((uint64_t)li < (uint64_t)d[2]) ireg[I->dest] = ((const int64_t *)(intptr_t)d[0])[li];
+        else if (flags & HF_MODERN_ARRAYS) ireg[I->dest] = 0;
+        else return pc; }
       pc++; NEXT;
   L_ArrayStoreIntConst:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        if (li >= 0 && li < d[2]) ((int64_t *)(intptr_t)d[0])[li] = I->imm; }
+        if ((uint64_t)li < (uint64_t)d[2]) ((int64_t *)(intptr_t)d[0])[li] = I->imm;
+        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
       pc++; NEXT;
   L_ArrayLoadIntBranchNZ:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
-      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        int nz = (li >= 0 && li < d[2]) && ((const int64_t *)(intptr_t)d[0])[li] != 0;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2]; int nz;
+        if ((uint64_t)li < (uint64_t)d[2]) nz = ((const int64_t *)(intptr_t)d[0])[li] != 0;
+        else if (flags & HF_MODERN_ARRAYS) nz = 0;   /* the element default is 0: no branch */
+        else return pc;
         JUMPTO(nz ? (int)I->imm : pc + 1); }
   L_ArrayLoadIntBranchZ:
-      if (!(flags & HF_MODERN_ARRAYS)) return pc;
-      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
-        int z = !(li >= 0 && li < d[2]) || ((const int64_t *)(intptr_t)d[0])[li] == 0;
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2]; int z;
+        if ((uint64_t)li < (uint64_t)d[2]) z = ((const int64_t *)(intptr_t)d[0])[li] == 0;
+        else if (flags & HF_MODERN_ARRAYS) z = 1;    /* the element default is 0: branch */
+        else return pc;
         JUMPTO(z ? (int)I->imm : pc + 1); }
 
 #undef NEXT
