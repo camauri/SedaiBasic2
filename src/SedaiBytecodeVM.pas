@@ -452,6 +452,18 @@ type
     FPrivArrCount: Integer;           // arrays per block (0 = the program has no private array at all)
     FPrivBlockBase: Integer;          // FArrays index of block 0
     FPrivBlockUsed: array of Boolean; // which blocks are handed out (guarded by FWorkerLock)
+    // ⛔⛔ THE HIGHEST BLOCK EVER HANDED OUT, and it is what makes an array PARAMETER affordable.
+    // The plan reserves MAX_LIVE_WORKERS+1 blocks at load (see BuildPrivateArrayPlan, and the note
+    // there on why lazy reservation is NOT the lever). A single-threaded program with ONE array
+    // parameter therefore owns 68 array slots where 4 hold anything - and both descriptor rebuilds
+    // walk all 68, on every entry to the C hot loop, several times per call.
+    // 📊 Measured 2 Sep 2026, 2 000 000 calls to a SUB with an array parameter and an EMPTY body:
+    // 2 331 ms against 22 ms without the parameter - 105x - with AcquireArrDescCtx at 47% of the
+    // program and RebuildJitArrDesc at 19%.
+    // An unhanded block has no storage, so its descriptor entries are zero and STAY zero: skipping
+    // them changes no value, only the work. Never lowered - a block is not returned to the pool in
+    // a way that could make a live descriptor entry unreachable.
+    FPrivBlockHigh: Integer;
     FStaticArrCount: Integer;         // size of the compile-time id space (ArrMap covers exactly this)
     // The array BYREF bind save-stack moved to TExecutionContext (per-context since 21 Aug 2026).
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
@@ -600,6 +612,7 @@ type
     procedure RebuildJitArrDesc;
     function AcquireArrDesc: Pointer;
     procedure EnsureArrDesc(Ctx: PAotCtx);
+    function AcquireArrDescCtxLocked(ECtx: TExecutionContext): Pointer;  // ...its body, lock NOT taken
     function AcquireArrDescCtx(ECtx: TExecutionContext): Pointer;   // per-context table when arrays are private
     function AcquireArrDescFast(var Cached: Pointer; ECtx: TExecutionContext): Pointer;
     procedure ReleaseRetiredArrDesc;
@@ -11737,6 +11750,7 @@ begin
     SetLength(FArrays, FPrivBlockBase);
   FStaticArrCount := Length(FArrays);
   FPrivArrCount := 0;
+  FPrivBlockHigh := 0;
   FPrivBlockBase := FStaticArrCount;
   SetLength(FArrPrivSlot, FStaticArrCount);
   for i := 0 to FStaticArrCount - 1 do FArrPrivSlot[i] := -1;
@@ -11786,6 +11800,7 @@ begin
       if not FPrivBlockUsed[b] then
       begin
         FPrivBlockUsed[b] := True;
+        if b > FPrivBlockHigh then FPrivBlockHigh := b;   // the rebuilds stop here - see FPrivBlockHigh
         Ctx.ArrPrivBlock := b;
         Base := FPrivBlockBase + b * FPrivArrCount;
         Break;
@@ -11919,6 +11934,14 @@ begin
   end;
   n := Length(FArrays);
   SetLength(FJitArrDesc, n * 4 + 4);   // +4 so @FJitArrDesc[0] is always valid even with no arrays
+  // ⛔ The TABLE keeps its full length - ids are baked into compiled code and must stay in range -
+  // but the WORK stops at the last block ever handed out. Everything past it has no storage, so its
+  // entries are zero from the first allocation and nothing here would change them. See FPrivBlockHigh.
+  if FPrivArrCount > 0 then
+  begin
+    a := FPrivBlockBase + (FPrivBlockHigh + 1) * FPrivArrCount;
+    if a < n then n := a;
+  end;
   for a := 0 to n - 1 do
   begin
     if Length(FArrays[a].IntData) > 0 then
@@ -11936,24 +11959,15 @@ begin
   Inc(FArrDescGen);   // every per-context copy built from the old one is now stale
 end;
 
-function TBytecodeVM.AcquireArrDescCtx(ECtx: TExecutionContext): Pointer;
-// The descriptor table THIS context may hand to compiled code.
-//
-// ⭐ Why it exists. hotdisp.c, the AOT and the loop JIT all index the table with the array id baked
-// into their code, which is a LOGICAL id. A proc-local array has one storage PER CONTEXT, so the same
-// logical id must resolve to different memory in different threads - and the cheapest place to say so
-// is the table itself, not every access. Patching the copy here is what let all three compiled
-// engines stay byte-identical while local arrays became per-thread.
-//
-// ⛔ A program with NO private array gets the master table, unchanged and unlocked on the fast lane,
-// exactly as before: this whole path must cost nothing where it buys nothing.
+function TBytecodeVM.AcquireArrDescCtxLocked(ECtx: TExecutionContext): Pointer;
+// The body of AcquireArrDescCtx, WITHOUT the lock. Two callers and one copy: the locked path
+// wraps it, the single-threaded fast lane calls it bare. Extracting it is what keeps the two
+// from drifting - the defect this file records four times over is the same steps written out
+// again somewhere else.
 var
   i, n: Integer;
   Src, Dst: Integer;
 begin
-  if FPrivArrCount = 0 then Exit(AcquireArrDesc);
-  EnterCriticalSection(FArrDescLock);
-  try
     if FArraysDirty then RebuildJitArrDesc;
     if (ECtx.ArrDescGen <> FArrDescGen) or (Length(ECtx.ArrDescOwn) <> Length(FJitArrDesc)) then
     begin
@@ -11986,7 +12000,15 @@ begin
       // re-reads at call boundaries - was stable.
       // Written this way each entry goes from one correct value straight to the next, and a 64-bit
       // aligned store is atomic, so there is no moment at which the table is wrong.
-      for i := 0 to (Length(ECtx.ArrDescOwn) div 4) - 1 do
+      // ⛔ Same bound as RebuildJitArrDesc, and for the same reason: past the last block ever handed
+      // out there is no storage, so both the master and this copy hold zeros there and always will.
+      n := Length(ECtx.ArrDescOwn) div 4;
+      if FPrivArrCount > 0 then
+      begin
+        Src := FPrivBlockBase + (FPrivBlockHigh + 1) * FPrivArrCount;
+        if Src < n then n := Src;
+      end;
+      for i := 0 to n - 1 do
       begin
         Dst := i * 4;
         if Dst + 3 >= Length(ECtx.ArrDescOwn) then Break;
@@ -12028,7 +12050,39 @@ begin
                     [FArrDescGen, i, ECtx.ArrMap[i], ECtx.ArrDescOwn[i*4], ECtx.ArrDescOwn[i*4+2]]));
     end;
     if Length(ECtx.ArrDescOwn) > 0 then Result := @ECtx.ArrDescOwn[0] else Result := nil;
-    ECtx.ArrDescCur := Result;   // published: this is what a cached pointer must compare equal to
+end;
+
+function TBytecodeVM.AcquireArrDescCtx(ECtx: TExecutionContext): Pointer;
+// The descriptor table THIS context may hand to compiled code.
+//
+// ⭐ Why it exists. hotdisp.c, the AOT and the loop JIT all index the table with the array id baked
+// into their code, which is a LOGICAL id. A proc-local array has one storage PER CONTEXT, so the same
+// logical id must resolve to different memory in different threads - and the cheapest place to say so
+// is the table itself, not every access. Patching the copy here is what let all three compiled
+// engines stay byte-identical while local arrays became per-thread.
+//
+// ⛔ A program with NO private array gets the master table, unchanged and unlocked on the fast lane,
+// exactly as before: this whole path must cost nothing where it buys nothing.
+var
+  i, n: Integer;
+  Src, Dst: Integer;
+begin
+  if FPrivArrCount = 0 then Exit(AcquireArrDesc);
+  // ⛔⛔ NO WORKER, NO LOCK - and this is not a micro-optimisation, it is the whole cost of passing an
+  // array to a SUB. An array PARAMETER is private, so FPrivArrCount > 0 for any program that has one,
+  // and every bind marks the table dirty: this runs on EVERY entry to the C hot loop, several times
+  // per call. Measured 2 Sep 2026 on a 2 000 000-call probe whose callee body is empty
+  // (job/tests/bench/arraybind_probe.bas): passing the array costs 2331 ms against 22 ms without,
+  // 105x, and perf puts AcquireArrDescCtx at 47% of the program and RebuildJitArrDesc at 19% - two
+  // thirds of the run inside the bookkeeping for a call that does nothing.
+  // FHasWorkers is False until a worker context is spawned, and with no second thread there is nobody
+  // to race: the same condition RebuildJitArrDesc already uses to decide whether the old buffer must
+  // be retired rather than resized. ⚠️ It is set BEFORE any worker can run, never cleared while one
+  // lives, so a program that spawns threads takes the lock from that moment on - including this one.
+  if not FHasWorkers then Exit(AcquireArrDescCtxLocked(ECtx));
+  EnterCriticalSection(FArrDescLock);
+  try
+    Result := AcquireArrDescCtxLocked(ECtx);
   finally
     LeaveCriticalSection(FArrDescLock);
   end;
