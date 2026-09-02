@@ -99,7 +99,8 @@ plane holds it, the haze is blue because blue holds nothing else. **AURORA** exc
 warm haze around a cold figure, an inversion of *which lifetime you are looking at* rather than of
 the picture. **EMBER** adds the three planes back together through one warm ramp, which is the
 single-channel Buddhabrot everyone has seen, and loses the lifetime along with the colour.
-`palette=nebula|aurora|ember` and `gamma=` do the same from the command line.
+`palette=nebula|aurora|ember` and `gamma=` do the same from the command line, and
+`sampling=uniform|mh` chooses how `c` is drawn (see below).
 
 > **The keys work in a window now, and on Linux they never had.** `TTerminalInput` — the only key
 > source the CLI has — is one big `{$IFDEF WINDOWS}`, so on Unix it could never report a keypress;
@@ -167,8 +168,36 @@ much of that work lands where you are looking.
 About a quarter of the signal survives each doubling. Four or five steps in, the picture stops
 converging in any useful time — and that is the whole reason Metropolis-Hastings sampling was
 invented: instead of drawing points uniformly, mutate one already known to produce a long orbit
-through your window. This demo is deliberately uniform, so what you are watching is the problem
-rather than the solution.
+through your window. **The default here is uniform, so what you are watching is the problem** — and
+the solution is one argument away.
+
+### …and `sampling=mh` shows you what it buys
+
+```bash
+bin/x86_64-linux/sb bas/demo/buddhabrot/buddhabrot.bas --aot sampling=mh zoom=8
+```
+
+A **declared variant**, not a better default. Four seconds of sampling at each zoom, brightest pixel
+in the red channel:
+
+| zoom | uniform | `sampling=mh` |
+|---:|---:|---:|
+| ×1  | 943 | **47 368** |
+| ×4  |  68 |  **5 045** |
+| ×8  |  25 |  **1 749** |
+| ×32 |   7 |  **1 629** |
+| ×64 |   2 |     **85** |
+
+At ×8 the uniform picture is a black square with a few lit pixels in it; the same four seconds of
+Metropolis sampling has structure you can look at. An MH orbit costs about sixteen times a uniform
+one — it scores every proposal — and the table is at equal *time*, so that is already paid for.
+
+⛔ **It converges to a different picture**, which is why it is declared and why the overlay says `MH`
+while it runs: the chain goes where the window is bright, so the structure arrives far sooner, the
+faint outer haze arrives later, and early frames carry the speckle of a correlated sampler. It is a
+different estimator of the same object, not a faster route to the same image —
+[`IMPLEMENTATIONS.md`](IMPLEMENTATIONS.md) says so in public, because the table there compares nine
+other implementations on the understanding that ours draws the uniform figure by default.
 
 ### Without a window
 
