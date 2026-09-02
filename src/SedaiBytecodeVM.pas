@@ -561,6 +561,7 @@ type
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+    procedure ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     // Dialect-aware bounds test for a flat element index. Returns True when in range. Out of bounds:
     // CLASSIC (Commodore ?BAD SUBSCRIPT) or an explicit --bounds-check raises; MODERN (FreeBASIC, which
@@ -13837,6 +13838,51 @@ begin
   end;
 end;
 
+function ArrayDataStillAt(const A: TArrayStorage; P: Pointer): Boolean;
+// ArrayDataShared, asked of a POINTER instead of a whole record: the bind entry keeps the element-bank
+// pointer the snapshot was installed with, because after the ownership move the Snapshot record no
+// longer holds anything. Same selection rule, same answer.
+begin
+  case A.ElementType of
+    1: Result := Pointer(A.FloatData) = P;
+    2: Result := Pointer(A.StringData) = P;
+  else
+    Result := Pointer(A.IntData) = P;
+  end;
+end;
+
+function ArrayBankData(const A: TArrayStorage): Pointer;
+// The element-bank pointer ArrayDataStillAt will compare against - one place, so the capture and the
+// test cannot pick different banks.
+begin
+  case A.ElementType of
+    1: Result := Pointer(A.FloatData);
+    2: Result := Pointer(A.StringData);
+  else
+    Result := Pointer(A.IntData);
+  end;
+end;
+
+procedure MoveArrayStorage(var Src, Dst: TArrayStorage);
+// TRANSFER ownership of a storage record: Dst releases whatever it held, takes Src's bits, and Src is
+// left owning nothing. No reference count moves, because none needs to: the value has one owner before
+// and one after.
+//
+// ⛔ THE GUARD IS NOT DECORATION. On the normal path Dst is empty - unbind zeroes what it takes and a
+// fresh stack entry is zero-initialised - so the five pointer tests fall through and the whole thing is
+// a 64-byte Move plus a FillChar. But an invocation abandoned without its unbind (a raise inside the
+// callee) leaves a stack entry still owning storage, and reusing that entry with a bare Move would leak
+// it forever. The old eager assignment released it as a side effect of copying; this releases it on
+// purpose, and only when there is something to release.
+begin
+  if (Pointer(Dst.IntData) <> nil) or (Pointer(Dst.FloatData) <> nil) or
+     (Pointer(Dst.StringData) <> nil) or (Pointer(Dst.Dimensions) <> nil) or
+     (Pointer(Dst.LowerBounds) <> nil) then
+    Finalize(Dst);
+  Move(Src, Dst, SizeOf(TArrayStorage));
+  FillChar(Src, SizeOf(TArrayStorage), 0);
+end;
+
 procedure ClearArrayStorage(var A: TArrayStorage);
 // Reset a storage record to a well-formed EMPTY array (no dimensions, no data). Field-by-field, not
 // FillChar: the dynamic-array fields are managed and must be released, not zeroed behind the RTL's back.
@@ -13851,65 +13897,20 @@ begin
   SetLength(A.StringData, 0);
 end;
 
-procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+procedure TBytecodeVM.ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+// bcArrayDim, lifted out of ExecuteArrayOp - and NOT for tidiness.
+//
+// ⛔⛔ A MANAGED LOCAL COSTS ITS RTTI ON EVERY CALL, WHETHER THE BRANCH RUNS OR NOT. TSSAArrayInfo
+// carries a string and five dynamic arrays, so declaring one inside ExecuteArrayOp made FPC emit an
+// fpc_initialize on entry and an fpc_finalize on exit of EVERY cold array opcode - and a SUB with an
+// array parameter goes through three of them per call (bind, apply, unbind). Measured 2 Sep 2026 on
+// job/tests/bench/arraybind_probe.bas: fpc_initialize 7.4% of the program, with fpc_finalize and
+// RecordRTTI beside it, for a record only THIS branch ever reads.
+// ⇒ The declaration follows the only code that uses it. Nothing else moves.
 var
-  SubOp: Word;
-  ArrayIdx, LinearIdx, i, ProdDims, ArrLowerBound: Integer;
   ArrInfo: TSSAArrayInfo;
-  PtrAddr, DestArr: Int64;
-  PtrOffset, RecSlot: Integer;
-  Rec: PRecordStorage;
-  InstrHot: PBytecodeInstruction;   // what ArrayHotOps.inc dereferences; see the note at its include
-                                    // in RunTemplate.inc - the same text is compiled into two scopes.
-  ArrMapP: PInteger;                // ...and so is the array-id map alias, for the same reason.
+  ArrayIdx, i, ProdDims, ArrLowerBound: Integer;
 begin
-  InstrHot := @Instr;
-  if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
-  // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
-  // move an array's backing store; the hot typed accessors never come through here. So the
-  // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.
-  //
-  // Marked HERE rather than only at the interpreter's call site, which is where it used to
-  // live: with the AOT runtime helper there is now a second caller, and a flag set by one
-  // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
-  // kept reading the pre-DIM descriptor and every array element came back 0.
-  FArraysDirty := True;
-  SubOp := Instr.OpCode and $FF;
-  case SubOp of
-    0: // bcArrayLoad (generic, deprecated)
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
-          case FArrays[ArrayIdx].ElementType of
-            0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
-            1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-            2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-          end
-        else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
-          case FArrays[ArrayIdx].ElementType of
-            0: Ctx.IntRegs[Instr.Dest] := 0;
-            1: Ctx.FloatRegs[Instr.Dest] := 0.0;
-            2: Ctx.StringRegs[Instr.Dest] := '';
-          end;
-      end;
-    1: // bcArrayStore (generic, deprecated)
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
-          case FArrays[ArrayIdx].ElementType of
-            0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
-            1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
-            2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
-          end;
-      end;
-    2: // bcArrayDim
-      begin
         // ⛔ TWO ids, and they are not interchangeable. The DECLARATION (element type, rank, bounds)
         // is looked up by the LOGICAL id, because the compiler's array table is indexed that way; the
         // STORAGE is written at the PHYSICAL slot this context owns. Mapping before the lookup reads
@@ -13998,6 +13999,67 @@ begin
               for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].StringData[i] := '';
             end;
         end;
+end;
+
+procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+var
+  SubOp: Word;
+  ArrayIdx, LinearIdx, i, ProdDims, ArrLowerBound: Integer;
+  PtrAddr, DestArr: Int64;
+  PtrOffset, RecSlot: Integer;
+  Rec: PRecordStorage;
+  InstrHot: PBytecodeInstruction;   // what ArrayHotOps.inc dereferences; see the note at its include
+                                    // in RunTemplate.inc - the same text is compiled into two scopes.
+  ArrMapP: PInteger;                // ...and so is the array-id map alias, for the same reason.
+begin
+  InstrHot := @Instr;
+  if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
+  // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
+  // move an array's backing store; the hot typed accessors never come through here. So the
+  // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.
+  //
+  // Marked HERE rather than only at the interpreter's call site, which is where it used to
+  // live: with the AOT runtime helper there is now a second caller, and a flag set by one
+  // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
+  // kept reading the pre-DIM descriptor and every array element came back 0.
+  FArraysDirty := True;
+  SubOp := Instr.OpCode and $FF;
+  case SubOp of
+    0: // bcArrayLoad (generic, deprecated)
+      begin
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
+          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+          case FArrays[ArrayIdx].ElementType of
+            0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+            1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+            2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+          end
+        else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
+          case FArrays[ArrayIdx].ElementType of
+            0: Ctx.IntRegs[Instr.Dest] := 0;
+            1: Ctx.FloatRegs[Instr.Dest] := 0.0;
+            2: Ctx.StringRegs[Instr.Dest] := '';
+          end;
+      end;
+    1: // bcArrayStore (generic, deprecated)
+      begin
+        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
+          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+        LinearIdx := Ctx.IntRegs[Instr.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
+          case FArrays[ArrayIdx].ElementType of
+            0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+            1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+            2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+          end;
+      end;
+    2: // bcArrayDim
+      begin
+        ExecuteArrayDim(Ctx, Instr);
       end;
     {$I ArrayHotOps.inc}
     9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4). Dim 0 (index -1) is the
@@ -14360,7 +14422,11 @@ begin
             SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := LinearIdx;
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved := FArrays[ArrayIdx];        // dyn-array fields share by ref
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
+          // ⭐ The ONE managed copy of the whole cycle, and it is the one that is genuinely a second
+          // reference: the parameter is about to share the argument's storage. The SAVE of what the
+          // parameter slot held is deferred to bcArrayBindApply, where it becomes a MOVE - see
+          // TArrayBindEntry and MoveArrayStorage.
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot := FArrays[LinearIdx];    // the arg, captured now
           Inc(Ctx.ArrayBindTop);
         end;
@@ -14377,7 +14443,7 @@ begin
           if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
             SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved := FArrays[ArrayIdx];
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;   // the save is deferred to Apply
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
           begin
             Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;
@@ -14396,7 +14462,16 @@ begin
       begin  // snapshotted arg. All snapshots were captured (in phase 1) from the unmodified table.
         for I := Ctx.ArrayBindTop - Instr.Immediate to Ctx.ArrayBindTop - 1 do
           if (I >= 0) and (Ctx.ArrayBindStack[I].SlotId <= High(FArrays)) then
-            FArrays[Ctx.ArrayBindStack[I].SlotId] := Ctx.ArrayBindStack[I].Snapshot;  // alias: share the caller's data
+          begin
+            // Two MOVES and no reference count: the parameter slot's old value goes to Saved, the
+            // snapshot goes into the slot. The snapshot's reference - taken once, at bind - is what
+            // the slot now owns, and unbind releases it. SnapData remembers which buffer that was,
+            // because the Snapshot record owns nothing after this.
+            Ctx.ArrayBindStack[I].SnapData := ArrayBankData(Ctx.ArrayBindStack[I].Snapshot);
+            MoveArrayStorage(FArrays[Ctx.ArrayBindStack[I].SlotId], Ctx.ArrayBindStack[I].Saved);
+            MoveArrayStorage(Ctx.ArrayBindStack[I].Snapshot, FArrays[Ctx.ArrayBindStack[I].SlotId]);
+            Ctx.ArrayBindStack[I].Applied := True;
+          end;
       end;
     35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
       begin
@@ -14409,19 +14484,22 @@ begin
           // snapshotted from the arg at bind time. Without a resize the caller already sees the writes via
           // the shared reference, and copying would be wrong: in deep recursion the arg slot may have been
           // rebound at an outer level (merge sort's swapped a()/b()), so an unconditional copy corrupts it.
-          if (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId >= 0) and
-             (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <= High(FArrays)) and
-             (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <> ArrayIdx) and
-             not ArrayDataShared(FArrays[ArrayIdx], Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot) then
-            FArrays[Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId] := FArrays[ArrayIdx];
-          FArrays[ArrayIdx] := Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved;
-          // Release the saved/snapshot copies' references (ownership transferred back to the live slots).
-          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved.IntData, 0);
-          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved.FloatData, 0);
-          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved.StringData, 0);
-          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot.IntData, 0);
-          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot.FloatData, 0);
-          SetLength(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot.StringData, 0);
+          // ⛔ ONLY IF THE BIND WAS APPLIED. The save is deferred to Apply now, so an entry that never
+          // reached it holds nothing and the slot was never overwritten: restoring would install an
+          // EMPTY array over the live one. The old eager copy got this case right by accident.
+          if Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied then
+          begin
+            if (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId >= 0) and
+               (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <= High(FArrays)) and
+               (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <> ArrayIdx) and
+               not ArrayDataStillAt(FArrays[ArrayIdx], Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData) then
+              FArrays[Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId] := FArrays[ArrayIdx];
+            // The move releases the alias (Finalize inside) and hands the slot its own value back;
+            // Saved is left owning nothing, so the entry is ready for reuse with no explicit clearing.
+            MoveArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved, FArrays[ArrayIdx]);
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
+          end;
+          Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData := nil;
         end;
       end;
     27: // bcArrayRedimPush - push one bound onto the pending REDIM list (Immediate bit0 = it is a

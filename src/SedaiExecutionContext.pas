@@ -129,6 +129,20 @@ type
     ArgId: Integer;
     Saved: TArrayStorage;
     Snapshot: TArrayStorage;
+    // ⛔⛔ THE BIND PROTOCOL MOVES OWNERSHIP, IT NO LONGER COPIES IT, and these two fields are what
+    // makes that safe. A managed TArrayStorage assignment walks the record's RTTI and touches the
+    // reference count of FIVE dynamic-array fields; the protocol did four of them per call, where the
+    // cycle genuinely needs ONE reference taken (the alias) and ONE released. Measured 2 Sep 2026 on
+    // job/tests/bench/arraybind_probe.bas - a SUB with an array parameter and an EMPTY body -
+    // RecordRTTI 23.6% of the program, fpc_copy 16.8%, FillChar 21%.
+    //   Applied  - the SAVE now happens at bcArrayBindApply, not at bind, so an unbind that never saw
+    //              an apply must restore NOTHING: the slot was never overwritten. With the old
+    //              eager copy that case restored correctly by accident; here it would destroy it.
+    //   SnapData - the element-bank pointer the snapshot was installed with. The REDIM-detection at
+    //              unbind used to compare against the whole Snapshot record, which now no longer owns
+    //              anything after apply. One pointer answers the same question.
+    Applied: Boolean;
+    SnapData: Pointer;
   end;
 
   { One call frame's bookkeeping, pushed by FramePush and read back by FramePop. 32 bytes, so two
