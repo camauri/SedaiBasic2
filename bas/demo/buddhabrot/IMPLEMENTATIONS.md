@@ -42,13 +42,56 @@ them that way.
 > rather than what any particular author chose, which would be a fact about their code.
 > Our own source, on the other hand, is in this directory in full and in the clear.
 
-**And the sampling stays UNIFORM, which is a declaration and not an omission.** Section 4 compares
-languages along axes that only mean something if every implementation is answering the same question,
-and Metropolis-Hastings sampling answers a different one — it converges far faster at depth by
-mutating a `c` already known to produce a long orbit, which is why the zoom in this demo visibly
-stops converging four steps in. If a Metropolis-Hastings variant is added here it will be added as a
-**separate, declared variant**, never as a change to the default: two sampling strategies mixed into
-one table make the comparison unreadable.
+**And the sampling stays UNIFORM by default, which is a declaration and not an omission.** Section 4
+compares languages along axes that only mean something if every implementation is answering the same
+question, and Metropolis-Hastings sampling answers a different one. There **is** a Metropolis-Hastings
+variant in this program — `sampling=mh`, section 6b of the source — and it is a declared variant and
+not a change to the default, because two sampling strategies mixed into one table make the comparison
+unreadable. Everything in section 3 and section 4 below describes the **uniform** program, which is
+what runs when nothing is asked for.
+
+<details>
+<summary><b>What the variant is, and what it is worth</b></summary>
+
+Zooming in narrows the *window* but cannot narrow the *sampling*: an orbit that crosses your zoomed
+window may have started anywhere in the plane, so the uniform sampler goes on drawing `c` from the
+whole rectangle and throws away everything that misses. Metropolis-Hastings spends its samples where
+they land instead — having found one `c` whose orbit crosses the window, it looks *near* that `c`,
+and accepts or rejects the move in proportion to how much of the window the new orbit reaches.
+
+Measured on one machine, **four seconds of sampling per cell**, 400×400, brightest pixel in the red
+channel and the share of traced orbits that reach the window at all:
+
+| zoom | uniform: drawn | uniform: peak | mh: drawn | mh: peak | peak, mh ÷ uniform |
+|---:|---:|---:|---:|---:|---:|
+| ×1  | 82.1% |  943 | 100.0% | 47 368 | **50×** |
+| ×2  | 82.1% |  198 | 100.0% | 15 584 | **79×** |
+| ×4  | 82.1% |   68 | 100.0% |  5 045 | **74×** |
+| ×8  | 82.1% |   25 | 100.0% |  1 749 | **70×** |
+| ×16 | 82.1% |   14 |  99.7% |  2 603 | **186×** |
+| ×32 | 82.1% |    7 |  99.7% |  1 629 | **233×** |
+| ×64 | 82.1% |    2 |  99.2% |     85 | **43×** |
+
+⚠️ **Read the two halves separately.** The `drawn` column is not the gain — the uniform sampler
+already draws 82% of what it traces at *every* zoom, because that share is decided by the whole
+plane and not by the window. What collapses under zoom is how much of that work lands where you are
+looking, and that is the `peak` column: uniform goes 943 → 2 across six doublings, which is the
+figure ceasing to converge, and it is exactly what this demo was built to let you watch. An MH orbit
+costs roughly sixteen times a uniform one — it scores every proposal, and the points it settles on
+have long orbits — and the table is at equal *time*, so that cost is already paid inside it.
+
+⛔ **It is a different estimator, not a faster one.** The uniform figure is an unbiased estimate of
+"how often does an escaping orbit visit this pixel". The chain's stationary distribution is
+proportional to an orbit's contribution to the *window*, so it converges to a different picture of
+the same object: the structure arrives far sooner, the faint outer haze — which contributes little —
+arrives later, and the speckle of a correlated sampler is visible early on where uniform noise is
+smooth. That is why it is not the default and why it is named on the picture while it runs.
+
+Both samplers are held to the same standard: `verify_determinism.sh` runs each of them on all four
+execution engines and requires one image per sampler, and requires the two samplers to *disagree* —
+identical output would mean `sampling=` had stopped selecting anything.
+
+</details>
 
 **The WebAssembly build is the same source, not a second implementation.** `sbc --target wasm`
 compiles `buddhabrot.bas` to a module that runs in a browser; what differs is compiled out with
@@ -60,7 +103,7 @@ is among it. The module's framebuffer hashes the same as the native one on the s
 
 | Language | Author | Licence (checked 1 Sep 2026) | Sampling | Runs on | Link |
 |---|---|---|---|---|---|
-| SedaiBasic | Maurizio Cammalleri | GPL-3.0-or-later | uniform | CPU, single thread; also WebAssembly | [`buddhabrot.bas`](buddhabrot.bas) |
+| SedaiBasic | Maurizio Cammalleri | GPL-3.0-or-later | uniform (Metropolis-Hastings as a declared variant, `sampling=mh`) | CPU, single thread; also WebAssembly | [`buddhabrot.bas`](buddhabrot.bas) |
 | C | Paul Bourke | not stated on the page | uniform | CPU | [paulbourke.net](https://paulbourke.net/fractals/buddhabrot/) |
 | Go | karlek | Unlicense (public domain) | uniform | CPU, multi-threaded | [karlek/wasabi](https://github.com/karlek/wasabi) |
 | JavaScript | Albert Lobo (llop) | MIT | uniform | browser | [llop/buddhabrot-4d-viewer-js](https://github.com/llop/buddhabrot-4d-viewer-js) |
@@ -135,6 +178,23 @@ speeds. `verify_determinism.sh` checks that with hashes.
 gladly. It does not use them because the demo exists to compare three execution engines, and three
 engines compared through a thread pool measure the thread pool. It is noted as a possible extension
 at the foot of the source, where it belongs.
+
+### Where the sampler is chosen
+
+Not a language axis, but the one place where this program's *shape* was decided by the engines rather
+than by taste, and it is worth writing down because it is invisible in the source.
+
+The two samplers are two Subs, and the choice between them is hoisted out of the per-orbit loop into
+a batch loop. The obvious shape — one Sub that tests a flag and calls one of the two — costs a fifth
+of the program *on the path it never takes*: 1 311 000 orbits per second became 1 050 000 under the
+JIT with the Metropolis call added behind a test the uniform run never passes. It is not the test and
+not the call being made; it is the call **site**. The sampling loop is one compiled region, and a
+call the JIT and the AOT backend cannot see through ends that region where it appears, so what
+follows goes back to being interpreted whether or not control ever goes there.
+
+A language whose compiler inlines across that boundary would not have this constraint, and a language
+compiled ahead of time to one object would not either. It is named here because "add a strategy flag"
+is the first thing anyone would do, and it is the thing that costs.
 
 ## 5. If you want to add a language
 

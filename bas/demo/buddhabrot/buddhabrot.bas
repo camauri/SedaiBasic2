@@ -308,33 +308,43 @@ Sub RecomputeView()
   pixelsPerRealUnit      = imageSize / (2.0 * viewHalfSpan)
 End Sub
 
-Sub AccumulateOrbitPoint( ByVal zReal As Double, ByVal zImaginary As Double, _
-                          ByVal planeBase As Integer )
+'' Where a point of the plane lands, or -1 if it misses the window altogether.
+''
+'' ⭐ IT IS A FUNCTION AND NOT FOUR LINES INSIDE THE ACCUMULATOR because two callers ask the same
+'' question and must not answer it twice: the accumulator increments the pixel it names, and the
+'' Metropolis sampler counts how many of an orbit's points are not -1 - which is that orbit's whole
+'' worth to the window. Two copies of this mapping would be two definitions of what "inside the
+'' picture" means, and the sampler would then be steering towards a window slightly different from
+'' the one being drawn.
+Function PixelIndexOf( ByVal zReal As Double, ByVal zImaginary As Double ) As Integer
   Dim As Integer column = Int( (zImaginary - viewImaginaryMin) * pixelsPerImaginaryUnit )
   Dim As Integer row    = Int( (zReal      - viewRealMin)      * pixelsPerRealUnit )
-  If column >= 0 And column < imageSize And row >= 0 And row < imageSize Then
-    Dim As Integer at = planeBase + row * imageSize + column
-    histogram(at) = histogram(at) + 1
-  End If
-End Sub
+  If column < 0 Or column >= imageSize Or row < 0 Or row >= imageSize Then Return -1
+  Return row * imageSize + column
+End Function
+
 
 
 '' ================================================================================================
-''  6. THE CENTRAL LOOP - one random point, one orbit, one decision
+''  6. THE CENTRAL LOOP - where c comes from, what an orbit is, and what is drawn
 '' ================================================================================================
 ''  This is the whole algorithm. Everything above is preparation and everything below is presentation.
 
-Sub TraceOneOrbit()
-  orbitsTraced = orbitsTraced + 1
+'' ================================================================================================
+''  6a. THE ORBIT ITSELF - the one question both samplers ask
+'' ================================================================================================
+''  Iterate z <- z^2 + c from z = 0, writing the path down as we go, and answer with the number of
+''  steps if this orbit is one we are allowed to draw - zero otherwise.
+''
+''  ⭐ IT IS ONE FUNCTION BECAUSE THERE ARE NOW TWO SAMPLERS. The uniform sampler and the
+''  Metropolis one differ only in where c comes from; what an orbit IS, and which orbits count, must
+''  not differ at all, or the two would be drawing two different figures and the variant would be
+''  incomparable with the default it is a variant of.
 
-  '' A point drawn uniformly from the sampling rectangle.
-  Dim As Double cReal      = SAMPLE_REAL_MIN      + NextRandom() * SAMPLE_REAL_SPAN
-  Dim As Double cImaginary = SAMPLE_IMAGINARY_MIN + NextRandom() * SAMPLE_IMAGINARY_SPAN
-
+Function EscapingOrbitSteps( ByVal cReal As Double, ByVal cImaginary As Double ) As Integer
   '' Trap 2: two algebraic tests remove about one sample in six before any iteration happens.
-  If PointIsProvablyInsideTheSet(cReal, cImaginary) Then Exit Sub
+  If PointIsProvablyInsideTheSet(cReal, cImaginary) Then Return 0
 
-  '' Iterate z <- z^2 + c from z = 0, writing the path down as we go.
   '' The squares are carried between iterations because each is needed twice: once to advance the
   '' orbit and once to test for escape. Recomputing them would double the multiplications here.
   Dim As Double zReal = 0.0, zImaginary = 0.0
@@ -357,27 +367,277 @@ Sub TraceOneOrbit()
   Loop
 
   '' Did it get out at all? (Trap 1: this is the moment we are finally allowed to know.)
-  If zRealSquared + zImaginarySquared <= ESCAPE_RADIUS_SQUARED Then Exit Sub   '' still bounded
-  If stepsTaken < minimumEscapeIterations Then Exit Sub                        '' escaped too fast
+  If zRealSquared + zImaginarySquared <= ESCAPE_RADIUS_SQUARED Then Return 0   '' still bounded
+  If stepsTaken < minimumEscapeIterations Then Return 0                        '' escaped too fast
+  Return stepsTaken
+End Function
 
-  '' How many channels does this orbit belong to? The ceilings are nested - blue inside green inside
-  '' red - so the answer is a count, decided once, before the replay rather than inside it.
+''  Replay the recorded path into the picture. Trap 3: each point counts twice, once mirrored,
+''  because the conjugate of an escaping point escapes along the mirrored path.
+''  How many channels does this orbit belong to? The ceilings are nested - blue inside green inside
+''  red - so the answer is decided once, before the replay rather than inside it.
+Sub ReplayOrbit( ByVal stepsTaken As Integer )
   Dim As Integer channels = 1
   Dim As Integer firstChannel = 0
   If stepsTaken <= greenCeiling Then firstChannel = 1
   If stepsTaken <= blueCeiling  Then firstChannel = 2
 
-  '' Now replay the path into the picture. Trap 3: each point counts twice, once mirrored, because
-  '' the conjugate of an escaping point escapes along the mirrored path.
   orbitsAccumulated = orbitsAccumulated + 1
-  Dim As Integer i, channel, planeBase
+  Dim As Integer i, channel, planeBase, at
   For channel = firstChannel To firstChannel + channels - 1
     planeBase = channel * pixelsPerPlane
     For i = 0 To stepsTaken - 1
-      AccumulateOrbitPoint( orbitReal(i),  orbitImaginary(i), planeBase )
-      AccumulateOrbitPoint( orbitReal(i), -orbitImaginary(i), planeBase )
+      at = PixelIndexOf( orbitReal(i),  orbitImaginary(i) )
+      If at >= 0 Then histogram(planeBase + at) = histogram(planeBase + at) + 1
+      at = PixelIndexOf( orbitReal(i), -orbitImaginary(i) )
+      If at >= 0 Then histogram(planeBase + at) = histogram(planeBase + at) + 1
     Next i
   Next channel
+End Sub
+
+'' ================================================================================================
+''  6b. METROPOLIS-HASTINGS - the declared variant, and the reason it exists
+'' ================================================================================================
+''  ⛔⛔ THIS IS NOT THE DEFAULT AND MUST NOT BECOME IT. `sampling=mh` selects it; `sampling=uniform`
+''  is what runs otherwise, what the determinism guard runs, and what IMPLEMENTATIONS.md compares
+''  against every other language in the table. Two sampling strategies mixed into one figure make
+''  that comparison unreadable - see section 5 of IMPLEMENTATIONS.md, which says so in public.
+''
+''  ⭐ WHAT IT IS FOR, in one paragraph. Zooming in narrows the WINDOW but cannot narrow the
+''  SAMPLING: an orbit that crosses your zoomed window may have started anywhere in the plane, so
+''  the uniform sampler goes on drawing c from the whole rectangle and throws away everything that
+''  misses. Halve the span and about three quarters of the remaining hits go with it - which is why
+''  the zoom in this demo visibly stops converging four steps in. Metropolis-Hastings spends its
+''  samples where they land instead: having found one c whose orbit crosses the window, it looks
+''  NEAR that c, because orbits are continuous in c and a neighbour is far more likely to cross the
+''  window than a point drawn from the whole plane.
+''
+''  ⛔ AND IT ANSWERS A DIFFERENT QUESTION, which is why it is declared rather than switched on. The
+''  uniform figure is an unbiased estimate of "how often does an escaping orbit visit this pixel".
+''  This one is a Markov chain whose stationary distribution is proportional to an orbit's
+''  contribution to the WINDOW, so it converges to a different picture of the same object: faster
+''  where the structure is, and with the outer haze - which contributes little - reached later.
+''
+''  The chain, in the order the code runs it:
+''    1. no current point?  search uniformly until one contributes to the window at all;
+''    2. mutate the current c into a proposal;
+''    3. score the proposal - how many of its orbit's points land inside the window;
+''    4. accept with probability min(1, proposed / current), which is Metropolis;
+''    5. draw the orbit the chain is now standing on, accepted or not.
+''
+''  ⭐ STEP 5 IS THE ONE THAT IS EASY TO GET WRONG. Drawing only the ACCEPTED proposals throws away
+''  the dwell time - a chain that rejects nine proposals in a row is telling you that where it
+''  stands is worth ten samples, and a sampler that forgets that under-draws exactly the places it
+''  was built to find. So the current orbit is drawn once per step whatever the decision was, which
+''  is why it has to be kept: the proposal has already overwritten the scratch arrays by then.
+
+Const SAMPLING_UNIFORM    = 0
+Const SAMPLING_METROPOLIS = 1
+Dim Shared As Integer samplingStrategy
+
+''  ⭐ THE MUTATION IS A RADIUS DRAWN LOG-UNIFORMLY, not a Gaussian and not a fixed step, and the
+''  reason is that no single step size is right: a big one walks off the filament, a small one
+''  crawls along the one filament it started on and never finds another. Drawing the radius
+''  log-uniformly between a coarse and a fine bound spends equal effort on every scale between them
+''  in one distribution, so the same chain both follows a filament and jumps to its neighbour.
+''  Both bounds are fractions of the VIEW, not of the plane: zoom in and the whole scale of the
+''  search follows the window down, which is the point of the technique.
+Const MH_MUTATE_COARSE   = 0.35      '' of the view half-span
+Const MH_MUTATE_FINE     = 0.0002    '' of the view half-span
+''  ⭐ And one proposal in ten ignores the current point entirely and is drawn from the whole
+''  rectangle. This is not a safety valve bolted on: it keeps the chain able to reach a part of the
+''  plane it has walked away from, and it costs nothing in correctness because the mixture is still
+''  SYMMETRIC - the chance of proposing y from x equals the chance of proposing x from y, for the
+''  jump and for the local move alike, so the acceptance ratio stays the plain min(1, T'/T).
+Const MH_LEAP_ODDS       = 0.10
+''  ⛔ A chain can still die: it stands on a point whose neighbours all score worse, rejects for
+''  ever, and draws the same orbit a million times - a bright thread across an otherwise empty
+''  picture, which looks like a rendering bug and is really a stuck sampler. After this many
+''  consecutive rejections the chain is abandoned and started again from a fresh uniform search.
+Const MH_STALL_LIMIT     = 300
+''  How long the opening search may look for a point that contributes at all before giving up on
+''  this call and trying again on the next. At deep zoom that search IS the expensive part - it is
+''  the uniform sampler, doing what the uniform sampler does - so it is bounded rather than endless,
+''  which keeps a frame from stalling when the window is nearly empty.
+Const MH_SEARCH_ATTEMPTS = 2000
+
+Dim Shared As Double  mhCurrentReal, mhCurrentImaginary, mhCurrentScore
+Dim Shared As Integer mhCurrentSteps, mhHasCurrent
+Dim Shared As Double  mhProposedReal, mhProposedImaginary
+Dim Shared As Double  mhOrbitReal(ITERATION_CEILING)
+Dim Shared As Double  mhOrbitImaginary(ITERATION_CEILING)
+Dim Shared As LongInt mhRejectStreak, mhAccepted, mhRestarts
+
+''  What this orbit is worth to the window we are looking at: how many of its points land in it.
+''  ⭐ It asks PixelIndexOf, the same question the replay asks, so the sampler steers towards exactly
+''  the window that is being drawn - see the note on that function.
+Function OrbitContribution( ByVal stepsTaken As Integer ) As Double
+  Dim As Integer i, inside = 0
+  For i = 0 To stepsTaken - 1
+    If PixelIndexOf( orbitReal(i),  orbitImaginary(i) ) >= 0 Then inside = inside + 1
+    If PixelIndexOf( orbitReal(i), -orbitImaginary(i) ) >= 0 Then inside = inside + 1
+  Next i
+  Return CDbl(inside)
+End Function
+
+Sub StoreCurrentOrbit( ByVal stepsTaken As Integer )
+  Dim As Integer i
+  For i = 0 To stepsTaken - 1
+    mhOrbitReal(i)      = orbitReal(i)
+    mhOrbitImaginary(i) = orbitImaginary(i)
+  Next i
+End Sub
+
+Sub RecallCurrentOrbit()
+  Dim As Integer i
+  For i = 0 To mhCurrentSteps - 1
+    orbitReal(i)      = mhOrbitReal(i)
+    orbitImaginary(i) = mhOrbitImaginary(i)
+  Next i
+End Sub
+
+''  The opening move, and the move after a stall: draw uniformly until something reaches the window.
+Sub SeekChainStart()
+  Dim As Integer attempt
+  For attempt = 1 To MH_SEARCH_ATTEMPTS
+    Dim As Double cReal      = SAMPLE_REAL_MIN      + NextRandom() * SAMPLE_REAL_SPAN
+    Dim As Double cImaginary = SAMPLE_IMAGINARY_MIN + NextRandom() * SAMPLE_IMAGINARY_SPAN
+    orbitsTraced = orbitsTraced + 1
+    Dim As Integer stepsTaken = EscapingOrbitSteps(cReal, cImaginary)
+    If stepsTaken > 0 Then
+      Dim As Double score = OrbitContribution(stepsTaken)
+      If score > 0.0 Then
+        mhCurrentReal      = cReal
+        mhCurrentImaginary = cImaginary
+        mhCurrentScore     = score
+        mhCurrentSteps     = stepsTaken
+        StoreCurrentOrbit(stepsTaken)
+        mhHasCurrent   = 1
+        mhRejectStreak = 0
+        Exit Sub
+      End If
+    End If
+  Next attempt
+End Sub
+
+Sub ProposeFromCurrent()
+  If NextRandom() < MH_LEAP_ODDS Then
+    mhProposedReal      = SAMPLE_REAL_MIN      + NextRandom() * SAMPLE_REAL_SPAN
+    mhProposedImaginary = SAMPLE_IMAGINARY_MIN + NextRandom() * SAMPLE_IMAGINARY_SPAN
+    Exit Sub
+  End If
+  Dim As Double coarse = viewHalfSpan * MH_MUTATE_COARSE
+  Dim As Double fine   = viewHalfSpan * MH_MUTATE_FINE
+  Dim As Double angle  = NextRandom() * 6.283185307179586
+  Dim As Double radius = coarse * Exp( -Log(coarse / fine) * NextRandom() )
+  mhProposedReal      = mhCurrentReal      + radius * Cos(angle)
+  mhProposedImaginary = mhCurrentImaginary + radius * Sin(angle)
+End Sub
+
+Sub TraceOneMetropolisOrbit()
+  If mhHasCurrent = 0 Then
+    SeekChainStart()
+    If mhHasCurrent = 0 Then Exit Sub          '' the window is empty here; try again next call
+    ReplayOrbit(mhCurrentSteps)                '' the scratch still holds the orbit just found
+    Exit Sub
+  End If
+
+  ProposeFromCurrent()
+  orbitsTraced = orbitsTraced + 1
+  Dim As Integer stepsTaken = EscapingOrbitSteps(mhProposedReal, mhProposedImaginary)
+  Dim As Double  score = 0.0
+  If stepsTaken > 0 Then score = OrbitContribution(stepsTaken)
+
+  '' Metropolis. A proposal that reaches the window more often than the current point is always
+  '' taken; one that reaches it less often is taken in proportion, which is what stops the chain
+  '' collapsing onto a single bright thread and keeps it exploring.
+  Dim As Integer accepted = 0
+  If score > 0.0 Then
+    If score >= mhCurrentScore Then
+      accepted = 1
+    ElseIf NextRandom() < score / mhCurrentScore Then
+      accepted = 1
+    End If
+  End If
+
+  If accepted <> 0 Then
+    mhCurrentReal      = mhProposedReal
+    mhCurrentImaginary = mhProposedImaginary
+    mhCurrentScore     = score
+    mhCurrentSteps     = stepsTaken
+    StoreCurrentOrbit(stepsTaken)
+    mhAccepted     = mhAccepted + 1
+    mhRejectStreak = 0
+  Else
+    RecallCurrentOrbit()                       '' the proposal overwrote the scratch
+    mhRejectStreak = mhRejectStreak + 1
+  End If
+
+  ReplayOrbit(mhCurrentSteps)                  '' the dwell time is part of the estimate
+
+  If mhRejectStreak >= MH_STALL_LIMIT Then
+    mhHasCurrent = 0
+    mhRestarts   = mhRestarts + 1
+  End If
+End Sub
+
+'' Every move throws the counts away and starts the sampling again, so what appears after a move is
+'' a fresh picture of the new window rather than the old one dragged into it.
+'' ⛔ AND THE CHAIN GOES WITH THEM. Its current point was chosen, and scored, against the window we
+'' have just left; carrying it over would have the sampler steering towards a window nobody is
+'' looking at any more - and it would do it invisibly, because a stale chain still produces orbits.
+'' Three callers restart the sampling (the keys, the pointer, the browser page) and a rule written
+'' three times is a rule that will be three rules.
+Sub RestartSampling( ByVal fromSeed As LongInt )
+  SeedRandom(fromSeed)
+  orbitsTraced      = 0
+  orbitsAccumulated = 0
+  mhHasCurrent      = 0
+  mhRejectStreak    = 0
+End Sub
+
+''  The default sampler: a point drawn uniformly from the whole rectangle, one orbit, one decision.
+Sub TraceOneOrbit()
+  orbitsTraced = orbitsTraced + 1
+
+  '' A point drawn uniformly from the sampling rectangle.
+  Dim As Double cReal      = SAMPLE_REAL_MIN      + NextRandom() * SAMPLE_REAL_SPAN
+  Dim As Double cImaginary = SAMPLE_IMAGINARY_MIN + NextRandom() * SAMPLE_IMAGINARY_SPAN
+
+  Dim As Integer stepsTaken = EscapingOrbitSteps(cReal, cImaginary)
+  If stepsTaken > 0 Then ReplayOrbit(stepsTaken)
+End Sub
+
+''  ⛔⛔⛔ THE SAMPLER IS CHOSEN ONCE PER BATCH, AND THE CHOICE MAY NOT SIT INSIDE THE HOT SUB.
+''  The obvious shape is a two-line dispatcher - TraceOneOrbit tests the strategy and calls one of
+''  two Subs - and it costs a fifth of the program on a path it never takes. Measured, 600 000
+''  orbits under --jit, one binary, four sources that differ only here:
+''
+''        TraceOneOrbit is the uniform sampler, no mention of MH        1 311 000 orbits/s
+''        ...with the strategy test added, but no call behind it        1 316 000 orbits/s
+''        ...with the call to the Metropolis sampler behind the test    1 050 000 orbits/s
+''
+''  ⇒ It is not the test, and it is not the call being MADE - the uniform run never takes that
+''  branch. It is the call SITE. The sampling loop is one region to the JIT and to the AOT, and a
+''  call they cannot see through ends the region where it appears, so what follows it in the Sub
+''  goes back to being interpreted whether or not control ever goes there. CLAUDE.md records the
+''  same shape twice - the array-binding triple, and an opcode missing from the C hot loop splitting
+''  a covered run into pieces too short to pay for their own entry - and this is the third.
+''
+''  ⇒ So the two samplers are two Subs that never mention each other, and the choice is hoisted out
+''  of the loop into here: made once per batch of orbits rather than once per orbit, which is also
+''  the honest place for it, since nothing can change the strategy while a batch is running.
+Sub TraceOrbits( ByVal count As Integer )
+  Dim As Integer i
+  If samplingStrategy = SAMPLING_METROPOLIS Then
+    For i = 1 To count
+      TraceOneMetropolisOrbit()
+    Next i
+  Else
+    For i = 1 To count
+      TraceOneOrbit()
+    Next i
+  End If
 End Sub
 
 
@@ -748,6 +1008,9 @@ Sub PrintUsage()
   Print "  gamma=N     tone curve applied after the log        (default 4.5)"
   Print "  norm=X      stable | peak - what each channel is divided by (default stable)"
   Print "  palette=X   nebula | aurora | ember                  (default nebula)"
+  Print "  sampling=X  uniform | mh - how c is chosen              (default uniform)"
+  Print "              mh is Metropolis-Hastings: a DECLARED VARIANT that converges to a"
+  Print "              different picture. It is what makes a deep zoom converge at all."
   Print "  fps=N       frames per second to hold                 (default 60)"
   Print "  re=N im=N   centre of the view                       (default -0.65, 0)"
   Print "  zoom=N      how many times to magnify                 (default 1)"
@@ -778,10 +1041,7 @@ End Sub
 Dim Shared As LongInt browserSeed
 
 Sub StepFrame( ByVal orbitsThisFrame As Integer )
-  Dim As Integer i
-  For i = 1 To orbitsThisFrame
-    TraceOneOrbit()
-  Next i
+  TraceOrbits(orbitsThisFrame)
   PaintFrame("", "", "")
 End Sub
 
@@ -799,7 +1059,7 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
     If toneGamma < 1.2  Then toneGamma = 1.2
     If toneGamma > 12.0 Then toneGamma = 12.0
   ElseIf command = 2 Then
-    '' The inverse of the mapping AccumulateOrbitPoint uses, exactly as the native mouse zoom does:
+    '' The inverse of the mapping PixelIndexOf makes, exactly as the native mouse zoom does:
     '' a pixel of the canvas IS a point of the complex plane.
     If a >= 0 And a < imageSize And b >= 0 And b < imageSize Then
       viewCentreImaginary = viewImaginaryMin + a / pixelsPerImaginaryUnit
@@ -825,7 +1085,7 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
     RecomputeView()
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
-    SeedRandom(browserSeed) : orbitsTraced = 0 : orbitsAccumulated = 0
+    RestartSampling(browserSeed)
   End If
   '' ⛔ AND THE MODULE SAYS WHERE THE VIEW IS, rather than letting the page work it out. The page has
   '' no other way to know - a Sub returns nothing - and the alternative is for the page to keep its
@@ -858,6 +1118,12 @@ toneGamma = CDbl( ArgumentValue("gamma", "4.5") )
 '' `norm=peak` is the old behaviour - each channel divided by its own brightest pixel - kept so the
 '' two can be compared on one run. The default is the reference described beside NormaliseAgainst.
 stableNormalise = IIf( LCase(ArgumentValue("norm", "stable")) = "peak", 0, 1 )
+'' ⛔ THE DEFAULT IS UNIFORM AND STAYS UNIFORM. `sampling=mh` is a declared variant, not an
+'' improvement switched on by degrees: it converges to a different picture (section 6b), and
+'' IMPLEMENTATIONS.md compares this program against nine others on the understanding that what it
+'' draws by default is the uniform figure they all draw.
+samplingStrategy = SAMPLING_UNIFORM
+If LCase(ArgumentValue("sampling", "uniform")) = "mh" Then samplingStrategy = SAMPLING_METROPOLIS
 colourReading = READING_NEBULA
 If LCase(ArgumentValue("palette", "")) = "aurora" Then colourReading = READING_AURORA
 If LCase(ArgumentValue("palette", "")) = "ember"  Then colourReading = READING_EMBER
@@ -878,9 +1144,7 @@ viewCentreReal      = CDbl( ArgumentValue("re",   Str(HOME_CENTRE_REAL)) )
 viewCentreImaginary = CDbl( ArgumentValue("im",   Str(HOME_CENTRE_IMAGINARY)) )
 viewHalfSpan        = HOME_HALF_SPAN / CDbl( ArgumentValue("zoom", "1") )
 RecomputeView()
-SeedRandom(seed)
-orbitsTraced = 0
-orbitsAccumulated = 0
+RestartSampling(seed)
 
 #if __SB_WASM__
 '' ---- the browser build: set up, draw one frame, hand back ---------------------------------------
@@ -924,8 +1188,19 @@ If stillOrbits > 0 Then
     nextFrameAt = stillOrbits * ((1.0 / CDbl(frameCount)) ^ framePower)
   End If
 
+  '' ⛔ THE ORBITS ARE ASKED FOR IN BATCHES, not one at a time. TraceOrbits names both samplers, and
+  '' a call site the compiled engines cannot see through ends the region it stands in (the note on
+  '' that Sub has the numbers); asking for one orbit per call puts that cost back on every orbit -
+  '' 1 258 000 orbits/s became 888 000 under --jit, which is most of what the film is made of.
+  '' ⭐ The batch is bounded by the next film frame, so `series=` is taken at exactly the orbit
+  '' counts it was always taken at and the recording does not change.
   Do While orbitsTraced < stillOrbits
-    TraceOneOrbit()
+    Dim As LongInt batchEnd = stillOrbits
+    If frameCount > 0 And CLngInt(nextFrameAt) < batchEnd Then batchEnd = CLngInt(nextFrameAt)
+    Dim As LongInt wanted = batchEnd - orbitsTraced
+    If wanted < 1     Then wanted = 1
+    If wanted > 65536 Then wanted = 65536
+    TraceOrbits(CInt(wanted))
     If frameCount > 0 And orbitsTraced >= nextFrameAt Then
       frameIndex = frameIndex + 1
       WritePortablePixmap( outputName + "_" + Right("000" + Str(frameIndex), 3) + ".ppm" )
@@ -938,8 +1213,13 @@ If stillOrbits > 0 Then
   Loop
   Dim As Double took = Timer - startedAt
   WritePortablePixmap(outputName)
+  Print "sampling           : "; IIf(samplingStrategy = SAMPLING_METROPOLIS, "metropolis-hastings", "uniform")
   Print "orbits traced      : "; orbitsTraced
   Print "orbits accumulated : "; orbitsAccumulated
+  If samplingStrategy = SAMPLING_METROPOLIS Then
+    Print "proposals accepted : "; mhAccepted
+    Print "chain restarts     : "; mhRestarts
+  End If
   Print "peak pixel count   : "; PeakRedCount()
   Print "seconds            : "; took
   Print "orbits per second  : "; Int(orbitsTraced / took)
@@ -998,16 +1278,13 @@ Do
     '' Timer is read once per batch, not once per orbit: at these speeds the clock call would
     '' otherwise be a measurable share of the work it is timing.
     Do
-      Dim As Integer batch
-      For batch = 1 To 256
-        TraceOneOrbit()
-      Next batch
+      TraceOrbits(256)
     Loop Until Timer - sampleStart >= sampleBudget
     '' (the rate the overlay shows is measured over the DISPLAY interval instead - see below)
   End If
 
   '' Where is the pointer, and what does it point AT? The picture is a window on the complex plane,
-  '' so a pixel has a coordinate: this is the inverse of the mapping AccumulateOrbitPoint uses to put
+  '' so a pixel has a coordinate: this is the inverse of the mapping PixelIndexOf makes to put
   '' an orbit point into the histogram, with the text band's height taken off the row.
   '' ⚠️ The window is sized to the framebuffer by the presenter, so a mouse pixel IS a picture pixel -
   '' there is no scale factor to undo here, and if the window is ever made resizable there will be.
@@ -1047,10 +1324,16 @@ Do
     overlayLine1 = Fits(overlayLine1, " " + Str(Int(orbitsPerSecond)) + "/s")
     overlayLine1 = Fits(overlayLine1, "  " + ReadingName(colourReading) + " g" + Format(toneGamma, "0.0"))
     overlayLine1 = Fits(overlayLine1, " iter " + Str(maximumIterations))
+    '' ⭐ A variant that is running has to SAY so on the picture. The whole claim of this demo is
+    '' that the default figure is the uniform one; a screenshot that does not name the sampler is a
+    '' screenshot nobody can check. Nothing is added in the default case - the absence is the word.
+    If samplingStrategy = SAMPLING_METROPOLIS Then overlayLine1 = Fits(overlayLine1, " MH")
 
     overlayLine2 = "traced " + Str(orbitsTraced)
     overlayLine2 = Fits(overlayLine2, "  drawn " + Str(orbitsAccumulated))
     overlayLine2 = Fits(overlayLine2, "  peak " + Str(PeakRedCount()))
+    If samplingStrategy = SAMPLING_METROPOLIS Then _
+      overlayLine2 = Fits(overlayLine2, "  acc " + Str(mhAccepted) + " re " + Str(mhRestarts))
   End If
 
   '' The pointer readout REPLACES the view while the pointer is over the picture: two coordinate
@@ -1132,7 +1415,7 @@ Do
     RecomputeView()
     Dim As Integer i
     For i = 0 To 3 * pixelsPerPlane - 1 : histogram(i) = 0 : Next i
-    SeedRandom(seed) : orbitsTraced = 0 : orbitsAccumulated = 0 : startedAt = Timer
+    RestartSampling(seed) : startedAt = Timer
   End If
   '' ⚠️ This used to be S, which is also the key that pans DOWN: one press did both, so every save
   '' wrote a picture of the view you had just left. P for picture.
@@ -1179,10 +1462,11 @@ Print "written           : "; outputName
 ''    percentile and clipping above it is more robust and is what photo software does. It has not
 ''    been needed: the log curve already compresses the top end hard.
 ''
-''  * METROPOLIS-HASTINGS SAMPLING. Instead of drawing c uniformly, mutate a c that is known to
-''    produce a long orbit and accept or reject the mutation. It converges far faster at deep zoom.
-''    It is a different algorithm with a different convergence behaviour, so mixing it in would make
-''    the comparison in IMPLEMENTATIONS.md meaningless. It belongs in a separate variant.
+''  (METROPOLIS-HASTINGS SAMPLING used to be on this list. It is now in the program, as
+''   `sampling=mh` - a declared variant and not a new default, for the reason that kept it off the
+''   list in the first place: it converges to a different picture, and IMPLEMENTATIONS.md compares
+''   this program with nine others on the understanding that what it draws by default is the
+''   uniform figure they all draw. Section 6b is the algorithm and the reason.)
 ''
 ''  * MORE THAN ONE THREAD. Each orbit is independent, so this parallelises almost perfectly. It is
 ''    left out on purpose: three engines compared through a thread pool measure the thread pool.
