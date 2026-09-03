@@ -2243,6 +2243,15 @@ begin
     Timer := CreateHiResTimer;
     try
       BytecodeProgram := Serializer.LoadFromFile(BytecodeFile);
+      // ⛔⛔ THE FUSION PASS RUNS HERE AND NOT IN `sbc`. Whether fusing pays depends on the ENGINE,
+      // and only this side knows which one: RunSuperinstructions' own gate reads GJitWillRun, which
+      // --jit has already set by the time we get here. `sbc` cannot know, always fused, and a
+      // `.basc` cannot be un-fused - which made `sb prog.basc --jit` TEN AND A HALF TIMES slower
+      // than `sb prog.bas --jit` on the same program (fannkuch N=11: 21 641 ms against 2 019, with
+      // the JIT compiling zero loops instead of seven). See FuseAtLoad for the whole measurement.
+      // ⚠️ This path does NOT go through TSedaiRunner, which carries the same call for `sbv`: two
+      // sites, one function, and the reason is written in both.
+      FuseAtLoad(BytecodeProgram);
       LoadTime := Timer.ElapsedMilliseconds;
     except
       on E: Exception do

@@ -13863,6 +13863,49 @@ begin
   end;
 end;
 
+procedure AliasArrayStorage(const Src: TArrayStorage; var Dst: TArrayStorage);
+// A SECOND reference to Src's storage - exactly what `Dst := Src` does, and exactly as many
+// reference counts moved - written out FIELD BY FIELD.
+//
+// ⛔⛔ THE DIFFERENCE IS NOT THE REFERENCE COUNTS, IT IS THE RTTI. A whole-record assignment on a
+// record with managed fields compiles to fpc_copy(@Src, @Dst, TypeInfo), which INTERPRETS the
+// record's type information at run time to find out which fields are managed and what each one is.
+// TArrayStorage has five dynamic arrays, so that walk happens five times per call, and the same is
+// true of the Finalize on the way out. Written out, the compiler emits five direct calls and no
+// interpretation at all.
+//
+// 📊 Measured 3 Sep 2026 on job/tests/bench/arraybind_probe.bas, 2 000 000 calls to a Sub whose body
+// does not touch the array, one binary. The cost is PER PARAMETER - an integer parameter is 25 ms,
+// one array 517, two 864, three 1226, i.e. ~177 ns for each bind/unbind pair - which is what says
+// the cost is this pair and not the call.
+//
+// ⚠️ It is NOT a borrow: the reference is really taken and really released. Making it uncounted
+// would be faster still and is NOT safe - ERASE on an array PARAMETER releases the slot's storage
+// inside the callee, and with no count of its own that would free the CALLER's array. That is what
+// m753_erase_through_a_udt_array_parameter exercises.
+begin
+  Dst.ElementType := Src.ElementType;
+  Dst.DimCount    := Src.DimCount;
+  Dst.TotalSize   := Src.TotalSize;
+  Dst.IsDynamic   := Src.IsDynamic;
+  Dst.Dimensions  := Src.Dimensions;
+  Dst.LowerBounds := Src.LowerBounds;
+  Dst.IntData     := Src.IntData;
+  Dst.FloatData   := Src.FloatData;
+  Dst.StringData  := Src.StringData;
+end;
+
+procedure ReleaseArrayStorage(var A: TArrayStorage);
+// Release A's five managed fields - exactly what Finalize(A) does, without the RTTI walk. The
+// scalar fields are deliberately left alone: every caller overwrites them in the next breath.
+begin
+  A.Dimensions  := nil;
+  A.LowerBounds := nil;
+  A.IntData     := nil;
+  A.FloatData   := nil;
+  A.StringData  := nil;
+end;
+
 procedure MoveArrayStorage(var Src, Dst: TArrayStorage);
 // TRANSFER ownership of a storage record: Dst releases whatever it held, takes Src's bits, and Src is
 // left owning nothing. No reference count moves, because none needs to: the value has one owner before
@@ -13878,7 +13921,7 @@ begin
   if (Pointer(Dst.IntData) <> nil) or (Pointer(Dst.FloatData) <> nil) or
      (Pointer(Dst.StringData) <> nil) or (Pointer(Dst.Dimensions) <> nil) or
      (Pointer(Dst.LowerBounds) <> nil) then
-    Finalize(Dst);
+    ReleaseArrayStorage(Dst);   // Finalize(Dst) is the same thing through the RTTI - see above
   Move(Src, Dst, SizeOf(TArrayStorage));
   FillChar(Src, SizeOf(TArrayStorage), 0);
 end;
@@ -13935,7 +13978,7 @@ begin
           if Ctx.ArrPrivSaveTop >= Length(Ctx.ArrPrivSave) then
             SetLength(Ctx.ArrPrivSave, (Ctx.ArrPrivSaveTop + 1) * 2);
           Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].SlotId := ArrayIdx;
-          Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Saved := FArrays[ArrayIdx];
+          AliasArrayStorage(FArrays[ArrayIdx], Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Saved);
           Inc(Ctx.ArrPrivSaveTop);
           if GArrPrivDiag then
             WriteLn(ErrOutput, Format('[arrpriv] SALVA phys %d, pila -> %d', [ArrayIdx, Ctx.ArrPrivSaveTop]));
@@ -14427,7 +14470,8 @@ begin
           // reference: the parameter is about to share the argument's storage. The SAVE of what the
           // parameter slot held is deferred to bcArrayBindApply, where it becomes a MOVE - see
           // TArrayBindEntry and MoveArrayStorage.
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot := FArrays[LinearIdx];    // the arg, captured now
+          AliasArrayStorage(FArrays[LinearIdx],
+                            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);   // the arg, captured now
           Inc(Ctx.ArrayBindTop);
         end;
       end;
@@ -14447,7 +14491,8 @@ begin
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
           begin
             Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot := FArrays[PtrAddr];   // alias the member's storage
+            AliasArrayStorage(FArrays[PtrAddr],
+                              Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);  // alias the member's storage
           end
           else
           begin  // handle < 1 = member array never allocated: bind an EMPTY array (UBOUND = -1), and set
