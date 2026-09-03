@@ -1092,6 +1092,8 @@ type
     procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
     function EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
                                       ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
+    procedure EnsureSharedBackingSized(const VarName: string);
+    procedure PublishScalarToHome(const VarName: string; const Val: TSSAValue);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     function AnyFixedLen: Boolean; inline;
@@ -10151,6 +10153,60 @@ begin
   Result := True;
 end;
 
+procedure TSSAGenerator.EnsureSharedBackingSized(const VarName: string);
+// A SHARED scalar's 1-element backing array is normally sized by its own DIM statement. A branch that
+// handles the declaration ITSELF and leaves early - the BYREF bind does exactly that - never reaches
+// that line, so the array stays unsized and every read and write of it is a wild access.
+//
+// ⛔ Skipped when the program has module constructors: there EmitSharedScalarAllocs pre-sized every
+// backing in the entry block, and re-sizing would zero what a constructor just wrote. Same condition,
+// same reason, as the DIM path itself.
+var ai: Integer; ArrayRef: TSSAValue;
+begin
+  if FSharedScalarArr = nil then Exit;
+  ai := FSharedScalarArr.IndexOf(UpperCase(VarName));
+  if ai < 0 then Exit;
+  if (FModuleCtors <> nil) and (FModuleCtors.Count > 0) then Exit;
+  ai := PtrInt(FSharedScalarArr.Objects[ai]);
+  ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+  EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.PublishScalarToHome(const VarName: string; const Val: TSSAValue);
+// Put a value where READERS of this variable will look for it. There are three homes and a variable
+// has exactly one; the register is written by the caller, this covers the other two.
+//
+// ⭐ THREE CALLERS AND ONE RULE. It began as the allocation's publisher and grew a third caller the
+// same day - the BYREF reference bind - because that was the SAME defect a third time: a value
+// written to the variable's REGISTER while its readers go to its HOME. DIVERGENZE 80, 92 and 49 are
+// one root, and this is where it is answered once.
+//
+// ⛔⛔ A RAWMODULE SCALAR IS NOT A SHARED SCALAR, even though IsSharedScalar says yes to both. Its
+// backing array holds the ADDRESS OF ITS RAW SLOT, not its value - so publishing the value there
+// does not store it, it DESTROYS the address, and the next read dereferences whatever the value
+// happened to be. Measured 4 Sep 2026, DIVERGENZE 92:
+//
+//     Dim As Integer Ptr ip = Allocate(8)
+//     *ip = 77                              <- "Null or invalid pointer dereference"
+//     Dim As Any Ptr a = @ip                <- because of THIS line
+//
+// and the same program with "Integer Ptr Ptr" in place of "Any Ptr" was right, because there ip
+// never became RAWMODULE. ⇒ The declared type of the pointer that TAKES the address decided where
+// the variable TAKEN lives, and one of the two homes was published wrongly.
+begin
+  if IsRawModuleScalar(VarName) then
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
+                    EnsureIntRegister(Val),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
+  else if IsRawAddrLocal(VarName) then
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
+                    EnsureIntRegister(Val),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))))
+  else if IsSharedScalar(VarName) then
+    EmitSharedScalarStoreVal(VarName, Val);
+end;
+
 function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
 // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
@@ -10207,7 +10263,7 @@ begin
                                       or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                       or ((Int64(UDTIdx) and $FFFF) shl 48)));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+      PublishScalarToHome(VarName, ExprValue);
       // Give the elements that are NEW their member-array / nested-UDT backing and field defaults, as
       // the first allocation did; the kept ones are before OldNReg and are not touched.
       EmitRecordBlockInitFrom(GetOrAllocateVariable(VarName), OldNReg, CountReg, UDTIdx, False);
@@ -10219,36 +10275,12 @@ begin
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
     // deref from another procedure (or module level) sees the allocated record, not a stale 0.
-    if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
-    // ⛔⛔ ...AND AN @-TAKEN ONE KEEPS IT IN ITS RAW SLOT, which this line was missing. DIVERGENZE 80.
-    // The conversion above turns "Allocate(SizeOf(T))" for a "T Ptr" into a MANAGED record block and
-    // hands back its HANDLE; the copy on the line above puts that handle in the variable's REGISTER.
-    // But an @-taken variable is not read from its register - it is read from its slot, and the slot
-    // still held whatever the initialiser had put there. So the reader loaded a raw byte address,
-    // handed it to the record path, and the program died:
-    //
-    //     Dim As T Ptr p = Allocate(SizeOf(T))
-    //     p->x = 42                            <- EAccessViolation
-    //     Dim As Any Ptr q = @p                <- ...because of THIS line, three lines later
-    //
-    // ⭐ THE TELL IS THAT THE CRASH MOVED WITH A LINE THAT COMES AFTER IT. Only "Allocate" plus "@p"
-    // does it: "New T" and "@u" are fine either way, and an "Integer Ptr" is fine too - because for
-    // those the value in the slot and the value the reader wants are the SAME KIND. Here they are two
-    // families of address, a raw byte pointer and a record handle, and the conversion published to
-    // one home out of two.
-    if IsRawModuleScalar(VarName) then
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
-                      EnsureIntRegister(ExprValue),
-                      MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
-    else if IsRawAddrLocal(VarName) then
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
-                      EnsureIntRegister(ExprValue),
-                      MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
+    PublishScalarToHome(VarName, ExprValue);
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
   EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+  PublishScalarToHome(VarName, ExprValue);
 end;
 
 // ============================================================================================
@@ -11668,6 +11700,9 @@ begin
           begin
             EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
                             EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EnsureSharedBackingSized(UpperCase(ArrName));
+            EnsureSharedBackingSized(UpperCase(ArrName));
+        PublishScalarToHome(UpperCase(ArrName), RecHandleVal);
             Continue;
           end;
         finally
@@ -11687,12 +11722,16 @@ begin
         ProcessExpression(RefTgt.GetChild(0).GetChild(0), RecHandleVal);
         EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
                         EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EnsureSharedBackingSized(UpperCase(ArrName));
+        PublishScalarToHome(UpperCase(ArrName), RecHandleVal);
         Continue;
       end
       else if ResolveRecordObject(RefTgt, RecHandleVal, RefTgtType) then
       begin
         EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
                         EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EnsureSharedBackingSized(UpperCase(ArrName));
+        PublishScalarToHome(UpperCase(ArrName), RecHandleVal);
         Continue;
       end;
     end;
@@ -11992,11 +12031,29 @@ begin
         else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
                 (ArrayDeclNode.Attributes.Values['PREINITED'] <> '1') then
         begin
-          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
-          InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
-          InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
-          ProcessArrayStore(InitAssign);
-          InitAssign.Free;
+          // ⛔⛔ ALLOCATE FIRST, AND THE REASON IS THAT THIS LINE BYPASSES ProcessAssignment.
+          // A shared scalar's initialiser is lowered as a store into element 0 of its backing array,
+          // which is right for a value - and wrong for "Dim Shared As T Ptr p = Allocate(SizeOf(T))",
+          // because the conversion that turns an Allocate for a UDT pointer into a managed record
+          // BLOCK lives in TryAllocAssign, on the assignment path this never reaches. The raw byte
+          // address went into the cell, "p->x" read it as a record handle, and the program died:
+          //
+          //     Dim Shared As T Ptr p = Allocate(SizeOf(T))
+          //     p->x = 42                                   <- EAccessViolation
+          //
+          // ⭐ The tell was that the SAME program with the assignment on the NEXT line worked - and
+          // the next line is ProcessAssignment. Two roads into one variable, and the conversion was
+          // on one of them. DIVERGENZE 80.
+          // ⚠️ TryAllocAssign publishes to the shared cell itself (it asks IsSharedScalar), so there
+          // is nothing to do here when it fires - and it fires for the RAW case too, correctly.
+          if not TryAllocAssign(UpperCase(ArrName), ArrayDeclNode.GetChild(2)) then
+          begin
+            InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+            InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
+            InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+            ProcessArrayStore(InitAssign);
+            InitAssign.Free;
+          end;
         end;
         Continue;
       end;
