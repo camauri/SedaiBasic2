@@ -11992,11 +11992,29 @@ begin
         else if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
                 (ArrayDeclNode.Attributes.Values['PREINITED'] <> '1') then
         begin
-          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
-          InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
-          InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
-          ProcessArrayStore(InitAssign);
-          InitAssign.Free;
+          // ⛔⛔ ALLOCATE FIRST, AND THE REASON IS THAT THIS LINE BYPASSES ProcessAssignment.
+          // A shared scalar's initialiser is lowered as a store into element 0 of its backing array,
+          // which is right for a value - and wrong for "Dim Shared As T Ptr p = Allocate(SizeOf(T))",
+          // because the conversion that turns an Allocate for a UDT pointer into a managed record
+          // BLOCK lives in TryAllocAssign, on the assignment path this never reaches. The raw byte
+          // address went into the cell, "p->x" read it as a record handle, and the program died:
+          //
+          //     Dim Shared As T Ptr p = Allocate(SizeOf(T))
+          //     p->x = 42                                   <- EAccessViolation
+          //
+          // ⭐ The tell was that the SAME program with the assignment on the NEXT line worked - and
+          // the next line is ProcessAssignment. Two roads into one variable, and the conversion was
+          // on one of them. DIVERGENZE 80.
+          // ⚠️ TryAllocAssign publishes to the shared cell itself (it asks IsSharedScalar), so there
+          // is nothing to do here when it fires - and it fires for the RAW case too, correctly.
+          if not TryAllocAssign(UpperCase(ArrName), ArrayDeclNode.GetChild(2)) then
+          begin
+            InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+            InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
+            InitAssign.AddChild(ArrayDeclNode.GetChild(2).Clone);
+            ProcessArrayStore(InitAssign);
+            InitAssign.Free;
+          end;
         end;
         Continue;
       end;
