@@ -1092,6 +1092,7 @@ type
     procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
     function EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
                                       ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
+    procedure PublishAllocToHome(const VarName: string; const Val: TSSAValue);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     function AnyFixedLen: Boolean; inline;
@@ -10151,6 +10152,35 @@ begin
   Result := True;
 end;
 
+procedure TSSAGenerator.PublishAllocToHome(const VarName: string; const Val: TSSAValue);
+// Put an allocation's result where READERS of this variable will look for it. There are three homes
+// and a variable has exactly one; the register is written by the caller, this covers the other two.
+//
+// ⛔⛔ A RAWMODULE SCALAR IS NOT A SHARED SCALAR, even though IsSharedScalar says yes to both. Its
+// backing array holds the ADDRESS OF ITS RAW SLOT, not its value - so publishing the value there
+// does not store it, it DESTROYS the address, and the next read dereferences whatever the value
+// happened to be. Measured 4 Sep 2026, DIVERGENZE 92:
+//
+//     Dim As Integer Ptr ip = Allocate(8)
+//     *ip = 77                              <- "Null or invalid pointer dereference"
+//     Dim As Any Ptr a = @ip                <- because of THIS line
+//
+// and the same program with "Integer Ptr Ptr" in place of "Any Ptr" was right, because there ip
+// never became RAWMODULE. ⇒ The declared type of the pointer that TAKES the address decided where
+// the variable TAKEN lives, and one of the two homes was published wrongly.
+begin
+  if IsRawModuleScalar(VarName) then
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
+                    EnsureIntRegister(Val),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
+  else if IsRawAddrLocal(VarName) then
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
+                    EnsureIntRegister(Val),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))))
+  else if IsSharedScalar(VarName) then
+    EmitSharedScalarStoreVal(VarName, Val);
+end;
+
 function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
 // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
@@ -10207,7 +10237,7 @@ begin
                                       or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                       or ((Int64(UDTIdx) and $FFFF) shl 48)));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+      PublishAllocToHome(VarName, ExprValue);
       // Give the elements that are NEW their member-array / nested-UDT backing and field defaults, as
       // the first allocation did; the kept ones are before OldNReg and are not touched.
       EmitRecordBlockInitFrom(GetOrAllocateVariable(VarName), OldNReg, CountReg, UDTIdx, False);
@@ -10219,36 +10249,12 @@ begin
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
     // deref from another procedure (or module level) sees the allocated record, not a stale 0.
-    if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
-    // ⛔⛔ ...AND AN @-TAKEN ONE KEEPS IT IN ITS RAW SLOT, which this line was missing. DIVERGENZE 80.
-    // The conversion above turns "Allocate(SizeOf(T))" for a "T Ptr" into a MANAGED record block and
-    // hands back its HANDLE; the copy on the line above puts that handle in the variable's REGISTER.
-    // But an @-taken variable is not read from its register - it is read from its slot, and the slot
-    // still held whatever the initialiser had put there. So the reader loaded a raw byte address,
-    // handed it to the record path, and the program died:
-    //
-    //     Dim As T Ptr p = Allocate(SizeOf(T))
-    //     p->x = 42                            <- EAccessViolation
-    //     Dim As Any Ptr q = @p                <- ...because of THIS line, three lines later
-    //
-    // ⭐ THE TELL IS THAT THE CRASH MOVED WITH A LINE THAT COMES AFTER IT. Only "Allocate" plus "@p"
-    // does it: "New T" and "@u" are fine either way, and an "Integer Ptr" is fine too - because for
-    // those the value in the slot and the value the reader wants are the SAME KIND. Here they are two
-    // families of address, a raw byte pointer and a record handle, and the conversion published to
-    // one home out of two.
-    if IsRawModuleScalar(VarName) then
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
-                      EnsureIntRegister(ExprValue),
-                      MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
-    else if IsRawAddrLocal(VarName) then
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
-                      EnsureIntRegister(ExprValue),
-                      MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
+    PublishAllocToHome(VarName, ExprValue);
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
   EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+  PublishAllocToHome(VarName, ExprValue);
 end;
 
 // ============================================================================================
