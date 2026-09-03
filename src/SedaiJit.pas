@@ -75,6 +75,10 @@ type
 // value the route needs is the context object, and that is already in the frame slot the Xfer/record
 // accessors read. Pass nil for either and the route is off: every routable opcode bails the loop
 // again, which is the pre-J14 behaviour.
+// GfxDescOff is the byte offset of TExecutionContext.GfxDesc - the five Int64 the compiled PSET
+// fast path reads (base, width, height, &penX, &penY). An OFFSET and not an address, for the same
+// reason as the banks below: the block is per-CONTEXT, so a worker running this same code reads its
+// own. Pass a negative value and PSET stays on the helper route.
 // PrimCtx/StringRegsOff are the string family as native LEAF calls (J15): the VM's filled TAotCtx,
 // whose primitive addresses are read at COMPILE time and baked, and the byte offset of the StringRegs
 // field inside TExecutionContext, read at RUN time so a worker uses its own bank. nil puts the whole
@@ -83,7 +87,7 @@ function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: I
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
                      RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
                      HelperFn, VMSelf: Pointer;
-                     PrimCtx: Pointer; StringRegsOff: Integer): TExecMem;
+                     PrimCtx: Pointer; StringRegsOff, GfxDescOff: Integer): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -259,7 +263,19 @@ begin
       bcLoadConstString, bcCopyString, bcIntToString,
       bcCmpEqString, bcCmpNeString, bcCmpLtString, bcCmpGtString,
       bcRecordNew, bcRecordFree,
-      bcStrAppendMapped, bcStrConcatCharAt:
+      bcStrAppendMapped, bcStrConcatCharAt,
+      // ⭐ THREE GRAPHICS OPCODES, BY NAME, AND NOT THE GROUP. Before 3 Sep 2026 this file did not
+      // name a single one, so ANY loop that drew bailed whole - which is why --jit was 0.92x the
+      // INTERPRETER on bas/demo/bubble_universe.bas: it compiled the three table-filling loops that
+      // run once and refused the render loop at its first instruction (BAIL op 2626 = bcGfxScreenLock).
+      // ⛔ The GROUP is not admitted, because the two properties above are not group facts: GET/PUT
+      // read and write an ARRAY and PALETTE USING takes one. These three were read: none names
+      // FArrays, none assigns Ctx.PC.
+      // ⚠️ bcGfxPset is here so a loop containing it ROUTES at all - it is what makes UseHelper true
+      // and reserves the call scratch - but it never actually takes this route: the case arm below
+      // emits it inline, and only its cold path calls out. A helper call is ~55 ns and the whole
+      // per-point budget on that demo is 57.
+      bcGfxScreenLock, bcGfxScreenUnlock, bcGfxPset:
         Result := True;
     else
       Result := False;
@@ -271,7 +287,7 @@ function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: I
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
                      RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
                      HelperFn, VMSelf: Pointer;
-                     PrimCtx: Pointer; StringRegsOff: Integer): TExecMem;
+                     PrimCtx: Pointer; StringRegsOff, GfxDescOff: Integer): TExecMem;
 var
   E: TX86Emitter;
   NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
@@ -290,6 +306,7 @@ var
   CallPC, CallEntry, CallRet, CallSaveN: array of Integer;   // parallel arrays, one entry per call site
   NCall: Integer;
   ScratchBytes: Integer;             // stack bytes reserved for the deepest call site's bank save/restore
+  GfxSaveDisp: Integer;              // two slots parking x and y across the compiled PSET's store path
   // Float register allocation (J4): map a VM float reg -> a native xmm (2..7, no REX) or -1 (memory).
   // Only the volatile-plus-two set xmm2..xmm7 is used; xmm6/xmm7 are callee-saved so they are spilled to
   // the stack in the prologue when allocated. Integer VM regs are allocated to r9..r15 (see ILoc below).
@@ -1872,6 +1889,117 @@ var
   function Prim(CtxOff: Integer): Pointer;
   begin Result := PPointer(PtrUInt(PrimCtx) + PtrUInt(CtxOff))^; end;
 
+  { C9 FOR THE LOOP JIT: the math family as LEAF calls, through the SAME table the AOT calls.
+
+    ⛔⛔ IT IS THE SAME TABLE AND THAT IS THE POINT. GAotMathFns holds shims that call c_sin, c_cos
+    and friends - the very functions the interpreter's arm and hotdisp.c call - so this is a cheaper
+    ROUTE to the existing answer and not a fifth implementation. CLAUDE.md counts the entrances:
+    the arm, ComputeBuiltinFP, hotdisp.c, the AOT - and this is the fifth. Any of them computing its
+    own sine makes the same program answer differently on different engines.
+
+    ⛔ AND IT IS WHAT MAKES THE COMPILED PSET WORTH HAVING. Routed through AotExecOne instead, each
+    of these is a full interpreter round trip: bas/demo/bubble_universe.bas calls Sin and Cos twice
+    each per pixel, and with the render loop compiled but the math routed, --jit measured 4.44 s
+    against the interpreter's 1.06 on 300 frames. Compiling a loop whose arithmetic leaves it is a
+    loss, which is the same rule as an opcode missing from the C hot loop.
+
+    ⚠️ Only the twelve the AOT admits. The exclusions are the AOT's and they are reasons, not a
+    to-do list: LOG/LOG10/LOG2/LOGN RAISE on a non-positive argument (and an exception through a
+    hand-built frame with no unwind information is undefined), ACOS/ASIN/ACOSH/ATANH/ROUND/SGN/
+    MIN/MAX/COPYSIGN carry a domain guard or a multi-way choice that a shim would have to copy, and
+    RND has state. }
+  function MathLeafKind(Op: Word): Integer;
+  begin
+    case Op of
+      bcMathSin:   Result := AOTMATH_SIN;    bcMathCos:   Result := AOTMATH_COS;
+      bcMathTan:   Result := AOTMATH_TAN;    bcMathAtn:   Result := AOTMATH_ATN;
+      bcMathExp:   Result := AOTMATH_EXP;    bcMathSinh:  Result := AOTMATH_SINH;
+      bcMathCosh:  Result := AOTMATH_COSH;   bcMathTanh:  Result := AOTMATH_TANH;
+      bcMathAsinh: Result := AOTMATH_ASINH;  bcMathCeil:  Result := AOTMATH_CEIL;
+      bcMathFrac:  Result := AOTMATH_FRAC;   bcMathAtan2: Result := AOTMATH_ATAN2;
+    else Result := -1;
+    end;
+  end;
+
+  procedure EmitMathLeafJ(Kind: Integer; TwoArgs: Boolean);
+  var fn: Pointer;
+  begin
+    fn := PPointer(PtrUInt(Prim(AOTCTX_MATHFNS)) + PtrUInt(Kind) * 8)^;
+    SpillVol; LeafSaveBases;
+    FLoad(XMM0, I^.Src1);                                  // xmm0 = first argument
+    if TwoArgs then FLoad(XMM1, I^.Src2);                  // xmm1 = second
+    LeafCall(fn);
+    LeafRestore;                                           // reloads xmm2.. only: xmm0 is the result
+    FStore(I^.Dest, XMM0);
+  end;
+
+  { C8 FOR THE LOOP JIT: PSET as an inline store, the same arm SedaiAot emits and for the same
+    reason. It is a TRANSCRIPTION of EmitGfxPsetNative in SedaiAot.pas - if one changes, both do.
+
+    ⛔ THE GATE IS ctx.GfxDesc[0] AND NOTHING ELSE, which is only sound because AotGfxRefresh leaves
+    it zero under every condition where PSET does more than one store (palette, clip, WINDOW, VIEW,
+    a draw target that is not the work page). That list now lives in THREE places - RunTemplate's
+    HotGfxDesc for the C loop, and AotGfxRefresh for both compilers - and they must stay one list.
+
+    ⛔⛔ AND THE COLD PATH RE-ARMS AFTER the helper call, never before: AotExecOne zeroes the
+    descriptor on its way through, so refreshing first would be undone by the very call it prepares.
+    One slow pixel per invalidation, then the rest of the loop is inline.
+
+    ⚠️ The bounds test is UNSIGNED on purpose - a negative coordinate becomes a huge unsigned and
+    fails the same compare, which lets one test do the work of two.
+    ⚠️ The pen is written even when the point falls OUTSIDE the surface, because the interpreter
+    writes it unconditionally after SetPixel and POINTCOORD reads it back.
+    ⚠️ The colour is in Immediate and it is a REGISTER NUMBER, not a value - see the opcode's own
+    comment in SedaiBytecodeTypes. }
+  procedure EmitGfxPsetJ(apc: Integer);
+  var pColdBase, pNoStore1, pNoStore2, pDone: Integer;
+  begin
+    ILoad(RCX, I^.Src1);                                   // rcx = x
+    ILoad(RDX, I^.Src2);                                   // rdx = y
+    E.EmitBytes([$48, $89, $8C, $24]); E.Emit32(LongWord(GfxSaveDisp));      // mov [rsp+G],   rcx
+    E.EmitBytes([$48, $89, $94, $24]); E.Emit32(LongWord(GfxSaveDisp + 8));  // mov [rsp+G+8], rdx
+
+    // rax = &ctx.GfxDesc[0]. The block is a FIELD of the context, so this is a lea and not a load -
+    // one indirection fewer than the Xfer banks, whose field holds a pointer.
+    E.EmitBytes([$48, $8B, $84, $24]); E.Emit32(LongWord(CtxDisp));          // mov rax, [rsp+Ctx]
+    LeaR(RAX, RAX, LongWord(GfxDescOff));                                    // lea rax, [rax+off]
+    E.EmitBytes([$48, $83, $38, $00]);                                       // cmp qword [rax], 0
+    E.EmitBytes([$0F, $84]); pColdBase := E.Len; E.Emit32(0);                // je cold
+
+    E.EmitBytes([$48, $3B, $48, $08]);                                       // cmp rcx, [rax+8]
+    E.EmitBytes([$0F, $83]); pNoStore1 := E.Len; E.Emit32(0);                // jae nostore
+    E.EmitBytes([$48, $3B, $50, $10]);                                       // cmp rdx, [rax+16]
+    E.EmitBytes([$0F, $83]); pNoStore2 := E.Len; E.Emit32(0);                // jae nostore
+
+    E.EmitBytes([$48, $0F, $AF, $50, $08]);                                  // imul rdx, [rax+8]
+    E.EmitBytes([$48, $01, $CA]);                                            // add  rdx, rcx
+    E.EmitBytes([$48, $8B, $08]);                                            // mov  rcx, [rax]
+    E.EmitBytes([$48, $8D, $0C, $91]);                                       // lea  rcx, [rcx+rdx*4]
+    ILoad(RDX, I^.Immediate);                                                // rdx = colour
+    E.EmitBytes([$89, $11]);                                                 // mov  [rcx], edx
+
+    E.Patch32(pNoStore1, LongWord(E.Len - (pNoStore1 + 4)));                 // @nostore
+    E.Patch32(pNoStore2, LongWord(E.Len - (pNoStore2 + 4)));
+    E.EmitBytes([$48, $8B, $48, $18]);                                       // mov rcx, [rax+24]
+    E.EmitBytes([$48, $8B, $94, $24]); E.Emit32(LongWord(GfxSaveDisp));      // mov rdx, [rsp+G]
+    E.EmitBytes([$89, $11]);                                                 // mov [rcx], edx
+    E.EmitBytes([$48, $8B, $48, $20]);                                       // mov rcx, [rax+32]
+    E.EmitBytes([$48, $8B, $94, $24]); E.Emit32(LongWord(GfxSaveDisp + 8));  // mov rdx, [rsp+G+8]
+    E.EmitBytes([$89, $11]);                                                 // mov [rcx], edx
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
+
+    E.Patch32(pColdBase, LongWord(E.Len - (pColdBase + 4)));                 // @cold
+    EmitHelperCall(apc);                                   // draw THIS pixel the old way...
+    SpillVol; LeafSaveBases;                               // ...then re-arm for the next one
+    MovImm64(ABI_ARG0, PtrInt(VMSelf));
+    E.EmitBytes([$48, $8B, $84, $24]); E.Emit32(LongWord(CtxDisp));          // rax = the ctx object
+    LeaR(ABI_ARG2, RAX, LongWord(GfxDescOff));                               // arg2 = &ctx.GfxDesc[0]
+    MovRR(ABI_ARG1, RAX);                                                    // arg1 = the ctx itself
+    LeafCall(Prim(AOTCTX_GFXREFRESH));
+    LeafRestore;
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
+  end;
+
   { The emitters. Argument order is the AOT's, and it is not stylistic: on Win64 arg2 IS r8 (already
     parked) and arg3 IS r9, which lives in the allocation pool - so every operand that may be read
     out of a pooled register is read BEFORE arg3 is written. }
@@ -2789,6 +2917,19 @@ var
           end;
         end
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcMathSin, bcMathCos, bcMathTan, bcMathAtn, bcMathExp, bcMathSinh, bcMathCosh,
+      bcMathTanh, bcMathAsinh, bcMathCeil, bcMathFrac, bcMathAtan2:
+        if (PrimCtx <> nil) and HelperRouteEnabled and (Prim(AOTCTX_MATHFNS) <> nil)
+           and (PPointer(PtrUInt(Prim(AOTCTX_MATHFNS)) + PtrUInt(MathLeafKind(I^.OpCode)) * 8)^ <> nil)
+           and not (InCallee or InGosub) then
+          EmitMathLeafJ(MathLeafKind(I^.OpCode), I^.OpCode = bcMathAtan2)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcGfxPset:
+        // ⛔ NOT the helper route, even though IsRoutableOp admits it: a helper call is ~55 ns and
+        // the whole per-point budget on bubble_universe is 57. The inline form is what makes the
+        // difference between compiling this loop and being no better than interpreting it.
+        if UseHelper and (GfxDescOff >= 0) and not (InCallee or InGosub) then EmitGfxPsetJ(apc)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
     else
       // The helper route (J14): an instruction with no native form is run by the INTERPRETER and
       // native execution carries on after it, instead of the whole loop being given up. Only for
@@ -3299,7 +3440,7 @@ begin
   GprSaveDisp := (NSaveInt + NSaveFloat) * 8;
   CtxDisp := GprSaveDisp + NCallerGpr * 8;
   ScratchBytes := CtxDisp + 8;
-  ArrDescDisp := -1; FltSaveDisp := -1; HelperAdjust := 0;
+  ArrDescDisp := -1; FltSaveDisp := -1; GfxSaveDisp := -1; HelperAdjust := 0;
   { ⛔⛔ "or UseLeaf", and it was missing. These two slots and the stack adjustment are what a CALL
     out of compiled code needs, and the LEAF path makes calls too - the whole string family goes
     through LeafSaveBases/LeafRestore. Gated on UseHelper alone, a loop that routes leaf calls but
@@ -3318,7 +3459,10 @@ begin
   begin
     ArrDescDisp := ScratchBytes;
     FltSaveDisp := ScratchBytes + 8;
-    ScratchBytes := ScratchBytes + 16;
+    // Two more for the compiled PSET: the store path clobbers rcx and rdx, and the pen has to be
+    // written from x and y AFTERWARDS - the interpreter writes it even when the point misses.
+    GfxSaveDisp := ScratchBytes + 16;
+    ScratchBytes := ScratchBytes + 32;
     // rsp at a call site, computed statically: the return address, the two unconditional pushes, the
     // callee-saved GPRs the allocator claimed, the optional xmm6/7 area, and the scratch. Win64 also
     // wants 32 bytes of shadow space; System V wants only the alignment.

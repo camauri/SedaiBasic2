@@ -28,7 +28,6 @@ var
   // C8: the compiled PSET fast path's view of the draw surface. Per-RUN like the ctx that points at
   // it, for the same reason: a worker must see its own. Left zeroed here - the first PSET in
   // compiled code finds base 0, takes the slow path once and rebuilds it.
-  LocalGfxDesc: array[0..4] of Int64;
   ArrDescPtr: Pointer;     // array-descriptor table for this native entry (AcquireArrDesc: locked)
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
@@ -178,8 +177,10 @@ begin
     // things for the same opcode. Only what is per-CONTEXT stays here.
     SetAotPrimitives(LocalAotCtx);
     LocalAotCtx.CtxObj := Ctx;
-    FillChar(LocalGfxDesc, SizeOf(LocalGfxDesc), 0);
-    LocalAotCtx.GfxDesc := @LocalGfxDesc[0];
+    // ⛔ The block itself now lives on the CONTEXT (see TExecutionContext.GfxDesc) and is zeroed
+    // below for every engine, not only here: the loop JIT reads it too and used to find whatever
+    // the stack held, because this branch only runs when the AOT does.
+    LocalAotCtx.GfxDesc := @Ctx.GfxDesc[0];
     if Length(Ctx.StringRegs) > 0 then LocalAotCtx.StrRegs := @Ctx.StringRegs[0]
     else LocalAotCtx.StrRegs := nil;
     // C7: the STRING transfer bank, alongside the int and float bases set above. Same lifetime as
@@ -189,6 +190,11 @@ begin
   end
   else
     AotFuncs := nil;
+  // ⛔⛔ ZEROED FOR EVERY ENGINE, AND OUTSIDE THE AotOn BRANCH ABOVE. The compiled PSET fast path
+  // reads element 0 as its gate, and it is now the loop JIT's gate as well; while this lived inside
+  // that branch a --jit run read an UNINITIALISED block - which is a base pointer made of whatever
+  // the stack held, and a store through it.
+  FillChar(Ctx.GfxDesc, SizeOf(Ctx.GfxDesc), 0);
   // Local copy of TrueValue for comparison operators
   TrueVal := FTrueValue;
   ModernConv := Assigned(FProgram) and FProgram.ModernMode;

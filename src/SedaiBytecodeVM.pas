@@ -10055,7 +10055,11 @@ begin
                          // from this table at compile time; the string BANK is per-context, so its
                          // field offset is passed instead and read at run time - a worker uses its own.
                          @FJitPrimCtx,
-                         Integer(PtrUInt(@FCtx.StringRegs) - PtrUInt(Pointer(FCtx))));
+                         Integer(PtrUInt(@FCtx.StringRegs) - PtrUInt(Pointer(FCtx))),
+                         // C8 for the JIT: the byte offset of the five-Int64 draw-surface block.
+                         // An OFFSET, like the banks above and for the same reason - the block is
+                         // per-CONTEXT, so a worker running this same code reads its own.
+                         Integer(PtrUInt(@FCtx.GfxDesc) - PtrUInt(Pointer(FCtx))));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin
@@ -10190,9 +10194,38 @@ begin
   C := TExecutionContext(CtxObj);
   // C8: whatever this instruction turns out to be, the compiled PSET fast path may not trust its
   // cached surface afterwards. SCREEN, VIEW, WINDOW, a palette change and a draw-target switch all
-  // arrive here, and enumerating them is exactly the list that would go stale - so every helper
+  // arrive here, and enumerating THOSE is exactly the list that would go stale - so every helper
   // call invalidates, and the PSET slow path rebuilds. One store against a helper round trip.
-  if (AotCtx <> nil) and (AotCtx^.GfxDesc <> nil) then AotCtx^.GfxDesc[0] := 0;
+  //
+  // ⛔⛔ THE ONE EXEMPTION IS THE MATH GROUP, AND IT IS WRITTEN ON THE CLOSED SIDE. The rule above
+  // is deliberately "everything invalidates" because a list of what DOES invalidate can never be
+  // finished. This is the opposite kind of statement - a whole group that provably CANNOT, because
+  // ExecuteMathOp does not name FGraphics, DrawSurface, FGfxWinActive or FGfxViewOffset even once.
+  //
+  // ⛔ It is not a micro-optimisation, it is what makes the JIT's compiled PSET possible at all.
+  // The loop JIT routes the math family through here (the AOT does not - C9 gave it leaf calls),
+  // and bas/demo/bubble_universe.bas calls Sin, Cos and Int TWICE EACH per pixel. Invalidating on
+  // all six left PSET permanently on its cold path: eight calls per pixel, and --jit measured
+  // 5.78 s against the interpreter's 1.09 on 300 frames. This is the same defect as C10, where an
+  // RGB helper call next door took PSET's fast path away on every pixel - CLAUDE.md records it.
+  //
+  // ⚠️ If the math group ever gains an opcode that can move the draw surface, this exemption is
+  // wrong and the symptom is compiled code drawing through a stale surface - which looks right on
+  // almost every program. The group is arithmetic by construction; keep it that way.
+  if (PC >= 0) and (VM.FProgram <> nil) and
+     ((PInstr(VM.FProgram.GetInstructionsPtr)[PC].OpCode and $FF00) = bcGroupMath) then
+  begin
+    // nothing to invalidate
+  end
+  else
+  begin
+    if (AotCtx <> nil) and (AotCtx^.GfxDesc <> nil) then AotCtx^.GfxDesc[0] := 0;
+    // ...and the same store through the CONTEXT, which is how the loop JIT reaches the block: its
+    // route passes nil for AotCtx (that is what tells AOTC_DIAG the two engines apart), so without
+    // this line a JIT-compiled loop would keep drawing through a surface a helper call had just
+    // invalidated. One store; the gate itself is the same one.
+    if C <> nil then C.GfxDesc[0] := 0;
+  end;
   // AOTC_DIAG=1: charge this exit to the opcode that caused it. Read BEFORE ExecuteInstruction,
   // because the instruction may change the PC. Off by default, and the test costs a predicted
   // branch against a round trip that already costs ~25 ns.

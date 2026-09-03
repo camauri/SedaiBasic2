@@ -270,6 +270,18 @@ type
     BlockRecMark: array of Integer;
     BlockRecMarkTop: Integer;
 
+    { ⭐ THE COMPILED PSET FAST PATH'S VIEW OF THE DRAW SURFACE - five Int64: the pixel base, the
+      width, the height, and the addresses of the two pen fields. It lived as a LOCAL of the Run
+      method (LocalGfxDesc) and moved here on 3 Sep 2026 so the loop JIT can reach it too: the JIT
+      bakes FIELD OFFSETS and never addresses, so a Run-local was reachable by the AOT (which is
+      handed a per-Run TAotCtx) and by nobody else.
+      ⛔ It is per-CONTEXT and not per-VM for the reason every other bank here is: a worker must not
+      share it. Two threads refreshing one block would let one of them read a base from one refresh
+      and a width from another, and write outside the surface.
+      ⚠️ Zero in element 0 means "do not take the fast path"; AotGfxRefresh is the ONE place that
+      decides otherwise, and its gate has to stay the same as RunTemplate's HotGfxDesc. }
+    GfxDesc: array[0..4] of Int64;
+
     // --- Transfer slots (M2): carry args/result across a call's frame save/restore ---
     XferInt: array of Int64;
     XferFloat: array of Double;
