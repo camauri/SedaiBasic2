@@ -313,6 +313,14 @@ begin
   try
     try
       Result := Serializer.LoadFromFile(BytecodeFile);
+      // ⛔⛔ THE FUSION PASS RUNS HERE AND NOT IN `sbc`, because whether it pays depends on the
+      // ENGINE and only the runner knows which one. See the header of FuseAtLoad: a `.basc` that
+      // arrived fused made `--jit` ten and a half times slower than the same program from source,
+      // because the loop JIT bails whole on a superinstruction and cannot un-fuse one.
+      // ⚠️ It is inside LoadBytecode rather than beside its two callers on purpose - `sbv` reaches
+      // a .basc through here, and a third runner that learns to would otherwise run UNFUSED
+      // bytecode and lose ~10% with nothing to report it.
+      if not FSkipSuperinstructions then FuseAtLoad(Result);
       if FVerbose then
         WriteLn('Loaded ', Result.GetInstructionCount, ' instructions');
     except

@@ -131,6 +131,36 @@ type
 
 function RunSuperinstructions(AProgram: TBytecodeProgram): Integer;
 
+{ FuseAtLoad - the fusion pass, run by whoever is about to EXECUTE, on a program that arrived as
+  bytecode.
+
+  ⛔⛔⛔ WHY THIS EXISTS: A COMPILER MUST NOT BAKE A DECISION ONLY THE RUNNER CAN MAKE.
+  Whether fusing pays depends on which ENGINE runs the bytecode - the interpreter wants it, the loop
+  JIT is destroyed by it (it has arms for 3 of the 72 superinstructions, so a fused hot loop bails
+  entirely). That is why RunSuperinstructions carries the GJitWillRun gate. But `sbc` does not know
+  which engine will run its output, never sets that flag, and therefore always fused - and a `.basc`
+  cannot be un-fused afterwards.
+
+  📊 Measured 3 Sep 2026, fannkuch-redux-modern N=11, one binary:
+
+        from the source, --jit          2 019 ms      JIT_DIAG: 7 loops NATIVE, 0 BAIL
+        from `sbc` output, --jit       21 641 ms      JIT_DIAG: 0 loops NATIVE, 5 BAIL
+        from the source, interpreted   21 796 ms
+        `SUPERINSTR=0 sbc`, --jit       2 056 ms      <- the same file, unfused: cured
+
+  ⇒ `sb prog.basc --jit` was TEN AND A HALF TIMES slower than `sb prog.bas --jit`, on the same
+  program, because the compiler had already decided. The JIT compiled NOTHING at all.
+
+  ⇒ The cure is the ORDER, not a patch: `sbc` no longer fuses, and every runner fuses here, at load,
+  where the engine is known. An old `.basc` produced before this change is still fused and still
+  hostile to --jit; nothing can undo that, which is exactly why the decision has moved.
+
+  ⚠️ GAotWillRun is forced False for the call, and that is a FACT and not a convenience: the AOT
+  compiles from the SSA program, a `.basc` carries no SSA, and `sb` says so where it refuses --aot
+  for one. Leaving the flag set would have `--aot prog.basc` suppress fusion for a compiler that
+  cannot run - an interpreted run with the optimisation switched off for nobody. }
+function FuseAtLoad(AProgram: TBytecodeProgram): Integer;
+
 implementation
 
 {$IFDEF DEBUG_SUPERINSTR}
@@ -2676,6 +2706,25 @@ begin
     Result := Optimizer.Run;
   finally
     Optimizer.Free;
+  end;
+end;
+
+function FuseAtLoad(AProgram: TBytecodeProgram): Integer;
+var
+  SavedAot: Boolean;
+begin
+  Result := 0;
+  if AProgram = nil then Exit;
+  SavedAot := GAotWillRun;
+  GAotWillRun := False;              // see the header: no AOT can consume a .basc
+  try
+    Result := RunSuperinstructions(AProgram);
+    // ⚠️ AND THE COMPACTION IS NOT OPTIONAL. A fusion leaves a NOP where the second opcode was, so
+    // without this the interpreter performs exactly as many dispatches as before and the pass buys
+    // NOTHING. It is the same note the pipeline carries where these two run from source.
+    if Result > 0 then RunNopCompaction(AProgram);
+  finally
+    GAotWillRun := SavedAot;
   end;
 end;
 

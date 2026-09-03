@@ -528,10 +528,22 @@ begin
           try RunPeephole(BytecodeProgram); except end;
           {$ENDIF}
 
-          // Superinstructions
-          {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
-          try RunSuperinstructions(BytecodeProgram); except end;
-          {$ENDIF}
+          // ⛔⛔⛔ SUPERINSTRUCTIONS ARE NOT FUSED HERE, AND THIS IS THE POINT OF THE PASS, NOT AN
+          // OMISSION. Whether fusing pays depends on which ENGINE runs the bytecode: the
+          // interpreter wants it, the loop JIT is destroyed by it (it has arms for 3 of the 72
+          // superinstructions, so a fused hot loop bails whole). RunSuperinstructions carries a
+          // GJitWillRun gate for exactly that - and `sbc` cannot set it, because `sbc` does not
+          // know how its output will be run. It always fused, and a `.basc` cannot be un-fused.
+          //
+          // 📊 3 Sep 2026, fannkuch-redux-modern N=11, one binary: from the source `--jit` took
+          // 2 019 ms and compiled 7 loops; from THIS compiler's output `--jit` took 21 641 ms and
+          // compiled ZERO. Ten and a half times, on the same program, decided here.
+          //
+          // ⇒ The runner fuses instead, at load, where the engine is known: SedaiSuperinstructions'
+          // FuseAtLoad, called by `sb` and `sbv` on every .basc. An interpreted .basc is therefore
+          // exactly as fast as before; a JIT-ed one is no longer crippled.
+          // ⚠️ If a fourth runner learns to load a .basc, it calls FuseAtLoad too - or it silently
+          // runs unfused bytecode, which is a 10% interpreter loss nothing would report.
 
           // NOP Compaction
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}

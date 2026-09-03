@@ -186,6 +186,8 @@ double tan(double);
   X(0xC81E, ArrayStoreIntConst    ) \
   X(0xC830, ArrayLoadIntBranchNZ  ) \
   X(0xC831, ArrayLoadIntBranchZ   ) \
+  X(0xC83B, ArrayCopyElement      ) \
+  X(0xC83C, ArrayMoveElement      ) \
   X(0x0068, RecordLoadInt         ) \
   X(0x0069, RecordLoadFloat       ) \
   X(0x006B, RecordStoreInt        ) \
@@ -605,6 +607,46 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         else if (flags & HF_MODERN_ARRAYS) z = 1;    /* the element default is 0: branch */
         else return pc;
         JUMPTO(z ? (int)I->imm : pc + 1); }
+
+  /* ⛔⛔ THESE TWO ARE HERE BECAUSE THE FUSION PASS COINS THEM AND THIS LOOP DID NOT HAVE THEM, which
+     is the third instance of the shape CLAUDE.md records twice already: a pass that mints an opcode
+     the C loop refuses splits a covered run into pieces too short to pay for their own entry.
+     📊 3 Sep 2026, fannkuch-redux-modern N=9, interpreter, one binary:
+         SUPERINSTR=0 (no fusion)   7 entries into this loop, and it never leaves
+         fusion on                  4 713 764 entries - 2 580 480 exits on ArrayCopyElement and
+                                    2 133 277 on ArrayMoveElement, one per element
+     ⇒ The pass that exists to REMOVE dispatches was adding 4.7 million loop entries, and the
+     program ran 65% slower fused (1 639 ms) than unfused (994 ms) - which read from the outside as
+     "fusion pessimises fannkuch" and was really "two arms are missing".
+
+     ⛔ THE MODERN GATE GUARDS THE OUT-OF-BOUNDS CASE, NEVER THE ACCESS. Putting the test at the top
+     hands the PC back at the FIRST element of every CLASSIC program - the defect that cost the plain
+     accessors spectral-norm -68.1% on 21 Aug and six fused forms another eleven days after that.
+     CLASSIC must RAISE on an out-of-bounds index, which this loop cannot do, so it returns pc and
+     lets the interpreter's arm do it. */
+  L_ArrayCopyElement:
+      /* dest array = I->dest, source array = I->s1, ONE index in I->s2 (interpreter sub-opcode 59) */
+      { const int64_t *dd = arrdesc + 4*(int)I->dest;
+        const int64_t *sd = arrdesc + 4*(int)I->s1;
+        int64_t li = ireg[I->s2];
+        if ((uint64_t)li < (uint64_t)dd[2]) {
+          if ((uint64_t)li < (uint64_t)sd[2])
+            ((int64_t *)(intptr_t)dd[0])[li] = ((const int64_t *)(intptr_t)sd[0])[li];
+          else if (flags & HF_MODERN_ARRAYS) ((int64_t *)(intptr_t)dd[0])[li] = 0;
+          else return pc;
+        } else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+      pc++; NEXT;
+  L_ArrayMoveElement:
+      /* ONE array (I->dest), destination index I->s2, source index I->s1 (sub-opcode 60) */
+      { const int64_t *dd = arrdesc + 4*(int)I->dest;
+        int64_t di = ireg[I->s2], si = ireg[I->s1];
+        if ((uint64_t)di < (uint64_t)dd[2]) {
+          if ((uint64_t)si < (uint64_t)dd[2])
+            ((int64_t *)(intptr_t)dd[0])[di] = ((const int64_t *)(intptr_t)dd[0])[si];
+          else if (flags & HF_MODERN_ARRAYS) ((int64_t *)(intptr_t)dd[0])[di] = 0;
+          else return pc;
+        } else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+      pc++; NEXT;
 
 #undef NEXT
 #undef HOT_OP_LIST
