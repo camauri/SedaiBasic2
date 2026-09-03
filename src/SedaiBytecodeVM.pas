@@ -347,6 +347,21 @@ type
     FRetiredArrDesc: array of TInt64Array;
     FArrDescLock: TRTLCriticalSection;
     FArraysDirty: Boolean;
+    { ⭐⭐ WHICH SLOTS the outstanding change touched, so the rebuild can be proportional to it
+      instead of to the length of the table.
+      📊 3 Sep 2026, job/tests/bench/arraybind_many.bas, 2 M calls to a Sub with an array parameter:
+      with 2 arrays the program cost 475 ms with the C hot loop and 333 without; with 62 arrays,
+      1719 and 341. The time with the loop OFF does not move - the sixty extra arrays cost NOTHING -
+      so the whole difference is the rebuild, which ran once per ENTRY into the C loop (4 000 002 of
+      them, because the bind triple is not covered) and rebuilt every entry for a change that
+      touched ONE slot.
+      ⛔ THE DEFAULT IS CONSERVATIVE AND THE NARROWING IS OPT-IN, which is the opposite of the
+      design withdrawn on 2 Sep (see job/markdown/DESCRITTORE-ARRAY.md §3-§5): there, a mutator that
+      forgot to publish gave a STALE descriptor, i.e. a wrong answer under --aot/--jit. Here a site
+      that says nothing gets the full rebuild it always got, and forgetting costs speed only. }
+    FDescAllPending: Boolean;   // an un-localised change is outstanding
+    FDescThisCall: Boolean;     // the ExecuteArrayOp in flight has not said which slot it touched
+    FDescLo, FDescHi: Integer;  // the localised range outstanding (Lo > Hi = none)
     // ⭐ L'ultimo puntatore che AcquireArrDesc ha pubblicato, scritto SOTTO IL LOCK. Serve alla
     // corsia veloce di EnsureArrDesc: se il contesto del chiamante ha gia' questo puntatore e
     // nessuno ha sporcato la tabella, non c'e' niente da riacquisire e la sezione critica si salta.
@@ -600,6 +615,9 @@ type
     {$ENDIF}
     // JIT (J2/J3): compile every eligible hot loop of the current program to native (called from
     // EnsureDenseOps when FJitEnabled). Loops with an unsupported opcode are left to the interpreter.
+    // The two markers that let RebuildJitArrDesc be proportional to what changed (see FDescLo).
+    procedure NoteDescSlot(Slot: Integer);
+    procedure NoteDescNoChange;
     procedure BuildJitLoops;
     // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
     procedure SetAotPrimitives(var C: TAotCtx);
@@ -10083,6 +10101,7 @@ begin
     if FNativeLoops[i] <> nil then begin hdr := i; Break; end;
   if hdr < 0 then SetLength(FNativeLoops, 0);
   FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
+  FDescAllPending := True; FDescThisCall := False; FDescLo := MaxInt; FDescHi := -1;
 end;
 
 { ---------------- AOT runtime helper (C3, PIANO_B1_AOT_DESIGN §5.6/§5.7) ----------------
@@ -11948,7 +11967,8 @@ end;
 procedure TBytecodeVM.RebuildJitArrDesc;
 // ⛔ CALL ONLY WITH FArrDescLock HELD - use EnsureArrDesc, which is the whole public entry point.
 var
-  a, n: Integer;
+  a, n, Lo, Hi: Integer;
+  Grew: Boolean;
 begin
   // 4 Int64 per array (32 bytes): IntData ptr, FloatData ptr, Count (TotalSize), lower bound of dim 0.
   // LBound lets the JIT compile LBOUND/UBOUND(arr) for a 1-D array (dim 0); other dims / the rank query
@@ -11967,6 +11987,11 @@ begin
     FJitArrDesc := nil;                                      // so the SetLength below allocates fresh
   end;
   n := Length(FArrays);
+  // ⛔ SETTLE THE OPERATION IN FLIGHT before reading the range: an ExecuteArrayOp that raised never
+  // reached its marker, and this is where that is noticed (see the fields' note).
+  FDescAllPending := FDescAllPending or FDescThisCall;
+  FDescThisCall := False;
+  Grew := Length(FJitArrDesc) <> n * 4 + 4;
   SetLength(FJitArrDesc, n * 4 + 4);   // +4 so @FJitArrDesc[0] is always valid even with no arrays
   // ⛔ The TABLE keeps its full length - ids are baked into compiled code and must stay in range -
   // but the WORK stops at the last block ever handed out. Everything past it has no storage, so its
@@ -11976,7 +12001,20 @@ begin
     a := FPrivBlockBase + (FPrivBlockHigh + 1) * FPrivArrCount;
     if a < n then n := a;
   end;
-  for a := 0 to n - 1 do
+  // ⭐⭐ AND HERE IS THE WHOLE POINT: rebuild the SLOTS THAT CHANGED, not the table. A bind moves
+  // one slot's storage; before this, a program with 62 arrays rebuilt 62 entries 4 000 002 times
+  // and cost 1719 ms where the same program with the C hot loop off cost 341.
+  // ⛔ Anything un-localised - a DIM, a REDIM, an ERASE, a fresh table, ANY site that did not say
+  // which slot it touched - still rebuilds everything. That is the direction that must be safe.
+  Lo := 0; Hi := n - 1;
+  if (not FDescAllPending) and (not Grew) and (FDescLo <= FDescHi) then
+  begin
+    Lo := FDescLo; Hi := FDescHi;
+    if Lo < 0 then Lo := 0;
+    if Hi > n - 1 then Hi := n - 1;
+  end;
+  FDescAllPending := False; FDescLo := MaxInt; FDescHi := -1;
+  for a := Lo to Hi do
   begin
     if Length(FArrays[a].IntData) > 0 then
       FJitArrDesc[a * 4 + 0] := Int64(PtrUInt(@FArrays[a].IntData[0]))
@@ -13939,6 +13977,31 @@ begin
   A.StringData  := nil;
 end;
 
+procedure TBytecodeVM.NoteDescSlot(Slot: Integer);
+// "this array operation changed slot N and nothing else". Widening, never narrowing: two marks
+// before one rebuild leave a range covering both.
+// ⛔ Switched off entirely while workers exist. The range is VM-wide state and two threads inside
+// ExecuteArrayOp would interleave their marks; with workers every change stays un-localised, which
+// is exactly what happened before this existed.
+begin
+  if FHasWorkers or (Slot < 0) then Exit;
+  FDescThisCall := False;
+  if FDescLo > FDescHi then begin FDescLo := Slot; FDescHi := Slot; end
+  else begin
+    if Slot < FDescLo then FDescLo := Slot;
+    if Slot > FDescHi then FDescHi := Slot;
+  end;
+end;
+
+procedure TBytecodeVM.NoteDescNoChange;
+// "this array operation moved no storage at all" - true of the bind's PHASE ONE, which only
+// snapshots the argument into the save stack. It still marks the table dirty, because it arrives
+// through ExecuteArrayOp, and it is a third of the marks on a program that passes arrays.
+begin
+  if FHasWorkers then Exit;
+  FDescThisCall := False;
+end;
+
 procedure MoveArrayStorage(var Src, Dst: TArrayStorage);
 // TRANSFER ownership of a storage record: Dst releases whatever it held, takes Src's bits, and Src is
 // left owning nothing. No reference count moves, because none needs to: the value has one owner before
@@ -14099,6 +14162,11 @@ begin
   // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
   // kept reading the pre-DIM descriptor and every array element came back 0.
   FArraysDirty := True;
+  // ⛔ SETTLE THE PREVIOUS CALL HERE AND NOT AT ITS OWN END, which is what makes this exception
+  // safe without a try..finally on the cold array path: an operation that RAISED never reached its
+  // marker, so its FDescThisCall is still True and folds into the pending "rebuild everything".
+  FDescAllPending := FDescAllPending or FDescThisCall;
+  FDescThisCall := True;
   SubOp := Instr.OpCode and $FF;
   case SubOp of
     0: // bcArrayLoad (generic, deprecated)
@@ -14506,6 +14574,7 @@ begin
           AliasArrayStorage(FArrays[LinearIdx],
                             Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);   // the arg, captured now
           Inc(Ctx.ArrayBindTop);
+          NoteDescNoChange;   // phase one only SNAPSHOTS: no slot's storage moved
         end;
       end;
     49: // bcArrayBindInd - PHASE 1 bind whose arg is a UDT ARRAY MEMBER: its FArrays handle is only known at
@@ -14549,6 +14618,7 @@ begin
             MoveArrayStorage(FArrays[Ctx.ArrayBindStack[I].SlotId], Ctx.ArrayBindStack[I].Saved);
             MoveArrayStorage(Ctx.ArrayBindStack[I].Snapshot, FArrays[Ctx.ArrayBindStack[I].SlotId]);
             Ctx.ArrayBindStack[I].Applied := True;
+            NoteDescSlot(Ctx.ArrayBindStack[I].SlotId);   // this slot, and only this slot, moved
           end;
       end;
     35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
@@ -14576,6 +14646,11 @@ begin
             // Saved is left owning nothing, so the entry is ready for reuse with no explicit clearing.
             MoveArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved, FArrays[ArrayIdx]);
             Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
+            // Both slots the branch above can write: the parameter always, and the argument when a
+            // REDIM inside the callee moved the storage. Marking the argument unconditionally is
+            // one slot too many at worst, which is the safe direction here.
+            NoteDescSlot(ArrayIdx);
+            NoteDescSlot(Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId);
           end;
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData := nil;
         end;
