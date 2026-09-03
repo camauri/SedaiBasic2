@@ -3114,6 +3114,11 @@ var
     IncludeOnce: Boolean;   // "#include Once": splice this path at most one time
     BlockCmt, PrevBlockCmt: Integer;   // depth of the /' ... '/ block comment we are inside
     ScopeDepth: Integer;    // block nesting, for the level a #pragma reserve was made at
+    DefDepth: Integer;      // block nesting for #define SCOPING - a different set, see DefBlockOpener
+    ScopedName: array of string;    // names defined at DefDepth > 0, innermost last
+    ScopedAt: array of Integer;     // the depth each was defined at
+    ScopedIsFn: array of Boolean;   // whether it went to FnDefs rather than Defs
+    ScopedN: Integer;
     DirWord: string;        // the leading word of the line, for that same counter
     SavedStackTop: Integer;
     ContJoin, CutPos: Integer;   // '_'-continued physical lines folded into this logical one
@@ -3126,6 +3131,70 @@ var
     if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
     Result := (W = 'SCOPE') or (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
               (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') or (W = 'NAMESPACE');
+  end;
+
+  { ⭐ WHICH BLOCKS SCOPE A #define, MEASURED AGAINST fbc AND NOT GUESSED (3 Sep 2026, deck of 11
+    variants through oracle_probe.sh). The rule that came out is clean and worth stating:
+    **an EXECUTABLE block scopes a #define; a DECLARATIVE container does not.**
+
+        scopes it  Scope · Sub · Function · Property · Constructor · Destructor · Operator ·
+                   If · For · While · Do · Select Case
+        does not   Namespace · Type · Union · the top level
+
+    ⚠️ This is NOT the same set as BlockOpener above, which exists for "#pragma reserve" alone and
+    stops at the procedure-like forms. Two questions, two sets: widening the pragma's set to match
+    would change a directive nobody asked about.
+    ⛔ And a one-line "If x Then y" opens nothing. The guard is the same shape the pragma already
+    uses for "Sub s() : ... : End Sub": a block If is one whose line ENDS at Then. }
+  function DefBlockOpener(const S: string; const FullLine: string): Boolean;
+  var W, U: string;
+  begin
+    W := Trim(S);
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    if Pos('(', W) > 0 then W := Copy(W, 1, Pos('(', W) - 1);
+    Result := (W = 'SCOPE') or (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
+              (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') or
+              (W = 'FOR') or (W = 'WHILE') or (W = 'DO') or (W = 'SELECT');
+    if Result then Exit;
+    // IF, only in its BLOCK form: the line ends at THEN (or has no THEN at all, the "If x" form).
+    if W <> 'IF' then Exit;
+    U := TrimRight(UpperCase(FullLine));
+    Result := (Length(U) >= 4) and (Copy(U, Length(U) - 3, 4) = 'THEN');
+  end;
+
+  function DefBlockCloser(const S: string): Boolean;
+  var W: string;
+  begin
+    W := Trim(UpperCase(S));
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    Result := (W = 'NEXT') or (W = 'WEND') or (W = 'LOOP');
+  end;
+
+  function EndClosesDefBlock(const S: string): Boolean;
+  var W: string;
+  begin
+    W := Trim(S);
+    if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+    Result := (W = 'SCOPE') or (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
+              (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') or
+              (W = 'IF') or (W = 'SELECT');
+  end;
+
+  { Remember a name defined INSIDE an executable block, so the block's end can take it away again.
+    Nothing is remembered at the top level, which is the overwhelming majority of #defines. }
+  procedure NoteScopedDefine(const AName: string; IsFn: Boolean);
+  begin
+    if DefDepth <= 0 then Exit;
+    if ScopedN >= Length(ScopedName) then
+    begin
+      SetLength(ScopedName, ScopedN * 2 + 8);
+      SetLength(ScopedAt,   Length(ScopedName));
+      SetLength(ScopedIsFn, Length(ScopedName));
+    end;
+    ScopedName[ScopedN] := AName;
+    ScopedAt[ScopedN]   := DefDepth;
+    ScopedIsFn[ScopedN] := IsFn;
+    Inc(ScopedN);
   end;
 
   function BlockOpener(const S: string): Boolean;
@@ -3176,6 +3245,7 @@ var
     SavedStackTop := High(Active);   // remember depth so includes can't leak unbalanced conditionals
     BlockCmt := 0;
     ScopeDepth := 0;
+    DefDepth := 0; ScopedN := 0;
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
@@ -3210,6 +3280,33 @@ var
         end
         else if BlockOpener(DirWord) and (Pos(' : END ', ' ' + UpperCase(Trimmed) + ' ') = 0) then
           Inc(ScopeDepth);
+        // ...and the same walk for #define scoping, over its OWN block set (see DefBlockOpener).
+        // ⛔ A miscount must fail toward KEEPING a define - that is what this code did before it
+        // existed - so the depth is clamped at zero and names are dropped only when the depth falls
+        // BELOW the one they were recorded at.
+        if (Copy(DirWord, 1, 4) = 'END ') then
+        begin
+          if EndClosesDefBlock(Copy(DirWord, 5, MaxInt)) and (DefDepth > 0) then Dec(DefDepth);
+        end
+        else if DefBlockCloser(DirWord) then
+        begin
+          if DefDepth > 0 then Dec(DefDepth);
+        end
+        else if DefBlockOpener(DirWord, Trimmed) and
+                (Pos(' : END ', ' ' + UpperCase(Trimmed) + ' ') = 0) then
+          Inc(DefDepth);
+        // Drop whatever the block that just closed had defined.
+        while (ScopedN > 0) and (ScopedAt[ScopedN - 1] > DefDepth) do
+        begin
+          Dec(ScopedN);
+          if ScopedIsFn[ScopedN] then
+          begin
+            if FnDefs.IndexOfName(ScopedName[ScopedN]) >= 0 then
+              FnDefs.Delete(FnDefs.IndexOfName(ScopedName[ScopedN]));
+          end
+          else if Defs.IndexOfName(ScopedName[ScopedN]) >= 0 then
+            Defs.Delete(Defs.IndexOfName(ScopedName[ScopedN]));
+        end;
         if PrevBlockCmt > 0 then
         begin
           if Emitting then Output.Add(Raw) else Output.Add('');
@@ -3407,7 +3504,11 @@ var
               q := p + 1;
               while (q <= Length(DRest)) and (DRest[q] <> ')') do Inc(q);
               MacroVal := Trim(Copy(DRest, p + 1, q - p - 1)) + #1 + Trim(StripDirectiveComment(Copy(DRest, q + 1, MaxInt)));
-              if MacroName <> '' then FnDefs.Values[MacroName] := MacroVal;
+              if MacroName <> '' then
+              begin
+                FnDefs.Values[MacroName] := MacroVal;
+                NoteScopedDefine(MacroName, True);
+              end;
             end
             else
             begin
@@ -3419,7 +3520,11 @@ var
               // Narrow on purpose: an ordinary #define still stores its text, as #define must.
               if Pos('__FB_EVAL__', UpperCase(MacroVal)) > 0 then
                 MacroVal := Trim(SubstituteMacros(MacroVal, Defs, FnDefs, 0));
-              if MacroName <> '' then Defs.Values[MacroName] := MacroVal;
+              if MacroName <> '' then
+              begin
+                Defs.Values[MacroName] := MacroVal;
+                NoteScopedDefine(MacroName, False);
+              end;
             end;
           end
           else if (DName = 'macro') and Emitting then

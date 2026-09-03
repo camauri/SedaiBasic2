@@ -464,6 +464,16 @@ type
     // The blocks are reserved ONCE at load (never grown afterwards) because a UDT member array
     // appends to FArrays at RUNTIME and a concurrent SetLength would move the table under it.
     FArrPrivSlot: array of Integer;   // per LOGICAL array id: position inside a block, or -1 = shared
+    { The same fact as FArrPrivSlot, as a LIST instead of a map: the logical ids that are private,
+      and there are exactly FPrivArrCount of them. FArrPrivSlot is indexed by logical id, so asking
+      it "which ones are private" costs a walk of the whole array table - which is the thing the
+      per-context rebuild is trying to stop doing. }
+    FPrivLogical: array of Integer;
+    { What the LAST master rebuild actually covered, kept so the per-context copy can narrow the
+      same way. RebuildJitArrDesc consumes and clears FDescLo/FDescHi, and it runs FIRST inside
+      AcquireArrDescCtxLocked - so by the time the per-context loop reads them they are gone. }
+    FDescUsedAll: Boolean;
+    FDescUsedLo, FDescUsedHi: Integer;
     FPrivArrCount: Integer;           // arrays per block (0 = the program has no private array at all)
     FPrivBlockBase: Integer;          // FArrays index of block 0
     FPrivBlockUsed: array of Boolean; // which blocks are handed out (guarded by FWorkerLock)
@@ -11806,6 +11816,7 @@ begin
   FPrivBlockHigh := 0;
   FPrivBlockBase := FStaticArrCount;
   SetLength(FArrPrivSlot, FStaticArrCount);
+  SetLength(FPrivLogical, 0);
   for i := 0 to FStaticArrCount - 1 do FArrPrivSlot[i] := -1;
   if FProgram = nil then Exit;
   n := FProgram.GetArrayCount;
@@ -11814,6 +11825,8 @@ begin
     if FProgram.GetArray(i).IsPrivate then
     begin
       FArrPrivSlot[i] := FPrivArrCount;
+      SetLength(FPrivLogical, FPrivArrCount + 1);
+      FPrivLogical[FPrivArrCount] := i;
       Inc(FPrivArrCount);
     end;
   if FPrivArrCount = 0 then
@@ -12014,6 +12027,10 @@ begin
     if Hi > n - 1 then Hi := n - 1;
   end;
   FDescAllPending := False; FDescLo := MaxInt; FDescHi := -1;
+  // Published for the per-context copy, which narrows on the same range and cannot read the fields
+  // above because this procedure has just cleared them.
+  FDescUsedAll := (Lo = 0) and (Hi = n - 1);
+  FDescUsedLo := Lo; FDescUsedHi := Hi;
   for a := Lo to Hi do
   begin
     if Length(FArrays[a].IntData) > 0 then
@@ -12032,6 +12049,9 @@ begin
 end;
 
 function TBytecodeVM.AcquireArrDescCtxLocked(ECtx: TExecutionContext): Pointer;
+var
+  NarrowCtx: Boolean;
+  k, kLo, kHi: Integer;
 // The body of AcquireArrDescCtx, WITHOUT the lock. Two callers and one copy: the locked path
 // wraps it, the single-threaded fast lane calls it bare. Extracting it is what keeps the two
 // from drifting - the defect this file records four times over is the same steps written out
@@ -12080,8 +12100,40 @@ begin
         Src := FPrivBlockBase + (FPrivBlockHigh + 1) * FPrivArrCount;
         if Src < n then n := Src;
       end;
-      for i := 0 to n - 1 do
+      // ⭐⭐ NARROW THE SAME WAY THE MASTER DOES, and the condition is deliberately tight.
+      // A shared entry is a copy of master[i], so its logical id IS its physical slot and it is
+      // stale exactly when i falls in the range the master just rebuilt. A private entry is built
+      // from the storage at ECtx.ArrMap[i] instead, and there are only FPrivArrCount of them -
+      // FPrivLogical lists them, so finding them costs their own number and not the table's.
+      // ⛔ ONE GENERATION BEHIND, AND NO WORKERS. The range is VM-wide and is consumed by the first
+      // reader: a context two generations behind would be handed the range of the LAST change only
+      // and would silently keep a stale entry for the one before. With no workers there is one
+      // context and it refreshes on every change, so "exactly one behind" is the whole of it -
+      // and anything else falls back to the full rebuild that has always run here.
+      NarrowCtx := (not FHasWorkers) and (not FDescUsedAll) and (FDescUsedLo <= FDescUsedHi)
+                   and (ECtx.ArrDescGen = FArrDescGen - 1);
+      // ⛔⛔ AND THE LOOP ITSELF IS BOUNDED, not just its body. Written as "walk them all and skip
+      // the ones outside the range" this was still O(table) - four cheap tests times sixty-two
+      // slots times four million entries into the C hot loop is a quarter of a second, and the
+      // measurement said so: 1224 ms became 776, still 418 above the ceiling. Bounding the range
+      // itself is what makes it proportional.
+      kLo := 0; kHi := n - 1;
+      if NarrowCtx then
       begin
+        kLo := FDescUsedLo; kHi := FDescUsedHi;
+        if kLo < 0 then kLo := 0;
+        if kHi > n - 1 then kHi := n - 1;
+      end;
+      for i := kLo to kHi do
+      begin
+        if NarrowCtx then
+        begin
+          // a shared entry is stale only inside the range; a private one is looked at below.
+          // ⛔ System.Continue: inside a VM method a bare Continue binds to TBytecodeVM.Continue -
+          // the BASIC CONT command - and the program dies with "?CAN'T CONTINUE ERROR" instead of
+          // looping. This file already carries that warning at BuildJitLoops, and it caught me here.
+          if (i < Length(FArrPrivSlot)) and (FArrPrivSlot[i] >= 0) then System.Continue;
+        end;
         Dst := i * 4;
         if Dst + 3 >= Length(ECtx.ArrDescOwn) then Break;
         if (i < Length(FArrPrivSlot)) and (FArrPrivSlot[i] >= 0) then
@@ -12114,6 +12166,29 @@ begin
           ECtx.ArrDescOwn[Dst + 3] := FJitArrDesc[i * 4 + 3];
         end;
       end;
+      // The private entries, when the loop above skipped them: only those whose PHYSICAL slot the
+      // master rebuild touched, which is what makes this proportional rather than FPrivArrCount.
+      if NarrowCtx then
+        for k := 0 to Length(FPrivLogical) - 1 do
+        begin
+          i := FPrivLogical[k];
+          if (i < 0) or (i >= n) or (i >= Length(ECtx.ArrMap)) then System.Continue;
+          Src := ECtx.ArrMap[i];
+          if (Src < FDescUsedLo) or (Src > FDescUsedHi) then System.Continue;
+          if (Src < 0) or (Src > High(FArrays)) then System.Continue;
+          Dst := i * 4;
+          if Dst + 3 >= Length(ECtx.ArrDescOwn) then System.Continue;
+          if Length(FArrays[Src].IntData) > 0 then
+            ECtx.ArrDescOwn[Dst + 0] := Int64(PtrUInt(@FArrays[Src].IntData[0]))
+          else ECtx.ArrDescOwn[Dst + 0] := 0;
+          if Length(FArrays[Src].FloatData) > 0 then
+            ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
+          else ECtx.ArrDescOwn[Dst + 1] := 0;
+          ECtx.ArrDescOwn[Dst + 2] := FArrays[Src].TotalSize;
+          if Length(FArrays[Src].LowerBounds) > 0 then
+            ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
+          else ECtx.ArrDescOwn[Dst + 3] := 0;
+        end;
       ECtx.ArrDescGen := FArrDescGen;
       if GArrPrivDiag then
         for i := 0 to Length(FArrPrivSlot) - 1 do
