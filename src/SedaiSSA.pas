@@ -1092,7 +1092,8 @@ type
     procedure ProcessSpecialVarAssign(VarNode, ExprNode: TASTNode);
     function EmitAllocRecordBlockValue(const RecType, AllocFuncU: string;
                                       ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
-    procedure PublishAllocToHome(const VarName: string; const Val: TSSAValue);
+    procedure EnsureSharedBackingSized(const VarName: string);
+    procedure PublishScalarToHome(const VarName: string; const Val: TSSAValue);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     function AnyFixedLen: Boolean; inline;
@@ -10152,9 +10153,34 @@ begin
   Result := True;
 end;
 
-procedure TSSAGenerator.PublishAllocToHome(const VarName: string; const Val: TSSAValue);
-// Put an allocation's result where READERS of this variable will look for it. There are three homes
-// and a variable has exactly one; the register is written by the caller, this covers the other two.
+procedure TSSAGenerator.EnsureSharedBackingSized(const VarName: string);
+// A SHARED scalar's 1-element backing array is normally sized by its own DIM statement. A branch that
+// handles the declaration ITSELF and leaves early - the BYREF bind does exactly that - never reaches
+// that line, so the array stays unsized and every read and write of it is a wild access.
+//
+// ⛔ Skipped when the program has module constructors: there EmitSharedScalarAllocs pre-sized every
+// backing in the entry block, and re-sizing would zero what a constructor just wrote. Same condition,
+// same reason, as the DIM path itself.
+var ai: Integer; ArrayRef: TSSAValue;
+begin
+  if FSharedScalarArr = nil then Exit;
+  ai := FSharedScalarArr.IndexOf(UpperCase(VarName));
+  if ai < 0 then Exit;
+  if (FModuleCtors <> nil) and (FModuleCtors.Count > 0) then Exit;
+  ai := PtrInt(FSharedScalarArr.Objects[ai]);
+  ArrayRef := MakeSSAArrayRef(ai, FProgram.GetArray(ai).ElementType);
+  EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
+                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
+procedure TSSAGenerator.PublishScalarToHome(const VarName: string; const Val: TSSAValue);
+// Put a value where READERS of this variable will look for it. There are three homes and a variable
+// has exactly one; the register is written by the caller, this covers the other two.
+//
+// ⭐ THREE CALLERS AND ONE RULE. It began as the allocation's publisher and grew a third caller the
+// same day - the BYREF reference bind - because that was the SAME defect a third time: a value
+// written to the variable's REGISTER while its readers go to its HOME. DIVERGENZE 80, 92 and 49 are
+// one root, and this is where it is answered once.
 //
 // ⛔⛔ A RAWMODULE SCALAR IS NOT A SHARED SCALAR, even though IsSharedScalar says yes to both. Its
 // backing array holds the ADDRESS OF ITS RAW SLOT, not its value - so publishing the value there
@@ -10237,7 +10263,7 @@ begin
                                       or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                       or ((Int64(UDTIdx) and $FFFF) shl 48)));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-      PublishAllocToHome(VarName, ExprValue);
+      PublishScalarToHome(VarName, ExprValue);
       // Give the elements that are NEW their member-array / nested-UDT backing and field defaults, as
       // the first allocation did; the kept ones are before OldNReg and are not touched.
       EmitRecordBlockInitFrom(GetOrAllocateVariable(VarName), OldNReg, CountReg, UDTIdx, False);
@@ -10249,12 +10275,12 @@ begin
     EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
     // deref from another procedure (or module level) sees the allocated record, not a stale 0.
-    PublishAllocToHome(VarName, ExprValue);
+    PublishScalarToHome(VarName, ExprValue);
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
   EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  PublishAllocToHome(VarName, ExprValue);
+  PublishScalarToHome(VarName, ExprValue);
 end;
 
 // ============================================================================================
@@ -11674,6 +11700,9 @@ begin
           begin
             EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
                             EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EnsureSharedBackingSized(UpperCase(ArrName));
+            EnsureSharedBackingSized(UpperCase(ArrName));
+        PublishScalarToHome(UpperCase(ArrName), RecHandleVal);
             Continue;
           end;
         finally
@@ -11693,12 +11722,16 @@ begin
         ProcessExpression(RefTgt.GetChild(0).GetChild(0), RecHandleVal);
         EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
                         EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EnsureSharedBackingSized(UpperCase(ArrName));
+        PublishScalarToHome(UpperCase(ArrName), RecHandleVal);
         Continue;
       end
       else if ResolveRecordObject(RefTgt, RecHandleVal, RefTgtType) then
       begin
         EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperCase(ArrName)),
                         EnsureIntRegister(RecHandleVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        EnsureSharedBackingSized(UpperCase(ArrName));
+        PublishScalarToHome(UpperCase(ArrName), RecHandleVal);
         Continue;
       end;
     end;
