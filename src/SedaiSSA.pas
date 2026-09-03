@@ -10220,6 +10220,30 @@ begin
     // A SHARED UDT pointer keeps its handle in element 0 of its backing array; publish it there so a
     // deref from another procedure (or module level) sees the allocated record, not a stale 0.
     if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, ExprValue);
+    // ⛔⛔ ...AND AN @-TAKEN ONE KEEPS IT IN ITS RAW SLOT, which this line was missing. DIVERGENZE 80.
+    // The conversion above turns "Allocate(SizeOf(T))" for a "T Ptr" into a MANAGED record block and
+    // hands back its HANDLE; the copy on the line above puts that handle in the variable's REGISTER.
+    // But an @-taken variable is not read from its register - it is read from its slot, and the slot
+    // still held whatever the initialiser had put there. So the reader loaded a raw byte address,
+    // handed it to the record path, and the program died:
+    //
+    //     Dim As T Ptr p = Allocate(SizeOf(T))
+    //     p->x = 42                            <- EAccessViolation
+    //     Dim As Any Ptr q = @p                <- ...because of THIS line, three lines later
+    //
+    // ⭐ THE TELL IS THAT THE CRASH MOVED WITH A LINE THAT COMES AFTER IT. Only "Allocate" plus "@p"
+    // does it: "New T" and "@u" are fine either way, and an "Integer Ptr" is fine too - because for
+    // those the value in the slot and the value the reader wants are the SAME KIND. Here they are two
+    // families of address, a raw byte pointer and a record handle, and the conversion published to
+    // one home out of two.
+    if IsRawModuleScalar(VarName) then
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName),
+                      EnsureIntRegister(ExprValue),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
+    else if IsRawAddrLocal(VarName) then
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
+                      EnsureIntRegister(ExprValue),
+                      MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
     Exit;
   end;
   EmitRawAlloc(ExprNode, ExprValue);
