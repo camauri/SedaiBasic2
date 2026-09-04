@@ -368,6 +368,9 @@ var
   FileMode: Word;
   TildePos: Integer;
   BomBuf: array[0..3] of Byte;
+  BomWant: array[0..3] of Byte;   // the byte-order mark an ENCODING clause promises (see the check)
+  BomLen, BomGot, i: Integer;
+  BomOk: Boolean;
 begin
   ErrorCode := 0;
   // DCLEAR / RESET: close every open handle. Signalled with Handle 0, so it must be handled before
@@ -458,6 +461,44 @@ begin
       FFileHandles[Handle] := TFileStream.Create(Filename, FileMode);
       InvalidateSize(Handle);
       FFileModes[Handle] := M;
+      // ⛔ AN ENCODING CLAUSE ON A FILE WE ARE GOING TO READ IS A CLAIM ABOUT ITS BYTES, and fbc
+      // CHECKS it: the file must begin with that encoding's byte-order mark or the open answers
+      // error 3. Measured over a 4x4 matrix (no BOM / UTF-8 / UTF-16LE / UTF-16BE files x utf-8 /
+      // utf-16 / utf-32 / ascii clauses), and the rule is narrower than "a BOM is present":
+      //   * the mark must MATCH, as a PREFIX - a UTF-32 file (FF FE 00 00) opens as "utf-16" because
+      //     FF FE is its prefix, while a UTF-16 file does NOT open as "utf-32";
+      //   * "utf-16" means LITTLE endian: a FF FE file opens, an FE FF one is error 3;
+      //   * an EMPTY file is error 3 - there is no mark to match;
+      //   * "ascii" is not a claim about bytes and never validates (it has no marker at all);
+      //   * and APPEND validates too, because it is going to read the file's shape. Only a mode that
+      //     CREATES the file skips the test - it writes its own mark a few lines below.
+      // Without this we accepted every combination and then DECODED the bytes as asked: a plain
+      // ASCII file opened as "utf-16" printed 敨汬 for "hello" and said nothing.
+      if (Pos('~', M) > 0) and (FileMode <> fmCreate) and (Pos('B', M) = 0) then
+      begin
+        BomLen := 0;
+        case TextEncodingOf(Handle) of
+          16: begin BomWant[0] := $FF; BomWant[1] := $FE; BomLen := 2; end;
+          32: begin BomWant[0] := $FF; BomWant[1] := $FE; BomWant[2] := 0; BomWant[3] := 0; BomLen := 4; end;
+        else  begin BomWant[0] := $EF; BomWant[1] := $BB; BomWant[2] := $BF; BomLen := 3; end;
+        end;
+        BomBuf[0] := 0; BomBuf[1] := 0; BomBuf[2] := 0; BomBuf[3] := 0;
+        BomGot := FFileHandles[Handle].Read(BomBuf[0], BomLen);
+        FFileHandles[Handle].Seek(0, soBeginning);
+        BomOk := BomGot = BomLen;
+        if BomOk then
+          for i := 0 to BomLen - 1 do
+            if BomBuf[i] <> BomWant[i] then begin BomOk := False; Break; end;
+        if not BomOk then
+        begin
+          FreeAndNil(FFileHandles[Handle]);
+          FFileModes[Handle] := '';
+          // 70 is the layer's "some other failure", and the VM maps everything that is not 62 (file
+          // not found) or 64 (bad handle) to FreeBASIC's 3 - which is the code fbc answers here.
+          ErrorCode := 70;
+          Exit;
+        end;
+      end;
       if Pos('A', M) > 0 then FFileHandles[Handle].Seek(0, soEnd);
       // A freshly CREATED wide-encoded text file opens with a byte-order mark, as fbc writes it:
       // FF FE for UTF-16LE, FF FE 00 00 for UTF-32LE. Only on creation - appending to an existing

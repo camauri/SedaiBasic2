@@ -989,6 +989,7 @@ type
     function RecPtrWireWidth(const Pointee: string): Integer;           // record-field pointer's low 4 bits for this pointee (-1 = leave alone)
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
+    function BinaryElemBytesOfNode(Node: TASTNode): Integer;   // ...and of any PUT/GET target shape
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
     function FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;  // n*SizeOf(elem) for a fixed array member
@@ -21777,7 +21778,7 @@ begin
     else
       // Read exactly the variable's declared width (BYTE=1, SHORT=2, LONG=4, else 8); Immediate = byte count.
       EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone),
-                      MakeSSAConstInt(BinaryElemBytes(string(VarChild.Value))));
+                      MakeSSAConstInt(BinaryElemBytesOfNode(VarChild)));
     Exit;
   end;
 
@@ -22160,7 +22161,7 @@ begin
       if (ExprVal.Kind = svkConstFloat) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtFloat)) then
         // SINGLE writes 4 bytes, DOUBLE 8 (Immediate = width), as fbc lays them out.
         EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, EnsureFloatRegister(ExprVal),
-                        MakeSSAConstInt(BinaryElemBytes(VarToStr(Node.GetChild(1).Value))))
+                        MakeSSAConstInt(BinaryElemBytesOfNode(Node.GetChild(1))))
       else if (ExprVal.Kind = svkConstString) or ((ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtString)) then
         // A string writes its RAW bytes, no length prefix (width 0 = its own length) — fbc-verified.
         EmitInstruction(ssaPutBinStr, MakeSSAValue(svkNone), HandleReg, EnsureStringRegister(ExprVal),
@@ -22170,7 +22171,7 @@ begin
         // else 8); a non-variable expression's name is not in the width map, so it defaults to 8.
         // Immediate = byte count.
         EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal),
-                        MakeSSAConstInt(BinaryElemBytes(VarToStr(Node.GetChild(1).Value))));
+                        MakeSSAConstInt(BinaryElemBytesOfNode(Node.GetChild(1))));
     end;
     Exit;
   end;
@@ -25572,6 +25573,49 @@ begin
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   TotalSize := Ofs;
   Result := n > 0;
+end;
+
+function TSSAGenerator.BinaryElemBytesOfNode(Node: TASTNode): Integer;
+// Byte width of the TARGET of a binary PUT/GET, whatever shape it has.
+//
+// ⛔ It used to ask BinaryElemBytes(Node.Value) - the width map, keyed by a NAME - and a node that is
+// not a bare identifier has no name to give: "Put #f, , a(0)" and "Put #f, , r.b" both landed on the
+// 8-byte default. So a UByte wrote EIGHT bytes through an array element and TWO through a variable of
+// the same type, silently, and the file was corrupt in a way that only shows on the next field.
+// ⭐ Found writing the guard for DIVERGENZE 15: the guard builds its own test files byte by byte, and
+// they came out eight times too long. A probe that needs the feature it is probing is how this one
+// surfaced - the encoding work would never have asked.
+// ⛔ ONE funnel, and both the PUT and the GET read it: a width taught to one of them alone writes a
+// file it then cannot read back.
+var
+  UIdx: Integer;
+  Nm: string;
+begin
+  Result := 8;
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antIdentifier:
+      Result := BinaryElemBytes(VarToStr(Node.Value));
+    antArrayAccess:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        Nm := ArrayFactKey(VarToStr(Node.GetChild(0).Value));
+        UIdx := FArrayElemWidth.IndexOf(Nm);
+        if UIdx >= 0 then
+          Result := BinaryElemBytesOfWidthCode(PtrInt(FArrayElemWidth.Objects[UIdx]))
+        else
+          // Not a declared array: the same node shape a pointer index has, and a pointer's element
+          // width is its POINTEE's.
+          Result := BinaryElemBytes(VarToStr(Node.GetChild(0).Value));
+      end;
+    antMemberAccess:
+      if Node.ChildCount >= 1 then
+      begin
+        UIdx := FindUDT(ObjectTypeName(Node.GetChild(0)));
+        if UIdx >= 0 then
+          Result := BinaryElemBytesOfWidthCode(UDTFieldWidthCode(UIdx, VarToStr(Node.Value)));
+      end;
+  end;
 end;
 
 function TSSAGenerator.BinaryElemBytesOfWidthCode(W: Integer): Integer;
