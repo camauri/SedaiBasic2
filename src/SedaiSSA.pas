@@ -789,6 +789,8 @@ type
     procedure CollectAddressTakenVars(Node: TASTNode);
     // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
     procedure CheckTypeNameShadowedByVar(Node: TASTNode);
+    function ParamIsAddressCarrier(ProcNode, ParamNode: TASTNode): Boolean;  // THE one rule: does this param carry the caller's ADDRESS?
+    function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;            // ...does this declaration have such a parameter?
     procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
     procedure MarkByrefRetCallArgs(Node: TASTNode; Names, Dict: TStringList); // mark their call args address-taken
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
@@ -902,9 +904,11 @@ type
     function ByrefRetPointeeType(const Name: string): string;
     function ByrefRetIsRaw(const Name: string): Boolean;
     function BodyReturnsRawIndexedElement(Decl: TASTNode): Boolean;
+    function EmitAddrParamRegister(const Name: string; out Addr: TSSAValue): Boolean;  // its register IS the address
+    function TryEmitArgAddress(ArgExpr: TASTNode; out Addr: TSSAValue): Boolean;   // the address of a BYREF argument, or False
     function ParamDeclaredTypeName(ParamNode: TASTNode): string;   // the type its own "AS type" child names
     function EmitVarAddressIsReal(const Name: string): Boolean;   // ...or would EmitVarAddress answer its 0 constant?
-    function EmitTempCellFor(const Val: TSSAValue; Bank: TSSARegisterType): TSSAValue;  // a homeless value -> a raw cell, and its address
+    function EmitTempCellFor(const Val: TSSAValue; const TypeName: string): TSSAValue;  // a homeless value -> a raw cell, and its address
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
     function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
     function ByrefRetByAddress(const Name: string): Boolean;                    // ...and is the reference actually an ADDRESS?
@@ -30668,11 +30672,12 @@ begin
           // "Function ... ByRef As T" answered exactly what fbc answers, on all four engines.
           // ⚠️ STRINGS are deliberately still out: a managed byref string has its own protocol, and
           // widening the two together would put two model changes behind one measurement.
-          if (ParamNode.Attributes.Values['BYREF'] = '1') and
-             (FindUDT(TypeName) < 0) and
-             (Pos('STRING', TypeName) = 0) and (Pos(' PTR', TypeName) = 0) and
-             (ParamNode.Attributes.Values['ARRAY'] <> '1') and
-             (ParamNode.Attributes.Values['FUNCPTR'] <> '1') then
+          // ⛔⛔ THE TWO KINDS COEXIST - the new rule ADDS, it never narrows the old one. Written as one
+          // widened condition it also EXCLUDED what the byref-return class already had: a BYREF STRING
+          // parameter was a carrier there since m482's day, and "smin(byref a as string, byref b as
+          // string) byref as string" stopped returning a reference (ptr9_byrefret died on a null deref).
+          // A gate that is widened for one class and tightened for another is two changes, not one.
+          if ParamIsAddressCarrier(Node, ParamNode) then
           begin
             ParamNode.Attributes.Values['ADDRCARRIER'] := '1';   // int address, not its declared bank (ParamDeclaredBank)
             RegisterTypedVar(VarName, 'INTEGER');
@@ -32406,6 +32411,12 @@ begin
         // own temporary either way.
         ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
         ProcessDefaultValue(PNode, PNode.GetChild(PNode.ChildCount - 1), DefVal);
+        // ⛔ A DEFAULT IS AN ARGUMENT TOO. An address-carrying parameter needs an ADDRESS, and a
+        // default value ("ByRef i As Integer = 123") has none - so it gets the same temporary cell a
+        // literal argument gets. Without it the callee received 123 AS the reference and dereferenced
+        // it: m808 died on "Null or invalid pointer dereference (address 123)".
+        if ParamIsAddressCarrier(Decl, PNode) then
+          DefVal := EmitTempCellFor(DefVal, ParamDeclaredTypeName(PNode));
         if ParamUdtDef >= 0 then
           DefVal := EmitByvalUdtCopyOf(DefVal, ParamUdtDef);
         if NDefStage > High(DefSlots) then Break;   // defensive: no procedure has 64 defaulted parameters
@@ -32433,7 +32444,20 @@ begin
       // constructor stages its own arguments, so the conversion has to be made here too.
       // ...and the WSTRING half of it, which is a different address (see TryEmitWStringPtrArg). Both
       // conversions have to be in BOTH staging paths, or a constructor converts where a SUB does not.
-      if (RT = srtInt) and TryEmitWStringPtrArg(ParamList.GetChild(i + 1), ArgsNode.GetChild(i), DefVal) then
+      // ⛔⛔ ...AND AN ADDRESS-CARRYING PARAMETER IS THE THIRD RULE THAT HAS TO BE IN BOTH PATHS. The
+      // comment above says it about the two string conversions; this one arrived with DIVERGENZE 43
+      // and cost the same lesson a third time in one afternoon: a CONSTRUCTOR stages its own
+      // arguments, so "U(456)" against "Constructor U( ByRef i As Integer )" handed 456 over AS the
+      // reference and the body dereferenced it. Same three answers as StageCallArgs, same order.
+      if ParamIsAddressCarrier(Decl, ParamList.GetChild(i + 1)) and (RT = srtInt) then
+      begin
+        if UpperCase(ArgsNode.GetChild(i).Attributes.Values['ARGPASSMODE']) <> 'BYVAL' then
+          if not TryEmitArgAddress(ArgsNode.GetChild(i), DefVal) then
+            DefVal := EmitTempCellFor(ArgVals[i], ParamDeclaredTypeName(ParamList.GetChild(i + 1)));
+        if UpperCase(ArgsNode.GetChild(i).Attributes.Values['ARGPASSMODE']) <> 'BYVAL' then
+          ArgVals[i] := DefVal;
+      end
+      else if (RT = srtInt) and TryEmitWStringPtrArg(ParamList.GetChild(i + 1), ArgsNode.GetChild(i), DefVal) then
         ArgVals[i] := DefVal
       else if (RT = srtInt) and (ArgVals[i].RegType = srtString) and
          IsStringArgForBytePtrParam(ParamList.GetChild(i + 1), ArgsNode.GetChild(i)) then
@@ -32923,7 +32947,11 @@ begin
     // An ADDRESS-carrying parameter was passed by address (StageCallArgs), not copy-in/out: the slot
     // holds an address, and writing it back would store that address INTO the argument variable.
     // ⛔ Per PARAMETER, not per procedure: since DIVERGENZE 43 one procedure can have both kinds.
-    if (ParamI.Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) then Continue;
+    // ⛔ Asked as the RULE, not as the stamp: a declaration has TWO spellings (the "Declare" inside a
+    // TYPE and the definition outside it) and the stamp is written on ONE of them. The caller then
+    // staged a VALUE while the callee's prologue derefed it as an address - m508's operators read
+    // 0 6 0 for 2 48 -1. Three sites, one function, and they agree by construction.
+    if ParamIsAddressCarrier(Decl, ParamI) and (RT = srtInt) then Continue;
     if ByrefRetByAddress(ParamOwnerName) and (RT = srtInt) then Continue;
     // A UDT passed to a BYREF STRING parameter was converted through "Operator T.Cast() As String", so
     // the callee holds a temporary, not the object. Copying the slot back would overwrite the caller's
@@ -35197,7 +35225,46 @@ begin
     MarkFixedWStringVars(Node.GetChild(i), Dict);
 end;
 
-function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;
+function TSSAGenerator.ParamIsAddressCarrier(ProcNode, ParamNode: TASTNode): Boolean;
+// ⭐⭐ THE ONE RULE: does this parameter carry the caller's ADDRESS rather than a copy of the value?
+// Written once because it is asked in THREE places that must agree - the stamp that marks it, the
+// pre-scan that gives its call arguments a home, and the caller that stages one. They disagreed for
+// one build and the cost was m360: the pre-scan backed a "ByRef dec As String" argument that is NOT a
+// carrier, and merely MOVING a variable out of its register into a cell changed the program's answer
+// (34 became 54) with nothing else touched. ⛔ A rule copied into a second place is a rule that will
+// be widened in one of them.
+//
+// Two kinds coexist, and the second is the one DIVERGENZE 43 adds:
+//   - any explicit-BYREF non-UDT parameter of a BYREF-RETURN function (unchanged since m482 - STRINGS
+//     included, which is what "smin(byref a as string...) byref as string" needs);
+//   - any explicit-BYREF NUMERIC scalar of any procedure at all.
+var
+  TypeName: string;
+begin
+  Result := False;
+  if (ProcNode = nil) or (ParamNode = nil) then Exit;
+  if ParamNode.Attributes.Values['BYREF'] <> '1' then Exit;
+  TypeName := '';
+  if (ParamNode.ChildCount >= 1) and (ParamNode.GetChild(0).NodeType = antIdentifier) and
+     not ((ParamNode.Attributes.Values['HASDEFAULT'] = '1') and (ParamNode.ChildCount = 1)) then
+    TypeName := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
+  if FindUDT(TypeName) >= 0 then Exit;
+  if ProcNode.Attributes.Values['BYREFRET'] = '1' then Exit(True);
+  // ⛔⛔ ...AND NOT A NARROW INTEGER. Measured, not assumed: over the six scalar types, Integer /
+  // Double / Single answer fbc exactly, and UByte / Short / Long die on a null dereference - because
+  // a narrow-typed scalar is not given the address backing that EmitVarAddress needs, so its address
+  // comes out as the 0 constant. That is the SLOT-WIDTH-versus-ELEMENT-WIDTH question this file
+  // already records (m807), and it is a different change from this one: dragging it in here would put
+  // two model questions behind one measurement. A narrow BYREF parameter keeps the copy-in/copy-out it
+  // has always had - which is today's behaviour, so nothing regresses; it simply is not cured yet.
+  if (TypeName = 'BYTE') or (TypeName = 'UBYTE') or (TypeName = 'SHORT') or (TypeName = 'USHORT') or
+     (TypeName = 'LONG') or (TypeName = 'ULONG') then Exit;
+  Result := (Pos('STRING', TypeName) = 0) and (Pos(' PTR', TypeName) = 0) and
+            (ParamNode.Attributes.Values['ARRAY'] <> '1') and
+            (ParamNode.Attributes.Values['FUNCPTR'] <> '1');
+end;
+
+function TSSAGenerator.ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;
 // True if Node is a FUNCTION declared BYREF-return ("FUNCTION f() BYREF AS T") with at least one
 // explicit-BYREF parameter — the shape that can return a reference to one of its parameters.
 var
@@ -35214,7 +35281,7 @@ begin
   if (Node.ChildCount < 2) or (Node.GetChild(1).NodeType <> antParameterList) then Exit;
   PList := Node.GetChild(1);
   for i := 0 to PList.ChildCount - 1 do
-    if PList.GetChild(i).Attributes.Values['BYREF'] = '1' then Exit(True);
+    if ParamIsAddressCarrier(Node, PList.GetChild(i)) then Exit(True);
 end;
 
 procedure TSSAGenerator.GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);
@@ -38779,6 +38846,68 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.EmitAddrParamRegister(const Name: string; out Addr: TSSAValue): Boolean;
+// An address-carrying parameter's register IS the address - the same value "@p" answers.
+begin
+  Addr := EnsureIntRegister(GetOrAllocateVariable(UpperCase(Name)));
+  Result := True;
+end;
+
+function TSSAGenerator.TryEmitArgAddress(ArgExpr: TASTNode; out Addr: TSSAValue): Boolean;
+// The address of an argument handed to an ADDRESS-CARRYING BYREF parameter, or False when the
+// argument has no address (a literal, arithmetic, a call result) and the caller must cell it.
+//
+// ⛔⛔ ONE FUNNEL, AND THAT IS THE WHOLE POINT. Written as a row of "else if" branches in StageCallArgs
+// this asked about a bare name and a pointer index and stopped, so an ARRAY ELEMENT - "t(a(i))", the
+// commonest byref argument in this language after a plain variable - fell through to the temporary and
+// its callee's writes vanished into the cell. With no copy-out left to hide it, m228 printed
+// "100 200 300 400" for "101 200 300 410": plausible numbers, no error. Every shape that HAS an
+// address must be answered here, and the answers are the same ones "@arg" already gives - which is
+// why each line below delegates to the routine the address-of chain uses for that shape.
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if ArgExpr = nil then Exit;
+  // "(x)" is x for this question: the parenthesised lvalue is still the same place.
+  while (ArgExpr.NodeType = antParentheses) and (ArgExpr.ChildCount >= 1) do ArgExpr := ArgExpr.GetChild(0);
+  if ArgExpr.NodeType = antIdentifier then
+  begin
+    // An argument that is ITSELF an address-carrying parameter already holds an address: hand the
+    // register over. Celling it would give the inner callee a pointer to a pointer.
+    if IsAddrParam(VarToStr(ArgExpr.Value)) then
+      Exit(EmitAddrParamRegister(VarToStr(ArgExpr.Value), Addr));
+    if EmitVarAddressIsReal(VarToStr(ArgExpr.Value)) then
+    begin
+      Addr := EmitVarAddress(VarToStr(ArgExpr.Value));
+      Exit(True);
+    end;
+    Exit;   // a register-resident local the pre-scan did not back: cell it rather than stage a 0
+  end;
+  // A real ARRAY element. ⚠️ antArrayAccess is also how a CALL is spelled, so the name has to name a
+  // declared array - otherwise "t(f(i))" would be read as an element of an array f that does not exist.
+  if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 1) and
+     (ArgExpr.GetChild(0).NodeType = antIdentifier) and
+     (ArrayIndexOf(UpperCase(VarToStr(ArgExpr.GetChild(0).Value))) >= 0) then
+  begin
+    EmitArrayElementAddress(ArgExpr, Addr);
+    Exit(True);
+  end;
+  // "p[i]" through a pointer, and "*p" - the two the byref-RETURN path already had to answer.
+  if TryEmitIndexedElementAddress(ArgExpr, Addr) then Exit(True);
+  if TryEmitDerefTargetAddress(ArgExpr, Addr) then Exit(True);
+  // ...and a FIELD, whose address is a record-field pointer - the same thing "@obj.f" emits.
+  // ⛔ TryRawUDTFieldAddress alone was NOT enough and the guard caught it: it answers only for a RAW
+  // UDT field, so an ordinary record field fell through to the temporary and "setIt(rec.f)" left rec.f
+  // at 1 where fbc leaves 77 - a REGRESSION, because the copy-out protocol this replaces handled a
+  // field correctly. EmitFieldAddress is the routine the address-of chain itself uses.
+  if ArgExpr.NodeType = antMemberAccess then
+  begin
+    if TryRawUDTFieldAddress(ArgExpr, Addr) then Exit(True);
+    EmitFieldAddress(ArgExpr, Addr);
+    Exit(Addr.Kind <> svkNone);
+  end;
+end;
+
 function TSSAGenerator.ParamDeclaredTypeName(ParamNode: TASTNode): string;
 // The type a parameter names in its own "AS type" child, upper-cased, or '' when it names none.
 begin
@@ -38800,24 +38929,30 @@ begin
             (FSharedScalarArr.IndexOf(UpperCase(Name)) >= 0);
 end;
 
-function TSSAGenerator.EmitTempCellFor(const Val: TSSAValue; Bank: TSSARegisterType): TSSAValue;
+function TSSAGenerator.EmitTempCellFor(const Val: TSSAValue; const TypeName: string): TSSAValue;
 // Put a value with no home into a fresh raw cell and answer the cell's ADDRESS - the TEMPORARY fbc
 // binds when a BYREF parameter is handed a literal, an expression or a call result. Eight bytes hold
-// any builtin scalar, and the block is never freed here on purpose: it dies with the statement's
-// frame, and a BYREF-to-a-temporary must stay readable for the whole call.
-// ⚠️ The bank decides the STORE, not the cell: a Double written with RawStoreInt would arrive as its
-// integer bits, which is the silent wrong answer this whole entry is about.
+// any builtin scalar; the block is deliberately not freed here - it dies with the frame, and a
+// BYREF-to-a-temporary has to stay readable for the whole call.
+//
+// ⛔⛔ THE LAST OPERAND IS A TYPE CODE, NOT A BYTE COUNT. Written as a literal 8 (the size of the
+// block, which is what the line above it means) the store went in under a type nobody reads back that
+// way: "x Mod= 7" handed the operator a cell that answered 1 instead of 7 - a plausible number, no
+// error, and only on the LITERAL argument, because a variable never comes through here. Every other
+// site in this file passes RawTypeCodeOfPointee(<declared type>), and so does this one.
 var
   Bytes: TSSAValue;
+  Code: Integer;
 begin
+  Code := RawTypeCodeOfPointee(TypeName);
   Bytes := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, Bytes, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRawAlloc, Result, Bytes, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  if Bank = srtFloat then
-    EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Result, Val, MakeSSAConstInt(8))
+  if TypeNameToBank(TypeName, '') = srtFloat then
+    EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Result, EnsureFloatRegister(Val), MakeSSAConstInt(Code))
   else
-    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Result, Val, MakeSSAConstInt(8));
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Result, EnsureIntRegister(Val), MakeSSAConstInt(Code));
 end;
 
 function TSSAGenerator.IsByrefRetFunc(const Name: string): Boolean;
@@ -42261,58 +42396,37 @@ begin
     // read only for arguments that had no address anyway, i.e. never for the case it exists for.
     // ⚠️ And no write-back: there is no variable behind a value. ARGPASSMODE has been carried since
     // 25 Aug with a comment saying it was not honoured yet (DIVERGENZE 28); this is where it lands.
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
-       (UpperCase(ArgExpr.Attributes.Values['ARGPASSMODE']) = 'BYVAL') then
-      ProcessExpression(ArgExpr, ArgVal)
-    // ⭐ "ByRef ... As ANY" takes whatever it is handed, unconverted - so an argument with no address
-    // hands over its VALUE rather than a temporary's address (DIVERGENZE 9). "As any" is legal on a
-    // DECLARE and nowhere else, which is why the definition's own type still drives the deref.
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
-       (ParamDeclaredTypeName(ParamList.GetChild(i)) = 'ANY') and
-       not ((ArgExpr.NodeType = antIdentifier) and EmitVarAddressIsReal(VarToStr(ArgExpr.Value))) then
-      ProcessExpression(ArgExpr, ArgVal)
-    // ⭐ An argument that is ITSELF an address-carrying parameter already holds an address: hand that
-    // register over. Without it the forwarding case ("outer p" -> "inner p") fell to the temporary
-    // branch and CELLED the address, so the inner callee dereferenced a pointer to a pointer and the
-    // alias silently became a different object one level down.
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
-       (ArgExpr.NodeType = antIdentifier) and IsAddrParam(VarToStr(ArgExpr.Value)) then
-      ArgVal := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(ArgExpr.Value))))
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
-       (ArgExpr.NodeType = antIdentifier) and (EmitVarAddressIsReal(VarToStr(ArgExpr.Value))) then
-      ArgVal := EmitVarAddress(VarToStr(ArgExpr.Value))
-    // ⛔⛔ ...AND AN ARGUMENT THAT HAS NO ADDRESS STILL NEEDS ONE. "t(1234)", "t(a+b)", "t(f())" against
-    // a BYREF parameter are everyday code, and EmitVarAddress answers a 0 CONSTANT for anything it does
-    // not back - so without this the callee would dereference NULL. fbc binds a TEMPORARY here; so do
-    // we, with the cell the raw allocator already provides. Nothing is copied back: the temporary dies
-    // with the statement, which is exactly what BYREF-to-a-temporary means.
-    // ⭐ And this is also the spelling fbc pins down in functions/zwstring-params: "f(byval 123)" hands
-    // the VALUE over as the reference, so an explicit ByVal argument stages the value ITSELF, uncelled.
-    // ⛔⛔ AN LVALUE IS NOT ALWAYS A BARE NAME, and this is where a temporary becomes a WRONG ANSWER
-    // instead of a missing feature. "t(a(i))", "t(*p)", "t(obj.f)" are lvalues with real addresses; put
-    // in a temporary cell their callee's writes land in the cell and vanish, and since an address
-    // parameter has no copy-out there is nothing to notice - m228 printed 100 200 300 400 for
-    // 101 200 300 410, plausible numbers and no error. The byref-RETURN path already had to answer
-    // exactly this question ("Operator = This.buf[i]"), so the two helpers exist and are reused here.
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
-       TryEmitIndexedElementAddress(ArgExpr, ArgVal) then
-      // handled: ArgVal is the element's address
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
-       TryEmitDerefTargetAddress(ArgExpr, ArgVal) then
-      // handled: ArgVal is the pointee's address
-    else if (ParamList.GetChild(i).Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) then
-    begin
-      ProcessExpression(ArgExpr, ArgVal);
-      if UpperCase(ArgExpr.Attributes.Values['ARGPASSMODE']) <> 'BYVAL' then
-        ArgVal := EmitTempCellFor(ArgVal, ParamDeclaredBank(ParamList.GetChild(i)));
-    end
-    // ...and when the argument is ITSELF a call to a byref-returning function, its result already IS an
-    // address: stage that, undereferenced. Otherwise the ordinary rvalue path loads the pointee and the
-    // callee receives a VALUE where it expects a reference - "power2( power2( I ) )" then used 4 as an
-    // address. Cascading byref returns is the shape the feature exists for.
-    else if (RT = srtInt) and (ParamList.GetChild(i).Attributes.Values['BYREF'] = '1') and
-            (ByrefRetCallName(ArgExpr) <> '') then
+    // ⛔⛔ AN ARGUMENT THAT IS ITSELF A BYREF-RETURN CALL ALREADY *IS* AN ADDRESS. The branch that
+    // knows this lives further down and used to be reached; the ADDRCARRIER block now sits above it,
+    // so the check has to come with it or "power2( power2( b ) )" stages the returned address as a
+    // VALUE, cells it, and every level after the first squares 2 instead of the caller's variable -
+    // m482 answered 4 and 4 where fbc answers 16 and 256.
+    else if ParamIsAddressCarrier(Decl, ParamList.GetChild(i)) and (RT = srtInt) and
+       (ByrefRetCallName(ArgExpr) <> '') then
       ArgVal := EmitByrefRetAddress(ArgExpr)
+    // ⭐ THE ADDRESS-CARRYING PARAMETER, in one place. Three answers, asked in this order:
+    //   1. an explicit "ByVal" at the call site BEATS the address - "f(byval x)" does not mean "pass
+    //      x's address", it means the VALUE itself IS the reference. fbc's own
+    //      functions/zwstring-params pins it down: "f(byval 123)" answers @z = 123, "f(byval 0)"
+    //      answers 0. ⚠️ Asked after the lvalue branch it would be read only where it cannot matter,
+    //      and ARGPASSMODE has been carried since 25 Aug with a comment saying it was not yet
+    //      honoured (DIVERGENZE 28) - this is where it lands.
+    //   2. "ByRef ... As ANY" takes what it is handed, unconverted: an argument with no address hands
+    //      over its VALUE rather than a temporary's (DIVERGENZE 9).
+    //   3. otherwise the argument's ADDRESS if it has one, and a TEMPORARY if it does not - which is
+    //      what fbc binds for "t(1234)", "t(a+b)", "t(f())". Nothing is copied back from a temporary:
+    //      it dies with the statement, and that is exactly what BYREF-to-a-temporary means.
+    else if ParamIsAddressCarrier(Decl, ParamList.GetChild(i)) and (RT = srtInt) then
+    begin
+      if UpperCase(ArgExpr.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then
+        ProcessExpression(ArgExpr, ArgVal)
+      else if not TryEmitArgAddress(ArgExpr, ArgVal) then
+      begin
+        ProcessExpression(ArgExpr, ArgVal);
+        if ParamDeclaredTypeName(ParamList.GetChild(i)) <> 'ANY' then
+          ArgVal := EmitTempCellFor(ArgVal, ParamDeclaredTypeName(ParamList.GetChild(i)));
+      end;
+    end
     // A STRING argument for a "ZSTRING PTR" / "BYTE PTR" / "ANY PTR" parameter: FreeBASIC passes the
     // string's ADDRESS, which is what SADD/STRPTR yield here. Without it the string register's INDEX was
     // staged into the int slot and the callee dereferenced address 1. A FOR over a UDT iterator built
@@ -42412,6 +42526,9 @@ begin
       // always a real copy.
       ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
       ProcessDefaultValue(ParamI, ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      // ...and the SUB/FUNCTION twin of the same rule (see the method site): a default has no address.
+      if ParamIsAddressCarrier(Decl, ParamI) then
+        ArgVal := EmitTempCellFor(ArgVal, ParamDeclaredTypeName(ParamI));
       if ParamUdtDef >= 0 then
         ArgVal := EmitByvalUdtCopyOf(ArgVal, ParamUdtDef);
       Slot := ParamBankAndSlot(ParamList, i, RT);
@@ -43364,7 +43481,11 @@ begin
         // ⭐ The STAMP decides, not the procedure kind. ADDRCARRIER is written once, where the
         // declaration is collected, so every CALLER reads the same answer off the parameter node -
         // which is the whole reason the decision cannot live at the call site.
-        else if (ParamNodeJ.Attributes.Values['ADDRCARRIER'] = '1') and (RT = srtInt) and
+        // ⛔ The RULE, not the stamp - same reason as the two call sites: a declaration has two
+        // spellings and the stamp is written on one. Asked here as a rule, the callee's prologue and
+        // the caller's staging cannot disagree about the protocol, which is the one disagreement that
+        // turns into a dereferenced integer rather than an error.
+        else if ParamIsAddressCarrier(Proc, ParamNodeJ) and (RT = srtInt) and
                 (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) then
           FCurrentProcAddrParams.Add(UpperCase(VarToStr(ParamNodeJ.Value)) + '=' +
                                      UpperCase(VarToStr(ParamNodeJ.GetChild(0).Value)))
