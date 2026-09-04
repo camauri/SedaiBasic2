@@ -965,6 +965,24 @@ begin
   Result := j;
 end;
 
+function DirectiveRebindsNames(const Seg: string): Boolean;
+// Does this directive segment change what a NAME means from here on? Only three do: "#define",
+// "#undef" and "#macro". They are the reason substitution has to STOP for the rest of an expansion -
+// see the note at the head of SubstituteMacros. Everything else ("#print", "#if", "#error", ...)
+// consumes its own text and leaves the surrounding names alone, so it does not suspend anything.
+var
+  W: string;
+  i: Integer;
+begin
+  W := TrimLeft(Seg);
+  if (W = '') or (W[1] <> '#') then Exit(False);
+  W := TrimLeft(Copy(W, 2, MaxInt));
+  i := 1;
+  while (i <= Length(W)) and not (W[i] in [' ', #9]) do Inc(i);
+  W := UpperCase(Copy(W, 1, i - 1));
+  Result := (W = 'DEFINE') or (W = 'UNDEF') or (W = 'MACRO');
+end;
+
 function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string;
 var
   i, j, k, idx, ParenDepth: Integer;
@@ -972,6 +990,8 @@ var
   InStr: Boolean;
   InArgStr: Boolean;   // inside a "..." while scanning a macro invocation's arguments
   InCmt: Boolean;   // inside a ' comment: copy verbatim to the end of the line
+  Suspended: Boolean;   // a #define/#undef/#macro segment went by: copy the REST verbatim
+  SegAt: Integer;       // where the directive segment just copied begins, to read it back
 begin
   Result := '';
   i := 1;
@@ -983,8 +1003,34 @@ begin
   // in the SAME body was resolved, so the index read as undefined and the extraction came out empty -
   // while the identical line with a literal index worked, which is what made it look like an
   // ARG_EXTRACT bug rather than an ordering one.
+  //
+  // ⛔⛔ AND THAT CURE WAS ONE HALF OF THE RULE (the other half added 4 Sep 2026, DIVERGENZE 66).
+  // Copying the directive verbatim protects the DIRECTIVE. It does nothing for the CODE that FOLLOWS
+  // it in the same expansion - and a "#define" exists precisely to change what that code means. So a
+  // body of
+  //       #undef Q : #define Q v : print Q
+  // had "print Q" resolved against the binding of the PREVIOUS invocation, because the "#define Q v"
+  // three characters to its left had not run yet. First invocation right, every one after it stale
+  // (fbc answers 1 then 2; we answered 1 then 1). The name only has to be already defined for the
+  // eager substitution to have something wrong to say - which is why a brand-new name looked fine.
+  //
+  // ⇒ Once a segment that REBINDS A NAME goes by, substitution stops for the rest of this expansion
+  // and the text is copied verbatim. ReprocessExpansion feeds it back through Expand, which walks the
+  // body line by line and substitutes each one AT THE MOMENT IT IS REACHED - after the directives
+  // above it have run. That is fbc's order, and the machinery for it was already here.
+  // ⚠️ The flag is LOCAL to this call and deliberately does not propagate to the caller: the only
+  // measurement for "code after the invocation on the SAME line" is that fbc swallows it entirely
+  // (measured 4 Sep), so there is no behaviour there to reproduce and widening the rule would be a
+  // guess. Inside the body - where every measured case lives - it does propagate, because the body is
+  // one string and this is one call.
+  Suspended := False;
+  SegAt := Length(Result) + 1;
   k := SkipDirectiveSegment(Line, i, Result);
-  if k > i then i := k;
+  if k > i then
+  begin
+    Suspended := DirectiveRebindsNames(Copy(Result, SegAt, MaxInt));
+    i := k;
+  end;
   while i <= Length(Line) do
   begin
     // A ' COMMENT IS TEXT, and it ends at the line end - cVirtualEOL included, because a #macro body
@@ -996,10 +1042,17 @@ begin
     begin
       InCmt := False; InStr := False;
       Result := Result + Line[i]; Inc(i);
+      SegAt := Length(Result) + 1;
       k := SkipDirectiveSegment(Line, i, Result);   // the NEXT segment may be a directive too
-      if k > i then i := k;
+      if k > i then
+      begin
+        if DirectiveRebindsNames(Copy(Result, SegAt, MaxInt)) then Suspended := True;
+        i := k;
+      end;
       Continue;
     end;
+    // A rebinding directive went by: this text belongs to the rescan, not to this pass.
+    if Suspended then begin Result := Result + Line[i]; Inc(i); Continue; end;
     if InCmt then begin Result := Result + Line[i]; Inc(i); Continue; end;
     if InStr then
     begin
