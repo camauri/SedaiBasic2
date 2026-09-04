@@ -2780,6 +2780,16 @@ procedure RegisterEmulatedHeader(const FileName: string; Defs, FnDefs: TStringLi
 // declare itself, exactly as under fbc. Keys are UPPER: the macro lookup upper-cases the word.
 var
   Base: string;
+
+  procedure Reg(const Name: string; Value: Int64);
+  // ONE constant of an emulated header, in BOTH spellings: qualified ("fb.SC_A", what fbc's own
+  // suite writes) and bare (what "Using FB" makes legal). Parenthesised because the value substitutes
+  // as TEXT and a negative one would otherwise change how the expression around it parses.
+  begin
+    Defs.Values['FB.' + Name] := '(' + IntToStr(Value) + ')';
+    Defs.Values[Name]         := '(' + IntToStr(Value) + ')';
+  end;
+
 begin
   Base := LowerCase(ExtractFileName(FileName));
   // fbc-int/symbol.bi exposes __FB_QUERY_SYMBOL__ through convenience macros. The real header wraps
@@ -2844,6 +2854,206 @@ begin
     Defs.Values['FB_QUERY_SYMBOL.TYPENAME']   := '3';
     Defs.Values['FB_QUERY_SYMBOL.TYPENAMEID'] := '4';
     Defs.Values['FB_QUERY_SYMBOL.EXISTS']     := '6';
+  end;
+  // ⛔⛔ fbgfx.bi IS PURE CONSTANTS, AND EVERY ONE OF THEM ANSWERED ZERO - which for a DRIVER flag is
+  // not "unsupported", it is "windowed, no flags": exactly the hazard the header of this routine
+  // describes, on 181 names at once. fbc's own graphics suite opens every test with
+  // "screenres( w, h, 32, , fb.GFX_NULL )" - the NULL driver, which is what makes a graphics test
+  // runnable with no display - and a silent 0 there asks for a real window instead. The scancodes are
+  // the same shape: "MultiKey( fb.SC_ESCAPE )" was asking about scancode 0.
+  // ⭐⭐ THE VALUES COME FROM THE ORACLE, NOT FROM READING THE HEADER. Its enums chain implicit
+  // increments across explicit jumps (SC_PAGEUP is 73 and SC_LEFT is &h4B = 75), so a parse of the
+  // text is a hypothesis; these 181 were printed by a program compiled with fbc and copied from its
+  // output. GFX_SCREEN_EXIT is -2147483648 and not 2147483648 for the same reason - the header writes
+  // "&h80000000l", a signed LONG.
+  // ⚠️ DECLARED PERMISSIVENESS: each name is registered BOTH qualified ("fb.SC_A", which is what the
+  // suite writes) and BARE (which is what "Using FB" makes legal). A macro table cannot see a "Using",
+  // so a program that includes this header and writes a bare name WITHOUT "Using FB" resolves here
+  // where fbc refuses it (error 42). A missing refusal, never a wrong answer, and only inside a
+  // program that asked for the header.
+  if Base = 'fbgfx.bi' then
+  begin
+    Reg('BUTTON_LEFT',                1);
+    Reg('BUTTON_MIDDLE',              4);
+    Reg('BUTTON_RIGHT',               2);
+    Reg('BUTTON_X1',                  8);
+    Reg('BUTTON_X2',                  16);
+    Reg('EVENT_KEY_PRESS',            1);
+    Reg('EVENT_KEY_RELEASE',          2);
+    Reg('EVENT_KEY_REPEAT',           3);
+    Reg('EVENT_MOUSE_BUTTON_PRESS',   5);
+    Reg('EVENT_MOUSE_BUTTON_RELEASE', 6);
+    Reg('EVENT_MOUSE_DOUBLE_CLICK',   7);
+    Reg('EVENT_MOUSE_ENTER',          9);
+    Reg('EVENT_MOUSE_EXIT',           10);
+    Reg('EVENT_MOUSE_HWHEEL',         14);
+    Reg('EVENT_MOUSE_MOVE',           4);
+    Reg('EVENT_MOUSE_WHEEL',          8);
+    Reg('EVENT_WINDOW_CLOSE',         13);
+    Reg('EVENT_WINDOW_GOT_FOCUS',     11);
+    Reg('EVENT_WINDOW_LOST_FOCUS',    12);
+    Reg('GET_ALPHA_PRIMITIVES',       14);
+    Reg('GET_COLOR',                  13);
+    Reg('GET_DESKTOP_SIZE',           3);
+    Reg('GET_DRIVER_NAME',            9);
+    Reg('GET_GL_2D_MODE',             82);
+    Reg('GET_GL_ACCUM_ALPHA_BITS',    48);
+    Reg('GET_GL_ACCUM_BITS',          44);
+    Reg('GET_GL_ACCUM_BLUE_BITS',     47);
+    Reg('GET_GL_ACCUM_GREEN_BITS',    46);
+    Reg('GET_GL_ACCUM_RED_BITS',      45);
+    Reg('GET_GL_COLOR_ALPHA_BITS',    41);
+    Reg('GET_GL_COLOR_BITS',          37);
+    Reg('GET_GL_COLOR_BLUE_BITS',     40);
+    Reg('GET_GL_COLOR_GREEN_BITS',    39);
+    Reg('GET_GL_COLOR_RED_BITS',      38);
+    Reg('GET_GL_DEPTH_BITS',          42);
+    Reg('GET_GL_EXTENSIONS',          15);
+    Reg('GET_GL_NUM_SAMPLES',         49);
+    Reg('GET_GL_SCALE',               83);
+    Reg('GET_GL_STENCIL_BITS',        43);
+    Reg('GET_HIGH_PRIORITY',          16);
+    Reg('GET_PEN_POS',                12);
+    Reg('GET_SCANLINE_SIZE',          17);
+    Reg('GET_SCREEN_BPP',             6);
+    Reg('GET_SCREEN_DEPTH',           5);
+    Reg('GET_SCREEN_PITCH',           7);
+    Reg('GET_SCREEN_REFRESH',         8);
+    Reg('GET_SCREEN_SIZE',            4);
+    Reg('GET_TRANSPARENT_COLOR',      10);
+    Reg('GET_VIEWPORT',               11);
+    Reg('GET_WINDOW_HANDLE',          2);
+    Reg('GET_WINDOW_POS',             0);
+    Reg('GET_WINDOW_TITLE',           1);
+    Reg('GFX_ACCUMULATION_BUFFER',    131072);
+    Reg('GFX_ALPHA_PRIMITIVES',       64);
+    Reg('GFX_ALWAYS_ON_TOP',          32);
+    Reg('GFX_FULLSCREEN',             1);
+    Reg('GFX_HIGH_PRIORITY',          128);
+    Reg('GFX_MULTISAMPLE',            262144);
+    Reg('GFX_NO_FRAME',               8);
+    Reg('GFX_NO_SWITCH',              4);
+    Reg('GFX_NULL',                   (-1));
+    Reg('GFX_OPENGL',                 2);
+    Reg('GFX_SCREEN_EXIT',            (-2147483648));
+    Reg('GFX_SHAPED_WINDOW',          16);
+    Reg('GFX_STENCIL_BUFFER',         65536);
+    Reg('GFX_WINDOWED',               0);
+    Reg('MASK_COLOR',                 16711935);
+    Reg('MASK_COLOR_INDEX',           0);
+    Reg('OGL_2D_AUTO_SYNC',           2);
+    Reg('OGL_2D_MANUAL_SYNC',         1);
+    Reg('OGL_2D_NONE',                0);
+    Reg('POLL_EVENTS',                200);
+    Reg('SC_0',                       11);
+    Reg('SC_1',                       2);
+    Reg('SC_2',                       3);
+    Reg('SC_3',                       4);
+    Reg('SC_4',                       5);
+    Reg('SC_5',                       6);
+    Reg('SC_6',                       7);
+    Reg('SC_7',                       8);
+    Reg('SC_8',                       9);
+    Reg('SC_9',                       10);
+    Reg('SC_A',                       30);
+    Reg('SC_ALT',                     56);
+    Reg('SC_ALTGR',                   100);
+    Reg('SC_B',                       48);
+    Reg('SC_BACKSLASH',               43);
+    Reg('SC_BACKSPACE',               14);
+    Reg('SC_C',                       46);
+    Reg('SC_CAPSLOCK',                58);
+    Reg('SC_CENTER',                  76);
+    Reg('SC_CLEAR',                   76);
+    Reg('SC_COMMA',                   51);
+    Reg('SC_CONTROL',                 29);
+    Reg('SC_D',                       32);
+    Reg('SC_DELETE',                  83);
+    Reg('SC_DOWN',                    80);
+    Reg('SC_E',                       18);
+    Reg('SC_END',                     79);
+    Reg('SC_ENTER',                   28);
+    Reg('SC_EQUALS',                  13);
+    Reg('SC_ESCAPE',                  1);
+    Reg('SC_F',                       33);
+    Reg('SC_F1',                      59);
+    Reg('SC_F10',                     68);
+    Reg('SC_F11',                     87);
+    Reg('SC_F12',                     88);
+    Reg('SC_F2',                      60);
+    Reg('SC_F3',                      61);
+    Reg('SC_F4',                      62);
+    Reg('SC_F5',                      63);
+    Reg('SC_F6',                      64);
+    Reg('SC_F7',                      65);
+    Reg('SC_F8',                      66);
+    Reg('SC_F9',                      67);
+    Reg('SC_G',                       34);
+    Reg('SC_H',                       35);
+    Reg('SC_HOME',                    71);
+    Reg('SC_I',                       23);
+    Reg('SC_INSERT',                  82);
+    Reg('SC_J',                       36);
+    Reg('SC_K',                       37);
+    Reg('SC_L',                       38);
+    Reg('SC_LEFT',                    75);
+    Reg('SC_LEFTBRACKET',             26);
+    Reg('SC_LSHIFT',                  42);
+    Reg('SC_LWIN',                    91);
+    Reg('SC_M',                       50);
+    Reg('SC_MENU',                    93);
+    Reg('SC_MINUS',                   12);
+    Reg('SC_MULTIPLY',                55);
+    Reg('SC_N',                       49);
+    Reg('SC_NUMLOCK',                 69);
+    Reg('SC_O',                       24);
+    Reg('SC_P',                       25);
+    Reg('SC_PAGEDOWN',                81);
+    Reg('SC_PAGEUP',                  73);
+    Reg('SC_PERIOD',                  52);
+    Reg('SC_PLUS',                    78);
+    Reg('SC_Q',                       16);
+    Reg('SC_QUOTE',                   40);
+    Reg('SC_R',                       19);
+    Reg('SC_RIGHT',                   77);
+    Reg('SC_RIGHTBRACKET',            27);
+    Reg('SC_RSHIFT',                  54);
+    Reg('SC_RWIN',                    92);
+    Reg('SC_S',                       31);
+    Reg('SC_SCROLLLOCK',              70);
+    Reg('SC_SEMICOLON',               39);
+    Reg('SC_SLASH',                   53);
+    Reg('SC_SPACE',                   57);
+    Reg('SC_T',                       20);
+    Reg('SC_TAB',                     15);
+    Reg('SC_TILDE',                   41);
+    Reg('SC_U',                       22);
+    Reg('SC_UP',                      72);
+    Reg('SC_V',                       47);
+    Reg('SC_W',                       17);
+    Reg('SC_X',                       45);
+    Reg('SC_Y',                       21);
+    Reg('SC_Z',                       44);
+    Reg('SET_ALPHA_PRIMITIVES',       104);
+    Reg('SET_DRIVER_NAME',            103);
+    Reg('SET_GL_2D_MODE',             150);
+    Reg('SET_GL_ACCUM_ALPHA_BITS',    116);
+    Reg('SET_GL_ACCUM_BITS',          112);
+    Reg('SET_GL_ACCUM_BLUE_BITS',     115);
+    Reg('SET_GL_ACCUM_GREEN_BITS',    114);
+    Reg('SET_GL_ACCUM_RED_BITS',      113);
+    Reg('SET_GL_COLOR_ALPHA_BITS',    109);
+    Reg('SET_GL_COLOR_BITS',          105);
+    Reg('SET_GL_COLOR_BLUE_BITS',     108);
+    Reg('SET_GL_COLOR_GREEN_BITS',    107);
+    Reg('SET_GL_COLOR_RED_BITS',      106);
+    Reg('SET_GL_DEPTH_BITS',          110);
+    Reg('SET_GL_NUM_SAMPLES',         117);
+    Reg('SET_GL_SCALE',               151);
+    Reg('SET_GL_STENCIL_BITS',        111);
+    Reg('SET_PEN_POS',                102);
+    Reg('SET_WINDOW_POS',             100);
+    Reg('SET_WINDOW_TITLE',           101);
   end;
   if Base = 'dir.bi' then
   begin
