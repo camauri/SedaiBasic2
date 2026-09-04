@@ -22,7 +22,7 @@ unit SedaiPreprocessor;
 
 interface
 
-uses SysUtils, Math, SedaiConsoleBehavior;
+uses Classes, SysUtils, Math, SedaiConsoleBehavior;
 
 type
   // Raised by #error / a failed #assert. Callers catch it to report a clean compile-time
@@ -36,6 +36,14 @@ type
   not keep that branch out of the module. A #if does. }
 var
   GTargetIsWasm: Boolean = False;
+  // ⭐ Names the program RETIRED with "#undef". A "#undef" is not only about macros: fbc removes the
+  // symbol, so "#undef f1" over a SUB makes a later "Dim f1 As Integer" legal - and we refused it with
+  // "Duplicated definition". The preprocessor is the only pass that sees the directive, so it leaves
+  // the names here and the SSA's duplicate check reads them. DIVERGENZE 73.
+  // ⚠️ Whole-FILE, not positional: a "#undef" anywhere retires the name for that check everywhere in
+  // the file. Widening it costs a MISSING refusal (never a wrong answer), and the positional form
+  // would need the directive's line to survive macro expansion, which it does not.
+  GPPUndefNames: TStringList = nil;
 
 type
   { One "#line <n> ["file"]" directive: from the PHYSICAL source line it stands on, positions are
@@ -72,7 +80,7 @@ function SourceDeclaresNonFbDialect: Boolean;
 
 implementation
 
-uses Classes, SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
+uses SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
 
 function DetectQBLang(const Src: string): Boolean;
 // Does this source select the QB dialect, '#lang "qb"' or the '$lang: "qb" metacommand?
@@ -3681,6 +3689,16 @@ var
             if p >= 0 then Defs.Delete(p);
             p := FnDefs.IndexOfName(UpperCase(Trim(DRest)));
             if p >= 0 then FnDefs.Delete(p);
+            // ...and the name is retired for the whole compilation, not only for macro expansion:
+            // it may be a SUB/FUNCTION, and fbc lets a later DIM take it. See GPPUndefNames.
+            if GPPUndefNames = nil then
+            begin
+              GPPUndefNames := TStringList.Create;
+              GPPUndefNames.CaseSensitive := False;
+              GPPUndefNames.Duplicates := dupIgnore;
+              GPPUndefNames.Sorted := True;
+            end;
+            if Trim(DRest) <> '' then GPPUndefNames.Add(UpperCase(Trim(DRest)));
           end
           else if (DName = 'include') and Emitting then
           begin

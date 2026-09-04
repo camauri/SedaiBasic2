@@ -35,7 +35,8 @@ uses
   Classes, SysUtils, StrUtils, Variants, Math, Generics.Collections,
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes, SedaiAST,
   SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals,
-  SedaiExecutorErrors;   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
+  SedaiExecutorErrors,   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
+  SedaiPreprocessor;     // GPPUndefNames: the names "#undef" retired (DIVERGENZE 73)
 
 type
   { Loop info for FOR/NEXT implementation }
@@ -1090,6 +1091,7 @@ type
     function ParamBankAndSlot(ParamList: TASTNode; Index: Integer; out RT: TSSARegisterType): Integer;
     function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
     function ModuleTypeHiddenHere(const NameU: string): Boolean;   // a module DIM's TYPE, invisible in this proc?
+    function UndefinedNameIsFunction(const NameU: string): Boolean; // "#undef" over a FUNCTION keeps the refusal (DIVERGENZE 73)
     procedure CollectProcPtrLocals(Proc: TASTNode);   // this proc's own "DIM x AS T PTR" locals
     procedure CollectProcDeclaredNames(Node: TASTNode);            // names this proc declares of its own
     function CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;  // is VarName a param of the current proc? UDTType = its UDT ('' if not a UDT)
@@ -35502,12 +35504,38 @@ begin
         without regard to case - which is the whole reason it bites, since "s" and "S" are one name.
         ⚠️ Either order is caught here because the offending declaration is a DIM either way, and this
         pass runs after PreCollectProcedures has seen every procedure in the file. }
-      if FProcedureNames.IndexOf(NameU) >= 0 then
+      // ⛔ ...unless the program RETIRED the name with "#undef". fbc removes the symbol, so
+      // "#undef f1" over a SUB makes a later "Dim f1 As Integer" legal - and refusing it turned a
+      // valid program into an error. The preprocessor is the only pass that sees the directive.
+      //
+      // ⛔⛔ A SUB ONLY, AND THE LIMIT IS MEASURED, NOT CAUTIOUS. The exemption is whole-FILE while
+      // fbc's "#undef" is POSITIONAL, and for a FUNCTION that difference is a WRONG ANSWER rather
+      // than a missing refusal: "Print g1()" written ABOVE the "#undef" then resolves to the DIM'd
+      // variable below it, and prints nothing where fbc prints the function's 5. A SUB has no result
+      // to read, so the same widening cannot change what a program answers.
+      // ⇒ A FUNCTION keeps the diagnostic: we support LESS than fbc here, on purpose and in writing.
+      //   Lifting it needs positional resolution of a module-level name, which is a different job.
+      if (FProcedureNames.IndexOf(NameU) >= 0) and
+         ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(NameU) < 0) or
+          UndefinedNameIsFunction(NameU)) then
         raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a SUB or ' +
                                   'FUNCTION, and BASIC does not tell the two apart', [NameU]);
     end;
   for i := 0 to Node.ChildCount - 1 do
     CheckTypeNameShadowedByVar(Node.GetChild(i));
+end;
+
+function TSSAGenerator.UndefinedNameIsFunction(const NameU: string): Boolean;
+// Is the procedure this "#undef" retired a FUNCTION (as opposed to a SUB)? See the note at the
+// duplicate-definition check: the exemption is safe for a SUB and would be a wrong answer for a
+// FUNCTION, because our whole-file approximation of a positional "#undef" would re-point a call
+// written ABOVE the directive at the variable declared below it.
+var
+  Decl: TASTNode;
+begin
+  Result := False;
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  Result := Assigned(Decl) and (UpperCase(VarToStr(Decl.Value)) = kFUNCTION);
 end;
 
 procedure TSSAGenerator.CollectFixedStrNames(Node: TASTNode);
