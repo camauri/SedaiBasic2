@@ -34492,15 +34492,28 @@ begin
       NameU := UpperCase(VarToStr(Decl.GetChild(0).Value));
       if not IsSharedScalar(NameU) then Continue;
       if FindUDT(UpperCase(VarToStr(Decl.GetChild(1).Value))) >= 0 then Continue;   // a record is built at its DIM
-      InitAssign := TASTNode.Create(antAssignment, Decl.GetChild(0).Token);
-      InitAssign.AddChild(MakeSharedScalarAccess(NameU, Decl.GetChild(0).Token));
-      InitAssign.AddChild(InitNode.Clone);
-      try
-        ProcessArrayStore(InitAssign);
-        Decl.Attributes.Values['PREINITED'] := '1';
-      finally
-        InitAssign.Free;
+      // ⛔⛔ AND THIS IS THE THIRD ROAD INTO ONE VARIABLE THAT SKIPS ProcessAssignment - after the DIM
+      // initializer (Allocate, DIVERGENZE 80) and the DIM initializer again (the fixed-length cut, the
+      // same day). A "Dim Shared As String * 3 s = "abcdefghij"" hoisted through here kept all TEN
+      // characters, and the identical program WITHOUT a module constructor was right - because this
+      // pass only runs when one exists.
+      // ⇒ That gate is why no probe found it and why the fbc suite met it on every file: an fbcunit
+      // TEST emits "Private Sub ..._fbcuctor() Constructor" to register itself, so EVERY test file
+      // defines a module constructor. Five lines reproduce it (job/tests/bas/m832).
+      // ⇒ Every conversion the assignment path performs has to be offered on each of these roads;
+      // there are now three, and TryFixedLenStore is on all three.
+      if not TryFixedLenStore(NameU, InitNode) then
+      begin
+        InitAssign := TASTNode.Create(antAssignment, Decl.GetChild(0).Token);
+        InitAssign.AddChild(MakeSharedScalarAccess(NameU, Decl.GetChild(0).Token));
+        InitAssign.AddChild(InitNode.Clone);
+        try
+          ProcessArrayStore(InitAssign);
+        finally
+          InitAssign.Free;
+        end;
       end;
+      Decl.Attributes.Values['PREINITED'] := '1';
     end;
   end;
 end;
