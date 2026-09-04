@@ -33792,6 +33792,21 @@ begin
   // block frames and stops - which is the whole stack there.
   if not FModernMode then Exit;
   nameU := UpperCase(Name);
+  // ⛔⛔ AN @-TAKEN LOCAL IS A LOCAL TOO, and this walk could not see one. Taking a local's address
+  // moves it out of the register bank into a per-frame backing (FAddrLocalVars, rebuilt per procedure),
+  // and that declaration does not leave the scope-frame binding this loop looks for - so the shadow
+  // went unnoticed, IsSharedScalar answered TRUE for the name, and the STORE path (which asks it before
+  // it asks IsAddrLocal) wrote the local's value into the module's SHARED backing. The READ path asks
+  // the two in the opposite order and read the local's own, still empty, storage.
+  // ⇒ "Dim Shared s As String" outside, "Dim s As String : Dim q As Any Ptr = @s" inside: fbc prints
+  //   inner / outer, we printed EMPTY / inner - the two halves of one variable talking past each other.
+  //   DIVERGENZE 78.
+  // ⚠️ It is STRING-specific only by accident: an @-taken INTEGER local is raw-backed and its branch is
+  // asked earlier, so it never reached this. The rule belongs here, where "is this name shadowed" is
+  // answered ONCE, rather than as a third ordering rule at each site that asks.
+  // ⭐ Safe to consult: FAddrLocalVars is per-PROCEDURE and cleared at the prologue, so a module-level
+  // @-taken variable of the same name can never report itself as its own shadow.
+  if IsAddrLocal(Name) or IsRawAddrLocal(Name) then Exit(True);
   for f := High(FScopeStack) downto 0 do
   begin
     if (FScopeStack[f].Bindings <> nil) and (FScopeStack[f].Bindings.IndexOf(nameU) >= 0) then
