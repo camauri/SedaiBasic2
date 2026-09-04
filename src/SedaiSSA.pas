@@ -920,6 +920,7 @@ type
     function ParamDeclaredTypeName(ParamNode: TASTNode): string;   // the type its own "AS type" child names
     function EmitVarAddressIsReal(const Name: string): Boolean;   // ...or would EmitVarAddress answer its 0 constant?
     function EmitTempCellFor(const Val: TSSAValue; const TypeName: string): TSSAValue;  // a homeless value -> a raw cell, and its address
+    function TryEmitUdtHandleCellAddress(const Name: string; out Addr: TSSAValue): Boolean;  // "Return This" / a byref UDT param (DIVERGENZE 81)
     function IsByrefRetFunc(const Name: string): Boolean;                       // FUNCTION declared BYREF AS T?
     function ByrefRetPointeeBank(const Name: string): TSSARegisterType;         // bank of a byref function's pointee
     function ByrefRetByAddress(const Name: string): Boolean;                    // ...and is the reference actually an ADDRESS?
@@ -9434,6 +9435,11 @@ begin
           ThisFieldNode.Free;
         end;
       end
+      // ...and the register-resident UDT reference, the twin of the RETURN spelling. ⛔ BOTH sites or
+      // neither: this file records four times that a byref-return rule taught to one spelling and not
+      // the other makes one form of an operator work and the other hand back 0. DIVERGENZE 81.
+      else if TryEmitUdtHandleCellAddress(VarToStr(ExprNode.Value), ExprValue) then
+        EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(ExprValue))
       else
         EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(ExprNode.Value)));
       Exit;
@@ -39140,6 +39146,35 @@ begin
     EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Result, EnsureIntRegister(Val), MakeSSAConstInt(Code));
 end;
 
+function TSSAGenerator.TryEmitUdtHandleCellAddress(const Name: string; out Addr: TSSAValue): Boolean;
+// A UDT reference that lives in a REGISTER - "This", or a BYREF UDT parameter - has no backing slot
+// whose address could be taken, and EmitVarAddress answered a literal ZERO for it. DIVERGENZE 81.
+//
+// ⭐⭐ THE CONVENTION WAS ALREADY THERE, AND THE DISASSEMBLY IS WHAT SAID SO. A byref UDT result is not
+// the handle: it is the ADDRESS OF A SLOT THAT HOLDS THE HANDLE. "Function pt() ByRef As T : Return g"
+// over a module UDT stages the packed address of g's 1-element backing array, and the caller emits ONE
+// RefLoad to fetch the handle and then works on the record. That is why the 28 Aug attempt at "a UDT
+// reference IS its record handle" had to be withdrawn - it was changing a convention that already
+// worked, and taking the WRITE path and "@" with it.
+// ⇒ So the cure is not a new convention: it is giving these two a slot to be the address OF.
+//
+// ⛔ The cell holds the HANDLE, never a copy of the record - so a field write through the result
+// ("uu.get_().m = 9") reaches the caller's own object, which is the whole point. The record is
+// untouched and shared; only the one-word slot is fresh.
+var
+  Handle: TSSAValue;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if Name = '' then Exit;
+  if VarRecordTypeName(Name) = '' then Exit;      // not a UDT: nothing here to say
+  if EmitVarAddressIsReal(Name) then Exit;        // it HAS a home - take its address, as before
+  if not VarIsBound(UpperCase(Name)) then Exit;   // ⛔ ask, never bind: [[a-lookup-that-answers-by-creating]]
+  Handle := GetOrAllocateVariable(UpperCase(Name));
+  Addr := EmitTempCellFor(Handle, 'INTEGER');     // a handle is an Int64, and so is the cell
+  Result := True;
+end;
+
 function TSSAGenerator.IsByrefRetFunc(const Name: string): Boolean;
 begin
   Result := FByrefRetFuncs.IndexOfName(UpperCase(Name)) >= 0;
@@ -40820,13 +40855,19 @@ begin
   // must keep falling through, and a name with no method behind it is not an access at all.
   CheckMemberAccess(ObjType, MethNm);
   RetRecType := VarRecordTypeName(MethodLabel);          // V3: '' unless it returns a UDT by value
-  // ⛔ A BYREF UDT RESULT IS STILL TREATED AS A VALUE RETURN, and that is a MODEL gap, not an
-  // oversight: the caller allocates a copy, so "@x[1] = @x" answers false where fbc says true and a
-  // mutation the operator made to THIS is invisible afterwards. ⚠️ TRIED AND WITHDRAWN 27 Aug:
-  // clearing RetRecType here to take the reference path instead makes the callee stage NOTHING - an
-  // OPERATOR body's "Operator = This" does not reach the byref-address arm - and the very next
-  // dereference dies on address 0. Closing it means giving the callee side that arm, which is a
-  // different piece of work. DIVERGENZE 72.
+  // ⭐⭐ ...and a BYREF UDT result is NOT a value return, whatever its type. The caller used to allocate
+  // a fresh record and read the field out of that throwaway, so "uu.get_().m" answered 0 and
+  // "uu.get_().m = 9" wrote into a copy nobody ever looked at again. Same ORDER defect m620 closed for
+  // a plain FUNCTION - "does it return a UDT?" was asked BEFORE "is its result BYREF?" - left standing
+  // on the METHOD path. DIVERGENZE 81 (and 72).
+  //
+  // ⛔⛔ THIS LINE WAS TRIED AND WITHDRAWN ON 27 AUG, AND THE WITHDRAWAL NOTE NAMED ITS MISSING HALF:
+  // "the callee stages NOTHING - an OPERATOR body's 'Operator = This' does not reach the byref-address
+  // arm - and the very next dereference dies on address 0. Closing it means giving the callee side that
+  // arm." That arm now exists (TryEmitUdtHandleCellAddress, wired into BOTH the RETURN and the
+  // "Function/Operator =" spellings), so the two halves land together - which is the only way this one
+  // was ever going to work. ⇒ A withdrawal note that names the missing half is the map back.
+  if (RetRecType <> '') and ByrefRetByAddress(MethodLabel) then RetRecType := '';
 
   // Build an argument list with the object (THIS) prepended.
   TmpArgs := TASTNode.Create(antArgumentList, ObjNode.Token);
@@ -44412,6 +44453,13 @@ begin
               ThisFieldNode.Free;
             end;
           end
+          // ...and a UDT reference that lives in a REGISTER - "Return This", or a BYREF UDT parameter -
+          // which has no backing slot, so EmitVarAddress staged a literal ZERO and the caller read
+          // through it. Asked BEFORE the plain-variable reading, and it stands aside on its own for any
+          // name that does have a home. DIVERGENZE 81.
+          else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) and
+                  TryEmitUdtHandleCellAddress(VarToStr(Node.GetChild(0).Value), RetVal) then
+            EmitXferStore(srtInt, XFER_RESULT_SLOT, EnsureIntRegister(RetVal))
           else if FCurrentProcByrefRet and (Node.GetChild(0).NodeType = antIdentifier) then
             EmitXferStore(srtInt, XFER_RESULT_SLOT, EmitVarAddress(VarToStr(Node.GetChild(0).Value)))
           // ...and an INDEXED byte on the raw heap is just as addressable as a named variable:
