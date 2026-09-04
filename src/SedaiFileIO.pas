@@ -39,15 +39,15 @@ uses
 type
   TVMFileHandler = class
   private
-    FFileHandles: array[1..15] of TFileStream;
+    FFileHandles: array[1..MAX_FILE_HANDLE] of TFileStream;
     // FreeBASIC standard DEVICES opened as ordinary handles: "Open Cons For Input As #1" is how a
     // program reads stdin, and CLBG's reverse-complement / k-nucleotide / regex-redux are all written
     // that way. A device has no TFileStream - the bytes come from System.Input and go to System.Output -
     // so it needs its own marker, and the handle counts as open while FFileHandles stays nil.
     //   1 = CONS (stdin when opened For Input, stdout when For Output)   2 = SCRN (stdout)   3 = ERR (stderr)
-    FDeviceKind: array[1..15] of Integer;
-    FFileModes: array[1..15] of string;
-    FRecordLens: array[1..15] of Integer;   // relative-file record length per handle (0 = not relative)
+    FDeviceKind: array[1..MAX_FILE_HANDLE] of Integer;
+    FFileModes: array[1..MAX_FILE_HANDLE] of string;
+    FRecordLens: array[1..MAX_FILE_HANDLE] of Integer;   // relative-file record length per handle (0 = not relative)
 
     { ===== Cached file size =====
 
@@ -60,7 +60,7 @@ type
       invalidated in the one place that writes. -1 = not known yet. ⚠️ This deliberately does not
       model another process appending to a file we hold open; neither does FreeBASIC, and paying four
       syscalls per character to find out is not a trade anyone asked for. }
-    FSizeCache: array[1..15] of Int64;
+    FSizeCache: array[1..MAX_FILE_HANDLE] of Int64;
 
     { ===== Buffered standard input =====
 
@@ -114,14 +114,14 @@ implementation
 
 function TVMFileHandler.CachedSize(Handle: Integer; FS: TFileStream): Int64;
 begin
-  if (Handle < 1) or (Handle > 15) then Exit(FS.Size);
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit(FS.Size);
   if FSizeCache[Handle] < 0 then FSizeCache[Handle] := FS.Size;
   Result := FSizeCache[Handle];
 end;
 
 procedure TVMFileHandler.InvalidateSize(Handle: Integer);
 begin
-  if (Handle >= 1) and (Handle <= 15) then FSizeCache[Handle] := -1;
+  if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) then FSizeCache[Handle] := -1;
 end;
 
 // LOC counts in RECORDS, and what a record IS depends only on how the file was opened
@@ -133,7 +133,7 @@ end;
 // trailing '<' for ACCESS READ), so testing for 'B' cannot collide with a filename.
 function TVMFileHandler.RecordUnit(Handle: Integer): Int64;
 begin
-  if (Handle < 1) or (Handle > 15) then Exit(1);
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit(1);
   if FRecordLens[Handle] > 0 then Result := FRecordLens[Handle]
   else if Pos('B', FFileModes[Handle]) > 0 then Result := 1
   else Result := 128;
@@ -280,7 +280,7 @@ procedure TVMFileHandler.CloseAll;
 var
   i: Integer;
 begin
-  for i := 1 to 15 do
+  for i := 1 to MAX_FILE_HANDLE do
     if Assigned(FFileHandles[i]) then
     begin
       FreeAndNil(FFileHandles[i]);
@@ -298,7 +298,7 @@ var
   p, q: Integer;
 begin
   Result := 8;
-  if (Handle < 1) or (Handle > 15) then Exit;
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit;
   p := Pos('~', FFileModes[Handle]);
   // ⛔ Only the DIGIT RUN, not "the rest of the string": the mode also carries '<' for ACCESS READ, and
   // reading "16<" as a number answered the default 8 - so the same file decoded correctly without the
@@ -373,7 +373,7 @@ begin
   // DCLEAR / RESET: close every open handle. Signalled with Handle 0, so it must be handled before
   // the per-handle range check below (which would otherwise reject Handle 0 with error 64).
   if Command = 'DCLEAR' then begin CloseAll; Exit; end;
-  if (Handle < 1) or (Handle > 15) then begin ErrorCode := 64; Exit; end;
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then begin ErrorCode := 64; Exit; end;
 
   if Command = 'DOPEN' then
   begin
@@ -511,16 +511,20 @@ begin
   Value := 0;
   ErrorCode := 0;
 
-  // FREEFILE: lowest unused handle 1..15 (0 if none). Does not need an open handle.
+  // FREEFILE: lowest unused handle 1..MAX_FILE_HANDLE (0 if none). Does not need an open handle.
   if QueryCode = FQ_FREEFILE then
   begin
-    for i := 1 to 15 do
-      if not Assigned(FFileHandles[i]) then begin Value := i; Exit; end;
+    // ⛔ A DEVICE HANDLE IS OPEN WITH NO STREAM BEHIND IT - the marker three fields up says so in
+    // writing ("the handle counts as open while FFileHandles stays nil"), and this loop asked only
+    // about the stream. "Open Cons For Input As #1" then FreeFile answered **1**: the handle already
+    // in use, which is the one answer FreeFile exists to avoid.
+    for i := 1 to MAX_FILE_HANDLE do
+      if (not Assigned(FFileHandles[i])) and (FDeviceKind[i] = 0) then begin Value := i; Exit; end;
     Exit;                                   // none free -> 0
   end;
 
   // A standard DEVICE handle (CONS/SCRN/ERR) has no stream behind it.
-  if (Handle >= 1) and (Handle <= 15) and (FDeviceKind[Handle] <> 0) then
+  if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and (FDeviceKind[Handle] <> 0) then
   begin
     if QueryCode = FQ_EOF then
     begin
@@ -534,7 +538,7 @@ begin
     Exit;                                   // LOF/LOC/SEEK mean nothing on a device -> 0
   end;
 
-  if (Handle < 1) or (Handle > 15) or (not Assigned(FFileHandles[Handle])) then
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) or (not Assigned(FFileHandles[Handle])) then
   begin
     ErrorCode := 64;                        // FILE NOT OPEN
     if QueryCode = FQ_EOF then Value := -1; // EOF of a closed file = true
@@ -606,7 +610,7 @@ begin
   begin
     RetType := StrToIntDef(Data, 1);
     Data := '0';
-    if (Handle >= 1) and (Handle <= 15) and Assigned(FFileHandles[Handle]) then
+    if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and Assigned(FFileHandles[Handle]) then
       case RetType of
         2: Data := IntToStr(PtrInt(FFileHandles[Handle].Handle));  // OS file handle
         3: Data := '0';   // Encoding: ASCII
@@ -631,7 +635,7 @@ begin
 
   // A standard DEVICE handle (CONS/SCRN/ERR) has no stream behind it: serve it from the process's own
   // input and output before the "is there a TFileStream?" test below, which would call it "not open".
-  if (Handle >= 1) and (Handle <= 15) and (FDeviceKind[Handle] <> 0) then
+  if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and (FDeviceKind[Handle] <> 0) then
   begin
     if Command = 'EOF' then
     begin
@@ -698,7 +702,7 @@ begin
     Exit;   // LOF/LOC/SEEK and the record commands mean nothing on a device
   end;
 
-  if (Handle < 1) or (Handle > 15) or (not Assigned(FFileHandles[Handle])) then
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) or (not Assigned(FFileHandles[Handle])) then
   begin
     ErrorCode := 64;  // FILE NOT OPEN
     if (Command = 'EOF') then Data := '-1';   // EOF of a closed file = true

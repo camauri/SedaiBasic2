@@ -331,8 +331,6 @@ double) through an integer pointer.
     it prescribes.
   - **Extensions** (fbc's base dialect rejects them; they exist only in `-lang fblite`/`qb` there, or
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
-  - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
-    `As #90` is legal there and an error here.
 - ⚠️ **The C standard library is not here, and only its I/O half is a divergence.** A program that
   includes `<crt.bi>` for MEMORY gets what it asked for: `malloc`, `calloc`, `realloc` and `free` are
   aliases of `Allocate`, `CAllocate`, `Reallocate` and `Deallocate`, byte for byte (`calloc(count,

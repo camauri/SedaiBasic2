@@ -94,6 +94,17 @@ type
                              out Value: Int64; out ErrorCode: Integer): Boolean of object;
 
 const
+  { ⭐ THE HIGHEST FILE HANDLE, and it is ONE constant because there are TWO file handlers - the
+    headless one (SedaiFileIO, what `sb` uses) and the console's own (SedaiNewConsole, what `sbv`
+    uses) - and each carried its own `array[1..15]` and its own range tests. A limit written twice
+    is a limit that will be raised in one of them.
+    ⛔ 15 was the COMMODORE limit and it is not FreeBASIC's: measured against fbc, handles 16, 40
+    and 255 all open, twenty files open at once, and 256 is where it answers error 1. So the ceiling
+    is 255, and it is fbc's, not a number picked to be large.
+    ⚠️ Raising it does not make a Commodore program wrong - it only stops refusing what fbc accepts;
+    the two dialects share one table because a handle is a handle. (DIVERGENZE 6.) }
+  MAX_FILE_HANDLE = 255;
+
   { bcFileQuery.Immediate - the query codes the SSA builder emits (SedaiSSA ~6057). }
   FQ_EOF      = 0;
   FQ_FREEFILE = 1;
@@ -17428,9 +17439,13 @@ begin
           FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);
           // The FreeBASIC code for what the file layer reported: 62 FILE NOT FOUND is fbc's 2, and the
           // other failures the layer can return are its 3 (file I/O error).
+          // ⭐ ...and a handle OUT OF RANGE is fbc's 1 (illegal function call), not an I/O error:
+          // measured, "Open f For Output As #0" and "... As #256" both answer 1 there while #255
+          // opens. The file layer reports 64 for that case, and 64 is the only way it says so.
           case ErrorCode of
             0:      OpenFbCode := 0;
             62:     OpenFbCode := 2;
+            64:     OpenFbCode := 1;
           else      OpenFbCode := 3;
           end;
           if SubOp = 34 then

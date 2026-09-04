@@ -12119,15 +12119,49 @@ begin
 end;
 
 function TPackratParser.FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
-// A file number can be a UDT member (e.g. "#bf.bw") — the handle identifier has
-// already been consumed; fold any trailing ".field" chain into antMemberAccess nodes
-// so the SSA evaluates the member's integer value (ProcessDopen's expression fallback).
+// A file number can be a UDT member (e.g. "#bf.bw") or an ARRAY ELEMENT ("#h(i)") — the handle
+// identifier has already been consumed; fold any trailing ".field" and "(...)" chain so the SSA
+// evaluates the value (ProcessDopen's expression fallback).
+//
+// ⛔ THE INDEX WAS MISSING, and it did not fail like a missing feature. "Open ... As #h(i)" parsed
+// as far as the identifier, and the "(i)" was left in the token stream: the rest of the statement
+// then leaked out as top-level nodes, the SSA printed "Unhandled node type" for each one, and the
+// handle reached the runtime as **0** — "PRINT# error 64 writing float to file: 0", on a program
+// fbc runs. It is the shape a table of open files has, and the loop that fills it
+// ("h(i) = FreeFile : Open ... As #h(i)") is how every program with more than a couple of files is
+// written. Found on the way to DIVERGENZE 6, and it is what that entry's own probe was really
+// hitting after the 1..15 ceiling went.
+// ⭐ The two fold together in ONE loop and in either order, because "#recs(i).fh" is both.
 var
-  MemberNode: TASTNode;
+  MemberNode, IdxNode, Indices: TASTNode;
+  IdxTok: TLexerToken;
 begin
   Result := BaseNode;
-  while Context.Check(ttOpDot) do
+  while Context.Check(ttOpDot) or Context.Check(ttDelimParOpen) or Context.Check(ttDelimBrackOpen) do
   begin
+    if Context.Check(ttDelimParOpen) or Context.Check(ttDelimBrackOpen) then
+    begin
+      IdxTok := Context.CurrentToken;
+      Context.Advance;                             // '(' or '['
+      Indices := ParseExpressionList(ttSeparParam);
+      if not Assigned(Indices) then
+      begin
+        HandleError('Expected index expression in file number', Context.CurrentToken);
+        Break;
+      end;
+      if not (Context.Match(ttDelimParClose) or Context.Match(ttDelimBrackClose)) then
+      begin
+        HandleError('Expected ")" after the index of a file number', Context.CurrentToken);
+        Indices.Free;
+        Break;
+      end;
+      IdxNode := TASTNode.Create(antArrayAccess, IdxTok);
+      IdxNode.AddChild(Result);
+      IdxNode.AddChild(Indices);
+      Result := IdxNode;
+      DoNodeCreated(Result);
+      Continue;
+    end;
     Context.Advance;                               // '.'
     if not Context.Check(ttIdentifier) then
     begin
