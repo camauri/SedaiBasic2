@@ -1184,6 +1184,35 @@ begin
       Mangled := ResolveUnqualified(ActivePrefix, BaseV, Ctx, Using);
       if Mangled <> '' then Node.Value := Mangled + SigV;
     end
+    // ⛔⛔ ...AND A DOTTED NAME IS NOT ALWAYS AN ALREADY-QUALIFIED ONE. The test above reads a dot as
+    // "the program spelled the path itself, leave it alone", and for a reference that is right. For the
+    // DECLARATION BODY OF A STATIC MEMBER it is wrong: "Var U.h = 11" written inside "Namespace ns"
+    // spells the owner the only way fbc ACCEPTS it - unqualified, since "Var ns.U.h" is refused there
+    // with "error 131: Declaration outside the original namespace" - so the dot is the TYPE's, not the
+    // namespace's, and the name still needs the prefix.
+    // ⇒ Two backings for one member: "U.H" ArrayDim'd on the Var line and written by the initializer,
+    // "NS.U.H" built by CollectStaticMembers from the (already mangled) type and read by everything
+    // else. The initializer went to the first, every read to the second, and the member answered 0.
+    // DIVERGENZE 71. At file scope the two names COINCIDE, which is why it worked there - by spelling
+    // coincidence, not by rule.
+    // ⚠️ Deliberately gated on Ctx.IsMember of the WHOLE dotted name: pass 1 (CollectDimMembers) files
+    // "NS|U.H" only for a declaration this namespace actually contains, so a mere reference to some
+    // other "a.b" cannot be caught by this. The TYPE slot has had the same escape hatch since the
+    // nested-type fix a screen above; the NAME slot never got it - one rule, two halves, one written.
+    // ⛔⛔ AND THE HEAD MAY BE A NAMESPACE RATHER THAN A TYPE - the twin arm, which I wrote one of and
+    // not the other, exactly as the TYPE slot's note a screen above warns. "Var b.UDT.i1 = 123" inside
+    // "Namespace a" spells a nested NAMESPACE as its head, and asking only IsMember (which answers for
+    // a TYPE) left it unqualified. Both questions, in the same order the type slot asks them.
+    else if (Pos('.', BaseV) > 0) and (ActivePrefix <> '') and
+            (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
+            Ctx.IsMember(ActivePrefix, BaseV) then
+    begin
+      Mangled := ResolveNamespacePrefix(ActivePrefix, Copy(BaseV, 1, Pos('.', BaseV) - 1), Ctx, Using);
+      if Mangled <> '' then
+        Node.Value := Mangled + Copy(BaseV, Pos('.', BaseV), MaxInt) + SigV
+      else if Ctx.IsMember(ActivePrefix, Copy(BaseV, 1, Pos('.', BaseV) - 1)) then
+        Node.Value := ActivePrefix + '.' + BaseV + SigV;
+    end
     // ⭐ ...AND A GLOBALSCOPE NAME STILL REACHES WHAT A "USING" IMPORTED. A leading '.' asks not to be
     // resolved against the ENCLOSING namespace; it does not ask to ignore the imports, because a
     // module-level "Using N" puts N's members into exactly the scope the dot names. fbc's own
