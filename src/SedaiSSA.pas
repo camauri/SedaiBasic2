@@ -374,6 +374,15 @@ type
     FRawPtrVars: TStringList;            // FreeBASIC raw pointers: var (UPPER) ever assigned from Allocate/CAllocate/
                                          // Reallocate. Its value is a RAWPTR_TAG byte offset → deref/arithmetic use the
                                          // raw byte heap (SizeOf-scaled), not the managed FArrays/record path.
+                                         // ⛔ FLAT, and it stays flat ON PURPOSE: it is the medium the fixpoint
+                                         // propagates through. The SCOPED answer lives beside it, below.
+    FRawPtrScoped: TStringList;          // ...the same fact WITH A SCOPE: "PROC|NAME" ('' = module level). DIVERGENZE 96.
+                                         // A "q" pointing at an @-taken local in one Sub used to mark the NAME, so every
+                                         // "q" in the program dereferenced raw - including a module one holding a handle.
+                                         // ⚠️ The pointer's VALUE was right; only the DEREF took the wrong mode.
+    FRawScanProc: string;                // the procedure CollectRawPtrVars is walking right now ('' = module level)
+    FRawScanning: Boolean;               // ...and whether that pre-scan is running: it reads the FLAT list, the LOWERING
+                                         // reads the scoped one. Two readers, two scopes, one predicate (IsRawPtr).
     FFixedLenVars: TStringList;          // fixed-length string vars (UPPER) -> capacity (DIM s AS STRING/WSTRING * n);
                                          // assignments truncate to the capacity (codepoints if also a WSTRING).
     FZStringVars: TStringList;           // "DIM z AS ZSTRING * n" (UPPER) -> max CHARACTERS (n-1): stores
@@ -582,7 +591,8 @@ type
     procedure EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
     function TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode; out Val: TSSAValue): Boolean;
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
-    procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode);   // raw-ness crosses the call here
+    procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);   // raw-ness crosses the call here
+    function RawPtrMarkedHere(const NameU: string): Boolean;       // ...is it raw in THIS scope? (DIVERGENZE 96)
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
     function ProcIsVariadic(const NameU: string): Boolean;                        // declared "(..., ...)"
     function ProcDeclaredParamCount(const NameU: string): Integer;
@@ -1646,6 +1656,8 @@ begin
   FVarPtrQuals := TStringList.Create;
   FVarPtrQuals.CaseSensitive := False;
   FRawPtrVars := TStringList.Create;
+  FRawPtrScoped := TStringList.Create;
+  FRawPtrScoped.CaseSensitive := False;
   FBlockManagedTypes := TStringList.Create;
   FConstStrBytes := TStringList.Create;
   FConstStrBytes.CaseSensitive := False;
@@ -1785,6 +1797,7 @@ begin
   FAddrLocalVars.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
+  FRawPtrScoped.Free;
   FBlockManagedTypes.Free;
   FConstDeclSeen.Free;
   FConstStrBytes.Free;
@@ -35793,13 +35806,60 @@ begin
   if idx >= 0 then Result := TypeNameToBank(FRefVars.ValueFromIndex[idx], Name);
 end;
 
+function TSSAGenerator.RawPtrMarkedHere(const NameU: string): Boolean;
+// Is THIS name raw IN THE SCOPE WE ARE STANDING IN? DIVERGENZE 96.
+//
+// ⛔⛔ It used to be one flat list of NAMES valid for the whole program, and that is a wrong ANSWER in
+// ordinary code: a "q" pointing at an @-taken local inside one Sub marked the NAME, so a module-level
+// "Dim q As String Ptr = @s" - a different variable, holding a managed handle - dereferenced as a byte
+// address and died on "Null or invalid raw pointer dereference". ⚠️ The pointer's VALUE was right; only
+// the DEREF took the wrong mode, which is why it looked like a pointer-typing defect and was not.
+// Sixth face of the family this project keeps meeting: a fact about a variable filed under its BARE
+// NAME (job/markdown/REGISTRI.md).
+//
+// Two readers, and they stand in different scopes:
+//   * the PRE-SCAN (FRawScanning) is propagating to a fixpoint; it asks about the scope it is walking,
+//     and falls back to the module's, which is what a procedure can see of one.
+//   * the LOWERING asks about FCurrentProcName - and there the VETO applies: a procedure that declares
+//     the name ITSELF is never talking about another procedure's variable, so a marking made elsewhere
+//     must not answer for it. Without the veto the module fallback would let the pollution back in.
+// ⛔ The flat list is NOT consulted here. It is kept because the fixpoint propagates through it, and
+// because it is the union of these entries by construction (two writers, both file both).
+var
+  Scope: string;
+begin
+  if FRawPtrScoped = nil then Exit(FRawPtrVars.IndexOf(NameU) >= 0);
+  if FRawScanning then Scope := FRawScanProc else Scope := FCurrentProcName;
+  Result := FRawPtrScoped.IndexOf(Scope + '|' + NameU) >= 0;
+  if Result then Exit;
+  if Scope = '' then
+  begin
+    if (GetEnvironmentVariable('RAWPTRDIAG') <> '') and (FRawPtrVars.IndexOf(NameU) >= 0) then
+      WriteLn(ErrOutput, 'RAWPTR miss  [module] ', NameU, '  (flat says raw, module scope does not)');
+    Exit;
+  end;
+  // Not marked here. A name the procedure declares itself is its own - answer NO, and do not look at
+  // the module. A name it does NOT declare may be the module's (a SHARED), so ask the module.
+  if (not FRawScanning) and (FCurrentProcDeclNames <> nil) and
+     (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then
+  begin
+    if (GetEnvironmentVariable('RAWPTRDIAG') <> '') and (FRawPtrVars.IndexOf(NameU) >= 0) then
+      WriteLn(ErrOutput, 'RAWPTR veto  [', Scope, '] ', NameU, '  (flat says raw, this proc declares it)');
+    Exit(False);
+  end;
+  Result := FRawPtrScoped.IndexOf('|' + NameU) >= 0;
+  if (not Result) and (GetEnvironmentVariable('RAWPTRDIAG') <> '') and
+     (FRawPtrVars.IndexOf(NameU) >= 0) then
+    WriteLn(ErrOutput, 'RAWPTR miss  [', Scope, '] ', NameU, '  (flat says raw, no scope does)');
+end;
+
 function TSSAGenerator.IsRawPtr(const Name: string): Boolean;
 // A pointer variable whose value is a raw byte-heap offset (it was assigned from Allocate/CAllocate/
 // Reallocate). Its deref and arithmetic use the raw heap (SizeOf-scaled), not the managed path.
 var
   Pointee: string;
 begin
-  Result := FRawPtrVars.IndexOf(UpperCase(Name)) >= 0;
+  Result := RawPtrMarkedHere(UpperCase(Name));
   if Result then Exit;
   // ...and a "T Ptr Ptr" PARAMETER is raw by construction. The managed model pairs a "T Ptr" with a
   // RECORD of type T; a "T Ptr Ptr" has no record to be a handle to, so its value can only be an
@@ -36696,16 +36756,31 @@ procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
 // pointer. Raw-ness then drives deref/arithmetic onto the byte heap regardless of statement order.
 var
   SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
+  SavedScanProc: string;   // DIVERGENZE 96: ...and the procedure scope, for the same reason
   i: Integer;
   Lhs, Rhs: TASTNode;
   LhsU, TU: string;
 
   procedure MarkRaw(const N: string);
+  // ⛔ TWO ENTRIES, ONE FACT. The flat one is what the fixpoint above propagates through ("p = q" asks
+  // whether q is raw while the walk is still going); the scoped one is what the LOWERING reads, so a
+  // "q" of one procedure stops ruling on the "q" of another. DIVERGENZE 96.
+  var
+    NU, K: string;
   begin
-    if FRawPtrVars.IndexOf(UpperCase(N)) < 0 then
+    NU := UpperCase(N);
+    if FRawPtrVars.IndexOf(NU) < 0 then
     begin
-      FRawPtrVars.Add(UpperCase(N));
+      FRawPtrVars.Add(NU);
       FRawCollectChanged := True;
+    end;
+    K := FRawScanProc + '|' + NU;
+    if FRawPtrScoped.IndexOf(K) < 0 then
+    begin
+      FRawPtrScoped.Add(K);
+      FRawCollectChanged := True;
+      if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+        WriteLn(ErrOutput, 'RAWPTR mark  [', FRawScanProc, '] ', NU);
     end;
   end;
 
@@ -36929,8 +37004,15 @@ begin
     PropagateRawArgs(VarToStr(Node.Value), Node.GetChild(0));
 
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
+  // ...and the children's PROCEDURE scope, DIVERGENZE 96 - the same shape, one question lower: what is
+  // raw HERE. Restored on the way out, so a nested declaration cannot leak its scope to its siblings.
+  SavedScanProc := FRawScanProc;
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+    FRawScanProc := UpperCase(VarToStr(Node.GetChild(0).Value));   // same spelling as FCurrentProcName
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
+  FRawScanProc := SavedScanProc;
   FTypeScopePath := SavedTypePath;
 end;
 
@@ -36950,7 +37032,7 @@ begin
   for i := 0 to ParamList.ChildCount - 1 do
   begin
     if i >= ArgListNode.ChildCount then Break;
-    MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i));
+    MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i), UpperCase(CalleeName));
   end;
 end;
 
@@ -36985,6 +37067,7 @@ procedure TSSAGenerator.CollectRawPtrRetFuncs(Node: TASTNode);
 // a function returning a raw LOCAL is caught once that local is marked raw.
 var
   SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
+  SavedScanProc: string;   // DIVERGENZE 96: ...and the procedure scope, for the same reason
   i: Integer;
   NameNode: TASTNode;
   Nm, RetT, Pointee: string;
@@ -37005,6 +37088,15 @@ var
 
 begin
   if Node = nil then Exit;
+  // ⛔⛔ THIS WALK ASKS "IS IT RAW" TOO, AND IT IS A SECOND WALK. "Return p" is a question about the
+  // procedure's OWN p, so the scope has to be set here as well - CollectRawPtrVars setting it is no
+  // help, this pass runs on its own pass over the AST. Left at module scope it asked the module about
+  // a name only the procedure has: every raw-returning FUNCTION stopped being recognised, and a var
+  // assigned from one lost its rawness (m372: "b[1]" read a float at byte offset 1). DIVERGENZE 96.
+  SavedScanProc := FRawScanProc;
+  if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+    FRawScanProc := UpperCase(VarToStr(Node.GetChild(0).Value));
   if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
      (Node.GetChild(0).NodeType = antIdentifier) and (Node.Attributes.Values['BYREFRET'] <> '1') then
   begin
@@ -37029,6 +37121,7 @@ begin
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrRetFuncs(Node.GetChild(i));
+  FRawScanProc := SavedScanProc;
   FTypeScopePath := SavedTypePath;
 end;
 
@@ -42288,7 +42381,7 @@ begin
                   MakeSSAValue(svkNone), MakeSSAConstInt(1));
 end;
 
-procedure TSSAGenerator.MarkRawPointerParam(ParamNode, ArgNode: TASTNode);
+procedure TSSAGenerator.MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);
 // A pointer PARAMETER is raw when the ARGUMENT passed to it is raw.
 //
 // What makes a pointer raw is not its type but where its VALUE came from -
@@ -42307,7 +42400,7 @@ procedure TSSAGenerator.MarkRawPointerParam(ParamNode, ArgNode: TASTNode);
 // looks equivalent and is not - a managed pointer to a scalar exists ("@x"), and
 // widening it that way broke ptr5_fieldptr, ptr6_subarg and two more.
 var
-  PT, Pointee, PN: string;
+  PT, Pointee, PN, K: string;
 begin
   if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
   PT := UpperCase(VarToStr(ParamNode.GetChild(0).Value));
@@ -42323,6 +42416,17 @@ begin
   begin
     FRawPtrVars.Add(PN);
     FRawCollectChanged := True;   // the fixpoint must run again: this can feed another call
+  end;
+  // ⛔ AND UNDER THE CALLEE'S SCOPE, not the caller's. This is the one marking made from OUTSIDE the
+  // procedure it is about: the walk is standing at the CALL, so FRawScanProc names the CALLER. Filing it
+  // there would tell the callee nothing and would make every same-named local of the caller raw.
+  K := CalleeU + '|' + PN;
+  if (CalleeU <> '') and (FRawPtrScoped.IndexOf(K) < 0) then
+  begin
+    FRawPtrScoped.Add(K);
+    FRawCollectChanged := True;
+    if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+      WriteLn(ErrOutput, 'RAWPTR param [', CalleeU, '] ', PN, '   <- from a raw argument');
   end;
 end;
 
@@ -42392,7 +42496,7 @@ begin
 
   // Raw-pointer PROVENANCE crosses the call here, and nowhere else.
   for i := 0 to NArgs - 1 do
-    MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i));
+    MarkRawPointerParam(ParamList.GetChild(i), ArgListNode.GetChild(i), UpperCase(ParamOwnerName));
 
   // ⭐ ...and so does the FUNCPTR SIGNATURE a parameter declares. "takeB( @fun )" against
   // "Sub takeB( ByVal p As Function(ByRef As B) As T )" tells @fun which overload it wants, exactly as
@@ -44935,6 +45039,7 @@ begin
   FRawModuleScalars.Clear;
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
+  FRawPtrScoped.Clear;    // beside FRawPtrVars: the same fact with the SCOPE it was learnt in
   FRawFromAddrOf.Clear;   // beside FRawPtrVars: it records WHY one of them is raw
   FWStringVars.Clear;
   FByrefRetFuncs.Clear;
@@ -44972,12 +45077,27 @@ begin
   // raw-returning function), and CollectRawPtrRetFuncs marks a "<scalar> PTR"-returning FUNCTION raw when a
   // Return expression is raw (Allocate / @field[i] / a raw var). The two feed each other (a function that
   // returns a raw local, and a var assigned from that function), so both run each round until stable.
+  // ⛔⛔ AND THE PROCEDURE TABLE HAS TO EXIST BEFORE THE FIXPOINT RUNS. PropagateRawArgs - the half
+  // that carries rawness from an argument into the callee's PARAMETER - opens with
+  // "FProcDecls.TryGetValue(CalleeName)", and FProcDecls was filled ninety lines BELOW this point.
+  // So that half never ran even once: every call exited on its first line, and what made a raw
+  // parameter work was the FLAT name list catching a same-named parameter of ANOTHER procedure.
+  // ⇒ bug_rawptr_param has three SUBs whose pointer parameter is called "p", and DrawLine's marking
+  // is what made PlotPixel's "p" raw. Scope the registry and that accident stops paying: the honest
+  // propagation has to be alive first. Idempotent, and the later call is left where it was.
+  PreCollectProcedures(AST);
   FRawPtrRetFuncs.Clear;
-  repeat
-    FRawCollectChanged := False;
-    CollectRawPtrVars(AST);
-    CollectRawPtrRetFuncs(AST);
-  until not FRawCollectChanged;
+  FRawScanProc := '';
+  FRawScanning := True;    // ...so IsRawPtr answers in the scope the WALK is in, not the one being lowered
+  try
+    repeat
+      FRawCollectChanged := False;
+      CollectRawPtrVars(AST);
+      CollectRawPtrRetFuncs(AST);
+    until not FRawCollectChanged;
+  finally
+    FRawScanning := False;
+  end;
   // FreeBASIC WSTRING: record vars/fields declared AS WSTRING so width-aware ops (LEN/MID/...) count by
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
   FBlockDeclVars.Clear;
@@ -45058,8 +45178,8 @@ begin
   FDataCount := 0;
   PreProcessData(AST);
 
-  // PRE-COLLECT SUB/FUNCTION DECLARATIONS so CALL sites can resolve parameter info even
-  // for procedures defined later in the source (forward references).
+  // (PreCollectProcedures already ran, above the raw-pointer fixpoint - see the note there. It is
+  // idempotent: CollectProcedureDecl exits on a name it has already registered.)
   {$IFDEF DEBUG_SSAPROF}Mark('collectors');{$ENDIF}
   PreCollectProcedures(AST);
   {$IFDEF DEBUG_SSAPROF}Mark('precollect-procs');{$ENDIF}
