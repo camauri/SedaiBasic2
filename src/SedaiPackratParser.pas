@@ -12241,6 +12241,9 @@ end;
 
 function TPackratParser.ParseDimStatement: TASTNode;
 var
+  StaticLB, StaticK: Integer;        // DIVERGENZE 94: the member array's lower bound, and the element index
+  StaticSawParen: Boolean;
+  StaticElem, StaticIdx, StaticAsg, InitList: TASTNode;
   NameIsConst: Boolean;   // "As Const <type>" on this declaration
   FixedCapVal: Int64;   // folded "* n" capacity
   Token, NameTok, TypeTok, SharedTypeTok: TLexerToken;
@@ -12551,9 +12554,75 @@ begin
         end;
         // "As <type>" (and any "* n" / PTR tail) belongs to the member's own declaration inside the
         // TYPE, not here: skip it to the end of the statement, then keep the initializer if there is one.
+        // ⭐ ...but REMEMBER THE LOWER BOUND while skipping. An ARRAY member's "(lb To ub)" is skipped
+        // with the rest, and the brace initializer below needs to know which element the first value
+        // belongs to. Only the two constant spellings are read - "(lb To ub)" and the bare "(n)", whose
+        // lower bound is 0 - and anything else leaves StaticLB at -1, which declines the brace path and
+        // keeps exactly the behaviour this branch had before.
+        StaticLB := 0;
+        StaticSawParen := False;
         while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and
               (not Context.Check(ttOpEq)) do
+        begin
+          if (not StaticSawParen) and Context.Check(ttDelimParOpen) then
+          begin
+            StaticSawParen := True;
+            if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttNumber) then
+            begin
+              // ⚠️ TO is lexed as ttLoopControl, not as an identifier - the rest of this file always
+              // pairs the two tests, and asking only for ttIdentifier made this decline every bound.
+              if Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttLoopControl) and
+                 (UpperCase(VarToStr(Context.PeekToken(2).Value)) = kTO) then
+                StaticLB := StrToIntDef(VarToStr(Context.PeekNext.Value), -1)
+              else if Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttDelimParClose) then
+                StaticLB := 0
+              else
+                StaticLB := -1;
+            end
+            else
+              StaticLB := -1;
+          end;
           Context.Advance;
+        end;
+        // ⛔⛔ A BRACE INITIALIZER IS NOT AN EXPRESSION, and this branch asked for one. "Dim T.arr(0 To 2)
+        // As Short = { 1, 2, 3 }" therefore fell past ParseExpression to "emit nothing at all" - and it
+        // threw away not only the values but the whole declaration, in silence: the member kept its
+        // zeroes while the SCALAR spelling beside it worked. DIVERGENZE 94.
+        // ⇒ The values become one assignment per element, which is the spelling that provably works
+        // ("T.arr(0) = 1" by hand always did). The array itself already exists - CollectStaticMembers
+        // built it with the TYPE - so nothing here declares anything.
+        if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
+           ((Context.PeekNext.TokenType = ttDelimBraceOpen) or
+            (Context.PeekNext.TokenType = ttOpGt)) and (StaticLB >= 0) then
+        begin
+          Context.Advance;                                  // '='
+          if Context.Check(ttOpGt) then Context.Advance;    // the "=>" spelling
+          if Context.Check(ttDelimBraceOpen) then
+          begin
+            InitList := TASTNode.Create(antArgumentList, NameTok);
+            SetLength(FInitLevelSizes, 0);
+            ParseArrayInitBraceGroup(InitList, ConstDimSizes(nil), 0);   // flat, row-major
+            StaticDef := TASTNode.Create(antBlock, NameTok);
+            for StaticK := 0 to InitList.ChildCount - 1 do
+            begin
+              StaticIdx := TASTNode.Create(antArgumentList, NameTok);
+              StaticIdx.AddChild(TASTNode.CreateWithValue(antLiteral, StaticLB + StaticK, NameTok));
+              StaticElem := TASTNode.Create(antArrayAccess, NameTok);
+              StaticElem.AddChild(MemberAccess.Clone);
+              StaticElem.AddChild(StaticIdx);
+              StaticAsg := TASTNode.Create(antAssignment, NameTok);
+              StaticAsg.AddChild(StaticElem);
+              StaticAsg.AddChild(InitList.GetChild(StaticK).Clone);
+              StaticDef.AddChild(StaticAsg);
+            end;
+            InitList.Free;
+            MemberAccess.Free;
+            Result.Free;
+            Result := StaticDef;
+            DoNodeCreated(Result);
+            Exit;
+          end;
+        end;
         if Context.Check(ttOpEq) then
         begin
           Context.Advance;                     // '='
