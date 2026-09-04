@@ -552,6 +552,7 @@ type
     // proc-root for non-shared names) then falls back to the module namespace (FVarMap). BindOrResolve
     // resolves a use, or binds a new register: explicit DIM in the innermost frame (shadowing), implicit
     // first-use at the nearest proc-root/module. DeclareVariable is the explicit-declaration entry point.
+    function VarIsBound(const VarName: string): Boolean;   // ...bound HERE and now, asked WITHOUT binding
     function ResolveExisting(const VarName: string; out Reg: TSSAValue;
       ModuleOnly: Boolean = False): Boolean;
     function BindOrResolve(const VarName: string; IsExplicitDecl: Boolean;
@@ -1864,6 +1865,27 @@ begin
   end;
 end;
 
+function TSSAGenerator.VarIsBound(const VarName: string): Boolean;
+// Is this name bound to a register HERE, right now? A pure question: unlike GetOrAllocateVariable it
+// never binds, and that difference is the whole point of its existence.
+//
+// ⛔⛔ GetOrAllocateVariable IS "resolve OR BIND", and a cleanup path that asks it about a name whose
+// DIM has not been lowered yet does not get an answer - it gets a NEW BINDING. Reported by a user on
+// 4 Sep 2026 (a 256-bit float engine): an "Exit Sub" written ABOVE a local UDT's Dim made every later
+// use of that local fault. EmitFrameDestructors enumerates FCurrentProcLocalRecs, which a PRE-SCAN
+// filled with the whole procedure's records, so at the early exit it asked about a variable that does
+// not exist yet; the phantom binding went into the proc-root frame, the real Dim APPENDED a second one
+// behind it, and ResolveExisting - a first-match IndexOf - answered the phantom ever after.
+// ⇒ "RecordNew R3" with every reader on "R5", and R5 never written. The early exit was not even TAKEN.
+// ⚠️ And a type with NO destructor was enough: the argument is evaluated before EmitDestructorCall can
+// decide it has nothing to emit, so the binding happened while zero instructions were produced.
+var
+  Dummy: TSSAValue;
+begin
+  if not FModernMode then Exit(FVarMap.IndexOf(VarName) >= 0);
+  Result := ResolveExisting(VarName, Dummy, False);
+end;
+
 function TSSAGenerator.ResolveExisting(const VarName: string; out Reg: TSSAValue;
   ModuleOnly: Boolean): Boolean;
 // FB lexical scope (MODERN): find an existing binding for VarName. Walk the scope stack
@@ -1953,7 +1975,13 @@ var
 begin
   // A use, or an explicit declaration at module level, first tries to resolve an existing binding.
   if (not IsExplicitDecl) or (Length(FScopeStack) = 0) or ModuleOnly then
-    if ResolveExisting(VarName, Result, ModuleOnly) then Exit;
+    if ResolveExisting(VarName, Result, ModuleOnly) then
+    begin
+      if GetEnvironmentVariable('SCOPEDIAG') <> '' then
+        WriteLn(ErrOutput, 'SCOPE resolve ', VarName, ' -> R', Result.RegIndex,
+                ' depth=', Length(FScopeStack));
+      Exit;
+    end;
   nameU := UpperCase(VarName);
   // Choose the binding frame: explicit DIM -> innermost frame; implicit -> nearest proc-root (else module).
   // ⛔ ...unless a LEADING DOT asked for the module namespace: ".x" cannot mean a local, so a first use
@@ -1974,6 +2002,9 @@ begin
   RegIndex := FProgram.AllocRegister(RegType);
   pk := (Ord(RegType) shl 16) or RegIndex;
 
+  if GetEnvironmentVariable('SCOPEDIAG') <> '' then
+    WriteLn(ErrOutput, 'SCOPE bind    ', VarName, ' -> R', RegIndex,
+            ' decl=', Ord(IsExplicitDecl), ' depth=', Length(FScopeStack), ' target=', targetIdx);
   if targetIdx >= 0 then
   begin
     FScopeStack[targetIdx].Bindings.AddObject(nameU, TObject(pk));
@@ -32813,6 +32844,17 @@ begin
       // exclusion is what stops it being destructed twice.
       if (not FModernMode) and
          (FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, VName)) >= 0) then Continue;
+      // ⛔⛔ NOT YET DECLARED AT THIS POINT, SO THERE IS NOTHING TO DESTROY. This list comes from a
+      // PRE-SCAN of the whole procedure, so on an EARLY frame exit it names locals whose Dim is still
+      // BELOW us. Destroying one is meaningless - and, far worse, ASKING for it used to CREATE it: see
+      // the note at VarIsBound. A user's program faulted on a local declared after an "Exit Sub" that
+      // was never even taken.
+      // ⚠️ SCALARS ONLY, and the boundary is not cosmetic. The hazard is the SCALAR branch of
+      // EmitRecordVarDestruction, which is the one that calls GetOrAllocateVariable; an ARRAY of
+      // records is reached through its array slot and is never a scope binding, so asking this about
+      // one answers "not bound" for a perfectly live array and SILENTLY DROPS its destructors -
+      // measured, m642 and m685 lost half of theirs, which is a LEAK, not a crash.
+      if (not IsArr) and (not VarIsBound(VName)) then Continue;
       EmitRecordVarDestruction(VName, TName, IsArr);
     end;
   if (FCurrentProcByvalRecs <> nil) then
