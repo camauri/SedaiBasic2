@@ -10581,10 +10581,16 @@ begin
   // element 0 of its array, an @-taken local through its per-frame record. Writing the variable's own
   // register - what the tail of this routine does - would leave both of them untouched, which is the
   // trap m617 had just been through with the MID statement.
-  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) then
+  // ⛔ ...and it must LET THROUGH what it does not handle, never Exit. This branch answers only the
+  // PADDED kind ("String * n"); a SHARED "ZString/WString * n" is the TRUNCATED kind and its arm is
+  // further down - but the early Exit here meant it never got there, so a shared Z/WString kept every
+  // character of an over-long value ("abcdefghij" into a "ZString * 4" stayed ten where fbc leaves
+  // three) while the identical LOCAL was right. Falling through costs nothing and is what "this branch
+  // is not about you" means.
+  if IsSharedScalar(VarName) and not IsRawModuleScalar(VarName) and
+     (VarRecordTypeName(VarName) = '') and (StrCapOf(FFixedLenVars, VarName, 0) > 0) then
   begin
     FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
-    if (FixedCap <= 0) or (VarRecordTypeName(VarName) <> '') then Exit;
     ProcessStringExpression(ExprNode, ExprValue);
     EmitSharedScalarStoreVal(VarName,
       EmitFixedLenPad(EnsureStringRegister(ExprValue), FixedCap, IsWStringVar(VarName)));
@@ -10641,7 +10647,13 @@ begin
       EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
                       EnsureStringRegister(FixedTrunc), MakeSSAConstInt(Ord(IsWStringVar(VarName))))
     else
+    begin
       EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), FixedTrunc, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // ⭐ ...and a SHARED one is read from element 0 of its backing array, not from the register.
+      // The value in the register with the readers at the home is the shape this file records four
+      // times over (DIVERGENZE 80, 92, 49): PublishScalarToHome is the one place that knows the homes.
+      PublishScalarToHome(VarName, FixedTrunc);
+    end;
     Exit(True);
   end;
   FixedCap := StrCapOf(FFixedLenVars, VarName, 0);
@@ -12134,7 +12146,15 @@ begin
           // on one of them. DIVERGENZE 80.
           // ⚠️ TryAllocAssign publishes to the shared cell itself (it asks IsSharedScalar), so there
           // is nothing to do here when it fires - and it fires for the RAW case too, correctly.
-          if not TryAllocAssign(UpperCase(ArrName), ArrayDeclNode.GetChild(2)) then
+          // ⛔⛔ ...AND THE SAME BYPASS COSTS A SECOND CONVERSION, for the same reason and in the same
+          // shape: the TRUNCATION of a "String/ZString/WString * n" to its declared capacity lives in
+          // TryFixedLenStore, also on the assignment path. "Dim Shared As String * 3 s = "abcdefghij""
+          // kept all ten characters where fbc keeps three - and the identical program written as a
+          // LOCAL Dim, or with the assignment on the next line, was right, which is the same tell that
+          // named DIVERGENZE 80. ⇒ Every conversion the assignment path performs has to be offered
+          // here; there are now two, and the next one added there belongs here as well.
+          if (not TryAllocAssign(UpperCase(ArrName), ArrayDeclNode.GetChild(2))) and
+             (not TryFixedLenStore(UpperCase(ArrName), ArrayDeclNode.GetChild(2))) then
           begin
             InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
             InitAssign.AddChild(MakeSharedScalarAccess(UpperCase(ArrName), ArrayDeclNode.GetChild(0).Token));
