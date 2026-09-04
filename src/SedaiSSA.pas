@@ -10102,6 +10102,23 @@ begin
     VarName := VarToStr(VarNode.GetChild(0).Value);
     VarReg := EmitPointerIndexAddress(VarName, VarNode.GetChild(1));
     ProcessExpression(ExprNode, ExprValue);
+    // ⛔ A STRING WRITTEN THROUGH A ZSTRING/WSTRING POINTER IS TEXT AT AN ADDRESS - characters plus a
+    // terminator, in the pointee's own units - and this rung was the ONE spelling that did not say so.
+    // The deref spelling has had the rule since DIVERGENZE 127 and the (*p)[i] one has it too; the
+    // INDEX spelling fell to the scalar store, which put VAL of the text (0) in one byte and TRUNCATED
+    // the buffer there - a "hello world" buffer became "hell", in SILENCE, where fbc writes "hellZZ".
+    // ⭐ A NUMERIC value stays ONE CHARACTER and terminates nothing (the manual's own idiom, a
+    // character code assigned through the pointer), which is the other half of the same rule and the
+    // reason the test is on the VALUE and not on the pointee type alone.
+    RawFieldPointee := UpperCase(PointeeTypeOf(VarName));
+    if ((RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING')) and
+       ((ExprValue.Kind = svkConstString) or
+        ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString))) then
+    begin
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(RawFieldPointee)));
+      Exit;
+    end;
     if PointeeBankOf(VarName) = srtFloat then
     begin
       ExprValue := EnsureFloatRegister(ExprValue);
