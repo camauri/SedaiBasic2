@@ -81,6 +81,20 @@ type
 
   TInt64Array = array of Int64;   // byte offsets of a UDT's fields in its C layout (UDTCLayout)
 
+  { The state of a RUN of bit fields while a type is being laid out. One run = one storage unit; the
+    members of the run share its bytes and each takes its own bits inside it. Carried by the caller so
+    that the FOUR walks that lay a UDT out (the live image, the two C layouts, and the nested-block
+    paths inside them) all ask ONE routine - PlaceBitField - where the unit goes.
+    ⛔ A run never crosses a UNION or a nested-Type boundary, and never survives a non-bit member:
+    the caller closes it by clearing Open. }
+  TBitRunState = record
+    Open: Boolean;
+    UnitOfs: Int64;      // first byte of the storage unit
+    UnitSize: Int64;     // how many bytes it is (1, 2, 4 or 8)
+    CapBits: Integer;    // UnitSize * 8 - what still has to fit for a member to JOIN the run
+    Used: Integer;       // bits already taken inside it, counted from the unit's first byte
+  end;
+
   { UDT/record type info (M3). Each field maps to a (bank, slot) within the record block. }
   TUDTField = record
     Name: string;
@@ -981,7 +995,9 @@ type
     procedure UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);  // what fbc SAYS a field measures
     function UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64;
                        ReportOnly: Boolean = False): Boolean;  // fbc's C layout of a UDT
-    procedure AssignBitFieldRuns(UDTIdx: Integer);   // pack a run of "name : n As T" members into one unit
+    procedure PlaceBitField(UDTIdx, FieldIdx: Integer; var Run: TBitRunState; CurOfs: Int64;
+                            out UnitOfs, UnitSize, AlignContrib: Int64;
+                            out BitOfs: Integer; out Continues: Boolean);
     function UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;   // a field's index in its type
     function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
     function EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
@@ -23757,10 +23773,14 @@ function TSSAGenerator.UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; 
 // and the whole point of "sig(0 To 5) As UByte" over a file header. UDTCLayout itself stays strict: it
 // serves binary GET/PUT, where an array member is a separate transfer and must not silently change shape.
 var
-  i, k, n, GrpCur: Integer;
-  Sz, Al, MaxAl, Ofs, Cnt, EB, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
+  i, k, n, GrpCur, RunU, RunS, BitOfs: Integer;
+  Sz, Al, MaxAl, Ofs, Cnt, EB, GrpBase, GrpMax, GrpAl, Sz2, Al2, UOfs, USize, AContrib: Int64;
   SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
+  Run: TBitRunState;
+  IsBit, BitCont: Boolean;
 begin
+  Run.Open := False; RunU := 0; RunS := 0;
+  UOfs := 0; USize := 0; AContrib := 1; BitOfs := 0; BitCont := False;
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
   // ⛔ ...AND THE ANONYMOUS-STRUCT PAIR, which two of the three layout routines did NOT initialise:
@@ -23778,20 +23798,19 @@ begin
   MaxAl := 1; Ofs := 0;
   for i := 0 to n - 1 do
   begin
-    // ⭐ A BIT-FIELD CONTINUATION SHARES THE UNIT BEFORE IT: same offset, and it advances nothing - and
-    // it contributes NO ALIGNMENT of its own, which is why the test stands before the shape work and
-    // not after it. Put after, a "Boolean b:1, Integer i:1" pair still rounded the type up to EIGHT
-    // bytes: the continuation was not given a slot but its alignment was still counted.
-    // AssignBitFieldRuns marks these members; the LIVE layout has honoured the mark from the start and
-    // these two C routines never did, so SizeOf and OffsetOf answered as if every bit member had a unit
-    // of its own ("Short a:3, Short b:8" said 4 where fbc says 2).
-    // ⛔ THE THIRD TIME a UDT rule lived in one of the three layout routines and was missing from the
-    // others; UDT_DIAG=1 had been printing the disagreement all along ("SIZE DISAGREES ... C=4 live=2").
-    if (i > 0) and FUDTs[UDTIdx].Fields[i].BitContinues then
+    // ⛔ A BIT FIELD IS PLACED BY PlaceBitField AND BY NOTHING ELSE - and it contributes the alignment
+    // the UNIT adds, not its declared type's, which is why the run state is kept here rather than read
+    // off a mark left by another walk (this one lays a fixed scalar array member INLINE, so its offsets
+    // are not the live image's and neither is the answer to "does this member still fit").
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> RunU) or
+       (FUDTs[UDTIdx].Fields[i].StructGroup <> RunS) then
     begin
-      Offsets[i] := Offsets[i - 1];
-      Continue;
+      RunU := FUDTs[UDTIdx].Fields[i].UnionGroup;
+      RunS := FUDTs[UDTIdx].Fields[i].StructGroup;
+      Run.Open := False;
     end;
+    IsBit := FUDTs[UDTIdx].Fields[i].BitWidth > 0;
+    if not IsBit then Run.Open := False;
     if FUDTs[UDTIdx].Fields[i].IsArray then
     begin
       if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB) then Exit;
@@ -23806,7 +23825,7 @@ begin
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
-    if Al > MaxAl then MaxAl := Al;
+    if (not IsBit) and (Al > MaxAl) then MaxAl := Al;
     // A nested "Union ... End Union" block: its members all start where the BLOCK starts and it is as
     // wide as its widest member. ⛔ THREE layout routines say this, not one - UDTCLayoutRaw,
     // UDTCLayout and ComputeUDTLiveLayout. Fixing only the live one made the members ALIAS correctly
@@ -23847,6 +23866,12 @@ begin
       begin
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
         begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize; Al := 1; SGrpOfs := UOfs;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         Offsets[i] := GrpBase + SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
@@ -23855,6 +23880,12 @@ begin
       else
       begin
         SGrpCur := 0;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, 0, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         Offsets[i] := GrpBase;
         if Sz > GrpMax then GrpMax := Sz;
       end;
@@ -23862,6 +23893,12 @@ begin
     else
     begin
       if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;
+      if IsBit then
+      begin
+        PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
+        Sz := USize; Al := 1; Ofs := UOfs;
+        if AContrib > MaxAl then MaxAl := AContrib;
+      end;
       if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
       Offsets[i] := Ofs;
       Ofs := Ofs + Sz;
@@ -25386,10 +25423,14 @@ function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out
 // Returns False when the type has a shape whose image we cannot reproduce (a variable-length string,
 // an array or nested-record member): those hold a pointer/descriptor in C, not the data.
 var
-  i, k, n, GrpCur: Integer;
-  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2: Int64;
+  i, k, n, GrpCur, RunU, RunS, BitOfs: Integer;
+  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, UOfs, USize, AContrib: Int64;
   SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
+  Run: TBitRunState;
+  IsBit, BitCont: Boolean;
 begin
+  Run.Open := False; RunU := 0; RunS := 0;
+  UOfs := 0; USize := 0; AContrib := 1; BitOfs := 0; BitCont := False;
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
   // ⛔ ...AND THE ANONYMOUS-STRUCT PAIR, which two of the three layout routines did NOT initialise:
@@ -25407,13 +25448,20 @@ begin
   MaxAl := 1; Ofs := 0;
   for i := 0 to n - 1 do
   begin
-    // A BIT-FIELD CONTINUATION shares the unit before it and contributes no alignment - the same guard
-    // UDTCLayoutRaw carries, and in the same position, before the shape work.
-    if (i > 0) and FUDTs[UDTIdx].Fields[i].BitContinues then
+    // ⛔ A BIT FIELD IS PLACED BY PlaceBitField AND BY NOTHING ELSE - the run state is kept here, and
+    // it closes at a union or nested-Type boundary and at any member that is not a bit field.
+    // ⚠️ The run is re-derived rather than read off BitContinues: this walk's field SIZES are not the
+    // live image's (a fixed array member is inline here and a handle there), so its offsets differ, and
+    // whether a member still FITS in the open unit is a question about THIS walk's offsets.
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> RunU) or
+       (FUDTs[UDTIdx].Fields[i].StructGroup <> RunS) then
     begin
-      Offsets[i] := Offsets[i - 1];
-      Continue;
+      RunU := FUDTs[UDTIdx].Fields[i].UnionGroup;
+      RunS := FUDTs[UDTIdx].Fields[i].StructGroup;
+      Run.Open := False;
     end;
+    IsBit := FUDTs[UDTIdx].Fields[i].BitWidth > 0;
+    if not IsBit then Run.Open := False;
     // ...and the ARRAY exclusion is now narrower: a FIXED-length array of scalars is reproducible
     // (see UDTFieldCShape), so only a dynamic one - or an array of records/pointers - still declines.
     with FUDTs[UDTIdx].Fields[i] do
@@ -25424,7 +25472,7 @@ begin
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
-    if Al > MaxAl then MaxAl := Al;
+    if (not IsBit) and (Al > MaxAl) then MaxAl := Al;
     // A nested "Union ... End Union" block: its members all start where the BLOCK starts and it is as
     // wide as its widest member. ⛔ THREE layout routines say this, not one - UDTCLayoutRaw,
     // UDTCLayout and ComputeUDTLiveLayout. Fixing only the live one made the members ALIAS correctly
@@ -25465,6 +25513,12 @@ begin
       begin
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
         begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize; Al := 1; SGrpOfs := UOfs;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         Offsets[i] := GrpBase + SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
@@ -25473,6 +25527,12 @@ begin
       else
       begin
         SGrpCur := 0;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, 0, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         Offsets[i] := GrpBase;
         if Sz > GrpMax then GrpMax := Sz;
       end;
@@ -25480,6 +25540,12 @@ begin
     else
     begin
       if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;
+      if IsBit then
+      begin
+        PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
+        Sz := USize; Al := 1; Ofs := UOfs;
+        if AContrib > MaxAl then MaxAl := AContrib;
+      end;
       if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
       Offsets[i] := Ofs;
       Ofs := Ofs + Sz;
@@ -25520,8 +25586,9 @@ var
   BaseNode, IdxList: TASTNode;
   PtrName, RecType: string;
   ArrIdx, W, Bank, NIdx, WIdx, UIdx: Integer;
-  ElemSize, TotalSz, Cur, PadTo: Int64;
+  ElemSize, TotalSz, Cur, PadTo, BitShift: Int64;
   AddrVal, CntVal, BytesReg, ElemReg, RecHandle, FieldReg: TSSAValue;
+  ShiftReg, MaskReg, KeptReg, HiReg, OldUnit: TSSAValue;
   Offsets: TInt64Array;
   Op: TSSAOpCode;
 begin
@@ -25577,6 +25644,20 @@ begin
                           MakeSSAConstInt(Offsets[NIdx] - Cur));
           Cur := Offsets[NIdx];
         end;
+        // ⛔⛔ A BIT FIELD IS NOT A FIELD ON THE WIRE - ITS UNIT IS, and several members share it. It
+        // can also START BEFORE the bytes already written, because a unit opened part-way through an
+        // alignment window overlaps the members in front of it. So what this member still owes the
+        // file is the part of its unit that lies past Cur; the low bytes went out with the fields
+        // that own them, and a member wholly inside a unit already written owes nothing at all.
+        // ⚠️ Without this a whole-record PUT wrote every bit member at its DECLARED width: the type
+        // in DIVERGENZE 100 came out 21 bytes where fbc writes 16.
+        BitShift := 0;
+        if FUDTs[UIdx].Fields[NIdx].BitWidth > 0 then
+        begin
+          ElemSize := Offsets[NIdx] + FUDTs[UIdx].Fields[NIdx].ByteSize - Cur;
+          if ElemSize <= 0 then Continue;
+          BitShift := (Cur - Offsets[NIdx]) * 8;
+        end;
         case FUDTs[UIdx].Fields[NIdx].Bank of
           srtFloat:  FieldReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
           srtString: FieldReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
@@ -25588,6 +25669,26 @@ begin
             srtFloat:  EmitInstruction(ssaGetBinFloat, FieldReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(ElemSize));
             srtString: EmitInstruction(ssaGetBinStr, FieldReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(ElemSize));
           else         EmitInstruction(ssaGetBinInt, FieldReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(ElemSize));
+          end;
+          // The unit's low bytes were read by the members that own them and are already in the
+          // record: shift what we just read into place and keep them.
+          if BitShift > 0 then
+          begin
+            ShiftReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, ShiftReg, MakeSSAConstInt(BitShift),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            HiReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaShl, HiReg, FieldReg, ShiftReg, MakeSSAValue(svkNone));
+            OldUnit := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRecordLoadInt, OldUnit, RecHandle, MakeSSAValue(svkNone),
+                            MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+            MaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, MaskReg, MakeSSAConstInt((Int64(1) shl BitShift) - 1),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            KeptReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseAnd, KeptReg, OldUnit, MaskReg, MakeSSAValue(svkNone));
+            FieldReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseOr, FieldReg, HiReg, KeptReg, MakeSSAValue(svkNone));
           end;
           case FUDTs[UIdx].Fields[NIdx].Bank of
             srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), RecHandle, FieldReg,
@@ -25607,6 +25708,15 @@ begin
                                        MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
           else         EmitInstruction(ssaRecordLoadInt, FieldReg, RecHandle, MakeSSAValue(svkNone),
                                        MakeSSAConstInt(FUDTs[UIdx].Fields[NIdx].Slot));
+          end;
+          if BitShift > 0 then
+          begin
+            ShiftReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, ShiftReg, MakeSSAConstInt(BitShift),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            HiReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaShr, HiReg, FieldReg, ShiftReg, MakeSSAValue(svkNone));
+            FieldReg := HiReg;
           end;
           case FUDTs[UIdx].Fields[NIdx].Bank of
             srtFloat:  EmitInstruction(ssaPutBinFloat, MakeSSAValue(svkNone), HandleReg, FieldReg, MakeSSAConstInt(ElemSize));
@@ -28329,59 +28439,85 @@ begin
   Result := Res;
 end;
 
-procedure TSSAGenerator.AssignBitFieldRuns(UDTIdx: Integer);
-// FreeBASIC BIT FIELDS: a run of consecutive "name : n As T" members shares ONE storage unit of type T.
-// Each member gets its BitOffset within that unit; a new unit starts when the next member would not fit,
-// or when the declared type changes, or at any non-bit member. C's rule, and fbc's.
+procedure TSSAGenerator.PlaceBitField(UDTIdx, FieldIdx: Integer; var Run: TBitRunState;
+                                      CurOfs: Int64; out UnitOfs, UnitSize, AlignContrib: Int64;
+                                      out BitOfs: Integer; out Continues: Boolean);
+// WHERE ONE BIT FIELD GOES, and the only place that knows. A run of "name : n As T" members shares ONE
+// storage unit; each member gets its own bits inside it. The caller passes the running byte offset and
+// gets back the unit (offset and size), this member's bit offset inside it, whether it JOINED the unit
+// before it, and how much ALIGNMENT the unit adds to the type. When Continues is False the caller places
+// the member at UnitOfs and advances its running offset to UnitOfs + UnitSize; when it is True nothing
+// moves - the unit is already paid for.
 //
-// Marks continuation members with ByteSize = -1 so the layout below can recognise them without
-// re-deriving the runs: they take the unit's own offset and advance nothing.
+// ⭐⭐ THE RULE IS MEASURED AGAINST fbc, NOT DEDUCED (80+ probes, 4 Sep 2026), and it is NOT C's:
+//
+//   1. A member JOINS the open unit when its bits still fit in it. The UNIT'S capacity decides, never
+//      this member's declared type - "UByte b1:3, ULong b2:5" is ONE byte in fbc, the ULong joins the
+//      byte-wide unit because five bits still fit.
+//   2. A new unit opened at an offset that is ALREADY aligned takes the full declared type: [Ofs, Ofs+B).
+//   3. A new unit opened MID-WAY through an alignment window takes THE REST OF THAT WINDOW and starts
+//      counting its bits at the byte the run began on: "a As UByte" then "As ULong b:3" puts b at bit 8
+//      of the ULong at offset 0, and the next ordinary field lands at 4 - not at 8, which is what we
+//      answered before, and not at 2, which is what C answers.
+//   4. ...unless the member does not FIT in what is left of that window, in which case the next window
+//      opens a full unit ("a As UByte" then "As ULong b:25" - 8+25 > 32 - starts at 4).
+//   5. THE ALIGNMENT A UNIT ADDS IS THE NUMBER OF BYTES IT ADDS, not the type's: one byte adds 1, two
+//      add 2, and three or more add the declared type's own. That is what makes SizeOf go DOWN when a
+//      leading byte is added - "UByte, ULong b:3, UByte" is 8 bytes and "UByte, UByte, ULong b:3,
+//      UByte" is 6 - which no rule read out of C would have predicted.
+//
+// ⚠️ The unit is always a power of two bytes at a multiple of its own size, so the shift-and-mask
+// accessors keep reading it with an ordinary field load and it can never reach past the record.
 var
-  i, UnitBits, Used, UnitW, UGrp, SGrp: Integer;
-  Sz, Al: Int64;
+  Sz, Al, B, A, R: Int64;
+  W: Integer;
 begin
-  UnitBits := 0; Used := 0; UnitW := -1; UGrp := 0; SGrp := 0;
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
-    FUDTs[UDTIdx].Fields[i].BitContinues := False;
-  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  W := FUDTs[UDTIdx].Fields[FieldIdx].BitWidth;
+  UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  B := Sz;
+  if B < 1 then B := 1;
+  if B > 8 then B := 8;
+  A := B;
+  if (FUDTs[UDTIdx].FieldAlign > 0) and (A > FUDTs[UDTIdx].FieldAlign) then A := FUDTs[UDTIdx].FieldAlign;
+  if A < 1 then A := 1;
+
+  // (1) JOIN the open unit.
+  if Run.Open and (Run.Used + W <= Run.CapBits) then
   begin
-    // ⛔ A RUN NEVER CROSSES A UNION OR A NESTED-TYPE BOUNDARY. The alternatives of a union OVERLAP, so
-    // the second run must start its own unit at bit 0 - fbc's own boolean/boolean_bitfield declares two
-    // anonymous Type blocks of four one-bit members over the same UByte, and merged into one unit the
-    // second block's members read bits 4..7 of the first: 100 assertions instead of 68.
-    // ⚠️ Found only after the unit rule stopped keying on the declared TYPE, which had been hiding it.
-    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> UGrp) or (FUDTs[UDTIdx].Fields[i].StructGroup <> SGrp) then
-    begin
-      UGrp := FUDTs[UDTIdx].Fields[i].UnionGroup;
-      SGrp := FUDTs[UDTIdx].Fields[i].StructGroup;
-      UnitBits := 0; Used := 0; UnitW := -1;
-    end;
-    if FUDTs[UDTIdx].Fields[i].BitWidth <= 0 then
-    begin
-      UnitBits := 0; Used := 0; UnitW := -1;
-      Continue;
-    end;
-    UDTFieldCShape(UDTIdx, i, Sz, Al);
-    // ⛔ THE UNIT'S WIDTH IS THE FIRST MEMBER'S, and a later bit member of ANOTHER declared type still
-    // joins it as long as the bits fit. Opening a new unit on a type change is C's textbook rule and it
-    // is NOT what fbc does - measured 25 Aug 2026: "Short a:3, Integer b:8" is TWO bytes there (and was
-    // ten here), "Integer a:8, Short b:3" is eight. Only "the bits do not fit" opens a unit.
-    if (UnitW < 0) or (Used + FUDTs[UDTIdx].Fields[i].BitWidth > UnitBits) then
-    begin
-      // A new storage unit: this member starts it, and the layout treats it as an ordinary field.
-      UnitW := FUDTs[UDTIdx].Fields[i].WidthCode;
-      UnitBits := Integer(Sz) * 8;
-      Used := 0;
-      FUDTs[UDTIdx].Fields[i].BitOffset := 0;
-    end
-    else
-    begin
-      FUDTs[UDTIdx].Fields[i].BitOffset := Used;
-      FUDTs[UDTIdx].Fields[i].ByteSize := -1;        // continuation: shares the unit before it
-      FUDTs[UDTIdx].Fields[i].BitContinues := True;  // ...and this mark SURVIVES the live layout
-    end;
-    Inc(Used, FUDTs[UDTIdx].Fields[i].BitWidth);
+    UnitOfs := Run.UnitOfs; UnitSize := Run.UnitSize;
+    BitOfs := Run.Used;
+    Inc(Run.Used, W);
+    Continues := True;
+    AlignContrib := 1;                 // the unit was counted when it opened
+    Exit;
   end;
+
+  // (2) Open a new one.
+  R := CurOfs mod A;
+  if (R <> 0) and (W <= (A - R) * 8) then
+  begin
+    UnitOfs := CurOfs - R;             // the rest of the window we are standing in
+    UnitSize := A;
+    Run.Used := Integer(R) * 8;        // the bytes before us in this window are somebody else's
+  end
+  else
+  begin
+    if R <> 0 then CurOfs := CurOfs + (A - R);
+    UnitOfs := CurOfs;
+    UnitSize := B;
+    Run.Used := 0;
+  end;
+  AlignContrib := UnitOfs + UnitSize - CurOfs;   // the bytes this unit ADDS - see rule 5
+  if AlignContrib > 2 then AlignContrib := B;
+  if AlignContrib > A then AlignContrib := A;
+  if AlignContrib < 1 then AlignContrib := 1;
+  BitOfs := Run.Used;
+  Inc(Run.Used, W);
+  Run.Open := True;
+  Run.UnitOfs := UnitOfs;
+  Run.UnitSize := UnitSize;
+  Run.CapBits := Integer(UnitSize) * 8;
+  Continues := False;
 end;
 
 procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
@@ -28412,8 +28548,10 @@ procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
   record with an array member still cannot be PUT to a file byte-faithfully, and closing that is
   its own piece of work. }
 var
-  i, k, n, WireW, GrpCur, SGrpCur: Integer;
-  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, SGrpOfs: Int64;
+  i, k, n, WireW, GrpCur, SGrpCur, RunU, RunS, BitOfs: Integer;
+  Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, SGrpOfs, UOfs, USize, AContrib: Int64;
+  Run: TBitRunState;
+  IsBit, BitCont: Boolean;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   n := Length(FUDTs[UDTIdx].Fields);
@@ -28422,24 +28560,32 @@ begin
   MaxAl := 1; Ofs := 0;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1;
   SGrpCur := 0; SGrpOfs := 0;
-  AssignBitFieldRuns(UDTIdx);           // marks the continuation members with ByteSize = -1
+  Run.Open := False; RunU := 0; RunS := 0;
+  UOfs := 0; USize := 0; AContrib := 1; BitOfs := 0; BitCont := False;
   for i := 0 to n - 1 do
   begin
-    // A BIT FIELD that continues the unit before it takes that unit's offset, width code and slot, and
-    // advances nothing: there is one piece of storage and several names for parts of it.
-    if (i > 0) and (FUDTs[UDTIdx].Fields[i].BitWidth > 0) and (FUDTs[UDTIdx].Fields[i].ByteSize = -1) then
+    // ⛔ A RUN OF BIT FIELDS NEVER CROSSES A UNION OR A NESTED-TYPE BOUNDARY, and never survives a
+    // member that is not one: the alternatives of a union OVERLAP, so a second block's members must
+    // start their own unit. fbc's own boolean/boolean_bitfield declares two anonymous Type blocks of
+    // four one-bit members over the same UByte, and merged into one unit the second block's members
+    // read bits 4..7 of the first.
+    if (FUDTs[UDTIdx].Fields[i].UnionGroup <> RunU) or
+       (FUDTs[UDTIdx].Fields[i].StructGroup <> RunS) then
     begin
-      FUDTs[UDTIdx].Fields[i].ByteOffset := FUDTs[UDTIdx].Fields[i - 1].ByteOffset;
-      FUDTs[UDTIdx].Fields[i].ByteSize := FUDTs[UDTIdx].Fields[i - 1].ByteSize;
-      FUDTs[UDTIdx].Fields[i].Slot := FUDTs[UDTIdx].Fields[i - 1].Slot;
-      Continue;
+      RunU := FUDTs[UDTIdx].Fields[i].UnionGroup;
+      RunS := FUDTs[UDTIdx].Fields[i].StructGroup;
+      Run.Open := False;
     end;
+    IsBit := FUDTs[UDTIdx].Fields[i].BitWidth > 0;
+    if not IsBit then Run.Open := False;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
       Al := FUDTs[UDTIdx].FieldAlign;
     if Al < 1 then Al := 1;
     if Sz < 1 then Sz := 8;              // a shape with no width of its own is a handle
-    if Al > MaxAl then MaxAl := Al;
+    // ⛔ A BIT FIELD'S OWN ALIGNMENT IS NOT WHAT THE UNIT ADDS - PlaceBitField answers that, and the
+    // test stands here so a member that only JOINS a unit adds nothing at all.
+    if (not IsBit) and (Al > MaxAl) then MaxAl := Al;
     if FUDTs[UDTIdx].IsUnion then
     begin
       if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
@@ -28450,6 +28596,12 @@ begin
         // overlapping "ub0..ub3", where the four bytes must be at 0,1,2,3 and not all at 0.
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
         begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize; Al := 1; SGrpOfs := UOfs;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         FUDTs[UDTIdx].Fields[i].ByteOffset := SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
@@ -28459,6 +28611,12 @@ begin
       begin
         // every member starts at zero; the type is as big as its widest member
         SGrpCur := 0;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, 0, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         FUDTs[UDTIdx].Fields[i].ByteOffset := 0;
         if Sz > Ofs then Ofs := Sz;
       end;
@@ -28500,6 +28658,12 @@ begin
       begin
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
         begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize; Al := 1; SGrpOfs := UOfs;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase + SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
@@ -28508,6 +28672,12 @@ begin
       else
       begin
         SGrpCur := 0;
+        if IsBit then
+        begin
+          PlaceBitField(UDTIdx, i, Run, 0, UOfs, USize, AContrib, BitOfs, BitCont);
+          Sz := USize;
+          if AContrib > MaxAl then MaxAl := AContrib;
+        end;
         FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase;
         if Sz > GrpMax then GrpMax := Sz;
       end;
@@ -28515,6 +28685,12 @@ begin
     else
     begin
       if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;   // a block just ended
+      if IsBit then
+      begin
+        PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
+        Sz := USize; Al := 1; Ofs := UOfs;
+        if AContrib > MaxAl then MaxAl := AContrib;
+      end;
       if (Ofs mod Al) <> 0 then Ofs := Ofs + (Al - (Ofs mod Al));
       FUDTs[UDTIdx].Fields[i].ByteOffset := Ofs;
       Ofs := Ofs + Sz;
@@ -28539,8 +28715,33 @@ begin
       if WireW = 8 then WireW := 0
       else if WireW = 9 then WireW := 5
       else if WireW = 10 then WireW := 6;
+      // ⭐ A BIT FIELD IS READ THROUGH ITS UNIT, NOT THROUGH ITS DECLARED TYPE, and the width on the
+      // wire has to say so: the unit can be NARROWER than the type ("As ULong b:3" one byte into a
+      // window is a two-byte unit under FIELD=2), and a load of the declared width would reach past
+      // the record. It is UNSIGNED for the same reason fbc reads a bit field unsigned - the shift and
+      // mask that follow want the raw bits, not a sign.
+      if IsBit then
+        case USize of
+          1: WireW := 2;
+          2: WireW := 4;
+          4: WireW := 6;
+        else  WireW := 0;
+        end;
       FUDTs[UDTIdx].Fields[i].Slot :=
         (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (WireW and $F);
+    end;
+    // The two facts the ACCESSORS read: which bit of the unit this member starts at, and whether it
+    // shares a unit with the member before it (the C layouts ask PlaceBitField again rather than this
+    // mark, because their own field sizes - and so their offsets - can differ from the live image's).
+    if IsBit then
+    begin
+      FUDTs[UDTIdx].Fields[i].BitOffset := BitOfs;
+      FUDTs[UDTIdx].Fields[i].BitContinues := BitCont;
+    end
+    else
+    begin
+      FUDTs[UDTIdx].Fields[i].BitOffset := 0;
+      FUDTs[UDTIdx].Fields[i].BitContinues := False;
     end;
   end;
   if GrpCur <> 0 then Ofs := GrpBase + GrpMax;        // a block that runs to the end of the type
