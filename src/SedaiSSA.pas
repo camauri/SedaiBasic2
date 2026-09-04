@@ -2845,6 +2845,23 @@ begin
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))));
         Exit;
       end;
+      // ⭐ "@p" WHERE p IS AN ADDRESS-CARRYING BYREF PARAMETER - the SAME fact as the branch above,
+      // in the one place that had not been told. IsAddrParam's own comment states it in the same
+      // words ("its register holds the caller variable's address, so reads/writes auto-dereference"),
+      // and the read (3621) and the write (9421) both consult it - but the case that answers "where
+      // is it" did not, so "@p" fell all the way to ssaLoadProcAddr and raised
+      // "Undefined procedure (address-of @)" on a name that is a perfectly ordinary parameter.
+      // ⛔ One rule, two carriers, and only one of them had it - the shape this file records over and
+      // over. DIVERGENZE 43 (with 9 and 28): fbc's own functions/zwstring-params pins it down,
+      // "f(byval 123)" against a "byref z" must answer @z = 123, and "byval 0" must answer 0 - a null
+      // reference is legal precisely because nobody dereferences it.
+      // ⛔ Tested BEFORE IsRawAddrLocal: MarkAddressTaken hands an @-taken parameter its own per-frame
+      // raw slot, and answering THAT slot is the boxing this entry is about.
+      if (Node.ChildCount = 0) and IsAddrParam(VarToStr(Node.Value)) then
+      begin
+        Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))));
+        Exit;
+      end;
       // "@Type.method": the entry PC of a member procedure named through its TYPE (a STATIC member sub
       // has no instance, so this is the only way to point at it). Tried before the field path, which
       // would otherwise report "object is not a record" for a type NAME.
