@@ -8090,6 +8090,13 @@ begin
             for RecSlotK := 0 to High(FUDTs[RecUDTIdx].Fields) do
               if FUDTs[RecUDTIdx].Fields[RecSlotK].Name = ArrName2 then
               begin RecFieldIdx := RecSlotK; Break; end;
+            // ⛔ A BIT FIELD HAS NO ADDRESS, so it has no OFFSET either: fbc refuses the whole
+            // expression ("error 24: Invalid data types"). We answered the offset of the storage UNIT
+            // the run is packed into - a plausible number for a question that has none, which is the
+            // worst way to be wrong. DIVERGENZE 34.
+            if (RecFieldIdx >= 0) and (FUDTs[RecUDTIdx].Fields[RecFieldIdx].BitWidth > 0) then
+              raise Exception.CreateFmt('Invalid data types: OFFSETOF of the bit field "%s" in "%s" ' +
+                                        '- a bit field has no address', [ArrName2, FUDTs[RecUDTIdx].Name]);
             if RecFieldIdx >= 0 then
             begin
               if FUDTs[RecUDTIdx].IsUnion then
@@ -15574,6 +15581,18 @@ begin
   // the type has fields and would otherwise satisfy the overlay test.
   CastLbl := UDTWritableStringCast(DstNode, CastType);
   if (CastLbl = '') and IsLeft and TryLRSetRecord(DstNode, SrcNode) then Exit;
+
+  // ⛔⛔ A UDT DESTINATION THAT IS NOT A STRING IS AN ERROR, NOT A STRING. Once the writable-cast test
+  // has declined and the record OVERLAY has declined too, what is left is "LSet <udt> = <string>" -
+  // and fbc answers "error 24: Invalid data types". We fell through to the string path below, read the
+  // record handle as a string and died with an ACCESS VIOLATION on the justify. DIVERGENZE 69.
+  // ⚠️ Both halves of UDTWritableStringCast matter and neither alone is the rule: fbc wants an
+  // assignable string Cast *and* an EXTENDS chain reaching ZSTRING/WSTRING. A type with only the
+  // Extends (this case) and a type with only the Cast are both refused, and for the same message.
+  if (CastLbl = '') and (ObjectTypeName(DstNode) <> '') and (FindUDT(ObjectTypeName(DstNode)) >= 0) then
+    raise Exception.CreateFmt('Invalid data types: %s of "%s" - the type declares no assignable ' +
+                              'Operator Cast to a string', [IfThen(IsLeft, 'LSET', 'RSET'),
+                              ObjectTypeName(DstNode)]);
 
   // Read inputs.
   ProcessStringExpression(DstNode, DstVal); DstReg := EnsureStringRegister(DstVal);
