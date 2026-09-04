@@ -431,6 +431,7 @@ type
     function ParseFastStatement: TASTNode;
     function ParseSlowStatement: TASTNode;
     function ParseRemStatement: TASTNode;
+    function StaticMemberBodyRestatesNamespace(const DottedName: string): Boolean;  // DIVERGENZE 93
     function ParseDimStatement: TASTNode;
     // VAR x = expr (FreeBASIC): declare a variable with type inferred from the initializer (SSA side).
     function ParseVarStatement: TASTNode;
@@ -12239,10 +12240,28 @@ begin
             (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING');
 end;
 
+function TPackratParser.StaticMemberBodyRestatesNamespace(const DottedName: string): Boolean;
+// ⛔ A STATIC MEMBER'S DEFINITION BODY MUST NOT REPEAT THE NAMESPACE IT IS ALREADY INSIDE.
+// fbc: "error 131: Declaration outside the original namespace". MEASURED, not deduced (six variants
+// through oracle_probe.sh), and the boundary is exactly "does the path restate where we already are":
+//     inside "ns":   var ns.U.h    REFUSED      var U.h        accepted
+//                    dim ns.U.k    REFUSED  (both spellings)
+//     inside "a":    var a.b.U.h   REFUSED      var b.U.h      accepted (relative, one level down)
+//     outside:       var ns.U.h    accepted
+// So a RELATIVE path from where we stand is fine; an ABSOLUTE one that re-states the enclosing prefix
+// is not - which is why the test is on the prefix and not on "is it dotted". DIVERGENZE 93.
+// ⚠️ Nothing is refused at module level: FNsPrefix is '' there and the test cannot fire.
+begin
+  Result := (FNsPrefix <> '') and
+            (Length(DottedName) > Length(FNsPrefix) + 1) and
+            (UpperCase(Copy(DottedName, 1, Length(FNsPrefix) + 1)) = UpperCase(FNsPrefix) + '.');
+end;
+
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   StaticLB, StaticK: Integer;        // DIVERGENZE 94: the member array's lower bound, and the element index
   StaticSawParen: Boolean;
+  StaticDotted: string;               // DIVERGENZE 93: the dotted name as written
   StaticElem, StaticIdx, StaticAsg, InitList: TASTNode;
   NameIsConst: Boolean;   // "As Const <type>" on this declaration
   FixedCapVal: Int64;   // folded "* n" capacity
@@ -12541,16 +12560,27 @@ begin
         MemberAccess := TASTNode.CreateWithValue(antIdentifier,
                           UpperCase(VarToStr(NameTok.Value)), NameTok);
         MemberAccess.Attributes.Values['STATICMEMBERDEF'] := '1';   // see the leading-AS twin above
+        StaticDotted := UpperCase(VarToStr(NameTok.Value));
         while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
               (Length(VarToStr(Context.PeekNext.Value)) > 0) and
               (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
         begin
           Context.Advance;                     // '.'
+          StaticDotted := StaticDotted + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
           StaticDef := TASTNode.CreateWithValue(antMemberAccess,
                          UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
           StaticDef.AddChild(MemberAccess);
           MemberAccess := StaticDef;
           Context.Advance;                     // member name
+        end;
+        // DIVERGENZE 93 - see StaticMemberBodyRestatesNamespace.
+        if StaticMemberBodyRestatesNamespace(StaticDotted) then
+        begin
+          HandleError('Declaration outside the original namespace, found ''' + StaticDotted + '''', NameTok);
+          MemberAccess.Free;
+          Result.Free;
+          Result := nil;
+          Exit;
         end;
         // "As <type>" (and any "* n" / PTR tail) belongs to the member's own declaration inside the
         // TYPE, not here: skip it to the end of the statement, then keep the initializer if there is one.
@@ -13067,6 +13097,14 @@ begin
       Context.Advance;                               // '.'
       VarDottedName := VarDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
       Context.Advance;                               // segment
+    end;
+    // DIVERGENZE 93 - see StaticMemberBodyRestatesNamespace. The DIM spelling has the same test;
+    // both are a static member's definition body and fbc refuses both, so one without the other
+    // would only move where the program is accepted.
+    if StaticMemberBodyRestatesNamespace(VarDottedName) then
+    begin
+      HandleError('Declaration outside the original namespace, found ''' + VarDottedName + '''', NameTok);
+      Break;
     end;
     if not Context.Check(ttOpEq) then
     begin
