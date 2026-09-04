@@ -3312,7 +3312,12 @@ begin
       begin
         if DerefTarget.NodeType = antIdentifier then
         begin
-          TempStr := UpperCase(FPointerVars.Values[UpperCase(VarToStr(DerefTarget.Value))]);
+          // ⛔ ASK THE LADDER FIRST, not the flat map. PointeeTypeOf ends AT FPointerVars, so this is
+          // the same answer wherever the scoped rungs are silent - and the right one where they are
+          // not. Reading the flat map first made a proc-local pointer take the pointee of a
+          // same-named one in ANOTHER procedure (DIVERGENZE 95): three readers of one fact, and
+          // each had learnt a different number of rungs.
+          TempStr := UpperCase(PointeeTypeOf(VarToStr(DerefTarget.Value)));
           if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
         end
         else
@@ -3430,8 +3435,12 @@ begin
         // ZSTRING/WSTRING pointee: "*p" IS the C string at the pointed address (read to the NUL),
         // FreeBASIC-style - not an 8-byte scalar load. WSTRING stores WIDE_CELL_BYTES-wide cells on
         // the heap and converts to/from our uniform UTF-8 managed strings (Src3: 0 = bytes, 1 = wide).
-        TempStr := UpperCase(FPointerVars.Values[UpperCase(ArrName2)]);
-        if TempStr = '' then TempStr := UpperCase(PointeeTypeOf(ArrName2));
+        // ⛔ ASK THE LADDER FIRST, not the flat map. PointeeTypeOf ends AT FPointerVars, so this is
+        // the same answer wherever the scoped rungs are silent - and the right one where they are
+        // not. Reading the flat map first made a proc-local pointer take the pointee of a
+        // same-named one in ANOTHER procedure (DIVERGENZE 95): three readers of one fact, and
+        // each had learnt a different number of rungs.
+        TempStr := UpperCase(PointeeTypeOf(ArrName2));
         if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') or (TempStr = 'STRING') then
         begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
@@ -9808,7 +9817,12 @@ begin
     ProcessExpression(ExprNode, ExprValue);
     // ZSTRING/WSTRING pointee: "*p = s" writes the string's characters + NUL at the pointed
     // address (WSTRING as wide cells), FreeBASIC-style - not a scalar store.
-    RawFieldPointee := UpperCase(FPointerVars.Values[UpperCase(RawPtrName)]);
+      // ⛔ ASK THE LADDER FIRST, not the flat map. PointeeTypeOf ends AT FPointerVars, so this is
+      // the same answer wherever the scoped rungs are silent - and the right one where they are
+      // not. Reading the flat map first made a proc-local pointer take the pointee of a
+      // same-named one in ANOTHER procedure (DIVERGENZE 95): three readers of one fact, and
+      // each had learnt a different number of rungs.
+    RawFieldPointee := UpperCase(PointeeTypeOf(RawPtrName));
     if RawFieldPointee = '' then RawFieldPointee := UpperCase(PointeeTypeOf(RawPtrName));
     // The same rule as the FIELD path above: a NUMERIC value through a ZSTRING/WSTRING pointer is ONE
     // CHARACTER, not the number's text.
@@ -36154,6 +36168,27 @@ begin
   idx := BlockPtrPointeeIdx(PtrName);
   if idx >= 0 then Exit(FPointerVars.ValueFromIndex[idx]);
   if idx = -1 then Exit('');
+  // ⛔⛔ ...AND THIS PROC'S OWN POINTER DIMs, which this reader did not know about. FPointerVars is
+  // keyed by BARE NAME and a proc-local declaration only gets in when the name is still free, so with
+  // two SUBs declaring a pointer of the same name and DIFFERENT pointees the first one won for both:
+  //   Sub a() : Dim q As Any Ptr    = @s : ...    '' files Q = ANY
+  //   Sub b() : Dim q As String Ptr = @t : *q = "x"   '' reads Q = ANY -> Access violation
+  // Same name with the same pointee is fine, and different names are fine, which is what named it.
+  // ⭐ The registry for this exists and is populated - FCurrentProcPtrLocals - and the note at the
+  // FPointerVars write site says so in as many words ("a proc-local shadow is what
+  // FCurrentProcPtrLocals exists for"). ManagedPtrPointee already asks the full ladder (block, then
+  // this proc's PARAMETERS, then this proc's DIMs, then the flat map); this reader asked three of the
+  // four. Two readers of one fact disagreeing is exactly what the note above warns about - it was
+  // written when the BLOCK rung was missing here, and the PROCEDURE rung was missing all along.
+  // DIVERGENZE 95.
+  // ⛔ ...INSIDE A PROCEDURE ONLY. This list is cleared at each prologue and never after, so at MODULE
+  // level it still holds whatever the last procedure lowered - and a module-level "Dim q As String Ptr"
+  // then took the pointee of some Sub's own q. The guard's own CONTROL case caught it, on --no-opt.
+  if FInProcedure and (FCurrentProcPtrLocals <> nil) then
+  begin
+    idx := FCurrentProcPtrLocals.IndexOfName(UpperCase(PtrName));
+    if idx >= 0 then Exit(FCurrentProcPtrLocals.ValueFromIndex[idx]);
+  end;
   Result := FPointerVars.Values[UpperCase(PtrName)];
   if Result = '' then Result := ParamPointeeType(PtrName);
 end;
