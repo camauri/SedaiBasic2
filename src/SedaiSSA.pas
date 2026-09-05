@@ -407,6 +407,8 @@ type
                                          // by node identity, set by ProcessExprFixedRaw around a buffer-aware
                                          // consumer's operand (LEN/PRINT/LEFT/MID/... and the binary file transfers).
     FHasFixedLenFields: Boolean;         // any declared UDT has a fixed-length string field -> member reads/stores
+    FHasNulStrLiteral: Boolean;          // the program contains a string literal with an embedded NUL (DIVERGENZE 98)
+    FNulStrConsts: TStringList;          // ...and the CONST names whose value carries one
                                          // must consider the pad/convert pair (a cheap global bail otherwise).
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
@@ -1156,6 +1158,7 @@ type
     procedure PublishScalarToHome(const VarName: string; const Val: TSSAValue);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
+    procedure ScanForNulStrLiteral(Node: TASTNode);   // DIVERGENZE 98: a literal with an embedded NUL
     function AnyFixedLen: Boolean; inline;
     function FixedLenCapOfNode(Node: TASTNode; out Wide: Boolean): Integer;
     function EmitFixedLenPad(const Src: TSSAValue; Cap: Integer; Wide: Boolean): TSSAValue;
@@ -1737,6 +1740,9 @@ begin
   FZStringVars.CaseSensitive := False;
   FRawFixedLenNode := nil;
   FHasFixedLenFields := False;
+  FHasNulStrLiteral := False;
+  FNulStrConsts := TStringList.Create;
+  FNulStrConsts.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
   FByrefRetValue := TStringList.Create;
   FByrefRetValue.CaseSensitive := False;
@@ -1849,6 +1855,7 @@ begin
   FRawPtrScoped.Free;
   FBlockManagedTypes.Free;
   FConstDeclSeen.Free;
+  FNulStrConsts.Free;
   FConstStrBytes.Free;
   FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
@@ -3648,7 +3655,15 @@ begin
         // into numbers, so e.g. LEN(".") was 0 and INSTR(s, ".") was wrong. Only synthesized/ambiguous
         // literals (no string token — e.g. a file handle written bare) fall through to the Val() guess.
         if (Node.Token <> nil) and (Node.Token.TokenType = ttStringLiteral) then
-          Result := MakeSSAConstString(TempStr)
+        begin
+          Result := MakeSSAConstString(TempStr);
+          // ⛔⛔ AND THE CUT IS NOT HERE, WHICH A DECK SETTLED (DIVERGENZE 98). Converting the literal
+          // on READ looks right - it is where a "String * n" variable converts - and it is wrong:
+          // fbc keeps every byte through a CONCATENATION too ("Len(lit + "X")" is 4), so a read hook
+          // turned that into 1. The cut belongs to the STORE into a variable-length string, which is
+          // the only place the measurement puts it: "Dim v As String = lit", "v = lit", a CONST read
+          // into a String, a "ZString * n". ⇒ See the var-len store site.
+        end
         else
         begin
           // Try to convert string to number (handles cases like file handle "1")
@@ -9155,7 +9170,9 @@ var
   ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
   VarName, CastTypeU, TgtTypeU: string;
   ExprValue, VarReg, DstHandleV, SrcHandleV: TSSAValue;
-  CopyOp: TSSAOpCode;
+  CopyOp: TSSAOpCode;  NulCap: Integer;
+  NulWide: Boolean;
+  NulVal: TSSAValue;
 begin
   // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
   // call site: antConst / DIM initializers also route through this procedure, and a stale call-site
@@ -9470,6 +9487,36 @@ begin
   // Fixed-length string (DIM s AS STRING/WSTRING * n): own frame (capacity probe included).
   if TryFixedLenStore(VarName, ExprNode) then
     Exit;
+
+  // ⭐⭐ A LITERAL WITH AN EMBEDDED NUL CUTS **HERE**, storing into a variable-length STRING
+  // (DIVERGENZE 98). fbc keeps every byte of the literal itself - "Len(!"A\000B")" is 3,
+  // "Asc(lit,3)" is 66, "Instr(lit,"B")" is 3, PRINT writes all of it, and even
+  // "Len(lit + "X")" is 4 - and cuts at the first NUL only where the value BECOMES a
+  // variable-length string. Measured over 14 forms.
+  // ⛔⛔ AND THAT IS WHY THE CUT IS NOT ON THE READ. Hooking the literal's read looked right - it is
+  // where a "String * n" variable converts - and a deck killed it in one run: the concatenation
+  // above then answered 1 instead of 4. The set of consumers that must NOT cut cannot be enumerated;
+  // the set of destinations that MUST is one line long.
+  // ⚠️ Only a plain var-len STRING destination: a "String * n" went through TryFixedLenStore just
+  // above (it pads to capacity), and a ZString/WString buffer cuts on its own byte path.
+  if FHasNulStrLiteral and (GetVariableType(UpperCase(VarName)) = srtString) and
+     (StrCapOf(FFixedLenVars, VarName, 0) = 0) then
+  begin
+    // ⛔ ...but NEVER into the CONST's own backing. A "Const s = <literal>" is lowered as an ordinary
+    // assignment to s, and cutting there truncates the constant AT ITS DECLARATION: fbc keeps every
+    // byte in the constant (Asc(s,3) = 66) and cuts only when it is READ into a String.
+    NulCap := 0;
+    if FNulStrConsts.IndexOfName(UpperCase(VarName)) < 0 then
+      NulCap := FixedLenCapOfNode(ExprNode, NulWide);
+    if NulCap > 0 then
+    begin
+      ProcessExpression(ExprNode, NulVal);
+      NulVal := EmitFixedLenToVarLen(EnsureStringRegister(NulVal), NulWide);
+      EmitInstruction(ssaCopyString, GetOrAllocateVariable(VarName), NulVal,
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
+  end;
 
   // Refinement #2: a builtin SHARED scalar is backed by a 1-element global array — store to element 0 (a
   // live cross-thread write), reusing the array-store lowering. A SHARED UDT scalar is excluded here: its
@@ -10583,11 +10630,48 @@ end;
 // Both are composed from existing opcodes (like LSET/RSET) — no new bytecode.
 // ============================================================================================
 
+procedure TSSAGenerator.ScanForNulStrLiteral(Node: TASTNode);
+// One walk before lowering, recording the two facts a NUL-bearing literal needs (DIVERGENZE 98):
+// whether the program contains one at all (the global bail AnyFixedLen), and the NAME of every CONST
+// whose value carries one, with its length.
+//
+// ⛔⛔ IT DESCENDS INTO PROCEDURES, and that is the whole reason it exists rather than reusing
+// CollectSharedVars: that pass deliberately does NOT (a module-level CONST lowers to a SHARED DIM and
+// a proc-local one must not be promoted), so FConstStrBytes knows nothing about a CONST declared
+// inside a SUB. Without this walk the store cut fired on the const's OWN backing there and truncated
+// it at declaration: "Const s = !"A\000B"" inside a Sub answered Asc(s,3) = 0 against fbc's 66, while
+// the identical declaration at module level was right - and fbc's own string/asc declares it inside a
+// scope, inside a TEST.
+// ⚠️ FLAT by name, like the two const registries beside it. Two same-named consts where only one
+// carries a NUL both read as carrying one; the cut is a no-op on the other, so the failure mode is
+// nothing happening.
+var
+  i: Integer;
+  Nm: string;
+begin
+  if Node = nil then Exit;
+  if (Node.NodeType = antLiteral) and VarIsStr(Node.Value) and
+     (Pos(#0, VarToStr(Node.Value)) > 0) then
+    FHasNulStrLiteral := True;
+  if (Node.Attributes.Values['CONSTDECL'] = '1') and (Node.ChildCount >= 3) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (Node.GetChild(2).NodeType = antLiteral) and VarIsStr(Node.GetChild(2).Value) and
+     (Pos(#0, VarToStr(Node.GetChild(2).Value)) > 0) then
+  begin
+    Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
+    if FNulStrConsts.IndexOfName(Nm) < 0 then
+      FNulStrConsts.Values[Nm] := IntToStr(Length(VarToStr(Node.GetChild(2).Value)));
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    ScanForNulStrLiteral(Node.GetChild(i));
+end;
+
 function TSSAGenerator.AnyFixedLen: Boolean;
 // Global bail: a program with no fixed-length variable and no fixed-length UDT field never pays for
 // any of this (one integer test on the read path).
 begin
-  Result := (FFixedLenVars.Count > 0) or FHasFixedLenFields;
+  Result := (FFixedLenVars.Count > 0) or FHasFixedLenFields or FHasNulStrLiteral or
+            (FNulStrConsts.Count > 0);
 end;
 
 function TSSAGenerator.FixedLenCapOfNode(Node: TASTNode; out Wide: Boolean): Integer;
@@ -10601,9 +10685,32 @@ begin
   Result := 0;
   Wide := False;
   if (Node = nil) or (not AnyFixedLen) then Exit;
+  // ⭐⭐ A STRING LITERAL WITH AN EMBEDDED NUL IS A FIXED-LENGTH RVALUE (DIVERGENZE 98), and saying so
+  // here is the whole cure. Measured over 14 forms, fbc keeps every byte of the literal - Len is 3,
+  // Asc(lit,3) is 66, Instr finds "B" at 3, Print writes all of it - and cuts at the NUL only where the
+  // value becomes a VARIABLE-LENGTH string ("Dim v As String = lit", "v = lit", a ZString * n).
+  // ⇒ That is EXACTLY the split this hook already implements: EmitFixedLenToVarLen is literally
+  // "everything before the first NUL", and the consumers that want the raw buffer (LEN, ASC, PRINT,
+  // LEFT/MID/RIGHT, INSTR) already mark their node through ProcessExprFixedRaw. Nothing new is built
+  // and no fourth road into a variable is opened - the alternative was a cut at every store site.
+  if (Node.NodeType = antLiteral) and VarIsStr(Node.Value) then
+  begin
+    VarName := VarToStr(Node.Value);
+    if Pos(#0, VarName) > 0 then
+    begin
+      Wide := Node.Attributes.Values['WIDELIT'] = '1';
+      Exit(Length(VarName));
+    end;
+    Exit;
+  end;
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
   begin
     VarName := VarToStr(Node.Value);
+    // ⭐ A CONST whose value carries an embedded NUL behaves as the literal does: it cuts where it
+    // becomes a variable-length string and keeps every byte everywhere else (DIVERGENZE 98). The
+    // capacity is its byte size less the terminator fbc counts.
+    if FNulStrConsts.IndexOfName(UpperCase(VarName)) >= 0 then
+      Exit(StrToIntDef(FNulStrConsts.Values[UpperCase(VarName)], 0));
     Result := StrCapOf(FFixedLenVars, VarName, 0);
     if Result > 0 then
     begin
@@ -34554,6 +34661,9 @@ begin
           // value itself is not folded, for the scoping reason above.
           if (Decl.ChildCount >= 3) and StringLiteralBytes(Decl.GetChild(2), ConstStrBytes) then
             FConstStrBytes.Values[VNameU] := IntToStr(ConstStrBytes);
+          // ⚠️ The NUL-bearing CONSTs are NOT recorded here: this pass does not descend into
+          // procedures, and fbc's own string/asc declares one inside a scope inside a TEST. They come
+          // from ScanForNulStrLiteral, which does. (DIVERGENZE 98.)
         end;
         // Refinement #2: a SHARED scalar is backed by a 1-element global array, so it lives in the shared
         // FArrays and is visible/live across threads. A builtin scalar stores its value; a UDT scalar
@@ -46139,6 +46249,11 @@ begin
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it
   // with a 1-element global array (a stable address); also records pointee types in FPointerVars.
+  // ⭐ Does the program contain a string literal with an embedded NUL? One walk, one flag, and it is
+  // what opens the fixed-length read hook for those literals (DIVERGENZE 98). Asked here so the global
+  // bail AnyFixedLen keeps costing one integer test for every program that has none.
+  FHasNulStrLiteral := False;
+  ScanForNulStrLiteral(AST);
   CollectBlockManagedTypes(AST);   // before the raw-pointer fixpoint: it asks whether New T[n] is managed
   CollectAddressTakenVars(AST);
   CollectSharedVars(AST);
