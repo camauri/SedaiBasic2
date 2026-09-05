@@ -224,7 +224,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `LOCK` / `UNLOCK` | ✓ | File record locking — no-op on a single-process VM |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening. Global-scope operator: `.name` reaches the module-level name from inside a namespace, and `..name` does the same EXPLICITLY — the only form that still means the global one from inside a `With` block, where a single dot is the WITH object (methods of a namespaced TYPE / `USING` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
 | Date/time | ✓ | Date serial = Double (epoch 1899-12-30). `NOW`/`TIMER`/`DATE`/`TIME` (bare), `DATESERIAL`/`TIMESERIAL`, `DATEVALUE`/`TIMEVALUE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/`WEEKDAY`, `MONTHNAME`/`WEEKDAYNAME`, `ISDATE`, `DATEADD`/`DATEDIFF`/`DATEPART` (intervals `yyyy q m y d w ww h n s`), `SETDATE`/`SETTIME` (VM-internal clock offset). Field functions intercepted by name so `day`/`month`/`year`/`second`… stay usable as variables |
@@ -371,15 +371,23 @@ double) through an integer pointer.
   (`f(0)` selecting `f(i As Integer, j As Integer = 0, k As Integer = 0)`); among the candidates the
   one needing the fewest omissions wins, and an exact bank prefix breaks a tie.
 - ⚠️ **`PUT ..., Alpha`**: the blended RGB matches fbc exactly; the resulting **alpha byte** does not.
-  fbc's is deterministic and fully characterised — with an explicit value it is the blend value when
-  the destination's **green** exceeds the source's green and the destination's own alpha otherwise
-  (threshold `srcGreen+1`, whatever the blend value); without one it is a fixed function of the two
-  alphas. ⭐ The destination's red and blue move it *not at all*, which is what identifies it: the
-  alpha byte shares its 32-bit lane with green (an `&hFF00FF00` mask groups A with G), so green's
-  borrow lands in alpha and red's and blue's cannot. It is a corrupted channel — "is the destination
-  greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
-  channel like the other three. Same position as the float double-rounding above: where fbc is
-  measurably wrong we do not follow, and we declare it.
+  Measured over a 6×6 matrix of source × destination alpha, fbc's rule is exact:
+
+  | | fbc | here |
+  |---|---|---|
+  | `dstAlpha <= srcAlpha` | the blend | the blend — we agree |
+  | `dstAlpha >  srcAlpha` | `(blend + srcAlpha) mod 256` | the blend |
+
+  ⭐ fbc's value is **not monotone and it wraps**: at `srcAlpha = 51` the alpha column reads
+  51 · 51 · 142 · 183 · 224 · **9** as the destination's alpha rises, because 214 + 51 = 265. The
+  alpha byte shares its 32-bit lane with green (an `&hFF00FF00` mask groups A with G), so a borrow
+  from the green lane lands in alpha and red's and blue's cannot reach it. It is a corrupted channel —
+  a blended pixel's alpha cannot mean "how much more opaque the destination was" — so we blend the
+  alpha channel like the other three. Same position as the float double-rounding above: where fbc is
+  measurably wrong we do not follow, and we declare it. Guard `m845` pins it.
+  ⚠️ An earlier wording of this note put the threshold on the destination's **green**; the matrix
+  above holds green fixed and the divergence still appears and disappears with alpha alone, so the
+  channel named was wrong. The RGB half was re-verified byte for byte over six blends.
 - **`POS` and `CSRLIN` count from 1** in MODERN, as FreeBASIC does (*"The topmost row is number 1"*);
   in CLASSIC they keep the Commodore numbering from 0. `Color()` before any `COLOR` statement reports
   `0` on `0`, measured.
@@ -2021,7 +2029,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `() (Array index)` | ✓ | `a(i [, j ...])` reads/writes an array element, honouring per-dimension lower bounds. Bounds checking is dialect-aware: MODERN/FreeBASIC does not bounds-check by default (an out-of-bounds read yields the default value, an out-of-bounds write is dropped — memory-safe); CLASSIC/Commodore raises `?BAD SUBSCRIPT`. The `--bounds-check` CLI flag forces a hard error on any out-of-bounds access (like FreeBASIC's `-exx`). |
 | `[] (String index)` | ✓ | `s[i]` reads/writes the byte (character code) at 0-based index `i` of a scalar string (read = `ASC(MID$(s,i+1,1))`; write replaces that byte). |
-| `[] (Pointer index)` | ✓ | `p[i]` (and `p(i)`) ≡ `*(p + i)`, read and write |
+| `[] (Pointer index)` | ✓ | `p[i]` ≡ `*(p + i)`, read and write. ⚠️ The BRACKETS are the only spelling, as in FreeBASIC: `p(i)` on a pointer is refused (fbc: *error 72, Array not dimensioned*) — the parentheses are an array subscript and a pointer is not an array. Accepted here until 5 Sep 2026. |
 
 #### String Operators
 

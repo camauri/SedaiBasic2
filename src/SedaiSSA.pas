@@ -461,6 +461,7 @@ type
     FMultiDimArrays: TStringList;        // array names (UPPER) ever given >1 dimension (rank is immutable in FB)
     FNarrowsElided: Integer;             // how many redundant narrowings were turned into copies
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
+    FBinGetTempSeq: Integer;             // serial for the "Get #" temporaries (DIVERGENZE 102)
     FArrayElemWidth: TStringList;        // B1.5: array name (UPPER) -> element narrow width code (1..7)
     // RESTORE targets: label name / line number (UPPER) -> the DATA-pool INDEX at which the items after
     // that mark begin. Filled by PreProcessData as the pool is built, so it is exact by construction
@@ -714,6 +715,7 @@ type
     function RecordTypeOfAddrOfObject(Node: TASTNode): string;  // "(@X)" as the OBJECT of a member access -> X's UDT, else ''
     function IsTypeNameForLen(const Name: string): Boolean;     // bare identifier that names a TYPE: LEN(T) = SizeOf(T)
     function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
+    function ProcRetFuncPtrSig(const NameU: string): string;   // a procedure whose RETURN is callable, either spelling
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
@@ -1008,6 +1010,7 @@ type
     function RecPtrWireWidth(const Pointee: string): Integer;           // record-field pointer's low 4 bits for this pointee (-1 = leave alone)
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
+    function EmitBinGetToLValue(const HandleReg: TSSAValue; Target: TASTNode): Boolean;  // Get # into a non-bare target
     function BinaryElemBytesOfNode(Node: TASTNode): Integer;   // ...and of any PUT/GET target shape
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
@@ -7482,9 +7485,9 @@ begin
            (Node.GetChild(0).ChildCount >= 1) and
            (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
            (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) and
-           (FPreProcRetPtrSig.IndexOfName(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) then
+           (ProcRetFuncPtrSig(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) <> '') then
         begin
-          TempStr := FPreProcRetPtrSig.Values[UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))];
+          TempStr := ProcRetFuncPtrSig(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)));
           ProcessExpression(Node.GetChild(0), Left);      // f(args) -> the returned entry PC
           Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
           Exit;
@@ -7520,9 +7523,9 @@ begin
           TempStr := ObjectTypeName(Node.GetChild(0).GetChild(0).GetChild(0));
           if TempStr <> '' then
             TempStr := UpperCase(TempStr) + '.' + UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value));
-          if (TempStr <> '') and (FPreProcRetPtrSig.IndexOfName(TempStr) >= 0) then
+          if (TempStr <> '') and (ProcRetFuncPtrSig(TempStr) <> '') then
           begin
-            TempStr := FPreProcRetPtrSig.Values[TempStr];
+            TempStr := ProcRetFuncPtrSig(TempStr);
             ProcessExpression(Node.GetChild(0), Left);    // obj.m(args) -> the returned entry PC
             Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
             Exit;
@@ -8805,6 +8808,17 @@ begin
            (Node.Attributes.Values['SHAREDELEM'] <> '1') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
+          // ⛔ THE BRACKETS ARE THE ONLY SPELLING (DIVERGENZE 101). fbc indexes a pointer with "p[i]"
+          // and refuses "p( i )" - "error 72: Array not dimensioned" - because the parentheses are an
+          // ARRAY subscript and this name is not an array. We accepted both, and the comment above
+          // said so; a permissiveness is still a program that compiles here and not there.
+          // ⭐ The spelling was already on the node ('BRACKET'), recorded for other questions, so this
+          // costs a test and no parser change. SHAREDELEM is a SYNTHETIC access this compiler builds
+          // for a backing array and carries no brackets, and it is excluded above for its own reason.
+          if (Node.Attributes.Values['BRACKET'] <> '1') and FModernMode then
+            raise Exception.CreateFmt(
+              'Array not dimensioned: %s is a pointer - index it with brackets, "%s[i]"',
+              [ArrName, ArrName]);
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));
           // p[i] where the pointee is a UDT: the record's VALUE is its handle (managed-reference model),
           // and p+i IS that handle for a managed block, so return it directly. A scalar ssaRefLoadInt
@@ -21957,6 +21971,23 @@ begin
     if (Node.Attributes.Values['HASCOUNT'] = '1') and (Node.ChildCount >= 3) then
       CountChild := Node.GetChild(Node.ChildCount - 1);
     if EmitBinFileBlock(True, HandleReg, VarChild, CountChild) then Exit;
+    // ⛔⛔ A TARGET THAT IS NOT A BARE NAME READ THE RIGHT BYTES AND THREW THEM AWAY (DIVERGENZE 102).
+    // Everything below works on GetOrAllocateVariable(VarChild.Value) - "resolve OR BIND" - and an
+    // "a(0)" or an "r.b" has no name to give: the call bound a PHANTOM, the read landed in it, and
+    // nothing ever stored it back. "Get #f, , a(0)" then printed 0 where fbc prints the byte it just
+    // read, on four shapes (array element and record field, narrow and wide), in silence. Same family
+    // as the early-exit phantom of m823: a lookup that answers by CREATING.
+    // ⇒ Cure: read into a TEMPORARY of the target's own bank, then hand "<target> = <temporary>" to
+    // ProcessAssignment - the one machine that knows how to store into an array element, a field, a
+    // narrow element, a fixed-length string. Nothing new is invented, and the temporary is bound with
+    // its bank FORCED, because a name-derived bank would put "_GETBIN$1" in the integer one whatever
+    // the target is.
+    // ⚠️ The address route was measured and rejected: an element of a managed array has no byte image
+    // to read into (its address is a packed (array, element) pair), so ssaGetBinMem - which the WSTRING
+    // branch below legitimately uses on a raw buffer - would write somewhere neither engine means.
+    if (VarChild.NodeType <> antIdentifier) and (not EmitBinGetToLValue(HandleReg, VarChild)) then
+      Exit;
+    if VarChild.NodeType <> antIdentifier then Exit;
     VarReg := GetOrAllocateVariable(string(VarChild.Value));
     if VarReg.RegType = srtFloat then
       // SINGLE reads 4 bytes on file, DOUBLE 8 (Immediate = width), as fbc lays them out.
@@ -25806,6 +25837,55 @@ begin
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   TotalSize := Ofs;
   Result := n > 0;
+end;
+
+function TSSAGenerator.EmitBinGetToLValue(const HandleReg: TSSAValue; Target: TASTNode): Boolean;
+// "Get #f, , <target>" where <target> is NOT a bare name - an array element, a record field.
+//
+// Reads the bytes into a TEMPORARY of the target's own bank and then assigns the temporary to the
+// target through ProcessAssignment, which is the single place that knows how to store into an array
+// element, a field, a narrow element or a fixed-length string. See the call site for why the address
+// route does not work here.
+//
+// ⛔ The temporary's bank is FORCED. Bound by name it would land in the integer bank whatever the
+// target is (GetVariableType reads the name), so a "Get #f, , d(0)" into a Double array would read
+// eight bytes into an integer register and store an integer.
+// ⛔ And its name carries a character no BASIC identifier can hold, so it can never collide with a
+// program's own variable, and a SERIAL, so two GETs in one procedure do not share a register.
+var
+  Bank: TSSARegisterType;
+  TmpName: string;
+  TmpReg: TSSAValue;
+  Assign, Ident: TASTNode;
+begin
+  Result := False;
+  if Target = nil then Exit;
+  Bank := InferExprBank(Target);
+  Inc(FBinGetTempSeq);
+  TmpName := '_GETBIN$' + IntToStr(FBinGetTempSeq);
+  TmpReg := BindOrResolve(TmpName, True, True, Bank, False);
+  case Bank of
+    srtFloat:
+      EmitInstruction(ssaGetBinFloat, TmpReg, HandleReg, MakeSSAValue(svkNone),
+                      MakeSSAConstInt(BinaryElemBytesOfNode(Target)));
+    srtString:
+      // A string target keeps the variable-length rule ("read Len(s) bytes"); the fixed-length
+      // capacities live on the DECLARATION, which a non-bare target does not carry here.
+      EmitInstruction(ssaGetBinStr, TmpReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+  else
+    EmitInstruction(ssaGetBinInt, TmpReg, HandleReg, MakeSSAValue(svkNone),
+                    MakeSSAConstInt(BinaryElemBytesOfNode(Target)));
+  end;
+  Assign := TASTNode.Create(antAssignment, Target.Token);
+  try
+    Assign.AddChild(Target.Clone);
+    Ident := TASTNode.CreateWithValue(antIdentifier, TmpName, Target.Token);
+    Assign.AddChild(Ident);
+    ProcessAssignment(Assign);
+  finally
+    Assign.Free;
+  end;
+  Result := True;
 end;
 
 function TSSAGenerator.BinaryElemBytesOfNode(Node: TASTNode): Integer;
@@ -30111,6 +30191,31 @@ begin
       Result := Result + '-';
   end;
   if not Any then Result := '';
+end;
+
+function TSSAGenerator.ProcRetFuncPtrSig(const NameU: string): string;
+// The "FPPARAMS|FPRET" of a procedure whose RETURN is itself callable, under either spelling.
+//
+// ⛔ TWO SPELLINGS OF ONE DECLARATION, AND ONLY ONE WAS RECORDED (DIVERGENZE 97). The pre-scan files
+// FPreProcRetPtrSig from the name node's FUNCPTR attribute, which the parser sets for the INLINE form
+// ("Function f( ) As Function( ) As Integer"). Declared through a NAMED funcptr type -
+// "Type FP As Function( ByVal n As Integer ) As Integer : Function sel( ) As FP" - the return type is
+// an ordinary type NAME, so the attribute is absent and "sel( )( 561 )" lowered to nothing: it printed
+// 0, in silence, where fbc prints 1122. The same call through a variable ("Dim p As FP = sel( ) :
+// p( 561 )") has always worked, which is the tell.
+// ⚠️ And the ledger entry named the wrong MECHANISM: it said ttDelimParOpen is registered "only as a
+// PREFIX rule" so "f( )( x )" is unrepresentable. The infix has been there all along
+// (StaticParseArrayAccess at precCall) - the AST was right and the LOWERING had no arm.
+//
+// ⭐ The named form is resolved HERE and not in the pre-scan on purpose: FFuncPtrTypes is filled while
+// lowering, and a pre-scan that asked it would read an empty table for every program whose type is
+// declared after the function. Asked at the consumer, both spellings answer.
+begin
+  Result := '';
+  if NameU = '' then Exit;
+  if FPreProcRetPtrSig.IndexOfName(NameU) >= 0 then Exit(FPreProcRetPtrSig.Values[NameU]);
+  if FPreFuncRetType.IndexOfName(NameU) >= 0 then
+    Result := FuncPtrTypeSig(UpperCase(FPreFuncRetType.Values[NameU]));
 end;
 
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
