@@ -9594,17 +9594,17 @@ begin
   // dispatched to the graphics statement, and reported "Expected ')' after expression" from inside the
   // first point - the identical symptom the dotted chain used to give. ⇒ The walk skips a BALANCED
   // parenthesis group, so "a(0)", "a(i,j)" and "x.p(0).q" all reach the statement a bare name reaches.
-  // ⭐ ...and a leading '@' is part of the target, not the end of it: fbc's gfx/image-expr draws into
-  // "@array(0)".
-  // ⛔⛔ '*' IS DELIBERATELY NOT HERE, and the census is why. Accepting it too made five of fbc's own
-  // tests compile that fbc REFUSES - gfx/image-expr-nonptr-deref{integerptr,ubyteptr,udtptr,zstringptr,
-  // fbimageptr}, each drawing through a "*p" whose POINTEE is not a pointer. They were passing because
-  // our parser refused the whole shape, which is a rejection for the wrong reason; widening the parser
-  // without the TYPE check fbc makes would have turned five right answers into five wrong ones.
-  // ⇒ The '*' spelling stays refused until the image expression's TYPE is checked (that check is the
-  // work those five tests are really asking for, and it is filed rather than guessed at here).
+  // ⭐ ...and a leading '@' or '*' is part of the target, not the end of it: fbc's gfx/image-expr
+  // draws into "@array(0)" and through "*p".
+  // ⛔⛔ THE '*' WAS HELD BACK UNTIL THE TYPE CHECK EXISTED, and the note it replaces said so:
+  // accepting it while the image expression's TYPE was unchecked made five of fbc's own tests compile
+  // that fbc REFUSES (gfx/image-expr-nonptr-deref*, each drawing through a "*p" whose POINTEE is not a
+  // pointer). They were passing because the parser refused the whole shape - a rejection for the wrong
+  // reason - so the parse and the check had to land TOGETHER or one of them was a regression.
+  // ⇒ ImageExprIsCertainlyNotAPointer is that check (DIVERGENZE 149), and this is its other half.
   k := 1;
-  while Assigned(Context.PeekToken(k)) and (Context.PeekToken(k).TokenType = ttOpAt) do Inc(k);
+  while Assigned(Context.PeekToken(k)) and
+        (Context.PeekToken(k).TokenType in [ttOpAt, ttOpMul]) do Inc(k);
   if (Context.PeekToken(k) = nil) or
      (Context.PeekToken(k).TokenType = ttDelimParOpen) then Exit;
   // Walk "name ( index | '.' name )*": k lands on the token after the target.

@@ -1267,6 +1267,7 @@ type
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);  // STEP: coord += base
     procedure EmitPenCoordRegs(out PenX, PenY: TSSAValue);  // read the current graphics point (POINTCOORD 0/1)
+    function  ImageExprIsCertainlyNotAPointer(Node: TASTNode): Boolean;  // the image of a draw statement must be a pointer
     function  EmitDrawTargetBegin(Node: TASTNode): Boolean;  // "PSET img,(x,y)": set the image draw target (if any)
     procedure EmitDrawTargetEnd;                             // clear the image draw target (back to the work page)
     function  EffChildCount(Node: TASTNode): Integer;        // ChildCount excluding an appended image-target child
@@ -17861,6 +17862,69 @@ begin
     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.ImageExprIsCertainlyNotAPointer(Node: TASTNode): Boolean;
+// Is this graphics IMAGE expression of a type that CANNOT be an image handle? (DIVERGENZE 149.)
+//
+// fbc requires the image expression of a draw statement to have POINTER type and refuses everything
+// else - fifteen of its own tests do nothing but check that, one per non-pointer type, plus five that
+// dereference a pointer whose POINTEE is not one ("Dim p As Integer Ptr : Line *p, (0,0)-(31,31)").
+//
+// ⛔⛔ THE QUESTION IS ASKED IN THE NEGATIVE, and that direction is the design. A list of what CAN be
+// an image handle cannot be finished - a UDT with an Operator Cast, a function result, an element of
+// an array of pointers, a cast - and every form missing from it would become a WRONG REFUSAL on a
+// valid program. Asked this way round, anything this routine cannot name reads as "maybe a pointer"
+// and keeps compiling, which is the permissiveness being narrowed and never a regression.
+//
+// ⛔ AND THE SOURCE OF THE ANSWER WAS CHOSEN BY MEASURING, not by reading. The first draft asked
+// FVarDeclTypeName - "every DIM'd scalar -> the type name it was declared as" - and that registry is
+// EMPTY at this point (count 0): it is filled by a pass that has not run. What IS answered here, and
+// was checked on the two cases that matter, is the POINTEE - "Dim img As Any Ptr" answers ANY through
+// both pointee maps, "Dim b As Byte" answers nothing through either, and a UDT variable answers its
+// type name through ObjectTypeName. ⇒ A name is refused only when nothing says it is a pointer AND
+// something says it is a declared variable.
+//
+// ⚠️ Every comparison is case-INSENSITIVE, because nothing in BASIC is not: "As Byte", "as byte" and
+// "AS BYTE" are one type, and a case-sensitive test would refuse one spelling and pass the other two.
+var
+  Nm: string;
+
+  function IsPointerTypeName(const TypeName: string): Boolean;
+  var U: string;
+  begin
+    U := UpperCase(Trim(TypeName));
+    Result := (U <> '') and
+              (((Length(U) >= 4) and (Copy(U, Length(U) - 3, 4) = ' PTR')) or
+               (Pos(' PTR', UpperCase(CanonicalType(U))) > 0));
+  end;
+
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  case Node.NodeType of
+    antIdentifier:
+      begin
+        Nm := VarToStr(Node.Value);
+        if (PointeeTypeOf(Nm) <> '') or (ManagedPtrPointee(Nm) <> '') then Exit;  // it IS a pointer
+        // Positive evidence that this is a declared value and not something unknown: a UDT variable,
+        // or a name bound to a register here. VarIsBound is the PURE question - it never binds (m823).
+        Result := (ObjectTypeName(Node) <> '') or VarIsBound(UpperCase(Nm));
+      end;
+    antDeref:
+      // "*p" is a pointer only when p is a pointer to a POINTER: the value is the pointee, and a
+      // pointee that is not itself "<something> Ptr" cannot be an image handle. That is exactly what
+      // fbc's five deref tests check, one per pointee kind (Integer, UByte, a UDT, ZString, FB.IMAGE).
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        Nm := VarToStr(Node.GetChild(0).Value);
+        if (PointeeTypeOf(Nm) = '') and (ManagedPtrPointee(Nm) = '') then Exit;   // not a pointer: unknown
+        Result := not (IsPointerTypeName(PointeeTypeOf(Nm)) or
+                       IsPointerTypeName(ManagedPtrPointee(Nm)));
+      end;
+  end;
+end;
+
 function TSSAGenerator.EmitDrawTargetBegin(Node: TASTNode): Boolean;
 // FreeBASIC "PSET img,(x,y)" (and LINE/CIRCLE/PAINT/POINT): when the statement names an image target
 // (attribute TARGETIDX = the child holding the target-handle expression), evaluate it and emit
@@ -17874,6 +17938,11 @@ begin
   if Node.Attributes.Values['TARGETIDX'] = '' then Exit;
   Val(Node.Attributes.Values['TARGETIDX'], Idx, Code);
   if (Code <> 0) or (Idx < 0) or (Idx >= Node.ChildCount) then Exit;
+  // ⛔ The image expression must have POINTER type, as fbc requires (DIVERGENZE 149). Only the forms
+  // this can NAME are refused; see ImageExprIsCertainlyNotAPointer for why the question runs that way.
+  if ImageExprIsCertainlyNotAPointer(Node.GetChild(Idx)) then
+    raise Exception.Create(
+      'Invalid data types: the image of a graphics statement must be a POINTER');
   ProcessExpression(Node.GetChild(Idx), HVal);
   HReg := EnsureIntRegister(HVal);
   EmitInstruction(ssaGfxSetTarget, MakeSSAValue(svkNone), HReg, MakeSSAValue(svkNone), MakeSSAConstInt(1));
