@@ -555,6 +555,21 @@ type
                                          //   the other scalar names, neither the "ZString * n" capacity). Filed as the
                                          //   SIZE and not as a name because the capacity of a fixed-length string lives
                                          //   in the declaration's FIXEDLEN attribute, not in its type name.
+    FZStrTextAddr: TStringList;          // ...and the MIRROR: a STRING register that is the TEXT read at an
+                                         // address of a ZSTRING/WSTRING pointee -> "<address register>|<mode>".
+                                         // The two spellings of the same thing default to different banks -
+                                         // "p[i]" to the code, "*(p+i)" to the text - because each is what its
+                                         // own context asks for most; each keeps the OTHER reading recoverable
+                                         // from the address, so neither ever has to be in two banks at once.
+    FZStrCharAddr: TStringList;          // an INT register that is one CHARACTER read at an address of a
+                                         // ZSTRING/WSTRING pointee -> "<address register>|<mode>".
+                                         // ⭐⭐ In fbc such a read has TWO readings and BOTH are pinned by
+                                         // its own suite: "Dim i As Integer = z[0]" is asc("a") - the code -
+                                         // and "Print z[0]" is the whole zstring from that offset. The INT
+                                         // reading is the default (it is what every numeric context wants and
+                                         // what string/indexing.bas asserts); the STRING one is re-derived
+                                         // FROM THE ADDRESS at the shared string hook, so the value never
+                                         // has to be in two banks at once.
     FArrayScalarPointee: TStringList;    // array of NON-UDT pointers ("DIM a(..) As ZString Ptr") -> the pointee type name.
     // ⛔ An array whose ELEMENTS hold a RAW address ("Dim a(10) As Integer Ptr : a(5) = Allocate(...)").
     // CollectRawPtrVars walks pointer VARIABLES, so nothing marked an element: "a(5)[3] = 777" never
@@ -857,6 +872,10 @@ type
     function RawPtrExprPointee(Node: TASTNode): string;                         // scalar pointee of a raw FIELD ptr expr (obj.field, @obj.field[i]), else ''
     procedure EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);           // p±n raw pointer arithmetic (SizeOf-scaled)
     function RawTypeCodeOf(const PtrName: string): Integer;                      // raw element type code for *p / p[i]
+    procedure NoteZStrCharRead(const Dst, Addr: TSSAValue; WideMode: Integer);
+    procedure NoteZStrTextRead(const Dst, Addr: TSSAValue; WideMode: Integer);
+    function ZStrTextAddrOf(const Val: TSSAValue; out Addr: TSSAValue; out WideMode: Integer): Boolean;
+    function ZStrCharAddrOf(const Val: TSSAValue; out Addr: TSSAValue; out WideMode: Integer): Boolean;
     function RawTypeCodeOfPointee(const PointeeType: string): Integer;           // raw element type code for a given scalar pointee
     function RawStrModeOf(const PointeeType: string): Integer;                  // ssaRaw*ZStr mode: 0 zstring, 1 wstring, -1 managed String cell
     function RawElemSizeOf(const PtrName: string): Int64;                        // SizeOf(pointee) in bytes
@@ -1580,6 +1599,8 @@ begin
   FArrayFuncPtrSig := TStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
   FArrayScalarPointee := TStringList.Create;
+  FZStrCharAddr := TStringList.Create;
+  FZStrTextAddr := TStringList.Create;
   FRawElemArrays := TStringList.Create;
   FRawElemArrays.CaseSensitive := False;
   FArrayScalarPointee.CaseSensitive := False;
@@ -1764,6 +1785,8 @@ begin
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
+  FZStrCharAddr.Free;
+  FZStrTextAddr.Free;
   FRawElemArrays.Free;
   FArrayElemBytes.Free;
   FArrayFixedStr.Free;
@@ -2717,6 +2740,8 @@ end;
 // Main implementation with destination hint
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
+  ZCharAddr: TSSAValue;         // the address behind a ZSTRING/WSTRING character read (DIVERGENZE 25)
+  ZCharWide: Integer;
   DerefElemBytes: Integer;   // width of one element behind "(*p)[i]" - see DerefZStringByteAddr
   CastW: Integer;            // record-field pointer width code a pointer CAST re-stamps (DIVERGENZE 102)
   CastMasked, TempV: TSSAValue;
@@ -3362,9 +3387,11 @@ begin
         if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
         begin
           ProcessExpression(DerefTarget, Left);
+          Left := EnsureIntRegister(Left);
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-          EmitInstruction(ssaRawLoadZStr, Result, EnsureIntRegister(Left), MakeSSAValue(svkNone),
+          EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
                           MakeSSAConstInt(Ord(TempStr = 'WSTRING')));
+          NoteZStrTextRead(Result, Left, Ord(TempStr = 'WSTRING'));
           Exit;
         end;
       end;
@@ -3376,9 +3403,11 @@ begin
       if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
       begin
         ProcessExpression(Node.GetChild(0), Left);
+        Left := EnsureIntRegister(Left);
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
-        EmitInstruction(ssaRawLoadZStr, Result, EnsureIntRegister(Left), MakeSSAValue(svkNone),
+        EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
                         MakeSSAConstInt(Ord(TempStr = 'WSTRING')));
+        NoteZStrTextRead(Result, Left, Ord(TempStr = 'WSTRING'));
         Exit;
       end;
       // *obj.field / *(@obj.field[i]) where the field is a raw "<scalar> PTR": load SizeOf(pointee) bytes
@@ -3398,6 +3427,7 @@ begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
                           MakeSSAConstInt(RawStrModeOf(TempStr)));
+          NoteZStrTextRead(Result, Left, RawStrModeOf(TempStr));
           Exit;
         end;
         if (TempStr = 'SINGLE') or (TempStr = 'DOUBLE') then
@@ -3456,6 +3486,7 @@ begin
         Left := EnsureIntRegister(Left);
         Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
         EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+        NoteZStrTextRead(Result, Left, 0);
         Exit;
       end;
       // *p / *(p±n) where p is a RAW (Allocate'd) pointer: load SizeOf(pointee) bytes from the raw heap.
@@ -3479,6 +3510,7 @@ begin
           Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
           EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone),
                           MakeSSAConstInt(RawStrModeOf(TempStr)));
+          NoteZStrTextRead(Result, Left, RawStrModeOf(TempStr));
           Exit;
         end;
         if PointeeBankOf(ArrName2) = srtFloat then
@@ -4568,6 +4600,25 @@ begin
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
 
+          // ⭐ ...and an operand that is ONE CHARACTER of a ZSTRING/WSTRING pointee is compared as THE
+          // TEXT at its address: comparing p[1] with a string literal is TRUE in fbc when the text
+          // from that offset matches. Coerced here, BEFORE the bank test below, because that test
+          // would see a string on one side and an INT register on the other and hand the string
+          // opcode a register index. Narrow on purpose, exactly as on the concat arm: fbc refuses
+          // comparing a plain number with a string. DIVERGENZE 25.
+          if ZStrCharAddrOf(Left, ZCharAddr, ZCharWide) and (Right.RegType = srtString) then
+            Left := EnsureStringRegister(Left);
+          if ZStrCharAddrOf(Right, ZCharAddr, ZCharWide) and (Left.RegType = srtString) then
+            Right := EnsureStringRegister(Right);
+          // ...and the MIRROR, for the other spelling: the TEXT of a pointee compared with a NUMBER
+          // is its first character's code. Without it the bank test below picked the STRING opcode
+          // and compared a number against a register index.
+          if ZStrTextAddrOf(Left, ZCharAddr, ZCharWide) and (Right.RegType <> srtString) and
+             (Right.Kind <> svkConstString) then
+            Left := EnsureIntRegister(Left);
+          if ZStrTextAddrOf(Right, ZCharAddr, ZCharWide) and (Left.RegType <> srtString) and
+             (Left.Kind <> svkConstString) then
+            Right := EnsureIntRegister(Right);
           // Determine comparison type based on operand types
           if (Left.RegType = srtString) or (Right.RegType = srtString) then
           begin
@@ -4693,6 +4744,20 @@ begin
       else
         // FreeBASIC "&": ALWAYS string concatenation; coerce both operands to their string form
         // (numeric operands become their STR$ representation).
+        // ⭐ An ARITHMETIC operator over the TEXT of a ZSTRING/WSTRING pointee uses its first
+        // character's CODE when the other operand is a NUMBER: fbc answers 99 for "*(p+1) + 1" over
+        // "abcd". Coerced before the concat test below, which would otherwise see a string on one
+        // side and turn the whole expression into a concatenation. ⛔ Never for "&", whose whole job
+        // is to render its operands as text. DIVERGENZE 25.
+        if (Node.Token.TokenType <> ttOpConcat) then
+        begin
+          if ZStrTextAddrOf(Left, ZCharAddr, ZCharWide) and (Right.RegType <> srtString) and
+             (Right.Kind <> svkConstString) then
+            Left := EnsureIntRegister(Left);
+          if ZStrTextAddrOf(Right, ZCharAddr, ZCharWide) and (Left.RegType <> srtString) and
+             (Left.Kind <> svkConstString) then
+            Right := EnsureIntRegister(Right);
+        end;
         if Node.Token.TokenType = ttOpConcat then
         begin
           // Materialize numeric constants into a register first (EnsureStringRegister only coerces
@@ -4715,6 +4780,14 @@ begin
            ((Left.RegType = srtString) or (Right.RegType = srtString)) then
         begin
           // String concatenation
+          // ⭐ ...and an operand that is ONE CHARACTER of a ZSTRING/WSTRING pointee is THE TEXT at its
+          // address. Unlike the "&" arm above, this one concatenated the operands RAW, so an INT
+          // register's index went in as if it were a STRING one: "<" + p[1] + ">" came out "<>".
+          // ⛔ Only that shape is coerced, not every numeric: fbc REFUSES "string + number" (its "&" is
+          // the operator that renders one), so a general coercion here would accept what the oracle
+          // rejects. DIVERGENZE 25.
+          if ZStrCharAddrOf(Left, ZCharAddr, ZCharWide) then Left := EnsureStringRegister(Left);
+          if ZStrCharAddrOf(Right, ZCharAddr, ZCharWide) then Right := EnsureStringRegister(Right);
           DestReg := FProgram.AllocRegister(srtString);
           Result := MakeSSARegister(srtString, DestReg);
           EmitInstruction(ssaStrConcat, Result, Left, Right, MakeSSAValue(svkNone));
@@ -8709,6 +8782,14 @@ begin
           begin
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(ArrName)));
+            // ⭐ "p[i]" on a ZSTRING/WSTRING pointer has TWO readings in fbc, and this one - the
+            // CHARACTER CODE - is the default because it is what every numeric context wants and what
+            // fbc's own string/indexing.bas asserts ("Dim i As Integer = z[0]" is asc("a")). The other
+            // one, the TEXT from that offset, is re-derived from the address when a STRING context asks
+            // (EnsureStringRegister). DIVERGENZE 25.
+            TempStr := UpperCase(PointeeTypeOf(ArrName));
+            if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+              NoteZStrCharRead(Result, Left, Ord(TempStr = 'WSTRING'));
           end;
           Exit;
         end;
@@ -8874,7 +8955,13 @@ begin
             TempVal := MakeSSARegister(srtInt, TempReg);
             EmitInstruction(ssaFloatToInt, TempVal, Indices[i], MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             Indices[i] := TempVal;
-          end;
+          end
+          // ⭐ An INDEX that is the TEXT of a ZSTRING/WSTRING pointee is its first character's CODE -
+          // "a( *(p+1) )" reads element 98 in fbc. There was no STRING arm here at all, so a string
+          // register's INDEX went in as the subscript and read element 0. DIVERGENZE 25.
+          else if (Indices[i].Kind = svkRegister) and (Indices[i].RegType = srtString) and
+                  ZStrTextAddrOf(Indices[i], ZCharAddr, ZCharWide) then
+            Indices[i] := EnsureIntRegister(Indices[i]);
         end;
 
         // FreeBASIC explicit lower bounds ("lb TO ub"): the dimension's allocated size is ub-lb+1 and the
@@ -9018,6 +9105,8 @@ procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
 // probes live in their own Try*/Process* frames below, so THIS frame — entered for every
 // assignment — keeps only the managed locals of the common scalar path.
 var
+  ZCharAddr: TSSAValue;         // the address behind a ZSTRING/WSTRING character read (DIVERGENZE 25)
+  ZCharWide: Integer;
   VarNode, ExprNode, SharedAssign, CastNode, UnwrapAssign: TASTNode;
   ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
   VarName, CastTypeU, TgtTypeU: string;
@@ -9678,6 +9767,24 @@ begin
       // Convert FLOAT register to INT
       EmitInstruction(ssaFloatToInt, VarReg, ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
+    else if (VarReg.RegType = srtInt) and (ExprValue.RegType = srtString) and
+            ZStrTextAddrOf(ExprValue, ZCharAddr, ZCharWide) then
+      // ...and the MIRROR: the TEXT of a pointee assigned to an INTEGER is its first character's code.
+      // This tail had no STRING->INT arm either, so "Dim n As Integer = *(p+1)" emitted NOTHING at all
+      // and n was never assigned - a silent DROP, which reads exactly like a wrong number.
+      EmitInstruction(ssaCopyInt, VarReg, EnsureIntRegister(ExprValue),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+    else if (VarReg.RegType = srtString) and (ExprValue.RegType = srtInt) and
+            ZStrCharAddrOf(ExprValue, ZCharAddr, ZCharWide) then
+      // ⭐ ONE character of a ZSTRING/WSTRING pointee assigned to a STRING is THE TEXT at that
+      // address, and this tail had no INT->STRING arm at all: it fell to the copy below and moved an
+      // INT register's index into a STRING one, so "Dim s As String = p[1]" left s EMPTY.
+      // ⛔ Narrow ON PURPOSE. fbc REFUSES a plain integer or double in a string context ("Dim s As
+      // String = 5" is its error 24), so a general INT->STRING coercion here would widen us onto a
+      // form the oracle rejects; this arm fires only for the one shape that HAS a string reading.
+      // DIVERGENZE 25.
+      EmitInstruction(ssaCopyString, VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone))
     else if ExprValue.RegIndex <> VarReg.RegIndex then
     begin
       // Same type but different register - direct copy
@@ -10746,6 +10853,8 @@ end;
 
 procedure TSSAGenerator.ProcessPrint(Node: TASTNode);
 var
+  ZCharAddr: TSSAValue;         // the address behind a ZSTRING/WSTRING character read (DIVERGENZE 25)
+  ZCharWide: Integer;
   i, j: Integer;
   ExprValue, RegValue, ArgValue, ArgReg: TSSAValue;
   DestReg: Integer;
@@ -10904,6 +11013,20 @@ begin
       EmitInstruction(ssaBigToStr, BigStrReg, EnsureIntRegister(ExprValue),
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), BigStrReg,
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
+    end;
+
+    { ⭐ ONE CHARACTER OF A ZSTRING/WSTRING POINTEE PRINTS AS THE TEXT AT ITS ADDRESS, not as the
+      code. Measured against fbc on the SAME pointer: "Print z[0]" is "abc" and
+      "Dim i As Integer = z[0]" is 97 - both readings are pinned, the second by fbc's own
+      string/indexing.bas, so the INT one stays the default and the STRING one is re-derived here.
+      Taken before the per-bank dispatch below for the same reason the BigInt arm above is: that
+      dispatch sees an int register and prints the NUMBER, which is entirely plausible and wrong.
+      DIVERGENZE 25. }
+    if (ExprValue.RegType = srtInt) and ZStrCharAddrOf(ExprValue, ZCharAddr, ZCharWide) then
+    begin
+      EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), EnsureStringRegister(ExprValue),
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Continue;
     end;
@@ -36470,6 +36593,62 @@ begin
   else Result := 0;
 end;
 
+procedure TSSAGenerator.NoteZStrTextRead(const Dst, Addr: TSSAValue; WideMode: Integer);
+// The mirror of NoteZStrCharRead: a STRING register that is the TEXT of a ZSTRING/WSTRING pointee,
+// and which address it was read at - so a NUMERIC context can ask for its first character's CODE.
+begin
+  if (Dst.Kind <> svkRegister) or (Addr.Kind <> svkRegister) then Exit;
+  FZStrTextAddr.Values[IntToStr(Dst.RegIndex)] := IntToStr(Addr.RegIndex) + '|' + IntToStr(WideMode);
+end;
+
+function TSSAGenerator.ZStrTextAddrOf(const Val: TSSAValue; out Addr: TSSAValue; out WideMode: Integer): Boolean;
+var
+  Rec: string;
+  Bar: Integer;
+begin
+  Result := False; WideMode := 0; Addr := MakeSSAValue(svkNone);
+  if (Val.Kind <> svkRegister) or (Val.RegType <> srtString) then Exit;
+  Rec := FZStrTextAddr.Values[IntToStr(Val.RegIndex)];
+  if Rec = '' then Exit;
+  Bar := Pos('|', Rec);
+  if Bar < 2 then Exit;
+  Addr := MakeSSARegister(srtInt, StrToIntDef(Copy(Rec, 1, Bar - 1), -1));
+  WideMode := StrToIntDef(Copy(Rec, Bar + 1, MaxInt), 0);
+  Result := Addr.RegIndex >= 0;
+end;
+
+procedure TSSAGenerator.NoteZStrCharRead(const Dst, Addr: TSSAValue; WideMode: Integer);
+// Records that an INT register holds ONE CHARACTER read at the address of a ZSTRING/WSTRING pointee,
+// and WHICH address - so a STRING context can ask for the text there instead of the number.
+//
+// ⛔ Keyed on the REGISTER and not on the AST node, and that is what makes the cure small: the arm then
+// belongs in EnsureStringRegister - the innermost hook - and EnsureStringRegisterOf inherits it through
+// its own fallthrough, which is where BigInt and Boolean already solve this same problem ("an INT
+// register that must render as something else in a string context").
+// ⭐ Keeping the ADDRESS rather than re-deriving it from the node also means the index expression is
+// evaluated ONCE: "p[f()]" in a string context must not call f twice.
+begin
+  if (Dst.Kind <> svkRegister) or (Addr.Kind <> svkRegister) then Exit;
+  FZStrCharAddr.Values[IntToStr(Dst.RegIndex)] := IntToStr(Addr.RegIndex) + '|' + IntToStr(WideMode);
+end;
+
+function TSSAGenerator.ZStrCharAddrOf(const Val: TSSAValue; out Addr: TSSAValue; out WideMode: Integer): Boolean;
+// The address behind an INT register that is one character of a ZSTRING/WSTRING pointee, if it is one.
+var
+  Rec: string;
+  Bar: Integer;
+begin
+  Result := False; WideMode := 0; Addr := MakeSSAValue(svkNone);
+  if (Val.Kind <> svkRegister) or (Val.RegType <> srtInt) then Exit;
+  Rec := FZStrCharAddr.Values[IntToStr(Val.RegIndex)];
+  if Rec = '' then Exit;
+  Bar := Pos('|', Rec);
+  if Bar < 2 then Exit;
+  Addr := MakeSSARegister(srtInt, StrToIntDef(Copy(Rec, 1, Bar - 1), -1));
+  WideMode := StrToIntDef(Copy(Rec, Bar + 1, MaxInt), 0);
+  Result := Addr.RegIndex >= 0;
+end;
+
 function TSSAGenerator.RawTypeCodeOfPointee(const PointeeType: string): Integer;
 // Raw element type code for a raw pointer with the given (scalar) pointee type.
 var
@@ -45733,6 +45912,8 @@ var
   TempReg: Integer;
   FloatReg: Integer;
   FloatRegVal: TSSAValue;
+  ZTextAddr: TSSAValue;
+  ZTextWide: Integer;
 begin
   // Ensure value is in an integer register
   case Val.Kind of
@@ -45767,6 +45948,20 @@ begin
       end
       else if Val.RegType = srtString then
       begin
+        // ⭐⭐ ...UNLESS IT IS THE TEXT OF A ZSTRING/WSTRING POINTEE, and then a numeric context wants
+        // the CODE OF ITS FIRST CHARACTER, not VAL of the text. Measured against fbc:
+        // "Dim n As Integer = *p" over "abcd" is 97 and over "42x" is 52 - the code of "4", NOT the
+        // number 42, so it was never VAL and the two only ever agreed on a string that starts with a
+        // digit and means it. The mirror of the arm in EnsureStringRegister, and the other half of
+        // FreeBASIC's dual reading of a ZSTRING. DIVERGENZE 25.
+        if ZStrTextAddrOf(Val, ZTextAddr, ZTextWide) then
+        begin
+          TempReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, TempReg);
+          EmitInstruction(ssaRawLoadInt, Result, ZTextAddr, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(IfThen(ZTextWide = 1, RawCodeOfWidth(WIDE_CELL_BYTES), RTC_U8)));
+          Exit;
+        end;
         // A STRING asked for as an integer is VAL(s), rounded - the coercion FreeBASIC performs when a
         // string reaches an integer context. Handing the string register back unchanged (what this did,
         // under a comment predicting "will likely cause error later") produced no error at all: the
@@ -45848,6 +46043,8 @@ end;
 function TSSAGenerator.EnsureStringRegister(const Val: TSSAValue): TSSAValue;
 var
   TempReg: Integer;
+  ZCharAddr: TSSAValue;
+  ZCharWide: Integer;
 begin
   // Ensure value is in a string register
   case Val.Kind of
@@ -45872,6 +46069,22 @@ begin
       end
       else if Val.RegType = srtInt then
       begin
+        // ⭐⭐ ...UNLESS IT IS ONE CHARACTER OF A ZSTRING/WSTRING POINTEE, and then a string context
+        // wants THE TEXT AT THAT ADDRESS, not the decimal spelling of the code. Measured against fbc,
+        // on the SAME pointer: "Print z[0]" is "abc" and "Dim i As Integer = z[0]" is 97. Both are
+        // pinned - the second by fbc's own string/indexing.bas - so neither bank can hold the value
+        // alone; the INT reading stays the default and this re-derives the other FROM ITS ADDRESS.
+        // ⛔ Deliberately HERE, the innermost hook, and not at each caller: EnsureStringRegisterOf
+        // falls through to this one, so the shared hook where BigInt and Boolean answer the very same
+        // question ("an INT register that renders as something else in a string context") inherits it.
+        if ZStrCharAddrOf(Val, ZCharAddr, ZCharWide) then
+        begin
+          TempReg := FProgram.AllocRegister(srtString);
+          Result := MakeSSARegister(srtString, TempReg);
+          EmitInstruction(ssaRawLoadZStr, Result, ZCharAddr, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(ZCharWide));
+          Exit;
+        end;
         // Convert int to string using IntToString
         TempReg := FProgram.AllocRegister(srtString);
         Result := MakeSSARegister(srtString, TempReg);
