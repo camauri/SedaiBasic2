@@ -1219,6 +1219,8 @@ type
     procedure NoteArrayElemBytes(const DeclArrName: string; Bytes: Int64);
     function EmitFixedStrElemStore(const FactKey: string; Value: TSSAValue): TSSAValue;  // "ZString * n" element truncation
     // FreeBASIC bare string functions (CHR/STR/LEFT/RIGHT) routed to their $-suffixed forms.
+    function NameIsLocalConst(const NameU: string): Boolean;  // a CONST declared inside the current proc
+    function AddrTempArgIsRuntime(Node: TASTNode): Boolean;   // @str/@chr/@wstr/@wchr: the arg is a run-time value
     procedure EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
     // FreeBASIC short-circuit operators a ANDALSO b / a ORELSE b (lowered via the IIF/IF mechanism).
     procedure EmitShortCircuit(Node: TASTNode; out Result: TSSAValue);
@@ -14458,6 +14460,114 @@ begin
 
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(Op, Result, A0, A1, MakeSSAConstInt(W));
+end;
+
+function TSSAGenerator.NameIsLocalConst(const NameU: string): Boolean;
+// Is this name a CONST declared inside the procedure being lowered?
+//
+// ⛔ It has to be asked of the AST, because no registry holds it, and that is BY DESIGN and written at
+// the site: CollectSharedVars - the pre-scan that fills FConstDeclSeen / FModuleConstVals - refuses to
+// descend into procedure bodies, because a module-level CONST lowers to a SHARED DIM and a proc-local
+// one must never be promoted to a shared global. So a local CONST is a register like any local, and
+// nothing downstream can tell it from a variable by name.
+// ⇒ The declaration is the only witness, and this walks the current procedure for it. It runs on ONE
+// path (the @str/@chr/@wstr/@wchr refusal), only for a name that is not a constant anywhere else, so
+// the walk costs nothing that matters and buys not refusing a program fbc accepts.
+var
+  Proc: TASTNode;
+
+  function Walk(N: TASTNode): Boolean;
+  // ⛔ The NAME is in child 0, not in the node's own Value - the declaration node carries only the
+  // attributes ("SHARED=1,CONSTDECL=1", and it is marked SHARED even inside a SUB, which is exactly
+  // why CollectSharedVars refuses to descend into procedure bodies). Matching on Value found the node
+  // and read an empty name.
+  var i: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.Attributes.Values['CONSTDECL'] = '1') and (N.ChildCount >= 1) and
+       (UpperCase(VarToStr(N.GetChild(0).Value)) = NameU) then Exit(True);
+    for i := 0 to N.ChildCount - 1 do
+      if Walk(N.GetChild(i)) then Exit(True);
+  end;
+
+begin
+  Result := False;
+  if (not FInProcedure) or (FCurrentProcName = '') then Exit;
+  if not FProcDecls.TryGetValue(UpperCase(FCurrentProcName), Proc) then Exit;
+  Result := Walk(Proc);
+end;
+
+function TSSAGenerator.AddrTempArgIsRuntime(Node: TASTNode): Boolean;
+// Does this argument to "@str/@chr/@wstr/@wchr( ... )" read a value that only exists at RUN TIME?
+//
+// ⭐ WHY THE QUESTION IS ASKED AT ALL (DIVERGENZE 142). fbc materialises a STATIC temporary for these
+// four and hands back its address, so it accepts them exactly when the argument folds at compile time
+// and answers "error 24: Invalid data types" otherwise. Measured over 15 variants, the accepted side
+// is WIDE: a literal, "64+1", a CONST name, a CONST inside an expression, a float const, a
+// concatenation of literals, a #define, an ENUM member, "SizeOf(Integer)", a CONST declared inside a
+// SUB, even "Asc("A")" - a builtin CALL folded on constant arguments. The refused side is every
+// expression mentioning a variable, a shared scalar, an array element, a field, or a user FUNCTION.
+//
+// ⛔⛔ AND "IS IT BOUND TO A REGISTER?" IS NOT THE DISCRIMINATOR, which is what an instrument said and
+// reading the source had not. A one-line diagnostic over four programs answered bound=TRUE for the
+// CONST "K", for the ENUM member "TWO", **and for the callee names SIZEOF and CHR** - so a predicate
+// built on VarIsBound refused eight forms fbc accepts. A constant here IS a register (this compiler
+// promotes them as the SSA is built), and a callee identifier is not an operand at all.
+// ⇒ What separates them is the CONST REGISTRIES plus not walking into the callee.
+//
+// ⛔ The integer folder answers first, and it is what makes "SizeOf(Integer)" and "64+1" constant
+// without this routine knowing anything about types or arithmetic.
+var
+  i, First: Integer;
+  U: string;
+  Dummy: Int64;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  // Anything the integer folder can evaluate is a compile-time constant by construction: a literal,
+  // a CONST name, arithmetic over them, SizeOf.
+  if TryFoldConstIntExpr(Node, Dummy) then Exit(False);
+  case Node.NodeType of
+    antLiteral:
+      Exit(False);
+    antIdentifier:
+      begin
+        // ⭐ FConstDeclSeen IS THE REGISTRY THAT ANSWERS FOR ALL OF THEM, and its comment at the
+        // declaration site says why: "a non-int CONST still occupies the name". FModuleConstVals holds
+        // only the ones that FOLD to an integer, so asking it alone refused "Const k As Double = 2.5"
+        // and a CONST declared inside a SUB - two forms fbc accepts. The pre-scan that fills
+        // FConstDeclSeen walks the WHOLE program, so a local const is in it too.
+        // ⚠️ And it is FLAT, deliberately read that way here: a name that is a CONST *somewhere* reads
+        // as constant, so the failure mode is accepting a program fbc refuses - the permissiveness
+        // this test narrows - and never refusing one it accepts.
+        U := UpperCase(VarToStr(Node.Value));
+        Exit(not ((FConstDeclSeen.IndexOf(U) >= 0) or (FModuleConstVals.IndexOfName(U) >= 0) or
+                  (FEnumMembers.IndexOf(U) >= 0) or IsStringConstName(U) or NameIsLocalConst(U)));
+      end;
+    antMemberAccess:
+      Exit(True);          // a field is read from an object at run time
+    antArrayAccess, antFunctionCall:
+      begin
+        // "name(args)" is an ARRAY ELEMENT or a call. An element and a USER procedure are run-time
+        // reads; a BUILTIN folds when its arguments do, so for it only the ARGUMENTS decide - and the
+        // callee's own identifier is skipped, because it names an operation and not a value.
+        First := 0;
+        if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+        begin
+          U := UpperCase(VarToStr(Node.GetChild(0).Value));
+          if (ArrayIndexOf(U) >= 0) or FProcDecls.ContainsKey(U) then Exit(True);
+          First := 1;
+        end
+        else if Node.NodeType = antFunctionCall then
+          if FProcDecls.ContainsKey(UpperCase(VarToStr(Node.Value))) then Exit(True);
+        for i := First to Node.ChildCount - 1 do
+          if AddrTempArgIsRuntime(Node.GetChild(i)) then Exit(True);
+        Exit(False);
+      end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    if AddrTempArgIsRuntime(Node.GetChild(i)) then Exit(True);
 end;
 
 procedure TSSAGenerator.EmitBareStringFunc(const DollarName: string; ArrayAccessNode: TASTNode; out Result: TSSAValue);
@@ -36567,6 +36677,7 @@ begin
      (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 2) and
      (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
      ((UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'WSTR') or
+      (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'WCHR') or
       (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'STR') or
       (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'CHR')) and
      (Node.GetChild(0).GetChild(1).NodeType = antExpressionList) and
@@ -38678,10 +38789,32 @@ begin
     // registered keyword while WSTR is not, so it never reaches the antArrayAccess interception that
     // gives WSTR its value ("Array not declared: WCHR", from inside ProcessExpression). A different
     // road, filed as its own ledger entry rather than papered over here.
-    if (UpperCase(ArrName) = 'WSTR') and (Node.ChildCount >= 2) and
+    // ⛔⛔ AND THE ARGUMENT MUST FOLD AT COMPILE TIME, for all four of them (DIVERGENZE 142). fbc
+    // materialises a STATIC temporary here, so there is nothing to take the address OF when the value
+    // is only known at run time: "@str(n)", "@wstr(s)", "@chr(asc(s))", "@str(f())" are all
+    // "error 24: Invalid data types" there, and we answered them. The test names the RUNTIME side on
+    // purpose - see AddrTempArgIsRuntime for why that direction is the whole design.
+    if ((UpperCase(ArrName) = 'WSTR') or (UpperCase(ArrName) = 'WCHR') or
+        (UpperCase(ArrName) = 'STR') or (UpperCase(ArrName) = 'CHR')) and
+       (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antExpressionList) and
+       (ArrayIndexOf(ArrName) < 0) and AddrTempArgIsRuntime(Node.GetChild(1)) then
+      raise Exception.CreateFmt(
+        'Cannot take the address of a %s() temporary built from a run-time value: ' +
+        'the argument must be a compile-time constant', [UpperCase(ArrName)]);
+
+    // ⭐ WCHR REACHES THE VALUE BY A DIFFERENT ROAD, and that is the whole of DIVERGENZE 141. WSTR is
+    // NOT a registered keyword, so it arrives here as an antArrayAccess and the interception a few
+    // hundred lines up gives it its value; WCHR **is** registered, so nothing intercepts the
+    // array-access spelling and ProcessExpression answered "Array not declared: WCHR" - a refusal on a
+    // program fbc accepts. EmitBareStringFunc is the machinery that already exists for exactly this:
+    // it synthesises the antFunctionCall the builtin handler expects, from this node's argument list.
+    if ((UpperCase(ArrName) = 'WSTR') or (UpperCase(ArrName) = 'WCHR')) and (Node.ChildCount >= 2) and
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 1) then
     begin
-      ProcessExpression(Node, TempVal);
+      if UpperCase(ArrName) = 'WCHR' then
+        EmitBareStringFunc(kWCHR, Node, TempVal)
+      else
+        ProcessExpression(Node, TempVal);
       if TempVal.Kind <> svkNone then
       begin
         Result := EmitWStringTempAddr(TempVal);
