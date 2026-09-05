@@ -2084,7 +2084,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `@ (Address of)` | ✓ | Address-of a scalar, array element `@arr(i)`, or UDT field `@obj.field` (yields a packed int reference). `@sub` (procedure address) also supported |
 | `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`); supports pointer arithmetic `*(p±n)` |
 | `VARPTR (Variable pointer)` | ✓ | Address of a variable (= @v). |
-| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p); vtable index form deferred. |
+| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p). A MEMBER is named through its type — `ProcPtr( T.proc )`, `ProcPtr( T.constructor, Sub( ByVal As Integer ) )`, `ProcPtr( T.let )`, `ProcPtr( T.+= )`, `ProcPtr( T.[] )`, `ProcPtr( T.cast, Function() As Integer )`, and a property's getter/setter told apart by `Function`/`Sub` — and the optional signature picks the overload (its parameter count *and* its types); with no signature the first declared one wins. The result is a procedure whose FIRST parameter is the object, `Sub cdecl( ByRef As T, … )`, so it is called as `p( obj, … )`. ⚠️ The vtable-index form is refused by name, and two overloads of `Operator Let`/`+=`/`[]` on one type still collapse onto one declaration. |
 
 #### Type or Class Operators
 

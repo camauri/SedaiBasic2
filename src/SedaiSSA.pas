@@ -669,7 +669,8 @@ type
     function IsArrayParamSlot(Idx: Integer): Boolean;
     function EmitParamArrayLBoundSub(const Idx: TSSAValue; ArrayIdx, Dim: Integer): TSSAValue;
     function ProcedureLabelName(const Name: string): string;
-    function OverloadNameForArity(const Name: string; Arity: Integer; const FPParams: string = ''): string;  // @name of an OVERLOAD set
+    function OverloadNameForArity(const Name: string; Arity: Integer; const FPParams: string = '';
+      Sep: Char = '~'): string;  // @name of an OVERLOAD set
     function CondAsIntTruth(const V: TSSAValue): TSSAValue;   // a branchable 0/nonzero INT for any condition
     procedure StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);   // tell "@f" what signature its destination wants
     // UDT/record support (M3)
@@ -680,6 +681,12 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function SoleOverloadLabel(const TypeU, MethNm: string): string;   // T.m when it has exactly ONE overload, else ''
+    function SameTypeNameLoose(const A, B: string): Boolean;
+    function PreProcSigLookup(const Base: string; NP: Integer; const WantTypes: string): string;
+    function ResolveMethodLabelSig(const TypeName, MethNm: string;
+      Arity: Integer; const FPParams: string; Sep: Char = '~'): string;   // pick an overload from a SIGNATURE
+    procedure AddrOfMemberBases(const MethNm, SigKind, SigRet: string; L: TStringList);
+    function MethodLabelForAddrOf(const TypeName, MethNm: string; Node: TASTNode): string;
     function ResolveMethodLabel(const TypeName, MethNm: string): string;  // walk inheritance
     function MethAttrKey(const MethNm: string): string;   // the name a type-decl decorator is filed under
     function MethodIsVirtual(const TypeName, MethNm: string): Boolean;      // OOP: "Declare Virtual ..." (Abstract implies it)
@@ -1599,6 +1606,12 @@ begin
   FTypeScopePath := '';
   FTypeScopeSerial := 0;
   FPreProcSig.CaseSensitive := False;
+  // ⛔⛔ THE KEY CAN CONTAIN AN '=' AND THE STORE SPLITS ON ONE. A member named by the OPERATOR it
+  // overloads is filed "T.OPERATOR+=", and with the default separator that entry came back as the name
+  // "T.OPERATOR+" holding the value "=T,INTEGER|": the lookup found nothing, the VAR was left unsigned
+  // and the call lowered as an array access. Every operator that ENDS in '=' has the same shape
+  // ("+=", "-=", "<=", ">=", "<>"...). #1 cannot appear in any label (DIVERGENZE 151).
+  FPreProcSig.NameValueSeparator := #1;
   FResultTemps := TStringList.Create;
   FVarExplicitType := TStringList.Create;
   FVarExplicitType.CaseSensitive := False;
@@ -2830,6 +2843,8 @@ var
   // User function handling
   FnDef: TUserFunctionDef;
   OldParamValue: TSSAValue;
+  DiagIdx: Integer;   // PROCPTRDIAG only
+  DiagKey: string;    // PROCPTRDIAG only
 begin
   if Node = nil then
   begin
@@ -3005,19 +3020,36 @@ begin
          (Node.GetChild(0).ChildCount >= 1) and
          (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
          (FindUDT(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value))) >= 0) and
-         (ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
-                             VarToStr(Node.GetChild(0).Value)) <> '') then
+         (MethodLabelForAddrOf(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                               VarToStr(Node.GetChild(0).Value), Node) <> '') then
       begin
         // Pointing AT a method is reaching it: fbc refuses "@T.foo" and "ProcPtr(T.foo)" on a private
         // member exactly as it refuses the call ("visibility/*-staticmethod-*-addrof*" and "*-procptr*"
         // are eight COMPILE_ONLY_FAIL tests of its suite). ProcPtr lowers to this same node.
         CheckMemberAccess(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
                           VarToStr(Node.GetChild(0).Value));
+        if GetEnvironmentVariable('PROCPTRDIAG') = '1' then
+        begin
+          // ⛔ Resolved into a variable FIRST: the funnel writes its own trace, so calling it inside a
+          // WriteLn interleaved the two lines and the output could not be read.
+          DiagKey := MethodLabelForAddrOf(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                                          VarToStr(Node.GetChild(0).Value), Node);
+          WriteLn(ErrOutput, '[PROCPTR] @', UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)), '.',
+                  UpperCase(VarToStr(Node.GetChild(0).Value)),
+                  '  sigarity=[', Node.Attributes.Values['SIGARITY'], ']',
+                  ' sigparams=[', Node.Attributes.Values['SIGPARAMS'], ']',
+                  ' sigkind=[', Node.Attributes.Values['SIGKIND'], ']',
+                  ' sigret=[', Node.Attributes.Values['SIGRET'], ']',
+                  ' -> ', DiagKey);
+          for DiagIdx := 0 to FProcedureNames.Count - 1 do
+            if Pos(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) + '.', FProcedureNames[DiagIdx]) = 1 then
+              WriteLn(ErrOutput, '[PROCPTR]   names ', FProcedureNames[DiagIdx]);
+        end;
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadProcAddr, Result,
                         MakeSSALabel(ProcedureLabelName(
-                          ResolveMethodLabel(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
-                                             VarToStr(Node.GetChild(0).Value)))),
+                          MethodLabelForAddrOf(UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)),
+                                               VarToStr(Node.GetChild(0).Value), Node))),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
       // ⭐ "@T.member" WHERE member IS A STATIC DATA MEMBER. A static member is not a field of any
@@ -8563,8 +8595,23 @@ begin
           // OVERLOAD of p to take. Its parameter count is all that separates them here.
           if (Node.GetChild(1).ChildCount >= 2) and
              (Node.GetChild(1).GetChild(1).NodeType = antProcSig) then
+          begin
             AddrNode.Attributes.Values['SIGARITY'] :=
               IntToStr(StrToIntDef(VarToStr(Node.GetChild(1).GetChild(1).Value), -1));
+            // ...and the two facts the COUNT cannot carry, for a member's overload set: a PROPERTY's
+            // getter and setter differ only by SUB/FUNCTION, an OPERATOR CAST's overloads only by the
+            // return type (DIVERGENZE 151).
+            AddrNode.Attributes.Values['SIGKIND'] :=
+              Node.GetChild(1).GetChild(1).Attributes.Values['SIGKIND'];
+            AddrNode.Attributes.Values['SIGRET'] :=
+              Node.GetChild(1).GetChild(1).Attributes.Values['SIGRET'];
+            // ⭐ The written parameter TYPES go where the DESTINATION's types go, because they answer
+            // the same question and OverloadNameForArity already knows how to match them against a
+            // label's type tail. Two overloads of one arity have nothing else to be told apart by.
+            if Node.GetChild(1).GetChild(1).Attributes.Values['SIGPARAMTYPES'] <> '' then
+              AddrNode.Attributes.Values['SIGPARAMS'] :=
+                Node.GetChild(1).GetChild(1).Attributes.Values['SIGPARAMTYPES'];
+          end;
           ProcessExpression(AddrNode, Result);
           AddrNode.Free;
           Exit;
@@ -25569,14 +25616,23 @@ begin
   if (InitNode = nil) or (Sig = '') then Exit;
   while (InitNode.NodeType = antParentheses) and (InitNode.ChildCount >= 1) do
     InitNode := InitNode.GetChild(0);
-  if (InitNode.NodeType <> antProcAddress) or (InitNode.ChildCount <> 0) then Exit;
+  // ⭐ A MEMBER's address is stamped too. "@T.m" is an antProcAddress with ONE child (the member
+  // access), so the "bare @name" test excluded it - and its overload was then chosen with nothing to
+  // choose by. It looked right only by accident: SoleOverloadLabel could not see the zero-parameter
+  // member of the set (its key is exactly "T.M~", which its length test skipped), so the one-parameter
+  // overload was the only candidate left. The moment the choice became honest, "@foo.bar" into a
+  // "Function( As Integer )" started answering the NO-ARGUMENT overload (fbc's own
+  // structs/obj_ptrto_static). The destination's parameter types are what pick it, here as everywhere
+  // else. DIVERGENZE 151.
+  if (InitNode.NodeType <> antProcAddress) or (InitNode.ChildCount > 1) then Exit;
+  if (InitNode.ChildCount = 1) and (InitNode.GetChild(0).NodeType <> antMemberAccess) then Exit;
   P := Pos('|', Sig);
   if P > 1 then InitNode.Attributes.Values['SIGPARAMS'] := Copy(Sig, 1, P - 1)
   else if P = 0 then InitNode.Attributes.Values['SIGPARAMS'] := Sig;
 end;
 
 function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer;
-  const FPParams: string): string;
+  const FPParams: string; Sep: Char): string;
 // The member of an OVERLOAD set to take the address of. An overload set has no bare label - every member
 // carries a "~<sig>" suffix - so "@s" / "ProcPtr(s)" had nothing to point at and died as an undefined
 // procedure. With a signature argument ("ProcPtr(s, Sub(ByVal i As Integer))", fbc 1.09+) the parameter
@@ -25592,12 +25648,16 @@ function TSSAGenerator.OverloadNameForArity(const Name: string; Arity: Integer;
 // ⛔ Only a UNIQUE match is taken: two candidates that fit equally well leave the arity rule in place,
 // which is what it did before.
 var
-  Pref, BankPart, Cand: string;
+  Pref, BankPart, Cand, WantBanks, Tail: string;
+  Parts: TStringList;
   k, Hits: Integer;
 begin
   Result := Name;
   if FProcDecls.ContainsKey(UpperCase(Name)) then Exit;
-  Pref := UpperCase(Name) + '~';
+  // ⛔ The separator is a PARAMETER because a CONSTRUCTOR's overload set does not use '~': its members
+  // are filed "T.CONSTRUCTOR#", "T.CONSTRUCTOR#I". Everything after it is the same signature tail, so
+  // this is the one character that differs (DIVERGENZE 151).
+  Pref := UpperCase(Name) + Sep;
   if FPParams <> '' then
   begin
     Cand := ''; Hits := 0;
@@ -25610,6 +25670,40 @@ begin
         Cand := FProcedureNames[k];
       end;
     if (Hits = 1) and (Cand <> '') then Exit(Cand);
+    // ⭐⭐ ...AND THE SECOND PASS IS THE BANK SEQUENCE, because a label records a BUILTIN parameter as
+    // one bank LETTER and no type tail at all. "Sub( ByVal As Integer )" and "Sub( ByRef As String )"
+    // therefore have nothing for the tail comparison above to look at - it separated only the UDT
+    // overload - and all three fell to the arity rule, which took the FIRST of one arity. Measured on
+    // fbc's own procptr-member: three overloads of one arity that must give three DIFFERENT addresses.
+    // ⛔ A candidate that DOES carry a tail must still match it, or the UDT overload would be claimed
+    // here by any int-banked request - a UDT handle signs 'I' exactly like an Integer.
+    WantBanks := '';
+    Parts := TStringList.Create;
+    try
+      Parts.StrictDelimiter := True;
+      Parts.Delimiter := ',';
+      Parts.DelimitedText := UpperCase(FPParams);
+      for k := 0 to Parts.Count - 1 do
+        if FindUDT(Trim(Parts[k])) >= 0 then WantBanks := WantBanks + 'I'
+        else WantBanks := WantBanks + BankToChar(TypeNameToBank(Trim(Parts[k]), ''));
+    finally
+      Parts.Free;
+    end;
+    if WantBanks <> '' then
+    begin
+      Cand := ''; Hits := 0;
+      for k := 0 to FProcedureNames.Count - 1 do
+        if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+        begin
+          Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+          if SigBankPart(Tail) <> WantBanks then Continue;
+          if (SigNamePart(Tail) <> '') and
+             not TypeTailMatchesCanonical(UpperCase(FPParams), SigNamePart(Tail)) then Continue;
+          Inc(Hits);
+          Cand := FProcedureNames[k];
+        end;
+      if (Hits = 1) and (Cand <> '') then Exit(Cand);
+    end;
   end;
   for k := 0 to FProcedureNames.Count - 1 do
     if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
@@ -27784,6 +27878,14 @@ begin
   // types both signed "F" and a call to "f( As MyEnum )" picked the Double overload instead.
   else if (FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0) then
     Result := srtInt
+  // ⭐ ...AND SO IS A UDT, for the same reason and with the same failure: a record variable holds an
+  // INT HANDLE (RegisterRecordVars says so in as many words), and without this a type NAME fell to the
+  // suffix fallback below - the classic FLOAT default. It surfaced on an indirect call to a member
+  // through "ProcPtr( T.m, ... )": the signature's first parameter is the object, it was staged into
+  // the FLOAT bank while the callee read THIS out of the INT bank, and the method dereferenced
+  // whatever was there (DIVERGENZE 151). Same shape as the ENUM line above it.
+  else if FindUDT(T) >= 0 then
+    Result := srtInt
   else
     Result := GetVariableType(FieldName);  // unknown (e.g. nested UDT, deferred): fall back to suffix
 end;
@@ -29552,6 +29654,144 @@ begin
     end;
 end;
 
+function TSSAGenerator.ResolveMethodLabelSig(const TypeName, MethNm: string;
+  Arity: Integer; const FPParams: string; Sep: Char): string;
+// ResolveMethodLabel's third form: pick between OVERLOADS from a SIGNATURE rather than from an argument
+// list. It is what "ProcPtr( T.m, Sub( ByVal As Integer ) )" needs (fbc 1.09+), and it is the half the
+// note on SoleOverloadLabel named and left out - "@T.m has no argument list to choose with, and the
+// choice belongs to the DESTINATION type, which this lookup cannot see". The signature IS that choice,
+// written at the site.
+//
+// ⭐ It adds no rule of its own: OverloadNameForArity is the SAME funnel a free procedure's "@f" asks,
+// and it already knows both halves - the parameter COUNT, and the destination's parameter TYPES when
+// the count cannot separate two candidates. Only the inheritance walk is this function's own.
+// ⛔ Answers ONLY when a decorated overload was actually chosen. A method with a single declaration is
+// filed under its bare name and belongs to ResolveMethodLabel, which also knows the nested-type and
+// ALIAS spellings; taking it here would be a second road to an answer that already has one.
+var
+  T, Base, Lbl: string;
+  Idx, Guard, Idx2: Integer;
+begin
+  Result := '';
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Base := T + '.' + UpperCase(MethNm);
+    if Sep = #0 then
+    begin
+      // "match any sigil": the first FProcedureNames entry that starts with Base, in declaration
+      // order. Only the CAST spelling asks for this - see AddrOfMemberBases.
+      for Idx2 := 0 to FProcedureNames.Count - 1 do
+        if Copy(FProcedureNames[Idx2], 1, Length(Base)) = Base then Exit(FProcedureNames[Idx2]);
+    end
+    else
+    begin
+      Lbl := OverloadNameForArity(Base, Arity, FPParams, Sep);
+      if (Lbl <> Base) and (FProcedureNames.IndexOf(Lbl) >= 0) then Exit(Lbl);
+    end;
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+procedure TSSAGenerator.AddrOfMemberBases(const MethNm, SigKind, SigRet: string; L: TStringList);
+// The INTERNAL names "T.<spelling>" can mean, in the order they are tried, each with the separator its
+// overload set uses, written "<base>"#1"<sep>" (DIVERGENZE 151).
+//
+// ⛔ A BASIC program names a special member the way it DECLARES it - "T.constructor", "T.let",
+// "T.+=", "T.cast" - while this compiler files those under names of its own, and the mapping is not
+// one rule but four shapes:
+//   constructor  -> CONSTRUCTOR, and its overload set is separated by '#', not '~'
+//   destructor   -> DESTRUCTOR   (already resolved: it has no overloads to separate)
+//   let / +=     -> OPERATOR<word or symbol>
+//   cast         -> OPERATORCAST plus the RETURN-TYPE sigil, because two casts differ ONLY by return
+//                   type; CastReturnCode is the one place that knows that sigil and is asked here too
+//   a property   -> <name> for the getter and <name>.SET for the setter, told apart by whether the
+//                   signature is a FUNCTION or a SUB
+// ⚠️ An ordinary method is tried under its own name as well, so a method literally called "cast" or a
+// property whose signature says nothing still resolves. Candidates are tried in order and the first
+// that names a real procedure wins, so adding one can only turn a refusal into an answer.
+var
+  M: string;
+begin
+  M := UpperCase(Trim(MethNm));
+  if M = 'CONSTRUCTOR' then
+  begin
+    L.Add('CONSTRUCTOR' + #1 + '#');
+    Exit;
+  end;
+  if M = 'DESTRUCTOR' then
+  begin
+    L.Add('DESTRUCTOR' + #1 + '~');
+    Exit;
+  end;
+  if M = 'CAST' then
+  begin
+    if SigRet <> '' then L.Add('OPERATORCAST' + CastReturnCode(SigRet) + #1 + '~');
+    // ⛔ With NO signature the answer is the FIRST DECLARED cast, not a fixed bank: fbc's own test
+    // asserts "procptr( T.cast ) = procptr( T.cast, function() as single )" on a type whose first
+    // cast returns SINGLE. Forcing '%' answered the INTEGER one - a plausible choice that is simply
+    // not the rule. The sigil-less prefix lets the scan take them in declaration order.
+    L.Add('OPERATORCAST' + #1 + #0);      // #0 = "match any sigil": the first declared wins
+    // ⛔ ...and the SIGIL-LESS spelling last, for the ONE registry that does not carry it: the early
+    // signature pre-scan reads a DECLARATION, and the return sigil is appended later by the collector,
+    // so every cast of a type is filed there under one name. The written signature says what the
+    // return is, and the caller puts it back (see PreProcPtrSigOf).
+    L.Add('OPERATORCAST' + #1 + '~');
+    Exit;
+  end;
+  // A property SETTER is a SUB and lives under "<name>.SET"; its GETTER is the bare name. With no
+  // signature the getter is taken, which is the first-declared rule everywhere else here.
+  if SameText(SigKind, 'SUB') then L.Add(M + '.SET' + #1 + '~');
+  L.Add(M + #1 + '~');                                       // an ordinary method, or a getter
+  L.Add('OPERATOR' + M + #1 + '~');                          // "T.let", "T.+=", "T.[]"
+end;
+
+function TSSAGenerator.MethodLabelForAddrOf(const TypeName, MethNm: string; Node: TASTNode): string;
+// The label "@T.m" / "ProcPtr( T.m [, <signature>] )" points at. ⛔ ONE place, asked by the GATE of the
+// "@Type.method" branch and by the instruction it emits, because those two disagreeing is how this went
+// wrong before: the gate said "yes, a method" from a lookup that could not see the signature, and the
+// emitter then took whichever overload that lookup happened to answer.
+//
+// ⚠️ With nothing to choose with - no signature and no destination type - the FIRST declared overload is
+// taken, which is fbc's own rule and is measured: its procptr-member test asserts
+// "procptr( T.proc ) = procptr( T.proc, sub() )" where sub() is the first declaration.
+var
+  L: TStringList;
+  i, P: Integer;
+  Base: string;
+  Sep: Char;
+  Arity: Integer;
+begin
+  Result := '';
+  Arity := StrToIntDef(Node.Attributes.Values['SIGARITY'], -1);
+  L := TStringList.Create;
+  try
+    AddrOfMemberBases(MethNm, Node.Attributes.Values['SIGKIND'],
+                      Node.Attributes.Values['SIGRET'], L);
+    for i := 0 to L.Count - 1 do
+    begin
+      P := Pos(#1, L[i]);
+      Base := Copy(L[i], 1, P - 1);
+      Sep  := L[i][P + 1];
+      Result := ResolveMethodLabelSig(TypeName, Base, Arity,
+                                      Node.Attributes.Values['SIGPARAMS'], Sep);
+      if GetEnvironmentVariable('PROCPTRDIAG') = '1' then
+        WriteLn(ErrOutput, '[PROCPTR] try ', TypeName, '.', Base, ' sep=', Sep,
+                ' arity=', Arity, ' -> sig[', Result, '] plain[',
+                ResolveMethodLabel(TypeName, Base), ']');
+      if Result <> '' then Exit;
+      Result := ResolveMethodLabel(TypeName, Base);
+      if Result <> '' then Exit;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
 function TSSAGenerator.ResolveMethodLabel(const TypeName, MethNm: string): string;
 // Find a method by walking up the inheritance chain: Child.method, then Parent.method, ...
 var
@@ -31092,15 +31332,21 @@ begin
   // procedure, so "Var p = ProcPtr(f)" can be stamped with the signature the explicit spelling
   // "Dim p As Sub(...)" carries. The parameter TYPE names are already in the shape FPPARAMS wants
   // ("INTEGER PTR" is one identifier here), so nothing is rebuilt - it is read off.
-  // ⚠️ A METHOD is skipped: its label carries an implicit THIS that this list would then declare as
-  // a parameter of the pointer, and ProcPtr on a method is a different question (a vtable index).
+  // ⭐⭐ A METHOD IS IN TOO, AND ITS IMPLICIT THIS IS A REAL PARAMETER (DIVERGENZE 151). The note that
+  // stood here skipped one - "its label carries an implicit THIS that this list would then declare as a
+  // parameter of the pointer, and ProcPtr on a method is a different question (a vtable index)". Both
+  // halves of that were wrong, and MEASURING fbc is what said so: a pointer to a member IS a procedure
+  // whose FIRST parameter is the object, "Sub cdecl( ByRef As T, ... )" - fbc's own procptr-member test
+  // asserts that type and then CALLS through it passing the object explicitly. And the vtable question
+  // is the DIFFERENT spelling "ProcPtr( p, Virtual )", which is refused by name where it is lowered.
+  // ⇒ The owner type is prepended to the parameter list, which is exactly the type the pointer has.
   if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) then
   begin
     NameNode := Node.GetChild(0);
     if (NameNode <> nil) and (NameNode.NodeType = antIdentifier) then
     begin
       Nm := UpperCase(VarToStr(NameNode.Value));
-      if (Nm <> '') and (Pos('.', Nm) = 0) and (FPreProcSig.IndexOfName(Nm) < 0) then
+      if (Nm <> '') and (FPreProcSig.IndexOfName(Nm) < 0) then
       begin
         Ps := '';
         for i := 0 to Node.ChildCount - 1 do
@@ -31120,6 +31366,10 @@ begin
         if (UpperCase(VarToStr(Node.Value)) = 'FUNCTION') and (NameNode.ChildCount >= 1) and
            (NameNode.GetChild(0).NodeType = antIdentifier) then
           Rt := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+        // ⭐ ...and the implicit THIS needs NOTHING added: a method's antParameterList ALREADY carries
+        // it as its first entry, so "T.proc()" records "T" and "T.proc(x)" records "T,INTEGER" - which
+        // IS the pointer's type, "Sub cdecl( ByRef As T [, ...] )". Prepending the owner was tried and
+        // the diagnostic printed "T,T": the list said it first.
         FPreProcSig.Values[Nm] := Ps + '|' + Rt;
       end;
     end;
@@ -31152,10 +31402,12 @@ function TSSAGenerator.PreProcPtrSigOf(Node: TASTNode): string;
 // signature is what the declaration has to say, and this is the half that says it.
 var
   Args: TASTNode;
-  Base, Ps: string;
-  i, k, NP, Hit, NPos: Integer;
+  Base, Ps, OwnerT, SigKind, SigRet, SigPT, Hit2: string;
+  Cands: TStringList;
+  i, NP: Integer;
 begin
   Result := '';
+  OwnerT := ''; SigKind := ''; SigRet := ''; SigPT := '';
   if Node = nil then Exit;
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   Base := ''; NP := -1;
@@ -31188,20 +31440,126 @@ begin
     else
       Exit;
     if (Args = nil) or (Args.ChildCount < 1) then Exit;
-    if Args.GetChild(0).NodeType <> antIdentifier then Exit;
-    Base := UpperCase(VarToStr(Args.GetChild(0).Value));
+    if Args.GetChild(0).NodeType = antIdentifier then
+      Base := UpperCase(VarToStr(Args.GetChild(0).Value))
+    // ⭐ "ProcPtr( T.m, ... )" - a MEMBER. The operand is a member ACCESS, not an identifier, and this
+    // pre-pass exited on it: the VAR was then left unsigned and "p( v )" lowered as an array access,
+    // "Array not declared: P" - the exact failure DIVERGENZE 57 records for the free spelling
+    // (DIVERGENZE 151). The name is the DECLARATION's, so the special spellings go through the same
+    // map the address path uses.
+    else if (Args.GetChild(0).NodeType = antMemberAccess) and
+            (Args.GetChild(0).ChildCount >= 1) and
+            (Args.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+    begin
+      OwnerT := UpperCase(VarToStr(Args.GetChild(0).GetChild(0).Value));
+      Base := OwnerT + '.' + UpperCase(VarToStr(Args.GetChild(0).Value));
+    end
+    else
+      Exit;
     // "ProcPtr(f, Sub(ByVal As Byte))" names ONE overload of f, and the only thing the bare signature
     // node carries is the parameter COUNT - which is all that is needed to pick between them.
     if (Args.ChildCount >= 2) and (Args.GetChild(1).NodeType = antProcSig) then
+    begin
       NP := StrToIntDef(VarToStr(Args.GetChild(1).Value), -1);
+      SigKind := Args.GetChild(1).Attributes.Values['SIGKIND'];
+      SigRet  := Args.GetChild(1).Attributes.Values['SIGRET'];
+      SigPT   := Args.GetChild(1).Attributes.Values['SIGPARAMTYPES'];
+      // ⛔ ...and a MEMBER's recorded list carries the implicit THIS, which the WRITTEN signature does
+      // not: "ProcPtr( T.proc, Sub() )" names "T.proc()", whose recorded list is "T". One is added
+      // here rather than taken off there, because the recorded list IS the pointer's own type.
+      if (NP >= 0) and (OwnerT <> '') then Inc(NP);
+    end;
+  end;
+  // ⭐⭐ AND THE SPELLING MAP IS THE SAME ONE THE ADDRESS PATH ASKS. "T.let" is filed "T.OPERATORLET",
+  // "T.constructor" is "T.CONSTRUCTOR#...", a property's setter is "<name>.SET" - so looking the
+  // written spelling up here directly found nothing, the VAR stayed unsigned and the call lowered as
+  // an array access ("Array not declared: FP_OP_LET_BYREF_AS_CONST_T"). Two sites asking the same
+  // question, and only one going through the funnel - the shape this project keeps recording.
+  if OwnerT <> '' then
+  begin
+    Cands := TStringList.Create;
+    try
+      AddrOfMemberBases(Copy(Base, Length(OwnerT) + 2, MaxInt), SigKind, SigRet, Cands);
+      if GetEnvironmentVariable('PROCPTRDIAG') = '1' then
+      begin
+        WriteLn(ErrOutput, '[PROCPTR] preSig owner=', OwnerT, ' meth=',
+                Copy(Base, Length(OwnerT) + 2, MaxInt), ' np=', NP);
+        for i := 0 to FPreProcSig.Count - 1 do
+          WriteLn(ErrOutput, '[PROCPTR]   pre ', FPreProcSig.Names[i], ' = ', FPreProcSig.ValueFromIndex[i]);
+      end;
+      for i := 0 to Cands.Count - 1 do
+      begin
+        Ps := Copy(Cands[i], 1, Pos(#1, Cands[i]) - 1);
+        Hit2 := PreProcSigLookup(OwnerT + '.' + Ps, NP, SigPT);
+        if GetEnvironmentVariable('PROCPTRDIAG') = '1' then
+          WriteLn(ErrOutput, '[PROCPTR]   preTry ', OwnerT + '.' + Ps, ' -> [', Hit2, ']');
+        if Hit2 <> '' then
+        begin
+          // ⭐ The WRITTEN signature owns the RETURN. It is what the program said the pointer returns,
+          // and it is the only thing that separates two OPERATOR CASTs of one type - which the pre-scan
+          // above cannot tell apart, because it reads the declaration before the return sigil is put on.
+          if SigKind <> '' then
+            Hit2 := Copy(Hit2, 1, Pos('|', Hit2)) + UpperCase(SigRet);
+          Exit(Hit2);
+        end;
+      end;
+    finally
+      Cands.Free;
+    end;
+    Exit('');
   end;
   if Base = '' then Exit;
+  Result := PreProcSigLookup(Base, NP, '');
+end;
+
+function TSSAGenerator.SameTypeNameLoose(const A, B: string): Boolean;
+// Are these two written type names the SAME type? Compared with the NAMESPACE tolerance every other
+// signature match here already has: a declaration records the qualified name a namespace pass built
+// ("TESTS.FOO.T"), while the program writes the name it can see ("T"). Requiring them equal made a
+// "ProcPtr( T.constructor, Sub( ByRef As Const T ) )" inside a namespace resolve to nothing - and the
+// same file at file scope was green, which is exactly the coincidence a namespaced test removes
+// (DIVERGENZE 151).
+// ⛔ The comparison is on a whole SEGMENT, never a substring: "T" must not match "MYT".
+var
+  U, V: string;
+begin
+  U := UpperCase(Trim(A));
+  V := UpperCase(Trim(B));
+  Result := (U = V);
+  if Result or (U = '') or (V = '') then Exit;
+  Result := (Length(U) > Length(V)) and (Copy(U, Length(U) - Length(V), Length(V) + 1) = '.' + V);
+  if Result then Exit;
+  Result := (Length(V) > Length(U)) and (Copy(V, Length(V) - Length(U), Length(U) + 1) = '.' + U);
+end;
+
+function TSSAGenerator.PreProcSigLookup(const Base: string; NP: Integer;
+  const WantTypes: string): string;
+// The "FPPARAMS|FPRET" recorded for the procedure named Base, picking by parameter COUNT when NP >= 0
+// and, when the written signature gave them, by the parameter TYPES.
+// Split out of PreProcPtrSigOf so a MEMBER can ask it once per candidate spelling of its name.
+//
+// ⛔⛔ THE COUNT ALONE PICKS THE WRONG ONE AND THE MISTAKE IS SILENT. A member with
+// "proc( ByVal As Integer )" and "proc( ByRef As String )" has two overloads of the same arity: the
+// count took the first, the VAR was then declared with an INTEGER second parameter, and the string
+// argument was staged into the INT bank while the callee read the STRING one - "proc2 x=" for
+// "proc2 x=hi". The ADDRESS was right the whole time; it is the pointer's declared TYPE that was not.
+// ⭐ Found by the GUARD, not by the probe: alone, the same call has one overload and is green.
+var
+  i, k, Hit, NPos: Integer;
+  Ps, Want: string;
+  L1, L2: TStringList;
+  Same: Boolean;
+begin
+  Result := '';
+  if Base = '' then Exit;
+  Want := UpperCase(Trim(WantTypes));
   Hit := -1;
   for i := 0 to FPreProcSig.Count - 1 do
   begin
     if not SameText(Copy(FPreProcSig.Names[i], 1, Length(Base)), Base) then Continue;
+    // ⛔ '#' as well as '~': a CONSTRUCTOR's overload set is separated by it (see OverloadNameForArity).
     if (Length(FPreProcSig.Names[i]) > Length(Base)) and
-       (FPreProcSig.Names[i][Length(Base) + 1] <> '~') then Continue;
+       not (FPreProcSig.Names[i][Length(Base) + 1] in ['~', '#']) then Continue;
     if NP >= 0 then
     begin
       Ps := FPreProcSig.ValueFromIndex[i];
@@ -31214,6 +31572,23 @@ begin
           if Ps[k] = ',' then Inc(NPos);
       end;
       if NPos <> NP then Continue;
+      // ...and when the written signature named the TYPES, they must line up too. The recorded list
+      // carries the implicit THIS first, so the comparison starts at its SECOND entry.
+      if Want <> '' then
+      begin
+        L1 := TStringList.Create; L2 := TStringList.Create;
+        try
+          L1.StrictDelimiter := True; L1.Delimiter := ','; L1.DelimitedText := Ps;
+          L2.StrictDelimiter := True; L2.Delimiter := ','; L2.DelimitedText := Want;
+          Same := (L1.Count = L2.Count + 1);
+          if Same then
+            for k := 0 to L2.Count - 1 do
+              if not SameTypeNameLoose(Trim(L1[k + 1]), Trim(L2[k])) then begin Same := False; Break; end;
+        finally
+          L1.Free; L2.Free;
+        end;
+        if not Same then Continue;
+      end;
     end;
     Hit := i;
     if NP >= 0 then Break;                 // the count picked it: that is the overload asked for

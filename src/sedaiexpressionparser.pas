@@ -112,6 +112,7 @@ type
     function ParseBinaryOperator(Left: TASTNode; Token: TLexerToken): TASTNode;
     function ParseAssignment(Left: TASTNode; Token: TLexerToken): TASTNode;
     function ParseArrayAccess(Left: TASTNode; Token: TLexerToken): TASTNode;
+    function TryOperatorMemberName: string;  // "T.+=" / "T.[]": a member named by its OPERATOR
     function ParseMemberAccess(Left: TASTNode; Token: TLexerToken): TASTNode; // record.field
     function ParseWithMember(Token: TLexerToken): TASTNode; // leading '.field' inside WITH
     function ParsePower(Left: TASTNode; Token: TLexerToken): TASTNode; // Right-associative
@@ -2191,26 +2192,82 @@ function TExpressionParser.ParseProcSignature(Token: TLexerToken): TASTNode;
 // a trailing "As <type>" for the FUNCTION form) without interpreting the parameter declarations.
 var
   Depth, NParams: Integer;
+  RetTxt, PTypes, Cur, W: string;
+  InAs: Boolean;
 begin
   Result := TASTNode.CreateWithValue(antProcSig, 0, Token);
   Context.Advance;                       // (
   Depth := 1; NParams := 0;
+  PTypes := ''; Cur := ''; InAs := False;
   while (Depth > 0) and not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
   begin
     if Context.Check(ttDelimParOpen) then Inc(Depth)
     else if Context.Check(ttDelimParClose) then
     begin
       Dec(Depth);
-      if Depth = 0 then begin Context.Advance; Break; end;
+      if Depth = 0 then
+      begin
+        if InAs then
+        begin
+          if PTypes <> '' then PTypes := PTypes + ',';
+          PTypes := PTypes + Trim(Cur);
+        end;
+        Context.Advance;
+        Break;
+      end;
     end
-    else if Context.Check(ttSeparParam) and (Depth = 1) then Inc(NParams)
-    else if (Depth = 1) and (NParams = 0) then NParams := 1;   // any token inside = at least one param
+    else if Context.Check(ttSeparParam) and (Depth = 1) then
+    begin
+      Inc(NParams);
+      // ⭐ ...and each parameter's TYPE is kept too (DIVERGENZE 151). Two overloads of ONE arity -
+      // "func( byref as const T )", "func( byval as integer )", "func( byref as string )" - are
+      // exactly what fbc's procptr-member test asks apart, and the COUNT cannot separate them.
+      if InAs then
+      begin
+        if PTypes <> '' then PTypes := PTypes + ',';
+        PTypes := PTypes + Trim(Cur);
+      end;
+      Cur := ''; InAs := False;
+    end
+    else if (Depth = 1) and Context.Check(ttAsType) then
+      InAs := True
+    else
+    begin
+      if (Depth = 1) and (NParams = 0) then NParams := 1;   // any token inside = at least one param
+      // ⛔ CONST/BYREF/BYVAL are not part of the type the label's tail records, so they are dropped:
+      // a "ByRef As Const T" parameter and a "ByVal As T" one both sign T there.
+      if InAs and (Depth >= 1) then
+      begin
+        W := UpperCase(Trim(VarToStr(Context.CurrentToken.Value)));
+        if (W <> 'CONST') and (W <> 'BYREF') and (W <> 'BYVAL') and (W <> '') then
+        begin
+          if Cur <> '' then Cur := Cur + ' ';
+          Cur := Cur + W;
+        end;
+      end;
+    end;
     Context.Advance;
   end;
+  Result.Attributes.Values['SIGPARAMTYPES'] := PTypes;
+  // ⭐ The WORD and the RETURN TYPE are kept, not just the parameter count (DIVERGENZE 151). A member's
+  // overload set is not always separated by its parameters: a PROPERTY's getter and setter differ by
+  // being a FUNCTION and a SUB, and an OPERATOR CAST's overloads differ ONLY by their return type. The
+  // count alone cannot name either, and "ProcPtr( T.pr, Function() As Integer )" against
+  // "ProcPtr( T.pr, Sub( ByVal As Integer ) )" is exactly how fbc's own test asks for them.
+  Result.Attributes.Values['SIGKIND'] := UpperCase(Token.Value);
   if Context.Check(ttAsType) then          // "... As <ret>" of the FUNCTION form
   begin
     Context.Advance;
-    if not Context.IsAtEnd then Context.Advance;
+    RetTxt := '';
+    // The type may be several tokens ("Integer Ptr"), and it ends where this argument does.
+    while not Context.IsAtEnd and
+          not Context.CheckAny([ttEndOfLine, ttEndOfFile, ttDelimParClose, ttSeparParam]) do
+    begin
+      if RetTxt <> '' then RetTxt := RetTxt + ' ';
+      RetTxt := RetTxt + VarToStr(Context.CurrentToken.Value);
+      Context.Advance;
+    end;
+    Result.Attributes.Values['SIGRET'] := Trim(RetTxt);
   end;
   Result.Value := NParams;
   DoNodeCreated(Result);
@@ -3498,6 +3555,46 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TExpressionParser.TryOperatorMemberName: string;
+// The SYMBOLIC spelling of an overloaded operator used as a member NAME - "T.+=", "T.[]" - or '' when
+// what follows the '.' is not one (DIVERGENZE 151). On '' the token position is exactly where it was.
+//
+// ⛔ Two conditions, and the second is what makes it safe: the run must spell an operator this dialect
+// can overload, AND it must be FOLLOWED by ',' or ')' or the end of the line. In any real expression an
+// operator is followed by its operand, so a member reference that stops there can only be the address
+// of a member - which is the only place fbc allows this spelling either.
+const
+  cOpMembers: array[0..27] of string = (
+    '+', '-', '*', '/', '\', '^', '&', '=', '<>', '<', '>', '<=', '>=',
+    '+=', '-=', '*=', '/=', '\=', '^=', '&=', '<<=', '>>=', '[]',
+    'MOD', 'SHL', 'SHR', '->', '@');
+var
+  Saved, N, k: Integer;
+  Acc: string;
+begin
+  Result := '';
+  Context.SavePosition(Saved);
+  Acc := '';
+  N := 0;
+  while (N < 3) and not Context.IsAtEnd and
+        not Context.CheckAny([ttEndOfLine, ttEndOfFile]) do
+  begin
+    // ⛔ A COMPOUND ASSIGNMENT is ONE token whose value is the BASE operator - "+=" arrives as '+' -
+    // so its '=' has to be put back or "T.+=" reads as "T.+", which resolves to nothing and reports a
+    // record where the question was about an operator.
+    if Context.Check(ttCompoundAssign) then
+      Acc := Acc + UpperCase(Trim(VarToStr(Context.CurrentToken.Value))) + '='
+    else
+      Acc := Acc + UpperCase(Trim(VarToStr(Context.CurrentToken.Value)));
+    Context.Advance;
+    Inc(N);
+    if Context.CheckAny([ttSeparParam, ttDelimParClose, ttEndOfLine, ttEndOfFile]) then
+      for k := Low(cOpMembers) to High(cOpMembers) do
+        if Acc = cOpMembers[k] then Exit(Acc);
+  end;
+  Context.RestorePosition(Saved);
+end;
+
 function TExpressionParser.ParseMemberAccess(Left: TASTNode; Token: TLexerToken): TASTNode;
 // record.field — the '.' operator has already been consumed by the Pratt loop. Read the
 // field name and build antMemberAccess(value=fieldName, child0=object expr). Chaining
@@ -3513,11 +3610,23 @@ begin
   FieldName := UpperCase(VarToStr(Context.CurrentToken.Value));
   if (FieldName = '') or not (FieldName[1] in ['A'..'Z', '_']) then
   begin
-    HandleError('Expected field name after "."', Context.CurrentToken);
-    Result := Left;
-    Exit;
-  end;
-  Context.Advance;   // consume field name
+    // ⭐ "T.+=" and "T.[]": a member named by the OPERATOR it overloads, which is how a program asks for
+    // one with "@" or "ProcPtr" (DIVERGENZE 151). fbc's own procptr-member test writes both.
+    // ⛔ The guard is NOT the list of symbols alone - it is that the run ENDS the reference: only a ','
+    // or a ')' may follow. In a real expression an operator after a dot is followed by an OPERAND, so
+    // this cannot swallow one; "@T.+=" and "ProcPtr( T.[], ... )" are exactly the two shapes where the
+    // member reference stops there. Everything that does not match restores the position and gets the
+    // diagnostic it has always had.
+    FieldName := TryOperatorMemberName;
+    if FieldName = '' then
+    begin
+      HandleError('Expected field name after "."', Context.CurrentToken);
+      Result := Left;
+      Exit;
+    end;
+  end
+  else
+    Context.Advance;   // consume field name
   // FreeBASIC "base.base.a": BASE names the base SUBOBJECT, so it chains -- base.base is the grandparent
   // level. It is NOT a field called "base", and building a member access for it would send the SSA looking
   // for one. Collapse the chain instead: `base` already parsed to THIS marked BASEREF (StaticParseBase),
