@@ -16073,7 +16073,12 @@ begin
       end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
-    39: // bcGfxGet - GET (x1,y1)-(x2,y2),dst : capture a screen rect into image dst (per-pixel copy)
+    39: // bcGfxGet - GET [src,] (x1,y1)-(x2,y2),dst : capture a rect into image dst (per-pixel copy)
+        // ⛔ It used to name FGfxWorkSurface outright, exactly as bcGfxPut below used to - and the note
+        //  there is the map: DrawSurface is the same funnel PSET/LINE/CIRCLE/PAINT/POINT read, and it
+        //  is the work page whenever no target is active. So "Get src, (..)-(..), dst" evaluated its
+        //  source, set it, and copied out of the SCREEN anyway: dst came back black (DIVERGENZE 146).
+        //  ⇒ One word, and the fix for the twin next door had already written down which word.
       if Assigned(FGraphics) then
       begin
         GetX1 := Ctx.IntRegs[Instr.Src1];
@@ -16086,7 +16091,7 @@ begin
         for GetSy := 0 to (GetY2 - GetY1) do
           for GetSx := 0 to (GetX2 - GetX1) do
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
-              FGraphics.GetPixel(FGfxWorkSurface, GetX1 + GetSx, GetY1 + GetSy));
+              FGraphics.GetPixel(DrawSurface, GetX1 + GetSx, GetY1 + GetSy));
       end;
     40: // bcGfxPut - PUT [img,] (x,y),src[,mode] : blit image src onto the DRAW SURFACE (Immediate[0-15]=
         //  src handle register, Immediate[16-31]=mode ordinal constant)

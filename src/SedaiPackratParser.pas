@@ -250,6 +250,7 @@ type
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
                                WithTypeNames: Boolean = False;
                                PtrKinds: Boolean = False): string;   // CONSTRUCTORS only: see the body
+    function ParseDrawTargetExpr: TASTNode;   // the image handle that opens a graphics statement
     function OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boolean): string;
     function OverloadKeysCollide(const A, B: string): Boolean;
     procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
@@ -873,6 +874,42 @@ begin
   // one label and the FIRST declaration won every call. POSITIONAL, like the others.
   if AnyWidth then
     Result := Result + '%' + Widths;
+end;
+
+function TPackratParser.ParseDrawTargetExpr: TASTNode;
+// The IMAGE HANDLE that opens a graphics statement - "Line img, (x1,y1)-(x2,y2)",
+// "Get img, (..)-(..), dst" - read so that neither of the two shapes that meet here is mangled.
+//
+// ⛔ AT precCall, and the note this replaces says why: read at the DEFAULT precedence a member access
+// swallowed what came after the comma as UNPARENTHESISED CALL ARGUMENTS, so "Line x.p, (0,0)-(31,31)"
+// died inside the first point while the same statement with a plain variable was fine.
+// ⛔⛔ ...BUT precCall ALSO STOPS BEFORE AN INDEX, and that is the other half (DIVERGENZE 146):
+// "Line array(0), (0,0)-(..)" left the target as the bare name "array", and the '(' that follows was
+// read as the start of the coordinate group with no comma before it - "Expected ')' after expression".
+// fbc's own gfx/image-expr keeps its surfaces in an array and writes exactly that.
+// ⇒ A '(' sitting HERE can only be an index: a coordinate group is always preceded by a comma, so the
+// two shapes are told apart by what follows the target and not by a precedence that cannot separate
+// them (an indexed name and a called member are the same syntax).
+var
+  IdxList: TASTNode;
+  Acc: TASTNode;
+begin
+  Result := FExpressionParser.ParseExpression(precCall);
+  while Assigned(Result) and Context.Check(ttDelimParOpen) do
+  begin
+    Context.Advance;                                          // '('
+    IdxList := TASTNode.Create(antExpressionList, Context.CurrentToken);
+    while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    begin
+      IdxList.AddChild(ParseExpression);
+      if Context.Check(ttSeparParam) then Context.Advance;    // ','
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    Acc := TASTNode.Create(antArrayAccess, Result.Token);
+    Acc.AddChild(Result);
+    Acc.AddChild(IdxList);
+    Result := Acc;
+  end;
 end;
 
 function TPackratParser.OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boolean): string;
@@ -2939,11 +2976,41 @@ end;
 function TPackratParser.ParseGetStatement: TASTNode;
 var
   Token: TLexerToken;
-  VarNode: TASTNode;
+  VarNode, SrcNode: TASTNode;
+  k: Integer;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antGet, Token);
   Context.Advance; // Consume GET
+
+  // ⭐ "GET <source>, (x1,y1)-(x2,y2), dst" — the SOURCE-IMAGE spelling (DIVERGENZE 146). fbc reads the
+  // rectangle out of an image instead of the screen, and its own gfx/image-expr is written that way.
+  // Only the screen form was parsed: the leading '(' is what selected it, so a source expression fell
+  // through to the "GET A$" branch and the statement died with "Expected ")" after expression".
+  // ⭐ The PUT side has had the image TARGET since it was written, and it rides on exactly the pair
+  // this reuses - the source is appended as the LAST child with TARGETIDX, so EmitDrawTargetBegin sets
+  // the surface and EffChildCount hides the extra child from the argument count. Nothing new is lowered.
+  // ⛔ The lookahead is the whole safety of it: a source is accepted only when a ',' followed by '(' is
+  // ahead on this statement, which is the one shape "GET A$" and "GET #n" can never have.
+  SrcNode := nil;
+  if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttFileHandlePrefix)) and
+     (Context.CurrentToken.Value <> '#') then
+  begin
+    k := 0;
+    while (k < 64) and
+          not (Context.PeekToken(k).TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    begin
+      if (Context.PeekToken(k).TokenType = ttSeparParam) and
+         (Context.PeekToken(k + 1).TokenType = ttDelimParOpen) then Break;
+      Inc(k);
+    end;
+    if (k < 64) and (Context.PeekToken(k).TokenType = ttSeparParam) and
+       (Context.PeekToken(k + 1).TokenType = ttDelimParOpen) then
+    begin
+      SrcNode := ParseDrawTargetExpr;                           // the source image
+      if Context.Check(ttSeparParam) then Context.Advance;      // ','
+    end;
+  end;
 
   // FreeBASIC graphics "GET (x1,y1)-(x2,y2), dst" — capture a screen rectangle into an image surface.
   // The leading '(' disambiguates from "GET A$" and "GET #n,...".
@@ -2964,9 +3031,16 @@ begin
     if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
     if Context.Check(ttSeparParam) then Context.Advance;        // ','
     Result.AddChild(ParseExpression);                           // dst image handle
+    if Assigned(SrcNode) then    // source image appended last, its index in TARGETIDX (as PUT does)
+    begin
+      Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+      Result.AddChild(SrcNode);
+      SrcNode := nil;
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
+  if Assigned(SrcNode) then SrcNode.Free;   // not the graphics form after all: give the node back
 
   // FreeBASIC binary "GET #n, [pos], var" — read sizeof(var) bytes into a scalar.
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
@@ -9149,13 +9223,9 @@ begin
   if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttOpSub)) and
      (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
   begin
-    // ⛔ AT precCall, NOT at the default precedence. The target is a HANDLE and nothing more; read at
-    // full precedence a member access swallowed what came after the comma as UNPARENTHESISED CALL
-    // ARGUMENTS, so "Line x.p, (0,0)-(31,31)" died inside the first point at "Expected \")\" after
-    // expression" while the identical statement with a plain variable target was fine - the tell that
-    // it was the READING of the target and not the statement. REDIM reads its own target at a low
-    // precedence for the mirror-image reason.
-    TargetNode := FExpressionParser.ParseExpression(precCall);   // image handle
+    // The two shapes that meet here - a called member and an INDEXED name - are told apart in
+    // ParseDrawTargetExpr, which is the one place that reads a graphics statement's image handle.
+    TargetNode := ParseDrawTargetExpr;                           // image handle
     if Context.Check(ttSeparParam) then Context.Advance;    // ','
   end;
   // FreeBASIC "LINE -(x2,y2)": the start point is omitted, so the line runs from the current graphics
@@ -9476,18 +9546,53 @@ function TPackratParser.LooksLikeImageTarget: Boolean;
 // walked here, so "x.p" and "a.b.c" reach the same statement a bare name always did.
 var
   T1, T2: TLexerToken;
-  k: Integer;
+  k, Depth: Integer;
 begin
   Result := False;
   T1 := Context.PeekToken(1);
   if (T1 = nil) or (T1.TokenType = ttDelimParOpen) or (UpperCase(VarToStr(T1.Value)) = kSTEP) then Exit;
-  // Walk "name ( '.' name )*": k lands on the token after the target.
-  k := 2;
+  // ⛔⛔ ...AND AN INDEX IS THE THIRD SHAPE, after the bare name and the dotted chain (DIVERGENZE 146).
+  // A handle kept in an ARRAY is how a program holds several surfaces, and it is how fbc's own
+  // gfx/image-expr holds them: "Line array(0), (0,0)-(w,h), c, bf" failed this test, was never
+  // dispatched to the graphics statement, and reported "Expected ')' after expression" from inside the
+  // first point - the identical symptom the dotted chain used to give. ⇒ The walk skips a BALANCED
+  // parenthesis group, so "a(0)", "a(i,j)" and "x.p(0).q" all reach the statement a bare name reaches.
+  // ⭐ ...and a leading '@' is part of the target, not the end of it: fbc's gfx/image-expr draws into
+  // "@array(0)".
+  // ⛔⛔ '*' IS DELIBERATELY NOT HERE, and the census is why. Accepting it too made five of fbc's own
+  // tests compile that fbc REFUSES - gfx/image-expr-nonptr-deref{integerptr,ubyteptr,udtptr,zstringptr,
+  // fbimageptr}, each drawing through a "*p" whose POINTEE is not a pointer. They were passing because
+  // our parser refused the whole shape, which is a rejection for the wrong reason; widening the parser
+  // without the TYPE check fbc makes would have turned five right answers into five wrong ones.
+  // ⇒ The '*' spelling stays refused until the image expression's TYPE is checked (that check is the
+  // work those five tests are really asking for, and it is filed rather than guessed at here).
+  k := 1;
+  while Assigned(Context.PeekToken(k)) and (Context.PeekToken(k).TokenType = ttOpAt) do Inc(k);
+  if (Context.PeekToken(k) = nil) or
+     (Context.PeekToken(k).TokenType = ttDelimParOpen) then Exit;
+  // Walk "name ( index | '.' name )*": k lands on the token after the target.
+  Inc(k);
   while True do
   begin
     T2 := Context.PeekToken(k);
     if (T2 <> nil) and (T2.TokenType = ttOpDot) and Assigned(Context.PeekToken(k + 1)) then
       Inc(k, 2)                                     // '.' and the segment after it
+    else if (T2 <> nil) and (T2.TokenType = ttDelimParOpen) then
+    begin
+      Depth := 0;
+      while Assigned(Context.PeekToken(k)) and
+            not (Context.PeekToken(k).TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      begin
+        if Context.PeekToken(k).TokenType = ttDelimParOpen then Inc(Depth)
+        else if Context.PeekToken(k).TokenType = ttDelimParClose then
+        begin
+          Dec(Depth);
+          if Depth = 0 then begin Inc(k); Break; end;
+        end;
+        Inc(k);
+      end;
+      if Depth <> 0 then Exit;                      // unbalanced: not this form
+    end
     else
       Break;
   end;

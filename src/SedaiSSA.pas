@@ -18532,8 +18532,13 @@ procedure TSSAGenerator.ProcessGfxGet(Node: TASTNode);
 var
   X1V, Y1V, X2V, Y2V, DV, X1R, Y1R, X2R, Y2R, DR: TSSAValue;
   Instr: TSSAInstruction;
+  HasSrc: Boolean;
 begin
-  if (FCurrentBlock = nil) or (Node.ChildCount < 5) then Exit;
+  if (FCurrentBlock = nil) or (EffChildCount(Node) < 5) then Exit;
+  // ⭐ "GET <source>, (..)-(..), dst" reads the rectangle out of an IMAGE (DIVERGENZE 146). The source
+  // rides in the last child with TARGETIDX, exactly as PUT's draw target does, so setting the surface
+  // is the pair that already exists and EffChildCount hides the extra child from the count above.
+  HasSrc := EmitDrawTargetBegin(Node);
   ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
   ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
   ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
@@ -18543,6 +18548,7 @@ begin
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
   Instr.AddPhiSource(Y2R, nil);
   Instr.AddPhiSource(DR, nil);
+  if HasSrc then EmitDrawTargetEnd;
 end;
 
 procedure TSSAGenerator.ProcessGfxPut(Node: TASTNode);
