@@ -37068,7 +37068,12 @@ begin
   T := UpperCase(Trim(Name));
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(True);
   T := CanonicalType(T);
-  Result := (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') or (T = 'SHORT') or (T = 'USHORT') or
+  // ⭐ ANY is here for the same reason it is in TypeSizeBytes: "Len( Any )" is a question about a TYPE
+  // and fbc answers 0 for it, as it answers 0 for SizeOf( Any ). Without the name in this list the
+  // identifier was not recognised as a type at all and LEN fell through to its VALUE path, which
+  // answered 1 - the length of something that has no length (DIVERGENZE 145).
+  Result := (T = 'ANY') or
+            (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') or (T = 'SHORT') or (T = 'USHORT') or
             (T = 'LONG') or (T = 'ULONG') or (T = 'INTEGER') or (T = 'UINTEGER') or
             (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'SINGLE') or (T = 'DOUBLE') or
             (T = 'STRING') or (T = 'WSTRING') or (T = 'ZSTRING') or
@@ -37108,6 +37113,12 @@ begin
   // neighbour was here from the start.
   else if T = 'ZSTRING' then Result := 1
   else if T = 'WSTRING' then Result := WIDE_CELL_BYTES
+  // ⛔ ANY HAS NO SIZE, AND fbc SAYS SO: SizeOf(Any) is 0 there (DIVERGENZE 145). It is not a type
+  // with a width - it is a POINTEE, and only "Any Ptr" is a real type (8, taken by the PTR test at the
+  // top of this routine). Absent from this list the name fell to the "unknown type is pointer-sized"
+  // default and answered 8, which is the same wrong number an unrecognised identifier gets - the very
+  // shape that hid SizeOf(ZString) two lines above.
+  else if T = 'ANY' then Result := 0
   else if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Result := 1
   else if (T = 'SHORT') or (T = 'USHORT') then Result := 2
   else if (T = 'LONG') or (T = 'ULONG') then Result := 4

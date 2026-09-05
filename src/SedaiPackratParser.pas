@@ -7766,7 +7766,20 @@ begin
   else if CmdName = 'PRST' then
     MaxParams := 0  // PRST (no parameters)
   else if CmdName = 'SCREENRES' then
-    MaxParams := 4  // SCREENRES w, h [, depth [, num_pages]]
+    // ⛔ SIX, and it was FOUR (DIVERGENZE 143). fbc's ScreenRes is
+    // "w, h [, depth [, num_pages [, flags [, refresh_rate]]]]" - seven arguments is where it answers
+    // "error 1: Argument count mismatch", six is legal - and the STATEMENT stopped at four. The fifth
+    // and sixth were not refused: they fell out of the statement and reached SSA generation as
+    // top-level nodes ("[SSA] WARNING: Unhandled node type 40"), which is the same silent shape as the
+    // file handle of DIVERGENZE 6.
+    // ⚠️ It matters more than the noise on stderr: the FIFTH argument carries the DRIVER FLAGS, and
+    // "screenres w, h, 32, , fb.GFX_NULL" - the null driver, which is what makes a graphics test
+    // runnable with no display - is how fbc's own graphics suite opens EVERY test.
+    // ⭐ The FUNCTION spelling was right all along, and both spellings lower through the same
+    // ProcessScreenRes, so this is one number and no second copy of the lowering.
+    // ⚠️ depth, flags and refresh_rate are accepted-and-ignored here, exactly as the function form has
+    // always accepted-and-ignored them; only w, h and num_pages reach the backend.
+    MaxParams := 6  // SCREENRES w, h [, depth [, num_pages [, flags [, refresh_rate]]]]
   else
     MaxParams := 5;
 
