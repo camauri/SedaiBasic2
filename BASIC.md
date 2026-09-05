@@ -282,6 +282,10 @@ same limit applies to reading a UDT as raw bytes and to punning a `Single` (stor
 double) through an integer pointer.
 
 
+- **`@wstr( s )` on a string VARIABLE is accepted here, and fbc refuses it** (*error 24: Invalid data
+  types*). fbc allows the address of a `str` / `chr` / `wstr` temporary built from a **literal** and
+  rejects every other string-valued expression — `@mid(s,2,3)`, `@ucase(s)`, `@(s + "cd")` — and so do
+  we, except for this one form. A missing refusal, never a wrong answer.
 - ⚠️ **A declaration must state its type, and that narrows what we used to accept.** In `-lang fb`
   there are no default types and no inference from a type sigil, so `Dim a`, `Dim a$`, `Dim a(0 To 1)`,
   `Common a` and `Dim a = 5` are all refused, exactly as fbc refuses them (`error 147`). The check is
@@ -3332,6 +3336,12 @@ Each of these is *refused with a message that names the reason*, never answered 
 - **`Close(n)` as a FUNCTION.** fbc lets `CLOSE` be called as an expression that answers an error
   code (`0` when the channel was open, `1` = illegal function call otherwise). Only the STATEMENT
   forms are implemented here — `Close #n` and the bare `Close`, which closes every channel.
+- **`@wchr( n )`** — the address of a WIDE temporary built by `WCHR`. `@str(...)`, `@chr(...)` and
+  `@wstr(...)` all work (they materialise a byte or wide-cell temporary and answer its address, which
+  is what fbc does); `WCHR` is a registered keyword here while `WSTR` is not, so inside `@` the operand
+  never reaches the interception that gives `WSTR` its value, and the program is refused rather than
+  answered. ⚠️ fbc accepts it.
+
 - **`ProcPtr(p, Virtual ...)`** (fbc 1.10+) asks for a member's **vtable index**, not its address.
   There is no vtable a program can index here: a virtual call goes through a generated dispatcher
   keyed on the instance's runtime type-id. Call the method directly — the dispatch is the same one.

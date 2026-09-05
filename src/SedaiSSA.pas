@@ -36550,6 +36550,28 @@ begin
     if (not Result) and (Node.Token.TokenType = ttOpAdd) then Result := IsStrDataPtrExpr(Node.GetChild(1));
     Exit;
   end;
+  // ⭐ "@wstr(expr)" IS THE WIDE TWIN OF SADD, and it belongs here for that reason (DIVERGENZE 104).
+  // EmitWStringTempAddr says so in its own header - "the WIDE half of what StrSAdd already is for
+  // bytes": it allocates a raw block and stores the characters into it, so its value is a byte-heap
+  // address exactly as SADD's is. Only the BYTE half was recognised, so "Dim p As WString Ptr =
+  // @wstr("abc")" left p unmarked and every read of it took the MANAGED string road: "Dim i As
+  // Integer = p[0]" emitted a string load into the string bank and then printed the INT register of
+  // the same number, which still held a constant from the address arithmetic - 4 where fbc says 97,
+  // a stale register and no error. ⛔ And the ledger entry named the wrong cause: it blamed the
+  // DECLARATION ("As WString Ptr sends the initializer down a wide path"). A 3x2 matrix says the
+  // declared type does not decide it at all - ZString Ptr, WString Ptr and Any Ptr behave alike, and
+  // what decides is the INITIALIZER's form: @<literal> is marked, @wstr(<literal>) was not.
+  // ⚠️ The same pointer taken from a REAL buffer ("@w" on a WString * 8) was right throughout, which
+  // is what said the gap was this one expression and not the wide model.
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 2) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+     ((UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'WSTR') or
+      (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'STR') or
+      (UpperCase(VarToStr(Node.GetChild(0).GetChild(0).Value)) = 'CHR')) and
+     (Node.GetChild(0).GetChild(1).NodeType = antExpressionList) and
+     (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) < 0) then
+    Exit(True);
   // A call parses as antArrayAccess(nameIdent, args); SADD/STRPTR are not registered keywords, so a
   // same-named declared array must keep winning.
   Result := FModernMode and (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
@@ -38644,6 +38666,18 @@ begin
     // as an antArrayAccess named WSTR (that is how a call with no declaration parses) and fell out of
     // the ladder with "Cannot take address of element of undeclared array: WSTR", which names the
     // spelling rather than the problem. Evaluated as the call it is, then handed a temporary.
+    // ⭐ ...AND STR AND CHR ARE THE SAME THING ON THE BYTE SIDE, and the set was MEASURED against fbc
+    // rather than guessed at. fbc accepts the address of exactly these temporaries and REFUSES every
+    // other string-valued expression: "@mid(s,2,3)", "@ucase(s)", "@(s + "cd")" are all "error 24:
+    // Invalid data types". So the arm stays a LIST OF NAMES; widening it to "any string expression"
+    // would accept programs the oracle rejects.
+    // ⛔ The byte half was a CRASH, not a wrong answer: "@str(123)" died with "Cannot take address of
+    // element of undeclared array: STR", a message that names the spelling instead of the problem -
+    // the same sentence the wide half used to die with before it got its arm.
+    // ⚠️ "@wchr(65)" is NOT here and fbc accepts it: it fails one layer lower, because WCHR **is** a
+    // registered keyword while WSTR is not, so it never reaches the antArrayAccess interception that
+    // gives WSTR its value ("Array not declared: WCHR", from inside ProcessExpression). A different
+    // road, filed as its own ledger entry rather than papered over here.
     if (UpperCase(ArrName) = 'WSTR') and (Node.ChildCount >= 2) and
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 1) then
     begin
@@ -38651,6 +38685,21 @@ begin
       if TempVal.Kind <> svkNone then
       begin
         Result := EmitWStringTempAddr(TempVal);
+        Exit;
+      end;
+    end;
+    // The BYTE twin: the address of a STR/CHR temporary is what StrSAdd answers, which is the same
+    // instruction "@<string constant>" already uses - one road for both spellings of the question.
+    if ((UpperCase(ArrName) = 'STR') or (UpperCase(ArrName) = 'CHR')) and (Node.ChildCount >= 2) and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 1) and
+       (ArrayIndexOf(ArrName) < 0) then
+    begin
+      ProcessExpression(Node, TempVal);
+      if TempVal.Kind <> svkNone then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         Exit;
       end;
     end;
@@ -42990,7 +43039,12 @@ begin
   // "T Ptr" with T a UDT stays a MANAGED record handle, and "T Ptr Ptr" is
   // already raw by construction (IsRawPtr) - neither belongs here.
   if (Pointee = '') or (FindUDT(Pointee) >= 0) or (Pos(' PTR', Pointee) > 0) then Exit;
-  if RawPtrExprName(ArgNode) = '' then Exit;      // the argument is not raw: nothing to carry over
+  // ⭐ ...OR A RAW EXPRESSION WITH NO NAME TO GIVE. RawPtrExprName answers a NAME, so it can only speak
+  // for an argument that IS a variable (or arithmetic on one); "show( @wstr("abc") )" hands over a raw
+  // byte-heap address that never had a name, and the parameter stayed managed - "q[0]" answered "a"
+  // where fbc answers "abc". The BYTE twin "show( @"abc" )" was right all along, which is what said
+  // this is the same asymmetry DIVERGENZE 104 is about and not a second defect.
+  if (RawPtrExprName(ArgNode) = '') and (not IsStrDataPtrExpr(ArgNode)) then Exit;   // not raw: nothing to carry
   PN := UpperCase(VarToStr(ParamNode.Value));
   if PN = '' then Exit;
   if FRawPtrVars.IndexOf(PN) < 0 then
