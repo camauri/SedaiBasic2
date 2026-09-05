@@ -3344,9 +3344,24 @@ Each of these is *refused with a message that names the reason*, never answered 
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
+- **A bare `Any` as a declared TYPE is accepted here and FreeBASIC refuses it.** `Any` is meant to be
+  a pointee — `Any Ptr` is the idiom and works identically on both sides — and fbc rejects it
+  everywhere a real type is needed: a defined procedure's parameter, `ByRef` or `ByVal` (*error 59:
+  Illegal specification*), an array parameter, a `Dim`, a `Type` field and a function's return type
+  (*error 24: Invalid data types*). ⚠️ A bare `Declare` carrying one is accepted by fbc — only the
+  definition is checked. We accept all of them. A missing refusal, never a wrong answer, and left
+  deliberately: the check would have to be repeated at six declaration sites, `ANY` is this
+  compiler's own internal wildcard in overload matching, and no program writes the form.
+  ⚠️ `SizeOf(Any)` answers 8 here and 0 in fbc.
 - **`Close(n)` as a FUNCTION.** fbc lets `CLOSE` be called as an expression that answers an error
   code (`0` when the channel was open, `1` = illegal function call otherwise). Only the STATEMENT
   forms are implemented here — `Close #n` and the bare `Close`, which closes every channel.
+- **`@<statement builtin>`** — `Var p = @Sleep`. In FreeBASIC `Sleep` is a real library function and
+  its address is that function's entry point; here the statement is an OPCODE, so there is no entry PC
+  to hand back and the program is refused by name (*Undefined procedure (address-of @): SLEEP*).
+  ⚠️ fbc refuses the same thing for a true statement keyword (`@Print` is *error 14*), so the two
+  agree except on the builtins it happens to implement as functions.
+
 - **`ProcPtr(p, Virtual ...)`** (fbc 1.10+) asks for a member's **vtable index**, not its address.
   There is no vtable a program can index here: a virtual call goes through a generated dispatcher
   keyed on the instance's runtime type-id. Call the method directly — the dispatch is the same one.
