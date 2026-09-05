@@ -26752,6 +26752,12 @@ begin
            (ArrayIndexOf(UpperCase(VarToStr(Node.GetChild(0).Value))) < 0) then
           Exit(1);
         Result := PrintKindOf(VarToStr(Node.GetChild(0).Value));
+        // ⚠️ The same flat-entry leak that DIVERGENZE 103 closed in IsUnsigned64Expr was looked for
+        // HERE too and MEASURED NOT TO EXIST: a scalar "b" of an unsigned type - parameter, module
+        // variable, or an unsigned module ARRAY - does not reach an array parameter "b()" of another
+        // procedure through this path, on any of the three shapes written to break it. A veto was
+        // written for this site, read inert on all of them, and was taken back out rather than kept
+        // on the strength of the argument.
         // ⛔ ...but a POINTER's own print kind is not its ELEMENT's. "p[i]" reads the POINTEE, and the
         // pointee's type is what decides the sign space - the pointer prints unsigned because an address
         // is unsigned, which says nothing about the Integer it points at. Cleared here so the pointee
@@ -40393,12 +40399,25 @@ begin
         Result := (U = 'CUINT') or (U = 'CULNGINT') or (U = kCUNSG);
         if not Result and (U <> '') then
         begin
-          Idx := FVarPrintKind.IndexOf(U);
-          Result := (Idx >= 0) and (PtrInt(FVarPrintKind.Objects[Idx]) = 2);
-          // An element read of an array declared "AS UInteger/ULongInt" is unsigned too (antArrayAccess
-          // with the array name in child 0, which is exactly how U was derived above).
-          if not Result and (Node.NodeType = antArrayAccess) then
-            Result := FUnsigned64Arrays.IndexOf(ArrayFactKey(U)) >= 0;
+          // ⛔⛔ AN ARRAY ASKS ITS OWN REGISTRY, NEVER THE SCALARS' ONE. The comment above says an
+          // array name "is never in FVarPrintKind (only scalars/params/returns are)" - and an array
+          // PARAMETER is a parameter, so it is in there, under the BARE spelling, with the print kind
+          // of its element type. A single "Sub u( b() As ULongInt )" therefore made every OTHER
+          // procedure's "b()" unsigned: 200 stored in a "b() As Byte" printed 18446744073709551560
+          // where fbc prints -56, in a program with no ULongInt anywhere near it. ⇒ A name that
+          // resolves to an ARRAY is answered only by the element registry, under the SCOPED key
+          // (job/markdown/REGISTRI.md; DIVERGENZE 103, found by the guard of that entry).
+          if (Node.NodeType = antArrayAccess) and (ArrayIndexOf(U) >= 0) then
+            Result := FUnsigned64Arrays.IndexOf(ArrayFactKey(U)) >= 0
+          else
+          begin
+            Idx := FVarPrintKind.IndexOf(U);
+            Result := (Idx >= 0) and (PtrInt(FVarPrintKind.Objects[Idx]) = 2);
+            // An element read of an array declared "AS UInteger/ULongInt" is unsigned too
+            // (antArrayAccess with the array name in child 0, which is how U was derived above).
+            if not Result and (Node.NodeType = antArrayAccess) then
+              Result := FUnsigned64Arrays.IndexOf(ArrayFactKey(U)) >= 0;
+          end;
         end;
       end;
   end;
@@ -43786,7 +43805,7 @@ procedure TSSAGenerator.RegisterArrayParams;
 // proc gets its own slot (also fixes the old element-type collision when two procs share a param name).
 // Body accesses redirect to this slot via ArrayIndexOf; binds restore across nested/recursive calls.
 var
-  i, j, Slot: Integer;
+  i, j, Slot, WIdx: Integer;
   Proc, ParamList, PN: TASTNode;
   PName, MangledName, TypeName, ProcName: string;
   ET: TSSARegisterType;
@@ -43815,6 +43834,59 @@ begin
         // mangled name the body resolves through, so "a(i)->field" reaches the record.
         if PointeeOfPtrTypeName(TypeName) <> '' then
           FArrayPtrPointee.Values[MangledName] := PointeeOfPtrTypeName(TypeName);
+
+        // ⛔⛔ AND THE REST OF THE ELEMENT FACTS, which this site did not record at all (DIVERGENZE
+        // 103). A parameter's element type was used to pick the placeholder's BANK and then thrown
+        // away, so every question about the element that is not "int or float" fell back to the
+        // module-wide default - and the entry named only ONE of the four faces it has. Measured
+        // against fbc, "Sub s( b() As UByte )":
+        //   b(0) = 300           kept 300 where fbc wraps to 44   (narrow width; Short kept 40000)
+        //   Put #f, , b(0)       wrote EIGHT bytes where fbc writes one (the same map, read by
+        //                        BinaryElemBytesOfNode through ArrayFactKey)
+        //   *n(0), n() As ZString Ptr   printed the ADDRESS as a number instead of the text
+        //   f(0)( 21 ), f() As <funcptr>  answered the ELEMENT instead of calling through it
+        // ⭐ All four are ONE omission, because all four are read back through ArrayFactKey, which
+        // resolves an array parameter to exactly this MangledName. The declaration site records them
+        // (see the DIM branch); this one is the same declaration written as a parameter.
+        // ⛔⛔ AND THE UNSIGNED-64 ELEMENT IS HERE BECAUSE THE GUARD CHANGED THE DECISION. A first
+        // pass left it out, on the measurement that "b() As ULongInt" already printed, compared and
+        // divided exactly as fbc does. It did - but only through a LEAK: an array parameter's name is
+        // recorded in FVarPrintKind like a scalar parameter's, and PrintKindOf falls back to the FLAT
+        // entry, so the right answer was coming from a table that is not keyed on this array at all.
+        // Put six subs in one file, as a guard does, and the same leak hands "b() As Byte" the
+        // unsigned form of ANOTHER procedure's "b": 200 stored in a Byte printed
+        // 18446744073709551560 where fbc prints -56. ⇒ The fact is recorded under the SCOPED key here,
+        // and the reader stops taking the flat one for a name that resolves to an ARRAY at all
+        // (IsUnsigned64Expr). Seventh face of the family in job/markdown/REGISTRI.md.
+        // ⚠️ Still narrow on purpose otherwise: only what was measured to diverge is recorded.
+        if FindUDT(TypeName) < 0 then
+        begin
+          // The narrow element width (Byte/UByte/Short/UShort/Long/ULong/Single): a store to an
+          // element wraps to it, and a binary PUT/GET writes and reads exactly that many bytes.
+          if TypeNameWidthCode(TypeName) <> 0 then
+          begin
+            WIdx := FArrayElemWidth.IndexOf(MangledName);
+            if WIdx >= 0 then
+              FArrayElemWidth.Objects[WIdx] := TObject(PtrInt(TypeNameWidthCode(TypeName)))
+            else
+              FArrayElemWidth.AddObject(MangledName, TObject(PtrInt(TypeNameWidthCode(TypeName))));
+          end;
+          // A SCALAR pointee ("n() As ZString Ptr"): "*n(i)" dereferences to CHARACTERS, not to eight
+          // bytes read as a number. The UDT-pointee map above declines these by design.
+          if (Length(TypeName) >= 5) and
+             (Copy(TypeName, Length(TypeName) - 3, 4) = ' PTR') and
+             (PointeeOfPtrTypeName(TypeName) = '') then
+            FArrayScalarPointee.Values[MangledName] :=
+              Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+          // An array of FUNCTION POINTERS: "f(i)(args)" is an indirect call through the element.
+          if FuncPtrTypeSig(TypeName) <> '' then
+            FArrayFuncPtrSig.Values[MangledName] := FuncPtrTypeSig(TypeName);
+          // An UNSIGNED 64-bit element: the print form has no leading sign space, and compare/divide/mod
+          // take the unsigned opcodes. Width code is 0 for these, so the block above records nothing.
+          if ((TypeName = 'UINTEGER') or (TypeName = 'ULONGINT')) and
+             (FUnsigned64Arrays.IndexOf(MangledName) < 0) then
+            FUnsigned64Arrays.Add(MangledName);
+        end;
       end
       else
       begin
