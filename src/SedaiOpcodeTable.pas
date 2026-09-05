@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 576 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches
+  OPCODE_LIST_COUNT = 577 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -118,7 +118,7 @@ const
     bcGetColor, bcGraphicWidth, bcGraphicScale, bcGraphicPaint, bcGraphicWindow, bcGraphicSShape,
     bcGraphicGShape, bcGraphicGList, bcGraphicPos, bcGraphicRclr, bcGraphicRwindow, bcPLoad,
     bcPSave, bcPRst, bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint,
-    bcGfxLine, bcGfxCircle, bcGfxPalette, bcGfxPalGet, bcGfxPaletteReset, bcGfxColor,
+    bcGfxLine, bcGfxCircle, bcGfxPalette, bcGfxPalGet, bcGfxPaletteReset, bcGfxPaletteUsing, bcGfxColor,
     bcGfxForeColor, bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo, bcGfxGet, bcGfxPut,
     bcGfxScreenInfo, bcGfxScreenSet, bcGfxPCopy, bcGfxWindow, bcGfxPMap, bcGfxView,
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
@@ -206,7 +206,7 @@ const
   {$ELSE}
   DENSE_WEB_SIZE      = 0;    // group 8 is gated out: it takes NO dense range
   {$ENDIF}
-  DENSE_GRAPHICS_SIZE = 69;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK)
+  DENSE_GRAPHICS_SIZE = 70;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK, PALETTE USING)
   DENSE_SOUND_SIZE    = 6;    // group 11
   DENSE_BIGINT_SIZE   = 13;   // group 12
   DENSE_SUPER_SIZE    = 72;   // group 200 keeps its whole block, holes included

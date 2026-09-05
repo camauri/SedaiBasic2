@@ -423,6 +423,7 @@ type
     ssaGfxPalette,     // PALETTE index, r, g, b : set a palette entry (Src1=index, Src2=packed color)
     ssaGfxPalGet,      // __PALGET(index, which) -> palette component (Dest=result, Src1=index, Immediate=which)
     ssaGfxPaletteReset,// PALETTE (no args) : reset the palette to the mode default
+    ssaGfxPaletteUsing,// PALETTE [GET] USING a() : the whole palette (Src1=array ref, Imm bit0=GET)
     ssaGfxColor,       // COLOR [fg][,bg] : set current draw foreground/background (Src1=fg, Src2=bg)
     ssaGfxForeColor,   // read the current draw foreground colour (Dest=result) — omitted-colour default
     ssaGfxImageCreate, // IMAGECREATE(w,h[,color]) -> image handle (Dest=handle, Src1=w, Src2=h, Src3=color)

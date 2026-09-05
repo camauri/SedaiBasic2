@@ -395,7 +395,7 @@ begin
     ssaGraphicColor, ssaSetColor, ssaGraphicWidth, ssaGraphicScale, ssaGraphicPaint, ssaGraphicWindow,
     ssaGraphicSShape, ssaGraphicGShape, ssaGraphicGList, ssaPLoad, ssaPSave, ssaPRst, ssaScnClr,
     ssaGfxScreenRes, ssaGfxPset, ssaGfxPaint, ssaGfxPaintBorder, ssaGfxSetTarget, ssaGfxLine, ssaGfxLineStyled, ssaGfxCircle, ssaGfxCircleEx, ssaGfxCircleExF, ssaGfxDrawGML, ssaGfxDrawString,
-    ssaGfxPalette, ssaGfxPaletteReset, ssaGfxColor,
+    ssaGfxPalette, ssaGfxPaletteReset, ssaGfxPaletteUsing, ssaGfxColor,
     ssaGfxImageCreate, ssaGfxImageDestroy, ssaGfxGet, ssaGfxPut, ssaGfxImageConvertRow,
     ssaGfxScreenSet, ssaGfxPCopy, ssaGfxWindow, ssaGfxView, ssaGfxScreen,
     ssaScreenLock, ssaScreenUnlock,   // the frame boundary IS the effect: never dead

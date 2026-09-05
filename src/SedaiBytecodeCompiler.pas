@@ -452,6 +452,7 @@ begin
     ssaGfxLineStyled: Result := bcGfxLineStyled;
     ssaGfxPalette: Result := bcGfxPalette;
     ssaGfxPalGet: Result := bcGfxPalGet;
+    ssaGfxPaletteUsing: Result := bcGfxPaletteUsing;
     ssaGfxPaletteReset: Result := bcGfxPaletteReset;
     ssaGfxColor: Result := bcGfxColor;
     ssaGfxForeColor: Result := bcGfxForeColor;

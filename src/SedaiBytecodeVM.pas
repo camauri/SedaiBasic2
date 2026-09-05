@@ -15684,6 +15684,9 @@ var
   JoyV: Single;
   ScrData: PByte;      // SCREENPTR: working-page pixel bytes (existence check only)
   ScrSize: Integer;
+  PalArr: ^TArrayStorage;   // PALETTE USING: the array the whole palette is read from / written to
+  PalN, PalK, PalStart, PalIdx: Integer;
+  PalPtr: Int64;
 begin
   // ⛔ THE TEST IS INLINE AND THE CALL IS NOT MADE WHILE LOCKED. Both of these run once per GRAPHICS
   // OPERATION - 62 500 times a frame in a demo that plots points - and a call that returns immediately
@@ -16033,6 +16036,57 @@ begin
     33: // bcGfxPaletteReset - PALETTE (no args)
       if Assigned(FGraphics) then
         FGraphics.ResetPalette;
+    69: // bcGfxPaletteUsing - PALETTE [GET] USING a() : the WHOLE 256-entry palette (DIVERGENZE 147).
+        //   Src1 = array id (logical), Immediate bit0 = 1 for GET (palette -> array), 0 for SET.
+        // ⭐ THE ELEMENT FORMAT IS fbc's, and it was MEASURED, not assumed: "&h00BBGGRR with each
+        //   component 0-63" - the QB palette convention, the same one PALETTE index,&hBBGGRR already
+        //   decodes. fbc's own gfx/palette asserts the default entries as &h002A0000, &h003F3F3F...
+        // ⛔⛔ AND THE TWO DIRECTIONS ARE NOT THE SAME SCALE, which a deck caught and an assumption
+        //   would not have: going OUT it is c SHR 2 (170 -> 42, 20 -> 5, 252 -> 63), and c*63 div 255
+        //   is off by one on both of those (4 and 62). Coming BACK it is c*255 div 63 (42 -> 170),
+        //   which is what makes the default palette round-trip exactly. Asymmetric, and measured.
+        // ⚠️ 256 entries from the array's LOWER BOUND, which is what "Dim p(N To N+255)" means and
+        //   what fbc's do_test_at_N exercises; a shorter array stops at its end rather than running off.
+      if Assigned(FGraphics) and
+         (((Instr.Immediate and 2) <> 0) or (Instr.Src1 < Length(FArrays))) then
+      begin
+        // ⭐ Immediate bit1: Src1 holds a POINTER VALUE, not an array id. The packed address decodes
+        // exactly as bcRefStoreInt decodes it - array index in the high bits, element offset in the
+        // low ones - so the pointer spelling costs a decode and reuses everything else.
+        if (Instr.Immediate and 2) <> 0 then
+        begin
+          PalPtr := Ctx.IntRegs[Instr.Src1];
+          PalIdx := MapArrDyn(Ctx, (PalPtr shr POINTER_ARRAY_SHIFT) - 1);
+          if (PalIdx < 0) or (PalIdx > High(FArrays)) then Exit;
+          PalArr := @FArrays[PalIdx];
+          PalStart := PalPtr and POINTER_OFFSET_MASK;
+        end
+        else
+        begin
+          PalArr := @FArrays[Ctx.ArrMap[Instr.Src1]];
+          PalStart := Ctx.IntRegs[Instr.Src2];       // start element ("@p(5)" over "p(5 To 260)" = 0)
+        end;
+        if PalStart < 0 then PalStart := 0;
+        PalN := PalArr^.TotalSize - PalStart;
+        if PalN > 256 then PalN := 256;
+        for PalK := 0 to PalN - 1 do
+          if (Instr.Immediate and 1) <> 0 then
+          begin
+            PalColor := UInt32(FGraphics.GetPaletteColor(TPaletteIndex(PalK)));
+            PalArr^.IntData[PalStart + PalK] := Int64(((PalColor and $FF) shr 2)                        // red
+                                  or ((((PalColor shr 8) and $FF) shr 2) shl 8)              // green
+                                  or ((((PalColor shr 16) and $FF) shr 2) shl 16));          // blue
+          end
+          else
+          begin
+            PalColor := UInt32(PalArr^.IntData[PalStart + PalK]);
+            FGraphics.SetPaletteColor(TPaletteIndex(PalK),
+              ((PalColor and $3F) * 255 div 63)                     // red
+              or (((((PalColor shr 8) and $3F) * 255 div 63)) shl 8)
+              or (((((PalColor shr 16) and $3F) * 255 div 63)) shl 16)
+              or $FF000000);
+          end;
+      end;
     34: // bcGfxColor - COLOR [fg][,bg] : set current draw colours (Immediate bit0=hasFg, bit1=hasBg)
       begin
         if (Instr.Immediate and 1) <> 0 then

@@ -246,7 +246,7 @@ function ExpandFnBody(const ParamsBody, ArgsStr: string;
                       Defs, FnDefs: TStringList; Depth: Integer): string;
 var
   sep, i, j, k, pi: Integer;
-  ParamList, Body, Word: string;
+  ParamList, Body, Word, ExpArgs: string;
   Params: array of string;
   Args: array[0..63] of string;
   Starts: array[0..63] of Integer;
@@ -302,12 +302,25 @@ begin
       Params[k] := TrimRight(Copy(Params[k], 1, Length(Params[k]) - 3));
       VarIdx := k;
     end;
-  SplitMacroArgs(ArgsStr, Args, ACount, @Starts[0]);
+  // ⛔⛔ THE ARGUMENT TEXT IS EXPANDED BEFORE IT IS SPLIT, and the ORDER is the whole of it
+  // (DIVERGENZE 148). A #define that stands for a comma-separated LIST is ONE token to the reader and
+  // SEVERAL arguments to fbc: "m( LIST3 )" over "#define LIST3 1, 2, 3" passes 1 and leaves 2, 3 to a
+  // variadic tail there, and passed the unexpanded name here - so "__FB_ARG_COUNT__(v)" answered 3
+  // against fbc's 1, and an argument that later grew commas pushed every following argument of a
+  // preprocessor builtin one place along. That is what made "__FB_ARG_LEFTOF__( v, AS, v )" read "2"
+  // as its separator inside fbc's own FOREACH macro.
+  // ⚠️ Skipped for text that carries a '#': that is preprocessor text (a stringize, a paste), and it
+  // is what the per-argument loop below deliberately leaves alone for the reasons written there.
+  if Pos('#', ArgsStr) = 0 then
+    ExpArgs := SubstituteMacros(ArgsStr, Defs, FnDefs, Depth + 1)
+  else
+    ExpArgs := ArgsStr;
+  SplitMacroArgs(ExpArgs, Args, ACount, @Starts[0]);
   // The variadic parameter takes the RAW remainder of the argument text (empty when nothing was passed).
   if VarIdx >= 0 then
   begin
     if (VarIdx < ACount) and (VarIdx <= High(Args)) then
-      Args[VarIdx] := Trim(Copy(ArgsStr, Starts[VarIdx], MaxInt))
+      Args[VarIdx] := Trim(Copy(ExpArgs, Starts[VarIdx], MaxInt))
     else if VarIdx <= High(Args) then
     begin
       Args[VarIdx] := '';
@@ -773,16 +786,28 @@ function TokenPos(const Hay, Needle: string): Integer;
 // Position of Needle in Hay as a WHOLE TOKEN (delimited by non-identifier characters), or 0. A plain
 // Pos() would find "verso" inside "versus" and split the argument at the wrong place -- and silently,
 // since the result is still a well-formed piece of text.
+//
+// ⛔⛔ AND THE MATCH IS CASE-INSENSITIVE, because nothing in BASIC is not (DIVERGENZE 148). Pos is
+// case-SENSITIVE, so "__FB_ARG_LEFTOF__( v, AS, v )" over an argument written "a as ubyte" found no
+// separator, answered the fallback, and the statement built around it lost its name - "Expected a
+// variable name after VAR". fbc's own gfx/blender-alpha4 writes its FOREACH exactly that way: the
+// macro names the separator in CAPITALS and the call site writes it in lower case, which is the
+// normal way a BASIC program is written and the one shape a case-sensitive compare cannot see.
+// ⚠️ The needle is compared UPPER against UPPER; the returned position indexes the ORIGINAL text, so
+// the two sides the caller cuts out keep the program's own spelling.
 var
   p: Integer;
+  HayU, NeedleU: string;
 begin
   Result := 0;
   if (Needle = '') or (Hay = '') then Exit;
+  HayU := UpperCase(Hay);
+  NeedleU := UpperCase(Needle);
   p := 1;
   repeat
     // Search from p onwards without StrUtils: Pos on the tail, then map the offset back.
     if p > Length(Hay) then Exit;
-    Result := Pos(Needle, Copy(Hay, p, MaxInt));
+    Result := Pos(NeedleU, Copy(HayU, p, MaxInt));
     if Result = 0 then Exit;
     p := p + Result - 1;
     Result := 0;

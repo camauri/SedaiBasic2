@@ -7692,6 +7692,43 @@ begin
       end
       else
         Result.Attributes.Values['OP'] := 'SET';
+      // ⭐ "PALETTE [GET] USING a()" - the WHOLE 256-entry palette in one statement (DIVERGENZE 147).
+      // The comment above used to say "PALETTE USING deferred"; fbc's own gfx/palette is written with
+      // it and with nothing else. The array name is taken as a bare identifier - it is an array, not an
+      // expression - and the OP becomes USINGGET / USINGSET so the lowering knows which way it runs.
+      if UpperCase(Context.CurrentToken.Value) = 'USING' then
+      begin
+        Context.Advance;                                          // USING
+        if Result.Attributes.Values['OP'] = 'GET' then
+          Result.Attributes.Values['OP'] := 'USINGGET'
+        else
+          Result.Attributes.Values['OP'] := 'USINGSET';
+        // ⭐ The operand has THREE spellings in fbc's own gfx/palette, and all three are kept: the bare
+        // array name, "@a(i)" - the address of an element - and that wrapped in a CAST. A bare name is
+        // taken as an identifier (it is an array, not a value); anything else is an expression.
+        // ⛔ The bare-name branch is taken only for a name that ENDS the statement or is followed by an
+        // EMPTY "()": written as "an identifier followed by '('" it swallowed "cast(any ptr, @s(0))",
+        // reading CAST as the array's name and dying inside the type.
+        if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+           ((Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) or
+            ((Context.PeekNext.TokenType = ttDelimParOpen) and Assigned(Context.PeekToken(2)) and
+             (Context.PeekToken(2).TokenType = ttDelimParClose))) then
+        begin
+          Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
+            UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+          Context.Advance;
+          // "PALETTE USING a()" - the empty parentheses are allowed and mean the same array.
+          if Context.Check(ttDelimParOpen) and Assigned(Context.PeekNext) and
+             (Context.PeekNext.TokenType = ttDelimParClose) then
+          begin
+            Context.Advance; Context.Advance;
+          end;
+        end
+        else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          Result.AddChild(ParseExpression);
+        DoNodeCreated(Result);
+        Exit;
+      end;
       Result.AddChild(ParseExpression);                           // index
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
       Result.AddChild(ParseExpression);                           // r / packed BGR colour (or r-variable for GET)

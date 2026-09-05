@@ -841,6 +841,13 @@ const
   // bcGfxCircleEx's 64-bit Immediate is fully spent on four register indices; the PACKING is
   // identical, so the two share the compiler branch and the VM arm.
   bcGfxCircleExF    = bcGroupGraphics + 68;
+
+  // PALETTE [GET] USING <array> : the whole 256-entry palette in one statement (DIVERGENZE 147).
+  // Src1 = the array ref, Immediate bit0 = 1 for GET (palette -> array), 0 for SET (array -> palette).
+  // ⭐ An OPCODE and not a lowering: the single-entry GET is lowered as synthetic assignments through
+  //   __PALGET, which does not extend to 256 elements without a loop the SSA has no shape for. The
+  //   array reaches the VM the way a whole-array binary GET/PUT reaches it (MakeSSAArrayRef).
+  bcGfxPaletteUsing = bcGroupGraphics + 69;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -2381,6 +2388,7 @@ begin
         31: Result := 'GfxPalette';
         32: Result := 'GfxPalGet';
         33: Result := 'GfxPaletteReset';
+        69: Result := 'GfxPaletteUsing';
         34: Result := 'GfxColor';
         35: Result := 'GfxForeColor';
         36: Result := 'GfxImageCreate';

@@ -18193,7 +18193,9 @@ var
   Op: string;
   IdxV, RV, GV, BV, AReg, ColorReg, IdxR: TSSAValue;
   Instr: TSSAInstruction;
-  i: Integer;
+  i, PalArrIdx, PalLb: Integer;
+  PalStart, PalTmp: TSSAValue;
+  PalNode, PalIdxNode: TASTNode;
   Assign, Call, ArgList, WhichLit: TASTNode;
 begin
   if FCurrentBlock = nil then Exit;
@@ -18202,6 +18204,45 @@ begin
   if Op = 'RESET' then
   begin
     EmitInstruction(ssaGfxPaletteReset, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+
+  // PALETTE [GET] USING a() : the whole 256-entry palette (DIVERGENZE 147). The array reaches the VM
+  // as an array REF, the way a whole-array binary GET/PUT reaches it; the VM walks the 256 entries.
+  // ⛔ A STRING array has no palette meaning and is refused rather than filled with nonsense.
+  if (Op = 'USINGGET') or (Op = 'USINGSET') then
+  begin
+    if Node.ChildCount < 1 then Exit;
+    // ⭐⭐ TWO PATHS, AND THE SECOND IS THE GENERAL ONE. fbc's own gfx/palette writes the operand six
+    // ways - a bare array name, "@a(i)", a CAST of that, a pointer VARIABLE, "@x" over a ByRef, and a
+    // UDT with an Operator Cast to a pointer - and only the first names an array. Every other one is
+    // an EXPRESSION whose value is a pointer, and in this model a pointer already carries the array
+    // and the element offset packed into it, so evaluating it and letting the VM decode covers all
+    // five with no shape recognition at all.
+    // ⛔ The first draft special-cased "@a(i)" and the cast by walking the AST, and the suite kept
+    // producing spellings it had not thought of - which is the tell that the ANALYSIS was the wrong
+    // tool: the VALUE already knew everything the walk was trying to work out.
+    // ⚠️ The element WIDTH fbc has to derive from the pointee (4 for a Long array, 8 for an Integer
+    // one) is not a question here: every array element is one VM slot whatever its declared width.
+    PalNode := Node.GetChild(0);
+    PalArrIdx := -1;
+    if PalNode.NodeType = antIdentifier then
+      PalArrIdx := ArrayIndexOf(UpperCase(VarToStr(PalNode.Value)));
+    if PalArrIdx >= 0 then
+    begin
+      if FProgram.GetArray(PalArrIdx).ElementType = srtString then
+        raise Exception.CreateFmt('PALETTE USING needs a numeric array, and %s is a string array',
+                                  [VarToStr(PalNode.Value)]);
+      EmitInstruction(ssaGfxPaletteUsing, MakeSSAValue(svkNone),
+                      MakeSSAArrayRef(PalArrIdx, FProgram.GetArray(PalArrIdx).ElementType),
+                      EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAConstInt(Ord(Op = 'USINGGET')));
+      Exit;
+    end;
+    ProcessExpression(PalNode, PalStart);
+    if PalStart.Kind = svkNone then
+      raise Exception.Create('PALETTE USING needs an array or a pointer to one');
+    EmitInstruction(ssaGfxPaletteUsing, MakeSSAValue(svkNone), EnsureIntRegister(PalStart),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(Ord(Op = 'USINGGET') or 2));
     Exit;
   end;
 
