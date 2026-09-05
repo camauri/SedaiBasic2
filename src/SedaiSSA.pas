@@ -681,6 +681,10 @@ type
     procedure FillUDTFields(Node: TASTNode);       // pass 2: fill fields (all names known)
     procedure FillOneUDT(Idx: Integer);            // fill one type's fields (parent-first)
     function SoleOverloadLabel(const TypeU, MethNm: string): string;   // T.m when it has exactly ONE overload, else ''
+    procedure MethodOverloadLabels(const TypeName, MethNm: string; L: TStringList);
+    function AnyMethodOverloadLabel(const TypeName, MethNm: string): string;
+    function ResolveMethodLabelByParamType(const TypeName, MethNm, WantParam: string): string;
+    function FirstExplicitParamType(const Lbl: string): string;
     function SameTypeNameLoose(const A, B: string): Boolean;
     function PreProcSigLookup(const Base: string; NP: Integer; const WantTypes: string): string;
     function ResolveMethodLabelSig(const TypeName, MethNm: string;
@@ -9960,7 +9964,10 @@ begin
     LhsRecType := ObjectTypeName(VarNode);
     if LhsRecType <> '' then
     begin
-      OpLabel := ResolveMethodLabel(LhsRecType,
+      // ⛔ The GATE asks only whether the type HAS such an operator; which overload runs is the
+      // business of the ProcessMethodCall below, which resolves by its arguments. Asked with the
+      // single-label lookup it answered '' the moment "op=" had two overloads (DIVERGENZE 152).
+      OpLabel := AnyMethodOverloadLabel(LhsRecType,
                    'OPERATOR' + UpperCase(Node.Attributes.Values['COMPOUNDOP']) + '=');
       if OpLabel <> '' then
       begin
@@ -24003,22 +24010,11 @@ begin
   if (RetT = '') or (FindUDT(RetT) < 0) then Exit;
   RhsType := UpperCase(ObjectTypeName(ExprNode));
   if (RhsType = '') or (RhsType = RetT) or (FindUDT(RhsType) < 0) then Exit;
-  Lbl := ResolveMethodLabel(RetT, 'OPERATORLET');
+  // ⭐ The OVERLOAD whose declared operand IS that type - asked as a lookup instead of "take the one
+  // label and compare its parameter", which with a set of two compared against whichever declaration
+  // happened to survive registration (DIVERGENZE 152).
+  Lbl := ResolveMethodLabelByParamType(RetT, 'OPERATORLET', RhsType);
   if Lbl = '' then Exit;
-  ParamType := '';
-  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
-  begin
-    PList := Decl.GetChild(1);
-    if Assigned(PList) and (PList.NodeType = antParameterList) then
-      for i := 1 to PList.ChildCount - 1 do
-      begin
-        P := PList.GetChild(i);
-        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
-          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
-        Break;
-      end;
-  end;
-  if ParamType <> RhsType then Exit;
   UDTIdx := FindUDT(RetT);
   RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordNew, RcHandle, MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes), MakeSSAConstInt(0),
@@ -24052,9 +24048,8 @@ function TSSAGenerator.TryLetOperatorOnResult(const RetRecType: string; ExprNode
 // the same layout StageCallArgs would produce for "THIS, rhs". Staged by hand because the destination
 // has no AST node to clone.
 var
-  Lbl, ParamType, RhsType: string;
-  Decl, PList, P: TASTNode;
-  i: Integer;
+  Lbl, RhsType: string;
+  Decl: TASTNode;
   OpndVal: TSSAValue;
 begin
   Result := False;
@@ -24062,23 +24057,10 @@ begin
   RhsType := UpperCase(ObjectTypeName(ExprNode));
   if (RhsType = '') or (RhsType = UpperCase(RetRecType)) then Exit;   // same type: an ordinary copy
   if FindUDT(RhsType) < 0 then Exit;
-  Lbl := ResolveMethodLabel(RetRecType, 'OPERATORLET');
+  // ...and only when the operator's declared operand IS that type - asked as a lookup over the whole
+  // overload SET, for the reason DIVERGENZE 152 records.
+  Lbl := ResolveMethodLabelByParamType(RetRecType, 'OPERATORLET', RhsType);
   if Lbl = '' then Exit;
-  // ...and only when the operator's declared operand IS that type.
-  ParamType := '';
-  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
-  begin
-    PList := Decl.GetChild(1);
-    if Assigned(PList) and (PList.NodeType = antParameterList) then
-      for i := 1 to PList.ChildCount - 1 do
-      begin
-        P := PList.GetChild(i);
-        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
-          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
-        Break;
-      end;
-  end;
-  if ParamType <> RhsType then Exit;
   // ⭐ ...and if that operand is declared BYVAL it gets its private copy here, like every other staging
   // path: since m759 the callee ADOPTS what it is handed. "Operator Let" takes it BYREF in practice -
   // which is why this line changes nothing today - but a path that stages by hand and forgets makes the
@@ -24105,36 +24087,45 @@ function TSSAGenerator.ProcessLetOperatorStore(VarNode, ExprNode: TASTNode): Boo
 // types: "Operator Let (ByRef rhs As UDT)" is the copy-assignment operator and MUST run on "b = a" —
 // it is how a type that owns a raw buffer avoids sharing it (examples/manual/operator/let) — while a
 // type whose only Let takes an Integer leaves "b = a" to the implicit record copy.
-// (A type declaring SEVERAL Let overloads shares one label, so only the last-declared one is reachable —
-// the same overload-by-parameter gap the CAST operator has, and a separate piece of work.)
+// ⭐ A type declaring SEVERAL Let overloads is handled by TRYING THEM IN DECLARATION ORDER: the note
+// that used to stand here said one label was shared and "only the last-declared one is reachable", and
+// called it a separate piece of work. It was - DIVERGENZE 152 - and this is it. The decision below is
+// per CANDIDATE, and the first whose declared operand the right-hand side can reach wins.
 var
   ObjType, Lbl, ParamType, RhsType: string;
-  TmpArgs, Decl, PList, P, ConvNode: TASTNode;
-  i: Integer;
+  TmpArgs, ConvNode: TASTNode;
+  Cands: TStringList;
+  ci: Integer;
   Dummy, OpndVal: TSSAValue;
+  Applies: Boolean;
 begin
   Result := False;
   if (not FModernMode) or (VarNode = nil) or (ExprNode = nil) then Exit;
+  // ⛔⛔ A POINTER TO THE TYPE IS NOT THE TYPE. "Dim As T Ptr p = CAllocate( SizeOf(T) )" assigns an
+  // ADDRESS, and ObjectTypeName answers the POINTEE ("T"), so this path claimed it: with a
+  // "Operator T.Let( ByVal As Integer )" declared, the allocation result was handed to that operator
+  // and its first field write dereferenced a raw block - an Access violation, not a wrong number.
+  // ⚠️ It had always been claimed; it only ever DECLINED by accident, because a type could keep just
+  // one Let and the surviving one took a UDT, which an addressed expression could not reach. The
+  // moment the integer overload existed (DIVERGENZE 152) the accident stopped covering it.
+  if (VarNode.NodeType = antIdentifier) and (VarNode.ChildCount = 0) and
+     (FPointerVars.IndexOfName(UpperCase(VarToStr(VarNode.Value))) >= 0) then Exit;
   ObjType := ObjectTypeName(VarNode);
   if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
-  Lbl := ResolveMethodLabel(ObjType, 'OPERATORLET');
-  if Lbl = '' then Exit;
-  // The declared type of the operand the operator takes. Parameter 0 is the implicit THIS.
-  ParamType := '';
-  if FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2) then
-  begin
-    PList := Decl.GetChild(1);
-    if Assigned(PList) and (PList.NodeType = antParameterList) then
-      for i := 1 to PList.ChildCount - 1 do
-      begin
-        P := PList.GetChild(i);
-        if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
-          ParamType := UpperCase(VarToStr(P.GetChild(0).Value));
-        Break;
-      end;
-  end;
   RhsType := UpperCase(ObjectTypeName(ExprNode));
-  ConvNode := nil;
+  Cands := TStringList.Create;
+  try
+    MethodOverloadLabels(ObjType, 'OPERATORLET', Cands);
+    if Cands.Count = 0 then Exit;
+    Lbl := '';
+    ConvNode := nil;
+    Applies := False;
+    for ci := 0 to Cands.Count - 1 do
+    begin
+      Lbl := Cands[ci];
+      ParamType := FirstExplicitParamType(Lbl);
+      ConvNode := nil;
+      Applies := True;
   if FindUDT(ParamType) >= 0 then
   begin
     // A UDT operand: an expression of that very type reaches it...
@@ -24159,23 +24150,33 @@ begin
         ConvNode := nil                                 // no wrapper: the handle is already acceptable
       else
       begin
-        if (FindUDT(RhsType) < 0) or (not UDTCastsToUDT(RhsType, ParamType)) then Exit;
-        ConvNode := TASTNode.CreateWithValue(antCast, ParamType, VarNode.Token);
-        ConvNode.AddChild(ExprNode.Clone);
+        if (FindUDT(RhsType) < 0) or (not UDTCastsToUDT(RhsType, ParamType)) then Applies := False
+        else
+        begin
+          ConvNode := TASTNode.CreateWithValue(antCast, ParamType, VarNode.Token);
+          ConvNode.AddChild(ExprNode.Clone);
+        end;
       end;
     end;
   end
   else if RhsType <> '' then
-    Exit;      // a builtin operand cannot take a record
-  TmpArgs := TASTNode.Create(antArgumentList, VarNode.Token);
-  try
-    if ConvNode <> nil then
-      TmpArgs.AddChild(ConvNode)             // the wrapper is OWNED by the argument list from here
-    else
-      TmpArgs.AddChild(ExprNode.Clone);      // ProcessMethodCall clones what it is given; keep the AST intact
-    ProcessMethodCall(VarNode, ObjType, 'OPERATORLET', TmpArgs, Dummy);
+    Applies := False;      // a builtin operand cannot take a record
+      if Applies then Break;
+      if ConvNode <> nil then begin ConvNode.Free; ConvNode := nil; end;
+    end;
+    if not Applies then Exit;
+    TmpArgs := TASTNode.Create(antArgumentList, VarNode.Token);
+    try
+      if ConvNode <> nil then
+        TmpArgs.AddChild(ConvNode)           // the wrapper is OWNED by the argument list from here
+      else
+        TmpArgs.AddChild(ExprNode.Clone);    // ProcessMethodCall clones what it is given; keep the AST intact
+      ProcessMethodCall(VarNode, ObjType, 'OPERATORLET', TmpArgs, Dummy);
+    finally
+      TmpArgs.Free;
+    end;
   finally
-    TmpArgs.Free;
+    Cands.Free;
   end;
   Result := True;
 end;
@@ -24191,7 +24192,11 @@ begin
   if Node.Attributes.Values['BRACKET'] <> '1' then Exit;
   ObjType := ObjectTypeName(Node.GetChild(0));
   if ObjType = '' then Exit;
-  Result := ResolveMethodLabel(ObjType, 'OPERATOR[]');
+  // ⭐ The INDEX picks the overload: "a[b]" with a UDT index and "a[3]" with an integer one are two
+  // different operators, and this answered whichever single label existed (DIVERGENZE 152). The
+  // argument list is right here, so the ordinary argument-aware resolution does it.
+  Result := ResolveMethodLabelArgs(ObjType, 'OPERATOR[]', Node.GetChild(1));
+  if Result = '' then Result := AnyMethodOverloadLabel(ObjType, 'OPERATOR[]');
 end;
 
 function TSSAGenerator.TryEmitIndexOperator(Node: TASTNode; out Value: TSSAValue): Boolean;
@@ -31512,6 +31517,88 @@ begin
   Result := PreProcSigLookup(Base, NP, '');
 end;
 
+procedure TSSAGenerator.MethodOverloadLabels(const TypeName, MethNm: string; L: TStringList);
+// Every label "TypeName.MethNm" has, walking the inheritance chain: the bare one when the member is not
+// overloaded, and each decorated member of the set when it is - in DECLARATION order (DIVERGENZE 152).
+//
+// ⛔ It exists because "does this type have such a member" and "which overload does this operand reach"
+// are two questions, and until now one lookup answered both by accident: an operator that could not be
+// decorated had exactly one label, so reading its single declaration WAS the choice. Decorated, the
+// old lookup answers '' for a set of two and every gate built on it closed.
+var
+  T, Base, Pref: string;
+  Idx, Guard, k: Integer;
+begin
+  if L = nil then Exit;
+  T := UpperCase(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    Base := T + '.' + UpperCase(MethNm);
+    if FProcDecls.ContainsKey(Base) and (L.IndexOf(Base) < 0) then L.Add(Base);
+    Pref := Base + '~';
+    for k := 0 to FProcedureNames.Count - 1 do
+      if (Copy(FProcedureNames[k], 1, Length(Pref)) = Pref) and (L.IndexOf(FProcedureNames[k]) < 0) then
+        L.Add(FProcedureNames[k]);
+    if L.Count > 0 then Exit;          // a level that declares it HIDES the base's, as a call does
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.AnyMethodOverloadLabel(const TypeName, MethNm: string): string;
+// "Does this type declare such a member at all?", answered with ONE of its labels - the first declared.
+// This is what a GATE asks; the CALL beside it resolves by its arguments and picks for itself.
+var
+  L: TStringList;
+begin
+  Result := '';
+  L := TStringList.Create;
+  try
+    MethodOverloadLabels(TypeName, MethNm, L);
+    if L.Count > 0 then Result := L[0];
+  finally
+    L.Free;
+  end;
+end;
+
+function TSSAGenerator.FirstExplicitParamType(const Lbl: string): string;
+// The declared type name of a method's FIRST EXPLICIT parameter (index 0 is the implicit THIS), or ''.
+var
+  Decl, PList, P: TASTNode;
+begin
+  Result := '';
+  if (Lbl = '') or not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  PList := Decl.GetChild(1);
+  if (PList = nil) or (PList.NodeType <> antParameterList) or (PList.ChildCount < 2) then Exit;
+  P := PList.GetChild(1);
+  if (P <> nil) and (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) then
+    Result := UpperCase(VarToStr(P.GetChild(0).Value));
+end;
+
+function TSSAGenerator.ResolveMethodLabelByParamType(const TypeName, MethNm, WantParam: string): string;
+// The overload of TypeName.MethNm whose FIRST EXPLICIT parameter is declared of type WantParam, or ''.
+// ⭐ It replaces "take the one label, read its parameter, compare" - three sites did exactly that, and
+// with a set of two the comparison was being made against whichever declaration happened to survive.
+var
+  L: TStringList;
+  i: Integer;
+begin
+  Result := '';
+  if WantParam = '' then Exit;
+  L := TStringList.Create;
+  try
+    MethodOverloadLabels(TypeName, MethNm, L);
+    for i := 0 to L.Count - 1 do
+      if SameTypeNameLoose(FirstExplicitParamType(L[i]), WantParam) then Exit(L[i]);
+  finally
+    L.Free;
+  end;
+end;
+
 function TSSAGenerator.SameTypeNameLoose(const A, B: string): Boolean;
 // Are these two written type names the SAME type? Compared with the NAMESPACE tolerance every other
 // signature match here already has: a declaration records the qualified name a namespace pass built
@@ -31523,8 +31610,12 @@ function TSSAGenerator.SameTypeNameLoose(const A, B: string): Boolean;
 var
   U, V: string;
 begin
-  U := UpperCase(Trim(A));
-  V := UpperCase(Trim(B));
+  // ⛔ Through CanonicalType FIRST, or a TYPE ALIAS reads as a different type. "Type _Src As Src" with
+  // the DECLARE written "ByRef s As _Src" and the definition "ByRef s As Src" is one parameter spelled
+  // two ways, and a plain comparison declined the operator - the guard udt_ptr_fields_and_let caught it
+  // on the FUNCTION-return conversion, printing 21 for 42 (DIVERGENZE 152).
+  U := CanonicalType(UpperCase(Trim(A)));
+  V := CanonicalType(UpperCase(Trim(B)));
   Result := (U = V);
   if Result or (U = '') or (V = '') then Exit;
   Result := (Length(U) > Length(V)) and (Copy(U, Length(U) - Length(V), Length(V) + 1) = '.' + V);

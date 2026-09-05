@@ -1042,6 +1042,32 @@ begin
   end;
 end;
 
+function OperatorOverloadsByParams(const BaseU: string): Boolean;
+// Does this MEMBER operator's overload set separate by its PARAMETERS? (DIVERGENZE 152.)
+//
+// ⛔⛔ The note in RegisterOverloadLabel excludes "the NAMED form (CAST / LET / FOR / STEP / NEXT)"
+// with a reason that is TRUE OF CAST AND FALSE OF THE REST: "a CAST takes no explicit parameters at
+// all, so every one of them would sign the same empty tail". LET has a parameter, and it is exactly
+// what separates its overloads - so with "Operator T.Let( ByRef As Const T )" and
+// "Operator T.Let( ByVal As Integer )" both declared, the second definition overwrote the first and
+// "a = 42" answered a garbage number with no error. Same for the compound assignments and for "[]".
+// ⭐ Measured over eight variants against the oracle: the two shapes that must NOT be touched are the
+// CAST (its overloads differ only by RETURN type, which the collector's sigil already encodes) and a
+// non-overloaded operator, and both stay green.
+// ⛔ An ALLOW-LIST, not "everything that is not a cast": a form nobody measured keeps the behaviour it
+// has, which is the direction that cannot invent a wrong answer.
+var
+  P: Integer;
+  Nm: string;
+begin
+  Result := False;
+  P := Pos('.OPERATOR', BaseU);
+  if P = 0 then Exit;
+  Nm := Copy(BaseU, P + Length('.OPERATOR'), MaxInt);
+  if Nm = '' then Exit;
+  Result := (Nm = 'LET') or (Nm = '[]') or (Nm[Length(Nm)] = '=');
+end;
+
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 // See the call site in ParseProcedureDecl. Only DEFINITIONS reach here -- a DECLARE (module level or in a
 // TYPE body) is skipped without producing a node -- so a repeated label really is an overload set, never a
@@ -1072,8 +1098,14 @@ begin
   // ⚠️ The NAMED form (CAST / LET / FOR / STEP / NEXT) is still excluded: a CAST takes no explicit
   // parameters at all, so every one of them would sign the same empty tail and the RETURN-BANK scheme
   // the SSA collector appends ("T.OPERATORCAST$") would break.
+  // ⭐⭐ ...AND THE NOTE ABOVE IS RIGHT ABOUT THE CAST AND WRONG ABOUT THE REST OF THAT LIST. LET, the
+  // compound assignments and "[]" all take an explicit parameter, and it is what separates their
+  // overloads: excluding them let the second definition overwrite the first and "a = 42" answered a
+  // garbage number with NO error. Third instance of one shape in this procedure - a note that excuses
+  // a FAMILY with one member's reason. DIVERGENZE 152.
   if (Base = '') or (Pos('#', Base) > 0) or (Pos('~', Base) > 0) or
-     ((Pos('.OPERATOR', Base) > 0) and (Pos('@', Base) = 0)) or
+     ((Pos('.OPERATOR', Base) > 0) and (Pos('@', Base) = 0) and
+      not (IsMethod and (ParamList.ChildCount >= 2) and OperatorOverloadsByParams(Base))) or
      ((Pos('.OPERATOR', Base) = 0) and (Pos('@', Base) > 0)) then Exit;
 
   // ⛔⛔ TWO PROCEDURES OF ONE NAME IN TWO NAMESPACES ARE NOT AN OVERLOAD SET. They only look alike
