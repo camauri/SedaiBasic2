@@ -164,6 +164,7 @@ type
     antClose,             // CLOSE statement
     antDopen,             // DOPEN statement (disk file open)
     antDclose,            // DCLOSE statement (disk file close)
+    antCloseFunc,         // CLOSE(n) as a FUNCTION: child0 = the handle; value = 0 open / 1 not
     antAppend,            // APPEND statement (append to file)
     antDclear,            // DCLEAR statement (close all file handles)
     antRecord,            // RECORD statement (seek file position)

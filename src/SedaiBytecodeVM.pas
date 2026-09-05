@@ -17531,17 +17531,27 @@ begin
           raise Exception.Create('DOPEN command not supported: no handler assigned');
       end;
 
-    1, 3: // bcDclose, bcClose
+    1, 3, 37: // bcDclose, bcClose, bcCloseFunc
       begin
         // DCLOSE #handle
         // Src1 = handle
+        //
+        // ⭐ bcCloseFunc is FreeBASIC's FUNCTION form (DIVERGENZE 41): the SAME close, except that the
+        // result is DELIVERED in Dest instead of raising - 0 when the channel was open, 1 (illegal
+        // function call) when it was not, which is what fbc answers. It shares this arm for the reason
+        // bcOpenFunc shares OPEN's: two forms of one statement must not drift apart.
         HandleNum := Ctx.IntRegs[Instr.Src1];
         HandleName := '';
 
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DCLOSE', HandleNum, HandleName, '', '', ErrorCode);
-          if ErrorCode <> 0 then
+          if SubOp = 37 then
+            Ctx.IntRegs[Instr.Dest] := Ord(ErrorCode <> 0)     // 0 = it was open, 1 = it was not
+          // ⛔ 64 is "there was nothing to close", and for the STATEMENT that is not an error: fbc's
+          // "Close #7" on a channel never opened prints nothing and leaves Err at 0 (measured). Only
+          // the function form above turns it into an answer.
+          else if (ErrorCode <> 0) and (ErrorCode <> 64) then
             raise Exception.CreateFmt('DCLOSE error %d closing handle: %d', [ErrorCode, HandleNum]);
           // Reset CMD redirection if closing the CMD output file
           if FCmdHandle = HandleNum then

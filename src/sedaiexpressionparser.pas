@@ -1792,6 +1792,36 @@ var
 
 begin
   Result := nil;
+  // ⭐ CLOSE HAS A FUNCTION FORM TOO, and it shares this rule for the reason the rule exists: the whole
+  // ttFileOperation family lexes as one token type, so an expression-position member needs a prefix
+  // rule or it is a syntax error. fbc answers 0 when the channel was open and 1 (illegal function
+  // call) when it was not - "If Close(f) <> 0 Then" is how a program checks it. DIVERGENZE 41.
+  // ⚠️ The bare statement "Close(f)" already parsed, through the statement path; only the VALUE was
+  // missing, which is why the gap read as a syntax error only in expression position.
+  if ModernMode and (UpperCase(Token.Value) = kCLOSE) and Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                                // '('
+    // ⭐ "close()" with NO argument is the CLOSE-ALL form, and fbc's own file/close.bas asserts it:
+    // it closes every channel and always answers 0 (measured - with nothing open, with a file open,
+    // and twice in a row). The bare statement "Close" already closes them all here, so the two forms
+    // agree by construction and only the VALUE is new.
+    if Context.Check(ttDelimParClose) then
+    begin
+      Context.Advance;                              // ')'
+      Result := TASTNode.Create(antCloseFunc, Token);
+      Exit;                                         // no child = close all
+    end;
+    Param := ParseExpression;                       // the handle
+    if not Assigned(Param) then
+    begin
+      HandleError('Expected a file number in CLOSE(...)', Context.CurrentToken);
+      Exit;
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    Result := TASTNode.Create(antCloseFunc, Token);
+    Result.AddChild(Param);
+    Exit;
+  end;
   if (not ModernMode) or (UpperCase(Token.Value) <> kOPEN) or (not Context.Check(ttDelimParOpen)) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);

@@ -521,6 +521,7 @@ type
     // Disk file I/O
     ssaDopen,          // DOPEN #handle, "filename" [, mode$]: Open disk file
     ssaOpenFunc,       // FreeBASIC Open(...) as an EXPRESSION: Dest = error code (0 = ok) instead of raising
+    ssaCloseFunc,      // CLOSE(n) as a FUNCTION: Dest = 0 when the channel was open, else 1
     ssaDirSearch,      // FreeBASIC DIR: Dest(str) = first (Src3=0) / next (Src3=1) matching entry, "" when done
     ssaDirAttr,        // FreeBASIC DIR: Dest(int) = attributes of the entry ssaDirSearch last returned
     // FreeBASIC variadic arguments (CVA_*).

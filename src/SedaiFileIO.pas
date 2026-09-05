@@ -529,6 +529,14 @@ begin
   end
   else if Command = 'DCLOSE' then
   begin
+    // ⭐ REPORT WHETHER THERE WAS ANYTHING TO CLOSE (DIVERGENZE 41). The FUNCTION form of CLOSE answers
+    // 0 when the channel was open and 1 (illegal function call) when it was not, and this is the only
+    // place that knows which. Code 64 is the same "illegal function call" the OPEN path already uses
+    // for a handle out of range, so the two file paths speak one language.
+    // ⛔ The STATEMENT must stay SILENT on it: "Close #7" on a channel never opened is not an error in
+    // fbc (measured: it prints ok and leaves Err at 0), so the statement arm ignores exactly this code.
+    if (not Assigned(FFileHandles[Handle])) and (FDeviceKind[Handle] = 0) then
+      ErrorCode := 64;
     if Assigned(FFileHandles[Handle]) then
     begin
       FreeAndNil(FFileHandles[Handle]);

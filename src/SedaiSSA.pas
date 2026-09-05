@@ -2838,6 +2838,33 @@ begin
   {$ENDIF}
 
   case Node.NodeType of
+    // ⭐ CLOSE(n) as a FUNCTION (DIVERGENZE 41): the same close the statement does, with the result
+    // delivered instead of raising - 0 when the channel was open, 1 (illegal function call) when it
+    // was not, as fbc answers. One VM arm serves both forms so they cannot drift apart.
+    antCloseFunc:
+      begin
+        // ...and with NO child it is "close()", the CLOSE-ALL form: every channel is closed and the
+        // answer is always 0, which fbc's file/close.bas asserts. The statement path already knows how
+        // to close them all, so this reuses it and only supplies the value.
+        // ⛔ ...and CLOSE-ALL is ssaDclear, not "ssaDclose of handle 0". The bare statement "Close"
+        // becomes an antDclear in the parser precisely because closing every channel is what
+        // RESET/DCLEAR does, and the note there says so; emitting a close of channel 0 instead left
+        // every other channel open and FreeFile answered 2 where fbc answers 1.
+        if Node.ChildCount < 1 then
+        begin
+          EmitInstruction(ssaDclear, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+        ProcessExpression(Node.GetChild(0), RVal);
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaCloseFunc, Result, EnsureIntRegister(RVal),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
     antProcAddress:
     begin
       // @name : either the address of a data variable (FreeBASIC pointers) or, when name is a SUB,

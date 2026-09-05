@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 577 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches
+  OPCODE_LIST_COUNT = 578 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -110,7 +110,7 @@ const
     bcPrintFileFloat, bcPrintFileInt, bcInputFileFloat, bcInputFileInt, bcFileQuery, bcSeekSet,
     bcInputFileLine, bcPutBinInt, bcPutBinFloat, bcGetBinInt, bcGetBinFloat, bcPutBinStr,
     bcGetBinStr, bcFileAttr, bcFileSetEof, bcPrintFileComma, bcPutBinMem, bcGetBinMem, bcPutBinArray,
-    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcOpenFunc, bcDirSearch, bcDirAttr, bcSprite, bcMovsprAbs, bcMovsprRel,
+    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcOpenFunc, bcCloseFunc, bcDirSearch, bcDirAttr, bcSprite, bcMovsprAbs, bcMovsprRel,
     bcMovsprPolar, bcMovsprAuto, bcSprcolor, bcSprsav, bcCollision, bcBump,
     bcRspcolor, bcRsppos, bcRsprite, bcSpriteDef, bcSprSaveFile, bcSprLoadFile,
     bcSprSize, bcSprForm, bcGraphicRGBA, bcGraphicSetMode, bcGraphicBox, bcGraphicCircle,
@@ -199,7 +199,7 @@ const
   DENSE_ARRAY_SIZE    = 52;   // group 3   (bcRawLoad/StoreZStr = subs 50/51)
   DENSE_IO_SIZE       = 23;   // group 4
   DENSE_SPECIAL_SIZE  = 18;   // group 5   (bcCpuCount = sub 17)
-  DENSE_FILEIO_SIZE   = 37;   // group 6
+  DENSE_FILEIO_SIZE   = 38;   // group 6  (+ bcCloseFunc)
   DENSE_SPRITE_SIZE   = 17;   // group 7
   {$IFDEF WEB_MODE}
   DENSE_WEB_SIZE      = 13;   // group 8   subs 1..12, slot 0 a hole

@@ -686,6 +686,11 @@ const
   // so each opcode has exactly one destination and one bank.
   bcDirSearch       = bcGroupFileIO + 35;   // Dest=string name (""=no more), Src1=spec, Src2=mask reg, Immediate 0=first 1=next
   bcDirAttr         = bcGroupFileIO + 36;   // Dest=int attributes of the entry bcDirSearch last returned
+  // CLOSE(n) as a FUNCTION (DIVERGENZE 41): the SAME close, except that the result is DELIVERED in
+  // Dest instead of raising - 0 when the channel was open, 1 (illegal function call) otherwise, which
+  // is what fbc answers. Shares the VM arm with the statement form so the two cannot drift apart, the
+  // way bcOpenFunc shares OPEN's.
+  bcCloseFunc       = bcGroupFileIO + 37;   // Dest=int result, Src1=handle
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -2298,6 +2303,7 @@ begin
         25: Result := 'FileAttr';
         26: Result := 'FileSetEof';
         34: Result := 'OpenFunc';
+        37: Result := 'CloseFunc';
         35: Result := 'DirSearch';
         36: Result := 'DirAttr';
         15: Result := 'InputFileInt';

@@ -374,7 +374,7 @@ begin
       Result := True;
 
     // File I/O operations - always live (side effects on file system)
-    ssaDopen, ssaOpenFunc, ssaDirSearch, ssaVarArgCtl, ssaVarArgPushInt, ssaVarArgPushFloat, ssaVarArgPushStr, ssaDclose, ssaOpen, ssaClose,
+    ssaDopen, ssaOpenFunc, ssaCloseFunc, ssaDirSearch, ssaVarArgCtl, ssaVarArgPushInt, ssaVarArgPushFloat, ssaVarArgPushStr, ssaDclose, ssaOpen, ssaClose,
     ssaGetFile, ssaInputFile, ssaPrintFile, ssaPrintFileNewLine, ssaPrintFileComma,
     ssaCmd, ssaAppend, ssaDclear, ssaRecord, ssaFileQuery, ssaFileAttr, ssaFileSetEof, ssaSeekSet, ssaInputFileLine,
     ssaPutBinInt, ssaPutBinFloat, ssaGetBinInt, ssaGetBinFloat, ssaPutBinStr, ssaGetBinStr,

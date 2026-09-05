@@ -558,6 +558,7 @@ begin
     // Disk file I/O
     ssaDopen: Result := bcDopen;
     ssaOpenFunc: Result := bcOpenFunc;
+    ssaCloseFunc: Result := bcCloseFunc;
     ssaDirSearch: Result := bcDirSearch;
     ssaDirAttr: Result := bcDirAttr;
     ssaVarArgCtl: Result := bcVarArgCtl;
