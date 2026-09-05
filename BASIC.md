@@ -3344,6 +3344,15 @@ Each of these is *refused with a message that names the reason*, never answered 
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
+- **Two overloads that differ only by a POINTER's constness, or only by an array parameter's RANK, are
+  accepted here and FreeBASIC refuses them.** The general rule is implemented — two overloads differing
+  only by the passing mode, or by `Const` on a `ByVal` parameter, are refused as fbc refuses them
+  (*error 4: Duplicated definition*), while `ByRef x As T` beside `ByRef x As Const T` stays legal on
+  both sides. The two exceptions are cases the parser does not record finely enough: the POSITION of a
+  `Const` inside a pointer type (`Const Integer Ptr Ptr` versus `Integer Const Ptr Ptr` are different
+  types to fbc), and an array parameter's rank (`a(Any)` versus `a(Any, Any)`). Missing refusals, never
+  a wrong answer.
+
 - **A bare `Any` as a declared TYPE is accepted here and FreeBASIC refuses it.** `Any` is meant to be
   a pointee — `Any Ptr` is the idiom and works identically on both sides — and fbc rejects it
   everywhere a real type is needed: a defined procedure's parameter, `ByRef` or `ByVal` (*error 59:

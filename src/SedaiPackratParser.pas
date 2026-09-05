@@ -131,6 +131,7 @@ type
     // "ns2.bar" answered 0. FProcSeen keeps the BARE names, because the two places that ask it ask
     // "is this name a procedure at all"; this one keys on "PREFIX|BASE" and owns the decision.
     FProcSeenNs: TStringList;
+    FProcOverloadKeys: TStringList;   // "<ns>|<base>"#1"<collapse key>" per DEFINITION (DIVERGENZE 144)
     FNsPrefix: string;               // the namespace body being parsed ('' at module level)
     // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
     // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
@@ -249,6 +250,8 @@ type
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
                                WithTypeNames: Boolean = False;
                                PtrKinds: Boolean = False): string;   // CONSTRUCTORS only: see the body
+    function OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boolean): string;
+    function OverloadKeysCollide(const A, B: string): Boolean;
     procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 
     // Dialect profile application + the per-dialect statement handlers it installs.
@@ -650,6 +653,8 @@ begin
   FProcSeen.CaseSensitive := False;
   FProcSeenNs := TStringList.Create;
   FProcSeenNs.CaseSensitive := False;
+  FProcOverloadKeys := TStringList.Create;
+  FProcOverloadKeys.CaseSensitive := False;
   FNsPrefix := '';
   FByrefRetProcs := TStringList.Create;
   FByrefRetProcs.CaseSensitive := False;
@@ -691,6 +696,7 @@ begin
 
   FForwardDeclNames.Free;
   FProcSeen.Free;
+  FProcOverloadKeys.Free;
   FProcSeenNs.Free;
   FByrefRetProcs.Free;
   FConstNames.Free;
@@ -869,6 +875,136 @@ begin
     Result := Result + '%' + Widths;
 end;
 
+function TPackratParser.OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boolean): string;
+// The key two overloads are compared on to decide whether FreeBASIC calls them the SAME declaration
+// (DIVERGENZE 144). One entry per parameter, "<type>|<mode>|<const>", joined by ';'.
+//
+// ⭐ THE RULE WAS MEASURED OVER 33 VARIANTS AGAINST fbc, AND IT IS NOT WHAT THE LEDGER SAID. Two
+// parameters at the same position COLLIDE unless their effective TYPE differs, or **both are BYREF
+// there and their const-ness differs**. Everything else about the spelling is ignored: ByVal and
+// ByRef do not distinguish, and Const on a BYVAL parameter does not either.
+//   f(ByVal a As T)      / f(ByVal a As Const T)   -> duplicate
+//   f(ByVal a As T)      / f(ByRef a As T)         -> duplicate
+//   f(ByRef a As Const T)/ f(ByVal a As T)         -> duplicate
+//   f(ByRef a As T)      / f(ByRef a As Const T)   -> ACCEPTED, the one distinguishing pair
+// ⛔ It is PAIRWISE, not a class: byref-const differs from byref-plain and collides with byval-plain,
+// which no single per-declaration key can express - hence a key plus a comparison, not a key alone.
+// ⚠️ And it is symmetric: every pair above was measured in BOTH declaration orders and answered the
+// same, so nothing here depends on which one the parser reaches first.
+//
+// ⛔⛔ THE DEFAULT PASSING MODE DEPENDS ON THE TYPE, and getting that wrong would refuse a program the
+// oracle compiles. Measured: "a As T" (a UDT) behaves as BYREF - "f(a As T)" and "f(a As Const T)" are
+// accepted together - while "a As Integer" behaves as BYVAL, since "f(a As Integer)" and
+// "f(a As Const Integer)" are a duplicate. STRING follows the UDT; DOUBLE follows the scalar.
+// ⇒ That is exactly the shape fbc's own overload/op-constonlydiff depends on: its three operators
+// differ only by Const on parameters written with NO mode, and they must keep compiling.
+//
+// ⭐ A POINTER folds its Const into the TYPE, because there the qualifier belongs to the POINTEE:
+// "ByVal a As T Ptr" and "ByVal a As Const T Ptr" are accepted together, on both modes.
+// ⚠️ DELIBERATELY UNDER-REFUSING where the type key cannot see through a spelling: a type ALIAS, a
+// namespace-qualified name written two ways, and (per the note in ProcSigFromParams) two SUBs that
+// differ only by ZSTRING PTR versus WSTRING PTR, which fbc also calls duplicates. A key that errs
+// toward "different" leaves the program compiling, which is the behaviour this check is narrowing.
+var
+  i, First: Integer;
+  p: TASTNode;
+  T, Nm, Md, Cn: string;
+  IsConst, IsPtr: Boolean;
+begin
+  Result := '';
+  if ParamList = nil then Exit;
+  if SkipThis then First := 1 else First := 0;
+  for i := First to ParamList.ChildCount - 1 do
+  begin
+    p := ParamList.GetChild(i);
+    T := '';
+    if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
+       not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
+      T := UpperCase(VarToStr(p.GetChild(0).Value));
+    if p.Attributes.Values['ARRAY'] = '1' then T := T + '()';
+    // ⛔ An INLINE procedure-pointer parameter ("ByVal p As Sub( ByRef As T1 )") carries its signature
+    // in attributes, not in a type name, so two of them reach here with the SAME (or an empty) type
+    // string while fbc may be looking at two different types - which is exactly what fbc's own
+    // pointers/procptr-namespaces relies on: one "overload1" per scope, each naming a DIFFERENT T1.
+    // Marked unknown, and an unknown type never collides: refusing on ignorance is the one direction
+    // this check must not take.
+    if p.Attributes.Values['FUNCPTR'] = '1' then T := '#P';
+    IsConst := p.Attributes.Values['CONSTP'] = '1';
+    IsPtr := Pos(' PTR', T) > 0;
+    if IsConst and IsPtr then T := 'CONST ' + T;      // the qualifier is the POINTEE's
+    if T = '' then
+    begin
+      // Untyped: the name's suffix types it, exactly as ProcSigFromParams reads it.
+      Nm := VarToStr(p.Value);
+      if (Nm <> '') and (Nm[Length(Nm)] = '$') then T := '#S'
+      else if (Nm <> '') and ((Nm[Length(Nm)] = '!') or (Nm[Length(Nm)] = '#')) then T := '#F'
+      else T := '#I';
+    end;
+    // The EFFECTIVE mode: explicit wins, else BYREF for a UDT or a string and BYVAL for the rest.
+    if p.Attributes.Values['BYREF'] = '1' then Md := 'R'
+    else if p.Attributes.Values['BYVAL'] = '1' then Md := 'V'
+    else if IsPtr or (Copy(T, 1, 1) = '#') then Md := 'V'
+    else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Md := 'R'
+    else if IsBuiltinTypeName(T) then Md := 'V'
+    else Md := 'R';                                    // a UDT
+    if IsConst and not IsPtr then Cn := 'C' else Cn := '-';
+    if Result <> '' then Result := Result + ';';
+    Result := Result + T + '|' + Md + '|' + Cn;
+  end;
+end;
+
+function TPackratParser.OverloadKeysCollide(const A, B: string): Boolean;
+// Do these two parameter keys describe declarations FreeBASIC calls the same one? See
+// OverloadCollapseKey for the measured rule. Different arity never collides.
+var
+  LA, LB: TStringList;
+  i: Integer;
+  fa, fb: TStringArray;
+begin
+  Result := False;
+  LA := TStringList.Create;
+  LB := TStringList.Create;
+  try
+    LA.Delimiter := ';'; LA.StrictDelimiter := True; LA.DelimitedText := A;
+    LB.Delimiter := ';'; LB.StrictDelimiter := True; LB.DelimitedText := B;
+    if (A = #2) or (B = #2) then Exit;       // a zero-parameter declaration: see the call site
+    if LA.Count <> LB.Count then Exit;
+    for i := 0 to LA.Count - 1 do
+    begin
+      fa := LA[i].Split('|');
+      fb := LB[i].Split('|');
+      if (Length(fa) < 3) or (Length(fb) < 3) then Exit;
+      if fa[0] <> fb[0] then Exit;                       // a different TYPE settles it
+      // ⛔⛔ AND TWO SHAPES THE KEY CANNOT SEE THROUGH NEVER COLLIDE, both found by running the
+      // ORACLE'S OWN SUITE as the census rather than by reading the parser:
+      //  · an ARRAY parameter, because the RANK is not recorded - the parser consumes whatever is
+      //    inside the parentheses - so "array(any)" and "array(any, any)" reach here identical while
+      //    fbc tells them apart (overload/bydesc declares exactly that pair);
+      //  · a POINTER, of any shape, because the CONST's POSITION inside a pointer type is not
+      //    recorded: "integer ptr ptr", "const integer ptr ptr", "integer const ptr ptr" and
+      //    "const integer const ptr ptr" are FOUR different types to fbc and at most two strings
+      //    here - const/ovl declares all four and overloads on them. ⚠️ This gives up the two
+      //    pointer duplicates the deck measured ("ByVal a As T Ptr" against "ByRef a As T Ptr"),
+      //    which stay accepted: a missing refusal, and the only honest answer while the type
+      //    spelling is not carried through.
+      // ⇒ Both err toward ACCEPTING, which leaves those programs compiling exactly as they did.
+      // ⛔ AN UNKNOWN TYPE NEVER COLLIDES. '#' opens the key of a parameter this check cannot name -
+      // an untyped one, and an inline procedure pointer - and two things it cannot name may be two
+      // different types. It over-refused fbc's pointers/procptr-namespaces exactly that way, which
+      // the suite caught as B1 falling by one: the census is a TRIPLE, and B2 rising is not enough.
+      if (Copy(fa[0], 1, 1) = '#') or (Copy(fb[0], 1, 1) = '#') then Exit;
+      if (Pos('()', fa[0]) > 0) or (Pos('()', fb[0]) > 0) then Exit;
+      if (Pos(' PTR', fa[0]) > 0) or (Pos(' PTR', fb[0]) > 0) then Exit;
+      // ...and the one pair that distinguishes without a type difference.
+      if (fa[1] = 'R') and (fb[1] = 'R') and (fa[2] <> fb[2]) then Exit;
+    end;
+    Result := True;
+  finally
+    LB.Free;
+    LA.Free;
+  end;
+end;
+
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 // See the call site in ParseProcedureDecl. Only DEFINITIONS reach here -- a DECLARE (module level or in a
 // TYPE body) is skipped without producing a node -- so a repeated label really is an overload set, never a
@@ -877,6 +1013,8 @@ var
   Base: string;
   Idx: Integer;
   FirstDecl, FirstName, FirstParams: TASTNode;
+  k: Integer;
+  CKey: string;
 begin
   if (NameNode = nil) or (ParamList = nil) then Exit;
   Base := UpperCase(VarToStr(NameNode.Value));
@@ -908,6 +1046,34 @@ begin
   // beside it, because the two places that ask it ask "is this name a procedure at all" - a question
   // the namespace does not change.
   if FProcSeen.IndexOf(Base) < 0 then FProcSeen.Add(Base);
+
+  // ⛔⛔ AND FIRST: IS THIS DECLARATION ONE FreeBASIC ALREADY HAS? (DIVERGENZE 144.) Two overloads that
+  // differ only by the passing MODE, or by Const on a BYVAL parameter, are the SAME declaration there
+  // - "error 4: Duplicated definition" - and we accepted them and answered through whichever won. The
+  // rule is measured over 33 variants and lives in OverloadCollapseKey; it is PAIRWISE, so every
+  // previous declaration of this name in this namespace is compared, not just the first.
+  // ⚠️ Recorded BEFORE the first-declaration exit below, or a set of two would never be compared.
+  // ⛔ A PROCEDURE WITH NO PARAMETERS IS A DIFFERENT QUESTION and is left to the machinery that
+  // already answers it. Two zero-parameter declarations of one name sign the same EMPTY key, so this
+  // check would call them duplicates - and fbc's own suite has two legitimate pairs: an "f1" retired
+  // by "#undef" and redeclared (quirk/undef), and two "f1( ) ByRef As Byte" in different TEST_GROUPs
+  // (functions/return-byref). Neither is an overload set, and neither is what DIVERGENZE 144 is about:
+  // this check exists for overloads that differ ONLY by passing mode or by CONST, which needs at least
+  // one parameter to differ in.
+  CKey := OverloadCollapseKey(ParamList, IsMethod);
+  if CKey = '' then CKey := #2;                 // no parameters: never compared, and never compares
+  for k := 0 to FProcOverloadKeys.Count - 1 do
+    if (Copy(FProcOverloadKeys[k], 1, Length(FNsPrefix + '|' + Base) + 1) = FNsPrefix + '|' + Base + #1) and
+       OverloadKeysCollide(CKey,
+         Copy(FProcOverloadKeys[k], Length(FNsPrefix + '|' + Base) + 2, MaxInt)) then
+    begin
+      Context.AddError('Duplicated definition: ' + Base +
+        ' - two overloads differ only by the passing mode or by CONST on a BYVAL parameter',
+        NameNode.Token);
+      Exit;
+    end;
+  FProcOverloadKeys.Add(FNsPrefix + '|' + Base + #1 + CKey);
+
   Idx := FProcSeenNs.IndexOf(FNsPrefix + '|' + Base);
   if Idx < 0 then
   begin
@@ -1074,6 +1240,7 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FProcSeenNs.Clear;
+  FProcOverloadKeys.Clear;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
@@ -1171,6 +1338,7 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FProcSeenNs.Clear;
+  FProcOverloadKeys.Clear;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
