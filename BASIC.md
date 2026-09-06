@@ -286,6 +286,20 @@ same limit applies to reading a UDT as raw bytes.
   and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
+- ⚠️ **`Err` is volatile: an output operation writes its own result into it, and `PRINT USING` is the
+  one place that still differs.** SedaiBasic follows FreeBASIC here — measured over twenty forms on
+  6 September 2026: `PRINT` in every spelling, `WRITE`, the separators, `TAB`, `SPC`, `PRINT #`,
+  `LOCATE` and `WIDTH` all write `Err`, **per item**, so `Print Err; Err; Err` after an error answers
+  `2 0 0`; `COLOR`, `CLS` and `INKEY` do not. **This holds inside an error handler too**: FreeBASIC's
+  own `On Error Goto h … h: Print "err="; Err` answers **0**, because the label is written before the
+  item is evaluated — so a handler reads `Err` into a variable first, which is the shape FreeBASIC's
+  own tests use.
+  The remaining difference is `Print Using "###"; Err`: FreeBASIC emits the format's literal part
+  before converting the value, so the item reads 0; here the value is evaluated first and reads the
+  code. That is an evaluation order inside `PRINT USING`, not a rule about `Err`.
+  ⛔ CLASSIC is untouched: the same storage is Commodore's `ER` and the code `DS$` reports, and a
+  CLASSIC `PRINT` never writes it. The two dialects share that field and nothing else.
+
 - ⚠️ **The `OPTION` statement is refused in the FreeBASIC dialect, and that is FreeBASIC's own rule.**
   Measured over all eleven forms — `EXPLICIT`, `BASE`, `DYNAMIC`, `STATIC`, `ESCAPE`, `NOKEYWORD`,
   `PRIVATE`, `BYVAL`, `BYREF`, `GOSUB`, `NOGOSUB` — fbc answers *error 146: Only valid in -lang

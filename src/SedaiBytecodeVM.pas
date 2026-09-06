@@ -223,6 +223,7 @@ type
     FSharedRecStore: TSharedRecArray;
     FVmGeneration: Int64;          // stamps a thread's TRecCache; see GVmGeneration
     FProgReadsScreen: Boolean;     // program calls SCREEN(row, col)
+    FProgReadsER: Boolean;         // program reads Err / ER: only then does output have to write it
     FProgPeeks: Boolean;           // program PEEKs/POKEs -- only reaches the screen through a mapper
     FRecBlockTake: Integer;        // how many fresh indices a cache reserves at once (grows to REC_CACHE_BATCH)
     FSharedRecLock: TRTLCriticalSection;
@@ -609,6 +610,7 @@ type
     procedure RedimArrayN(ArrayIdx: Integer; const Uppers: array of Integer; Preserve: Boolean; const Lowers: array of Integer); // REDIM multi-dim
 
     procedure AdvancePrintCol(Ctx: TExecutionContext; Chars: Integer);   // printed text advances the cursor -- and the cursor WRAPS at the right margin
+    procedure OutputWroteErr(Ctx: TExecutionContext);   // MODERN: a successful output writes 0 into Err
     procedure ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteSpecialVarOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -6567,6 +6569,7 @@ begin
   // other direction would make SCREEN() return spaces, so the doubt goes to keeping the model.
   FProgReadsScreen := False;
   FProgPeeks := False;
+  FProgReadsER := False;       // ...and the same question for Err (DIVERGENZE 46)
   if Assigned(FProgram) then
     for i := 0 to FProgram.GetInstructionCount - 1 do
     begin
@@ -6576,7 +6579,8 @@ begin
       if FProgram.GetInstruction(i).OpCode = bcConScreen then FProgReadsScreen := True
       else if (FProgram.GetInstruction(i).OpCode = bcPeek) or
               (FProgram.GetInstruction(i).OpCode = bcPoke) then FProgPeeks := True;
-      if FProgReadsScreen and FProgPeeks then Break;
+      if FProgram.GetInstruction(i).OpCode = bcLoadER then FProgReadsER := True;
+      if FProgReadsScreen and FProgPeeks and FProgReadsER then Break;
     end;
   UpdateScreenModelGate;
 
@@ -9038,6 +9042,7 @@ begin
     // The tracked column is also what POS() and CSRLIN answer, so it was wrong there too.
     bcPrintUsing:
       begin
+        OutputWroteErr(Ctx);
         // PRINT USING format$; value
         // Src1 = format string register, Src2 = value register
         if Assigned(FOutputDevice) then
@@ -9052,6 +9057,7 @@ begin
       // PRINT USING with an EXACT integer value: Src1 = format string, Src2 = int value. A LongInt beyond
       // 2^53 keeps every digit instead of being rounded through a Double (Pell's 2469645423824185801).
       begin
+        OutputWroteErr(Ctx);
         if Assigned(FOutputDevice) then
         begin
           PrintStr := FormatUsing(Ctx.StringRegs[Instr.Src1], 0.0, True, Ctx.IntRegs[Instr.Src2]);
@@ -9062,12 +9068,14 @@ begin
     bcPrintUsingStage:
       // Stage one already-stringified value for a runtime-format PRINT USING (Src1 = string register).
       begin
+        OutputWroteErr(Ctx);
         SetLength(FPUStage, Length(FPUStage) + 1);
         FPUStage[High(FPUStage)] := Ctx.StringRegs[Instr.Src1];
       end;
     bcPrintUsingRun:
       // Run a runtime-format PRINT USING over the staged values (Src1 = format string register).
       begin
+        OutputWroteErr(Ctx);
         if Assigned(FOutputDevice) then
         begin
           PrintStr := FormatUsingRuntime(Ctx.StringRegs[Instr.Src1]);
@@ -14954,6 +14962,23 @@ begin
   FArraysDirty := True;
 end;
 
+procedure TBytecodeVM.OutputWroteErr(Ctx: TExecutionContext);
+// The one place the rule above lives. MODERN only: this field is CLASSIC's ER and what DS$ reports.
+//
+// ⛔⛔ IT APPLIES INSIDE AN ERROR HANDLER TOO, which is where it costs something and where it was
+// nearly withdrawn. fbc's own "On Error Goto h ... h: Print "err="; Err" answers **0** - the literal is
+// written before the item is evaluated - so a handler there reads err() into a VARIABLE first, exactly
+// as fbc's own file/close.bas does. Seven guards here printed the label first and started measuring 0
+// once this landed; they were rewritten to take the reading first, because that is what they were
+// written to measure and it is the shape fbc's own tests use.
+// ⚠️ ON ERROR / ERR / ERL / ERROR / ON ERROR GOTO 0 are FreeBASIC's OWN in -lang fb (measured on 6 Sep
+// 2026, form by form); only RESUME and RESUME NEXT are fblite/qb there. So this rule binds the whole
+// family, and calling ON ERROR "our extension" - which I did once - was wrong.
+begin
+  if FProgReadsER and Assigned(FProgram) and FProgram.ModernMode then
+    Ctx.LastErrorCode := 0;
+end;
+
 procedure TBytecodeVM.AdvancePrintCol(Ctx: TExecutionContext; Chars: Integer);
 // The tracked cursor column is a SCREEN column, so it WRAPS at the right margin: text that runs past the
 // last column continues on the next line, and the column starts over. The counter never did, and the one
@@ -14983,6 +15008,18 @@ begin
   CmdErr := 0;
   CmdNewLine := #13;  // CR for file newlines
   SubOp := Instr.OpCode and $FF;
+  // ⛔⛔ AN OUTPUT OPERATION WRITES ITS OWN RESULT INTO Err, AND A SUCCESSFUL ONE WRITES 0
+  // (DIVERGENZE 46, MODERN only). Measured over sixteen forms: PRINT in every spelling, WRITE, the
+  // separators, TAB, SPC, PRINT USING, PRINT # and LOCATE all clear it, per ITEM - "Print Err; Err; Err"
+  // after an error answers "2 0 0" in fbc, because the first item is written before the second is
+  // evaluated. COLOR, CLS and INKEY do NOT, so the list is what the oracle answered and nothing else;
+  // a sub-op not named here keeps the behaviour it has, which is the conservative side.
+  // ⛔ MODERN ONLY, and this is the constraint the owner restated on 6 Sep 2026: this field is CLASSIC's
+  // ER and what DS$ reports, and CLASSIC's PRINT must not touch it. The two dialects share this storage
+  // and nothing else - they are never merged and never confused.
+  // ⭐ And it costs NOTHING where nobody looks: FProgReadsER is false for a program that never reads
+  // Err, which is every program in the corpus but one.
+  if (SubOp <= 11) or (SubOp = 21) then OutputWroteErr(Ctx);   // the PRINT family, and LOCATE
   case SubOp of
     0: // bcPrint (float). Immediate = 1 when the value is SINGLE-typed: print it with a SINGLE's
        // 7 significant digits, which is what hides its representation error (8.300000190734863 -> "8.3").
@@ -15806,6 +15843,7 @@ begin
       if Assigned(FOutputDevice) then
       begin
         FOutputDevice.SetLineWidth(Ctx.IntRegs[Instr.Src1]);
+        OutputWroteErr(Ctx);   // WIDTH reaches the device, so it writes Err too (DIVERGENZE 46)
       end;
     10: // bcGraphicScale - SCALE n [,xmax, ymax]
       if Assigned(FOutputDevice) then
@@ -17548,11 +17586,23 @@ begin
           FOnDiskFile(Self, 'DCLOSE', HandleNum, HandleName, '', '', ErrorCode);
           if SubOp = 37 then
             Ctx.IntRegs[Instr.Dest] := Ord(ErrorCode <> 0)     // 0 = it was open, 1 = it was not
-          // ⛔ 64 is "there was nothing to close", and for the STATEMENT that is not an error: fbc's
-          // "Close #7" on a channel never opened prints nothing and leaves Err at 0 (measured). Only
-          // the function form above turns it into an answer.
+          // ⛔ 64 is "there was nothing to close", and for the STATEMENT that is not a RAISE: fbc's
+          // "Close #7" on a channel never opened prints nothing and does not stop the program.
           else if (ErrorCode <> 0) and (ErrorCode <> 64) then
             raise Exception.CreateFmt('DCLOSE error %d closing handle: %d', [ErrorCode, HandleNum]);
+          // ⛔⛔ ...BUT IT DOES SET Err, AND THE NOTE THAT USED TO STAND HERE SAID THE OPPOSITE.
+          // It read "leaves Err at 0 (measured)", and what had been measured is that the statement does
+          // not print and does not raise; the Err half was never asked. Re-measured on 6 Sep 2026 with
+          // "Dim e0 = Err : Close #7 : Dim e1 = Err", fbc answers 0 then **1**. DIVERGENZE 46.
+          // ⇒ The STATEMENT sets Err to exactly what the FUNCTION form one line above ANSWERS - which
+          // is the whole point of the two sharing this arm, and the half DIVERGENZE 41 left out: it
+          // wired the result and not the side effect. fbc's own file/close.bas asserts it directly
+          // ("close #1" twice, then err() must be ILLEGALFUNCTIONCALL), and with several handles the
+          // LAST one wins, which its comment spells out.
+          // ⛔ MODERN ONLY. This field is CLASSIC's ER and the code DS$ reports, and CLASSIC's DCLOSE
+          // must keep the Commodore meaning: the two dialects share this storage and nothing else.
+          if Assigned(FProgram) and FProgram.ModernMode then
+            Ctx.LastErrorCode := Ord(ErrorCode <> 0);
           // Reset CMD redirection if closing the CMD output file
           if FCmdHandle = HandleNum then
             FCmdHandle := 0;
@@ -17685,6 +17735,14 @@ begin
           FOnDiskFile(Self, 'DCLEAR', 0, '', '', '', ErrorCode);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('DCLEAR error %d', [ErrorCode]);
+          // ⭐ ...and the BARE "Close" is a close too, so it writes its own result into Err like every
+          // other form: it closes whatever is open and always succeeds, so that result is 0. Measured -
+          // "Close #7 : Close" leaves Err at 0 in fbc and left it at 1 here, and fbc's own
+          // file/close.bas asserts exactly that on its first line (DIVERGENZE 46).
+          // ⛔ MODERN ONLY: this field is CLASSIC's ER and what DS$ reports, and DCLEAR is a Commodore
+          // statement in its own right. The two dialects share the storage and nothing else.
+          if Assigned(FProgram) and FProgram.ModernMode then
+            Ctx.LastErrorCode := 0;
         end
         else
           raise Exception.Create('DCLEAR command not supported: no handler assigned');
