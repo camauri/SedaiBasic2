@@ -409,6 +409,7 @@ type
     FHasFixedLenFields: Boolean;         // any declared UDT has a fixed-length string field -> member reads/stores
     FHasNulStrLiteral: Boolean;          // the program contains a string literal with an embedded NUL (DIVERGENZE 98)
     FNulStrConsts: TStringList;          // ...and the CONST names whose value carries one
+    FWideNulConsts: TStringList;         // ...quelle fra esse dichiarate da wstr(<literal>): il taglio e' di LEN
                                          // must consider the pad/convert pair (a cheap global bail otherwise).
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
@@ -1216,6 +1217,8 @@ type
     procedure EmitStringByteWrite(SNode, IdxNode, ValNode: TASTNode; Tok: TLexerToken);
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
+    function NulLitUnderWstr(Node: TASTNode): Integer;
+    function NulLiteralArg(Node: TASTNode): Boolean;   // un literal con NUL, o una CONST che ne viene
     procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
     procedure EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue; ToConsole: Boolean);  // WRITE [#n] CSV
     procedure EmitStringFill(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -1761,6 +1764,8 @@ begin
   FHasNulStrLiteral := False;
   FNulStrConsts := TStringList.Create;
   FNulStrConsts.CaseSensitive := False;
+  FWideNulConsts := TStringList.Create;
+  FWideNulConsts.CaseSensitive := False;
   FByrefRetFuncs := TStringList.Create;
   FByrefRetValue := TStringList.Create;
   FByrefRetValue.CaseSensitive := False;
@@ -1874,6 +1879,7 @@ begin
   FBlockManagedTypes.Free;
   FConstDeclSeen.Free;
   FNulStrConsts.Free;
+  FWideNulConsts.Free;
   FConstStrBytes.Free;
   FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
@@ -2850,6 +2856,7 @@ var
   OldParamValue: TSSAValue;
   DiagIdx: Integer;   // PROCPTRDIAG only
   DiagKey: string;    // PROCPTRDIAG only
+  ArgWide: Boolean;   // DIVERGENZE 150: LEN taglia sul lato WIDE
 begin
   if Node = nil then
   begin
@@ -5485,7 +5492,14 @@ begin
             end;
           end;
           // LEN of a fixed-length string is its declared capacity: read the raw padded buffer.
+          // ⛔⛔ ...EXCEPT FOR A WIDE ONE, WHERE LEN STOPS AT THE NUL - a WSTRING is a C string, and
+          // that is measured, not assumed: on "Const S = wstr( !"A\000B" )" fbc answers Len 1 while
+          // Asc(S,3) is 66, and on a "WString * 8" holding one character it answers 1, not 8. So the
+          // wide side reads the CUT value and only ASC keeps the buffer (DIVERGENZE 150).
           ProcessExprFixedRaw(ArgNode, ArgValue);
+          if FixedLenCapOfNode(ArgNode, ArgWide) > 0 then
+            if ArgWide then
+              ArgValue := EmitFixedLenToVarLen(EnsureStringRegister(ArgValue), True);
           ArgReg := EnsureStringRegister(ArgValue);
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
@@ -10701,7 +10715,7 @@ procedure TSSAGenerator.ScanForNulStrLiteral(Node: TASTNode);
 // carries a NUL both read as carrying one; the cut is a no-op on the other, so the failure mode is
 // nothing happening.
 var
-  i: Integer;
+  i, WLit: Integer;
   Nm: string;
 begin
   if Node = nil then Exit;
@@ -10709,13 +10723,29 @@ begin
      (Pos(#0, VarToStr(Node.Value)) > 0) then
     FHasNulStrLiteral := True;
   if (Node.Attributes.Values['CONSTDECL'] = '1') and (Node.ChildCount >= 3) and
-     (Node.GetChild(0).NodeType = antIdentifier) and
-     (Node.GetChild(2).NodeType = antLiteral) and VarIsStr(Node.GetChild(2).Value) and
-     (Pos(#0, VarToStr(Node.GetChild(2).Value)) > 0) then
+     (Node.GetChild(0).NodeType = antIdentifier) then
   begin
     Nm := UpperCase(VarToStr(Node.GetChild(0).Value));
-    if FNulStrConsts.IndexOfName(Nm) < 0 then
-      FNulStrConsts.Values[Nm] := IntToStr(Length(VarToStr(Node.GetChild(2).Value)));
+    if (Node.GetChild(2).NodeType = antLiteral) and VarIsStr(Node.GetChild(2).Value) and
+       (Pos(#0, VarToStr(Node.GetChild(2).Value)) > 0) then
+    begin
+      if FNulStrConsts.IndexOfName(Nm) < 0 then
+        FNulStrConsts.Values[Nm] := IntToStr(Length(VarToStr(Node.GetChild(2).Value)));
+    end
+    // ⭐ ...AND THROUGH A "wstr( ... )" AROUND IT (DIVERGENZE 150). The initializer of the WIDE half is
+    // a CALL, not a literal node, so this pass saw nothing and the const was not a fixed-length rvalue
+    // at all - the mark FixedLenCapOfNode reads for it, WIDELIT, had no writer anywhere in the
+    // compiler. The wide names are kept apart because their consumers differ: Len CUTS on a wide value
+    // and does not on a byte one, which is measured, not assumed.
+    else
+    begin
+      WLit := NulLitUnderWstr(Node.GetChild(2));
+      if (WLit >= 0) and (FNulStrConsts.IndexOfName(Nm) < 0) then
+      begin
+        FNulStrConsts.Values[Nm] := IntToStr(WLit);
+        if FWideNulConsts.IndexOf(Nm) < 0 then FWideNulConsts.Add(Nm);
+      end;
+    end;
   end;
   for i := 0 to Node.ChildCount - 1 do
     ScanForNulStrLiteral(Node.GetChild(i));
@@ -10758,6 +10788,14 @@ begin
     end;
     Exit;
   end;
+  // ⭐ ...and "wstr( <literal with a NUL> )" is one too: fbc builds a static wide BUFFER of the whole
+  // literal there, which is why Asc reaches past the NUL while Len stops at it (DIVERGENZE 150).
+  UIdx := NulLitUnderWstr(Node);
+  if UIdx >= 0 then
+  begin
+    Wide := True;
+    Exit(UIdx);
+  end;
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
   begin
     VarName := VarToStr(Node.Value);
@@ -10765,7 +10803,10 @@ begin
     // becomes a variable-length string and keeps every byte everywhere else (DIVERGENZE 98). The
     // capacity is its byte size less the terminator fbc counts.
     if FNulStrConsts.IndexOfName(UpperCase(VarName)) >= 0 then
+    begin
+      Wide := FWideNulConsts.IndexOf(UpperCase(VarName)) >= 0;
       Exit(StrToIntDef(FNulStrConsts.Values[UpperCase(VarName)], 0));
+    end;
     Result := StrCapOf(FFixedLenVars, VarName, 0);
     if Result > 0 then
     begin
@@ -14061,6 +14102,45 @@ begin
   end;
 end;
 
+function TSSAGenerator.NulLitUnderWstr(Node: TASTNode): Integer;
+// The LENGTH of the NUL-bearing string literal a "wstr( ... )" wraps, or -1 when the node is not that
+// shape. WSTR is not a registered keyword, so the call arrives as an ACCESS to a name called WSTR
+// (DIVERGENZE 150).
+var
+  Args: TASTNode;
+begin
+  Result := -1;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  Args := nil;
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     (UpperCase(VarToStr(Node.GetChild(0).Value)) = 'WSTR') then
+    Args := Node.GetChild(1)
+  else if (Node.NodeType = antFunctionCall) and (Node.ChildCount >= 1) and
+          (UpperCase(VarToStr(Node.Value)) = 'WSTR') then
+    Args := Node.GetChild(0);
+  if (Args = nil) or (Args.ChildCount < 1) then Exit;
+  Node := Args.GetChild(0);
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType = antLiteral) and VarIsStr(Node.Value) and (Pos(#0, VarToStr(Node.Value)) > 0) then
+    Result := Length(VarToStr(Node.Value));
+end;
+
+function TSSAGenerator.NulLiteralArg(Node: TASTNode): Boolean;
+// Is this expression a COMPILE-TIME string literal carrying an embedded NUL - directly, or through a
+// CONST declared from one? (DIVERGENZE 150.) It is what tells "wstr( !"A\000B" )", whose characters fbc
+// keeps, from "wstr( s + Chr(0) + t )", which it cuts.
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType = antLiteral) and VarIsStr(Node.Value) then
+    Exit(Pos(#0, VarToStr(Node.Value)) > 0);
+  if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
+    Exit(FNulStrConsts.IndexOfName(UpperCase(VarToStr(Node.Value))) >= 0);
+end;
+
 procedure TSSAGenerator.EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);
 // Lower FreeBASIC WSTR(x) to a wide string. In the UTF-8 storage model a numeric argument becomes its
 // STR$ text (ASCII digits are valid UTF-8); a string argument passes through unchanged (its bytes are
@@ -14083,7 +14163,19 @@ begin
     // characters in fbc and we kept five, so Instr over it answered a position fbc cannot see. Storing
     // into a WSTRING VARIABLE already cut it (see TryFixedLenStore); the CONVERSION did not - the same
     // rule in one path and not the other. EmitFixedLenToVarLen is that one implementation.
-    Result := EmitFixedLenToVarLen(EnsureStringRegister(ArgValue), True)
+    //
+    // ⛔⛔ ...AND A COMPILE-TIME LITERAL IS THE EXCEPTION, MEASURED (DIVERGENZE 150). The note above is
+    // right for a RUN-TIME value and wrong for a literal, and fbc answers the two differently:
+    //   wstr("asd" + Chr(0) + "x")   Len 3, Asc(...,5) 0     - the conversion CUT it
+    //   wstr( !"A\000B" )            Len 1, Asc(...,3) 66    - the characters are ALL THERE
+    // For a literal fbc builds a static wide BUFFER of the whole thing; it is Len and Instr that stop
+    // at the NUL, because a WSTRING is a C string, while Asc indexes the buffer. ⇒ Do not cut here:
+    // the literal stays a fixed-length rvalue and each consumer decides, which is exactly the split
+    // DIVERGENZE 98 built for the byte half.
+    if NulLiteralArg(ArgsNode.GetChild(0)) then
+      Result := EnsureStringRegister(ArgValue)
+    else
+      Result := EmitFixedLenToVarLen(EnsureStringRegister(ArgValue), True)
   else
   begin
     ArgReg := EnsureFloatRegister(ArgValue);
@@ -39054,6 +39146,12 @@ begin
     antIdentifier:
       begin
         Result := IsWStringVar(VarToStr(Node.Value));
+        // ⭐ ...AND A CONST DECLARED FROM "wstr( <literal> )" IS WIDE (DIVERGENZE 150). Everything that
+        // reads it has to count CODEPOINTS: fbc's own string/asc asserts
+        // "asc( wstr(!"\u1111\u0000\u2222"), 1 ) = &h1111", and read as a byte string it answered
+        // &hE1 - the first byte of that codepoint's UTF-8.
+        if (not Result) and (FWideNulConsts <> nil) then
+          Result := FWideNulConsts.IndexOf(UpperCase(VarToStr(Node.Value))) >= 0;
         // ⭐ ...AND A BARE FIELD NAME INSIDE A METHOD BODY IS "this.<field>". The member-access arm
         // below has always answered for the QUALIFIED spelling, so "Len( this.d )" was right while
         // "Len( d )" - the same field, written the way one writes it inside its own type - counted
