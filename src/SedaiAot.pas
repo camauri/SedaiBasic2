@@ -1407,6 +1407,40 @@ end;
 
 // Is this SSA op one the AOT lowers natively? Combines the op set with the per-op shape
 // conditions, so callers get a single yes/no and the helper picks up everything else.
+var
+  GErrProbeProg: TSSAProgram = nil;   // the program the answer below was computed for
+  GErrProbeReads: Boolean = False;
+
+function AotProgReadsER(SSAProg: TSSAProgram): Boolean;
+// Does this program read Err / ER anywhere? (DIVERGENZE 46.)
+//
+// ⛔⛔ It decides whether the PRINT family may keep its NATIVE descent. A successful output writes 0
+// into Err, and the interpreter's arm does that; the emitted code does not, so a program that can
+// OBSERVE Err must not take the compiled road for a print - the two engines would answer differently
+// and aot_validate would (rightly) call it a MISMATCH.
+// ⭐ The cost is paid by the programs that read Err and by no others. The alternative - emitting the
+// store in machine code - buys back a native print at the price of a second place where the rule lives.
+// ⚠️ Cached on the program pointer: asked once per instruction, a scan per call would be quadratic.
+var
+  b, i: Integer;
+begin
+  if SSAProg = nil then Exit(False);
+  if SSAProg = GErrProbeProg then Exit(GErrProbeReads);
+  GErrProbeProg := SSAProg;
+  GErrProbeReads := False;
+  for b := 0 to SSAProg.Blocks.Count - 1 do
+  begin
+    for i := 0 to SSAProg.Blocks[b].Instructions.Count - 1 do
+      if SSAProg.Blocks[b].Instructions[i].OpCode = ssaLoadER then
+      begin
+        GErrProbeReads := True;
+        Break;
+      end;
+    if GErrProbeReads then Break;
+  end;
+  Result := GErrProbeReads;
+end;
+
 function AotIsNative(SSAProg: TSSAProgram; const Ins: TSSAInstruction): Boolean;
 begin
   // B3: a STATIC call is a native call site (AotCallSub replicates bcCallSub in Pascal and
@@ -1480,12 +1514,12 @@ begin
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
     // C7: the two print bookkeeping opcodes. No operands to check - only the A/B gate.
     ssaPrintSemicolon, ssaPrintEnd:
-      Result := AotPrintOpNative;
+      Result := AotPrintOpNative and (not AotProgReadsER(SSAProg));
     // C7b: the print item. The operand must be a string REGISTER (a constant would have no bank
     // slot to read); anything else takes the helper road whole.
     ssaPrintString, ssaPrintStringLn:
-      Result := AotPrintStrNative and (Ins.Src1.Kind = svkRegister) and
-                (Ins.Src1.RegType = srtString);
+      Result := AotPrintStrNative and (not AotProgReadsER(SSAProg)) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtString);
     // C7: the STRING transfer pair. The slot index travels in the bytecode Immediate, which the
     // emitter reads at compile time, so the operand shape is fixed - only the A/B gate to check.
     ssaXferLoadString, ssaXferStoreString:
