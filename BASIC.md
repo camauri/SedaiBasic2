@@ -294,9 +294,9 @@ same limit applies to reading a UDT as raw bytes.
   own `On Error Goto h … h: Print "err="; Err` answers **0**, because the label is written before the
   item is evaluated — so a handler reads `Err` into a variable first, which is the shape FreeBASIC's
   own tests use.
-  The remaining difference is `Print Using "###"; Err`: FreeBASIC emits the format's literal part
-  before converting the value, so the item reads 0; here the value is evaluated first and reads the
-  code. That is an evaluation order inside `PRINT USING`, not a rule about `Err`.
+  `PRINT USING` follows the same rule and for the same reason: it **starts its format before it
+  evaluates its items**, so `Print Using "###"; Err` — and `Print Using "###"; g()` with a `g` that
+  returns `Err` — answer 0 on both sides.
   ⛔ CLASSIC is untouched: the same storage is Commodore's `ER` and the code `DS$` reports, and a
   CLASSIC `PRINT` never writes it. The two dialects share that field and nothing else.
 
