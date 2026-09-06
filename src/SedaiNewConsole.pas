@@ -912,9 +912,9 @@ type
     FLastVMRenderTick: UInt32;
 
     // File I/O for DOPEN/DCLOSE/PRINT#/INPUT#/GET#
-    FFileHandles: array[1..15] of TFileStream;  // Open file handles (BASIC uses 1-15)
-    FFileNames: array[1..15] of string;         // Filenames for open handles
-    FFileModes: array[1..15] of string;         // Access mode for open handles
+    FFileHandles: array[1..MAX_FILE_HANDLE] of TFileStream;  // Open file handles (1..MAX_FILE_HANDLE)
+    FFileNames: array[1..MAX_FILE_HANDLE] of string;         // Filenames for open handles
+    FFileModes: array[1..MAX_FILE_HANDLE] of string;         // Access mode for open handles
 
     procedure ShowSplashScreen;
     function GetSystemInfo: string;
@@ -6240,7 +6240,7 @@ begin
   FLastErrorMessage := '';
 
   // Initialize file handles (all closed)
-  for I := 1 to 15 do
+  for I := 1 to MAX_FILE_HANDLE do
   begin
     FFileHandles[I] := nil;
     FFileNames[I] := '';
@@ -9668,7 +9668,7 @@ begin
   end;
 
   // Validate handle range for other commands
-  if (Handle < 1) or (Handle > 15) then
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then
   begin
     ErrorCode := 64;  // FILE NOT OPEN error
     Exit;
@@ -9771,7 +9771,7 @@ begin
   begin
     RetType := StrToIntDef(Data, 1);
     Data := '0';
-    if (Handle >= 1) and (Handle <= 15) and Assigned(FFileHandles[Handle]) then
+    if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and Assigned(FFileHandles[Handle]) then
       case RetType of
         2: Data := IntToStr(PtrInt(FFileHandles[Handle].Handle));  // OS file handle
         3: Data := '0';   // Encoding: ASCII
@@ -9795,7 +9795,7 @@ begin
   end;
 
   // Validate handle range
-  if (Handle < 1) or (Handle > 15) then
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then
   begin
     ErrorCode := 64;  // FILE NOT OPEN error
     Exit;
@@ -9918,7 +9918,7 @@ procedure TSedaiNewConsole.CloseAllFileHandles;
 var
   I: Integer;
 begin
-  for I := 1 to 15 do
+  for I := 1 to MAX_FILE_HANDLE do
   begin
     if Assigned(FFileHandles[I]) then
     begin

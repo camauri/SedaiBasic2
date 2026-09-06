@@ -224,7 +224,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `LOCK` / `UNLOCK` | ✓ | File record locking — no-op on a single-process VM |
 | `#define`/`#undef`/`#ifdef`/`#ifndef`/`#else`/`#endif`/`#include` | ✓ | Preprocessor (object-like **and** function-like macros `#define NAME(p) body`, nested expansion) |
 | `NAMESPACE` | ✓ | Group decls under a name; qualified `N.member`, unqualified inside, nesting + reopening. Global-scope operator: `.name` reaches the module-level name from inside a namespace, and `..name` does the same EXPLICITLY — the only form that still means the global one from inside a `With` block, where a single dot is the WITH object (methods of a namespaced TYPE / `USING` pending) |
-| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`/`p(i)`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
+| Pointers `@x` / `T PTR` / `*p` | ✓ | Explicit pointers (int/float/string): address-of, pointer DIM, dereference read+write. NULL=0. Array-element pointers `@arr(i)`, UDT-field pointers `@obj.field` (incl. `@arr(i).field`, nested `@a.b.c`), pointer arithmetic `*(p±n)`, indexing `p[i]`, passing pointers across SUB calls, multi-level `PTR PTR` (`**pp`). **UDT pointers**: `DIM p AS T PTR`, `NEW T`/`DELETE`, `@obj`, `p->field`/`p.field`, self-referential `NXT AS NODE PTR` (linked lists/trees), chained `p->nxt->val`. **BYREF-return of a BYREF param** (`min(a,b)=0`, int pointees). **Pointer return types** (`FUNCTION f() AS T PTR` returning a pointer value). **Raw memory**: `Allocate`/`CAllocate`/`Reallocate`/`Deallocate` on a VM-internal byte heap, `SizeOf(T)`, `CAST`/`CPTR(type, expr)`, scaled `p[i]`/`*(p±n)`; `SADD(s)` = raw ZSTRING pointer to a string's bytes (read-only snapshot) |
 | `FUNCTION f() BYREF AS T` | ✓ | BYREF function results: return a reference to a SHARED/global scalar or a BYREF parameter (the `min(a,b)=0` idiom, int pointees), read + write through it (`f()=x`) |
 | `WSTRING` | ✓ | Unicode wide string (UTF-8 storage). `DIM s AS WSTRING [* n]`, params/return/UDT fields/arrays. `LEN`/`LEFT$`/`RIGHT$`/`MID$` index by codepoint; assignment/concat/PRINT shared with `STRING`. `WSTR(x)` converter. Fixed-length `* n` advisory (var-length storage) |
 | Date/time | ✓ | Date serial = Double (epoch 1899-12-30). `NOW`/`TIMER`/`DATE`/`TIME` (bare), `DATESERIAL`/`TIMESERIAL`, `DATEVALUE`/`TIMEVALUE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/`WEEKDAY`, `MONTHNAME`/`WEEKDAYNAME`, `ISDATE`, `DATEADD`/`DATEDIFF`/`DATEPART` (intervals `yyyy q m y d w ww h n s`), `SETDATE`/`SETTIME` (VM-internal clock offset). Field functions intercepted by name so `day`/`month`/`year`/`second`… stay usable as variables |
@@ -278,10 +278,21 @@ because both sides of those speak the same unit.
 **Reinterpreting memory across element boundaries is not supported.** An array here is a vector of
 typed elements, not a flat byte image, so a pointer cast that lands part-way into an element — for
 example advancing a `Long Ptr` by one `Short` and then reading a `Long` — has no memory to read. The
-same limit applies to reading a UDT as raw bytes and to punning a `Single` (stored as an 8-byte
-double) through an integer pointer.
+same limit applies to reading a UDT as raw bytes.
+  ⭐ **Punning a `Single` is supported** (6 September 2026): `*Cast(ULong Ptr, @s)` answers its IEEE-754
+  image, `*Cast(ULong Ptr, @s) = 1065353216` writes it back, and a `UByte Ptr` walks its four bytes —
+  a module-level, `Shared`, local or UDT-field one alike. The value itself was never a double
+  pretending: single arithmetic rounds to 32 bits at every step, so `16777216f + 1f - 16777216f` is 0
+  and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
+- **The address of a `Str` / `Chr` / `WStr` / `WChr` temporary needs a COMPILE-TIME CONSTANT**, as in
+  FreeBASIC: `@str(123)`, `@chr(64+1)`, `@wstr("a" + "b")`, `@str(SizeOf(Integer))`, `@chr(Asc("A"))`
+  and the same over a `Const`, a `#define` or an `Enum` member all answer the address of a static
+  temporary; `@str(n)` on a variable, on a field, on an array element or on a user function's result
+  is refused with a message that names the reason (fbc answers *error 24: Invalid data types*).
+  Every other string-valued expression is refused on both sides — `@mid(s,2,3)`, `@ucase(s)`,
+  `@(s + "cd")`.
 - ⚠️ **A declaration must state its type, and that narrows what we used to accept.** In `-lang fb`
   there are no default types and no inference from a type sigil, so `Dim a`, `Dim a$`, `Dim a(0 To 1)`,
   `Common a` and `Dim a = 5` are all refused, exactly as fbc refuses them (`error 147`). The check is
@@ -331,8 +342,6 @@ double) through an integer pointer.
     it prescribes.
   - **Extensions** (fbc's base dialect rejects them; they exist only in `-lang fblite`/`qb` there, or
     not at all): `On Error Goto`, `Resume`, `Resume Next`, and `Err$(n)`.
-  - ⚠️ File handles run 1–15 here (a Commodore-era limit in the file layer); fbc allows many more, so
-    `As #90` is legal there and an error here.
 - ⚠️ **The C standard library is not here, and only its I/O half is a divergence.** A program that
   includes `<crt.bi>` for MEMORY gets what it asked for: `malloc`, `calloc`, `realloc` and `free` are
   aliases of `Allocate`, `CAllocate`, `Reallocate` and `Deallocate`, byte for byte (`calloc(count,
@@ -366,15 +375,23 @@ double) through an integer pointer.
   (`f(0)` selecting `f(i As Integer, j As Integer = 0, k As Integer = 0)`); among the candidates the
   one needing the fewest omissions wins, and an exact bank prefix breaks a tie.
 - ⚠️ **`PUT ..., Alpha`**: the blended RGB matches fbc exactly; the resulting **alpha byte** does not.
-  fbc's is deterministic and fully characterised — with an explicit value it is the blend value when
-  the destination's **green** exceeds the source's green and the destination's own alpha otherwise
-  (threshold `srcGreen+1`, whatever the blend value); without one it is a fixed function of the two
-  alphas. ⭐ The destination's red and blue move it *not at all*, which is what identifies it: the
-  alpha byte shares its 32-bit lane with green (an `&hFF00FF00` mask groups A with G), so green's
-  borrow lands in alpha and red's and blue's cannot. It is a corrupted channel — "is the destination
-  greener than the source" is not something a blended pixel's alpha can mean — so we blend the alpha
-  channel like the other three. Same position as the float double-rounding above: where fbc is
-  measurably wrong we do not follow, and we declare it.
+  Measured over a 6×6 matrix of source × destination alpha, fbc's rule is exact:
+
+  | | fbc | here |
+  |---|---|---|
+  | `dstAlpha <= srcAlpha` | the blend | the blend — we agree |
+  | `dstAlpha >  srcAlpha` | `(blend + srcAlpha) mod 256` | the blend |
+
+  ⭐ fbc's value is **not monotone and it wraps**: at `srcAlpha = 51` the alpha column reads
+  51 · 51 · 142 · 183 · 224 · **9** as the destination's alpha rises, because 214 + 51 = 265. The
+  alpha byte shares its 32-bit lane with green (an `&hFF00FF00` mask groups A with G), so a borrow
+  from the green lane lands in alpha and red's and blue's cannot reach it. It is a corrupted channel —
+  a blended pixel's alpha cannot mean "how much more opaque the destination was" — so we blend the
+  alpha channel like the other three. Same position as the float double-rounding above: where fbc is
+  measurably wrong we do not follow, and we declare it. Guard `m845` pins it.
+  ⚠️ An earlier wording of this note put the threshold on the destination's **green**; the matrix
+  above holds green fixed and the divergence still appears and disappears with alpha alone, so the
+  channel named was wrong. The RGB half was re-verified byte for byte over six blends.
 - **`POS` and `CSRLIN` count from 1** in MODERN, as FreeBASIC does (*"The topmost row is number 1"*);
   in CLASSIC they keep the Commodore numbering from 0. `Color()` before any `COLOR` statement reports
   `0` on `0`, measured.
@@ -2016,7 +2033,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `() (Array index)` | ✓ | `a(i [, j ...])` reads/writes an array element, honouring per-dimension lower bounds. Bounds checking is dialect-aware: MODERN/FreeBASIC does not bounds-check by default (an out-of-bounds read yields the default value, an out-of-bounds write is dropped — memory-safe); CLASSIC/Commodore raises `?BAD SUBSCRIPT`. The `--bounds-check` CLI flag forces a hard error on any out-of-bounds access (like FreeBASIC's `-exx`). |
 | `[] (String index)` | ✓ | `s[i]` reads/writes the byte (character code) at 0-based index `i` of a scalar string (read = `ASC(MID$(s,i+1,1))`; write replaces that byte). |
-| `[] (Pointer index)` | ✓ | `p[i]` (and `p(i)`) ≡ `*(p + i)`, read and write |
+| `[] (Pointer index)` | ✓ | `p[i]` ≡ `*(p + i)`, read and write. ⚠️ The BRACKETS are the only spelling, as in FreeBASIC: `p(i)` on a pointer is refused (fbc: *error 72, Array not dimensioned*) — the parentheses are an array subscript and a pointer is not an array. Accepted here until 5 Sep 2026. |
 
 #### String Operators
 
@@ -2071,7 +2088,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 | `@ (Address of)` | ✓ | Address-of a scalar, array element `@arr(i)`, or UDT field `@obj.field` (yields a packed int reference). `@sub` (procedure address) also supported |
 | `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`); supports pointer arithmetic `*(p±n)` |
 | `VARPTR (Variable pointer)` | ✓ | Address of a variable (= @v). |
-| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p); vtable index form deferred. |
+| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p). A MEMBER is named through its type — `ProcPtr( T.proc )`, `ProcPtr( T.constructor, Sub( ByVal As Integer ) )`, `ProcPtr( T.let )`, `ProcPtr( T.+= )`, `ProcPtr( T.[] )`, `ProcPtr( T.cast, Function() As Integer )`, and a property's getter/setter told apart by `Function`/`Sub` — and the optional signature picks the overload (its parameter count *and* its types); with no signature the first declared one wins. The result is a procedure whose FIRST parameter is the object, `Sub cdecl( ByRef As T, … )`, so it is called as `p( obj, … )`. ⚠️ The vtable-index form is refused by name. |
 
 #### Type or Class Operators
 
@@ -2423,7 +2440,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ASM__` | ✓ | `"intel"` — fbc's own answer on linux-x86_64. Naming a dialect does not make inline `Asm` supported; that stays a declared gap (see divergence 51). |
+| `__FB_ASM__` | ✓ | `"intel"` — fbc's own answer on linux-x86_64. Naming a dialect does not make inline `Asm` supported; that waits on the native-binary backend (see divergence 51). |
 | `__FB_BACKEND__` | ✓ | `"gcc"` — fbc's default backend on this host, and therefore the branch fbc itself compiles. |
 | `__FB_GCC__` | ✓ | `-1` — the flag form of `__FB_BACKEND__ = "gcc"`, kept consistent with it. |
 | `__FB_OPTIMIZE__` | ✓ | `0` — the optimisation level the SOURCE asked for (fbc's default; a `#cmdline` carrying `-O` raises it). It reports the REQUEST, not our pipeline, which has no `-O` ladder. |
@@ -2602,9 +2619,9 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | Keyword | Status | Description |
 |---|---|---|
 | `END (Block)` | ✓ |  |
-| `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time). Field-index × 8 (exact for all-64-bit UDTs, consistent with `SizeOf`; no FB packing/alignment for narrow fields). |
+| `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time), read off the type's C layout, which is fbc's byte for byte: narrow fields, `FIELD = n`, nested `Union`/`Type` blocks and **runs of bit fields** included. ⛔ A **bit field has no offset** — it has no address — so `OffsetOf` of one is REFUSED, as fbc refuses it (guard `m835`); the run's own packing is guard `m836`. |
 | `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
-| `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). The `#if TypeOf(a)=TypeOf(b)` form is **rejected with an error**, not silently evaluated: this preprocessor runs on text, before any declaration is seen, so it cannot answer the question — and answering it "false" (the undefined-identifier rule) would quietly take the wrong branch. |
+| `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). `#if TypeOf(x) = <type>` is **answered**, from the declarations that appear ABOVE the directive: fbc's preprocessor is a single top-down pass, so a `#if` at line N needs only lines 1..N-1, and ours collects them as it emits. The result is an UPPER-cased type name, as fbc's own tests spell out (`#assert typeof( pi ) = "INTEGER PTR"`). Two names neither declared nor known as types compare EQUAL to each other and differ from every real type — measured against fbc, not chosen. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
 | `OPTION()` | ✓ |  |
@@ -2900,7 +2917,7 @@ End Function
 | `READ (File Access)` | ✓ | Binary data can only be read from the file. |
 | `WRITE (File Access)` | ✓ | `WRITE #n, ...` writes quoted comma-separated (CSV) values to the file. |
 | `READ WRITE(File Access)` | ✓ | Binary data can be read from and written to the file. |
-| `ENCODING` | ✓ | `OPEN ... ENCODING "ascii\|utf8\|utf16\|utf32"`, in the statement form and in the function form alike. The name need not be a literal — `ENCODING encod` and `ENCODING files(i).encoding` are evaluated at run time. `utf16`/`utf32` re-encode file I/O (little-endian, byte-order mark written on creation and skipped on read); `utf8` writes the BOM but needs no conversion, our strings being UTF-8 bytes already; `ascii` is the passthrough. ⚠️ Declared divergence: a file opened FOR INPUT with an explicit encoding is not validated against its byte-order mark, where fbc answers error 3. |
+| `ENCODING` | ✓ | `OPEN ... ENCODING "ascii\|utf8\|utf16\|utf32"`, in the statement form and in the function form alike. The name need not be a literal — `ENCODING encod` and `ENCODING files(i).encoding` are evaluated at run time. `utf16`/`utf32` re-encode file I/O (little-endian, byte-order mark written on creation and skipped on read); `utf8` writes the BOM but needs no conversion, our strings being UTF-8 bytes already; `ascii` is the passthrough. A file opened FOR INPUT **or FOR APPEND** with an explicit encoding is validated against its byte-order mark, as fbc does: the mark must match as a **prefix** (a UTF-32 file opens as `utf16`, a UTF-16 file does not open as `utf32`), `utf16` means little-endian (an `FE FF` file is error 3), an **empty** file is error 3, and `ascii` never validates. A mode that CREATES the file skips the check — it writes the mark itself. |
 
 #### Reading from and Writing to Files or Devices
 
@@ -3331,9 +3348,33 @@ Each of these is *refused with a message that names the reason*, never answered 
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
   BANK (string / integer / floating point). `Cast(TypeOf(p), 0)` with `p As Double Ptr` does not yield
   `Double Ptr`, so it is not supported.
+- **Two overloads that differ only by a POINTER's constness, or only by an array parameter's RANK, are
+  accepted here and FreeBASIC refuses them.** The general rule is implemented — two overloads differing
+  only by the passing mode, or by `Const` on a `ByVal` parameter, are refused as fbc refuses them
+  (*error 4: Duplicated definition*), while `ByRef x As T` beside `ByRef x As Const T` stays legal on
+  both sides. The two exceptions are cases the parser does not record finely enough: the POSITION of a
+  `Const` inside a pointer type (`Const Integer Ptr Ptr` versus `Integer Const Ptr Ptr` are different
+  types to fbc), and an array parameter's rank (`a(Any)` versus `a(Any, Any)`). Missing refusals, never
+  a wrong answer.
+
+- **A bare `Any` as a declared TYPE is accepted here and FreeBASIC refuses it.** `Any` is meant to be
+  a pointee — `Any Ptr` is the idiom and works identically on both sides — and fbc rejects it
+  everywhere a real type is needed: a defined procedure's parameter, `ByRef` or `ByVal` (*error 59:
+  Illegal specification*), an array parameter, a `Dim`, a `Type` field and a function's return type
+  (*error 24: Invalid data types*). ⚠️ A bare `Declare` carrying one is accepted by fbc — only the
+  definition is checked. We accept all of them. A missing refusal, never a wrong answer, and left
+  deliberately: the check would have to be repeated at six declaration sites, `ANY` is this
+  compiler's own internal wildcard in overload matching, and no program writes the form.
+  ⚠️ `SizeOf(Any)` answers 8 here and 0 in fbc.
 - **`Close(n)` as a FUNCTION.** fbc lets `CLOSE` be called as an expression that answers an error
   code (`0` when the channel was open, `1` = illegal function call otherwise). Only the STATEMENT
   forms are implemented here — `Close #n` and the bare `Close`, which closes every channel.
+- **`@<statement builtin>`** — `Var p = @Sleep`. In FreeBASIC `Sleep` is a real library function and
+  its address is that function's entry point; here the statement is an OPCODE, so there is no entry PC
+  to hand back and the program is refused by name (*Undefined procedure (address-of @): SLEEP*).
+  ⚠️ fbc refuses the same thing for a true statement keyword (`@Print` is *error 14*), so the two
+  agree except on the builtins it happens to implement as functions.
+
 - **`ProcPtr(p, Virtual ...)`** (fbc 1.10+) asks for a member's **vtable index**, not its address.
   There is no vtable a program can index here: a virtual call goes through a generated dispatcher
   keyed on the instance's runtime type-id. Call the method directly — the dispatch is the same one.
@@ -3369,10 +3410,21 @@ Each of these is *refused with a message that names the reason*, never answered 
   message that says so rather than "Array not declared". Use the BASIC equivalents
   (`Open`/`Print #`/`Close`, `Print Using`).
 - **Inline assembly**: `Asm … End Asm`, `Naked` procedures, and `__FB_ASM__` branches that select one.
-  Machine code in the source is not something a bytecode VM can host — one of its engines is an
-  interpreter, and the interpreter is the *reference* the AOT and JIT validators demand MISMATCH 0
-  against, so a feature alive on two engines of four could not be verified at all. The targets are not
-  only x86 either (the WebAssembly backend, and the MCU work).
+  ⚠️ **Not supported YET — this one is on the roadmap, not a permanent divergence.** Machine code in
+  the source is not something a bytecode VM can host: one of its engines is an interpreter, and the
+  interpreter is the *reference* the AOT and JIT validators demand MISMATCH 0 against, so a feature
+  alive on two engines of four could not be verified at all. The targets are not only x86 either (the
+  WebAssembly backend, and the MCU work). ⇒ It becomes possible when SedaiBasic can produce **native
+  binaries**, which is a planned dual environment: the VM where a distributed, multiplatform — and
+  web-capable — runtime is what is wanted, a native binary for desktop and embedded where that form
+  performs better. Inline assembly belongs to the second.
+  ⭐ For reference, how fbc does it, measured on both of its backends: **it does not compile the
+  assembly, it hands it over.** With the C backend each line comes out as a GCC `__asm__ __volatile__`
+  whose BASIC variables are `"+m"` operands and whose clobber list names every general register plus
+  `cc` and `memory` — the allocation around the block is left to gcc; with `-gen gas64` the text lands
+  *verbatim* in the `.asm` in Intel syntax and `as` assembles it, the variable name already replaced by
+  its frame offset. fbc never looks at the instructions. It can do that because it has ONE target with
+  an assembler under it.
   ⭐ **An `Asm … End Asm` block that holds NO INSTRUCTION is accepted** (29 August 2026): there is
   nothing to translate. fbc's own `pp/pragma-reserve-7` writes one whose entire content is
   preprocessor directives — consumed before the parser sees the block — and the test is about the

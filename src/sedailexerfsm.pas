@@ -1653,21 +1653,23 @@ var
   // CODEPOINT and keeps the UTF-8 encoding - which is what AppendCP is for, and why the two are now
   // separate calls instead of one.
   function EmitByte(Val: Integer): Boolean;
+  // ⛔⛔ A PRODUCED NUL IS A BYTE, NOT A TERMINATOR (DIVERGENZE 98). This used to answer False on 0 and
+  // the caller stopped, so "!"A\000B"" was the one-byte string "A" everywhere. Measured over 14 forms,
+  // fbc keeps all three bytes in the LITERAL and cuts at the NUL only where a value becomes a
+  // VARIABLE-LENGTH string: Len is 3, Len(lit + "X") is 4, Asc(lit,3) is 66, Instr finds "B" at 3 and
+  // Print writes all of it, while "Dim v As String = lit", "v = lit" and a "ZString * 8" all give 1.
+  // ⇒ The cut belongs to the CONVERSION, not to the lexer, and the conversion already exists
+  // (EmitFixedLenToVarLen is literally "everything before the first NUL"). Keeping the byte here is
+  // what lets that machinery answer both halves; see FixedLenCapOfNode.
   begin
-    if Val = 0 then
-      Result := False
-    else
-    begin
-      AppendByte(Val);
-      Result := True;
-    end;
+    AppendByte(Val);
+    Result := True;
   end;
 
   function EmitCodepoint(Val: Integer): Boolean;
+  // ⛔ Same as EmitByte: a produced NUL is a codepoint like any other, and the cut belongs to the
+  // conversion to a variable-length string (DIVERGENZE 98).
   begin
-    if Val = 0 then
-      Result := False
-    else
     begin
       // ⭐ A "\uNNNN" ABOVE 127 IS WHAT MAKES THE LITERAL WIDE, and after expansion nothing says so:
       // the value is UTF-8 bytes, indistinguishable from a byte string that happens to hold them. So

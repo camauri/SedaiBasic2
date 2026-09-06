@@ -39,15 +39,15 @@ uses
 type
   TVMFileHandler = class
   private
-    FFileHandles: array[1..15] of TFileStream;
+    FFileHandles: array[1..MAX_FILE_HANDLE] of TFileStream;
     // FreeBASIC standard DEVICES opened as ordinary handles: "Open Cons For Input As #1" is how a
     // program reads stdin, and CLBG's reverse-complement / k-nucleotide / regex-redux are all written
     // that way. A device has no TFileStream - the bytes come from System.Input and go to System.Output -
     // so it needs its own marker, and the handle counts as open while FFileHandles stays nil.
     //   1 = CONS (stdin when opened For Input, stdout when For Output)   2 = SCRN (stdout)   3 = ERR (stderr)
-    FDeviceKind: array[1..15] of Integer;
-    FFileModes: array[1..15] of string;
-    FRecordLens: array[1..15] of Integer;   // relative-file record length per handle (0 = not relative)
+    FDeviceKind: array[1..MAX_FILE_HANDLE] of Integer;
+    FFileModes: array[1..MAX_FILE_HANDLE] of string;
+    FRecordLens: array[1..MAX_FILE_HANDLE] of Integer;   // relative-file record length per handle (0 = not relative)
 
     { ===== Cached file size =====
 
@@ -60,7 +60,7 @@ type
       invalidated in the one place that writes. -1 = not known yet. ⚠️ This deliberately does not
       model another process appending to a file we hold open; neither does FreeBASIC, and paying four
       syscalls per character to find out is not a trade anyone asked for. }
-    FSizeCache: array[1..15] of Int64;
+    FSizeCache: array[1..MAX_FILE_HANDLE] of Int64;
 
     { ===== Buffered standard input =====
 
@@ -114,14 +114,14 @@ implementation
 
 function TVMFileHandler.CachedSize(Handle: Integer; FS: TFileStream): Int64;
 begin
-  if (Handle < 1) or (Handle > 15) then Exit(FS.Size);
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit(FS.Size);
   if FSizeCache[Handle] < 0 then FSizeCache[Handle] := FS.Size;
   Result := FSizeCache[Handle];
 end;
 
 procedure TVMFileHandler.InvalidateSize(Handle: Integer);
 begin
-  if (Handle >= 1) and (Handle <= 15) then FSizeCache[Handle] := -1;
+  if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) then FSizeCache[Handle] := -1;
 end;
 
 // LOC counts in RECORDS, and what a record IS depends only on how the file was opened
@@ -133,7 +133,7 @@ end;
 // trailing '<' for ACCESS READ), so testing for 'B' cannot collide with a filename.
 function TVMFileHandler.RecordUnit(Handle: Integer): Int64;
 begin
-  if (Handle < 1) or (Handle > 15) then Exit(1);
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit(1);
   if FRecordLens[Handle] > 0 then Result := FRecordLens[Handle]
   else if Pos('B', FFileModes[Handle]) > 0 then Result := 1
   else Result := 128;
@@ -280,7 +280,7 @@ procedure TVMFileHandler.CloseAll;
 var
   i: Integer;
 begin
-  for i := 1 to 15 do
+  for i := 1 to MAX_FILE_HANDLE do
     if Assigned(FFileHandles[i]) then
     begin
       FreeAndNil(FFileHandles[i]);
@@ -298,7 +298,7 @@ var
   p, q: Integer;
 begin
   Result := 8;
-  if (Handle < 1) or (Handle > 15) then Exit;
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit;
   p := Pos('~', FFileModes[Handle]);
   // ⛔ Only the DIGIT RUN, not "the rest of the string": the mode also carries '<' for ACCESS READ, and
   // reading "16<" as a number answered the default 8 - so the same file decoded correctly without the
@@ -368,12 +368,15 @@ var
   FileMode: Word;
   TildePos: Integer;
   BomBuf: array[0..3] of Byte;
+  BomWant: array[0..3] of Byte;   // the byte-order mark an ENCODING clause promises (see the check)
+  BomLen, BomGot, i: Integer;
+  BomOk: Boolean;
 begin
   ErrorCode := 0;
   // DCLEAR / RESET: close every open handle. Signalled with Handle 0, so it must be handled before
   // the per-handle range check below (which would otherwise reject Handle 0 with error 64).
   if Command = 'DCLEAR' then begin CloseAll; Exit; end;
-  if (Handle < 1) or (Handle > 15) then begin ErrorCode := 64; Exit; end;
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then begin ErrorCode := 64; Exit; end;
 
   if Command = 'DOPEN' then
   begin
@@ -458,6 +461,44 @@ begin
       FFileHandles[Handle] := TFileStream.Create(Filename, FileMode);
       InvalidateSize(Handle);
       FFileModes[Handle] := M;
+      // ⛔ AN ENCODING CLAUSE ON A FILE WE ARE GOING TO READ IS A CLAIM ABOUT ITS BYTES, and fbc
+      // CHECKS it: the file must begin with that encoding's byte-order mark or the open answers
+      // error 3. Measured over a 4x4 matrix (no BOM / UTF-8 / UTF-16LE / UTF-16BE files x utf-8 /
+      // utf-16 / utf-32 / ascii clauses), and the rule is narrower than "a BOM is present":
+      //   * the mark must MATCH, as a PREFIX - a UTF-32 file (FF FE 00 00) opens as "utf-16" because
+      //     FF FE is its prefix, while a UTF-16 file does NOT open as "utf-32";
+      //   * "utf-16" means LITTLE endian: a FF FE file opens, an FE FF one is error 3;
+      //   * an EMPTY file is error 3 - there is no mark to match;
+      //   * "ascii" is not a claim about bytes and never validates (it has no marker at all);
+      //   * and APPEND validates too, because it is going to read the file's shape. Only a mode that
+      //     CREATES the file skips the test - it writes its own mark a few lines below.
+      // Without this we accepted every combination and then DECODED the bytes as asked: a plain
+      // ASCII file opened as "utf-16" printed 敨汬 for "hello" and said nothing.
+      if (Pos('~', M) > 0) and (FileMode <> fmCreate) and (Pos('B', M) = 0) then
+      begin
+        BomLen := 0;
+        case TextEncodingOf(Handle) of
+          16: begin BomWant[0] := $FF; BomWant[1] := $FE; BomLen := 2; end;
+          32: begin BomWant[0] := $FF; BomWant[1] := $FE; BomWant[2] := 0; BomWant[3] := 0; BomLen := 4; end;
+        else  begin BomWant[0] := $EF; BomWant[1] := $BB; BomWant[2] := $BF; BomLen := 3; end;
+        end;
+        BomBuf[0] := 0; BomBuf[1] := 0; BomBuf[2] := 0; BomBuf[3] := 0;
+        BomGot := FFileHandles[Handle].Read(BomBuf[0], BomLen);
+        FFileHandles[Handle].Seek(0, soBeginning);
+        BomOk := BomGot = BomLen;
+        if BomOk then
+          for i := 0 to BomLen - 1 do
+            if BomBuf[i] <> BomWant[i] then begin BomOk := False; Break; end;
+        if not BomOk then
+        begin
+          FreeAndNil(FFileHandles[Handle]);
+          FFileModes[Handle] := '';
+          // 70 is the layer's "some other failure", and the VM maps everything that is not 62 (file
+          // not found) or 64 (bad handle) to FreeBASIC's 3 - which is the code fbc answers here.
+          ErrorCode := 70;
+          Exit;
+        end;
+      end;
       if Pos('A', M) > 0 then FFileHandles[Handle].Seek(0, soEnd);
       // A freshly CREATED wide-encoded text file opens with a byte-order mark, as fbc writes it:
       // FF FE for UTF-16LE, FF FE 00 00 for UTF-32LE. Only on creation - appending to an existing
@@ -488,6 +529,14 @@ begin
   end
   else if Command = 'DCLOSE' then
   begin
+    // ⭐ REPORT WHETHER THERE WAS ANYTHING TO CLOSE (DIVERGENZE 41). The FUNCTION form of CLOSE answers
+    // 0 when the channel was open and 1 (illegal function call) when it was not, and this is the only
+    // place that knows which. Code 64 is the same "illegal function call" the OPEN path already uses
+    // for a handle out of range, so the two file paths speak one language.
+    // ⛔ The STATEMENT must stay SILENT on it: "Close #7" on a channel never opened is not an error in
+    // fbc (measured: it prints ok and leaves Err at 0), so the statement arm ignores exactly this code.
+    if (not Assigned(FFileHandles[Handle])) and (FDeviceKind[Handle] = 0) then
+      ErrorCode := 64;
     if Assigned(FFileHandles[Handle]) then
     begin
       FreeAndNil(FFileHandles[Handle]);
@@ -511,16 +560,20 @@ begin
   Value := 0;
   ErrorCode := 0;
 
-  // FREEFILE: lowest unused handle 1..15 (0 if none). Does not need an open handle.
+  // FREEFILE: lowest unused handle 1..MAX_FILE_HANDLE (0 if none). Does not need an open handle.
   if QueryCode = FQ_FREEFILE then
   begin
-    for i := 1 to 15 do
-      if not Assigned(FFileHandles[i]) then begin Value := i; Exit; end;
+    // ⛔ A DEVICE HANDLE IS OPEN WITH NO STREAM BEHIND IT - the marker three fields up says so in
+    // writing ("the handle counts as open while FFileHandles stays nil"), and this loop asked only
+    // about the stream. "Open Cons For Input As #1" then FreeFile answered **1**: the handle already
+    // in use, which is the one answer FreeFile exists to avoid.
+    for i := 1 to MAX_FILE_HANDLE do
+      if (not Assigned(FFileHandles[i])) and (FDeviceKind[i] = 0) then begin Value := i; Exit; end;
     Exit;                                   // none free -> 0
   end;
 
   // A standard DEVICE handle (CONS/SCRN/ERR) has no stream behind it.
-  if (Handle >= 1) and (Handle <= 15) and (FDeviceKind[Handle] <> 0) then
+  if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and (FDeviceKind[Handle] <> 0) then
   begin
     if QueryCode = FQ_EOF then
     begin
@@ -534,7 +587,7 @@ begin
     Exit;                                   // LOF/LOC/SEEK mean nothing on a device -> 0
   end;
 
-  if (Handle < 1) or (Handle > 15) or (not Assigned(FFileHandles[Handle])) then
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) or (not Assigned(FFileHandles[Handle])) then
   begin
     ErrorCode := 64;                        // FILE NOT OPEN
     if QueryCode = FQ_EOF then Value := -1; // EOF of a closed file = true
@@ -606,7 +659,7 @@ begin
   begin
     RetType := StrToIntDef(Data, 1);
     Data := '0';
-    if (Handle >= 1) and (Handle <= 15) and Assigned(FFileHandles[Handle]) then
+    if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and Assigned(FFileHandles[Handle]) then
       case RetType of
         2: Data := IntToStr(PtrInt(FFileHandles[Handle].Handle));  // OS file handle
         3: Data := '0';   // Encoding: ASCII
@@ -631,7 +684,7 @@ begin
 
   // A standard DEVICE handle (CONS/SCRN/ERR) has no stream behind it: serve it from the process's own
   // input and output before the "is there a TFileStream?" test below, which would call it "not open".
-  if (Handle >= 1) and (Handle <= 15) and (FDeviceKind[Handle] <> 0) then
+  if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and (FDeviceKind[Handle] <> 0) then
   begin
     if Command = 'EOF' then
     begin
@@ -698,7 +751,7 @@ begin
     Exit;   // LOF/LOC/SEEK and the record commands mean nothing on a device
   end;
 
-  if (Handle < 1) or (Handle > 15) or (not Assigned(FFileHandles[Handle])) then
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) or (not Assigned(FFileHandles[Handle])) then
   begin
     ErrorCode := 64;  // FILE NOT OPEN
     if (Command = 'EOF') then Data := '-1';   // EOF of a closed file = true

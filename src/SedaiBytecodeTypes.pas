@@ -686,6 +686,11 @@ const
   // so each opcode has exactly one destination and one bank.
   bcDirSearch       = bcGroupFileIO + 35;   // Dest=string name (""=no more), Src1=spec, Src2=mask reg, Immediate 0=first 1=next
   bcDirAttr         = bcGroupFileIO + 36;   // Dest=int attributes of the entry bcDirSearch last returned
+  // CLOSE(n) as a FUNCTION (DIVERGENZE 41): the SAME close, except that the result is DELIVERED in
+  // Dest instead of raising - 0 when the channel was open, 1 (illegal function call) otherwise, which
+  // is what fbc answers. Shares the VM arm with the statement form so the two cannot drift apart, the
+  // way bcOpenFunc shares OPEN's.
+  bcCloseFunc       = bcGroupFileIO + 37;   // Dest=int result, Src1=handle
 
   // === GROUP 7: SPRITE OPERATIONS (0x07xx) ===
   // Sprite commands
@@ -841,6 +846,13 @@ const
   // bcGfxCircleEx's 64-bit Immediate is fully spent on four register indices; the PACKING is
   // identical, so the two share the compiler branch and the VM arm.
   bcGfxCircleExF    = bcGroupGraphics + 68;
+
+  // PALETTE [GET] USING <array> : the whole 256-entry palette in one statement (DIVERGENZE 147).
+  // Src1 = the array ref, Immediate bit0 = 1 for GET (palette -> array), 0 for SET (array -> palette).
+  // ⭐ An OPCODE and not a lowering: the single-entry GET is lowered as synthetic assignments through
+  //   __PALGET, which does not extend to 256 elements without a loop the SSA has no shape for. The
+  //   array reaches the VM the way a whole-array binary GET/PUT reaches it (MakeSSAArrayRef).
+  bcGfxPaletteUsing = bcGroupGraphics + 69;
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -2291,6 +2303,7 @@ begin
         25: Result := 'FileAttr';
         26: Result := 'FileSetEof';
         34: Result := 'OpenFunc';
+        37: Result := 'CloseFunc';
         35: Result := 'DirSearch';
         36: Result := 'DirAttr';
         15: Result := 'InputFileInt';
@@ -2381,6 +2394,7 @@ begin
         31: Result := 'GfxPalette';
         32: Result := 'GfxPalGet';
         33: Result := 'GfxPaletteReset';
+        69: Result := 'GfxPaletteUsing';
         34: Result := 'GfxColor';
         35: Result := 'GfxForeColor';
         36: Result := 'GfxImageCreate';

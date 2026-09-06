@@ -131,6 +131,7 @@ type
     // "ns2.bar" answered 0. FProcSeen keeps the BARE names, because the two places that ask it ask
     // "is this name a procedure at all"; this one keys on "PREFIX|BASE" and owns the decision.
     FProcSeenNs: TStringList;
+    FProcOverloadKeys: TStringList;   // "<ns>|<base>"#1"<collapse key>" per DEFINITION (DIVERGENZE 144)
     FNsPrefix: string;               // the namespace body being parsed ('' at module level)
     // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
     // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
@@ -249,6 +250,9 @@ type
     function ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean;
                                WithTypeNames: Boolean = False;
                                PtrKinds: Boolean = False): string;   // CONSTRUCTORS only: see the body
+    function ParseDrawTargetExpr: TASTNode;   // the image handle that opens a graphics statement
+    function OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boolean): string;
+    function OverloadKeysCollide(const A, B: string): Boolean;
     procedure RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 
     // Dialect profile application + the per-dialect statement handlers it installs.
@@ -650,6 +654,8 @@ begin
   FProcSeen.CaseSensitive := False;
   FProcSeenNs := TStringList.Create;
   FProcSeenNs.CaseSensitive := False;
+  FProcOverloadKeys := TStringList.Create;
+  FProcOverloadKeys.CaseSensitive := False;
   FNsPrefix := '';
   FByrefRetProcs := TStringList.Create;
   FByrefRetProcs.CaseSensitive := False;
@@ -691,6 +697,7 @@ begin
 
   FForwardDeclNames.Free;
   FProcSeen.Free;
+  FProcOverloadKeys.Free;
   FProcSeenNs.Free;
   FByrefRetProcs.Free;
   FConstNames.Free;
@@ -869,6 +876,198 @@ begin
     Result := Result + '%' + Widths;
 end;
 
+function TPackratParser.ParseDrawTargetExpr: TASTNode;
+// The IMAGE HANDLE that opens a graphics statement - "Line img, (x1,y1)-(x2,y2)",
+// "Get img, (..)-(..), dst" - read so that neither of the two shapes that meet here is mangled.
+//
+// ⛔ AT precCall, and the note this replaces says why: read at the DEFAULT precedence a member access
+// swallowed what came after the comma as UNPARENTHESISED CALL ARGUMENTS, so "Line x.p, (0,0)-(31,31)"
+// died inside the first point while the same statement with a plain variable was fine.
+// ⛔⛔ ...BUT precCall ALSO STOPS BEFORE AN INDEX, and that is the other half (DIVERGENZE 146):
+// "Line array(0), (0,0)-(..)" left the target as the bare name "array", and the '(' that follows was
+// read as the start of the coordinate group with no comma before it - "Expected ')' after expression".
+// fbc's own gfx/image-expr keeps its surfaces in an array and writes exactly that.
+// ⇒ A '(' sitting HERE can only be an index: a coordinate group is always preceded by a comma, so the
+// two shapes are told apart by what follows the target and not by a precedence that cannot separate
+// them (an indexed name and a called member are the same syntax).
+var
+  IdxList: TASTNode;
+  Acc: TASTNode;
+begin
+  Result := FExpressionParser.ParseExpression(precCall);
+  while Assigned(Result) and Context.Check(ttDelimParOpen) do
+  begin
+    Context.Advance;                                          // '('
+    IdxList := TASTNode.Create(antExpressionList, Context.CurrentToken);
+    while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    begin
+      IdxList.AddChild(ParseExpression);
+      if Context.Check(ttSeparParam) then Context.Advance;    // ','
+    end;
+    if Context.Check(ttDelimParClose) then Context.Advance;   // ')'
+    Acc := TASTNode.Create(antArrayAccess, Result.Token);
+    Acc.AddChild(Result);
+    Acc.AddChild(IdxList);
+    Result := Acc;
+  end;
+end;
+
+function TPackratParser.OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boolean): string;
+// The key two overloads are compared on to decide whether FreeBASIC calls them the SAME declaration
+// (DIVERGENZE 144). One entry per parameter, "<type>|<mode>|<const>", joined by ';'.
+//
+// ⭐ THE RULE WAS MEASURED OVER 33 VARIANTS AGAINST fbc, AND IT IS NOT WHAT THE LEDGER SAID. Two
+// parameters at the same position COLLIDE unless their effective TYPE differs, or **both are BYREF
+// there and their const-ness differs**. Everything else about the spelling is ignored: ByVal and
+// ByRef do not distinguish, and Const on a BYVAL parameter does not either.
+//   f(ByVal a As T)      / f(ByVal a As Const T)   -> duplicate
+//   f(ByVal a As T)      / f(ByRef a As T)         -> duplicate
+//   f(ByRef a As Const T)/ f(ByVal a As T)         -> duplicate
+//   f(ByRef a As T)      / f(ByRef a As Const T)   -> ACCEPTED, the one distinguishing pair
+// ⛔ It is PAIRWISE, not a class: byref-const differs from byref-plain and collides with byval-plain,
+// which no single per-declaration key can express - hence a key plus a comparison, not a key alone.
+// ⚠️ And it is symmetric: every pair above was measured in BOTH declaration orders and answered the
+// same, so nothing here depends on which one the parser reaches first.
+//
+// ⛔⛔ THE DEFAULT PASSING MODE DEPENDS ON THE TYPE, and getting that wrong would refuse a program the
+// oracle compiles. Measured: "a As T" (a UDT) behaves as BYREF - "f(a As T)" and "f(a As Const T)" are
+// accepted together - while "a As Integer" behaves as BYVAL, since "f(a As Integer)" and
+// "f(a As Const Integer)" are a duplicate. STRING follows the UDT; DOUBLE follows the scalar.
+// ⇒ That is exactly the shape fbc's own overload/op-constonlydiff depends on: its three operators
+// differ only by Const on parameters written with NO mode, and they must keep compiling.
+//
+// ⭐ A POINTER folds its Const into the TYPE, because there the qualifier belongs to the POINTEE:
+// "ByVal a As T Ptr" and "ByVal a As Const T Ptr" are accepted together, on both modes.
+// ⚠️ DELIBERATELY UNDER-REFUSING where the type key cannot see through a spelling: a type ALIAS, a
+// namespace-qualified name written two ways, and (per the note in ProcSigFromParams) two SUBs that
+// differ only by ZSTRING PTR versus WSTRING PTR, which fbc also calls duplicates. A key that errs
+// toward "different" leaves the program compiling, which is the behaviour this check is narrowing.
+var
+  i, First: Integer;
+  p: TASTNode;
+  T, Nm, Md, Cn: string;
+  IsConst, IsPtr: Boolean;
+begin
+  Result := '';
+  if ParamList = nil then Exit;
+  if SkipThis then First := 1 else First := 0;
+  for i := First to ParamList.ChildCount - 1 do
+  begin
+    p := ParamList.GetChild(i);
+    T := '';
+    if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
+       not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
+      T := UpperCase(VarToStr(p.GetChild(0).Value));
+    if p.Attributes.Values['ARRAY'] = '1' then T := T + '()';
+    // ⛔ An INLINE procedure-pointer parameter ("ByVal p As Sub( ByRef As T1 )") carries its signature
+    // in attributes, not in a type name, so two of them reach here with the SAME (or an empty) type
+    // string while fbc may be looking at two different types - which is exactly what fbc's own
+    // pointers/procptr-namespaces relies on: one "overload1" per scope, each naming a DIFFERENT T1.
+    // Marked unknown, and an unknown type never collides: refusing on ignorance is the one direction
+    // this check must not take.
+    if p.Attributes.Values['FUNCPTR'] = '1' then T := '#P';
+    IsConst := p.Attributes.Values['CONSTP'] = '1';
+    IsPtr := Pos(' PTR', T) > 0;
+    if IsConst and IsPtr then T := 'CONST ' + T;      // the qualifier is the POINTEE's
+    if T = '' then
+    begin
+      // Untyped: the name's suffix types it, exactly as ProcSigFromParams reads it.
+      Nm := VarToStr(p.Value);
+      if (Nm <> '') and (Nm[Length(Nm)] = '$') then T := '#S'
+      else if (Nm <> '') and ((Nm[Length(Nm)] = '!') or (Nm[Length(Nm)] = '#')) then T := '#F'
+      else T := '#I';
+    end;
+    // The EFFECTIVE mode: explicit wins, else BYREF for a UDT or a string and BYVAL for the rest.
+    if p.Attributes.Values['BYREF'] = '1' then Md := 'R'
+    else if p.Attributes.Values['BYVAL'] = '1' then Md := 'V'
+    else if IsPtr or (Copy(T, 1, 1) = '#') then Md := 'V'
+    else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Md := 'R'
+    else if IsBuiltinTypeName(T) then Md := 'V'
+    else Md := 'R';                                    // a UDT
+    if IsConst and not IsPtr then Cn := 'C' else Cn := '-';
+    if Result <> '' then Result := Result + ';';
+    Result := Result + T + '|' + Md + '|' + Cn;
+  end;
+end;
+
+function TPackratParser.OverloadKeysCollide(const A, B: string): Boolean;
+// Do these two parameter keys describe declarations FreeBASIC calls the same one? See
+// OverloadCollapseKey for the measured rule. Different arity never collides.
+var
+  LA, LB: TStringList;
+  i: Integer;
+  fa, fb: TStringArray;
+begin
+  Result := False;
+  LA := TStringList.Create;
+  LB := TStringList.Create;
+  try
+    LA.Delimiter := ';'; LA.StrictDelimiter := True; LA.DelimitedText := A;
+    LB.Delimiter := ';'; LB.StrictDelimiter := True; LB.DelimitedText := B;
+    if (A = #2) or (B = #2) then Exit;       // a zero-parameter declaration: see the call site
+    if LA.Count <> LB.Count then Exit;
+    for i := 0 to LA.Count - 1 do
+    begin
+      fa := LA[i].Split('|');
+      fb := LB[i].Split('|');
+      if (Length(fa) < 3) or (Length(fb) < 3) then Exit;
+      if fa[0] <> fb[0] then Exit;                       // a different TYPE settles it
+      // ⛔⛔ AND TWO SHAPES THE KEY CANNOT SEE THROUGH NEVER COLLIDE, both found by running the
+      // ORACLE'S OWN SUITE as the census rather than by reading the parser:
+      //  · an ARRAY parameter, because the RANK is not recorded - the parser consumes whatever is
+      //    inside the parentheses - so "array(any)" and "array(any, any)" reach here identical while
+      //    fbc tells them apart (overload/bydesc declares exactly that pair);
+      //  · a POINTER, of any shape, because the CONST's POSITION inside a pointer type is not
+      //    recorded: "integer ptr ptr", "const integer ptr ptr", "integer const ptr ptr" and
+      //    "const integer const ptr ptr" are FOUR different types to fbc and at most two strings
+      //    here - const/ovl declares all four and overloads on them. ⚠️ This gives up the two
+      //    pointer duplicates the deck measured ("ByVal a As T Ptr" against "ByRef a As T Ptr"),
+      //    which stay accepted: a missing refusal, and the only honest answer while the type
+      //    spelling is not carried through.
+      // ⇒ Both err toward ACCEPTING, which leaves those programs compiling exactly as they did.
+      // ⛔ AN UNKNOWN TYPE NEVER COLLIDES. '#' opens the key of a parameter this check cannot name -
+      // an untyped one, and an inline procedure pointer - and two things it cannot name may be two
+      // different types. It over-refused fbc's pointers/procptr-namespaces exactly that way, which
+      // the suite caught as B1 falling by one: the census is a TRIPLE, and B2 rising is not enough.
+      if (Copy(fa[0], 1, 1) = '#') or (Copy(fb[0], 1, 1) = '#') then Exit;
+      if (Pos('()', fa[0]) > 0) or (Pos('()', fb[0]) > 0) then Exit;
+      if (Pos(' PTR', fa[0]) > 0) or (Pos(' PTR', fb[0]) > 0) then Exit;
+      // ...and the one pair that distinguishes without a type difference.
+      if (fa[1] = 'R') and (fb[1] = 'R') and (fa[2] <> fb[2]) then Exit;
+    end;
+    Result := True;
+  finally
+    LB.Free;
+    LA.Free;
+  end;
+end;
+
+function OperatorOverloadsByParams(const BaseU: string): Boolean;
+// Does this MEMBER operator's overload set separate by its PARAMETERS? (DIVERGENZE 152.)
+//
+// ⛔⛔ The note in RegisterOverloadLabel excludes "the NAMED form (CAST / LET / FOR / STEP / NEXT)"
+// with a reason that is TRUE OF CAST AND FALSE OF THE REST: "a CAST takes no explicit parameters at
+// all, so every one of them would sign the same empty tail". LET has a parameter, and it is exactly
+// what separates its overloads - so with "Operator T.Let( ByRef As Const T )" and
+// "Operator T.Let( ByVal As Integer )" both declared, the second definition overwrote the first and
+// "a = 42" answered a garbage number with no error. Same for the compound assignments and for "[]".
+// ⭐ Measured over eight variants against the oracle: the two shapes that must NOT be touched are the
+// CAST (its overloads differ only by RETURN type, which the collector's sigil already encodes) and a
+// non-overloaded operator, and both stay green.
+// ⛔ An ALLOW-LIST, not "everything that is not a cast": a form nobody measured keeps the behaviour it
+// has, which is the direction that cannot invent a wrong answer.
+var
+  P: Integer;
+  Nm: string;
+begin
+  Result := False;
+  P := Pos('.OPERATOR', BaseU);
+  if P = 0 then Exit;
+  Nm := Copy(BaseU, P + Length('.OPERATOR'), MaxInt);
+  if Nm = '' then Exit;
+  Result := (Nm = 'LET') or (Nm = '[]') or (Nm[Length(Nm)] = '=');
+end;
+
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 // See the call site in ParseProcedureDecl. Only DEFINITIONS reach here -- a DECLARE (module level or in a
 // TYPE body) is skipped without producing a node -- so a repeated label really is an overload set, never a
@@ -877,6 +1076,8 @@ var
   Base: string;
   Idx: Integer;
   FirstDecl, FirstName, FirstParams: TASTNode;
+  k: Integer;
+  CKey: string;
 begin
   if (NameNode = nil) or (ParamList = nil) then Exit;
   Base := UpperCase(VarToStr(NameNode.Value));
@@ -897,8 +1098,14 @@ begin
   // ⚠️ The NAMED form (CAST / LET / FOR / STEP / NEXT) is still excluded: a CAST takes no explicit
   // parameters at all, so every one of them would sign the same empty tail and the RETURN-BANK scheme
   // the SSA collector appends ("T.OPERATORCAST$") would break.
+  // ⭐⭐ ...AND THE NOTE ABOVE IS RIGHT ABOUT THE CAST AND WRONG ABOUT THE REST OF THAT LIST. LET, the
+  // compound assignments and "[]" all take an explicit parameter, and it is what separates their
+  // overloads: excluding them let the second definition overwrite the first and "a = 42" answered a
+  // garbage number with NO error. Third instance of one shape in this procedure - a note that excuses
+  // a FAMILY with one member's reason. DIVERGENZE 152.
   if (Base = '') or (Pos('#', Base) > 0) or (Pos('~', Base) > 0) or
-     ((Pos('.OPERATOR', Base) > 0) and (Pos('@', Base) = 0)) or
+     ((Pos('.OPERATOR', Base) > 0) and (Pos('@', Base) = 0) and
+      not (IsMethod and (ParamList.ChildCount >= 2) and OperatorOverloadsByParams(Base))) or
      ((Pos('.OPERATOR', Base) = 0) and (Pos('@', Base) > 0)) then Exit;
 
   // ⛔⛔ TWO PROCEDURES OF ONE NAME IN TWO NAMESPACES ARE NOT AN OVERLOAD SET. They only look alike
@@ -908,6 +1115,34 @@ begin
   // beside it, because the two places that ask it ask "is this name a procedure at all" - a question
   // the namespace does not change.
   if FProcSeen.IndexOf(Base) < 0 then FProcSeen.Add(Base);
+
+  // ⛔⛔ AND FIRST: IS THIS DECLARATION ONE FreeBASIC ALREADY HAS? (DIVERGENZE 144.) Two overloads that
+  // differ only by the passing MODE, or by Const on a BYVAL parameter, are the SAME declaration there
+  // - "error 4: Duplicated definition" - and we accepted them and answered through whichever won. The
+  // rule is measured over 33 variants and lives in OverloadCollapseKey; it is PAIRWISE, so every
+  // previous declaration of this name in this namespace is compared, not just the first.
+  // ⚠️ Recorded BEFORE the first-declaration exit below, or a set of two would never be compared.
+  // ⛔ A PROCEDURE WITH NO PARAMETERS IS A DIFFERENT QUESTION and is left to the machinery that
+  // already answers it. Two zero-parameter declarations of one name sign the same EMPTY key, so this
+  // check would call them duplicates - and fbc's own suite has two legitimate pairs: an "f1" retired
+  // by "#undef" and redeclared (quirk/undef), and two "f1( ) ByRef As Byte" in different TEST_GROUPs
+  // (functions/return-byref). Neither is an overload set, and neither is what DIVERGENZE 144 is about:
+  // this check exists for overloads that differ ONLY by passing mode or by CONST, which needs at least
+  // one parameter to differ in.
+  CKey := OverloadCollapseKey(ParamList, IsMethod);
+  if CKey = '' then CKey := #2;                 // no parameters: never compared, and never compares
+  for k := 0 to FProcOverloadKeys.Count - 1 do
+    if (Copy(FProcOverloadKeys[k], 1, Length(FNsPrefix + '|' + Base) + 1) = FNsPrefix + '|' + Base + #1) and
+       OverloadKeysCollide(CKey,
+         Copy(FProcOverloadKeys[k], Length(FNsPrefix + '|' + Base) + 2, MaxInt)) then
+    begin
+      Context.AddError('Duplicated definition: ' + Base +
+        ' - two overloads differ only by the passing mode or by CONST on a BYVAL parameter',
+        NameNode.Token);
+      Exit;
+    end;
+  FProcOverloadKeys.Add(FNsPrefix + '|' + Base + #1 + CKey);
+
   Idx := FProcSeenNs.IndexOf(FNsPrefix + '|' + Base);
   if Idx < 0 then
   begin
@@ -1074,6 +1309,7 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FProcSeenNs.Clear;
+  FProcOverloadKeys.Clear;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
@@ -1171,6 +1407,7 @@ begin
   Result := TParsingResult.Create;
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FProcSeenNs.Clear;
+  FProcOverloadKeys.Clear;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
@@ -2771,11 +3008,41 @@ end;
 function TPackratParser.ParseGetStatement: TASTNode;
 var
   Token: TLexerToken;
-  VarNode: TASTNode;
+  VarNode, SrcNode: TASTNode;
+  k: Integer;
 begin
   Token := Context.CurrentToken;
   Result := TASTNode.Create(antGet, Token);
   Context.Advance; // Consume GET
+
+  // ⭐ "GET <source>, (x1,y1)-(x2,y2), dst" — the SOURCE-IMAGE spelling (DIVERGENZE 146). fbc reads the
+  // rectangle out of an image instead of the screen, and its own gfx/image-expr is written that way.
+  // Only the screen form was parsed: the leading '(' is what selected it, so a source expression fell
+  // through to the "GET A$" branch and the statement died with "Expected ")" after expression".
+  // ⭐ The PUT side has had the image TARGET since it was written, and it rides on exactly the pair
+  // this reuses - the source is appended as the LAST child with TARGETIDX, so EmitDrawTargetBegin sets
+  // the surface and EffChildCount hides the extra child from the argument count. Nothing new is lowered.
+  // ⛔ The lookahead is the whole safety of it: a source is accepted only when a ',' followed by '(' is
+  // ahead on this statement, which is the one shape "GET A$" and "GET #n" can never have.
+  SrcNode := nil;
+  if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttFileHandlePrefix)) and
+     (Context.CurrentToken.Value <> '#') then
+  begin
+    k := 0;
+    while (k < 64) and
+          not (Context.PeekToken(k).TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    begin
+      if (Context.PeekToken(k).TokenType = ttSeparParam) and
+         (Context.PeekToken(k + 1).TokenType = ttDelimParOpen) then Break;
+      Inc(k);
+    end;
+    if (k < 64) and (Context.PeekToken(k).TokenType = ttSeparParam) and
+       (Context.PeekToken(k + 1).TokenType = ttDelimParOpen) then
+    begin
+      SrcNode := ParseDrawTargetExpr;                           // the source image
+      if Context.Check(ttSeparParam) then Context.Advance;      // ','
+    end;
+  end;
 
   // FreeBASIC graphics "GET (x1,y1)-(x2,y2), dst" — capture a screen rectangle into an image surface.
   // The leading '(' disambiguates from "GET A$" and "GET #n,...".
@@ -2796,9 +3063,16 @@ begin
     if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
     if Context.Check(ttSeparParam) then Context.Advance;        // ','
     Result.AddChild(ParseExpression);                           // dst image handle
+    if Assigned(SrcNode) then    // source image appended last, its index in TARGETIDX (as PUT does)
+    begin
+      Result.Attributes.Values['TARGETIDX'] := IntToStr(Result.ChildCount);
+      Result.AddChild(SrcNode);
+      SrcNode := nil;
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
+  if Assigned(SrcNode) then SrcNode.Free;   // not the graphics form after all: give the node back
 
   // FreeBASIC binary "GET #n, [pos], var" — read sizeof(var) bytes into a scalar.
   if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
@@ -7450,6 +7724,43 @@ begin
       end
       else
         Result.Attributes.Values['OP'] := 'SET';
+      // ⭐ "PALETTE [GET] USING a()" - the WHOLE 256-entry palette in one statement (DIVERGENZE 147).
+      // The comment above used to say "PALETTE USING deferred"; fbc's own gfx/palette is written with
+      // it and with nothing else. The array name is taken as a bare identifier - it is an array, not an
+      // expression - and the OP becomes USINGGET / USINGSET so the lowering knows which way it runs.
+      if UpperCase(Context.CurrentToken.Value) = 'USING' then
+      begin
+        Context.Advance;                                          // USING
+        if Result.Attributes.Values['OP'] = 'GET' then
+          Result.Attributes.Values['OP'] := 'USINGGET'
+        else
+          Result.Attributes.Values['OP'] := 'USINGSET';
+        // ⭐ The operand has THREE spellings in fbc's own gfx/palette, and all three are kept: the bare
+        // array name, "@a(i)" - the address of an element - and that wrapped in a CAST. A bare name is
+        // taken as an identifier (it is an array, not a value); anything else is an expression.
+        // ⛔ The bare-name branch is taken only for a name that ENDS the statement or is followed by an
+        // EMPTY "()": written as "an identifier followed by '('" it swallowed "cast(any ptr, @s(0))",
+        // reading CAST as the array's name and dying inside the type.
+        if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+           ((Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) or
+            ((Context.PeekNext.TokenType = ttDelimParOpen) and Assigned(Context.PeekToken(2)) and
+             (Context.PeekToken(2).TokenType = ttDelimParClose))) then
+        begin
+          Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
+            UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+          Context.Advance;
+          // "PALETTE USING a()" - the empty parentheses are allowed and mean the same array.
+          if Context.Check(ttDelimParOpen) and Assigned(Context.PeekNext) and
+             (Context.PeekNext.TokenType = ttDelimParClose) then
+          begin
+            Context.Advance; Context.Advance;
+          end;
+        end
+        else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+          Result.AddChild(ParseExpression);
+        DoNodeCreated(Result);
+        Exit;
+      end;
       Result.AddChild(ParseExpression);                           // index
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
       Result.AddChild(ParseExpression);                           // r / packed BGR colour (or r-variable for GET)
@@ -7766,7 +8077,20 @@ begin
   else if CmdName = 'PRST' then
     MaxParams := 0  // PRST (no parameters)
   else if CmdName = 'SCREENRES' then
-    MaxParams := 4  // SCREENRES w, h [, depth [, num_pages]]
+    // ⛔ SIX, and it was FOUR (DIVERGENZE 143). fbc's ScreenRes is
+    // "w, h [, depth [, num_pages [, flags [, refresh_rate]]]]" - seven arguments is where it answers
+    // "error 1: Argument count mismatch", six is legal - and the STATEMENT stopped at four. The fifth
+    // and sixth were not refused: they fell out of the statement and reached SSA generation as
+    // top-level nodes ("[SSA] WARNING: Unhandled node type 40"), which is the same silent shape as the
+    // file handle of DIVERGENZE 6.
+    // ⚠️ It matters more than the noise on stderr: the FIFTH argument carries the DRIVER FLAGS, and
+    // "screenres w, h, 32, , fb.GFX_NULL" - the null driver, which is what makes a graphics test
+    // runnable with no display - is how fbc's own graphics suite opens EVERY test.
+    // ⭐ The FUNCTION spelling was right all along, and both spellings lower through the same
+    // ProcessScreenRes, so this is one number and no second copy of the lowering.
+    // ⚠️ depth, flags and refresh_rate are accepted-and-ignored here, exactly as the function form has
+    // always accepted-and-ignored them; only w, h and num_pages reach the backend.
+    MaxParams := 6  // SCREENRES w, h [, depth [, num_pages [, flags [, refresh_rate]]]]
   else
     MaxParams := 5;
 
@@ -8968,13 +9292,9 @@ begin
   if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttOpSub)) and
      (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
   begin
-    // ⛔ AT precCall, NOT at the default precedence. The target is a HANDLE and nothing more; read at
-    // full precedence a member access swallowed what came after the comma as UNPARENTHESISED CALL
-    // ARGUMENTS, so "Line x.p, (0,0)-(31,31)" died inside the first point at "Expected \")\" after
-    // expression" while the identical statement with a plain variable target was fine - the tell that
-    // it was the READING of the target and not the statement. REDIM reads its own target at a low
-    // precedence for the mirror-image reason.
-    TargetNode := FExpressionParser.ParseExpression(precCall);   // image handle
+    // The two shapes that meet here - a called member and an INDEXED name - are told apart in
+    // ParseDrawTargetExpr, which is the one place that reads a graphics statement's image handle.
+    TargetNode := ParseDrawTargetExpr;                           // image handle
     if Context.Check(ttSeparParam) then Context.Advance;    // ','
   end;
   // FreeBASIC "LINE -(x2,y2)": the start point is omitted, so the line runs from the current graphics
@@ -9295,18 +9615,53 @@ function TPackratParser.LooksLikeImageTarget: Boolean;
 // walked here, so "x.p" and "a.b.c" reach the same statement a bare name always did.
 var
   T1, T2: TLexerToken;
-  k: Integer;
+  k, Depth: Integer;
 begin
   Result := False;
   T1 := Context.PeekToken(1);
   if (T1 = nil) or (T1.TokenType = ttDelimParOpen) or (UpperCase(VarToStr(T1.Value)) = kSTEP) then Exit;
-  // Walk "name ( '.' name )*": k lands on the token after the target.
-  k := 2;
+  // ⛔⛔ ...AND AN INDEX IS THE THIRD SHAPE, after the bare name and the dotted chain (DIVERGENZE 146).
+  // A handle kept in an ARRAY is how a program holds several surfaces, and it is how fbc's own
+  // gfx/image-expr holds them: "Line array(0), (0,0)-(w,h), c, bf" failed this test, was never
+  // dispatched to the graphics statement, and reported "Expected ')' after expression" from inside the
+  // first point - the identical symptom the dotted chain used to give. ⇒ The walk skips a BALANCED
+  // parenthesis group, so "a(0)", "a(i,j)" and "x.p(0).q" all reach the statement a bare name reaches.
+  // ⭐ ...and a leading '@' or '*' is part of the target, not the end of it: fbc's gfx/image-expr
+  // draws into "@array(0)" and through "*p".
+  // ⛔⛔ THE '*' WAS HELD BACK UNTIL THE TYPE CHECK EXISTED, and the note it replaces said so:
+  // accepting it while the image expression's TYPE was unchecked made five of fbc's own tests compile
+  // that fbc REFUSES (gfx/image-expr-nonptr-deref*, each drawing through a "*p" whose POINTEE is not a
+  // pointer). They were passing because the parser refused the whole shape - a rejection for the wrong
+  // reason - so the parse and the check had to land TOGETHER or one of them was a regression.
+  // ⇒ ImageExprIsCertainlyNotAPointer is that check (DIVERGENZE 149), and this is its other half.
+  k := 1;
+  while Assigned(Context.PeekToken(k)) and
+        (Context.PeekToken(k).TokenType in [ttOpAt, ttOpMul]) do Inc(k);
+  if (Context.PeekToken(k) = nil) or
+     (Context.PeekToken(k).TokenType = ttDelimParOpen) then Exit;
+  // Walk "name ( index | '.' name )*": k lands on the token after the target.
+  Inc(k);
   while True do
   begin
     T2 := Context.PeekToken(k);
     if (T2 <> nil) and (T2.TokenType = ttOpDot) and Assigned(Context.PeekToken(k + 1)) then
       Inc(k, 2)                                     // '.' and the segment after it
+    else if (T2 <> nil) and (T2.TokenType = ttDelimParOpen) then
+    begin
+      Depth := 0;
+      while Assigned(Context.PeekToken(k)) and
+            not (Context.PeekToken(k).TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      begin
+        if Context.PeekToken(k).TokenType = ttDelimParOpen then Inc(Depth)
+        else if Context.PeekToken(k).TokenType = ttDelimParClose then
+        begin
+          Dec(Depth);
+          if Depth = 0 then begin Inc(k); Break; end;
+        end;
+        Inc(k);
+      end;
+      if Depth <> 0 then Exit;                      // unbalanced: not this form
+    end
     else
       Break;
   end;
@@ -12119,15 +12474,49 @@ begin
 end;
 
 function TPackratParser.FoldFileHandlePostfix(BaseNode: TASTNode): TASTNode;
-// A file number can be a UDT member (e.g. "#bf.bw") — the handle identifier has
-// already been consumed; fold any trailing ".field" chain into antMemberAccess nodes
-// so the SSA evaluates the member's integer value (ProcessDopen's expression fallback).
+// A file number can be a UDT member (e.g. "#bf.bw") or an ARRAY ELEMENT ("#h(i)") — the handle
+// identifier has already been consumed; fold any trailing ".field" and "(...)" chain so the SSA
+// evaluates the value (ProcessDopen's expression fallback).
+//
+// ⛔ THE INDEX WAS MISSING, and it did not fail like a missing feature. "Open ... As #h(i)" parsed
+// as far as the identifier, and the "(i)" was left in the token stream: the rest of the statement
+// then leaked out as top-level nodes, the SSA printed "Unhandled node type" for each one, and the
+// handle reached the runtime as **0** — "PRINT# error 64 writing float to file: 0", on a program
+// fbc runs. It is the shape a table of open files has, and the loop that fills it
+// ("h(i) = FreeFile : Open ... As #h(i)") is how every program with more than a couple of files is
+// written. Found on the way to DIVERGENZE 6, and it is what that entry's own probe was really
+// hitting after the 1..15 ceiling went.
+// ⭐ The two fold together in ONE loop and in either order, because "#recs(i).fh" is both.
 var
-  MemberNode: TASTNode;
+  MemberNode, IdxNode, Indices: TASTNode;
+  IdxTok: TLexerToken;
 begin
   Result := BaseNode;
-  while Context.Check(ttOpDot) do
+  while Context.Check(ttOpDot) or Context.Check(ttDelimParOpen) or Context.Check(ttDelimBrackOpen) do
   begin
+    if Context.Check(ttDelimParOpen) or Context.Check(ttDelimBrackOpen) then
+    begin
+      IdxTok := Context.CurrentToken;
+      Context.Advance;                             // '(' or '['
+      Indices := ParseExpressionList(ttSeparParam);
+      if not Assigned(Indices) then
+      begin
+        HandleError('Expected index expression in file number', Context.CurrentToken);
+        Break;
+      end;
+      if not (Context.Match(ttDelimParClose) or Context.Match(ttDelimBrackClose)) then
+      begin
+        HandleError('Expected ")" after the index of a file number', Context.CurrentToken);
+        Indices.Free;
+        Break;
+      end;
+      IdxNode := TASTNode.Create(antArrayAccess, IdxTok);
+      IdxNode.AddChild(Result);
+      IdxNode.AddChild(Indices);
+      Result := IdxNode;
+      DoNodeCreated(Result);
+      Continue;
+    end;
     Context.Advance;                               // '.'
     if not Context.Check(ttIdentifier) then
     begin

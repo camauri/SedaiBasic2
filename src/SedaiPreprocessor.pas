@@ -22,7 +22,7 @@ unit SedaiPreprocessor;
 
 interface
 
-uses SysUtils, Math, SedaiConsoleBehavior;
+uses Classes, SysUtils, Math, SedaiConsoleBehavior;
 
 type
   // Raised by #error / a failed #assert. Callers catch it to report a clean compile-time
@@ -36,6 +36,34 @@ type
   not keep that branch out of the module. A #if does. }
 var
   GTargetIsWasm: Boolean = False;
+  // ⭐ Names the program RETIRED with "#undef". A "#undef" is not only about macros: fbc removes the
+  // symbol, so "#undef f1" over a SUB makes a later "Dim f1 As Integer" legal - and we refused it with
+  // "Duplicated definition". The preprocessor is the only pass that sees the directive, so it leaves
+  // the names here and the SSA's duplicate check reads them. DIVERGENZE 73.
+  // ⚠️ Whole-FILE, not positional: a "#undef" anywhere retires the name for that check everywhere in
+  // the file. Widening it costs a MISSING refusal (never a wrong answer), and the positional form
+  // would need the directive's line to survive macro expansion, which it does not.
+  GPPUndefNames: TStringList = nil;
+
+  // ⭐⭐ THE PREPROCESSOR'S OWN SYMBOL TABLE, and it exists because fbc's preprocessor IS the compiler
+  // (DIVERGENZE 23). "#if TypeOf(s) = String" asks what type a NAME has, and the note that used to
+  // stand at the refusal said "this preprocessor runs on text, before any declaration has been seen".
+  // Half of that is false: it runs on text, but it runs TOP-DOWN, so every declaration ABOVE the
+  // directive has already gone past - which is exactly what fbc's single pass has, and all seven of
+  // its tests declare the name above the "#if".
+  // ⇒ Names are collected from the lines as they are EMITTED (so a line inside a false branch, or one
+  // that a macro produced, is treated exactly as the compiler will treat it), and the condition asks
+  // this table instead of refusing.
+  // ⚠️ Keyed case-INSENSITIVELY, because nothing in BASIC is not.
+  GPPVarTypes: TStringList = nil;    // NAME -> the type NAME it was declared as (both UPPER)
+  GPPTypeNames: TStringList = nil;   // names declared with "Type"/"Union"/"Enum": they ARE types
+
+const
+  // The answer a "#if TypeOf(...)" / "#print TypeOf(...)" gives for an operand the table does not
+  // know. It carries a character no identifier can hold, so it can never collide with a real type
+  // name - and it is ONE marker for every unknown, which is measured: fbc makes two DIFFERENT
+  // undeclared names compare EQUAL to each other while both differ from every real type.
+  cPPUnknownType = '?UNKNOWN';
 
 type
   { One "#line <n> ["file"]" directive: from the PHYSICAL source line it stands on, positions are
@@ -72,7 +100,7 @@ function SourceDeclaresNonFbDialect: Boolean;
 
 implementation
 
-uses Classes, SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
+uses SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
 
 function DetectQBLang(const Src: string): Boolean;
 // Does this source select the QB dialect, '#lang "qb"' or the '$lang: "qb" metacommand?
@@ -238,7 +266,7 @@ function ExpandFnBody(const ParamsBody, ArgsStr: string;
                       Defs, FnDefs: TStringList; Depth: Integer): string;
 var
   sep, i, j, k, pi: Integer;
-  ParamList, Body, Word: string;
+  ParamList, Body, Word, ExpArgs: string;
   Params: array of string;
   Args: array[0..63] of string;
   Starts: array[0..63] of Integer;
@@ -294,12 +322,25 @@ begin
       Params[k] := TrimRight(Copy(Params[k], 1, Length(Params[k]) - 3));
       VarIdx := k;
     end;
-  SplitMacroArgs(ArgsStr, Args, ACount, @Starts[0]);
+  // ⛔⛔ THE ARGUMENT TEXT IS EXPANDED BEFORE IT IS SPLIT, and the ORDER is the whole of it
+  // (DIVERGENZE 148). A #define that stands for a comma-separated LIST is ONE token to the reader and
+  // SEVERAL arguments to fbc: "m( LIST3 )" over "#define LIST3 1, 2, 3" passes 1 and leaves 2, 3 to a
+  // variadic tail there, and passed the unexpanded name here - so "__FB_ARG_COUNT__(v)" answered 3
+  // against fbc's 1, and an argument that later grew commas pushed every following argument of a
+  // preprocessor builtin one place along. That is what made "__FB_ARG_LEFTOF__( v, AS, v )" read "2"
+  // as its separator inside fbc's own FOREACH macro.
+  // ⚠️ Skipped for text that carries a '#': that is preprocessor text (a stringize, a paste), and it
+  // is what the per-argument loop below deliberately leaves alone for the reasons written there.
+  if Pos('#', ArgsStr) = 0 then
+    ExpArgs := SubstituteMacros(ArgsStr, Defs, FnDefs, Depth + 1)
+  else
+    ExpArgs := ArgsStr;
+  SplitMacroArgs(ExpArgs, Args, ACount, @Starts[0]);
   // The variadic parameter takes the RAW remainder of the argument text (empty when nothing was passed).
   if VarIdx >= 0 then
   begin
     if (VarIdx < ACount) and (VarIdx <= High(Args)) then
-      Args[VarIdx] := Trim(Copy(ArgsStr, Starts[VarIdx], MaxInt))
+      Args[VarIdx] := Trim(Copy(ExpArgs, Starts[VarIdx], MaxInt))
     else if VarIdx <= High(Args) then
     begin
       Args[VarIdx] := '';
@@ -761,20 +802,36 @@ var
   GUniqueIdStacks: TStringList = nil;
   GUniqueIdSerial: Integer = 0;
 
+function PPResolveTypeName(const Operand: string): string; forward;
+function PPIsBuiltinTypeWord(const U: string): Boolean; forward;
+procedure PPNoteDeclarations(const Line: string); forward;
+
 function TokenPos(const Hay, Needle: string): Integer;
 // Position of Needle in Hay as a WHOLE TOKEN (delimited by non-identifier characters), or 0. A plain
 // Pos() would find "verso" inside "versus" and split the argument at the wrong place -- and silently,
 // since the result is still a well-formed piece of text.
+//
+// ⛔⛔ AND THE MATCH IS CASE-INSENSITIVE, because nothing in BASIC is not (DIVERGENZE 148). Pos is
+// case-SENSITIVE, so "__FB_ARG_LEFTOF__( v, AS, v )" over an argument written "a as ubyte" found no
+// separator, answered the fallback, and the statement built around it lost its name - "Expected a
+// variable name after VAR". fbc's own gfx/blender-alpha4 writes its FOREACH exactly that way: the
+// macro names the separator in CAPITALS and the call site writes it in lower case, which is the
+// normal way a BASIC program is written and the one shape a case-sensitive compare cannot see.
+// ⚠️ The needle is compared UPPER against UPPER; the returned position indexes the ORIGINAL text, so
+// the two sides the caller cuts out keep the program's own spelling.
 var
   p: Integer;
+  HayU, NeedleU: string;
 begin
   Result := 0;
   if (Needle = '') or (Hay = '') then Exit;
+  HayU := UpperCase(Hay);
+  NeedleU := UpperCase(Needle);
   p := 1;
   repeat
     // Search from p onwards without StrUtils: Pos on the tail, then map the offset back.
     if p > Length(Hay) then Exit;
-    Result := Pos(Needle, Copy(Hay, p, MaxInt));
+    Result := Pos(NeedleU, Copy(HayU, p, MaxInt));
     if Result = 0 then Exit;
     p := p + Result - 1;
     Result := 0;
@@ -2409,14 +2466,26 @@ var
           else
             Toks.Add('0');
         end
-        else if id = 'TYPEOF' then
-          // "#if TypeOf(a) = TypeOf(b)" asks a question only the compiler's symbol table can answer,
-          // and this preprocessor runs on text, before any declaration has been seen. Falling through
-          // to the undefined-identifier rule below would silently make every such condition FALSE --
-          // including the ones that should be true. Say so instead. (The statement form,
-          // "Dim As TypeOf(expr) name", is handled by the parser and works.)
-          raise EPreprocessorError.Create(
-            'TypeOf() in a #if condition is not supported: the preprocessor has no type information')
+        else if (id = 'TYPEOF') and NextNonBlankIsOpenParen(S, p) then
+        begin
+          // ⭐⭐ "#if TypeOf(x) = <type>" is answered from the declarations seen ABOVE this directive
+          // (DIVERGENZE 23). The note that stood here said the preprocessor runs "before any
+          // declaration has been seen": it runs on TEXT, but it runs TOP-DOWN, and PPNoteDeclarations
+          // has taken every emitted line - which is precisely what fbc's single pass has.
+          // ⛔ An operand this table does not know answers ONE shared marker - measured: fbc makes two
+          // DIFFERENT undeclared names compare equal while both differ from every real type. Answering
+          // the name itself, the obvious reading, gets that case wrong. Never a guessed TYPE.
+          q := p;
+          while (q <= Length(S)) and (S[q] in [' ', #9]) do Inc(q);
+          nm := GatherBalancedParens(S, q);          // "( x )", q lands past the ')'
+          p := q;
+          nm := Trim(nm);
+          if (Length(nm) >= 2) and (nm[1] = '(') then nm := Trim(Copy(nm, 2, Length(nm) - 2));
+          Toks.Add(cPPStrTok + PPResolveTypeName(nm));
+        end
+        else if (id = 'TYPEOF') then
+          // Written without an argument list it is not the operator at all.
+          Toks.Add('0')
         else if (id = 'AND') or (id = 'OR') or (id = 'NOT') or (id = 'MOD') then
           Toks.Add(id)
         // ⭐ The TEXT-ONLY intrinsics fold here as well as in a Const declaration, and it is the same
@@ -2772,6 +2841,16 @@ procedure RegisterEmulatedHeader(const FileName: string; Defs, FnDefs: TStringLi
 // declare itself, exactly as under fbc. Keys are UPPER: the macro lookup upper-cases the word.
 var
   Base: string;
+
+  procedure Reg(const Name: string; Value: Int64);
+  // ONE constant of an emulated header, in BOTH spellings: qualified ("fb.SC_A", what fbc's own
+  // suite writes) and bare (what "Using FB" makes legal). Parenthesised because the value substitutes
+  // as TEXT and a negative one would otherwise change how the expression around it parses.
+  begin
+    Defs.Values['FB.' + Name] := '(' + IntToStr(Value) + ')';
+    Defs.Values[Name]         := '(' + IntToStr(Value) + ')';
+  end;
+
 begin
   Base := LowerCase(ExtractFileName(FileName));
   // fbc-int/symbol.bi exposes __FB_QUERY_SYMBOL__ through convenience macros. The real header wraps
@@ -2836,6 +2915,206 @@ begin
     Defs.Values['FB_QUERY_SYMBOL.TYPENAME']   := '3';
     Defs.Values['FB_QUERY_SYMBOL.TYPENAMEID'] := '4';
     Defs.Values['FB_QUERY_SYMBOL.EXISTS']     := '6';
+  end;
+  // ⛔⛔ fbgfx.bi IS PURE CONSTANTS, AND EVERY ONE OF THEM ANSWERED ZERO - which for a DRIVER flag is
+  // not "unsupported", it is "windowed, no flags": exactly the hazard the header of this routine
+  // describes, on 181 names at once. fbc's own graphics suite opens every test with
+  // "screenres( w, h, 32, , fb.GFX_NULL )" - the NULL driver, which is what makes a graphics test
+  // runnable with no display - and a silent 0 there asks for a real window instead. The scancodes are
+  // the same shape: "MultiKey( fb.SC_ESCAPE )" was asking about scancode 0.
+  // ⭐⭐ THE VALUES COME FROM THE ORACLE, NOT FROM READING THE HEADER. Its enums chain implicit
+  // increments across explicit jumps (SC_PAGEUP is 73 and SC_LEFT is &h4B = 75), so a parse of the
+  // text is a hypothesis; these 181 were printed by a program compiled with fbc and copied from its
+  // output. GFX_SCREEN_EXIT is -2147483648 and not 2147483648 for the same reason - the header writes
+  // "&h80000000l", a signed LONG.
+  // ⚠️ DECLARED PERMISSIVENESS: each name is registered BOTH qualified ("fb.SC_A", which is what the
+  // suite writes) and BARE (which is what "Using FB" makes legal). A macro table cannot see a "Using",
+  // so a program that includes this header and writes a bare name WITHOUT "Using FB" resolves here
+  // where fbc refuses it (error 42). A missing refusal, never a wrong answer, and only inside a
+  // program that asked for the header.
+  if Base = 'fbgfx.bi' then
+  begin
+    Reg('BUTTON_LEFT',                1);
+    Reg('BUTTON_MIDDLE',              4);
+    Reg('BUTTON_RIGHT',               2);
+    Reg('BUTTON_X1',                  8);
+    Reg('BUTTON_X2',                  16);
+    Reg('EVENT_KEY_PRESS',            1);
+    Reg('EVENT_KEY_RELEASE',          2);
+    Reg('EVENT_KEY_REPEAT',           3);
+    Reg('EVENT_MOUSE_BUTTON_PRESS',   5);
+    Reg('EVENT_MOUSE_BUTTON_RELEASE', 6);
+    Reg('EVENT_MOUSE_DOUBLE_CLICK',   7);
+    Reg('EVENT_MOUSE_ENTER',          9);
+    Reg('EVENT_MOUSE_EXIT',           10);
+    Reg('EVENT_MOUSE_HWHEEL',         14);
+    Reg('EVENT_MOUSE_MOVE',           4);
+    Reg('EVENT_MOUSE_WHEEL',          8);
+    Reg('EVENT_WINDOW_CLOSE',         13);
+    Reg('EVENT_WINDOW_GOT_FOCUS',     11);
+    Reg('EVENT_WINDOW_LOST_FOCUS',    12);
+    Reg('GET_ALPHA_PRIMITIVES',       14);
+    Reg('GET_COLOR',                  13);
+    Reg('GET_DESKTOP_SIZE',           3);
+    Reg('GET_DRIVER_NAME',            9);
+    Reg('GET_GL_2D_MODE',             82);
+    Reg('GET_GL_ACCUM_ALPHA_BITS',    48);
+    Reg('GET_GL_ACCUM_BITS',          44);
+    Reg('GET_GL_ACCUM_BLUE_BITS',     47);
+    Reg('GET_GL_ACCUM_GREEN_BITS',    46);
+    Reg('GET_GL_ACCUM_RED_BITS',      45);
+    Reg('GET_GL_COLOR_ALPHA_BITS',    41);
+    Reg('GET_GL_COLOR_BITS',          37);
+    Reg('GET_GL_COLOR_BLUE_BITS',     40);
+    Reg('GET_GL_COLOR_GREEN_BITS',    39);
+    Reg('GET_GL_COLOR_RED_BITS',      38);
+    Reg('GET_GL_DEPTH_BITS',          42);
+    Reg('GET_GL_EXTENSIONS',          15);
+    Reg('GET_GL_NUM_SAMPLES',         49);
+    Reg('GET_GL_SCALE',               83);
+    Reg('GET_GL_STENCIL_BITS',        43);
+    Reg('GET_HIGH_PRIORITY',          16);
+    Reg('GET_PEN_POS',                12);
+    Reg('GET_SCANLINE_SIZE',          17);
+    Reg('GET_SCREEN_BPP',             6);
+    Reg('GET_SCREEN_DEPTH',           5);
+    Reg('GET_SCREEN_PITCH',           7);
+    Reg('GET_SCREEN_REFRESH',         8);
+    Reg('GET_SCREEN_SIZE',            4);
+    Reg('GET_TRANSPARENT_COLOR',      10);
+    Reg('GET_VIEWPORT',               11);
+    Reg('GET_WINDOW_HANDLE',          2);
+    Reg('GET_WINDOW_POS',             0);
+    Reg('GET_WINDOW_TITLE',           1);
+    Reg('GFX_ACCUMULATION_BUFFER',    131072);
+    Reg('GFX_ALPHA_PRIMITIVES',       64);
+    Reg('GFX_ALWAYS_ON_TOP',          32);
+    Reg('GFX_FULLSCREEN',             1);
+    Reg('GFX_HIGH_PRIORITY',          128);
+    Reg('GFX_MULTISAMPLE',            262144);
+    Reg('GFX_NO_FRAME',               8);
+    Reg('GFX_NO_SWITCH',              4);
+    Reg('GFX_NULL',                   (-1));
+    Reg('GFX_OPENGL',                 2);
+    Reg('GFX_SCREEN_EXIT',            (-2147483648));
+    Reg('GFX_SHAPED_WINDOW',          16);
+    Reg('GFX_STENCIL_BUFFER',         65536);
+    Reg('GFX_WINDOWED',               0);
+    Reg('MASK_COLOR',                 16711935);
+    Reg('MASK_COLOR_INDEX',           0);
+    Reg('OGL_2D_AUTO_SYNC',           2);
+    Reg('OGL_2D_MANUAL_SYNC',         1);
+    Reg('OGL_2D_NONE',                0);
+    Reg('POLL_EVENTS',                200);
+    Reg('SC_0',                       11);
+    Reg('SC_1',                       2);
+    Reg('SC_2',                       3);
+    Reg('SC_3',                       4);
+    Reg('SC_4',                       5);
+    Reg('SC_5',                       6);
+    Reg('SC_6',                       7);
+    Reg('SC_7',                       8);
+    Reg('SC_8',                       9);
+    Reg('SC_9',                       10);
+    Reg('SC_A',                       30);
+    Reg('SC_ALT',                     56);
+    Reg('SC_ALTGR',                   100);
+    Reg('SC_B',                       48);
+    Reg('SC_BACKSLASH',               43);
+    Reg('SC_BACKSPACE',               14);
+    Reg('SC_C',                       46);
+    Reg('SC_CAPSLOCK',                58);
+    Reg('SC_CENTER',                  76);
+    Reg('SC_CLEAR',                   76);
+    Reg('SC_COMMA',                   51);
+    Reg('SC_CONTROL',                 29);
+    Reg('SC_D',                       32);
+    Reg('SC_DELETE',                  83);
+    Reg('SC_DOWN',                    80);
+    Reg('SC_E',                       18);
+    Reg('SC_END',                     79);
+    Reg('SC_ENTER',                   28);
+    Reg('SC_EQUALS',                  13);
+    Reg('SC_ESCAPE',                  1);
+    Reg('SC_F',                       33);
+    Reg('SC_F1',                      59);
+    Reg('SC_F10',                     68);
+    Reg('SC_F11',                     87);
+    Reg('SC_F12',                     88);
+    Reg('SC_F2',                      60);
+    Reg('SC_F3',                      61);
+    Reg('SC_F4',                      62);
+    Reg('SC_F5',                      63);
+    Reg('SC_F6',                      64);
+    Reg('SC_F7',                      65);
+    Reg('SC_F8',                      66);
+    Reg('SC_F9',                      67);
+    Reg('SC_G',                       34);
+    Reg('SC_H',                       35);
+    Reg('SC_HOME',                    71);
+    Reg('SC_I',                       23);
+    Reg('SC_INSERT',                  82);
+    Reg('SC_J',                       36);
+    Reg('SC_K',                       37);
+    Reg('SC_L',                       38);
+    Reg('SC_LEFT',                    75);
+    Reg('SC_LEFTBRACKET',             26);
+    Reg('SC_LSHIFT',                  42);
+    Reg('SC_LWIN',                    91);
+    Reg('SC_M',                       50);
+    Reg('SC_MENU',                    93);
+    Reg('SC_MINUS',                   12);
+    Reg('SC_MULTIPLY',                55);
+    Reg('SC_N',                       49);
+    Reg('SC_NUMLOCK',                 69);
+    Reg('SC_O',                       24);
+    Reg('SC_P',                       25);
+    Reg('SC_PAGEDOWN',                81);
+    Reg('SC_PAGEUP',                  73);
+    Reg('SC_PERIOD',                  52);
+    Reg('SC_PLUS',                    78);
+    Reg('SC_Q',                       16);
+    Reg('SC_QUOTE',                   40);
+    Reg('SC_R',                       19);
+    Reg('SC_RIGHT',                   77);
+    Reg('SC_RIGHTBRACKET',            27);
+    Reg('SC_RSHIFT',                  54);
+    Reg('SC_RWIN',                    92);
+    Reg('SC_S',                       31);
+    Reg('SC_SCROLLLOCK',              70);
+    Reg('SC_SEMICOLON',               39);
+    Reg('SC_SLASH',                   53);
+    Reg('SC_SPACE',                   57);
+    Reg('SC_T',                       20);
+    Reg('SC_TAB',                     15);
+    Reg('SC_TILDE',                   41);
+    Reg('SC_U',                       22);
+    Reg('SC_UP',                      72);
+    Reg('SC_V',                       47);
+    Reg('SC_W',                       17);
+    Reg('SC_X',                       45);
+    Reg('SC_Y',                       21);
+    Reg('SC_Z',                       44);
+    Reg('SET_ALPHA_PRIMITIVES',       104);
+    Reg('SET_DRIVER_NAME',            103);
+    Reg('SET_GL_2D_MODE',             150);
+    Reg('SET_GL_ACCUM_ALPHA_BITS',    116);
+    Reg('SET_GL_ACCUM_BITS',          112);
+    Reg('SET_GL_ACCUM_BLUE_BITS',     115);
+    Reg('SET_GL_ACCUM_GREEN_BITS',    114);
+    Reg('SET_GL_ACCUM_RED_BITS',      113);
+    Reg('SET_GL_COLOR_ALPHA_BITS',    109);
+    Reg('SET_GL_COLOR_BITS',          105);
+    Reg('SET_GL_COLOR_BLUE_BITS',     108);
+    Reg('SET_GL_COLOR_GREEN_BITS',    107);
+    Reg('SET_GL_COLOR_RED_BITS',      106);
+    Reg('SET_GL_DEPTH_BITS',          110);
+    Reg('SET_GL_NUM_SAMPLES',         117);
+    Reg('SET_GL_SCALE',               151);
+    Reg('SET_GL_STENCIL_BITS',        111);
+    Reg('SET_PEN_POS',                102);
+    Reg('SET_WINDOW_POS',             100);
+    Reg('SET_WINDOW_TITLE',           101);
   end;
   if Base = 'dir.bi' then
   begin
@@ -3010,6 +3289,218 @@ begin
   if k < 0 then Exit;
   Reported := GPPLineDirectives[k].ReportedLine + (Physical - GPPLineDirectives[k].FromPhysical);
   if GPPLineDirectives[k].ModuleName <> '' then Module := GPPLineDirectives[k].ModuleName;
+end;
+
+function PPIsBuiltinTypeWord(const U: string): Boolean;
+// The builtin type names a "#if TypeOf(...)" can be compared against. Case-insensitive, like
+// everything in BASIC.
+begin
+  Result := (U = 'BYTE') or (U = 'UBYTE') or (U = 'SHORT') or (U = 'USHORT') or
+            (U = 'LONG') or (U = 'ULONG') or (U = 'INTEGER') or (U = 'UINTEGER') or
+            (U = 'LONGINT') or (U = 'ULONGINT') or (U = 'SINGLE') or (U = 'DOUBLE') or
+            (U = 'BOOLEAN') or (U = 'STRING') or (U = 'ZSTRING') or (U = 'WSTRING') or
+            (U = 'ANY');
+end;
+
+function PPResolveTypeName(const Operand: string): string;
+// The TYPE NAME a "#if TypeOf( <operand> )" answers, UPPER-cased (DIVERGENZE 23).
+//   a declared name  -> the type it was declared as
+//   a type name      -> itself (fbc lets "TypeOf(Integer)" name the type)
+//   anything else    -> itself, so two unknowns still compare equal to each other and an unknown
+//                       never becomes some OTHER type. fbc's own pp/if relies on an undeclared
+//                       identifier being accepted here rather than refused.
+var
+  U: string;
+begin
+  U := UpperCase(Trim(Operand));
+  if U = '' then Exit('');
+  if (GPPVarTypes <> nil) and (GPPVarTypes.IndexOfName(U) >= 0) then
+    Exit(UpperCase(GPPVarTypes.Values[U]));
+  if PPIsBuiltinTypeWord(U) or
+     ((GPPTypeNames <> nil) and (GPPTypeNames.IndexOf(U) >= 0)) then
+    Exit(U);                              // a TYPE names itself: "TypeOf(Integer)" is Integer
+  // ⛔ EVERY UNKNOWN NAME ANSWERS THE SAME MARKER, and that is measured, not chosen: fbc makes
+  // "TypeOf(zz1) = TypeOf(zz2)" TRUE for two different undeclared names while both differ from
+  // Integer, from String, from a declared name's type and from the literal "STRING". Answering the
+  // NAME itself - the obvious reading - made two unknowns differ, which is the one case the deck
+  // caught. The marker holds a character no identifier can contain, so it can never collide with a
+  // real type name.
+  Result := cPPUnknownType;
+end;
+
+function PPPrintTypeOfResolved(const Msg: string; out Res: string): Boolean;
+// "#print TypeOf( x )" echoes the TYPE NAME, upper-cased. fbc's rule here is NARROWER than the one in
+// a "#if", and it was MEASURED, six shapes against fbc 1.10.1:
+//   "#print TypeOf(foo)"       -> STRING            the whole message IS the operator
+//   "#print TypeOf(pi)"        -> INTEGER PTR       the pointer suffix belongs to the type
+//   "#print TypeOf(Integer)"   -> INTEGER
+//   "#print   TypeOf(foo)   "  -> STRING            leading and trailing blanks do not matter
+//   "#print xx TypeOf(foo)"    -> "xx TypeOf(foo)"  it must OPEN the message, or it is plain text
+//   "#print TypeOf(foo) tail"  -> fbc: error 3, "Expected End-of-Line"
+// ⛔ Answered only for an operand THIS table knows - a declared name, a builtin type word, a user
+// TYPE. Everything else keeps the verbatim echo it has always had, and that is deliberate: the
+// suite's "#print typeof( A + B )", "typeof( @s[0] )", "typeof( f() )" ask for the type of an
+// EXPRESSION, which is the compiler's question and not this table's. Answering those here would put
+// a GUESSED type where today there is only unexpanded text. ⇒ 144 such lines in the suite are left
+// exactly as they were.
+// ⛔ And an operand fbc REFUSES ("error 42: Variable not declared") is left alone too rather than
+// printed as the marker: we support less than the oracle here, never something else.
+var
+  T, Nm: string;
+  q: Integer;
+begin
+  Result := False;
+  Res := '';
+  T := Trim(Msg);
+  if UpperCase(Copy(T, 1, 6)) <> 'TYPEOF' then Exit;
+  q := 7;
+  while (q <= Length(T)) and (T[q] in [' ', #9]) do Inc(q);
+  if (q > Length(T)) or (T[q] <> '(') then Exit;
+  Nm := GatherBalancedParens(T, q);
+  if Trim(Copy(T, q, MaxInt)) <> '' then Exit;   // fbc refuses a tail; we leave the line untouched
+  Nm := Trim(Nm);
+  if (Length(Nm) >= 2) and (Nm[1] = '(') then Nm := Trim(Copy(Nm, 2, Length(Nm) - 2));
+  if Nm = '' then Exit;
+  Res := PPResolveTypeName(Nm);
+  Result := (Res <> '') and (Res <> cPPUnknownType);
+end;
+
+function PPPrintLine(const Msg: string): string;
+// What a "#print" actually echoes: the TypeOf answer when this is that operator and the operand is
+// known, otherwise the message the way it has always been echoed. ONE place decides, so the two
+// readings cannot drift apart.
+begin
+  if not PPPrintTypeOfResolved(Msg, Result) then
+    Result := UnquotePPMessage(Msg);
+end;
+
+procedure PPNoteDeclarations(const Line: string);
+// Collect, from a line the preprocessor is about to EMIT, the names it declares and the type each was
+// declared as (DIVERGENZE 23). This is the preprocessor's half of what fbc's single pass has for free:
+// by the time a "#if TypeOf(x)" is reached, every declaration above it has gone past here.
+//
+// ⭐ Deliberately SYNTACTIC and deliberately small: the shapes fbc's own seven tests declare their
+// operands with, and no more.
+//   Dim|Var|Static|Common|Redim [Shared] As <type> <name> [, <name>...]
+//   Dim|Static|Common <name> [, <name>...] As <type>
+//   Sub|Function <n> ( [ByRef|ByVal] <p> As <type> [, ...] )   - a PARAMETER's type
+//   Type|Union|Enum <name>                                     - the name IS a type
+// ⛔ A shape it does not recognise leaves the name UNKNOWN, and an unknown name answers as fbc's
+// "undeclared identifier" rule already answers - never a wrong type. Erring toward not knowing is the
+// only safe direction for a table a condition is decided on.
+// ⚠️ Everything is folded to UPPER: "As Byte", "as byte" and "AS BYTE" are one type.
+var
+  L, W, TypeName, Nm: string;
+  i, j, k: Integer;
+  Words: TStringList;
+
+  procedure Remember(const AName, AType: string);
+  begin
+    if (AName = '') or (AType = '') then Exit;
+    if GPPVarTypes = nil then
+    begin
+      GPPVarTypes := TStringList.Create;
+      GPPVarTypes.CaseSensitive := False;
+    end;
+    GPPVarTypes.Values[UpperCase(AName)] := UpperCase(AType);
+  end;
+
+  procedure RememberType(const AName: string);
+  begin
+    if AName = '' then Exit;
+    if GPPTypeNames = nil then
+    begin
+      GPPTypeNames := TStringList.Create;
+      GPPTypeNames.CaseSensitive := False;
+      GPPTypeNames.Duplicates := dupIgnore;
+      GPPTypeNames.Sorted := True;
+    end;
+    GPPTypeNames.Add(UpperCase(AName));
+  end;
+
+  function CleanIdent(const T: string): string;
+  var q: Integer;
+  begin
+    Result := '';
+    for q := 1 to Length(T) do
+      if IsIdentChar(T[q]) or (T[q] = '.') then Result := Result + T[q] else Break;
+  end;
+
+begin
+  L := Trim(Line);
+  if L = '' then Exit;
+  Words := TStringList.Create;
+  try
+    // Split on the characters that separate a declaration's words; commas and parentheses are kept as
+    // their own words so a parameter list reads the same way a DIM list does.
+    W := '';
+    for i := 1 to Length(L) do
+      if IsIdentChar(L[i]) or (L[i] = '.') or (L[i] = '_') then W := W + L[i]
+      else
+      begin
+        if W <> '' then begin Words.Add(W); W := ''; end;
+        if L[i] in ['(', ')', ','] then Words.Add(L[i]);
+      end;
+    if W <> '' then Words.Add(W);
+    if Words.Count = 0 then Exit;
+
+    W := UpperCase(Words[0]);
+    if (W = 'TYPE') or (W = 'UNION') or (W = 'ENUM') then
+    begin
+      if (Words.Count >= 2) and (UpperCase(Words[1]) <> 'AS') then RememberType(Words[1]);
+      Exit;
+    end;
+
+    if (W = 'DIM') or (W = 'VAR') or (W = 'STATIC') or (W = 'COMMON') or (W = 'REDIM') or
+       (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') then
+    begin
+      // Leading "As <type> <name> [, <name>]" - the type comes first and covers every name after it.
+      i := 1;
+      while (i < Words.Count) and
+            ((UpperCase(Words[i]) = 'SHARED') or (UpperCase(Words[i]) = 'PRESERVE') or
+             (UpperCase(Words[i]) = 'SUB') or (UpperCase(Words[i]) = 'FUNCTION')) do Inc(i);
+      if (i < Words.Count) and (UpperCase(Words[i]) = 'AS') and (i + 1 < Words.Count) then
+      begin
+        TypeName := Words[i + 1];
+        j := i + 2;
+        // "As <type> Ptr [Ptr]" - the pointer stars belong to the type.
+        while (j < Words.Count) and (UpperCase(Words[j]) = 'PTR') do
+        begin TypeName := TypeName + ' PTR'; Inc(j); end;
+        while j < Words.Count do
+        begin
+          Nm := CleanIdent(Words[j]);
+          if (Nm <> '') and (UpperCase(Nm) <> 'PTR') then Remember(Nm, TypeName);
+          Inc(j);
+          while (j < Words.Count) and (Words[j] = ',') do Inc(j);
+          if (j < Words.Count) and (UpperCase(Words[j]) = 'AS') then Break;
+        end;
+        Exit;
+      end;
+      // "<name> [, <name>] As <type>", and the same shape inside a parameter list.
+      k := 0;
+      for i := 1 to Words.Count - 1 do
+        if UpperCase(Words[i]) = 'AS' then
+        begin
+          if i + 1 >= Words.Count then Break;
+          TypeName := Words[i + 1];
+          j := i + 2;
+          while (j < Words.Count) and (UpperCase(Words[j]) = 'PTR') do
+          begin TypeName := TypeName + ' PTR'; Inc(j); end;
+          // every name gathered since the previous AS / separator belongs to this type
+          for k := i - 1 downto 1 do
+          begin
+            if (Words[k] = ',') then Continue;
+            if (Words[k] = '(') or (Words[k] = ')') then Break;
+            W := UpperCase(Words[k]);
+            if (W = 'BYREF') or (W = 'BYVAL') or (W = 'AS') or (W = 'SHARED') then Break;
+            Remember(CleanIdent(Words[k]), TypeName);
+            if (k - 1 >= 1) and (Words[k - 1] <> ',') then Break;
+          end;
+        end;
+    end;
+  finally
+    Words.Free;
+  end;
 end;
 
 function PreprocessSource(const Src, BaseDir: string; const FileName: string = ''): string;
@@ -3681,6 +4172,16 @@ var
             if p >= 0 then Defs.Delete(p);
             p := FnDefs.IndexOfName(UpperCase(Trim(DRest)));
             if p >= 0 then FnDefs.Delete(p);
+            // ...and the name is retired for the whole compilation, not only for macro expansion:
+            // it may be a SUB/FUNCTION, and fbc lets a later DIM take it. See GPPUndefNames.
+            if GPPUndefNames = nil then
+            begin
+              GPPUndefNames := TStringList.Create;
+              GPPUndefNames.CaseSensitive := False;
+              GPPUndefNames.Duplicates := dupIgnore;
+              GPPUndefNames.Sorted := True;
+            end;
+            if Trim(DRest) <> '' then GPPUndefNames.Add(UpperCase(Trim(DRest)));
           end
           else if (DName = 'include') and Emitting then
           begin
@@ -3802,7 +4303,7 @@ var
             // CONTENT, not the quotes. That is what makes "#print #arg" - the standard way to see what
             // a macro argument expanded to - readable: stringizing adds the quotes, and #print takes
             // them back off. We echoed them, so every such line differed from fbc by two characters.
-            WriteLn(StdErr, UnquotePPMessage(PPPrintMessage(SubstituteMacros(TrimRight(DRest) +
+            WriteLn(StdErr, PPPrintLine(PPPrintMessage(SubstituteMacros(TrimRight(DRest) +
                             Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0))))
           else if (DName = 'cmdline') and Emitting then
           begin
@@ -3913,10 +4414,21 @@ var
           // expands to several lines joined with cVirtualEOL, so a directive is recognisable as a
           // SEGMENT that starts with '#': when one is there, the expansion goes back through this same
           // loop (conditionals, macro table and all) and only the surviving CODE comes out.
+          // ⭐ Every line that is actually EMITTED goes past the declaration collector first, which is
+          // what gives a later "#if TypeOf(x)" the type of x - fbc's single pass has it for free
+          // (DIVERGENZE 23). A line inside a false branch never reaches here, exactly as it never
+          // reaches the compiler.
           if ExpandedLineHasDirective(ExpandedLine) then
-            Output.Add(ReprocessExpansion(ExpandedLine, Dir))
-          else
+          begin
+            ExpandedLine := ReprocessExpansion(ExpandedLine, Dir);
+            PPNoteDeclarations(ExpandedLine);
             Output.Add(ExpandedLine);
+          end
+          else
+          begin
+            PPNoteDeclarations(ExpandedLine);
+            Output.Add(ExpandedLine);
+          end;
           while ContJoin > 0 do                       // one blank per swallowed line: keep numbering
           begin
             Output.Add('');

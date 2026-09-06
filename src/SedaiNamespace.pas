@@ -485,6 +485,7 @@ function ResolveUnqualified(const ActivePrefix, V: string; Ctx: TNsContext;
 // so a name of the namespace one is written INSIDE always wins over an imported one - which is what
 // fbc does and the only order that keeps an existing program's meaning.
 var
+  Owner, Amb: string;   // DIVERGENZE 38: quale import offre il nome, e se sono piu' di uno
   P, Member: string;
   DotPos, u: Integer;
   Closure: TStringList;
@@ -536,8 +537,29 @@ begin
     try
       Closure.Assign(Using);
       for u := 0 to Using.Count - 1 do Ctx.AddUsingClosure(Using[u], Closure);
+      // ⛔⛔ TWO IMPORTS OFFERING THE SAME NAME IS AN ERROR, NOT A CHOICE. This loop took the FIRST
+      // match, so "Using n1 : Using n2" with an "x" in each printed one of them in SILENCE - a wrong
+      // answer with no diagnostic, and which of the two you got depended on the order of the imports.
+      // fbc refuses: "error 255: Ambiguous symbol access, explicit scope resolution required".
+      // DIVERGENZE 38.
+      // ⚠️ The owners are collected and COMPARED, not counted: the same namespace can reach the
+      // closure by more than one path (A uses B, C uses B), and that is one entity, not two.
+      Owner := '';
+      Amb := '';
       for u := 0 to Closure.Count - 1 do
-        if Ctx.IsMember(Closure[u], V) then Exit(Closure[u] + '.' + V);
+        if Ctx.IsMember(Closure[u], V) then
+        begin
+          if Owner = '' then Owner := Closure[u]
+          else if not SameText(Owner, Closure[u]) then
+          begin
+            if Amb = '' then Amb := Owner;
+            Amb := Amb + ', ' + Closure[u];
+          end;
+        end;
+      if Amb <> '' then
+        raise Exception.CreateFmt('Ambiguous symbol access, explicit scope resolution required ' +
+                                  'for %s, found "%s"', [Amb, V]);
+      if Owner <> '' then Exit(Owner + '.' + V);
     finally
       Closure.Free;
     end;

@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 576 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches
+  OPCODE_LIST_COUNT = 578 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -110,7 +110,7 @@ const
     bcPrintFileFloat, bcPrintFileInt, bcInputFileFloat, bcInputFileInt, bcFileQuery, bcSeekSet,
     bcInputFileLine, bcPutBinInt, bcPutBinFloat, bcGetBinInt, bcGetBinFloat, bcPutBinStr,
     bcGetBinStr, bcFileAttr, bcFileSetEof, bcPrintFileComma, bcPutBinMem, bcGetBinMem, bcPutBinArray,
-    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcOpenFunc, bcDirSearch, bcDirAttr, bcSprite, bcMovsprAbs, bcMovsprRel,
+    bcGetBinArray, bcPutBinPad, bcGetBinSkip, bcOpenFunc, bcCloseFunc, bcDirSearch, bcDirAttr, bcSprite, bcMovsprAbs, bcMovsprRel,
     bcMovsprPolar, bcMovsprAuto, bcSprcolor, bcSprsav, bcCollision, bcBump,
     bcRspcolor, bcRsppos, bcRsprite, bcSpriteDef, bcSprSaveFile, bcSprLoadFile,
     bcSprSize, bcSprForm, bcGraphicRGBA, bcGraphicSetMode, bcGraphicBox, bcGraphicCircle,
@@ -118,7 +118,7 @@ const
     bcGetColor, bcGraphicWidth, bcGraphicScale, bcGraphicPaint, bcGraphicWindow, bcGraphicSShape,
     bcGraphicGShape, bcGraphicGList, bcGraphicPos, bcGraphicRclr, bcGraphicRwindow, bcPLoad,
     bcPSave, bcPRst, bcGfxScreenRes, bcGfxPset, bcGfxPoint, bcGfxPaint,
-    bcGfxLine, bcGfxCircle, bcGfxPalette, bcGfxPalGet, bcGfxPaletteReset, bcGfxColor,
+    bcGfxLine, bcGfxCircle, bcGfxPalette, bcGfxPalGet, bcGfxPaletteReset, bcGfxPaletteUsing, bcGfxColor,
     bcGfxForeColor, bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo, bcGfxGet, bcGfxPut,
     bcGfxScreenInfo, bcGfxScreenSet, bcGfxPCopy, bcGfxWindow, bcGfxPMap, bcGfxView,
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
@@ -199,14 +199,14 @@ const
   DENSE_ARRAY_SIZE    = 52;   // group 3   (bcRawLoad/StoreZStr = subs 50/51)
   DENSE_IO_SIZE       = 23;   // group 4
   DENSE_SPECIAL_SIZE  = 18;   // group 5   (bcCpuCount = sub 17)
-  DENSE_FILEIO_SIZE   = 37;   // group 6
+  DENSE_FILEIO_SIZE   = 38;   // group 6  (+ bcCloseFunc)
   DENSE_SPRITE_SIZE   = 17;   // group 7
   {$IFDEF WEB_MODE}
   DENSE_WEB_SIZE      = 13;   // group 8   subs 1..12, slot 0 a hole
   {$ELSE}
   DENSE_WEB_SIZE      = 0;    // group 8 is gated out: it takes NO dense range
   {$ENDIF}
-  DENSE_GRAPHICS_SIZE = 69;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK)
+  DENSE_GRAPHICS_SIZE = 70;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK, PALETTE USING)
   DENSE_SOUND_SIZE    = 6;    // group 11
   DENSE_BIGINT_SIZE   = 13;   // group 12
   DENSE_SUPER_SIZE    = 72;   // group 200 keeps its whole block, holes included

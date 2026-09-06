@@ -94,6 +94,17 @@ type
                              out Value: Int64; out ErrorCode: Integer): Boolean of object;
 
 const
+  { ⭐ THE HIGHEST FILE HANDLE, and it is ONE constant because there are TWO file handlers - the
+    headless one (SedaiFileIO, what `sb` uses) and the console's own (SedaiNewConsole, what `sbv`
+    uses) - and each carried its own `array[1..15]` and its own range tests. A limit written twice
+    is a limit that will be raised in one of them.
+    ⛔ 15 was the COMMODORE limit and it is not FreeBASIC's: measured against fbc, handles 16, 40
+    and 255 all open, twenty files open at once, and 256 is where it answers error 1. So the ceiling
+    is 255, and it is fbc's, not a number picked to be large.
+    ⚠️ Raising it does not make a Commodore program wrong - it only stops refusing what fbc accepts;
+    the two dialects share one table because a handle is a handle. (DIVERGENZE 6.) }
+  MAX_FILE_HANDLE = 255;
+
   { bcFileQuery.Immediate - the query codes the SSA builder emits (SedaiSSA ~6057). }
   FQ_EOF      = 0;
   FQ_FREEFILE = 1;
@@ -15673,6 +15684,9 @@ var
   JoyV: Single;
   ScrData: PByte;      // SCREENPTR: working-page pixel bytes (existence check only)
   ScrSize: Integer;
+  PalArr: ^TArrayStorage;   // PALETTE USING: the array the whole palette is read from / written to
+  PalN, PalK, PalStart, PalIdx: Integer;
+  PalPtr: Int64;
 begin
   // ⛔ THE TEST IS INLINE AND THE CALL IS NOT MADE WHILE LOCKED. Both of these run once per GRAPHICS
   // OPERATION - 62 500 times a frame in a demo that plots points - and a call that returns immediately
@@ -16022,6 +16036,57 @@ begin
     33: // bcGfxPaletteReset - PALETTE (no args)
       if Assigned(FGraphics) then
         FGraphics.ResetPalette;
+    69: // bcGfxPaletteUsing - PALETTE [GET] USING a() : the WHOLE 256-entry palette (DIVERGENZE 147).
+        //   Src1 = array id (logical), Immediate bit0 = 1 for GET (palette -> array), 0 for SET.
+        // ⭐ THE ELEMENT FORMAT IS fbc's, and it was MEASURED, not assumed: "&h00BBGGRR with each
+        //   component 0-63" - the QB palette convention, the same one PALETTE index,&hBBGGRR already
+        //   decodes. fbc's own gfx/palette asserts the default entries as &h002A0000, &h003F3F3F...
+        // ⛔⛔ AND THE TWO DIRECTIONS ARE NOT THE SAME SCALE, which a deck caught and an assumption
+        //   would not have: going OUT it is c SHR 2 (170 -> 42, 20 -> 5, 252 -> 63), and c*63 div 255
+        //   is off by one on both of those (4 and 62). Coming BACK it is c*255 div 63 (42 -> 170),
+        //   which is what makes the default palette round-trip exactly. Asymmetric, and measured.
+        // ⚠️ 256 entries from the array's LOWER BOUND, which is what "Dim p(N To N+255)" means and
+        //   what fbc's do_test_at_N exercises; a shorter array stops at its end rather than running off.
+      if Assigned(FGraphics) and
+         (((Instr.Immediate and 2) <> 0) or (Instr.Src1 < Length(FArrays))) then
+      begin
+        // ⭐ Immediate bit1: Src1 holds a POINTER VALUE, not an array id. The packed address decodes
+        // exactly as bcRefStoreInt decodes it - array index in the high bits, element offset in the
+        // low ones - so the pointer spelling costs a decode and reuses everything else.
+        if (Instr.Immediate and 2) <> 0 then
+        begin
+          PalPtr := Ctx.IntRegs[Instr.Src1];
+          PalIdx := MapArrDyn(Ctx, (PalPtr shr POINTER_ARRAY_SHIFT) - 1);
+          if (PalIdx < 0) or (PalIdx > High(FArrays)) then Exit;
+          PalArr := @FArrays[PalIdx];
+          PalStart := PalPtr and POINTER_OFFSET_MASK;
+        end
+        else
+        begin
+          PalArr := @FArrays[Ctx.ArrMap[Instr.Src1]];
+          PalStart := Ctx.IntRegs[Instr.Src2];       // start element ("@p(5)" over "p(5 To 260)" = 0)
+        end;
+        if PalStart < 0 then PalStart := 0;
+        PalN := PalArr^.TotalSize - PalStart;
+        if PalN > 256 then PalN := 256;
+        for PalK := 0 to PalN - 1 do
+          if (Instr.Immediate and 1) <> 0 then
+          begin
+            PalColor := UInt32(FGraphics.GetPaletteColor(TPaletteIndex(PalK)));
+            PalArr^.IntData[PalStart + PalK] := Int64(((PalColor and $FF) shr 2)                        // red
+                                  or ((((PalColor shr 8) and $FF) shr 2) shl 8)              // green
+                                  or ((((PalColor shr 16) and $FF) shr 2) shl 16));          // blue
+          end
+          else
+          begin
+            PalColor := UInt32(PalArr^.IntData[PalStart + PalK]);
+            FGraphics.SetPaletteColor(TPaletteIndex(PalK),
+              ((PalColor and $3F) * 255 div 63)                     // red
+              or (((((PalColor shr 8) and $3F) * 255 div 63)) shl 8)
+              or (((((PalColor shr 16) and $3F) * 255 div 63)) shl 16)
+              or $FF000000);
+          end;
+      end;
     34: // bcGfxColor - COLOR [fg][,bg] : set current draw colours (Immediate bit0=hasFg, bit1=hasBg)
       begin
         if (Instr.Immediate and 1) <> 0 then
@@ -16062,7 +16127,12 @@ begin
       end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
-    39: // bcGfxGet - GET (x1,y1)-(x2,y2),dst : capture a screen rect into image dst (per-pixel copy)
+    39: // bcGfxGet - GET [src,] (x1,y1)-(x2,y2),dst : capture a rect into image dst (per-pixel copy)
+        // ⛔ It used to name FGfxWorkSurface outright, exactly as bcGfxPut below used to - and the note
+        //  there is the map: DrawSurface is the same funnel PSET/LINE/CIRCLE/PAINT/POINT read, and it
+        //  is the work page whenever no target is active. So "Get src, (..)-(..), dst" evaluated its
+        //  source, set it, and copied out of the SCREEN anyway: dst came back black (DIVERGENZE 146).
+        //  ⇒ One word, and the fix for the twin next door had already written down which word.
       if Assigned(FGraphics) then
       begin
         GetX1 := Ctx.IntRegs[Instr.Src1];
@@ -16075,7 +16145,7 @@ begin
         for GetSy := 0 to (GetY2 - GetY1) do
           for GetSx := 0 to (GetX2 - GetX1) do
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
-              FGraphics.GetPixel(FGfxWorkSurface, GetX1 + GetSx, GetY1 + GetSy));
+              FGraphics.GetPixel(DrawSurface, GetX1 + GetSx, GetY1 + GetSy));
       end;
     40: // bcGfxPut - PUT [img,] (x,y),src[,mode] : blit image src onto the DRAW SURFACE (Immediate[0-15]=
         //  src handle register, Immediate[16-31]=mode ordinal constant)
@@ -17428,9 +17498,13 @@ begin
           FOnDiskFile(Self, 'DOPEN', HandleNum, HandleName, Filename, Mode, ErrorCode);
           // The FreeBASIC code for what the file layer reported: 62 FILE NOT FOUND is fbc's 2, and the
           // other failures the layer can return are its 3 (file I/O error).
+          // ⭐ ...and a handle OUT OF RANGE is fbc's 1 (illegal function call), not an I/O error:
+          // measured, "Open f For Output As #0" and "... As #256" both answer 1 there while #255
+          // opens. The file layer reports 64 for that case, and 64 is the only way it says so.
           case ErrorCode of
             0:      OpenFbCode := 0;
             62:     OpenFbCode := 2;
+            64:     OpenFbCode := 1;
           else      OpenFbCode := 3;
           end;
           if SubOp = 34 then
@@ -17457,17 +17531,27 @@ begin
           raise Exception.Create('DOPEN command not supported: no handler assigned');
       end;
 
-    1, 3: // bcDclose, bcClose
+    1, 3, 37: // bcDclose, bcClose, bcCloseFunc
       begin
         // DCLOSE #handle
         // Src1 = handle
+        //
+        // ⭐ bcCloseFunc is FreeBASIC's FUNCTION form (DIVERGENZE 41): the SAME close, except that the
+        // result is DELIVERED in Dest instead of raising - 0 when the channel was open, 1 (illegal
+        // function call) when it was not, which is what fbc answers. It shares this arm for the reason
+        // bcOpenFunc shares OPEN's: two forms of one statement must not drift apart.
         HandleNum := Ctx.IntRegs[Instr.Src1];
         HandleName := '';
 
         if Assigned(FOnDiskFile) then
         begin
           FOnDiskFile(Self, 'DCLOSE', HandleNum, HandleName, '', '', ErrorCode);
-          if ErrorCode <> 0 then
+          if SubOp = 37 then
+            Ctx.IntRegs[Instr.Dest] := Ord(ErrorCode <> 0)     // 0 = it was open, 1 = it was not
+          // ⛔ 64 is "there was nothing to close", and for the STATEMENT that is not an error: fbc's
+          // "Close #7" on a channel never opened prints nothing and leaves Err at 0 (measured). Only
+          // the function form above turns it into an answer.
+          else if (ErrorCode <> 0) and (ErrorCode <> 64) then
             raise Exception.CreateFmt('DCLOSE error %d closing handle: %d', [ErrorCode, HandleNum]);
           // Reset CMD redirection if closing the CMD output file
           if FCmdHandle = HandleNum then
