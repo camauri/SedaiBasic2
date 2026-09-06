@@ -775,7 +775,14 @@ var
     else if (TN = 'LONG') then Result := '5'
     else if (TN = 'ULONG') then Result := '6'
     else if (TN = 'SINGLE') then Result := '7'
-    else if (TN = 'UINTEGER') or (TN = 'ULONGINT') then Result := '8'
+    // ⭐ THE FOUR 64-BIT NAMES GET ONE CODE EACH (DIVERGENZE 8). They were two codes for four names -
+    // Integer and LongInt both '-' (no narrowing), UInteger and ULongInt both '8' - so two declarations
+    // signed ONE label and the second did not exist. Narrowing genuinely cannot tell them apart; overload
+    // resolution must, and the call site reproduces these through DeclaredIdentCode.
+    else if (TN = 'INTEGER') then Result := 'C'
+    else if (TN = 'LONGINT') then Result := 'D'
+    else if (TN = 'UINTEGER') then Result := 'E'
+    else if (TN = 'ULONGINT') then Result := 'G'
     else if (TN = 'INT32') then Result := '9'
     else if (TN = 'UINT32') then Result := 'A'
     else if (TN = 'BOOLEAN') then Result := 'B'

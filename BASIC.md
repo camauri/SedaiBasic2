@@ -409,13 +409,22 @@ same limit applies to reading a UDT as raw bytes.
   supply. Where fbc accepts the statement, the result is byte-identical: the destination's current
   length is preserved, the source is cut from the right when longer and padded when shorter, and the
   counts are codepoints for a wide destination.
-- ⚠️ **Overload resolution does not tell `Integer` from `LongInt`, nor `UInteger` from `ULongInt`.**
-  On this target all four are 64 bits and all four sign the same register bank, and no registry records
-  which of the four a name was *declared* as — so given `f(ByVal x As Integer)` and
-  `f(ByVal x As UInteger)`, both `f(i)` and `f(u)` answer the first declaration. Everything the bank
-  and the declared width *can* separate is resolved exactly: `Byte`/`UByte`/`Short`/`UShort`/`Long`/
-  `ULong`/`Single`/`Double`/`Boolean`, each **enum** type, each **pointee** type (`Integer Ptr` from
-  `Double Ptr` from `T Ptr`, at any pointer depth), each by-value UDT, and `Const` against non-`Const`.
+- **Overload resolution ranks the implicit conversions, as FreeBASIC does.** All twelve numeric types
+  are told apart, the four 64-bit names (`Integer`, `LongInt`, `UInteger`, `ULongInt`) included, and a
+  call whose argument matches no candidate exactly takes the cheapest conversion rather than the first
+  declaration. The order, measured against `fbc` over a 12×12 matrix in both declaration orders: the
+  **exact** type · the **kind** (an integer argument takes every integer candidate before any
+  floating-point one, so `f(As Long)` beats `f(As Double)` for an `Integer`) · the **width class**
+  (same width, then wider, then narrower) · the **distance** · the **sign** · the argument's own
+  signed/unsigned partner · `Integer` before `LongInt`. A call with several arguments adds the
+  per-argument costs. The argument's type is read from a declared name, an explicit `Cast`, a
+  function's declared return, a record field, or the literal itself (an integer literal is `Integer`,
+  one with a fractional part is `Double`).
+  ⚠️ **A tie is left unresolved rather than guessed.** fbc reports an ambiguous call as an error; here
+  a tie falls back to the older, order-dependent choice instead of being refused. Everything else the
+  bank and the declared type separate is resolved exactly as before: each **enum** type, each
+  **pointee** type (`Integer Ptr` from `Double Ptr` from `T Ptr`, at any pointer depth), each by-value
+  UDT, and `Const` against non-`Const`.
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.

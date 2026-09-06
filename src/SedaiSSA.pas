@@ -116,6 +116,10 @@ type
                             // "Double Ptr" field, else ''): a raw byte-heap pointer, so "obj.field[i]" /
                             // "*obj.field" / "@obj.field[i]" index and deref onto the raw heap, SizeOf-scaled
     WidthCode: Integer;     // B1.5: narrow width code for a sub-64-bit/SINGLE field (0 = full width)
+    IdentCode: Integer;     // DIVERGENZE 8: WidthCode's twin for OVERLOAD IDENTITY, which needs the four
+                            // 64-bit names told apart (INTEGER 12, LONGINT 13, UINTEGER 14, ULONGINT 15)
+                            // where the store-narrowing question rightly says 0 for all four. Written at
+                            // the one site that writes WidthCode, from the same declared type name.
     BitWidth: Integer;      // FreeBASIC BIT FIELD "name : n As T": n bits (0 = not a bit field). A RUN of
     BitOffset: Integer;     // consecutive bit fields shares ONE storage unit of the declared type: every
                             // member of the run gets that unit's ByteOffset and width code, and its own
@@ -465,6 +469,10 @@ type
     FRawPtrRetFuncs: TStringList;        // FUNCTION returning a raw "<scalar> PTR": func name (UPPER) -> scalar pointee type
     FCurrentProcByrefRet: Boolean;       // lowering a "FUNCTION f() BYREF AS T" (returns an address)
     FVarWidthCode: TStringList;          // B1.5 phase 2: name (UPPER) -> narrow width code (Objects[]=PtrInt 1..7)
+    FVarIdentCode: TStringList;          // ...and its TWIN, the overload IDENTITY code (DIVERGENZE 8):
+                                         // the same key, but Integer/LongInt/UInteger/ULongInt each get
+                                         // their own number. Narrowing cannot tell them apart - they all
+                                         // occupy the whole slot - and overload resolution must.
     FMultiDimArrays: TStringList;        // array names (UPPER) ever given >1 dimension (rank is immutable in FB)
     FNarrowsElided: Integer;             // how many redundant narrowings were turned into copies
     FVarPrintKind: TStringList;          // B1.5 phase C: name (UPPER) -> 1=BOOLEAN, 2=unsigned-64 (print form)
@@ -731,6 +739,8 @@ type
     function TypeTailWantsARecordWhere(const DeclTail, NotRecMask: string): Boolean;
     function SigNamePart(const Sig: string): string;   // the type-name tail of a label signature
     function TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
+    function WidthTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;  // ...its WIDTH twin
+    function SigConstPart(const Sig: string): string;                     // ...and the CONST tail read back
     function SigWidthPart(const Sig: string): string;   // ...and the WIDTH tail after '%'            // the bank chars of a signature = its parameter count
     function IsDeclaredVariable(const Name: string): Boolean;   // a variable wins over a type of the same name
     function RecordTypeOfAddrOfObject(Node: TASTNode): string;  // "(@X)" as the OBJECT of a member access -> X's UDT, else ''
@@ -1026,7 +1036,14 @@ type
     function TypeNameIsKnownBank(const TypeName: string): Boolean;   // ...does it resolve WITHOUT the suffix fallback?
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
-    function TypeNameWidthCode(const TypeName: string): Integer;        // B1.5 phase 2: type -> narrow code
+    function TypeNameWidthCode(const TypeName: string): Integer;
+    function TypeNameIdentCode(const TypeName: string): Integer;   // ...its overload-IDENTITY twin (DIVERGENZE 8)
+    function DeclaredIdentCode(Node: TASTNode): Integer;           // the same, derived from an ARGUMENT        // B1.5 phase 2: type -> narrow code
+    function UDTFieldIdentCode(UDTIdx: Integer; const FieldName: string): Integer;  // ...and from a FIELD
+    function ConvRankFacts(Code: Integer; out Kind, Wid, Sgn, Canon: Integer): Boolean;  // DIVERGENZE 8: the ranking
+    function ConvRankCost(ArgCode, CandCode: Integer): Int64;                            // ...its cost of one conversion
+    function ArgRankCode(Node: TASTNode): Integer;                                       // ...the ARGUMENT's type
+    function LabelRankCost(const Lbl: string; ArgsNode: TASTNode; out Cost: Int64): Boolean;
     function IsFieldAddrExpr(Node: TASTNode): Boolean;                  // "@obj.field" over a MANAGED record (no emit)
     function RecPtrWireWidth(const Pointee: string): Integer;           // record-field pointer's low 4 bits for this pointee (-1 = leave alone)
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
@@ -1064,6 +1081,7 @@ type
     // ...and its declared narrowing width, same key shape (a PARAMETER's, so a store to it wraps).
     procedure SetVarWidthScoped(const ProcName, VarName, TypeName: string);
     procedure SetVarWidthUnderKey(const Key, TypeName: string);   // ...under a block's own mangled key
+    procedure SetIdentUnderKey(const Key, TypeName: string);      // ...and the identity twin, same key
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
@@ -1792,6 +1810,8 @@ begin
   FMultiDimArrays.CaseSensitive := False;
   FVarWidthCode := TStringList.Create;
   FVarWidthCode.CaseSensitive := False;
+  FVarIdentCode := TStringList.Create;
+  FVarIdentCode.CaseSensitive := False;
   FVarPrintKind := TStringList.Create;
   FVarPrintKind.CaseSensitive := False;
   FArrayElemWidth := TStringList.Create;
@@ -1919,6 +1939,7 @@ begin
   FRawPtrRetFuncs.Free;
   FMultiDimArrays.Free;
   FVarWidthCode.Free;
+  FVarIdentCode.Free;
   FVarPrintKind.Free;
   FArrayElemWidth.Free;
   FDataMarks.Free;
@@ -14645,6 +14666,16 @@ begin
            (UDTFieldIndex(ai, UpperCase(VarToStr(Node.Value))) >= 0) then
           Result := UDTFieldBankOf(Node);
       end;
+    // ⛔ AN EXPLICIT CAST NAMES ITS OWN BANK, and there was no arm for it - so "f( Cast(LongInt, 1) )"
+    // signed the bank 'F', the classic float default this file records everywhere, and matched no
+    // member of an integer overload set at all. Asked only when the name resolves to a bank on its
+    // own; a cast to a type this pass cannot name takes the bank of what is being cast, which is a
+    // better guess than the default and never worse.
+    antCast:
+      if TypeNameIsKnownBank(VarToStr(Node.Value)) then
+        Result := TypeNameToBank(UpperCase(VarToStr(Node.Value)), '')
+      else if Node.ChildCount > 0 then
+        Result := InferExprBank(Node.GetChild(0));
     antUnaryOp:
       if Node.ChildCount > 0 then Result := InferExprBank(Node.GetChild(0));
   end;
@@ -26145,6 +26176,41 @@ begin
   end;
 end;
 
+function TSSAGenerator.TypeNameIdentCode(const TypeName: string): Integer;
+// The overload IDENTITY of a declared type: TypeNameWidthCode's answer, except that the FOUR 64-bit
+// names get one code each (DIVERGENZE 8).
+//
+// ⛔⛔ WHY IT IS A SECOND FUNCTION AND NOT A WIDER FIRST ONE. TypeNameWidthCode is the STORE-NARROWING
+// registry - a question about STORAGE - and it is right that it cannot tell Integer from LongInt: they
+// narrow identically, both occupying the whole slot. Overload resolution asks a different question,
+// IDENTITY, and reading the narrowing registry for it is what made two declarations share ONE label:
+// "Sub f(As Integer)" and "Sub f(As LongInt)" both signed "F_~I", so the second was not merely
+// out-ranked, it did not exist. ⇒ *A registry kept for one question and read for another answers well
+// until the two questions diverge.*
+// ⚠️ The new codes are deliberately ABOVE every storage code, and nothing but the signature machinery
+// reads them: ApplyNarrowCode, BinaryElemBytesOfWidthCode and the wire formats keep asking
+// TypeNameWidthCode, which still answers 0 and 8 exactly as before.
+begin
+  Result := TypeNameWidthCode(TypeName);
+  if Result <> 0 then
+  begin
+    // UINTEGER and ULONGINT shared code 8 - one code for two names, the unsigned half of the same gap.
+    if UpperCase(CanonicalType(TypeName)) = 'UINTEGER' then Result := 14
+    else if UpperCase(CanonicalType(TypeName)) = 'ULONGINT' then Result := 15;
+    Exit;
+  end;
+  if UpperCase(CanonicalType(TypeName)) = 'INTEGER' then Result := 12
+  else if UpperCase(CanonicalType(TypeName)) = 'LONGINT' then Result := 13
+  // ⭐ ...AND DOUBLE, 16, which the narrowing registry rightly calls 0 - a Double occupies the whole
+  // slot and narrows nothing. It is here for the CONVERSION RANKING, which has to place a Double
+  // candidate against an Integer one and cannot do it with "unknown". ⛔ It costs the label tail
+  // nothing: ArgWidthSigFromArgs writes a letter for 12..15 only, so 16 lands on '-' exactly where 0
+  // landed before, and the parser's WidthCharOf still signs a Double parameter '-' as well.
+  // ⚠️ SINGLE outside MODERN keeps answering 0 (TypeNameWidthCode gates code 7 on the dialect), so the
+  // ranking simply declines there - CLASSIC has no overload sets to rank.
+  else if UpperCase(CanonicalType(TypeName)) = 'DOUBLE' then Result := 16;
+end;
+
 function TSSAGenerator.TypeNameWidthCode(const TypeName: string): Integer;
 // Map a declared type name to a narrowing width code for STORE narrowing (B1.5). 0 = no narrowing.
 // 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 (Long/ULong are 32-bit in FB), 7=single precision,
@@ -27109,6 +27175,8 @@ begin
     FVarWidthCode.Objects[Idx] := TObject(PtrInt(W))
   else
     FVarWidthCode.AddObject(Nm, TObject(PtrInt(W)));
+  // ...and the IDENTITY twin beside it, on the SAME key, so the two can never drift (DIVERGENZE 8).
+  SetIdentUnderKey(Nm, TypeName);
   PK := PrintKindOfType(T);
   Idx := FVarPrintKind.IndexOf(Nm);
   if PK = 0 then
@@ -27188,6 +27256,26 @@ begin
     FVarWidthCode.Objects[Idx] := TObject(PtrInt(TypeNameWidthCode(TypeName)))
   else
     FVarWidthCode.AddObject(Key, TObject(PtrInt(TypeNameWidthCode(TypeName))));
+  SetIdentUnderKey(Key, TypeName);
+end;
+
+procedure TSSAGenerator.SetIdentUnderKey(const Key, TypeName: string);
+// File the overload IDENTITY under the same key the width goes under (DIVERGENZE 8). Called from every
+// site that records a width, so the two registries cannot drift apart - the drift this file records
+// four times over.
+var
+  Idx, C: Integer;
+begin
+  C := TypeNameIdentCode(TypeName);
+  Idx := FVarIdentCode.IndexOf(Key);
+  if C = 0 then
+  begin
+    if Idx >= 0 then FVarIdentCode.Delete(Idx);
+  end
+  else if Idx >= 0 then
+    FVarIdentCode.Objects[Idx] := TObject(PtrInt(C))
+  else
+    FVarIdentCode.AddObject(Key, TObject(PtrInt(C)));
 end;
 
 procedure TSSAGenerator.SetVarWidthScoped(const ProcName, VarName, TypeName: string);
@@ -27207,6 +27295,7 @@ begin
     FVarWidthCode.Objects[Idx] := TObject(PtrInt(W))
   else
     FVarWidthCode.AddObject(Key, TObject(PtrInt(W)));
+  SetIdentUnderKey(Key, TypeName);
 end;
 
 procedure TSSAGenerator.RecordSharedScalarType(const VarName, TypeName: string);
@@ -27318,6 +27407,45 @@ begin
   end
   else if (Node.NodeType = antUnaryOp) and (Node.ChildCount >= 1) then
     Result := Is32BitExpr(Node.GetChild(0));
+end;
+
+function TSSAGenerator.DeclaredIdentCode(Node: TASTNode): Integer;
+// Declared32Code's twin, reading the IDENTITY registry (DIVERGENZE 8). Only a shape whose DECLARED
+// type the call site can name answers: a named scalar, an explicit CAST, a record FIELD, a FUNCTION's
+// return. Everything else answers 0 and the tail writes '-', which is "unknown" - the direction that
+// leaves today's resolution untouched.
+// ⛔ THE FOUR SHAPES ARE ASKED IN THE ORDER OF THE NODE, NOT BEHIND ONE GUARD. The first draft opened
+// with "if not (Node.NodeType in [antIdentifier, antFunctionCall]) then Exit", which is right for the
+// registry lookup and wrong for the other three: a call written "g_()" arrives as an antArrayAccess
+// (the parser cannot tell an index from a call until the name is resolved), so the return-type arm
+// below it was unreachable - "f_( g_() )" answered the first declaration, and so did "f_( t.v )".
+var
+  idx: Integer;
+  T: string;
+begin
+  Result := 0;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  // An explicit Cast NAMES the type at the call site, and it is the shape that showed the gap was in
+  // the KEY and not in the ranking: "f( Cast(LongInt, 1) )" still answered the Integer overload.
+  if Node.NodeType = antCast then Exit(TypeNameIdentCode(UpperCase(VarToStr(Node.Value))));
+  // A record FIELD: its declared type is on the field, which is why it carries an IdentCode of its own.
+  if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
+    Exit(UDTFieldIdentCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)));
+  if Node.NodeType in [antIdentifier, antFunctionCall] then
+  begin
+    if FInProcedure and (FCurrentProcName <> '') then
+    begin
+      idx := FVarIdentCode.IndexOf(FCurrentProcName + '|' + UpperCase(VarToStr(Node.Value)));
+      if idx >= 0 then Exit(PtrInt(FVarIdentCode.Objects[idx]));
+    end;
+    idx := FVarIdentCode.IndexOf(UpperCase(VarToStr(Node.Value)));
+    if idx >= 0 then Exit(PtrInt(FVarIdentCode.Objects[idx]));
+  end;
+  // ...and a FUNCTION's declared return type, which is how "f( g() )" reaches the right overload.
+  // CalleeRetTypeName answers '' for anything that is not a call, array indexing included.
+  T := CalleeRetTypeName(Node);
+  if T <> '' then Result := TypeNameIdentCode(T);
 end;
 
 function TSSAGenerator.Declared32Code(Node: TASTNode): Integer;
@@ -28804,6 +28932,21 @@ begin
     if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].WidthCode);
 end;
 
+function TSSAGenerator.UDTFieldIdentCode(UDTIdx: Integer; const FieldName: string): Integer;
+// DIVERGENZE 8: the OVERLOAD IDENTITY of a field (0 = nothing recorded). UDTFieldWidthCode's twin, and
+// the reason it is needed: a "v As LongInt" field and a "v As Integer" one both answer 0 there, so
+// "f( t.v )" against f(As Integer)/f(As LongInt) had nothing to choose by and took the first declared.
+var
+  i: Integer;
+  F: string;
+begin
+  Result := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  F := UpperCase(FieldName);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if FUDTs[UDTIdx].Fields[i].Name = F then Exit(FUDTs[UDTIdx].Fields[i].IdentCode);
+end;
+
 function TSSAGenerator.UDTFieldArrayElemWidthCode(UDTIdx: Integer; const FieldName: string): Integer;
 // The narrow width code of an ARRAY member's ELEMENT ("a(0 To 3) As UByte" -> the UByte code), which is
 // what "obj.field(i)" is worth. ⛔ Its twin UDTFieldWidthCode answers for the FIELD, and for an array
@@ -29484,9 +29627,15 @@ begin
       // the bottom were all green because their handles were small.
       // ⭐ The ELEMENT's width is a different question and has its own storage, ArrayElemScalarType.
       if (NestedT = '') and (not IsArrayField) then
-        FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName)  // B1.5: narrow field on store
+      begin
+        FUDTs[Idx].Fields[n].WidthCode := TypeNameWidthCode(TypeName);  // B1.5: narrow field on store
+        FUDTs[Idx].Fields[n].IdentCode := TypeNameIdentCode(TypeName);  // DIVERGENZE 8: the overload identity
+      end
       else
+      begin
         FUDTs[Idx].Fields[n].WidthCode := 0;
+        FUDTs[Idx].Fields[n].IdentCode := 0;
+      end;
       // A3-i: only the STRING bank still hands out slots, because only strings still live in a
       // slot array. A numeric field's Slot is stamped by ComputeUDTLiveLayout below, from the byte
       // layout - which is also what finally makes a UNION overlap ACROSS banks: "b As UByte" and
@@ -30740,7 +30889,12 @@ begin
     // five specific codes were unreachable through the tail, and their overloads with them
     // ("h(As ULongInt)" beside "h(As Integer)" answered "integer" where fbc answers "ulongint").
     // Declared32Code is the same registry read WITHOUT that clamp, and it is scoped by procedure.
-    W := Declared32Code(ArgsNode.GetChild(i));
+    // ⭐ THE IDENTITY CODE FIRST (DIVERGENZE 8): it is the only one that can tell Integer from LongInt
+    // and UInteger from ULongInt, which narrowing cannot - they occupy the whole slot alike. It answers
+    // only for a NAMED scalar, a function's declared return and an explicit Cast, and 0 otherwise, so
+    // every shape it cannot name falls through to exactly the chain that was here before.
+    W := DeclaredIdentCode(ArgsNode.GetChild(i));
+    if W = 0 then W := Declared32Code(ArgsNode.GetChild(i));
     if W = 0 then W := OperandWidthCode(ArgsNode.GetChild(i));
     // ⛔ A SINGLE IS NOT IN THAT REGISTRY. OperandWidthCode answers the narrow-INTEGER width, and a
     // Single is tracked by its own predicate (IsSingleExpr) - which is why "h(As Single)" against
@@ -30751,6 +30905,11 @@ begin
     if (W >= 1) and (W <= 9) then Result := Result + Chr(Ord('0') + W)
     else if W = 10 then Result := Result + 'A'
     else if W = 11 then Result := Result + 'B'
+    // ⭐ The four 64-bit names, one code each - the half that did not exist (DIVERGENZE 8).
+    else if W = 12 then Result := Result + 'C'
+    else if W = 13 then Result := Result + 'D'
+    else if W = 14 then Result := Result + 'E'
+    else if W = 15 then Result := Result + 'G'
     else Result := Result + '-';
   end;
   for i := 1 to Length(Result) do
@@ -31100,6 +31259,37 @@ begin
   end;
 end;
 
+function TSSAGenerator.WidthTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
+// Does a call's WIDTH tail fit a declaration's? TypeTailMatchesWithWildcards' twin, one character per
+// parameter instead of one comma-separated name, and with the same rule: '-' on either side means
+// "nothing here says", which matches anything. An EMPTY tail is all placeholders (that is what
+// ArgWidthSigFromArgs and ProcSigFromParams both write when no parameter has a declared width), so it
+// fits everything - which is exactly the case this exists for.
+var
+  i: Integer;
+begin
+  Result := True;
+  if (CallTail = '') or (DeclTail = '') then Exit;
+  if Length(CallTail) <> Length(DeclTail) then Exit(False);
+  for i := 1 to Length(CallTail) do
+    if (CallTail[i] <> '-') and (DeclTail[i] <> '-') and (CallTail[i] <> DeclTail[i]) then Exit(False);
+end;
+
+function TSSAGenerator.SigConstPart(const Sig: string): string;
+// The CONST tail of a label's signature - what follows '!' up to the width tail - or '' when the
+// declaration has no const-qualified parameter. SigWidthPart's and SigBankPart's third sibling: the
+// label has three tails and, until this existed, only two of them could be read back off it.
+var
+  p, q: Integer;
+begin
+  Result := '';
+  p := Pos('!', Sig);
+  if p <= 0 then Exit;
+  Result := Copy(Sig, p + 1, MaxInt);
+  q := Pos('%', Result);
+  if q > 0 then Result := Copy(Result, 1, q - 1);
+end;
+
 function TSSAGenerator.SigWidthPart(const Sig: string): string;
 // The WIDTH tail of a label's signature - what follows '%' - or '' when the label carries none. The
 // mirror of SigBankPart, and it exists so the arity fallback can compare tails it cannot match exactly.
@@ -31190,6 +31380,136 @@ begin
     Result := FuncPtrTypeSig(UpperCase(FPreFuncRetType.Values[NameU]));
 end;
 
+function TSSAGenerator.ConvRankFacts(Code: Integer; out Kind, Wid, Sgn, Canon: Integer): Boolean;
+// The four facts fbc's implicit-conversion ranking is built on, read off the IDENTITY code
+// (DIVERGENZE 8). Kind: 0 integer, 1 floating. Wid: bits. Sgn: 1 signed, 0 unsigned. Canon: the
+// canonical order inside one (kind, width, sign) cell - 0 for INTEGER/UINTEGER, 1 for LONGINT/ULONGINT,
+// which is the only thing that separates those two pairs once every other fact agrees.
+// ⛔ Anything else answers FALSE and the ranking DECLINES on the whole call: a string, a UDT, a
+// pointer, a Boolean, an enum, or a type this pass simply cannot name. Declining leaves the call to
+// exactly the passes that were resolving it before, which is the direction that cannot regress.
+begin
+  Result := True;
+  Kind := 0; Wid := 64; Sgn := 1; Canon := 0;
+  case Code of
+    1:      begin Wid := 8;  Sgn := 1; end;                       // BYTE
+    2:      begin Wid := 8;  Sgn := 0; end;                       // UBYTE
+    3:      begin Wid := 16; Sgn := 1; end;                       // SHORT
+    4:      begin Wid := 16; Sgn := 0; end;                       // USHORT
+    5, 9:   begin Wid := 32; Sgn := 1; end;                       // LONG, INT32 (same width and sign)
+    6, 10:  begin Wid := 32; Sgn := 0; end;                       // ULONG, UINT32
+    7:      begin Kind := 1; Wid := 32; Sgn := 1; end;            // SINGLE
+    12:     begin Wid := 64; Sgn := 1; Canon := 0; end;           // INTEGER
+    13:     begin Wid := 64; Sgn := 1; Canon := 1; end;           // LONGINT
+    14:     begin Wid := 64; Sgn := 0; Canon := 0; end;           // UINTEGER
+    15:     begin Wid := 64; Sgn := 0; Canon := 1; end;           // ULONGINT
+    16:     begin Kind := 1; Wid := 64; Sgn := 1; end;            // DOUBLE
+  else
+    Result := False;
+  end;
+end;
+
+function TSSAGenerator.ConvRankCost(ArgCode, CandCode: Integer): Int64;
+// What fbc charges for converting an argument of ArgCode into a parameter of CandCode. Lower is
+// better; -1 means "not rankable", and then the caller declines.
+//
+// ⭐⭐ THE RULE IS MEASURED, NOT DEDUCED. A 12x12 matrix was taken from the oracle - for each argument
+// type, the twelve candidates were offered together and the winner removed until the list was empty,
+// giving fbc's own preference ORDER for that argument - and then reversed (the declarations offered
+// in the opposite order) to prove the answer is not "the first declaration": 12 rows of 12, identical
+// both ways. This function reproduces all 12 rows. The keys, most significant first:
+//   1) the EXACT type wins outright;
+//   2) the KIND: an integer argument takes every integer candidate before any floating one, and a
+//      floating argument every floating one first - "f( As Long )" beats "f( As Double )" for an
+//      Integer argument even though Double loses no value and Long does;
+//   3) the WIDTH CLASS: same width, then WIDER, then NARROWER - fbc prefers a lossless widening;
+//   4) the DISTANCE inside that class, nearest first;
+//   5) the SIGN, agreeing before differing;
+//   6) the argument's own signed/unsigned PARTNER (Integer<->UInteger, LongInt<->ULongInt, ...), which
+//      is what puts ULongInt ahead of UInteger for a LongInt argument and UInteger ahead of ULongInt
+//      for an Integer one;
+//   7) the canonical order, INTEGER before LONGINT and UINTEGER before ULONGINT.
+//
+// ⛔ THE FIELDS ARE WEIGHTED SO THAT ADDING UP TO EIGHT ARGUMENTS CANNOT CARRY BETWEEN THEM: each
+// weight is larger than the largest total everything below it can reach, so the sum of per-argument
+// costs compares exactly as the vector of per-argument fields does. That is the model for a call with
+// several arguments, and it is DECLARED rather than measured: the oracle answers "ambiguous" for the
+// mixed cases that would separate two models, and a tie here declines.
+var
+  AK, AW, AS_, AC, CK, CW, CS, CC: Integer;
+  WideCls, Dist, SignDif, NotPair: Integer;
+begin
+  Result := -1;
+  if not ConvRankFacts(ArgCode, AK, AW, AS_, AC) then Exit;
+  if not ConvRankFacts(CandCode, CK, CW, CS, CC) then Exit;
+  if (AK = CK) and (AW = CW) and (AS_ = CS) and (AC = CC) then Exit(0);   // the exact type
+  if CW = AW then begin WideCls := 0; Dist := 0; end
+  else if CW > AW then begin WideCls := 1; Dist := CW - AW; end
+  else begin WideCls := 2; Dist := AW - CW; end;
+  if CS = AS_ then SignDif := 0 else SignDif := 1;
+  // The signed/unsigned PARTNER of the argument's own type: same kind, same width, same canonical
+  // order, the other sign. Written as a comparison rather than a table, because that IS the pairing.
+  if (CK = AK) and (CW = AW) and (CC = AC) and (CS <> AS_) then NotPair := 0 else NotPair := 1;
+  Result := Int64(1) shl 37;                                  // not the exact type
+  if CK <> AK then Result := Result + (Int64(1) shl 30);      // a different KIND
+  Result := Result + Int64(WideCls) * (Int64(1) shl 22);
+  Result := Result + Int64(Dist) * 4096;
+  Result := Result + Int64(SignDif) * 256;
+  Result := Result + Int64(NotPair) * 16;
+  Result := Result + Int64(CC);
+end;
+
+function TSSAGenerator.ArgRankCode(Node: TASTNode): Integer;
+// The ranking's view of ONE argument: its IDENTITY code, or 0 when nothing here can name its type.
+// ⭐ A LITERAL IS TYPED, and the oracle says so: an integer literal ranks exactly as an INTEGER
+// argument ("f_(1)" against f_(As LongInt) declared first and f_(As Integer) second answers Integer,
+// not the first declaration) and a float literal exactly as a DOUBLE.
+begin
+  Result := 0;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  Result := DeclaredIdentCode(Node);
+  if Result <> 0 then Exit;
+  if Node.NodeType = antLiteral then
+  begin
+    if VarIsStr(Node.Value) or ((Node.Token <> nil) and (Node.Token.TokenType = ttStringLiteral)) then Exit(0);
+    if VarIsFloat(Node.Value) then Exit(16) else Exit(12);
+  end;
+  // A SINGLE has no entry in the narrowing registry outside MODERN, and its own predicate is what the
+  // width tail already asks in the same position.
+  if IsSingleExpr(Node) then Result := 7;
+end;
+
+function TSSAGenerator.LabelRankCost(const Lbl: string; ArgsNode: TASTNode; out Cost: Int64): Boolean;
+// The total conversion cost of calling the declaration behind Lbl with these arguments. FALSE when the
+// candidate is not rankable at all - a different arity, a parameter type this ranking cannot name, or
+// a declaration with no parameter list - and then the whole ranking declines.
+var
+  Decl, PL, PN: TASTNode;
+  i, N, ArgC, ParC: Integer;
+  One: Int64;
+begin
+  Result := False;
+  Cost := 0;
+  if ArgsNode = nil then N := 0 else N := ArgsNode.ChildCount;
+  if N > 8 then Exit;                                   // the weights carry no further; decline
+  if not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  PL := Decl.GetChild(1);
+  if (PL = nil) or (PL.NodeType <> antParameterList) or (PL.ChildCount <> N) then Exit;
+  for i := 0 to N - 1 do
+  begin
+    PN := PL.GetChild(i);
+    if (PN = nil) or (PN.ChildCount < 1) or (PN.GetChild(0).NodeType <> antIdentifier) then Exit;
+    ParC := TypeNameIdentCode(UpperCase(VarToStr(PN.GetChild(0).Value)));
+    ArgC := ArgRankCode(ArgsNode.GetChild(i));
+    One := ConvRankCost(ArgC, ParC);
+    if One < 0 then Exit;
+    Cost := Cost + One;
+  end;
+  Result := True;
+end;
+
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
 // Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
 // test settles every non-overloaded program and this costs nothing. An overload set has no bare label
@@ -31207,6 +31527,9 @@ var
   k, j, Extra, BestExtra: Integer;
   DeclN, ParamsN: TASTNode;
   OkDef: Boolean;
+  RankCost, BestCost: Int64;
+  Phase: Integer;
+  Pref2: string;
 
   // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
   function WidthTailLabel(const WT: string): string;
@@ -31246,7 +31569,7 @@ begin
     // member read identically without them.
     for k := 0 to FProcedureNames.Count - 1 do
       if Copy(FProcedureNames[k], 1, Length(BaseLabel) + 1) = BaseLabel + '~' then
-        WriteLn(ErrOutput, 'OVL:   cand ', FProcedureNames[k]);
+        WriteLn(ErrOutput, 'OVL:   cand ', FProcedureNames[k], ' decl=', FProcDecls.ContainsKey(FProcedureNames[k]));
   end;
   // ⭐ THE DECLARED WIDTH FIRST, when there is one. It is the only thing that tells "g(As Long)" from
   // "g(As Integer)": both sign the bank 'I', so before this the two collided and the FIRST declaration
@@ -31325,6 +31648,51 @@ begin
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
   Pref := BaseLabel + '~';
+  // ⭐⭐ ...AND A '-' IN THE CALL'S WIDTH TAIL MEANS "UNKNOWN" TOO, which is the same doctrine the type
+  // tail gets one pass below and the width tail did not have. It is asked exactly HERE, in the slot the
+  // bare "BaseLabel~Sig" key used to answer from, because that is what this replaces: giving the four
+  // 64-bit names one width character each (DIVERGENZE 8) moved "Function hexa( As LongInt )" from the
+  // label "HEXA~I" to "HEXA~I%D", and a call whose argument has no declared width - a literal, a typed
+  // CONST - could no longer spell it. It then fell PAST the numeric member onto a candidate with a TYPE
+  // tail, and fbc's own overload/integer_width answered 1 for "hexa(0ull)" where it answers 2,
+  // overload/const_enum the enum overload where it answers the integer one, and our own m849 lost a
+  // "ByRef As Const T" overload to its non-const twin. ⇒ *Giving a label a finer key is only half the
+  // change; the other half is every call site that could spell the coarse one.*
+  //
+  // TWO PHASES, and the order is the whole of it:
+  //   0) only candidates that name NO type - so "proc( i )" against an ENUM overload and an INTEGER one
+  //      takes the integer member, which is what fbc answers, instead of reading the enum's type tail
+  //      as a wildcard match and calling the pair ambiguous;
+  //   1) then any candidate, its type tail matched with the same wildcards the pass below uses.
+  // ⛔ The CONST tail is matched EXACTLY (an empty tail means "no const parameter", which is a fact, not
+  // an unknown): that is the one distinction "ByRef As T" / "ByRef As Const T" rests on, and matching it
+  // loosely would hand a const argument to the non-const overload - m849's group 3.
+  // ⛔ A width position the call DOES know must match exactly, or an "f(As Byte)/f(As Short)" pair would
+  // be decided here instead of by the ranking below.
+  // ⛔ Only when it is the ONLY candidate that fits: a tie is left to the ranking, as everywhere else.
+  if Length(Sig) > 0 then
+  begin
+    if ConstSig <> '' then Tail := ConstSig else Tail := StringOfChar('-', Length(Sig));
+    for Phase := 0 to 1 do
+    begin
+      Cand := '';
+      for k := 0 to FProcedureNames.Count - 1 do
+        if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+        begin
+          LegacySig := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+          if SigBankPart(LegacySig) <> Sig then Continue;
+          if (Phase = 0) and (SigNamePart(LegacySig) <> '') then Continue;
+          if (Phase = 1) and (not TypeTailMatchesWithWildcards(UdtSig, SigNamePart(LegacySig))) then Continue;
+          if SigConstPart(LegacySig) = '' then Pref2 := StringOfChar('-', Length(Sig))
+          else Pref2 := SigConstPart(LegacySig);
+          if Pref2 <> Tail then Continue;
+          if not WidthTailMatchesWithWildcards(WidthSig, SigWidthPart(LegacySig)) then Continue;
+          if Cand <> '' then begin Cand := ''; Break; end;   // ambiguous: leave it to the ranking
+          Cand := FProcedureNames[k];
+        end;
+      if Cand <> '' then Exit(Cand);
+    end;
+  end;
   // ⭐ A '-' IN THE CALL'S TYPE TAIL MEANS "UNKNOWN", NOT "NONE". The tail is positional and the
   // declaration fills every position it can name (a by-value UDT, an enum, a pointer type); the call
   // site fills the ones it can DERIVE. Where it cannot, an exact comparison finds nothing and the call
@@ -31346,6 +31714,31 @@ begin
       end;
     if Cand <> '' then Exit(Cand);
   end;
+  // ⭐⭐ THE CONVERSION RANKING (DIVERGENZE 8). Everything above this line is an EXACT match of one
+  // spelling or another; below it the passes take "the first candidate that fits", which is where the
+  // wrong overload lives. fbc does neither: it RANKS the implicit conversions and takes the cheapest.
+  // The rule is measured (see ConvRankCost) and reproduces a 12x12 preference matrix taken from the
+  // oracle in both declaration orders.
+  // ⛔ IT DECLINES ON A TIE, and on anything it cannot rank - a string, a UDT, a pointer, an enum, a
+  // Boolean, a different arity. A call it declines takes exactly the path it took before, so this pass
+  // can only ever move a call that the fallbacks below would have decided by DECLARATION ORDER.
+  // ⛔⛔ AND IT SITS ABOVE THE "not a record" PASS, NOT BELOW IT, which the deck settled: that pass is
+  // itself a "take the first that fits", so with the ranking underneath it "f_(v)" against
+  // f_(As Byte) / f_(As Short) still answered Byte where fbc answers Short. The two cannot collide:
+  // a record parameter has no rank at all (a UDT name has no identity code), so every call 157 exists
+  // for is one this pass DECLINES on, and it reaches that pass exactly as it did.
+  Cand := '';
+  BestCost := -1;
+  OkDef := False;                                  // OkDef: the best cost is shared -> ambiguous
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
+    if not LabelRankCost(FProcedureNames[k], ArgsNode, RankCost) then begin Cand := ''; Break; end;
+    if (BestCost < 0) or (RankCost < BestCost) then
+    begin BestCost := RankCost; Cand := FProcedureNames[k]; OkDef := False; end
+    else if RankCost = BestCost then OkDef := True;
+  end;
+  if (Cand <> '') and (not OkDef) then Exit(Cand);
   // ⭐⭐ ...AND A NUMBER IS NOT A RECORD, which is the one thing the bank part cannot say (DIVERGENZE
   // 157). Every UDT is an int handle, so "Operator T.Let( ByRef As T )" and "Operator T.Let( ByVal As
   // Long )" both sign the bank 'I', the call "b = 3" names no type at all, and the fallback below took
