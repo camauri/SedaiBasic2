@@ -286,6 +286,12 @@ same limit applies to reading a UDT as raw bytes.
   and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
+- ⚠️ **`Print` of a `WString` writes UTF-8, FreeBASIC writes its code units.** Sent to a redirected
+  stream, `Print wstr("AB")` gives `41 42` here and `41 00 00 00 42 00 00 00` in FreeBASIC — four bytes
+  per character, unconverted. Everything a program can *observe about the value* agrees (`Len`, `Asc`,
+  `Instr`, `Mid`, a comparison, a binary `Put`); it is only the bytes that reach the stream that differ,
+  and ours are the text a reader expects. Measured 6 September 2026.
+
 - **The address of a `Str` / `Chr` / `WStr` / `WChr` temporary needs a COMPILE-TIME CONSTANT**, as in
   FreeBASIC: `@str(123)`, `@chr(64+1)`, `@wstr("a" + "b")`, `@str(SizeOf(Integer))`, `@chr(Asc("A"))`
   and the same over a `Const`, a `#define` or an `Enum` member all answer the address of a static
