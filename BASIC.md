@@ -286,6 +286,13 @@ same limit applies to reading a UDT as raw bytes.
   and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
+- ⚠️ **A TEMPORARY operand passes through `Operator Let` once here, twice in FreeBASIC.** With
+  `Operator T.Let( ByRef rhs As T )` declared, `a = b` runs it once on both; `a = b + b`, whose operand
+  is the result of an operator and therefore a temporary, runs it **twice** in FreeBASIC and once here —
+  FreeBASIC materialises an extra temporary and copies through it. Any copy-assignment operator (which
+  is what one is for) gives the same value either way; only an operator with an accumulating side effect
+  — a counter, a log — can tell. Measured 6 September 2026.
+
 - ⚠️ **`Print` of a `WString` writes UTF-8, FreeBASIC writes its code units.** Sent to a redirected
   stream, `Print wstr("AB")` gives `41 42` here and `41 00 00 00 42 00 00 00` in FreeBASIC — four bytes
   per character, unconverted. Everything a program can *observe about the value* agrees (`Len`, `Asc`,

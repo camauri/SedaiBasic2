@@ -726,6 +726,9 @@ type
     function DeclaredPointerTypeOfArg(Node: TASTNode): string;  // the declared "T PTR" type of an argument, or ''
     function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
     function SigBankPart(const Sig: string): string;
+    function ArgIsSurelyNotRecord(Node: TASTNode): Boolean;
+    function ArgNotRecordMask(ArgsNode: TASTNode): string;
+    function TypeTailWantsARecordWhere(const DeclTail, NotRecMask: string): Boolean;
     function SigNamePart(const Sig: string): string;   // the type-name tail of a label signature
     function TypeTailMatchesWithWildcards(const CallTail, DeclTail: string): Boolean;
     function SigWidthPart(const Sig: string): string;   // ...and the WIDTH tail after '%'            // the bank chars of a signature = its parameter count
@@ -30877,6 +30880,71 @@ begin
   Result := '';                                             // all placeholders: no tail, as declared
 end;
 
+function TSSAGenerator.ArgIsSurelyNotRecord(Node: TASTNode): Boolean;
+// Can this argument be said, WITHOUT GUESSING, not to be a record instance? (DIVERGENZE 157.)
+//
+// ⛔ It is the question ArgUdtSigFromArgs cannot answer. That tail writes '-' for every argument whose
+// type it could not NAME, and '-' means "unknown" - so a plain "3" and a record this pass failed to
+// identify are written the same way, and the resolver's last fallback (bank part only, first match)
+// then hands an INTEGER to a parameter declared "ByRef As T", because a record IS an int handle.
+// ⇒ This is the small, FINISHABLE half of that question: a numeric or string LITERAL is not a record,
+// and neither is a DECLARED variable that no registry calls a record, a pointer or an enum. Everything
+// else answers FALSE, which is what leaves today's resolution untouched.
+var
+  NameU: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType = antLiteral then Exit(True);
+  if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
+  begin
+    NameU := UpperCase(VarToStr(Node.Value));
+    if NameU = '' then Exit;
+    if not IsDeclaredName(NameU) then Exit;              // an undeclared name says nothing
+    if VarRecordTypeName(NameU) <> '' then Exit;
+    if DeclaredPointerTypeOfArg(Node) <> '' then Exit;
+    if EnumTypeOfOperand(Node) <> '' then Exit;
+    if ObjectTypeName(Node) <> '' then Exit;
+    Result := True;
+  end;
+end;
+
+function TSSAGenerator.ArgNotRecordMask(ArgsNode: TASTNode): string;
+// One character per argument: 'B' where ArgIsSurelyNotRecord says so, '?' everywhere else.
+var
+  i: Integer;
+begin
+  Result := '';
+  if ArgsNode = nil then Exit;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+    if ArgIsSurelyNotRecord(ArgsNode.GetChild(i)) then Result := Result + 'B'
+    else Result := Result + '?';
+end;
+
+function TSSAGenerator.TypeTailWantsARecordWhere(const DeclTail, NotRecMask: string): Boolean;
+// Does this declaration's type tail name a RECORD type at a position the call site knows is not one?
+// A tail of a different length is not comparable and answers False - the tail is positional.
+var
+  L: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  if (DeclTail = '') or (NotRecMask = '') then Exit;
+  L := TStringList.Create;
+  try
+    L.Delimiter := ',';
+    L.StrictDelimiter := True;
+    L.DelimitedText := DeclTail;
+    if L.Count <> Length(NotRecMask) then Exit;
+    for i := 0 to L.Count - 1 do
+      if (NotRecMask[i + 1] = 'B') and (L[i] <> '-') and (L[i] <> '') and (FindUDT(L[i]) >= 0) then
+        Exit(True);
+  finally
+    L.Free;
+  end;
+end;
+
 function TSSAGenerator.SigNamePart(const Sig: string): string;
 // The TYPE-NAME tail of a label's signature - what stands between ':' and the next tail marker - or ''
 // when the label carries none. The mirror of SigBankPart and SigWidthPart.
@@ -31118,7 +31186,7 @@ function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTN
 //      count is the length of the BANK part: the type tail must not be mistaken for more parameters.
 // Returns '' when nothing matches, and the caller reports it as before.
 var
-  Sig, UdtSig, ConstSig, WidthSig, LegacySig, Pref, Cand, Tail: string;
+  Sig, UdtSig, ConstSig, WidthSig, LegacySig, Pref, Cand, Tail, NotRecMask: string;
   k, j, Extra, BestExtra: Integer;
   DeclN, ParamsN: TASTNode;
   OkDef: Boolean;
@@ -31258,6 +31326,30 @@ begin
         if not TypeTailMatchesWithWildcards(UdtSig, SigNamePart(Tail)) then Continue;
         if Cand <> '' then begin Cand := ''; Break; end;   // ambiguous: leave it to the fallback
         Cand := FProcedureNames[k];
+      end;
+    if Cand <> '' then Exit(Cand);
+  end;
+  // ⭐⭐ ...AND A NUMBER IS NOT A RECORD, which is the one thing the bank part cannot say (DIVERGENZE
+  // 157). Every UDT is an int handle, so "Operator T.Let( ByRef As T )" and "Operator T.Let( ByVal As
+  // Long )" both sign the bank 'I', the call "b = 3" names no type at all, and the fallback below took
+  // whichever was DEFINED FIRST: with the UDT one first, the literal 3 was passed as a record handle
+  // and its first field read was an Access violation - reported by a user on a 2 200-line decimal
+  // float library, where the Let overloads are declared builtin-first and DEFINED udt-first.
+  // ⛔ Asked only where the call site can say "not a record" without guessing, and it only ever moves a
+  // call that would otherwise have taken a record parameter for such an argument: when this pass finds
+  // nothing, the fallback below runs exactly as it did.
+  NotRecMask := ArgNotRecordMask(ArgsNode);
+  if Pos('B', NotRecMask) > 0 then
+  begin
+    Cand := '';
+    for k := 0 to FProcedureNames.Count - 1 do
+      if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+      begin
+        Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+        if SigBankPart(Tail) <> Sig then Continue;
+        if TypeTailWantsARecordWhere(SigNamePart(Tail), NotRecMask) then Continue;
+        Cand := FProcedureNames[k];
+        Break;
       end;
     if Cand <> '' then Exit(Cand);
   end;
@@ -43874,7 +43966,8 @@ var
   BitUnit: TSSAValue;
   Bank: TSSARegisterType;
   FixWide: Boolean;
-  HandleVal, ExprVal, DummyVal: TSSAValue;
+  HandleVal, ExprVal, DummyVal, NestSrcH, NestDstH: TSSAValue;
+  NestSrcT: string;
   Op: TSSAOpCode;
   SetterArgs, StoreAssign: TASTNode;
 begin
@@ -43955,6 +44048,41 @@ begin
     Exit;
   end;
 
+  // ⛔⛔ A NESTED UDT FIELD OWNS ITS OWN RECORD, so "obj.f = <a record>" COPIES INTO IT - it must never
+  // store the source's HANDLE. EmitRecordInit gives every nested field a record of its own at
+  // construction, and storing a handle over that slot makes the field ALIAS the source: the two are
+  // then one object, and when the source is a procedure LOCAL its slot is recycled at frame exit, so
+  // the field silently becomes whatever record is allocated next.
+  // ⇒ Reported by a user on a 2 200-line decimal float library: "Operator T.Let( ByVal As Long )" whose
+  // body is "this.num = si2fp( rhs )" left x.num aliasing a dead temporary, and an unrelated
+  // "Dim As decfloat_struct ip" three lines later took the same slot - x read 0, and writing ip wrote
+  // into x. The assignment path had this right all along (TryRecordCopyAssign); only the MEMBER
+  // destination did not, which is the shape this file records over and over.
+  // ⭐ Nothing new is built: EmitRecordCopy already deep-copies a nested member, loading both handles
+  // out of the slot exactly as these three lines do.
+  // ⚠️ SAME TYPE only. A source of another type is a conversion (the "Operator Cast() As <dest>" chain
+  // TryRecordCopyAssign runs), and a non-record source is not this shape at all; both keep the path
+  // they had.
+  if (NestedT <> '') and (FindUDT(NestedT) >= 0) then
+  begin
+    NestSrcT := '';
+    if ResolveRecordObject(ExprNode, NestSrcH, NestSrcT) then
+    else
+    begin
+      NestSrcT := ObjectTypeName(ExprNode);
+      if (NestSrcT <> '') and (UpperCase(NestSrcT) = UpperCase(NestedT)) then
+        ProcessExpression(ExprNode, NestSrcH)
+      else
+        NestSrcT := '';
+    end;
+    if (NestSrcT <> '') and (UpperCase(NestSrcT) = UpperCase(NestedT)) then
+    begin
+      NestDstH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, NestDstH, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      EmitRecordCopy(NestDstH, EnsureIntRegister(NestSrcH), FindUDT(NestedT));
+      Exit;
+    end;
+  end;
   ProcessExpression(ExprNode, ExprVal);
   // B1.5: a field declared with a narrow integer type or SINGLE wraps/rounds the value on store.
   case Bank of
