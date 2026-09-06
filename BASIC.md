@@ -304,11 +304,21 @@ same limit applies to reading a UDT as raw bytes.
   is what one is for) gives the same value either way; only an operator with an accumulating side effect
   — a counter, a log — can tell. Measured 6 September 2026.
 
-- ⚠️ **`Print` of a `WString` writes UTF-8, FreeBASIC writes its code units.** Sent to a redirected
-  stream, `Print wstr("AB")` gives `41 42` here and `41 00 00 00 42 00 00 00` in FreeBASIC — four bytes
-  per character, unconverted. Everything a program can *observe about the value* agrees (`Len`, `Asc`,
-  `Instr`, `Mid`, a comparison, a binary `Put`); it is only the bytes that reach the stream that differ,
-  and ours are the text a reader expects. Measured 6 September 2026.
+- ⚠️ **A `WString` printed to a REDIRECTED console channel is text here and code units in FreeBASIC.**
+  The scope is narrow, and measured over seven forms on 6 September 2026:
+  - **to a FILE the two agree exactly**, in all three encodings — `Print #1, wstr("AB")` writes
+    `41 42 0A` on both, `Encoding "utf8"` writes `EF BB BF 41 42 0A`, `Encoding "utf16"` writes
+    `FF FE 41 00 42 00 0A 00`;
+  - **on a terminal the text is the same** — FreeBASIC writes `ESC%G` + the characters in UTF-8 +
+    `ESC%@`, switching the terminal to UTF-8 and back around the same bytes SedaiBasic writes;
+  - only the **console channel with no console attached** — `Print w` redirected to a pipe or a file —
+    differs: `41 42` here, `41 00 00 00 42 00 00 00` there.
+
+  That last one is not a rule of the language but what FreeBASIC's console layer does when it has no
+  console to negotiate a charset with; the same value from the same program reaches a *file* as text.
+  Reproducing it would make every redirected `Print` of a wide value emit binary, so SedaiBasic writes
+  the text instead — and says so here. Everything a program can *observe about the value* agrees
+  (`Len`, `Asc`, `Instr`, `Mid`, a comparison, a binary `Put`).
 
 - **The address of a `Str` / `Chr` / `WStr` / `WChr` temporary needs a COMPILE-TIME CONSTANT**, as in
   FreeBASIC: `@str(123)`, `@chr(64+1)`, `@wstr("a" + "b")`, `@str(SizeOf(Integer))`, `@chr(Asc("A"))`
