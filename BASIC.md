@@ -286,6 +286,17 @@ same limit applies to reading a UDT as raw bytes.
   and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
+- ⚠️ **The `OPTION` statement is refused in the FreeBASIC dialect, and that is FreeBASIC's own rule.**
+  Measured over all eleven forms — `EXPLICIT`, `BASE`, `DYNAMIC`, `STATIC`, `ESCAPE`, `NOKEYWORD`,
+  `PRIVATE`, `BYVAL`, `BYREF`, `GOSUB`, `NOGOSUB` — fbc answers *error 146: Only valid in -lang
+  deprecated or fblite or qb* for every one of them in `-lang fb`. SedaiBasic used to accept them all
+  and act on none, which is a silent lie: a program writing `Option Explicit` got no checking and no
+  word about it. **Two exemptions, both SedaiBasic's own**: `OPTION DIGITS` (no FreeBASIC equivalent)
+  and `OPTION BASE` (the QuickBASIC idiom), which stay accepted and keep working. A source that asks
+  for another dialect — `#lang "fblite"` — keeps every `OPTION`, because fbc compiles it there; the
+  ones whose *semantics* SedaiBasic does not implement (`ByVal`/`ByRef`'s default passing mode,
+  `Dynamic`'s array storage class) still parse and stay inert, which is the declared limit below.
+
 - ⚠️ **A TEMPORARY operand passes through `Operator Let` once here, twice in FreeBASIC.** With
   `Operator T.Let( ByRef rhs As T )` declared, `a = b` runs it once on both; `a = b + b`, whose operand
   is the result of an operator and therefore a temporary, runs it **twice** in FreeBASIC and once here —
@@ -437,13 +448,16 @@ same limit applies to reading a UDT as raw bytes.
   `Lt_0001` where fbc starts at `Lt_0002`, its own label counter having already spent one. The
   manual's `defines/fbuniqueid` prints its values under the heading *"Compiler output example"*, and
   matching another compiler's private counter is not compatibility.
-- ⛔ **`INP` / `OUT` / `WAIT` ARE NOT IMPLEMENTED.** They parse, they evaluate their operands, and
-  they do nothing: `INP` always answers **-8**, `OUT` never writes, `WAIT` returns at once. The value
-  is not arbitrary — it is what `fbc` itself answers where the OS denies port access, and the
-  negation of its runtime error 8 (*No privileges*) — but answering it is **not the same as reading a
-  port**, and this entry exists so that nobody reads the matching output as a working implementation.
-  Where the OS *does* grant access (Windows with the driver `fbc` installs, Linux as root) `fbc`
-  reads real hardware and we still answer -8.
+- ⚠️ **`INP` / `OUT` / `WAIT` answer exactly what FreeBASIC answers here, and that is measured.**
+  `INP` always gives **-8**, `OUT` performs no write and faults on nothing, `WAIT` returns at once —
+  and so does `fbc`'s own binary on this platform, byte for byte over ten forms (four low ports,
+  `&h3F8`, `&hFFFF`, a write-then-read round trip on two ports, `WAIT` with a mask, `WAIT` with a mask
+  and an XOR). The value is not arbitrary: it is the negation of runtime error 8 (*No privileges*),
+  which is what an unprivileged process gets. So on Linux this is **not a divergence** — it is what
+  the oracle does.
+  ⛔ **It is still not an implementation**, and the distinction matters where the OS *does* grant
+  access (Windows with the driver `fbc` installs, Linux as root): there `fbc` reads real hardware and
+  we would still answer -8.
   🟡 **Open decision, deliberately not taken**: implement them somehow, or withdraw the keywords so a
   program cannot silently use something inert. Two things bear on it:
   - `INP`/`OUT` are the **x86** `in`/`out` instructions. On ARM — a Raspberry Pi, an RP2040 — there is
@@ -2671,9 +2685,9 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `OPTION DYNAMIC` | ✓ | Forces arrays to be defined as variable-length arrays. |
+| `OPTION DYNAMIC` | ⚠️ | **Refused in the FreeBASIC dialect, as fbc refuses it** (*error 146: Only valid in -lang deprecated or fblite or qb*) — the `OPTION` statement is not part of `-lang fb`. Accepted, and inert, in a source that declares another dialect with `#lang "fblite"`, and in CLASSIC. See *Declared divergences*. |
 | `'$DYNAMIC` | ✓ | Advisory metacommand, accepted and ignored (REDIM works regardless of array storage class). |
-| `OPTION STATIC` | ✓ | Reverts a previous OPTION DYNAMIC command. |
+| `OPTION STATIC` | ⚠️ | Refused in the FreeBASIC dialect, exactly as `OPTION DYNAMIC` above. |
 | `'$STATIC` | ✓ | Advisory metacommand, accepted and ignored. |
 | `DIM` | ✓ | Defines any type of array. Supports `lo TO hi` bounds (incl. negative), positional initializers `= { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (`UBOUND = -1` until `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` sized from the initializer. |
 | `REDIM` | ✓ | Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional; each existing dimension's lower bound is kept. If the array was not DIM'd first, REDIM declares it as a fresh dynamic array (honouring the element type and any `lb TO ub` bounds). A multi-dim REDIM'd array computes its element strides at runtime. |
