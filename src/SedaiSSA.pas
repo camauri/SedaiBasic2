@@ -21682,6 +21682,7 @@ procedure TSSAGenerator.EmitUsingFields(FmtNode: TASTNode; const ValNodes: array
   written in exactly that shape produced four tables of phantom "divergences".
   ⇒ Two spellings of one feature want one implementation, not two. }
 var
+  ErrZeroReg: TSSAValue;   // PRINT USING starts its format before its items (DIVERGENZE 46)
   i, vi, fi, fLen, W, nVals, PassStart: Integer;
   FmtStr, FieldStr: string;
   FormatVal, ValueVal, FormatReg, ValueReg, FmtReg, TmpReg: TSSAValue;
@@ -21801,6 +21802,22 @@ begin
   NoneV := MakeSSAValue(svkNone);
   nVals := Length(ValNodes);
   if nVals = 0 then Exit;
+
+  // ⭐⭐ PRINT USING STARTS ITS FORMAT BEFORE IT EVALUATES ITS ITEMS, and the only thing that can see
+  // that is Err (DIVERGENZE 46). fbc lowers the statement to "start the format" followed by one call
+  // per value, so the start's Err write lands BEFORE the first item is computed: "Print Using "###";
+  // Err" answers 0 there, and so does "Print Using "###"; g()" with a g that returns Err - which is
+  // the probe that settles it, because a literal Err could be explained by folding.
+  // ⛔ Here the item is lowered FIRST and the write lives in the print opcode's arm, one instruction
+  // too late, and no arm can fix an order decided at lowering. So the start is emitted explicitly -
+  // with the very instruction "Err = 0" uses, so the two spellings share one arm and cannot drift.
+  // ⛔ MODERN only: in CLASSIC that field is ER and what DS$ reports, and PRINT never touches it.
+  if FModernMode then
+  begin
+    ErrZeroReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, ErrZeroReg, MakeSSAConstInt(0), NoneV, NoneV);
+    EmitInstruction(ssaRaiseError, NoneV, ErrZeroReg, NoneV, MakeSSAConstInt(1));
+  end;
 
   if (FmtNode.NodeType = antLiteral) and VarIsStr(FmtNode.Value) then
   begin
