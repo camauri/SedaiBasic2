@@ -35,10 +35,10 @@ open work, and it is measured elsewhere: the manual-example sweep and FreeBASIC'
 ⚠️ Read the headline as a *compatibility measure*, not a completion score: MODERN is SedaiBasic's own
 dialect, and it says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists.
 
-### How each keyword BEHAVES — the two nets that measure it (1 Sep 2026)
+### How each keyword BEHAVES — the two nets that measure it (6 Sep 2026)
 
 **The FreeBASIC manual's own examples**, compiled and run side by side with `fbc` and diffed:
-**545 match** byte for byte, **3 differ** (all three declared below), 15 are missing a feature that is
+**546 match** byte for byte, **3 differ** (all three declared below), 14 are missing a feature that is
 structural here, 10 declare another dialect.
 
 **FreeBASIC's own test suite** — 2 466 files, at the tag matching the oracle. It answers three
@@ -47,8 +47,8 @@ different questions and they do not add up, so they are kept apart:
 | question | today |
 |---|---|
 | accept what `fbc` accepts | **319 / 320** |
-| of the runtime tests, pass EVERY assertion | **427 / 655** |
-| reject what `fbc` rejects | **572 / 1 238** |
+| of the runtime tests, pass EVERY assertion | **431 / 655** |
+| reject what `fbc` rejects | **586 / 1 238** |
 
 ⛔ **There is no single percentage here, and one must not be invented.** The suite's own target is one
 executable that exits 0 only if every assertion of every test holds, so a sum of "passes" and "runs but
@@ -1900,6 +1900,30 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `SINGLE` | ✓ | Assignments round to true single precision (held in the Double bank) (B1.5). |
 | `DOUBLE` | ✓ | 64-bit real type. |
+
+##### Arbitrary-precision integer (SedaiBasic extension)
+
+| Keyword | Status | Description |
+|---|---|---|
+| `BIGINT` | ~ | **A SedaiBasic extension — FreeBASIC has no such type**, so a program using it is not `fbc` source. An integer of unbounded size: `Dim As BigInt a = "123456789012345678901234567890"` (from a decimal string, sign allowed) or from an ordinary integer. Exact at any magnitude — `60!` and `a*a*a` come out to their full digit count. |
+
+⚠️ **`BigInt` is a SCALAR with four operations, and the limits are real** (measured 6 September 2026).
+What works: `+` `-` `*` `\` `Mod`, and `/`, which divides like `\` (there is no rational result);
+comparisons; mixed operands with `Integer` and with numeric literals; `Str()`, `CInt()`, `Val()`.
+
+What does **not** work yet, each an open piece of work:
+
+| Form | Answers | Should |
+|---|---|---|
+| `-b` — unary minus on a variable | `0` | the negation. ⚠️ `0 - b` is correct, so only the unary form is missing |
+| `b ^ 3` | `0` | the power |
+| `Abs(b)`, `Sgn(b)` | `1` | the value / the sign |
+| an ARRAY element (`Dim As BigInt a(2)`) | `0` | the value |
+| a UDT FIELD (`v As BigInt`) | `1` | the value |
+| `CDbl(b)` | `0` | the value as a Double |
+
+⇒ The cut is clean: a `BigInt` lives in a scalar variable and does not yet have a place in an array,
+in a record, or in the numeric builtins. Keep one in a plain `Dim` until those close.
 
 ##### Boolean types
 
