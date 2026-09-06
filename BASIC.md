@@ -35,7 +35,7 @@ open work, and it is measured elsewhere: the manual-example sweep and FreeBASIC'
 ⚠️ Read the headline as a *compatibility measure*, not a completion score: MODERN is SedaiBasic's own
 dialect, and it says how much FreeBASIC code runs here unchanged — not how much of SedaiBasic exists.
 
-### How each keyword BEHAVES — the two nets that measure it (6 Sep 2026)
+### How each keyword BEHAVES — the two nets that measure it (7 Sep 2026)
 
 **The FreeBASIC manual's own examples**, compiled and run side by side with `fbc` and diffed:
 **546 match** byte for byte, **3 differ** (all three declared below), 14 are missing a feature that is
@@ -47,7 +47,7 @@ different questions and they do not add up, so they are kept apart:
 | question | today |
 |---|---|
 | accept what `fbc` accepts | **319 / 320** |
-| of the runtime tests, pass EVERY assertion | **431 / 655** |
+| of the runtime tests, pass EVERY assertion | **435 / 655** |
 | reject what `fbc` rejects | **586 / 1 238** |
 
 ⛔ **There is no single percentage here, and one must not be invented.** The suite's own target is one
