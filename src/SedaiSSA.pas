@@ -410,6 +410,10 @@ type
     FHasNulStrLiteral: Boolean;          // the program contains a string literal with an embedded NUL (DIVERGENZE 98)
     FNulStrConsts: TStringList;          // ...and the CONST names whose value carries one
     FWideNulConsts: TStringList;         // ...quelle fra esse dichiarate da wstr(<literal>): il taglio e' di LEN
+    FNulConstScoped: TStringList;        // "@B@<serial>@NAME" -> "<cap>|W" - the same two facts, filed under the
+                                         // SCOPE that declared the const instead of under its bare NAME.
+                                         // -1 is the serial of module level, where no frame is open.
+                                         // DIVERGENZE 155.
                                          // must consider the pad/convert pair (a cheap global bail otherwise).
     FRedimMultiArrays: TStringList;      // array names (UPPER) that appear in a multi-dim REDIM → their multi-dim
                                          // element access computes the linear index from RUNTIME dimensions
@@ -1218,6 +1222,8 @@ type
     procedure ProcessLRSetStatement(Node: TASTNode; IsLeft: Boolean);
     procedure EmitMidSubstring(ArgsNode: TASTNode; out Result: TSSAValue);
     function NulLitUnderWstr(Node: TASTNode): Integer;
+    procedure NoteNulConstScoped(Decl: TASTNode);
+    function NulConstFact(const Name: string; out Cap: Integer; out Wide: Boolean): Boolean;
     function NulLiteralArg(Node: TASTNode): Boolean;   // un literal con NUL, o una CONST che ne viene
     procedure EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);   // FreeBASIC WSTR(x) -> wide string
     procedure EmitWriteFileValues(Node: TASTNode; const HandleReg: TSSAValue; ToConsole: Boolean);  // WRITE [#n] CSV
@@ -1766,6 +1772,9 @@ begin
   FNulStrConsts.CaseSensitive := False;
   FWideNulConsts := TStringList.Create;
   FWideNulConsts.CaseSensitive := False;
+  FNulConstScoped := TStringList.Create;
+  FNulConstScoped.CaseSensitive := False;
+  FNulConstScoped.NameValueSeparator := '=';
   FByrefRetFuncs := TStringList.Create;
   FByrefRetValue := TStringList.Create;
   FByrefRetValue.CaseSensitive := False;
@@ -1880,6 +1889,7 @@ begin
   FConstDeclSeen.Free;
   FNulStrConsts.Free;
   FWideNulConsts.Free;
+  FNulConstScoped.Free;
   FConstStrBytes.Free;
   FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
@@ -9236,8 +9246,8 @@ var
   ThisFieldNode: TASTNode;      // implicit-THIS rewrite of a bare field name (we free it)
   VarName, CastTypeU, TgtTypeU: string;
   ExprValue, VarReg, DstHandleV, SrcHandleV: TSSAValue;
-  CopyOp: TSSAOpCode;  NulCap: Integer;
-  NulWide: Boolean;
+  CopyOp: TSSAOpCode;  NulCap, ConstNulCap: Integer;
+  NulWide, ConstNulWide: Boolean;
   NulVal: TSSAValue;
 begin
   // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
@@ -9572,7 +9582,7 @@ begin
     // assignment to s, and cutting there truncates the constant AT ITS DECLARATION: fbc keeps every
     // byte in the constant (Asc(s,3) = 66) and cuts only when it is READ into a String.
     NulCap := 0;
-    if FNulStrConsts.IndexOfName(UpperCase(VarName)) < 0 then
+    if not NulConstFact(VarName, ConstNulCap, ConstNulWide) then
       NulCap := FixedLenCapOfNode(ExprNode, NulWide);
     if NulCap > 0 then
     begin
@@ -10764,8 +10774,9 @@ function TSSAGenerator.FixedLenCapOfNode(Node: TASTNode; out Wide: Boolean): Int
 // or a UDT field "As String * n". SHARED / @-taken scalars are excluded exactly as TryFixedLenStore
 // excludes them — their stores never pad, so their reads must not convert either.
 var
-  UIdx, k: Integer;
+  UIdx, k, NulCap: Integer;
   VarName, TypeName: string;
+  NulWide: Boolean;
 begin
   Result := 0;
   Wide := False;
@@ -10802,10 +10813,10 @@ begin
     // ⭐ A CONST whose value carries an embedded NUL behaves as the literal does: it cuts where it
     // becomes a variable-length string and keeps every byte everywhere else (DIVERGENZE 98). The
     // capacity is its byte size less the terminator fbc counts.
-    if FNulStrConsts.IndexOfName(UpperCase(VarName)) >= 0 then
+    if NulConstFact(VarName, NulCap, NulWide) then
     begin
-      Wide := FWideNulConsts.IndexOf(UpperCase(VarName)) >= 0;
-      Exit(StrToIntDef(FNulStrConsts.Values[UpperCase(VarName)], 0));
+      Wide := NulWide;
+      Exit(NulCap);
     end;
     Result := StrCapOf(FFixedLenVars, VarName, 0);
     if Result > 0 then
@@ -12118,6 +12129,12 @@ begin
     // Only process antArrayDecl nodes (modern AST format)
     if ArrayDeclNode.NodeType <> antArrayDecl then
       Continue;
+
+    // A CONST files "do I carry an embedded NUL, and am I wide" under the SCOPE that declares it, and it
+    // is filed HERE - before this declaration is lowered - because its own initializer store reads the
+    // fact back to know it must not cut (DIVERGENZE 155, and 98 for the store).
+    if ArrayDeclNode.Attributes.Values['CONSTDECL'] = '1' then
+      NoteNulConstScoped(ArrayDeclNode);
 
     // antArrayDecl contains identifier and dimensions
     if ArrayDeclNode.ChildCount < 2 then Continue;
@@ -14127,10 +14144,124 @@ begin
     Result := Length(VarToStr(Node.Value));
 end;
 
+procedure TSSAGenerator.NoteNulConstScoped(Decl: TASTNode);
+// File "does this CONST carry an embedded NUL, and is it WIDE" under the SCOPE that declares it, at the
+// moment its declaration is lowered (DIVERGENZE 155).
+//
+// EXISTS BECAUSE the two registries beside it - FNulStrConsts and FWideNulConsts, filled by the
+// ScanForNulStrLiteral pre-pass - are keyed by the BARE NAME for the whole program, and FIRST WINS.
+// fbc's own string/asc declares a BYTE Const S from a literal with an embedded NUL in one TEST and a
+// WIDE one, from wstr() of a literal, in another: the byte one won, the wide one inherited "not wide"
+// and a length of 3, so Asc indexed BYTES and answered &hE1 - the first UTF-8 byte of &h1111. Reversing
+// the two declarations breaks the other one instead (Len 1 where the answer is 3). Seventh face of the
+// family job/markdown/REGISTRI.md records.
+// The VALUES of those constants were already scoped and already right - three sibling Const S answer
+// correctly one by one. It was only this fact that was flat.
+//
+// EVERY const declaration is filed, NUL-bearing or not, because the entry is also the VETO: a scope that
+// declares "Const S = 5" must answer "not a NUL const" and STOP, never fall through to a flat entry
+// another declaration wrote. Cap 0 is that answer.
+// Serial -1 is module level, where no frame is open; the flat tables stay as the fallback for a name no
+// lowered declaration has claimed.
+var
+  k, Cap, WLit: Integer;
+  Nm, Key: string;
+  Wide: Boolean;
+begin
+  if (Decl = nil) or (Decl.ChildCount < 3) or (Decl.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+  if Nm = '' then Exit;
+  Cap := 0;
+  Wide := False;
+  if (Decl.GetChild(2).NodeType = antLiteral) and VarIsStr(Decl.GetChild(2).Value) and
+     (Pos(#0, VarToStr(Decl.GetChild(2).Value)) > 0) then
+    Cap := Length(VarToStr(Decl.GetChild(2).Value))
+  else
+  begin
+    WLit := NulLitUnderWstr(Decl.GetChild(2));
+    if WLit >= 0 then
+    begin
+      Cap := WLit;
+      Wide := True;
+    end;
+  end;
+  Key := '';
+  for k := High(FScopeStack) downto 0 do
+    if FScopeStack[k].Kind in [skBlock, skProcRoot] then
+    begin
+      Key := BlockArrayMangle(FScopeStack[k].Serial, Nm);
+      Break;
+    end;
+  if Key = '' then Key := BlockArrayMangle(-1, Nm);
+  if FNulConstScoped.IndexOfName(Key) < 0 then
+    FNulConstScoped.Add(Key + '=' + IntToStr(Cap) + '|' + Copy('WB', 1 + Ord(not Wide), 1));
+end;
+
+function TSSAGenerator.NulConstFact(const Name: string; out Cap: Integer; out Wide: Boolean): Boolean;
+// The one funnel four readers ask: is this name a CONST carrying an embedded NUL *in the scope the code
+// is standing in*, how long is it, and is it wide? (DIVERGENZE 155.)
+//
+// The walk is the house one - the OPEN frames innermost first, stopping at the proc-root, then module
+// level - and the first frame that declares the name gives the WHOLE answer, cap 0 included. Only a name
+// no lowered declaration claimed falls through to the flat pre-pass entries.
+var
+  k, p: Integer;
+  nameU, Key, V: string;
+  Found: Boolean;
+begin
+  Cap := 0;
+  Wide := False;
+  Result := False;
+  nameU := UpperCase(Name);
+  if (nameU = '') or (FNulConstScoped = nil) then Exit;
+  Found := False;
+  V := '';
+  for k := High(FScopeStack) downto 0 do
+  begin
+    if not (FScopeStack[k].Kind in [skBlock, skProcRoot]) then Continue;
+    Key := BlockArrayMangle(FScopeStack[k].Serial, nameU);
+    if FNulConstScoped.IndexOfName(Key) >= 0 then
+    begin
+      V := FNulConstScoped.Values[Key];
+      Found := True;
+      Break;
+    end;
+    if FScopeStack[k].Kind = skProcRoot then Break;   // a procedure does not see the caller's locals
+  end;
+  if not Found then
+  begin
+    Key := BlockArrayMangle(-1, nameU);
+    if FNulConstScoped.IndexOfName(Key) >= 0 then
+    begin
+      V := FNulConstScoped.Values[Key];
+      Found := True;
+    end;
+  end;
+  if Found then
+  begin
+    p := Pos('|', V);
+    if p > 0 then
+    begin
+      Cap := StrToIntDef(Copy(V, 1, p - 1), 0);
+      Wide := Copy(V, p + 1, 1) = 'W';
+    end;
+    Exit(Cap > 0);
+  end;
+  if FNulStrConsts.IndexOfName(nameU) >= 0 then
+  begin
+    Cap := StrToIntDef(FNulStrConsts.Values[nameU], 0);
+    Wide := FWideNulConsts.IndexOf(nameU) >= 0;
+    Result := Cap > 0;
+  end;
+end;
+
 function TSSAGenerator.NulLiteralArg(Node: TASTNode): Boolean;
 // Is this expression a COMPILE-TIME string literal carrying an embedded NUL - directly, or through a
 // CONST declared from one? (DIVERGENZE 150.) It is what tells "wstr( !"A\000B" )", whose characters fbc
 // keeps, from "wstr( s + Chr(0) + t )", which it cuts.
+var
+  NulCap: Integer;
+  NulWide: Boolean;
 begin
   Result := False;
   if Node = nil then Exit;
@@ -14138,7 +14269,7 @@ begin
   if (Node.NodeType = antLiteral) and VarIsStr(Node.Value) then
     Exit(Pos(#0, VarToStr(Node.Value)) > 0);
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
-    Exit(FNulStrConsts.IndexOfName(UpperCase(VarToStr(Node.Value))) >= 0);
+    Exit(NulConstFact(VarToStr(Node.Value), NulCap, NulWide));
 end;
 
 procedure TSSAGenerator.EmitWStr(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -39157,6 +39288,8 @@ var
   NameU: string;
   ArgsW: TASTNode;
   WideTmp: TSSAValue;
+  WideNulCap: Integer;
+  WideNulW: Boolean;
 begin
   Result := False;
   if Node = nil then Exit;
@@ -39175,7 +39308,7 @@ begin
         // "asc( wstr(!"\u1111\u0000\u2222"), 1 ) = &h1111", and read as a byte string it answered
         // &hE1 - the first byte of that codepoint's UTF-8.
         if (not Result) and (FWideNulConsts <> nil) then
-          Result := FWideNulConsts.IndexOf(UpperCase(VarToStr(Node.Value))) >= 0;
+          if NulConstFact(VarToStr(Node.Value), WideNulCap, WideNulW) then Result := WideNulW;
         // ⭐ ...AND A BARE FIELD NAME INSIDE A METHOD BODY IS "this.<field>". The member-access arm
         // below has always answered for the QUALIFIED spelling, so "Len( this.d )" was right while
         // "Len( d )" - the same field, written the way one writes it inside its own type - counted
@@ -46917,6 +47050,7 @@ begin
   // Unicode codepoint. Same srtString bank (UTF-8 storage) → no new register bank, existing ops intact.
   FBlockDeclVars.Clear;
   FBlockDeclRecs.Clear;
+  FNulConstScoped.Clear;
   FFixedLenVars.Clear;
   FZStringVars.Clear;
   FRawFixedLenNode := nil;
