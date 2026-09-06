@@ -36372,7 +36372,14 @@ var
     ch: Char;
   begin
     if (ScalarU = '') or (PointeeType = '') then Exit;
-    ch := BankToChar(TypeNameToBank(PointeeType, ''));
+    // ⛔⛔ AN "ANY PTR" IS A BYTE POINTER AND HAS NO BANK. Asked of TypeNameToBank it falls off the
+    // ladder onto the FLOAT default - the trap this project records for every unrecognised type name -
+    // so "Dim q As Any Ptr = @s" on a SINGLE signed the scalar's OWN bank and read as "not punned":
+    // the value stayed a managed cell and the bytes were never there to read (DIVERGENZE 55). Taking
+    // an address through an Any Ptr IS asking for the bytes, whatever the pointee's bank, so it gets a
+    // char no real bank can equal.
+    if UpperCase(Trim(PointeeType)) = 'ANY' then ch := '?'
+    else ch := BankToChar(TypeNameToBank(PointeeType, ''));
     c := FScalarPtrBanks.Values[ScalarU];
     if Pos(ch, c) = 0 then FScalarPtrBanks.Values[ScalarU] := c + ch;
   end;
@@ -36431,6 +36438,23 @@ begin
         end;
       end;
     end;
+  // ⭐⭐ "Cast( <T> Ptr, @x )" / "CPtr( <T> Ptr, @x )": THE POINTER IS NEVER DECLARED, and this pass saw
+  // only the two spellings that declare one (DIVERGENZE 55). It is the spelling fbc's own suite and the
+  // manual use to read a value's bits - "*Cast( ULong Ptr, @s )" on a SINGLE - and without it the
+  // scalar stayed a managed SHARED cell, so the read answered the low half of the 8-byte double: 0 for
+  // 1.0 where fbc answers 1065353216. The DECLARED form was right all along, which is the tell that the
+  // model was fine and only this shape was invisible.
+  // ⚠️ The pointee type is written INSIDE the cast, so it is read from there rather than from
+  // FPointerVars - there is no pointer variable to ask.
+  if (Node.NodeType = antCast) and (Node.ChildCount >= 1) then
+  begin
+    TypeNameU := UpperCase(VarToStr(Node.Value));
+    if (Length(TypeNameU) >= 4) and (Copy(TypeNameU, Length(TypeNameU) - 3, 4) = ' PTR') then
+    begin
+      PointeeT := Trim(Copy(TypeNameU, 1, Length(TypeNameU) - 4));
+      AddBank(AddrOfScalarName(Node.GetChild(0)), PointeeT);
+    end;
+  end;
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do
     CollectScalarPtrBanks(Node.GetChild(i));

@@ -278,8 +278,12 @@ because both sides of those speak the same unit.
 **Reinterpreting memory across element boundaries is not supported.** An array here is a vector of
 typed elements, not a flat byte image, so a pointer cast that lands part-way into an element — for
 example advancing a `Long Ptr` by one `Short` and then reading a `Long` — has no memory to read. The
-same limit applies to reading a UDT as raw bytes and to punning a `Single` (stored as an 8-byte
-double) through an integer pointer.
+same limit applies to reading a UDT as raw bytes.
+  ⭐ **Punning a `Single` is supported** (6 September 2026): `*Cast(ULong Ptr, @s)` answers its IEEE-754
+  image, `*Cast(ULong Ptr, @s) = 1065353216` writes it back, and a `UByte Ptr` walks its four bytes —
+  a module-level, `Shared`, local or UDT-field one alike. The value itself was never a double
+  pretending: single arithmetic rounds to 32 bits at every step, so `16777216f + 1f - 16777216f` is 0
+  and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
 - **The address of a `Str` / `Chr` / `WStr` / `WChr` temporary needs a COMPILE-TIME CONSTANT**, as in
