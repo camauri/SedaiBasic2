@@ -423,11 +423,28 @@ same limit applies to reading a UDT as raw bytes.
   real pty, its `POS` answers `1` however much has been printed. Ours answers the true column, which
   is what the manual describes; theirs is a missing implementation on this platform, so the manual's
   own `console/pos` example cannot agree with both.
-- **`#lang "fblite"` and `Option ByVal` / `Option ByRef` are not implemented.** They parse and are
-  inert. In fbc's `fblite` dialect a parameter defaults to **BYREF** and `Option ByVal` flips that
-  default; MODERN is FreeBASIC's own base dialect throughout, where a parameter defaults to BYVAL, and
-  it stays that way whatever `#lang` asks for. The manual's `switches/option-byval` therefore cannot
-  agree with us — its own first line says *"compile with the -lang fblite compiler switch"*.
+- **The `fblite` dialect is recognised, and covered only as far as MODERN reaches.** `#lang "fblite"`
+  parses and is inert: MODERN is FreeBASIC's own base dialect throughout, whatever `#lang` asks for.
+  ⭐ Measured over 23 probes against fbc on 6 September 2026, and the shape of it is worth stating,
+  because `fblite` is not "base FreeBASIC plus a few options" — it is a **different and smaller**
+  language. It **removes** `Scope … End Scope`, `Operator` overloading and `Declare` inside a `Type`
+  (fbc: *only valid in -lang fb*), so it has no block scoping, no operator overloading and **no OOP**;
+  and it **adds** default types and sigils, implicit declaration, `DefInt`, the whole live `OPTION`
+  family, `'$DYNAMIC`/`'$STATIC`, `GOSUB`/`RETURN` behind `Option Gosub`, `LET`, dotted identifiers,
+  and **BYREF as the default passing mode** for a scalar parameter.
+  With `#lang "fblite"` declared in the source, **16 of those 23 probes already agree byte for byte**.
+  The seven that do not, each measured:
+  1. the **passing mode** — `Sub s(x As Integer)` then `s(a)` writes 99 into the caller's variable in
+     fbc and leaves 1 here. The manual's `switches/option-byval` cannot agree with us for this reason;
+     its own first line says *"compile with the -lang fblite compiler switch"*;
+  2. a **dotted identifier** — `Dim As Integer a.b = 5` is one NAME there and a member access here;
+  3. `Option Dynamic` / `'$DYNAMIC` do not make a `Dim a(3)` re-dimensionable here;
+  4. `Option Gosub` does not enable `GOSUB`, because in MODERN `RETURN` already means "return from a
+     procedure" — which is what the refusal says;
+  5. `Scope … End Scope` is accepted here and refused there;
+  6. `Operator` overloading is accepted here and refused there;
+  7. `Declare` inside a `Type` is refused on both sides, for different reasons.
+  ⚠️ Only the first two change an answer **silently**; the rest refuse or are visibly absent.
 - **`ByRef ... As Any` converts; it does not type-pun — and that is a MISSING FEATURE, not a rule.**
   fbc's `Any` disables the parameter's type check, so passing a `Single` to a body declared
   `ByRef a As Integer` makes the body read that variable's BYTES as an Integer: `-15.0` prints as
