@@ -10184,12 +10184,32 @@ begin
         Context.Advance;
       end;
     end
-    // Every other OPTION is a compiler switch we accept and do not act on: DYNAMIC / STATIC (default
-    // array storage - we allow REDIM either way), GOSUB (enables GOSUB in fblite, which we always
-    // support), BYVAL / BYREF (the fblite default passing convention), EXPLICIT, PRIVATE, ESCAPE.
-    // The option NAME is usually a reserved word, not an identifier - "Option Static" is STATIC, "Option
-    // GoSub" is GOSUB - so testing for an identifier left the keyword in the stream to be parsed as a
-    // statement of its own, and the program died on it.
+    // ⛔⛔ EVERY OTHER "OPTION" IS REFUSED IN MODERN, because fbc refuses it and we were accepting it
+    // INERT - which is a silent lie: a program that writes "Option Explicit" got no explicit-declaration
+    // checking and no word about it, and one that writes "Option ByVal" got fb's BYVAL default where it
+    // asked for fblite's BYREF one and read a WRONG ANSWER (a Sub that assigns its parameter changes the
+    // caller's variable there and not here). DIVERGENZE 17.
+    // ⭐ The rule was MEASURED over ELEVEN forms and it is uniform: EXPLICIT · BASE · DYNAMIC · STATIC ·
+    // ESCAPE · NOKEYWORD · PRIVATE · BYVAL · BYREF · GOSUB · NOGOSUB are all "error 146: Only valid in
+    // -lang deprecated or fblite or qb". The OPTION statement simply does not exist in -lang fb.
+    // ⭐ TWO EXEMPTIONS, and both are DECLARED SedaiBasic extensions handled above: "Option Digits"
+    // (BASIC.md, no FreeBASIC equivalent) and "Option Base" (the QuickBASIC idiom our own corpus uses).
+    // ⚠️ And a file that asks for another dialect keeps them all: "#lang "fblite"" is exactly the case
+    // fbc's own message names, so refusing there would refuse a program the oracle compiles. Same
+    // escape hatch CheckDeclStatesItsType uses, for the same reason.
+    else if FModernMode and (not SourceDeclaresNonFbDialect) and Assigned(Context.CurrentToken) and
+            ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) then
+    begin
+      HandleError(Format('OPTION %s is not part of the FreeBASIC dialect: the OPTION statement is only ' +
+        'valid in -lang deprecated, fblite or qb (fbc: error 146). SedaiBasic keeps OPTION DIGITS and ' +
+        'OPTION BASE, which are its own; add ''#lang "fblite"'' if you want the others.',
+        [UpperCase(Context.CurrentToken.Value)]), Context.CurrentToken);
+      Context.Advance;
+    end
+    // CLASSIC, and a source that declared another dialect, keep every OPTION as before: accepted and
+    // not acted on. The option NAME is usually a reserved word, not an identifier - "Option Static" is
+    // STATIC, "Option GoSub" is GOSUB - so testing for an identifier left the keyword in the stream to
+    // be parsed as a statement of its own, and the program died on it.
     else if Assigned(Context.CurrentToken) and
             ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) then
     begin
