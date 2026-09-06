@@ -1041,9 +1041,13 @@ type
     function DeclaredIdentCode(Node: TASTNode): Integer;           // the same, derived from an ARGUMENT        // B1.5 phase 2: type -> narrow code
     function UDTFieldIdentCode(UDTIdx: Integer; const FieldName: string): Integer;  // ...and from a FIELD
     function ConvRankFacts(Code: Integer; out Kind, Wid, Sgn, Canon: Integer): Boolean;  // DIVERGENZE 8: the ranking
-    function ConvRankCost(ArgCode, CandCode: Integer): Int64;                            // ...its cost of one conversion
+    function ConvRankOrder(ArgCode, CandCode: Integer): Int64;                           // ...its preference ORDER
+    function ConvRankCost(ArgCode, CandCode: Integer): Int64;                            // ...and fbc's own MAGNITUDE
+    function ConvRankSameType(CodeA, CodeB: Integer): Boolean;                           // ...same type as the ranking sees it
     function ArgRankCode(Node: TASTNode): Integer;                                       // ...the ARGUMENT's type
     function LabelRankCost(const Lbl: string; ArgsNode: TASTNode; out Cost: Int64): Boolean;
+    function RankedParamCode(const Lbl: string; Idx: Integer): Integer;        // ...one parameter's type
+    function RankedCandidatesDiffer(const L1, L2: string; N: Integer): Boolean;// ...and whether two candidates really differ
     function IsFieldAddrExpr(Node: TASTNode): Boolean;                  // "@obj.field" over a MANAGED record (no emit)
     function RecPtrWireWidth(const Pointee: string): Integer;           // record-field pointer's low 4 bits for this pointee (-1 = leave alone)
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
@@ -31409,9 +31413,10 @@ begin
   end;
 end;
 
-function TSSAGenerator.ConvRankCost(ArgCode, CandCode: Integer): Int64;
-// What fbc charges for converting an argument of ArgCode into a parameter of CandCode. Lower is
-// better; -1 means "not rankable", and then the caller declines.
+function TSSAGenerator.ConvRankOrder(ArgCode, CandCode: Integer): Int64;
+// fbc's preference ORDER for converting an argument of ArgCode into a parameter of CandCode: a
+// number whose COMPARISONS are the measured order and whose magnitude means nothing (ConvRankCost
+// supplies the magnitude). Lower is better; -1 means "not rankable", and then the caller declines.
 //
 // ⭐⭐ THE RULE IS MEASURED, NOT DEDUCED. A 12x12 matrix was taken from the oracle - for each argument
 // type, the twelve candidates were offered together and the winner removed until the list was empty,
@@ -31430,11 +31435,9 @@ function TSSAGenerator.ConvRankCost(ArgCode, CandCode: Integer): Int64;
 //      for an Integer one;
 //   7) the canonical order, INTEGER before LONGINT and UINTEGER before ULONGINT.
 //
-// ⛔ THE FIELDS ARE WEIGHTED SO THAT ADDING UP TO EIGHT ARGUMENTS CANNOT CARRY BETWEEN THEM: each
-// weight is larger than the largest total everything below it can reach, so the sum of per-argument
-// costs compares exactly as the vector of per-argument fields does. That is the model for a call with
-// several arguments, and it is DECLARED rather than measured: the oracle answers "ambiguous" for the
-// mixed cases that would separate two models, and a tie here declines.
+// ⛔ THE FIELDS ARE WEIGHTED SO THAT NOTHING CARRIES BETWEEN THEM, and that is ALL this function is
+// for: it answers WHICH of two candidates fbc prefers for ONE argument, never by how much. A call with
+// several arguments needs the magnitude, and the magnitude is a separate measurement - ConvRankCost.
 var
   AK, AW, AS_, AC, CK, CW, CS, CC: Integer;
   WideCls, Dist, SignDif, NotPair: Integer;
@@ -31457,6 +31460,75 @@ begin
   Result := Result + Int64(SignDif) * 256;
   Result := Result + Int64(NotPair) * 16;
   Result := Result + Int64(CC);
+end;
+
+function TSSAGenerator.ConvRankCost(ArgCode, CandCode: Integer): Int64;
+// What fbc CHARGES for converting an argument of ArgCode into a parameter of CandCode. Lower is
+// better; -1 means "not rankable", and then the caller declines. A call's total cost is the SUM over
+// its arguments, and fbc compares those sums: the cheaper candidate is called, and an exact TIE is
+// "error 98: Ambiguous call to overloaded function".
+//
+// ⭐⭐⭐ THE MAGNITUDE IS MEASURED, AND IT IS NOT THE ORDER. ConvRankOrder gives fbc's preference order
+// for one argument, which is all a single-argument call needs; entry 8 then DECLARED a weighting for
+// the multi-argument sum instead of measuring it, precisely so that nothing could carry between
+// arguments. That declaration is wrong, and a 12x12x12x12 sweep against the oracle says where: with
+// candidates "z_(Long, ULongInt)" and "z_(ULong, LongInt)" called with (Long, ULongInt), fbc picks the
+// SECOND and the non-carrying weights pick the first. A carry between arguments is exactly what fbc
+// has.
+//
+// THE MEASURED RULE, over 15 857 probes against fbc (11 368 fitted, 4 489 held out at arities 2..5,
+// 4 489 of 4 489 agreeing, 146 of them ambiguous):
+//     the EXACT type costs 0;  everything else costs 52 + its RANK,
+// where the rank is the candidate's 1..11 position in ConvRankOrder's preference order for that
+// argument. The ladder is CONSECUTIVE - a linear program over the observations put every row's eleven
+// non-exact costs at consecutive integers - and 52 is read directly off the oracle rather than
+// bounded: a 7-argument probe whose two candidates differ by exactly K-52 answers "A" at 51,
+// "error 98: Ambiguous" at 52 and "B" at 53.
+//
+// ⛔ 52 IS WHAT AN EXACT MATCH IS WORTH, and it has to be that large for a reason worth naming: an
+// exact match in one position outweighs a whole argument's worth of conversion elsewhere, but not
+// SIX of them - "f(Integer, Single*6)" loses to seven LongInt parameters and "f(Integer*5, Single)"
+// wins. A model that made the exact match lexicographic (an infinite bonus) gets the first of those
+// wrong, and a rank-only model (no bonus) gets 371 of 11 368 probes wrong.
+var
+  k, Rank: Integer;
+  Mine, Other: Int64;
+const
+  // The types the ranking can name, by identity code - the twelve fbc has. INT32/UINT32 are OUR
+  // extension and share LONG/ULONG's facts, so they take LONG/ULONG's rank, which is what "the same
+  // type as far as this ranking can see" means (ConvRankSameType says so out loud).
+  RANKABLE: array[0..11] of Integer = (1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16);
+  EXACT_MATCH_BONUS = 52;
+begin
+  Result := -1;
+  Mine := ConvRankOrder(ArgCode, CandCode);
+  if Mine < 0 then Exit;
+  if Mine = 0 then Exit(0);                          // the exact type
+  // The RANK is the position in the argument's own preference order: how many of the twelve rankable
+  // types fbc would rather convert to than this one. Asked of ConvRankOrder rather than tabulated, so
+  // the order has exactly ONE definition and this cannot drift away from it.
+  Rank := 0;
+  for k := Low(RANKABLE) to High(RANKABLE) do
+  begin
+    Other := ConvRankOrder(ArgCode, RANKABLE[k]);
+    if (Other >= 0) and (Other < Mine) then Inc(Rank);
+  end;
+  Result := EXACT_MATCH_BONUS + Rank;
+end;
+
+function TSSAGenerator.ConvRankSameType(CodeA, CodeB: Integer): Boolean;
+// Are these two declared types the SAME type as far as the conversion ranking can see? Two candidates
+// that answer TRUE here in every parameter position cost the same by construction, so their tie is not
+// fbc's ambiguity: fbc would call such a pair "error 4: Duplicated definition" (a different refusal,
+// and not this pass's), and where the two names are OUR extension - INT32 beside LONG, UINT32 beside
+// ULONG, which share every fact - it is a program fbc cannot compile at all and we accept.
+var
+  KA, WA, SA, CA, KB, WB, SB, CB: Integer;
+begin
+  Result := False;
+  if not ConvRankFacts(CodeA, KA, WA, SA, CA) then Exit;
+  if not ConvRankFacts(CodeB, KB, WB, SB, CB) then Exit;
+  Result := (KA = KB) and (WA = WB) and (SA = SB) and (CA = CB);
 end;
 
 function TSSAGenerator.ArgRankCode(Node: TASTNode): Integer;
@@ -31492,7 +31564,9 @@ begin
   Result := False;
   Cost := 0;
   if ArgsNode = nil then N := 0 else N := ArgsNode.ChildCount;
-  if N > 8 then Exit;                                   // the weights carry no further; decline
+  // ⚠️ The old cap of 8 arguments came from the DECLARED weighting, which needed the fields not to
+  // carry; the measured cost is 0 or 52..63, so eight of them reach 504 and a hundred would still fit.
+  // The cap is gone with the reason for it - an orphan guard documents a rule that is not there.
   if not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
   if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
   PL := Decl.GetChild(1);
@@ -31508,6 +31582,36 @@ begin
     Cost := Cost + One;
   end;
   Result := True;
+end;
+
+function TSSAGenerator.RankedParamCode(const Lbl: string; Idx: Integer): Integer;
+// The identity code of one parameter of the declaration behind Lbl, or 0 when there is no such
+// parameter or nothing here can name its type. Read by the ambiguity check, which has to tell two
+// candidates that genuinely differ from two spellings of ONE type.
+var
+  Decl, PL, PN: TASTNode;
+begin
+  Result := 0;
+  if not FProcDecls.TryGetValue(Lbl, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  PL := Decl.GetChild(1);
+  if (PL = nil) or (PL.NodeType <> antParameterList) or (Idx < 0) or (Idx >= PL.ChildCount) then Exit;
+  PN := PL.GetChild(Idx);
+  if (PN = nil) or (PN.ChildCount < 1) or (PN.GetChild(0).NodeType <> antIdentifier) then Exit;
+  Result := TypeNameIdentCode(UpperCase(VarToStr(PN.GetChild(0).Value)));
+end;
+
+function TSSAGenerator.RankedCandidatesDiffer(const L1, L2: string; N: Integer): Boolean;
+// Do these two ranked candidates name a DIFFERENT type in some parameter position? Two labels that
+// answer FALSE cost the same whatever the arguments are, so their tie is arithmetic and not fbc's
+// ambiguity - see ConvRankSameType for the two ways that happens.
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 0 to N - 1 do
+    if not ConvRankSameType(RankedParamCode(L1, i), RankedParamCode(L2, i)) then Exit;
+  Result := False;
 end;
 
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
@@ -31528,8 +31632,9 @@ var
   DeclN, ParamsN: TASTNode;
   OkDef: Boolean;
   RankCost, BestCost: Int64;
-  Phase: Integer;
-  Pref2: string;
+  Phase, ArgCount: Integer;
+  Pref2, AmbWith: string;
+  Ranked: Boolean;
 
   // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
   function WidthTailLabel(const WT: string): string;
@@ -31557,6 +31662,7 @@ var
 begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
+  if ArgsNode = nil then ArgCount := 0 else ArgCount := ArgsNode.ChildCount;
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
   ConstSig := ArgConstSigFromArgs(ArgsNode);
   WidthSig := ArgWidthSigFromArgs(ArgsNode);
@@ -31730,14 +31836,40 @@ begin
   Cand := '';
   BestCost := -1;
   OkDef := False;                                  // OkDef: the best cost is shared -> ambiguous
+  AmbWith := '';
+  Ranked := True;
   for k := 0 to FProcedureNames.Count - 1 do
   begin
     if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
-    if not LabelRankCost(FProcedureNames[k], ArgsNode, RankCost) then begin Cand := ''; Break; end;
+    if not LabelRankCost(FProcedureNames[k], ArgsNode, RankCost) then
+    begin Cand := ''; Ranked := False; Break; end;
     if (BestCost < 0) or (RankCost < BestCost) then
-    begin BestCost := RankCost; Cand := FProcedureNames[k]; OkDef := False; end
-    else if RankCost = BestCost then OkDef := True;
+    begin BestCost := RankCost; Cand := FProcedureNames[k]; OkDef := False; AmbWith := ''; end
+    else if RankCost = BestCost then
+    begin
+      OkDef := True;
+      // ...and only a candidate that names a DIFFERENT type somewhere is fbc's ambiguity.
+      if (AmbWith = '') and RankedCandidatesDiffer(Cand, FProcedureNames[k], ArgCount) then
+        AmbWith := FProcedureNames[k];
+    end;
   end;
+  // ⭐⭐ AN AMBIGUOUS CALL IS AN ERROR, NOT A CHOICE (DIVERGENZE 160). fbc compares the SUMS and refuses
+  // a draw outright - "error 98: Ambiguous call to overloaded function" - where we used to decline and
+  // let the fallbacks below take whichever was declared first, in silence.
+  // ⛔ IT IS REFUSED ONLY WHERE THE RANKING ACTUALLY RANKED, which is the whole distinction this entry
+  // is about: a set holding a string, a UDT, a pointer, an enum, a Boolean or a different arity breaks
+  // the loop above with Ranked=FALSE, and there the draw means "this pass could not classify" - the
+  // fallbacks are right and nothing is refused. A draw with Ranked=TRUE means "classified, and it is a
+  // tie", which is exactly what fbc reports.
+  // ⛔⛔ AND THE EXEMPTION IS THAT TWO CANDIDATES MAY BE ONE TYPE SPELLED TWICE. The cost is a function
+  // of the parameter's TYPE FACTS, so two candidates naming the same facts everywhere always draw -
+  // and that draw is arithmetic, not ambiguity: fbc calls such a pair "error 4: Duplicated definition"
+  // (a different refusal, and m849's, not this one), and for INT32 beside LONG it is our own extension,
+  // a program fbc cannot compile at all. RankedCandidatesDiffer is what asks.
+  if Ranked and (Cand <> '') and OkDef and (AmbWith <> '') then
+    raise Exception.CreateFmt('Ambiguous call to overloaded procedure "%s": no candidate is better ' +
+      'than the others for these arguments (%s and %s cost the same)',
+      [BaseLabel, Cand, AmbWith]);
   if (Cand <> '') and (not OkDef) then Exit(Cand);
   // ⭐⭐ ...AND A NUMBER IS NOT A RECORD, which is the one thing the bank part cannot say (DIVERGENZE
   // 157). Every UDT is an int handle, so "Operator T.Let( ByRef As T )" and "Operator T.Let( ByVal As

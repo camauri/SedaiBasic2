@@ -416,18 +416,35 @@ same limit applies to reading a UDT as raw bytes.
   **exact** type · the **kind** (an integer argument takes every integer candidate before any
   floating-point one, so `f(As Long)` beats `f(As Double)` for an `Integer`) · the **width class**
   (same width, then wider, then narrower) · the **distance** · the **sign** · the argument's own
-  signed/unsigned partner · `Integer` before `LongInt`. A call with several arguments adds the
-  per-argument costs. The argument's type is read from a declared name, an explicit `Cast`, a
-  function's declared return, a record field, or the literal itself (an integer literal is `Integer`,
-  one with a fractional part is `Double`).
-  ⚠️ **A tie is left unresolved rather than guessed.** fbc reports an ambiguous call as an error; here
-  a tie falls back to the older, order-dependent choice instead of being refused. Everything else the
-  bank and the declared type separate is resolved exactly as before: each **enum** type, each
+  signed/unsigned partner · `Integer` before `LongInt`. The argument's type is read from a declared
+  name, an explicit `Cast`, a function's declared return, a record field, or the literal itself (an
+  integer literal is `Integer`, one with a fractional part is `Double`).
+  A call with several arguments adds the per-argument **costs**, and the cost is measured too, over
+  15 857 probes against `fbc`: the **exact** type costs nothing, and every other conversion costs
+  **52 plus its rank** in that argument's preference order. The bonus for an exact match is therefore
+  finite: one exact match outweighs a whole argument's worth of conversion elsewhere, but not six of
+  them. **An exact tie is an error**, as it is in FreeBASIC (*error 98: Ambiguous call to overloaded
+  function*), and is reported rather than resolved by declaration order.
+  ⚠️ **Only where the ranking could rank.** A candidate set holding a string, a UDT, a pointer, an
+  enum, a `Boolean` or a differing arity is not ranked at all, and there a tie still falls back to the
+  older, order-dependent choice rather than being refused — a draw among candidates this pass cannot
+  classify is not evidence of ambiguity. Two candidates naming the same type in every position are
+  likewise not ambiguous: they draw by arithmetic, and FreeBASIC calls such a pair a duplicated
+  definition instead.
+  Everything else the bank and the declared type separate is resolved exactly as before: each
+  **enum** type, each
   **pointee** type (`Integer Ptr` from `Double Ptr` from `T Ptr`, at any pointer depth), each by-value
   UDT, and `Const` against non-`Const`.
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.
+  ⚠️ **The ranking does not reach across register banks** (divergence 161). A candidate whose
+  parameter is an integer type is not weighed against one whose parameter is floating-point when the
+  arguments are all of the other kind: the bank part of the signature is matched first, and it
+  settles the call. It shows only where converting across kinds in one position would be cheaper than
+  converting within the kind in all of them — `z_(As UShort, As Double)` beside
+  `z_(As Single, As Single)` called with two `Double`s, where fbc takes the first and we take the
+  second. Measured at 3 calls in 15 405 probes.
   An overload whose trailing parameters carry **defaults** is reachable with fewer arguments
   (`f(0)` selecting `f(i As Integer, j As Integer = 0, k As Integer = 0)`); among the candidates the
   one needing the fewest omissions wins, and an exact bank prefix breaks a tie.
