@@ -1122,6 +1122,7 @@ type
     function OverloadsAddressOf(Node: TASTNode): Boolean;   // ...unless the type declares "Operator @"
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function SolePtrCastLabel(const TypeName: string): string;        // the ONE pointer-returning cast, or ''
+    function ExprIsPointerValue(Node: TASTNode): Boolean;   // un T Ptr NON e' un T
     function TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
@@ -24108,8 +24109,7 @@ begin
   // ⚠️ It had always been claimed; it only ever DECLINED by accident, because a type could keep just
   // one Let and the surviving one took a UDT, which an addressed expression could not reach. The
   // moment the integer overload existed (DIVERGENZE 152) the accident stopped covering it.
-  if (VarNode.NodeType = antIdentifier) and (VarNode.ChildCount = 0) and
-     (FPointerVars.IndexOfName(UpperCase(VarToStr(VarNode.Value))) >= 0) then Exit;
+  if ExprIsPointerValue(VarNode) then Exit;
   ObjType := ObjectTypeName(VarNode);
   if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
   RhsType := UpperCase(ObjectTypeName(ExprNode));
@@ -42058,6 +42058,29 @@ begin
   end;
 end;
 
+function TSSAGenerator.ExprIsPointerValue(Node: TASTNode): Boolean;
+// Is this expression a POINTER, whose value is an ADDRESS rather than an instance? (DIVERGENZE 153.)
+//
+// ⛔⛔ IT EXISTS BECAUSE ObjectTypeName ANSWERS THE POINTEE. For "Dim a As T Ptr" it says "T", which is
+// what "a->x" and "*a" need and what every question about the VALUE must not have: with a
+// "Operator T.Cast() As Integer" declared, "a <> 0" ran that cast ON THE POINTER and compared the
+// pointee's field instead of the address. Measured, and worse than it sounds: two DIFFERENT pointers
+// compared EQUAL ("a = b" cast both and compared 0 with 0), and "a = 0" on a NULL pointer was an
+// ACCESS VIOLATION - a crash where fbc answers True.
+// ⭐ Asked in the innermost funnels (TryEmitUDTCastToNumber / TryEmitUDTCastToPtr) so their ~12 callers
+// inherit it, instead of at each site: the shape entry 25 records, and the one that keeps a rule from
+// being widened in one copy and not the other. The same veto written inline for the assignment path on
+// 5 Sep (entry 152) now asks THIS.
+// ⚠️ A bare pointer VARIABLE only, on purpose. "*p" and "p->f" are dereferences and denote an
+// instance; a cast on those is right and must keep working.
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
+    Result := FPointerVars.IndexOfName(UpperCase(VarToStr(Node.Value))) >= 0;
+end;
+
 function TSSAGenerator.TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string;
   out Val: TSSAValue): Boolean;
 // FreeBASIC "Operator T.Cast() As <something> Ptr": if Node is a UDT of type T declaring one, invoke it
@@ -42072,6 +42095,7 @@ begin
   Result := False;
   Val := MakeSSAValue(svkNone);
   if (not FModernMode) or (Node = nil) then Exit;
+  if ExprIsPointerValue(Node) then Exit;      // a T Ptr is not a T (DIVERGENZE 153)
   TypeName := ObjectTypeName(Node);
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   MethNm := '';
@@ -42110,6 +42134,7 @@ begin
   Result := False;
   Val := MakeSSAValue(svkNone);
   if Node = nil then Exit;
+  if ExprIsPointerValue(Node) then Exit;      // a T Ptr is not a T (DIVERGENZE 153)
   TypeName := ObjectTypeName(Node);
   if (TypeName = '') or (FindUDT(TypeName) < 0) then Exit;
   // The cast label carries its return bank as a suffix (see PreCollectProcedures): '%' int, '#' float.
