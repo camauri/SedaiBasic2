@@ -2436,7 +2436,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `__FB_ASM__` | ✓ | `"intel"` — fbc's own answer on linux-x86_64. Naming a dialect does not make inline `Asm` supported; that stays a declared gap (see divergence 51). |
+| `__FB_ASM__` | ✓ | `"intel"` — fbc's own answer on linux-x86_64. Naming a dialect does not make inline `Asm` supported; that waits on the native-binary backend (see divergence 51). |
 | `__FB_BACKEND__` | ✓ | `"gcc"` — fbc's default backend on this host, and therefore the branch fbc itself compiles. |
 | `__FB_GCC__` | ✓ | `-1` — the flag form of `__FB_BACKEND__ = "gcc"`, kept consistent with it. |
 | `__FB_OPTIMIZE__` | ✓ | `0` — the optimisation level the SOURCE asked for (fbc's default; a `#cmdline` carrying `-O` raises it). It reports the REQUEST, not our pipeline, which has no `-O` ladder. |
@@ -3406,10 +3406,21 @@ Each of these is *refused with a message that names the reason*, never answered 
   message that says so rather than "Array not declared". Use the BASIC equivalents
   (`Open`/`Print #`/`Close`, `Print Using`).
 - **Inline assembly**: `Asm … End Asm`, `Naked` procedures, and `__FB_ASM__` branches that select one.
-  Machine code in the source is not something a bytecode VM can host — one of its engines is an
-  interpreter, and the interpreter is the *reference* the AOT and JIT validators demand MISMATCH 0
-  against, so a feature alive on two engines of four could not be verified at all. The targets are not
-  only x86 either (the WebAssembly backend, and the MCU work).
+  ⚠️ **Not supported YET — this one is on the roadmap, not a permanent divergence.** Machine code in
+  the source is not something a bytecode VM can host: one of its engines is an interpreter, and the
+  interpreter is the *reference* the AOT and JIT validators demand MISMATCH 0 against, so a feature
+  alive on two engines of four could not be verified at all. The targets are not only x86 either (the
+  WebAssembly backend, and the MCU work). ⇒ It becomes possible when SedaiBasic can produce **native
+  binaries**, which is a planned dual environment: the VM where a distributed, multiplatform — and
+  web-capable — runtime is what is wanted, a native binary for desktop and embedded where that form
+  performs better. Inline assembly belongs to the second.
+  ⭐ For reference, how fbc does it, measured on both of its backends: **it does not compile the
+  assembly, it hands it over.** With the C backend each line comes out as a GCC `__asm__ __volatile__`
+  whose BASIC variables are `"+m"` operands and whose clobber list names every general register plus
+  `cc` and `memory` — the allocation around the block is left to gcc; with `-gen gas64` the text lands
+  *verbatim* in the `.asm` in Intel syntax and `as` assembles it, the variable name already replaced by
+  its frame offset. fbc never looks at the instructions. It can do that because it has ONE target with
+  an assembler under it.
   ⭐ **An `Asm … End Asm` block that holds NO INSTRUCTION is accepted** (29 August 2026): there is
   nothing to translate. fbc's own `pp/pragma-reserve-7` writes one whose entire content is
   preprocessor directives — consumed before the parser sees the block — and the test is about the
