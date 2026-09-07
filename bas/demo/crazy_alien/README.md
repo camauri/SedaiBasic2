@@ -1,17 +1,40 @@
-# Crazy Alien — procedural death effects (prototype)
+# Crazy Alien — a wave shooter whose deaths are computed
 
-An exploratory prototype for a wave shooter with a comic tone: the enemies will be drawn sprites,
-but their **deaths are entirely computed** — no hand-drawn animation. This program answers one
-question only: do the effects hold up visually, at any speed, and inside the frame budget?
+A wave shooter with a comic tone. A formation of robotic sea creatures advances across the screen,
+drops a row at every turn and speeds up as it thins; the cannon at the bottom moves sideways and
+fires; four shields take the hits until they crumble. What is different is how the aliens **die**:
+every death is computed from the sprite's own pixels — no hand-drawn animation — and its duration
+follows the formation's speed, so the rhythm is never broken. Past a certain speed the cannon fires
+a laser and every death is the shortest one. The black hole is a rare event, never an ordinary hit.
+The eyes tell the alien's state: normal, alarmed when a shot passes close or the wave is fast, hit
+for a few frames before the death.
 
-There is no game here: no movement, no weapon, no score. One alien in the middle of the screen —
-five robotic sea creatures take turns: cuttlefish, octopus, crab, hermit crab, jellyfish, 24×24 —
-and six ways for it to die.
+## The files
+
+| file | |
+|---|---|
+| `crazy_alien.bas` | the game |
+| `deaths.bas` | the test bench for the death effects (the prototype this started from) |
+| `aliens.bi` | **the sprite bank** — replace a creature here and nothing else changes |
+| `effects.bi` | the death engine: five force fields over a list of fragments, and the ghost |
+
+To replace a sprite, edit its block in `aliens.bi`: a header line `Data "NAME", "RRGGBB", "RRGGBB"`
+(name, then the two accent colours) and 24 rows of 24 palette letters (`.` air, `M` metal, `D` dark
+metal, `E` eye, `P` pupil, `Y` lamp, `R` red, `A`/`B` the accents). The bank opens with the sprite
+count and the grid size; the sprite named `CANNON` is the player. Eyes, wings, halos and every death
+are derived from the pixels, so a new creature needs nothing but its picture.
 
 ## Running it
 
-    sb --window bas/demo/crazy_alien/deaths.bas        # SedaiBasic (needs a build with --window)
-    fbc bas/demo/crazy_alien/deaths.bas && ./deaths     # FreeBASIC, unchanged source
+    sb --window bas/demo/crazy_alien/crazy_alien.bas          # the game (needs a build with --window)
+    sb --window bas/demo/crazy_alien/deaths.bas               # the effects bench
+    fbc bas/demo/crazy_alien/crazy_alien.bas && ./crazy_alien # FreeBASIC, unchanged source
+
+Game keys: LEFT/RIGHT or A/D move, SPACE fires, P pauses, F fullscreen, ENTER restarts after a game
+over, Q or ESC quits. `auto=1 frames=N out=<name>` plays the game by itself headless and writes the
+last frame — the way it is tested.
+
+### The effects bench (`deaths.bas`)
 
 | key | |
 |---|---|
