@@ -29,7 +29,7 @@ unit SedaiFileIO;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeVM, SedaiBasicKeywords,
+  Classes, SysUtils, SedaiBytecodeVM, SedaiBasicKeywords, SedaiInputFields,
   // TerminalOutFlush: the console keeps its OWN stdout buffer, so anything that writes through
   // System.Write has to drain it first or the two arrive out of order. See the SCRN/CONS device write.
   SedaiTerminalIO
@@ -111,51 +111,6 @@ implementation
   ⚠️ These use the RAW stdin handle, so they must never be mixed with System.ReadLn(System.Input) on
   the same run: the Text layer keeps its own buffer and the two would each swallow part of the stream.
   StdInBuffered decides ONCE, and every device read goes through one path or the other for good. }
-
-{ An INPUT # FIELD, once the scanner has cut it out of the line - measured against fbc 7 Sep 2026
-  over fourteen forms (DIVERGENZE 169):
-    * LEADING blanks and tabs are not part of the field: "42, text" reads `text`;
-    * TRAILING blanks ARE: "  a  ,  b  " reads `a  ` and `b  `;
-    * a field that OPENS with a quote is the text up to the closing quote, commas included, and
-      the quotes themselves go; blanks after the closing quote go too;
-    * what follows the closing quote is the NEXT field, not this one: `"x"y, z` reads x, y, z. So
-      the helper reports how many units of the raw field it did not consume, and the caller puts
-      the stream back at their start - the delimiter it had swallowed is then read by the next field.
-  Works on the raw UNITS of the encoding (UW bytes each, little-endian) so the byte and the wide
-  scanner share it: a blank, a tab and a quote are ASCII in every encoding this reader knows. }
-procedure TrimInputField(var Raw: string; UW: Integer; out TailUnits: Integer);
-var
-  NUnits, I, J, K: Integer;
-  function UnitCode(Idx: Integer): Integer;   // 0-based unit -> its code, -1 when not ASCII
-  var B: Integer;
-  begin
-    Result := Ord(Raw[Idx * UW + 1]);
-    for B := 2 to UW do
-      if Ord(Raw[Idx * UW + B]) <> 0 then Exit(-1);
-  end;
-  function IsBlank(Idx: Integer): Boolean;
-  begin
-    Result := UnitCode(Idx) in [32, 9];
-  end;
-begin
-  TailUnits := 0;
-  if UW < 1 then UW := 1;
-  NUnits := Length(Raw) div UW;
-  I := 0;
-  while (I < NUnits) and IsBlank(I) do Inc(I);
-  if (I < NUnits) and (UnitCode(I) = Ord('"')) then
-  begin
-    J := I + 1;
-    while (J < NUnits) and (UnitCode(J) <> Ord('"')) do Inc(J);
-    // J is the closing quote, or NUnits when the line ended first (then the field runs to its end)
-    K := J + 1;
-    while (K < NUnits) and IsBlank(K) do Inc(K);
-    if K < NUnits then TailUnits := NUnits - K;
-    Raw := Copy(Raw, (I + 1) * UW + 1, (J - I - 1) * UW);
-  end
-  else if I > 0 then
-    Raw := Copy(Raw, I * UW + 1, (NUnits - I) * UW);
-end;
 
 function TVMFileHandler.CachedSize(Handle: Integer; FS: TFileStream): Int64;
 begin
