@@ -49,6 +49,10 @@ var
   GGetMouseProvider: TGetMouseFn = nil;
   GSetMouseProvider: TSetMouseFn = nil;
   GGetJoystickProvider: TGetJoystickFn = nil;
+  // SCREENRES's driver flags (GFX_FULLSCREEN = bit 0), written by the VM on every SCREENRES and read by
+  // the window presenter at the frame boundary. A knob, not a callback: the two units must not know
+  // each other, and this is the same shape the four providers above use.
+  GGfxScreenFlags: Integer = 0;
 
 // FB MULTIKEY scancode (PC/AT set 1) -> SDL_Scancode. Returns 0 (SDL_SCANCODE_UNKNOWN) if unmapped.
 function ATScancodeToSDL(AT: Integer): Integer;
