@@ -685,6 +685,26 @@ begin
       Exit;
     end;
 
+    // ⛔⛔ AN OUTPUT NAMED *.bas IS A SOURCE FILE, AND WRITING BYTECODE OVER IT DESTROYS IT.
+    // "sbc a.bas b.bas" is how FreeBASIC spells a MULTI-MODULE build - fbc compiles both sources into
+    // one program - and here the second positional is the OUTPUT name, so that command silently
+    // overwrote the user's second source with a .basc image. Measured 7 Sep 2026: b.bas came back as
+    // "OS/2 graphic array" and its text was gone. ⇒ Refuse it, and NAME the reason, because the user
+    // who typed it was not asking for an output file at all (DIVERGENZE 162).
+    // ⚠️ The refusal is on the EXTENSION only: any other output name still works exactly as before,
+    // and "sb prog.bas arg1 arg2" is untouched - there the extra words are the PROGRAM's arguments,
+    // which is what a compiled binary does and what fbc's own runtime does.
+    if (OutputFile <> '') and SameText(ExtractFileExt(OutputFile), '.bas') then
+    begin
+      WriteLn(ErrOutput, 'ERROR: refusing to write bytecode over "', OutputFile,
+              '": a .bas file is SOURCE, and this would destroy it.');
+      WriteLn(ErrOutput, '  If you meant to build a program from SEVERAL modules, as "fbc a.bas b.bas" does:');
+      WriteLn(ErrOutput, '  separate compilation units are not supported (see BASIC.md, "Declared unsupported").');
+      WriteLn(ErrOutput, '  If you meant an output file, give it a .basc extension.');
+      ExitCode := 1;
+      Exit;
+    end;
+
     // Determine output file
     if OutputFile = '' then
       if OptTargetWasm then

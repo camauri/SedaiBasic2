@@ -3461,6 +3461,18 @@ the divergence is deliberate and is not going to be reproduced.
 
 ### Declared unsupported (24 August 2026)
 
+- **A program is ONE compilation unit** (divergence 162). FreeBASIC builds a program from several
+  modules — a main source plus further sources, each its own compilation unit with its own module
+  scope, their symbols bound together through `Public`, `Extern` and `Common`. `sb` and `sbc` take a
+  single source, so a program that needs a second module fails on the symbol it cannot find.
+  ⚠️ This is not `#include`, which works and is textual; what is missing is *separate* units.
+  ⭐ There is no command line on which the extra module could be named: for `sb`, words after the
+  source are the **program's** arguments (`Command$`), exactly as for a binary compiled by `fbc`; for
+  `sbc`, the second positional is the output file — and writing `sbc a.bas b.bas`, which is how
+  FreeBASIC spells a multi-module build, is **refused by name** rather than overwriting the second
+  source. Linking a compilation unit written in C or C++ needs a native object file and a linker, and
+  waits on the native binaries of the dual environment (divergence 163), as inline `Asm` does (51).
+
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
 
 - **`TypeOf` as an exact type**: `Dim As TypeOf(x)` works, but the inferred type is approximated to the
