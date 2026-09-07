@@ -4719,6 +4719,8 @@ function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
 var
   IsFunc: Boolean;
   KindU, PT, ParamTypes: string;
+  LoopMark: Integer;
+  NestedFp: TASTNode;
 begin
   Result := False;
   if not Context.Check(ttProcedureStart) then Exit;
@@ -4743,6 +4745,14 @@ begin
     Context.Advance;                                 // (
     while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]) do
     begin
+      // ⛔⛔ A PARSER LOOP NEEDS A PROGRESS GUARANTEE, and this one had none: it consumed only what it
+      // recognised, so ONE token it could not name and did not skip made it spin for ever. That is not
+      // a hypothetical - "Sub f( ByVal p As Sub( As Sub( ) ) )" hung the compiler outright, and fbc's
+      // own functions/mangling-procptr (line 39) is exactly that shape: it never finished compiling and
+      // read as a TIMEOUT in the suite, which is the one verdict that names nothing.
+      // ⇒ The cursor is remembered here and forced forward at the bottom of the body. A shape nobody
+      // thought of then produces a DIAGNOSTIC downstream instead of a hang, which is the safe direction.
+      LoopMark := Context.CurrentIndex;
       if Context.Check(ttParamMode) then Context.Advance;  // optional BYVAL/BYREF
       // Optional parameter name before AS (FB allows both "as integer" and "x as integer").
       if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
@@ -4753,7 +4763,21 @@ begin
       begin
         Context.Advance;                             // AS
         SkipTypeQualifiers;                     // FB: "As Const <type>"
-        if Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
+        // ⭐ A PARAMETER'S TYPE MAY ITSELF BE A PROCEDURE POINTER - "Sub( As Sub( ) )" - and fbc means
+        // two different types by two different inner signatures. Read it with this same function, which
+        // is what makes any nesting depth terminate, and record it as '#P': the marker this parser
+        // already uses for an inline procedure-pointer parameter, which never collides with another
+        // type because it deliberately means "unknown" (see the overload-duplicate check).
+        if Context.Check(ttProcedureStart) then
+        begin
+          NestedFp := TASTNode.Create(antIdentifier, Context.CurrentToken);
+          try
+            if TryParseProcPtrType(NestedFp) then PT := '#P';
+          finally
+            NestedFp.Free;
+          end;
+        end
+        else if Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
         // Keep the "PTR" suffix on the parameter type (a "T PTR" param is an int address, not a T value).
         // Dropping it recorded a "Cat Ptr" parameter as "Cat", so the indirect call staged the argument
         // with UDT (by-value/handle) semantics instead of passing the pointer, corrupting the callee's arg.
@@ -4766,6 +4790,8 @@ begin
         ParamTypes := ParamTypes + PT;
       end;
       if Context.Check(ttSeparParam) then Context.Advance;   // ,
+      // ...and the guarantee itself: nothing recognised this token, so step over it rather than spin.
+      if Context.CurrentIndex = LoopMark then Context.Advance;
     end;
     if Context.Check(ttDelimParClose) then Context.Advance;  // )
   end;
