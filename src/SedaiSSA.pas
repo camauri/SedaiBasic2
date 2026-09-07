@@ -1041,6 +1041,7 @@ type
     function TypeNameIdentCode(const TypeName: string): Integer;   // ...its overload-IDENTITY twin (DIVERGENZE 8)
     function DeclaredIdentCode(Node: TASTNode): Integer;           // the same, derived from an ARGUMENT        // B1.5 phase 2: type -> narrow code
     function UDTFieldIdentCode(UDTIdx: Integer; const FieldName: string): Integer;  // ...and from a FIELD
+    function IsIntReturningConv(const NameU: string): Boolean;   // CINT/CLNG/... : il RISULTATO e' intero
     function ConvRankFacts(Code: Integer; out Kind, Wid, Sgn, Canon: Integer): Boolean;  // DIVERGENZE 8: the ranking
     function ConvRankOrder(ArgCode, CandCode: Integer): Int64;                           // ...its preference ORDER
     function ConvRankCost(ArgCode, CandCode: Integer): Int64;                            // ...and fbc's own MAGNITUDE
@@ -6426,11 +6427,7 @@ begin
           if FuncName = kTIMEFN then SelImm := 1 else SelImm := 0;
           EmitInstruction(ssaDateStr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
         end
-        else if (FuncName = 'CINT') or (FuncName = 'CLNG') or (FuncName = 'CLNGINT') or
-                (FuncName = kCULNGINT) or
-                (FuncName = 'CSHORT') or (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') or
-                (FuncName = 'CUSHORT') or (FuncName = 'CUINT') or (FuncName = 'CULNG') or
-                (FuncName = kCSIGN) or (FuncName = kCUNSG) then
+        else if IsIntReturningConv(FuncName) then
         begin
           // CSIGN/CUNSG reinterpret the signedness AT THE OPERAND'S WIDTH (see the ConvW block below):
           // CUnsg(Short -1) is a UShort 65535, CSign(UShort 65535) is a Short -1. A 64-bit / unknown-width
@@ -14661,6 +14658,10 @@ begin
         Nm := UpperCase(VarToStr(Node.Value));
         if ((Length(Nm) > 0) and (Nm[Length(Nm)] = '$')) or IsBareStringFunc(Nm) then
           Result := srtString
+        // ⭐ ...and an INTEGER-returning conversion is an INT, not the float default. Asked before the
+        // user-procedure test only because a program may not redefine these names anyway.
+        else if IsIntReturningConv(Nm) then
+          Result := srtInt
         else if FProcedureNames.IndexOf(Nm) >= 0 then
           Result := GetVariableType(Nm);
       end;
@@ -31427,6 +31428,22 @@ begin
   if FPreProcRetPtrSig.IndexOfName(NameU) >= 0 then Exit(FPreProcRetPtrSig.Values[NameU]);
   if FPreFuncRetType.IndexOfName(NameU) >= 0 then
     Result := FuncPtrTypeSig(UpperCase(FPreFuncRetType.Values[NameU]));
+end;
+
+function TSSAGenerator.IsIntReturningConv(const NameU: string): Boolean;
+// The FreeBASIC conversion builtins whose RESULT is an integer, whatever the operand is.
+// ⛔⛔ WHY IT IS A FUNCTION AND NOT A CONDITION AT ITS SITE. This list already existed, written out at
+// the one place that LOWERS these calls - and InferExprBank, which answers "what bank is this
+// expression", did not have it: an antFunctionCall that is neither a string intrinsic nor a user
+// procedure falls through to the FLOAT default, so "CInt( d )" signed the call site 'F'. With
+// "Sub bar( As Integer )" beside "Sub bar( As Double )" that picked the DOUBLE overload - and where
+// the call sits inside bar(Double) itself, as fbc's own structs/obj_meth_static2 writes it, the
+// program recursed for ever and the suite reported a TIMEOUT.
+// ⇒ *A measured list written at one consumer belongs in the funnel every consumer asks.*
+begin
+  Result := (NameU = 'CINT') or (NameU = 'CLNG') or (NameU = 'CLNGINT') or (NameU = kCULNGINT) or
+            (NameU = 'CSHORT') or (NameU = 'CBYTE') or (NameU = 'CUBYTE') or (NameU = 'CUSHORT') or
+            (NameU = 'CUINT') or (NameU = 'CULNG') or (NameU = kCSIGN) or (NameU = kCUNSG);
 end;
 
 function TSSAGenerator.ConvRankFacts(Code: Integer; out Kind, Wid, Sgn, Canon: Integer): Boolean;
