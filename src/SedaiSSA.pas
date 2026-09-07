@@ -3158,7 +3158,19 @@ begin
           TempNode.Free;
         end;
       end
-      else if VarRecordTypeName(VarToStr(Node.Value)) <> '' then
+      // ⛔⛔ A PROCEDURE IS NOT A VARIABLE OF ITS RETURN TYPE. A FUNCTION's own NAME is registered with
+      // its declared return type - that is how its result slot gets the right bank, and RTV_DIAG prints
+      // "FU -> U" for "Function fu( ) As U". So for a function RETURNING a UDT, "@fu" matched the record
+      // branch below and answered the record HANDLE of a variable that does not exist, emitting no
+      // ssaLoadProcAddr at all: the pointer held 0, "p( )" became "CallSubIndirect R0" and jumped to
+      // PC 0, restarting the program for ever. fbc's own functions/ignore-result is that shape, and it
+      // read as a TIMEOUT in the suite.
+      // ⭐ Measured, not guessed: only a UDT returned BY VALUE loses it - Integer, String, Double and
+      // "U Ptr" all emit the address - which is exactly the set VarRecordTypeName answers for.
+      // ⇒ The name is asked of FProcedureNames FIRST, because "is it a procedure" is a fact and "does
+      // some registry hold a type under that name" is an inference.
+      else if (VarRecordTypeName(VarToStr(Node.Value)) <> '') and
+              (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
         // @obj where obj is a UDT value variable: its handle IS the pointer (managed-reference model).
         Result := EnsureIntRegister(GetOrAllocateVariable(UpperCase(VarToStr(Node.Value))))
       else if IsRawAddrLocal(VarToStr(Node.Value)) then
@@ -42253,7 +42265,11 @@ begin
   EmitInstruction(ssaCallSubIndirect, MakeSSAValue(svkNone), PCVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   // Read the result (FUNCTION); a SUB pointer used as a value yields int 0 harmlessly.
   RetRT := srtInt;
-  if RetPart <> '' then RetRT := TypeNameToBank(RetPart, '');
+  // ⛔ A UDT RETURNED BY VALUE IS AN INT HANDLE, and TypeNameToBank answers the FLOAT default for a
+  // name it does not recognise - the trap this file records at the enum line and at DIVERGENZE 151.
+  // Read out of the float slot, an indirect call to "Function( ) As <UDT>" faulted on the handle.
+  if (RetPart <> '') and (FindUDT(CanonicalType(UpperCase(RetPart))) < 0) then
+    RetRT := TypeNameToBank(RetPart, '');
   // A BYREF return arrives as an ADDRESS in the INT result slot; load it there and dereference into the
   // declared return bank. Read straight out of RetRT's slot it was the packed address itself, which is
   // what "Print pb()" printed (4294967296) where fbc printed the referand.
