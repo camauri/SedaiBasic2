@@ -46,7 +46,7 @@ uses
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
   SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiOpcodeBanks,
-  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt
+  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt, SedaiInputFields
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -443,6 +443,10 @@ type
     // clock, which is what makes a self-timing program's output comparable between two engines.
     FFakeClock: Boolean;
     FFakeClockTicks: Int64;
+    // MODERN console INPUT reads a STREAM of fields, not a line per variable (DIVERGENZE 170): the
+    // line read last, and the position of the next field in it. Exhausted = read another line.
+    FConInBuf: string;
+    FConInPos: Integer;
     FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
     // FreeBASIC DIR: ONE directory walk is open at a time, exactly as in fbc - "Dir(spec, mask)" starts
     // it, "Dir()" steps it, and it ends when the entries run out (fbc has no handle to close). The
@@ -594,6 +598,7 @@ type
     function GfxViewH: Integer;
     procedure RecomputeGfxWindow;            // rebuild the WINDOW coefficients against the current viewport
     function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
+    function NextConsoleField: string;             // MODERN INPUT: the next field of the stdin stream
     procedure SetupGfxScreen(W, H, NumPages: Integer);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -15339,10 +15344,7 @@ begin
           // prompt string nor the "? " when standard input is redirected - measured: its own program
           // "Print "start" : Input "enter n"; n" emits just "start" under < /dev/null, while we
           // wrote "enter n? " into the captured output. See GStdinIsTerminal.
-          if GStdinIsTerminal then
-            InputStr := Trim(FInputDevice.ReadLine('? ', False, False, True))
-          else
-            InputStr := Trim(FInputDevice.ReadLine('', False, False, True));
+          InputStr := Trim(NextConsoleField);          // the field stream: see NextConsoleField
           // ⛔ EXHAUSTED INPUT IS A VALUE, NOT AN END. fbc leaves 0 in the variable and runs on -
           // "Dim a As Integer = 7 : Input a : Print a" prints 0 and then the rest of the program -
           // while we STOPPED the program mid-line. Only a STOP request (Ctrl+End, window closed)
@@ -15408,10 +15410,7 @@ begin
         // ⭐ MODERN never refuses - see the integer arm above.
         if Assigned(FProgram) and FProgram.ModernMode then
         begin
-          if GStdinIsTerminal then
-            InputStr := Trim(FInputDevice.ReadLine('? ', False, False, True))
-          else
-            InputStr := Trim(FInputDevice.ReadLine('', False, False, True));
+          InputStr := Trim(NextConsoleField);          // the field stream: see NextConsoleField
           // Exhausted input is a VALUE - see the integer arm.
           if FInputDevice.ShouldStop then
           begin
@@ -15450,13 +15449,19 @@ begin
     15: // bcInputString
       if Assigned(FInputDevice) then
       begin
-        // Print prompt (from Src1 register if set) + "? "
-        if Assigned(FOutputDevice) then
+        // Print prompt (from Src1 register if set) + "? " - in MODERN only at a terminal, as 13 and 14.
+        if Assigned(FOutputDevice) and
+           (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
           if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
-        Ctx.StringRegs[Instr.Dest] := FInputDevice.ReadLine('? ', False, False, False);
+        // MODERN: the field stream, with the field rule (leading blanks off, trailing kept, quotes).
+        // This arm had no MODERN branch at all: it read a whole line per variable, prompt included.
+        if Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.StringRegs[Instr.Dest] := NextConsoleField
+        else
+          Ctx.StringRegs[Instr.Dest] := FInputDevice.ReadLine('? ', False, False, False);
         if FInputDevice.ShouldStop then
         begin
           Ctx.Running := False;
@@ -15624,6 +15629,28 @@ begin
   else
     raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
+end;
+
+function TBytecodeVM.NextConsoleField: string;
+// The next field of console INPUT in the FreeBASIC dialect. fbc reads ONE line per statement and
+// splits it at the commas with the field rule INPUT # uses - and what a statement does not consume
+// stays for the next one: measured 7 Sep 2026, "1, "p"tail, z" read by Input n, a, b gives 1, p,
+// tail, and the following Input n, a gets n from the leftover z (0) and a from the NEXT line. We
+// read one whole line per VARIABLE and never split, so "42, con" into n, a left a empty.
+// ⛔ No prompt at all when nobody is there to read it: fbc writes neither the user's prompt nor
+// the "? " when standard input is redirected (measured; see GStdinIsTerminal).
+begin
+  // FConInPos starts at 0 (a fresh VM): that is "exhausted" too, or the first INPUT of a program
+  // would answer an empty field before reading anything.
+  if (FConInPos < 1) or (FConInPos > Length(FConInBuf)) then
+  begin
+    if GStdinIsTerminal then
+      FConInBuf := FInputDevice.ReadLine('? ', False, False, True)
+    else
+      FConInBuf := FInputDevice.ReadLine('', False, False, True);
+    FConInPos := 1;
+  end;
+  Result := NextInputField(FConInBuf, FConInPos);
 end;
 
 procedure TBytecodeVM.SetupGfxScreen(W, H, NumPages: Integer);

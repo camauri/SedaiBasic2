@@ -11578,7 +11578,9 @@ begin
 
     // For multiple variables: newline only BEFORE the FIRST "?"
     // After first input, ReadLine already moves to new line after ENTER
-    if IsMultiple and (i = 0) then
+    // ⛔ Commodore's, not FreeBASIC's: fbc prints nothing before a multi-variable INPUT, and under a
+    // redirected stdin that newline was the one byte left between us (DIVERGENZE 170).
+    if IsMultiple and (i = 0) and not FModernMode then
     begin
       EmitInstruction(ssaPrintNewLine, MakeSSAValue(svkNone), MakeSSAValue(svkNone),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));

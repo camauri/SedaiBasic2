@@ -3292,7 +3292,7 @@ End Function
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INPUT` | ✓ | Reads values from the keyboard buffer. |
+| `INPUT` | ✓ | Reads values from the keyboard buffer. ⭐ In the FreeBASIC dialect it reads ONE line per statement and splits it at the commas with the same field rule as `INPUT #` (leading blanks dropped, trailing kept, quotes); what a statement does not consume waits for the next one, and with a redirected standard input neither the prompt nor `? ` is written (7 September 2026, net `console_input_check.sh`). |
 | `LINE INPUT` | ✓ | `LINE INPUT [;][prompt;]var` reads a whole line from the console; `LINE INPUT #n, s` from a file (commas not split). |
 | `INPUT()` | ✓ | `INPUT(n)` — reads n characters from the keyboard, unechoed. The INPUT *statement* is unaffected: it is parsed at statement level and never reaches the expression parser. |
 | `WINPUT()` | ✓ | `WINPUT(n)` — reads n wide characters from the keyboard, unechoed. Extended keys are not read. (FreeBASIC itself does not read wide characters from the console.) |
