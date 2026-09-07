@@ -2679,7 +2679,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | Keyword | Status | Description |
 |---|---|---|
 | `DATA` | ✓ |  |
-| `READ` | ✓ |  |
+| `READ` | ✓ | Reads into a `Shared` scalar from inside a procedure, into an @-taken local and into a narrow numeric (`Byte`, `Short`, …) exactly as an assignment would — a `Read b` over a DATA 300 leaves 44 in a `Byte` (7 September 2026, guard m879; the same holds for `INPUT`, `LINE INPUT`, `INPUT #`, `GET #`). |
 | `RESTORE` | ✓ |  |
 
 ##### Debugging
@@ -2987,7 +2987,7 @@ End Function
 | `TIME` | ✓ | Current system time as `"hh:mm:ss"`. Bare (no parens); MODERN-only keyword. |
 | `SETDATE` | ✓ | `SETDATE str` sets the VM-internal current date (OS-safe offset, not the real system clock). |
 | `SETTIME` | ✓ | `SETTIME str` sets the VM-internal current time (OS-safe offset). |
-| `TIMER` | ✓ | Seconds elapsed since midnight (Double). Bare (no parens). |
+| `TIMER` | ✓ | Seconds elapsed since midnight (Double). Bare (no parens). ⭐ In the FreeBASIC dialect it is a **microsecond** clock (7 September 2026): fbc's `Timer` steps by ~1 µs and so does this one. ⚠️ The ORIGIN differs from fbc on Linux, where its `Timer` counts from the Unix epoch: differences agree, absolute values do not. |
 
 ### Error Handling Functions
 

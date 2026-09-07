@@ -1200,6 +1200,7 @@ type
                                       ExprNode: TASTNode; out ExprValue: TSSAValue): Boolean;
     procedure EnsureSharedBackingSized(const VarName: string);
     procedure PublishScalarToHome(const VarName: string; const Val: TSSAValue);
+    procedure PublishInputTarget(const VarName: string; const Reg: TSSAValue);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     procedure ScanForNulStrLiteral(Node: TASTNode);   // DIVERGENZE 98: a literal with an embedded NUL
@@ -10680,6 +10681,51 @@ begin
     EmitSharedScalarStoreVal(VarName, Val);
 end;
 
+procedure TSSAGenerator.PublishInputTarget(const VarName: string; const Reg: TSSAValue);
+// The seam every INPUT-family statement goes through after writing its target's REGISTER: READ,
+// INPUT, LINE INPUT, INPUT #, LINE INPUT #, GET #, GET, GETKEY. They all bind the target with
+// GetOrAllocateVariable and emit into that register, and that was the whole store - so a target
+// whose READERS look somewhere else got nothing. Measured 7 Sep 2026, four lines:
+//
+//     Dim Shared As Integer w
+//     Data 16
+//     Sub L() : Read w : End Sub
+//     L() : Print w                          <- 0 here, 16 in fbc; INPUT and LINE INPUT alike
+//
+// A SHARED scalar inside a Sub is read from element 0 of its backing array, an @-taken local from
+// its frame slot, a raw module scalar from its raw slot: the three homes PublishScalarToHome already
+// knows, written for the assignment path (DIVERGENZE 80, 92, 49). This is the fourth caller of the
+// same rule; the input statements were the one family of writers that had never been told.
+// A plain local or a module scalar lives in its register, and this emits nothing for it.
+// GETMOUSE/GETJOYSTICK are not here: they synthesise an assignment and already take the funnel.
+//
+// ⛔ It is NOT a call to PublishScalarToHome, and the guard is why. That publisher stores the value
+// AS IS, and a SHARED scalar's declared WIDTH is applied by the ASSIGNMENT path on its way to the
+// cell: "Dim Shared As Byte nb : Read nb" over a DATA 300 came back 300 through the plain publisher
+// and 44 through an assignment (fbc: 44). So the value is parked in a named temporary of its own
+// bank and "<target> = <temporary>" is handed to ProcessAssignment - the one machine that knows
+// every home AND every conversion on the way there. Same shape as READ into an array element
+// and GET # into a field (DIVERGENZE 102).
+var
+  TmpName: string;
+  TmpReg: TSSAValue;
+  CopyOp: TSSAOpCode;
+  Assign: TASTNode;
+begin
+  if not (IsRawModuleScalar(VarName) or IsRawAddrLocal(VarName) or IsSharedScalar(VarName)) then Exit;
+  case Reg.RegType of
+    srtInt:    begin TmpName := '__INTMP%'; CopyOp := ssaCopyInt;    end;
+    srtString: begin TmpName := '__INTMP$'; CopyOp := ssaCopyString; end;
+  else         begin TmpName := '__INTMP!'; CopyOp := ssaCopyFloat;  end;
+  end;
+  TmpReg := GetOrAllocateVariable(TmpName);
+  EmitInstruction(CopyOp, TmpReg, Reg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Assign := TASTNode.Create(antAssignment);
+  Assign.AddChild(TASTNode.CreateWithValue(antIdentifier, VarName));
+  Assign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName));
+  try ProcessAssignment(Assign); finally Assign.Free; end;
+end;
+
 function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
 // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
@@ -11590,6 +11636,7 @@ begin
         EmitInstruction(InCopyOp, VarReg, NarrowedIn, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
     end;
+    PublishInputTarget(VarName, VarReg);
   end;
 end;
 
@@ -21574,7 +21621,8 @@ var
   i, ai: Integer;
   Child, StoreAssign: TASTNode;
   VarName, TmpName: string;
-  DestReg: TSSAValue;
+  DestReg, NarrowedRd: TSSAValue;
+  RdCopyOp: TSSAOpCode;
   ElemBank: TSSARegisterType;
   MemberUDT, MemberSlot: Integer;
   MemberBank: TSSARegisterType;
@@ -21597,6 +21645,21 @@ begin
       // STRING, not default to float (which mis-read a string DATA item -> "invalid variant type cast").
       EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(DestReg.RegType)),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // READ into a NARROW numeric is a store to it, exactly as INPUT and INPUT # already are
+      // (DIVERGENZE 123/124): "Dim b As Byte : Read b" over a DATA 300 leaves 44 in fbc, and left
+      // 300 here until the guard for the shared-home seam (m879) read it back. Same funnel, same
+      // per-bank copy.
+      if DestReg.RegType in [srtInt, srtFloat] then
+      begin
+        NarrowedRd := ApplyScalarNarrow(VarName, DestReg, nil);
+        if (NarrowedRd.Kind = svkRegister) and (NarrowedRd.RegType = DestReg.RegType) and
+           (NarrowedRd.RegIndex <> DestReg.RegIndex) then
+        begin
+          if DestReg.RegType = srtFloat then RdCopyOp := ssaCopyFloat else RdCopyOp := ssaCopyInt;
+          EmitInstruction(RdCopyOp, DestReg, NarrowedRd, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end;
+      PublishInputTarget(VarName, DestReg);
     end
     else if Child.NodeType = antArrayAccess then
     begin
@@ -21691,6 +21754,7 @@ begin
     DestReg := GetOrAllocateVariable(VarName);
     EmitInstruction(ssaGet, DestReg, MakeSSAValue(svkNone),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    PublishInputTarget(VarName, DestReg);
   end;
 end;
 
@@ -21709,6 +21773,7 @@ begin
     DestReg := GetOrAllocateVariable(VarName);
     EmitInstruction(ssaGetkey, DestReg, MakeSSAValue(svkNone),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    PublishInputTarget(VarName, DestReg);
   end;
 end;
 
@@ -22853,6 +22918,7 @@ begin
       // Read exactly the variable's declared width (BYTE=1, SHORT=2, LONG=4, else 8); Immediate = byte count.
       EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone),
                       MakeSSAConstInt(BinaryElemBytesOfNode(VarChild)));
+    PublishInputTarget(string(VarChild.Value), VarReg);
     Exit;
   end;
 
@@ -23037,6 +23103,7 @@ begin
           EmitInstruction(InCopyOp, VarReg, NarrowedIn, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
       end;
+      PublishInputTarget(VarName, VarReg);
     end;
     // Skip separators and other nodes
     Inc(i);

@@ -950,7 +950,54 @@ uses
   // Only for AttachGraphicsToOutput: the headless text device is the one that has to be TOLD about the
   // drawing surface, because unlike sbv's controller it is not the graphics backend itself. In the
   // implementation section so the interface of this unit stays free of it.
-  SedaiTerminalIO;
+  SedaiTerminalIO
+  {$IFDEF UNIX}, BaseUnix, Unix{$ENDIF}   // fpgettimeofday (unit Unix): TIMER's microsecond clock (HighResSecondsOfDay)
+  {$IFDEF WINDOWS}, Windows{$ENDIF};   // QueryPerformanceCounter, same purpose
+
+{$IFDEF WINDOWS}
+var
+  GTimerQpcFreq, GTimerQpcAnchor: Int64;
+  GTimerWallAnchor: Double;
+{$ENDIF}
+
+{ TIMER's clock for the FreeBASIC dialect: seconds since local midnight, MICROSECOND resolution.
+  Unix reads gettimeofday directly - the same source Now() is built from, minus the truncation to
+  milliseconds Now() applies on the way to a day serial. Windows has no sub-millisecond wall clock in
+  the RTL, so it anchors the wall clock ONCE to QueryPerformanceCounter and advances by the counter:
+  the sub-millisecond part is then real, and the drift between the two clocks over a session is far
+  below anything a program can observe. ClockOffsetDays is SETDATE/SETTIME's shift, in days. }
+function HighResSecondsOfDay(ClockOffsetDays: Double): Double;
+{$IFDEF UNIX}
+var
+  tv: TTimeVal;
+  secs, usec: Int64;
+begin
+  fpgettimeofday(@tv, nil);
+  secs := Int64(tv.tv_sec) - Int64(GetLocalTimeOffset) * 60;    // UTC -> local, as Now() does
+  usec := tv.tv_usec;
+  // ⛔ Every operand is cast to Double ON PURPOSE. FPC types a real literal as the SMALLEST type that
+  // holds it exactly, so "1000000.0" and "86400.0" are SINGLE, and the first draft of this line came
+  // out in 32-bit arithmetic: 81971.90625 for every reading, steps of 1/128 s - WORSE than the
+  // millisecond clock it replaced. Measured 7 Sep 2026 (smallest delta 7812 us).
+  Result := Double(secs mod 86400) + Double(usec) / Double(1000000) + ClockOffsetDays * Double(86400);
+  Result := Result - Floor(Result / Double(86400)) * Double(86400);
+end;
+{$ELSE}
+var
+  qpc: Int64;
+begin
+  if GTimerQpcFreq = 0 then
+  begin
+    QueryPerformanceFrequency(GTimerQpcFreq);
+    QueryPerformanceCounter(GTimerQpcAnchor);
+    GTimerWallAnchor := Frac(Now) * Double(86400);
+  end;
+  QueryPerformanceCounter(qpc);
+  Result := GTimerWallAnchor + Double(qpc - GTimerQpcAnchor) / Double(GTimerQpcFreq) +
+            ClockOffsetDays * Double(86400);                    // Double casts: see the Unix branch
+  Result := Result - Floor(Result / Double(86400)) * Double(86400);
+end;
+{$ENDIF}
 
 { Trigonometry comes from the platform C library, NOT from FPC's RTL.
   FPC lowers Sin/Cos/Tan onto the x87's fsin/fcos, whose argument reduction carries pi to 66 bits.
@@ -13708,6 +13755,16 @@ begin
           else
             Ctx.FloatRegs[Instr.Dest] := 45000.0 + FFakeClockTicks * 0.001 / 86400.0;  // NOW: serial
         end
+        else if (Instr.Immediate = 1) and Assigned(FProgram) and FProgram.ModernMode then
+          // ⭐ TIMER in the FreeBASIC dialect reads a MICROSECOND clock. fbc's Timer moves in ~1 us
+          // steps (measured 7 Sep 2026 on linux-x86_64: smallest positive delta 0.95 us); Now() is a
+          // day serial built from MILLISECONDS, so a TIMER derived from it moved in 1 ms steps and a
+          // 0.3 ms frame timed with "Timer - t0" read 0 or 1 - which is how the death-effects demo
+          // found it. The ORIGIN stays midnight, local time (declared in BASIC.md; fbc's own origin
+          // differs per platform), and SETDATE/SETTIME's offset still applies: only the resolution
+          // changes. CLASSIC keeps the serial-based clock below, on purpose - the Commodore TI it
+          // stands in for ticks in jiffies, and nothing there can see a microsecond.
+          Ctx.FloatRegs[Instr.Dest] := HighResSecondsOfDay(FClockOffsetDays)
         else
         begin
           dtVal := Now + FClockOffsetDays;
