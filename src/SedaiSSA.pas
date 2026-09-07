@@ -427,6 +427,7 @@ type
     // one, so the rank rule may not be asked of it. This set is what tells the two apart, and it is
     // filled from the DECLARATION's own dimension list, which is the only place that knows.
     FRankStatedArrays: TStringList;
+    FArrRankOfSlot: TStringList;         // SLOTNAME=<rank>: the rank a REDIM fixed, per SLOT (B2 err 36)
     // ⛔ ...and the names DECLARED MORE THAN ONCE, which leave the set for good. This registry is keyed
     // on a bare NAME with no scope - the trap this codebase has paid for repeatedly - and the fbc
     // suite's overload/bydesc declares "array2" in eight sibling TEST blocks with FOUR different ranks.
@@ -1775,6 +1776,8 @@ begin
   FWStringVars.CaseSensitive := False;
   FRedimMultiArrays := TStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
+  FArrRankOfSlot := TStringList.Create;
+  FArrRankOfSlot.CaseSensitive := False;
   FRankStatedArrays := TStringList.Create;
   FRankStatedArrays.CaseSensitive := False;
   FRankPoisoned := TStringList.Create;
@@ -1926,6 +1929,7 @@ begin
   FVarPtrQuals.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
+  FArrRankOfSlot.Free;
   FRankStatedArrays.Free;
   FRankPoisoned.Free;
   FArrShapeDyn.Free;
@@ -13298,6 +13302,18 @@ begin
     // rule below - which then declared a fresh array on every ReDim of such a slot and cost 66 failing
     // assertions across six tests. A registry that nothing reads is not right; it is unobserved.
     NoteArrayShape(DeclArrName, (ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1') or HasAnyDim);
+    // ⭐ ...and the same declaration fixes the array's RANK, filed under the SLOT beside its shape
+    // (B2, fbc error 36). Only for a DYNAMIC one: a FIXED array re-dimensioned at all is fbc's
+    // "error 4: this array cannot be re-dimensioned", a different refusal that already exists, and
+    // answering error 36 there would be a refusal for the wrong reason.
+    // ⛔ THE FIRST ReDim OF A NAME NEVER DECLARED ARRIVES HERE, not in ProcessRedim - it is lowered as
+    // the DIM it also is (FROMREDIM) - which is why ProcessRedim alone saw only the SECOND of two and
+    // had nothing to compare it with. Instrumented rather than reasoned about: RANK_DIAG=1 printed one
+    // "redim" line where two were expected.
+    if ((ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1') or HasAnyDim) and
+       (DeclArrName <> '') and (Pos('.', DeclArrName) = 0) and (DimCount >= 1) then
+      if FArrRankOfSlot.Values[UpperCase(DeclArrName)] = '' then
+        FArrRankOfSlot.Values[UpperCase(DeclArrName)] := IntToStr(DimCount);
     if HasLowerBounds then
       FProgram.SetArrayLowerBounds(ArrayIdx, LowerBounds);
 
@@ -13647,7 +13663,8 @@ procedure TSSAGenerator.ProcessRedim(Node: TASTNode);
 // the upper bounds / size change). PRESERVE keeps the flat element order up to the new size.
 var
   j, di, ArrayIdx, MSlot, MDimCount, UdtIdx, MElemUDT: Integer;
-  ArrName, MTypeName, ElemUdtName: string;
+  ArrName, MTypeName, ElemUdtName, SlotRankKey: string;
+  PrevRank: Integer;
   ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode, StaticArr, ThisArrNode: TASTNode;
   UbValue, UbReg, MHandle, LbVal, MArrHandle: TSSAValue;
   MElemBank: TSSARegisterType;
@@ -13880,6 +13897,34 @@ begin
        (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
       raise Exception.CreateFmt('Wrong number of dimensions for %s: it was declared with %d, ' +
         'this ReDim gives %d', [ArrName, FProgram.GetArray(ArrayIdx).DimCount, DimsNode.ChildCount]);
+
+    // ⭐⭐ ...AND A REDIM FIXES THE RANK TOO, not only a DIM with subscripts (B2, fbc error 36).
+    // Measured: "Dim a()" states NO rank - "Dim a() : ReDim a(0 To 1, 0 To 1)" is accepted by fbc and
+    // by us - so the FIRST ReDim is what fixes it, and "ReDim a(0 To 1) : ReDim a(0 To 1, 0 To 1)" is
+    // an error. FRankStatedArrays could not say this: it is written by a pre-scan from DIM nodes only.
+    // ⛔⛔ AND IT IS KEYED ON THE **SLOT**, not on the bare name, which is the difference between a
+    // refusal and a WRONG refusal. Two same-named arrays of different rank in sibling Scopes - or one
+    // in a Sub beside a module-level one - are two arrays and both are legal; fbc accepts them and so
+    // must we. The slot is what the scope walk already resolved, so the fact lands where the array is,
+    // exactly as NoteArrayShape files fixed-or-dynamic. Seventh member of the family in
+    // `job/markdown/REGISTRI.md`.
+    // ⛔ A MANGLED name (a block-scoped or STATIC-hoisted array) and an array PARAMETER are out for the
+    // same reasons the check above states them.
+    if GetEnvironmentVariable('RANK_DIAG') = '1' then
+      WriteLn(StdErr, '[RANK] gate name="', ArrName, '" dot=', Pos('.', ArrName),
+              ' runtimeLB=', UsesRuntimeLBound(ArrayIdx, ArrName), ' dims=', DimsNode.ChildCount);
+    if (Pos('.', ArrName) = 0) and (not UsesRuntimeLBound(ArrayIdx, ArrName)) then
+    begin
+      SlotRankKey := UpperCase(FProgram.GetArray(ArrayIdx).Name);
+      if GetEnvironmentVariable('RANK_DIAG') = '1' then
+        WriteLn(StdErr, '[RANK] redim name="', ArrName, '" slot="', SlotRankKey, '" dims=',
+                DimsNode.ChildCount, ' prev=', FArrRankOfSlot.Values[SlotRankKey]);
+      PrevRank := StrToIntDef(FArrRankOfSlot.Values[SlotRankKey], 0);
+      if (PrevRank >= 1) and (PrevRank <> DimsNode.ChildCount) then
+        raise Exception.CreateFmt('Wrong number of dimensions for %s: a previous ReDim gave %d, ' +
+          'this one gives %d', [ArrName, PrevRank, DimsNode.ChildCount]);
+      if PrevRank = 0 then FArrRankOfSlot.Values[SlotRankKey] := IntToStr(DimsNode.ChildCount);
+    end;
 
     if DimsNode.ChildCount = 1 then
     begin
