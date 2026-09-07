@@ -4,8 +4,9 @@ An exploratory prototype for a wave shooter with a comic tone: the enemies will 
 but their **deaths are entirely computed** — no hand-drawn animation. This program answers one
 question only: do the effects hold up visually, at any speed, and inside the frame budget?
 
-There is no game here: no movement, no weapon, no score. One test sprite in the middle of the
-screen, and six ways for it to die.
+There is no game here: no movement, no weapon, no score. One alien in the middle of the screen —
+five robotic sea creatures take turns: cuttlefish, octopus, crab, hermit crab, jellyfish, 24×24 —
+and six ways for it to die.
 
 ## Running it
 
@@ -15,15 +16,20 @@ screen, and six ways for it to die.
 | key | |
 |---|---|
 | `1` … `6` | disintegration · tornado · freeze and melt · char · black hole · ghost |
+| `N` | next species |
+| `S` | twenty at once — every species, a random effect each |
+| `F` | fullscreen on/off |
 | `+` / `-` | death duration, 0.05 s to 2 s (shown on screen) |
-| `S` | twenty deaths at once — the worst case |
 | `Q` | quit |
+
+Everything is drawn in a logical 320×240 and shown at `scale=2` (each logical pixel a 2×2 block);
+`scale=1` gives the native size, `fullscreen=1` starts on the whole monitor.
 
 The screen shows the frame time (median, p99, worst of the last 120 frames) and the live fragment count.
 
 Headless runs, for measuring without a window:
 
-    sb deaths.bas run=bench effect=3 many=1        # 240 frames at 60 Hz, twenty deaths; stats to bench.txt
+    sb deaths.bas run=bench effect=3 many=1        # 240 frames at 60 Hz, twenty deaths of ONE effect; stats to bench.txt
     sb deaths.bas run=capture effect=5 dur=0.15    # stills at 20/45/70/95 % of one death, as PPM
 
 ## How it works
@@ -38,23 +44,24 @@ Every effect takes a **duration** and is written in normalised time (0 at the hi
 the same trajectory plays at any speed: in the game the duration will follow the wave's speed. The
 source explains, at each force field, what it produces and what moving the key constants would do.
 
-## What the prototype measured (7 September 2026, 640×480, 16×16 sprite, 60 Hz step)
+## What the prototype measured (7 September 2026, logical 320×240 at scale 2, 24×24 sprites, 60 Hz step)
 
-Frame time in ms, one death / twenty simultaneous deaths:
+Frame time in ms, one death / twenty simultaneous deaths of the same effect (11 520 fragments):
 
 | effect | fbc median | fbc p99 | sb median | sb p99 |
 |---|---:|---:|---:|---:|
-| 1 disintegration | 0.07 / 0.19 | 0.09 / 0.37 | 0.90 / 3.05 | 1.22 / 3.51 |
-| 2 tornado | 0.07 / 0.22 | 0.09 / 0.31 | 0.90 / 3.69 | 1.09 / 4.21 |
-| 3 freeze and melt | 0.06 / 0.25 | 0.09 / 0.39 | 0.84 / 3.28 | 1.12 / 5.42 |
-| 4 char | 0.06 / 0.28 | 0.13 / 1.40 | 0.88 / 3.35 | 1.00 / 5.58 |
-| 5 black hole | 0.07 / 0.26 | 0.10 / 0.47 | 0.93 / **5.76** | 1.15 / **6.52** |
-| 6 ghost | 0.07 / 0.25 | 0.13 / 1.29 | 0.87 / 3.81 | 1.09 / 5.09 |
+| 1 disintegration | 0.12 / 1.17 | 0.25 / 1.79 | 0.95 / 6.40 | 1.15 / 7.87 |
+| 2 tornado | 0.10 / 0.92 | 0.13 / 1.79 | 0.96 / 7.55 | 1.14 / 8.04 |
+| 3 freeze and melt | 0.11 / 1.28 | 0.25 / 1.79 | 0.94 / 6.46 | 1.39 / 10.64 |
+| 4 char | 0.13 / 1.36 | 0.17 / 1.73 | 1.00 / 7.18 | 1.43 / 9.05 |
+| 5 black hole | 0.07 / 0.60 | 0.13 / 1.24 | 1.24 / **12.83** | 1.58 / **14.71** |
+| 6 ghost | 0.12 / 1.54 | 0.53 / 6.15 | 1.02 / 6.31 | 1.28 / 9.26 |
 
-Twenty deaths cost under a third of a 16.7 ms frame on the interpreter and a fiftieth of it compiled.
-The black hole is the most expensive fragment effect (a square root, a division and a `Line` per
-fragment); the ghost is the most expensive per sprite (five `PSet` per pixel plus three filled
-ellipses) but has no fragment list to grow.
+`sb --aot` brings the black hole's twenty to 3.3 ms median; `--jit` does not help here (its loops
+contain graphics opcodes it does not compile). Twenty deaths stay inside a 16.7 ms frame on every
+engine; the black hole is the most expensive fragment effect (a square root, a division and a `Line`
+per fragment — the same 12.5 ms at scale 1, so it is the arithmetic, not the pixels), the ghost the
+most expensive per sprite (five plots per pixel plus three filled ellipses).
 
 Shortest duration at which each effect still reads (from stills at 60 Hz):
 
