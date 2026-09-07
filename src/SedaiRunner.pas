@@ -109,6 +109,12 @@ type
   { Exception for runner errors }
   ESedaiRunnerError = class(Exception);
 
+{ PHASE_DIAG=1 - per-phase compile TIME, in milliseconds. See the bodies in the implementation. }
+procedure PhaseBegin;
+procedure PhaseMark(const PhaseName: string);
+procedure PhaseTotal(const InstructionCount: Integer);
+function PhaseDiagOn: Boolean;
+
 implementation
 
 uses
@@ -140,6 +146,51 @@ uses
 
   Ora il fallimento PARLA. E OPT_STRICT=1 lo fa RILANCIARE, cosi' le reti possono pretendere che
   nessun passo fallisca invece di misurarne solo il risultato finale. }
+{ PHASE_DIAG=1 — per-phase compile TIME, in milliseconds.
+  ⛔ WHY IT EXISTS (7 Sep 2026). Compile time had no honest instrument. `--stats` times the SSA
+  passes, the bytecode passes and their total — and NOT the preprocessor, the lexer, the parser or
+  the run, so on a file whose macros expand into tens of thousands of instructions it reported
+  "3942 ms" for a command that had not finished after four minutes. A total that omits phases is
+  worse than no total: it is a number that invites the wrong conclusion. ⛔ And `perf` cannot fill
+  the gap — an FPC release binary has no frame pointers, so its INCLUSIVE call graph is invalid and
+  only self times are evidence. This prints one line per phase, and one total that covers them all. }
+var
+  GPhaseDiag: Boolean = False;
+  GPhaseT0: QWord = 0;
+  GPhaseLast: QWord = 0;
+
+procedure PhaseMark(const PhaseName: string);
+var
+  Now_: QWord;
+begin
+  if not GPhaseDiag then Exit;
+  Now_ := GetTickCount64;
+  WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)',
+          [PhaseName, Int64(Now_ - GPhaseLast), Int64(Now_ - GPhaseT0)]));
+  Flush(ErrOutput);
+  GPhaseLast := Now_;
+end;
+
+procedure PhaseBegin;
+begin
+  GPhaseDiag := GetEnvironmentVariable('PHASE_DIAG') = '1';
+  GPhaseT0 := GetTickCount64;
+  GPhaseLast := GPhaseT0;
+end;
+
+function PhaseDiagOn: Boolean;
+begin
+  Result := GPhaseDiag;
+end;
+
+procedure PhaseTotal(const InstructionCount: Integer);
+begin
+  if not GPhaseDiag then Exit;
+  WriteLn(ErrOutput, Format('[PHASE] TOTAL %d ms, %d bytecode instructions',
+          [Int64(GetTickCount64 - GPhaseT0), InstructionCount]));
+  Flush(ErrOutput);
+end;
+
 procedure OptPassFailed(const PassName: string; E: Exception);
 begin
   WriteLn(ErrOutput, '[OPT] il passo ', PassName, ' e'' FALLITO: ',
@@ -318,6 +369,7 @@ var
 begin
   Result := nil;
   FLastError := '';
+  PhaseBegin;
 
   if not FileExists(FileName) then
   begin
@@ -434,6 +486,7 @@ begin
         Exit(nil);
       end;
     end;
+    PhaseMark('preprocess');
 
     // === LEXING ===
     // Dialect auto-selected at LOAD by content: a program with line numbers is
@@ -450,6 +503,7 @@ begin
 
       try
         TokenList := Lexer.ScanAllTokensFast;
+        PhaseMark('lex');
         if FVerbose then
           WriteLn('Tokenized ', Lexer.TokenCount, ' tokens');
       except
@@ -465,6 +519,7 @@ begin
       try
         try
           ParserResult := Parser.Parse(TokenList);
+          PhaseMark('parse');
 
           if not ParserResult.Success then
           begin
@@ -492,6 +547,7 @@ begin
       try
         try
           SSAProgram := SSAGen.Generate(ParserResult.AST);
+          PhaseMark('ssa-gen');
 
           if not Assigned(SSAProgram) then
           begin
@@ -511,14 +567,15 @@ begin
         // === SSA OPTIMIZATIONS ===
         {$IFNDEF DISABLE_DBE}
         {$IFNDEF DISABLE_SUB_INLINING}
-        try SSAProgram.RunSubInlining; except on E: Exception do OptPassFailed('SubInlining', E); end;   // unification: before everything
+        try SSAProgram.RunSubInlining; except on E: Exception do OptPassFailed('SubInlining', E); end; PhaseMark('SubInlining');   // unification: before everything
         {$ENDIF}
-        try SSAProgram.RunDBE; except on E: Exception do OptPassFailed('DBE', E); end;
+        try SSAProgram.RunDBE; except on E: Exception do OptPassFailed('DBE', E); end; PhaseMark('DBE');
         {$ENDIF}
 
         {$IFNDEF DISABLE_DOMINATOR_TREE}
         try
           SSAProgram.BuildDominatorTree;
+          PhaseMark('DominatorTree');
         except
           on E: Exception do
           begin
@@ -543,27 +600,27 @@ begin
         // GVN or CSE
         {$IFNDEF DISABLE_GVN}
         {$IFDEF DISABLE_CSE}
-        try SSAProgram.RunGVN; except on E: Exception do OptPassFailed('GVN', E); end;
+        try SSAProgram.RunGVN; except on E: Exception do OptPassFailed('GVN', E); end; PhaseMark('GVN');
         {$ENDIF}
         {$ENDIF}
 
         {$IFNDEF DISABLE_CSE}
         {$IFDEF DISABLE_GVN}
-        try SSAProgram.RunCSE; except on E: Exception do OptPassFailed('CSE', E); end;
+        try SSAProgram.RunCSE; except on E: Exception do OptPassFailed('CSE', E); end; PhaseMark('CSE');
         {$ENDIF}
         {$ENDIF}
 
         // Other optimizations
         {$IFNDEF DISABLE_ALGEBRAIC}
-        try SSAProgram.RunAlgebraic; except on E: Exception do OptPassFailed('Algebraic', E); end;
+        try SSAProgram.RunAlgebraic; except on E: Exception do OptPassFailed('Algebraic', E); end; PhaseMark('Algebraic');
         {$ENDIF}
 
         {$IFNDEF DISABLE_STRENGTH_RED}
-        try SSAProgram.RunStrengthReduction; except on E: Exception do OptPassFailed('StrengthReduction', E); end;
+        try SSAProgram.RunStrengthReduction; except on E: Exception do OptPassFailed('StrengthReduction', E); end; PhaseMark('StrengthReduction');
         {$ENDIF}
 
         {$IFNDEF DISABLE_GOSUB_INLINE}
-        try SSAProgram.RunGosubInlining; except on E: Exception do OptPassFailed('GosubInlining', E); end;
+        try SSAProgram.RunGosubInlining; except on E: Exception do OptPassFailed('GosubInlining', E); end; PhaseMark('GosubInlining');
         {$ENDIF}
 
         // ⛔ CONST_PROP RIMOSSO DALLA PIPELINE (21 ago 2026). Non e' stato spento: e' STACCATO,
@@ -582,11 +639,11 @@ begin
         // riscriverla sui REGISTRI invece che sulle variabili, e a quel punto sarebbe un passo nuovo.
 
         {$IFNDEF DISABLE_COPY_PROP}
-        try SSAProgram.RunCopyProp; except on E: Exception do OptPassFailed('CopyProp', E); end;
+        try SSAProgram.RunCopyProp; except on E: Exception do OptPassFailed('CopyProp', E); end; PhaseMark('CopyProp');
         {$ENDIF}
 
         {$IFNDEF DISABLE_LICM}
-        try SSAProgram.RunLICM; except on E: Exception do OptPassFailed('LICM', E); end;
+        try SSAProgram.RunLICM; except on E: Exception do OptPassFailed('LICM', E); end; PhaseMark('LICM');
         {$ENDIF}
 
         {$IFNDEF DISABLE_LOOP_UNROLL}
@@ -595,15 +652,16 @@ begin
           SSAProgram.BuildDominatorTree;
           SSAProgram.RunLoopUnrolling;
         except on E: Exception do OptPassFailed('LoopUnrolling', E); end;
+        PhaseMark('LoopUnrolling'); PhaseMark('LoopUnrolling');
         {$ENDIF}
 
         {$IFNDEF DISABLE_DCE}
-        try SSAProgram.RunDCE; except on E: Exception do OptPassFailed('DCE', E); end;
+        try SSAProgram.RunDCE; except on E: Exception do OptPassFailed('DCE', E); end; PhaseMark('DCE');
         {$ENDIF}
 
         // B4 bounds-check elimination hints (after DCE, before PHI elimination)
         {$IFNDEF DISABLE_RANGE_ANALYSIS}
-        try SSAProgram.RunRangeAnalysis; except on E: Exception do OptPassFailed('RangeAnalysis', E); end;
+        try SSAProgram.RunRangeAnalysis; except on E: Exception do OptPassFailed('RangeAnalysis', E); end; PhaseMark('RangeAnalysis');
         {$ENDIF}
 
         // PHI Elimination
@@ -623,7 +681,7 @@ begin
 
         // Copy Coalescing
         {$IFNDEF DISABLE_COPY_COAL}
-        try SSAProgram.RunCopyCoalescing; except on E: Exception do OptPassFailed('CopyCoalescing', E); end;
+        try SSAProgram.RunCopyCoalescing; except on E: Exception do OptPassFailed('CopyCoalescing', E); end; PhaseMark('CopyCoalescing');
         {$ENDIF}
 
         // String temp fusion: let a string primitive write straight into its destination register.
@@ -633,11 +691,11 @@ begin
         // exactly one definition and one use. STRFUSE=0 turns it off.
         if GetEnvironmentVariable('STRFUSE') <> '0' then
         begin
-          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end;
-          try SSAProgram.RunAscMidFusion; except on E: Exception do OptPassFailed('AscMidFusion', E); end;
-          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end;
-          try SSAProgram.RunConcatCharFusion; except on E: Exception do OptPassFailed('ConcatCharFusion', E); end;
-          try SSAProgram.RunConcatDeadSourceMark; except on E: Exception do OptPassFailed('ConcatDeadSourceMark', E); end;
+          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end; PhaseMark('StringTempFusion');
+          try SSAProgram.RunAscMidFusion; except on E: Exception do OptPassFailed('AscMidFusion', E); end; PhaseMark('AscMidFusion');
+          try SSAProgram.RunStringTempFusion; except on E: Exception do OptPassFailed('StringTempFusion', E); end; PhaseMark('StringTempFusion');
+          try SSAProgram.RunConcatCharFusion; except on E: Exception do OptPassFailed('ConcatCharFusion', E); end; PhaseMark('ConcatCharFusion');
+          try SSAProgram.RunConcatDeadSourceMark; except on E: Exception do OptPassFailed('ConcatDeadSourceMark', E); end; PhaseMark('ConcatDeadSourceMark');
         end;
 
         // Register Allocation
@@ -681,18 +739,18 @@ begin
 
           // === BYTECODE OPTIMIZATIONS ===
           {$IFNDEF DISABLE_PEEPHOLE}
-          try RunPeephole(Result); except on E: Exception do OptPassFailed('Peephole', E); end;
+          try RunPeephole(Result); except on E: Exception do OptPassFailed('Peephole', E); end; PhaseMark('Peephole');
           {$ENDIF}
 
           {$IFNDEF DISABLE_SUPERINSTRUCTIONS}
           // The engine gate lives inside RunSuperinstructions - four callers, one place.
           if not FSkipSuperinstructions then
-            try RunSuperinstructionsAot(Result, SSAProgram); except on E: Exception do OptPassFailed('Superinstructions', E); end;
+            try RunSuperinstructionsAot(Result, SSAProgram); except on E: Exception do OptPassFailed('Superinstructions', E); end; PhaseMark('Superinstructions');
           {$ENDIF}
 
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_NOP_COMPACTION}
-          try RunNopCompaction(Result); except on E: Exception do OptPassFailed('NopCompaction', E); end;
+          try RunNopCompaction(Result); except on E: Exception do OptPassFailed('NopCompaction', E); end; PhaseMark('NopCompaction');
           {$ENDIF}
           {$ENDIF}
 
@@ -718,6 +776,7 @@ begin
             RunNopCompaction(Result);
             {$ENDIF}
           except on E: Exception do OptPassFailed('Peephole2', E); end;
+          PhaseMark('Peephole2'); PhaseMark('Peephole2');
           {$ENDIF}
           {$ENDIF}
           {$ENDIF}
@@ -725,10 +784,12 @@ begin
           // Register Compaction
           {$IFNDEF DISABLE_ALL_OPTIMIZATIONS}
           {$IFNDEF DISABLE_REG_COMPACTION}
-          try RunRegisterCompaction(Result); except on E: Exception do OptPassFailed('RegisterCompaction', E); end;
+          try RunRegisterCompaction(Result); except on E: Exception do OptPassFailed('RegisterCompaction', E); end; PhaseMark('RegisterCompaction');
           {$ENDIF}
           {$ENDIF}
 
+          PhaseMark('bytecode-total');
+          PhaseTotal(Result.GetInstructionCount);
           if FVerbose then
             WriteLn('Compiled ', Result.GetInstructionCount, ' instructions');
 
