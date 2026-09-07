@@ -122,6 +122,30 @@ type
     { Make a NOP instruction }
     procedure MakeNop(Index: Integer);
 
+    { ⭐⭐ THE MAINTAINED INDEX (7 Sep 2026) — why the pass stopped being QUADRATIC.
+      `IsJumpTarget` and `RegReadElsewhere` each answered by scanning the WHOLE program, and both are
+      asked once per fusion CANDIDATE, so the pass cost O(instructions²). 📊 Measured on fbc's own
+      compound/select_const2 at 1/2/3/4/8 macro groups: 76 / 284 / 607 / 1052 / 4632 ms — x4.4 per
+      doubling of the program, 75 s on the whole file and the largest single cost of the compile.
+      ⇒ Two counters, built once and kept exact:
+        FIdxTargetCount[i]  — how many instructions carry i as a jump target;
+        FIdxReadCount[b][r] — how many instructions read register r of bank b.
+      ⛔ IT IS EXACT ONLY BECAUSE THE PASS HAS EXACTLY ONE WAY TO MUTATE THE PROGRAM. This unit
+      touches FProgram through three methods and no others (GetInstruction / GetInstructionCount /
+      SetInstruction), the instruction COUNT never changes (a fusion NOPs, it never removes), and
+      every write now goes through WriteInstr, which un-counts the old instruction and counts the new
+      one. Adding a fourth way to write an instruction without routing it here silently rots both
+      answers — and a stale "nothing reads this" is a DELETED definition, i.e. a miscompile, not a
+      missed fusion. }
+  private
+    FIdxTargetCount: array of Integer;
+    FIdxReadCount: array[TRegBank] of array of Integer;
+  private
+    procedure IndexBuild;
+    procedure IndexApply(const Instr: TBytecodeInstruction; Delta: Integer);
+    procedure WriteInstr(Index: Integer; const Instr: TBytecodeInstruction);
+    function InstrReadsReg(const Instr: TBytecodeInstruction; Reg: Word; Bank: TRegBank): Boolean;
+
   public
     constructor Create(AProgram: TBytecodeProgram);
     // The AOT's PC mask (see AotEligiblePCMask). Set it before Run when a compiler will run.
@@ -167,6 +191,9 @@ implementation
 uses SedaiDebug;
 {$ENDIF}
 
+{ Forward: defined further down with the note that explains why rbUnknown must read as "maybe". }
+function FieldMayName(FieldBank, Wanted: TRegBank): Boolean; forward;
+
 { TSuperinstructionOptimizer }
 
 constructor TSuperinstructionOptimizer.Create(AProgram: TBytecodeProgram);
@@ -184,7 +211,105 @@ begin
   FillChar(NopInstr, SizeOf(NopInstr), 0);
   NopInstr.OpCode := bcNop;
   // All other fields are already 0 from FillChar
-  FProgram.SetInstruction(Index, NopInstr);
+  WriteInstr(Index, NopInstr);
+end;
+
+{ The single write funnel: un-count what was there, write, count what is there now. }
+procedure TSuperinstructionOptimizer.WriteInstr(Index: Integer; const Instr: TBytecodeInstruction);
+begin
+  if Length(FIdxTargetCount) > 0 then
+    IndexApply(FProgram.GetInstruction(Index), -1);
+  FProgram.SetInstruction(Index, Instr);       // ⛔ the ONLY SetInstruction in this unit
+  if Length(FIdxTargetCount) > 0 then
+    IndexApply(Instr, +1);
+end;
+
+{ Add (Delta=+1) or remove (Delta=-1) one instruction's whole contribution to both counters. }
+procedure TSuperinstructionOptimizer.IndexApply(const Instr: TBytecodeInstruction; Delta: Integer);
+var
+  Cand: array[0..10] of Integer;
+  NCand, k, m: Integer;
+  C: SedaiOpcodeBanks.TImmRegCandidates;
+  B: TRegBank;
+  R: Integer;
+
+  procedure Want(V: Integer);
+  var j: Integer;
+  begin
+    if (V < 0) or (V > High(Word)) then Exit;
+    for j := 0 to NCand - 1 do if Cand[j] = V then Exit;
+    if NCand > High(Cand) then Exit;
+    Cand[NCand] := V; Inc(NCand);
+  end;
+
+begin
+  // the JUMP TARGET half
+  if OpCarriesJumpTarget(Instr.OpCode) then
+  begin
+    R := Instr.Immediate;
+    if (R >= 0) and (R < Length(FIdxTargetCount)) then
+      Inc(FIdxTargetCount[R], Delta);
+  end;
+
+  // the READ half. Only these fields can name a register, so only these numbers can be affected -
+  // and whether each one really IS a read is decided by InstrReadsReg, the one predicate
+  // RegReadElsewhere itself asks, so the index cannot disagree with the question it answers.
+  NCand := 0;
+  Want(Instr.Src1);
+  Want(Instr.Src2);
+  Want(Instr.Dest);
+  C := SedaiOpcodeBanks.ImmediateRegCandidates(Instr);
+  for k := 0 to C.Count - 1 do Want(C.Reg[k]);
+  if SedaiOpcodeBanks.ImmediateIsFloatReg(TBytecodeOp(Instr.OpCode)) then Want(Instr.Immediate);
+
+  for m := 0 to NCand - 1 do
+    for B := Low(TRegBank) to High(TRegBank) do
+      if (Length(FIdxReadCount[B]) > Cand[m]) and InstrReadsReg(Instr, Cand[m], B) then
+        Inc(FIdxReadCount[B][Cand[m]], Delta);
+end;
+
+{ One pass over the program, from scratch. }
+procedure TSuperinstructionOptimizer.IndexBuild;
+var
+  i: Integer;
+  B: TRegBank;
+begin
+  SetLength(FIdxTargetCount, 0);
+  for B := Low(TRegBank) to High(TRegBank) do SetLength(FIdxReadCount[B], 0);
+  SetLength(FIdxTargetCount, FProgram.GetInstructionCount);
+  for i := 0 to High(FIdxTargetCount) do FIdxTargetCount[i] := 0;
+  for B := Low(TRegBank) to High(TRegBank) do
+    SetLength(FIdxReadCount[B], Integer(High(Word)) + 1);
+  for i := 0 to FProgram.GetInstructionCount - 1 do
+    IndexApply(FProgram.GetInstruction(i), +1);
+end;
+
+{ Does ONE instruction read register Reg of bank Bank? The body of RegReadElsewhere's loop, lifted
+  out so that the scan and the index ask literally the same question. }
+function TSuperinstructionOptimizer.InstrReadsReg(const Instr: TBytecodeInstruction;
+  Reg: Word; Bank: TRegBank): Boolean;
+var
+  Op: TBytecodeOp;
+begin
+  Result := True;
+  Op := TBytecodeOp(Instr.OpCode);
+  if (Instr.Src1 = Reg) and (not SedaiOpcodeBanks.Src1IsArrayId(Op)) and
+     FieldMayName(SedaiOpcodeBanks.BankOfSrc1(Op), Bank) then Exit;
+  if (Instr.Src2 = Reg) and FieldMayName(SedaiOpcodeBanks.BankOfSrc2(Op), Bank) then Exit;
+  // A Dest that is READ BACK is a read like any other (ArrayStore's value, BigInt's target).
+  if Instr.Dest = Reg then
+    case Bank of
+      rbInt:    if SedaiOpcodeBanks.DestReadIsIntReg(Op) then Exit;
+      rbFloat:  if SedaiOpcodeBanks.DestReadIsFloatReg(Op) then Exit;
+      rbString: if SedaiOpcodeBanks.DestReadIsStringReg(Op) then Exit;
+    end;
+  // ...and a superinstruction Dest is read-modify-write often enough that any of them holding this
+  // number refuses - but only in the SAME BANK (see RegReadElsewhere's own note).
+  if (Instr.Dest = Reg) and (Instr.OpCode >= bcGroupSuper) and
+     FieldMayName(SedaiOpcodeBanks.BankOfDest(Op), Bank) then Exit;
+  if SedaiOpcodeBanks.ImmediateReadsIntReg(Instr, Reg) and (Bank = rbInt) then Exit;
+  if SedaiOpcodeBanks.ImmediateReadsFloatReg(Instr, Reg) and (Bank = rbFloat) then Exit;
+  Result := False;
 end;
 
 function TSuperinstructionOptimizer.IsJumpTarget(Index: Integer): Boolean;
@@ -197,19 +322,24 @@ function TSuperinstructionOptimizer.IsJumpTarget(Index: Integer): Boolean;
 // whose second half is a jump target; a target it cannot see is a jump that lands after the fused
 // pair. One shared list now, in SedaiOpcodeBanks, which is also the one the NOP compactor uses to
 // remap those very targets.
+//
+// ⭐ And it used to SCAN THE WHOLE PROGRAM for every candidate, which is half of why this pass was
+// quadratic. The counter behind it is maintained by WriteInstr; see the field's own note.
 var
   i: Integer;
-  Instr: TBytecodeInstruction;
+  Scan: Boolean;
 begin
-  Result := False;
-  for i := 0 to FProgram.GetInstructionCount - 1 do
+  if (Index < 0) or (Index >= Length(FIdxTargetCount)) then Exit(False);
+  Result := FIdxTargetCount[Index] > 0;
+  if GetEnvironmentVariable('SUPERIDX_CHECK') = '1' then
   begin
-    Instr := FProgram.GetInstruction(i);
-    if OpCarriesJumpTarget(Instr.OpCode) and (Instr.Immediate = Index) then
-    begin
-      Result := True;
-      Exit;
-    end;
+    Scan := False;
+    for i := 0 to FProgram.GetInstructionCount - 1 do
+      if OpCarriesJumpTarget(FProgram.GetInstruction(i).OpCode) and
+         (FProgram.GetInstruction(i).Immediate = Index) then begin Scan := True; Break; end;
+    if Scan <> Result then
+      WriteLn(ErrOutput, Format('[SUPERIDX] JUMPTARGET DISAGREE index=%d idx=%s scan=%s count=%d',
+        [Index, BoolToStr(Result, True), BoolToStr(Scan, True), FIdxTargetCount[Index]]));
   end;
 end;
 
@@ -389,7 +519,7 @@ begin
   Fused.OpCode := bcStrAppendMapped;
   Fused.Src1 := A.Src1;                  // the source string the byte is read from
   Fused.Immediate := A.Src2;             // ...and the int register holding the position in it
-  FProgram.SetInstruction(Index + 2, Fused);
+  WriteInstr(Index + 2, Fused);
   MakeNop(Index);
   MakeNop(Index + 1);
   Inc(FFusedCount);
@@ -432,40 +562,45 @@ function TSuperinstructionOptimizer.RegReadElsewhere(Reg: Word; Bank: TRegBank; 
 // It is the generalisation of IntRegReadElsewhere just above, which was written for one fusion and
 // could only speak about int registers, because the bank predicates for the other two banks were
 // still locked inside the register compactor. They are in SedaiOpcodeBanks now.
+//
+// ⭐ It no longer SCANS to answer. The whole-program read count is maintained by WriteInstr, so this
+// is "how many instructions read it at all" minus "how many of those are inside [Lo..Hi]" - and the
+// window is a handful of instructions, where the program is tens of thousands. Same predicate on
+// both sides (InstrReadsReg), so the index cannot answer a different question from the scan it
+// replaced.
 var
-  i: Integer;
-  Instr: TBytecodeInstruction;
-  Op: TBytecodeOp;
+  i, N: Integer;
+  Scan: Boolean;
 begin
-  Result := True;
-  for i := 0 to FProgram.GetInstructionCount - 1 do
+  if (Length(FIdxReadCount[Bank]) <= Reg) then
   begin
-    if (i >= Lo) and (i <= Hi) then Continue;
-    Instr := FProgram.GetInstruction(i);
-    Op := TBytecodeOp(Instr.OpCode);
-    if (Instr.Src1 = Reg) and (not SedaiOpcodeBanks.Src1IsArrayId(Op)) and
-       FieldMayName(SedaiOpcodeBanks.BankOfSrc1(Op), Bank) then Exit;
-    if (Instr.Src2 = Reg) and FieldMayName(SedaiOpcodeBanks.BankOfSrc2(Op), Bank) then Exit;
-    // A Dest that is READ BACK is a read like any other (ArrayStore's value, BigInt's target).
-    if Instr.Dest = Reg then
-      case Bank of
-        rbInt:    if SedaiOpcodeBanks.DestReadIsIntReg(Op) then Exit;
-        rbFloat:  if SedaiOpcodeBanks.DestReadIsFloatReg(Op) then Exit;
-        rbString: if SedaiOpcodeBanks.DestReadIsStringReg(Op) then Exit;
-      end;
-    // ...and a superinstruction Dest is read-modify-write often enough (bcAddIntTo, bcAddIntSelf,
-    // bcMulAddToFloat: "Dest = Dest op ...") that any of them holding this number refuses - but only
-    // in the SAME BANK. Refusing bank-blind here undid the whole point of the scan: in n-body the
-    // integer R17 of a loop's compare-and-branch was refused because a `MulSubFloat R17 = ...`
-    // exists elsewhere, so the loop head kept its CmpInt+JumpIfZero, and with no BranchGtInt in the
-    // head the loop TAIL could not fuse either - one missed fusion dragging a second one down, two
-    // instructions per iteration in a hot loop.
-    if (Instr.Dest = Reg) and (Instr.OpCode >= bcGroupSuper) and
-       FieldMayName(SedaiOpcodeBanks.BankOfDest(TBytecodeOp(Instr.OpCode)), Bank) then Exit;
-    if SedaiOpcodeBanks.ImmediateReadsIntReg(Instr, Reg) and (Bank = rbInt) then Exit;
-    if SedaiOpcodeBanks.ImmediateReadsFloatReg(Instr, Reg) and (Bank = rbFloat) then Exit;
+    // No index (should not happen; Run builds it): fall back to the honest scan.
+    for i := 0 to FProgram.GetInstructionCount - 1 do
+    begin
+      if (i >= Lo) and (i <= Hi) then Continue;
+      if InstrReadsReg(FProgram.GetInstruction(i), Reg, Bank) then Exit(True);
+    end;
+    Exit(False);
   end;
-  Result := False;
+  N := FIdxReadCount[Bank][Reg];
+  for i := Lo to Hi do
+  begin
+    if (i < 0) or (i >= FProgram.GetInstructionCount) then Continue;
+    if InstrReadsReg(FProgram.GetInstruction(i), Reg, Bank) then Dec(N);
+  end;
+  Result := N > 0;
+  if GetEnvironmentVariable('SUPERIDX_CHECK') = '1' then
+  begin
+    Scan := False;
+    for i := 0 to FProgram.GetInstructionCount - 1 do
+    begin
+      if (i >= Lo) and (i <= Hi) then Continue;
+      if InstrReadsReg(FProgram.GetInstruction(i), Reg, Bank) then begin Scan := True; Break; end;
+    end;
+    if Scan <> Result then
+      WriteLn(ErrOutput, Format('[SUPERIDX] DISAGREE reg=%d bank=%d lo=%d hi=%d index=%s scan=%s n=%d total=%d',
+        [Reg, Ord(Bank), Lo, Hi, BoolToStr(Result, True), BoolToStr(Scan, True), N, FIdxReadCount[Bank][Reg]]));
+  end;
 end;
 
 function TSuperinstructionOptimizer.IsTemporaryResult(Index: Integer; Reg: Word; FusedDest: Integer = -1; PatternEnd: Integer = -1): Boolean;
@@ -731,7 +866,7 @@ begin
   FusedInstr.Immediate := JmpInstr.Immediate;  // Jump target
   // SourceLine now managed via Source Map (unchanged by superinstruction fusion)
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -816,7 +951,7 @@ begin
   FusedInstr.Immediate := 0;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -904,7 +1039,7 @@ begin
   FusedInstr.Immediate := LoadInstr.Immediate;  // The constant
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);  // Replace Load with fused
+  WriteInstr(Index, FusedInstr);  // Replace Load with fused
   MakeNop(Index + 1);  // Remove Arith
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -1020,7 +1155,7 @@ begin
   FusedInstr.Immediate := JmpInstr.Immediate;  // Jump target
   // SourceLine now managed via Source Map (unchanged by superinstruction fusion)
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
   MakeNop(Index + 2);
 
@@ -1118,7 +1253,7 @@ begin
   FusedInstr.Immediate := LoadInstr.Immediate;  // Constant value
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -1239,7 +1374,7 @@ begin
   FusedInstr.Immediate := LoopBodyIndex;  // Loop body (first non-NOP after branch)
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(JumpIndex);  // Remove Jump
 
   // NOTE: We do NOT remove the BranchGtInt at LoopTarget because:
@@ -1309,7 +1444,7 @@ begin
           FusedInstr.Immediate := 0;
           // SourceLine now managed via Source Map
 
-          FProgram.SetInstruction(Index, FusedInstr);
+          WriteInstr(Index, FusedInstr);
           MakeNop(Index + 1);
 
           {$IFDEF DEBUG_SUPERINSTR}
@@ -1342,7 +1477,7 @@ begin
           FusedInstr.Immediate := 0;
           // SourceLine now managed via Source Map
 
-          FProgram.SetInstruction(Index, FusedInstr);
+          WriteInstr(Index, FusedInstr);
           MakeNop(Index + 1);
 
           {$IFDEF DEBUG_SUPERINSTR}
@@ -1388,7 +1523,7 @@ begin
           FusedInstr.Immediate := AddInstr.Src1; // c (extra operand stored in Immediate)
           // SourceLine now managed via Source Map
 
-          FProgram.SetInstruction(Index, FusedInstr);
+          WriteInstr(Index, FusedInstr);
           MakeNop(Index + 1);
 
           {$IFDEF DEBUG_SUPERINSTR}
@@ -1423,7 +1558,7 @@ begin
           FusedInstr.Immediate := AddInstr.Src1; // c (extra operand stored in Immediate)
           // SourceLine now managed via Source Map
 
-          FProgram.SetInstruction(Index, FusedInstr);
+          WriteInstr(Index, FusedInstr);
           MakeNop(Index + 1);
 
           {$IFDEF DEBUG_SUPERINSTR}
@@ -1498,7 +1633,7 @@ begin
         FusedInstr.Immediate := AddInstr.Src1;  // Accumulator register
         // SourceLine now managed via Source Map
 
-        FProgram.SetInstruction(Index, FusedInstr);
+        WriteInstr(Index, FusedInstr);
         MakeNop(Index + 1);
 
         {$IFDEF DEBUG_SUPERINSTR}
@@ -1529,7 +1664,7 @@ begin
         FusedInstr.Immediate := AddInstr.Src1;  // Accumulator register
         // SourceLine now managed via Source Map
 
-        FProgram.SetInstruction(Index, FusedInstr);
+        WriteInstr(Index, FusedInstr);
         MakeNop(Index + 1);
 
         {$IFDEF DEBUG_SUPERINSTR}
@@ -1598,7 +1733,7 @@ begin
           FusedInstr.Src2 := Mul1Instr.Src1;     // x (value to square)
           // SourceLine now managed via Source Map
 
-          FProgram.SetInstruction(Index, FusedInstr);
+          WriteInstr(Index, FusedInstr);
           MakeNop(Index + 1);
 
           {$IFDEF DEBUG_SUPERINSTR}
@@ -1651,7 +1786,7 @@ begin
         FusedInstr.Src2 := Mul2Instr.Src1;      // y
         // SourceLine now managed via Source Map
 
-        FProgram.SetInstruction(Index, FusedInstr);
+        WriteInstr(Index, FusedInstr);
         MakeNop(Index + 1);
         MakeNop(Index + 2);
 
@@ -1708,7 +1843,7 @@ begin
   FusedInstr.Immediate := Mul2Instr.Src2; // c
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -1762,7 +1897,7 @@ begin
   FusedInstr.Src2 := AddInstr.Src2;      // b
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -1828,7 +1963,7 @@ begin
   FusedInstr.Immediate := BranchInstr.Immediate; // Branch target
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -1921,7 +2056,7 @@ begin
   FusedInstr.Immediate := 0;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
   MakeNop(Index + 2);
   MakeNop(Index + 3);
@@ -1986,7 +2121,7 @@ begin
   FusedInstr.Immediate := 0;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
 
   {$IFDEF DEBUG_SUPERINSTR}
   if DebugSuperinstr then
@@ -2041,7 +2176,7 @@ begin
   FusedInstr.Immediate := 0;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -2128,7 +2263,7 @@ begin
   FusedInstr.Immediate := 0;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -2193,7 +2328,7 @@ begin
   FusedInstr.Immediate := 0;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
 
   {$IFDEF DEBUG_SUPERINSTR}
@@ -2303,7 +2438,7 @@ begin
   // SourceLine now managed via Source Map
 
   // Replace first instruction with fused, NOP the rest
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
   MakeNop(Index + 2);
   MakeNop(Index + 3);
@@ -2438,7 +2573,7 @@ begin
   FusedInstr.Immediate := ExitTarget;
   // SourceLine now managed via Source Map
 
-  FProgram.SetInstruction(Index, FusedInstr);
+  WriteInstr(Index, FusedInstr);
   MakeNop(Index + 1);
   MakeNop(Index + 2);
   MakeNop(Index + 3);
@@ -2548,6 +2683,9 @@ begin
   // a month, so it has rotted: with all of it on, run_regress gives 16 FAIL and 16 OPTDIFF. This is
   // how the broken one gets named instead of guessed.
   FKindMask := GetEnvironmentVariable('SUPERMASK');
+
+  // Built AFTER every early exit, so a run that fuses nothing pays nothing for it.
+  IndexBuild;
 
   Pass := 0;
 
@@ -2690,7 +2828,18 @@ begin
 
     // Compact NOPs after each pass to enable multi-instruction pattern matching
     if Changed then
+    begin
       RunNopCompaction(FProgram);
+      // ⛔⛔ AND THE INDEX HAS TO BE REBUILT HERE, because compaction is the ONE mutation of the
+      // program this unit does not perform itself: it REMOVES instructions, renumbers every one of
+      // them and remaps every jump target — behind the counters' back. Found by SUPERIDX_CHECK=1,
+      // which answers both ways and reports a disagreement: without this line the target counter
+      // read "1" for an index nothing targets and "0" for one that is targeted, and the pass then
+      // both refused a legal fusion and (worse) could have allowed an illegal one.
+      // ⇒ A maintained index is exact only while EVERY writer is known; a pass called from inside
+      // the loop is a writer.
+      IndexBuild;
+    end;
 
   until (not Changed) or (Pass > 10);  // Safety limit
 

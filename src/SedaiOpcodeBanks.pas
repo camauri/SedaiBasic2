@@ -107,6 +107,22 @@ function OpCarriesJumpTarget(OpCode: Word): Boolean;
 
 function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
 
+{ Every register number an Immediate CAN name, enumerated once.
+
+  ⛔ WHY IT EXISTS (7 Sep 2026). ImmediateReadsIntReg answers "does this Immediate name Reg" by
+  testing seven bit positions, which is the right shape for one question asked about one register -
+  and the wrong shape for an INDEX, which has to go the other way and ask "which registers does this
+  Immediate name". Restating the seven positions at the index would be a second copy of a layout the
+  comment below already refuses to restate. So the enumeration is the definition and both readers
+  are written on top of it. }
+type
+  TImmRegCandidates = record
+    Count: Integer;
+    Reg: array[0..7] of Integer;
+  end;
+
+function ImmediateRegCandidates(const Instr: TBytecodeInstruction): TImmRegCandidates;
+
 implementation
 
 function Src1IsArrayId(OpCode: TBytecodeOp): Boolean;
@@ -1113,7 +1129,7 @@ begin
          or (DestReadIsStringReg(TBytecodeOp(Instr.OpCode)) and (Instr.Dest = Reg));
 end;
 
-function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
+function ImmediateRegCandidates(const Instr: TBytecodeInstruction): TImmRegCandidates;
 // The opcodes below are exactly those the register compactor remaps int registers inside Immediate
 // for. Which BITS each one uses varies (16-bit halves for most, 12-bit fields for SETCOLOR and
 // GRAPHICBOX, the whole value for GRAPHICSETMODE), and rather than restate every layout - a second
@@ -1123,10 +1139,19 @@ function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): 
 // True. The only consumer is a fusion pass asking "is this int register read anywhere else?", where
 // a false yes costs a missed fusion and a false NO would cost a miscompile. Erring towards yes is
 // the safe direction, and it makes this immune to a layout being transcribed wrong.
+
+  procedure Add(var R: TImmRegCandidates; V: Int64);
+  var k: Integer;
+  begin
+    if (V < 0) or (V > $FFFF) then Exit;              // not a register number
+    for k := 0 to R.Count - 1 do if R.Reg[k] = V then Exit;   // each number once
+    R.Reg[R.Count] := V; Inc(R.Count);
+  end;
+
 var
   Imm: Int64;
 begin
-  Result := False;
+  Result.Count := 0;
   case TBytecodeOp(Instr.OpCode) of
     bcStrMid, bcStrMidW, bcStrAscMid, bcStrConcatCharAt, bcStrAppendMapped, bcStrMidAssign,
     bcStrMidAssignArr,
@@ -1143,15 +1168,24 @@ begin
       begin
         Imm := Instr.Immediate;
         if Imm < 0 then Exit;              // a negative Immediate is a flag, never a register index
-        Result := (Imm = Reg)                                  // GRAPHICSETMODE: the whole value
-               or ((Imm and $FFFF) = Reg) or (((Imm shr 16) and $FFFF) = Reg)
-               or (((Imm shr 32) and $FFFF) = Reg) or (((Imm shr 48) and $FFFF) = Reg)
-               or ((Imm and $FFF) = Reg) or (((Imm shr 12) and $FFF) = Reg)
-               or (((Imm shr 36) and $FFF) = Reg);
+        Add(Result, Imm);                                      // GRAPHICSETMODE: the whole value
+        Add(Result, Imm and $FFFF);        Add(Result, (Imm shr 16) and $FFFF);
+        Add(Result, (Imm shr 32) and $FFFF); Add(Result, (Imm shr 48) and $FFFF);
+        Add(Result, Imm and $FFF);         Add(Result, (Imm shr 12) and $FFF);
+        Add(Result, (Imm shr 36) and $FFF);
       end;
-  else
-    Result := False;
   end;
+end;
+
+function ImmediateReadsIntReg(const Instr: TBytecodeInstruction; Reg: Integer): Boolean;
+var
+  C: TImmRegCandidates;
+  k: Integer;
+begin
+  C := ImmediateRegCandidates(Instr);
+  for k := 0 to C.Count - 1 do
+    if C.Reg[k] = Reg then Exit(True);
+  Result := False;
 end;
 
 end.
