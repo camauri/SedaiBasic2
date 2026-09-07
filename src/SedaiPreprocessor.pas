@@ -1023,10 +1023,28 @@ begin
 end;
 
 function DirectiveRebindsNames(const Seg: string): Boolean;
-// Does this directive segment change what a NAME means from here on? Only three do: "#define",
-// "#undef" and "#macro". They are the reason substitution has to STOP for the rest of an expansion -
-// see the note at the head of SubstituteMacros. Everything else ("#print", "#if", "#error", ...)
-// consumes its own text and leaves the surrounding names alone, so it does not suspend anything.
+// Does this directive segment mean that the REST of this expansion must not be substituted yet?
+//
+// Two families do, and for two different reasons.
+//
+// ⭐ It REBINDS A NAME - "#define", "#undef", "#macro" - so the text after it must be read against the
+//   new binding and not the old one. That is what DIVERGENZE 66 was.
+//
+// ⭐⭐ ...or it SELECTS WHICH TEXT SURVIVES - "#if", "#ifdef", "#ifndef", "#elseif", "#else", "#endif"
+//   (DIVERGENZE 166). The note that used to stand here said a conditional "leaves the surrounding
+//   names alone, so it does not suspend anything". True of the NAMES and false of the TEXT: with
+//   substitution already run over BOTH branches, every preprocessor BUILTIN in the branch the "#if"
+//   is about to discard has already been evaluated - and the ones with a SIDE EFFECT cannot be
+//   undone. fbc's own compound/select_const2 is exactly that shape: one macro whose body is
+//   "#if DEFINITION - push a unique id and DEFINE a Sub - #else - read the top and POP it - #endif",
+//   and every invocation ran push AND read AND pop, so the definitions and the calls never paired and
+//   the program died on "Array not declared: LT_nnnn". Traced with UIDDIAG=1: push, read, read, pop,
+//   four operations per invocation where two were due.
+// ⇒ Suspending here hands the body to ReprocessExpansion, which walks it line by line and substitutes
+//   each line AT THE MOMENT IT IS REACHED - after the "#if" above it has chosen. That is fbc's order,
+//   and the machinery was already here for the rebinding half.
+// ⛔ The other directives stay out on purpose: "#print", "#error", "#assert", "#include" consume their
+//   own text and choose nothing, so deferring them would only cost a rescan.
 var
   W: string;
   i: Integer;
@@ -1037,7 +1055,9 @@ begin
   i := 1;
   while (i <= Length(W)) and not (W[i] in [' ', #9]) do Inc(i);
   W := UpperCase(Copy(W, 1, i - 1));
-  Result := (W = 'DEFINE') or (W = 'UNDEF') or (W = 'MACRO');
+  Result := (W = 'DEFINE') or (W = 'UNDEF') or (W = 'MACRO') or
+            (W = 'IF') or (W = 'IFDEF') or (W = 'IFNDEF') or
+            (W = 'ELSEIF') or (W = 'ELSE') or (W = 'ENDIF');
 end;
 
 function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string;
