@@ -74,7 +74,12 @@ const
   // v3: appends the error-reporting metadata - ModuleName (ERMN) and the procedure map
   // (PC -> procedure name, ERFN) - after the instructions. Without it a .basc run reported
   // ERFN/ERMN as empty. v1/v2 files still load (metadata stays empty, the old behavior).
-  BASC_VERSION = 3;
+  // v4 (7 Sep 2026): one FLAGS byte per array after ArrayIndex - the three facts the compiler settles
+  // per slot and "carries to the VM" (IsPrivate, MultiDimEver, IsDynamicShape). None of them was
+  // written, so through a .basc a proc-local array lost its per-invocation identity (the recursion
+  // guard read 108 for 198), a multi-dimensional one could get a native UBound, and ERASE could free
+  // a fixed array. A v3 file loads with the flags at 0, which is what it always did. DIVERGENZE 172.
+  BASC_VERSION = 4;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -301,6 +306,12 @@ begin
         Stream.WriteBuffer(DimReg, SizeOf(DimReg));
       end;
       Stream.WriteBuffer(ArrInfo.ArrayIndex, SizeOf(ArrInfo.ArrayIndex));
+      // v4: the per-slot facts, one byte. Add a bit here AND in the reader, never one alone.
+      RegType := 0;
+      if ArrInfo.IsPrivate then RegType := RegType or 1;
+      if ArrInfo.MultiDimEver then RegType := RegType or 2;
+      if ArrInfo.IsDynamicShape then RegType := RegType or 4;
+      Stream.WriteBuffer(RegType, SizeOf(RegType));
     except
       on E: Exception do
         raise EBytecodeSerializerError.CreateFmt('Error writing array %d: %s', [i, E.Message]);
@@ -458,6 +469,14 @@ begin
         end;
       end;
       Stream.ReadBuffer(ArrInfo.ArrayIndex, SizeOf(ArrInfo.ArrayIndex));
+      // v4: the per-slot facts (see BASC_VERSION). A v3 file has none and they stay False.
+      if Header.Version >= 4 then
+      begin
+        Stream.ReadBuffer(RegType, SizeOf(RegType));
+        ArrInfo.IsPrivate := (RegType and 1) <> 0;
+        ArrInfo.MultiDimEver := (RegType and 2) <> 0;
+        ArrInfo.IsDynamicShape := (RegType and 4) <> 0;
+      end;
       Result.AddArrayInfo(ArrInfo);
     end;
 
