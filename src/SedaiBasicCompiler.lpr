@@ -147,7 +147,8 @@ var
   OptTargetWasm: Boolean = False;
 
 { Compile BASIC source to bytecode file }
-function CompileFile(const SourceFile, OutputFile: string; Verbose: Boolean): Boolean;
+function CompileFile(const SourceFile, OutputFile: string; Verbose: Boolean;
+  ExtraModules: TStrings = nil): Boolean;
 var
   Source: TStringList;
   Lexer: TLexerFSM;
@@ -177,13 +178,10 @@ begin
 
   Source := TStringList.Create;
   try
-    if not FileExists(SourceFile) then
-    begin
-      WriteLn('ERROR: File not found: ', SourceFile);
-      Exit;
-    end;
-
-    Source.LoadFromFile(SourceFile);
+    // ⭐ Several modules become one compilation, in fbc's measured order: the non-main modules first
+    // (their module-level code runs before the main module's), the main module last. The rule lives in
+    // TSedaiRunner.LoadProgramModules so that sb and sbc cannot drift apart on it.
+    TSedaiRunner.LoadProgramModules(Source, SourceFile, ExtraModules);
 
     if Verbose then
       WriteLn('Source loaded (', Source.Count, ' lines)');
@@ -625,6 +623,7 @@ end;
 
 var
   SourceFile, OutputFile: string;
+  ExtraModules: TStringList;
   OptVerbose, OptQuiet, OptHelp: Boolean;
   i: Integer;
   Param: string;
@@ -639,6 +638,7 @@ begin
     // Parse command-line parameters
     SourceFile := '';
     OutputFile := '';
+    ExtraModules := TStringList.Create;
     OptVerbose := False;
     OptQuiet := False;
     OptHelp := False;
@@ -668,9 +668,16 @@ begin
         // consumed by the branch above
       else if (Pos('-', Param) <> 1) then
       begin
-        // Positional argument
-        if SourceFile = '' then
-          SourceFile := Param
+        // ⭐ A POSITIONAL ENDING IN .bas IS A MODULE, and the first of them is the MAIN module
+        // (DIVERGENZE 162) - which is how FreeBASIC spells it: "fbc main.bas b.bas c.bas". Anything
+        // else is the output name, so "sbc a.bas out.basc" keeps working exactly as before.
+        // ⛔ This is also what closes a data-loss bug: before, the second .bas was taken as the OUTPUT
+        // and the compiler wrote bytecode over the user's second source, silently.
+        if SameText(ExtractFileExt(Param), '.bas') then
+        begin
+          if SourceFile = '' then SourceFile := Param
+          else ExtraModules.Add(Param);
+        end
         else if OutputFile = '' then
           OutputFile := Param;
       end;
@@ -694,12 +701,12 @@ begin
     // ⚠️ The refusal is on the EXTENSION only: any other output name still works exactly as before,
     // and "sb prog.bas arg1 arg2" is untouched - there the extra words are the PROGRAM's arguments,
     // which is what a compiled binary does and what fbc's own runtime does.
+    // ⚠️ Unreachable through the positional route since a .bas argument became a MODULE, and kept as a
+    // guard because the hazard is real: writing bytecode over a source DESTROYS it.
     if (OutputFile <> '') and SameText(ExtractFileExt(OutputFile), '.bas') then
     begin
       WriteLn(ErrOutput, 'ERROR: refusing to write bytecode over "', OutputFile,
               '": a .bas file is SOURCE, and this would destroy it.');
-      WriteLn(ErrOutput, '  If you meant to build a program from SEVERAL modules, as "fbc a.bas b.bas" does:');
-      WriteLn(ErrOutput, '  separate compilation units are not supported (see BASIC.md, "Declared unsupported").');
       WriteLn(ErrOutput, '  If you meant an output file, give it a .basc extension.');
       ExitCode := 1;
       Exit;
@@ -717,7 +724,7 @@ begin
       PrintVersion;
 
     // Compile
-    if CompileFile(SourceFile, OutputFile, OptVerbose) then
+    if CompileFile(SourceFile, OutputFile, OptVerbose, ExtraModules) then
     begin
       if not OptQuiet and not OptVerbose then
         WriteLn('Compiled: ', ExtractFileName(SourceFile), ' -> ', OutputFile);

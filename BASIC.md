@@ -3461,16 +3461,23 @@ the divergence is deliberate and is not going to be reproduced.
 
 ### Declared unsupported (24 August 2026)
 
-- **A program is ONE compilation unit** (divergence 162). FreeBASIC builds a program from several
-  modules — a main source plus further sources, each its own compilation unit with its own module
-  scope, their symbols bound together through `Public`, `Extern` and `Common`. `sb` and `sbc` take a
-  single source, so a program that needs a second module fails on the symbol it cannot find.
-  ⚠️ This is not `#include`, which works and is textual; what is missing is *separate* units.
-  ⭐ There is no command line on which the extra module could be named: for `sb`, words after the
-  source are the **program's** arguments (`Command$`), exactly as for a binary compiled by `fbc`; for
-  `sbc`, the second positional is the output file — and writing `sbc a.bas b.bas`, which is how
-  FreeBASIC spells a multi-module build, is **refused by name** rather than overwriting the second
-  source. Linking a compilation unit written in C or C++ needs a native object file and a linker, and
+- **A program may be built from several MODULES**, as FreeBASIC does. `sbc main.bas b.bas c.bas`
+  names the modules — the first is the main one — and `sb --module b.bas --module c.bas main.bas` runs
+  the same program without compiling it first. The module-level code of every non-main module runs
+  first, in the order the sources are named, and the main module's runs last, which is FreeBASIC's own
+  order. `Public`, `Extern`, `Extern … Alias`, `Common` and `Common Shared` bind names across the
+  modules, and a `Namespace` may be declared in one and defined in another.
+  ⛔ `sb` spells it with a **flag** and not with extra positionals on purpose: words after the source
+  are the *program's* arguments (`Command$`), exactly as for a binary compiled by `fbc`, and taking one
+  as a module would silently steal an argument from every program that reads them. `sbc` has no such
+  contract, so there the positional spelling is FreeBASIC's own.
+  ⚠️ **The modules become ONE compilation unit**, where FreeBASIC compiles each separately and links
+  the objects. Two consequences, both of which *accept* more than FreeBASIC and neither of which can
+  answer a valid program wrongly: a module-level name is **not private to its module**, so two modules
+  declaring the same one share it instead of colliding; and a `#define` made in one module is visible
+  in the next, while `#include once` includes a header once for the whole program rather than once per
+  module. Diagnostics report a position in the merged program.
+  ⛔ Linking a compilation unit written in **C or C++** needs a native object file and a linker, and
   waits on the native binaries of the dual environment (divergence 163), as inline `Asm` does (51).
 
 Each of these is *refused with a message that names the reason*, never answered wrongly in silence.
