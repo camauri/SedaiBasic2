@@ -86,6 +86,9 @@ type
       integer). Used to auto-select the dialect at LOAD: line numbers => classic,
       otherwise FreeBASIC/Modern. }
     class function SourceHasLineNumbers(const Source: string): Boolean;
+    // The ONE place that knows how several modules become one compilation (DIVERGENZE 162).
+    class procedure LoadProgramModules(Dest: TStringList; const MainFile: string;
+                                       ExtraModules: TStrings);
 
     { Load program from file (auto-detects type) }
     function Load(const FileName: string): TBytecodeProgram;
@@ -174,6 +177,51 @@ begin
     Result := sftBytecode
   else
     Result := sftUnknown;
+end;
+
+class procedure TSedaiRunner.LoadProgramModules(Dest: TStringList; const MainFile: string;
+  ExtraModules: TStrings);
+// Load a program made of several MODULES into one source, in the order FreeBASIC runs them.
+//
+// ⭐⭐ THE ORDER IS MEASURED, NOT ASSUMED (DIVERGENZE 162). `fbc main.bas b.bas c.bas` prints
+// "B top / C top / MAIN top": the module-level code of every NON-MAIN module runs first, in the order
+// the sources are named, and the MAIN module's runs last. Naming them in the other order swaps B and C
+// and leaves MAIN last, which is what says the rule is about the command line and not about the file
+// names. So the extra modules are appended FIRST and the main module LAST.
+//
+// ⛔ WHAT THIS IS NOT. fbc compiles each module SEPARATELY and links the objects; here the modules
+// become ONE compilation unit, so two things differ and both are declared in `BASIC.md`:
+//   - a module-private name is not private to its module - two modules that both declare a
+//     module-level `Dim x` share it instead of colliding;
+//   - a `#define` from one module is visible in the next, and `#include once` includes a header once
+//     for the whole program rather than once per module. ⚠️ That last one is what makes the shared
+//     `.bi` of the suite's own multi-module tests work: the declarations land once instead of twice.
+// Both differences ACCEPT more than fbc does; neither can answer a valid program wrongly.
+//
+// ⛔ And a missing module is an ERROR, never a skip: silently compiling the rest would answer
+// "Variable not declared" about a symbol whose definition simply was not read.
+var
+  k: Integer;
+  Part: TStringList;
+begin
+  Part := TStringList.Create;
+  try
+    if Assigned(ExtraModules) then
+      for k := 0 to ExtraModules.Count - 1 do
+      begin
+        if not FileExists(ExtraModules[k]) then
+          raise Exception.CreateFmt('Module not found: %s', [ExtraModules[k]]);
+        Part.LoadFromFile(ExtraModules[k]);
+        Dest.AddStrings(Part);
+        Part.Clear;
+      end;
+    if not FileExists(MainFile) then
+      raise Exception.CreateFmt('File not found: %s', [MainFile]);
+    Part.LoadFromFile(MainFile);
+    Dest.AddStrings(Part);
+  finally
+    Part.Free;
+  end;
 end;
 
 class function TSedaiRunner.SourceHasLineNumbers(const Source: string): Boolean;

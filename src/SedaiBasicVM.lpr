@@ -593,6 +593,8 @@ var
   OptWindow: Boolean = False;   // sb --window: mirror the software framebuffer into an SDL2 window
   GTermCtrl: TTerminalController = nil;   // concrete terminal output device (for graphics attach under --window)
   GProgramArgs: array of string;   // COMMAND$: everything on the command line after the script file
+  GExtraModules: TStringList = nil; // --module: the non-main modules of a multi-module program (162)
+  GSkipNextArg: Boolean = False;    // ...the file name that follows --module is not a program argument
 {$IFDEF WITH_WINDOW}
 var
   GPresenter: TWindowPresenter = nil;
@@ -765,13 +767,17 @@ begin
     WriteLn('Loading source: ', SourceFile);
   Source := TStringList.Create;
   try
-    if FileExists(SourceFile) then
-      Source.LoadFromFile(SourceFile)
-    else
-    begin
-      WriteLn('ERROR: File not found: ', SourceFile);
-      ExitCode := 1;   // a compiler that fails must not report success
-      Exit;
+    // ⭐ Several modules become one compilation, in fbc's measured order (DIVERGENZE 162): the
+    // non-main modules first, the main module last. Same funnel sbc uses, so the two cannot drift.
+    try
+      TSedaiRunner.LoadProgramModules(Source, SourceFile, GExtraModules);
+    except
+      on E: Exception do
+      begin
+        WriteLn('ERROR: ', E.Message);
+        ExitCode := 1;   // a compiler that fails must not report success
+        Exit;
+      end;
     end;
 
     if OptVerbose then
@@ -2357,6 +2363,14 @@ begin
           {$ENDIF}
           ExecuteTime := Timer.ElapsedMilliseconds;
           FinishVMGraphics(VM);  // sb --window: keep the window open until closed
+          // ⛔⛔ THE SAME PROGRAM MUST ANSWER THE SAME EXIT CODE FROM .bas AND FROM .basc, and this
+          // line was missing on THIS twin only: a failed ASSERT (or "End n") set VM.ProgramExitCode,
+          // the run-from-source path above copied it, and the bytecode path answered 0 — so
+          // "sb prog.bas" exited 1 while "sb prog.basc" exited 0 on the identical program, with the
+          // identical message printed. ⭐ Interpreter, --aot and --jit were all right; only the .basc
+          // route was blind, which is why no engine A/B could see it.
+          // ⚠️ And basc_sweep cannot: it compares the OUTPUT, which was identical all along.
+          if VM.ProgramExitCode <> 0 then ExitCode := VM.ProgramExitCode;
         except
           on E: Exception do
           begin
@@ -2566,6 +2580,7 @@ begin
     OptHelp := False;
     OptNoExec := False;
     OptTrueValue := -1;  // Default: Commodore BASIC style (TRUE = -1)
+    GExtraModules := TStringList.Create;   // --module (DIVERGENZE 162)
     {$IFDEF ENABLE_PROFILER}
     OptProfile := False;
     ProfileMode := 'sampling';  // Default to low-overhead sampling
@@ -2649,6 +2664,19 @@ begin
           OptTrueValue := -1;
         end;
       end
+      else if (Param = '--module') and (i < ParamCount) then
+      begin
+        // ⭐⭐ A FLAG, NOT A POSITIONAL, and that is the whole design (DIVERGENZE 162). "fbc a.bas
+        // b.bas" names modules because fbc is a COMPILER; `sb` is a runner, and words after the source
+        // are the PROGRAM's arguments (Command$) - measured byte for byte against a binary compiled by
+        // fbc, __FB_ARGC__ = 3 on both. Taking a second .bas as a module would silently steal an
+        // argument from every program that reads Command$. `sbc` has no such contract, so THERE the
+        // positional spelling is fbc's own.
+        GExtraModules.Add(ParamStr(i + 1));
+        GSkipNextArg := True;
+      end
+      else if GSkipNextArg then
+        GSkipNextArg := False
       else if (Pos('--', Param) <> 1) and (TestFile = '') then
         TestFile := ParamStr(i)   // first non-flag argument = the script/bytecode file
       else if (Pos('--', Param) <> 1) then
