@@ -438,13 +438,13 @@ same limit applies to reading a UDT as raw bytes.
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.
-  ⚠️ **The ranking does not reach across register banks** (divergence 161). A candidate whose
-  parameter is an integer type is not weighed against one whose parameter is floating-point when the
-  arguments are all of the other kind: the bank part of the signature is matched first, and it
-  settles the call. It shows only where converting across kinds in one position would be cheaper than
-  converting within the kind in all of them — `z_(As UShort, As Double)` beside
-  `z_(As Single, As Single)` called with two `Double`s, where fbc takes the first and we take the
-  second. Measured at 3 calls in 15 405 probes.
+  ⭐ **The ranking weighs candidates across the kinds**, as FreeBASIC does: an overload taking an
+  integer parameter competes with one taking a floating-point parameter even when every argument is of
+  the other kind, and the cheaper total wins. `z_(As UShort, As Double)` beside
+  `z_(As Single, As Single)` called with two `Double`s takes the **first** — one `Double`→`UShort`
+  costs 61 against two `Double`→`Single` at 106 — while `z_(As UByte, As UByte)` beside
+  `z_(As Double, As Double)` called with two `Integer`s takes the integer one, because an integer
+  argument prefers every integer candidate to any floating-point one.
   An overload whose trailing parameters carry **defaults** is reachable with fewer arguments
   (`f(0)` selecting `f(i As Integer, j As Integer = 0, k As Integer = 0)`); among the candidates the
   one needing the fewest omissions wins, and an exact bank prefix breaks a tie.
