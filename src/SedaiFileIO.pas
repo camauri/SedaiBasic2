@@ -112,6 +112,51 @@ implementation
   the same run: the Text layer keeps its own buffer and the two would each swallow part of the stream.
   StdInBuffered decides ONCE, and every device read goes through one path or the other for good. }
 
+{ An INPUT # FIELD, once the scanner has cut it out of the line - measured against fbc 7 Sep 2026
+  over fourteen forms (DIVERGENZE 169):
+    * LEADING blanks and tabs are not part of the field: "42, text" reads `text`;
+    * TRAILING blanks ARE: "  a  ,  b  " reads `a  ` and `b  `;
+    * a field that OPENS with a quote is the text up to the closing quote, commas included, and
+      the quotes themselves go; blanks after the closing quote go too;
+    * what follows the closing quote is the NEXT field, not this one: `"x"y, z` reads x, y, z. So
+      the helper reports how many units of the raw field it did not consume, and the caller puts
+      the stream back at their start - the delimiter it had swallowed is then read by the next field.
+  Works on the raw UNITS of the encoding (UW bytes each, little-endian) so the byte and the wide
+  scanner share it: a blank, a tab and a quote are ASCII in every encoding this reader knows. }
+procedure TrimInputField(var Raw: string; UW: Integer; out TailUnits: Integer);
+var
+  NUnits, I, J, K: Integer;
+  function UnitCode(Idx: Integer): Integer;   // 0-based unit -> its code, -1 when not ASCII
+  var B: Integer;
+  begin
+    Result := Ord(Raw[Idx * UW + 1]);
+    for B := 2 to UW do
+      if Ord(Raw[Idx * UW + B]) <> 0 then Exit(-1);
+  end;
+  function IsBlank(Idx: Integer): Boolean;
+  begin
+    Result := UnitCode(Idx) in [32, 9];
+  end;
+begin
+  TailUnits := 0;
+  if UW < 1 then UW := 1;
+  NUnits := Length(Raw) div UW;
+  I := 0;
+  while (I < NUnits) and IsBlank(I) do Inc(I);
+  if (I < NUnits) and (UnitCode(I) = Ord('"')) then
+  begin
+    J := I + 1;
+    while (J < NUnits) and (UnitCode(J) <> Ord('"')) do Inc(J);
+    // J is the closing quote, or NUnits when the line ended first (then the field runs to its end)
+    K := J + 1;
+    while (K < NUnits) and IsBlank(K) do Inc(K);
+    if K < NUnits then TailUnits := NUnits - K;
+    Raw := Copy(Raw, (I + 1) * UW + 1, (J - I - 1) * UW);
+  end
+  else if I > 0 then
+    Raw := Copy(Raw, I * UW + 1, (NUnits - I) * UW);
+end;
+
 function TVMFileHandler.CachedSize(Handle: Integer; FS: TFileStream): Int64;
 begin
   if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit(FS.Size);
@@ -635,6 +680,7 @@ var
   LGot, LIdx, LOld, LUsed: Integer;
   LTerm: Boolean;
   LInQ: Boolean;      // INPUT#: inside a "..." field, where a comma is text
+  LTail, LRawLen: Integer;   // INPUT#: units after a closing quote (the next field), raw field length
   LWant: Integer;      // INPUT(n [, #f]): bytes requested, carried in through Data
   Ch2: Char;
   EncBits, UW, UIdx, WCode: Integer;   // wide text encoding: bits per unit, its byte width, a unit's code
@@ -884,6 +930,13 @@ begin
         WRaw := WRaw + WUnit;
       end;
       FS.Position := LStart + LUsed;
+      if Command = 'INPUT#' then
+      begin
+        LRawLen := Length(WRaw);
+        TrimInputField(WRaw, UW, LTail);
+        // What follows the closing quote is the next field: back the stream up to its first unit.
+        if LTail > 0 then FS.Position := LStart + LRawLen - LTail * UW;
+      end;
       Data := DecodeTextUnits(WRaw, EncBits);
       Exit;
     end;
@@ -943,11 +996,16 @@ begin
       LTerm := True;
     end;
     FS.Position := LStart + LUsed;       // where the byte-at-a-time loop would have stopped
-    // A quoted field yields its CONTENT: `"con virgolette"` is `con virgolette`. LINE INPUT# keeps the
-    // line exactly as written, quotes included, which is its whole point.
-    if (Command = 'INPUT#') and (Length(Line) >= 2) and
-       (Line[1] = '"') and (Line[Length(Line)] = '"') then
-      Line := Copy(Line, 2, Length(Line) - 2);
+    // A quoted field yields its CONTENT and leading blanks are not the field's: TrimInputField
+    // holds the measured rule. LINE INPUT# keeps the line exactly as written, quotes included,
+    // which is its whole point.
+    if Command = 'INPUT#' then
+    begin
+      LRawLen := Length(Line);
+      TrimInputField(Line, 1, LTail);
+      // What follows the closing quote is the next field: back the stream up to its first byte.
+      if LTail > 0 then FS.Position := LStart + LRawLen - LTail;
+    end;
     Data := Line;
   end
   else if (Command = 'PRINT#') or (Command = 'CMD') or (Command = 'APPEND') or (Command = 'WRITE#') then

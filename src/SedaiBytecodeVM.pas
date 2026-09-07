@@ -16044,8 +16044,14 @@ begin
       if Assigned(FOutputDevice) then
         FOutputDevice.ResetPalette;
     // FreeBASIC graphics (phase 1 slice) routed through the IGraphicsBackend abstraction.
-    25: // bcGfxScreenRes - SCREENRES w, h [, , numpages]  (Immediate = number of pages, default 1)
-      SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
+    25: // bcGfxScreenRes - SCREENRES w, h [, depth, numpages, flags]
+        // Immediate: pages in the low 16 bits, the driver FLAGS in the high 16 (see ProcessScreenRes).
+        // The flags go to a shared knob the window presenter reads at the next frame boundary: the VM
+        // knows nothing about windows, and the presenter knows nothing about opcodes.
+      begin
+        SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate and $FFFF);
+        GGfxScreenFlags := (Instr.Immediate shr 16) and $FFFF;
+      end;
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
       if Assigned(FGraphics) then
       begin

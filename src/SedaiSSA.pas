@@ -18559,7 +18559,7 @@ procedure TSSAGenerator.ProcessScreenRes(Node: TASTNode);
 // and is carried in Src3 -> Immediate (the VM reads it as the literal page count, not a register).
 var
   WVal, HVal, NVal, WReg, HReg: TSSAValue;
-  NumPages: Int64;
+  NumPages, Flags: Int64;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), WVal); WReg := EnsureIntRegister(WVal);
@@ -18572,7 +18572,18 @@ begin
     else if NVal.Kind = svkConstFloat then NumPages := Trunc(NVal.ConstFloat);
   end;
   if NumPages < 1 then NumPages := 1;
-  EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg, MakeSSAConstInt(NumPages));
+  // The DRIVER FLAGS (5th argument: GFX_FULLSCREEN = 1, GFX_WINDOWED = 0, GFX_NULL = -1, ...) ride in
+  // the high 16 bits of the same Immediate, pages in the low 16. They used to be parsed and dropped,
+  // so a program asking for fullscreen got a window in silence; the presenter reads bit 0 (7 Sep 2026).
+  Flags := 0;
+  if Node.ChildCount >= 5 then
+  begin
+    ProcessExpression(Node.GetChild(4), NVal);
+    if NVal.Kind = svkConstInt then Flags := NVal.ConstInt
+    else if NVal.Kind = svkConstFloat then Flags := Trunc(NVal.ConstFloat);
+  end;
+  EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg,
+                  MakeSSAConstInt((NumPages and $FFFF) or ((Flags and $FFFF) shl 16)));
 end;
 
 procedure TSSAGenerator.EmitPenCoordRegs(out PenX, PenY: TSSAValue);

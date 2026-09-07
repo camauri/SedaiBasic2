@@ -40,8 +40,10 @@ type
     FRenderer: PSDL_Renderer;
     FTexture: PSDL_Texture;
     FTexW, FTexH: Integer;
+    FFullscreen: Boolean;       // what the window currently is; compared with GGfxScreenFlags bit 0
     FClosed: Boolean;
     procedure EnsureTexture(W, H: Integer);
+    procedure ApplyScreenFlags;
     procedure HandleEvent(const Event: TSDL_Event);
   public
     constructor Create(ABackend: TSoftwareGraphicsBackend; const Title: string);
@@ -262,6 +264,26 @@ begin
   FTexture := SDL_CreateTexture(FRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
   FTexW := W; FTexH := H;
   if Assigned(FWindow) then SDL_SetWindowSize(FWindow, W, H);
+  // The logical size is the framebuffer's: in fullscreen (or a resized window) SDL then scales the
+  // picture to fit and letterboxes it, instead of stretching it to the monitor's aspect ratio.
+  SDL_RenderSetLogicalSize(FRenderer, W, H);
+end;
+
+procedure TWindowPresenter.ApplyScreenFlags;
+// SCREENRES w, h, 32, , GFX_FULLSCREEN (fbgfx.bi: 1) asks for the whole monitor; GFX_WINDOWED (0) for
+// a window. The VM leaves the flags in GGfxScreenFlags on every SCREENRES; this compares them with
+// what the window IS and switches only on a change, so a program that calls SCREENRES once per frame
+// does not thrash the window. FULLSCREEN_DESKTOP keeps the desktop mode and scales (no mode switch,
+// instant, and the logical size set above letterboxes it); a real mode switch is not worth its cost.
+var
+  Want: Boolean;
+begin
+  if not Assigned(FWindow) then Exit;
+  Want := (GGfxScreenFlags and 1) <> 0;
+  if Want = FFullscreen then Exit;
+  if Want then SDL_SetWindowFullscreen(FWindow, SDL_WINDOW_FULLSCREEN_DESKTOP)
+  else SDL_SetWindowFullscreen(FWindow, 0);
+  FFullscreen := Want;
 end;
 
 procedure TWindowPresenter.HandleEvent(const Event: TSDL_Event);
@@ -336,6 +358,7 @@ begin
     begin
       W := Mem.State.Width; H := Mem.State.Height;
       EnsureTexture(W, H);
+      ApplyScreenFlags;
       // ⛔ SDL_UpdateTexture, NOT SDL_LockTexture. Locking a STREAMING texture asks the driver for a
       // writable mapping, and on this stack (i915/DRM) that means FRESH PAGES EVERY FRAME: the kernel
       // has to zero them and flush them out of the CPU cache before the GPU may read them.
