@@ -36,7 +36,17 @@ uses
 const
   { Register allocation limits }
   MIN_REGISTER_SLOTS = 256;      // Initial allocation size (backward compatible)
-  MAX_REGISTER_SLOTS = 65536;    // Maximum registers per type (2^16)
+  MAX_REGISTER_SLOTS = 65536;    // Maximum registers per type (2^16), PHYSICAL: a bytecode
+                                 // instruction stores a register in a Word (TBytecodeInstruction.Dest)
+  // ⭐⭐ ...E QUELLO VIRTUALE E' UN'ALTRA COSA. Un registro SSA e' virtuale: l'allocatore lineare che
+  // gira dopo la generazione mappa i registri di TUTTO il programma su quei pochi vivi insieme. Il
+  // tetto a 16 bit appartiene al BYTECODE, non all'SSA.
+  // ⚠️ E fino al 7 set 2026 non si poteva alzare: la costruzione SSA teneva un insieme DENSO di
+  // blocchi per variabile (O(variabili x blocchi)), quindi allargare i registri portava dritti a
+  // chiedere 1 796 789 808 booleani - il tetto era l'unica cosa che fermava l'esplosione, non il
+  // difetto. Reso SPARSO quell'insieme (due timbri + la lista che c'era gia'), la memoria e'
+  // O(variabili) e il tetto virtuale puo' stare dove appartiene.
+  MAX_SSA_VREGS = 1 shl 22;      // registri SSA VIRTUALI per banco, prima dell'allocazione
 
   { FreeBASIC pointer encoding. A pointer value is a packed int: the high bits hold (backingArrayId+1)
     so 0 stays NULL, the low POINTER_ARRAY_SHIFT bits hold the element offset (in element units). Plain
@@ -1395,9 +1405,10 @@ function TSSAProgram.AllocRegister(RegType: TSSARegisterType): Integer;
 begin
   Result := FNextRegister[RegType];
   Inc(FNextRegister[RegType]);
-  if FNextRegister[RegType] >= MAX_REGISTER_SLOTS then
-    raise Exception.CreateFmt('Register overflow: exceeded %d registers for type %d',
-                              [MAX_REGISTER_SLOTS, Ord(RegType)]);
+  // ⛔ Il tetto qui e' quello VIRTUALE, non i 16 bit del bytecode: vedi MAX_SSA_VREGS.
+  if FNextRegister[RegType] >= MAX_SSA_VREGS then
+    raise Exception.CreateFmt('Register overflow: exceeded %d virtual registers for type %d',
+                              [MAX_SSA_VREGS, Ord(RegType)]);
 end;
 
 procedure TSSAProgram.AddVariable(const VarName: string);

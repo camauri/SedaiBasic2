@@ -79,8 +79,18 @@ type
     DefBlocks: array of TSSABasicBlock;  // Blocks where this variable is defined
     DefBlockCount: Integer;              // Number of entries in DefBlocks
     UseBlockCount: Integer;              // Number of blocks with uses (for IsLiveAt check)
-    DefBlockOffset: Integer;   // Offset into FBoolPool for DefBlockSet (FBlockCount booleans)
-    UseBlockOffset: Integer;   // Offset into FBoolPool for UseBlockSet (FBlockCount booleans)
+    // ⭐⭐ DUE TIMBRI AL POSTO DI DUE INSIEMI DENSI. Questi erano gli offset di due bitset da
+    // FBlockCount booleani CIASCUNO, per OGNI variabile: memoria O(variabili x blocchi). Su
+    // compound/select_const2 di fbc - ~1900 procedure generate, 32 768 variabili di banco stringa,
+    // ~27 000 blocchi - il pool arrivava a chiedere 1 796 789 808 entries, e il tetto di 65 536
+    // registri era l'unica cosa che fermava l'esplosione.
+    // ⇒ Ma le due bitset rispondevano a UNA domanda sola: «questa variabile l'ho gia' vista in QUESTO
+    // blocco?». CollectDefinitions e CollectUses percorrono i blocchi UNO ALLA VOLTA, quindi la
+    // risposta e' un TIMBRO, non un insieme - la stessa forma che KilledStamp qui sotto usa gia'.
+    // Memoria O(variabili), e la terza domanda ("questo blocco DEFINISCE la variabile?") la risponde
+    // la lista SPARSA che era gia' qui accanto, dimensionata per «most vars defined in 1-4 blocks».
+    DefSeenBlock: Integer;     // ultimo BlockIdx in cui e' stata vista una DEFINIZIONE (MinInt = mai)
+    UseSeenBlock: Integer;     // ...e un USO
     // Is there a block where this variable is READ before anything in that block writes it? That is
     // the only reason a PHI can ever be needed: an upward-exposed use is a use of a value that came
     // in from a predecessor. Without it the variable is never live-in anywhere and no merge exists
@@ -116,8 +126,6 @@ type
     // Pre-allocated boolean pool for DefBlockSet/UseBlockSet
     // Instead of 765+ individual SetLength calls, we allocate ONE big array
     // and give each variable an offset into it
-    FBoolPool: array of Boolean;     // Pool: 2 * MaxVars * FBlockCount booleans
-    FBoolPoolNextOffset: Integer;    // Next available offset in pool
 
     // Variable info: array of all variables
     FVarInfo: array of TVarInfo;
@@ -143,6 +151,7 @@ type
 
     { Helper functions - now use integer keys for O(1) lookup }
     function EncodeRegKey(RegType: TSSARegisterType; RegIndex: Integer): Integer; inline;
+    function DefinesInBlock(VarIdx, BlockIdx: Integer): Boolean;
     function GetOrCreateVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
     function FindVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
     procedure CollectDefinitions;
@@ -259,8 +268,6 @@ begin
   // Pre-allocate boolean pool for DefBlockSet/UseBlockSet
   // Estimate: 1024 variables * 2 sets * FBlockCount = one big allocation
   // This replaces 2048 individual SetLength calls with ONE allocation!
-  SetLength(FBoolPool, 1024 * 2 * FBlockCount);
-  FBoolPoolNextOffset := 0;
 
   // Initialize variable info array (grows as needed)
   SetLength(FVarInfo, 256);  // Initial capacity
@@ -288,7 +295,6 @@ begin
   // Free pre-allocated work arrays
   SetLength(FPhiWorkList, 0);
   SetLength(FPhiBlockSet, 0);
-  SetLength(FBoolPool, 0);  // Free the pooled boolean array
 
   // Free variable info
   for i := 0 to FVarInfoCount - 1 do
@@ -311,9 +317,21 @@ begin
   Result := Ord(RegType) * 65536 + RegIndex;
 end;
 
+function TSSAConstruction.DefinesInBlock(VarIdx, BlockIdx: Integer): Boolean;
+// Il blocco BlockIdx definisce questa variabile? Scansione della lista SPARSA delle definizioni, che e'
+// dimensionata per il caso vero («most vars defined in 1-4 blocks») - dove la matrice densa costava
+// FBlockCount booleani per variabile solo per rispondere a questo.
+var
+  k: Integer;
+begin
+  Result := False;
+  for k := 0 to FVarInfo[VarIdx].DefBlockCount - 1 do
+    if FVarInfo[VarIdx].DefBlocks[k].BlockIndex = BlockIdx then Exit(True);
+end;
+
 function TSSAConstruction.GetOrCreateVarIndex(RegType: TSSARegisterType; RegIndex: Integer): Integer;
 var
-  TypeIdx, i, NeededSize: Integer;
+  TypeIdx, i: Integer;
 begin
   TypeIdx := Ord(RegType);
 
@@ -341,15 +359,6 @@ begin
   if FVarInfoCount > Length(FVarInfo) then
     SetLength(FVarInfo, Length(FVarInfo) * 2);
 
-  // Allocate from boolean pool instead of individual SetLength calls
-  // Each variable needs 2 * FBlockCount booleans (DefBlockSet + UseBlockSet)
-  NeededSize := FBoolPoolNextOffset + 2 * FBlockCount;
-  if NeededSize > Length(FBoolPool) then
-  begin
-    // Grow pool - double it
-    SetLength(FBoolPool, Length(FBoolPool) * 2);
-  end;
-
   // Initialize new entry - use offsets into pool instead of separate arrays
   FVarInfo[Result].RegType := RegType;
   FVarInfo[Result].RegIndex := RegIndex;
@@ -359,10 +368,8 @@ begin
   FVarInfo[Result].UseBlockCount := 0;
   FVarInfo[Result].UpwardExposed := False;
   FVarInfo[Result].KilledStamp := -1;
-  FVarInfo[Result].DefBlockOffset := FBoolPoolNextOffset;
-  FVarInfo[Result].UseBlockOffset := FBoolPoolNextOffset + FBlockCount;
-  FBoolPoolNextOffset := FBoolPoolNextOffset + 2 * FBlockCount;
-  // Pool is already zero-initialized by SetLength, no need to clear
+  FVarInfo[Result].DefSeenBlock := Low(Integer);   // mai vista: nessun BlockIdx puo' valere questo
+  FVarInfo[Result].UseSeenBlock := Low(Integer);
   FVarInfo[Result].VersionCounter := 1;
   FVarInfo[Result].LastVersion := 0;
   // Lazy allocation: only create VersionStack when scoped semantics are used
@@ -649,10 +656,11 @@ begin
       begin
         VarIdx := GetOrCreateVarIndex(Instr.Dest.RegType, Instr.Dest.RegIndex);
 
-        // O(1) membership test using pooled boolean array
-        if not FBoolPool[FVarInfo[VarIdx].DefBlockOffset + BlockIdx] then
+        // O(1) e senza matrice: i blocchi si percorrono uno alla volta, quindi «gia' vista qui» e'
+        // il confronto col timbro dell'ultimo blocco in cui l'abbiamo vista.
+        if FVarInfo[VarIdx].DefSeenBlock <> BlockIdx then
         begin
-          FBoolPool[FVarInfo[VarIdx].DefBlockOffset + BlockIdx] := True;
+          FVarInfo[VarIdx].DefSeenBlock := BlockIdx;
           // Add to inline array (grow if needed)
           if FVarInfo[VarIdx].DefBlockCount >= Length(FVarInfo[VarIdx].DefBlocks) then
             SetLength(FVarInfo[VarIdx].DefBlocks, Length(FVarInfo[VarIdx].DefBlocks) * 2);
@@ -683,10 +691,9 @@ var
 
     Idx := GetOrCreateVarIndex(Val.RegType, Val.RegIndex);
 
-    // O(1) membership test using pooled boolean array
-    if not FBoolPool[FVarInfo[Idx].UseBlockOffset + BlockIdx] then
+    if FVarInfo[Idx].UseSeenBlock <> BlockIdx then
     begin
-      FBoolPool[FVarInfo[Idx].UseBlockOffset + BlockIdx] := True;
+      FVarInfo[Idx].UseSeenBlock := BlockIdx;
       Inc(FVarInfo[Idx].UseBlockCount);  // Just count, don't store list
     end;
     // Upward-exposed IN A BLOCK THAT ALSO DEFINES IT: nothing in this block has written the
@@ -700,8 +707,11 @@ var
     // 53% of its native time by changing the shape the bounds-check analysis matches on - for a
     // shape no test has ever shown to be wrong. Narrow to the defect actually demonstrated.
     // CollectDefinitions has already run, so the def-block set is complete here.
-    if (FVarInfo[Idx].KilledStamp <> BlockIdx) and
-       FBoolPool[FVarInfo[Idx].DefBlockOffset + BlockIdx] then
+    // ⭐ «Questo blocco DEFINISCE la variabile?» - l'unica delle tre domande che non e' «gia' vista
+    // qui», perche' CollectDefinitions e' un'altra passata e il suo timbro non sopravvive. La
+    // risponde la lista SPARSA, che per costruzione e' corta: la stessa DefBlocks che la passata
+    // precedente ha riempito.
+    if (FVarInfo[Idx].KilledStamp <> BlockIdx) and DefinesInBlock(Idx, BlockIdx) then
       FVarInfo[Idx].UpwardExposed := True;
   end;
 
@@ -943,8 +953,10 @@ begin
           WriteLn('[SSAConstruction]     Inserted PHI for var ', VarIdx, ' in block ', Y.LabelName);
         {$ENDIF}
 
-        // O(1) check: If Y was not an original definition site, add to worklist
-        if not FBoolPool[FVarInfo[VarIdx].DefBlockOffset + YIdx] then
+        // Se Y non era un sito di definizione ORIGINALE, va nella worklist. Quarta lettura della
+        // vecchia matrice densa, e l'unica che chiede di un blocco QUALSIASI invece che di quello
+        // corrente: la risponde la stessa lista sparsa.
+        if not DefinesInBlock(VarIdx, YIdx) then
         begin
           FPhiWorkList[FPhiWorkListCount] := Y;
           Inc(FPhiWorkListCount);
