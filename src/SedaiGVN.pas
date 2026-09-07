@@ -59,10 +59,37 @@ type
   TScopedGVNTable = class
   private
     type
-      TValueMap = specialize TDictionary<string, TSSAValue>;
-      TMapStack = specialize TList<TValueMap>;
+      { ⭐⭐ ONE TABLE, NOT A STACK OF TABLES. This used to be a stack of dictionaries, one per node
+        of the dominator tree, and Lookup walked them from the top down to the floor: a lookup cost AS
+        MUCH AS THE STACK IS DEEP. Module-level code is a dominator CHAIN - every instruction dominates
+        the next - so on a program that generates ~1900 procedures the stack reaches 1665 scopes and a
+        single lookup probes ~800 of them.
+        📊 Measured on fbc's own compound/select_const2, at 2/4/8 macro groups: the LOOKUPS grow
+        linearly (9 073 / 18 121 / 36 217) while the PROBES grow QUADRATICALLY (1 838 555 / 7 429 703 /
+        29 834 699). GVN was 28% of the compilation and grew 4x per doubling of the program.
+        ⇒ The canonical shape: ONE map plus an UNDO JOURNAL. Lookup is O(1) whatever the depth;
+        PushScope records the journal's length; PopScope undoes back to that mark, restoring whatever
+        binding was there before. Depth no longer enters the cost of a lookup.
+        ⛔ And the FLOOR survives, because it is needed: every entry carries the scope INDEX it was
+        inserted at, and an entry below the floor is invisible. That is exactly what the stack did -
+        the map always holds the INNERMOST binding, and if that one is below the floor there is no
+        outer binding to prefer to it: those sit in the journal, already covered. }
+      TValueEntry = record
+        Value: TSSAValue;
+        Depth: Integer;      // scope in cui e' stata inserita: sotto il pavimento non si vede
+      end;
+      TValueMap = specialize TDictionary<string, TValueEntry>;
+      TUndoRec = record
+        Key: string;
+        HadOld: Boolean;
+        Old: TValueEntry;
+      end;
   private
-    FStack: TMapStack;
+    FMap: TValueMap;
+    FUndo: array of TUndoRec;
+    FUndoCount: Integer;
+    FMarks: array of Integer;   // lunghezza del giornale all'apertura di ogni scope
+    FDepth: Integer;
     FInitialStackDepth: Integer;
     // Lowest scope Lookup may reach. A CALL is an edge in this CFG, so a procedure body is DOMINATED
     // by the module code that calls it -- but dominance there does not mean the caller's register
@@ -227,46 +254,53 @@ uses TypInfo
 constructor TScopedGVNTable.Create;
 begin
   inherited Create;
-  FStack := TMapStack.Create;
+  FMap := TValueMap.Create;
+  FUndoCount := 0;
+  FDepth := 0;
+  SetLength(FUndo, 1024);
+  SetLength(FMarks, 64);
   FInitialStackDepth := 0;
 end;
 
 destructor TScopedGVNTable.Destroy;
-var
-  Map: TValueMap;
 begin
-  // Free all hash tables in stack
-  for Map in FStack do
-    Map.Free;
-
-  FStack.Free;
+  FMap.Free;
+  SetLength(FUndo, 0);
+  SetLength(FMarks, 0);
   inherited Destroy;
 end;
 
 procedure TScopedGVNTable.PushScope;
-var
-  NewMap: TValueMap;
 begin
-  NewMap := TValueMap.Create;
-  FStack.Add(NewMap);
+  if FDepth >= Length(FMarks) then SetLength(FMarks, Length(FMarks) * 2);
+  FMarks[FDepth] := FUndoCount;
+  Inc(FDepth);
 end;
 
 procedure TScopedGVNTable.PopScope;
 var
-  Map: TValueMap;
+  Mark: Integer;
 begin
-  if FStack.Count = 0 then
+  if FDepth = 0 then
     raise Exception.Create('TScopedGVNTable.PopScope: Stack underflow!');
-
-  // Free top map and remove from stack
-  Map := FStack[FStack.Count - 1];
-  FStack.Delete(FStack.Count - 1);
-  Map.Free;
+  Dec(FDepth);
+  Mark := FMarks[FDepth];
+  // Disfa in ordine INVERSO: la stessa chiave puo' essere stata riscritta piu' volte in questo
+  // scope, e solo annullando l'ultima per prima si rimette il legame giusto.
+  while FUndoCount > Mark do
+  begin
+    Dec(FUndoCount);
+    if FUndo[FUndoCount].HadOld then
+      FMap.AddOrSetValue(FUndo[FUndoCount].Key, FUndo[FUndoCount].Old)
+    else
+      FMap.Remove(FUndo[FUndoCount].Key);
+    FUndo[FUndoCount].Key := '';
+  end;
 end;
 
 function TScopedGVNTable.Depth: Integer;
 begin
-  Result := FStack.Count;
+  Result := FDepth;
 end;
 
 function TScopedGVNTable.SetFloor(NewFloor: Integer): Integer;
@@ -277,42 +311,46 @@ end;
 
 function TScopedGVNTable.Lookup(const Hash: string; out Value: TSSAValue): Boolean;
 var
-  i: Integer;
-  Map: TValueMap;
+  Entry: TValueEntry;
 begin
-  // Search from top (most recent scope) down to the floor (see FFloor: never below the procedure
-  // body currently being processed).
-  for i := FStack.Count - 1 downto FFloor do
-  begin
-    Map := FStack[i];
-    if Map.TryGetValue(Hash, Value) then
-      Exit(True);  // Found in this scope
-  end;
-
-  Result := False;  // Not found in any scope
+  // O(1): una sonda sola, qualunque sia la profondita'. La voce vale solo se e' stata inserita a un
+  // livello che il pavimento lascia vedere.
+  Result := FMap.TryGetValue(Hash, Entry) and (Entry.Depth >= FFloor);
+  if Result then Value := Entry.Value;
 end;
 
 procedure TScopedGVNTable.Insert(const Hash: string; const Value: TSSAValue);
 var
-  Map: TValueMap;
+  Entry, Old: TValueEntry;
 begin
-  if FStack.Count = 0 then
+  if FDepth = 0 then
     raise Exception.Create('TScopedGVNTable.Insert: No active scope!');
-
-  // Insert into top scope (current dominator subtree)
-  Map := FStack[FStack.Count - 1];
-  Map.AddOrSetValue(Hash, Value);
+  if FUndoCount >= Length(FUndo) then SetLength(FUndo, Length(FUndo) * 2);
+  FUndo[FUndoCount].Key := Hash;
+  FUndo[FUndoCount].HadOld := FMap.TryGetValue(Hash, Old);
+  if FUndo[FUndoCount].HadOld then FUndo[FUndoCount].Old := Old;
+  Inc(FUndoCount);
+  Entry.Value := Value;
+  { ⛔⛔ THE SCOPE'S INDEX, NOT ITS DEPTH. The floor is an INDEX into the old stack of maps
+    (`SetFloor(Depth - 1)`, and the old Lookup ran `for i := Count-1 downto FFloor`), so the k-th
+    scope sat at index k-1 while FDepth reads k. Stamping FDepth makes `Depth >= FFloor` true for the
+    scope IMMEDIATELY BELOW the floor as well: a procedure body then saw a value of its CALLER and GVN
+    replaced an instruction with a register belonging to another frame. And it is not just any wrong
+    answer - measured on the oracle's own compound/select_const2, the program enters an infinite loop
+    and never terminates. ⇒ A floor is expressed in the units of whoever compares against it. }
+  Entry.Depth := FDepth - 1;
+  FMap.AddOrSetValue(Hash, Entry);
 end;
 
 function TScopedGVNTable.VerifyStackIntegrity: Boolean;
 begin
   // STEP 5 REQUIREMENT: Verify stack returns to original size after traversal
-  Result := (FStack.Count = FInitialStackDepth);
+  Result := (FDepth = FInitialStackDepth);
 
   {$IFDEF DEBUG_GVN}
   if not Result and DebugGVN then
     WriteLn(Format('[GVN] WARNING: Stack integrity violated! Expected depth %d, got %d',
-      [FInitialStackDepth, FStack.Count]));
+      [FInitialStackDepth, FDepth]));
   {$ENDIF}
 end;
 

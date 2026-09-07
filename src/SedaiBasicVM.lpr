@@ -716,11 +716,31 @@ var
   // rewrote nothing at all on this program - which is not automatically a defect (many passes
   // legitimately find no opportunity in a given program), but a pass inert across the whole corpus
   // is the signature of the GVN bug found on 2026-07-25: sound, timed, and doing nothing.
+  { OPTSKIP=<name>[,<name>...] skips SSA optimization passes by name at RUN time.
+    ⛔ WHY IT EXISTS (7 Sep 2026). Bisecting an optimizer MISCOMPILATION cost one full REBUILD per
+    pass, because the only switch was the compile-time {$DEFINE} in OptimizationFlags.inc - so a
+    program that answers under --no-opt and never terminates with optimizations on could not be
+    attributed to a pass in less than half an hour. It found one in twelve runs, and the answer was
+    not one pass but THREE that had to co-operate: skipping any of SubInlining, DBE or GVN made the
+    program finish, and none of the three alone was enough to hang it. This is the SSA-side twin of
+    SUPERINSTR=0 / SUPERMASK, which the bytecode passes have had all along.
+    Names are the ones the pass call sites use; the match is case-insensitive. }
+  function PassEnabled(const AName: string): Boolean;
+  var
+    Skip: string;
+  begin
+    Skip := UpperCase(GetEnvironmentVariable('OPTSKIP'));
+    Result := (Skip = '') or (Pos(',' + UpperCase(AName) + ',', ',' + Skip + ',') = 0);
+  end;
+
   procedure PassMark(const AName: string);
   var
     H: QWord;
     Cnt, Delta: Integer;
   begin
+    // PHASE_DIAG=1 prints the TIME of every pass, whether or not --stats asked for its EFFECT:
+    // the two questions are separate, and until 7 Sep 2026 the time half stopped at the SSA passes.
+    PhaseMark(AName);
     if not OptStats then Exit;
     if not Assigned(SSAProgram) then Exit;
     H := SSAProgram.Fingerprint(Cnt);
@@ -765,6 +785,7 @@ begin
   // Load source
   if OptVerbose then
     WriteLn('Loading source: ', SourceFile);
+  PhaseBegin;
   Source := TStringList.Create;
   try
     // ⭐ Several modules become one compilation, in fbc's measured order (DIVERGENZE 162): the
@@ -805,6 +826,7 @@ begin
       // on the RAW text: the preprocessor strips both directive forms before the old site ran.
       QBLangDetected := DetectQBLang(Source.Text);
       Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
+      PhaseMark('preprocess');
     except
       on E: EPreprocessorError do
       begin
@@ -833,6 +855,7 @@ begin
       try
         Timer := CreateHiResTimer;
         TokenList := Lexer.ScanAllTokensFast;
+        PhaseMark('lex');
         if OptVerbose then
           WriteLn(Format('Tokenized %d tokens in %.2f ms',
             [Lexer.TokenCount, Timer.ElapsedMilliseconds]));
@@ -858,6 +881,7 @@ begin
       try
         Timer := CreateHiResTimer;
         ParserResult := Parser.Parse(TokenList);
+        PhaseMark('parse');
         if OptVerbose then
           WriteLn(Format('Parsed in %.2f ms', [Timer.ElapsedMilliseconds]));
 
@@ -908,6 +932,7 @@ begin
       try
         Timer := CreateHiResTimer;
         SSAProgram := SSAGen.Generate(ParserResult.AST);
+        PhaseMark('ssa-gen');
         SSATime := Timer.ElapsedMilliseconds;
 
         if not Assigned(SSAProgram) then
@@ -953,7 +978,7 @@ begin
       // SUB/FUNCTION INLINING (unification) - flatten small leaf calls FIRST, so the
       // clones go through versioning and every later pass like hand-written code.
       try
-        SSAProgram.RunSubInlining;
+        if PassEnabled('SubInlining') then SSAProgram.RunSubInlining;
       except
         on E: Exception do
         begin
@@ -967,7 +992,7 @@ begin
       // Measured on a three-statement SUB in a hot loop: five instructions of fourteen, and 52% of
       // the running time against the same statements written inline by hand.
       try
-        SSAProgram.RunXferForwarding;
+        if PassEnabled('XferForwarding') then SSAProgram.RunXferForwarding;
       except
         on E: Exception do
         begin
@@ -990,7 +1015,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunDBE;
+        if PassEnabled('DBE') then SSAProgram.RunDBE;
       except
         on E: Exception do
         begin
@@ -1040,7 +1065,7 @@ begin
       {$IFNDEF DISABLE_SSA_CONSTRUCTION}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunSSAConstruction;
+        if PassEnabled('SSAConstruction') then SSAProgram.RunSSAConstruction;
       except
         on E: Exception do
         begin
@@ -1086,7 +1111,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunGVN;
+        if PassEnabled('GVN') then SSAProgram.RunGVN;
       except
         on E: Exception do
         begin
@@ -1129,7 +1154,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunCSE;
+        if PassEnabled('CSE') then SSAProgram.RunCSE;
       except
         on E: Exception do
         begin
@@ -1171,7 +1196,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunAlgebraic;
+        if PassEnabled('Algebraic') then SSAProgram.RunAlgebraic;
       except
         on E: Exception do
         begin
@@ -1203,7 +1228,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunStrengthReduction;
+        if PassEnabled('StrengthReduction') then SSAProgram.RunStrengthReduction;
       except
         on E: Exception do
         begin
@@ -1235,7 +1260,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunGosubInlining;
+        if PassEnabled('GosubInlining') then SSAProgram.RunGosubInlining;
       except
         on E: Exception do
         begin
@@ -1269,7 +1294,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunConstProp;
+        if PassEnabled('ConstProp') then SSAProgram.RunConstProp;
       except
         on E: Exception do
         begin
@@ -1301,7 +1326,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunCopyProp;
+        if PassEnabled('CopyProp') then SSAProgram.RunCopyProp;
       except
         on E: Exception do
         begin
@@ -1333,7 +1358,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunLICM;
+        if PassEnabled('LICM') then SSAProgram.RunLICM;
       except
         on E: Exception do
         begin
@@ -1360,7 +1385,7 @@ begin
       // creates; and before the range analysis, because the running indices it emits have to be
       // re-proven in bounds by EvalDerivedIV or the loop gets its guards back and comes out SLOWER.
       try
-        SSAProgram.RunIndexReduction;
+        if PassEnabled('IndexReduction') then SSAProgram.RunIndexReduction;
       except
         on E: Exception do
         begin
@@ -1386,7 +1411,7 @@ begin
         // Rebuild dominator tree to include any blocks added by LICM
         SSAProgram.ClearDomTree;
         SSAProgram.BuildDominatorTree;
-        SSAProgram.RunLoopUnrolling;
+        if PassEnabled('LoopUnrolling') then SSAProgram.RunLoopUnrolling;
       except
         on E: Exception do
         begin
@@ -1419,7 +1444,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunDCE;
+        if PassEnabled('DCE') then SSAProgram.RunDCE;
       except
         on E: Exception do
         begin
@@ -1446,7 +1471,7 @@ begin
       // elimination (the induction-variable proof needs the PHIs). Sets a hint
       // only - the instruction stream is untouched.
       try
-        SSAProgram.RunRangeAnalysis;
+        if PassEnabled('RangeAnalysis') then SSAProgram.RunRangeAnalysis;
       except
         on E: Exception do
         begin
@@ -1470,7 +1495,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunPhiElimination;
+        if PassEnabled('PhiElimination') then SSAProgram.RunPhiElimination;
       except
         on E: Exception do
         begin
@@ -1516,7 +1541,7 @@ begin
       {$ENDIF}
       if OptStats then PassTimer := CreateHiResTimer;
       try
-        SSAProgram.RunCopyCoalescing;
+        if PassEnabled('CopyCoalescing') then SSAProgram.RunCopyCoalescing;
       except
         on E: Exception do
         begin
@@ -1696,6 +1721,7 @@ begin
         BytecodeProgram.ModuleName := SourceFile;
         {$ENDIF}
         BytecodeProgram.QBLang := QBLangDetected;
+        PhaseMark('bytecode-gen');
 
       except
         on E: Exception do
@@ -1733,6 +1759,7 @@ begin
     {$ENDIF}
     try
       if GSSAOptimizationsEnabled then RunPeephole(BytecodeProgram);
+      PhaseMark('Peephole');
       {$IFDEF DEBUG_PEEPHOLE}
       if DebugPeephole then
         WriteLn(Format('  Instructions after peephole: %d', [BytecodeProgram.GetInstructionCount]));
@@ -1782,6 +1809,7 @@ begin
     {$ENDIF}
     try
       if GSSAOptimizationsEnabled then RunSuperinstructionsAot(BytecodeProgram, SSAProgram);
+      PhaseMark('Superinstr');
       {$IFDEF DEBUG_SUPERINSTR}
       if DebugSuperinstr then
         WriteLn(Format('  Instructions after fusion: %d', [BytecodeProgram.GetInstructionCount]));
@@ -1815,6 +1843,7 @@ begin
     {$IFNDEF DISABLE_NOP_COMPACTION}
     try
       RunNopCompaction(BytecodeProgram);
+      PhaseMark('NopCompaction');
     except
       on E: Exception do
       begin
@@ -1832,9 +1861,11 @@ begin
     {$IFNDEF DISABLE_PEEPHOLE}
     try
       if GSSAOptimizationsEnabled then RunPeephole(BytecodeProgram);
+      PhaseMark('Peephole2');
       // Run NOP compaction again to remove any new NOPs
       {$IFNDEF DISABLE_NOP_COMPACTION}
       RunNopCompaction(BytecodeProgram);
+      PhaseMark('NopCompaction2');
       {$ENDIF}
     except
       on E: Exception do
@@ -1854,6 +1885,7 @@ begin
     {$ENDIF}
     try
       if GSSAOptimizationsEnabled then RunRegisterCompaction(BytecodeProgram);
+      PhaseMark('RegCompaction');
       {$IFDEF DEBUG_REGALLOC}
       if DebugRegAlloc then
         WriteLn;
