@@ -31751,9 +31751,86 @@ begin
       end;
     if (Cand <> '') and (not OkDef) then Exit(Cand);
   end;
+  Pref := BaseLabel + '~';
+  // ⭐⭐⭐ ...AND THE RANKING GOES ABOVE THE BANK FILTER, NOT BELOW IT (DIVERGENZE 161). Every pass
+  // from here down requires the label's BANK part to match the call's EXACTLY, and the bank is a
+  // COARSER type key than the ranking: it says "integer or float", where the ranking knows the twelve
+  // types and what fbc charges to convert between them. Below the filter, a candidate of the other
+  // bank is discarded before it can be weighed - "z_(As UShort, As Double)" beside
+  // "z_(As Single, As Single)" called with two Doubles is fbc's FIRST (61 against 106) and was our
+  // second, in silence, because the integer-bank candidate never reached the ranking.
+  // ⚠️ MOVING IT UP CHANGES NOTHING ELSE, and that is measured rather than argued: inside the
+  // ranking's own domain (every candidate of the call's arity, every parameter one of the twelve
+  // numeric types, every argument typeable) the pass below can only resolve where the call's widths
+  // are KNOWN - and there the winning candidate is an EXACT match, which costs 0 and wins the ranking
+  // too - or where exactly one candidate carries the call's bank, which IS this entry. Everything the
+  // ranking cannot rank declines and reaches the pass below exactly as before.
+  // ⛔ And the two passes it is NOT allowed above are the two whose key is FINER, not coarser: the
+  // width tail and the CONST tail, both matched exactly further up. A const pair signs the same facts
+  // in every position, so the ranking DRAWS on it and declines by its own tie rule - m849's group 3
+  // reaches its pass untouched.
+  // ⭐⭐ THE CONVERSION RANKING (DIVERGENZE 8). Everything above this line is an EXACT match of one
+  // spelling or another; below it the passes take "the first candidate that fits", which is where the
+  // wrong overload lives. fbc does neither: it RANKS the implicit conversions and takes the cheapest.
+  // The rule is measured (see ConvRankCost) and reproduces a 12x12 preference matrix taken from the
+  // oracle in both declaration orders.
+  // ⛔ IT DECLINES ON A TIE, and on anything it cannot rank - a string, a UDT, a pointer, an enum, a
+  // Boolean, a different arity. A call it declines takes exactly the path it took before, so this pass
+  // can only ever move a call that the fallbacks below would have decided by DECLARATION ORDER.
+  // ⛔⛔ AND IT SITS ABOVE THE "not a record" PASS, NOT BELOW IT, which the deck settled: that pass is
+  // itself a "take the first that fits", so with the ranking underneath it "f_(v)" against
+  // f_(As Byte) / f_(As Short) still answered Byte where fbc answers Short. The two cannot collide:
+  // a record parameter has no rank at all (a UDT name has no identity code), so every call 157 exists
+  // for is one this pass DECLINES on, and it reaches that pass exactly as it did.
+  Cand := '';
+  BestCost := -1;
+  OkDef := False;                                  // OkDef: the best cost is shared -> ambiguous
+  AmbWith := '';
+  Ranked := True;
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
+    if not LabelRankCost(FProcedureNames[k], ArgsNode, RankCost) then
+    begin Cand := ''; Ranked := False; Break; end;
+    if (BestCost < 0) or (RankCost < BestCost) then
+    begin BestCost := RankCost; Cand := FProcedureNames[k]; OkDef := False; AmbWith := ''; end
+    else if RankCost = BestCost then
+    begin
+      OkDef := True;
+      // ...and only a candidate that names a DIFFERENT type somewhere is fbc's ambiguity.
+      if (AmbWith = '') and RankedCandidatesDiffer(Cand, FProcedureNames[k], ArgCount) then
+        AmbWith := FProcedureNames[k];
+    end;
+  end;
+  // ⭐⭐ AN AMBIGUOUS CALL IS AN ERROR, NOT A CHOICE (DIVERGENZE 160). fbc compares the SUMS and refuses
+  // a draw outright - "error 98: Ambiguous call to overloaded function" - where we used to decline and
+  // let the fallbacks below take whichever was declared first, in silence.
+  // ⛔ IT IS REFUSED ONLY WHERE THE RANKING ACTUALLY RANKED, which is the whole distinction this entry
+  // is about: a set holding a string, a UDT, a pointer, an enum, a Boolean or a different arity breaks
+  // the loop above with Ranked=FALSE, and there the draw means "this pass could not classify" - the
+  // fallbacks are right and nothing is refused. A draw with Ranked=TRUE means "classified, and it is a
+  // tie", which is exactly what fbc reports.
+  // ⛔⛔ AND THE EXEMPTION IS THAT TWO CANDIDATES MAY BE ONE TYPE SPELLED TWICE. The cost is a function
+  // of the parameter's TYPE FACTS, so two candidates naming the same facts everywhere always draw -
+  // and that draw is arithmetic, not ambiguity: fbc calls such a pair "error 4: Duplicated definition"
+  // (a different refusal, and m849's, not this one), and for INT32 beside LONG it is our own extension,
+  // a program fbc cannot compile at all. RankedCandidatesDiffer is what asks.
+  if Ranked and (Cand <> '') and OkDef and (AmbWith <> '') then
+    raise Exception.CreateFmt('Ambiguous call to overloaded procedure "%s": no candidate is better ' +
+      'than the others for these arguments (%s and %s cost the same)',
+      [BaseLabel, Cand, AmbWith]);
+  if (Cand <> '') and (not OkDef) then Exit(Cand);
+  // The exact BANK signature, which is what tells "g(As Long)" from "g(As Single)" apart and what
+  // every overload set without a by-value UDT parameter resolved by before any of this existed.
+  // ⛔ It is BELOW the ranking, and one line of the census is why: a candidate whose parameters are
+  // all DOUBLE carries no width tail at all, so it - and only it - can still be spelled by the bare
+  // bank key. "z_(As ULong, As Single)" beside "z_(As Double, As Double)" called with two Singles is
+  // fbc's FIRST (55 against 106); the bare key found the second and stopped. Every other numeric
+  // candidate carries a width tail and could never match here anyway, so moving this down costs the
+  // exactness nothing: where the ranking ranks it is the finer answer, and where it declines this
+  // line runs exactly as it did.
   Result := BaseLabel + '~' + Sig;
   if FProcDecls.ContainsKey(Result) then Exit;
-  Pref := BaseLabel + '~';
   // ⭐⭐ ...AND A '-' IN THE CALL'S WIDTH TAIL MEANS "UNKNOWN" TOO, which is the same doctrine the type
   // tail gets one pass below and the width tail did not have. It is asked exactly HERE, in the slot the
   // bare "BaseLabel~Sig" key used to answer from, because that is what this replaces: giving the four
@@ -31820,57 +31897,6 @@ begin
       end;
     if Cand <> '' then Exit(Cand);
   end;
-  // ⭐⭐ THE CONVERSION RANKING (DIVERGENZE 8). Everything above this line is an EXACT match of one
-  // spelling or another; below it the passes take "the first candidate that fits", which is where the
-  // wrong overload lives. fbc does neither: it RANKS the implicit conversions and takes the cheapest.
-  // The rule is measured (see ConvRankCost) and reproduces a 12x12 preference matrix taken from the
-  // oracle in both declaration orders.
-  // ⛔ IT DECLINES ON A TIE, and on anything it cannot rank - a string, a UDT, a pointer, an enum, a
-  // Boolean, a different arity. A call it declines takes exactly the path it took before, so this pass
-  // can only ever move a call that the fallbacks below would have decided by DECLARATION ORDER.
-  // ⛔⛔ AND IT SITS ABOVE THE "not a record" PASS, NOT BELOW IT, which the deck settled: that pass is
-  // itself a "take the first that fits", so with the ranking underneath it "f_(v)" against
-  // f_(As Byte) / f_(As Short) still answered Byte where fbc answers Short. The two cannot collide:
-  // a record parameter has no rank at all (a UDT name has no identity code), so every call 157 exists
-  // for is one this pass DECLINES on, and it reaches that pass exactly as it did.
-  Cand := '';
-  BestCost := -1;
-  OkDef := False;                                  // OkDef: the best cost is shared -> ambiguous
-  AmbWith := '';
-  Ranked := True;
-  for k := 0 to FProcedureNames.Count - 1 do
-  begin
-    if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
-    if not LabelRankCost(FProcedureNames[k], ArgsNode, RankCost) then
-    begin Cand := ''; Ranked := False; Break; end;
-    if (BestCost < 0) or (RankCost < BestCost) then
-    begin BestCost := RankCost; Cand := FProcedureNames[k]; OkDef := False; AmbWith := ''; end
-    else if RankCost = BestCost then
-    begin
-      OkDef := True;
-      // ...and only a candidate that names a DIFFERENT type somewhere is fbc's ambiguity.
-      if (AmbWith = '') and RankedCandidatesDiffer(Cand, FProcedureNames[k], ArgCount) then
-        AmbWith := FProcedureNames[k];
-    end;
-  end;
-  // ⭐⭐ AN AMBIGUOUS CALL IS AN ERROR, NOT A CHOICE (DIVERGENZE 160). fbc compares the SUMS and refuses
-  // a draw outright - "error 98: Ambiguous call to overloaded function" - where we used to decline and
-  // let the fallbacks below take whichever was declared first, in silence.
-  // ⛔ IT IS REFUSED ONLY WHERE THE RANKING ACTUALLY RANKED, which is the whole distinction this entry
-  // is about: a set holding a string, a UDT, a pointer, an enum, a Boolean or a different arity breaks
-  // the loop above with Ranked=FALSE, and there the draw means "this pass could not classify" - the
-  // fallbacks are right and nothing is refused. A draw with Ranked=TRUE means "classified, and it is a
-  // tie", which is exactly what fbc reports.
-  // ⛔⛔ AND THE EXEMPTION IS THAT TWO CANDIDATES MAY BE ONE TYPE SPELLED TWICE. The cost is a function
-  // of the parameter's TYPE FACTS, so two candidates naming the same facts everywhere always draw -
-  // and that draw is arithmetic, not ambiguity: fbc calls such a pair "error 4: Duplicated definition"
-  // (a different refusal, and m849's, not this one), and for INT32 beside LONG it is our own extension,
-  // a program fbc cannot compile at all. RankedCandidatesDiffer is what asks.
-  if Ranked and (Cand <> '') and OkDef and (AmbWith <> '') then
-    raise Exception.CreateFmt('Ambiguous call to overloaded procedure "%s": no candidate is better ' +
-      'than the others for these arguments (%s and %s cost the same)',
-      [BaseLabel, Cand, AmbWith]);
-  if (Cand <> '') and (not OkDef) then Exit(Cand);
   // ⭐⭐ ...AND A NUMBER IS NOT A RECORD, which is the one thing the bank part cannot say (DIVERGENZE
   // 157). Every UDT is an int handle, so "Operator T.Let( ByRef As T )" and "Operator T.Let( ByVal As
   // Long )" both sign the bank 'I', the call "b = 3" names no type at all, and the fallback below took
