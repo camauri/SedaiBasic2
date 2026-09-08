@@ -260,10 +260,10 @@ begin
   // length of the run - but the cure was never to refuse the loop: it is to bound how long one stay
   // can last. HOTC_GATE=1 puts the old refusal back, so the A/B lives on ONE binary.
   HotCOk := (not Ctx.TraceActive) and
-            ((not Assigned(FEventPollCallback)) or (GetEnvironmentVariable('HOTC_GATE') <> '1')) and
-            ((not AotOn) or (GetEnvironmentVariable('HOTC_AOT') <> '0')) and
-            ((not JitOn) or (GetEnvironmentVariable('HOTC_JIT') <> '0'));
-  if GetEnvironmentVariable('HOTC_OFF') = '1' then HotCOk := False;
+            ((not Assigned(FEventPollCallback)) or (SysUtils.GetEnvironmentVariable('HOTC_GATE') <> '1')) and
+            ((not AotOn) or (SysUtils.GetEnvironmentVariable('HOTC_AOT') <> '0')) and
+            ((not JitOn) or (SysUtils.GetEnvironmentVariable('HOTC_JIT') <> '0'));
+  if SysUtils.GetEnvironmentVariable('HOTC_OFF') = '1' then HotCOk := False;
   // CLASSIC and --bounds-check both have to RAISE on an out-of-bounds access, and the C loop cannot
   // raise; there its array arms hand the PC back instead.
   HotFlags := 0;

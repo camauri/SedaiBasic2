@@ -964,6 +964,13 @@ uses
   // Only for AttachGraphicsToOutput: the headless text device is the one that has to be TOLD about the
   // drawing surface, because unlike sbv's controller it is not the graphics backend itself. In the
   // implementation section so the interface of this unit stays free of it.
+  // ⛔⛔ EVERY SysUtils.GetEnvironmentVariable IN THIS UNIT AND IN RunTemplate.inc IS QUALIFIED, and it
+  // has to be: the Windows unit below declares a THREE-argument GetEnvironmentVariable (the Win32 API),
+  // which SHADOWS the one-argument SysUtils function for the whole implementation section. 25 call
+  // sites failed to compile that way and the win64 cross-build had simply been broken - found on
+  // 8 Sep 2026, and it predates the FFI work by at least a commit. ⚠️ NO NET BUILDS THE WINDOWS
+  // TARGET, which is the same shape that let every Windows build die once before (see the PowerShell
+  // scripts, 2 Sep). A diagnostic knob is not worth an unbuildable target.
   SedaiTerminalIO,
   // ⭐ The FFI, and it is named HERE and nowhere else in the VM: SedaiForeignRuntime is the one unit
   // that knows a provider exists, so the day the core is cut from its providers there is a single edge
@@ -1157,7 +1164,7 @@ end;
 function DateLocaleMode: Boolean;
 begin
   if GDateLocale < 0 then
-    if GetEnvironmentVariable('SB_DATE_LOCALE') = '1' then GDateLocale := 1 else GDateLocale := 0;
+    if SysUtils.GetEnvironmentVariable('SB_DATE_LOCALE') = '1' then GDateLocale := 1 else GDateLocale := 0;
   Result := GDateLocale = 1;
 end;
 
@@ -1545,7 +1552,7 @@ begin
   InitCriticalSection(FWorkerLock);
   InitCriticalSection(FArrDescLock);
   // The deterministic clock (see bcDateNow). Read once per VM: a program cannot turn it on or off.
-  FFakeClock := GetEnvironmentVariable('SB_FAKE_CLOCK') = '1';
+  FFakeClock := SysUtils.GetEnvironmentVariable('SB_FAKE_CLOCK') = '1';
   FFakeClockTicks := 0;
   SetLength(FMutexes, 0);
   InitCriticalSection(FMutexTableLock);
@@ -1560,14 +1567,14 @@ begin
   SetLength(FSharedRetired, 0);
   // Default ON. SHAREDREC_LOCK=1 puts the per-access lock back, so the two can be timed against each
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
-  FSharedRecLockFree := GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
-  GArrPrivDiag := GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
-  GRecDiag := GetEnvironmentVariable('RECDIAG') = '1';
-  GHotCDiag := GetEnvironmentVariable('HOTC_DIAG') = '1';
-  GAotcDiag := GetEnvironmentVariable('AOTC_DIAG') = '1';
-  GSuperDiag := GetEnvironmentVariable('SUPER_DIAG') = '1';
+  FSharedRecLockFree := SysUtils.GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
+  GArrPrivDiag := SysUtils.GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
+  GRecDiag := SysUtils.GetEnvironmentVariable('RECDIAG') = '1';
+  GHotCDiag := SysUtils.GetEnvironmentVariable('HOTC_DIAG') = '1';
+  GAotcDiag := SysUtils.GetEnvironmentVariable('AOTC_DIAG') = '1';
+  GSuperDiag := SysUtils.GetEnvironmentVariable('SUPER_DIAG') = '1';
   // PAIR_DIAG=1 (the old spelling, top 20) | PAIR_DIAG=all | PAIR_DIAG=<n>
-  PairDiagEnv := LowerCase(Trim(GetEnvironmentVariable('PAIR_DIAG')));
+  PairDiagEnv := LowerCase(Trim(SysUtils.GetEnvironmentVariable('PAIR_DIAG')));
   GPairDiag := (PairDiagEnv <> '') and (PairDiagEnv <> '0');
   if PairDiagEnv = 'all' then GPairDiagTop := 0
   else if (PairDiagEnv <> '') and (PairDiagEnv <> '1') then
@@ -1575,9 +1582,9 @@ begin
     GPairDiagTop := StrToIntDef(PairDiagEnv, 20);
     if GPairDiagTop < 0 then GPairDiagTop := 20;
   end;
-  GJitOverAot := GetEnvironmentVariable('JIT_OVERAOT') = '1';
-  GArrDescFast := GetEnvironmentVariable('AOT_ARRDESC') <> '0';
-  GNoExcFrame := GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
+  GJitOverAot := SysUtils.GetEnvironmentVariable('JIT_OVERAOT') = '1';
+  GArrDescFast := SysUtils.GetEnvironmentVariable('AOT_ARRDESC') <> '0';
+  GNoExcFrame := SysUtils.GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
   FRawHeapTop := 0;
@@ -1688,7 +1695,7 @@ begin
   for JitI := 0 to High(FNativeLoops) do FNativeLoops[JitI].Free;   // JIT: release executable pages
   for JitI := 0 to High(FNativeFuncs) do FNativeFuncs[JitI].Free;   // AOT: release executable pages
   FEnvOverrides.Free;
-  if FDirOpen then begin FindClose(FDirRec); FDirOpen := False; end;   // a DIR walk the program never finished
+  if FDirOpen then begin SysUtils.FindClose(FDirRec); FDirOpen := False; end;   // a DIR walk the program never finished
   {$IFDEF WITH_SEDAI_AUDIO}
   // Stop and shutdown SAF audio backend
   if Assigned(FAudioBackend) then
@@ -4835,7 +4842,7 @@ begin
   else
   begin
     // ⛔ THE RANGE TEST FIRST, and the flag is a GLOBAL read once at startup: this runs on EVERY
-    // per-thread record resolution, so a GetEnvironmentVariable here would be a lookup per field access.
+    // per-thread record resolution, so a SysUtils.GetEnvironmentVariable here would be a lookup per field access.
     if ((Handle < 0) or (Handle > High(Ctx.Records))) and GRecDiag then
       WriteLn(ErrOutput, Format('[rec] FUORI RANGE handle=%d alto=%d pc=%d',
               [Handle, High(Ctx.Records), Ctx.PC]));
@@ -5408,7 +5415,7 @@ var
 begin
   ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-  if GetEnvironmentVariable('ZPTR_DIAG') = '1' then
+  if SysUtils.GetEnvironmentVariable('ZPTR_DIAG') = '1' then
     WriteLn(StdErr, '[ZPTR] store addr=', PtrAddr, ' idx=', ArrayIdx, ' off=', PtrOffset,
             ' highArr=', High(FArrays), ' limInt=', High(FArrays[ArrayIdx].IntData));
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
@@ -7748,7 +7755,7 @@ begin
           CreditField(BankOfDest(TBytecodeOp(Instr.OpCode)), Instr.Dest);
           CreditField(BankOfSrc1(TBytecodeOp(Instr.OpCode)), Instr.Src1);
           CreditField(BankOfSrc2(TBytecodeOp(Instr.OpCode)), Instr.Src2);
-          if GetEnvironmentVariable('REGSCAN_DIAG') = '1' then
+          if SysUtils.GetEnvironmentVariable('REGSCAN_DIAG') = '1' then
             WriteLn(ErrOutput, '[regscan] opcode NON ELENCATO nella scansione dei banchi: ',
                     BytecodeOpToString(TBytecodeOp(Instr.OpCode)),
                     ' (dest=', Instr.Dest, ' src1=', Instr.Src1, ' src2=', Instr.Src2, ')');
@@ -10203,7 +10210,7 @@ begin
       // in code the AOT did NOT take. JIT_OVERAOT=1 restores the overlap for A/B.
       if (Length(FAotCovered) > hdr) and FAotCovered[hdr] and not GJitOverAot then
       begin
-        if GetEnvironmentVariable('JIT_DIAG') <> '' then
+        if SysUtils.GetEnvironmentVariable('JIT_DIAG') <> '' then
           WriteLn(ErrOutput, Format('[JIT] loop PC %d..%d: SKIP (already compiled by the AOT)',
                                     [hdr, HeaderEnd[hdr]]));
         // ⛔ System.Continue: inside a VM method a bare Continue binds to TBytecodeVM.Continue -- the
@@ -10239,7 +10246,7 @@ begin
                          // per-CONTEXT, so a worker running this same code reads its own.
                          Integer(PtrUInt(@FCtx.GfxDesc) - PtrUInt(Pointer(FCtx))));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
-      if GetEnvironmentVariable('JIT_DIAG') <> '' then
+      if SysUtils.GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin
         if Mem <> nil then
           WriteLn(ErrOutput, Format('[JIT] loop PC %d..%d (%d instr, src line %d): NATIVE',
@@ -10424,7 +10431,7 @@ begin
     // build.ps1 -Target sb -DebugFlags AOTTRACE, then AOT_TRACE=1 at runtime. Compiled out
     // otherwise: this unit's code size is not free, it moves the dispatch loop around
     // (see PIANO_B1_AOT_DESIGN §5.7).
-    if GetEnvironmentVariable('AOT_TRACE') <> '' then
+    if SysUtils.GetEnvironmentVariable('AOT_TRACE') <> '' then
       WriteLn(ErrOutput, '[AOT] helper PC=', PC, ' op=$',
               IntToHex(PInstr(VM.FProgram.GetInstructionsPtr)[PC].OpCode, 4));
     {$ENDIF}
@@ -10681,8 +10688,8 @@ var i: Integer; a, b, lo: QWord;
 begin
   if GCallProf < 0 then
   begin
-    if GetEnvironmentVariable('AOT_CALLPROF') = '1' then GCallProf := 1
-    else if GetEnvironmentVariable('AOT_CALLPROF') = '2' then GCallProf := 2
+    if SysUtils.GetEnvironmentVariable('AOT_CALLPROF') = '1' then GCallProf := 1
+    else if SysUtils.GetEnvironmentVariable('AOT_CALLPROF') = '2' then GCallProf := 2
     else GCallProf := 0;
     if GCallProf > 0 then
     begin
@@ -11467,14 +11474,14 @@ var
 function RegexBisectLevel: Integer;
 begin
   if GRegexBisect < 0 then
-    GRegexBisect := StrToIntDef(GetEnvironmentVariable('REGEX_BISECT'), 0);
+    GRegexBisect := StrToIntDef(SysUtils.GetEnvironmentVariable('REGEX_BISECT'), 0);
   Result := GRegexBisect;
 end;
 
 function RegexUseOwnEngine: Boolean;
 begin
   if GRegexOwnEngine < 0 then
-    if LowerCase(GetEnvironmentVariable('REGEX_ENGINE')) = 'tregexpr' then GRegexOwnEngine := 0
+    if LowerCase(SysUtils.GetEnvironmentVariable('REGEX_ENGINE')) = 'tregexpr' then GRegexOwnEngine := 0
     else GRegexOwnEngine := 1;
   Result := GRegexOwnEngine = 1;
 end;
@@ -11609,7 +11616,7 @@ begin
       // single binary, and the differential the guard is run under: the two paths must agree on
       // every output, byte for byte, or the rewrite has changed a semantics rather than a cost.
       if GRegexReplLinear < 0 then
-        if GetEnvironmentVariable('REGEXREPL') = '0' then GRegexReplLinear := 0
+        if SysUtils.GetEnvironmentVariable('REGEXREPL') = '0' then GRegexReplLinear := 0
         else GRegexReplLinear := 1;
       if GRegexReplLinear = 0 then
       begin
@@ -11702,7 +11709,7 @@ var
   E: TObject;
 begin
   {$IFDEF DEBUG_AOTTRACE}
-  if GetEnvironmentVariable('AOT_TRACE') <> '' then
+  if SysUtils.GetEnvironmentVariable('AOT_TRACE') <> '' then
     WriteLn(ErrOutput, '[AOT] native returned ', R);
   {$ENDIF}
   if R >= 0 then Exit(Integer(R));
@@ -11935,7 +11942,7 @@ begin
   // behaviour's own property, so it needs no per-run flavor the way StrMid does.
   C.PrintSemi := @AotPrintSemicolon;
   C.PrintEnd := @AotPrintEnd;
-  if GetEnvironmentVariable('AOT_PRINTSTR') = '2' then
+  if SysUtils.GetEnvironmentVariable('AOT_PRINTSTR') = '2' then
     C.PrintStr := @AotPrintStringForceHelper       // injection: see the comment on that function
   else
     C.PrintStr := @AotPrintString;
@@ -13165,7 +13172,7 @@ begin
         if EnvIdx >= 0 then
           Ctx.StringRegs[Instr.Dest] := FEnvOverrides.ValueFromIndex[EnvIdx]
         else
-          Ctx.StringRegs[Instr.Dest] := GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
+          Ctx.StringRegs[Instr.Dest] := SysUtils.GetEnvironmentVariable(Ctx.StringRegs[Instr.Src1]);
       end;
     43: // bcFileLen - FILELEN(path): size of the file in bytes (0 if absent).
       Ctx.IntRegs[Instr.Dest] := FileLength(Ctx.StringRegs[Instr.Src1]);
@@ -18419,12 +18426,12 @@ begin
         // such loop stopped after its FIRST entry: a directory listing that silently listed one file.
         if (Instr.Immediate = 0) and (Ctx.StringRegs[Instr.Src1] <> '') then
         begin
-          if FDirOpen then begin FindClose(FDirRec); FDirOpen := False; end;   // a new search cancels the old one
+          if FDirOpen then begin SysUtils.FindClose(FDirRec); FDirOpen := False; end;   // a new search cancels the old one
           FDirMask := Integer(Ctx.IntRegs[Instr.Src2]);
           FDirOpen := FindFirst(DirTranslateSpec(Ctx.StringRegs[Instr.Src1]), faAnyFile, FDirRec) = 0;
         end
         else if FDirOpen then
-          if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;
+          if FindNext(FDirRec) <> 0 then begin SysUtils.FindClose(FDirRec); FDirOpen := False; end;
         // Filter here rather than through FindFirst's own mask, because FreeBASIC's rule is its own and
         // was read off the oracle: an entry is returned when every attribute bit it carries is one the
         // mask allows, with ARCHIVE allowed implicitly -- EXCEPT when the mask asks for directories, and
@@ -18433,7 +18440,7 @@ begin
         // mask/entry combinations measured against fbc.
         while FDirOpen and (DirEntrySkipped(FDirRec) or
                             ((DirEntryAttrs(FDirRec) and not DirAllowedAttrs(FDirMask)) <> 0)) do
-          if FindNext(FDirRec) <> 0 then begin FindClose(FDirRec); FDirOpen := False; end;
+          if FindNext(FDirRec) <> 0 then begin SysUtils.FindClose(FDirRec); FDirOpen := False; end;
         if FDirOpen then
         begin
           Ctx.StringRegs[Instr.Dest] := FDirRec.Name;
@@ -18751,7 +18758,7 @@ begin
   Result := -1;
   try
     {$IFDEF WINDOWS}
-    ComSpec := GetEnvironmentVariable('COMSPEC');
+    ComSpec := SysUtils.GetEnvironmentVariable('COMSPEC');
     if ComSpec = '' then ComSpec := 'cmd.exe';
     Result := ExecuteProcess(ComSpec, ['/C', Cmd], []);
     {$ELSE}
@@ -19302,7 +19309,7 @@ var
 begin
   if (not GAotcDiag) or GAotcReported then Exit;
   GAotcReported := True;
-  NsPer := StrToInt64Def(Trim(GetEnvironmentVariable('AOTC_NS')), 55);
+  NsPer := StrToInt64Def(Trim(SysUtils.GetEnvironmentVariable('AOTC_NS')), 55);
   if NsPer <= 0 then NsPer := 55;
   SetLength(Idx, 0);
   Tot := 0;
@@ -19355,21 +19362,21 @@ end;
 
 
 initialization
-  if GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
-  if GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
-  if GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
-  if GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
-  if GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
-  if GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
-  if GetEnvironmentVariable('FRAMEBASE_WIDE') = '1' then GFrameBaseWide := 1;
-  if GetEnvironmentVariable('FRAMEBANK_SHAPE') = '0' then GFrameBankShape := 0;
-  if GetEnvironmentVariable('FRAME_FAST') = '0' then GFrameFast := 0;
-  if GetEnvironmentVariable('AOT_FASTCALL') = '0' then GAotFastCall := 0;
-  if GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
+  if SysUtils.GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
+  if SysUtils.GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
+  if SysUtils.GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;
+  if SysUtils.GetEnvironmentVariable('FRAMELIVE') = '0' then GFrameLiveNarrow := 0;
+  if SysUtils.GetEnvironmentVariable('FRAMEMARK') = '0' then GFrameMark := 0;
+  if SysUtils.GetEnvironmentVariable('FRAMEBASE') = '0' then GFrameBase := 0;
+  if SysUtils.GetEnvironmentVariable('FRAMEBASE_WIDE') = '1' then GFrameBaseWide := 1;
+  if SysUtils.GetEnvironmentVariable('FRAMEBANK_SHAPE') = '0' then GFrameBankShape := 0;
+  if SysUtils.GetEnvironmentVariable('FRAME_FAST') = '0' then GFrameFast := 0;
+  if SysUtils.GetEnvironmentVariable('AOT_FASTCALL') = '0' then GAotFastCall := 0;
+  if SysUtils.GetEnvironmentVariable('FRAMEBASE_DIAG') = '1' then GFrameBaseDiag := 1;
   // Confirm the AnsiString header layout once, before any append can take the capacity path.
   // STRCAP=0 forces the old SetLength-per-append behaviour, so the two can be timed on ONE binary.
   StrCapacityInit;
-  if GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
+  if SysUtils.GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
   AddExitProc(@ReportHotCExits);
   AddExitProc(@ReportAotHelperExits);
   AddExitProc(@ReportSuperCounts);
