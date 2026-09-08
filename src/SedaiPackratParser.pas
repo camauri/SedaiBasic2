@@ -123,6 +123,9 @@ type
     // "print bar" answered the namespace's 1 where fbc answers the program's 2. Written onto the program
     // root as an attribute so the namespace pass can read it. DIVERGENZE 98.
     FForwardDeclNames: TStringList;
+    // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
+    // line, handed to the SSA on the program node (DIVERGENZE 183).
+    FForeignDecls: TStringList;
     FProcSeen: TStringList;
     // ⛔⛔ ...AND THE OVERLOAD DECISION IS ASKED PER NAMESPACE. Two procedures of the same name in two
     // DIFFERENT namespaces are not an overload set - they are two names that only look alike until the
@@ -648,6 +651,7 @@ begin
   MemoizationMode := mmAdaptive;
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
+  FForeignDecls := TStringList.Create;
   FForwardDeclNames := TStringList.Create;
   FForwardDeclNames.CaseSensitive := False;
   FProcSeen := TStringList.Create;
@@ -695,6 +699,7 @@ begin
   if Assigned(FExpressionParser) then
     FExpressionParser.Free;
 
+  FForeignDecls.Free;
   FForwardDeclNames.Free;
   FProcSeen.Free;
   FProcOverloadKeys.Free;
@@ -1598,6 +1603,10 @@ begin
    FForwardDeclNames.StrictDelimiter := True;
    Result.Attributes.Values['FWDDECL'] := FForwardDeclNames.DelimitedText;
  end;
+ // ⭐ The foreign declarations travel the same way, one per line: the SSA is the first reader that
+ // knows what a CALL is, and it needs the symbol, the library and the signature to build the call.
+ if FForeignDecls.Count > 0 then
+   Result.Attributes.Values['FOREIGNDECLS'] := StringReplace(FForeignDecls.Text, sLineBreak, ';', [rfReplaceAll]);
 
  DoNodeCreated(Result);
 end;
@@ -1702,6 +1711,11 @@ var
   SavedIndex: integer;
   AtModuleLevel: Boolean;
   DeclDecoU: string;      // the word right after a module-level DECLARE, if it is a member decorator
+  // A DECLARE that carries an ALIAS is a FOREIGN procedure: its signature is read while the line is
+  // skipped, because a bodiless DECLARE emits no node at all (DIVERGENZE 183).
+  FgnName, FgnAlias, FgnLib, FgnRet, FgnParams, FgnTok: string;
+  FgnDepth: Integer;
+  FgnAfterAs, FgnIsFunc: Boolean;
 begin
   Result := nil;
   // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
@@ -1830,7 +1844,55 @@ begin
       (Pos('.', VarToStr(Context.PeekToken(2).Value)) = 0) then
      if FForwardDeclNames.IndexOf(UpperCase(VarToStr(Context.PeekToken(2).Value))) < 0 then
        FForwardDeclNames.Add(UpperCase(VarToStr(Context.PeekToken(2).Value)));
-   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+   // ⭐ ...AND A DECLARE THAT CARRIES AN "ALIAS" IS A FOREIGN PROCEDURE, so its SIGNATURE is collected
+   // on the way past. The line is skipped token by token anyway; reading it while walking costs
+   // nothing and is the only place the information exists - a bodiless DECLARE emits no node at all.
+   // Recorded as NAME|SYMBOL|LIBRARY|RETURNTYPE|PARAMTYPE,PARAMTYPE,... and handed to the SSA on the
+   // program node. DIVERGENZE 183.
+   FgnName := ''; FgnAlias := ''; FgnLib := ''; FgnRet := ''; FgnParams := '';
+   FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False;
+   if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
+     FgnIsFunc := UpperCase(VarToStr(Context.PeekNext.Value)) = kFUNCTION;
+   if Assigned(Context.PeekToken(2)) then FgnName := UpperCase(VarToStr(Context.PeekToken(2).Value));
+   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+   begin
+     FgnTok := UpperCase(VarToStr(Context.CurrentToken.Value));
+     if Context.Check(ttDelimParOpen) then begin Inc(FgnDepth); FgnAfterAs := False; end
+     else if Context.Check(ttDelimParClose) then begin Dec(FgnDepth); FgnAfterAs := False; end
+     else if (FgnTok = kALIAS) or (FgnTok = kLIB) then
+     begin
+       // The symbol's CASE is its own: a C name is not upper-cased.
+       if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral) then
+       begin
+         if FgnTok = kALIAS then FgnAlias := VarToStr(Context.PeekNext.Value)
+         else FgnLib := VarToStr(Context.PeekNext.Value);
+       end;
+     end
+     else if (FgnTok = kAS) or Context.Check(ttAsType) then FgnAfterAs := True
+     else if FgnAfterAs and Context.Check(ttIdentifier) then
+     begin
+       if FgnDepth > 0 then
+       begin
+         if FgnParams <> '' then FgnParams := FgnParams + ',';
+         FgnParams := FgnParams + FgnTok;
+       end
+       else if FgnRet = '' then FgnRet := FgnTok;
+       FgnAfterAs := False;
+     end
+     else if FgnAfterAs and (FgnTok = kPTR) then
+     begin
+       // "As Integer Ptr": the PTR belongs to the type just read, and a pointer is what most of a C
+       // binding passes - dropping it would marshal the VALUE where the address was meant.
+       if (FgnDepth > 0) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
+       else if FgnRet <> '' then FgnRet := FgnRet + ' PTR';
+     end;
+     Context.Advance;
+   end;
+   if (FgnName <> '') and (FgnAlias <> '') then
+   begin
+     if not FgnIsFunc then FgnRet := '';
+     FForeignDecls.Add(FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
+   end;
    Result := nil;
    Exit;
  end;
@@ -3757,7 +3819,17 @@ begin
     else if (DecoU = kALIAS) or (DecoU = kLIB) then
     begin
       Context.Advance;                            // ALIAS / LIB
-      if Context.Check(ttStringLiteral) then Context.Advance;   // "name" (discarded)
+      if Context.Check(ttStringLiteral) then
+      begin
+        // ⭐ KEPT, not discarded. ALIAS names the symbol a FOREIGN procedure has in its library and LIB
+        // names the library, and both were read and thrown away - which is exactly what stood between
+        // a program and calling C. The case is the symbol's, so it is NOT upper-cased. DIVERGENZE 183.
+        if DecoU = kALIAS then
+          Result.Attributes.Values['EXTALIAS'] := VarToStr(Context.CurrentToken.Value)
+        else
+          Result.Attributes.Values['EXTLIB'] := VarToStr(Context.CurrentToken.Value);
+        Context.Advance;                          // "name"
+      end;
     end
     else
       Break;
