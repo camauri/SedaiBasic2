@@ -752,6 +752,15 @@ type
     procedure GrowSharedRecords(NeedLen: Integer);
     function AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
     function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
+    { ⭐⭐ THE TWO ACCESSORS EVERY INTEGER-ARRAY ELEMENT GOES THROUGH. An array of a narrow type stores
+      its elements PACKED (see TArrayStorage.ElemWidth), so "IntData[i]" is no longer the whole truth -
+      it is the truth for 64-bit arrays and empty for the others. Routing the reads and writes through
+      one pair is what makes the two storages impossible to disagree: there is one place that knows
+      which is populated.
+      ⚠️ INLINE, and deliberately: this pair sits on the array hot path, and the 64-bit case must stay a
+      single indexed load. }
+    function ArrGetInt(const A: TArrayStorage; Idx: Integer): Int64; inline;
+    procedure ArrSetInt(var A: TArrayStorage; Idx: Integer; V: Int64); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
@@ -6089,6 +6098,34 @@ procedure TBytecodeVM.ExecForeignCall(Ctx: TExecutionContext; TableIdx, NArgs: I
   out ResInt: Int64; out ResFloat: Double);
 begin
   TForeignTable(ForeignTable).Invoke(TableIdx, Ctx, Ctx.XferInt, Ctx.XferFloat, NArgs, ResInt, ResFloat);
+end;
+
+function TBytecodeVM.ArrGetInt(const A: TArrayStorage; Idx: Integer): Int64;
+// One element, read at ITS OWN width. A narrow element sign-extends when its declared type is signed -
+// which is a property of the TYPE and not of the bytes, and is the reason ElemSigned rides beside the
+// width rather than being guessed from the value.
+begin
+  case A.ElemWidth of
+    1: if A.ElemSigned then Result := PShortInt(@A.ByteData[Idx])^ else Result := A.ByteData[Idx];
+    2: if A.ElemSigned then Result := PSmallInt(@A.ByteData[Idx * 2])^ else Result := PWord(@A.ByteData[Idx * 2])^;
+    4: if A.ElemSigned then Result := PLongInt(@A.ByteData[Idx * 4])^ else Result := PLongWord(@A.ByteData[Idx * 4])^;
+  else
+    Result := A.IntData[Idx];
+  end;
+end;
+
+procedure TBytecodeVM.ArrSetInt(var A: TArrayStorage; Idx: Integer; V: Int64);
+// ...and one element written at its own width, which is where the WRAP of a narrow type happens: an
+// out-of-range value truncates exactly as it does in FreeBASIC, because there is nowhere else for the
+// high bits to go.
+begin
+  case A.ElemWidth of
+    1: A.ByteData[Idx] := Byte(V);
+    2: PWord(@A.ByteData[Idx * 2])^ := Word(V);
+    4: PLongWord(@A.ByteData[Idx * 4])^ := LongWord(V);
+  else
+    A.IntData[Idx] := V;
+  end;
 end;
 
 function TBytecodeVM.SharedRecordBlockLen(Handle: Int64): Int64;

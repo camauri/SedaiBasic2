@@ -115,6 +115,19 @@ type
     // with fixed bounds, and the two callers may be in different files. The flag rides on the storage,
     // so a bind - which copies this record WHOLE - carries the caller's answer into the parameter.
     IsDynamic: Boolean;
+    { ⭐⭐ HOW WIDE ONE ELEMENT IS, IN BYTES - 0 means "eight, in IntData", which is what every array was
+      until 8 Sep 2026 and what every array of a 64-bit type still is.
+      ⛔ WHY IT HAD TO EXIST. In FreeBASIC an array of UByte IS A BLOCK OF BYTES: "Peek(ULong, @a(0))"
+      reads four of them side by side, memcpy steps one byte per element, and SizeOf(a) is 1. Here every
+      element occupied an Int64 whatever its declared type, so all three answered wrong - quietly.
+      retrogra's font loader checks a 32-bit magic that way and was refused a perfectly good file.
+      ⇒ A narrow-typed array stores its elements PACKED in ByteData, at ElemWidth bytes each, and
+      IntData stays empty for it. The two are never both populated: one storage, one truth.
+      ⚠️ Signedness is NOT here: it belongs to the read, not to the storage, and the element accessors
+      take it from the array's declared type. }
+    ElemWidth: Byte;              // 0 = 8 bytes in IntData; 1, 2 or 4 = packed in ByteData
+    ElemSigned: Boolean;          // a narrow element sign-extends on read when its type is signed
+    ByteData: array of Byte;      // populated only when ElemWidth > 0
   end;
 
   { One suspended invocation's copy of a proc-local array. The storage record is copied WHOLE, which
