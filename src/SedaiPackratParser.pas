@@ -818,6 +818,21 @@ begin
     if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
        not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
       T := UpperCase(VarToStr(p.GetChild(0).Value));
+    // ⭐ AN INLINE PROCEDURE-POINTER PARAMETER NAMES ITSELF HERE, exactly as a pointer does below.
+    // Its signature lives in attributes and not in a type CHILD, so T came out EMPTY and every one of
+    // them signed the same label: "Sub take( ByVal p As Sub( ByVal As Byte ) )" and the same with
+    // Double were filed under "TAKE~I", so the second declaration never got a label of its own - its
+    // BODY was not even emitted, and both calls went to the first (fbc prints byte/double, we printed
+    // byte/byte, in silence). DIVERGENZE 176.
+    // ⚠️ One level: a procptr nested INSIDE the signature is still recorded '#P' by the reader that
+    // builds FPPARAMS, so two signatures differing only at the second level still collide.
+    if (T = '') and (p.Attributes.Values['FUNCPTR'] = '1') then
+    begin
+      if p.Attributes.Values['FPRET'] <> '' then
+        T := 'FUNCTION(' + p.Attributes.Values['FPPARAMS'] + ')AS ' + p.Attributes.Values['FPRET']
+      else
+        T := 'SUB(' + p.Attributes.Values['FPPARAMS'] + ')';
+    end;
     if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then
       C := 'S'
     else if (T = 'SINGLE') or (T = 'DOUBLE') then

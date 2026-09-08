@@ -623,7 +623,8 @@ type
     function BareCallableFunction(const NameU: string): Boolean;  // a FUNCTION invocable with no arguments
     function ProcReturnPtrUDT(const NameU: string): string;       // pointee UDT of a "FUNCTION f(...) AS T PTR", else ''
     function ManagedPtrArithUDT(Node: TASTNode): string;          // pointee UDT of "p", "(p)", "p±n", "n+p" for a managed UDT pointer
-    function ProcHasParamCount(const NameU: string; N: Integer): Boolean;  // decl has exactly N parameters
+    function ProcHasParamCount(const NameU: string; N: Integer): Boolean;
+    function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
     procedure ProcessStatementFull(Node: TASTNode);
@@ -2427,6 +2428,44 @@ begin
   ParamList := Decl.GetChild(1);
   if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Exit;
   Result := ParamList.ChildCount = N;
+end;
+
+function TSSAGenerator.ProcPtrSigNameOfProc(const NameU: string): string;
+// ⭐ The type NAME a procedure's own signature spells, in exactly the form the declaration side writes
+// for an inline procedure-pointer parameter ("SUB(BYTE)", "FUNCTION(INTEGER)AS LONG" - see
+// ProcSigFromParams). It is what lets a call site tell two overloads apart when the only difference is
+// the signature of a procptr parameter: "@cb" carries no type name of its own, so both candidates
+// matched and the FIRST won, in silence. DIVERGENZE 176.
+// ⛔ Answers '' as soon as one parameter cannot be named. A partial spelling would match the wrong
+// candidate instead of falling back to the arity rule, and a WRONG answer is worse than no answer.
+var
+  Decl, ParamList, NameNode, p: TASTNode;
+  i: Integer;
+  Params, Ret, T: string;
+begin
+  Result := '';
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  ParamList := Decl.GetChild(1);
+  if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Exit;
+  Params := '';
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    p := ParamList.GetChild(i);
+    T := '';
+    if (p <> nil) and (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) then
+      T := UpperCase(VarToStr(p.GetChild(0).Value));
+    if T = '' then Exit;
+    if Params <> '' then Params := Params + ',';
+    Params := Params + T;
+  end;
+  NameNode := Decl.GetChild(0);
+  Ret := '';
+  if (NameNode <> nil) and (NameNode.ChildCount >= 1) and
+     (NameNode.GetChild(0).NodeType = antIdentifier) then
+    Ret := UpperCase(VarToStr(NameNode.GetChild(0).Value));
+  if Ret <> '' then Result := 'FUNCTION(' + Params + ')AS ' + Ret
+                 else Result := 'SUB(' + Params + ')';
 end;
 
 function TSSAGenerator.ManagedPtrArithUDT(Node: TASTNode): string;
@@ -31181,7 +31220,17 @@ begin
     // ObjectTypeName answers "PT" for a "Pt Ptr" variable just as it does for a Pt one - and the call
     // then asked for the by-value overload. Asked in this order, a UDT VALUE still answers '' here (it
     // is not a pointer) and falls through to ObjectTypeName exactly as before.
-    T := DeclaredPointerTypeOfArg(ArgsNode.GetChild(i));
+    // ⭐ "@proc" names its own SIGNATURE, which is what the declaration side writes for a procptr
+    // parameter. Without it two overloads differing only in that signature were indistinguishable at
+    // the call site and the first won, in silence (DIVERGENZE 176).
+    // ⛔ ASKED FIRST, and that is not a detail: DeclaredPointerTypeOfArg answers "DOUBLE PTR" for a
+    // procedure address - the same wrong answer for every one of them - so a branch guarded on T = ''
+    // below would never run at all. Measured with OVL_DIAG=1, which showed both calls signing the
+    // identical tail.
+    T := '';
+    if (ArgsNode.GetChild(i) <> nil) and (ArgsNode.GetChild(i).NodeType = antProcAddress) then
+      T := ProcPtrSigNameOfProc(UpperCase(VarToStr(ArgsNode.GetChild(i).Value)));
+    if T = '' then T := DeclaredPointerTypeOfArg(ArgsNode.GetChild(i));
     if T = '' then
       T := UpperCase(ObjectTypeName(ArgsNode.GetChild(i)));   // '' when the argument is not a record
     // ⭐ ...and an ENUM-typed argument names its type here too. The DECLARATION already puts it in this
