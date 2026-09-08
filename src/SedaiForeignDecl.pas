@@ -30,7 +30,9 @@ type
     caller that sees it must refuse, because a wrongly classified argument does not raise - it answers
     wrong numbers. }
   TForeignKind = (fkUnknown, fkVoid, fkS8, fkU8, fkS16, fkU16, fkS32, fkU32,
-                  fkS64, fkU64, fkFloat, fkDouble, fkPointer);
+                  fkS64, fkU64, fkFloat, fkDouble, fkPointer,
+                  { recognised so it can be refused BY NAME - see ForeignKindOf }
+                  fkLongDouble);
 
   TForeignDecl = record
     Name: string;                    // the BASIC name, upper case
@@ -52,6 +54,9 @@ function ForeignKindSize(AKind: TForeignKind): Integer;
 
 { True when the kind travels in the FLOAT bank; everything else travels in the int bank. }
 function ForeignKindIsFloat(AKind: TForeignKind): Boolean;
+
+{ The words a diagnostic should use for a type this build cannot pass; '' when the kind is fine. }
+function ForeignKindRefusalReason(AKind: TForeignKind; const ATypeName: string): string;
 
 implementation
 
@@ -121,6 +126,11 @@ begin
   if (T = 'UINTEGER') or (T = 'ULONGINT') then Exit(fkU64);
   if (T = 'SINGLE') then Exit(fkFloat);
   if (T = 'DOUBLE') then Exit(fkDouble);
+  // ⛔ NAMED, NOT LEFT TO "unknown". A C `long double` is an 80-bit x87 value on SysV x86-64 - passed
+  // on the x87 register stack, returned in ST(0), and 16 bytes wide - while on Win64 it is just a
+  // double. Neither our trampolines nor this classification touch x87, so it is refused; being refused
+  // BY NAME is what tells the next reader that the answer is "not yet", not "we did not think of it".
+  if (T = 'LONGDOUBLE') then Exit(fkLongDouble);
   // ZSTRING / WSTRING with no PTR is a fixed buffer in a UDT, never a scalar parameter; a STRING
   // parameter of a foreign function is the address of its bytes.
   if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit(fkPointer);
@@ -141,7 +151,18 @@ end;
 
 function ForeignKindIsFloat(AKind: TForeignKind): Boolean;
 begin
-  Result := AKind in [fkFloat, fkDouble];
+  Result := AKind in [fkFloat, fkDouble];   // NOT fkLongDouble: that one is refused, never banked
+end;
+
+function ForeignKindRefusalReason(AKind: TForeignKind; const ATypeName: string): string;
+// The words a diagnostic should use for a type this build cannot pass. '' when the kind is fine.
+begin
+  Result := '';
+  if AKind = fkLongDouble then
+    Result := '"' + ATypeName + '" is an 80-bit x87 value on this target and travels on the x87 ' +
+              'register stack, which the foreign-call path does not use'
+  else if AKind = fkUnknown then
+    Result := '"' + ATypeName + '" has no C type here';
 end;
 
 end.

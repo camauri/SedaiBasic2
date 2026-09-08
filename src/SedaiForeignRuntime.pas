@@ -9,8 +9,9 @@ unit SedaiForeignRuntime;
 // ⛔ THIS IS THE ONLY UNIT OF THE VM SIDE THAT NAMES THE PROVIDER. SedaiBytecodeVM names THIS, and this
 // names SedaiFFI - so the count of core units that reach a provider stays at one, and the day the core
 // is separated from its providers (owner's decision, 8 Sep 2026) there is one edge to cut, not one per
-// call site. Nothing here links against libffi either: the provider loads it lazily, and a machine
-// without it gets a named diagnostic at the first foreign call rather than a build that will not run.
+// call site. ⭐ Since the owner's decision of 8 Sep 2026 there is no external dependency at all: the
+// calling convention is ours (SedaiAbi), and an architecture with no trampoline written for it gets a
+// named diagnostic at the first foreign call rather than a build that will not run.
 //
 // A binding is prepared ONCE per table entry and reused: opening the library and preparing the call
 // interface cost far more than the call, and a C binding is called in loops. DIVERGENZE 183.
@@ -18,7 +19,7 @@ unit SedaiForeignRuntime;
 interface
 
 uses
-  Classes, SysUtils, dynlibs, SedaiSSATypes, SedaiForeignDecl, SedaiFFI;
+  Classes, SysUtils, dynlibs, SedaiSSATypes, SedaiForeignDecl, SedaiAbi, SedaiFFI;
 
 type
   EForeignCallError = class(Exception);
@@ -34,9 +35,8 @@ type
     RetKind: TForeignKind;
     Fn: Pointer;
     Prepared: Boolean;
-    Call: TFFICall;
-    RetRef: TFFITypeRef;
-    ArgRefs: array of TFFITypeRef;
+    RetRef: TAbiType;
+    ArgRefs: array of TAbiType;
   end;
 
   { One per running program. Built from the bytecode program's declaration table, in the SAME order:
@@ -47,9 +47,17 @@ type
     FLibs: TStringList;          // "#inclib" names, in the order the program gave them
     FOpened: TStringList;        // name -> handle, so a library is opened once
     FResolvePtr: TForeignPtrResolver;
+    // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
+    // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
+    // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
+    // (FOpened is a TStringList, which is not thread-safe at all). The CALL itself is deliberately
+    // outside the lock: AbiCall keeps its whole frame in locals, so it is re-entrant, and holding a
+    // lock across a call that leaves the process would serialise every database query in the program.
+    FPrepLock: TRTLCriticalSection;
     function OpenLib(const AName: string): TLibHandle;
     function ResolveSymbol(var B: TForeignBinding): Pointer;
     procedure Prepare(var B: TForeignBinding);
+    procedure PrepareLocked(var B: TForeignBinding);   // the body of Prepare, with FPrepLock held
   public
     constructor Create;
     destructor Destroy; override;
@@ -73,6 +81,7 @@ begin
   FLibs := TStringList.Create;
   FOpened := TStringList.Create;
   FOpened.CaseSensitive := True;
+  InitCriticalSection(FPrepLock);
 end;
 
 destructor TForeignTable.Destroy;
@@ -81,15 +90,15 @@ var
 begin
   for i := 0 to High(FEntries) do
   begin
-    FEntries[i].Call.Free;
-    FEntries[i].RetRef := nil;    // the primitive wrappers belong to the provider
-    for j := 0 to High(FEntries[i].ArgRefs) do FEntries[i].ArgRefs[j] := nil;
+    FEntries[i].RetRef.Free;
+    for j := 0 to High(FEntries[i].ArgRefs) do FEntries[i].ArgRefs[j].Free;
   end;
   // ⚠️ The libraries are NOT unloaded. A foreign function may have registered an atexit handler, left
   // a pointer into its own data with the program, or be shared with something else in the process;
   // closing it at program end buys nothing and can crash on the way out.
   FOpened.Free;
   FLibs.Free;
+  DoneCriticalSection(FPrepLock);
   inherited Destroy;
 end;
 
@@ -168,21 +177,23 @@ begin
       [B.Decl.Name, B.Decl.Symbol, Tried]);
 end;
 
-function KindToRef(K: TForeignKind): TFFITypeRef;
+function KindToRef(K: TForeignKind): TAbiType;
+// ⛔ fkLongDouble and fkUnknown answer nil ON PURPOSE, and the caller raises with the name of the type:
+// a kind this path cannot pass must never be quietly turned into something it can.
 begin
   case K of
-    fkVoid:    Result := FFITypeVoid;
-    fkS8:      Result := FFITypeSInt8;
-    fkU8:      Result := FFITypeUInt8;
-    fkS16:     Result := FFITypeSInt16;
-    fkU16:     Result := FFITypeUInt16;
-    fkS32:     Result := FFITypeSInt32;
-    fkU32:     Result := FFITypeUInt32;
-    fkS64:     Result := FFITypeSInt64;
-    fkU64:     Result := FFITypeUInt64;
-    fkFloat:   Result := FFITypeFloat;
-    fkDouble:  Result := FFITypeDouble;
-    fkPointer: Result := FFITypePointer;
+    fkVoid:    Result := TAbiType.CreatePrimitive(akVoid);
+    fkS8:      Result := TAbiType.CreatePrimitive(akS8);
+    fkU8:      Result := TAbiType.CreatePrimitive(akU8);
+    fkS16:     Result := TAbiType.CreatePrimitive(akS16);
+    fkU16:     Result := TAbiType.CreatePrimitive(akU16);
+    fkS32:     Result := TAbiType.CreatePrimitive(akS32);
+    fkU32:     Result := TAbiType.CreatePrimitive(akU32);
+    fkS64:     Result := TAbiType.CreatePrimitive(akS64);
+    fkU64:     Result := TAbiType.CreatePrimitive(akU64);
+    fkFloat:   Result := TAbiType.CreatePrimitive(akFloat);
+    fkDouble:  Result := TAbiType.CreatePrimitive(akDouble);
+    fkPointer: Result := TAbiType.CreatePrimitive(akPointer);
   else
     Result := nil;
   end;
@@ -192,7 +203,20 @@ procedure TForeignTable.Prepare(var B: TForeignBinding);
 var
   i: Integer;
 begin
-  if B.Prepared then Exit;
+  if B.Prepared then Exit;                 // the common case, and it needs no lock: Prepared is set LAST
+  EnterCriticalSection(FPrepLock);
+  try
+    if B.Prepared then Exit;               // ...and re-asked inside, because another thread may have won
+    PrepareLocked(B);
+  finally
+    LeaveCriticalSection(FPrepLock);
+  end;
+end;
+
+procedure TForeignTable.PrepareLocked(var B: TForeignBinding);
+var
+  i: Integer;
+begin
   if not FFIAvailable then
     raise EForeignCallError.CreateFmt('%s cannot be called: %s', [B.Decl.Name, FFIUnavailableReason]);
   if B.Decl.Name = '' then
@@ -201,26 +225,23 @@ begin
   B.Fn := ResolveSymbol(B);
   B.RetRef := KindToRef(B.RetKind);
   if B.RetRef = nil then
-    raise EForeignCallError.CreateFmt('%s returns "%s", which has no C type here',
-                                      [B.Decl.Name, B.Decl.RetTypeName]);
+    raise EForeignCallError.CreateFmt('%s returns %s',
+      [B.Decl.Name, ForeignKindRefusalReason(B.RetKind, B.Decl.RetTypeName)]);
   SetLength(B.ArgRefs, Length(B.ArgKinds));
   for i := 0 to High(B.ArgKinds) do
   begin
     B.ArgRefs[i] := KindToRef(B.ArgKinds[i]);
     if B.ArgRefs[i] = nil then
-      raise EForeignCallError.CreateFmt('%s: parameter %d is "%s", which has no C type here',
-                                        [B.Decl.Name, i + 1, B.Decl.ParamTypeNames[i]]);
+      raise EForeignCallError.CreateFmt('%s: parameter %d - %s',
+        [B.Decl.Name, i + 1, ForeignKindRefusalReason(B.ArgKinds[i], B.Decl.ParamTypeNames[i])]);
   end;
-  B.Call := TFFICall.Create(B.Fn, B.RetRef, B.ArgRefs);
-  if not B.Call.Ready then
-    raise EForeignCallError.CreateFmt('%s: libffi refused this signature', [B.Decl.Name]);
   B.Prepared := True;
 end;
 
 procedure TForeignTable.Invoke(Idx: Integer; ACtx: TObject; const XferInt: array of Int64;
   const XferFloat: array of Double; NArgs: Integer; out ResInt: Int64; out ResFloat: Double);
-// ⛔ ONE BUFFER PER ARGUMENT, AT ITS OWN WIDTH, and a pointer to each: that is libffi's convention, and
-// it is why the buffers are locals that outlive the call rather than expressions. A "Long" parameter
+// ⛔ ONE BUFFER PER ARGUMENT, AT ITS OWN WIDTH, and a pointer to each: that is the convention the whole
+// call path speaks, and it is why the buffers are locals that outlive the call rather than expressions. A "Long" parameter
 // given the address of an Int64 would have the callee read four bytes of an eight-byte value - right on
 // a little-endian machine for small numbers, and wrong the moment the value does not fit, which is the
 // silent kind of wrong.
@@ -272,7 +293,7 @@ begin
   end;
 
   FillChar(RetBuf, SizeOf(RetBuf), 0);
-  B^.Call.Call(Slice(Vals, NArgs), @RetBuf[0]);
+  AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
 
   // ⛔ A RETURN NARROWER THAN A REGISTER IS READ AT ITS OWN WIDTH AND SIGN. libffi widens an integer
   // return to at least a full word, but the BYTES above the declared width are unspecified padding -

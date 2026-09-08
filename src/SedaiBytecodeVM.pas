@@ -5978,23 +5978,33 @@ end;
 
 function TBytecodeVM.ForeignTable: TObject;
 // Built on FIRST USE, not at load: a program with no foreign call must not pay for the table, and -
-// more importantly - must not be told libffi is missing on a machine where it never needed it.
+// more importantly - must not be told a foreign call is impossible on a machine where it never makes one.
 var
   T: TForeignTable;
   i: Integer;
 begin
+  // ⛔ AND THE TABLE ITSELF IS BUILT UNDER A LOCK. "Lazily on first use" and "more than one thread" is
+  // the oldest race there is: two workers reaching their first foreign call together would each build a
+  // table, one of them would be leaked, and the calls made through it would prepare their bindings
+  // twice. FWorkerLock already exists for exactly this class of shared VM state.
   if FForeignTable = nil then
   begin
-    T := TForeignTable.Create;
-    if FProgram <> nil then
-    begin
-      for i := 0 to FProgram.ForeignDeclCount - 1 do
-        T.AddDecl(FProgram.GetForeignDecl(i));
-      for i := 0 to FProgram.IncLibCount - 1 do
-        T.AddLib(FProgram.GetIncLib(i));
+    EnterCriticalSection(FWorkerLock);
+    try
+      if FForeignTable <> nil then Exit(FForeignTable);   // another thread won the race
+      T := TForeignTable.Create;
+      if FProgram <> nil then
+      begin
+        for i := 0 to FProgram.ForeignDeclCount - 1 do
+          T.AddDecl(FProgram.GetForeignDecl(i));
+        for i := 0 to FProgram.IncLibCount - 1 do
+          T.AddLib(FProgram.GetIncLib(i));
+      end;
+      T.ResolvePtr := @ForeignPtrArg;
+      FForeignTable := T;
+    finally
+      LeaveCriticalSection(FWorkerLock);
     end;
-    T.ResolvePtr := @ForeignPtrArg;
-    FForeignTable := T;
   end;
   Result := FForeignTable;
 end;
