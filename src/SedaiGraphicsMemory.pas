@@ -70,6 +70,19 @@ type
     FPalette: array[0..255] of UInt32;
     FDefaultC64Palette: array[0..15] of UInt32;
     FPaletteIsFB: Boolean;      // this screen was opened by the FreeBASIC path: reset to ITS palette
+    { ⭐ THE PIXEL DEPTH OF THIS SURFACE, in fbc's terms: 1, 2, 4, 8, 16 or 32 (8 Sep 2026).
+      Until then every surface was 32bpp and a program asking for another depth got 32 without being
+      told - which is fine until it writes ONE BYTE per pixel through SCREENPTR, as every 8-bit program
+      does, and lands on a quarter of the picture.
+      ⛔ The storage follows the depth and not the other way round: 1/2/4/8 live in the INDEX buffer
+      (one byte per pixel, exactly what FColorBuffer already was for CLASSIC), 16 in a two-byte buffer,
+      32 in the RGBA one. FGraphicsBuffer stays 32bpp in every case, because that is what the presenter
+      and every existing primitive read - an indexed surface keeps it in step through the palette.
+      ⚠️ DEFAULT 32, so nothing that does not ask changes behaviour: CLASSIC opens its modes through
+      SwitchToMode and never touches this. }
+    FDepth: Integer;
+    FNativeBuffer: PByte;       // 1 or 2 bytes per pixel when FDepth < 32; nil at 32
+    FNativeBufferSize: Integer;
     // FreeBASIC VIEW clip rectangle (inclusive, physical pixels). When active, pixel writes outside it
     // are discarded. Reads (GetPixel) are unaffected.
     FClipActive: Boolean;
@@ -140,6 +153,14 @@ type
     property State: TGraphicsState read FState write FState;
     property GraphicsBuffer: PByte read FGraphicsBuffer;
     property GraphicsBufferSize: Integer read FGraphicsBufferSize;   // bytes; 32bpp, Width*Height*4
+    { The surface's pixel depth in fbc's terms, and the buffer a program actually WRITES through
+      SCREENPTR at that depth. At 32 the native buffer IS the RGBA one. }
+    property Depth: Integer read FDepth;
+    property NativeBuffer: PByte read FNativeBuffer;
+    property NativeBufferSize: Integer read FNativeBufferSize;
+    function BytesPerPixel: Integer;
+    procedure SetDepth(ADepth: Integer);        // (re)shape the native buffer for this depth
+    procedure SyncNativeToRGB;                  // indexed/16bpp bytes -> the 32bpp buffer the presenter reads
     // Read-only, and it exists so the C hot loop's PSET arm can be REFUSED while a clip is in
     // force: that arm writes the framebuffer directly and knows nothing about clipping.
     property ClipActive: Boolean read FClipActive;
@@ -151,6 +172,9 @@ implementation
 
 constructor TGraphicsMemory.Create;
 begin
+  FDepth := 32;            // 32bpp unless a program asks otherwise; CLASSIC never does
+  FNativeBuffer := nil;
+  FNativeBufferSize := 0;
   inherited Create;
   FTextBuffer := nil;
   FGraphicsBuffer := nil;
@@ -179,6 +203,7 @@ destructor TGraphicsMemory.Destroy;
 var
   Mode: TGraphicMode;
 begin
+  if Assigned(FNativeBuffer) then begin FreeMem(FNativeBuffer); FNativeBuffer := nil; end;
   // Free text buffer (always separate)
   if Assigned(FTextBuffer) then FreeMem(FTextBuffer);
 
@@ -321,6 +346,81 @@ end;
 function TGraphicsMemory.IsClassicMode(Mode: TGraphicMode): Boolean;
 begin
   Result := Mode in [gm40ColText..gm80x50Mixed]; // Modes 0-10 (all classic modes with persistent buffers)
+end;
+
+function TGraphicsMemory.BytesPerPixel: Integer;
+begin
+  if FDepth <= 8 then Result := 1
+  else if FDepth <= 16 then Result := 2
+  else Result := 4;
+end;
+
+procedure TGraphicsMemory.SetDepth(ADepth: Integer);
+// ⛔ fbc ROUNDS a depth up to the one it implements, and answers the rounded value from SCREENINFO:
+// 15 becomes 16 and 24 becomes 32 (measured against fbc 1.10.1, 8 Sep 2026). Doing the same here means
+// a program that asks for 15 and then reads SCREENINFO gets the same two numbers from both.
+var
+  Want: Integer;
+begin
+  case ADepth of
+    1, 2, 4, 8: Want := ADepth;
+    15, 16:     Want := 16;
+  else
+    Want := 32;
+  end;
+  FDepth := Want;
+  if Assigned(FNativeBuffer) then begin FreeMem(FNativeBuffer); FNativeBuffer := nil; end;
+  FNativeBufferSize := 0;
+  if (Want < 32) and (FState.Width > 0) and (FState.Height > 0) then
+  begin
+    FNativeBufferSize := FState.Width * FState.Height * BytesPerPixel;
+    GetMem(FNativeBuffer, FNativeBufferSize);
+    FillChar(FNativeBuffer^, FNativeBufferSize, 0);
+  end;
+end;
+
+procedure TGraphicsMemory.SyncNativeToRGB;
+// ⛔ THE HALF THAT MAKES SCREENPTR WORK AT A LOW DEPTH. A program at 8bpp writes ONE BYTE per pixel
+// straight into the native buffer and never touches the RGBA one - which is what the presenter, POINT
+// and every blit read. So the two are reconciled here, and this is called before anything reads the
+// picture. O(w*h), which is what a real backend pays for an indexed mode too.
+// ⚠️ One direction only, on purpose: the native buffer is the TRUTH at a low depth. Copying the other
+// way would need a colour match per pixel and would undo a write the program has just made.
+var
+  n, i: Integer;
+  Src8: PByte;
+  Src16: PWord;
+  Dst: PUInt32;
+  c: Word;
+begin
+  if (FDepth >= 32) or not Assigned(FNativeBuffer) or not Assigned(FGraphicsBuffer) then Exit;
+  n := FState.Width * FState.Height;
+  if n <= 0 then Exit;
+  Dst := PUInt32(FGraphicsBuffer);
+  if BytesPerPixel = 1 then
+  begin
+    Src8 := FNativeBuffer;
+    for i := 0 to n - 1 do
+    begin
+      Dst^ := FPalette[Src8^];
+      Inc(Src8); Inc(Dst);
+    end;
+  end
+  else
+  begin
+    // 16bpp is RGB565, the layout fbc uses. Each channel is scaled back to eight bits by repeating its
+    // high bits, so full-scale in stays full-scale out (31 -> 255, not 248).
+    Src16 := PWord(FNativeBuffer);
+    for i := 0 to n - 1 do
+    begin
+      c := Src16^;
+      Dst^ := $FF000000 or
+              (UInt32(((c shr 11) and $1F) * 255 div 31) shl 16) or
+              (UInt32(((c shr 5) and $3F) * 255 div 63) shl 8) or
+              (UInt32((c and $1F) * 255 div 31));
+      Inc(Src16); Inc(Dst);
+    end;
+  end;
 end;
 
 function TGraphicsMemory.AllocateBuffers(Width, Height: Integer; PaletteMode: Boolean; Mode: TGraphicMode): Boolean;

@@ -213,6 +213,7 @@ type
     // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
     // per surface: it is filled from the surface at every read, so it is never stale.
     FImgHeaderBuf: array[0..RAWPTR_IMG_HDR_SIZE - 1] of Byte;
+    FGfxScreenDepth: Integer;   // what SCREENRES actually gave, after fbc's rounding
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
@@ -603,7 +604,7 @@ type
     procedure RecomputeGfxWindow;            // rebuild the WINDOW coefficients against the current viewport
     function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
     function NextConsoleField: string;             // MODERN INPUT: the next field of the stdin stream
-    procedure SetupGfxScreen(W, H, NumPages: Integer);  // SCREENRES/SCREEN: resize + (re)build pages
+    procedure SetupGfxScreen(W, H, NumPages: Integer; Depth: Integer = 0);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
     procedure ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -7510,6 +7511,12 @@ begin
         begin
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;   // w
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;   // h
+          // ⛔ THE FOURTH COUNTER, and it is the one this project keeps paying for: the DEPTH's
+          // register rides in Immediate[32..47], and a register nobody declares here is a register the
+          // bank is not sized for. It does not raise - it reads whatever is past the end.
+          if (((Instr.Immediate shr 32) and $FFFF) <> $FFFF) and
+             (((Instr.Immediate shr 32) and $FFFF) > MaxIntReg) then
+            MaxIntReg := (Instr.Immediate shr 32) and $FFFF;
         end;
         bcGfxPset:
         begin
@@ -15803,7 +15810,7 @@ begin
   Result := NextInputField(FConInBuf, FConInPos);
 end;
 
-procedure TBytecodeVM.SetupGfxScreen(W, H, NumPages: Integer);
+procedure TBytecodeVM.SetupGfxScreen(W, H, NumPages: Integer; Depth: Integer = 0);
 // SCREENRES / SCREEN: resize the screen surface and (re)build the page table (page 0 = screen, pages
 // 1..n-1 = same-size image surfaces). Resets the work/visible page to 0. Shared by both opcodes.
 var
@@ -15811,6 +15818,17 @@ var
 begin
   if not Assigned(FGraphics) then Exit;
   FGraphics.ResizeScreen(W, H, 0);
+  // 🚧 THE DEPTH, AND THE DEFAULT IS STILL 32 - which is NOT what fbc does, and it is written here so
+  // the next reader does not have to re-measure it: fbc's default is 8 (measured 8 Sep 2026,
+  // "ScreenRes 320,200" then ScreenInfo answers depth 8, one byte per pixel).
+  // ⛔ It is 32 here on purpose, for one turn: the depth does not yet REACH this point (see the note in
+  // NEXT_SESSION_PROMPT - the register packed into the Immediate arrives as $FFFF), so switching the
+  // default to 8 would put EVERY program at 8bpp regardless of what it asked for, and four guards of
+  // the corpus said so immediately. Shipping the honest default before the value that overrides it
+  // would be shipping half a change.
+  if Depth = 0 then Depth := 32;
+  FGraphics.SetSurfaceDepth(FGraphics.ScreenSurface, Depth);
+  FGfxScreenDepth := FGraphics.SurfaceDepth(FGraphics.ScreenSurface);
   for i := 1 to High(FGfxPages) do
     if FGfxPages[i] <> GFX_SCREEN_SURFACE then FGraphics.DestroySurface(FGfxPages[i]);
   if NumPages < 1 then NumPages := 1;
@@ -16227,7 +16245,10 @@ begin
         // The flags go to a shared knob the window presenter reads at the next frame boundary: the VM
         // knows nothing about windows, and the presenter knows nothing about opcodes.
       begin
-        SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate and $FFFF);
+        // The depth's REGISTER is in bits 32..47; $FFFF = the argument was absent (default 8).
+        if ((Instr.Immediate shr 32) and $FFFF) = $FFFF then GetX1 := 0
+        else GetX1 := Integer(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
+        SetupGfxScreen(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate and $FFFF, GetX1);
         GGfxScreenFlags := (Instr.Immediate shr 16) and $FFFF;
       end;
     26: // bcGfxPset - PSET (x,y), color  (color in Immediate float-free int register; targets the work page)
@@ -16475,9 +16496,12 @@ begin
         case Instr.Immediate of
           0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(FGraphics.ScreenSurface);
           1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(FGraphics.ScreenSurface);
-          2: Ctx.IntRegs[Instr.Dest] := 32;                                             // colour depth (bits)
-          3: Ctx.IntRegs[Instr.Dest] := 4;                                              // bytes per pixel
-          4: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(FGraphics.ScreenSurface) * 4;  // pitch (bytes)
+          // ⭐ The screen's REAL depth, not a constant 32. fbc answers the depth it gave you, which is
+          // the one it rounded to (15->16, 24->32), and a program reads it back to size its own walk.
+          2: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceDepth(FGraphics.ScreenSurface);
+          3: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceBytesPerPixel(FGraphics.ScreenSurface);
+          4: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(FGraphics.ScreenSurface) *
+                                        FGraphics.SurfaceBytesPerPixel(FGraphics.ScreenSurface);
         else Ctx.IntRegs[Instr.Dest] := 0;                                              // refresh rate (unknown)
         end
       else

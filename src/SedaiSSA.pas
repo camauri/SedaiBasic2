@@ -18647,15 +18647,30 @@ end;
 
 procedure TSSAGenerator.ProcessScreenRes(Node: TASTNode);
 // SCREENRES w, h [, depth [, num_pages]] : set the graphics screen resolution (routed to the backend).
-// depth is accepted-and-ignored; num_pages (a compile-time constant, default 1) sets up page flipping
-// and is carried in Src3 -> Immediate (the VM reads it as the literal page count, not a register).
+// ⭐ DEPTH IS HONOURED SINCE 8 SEP 2026 - it used to be "accepted and ignored", which is right up to the
+// moment a program writes ONE BYTE per pixel through SCREENPTR, as every 8-bit program does. Its
+// REGISTER rides in bits 32..47 of the same Immediate that carries the page count (low 16) and the
+// driver flags (bits 16..31); $FFFF there means the argument was not given, and fbc's default is 8.
+// num_pages (a compile-time constant, default 1) sets up page flipping.
 var
   WVal, HVal, NVal, WReg, HReg: TSSAValue;
-  NumPages, Flags: Int64;
+  NumPages, Flags, Depth: Int64;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), WVal); WReg := EnsureIntRegister(WVal);
   ProcessExpression(Node.GetChild(1), HVal); HReg := EnsureIntRegister(HVal);
+  // The DEPTH: a compile-time constant like the page count. fbc's own default when the argument is
+  // absent is 8 - measured, not assumed - and rounding (15->16, 24->32) is the surface's business.
+  // ⛔ A REGISTER, NOT A CONSTANT. fbc takes the depth as an ordinary expression - "ScreenRes w,h,d"
+  // with d a variable is legal and real code writes it that way (retrogra picks the depth from
+  // SCREENLIST). Reading it as a compile-time constant made every non-literal depth read as "absent".
+  // $FFFF in bits 32..47 = the argument was not given.
+  Depth := $FFFF;
+  if Node.ChildCount >= 3 then
+  begin
+    ProcessExpression(Node.GetChild(2), NVal);
+    Depth := EnsureIntRegister(NVal).RegIndex;
+  end;
   NumPages := 1;
   if Node.ChildCount >= 4 then
   begin
@@ -18675,7 +18690,8 @@ begin
     else if NVal.Kind = svkConstFloat then Flags := Trunc(NVal.ConstFloat);
   end;
   EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg,
-                  MakeSSAConstInt((NumPages and $FFFF) or ((Flags and $FFFF) shl 16)));
+                  MakeSSAConstInt((NumPages and $FFFF) or ((Flags and $FFFF) shl 16) or
+                                  ((Depth and $FFFF) shl 32)));
 end;
 
 procedure TSSAGenerator.EmitPenCoordRegs(out PenX, PenY: TSSAValue);

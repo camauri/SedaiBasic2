@@ -64,6 +64,12 @@ type
     procedure DestroySurface(Surface: TGfxSurface);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
+    { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
+      that depth. Setting it (re)shapes the native buffer SCREENPTR hands out. }
+    function  SurfaceDepth(Surface: TGfxSurface): Integer;
+    function  SurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
+    procedure SetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
+    procedure SyncSurfaceToRGB(Surface: TGfxSurface);   // low-depth bytes -> the 32bpp buffer
     // SCREENPTR: hand out the surface's pixel bytes so the VM can expose them as a raw-pointer region.
     // 32 bits per pixel, Width*Height*4 bytes, row pitch = Width*4. False when there is no such surface.
     function  SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
@@ -137,6 +143,12 @@ type
     procedure DestroySurface(Surface: TGfxSurface);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
+    { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
+      that depth. Setting it (re)shapes the native buffer SCREENPTR hands out. }
+    function  SurfaceDepth(Surface: TGfxSurface): Integer;
+    function  SurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
+    procedure SetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
+    procedure SyncSurfaceToRGB(Surface: TGfxSurface);   // low-depth bytes -> the 32bpp buffer
     function  SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     procedure SetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
@@ -326,6 +338,34 @@ begin
   if Assigned(M) then Result := M.State.Height else Result := 0;
 end;
 
+function TSoftwareGraphicsBackend.SurfaceDepth(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if Assigned(M) then Result := M.Depth else Result := 32;
+end;
+
+function TSoftwareGraphicsBackend.SurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if Assigned(M) then Result := M.BytesPerPixel else Result := 4;
+end;
+
+procedure TSoftwareGraphicsBackend.SetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
+var M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.SetDepth(ADepth);
+end;
+
+procedure TSoftwareGraphicsBackend.SyncSurfaceToRGB(Surface: TGfxSurface);
+var M: TGraphicsMemory;
+begin
+  M := MemoryOf(Surface);
+  if Assigned(M) then M.SyncNativeToRGB;
+end;
+
 function TSoftwareGraphicsBackend.SurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
 // The drawable surface is always a plain CPU byte buffer here (which is also why SCREENLOCK/SCREENUNLOCK
 // are no-ops), so SCREENPTR can expose it directly. Nothing is copied: a write through the pointer is a
@@ -334,6 +374,16 @@ var M: TGraphicsMemory;
 begin
   Data := nil; SizeBytes := 0;
   M := MemoryOf(Surface);
+  // ⭐ AT A LOW DEPTH THE PROGRAM WRITES THE NATIVE BUFFER, not the RGBA one: an 8bpp program puts ONE
+  // BYTE per pixel through SCREENPTR, and handing it the 32bpp buffer made it paint a quarter of the
+  // picture in the wrong colours. The RGBA buffer stays what the presenter reads; SyncNativeToRGB
+  // reconciles them. DIVERGENZE / retrogra, 8 Sep 2026.
+  if Assigned(M) and (M.Depth < 32) and Assigned(M.NativeBuffer) and (M.NativeBufferSize > 0) then
+  begin
+    Data := M.NativeBuffer;
+    SizeBytes := M.NativeBufferSize;
+    Exit(True);
+  end;
   Result := Assigned(M) and Assigned(M.GraphicsBuffer) and (M.GraphicsBufferSize > 0);
   if Result then
   begin

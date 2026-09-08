@@ -9765,7 +9765,12 @@ begin
 
     ssaGfxScreenRes:
       begin
-        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt > 1) then
+        // ⛔ THE PAGE COUNT IS THE LOW 16 BITS, not the whole Immediate. It always was, but nothing
+        // else lived up there until the DEPTH's register moved into bits 32..47 (8 Sep 2026) - and
+        // this reader then saw every SCREENRES as "more than one page" and refused the demo.
+        // Refining a packed field is half the change; the other half is every reader of the old,
+        // coarser one.
+        if (Instr.Src3.Kind = svkConstInt) and ((Instr.Src3.ConstInt and $FFFF) > 1) then
           Exit(Fail('SCREENRES with more than one page is not modelled yet'));
         LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.GlobalSet(FScrW);
         LoadReg(B, Instr.Src2); B.Op(wopI32WrapI64); B.GlobalSet(FScrH);
