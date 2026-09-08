@@ -4719,10 +4719,29 @@ function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
 var
   IsFunc: Boolean;
   KindU, PT, ParamTypes: string;
-  LoopMark: Integer;
+  LoopMark, TypeOfMark: Integer;
   NestedFp: TASTNode;
 begin
   Result := False;
+  // ⭐ "As TypeOf( Sub( ) ) Ptr": TypeOf of a PROCEDURE TYPE *is* that procedure type. Its operand is a
+  // TYPE, not an expression, so the TypeOf readers elsewhere - which all parse an expression inside the
+  // parentheses - cannot answer here; the parser stopped on the ')' of "Sub( )". The rule belongs in
+  // THIS function rather than at its call sites, because every position that reads a procedure type
+  // goes through here: a parameter, a FUNCTION result, and a nested procptr parameter. fbc's
+  // functions/mangling-procptr writes it in the parameter position.
+  // ⚠️ Rewind if what follows the parenthesis is NOT a procedure type: "TypeOf( x )" over an ordinary
+  // expression must still reach the readers that know how to answer it, having consumed nothing.
+  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.SavePosition(TypeOfMark);
+    Context.Advance;                                   // TYPEOF
+    Context.Advance;                                   // '('
+    if TryParseProcPtrType(Node) and Context.Match(ttDelimParClose) then
+      Exit(True);
+    Context.RestorePosition(TypeOfMark);
+    Result := False;
+  end;
   if not Context.Check(ttProcedureStart) then Exit;
   KindU := UpperCase(VarToStr(Context.CurrentToken.Value));
   if (KindU <> kFUNCTION) and (KindU <> kSUB) then Exit;
@@ -4768,7 +4787,15 @@ begin
         // is what makes any nesting depth terminate, and record it as '#P': the marker this parser
         // already uses for an inline procedure-pointer parameter, which never collides with another
         // type because it deliberately means "unknown" (see the overload-duplicate check).
-        if Context.Check(ttProcedureStart) then
+        // ⭐ ...and the inner type may be SPELLED as "TypeOf( Sub( ) )", which names the same procedure
+        // type. Gating only on ttProcedureStart sent that spelling to the name reader below, which took
+        // "TYPEOF" for the type and left "( Sub( ) ) Ptr" in the stream - the parse then failed several
+        // tokens later, on the ')' , naming nothing useful. TryParseProcPtrType understands both
+        // spellings and consumes nothing when it recognises neither, so the gate can simply admit it.
+        if Context.Check(ttProcedureStart) or
+           (Context.Check(ttIdentifier) and
+            (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)) then
         begin
           NestedFp := TASTNode.Create(antIdentifier, Context.CurrentToken);
           try
@@ -4776,8 +4803,10 @@ begin
           finally
             NestedFp.Free;
           end;
-        end
-        else if Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
+        end;
+        // A "TypeOf( expr )" that named no procedure type left the cursor where it was: the ordinary
+        // name reader answers it, exactly as before.
+        if (PT = '') and Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
         // Keep the "PTR" suffix on the parameter type (a "T PTR" param is an int address, not a T value).
         // Dropping it recorded a "Cat Ptr" parameter as "Cat", so the indirect call staged the argument
         // with UDT (by-value/handle) semantics instead of passing the pointer, corrupting the callee's arg.

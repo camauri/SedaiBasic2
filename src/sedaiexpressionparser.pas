@@ -2833,6 +2833,18 @@ begin
       NameNode.Free; if Assigned(Args) then Args.Free; Exit(nil);
     end;
   end
+  else if Context.CheckAny([ttEndOfLine, ttEndOfFile, ttSeparParam, ttSeparStmt, ttSeparOutput,
+                            ttDelimParClose, ttDelimBrackClose]) then
+  begin
+    // ⭐ "return type<T>" / "y = type<T>" / "f( type<T> )": the BARE form, with neither parentheses nor
+    // a value, is a DEFAULT-constructed temporary - the same thing "type<T>( )" builds. Verified against
+    // fbc in all three positions (DIM initialiser, assignment, RETURN): the constructor runs and its
+    // fields come back. Without this the parser demanded a value and a "return type<T>" at end of line
+    // was a syntax error (fbc's pp/typeof-no-dtors).
+    // ⛔ Only for a UDT. On a built-in the same spelling is an ERROR in fbc ("Expected expression" on
+    // "type<Integer>"), and it still is here: the conversion branch above runs first and demands a value.
+    Args := TASTNode.Create(antExpressionList, Token);
+  end
   else
   begin
     // "Dim As Parent p = type<Child>c": the parenthesis-less form works for a UDT too, where it is the
