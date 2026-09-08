@@ -165,6 +165,15 @@ begin
 end;
 
 begin
+    // ⛔ EVERY unit declares {$codepage UTF8}, so a string LITERAL carries code page 65001 - while a
+    // string BUILT at run time carries DefaultSystemCodePage, which is CP_ACP (0) because no cwstring
+    // unit is linked. FPC compares the two code pages on every concatenation: when they differ it takes
+    // ansistr_concat_COMPLEX, which converts BOTH operands to UnicodeString, concatenates, and converts
+    // the result back. So `s := s + 'literal'` - the single most common statement in this compiler - was
+    // paying a full UTF-16 round trip, and AnsiCompareText paid the same conversion on both arguments.
+    // Naming the two code pages the same makes both take the byte path. Measured: concatenation 7.0x,
+    // AnsiCompareText 3.5x (200k iterations, 98 -> 14 ms and 21 -> 6 ms).
+    SetMultiByteConversionCodePage(CP_UTF8);
   try
     // Mask the FPU/SSE exceptions so floating-point overflow/invalid/div-by-zero produce IEEE Inf/NaN
     // (FreeBASIC/C semantics) instead of raising a Pascal exception. Same line, same reason, as sb -

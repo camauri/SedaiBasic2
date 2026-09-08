@@ -67,7 +67,7 @@ unit SedaiDBE;
 interface
 
 uses
-  Classes, SysUtils, Generics.Collections, SedaiSSATypes;
+  Classes, SysUtils, Generics.Collections, SedaiSSATypes, SedaiFastLookup;
 
 type
   { TDeadBlockElimination - Unreachable block removal via smart reachability analysis }
@@ -78,6 +78,12 @@ type
     FReferencedLines: specialize TDictionary<Integer, Boolean>;  // Line numbers referenced by instructions
     FReferencedLabels: TStringList;  // Block labels referenced by ON ERROR GOTO / RESUME <label>
     FRemovedCount: Integer;
+    // ⛔ "Where in the program is this block" used to be TFPGObjectList.IndexOf - a linear scan, run
+    // once per CFG edge and TWICE per predecessor and successor examined, which made this pass
+    // quadratic in the block count. The list does not change between Run building this map and
+    // Pass 3 deleting blocks, so every position is learnt once. See BlockIndexOf.
+    FBlockIndex: TObjectIndexMap;
+    FIndexCheck: Boolean;            // DBEIDX_CHECK=1: answer both ways and report any disagreement
 
     { Try to resolve a register value to its constant definition }
     function TryResolveConstant(Block: TSSABasicBlock; InstrIdx: Integer;
@@ -85,6 +91,9 @@ type
 
     { Collect all line numbers referenced by dynamic jump instructions }
     procedure CollectReferencedLines;
+
+    { The position of a block in FProgram.Blocks, from FBlockIndex rather than by scanning }
+    function BlockIndexOf(ABlock: TSSABasicBlock): Integer; inline;
 
     { Mark all blocks reachable from entry via DFS }
     procedure MarkReachableBlocks;
@@ -120,6 +129,8 @@ begin
   FProgram := Prog;
   FRemovedCount := 0;
   FReferencedLines := specialize TDictionary<Integer, Boolean>.Create;
+  FBlockIndex := TObjectIndexMap.Create;
+  FIndexCheck := GetEnvironmentVariable('DBEIDX_CHECK') = '1';
   FReferencedLabels := TStringList.Create;
   FReferencedLabels.Sorted := True;
   FReferencedLabels.Duplicates := dupIgnore;
@@ -130,6 +141,7 @@ destructor TDeadBlockElimination.Destroy;
 begin
   FReferencedLines.Free;
   FReferencedLabels.Free;
+  FBlockIndex.Free;
   inherited;
 end;
 
@@ -325,14 +337,23 @@ end;
 function TDeadBlockElimination.Run: Integer;
 var
   i: Integer;
+  T0: QWord;
 begin
+  T0 := 0;
   {$IFDEF DEBUG_DBE}
   if DebugDBE then
     WriteLn('[DBE] Running dead block elimination...');
   {$ENDIF}
 
   // Step 1: Collect all referenced line numbers
+  if FIndexCheck then T0 := GetTickCount64;
   CollectReferencedLines;
+  if FIndexCheck then begin WriteLn('[DBEPHASE] collect ', GetTickCount64-T0, ' blocks ', FProgram.Blocks.Count); T0 := GetTickCount64; end;
+
+  // ⛔ Step 1b: learn where every block IS, once. Read by DFS and by RemoveUnreachableBlocks passes 1
+  // and 2; pass 3 is the only place the block list changes, and nothing asks for a position after it.
+  FBlockIndex.Build(FProgram.Blocks);
+  if FIndexCheck then begin WriteLn('[DBEPHASE] build ', GetTickCount64-T0); T0 := GetTickCount64; end;
 
   // Step 2: Initialize reachability map
   SetLength(FReachable, FProgram.Blocks.Count);
@@ -341,15 +362,32 @@ begin
 
   // Step 3: Mark all blocks reachable from entry via DFS
   MarkReachableBlocks;
+  if FIndexCheck then begin WriteLn('[DBEPHASE] mark ', GetTickCount64-T0); T0 := GetTickCount64; end;
 
   // Step 4: Remove blocks that are BOTH unreachable AND unreferenced
   RemoveUnreachableBlocks;
+  if FIndexCheck then WriteLn('[DBEPHASE] remove ', GetTickCount64-T0, ' removed ', FRemovedCount);
 
   {$IFDEF DEBUG_DBE}
   if DebugDBE then
     WriteLn('[DBE] Removed ', FRemovedCount, ' unreachable blocks');
   {$ENDIF}
   Result := FRemovedCount;
+end;
+
+function TDeadBlockElimination.BlockIndexOf(ABlock: TSSABasicBlock): Integer;
+var
+  Scan: Integer;
+begin
+  Result := FBlockIndex.IndexOf(Pointer(ABlock));
+  // ⚠️ The environment is read ONCE, in the constructor: asking for it here cost a syscall-shaped
+  // getenv per CFG edge, which showed up in the profile of the very pass this map was meant to cure.
+  if FIndexCheck then
+  begin
+    Scan := FProgram.Blocks.IndexOf(ABlock);
+    if Scan <> Result then
+      WriteLn('[DBEIDX] DISAGREE map=', Result, ' scan=', Scan, ' blocks=', FProgram.Blocks.Count);
+  end;
 end;
 
 procedure TDeadBlockElimination.MarkReachableBlocks;
@@ -452,7 +490,7 @@ begin
     Succ := TSSABasicBlock(Block.Successors[i]);
 
     // Find successor index in program block list
-    SuccIdx := FProgram.Blocks.IndexOf(Succ);
+    SuccIdx := BlockIndexOf(Succ);
 
     if SuccIdx >= 0 then
       DFS(SuccIdx);
@@ -464,6 +502,7 @@ var
   Block: TSSABasicBlock;
   i, j: Integer;
   UnreachableCount: Integer;
+  PredIdx, SuccIdx: Integer;
   PredBlock, SuccBlock: TSSABasicBlock;
   ShouldRemove: Boolean;
 begin
@@ -563,9 +602,10 @@ begin
     while j < Block.Successors.Count do
     begin
       SuccBlock := TSSABasicBlock(Block.Successors[j]);
-      if FProgram.Blocks.IndexOf(SuccBlock) >= 0 then
+      SuccIdx := BlockIndexOf(SuccBlock);
+      if SuccIdx >= 0 then
       begin
-        if not FReachable[FProgram.Blocks.IndexOf(SuccBlock)] then
+        if not FReachable[SuccIdx] then
         begin
           {$IFDEF DEBUG_DBE}
           if DebugDBE then
@@ -583,9 +623,10 @@ begin
     while j < Block.Predecessors.Count do
     begin
       PredBlock := TSSABasicBlock(Block.Predecessors[j]);
-      if FProgram.Blocks.IndexOf(PredBlock) >= 0 then
+      PredIdx := BlockIndexOf(PredBlock);
+      if PredIdx >= 0 then
       begin
-        if not FReachable[FProgram.Blocks.IndexOf(PredBlock)] then
+        if not FReachable[PredIdx] then
         begin
           {$IFDEF DEBUG_DBE}
           if DebugDBE then
@@ -651,8 +692,10 @@ begin
                 ' (', Block.Instructions.Count, ' instructions)');
       {$ENDIF}
 
-      // Extract removes without freeing, then we free manually
-      FProgram.Blocks.Extract(Block).Free;
+      // ⛔ NOT Extract(Block): TFPSList.Extract SCANS the list to find an object whose index this loop
+      // already has, so removing R blocks cost R x Blocks.Count item comparisons. The list is built
+      // with Create(True), so Delete frees the block exactly as Extract-then-Free did.
+      FProgram.Blocks.Delete(i);
       Inc(FRemovedCount);
     end;
   end;
