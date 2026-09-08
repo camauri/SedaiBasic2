@@ -768,6 +768,7 @@ type
       FArrays until after the value exists, which restores the original order exactly. }
     procedure ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
+    function ArrDescCount(const A: TArrayStorage): Int64;  // the count the COMPILED engines see
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
     // ExecuteInstruction are the two arms this VM keeps having to hold in step, and a foreign call is
@@ -822,7 +823,9 @@ type
     // (which the compiler classifies as raw) died on a dereference that worked from a pointer VARIABLE.
     // ⛔ Extracted rather than copied: this would have been the THIRD written-out copy of the same
     // decode, and every earlier copy of it in this VM has cost a defect.
-    function PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64): Int64;
+    function ReadPackedBytes(const A: TArrayStorage; ByteOfs, WidthCode: Integer): Int64;
+    procedure WritePackedBytes(ArrIdx, ByteOfs, WidthCode: Integer; V: Int64);  // its WRITE twin
+    function PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64; WidthCode: Integer = 0): Int64;
     function PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
     procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
     procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
@@ -1532,6 +1535,10 @@ var
 {$ENDIF}
 begin
   inherited Create;
+  // The tripwire on TArrayStorage's field list - see ARRAY_STORAGE_FIELD_BYTES. One comparison, once
+  // per process, and it is what stops a field added to the record from shipping without the ten
+  // routines that spell the fields out by hand.
+  CheckArrayStorageLayout;
   FEnvOverrides := TStringList.Create;
   FEnvOverrides.CaseSensitive := False;   // environment names are case-insensitive on Windows; harmless elsewhere
   // FreeBASIC draw colours: white foreground, opaque-black background (match the SCREENRES surface clear).
@@ -1934,6 +1941,7 @@ begin
     SetLength(FArrays[i].IntData, 0);
     SetLength(FArrays[i].FloatData, 0);
     SetLength(FArrays[i].StringData, 0);
+    SetLength(FArrays[i].ByteData, 0);
     FArrays[i].TotalSize := 0;
   end;
   SetLength(FArrays, 0);
@@ -5409,7 +5417,10 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-  Lim := High(FArrays[ArrayIdx].IntData);
+  // ⛔ THE ELEMENT COUNT, NOT High(IntData). A packed array keeps IntData empty on purpose, so this
+  // read -1 and the loop never ran: "*Cast(ZString Ptr, @foo(0))" over a UByte buffer - the very shape
+  // this function was written for - answered the empty string, in silence. Guard m788.
+  Lim := FArrays[ArrayIdx].TotalSize - 1;
   while PtrOffset <= Lim do
   begin
     Ch := ArrGetInt(FArrays[ArrayIdx], PtrOffset);
@@ -5437,10 +5448,10 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if SysUtils.GetEnvironmentVariable('ZPTR_DIAG') = '1' then
     WriteLn(StdErr, '[ZPTR] store addr=', PtrAddr, ' idx=', ArrayIdx, ' off=', PtrOffset,
-            ' highArr=', High(FArrays), ' limInt=', High(FArrays[ArrayIdx].IntData));
+            ' highArr=', High(FArrays), ' n=', FArrays[ArrayIdx].TotalSize);
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-  Lim := High(FArrays[ArrayIdx].IntData);
+  Lim := FArrays[ArrayIdx].TotalSize - 1;   // the element count - see PtrDomainLoadZStr
   if Wide then
   begin
     W := UTF8Decode(Value);
@@ -5544,8 +5555,84 @@ begin
   Result := @FRawHeap[ofs];
 end;
 
-function TBytecodeVM.PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64): Int64;
+function TBytecodeVM.ReadPackedBytes(const A: TArrayStorage; ByteOfs: Integer;
+  WidthCode: Integer): Int64;
+// N contiguous bytes out of a packed array, N and the sign coming from the READ's type code (RTC_*).
+// ⛔ Bounds are checked against the BYTE length, not the element count: a four-byte read at the last
+// element is out of range even though that element exists, and that is exactly the case a program
+// walking a header hits first.
+var
+  W: Integer;
+begin
+  case WidthCode of
+    RTC_I8, RTC_U8:   W := 1;
+    RTC_I16, RTC_U16: W := 2;
+    RTC_I32, RTC_U32: W := 4;
+    RTC_I64:          W := 8;
+  else
+    W := A.ElemWidth;                 // 0 = "one element, at its own width"
+  end;
+  if (ByteOfs < 0) or (ByteOfs + W > Length(A.ByteData)) then
+    raise ERangeError.CreateFmt('reading %d bytes at offset %d of a %d-byte array is out of range',
+                                [W, ByteOfs, Length(A.ByteData)]);
+  case WidthCode of
+    RTC_I8:  Result := PShortInt(@A.ByteData[ByteOfs])^;
+    RTC_U8:  Result := A.ByteData[ByteOfs];
+    RTC_I16: Result := PSmallInt(@A.ByteData[ByteOfs])^;
+    RTC_U16: Result := PWord(@A.ByteData[ByteOfs])^;
+    RTC_I32: Result := PLongInt(@A.ByteData[ByteOfs])^;
+    RTC_U32: Result := PLongWord(@A.ByteData[ByteOfs])^;
+    RTC_I64: Result := PInt64(@A.ByteData[ByteOfs])^;
+  else
+    // No type on the read: one element, at the array's own width and sign.
+    case A.ElemWidth of
+      1: if A.ElemSigned then Result := PShortInt(@A.ByteData[ByteOfs])^ else Result := A.ByteData[ByteOfs];
+      2: if A.ElemSigned then Result := PSmallInt(@A.ByteData[ByteOfs])^ else Result := PWord(@A.ByteData[ByteOfs])^;
+    else
+      if A.ElemSigned then Result := PLongInt(@A.ByteData[ByteOfs])^ else Result := PLongWord(@A.ByteData[ByteOfs])^;
+    end;
+  end;
+end;
+
+procedure TBytecodeVM.WritePackedBytes(ArrIdx, ByteOfs, WidthCode: Integer; V: Int64);
+// The WRITE twin of ReadPackedBytes, and it is a separate procedure for one reason: it takes the array
+// by INDEX. Taking the record by "var" and writing through it aliases FArrays, which the surrounding
+// arms also index - the same trap ArrSetIntAt was written to avoid.
+// ⛔ Both halves are needed or the feature is half a feature: "*Cast(ULong Ptr, @a(4)) = &h11223344"
+// must lay four bytes side by side exactly as the read takes four side by side. WidthCode 0 means
+// "one element, at the array's own width", which is what a plain element store means.
+var
+  W: Integer;
+begin
+  case WidthCode of
+    RTC_I8, RTC_U8:   W := 1;
+    RTC_I16, RTC_U16: W := 2;
+    RTC_I32, RTC_U32: W := 4;
+    RTC_I64:          W := 8;
+  else
+    W := FArrays[ArrIdx].ElemWidth;
+  end;
+  if (ByteOfs < 0) or (ByteOfs + W > Length(FArrays[ArrIdx].ByteData)) then
+    raise ERangeError.CreateFmt('writing %d bytes at offset %d of a %d-byte array is out of range',
+                                [W, ByteOfs, Length(FArrays[ArrIdx].ByteData)]);
+  case W of
+    1: FArrays[ArrIdx].ByteData[ByteOfs] := Byte(V);
+    2: PWord(@FArrays[ArrIdx].ByteData[ByteOfs])^ := Word(V);
+    4: PLongWord(@FArrays[ArrIdx].ByteData[ByteOfs])^ := LongWord(V);
+  else
+    PInt64(@FArrays[ArrIdx].ByteData[ByteOfs])^ := V;
+  end;
+end;
+
+function TBytecodeVM.PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64;
+  WidthCode: Integer = 0): Int64;
 // A pointer value that is NOT a raw heap address: a record-field pointer or a packed array pointer.
+//
+// ⭐ WidthCode is the raw type code of the READ ("*Cast(ULong Ptr, p)" carries one), and it matters only
+// for a PACKED array: there the elements are contiguous BYTES, so a four-byte read at element 0 takes
+// a(0)..a(3) side by side, exactly as it does in FreeBASIC. That is what makes
+// "Peek(ULong, @a(0))" answer D544E46 instead of 46, and it is the whole reason retrogra's font loader
+// refused a good file. 0 = read one element at its own width, which is what every caller meant before.
 var
   Rec: PRecordStorage;
   RecSlot, ArrayIdx: Integer;
@@ -5560,6 +5647,13 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  // ⭐ A PACKED ARRAY: the bytes are contiguous, so a read WIDER than one element spans the next ones.
+  if FArrays[ArrayIdx].ElemWidth > 0 then
+  begin
+    if (PtrOffset < 0) or (PtrOffset >= FArrays[ArrayIdx].TotalSize) then
+      raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+    Exit(ReadPackedBytes(FArrays[ArrayIdx], PtrOffset * FArrays[ArrayIdx].ElemWidth, WidthCode));
+  end;
   // The vector that IS populated is the discriminator - see the note in bcRefLoadInt.
   if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
     Result := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
@@ -5953,6 +6047,17 @@ begin
   PtrOffset := Ptr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ptr]);
+  // ⭐ A PACKED ARRAY IS ALREADY A BLOCK OF BYTES - which is the whole point of it - so the offset is a
+  // BYTE offset here and not an element index. That is what makes "Clear a(0), 0, n", FB_MEMCOPY and a
+  // pointer handed to a C function all step one byte per element, as FreeBASIC does.
+  if FArrays[ArrayIdx].ElemWidth > 0 then
+  begin
+    Avail := Int64(Length(FArrays[ArrayIdx].ByteData)) - PtrOffset * FArrays[ArrayIdx].ElemWidth;
+    if (PtrOffset > FArrays[ArrayIdx].TotalSize) or (Int64(NeedBytes) > Avail) then
+      raise ERangeError.CreateFmt('Block operation out of bounds: %d bytes from element %d, %d available',
+                                  [Int64(NeedBytes), PtrOffset, Avail]);
+    Exit(@FArrays[ArrayIdx].ByteData[PtrOffset * FArrays[ArrayIdx].ElemWidth]);
+  end;
   case FArrays[ArrayIdx].ElementType of
     0: begin
          Avail := (Int64(Length(FArrays[ArrayIdx].IntData)) - PtrOffset) * SizeOf(Int64);
@@ -12179,6 +12284,7 @@ begin
         SetLength(FArrays[i].IntData, 0);
         SetLength(FArrays[i].FloatData, 0);
         SetLength(FArrays[i].StringData, 0);
+        SetLength(FArrays[i].ByteData, 0);
         SetLength(FArrays[i].Dimensions, 0);
         SetLength(FArrays[i].LowerBounds, 0);
         FArrays[i].TotalSize := 0;
@@ -12227,6 +12333,20 @@ begin
         WriteLn(ErrOutput, Format('[arrpriv] ⛔ ARR[%d] phys=%d desc=%x atteso=%x size=%d gen=%d/%d',
                 [i, phys, D[i * 4], want, FArrays[phys].TotalSize, Ctx.ArrDescGen, FArrDescGen]));
     end;
+end;
+
+function TBytecodeVM.ArrDescCount(const A: TArrayStorage): Int64;
+// ⛔⛔ THE COUNT THE COMPILED ENGINES SEE IS NOT THE NUMBER OF ELEMENTS - it is how many EIGHT-BYTE
+// cells the descriptor's IntData/FloatData pointer addresses. A narrow-typed array is packed in
+// ByteData at one, two or four bytes per element, so that pointer is NULL and the right count is
+// ZERO: the bounds test then fails, the arm takes the branch already off the fast path, and the C
+// loop / JIT / AOT hand the PC back to the interpreter, which knows about the packing.
+// ⚠️ Publishing TotalSize here instead was an ACCESS VIOLATION, not a wrong number: hotdisp.c's arms
+// were already written to check the pointer, the reader half of the change was in place, and the
+// WRITER still said 16. "Decorare un'etichetta e spostare i suoi lettori sono una modifica in due
+// meta'" - this is the other half. Guard m884.
+begin
+  if A.ElemWidth > 0 then Result := 0 else Result := A.TotalSize;
 end;
 
 function TBytecodeVM.ActiveCtx: TExecutionContext; inline;
@@ -12310,7 +12430,7 @@ begin
     if Length(FArrays[a].FloatData) > 0 then
       FJitArrDesc[a * 4 + 1] := Int64(PtrUInt(@FArrays[a].FloatData[0]))
     else FJitArrDesc[a * 4 + 1] := 0;
-    FJitArrDesc[a * 4 + 2] := FArrays[a].TotalSize;
+    FJitArrDesc[a * 4 + 2] := ArrDescCount(FArrays[a]);
     if Length(FArrays[a].LowerBounds) > 0 then
       FJitArrDesc[a * 4 + 3] := FArrays[a].LowerBounds[0]
     else FJitArrDesc[a * 4 + 3] := 0;
@@ -12424,7 +12544,7 @@ begin
           if Length(FArrays[Src].FloatData) > 0 then
             ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
           else ECtx.ArrDescOwn[Dst + 1] := 0;
-          ECtx.ArrDescOwn[Dst + 2] := FArrays[Src].TotalSize;
+          ECtx.ArrDescOwn[Dst + 2] := ArrDescCount(FArrays[Src]);
           if Length(FArrays[Src].LowerBounds) > 0 then
             ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
           else ECtx.ArrDescOwn[Dst + 3] := 0;
@@ -12455,7 +12575,7 @@ begin
           if Length(FArrays[Src].FloatData) > 0 then
             ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
           else ECtx.ArrDescOwn[Dst + 1] := 0;
-          ECtx.ArrDescOwn[Dst + 2] := FArrays[Src].TotalSize;
+          ECtx.ArrDescOwn[Dst + 2] := ArrDescCount(FArrays[Src]);
           if Length(FArrays[Src].LowerBounds) > 0 then
             ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
           else ECtx.ArrDescOwn[Dst + 3] := 0;
@@ -14147,6 +14267,7 @@ begin
     SetLength(FArrays[ArrayIdx].IntData, 0);
     SetLength(FArrays[ArrayIdx].FloatData, 0);
     SetLength(FArrays[ArrayIdx].StringData, 0);
+    SetLength(FArrays[ArrayIdx].ByteData, 0);
     for d := 0 to High(FArrays[ArrayIdx].Dimensions) do
       FArrays[ArrayIdx].Dimensions[d] := 0;        // UBound(d) = LowerBound(d) + 0 - 1 = -1
     for d := 0 to High(FArrays[ArrayIdx].LowerBounds) do
@@ -14155,7 +14276,15 @@ begin
     Exit;
   end;
   case FArrays[ArrayIdx].ElementType of
-    0: for k := 0 to High(FArrays[ArrayIdx].IntData) do ArrSetIntAt(ArrayIdx, k, 0);
+    // ⛔ The element COUNT, not High(IntData): a packed array keeps IntData empty, so the loop bound
+    // read -1 and ERASE of a narrow-typed array cleared nothing at all - in silence.
+    0: if FArrays[ArrayIdx].ElemWidth > 0 then
+       begin
+         if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+         for k := 0 to High(FArrays[ArrayIdx].IntData) do ArrSetIntAt(ArrayIdx, k, 0);
     1: for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
     2: for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
   end;
@@ -14180,7 +14309,24 @@ begin
   NewSize := NewUpper - Lb + 1;
   if NewSize < 0 then NewSize := 0;
   case FArrays[ArrayIdx].ElementType of
-    0: begin
+    // ⛔ A PACKED ARRAY RESIZES ITS OWN BANK. Growing IntData instead left ByteData at its old size and
+    // every element past it wrote out of range - and PRESERVE has to keep the BYTES, which SetLength on
+    // a dynamic array already does.
+    0: if FArrays[ArrayIdx].ElemWidth > 0 then
+       begin
+         k := Length(FArrays[ArrayIdx].ByteData);
+         SetLength(FArrays[ArrayIdx].ByteData, NewSize * FArrays[ArrayIdx].ElemWidth);
+         if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           if Preserve then
+           begin
+             if Length(FArrays[ArrayIdx].ByteData) > k then
+               FillChar(FArrays[ArrayIdx].ByteData[k], Length(FArrays[ArrayIdx].ByteData) - k, 0);
+           end
+           else
+             FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+       begin
          SetLength(FArrays[ArrayIdx].IntData, NewSize);
          if not Preserve then
            for k := 0 to NewSize - 1 do ArrSetIntAt(ArrayIdx, k, 0);
@@ -14234,7 +14380,21 @@ begin
     NewSize := NewSize * k;
   end;
   case FArrays[ArrayIdx].ElementType of
-    0: begin
+    0: if FArrays[ArrayIdx].ElemWidth > 0 then       // the packed bank - see RedimArray
+       begin
+         k := Length(FArrays[ArrayIdx].ByteData);
+         SetLength(FArrays[ArrayIdx].ByteData, NewSize * FArrays[ArrayIdx].ElemWidth);
+         if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           if Preserve then
+           begin
+             if Length(FArrays[ArrayIdx].ByteData) > k then
+               FillChar(FArrays[ArrayIdx].ByteData[k], Length(FArrays[ArrayIdx].ByteData) - k, 0);
+           end
+           else
+             FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+       begin
          SetLength(FArrays[ArrayIdx].IntData, NewSize);
          if not Preserve then for k := 0 to NewSize - 1 do ArrSetIntAt(ArrayIdx, k, 0);
        end;
@@ -14261,7 +14421,11 @@ begin
     1: Result := Pointer(A.FloatData) = Pointer(B.FloatData);
     2: Result := Pointer(A.StringData) = Pointer(B.StringData);
   else
-    Result := Pointer(A.IntData) = Pointer(B.IntData);
+    // ⛔ THE INT BANK OF A PACKED ARRAY IS ByteData. An array of a narrow type keeps IntData empty on
+    // purpose (that is what makes the compiled engines deopt), so comparing IntData here answered
+    // "nil = nil" - SHARED - for two arrays that share nothing at all. Guard m884.
+    if A.ElemWidth > 0 then Result := Pointer(A.ByteData) = Pointer(B.ByteData)
+    else Result := Pointer(A.IntData) = Pointer(B.IntData);
   end;
 end;
 
@@ -14274,7 +14438,8 @@ begin
     1: Result := Pointer(A.FloatData) = P;
     2: Result := Pointer(A.StringData) = P;
   else
-    Result := Pointer(A.IntData) = P;
+    if A.ElemWidth > 0 then Result := Pointer(A.ByteData) = P    // the packed bank - see ArrayDataShared
+    else Result := Pointer(A.IntData) = P;
   end;
 end;
 
@@ -14286,7 +14451,8 @@ begin
     1: Result := Pointer(A.FloatData);
     2: Result := Pointer(A.StringData);
   else
-    Result := Pointer(A.IntData);
+    if A.ElemWidth > 0 then Result := Pointer(A.ByteData)        // the packed bank - see ArrayDataShared
+    else Result := Pointer(A.IntData);
   end;
 end;
 
@@ -14320,6 +14486,15 @@ begin
   Dst.IntData     := Src.IntData;
   Dst.FloatData   := Src.FloatData;
   Dst.StringData  := Src.StringData;
+  // ⛔⛔ AND THE PACKED BANK, WITH THE TWO FIELDS THAT DESCRIBE IT. This family is written out field by
+  // field to avoid the RTTI walk, which means adding a field to TArrayStorage is a change HERE too and
+  // nothing says so - the trap this file records as "un elenco parallelo non ha un momento in cui e'
+  // COMPLETO". Omitting them aliased a narrow-typed array parameter to an EMPTY ByteData and the first
+  // element store took an access violation. CheckArrayStorageLayout is the check that makes forgetting
+  // impossible to ship.
+  Dst.ByteData    := Src.ByteData;
+  Dst.ElemWidth   := Src.ElemWidth;
+  Dst.ElemSigned  := Src.ElemSigned;
 end;
 
 procedure ReleaseArrayStorage(var A: TArrayStorage);
@@ -14331,6 +14506,7 @@ begin
   A.IntData     := nil;
   A.FloatData   := nil;
   A.StringData  := nil;
+  A.ByteData    := nil;   // the packed bank is managed like the other three
 end;
 
 procedure TBytecodeVM.NoteDescSlot(Slot: Integer);
@@ -14371,8 +14547,8 @@ procedure MoveArrayStorage(var Src, Dst: TArrayStorage);
 // purpose, and only when there is something to release.
 begin
   if (Pointer(Dst.IntData) <> nil) or (Pointer(Dst.FloatData) <> nil) or
-     (Pointer(Dst.StringData) <> nil) or (Pointer(Dst.Dimensions) <> nil) or
-     (Pointer(Dst.LowerBounds) <> nil) then
+     (Pointer(Dst.StringData) <> nil) or (Pointer(Dst.ByteData) <> nil) or
+     (Pointer(Dst.Dimensions) <> nil) or (Pointer(Dst.LowerBounds) <> nil) then
     ReleaseArrayStorage(Dst);   // Finalize(Dst) is the same thing through the RTTI - see above
   Move(Src, Dst, SizeOf(TArrayStorage));
   FillChar(Src, SizeOf(TArrayStorage), 0);
@@ -14390,6 +14566,9 @@ begin
   SetLength(A.IntData, 0);
   SetLength(A.FloatData, 0);
   SetLength(A.StringData, 0);
+  SetLength(A.ByteData, 0);
+  A.ElemWidth := 0;
+  A.ElemSigned := False;
 end;
 
 procedure TBytecodeVM.ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -14477,8 +14656,24 @@ begin
         for i := 0 to ArrInfo.DimCount - 1 do
           ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[i];
         FArrays[ArrayIdx].TotalSize := ProdDims;
+        // ⭐⭐ THE STORAGE FOLLOWS THE DECLARED WIDTH. An array of a narrow type is PACKED - one, two or
+        // four bytes per element, contiguously - which is what makes it a BLOCK OF BYTES the way
+        // FreeBASIC's is, so "Peek(ULong, @a(0))" reads four of them side by side. Guard m884.
+        // ⛔ IntData stays EMPTY for such an array, and that is deliberate rather than incidental: it
+        // is how the JIT/AOT descriptor comes out with a null pointer and a zero count, which is what
+        // takes the compiled engines out on their own (they deopt when the bounds test fails).
+        FArrays[ArrayIdx].ElemWidth := ArrInfo.ElemWidth;
+        FArrays[ArrayIdx].ElemSigned := ArrInfo.ElemSigned;
+        SetLength(FArrays[ArrayIdx].ByteData, 0);
         case ArrInfo.ElementType of
           srtInt:
+            if FArrays[ArrayIdx].ElemWidth > 0 then
+            begin
+              SetLength(FArrays[ArrayIdx].ByteData, ProdDims * FArrays[ArrayIdx].ElemWidth);
+              if ProdDims > 0 then
+                FillChar(FArrays[ArrayIdx].ByteData[0], ProdDims * FArrays[ArrayIdx].ElemWidth, 0);
+            end
+            else
             begin
               SetLength(FArrays[ArrayIdx].IntData, ProdDims);
               for i := 0 to ProdDims - 1 do ArrSetIntAt(ArrayIdx, i, 0);
@@ -14650,7 +14845,17 @@ begin
           // which is what numbers/infnan and numbers/limits use, is exact.
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+          // ⭐ A PACKED ARRAY IS CONTIGUOUS BYTES, so a read WIDER than one element spans the ones
+          // after it - which is what "Peek(ULong, @a(0))" over an array of UByte means, and what it
+          // answers in FreeBASIC. Immediate carries the read's own width (see the lowering). Guard m884.
+          if FArrays[ArrayIdx].ElemWidth > 0 then
+          begin
+            if PtrOffset >= FArrays[ArrayIdx].TotalSize then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            Ctx.IntRegs[Instr.Dest] := ReadPackedBytes(FArrays[ArrayIdx],
+                                         PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate);
+          end
+          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
             Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
           else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
             Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
@@ -14729,7 +14934,16 @@ begin
           // WRITE half needs it too, or "*Cast(ULongInt Ptr, @d) = bits" raises where the read works.
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+          // ⭐ A PACKED ARRAY IS CONTIGUOUS BYTES on the write side too: Immediate carries the width the
+          // store was written at, so "*Cast(ULong Ptr, @a(4)) = &h11223344" fills a(4)..a(7). Guard m884.
+          if FArrays[ArrayIdx].ElemWidth > 0 then
+          begin
+            if PtrOffset >= FArrays[ArrayIdx].TotalSize then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            WritePackedBytes(ArrayIdx, PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate,
+                             Ctx.IntRegs[Instr.Src2]);
+          end
+          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
             ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2])
           else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
             PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
@@ -14809,7 +15023,7 @@ begin
         if (PtrAddr and RAWPTR_TAG) <> 0 then
           Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)   // a real raw address: it carries the WIDTH
         else
-          Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr);
+          Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr, Instr.Immediate);
       end;
     24: // bcRawLoadFloat
       begin
@@ -16403,7 +16617,8 @@ begin
         end
         else
         begin
-          PalArr := @FArrays[Ctx.ArrMap[Instr.Src1]];
+          PalIdx := Ctx.ArrMap[Instr.Src1];    // the PHYSICAL slot - ArrSetIntAt needs the index
+          PalArr := @FArrays[PalIdx];
           PalStart := Ctx.IntRegs[Instr.Src2];       // start element ("@p(5)" over "p(5 To 260)" = 0)
         end;
         if PalStart < 0 then PalStart := 0;
@@ -16413,9 +16628,12 @@ begin
           if (Instr.Immediate and 1) <> 0 then
           begin
             PalColor := UInt32(FGraphics.GetPaletteColor(TPaletteIndex(PalK)));
-            PalArr^.IntData[PalStart + PalK] := Int64(((PalColor and $FF) shr 2)                        // red
+            // ⛔ Through the ACCESSOR, not IntData: "Dim p(0 To 255) As ULong" is a PACKED array now,
+            // its IntData is empty, and writing there took an access violation. The read half a few
+            // lines below already asked ArrGetInt - one of the two was updated and the other was not.
+            ArrSetIntAt(PalIdx, PalStart + PalK, Int64(((PalColor and $FF) shr 2)            // red
                                   or ((((PalColor shr 8) and $FF) shr 2) shl 8)              // green
-                                  or ((((PalColor shr 16) and $FF) shr 2) shl 16));          // blue
+                                  or ((((PalColor shr 16) and $FF) shr 2) shl 16)));         // blue
           end
           else
           begin
@@ -18551,7 +18769,7 @@ begin
                     2: BinI := Int64(SmallInt(Word(BinI)));
                     4: BinI := Int64(LongInt(LongWord(BinI)));
                   end;
-                  BinArr^.IntData[k] := BinI;
+                  ArrSetIntAt(Ctx.ArrMap[Instr.Src2], k, BinI);   // the accessor: the array may be PACKED
                 end;
             end;
           end;

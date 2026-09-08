@@ -1050,6 +1050,8 @@ type
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;
+    procedure NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
+                                   const ArrElemTypeName: string);  // packed storage, guard m884
     function TypeNameIdentCode(const TypeName: string): Integer;   // ...its overload-IDENTITY twin (DIVERGENZE 8)
     function DeclaredIdentCode(Node: TASTNode): Integer;           // the same, derived from an ARGUMENT        // B1.5 phase 2: type -> narrow code
     function UDTFieldIdentCode(UDTIdx: Integer; const FieldName: string): Integer;  // ...and from a FIELD
@@ -3767,7 +3769,13 @@ begin
         srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       else
-        EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // ⭐ ...AND THE READ CARRIES ITS OWN WIDTH. Over a PACKED array the elements are contiguous
+        // bytes, so "*Cast(ULong Ptr, @a(0))" must take FOUR of them side by side - which the VM can
+        // only do if it is told how wide the read is. Src3 was free here; ApplyNarrowCode below still
+        // narrows the RESULT, which is a different question (that one is about the value, this one is
+        // about how many bytes to fetch). Guard m884.
+        EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(DerefedType(Node.GetChild(0)))));
       end;
       // ⭐ A VALUE READ THROUGH A POINTER HAS THE POINTER'S DECLARED POINTEE TYPE. A managed address
       // reads its slot WHOLE - 64 bits - so a narrow or differently-signed pointee saw the wrong
@@ -8162,6 +8170,14 @@ begin
           if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
             // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (FConstStrBytes).
             Result := MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8))
+          // ⛔ SIZEOF OF AN ARRAY IS THE SIZE OF ONE ELEMENT, which is FreeBASIC's rule and not C's:
+          // "Dim As UByte a(0 To 15) : Print SizeOf(a)" answers 1 there, and ARRAYSIZE(a) is the whole
+          // block. This ladder had no rung for an array name at all, so it fell to the last line, where
+          // the name is not a type either, and answered the unknown-type default 8 - the same wrong
+          // number for a Byte array and a Double one. ArrayElemSizeBytes is the registry that knows
+          // (it is what ARRAYSIZE multiplies by), so the two answers now read ONE constant. Guard m884.
+          else if (FindUDT(ArrName2) < 0) and (ArrayIndexOf(ArrName2) >= 0) then
+            Result := MakeSSAConstInt(ArrayElemSizeBytes(ArrName2))
           // ⛔ THE POINTER QUESTION UNDER THE BLOCK'S OWN KEY. FPointerVars answers by BARE NAME and
           // this rung short-circuits the whole ladder, so ONE "Dim x As Any Ptr" in a sibling Scope
           // made SizeOf(x) answer 8 in every other scope that declared x - twelve of them, in fbc's
@@ -10378,7 +10394,12 @@ begin
       end;
   else
     ExprValue := EnsureIntRegister(ExprValue);
-    EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+    // ⭐ ...AND THE WRITE CARRIES ITS OWN WIDTH, the twin of the read at the "*p" rung. Over a PACKED
+    // array "*Cast(ULong Ptr, @a(4)) = &h11223344" has to lay FOUR bytes side by side; without the
+    // width the store wrote one element and the three after it kept their old value, which is a lost
+    // write, not a wrong one. Guard m884.
+    EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue,
+                    MakeSSAConstInt(RawTypeCodeOfPointee(DerefedType(VarNode.GetChild(0)))));
   end;
 end;
 
@@ -10602,7 +10623,10 @@ begin
         end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+      // The width of the write - see the "*p" rung above. "p[i] = v" through a wide pointer over a
+      // packed array writes as many bytes as the pointee is wide.
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue,
+                      MakeSSAConstInt(RawTypeCodeOfPointee(PointeeTypeOf(VarName))));
     end;
     Exit;
   end;
@@ -13245,6 +13269,15 @@ begin
       SetLength(Dimensions, 1);
       Dimensions[0] := 0;                              // 0 => runtime-sized; the ub register below holds -1
       ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
+      // ⭐⭐ THE ELEMENT WIDTH AS *STORAGE*, which is a different question from "wrap the store".
+      // B1.5 remembers the width so a store WRAPS; this says how wide the element IS, so an array of a
+      // narrow type is a BLOCK OF BYTES the way FreeBASIC's is - which is what makes
+      // "Peek(ULong, @a(0))" read four bytes side by side instead of one (guard m884).
+      // ⛔ HERE and not at the width table above, because the SLOT does not exist until DeclareArrayScoped
+      // has run: setting it earlier wrote to an array index that had not been handed out yet.
+      // ⚠️ INT bank only: a SINGLE array (code 7) is float-banked and keeps its own storage, and an
+      // unsigned 64-bit one (code 8) is already eight bytes wide.
+      NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
       NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -13439,6 +13472,13 @@ begin
 
     // Declare array in SSA program
     ArrayIdx := DeclareArrayScoped(DeclArrName, ElementType, Dimensions, ArrayDeclNode);
+    // ⛔ AND THE PACKED-STORAGE DECISION BELONGS TO *EVERY* DECLARATION, not to the one whose comment
+    // happens to explain it. It was written once, beside "Dim a()" - the empty variable-length form -
+    // and "Dim As UByte a(0 To 15)", which is the shape guard m884 is written in and the shape every
+    // real program uses, comes through HERE and got ElemWidth 0. The symptom was the whole feature
+    // reading as inert: the SSA carried the read's width, the VM arm knew how to use it, and the array
+    // it asked was never marked. Two call sites, one funnel - see NoteArrayElemStorage.
+    NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
     // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
     // name never declared, which is a dynamic array however it is written.
     // ⛔ ...OR ONE OF THE SUBSCRIPTS IS "Any", WHICH *IS* THE WORD FOR DYNAMIC. "Dim b(Any, Any)" reaches
@@ -46196,6 +46236,30 @@ function TSSAGenerator.ParamArrayMangle(const ProcName, ParamName: string): stri
 // whole point: a SUB's "a() As T" parameter must NOT share a slot with a module array also named "a".
 begin
   Result := '@P@' + ProcName + '@' + ParamName;
+end;
+
+// ⭐⭐ THE ELEMENT WIDTH AS *STORAGE*, which is a different question from "wrap the store". B1.5
+// remembers a width so an element store WRAPS; this says how wide the element IS, so an array of a
+// narrow type is a BLOCK OF BYTES the way FreeBASIC's is - which is what makes "Peek(ULong, @a(0))"
+// read four of them side by side instead of one (guard m884).
+// ⛔ Called AFTER DeclareArrayScoped and from every declaration path: the slot does not exist until
+// the array has been handed out, and a path that forgets to call this silently keeps the wide layout.
+// ⚠️ INT bank only: a SINGLE array (code 7) is float-banked and keeps its own storage, and an
+// unsigned 64-bit one (code 8) is already eight bytes wide.
+procedure TSSAGenerator.NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
+                                             const ArrElemTypeName: string);
+begin
+  if (ArrayIdx < 0) or (ET <> srtInt) or (ArrElemTypeName = '') then Exit;
+  case TypeNameWidthCode(ArrElemTypeName) of
+    1: FProgram.SetArrayElemWidth(ArrayIdx, 1, True);
+    2: FProgram.SetArrayElemWidth(ArrayIdx, 1, False);
+    3: FProgram.SetArrayElemWidth(ArrayIdx, 2, True);
+    4: FProgram.SetArrayElemWidth(ArrayIdx, 2, False);
+    5: FProgram.SetArrayElemWidth(ArrayIdx, 4, True);
+    6: FProgram.SetArrayElemWidth(ArrayIdx, 4, False);
+  else
+    FProgram.SetArrayElemWidth(ArrayIdx, 0, False);
+  end;
 end;
 
 function TSSAGenerator.DeclareArrayScoped(const AName: string; ET: TSSARegisterType;

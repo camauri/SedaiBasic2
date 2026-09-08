@@ -30,7 +30,7 @@ interface
 uses
   // Only for TLimbs, the limb vector a BigInt value holds. SedaiBigInt depends on
   // nothing of ours, so this cannot close a cycle.
-  SedaiBigInt;
+  SysUtils, SedaiBigInt;
 
 { TExecutionContext — the per-thread-of-control execution state of the bytecode VM.
 
@@ -129,6 +129,7 @@ type
     ElemSigned: Boolean;          // a narrow element sign-extends on read when its type is signed
     ByteData: array of Byte;      // populated only when ElemWidth > 0
   end;
+
 
   { One suspended invocation's copy of a proc-local array. The storage record is copied WHOLE, which
     is O(1): its dynamic fields share by reference, exactly as TArrayBindEntry.Saved already relies on. }
@@ -445,6 +446,41 @@ type
     AotCallDepth: Integer;
   end;
 
+
+const
+  { ⛔⛔⛔ ADDING A FIELD TO TArrayStorage IS A CHANGE IN NINE OTHER PLACES, AND NOTHING SAYS SO.
+    The record is copied, aliased, released, cleared, resized and compared by routines that spell every
+    field out BY HAND - deliberately, because a whole-record assignment walks the RTTI and this is the
+    hot path of every array parameter (~177 ns per bind/unbind pair, measured). A field added to the
+    record and not to those lists compiles, runs, and is wrong in silence: ByteData was added on 8 Sep
+    2026 and an array of UByte passed to a SUB aliased an EMPTY packed bank, so the first element store
+    took an access violation.
+    ⇒ This constant is the tripwire. It is checked at VM start-up (CheckArrayStorageLayout), so the
+    forgetting cannot SHIP: the next person to add a field gets a message naming the routines to visit
+    rather than an access violation three layers away. Update it ONLY together with them.
+    The list, in SedaiBytecodeVM.pas: ArrayDataShared - ArrayDataStillAt - ArrayBankData -
+    AliasArrayStorage - ReleaseArrayStorage - MoveArrayStorage - ClearArrayStorage - EraseArray -
+    RedimArray - RedimArrayN, plus the two loops that clear FArrays wholesale. }
+  ARRAY_STORAGE_FIELD_BYTES = 72;
+
+procedure CheckArrayStorageLayout;
+
 implementation
+
+procedure CheckArrayStorageLayout;
+// The tripwire described at ARRAY_STORAGE_FIELD_BYTES. Cheap enough to run unconditionally at start-up:
+// one comparison, once per process.
+begin
+  if SizeOf(TArrayStorage) = ARRAY_STORAGE_FIELD_BYTES then Exit;
+  // ⛔ Written to stderr and HALTED, not raised: this fires before anything is constructed, and an
+  // exception out of a constructor unwinds through a half-built object - the message is the point.
+  WriteLn(ErrOutput, Format(
+    'TArrayStorage is %d bytes, expected %d: a field was added or removed. The routines that spell its ' +
+    'fields out BY HAND must be updated too (ArrayDataShared, ArrayDataStillAt, ArrayBankData, ' +
+    'AliasArrayStorage, ReleaseArrayStorage, MoveArrayStorage, ClearArrayStorage, EraseArray, ' +
+    'RedimArray, RedimArrayN), then set ARRAY_STORAGE_FIELD_BYTES to %d.',
+    [SizeOf(TArrayStorage), ARRAY_STORAGE_FIELD_BYTES, SizeOf(TArrayStorage)]));
+  Halt(2);
+end;
 
 end.

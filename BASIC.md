@@ -275,10 +275,19 @@ FreeBASIC. A pointer obtained with `@` on a variable or an array element is a pa
 unaffected — `*p`, `p[i]`, `p2 - p1` and `For p = @a(0) To @a(n)` all answer what FreeBASIC answers,
 because both sides of those speak the same unit.
 
-**Reinterpreting memory across element boundaries is not supported.** An array here is a vector of
-typed elements, not a flat byte image, so a pointer cast that lands part-way into an element — for
-example advancing a `Long Ptr` by one `Short` and then reading a `Long` — has no memory to read. The
-same limit applies to reading a UDT as raw bytes.
+**An array of a narrow type IS a flat byte image** (9 September 2026). `Dim As UByte a(0 To 15)` stores
+its elements one byte apart, a `Short` array two and a `Long` array four — contiguously, exactly as
+FreeBASIC does — so `Peek(ULong, @a(0))` and `*Cast(ULong Ptr, @a(0))` read four of them side by side,
+writing through a `ULong Ptr` lays four bytes side by side, `Clear` and `FB_MEMCOPY` step one byte per
+element, and `SizeOf(a)` answers the size of ONE element (1 for a `UByte` array), which is FreeBASIC's
+rule rather than C's. An array of a 64-bit type (`Integer`, `LongInt`, any pointer, a record handle)
+still holds one element per eight bytes.
+
+**Reinterpreting memory across element boundaries is still not supported for the WIDE ones.** Where the
+elements are eight bytes the array is a vector of typed cells rather than a byte image, so a pointer
+cast that lands part-way into an element — advancing a `Long Ptr` by one `Short` over an `Integer`
+array and then reading a `Long` — has no memory to read. The same limit applies to reading a UDT as
+raw bytes.
   ⭐ **Punning a `Single` is supported** (6 September 2026): `*Cast(ULong Ptr, @s)` answers its IEEE-754
   image, `*Cast(ULong Ptr, @s) = 1065353216` writes it back, and a `UByte Ptr` walks its four bytes —
   a module-level, `Shared`, local or UDT-field one alike. The value itself was never a double

@@ -324,6 +324,16 @@ begin
       if ArrInfo.IsPrivate then RegType := RegType or 1;
       if ArrInfo.MultiDimEver then RegType := RegType or 2;
       if ArrInfo.IsDynamicShape then RegType := RegType or 4;
+      // ⭐ ...and the ELEMENT WIDTH, in the same byte: bits 3-4 hold 0/1/2/4 as 0/1/2/3, bit 5 the
+      // sign. ⛔ NO NEW FILE VERSION for this: the flags byte has been there since v4 and used three of
+      // its eight bits. A version bump costs every reader a branch and every older file a migration;
+      // three spare bits cost nothing, and a v4 file reads back width 0, which is what it meant.
+      case ArrInfo.ElemWidth of
+        1: RegType := RegType or (1 shl 3);
+        2: RegType := RegType or (2 shl 3);
+        4: RegType := RegType or (3 shl 3);
+      end;
+      if ArrInfo.ElemSigned then RegType := RegType or 32;
       Stream.WriteBuffer(RegType, SizeOf(RegType));
     except
       on E: Exception do
@@ -499,6 +509,18 @@ begin
         ArrInfo.IsPrivate := (RegType and 1) <> 0;
         ArrInfo.MultiDimEver := (RegType and 2) <> 0;
         ArrInfo.IsDynamicShape := (RegType and 4) <> 0;
+        // ⛔ ...AND THE WIDTH, READ IN THE SAME CHANGE THAT WROTE IT. A bit added to the writer is
+        // added to the reader, never one alone - DIVERGENZE 172 is the entry that cost this rule, and
+        // basc_sweep is the net that sees it. A v4 file has zeroes here and reads back width 0, which
+        // is what it meant.
+        case (RegType shr 3) and 3 of
+          1: ArrInfo.ElemWidth := 1;
+          2: ArrInfo.ElemWidth := 2;
+          3: ArrInfo.ElemWidth := 4;
+        else
+          ArrInfo.ElemWidth := 0;
+        end;
+        ArrInfo.ElemSigned := (RegType and 32) <> 0;
       end;
       Result.AddArrayInfo(ArrInfo);
     end;

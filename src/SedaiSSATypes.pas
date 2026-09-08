@@ -856,6 +856,7 @@ type
     procedure SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
+    procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
     function GetArray(Index: Integer): TSSAArrayInfo;
@@ -1702,6 +1703,16 @@ begin
   SetLength(FArrays[ArrayIdx].LowerBounds, Length(LowerBounds));
   for i := 0 to High(LowerBounds) do
     FArrays[ArrayIdx].LowerBounds[i] := LowerBounds[i];
+end;
+
+procedure TSSAProgram.SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);
+// ⭐ The DECLARED width of one element, in bytes: 1, 2 or 4 for a narrow type, 0 for everything else
+// (which keeps the eight-byte storage every array had). Set at the declaration, because that is the
+// only place the declared TYPE is known - see TSSAArrayInfo.ElemWidth.
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
+  FArrays[ArrayIdx].ElemWidth := Byte(Width);
+  FArrays[ArrayIdx].ElemSigned := Signed;
 end;
 
 procedure TSSAProgram.SetArrayMultiDim(ArrayIdx: Integer);
