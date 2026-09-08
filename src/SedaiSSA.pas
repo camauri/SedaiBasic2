@@ -622,6 +622,7 @@ type
     procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
     function IsDeclaredName(const VarName: string): Boolean;
     function BareCallableFunction(const NameU: string): Boolean;  // a FUNCTION invocable with no arguments
+    function DeclaredReturnBank(const NameU: string; out Bank: TSSARegisterType): Boolean;
     function ProcReturnPtrUDT(const NameU: string): string;       // pointee UDT of a "FUNCTION f(...) AS T PTR", else ''
     function ManagedPtrArithUDT(Node: TASTNode): string;          // pointee UDT of "p", "(p)", "p±n", "n+p" for a managed UDT pointer
     function ProcHasParamCount(const NameU: string; N: Integer): Boolean;
@@ -646,6 +647,7 @@ type
     // so it can be asked wherever a name has failed to resolve.
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
                             out ResultVal: TSSAValue): Boolean;
+    procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);   // raw-ness crosses the call here
     function RawPtrMarkedHere(const NameU: string): Boolean;       // ...is it raw in THIS scope? (DIVERGENZE 96)
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -871,7 +873,8 @@ type
     procedure CollectFixedStrNames(Node: TASTNode);   // fills FFixedStrNames
     procedure CollectAddressTakenVars(Node: TASTNode);
     // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
-    procedure CheckTypeNameShadowedByVar(Node: TASTNode);
+    function DimPrecedesProcedure(const NameU: string; DimNode: TASTNode): Boolean;
+    procedure CheckTypeNameShadowedByVar(Node: TASTNode; InProc: Boolean = False);
     function ParamIsAddressCarrier(ProcNode, ParamNode: TASTNode): Boolean;  // THE one rule: does this param carry the caller's ADDRESS?
     function ByrefRetDeclHasByrefParam(Node: TASTNode): Boolean;            // ...does this declaration have such a parameter?
     procedure GatherByrefRetFuncNames(Node: TASTNode; Names: TStringList);   // byref-ret funcs with a BYREF param
@@ -2495,6 +2498,42 @@ begin
     Result := ManagedPtrArithUDT(Node.GetChild(0));
     if (Result = '') and (Node.Token.TokenType = ttOpAdd) then Result := ManagedPtrArithUDT(Node.GetChild(1));
   end;
+end;
+
+function TSSAGenerator.DeclaredReturnBank(const NameU: string; out Bank: TSSARegisterType): Boolean;
+// The bank a FUNCTION's result travels in, taken from ITS OWN DECLARATION rather than from the name.
+//
+// ⛔⛔ WHY IT HAD TO BE ASKED SEPARATELY. The caller used GetVariableType(Name), which reads the flat
+// name registry - and a VARIABLE of the same name declared anywhere in the program answers there. In
+// retrogra's BASIC.bas a "Dim As UByte c" inside an included procedure made "Function C() As String"
+// return in the INTEGER bank: "Print C(...)" printed 0 instead of the text, and every engine agreed,
+// because the bytecode was already wrong. That is the shape no differential between engines can see.
+// ⭐ It also explains why the same program was REFUSED before: the refusal existed precisely to stop
+// that silent wrong answer. Reading the declaration removes the reason for the refusal instead of
+// removing the refusal - which is what "neither a rejection nor a wrong answer" requires.
+// ⚠️ Only when the declaration actually names a type: a suffix-typed or DEFtype'd function keeps the
+// old route, which is where that information lives.
+var
+  Decl, NameNode: TASTNode;
+  T: string;
+begin
+  Result := False;
+  Bank := srtInt;
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 1) then Exit;
+  if UpperCase(VarToStr(Decl.Value)) <> kFUNCTION then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.ChildCount < 1) or
+     (NameNode.GetChild(0).NodeType <> antIdentifier) then Exit;
+  T := UpperCase(Trim(VarToStr(NameNode.GetChild(0).Value)));
+  if T = '' then Exit;
+  // A pointer, a UDT and every integer width travel in the int bank; only these two do not.
+  if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Bank := srtInt
+  else if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Bank := srtString
+  else if (T = 'DOUBLE') or (T = 'SINGLE') then Bank := srtFloat
+  else if FindUDT(T) >= 0 then Bank := srtInt
+  else Bank := TypeNameToBank(T, NameU);
+  Result := True;
 end;
 
 function TSSAGenerator.ProcReturnPtrUDT(const NameU: string): string;
@@ -38099,7 +38138,24 @@ begin
     MarkByrefRetCallArgs(Node.GetChild(i), Names, Dict);
 end;
 
-procedure TSSAGenerator.CheckTypeNameShadowedByVar(Node: TASTNode);
+function TSSAGenerator.DimPrecedesProcedure(const NameU: string; DimNode: TASTNode): Boolean;
+// True when this DIM stands ABOVE the declaration of the procedure of the same name - the position fbc
+// decides on, because it compiles in one pass and a name becomes a procedure only from its own line.
+// 🕳️ KEPT, UNUSED, ON PURPOSE: it is the measured half of a fix whose other half is missing (see the
+// note at the refusal). Deleting it would throw away a deck of five variants asked of the oracle.
+// ⚠️ Lines are the PREPROCESSED file's, so an included declaration and a main-file one are on the same
+// scale, which is what makes them comparable at all.
+var
+  Decl: TASTNode;
+begin
+  Result := False;
+  if not Assigned(DimNode) or not Assigned(DimNode.Token) then Exit;
+  if not FProcDecls.TryGetValue(NameU, Decl) then Exit;
+  if not Assigned(Decl) or not Assigned(Decl.Token) then Exit;
+  Result := DimNode.Token.Line < Decl.Token.Line;
+end;
+
+procedure TSSAGenerator.CheckTypeNameShadowedByVar(Node: TASTNode; InProc: Boolean = False);
 // "Dim As V v" where V is a declared type. BASIC is case-insensitive, so the variable and the type are
 // the SAME NAME, and from there on "V" means two things: fbc reports "Duplicated definition" — but only
 // when the type declares a member procedure, because that is what turns the type name into a SCOPE
@@ -38158,14 +38214,39 @@ begin
       // to read, so the same widening cannot change what a program answers.
       // ⇒ A FUNCTION keeps the diagnostic: we support LESS than fbc here, on purpose and in writing.
       //   Lifting it needs positional resolution of a module-level name, which is a different job.
+      // ⛔⛔ ...AND fbc IS POSITIONAL ABOUT A LOCAL ONE, which the note above got wrong by generalising.
+      // It says the rule was measured "at module level and inside another procedure"; a deck of five
+      // variants asked the oracle again on 8 Sep 2026 and it does NOT agree:
+      //   Dim local in ANOTHER proc, the FUNCTION below it   -> fbc COMPILES (we refused)
+      //   ...the same inside a Scope                          -> fbc COMPILES (we refused)
+      //   Dim Shared at module level                          -> fbc refuses  (as we do)
+      //   the FUNCTION above, the Dim local below it          -> fbc refuses  (as we do)
+      //   Dim local inside the function of that very name     -> fbc refuses  (as we do)
+      // ⇒ The rule is not "a local one counts too": it is that fbc compiles in ONE PASS, so a name is
+      // only a procedure from the line its declaration appears on. A local Dim ABOVE that line meets a
+      // name that is not a procedure yet, and is legal. retrogra's BASIC.bas is exactly that shape - a
+      // "Dim As UByte c" in an included file, and "Function C()" further down - and it is the only
+      // thing that stopped it compiling. A note that excuses (or accuses) a whole FAMILY is right about
+      // the member it was written for and wrong about the others.
+      // 🕳️ ...AND THE REFUSAL STAYS, THOUGH IT IS NOT fbc's RULE. Lifting it was tried on 8 Sep 2026 and
+      // RETRACTED the same hour, because it moved the problem instead of closing it: with the refusal
+      // gone the two accepted variants COMPILE AND ANSWER WRONG - "Print C("a")" prints 0, because the
+      // call resolves to the VARIABLE. The name was already bound at module depth by the local Dim
+      // (SCOPEDIAG: "resolve C -> R15 depth=0"), which is the flat-registry family again: a proc-local
+      // declaration must not create a module-level binding at all.
+      // ⇒ Closing this means fixing THAT, not relaxing the check. A visible refusal beats a silent
+      // wrong answer, which is what the note above says in its own words. retrogra's BASIC.bas waits
+      // on it; demo.bas and FontEdit.bas do not.
       if (FProcedureNames.IndexOf(NameU) >= 0) and
+         (not (InProc and DimPrecedesProcedure(NameU, NameNode))) and
          ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(NameU) < 0) or
           UndefinedNameIsFunction(NameU)) then
         raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a SUB or ' +
                                   'FUNCTION, and BASIC does not tell the two apart', [NameU]);
     end;
   for i := 0 to Node.ChildCount - 1 do
-    CheckTypeNameShadowedByVar(Node.GetChild(i));
+    CheckTypeNameShadowedByVar(Node.GetChild(i),
+                               InProc or (Node.GetChild(i).NodeType = antProcedureDecl));
 end;
 
 function TSSAGenerator.UndefinedNameIsFunction(const NameU: string): Boolean;
@@ -39038,7 +39119,22 @@ begin
     idx := FCurrentProcPtrLocals.IndexOfName(UpperCase(PtrName));
     if idx >= 0 then Exit(FCurrentProcPtrLocals.ValueFromIndex[idx]);
   end;
-  Result := FPointerVars.Values[UpperCase(PtrName)];
+  // ⛔⛔ ...AND THE FLAT ENTRY DOES NOT ANSWER FOR A NAME THIS PROCEDURE DECLARES ITSELF. Same veto the
+  // raw-pointer reader already applies, and for the same reason - the seventh face of the flat-registry
+  // family. retrogra's locale.bi has "Dim As String fbuffer" inside LOCALELOADTABLE while an OVERLOAD of
+  // DFLOAD elsewhere declares "ByRef fbuffer As UByte Ptr": the flat map said POINTER for both, and
+  // "Right(fbuffer, 1)" on the STRING was refused with "FBUFFER is a POINTER".
+  // ⭐ RAWPTRDIAG=1 had been saying so all along - "flat says raw, no scope does" - so the veto was
+  // right and this reader was not asking it. A fact and a reader of it, disagreeing.
+  // ⚠️ AND IT VETOES THE FLAT MAP ONLY - not the PARAMETER fallback below it. Written as an early Exit
+  // it also silenced ParamPointeeType, and a raw pointer passed INTO a SUB lost its pointee again:
+  // p[i] scaled by 1 instead of SizeOf(pointee) (guard bug_rawptr_param, which is exactly the case that
+  // note was written for). A veto aimed at one registry must not close the ladder.
+  if FInProcedure and (FCurrentProcDeclNames <> nil) and
+     (FCurrentProcDeclNames.IndexOf(UpperCase(PtrName)) >= 0) then
+    Result := ''
+  else
+    Result := FPointerVars.Values[UpperCase(PtrName)];
   if Result = '' then Result := ParamPointeeType(PtrName);
 end;
 
@@ -42536,7 +42632,11 @@ begin
       IsFunc := UpperCase(VarToStr(Decl.Value)) = kFUNCTION;
     if IsFunc then
     begin
-      FuncRetType := GetVariableType(Name);
+      // ⭐ THE DECLARATION FIRST, the name registry only as a fallback. See DeclaredReturnBank: a
+      // variable of the same name anywhere in the program used to decide this, and a String-returning
+      // function then returned in the integer bank - silently.
+      if not DeclaredReturnBank(UpperCase(Name), FuncRetType) then
+        FuncRetType := GetVariableType(Name);
       Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
       EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
     end
@@ -45754,6 +45854,29 @@ begin
   if not FInDispatcher then EmitSharedSyncIn;
 end;
 
+procedure TSSAGenerator.CanonicaliseForeignDecls;
+// Rewrite every foreign declaration with its type names resolved through the alias table. The PTR
+// suffixes ride along - CanonicalType keeps them - so "zip_t ptr" stays a pointer whatever zip_t is.
+var
+  i, k: Integer;
+  D: TForeignDecl;
+  Line, Params: string;
+begin
+  for i := 0 to FProgram.ForeignDeclCount - 1 do
+  begin
+    if not ParseForeignDecl(FProgram.GetForeignDecl(i), D) then Continue;
+    Params := '';
+    for k := 0 to High(D.ParamTypeNames) do
+    begin
+      if Params <> '' then Params := Params + ',';
+      Params := Params + CanonicalType(D.ParamTypeNames[k]);
+    end;
+    Line := D.Name + '|' + D.Symbol + '|' + D.LibName + '|';
+    if D.RetTypeName <> '' then Line := Line + CanonicalType(D.RetTypeName);
+    FProgram.SetForeignDecl(i, Line + '|' + Params);
+  end;
+end;
+
 function TSSAGenerator.TryForeignCall(const NameU: string; ArgListNode: TASTNode;
   out ResultVal: TSSAValue): Boolean;
 // Lower a call to a C function the program declared with "Declare ... Alias ... [Lib ...]".
@@ -48144,6 +48267,14 @@ begin
   FEnumQualVals.Clear;
   CollectEnumNames(AST);
   RegisterUDTs(AST);
+  // ⭐ NOW the foreign declarations can be resolved through the TYPE ALIASES, and this is the only
+  // moment when both exist: the declarations were read off the program node before anything was
+  // lowered, and the aliases have just been registered. A C binding is written almost entirely in
+  // typedefs - zip.bi declares "zip_flags_t" as an alias of an alias of "ulong" - so without this
+  // every parameter of it is an unknown type.
+  // ⛔ The table is REWRITTEN, not resolved at each use, because it TRAVELS: what reaches the VM (and
+  // the .basc) must already be in types the runtime can classify, since the runtime has no aliases.
+  CanonicaliseForeignDecls;
   CheckOverrideAnnotations;   // MODERN: OVERRIDE/FINAL, once every TYPE is known
   // These must be cleared BEFORE RegisterRecordVars: that pre-pass records the print-kind of unsigned
   // 64-bit parameters and FUNCTION return types here (so a call result / a param in a body is seen as

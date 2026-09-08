@@ -45,6 +45,7 @@ var
   // would need the directive's line to survive macro expansion, which it does not.
   GPPUndefNames: TStringList = nil;
 
+
   // ⭐ THE LIBRARIES THE PROGRAM NAMED with "#inclib". Until the FFI existed this directive was
   // "accepted and ignored" - true while there was no link step and nothing could call out of the
   // process. It is the only place a program says WHICH shared object its foreign DECLAREs live in
@@ -56,6 +57,9 @@ var
   // directory only if it is given one.
   GPPIncLibs: TStringList = nil;
   GPPLibPaths: TStringList = nil;
+  // Where to look for an #include that is not beside its includer. See AddIncludeSearchPath.
+  GPPIncludePaths: TStringList = nil;
+  GPPFbIncludeTried: Boolean = False;
 
   // ⭐⭐ THE PREPROCESSOR'S OWN SYMBOL TABLE, and it exists because fbc's preprocessor IS the compiler
   // (DIVERGENZE 23). "#if TypeOf(s) = String" asks what type a NAME has, and the note that used to
@@ -110,9 +114,112 @@ function DetectQBLang(const Src: string): Boolean;
 function DetectNonFbLang(const Src: string): Boolean;
 function SourceDeclaresNonFbDialect: Boolean;
 
+{ ⛔⛔ EVERY TABLE BELOW IS PER-PROGRAM STATE HELD IN A UNIT GLOBAL, AND NOTHING USED TO CLEAR IT.
+  That was invisible while a process compiled exactly one program, which is every use this compiler has
+  had. It stops being invisible the moment a WORKER outlives one request - the PHP-FPM model chosen on
+  8 Sep 2026 - because the second program then inherits the first: a "#inclib" from one file names a
+  library for the next, a "#undef" retires a name in a file that never asked, and the preprocessor's
+  symbol table answers questions about declarations that belong to another program.
+  ⇒ ResetPreprocessorState clears them, and TSedaiRunner calls it at the start of every compilation.
+  ⚠️ GTargetIsWasm is deliberately NOT cleared: it is CONFIGURATION, set by the front end from the
+  command line, and it outlives any one program on purpose. Telling the two apart is the whole content
+  of this procedure - a reset that clears too much is as wrong as one that clears too little. }
+procedure ResetPreprocessorState;
+
+{ ⭐ WHERE AN #include IS LOOKED FOR when it is not beside the file that asked for it.
+  Until 8 Sep 2026 there was no search path at all: a header that was not in the including file's own
+  directory was silently dropped (or emulated by name, for the two we implement ourselves). That is
+  right for a self-contained program and wrong for one written against FreeBASIC's own headers -
+  retrogra's datafolder.bi includes "zip.bi", which lives in fbc's include/freebasic, and without it
+  the 103 declarations of the libzip binding simply were not there.
+
+  Order: the path as written · the including file's directory · these paths, in the order added · and
+  only then the emulation.
+  ⛔ THE EMULATION STILL WINS over anything found on disk, deliberately: "fbgfx.bi" and
+  "fbc-int/symbol.bi" are implemented HERE on purpose, and reading fbc's versions instead would replace
+  a decision with an accident. }
+procedure AddIncludeSearchPath(const APath: string);
+function IncludeSearchPathCount: Integer;
+
 implementation
 
-uses SedaiLexerTypes;   // cVirtualEOL: the separator a multi-line #macro body is joined with
+uses
+  SedaiLexerTypes,    // cVirtualEOL: the separator a multi-line #macro body is joined with
+  SedaiConfig;        // where things are: sedai.conf, the environment, the command line
+
+function IsEmulatedHeaderName(const FileName: string): Boolean;
+// ⛔ The list is the one RegisterEmulatedHeader actually answers to, and it is short on purpose: these
+// two are implemented HERE, and finding fbc's copies on disk must not silently replace them.
+var
+  Base: string;
+begin
+  Base := LowerCase(ExtractFileName(FileName));
+  Result := (Base = 'fbgfx.bi') or
+            ((Base = 'symbol.bi') and (Pos('fbc-int', LowerCase(FileName)) > 0));
+end;
+
+procedure DiscoverFbIncludeDir;
+// The search path, assembled from every place that is allowed to say where things are - and NONE of
+// them is a path written into this file (owner, 8 Sep 2026: no hard-coded paths).
+//   · "include = ..." from sedai.conf / SEDAI_INCLUDE, in resolution order   -> used as given
+//   · "fbc = ..." from sedai.conf / SEDAI_FBC, else fbc found on the PATH    -> <fbc>/../include/freebasic
+// ⚠️ Finding FreeBASIC is NOT a dependency on it: it adds a directory when one exists. A program that
+// includes "zip.bi" is a program that asked for FreeBASIC's binding to libzip - the user's choice, and
+// refusing to look would make it fail for a reason we invented.
+// ⛔ Asked ONCE per process: a PATH walk per #include would be paid on every header of every build.
+var
+  Fbc, Dir, Cand: string;
+  PathList, Cfg: TStringList;
+  i: Integer;
+begin
+  if GPPFbIncludeTried then Exit;
+  GPPFbIncludeTried := True;
+  Cfg := ConfigList('INCLUDE');
+  for i := 0 to Cfg.Count - 1 do AddIncludeSearchPath(Cfg[i]);
+  Fbc := ConfigValue('FBC');
+  if (Fbc = '') or not FileExists(Fbc) then
+  begin
+    // A PATH walk by hand: ExeSearch lives in LazUtils, which this unit does not and should not use.
+    PathList := TStringList.Create;
+    try
+      PathList.Delimiter := PathSeparator;
+      PathList.StrictDelimiter := True;
+      PathList.DelimitedText := GetEnvironmentVariable('PATH');
+      for i := 0 to PathList.Count - 1 do
+        if PathList[i] <> '' then
+        begin
+          Cand := IncludeTrailingPathDelimiter(PathList[i]) + 'fbc' {$IFDEF WINDOWS} + '.exe'{$ENDIF};
+          if FileExists(Cand) then begin Fbc := Cand; Break; end;
+        end;
+    finally
+      PathList.Free;
+    end;
+  end;
+  if (Fbc = '') or not FileExists(Fbc) then Exit;
+  Dir := ExtractFilePath(ExpandFileName(Fbc));
+  // <prefix>/bin/fbc  ->  <prefix>/include/freebasic
+  Dir := IncludeTrailingPathDelimiter(ExtractFilePath(ExcludeTrailingPathDelimiter(Dir))) +
+         'include' + PathDelim + 'freebasic';
+  if DirectoryExists(Dir) then AddIncludeSearchPath(Dir);
+end;
+
+function FindIncludeOnPath(const FileName: string): string;
+// '' when nothing on the search path holds it. The paths are tried in the order they were added, which
+// is the order the front end and the environment gave them.
+var
+  i: Integer;
+  Cand: string;
+begin
+  Result := '';
+  DiscoverFbIncludeDir;
+  if GPPIncludePaths = nil then Exit;
+  for i := 0 to GPPIncludePaths.Count - 1 do
+  begin
+    Cand := GPPIncludePaths[i] + FileName;
+    if FileExists(Cand) then Exit(Cand);
+  end;
+end;
+
 
 function DetectQBLang(const Src: string): Boolean;
 // Does this source select the QB dialect, '#lang "qb"' or the '$lang: "qb" metacommand?
@@ -3678,7 +3785,7 @@ var
     Lines: TStringList;
     li, p, q: Integer;
     Canon: string;   // the include path, canonicalised - the identity every "once" question asks about
-    Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath: string;
+    Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath, PathHit: string;
     Params, MacroBody, BodyTrim, EName, ERest, LineFile: string;
     LineNum: Integer;
     IsFn: Boolean;
@@ -3906,6 +4013,17 @@ var
             if p > 0 then FileName := Copy(FileName, 1, p - 1);
             FullPath := FileName;
             if not FileExists(FullPath) then FullPath := IncludeTrailingPathDelimiter(Dir) + FileName;
+            // ⭐ ...and then the SEARCH PATH: the front end's "-i", the environment, and FreeBASIC's own
+            // include directory when FreeBASIC is installed. ⛔ Only for a header we do NOT emulate:
+            // "fbgfx.bi" and "fbc-int/symbol.bi" are implemented here on purpose, and letting fbc's
+            // copies win over them would replace a decision with an accident.
+            // ⚠️ BOTH #include branches of this function get it - there are two, and giving it to one
+            // would make a header resolve or not depending on which pass met it. retrogra / DIVERGENZE 183.
+            if (not FileExists(FullPath)) and (not IsEmulatedHeaderName(FileName)) then
+            begin
+              PathHit := FindIncludeOnPath(FileName);
+              if PathHit <> '' then FullPath := PathHit;
+            end;
             if FileExists(FullPath) then
             begin
               IncText := TStringList.Create;
@@ -4239,6 +4357,17 @@ var
               FileName := Trim(StripDirectiveComment(FileName));   // unquoted form
             FullPath := FileName;
             if not FileExists(FullPath) then FullPath := IncludeTrailingPathDelimiter(Dir) + FileName;
+            // ⭐ ...and then the SEARCH PATH: the front end's "-i", the environment, and FreeBASIC's own
+            // include directory when FreeBASIC is installed. ⛔ Only for a header we do NOT emulate:
+            // "fbgfx.bi" and "fbc-int/symbol.bi" are implemented here on purpose, and letting fbc's
+            // copies win over them would replace a decision with an accident.
+            // ⚠️ BOTH #include branches of this function get it - there are two, and giving it to one
+            // would make a header resolve or not depending on which pass met it. retrogra / DIVERGENZE 183.
+            if (not FileExists(FullPath)) and (not IsEmulatedHeaderName(FileName)) then
+            begin
+              PathHit := FindIncludeOnPath(FileName);
+              if PathHit <> '' then FullPath := PathHit;
+            end;
             if FileExists(FullPath) then
             begin
               // ⛔ THE IDENTITY IS THE CANONICAL PATH, NOT THE SPELLING. fbc's own pp/inc_once1 reaches
@@ -4628,10 +4757,51 @@ begin
 end;
 
 
+procedure AddIncludeSearchPath(const APath: string);
+begin
+  if Trim(APath) = '' then Exit;
+  if GPPIncludePaths = nil then
+  begin
+    GPPIncludePaths := TStringList.Create;
+    GPPIncludePaths.CaseSensitive := True;
+  end;
+  if GPPIncludePaths.IndexOf(IncludeTrailingPathDelimiter(APath)) < 0 then
+    GPPIncludePaths.Add(IncludeTrailingPathDelimiter(APath));
+end;
+
+function IncludeSearchPathCount: Integer;
+begin
+  if GPPIncludePaths = nil then Result := 0 else Result := GPPIncludePaths.Count;
+end;
+
+procedure ResetPreprocessorState;
+// Per-program tables only. Everything here is rebuilt from the source being compiled; anything that is
+// configuration (the target, the front end's switches) is not touched.
+begin
+  FreeAndNil(GPPUndefNames);
+  FreeAndNil(GPPIncLibs);
+  FreeAndNil(GPPLibPaths);
+  FreeAndNil(GPPVarTypes);
+  FreeAndNil(GPPTypeNames);
+  FreeAndNil(GUniqueIdStacks);
+  GUniqueIdSerial := 0;
+  SetLength(GPPLineDirectives, 0);
+  GDeclaredNonFbDialect := False;
+  GPPSourceForDefined := '';
+  GPPDefinedLimit := -1;
+  FreeAndNil(GPPReserved);
+  // ⚠️ GPPIncludePaths is NOT cleared either: like GTargetIsWasm it is CONFIGURATION - the front end's
+  // "-i" and the environment - and it outlives any one program on purpose.
+  // ⚠️ GPPOutput and GPPKeywords are NOT here: the first is a scratch buffer owned by the pass that is
+  // running, and the second is the KEYWORD list, which is the same for every program - rebuilding it
+  // per request would be work for nothing.
+end;
+
 initialization
   // A constant expression's decimal point is a '.', whatever the machine's locale calls it: the SOURCE
   // says '.', and StrToFloat would otherwise read "1.5" as 15 on a comma-decimal locale.
   PPFloatFmt := DefaultFormatSettings;
   PPFloatFmt.DecimalSeparator := '.';
+
 
 end.

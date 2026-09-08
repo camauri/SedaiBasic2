@@ -451,6 +451,15 @@ var
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
 begin
+  // 🚧 ABBOZZO (8 set 2026, per il modello a WORKER PERSISTENTI): lo stato per-programma del
+  // preprocessore vive in globali di unita' che nessuno azzerava, quindi un processo che compila un
+  // SECONDO programma gli fa ereditare il primo - MISURATO: un "#inclib" di A nominava una libreria
+  // per B, che non ne nominava nessuna. Azzerarlo qui e' un no-op per l'uso di oggi (un processo, un
+  // programma) ed e' la precondizione di un worker che sopravvive alla richiesta.
+  // ⛔ NON E' COMPLETO: sono coperte le tabelle del PREPROCESSORE, verificate contaminanti. La SSA e la
+  // VM hanno altri globali di unita' che NON sono stati classificati. L'oracolo che lo misura e'
+  // differenziale e generale: compilare B da solo e compilare A poi B devono dare lo STESSO bytecode.
+  ResetPreprocessorState;
   Result := nil;
   FLastError := '';
 

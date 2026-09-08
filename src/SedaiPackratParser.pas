@@ -126,6 +126,11 @@ type
     // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
     // line, handed to the SSA on the program node (DIVERGENZE 183).
     FForeignDecls: TStringList;
+    // ⭐ How deep inside an `Extern "C" ... End Extern` block we are. A bodiless DECLARE in such a block
+    // is a FOREIGN procedure even with no ALIAS - the C name IS the symbol, which is what "C" linkage
+    // means - and that is how every real binding is written: fbc's own zip.bi declares 103 functions
+    // that way and not one of them carries an alias. DIVERGENZE 183 / retrogra.
+    FExternCDepth: Integer;
     FProcSeen: TStringList;
     // ⛔⛔ ...AND THE OVERLOAD DECISION IS ASKED PER NAMESPACE. Two procedures of the same name in two
     // DIFFERENT namespaces are not an overload set - they are two names that only look alike until the
@@ -1716,6 +1721,7 @@ var
   FgnName, FgnAlias, FgnLib, FgnRet, FgnParams, FgnTok: string;
   FgnDepth: Integer;
   FgnAfterAs, FgnIsFunc, FgnTypeOpen: Boolean;
+  FgnNameRaw: string;
 begin
   Result := nil;
   // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
@@ -1853,7 +1859,12 @@ begin
    FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False; FgnTypeOpen := False;
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
      FgnIsFunc := UpperCase(VarToStr(Context.PeekNext.Value)) = kFUNCTION;
-   if Assigned(Context.PeekToken(2)) then FgnName := UpperCase(VarToStr(Context.PeekToken(2).Value));
+   FgnNameRaw := '';
+   if Assigned(Context.PeekToken(2)) then
+   begin
+     FgnNameRaw := VarToStr(Context.PeekToken(2).Value);     // the C spelling, kept as written
+     FgnName := UpperCase(FgnNameRaw);
+   end;
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
    begin
      FgnTok := UpperCase(VarToStr(Context.CurrentToken.Value));
@@ -1885,6 +1896,11 @@ begin
        if (FgnDepth > 0) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
        else if (FgnDepth = 0) and (FgnRet <> '') then FgnRet := FgnRet + ' PTR';
      end
+     // ⛔ "ByVal As Const ZString Ptr": CONST describes the POINTEE, not the type, and taking it as the
+     // type name would classify the parameter as unknown and refuse the whole declaration. Every C
+     // binding is full of them - zip.bi alone has dozens.
+     else if FgnAfterAs and (FgnTok = 'CONST') then
+       // stay after-AS: the real type name is the next word
      else if FgnAfterAs and Context.CheckAny([ttIdentifier, ttAsType]) then
      begin
        if FgnDepth > 0 then
@@ -1900,9 +1916,14 @@ begin
        FgnTypeOpen := False;   // the next parameter's type has not been read yet
      Context.Advance;
    end;
-   if (FgnName <> '') and (FgnAlias <> '') then
+   // ⭐ A FOREIGN DECLARE IS EITHER SPELLING: one that names an ALIAS, or ANY bodiless one inside an
+   // `Extern "C"` block, where the C name IS the symbol. ⛔ And there the symbol keeps its OWN CASE -
+   // "zip_open", not "ZIP_OPEN" - because C is case-sensitive and the loader will not find the other.
+   // The BASIC name stays upper, because BASIC is not.
+   if (FgnName <> '') and ((FgnAlias <> '') or (FExternCDepth > 0)) then
    begin
      if not FgnIsFunc then FgnRet := '';
+     if FgnAlias = '' then FgnAlias := FgnNameRaw;
      FForeignDecls.Add(FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
    end;
    Result := nil;
@@ -1924,7 +1945,14 @@ begin
      // away, so a SUB declared in such a block did not exist and every call to it failed ("Array not
      // declared"). Consume the header and the terminator only, and let the body parse where it stands.
      Context.Advance;                     // EXTERN
-     if Context.Check(ttStringLiteral) then Context.Advance;   // the "C" / "Windows" linkage name
+     // ⭐ ...and REMEMBER that we are in one, because a bodiless DECLARE inside it is FOREIGN. Only "C"
+     // linkage: "Windows" (stdcall) is a convention this call path does not implement, and claiming
+     // otherwise would marshal the arguments the wrong way round without a word.
+     if Context.Check(ttStringLiteral) then
+     begin
+       if UpperCase(Trim(VarToStr(Context.CurrentToken.Value))) = 'C' then Inc(FExternCDepth);
+       Context.Advance;                   // the "C" / "Windows" linkage name
+     end;
      Result := nil;
      Exit;
    end
@@ -6687,6 +6715,7 @@ begin
   if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXTERN') then
   begin
     Context.Advance;
+    if FExternCDepth > 0 then Dec(FExternCDepth);
     Result.Free;
     Result := nil;
     Exit;

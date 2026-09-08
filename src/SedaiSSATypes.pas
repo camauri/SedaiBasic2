@@ -806,6 +806,7 @@ type
     function ForeignDeclCount: Integer;
     function GetForeignDecl(Index: Integer): string;
     function IndexOfForeignDecl(const ANameU: string): Integer;   // -1 when the name is not foreign
+    procedure SetForeignDecl(Index: Integer; const ADecl: string);   // rewritten once the type aliases are known
     function CreateBlock(const LabelName: string): TSSABasicBlock;
     function CreateBlockBefore(const LabelName: string; BeforeBlock: TSSABasicBlock): TSSABasicBlock;  // Insert block before another block
     function FindBlock(const LabelName: string): TSSABasicBlock;
@@ -1260,6 +1261,11 @@ function TSSAProgram.GetForeignDecl(Index: Integer): string;
 begin
   if (Index < 0) or (Index >= FForeignDecls.Count) then Exit('');
   Result := FForeignDecls[Index];
+end;
+
+procedure TSSAProgram.SetForeignDecl(Index: Integer; const ADecl: string);
+begin
+  if (Index >= 0) and (Index < FForeignDecls.Count) then FForeignDecls[Index] := ADecl;
 end;
 
 function TSSAProgram.IndexOfForeignDecl(const ANameU: string): Integer;

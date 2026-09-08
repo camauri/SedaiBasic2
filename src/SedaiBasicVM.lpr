@@ -44,6 +44,8 @@ uses
   SedaiParserTypes, SedaiAST, SedaiParserContext, SedaiParserResults,
   SedaiPackratParser, SedaiDateTimeUtils,
   // Bytecode VM
+  // -i / -p: dove stanno gli header e le librerie (SedaiConfig e' la loro fonte)
+  SedaiConfig, SedaiFFI,
   SedaiSSATypes, SedaiSSA,
   SedaiBytecodeTypes, SedaiBytecodeCompiler, SedaiBytecodeVM,
   SedaiBytecodeDisassembler, SedaiOpcodeTable, SedaiJit, SedaiAot,
@@ -2649,6 +2651,20 @@ begin
         OptStats := True
       else if Param = '--no-exec' then
         OptNoExec := True
+      // ⭐ WHERE THINGS ARE, said on the command line - the most specific of the five places allowed to
+      // say it (see SedaiConfig). Spelled as fbc spells them, "-i" for headers and "-p" for libraries,
+      // because a program written for fbc is built with fbc's own flags and copying them costs nothing.
+      // ⛔ These go IN FRONT of anything sedai.conf or the environment gave: the run outranks the file.
+      else if (Param = '-i') and (i < ParamCount) then
+      begin
+        AddIncludeSearchPath(ParamStr(i + 1));
+        GSkipNextArg := True;
+      end
+      else if (Param = '-p') and (i < ParamCount) then
+      begin
+        AddLibrarySearchPath(ParamStr(i + 1));
+        GSkipNextArg := True;
+      end
       else if (Param = '--no-opt') or (Param = '--no-optimize') then
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
       else if (Param = '--bounds-check') or (Param = '--boundscheck') then
