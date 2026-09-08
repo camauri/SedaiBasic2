@@ -755,6 +755,7 @@ type
   private
     FBlocks: TSSABasicBlockList;
     FVariables, FLabels: TStringList;
+    FLabelHintsStale: Boolean;   // a block was inserted: the indices in FLabels.Objects may have shifted
     FVarRegMap: TStringList;    // Maps variable name → "RegType:RegIndex" (for optimization passes)
     FArrays: array of TSSAArrayInfo;  // Array declarations
     FNextRegister: array[TSSARegisterType] of Integer;
@@ -775,6 +776,7 @@ type
     function CreateBlock(const LabelName: string): TSSABasicBlock;
     function CreateBlockBefore(const LabelName: string; BeforeBlock: TSSABasicBlock): TSSABasicBlock;  // Insert block before another block
     function FindBlock(const LabelName: string): TSSABasicBlock;
+    procedure RepairLabelHints;   // re-point every label at its block, in one pass over the blocks
     function GetOrCreateBlock(const LabelName: string): TSSABasicBlock;  // Find existing or create new block
     function AllocRegister(RegType: TSSARegisterType): Integer;
     procedure AddVariable(const VarName: string);
@@ -1283,26 +1285,29 @@ begin
   // heap corruption). Since blocks are about to be freed anyway and TFPList.Free handles
   // cleanup internally, we skip the explicit Clear() calls.
   // The original purpose was to break cycles that might cause issues during destruction,
-  // but TFPGObjectList with Extract + Free handles this correctly.
+  // but TFPGObjectList handles this correctly when the blocks are deleted from the end.
   {$IFDEF DEBUG_CLEANUP}
   if DebugCleanup then
     WriteLn('[SSAProgram.Destroy] Skipping predecessor/successor clearing (blocks will be freed)');
   {$ENDIF}
 
-  // Free blocks manually with Extract to avoid TFPGObjectList internal issues
+  // Free blocks from the END, one at a time - see the note below on why not Extract
   {$IFDEF DEBUG_CLEANUP}
   if DebugCleanup then
     WriteLn('[SSAProgram.Destroy] Freeing ', FBlocks.Count, ' blocks...');
   {$ENDIF}
 
+  // ⛔ NOT Extract(FBlocks[Count-1]): Extract takes an OBJECT and scans from index 0 to find it, so
+  // tearing down N blocks cost N x N/2 item comparisons - the destructor was quadratic, and on a large
+  // program it was one of the most expensive leaves of the whole compile. The list is built with
+  // Create(True), so Delete of the LAST index frees the block and moves nothing.
   while FBlocks.Count > 0 do
   begin
-    Block := FBlocks.Extract(FBlocks[FBlocks.Count - 1]);
     {$IFDEF DEBUG_CLEANUP}
     if DebugCleanup then
-      WriteLn('[SSAProgram.Destroy]   Block: ', Block.LabelName);
+      WriteLn('[SSAProgram.Destroy]   Block: ', FBlocks[FBlocks.Count - 1].LabelName);
     {$ENDIF}
-    Block.Free;
+    FBlocks.Delete(FBlocks.Count - 1);
   end;
 
   FBlocks.Free;
@@ -1349,13 +1354,14 @@ begin
   // Insert at the correct position
   FBlocks.Insert(InsertIdx, Result);
 
-  // Update FLabels indices - all blocks after InsertIdx have shifted by 1
-  // FLabels stores block indices as Objects, so we need to update them
-  for i := 0 to FLabels.Count - 1 do
-  begin
-    if PtrInt(FLabels.Objects[i]) >= InsertIdx then
-      FLabels.Objects[i] := TObject(PtrInt(FLabels.Objects[i]) + 1);
-  end;
+  // ⛔ THE INDICES IN FLabels ARE NOT RENUMBERED HERE, and that is the point. Walking the whole label
+  // list on every block insertion made SUB inlining quadratic: on fbc's compound/select_const2 this
+  // one loop was 81% of the pass, 3.7 s of 4.6 s. It was also an EAGER repair of something the reader
+  // already repairs LAZILY - FindBlock verifies the label before it trusts the index and mends
+  // the entry when it does not match - which is what makes dropping it safe. A DELETED block already
+  // left the same staleness behind and nothing renumbered for that either.
+  // ⇒ Mark the hints stale instead, and let the first reader that misses mend them ALL in one pass.
+  FLabelHintsStale := True;
 
   // Add new block's label to FLabels
   if LabelName <> '' then
@@ -1381,6 +1387,20 @@ begin
     B := TSSABasicBlock(FBlocks[i]);
     if Assigned(B) and (B.LabelName = LabelName) then Exit(B);
   end;
+  // ⭐ A miss after blocks were INSERTED means every hint from the insertion point on is off by the
+  // same shifts, so mending only this one would leave the next lookup to scan again. One pass mends
+  // them ALL, at the cost of the scan this used to do alone - which is why CreateBlockBefore no
+  // longer renumbers eagerly.
+  if FLabelHintsStale then
+  begin
+    RepairLabelHints;
+    i := PtrInt(FLabels.Objects[Idx]);
+    if (i >= 0) and (i < FBlocks.Count) then
+    begin
+      B := TSSABasicBlock(FBlocks[i]);
+      if Assigned(B) and (B.LabelName = LabelName) then Exit(B);
+    end;
+  end;
   for i := 0 to FBlocks.Count - 1 do
   begin
     B := TSSABasicBlock(FBlocks[i]);
@@ -1390,6 +1410,26 @@ begin
       Exit(B);
     end;
   end;
+end;
+
+procedure TSSAProgram.RepairLabelHints;
+// Re-point every label at the block that carries it, in ONE pass over the blocks. Walking BACKWARDS
+// leaves the LOWEST index in place when two live blocks share a label, which is the block the scan
+// in FindBlock would have answered. A label naming no live block keeps whatever it had: FindBlock
+// verifies before it trusts, so a hint that answers nothing is harmless.
+var
+  i, Idx: Integer;
+  B: TSSABasicBlock;
+begin
+  for i := FBlocks.Count - 1 downto 0 do
+  begin
+    B := TSSABasicBlock(FBlocks[i]);
+    if not Assigned(B) then Continue;
+    if B.LabelName = '' then Continue;
+    Idx := FLabels.IndexOf(B.LabelName);
+    if Idx >= 0 then FLabels.Objects[Idx] := TObject(PtrInt(i));
+  end;
+  FLabelHintsStale := False;
 end;
 
 function TSSAProgram.GetOrCreateBlock(const LabelName: string): TSSABasicBlock;

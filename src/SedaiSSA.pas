@@ -35,6 +35,7 @@ uses
   Classes, SysUtils, StrUtils, Variants, Math, Generics.Collections,
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes, SedaiAST,
   SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals,
+  SedaiFastLookup,        // TIndexedStringList: the name registries below answer IndexOf from a hash
   SedaiExecutorErrors,   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
   SedaiPreprocessor;     // GPPUndefNames: the names "#undef" retired (DIVERGENZE 73)
 
@@ -1627,7 +1628,7 @@ begin
   FLabelCounter := 0;
   FCurrentLineNumber := 0;
   FLastResult := MakeSSAValue(svkNone);
-  FVarMap := TStringList.Create;
+  FVarMap := TIndexedStringList.Create;
   FVarMap.Sorted := True;
   FVarMap.Duplicates := dupIgnore;
   FVarMap.CaseSensitive := False;  // BASIC is case-insensitive
@@ -1636,17 +1637,17 @@ begin
   FConstFloatRegs := specialize TDictionary<Integer, Double>.Create;
   FConstIntRegs := specialize TDictionary<Integer, Int64>.Create;
   SetLength(FDeferredProcs, 0);
-  FProcedureNames := TStringList.Create;
+  FProcedureNames := TIndexedStringList.Create;
   FProcedureNames.CaseSensitive := False;
   FProcDecls := specialize TDictionary<string, TASTNode>.Create;
   SetLength(FUDTs, 0);
-  FVarRecordType := TStringList.Create;
+  FVarRecordType := TIndexedStringList.Create;
   FVarRecordType.CaseSensitive := False;
-  FPreFuncRetType := TStringList.Create;
+  FPreFuncRetType := TIndexedStringList.Create;
   FPreFuncRetType.CaseSensitive := False;
-  FPreProcSig := TStringList.Create;
-  FPreProcRetPtrSig := TStringList.Create;
-  FPreVarDeclType := TStringList.Create;
+  FPreProcSig := TIndexedStringList.Create;
+  FPreProcRetPtrSig := TIndexedStringList.Create;
+  FPreVarDeclType := TIndexedStringList.Create;
   FPreVarDeclType.CaseSensitive := False;
   FTypeScopePath := '';
   FTypeScopeSerial := 0;
@@ -1657,185 +1658,185 @@ begin
   // and the call lowered as an array access. Every operator that ENDS in '=' has the same shape
   // ("+=", "-=", "<=", ">=", "<>"...). #1 cannot appear in any label (DIVERGENZE 151).
   FPreProcSig.NameValueSeparator := #1;
-  FResultTemps := TStringList.Create;
-  FVarExplicitType := TStringList.Create;
+  FResultTemps := TIndexedStringList.Create;
+  FVarExplicitType := TIndexedStringList.Create;
   FVarExplicitType.CaseSensitive := False;
-  FArrayRecordType := TStringList.Create;
-  FArrayScalarType := TStringList.Create;
+  FArrayRecordType := TIndexedStringList.Create;
+  FArrayScalarType := TIndexedStringList.Create;
   FArrayRecordType.CaseSensitive := False;
-  FArrayFuncPtrSig := TStringList.Create;
+  FArrayFuncPtrSig := TIndexedStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
-  FArrayScalarPointee := TStringList.Create;
-  FZStrCharAddr := TStringList.Create;
-  FZStrTextAddr := TStringList.Create;
-  FRawElemArrays := TStringList.Create;
+  FArrayScalarPointee := TIndexedStringList.Create;
+  FZStrCharAddr := TIndexedStringList.Create;
+  FZStrTextAddr := TIndexedStringList.Create;
+  FRawElemArrays := TIndexedStringList.Create;
   FRawElemArrays.CaseSensitive := False;
   FArrayScalarPointee.CaseSensitive := False;
-  FArrayElemBytes := TStringList.Create;
+  FArrayElemBytes := TIndexedStringList.Create;
   FArrayElemBytes.CaseSensitive := False;
-  FArrayFixedStr := TStringList.Create;
+  FArrayFixedStr := TIndexedStringList.Create;
   FArrayFixedStr.CaseSensitive := False;
-  FArrayPtrPointee := TStringList.Create;
+  FArrayPtrPointee := TIndexedStringList.Create;
   FArrayPtrPointee.CaseSensitive := False;
-  FNeededDispatchers := TStringList.Create;
+  FNeededDispatchers := TIndexedStringList.Create;
   FNeededDispatchers.Duplicates := dupIgnore;
   FNeededDispatchers.Sorted := True;
-  FCurrentProcLocalRecs := TStringList.Create;
-  FCurrentProcNonRecs := TStringList.Create;
+  FCurrentProcLocalRecs := TIndexedStringList.Create;
+  FCurrentProcNonRecs := TIndexedStringList.Create;
   FCurrentProcNonRecs.CaseSensitive := False;
-  FDefinedLabels := TStringList.Create;
+  FDefinedLabels := TIndexedStringList.Create;
   FDefinedLabels.CaseSensitive := False;
-  FConstVars := TStringList.Create;
+  FConstVars := TIndexedStringList.Create;
   FConstVars.CaseSensitive := False;
-  FModuleOnlyVars := TStringList.Create;
+  FModuleOnlyVars := TIndexedStringList.Create;
   FModuleOnlyVars.CaseSensitive := False;
-  FCurrentProcDeclNames := TStringList.Create;
+  FCurrentProcDeclNames := TIndexedStringList.Create;
   FCurrentProcDeclNames.CaseSensitive := False;
-  FCurrentProcByvalRecs := TStringList.Create;
-  FCurrentProcByrefScalars := TStringList.Create;
-  FCurrentProcAddrParams := TStringList.Create;
-  FCurrentProcPtrLocals := TStringList.Create;
-  FCurrentProcPtrParams := TStringList.Create;
-  FFuncPtrSigs := TStringList.Create;
-  FModuleFuncPtrSigs := TStringList.Create;
-  FFuncPtrTypes := TStringList.Create;
+  FCurrentProcByvalRecs := TIndexedStringList.Create;
+  FCurrentProcByrefScalars := TIndexedStringList.Create;
+  FCurrentProcAddrParams := TIndexedStringList.Create;
+  FCurrentProcPtrLocals := TIndexedStringList.Create;
+  FCurrentProcPtrParams := TIndexedStringList.Create;
+  FFuncPtrSigs := TIndexedStringList.Create;
+  FModuleFuncPtrSigs := TIndexedStringList.Create;
+  FFuncPtrTypes := TIndexedStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
-  FModuleRecordVars := TStringList.Create;
-  FModuleCtors := TStringList.Create;
-  FModuleDtors := TStringList.Create;
-  FTypeAliases := TStringList.Create;
-  FMemberAliasLabel := TStringList.Create;
+  FModuleRecordVars := TIndexedStringList.Create;
+  FModuleCtors := TIndexedStringList.Create;
+  FModuleDtors := TIndexedStringList.Create;
+  FTypeAliases := TIndexedStringList.Create;
+  FMemberAliasLabel := TIndexedStringList.Create;
   FMemberAliasLabel.CaseSensitive := False;
-  FModuleDtorSlots := TStringList.Create;
+  FModuleDtorSlots := TIndexedStringList.Create;
   FModuleDtorSlots.CaseSensitive := False;
-  FStaticLocalOwner := TStringList.Create;
+  FStaticLocalOwner := TIndexedStringList.Create;
   FStaticLocalOwner.CaseSensitive := False;
-  FSharedVars := TStringList.Create;
+  FSharedVars := TIndexedStringList.Create;
   FSharedVars.CaseSensitive := False;
-  FSharedScalarArr := TStringList.Create;
-  FModuleConstVals := TStringList.Create;
+  FSharedScalarArr := TIndexedStringList.Create;
+  FModuleConstVals := TIndexedStringList.Create;
   FModuleConstVals.CaseSensitive := False;
-  FStaticMembers := TStringList.Create;
-  FStaticMemberProcs := TStringList.Create;
+  FStaticMembers := TIndexedStringList.Create;
+  FStaticMemberProcs := TIndexedStringList.Create;
   FStaticMemberProcs.CaseSensitive := False;
   FStaticMembers.CaseSensitive := False;
-  FStaticMemberArrays := TStringList.Create;
+  FStaticMemberArrays := TIndexedStringList.Create;
   FStaticMemberArrays.CaseSensitive := False;
-  FStaticMemberTypes := TStringList.Create;
+  FStaticMemberTypes := TIndexedStringList.Create;
   FStaticMemberTypes.CaseSensitive := False;
-  FEnumMembers := TStringList.Create;
-  FTypeEnumMembers := TStringList.Create;
+  FEnumMembers := TIndexedStringList.Create;
+  FTypeEnumMembers := TIndexedStringList.Create;
   FTypeEnumMembers.CaseSensitive := False;
-  FTypeConstMembers := TStringList.Create;
+  FTypeConstMembers := TIndexedStringList.Create;
   FTypeConstMembers.CaseSensitive := False;
   FEnumMembers.CaseSensitive := False;
-  FEnumNames := TStringList.Create;
+  FEnumNames := TIndexedStringList.Create;
   FEnumNames.CaseSensitive := False;
-  FEnumMemberType := TStringList.Create;
-  FEnumQualVals := TStringList.Create;
+  FEnumMemberType := TIndexedStringList.Create;
+  FEnumQualVals := TIndexedStringList.Create;
   FEnumQualVals.CaseSensitive := False;
   FEnumMemberType.CaseSensitive := False;
-  FVarEnumType := TStringList.Create;
+  FVarEnumType := TIndexedStringList.Create;
   FVarEnumType.CaseSensitive := False;
-  FFixedStrNames := TStringList.Create;
+  FFixedStrNames := TIndexedStringList.Create;
   FFixedStrNames.CaseSensitive := False;
-  FVarDeclTypeName := TStringList.Create;
+  FVarDeclTypeName := TIndexedStringList.Create;
   FVarDeclTypeName.CaseSensitive := False;
-  FPreFixedStrCap := TStringList.Create;
+  FPreFixedStrCap := TIndexedStringList.Create;
   FPreFixedStrCap.CaseSensitive := False;
-  FLexVarTypes := TStringList.Create;
+  FLexVarTypes := TIndexedStringList.Create;
   FLexVarTypes.CaseSensitive := False;
   SetLength(FLexVarFrames, 0);
-  FPointerVars := TStringList.Create;
-  FAddrTakenScalars := TStringList.Create;
+  FPointerVars := TIndexedStringList.Create;
+  FAddrTakenScalars := TIndexedStringList.Create;
   FAddrTakenScalars.CaseSensitive := False;
-  FRawModuleScalars := TStringList.Create;
+  FRawModuleScalars := TIndexedStringList.Create;
   FRawModuleScalars.CaseSensitive := False;
-  FAddrSharedScalars := TStringList.Create;
+  FAddrSharedScalars := TIndexedStringList.Create;
   FAddrSharedScalars.CaseSensitive := False;
-  FScalarPtrBanks := TStringList.Create;
+  FScalarPtrBanks := TIndexedStringList.Create;
   FScalarPtrBanks.CaseSensitive := False;
-  FAddrLocalVars := TStringList.Create;
-  FRefVars := TStringList.Create;
-  FRawFromAddrOf := TStringList.Create;
+  FAddrLocalVars := TIndexedStringList.Create;
+  FRefVars := TIndexedStringList.Create;
+  FRawFromAddrOf := TIndexedStringList.Create;
   FRawFromAddrOf.CaseSensitive := False;
-  FRawUDTPtrs := TStringList.Create;
+  FRawUDTPtrs := TIndexedStringList.Create;
   FRawUDTPtrs.CaseSensitive := False;
-  FVarPtrQuals := TStringList.Create;
+  FVarPtrQuals := TIndexedStringList.Create;
   FVarPtrQuals.CaseSensitive := False;
-  FRawPtrVars := TStringList.Create;
-  FRawPtrScoped := TStringList.Create;
+  FRawPtrVars := TIndexedStringList.Create;
+  FRawPtrScoped := TIndexedStringList.Create;
   FRawPtrScoped.CaseSensitive := False;
-  FBlockManagedTypes := TStringList.Create;
-  FConstStrBytes := TStringList.Create;
+  FBlockManagedTypes := TIndexedStringList.Create;
+  FConstStrBytes := TIndexedStringList.Create;
   FConstStrBytes.CaseSensitive := False;
-  FConstDeclSeen := TStringList.Create;
+  FConstDeclSeen := TIndexedStringList.Create;
   FConstDeclSeen.Sorted := True;
   FConstDeclSeen.Duplicates := dupIgnore;
   FBlockManagedTypes.Sorted := True;
   FBlockManagedTypes.Duplicates := dupIgnore;
-  FWStringVars := TStringList.Create;
+  FWStringVars := TIndexedStringList.Create;
   FWStringVars.CaseSensitive := False;
-  FRedimMultiArrays := TStringList.Create;
+  FRedimMultiArrays := TIndexedStringList.Create;
   FRedimMultiArrays.CaseSensitive := False;
-  FArrRankOfSlot := TStringList.Create;
+  FArrRankOfSlot := TIndexedStringList.Create;
   FArrRankOfSlot.CaseSensitive := False;
-  FRankStatedArrays := TStringList.Create;
+  FRankStatedArrays := TIndexedStringList.Create;
   FRankStatedArrays.CaseSensitive := False;
-  FRankPoisoned := TStringList.Create;
+  FRankPoisoned := TIndexedStringList.Create;
   FRankPoisoned.CaseSensitive := False;
-  FArrShapeDyn := TStringList.Create;   FArrShapeDyn.CaseSensitive := False;
-  FArrShapeFixed := TStringList.Create; FArrShapeFixed.CaseSensitive := False;
-  FDynamicArrays := TStringList.Create;
-  FZeroLbArrays := TStringList.Create;
-  FZeroLbPoisoned := TStringList.Create;
+  FArrShapeDyn := TIndexedStringList.Create;   FArrShapeDyn.CaseSensitive := False;
+  FArrShapeFixed := TIndexedStringList.Create; FArrShapeFixed.CaseSensitive := False;
+  FDynamicArrays := TIndexedStringList.Create;
+  FZeroLbArrays := TIndexedStringList.Create;
+  FZeroLbPoisoned := TIndexedStringList.Create;
   FDynamicArrays.CaseSensitive := False;
-  FBlockDeclVars := TStringList.Create;
+  FBlockDeclVars := TIndexedStringList.Create;
   FBlockDeclVars.CaseSensitive := False;
-  FBlockDeclRecs := TStringList.Create;
+  FBlockDeclRecs := TIndexedStringList.Create;
   FBlockDeclRecs.CaseSensitive := False;
-  FFixedLenVars := TStringList.Create;
+  FFixedLenVars := TIndexedStringList.Create;
   FFixedLenVars.CaseSensitive := False;
-  FZStringVars := TStringList.Create;
+  FZStringVars := TIndexedStringList.Create;
   FZStringVars.CaseSensitive := False;
   FRawFixedLenNode := nil;
   FHasFixedLenFields := False;
   FHasNulStrLiteral := False;
-  FNulStrConsts := TStringList.Create;
+  FNulStrConsts := TIndexedStringList.Create;
   FNulStrConsts.CaseSensitive := False;
-  FWideNulConsts := TStringList.Create;
+  FWideNulConsts := TIndexedStringList.Create;
   FWideNulConsts.CaseSensitive := False;
-  FNulConstScoped := TStringList.Create;
+  FNulConstScoped := TIndexedStringList.Create;
   FNulConstScoped.CaseSensitive := False;
   FNulConstScoped.NameValueSeparator := '=';
-  FByrefRetFuncs := TStringList.Create;
-  FByrefRetValue := TStringList.Create;
+  FByrefRetFuncs := TIndexedStringList.Create;
+  FByrefRetValue := TIndexedStringList.Create;
   FByrefRetValue.CaseSensitive := False;
-  FByrefRetRaw := TStringList.Create;
+  FByrefRetRaw := TIndexedStringList.Create;
   FByrefRetRaw.CaseSensitive := False;
-  FRawPtrRetFuncs := TStringList.Create;
+  FRawPtrRetFuncs := TIndexedStringList.Create;
   FSharedScalarArr.CaseSensitive := False;
-  FMultiDimArrays := TStringList.Create;
+  FMultiDimArrays := TIndexedStringList.Create;
   FMultiDimArrays.CaseSensitive := False;
-  FVarWidthCode := TStringList.Create;
+  FVarWidthCode := TIndexedStringList.Create;
   FVarWidthCode.CaseSensitive := False;
-  FVarIdentCode := TStringList.Create;
+  FVarIdentCode := TIndexedStringList.Create;
   FVarIdentCode.CaseSensitive := False;
-  FVarPrintKind := TStringList.Create;
+  FVarPrintKind := TIndexedStringList.Create;
   FVarPrintKind.CaseSensitive := False;
-  FArrayElemWidth := TStringList.Create;
+  FArrayElemWidth := TIndexedStringList.Create;
   FArrayElemWidth.CaseSensitive := False;
-  FDataMarks := TStringList.Create;
+  FDataMarks := TIndexedStringList.Create;
   FDataMarks.CaseSensitive := False;
   FDataCount := 0;
-  FUnsigned64Arrays := TStringList.Create;
+  FUnsigned64Arrays := TIndexedStringList.Create;
   FUnsigned64Arrays.CaseSensitive := False;
   FInDispatcher := False;
-  FBlockHandledVars := TStringList.Create;
+  FBlockHandledVars := TIndexedStringList.Create;
   FBlockHandledVars.CaseSensitive := False;
-  FCurrentTopLevelLabels := TStringList.Create;
+  FCurrentTopLevelLabels := TIndexedStringList.Create;
   FCurrentTopLevelLabels.CaseSensitive := False;
-  FDeclaredNames := TStringList.Create;
+  FDeclaredNames := TIndexedStringList.Create;
   FDeclaredNames.CaseSensitive := False;
   FDeclaredNames.Sorted := True;
   FDeclaredNames.Duplicates := dupIgnore;
@@ -24698,7 +24699,7 @@ begin
   ObjType := ObjectTypeName(VarNode);
   if (ObjType = '') or (FindUDT(ObjType) < 0) then Exit;
   RhsType := UpperCase(ObjectTypeName(ExprNode));
-  Cands := TStringList.Create;
+  Cands := TIndexedStringList.Create;
   try
     MethodOverloadLabels(ObjType, 'OPERATORLET', Cands);
     if Cands.Count = 0 then Exit;
@@ -26268,7 +26269,7 @@ begin
     // ⛔ A candidate that DOES carry a tail must still match it, or the UDT overload would be claimed
     // here by any int-banked request - a UDT handle signs 'I' exactly like an Integer.
     WantBanks := '';
-    Parts := TStringList.Create;
+    Parts := TIndexedStringList.Create;
     try
       Parts.StrictDelimiter := True;
       Parts.Delimiter := ',';
@@ -28209,8 +28210,8 @@ var
   end;
 
 begin
-  Known := TStringList.Create;
-  Consts := TStringList.Create;
+  Known := TIndexedStringList.Create;
+  Consts := TIndexedStringList.Create;
   try
     for b := 0 to FProgram.Blocks.Count - 1 do
     begin
@@ -29390,7 +29391,7 @@ var
   Firsts: TStringList;
 begin
   FMemberAliasLabel.Clear;
-  Firsts := TStringList.Create;
+  Firsts := TIndexedStringList.Create;
   try
     Firsts.CaseSensitive := False;
     for u := 0 to High(FUDTs) do
@@ -30476,7 +30477,7 @@ var
 begin
   Result := '';
   Arity := StrToIntDef(Node.Attributes.Values['SIGARITY'], -1);
-  L := TStringList.Create;
+  L := TIndexedStringList.Create;
   try
     AddrOfMemberBases(MethNm, Node.Attributes.Values['SIGKIND'],
                       Node.Attributes.Values['SIGRET'], L);
@@ -31249,7 +31250,7 @@ var
 begin
   Result := False;
   if (DeclTail = '') or (NotRecMask = '') then Exit;
-  L := TStringList.Create;
+  L := TIndexedStringList.Create;
   try
     L.Delimiter := ',';
     L.StrictDelimiter := True;
@@ -31287,8 +31288,8 @@ var
   i: Integer;
 begin
   Result := False;
-  C := TStringList.Create;
-  D := TStringList.Create;
+  C := TIndexedStringList.Create;
+  D := TIndexedStringList.Create;
   try
     C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := CallTail;
     D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
@@ -31354,8 +31355,8 @@ var
   i: Integer;
 begin
   Result := False;
-  C := TStringList.Create;
-  D := TStringList.Create;
+  C := TIndexedStringList.Create;
+  D := TIndexedStringList.Create;
   try
     C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := A;
     D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := B;
@@ -31381,8 +31382,8 @@ var
   i, d1: Integer;
 begin
   Result := -1;
-  C := TStringList.Create;
-  D := TStringList.Create;
+  C := TIndexedStringList.Create;
+  D := TIndexedStringList.Create;
   try
     C.Delimiter := ','; C.StrictDelimiter := True; C.DelimitedText := CallTail;
     D.Delimiter := ','; D.StrictDelimiter := True; D.DelimitedText := DeclTail;
@@ -32688,7 +32689,7 @@ begin
   // question, and only one going through the funnel - the shape this project keeps recording.
   if OwnerT <> '' then
   begin
-    Cands := TStringList.Create;
+    Cands := TIndexedStringList.Create;
     try
       AddrOfMemberBases(Copy(Base, Length(OwnerT) + 2, MaxInt), SigKind, SigRet, Cands);
       if GetEnvironmentVariable('PROCPTRDIAG') = '1' then
@@ -32761,7 +32762,7 @@ var
   L: TStringList;
 begin
   Result := '';
-  L := TStringList.Create;
+  L := TIndexedStringList.Create;
   try
     MethodOverloadLabels(TypeName, MethNm, L);
     if L.Count > 0 then Result := L[0];
@@ -32795,7 +32796,7 @@ var
 begin
   Result := '';
   if WantParam = '' then Exit;
-  L := TStringList.Create;
+  L := TIndexedStringList.Create;
   try
     MethodOverloadLabels(TypeName, MethNm, L);
     for i := 0 to L.Count - 1 do
@@ -32873,7 +32874,7 @@ begin
       // carries the implicit THIS first, so the comparison starts at its SECOND entry.
       if Want <> '' then
       begin
-        L1 := TStringList.Create; L2 := TStringList.Create;
+        L1 := TIndexedStringList.Create; L2 := TIndexedStringList.Create;
         try
           L1.StrictDelimiter := True; L1.Delimiter := ','; L1.DelimitedText := Ps;
           L2.StrictDelimiter := True; L2.Delimiter := ','; L2.DelimitedText := Want;
@@ -35345,8 +35346,8 @@ var
   i: Integer;
 begin
   if (Node = nil) or (FCurrentProcNonRecs = nil) or (not FModernMode) then Exit;
-  UdtNames := TStringList.Create;
-  PlainNames := TStringList.Create;
+  UdtNames := TIndexedStringList.Create;
+  PlainNames := TIndexedStringList.Create;
   try
     UdtNames.CaseSensitive := False;
     PlainNames.CaseSensitive := False;
@@ -35750,7 +35751,7 @@ var
   Taken: array of Boolean;
 begin
   if (L = nil) or (L.Count < 2) then Exit;
-  Ordered := TStringList.Create;
+  Ordered := TIndexedStringList.Create;
   try
     SetLength(Taken, L.Count);
     for i := 0 to L.Count - 1 do Taken[i] := False;
@@ -36200,9 +36201,9 @@ begin
   F.Kind := Kind;
   F.Serial := FNextScopeSerial;
   Inc(FNextScopeSerial);
-  F.Bindings := TStringList.Create;
+  F.Bindings := TIndexedStringList.Create;
   F.Bindings.CaseSensitive := False;
-  F.Dtors := TStringList.Create;
+  F.Dtors := TIndexedStringList.Create;
   F.Dtors.CaseSensitive := False;
   F.RecMarkEmitted := False;
   F.IsLoopBody := False;
@@ -37720,7 +37721,7 @@ begin
   // in the procedure at all.
   if Node.NodeType = antProcedureDecl then
   begin
-    ProcDict := TStringList.Create;
+    ProcDict := TIndexedStringList.Create;
     try
       ProcDict.CaseSensitive := False;
       // InProc: everything under here IS a procedure body, so its pointer DIMs must not overwrite a
@@ -38146,8 +38147,8 @@ var
   Dict, ByrefRetNames, WFixed: TStringList;
 begin
   if Node = nil then Exit;
-  Dict := TStringList.Create;
-  ByrefRetNames := TStringList.Create;
+  Dict := TIndexedStringList.Create;
+  ByrefRetNames := TIndexedStringList.Create;
   WFixed := nil;
   try
     FFixedStrNames.Clear;
@@ -38166,7 +38167,7 @@ begin
     // Without this the same program read the bytes into the managed register while the buffer stayed
     // zero, and which of the two a later "w(i)" answered depended on whether the program happened to
     // take the variable's address somewhere else.
-    WFixed := TStringList.Create;
+    WFixed := TIndexedStringList.Create;
     try
       CollectFixedWStringNames(Node, WFixed);
       if WFixed.Count > 0 then MarkBinaryIOFixedWStrings(Node, WFixed, Dict);
@@ -42312,7 +42313,7 @@ begin
     RetIsByref := True;
     RetPart := Copy(RetPart, 1, Length(RetPart) - 6);
   end;
-  ParamList := TStringList.Create;
+  ParamList := TIndexedStringList.Create;
   try
     ParamList.StrictDelimiter := True;
     ParamList.Delimiter := ',';

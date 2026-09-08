@@ -685,8 +685,10 @@ begin
             end;
             {$ENDIF}
 
-            // Extract removes without freeing, then we free manually
-            Block.Instructions.Extract(Block.Instructions[j]).Free;
+            // ⛔ NOT Extract(Instructions[j]): Extract takes an OBJECT and scans from index 0 to find
+            // it, though this loop already holds j - removing R instructions from a block of N cost
+            // R x N/2 comparisons. The list is built with Create(True), so Delete frees it just the same.
+            Block.Instructions.Delete(j);
             Inc(FRemovedCount);
           end;
         end;

@@ -986,6 +986,11 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      // ⛔ Its own mark. Without one, PassMark('DBE') was the first mark after ssa-gen and it billed
+      // SubInlining and XferForwarding to DEAD BLOCK ELIMINATION: on fbc's compound/select_const2 the
+      // line read 5.0 s while DBE itself, timed from inside, took 0.45 s. A phase that carries another
+      // pass's time sends the next reader to the wrong unit.
+      PassMark('SubInlining');
       // ARGUMENT-SLOT FORWARDING - immediately after inlining, and only useful there. Inlining
       // splices the callee's body in but leaves the argument protocol around it: the arguments are
       // staged into the transfer bank and read straight back out, with no call in between any more.
@@ -1000,6 +1005,7 @@ begin
           WriteLn('Continuing...');
         end;
       end;
+      PassMark('XferForwarding');
       {$ENDIF}
 
       {$IFNDEF DISABLE_DBE}
@@ -2519,6 +2525,15 @@ var
   VerifyI: Integer;
 
 begin
+    // ⛔ EVERY unit declares {$codepage UTF8}, so a string LITERAL carries code page 65001 - while a
+    // string BUILT at run time carries DefaultSystemCodePage, which is CP_ACP (0) because no cwstring
+    // unit is linked. FPC compares the two code pages on every concatenation: when they differ it takes
+    // ansistr_concat_COMPLEX, which converts BOTH operands to UnicodeString, concatenates, and converts
+    // the result back. So `s := s + 'literal'` - the single most common statement in this compiler - was
+    // paying a full UTF-16 round trip, and AnsiCompareText paid the same conversion on both arguments.
+    // Naming the two code pages the same makes both take the byte path. Measured: concatenation 7.0x,
+    // AnsiCompareText 3.5x (200k iterations, 98 -> 14 ms and 21 -> 6 ms).
+    SetMultiByteConversionCodePage(CP_UTF8);
   try
     // Mask the FPU/SSE exceptions so floating-point overflow/invalid/div-by-zero produce IEEE Inf/NaN
     // (FreeBASIC/C semantics) instead of raising a Pascal exception that would abort the program. FPC
