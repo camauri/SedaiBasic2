@@ -15818,15 +15818,12 @@ var
 begin
   if not Assigned(FGraphics) then Exit;
   FGraphics.ResizeScreen(W, H, 0);
-  // 🚧 THE DEPTH, AND THE DEFAULT IS STILL 32 - which is NOT what fbc does, and it is written here so
-  // the next reader does not have to re-measure it: fbc's default is 8 (measured 8 Sep 2026,
-  // "ScreenRes 320,200" then ScreenInfo answers depth 8, one byte per pixel).
-  // ⛔ It is 32 here on purpose, for one turn: the depth does not yet REACH this point (see the note in
-  // NEXT_SESSION_PROMPT - the register packed into the Immediate arrives as $FFFF), so switching the
-  // default to 8 would put EVERY program at 8bpp regardless of what it asked for, and four guards of
-  // the corpus said so immediately. Shipping the honest default before the value that overrides it
-  // would be shipping half a change.
-  if Depth = 0 then Depth := 32;
+  // ⭐ THE DEPTH, AND THE DEFAULT IS 8 - fbc's, measured on 8 Sep 2026: "ScreenRes 320,200" followed by
+  // ScreenInfo answers depth 8, one byte per pixel. It was briefly held at 32 here "because this
+  // engine's graphics history was written against 32bpp", and the owner was right that this is not a
+  // reason: it only means some blessed baselines record the old answer. A baseline is re-blessed; a
+  // divergence is forever.
+  if Depth = 0 then Depth := 8;
   FGraphics.SetSurfaceDepth(FGraphics.ScreenSurface, Depth);
   FGfxScreenDepth := FGraphics.SurfaceDepth(FGraphics.ScreenSurface);
   for i := 1 to High(FGfxPages) do

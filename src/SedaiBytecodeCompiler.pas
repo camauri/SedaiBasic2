@@ -811,6 +811,30 @@ begin
 
   // Special handling for BOX - pack 8 parameters into bytecode format
   // BOX color, x1, y1, x2, y2, angle, filled, fill_color
+  // ⭐ ssaGfxScreenRes: Src1=w, Src2=h, Src3 const = pages|flags, and PhiSources[0] - when present - is
+  // the DEPTH's register. It is mapped HERE, with the same MapSSARegisterToBytecode every other operand
+  // gets: $FFFF in bits 32..47 means the argument was not given, and fbc's default then applies.
+  if Instr.OpCode = ssaGfxScreenRes then
+  begin
+    BCOp := bcGfxScreenRes;
+    BCInstr := MakeBytecodeInstruction(BCOp, 0, 0, 0, 0);
+    if Instr.Src1.Kind = svkRegister then
+      BCInstr.Src1 := MapSSARegisterToBytecode(Instr.Src1.RegType, Instr.Src1.RegIndex, Instr.Src1.Version);
+    if Instr.Src2.Kind = svkRegister then
+      BCInstr.Src2 := MapSSARegisterToBytecode(Instr.Src2.RegType, Instr.Src2.RegIndex, Instr.Src2.Version);
+    BCInstr.Immediate := 0;
+    if Instr.Src3.Kind = svkConstInt then BCInstr.Immediate := Instr.Src3.ConstInt and $FFFFFFFF;
+    if (Length(Instr.PhiSources) >= 1) and (Instr.PhiSources[0].Value.Kind = svkRegister) then
+      BCInstr.Immediate := BCInstr.Immediate or
+        ((Int64(MapSSARegisterToBytecode(Instr.PhiSources[0].Value.RegType,
+                                         Instr.PhiSources[0].Value.RegIndex,
+                                         Instr.PhiSources[0].Value.Version)) and $FFFF) shl 32)
+    else
+      BCInstr.Immediate := BCInstr.Immediate or (Int64($FFFF) shl 32);
+    FProgram.AddInstructionWithLine(BCInstr, Instr.SourceLine);
+    Exit;
+  end;
+
   // SSA: Src1=color, Src2=x1, Src3=y1, PhiSources[0..4]=x2,y2,angle,filled,fill_color
   if Instr.OpCode = ssaGraphicBox then
   begin

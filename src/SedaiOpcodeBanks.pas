@@ -1169,6 +1169,15 @@ begin
     bcGfxPset, bcGfxPaint, bcGfxPaintBorder, bcGfxLine, bcGfxLineStyled,
     bcGfxCircle, bcGfxCircleEx, bcGfxCircleExF, bcGfxGet, bcGfxPut, bcGfxView, bcGfxWindow,
     bcGfxImageCreate, bcGfxImageConvertRow,
+    // ⛔ bcGfxScreenRes CARRIES A REGISTER TOO, and this was the last of the THREE places a register
+    // packed into an Immediate has to be named: the bank sizer (RunFast's pre-scan), the register
+    // compactor's remap, and this liveness scan. Two of the three were done and the third was not, so
+    // the depth's register looked DEAD, the compactor was free to reuse its number, and the VM read
+    // whatever landed there - which came out as "no depth given" and put every screen at the default.
+    // ⚠️ The candidate list below is deliberately over-generous (it offers every field slicing an
+    // Immediate can have): being INCOMPLETE here deletes a live definition, being generous only costs
+    // a register that stays alive a little longer. Same polarity note as Src1IsArrayId.
+    bcGfxScreenRes,
     bcGraphicBox, bcGraphicRGBA, bcGraphicSetMode:
       begin
         Imm := Instr.Immediate;

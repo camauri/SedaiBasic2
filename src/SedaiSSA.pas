@@ -18654,7 +18654,9 @@ procedure TSSAGenerator.ProcessScreenRes(Node: TASTNode);
 // num_pages (a compile-time constant, default 1) sets up page flipping.
 var
   WVal, HVal, NVal, WReg, HReg: TSSAValue;
-  NumPages, Flags, Depth: Int64;
+  NumPages, Flags: Int64;
+  DepthReg: TSSAValue;
+  HasDepth: Boolean;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 2) then Exit;
   ProcessExpression(Node.GetChild(0), WVal); WReg := EnsureIntRegister(WVal);
@@ -18665,11 +18667,17 @@ begin
   // with d a variable is legal and real code writes it that way (retrogra picks the depth from
   // SCREENLIST). Reading it as a compile-time constant made every non-literal depth read as "absent".
   // $FFFF in bits 32..47 = the argument was not given.
-  Depth := $FFFF;
+  // ⛔ THE DEPTH IS AN EXTRA REGISTER, so it travels the way every other extra register in this file
+  // does: AddPhiSource. Writing its SSA index straight into the Immediate looked equivalent and was
+  // not - the bytecode compiler RENUMBERS registers, so the VM read whichever value had landed at the
+  // old index and fell back to the default for every program. There is one mechanism for this and it
+  // is not "pack it yourself".
+  HasDepth := False;
   if Node.ChildCount >= 3 then
   begin
     ProcessExpression(Node.GetChild(2), NVal);
-    Depth := EnsureIntRegister(NVal).RegIndex;
+    DepthReg := EnsureIntRegister(NVal);
+    HasDepth := True;
   end;
   NumPages := 1;
   if Node.ChildCount >= 4 then
@@ -18690,8 +18698,9 @@ begin
     else if NVal.Kind = svkConstFloat then Flags := Trunc(NVal.ConstFloat);
   end;
   EmitInstruction(ssaGfxScreenRes, MakeSSAValue(svkNone), WReg, HReg,
-                  MakeSSAConstInt((NumPages and $FFFF) or ((Flags and $FFFF) shl 16) or
-                                  ((Depth and $FFFF) shl 32)));
+                  MakeSSAConstInt((NumPages and $FFFF) or ((Flags and $FFFF) shl 16)));
+  if HasDepth then
+    FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1].AddPhiSource(DepthReg, nil);
 end;
 
 procedure TSSAGenerator.EmitPenCoordRegs(out PenX, PenY: TSSAValue);
