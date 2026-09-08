@@ -92,36 +92,120 @@ begin
   Result := AbiUnavailableReason;
 end;
 
+function TryOpen(const ASpelling: string; const APaths: TStringList): TLibHandle;
+// One spelling, asked of the loader first (no path: it searches where IT searches - LD_LIBRARY_PATH,
+// ld.so.cache, the standard directories) and then of every directory we were told about.
+var
+  j: Integer;
+begin
+  Result := LoadLibrary(ASpelling);
+  if Result <> NilHandle then Exit;
+  if APaths = nil then Exit;
+  for j := 0 to APaths.Count - 1 do
+  begin
+    Result := LoadLibrary(APaths[j] + ASpelling);
+    if Result <> NilHandle then Exit;
+  end;
+end;
+
 function FFILoadLibrary(const AName: string): TLibHandle;
-// The spellings a program may write: "zip", "libzip.so.5", "libzip.so". #inclib names the FIRST, so
-// the decorated forms are tried around it - which is what a linker would have done.
+// ⛔⛔ A LIBRARY IS NOT INSTALLED UNDER THE NAME A PROGRAM WRITES. "#inclib "zip"" is what a LINKER
+// reads, and a linker resolves it through libzip.so - the DEVELOPMENT symlink, which is in the -dev
+// package and is absent on a machine that merely RUNS things. What is actually there is the SONAME:
+// libzip.so.5. So the decorated spellings are not enough, and this is the shape that made a program
+// with libzip installed report "the symbol was not found".
+//
+// ⭐ THE VERSIONED SPELLINGS ARE ASKED OF THE LOADER BY NAME, NOT LOOKED FOR IN DIRECTORIES WE NAME.
+// "libzip.so.5" with no path sends the loader to ld.so.cache and the standard directories - wherever
+// this system keeps them - so no directory is written into this file (owner: no hard-coded paths).
+// Counted DOWNWARDS, so the highest version present wins, which is what a linker would have picked.
+// ⚠️ The scan only runs when the plain spellings failed, so a library that is properly installed
+// costs nothing; a missing one costs a few dozen failed dlopen calls, once.
+//
+// ...and where a directory IS known (a "-p" or a "libpath ="), the versioned file is found by LOOKING,
+// which is exact and needs no guess about the number.
+const
+  MAX_SONAME_VERSION = 40;   // libffi is at 8, libstdc++ at 6; 40 is slack, and it is only a loop bound
 var
   Cands: array[0..3] of string;
-  i, j: Integer;
+  i, v, Best, Dot: Integer;
+  Base, Cand, BestName: string;
+  Paths: TStringList;
+  SR: TSearchRec;
 begin
   Result := NilHandle;
   if AName = '' then Exit;
+  PullLibPathsFromConfig;
+  Paths := GLibPaths;
+
+  // 1. The spellings a program may write, and the decorations a linker would have added.
   Cands[0] := AName;
   {$IFDEF WINDOWS}
   Cands[1] := AName + '.dll';        Cands[2] := 'lib' + AName + '.dll';  Cands[3] := AName;
   {$ELSE}
   Cands[1] := 'lib' + AName + '.so'; Cands[2] := AName + '.so';           Cands[3] := 'lib' + AName;
   {$ENDIF}
-  // First as the loader would see it: an absolute path, or a name it can resolve on its own.
   for i := 0 to 3 do
   begin
-    Result := LoadLibrary(Cands[i]);
+    Result := TryOpen(Cands[i], Paths);
     if Result <> NilHandle then Exit;
   end;
-  // ...then every directory we were TOLD about, each spelling tried inside it.
-  PullLibPathsFromConfig;
-  if GLibPaths <> nil then
-    for j := 0 to GLibPaths.Count - 1 do
-      for i := 0 to 3 do
-      begin
-        Result := LoadLibrary(GLibPaths[j] + Cands[i]);
-        if Result <> NilHandle then Exit;
-      end;
+  // A name the program already wrote WITH a version ("libzip.so.5") is done: it either opened above or
+  // it is not there, and appending more numbers to it would be nonsense.
+  if Pos('.so.', AName) > 0 then Exit;
+  {$IFDEF WINDOWS}
+  if Pos('.dll', LowerCase(AName)) > 0 then Exit;
+  {$ENDIF}
+
+  // 2. The SONAME. On Windows the same idea wears a different spelling: libffi-8.dll, libpng16-16.dll.
+  {$IFDEF WINDOWS}
+  Base := 'lib' + AName + '-';
+  for v := MAX_SONAME_VERSION downto 0 do
+  begin
+    Result := TryOpen(Base + IntToStr(v) + '.dll', Paths);
+    if Result <> NilHandle then Exit;
+    Result := TryOpen(AName + '-' + IntToStr(v) + '.dll', Paths);
+    if Result <> NilHandle then Exit;
+  end;
+  {$ELSE}
+  Base := 'lib' + AName + '.so.';
+  for v := MAX_SONAME_VERSION downto 0 do
+  begin
+    Result := TryOpen(Base + IntToStr(v), Paths);
+    if Result <> NilHandle then Exit;
+  end;
+  {$ENDIF}
+
+  // 3. ...and in a directory we were GIVEN, look instead of guessing: the full name may carry a minor
+  // ("libzip.so.5.5") that no counted scan would reach.
+  if Paths = nil then Exit;
+  for i := 0 to Paths.Count - 1 do
+  begin
+    Best := -1; BestName := '';
+    {$IFDEF WINDOWS}
+    if FindFirst(Paths[i] + '*' + AName + '*.dll', faAnyFile, SR) = 0 then
+    {$ELSE}
+    if FindFirst(Paths[i] + 'lib' + AName + '.so.*', faAnyFile, SR) = 0 then
+    {$ENDIF}
+    begin
+      repeat
+        // Rank by the FIRST version number, so .so.5.5 beats .so.4.9 and .so.5 ties with .so.5.5 -
+        // and among ties the longer (more specific) name is the real file rather than a symlink.
+        Cand := SR.Name;
+        Dot := Pos('.so.', Cand);
+        v := 0;
+        if Dot > 0 then v := StrToIntDef(Copy(Cand, Dot + 4, Pos('.', Cand + '.', Dot + 4) - Dot - 4), 0);
+        if (v > Best) or ((v = Best) and (Length(Cand) > Length(BestName))) then
+        begin Best := v; BestName := Cand; end;
+      until FindNext(SR) <> 0;
+      FindClose(SR);
+    end;
+    if BestName <> '' then
+    begin
+      Result := LoadLibrary(Paths[i] + BestName);
+      if Result <> NilHandle then Exit;
+    end;
+  end;
 end;
 
 function FFISymbol(ALib: TLibHandle; const AName: string): Pointer;

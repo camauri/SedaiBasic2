@@ -19290,10 +19290,15 @@ procedure TSSAGenerator.ProcessImageInfo(Node: TASTNode);
 // synthetic assignments "var = __IMGINFO(handle, which)" reusing the assignment machinery (handle cloned).
 var
   Assign, Call, ArgList, WhichLit: TASTNode;
-  i: Integer;
+  i, Last: Integer;
 begin
   if (FCurrentBlock = nil) or (Node.ChildCount < 3) then Exit;
-  for i := 0 to 1 do
+  // ⭐ Up to FOUR destinations now - w, h, bpp, pitch - because fbc's IMAGEINFO takes them and real
+  // code uses the later ones. Bounded by what the caller actually passed, so the two- and three-argument
+  // spellings are untouched.
+  Last := Node.ChildCount - 2;
+  if Last > 3 then Last := 3;
+  for i := 0 to Last do
   begin
     WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
     ArgList := TASTNode.Create(antArgumentList, Node.Token);
@@ -19323,7 +19328,7 @@ var
 begin
   StatusReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   MaxArgs := ArgListNode.ChildCount - 1;      // arg 0 is the handle; the rest are destinations
-  if MaxArgs > 2 then MaxArgs := 2;           // w and h, the two this engine reports
+  if MaxArgs > 4 then MaxArgs := 4;           // w, h, bpp, pitch - the four this engine reports
   for i := 0 to MaxArgs - 1 do
   begin
     // An omitted slot ("ImageInfo(img, , h)") is an empty placeholder: skip it, do not write to it.

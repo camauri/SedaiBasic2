@@ -16341,14 +16341,29 @@ begin
     37: // bcGfxImageDestroy - IMAGEDESTROY handle
       if Assigned(FGraphics) then
         FGraphics.DestroySurface(Ctx.IntRegs[Instr.Src1]);
-    38: // bcGfxImageInfo - __IMGINFO(handle, which): width (0) / height (1)
+    38: // bcGfxImageInfo - __IMGINFO(handle, which): width (0) / height (1) / bpp (2) / pitch (3)
+      // ⛔ bpp AND pitch WERE MISSING, and a program that asked for them got 0 - not an error, a
+      // NUMBER, which is the kind of answer that propagates. fbc's IMAGEINFO takes up to six
+      // arguments and real code uses the later ones: retrogra reads the pitch to walk the rows of an
+      // image it just created ("IMAGEINFO buffer, dummy, dummy, dummy, lw8, p8"), and a pitch of 0
+      // makes every row land on the first one.
+      // ⚠️ Every surface this engine allocates is 32bpp - the software backend has one pixel format -
+      // so bpp is 4 BYTES PER PIXEL, which is what fbc reports there (not 32: fbc's field is bytes).
+      // The pitch follows from the width, and is where a caller expects the row stride in BYTES.
       if Assigned(FGraphics) then
-      begin
-        if Instr.Immediate = 0 then
-          Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(Ctx.IntRegs[Instr.Src1])
+        case Instr.Immediate of
+          0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(Ctx.IntRegs[Instr.Src1]);
+          1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(Ctx.IntRegs[Instr.Src1]);
+          2: Ctx.IntRegs[Instr.Dest] := 4;      // bytes per pixel, always 32bpp here
+          3: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(Ctx.IntRegs[Instr.Src1]) * 4;
         else
-          Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(Ctx.IntRegs[Instr.Src1]);
-      end
+          // 4 would be the POINTER to the pixels, and it is deliberately not answered yet: an image
+          // surface is a table entry here, not a block of the raw heap, so there is no address to
+          // give. Answering 0 is the truthful "no pointer"; inventing one would be an address that
+          // dereferences into nothing. See the note in NEXT_SESSION_PROMPT: it needs a pointer REGION
+          // of its own, the way SCREENPTR has one.
+          Ctx.IntRegs[Instr.Dest] := 0;
+        end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
     39: // bcGfxGet - GET [src,] (x1,y1)-(x2,y2),dst : capture a rect into image dst (per-pixel copy)

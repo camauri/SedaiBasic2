@@ -3341,7 +3341,7 @@ End Function
 | `IMAGECREATE` | ✓ | `IMAGECREATE(w,h[,color])` allocates a truecolor image surface and returns an integer handle (via IGraphicsBackend; software-backed, headless-testable). Default fill is the transparent key (magenta). |
 | `IMAGEDESTROY` | ✓ | `IMAGEDESTROY handle` frees an image surface (the id slot is reused by a later IMAGECREATE). |
 | `IMAGECONVERTROW` | ✗ | Converts a row of pixels in an image buffer to a different color depth. |
-| `IMAGEINFO` | ✓ | `IMAGEINFO handle, w, h` writes the surface width/height into the w and h variables. (Pitch/depth/pixel-pointer forms deferred.) |
+| `IMAGEINFO` | ✓ | `IMAGEINFO handle, w [, h [, bpp [, pitch]]]` writes the surface's width, height, **bytes per pixel** and **row pitch in bytes** into the variables given (8 Sep 2026: bpp and pitch used to answer 0, which is a NUMBER and not an error - a pitch of 0 makes every row land on the first). Every surface here is 32bpp, so bpp is always 4, as fbc reports it. ⚠️ fbc's sixth argument, the POINTER to the pixels, answers 0: an image surface is a table entry here, not a block of addressable memory. Declared divergence. Also accepted as the function form `IMAGEINFO(...)`, which answers 0 for a valid image. |
 | `BLOAD` | ✓ | Creates an image buffer from a file. |
 | `BSAVE` | ✓ | Saves an image buffer to a file. |
 
