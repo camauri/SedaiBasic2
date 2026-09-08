@@ -618,7 +618,7 @@ begin
         29: if FloatRegs[Instr^.Src1] <> 0.0 then CurPC := Instr^.Immediate else Inc(CurPC); // bcBranchNeZeroFloat
 
         // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded: OOB store dropped (MODERN), CLASSIC raises.
-        30: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := Instr^.Immediate; Inc(CurPC); end; // bcArrayStoreIntConst
+        30: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], Instr^.Immediate); Inc(CurPC); end; // bcArrayStoreIntConst
         31: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
         32: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
 
@@ -737,7 +737,7 @@ begin
           begin
             ArrIdxW := ArrMapP[Instr^.Src1];
             if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) and
-               (FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] <> 0) then
+               (ArrGetInt(FArrays[ArrIdxW], IntRegs[Instr^.Src2]) <> 0) then
               CurPC := Instr^.Immediate
             else
               Inc(CurPC);
@@ -746,7 +746,7 @@ begin
           begin
             ArrIdxW := ArrMapP[Instr^.Src1];
             if (not ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2])) or
-               (FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] = 0) then
+               (ArrGetInt(FArrays[ArrIdxW], IntRegs[Instr^.Src2]) = 0) then
               CurPC := Instr^.Immediate
             else
               Inc(CurPC);
@@ -764,9 +764,9 @@ begin
               LStartIdx := LEndIdx;
             while LStartIdx < LEndIdx do
             begin
-              Ctx.SwapTempInt := FArrays[ArrIdxW].IntData[LStartIdx];
-              FArrays[ArrIdxW].IntData[LStartIdx] := FArrays[ArrIdxW].IntData[LEndIdx];
-              FArrays[ArrIdxW].IntData[LEndIdx] := Ctx.SwapTempInt;
+              Ctx.SwapTempInt := ArrGetInt(FArrays[ArrIdxW], LStartIdx);
+              ArrSetIntAt(ArrIdxW, LStartIdx, ArrGetInt(FArrays[ArrIdxW], LEndIdx));
+              ArrSetIntAt(ArrIdxW, LEndIdx, Ctx.SwapTempInt);
               Inc(LStartIdx);
               Dec(LEndIdx);
             end;
@@ -782,14 +782,14 @@ begin
             // Bounds-guard the touched range [start .. end+1] once; skip the whole rotate if OOB (MODERN).
             if ArrayBoundsOK(ArrIdxW, LStartIdx) and ArrayBoundsOK(ArrIdxW, LEndIdx + 1) then
             begin
-              LFirstVal := FArrays[ArrIdxW].IntData[LStartIdx];
+              LFirstVal := ArrGetInt(FArrays[ArrIdxW], LStartIdx);
               LLoopIdx := LStartIdx;
               while LLoopIdx <= LEndIdx do
               begin
-                FArrays[ArrIdxW].IntData[LLoopIdx] := FArrays[ArrIdxW].IntData[LLoopIdx + 1];
+                ArrSetIntAt(ArrIdxW, LLoopIdx, ArrGetInt(FArrays[ArrIdxW], LLoopIdx + 1));
                 Inc(LLoopIdx);
               end;
-              FArrays[ArrIdxW].IntData[LEndIdx + 1] := LFirstVal;
+              ArrSetIntAt(ArrIdxW, LEndIdx + 1, LFirstVal);
             end;
             Inc(CurPC);
           end;
@@ -801,9 +801,9 @@ begin
             if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) and
                ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Dest]) then
             begin
-              Ctx.SwapTempInt := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]];
-              FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Dest]];
-              FArrays[ArrIdxW].IntData[IntRegs[Instr^.Dest]] := Ctx.SwapTempInt;
+              Ctx.SwapTempInt := ArrGetInt(FArrays[ArrIdxW], IntRegs[Instr^.Src2]);
+              ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], ArrGetInt(FArrays[ArrIdxW], IntRegs[Instr^.Dest]));
+              ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Dest], Ctx.SwapTempInt);
             end;
             Inc(CurPC);
           end;
@@ -816,7 +816,7 @@ begin
         58: begin
             ArrIdxW := ArrMapP[Instr^.Src1];
             if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
-              IntRegs[Instr^.Dest] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]]
+              IntRegs[Instr^.Dest] := ArrGetInt(FArrays[ArrIdxW], IntRegs[Instr^.Src2])
             else
               IntRegs[Instr^.Dest] := 0;
             Inc(CurPC);
@@ -829,9 +829,9 @@ begin
             if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
             begin
               if ArrayBoundsOK(ArrIdxW2, IntRegs[Instr^.Src2]) then
-                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW2].IntData[IntRegs[Instr^.Src2]]
+                ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], ArrGetInt(FArrays[ArrIdxW2], IntRegs[Instr^.Src2]))
               else
-                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := 0;
+                ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], 0);
             end;
             Inc(CurPC);
           end; // bcArrayCopyElement
@@ -842,9 +842,9 @@ begin
             if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then
             begin
               if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src1]) then
-                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src1]]
+                ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], ArrGetInt(FArrays[ArrIdxW], IntRegs[Instr^.Src1]))
               else
-                FArrays[ArrIdxW].IntData[IntRegs[Instr^.Src2]] := 0;
+                ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], 0);
             end;
             Inc(CurPC);
           end; // bcArrayMoveElement

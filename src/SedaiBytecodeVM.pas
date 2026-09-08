@@ -760,7 +760,13 @@ type
       ⚠️ INLINE, and deliberately: this pair sits on the array hot path, and the 64-bit case must stay a
       single indexed load. }
     function ArrGetInt(const A: TArrayStorage; Idx: Integer): Int64; inline;
-    procedure ArrSetInt(var A: TArrayStorage; Idx: Integer; V: Int64); inline;
+    { ⛔⛔ THE WRITE TAKES THE ARRAY'S INDEX, NOT THE RECORD BY REFERENCE, and that is not a style
+      choice. "A.IntData[i] := <expr>" evaluates <expr> and only then touches A; a call
+      "ArrSetInt(A, i, <expr>)" binds the var-parameter FIRST, so an <expr> that makes FArrays grow or
+      remaps it - which several of them do - leaves the reference dangling. That is a core dump, and it
+      is what 417 corpus failures looked like on the first attempt. Taking the INDEX defers resolving
+      FArrays until after the value exists, which restores the original order exactly. }
+    procedure ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
@@ -5406,7 +5412,7 @@ begin
   Lim := High(FArrays[ArrayIdx].IntData);
   while PtrOffset <= Lim do
   begin
-    Ch := FArrays[ArrayIdx].IntData[PtrOffset];
+    Ch := ArrGetInt(FArrays[ArrayIdx], PtrOffset);
     // ⚠️ A WIDE cell is one ELEMENT here, not two bytes: the array holds one code unit per element,
     // which is the same image the scalar loads see through this address.
     if Ch = 0 then Break;
@@ -5441,7 +5447,7 @@ begin
     for i := 1 to Length(W) do
     begin
       if PtrOffset > Lim then Exit;
-      FArrays[ArrayIdx].IntData[PtrOffset] := Ord(W[i]);
+      ArrSetIntAt(ArrayIdx, PtrOffset, Ord(W[i]));
       Inc(PtrOffset);
     end;
   end
@@ -5449,10 +5455,10 @@ begin
     for i := 1 to Length(Value) do
     begin
       if PtrOffset > Lim then Exit;
-      FArrays[ArrayIdx].IntData[PtrOffset] := Ord(Value[i]);
+      ArrSetIntAt(ArrayIdx, PtrOffset, Ord(Value[i]));
       Inc(PtrOffset);
     end;
-  if PtrOffset <= Lim then FArrays[ArrayIdx].IntData[PtrOffset] := 0;   // the terminator
+  if PtrOffset <= Lim then ArrSetIntAt(ArrayIdx, PtrOffset, 0);   // the terminator
 end;
 
 function TBytecodeVM.ImgHandleOf(V: Int64): Integer;
@@ -5556,7 +5562,7 @@ begin
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
   // The vector that IS populated is the discriminator - see the note in bcRefLoadInt.
   if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-    Result := FArrays[ArrayIdx].IntData[PtrOffset]
+    Result := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
   else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     Result := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
   else
@@ -5603,7 +5609,7 @@ begin
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
   if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-    FArrays[ArrayIdx].IntData[PtrOffset] := Value
+    ArrSetIntAt(ArrayIdx, PtrOffset, Value)
   else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Value
   else
@@ -6001,8 +6007,8 @@ begin
   // uninitialized slot. After a plain DIM every slot is 0, so all are filled; after REDIM [PRESERVE]
   // only the freshly-grown slots are 0, so existing records are kept (no clobber / leak).
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
-    if FArrays[ArrayId].IntData[k] = 0 then
-      FArrays[ArrayId].IntData[k] := AllocSharedRecord(ByteSize, StrC, TypeId);
+    if ArrGetInt(FArrays[ArrayId], k) = 0 then
+      ArrSetIntAt(ArrayId, k, AllocSharedRecord(ByteSize, StrC, TypeId));
 end;
 
 function TBytecodeVM.AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
@@ -6114,17 +6120,17 @@ begin
   end;
 end;
 
-procedure TBytecodeVM.ArrSetInt(var A: TArrayStorage; Idx: Integer; V: Int64);
+procedure TBytecodeVM.ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64);
 // ...and one element written at its own width, which is where the WRAP of a narrow type happens: an
 // out-of-range value truncates exactly as it does in FreeBASIC, because there is nowhere else for the
 // high bits to go.
 begin
-  case A.ElemWidth of
-    1: A.ByteData[Idx] := Byte(V);
-    2: PWord(@A.ByteData[Idx * 2])^ := Word(V);
-    4: PLongWord(@A.ByteData[Idx * 4])^ := LongWord(V);
+  case FArrays[ArrIdx].ElemWidth of
+    1: FArrays[ArrIdx].ByteData[Idx] := Byte(V);
+    2: PWord(@FArrays[ArrIdx].ByteData[Idx * 2])^ := Word(V);
+    4: PLongWord(@FArrays[ArrIdx].ByteData[Idx * 4])^ := LongWord(V);
   else
-    A.IntData[Idx] := V;
+    FArrays[ArrIdx].IntData[Idx] := V;
   end;
 end;
 
@@ -6227,21 +6233,21 @@ begin
   if FArrays[DestArr].TotalSize <> FArrays[SrcArr].TotalSize then
   begin
     for k := 0 to FArrays[DestArr].TotalSize - 1 do
-      if FArrays[DestArr].IntData[k] <> 0 then FreeSharedRecord(FArrays[DestArr].IntData[k]);
+      if ArrGetInt(FArrays[DestArr], k) <> 0 then FreeSharedRecord(ArrGetInt(FArrays[DestArr], k));
     FArrays[DestArr].ElementType := FArrays[SrcArr].ElementType;
     FArrays[DestArr].DimCount    := FArrays[SrcArr].DimCount;
     FArrays[DestArr].TotalSize   := FArrays[SrcArr].TotalSize;
     FArrays[DestArr].Dimensions  := Copy(FArrays[SrcArr].Dimensions);
     FArrays[DestArr].LowerBounds := Copy(FArrays[SrcArr].LowerBounds);
     SetLength(FArrays[DestArr].IntData, FArrays[SrcArr].TotalSize);
-    for k := 0 to FArrays[DestArr].TotalSize - 1 do FArrays[DestArr].IntData[k] := 0;
+    for k := 0 to FArrays[DestArr].TotalSize - 1 do ArrSetIntAt(DestArr, k, 0);
   end;
   for k := 0 to FArrays[SrcArr].TotalSize - 1 do
   begin
-    if FArrays[DestArr].IntData[k] = 0 then
-      FArrays[DestArr].IntData[k] := AllocSharedRecord(ByteSize, StrC, TypeId);
-    SrcRec := ResolveRec(Ctx, FArrays[SrcArr].IntData[k]);
-    DestRec := ResolveRec(Ctx, FArrays[DestArr].IntData[k]);
+    if ArrGetInt(FArrays[DestArr], k) = 0 then
+      ArrSetIntAt(DestArr, k, AllocSharedRecord(ByteSize, StrC, TypeId));
+    SrcRec := ResolveRec(Ctx, ArrGetInt(FArrays[SrcArr], k));
+    DestRec := ResolveRec(Ctx, ArrGetInt(FArrays[DestArr], k));
     if (SrcRec <> nil) and (DestRec <> nil) then
     begin
       DestRec^.TypeId := SrcRec^.TypeId;
@@ -9768,7 +9774,7 @@ begin
     // store path: MODERN drops an out-of-bounds store (memory-safe), CLASSIC/--bounds-check raises.
     30: // bcArrayStoreIntConst
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
-        FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] := Instr.Immediate;
+        ArrSetIntAt(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
     31: // bcArrayStoreFloatConst
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
         FArrays[Ctx.ArrMap[Instr.Src1]].FloatData[Ctx.IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
@@ -9856,13 +9862,13 @@ begin
     48: // bcArrayLoadIntBranchNZ: if arr[idx] <> 0 goto target
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
       begin
-        if FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] <> 0 then
+        if ArrGetInt(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Src2]) <> 0 then
           Ctx.PC := Instr.Immediate - 1;
       end;
     49: // bcArrayLoadIntBranchZ: if arr[idx] = 0 goto target
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
       begin
-        if FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] = 0 then
+        if ArrGetInt(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Src2]) = 0 then
           Ctx.PC := Instr.Immediate - 1;
       end
       else
@@ -9880,9 +9886,9 @@ begin
           Ctx.StartIdx := Ctx.EndIdx;   // MODERN: skip out-of-range reversal (CLASSIC already raised)
         while Ctx.StartIdx < Ctx.EndIdx do
         begin
-          Ctx.SwapTempInt := FArrays[Ctx.ArrIdxTmp].IntData[Ctx.StartIdx];
-          FArrays[Ctx.ArrIdxTmp].IntData[Ctx.StartIdx] := FArrays[Ctx.ArrIdxTmp].IntData[Ctx.EndIdx];
-          FArrays[Ctx.ArrIdxTmp].IntData[Ctx.EndIdx] := Ctx.SwapTempInt;
+          Ctx.SwapTempInt := ArrGetInt(FArrays[Ctx.ArrIdxTmp], Ctx.StartIdx);
+          ArrSetIntAt(Ctx.ArrIdxTmp, Ctx.StartIdx, ArrGetInt(FArrays[Ctx.ArrIdxTmp], Ctx.EndIdx));
+          ArrSetIntAt(Ctx.ArrIdxTmp, Ctx.EndIdx, Ctx.SwapTempInt);
           Inc(Ctx.StartIdx);
           Dec(Ctx.EndIdx);
         end;
@@ -9897,14 +9903,14 @@ begin
         // Bounds-guard the touched range [start .. end+1] once; skip the whole rotate if out of range (MODERN).
         if ArrayBoundsOK(Ctx.ArrIdxTmp, Ctx.StartIdx) and ArrayBoundsOK(Ctx.ArrIdxTmp, Ctx.EndIdx + 1) then
         begin
-          Ctx.FirstVal := FArrays[Ctx.ArrIdxTmp].IntData[Ctx.StartIdx];
+          Ctx.FirstVal := ArrGetInt(FArrays[Ctx.ArrIdxTmp], Ctx.StartIdx);
           Ctx.LoopIdx := Ctx.StartIdx;
           while Ctx.LoopIdx <= Ctx.EndIdx do
           begin
-            FArrays[Ctx.ArrIdxTmp].IntData[Ctx.LoopIdx] := FArrays[Ctx.ArrIdxTmp].IntData[Ctx.LoopIdx + 1];
+            ArrSetIntAt(Ctx.ArrIdxTmp, Ctx.LoopIdx, ArrGetInt(FArrays[Ctx.ArrIdxTmp], Ctx.LoopIdx + 1));
             Inc(Ctx.LoopIdx);
           end;
-          FArrays[Ctx.ArrIdxTmp].IntData[Ctx.EndIdx + 1] := Ctx.FirstVal;
+          ArrSetIntAt(Ctx.ArrIdxTmp, Ctx.EndIdx + 1, Ctx.FirstVal);
         end;
       end;
 
@@ -10067,9 +10073,9 @@ begin
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) and
          ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Dest]) then
       begin
-        Ctx.SwapTempInt := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]];
-        FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Dest]];
-        FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Dest]] := Ctx.SwapTempInt;
+        Ctx.SwapTempInt := ArrGetInt(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Src2]);
+        ArrSetIntAt(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], ArrGetInt(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Dest]));
+        ArrSetIntAt(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Dest], Ctx.SwapTempInt);
       end;
 
     // Self-increment/decrement (Int) - sub-opcodes 251-252
@@ -10081,7 +10087,7 @@ begin
     // Array Load to register (Int) - sub-opcode 253. Bounds-guarded: OOB read yields default 0 (MODERN); CLASSIC raises.
     58: // bcArrayLoadIntTo: r[dest] = arr[src1][r[src2]]
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
-        Ctx.IntRegs[Instr.Dest] := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]]
+        Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Src2])
       else
         Ctx.IntRegs[Instr.Dest] := 0;
 
@@ -10090,9 +10096,9 @@ begin
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2]) then
       begin
         if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
-          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Ctx.ArrMap[Instr.Src1]].IntData[Ctx.IntRegs[Instr.Src2]]
+          ArrSetIntAt(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2], ArrGetInt(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Src2]))
         else
-          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := 0;
+          ArrSetIntAt(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2], 0);
       end;
 
     // Array Move Element - sub-opcode 255. Bounds-guarded like 254.
@@ -10100,9 +10106,9 @@ begin
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2]) then
       begin
         if ArrayBoundsOK(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src1]) then
-          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src1]]
+          ArrSetIntAt(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2], ArrGetInt(FArrays[Ctx.ArrMap[Instr.Dest]], Ctx.IntRegs[Instr.Src1]))
         else
-          FArrays[Ctx.ArrMap[Instr.Dest]].IntData[Ctx.IntRegs[Instr.Src2]] := 0;
+          ArrSetIntAt(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2], 0);
       end;
 
   else
@@ -14149,7 +14155,7 @@ begin
     Exit;
   end;
   case FArrays[ArrayIdx].ElementType of
-    0: for k := 0 to High(FArrays[ArrayIdx].IntData) do FArrays[ArrayIdx].IntData[k] := 0;
+    0: for k := 0 to High(FArrays[ArrayIdx].IntData) do ArrSetIntAt(ArrayIdx, k, 0);
     1: for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
     2: for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
   end;
@@ -14177,7 +14183,7 @@ begin
     0: begin
          SetLength(FArrays[ArrayIdx].IntData, NewSize);
          if not Preserve then
-           for k := 0 to NewSize - 1 do FArrays[ArrayIdx].IntData[k] := 0;
+           for k := 0 to NewSize - 1 do ArrSetIntAt(ArrayIdx, k, 0);
        end;
     1: begin
          SetLength(FArrays[ArrayIdx].FloatData, NewSize);
@@ -14230,7 +14236,7 @@ begin
   case FArrays[ArrayIdx].ElementType of
     0: begin
          SetLength(FArrays[ArrayIdx].IntData, NewSize);
-         if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].IntData[k] := 0;
+         if not Preserve then for k := 0 to NewSize - 1 do ArrSetIntAt(ArrayIdx, k, 0);
        end;
     1: begin
          SetLength(FArrays[ArrayIdx].FloatData, NewSize);
@@ -14475,7 +14481,7 @@ begin
           srtInt:
             begin
               SetLength(FArrays[ArrayIdx].IntData, ProdDims);
-              for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].IntData[i] := 0;
+              for i := 0 to ProdDims - 1 do ArrSetIntAt(ArrayIdx, i, 0);
             end;
           srtFloat:
             begin
@@ -14527,7 +14533,7 @@ begin
         LinearIdx := Ctx.IntRegs[Instr.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
           case FArrays[ArrayIdx].ElementType of
-            0: Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+            0: Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx);
             1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
             2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
           end
@@ -14546,7 +14552,7 @@ begin
         LinearIdx := Ctx.IntRegs[Instr.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
           case FArrays[ArrayIdx].ElementType of
-            0: FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+            0: ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[Instr.Dest]);
             1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
             2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
           end;
@@ -14645,7 +14651,7 @@ begin
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
           if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].IntData[PtrOffset]
+            Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
           else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
             Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
           else
@@ -14724,7 +14730,7 @@ begin
           if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
             raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
           if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-            FArrays[ArrayIdx].IntData[PtrOffset] := Ctx.IntRegs[Instr.Src2]
+            ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2])
           else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
             PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
           else
@@ -15067,7 +15073,7 @@ begin
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
           LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].IntData[LinearIdx]
+          Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[PtrAddr], LinearIdx)
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
@@ -15097,7 +15103,7 @@ begin
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
           LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
         if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          FArrays[PtrAddr].IntData[LinearIdx] := Ctx.IntRegs[Instr.Dest];
+          ArrSetIntAt(PtrAddr, LinearIdx, Ctx.IntRegs[Instr.Dest]);
       end;
     41: // bcArrayStoreIndFloat (Dest = value register, READ)
       begin
@@ -16413,7 +16419,7 @@ begin
           end
           else
           begin
-            PalColor := UInt32(PalArr^.IntData[PalStart + PalK]);
+            PalColor := UInt32(ArrGetInt(PalArr^, PalStart + PalK));
             FGraphics.SetPaletteColor(TPaletteIndex(PalK),
               ((PalColor and $3F) * 255 div 63)                     // red
               or (((((PalColor shr 8) and $3F) * 255 div 63)) shl 8)
@@ -18512,7 +18518,7 @@ begin
                 end
                 else
                 begin
-                  BinI := BinArr^.IntData[k];
+                  BinI := ArrGetInt(BinArr^, k);
                   Move(BinI, Data[k * BinWidth + 1], BinWidth);   // little-endian low bytes
                 end;
               FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);

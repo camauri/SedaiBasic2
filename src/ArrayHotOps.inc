@@ -27,7 +27,7 @@
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          Ctx.IntRegs[InstrHot^.Dest] := FArrays[ArrayIdx].IntData[LinearIdx];
+          Ctx.IntRegs[InstrHot^.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx);
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
@@ -72,7 +72,7 @@
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then     // MODERN out-of-bounds store is dropped (FreeBASIC)
         begin
-          FArrays[ArrayIdx].IntData[LinearIdx] := Ctx.IntRegs[InstrHot^.Dest];
+          ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[InstrHot^.Dest]);
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);
