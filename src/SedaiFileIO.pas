@@ -29,7 +29,7 @@ unit SedaiFileIO;
 interface
 
 uses
-  Classes, SysUtils, SedaiBytecodeVM, SedaiBasicKeywords, SedaiInputFields,
+  Classes, SysUtils, Process, SedaiBytecodeVM, SedaiBasicKeywords, SedaiInputFields,
   // TerminalOutFlush: the console keeps its OWN stdout buffer, so anything that writes through
   // System.Write has to drain it first or the two arrive out of order. See the SCRN/CONS device write.
   SedaiTerminalIO
@@ -46,6 +46,10 @@ type
     // so it needs its own marker, and the handle counts as open while FFileHandles stays nil.
     //   1 = CONS (stdin when opened For Input, stdout when For Output)   2 = SCRN (stdout)   3 = ERR (stderr)
     FDeviceKind: array[1..MAX_FILE_HANDLE] of Integer;
+    // ⭐ "Open Pipe <cmd> For Input|Output As n": the file IS a process. Device kinds 4 (we read its
+    // output) and 5 (we write its input); the TProcess lives here for the life of the handle, and the
+    // close arm reaps it. DIVERGENZE 180 - retrogra reads the output of "locale" this way.
+    FPipes: array[1..MAX_FILE_HANDLE] of TProcess;
     FFileModes: array[1..MAX_FILE_HANDLE] of string;
     FRecordLens: array[1..MAX_FILE_HANDLE] of Integer;   // relative-file record length per handle (0 = not relative)
 
@@ -89,6 +93,9 @@ type
     function StdInReadLine(out Line: string): Boolean;
     function StdInReadBytes(Count: Integer; out Data: string): Boolean;
     function StdInAtEof: Boolean;
+    function PipeReadLine(Handle: Integer; out Line: string): Boolean;
+    function PipeAtEof(Handle: Integer): Boolean;
+    procedure ReapPipe(Handle: Integer);
   public
     destructor Destroy; override;
     procedure CloseAll;
@@ -111,6 +118,56 @@ implementation
   ⚠️ These use the RAW stdin handle, so they must never be mixed with System.ReadLn(System.Input) on
   the same run: the Text layer keeps its own buffer and the two would each swallow part of the stream.
   StdInBuffered decides ONCE, and every device read goes through one path or the other for good. }
+
+function TVMFileHandler.PipeAtEof(Handle: Integer): Boolean;
+// A process pipe is at EOF when nothing is buffered AND the child has stopped writing. Asking only
+// "is it still running" reports EOF while the last block is still in the pipe.
+begin
+  Result := True;
+  if not Assigned(FPipes[Handle]) then Exit;
+  if FPipes[Handle].Output.NumBytesAvailable > 0 then Exit(False);
+  Result := not FPipes[Handle].Running;
+end;
+
+function TVMFileHandler.PipeReadLine(Handle: Integer; out Line: string): Boolean;
+// One line from the child's standard output, the line feed dropped and a trailing CR with it. A byte
+// at a time on purpose: a pipe has no length to seek and the child may still be writing, so the only
+// honest stop is the newline or the end of the stream.
+var
+  Ch: Char;
+  N: LongInt;
+  Got: Boolean;
+begin
+  Line := '';
+  Got := False;
+  Result := False;
+  if not Assigned(FPipes[Handle]) then Exit;
+  while True do
+  begin
+    if (FPipes[Handle].Output.NumBytesAvailable = 0) and (not FPipes[Handle].Running) then Break;
+    N := FPipes[Handle].Output.Read(Ch, 1);
+    if N <= 0 then Break;
+    Got := True;
+    if Ch = #10 then Break;
+    Line := Line + Ch;
+  end;
+  if (Length(Line) > 0) and (Line[Length(Line)] = #13) then SetLength(Line, Length(Line) - 1);
+  Result := Got;
+end;
+
+procedure TVMFileHandler.ReapPipe(Handle: Integer);
+// ⛔ The child's INPUT is closed FIRST: a process reading from a pipe that is never closed waits for
+// ever, and that wait would be inside our CLOSE.
+begin
+  if (Handle < 1) or (Handle > MAX_FILE_HANDLE) then Exit;
+  if not Assigned(FPipes[Handle]) then Exit;
+  try
+    if FDeviceKind[Handle] = 5 then FPipes[Handle].CloseInput;
+    if FPipes[Handle].Running then FPipes[Handle].WaitOnExit;
+  except
+  end;
+  FreeAndNil(FPipes[Handle]);
+end;
 
 function TVMFileHandler.CachedSize(Handle: Integer; FS: TFileStream): Int64;
 begin
@@ -396,6 +453,25 @@ begin
     // to the process's own streams. This must come BEFORE the reserved-name refusal below, which exists
     // to stop a PROGRAM from reaching the printer or a serial port by naming a DOS device in a string -
     // a different thing entirely from the language's own CONS/SCRN/ERR.
+    if Pos('P', UpperCase(EncMode)) > 0 then
+    begin
+      if Assigned(FFileHandles[Handle]) then begin FreeAndNil(FFileHandles[Handle]); FFileModes[Handle] := ''; end;
+      if Assigned(FPipes[Handle]) then FreeAndNil(FPipes[Handle]);
+      FPipes[Handle] := TProcess.Create(nil);
+      FPipes[Handle].Executable := '/bin/sh';
+      FPipes[Handle].Parameters.Add('-c');
+      FPipes[Handle].Parameters.Add(Filename);
+      FPipes[Handle].Options := [poUsePipes, poNoConsole];
+      try
+        FPipes[Handle].Execute;
+      except
+        FreeAndNil(FPipes[Handle]); ErrorCode := 2; Exit;   // 2 = File not found, as fbc reports
+      end;
+      if Pos('W', UpperCase(EncMode)) > 0 then FDeviceKind[Handle] := 5 else FDeviceKind[Handle] := 4;
+      FFileModes[Handle] := UpperCase(EncMode);
+      FRecordLens[Handle] := 0;
+      Exit;
+    end;
     if (Filename = 'CONS:') or (Filename = 'SCRN:') or (Filename = 'ERR:') then
     begin
       if Assigned(FFileHandles[Handle]) then
@@ -542,6 +618,7 @@ begin
       FreeAndNil(FFileHandles[Handle]);
       FFileModes[Handle] := '';
     end;
+    ReapPipe(Handle);              // ...a pipe handle owns a PROCESS: close its input and reap it
     FDeviceKind[Handle] := 0;      // ...and release the handle if it was a device
     FRecordLens[Handle] := 0;
   end;
@@ -577,6 +654,11 @@ begin
   begin
     if QueryCode = FQ_EOF then
     begin
+      if FDeviceKind[Handle] = 4 then
+      begin
+        if PipeAtEof(Handle) then Value := -1;
+        Exit;
+      end;
       if FDeviceKind[Handle] <> 1 then Exit;            // output device: never at EOF
       if StdInBuffered then
       begin
@@ -695,6 +777,12 @@ begin
     end;
     if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
     begin
+      if FDeviceKind[Handle] = 4 then
+      begin
+        if not PipeReadLine(Handle, Line) then begin Data := ''; ErrorCode := 62; Exit; end;
+        Data := Line;
+        Exit;
+      end;
       if StdInBuffered then
       begin
         if not StdInReadLine(Line) then begin Data := ''; ErrorCode := 62; Exit; end;
@@ -716,6 +804,11 @@ begin
       // ⭐ The cure was already written down: TerminalOutFlush's own comment says "any code that
       // writes through System.Write/WriteLn while a program's output may still be buffered MUST call
       // this first, or its text jumps ahead of text that was produced before it". This was that code.
+      if (FDeviceKind[Handle] = 5) and Assigned(FPipes[Handle]) then
+      begin
+        if Length(Data) > 0 then FPipes[Handle].Input.Write(Data[1], Length(Data));
+        Exit;
+      end;
       TerminalOutFlush;
       if FDeviceKind[Handle] = 3 then System.Write(System.ErrOutput, Data)
       else
@@ -748,7 +841,7 @@ begin
       Data := Line;
       Exit;
     end;
-    if Command = 'DCLOSE' then begin FDeviceKind[Handle] := 0; FFileModes[Handle] := ''; Exit; end;
+    if Command = 'DCLOSE' then begin ReapPipe(Handle); FDeviceKind[Handle] := 0; FFileModes[Handle] := ''; Exit; end;
     Exit;   // LOF/LOC/SEEK and the record commands mean nothing on a device
   end;
 

@@ -25704,7 +25704,16 @@ begin
   begin
     Call := TASTNode.CreateWithValue(antFsFunction, '__DIRATTR', Node.Token);
     Assign := TASTNode.Create(antAssignment, Node.Token);
-    Assign.AddChild(AttrNode.Clone);
+    // ⭐ fbc's third parameter is BYREF, and the sources that use it write "@i" - which parses as an
+    // address-of (antProcAddress carrying the NAME). Assigning to the address wrote nowhere, so the
+    // attribute silently stayed 0 where fbc answers 16: the target is the VARIABLE the address names.
+    // DIVERGENZE 181, found in retrogra's datafolder.bi, where it asks "is this path a folder?" - so
+    // every folder answered no. A plain "Dir(p, m, attr)" without the '@' still works as it did.
+    if (AttrNode.NodeType = antProcAddress) and (AttrNode.ChildCount = 0) and
+       (VarToStr(AttrNode.Value) <> '') then
+      Assign.AddChild(TASTNode.CreateWithValue(antIdentifier, VarToStr(AttrNode.Value), AttrNode.Token))
+    else
+      Assign.AddChild(AttrNode.Clone);
     Assign.AddChild(Call);
     try ProcessStatement(Assign); finally Assign.Free; end;
   end;
@@ -47841,6 +47850,11 @@ begin
     antLetList: ProcessLetList(Node);
     antRenumber: ProcessRenumber(Node);
     antCatalog: ProcessCatalog(Node);
+    // ⭐ A file-system FUNCTION called as a STATEMENT, its result discarded: "Dir( p, m, @attr )" is
+    // written that way wherever the caller wants only the out-parameter (retrogra's datafolder.bi asks
+    // "is this a folder?" exactly so). The expression arm already knows how to lower it; here the value
+    // is simply not used. DIVERGENZE 181a.
+    antFsFunction: ProcessFsFunction(Node);
     // File management commands
     antCopy: ProcessCopyFile(Node);
     antScratch: ProcessScratch(Node);

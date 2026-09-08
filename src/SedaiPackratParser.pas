@@ -8492,6 +8492,7 @@ var
   CmdName, ModeStr, MW, EncMark: string;
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
+  IsPipe: Boolean;                     // "Open Pipe <cmd> ...": the file is a PROCESS (DIVERGENZE 180)
   C64CommaPos: Integer;
   AccessRead: Boolean;
   ClosedParen: Boolean;   // "Close(fileNum)": the FreeBASIC parenthesised handle
@@ -8600,6 +8601,18 @@ begin
     // where ERR is the error-code function - so it evaluated to 0 and became the FILENAME again, the
     // very defect the note above describes, just through the other door. A device word can only be a
     // device when the next token is FOR or AS.
+    // ⭐ "Open Pipe <command> For Input|Output As n": the process is the file. The command is an
+    // EXPRESSION (retrogra builds it at run time), so this is not the bare-device shape below; the
+    // fact that it is a pipe travels in the MODE string as a 'P' marker, which the runtime reads the
+    // way it already reads 'L' and the encoding markers. DIVERGENZE 180.
+    IsPipe := False;
+    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PIPE') and Assigned(Context.PeekNext) and
+       (Context.PeekNext.TokenType <> ttDelimParOpen) and
+       (Context.PeekNext.TokenType <> ttOpEq) then
+    begin
+      Context.Advance;                      // PIPE
+      IsPipe := True;
+    end;
     if ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'SCRN') or
         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ERR')) and
@@ -8758,6 +8771,7 @@ begin
     end;
     Result.AddChild(HandleNode);                            // child 0 = handle
     Result.AddChild(Param);                                 // child 1 = filename
+    if IsPipe then ModeStr := ModeStr + 'P';                // ...and the runtime opens a PROCESS
     Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));  // child 2 = mode$
     // child 3 = record length expression (RANDOM only; the SSA appends it to the "L" mode).
     if LenExpr <> nil then
@@ -9120,6 +9134,18 @@ begin
   CmdName := UpperCase(Token.Value);
 
   // Recognize file management commands
+  // ⛔ "Dir( path, mask, @attr )" IN MODERN IS THE FUNCTION, called as a statement and its result
+  // discarded - not the Commodore CATALOG. The two tables stay separate, and here the Commodore arm
+  // was winning in both dialects: it takes at most one argument, so the comma was a syntax error
+  // (DIVERGENZE 181a, found in retrogra's datafolder.bi). Only when a '(' follows immediately, which
+  // is the call spelling; "Dir" alone, and "Dir path", stay the Commodore command.
+  if FModernMode and ((CmdName = 'DIR') or (CmdName = 'DIRECTORY')) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Result := FExpressionParser.ParseExpression;
+    Exit;
+  end;
+
   case CmdName of
     'CATALOG', 'DIR', 'DIRECTORY': Result := TASTNode.Create(antCatalog, Token);
     'COPY', 'CP': Result := TASTNode.Create(antCopy, Token);
@@ -14319,8 +14345,18 @@ begin
     begin
       if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) then
       begin Context.Advance; Continue; end;
-      HandleError('Expected enum member name', Context.CurrentToken);
-      Break;
+      // ⭐ A KEYWORD is a legal enum member name: "Enum DialogFlag : Stop=64, Error=224 : End Enum"
+      // compiles in fbc, because inside an enum body a name is being DECLARED, not used - nothing here
+      // could be the statement the keyword usually opens. The lexer gives Stop its own token type, so
+      // asking for ttIdentifier alone refused a program fbc accepts (DIVERGENZE 184, found in
+      // retrogra's rggui.bi). Anything that CARRIES a name is taken; a punctuation token is still an
+      // error, and the '=' / ',' / end-of-line handling below is unchanged.
+      if (Context.CurrentToken = nil) or (VarToStr(Context.CurrentToken.Value) = '') or
+         (not (VarToStr(Context.CurrentToken.Value)[1] in ['A'..'Z', 'a'..'z', '_'])) then
+      begin
+        HandleError('Expected enum member name', Context.CurrentToken);
+        Break;
+      end;
     end;
     MemberName := UpperCase(Context.CurrentToken.Value);
     Context.Advance;

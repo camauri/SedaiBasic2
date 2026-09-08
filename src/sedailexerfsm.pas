@@ -1531,6 +1531,7 @@ var
   Base, DigVal: Integer;
   Ch: Char;
   Val: Int64;
+  HasLetter: Boolean;
 
   function IsBaseDigit(C: Char; B: Integer): Boolean;
   begin
@@ -1545,15 +1546,27 @@ var
 begin
   Result := nil;
   Ch := GetCurrentChar;   // base letter candidate
+  HasLetter := True;
   case Ch of
     'H', 'h': Base := 16;
     'O', 'o': Base := 8;
     'B', 'b': Base := 2;
-  else        Exit;       // not a base prefix
+  else
+    // ⭐ "&777" with NO base letter is OCTAL - the classic BASIC spelling, and fbc still honours it:
+    // &777 is 511 exactly as &O777, and &17 is 15. Verified against fbc, which also settles the
+    // ambiguity with the CONCATENATION operator: "s &1" is an ERROR there ("Expected End-of-Line"),
+    // because the '&' took the 1 as a literal - so a '&' IMMEDIATELY followed by an octal digit is
+    // always a number, and one followed by a space stays the operator ("s & 1" is "a1").
+    // ⛔ Only octal digits: "&8" is an error in fbc too, and falls through to the operator here.
+    // DIVERGENZE 182, found in the retrogra sources ("b = c AND &1F", which fbc reads as c AND 1).
+    if Ch in ['0'..'7'] then begin Base := 8; HasLetter := False; end
+    else Exit;              // not a base prefix
   end;
-  if not IsBaseDigit(PeekChar(1), Base) then Exit;   // need at least one valid digit -> else it's '&'
-
-  TokenBufferAdd(Ch); AdvanceChar;   // consume the base letter
+  if HasLetter then
+  begin
+    if not IsBaseDigit(PeekChar(1), Base) then Exit;   // need at least one valid digit -> else it's '&'
+    TokenBufferAdd(Ch); AdvanceChar;   // consume the base letter
+  end;
   Val := 0;
   while IsBaseDigit(GetCurrentChar, Base) do
   begin
