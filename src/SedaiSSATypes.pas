@@ -99,7 +99,27 @@ const
     Bit 62 is crowded (SHARED_REC_FLAG and BUILTIN_FP_TAG use it in their own namespaces), which is why
     the framebuffer is a second REGION of the raw-pointer namespace rather than a third tag. }
   RAWPTR_REGION_FB = Int64(1) shl 61;       // region selector: framebuffer instead of the byte heap
-  RAWPTR_OFS_MASK = RAWPTR_REGION_FB - 1;   // byte offset occupies the low 61 bits
+
+  { ⭐ THE THIRD REGION: AN IMAGE SURFACE (8 Sep 2026). SCREENPTR has been able to hand a program the
+    working page's pixels since the beginning; an IMAGE created with IMAGECREATE could not be reached
+    at all, so "IMAGEINFO img, w, h, bpp, pitch, p" answered 0 for p and every program that walks an
+    image's rows - which is what an image is FOR - had nothing to walk.
+
+    A pointer into this region carries the SURFACE HANDLE beside the offset, because unlike the
+    framebuffer there is more than one of them:  bits 40..59 the handle, bits 0..39 the offset.
+    2^20 surfaces and a terabyte each, both far past anything a program can make.
+
+    ⛔ AND THE FIRST 32 BYTES ARE THE HEADER, NOT PIXELS. FreeBASIC puts a 32-byte FB.IMAGE in front of
+    an image's pixels and real code reads it - "img->width", "PEEK(USHORT, img + SizeOf(FB.IMAGE) + k)"
+    - so the offset is read the same way: below 32 it names a field of a header this VM builds on
+    demand, at 32 and above it names pixel (offset - 32). That keeps the backend's surfaces exactly as
+    they are: no header is stored anywhere, it is answered. }
+  RAWPTR_REGION_IMG   = Int64(1) shl 60;
+  RAWPTR_IMG_HDR_SIZE = 32;                     // SizeOf(FB.IMAGE) on this target
+  RAWPTR_IMG_OFS_BITS = 40;
+  RAWPTR_IMG_OFS_MASK = (Int64(1) shl RAWPTR_IMG_OFS_BITS) - 1;
+
+  RAWPTR_OFS_MASK = RAWPTR_REGION_IMG - 1;  // byte offset occupies the low 60 bits
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
     machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program

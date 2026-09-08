@@ -4035,7 +4035,31 @@ var
               end;
             end
             else
+            begin
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
+              // ⭐ ...AND fbgfx.bi ALSO DECLARES A TYPE, which constants alone cannot stand in for.
+              // "FB.IMAGE" is the 32-byte header FreeBASIC puts in front of an image's pixels, and real
+              // code reads it through the pointer IMAGECREATE answers ("img->width"). Without the TYPE
+              // the field offsets do not exist and every field read the same byte: 7 7 7 for a 7x5
+              // image. Emitted as SOURCE, on ONE physical line joined by the preprocessor's own virtual
+              // EOL, so the line numbering of everything below it does not move.
+              // ⚠️ The first field is named "imgtype" and not "type": the layout is what matters here
+              // (0,4,8,12,16, which the natural alignment of four-byte fields already gives), and
+              // "type" is a keyword. Nothing in the wild reads that field by name.
+              if LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi' then
+                Output.Add('Namespace FB' + cVirtualEOL +
+                           'Type IMAGE' + cVirtualEOL +
+                           '  As ULong imgtype' + cVirtualEOL +
+                           '  As Long  bpp' + cVirtualEOL +
+                           '  As ULong width' + cVirtualEOL +
+                           '  As ULong height' + cVirtualEOL +
+                           '  As ULong pitch' + cVirtualEOL +
+                           '  As ULong _reserved0' + cVirtualEOL +
+                           '  As ULong _reserved1' + cVirtualEOL +
+                           '  As ULong _reserved2' + cVirtualEOL +
+                           'End Type' + cVirtualEOL +
+                           'End Namespace');
+            end;
           end;
           Output.Add('');   // the metacommand line itself produces no output
           Inc(li);
@@ -4392,7 +4416,31 @@ var
               end;
             end
             else
+            begin
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
+              // ⭐ ...AND fbgfx.bi ALSO DECLARES A TYPE, which constants alone cannot stand in for.
+              // "FB.IMAGE" is the 32-byte header FreeBASIC puts in front of an image's pixels, and real
+              // code reads it through the pointer IMAGECREATE answers ("img->width"). Without the TYPE
+              // the field offsets do not exist and every field read the same byte: 7 7 7 for a 7x5
+              // image. Emitted as SOURCE, on ONE physical line joined by the preprocessor's own virtual
+              // EOL, so the line numbering of everything below it does not move.
+              // ⚠️ The first field is named "imgtype" and not "type": the layout is what matters here
+              // (0,4,8,12,16, which the natural alignment of four-byte fields already gives), and
+              // "type" is a keyword. Nothing in the wild reads that field by name.
+              if LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi' then
+                Output.Add('Namespace FB' + cVirtualEOL +
+                           'Type IMAGE' + cVirtualEOL +
+                           '  As ULong imgtype' + cVirtualEOL +
+                           '  As Long  bpp' + cVirtualEOL +
+                           '  As ULong width' + cVirtualEOL +
+                           '  As ULong height' + cVirtualEOL +
+                           '  As ULong pitch' + cVirtualEOL +
+                           '  As ULong _reserved0' + cVirtualEOL +
+                           '  As ULong _reserved1' + cVirtualEOL +
+                           '  As ULong _reserved2' + cVirtualEOL +
+                           'End Type' + cVirtualEOL +
+                           'End Namespace');
+            end;
           end
           else if ((DName = 'inclib') or (DName = 'libpath')) and Emitting then
           begin

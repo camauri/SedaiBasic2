@@ -911,6 +911,7 @@ type
     function IsWStringExpr(Node: TASTNode): Boolean;                            // expression that yields a WSTRING value?
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
+    function IsImageCreateExpr(Node: TASTNode): Boolean;                        // Node = IMAGECREATE(...)?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
     function IsStrDataPtrExpr(Node: TASTNode): Boolean;                         // SADD(s)/STRPTR(s), and that ± an offset
     function IsStringConstName(const Name: string): Boolean;                    // a declared STRING constant?
@@ -19297,7 +19298,7 @@ begin
   // code uses the later ones. Bounded by what the caller actually passed, so the two- and three-argument
   // spellings are untouched.
   Last := Node.ChildCount - 2;
-  if Last > 3 then Last := 3;
+  if Last > 4 then Last := 4;   // w, h, bpp, pitch, and the POINTER to the pixels
   for i := 0 to Last do
   begin
     WhichLit := TASTNode.CreateWithValue(antLiteral, i, Node.Token);
@@ -19328,7 +19329,7 @@ var
 begin
   StatusReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   MaxArgs := ArgListNode.ChildCount - 1;      // arg 0 is the handle; the rest are destinations
-  if MaxArgs > 4 then MaxArgs := 4;           // w, h, bpp, pitch - the four this engine reports
+  if MaxArgs > 5 then MaxArgs := 5;           // w, h, bpp, pitch, pixel pointer
   for i := 0 to MaxArgs - 1 do
   begin
     // An omitted slot ("ImageInfo(img, , h)") is an empty placeholder: skip it, do not write to it.
@@ -38709,6 +38710,28 @@ begin
     Result := ArrayIndexOf(FuncU) < 0;
 end;
 
+function TSSAGenerator.IsImageCreateExpr(Node: TASTNode): Boolean;
+// IMAGECREATE(...), which answers a POINTER into the image-surface region since 8 Sep 2026 - so a
+// variable initialised from it is raw, exactly as one initialised from SCREENPTR or ALLOCATE is.
+// ⚠️ Only when nothing of that name is declared as an array, the same guard the other intercepts use.
+var
+  U: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+    U := UpperCase(VarToStr(Node.GetChild(0).Value))
+  else if Node.NodeType = antGraphicsFunction then
+    U := UpperCase(VarToStr(Node.Value))
+  else if Node.NodeType = antIdentifier then
+    U := UpperCase(VarToStr(Node.Value))
+  else
+    Exit;
+  Result := (U = 'IMAGECREATE') and (ArrayIndexOf(U) < 0);
+end;
+
 function TSSAGenerator.IsScreenPtrExpr(Node: TASTNode): Boolean;
 // SCREENPTR, bare or parenthesised. It yields a raw pointer -- into the framebuffer region rather than
 // the byte heap, but raw all the same -- so a variable initialised from it must be tracked raw, or
@@ -39773,8 +39796,11 @@ var
       // operator answered - raw bytes it allocated itself - and not a record this compiler owns, so the
       // value is an ADDRESS like every other one in this list. Without it "p->i = 3" read a byte
       // address through the managed record path and faulted on the first store.
+      // ⭐ ...AND AN IMAGE. "Dim As FB.IMAGE Ptr img = ImageCreate(...)" is a UDT pointer whose value is
+      // an ADDRESS - into the image-surface region - not a handle of a record this compiler owns. Left
+      // unmarked, "img->width" took the managed-record path and faulted on the first field.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
-         IsRawPtrFieldExpr(Rhs) or
+         IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
           TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
@@ -39791,6 +39817,8 @@ var
       MarkRaw(TargetU)
     else if IsScreenPtrExpr(Rhs) then
       MarkRaw(TargetU)   // p = ScreenPtr: raw, in the framebuffer region
+    else if IsImageCreateExpr(Rhs) then
+      MarkRaw(TargetU)   // p = ImageCreate(...): raw, in the image-surface region
     else if Rhs.NodeType = antCast then
     begin
       TU := UpperCase(VarToStr(Rhs.Value));
@@ -39881,6 +39909,18 @@ begin
     end;
   end;
 
+
+  // ⭐ IMAGEINFO's PIXEL POINTER IS A RAW SOURCE, and it has to be recognised in the ORIGINAL shape:
+  // the lowering turns "ImageInfo img, w, h, bpp, pitch, p" into synthetic assignments, but that
+  // happens LATER - this pre-scan walks the AST as written, where the destinations are still plain
+  // children of the statement. Without it "p" was not raw, so "p[i]" took the MANAGED pointer path and
+  // stepped by ONE BYTE instead of SizeOf(ULong): writing p[0] then p[1] left 112233CC where AABBCC
+  // belonged. Same reason SCREENPTR is recognised a few lines up, and the same failure it prevents.
+  // ⚠️ The SIXTH child (index 5) and only it: the first is the handle and the four after it are plain
+  // integers.
+  if (Node.NodeType = antImageInfo) and (Node.ChildCount >= 6) and
+     (Node.GetChild(5).NodeType = antIdentifier) then
+    MarkRaw(UpperCase(VarToStr(Node.GetChild(5).Value)));
 
   // A CALL: raw-ness crosses into the callee's pointer PARAMETERS. It has to be
   // decided HERE, in the fixpoint, and not while the call is lowered - a

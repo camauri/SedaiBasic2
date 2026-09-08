@@ -210,6 +210,9 @@ type
     // A handle with SHARED_REC_FLAG set indexes here; otherwise it indexes the active context's heap.
     FSharedRecords: TSharedRecArray;
     FForeignTable: TObject;   // TForeignTable: nil until the program makes its first foreign call
+    // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
+    // per surface: it is filled from the surface at every read, so it is never stale.
+    FImgHeaderBuf: array[0..RAWPTR_IMG_HDR_SIZE - 1] of Byte;
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
@@ -749,6 +752,7 @@ type
     function AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
     function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
     function SharedRecordBlockLen(Handle: Int64): Int64;
+    function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
     // ExecuteInstruction are the two arms this VM keeps having to hold in step, and a foreign call is
     // exactly the kind of work where a second copy would drift. The table is built on first use, from
@@ -5441,6 +5445,20 @@ begin
   if PtrOffset <= Lim then FArrays[ArrayIdx].IntData[PtrOffset] := 0;   // the terminator
 end;
 
+function TBytecodeVM.ImgHandleOf(V: Int64): Integer;
+// ⭐ AN IMAGE IS NAMED IN TWO WAYS AND BOTH MUST WORK. IMAGECREATE now answers a POINTER into the
+// image-surface region, because real FreeBASIC code reads the picture through it ("img->width",
+// "PEEK(USHORT, img + SizeOf(FB.IMAGE) + k)") - but every program written against this VM until today
+// holds the bare table INDEX, and PUT/GET/IMAGEDESTROY/IMAGEINFO are given whichever the program has.
+// ⇒ Decode when it carries the tag, pass through when it does not. Retrocompatible by construction,
+// and there is no ambiguity: a tagged value has bit 62 set and an index never will.
+begin
+  if (V and RAWPTR_TAG) <> 0 then
+    Result := Integer((V shr RAWPTR_IMG_OFS_BITS) and $FFFFF)
+  else
+    Result := Integer(V);
+end;
+
 function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
 // Resolve a tagged raw pointer to a real address inside whichever REGION it names, after checking that
 // NeedBytes bytes starting there actually fit. Every raw load, store and block operation goes through
@@ -5452,11 +5470,44 @@ function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
 var
   ofs: PtrUInt;
   Data: PByte;
-  SizeBytes: Integer;
+  SizeBytes, ImgHandle: Integer;
 begin
   if (RawPtr and RAWPTR_TAG) = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
+
+  // ⭐ THE IMAGE-SURFACE REGION. The handle rides above the offset (see RAWPTR_REGION_IMG), because
+  // unlike the framebuffer there is more than one surface. The first 32 bytes are the FB.IMAGE header,
+  // which is ANSWERED rather than stored: the backend's surfaces are left exactly as they are.
+  if (RawPtr and RAWPTR_REGION_IMG) <> 0 then
+  begin
+    ImgHandle := Integer((RawPtr shr RAWPTR_IMG_OFS_BITS) and $FFFFF);
+    ofs := PtrUInt(RawPtr and RAWPTR_IMG_OFS_MASK);
+    if not Assigned(FGraphics) or not FGraphics.SurfaceData(ImgHandle, Data, SizeBytes) then
+      raise ERangeError.CreateFmt('image pointer dereference: %d is not an image surface', [ImgHandle]);
+    if ofs < RAWPTR_IMG_HDR_SIZE then
+    begin
+      // The header, built on demand into a per-VM scratch block. ⚠️ Its layout is fbgfx.bi's IMAGE:
+      // type(u32) bpp(s32) width(u32) height(u32) pitch(u32) then 12 reserved bytes. "bpp" is BYTES per
+      // pixel there, which is why it is 4 and not 32.
+      if (ofs + NeedBytes) > RAWPTR_IMG_HDR_SIZE then
+        raise ERangeError.Create('image pointer dereference: a read may not straddle the header and the pixels');
+      FillChar(FImgHeaderBuf, SizeOf(FImgHeaderBuf), 0);
+      PLongWord(@FImgHeaderBuf[0])^  := 7;                                       // fbc's PUT_HEADER_NEW
+      PLongInt(@FImgHeaderBuf[4])^   := 4;                                       // bytes per pixel
+      PLongWord(@FImgHeaderBuf[8])^  := LongWord(FGraphics.SurfaceWidth(ImgHandle));
+      PLongWord(@FImgHeaderBuf[12])^ := LongWord(FGraphics.SurfaceHeight(ImgHandle));
+      PLongWord(@FImgHeaderBuf[16])^ := LongWord(FGraphics.SurfaceWidth(ImgHandle) * 4);
+      Result := Pointer(@FImgHeaderBuf[ofs]);
+      Exit;
+    end;
+    Dec(ofs, RAWPTR_IMG_HDR_SIZE);
+    if (SizeBytes <= 0) or (ofs + NeedBytes > PtrUInt(SizeBytes)) then
+      raise ERangeError.CreateFmt('image pointer dereference out of bounds: offset %d + %d > %d bytes',
+                                  [Int64(ofs), Int64(NeedBytes), Int64(SizeBytes)]);
+    Result := Pointer(Data + ofs);
+    Exit;
+  end;
 
   if (RawPtr and RAWPTR_REGION_FB) <> 0 then
   begin
@@ -11835,7 +11886,10 @@ begin
   if Active <> 0 then
   begin
     TBytecodeVM(VMSelf).FGfxDrawTargetActive := True;
-    TBytecodeVM(VMSelf).FGfxDrawTargetHandle := Handle;
+    // ⚠️ The SAME decode the interpreter's arm does, and it has to be here too: this is "an EXACT
+    // transcription of sub-op 61", and a transcription that drops a step is the silent divergence
+    // between engines that the AOT validator exists to catch.
+    TBytecodeVM(VMSelf).FGfxDrawTargetHandle := TBytecodeVM(VMSelf).ImgHandleOf(Handle);
   end
   else
     TBytecodeVM(VMSelf).FGfxDrawTargetActive := False;
@@ -15904,6 +15958,7 @@ var
   PalArr: ^TArrayStorage;   // PALETTE USING: the array the whole palette is read from / written to
   PalN, PalK, PalStart, PalIdx: Integer;
   PalPtr: Int64;
+  ImgHandle: Integer;   // IMAGECREATE: the surface index, before it becomes a pointer
 begin
   // ⛔ THE TEST IS INLINE AND THE CALL IS NOT MADE WHILE LOCKED. Both of these run once per GRAPHICS
   // OPERATION - 62 500 times a frame in a demo that plots points - and a call that returns immediately
@@ -16334,13 +16389,24 @@ begin
       end;
     36: // bcGfxImageCreate - IMAGECREATE(w,h[,color]) -> handle (Immediate = fill colour reg)
       if Assigned(FGraphics) then
-        Ctx.IntRegs[Instr.Dest] := Int64(FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
-                                          UInt32(Ctx.IntRegs[Instr.Immediate])))
+      begin
+        ImgHandle := FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                                             UInt32(Ctx.IntRegs[Instr.Immediate]));
+        // ⭐ A POINTER, not the bare index: FreeBASIC's IMAGECREATE answers an FB.IMAGE PTR and code
+        // reads the header and the pixels through it. Offset 0 is the start of the header, so
+        // "img->width" and "img + SizeOf(FB.IMAGE)" both land where they should. A failed creation
+        // stays GFX_INVALID_SURFACE, untagged, so "If img = 0" and the old comparisons still work.
+        if ImgHandle > 0 then
+          Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_IMG or
+                                     ((Int64(ImgHandle) and $FFFFF) shl RAWPTR_IMG_OFS_BITS)
+        else
+          Ctx.IntRegs[Instr.Dest] := GFX_INVALID_SURFACE;
+      end
       else
         Ctx.IntRegs[Instr.Dest] := GFX_INVALID_SURFACE;
     37: // bcGfxImageDestroy - IMAGEDESTROY handle
       if Assigned(FGraphics) then
-        FGraphics.DestroySurface(Ctx.IntRegs[Instr.Src1]);
+        FGraphics.DestroySurface(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
     38: // bcGfxImageInfo - __IMGINFO(handle, which): width (0) / height (1) / bpp (2) / pitch (3)
       // ⛔ bpp AND pitch WERE MISSING, and a program that asked for them got 0 - not an error, a
       // NUMBER, which is the kind of answer that propagates. fbc's IMAGEINFO takes up to six
@@ -16352,16 +16418,21 @@ begin
       // The pitch follows from the width, and is where a caller expects the row stride in BYTES.
       if Assigned(FGraphics) then
         case Instr.Immediate of
-          0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(Ctx.IntRegs[Instr.Src1]);
-          1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(Ctx.IntRegs[Instr.Src1]);
+          0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
+          1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
           2: Ctx.IntRegs[Instr.Dest] := 4;      // bytes per pixel, always 32bpp here
-          3: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(Ctx.IntRegs[Instr.Src1]) * 4;
+          3: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) * 4;
+          // ⭐ 4: the POINTER TO THE PIXELS, which is what an image is FOR - walking its rows. It names
+          // the image-surface region (RAWPTR_REGION_IMG) at the offset where the pixels begin, i.e.
+          // just past the 32-byte FB.IMAGE header, so "p32[i]" steps through the picture and
+          // "img + SizeOf(FB.IMAGE)" lands on the same byte.
+          4: if Ctx.IntRegs[Instr.Src1] <> 0 then
+               Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_IMG or
+                 ((Int64(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) and $FFFFF) shl RAWPTR_IMG_OFS_BITS) or
+                 RAWPTR_IMG_HDR_SIZE
+             else
+               Ctx.IntRegs[Instr.Dest] := 0;
         else
-          // 4 would be the POINTER to the pixels, and it is deliberately not answered yet: an image
-          // surface is a table entry here, not a block of the raw heap, so there is no address to
-          // give. Answering 0 is the truthful "no pointer"; inventing one would be an address that
-          // dereferences into nothing. See the note in NEXT_SESSION_PROMPT: it needs a pointer REGION
-          // of its own, the way SCREENPTR has one.
           Ctx.IntRegs[Instr.Dest] := 0;
         end
       else
@@ -16378,7 +16449,9 @@ begin
         GetY1 := Ctx.IntRegs[Instr.Src2];
         GetX2 := Ctx.IntRegs[Instr.Immediate and $FFFF];
         GetY2 := Ctx.IntRegs[(Instr.Immediate shr 16) and $FFFF];
-        DrawMode := Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF];   // dst image handle (reuse DrawMode var)
+        // ⭐ ImgHandleOf: the destination may be a POINTER (what IMAGECREATE answers now) or the bare
+        // index (what a program written earlier holds). Both name the same surface.
+        DrawMode := ImgHandleOf(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);   // dst image handle
         if GetX2 < GetX1 then begin SwapTmp := GetX1; GetX1 := GetX2; GetX2 := SwapTmp; end;
         if GetY2 < GetY1 then begin SwapTmp := GetY1; GetY1 := GetY2; GetY2 := SwapTmp; end;
         for GetSy := 0 to (GetY2 - GetY1) do
@@ -16394,7 +16467,8 @@ begin
       if Assigned(FGraphics) then
         // Immediate [0-15]=src handle reg, [16-31]=mode ordinal, [32-47]=blend-value reg (-1 = none).
         FGraphics.Blit(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
-                       Ctx.IntRegs[Instr.Immediate and $FFFF], TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
+                       ImgHandleOf(Ctx.IntRegs[Instr.Immediate and $FFFF]),
+                       TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
                        Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
       if Assigned(FGraphics) then
@@ -16700,7 +16774,8 @@ begin
       if (Instr.Immediate and 1) <> 0 then
       begin
         FGfxDrawTargetActive := True;
-        FGfxDrawTargetHandle := Ctx.IntRegs[Instr.Src1];
+        // ⭐ ImgHandleOf: the target may arrive as a POINTER or as the bare index. Same surface.
+        FGfxDrawTargetHandle := ImgHandleOf(Ctx.IntRegs[Instr.Src1]);
       end
       else
         FGfxDrawTargetActive := False;
