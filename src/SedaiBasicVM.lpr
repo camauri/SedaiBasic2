@@ -2751,6 +2751,12 @@ begin
       end;
     end;
 
+    // ⭐ THE CONFIGURATION, read once the source file is known - its directory is the most specific of
+    // the five places allowed to say where things are (see SedaiConfig). ⛔ Without this call the whole
+    // file was inert: ConfigList answered an empty list, so "sedai.conf" beside a program did nothing
+    // and every include had to be given with -i on the command line. Written and never wired.
+    LoadConfig(ExtractFilePath(ExpandFileName(TestFile)));
+
     // Show help if requested or no file provided
     if OptHelp or (TestFile = '') then
     begin

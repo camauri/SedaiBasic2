@@ -154,8 +154,13 @@ var
   Base: string;
 begin
   Base := LowerCase(ExtractFileName(FileName));
-  Result := (Base = 'fbgfx.bi') or
-            ((Base = 'symbol.bi') and (Pos('fbc-int', LowerCase(FileName)) > 0));
+  // ⛔ EVERY fbc-int HEADER, not just symbol.bi. These describe the COMPILER'S OWN internals - the array
+  // descriptor, the symbol table - and this engine implements what they expose natively (FB.ARRAYLEN and
+  // friends). Reading fbc's real copies instead replaces our implementation with declarations of a
+  // layout we do not have: m766 died with "Array not declared: FB.ARRAYLEN" the moment the search path
+  // made "fbc-int/array.bi" findable. ⇒ The whole directory is ours to answer, and that is a decision,
+  // not a gap: a header we IMPLEMENT must never lose to one we merely FIND.
+  Result := (Base = 'fbgfx.bi') or (Pos('fbc-int', LowerCase(FileName)) > 0);
 end;
 
 procedure DiscoverFbIncludeDir;
@@ -4046,7 +4051,15 @@ var
               // ⚠️ The first field is named "imgtype" and not "type": the layout is what matters here
               // (0,4,8,12,16, which the natural alignment of four-byte fields already gives), and
               // "type" is a keyword. Nothing in the wild reads that field by name.
-              if LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi' then
+              // ⛔ ...AND ONLY WHEN THE PROGRAM ACTUALLY NAMES IT. Opening "Namespace FB" registers FB
+              // as a user namespace, and that changes how every OTHER qualified name under it resolves:
+              // "FB.ARRAYLEN" stopped resolving and m766 died with "Array not declared" the moment this
+              // was emitted unconditionally. A declaration that is free when it is needed is not free
+              // when it is not - so it is emitted only for a source that mentions FB.IMAGE.
+              // ⚠️ A text test, and it is allowed to be one: emitting the type for a program that merely
+              // mentions the name in a comment costs nothing, while missing one costs the field offsets.
+              if (LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi') and
+                 (Pos('FB.IMAGE', UpperCase(Src)) > 0) then
                 Output.Add('Namespace FB' + cVirtualEOL +
                            'Type IMAGE' + cVirtualEOL +
                            '  As ULong imgtype' + cVirtualEOL +
@@ -4427,7 +4440,15 @@ var
               // ⚠️ The first field is named "imgtype" and not "type": the layout is what matters here
               // (0,4,8,12,16, which the natural alignment of four-byte fields already gives), and
               // "type" is a keyword. Nothing in the wild reads that field by name.
-              if LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi' then
+              // ⛔ ...AND ONLY WHEN THE PROGRAM ACTUALLY NAMES IT. Opening "Namespace FB" registers FB
+              // as a user namespace, and that changes how every OTHER qualified name under it resolves:
+              // "FB.ARRAYLEN" stopped resolving and m766 died with "Array not declared" the moment this
+              // was emitted unconditionally. A declaration that is free when it is needed is not free
+              // when it is not - so it is emitted only for a source that mentions FB.IMAGE.
+              // ⚠️ A text test, and it is allowed to be one: emitting the type for a program that merely
+              // mentions the name in a comment costs nothing, while missing one costs the field offsets.
+              if (LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi') and
+                 (Pos('FB.IMAGE', UpperCase(Src)) > 0) then
                 Output.Add('Namespace FB' + cVirtualEOL +
                            'Type IMAGE' + cVirtualEOL +
                            '  As ULong imgtype' + cVirtualEOL +
