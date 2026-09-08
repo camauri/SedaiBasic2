@@ -96,3 +96,6 @@ test_out.txt
 # at a compiler that is not there.
 setup.config.json
 src/hotdisp.o
+
+# Crazy Alien: the working notes of the demo (a local note, not a document)
+bas/demo/crazy_alien/PROMPT.md
