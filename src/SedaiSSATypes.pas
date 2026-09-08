@@ -792,6 +792,17 @@ type
     // fixed-or-dynamic nature belongs to the CALLER's array and may differ between two calls. The VM
     // stamps it on the storage at DIM, a REDIM sets it, and a bind carries it into the parameter.
     IsDynamicShape: Boolean;
+    { ⭐⭐ HOW WIDE ONE ELEMENT IS, decided by the DECLARED type and carried to the VM (8 Sep 2026).
+      0 means eight bytes, which is what every array was and what every 64-bit-typed array still is;
+      1, 2 and 4 mean a PACKED array, stored the way FreeBASIC stores one - "Peek(ULong, @a(0))" then
+      reads four bytes side by side, and SizeOf(a) is the element's own size.
+      ⛔ It is settled HERE, at the declaration, because it is the only place the declared TYPE is
+      known: the VM sees a slot id and an element BANK (int/float/string), never "UByte".
+      ⛔⛔ AND IT IS WHY THE COMPILED ENGINES MUST BAIL. The AOT, the JIT and the C hot loop all read a
+      four-Int64 descriptor whose first field is a POINTER INTO IntData - which a packed array does not
+      have. They refuse such an array the way they already refuse a multi-dimensional one. }
+    ElemWidth: Byte;
+    ElemSigned: Boolean;
   end;
 
   TSSAProgram = class

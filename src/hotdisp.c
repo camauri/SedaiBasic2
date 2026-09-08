@@ -514,27 +514,33 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
        the CLASSIC programs, spectral-norm.bas and n-body.bas among them. */
     /* The in-bounds test is ONE unsigned compare: a negative index wraps to a huge unsigned value
        and fails the same test, so there is no separate li >= 0 branch on the hot path. */
+/* ⭐⭐ A PACKED ARRAY LEAVES THE LOOP, IT DOES NOT ANSWER ZERO (8 Sep 2026). An array of a narrow type
+   stores its elements one, two or four bytes wide, not eight, so its descriptor carries a NULL IntData
+   pointer and a count of zero. The bounds test then fails - correctly, there is nothing here to read -
+   and the MODERN arm would have answered 0, which is a WRONG VALUE rather than an out-of-range one.
+   ⇒ Every arm that could answer for a missing pointer now checks it, and every check sits in the
+   branch that was ALREADY off the fast path: an in-bounds access pays nothing for this. */
   L_ArrayLoadInt:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) ireg[I->dest] = ((const int64_t *)(intptr_t)d[0])[li];
-        else if (flags & HF_MODERN_ARRAYS) ireg[I->dest] = 0;
+        else if ((flags & HF_MODERN_ARRAYS) && d[0]) ireg[I->dest] = 0;
         else return pc; }
       pc++; NEXT;
   L_ArrayLoadFloat:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = ((const double *)(intptr_t)d[1])[li];
-        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = 0.0;
+        else if ((flags & HF_MODERN_ARRAYS) && d[1]) freg[I->dest] = 0.0;
         else return pc; }
       pc++; NEXT;
   L_ArrayStoreInt:   /* bcArrayStoreInt - the VALUE is in Dest, read not written */
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) ((int64_t *)(intptr_t)d[0])[li] = ireg[I->dest];
-        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+        else if (!(flags & HF_MODERN_ARRAYS) || !d[0]) return pc; }
       pc++; NEXT;
   L_ArrayStoreFloat:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) ((double *)(intptr_t)d[1])[li] = freg[I->dest];
-        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+        else if (!(flags & HF_MODERN_ARRAYS) || !d[0]) return pc; }
       pc++; NEXT;
 
     /* ---- fused float arithmetic and the transfer banks ---- */
@@ -575,25 +581,25 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
   L_ArrayLoadAddFloat:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = freg[I->imm] + ((const double *)(intptr_t)d[1])[li];
-        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = freg[I->imm];
+        else if ((flags & HF_MODERN_ARRAYS) && d[1]) freg[I->dest] = freg[I->imm];
         else return pc; }
       pc++; NEXT;
   L_ArrayLoadSubFloat:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = freg[I->imm] - ((const double *)(intptr_t)d[1])[li];
-        else if (flags & HF_MODERN_ARRAYS) freg[I->dest] = freg[I->imm];
+        else if ((flags & HF_MODERN_ARRAYS) && d[1]) freg[I->dest] = freg[I->imm];
         else return pc; }
       pc++; NEXT;
   L_ArrayLoadIntTo:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) ireg[I->dest] = ((const int64_t *)(intptr_t)d[0])[li];
-        else if (flags & HF_MODERN_ARRAYS) ireg[I->dest] = 0;
+        else if ((flags & HF_MODERN_ARRAYS) && d[0]) ireg[I->dest] = 0;
         else return pc; }
       pc++; NEXT;
   L_ArrayStoreIntConst:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) ((int64_t *)(intptr_t)d[0])[li] = I->imm;
-        else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+        else if (!(flags & HF_MODERN_ARRAYS) || !d[0]) return pc; }
       pc++; NEXT;
   L_ArrayLoadIntBranchNZ:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2]; int nz;
@@ -632,9 +638,9 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         if ((uint64_t)li < (uint64_t)dd[2]) {
           if ((uint64_t)li < (uint64_t)sd[2])
             ((int64_t *)(intptr_t)dd[0])[li] = ((const int64_t *)(intptr_t)sd[0])[li];
-          else if (flags & HF_MODERN_ARRAYS) ((int64_t *)(intptr_t)dd[0])[li] = 0;
+          else if ((flags & HF_MODERN_ARRAYS) && sd[0]) ((int64_t *)(intptr_t)dd[0])[li] = 0;
           else return pc;
-        } else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+        } else if (!(flags & HF_MODERN_ARRAYS) || !dd[0]) return pc; }
       pc++; NEXT;
   L_ArrayMoveElement:
       /* ONE array (I->dest), destination index I->s2, source index I->s1 (sub-opcode 60) */
@@ -645,7 +651,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
             ((int64_t *)(intptr_t)dd[0])[di] = ((const int64_t *)(intptr_t)dd[0])[si];
           else if (flags & HF_MODERN_ARRAYS) ((int64_t *)(intptr_t)dd[0])[di] = 0;
           else return pc;
-        } else if (!(flags & HF_MODERN_ARRAYS)) return pc; }
+        } else if (!(flags & HF_MODERN_ARRAYS) || !dd[0]) return pc; }
       pc++; NEXT;
 
 #undef NEXT
