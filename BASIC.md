@@ -2040,7 +2040,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 | `POINTER and PTR (Shortcut for 'POINTER')` | ✓ | Modifies types to be pointer types. |
 | `UNSIGNED` | ✓ | `AS UNSIGNED <basetype>` modifier → maps to the unsigned variant (INTEGER→UINTEGER, BYTE→UBYTE, SHORT→USHORT, LONG→ULONG, LONGINT→ULONGINT). Bare `UNSIGNED` == UNSIGNED INTEGER. |
 | `INTEGER<n>` / `UINTEGER<n>` | ✓ | Explicit-width integer type names: `<8>` → BYTE/UBYTE, `<16>` → SHORT/USHORT, `<32>` → LONG/ULONG, `<64>` → LONGINT/ULONGINT. Accepted in a declaration (`Dim As Integer<8> b`) and in expression position (`SizeOf(Integer<8>)`, `Cast(Integer<8>, e)`). |
-| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name for linking. SedaiBasic emits bytecode and does no external linking, so the alias is parsed and ignored. Accepted in all five places `fbc` accepts one (procedure, variable, `NAMESPACE`, `TYPE`, `ENUM`); an EMPTY alias name (`ALIAS ""`) is refused everywhere, as `fbc` does. |
+| `ALIAS (Modifier)` | ✓ | `SUB f ALIAS "extname" (...)` — the external name. On a **bodiless `DECLARE`** it now names a **C function to call** (8 Sep 2026): the symbol is looked up in the declaration's own `LIB`, then in the `#INCLIB` list, then in the process, and the call is made through the foreign-function provider. On a procedure that HAS a body it stays parsed and ignored, since nothing links this bytecode. Accepted in all five places `fbc` accepts one (procedure, variable, `NAMESPACE`, `TYPE`, `ENUM`); an EMPTY alias name (`ALIAS ""`) is refused everywhere, as `fbc` does. |
 
 ##### String types
 
@@ -2279,7 +2279,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Declare` | ✓ | Forward `DECLARE SUB|FUNCTION ...` is accepted and ignored (calls are resolved by a pre-pass over the definitions). |
+| `Declare` | ✓ | Forward `DECLARE SUB|FUNCTION ...` is accepted and ignored (calls are resolved by a pre-pass over the definitions). ⭐ **A `DECLARE` that carries an `ALIAS` and has no body is a FOREIGN procedure** (8 Sep 2026): its signature is recorded and a call to that name is compiled into a call to the C function. Supported parameter and return types: the integer widths (`Byte`…`ULongInt`, `Boolean`), `Single`, `Double`, any `... Ptr`, and `String`/`ZString`/`WString` (the address of the bytes). ⛔ A type that has no C meaning here — a UDT passed BY VALUE, which the provider supports but the language surface does not yet route — is **refused by name**, not guessed at: a wrongly marshalled argument does not raise, it returns wrong numbers. |
 | `Sub` | ✓ | Specifies a procedure that does not return an argument. |
 | `Function` | ✓ | Specifies a procedure that returns an argument. |
 | `Overload` | ✓ | Accepted after a procedure name and ignored (overloading by arity/signature already works for constructors; the marker is not required). |
@@ -2293,7 +2293,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 |---|---|---|
 | `Public` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
 | `Private` | ✓ | Accepted as a procedure/declaration prefix and ignored (linkage is not enforced). |
-| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name, a variable, a `NAMESPACE`, a `TYPE` or an `ENUM`, and ignored (no external linking). An empty name is refused. |
+| `Alias` | ✓ | `ALIAS "name"` accepted after a procedure name, a variable, a `NAMESPACE`, a `TYPE` or an `ENUM`. On a bodiless `DECLARE` it names the **C symbol to call**; elsewhere it is ignored (nothing links this bytecode). An empty name is refused. |
 | `Export` | ✗ | N/A — native linkage / ABI directive; no native object output. |
 | `Lib` | ✓ | `LIB "name"` accepted after a procedure name and ignored (no external linking). |
 
@@ -2448,8 +2448,8 @@ asks fbc itself in a single compile. It moves the day the oracle moves.
 | Keyword | Status | Description |
 |---|---|---|
 | `#INCLUDE` | ✓ | Inserts text from a file. `#include once` splices a file only if it has not been included yet — and a PLAIN `#include` registers the file too, so “once” after two plain includes is skipped (29 Aug 2026, fbc's own `pp/inc_once1..5`). Identity is the canonical PATH, not the spelling. |
-| `#INCLIB` | ✓ | Accepted and ignored — there is no separate link step, and a program that names a library still has to compile. Verified against fbc 1.10.1 (28 Aug 2026). |
-| `#LIBPATH` | ✓ | Accepted and ignored; see `#INCLIB`. Verified against fbc 1.10.1 (28 Aug 2026). |
+| `#INCLIB` | ✓ | **Names a library the program's foreign declarations may live in** (8 Sep 2026). It used to be accepted and ignored, which was right while nothing could call out of the process; now it is the list a `Declare ... Alias` with no `Lib` of its own is searched in, in the order the program gave. ⚠️ A program naming a library that is not installed therefore fails where it used to be silent — deliberately: silence there means every call into it returns garbage. |
+| `#LIBPATH` | ✓ | Collected beside `#INCLIB` and reported to the loader. ⚠️ On this platform the loader's search path is fixed before the process starts, so a `#LIBPATH` cannot add to it at run time — name the library by path, or set `LD_LIBRARY_PATH`. Declared divergence. |
 
 ##### Control Directives
 

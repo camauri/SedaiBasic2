@@ -209,6 +209,7 @@ type
     // separately heap-allocated record (stable pointer → a handle stays valid when the outer array grows).
     // A handle with SHARED_REC_FLAG set indexes here; otherwise it indexes the active context's heap.
     FSharedRecords: TSharedRecArray;
+    FForeignTable: TObject;   // TForeignTable: nil until the program makes its first foreign call
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
     FSharedRecFreeCount: Integer;
@@ -748,6 +749,14 @@ type
     function AllocSharedRecord(ByteSize, StrC, TypeId: Integer): Int64;
     function AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
     function SharedRecordBlockLen(Handle: Int64): Int64;
+    // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
+    // ExecuteInstruction are the two arms this VM keeps having to hold in step, and a foreign call is
+    // exactly the kind of work where a second copy would drift. The table is built on first use, from
+    // the program's own declaration list.
+    function ForeignTable: TObject;                       // TForeignTable, built lazily
+    procedure ExecForeignCall(Ctx: TExecutionContext; TableIdx, NArgs: Integer;
+                              out ResInt: Int64; out ResFloat: Double);
+    function ForeignPtrArg(ACtx: TObject; Tagged: Int64): Pointer;  // VM pointer domain -> machine address
     function ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
@@ -955,7 +964,11 @@ uses
   // Only for AttachGraphicsToOutput: the headless text device is the one that has to be TOLD about the
   // drawing surface, because unlike sbv's controller it is not the graphics backend itself. In the
   // implementation section so the interface of this unit stays free of it.
-  SedaiTerminalIO
+  SedaiTerminalIO,
+  // ⭐ The FFI, and it is named HERE and nowhere else in the VM: SedaiForeignRuntime is the one unit
+  // that knows a provider exists, so the day the core is cut from its providers there is a single edge
+  // to cut. In the implementation section for the same reason SedaiTerminalIO is. DIVERGENZE 183.
+  SedaiForeignRuntime
   {$IFDEF UNIX}, BaseUnix, Unix{$ENDIF}   // fpgettimeofday (unit Unix): TIMER's microsecond clock (HighResSecondsOfDay)
   {$IFDEF WINDOWS}, Windows{$ENDIF};   // QueryPerformanceCounter, same purpose
 
@@ -5956,6 +5969,59 @@ begin
   Result := SHARED_REC_FLAG or Int64(firstIdx);
 end;
 
+function TBytecodeVM.ForeignTable: TObject;
+// Built on FIRST USE, not at load: a program with no foreign call must not pay for the table, and -
+// more importantly - must not be told libffi is missing on a machine where it never needed it.
+var
+  T: TForeignTable;
+  i: Integer;
+begin
+  if FForeignTable = nil then
+  begin
+    T := TForeignTable.Create;
+    if FProgram <> nil then
+    begin
+      for i := 0 to FProgram.ForeignDeclCount - 1 do
+        T.AddDecl(FProgram.GetForeignDecl(i));
+      for i := 0 to FProgram.IncLibCount - 1 do
+        T.AddLib(FProgram.GetIncLib(i));
+    end;
+    T.ResolvePtr := @ForeignPtrArg;
+    FForeignTable := T;
+  end;
+  Result := FForeignTable;
+end;
+
+function TBytecodeVM.ForeignPtrArg(ACtx: TObject; Tagged: Int64): Pointer;
+// The three answers a pointer VALUE can have when it is about to leave the process:
+//   0                     -> NULL, and never an error: passing null is how half of C is called.
+//   FGNPTR_TAG set        -> a machine address a foreign call already returned: strip the tag, pass it.
+//   anything else         -> a VM-domain pointer (byte heap, framebuffer, array storage): resolve it.
+//
+// ⚠️ ...and a value that resolves to NONE of the VM's regions is taken to be a machine address that
+// reached the program without a tag - through an out-parameter, or read back out of a struct. That is
+// a HEURISTIC, and it is stated as one at FGNPTR_TAG: past a foreign call the memory safety this VM
+// keeps everywhere else is the C library's to keep. Refusing instead would make every binding that
+// hands back a pointer through memory - which is most of them - impossible to use at all.
+//
+// ⛔ NeedBytes = 1: how many bytes the callee will read is not knowable here. The check that remains is
+// the one that matters at this boundary - that the pointer names a region we own at all.
+begin
+  if Tagged = 0 then Exit(nil);
+  if (Tagged and FGNPTR_TAG) <> 0 then Exit(Pointer(PtrUInt(Tagged and not FGNPTR_TAG)));
+  try
+    Result := BlockAddr(TExecutionContext(ACtx), Tagged, 1);
+  except
+    on ERangeError do Result := Pointer(PtrUInt(Tagged));
+  end;
+end;
+
+procedure TBytecodeVM.ExecForeignCall(Ctx: TExecutionContext; TableIdx, NArgs: Integer;
+  out ResInt: Int64; out ResFloat: Double);
+begin
+  TForeignTable(ForeignTable).Invoke(TableIdx, Ctx, Ctx.XferInt, Ctx.XferFloat, NArgs, ResInt, ResFloat);
+end;
+
 function TBytecodeVM.SharedRecordBlockLen(Handle: Int64): Int64;
 // How many CONSECUTIVE records the block starting at Handle holds. Only the FIRST record of a block
 // carries the number (AllocSharedRecordBlock writes it there), so anything else - a lone record, a
@@ -8202,6 +8268,8 @@ var
   InQuotes: Boolean;
   HandleNum64: Int64;   // indirect-call target (entry PC, or a BUILTIN_FP_TAG @Sin sentinel)
   VaIdx: Integer;       // CVA_ARG: cursor into the variadic slot stack
+  FgnResI: Int64;       // FFI: the two result banks, one of which the declaration selects
+  FgnResF: Double;
 begin
   // Two-level dispatch: extract group from high byte
   Group := Instr.OpCode shr 8;
@@ -8553,6 +8621,17 @@ begin
                                    (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
     bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
       Ctx.IntRegs[Instr.Dest] := SharedRecordBlockLen(Ctx.IntRegs[Instr.Src1]);
+    // FFI: Immediate = index into the foreign declaration table, Src1 = staged argument count.
+    bcForeignCall:
+      begin
+        ExecForeignCall(Ctx, Instr.Immediate, Instr.Src1, FgnResI, FgnResF);
+        Ctx.IntRegs[Instr.Dest] := FgnResI;
+      end;
+    bcForeignCallF:
+      begin
+        ExecForeignCall(Ctx, Instr.Immediate, Instr.Src1, FgnResI, FgnResF);
+        Ctx.FloatRegs[Instr.Dest] := FgnResF;
+      end;
     bcRecordFree:
       FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).

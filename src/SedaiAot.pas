@@ -1316,6 +1316,13 @@ begin
     // middle of one (a moved PC, a sentinel), leaving a half-built index list that the
     // interpreter then adds to, so Resolve linearises the wrong subscripts. Whole regions
     // using runtime multi-dim indexing stay interpreted, as they did before C4.
+    // ⛔ FFI: a foreign call LEAVES THE PROCESS. Routing it through the helper would work today - the
+    // helper flushes the registers and ExecuteInstruction has the arm - but the arguments reach it
+    // through the TRANSFER BANK, and whether every xfer store feeding this call was itself helper-routed
+    // rather than kept in a native register is not a property this classification can see. A wrongly
+    // sourced argument does not raise: the C function answers wrong numbers. The whole region stays
+    // interpreted, which for a call out of the process costs nothing worth measuring. DIVERGENZE 183.
+    bcForeignCall, bcForeignCallF,
     bcArrayIdxPush, bcArrayIdxResolve, bcArrayIdxResolveInd:
       Result := True;
   else

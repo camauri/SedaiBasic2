@@ -1715,7 +1715,7 @@ var
   // skipped, because a bodiless DECLARE emits no node at all (DIVERGENZE 183).
   FgnName, FgnAlias, FgnLib, FgnRet, FgnParams, FgnTok: string;
   FgnDepth: Integer;
-  FgnAfterAs, FgnIsFunc: Boolean;
+  FgnAfterAs, FgnIsFunc, FgnTypeOpen: Boolean;
 begin
   Result := nil;
   // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
@@ -1850,15 +1850,17 @@ begin
    // Recorded as NAME|SYMBOL|LIBRARY|RETURNTYPE|PARAMTYPE,PARAMTYPE,... and handed to the SSA on the
    // program node. DIVERGENZE 183.
    FgnName := ''; FgnAlias := ''; FgnLib := ''; FgnRet := ''; FgnParams := '';
-   FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False;
+   FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False; FgnTypeOpen := False;
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
      FgnIsFunc := UpperCase(VarToStr(Context.PeekNext.Value)) = kFUNCTION;
    if Assigned(Context.PeekToken(2)) then FgnName := UpperCase(VarToStr(Context.PeekToken(2).Value));
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
    begin
      FgnTok := UpperCase(VarToStr(Context.CurrentToken.Value));
-     if Context.Check(ttDelimParOpen) then begin Inc(FgnDepth); FgnAfterAs := False; end
-     else if Context.Check(ttDelimParClose) then begin Dec(FgnDepth); FgnAfterAs := False; end
+     if Context.Check(ttDelimParOpen) then
+     begin Inc(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False; end
+     else if Context.Check(ttDelimParClose) then
+     begin Dec(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False; end
      else if (FgnTok = kALIAS) or (FgnTok = kLIB) then
      begin
        // The symbol's CASE is its own: a C name is not upper-cased.
@@ -1868,8 +1870,22 @@ begin
          else FgnLib := VarToStr(Context.PeekNext.Value);
        end;
      end
-     else if (FgnTok = kAS) or Context.Check(ttAsType) then FgnAfterAs := True
-     else if FgnAfterAs and Context.Check(ttIdentifier) then
+     else if (FgnTok = kAS) or Context.Check(ttAsType) then
+     begin FgnAfterAs := True; FgnTypeOpen := False; end
+     // ⛔ THE PTR TEST COMES FIRST, AND IT IS GATED ON "a type was just read" - NOT on "we are after an
+     // AS". The first version of this loop cleared the after-AS flag the instant it recorded the type
+     // name, so the arm that appended " PTR" could never run: every pointer parameter in every binding
+     // was recorded as its POINTEE. It still answered right for "ZString Ptr" (a bare ZSTRING is
+     // classified as a pointer anyway) and wrong for "Integer Ptr" - the VALUE marshalled where the
+     // ADDRESS was meant, which does not raise, it answers wrong numbers. Found by reading the table
+     // back out of a .basc instead of trusting the code. DIVERGENZE 183.
+     // The flag STAYS open afterwards, so "Any Ptr Ptr" keeps both.
+     else if FgnTypeOpen and (FgnTok = kPTR) then
+     begin
+       if (FgnDepth > 0) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
+       else if (FgnDepth = 0) and (FgnRet <> '') then FgnRet := FgnRet + ' PTR';
+     end
+     else if FgnAfterAs and Context.CheckAny([ttIdentifier, ttAsType]) then
      begin
        if FgnDepth > 0 then
        begin
@@ -1878,14 +1894,10 @@ begin
        end
        else if FgnRet = '' then FgnRet := FgnTok;
        FgnAfterAs := False;
+       FgnTypeOpen := True;
      end
-     else if FgnAfterAs and (FgnTok = kPTR) then
-     begin
-       // "As Integer Ptr": the PTR belongs to the type just read, and a pointer is what most of a C
-       // binding passes - dropping it would marshal the VALUE where the address was meant.
-       if (FgnDepth > 0) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
-       else if FgnRet <> '' then FgnRet := FgnRet + ' PTR';
-     end;
+     else if Context.Check(ttSeparParam) then
+       FgnTypeOpen := False;   // the next parameter's type has not been read yet
      Context.Advance;
    end;
    if (FgnName <> '') and (FgnAlias <> '') then

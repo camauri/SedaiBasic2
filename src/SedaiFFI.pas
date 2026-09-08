@@ -142,6 +142,10 @@ function FFITypePointer: TFFITypeRef;
 // Opening a user library and finding a symbol: the two things the language surface needs.
 function FFILoadLibrary(const AName: string): TLibHandle;
 function FFISymbol(ALib: TLibHandle; const AName: string): Pointer;
+// ...and the symbols the PROCESS already has - the host executable and everything it is linked
+// against. ⛔ Not the same as FFILoadLibrary(''): that asks the loader for a file called "", which
+// fails. The global handle is a NULL argument to dlopen, which is a different request.
+function FFISelfSymbol(const AName: string): Pointer;
 
 implementation
 
@@ -165,8 +169,18 @@ var
   GRefs: array of TFFITypeRef;    // the primitive wrappers, freed at finalization
 
 function LoadFFI: Boolean;
+// ⛔ ONE candidate list per platform, not one list with a Windows branch INSIDE the loop: that shape
+// tried "libffi-8.dll" four times and never any other spelling, so a machine carrying libffi under any
+// of its other names reported "not installed". A soname is a per-platform fact, so it gets a
+// per-platform list.
 const
+  {$IFDEF WINDOWS}
+  Candidates: array[0..3] of string = ('libffi-8.dll', 'libffi-7.dll', 'libffi.dll', 'ffi.dll');
+  Tried = 'libffi-8.dll, libffi-7.dll, libffi.dll and ffi.dll';
+  {$ELSE}
   Candidates: array[0..3] of string = ('libffi.so.8', 'libffi.so.7', 'libffi.so.6', 'libffi.so');
+  Tried = 'libffi.so.8, .7, .6 and libffi.so';
+  {$ENDIF}
 var
   i: Integer;
 begin
@@ -175,16 +189,12 @@ begin
   GTried := True;
   for i := Low(Candidates) to High(Candidates) do
   begin
-    {$IFDEF WINDOWS}
-    GFFI := LoadLibrary('libffi-8.dll');
-    {$ELSE}
     GFFI := LoadLibrary(Candidates[i]);
-    {$ENDIF}
     if GFFI <> NilHandle then Break;
   end;
   if GFFI = NilHandle then
   begin
-    GReason := 'libffi is not installed (tried libffi.so.8, .7, .6 and libffi.so)';
+    GReason := 'libffi is not installed (tried ' + Tried + ')';
     Exit(False);
   end;
   Pointer(ffi_prep_cif)        := GetProcedureAddress(GFFI, 'ffi_prep_cif');
@@ -382,6 +392,21 @@ function FFISymbol(ALib: TLibHandle; const AName: string): Pointer;
 begin
   if ALib = NilHandle then Exit(nil);
   Result := GetProcedureAddress(ALib, AName);
+end;
+
+function FFISelfSymbol(const AName: string): Pointer;
+begin
+  // ⭐ NO NEW EXTERNAL FOR THIS on Unix: GetProcedureAddress IS dlsym, and glibc's RTLD_DEFAULT - "look
+  // in everything already loaded" - is the NULL handle. Declaring dlopen/dlsym here would put a
+  // link-time dependency in a unit whose whole point is not to have one.
+  // ⛔ AND THERE IS NO SUCH THING ON WINDOWS. A DLL's exports live in that DLL; there is no process-wide
+  // symbol namespace to search, so this answers nil there and the caller says "no library was named",
+  // which is the truth: on Windows a foreign declaration must name its DLL through "Lib" or "#inclib".
+  {$IFDEF WINDOWS}
+  Result := nil;
+  {$ELSE}
+  Result := GetProcedureAddress(NilHandle, AName);
+  {$ENDIF}
 end;
 
 var

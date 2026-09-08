@@ -1,0 +1,303 @@
+unit SedaiForeignRuntime;
+
+{$mode objfpc}{$H+}
+{$codepage UTF8}
+
+// ⭐ THE RUNTIME HALF OF THE FFI: the table a program's bcForeignCall instructions index into, and the
+// marshalling that turns transfer slots into C arguments.
+//
+// ⛔ THIS IS THE ONLY UNIT OF THE VM SIDE THAT NAMES THE PROVIDER. SedaiBytecodeVM names THIS, and this
+// names SedaiFFI - so the count of core units that reach a provider stays at one, and the day the core
+// is separated from its providers (owner's decision, 8 Sep 2026) there is one edge to cut, not one per
+// call site. Nothing here links against libffi either: the provider loads it lazily, and a machine
+// without it gets a named diagnostic at the first foreign call rather than a build that will not run.
+//
+// A binding is prepared ONCE per table entry and reused: opening the library and preparing the call
+// interface cost far more than the call, and a C binding is called in loops. DIVERGENZE 183.
+
+interface
+
+uses
+  Classes, SysUtils, dynlibs, SedaiSSATypes, SedaiForeignDecl, SedaiFFI;
+
+type
+  EForeignCallError = class(Exception);
+
+  { ⭐ HOW A POINTER ARGUMENT BECOMES A MACHINE ADDRESS. The VM owns that answer - only it knows its own
+    regions - so it hands one of its methods in rather than this unit learning the pointer encoding.
+    The resolver answers nil for a null pointer. }
+  TForeignPtrResolver = function(ACtx: TObject; Tagged: Int64): Pointer of object;
+
+  TForeignBinding = record
+    Decl: TForeignDecl;
+    ArgKinds: array of TForeignKind;
+    RetKind: TForeignKind;
+    Fn: Pointer;
+    Prepared: Boolean;
+    Call: TFFICall;
+    RetRef: TFFITypeRef;
+    ArgRefs: array of TFFITypeRef;
+  end;
+
+  { One per running program. Built from the bytecode program's declaration table, in the SAME order:
+    the Immediate of a bcForeignCall is an index into it. }
+  TForeignTable = class
+  private
+    FEntries: array of TForeignBinding;
+    FLibs: TStringList;          // "#inclib" names, in the order the program gave them
+    FOpened: TStringList;        // name -> handle, so a library is opened once
+    FResolvePtr: TForeignPtrResolver;
+    function OpenLib(const AName: string): TLibHandle;
+    function ResolveSymbol(var B: TForeignBinding): Pointer;
+    procedure Prepare(var B: TForeignBinding);
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure AddDecl(const ALine: string);
+    procedure AddLib(const AName: string);
+    function Count: Integer;
+    { Call entry Idx. The arguments are read from the transfer banks with the SAME per-bank slot
+      numbering the SSA staged them under: the n-th integer parameter is XferInt[n], the n-th float
+      parameter is XferFloat[n]. }
+    procedure Invoke(Idx: Integer; ACtx: TObject;
+                     const XferInt: array of Int64; const XferFloat: array of Double;
+                     NArgs: Integer; out ResInt: Int64; out ResFloat: Double);
+    property ResolvePtr: TForeignPtrResolver read FResolvePtr write FResolvePtr;
+  end;
+
+implementation
+
+constructor TForeignTable.Create;
+begin
+  inherited Create;
+  FLibs := TStringList.Create;
+  FOpened := TStringList.Create;
+  FOpened.CaseSensitive := True;
+end;
+
+destructor TForeignTable.Destroy;
+var
+  i, j: Integer;
+begin
+  for i := 0 to High(FEntries) do
+  begin
+    FEntries[i].Call.Free;
+    FEntries[i].RetRef := nil;    // the primitive wrappers belong to the provider
+    for j := 0 to High(FEntries[i].ArgRefs) do FEntries[i].ArgRefs[j] := nil;
+  end;
+  // ⚠️ The libraries are NOT unloaded. A foreign function may have registered an atexit handler, left
+  // a pointer into its own data with the program, or be shared with something else in the process;
+  // closing it at program end buys nothing and can crash on the way out.
+  FOpened.Free;
+  FLibs.Free;
+  inherited Destroy;
+end;
+
+procedure TForeignTable.AddDecl(const ALine: string);
+var
+  n, i: Integer;
+begin
+  n := Length(FEntries);
+  SetLength(FEntries, n + 1);
+  FillChar(FEntries[n], SizeOf(FEntries[n]), 0);
+  // ⛔ An unparseable line still takes a SLOT. The index is positional: skipping one would shift every
+  // later entry, so a call would reach the wrong function - which is the failure this table exists to
+  // make impossible.
+  if not ParseForeignDecl(ALine, FEntries[n].Decl) then Exit;
+  FEntries[n].RetKind := ForeignKindOf(FEntries[n].Decl.RetTypeName);
+  SetLength(FEntries[n].ArgKinds, Length(FEntries[n].Decl.ParamTypeNames));
+  for i := 0 to High(FEntries[n].Decl.ParamTypeNames) do
+    FEntries[n].ArgKinds[i] := ForeignKindOf(FEntries[n].Decl.ParamTypeNames[i]);
+end;
+
+procedure TForeignTable.AddLib(const AName: string);
+begin
+  if (AName <> '') and (FLibs.IndexOf(AName) < 0) then FLibs.Add(AName);
+end;
+
+function TForeignTable.Count: Integer;
+begin
+  Result := Length(FEntries);
+end;
+
+function TForeignTable.OpenLib(const AName: string): TLibHandle;
+var
+  k: Integer;
+  H: TLibHandle;
+begin
+  k := FOpened.IndexOf(AName);
+  if k >= 0 then Exit(TLibHandle(PtrUInt(FOpened.Objects[k])));
+  H := FFILoadLibrary(AName);
+  FOpened.AddObject(AName, TObject(PtrUInt(H)));
+  Result := H;
+end;
+
+function TForeignTable.ResolveSymbol(var B: TForeignBinding): Pointer;
+// Where to look, in order: the library the DECLARATION named, then each "#inclib", then the process
+// itself. The last one is what makes a symbol from the host executable or from an already-loaded
+// library reachable without naming a file.
+var
+  i: Integer;
+  H: TLibHandle;
+  Tried: string;
+begin
+  Result := nil;
+  Tried := '';
+  if B.Decl.LibName <> '' then
+  begin
+    H := OpenLib(B.Decl.LibName);
+    if H <> NilHandle then Result := FFISymbol(H, B.Decl.Symbol);
+    if Result <> nil then Exit;
+    Tried := B.Decl.LibName;
+  end;
+  for i := 0 to FLibs.Count - 1 do
+  begin
+    H := OpenLib(FLibs[i]);
+    if H <> NilHandle then Result := FFISymbol(H, B.Decl.Symbol);
+    if Result <> nil then Exit;
+    if Tried <> '' then Tried := Tried + ', ';
+    Tried := Tried + FLibs[i];
+  end;
+  Result := FFISelfSymbol(B.Decl.Symbol);   // the process's own symbols, and everything it loaded
+  if Result <> nil then Exit;
+  if Tried = '' then
+    raise EForeignCallError.CreateFmt('%s: the symbol "%s" was not found, and no library was named ' +
+      '(a "Lib" on the declaration or a "#inclib" says where to look)', [B.Decl.Name, B.Decl.Symbol])
+  else
+    raise EForeignCallError.CreateFmt('%s: the symbol "%s" was not found in %s',
+      [B.Decl.Name, B.Decl.Symbol, Tried]);
+end;
+
+function KindToRef(K: TForeignKind): TFFITypeRef;
+begin
+  case K of
+    fkVoid:    Result := FFITypeVoid;
+    fkS8:      Result := FFITypeSInt8;
+    fkU8:      Result := FFITypeUInt8;
+    fkS16:     Result := FFITypeSInt16;
+    fkU16:     Result := FFITypeUInt16;
+    fkS32:     Result := FFITypeSInt32;
+    fkU32:     Result := FFITypeUInt32;
+    fkS64:     Result := FFITypeSInt64;
+    fkU64:     Result := FFITypeUInt64;
+    fkFloat:   Result := FFITypeFloat;
+    fkDouble:  Result := FFITypeDouble;
+    fkPointer: Result := FFITypePointer;
+  else
+    Result := nil;
+  end;
+end;
+
+procedure TForeignTable.Prepare(var B: TForeignBinding);
+var
+  i: Integer;
+begin
+  if B.Prepared then Exit;
+  if not FFIAvailable then
+    raise EForeignCallError.CreateFmt('%s cannot be called: %s', [B.Decl.Name, FFIUnavailableReason]);
+  if B.Decl.Name = '' then
+    raise EForeignCallError.Create('a foreign call names an entry this program does not carry ' +
+      '(a .basc written before the foreign table existed?)');
+  B.Fn := ResolveSymbol(B);
+  B.RetRef := KindToRef(B.RetKind);
+  if B.RetRef = nil then
+    raise EForeignCallError.CreateFmt('%s returns "%s", which has no C type here',
+                                      [B.Decl.Name, B.Decl.RetTypeName]);
+  SetLength(B.ArgRefs, Length(B.ArgKinds));
+  for i := 0 to High(B.ArgKinds) do
+  begin
+    B.ArgRefs[i] := KindToRef(B.ArgKinds[i]);
+    if B.ArgRefs[i] = nil then
+      raise EForeignCallError.CreateFmt('%s: parameter %d is "%s", which has no C type here',
+                                        [B.Decl.Name, i + 1, B.Decl.ParamTypeNames[i]]);
+  end;
+  B.Call := TFFICall.Create(B.Fn, B.RetRef, B.ArgRefs);
+  if not B.Call.Ready then
+    raise EForeignCallError.CreateFmt('%s: libffi refused this signature', [B.Decl.Name]);
+  B.Prepared := True;
+end;
+
+procedure TForeignTable.Invoke(Idx: Integer; ACtx: TObject; const XferInt: array of Int64;
+  const XferFloat: array of Double; NArgs: Integer; out ResInt: Int64; out ResFloat: Double);
+// ⛔ ONE BUFFER PER ARGUMENT, AT ITS OWN WIDTH, and a pointer to each: that is libffi's convention, and
+// it is why the buffers are locals that outlive the call rather than expressions. A "Long" parameter
+// given the address of an Int64 would have the callee read four bytes of an eight-byte value - right on
+// a little-endian machine for small numbers, and wrong the moment the value does not fit, which is the
+// silent kind of wrong.
+var
+  B: ^TForeignBinding;
+  i, SlotI, SlotF: Integer;
+  Buf: array[0..63] of array[0..7] of Byte;   // storage for up to 64 arguments
+  Vals: array[0..63] of Pointer;
+  RetBuf: array[0..15] of Byte;
+begin
+  ResInt := 0; ResFloat := 0;
+  if (Idx < 0) or (Idx > High(FEntries)) then
+    raise EForeignCallError.CreateFmt('foreign call index %d is outside this program''s table of %d',
+                                      [Idx, Length(FEntries)]);
+  B := @FEntries[Idx];
+  if NArgs > Length(B^.ArgKinds) then NArgs := Length(B^.ArgKinds);
+  if NArgs > 64 then
+    raise EForeignCallError.CreateFmt('%s: %d arguments is more than this call path carries',
+                                      [B^.Decl.Name, NArgs]);
+  Prepare(B^);
+
+  SlotI := 0; SlotF := 0;
+  FillChar(Buf, SizeOf(Buf), 0);
+  for i := 0 to NArgs - 1 do
+  begin
+    Vals[i] := @Buf[i][0];
+    case B^.ArgKinds[i] of
+      fkFloat:  begin PSingle(Vals[i])^ := XferFloat[SlotF]; Inc(SlotF); end;
+      fkDouble: begin PDouble(Vals[i])^ := XferFloat[SlotF]; Inc(SlotF); end;
+      fkS8, fkU8:   begin PByte(Vals[i])^ := Byte(XferInt[SlotI]); Inc(SlotI); end;
+      fkS16, fkU16: begin PWord(Vals[i])^ := Word(XferInt[SlotI]); Inc(SlotI); end;
+      fkS32, fkU32: begin PLongWord(Vals[i])^ := LongWord(XferInt[SlotI]); Inc(SlotI); end;
+      fkPointer:
+        begin
+          // ⛔ A POINTER ARGUMENT IS NOT AN INTEGER. What the program holds is a VM-domain value - an
+          // offset into the byte heap, a packed array pointer, or a machine address a previous foreign
+          // call returned - and C wants the third of those. Handing the raw Int64 over passes an OFFSET
+          // as an ADDRESS, which is the access violation this cost to find.
+          // ⛔ The CONTEXT travels with the call: an array pointer resolves against the executing
+          // thread's arrays, so a worker must not be resolved against the main context's.
+          if Assigned(FResolvePtr) then PPointer(Vals[i])^ := FResolvePtr(ACtx, XferInt[SlotI])
+          else PInt64(Vals[i])^ := XferInt[SlotI];
+          Inc(SlotI);
+        end;
+    else
+      // 64-bit integers.
+      begin PInt64(Vals[i])^ := XferInt[SlotI]; Inc(SlotI); end;
+    end;
+  end;
+
+  FillChar(RetBuf, SizeOf(RetBuf), 0);
+  B^.Call.Call(Slice(Vals, NArgs), @RetBuf[0]);
+
+  // ⛔ A RETURN NARROWER THAN A REGISTER IS READ AT ITS OWN WIDTH AND SIGN. libffi widens an integer
+  // return to at least a full word, but the BYTES above the declared width are unspecified padding -
+  // reading the whole Int64 makes a "Long" returning -1 answer 4294967295 on one build and -1 on the
+  // next, which is the worst kind of difference to chase.
+  case B^.RetKind of
+    fkVoid:   ;
+    fkFloat:  ResFloat := PSingle(@RetBuf[0])^;
+    fkDouble: ResFloat := PDouble(@RetBuf[0])^;
+    fkS8:     ResInt := PShortInt(@RetBuf[0])^;
+    fkU8:     ResInt := PByte(@RetBuf[0])^;
+    fkS16:    ResInt := PSmallInt(@RetBuf[0])^;
+    fkU16:    ResInt := PWord(@RetBuf[0])^;
+    fkS32:    ResInt := PLongInt(@RetBuf[0])^;
+    fkU32:    ResInt := PLongWord(@RetBuf[0])^;
+    fkPointer:
+      begin
+        // Tagged, so the next call can tell this machine address from a VM-domain pointer. A NULL is
+        // left at 0: "If p = 0" is how every C binding tests one. See FGNPTR_TAG.
+        ResInt := PInt64(@RetBuf[0])^;
+        if ResInt <> 0 then ResInt := ResInt or FGNPTR_TAG;
+      end;
+  else
+    ResInt := PInt64(@RetBuf[0])^;
+  end;
+end;
+
+end.

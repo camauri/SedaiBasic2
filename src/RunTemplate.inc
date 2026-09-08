@@ -31,6 +31,8 @@ var
   ArrDescPtr: Pointer;     // array-descriptor table for this native entry (AcquireArrDesc: locked)
   Instructions: PBytecodeInstruction;
   InstrCount: Integer;
+  FgnResI: Int64;          // FFI: the two result banks, one of which the declaration selects
+  FgnResF: Double;
   CurPC: Integer;  // Current Program Counter (local for speed)
   S53Pos, S53Idx: Integer;   // sub-opcode 53 fast lane: the source index and the table index
   Instr: PBytecodeInstruction;   // POINTER, not a copy - see the note at the assignment
@@ -1351,6 +1353,21 @@ begin
         bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
           begin
             IntRegs[Instr^.Dest] := SharedRecordBlockLen(IntRegs[Instr^.Src1]);
+            Inc(CurPC);
+          end;
+        // ⭐ FFI: call a C function. Immediate = index into the foreign declaration table, Src1 = how
+        // many arguments were staged into the transfer bank. The SAME ExecForeignCall the other
+        // dispatcher calls - a foreign call is not the place to keep two copies in step.
+        bcForeignCall:
+          begin
+            ExecForeignCall(Ctx, Instr^.Immediate, Instr^.Src1, FgnResI, FgnResF);
+            IntRegs[Instr^.Dest] := FgnResI;
+            Inc(CurPC);
+          end;
+        bcForeignCallF:
+          begin
+            ExecForeignCall(Ctx, Instr^.Immediate, Instr^.Src1, FgnResI, FgnResF);
+            FloatRegs[Instr^.Dest] := FgnResF;
             Inc(CurPC);
           end;
         bcRecordReallocBlock:  // Reallocate a UDT block: Dest = the (possibly moved) first handle

@@ -198,6 +198,21 @@ const
   bcRecordNewArrayInd = bcGroupCore + 151; // allocate a record per element of the member array whose FArrays handle is in IntRegs[Src1]; Immediate = packed slot counts (int|float<<16|str<<32|typeId<<48)
   bcRecordReallocBlock = bcGroupCore + 169; // Reallocate a UDT block: Dest = new first handle, Src1 = old first handle,
                                            //   Src2 = new element count reg; Immediate = packed slot counts (as bcRecordNewBlock).
+  // ⭐ CALL A C FUNCTION. Immediate = index into the program's foreign declaration table, Src1 = how
+  // many arguments were staged, Dest = the register the result lands in. The arguments arrive through
+  // the ORDINARY transfer bank, staged by the same ssaXferStore* a BASIC call uses - a foreign call is
+  // a call, and inventing a second protocol for it would be a second thing to keep in step.
+  // ⛔ TWO OPCODES, ONE PER RESULT BANK, and not one carrying the bank in Immediate: the register
+  // compactor classifies Dest from the OPCODE (DestIsIntReg / DestIsFloatReg), so a single opcode whose
+  // Dest is sometimes a float register would have its float results compacted as ints - silently. It is
+  // the same reason bcXferLoad is three opcodes and not one. A void SUB uses the int form and never
+  // reads Dest. (No string form: a C function returns a POINTER to bytes, which is an int.)
+  // ⛔ Deliberately NOT covered by the C hot loop, the AOT or the JIT: it leaves the process. The AOT
+  // names both in AotHelperUnsafeOp (its helper route is a BLOCKLIST, so silence there would have
+  // admitted them); the JIT's IsRoutableOp is a whitelist and it has no native emitter, so it bails on
+  // its own - and the C hot loop's arms are a whitelist too. DIVERGENZE 183.
+  bcForeignCall     = bcGroupCore + 171;   // Dest = int result (or unused, for a SUB)
+  bcForeignCallF    = bcGroupCore + 172;   // Dest = float result (SINGLE / DOUBLE return)
   bcRecordBlockLen  = bcGroupCore + 170; // Dest = how many CONSECUTIVE records the block starting at IntRegs[Src1] holds
                                         //   (1 when the handle is a lone record). What "Delete[] p" needs to run one
                                         //   destructor per element: fbc keeps the same number in a UInteger in front
@@ -1167,7 +1182,21 @@ type
     // so a peephole that deletes a register's last use makes the compactor drop it (-> -1) while SSA
     // keeps naming it, and the region bails with "unmapped-str". Reserving it keeps a slot alive.
     FReservedStrRegs: array of Integer;
+    // ⭐ THE FOREIGN DECLARATION TABLE the program's bcForeignCall instructions index into, one entry
+    // per line: NAME|SYMBOL|LIBRARY|RETURNTYPE|PARAMTYPE,PARAMTYPE,... - the parser's own spelling,
+    // carried down unchanged. It TRAVELS IN THE .basc (v5): an Immediate that indexes a table the
+    // reader does not rebuild is a call to whatever happens to sit at that index. DIVERGENZE 183.
+    FForeignDecls: TStringList;
+    // ...and the libraries the program named with "#inclib", in the order it named them. A foreign
+    // DECLARE that carries its own "Lib" says where to look; one that does not is looked for in these.
+    FIncLibs: TStringList;
   public
+    procedure AddForeignDecl(const ADecl: string);
+    function ForeignDeclCount: Integer;
+    function GetForeignDecl(Index: Integer): string;
+    procedure AddIncLib(const AName: string);
+    function IncLibCount: Integer;
+    function GetIncLib(Index: Integer): string;
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
     property QBLang: Boolean read FQBLang write FQBLang;
@@ -1320,13 +1349,49 @@ begin
   FOptionDigits := 0;    // 0 = the dialect default stands
   FStringConstants := TStringList.Create;
   FStringConstants.CaseSensitive := True;  // IMPORTANT: "n" and "N" are different!
+  FForeignDecls := TStringList.Create;
+  FIncLibs := TStringList.Create;
   FEntryPoint := 0;
 end;
 
 destructor TBytecodeProgram.Destroy;
 begin
   FStringConstants.Free;
+  FForeignDecls.Free;
+  FIncLibs.Free;
   inherited Destroy;
+end;
+
+procedure TBytecodeProgram.AddForeignDecl(const ADecl: string);
+begin
+  if ADecl <> '' then FForeignDecls.Add(ADecl);
+end;
+
+function TBytecodeProgram.ForeignDeclCount: Integer;
+begin
+  Result := FForeignDecls.Count;
+end;
+
+function TBytecodeProgram.GetForeignDecl(Index: Integer): string;
+begin
+  if (Index < 0) or (Index >= FForeignDecls.Count) then Exit('');
+  Result := FForeignDecls[Index];
+end;
+
+procedure TBytecodeProgram.AddIncLib(const AName: string);
+begin
+  if (AName <> '') and (FIncLibs.IndexOf(AName) < 0) then FIncLibs.Add(AName);
+end;
+
+function TBytecodeProgram.IncLibCount: Integer;
+begin
+  Result := FIncLibs.Count;
+end;
+
+function TBytecodeProgram.GetIncLib(Index: Integer): string;
+begin
+  if (Index < 0) or (Index >= FIncLibs.Count) then Exit('');
+  Result := FIncLibs[Index];
 end;
 
 procedure TBytecodeProgram.AddInstruction(const Instr: TBytecodeInstruction);
@@ -2052,6 +2117,8 @@ begin
         152: Result := 'RecordNewBlock';
         169: Result := 'RecordReallocBlock';
         170: Result := 'RecordBlockLen';
+        171: Result := 'ForeignCall';
+        172: Result := 'ForeignCallF';
         111: Result := 'RecordTypeId';
         133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';

@@ -550,6 +550,9 @@ begin
     bcXferLoadInt,
     // UDT/record (M3): RecordNew writes the handle (int); RecordLoadInt writes an int field.
     bcRecordNew, bcRecordNewBlock, bcRecordReallocBlock, bcRecordBlockLen, bcRecordLoadInt,
+    // ⭐ FFI: the int-result form writes Dest. (The float-result form is bcForeignCallF, in
+    // DestIsFloatReg - one opcode per result bank is what lets this classification be static.)
+    bcForeignCall,
     // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).
@@ -704,6 +707,8 @@ begin
     bcXferLoadFloat,
     // UDT/record (M3): RecordLoadFloat writes a float field into Dest.
     bcRecordLoadFloat,
+    // ⭐ FFI: a foreign function declared "As Double"/"As Single" writes its result here.
+    bcForeignCallF,
     // === GROUP 0: Core VM operations ===
     bcLoadConstFloat, bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat,
     bcModFloat, bcNegFloat, bcPowFloat,

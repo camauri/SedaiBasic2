@@ -37,7 +37,8 @@ uses
   SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals,
   SedaiFastLookup,        // TIndexedStringList: the name registries below answer IndexOf from a hash
   SedaiExecutorErrors,   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
-  SedaiPreprocessor;     // GPPUndefNames: the names "#undef" retired (DIVERGENZE 73)
+  SedaiPreprocessor,     // GPPUndefNames: the names "#undef" retired (DIVERGENZE 73)
+  SedaiForeignDecl;      // the format of a foreign DECLARE, and nothing about libffi (DIVERGENZE 183)
 
 type
   { Loop info for FOR/NEXT implementation }
@@ -640,6 +641,11 @@ type
     procedure EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
     function TryEmitImplicitUDTArg(const ParamTypeU: string; ArgExpr: TASTNode; out Val: TSSAValue): Boolean;
     procedure StageCallArgs(const ParamOwnerName: string; ArgListNode: TASTNode);  // args -> xfer
+    // ⭐ FFI (DIVERGENZE 183): a call to a name the program declared with "Declare ... Alias ... Lib"
+    // is not a BASIC call - it leaves the process. TryForeignCall answers False for every other name,
+    // so it can be asked wherever a name has failed to resolve.
+    function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
+                            out ResultVal: TSSAValue): Boolean;
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);   // raw-ness crosses the call here
     function RawPtrMarkedHere(const NameU: string): Boolean;       // ...is it raw in THIS scope? (DIVERGENZE 96)
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -9144,6 +9150,10 @@ begin
             try ProcessExpression(ThisFieldNode, Result); finally ThisFieldNode.Free; end;
             Exit;
           end;
+          // ⭐ ...or it is a call to a C FUNCTION the program declared. A foreign name has no array and
+          // no procedure body, so it arrives here - which is where "Array not declared: ZIP_OPEN" came
+          // from. DIVERGENZE 183.
+          if TryForeignCall(UpperCase(ArrName), Node.GetChild(1), Result) then Exit;
           raise Exception.CreateFmt('Array not declared: %s%s', [ArrName, CRuntimeHint(ArrName)]);
         end;
 
@@ -45744,6 +45754,129 @@ begin
   if not FInDispatcher then EmitSharedSyncIn;
 end;
 
+function TSSAGenerator.TryForeignCall(const NameU: string; ArgListNode: TASTNode;
+  out ResultVal: TSSAValue): Boolean;
+// Lower a call to a C function the program declared with "Declare ... Alias ... [Lib ...]".
+//
+// The arguments go through the ORDINARY transfer bank, staged by the same ssaXferStore* a BASIC call
+// uses and with the same per-bank slot numbering: a foreign call IS a call, and a second protocol for
+// it would be a second thing to keep in step with the register allocator. Only the CALL instruction
+// differs - it names a table entry instead of a label.
+//
+// ⛔ TWO-PHASE, for the reason StageCallArgs is: an argument may itself contain a call, which reuses
+// the SAME transfer slots. Staging each value the instant it is evaluated would let a nested call
+// overwrite an argument already staged.
+//
+// ⛔ AN UNCLASSIFIABLE PARAMETER TYPE REFUSES THE CALL, and does not fall back to "pass it as an
+// integer". A wrongly marshalled argument does not raise: the C function answers wrong numbers, and
+// that is the failure this whole feature is most likely to produce. DIVERGENZE 183.
+var
+  Decl: TForeignDecl;
+  Idx, i, NArgs, SlotI, SlotF, ResReg: Integer;
+  Kind, RetKind: TForeignKind;
+  ArgVal: TSSAValue;
+  StageVals: array of TSSAValue;
+  StageRTs: array of TSSARegisterType;
+  StageSlots: array of Integer;
+  PtrReg: TSSAValue;
+begin
+  Result := False;
+  ResultVal := MakeSSAValue(svkNone);
+  Idx := FProgram.IndexOfForeignDecl(NameU);
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
+
+  RetKind := ForeignKindOf(Decl.RetTypeName);
+  if RetKind = fkUnknown then
+    raise Exception.CreateFmt('Foreign function %s returns "%s", which has no C type here',
+                              [Decl.Name, Decl.RetTypeName]);
+
+  NArgs := 0;
+  if Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
+    NArgs := ArgListNode.ChildCount;
+  // ⚠️ The declaration is the authority on how many values the callee reads. Passing FEWER than it
+  // declares would leave the callee reading an unwritten transfer slot, so that is refused too; extra
+  // arguments beyond the declaration are dropped, which is what a variadic C function would want and
+  // is all we can do without a variadic FFI path.
+  if NArgs < Length(Decl.ParamTypeNames) then
+    raise Exception.CreateFmt('Foreign function %s declares %d argument(s), called with %d',
+                              [Decl.Name, Length(Decl.ParamTypeNames), NArgs]);
+  if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
+
+  if not Assigned(FCurrentBlock) then
+    FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('fgncall'));
+
+  SetLength(StageVals, NArgs);
+  SetLength(StageRTs, NArgs);
+  SetLength(StageSlots, NArgs);
+  SlotI := 0; SlotF := 0;
+
+  // Phase 1: evaluate, in source order, coercing each argument to the bank its declared C type travels in.
+  for i := 0 to NArgs - 1 do
+  begin
+    Kind := ForeignKindOf(Decl.ParamTypeNames[i]);
+    // An ENUM name is an integer, and the SSA is the pass that knows the enum names - the declaration
+    // text alone cannot tell one from a UDT.
+    if (Kind = fkUnknown) and (FEnumNames.IndexOf(UpperCase(Decl.ParamTypeNames[i])) >= 0) then
+      Kind := fkS64;
+    if Kind = fkUnknown then
+      raise Exception.CreateFmt('Foreign function %s: parameter %d is "%s", which has no C type here ' +
+        '(a UDT passed BY VALUE is not wired to the language surface yet)',
+        [Decl.Name, i + 1, Decl.ParamTypeNames[i]]);
+    if Kind = fkVoid then
+      raise Exception.CreateFmt('Foreign function %s: parameter %d has no type', [Decl.Name, i + 1]);
+
+    ProcessExpression(ArgListNode.GetChild(i), ArgVal);
+    if ForeignKindIsFloat(Kind) then
+    begin
+      StageRTs[i] := srtFloat;
+      StageVals[i] := EnsureFloatRegister(ArgVal);
+      StageSlots[i] := SlotF; Inc(SlotF);
+    end
+    else
+    begin
+      StageRTs[i] := srtInt;
+      // ⭐ A BASIC STRING handed to a pointer parameter is the ADDRESS OF ITS BYTES, which is what
+      // "const char *" means and what every binding writes. Routing it through EnsureIntRegister would
+      // instead give VAL of the text - a number, silently, for a string that starts with a digit.
+      // ssaStrSAdd is the existing STRPTR/SADD lowering, so this invents nothing.
+      if (Kind = fkPointer) and (ArgVal.Kind in [svkConstString, svkRegister]) and
+         ((ArgVal.Kind = svkConstString) or (ArgVal.RegType = srtString)) then
+      begin
+        PtrReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaStrSAdd, PtrReg, EnsureStringRegister(ArgVal),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        StageVals[i] := PtrReg;
+      end
+      else
+        StageVals[i] := EnsureIntRegister(ArgVal);
+      StageSlots[i] := SlotI; Inc(SlotI);
+    end;
+  end;
+
+  // Phase 2: stage.
+  for i := 0 to NArgs - 1 do
+    EmitXferStore(StageRTs[i], StageSlots[i], StageVals[i]);
+
+  // The result register is allocated even for a SUB: the opcode always names a Dest, and one unread
+  // register is cheaper than a second pair of opcodes for the void case.
+  if ForeignKindIsFloat(RetKind) then
+  begin
+    ResReg := FProgram.AllocRegister(srtFloat);
+    ResultVal := MakeSSARegister(srtFloat, ResReg);
+    EmitInstruction(ssaForeignCallF, ResultVal, MakeSSAConstInt(NArgs),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(Idx));
+  end
+  else
+  begin
+    ResReg := FProgram.AllocRegister(srtInt);
+    ResultVal := MakeSSARegister(srtInt, ResReg);
+    EmitInstruction(ssaForeignCall, ResultVal, MakeSSAConstInt(NArgs),
+                    MakeSSAValue(svkNone), MakeSSAConstInt(Idx));
+  end;
+  Result := True;
+end;
+
 procedure TSSAGenerator.EmitProcedureCall(const Name0: string; ArgListNode: TASTNode);
 // Static call: stage args then ssaCallSub to the named procedure.
 //
@@ -45853,6 +45986,11 @@ begin
   // method of the owner type is not a stray identifier.
   if (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) and
      TryImplicitThisMethod(UpperCase(VarToStr(Node.Value)), ArgList, Node.Token, PtrVal) then Exit;
+  // ⭐ A FOREIGN SUB, called as a statement. Asked BEFORE the "a bare parameterless name is a stray
+  // identifier" rule below, because a foreign SUB with no arguments is exactly that shape and treating
+  // it as a no-op would drop the call in silence. DIVERGENZE 183.
+  if (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) and
+     TryForeignCall(UpperCase(VarToStr(Node.Value)), ArgList, PtrVal) then Exit;
   if (not Assigned(ArgList) or (ArgList.ChildCount = 0)) and
      (FProcedureNames.IndexOf(UpperCase(VarToStr(Node.Value))) < 0) then
     Exit;
@@ -47918,6 +48056,10 @@ var
   LastArr: Integer;
   PsI: Integer;          // pre-scan cursor over the static ARRAY members
   DefCh: Char;
+  FgnText: string;       // the foreign declarations, ';'-separated
+  FgnStart: Integer;
+  FgnDecl: TForeignDecl; // ...and one of them, split, to read its return type's print kind
+  FgnKind: Integer;
   {$IFDEF DEBUG_SSAPROF}
   ProfT0, ProfFreq: Int64;
   ProfOn: Boolean;
@@ -47945,6 +48087,26 @@ begin
   // BASIC allocator for BOTH dialects (see SedaiRegAlloc: one physical reg per version, safe spill).
   // See job/docs/PIANO_FASE_A_SSA_VERSIONING.md.
   FProgram.GlobalVariableSemantics := not FModernMode;
+
+  // ⭐ THE FOREIGN DECLARATIONS, read off the program node before anything is lowered: a call to one of
+  // these names must be recognised as a foreign call wherever it appears, including above the point the
+  // DECLARE was written. The parser is the only pass that ever sees a bodiless DECLARE - it emits no
+  // node - so this attribute is where that information exists. DIVERGENZE 183.
+  if AST.Attributes.Values['FOREIGNDECLS'] <> '' then
+  begin
+    // ⛔ Split BY HAND, not through DelimitedText: a parameter type carries a SPACE ("INTEGER PTR")
+    // and TStringList's delimited reader also honours a quote character, so a value with either in it
+    // comes back changed. The separator is ';' and nothing else.
+    FgnText := AST.Attributes.Values['FOREIGNDECLS'] + ';';
+    FgnStart := 1;
+    for PsI := 1 to Length(FgnText) do
+      if FgnText[PsI] = ';' then
+      begin
+        if Trim(Copy(FgnText, FgnStart, PsI - FgnStart)) <> '' then
+          FProgram.AddForeignDecl(Trim(Copy(FgnText, FgnStart, PsI - FgnStart)));
+        FgnStart := PsI + 1;
+      end;
+  end;
 
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
@@ -48013,6 +48175,19 @@ begin
     FVarPrintKind.AddObject('VALUINT', TObject(PtrInt(3)));
     FVarPrintKind.AddObject(kVALULNG, TObject(PtrInt(2)));
   end;
+  // ⭐ A FOREIGN FUNCTION'S RESULT IS TYPED TOO, and it prints by the same rules as any other. A
+  // "Declare Function f ... As ULong" answers an UNSIGNED value, and fbc prints one without the
+  // leading sign space - so "Print f()" was a column wider than fbc's for every unsigned return.
+  // Registered under the function's NAME, which is the key PrintKindOf asks for a call result, and
+  // HERE rather than where the declarations are read: the table is cleared in between, which is the
+  // same trap the note above ASC records. DIVERGENZE 183.
+  for PsI := 0 to FProgram.ForeignDeclCount - 1 do
+    if ParseForeignDecl(FProgram.GetForeignDecl(PsI), FgnDecl) and (FgnDecl.RetTypeName <> '') then
+    begin
+      FgnKind := PrintKindOfType(UpperCase(FgnDecl.RetTypeName));
+      if FgnKind <> 0 then
+        FVarPrintKind.AddObject(FgnDecl.Name, TObject(PtrInt(FgnKind)));
+    end;
   // The four byte/word extractors, same table and same reason. Their manual examples print the result
   // straight, and every one of them came out a column wider than fbc's.
   // ⚠️ The obvious reading -- "HiByte gives a BYTE, so it is a narrow unsigned, kind 3" -- is WRONG, and

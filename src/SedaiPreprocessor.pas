@@ -45,6 +45,18 @@ var
   // would need the directive's line to survive macro expansion, which it does not.
   GPPUndefNames: TStringList = nil;
 
+  // ⭐ THE LIBRARIES THE PROGRAM NAMED with "#inclib". Until the FFI existed this directive was
+  // "accepted and ignored" - true while there was no link step and nothing could call out of the
+  // process. It is the only place a program says WHICH shared object its foreign DECLAREs live in
+  // (a "Declare ... Lib" names one per declaration, "#inclib" names it once for the file), so it is
+  // collected here and read by whoever has to open it. ⚠️ From now on a program that names a library
+  // which is not installed FAILS where it used to be silent - deliberately: silence there means
+  // every call into it returns garbage.
+  // #libpath is kept beside it for the same reason: it is where to look, and dlopen honours a
+  // directory only if it is given one.
+  GPPIncLibs: TStringList = nil;
+  GPPLibPaths: TStringList = nil;
+
   // ⭐⭐ THE PREPROCESSOR'S OWN SYMBOL TABLE, and it exists because fbc's preprocessor IS the compiler
   // (DIVERGENZE 23). "#if TypeOf(s) = String" asks what type a NAME has, and the note that used to
   // stand at the refusal said "this preprocessor runs on text, before any declaration has been seen".
@@ -4252,6 +4264,70 @@ var
             end
             else
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
+          end
+          else if ((DName = 'inclib') or (DName = 'libpath')) and Emitting then
+          begin
+            // #inclib "zip" / #libpath "/opt/lib" - the program's own list of libraries and of places
+            // to look for them. fbc hands both to the linker; here they are what the FFI opens.
+            // The name is what stands between the QUOTES (a trailing "'" comment is ordinary on these
+            // lines), and fbc accepts a comma-separated list on one directive.
+            MacroVal := Trim(StripDirectiveComment(DRest));
+            while MacroVal <> '' do
+            begin
+              if MacroVal[1] = '"' then
+              begin
+                q := Pos('"', Copy(MacroVal, 2, MaxInt));
+                if q > 0 then
+                begin
+                  MacroName := Copy(MacroVal, 2, q - 1);
+                  MacroVal := Trim(Copy(MacroVal, q + 2, MaxInt));
+                end
+                else
+                begin
+                  MacroName := Copy(MacroVal, 2, MaxInt);
+                  MacroVal := '';
+                end;
+              end
+              else
+              begin
+                q := Pos(',', MacroVal);
+                if q > 0 then
+                begin
+                  MacroName := Trim(Copy(MacroVal, 1, q - 1));
+                  MacroVal := Trim(Copy(MacroVal, q + 1, MaxInt));
+                end
+                else
+                begin
+                  MacroName := MacroVal;
+                  MacroVal := '';
+                end;
+              end;
+              if (MacroVal <> '') and (MacroVal[1] = ',') then
+                MacroVal := Trim(Copy(MacroVal, 2, MaxInt));
+              if MacroName <> '' then
+              begin
+                if DName = 'inclib' then
+                begin
+                  if GPPIncLibs = nil then
+                  begin
+                    GPPIncLibs := TStringList.Create;
+                    GPPIncLibs.CaseSensitive := True;   // a library file name is case-sensitive here
+                    GPPIncLibs.Duplicates := dupIgnore;
+                  end;
+                  if GPPIncLibs.IndexOf(MacroName) < 0 then GPPIncLibs.Add(MacroName);
+                end
+                else
+                begin
+                  if GPPLibPaths = nil then
+                  begin
+                    GPPLibPaths := TStringList.Create;
+                    GPPLibPaths.CaseSensitive := True;
+                    GPPLibPaths.Duplicates := dupIgnore;
+                  end;
+                  if GPPLibPaths.IndexOf(MacroName) < 0 then GPPLibPaths.Add(MacroName);
+                end;
+              end;
+            end;
           end
           else if (DName = 'pragma') and Emitting then
           begin

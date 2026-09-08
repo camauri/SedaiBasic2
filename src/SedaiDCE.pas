@@ -309,6 +309,12 @@ begin
     ssaArrayBind, ssaArrayBindInd, ssaArrayUnbind, ssaArrayBindApply,
     // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
     ssaStrSAdd,
+    // ⛔⛔ A FOREIGN CALL LEAVES THE PROCESS, so nothing here can know what it did. Its Dest is unused
+    // whenever the program calls it for effect - which is most of C - and without this entry DCE
+    // deleted every such call in SILENCE: "memset(p, 65, 11)" then "strlen(p)" answered 0, because the
+    // memset was never emitted. It is the same rule ssaRawStore* and ssaThreadCreate get, for the same
+    // reason. DIVERGENZE 183.
+    ssaForeignCall, ssaForeignCallF,
     // FILEEXISTS depends on external filesystem state — keep it (don't elide/CSE) so repeated checks
     // re-query rather than being deduplicated. CURDIR/ENVIRON likewise read mutable external state.
     ssaFileExists, ssaCurDir, ssaEnviron, ssaFileLen, ssaFileDateTime,

@@ -55,6 +55,12 @@ unit SedaiBytecodeSerializer;
   │  - ModuleName (string)         │
   │  - ProcMapCount: u32           │
   │  - For each: StartPC + Name    │
+  ├────────────────────────────────┤
+  │ v5: Foreign declarations (FFI) │
+  │  - ForeignCount: u32           │
+  │  - For each: the decl line     │
+  │  - IncLibCount: u32            │
+  │  - For each: the library name  │
   └────────────────────────────────┘
   ============================================================================ }
 
@@ -79,7 +85,14 @@ const
   // written, so through a .basc a proc-local array lost its per-invocation identity (the recursion
   // guard read 108 for 198), a multi-dimensional one could get a native UBound, and ERASE could free
   // a fixed array. A v3 file loads with the flags at 0, which is what it always did. DIVERGENZE 172.
-  BASC_VERSION = 4;
+  // v5 (8 Sep 2026): the FOREIGN DECLARATION TABLE and the "#inclib" list, appended after the v3
+  // metadata. A bcForeignCall's Immediate is an INDEX into that table, so a file that carried the
+  // instruction without the table would call whatever function happened to sit at that index - the
+  // exact silent failure DIVERGENZE 172 taught this format to refuse. A v4 file loads with both empty,
+  // which is right: it cannot contain a bcForeignCall, because the opcode did not exist.
+  // ⛔ The lesson of 172, written where the next person will need it: a field added to the WRITER is
+  // added to the READER in the same change, never one alone, and `basc_sweep` is the net that sees it.
+  BASC_VERSION = 5;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -347,6 +360,16 @@ begin
     Stream.WriteBuffer(DimReg, SizeOf(DimReg));
     WriteString(Stream, Program_.GetProcMapName(i));
   end;
+
+  // v5: the foreign declaration table (indexed by bcForeignCall's Immediate) and the "#inclib" list.
+  DimCount := Program_.ForeignDeclCount;
+  Stream.WriteBuffer(DimCount, SizeOf(DimCount));
+  for i := 0 to Integer(DimCount) - 1 do
+    WriteString(Stream, Program_.GetForeignDecl(i));
+  DimCount := Program_.IncLibCount;
+  Stream.WriteBuffer(DimCount, SizeOf(DimCount));
+  for i := 0 to Integer(DimCount) - 1 do
+    WriteString(Stream, Program_.GetIncLib(i));
 end;
 
 procedure TBytecodeSerializer.SaveToFile(Program_: TBytecodeProgram; const FileName: string);
@@ -504,6 +527,18 @@ begin
         Stream.ReadBuffer(DimReg, SizeOf(DimReg));
         Result.AddProcRange(DimReg, ReadString(Stream));
       end;
+    end;
+
+    // v5: the foreign declaration table and the "#inclib" list. A v4 file has neither and stays empty -
+    // it cannot hold a bcForeignCall, since the opcode is younger than the version.
+    if Header.Version >= 5 then
+    begin
+      Stream.ReadBuffer(DimCount, SizeOf(DimCount));
+      for i := 0 to Integer(DimCount) - 1 do
+        Result.AddForeignDecl(ReadString(Stream));
+      Stream.ReadBuffer(DimCount, SizeOf(DimCount));
+      for i := 0 to Integer(DimCount) - 1 do
+        Result.AddIncLib(ReadString(Stream));
     end;
 
     // Validate checksum

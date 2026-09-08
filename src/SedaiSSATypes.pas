@@ -100,6 +100,24 @@ const
     the framebuffer is a second REGION of the raw-pointer namespace rather than a third tag. }
   RAWPTR_REGION_FB = Int64(1) shl 61;       // region selector: framebuffer instead of the byte heap
   RAWPTR_OFS_MASK = RAWPTR_REGION_FB - 1;   // byte offset occupies the low 61 bits
+
+  { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
+    machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program
+    hands it straight back to the next call ("z = zip_open(...) : zip_close(z)"). Those two values look
+    alike in an Int64 and mean opposite things: one has to be resolved through the VM's regions, the
+    other must reach C untouched.
+
+    So a foreign function's pointer RESULT is tagged here, and the tag is stripped on the way back out.
+    Bit 61, which is free for a value whose bits 62 and 63 are clear: an FArrays pointer packs the array
+    index above bit 32, and bit 61 would mean an index of 2^29, more arrays than a program can declare.
+    A NULL return is NOT tagged, so "If p = 0" keeps working - which is how every C binding tests one.
+
+    ⚠️ THE LIMIT, stated because it is invisible otherwise: a pointer that C writes into MEMORY rather
+    than returning (an out-parameter, a field of a struct we read back) arrives untagged. Those are
+    recognised the only other way there is - a value that decodes to none of the VM's regions is taken
+    to be a machine address - which is a heuristic, not a proof. It is why a foreign call is a BOUNDARY:
+    past it, the safety this VM keeps everywhere else is the C library's to keep. }
+  FGNPTR_TAG = Int64(1) shl 61;
   // Raw element type codes (Immediate of bcRaw{Load,Store}): width + bank.
   RTC_I8 = 1; RTC_I16 = 2; RTC_I32 = 3; RTC_I64 = 4; RTC_SINGLE = 5; RTC_DOUBLE = 6;
   // ...and the UNSIGNED narrow views. The width is the signed code's, so a STORE treats them alike; only
@@ -670,6 +688,11 @@ type
                             //   Src1 that belongs to the set Src2 (0 if none). The byte twin compares
                             //   BYTES and so matches a UTF-8 continuation byte.
     ssaStrInstrRevAnyW,     // INSTRREV(wstring, Any set) -> the LAST such codepoint
+    // ⭐ FFI (DIVERGENZE 183): call a C function. Src3 const = index into the program's foreign
+    // declaration table, Src1 const = how many arguments were staged into the transfer bank, Dest =
+    // the result register. TWO opcodes, one per result bank - see bcForeignCall for why.
+    ssaForeignCall,         // Dest = int result (or unused, for a foreign SUB)
+    ssaForeignCallF,        // Dest = float result
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 
@@ -770,9 +793,19 @@ type
     // values with disjoint live ranges were given a SHARED register number. The AOT reads it to
     // arbitrate against its own within-block dynamic allocator - see RegisterMergeApplied.
     FRegisterMergeApplied: Boolean;
+    // ⭐ THE FOREIGN DECLARATIONS, one per line, exactly as the parser wrote them:
+    //   NAME|SYMBOL|LIBRARY|RETURNTYPE|PARAMTYPE,PARAMTYPE,...
+    // Kept as TEXT the whole way down - SSA, bytecode, .basc - because every reader wants a different
+    // slice of it (the SSA wants the banks, the VM wants the C types) and a record would have to be
+    // serialized field by field for no gain. DIVERGENZE 183.
+    FForeignDecls: TStringList;
   public
     constructor Create;
     destructor Destroy; override;
+    procedure AddForeignDecl(const ADecl: string);
+    function ForeignDeclCount: Integer;
+    function GetForeignDecl(Index: Integer): string;
+    function IndexOfForeignDecl(const ANameU: string): Integer;   // -1 when the name is not foreign
     function CreateBlock(const LabelName: string): TSSABasicBlock;
     function CreateBlockBefore(const LabelName: string; BeforeBlock: TSSABasicBlock): TSSABasicBlock;  // Insert block before another block
     function FindBlock(const LabelName: string): TSSABasicBlock;
@@ -1198,6 +1231,7 @@ begin
   FVarRegMap.Sorted := True;
   FLabels := TStringList.Create;
   FLabels.Sorted := True;
+  FForeignDecls := TStringList.Create;
   SetLength(FArrays, 0);
   FNextArrayIndex := 0;
   for rt := Low(TSSARegisterType) to High(TSSARegisterType) do
@@ -1210,6 +1244,36 @@ begin
   // Default: BASIC mode with global variable semantics (Version=0)
   // Can be changed to False for SSA languages with scoped variables
   FGlobalVariableSemantics := True;  // Must be built after SSA construction
+end;
+
+procedure TSSAProgram.AddForeignDecl(const ADecl: string);
+begin
+  if (ADecl <> '') and (FForeignDecls.IndexOf(ADecl) < 0) then FForeignDecls.Add(ADecl);
+end;
+
+function TSSAProgram.ForeignDeclCount: Integer;
+begin
+  Result := FForeignDecls.Count;
+end;
+
+function TSSAProgram.GetForeignDecl(Index: Integer): string;
+begin
+  if (Index < 0) or (Index >= FForeignDecls.Count) then Exit('');
+  Result := FForeignDecls[Index];
+end;
+
+function TSSAProgram.IndexOfForeignDecl(const ANameU: string): Integer;
+// The NAME is the first field, and it is already upper-cased by the parser.
+var
+  i, p: Integer;
+begin
+  Result := -1;
+  if ANameU = '' then Exit;
+  for i := 0 to FForeignDecls.Count - 1 do
+  begin
+    p := Pos('|', FForeignDecls[i]);
+    if (p > 1) and (Copy(FForeignDecls[i], 1, p - 1) = ANameU) then Exit(i);
+  end;
 end;
 
 destructor TSSAProgram.Destroy;
@@ -1228,6 +1292,7 @@ begin
 
   // Free dominator tree
   FreeAndNil(FDomTreeObj);
+  FreeAndNil(FForeignDecls);
   {$IFDEF DEBUG_CLEANUP}
   if DebugCleanup then
   begin

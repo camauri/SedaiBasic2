@@ -66,9 +66,9 @@ type
 
 implementation
 
-{$IFDEF DEBUG_BYTECODE}
-uses SedaiDebug;
-{$ENDIF}
+uses
+  SedaiPreprocessor    // GPPIncLibs: the libraries "#inclib" named (DIVERGENZE 183)
+  {$IFDEF DEBUG_BYTECODE}, SedaiDebug{$ENDIF};
 
 constructor TBytecodeCompiler.Create;
 var
@@ -324,6 +324,8 @@ begin
     ssaRecordNewBlock: Result := bcRecordNewBlock;
     ssaRecordReallocBlock: Result := bcRecordReallocBlock;
     ssaRecordBlockLen: Result := bcRecordBlockLen;
+    ssaForeignCall: Result := bcForeignCall;     // FFI: int result
+    ssaForeignCallF: Result := bcForeignCallF;   // FFI: float result
     ssaRecordTypeId: Result := bcRecordTypeId;
     ssaRecordSetTypeId: Result := bcRecordSetTypeId;
     ssaRecordFree: Result := bcRecordFree;     // DELETE
@@ -2169,6 +2171,11 @@ begin
   // Src3 const = the packed slot counts.
   if Instr.OpCode = ssaRecordReallocBlock then
     BCInstr.Immediate := Instr.Src3.ConstInt;
+  // FFI: Src1 is the ARGUMENT COUNT, not a register - the generic mapping turns a const operand into
+  // register 0, which would tell the VM "no arguments" for every call. Src3 (the table index) is
+  // already in Immediate through the generic const path above. DIVERGENZE 183.
+  if OpIn(Instr.OpCode, [ssaForeignCall, ssaForeignCallF]) then
+    BCInstr.Src1 := Word(Instr.Src1.ConstInt);
   // B4 bounds-check elimination: array load/store carries no Src3, so Immediate is free
   // (always 0 here). BoundsSafe (proven by SedaiRangeAnalysis) rides bit 0 for the JIT;
   // the interpreter ignores Immediate on these opcodes and keeps checking.
@@ -2294,6 +2301,17 @@ begin
     end;
   end;
   FProgram.SetVarRegCounts(IntVarCount, FloatVarCount, StringVarCount);
+
+  // ⭐ The foreign declaration table travels with the program: every bcForeignCall's Immediate is an
+  // INDEX into it, so a program without it would call whatever sits at that index. Copied in the SSA's
+  // order, which is the order the indexes were handed out. DIVERGENZE 183.
+  for i := 0 to SSAProgram.ForeignDeclCount - 1 do
+    FProgram.AddForeignDecl(SSAProgram.GetForeignDecl(i));
+  // ...and the libraries "#inclib" named, which is where a declaration with no "Lib" of its own is
+  // looked for. The preprocessor is the only pass that sees the directive.
+  if GPPIncLibs <> nil then
+    for i := 0 to GPPIncLibs.Count - 1 do
+      FProgram.AddIncLib(GPPIncLibs[i]);
 
   // Initialize max register tracking and register mapping
   for RegType := Low(TSSARegisterType) to High(TSSARegisterType) do
