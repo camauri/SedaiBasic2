@@ -71,6 +71,7 @@ var
   TrapTriggered: Boolean;
   // Event polling counter
   EventPollCounter: Integer;
+  SpinDiagCounter: Integer;   // SPINDIAG=<n>: see the note at its use
   // The JIT arm's array-descriptor fast lane. It belongs to the JIT and NOT to the C hot loop, and
   // it used to be declared inside the {$IFDEF HOT_C} block below while being initialised and read
   // from the common body - so --no-hot-c did not compile at all ("Identifier not found"). Nobody
@@ -201,7 +202,8 @@ begin
   TrueVal := FTrueValue;
   ModernConv := Assigned(FProgram) and FProgram.ModernMode;
   // Initialize event polling counter
-  EventPollCounter := 0;
+EventPollCounter := 0;
+  SpinDiagCounter := 0;
   {$IFDEF HOT_C}
   // ⭐ AotOn NO LONGER disqualifies the C loop, and that was the binary-trees inversion.
   //
@@ -534,6 +536,28 @@ begin
     {$IFDEF ENABLE_INSTRUCTION_COUNTING}
     Inc(FInstructionsExecuted);
     {$ENDIF}
+
+    // ⭐⭐ SPINDIAG=<n>: every n instructions, name the PC, its SOURCE LINE and its opcode, on
+    // stderr. ⛔ It exists because a program that LOOPS FOREVER cannot be diagnosed by anything that
+    // prints at EXIT - every census in this unit does - and the one thing that names source lines,
+    // TRON, writes to FOutputDevice: on a program that has opened a graphics screen that is the
+    // CANVAS, so headless it says nothing at all. (TRON is also Commodore syntax, which a MODERN
+    // program has no reason to carry.) Off by default; one compare against a global when off.
+    if GSpinDiag > 0 then
+    begin
+      Inc(SpinDiagCounter);
+      if SpinDiagCounter >= GSpinDiag then
+      begin
+        SpinDiagCounter := 0;
+        // ⛔ WHICH THREAD, and it is not decoration: a worker that loops by DESIGN - retrogra's
+        // refresh thread is one - lands in every sample and looks exactly like a program that is
+        // stuck. Without this line the tool names the busiest loop, not the stuck one.
+        WriteLn(ErrOutput, '[SPIN] ', BoolToStr(GActiveCtx = nil, 'main  ', 'worker'),
+                ' pc=', Ctx.PC, '  riga=', FProgram.GetSourceLine(Ctx.PC),
+                '  op=', OpcodeToString(FProgram.GetInstruction(Ctx.PC).OpCode));
+        Flush(ErrOutput);
+      end;
+    end;
 
     // Periodic event polling via callback - keeps UI responsive. M5.2: only the main thread
     // (GActiveCtx = nil) polls — the callback touches SDL/input, which is not thread-safe.

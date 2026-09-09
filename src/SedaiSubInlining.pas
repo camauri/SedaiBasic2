@@ -90,6 +90,24 @@ uses SedaiDebug;
 
 var
   ID_Sites, ID_TooBig, ID_Call, ID_Record, ID_Jump: Integer;
+  // ⭐⭐⭐ THE BISECTION KNOBS, and they exist because attributing a MISCOMPILATION to a pass is only
+  // half an answer: "OPTSKIP=SubInlining makes the program terminate" says the inliner, not WHICH of
+  // its several hundred sites. Without these, narrowing means deleting BASIC source from a 5762-line
+  // include against a differential oracle - a day of delta-debugging for one bit of information.
+  //   INLINE_MAX=<n>    inline only the FIRST n sites (n = 0 disables the pass entirely).
+  //                     ⇒ a binary search on n names the site in about ten runs.
+  //   INLINE_SKIP=a,b   never inline these callees (PROC_ prefix optional, case-insensitive).
+  //   INLINE_ONLY=a,b   inline ONLY these callees - the confirmation half of the same question.
+  // ⚠️ They narrow the pass, they never change what it EMITS: a site that is inlined is inlined
+  // exactly as it would have been, so a program that answers under INLINE_MAX=k and hangs under
+  // k+1 has named site k+1 and nothing else.
+  //   INLINE_SKIPN=7,12 skip these SITE ORDINALS - the numbers INLINE_DIAG=1 prints. It is the
+  //                     knob that separates "THIS site is wrong" from "n sites is too many": a
+  //                     binary search on INLINE_MAX cannot tell them apart, because both answer
+  //                     "k works, k+1 does not".
+  ID_Max: Integer;              // -1 = no limit
+  ID_Skip, ID_Only: string;     // ','-delimited, upper case, empty = no filter
+  ID_SkipN: string;             // ','-delimited site ordinals
   ID_Block: array of TSSAOpCode;      // and WHICH opcode blocked each one
   ID_BlockN: array of Integer;
 
@@ -460,13 +478,42 @@ begin
   FlushRegion(RegionStart, FProgram.Blocks.Count - 1);
 end;
 
+function SiteAllowed(const ProcLabel: string; SoFar: Integer): Boolean;
+// The three knobs, in one place. SoFar is how many sites have ALREADY been inlined, so INLINE_MAX
+// counts inlined sites and not candidates - a refused site must not consume a slot, or the bisection
+// would move under its own feet as the other filters change.
+var
+  Bare: string;
+begin
+  Result := True;
+  if (ID_Max >= 0) and (SoFar >= ID_Max) then Exit(False);
+  // The ordinal this site WOULD get: a refused site never increments SoFar, so these numbers are
+  // exactly the ones INLINE_DIAG=1 prints, and the two knobs can be read against each other.
+  if (ID_SkipN <> ',,') and (Pos(',' + IntToStr(SoFar + 1) + ',', ID_SkipN) > 0) then Exit(False);
+  Bare := UpperCase(ProcLabel);
+  if Copy(Bare, 1, 5) = 'PROC_' then Delete(Bare, 1, 5);
+  if (ID_Skip <> ',,') and
+     ((Pos(',' + Bare + ',', ID_Skip) > 0) or (Pos(',' + UpperCase(ProcLabel) + ',', ID_Skip) > 0)) then
+    Exit(False);
+  if (ID_Only <> ',,') and
+     (Pos(',' + Bare + ',', ID_Only) = 0) and (Pos(',' + UpperCase(ProcLabel) + ',', ID_Only) = 0) then
+    Exit(False);
+end;
+
 function TSubInliner.Run: Integer;
 var
   b, j: Integer;
   Blk: TSSABasicBlock;
   Ins: TSSAInstruction;
+  CallBlk_Label: string;
 begin
   ID_Sites := 0; ID_TooBig := 0; ID_Call := 0; ID_Record := 0; ID_Jump := 0;
+  ID_Max := -1;
+  if GetEnvironmentVariable('INLINE_MAX') <> '' then
+    ID_Max := StrToIntDef(GetEnvironmentVariable('INLINE_MAX'), -1);
+  ID_Skip := ',' + UpperCase(GetEnvironmentVariable('INLINE_SKIP')) + ',';
+  ID_SkipN := ',' + GetEnvironmentVariable('INLINE_SKIPN') + ',';
+  ID_Only := ',' + UpperCase(GetEnvironmentVariable('INLINE_ONLY')) + ',';
   SetLength(ID_Block, 0); SetLength(ID_BlockN, 0);
   Result := 0;
   // Walk a SNAPSHOT of the current block list: inlining inserts blocks, and
@@ -481,8 +528,19 @@ begin
       Ins := Blk.Instructions[j];
       if (Ins.OpCode = ssaCallSub) and (Ins.Dest.Kind = svkLabel) and
          (Copy(Ins.Dest.LabelName, 1, 5) = 'PROC_') then
-        if InlineSite(b, j, Ins.Dest.LabelName) then
+      begin
+        CallBlk_Label := Blk.LabelName;
+        if SiteAllowed(Ins.Dest.LabelName, Result) and InlineSite(b, j, Ins.Dest.LabelName) then
+        begin
           Inc(Result);
+          if GetEnvironmentVariable('INLINE_DIAG') = '1' then
+            // ⛔ The SOURCE LINE, not just the callee: "the 26th rgcSETPIXEL site" is an ordinal, and
+            // an ordinal cannot be looked up in a 5762-line include. It is what turns a bisection
+            // result into a place to read.
+            WriteLn(ErrOutput, '[INLINE]   sito #', Result, ' -> ', Ins.Dest.LabelName,
+                    '   (riga ', Ins.SourceLine, ' del blocco ', CallBlk_Label, ')');
+        end;
+      end;
       Inc(j);
     end;
     Inc(b);

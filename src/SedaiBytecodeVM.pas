@@ -1126,6 +1126,9 @@ var
   // ⚠️ Increments are not atomic (like HOTC_DIAG's): with workers the totals are approximate, and
   // the RANKING - which is what is read - survives that.
   GArrDescDiag: Boolean = False;
+  // SPINDIAG=<n>: print the PC, its source line and its opcode every n instructions - the only
+  // way to see where a program that never terminates is spinning. See RunTemplate.inc.
+  GSpinDiag: Integer = 0;
   GADRebuilds, GADRebuildsNarrow, GADSlots: Int64;   // master: calls, narrowed calls, slots walked
   GADCtxCopies, GADCtxNarrow, GADCtxEntries: Int64;  // per-context: calls, narrowed calls, entries
   GADUnloc: array[0..255] of Int64;                  // per array sub-opcode: left it un-localised
@@ -1664,6 +1667,7 @@ begin
   FSharedRecLockFree := SysUtils.GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GArrPrivDiag := SysUtils.GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
   GArrDescDiag := SysUtils.GetEnvironmentVariable('ARRDESC_DIAG') = '1';
+  GSpinDiag := StrToIntDef(SysUtils.GetEnvironmentVariable('SPINDIAG'), 0);
   GRecDiag := SysUtils.GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := SysUtils.GetEnvironmentVariable('HOTC_DIAG') = '1';
   GAotcDiag := SysUtils.GetEnvironmentVariable('AOTC_DIAG') = '1';
