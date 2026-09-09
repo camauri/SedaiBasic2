@@ -435,6 +435,30 @@ type
     FJoyButtons: Integer;
     FJoyAxes: array[0..7] of Single;
     FProgramArgs: array of string;   // COMMAND$: arguments passed to the BASIC program (arg 1, 2, ...)
+    { ⭐⭐⭐⭐⭐ THE THREE PATHS (owner, 9 Sep 2026). They are three different facts and conflating any
+      two of them is what made a FreeBASIC program unable to find its own data under this VM.
+
+        FProgramFile / FProgramDir - the .bas or .basc BEING RUN, and its directory. This is the
+          program's HOME: where its fonts, its .rsc, its levels sit, and what EXEPATH must answer.
+        FInvokeDir  - the CURRENT DIRECTORY at launch, i.e. the shell's. It is what CURDIR$ answers
+          at the start; it is remembered separately because a program may CHDIR and then still want
+          to know where it was called FROM.
+        FVmExeDir   - the directory of the SedaiBasic executable itself (sb / sbc / sbv / sbw). It
+          is the one thing EXEPATH used to answer, and it is almost never what the program wants.
+
+      ⛔ WHY THIS IS A REAL GAP AND NOT A CONVENIENCE. fbc compiles the program INTO the executable,
+      so for it "where the program lives" and "where the executable lives" are the same place - which
+      is why the universal FB idiom "ExePath + "/data/..."" works from any working directory. Here
+      the executable is the INTERPRETER, so EXEPATH answered bin/x86_64-linux and COMMAND$(0) the
+      path of sb, ALWAYS. The same idiom therefore worked under fbc from every directory and under
+      sb from none. 📊 Measured: retrogra's %FBDATA% does DIR("FreeBASIC.rsc", 255) on the current
+      directory; run from anywhere but its own folder the font never loads, rgcfont stays 0 and the
+      first glyph dereferences address 0 - the ERangeError at BASIC line 8165.
+      🎯 Declared divergence (DIVERGENZE 188): EXEPATH and COMMAND$(0) answer the PROGRAM's path. }
+    FProgramFile: string;            // full path of the .bas/.basc being run ('' until set)
+    FProgramDir: string;             // its directory - the program's HOME
+    FInvokeDir: string;              // the current directory when the program was launched
+    FVmExeDir: string;               // the directory of the sb/sbc/sbv/sbw binary itself
     FIOStatus: Integer;   // ST (Commodore): Kernal I/O status byte; bit 6 (64) = EOF on the last GET#
     FInputDevice: IInputDevice;
     FMemoryMapper: IMemoryMapper;  // Memory-mapped PEEK/POKE support
@@ -776,8 +800,8 @@ type
     procedure ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
     procedure GrowArrays(NewLen: Integer);   // resize FArrays with the descriptor lock held
-    procedure LockArrays;                    // ...and hold it while ONE array's storage is reshaped
-    procedure UnlockArrays;
+    function  LockArrays: Boolean;           // ...and hold it while ONE array's storage is reshaped
+    procedure UnlockArrays(Taken: Boolean);  // Taken = what LockArrays ANSWERED, never re-decided
     function ArrDescCount(const A: TArrayStorage): Int64;  // the count the COMPILED engines see
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
@@ -804,6 +828,7 @@ type
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
     procedure ImageConvertRowExec(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);  // IMAGECONVERTROW
     function CommandLine(Index: Integer): string;  // COMMAND$(index) -> command-line argument(s)
+    function ProgramPathOrExe: string;            // the program's path, or the interpreter's if none
     function DiskStatusString: string;  // DS$ -> Commodore disk status line "NN, MESSAGE,00,00"
     function FileLength(const Path: string): Int64;   // FILELEN(path) -> file size in bytes (0 if absent)
     function FileDateTimeSerial(const Path: string): Double;  // FILEDATETIME(path) -> last-modified date serial (0 if absent)
@@ -882,6 +907,15 @@ type
     // Command-line arguments passed to the BASIC program (for COMMAND$): Args are the arguments only
     // (arg 1, 2, ...), excluding the interpreter/script name. Empty by default.
     procedure SetProgramArgs(const Args: array of string);
+    { The ONE way the VM learns where the program lives. Every front end calls it; see the fields. }
+    procedure SetProgramPaths(const AProgramFile: string);
+    { A relative path that does not exist as given is looked up BESIDE THE PROGRAM. Answers the path
+      to use. ⛔ READ-ONLY callers only - see the note at the implementation. }
+    function ResolveReadPath(const APath: string): string;
+    property ProgramFile: string read FProgramFile;
+    property ProgramDir: string read FProgramDir;
+    property InvokeDir: string read FInvokeDir;
+    property VmExeDir: string read FVmExeDir;
     procedure SetMemoryMapper(Mapper: IMemoryMapper);
     procedure SetSpriteManager(Manager: ISpriteManager);
     procedure SetConsoleBehavior(ABehavior: TConsoleBehavior; OwnsBehavior: Boolean = False);
@@ -1129,6 +1163,17 @@ var
   // SPINDIAG=<n>: print the PC, its source line and its opcode every n instructions - the only
   // way to see where a program that never terminates is spinning. See RunTemplate.inc.
   GSpinDiag: Integer = 0;
+  // SB_NO_PROGDIR_FALLBACK=1 turns OFF the beside-the-program lookup of DIVERGENZE 188, so the two
+  // behaviours can be compared on ONE binary. ⛔ It is not a convenience: a fallback that finds a
+  // file the program did not find in the current directory can make a test that EXPECTED to find
+  // nothing start finding something, and the only honest way to attribute a moved counter is to run
+  // the same binary both ways and diff the two lists of names.
+  GNoProgDirFallback: Boolean = False;
+  // SB_LEGACY_PATHS=1 makes EXEPATH and COMMAND$(0) answer what they answered before DIVERGENZE 188
+  // - the INTERPRETER's path. The twin of the knob above, and for the same reason: when a suite
+  // counter moves by one, the only honest way to attribute it is to run ONE binary both ways and
+  // diff the two lists of NAMES. A number that moved is not a diagnosis.
+  GLegacyPaths: Boolean = False;
   GADRebuilds, GADRebuildsNarrow, GADSlots: Int64;   // master: calls, narrowed calls, slots walked
   GADCtxCopies, GADCtxNarrow, GADCtxEntries: Int64;  // per-context: calls, narrowed calls, entries
   GADUnloc: array[0..255] of Int64;                  // per array sub-opcode: left it un-localised
@@ -1668,6 +1713,8 @@ begin
   GArrPrivDiag := SysUtils.GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
   GArrDescDiag := SysUtils.GetEnvironmentVariable('ARRDESC_DIAG') = '1';
   GSpinDiag := StrToIntDef(SysUtils.GetEnvironmentVariable('SPINDIAG'), 0);
+  GNoProgDirFallback := SysUtils.GetEnvironmentVariable('SB_NO_PROGDIR_FALLBACK') = '1';
+  GLegacyPaths := SysUtils.GetEnvironmentVariable('SB_LEGACY_PATHS') = '1';
   GRecDiag := SysUtils.GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := SysUtils.GetEnvironmentVariable('HOTC_DIAG') = '1';
   GAotcDiag := SysUtils.GetEnvironmentVariable('AOTC_DIAG') = '1';
@@ -8140,6 +8187,45 @@ begin
   // nothing to do here: see AttachGraphicsBackend at the call site in SedaiBasicVM.lpr
 end;
 
+procedure TBytecodeVM.SetProgramPaths(const AProgramFile: string);
+// The ONE place the three paths are decided, so that no front end can decide a fourth way.
+// ⛔ Called BEFORE the program runs; every front end that has a source file calls it, and one that
+// has none (the REPL) simply does not - the fields then stay empty and every reader falls back to
+// the executable's directory, which is exactly what the VM answered before this existed.
+begin
+  FVmExeDir := ExtractFileDir(ExpandFileName(ParamStr(0)));
+  FInvokeDir := GetCurrentDir;    // the shell's, captured now: the program may CHDIR later
+  if AProgramFile = '' then Exit;
+  FProgramFile := ExpandFileName(AProgramFile);
+  FProgramDir := ExtractFileDir(FProgramFile);
+end;
+
+function TBytecodeVM.ResolveReadPath(const APath: string): string;
+// "this relative path did not exist where the program said - is it BESIDE THE PROGRAM?"
+//
+// ⛔⛔ READ-ONLY, AND THE ASYMMETRY IS THE WHOLE DESIGN. The fallback can only turn a FAILURE into a
+// success: it fires solely when the path does not exist as given, so it can never change an answer
+// that was already right, and it can never move a file. A WRITE must keep creating exactly where the
+// program said - an OPEN FOR OUTPUT that silently landed next to the .bas instead of in the current
+// directory would be a data-loss bug, not a convenience. Callers: DIR, FILEEXISTS and a read-only
+// open, and nothing else.
+// ⚠️ An ABSOLUTE path is never redirected: the program was explicit, and being explicit must win.
+begin
+  Result := APath;
+  if GNoProgDirFallback then Exit;   // the A/B knob - see its declaration
+  if (APath = '') or (FProgramDir = '') then Exit;
+  if FileExists(APath) or DirectoryExists(APath) then Exit;
+  {$IFDEF UNIX}
+  if APath[1] = '/' then Exit;
+  {$ELSE}
+  if (Length(APath) >= 2) and (APath[2] = ':') then Exit;
+  if (APath[1] = '\') or (APath[1] = '/') then Exit;
+  {$ENDIF}
+  if FileExists(FProgramDir + DirectorySeparator + APath) or
+     DirectoryExists(FProgramDir + DirectorySeparator + APath) then
+    Result := FProgramDir + DirectorySeparator + APath;
+end;
+
 function TBytecodeVM.GraphicsBackend: IGraphicsBackend;
 begin
   Result := FGraphics;
@@ -8234,6 +8320,13 @@ begin
   end;
 end;
 
+function TBytecodeVM.ProgramPathOrExe: string;
+// The program's own path, falling back to the interpreter's when there is no program file (the
+// REPL). One helper because COMMAND$(0) and __FB_ARGV__[0] are the same fact asked twice.
+begin
+  if GLegacyPaths or (FProgramFile = '') then Result := ParamStr(0) else Result := FProgramFile;
+end;
+
 function TBytecodeVM.CommandLine(Index: Integer): string;
 // COMMAND$(index): index < 0 -> the whole command line (program args, space-separated); 0 -> the
 // executable name; n >= 1 -> the n-th program argument ('' if out of range). FProgramArgs holds the
@@ -8259,7 +8352,7 @@ begin
     // they live as long as the program does, which is what a C argv is entitled to assume.
     Vec := RawAlloc(PtrUInt((Length(FProgramArgs) + 1) * SizeOf(Int64)));
     if (Vec and RAWPTR_TAG) = 0 then Exit('0');
-    SPtr := StrSAdd(ParamStr(0));
+    SPtr := StrSAdd(ProgramPathOrExe);   // argv[0] is the PROGRAM, as it is under fbc
     RawStoreInt(Vec, RTC_I64, SPtr);
     for i := 0 to High(FProgramArgs) do
     begin
@@ -8276,7 +8369,10 @@ begin
       else Result := Result + ' ' + FProgramArgs[i];
   end
   else if Index = 0 then
-    Result := ParamStr(0)
+    // ⛔ THE PROGRAM's path, not the interpreter's - DIVERGENZE 188, the same decision as EXEPATH.
+    // argv[0] under fbc is the compiled program; here the executable is sb, and a program that
+    // derived its data directory from COMMAND$(0) landed in bin/x86_64-linux every time.
+    Result := ProgramPathOrExe
   else if Index <= Length(FProgramArgs) then
     Result := FProgramArgs[Index - 1]
   else
@@ -12429,7 +12525,7 @@ begin
     end;
 end;
 
-procedure TBytecodeVM.LockArrays;
+function TBytecodeVM.LockArrays: Boolean;
 // ⛔⛔ RESHAPING ONE ARRAY'S STORAGE IS THE OTHER HALF OF THE SAME RACE AS GROWING THE TABLE. A worker
 // rebuilds the descriptor table under FArrDescLock and, for every slot, reads @FArrays[a].IntData[0] -
 // so a DIM / REDIM / ERASE on the main thread doing SetLength on that very vector hands it a pointer
@@ -12440,13 +12536,27 @@ procedure TBytecodeVM.LockArrays;
 // ⚠️ Free of re-entrancy by construction: the four callers (ExecuteArrayDim, RedimArray, RedimArrayN,
 // EraseArray) reach nothing that takes this lock - checked, not assumed - so the region stays a plain
 // pair. And with no worker there is nobody to race with, so the single-threaded path pays nothing.
+//
+// ⛔⛔⛔ AND IT ANSWERS WHETHER IT TOOK THE LOCK, instead of letting the release ASK AGAIN.
+// The pair used to read FHasWorkers twice - once here, once in UnlockArrays - which is one condition
+// evaluated at two moments and therefore two different conditions. FHasWorkers goes False -> True
+// exactly once, at the first SpawnWorker, and never back; a flip between the two reads would leave
+// LeaveCriticalSection called on a section this thread never entered. FPC's critical sections are
+// PTHREAD_MUTEX_RECURSIVE, so that unlock returns EPERM and CLeaveCriticalSection turns it into
+// fpc_threaderror - a thread killed, not a lock quietly lost.
+// 📊 Checked 9 Sep 2026 and the window is NOT reachable today: the only writer of FHasWorkers is
+// SpawnWorker, which runs on the thread that spawns, so that thread cannot also be inside
+// ExecuteArrayOp at the time. ⇒ This is not a bug being fixed, it is a bug being made impossible:
+// the day a worker spawns a worker, the old form breaks and nothing would say so.
 begin
-  if FHasWorkers then EnterCriticalSection(FArrDescLock);
+  Result := FHasWorkers;
+  if Result then EnterCriticalSection(FArrDescLock);
 end;
 
-procedure TBytecodeVM.UnlockArrays;
+procedure TBytecodeVM.UnlockArrays(Taken: Boolean);
+// Taken comes from LockArrays and is never re-derived - see the note there.
 begin
-  if FHasWorkers then LeaveCriticalSection(FArrDescLock);
+  if Taken then LeaveCriticalSection(FArrDescLock);
 end;
 
 procedure TBytecodeVM.GrowArrays(NewLen: Integer);
@@ -13576,7 +13686,9 @@ begin
     33: // bcStrSAdd - SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string
       Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
     40: // bcFileExists - FILEEXISTS(path): -1 if the file exists, else 0 (cross-platform).
-      if FileExists(Ctx.StringRegs[Instr.Src1]) then Ctx.IntRegs[Instr.Dest] := -1
+        // A relative path that is not in the current directory is looked for BESIDE THE PROGRAM -
+        // read-only, so it can only turn a False into a True. See ResolveReadPath.
+      if FileExists(ResolveReadPath(Ctx.StringRegs[Instr.Src1])) then Ctx.IntRegs[Instr.Dest] := -1
       else Ctx.IntRegs[Instr.Dest] := 0;
     41: // bcCurDir - CURDIR$: the current working directory (cross-platform).
       Ctx.StringRegs[Instr.Dest] := GetCurrentDir;
@@ -13591,8 +13703,13 @@ begin
       end;
     43: // bcFileLen - FILELEN(path): size of the file in bytes (0 if absent).
       Ctx.IntRegs[Instr.Dest] := FileLength(Ctx.StringRegs[Instr.Src1]);
-    44: // bcExePath - EXEPATH: directory of the running program (cross-platform).
-      Ctx.StringRegs[Instr.Dest] := ExtractFileDir(ParamStr(0));
+    44: // bcExePath - EXEPATH: the directory of the running PROGRAM (DIVERGENZE 188, owner 9 Sep 2026).
+        // ⛔ NOT the interpreter's. fbc compiles the program into the executable, so for it the two
+        // are the same directory and "ExePath + "/data/x"" is the universal FB idiom for finding a
+        // program's own files. Answering bin/x86_64-linux here made that idiom work under fbc from
+        // every directory and under sb from none. See the note at FProgramFile.
+      if GLegacyPaths or (FProgramDir = '') then Ctx.StringRegs[Instr.Dest] := FVmExeDir
+      else Ctx.StringRegs[Instr.Dest] := FProgramDir;
     45: // bcStrFormat - FORMAT(num, mask): formatted number string. Value is in the Immediate float reg.
       Ctx.StringRegs[Instr.Dest] := FormatNumber(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1]);
     46: // bcCommand - COMMAND$(index): command-line argument(s) passed to the BASIC program.
@@ -14950,6 +15067,7 @@ var
   ArrMapP: PInteger;                // ...and so is the array-id map alias, for the same reason.
   Reshapes: Boolean;                // can this sub-opcode move an array's storage? decides BOTH the
                                     // lock and the descriptor mark - see ArrayOpMayReshape.
+  Locked: Boolean;                  // what LockArrays ANSWERED, so the release cannot re-decide
 begin
   // ⛔⛔⛔ THE FUNNEL, AND IT IS THE FUNNEL BECAUSE ONE LOCK PER *SITE* WAS WHACK-A-MOLE. A worker
   // rebuilds the descriptor table under FArrDescLock and reads @FArrays[a].IntData[0] for every
@@ -14972,7 +15090,9 @@ begin
   // code: pthread_mutex_lock 6.6% + futex_wake 3.4% + the queued-spinlock slow path 2.3%, plus the
   // unlock side - about a QUARTER of the run in lock traffic, on opcodes that cannot reshape.
   Reshapes := ArrayOpMayReshape(Instr.OpCode and $FF);
-  if Reshapes then LockArrays;
+  // ⛔ ONE decision, remembered: LockArrays answers whether it actually entered, and the release
+  // below repeats that answer instead of asking the question again. See the note at LockArrays.
+  Locked := Reshapes and LockArrays;
   try
     InstrHot := @Instr;
     if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
@@ -15738,7 +15858,7 @@ begin
       if GArrDescDiag then Inc(GADDirtySrc[0]);
     end;
   finally
-    if Reshapes then UnlockArrays;
+    UnlockArrays(Locked);
   end;
 end;
 
@@ -18402,6 +18522,7 @@ var
   OpenFbCode: Integer;   // the FreeBASIC status of an OPEN: delivered in Dest AND in Err
   HandleNum: Integer;
   HandleName, Filename, Mode, Data: string;
+  DirSpec: string;     // the DIR() filespec, kept so the beside-the-program retry can reuse it
   QVal: Int64;         // bcFileQuery numeric fast path result (unmanaged: costs nothing to declare)
   BinI: Int64;
   BinF: Double;
@@ -19181,7 +19302,18 @@ begin
         begin
           if FDirOpen then begin SysUtils.FindClose(FDirRec); FDirOpen := False; end;   // a new search cancels the old one
           FDirMask := Integer(Ctx.IntRegs[Instr.Src2]);
-          FDirOpen := FindFirst(DirTranslateSpec(Ctx.StringRegs[Instr.Src1]), faAnyFile, FDirRec) = 0;
+          DirSpec := DirTranslateSpec(Ctx.StringRegs[Instr.Src1]);
+          FDirOpen := FindFirst(DirSpec, faAnyFile, FDirRec) = 0;
+          // ⛔ A RELATIVE SPEC THAT MATCHES NOTHING IS RETRIED BESIDE THE PROGRAM (DIVERGENZE 188).
+          // ResolveReadPath cannot be used here: a spec may carry WILDCARDS, so "does it exist" is not
+          // the question - "did the search find anything" is. Same asymmetry: it only turns an empty
+          // walk into a non-empty one, never a found entry into a different one.
+          // 📊 This is the line retrogra needs: %FBDATA% in fbsystem.bi does DIR("FreeBASIC.rsc", 255)
+          // on the CURRENT directory, so from anywhere but its own folder the font never loaded,
+          // rgcfont stayed 0 and the first glyph dereferenced address 0.
+          if (not FDirOpen) and (not GNoProgDirFallback) and
+             (FProgramDir <> '') and (ExtractFilePath(DirSpec) = '') then
+            FDirOpen := FindFirst(FProgramDir + DirectorySeparator + DirSpec, faAnyFile, FDirRec) = 0;
         end
         else if FDirOpen then
           if FindNext(FDirRec) <> 0 then begin SysUtils.FindClose(FDirRec); FDirOpen := False; end;

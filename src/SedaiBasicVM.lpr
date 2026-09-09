@@ -385,6 +385,17 @@ var
   // --bounds-check: force array bounds checking on in every dialect (default off; MODERN follows FreeBASIC
   // and skips it, CLASSIC always checks). A debugging aid analogous to FreeBASIC's -exx.
   OptBoundsCheck: Boolean = False;
+  { --home: run the program AS IF from its own directory - chdir there before it starts.
+    ⛔⛔ EXPLICIT AND OPT-IN, AND THAT IS THE WHOLE SECURITY ARGUMENT (owner, 9 Sep 2026). Doing this
+    by default, or letting the read-only fallback cover a WRITE mode, would make the directory the
+    program is INSTALLED in writable by the program's own relative paths - in a web deployment that
+    is the served tree, and it is exactly where a stray OPEN FOR OUTPUT must not land. As a flag the
+    decision belongs to whoever LAUNCHES, not to the program, so nothing changes for anyone who does
+    not ask. The default stays: the current directory is the shell's, as it is for fbc, and only a
+    read-only lookup falls back beside the program.
+    🕳️ The owner has asked that the mechanism be STUDIED FURTHER before it grows: see
+    NEXT_SESSION_PROMPT.md. It is a first, deliberately narrow step, not a settled design. }
+  OptHome: Boolean = False;
   // --jit: compile eligible hot loops to native code (JIT J2/J3).
   OptJit: Boolean = False;
   OptAot: Boolean = False;
@@ -527,6 +538,9 @@ begin
   WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
   WriteLn('  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)');
+  WriteLn('  --home              Run the program as if from its own directory (chdir before it starts).');
+  WriteLn('                        Without it the current directory is the shell''s, as it is for fbc,');
+  WriteLn('                        and only a READ-ONLY relative path falls back beside the program.');
   WriteLn('  --bounds-check      Hard-error on out-of-bounds array access (MODERN too; default follows dialect)');
   WriteLn('  --date-locale       Month/day names and date parsing follow the SYSTEM locale (as fbc does).');
   WriteLn('                        Default is deterministic: English names, ISO-ish dates, same everywhere.');
@@ -2012,6 +2026,15 @@ begin
       VM.SetOutputDevice(Output);
       SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
       VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
+      // ⛔ WHERE THE PROGRAM LIVES (DIVERGENZE 188, owner 9 Sep 2026). The VM did not know it: the
+      // front ends had the source file, the VM had only ParamStr(0) - which is the INTERPRETER. So
+      // EXEPATH answered bin/x86_64-linux and COMMAND$(0) the path of sb, and the universal FB idiom
+      // for a program finding its own data worked under fbc from every directory and here from none.
+      VM.SetProgramPaths(SourceFile);
+      // ⛔ AFTER SetProgramPaths, never before: the invocation directory has to be captured while it
+      // is still the invocation directory. --home is what the owner authorised as the EXPLICIT form
+      // of "run it where it lives"; see OptHome for why it is not a default.
+      if OptHome and (VM.ProgramDir <> '') then SetCurrentDir(VM.ProgramDir);
       VM.SetInputDevice(Input);
       VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
       VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
@@ -2377,6 +2400,8 @@ begin
         VM.SetOutputDevice(Output);
         SetupVMGraphics(VM);  // headless SW backend by default; SDL2 window when `sb --window` (WITH_WINDOW)
         VM.SetProgramArgs(GProgramArgs);  // COMMAND$: command-line args after the script
+        VM.SetProgramPaths(BytecodeFile); // ...and for a .basc it is the .basc's own directory
+        if OptHome and (VM.ProgramDir <> '') then SetCurrentDir(VM.ProgramDir);
         VM.SetInputDevice(Input);
         VM.TrueValue := OptTrueValue;  // Set TRUE value for comparisons
         VM.BoundsCheck := OptBoundsCheck;  // --bounds-check: hard-error on out-of-bounds array access
@@ -2667,6 +2692,8 @@ begin
       end
       else if (Param = '--no-opt') or (Param = '--no-optimize') then
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
+      else if (Param = '--home') then
+        OptHome := True          // run the program as if from its own directory - see OptHome
       else if (Param = '--bounds-check') or (Param = '--boundscheck') then
         OptBoundsCheck := True   // force array bounds checking on (even in MODERN); default follows the dialect
       else if (Param = '--date-locale') or (Param = '--datelocale') then

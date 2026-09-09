@@ -3160,7 +3160,7 @@ End Function
 | `CURDIR` | ✓ | `CURDIR` / `CURDIR$` (bare or parenthesised) -> the current working directory. |
 | `CHDIR` | ✓ | Sets the current working directory. |
 | `DIR` | ✓ | Gets the names of files or directories matching certain attributes. |
-| `EXEPATH` | ⚠️ | `EXEPATH` (bare or `EXEPATH()`) → **the directory of the VM executable**, not of the BASIC program. FreeBASIC compiles the program INTO the executable, so there `ExePath` is the program's own directory and stays right from any working directory; here the executable is the interpreter. A program that finds its data with `ExePath + "/..."` therefore does not work under `sb` from any directory. `COMMAND(0)` has the same shape. Declared 9 September 2026. |
+| `EXEPATH` | ⚠️ | `EXEPATH` (bare or `EXEPATH()`) → **the directory of the BASIC PROGRAM being run**, and `COMMAND(0)` → its full path. FreeBASIC compiles the program INTO the executable, so there the two questions have one answer; here the executable is the interpreter, and answering *its* directory made the universal FB idiom `ExePath + "/data/..."` work under `fbc` from every directory and under `sb` from none. A **declared divergence**, deliberate: the answer is the program's own home, stable from any working directory. A relative path that does not exist in the current directory is also looked up **beside the program** — for `DIR`, `FILEEXISTS` and a **read-only** open only; a write always creates exactly where the program said. `--home` runs the program as if from its own directory (opt-in; the default keeps the current directory the shell's, as `fbc` does). Declared 9 September 2026. |
 | `MKDIR` | ✓ | Creates a new directory. |
 | `RMDIR` | ✓ | Removes an empty directory (`RMDIR "path"`, alias `RD`). |
 

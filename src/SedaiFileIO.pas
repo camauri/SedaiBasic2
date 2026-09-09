@@ -422,6 +422,8 @@ procedure TVMFileHandler.DiskFile(Sender: TBytecodeVM; const Command: string; Ha
   const HandleName, Filename, Mode: string; var ErrorCode: Integer);
 var
   M, EncMode, EncName: string;
+  OpenName: string;      // Filename, or the copy BESIDE THE PROGRAM when this open is read-only
+  ReadOnlyOpen: Boolean; // ...and the test that decides it - see the note below
   FileMode: Word;
   TildePos: Integer;
   BomBuf: array[0..3] of Byte;
@@ -513,12 +515,23 @@ begin
       end;
       Exit;
     end;
+    // ⛔⛔⛔ A READ-ONLY OPEN OF A RELATIVE PATH THAT IS NOT THERE LOOKS BESIDE THE PROGRAM
+    // (DIVERGENZE 188, owner 9 Sep 2026), AND A WRITE NEVER DOES. The asymmetry is the whole design:
+    // the fallback fires only when the file does not exist as given, so it can only turn a FAILURE
+    // into a success and can never change an answer that was already right - while an OPEN FOR
+    // OUTPUT that silently created next to the .bas instead of in the current directory would be a
+    // data-loss bug wearing a convenience's clothes.
+    // 📊 It is the third of the three consumers the plan named, and the one retrogra actually needs:
+    // %FBDATA% locates the font with DIR (which now retries beside the program) but DIR answers a
+    // NAME, so the program then opens "FreeBASIC.rsc" - relative, and still not there.
+    ReadOnlyOpen := (Pos('<', M) > 0) or
+                    ((Pos('W', M) = 0) and (Pos('A', M) = 0) and (Pos('B', M) = 0));
+    if ReadOnlyOpen and Assigned(Sender) then OpenName := Sender.ResolveReadPath(Filename)
+    else OpenName := Filename;
     // "ACCESS READ" (trailing '<') never creates: "Open f For Binary Access Read As #h" on a missing
     // file is an error in fbc, where a plain "For Binary" creates the file. Checked BEFORE the mode
     // letters, since 'B' alone would otherwise create it.
-    if not FileExists(Filename) and
-       ((Pos('<', M) > 0) or
-        ((Pos('W', M) = 0) and (Pos('A', M) = 0) and (Pos('B', M) = 0))) then
+    if not FileExists(OpenName) and ReadOnlyOpen then
     begin
       ErrorCode := 62;  // FILE NOT FOUND (read of a missing file)
       Exit;
@@ -529,12 +542,13 @@ begin
       FileMode := fmCreate
     else if (Pos('A', M) > 0) or (Pos('B', M) > 0) then
     begin
-      if FileExists(Filename) then FileMode := fmOpenReadWrite else FileMode := fmCreate;
+      if FileExists(OpenName) then FileMode := fmOpenReadWrite else FileMode := fmCreate;
     end
     else
       FileMode := fmOpenRead or fmShareDenyNone;
     try
-      FFileHandles[Handle] := TFileStream.Create(Filename, FileMode);
+      // OpenName is Filename itself for every mode that can CREATE - see the note above.
+      FFileHandles[Handle] := TFileStream.Create(OpenName, FileMode);
       InvalidateSize(Handle);
       FFileModes[Handle] := M;
       // ⛔ AN ENCODING CLAUSE ON A FILE WE ARE GOING TO READ IS A CLAIM ABOUT ITS BYTES, and fbc
