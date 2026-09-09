@@ -3160,7 +3160,7 @@ End Function
 | `CURDIR` | ✓ | `CURDIR` / `CURDIR$` (bare or parenthesised) -> the current working directory. |
 | `CHDIR` | ✓ | Sets the current working directory. |
 | `DIR` | ✓ | Gets the names of files or directories matching certain attributes. |
-| `EXEPATH` | ✓ | `EXEPATH` (bare or `EXEPATH()`) → directory of the running program. |
+| `EXEPATH` | ⚠️ | `EXEPATH` (bare or `EXEPATH()`) → **the directory of the VM executable**, not of the BASIC program. FreeBASIC compiles the program INTO the executable, so there `ExePath` is the program's own directory and stays right from any working directory; here the executable is the interpreter. A program that finds its data with `ExePath + "/..."` therefore does not work under `sb` from any directory. `COMMAND(0)` has the same shape. Declared 9 September 2026. |
 | `MKDIR` | ✓ | Creates a new directory. |
 | `RMDIR` | ✓ | Removes an empty directory (`RMDIR "path"`, alias `RD`). |
 
