@@ -653,9 +653,11 @@ type
     {$ENDIF}
     // JIT (J2/J3): compile every eligible hot loop of the current program to native (called from
     // EnsureDenseOps when FJitEnabled). Loops with an unsupported opcode are left to the interpreter.
-    // The two markers that let RebuildJitArrDesc be proportional to what changed (see FDescLo).
+    // The two markers that let RebuildJitArrDesc be proportional to what changed (see FDescLo),
+    // and the THIRD one, which is the marker for everybody who cannot name a slot.
     procedure NoteDescSlot(Slot: Integer);
     procedure NoteDescNoChange;
+    procedure MarkArraysDirtyAll(Src: Integer);
     procedure BuildJitLoops;
     // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
     procedure SetAotPrimitives(var C: TAotCtx);
@@ -1113,6 +1115,31 @@ var
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
   GArrDescFast: Boolean = True;
   GArrPrivDiag: Boolean = False;   // ARRPRIV_DIAG=1: trace the private-array mapping
+  // ⭐⭐ ARRDESC_DIAG=1: THE CENSUS OF THE DESCRIPTOR BOOKKEEPING, and it exists for the same reason
+  // HOTC_DIAG does - reading the source says which sites COULD force a full rebuild, and only a
+  // counter says which ones DO. 📊 On retrogra's console the two procedures below are 49.2% of the
+  // whole run (perf, 9 Sep 2026), and the ranking of who dirtied the table is the thing to act on.
+  // It answers three questions the profile cannot:
+  //   - how many master rebuilds ran, how many were NARROW, and how many slots they walked;
+  //   - how many per-context copies ran, and how many entries they wrote;
+  //   - WHICH array sub-opcode left the change un-localised, which is the "next opcode to cover".
+  // ⚠️ Increments are not atomic (like HOTC_DIAG's): with workers the totals are approximate, and
+  // the RANKING - which is what is read - survives that.
+  GArrDescDiag: Boolean = False;
+  GADRebuilds, GADRebuildsNarrow, GADSlots: Int64;   // master: calls, narrowed calls, slots walked
+  GADCtxCopies, GADCtxNarrow, GADCtxEntries: Int64;  // per-context: calls, narrowed calls, entries
+  GADUnloc: array[0..255] of Int64;                  // per array sub-opcode: left it un-localised
+  GADLoc: array[0..255] of Int64;                    // per array sub-opcode: named a slot
+  // The sub-opcode of the array operation IN FLIGHT. The verdict on a call is only known at the
+  // NEXT one - that is where FDescThisCall is settled, and settling it there is what makes the
+  // marker exception-safe - so the census has to carry the name forward the same way.
+  GADLastSubOp: Integer = -1;
+  // WHO declared the table stale, which is a different question from "which array opcode was in
+  // flight" - and the first reading of this census confused the two. The rebuild is paid for by the
+  // site that dirtied the flag, so that is what has to be counted.
+  GADDirtySrc: array[0..5] of Int64;   // 0 funnel · 1 ArrPrivRestore · 2 BindArrayMap ·
+                                       // 3 ReleaseArrayMap · 4 RegisterAotFunc · 5 altro
+  GArrDescReported: Boolean = False;
   GRecDiag: Boolean = False;       // RECDIAG=1: name a record handle that is out of its context's range
   // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
   // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
@@ -1635,6 +1662,7 @@ begin
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := SysUtils.GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GArrPrivDiag := SysUtils.GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
+  GArrDescDiag := SysUtils.GetEnvironmentVariable('ARRDESC_DIAG') = '1';
   GRecDiag := SysUtils.GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := SysUtils.GetEnvironmentVariable('HOTC_DIAG') = '1';
   GAotcDiag := SysUtils.GetEnvironmentVariable('AOTC_DIAG') = '1';
@@ -4363,7 +4391,7 @@ begin
     Ctx.ArrPrivSave[i].Saved := Default(TArrayStorage);   // drop this stack slot's references
   end;
   Ctx.ArrPrivSaveTop := Base;
-  FArraysDirty := True;
+  MarkArraysDirtyAll(1);  // arbitrary slots got their storage back
 end;
 
 procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
@@ -12046,7 +12074,7 @@ begin
     FNativeFuncs[EntryPC] := TExecMem(Mem);
     // Force a descriptor rebuild before the first native call: with --aot alone (no --jit)
     // nothing else may have primed FJitArrDesc yet.
-    FArraysDirty := True;
+    MarkArraysDirtyAll(4);  // ...the WHOLE table, so no outstanding narrow mark can shrink it
   end
   else
     Mem.Free;
@@ -12306,7 +12334,7 @@ begin
     if FArrPrivSlot[i] >= 0 then Ctx.ArrMap[i] := Base + FArrPrivSlot[i];
   // The block this context just took may have been somebody else's a moment ago, so the entries the
   // descriptor table holds for it are not this context's. Same reason as the release path above.
-  FArraysDirty := True;
+  MarkArraysDirtyAll(2);  // a whole block changed hands: nothing here can name one slot
   if GArrPrivDiag then
     WriteLn(ErrOutput, Format('[arrpriv] bind: ctx=%p block=%d base=%d', [Pointer(Ctx), Ctx.ArrPrivBlock, Base]));
 end;
@@ -12347,7 +12375,7 @@ begin
   // spawns more than one wave of workers. 📊 Found on parallel fasta (three waves): threads died with
   // access violations and the output changed run to run, while fannkuch, k-nucleotide and
   // reverse-complement - one wave each, or no local array at all - were stable.
-  FArraysDirty := True;
+  MarkArraysDirtyAll(3);  // a whole block's storage is gone: a narrow mark must not survive it
   EnterCriticalSection(FWorkerLock);
   try
     if Ctx.ArrPrivBlock <= High(FPrivBlockUsed) then FPrivBlockUsed[Ctx.ArrPrivBlock] := False;
@@ -12527,6 +12555,21 @@ begin
     if Hi > n - 1 then Hi := n - 1;
   end;
   FDescAllPending := False; FDescLo := MaxInt; FDescHi := -1;
+  if GArrDescDiag then
+  begin
+    Inc(GADRebuilds);
+    if (Lo > 0) or (Hi < n - 1) then Inc(GADRebuildsNarrow);
+    if Hi >= Lo then GADSlots := GADSlots + (Hi - Lo + 1);
+    // ⛔ THE VERDICT IS TAKEN HERE, NOT AT THE FUNNEL, and getting that wrong cost a reading of this
+    // very census: attributed at the funnel, "localised" was measured as "a rebuild had already
+    // settled the flag", so the three opcodes that were forcing FULL rebuilds read as the three
+    // best-behaved ones. Here the name carried forward is the operation the rebuild is paying for.
+    if GADLastSubOp >= 0 then
+    begin
+      if (Lo > 0) or (Hi < n - 1) then Inc(GADLoc[GADLastSubOp])
+      else Inc(GADUnloc[GADLastSubOp]);
+    end;
+  end;
   // Published for the per-context copy, which narrows on the same range and cannot read the fields
   // above because this procedure has just cleared them.
   FDescUsedAll := (Lo = 0) and (Hi = n - 1);
@@ -12695,6 +12738,12 @@ begin
           else ECtx.ArrDescOwn[Dst + 3] := 0;
         end;
       ECtx.ArrDescGen := FArrDescGen;
+      if GArrDescDiag then
+      begin
+        Inc(GADCtxCopies);
+        if NarrowCtx then Inc(GADCtxNarrow);
+        if kHi >= kLo then GADCtxEntries := GADCtxEntries + (kHi - kLo + 1);
+      end;
       if GArrPrivDiag then
         for i := 0 to Length(FArrPrivSlot) - 1 do
           if FArrPrivSlot[i] >= 0 then
@@ -14626,11 +14675,25 @@ end;
 procedure TBytecodeVM.NoteDescSlot(Slot: Integer);
 // "this array operation changed slot N and nothing else". Widening, never narrowing: two marks
 // before one rebuild leave a range covering both.
-// ⛔ Switched off entirely while workers exist. The range is VM-wide state and two threads inside
-// ExecuteArrayOp would interleave their marks; with workers every change stays un-localised, which
-// is exactly what happened before this existed.
+//
+// ⛔⛔ IT USED TO BE SWITCHED OFF ENTIRELY WHILE WORKERS EXIST, and that was the whole cost of
+// retrogra's console: the range is VM-wide state, so two threads inside ExecuteArrayOp could
+// interleave their marks, and rather than lose one the marker gave up and left every change
+// un-localised. Un-localised means RebuildJitArrDesc walks the WHOLE table on every entry to the
+// C hot loop - and AcquireArrDescCtxLocked copies the whole table behind it.
+// ⭐ What makes the mark safe now is not a new lock but the one added on 9 Sep 2026: every caller
+// of these two markers sits inside ExecuteArrayOp, which holds FArrDescLock for its whole body, and
+// RebuildJitArrDesc runs only under that same lock. Two threads therefore CANNOT be marking at
+// once, and a rebuild cannot run between a mark and the change it describes. The interleave the
+// gate defended against stopped being reachable when the funnel got its lock.
+// 📊 Measured on job/temp/retrogra/pv.bas (rgSCREENNEW + rgCLS 32 + three rgPRINT), which starts
+// retrogra's refresh thread: rgCLS 32 went from 2189 ms to the figure in the note at
+// MarkArraysDirtyAll, with the two descriptor procedures at 49.2% of the run before.
+// ⚠️ The direction that must stay safe is "rebuild everything": anything that changes storage
+// without naming a slot says MarkArraysDirtyAll, and an operation that raises before reaching its
+// marker still folds into FDescAllPending (see the note in ExecuteArrayOp).
 begin
-  if FHasWorkers or (Slot < 0) then Exit;
+  if Slot < 0 then Exit;
   FDescThisCall := False;
   if FDescLo > FDescHi then begin FDescLo := Slot; FDescHi := Slot; end
   else begin
@@ -14643,9 +14706,29 @@ procedure TBytecodeVM.NoteDescNoChange;
 // "this array operation moved no storage at all" - true of the bind's PHASE ONE, which only
 // snapshots the argument into the save stack. It still marks the table dirty, because it arrives
 // through ExecuteArrayOp, and it is a third of the marks on a program that passes arrays.
+// ⛔ Live with workers too, for the reason written out at NoteDescSlot.
 begin
-  if FHasWorkers then Exit;
   FDescThisCall := False;
+end;
+
+procedure TBytecodeVM.MarkArraysDirtyAll(Src: Integer);
+// "the array set changed and I cannot name a slot" - the marker for every site OUTSIDE the
+// ExecuteArrayOp funnel.
+//
+// ⛔⛔ IT EXISTS BECAUSE "FArraysDirty := True" ALONE IS NOT ENOUGH ONCE THE RANGE IS LIVE.
+// FArraysDirty says the table must be rebuilt; FDescLo/FDescHi say how MUCH of it. A site that sets
+// only the first while a mark from an earlier bind is still outstanding gets a rebuild narrowed to
+// somebody else's slot, and its own change is never published - the descriptor keeps a pointer into
+// storage that has been restored, rebound or freed.
+// 📊 That is not hypothetical: ReleaseArrayMap frees a whole private block's storage and
+// BindArrayMap hands the block to another context, both while a worker may hold a narrow mark. The
+// four callers are exactly the ones that change storage without going through the funnel.
+// ⚠️ Widening only, and always in the safe direction: it can cost a full rebuild that a finer
+// marker would have avoided, never a stale entry.
+begin
+  FArraysDirty := True;
+  FDescAllPending := True;
+  if GArrDescDiag and (Src <= High(GADDirtySrc)) then Inc(GADDirtySrc[Src]);
 end;
 
 procedure MoveArrayStorage(var Src, Dst: TArrayStorage);
@@ -14805,6 +14888,38 @@ begin
         end;
 end;
 
+function ArrayOpMayReshape(SubOp: Word): Boolean; inline;
+// "can this group-3 sub-opcode move an array's storage?" - and the answer decides whether the
+// descriptor table is declared stale, which is the most expensive sentence in this unit.
+//
+// ⛔ THE DEFAULT IS YES. The list below is an EXEMPTION list: everything not named marks the table,
+// so a sub-opcode added tomorrow is safe by omission and only becomes cheap when somebody has read
+// it. The opposite default - name the ones that DO reshape - is the same shape as the defect this
+// unit already records twice, where a flag set at one call site was silently lost at another.
+//
+// ⭐ What earns an exemption: the arm and everything it reaches must not call GrowArrays, must not
+// SetLength any FArrays[] vector, and must not move, alias or release a storage record. Checked
+// transitively for every entry here on 9 Sep 2026 (23 helper procedures, from PtrDomainStoreInt and
+// RawStrCellSet down to ReadPackedBytes) - none of them does any of the three.
+//   pointer dereference   13..19  bcRef{Load,Store}{Int,Float,String}, bcRefAddrField
+//   raw heap              20..22  bcRawAlloc / bcRawFree / bcRawRealloc  (C heap, not FArrays)
+//   raw dereference       23..26  bcRaw{Load,Store}{Int,Float}
+//   raw memory            31..33  FB_MEMCOPY / FB_MEMMOVE / CLEAR
+//   C strings             50, 51  bcRaw{Load,Store}ZStr
+//   pure queries           9, 10  LBOUND / UBOUND        45, 46  the same on a UDT member
+//   index arithmetic      29, 30  ArrayIdxPush / Resolve  43  ...on a UDT member
+// ⚠️ A pointer store CAN write into an array's element data - that is why the lock is still taken
+// for these arms. Writing an element does not change where the element IS, which is all the
+// descriptor records.
+begin
+  case SubOp of
+    9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    29, 30, 31, 32, 33, 43, 45, 46, 50, 51: Result := False;
+  else
+    Result := True;
+  end;
+end;
+
 procedure TBytecodeVM.ExecuteArrayOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -14838,13 +14953,34 @@ begin
     // live: with the AOT runtime helper there is now a second caller, and a flag set by one
     // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
     // kept reading the pre-DIM descriptor and every array element came back 0.
-    FArraysDirty := True;
-    // ⛔ SETTLE THE PREVIOUS CALL HERE AND NOT AT ITS OWN END, which is what makes this exception
-    // safe without a try..finally on the cold array path: an operation that RAISED never reached its
-    // marker, so its FDescThisCall is still True and folds into the pending "rebuild everything".
-    FDescAllPending := FDescAllPending or FDescThisCall;
-    FDescThisCall := True;
     SubOp := Instr.OpCode and $FF;
+    if GArrDescDiag then GADLastSubOp := SubOp;
+    // ⛔⛔⛔ AND ONLY WHEN THIS SUB-OPCODE CAN ACTUALLY RESHAPE AN ARRAY. Group 3 is where the
+    // POINTER opcodes live as well as the array ones - bcRefLoadInt, bcRawStoreInt, FB_MEMCOPY,
+    // the ZSTRING pair, LBOUND/UBOUND, the multi-dim index arithmetic - and not one of them moves
+    // an array's storage. Dirtying the table for them made the next entry to the C hot loop rebuild
+    // the WHOLE descriptor table and copy the WHOLE per-context table behind it.
+    // 📊 Measured 9 Sep 2026 with ARRDESC_DIAG=1 on job/temp/retrogra/pv.bas, which is a console
+    // CLS: 1 891 141 master rebuilds, ZERO of them narrow, 482 215 362 slots walked - and the
+    // ranking said the three opcodes paying for it were bcRefLoadInt, bcRawStoreInt and
+    // bcRawLoadInt, 1.89 M calls between them, none of which touches an array. perf put
+    // AcquireArrDescCtxLocked + RebuildJitArrDesc + ArrDescCount at 49.2% of the whole run.
+    // ⚠️ THE DEFAULT IS "IT CAN", so a sub-opcode added tomorrow marks the table until somebody
+    // proves otherwise: the exemption list below is what was checked, transitively, down to the
+    // leaf helpers - none of them calls GrowArrays, reshapes FArrays[] or moves a storage record.
+    // ⛔ The LOCK is not part of this decision and is still taken for every arm: a pointer store can
+    // write INTO an array's element data, so it must still be serialised against a REDIM that frees
+    // that buffer. What changes is only whether the descriptor is declared stale.
+    if ArrayOpMayReshape(SubOp) then
+    begin
+      FArraysDirty := True;
+      if GArrDescDiag then Inc(GADDirtySrc[0]);
+      // ⛔ SETTLE THE PREVIOUS CALL HERE AND NOT AT ITS OWN END, which is what makes this exception
+      // safe without a try..finally on the cold array path: an operation that RAISED never reached
+      // its marker, so its FDescThisCall is still True and folds into "rebuild everything".
+      FDescAllPending := FDescAllPending or FDescThisCall;
+      FDescThisCall := True;
+    end;
     case SubOp of
       0: // bcArrayLoad (generic, deprecated)
         begin
@@ -15561,7 +15697,17 @@ begin
     // different slots at once, and the guard program either read another thread's data or died in the
     // JIT on `mov (%rdx,%rcx,8)` with rdx = 0. The window existed before - every worker DIMmed the same
     // slot, so a stale entry was overwritten by the next DIM instead of staying null.
-    FArraysDirty := True;
+    // ⛔⛔⛔ AND IT IS GATED ON THE SAME QUESTION AS THE MARK AT THE TOP - which it was NOT, and that
+    // is where the whole cost of retrogra's console actually was. Gating only the entry mark moved
+    // nothing at all: ARRDESC_DIAG counted 249 declarations from every site in the unit and
+    // 1 891 143 master rebuilds, because THIS line fired unconditionally for every group-3 opcode,
+    // pointer dereferences included. ⇒ "The instrument is the first job": the profile named the
+    // procedure, the census named the caller, and only the census separated the two marks.
+    if ArrayOpMayReshape(SubOp) then
+    begin
+      FArraysDirty := True;
+      if GArrDescDiag then Inc(GADDirtySrc[0]);
+    end;
   finally
     UnlockArrays;
   end;
@@ -19857,6 +20003,54 @@ begin
     WriteLn(ErrOutput, '[HOTC]   ', GHotCExit[Idx[i]]:12, '  ', OpcodeToString(Word(Idx[i])));
 end;
 
+procedure ReportArrDescWork;
+// The ARRDESC_DIAG census, printed once at shutdown so it covers every engine and every thread.
+//
+// ⭐ THE RANKING IS THE ANSWER, and here the ranking is of SUB-OPCODES that dirtied the descriptor
+// table without saying which slot they touched. An un-localised change makes RebuildJitArrDesc walk
+// the whole table and AcquireArrDescCtxLocked copy the whole table behind it, so one such opcode in
+// a loop costs both walks on every entry to the C hot loop - the same shape as an opcode missing
+// from the C loop, and it is measured the same way.
+// ⚠️ "narrow" is not a target of 100%: a DIM, a REDIM and an ERASE genuinely change more than one
+// slot's meaning, and rebuilding everything is their CORRECT answer. What the column says is where
+// the work is going, so a decision to cover one more opcode can be taken on a count.
+var
+  i, j, n, t: Integer;
+  Idx: array of Integer;
+  Tot: Int64;
+begin
+  if (not GArrDescDiag) or GArrDescReported then Exit;
+  GArrDescReported := True;
+  WriteLn(ErrOutput, '[ARRDESC] rebuild della tabella MAESTRA: ', GADRebuilds,
+          '  (di cui ristretti ', GADRebuildsNarrow, ')   slot percorsi = ', GADSlots);
+  WriteLn(ErrOutput, '[ARRDESC] copie PER CONTESTO:            ', GADCtxCopies,
+          '  (di cui ristrette ', GADCtxNarrow, ')   voci scritte  = ', GADCtxEntries);
+  WriteLn(ErrOutput, '[ARRDESC] chi ha sporcato la tabella: imbuto=', GADDirtySrc[0],
+          ' ArrPrivRestore=', GADDirtySrc[1], ' BindArrayMap=', GADDirtySrc[2],
+          ' ReleaseArrayMap=', GADDirtySrc[3], ' RegisterAotFunc=', GADDirtySrc[4]);
+  SetLength(Idx, 0);
+  Tot := 0;
+  for i := 0 to 255 do
+    if (GADUnloc[i] > 0) or (GADLoc[i] > 0) then
+    begin
+      n := Length(Idx); SetLength(Idx, n + 1); Idx[n] := i;
+      Tot := Tot + GADUnloc[i];
+    end;
+  if Length(Idx) = 0 then
+  begin
+    WriteLn(ErrOutput, '[ARRDESC] nessuna operazione di array e'' passata dall''imbuto');
+    Exit;
+  end;
+  for i := 0 to High(Idx) - 1 do
+    for j := i + 1 to High(Idx) do
+      if GADUnloc[Idx[j]] > GADUnloc[Idx[i]] then
+      begin t := Idx[i]; Idx[i] := Idx[j]; Idx[j] := t; end;
+  WriteLn(ErrOutput, '[ARRDESC] rebuild INTERI, per l''operazione di array in volo (totale ', Tot, '):');
+  for i := 0 to High(Idx) do
+    WriteLn(ErrOutput, '[ARRDESC]   sub=', Idx[i]:3, '  interi ', GADUnloc[Idx[i]]:12,
+            '   ristretti ', GADLoc[Idx[i]]:12, '   ', OpcodeToString(Word($0300 or Idx[i])));
+end;
+
 procedure ReportAotHelperExits;
 // The AOTC_DIAG census: which opcode makes COMPILED code leave, and how often. Printed once at
 // shutdown so it covers every engine and every thread that ran, to stderr so it never mixes with a
@@ -19954,6 +20148,7 @@ initialization
   if SysUtils.GetEnvironmentVariable('STRCAP') = '0' then GStrCapacity := False;
   AddExitProc(@ReportHotCExits);
   AddExitProc(@ReportAotHelperExits);
+  AddExitProc(@ReportArrDescWork);
   AddExitProc(@ReportSuperCounts);
   AddExitProc(@ReportPairCounts);
 
