@@ -377,6 +377,14 @@ type
     ArrDescOwn: array of Int64;
     ArrDescRetired: array of array of Int64;  // superseded buffers; a native frame may still hold one
     ArrDescGen: Int64;          // the master generation this copy was built from (0 = never built)
+    // ⛔⛔ TRUE ONLY FOR THE VM's SCRATCH REPLAY CONTEXT (TBytecodeVM.FDrainCtx). A drained draw
+    // command is replayed through the ordinary opcode handlers, and those handlers begin by asking
+    // "am I on the render-owner thread? if not, QUEUE this" - so a replay that reaches that test
+    // with the answer "no" puts the command straight back on the queue it came from. This field is
+    // how the replay says "I am the drain": it is the queue's exit, never its entrance.
+    // 📊 Seen 9 Sep 2026 on retrogra: perf named the cycle DrainDrawQueue -> ExecuteGraphicsOp ->
+    // EnqueueDeferredOp, and the second frame of a redraw never finished.
+    IsDrainCtx: Boolean;
     // ⛔ The pointer LAST PUBLISHED from ArrDescOwn. A caller that caches the table (the JIT arm)
     // must be able to ask "is what I hold still the current buffer", and the generation alone
     // cannot answer it: another arm of the same thread can rebuild this context's table, which

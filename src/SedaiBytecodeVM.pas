@@ -1639,6 +1639,7 @@ begin
   // M5.2: the main context starts at the program EntryPoint (StartPC = -1); workers override it.
   FCtx.StartPC := -1;
   FDrainCtx.StartPC := -1;
+  FDrainCtx.IsDrainCtx := True;   // this context is the queue's EXIT: see the field's note
   FCtx.ModeSwitchPC := -1;
   FDrainCtx.ModeSwitchPC := -1;
   SetLength(FWorkerThreads, 0);
@@ -1885,9 +1886,22 @@ begin
 end;
 
 { PresentFrame — the once-per-frame render hook: replay any deferred worker draws, then present.
-  On the single-threaded path FHasWorkers is False, so this is exactly FOutputDevice.Present. }
+  On the single-threaded path FHasWorkers is False, so this is exactly FOutputDevice.Present.
+
+  ⛔⛔⛔ AND A WORKER MUST LEAVE HERE WITHOUT DOING EITHER, which is the rule the whole M5.3 design
+  rests on and the one place that did not state it. DrainDrawQueue's own header says "runs only on
+  the render-owner thread" - that was an ASSUMPTION about the callers, not a test, and it was false:
+  retrogra's refresh thread calls rgSCREENSHOW, which reaches this hook like any other thread. The
+  worker then drained the queue and replayed each command through ExecuteGraphicsOp, whose first
+  question is "am I the render owner?" - so every drained command went straight back on the queue.
+  📊 Measured 9 Sep 2026: the SECOND full-screen redraw of a 216-cell frame never finished (28 ms
+  for the first), and perf named the cycle DrainDrawQueue -> ExecuteGraphicsOp -> EnqueueDeferredOp.
+  ⚠️ Two guards, not one, and they are not the same guard. This one stops a worker from touching the
+  device at all; TExecutionContext.IsDrainCtx stops the REPLAY from re-queueing even if some other
+  caller reaches the drain from the wrong thread. The queue is drained by its owner, once. }
 procedure TBytecodeVM.PresentFrame;
 begin
+  if FHasWorkers and (not IsRenderOwner) then Exit;
   if FHasWorkers then DrainDrawQueue;
   if Assigned(FOutputDevice) then FOutputDevice.Present;
 end;
@@ -14930,6 +14944,8 @@ var
   InstrHot: PBytecodeInstruction;   // what ArrayHotOps.inc dereferences; see the note at its include
                                     // in RunTemplate.inc - the same text is compiled into two scopes.
   ArrMapP: PInteger;                // ...and so is the array-id map alias, for the same reason.
+  Reshapes: Boolean;                // can this sub-opcode move an array's storage? decides BOTH the
+                                    // lock and the descriptor mark - see ArrayOpMayReshape.
 begin
   // ⛔⛔⛔ THE FUNNEL, AND IT IS THE FUNNEL BECAUSE ONE LOCK PER *SITE* WAS WHACK-A-MOLE. A worker
   // rebuilds the descriptor table under FArrDescLock and reads @FArrays[a].IntData[0] for every
@@ -14941,7 +14957,18 @@ begin
   // ⚠️ The hot element load/store arms do NOT pass through this procedure - RunTemplate includes
   // ArrayHotOps.inc inline - so the price is paid by the structural opcodes only, and only while
   // workers exist (LockArrays is a no-op otherwise).
-  LockArrays;
+  //
+  // ⛔⛔ ...AND BY THE SAME TEST THAT DECIDES THE DESCRIPTOR MARK, because it is the same question.
+  // What the lock protects is a rebuild reading @FArrays[a].IntData[0] while somebody SetLengths
+  // that vector: only an operation that can RESHAPE storage can do that. A pointer dereference
+  // cannot - and locking it bought nothing the engine was not already giving away, because the hot
+  // element arms write into those same buffers through ArrayHotOps.inc and take no lock at all. The
+  // class of race is not closed by paying here; it is only paid for.
+  // 📊 Measured 9 Sep 2026 on retrogra, whose refresh thread and main thread both run array-heavy
+  // code: pthread_mutex_lock 6.6% + futex_wake 3.4% + the queued-spinlock slow path 2.3%, plus the
+  // unlock side - about a QUARTER of the run in lock traffic, on opcodes that cannot reshape.
+  Reshapes := ArrayOpMayReshape(Instr.OpCode and $FF);
+  if Reshapes then LockArrays;
   try
     InstrHot := @Instr;
     if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
@@ -14968,10 +14995,8 @@ begin
     // ⚠️ THE DEFAULT IS "IT CAN", so a sub-opcode added tomorrow marks the table until somebody
     // proves otherwise: the exemption list below is what was checked, transitively, down to the
     // leaf helpers - none of them calls GrowArrays, reshapes FArrays[] or moves a storage record.
-    // ⛔ The LOCK is not part of this decision and is still taken for every arm: a pointer store can
-    // write INTO an array's element data, so it must still be serialised against a REDIM that frees
-    // that buffer. What changes is only whether the descriptor is declared stale.
-    if ArrayOpMayReshape(SubOp) then
+    // ⛔ The same answer decides the LOCK, taken above before this procedure's body began.
+    if Reshapes then
     begin
       FArraysDirty := True;
       if GArrDescDiag then Inc(GADDirtySrc[0]);
@@ -15703,13 +15728,13 @@ begin
     // 1 891 143 master rebuilds, because THIS line fired unconditionally for every group-3 opcode,
     // pointer dereferences included. ⇒ "The instrument is the first job": the profile named the
     // procedure, the census named the caller, and only the census separated the two marks.
-    if ArrayOpMayReshape(SubOp) then
+    if Reshapes then
     begin
       FArraysDirty := True;
       if GArrDescDiag then Inc(GADDirtySrc[0]);
     end;
   finally
-    UnlockArrays;
+    if Reshapes then UnlockArrays;
   end;
 end;
 
@@ -16523,7 +16548,9 @@ begin
   // answerable from any thread and are answered HERE.
   // ⚠️ The queries that genuinely need the backend - GETMOUSE and the joystick family - are NOT in this
   // list: they still defer, and that is a separate open question rather than something this fixes.
-  if FHasWorkers and not IsRenderOwner then
+  // ⛔ ...and NOT when this is the drain replaying a command it already took off the queue: see
+  // TExecutionContext.IsDrainCtx. Without it the queue's exit is its entrance.
+  if FHasWorkers and (not Ctx.IsDrainCtx) and (not IsRenderOwner) then
   begin
     case Instr.OpCode of
       bcGraphicRGBA, bcGfxPoint, bcGfxPalGet, bcGfxImageInfo, bcGfxScreenInfo,
@@ -18163,7 +18190,8 @@ begin
   // M5.3: off the render-owner thread, defer to the queue (see ExecuteGraphicsOp). Dormant on
   // the single-threaded path. NOTE for M5.2: sprite *query* ops (RSPRITE/BUMP/RSPPOS) return a
   // value into a register and so must run synchronously, not be deferred — to be split out then.
-  if FHasWorkers and not IsRenderOwner then
+  // ⛔ ...and not when this IS the drain: same reason as the graphics gate, see IsDrainCtx.
+  if FHasWorkers and (not Ctx.IsDrainCtx) and (not IsRenderOwner) then
   begin
     EnqueueDeferredOp(Ctx, dckSprite, Instr);
     Exit;
