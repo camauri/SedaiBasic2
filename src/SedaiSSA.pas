@@ -455,6 +455,12 @@ type
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
+    FAtTakenOnly: TStringList;           // the names CollectDimVarBanks alone put in the @-dictionary,
+                                         // i.e. the ones that are there BECAUSE an @ was taken. That
+                                         // dictionary is enriched afterwards for reasons that have
+                                         // nothing to do with @ (the arguments of a byref-returning
+                                         // call, a fixed WSTRING a binary Get/Put names), and those
+                                         // must NOT be narrowed to a procedure - see MarkAddressTaken.
     FAddrTakenScalars: TStringList;      // program-wide @-taken builtin SCALARS (local DIMs + params): name (UPPER) -> type. Raw-backed for bit-exact @/deref (type-punning). Used by CollectRawPtrVars (persistent, unlike per-proc FAddrLocalVars).
     // MODULE-level @-taken scalar that stayed SAME-BANK, so it is array-backed rather than raw:
     // name (UPPER) -> declared type. It exists for ONE reason: turning the scalar into a 1-element
@@ -882,7 +888,8 @@ type
     procedure CollectDimVarBanks(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
     procedure CollectScalarPtrBanks(Node: TASTNode);                            // record, per @-taken scalar, the banks of pointers taking its @ (drives RAWMODULE vs SHARED)
     function ScalarIsTypePunned(const VNameU: string; Bank: TSSARegisterType): Boolean;  // a DIFFERENT-bank pointer takes @scalar
-    procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False);
+    procedure MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean = False;
+                               ProcOwn: TStringList = nil);
     function PointeeBankOf(const PtrName: string): TSSARegisterType;            // bank of *p from p's declared pointee
     function IsBuiltinNewType(NewNode: TASTNode): Boolean;  // "New <builtin>" -> a RAW pointer
     function DeclaredTypeNameOf(Node: TASTNode): string;   // the DECLARED type of an expression, or ''
@@ -1761,6 +1768,8 @@ begin
   FLexVarTypes.CaseSensitive := False;
   SetLength(FLexVarFrames, 0);
   FPointerVars := TIndexedStringList.Create;
+  FAtTakenOnly := TIndexedStringList.Create;
+  FAtTakenOnly.CaseSensitive := False;
   FAddrTakenScalars := TIndexedStringList.Create;
   FAddrTakenScalars.CaseSensitive := False;
   FRawModuleScalars := TIndexedStringList.Create;
@@ -1926,6 +1935,7 @@ begin
   FPreFixedStrCap.Free;
   FLexVarTypes.Free;
   FPointerVars.Free;
+  FAtTakenOnly.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
   FAddrSharedScalars.Free;
@@ -37815,7 +37825,8 @@ begin
       CollectByrefReturnedNames(N.GetChild(i), L);
 end;
 
-procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean);
+procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean;
+                                         ProcOwn: TStringList);
 // Pass 2: route each typed-scalar DIM whose variable is @-taken. A MODULE-level var is marked SHARED
 // (CollectSharedVars backs it with a 1-element global array — one stable cell, correct lifetime). A var
 // declared INSIDE a SUB/FUNCTION is instead recorded in FAddrLocalVars: it gets a per-frame 1-field
@@ -37827,6 +37838,7 @@ var
   VNameU, VTypeU, VTypeC, SavedTypePath: string;
 begin
   if Node = nil then Exit;
+  ProcDict := nil;
   if Node.NodeType = antDim then
     for k := 0 to Node.ChildCount - 1 do
     begin
@@ -37848,7 +37860,20 @@ begin
         VTypeC := CanonicalType(VTypeU);
         // Only builtin scalars need backing: a UDT variable is already a stable record handle, so @obj
         // just reads that handle (the backing machinery would wrongly turn the UDT into a 1-element array).
-        if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) then
+        if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and
+           // ⛔⛔⛔ ...AND, FOR A LOCAL, THE @ THAT PUT THE NAME THERE MUST BE IN THIS PROCEDURE. The
+           // dictionary is program-wide, so one procedure writing "@i" turned a plain "Dim As Integer i"
+           // in EVERY other procedure into a raw-backed slot: the declaration then bound "I$REC" while
+           // the reads bound "I", and "For i = 0 To 5" wrote element 0 five times, in silence. Found in
+           // retrogra, where "Dir(path, &HFF, @i)" in datafolder.bi blanked the console of a file three
+           // includes away - no glyph had pixels because every font page offset landed at index 0.
+           // Guard m885.
+           // ⚠️ ONLY the @-derived half is narrowed, and finding that out cost a silent miscompilation:
+           // narrowing the WHOLE dictionary was tried first and turned pidigits-modern from the digits
+           // of pi into "LIMBS too small", because the arguments of its byref-returning calls are in
+           // that dictionary for a reason that has nothing to do with @. FAtTakenOnly is the @ half.
+           ((not InProc) or (ProcOwn = nil) or (FAtTakenOnly.IndexOf(VNameU) < 0) or
+            (ProcOwn.IndexOf(VNameU) >= 0)) then
         begin
           if InProc then
           begin
@@ -37990,7 +38015,8 @@ begin
             end;
           end;
     finally
-      ProcDict.Free;
+      // ⛔⛔ NOT FREED HERE ANY MORE: it is the dictionary the CHILDREN must be judged against.
+      // See the note below.
     end;
   end;
   if Node.NodeType = antProcedureDecl then InProc := True;
@@ -38009,8 +38035,29 @@ begin
   // what LocalArrayMangle gives an array - and that is a model change, not a branch here. Worth 516
   // assertions; DIVERGENZE 56.
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
-  for i := 0 to Node.ChildCount - 1 do
-    MarkAddressTaken(Node.GetChild(i), Dict, InProc);
+  // ⛔⛔⛔ AND A PROCEDURE'S OWN DIMs ARE JUDGED AGAINST ITS OWN DICTIONARY. The recursion used to hand
+  // every child the OUTER dictionary - every @ taken anywhere in the program - so one procedure writing
+  // "@i" turned a plain "Dim As Integer i" in EVERY OTHER procedure into a raw-backed slot. The
+  // declaration then bound "I$REC" while the reads bound "I": the two disagreed, and a "For i = 0 To 5"
+  // loop ran five times writing element 0 five times, in silence.
+  // 📊 Found in retrogra: datafolder.bi does "Dir(path, &HFF, @i)" in one function, and that alone made
+  // the font loader in a DIFFERENT file store all 96 page offsets at index 0 - so no glyph ever had any
+  // pixels and the console drew nothing. Fifteen lines reproduce it (guard m885).
+  // ⚠️ This is the PROCEDURE level, and only that. Doing the same for a BLOCK was tried twice and
+  // withdrawn (see the note above and DIVERGENZE 56): a block dictionary loses the @s taken outside it,
+  // and what is missing there is per-DECLARATION identity. A procedure is a real scope with a real
+  // frame - FAddrLocalVars is already rebuilt per procedure, and the PARAMETER half of this very pass
+  // has judged per procedure since the day the global dictionary was found marking parameters wrongly.
+  // That fix stopped at parameters; this is the other half of it.
+  try
+    for i := 0 to Node.ChildCount - 1 do
+      if ProcDict <> nil then
+        MarkAddressTaken(Node.GetChild(i), Dict, InProc, ProcDict)
+      else
+        MarkAddressTaken(Node.GetChild(i), Dict, InProc, ProcOwn);
+  finally
+    ProcDict.Free;
+  end;
   FTypeScopePath := SavedTypePath;
 end;
 
@@ -38379,6 +38426,7 @@ procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
 // to a BYREF-return function are address-backed so it can return a reference to them (min(a,b)=0).
 var
   Dict, ByrefRetNames, WFixed: TStringList;
+  DictI: Integer;
 begin
   if Node = nil then Exit;
   Dict := TIndexedStringList.Create;
@@ -38388,6 +38436,11 @@ begin
     FFixedStrNames.Clear;
     CollectFixedStrNames(Node);       // which names are fixed-length character BUFFERS
     CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
+    // The @ half on its own, taken BEFORE the enrichments below add names for other reasons: it is what
+    // tells a retroactive marking from a legitimate one. See the note in MarkAddressTaken.
+    FAtTakenOnly.Clear;
+    for DictI := 0 to Dict.Count - 1 do
+      FAtTakenOnly.Add(Dict[DictI]);   // bare names: membership is tested with IndexOf, not IndexOfName
     CollectScalarPtrBanks(Node);      // per @-taken scalar, the banks of pointers taking its @ (RAWMODULE gate)
     GatherByrefRetFuncNames(Node, ByrefRetNames);
     if ByrefRetNames.Count > 0 then
