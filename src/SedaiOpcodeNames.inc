@@ -17,7 +17,7 @@
   la dimenticanza non e' piu' una cosa che si scopre, e' una cosa che non si puo' spedire. }
 
 const
-  OPCODE_NAME_COUNT = 570;
+  OPCODE_NAME_COUNT = 575;
   OPCODE_NAMES: array[0..OPCODE_NAME_COUNT - 1] of record
     Code: Word;
     Name: string[28];
@@ -501,6 +501,11 @@ const
     (Code: $0A3F; Name: 'GfxScreenPtr'),
     (Code: $0A40; Name: 'GfxImageConvertRow'),
     (Code: $0A41; Name: 'GfxDrawString'),
+    (Code: $0A42; Name: 'GfxScreenLock'),
+    (Code: $0A43; Name: 'GfxScreenUnlock'),
+    (Code: $0A44; Name: 'GfxCircleExF'),
+    (Code: $0A45; Name: 'GfxPaletteUsing'),
+    (Code: $0A46; Name: 'GfxScreenList'),
     (Code: $0B00; Name: 'SoundVol'),
     (Code: $0B01; Name: 'SoundSound'),
     (Code: $0B02; Name: 'SoundEnvelope'),

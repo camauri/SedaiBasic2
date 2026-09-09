@@ -119,6 +119,18 @@ const
   RAWPTR_IMG_OFS_BITS = 40;
   RAWPTR_IMG_OFS_MASK = (Int64(1) shl RAWPTR_IMG_OFS_BITS) - 1;
 
+  { ⭐ AND THE FRAMEBUFFER REGION CARRIES ITS PAGE, for the same reason the image region carries its
+    handle: there is more than one of them. SCREENPTR used to be the bare constant
+    "RAWPTR_TAG or RAWPTR_REGION_FB", so the page was resolved at DEREFERENCE time from whatever
+    SCREENSET had most recently selected - which means two pointers taken from two different pages were
+    the SAME VALUE and both read the last one selected. That is exactly the shape of a page-flipping
+    scale-up ("p1 = ScreenPtr : ScreenSet 1,0 : p2 = ScreenPtr : copy p1 -> p2"), which then copied a
+    page onto itself.
+    Bits 40..47 hold page + 1; ZERO keeps the old meaning, "whatever page is current", so a pointer
+    built anywhere else (the wasm backend does) still behaves as it did. }
+  RAWPTR_FB_PAGE_SHIFT = 40;
+  RAWPTR_FB_PAGE_MASK  = Int64($FF) shl RAWPTR_FB_PAGE_SHIFT;
+
   RAWPTR_OFS_MASK = RAWPTR_REGION_IMG - 1;  // byte offset occupies the low 60 bits
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
@@ -458,6 +470,7 @@ type
     // the leading image handle needs nothing of its own here.
     ssaGfxDrawString,
     ssaGfxPointCoord,  // POINTCOORD(n): DRAW pen coordinate (Dest = result, Src1 = selector 0=x/1=y)
+    ssaGfxScreenList,  // SCREENLIST([d]): next fullscreen resolution (Dest = (w shl 16) or h, Src1 = depth, Imm bit0 = depth given)
     ssaGfxPset,        // PSET (x,y),color
     ssaGfxPoint,       // POINT(x,y) -> color
     ssaGfxPaint,       // PAINT (x,y),color (flood fill)

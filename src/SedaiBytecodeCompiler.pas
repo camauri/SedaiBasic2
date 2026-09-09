@@ -440,6 +440,7 @@ begin
     ssaGfxDrawGML: Result := bcGfxDrawGML;
     ssaGfxDrawString: Result := bcGfxDrawString;
     ssaGfxPointCoord: Result := bcGfxPointCoord;
+    ssaGfxScreenList: Result := bcGfxScreenList;
     ssaGfxPoint: Result := bcGfxPoint;
     ssaConScreen: Result := bcConScreen;
     ssaConLocate: Result := bcConLocate;

@@ -868,6 +868,17 @@ const
   //   __PALGET, which does not extend to 256 elements without a loop the SSA has no shape for. The
   //   array reaches the VM the way a whole-array binary GET/PUT reaches it (MakeSSAArrayRef).
   bcGfxPaletteUsing = bcGroupGraphics + 69;
+
+  // SCREENLIST([depth]) : enumerate the fullscreen resolutions available at that colour depth. Src1 =
+  // the depth register, Immediate bit0 = 1 when a depth was given (which RESTARTS the enumeration) and
+  // 0 for the bare "ScreenList()" that asks for the NEXT one. Dest = (width shl 16) or height, 0 at the
+  // end of the list.
+  // ⛔ It answered a constant 0 until 9 Sep 2026, and that is not "no modes" to a caller: retrogra's
+  //   rgSCREENNEW walks this list looking for 640x480 and, finding nothing, falls through to a branch
+  //   that sizes its canvas from ScreenInfo's DESKTOP resolution - so a wrong 0 here became a 0x0
+  //   canvas, a null SCREENPTR, and a program that never drew a pixel.
+  bcGfxScreenList   = bcGroupGraphics + 70;
+
   bcScnClr          = bcGroupGraphics + 21;  // SCNCLR [mode]
 
   // === GROUP 11: SOUND (0x0Bxx) ===
@@ -2487,6 +2498,7 @@ begin
         56: Result := 'Strig';
         57: Result := 'GfxDrawGML';
         58: Result := 'GfxPointCoord';
+        70: Result := 'GfxScreenList';
         59: Result := 'GfxCircleEx';
         60: Result := 'GfxPaintBorder';
         61: Result := 'GfxSetTarget';

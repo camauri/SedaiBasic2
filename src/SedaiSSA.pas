@@ -8673,13 +8673,27 @@ begin
           Exit;
         end;
 
-        // FreeBASIC SCREENLIST(depth): enumerate fullscreen resolutions. A portable/headless VM does not
-        // enumerate hardware modes, so it returns 0 (no more resolutions). Evaluate and discard the argument.
+        // FreeBASIC SCREENLIST(depth) / SCREENLIST(): walk the fullscreen resolutions available at that
+        // colour depth, most-recently-opened first, and answer 0 at the end of the list. With a depth the
+        // enumeration RESTARTS; bare, it continues - which is the shape every caller uses (open with a
+        // depth, then loop on the bare form).
+        // ⛔ It answered a constant 0 until 9 Sep 2026, on the argument that a portable VM does not
+        // enumerate hardware modes - and that argument was WRONG about fbc, not just about us: fbc's
+        // list is a FIXED table, identical for 8/15/16/24/32 bpp and empty for every other depth, so it
+        // is not a hardware enumeration there either. Answering 0 sent retrogra's rgSCREENNEW down the
+        // branch that sizes its canvas from ScreenInfo's desktop resolution, and the program drew nothing.
         if FModernMode and (UpperCase(ArrName) = kSCREENLIST) and (ArrayIndexOf(ArrName) < 0) then
         begin
-          if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          if Node.GetChild(1).ChildCount >= 1 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+            ArgReg := EnsureIntRegister(MakeSSAConstInt(0));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaGfxScreenList, Result, ArgReg, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(Ord(Node.GetChild(1).ChildCount >= 1)));
           Exit;
         end;
 

@@ -472,6 +472,11 @@ type
     // 14-column boundaries). Grown on demand; a newline resets its handle's column.
     FFilePrintCols: array of Integer;
     FDrawPenX, FDrawPenY: Integer; // FreeBASIC DRAW "..." (GML) pen position, in logical (WINDOW) coordinates; read by POINTCOORD
+    // SCREENLIST's cursor: which mode of GFX_MODE_LIST comes next, and at which colour depth the
+    // enumeration was opened. Per-VM and not per-context: fbc's is a global too, and a program that
+    // walked the list from two threads would be asking one cursor two questions in either language.
+    FScreenListNext: Integer;
+    FScreenListDepth: Integer;
     FLastFrameTick: QWord;  // Last FRAME sync tick for drift-free timing
     // Function key definitions (1-12)
     FFunctionKeys: array[1..12] of string;
@@ -1172,6 +1177,37 @@ begin
   end;                // with a core opcode - and the report prints the real name, so it is visible
   Result := gid * 256 + (Op and $FF);
 end;
+
+// The desktop SCREENINFO reports before any SCREENRES - see the note at bcGfxScreenInfo.
+// ⭐ WHY 1280x960 AND NOT 640x480. A headless VM has to DECLARE a desktop, and the declaration is not
+// free: programs divide by it. 1280x960 is exactly TWICE the 640x480 canvas the FreeBASIC examples are
+// written for, and it is a mode fbc's own SCREENLIST reports, so both halves of the answer come from
+// the oracle's table. 640x480 looked like the modest choice and was the degenerate one: retrogra
+// computes "desktop height / 480" as its scaling factor, got 1, and 1 is the single value its author
+// documents as impossible ("if it's 1 or too high for the screen, it should really crash").
+const
+  GFX_DESKTOP_W = 1280;
+  GFX_DESKTOP_H = 960;
+  GFX_DESKTOP_DEPTH = 32;   // what fbc answers for a desktop it cannot ask about a colour depth
+
+// ⭐⭐ THE FULLSCREEN MODE LIST SCREENLIST ENUMERATES, TAKEN FROM THE ORACLE AND NOT DEDUCED.
+// fbc was asked for every colour depth 1..32 on 9 Sep 2026 and answers exactly these thirty-two modes
+// for 8, 15, 16, 24 and 32 bpp, and nothing at all for every other depth - so it is fbc's own fixed
+// table rather than a property of the display, which is what makes it reproducible here.
+// ⚠️ The ORDER is the oracle's too, and it matters: a caller walks the list until it recognises a mode
+// (retrogra looks for 640x480), so re-sorting it would change which mode a program picks.
+const
+  GFX_MODE_LIST: array[0..31] of record W, H: Word; end = (
+    (W: 320;  H: 200),  (W: 320;  H: 240),  (W: 400;  H: 300),  (W: 512;  H: 384),
+    (W: 640;  H: 350),  (W: 640;  H: 400),  (W: 640;  H: 480),  (W: 720;  H: 400),
+    (W: 720;  H: 480),  (W: 768;  H: 480),  (W: 800;  H: 500),  (W: 800;  H: 600),
+    (W: 864;  H: 486),  (W: 928;  H: 580),  (W: 960;  H: 600),  (W: 1024; H: 576),
+    (W: 1024; H: 768),  (W: 1152; H: 720),  (W: 1152; H: 864),  (W: 1280; H: 720),
+    (W: 1280; H: 800),  (W: 1280; H: 960),  (W: 1280; H: 1024), (W: 1368; H: 768),
+    (W: 1400; H: 1050), (W: 1440; H: 900),  (W: 1440; H: 1080), (W: 1600; H: 900),
+    (W: 1600; H: 1200), (W: 1680; H: 1050), (W: 1920; H: 1080), (W: 1920; H: 1200)
+  );
+
 
 function SlotOpcode(Slot: Integer): Word;
 const G: array[0..7] of Word = ($00, $01, $02, $03, $04, $0A, $0B, $C8);
@@ -5497,7 +5533,8 @@ function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
 var
   ofs: PtrUInt;
   Data: PByte;
-  SizeBytes, ImgHandle: Integer;
+  SizeBytes, ImgHandle, FbSurf: Integer;
+  FbPage: Int64;
 begin
   if (RawPtr and RAWPTR_TAG) = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
@@ -5538,8 +5575,16 @@ begin
 
   if (RawPtr and RAWPTR_REGION_FB) <> 0 then
   begin
-    // SCREENPTR region: the working page's framebuffer.
-    if not Assigned(FGraphics) or not FGraphics.SurfaceData(FGfxWorkSurface, Data, SizeBytes) then
+    // SCREENPTR region: the page the pointer was taken from (bits 40..47, page+1), or the CURRENT work
+    // page when those bits are zero - which is what every pointer built before 9 Sep 2026 means, and
+    // what the wasm backend still builds.
+    FbPage := (RawPtr and RAWPTR_FB_PAGE_MASK) shr RAWPTR_FB_PAGE_SHIFT;
+    if (FbPage >= 1) and (FbPage - 1 <= High(FGfxPages)) then
+      FbSurf := FGfxPages[FbPage - 1]
+    else
+      FbSurf := FGfxWorkSurface;
+    ofs := ofs and not PtrUInt(RAWPTR_FB_PAGE_MASK);   // the page bits are not part of the offset
+    if not Assigned(FGraphics) or not FGraphics.SurfaceData(FbSurf, Data, SizeBytes) then
       raise ERangeError.Create('SCREENPTR dereference: no graphics screen (call SCREENRES first)');
     if (SizeBytes <= 0) or (ofs + NeedBytes > PtrUInt(SizeBytes)) then
       raise ERangeError.CreateFmt('SCREENPTR dereference out of bounds: offset %d + %d > %d bytes',
@@ -12384,13 +12429,23 @@ begin
   // list entry per rebuild for the duration of the threaded phase, and rebuilds are rare (DIM/REDIM/
   // ERASE and native-region installs). With no workers the assignment below just resizes in place,
   // exactly as before.
-  if FHasWorkers and (Length(FJitArrDesc) > 0) then
+  n := Length(FArrays);
+  // ⛔⛔ ...AND ONLY WHEN THE BUFFER CANNOT STAY WHERE IT IS, which is the condition the note above
+  // states and the code did not test. Retiring on EVERY rebuild costs an allocation and one list entry
+  // per rebuild - and the premise that "rebuilds are rare" is exactly what stops holding once a worker
+  // exists: NoteDescSlot is switched off then, so every array operation forces an un-localised rebuild.
+  // 📊 Measured 9 Sep 2026 on retrogra, which starts a refresh thread and then clears the screen: 78%
+  // of the whole run in SysGetMem under this SetLength, and the cost GREW with every row cleared -
+  // "SetLength(FRetiredArrDesc, k+1)" is O(k), so the clear was quadratic and a 20 ms loop took minutes.
+  // A DIM SHARED scalar is array-backed, so even "*p = sharedByte" in a pixel loop comes through here.
+  // ⚠️ Same length ⇒ SetLength does not move the buffer, so the pointer a worker holds stays valid and
+  // there is nothing to retire. The retire is for the case where the table must be REPLACED.
+  if FHasWorkers and (Length(FJitArrDesc) > 0) and (Length(FJitArrDesc) <> n * 4 + 4) then
   begin
     SetLength(FRetiredArrDesc, Length(FRetiredArrDesc) + 1);
     FRetiredArrDesc[High(FRetiredArrDesc)] := FJitArrDesc;   // the reference is what keeps it alive
     FJitArrDesc := nil;                                      // so the SetLength below allocates fresh
   end;
-  n := Length(FArrays);
   // ⛔ SETTLE THE OPERATION IN FLIGHT before reading the range: an ExecuteArrayOp that raised never
   // reached its marker, and this is where that is noticed (see the fields' note).
   FDescAllPending := FDescAllPending or FDescThisCall;
@@ -16240,10 +16295,25 @@ begin
   if (FPresentCadenceMs > 0) and (FScreenLockDepth = 0) then PresentBeforeFullRepaint(Ctx, Instr);
   // M5.3: off the render-owner thread, defer to the queue instead of touching SDL. Dormant on
   // the single-threaded path (FHasWorkers = False short-circuits before any thread-id check).
+  // ⛔⛔ ...BUT A QUERY DEFERRED IS A WRONG ANSWER, NOT A DELAYED ONE. Enqueuing leaves Dest untouched,
+  // so every graphics op that RETURNS something answered 0 on a worker thread while answering correctly
+  // on the main one - the same call, two answers, in silence. It is what killed retrogra's refresh
+  // thread: it asks SCREENPTR, got 0, and dereferenced it. The ones listed here read VM-side state only
+  // (a surface this VM owns, the palette table, the window transform, or pure arithmetic), so they are
+  // answerable from any thread and are answered HERE.
+  // ⚠️ The queries that genuinely need the backend - GETMOUSE and the joystick family - are NOT in this
+  // list: they still defer, and that is a separate open question rather than something this fixes.
   if FHasWorkers and not IsRenderOwner then
   begin
-    EnqueueDeferredOp(Ctx, dckGraphics, Instr);
-    Exit;
+    case Instr.OpCode of
+      bcGraphicRGBA, bcGfxPoint, bcGfxPalGet, bcGfxImageInfo, bcGfxScreenInfo,
+      bcGfxPMap, bcGfxPointCoord, bcGfxScreenPtr, bcGfxScreenList: ;   // answered in place, below
+    else
+      begin
+        EnqueueDeferredOp(Ctx, dckGraphics, Instr);
+        Exit;
+      end;
+    end;
   end;
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -16750,7 +16820,24 @@ begin
                        TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
                        Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
-      if Assigned(FGraphics) then
+      // ⭐⭐ WITH NO SCREEN SET, SCREENINFO REPORTS THE DESKTOP - and answering 0 there is not a
+      // conservative silence, it is a wrong number a program divides by. fbc answers the desktop it
+      // found (1920x1200 here, depth 24 under X and 32 without); we answered 0x0, and retrogra's
+      // rgSCREENNEW - which sizes its canvas from exactly this call before any SCREENRES - then asked
+      // for a 0x0 screen, got a null SCREENPTR, and spun writing pixels nowhere.
+      // 🎯 DECLARED DIVERGENCE: a headless VM has no desktop to report, and fbc's own answer is a
+      //   property of the MACHINE (a 1280x1024 desktop makes fbc answer differently), so no fixed
+      //   number can match it. GFX_DESKTOP_W/H is fbc's smallest fullscreen mode, which is also the
+      //   canvas retrogra and the FreeBASIC examples are written for. A front end that HAS a desktop
+      //   (sbv, --window) is the one entitled to answer differently.
+      if Assigned(FGraphics) and (FGraphics.SurfaceWidth(FGraphics.ScreenSurface) <= 0) then
+        case Instr.Immediate of
+          0: Ctx.IntRegs[Instr.Dest] := GFX_DESKTOP_W;
+          1: Ctx.IntRegs[Instr.Dest] := GFX_DESKTOP_H;
+          2: Ctx.IntRegs[Instr.Dest] := GFX_DESKTOP_DEPTH;
+        else Ctx.IntRegs[Instr.Dest] := 0;   // fbc answers 0 for bytes-per-pixel, pitch and rate too
+        end
+      else if Assigned(FGraphics) then
         case Instr.Immediate of
           0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(FGraphics.ScreenSurface);
           1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(FGraphics.ScreenSurface);
@@ -16811,8 +16898,12 @@ begin
         //  returns 0 when there is no graphics screen; do the same rather than hand out a pointer that
         //  would only fail later.
       begin
+        // ⭐ The pointer names the page it was taken FROM - see RAWPTR_FB_PAGE_SHIFT. Without it a
+        // pointer to page 2 and one to page 1 were the same value and both read whatever SCREENSET had
+        // selected last, so a scale-up that reads one page and writes another copied a page onto itself.
         if Assigned(FGraphics) and FGraphics.SurfaceData(FGfxWorkSurface, ScrData, ScrSize) and (ScrSize > 0) then
           Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_FB
+                                     or ((Int64(FGfxWorkPage) + 1) shl RAWPTR_FB_PAGE_SHIFT)
         else
           Ctx.IntRegs[Instr.Dest] := 0;
       end;
@@ -17022,6 +17113,34 @@ begin
         Ctx.IntRegs[Instr.Dest] := FDrawPenY
       else
         Ctx.IntRegs[Instr.Dest] := FDrawPenX;
+    70: // bcGfxScreenList - SCREENLIST([depth]): the next fullscreen resolution at that colour depth,
+        // as (width shl 16) or height, and 0 when the list is exhausted. Immediate bit0 = a depth was
+        // given, which RESTARTS the enumeration; a bare "ScreenList()" continues it.
+        // ⭐ THE TABLE IS THE ORACLE'S, ENUMERATED not deduced (9 Sep 2026): fbc was asked for every
+        //   depth 1..32 and answers the SAME thirty-two modes for 8, 15, 16, 24 and 32, and nothing at
+        //   all for the others - it is fbc's fixed mode table, not a property of the display.
+        // ⛔ ...and the depths are the five fbc supports, not "anything > 0": retrogra asks for 8, and a
+        //   list answered for a depth fbc refuses would send a program down a branch fbc never takes.
+      begin
+        if (Instr.Immediate and 1) <> 0 then
+        begin
+          FScreenListDepth := Ctx.IntRegs[Instr.Src1];
+          FScreenListNext := 0;
+        end;
+        case FScreenListDepth of
+          8, 15, 16, 24, 32: ;
+        else
+          FScreenListNext := Length(GFX_MODE_LIST);   // an unsupported depth lists nothing
+        end;
+        if FScreenListNext <= High(GFX_MODE_LIST) then
+        begin
+          Ctx.IntRegs[Instr.Dest] := (Int64(GFX_MODE_LIST[FScreenListNext].W) shl 16)
+                                     or Int64(GFX_MODE_LIST[FScreenListNext].H);
+          Inc(FScreenListNext);
+        end
+        else
+          Ctx.IntRegs[Instr.Dest] := 0;
+      end;
     59, 68: // bcGfxCircleEx / bcGfxCircleExF - CIRCLE ellipse/arc, outline or FILLED (sub-op 68).
         // Src1=x, Src2=y, Dest=RX; Immediate [0-15]=RY, [16-31]=color,
         // [32-47]=start-angle-degrees, [48-63]=end-angle-degrees (all int regs). Angles are already in

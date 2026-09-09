@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 580 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F
+  OPCODE_LIST_COUNT = 581 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -122,7 +122,7 @@ const
     bcGfxForeColor, bcGfxImageCreate, bcGfxImageDestroy, bcGfxImageInfo, bcGfxGet, bcGfxPut,
     bcGfxScreenInfo, bcGfxScreenSet, bcGfxPCopy, bcGfxWindow, bcGfxPMap, bcGfxView,
     bcGfxScreen, bcMultikey, bcGetmouse, bcMouseAxis, bcSetmouse, bcGetJoystick,
-    bcJoyBtn, bcJoyAxis, bcStick, bcStrig, bcGfxDrawGML, bcGfxPointCoord,
+    bcJoyBtn, bcJoyAxis, bcStick, bcStrig, bcGfxDrawGML, bcGfxPointCoord, bcGfxScreenList,
     bcGfxCircleEx, bcGfxCircleExF, bcGfxPaintBorder, bcGfxSetTarget, bcGfxLineStyled, bcGfxScreenPtr,
     bcGfxScreenLock, bcGfxScreenUnlock, bcScnClr,
   bcGfxImageConvertRow, bcGfxDrawString, bcRegexCount, bcRegexReplace,
@@ -206,7 +206,7 @@ const
   {$ELSE}
   DENSE_WEB_SIZE      = 0;    // group 8 is gated out: it takes NO dense range
   {$ENDIF}
-  DENSE_GRAPHICS_SIZE = 70;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK, PALETTE USING)
+  DENSE_GRAPHICS_SIZE = 71;   // group 10  (bcGfxDrawString, bcGfxCircleExF, SCREENLOCK/UNLOCK, PALETTE USING, SCREENLIST)
   DENSE_SOUND_SIZE    = 6;    // group 11
   DENSE_BIGINT_SIZE   = 13;   // group 12
   DENSE_SUPER_SIZE    = 72;   // group 200 keeps its whole block, holes included
@@ -224,7 +224,7 @@ const
   DENSE_SOUND_BASE    = DENSE_GRAPHICS_BASE + DENSE_GRAPHICS_SIZE;
   DENSE_BIGINT_BASE   = DENSE_SOUND_BASE    + DENSE_SOUND_SIZE;
   DENSE_SUPER_BASE    = DENSE_BIGINT_BASE   + DENSE_BIGINT_SIZE;
-  DENSE_TOTAL         = DENSE_SUPER_BASE    + DENSE_SUPER_SIZE; // N: 576, or 589 with web
+  DENSE_TOTAL         = DENSE_SUPER_BASE    + DENSE_SUPER_SIZE; // N: 577, or 590 with web
 
 var
   // Derived at initialization from OPCODES (see InitOpcodeTable).
