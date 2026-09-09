@@ -9161,10 +9161,17 @@ begin
         // 0-based index i (its character code). Not an array, not a pointer -> a string byte read.
         // A SHARED scalar string is array-backed (ArrayIndexOf >= 0) but is conceptually a scalar, so
         // IsSharedScalar also routes it here (otherwise "s[i]" reads the whole backing element).
+        // ⛔ "IS IT A POINTER?" IS ASKED OF THE SCOPE, NOT OF THE FLAT MAP. This rung read
+        // FPointerVars directly while the rung above it asks ManagedPtrPointee, which walks the block,
+        // this procedure's pointer parameters and its pointer DIMs before the flat map - so once that
+        // one learnt the veto, a name some OTHER procedure declares as a pointer made BOTH rungs
+        // decline and the subscript fell to the array ladder: "Array not declared: FBUFFER" on a
+        // "Dim As String fbuffer" three files from the declaration that poisoned it. Same fact, two
+        // readers, one of them uninformed - the recurring shape of this registry family.
         if ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(UpperCase(ArrName))) and
            (Node.Attributes.Values['SHAREDELEM'] <> '1') and
            (GetVariableType(ArrName) = srtString) and
-           (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
+           (ManagedPtrPointee(ArrName) = '') and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Result := EmitStringByteRead(Node.GetChild(0), Node.GetChild(1).GetChild(0));
@@ -12142,10 +12149,13 @@ begin
   // FreeBASIC string subscript write "s[i] = c" on a scalar STRING variable: set the byte at the
   // 0-based index i. Not an array, not a pointer -> a string byte write. A SHARED scalar string is
   // array-backed but conceptually a scalar, so IsSharedScalar also routes it here.
+  // ⛔ Asked of the SCOPE, not of the flat map - the WRITE half of the same rule as the read rung in
+  // ProcessArrayAccess. Leaving one of the pair on FPointerVars is how "c = fbuffer[i]" started working
+  // while "fbuffer[i] = 32", four lines below it in the same loop, still fell to the array ladder.
   if ((ArrayIndexOf(ArrName) < 0) or IsSharedScalar(UpperCase(ArrName))) and
      (TargetNode.Attributes.Values['SHAREDELEM'] <> '1') and
      (GetVariableType(ArrName) = srtString) and
-     (FPointerVars.IndexOfName(UpperCase(ArrName)) < 0) and
+     (ManagedPtrPointee(ArrName) = '') and
      (TargetNode.GetChild(1).NodeType = antExpressionList) and (TargetNode.GetChild(1).ChildCount = 1) then
   begin
     EmitStringByteWrite(TargetNode.GetChild(0), TargetNode.GetChild(1).GetChild(0), ExprNode, Node.Token);
@@ -38679,6 +38689,21 @@ begin
     idx := FCurrentProcPtrLocals.IndexOfName(UpperCase(Name));
     if idx >= 0 then Exit(FCurrentProcPtrLocals.ValueFromIndex[idx]);
   end;
+  // ⛔⛔⛔ ...AND THE FLAT ENTRY DOES NOT ANSWER FOR A NAME THIS PROCEDURE DECLARES ITSELF. Its twin
+  // PointeeTypeOf has had this veto since DIVERGENZE 95 - the note there even names the case - and this
+  // reader did not: two readers of ONE fact, disagreeing, which is precisely what that note warns
+  // about. retrogra's locale.bi declares "Dim As String fbuffer" inside LOCALELOADTABLE while an
+  // OVERLOAD of DFLOAD elsewhere declares "ByRef fbuffer As UByte Ptr". The flat map answered POINTER,
+  // so "c = fbuffer[i]" on the STRING took the pointer-indexing rung instead of the string-byte one:
+  // the compiler emitted VAL(fbuffer) as an ADDRESS and the program died on "Null or invalid pointer
+  // dereference (address 0)" - a wrong ANSWER, not a refusal, and three files away from the cause.
+  // ⭐ RAWPTRDIAG=1 had been saying it all along ("flat says raw, no scope does"): the veto was right,
+  // this reader was not asking it.
+  // ⚠️ THE FLAT MAP ONLY. The rungs above - the open block, this proc's pointer PARAMETERS, this
+  // proc's pointer DIMs - have already answered for every name that really is a pointer here, so
+  // vetoing after them cannot take a pointer away from its owner.
+  if FInProcedure and (FCurrentProcDeclNames <> nil) and
+     (FCurrentProcDeclNames.IndexOf(UpperCase(Name)) >= 0) then Exit('');
   idx := FPointerVars.IndexOfName(UpperCase(Name));
   if idx >= 0 then Result := FPointerVars.ValueFromIndex[idx];
 end;
