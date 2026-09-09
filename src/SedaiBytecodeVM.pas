@@ -774,6 +774,8 @@ type
     procedure ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
     procedure GrowArrays(NewLen: Integer);   // resize FArrays with the descriptor lock held
+    procedure LockArrays;                    // ...and hold it while ONE array's storage is reshaped
+    procedure UnlockArrays;
     function ArrDescCount(const A: TArrayStorage): Int64;  // the count the COMPILED engines see
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
@@ -12381,6 +12383,26 @@ begin
     end;
 end;
 
+procedure TBytecodeVM.LockArrays;
+// ⛔⛔ RESHAPING ONE ARRAY'S STORAGE IS THE OTHER HALF OF THE SAME RACE AS GROWING THE TABLE. A worker
+// rebuilds the descriptor table under FArrDescLock and, for every slot, reads @FArrays[a].IntData[0] -
+// so a DIM / REDIM / ERASE on the main thread doing SetLength on that very vector hands it a pointer
+// into freed memory. GrowArrays closed the TABLE; this closes the ELEMENT.
+// 📊 retrogra's demo and BASIC: a refresh thread runs while a message box DIMs a local array, and the
+// worker died inside RebuildJitArrDesc roughly two runs in three (resolved with --symbols:
+// RebuildJitArrDesc <- AcquireArrDescCtxLocked <- AcquireArrDescCtx <- RunFast).
+// ⚠️ Free of re-entrancy by construction: the four callers (ExecuteArrayDim, RedimArray, RedimArrayN,
+// EraseArray) reach nothing that takes this lock - checked, not assumed - so the region stays a plain
+// pair. And with no worker there is nobody to race with, so the single-threaded path pays nothing.
+begin
+  if FHasWorkers then EnterCriticalSection(FArrDescLock);
+end;
+
+procedure TBytecodeVM.UnlockArrays;
+begin
+  if FHasWorkers then LeaveCriticalSection(FArrDescLock);
+end;
+
 procedure TBytecodeVM.GrowArrays(NewLen: Integer);
 // ⛔⛔ GROWING THE ARRAY TABLE IS A RACE AGAINST THE DESCRIPTOR REBUILD, and it went unguarded because
 // the table only grows in four places, all of which look like ordinary single-threaded work: a DIM, the
@@ -12511,6 +12533,11 @@ begin
   FDescUsedLo := Lo; FDescUsedHi := Hi;
   for a := Lo to Hi do
   begin
+    // ⛔ A BOUND ON THE TWO VECTORS THIS LOOP INDEXES. Lo/Hi are derived from Length(FArrays) and the
+    // private-block plan, so they are supposed to be in range - but "supposed to" is what an access
+    // violation on a worker disproves, and the cost here is two comparisons per slot on a path that
+    // already rebuilds the whole table. It turns a crash three layers away into a skipped entry.
+    if (a > High(FArrays)) or (a * 4 + 3 > High(FJitArrDesc)) then Break;
     if Length(FArrays[a].IntData) > 0 then
       FJitArrDesc[a * 4 + 0] := Int64(PtrUInt(@FArrays[a].IntData[0]))
     else FJitArrDesc[a * 4 + 0] := 0;
@@ -14789,740 +14816,755 @@ var
                                     // in RunTemplate.inc - the same text is compiled into two scopes.
   ArrMapP: PInteger;                // ...and so is the array-id map alias, for the same reason.
 begin
-  InstrHot := @Instr;
-  if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
-  // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
-  // move an array's backing store; the hot typed accessors never come through here. So the
-  // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.
-  //
-  // Marked HERE rather than only at the interpreter's call site, which is where it used to
-  // live: with the AOT runtime helper there is now a second caller, and a flag set by one
-  // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
-  // kept reading the pre-DIM descriptor and every array element came back 0.
-  FArraysDirty := True;
-  // ⛔ SETTLE THE PREVIOUS CALL HERE AND NOT AT ITS OWN END, which is what makes this exception
-  // safe without a try..finally on the cold array path: an operation that RAISED never reached its
-  // marker, so its FDescThisCall is still True and folds into the pending "rebuild everything".
-  FDescAllPending := FDescAllPending or FDescThisCall;
-  FDescThisCall := True;
-  SubOp := Instr.OpCode and $FF;
-  case SubOp of
-    0: // bcArrayLoad (generic, deprecated)
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
-          case FArrays[ArrayIdx].ElementType of
-            0: Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx);
-            1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
-            2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
-          end
-        else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
-          case FArrays[ArrayIdx].ElementType of
-            0: Ctx.IntRegs[Instr.Dest] := 0;
-            1: Ctx.FloatRegs[Instr.Dest] := 0.0;
-            2: Ctx.StringRegs[Instr.Dest] := '';
-          end;
-      end;
-    1: // bcArrayStore (generic, deprecated)
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
-          raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
-          case FArrays[ArrayIdx].ElementType of
-            0: ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[Instr.Dest]);
-            1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
-            2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
-          end;
-      end;
-    2: // bcArrayDim
-      begin
-        ExecuteArrayDim(Ctx, Instr);
-      end;
-    {$I ArrayHotOps.inc}
-    9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4). Dim 0 (index -1) is the
-       // special FreeBASIC query "how many dimensions": LBOUND(arr, 0) is always 1.
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if LinearIdx < 0 then
-          Ctx.IntRegs[Instr.Dest] := 1
-        else
-          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
-      end;
-    10: // bcArrayUBound - UBOUND(arr[, dim]) - upper = lower + size - 1 (B1.4). Dim 0 (index -1) is the
-        // FreeBASIC "number of dimensions" query: the count of ALLOCATED dimensions -- a fixed array's rank,
-        // and 0 for a dynamic array not yet dimensioned (TotalSize 0, which reports UBOUND(arr) = -1).
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if LinearIdx < 0 then
+  // ⛔⛔⛔ THE FUNNEL, AND IT IS THE FUNNEL BECAUSE ONE LOCK PER *SITE* WAS WHACK-A-MOLE. A worker
+  // rebuilds the descriptor table under FArrDescLock and reads @FArrays[a].IntData[0] for every
+  // slot; anything on the main thread that reshapes an array - a DIM, a REDIM, an ERASE, and the
+  // BIND protocol that moves storage records on every call with an array parameter - hands it a
+  // pointer into freed memory. Locking the four resize entry points first left the fault exactly
+  // where it was (same frame, resolved with --symbols), because the racer was the bind arms.
+  // ⇒ Every group-3 opcode that can reshape storage arrives HERE, so here is where it is settled.
+  // ⚠️ The hot element load/store arms do NOT pass through this procedure - RunTemplate includes
+  // ArrayHotOps.inc inline - so the price is paid by the structural opcodes only, and only while
+  // workers exist (LockArrays is a no-op otherwise).
+  LockArrays;
+  try
+    InstrHot := @Instr;
+    if Length(Ctx.ArrMap) > 0 then ArrMapP := @Ctx.ArrMap[0] else ArrMapP := nil;
+    // This is the COLD array path - DIM/REDIM/ERASE/BIND and friends, any of which can resize or
+    // move an array's backing store; the hot typed accessors never come through here. So the
+    // JIT/AOT descriptor table must be rebuilt before the next compiled code reads it.
+    //
+    // Marked HERE rather than only at the interpreter's call site, which is where it used to
+    // live: with the AOT runtime helper there is now a second caller, and a flag set by one
+    // caller is a semantic the other silently loses. It cost a real bug to learn - compiled code
+    // kept reading the pre-DIM descriptor and every array element came back 0.
+    FArraysDirty := True;
+    // ⛔ SETTLE THE PREVIOUS CALL HERE AND NOT AT ITS OWN END, which is what makes this exception
+    // safe without a try..finally on the cold array path: an operation that RAISED never reached its
+    // marker, so its FDescThisCall is still True and folds into the pending "rebuild everything".
+    FDescAllPending := FDescAllPending or FDescThisCall;
+    FDescThisCall := True;
+    SubOp := Instr.OpCode and $FF;
+    case SubOp of
+      0: // bcArrayLoad (generic, deprecated)
         begin
-          if FArrays[ArrayIdx].TotalSize > 0 then
-            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].DimCount
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+          if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
+            raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+          LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+            case FArrays[ArrayIdx].ElementType of
+              0: Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx);
+              1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+              2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+            end
+          else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
+            case FArrays[ArrayIdx].ElementType of
+              0: Ctx.IntRegs[Instr.Dest] := 0;
+              1: Ctx.FloatRegs[Instr.Dest] := 0.0;
+              2: Ctx.StringRegs[Instr.Dest] := '';
+            end;
+        end;
+      1: // bcArrayStore (generic, deprecated)
+        begin
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+          if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then
+            raise ERangeError.CreateFmt('Array not allocated: %d', [ArrayIdx]);
+          LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
+            case FArrays[ArrayIdx].ElementType of
+              0: ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[Instr.Dest]);
+              1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+              2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+            end;
+        end;
+      2: // bcArrayDim
+        begin
+          ExecuteArrayDim(Ctx, Instr);
+        end;
+      {$I ArrayHotOps.inc}
+      9: // bcArrayLBound - LBOUND(arr[, dim]) - Src2 = 0-based dim index (B1.4). Dim 0 (index -1) is the
+         // special FreeBASIC query "how many dimensions": LBOUND(arr, 0) is always 1.
+        begin
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+          LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if LinearIdx < 0 then
+            Ctx.IntRegs[Instr.Dest] := 1
           else
-            Ctx.IntRegs[Instr.Dest] := 0;
-        end
-        else
-          Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
-                                     + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
-      end;
-    11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
-        // 0 = static array (keep bounds, zero the elements).
-      // Immediate 2 = "the compiler could not tell": the name is an array PARAMETER, and whether ERASE
-      // frees or merely resets is the CALLER's array's property. The bind copied the storage record
-      // whole, so the answer travels with it. fbc suite string/string-array-erase-arg.
-      if Instr.Immediate = 2 then
-        EraseArray(Ctx.ArrMap[Instr.Src1], FArrays[Ctx.ArrMap[Instr.Src1]].IsDynamic)
-      else
-        EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
-    12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
-        // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
-        // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
-      begin
-        if Length(FRedimPendingLBs) > 0 then
+            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx];
+        end;
+      10: // bcArrayUBound - UBOUND(arr[, dim]) - upper = lower + size - 1 (B1.4). Dim 0 (index -1) is the
+          // FreeBASIC "number of dimensions" query: the count of ALLOCATED dimensions -- a fixed array's rank,
+          // and 0 for a dynamic array not yet dimensioned (TotalSize 0, which reports UBOUND(arr) = -1).
         begin
-          RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
-                     True, FRedimPendingLBs[0]);
-          SetLength(FRedimPendingLBs, 0);
-        end
-        else
-          RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
-                     (Instr.Immediate and 2) <> 0, Instr.Immediate shr 8);
-      end;
-    // FreeBASIC pointer dereference. Two pointer kinds share these ops, discriminated by bit 63: a
-    // record-field pointer (RECPTR_TAG set, so PtrAddr < 0) addresses ResolveRec(handle)^.Data[slot];
-    // otherwise the packed address holds (arrayId+1) in the high bits (0 = NULL) and the element offset
-    // in the low POINTER_ARRAY_SHIFT bits, addressing FArrays[arrayId].Data[offset] (offset 0 for a
-    // scalar's 1-element backing). Load: Dest=value, Src1=address. Store: Src1=address, Src2=value.
-    13: // bcRefLoadInt
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if PtrAddr < 0 then
-        begin
-          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          Ctx.IntRegs[Instr.Dest] := RecFieldInt(Rec, RecSlot);
-        end
-        // ⛔ ...AND A RAW ADDRESS IS A THIRD KIND. An @-taken LOCAL is a raw byte slot (RAWPTR_TAG,
-        // bit 62), and the deref lowered from a NAME knows that; the one lowered from a VALUE cannot,
-        // because there is no name left to ask. So "*p" worked and "**pp" did not: the inner deref
-        // handed back p's value - a correctly tagged raw address - and this arm decoded it as a packed
-        // array pointer, whose array id is then nonsense ("Null or invalid pointer dereference,
-        // address 4611686018427387920"). The tag is IN the value, so the question is answered here,
-        // where every path that produces one arrives.
-        else if (PtrAddr and RAWPTR_TAG) <> 0 then
-          Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, 0)
-        else
-        begin
-          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
-          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          // ⛔ ...AND THE BANK OF THE POINTER NEED NOT BE THE BANK OF THE STORAGE. These six arms chose
-          // which vector to read from the OPCODE, while a TArrayStorage populates exactly ONE of
-          // IntData / FloatData / StringData - so "*CPtr(ULongInt Ptr, @d)" over a Double reached an
-          // INT arm, found IntData empty and reported the FLOAT bank's tag as a bad address. Type
-          // punning is the idiom fbc's own suite uses everywhere, and it was impossible by
-          // construction. The vector that IS populated is the discriminator, so no extra field is
-          // needed: fall through to it and REINTERPRET the eight bytes, which is what fbc does.
-          // ⚠️ DECLARED LIMIT: a SINGLE is stored here as an 8-byte Double, so punning one through a
-          // ULong Ptr still differs from fbc's 4-byte IEEE754 image (DIVERGENZE 55). Double <-> Int64,
-          // which is what numbers/infnan and numbers/limits use, is exact.
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          // ⭐ A PACKED ARRAY IS CONTIGUOUS BYTES, so a read WIDER than one element spans the ones
-          // after it - which is what "Peek(ULong, @a(0))" over an array of UByte means, and what it
-          // answers in FreeBASIC. Immediate carries the read's own width (see the lowering). Guard m884.
-          if FArrays[ArrayIdx].ElemWidth > 0 then
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+          LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if LinearIdx < 0 then
           begin
-            if PtrOffset >= FArrays[ArrayIdx].TotalSize then
-              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-            Ctx.IntRegs[Instr.Dest] := ReadPackedBytes(FArrays[ArrayIdx],
-                                         PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate);
+            if FArrays[ArrayIdx].TotalSize > 0 then
+              Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].DimCount
+            else
+              Ctx.IntRegs[Instr.Dest] := 0;
           end
-          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-            Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
-          else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
-            Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
           else
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            Ctx.IntRegs[Instr.Dest] := FArrays[ArrayIdx].LowerBounds[LinearIdx]
+                                       + FArrays[ArrayIdx].Dimensions[LinearIdx] - 1;
         end;
-      end;
-    14: // bcRefLoadFloat
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if PtrAddr < 0 then
-        begin
-          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
-        end
-        // The raw-address kind - see the note in bcRefLoadInt above.
-        else if (PtrAddr and RAWPTR_TAG) <> 0 then
-          Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
+      11: // bcArrayErase - ERASE arr (B1.4). Immediate 1 = dynamic array (free -> LBound 0/UBound -1);
+          // 0 = static array (keep bounds, zero the elements).
+        // Immediate 2 = "the compiler could not tell": the name is an array PARAMETER, and whether ERASE
+        // frees or merely resets is the CALLER's array's property. The bind copied the storage record
+        // whole, so the answer travels with it. fbc suite string/string-array-erase-arg.
+        if Instr.Immediate = 2 then
+          EraseArray(Ctx.ArrMap[Instr.Src1], FArrays[Ctx.ArrMap[Instr.Src1]].IsDynamic)
         else
+          EraseArray(Ctx.ArrMap[Instr.Src1], Instr.Immediate <> 0);
+      12: // bcArrayRedim - REDIM [PRESERVE] arr([lb TO] ub) (B1.4); Src2=ub reg. Immediate: bit0=preserve,
+          // bit1=has explicit lower bound, bits8+ = that (non-negative) lower bound. A RUNTIME lower bound
+          // arrives via a preceding bcArrayRedimPush (LB flag) in FRedimPendingLBs and takes precedence.
         begin
-          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
-          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
-            Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset]
-          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-            Ctx.FloatRegs[Instr.Dest] := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
+          if Length(FRedimPendingLBs) > 0 then
+          begin
+            RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+                       True, FRedimPendingLBs[0]);
+            SetLength(FRedimPendingLBs, 0);
+          end
           else
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            RedimArray(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2], (Instr.Immediate and 1) <> 0,
+                       (Instr.Immediate and 2) <> 0, Instr.Immediate shr 8);
         end;
-      end;
-    15: // bcRefLoadString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if PtrAddr < 0 then
+      // FreeBASIC pointer dereference. Two pointer kinds share these ops, discriminated by bit 63: a
+      // record-field pointer (RECPTR_TAG set, so PtrAddr < 0) addresses ResolveRec(handle)^.Data[slot];
+      // otherwise the packed address holds (arrayId+1) in the high bits (0 = NULL) and the element offset
+      // in the low POINTER_ARRAY_SHIFT bits, addressing FArrays[arrayId].Data[offset] (offset 0 for a
+      // scalar's 1-element backing). Load: Dest=value, Src1=address. Store: Src1=address, Src2=value.
+      13: // bcRefLoadInt
         begin
-          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if PtrAddr < 0 then
+          begin
+            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Ctx.IntRegs[Instr.Dest] := RecFieldInt(Rec, RecSlot);
+          end
+          // ⛔ ...AND A RAW ADDRESS IS A THIRD KIND. An @-taken LOCAL is a raw byte slot (RAWPTR_TAG,
+          // bit 62), and the deref lowered from a NAME knows that; the one lowered from a VALUE cannot,
+          // because there is no name left to ask. So "*p" worked and "**pp" did not: the inner deref
+          // handed back p's value - a correctly tagged raw address - and this arm decoded it as a packed
+          // array pointer, whose array id is then nonsense ("Null or invalid pointer dereference,
+          // address 4611686018427387920"). The tag is IN the value, so the question is answered here,
+          // where every path that produces one arrives.
+          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+            Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, 0)
+          else
+          begin
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+            // ⛔ ...AND THE BANK OF THE POINTER NEED NOT BE THE BANK OF THE STORAGE. These six arms chose
+            // which vector to read from the OPCODE, while a TArrayStorage populates exactly ONE of
+            // IntData / FloatData / StringData - so "*CPtr(ULongInt Ptr, @d)" over a Double reached an
+            // INT arm, found IntData empty and reported the FLOAT bank's tag as a bad address. Type
+            // punning is the idiom fbc's own suite uses everywhere, and it was impossible by
+            // construction. The vector that IS populated is the discriminator, so no extra field is
+            // needed: fall through to it and REINTERPRET the eight bytes, which is what fbc does.
+            // ⚠️ DECLARED LIMIT: a SINGLE is stored here as an 8-byte Double, so punning one through a
+            // ULong Ptr still differs from fbc's 4-byte IEEE754 image (DIVERGENZE 55). Double <-> Int64,
+            // which is what numbers/infnan and numbers/limits use, is exact.
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            // ⭐ A PACKED ARRAY IS CONTIGUOUS BYTES, so a read WIDER than one element spans the ones
+            // after it - which is what "Peek(ULong, @a(0))" over an array of UByte means, and what it
+            // answers in FreeBASIC. Immediate carries the read's own width (see the lowering). Guard m884.
+            if FArrays[ArrayIdx].ElemWidth > 0 then
+            begin
+              if PtrOffset >= FArrays[ArrayIdx].TotalSize then
+                raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+              Ctx.IntRegs[Instr.Dest] := ReadPackedBytes(FArrays[ArrayIdx],
+                                           PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate);
+            end
+            else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+              Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
+            else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+              Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
+            else
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          end;
+        end;
+      14: // bcRefLoadFloat
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if PtrAddr < 0 then
+          begin
+            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
+          end
+          // The raw-address kind - see the note in bcRefLoadInt above.
+          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+            Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
+          else
+          begin
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+            // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+              Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset]
+            else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+              Ctx.FloatRegs[Instr.Dest] := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
+            else
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          end;
+        end;
+      15: // bcRefLoadString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if PtrAddr < 0 then
+          begin
+            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
+          end
+          // ⛔ THE RAW THIRD KIND, WHICH THIS ARM ALONE DID NOT KNOW. bcRefLoadInt/Float learned it and
+          // say so in the note above - "the tag is IN the value, so the question is answered here, where
+          // every path that produces one arrives" - and the STRING arm was never visited. A BYREF cast
+          // written "Operator = *This.p" over a CAllocate'd ZString hands back a correctly tagged raw
+          // address, and this decoded it as a packed array pointer: "Null or invalid pointer
+          // dereference, address 4611686018427387944". Text at a raw address is a C string.
+          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+            Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
+          else
+          begin
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[PtrOffset];
+          end;
+        end;
+      16: // bcRefStoreInt
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if PtrAddr < 0 then
+          begin
+            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            RecSetFieldInt(Rec, RecSlot, Ctx.IntRegs[Instr.Src2]);
+          end
+          // The raw-address kind - see the note in bcRefLoadInt above. The WRITE half must know it too,
+          // or "**pp = 5" stores into a nonexistent array while "*p = 5" works.
+          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+            RawStoreInt(PtrAddr, 0, Ctx.IntRegs[Instr.Src2])
+          else
+          begin
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+            // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above. The
+            // WRITE half needs it too, or "*Cast(ULongInt Ptr, @d) = bits" raises where the read works.
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            // ⭐ A PACKED ARRAY IS CONTIGUOUS BYTES on the write side too: Immediate carries the width the
+            // store was written at, so "*Cast(ULong Ptr, @a(4)) = &h11223344" fills a(4)..a(7). Guard m884.
+            if FArrays[ArrayIdx].ElemWidth > 0 then
+            begin
+              if PtrOffset >= FArrays[ArrayIdx].TotalSize then
+                raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+              WritePackedBytes(ArrayIdx, PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate,
+                               Ctx.IntRegs[Instr.Src2]);
+            end
+            else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+              ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2])
+            else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+              PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
+            else
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          end;
+        end;
+      17: // bcRefStoreFloat
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if PtrAddr < 0 then
+          begin
+            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
+          end
+          // The raw-address kind - see the note in bcRefLoadInt above.
+          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+            RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
+          else
+          begin
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+            // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+              FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2]
+            else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+              PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Ctx.FloatRegs[Instr.Src2]
+            else
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+          end;
+        end;
+      18: // bcRefStoreString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if PtrAddr < 0 then
+          begin
+            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
+          end
+          // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
+          // or LSET on such a UDT reads its buffer and then stores into a nonexistent array.
+          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+            RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
+          else
+          begin
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+            FArrays[ArrayIdx].StringData[PtrOffset] := Ctx.StringRegs[Instr.Src2];
+          end;
+        end;
+      19: // bcRefAddrField — pack a record-field pointer from a handle (Src1) and slot (Immediate)
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];   // record handle (may carry SHARED_REC_FLAG)
+          Ctx.IntRegs[Instr.Dest] := RECPTR_TAG or (PtrAddr and SHARED_REC_FLAG) or
+            (((PtrAddr and SHARED_REC_MASK) and RECPTR_INDEX_MASK) shl RECPTR_SLOT_BITS) or
+            (Int64(Instr.Immediate) and RECPTR_SLOT_MASK);
+        end;
+      // FreeBASIC raw byte heap (Allocate family).
+      20: Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                              // bcRawAlloc
+      21: RawFree(Ctx.IntRegs[Instr.Src1]);                                                          // bcRawFree
+      22: Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);   // bcRawRealloc
+      // ⛔ A NEGATIVE ADDRESS IS NOT RAW MEMORY: it is a RECORD-FIELD pointer (RECPTR_TAG, bit 63), what
+      // "@obj.field" yields for a managed record. bcRefLoadInt has told the three domains apart for a
+      // while - its own comment says "the tag is IN the value, so the question is answered here, where
+      // every path that produces one arrives" - and the RAW arm never learnt the same thing. So
+      // "@a.i" put in a pointer VARIABLE worked and the same address put in a pointer FIELD of another
+      // UDT died on "Null or invalid raw pointer dereference": the compiler classifies a pointer FIELD as
+      // raw and emits this opcode, and only the value knows better. Measured with a 5-variant deck: the
+      // combination "record-field pointer inside a record field" was the only one that broke.
+      23: // bcRawLoadInt
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if (PtrAddr and RAWPTR_TAG) <> 0 then
+            Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)   // a real raw address: it carries the WIDTH
+          else
+            Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr, Instr.Immediate);
+        end;
+      24: // bcRawLoadFloat
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if (PtrAddr and RAWPTR_TAG) <> 0 then
+            Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)
+          else
+            Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr);
+        end;
+      // The WRITE half of the same rule, and it must be here too - "*g.pi = 33" through a pointer FIELD
+      // holding "@obj.field" wrote into a nonexistent raw block while the READ, once fixed, worked.
+      25: // bcRawStoreInt
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if (PtrAddr and RAWPTR_TAG) <> 0 then
+            RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
+          else
+            PtrDomainStoreInt(Ctx, PtrAddr, Ctx.IntRegs[Instr.Src2]);
+        end;
+      26: // bcRawStoreFloat
+        begin
+          PtrAddr := Ctx.IntRegs[Instr.Src1];
+          if (PtrAddr and RAWPTR_TAG) <> 0 then
+            RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])
+          else
+            PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2]);
+        end;
+      31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
+        begin
+          RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+          Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+        end;
+      32: // bcRawMemMove - FB_MEMMOVE(dst, src, bytes); overlap-safe
+        begin
+          RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+          Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
+        end;
+      33: // bcRawClear - CLEAR(dst, value, bytes)
+        RawClear(Ctx, Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
+      50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (wide cells).
+          // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
+          // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
+          // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
+          // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
+        // ⭐ A NEGATIVE address is not raw memory at all: it is a RECORD-FIELD pointer (RECPTR_TAG,
+        // bit 63), which is what "@obj.field" yields for a MANAGED record. A raw byte address carries
+        // RAWPTR_TAG (bit 62) and so is never negative - the two domains are told apart here exactly as
+        // bcRefLoad*/bcRefStore* already tell them apart. Without this "*Cast(ZString Ptr, @_data)",
+        // which is how fbc's OWN udt-zstring reference implementation reads a fixed-length field, took a
+        // field pointer for a heap offset and raised "Null or invalid raw pointer dereference".
+        // The exact-byte-count form still means "the field's DECLARED width", so the content is padded
+        // with NULs or cut to it; the managed slot holds the content and has no padding of its own.
+        if Ctx.IntRegs[Instr.Src1] < 0 then
+        begin
+          Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
           Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
-        end
-        // ⛔ THE RAW THIRD KIND, WHICH THIS ARM ALONE DID NOT KNOW. bcRefLoadInt/Float learned it and
-        // say so in the note above - "the tag is IN the value, so the question is answered here, where
-        // every path that produces one arrives" - and the STRING arm was never visited. A BYREF cast
-        // written "Operator = *This.p" over a CAllocate'd ZString hands back a correctly tagged raw
-        // address, and this decoded it as a packed array pointer: "Null or invalid pointer
-        // dereference, address 4611686018427387944". Text at a raw address is a C string.
-        else if (PtrAddr and RAWPTR_TAG) <> 0 then
-          Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
-        else
-        begin
-          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
-          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[PtrOffset];
-        end;
-      end;
-    16: // bcRefStoreInt
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if PtrAddr < 0 then
-        begin
-          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          RecSetFieldInt(Rec, RecSlot, Ctx.IntRegs[Instr.Src2]);
-        end
-        // The raw-address kind - see the note in bcRefLoadInt above. The WRITE half must know it too,
-        // or "**pp = 5" stores into a nonexistent array while "*p = 5" works.
-        else if (PtrAddr and RAWPTR_TAG) <> 0 then
-          RawStoreInt(PtrAddr, 0, Ctx.IntRegs[Instr.Src2])
-        else
-        begin
-          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
-          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above. The
-          // WRITE half needs it too, or "*Cast(ULongInt Ptr, @d) = bits" raises where the read works.
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          // ⭐ A PACKED ARRAY IS CONTIGUOUS BYTES on the write side too: Immediate carries the width the
-          // store was written at, so "*Cast(ULong Ptr, @a(4)) = &h11223344" fills a(4)..a(7). Guard m884.
-          if FArrays[ArrayIdx].ElemWidth > 0 then
+          if Instr.Immediate >= 2 then
           begin
-            if PtrOffset >= FArrays[ArrayIdx].TotalSize then
-              raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-            WritePackedBytes(ArrayIdx, PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate,
-                             Ctx.IntRegs[Instr.Src2]);
-          end
-          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-            ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2])
-          else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
-            PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
-          else
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        end;
-      end;
-    17: // bcRefStoreFloat
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if PtrAddr < 0 then
-        begin
-          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
-          RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
+            if Length(Ctx.StringRegs[Instr.Dest]) > Instr.Immediate - 2 then
+              Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Dest], 1, Instr.Immediate - 2)
+            else if Length(Ctx.StringRegs[Instr.Dest]) < Instr.Immediate - 2 then
+              Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Dest] +
+                StringOfChar(#0, Instr.Immediate - 2 - Length(Ctx.StringRegs[Instr.Dest]));
+          end;
         end
-        // The raw-address kind - see the note in bcRefLoadInt above.
-        else if (PtrAddr and RAWPTR_TAG) <> 0 then
-          RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
+        else if Instr.Immediate = -1 then
+          Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
+        // ⭐ ...and the THIRD domain: a positive address with no RAWPTR_TAG is a PACKED ARRAY pointer,
+        // which is what "@foo(0)" yields. See PtrDomainLoadZStr. DIVERGENZE 127.
+        // ⚠️ ...and NOT for address 0, which has a DEFINED answer of its own further down (fbc's string
+        // runtime tests the pointer, so a null ZSTRING reads as the empty string). Gated on non-zero so
+        // that rule keeps its own path, exactly as it had it.
+        else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
+          Ctx.StringRegs[Instr.Dest] := PtrDomainLoadZStr(Ctx, Ctx.IntRegs[Instr.Src1],
+                                          Instr.Immediate = 1,
+                                          Ord(Instr.Immediate >= 2) * (Instr.Immediate - 2))
+        else if Instr.Immediate >= 2 then
+          Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
         else
+          Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
+      51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING,
+          // Imm -1 a MANAGED STRING CELL ("String Ptr" - see RawStrCellSet).
+        // ...and the write half of the same discrimination: a negative address is the MANAGED field
+        // itself, so the characters go into its slot rather than into bytes that do not exist.
+        if Ctx.IntRegs[Instr.Src1] < 0 then
         begin
-          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
-          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
-            FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2]
-          else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-            PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Ctx.FloatRegs[Instr.Src2]
-          else
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-        end;
-      end;
-    18: // bcRefStoreString - Imm 1 = the pointee is a WSTRING (only consulted for a RAW address)
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if PtrAddr < 0 then
-        begin
-          Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+          Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
           Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
         end
-        // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
-        // or LSET on such a UDT reads its buffer and then stores into a nonexistent array.
-        else if (PtrAddr and RAWPTR_TAG) <> 0 then
-          RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
+        else if Instr.Immediate = -1 then
+          RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
+        else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
+          PtrDomainStoreZStr(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
+                             Instr.Immediate = 1)
         else
-        begin
-          ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
-          PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-          if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
-            raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-          FArrays[ArrayIdx].StringData[PtrOffset] := Ctx.StringRegs[Instr.Src2];
-        end;
-      end;
-    19: // bcRefAddrField — pack a record-field pointer from a handle (Src1) and slot (Immediate)
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];   // record handle (may carry SHARED_REC_FLAG)
-        Ctx.IntRegs[Instr.Dest] := RECPTR_TAG or (PtrAddr and SHARED_REC_FLAG) or
-          (((PtrAddr and SHARED_REC_MASK) and RECPTR_INDEX_MASK) shl RECPTR_SLOT_BITS) or
-          (Int64(Instr.Immediate) and RECPTR_SLOT_MASK);
-      end;
-    // FreeBASIC raw byte heap (Allocate family).
-    20: Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                              // bcRawAlloc
-    21: RawFree(Ctx.IntRegs[Instr.Src1]);                                                          // bcRawFree
-    22: Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);   // bcRawRealloc
-    // ⛔ A NEGATIVE ADDRESS IS NOT RAW MEMORY: it is a RECORD-FIELD pointer (RECPTR_TAG, bit 63), what
-    // "@obj.field" yields for a managed record. bcRefLoadInt has told the three domains apart for a
-    // while - its own comment says "the tag is IN the value, so the question is answered here, where
-    // every path that produces one arrives" - and the RAW arm never learnt the same thing. So
-    // "@a.i" put in a pointer VARIABLE worked and the same address put in a pointer FIELD of another
-    // UDT died on "Null or invalid raw pointer dereference": the compiler classifies a pointer FIELD as
-    // raw and emits this opcode, and only the value knows better. Measured with a 5-variant deck: the
-    // combination "record-field pointer inside a record field" was the only one that broke.
-    23: // bcRawLoadInt
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if (PtrAddr and RAWPTR_TAG) <> 0 then
-          Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)   // a real raw address: it carries the WIDTH
-        else
-          Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr, Instr.Immediate);
-      end;
-    24: // bcRawLoadFloat
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if (PtrAddr and RAWPTR_TAG) <> 0 then
-          Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)
-        else
-          Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr);
-      end;
-    // The WRITE half of the same rule, and it must be here too - "*g.pi = 33" through a pointer FIELD
-    // holding "@obj.field" wrote into a nonexistent raw block while the READ, once fixed, worked.
-    25: // bcRawStoreInt
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if (PtrAddr and RAWPTR_TAG) <> 0 then
-          RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
-        else
-          PtrDomainStoreInt(Ctx, PtrAddr, Ctx.IntRegs[Instr.Src2]);
-      end;
-    26: // bcRawStoreFloat
-      begin
-        PtrAddr := Ctx.IntRegs[Instr.Src1];
-        if (PtrAddr and RAWPTR_TAG) <> 0 then
-          RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])
-        else
-          PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2]);
-      end;
-    31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
-      begin
-        RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-        Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
-      end;
-    32: // bcRawMemMove - FB_MEMMOVE(dst, src, bytes); overlap-safe
-      begin
-        RawMemCopy(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-        Ctx.IntRegs[Instr.Dest] := Ctx.IntRegs[Instr.Src1];
-      end;
-    33: // bcRawClear - CLEAR(dst, value, bytes)
-      RawClear(Ctx, Ctx.IntRegs[Instr.Src1], Byte(Ctx.IntRegs[Instr.Src2]), PtrUInt(Ctx.IntRegs[Instr.Immediate]));
-    50: // bcRawLoadZStr - Dest(str) = C string at RawAddr(IntRegs[Src1]); Imm 1 = WSTRING (wide cells).
-        // Imm -1 is a MANAGED STRING CELL ("String Ptr"), not text in the heap: see RawStrCellGet.
-        // Immediate >= 2 asks for EXACTLY (Immediate - 2) bytes instead of "up to the terminator": that
-        // is what a fixed-length string FIELD of a UDT laid over raw memory is - n bytes, terminator or
-        // not, which is why "As String*5 sig" over "GIF89a" reads "GIF89" and misses a character.
-      // ⭐ A NEGATIVE address is not raw memory at all: it is a RECORD-FIELD pointer (RECPTR_TAG,
-      // bit 63), which is what "@obj.field" yields for a MANAGED record. A raw byte address carries
-      // RAWPTR_TAG (bit 62) and so is never negative - the two domains are told apart here exactly as
-      // bcRefLoad*/bcRefStore* already tell them apart. Without this "*Cast(ZString Ptr, @_data)",
-      // which is how fbc's OWN udt-zstring reference implementation reads a fixed-length field, took a
-      // field pointer for a heap offset and raised "Null or invalid raw pointer dereference".
-      // The exact-byte-count form still means "the field's DECLARED width", so the content is padded
-      // with NULs or cut to it; the managed slot holds the content and has no padding of its own.
-      if Ctx.IntRegs[Instr.Src1] < 0 then
-      begin
-        Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
-        Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
-        if Instr.Immediate >= 2 then
-        begin
-          if Length(Ctx.StringRegs[Instr.Dest]) > Instr.Immediate - 2 then
-            Ctx.StringRegs[Instr.Dest] := Copy(Ctx.StringRegs[Instr.Dest], 1, Instr.Immediate - 2)
-          else if Length(Ctx.StringRegs[Instr.Dest]) < Instr.Immediate - 2 then
-            Ctx.StringRegs[Instr.Dest] := Ctx.StringRegs[Instr.Dest] +
-              StringOfChar(#0, Instr.Immediate - 2 - Length(Ctx.StringRegs[Instr.Dest]));
-        end;
-      end
-      else if Instr.Immediate = -1 then
-        Ctx.StringRegs[Instr.Dest] := RawStrCellGet(Ctx.IntRegs[Instr.Src1])
-      // ⭐ ...and the THIRD domain: a positive address with no RAWPTR_TAG is a PACKED ARRAY pointer,
-      // which is what "@foo(0)" yields. See PtrDomainLoadZStr. DIVERGENZE 127.
-      // ⚠️ ...and NOT for address 0, which has a DEFINED answer of its own further down (fbc's string
-      // runtime tests the pointer, so a null ZSTRING reads as the empty string). Gated on non-zero so
-      // that rule keeps its own path, exactly as it had it.
-      else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
-        Ctx.StringRegs[Instr.Dest] := PtrDomainLoadZStr(Ctx, Ctx.IntRegs[Instr.Src1],
-                                        Instr.Immediate = 1,
-                                        Ord(Instr.Immediate >= 2) * (Instr.Immediate - 2))
-      else if Instr.Immediate >= 2 then
-        Ctx.StringRegs[Instr.Dest] := RawLoadBytesVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate - 2)
-      else
-        Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Ctx.IntRegs[Instr.Src1], Instr.Immediate = 1);
-    51: // bcRawStoreZStr - StringRegs[Src2] chars + NUL -> RawAddr(IntRegs[Src1]); Imm 1 = WSTRING,
-        // Imm -1 a MANAGED STRING CELL ("String Ptr" - see RawStrCellSet).
-      // ...and the write half of the same discrimination: a negative address is the MANAGED field
-      // itself, so the characters go into its slot rather than into bytes that do not exist.
-      if Ctx.IntRegs[Instr.Src1] < 0 then
-      begin
-        Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
-        Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
-      end
-      else if Instr.Immediate = -1 then
-        RawStrCellSet(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2])
-      else if (Ctx.IntRegs[Instr.Src1] <> 0) and ((Ctx.IntRegs[Instr.Src1] and RAWPTR_TAG) = 0) then
-        PtrDomainStoreZStr(Ctx, Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2],
-                           Instr.Immediate = 1)
-      else
-        RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
-    34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
-      begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
-             // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
-             // arg from the UNMODIFIED table before any assignment. Src1=param id, Imm=arg id.
-        if (Instr.Src1 >= 0) and (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
-        begin
-          // Both ids are logical. The ARGUMENT in particular may be a proc-local array being passed
-          // on, so it has to name this context's copy and not the dead compile-time slot.
-          ArrayIdx := Ctx.ArrMap[Instr.Src1];
-          LinearIdx := Ctx.ArrMap[Instr.Immediate];
-          // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
-          if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);
-          if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
-            SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := LinearIdx;
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
-          // ⭐ The ONE managed copy of the whole cycle, and it is the one that is genuinely a second
-          // reference: the parameter is about to share the argument's storage. The SAVE of what the
-          // parameter slot held is deferred to bcArrayBindApply, where it becomes a MOVE - see
-          // TArrayBindEntry and MoveArrayStorage.
-          AliasArrayStorage(FArrays[LinearIdx],
-                            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);   // the arg, captured now
-          Inc(Ctx.ArrayBindTop);
-          NoteDescNoChange;   // phase one only SNAPSHOTS: no slot's storage moved
-        end;
-      end;
-    49: // bcArrayBindInd - PHASE 1 bind whose arg is a UDT ARRAY MEMBER: its FArrays handle is only known at
-      begin  // runtime (per instance), so it arrives in a register instead of an immediate. Src1=param id,
-             // Src2=handle reg. Always pushes a save-stack entry — bcArrayBindApply commits a FIXED count and
-             // bcArrayUnbind pops LIFO by SlotId, so skipping a push here would desynchronize both.
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
-        if Instr.Src1 >= 0 then
-        begin
-          ArrayIdx := Ctx.ArrMap[Instr.Src1];
-          if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);  // grow AFTER reading the handle
-          if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
-            SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;   // the save is deferred to Apply
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+          RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
+      34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
+        begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
+               // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
+               // arg from the UNMODIFIED table before any assignment. Src1=param id, Imm=arg id.
+          if (Instr.Src1 >= 0) and (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
           begin
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;
-            AliasArrayStorage(FArrays[PtrAddr],
-                              Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);  // alias the member's storage
+            // Both ids are logical. The ARGUMENT in particular may be a proc-local array being passed
+            // on, so it has to name this context's copy and not the dead compile-time slot.
+            ArrayIdx := Ctx.ArrMap[Instr.Src1];
+            LinearIdx := Ctx.ArrMap[Instr.Immediate];
+            // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
+            if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);
+            if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
+              SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := LinearIdx;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
+            // ⭐ The ONE managed copy of the whole cycle, and it is the one that is genuinely a second
+            // reference: the parameter is about to share the argument's storage. The SAVE of what the
+            // parameter slot held is deferred to bcArrayBindApply, where it becomes a MOVE - see
+            // TArrayBindEntry and MoveArrayStorage.
+            AliasArrayStorage(FArrays[LinearIdx],
+                              Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);   // the arg, captured now
+            Inc(Ctx.ArrayBindTop);
+            NoteDescNoChange;   // phase one only SNAPSHOTS: no slot's storage moved
+          end;
+        end;
+      49: // bcArrayBindInd - PHASE 1 bind whose arg is a UDT ARRAY MEMBER: its FArrays handle is only known at
+        begin  // runtime (per instance), so it arrives in a register instead of an immediate. Src1=param id,
+               // Src2=handle reg. Always pushes a save-stack entry — bcArrayBindApply commits a FIXED count and
+               // bcArrayUnbind pops LIFO by SlotId, so skipping a push here would desynchronize both.
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
+          if Instr.Src1 >= 0 then
+          begin
+            ArrayIdx := Ctx.ArrMap[Instr.Src1];
+            if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);  // grow AFTER reading the handle
+            if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
+              SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;   // the save is deferred to Apply
+            if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+            begin
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;
+              AliasArrayStorage(FArrays[PtrAddr],
+                                Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);  // alias the member's storage
+            end
+            else
+            begin  // handle < 1 = member array never allocated: bind an EMPTY array (UBOUND = -1), and set
+                   // ArgId = -1 so unbind performs no copy-back (there is no caller slot to write to).
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := -1;
+              ClearArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);
+            end;
+            Inc(Ctx.ArrayBindTop);
+          end;
+        end;
+      36: // bcArrayBindApply - commit the top N pending binds (Immediate=N): alias each param slot to its
+        begin  // snapshotted arg. All snapshots were captured (in phase 1) from the unmodified table.
+          for I := Ctx.ArrayBindTop - Instr.Immediate to Ctx.ArrayBindTop - 1 do
+            if (I >= 0) and (Ctx.ArrayBindStack[I].SlotId <= High(FArrays)) then
+            begin
+              // Two MOVES and no reference count: the parameter slot's old value goes to Saved, the
+              // snapshot goes into the slot. The snapshot's reference - taken once, at bind - is what
+              // the slot now owns, and unbind releases it. SnapData remembers which buffer that was,
+              // because the Snapshot record owns nothing after this.
+              Ctx.ArrayBindStack[I].SnapData := ArrayBankData(Ctx.ArrayBindStack[I].Snapshot);
+              MoveArrayStorage(FArrays[Ctx.ArrayBindStack[I].SlotId], Ctx.ArrayBindStack[I].Saved);
+              MoveArrayStorage(Ctx.ArrayBindStack[I].Snapshot, FArrays[Ctx.ArrayBindStack[I].SlotId]);
+              Ctx.ArrayBindStack[I].Applied := True;
+              NoteDescSlot(Ctx.ArrayBindStack[I].SlotId);   // this slot, and only this slot, moved
+            end;
+        end;
+      35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
+        begin
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];
+          if (Ctx.ArrayBindTop > 0) and (Ctx.ArrayBindStack[Ctx.ArrayBindTop - 1].SlotId = ArrayIdx) then
+          begin
+            Dec(Ctx.ArrayBindTop);
+            // Propagate the callee's final array back to the caller's slot ONLY if a REDIM [PRESERVE]
+            // reallocated the param's storage — detected by its data no longer sharing the reference we
+            // snapshotted from the arg at bind time. Without a resize the caller already sees the writes via
+            // the shared reference, and copying would be wrong: in deep recursion the arg slot may have been
+            // rebound at an outer level (merge sort's swapped a()/b()), so an unconditional copy corrupts it.
+            // ⛔ ONLY IF THE BIND WAS APPLIED. The save is deferred to Apply now, so an entry that never
+            // reached it holds nothing and the slot was never overwritten: restoring would install an
+            // EMPTY array over the live one. The old eager copy got this case right by accident.
+            if Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied then
+            begin
+              if (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId >= 0) and
+                 (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <= High(FArrays)) and
+                 (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <> ArrayIdx) and
+                 not ArrayDataStillAt(FArrays[ArrayIdx], Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData) then
+                FArrays[Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId] := FArrays[ArrayIdx];
+              // The move releases the alias (Finalize inside) and hands the slot its own value back;
+              // Saved is left owning nothing, so the entry is ready for reuse with no explicit clearing.
+              MoveArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved, FArrays[ArrayIdx]);
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
+              // Both slots the branch above can write: the parameter always, and the argument when a
+              // REDIM inside the callee moved the storage. Marking the argument unconditionally is
+              // one slot too many at worst, which is the safe direction here.
+              NoteDescSlot(ArrayIdx);
+              NoteDescSlot(Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId);
+            end;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData := nil;
+          end;
+        end;
+      27: // bcArrayRedimPush - push one bound onto the pending REDIM list (Immediate bit0 = it is a
+          // RUNTIME lower bound -> the parallel LB list; otherwise an upper bound).
+        begin
+          if (Instr.Immediate and 1) <> 0 then
+          begin
+            SetLength(FRedimPendingLBs, Length(FRedimPendingLBs) + 1);
+            FRedimPendingLBs[High(FRedimPendingLBs)] := Ctx.IntRegs[Instr.Src1];
           end
           else
-          begin  // handle < 1 = member array never allocated: bind an EMPTY array (UBOUND = -1), and set
-                 // ArgId = -1 so unbind performs no copy-back (there is no caller slot to write to).
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := -1;
-            ClearArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);
+          begin
+            SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);
+            FRedimPendingUBs[High(FRedimPendingUBs)] := Ctx.IntRegs[Instr.Src1];
           end;
-          Inc(Ctx.ArrayBindTop);
         end;
-      end;
-    36: // bcArrayBindApply - commit the top N pending binds (Immediate=N): alias each param slot to its
-      begin  // snapshotted arg. All snapshots were captured (in phase 1) from the unmodified table.
-        for I := Ctx.ArrayBindTop - Instr.Immediate to Ctx.ArrayBindTop - 1 do
-          if (I >= 0) and (Ctx.ArrayBindStack[I].SlotId <= High(FArrays)) then
-          begin
-            // Two MOVES and no reference count: the parameter slot's old value goes to Saved, the
-            // snapshot goes into the slot. The snapshot's reference - taken once, at bind - is what
-            // the slot now owns, and unbind releases it. SnapData remembers which buffer that was,
-            // because the Snapshot record owns nothing after this.
-            Ctx.ArrayBindStack[I].SnapData := ArrayBankData(Ctx.ArrayBindStack[I].Snapshot);
-            MoveArrayStorage(FArrays[Ctx.ArrayBindStack[I].SlotId], Ctx.ArrayBindStack[I].Saved);
-            MoveArrayStorage(Ctx.ArrayBindStack[I].Snapshot, FArrays[Ctx.ArrayBindStack[I].SlotId]);
-            Ctx.ArrayBindStack[I].Applied := True;
-            NoteDescSlot(Ctx.ArrayBindStack[I].SlotId);   // this slot, and only this slot, moved
-          end;
-      end;
-    35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];
-        if (Ctx.ArrayBindTop > 0) and (Ctx.ArrayBindStack[Ctx.ArrayBindTop - 1].SlotId = ArrayIdx) then
+      28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper (and any lower) bounds
         begin
-          Dec(Ctx.ArrayBindTop);
-          // Propagate the callee's final array back to the caller's slot ONLY if a REDIM [PRESERVE]
-          // reallocated the param's storage — detected by its data no longer sharing the reference we
-          // snapshotted from the arg at bind time. Without a resize the caller already sees the writes via
-          // the shared reference, and copying would be wrong: in deep recursion the arg slot may have been
-          // rebound at an outer level (merge sort's swapped a()/b()), so an unconditional copy corrupts it.
-          // ⛔ ONLY IF THE BIND WAS APPLIED. The save is deferred to Apply now, so an entry that never
-          // reached it holds nothing and the slot was never overwritten: restoring would install an
-          // EMPTY array over the live one. The old eager copy got this case right by accident.
-          if Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied then
-          begin
-            if (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId >= 0) and
-               (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <= High(FArrays)) and
-               (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <> ArrayIdx) and
-               not ArrayDataStillAt(FArrays[ArrayIdx], Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData) then
-              FArrays[Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId] := FArrays[ArrayIdx];
-            // The move releases the alias (Finalize inside) and hands the slot its own value back;
-            // Saved is left owning nothing, so the entry is ready for reuse with no explicit clearing.
-            MoveArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved, FArrays[ArrayIdx]);
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
-            // Both slots the branch above can write: the parameter always, and the argument when a
-            // REDIM inside the callee moved the storage. Marking the argument unconditionally is
-            // one slot too many at worst, which is the safe direction here.
-            NoteDescSlot(ArrayIdx);
-            NoteDescSlot(Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId);
-          end;
-          Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData := nil;
+          RedimArrayN(Ctx.ArrMap[Instr.Src1], FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
+          SetLength(FRedimPendingUBs, 0);
+          SetLength(FRedimPendingLBs, 0);
         end;
-      end;
-    27: // bcArrayRedimPush - push one bound onto the pending REDIM list (Immediate bit0 = it is a
-        // RUNTIME lower bound -> the parallel LB list; otherwise an upper bound).
-      begin
-        if (Instr.Immediate and 1) <> 0 then
+      29: // bcArrayIdxPush - push one (already lower-bound-adjusted) index for a runtime multi-dim access
         begin
-          SetLength(FRedimPendingLBs, Length(FRedimPendingLBs) + 1);
-          FRedimPendingLBs[High(FRedimPendingLBs)] := Ctx.IntRegs[Instr.Src1];
-        end
-        else
-        begin
-          SetLength(FRedimPendingUBs, Length(FRedimPendingUBs) + 1);
-          FRedimPendingUBs[High(FRedimPendingUBs)] := Ctx.IntRegs[Instr.Src1];
+          // ⛔ GROW, NEVER SHRINK. This was SetLength(+1) per push and SetLength(0) per resolve - a
+          // reallocation and a free on every element access of a runtime-sized matrix, which measured
+          // 279 ns against 5 ns for the same read on a fixed-size array. The buffer now reaches the
+          // program's widest access on its first use and is never touched again. See TExecutionContext.
+          if Ctx.IdxPendingCount >= Length(Ctx.IdxPending) then
+            SetLength(Ctx.IdxPending, 8 + 2 * Length(Ctx.IdxPending));
+          Ctx.IdxPending[Ctx.IdxPendingCount] := Ctx.IntRegs[Instr.Src1];
+          Inc(Ctx.IdxPendingCount);
         end;
-      end;
-    28: // bcArrayRedimN - commit a multi-dimensional REDIM using the pushed upper (and any lower) bounds
-      begin
-        RedimArrayN(Ctx.ArrMap[Instr.Src1], FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
-        SetLength(FRedimPendingUBs, 0);
-        SetLength(FRedimPendingLBs, 0);
-      end;
-    29: // bcArrayIdxPush - push one (already lower-bound-adjusted) index for a runtime multi-dim access
-      begin
-        // ⛔ GROW, NEVER SHRINK. This was SetLength(+1) per push and SetLength(0) per resolve - a
-        // reallocation and a free on every element access of a runtime-sized matrix, which measured
-        // 279 ns against 5 ns for the same read on a fixed-size array. The buffer now reaches the
-        // program's widest access on its first use and is never touched again. See TExecutionContext.
-        if Ctx.IdxPendingCount >= Length(Ctx.IdxPending) then
-          SetLength(Ctx.IdxPending, 8 + 2 * Length(Ctx.IdxPending));
-        Ctx.IdxPending[Ctx.IdxPendingCount] := Ctx.IntRegs[Instr.Src1];
-        Inc(Ctx.IdxPendingCount);
-      end;
-    30: // bcArrayIdxResolve - linear row-major index from the array's CURRENT dimensions: Dest=int, Src1=array id.
-        // Matches the compile-time formula Σ idx[d] * (Π Dimensions[d+1..]) but with runtime sizes (REDIM).
-      begin
-        ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
-        LinearIdx := 0;
-        if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
-          for i := 0 to Ctx.IdxPendingCount - 1 do
-          begin
-            ProdDims := 1;
-            for ArrLowerBound := i + 1 to High(FArrays[ArrayIdx].Dimensions) do
-              ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[ArrLowerBound];
-            LinearIdx := LinearIdx + Ctx.IdxPending[i] * ProdDims;
-          end;
-        Ctx.IntRegs[Instr.Dest] := LinearIdx;
-        Ctx.IdxPendingCount := 0;   // the buffer stays allocated: see bcArrayIdxPush
-      end;
-    // --- UDT array members: indirect access, array handle read from a register (Src1). A handle < 1
-    //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
-    37: // bcArrayLoadIndInt
-      begin
-        // ⛔ AN ELEMENT INDEX IS RELATIVE TO THE ARRAY'S LOWER BOUND, and a member array used to be
-        // documented as "0-based (v1), so no lower-bound subtraction is needed" - true only while
-        // nothing could give one a non-zero bound. "ReDim obj.field(3 To 5)" now can (the member arm
-        // of ProcessRedim threw its lower bound away until 1 Sep 2026), so the subtraction is real.
-        // ⭐ It belongs HERE and not in the SSA: this opcode already holds the descriptor, so it costs
-        // one read and one subtract instead of two extra instructions per access - and it is the
-        // identity for every array whose lower bound is 0, which is all of them today.
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
-          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[PtrAddr], LinearIdx)
-        else
-          Ctx.IntRegs[Instr.Dest] := 0;
-      end;
-    38: // bcArrayLoadIndFloat
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
-          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
-        else
-          Ctx.FloatRegs[Instr.Dest] := 0.0;
-      end;
-    39: // bcArrayLoadIndString
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
-          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
-        else
-          Ctx.StringRegs[Instr.Dest] := '';
-      end;
-    40: // bcArrayStoreIndInt (Dest = value register, READ)
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
-          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          ArrSetIntAt(PtrAddr, LinearIdx, Ctx.IntRegs[Instr.Dest]);
-      end;
-    41: // bcArrayStoreIndFloat (Dest = value register, READ)
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
-          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
-      end;
-    42: // bcArrayStoreIndString (Dest = value register, READ)
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
-          LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-          FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
-      end;
-    43: // bcArrayIdxResolveInd - member multi-dim linear index from the handle array's CURRENT dimensions
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]);
-        LinearIdx := 0;
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
-          for i := 0 to Ctx.IdxPendingCount - 1 do
-          begin
-            ProdDims := 1;
-            for ArrLowerBound := i + 1 to High(FArrays[PtrAddr].Dimensions) do
-              ProdDims := ProdDims * FArrays[PtrAddr].Dimensions[ArrLowerBound];
-            // ...and the same subtraction per dimension, for the same reason as the element opcodes.
-            ArrLowerBound := 0;
-            if i <= High(FArrays[PtrAddr].LowerBounds) then
-              ArrLowerBound := FArrays[PtrAddr].LowerBounds[i];
-            LinearIdx := LinearIdx + (Ctx.IdxPending[i] - ArrLowerBound) * ProdDims;
-          end;
-        Ctx.IntRegs[Instr.Dest] := LinearIdx;
-        Ctx.IdxPendingCount := 0;   // the buffer stays allocated: see bcArrayIdxPush
-      end;
-    44: // bcMemberArrayRedim - REDIM obj.field(...): allocate the member's FArrays entry lazily, size it
-      begin
-        Rec := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]);
-        RecSlot := (Instr.Immediate shr 8) and $FFFF;   // field int-slot within the record
-        PtrOffset := (Instr.Immediate shr 4) and $F;    // element type (0=int, 1=float, 2=string)
-        if Assigned(Rec) then
+      30: // bcArrayIdxResolve - linear row-major index from the array's CURRENT dimensions: Dest=int, Src1=array id.
+          // Matches the compile-time formula Σ idx[d] * (Π Dimensions[d+1..]) but with runtime sizes (REDIM).
         begin
-          PtrAddr := RecFieldInt(Rec, RecSlot);
-          if (PtrAddr < 1) or (PtrAddr > High(FArrays)) then
-          begin
-            if Length(FArrays) = 0 then GrowArrays(1);   // keep id 0 reserved as the "unallocated" sentinel
-            PtrAddr := Length(FArrays);
-            GrowArrays(PtrAddr + 1);
-            FArrays[PtrAddr].ElementType := PtrOffset;
-            FArrays[PtrAddr].DimCount := 0;
-            FArrays[PtrAddr].TotalSize := 0;
-            SetLength(FArrays[PtrAddr].Dimensions, 0);
-            SetLength(FArrays[PtrAddr].LowerBounds, 0);
-            RecSetFieldInt(Rec, RecSlot, PtrAddr);
-          end;
-          RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
-          if GArrPrivDiag then
-            WriteLn(ErrOutput, Format('[arrpriv] MEMBRO rec=%p slot=%d -> phys %d size=%d',
-                    [Pointer(Rec), RecSlot, PtrAddr, FArrays[PtrAddr].TotalSize]));
-        end
-        else if GArrPrivDiag then
-          WriteLn(ErrOutput, Format('[arrpriv] MEMBRO ⛔ record NULLO (handle=%d slot=%d)',
-                  [Ctx.IntRegs[Instr.Src1], RecSlot]));
-        SetLength(FRedimPendingUBs, 0);
-        SetLength(FRedimPendingLBs, 0);
-      end;
-    45: // bcArrayLBoundInd - LBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
-           (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].LowerBounds)) then
-          Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
-        else
-          Ctx.IntRegs[Instr.Dest] := 0;
-      end;
-    46: // bcArrayUBoundInd - UBOUND of a UDT array member (upper = lower + size - 1; -1 if unallocated)
-      begin
-        PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-        if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
-           (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].Dimensions)) then
-          Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
-                                     + FArrays[PtrAddr].Dimensions[LinearIdx] - 1
-        else
-          Ctx.IntRegs[Instr.Dest] := -1;
-      end;
-    47: // bcArrayCopyContents - deep-copy FArrays[Src1] <- FArrays[Src2] (value semantics of an array member)
-      begin
-        DestArr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
-        if (DestArr >= 1) and (DestArr <= High(FArrays)) and
-           (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
-        begin
-          FArrays[DestArr].ElementType := FArrays[PtrAddr].ElementType;
-          FArrays[DestArr].DimCount    := FArrays[PtrAddr].DimCount;
-          FArrays[DestArr].TotalSize   := FArrays[PtrAddr].TotalSize;
-          FArrays[DestArr].Dimensions  := Copy(FArrays[PtrAddr].Dimensions);
-          FArrays[DestArr].LowerBounds := Copy(FArrays[PtrAddr].LowerBounds);
-          FArrays[DestArr].IntData     := Copy(FArrays[PtrAddr].IntData);
-          FArrays[DestArr].FloatData   := Copy(FArrays[PtrAddr].FloatData);
-          FArrays[DestArr].StringData  := Copy(FArrays[PtrAddr].StringData);
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];   // logical -> this context's physical slot
+          LinearIdx := 0;
+          if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
+            for i := 0 to Ctx.IdxPendingCount - 1 do
+            begin
+              ProdDims := 1;
+              for ArrLowerBound := i + 1 to High(FArrays[ArrayIdx].Dimensions) do
+                ProdDims := ProdDims * FArrays[ArrayIdx].Dimensions[ArrLowerBound];
+              LinearIdx := LinearIdx + Ctx.IdxPending[i] * ProdDims;
+            end;
+          Ctx.IntRegs[Instr.Dest] := LinearIdx;
+          Ctx.IdxPendingCount := 0;   // the buffer stays allocated: see bcArrayIdxPush
         end;
-      end;
-    48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
-      DeepCopyArrayRecords(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]),
-                                MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]), Instr.Immediate);
-  else
-    raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
+      // --- UDT array members: indirect access, array handle read from a register (Src1). A handle < 1
+      //     means the member was never allocated (REDIM not yet run): reads yield the default, stores drop. ---
+      37: // bcArrayLoadIndInt
+        begin
+          // ⛔ AN ELEMENT INDEX IS RELATIVE TO THE ARRAY'S LOWER BOUND, and a member array used to be
+          // documented as "0-based (v1), so no lower-bound subtraction is needed" - true only while
+          // nothing could give one a non-zero bound. "ReDim obj.field(3 To 5)" now can (the member arm
+          // of ProcessRedim threw its lower bound away until 1 Sep 2026), so the subtraction is real.
+          // ⭐ It belongs HERE and not in the SSA: this opcode already holds the descriptor, so it costs
+          // one read and one subtract instead of two extra instructions per access - and it is the
+          // identity for every array whose lower bound is 0, which is all of them today.
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+            LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+            Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[PtrAddr], LinearIdx)
+          else
+            Ctx.IntRegs[Instr.Dest] := 0;
+        end;
+      38: // bcArrayLoadIndFloat
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+            LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+            Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
+          else
+            Ctx.FloatRegs[Instr.Dest] := 0.0;
+        end;
+      39: // bcArrayLoadIndString
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+            LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+            Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
+          else
+            Ctx.StringRegs[Instr.Dest] := '';
+        end;
+      40: // bcArrayStoreIndInt (Dest = value register, READ)
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+            LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+            ArrSetIntAt(PtrAddr, LinearIdx, Ctx.IntRegs[Instr.Dest]);
+        end;
+      41: // bcArrayStoreIndFloat (Dest = value register, READ)
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+            LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+            FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+        end;
+      42: // bcArrayStoreIndString (Dest = value register, READ)
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+            LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
+            FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+        end;
+      43: // bcArrayIdxResolveInd - member multi-dim linear index from the handle array's CURRENT dimensions
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]);
+          LinearIdx := 0;
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+            for i := 0 to Ctx.IdxPendingCount - 1 do
+            begin
+              ProdDims := 1;
+              for ArrLowerBound := i + 1 to High(FArrays[PtrAddr].Dimensions) do
+                ProdDims := ProdDims * FArrays[PtrAddr].Dimensions[ArrLowerBound];
+              // ...and the same subtraction per dimension, for the same reason as the element opcodes.
+              ArrLowerBound := 0;
+              if i <= High(FArrays[PtrAddr].LowerBounds) then
+                ArrLowerBound := FArrays[PtrAddr].LowerBounds[i];
+              LinearIdx := LinearIdx + (Ctx.IdxPending[i] - ArrLowerBound) * ProdDims;
+            end;
+          Ctx.IntRegs[Instr.Dest] := LinearIdx;
+          Ctx.IdxPendingCount := 0;   // the buffer stays allocated: see bcArrayIdxPush
+        end;
+      44: // bcMemberArrayRedim - REDIM obj.field(...): allocate the member's FArrays entry lazily, size it
+        begin
+          Rec := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]);
+          RecSlot := (Instr.Immediate shr 8) and $FFFF;   // field int-slot within the record
+          PtrOffset := (Instr.Immediate shr 4) and $F;    // element type (0=int, 1=float, 2=string)
+          if Assigned(Rec) then
+          begin
+            PtrAddr := RecFieldInt(Rec, RecSlot);
+            if (PtrAddr < 1) or (PtrAddr > High(FArrays)) then
+            begin
+              if Length(FArrays) = 0 then GrowArrays(1);   // keep id 0 reserved as the "unallocated" sentinel
+              PtrAddr := Length(FArrays);
+              GrowArrays(PtrAddr + 1);
+              FArrays[PtrAddr].ElementType := PtrOffset;
+              FArrays[PtrAddr].DimCount := 0;
+              FArrays[PtrAddr].TotalSize := 0;
+              SetLength(FArrays[PtrAddr].Dimensions, 0);
+              SetLength(FArrays[PtrAddr].LowerBounds, 0);
+              RecSetFieldInt(Rec, RecSlot, PtrAddr);
+            end;
+            RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
+            if GArrPrivDiag then
+              WriteLn(ErrOutput, Format('[arrpriv] MEMBRO rec=%p slot=%d -> phys %d size=%d',
+                      [Pointer(Rec), RecSlot, PtrAddr, FArrays[PtrAddr].TotalSize]));
+          end
+          else if GArrPrivDiag then
+            WriteLn(ErrOutput, Format('[arrpriv] MEMBRO ⛔ record NULLO (handle=%d slot=%d)',
+                    [Ctx.IntRegs[Instr.Src1], RecSlot]));
+          SetLength(FRedimPendingUBs, 0);
+          SetLength(FRedimPendingLBs, 0);
+        end;
+      45: // bcArrayLBoundInd - LBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
+             (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].LowerBounds)) then
+            Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
+          else
+            Ctx.IntRegs[Instr.Dest] := 0;
+        end;
+      46: // bcArrayUBoundInd - UBOUND of a UDT array member (upper = lower + size - 1; -1 if unallocated)
+        begin
+          PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
+          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
+             (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].Dimensions)) then
+            Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
+                                       + FArrays[PtrAddr].Dimensions[LinearIdx] - 1
+          else
+            Ctx.IntRegs[Instr.Dest] := -1;
+        end;
+      47: // bcArrayCopyContents - deep-copy FArrays[Src1] <- FArrays[Src2] (value semantics of an array member)
+        begin
+          DestArr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
+          if (DestArr >= 1) and (DestArr <= High(FArrays)) and
+             (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
+          begin
+            FArrays[DestArr].ElementType := FArrays[PtrAddr].ElementType;
+            FArrays[DestArr].DimCount    := FArrays[PtrAddr].DimCount;
+            FArrays[DestArr].TotalSize   := FArrays[PtrAddr].TotalSize;
+            FArrays[DestArr].Dimensions  := Copy(FArrays[PtrAddr].Dimensions);
+            FArrays[DestArr].LowerBounds := Copy(FArrays[PtrAddr].LowerBounds);
+            FArrays[DestArr].IntData     := Copy(FArrays[PtrAddr].IntData);
+            FArrays[DestArr].FloatData   := Copy(FArrays[PtrAddr].FloatData);
+            FArrays[DestArr].StringData  := Copy(FArrays[PtrAddr].StringData);
+          end;
+        end;
+      48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
+        DeepCopyArrayRecords(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]),
+                                  MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]), Instr.Immediate);
+    else
+      raise Exception.CreateFmt('Unknown array opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
+    end;
+    // ⛔ AND AGAIN, AFTER THE WORK. The flag above says "the table is about to change"; this one says
+    // "it has changed". Both are needed because the rebuild that CONSUMES the flag also CLEARS it, and
+    // it runs on another thread: a worker that set the flag and then allocated its elements could have
+    // the flag cleared by a rebuild that ran between the two - publishing a descriptor with a NULL data
+    // pointer, which compiled code then dereferences.
+    // 📊 Found 21 Aug 2026 while giving proc-local arrays per-thread storage: four workers DIMming four
+    // different slots at once, and the guard program either read another thread's data or died in the
+    // JIT on `mov (%rdx,%rcx,8)` with rdx = 0. The window existed before - every worker DIMmed the same
+    // slot, so a stale entry was overwritten by the next DIM instead of staying null.
+    FArraysDirty := True;
+  finally
+    UnlockArrays;
   end;
-  // ⛔ AND AGAIN, AFTER THE WORK. The flag above says "the table is about to change"; this one says
-  // "it has changed". Both are needed because the rebuild that CONSUMES the flag also CLEARS it, and
-  // it runs on another thread: a worker that set the flag and then allocated its elements could have
-  // the flag cleared by a rebuild that ran between the two - publishing a descriptor with a NULL data
-  // pointer, which compiled code then dereferences.
-  // 📊 Found 21 Aug 2026 while giving proc-local arrays per-thread storage: four workers DIMming four
-  // different slots at once, and the guard program either read another thread's data or died in the
-  // JIT on `mov (%rdx,%rcx,8)` with rdx = 0. The window existed before - every worker DIMmed the same
-  // slot, so a stale entry was overwritten by the next DIM instead of staying null.
-  FArraysDirty := True;
 end;
 
 procedure TBytecodeVM.OutputWroteErr(Ctx: TExecutionContext);
