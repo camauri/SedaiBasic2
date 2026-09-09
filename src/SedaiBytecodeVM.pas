@@ -12438,20 +12438,27 @@ begin
   // of the whole run in SysGetMem under this SetLength, and the cost GREW with every row cleared -
   // "SetLength(FRetiredArrDesc, k+1)" is O(k), so the clear was quadratic and a 20 ms loop took minutes.
   // A DIM SHARED scalar is array-backed, so even "*p = sharedByte" in a pixel loop comes through here.
-  // ⚠️ Same length ⇒ SetLength does not move the buffer, so the pointer a worker holds stays valid and
-  // there is nothing to retire. The retire is for the case where the table must be REPLACED.
-  if FHasWorkers and (Length(FJitArrDesc) > 0) and (Length(FJitArrDesc) <> n * 4 + 4) then
+  // ⛔⛔ AND THE FIX IS NOT "SKIP THE RETIRE", IT IS "SKIP THE SetLength". Keeping the unconditional
+  // SetLength and only skipping the retire was tried and CRASHED retrogra's refresh thread inside this
+  // very procedure: SetLength to the SAME length still goes through ReallocMem, which is free to MOVE
+  // the block, and a worker holds @FJitArrDesc[0] until its own next call boundary. So the table is
+  // resized only when its length actually changes - and the retire, which exists for exactly that
+  // case, goes back inside that branch where it belongs.
+  Grew := Length(FJitArrDesc) <> n * 4 + 4;
+  if Grew then
   begin
-    SetLength(FRetiredArrDesc, Length(FRetiredArrDesc) + 1);
-    FRetiredArrDesc[High(FRetiredArrDesc)] := FJitArrDesc;   // the reference is what keeps it alive
-    FJitArrDesc := nil;                                      // so the SetLength below allocates fresh
+    if FHasWorkers and (Length(FJitArrDesc) > 0) then
+    begin
+      SetLength(FRetiredArrDesc, Length(FRetiredArrDesc) + 1);
+      FRetiredArrDesc[High(FRetiredArrDesc)] := FJitArrDesc;   // the reference is what keeps it alive
+      FJitArrDesc := nil;                                      // so the SetLength below allocates fresh
+    end;
+    SetLength(FJitArrDesc, n * 4 + 4);   // +4 so @FJitArrDesc[0] is always valid even with no arrays
   end;
   // ⛔ SETTLE THE OPERATION IN FLIGHT before reading the range: an ExecuteArrayOp that raised never
   // reached its marker, and this is where that is noticed (see the fields' note).
   FDescAllPending := FDescAllPending or FDescThisCall;
   FDescThisCall := False;
-  Grew := Length(FJitArrDesc) <> n * 4 + 4;
-  SetLength(FJitArrDesc, n * 4 + 4);   // +4 so @FJitArrDesc[0] is always valid even with no arrays
   // ⛔ The TABLE keeps its full length - ids are baked into compiled code and must stay in range -
   // but the WORK stops at the last block ever handed out. Everything past it has no storage, so its
   // entries are zero from the first allocation and nothing here would change them. See FPrivBlockHigh.
