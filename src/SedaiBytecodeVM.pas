@@ -773,6 +773,7 @@ type
       FArrays until after the value exists, which restores the original order exactly. }
     procedure ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
+    procedure GrowArrays(NewLen: Integer);   // resize FArrays with the descriptor lock held
     function ArrDescCount(const A: TArrayStorage): Int64;  // the count the COMPILED engines see
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
@@ -12380,6 +12381,30 @@ begin
     end;
 end;
 
+procedure TBytecodeVM.GrowArrays(NewLen: Integer);
+// ⛔⛔ GROWING THE ARRAY TABLE IS A RACE AGAINST THE DESCRIPTOR REBUILD, and it went unguarded because
+// the table only grows in four places, all of which look like ordinary single-threaded work: a DIM, the
+// two halves of an array BIND, and the first REDIM of a UDT's array member. But a WORKER rebuilds the
+// descriptor table under FArrDescLock and walks FArrays[a] while doing it - so a SetLength here moves
+// that buffer out from under it and the worker takes an access violation inside RebuildJitArrDesc.
+// 📊 Seen on retrogra's demo, which starts a refresh thread and then opens a message box (whose body
+// DIMs a local array). The lock is the same one the rebuild takes, so the two simply serialise.
+// ⚠️ Nothing here calls back into the VM, so this cannot deadlock: the lock is held for a SetLength.
+begin
+  if NewLen <= Length(FArrays) then Exit;
+  if not FHasWorkers then
+  begin
+    SetLength(FArrays, NewLen);   // no worker can be reading it: keep the single-threaded path free
+    Exit;
+  end;
+  EnterCriticalSection(FArrDescLock);
+  try
+    SetLength(FArrays, NewLen);
+  finally
+    LeaveCriticalSection(FArrDescLock);
+  end;
+end;
+
 function TBytecodeVM.ArrDescCount(const A: TArrayStorage): Int64;
 // ⛔⛔ THE COUNT THE COMPILED ENGINES SEE IS NOT THE NUMBER OF ELEMENTS - it is how many EIGHT-BYTE
 // cells the descriptor's IntData/FloatData pointer addresses. A narrow-typed array is packed in
@@ -14660,7 +14685,7 @@ begin
           WriteLn(ErrOutput, Format('[arrpriv] DIM ARR[%d] -> phys %d (ctx=%p)',
                   [Instr.Src1, ArrayIdx, Pointer(Ctx)]));
         if ArrayIdx >= Length(FArrays) then
-          SetLength(FArrays, ArrayIdx + 1);
+          GrowArrays(ArrayIdx + 1);
         // ⛔ A PRIVATE array is one storage PER CONTEXT, and every recursion level runs in the same
         // context: DIMming it here would destroy the values of the invocation that called us. Push
         // what is in the slot and start clean; FramePop puts it back. Copying the record is O(1) -
@@ -15193,7 +15218,7 @@ begin
           ArrayIdx := Ctx.ArrMap[Instr.Src1];
           LinearIdx := Ctx.ArrMap[Instr.Immediate];
           // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
-          if ArrayIdx > High(FArrays) then SetLength(FArrays, ArrayIdx + 1);
+          if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);
           if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
             SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
@@ -15217,7 +15242,7 @@ begin
         if Instr.Src1 >= 0 then
         begin
           ArrayIdx := Ctx.ArrMap[Instr.Src1];
-          if ArrayIdx > High(FArrays) then SetLength(FArrays, ArrayIdx + 1);  // grow AFTER reading the handle
+          if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);  // grow AFTER reading the handle
           if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
             SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
           Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
@@ -15426,9 +15451,9 @@ begin
           PtrAddr := RecFieldInt(Rec, RecSlot);
           if (PtrAddr < 1) or (PtrAddr > High(FArrays)) then
           begin
-            if Length(FArrays) = 0 then SetLength(FArrays, 1);   // keep id 0 reserved as the "unallocated" sentinel
+            if Length(FArrays) = 0 then GrowArrays(1);   // keep id 0 reserved as the "unallocated" sentinel
             PtrAddr := Length(FArrays);
-            SetLength(FArrays, PtrAddr + 1);
+            GrowArrays(PtrAddr + 1);
             FArrays[PtrAddr].ElementType := PtrOffset;
             FArrays[PtrAddr].DimCount := 0;
             FArrays[PtrAddr].TotalSize := 0;
