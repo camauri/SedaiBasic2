@@ -94,6 +94,12 @@ var
   // wants. SB_PP_LAX_CMP=1 puts the lenient answer back everywhere, on one binary.
   GPPStrictCmp: Boolean = False;
 
+  // A/B knobs on ONE binary, read once per program: SB_PP_NO_DEFSCOPE=1 never retires a block's
+  // #define (the behaviour before #define scoping existed), SB_PP_NO_TRUEFALSE=1 reads TRUE/FALSE in a
+  // #if as undeclared text again. SB_PP_DUMP=<file> writes the preprocessed program to <file>.
+  GPPNoDefScope: Boolean = False;
+  GPPNoTrueFalse: Boolean = False;
+
   // ⭐⭐⭐ THE SIZE OF A USER TYPE, ASKED OF THE COMPILER RATHER THAN GUESSED HERE.
   //
   // fbc's preprocessor IS its compiler, so "#assert sizeof( T ) = 16" is answered from the symbol
@@ -3093,11 +3099,32 @@ var
           else Toks.Add('0');
         end
         // ⭐ ...unless the SOURCE declares it as a Const with an integer value. See SourceConstValue.
+        // ⛔ A NEGATIVE value is TWO tokens. "-1" as one token is not a number to IsNum (it starts
+        // with '-') and ParsePrimary read it as 0 - so a "Const K = -1" compared EQUAL to 0 in a #if.
         else if SourceConstValue(id, ConstV) then
-          Toks.Add(IntToStr(ConstV))
+        begin
+          if ConstV < 0 then
+          begin
+            Toks.Add('-');
+            Toks.Add(IntToStr(QWord(-(ConstV + 1)) + 1));
+          end
+          else
+            Toks.Add(IntToStr(ConstV));
+        end
         // ...or with a STRING one, which that function declines by design. See SourceConstStr.
         else if SourceConstStr(id, ConstS) then
           Toks.Add(cPPStrTok + ConstS)
+        // ⭐ TRUE AND FALSE ARE fbc's INTRINSIC CONSTANTS, -1 and 0, and a #if knows them: measured,
+        // "#if -1 = TRUE" and "#if FALSE = 0" both take the branch, "#if 1 = TRUE" does not. Read as
+        // undeclared TEXT they tripped the type-mismatch refusal - compound/select_const2 compares a
+        // "#define DEFINITION TRUE" against TRUE (DIVERGENZE 213). A macro of that name wins, above.
+        else if (id = 'TRUE') and not GPPNoTrueFalse then
+        begin
+          Toks.Add('-');      // two tokens, for the reason given at SourceConstValue above
+          Toks.Add('1');
+        end
+        else if (id = 'FALSE') and not GPPNoTrueFalse then
+          Toks.Add('0')
         else
           // ⛔⛔ AN UNDEFINED IDENTIFIER IS ITS OWN NAME, AS TEXT - it is not 0, and reading it as 0
           // is what made "undeclaredid1 <> undeclaredid2" answer FALSE in fbc's own pp/assert while
@@ -4584,6 +4611,93 @@ var
     Inc(ScopedN);
   end;
 
+  { The block walk for #define scoping, over one EMITTED line - which may hold several lines of a
+    macro body, joined with cVirtualEOL.
+    ⛔⛔ It reads the line AFTER macro substitution, and that is the whole point. fbcunit's
+    "TEST( name )" expands to "... Sub name( )" and "END_TEST" to "End Sub": on the raw text neither
+    line opens or closes anything, so a "#define foo" inside two consecutive tests landed at module
+    level twice and was refused as a duplicate - 8 valid programs of fbc's own suite (DIVERGENZE
+    212). Counting the raw text also counted lines of a FALSE "#if" branch, which is not code.
+    ⛔ A miscount must fail toward KEEPING a define - that is what this code did before it existed -
+    so the depth is clamped at zero and names are dropped only when the depth falls BELOW the one
+    they were recorded at. }
+  procedure CountDefBlocks(const S: string);
+  var
+    k, Start: Integer;
+
+    procedure OneStatement(const Seg: string);
+    var T, W: string;
+    begin
+      T := TrimLeft(Seg);
+      if T = '' then Exit;
+      W := UpperFast(Copy(T, 1, 40));
+      // "Private Sub" / "Public Function": the visibility word is not the block.
+      if Copy(W, 1, 8) = 'PRIVATE ' then T := TrimLeft(Copy(T, 9, MaxInt))
+      else if Copy(W, 1, 7) = 'PUBLIC ' then T := TrimLeft(Copy(T, 8, MaxInt));
+      W := UpperFast(Copy(T, 1, 40));
+      if Copy(W, 1, 4) = 'END ' then
+      begin
+        if EndClosesDefBlock(Copy(W, 5, MaxInt)) and (DefDepth > 0) then Dec(DefDepth);
+      end
+      else if DefBlockCloser(W) then
+      begin
+        if DefDepth > 0 then Dec(DefDepth);
+      end
+      else if DefBlockOpener(W, T) then
+        Inc(DefDepth);
+    end;
+
+    { ⛔ Every STATEMENT of the line counts, not only the first. "r = 1 : CU_ASSERT( r )" expands to
+      "r = 1 : If (r) = 0 Then" and then "End If" on a line of its own: reading the first statement
+      only saw the closer and never the opener, the depth fell under the test's own #defines and
+      they were retired while still in use (boolean_bop, udt-init-6 read them as undeclared zeros).
+      A ':' inside a string is not a separator, and a comment ends the line. }
+    procedure OneLine(const Seg: string);
+    var
+      j, From: Integer;
+      InStr: Boolean;
+    begin
+      InStr := False;
+      From := 1;
+      for j := 1 to Length(Seg) do
+        if Seg[j] = '"' then InStr := not InStr
+        else if not InStr then
+        begin
+          if Seg[j] = '''' then
+          begin
+            OneStatement(Copy(Seg, From, j - From));
+            Exit;
+          end;
+          if Seg[j] = ':' then
+          begin
+            OneStatement(Copy(Seg, From, j - From));
+            From := j + 1;
+          end;
+        end;
+      OneStatement(Copy(Seg, From, MaxInt));
+    end;
+
+  begin
+    if GPPNoDefScope then Exit;
+    Start := 1;
+    for k := 1 to Length(S) do
+      if S[k] = cVirtualEOL then
+      begin
+        OneLine(Copy(S, Start, k - Start));
+        Start := k + 1;
+      end;
+    OneLine(Copy(S, Start, MaxInt));
+    // Drop whatever the block that just closed had defined.
+    while (ScopedN > 0) and (ScopedAt[ScopedN - 1] > DefDepth) do
+    begin
+      Dec(ScopedN);
+      if ScopedIsFn[ScopedN] then
+        PPRetireDef(FnDefs, FnDefs.IndexOfName(ScopedName[ScopedN]))
+      else
+        PPRetireDef(Defs, Defs.IndexOfName(ScopedName[ScopedN]));
+    end;
+  end;
+
   function BlockOpener(const S: string): Boolean;
   var W: string;
   begin
@@ -4667,32 +4781,8 @@ var
         end
         else if BlockOpener(DirWord) and (Pos(' : END ', ' ' + UpperFast(Trimmed) + ' ') = 0) then
           Inc(ScopeDepth);
-        // ...and the same walk for #define scoping, over its OWN block set (see DefBlockOpener).
-        // ⛔ A miscount must fail toward KEEPING a define - that is what this code did before it
-        // existed - so the depth is clamped at zero and names are dropped only when the depth falls
-        // BELOW the one they were recorded at.
-        if (Copy(DirWord, 1, 4) = 'END ') then
-        begin
-          if EndClosesDefBlock(Copy(DirWord, 5, MaxInt)) and (DefDepth > 0) then Dec(DefDepth);
-        end
-        else if DefBlockCloser(DirWord) then
-        begin
-          if DefDepth > 0 then Dec(DefDepth);
-        end
-        else if DefBlockOpener(DirWord, Trimmed) and
-                (Pos(' : END ', ' ' + UpperFast(Trimmed) + ' ') = 0) then
-          Inc(DefDepth);
-        // Drop whatever the block that just closed had defined.
-        while (ScopedN > 0) and (ScopedAt[ScopedN - 1] > DefDepth) do
-        begin
-          Dec(ScopedN);
-          if ScopedIsFn[ScopedN] then
-          begin
-            PPRetireDef(FnDefs, FnDefs.IndexOfName(ScopedName[ScopedN]));
-          end
-          else
-            PPRetireDef(Defs, Defs.IndexOfName(ScopedName[ScopedN]));
-        end;
+        // ⛔ The walk for #define SCOPING is NOT made here, on the raw line: it runs on the line as
+        // EXPANDED, further down (CountDefBlocks). See the note there.
         if PrevBlockCmt > 0 then
         begin
           if Emitting then Output.Add(Raw) else Output.Add('');
@@ -5490,7 +5580,8 @@ var
             PPNoteDeclarations(ExpandedLine);
             Output.Add(ExpandedLine);
           end;
-          while ContJoin > 0 do                       // one blank per swallowed line: keep numbering
+          CountDefBlocks(ExpandedLine);
+          while ContJoin > 0 do                      // one blank per swallowed line: keep numbering
           begin
             Output.Add('');
             Inc(li);
@@ -5592,8 +5683,12 @@ begin
   GPPReserved.Values['__FUNCTION__'] := '';
   GPPReserved.Values['__FUNCTION_NQ__'] := '';
   SeedFbKeywords;
+    GPPNoDefScope := GetEnvironmentVariable('SB_PP_NO_DEFSCOPE') = '1';
+    GPPNoTrueFalse := GetEnvironmentVariable('SB_PP_NO_TRUEFALSE') = '1';
     Expand(Src, BaseDir);
     Result := Output.Text;
+    if GetEnvironmentVariable('SB_PP_DUMP') <> '' then
+      Output.SaveToFile(GetEnvironmentVariable('SB_PP_DUMP'));
   finally
     Defs.Free;
     IncOnce.Free;

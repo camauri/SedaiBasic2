@@ -12813,7 +12813,11 @@ begin
       // dell'albero (win/cguid, win/isguids, win/knownfolders, win/shlguid) piu' i tre X11 - tutti
       // sotto-header che nominano un tipo dichiarato dal loro parente. Stesso canale di DECLTYPES,
       // con il proprio genere: 'X'.
-      if (TypeName <> '') and (Pos('.', TypeName) = 0) then
+      // ⚠️ "extern v as type_ns.duptype" reaches here as THREE tokens: the head alone is the name of
+      // a NAMESPACE, not a type, and recording it refused fbc's namespace/dups. A qualified name is
+      // left alone, as the DECLARE and definition checks leave it.
+      if (TypeName <> '') and (Pos('.', TypeName) = 0) and
+         not (Assigned(Context.PeekToken(1)) and (Context.PeekToken(1).TokenType = ttOpDot)) then
         FDeclTypeUses.Add('X|' + TypeName + '|' + IntToStr(Context.CurrentToken.Line) + '|R' +
                           BoolToStr(FNsPrefix <> '', '|NS:' + UpperFast(FNsPrefix), ''));
       Context.Advance;

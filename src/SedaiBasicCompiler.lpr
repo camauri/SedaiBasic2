@@ -49,6 +49,8 @@ uses
   Classes, SysUtils,
   // Preprocessor (runs before lexing)
   SedaiPreprocessor,
+  // Where headers and libraries live (sedai.conf / SEDAI_* / fbc on the PATH) - see LoadConfig below
+  SedaiConfig,
   // Installs GPPTypeSizeHook: see the note in SedaiTypeSizeProbe. Linked for its initialization.
   SedaiTypeSizeProbe,
   // Dialect auto-detection (line numbers => classic, otherwise Modern)
@@ -213,6 +215,11 @@ begin
         entirely - the backend refuses an uncovered opcode for being PRESENT, and
         a run-time If does not remove it. }
       GTargetIsWasm := OptTargetWasm;
+      // ⛔ THE CONFIGURATION, exactly as sb reads it. sbc never called LoadConfig, so ConfigList and
+      // ConfigValue answered empty, FreeBASIC's include tree was never found, "#include crt.bi" was
+      // dropped in silence and every C call was "Array not declared: PRINTF" - while sb ran the same
+      // file. A missing include was not refused either (guard m894e). basc_sweep: 4 SBCFAIL + 1 DIFF.
+      LoadConfig(ExtractFilePath(ExpandFileName(SourceFile)));
       Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
     except
       on E: EPreprocessorError do

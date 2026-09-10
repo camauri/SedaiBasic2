@@ -780,6 +780,35 @@ begin
     UseShadow.Sorted := True;
     CollectParamNames(Node, UseShadow);
     CollectOwnerFieldNames(Node, Ctx, UseShadow);
+    // ⛔ A DEFINITION WRITTEN UNDER A QUALIFIED NAME LIVES IN THAT NAMESPACE. "function ns.g( byval p
+    // as bar ptr )" at module level names ns's own "bar", and its body sees ns's members, exactly as if
+    // it were written inside "namespace ns" - fbc's namespace/extimp is that shape. The children were
+    // walked with the MODULE's prefix, so "bar" stayed bare, named a type that exists nowhere after
+    // flattening, and "p->v" answered 1 where fbc answers the field. The longest head that IS a
+    // namespace wins; a head that is a TYPE ("T.method") is not one and changes nothing.
+    if (Ctx <> nil) and (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+    begin
+      Qual := UpperCase(VarToStr(Node.GetChild(0).Value));
+      SigPos := Pos('~', Qual);
+      if SigPos = 0 then SigPos := Pos('#', Qual);
+      if SigPos > 0 then Qual := Copy(Qual, 1, SigPos - 1);
+      DotPos := LastDelimiter('.', Qual);
+      while DotPos > 0 do
+      begin
+        Qual := Copy(Qual, 1, DotPos - 1);
+        if Ctx.NamespaceNames.IndexOf(Qual) >= 0 then
+        begin
+          ChildPrefix := Qual;
+          Break;
+        end;
+        if (ActivePrefix <> '') and (Ctx.NamespaceNames.IndexOf(ActivePrefix + '.' + Qual) >= 0) then
+        begin
+          ChildPrefix := ActivePrefix + '.' + Qual;
+          Break;
+        end;
+        DotPos := LastDelimiter('.', Qual);
+      end;
+    end;
   end;
 
   // Recurse into children first (bottom-up), replacing each in place if needed.

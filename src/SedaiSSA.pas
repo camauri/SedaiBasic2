@@ -266,6 +266,8 @@ type
     // whether its record mark is needed at all -- see TScopeFrame.RecAllocSeq.
     FRecAllocSeq: Int64;
     FCurrentProcName: string;
+    FConstCheckProc: TASTNode;   // the procedure CheckConstInitialisers is walking (nil outside one)
+    FDefNsDepth: Integer;        // namespaces CheckDefinedProcTypes stands inside, counted top-down
     // RegisterRecordVars pre-scan only: True while walking a procedure's declaration (its return type,
     // its parameters, and the local DIMs in its body). It is what tells a MODULE-level declaration --
     // the one name that legitimately owns the bare-name entry in FVarExplicitType -- apart from a
@@ -15592,6 +15594,10 @@ var
 
 begin
   Result := False;
+  // ⛔ CheckConstInitialisers asks this from a PRE-PASS over the whole tree, where no procedure is
+  // being lowered and FInProcedure is False - so every "Const b = a*2" reading a LOCAL "Const a" was
+  // refused as run time, inside any SUB (DIVERGENZE 213). That pass names the procedure it stands in.
+  if FConstCheckProc <> nil then Exit(Walk(FConstCheckProc));
   if (not FInProcedure) or (FCurrentProcName = '') then Exit;
   if not FProcDecls.TryGetValue(UpperFast(FCurrentProcName), Proc) then Exit;
   Result := Walk(Proc);
@@ -40304,7 +40310,7 @@ procedure TSSAGenerator.CheckConstInitialisers(Node: TASTNode);
 // an operand, and treating it as one would refuse "const A = Asc(\"A\")".
 var
   i: Integer;
-  Init: TASTNode;
+  Init, Saved: TASTNode;
 begin
   if Node = nil then Exit;
   // ⛔ A CAST NAMES A TYPE, AND IT HAS TO BE ONE. "const SRCCOPY = cast(DWORD, &h00CC0020)" is how
@@ -40335,6 +40341,19 @@ begin
         'Const "%s" is not a constant: its value reads something that only exists at run time ' +
         '(an undeclared name, or a variable)', [VarToStr(Node.GetChild(0).Value)]);
   end;
+  if Node.NodeType = antProcedureDecl then
+  begin
+    // A local CONST is known only to its procedure's AST (see NameIsLocalConst): say which one.
+    Saved := FConstCheckProc;
+    FConstCheckProc := Node;
+    try
+      for i := 0 to Node.ChildCount - 1 do
+        CheckConstInitialisers(Node.GetChild(i));
+    finally
+      FConstCheckProc := Saved;
+    end;
+    Exit;
+  end;
   for i := 0 to Node.ChildCount - 1 do
     CheckConstInitialisers(Node.GetChild(i));
 end;
@@ -40348,6 +40367,7 @@ var
   i, k: Integer;
   ParamList, ParamNode, TypeNode: TASTNode;
   Nm: string;
+  Inside: Boolean;
 
   { Il prefisso di NAMESPACE di un nome gia' composto: "GDIPLUS.RPC_NEW_HTTP_PROXY_CHANNEL" -> "GDIPLUS." }
   function NsPrefixOf(const Composed: string): string;
@@ -40362,6 +40382,19 @@ var
   { ...e per un nodo che il proprio prefisso non ce l'ha, lo si trova RISALENDO. Un puntatore a
     procedura che e' un CAMPO di vtable si chiama "QUERYINTERFACE" e basta: il namespace sta sul TIPO
     che lo contiene ("GDIPLUS.IUNKNOWNVTBL"), qualche livello piu' su. }
+  { ⛔ A node's Value is not always TEXT: climbing the parents meets nodes whose variant does not
+    convert to a string, and VarToStr raised EVariantError out of this whole pre-pass - a procedure
+    pointer PARAMETER inside a fbcunit SUITE was enough (functions/fwdref-in-signature). A value
+    that is not text holds no namespace prefix. }
+  function NodeTextUpper(N: TASTNode): string;
+  begin
+    try
+      Result := N.ValueUpper;
+    except
+      on EVariantError do Result := '';
+    end;
+  end;
+
   function NsContextOf(N: TASTNode): string;
   var
     P: TASTNode;
@@ -40372,7 +40405,7 @@ var
     Guard := 0;
     while (P <> nil) and (Guard < 64) do
     begin
-      Result := NsPrefixOf(P.ValueUpper);
+      Result := NsPrefixOf(NodeTextUpper(P));
       if Result <> '' then Exit;
       P := P.Parent;
       Inc(Guard);
@@ -40402,7 +40435,14 @@ var
   procedure Want(N: TASTNode; const What: string);
   begin
     if N = nil then Exit;
-    WantName(VarToStr(N.Value), What);
+    // ⛔ A procedure DEFINITION inside a namespace names its types bare, and there they are registered
+    // WITH the prefix - of that namespace, of an enclosing one, or of one a USING imports. fbcunit's
+    // SUITE opens a namespace, so "type udt" and "function proc(byval u as udt) as udt" in the same
+    // SUITE were refused: 4 valid programs of fbc's suite (DIVERGENZE 213). The same declared
+    // permissiveness the DECLTYPES path uses (CheckDeclaredProcTypes): a name declared under ANY
+    // prefix is taken, which errs toward accepting.
+    if not TypeNameKnownUnderAnyPrefix(UpperFast(Trim(TypeBaseName(VarToStr(N.Value))))) then
+      WantName(VarToStr(N.Value), What);
     // ...e se il tipo c'e' ma viene DOPO, per `fbc` in quel punto non c'e' ancora.
     if TypeDeclaredAfter(VarToStr(N.Value), N.SourceLine) then
       raise Exception.CreateFmt(
@@ -40426,7 +40466,11 @@ var
     // stesso imbuto che risolve un nome di tipo durante la generazione (FindUDT + il percorso di
     // scope), che a pre-passata non e' ancora in mano. Stessa lezione della regola sulle variabili,
     // ritirata per la stessa ragione (DIVERGENZE 206).
-    if NsContextOf(N) <> '' then Exit;
+    // ⛔⛔ "Inside a namespace" is carried DOWN by the walk (FDefNsDepth), never asked by climbing
+    // N.Parent: a procedure-pointer PARAMETER has a DANGLING parent, and climbing it read freed memory
+    // - an EVariantError at first, an access violation once that was caught (fbc's
+    // functions/fwdref-in-signature, "sub f5( byval p as sub( byval as T ptr ) )" in a SUITE).
+    if FDefNsDepth > 0 then Exit;
     Lst := N.Attributes.Values['FPPARAMS'];
     b := 1;
     for i := 1 to Length(Lst) + 1 do
@@ -40511,8 +40555,17 @@ begin
       end;
     end;
   end;
-  for i := 0 to Node.ChildCount - 1 do
-    CheckDefinedProcTypes(Node.GetChild(i));
+  // A namespace block, or a procedure defined under a qualified name, puts everything below it inside.
+  Inside := (Node.NodeType = antNamespace) or
+            ((Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
+             (Pos('.', NodeTextUpper(Node.GetChild(0))) > 0));
+  if Inside then Inc(FDefNsDepth);
+  try
+    for i := 0 to Node.ChildCount - 1 do
+      CheckDefinedProcTypes(Node.GetChild(i));
+  finally
+    if Inside then Dec(FDefNsDepth);
+  end;
 end;
 
 procedure TSSAGenerator.CheckDeclaredProcTypes(AST: TASTNode);
