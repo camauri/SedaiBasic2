@@ -290,9 +290,15 @@ the call states it (`malloc`, `calloc`, `realloc`, `CoTaskMemAlloc`, `HeapAlloc`
 `GlobalAlloc`, `VirtualAlloc`), and forgets it when the matching `free` releases it.
   ⚠️ **What therefore differs from FreeBASIC**: an address outside every such block — past the end of
   a block of known size, inside a block already freed, or a number converted to a pointer — stops the
-  program with a message, where FreeBASIC reads whatever is there or crashes. For a block whose size no
-  call states (a structure an API returns, a string `getenv` answers) only the start is checked. A
-  `WString Ptr` a Windows function returns is not yet read as UTF-16.
+  program with a message, where FreeBASIC reads whatever is there or crashes. A block whose size no call
+  states (a structure an API returns, a string `getenv` answers) is bounded by the memory mapping it lies
+  in: reading past the block but inside the mapping behaves as in FreeBASIC, reading past the mapping
+  stops with a message instead of crashing. A pointer C writes into an out-parameter (`T Ptr Ptr`) is
+  treated the same way as one it returns.
+  ⭐ **And a `WString` Windows hands back is read as UTF-16**, consistently with the `WString` above:
+  the whole string, a single character `(*p)[i]` and a pointer passed back all name the UTF-16 unit that
+  the program's character cell stands for. A string expression passed to a `WString Ptr` parameter
+  travels as a wide temporary, as in FreeBASIC.
 
 **Pointer arithmetic and the numeric value of a pointer.** A pointer obtained from `Allocate`,
 `SAdd`, `StrPtr` or `ScreenPtr` is a byte address and steps by `SizeOf(pointee)`, exactly as in

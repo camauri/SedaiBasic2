@@ -65,7 +65,8 @@ type
     address only inside a region recorded here: a pointer a call RETURNED, one C wrote into an
     out-parameter, one a callback received. ALen is the extent when the call itself says it (an
     allocator's size argument), 0 when nothing does. AAdd = False releases the region: C's own free. }
-  TForeignRegionNote = procedure(ACtx: TObject; ABase, ALen: PtrUInt; AAdd: Boolean) of object;
+  TForeignRegionNote = procedure(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean) of object;
+  { AWide: the block is a WSTRING Windows handed back - UTF-16 units that the program counts as cells. }
 
   TForeignBinding = record
     Decl: TForeignDecl;
@@ -123,6 +124,11 @@ type
   bisogno della stessa mappa, e due copie di questa tabella sarebbero due letture dello stesso fatto
   che possono divergere. Risponde nil per un tipo che questo percorso non sa passare. }
 function KindToRef(K: TForeignKind): TAbiType;
+
+{ How many bytes are readable from machine address A to the end of the memory MAPPING that holds it; 0
+  when A is not in readable memory. It is the extent a block of unknown size can be given (DIVERGENZE
+  239): not the block's own size - C does not say it - but the line past which a read would fault. }
+function ForeignMappedExtent(A: PtrUInt): PtrUInt;
 
 implementation
 
@@ -201,17 +207,140 @@ begin
     if Sym = FGN_FREE_RULES[i].Sym then
     begin
       P := FgnArg(Vals, NArgs, FGN_FREE_RULES[i].PtrA);
-      if P <> 0 then Note(ACtx, P, 0, False);
+      if P <> 0 then Note(ACtx, P, 0, False, False);
       Exit;
     end;
   for i := 0 to High(FGN_ALLOC_RULES) do
     if (Sym = FGN_ALLOC_RULES[i].Sym) and (FGN_ALLOC_RULES[i].OldP >= 0) then
     begin
       P := FgnArg(Vals, NArgs, FGN_ALLOC_RULES[i].OldP);
-      if P <> 0 then Note(ACtx, P, 0, False);
+      if P <> 0 then Note(ACtx, P, 0, False, False);
       Exit;
     end;
 end;
+
+{$IFDEF WINDOWS}
+{$PUSH}{$PACKRECORDS C}
+type
+  TFgnMemInfo = record                     // MEMORY_BASIC_INFORMATION, 48 bytes on win64
+    BaseAddress, AllocationBase: Pointer;
+    AllocationProtect: LongWord;
+    PartitionId: Word;
+    RegionSize: PtrUInt;
+    State, Protect, MemType, Pad: LongWord;
+  end;
+{$POP}
+
+function FgnVirtualQuery(lpAddress: Pointer; var lpBuffer: TFgnMemInfo; dwLength: PtrUInt): PtrUInt;
+  stdcall; external 'kernel32' name 'VirtualQuery';
+
+function ForeignMappedExtent(A: PtrUInt): PtrUInt;
+var
+  M: TFgnMemInfo;
+  Hi: PtrUInt;
+begin
+  Result := 0;
+  FillChar(M, SizeOf(M), 0);
+  if FgnVirtualQuery(Pointer(A), M, SizeOf(M)) = 0 then Exit;
+  // MEM_COMMIT, and neither PAGE_NOACCESS ($01) nor PAGE_GUARD ($100).
+  if (M.State <> $1000) or (M.Protect = 0) or ((M.Protect and $101) <> 0) then Exit;
+  Hi := PtrUInt(M.BaseAddress) + M.RegionSize;
+  if Hi > A then Result := Hi - A;
+end;
+{$ELSE}
+var
+  GMapLo, GMapHi: array of PtrUInt;        // readable mappings of this process, contiguous ones merged
+  GMapCount: Integer;
+  GMapLock: TRTLCriticalSection;
+
+procedure FgnLoadMaps;
+// /proc/self/maps, reread only on a miss: a process maps new memory rarely, and a block C hands back
+// almost always lies in a mapping already seen (the heap, a library's data).
+var
+  F: THandle;
+  Buf: array[0..65535] of Char;
+  Tmp, S, Line: string;
+  n, p, q: Integer;
+  Lo, Hi: QWord;
+begin
+  GMapCount := 0;
+  S := '';
+  F := FileOpen('/proc/self/maps', fmOpenRead);
+  if F = THandle(-1) then Exit;
+  try
+    repeat
+      n := FileRead(F, Buf, SizeOf(Buf));
+      if n > 0 then
+      begin
+        SetString(Tmp, PChar(@Buf[0]), n);
+        S := S + Tmp;
+      end;
+    until n <= 0;
+  finally
+    FileClose(F);
+  end;
+  p := 1;
+  while p <= Length(S) do
+  begin
+    q := p;
+    while (q <= Length(S)) and (S[q] <> #10) do Inc(q);
+    Line := Copy(S, p, q - p);
+    p := q + 1;
+    // "lo-hi perms ..." in hex; only READABLE mappings count.
+    q := Pos('-', Line);
+    if (q < 2) or (Pos(' ', Line) < q) then Continue;
+    if not TryStrToQWord('$' + Copy(Line, 1, q - 1), Lo) then Continue;
+    Line := Copy(Line, q + 1, MaxInt);
+    q := Pos(' ', Line);
+    if (q < 2) or not TryStrToQWord('$' + Copy(Line, 1, q - 1), Hi) then Continue;
+    if (q + 1 > Length(Line)) or (Line[q + 1] <> 'r') then Continue;
+    if (GMapCount > 0) and (GMapHi[GMapCount - 1] = PtrUInt(Lo)) then
+      GMapHi[GMapCount - 1] := PtrUInt(Hi)
+    else
+    begin
+      if GMapCount = Length(GMapLo) then
+      begin
+        SetLength(GMapLo, 2 * GMapCount + 64);
+        SetLength(GMapHi, Length(GMapLo));
+      end;
+      GMapLo[GMapCount] := PtrUInt(Lo);
+      GMapHi[GMapCount] := PtrUInt(Hi);
+      Inc(GMapCount);
+    end;
+  end;
+end;
+
+function ForeignMappedExtent(A: PtrUInt): PtrUInt;
+
+  function Find: PtrUInt;
+  var
+    lo, hi, mid: Integer;
+  begin
+    Result := 0;
+    lo := 0; hi := GMapCount - 1;
+    while lo <= hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if A < GMapLo[mid] then hi := mid - 1
+      else if A >= GMapHi[mid] then lo := mid + 1
+      else Exit(GMapHi[mid] - A);
+    end;
+  end;
+
+begin
+  EnterCriticalSection(GMapLock);
+  try
+    Result := Find;
+    if Result = 0 then
+    begin
+      FgnLoadMaps;
+      Result := Find;
+    end;
+  finally
+    LeaveCriticalSection(GMapLock);
+  end;
+end;
+{$ENDIF}
 
 constructor TForeignTable.Create;
 begin
@@ -608,7 +737,7 @@ begin
           else
           begin
             PInt64(OutLoc[i])^ := Int64(RetAddr) or FGNPTR_TAG;
-            if Assigned(FNoteRegion) then FNoteRegion(ACtx, RetAddr, 0, True);   // DIVERGENZE 239
+            if Assigned(FNoteRegion) then FNoteRegion(ACtx, RetAddr, 0, True, False);   // DIVERGENZE 239
           end;
         end;
       end;
@@ -678,7 +807,8 @@ begin
           // modo in cui ogni binding lo prova. Vedi FGNPTR_TAG.
           // ⭐ ...and readable, inside the region this call handed back (DIVERGENZE 239).
           if Assigned(FNoteRegion) then
-            FNoteRegion(ACtx, RetAddr, FgnAllocLen(B^.Decl.Symbol, @Vals[0], NArgs), True);
+            FNoteRegion(ACtx, RetAddr, FgnAllocLen(B^.Decl.Symbol, @Vals[0], NArgs), True,
+                        {$IFDEF WINDOWS}IsWideStrParam(B^.Decl.RetTypeName){$ELSE}False{$ENDIF});
           ResInt := ResInt or FGNPTR_TAG;
         end;
       end;
@@ -687,4 +817,10 @@ begin
   end;
 end;
 
+{$IFNDEF WINDOWS}
+initialization
+  InitCriticalSection(GMapLock);
+finalization
+  DoneCriticalSection(GMapLock);
+{$ENDIF}
 end.

@@ -221,6 +221,8 @@ type
     // base. A machine address is dereferenceable only inside one of these - bounds-checked when the
     // length is known - and a region leaves when C's own free releases it.
     FFgnBase, FFgnLen: array of PtrUInt;
+    FFgnMap: array of PtrUInt;     // with no stated size: bytes to the end of the MAPPING the base lies in
+    FFgnWide: array of Boolean;    // a WSTRING block Windows returned: the program's cells are UTF-16 units there
     FFgnCount: Integer;
     FFgnLock: TRTLCriticalSection;
     // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
@@ -831,7 +833,8 @@ type
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
-    procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd: Boolean);
+    procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean);
+    function ForeignWideUnit(RawPtr: Int64; out PU: PWord; out AvailUnits: PtrUInt): Boolean;
     function ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Pointer;
     procedure RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
                              ARet: Pointer; AArgs: PPointer;
@@ -5973,7 +5976,13 @@ begin
 end;
 
 function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
+var
+  PU: PWord;
+  AvU: PtrUInt;
 begin
+  // A character cell of a WSTRING Windows handed back is one UTF-16 unit there (DIVERGENZE 239).
+  if ((TypeCode = RTC_I32) or (TypeCode = RTC_U32)) and ForeignWideUnit(RawPtr, PU, AvU) then
+    Exit(PU^);
   case TypeCode of
     RTC_I8:  Result := PShortInt(RawAddr(RawPtr, 1))^;
     RTC_I16: Result := PSmallInt(RawAddr(RawPtr, 2))^;
@@ -6123,6 +6132,35 @@ var
   i: Integer;
   W: UnicodeString;
   PW: PLongWord;
+  PU16: PWord;
+  AvU: PtrUInt;
+
+  {$IFDEF WINDOWS}
+  function FromUTF16(PU: PWord; MaxUnits: PtrUInt): string;
+  // A NUL-terminated UTF-16 string in Windows' own memory, as the VM's UTF-8: a surrogate PAIR is ONE
+  // character (the PORTABLE WSTRING, DIVERGENZE 237), a lone surrogate keeps its code unit.
+  var
+    u: PtrUInt;
+    c: LongWord;
+  begin
+    Result := '';
+    u := 0;
+    while (u < MaxUnits) and (PU[u] <> 0) do
+    begin
+      c := PU[u];
+      if (c >= $D800) and (c <= $DBFF) and (u + 1 < MaxUnits) and
+         (PU[u + 1] >= $DC00) and (PU[u + 1] <= $DFFF) then
+      begin
+        c := $10000 + ((c - $D800) shl 10) + (LongWord(PU[u + 1]) - $DC00);
+        Inc(u, 2);
+      end
+      else
+        Inc(u);
+      Result := Result + UCS4CellToUTF8(c);
+    end;
+  end;
+  {$ENDIF}
+
 begin
   // ⛔ A NULL ZSTRING/WSTRING POINTER READS AS THE EMPTY STRING, and that is fbc's rule rather than
   // undefined behaviour it gets away with: its string runtime tests the pointer, so "Len(*pz)" answers
@@ -6152,6 +6190,16 @@ begin
     // ⭐ ONE CELL IS WIDE_CELL_BYTES, and the cell is WIDER than the UnicodeString unit it decodes
     // into, so this cannot be a Move: each cell is read whole and narrowed. A codepoint above the BMP
     // fits one cell here and TWO UTF-16 units in W, which is why W is built by appending.
+    {$IFDEF WINDOWS}
+    // ⭐ ...EXCEPT IN WINDOWS' OWN MEMORY, which holds UTF-16 (DIVERGENZE 239): a string a "...W"
+    // function returned is decoded at the boundary, as an argument is encoded there (234).
+    if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+    begin
+      // Inside a wide block the address counts CELLS from its start: translate it to the unit.
+      if ForeignWideUnit(RawPtr, PU16, AvU) then Exit(FromUTF16(PU16, AvU));
+      Exit(FromUTF16(PWord(P), Limit div 2));
+    end;
+    {$ENDIF}
     PW := PLongWord(P);
     n := 0;
     while ((n + 1) * WIDE_CELL_BYTES <= Limit) and (PW[n] <> 0) do Inc(n);
@@ -6169,6 +6217,9 @@ var
   P: PByte;
   i: Integer;
   U: TUCS4Cells;
+  n: PtrUInt;
+  PU16: PWord;
+  AvU: PtrUInt;
 begin
   if not Wide then
   begin
@@ -6182,6 +6233,39 @@ begin
     // from - so a round trip through the buffer is the identity, which the UCS-2 image could not
     // promise above the BMP.
     U := UTF8ToUCS4Cells(S);
+    {$IFDEF WINDOWS}
+    // ⭐ Into Windows' own memory the text goes as UTF-16, a character above U+FFFF as a surrogate pair
+    // (DIVERGENZE 239) - the mirror of RawLoadZStrVal.
+    if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+    begin
+      n := 0;
+      for i := 0 to Length(U) - 1 do
+        if U[i] > $FFFF then Inc(n, 2) else Inc(n);
+      if ForeignWideUnit(RawPtr, PU16, AvU) then
+      begin
+        if n + 1 > AvU then
+          raise ERangeError.Create('Foreign wide string store out of bounds');
+        P := PByte(PU16);
+      end
+      else
+        P := PByte(RawAddr(RawPtr, (n + 1) * 2));
+      n := 0;
+      for i := 0 to Length(U) - 1 do
+        if (U[i] > $FFFF) and (U[i] <= $10FFFF) then
+        begin
+          PWord(P)[n] := Word($D800 + ((U[i] - $10000) shr 10));
+          PWord(P)[n + 1] := Word($DC00 + ((U[i] - $10000) and $3FF));
+          Inc(n, 2);
+        end
+        else
+        begin
+          PWord(P)[n] := Word(U[i]);
+          Inc(n);
+        end;
+      PWord(P)[n] := 0;
+      Exit;
+    end;
+    {$ENDIF}
     P := PByte(RawAddr(RawPtr, (PtrUInt(Length(U)) + 1) * WIDE_CELL_BYTES));
     for i := 0 to Length(U) - 1 do PLongWord(P)[i] := U[i];
     PLongWord(P)[Length(U)] := 0;
@@ -6234,7 +6318,16 @@ begin
 end;
 
 procedure TBytecodeVM.RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
+var
+  PU: PWord;
+  AvU: PtrUInt;
 begin
+  // ...and a store into one writes that unit; a character above U+FFFF has no single unit (U+FFFD).
+  if ((TypeCode = RTC_I32) or (TypeCode = RTC_U32)) and ForeignWideUnit(RawPtr, PU, AvU) then
+  begin
+    if (Value < 0) or (Value > $FFFF) then PU^ := $FFFD else PU^ := Word(Value);
+    Exit;
+  end;
   case TypeCode of
     RTC_I8:  PShortInt(RawAddr(RawPtr, 1))^ := ShortInt(Value);
     RTC_I16: PSmallInt(RawAddr(RawPtr, 2))^ := SmallInt(Value);
@@ -6501,7 +6594,7 @@ begin
             begin
               ACtx.XferInt[SlotI] := ACtx.XferInt[SlotI] or FGNPTR_TAG;
               // ...and readable for the callback, as memory C handed over (DIVERGENZE 239).
-              ForeignNoteRegion(ACtx, PtrUInt(PPointer(AArgs[i])^), 0, True);
+              ForeignNoteRegion(ACtx, PtrUInt(PPointer(AArgs[i])^), 0, True, False);
             end;
           end;
           Inc(SlotI);
@@ -6552,14 +6645,19 @@ begin
   end;
 end;
 
-procedure TBytecodeVM.ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd: Boolean);
+procedure TBytecodeVM.ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean);
 // Record (AAdd) or release a region of memory C handed back. A second note of the same base keeps the
 // larger knowledge: a known length is never overwritten by an unknown one - "f(p)" answering its own
 // argument must not forget how big the block malloc gave was.
 var
   lo, hi, mid: Integer;
+  Map: PtrUInt;
 begin
   if ABase = 0 then Exit;
+  // ⭐ With no size stated, the MAPPING bounds the block: not its own extent - C does not say it - but
+  // the line past which a read would fault, which becomes a message instead of a crash.
+  Map := 0;
+  if AAdd and (ALen = 0) then Map := ForeignMappedExtent(ABase);
   EnterCriticalSection(FFgnLock);
   try
     lo := 0; hi := FFgnCount - 1;
@@ -6573,6 +6671,8 @@ begin
       if AAdd then
       begin
         if ALen > 0 then FFgnLen[lo] := ALen;
+        if (FFgnMap[lo] = 0) and (Map > 0) then FFgnMap[lo] := Map;
+        if AWide then FFgnWide[lo] := True;
       end
       else
       begin
@@ -6580,6 +6680,8 @@ begin
         begin
           Move(FFgnBase[lo + 1], FFgnBase[lo], (FFgnCount - lo - 1) * SizeOf(PtrUInt));
           Move(FFgnLen[lo + 1], FFgnLen[lo], (FFgnCount - lo - 1) * SizeOf(PtrUInt));
+          Move(FFgnMap[lo + 1], FFgnMap[lo], (FFgnCount - lo - 1) * SizeOf(PtrUInt));
+          Move(FFgnWide[lo + 1], FFgnWide[lo], (FFgnCount - lo - 1) * SizeOf(Boolean));
         end;
         Dec(FFgnCount);
       end;
@@ -6590,14 +6692,20 @@ begin
     begin
       SetLength(FFgnBase, 2 * FFgnCount + 16);
       SetLength(FFgnLen, Length(FFgnBase));
+      SetLength(FFgnMap, Length(FFgnBase));
+      SetLength(FFgnWide, Length(FFgnBase));
     end;
     if lo < FFgnCount then
     begin
       Move(FFgnBase[lo], FFgnBase[lo + 1], (FFgnCount - lo) * SizeOf(PtrUInt));
       Move(FFgnLen[lo], FFgnLen[lo + 1], (FFgnCount - lo) * SizeOf(PtrUInt));
+      Move(FFgnMap[lo], FFgnMap[lo + 1], (FFgnCount - lo) * SizeOf(PtrUInt));
+      Move(FFgnWide[lo], FFgnWide[lo + 1], (FFgnCount - lo) * SizeOf(Boolean));
     end;
     FFgnBase[lo] := ABase;
     FFgnLen[lo] := ALen;
+    FFgnMap[lo] := Map;
+    FFgnWide[lo] := AWide;
     Inc(FFgnCount);
   finally
     LeaveCriticalSection(FFgnLock);
@@ -6611,9 +6719,9 @@ function TBytecodeVM.ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUIn
 // address is past the start of something C gave the program, and how far past nobody here can say.
 var
   lo, hi, mid, r: Integer;
-  B, L: PtrUInt;
+  B, L, M: PtrUInt;
 begin
-  r := -1; B := 0; L := 0;
+  r := -1; B := 0; L := 0; M := 0;
   EnterCriticalSection(FFgnLock);
   try
     lo := 0; hi := FFgnCount - 1;
@@ -6623,7 +6731,7 @@ begin
       if FFgnBase[mid] <= A then begin r := mid; lo := mid + 1; end
       else hi := mid - 1;
     end;
-    if r >= 0 then begin B := FFgnBase[r]; L := FFgnLen[r]; end;
+    if r >= 0 then begin B := FFgnBase[r]; L := FFgnLen[r]; M := FFgnMap[r]; end;
   finally
     LeaveCriticalSection(FFgnLock);
   end;
@@ -6637,9 +6745,67 @@ begin
                                   [Int64(A - B), Int64(NeedBytes), Int64(L)]);
     AAvail := L - (A - B);
   end
+  else if M > 0 then
+  begin
+    // No size stated: the mapping is the bound (see ForeignNoteRegion).
+    if (A - B) + NeedBytes > M then
+      raise ERangeError.CreateFmt('Foreign pointer dereference: offset %d + %d leaves the memory ' +
+                                  'mapped at that block (%d bytes)', [Int64(A - B), Int64(NeedBytes), Int64(M)]);
+    AAvail := M - (A - B);
+  end
   else
     AAvail := High(PtrUInt) shr 1;
   Result := Pointer(A);
+end;
+
+function TBytecodeVM.ForeignWideUnit(RawPtr: Int64; out PU: PWord; out AvailUnits: PtrUInt): Boolean;
+// ⭐ A WSTRING block Windows handed back, seen through the PORTABLE model (DIVERGENZE 237 · 239): the
+// program counts its cells four bytes apart, Windows keeps UTF-16 units two bytes apart - so cell k from
+// the block's start is unit k, at half the distance. True only inside such a block, and only on Windows.
+var
+  lo, hi, mid, r: Integer;
+  A, B, L, Ext: PtrUInt;
+begin
+  Result := False;
+  PU := nil;
+  AvailUnits := 0;
+  {$IFDEF WINDOWS}
+  if (RawPtr <= 0) or ((RawPtr and RAWPTR_TAG) <> 0) or ((RawPtr and FGNPTR_TAG) = 0) then Exit;
+  A := PtrUInt(RawPtr and not FGNPTR_TAG);
+  r := -1; B := 0; Ext := 0;
+  EnterCriticalSection(FFgnLock);
+  try
+    lo := 0; hi := FFgnCount - 1;
+    while lo <= hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if FFgnBase[mid] <= A then begin r := mid; lo := mid + 1; end
+      else hi := mid - 1;
+    end;
+    if (r >= 0) and FFgnWide[r] then
+    begin
+      B := FFgnBase[r];
+      L := FFgnLen[r];
+      if L > 0 then Ext := L else Ext := FFgnMap[r];
+    end
+    else
+      r := -1;
+  finally
+    LeaveCriticalSection(FFgnLock);
+  end;
+  if r < 0 then Exit;
+  PU := PWord(B + (A - B) div 2);
+  if Ext > 0 then
+  begin
+    if (A - B) div 2 + 2 > Ext then
+      raise ERangeError.CreateFmt('Foreign wide string dereference out of bounds: character %d of a ' +
+                                  '%d-byte block', [Int64((A - B) div 4), Int64(Ext)]);
+    AvailUnits := (Ext - (A - B) div 2) div 2;
+  end
+  else
+    AvailUnits := High(PtrUInt) shr 2;
+  Result := True;
+  {$ENDIF}
 end;
 
 function TBytecodeVM.ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;
@@ -6834,9 +7000,17 @@ function TBytecodeVM.ForeignPtrArg(ACtx: TObject; Tagged: Int64): Pointer;
 //
 // ⛔ NeedBytes = 1: how many bytes the callee will read is not knowable here. The check that remains is
 // the one that matters at this boundary - that the pointer names a region we own at all.
+var
+  PU: PWord;
+  AvU: PtrUInt;
 begin
   if Tagged = 0 then Exit(nil);
-  if (Tagged and FGNPTR_TAG) <> 0 then Exit(Pointer(PtrUInt(Tagged and not FGNPTR_TAG)));
+  if (Tagged and FGNPTR_TAG) <> 0 then
+  begin
+    // A cell inside a Windows wide block goes back to C as the UTF-16 unit it names (DIVERGENZE 239).
+    if ForeignWideUnit(Tagged, PU, AvU) then Exit(Pointer(PU));
+    Exit(Pointer(PtrUInt(Tagged and not FGNPTR_TAG)));
+  end;
   try
     Result := BlockAddr(TExecutionContext(ACtx), Tagged, 1);
   except

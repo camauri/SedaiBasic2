@@ -710,6 +710,7 @@ type
                             out ResultVal: TSSAValue): Boolean;
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
     function IsForeignPtrCall(Node: TASTNode): Boolean;   // a C call returning C-owned memory (DIVERGENZE 239)
+    function ArgIsProgramMemory(A: TASTNode): Boolean;    // ...and the argument shape that vetoes it
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);   // raw-ness crosses the call here
     function RawPtrMarkedHere(const NameU: string): Boolean;       // ...is it raw in THIS scope? (DIVERGENZE 96)
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -41250,31 +41251,6 @@ var
   D: TForeignDecl;
   Idx, i, k, First: Integer;
   Args: TASTNode;
-
-  function IsProgramMemory(A: TASTNode): Boolean;
-  var
-    j: Integer;
-    Dummy: TASTNode;
-  begin
-    Result := False;
-    if A = nil then Exit;
-    while (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
-    case A.NodeType of
-      // "@a(i)" is an ELEMENT pointer into the program's array - the one shape a result can come home
-      // into and then be walked by elements. "@x" of a scalar or a record is not: that storage is never a
-      // region the call hands back into ("gmtime(@t)" answers C's own struct), and "@proc" names code.
-      antProcAddress:
-        Result := (A.ChildCount > 0) and (A.GetChild(0) <> nil) and
-                  (A.GetChild(0).NodeType = antArrayAccess);
-      // A pointer VARIABLE that is not raw may hold an element pointer into the program's arrays.
-      antIdentifier:
-        Result := (PointeeTypeOf(VarToStr(A.Value)) <> '') and not IsRawPtr(VarToStr(A.Value));
-      antCast, antBinaryOp:
-        for j := 0 to A.ChildCount - 1 do
-          if IsProgramMemory(A.GetChild(j)) then Exit(True);
-    end;
-  end;
-
 begin
   Result := False;
   if (Node = nil) or not Assigned(FProgram) then Exit;
@@ -41298,11 +41274,34 @@ begin
     if (Args <> nil) and (Args.NodeType in [antArgumentList, antExpressionList]) then
     begin
       for k := 0 to Args.ChildCount - 1 do
-        if IsProgramMemory(Args.GetChild(k)) then Exit;
+        if ArgIsProgramMemory(Args.GetChild(k)) then Exit;
     end
-    else if IsProgramMemory(Args) then Exit;
+    else if ArgIsProgramMemory(Args) then Exit;
   end;
   Result := True;
+end;
+
+function TSSAGenerator.ArgIsProgramMemory(A: TASTNode): Boolean;
+// Is this C-call argument a pointer a result could come HOME into and then be walked by ELEMENTS?
+// "@a(i)" is: an element pointer into the program's array. "@x" of a scalar or a record is not - that
+// storage is never a region a call hands back into ("gmtime(@t)" answers C's own struct) - and "@proc"
+// names code. A pointer VARIABLE that is not raw may hold an element pointer, so it counts too.
+var
+  j: Integer;
+begin
+  Result := False;
+  if A = nil then Exit;
+  while (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
+  case A.NodeType of
+    antProcAddress:
+      Result := (A.ChildCount > 0) and (A.GetChild(0) <> nil) and
+                (A.GetChild(0).NodeType = antArrayAccess);
+    antIdentifier:
+      Result := (PointeeTypeOf(VarToStr(A.Value)) <> '') and not IsRawPtr(VarToStr(A.Value));
+    antCast, antBinaryOp:
+      for j := 0 to A.ChildCount - 1 do
+        if ArgIsProgramMemory(A.GetChild(j)) then Exit(True);
+  end;
 end;
 
 procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
@@ -41495,6 +41494,47 @@ var
       MarkRaw(TargetU);
   end;
 
+  procedure NoteForeignOutArgs(const CalleeName: string; ArgListNode: TASTNode);
+  // ⭐ "f(@p)" where f is a C function whose parameter is "T PTR PTR": C writes a pointer INTO p
+  // (posix_memalign, FormatMessage with ALLOCATE_BUFFER, every API that hands a block back through an
+  // out-parameter). The runtime tags it and records its region (DIVERGENZE 219 · 239); here p learns it
+  // is RAW, or "p[3]" walks three ELEMENTS - three bytes - into C's block and writes over "p[0]".
+  // ⛔ Same veto as IsForeignPtrCall: with an element pointer among the arguments, the written pointer
+  // may land in the program's array and come home element-indexed.
+  var
+    Idx, k: Integer;
+    D: TForeignDecl;
+    A: TASTNode;
+    NU: string;
+  begin
+    if (ArgListNode = nil) or (CalleeName = '') or not Assigned(FProgram) then Exit;
+    Idx := FProgram.IndexOfForeignDecl(UpperFast(CalleeName));
+    if (Idx < 0) or not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+    for k := 0 to ArgListNode.ChildCount - 1 do
+      if ArgIsProgramMemory(ArgListNode.GetChild(k)) then Exit;
+    for k := 0 to ArgListNode.ChildCount - 1 do
+    begin
+      if k > High(D.ParamTypeNames) then Break;
+      if Pos(' PTR PTR', UpperFast(D.ParamTypeNames[k])) = 0 then Continue;
+      A := ArgListNode.GetChild(k);
+      while (A <> nil) and (A.NodeType in [antParentheses, antCast]) and (A.ChildCount >= 1) do
+        A := A.GetChild(0);
+      if (A = nil) or (A.NodeType <> antProcAddress) or (A.ChildCount <> 0) then Continue;
+      NU := UpperFast(VarToStr(A.Value));
+      if PointeeTypeOf(VarToStr(A.Value)) = '' then Continue;   // not a pointer variable
+      if PointerUDTType(NU) <> '' then
+      begin
+        if FRawUDTPtrs.IndexOfName(NU) < 0 then
+        begin
+          FRawUDTPtrs.Add(NU + '=' + PointerUDTType(NU));
+          FRawCollectChanged := True;
+        end;
+      end
+      else
+        MarkRaw(NU);
+    end;
+  end;
+
 begin
   if Node = nil then Exit;
   if (Node.NodeType = antAssignment) and (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antIdentifier) then
@@ -41572,13 +41612,20 @@ begin
      (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
   begin
     if Node.GetChild(0).NodeType = antIdentifier then
+    begin
       PropagateRawArgs(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
+      NoteForeignOutArgs(VarToStr(Node.GetChild(0).Value), Node.GetChild(1));
+    end;
     PropagateRawArgs(VarToStr(Node.Value), Node.GetChild(1));
+    NoteForeignOutArgs(VarToStr(Node.Value), Node.GetChild(1));
   end
   else if (Node.NodeType = antFunctionCall) and (Node.ChildCount >= 1) and
           (Node.GetChild(0) <> nil) and
           (Node.GetChild(0).NodeType in [antArgumentList, antExpressionList]) then
+  begin
     PropagateRawArgs(VarToStr(Node.Value), Node.GetChild(0));
+    NoteForeignOutArgs(VarToStr(Node.Value), Node.GetChild(0));
+  end;
 
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   // ...and the children's PROCEDURE scope, DIVERGENZE 96 - the same shape, one question lower: what is
@@ -47887,7 +47934,15 @@ begin
       // "const char *" means and what every binding writes. Routing it through EnsureIntRegister would
       // instead give VAL of the text - a number, silently, for a string that starts with a digit.
       // ssaStrSAdd is the existing STRPTR/SADD lowering, so this invents nothing.
+      // ⭐ ...AND TO A "WSTRING PTR" PARAMETER IT IS A WIDE TEMPORARY, as fbc makes one: "f(WStr("abc"))"
+      // handed the UTF-8 BYTES, which a wchar_t reader takes four at a time - wcslen answered 1 for
+      // "abc", and a Windows "...W" function received noise (DIVERGENZE 239, guard m907m).
       if (Kind = fkPointer) and (ArgVal.Kind in [svkConstString, svkRegister]) and
+         ((ArgVal.Kind = svkConstString) or (ArgVal.RegType = srtString)) and
+         (Pos('WSTRING PTR', UpperFast(Decl.ParamTypeNames[i])) > 0) and
+         (Pos(' PTR PTR', UpperFast(Decl.ParamTypeNames[i])) = 0) then
+        StageVals[i] := EmitWStringTempAddr(ArgVal)
+      else if (Kind = fkPointer) and (ArgVal.Kind in [svkConstString, svkRegister]) and
          ((ArgVal.Kind = svkConstString) or (ArgVal.RegType = srtString)) then
       begin
         PtrReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
