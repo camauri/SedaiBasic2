@@ -2596,6 +2596,9 @@ begin
     T := '';
     if (prm <> nil) and (prm.ChildCount >= 1) and (prm.GetChild(0).NodeType = antIdentifier) then
       T := prm.GetChild(0).ValueUpper;
+    // An alias ("byval d as LPARAM") is named through the alias table first: ForeignKindOf knows only
+    // canonical names, and an unknown one would drop the whole signature - the closure never built.
+    if T <> '' then T := UpperFast(CanonicalType(T));
     if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
     // ⛔⛔ IL SEPARATORE E' "~", NON LA VIRGOLA. La virgola separa gia' i PARAMETRI nella riga della
     // tabella esterna, quindi una firma scritta con le virgole veniva spezzata da ParseForeignDecl:
@@ -2611,6 +2614,7 @@ begin
   if (NameNode <> nil) and (NameNode.ChildCount >= 1) and
      (NameNode.GetChild(0).NodeType = antIdentifier) then
     Ret := NameNode.GetChild(0).ValueUpper;
+  if Ret <> '' then Ret := UpperFast(CanonicalType(Ret));
   if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
   Result := 'FNPTR:' + Ret + ':' + Params;
 end;
@@ -42324,6 +42328,14 @@ begin
     T := UpperFast(DeclaredTypeNameOf(Node));
     if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
+    // ⛔ CONST is not part of the pointee's name (the lesson of m586): "*Cast(Const Long Ptr, p)" named
+    // a pointee "CONST LONG" that no width table knows, and the deref took the RAW path - a packed VM
+    // array pointer read as a machine address (2^32 + index). Peeled at the top level only: a
+    // "Const Long Ptr Ptr" still dereferences to a pointer, which keeps its own qualifier.
+    while (Length(Result) >= 6) and (Copy(Result, 1, 6) = 'CONST ') do
+      Result := Trim(Copy(Result, 7, MaxInt));
+    while (Length(Result) >= 6) and (Copy(Result, Length(Result) - 5, 6) = ' CONST') do
+      Result := Trim(Copy(Result, 1, Length(Result) - 6));
   end
   else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
           (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antCast) then
@@ -47547,7 +47559,15 @@ begin
     for k := 0 to High(D.ParamTypeNames) do
     begin
       if Params <> '' then Params := Params + ',';
-      Params := Params + CanonicalType(D.ParamTypeNames[k]);
+      // A parameter typed by a named procedure-pointer ALIAS ("Type LINEDDAPROC As Sub(...)") is the
+      // same slot as one written "As Sub(...)" in full, which the parser already records as ANY PTR -
+      // and only an ANY PTR slot gets the per-site closure (DIVERGENZE 217/218). Left as the alias,
+      // ForeignKindOf saw an unknown name and the BASIC entry PC travelled as a machine address.
+      if (FuncPtrTypeSig(UpperFast(D.ParamTypeNames[k])) <> '') or
+         (FuncPtrTypeSig(UpperFast(CanonicalType(D.ParamTypeNames[k]))) <> '') then
+        Params := Params + 'ANY PTR'
+      else
+        Params := Params + CanonicalType(D.ParamTypeNames[k]);
     end;
     // ⛔⛔ E LA CODA VARIADICA VA RIMESSA. Questa procedura RICOSTRUISCE la riga da cio' che la
     // lettura ha tenuto, quindi cancella in silenzio ogni cosa che la lettura non tiene - e "..." non

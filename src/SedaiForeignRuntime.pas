@@ -210,6 +210,19 @@ begin
     if Tried <> '' then Tried := Tried + ', ';
     Tried := Tried + FLibs[i];
   end;
+  {$IFDEF WINDOWS}
+  // ⛔ ON WINDOWS THE C RUNTIME IS A DLL NOBODY NAMES. fbc LINKS msvcrt (and kernel32) into every
+  // program, so FreeBASIC's crt/*.bi headers declare qsort, printf, strlen... with no library at all;
+  // here nothing is linked, and the process-self lookup below has no RTLD_DEFAULT on Windows - it
+  // answers nil. Every CRT function was "not found" under win64 (qsort in the win64 deck). The libraries
+  // fbc puts on every link line are tried before giving up, in the same order.
+  for i := 0 to 1 do
+  begin
+    if i = 0 then H := OpenLib('msvcrt') else H := OpenLib('kernel32');
+    if H <> NilHandle then Result := FFISymbol(H, B.Decl.Symbol);
+    if Result <> nil then Exit;
+  end;
+  {$ENDIF}
   Result := FFISelfSymbol(B.Decl.Symbol);   // the process's own symbols, and everything it loaded
   if Result <> nil then Exit;
   if Tried = '' then
@@ -372,10 +385,11 @@ begin
           // questo sito di chiamata lo dice scrivendo il parametro come "FNPTR:..." (DIVERGENZE 218).
           if (i <= High(B^.Decl.ParamTypeNames)) and Assigned(FMakeClosure) and
              (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 6)) = 'FNPTR:') then
-          begin
-            PPointer(Vals[i])^ := FMakeClosure(ACtx, XferInt[SlotI], B^.Decl.ParamTypeNames[i]);
-            Inc(SlotI);
-          end
+          // ⛔⛔ NO Inc(SlotI) HERE: the one at the bottom of this arm counts every pointer, callbacks
+          // included. A second one made every argument AFTER a callback read the next slot over -
+          // invisible to qsort, whose callback is the last argument, and gdi32 LineDDA handed its
+          // callback an lParam of 0 (guard m907j, qsort_r).
+            PPointer(Vals[i])^ := FMakeClosure(ACtx, XferInt[SlotI], B^.Decl.ParamTypeNames[i])
           else if Assigned(FResolvePtr) then
           begin
             P := FResolvePtr(ACtx, XferInt[SlotI]);
