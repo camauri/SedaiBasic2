@@ -282,6 +282,18 @@ is recombined into one character each.
   On Linux nothing differs. FreeBASIC's own per-platform behaviour is planned as an opt-in STRICT mode,
   chosen when the program is compiled.
 
+**Memory a foreign function hands back is readable only inside what it handed back** (10 September
+2026). A pointer returned by a C or Windows function — or written by one into an out-parameter, or
+passed to a callback — can be read and written as in FreeBASIC: `p[i]` steps by the pointee's size and
+a structure's fields are read at their C layout. SedaiBasic records each such block, with its size when
+the call states it (`malloc`, `calloc`, `realloc`, `CoTaskMemAlloc`, `HeapAlloc`, `LocalAlloc`,
+`GlobalAlloc`, `VirtualAlloc`), and forgets it when the matching `free` releases it.
+  ⚠️ **What therefore differs from FreeBASIC**: an address outside every such block — past the end of
+  a block of known size, inside a block already freed, or a number converted to a pointer — stops the
+  program with a message, where FreeBASIC reads whatever is there or crashes. For a block whose size no
+  call states (a structure an API returns, a string `getenv` answers) only the start is checked. A
+  `WString Ptr` a Windows function returns is not yet read as UTF-16.
+
 **Pointer arithmetic and the numeric value of a pointer.** A pointer obtained from `Allocate`,
 `SAdd`, `StrPtr` or `ScreenPtr` is a byte address and steps by `SizeOf(pointee)`, exactly as in
 FreeBASIC. A pointer obtained with `@` on a variable or an array element is a packed

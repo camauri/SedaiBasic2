@@ -61,6 +61,12 @@ type
     puntatore - quindi si guarda solo dove il tipo dice che c'e' un puntatore da guardare. }
   TForeignPtrHome = function(ACtx: TObject; A: PtrUInt): Int64 of object;
 
+  { ⭐ MEMORY C HANDS BACK, AND WHEN IT TAKES IT AWAY (DIVERGENZE 239). The VM dereferences a machine
+    address only inside a region recorded here: a pointer a call RETURNED, one C wrote into an
+    out-parameter, one a callback received. ALen is the extent when the call itself says it (an
+    allocator's size argument), 0 when nothing does. AAdd = False releases the region: C's own free. }
+  TForeignRegionNote = procedure(ACtx: TObject; ABase, ALen: PtrUInt; AAdd: Boolean) of object;
+
   TForeignBinding = record
     Decl: TForeignDecl;
     ArgKinds: array of TForeignKind;
@@ -82,6 +88,7 @@ type
     FPtrRegion: TForeignPtrRegion;      // optional: without it nothing is translated back
     FMakeClosure: TForeignClosureMaker; // optional: senza, un callback resta un PC che C non sa chiamare
     FPtrHome: TForeignPtrHome;          // optional: senza, un parametro d'uscita resta un indirizzo nudo
+    FNoteRegion: TForeignRegionNote;    // optional: without it no C memory is ever readable
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -109,6 +116,7 @@ type
     property PtrRegion: TForeignPtrRegion read FPtrRegion write FPtrRegion;
     property MakeClosure: TForeignClosureMaker read FMakeClosure write FMakeClosure;
     property PtrHome: TForeignPtrHome read FPtrHome write FPtrHome;
+    property NoteRegion: TForeignRegionNote read FNoteRegion write FNoteRegion;
   end;
 
 { La mappa dai nostri tipi a quelli della ABI. ⛔ Esportata perche' chi costruisce una CHIUSURA ha
@@ -117,6 +125,93 @@ type
 function KindToRef(K: TForeignKind): TAbiType;
 
 implementation
+
+{ ⭐ THE CALLS THAT SAY HOW BIG THE MEMORY THEY RETURN IS, and the ones that take it back (DIVERGENZE
+  239). Argument indexes, -1 = none. OldP is the block a reallocator releases; FlagsA holds the flags
+  of LocalAlloc/GlobalAlloc, whose MOVEABLE bit ($0002) makes the result a HANDLE and not memory.
+  ⚠️ A call not listed here still hands back readable memory - of unknown extent, checked for
+  provenance only. The list buys the BOUNDS, not the access. }
+type
+  TFgnAllocRule = record
+    Sym: string;
+    SizeA, SizeB, OldP, FlagsA: Integer;
+  end;
+  TFgnFreeRule = record
+    Sym: string;
+    PtrA: Integer;
+  end;
+
+const
+  FGN_ALLOC_RULES: array[0..12] of TFgnAllocRule = (
+    (Sym: 'malloc';           SizeA: 0; SizeB: -1; OldP: -1; FlagsA: -1),
+    (Sym: 'calloc';           SizeA: 0; SizeB:  1; OldP: -1; FlagsA: -1),
+    (Sym: 'realloc';          SizeA: 1; SizeB: -1; OldP:  0; FlagsA: -1),
+    (Sym: 'aligned_alloc';    SizeA: 1; SizeB: -1; OldP: -1; FlagsA: -1),
+    (Sym: 'CoTaskMemAlloc';   SizeA: 0; SizeB: -1; OldP: -1; FlagsA: -1),
+    (Sym: 'CoTaskMemRealloc'; SizeA: 1; SizeB: -1; OldP:  0; FlagsA: -1),
+    (Sym: 'HeapAlloc';        SizeA: 2; SizeB: -1; OldP: -1; FlagsA: -1),
+    (Sym: 'HeapReAlloc';      SizeA: 3; SizeB: -1; OldP:  2; FlagsA: -1),
+    (Sym: 'LocalAlloc';       SizeA: 1; SizeB: -1; OldP: -1; FlagsA:  0),
+    (Sym: 'LocalReAlloc';     SizeA: 1; SizeB: -1; OldP:  0; FlagsA:  2),
+    (Sym: 'GlobalAlloc';      SizeA: 1; SizeB: -1; OldP: -1; FlagsA:  0),
+    (Sym: 'GlobalReAlloc';    SizeA: 1; SizeB: -1; OldP:  0; FlagsA:  2),
+    (Sym: 'VirtualAlloc';     SizeA: 1; SizeB: -1; OldP: -1; FlagsA: -1));
+  FGN_FREE_RULES: array[0..5] of TFgnFreeRule = (
+    (Sym: 'free';          PtrA: 0),
+    (Sym: 'CoTaskMemFree'; PtrA: 0),
+    (Sym: 'HeapFree';      PtrA: 2),
+    (Sym: 'LocalFree';     PtrA: 0),
+    (Sym: 'GlobalFree';    PtrA: 0),
+    (Sym: 'VirtualFree';   PtrA: 0));
+
+function FgnArg(Vals: PPointer; NArgs, K: Integer): PtrUInt;
+// The marshalled value of argument K - the buffer is zero-filled, so a narrower one reads right.
+begin
+  if (K < 0) or (K >= NArgs) or (Vals[K] = nil) then Exit(0);
+  Result := PPtrUInt(Vals[K])^;
+end;
+
+function FgnAllocLen(const Sym: string; Vals: PPointer; NArgs: Integer): PtrUInt;
+// The extent of the block this call returned, when the call says it; 0 otherwise.
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to High(FGN_ALLOC_RULES) do
+    if Sym = FGN_ALLOC_RULES[i].Sym then
+    begin
+      with FGN_ALLOC_RULES[i] do
+      begin
+        if (FlagsA >= 0) and ((FgnArg(Vals, NArgs, FlagsA) and 2) <> 0) then Exit(0);   // a HANDLE
+        Result := FgnArg(Vals, NArgs, SizeA);
+        if SizeB >= 0 then Result := Result * FgnArg(Vals, NArgs, SizeB);
+      end;
+      Exit;
+    end;
+end;
+
+procedure FgnNoteReleases(ACtx: TObject; const Sym: string; Vals: PPointer; NArgs: Integer;
+  Note: TForeignRegionNote);
+// A block C's own free (or a reallocator) has taken back stops being readable.
+var
+  i: Integer;
+  P: PtrUInt;
+begin
+  for i := 0 to High(FGN_FREE_RULES) do
+    if Sym = FGN_FREE_RULES[i].Sym then
+    begin
+      P := FgnArg(Vals, NArgs, FGN_FREE_RULES[i].PtrA);
+      if P <> 0 then Note(ACtx, P, 0, False);
+      Exit;
+    end;
+  for i := 0 to High(FGN_ALLOC_RULES) do
+    if (Sym = FGN_ALLOC_RULES[i].Sym) and (FGN_ALLOC_RULES[i].OldP >= 0) then
+    begin
+      P := FgnArg(Vals, NArgs, FGN_ALLOC_RULES[i].OldP);
+      if P <> 0 then Note(ACtx, P, 0, False);
+      Exit;
+    end;
+end;
 
 constructor TForeignTable.Create;
 begin
@@ -470,6 +565,7 @@ begin
 
   FillChar(RetBuf, SizeOf(RetBuf), 0);
   AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
+  if Assigned(FNoteRegion) then FgnNoteReleases(ACtx, B^.Decl.Symbol, @Vals[0], NArgs, FNoteRegion);
 
   {$IFDEF WINDOWS}
   // ...and each UTF-16 copy goes back into the program's cells: a surrogate pair becomes ONE character,
@@ -509,7 +605,11 @@ begin
           Avail := 0;
           ResInt := FPtrHome(ACtx, RetAddr);
           if ResInt <> 0 then PInt64(OutLoc[i])^ := ResInt
-          else PInt64(OutLoc[i])^ := Int64(RetAddr) or FGNPTR_TAG;
+          else
+          begin
+            PInt64(OutLoc[i])^ := Int64(RetAddr) or FGNPTR_TAG;
+            if Assigned(FNoteRegion) then FNoteRegion(ACtx, RetAddr, 0, True);   // DIVERGENZE 239
+          end;
         end;
       end;
 
@@ -576,6 +676,9 @@ begin
           // Non e' memoria nostra (malloc, una stringa statica dentro la libreria): resta un indirizzo
           // MACCHINA, marcato perche' la chiamata dopo lo riconosca. Un NULL resta 0: "If p = 0" e' il
           // modo in cui ogni binding lo prova. Vedi FGNPTR_TAG.
+          // ⭐ ...and readable, inside the region this call handed back (DIVERGENZE 239).
+          if Assigned(FNoteRegion) then
+            FNoteRegion(ACtx, RetAddr, FgnAllocLen(B^.Decl.Symbol, @Vals[0], NArgs), True);
           ResInt := ResInt or FGNPTR_TAG;
         end;
       end;

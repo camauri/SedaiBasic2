@@ -709,6 +709,7 @@ type
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
                             out ResultVal: TSSAValue): Boolean;
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
+    function IsForeignPtrCall(Node: TASTNode): Boolean;   // a C call returning C-owned memory (DIVERGENZE 239)
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);   // raw-ness crosses the call here
     function RawPtrMarkedHere(const NameU: string): Boolean;       // ...is it raw in THIS scope? (DIVERGENZE 96)
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -41234,6 +41235,76 @@ begin
   end;
 end;
 
+function TSSAGenerator.IsForeignPtrCall(Node: TASTNode): Boolean;
+// A call to a C function whose declared result is a POINTER, and none of whose arguments is the
+// program's own memory. Its result is a MACHINE address - memory C owns, addressed in BYTES - so a
+// variable that receives it is RAW: "p[1]" on a Long Ptr must step four bytes, not one element, and a
+// field must be read at its C-layout offset. DIVERGENZE 239.
+// ⛔ THE ARGUMENT TEST IS WHAT KEEPS THE OTHER HALF WORKING. When an argument IS the program's memory
+// ("bsearch(@key, @v(0), ...)", "strchr(@buf(0), ...)") the result may land inside it, and the runtime
+// then hands it back as the program's own ELEMENT-indexed pointer (DIVERGENZE 215) - which byte-scaled
+// arithmetic would walk eight times too far along an Integer array. A STRING argument does not count:
+// its bytes travel from the raw heap, so a pointer into them comes home raw anyway.
+var
+  NameU: string;
+  D: TForeignDecl;
+  Idx, i, k, First: Integer;
+  Args: TASTNode;
+
+  function IsProgramMemory(A: TASTNode): Boolean;
+  var
+    j: Integer;
+    Dummy: TASTNode;
+  begin
+    Result := False;
+    if A = nil then Exit;
+    while (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
+    case A.NodeType of
+      // "@a(i)" is an ELEMENT pointer into the program's array - the one shape a result can come home
+      // into and then be walked by elements. "@x" of a scalar or a record is not: that storage is never a
+      // region the call hands back into ("gmtime(@t)" answers C's own struct), and "@proc" names code.
+      antProcAddress:
+        Result := (A.ChildCount > 0) and (A.GetChild(0) <> nil) and
+                  (A.GetChild(0).NodeType = antArrayAccess);
+      // A pointer VARIABLE that is not raw may hold an element pointer into the program's arrays.
+      antIdentifier:
+        Result := (PointeeTypeOf(VarToStr(A.Value)) <> '') and not IsRawPtr(VarToStr(A.Value));
+      antCast, antBinaryOp:
+        for j := 0 to A.ChildCount - 1 do
+          if IsProgramMemory(A.GetChild(j)) then Exit(True);
+    end;
+  end;
+
+begin
+  Result := False;
+  if (Node = nil) or not Assigned(FProgram) then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if not (Node.NodeType in [antFunctionCall, antArrayAccess]) then Exit;
+  First := 0;
+  if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
+    NameU := Node.GetChild(0).ValueUpper;
+    First := 1;
+  end
+  else
+    NameU := Node.ValueUpper;
+  if NameU = '' then Exit;
+  Idx := FProgram.IndexOfForeignDecl(NameU);
+  if (Idx < 0) or not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+  if ForeignKindOf(D.RetTypeName) <> fkPointer then Exit;
+  for i := First to Node.ChildCount - 1 do
+  begin
+    Args := Node.GetChild(i);
+    if (Args <> nil) and (Args.NodeType in [antArgumentList, antExpressionList]) then
+    begin
+      for k := 0 to Args.ChildCount - 1 do
+        if IsProgramMemory(Args.GetChild(k)) then Exit;
+    end
+    else if IsProgramMemory(Args) then Exit;
+  end;
+  Result := True;
+end;
+
 procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
 // Pre-scan (run to a fixpoint by the caller): a pointer variable is RAW if it is assigned from
 // ALLOCATE/CALLOCATE/REALLOCATE, from a pointer CAST/CPTR of a raw value, or copied from another raw
@@ -41359,8 +41430,10 @@ var
       // ⭐ ...AND AN IMAGE. "Dim As FB.IMAGE Ptr img = ImageCreate(...)" is a UDT pointer whose value is
       // an ADDRESS - into the image-surface region - not a handle of a record this compiler owns. Left
       // unmarked, "img->width" took the managed-record path and faulted on the first field.
+      // ⭐ ...AND A STRUCTURE C HANDS BACK ("tm Ptr" from gmtime, any struct a Windows API returns by
+      // pointer): C-layout bytes C owns, not a record this compiler allocated. DIVERGENZE 239.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
-         IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or
+         IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or IsForeignPtrCall(Rhs) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
           TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
@@ -41375,6 +41448,8 @@ var
       MarkRaw(TargetU)   // p = New T[n] / New <builtin>: a byte block, indexed and freed raw
     else if IsAllocCall(Rhs, FU) then
       MarkRaw(TargetU)
+    else if IsForeignPtrCall(Rhs) then
+      MarkRaw(TargetU)   // p = f(...), f a C function returning memory C owns (DIVERGENZE 239)
     else if IsScreenPtrExpr(Rhs) then
       MarkRaw(TargetU)   // p = ScreenPtr: raw, in the framebuffer region
     else if IsImageCreateExpr(Rhs) then
@@ -41384,6 +41459,7 @@ var
       TU := Rhs.ValueUpper;
       if (Length(TU) >= 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
         if IsAllocCall(Rhs.GetChild(0), FU) or IsScreenPtrExpr(Rhs.GetChild(0)) or
+           IsForeignPtrCall(Rhs.GetChild(0)) or
            ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) or
            ((Rhs.GetChild(0).NodeType = antProcAddress) and (Rhs.GetChild(0).ChildCount = 0) and
             (FAddrTakenScalars.IndexOfName(Rhs.GetChild(0).ValueUpper) >= 0)) then
@@ -41456,7 +41532,7 @@ begin
   begin
     Rhs := Node.GetChild(1);
     if IsAllocCall(Rhs, TU) or IsScreenPtrExpr(Rhs) or IsStrDataPtrExpr(Rhs) or
-       (RawPtrExprName(Rhs) <> '') or
+       IsForeignPtrCall(Rhs) or (RawPtrExprName(Rhs) <> '') or
        ((Rhs.NodeType = antCast) and (Rhs.ChildCount >= 1) and IsAllocCall(Rhs.GetChild(0), TU)) or
        ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1')) then
     begin
@@ -41549,6 +41625,7 @@ begin
   if Node = nil then Exit;
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if IsAllocCall(Node, FU) then Exit(True);                 // return Allocate/CAllocate/Reallocate(...)
+  if IsForeignPtrCall(Node) then Exit(True);                // return f(...), f a C function (DIVERGENZE 239)
   if IsScreenPtrExpr(Node) then Exit(True);
   // return @obj.field[i]: the address of a raw field element (a member-access base). "@g" (a plain
   // identifier base) is a managed variable address and is deliberately excluded.

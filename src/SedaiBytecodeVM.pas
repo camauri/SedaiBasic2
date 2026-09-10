@@ -217,6 +217,12 @@ type
     // Le chiusure costruite per le procedure BASIC passate a C, in cache per (PC, firma) e possedute
     // qui: una pagina eseguibile per confronto di `qsort` sarebbe una syscall per confronto.
     FClosures: TStringList;
+    // ⭐ MEMORY A FOREIGN CALL HANDED BACK (DIVERGENZE 239): base and length (0 = not known), sorted by
+    // base. A machine address is dereferenceable only inside one of these - bounds-checked when the
+    // length is known - and a region leaves when C's own free releases it.
+    FFgnBase, FFgnLen: array of PtrUInt;
+    FFgnCount: Integer;
+    FFgnLock: TRTLCriticalSection;
     // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
     // per surface: it is filled from the surface at every read, so it is never stale.
     FImgHeaderBuf: array[0..RAWPTR_IMG_HDR_SIZE - 1] of Byte;
@@ -825,6 +831,8 @@ type
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
+    procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd: Boolean);
+    function ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Pointer;
     procedure RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
                              ARet: Pointer; AArgs: PPointer;
                              ARetKind: TForeignKind;
@@ -1764,6 +1772,7 @@ begin
   GNoExcFrame := SysUtils.GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
   InitCriticalSection(FSharedRecLock);
   InitCriticalSection(FRawHeapLock);
+  InitCriticalSection(FFgnLock);
   FRawHeapTop := 0;
   FRawFreeCount := 0;
   FProgram := nil;
@@ -1918,6 +1927,7 @@ begin
   DoneCriticalSection(FSharedRecLock);
   SetLength(FRawHeap, 0);
   DoneCriticalSection(FRawHeapLock);
+  DoneCriticalSection(FFgnLock);
   FCtx.Free;
   FDrainCtx.Free;
   FDrawQueue.Free;
@@ -5589,6 +5599,15 @@ var
   Ch: Int64;
 begin
   Result := '';
+  // C's memory - a string getenv answered, a buffer a Windows API filled (DIVERGENZE 239).
+  if (PtrAddr > 0) and ((PtrAddr and RAWPTR_TAG) = 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+  begin
+    Result := RawLoadZStrVal(PtrAddr, Wide);
+    if (ExactBytes > 0) and (Length(Result) > ExactBytes) then SetLength(Result, ExactBytes);
+    if (ExactBytes > 0) and (Length(Result) < ExactBytes) then
+      Result := Result + StringOfChar(#0, ExactBytes - Length(Result));
+    Exit;
+  end;
   ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
@@ -5626,6 +5645,11 @@ var
   PtrOffset, Lim: Int64;
   U: TUCS4Cells;
 begin
+  if (PtrAddr > 0) and ((PtrAddr and RAWPTR_TAG) = 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+  begin
+    RawStoreZStrVal(PtrAddr, Value, Wide);               // C's memory - DIVERGENZE 239
+    Exit;
+  end;
   ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if SysUtils.GetEnvironmentVariable('ZPTR_DIAG') = '1' then
@@ -5684,7 +5708,13 @@ var
   Data: PByte;
   SizeBytes, ImgHandle, FbSurf: Integer;
   FbPage: Int64;
+  FgnAvail: PtrUInt;
 begin
+  // ⭐ MEMORY A FOREIGN CALL RETURNED (DIVERGENZE 239): a machine address, dereferenceable only inside a
+  // region C handed back. ⛔ Asked BEFORE the raw test: the tag is bit 61, which under RAWPTR_TAG means
+  // the framebuffer - so the two are told apart by bit 62, never by bit 61 alone.
+  if (RawPtr > 0) and ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+    Exit(ForeignRegionAddr(PtrUInt(RawPtr and not FGNPTR_TAG), NeedBytes, FgnAvail));
   if (RawPtr and RAWPTR_TAG) = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
@@ -5832,6 +5862,8 @@ var
   RecSlot, ArrayIdx: Integer;
   PtrOffset: Int64;
 begin
+  if (PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+    Exit(RawLoadInt(PtrAddr, WidthCode));                // C's memory - DIVERGENZE 239
   if PtrAddr < 0 then
   begin
     Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
@@ -5863,6 +5895,8 @@ var
   RecSlot, ArrayIdx: Integer;
   PtrOffset: Int64;
 begin
+  if (PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+    Exit(RawLoadFloat(PtrAddr, 0));                      // C's memory - DIVERGENZE 239
   if PtrAddr < 0 then
   begin
     Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
@@ -5886,6 +5920,11 @@ var
   RecSlot, ArrayIdx: Integer;
   PtrOffset: Int64;
 begin
+  if (PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+  begin
+    RawStoreInt(PtrAddr, 0, Value);                      // C's memory - DIVERGENZE 239
+    Exit;
+  end;
   if PtrAddr < 0 then
   begin
     Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
@@ -5910,6 +5949,11 @@ var
   RecSlot, ArrayIdx: Integer;
   PtrOffset: Int64;
 begin
+  if (PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+  begin
+    RawStoreFloat(PtrAddr, 0, Value);                    // C's memory - DIVERGENZE 239
+    Exit;
+  end;
   if PtrAddr < 0 then
   begin
     Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
@@ -6090,7 +6134,9 @@ begin
   if RawPtr = 0 then Exit('');
   P := PByte(RawAddr(RawPtr, 1));                      // validates region + at least one byte
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
-  if (RawPtr and RAWPTR_REGION_FB) <> 0 then
+  if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+    ForeignRegionAddr(PtrUInt(RawPtr and not FGNPTR_TAG), 1, Limit)   // C's memory: its region's extent
+  else if (RawPtr and RAWPTR_REGION_FB) <> 0 then
     Limit := 0                                          // a framebuffer is not text: empty string
   else
     Limit := PtrUInt(Length(FRawHeap)) - ofs;
@@ -6232,6 +6278,7 @@ begin
   // A raw-heap / framebuffer pointer, or a record-field pointer (bit 63): RawAddr owns both answers -
   // the second one by refusing it, since a record field is not a byte image either.
   if (Ptr and RAWPTR_TAG) <> 0 then Exit(RawAddr(Ptr, NeedBytes));
+  if (Ptr > 0) and ((Ptr and FGNPTR_TAG) <> 0) then Exit(RawAddr(Ptr, NeedBytes));   // DIVERGENZE 239
   if Ptr < 0 then
     raise ERangeError.Create('CLEAR/FB_MEMCOPY: a record-field pointer is not a byte image');
   if Ptr = 0 then
@@ -6370,6 +6417,7 @@ begin
       T.PtrRegion := @ForeignPtrRegion;
       T.MakeClosure := @ForeignMakeClosure;
       T.PtrHome := @ForeignPtrHome;
+      T.NoteRegion := @ForeignNoteRegion;
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
@@ -6450,7 +6498,11 @@ begin
             // Non e' memoria nostra: resta un indirizzo MACCHINA, marcato.
             ACtx.XferInt[SlotI] := Int64(PtrUInt(PPointer(AArgs[i])^));
             if ACtx.XferInt[SlotI] <> 0 then
+            begin
               ACtx.XferInt[SlotI] := ACtx.XferInt[SlotI] or FGNPTR_TAG;
+              // ...and readable for the callback, as memory C handed over (DIVERGENZE 239).
+              ForeignNoteRegion(ACtx, PtrUInt(PPointer(AArgs[i])^), 0, True);
+            end;
           end;
           Inc(SlotI);
         end;
@@ -6498,6 +6550,96 @@ begin
   else
     PInt64(ARet)^ := ACtx.XferInt[255];
   end;
+end;
+
+procedure TBytecodeVM.ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd: Boolean);
+// Record (AAdd) or release a region of memory C handed back. A second note of the same base keeps the
+// larger knowledge: a known length is never overwritten by an unknown one - "f(p)" answering its own
+// argument must not forget how big the block malloc gave was.
+var
+  lo, hi, mid: Integer;
+begin
+  if ABase = 0 then Exit;
+  EnterCriticalSection(FFgnLock);
+  try
+    lo := 0; hi := FFgnCount - 1;
+    while lo <= hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if FFgnBase[mid] < ABase then lo := mid + 1 else hi := mid - 1;
+    end;
+    if (lo < FFgnCount) and (FFgnBase[lo] = ABase) then
+    begin
+      if AAdd then
+      begin
+        if ALen > 0 then FFgnLen[lo] := ALen;
+      end
+      else
+      begin
+        if lo < FFgnCount - 1 then
+        begin
+          Move(FFgnBase[lo + 1], FFgnBase[lo], (FFgnCount - lo - 1) * SizeOf(PtrUInt));
+          Move(FFgnLen[lo + 1], FFgnLen[lo], (FFgnCount - lo - 1) * SizeOf(PtrUInt));
+        end;
+        Dec(FFgnCount);
+      end;
+      Exit;
+    end;
+    if not AAdd then Exit;
+    if FFgnCount = Length(FFgnBase) then
+    begin
+      SetLength(FFgnBase, 2 * FFgnCount + 16);
+      SetLength(FFgnLen, Length(FFgnBase));
+    end;
+    if lo < FFgnCount then
+    begin
+      Move(FFgnBase[lo], FFgnBase[lo + 1], (FFgnCount - lo) * SizeOf(PtrUInt));
+      Move(FFgnLen[lo], FFgnLen[lo + 1], (FFgnCount - lo) * SizeOf(PtrUInt));
+    end;
+    FFgnBase[lo] := ABase;
+    FFgnLen[lo] := ALen;
+    Inc(FFgnCount);
+  finally
+    LeaveCriticalSection(FFgnLock);
+  end;
+end;
+
+function TBytecodeVM.ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Pointer;
+// The machine address A, if NeedBytes from it lie in memory a foreign call handed back; raise otherwise.
+// ⛔ The region is the NEAREST one at or below A. With a known length that is a real bounds check; with
+// an unknown one (a structure an API returned, a string getenv answered) it is provenance only - the
+// address is past the start of something C gave the program, and how far past nobody here can say.
+var
+  lo, hi, mid, r: Integer;
+  B, L: PtrUInt;
+begin
+  r := -1; B := 0; L := 0;
+  EnterCriticalSection(FFgnLock);
+  try
+    lo := 0; hi := FFgnCount - 1;
+    while lo <= hi do
+    begin
+      mid := (lo + hi) shr 1;
+      if FFgnBase[mid] <= A then begin r := mid; lo := mid + 1; end
+      else hi := mid - 1;
+    end;
+    if r >= 0 then begin B := FFgnBase[r]; L := FFgnLen[r]; end;
+  finally
+    LeaveCriticalSection(FFgnLock);
+  end;
+  if r < 0 then
+    raise ERangeError.CreateFmt('Foreign pointer dereference: address %d is not inside memory a ' +
+                                'foreign call returned', [Int64(A)]);
+  if L > 0 then
+  begin
+    if (A - B) + NeedBytes > L then
+      raise ERangeError.CreateFmt('Foreign pointer dereference out of bounds: offset %d + %d > %d bytes',
+                                  [Int64(A - B), Int64(NeedBytes), Int64(L)]);
+    AAvail := L - (A - B);
+  end
+  else
+    AAvail := High(PtrUInt) shr 1;
+  Result := Pointer(A);
 end;
 
 function TBytecodeVM.ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;
@@ -15601,6 +15743,9 @@ begin
           // where every path that produces one arrives.
           else if (PtrAddr and RAWPTR_TAG) <> 0 then
             Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, 0)
+          // ⭐ Memory a foreign call returned, read at the width the lowering names (DIVERGENZE 239).
+          else if (PtrAddr and FGNPTR_TAG) <> 0 then
+            Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)
           else
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -15644,7 +15789,7 @@ begin
             Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
           end
           // The raw-address kind - see the note in bcRefLoadInt above.
-          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
             Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
           else
           begin
@@ -15675,7 +15820,7 @@ begin
           // written "Operator = *This.p" over a CAllocate'd ZString hands back a correctly tagged raw
           // address, and this decoded it as a packed array pointer: "Null or invalid pointer
           // dereference, address 4611686018427387944". Text at a raw address is a C string.
-          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
             Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
           else
           begin
@@ -15698,6 +15843,9 @@ begin
           // or "**pp = 5" stores into a nonexistent array while "*p = 5" works.
           else if (PtrAddr and RAWPTR_TAG) <> 0 then
             RawStoreInt(PtrAddr, 0, Ctx.IntRegs[Instr.Src2])
+          // ⭐ Memory a foreign call returned, written at the store's own width (DIVERGENZE 239).
+          else if (PtrAddr and FGNPTR_TAG) <> 0 then
+            RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
           else
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -15732,7 +15880,7 @@ begin
             RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
           end
           // The raw-address kind - see the note in bcRefLoadInt above.
-          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
             RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
           else
           begin
@@ -15759,7 +15907,7 @@ begin
           end
           // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
           // or LSET on such a UDT reads its buffer and then stores into a nonexistent array.
-          else if (PtrAddr and RAWPTR_TAG) <> 0 then
+          else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
             RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
           else
           begin
@@ -15792,7 +15940,9 @@ begin
       23: // bcRawLoadInt
         begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
-          if (PtrAddr and RAWPTR_TAG) <> 0 then
+          // ⭐ ...and so does memory a foreign call returned (DIVERGENZE 239): through PtrDomain it would
+          // lose the width, and a Long written through a Long Ptr became eight bytes.
+          if ((PtrAddr and RAWPTR_TAG) <> 0) or ((PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0)) then
             Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)   // a real raw address: it carries the WIDTH
           else
             Ctx.IntRegs[Instr.Dest] := PtrDomainLoadInt(Ctx, PtrAddr, Instr.Immediate);
@@ -15800,7 +15950,7 @@ begin
       24: // bcRawLoadFloat
         begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
-          if (PtrAddr and RAWPTR_TAG) <> 0 then
+          if ((PtrAddr and RAWPTR_TAG) <> 0) or ((PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0)) then
             Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)
           else
             Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr);
@@ -15810,7 +15960,7 @@ begin
       25: // bcRawStoreInt
         begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
-          if (PtrAddr and RAWPTR_TAG) <> 0 then
+          if ((PtrAddr and RAWPTR_TAG) <> 0) or ((PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0)) then
             RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
           else
             PtrDomainStoreInt(Ctx, PtrAddr, Ctx.IntRegs[Instr.Src2]);
@@ -15818,7 +15968,7 @@ begin
       26: // bcRawStoreFloat
         begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
-          if (PtrAddr and RAWPTR_TAG) <> 0 then
+          if ((PtrAddr and RAWPTR_TAG) <> 0) or ((PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0)) then
             RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])
           else
             PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2]);
