@@ -40,6 +40,12 @@ type
     LibName: string;                 // the library named on the declaration ('' = use #inclib)
     RetTypeName: string;             // '' for a SUB
     ParamTypeNames: array of string;
+    { ⭐ The C variadic tail, "..." on the declaration (printf, sprintf, fprintf, ...). It travels in
+      the parameter list as an entry spelled "..." and is stripped out here, so ParamTypeNames holds
+      only the DECLARED parameters and every existing reader keeps counting what it counted before.
+      ⛔ It changes what "called with more arguments than declared" MEANS: on an ordinary declaration
+      the surplus is an error, on a variadic one it is the point. }
+    Variadic: Boolean;
   end;
 
 { Split one table line. Returns False on a line that is not in the format above. }
@@ -69,6 +75,7 @@ begin
   Result := False;
   ADecl.Name := ''; ADecl.Symbol := ''; ADecl.LibName := '';
   ADecl.RetTypeName := ''; SetLength(ADecl.ParamTypeNames, 0);
+  ADecl.Variadic := False;
   if ALine = '' then Exit;
   Rest := ALine;
   for i := 0 to 3 do
@@ -93,7 +100,9 @@ begin
       if (i > Length(Fields[4])) or (Fields[4][i] = ',') then
       begin
         T := Trim(Copy(Fields[4], Start, i - Start));
-        if T <> '' then
+        if T = '...' then
+          ADecl.Variadic := True
+        else if T <> '' then
         begin
           SetLength(ADecl.ParamTypeNames, n + 1);
           ADecl.ParamTypeNames[n] := T;

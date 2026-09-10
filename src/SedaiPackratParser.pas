@@ -1782,6 +1782,7 @@ var
   FgnName, FgnAlias, FgnLib, FgnRet, FgnParams, FgnTok: string;
   FgnDepth: Integer;
   FgnAfterAs, FgnIsFunc, FgnTypeOpen: Boolean;
+  FgnVariadic: Boolean;     // "..." in the parameter list: the C tail (printf, sprintf, ...)
   FgnByVal: Boolean;        // the parameter's stated passing mode; unstated reads as BYREF
   FgnLastDecl: Integer;     // index in FDeclTypeUses of the type just recorded, so a PTR can mark it
   FgnNameRaw: string;
@@ -1939,6 +1940,7 @@ begin
    // program node. DIVERGENZE 183.
    FgnName := ''; FgnAlias := ''; FgnLib := ''; FgnRet := ''; FgnParams := '';
    FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False; FgnTypeOpen := False;
+   FgnVariadic := False;
    // ⛔ THE PASSING MODE AND THE POINTER SUFFIX DECIDE WHETHER AN INCOMPLETE TYPE IS AN ERROR, so the
    // walk has to carry both. fbc refuses "byval as <incomplete>" (error 71) and takes the same type
    // "byref" or "ptr" without a word: win/sql.bi declares "byval BufferLength as SQLLEN" where SQLLEN
@@ -1970,6 +1972,12 @@ begin
          else FgnLib := VarToStr(Context.PeekNext.Value);
        end;
      end
+     // ⛔⛔ "..." E' LA CODA VARIADICA DEL C, e cadeva nell'ultimo ramo che consuma e basta: i punti
+     // sparivano e la dichiarazione sembrava ordinaria, quindi a OGNI sito di chiamata gli argomenti
+     // in piu' venivano scartati in silenzio - `printf("%d", 7)` stampava 0. E' lo stesso token che il
+     // lettore delle procedure BASIC riconosce gia' (ttOpDot, attributo VARIADIC).
+     else if (FgnDepth > 0) and Context.Check(ttOpDot) then
+       FgnVariadic := True
      else if (FgnTok = 'BYVAL') or (FgnTok = 'BYREF') then
        FgnByVal := FgnTok = 'BYVAL'
      else if (FgnTok = kAS) or Context.Check(ttAsType) then
@@ -2076,6 +2084,14 @@ begin
    begin
      if not FgnIsFunc then FgnRet := '';
      if FgnAlias = '' then FgnAlias := FgnNameRaw;
+     // ⭐ La coda variadica viaggia come un PARAMETRO di nome "...", cioe' dentro il formato che
+     // c'e' gia' (NOME|SIMBOLO|LIB|RITORNO|TIPO,TIPO,...). Non serve un campo nuovo, e un `.basc`
+     // vecchio - che quel parametro non ce l'ha - continua a leggersi come prima.
+     if FgnVariadic then
+     begin
+       if FgnParams <> '' then FgnParams := FgnParams + ',';
+       FgnParams := FgnParams + '...';
+     end;
      FForeignDecls.Add(FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
    end;
    Result := nil;

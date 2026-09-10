@@ -700,6 +700,9 @@ type
     // ⭐ FFI (DIVERGENZE 183): a call to a name the program declared with "Declare ... Alias ... Lib"
     // is not a BASIC call - it leaves the process. TryForeignCall answers False for every other name,
     // so it can be asked wherever a name has failed to resolve.
+    function VarArgIsAddress(Node: TASTNode): Boolean;   // il valore e' un INDIRIZZO?
+    function VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
+                                  NArgs: Integer): Integer;   // la coda variadica di UN sito
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
                             out ResultVal: TSSAValue): Boolean;
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
@@ -47298,10 +47301,123 @@ begin
       if Params <> '' then Params := Params + ',';
       Params := Params + CanonicalType(D.ParamTypeNames[k]);
     end;
+    // ⛔⛔ E LA CODA VARIADICA VA RIMESSA. Questa procedura RICOSTRUISCE la riga da cio' che la
+    // lettura ha tenuto, quindi cancella in silenzio ogni cosa che la lettura non tiene - e "..." non
+    // sta fra i ParamTypeNames per costruzione. La marcatura spariva qui, prima che un solo sito di
+    // chiamata la vedesse: il parser la registrava, il registro la mostrava, e al momento di decidere
+    // valeva gia' False. ⇒ Un riscrittore che ricompone da una forma LETTA e' completo solo quanto la
+    // lettura: ogni campo che la lettura mette da parte va rimesso qui a mano.
+    if D.Variadic then
+    begin
+      if Params <> '' then Params := Params + ',';
+      Params := Params + '...';
+    end;
     Line := D.Name + '|' + D.Symbol + '|' + D.LibName + '|';
     if D.RetTypeName <> '' then Line := Line + CanonicalType(D.RetTypeName);
     FProgram.SetForeignDecl(i, Line + '|' + Params);
   end;
+end;
+
+function TSSAGenerator.VarArgIsAddress(Node: TASTNode): Boolean;
+// Does this expression's VALUE denote an ADDRESS? Asked only of the arguments in a C variadic tail,
+// where no declaration answers it and the two possibilities are marshalled differently: "@buf" and "7"
+// are both INTEGER-banked here, and handing printf the second where it expects the first prints a
+// number nobody passed - or, for "%s", dereferences it and CRASHES.
+//
+// ⛔⛔ IT IS ITS OWN QUESTION, and deliberately not ExprIsPointerValue widened. That one answers for a
+// bare pointer VARIABLE and is asked by eleven other callers whose meaning would change with it
+// (DIVERGENZE 153: a cast on "*p" is right and must keep working). Widening a narrow rule in one copy
+// is a trap this project has already paid for.
+//
+// ⭐ The shapes that reach a variadic tail in real bindings, and nothing more:
+//   "@x" / "@literal"        an address-of                  -> antProcAddress
+//   "p" declared "T Ptr"     a pointer variable             -> ExprIsPointerValue
+//   "Cast(ZString Ptr, x)"   a cast whose target is a PTR   -> antCast with a " PTR" type
+//   "StrPtr(s)" / "SAdd(s)"  the address of a string's bytes
+// Anything else answers False, which is the safe direction: a pointer passed as a number prints a
+// wrong number, a number passed as a pointer crashes.
+var
+  Nm: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType = antProcAddress then Exit(True);
+  if Node.NodeType = antCast then
+    Exit(Pos(' PTR', UpperFast(VarToStr(Node.Value))) > 0);
+  // ⛔ E "@\"letterale\"" NON E' UN antProcAddress: il parser lo riscrive in StrPtr(<letterale>) -
+  // «una grafia nuova, nessun ramo nuovo» - quindi arriva come un antArrayAccess il cui figlio 0 e'
+  // l'identificatore STRPTR. E' la forma piu' comune di tutte in una coda variadica
+  // (`printf("%s", @"ciao")`), e senza questo ramo veniva classificata INTEGER: printf dereferenziava
+  // il numero e il programma moriva di access violation invece di stampare una risposta sbagliata.
+  Nm := '';
+  if Node.NodeType in [antFunctionCall, antIdentifier] then
+    Nm := Node.ValueUpper
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+    Nm := Node.GetChild(0).ValueUpper;
+  if (Nm = 'STRPTR') or (Nm = 'SADD') or (Nm = 'VARPTR') or (Nm = 'PROCPTR') then Exit(True);
+  Result := ExprIsPointerValue(Node);
+end;
+
+function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
+  NArgs: Integer): Integer;
+// The foreign-table entry for ONE variadic call site: the declared parameters, then the tail spelled
+// out as ordinary types read off the ARGUMENTS. Returns its index.
+//
+// ⭐ Why the types come from the arguments and not from the declaration: a "..." declares nothing.
+// C answers the same question with the default argument promotions, and they are the rule here too -
+// a float travels as a DOUBLE and a narrow integer as a full machine word, which is what a variadic
+// callee reads out of the register. Getting that wrong does not raise: printf reads the register it
+// was told to read and prints a number nobody passed.
+//
+// ⛔ AND POINTER-OR-NUMBER IS THE ONE QUESTION THE BANK CANNOT ANSWER. "@buf" and "7" are both INTEGER
+// values here, and they must be marshalled differently - the first is a VM-domain address that has to
+// be resolved to a machine address, the second is the number itself. ExprIsPointerValue is the pass
+// that knows, and passing one for the other prints "(null)".
+//
+// ⛔ A BASIC STRING in the tail is REFUSED BY NAME. fbc passes the string DESCRIPTOR there, not the
+// bytes, so "%s" is wrong in fbc too; answering with the bytes would be a silent divergence in the
+// direction that looks like it works. The idiom that IS right - "@literal" or a ZSTRING PTR - goes
+// through the pointer arm above.
+var
+  i, k: Integer;
+  Params, T, Line: string;
+begin
+  Params := '';
+  for i := 0 to High(Decl.ParamTypeNames) do
+  begin
+    if Params <> '' then Params := Params + ',';
+    Params := Params + Decl.ParamTypeNames[i];
+  end;
+  for i := Length(Decl.ParamTypeNames) to NArgs - 1 do
+  begin
+    if VarArgIsAddress(ArgListNode.GetChild(i)) then
+      T := 'ANY PTR'
+    else
+      case InferExprBank(ArgListNode.GetChild(i)) of
+        srtFloat:  T := 'DOUBLE';          // the C default promotion: a variadic float IS a double
+        srtString: raise Exception.CreateFmt(
+                     'Foreign function %s: argument %d of the variadic tail is a BASIC STRING, which ' +
+                     'has no C meaning there - pass "@" of a literal or a ZSTRING PTR',
+                     [Decl.Name, i + 1]);
+      else
+        T := 'INTEGER';
+      end;
+    if Params <> '' then Params := Params + ',';
+    Params := Params + T;
+  end;
+  // ⚠️ The NAME carries the argument count so two call sites of the same function with different tails
+  // get different entries - and it can never collide with a real declaration, because no BASIC name
+  // holds a '#'. Nothing ever looks this name up: the loader resolves the SYMBOL.
+  Line := Decl.Name + '#' + IntToStr(NArgs) + '|' + Decl.Symbol + '|' + Decl.LibName + '|' +
+          Decl.RetTypeName + '|' + Params;
+  if GetEnvironmentVariable('FGNDIAG') = '1' then
+    WriteLn(ErrOutput, 'FGN[sito variadico] ', Line);
+  for k := 0 to FProgram.ForeignDeclCount - 1 do
+    if FProgram.GetForeignDecl(k) = Line then Exit(k);
+  FProgram.AddForeignDecl(Line);
+  Result := FProgram.ForeignDeclCount - 1;
 end;
 
 function TSSAGenerator.TryForeignCall(const NameU: string; ArgListNode: TASTNode;
@@ -47345,13 +47461,29 @@ begin
   if Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
     NArgs := ArgListNode.ChildCount;
   // ⚠️ The declaration is the authority on how many values the callee reads. Passing FEWER than it
-  // declares would leave the callee reading an unwritten transfer slot, so that is refused too; extra
-  // arguments beyond the declaration are dropped, which is what a variadic C function would want and
-  // is all we can do without a variadic FFI path.
+  // declares would leave the callee reading an unwritten transfer slot, so that is refused.
   if NArgs < Length(Decl.ParamTypeNames) then
     raise Exception.CreateFmt('Foreign function %s declares %d argument(s), called with %d',
                               [Decl.Name, Length(Decl.ParamTypeNames), NArgs]);
-  if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
+  // ⭐⭐ THE C VARIADIC TAIL. Until 10 Sep 2026 the surplus arguments were DROPPED here - the code
+  // said so, "all we can do without a variadic FFI path" - and the whole printf family answered with
+  // zeros and "(null)" while compiling perfectly: `printf("A=%d", 7)` printed `A=0`. The rete
+  // `lib_probe.sh crt` is what made that visible, because `bi_sweep` had CRT at 78 headers out of 78
+  // agreeing with `fbc`.
+  //
+  // ⭐ The call site is where the tail's types are known, and NOWHERE ELSE knows them: a declaration
+  // that ends in "..." says nothing about what follows it. So a variadic call site takes its OWN
+  // entry in the foreign table, with the tail spelled out as ordinary parameter types - and every
+  // reader downstream (the bytecode, the .basc, the VM's marshaller) keeps doing exactly what it did,
+  // because what it sees is an ordinary declaration with more parameters. No second protocol.
+  if GetEnvironmentVariable('FGNDIAG') = '1' then
+    WriteLn(ErrOutput, 'FGN sito ', Decl.Name, ': variadic=', Decl.Variadic,
+            ' NArgs=', NArgs, ' dichiarati=', Length(Decl.ParamTypeNames));
+  if Decl.Variadic and (NArgs > Length(Decl.ParamTypeNames)) then
+    Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs)
+  else if NArgs > Length(Decl.ParamTypeNames) then
+    NArgs := Length(Decl.ParamTypeNames);
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
 
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('fgncall'));
@@ -49682,6 +49814,14 @@ begin
           FProgram.AddForeignDecl(Trim(Copy(FgnText, FgnStart, PsI - FgnStart)));
         FgnStart := PsI + 1;
       end;
+    // ⭐ FGNDIAG=1 stampa la TABELLA ESTERNA come il compilatore l'ha letta - una riga per
+    // dichiarazione, nel formato NOME|SIMBOLO|LIB|RITORNO|TIPI. ⛔ Esiste perche' quella tabella
+    // decide COME ogni argomento viene marshallato e non la stampava nessuno: un tipo letto male non
+    // solleva, fa rispondere numeri sbagliati alla funzione C. Le voci aggiunte da un SITO di
+    // chiamata variadico (nome con '#') compaiono qui solo dopo la generazione SSA.
+    if GetEnvironmentVariable('FGNDIAG') = '1' then
+      for PsI := 0 to FProgram.ForeignDeclCount - 1 do
+        WriteLn(ErrOutput, 'FGN[', PsI, '] ', FProgram.GetForeignDecl(PsI));
   end;
 
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
