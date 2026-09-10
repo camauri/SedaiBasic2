@@ -812,6 +812,8 @@ type
     procedure ExecForeignCall(Ctx: TExecutionContext; TableIdx, NArgs: Integer;
                               out ResInt: Int64; out ResFloat: Double);
     function ForeignPtrArg(ACtx: TObject; Tagged: Int64): Pointer;  // VM pointer domain -> machine address
+    function ForeignPtrRegion(ACtx: TObject; Tagged: Int64;
+                              out AAvail: PtrUInt): Boolean;        // ...e quanto e' grande, se e' a BYTE
     function ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
@@ -6323,12 +6325,56 @@ begin
           T.AddLib(FProgram.GetIncLib(i));
       end;
       T.ResolvePtr := @ForeignPtrArg;
+      T.PtrRegion := @ForeignPtrRegion;
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
     end;
   end;
   Result := FForeignTable;
+end;
+
+function TBytecodeVM.ForeignPtrRegion(ACtx: TObject; Tagged: Int64;
+  out AAvail: PtrUInt): Boolean;
+// How many bytes are readable from this VM pointer, and is the pointer addressed in BYTES?
+//
+// ⭐ Asked of every pointer ARGUMENT before a foreign call, and for one purpose: half the C string
+// library answers with a pointer INTO the buffer it was given (strchr, strstr, strrchr, memchr,
+// strpbrk, strtok), and knowing the extent of what was passed is what lets that answer be translated
+// back into the VM's own pointer domain instead of coming home as a bare machine address.
+//
+// ⛔⛔ "ADDRESSED IN BYTES" IS THE WHOLE CONDITION, and answering True where it does not hold would be
+// wrong IN SILENCE. A VM array pointer packs arrayId and an ELEMENT index, so adding a byte delta to
+// one over an Integer array names a different element - eight times too far - and nothing would raise.
+// Only a packed array of ONE-byte elements (a ZString buffer, "Dim As UByte b(...)") and the raw byte
+// heap have a byte index, and those are exactly the regions a C string function is ever handed.
+// ⚠️ The framebuffer and image regions answer False on purpose: nothing in C returns a pointer into
+// them, and their offsets carry page/handle bits that this arithmetic must not touch.
+var
+  ArrayIdx: Integer;
+  PtrOffset: Int64;
+  ofs: PtrUInt;
+begin
+  Result := False;
+  AAvail := 0;
+  if Tagged = 0 then Exit;
+  if (Tagged and FGNPTR_TAG) <> 0 then Exit;       // gia' un indirizzo macchina: non e' una regione nostra
+  if (Tagged and RAWPTR_TAG) <> 0 then
+  begin
+    if ((Tagged and RAWPTR_REGION_IMG) <> 0) or ((Tagged and RAWPTR_REGION_FB) <> 0) then Exit;
+    ofs := PtrUInt(Tagged and RAWPTR_OFS_MASK);
+    if (ofs < 8) or (ofs >= PtrUInt(Length(FRawHeap))) then Exit;
+    AAvail := PtrUInt(Length(FRawHeap)) - ofs;
+    Exit(True);
+  end;
+  if Tagged < 0 then Exit;                          // puntatore a CAMPO di record: non e' un blocco
+  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Tagged shr POINTER_ARRAY_SHIFT) - 1);
+  PtrOffset := Tagged and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then Exit;
+  if FArrays[ArrayIdx].ElemWidth <> 1 then Exit;    // solo un elemento da UN byte ha indice = byte
+  if PtrOffset >= Int64(Length(FArrays[ArrayIdx].ByteData)) then Exit;
+  AAvail := PtrUInt(Int64(Length(FArrays[ArrayIdx].ByteData)) - PtrOffset);
+  Result := True;
 end;
 
 function TBytecodeVM.ForeignPtrArg(ACtx: TObject; Tagged: Int64): Pointer;

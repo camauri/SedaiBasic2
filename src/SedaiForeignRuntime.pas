@@ -29,6 +29,22 @@ type
     The resolver answers nil for a null pointer. }
   TForeignPtrResolver = function(ACtx: TObject; Tagged: Int64): Pointer of object;
 
+  { ⭐⭐ ...AND HOW ONE COMES BACK. Half of the C string library returns a pointer INTO THE BUFFER IT
+    WAS GIVEN - strchr, strstr, strrchr, memchr, strpbrk, strtok - so the address that comes back is
+    usually an address the VM already owns, only expressed in machine terms. Answering it as a machine
+    address (FGNPTR_TAG) is correct but lossy: the program can no longer dereference it through the
+    VM's own funnels, and subtracting it from "@buf" - which is how C code finds an INDEX - mixes two
+    pointer domains and gives a number with a tag in it.
+    ⇒ This asks the VM, for a pointer ARGUMENT, how big the region is and whether it is addressed in
+    BYTES; with that, a returned interior pointer is translated back into the VM domain and everything
+    downstream keeps working: the dereference goes through the ordinary bounds-checked path, and the
+    subtraction answers what fbc answers.
+    ⛔ BYTE-ADDRESSED ONLY, and the flag is the whole point. In an Integer array a VM pointer's offset
+    counts ELEMENTS, so adding a byte delta to it would name a different element - silently. Answer
+    False there and the caller keeps the tag, which is merely lossy instead of wrong. }
+  TForeignPtrRegion = function(ACtx: TObject; Tagged: Int64;
+                               out AAvail: PtrUInt): Boolean of object;
+
   TForeignBinding = record
     Decl: TForeignDecl;
     ArgKinds: array of TForeignKind;
@@ -47,6 +63,7 @@ type
     FLibs: TStringList;          // "#inclib" names, in the order the program gave them
     FOpened: TStringList;        // name -> handle, so a library is opened once
     FResolvePtr: TForeignPtrResolver;
+    FPtrRegion: TForeignPtrRegion;      // optional: without it nothing is translated back
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -71,6 +88,7 @@ type
                      const XferInt: array of Int64; const XferFloat: array of Double;
                      NArgs: Integer; out ResInt: Int64; out ResFloat: Double);
     property ResolvePtr: TForeignPtrResolver read FResolvePtr write FResolvePtr;
+    property PtrRegion: TForeignPtrRegion read FPtrRegion write FPtrRegion;
   end;
 
 implementation
@@ -251,6 +269,15 @@ var
   Buf: array[0..63] of array[0..7] of Byte;   // storage for up to 64 arguments
   Vals: array[0..63] of Pointer;
   RetBuf: array[0..15] of Byte;
+  // ⭐ Le regioni della VM che questa chiamata ha passato: base MACCHINA, quanti byte, e il puntatore
+  // del DOMINIO VM da cui vengono. Servono solo per tradurre all'indietro un puntatore restituito.
+  RegBase: array[0..63] of PtrUInt;
+  RegLen: array[0..63] of PtrUInt;
+  RegVM: array[0..63] of Int64;
+  NReg: Integer;
+  RetAddr: PtrUInt;
+  Avail: PtrUInt;
+  P: Pointer;
 begin
   ResInt := 0; ResFloat := 0;
   if (Idx < 0) or (Idx > High(FEntries)) then
@@ -263,7 +290,7 @@ begin
                                       [B^.Decl.Name, NArgs]);
   Prepare(B^);
 
-  SlotI := 0; SlotF := 0;
+  SlotI := 0; SlotF := 0; NReg := 0;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
   begin
@@ -282,7 +309,23 @@ begin
           // as an ADDRESS, which is the access violation this cost to find.
           // ⛔ The CONTEXT travels with the call: an array pointer resolves against the executing
           // thread's arrays, so a worker must not be resolved against the main context's.
-          if Assigned(FResolvePtr) then PPointer(Vals[i])^ := FResolvePtr(ACtx, XferInt[SlotI])
+          if Assigned(FResolvePtr) then
+          begin
+            P := FResolvePtr(ACtx, XferInt[SlotI]);
+            PPointer(Vals[i])^ := P;
+            // ⭐ Si ricorda la regione SOLO se e' della VM e indirizzata a byte: e' la condizione che
+            // rende sana la traduzione all'indietro del risultato (vedi TForeignPtrRegion). Un
+            // argomento che era gia' un indirizzo macchina non si registra - un risultato che cade li'
+            // dentro deve restare un indirizzo macchina.
+            if (P <> nil) and (NReg <= High(RegBase)) and Assigned(FPtrRegion) and
+               ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail) then
+            begin
+              RegBase[NReg] := PtrUInt(P);
+              RegLen[NReg] := Avail;
+              RegVM[NReg] := XferInt[SlotI];
+              Inc(NReg);
+            end;
+          end
           else PInt64(Vals[i])^ := XferInt[SlotI];
           Inc(SlotI);
         end;
@@ -311,10 +354,28 @@ begin
     fkU32:    ResInt := PLongWord(@RetBuf[0])^;
     fkPointer:
       begin
-        // Tagged, so the next call can tell this machine address from a VM-domain pointer. A NULL is
-        // left at 0: "If p = 0" is how every C binding tests one. See FGNPTR_TAG.
         ResInt := PInt64(@RetBuf[0])^;
-        if ResInt <> 0 then ResInt := ResInt or FGNPTR_TAG;
+        // ⭐⭐ UN PUNTATORE DENTRO UN BUFFER CHE ABBIAMO PASSATO NOI TORNA NEL DOMINIO VM. Meta'
+        // della libreria C risponde cosi' - strchr, strstr, strrchr, memchr, strpbrk - e rendere
+        // quell'indirizzo un puntatore della VM chiude TRE cose in una: `*p` passa dagli imbuti
+        // ordinari (quindi CON i controlli di limite), `cast(integer,p) - cast(integer,@buf)` da'
+        // l'indice che da' `fbc`, e ripassarlo a un'altra funzione C continua a funzionare.
+        // ⛔ Il confronto e' <= sulla FINE della regione: `strchr(s, 0)` risponde il terminatore, e
+        // un puntatore alla fine di un buffer e' un puntatore legittimo in C.
+        RetAddr := PtrUInt(ResInt);
+        if ResInt <> 0 then
+        begin
+          for i := 0 to NReg - 1 do
+            if (RetAddr >= RegBase[i]) and (RetAddr - RegBase[i] <= RegLen[i]) then
+            begin
+              ResInt := RegVM[i] + Int64(RetAddr - RegBase[i]);
+              Exit;
+            end;
+          // Non e' memoria nostra (malloc, una stringa statica dentro la libreria): resta un indirizzo
+          // MACCHINA, marcato perche' la chiamata dopo lo riconosca. Un NULL resta 0: "If p = 0" e' il
+          // modo in cui ogni binding lo prova. Vedi FGNPTR_TAG.
+          ResInt := ResInt or FGNPTR_TAG;
+        end;
       end;
   else
     ResInt := PInt64(@RetBuf[0])^;
