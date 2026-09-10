@@ -1783,6 +1783,7 @@ var
   FgnDepth: Integer;
   FgnAfterAs, FgnIsFunc, FgnTypeOpen: Boolean;
   FgnVariadic: Boolean;     // "..." in the parameter list: the C tail (printf, sprintf, ...)
+  FgnFnPtrRet: Boolean;     // ...e il RITORNO di un parametro "as function(...) as T" e' suo, non nostro
   FgnByVal: Boolean;        // the parameter's stated passing mode; unstated reads as BYREF
   FgnLastDecl: Integer;     // index in FDeclTypeUses of the type just recorded, so a PTR can mark it
   FgnNameRaw: string;
@@ -1940,7 +1941,7 @@ begin
    // program node. DIVERGENZE 183.
    FgnName := ''; FgnAlias := ''; FgnLib := ''; FgnRet := ''; FgnParams := '';
    FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False; FgnTypeOpen := False;
-   FgnVariadic := False;
+   FgnVariadic := False; FgnFnPtrRet := False;
    // ⛔ THE PASSING MODE AND THE POINTER SUFFIX DECIDE WHETHER AN INCOMPLETE TYPE IS AN ERROR, so the
    // walk has to carry both. fbc refuses "byval as <incomplete>" (error 71) and takes the same type
    // "byref" or "ptr" without a word: win/sql.bi declares "byval BufferLength as SQLLEN" where SQLLEN
@@ -1962,7 +1963,15 @@ begin
      if Context.Check(ttDelimParOpen) then
      begin Inc(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False; end
      else if Context.Check(ttDelimParClose) then
-     begin Dec(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False; end
+     begin
+       Dec(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False;
+       if FgnDepth <= 0 then FgnFnPtrRet := False;
+     end
+     // ⛔ La VIRGOLA di primo livello chiude il ritorno del puntatore a procedura: dopo di lei ricomincia
+     // un parametro NOSTRO. Serve anche per "as sub(...)", che un ritorno non ce l'ha affatto - senza,
+     // lo swallow si mangerebbe il tipo del parametro seguente.
+     else if (FgnDepth = 1) and Context.Check(ttSeparParam) and FgnFnPtrRet then
+       FgnFnPtrRet := False
      else if (FgnTok = kALIAS) or (FgnTok = kLIB) then
      begin
        // The symbol's CASE is its own: a C name is not upper-cased.
@@ -1976,7 +1985,7 @@ begin
      // sparivano e la dichiarazione sembrava ordinaria, quindi a OGNI sito di chiamata gli argomenti
      // in piu' venivano scartati in silenzio - `printf("%d", 7)` stampava 0. E' lo stesso token che il
      // lettore delle procedure BASIC riconosce gia' (ttOpDot, attributo VARIADIC).
-     else if (FgnDepth > 0) and Context.Check(ttOpDot) then
+     else if (FgnDepth = 1) and Context.Check(ttOpDot) then
        FgnVariadic := True
      else if (FgnTok = 'BYVAL') or (FgnTok = 'BYREF') then
        FgnByVal := FgnTok = 'BYVAL'
@@ -1992,7 +2001,7 @@ begin
      // The flag STAYS open afterwards, so "Any Ptr Ptr" keeps both.
      else if FgnTypeOpen and (FgnTok = kPTR) then
      begin
-       if (FgnDepth > 0) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
+       if (FgnDepth = 1) and (not FgnFnPtrRet) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
        else if (FgnDepth = 0) and (FgnRet <> '') then FgnRet := FgnRet + ' PTR';
        // ...and the entry the declared-type check will read says so too: a pointer to an incomplete
        // type is a perfectly good pointer.
@@ -2015,12 +2024,24 @@ begin
      // argument is marshalled. The check is what made it visible.
      else if FgnAfterAs and Context.Check(ttProcedureStart) then
      begin
-       if FgnDepth > 0 then
+       // ⛔⛔ UN PARAMETRO "AS FUNCTION(...)" E' UN PUNTATORE A PROCEDURA, e la sua lista di parametri
+       // e' SUA. Lo scanner scendeva dentro e contava anche quelli: `qsort`, che di parametri ne ha
+       // QUATTRO, veniva registrata con SETTE, e ogni chiamata moriva con «declares 7 argument(s),
+       // called with 4». Idem `bsearch` (8 invece di 5). ⇒ L'intera famiglia CALLBACK della CRT era
+       // inutilizzabile, e nessuna sonda per FUNZIONE poteva accorgersene: si vede solo provando il
+       // MECCANISMO. ⭐ E il tipo giusto e' "ANY PTR": un puntatore a procedura si marshalla come un
+       // indirizzo, non come la parola "FUNCTION" (che ForeignKindOf non conosce e che avrebbe fatto
+       // rifiutare la dichiarazione per intero).
+       if FgnDepth = 1 then
        begin
          if FgnParams <> '' then FgnParams := FgnParams + ',';
-         FgnParams := FgnParams + FgnTok;
+         FgnParams := FgnParams + 'ANY PTR';
+         FgnFnPtrRet := True;      // ...e cio' che segue, fino alla virgola, e' il RITORNO del callback
        end
-       else if FgnRet = '' then FgnRet := FgnTok;
+       else if FgnDepth = 0 then
+       begin
+         if FgnRet = '' then FgnRet := FgnTok;
+       end;
        FgnAfterAs := False;
        FgnTypeOpen := True;
      end
@@ -2037,12 +2058,17 @@ begin
              (not Context.CheckAny([ttDelimParOpen, ttDelimParClose, ttSeparParam,
                                     ttEndOfLine, ttSeparStmt, ttEndOfFile])) then
      begin
-       if FgnDepth > 0 then
+       // ⛔ SOLO AL PRIMO LIVELLO: dentro "as function(...)" ci sono i parametri del CALLBACK, non
+       // quelli di questa procedura (vedi la nota sul ramo ttProcedureStart).
+       if (FgnDepth = 1) and (not FgnFnPtrRet) then
        begin
          if FgnParams <> '' then FgnParams := FgnParams + ',';
          FgnParams := FgnParams + FgnTok;
        end
-       else if FgnRet = '' then FgnRet := FgnTok;
+       else if FgnDepth = 0 then
+       begin
+         if FgnRet = '' then FgnRet := FgnTok;
+       end;
        // ⭐ The same token, kept for the DECLARED-TYPE check: the SSA is the only pass that knows every
        // TYPE the program declares, and this is the only place that knows a bodiless DECLARE named one.
        // "R" marks a return type and "P" a parameter, because fbc gives the two different errors.
