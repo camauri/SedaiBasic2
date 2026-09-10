@@ -139,6 +139,7 @@ type
     // means - and that is how every real binding is written: fbc's own zip.bi declares 103 functions
     // that way and not one of them carries an alias. DIVERGENZE 183 / retrogra.
     FExternCDepth: Integer;
+    FExternKinds: string;   // one char per open EXTERN block: '1' if it counts in FExternCDepth, else '0'
     FProcSeen: TStringList;
     // ⛔⛔ ...AND THE OVERLOAD DECISION IS ASKED PER NAMESPACE. Two procedures of the same name in two
     // DIFFERENT namespaces are not an overload set - they are two names that only look alike until the
@@ -1791,6 +1792,7 @@ var
   DupNm: string;
   DupK: Integer;
   DupOvl: Boolean;
+  ExternName: string;   // the linkage of an EXTERN "..." block
 begin
   Result := nil;
   // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
@@ -2139,14 +2141,28 @@ begin
      // away, so a SUB declared in such a block did not exist and every call to it failed ("Array not
      // declared"). Consume the header and the terminator only, and let the body parse where it stands.
      Context.Advance;                     // EXTERN
-     // ⭐ ...and REMEMBER that we are in one, because a bodiless DECLARE inside it is FOREIGN. Only "C"
-     // linkage: "Windows" (stdcall) is a convention this call path does not implement, and claiming
-     // otherwise would marshal the arguments the wrong way round without a word.
+     // ⭐ ...and REMEMBER that we are in one, because a bodiless DECLARE inside it is FOREIGN.
+     // ⛔⛔ "Windows" AND "Windows-MS" TOO. The old note excluded "Windows" as "a convention this call
+     // path does not implement" - true of stdcall on win32, which decorates names with @N and pushes
+     // arguments differently, and win32 is outside this product. On a 64-bit target stdcall IS the
+     // platform ABI - the one convention there is - and SedaiAbi implements both Win64 and SysV. So
+     // every "declare function MulDiv(...)" of windows.bi was filed as a bodiless BASIC procedure, and
+     // calling it answered 0 in silence (win64 deck, k01..k04). "C++" still does not count: its names
+     // are mangled (ledger 177).
      if Context.Check(ttStringLiteral) then
      begin
-       if UpperFast(Trim(VarToStr(Context.CurrentToken.Value))) = 'C' then Inc(FExternCDepth);
+       ExternName := UpperFast(Trim(VarToStr(Context.CurrentToken.Value)));
+       if (ExternName = 'C') or (ExternName = 'WINDOWS') or (ExternName = 'WINDOWS-MS') then
+       begin
+         Inc(FExternCDepth);
+         FExternKinds := FExternKinds + '1';
+       end
+       else
+         FExternKinds := FExternKinds + '0';
        Context.Advance;                   // the "C" / "Windows" linkage name
-     end;
+     end
+     else
+       FExternKinds := FExternKinds + '0';
      Result := nil;
      Exit;
    end
@@ -6909,7 +6925,15 @@ begin
   if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'EXTERN')) then
   begin
     Context.Advance;
-    if FExternCDepth > 0 then Dec(FExternCDepth);
+    // Only the block that COUNTED gives the count back: closing an "Extern "C++"" must not end the
+    // "C" block around it.
+    if FExternKinds <> '' then
+    begin
+      if (FExternKinds[Length(FExternKinds)] = '1') and (FExternCDepth > 0) then Dec(FExternCDepth);
+      SetLength(FExternKinds, Length(FExternKinds) - 1);
+    end
+    else if FExternCDepth > 0 then
+      Dec(FExternCDepth);
     Result.Free;
     Result := nil;
     Exit;

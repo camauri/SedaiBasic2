@@ -15088,6 +15088,18 @@ begin
         // user-procedure test only because a program may not redefine these names anyway.
         else if IsIntReturningConv(Nm) then
           Result := srtInt
+        // ⛔ ...AND THE INTEGER-RETURNING INTRINSICS, which fell to the FLOAT default too. Nobody noticed
+        // while the value only went to PRINT, which prints 3.0 and 3 alike; a VARIADIC C call cannot
+        // tolerate it - the argument travelled in a FLOAT register and printf("%d", Len(s)) read the
+        // integer one: "3 -4 0 0 0 7 7" where fbc prints "5 3 104 3 -4 -1 65" (win64 deck, k04 -> CRT o10).
+        else if (Nm = 'LEN') or (Nm = 'ASC') or (Nm = 'INSTR') or (Nm = 'INSTRREV') or
+                (Nm = 'VALINT') or (Nm = 'VALLNG') or (Nm = 'VALUINT') or (Nm = 'VALULNG') or
+                (Nm = 'LBOUND') or (Nm = 'UBOUND') or (Nm = 'FREEFILE') then
+          Result := srtInt
+        // SGN and ABS answer in the type of their argument: SGN(-7) is an Integer, SGN(-7.5) is not.
+        else if ((Nm = 'SGN') or (Nm = 'ABS')) and (Node.ChildCount >= 1) and
+                (Node.GetChild(0).ChildCount >= 1) then
+          Result := InferExprBank(Node.GetChild(0).GetChild(0))
         else if FProcedureNames.IndexOf(Nm) >= 0 then
           Result := GetVariableType(Nm);
       end;
@@ -47528,10 +47540,11 @@ function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNod
 // be resolved to a machine address, the second is the number itself. ExprIsPointerValue is the pass
 // that knows, and passing one for the other prints "(null)".
 //
-// ⛔ A BASIC STRING in the tail is REFUSED BY NAME. fbc passes the string DESCRIPTOR there, not the
-// bytes, so "%s" is wrong in fbc too; answering with the bytes would be a silent divergence in the
-// direction that looks like it works. The idiom that IS right - "@literal" or a ZSTRING PTR - goes
-// through the pointer arm above.
+// ⭐ A BASIC STRING in the tail travels as its BYTES - a ZSTRING PTR - because that is what fbc does.
+// ⛔⛔ This used to be a REFUSAL, justified here by "fbc passes the string DESCRIPTOR, so %s is wrong
+// in fbc too". MEASURED, it is false: printf("[%s]", "lit"), printf("[%s]", s) on a STRING and on a
+// ZSTRING all print the text under fbc 1.10.1, Linux and win64 alike. A reason written into the code
+// is a hypothesis until a probe says so, and this one refused the most common idiom of the C library.
 var
   i, k: Integer;
   Params, T, Line: string;
@@ -47560,10 +47573,7 @@ begin
     else
       case InferExprBank(ArgListNode.GetChild(i)) of
         srtFloat:  T := 'DOUBLE';          // the C default promotion: a variadic float IS a double
-        srtString: raise Exception.CreateFmt(
-                     'Foreign function %s: argument %d of the variadic tail is a BASIC STRING, which ' +
-                     'has no C meaning there - pass "@" of a literal or a ZSTRING PTR',
-                     [Decl.Name, i + 1]);
+        srtString: T := 'ZSTRING PTR';      // its BYTES, as fbc passes them (see the note above)
       else
         T := 'INTEGER';
       end;
