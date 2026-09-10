@@ -46,7 +46,11 @@ uses
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
   SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiOpcodeBanks,
-  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt, SedaiInputFields
+  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt, SedaiInputFields,
+  // ⭐ Il FORMATO di una dichiarazione esterna, non un provider: questa unit «non nomina nessun
+  // provider» per sua stessa nota, quindi il core puo' dipenderne. Serve nell'INTERFACCIA perche' i
+  // metodi delle chiusure (DIVERGENZE 218) parlano di TForeignKind.
+  SedaiForeignDecl
   {$IFDEF ENABLE_PROFILER}, SedaiProfiler{$ENDIF}
   {$IFDEF WITH_SEDAI_AUDIO}, SedaiAudioTypes, SedaiAudioBackend, SedaiSIDEvo{$ENDIF}
   {$IFDEF WEB_MODE}, SedaiWebIO{$ENDIF};
@@ -210,6 +214,9 @@ type
     // A handle with SHARED_REC_FLAG set indexes here; otherwise it indexes the active context's heap.
     FSharedRecords: TSharedRecArray;
     FForeignTable: TObject;   // TForeignTable: nil until the program makes its first foreign call
+    // Le chiusure costruite per le procedure BASIC passate a C, in cache per (PC, firma) e possedute
+    // qui: una pagina eseguibile per confronto di `qsort` sarebbe una syscall per confronto.
+    FClosures: TStringList;
     // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
     // per surface: it is filled from the surface at every read, so it is never stale.
     FImgHeaderBuf: array[0..RAWPTR_IMG_HDR_SIZE - 1] of Byte;
@@ -813,7 +820,14 @@ type
                               out ResInt: Int64; out ResFloat: Double);
     function ForeignPtrArg(ACtx: TObject; Tagged: Int64): Pointer;  // VM pointer domain -> machine address
     function ForeignPtrRegion(ACtx: TObject; Tagged: Int64;
-                              out AAvail: PtrUInt): Boolean;        // ...e quanto e' grande, se e' a BYTE
+                              out AAvail: PtrUInt; out AElemW: Integer): Boolean;   // ...e com'e' fatta
+    function ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;
+                                const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
+    function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
+    procedure RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
+                             ARet: Pointer; AArgs: PPointer;
+                             ARetKind: TForeignKind;
+                             const AArgKinds: array of TForeignKind; ANArgs: Integer);
     function ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
@@ -1044,9 +1058,23 @@ uses
   // ⭐ The FFI, and it is named HERE and nowhere else in the VM: SedaiForeignRuntime is the one unit
   // that knows a provider exists, so the day the core is cut from its providers there is a single edge
   // to cut. In the implementation section for the same reason SedaiTerminalIO is. DIVERGENZE 183.
-  SedaiForeignRuntime
+  SedaiForeignRuntime, SedaiAbi
   {$IFDEF UNIX}, BaseUnix, Unix{$ENDIF}   // fpgettimeofday (unit Unix): TIMER's microsecond clock (HighResSecondsOfDay)
-  {$IFDEF WINDOWS}, Windows{$ENDIF};   // QueryPerformanceCounter, same purpose
+  {$IFDEF WINDOWS}, Windows{$ENDIF};
+
+type
+  PSbClosureCtx = ^TSbClosureCtx;
+  TSbClosureCtx = record
+    VM: TObject;                 // TBytecodeVM
+    Ctx: TObject;                // TExecutionContext: quello che sta eseguendo la chiamata esterna
+    EntryPC: Int64;
+    RetKind: TForeignKind;
+    NArgs: Integer;
+    ArgKinds: array[0..15] of TForeignKind;
+    Closure: TObject;            // TAbiClosure, posseduta: vive quanto la VM
+    Sig: string;
+  end;
+   // QueryPerformanceCounter, same purpose
 
 {$IFDEF WINDOWS}
 var
@@ -1861,6 +1889,19 @@ begin
     FConsoleBehavior.Free;
   if Assigned(FOwnedGraphics) then
     FreeAndNil(FOwnedGraphics);   // free a VM-owned graphics backend (e.g. the software backend on sb)
+  // ⛔ Le chiusure PRIMA di tutto cio' che il loro handler potrebbe raggiungere: una pagina eseguibile
+  // che C ha ancora in mano dopo che la VM e' morta e' esattamente la trappola che i worker documentano
+  // qui sopra. Ognuna possiede il proprio contesto, che va liberato con lei.
+  if FClosures <> nil then
+  begin
+    for JitI := 0 to FClosures.Count - 1 do
+      if FClosures.Objects[JitI] <> nil then
+      begin
+        PSbClosureCtx(FClosures.Objects[JitI])^.Closure.Free;
+        Dispose(PSbClosureCtx(FClosures.Objects[JitI]));
+      end;
+    FreeAndNil(FClosures);
+  end;
   FVarMap.Free;
   // M5.2: the workers were joined at the TOP of this destructor (see the note there); only their
   // lock is released here, once nothing can spawn or join any more.
@@ -6326,6 +6367,7 @@ begin
       end;
       T.ResolvePtr := @ForeignPtrArg;
       T.PtrRegion := @ForeignPtrRegion;
+      T.MakeClosure := @ForeignMakeClosure;
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
@@ -6334,8 +6376,257 @@ begin
   Result := FForeignTable;
 end;
 
+{ ⭐⭐ UNA PROCEDURA BASIC CHE C PUO' CHIAMARE (DIVERGENZE 218).
+
+  `qsort` non riceve dati dal chiamante: riceve un INDIRIZZO e ci salta sopra quando gli pare. Ma
+  l'indirizzo di una procedura BASIC non e' codice macchina, e' un PC di bytecode - saltarci sopra e'
+  l'access violation con cui questa voce e' stata trovata.
+
+  ⭐ Il pezzo difficile esisteva gia': `TAbiClosure` costruisce una paginetta eseguibile che mette il
+  proprio contesto in un registro di scratch e salta a un trampolino fisso scritto in assembly. Cio'
+  che mancava e' il CABLAGGIO: chi tiene il contesto, e che cosa fa il trampolino quando arriva.
+
+  ⛔ L'handler gira SULLA PILA DI C, dentro `qsort`, con la VM ferma a meta' di `bcForeignCall`. Non
+  puo' toccare il ciclo principale: rientra con un ciclo suo (RunClosureBody). }
+procedure SbClosureTrampoline(ARet: Pointer; AArgs: PPointer; AUser: Pointer);
+// ⛔ Una procedura SEMPLICE, non un metodo: e' la forma che TAbiClosureFun dichiara, e tutto cio' che
+// serve viaggia in AUser.
+var
+  C: PSbClosureCtx;
+begin
+  C := PSbClosureCtx(AUser);
+  if (C = nil) or (C^.VM = nil) or (C^.Ctx = nil) then Exit;
+  TBytecodeVM(C^.VM).RunClosureBody(TExecutionContext(C^.Ctx), C^.EntryPC, ARet, AArgs,
+                                    C^.RetKind, C^.ArgKinds, C^.NArgs);
+end;
+
+procedure TBytecodeVM.RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
+  ARet: Pointer; AArgs: PPointer; ARetKind: TForeignKind;
+  const AArgKinds: array of TForeignKind; ANArgs: Integer);
+// Esegue la procedura BASIC a AEntryPC con gli argomenti che C ha appena messo nei registri, e scrive
+// il risultato dove C lo aspetta.
+//
+// ⛔ GLI SLOT SONO QUELLI DI UNA CHIAMATA BASIC, non quelli di una chiamata esterna: un contatore per
+// BANCO, come fa ParamBankAndSlot nella SSA. Chiamante e chiamato devono contare allo stesso modo, e
+// qui il chiamato e' codice che la SSA ha gia' emesso.
+//
+// ⛔⛔ E IL RIENTRO E' UN CICLO A PARTE. Il ciclo principale sta fermo dentro bcForeignCall, sulla pila
+// di C; ricorsione sul ciclo principale vorrebbe dire due lettori dello stesso PC. Si salva PC e
+// profondita' di pila, si spinge il frame come fa bcCallSub, si esegue finche' la pila non ritorna, e
+// si rimette tutto. ⚠️ La convenzione del PC va rispettata: il ciclo principale incrementa DOPO ogni
+// istruzione, e i salti scrivono "destinazione - 1".
+var
+  i, SlotI, SlotF, SaveDepth: Integer;
+  SavePC: Int64;
+  Instrs: PBytecodeInstruction;
+  NInstr: Integer;
+begin
+  if (AEntryPC <= 0) or (AEntryPC >= FProgram.GetInstructionCount) then Exit;
+  SlotI := 0; SlotF := 0;
+  for i := 0 to ANArgs - 1 do
+  begin
+    if AArgs = nil then Break;
+    case AArgKinds[i] of
+      fkFloat:  begin ACtx.XferFloat[SlotF] := PSingle(AArgs[i])^; Inc(SlotF); end;
+      fkDouble: begin ACtx.XferFloat[SlotF] := PDouble(AArgs[i])^; Inc(SlotF); end;
+      fkS8:     begin ACtx.XferInt[SlotI] := PShortInt(AArgs[i])^; Inc(SlotI); end;
+      fkU8:     begin ACtx.XferInt[SlotI] := PByte(AArgs[i])^; Inc(SlotI); end;
+      fkS16:    begin ACtx.XferInt[SlotI] := PSmallInt(AArgs[i])^; Inc(SlotI); end;
+      fkU16:    begin ACtx.XferInt[SlotI] := PWord(AArgs[i])^; Inc(SlotI); end;
+      fkS32:    begin ACtx.XferInt[SlotI] := PLongInt(AArgs[i])^; Inc(SlotI); end;
+      fkU32:    begin ACtx.XferInt[SlotI] := PLongWord(AArgs[i])^; Inc(SlotI); end;
+      fkPointer:
+        begin
+          // ⭐ C consegna un indirizzo MACCHINA. Marcandolo, la procedura BASIC lo puo' dereferenziare
+          // e ripassare a un'altra funzione C esattamente come fa con cio' che una funzione RESTITUISCE
+          // (voce 215). ⚠️ Un puntatore che punta dentro memoria NOSTRA non viene tradotto indietro
+          // qui: la traduzione ha bisogno delle regioni passate a QUESTA chiamata, e qui siamo dentro
+          // il chiamato, non nel marshaller.
+          ACtx.XferInt[SlotI] := VMPointerForMachineAddr(ACtx, PtrUInt(PPointer(AArgs[i])^));
+          if ACtx.XferInt[SlotI] = 0 then
+          begin
+            // Non e' memoria nostra: resta un indirizzo MACCHINA, marcato.
+            ACtx.XferInt[SlotI] := Int64(PtrUInt(PPointer(AArgs[i])^));
+            if ACtx.XferInt[SlotI] <> 0 then
+              ACtx.XferInt[SlotI] := ACtx.XferInt[SlotI] or FGNPTR_TAG;
+          end;
+          Inc(SlotI);
+        end;
+    else
+      begin ACtx.XferInt[SlotI] := PInt64(AArgs[i])^; Inc(SlotI); end;
+    end;
+  end;
+
+  SavePC := ACtx.PC;
+  SaveDepth := ACtx.CallStackPtr;
+  FramePush(ACtx, AEntryPC, ACtx.PC);
+  GrowCallStackIfNeeded(ACtx);
+  ACtx.CallStack[ACtx.CallStackPtr] := ACtx.PC;
+  Inc(ACtx.CallStackPtr);
+  ACtx.PC := AEntryPC;
+  Instrs := PBytecodeInstruction(FProgram.GetInstructionsPtr);
+  NInstr := FProgram.GetInstructionCount;
+  try
+    while (ACtx.CallStackPtr > SaveDepth) and ACtx.Running and
+          (ACtx.PC >= 0) and (ACtx.PC < NInstr) do
+    begin
+      ExecuteInstruction(ACtx, Instrs[ACtx.PC]);
+      ACtx.PC := ACtx.PC + 1;
+    end;
+  finally
+    ACtx.PC := SavePC;
+    // ⛔ Se il corpo e' uscito per un'altra strada (un errore, un END), la pila va comunque rimessa
+    // dove il chiamante esterno la lascera': altrimenti il ritorno da bcForeignCall salta nel vuoto.
+    while ACtx.CallStackPtr > SaveDepth do
+    begin
+      Dec(ACtx.CallStackPtr);
+      FramePop(ACtx);
+    end;
+  end;
+
+  if ARet = nil then Exit;
+  case ARetKind of
+    fkVoid:   ;
+    fkFloat:  PSingle(ARet)^ := ACtx.XferFloat[255];
+    fkDouble: PDouble(ARet)^ := ACtx.XferFloat[255];
+    fkPointer:
+      // Il verso opposto: un puntatore del dominio VM che il callback restituisce va risolto a
+      // indirizzo macchina, o C riceverebbe un offset e ci salterebbe sopra.
+      PPointer(ARet)^ := ForeignPtrArg(ACtx, ACtx.XferInt[255]);
+  else
+    PInt64(ARet)^ := ACtx.XferInt[255];
+  end;
+end;
+
+function TBytecodeVM.VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;
+// L'indirizzo macchina A, riportato a un puntatore del DOMINIO VM se cade in memoria che la VM
+// possiede. 0 se non ci cade.
+//
+// ⛔ E' la strada INVERSA di ForeignPtrArg, e serve dentro un CALLBACK: `qsort` chiama il comparatore
+// passandogli due indirizzi DENTRO l'array che gli abbiamo dato noi, e il comparatore e' codice BASIC
+// che quell'indirizzo lo deve dereferenziare con i propri opcode. Lasciandolo come indirizzo macchina
+// marcato, `*x` moriva - la stessa cosa che la voce 215 risolve per un puntatore RESTITUITO, qui per
+// uno che arriva come ARGOMENTO.
+//
+// ⚠️ La divisione dev'essere ESATTA. L'offset di un puntatore VM conta gli ELEMENTI, quindi un
+// indirizzo che cade a meta' di un elemento non ha un puntatore VM che lo nomini: si risponde 0 e chi
+// chiama tiene l'indirizzo macchina, che e' lossy ma non sbagliato.
+var
+  i: Integer;
+  Base: PtrUInt;
+  Delta: PtrUInt;
+  W: Integer;
+begin
+  Result := 0;
+  if A = 0 then Exit;
+  // L'heap grezzo: gli offset sono BYTE, quindi non c'e' nessuna divisione da fare.
+  if Length(FRawHeap) > 0 then
+  begin
+    Base := PtrUInt(@FRawHeap[0]);
+    if (A >= Base) and (A - Base < PtrUInt(Length(FRawHeap))) then
+      Exit(Int64(A - Base) or RAWPTR_TAG);
+  end;
+  for i := 0 to High(FArrays) do
+  begin
+    // ⛔⛔ System.Continue, MAI un Continue nudo: dentro un metodo di TBytecodeVM quello si lega a
+    // TBytecodeVM.Continue - il comando BASIC CONT - e il programma muore con «?CAN'T CONTINUE ERROR».
+    // E' scritto due volte altrove in questo file, e ci sono cascato lo stesso: `qsort` funzionava
+    // (il primo array era quello giusto, si usciva prima), `bsearch` no - il suo primo argomento e' uno
+    // SCALARE, quindi il ciclo saltava almeno un array e ci passava.
+    W := FArrays[i].ElemWidth;
+    if (W > 0) and (Length(FArrays[i].ByteData) > 0) then
+    begin
+      Base := PtrUInt(@FArrays[i].ByteData[0]);
+      if (A < Base) or (A - Base >= PtrUInt(Length(FArrays[i].ByteData))) then System.Continue;
+      Delta := A - Base;
+      if (Delta mod PtrUInt(W)) <> 0 then System.Continue;   // a meta' di un elemento: nessun nome
+      Exit((Int64(i + 1) shl POINTER_ARRAY_SHIFT) or Int64(Delta div PtrUInt(W)));
+    end;
+    // ⛔ E NON SOLO GLI ARRAY IMPACCHETTATI. Uno SCALARE di cui il programma prende l'indirizzo e'
+    // sostenuto da uno storage non impacchettato (IntData / FloatData, otto byte per elemento), ed e'
+    // esattamente la forma del primo argomento di `bsearch`: la chiave. Guardando solo ByteData
+    // quell'indirizzo non aveva nome e tornava marcato, quindi il callback non poteva leggerlo.
+    if Length(FArrays[i].IntData) > 0 then
+    begin
+      Base := PtrUInt(@FArrays[i].IntData[0]);
+      if (A >= Base) and (A - Base < PtrUInt(Length(FArrays[i].IntData)) * SizeOf(Int64)) then
+      begin
+        Delta := A - Base;
+        if (Delta mod SizeOf(Int64)) = 0 then
+          Exit((Int64(i + 1) shl POINTER_ARRAY_SHIFT) or Int64(Delta div SizeOf(Int64)));
+      end;
+    end;
+    if Length(FArrays[i].FloatData) > 0 then
+    begin
+      Base := PtrUInt(@FArrays[i].FloatData[0]);
+      if (A >= Base) and (A - Base < PtrUInt(Length(FArrays[i].FloatData)) * SizeOf(Double)) then
+      begin
+        Delta := A - Base;
+        if (Delta mod SizeOf(Double)) = 0 then
+          Exit((Int64(i + 1) shl POINTER_ARRAY_SHIFT) or Int64(Delta div SizeOf(Double)));
+      end;
+    end;
+  end;
+end;
+
+function TBytecodeVM.ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;
+  const ASig: string): Pointer;
+// La paginetta eseguibile per UNA procedura BASIC, costruita al primo uso e tenuta finche' vive la VM.
+// ⛔ In CACHE per (PC, firma): `qsort` chiama il comparatore migliaia di volte, e costruire una pagina
+// eseguibile per ognuna sarebbe una syscall di protezione memoria per confronto.
+var
+  RetK: TForeignKind;
+  ArgK: array[0..15] of TForeignKind;
+  NA, i: Integer;
+  C: PSbClosureCtx;
+  Args: array of TAbiType;
+  Cl: TAbiClosure;
+  Key: string;
+begin
+  Result := nil;
+  if AEntryPC <= 0 then Exit;
+  if not ForeignCallbackSig(ASig, RetK, ArgK, NA) then Exit;
+  Key := IntToStr(AEntryPC) + '|' + UpperCase(ASig);
+  if FClosures = nil then FClosures := TStringList.Create;
+  i := FClosures.IndexOf(Key);
+  if i >= 0 then
+  begin
+    C := PSbClosureCtx(FClosures.Objects[i]);
+    Exit(TAbiClosure(C^.Closure).Code);
+  end;
+  New(C);
+  FillChar(C^, SizeOf(C^), 0);
+  C^.VM := Self;
+  C^.Ctx := ACtx;
+  C^.EntryPC := AEntryPC;
+  C^.RetKind := RetK;
+  C^.NArgs := NA;
+  C^.Sig := ASig;
+  for i := 0 to NA - 1 do C^.ArgKinds[i] := ArgK[i];
+  SetLength(Args, NA);
+  for i := 0 to NA - 1 do
+  begin
+    Args[i] := KindToRef(ArgK[i]);
+    if Args[i] = nil then
+    begin
+      Dispose(C);
+      raise EForeignCallError.CreateFmt(
+        'callback: parameter %d has a type this call path cannot pass', [i + 1]);
+    end;
+  end;
+  Cl := TAbiClosure.Create(KindToRef(RetK), Args, @SbClosureTrampoline, C);
+  if not Cl.Ready then
+  begin
+    Cl.Free; Dispose(C);
+    raise EForeignCallError.Create('callback: could not build the executable stub');
+  end;
+  C^.Closure := Cl;
+  FClosures.AddObject(Key, TObject(C));
+  Result := Cl.Code;
+end;
+
 function TBytecodeVM.ForeignPtrRegion(ACtx: TObject; Tagged: Int64;
-  out AAvail: PtrUInt): Boolean;
+  out AAvail: PtrUInt; out AElemW: Integer): Boolean;
 // How many bytes are readable from this VM pointer, and is the pointer addressed in BYTES?
 //
 // ⭐ Asked of every pointer ARGUMENT before a foreign call, and for one purpose: half the C string
@@ -6356,7 +6647,7 @@ var
   ofs: PtrUInt;
 begin
   Result := False;
-  AAvail := 0;
+  AAvail := 0; AElemW := 1;
   if Tagged = 0 then Exit;
   if (Tagged and FGNPTR_TAG) <> 0 then Exit;       // gia' un indirizzo macchina: non e' una regione nostra
   if (Tagged and RAWPTR_TAG) <> 0 then
@@ -6371,9 +6662,11 @@ begin
   ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Tagged shr POINTER_ARRAY_SHIFT) - 1);
   PtrOffset := Tagged and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then Exit;
-  if FArrays[ArrayIdx].ElemWidth <> 1 then Exit;    // solo un elemento da UN byte ha indice = byte
-  if PtrOffset >= Int64(Length(FArrays[ArrayIdx].ByteData)) then Exit;
-  AAvail := PtrUInt(Int64(Length(FArrays[ArrayIdx].ByteData)) - PtrOffset);
+  // ⭐ La larghezza d'elemento viaggia con la regione: chi traduce all'indietro divide per lei.
+  AElemW := FArrays[ArrayIdx].ElemWidth;
+  if AElemW <= 0 then Exit;                        // storage non impacchettato: nessuna immagine di byte
+  if PtrOffset * AElemW >= Int64(Length(FArrays[ArrayIdx].ByteData)) then Exit;
+  AAvail := PtrUInt(Int64(Length(FArrays[ArrayIdx].ByteData)) - PtrOffset * AElemW);
   Result := True;
 end;
 

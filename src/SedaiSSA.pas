@@ -681,6 +681,7 @@ type
     function ProcReturnPtrUDT(const NameU: string): string;       // pointee UDT of a "FUNCTION f(...) AS T PTR", else ''
     function ManagedPtrArithUDT(Node: TASTNode): string;          // pointee UDT of "p", "(p)", "p±n", "n+p" for a managed UDT pointer
     function ProcHasParamCount(const NameU: string; N: Integer): Boolean;
+    function BasicProcCallbackSig(Node: TASTNode): string;   // "@proc" -> FNPTR:<ret>:<args>
     function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -2551,6 +2552,63 @@ begin
   ParamList := Decl.GetChild(1);
   if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Exit;
   Result := ParamList.ChildCount = N;
+end;
+
+function TSSAGenerator.BasicProcCallbackSig(Node: TASTNode): string;
+// "@<procedura BASIC>" passato a un parametro PUNTATORE di una funzione C: la firma di quella
+// procedura, scritta come "FNPTR:<ritorno>:<arg,arg,...>" (DIVERGENZE 218). '' per ogni altra cosa.
+//
+// ⭐⭐ LA FIRMA VIENE DALLA PROCEDURA BASIC, NON DALL'HEADER. L'header scrive
+// "byval as function(byval as const any ptr, byval as const any ptr) as long", ma quella dichiarazione
+// e' scartata di proposito dallo scanner (voce 217, perche' contarne i parametri rompeva `qsort`), e
+// soprattutto **non e' la procedura che girera'**: a essere eseguita e' quella BASIC, ed e' la sua
+// firma che decide come stagiare i banchi al rientro nella VM.
+// ⚠️ Se le due firme non combaciano il marshalling e' sbagliato E NON SOLLEVA - la stessa esposizione
+// che ha `fbc`, che pure prende la firma dalla procedura.
+//
+// ⛔ Risponde '' appena un tipo non si sa nominare: senza una firma completa la chiusura andrebbe
+// costruita a indovinare, e la chiamata arriverebbe con i registri sbagliati in silenzio. Meglio
+// lasciare la strada di prima (il PC nudo, che C non sa chiamare e che fallisce a voce alta).
+var
+  Decl, ParamList, NameNode, prm: TASTNode;
+  i: Integer;
+  Nm, Params, Ret, T: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  // "@nome" porta il nome nel Value e non ha figli; "@espressione" ha un figlio e non e' una procedura.
+  if (Node.NodeType <> antProcAddress) or (Node.ChildCount <> 0) then Exit;
+  Nm := UpperFast(VarToStr(Node.Value));
+  if Nm = '' then Exit;
+  if not FProcDecls.TryGetValue(Nm, Decl) then Exit;
+  if (Decl = nil) or (Decl.ChildCount < 2) then Exit;
+  ParamList := Decl.GetChild(1);
+  if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Exit;
+  Params := '';
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    prm := ParamList.GetChild(i);
+    T := '';
+    if (prm <> nil) and (prm.ChildCount >= 1) and (prm.GetChild(0).NodeType = antIdentifier) then
+      T := prm.GetChild(0).ValueUpper;
+    if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
+    // ⛔⛔ IL SEPARATORE E' "~", NON LA VIRGOLA. La virgola separa gia' i PARAMETRI nella riga della
+    // tabella esterna, quindi una firma scritta con le virgole veniva spezzata da ParseForeignDecl:
+    // "FNPTR:LONG:ANY PTR,ANY PTR" diventava DUE parametri, il callback ne riceveva uno solo, e il
+    // secondo argomento del comparatore leggeva lo slot che il chiamante aveva riempito per un ALTRO
+    // parametro di `qsort` - rispondeva 3, cioe' il numero di elementi. ⚠️ E nemmeno ";" andava bene:
+    // quello separa le DICHIARAZIONI fra loro nell'attributo FOREIGNDECLS.
+    if Params <> '' then Params := Params + '~';
+    Params := Params + T;
+  end;
+  NameNode := Decl.GetChild(0);
+  Ret := '';
+  if (NameNode <> nil) and (NameNode.ChildCount >= 1) and
+     (NameNode.GetChild(0).NodeType = antIdentifier) then
+    Ret := NameNode.GetChild(0).ValueUpper;
+  if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
+  Result := 'FNPTR:' + Ret + ':' + Params;
 end;
 
 function TSSAGenerator.ProcPtrSigNameOfProc(const NameU: string): string;
@@ -47384,8 +47442,8 @@ end;
 
 function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
   NArgs: Integer): Integer;
-// The foreign-table entry for ONE variadic call site: the declared parameters, then the tail spelled
-// out as ordinary types read off the ARGUMENTS. Returns its index.
+// The foreign-table entry for ONE call site: the declared parameters (with any CALLBACK spelled out,
+// DIVERGENZE 218), then the variadic tail read off the ARGUMENTS. Returns its index.
 //
 // ⭐ Why the types come from the arguments and not from the declaration: a "..." declares nothing.
 // C answers the same question with the default argument promotions, and they are the rule here too -
@@ -47410,11 +47468,22 @@ begin
   for i := 0 to High(Decl.ParamTypeNames) do
   begin
     if Params <> '' then Params := Params + ',';
-    Params := Params + Decl.ParamTypeNames[i];
+    // ⭐ Un parametro PUNTATORE che riceve "@<procedura BASIC>" e' un CALLBACK: al suo posto va la
+    // firma della procedura, cosi' il runtime puo' costruire la chiusura che C chiamera'
+    // (DIVERGENZE 218). Ogni altro parametro resta com'e' dichiarato.
+    T := '';
+    if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
+       Assigned(ArgListNode) and (i < ArgListNode.ChildCount) then
+      T := BasicProcCallbackSig(ArgListNode.GetChild(i));
+    if T <> '' then Params := Params + T
+    else Params := Params + Decl.ParamTypeNames[i];
   end;
   for i := Length(Decl.ParamTypeNames) to NArgs - 1 do
   begin
-    if VarArgIsAddress(ArgListNode.GetChild(i)) then
+    T := BasicProcCallbackSig(ArgListNode.GetChild(i));
+    if T <> '' then
+      // gia' pronta: la coda variadica puo' portare un callback quanto un parametro dichiarato
+    else if VarArgIsAddress(ArgListNode.GetChild(i)) then
       T := 'ANY PTR'
     else
       case InferExprBank(ArgListNode.GetChild(i)) of
@@ -47503,8 +47572,19 @@ begin
             ' NArgs=', NArgs, ' dichiarati=', Length(Decl.ParamTypeNames));
   if Decl.Variadic and (NArgs > Length(Decl.ParamTypeNames)) then
     Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs)
-  else if NArgs > Length(Decl.ParamTypeNames) then
-    NArgs := Length(Decl.ParamTypeNames);
+  else
+  begin
+    if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
+    // ...e anche una chiamata NON variadica vuole la propria voce se le si passa una procedura BASIC:
+    // e' li' che la firma del callback viene scritta (DIVERGENZE 218).
+    for i := 0 to NArgs - 1 do
+      if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
+         (BasicProcCallbackSig(ArgListNode.GetChild(i)) <> '') then
+      begin
+        Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs);
+        Break;
+      end;
+  end;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
 
   if not Assigned(FCurrentBlock) then

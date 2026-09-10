@@ -55,6 +55,15 @@ function ParseForeignDecl(const ALine: string; out ADecl: TForeignDecl): Boolean
   points at, which is why it is tested first. An unrecognised name answers fkUnknown. }
 function ForeignKindOf(const ATypeName: string): TForeignKind;
 
+{ Is this parameter type a CALLBACK, and if so what does the procedure behind it look like? The
+  spelling is "FNPTR:<ret>:<arg~arg~...>" where every piece is an ordinary declared type name, so the
+  same ForeignKindOf answers each of them. ⛔ Il separatore e' "~" e non la virgola, perche' la virgola
+  separa gia' i PARAMETRI nella riga della tabella (e ";" separa le dichiarazioni fra loro). Returns
+  False for every other type name. }
+function ForeignCallbackSig(const ATypeName: string;
+                            out ARet: TForeignKind; out AArgs: array of TForeignKind;
+                            out ANArgs: Integer): Boolean;
+
 { How many bytes the kind occupies, for the buffer an argument is marshalled into. }
 function ForeignKindSize(AKind: TForeignKind): Integer;
 
@@ -114,12 +123,52 @@ begin
   Result := True;
 end;
 
+function ForeignCallbackSig(const ATypeName: string;
+  out ARet: TForeignKind; out AArgs: array of TForeignKind; out ANArgs: Integer): Boolean;
+var
+  T, Rest, Piece: string;
+  p, i, Start: Integer;
+begin
+  ARet := fkVoid; ANArgs := 0;
+  Result := False;
+  T := UpperCase(Trim(ATypeName));
+  if Copy(T, 1, 6) <> 'FNPTR:' then Exit;
+  Rest := Copy(T, 7, MaxInt);
+  p := Pos(':', Rest);
+  if p = 0 then Exit;
+  ARet := ForeignKindOf(Trim(Copy(Rest, 1, p - 1)));
+  Rest := Copy(Rest, p + 1, MaxInt);
+  if Trim(Rest) <> '' then
+  begin
+    Start := 1;
+    for i := 1 to Length(Rest) + 1 do
+      if (i > Length(Rest)) or (Rest[i] = '~') then
+      begin
+        Piece := Trim(Copy(Rest, Start, i - Start));
+        if (Piece <> '') and (ANArgs <= High(AArgs)) then
+        begin
+          AArgs[ANArgs] := ForeignKindOf(Piece);
+          Inc(ANArgs);
+        end;
+        Start := i + 1;
+      end;
+  end;
+  Result := True;
+end;
+
 function ForeignKindOf(const ATypeName: string): TForeignKind;
 var
   T: string;
 begin
   T := UpperCase(Trim(ATypeName));
   if T = '' then Exit(fkVoid);
+  // ⭐ A CALLBACK PARAMETER. The call site writes it as "FNPTR:<ret>:<arg,arg,...>", spelling out the
+  // signature of the BASIC procedure whose address is being handed over - see ForeignCallbackSig. To
+  // everything that marshals it is simply a POINTER; only the runtime, which has to BUILD the closure
+  // C will call, looks inside. ⛔ The signature comes from the BASIC procedure and not from the header's
+  // own "as function(...)": that one is deliberately discarded (see the note on the scanner), and the
+  // procedure that will actually run is the one whose banks must be staged.
+  if Copy(T, 1, 6) = 'FNPTR:' then Exit(fkPointer);
   // A POINTER is a pointer whatever it points at, and the suffix can repeat ("Any Ptr Ptr").
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(fkPointer);
   if (T = 'ANY') then Exit(fkPointer);           // "As Any" only ever appears as a pointer here

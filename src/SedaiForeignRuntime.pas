@@ -43,7 +43,16 @@ type
     counts ELEMENTS, so adding a byte delta to it would name a different element - silently. Answer
     False there and the caller keeps the tag, which is merely lossy instead of wrong. }
   TForeignPtrRegion = function(ACtx: TObject; Tagged: Int64;
-                               out AAvail: PtrUInt): Boolean of object;
+                               out AAvail: PtrUInt; out AElemW: Integer): Boolean of object;
+
+  { ⭐⭐ E LA DIREZIONE OPPOSTA: una procedura BASIC che C deve poter CHIAMARE (DIVERGENZE 218).
+    `qsort` non riceve dati, riceve un INDIRIZZO su cui salta - e l'indirizzo di una procedura BASIC
+    non e' codice macchina, e' un PC di bytecode. Chi sa costruire il ponte e' la VM (solo lei sa
+    rientrare nel proprio interprete), quindi passa un proprio metodo, esattamente come per i puntatori.
+    Riceve il PC d'ingresso e la firma nella forma "FNPTR:<ret>:<arg,...>", e risponde l'indirizzo
+    MACCHINA da consegnare al C. }
+  TForeignClosureMaker = function(ACtx: TObject; AEntryPC: Int64;
+                                  const ASig: string): Pointer of object;
 
   TForeignBinding = record
     Decl: TForeignDecl;
@@ -64,6 +73,7 @@ type
     FOpened: TStringList;        // name -> handle, so a library is opened once
     FResolvePtr: TForeignPtrResolver;
     FPtrRegion: TForeignPtrRegion;      // optional: without it nothing is translated back
+    FMakeClosure: TForeignClosureMaker; // optional: senza, un callback resta un PC che C non sa chiamare
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -89,7 +99,13 @@ type
                      NArgs: Integer; out ResInt: Int64; out ResFloat: Double);
     property ResolvePtr: TForeignPtrResolver read FResolvePtr write FResolvePtr;
     property PtrRegion: TForeignPtrRegion read FPtrRegion write FPtrRegion;
+    property MakeClosure: TForeignClosureMaker read FMakeClosure write FMakeClosure;
   end;
+
+{ La mappa dai nostri tipi a quelli della ABI. ⛔ Esportata perche' chi costruisce una CHIUSURA ha
+  bisogno della stessa mappa, e due copie di questa tabella sarebbero due letture dello stesso fatto
+  che possono divergere. Risponde nil per un tipo che questo percorso non sa passare. }
+function KindToRef(K: TForeignKind): TAbiType;
 
 implementation
 
@@ -274,9 +290,11 @@ var
   RegBase: array[0..63] of PtrUInt;
   RegLen: array[0..63] of PtrUInt;
   RegVM: array[0..63] of Int64;
+  RegW: array[0..63] of Integer;
   NReg: Integer;
   RetAddr: PtrUInt;
   Avail: PtrUInt;
+  ElemW: Integer;
   P: Pointer;
 begin
   ResInt := 0; ResFloat := 0;
@@ -309,7 +327,16 @@ begin
           // as an ADDRESS, which is the access violation this cost to find.
           // ⛔ The CONTEXT travels with the call: an array pointer resolves against the executing
           // thread's arrays, so a worker must not be resolved against the main context's.
-          if Assigned(FResolvePtr) then
+          // ⭐ UN CALLBACK non e' un puntatore a dati: il valore nel banco intero e' il PC d'ingresso
+          // di una procedura BASIC, e cio' che C vuole e' un indirizzo su cui saltare. La voce di
+          // questo sito di chiamata lo dice scrivendo il parametro come "FNPTR:..." (DIVERGENZE 218).
+          if (i <= High(B^.Decl.ParamTypeNames)) and Assigned(FMakeClosure) and
+             (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 6)) = 'FNPTR:') then
+          begin
+            PPointer(Vals[i])^ := FMakeClosure(ACtx, XferInt[SlotI], B^.Decl.ParamTypeNames[i]);
+            Inc(SlotI);
+          end
+          else if Assigned(FResolvePtr) then
           begin
             P := FResolvePtr(ACtx, XferInt[SlotI]);
             PPointer(Vals[i])^ := P;
@@ -318,11 +345,12 @@ begin
             // argomento che era gia' un indirizzo macchina non si registra - un risultato che cade li'
             // dentro deve restare un indirizzo macchina.
             if (P <> nil) and (NReg <= High(RegBase)) and Assigned(FPtrRegion) and
-               ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail) then
+               ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail, ElemW) then
             begin
               RegBase[NReg] := PtrUInt(P);
               RegLen[NReg] := Avail;
               RegVM[NReg] := XferInt[SlotI];
+              RegW[NReg] := ElemW;
               Inc(NReg);
             end;
           end
@@ -366,9 +394,13 @@ begin
         if ResInt <> 0 then
         begin
           for i := 0 to NReg - 1 do
-            if (RetAddr >= RegBase[i]) and (RetAddr - RegBase[i] <= RegLen[i]) then
+            if (RetAddr >= RegBase[i]) and (RetAddr - RegBase[i] <= RegLen[i]) and
+               (RegW[i] > 0) and (((RetAddr - RegBase[i]) mod PtrUInt(RegW[i])) = 0) then
             begin
-              ResInt := RegVM[i] + Int64(RetAddr - RegBase[i]);
+              // ⛔ Diviso per la larghezza d'ELEMENTO: l'offset di un puntatore VM conta gli elementi,
+              // non i byte. Una divisione non esatta vuol dire «a meta' di un elemento», e li' non c'e'
+              // nessun puntatore VM da rispondere: si tiene l'indirizzo macchina.
+              ResInt := RegVM[i] + Int64((RetAddr - RegBase[i]) div PtrUInt(RegW[i]));
               Exit;
             end;
           // Non e' memoria nostra (malloc, una stringa statica dentro la libreria): resta un indirizzo
