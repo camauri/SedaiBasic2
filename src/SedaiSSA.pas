@@ -1253,6 +1253,7 @@ type
     function TryEmitUDTCastToUDT(Node: TASTNode; const SrcType, DstType: string; out Val: TSSAValue): Boolean;
     function UDTCastsToUDT(const SrcType, DstType: string): Boolean;   // ...asked without emitting
     function ProcRetTypeName(const Lbl: string): string;   // the type a procedure was DECLARED to return
+    function ForeignRetTypeName(const NameU: string): string;  // il ritorno di una DECLARE esterna
     function CalleeRetTypeName(Node: TASTNode): string;    // ...of the CALL this node is (function or method)
     function CastRetRecType(const Lbl: string): string;   // record type a CAST operator returns
     procedure ProcessStringExpression(Node: TASTNode; out Val: TSSAValue);  // evaluate where a STRING is expected
@@ -45013,6 +45014,20 @@ begin
   Result := NameNode.GetChild(0).ValueUpper;
 end;
 
+function TSSAGenerator.ForeignRetTypeName(const NameU: string): string;
+// The declared return type of a FOREIGN function, read off the foreign table - the only place it
+// exists. '' when the name is not foreign.
+var
+  Idx: Integer;
+  D: TForeignDecl;
+begin
+  Result := '';
+  Idx := FProgram.IndexOfForeignDecl(NameU);
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+  Result := UpperFast(Trim(D.RetTypeName));
+end;
+
 function TSSAGenerator.CalleeRetTypeName(Node: TASTNode): string;
 // The declared return type of the CALL this node is, function or method. '' when it is not a call.
 // ⛔ It exists because DerefedType had an arm for every pointer SHAPE except a call: "*f( )" where f
@@ -45033,6 +45048,13 @@ begin
     Nm := Callee.ValueUpper;
     if ArrayIndexOf(Nm) >= 0 then Exit;         // an array access, not a call
     Result := ProcRetTypeName(Nm);
+    // ⛔⛔ ...E UNA FUNZIONE ESTERNA NON STA IN FProcDecls. Il tipo di ritorno di una DECLARE con ALIAS
+    // vive nella TABELLA ESTERNA, che e' l'unico posto in cui esiste, e questo lettore non la
+    // guardava: `print *strrchr(@s, asc("/"))` leggeva un INTERO invece di una stringa C - rispondeva
+    // 25391, cioe' 0x632F, gli stessi due byte letti come numero. ⭐ Il tell e' quello solito: la
+    // stessa cosa attraverso una variabile ("dim as zstring ptr r = strrchr(...) : print *r")
+    // rispondeva giusto, perche' li' il tipo lo portava la variabile. DIVERGENZE 216.
+    if Result = '' then Result := ForeignRetTypeName(Nm);
   end
   else if (Callee.NodeType = antMemberAccess) and (Callee.ChildCount >= 1) then
   begin
