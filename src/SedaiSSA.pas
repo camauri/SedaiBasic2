@@ -1247,6 +1247,8 @@ type
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function SolePtrCastLabel(const TypeName: string): string;        // the ONE pointer-returning cast, or ''
     function ExprIsPointerValue(Node: TASTNode): Boolean;   // un T Ptr NON e' un T
+    function ExprIsPointerTyped(Node: TASTNode): Boolean;   // a pointer VARIABLE, CAST or CALL result (235)
+    function EmitStripForeignTag(const V: TSSAValue): TSSAValue;   // a foreign address, as a NUMBER (235)
     function TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
     function HasUDTStringCast(Node: TASTNode): Boolean;  // would TryEmitUDTCastToString fire? (emits nothing)
@@ -3680,6 +3682,12 @@ begin
         // functions and the assignment path both went through ApplyNarrowCode already, so a program got
         // one answer from "CByte(x)" and another from "Cast(Byte, x)". Width code 0 (Integer, LongInt,
         // an unknown name) leaves the value alone, which is what the line below used to do for everything.
+        // ⭐ ...and a POINTER cast to an integer becomes its NUMBER, without the foreign-address tag
+        // (DIVERGENZE 235). Only when the source IS a pointer: a plain integer in [2^61, 2^62) keeps
+        // every bit it has.
+        if ExprIsPointerTyped(Node.GetChild(0)) then
+          Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EmitStripForeignTag(Left))
+        else
         Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EnsureIntRegister(Left));
     end;
 
@@ -11789,6 +11797,11 @@ begin
       begin
         if PKidx = 1 then
           EmitInstruction(ssaPrintBool, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        // ⭐ Kind 3 is a narrow unsigned or a POINTER; a pointer prints its NUMBER, without the
+        // foreign-address tag (DIVERGENZE 235). Harmless on a narrow unsigned, which never reaches bit 61.
+        else if (PKidx = 3) and ExprIsPointerTyped(Child) then
+          EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), EmitStripForeignTag(ExprValue),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone))
         else
           EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), ExprValue,
@@ -45078,6 +45091,62 @@ begin
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if (Node.NodeType = antIdentifier) and (Node.ChildCount = 0) then
     Result := FPointerVars.IndexOfName(Node.ValueUpper) >= 0;
+end;
+
+function TSSAGenerator.ExprIsPointerTyped(Node: TASTNode): Boolean;
+// Is this expression's TYPE a pointer - a pointer variable, a CAST to a pointer type, or a CALL that
+// returns one (a foreign function included, through CalleeRetTypeName)? Wider than ExprIsPointerValue,
+// which answers for a bare variable only; asked where a pointer becomes a NUMBER (DIVERGENZE 235).
+  function EndsPtr(const T: string): Boolean;
+  var C: string;
+  begin
+    C := UpperFast(Trim(T));
+    if C = '' then Exit(False);
+    C := UpperFast(CanonicalType(C));
+    Result := (Length(C) >= 4) and (Copy(C, Length(C) - 3, 4) = ' PTR');
+  end;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if ExprIsPointerValue(Node) then Exit(True);
+  if (Node.NodeType = antCast) and EndsPtr(VarToStr(Node.Value)) then Exit(True);
+  Result := EndsPtr(DeclaredTypeNameOf(Node)) or EndsPtr(CalleeRetTypeName(Node));
+end;
+
+function TSSAGenerator.EmitStripForeignTag(const V: TSSAValue): TSSAValue;
+// The NUMERIC value of a pointer, with the FGNPTR_TAG taken off a foreign machine address (DIVERGENZE
+// 235). The tag stays inside the pointer - it is what keeps a machine address from being decoded as one
+// of the VM's own pointers - and comes off only here, where the value becomes a number the program
+// sees: "cast(integer, CharUpperA(cast(LPSTR, 81)))" answered 2305843009213694033, fbc answers 81.
+// ⛔ Only the pattern bits 63-62-61 = 0 0 1 is a foreign address. RAWPTR_REGION_FB is bit 61 TOO, but a
+// raw framebuffer pointer also carries RAWPTR_TAG (bit 62); a record-field pointer is negative (bit 63);
+// an array pointer reaches bit 61 only past 2^29 arrays. Branch-free, on existing opcodes:
+//   t = v shr 61 ; b = t and 7 ; c = (b = 1) ; m = (c and 1) shl 61 ; result = v xor m
+// "(c and 1)" and not "c": the TRUE value is FTrueValue, -1 by default and configurable - bit 0 is set
+// in both spellings.
+var
+  VI, K, T, B, C, M, R: TSSAValue;
+  function IntConst(N: Int64): TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(N), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+  function Op(OpC: TSSAOpCode; const A, B2: TSSAValue): TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(OpC, Result, A, B2, MakeSSAValue(svkNone));
+  end;
+begin
+  VI := EnsureIntRegister(V);
+  K := IntConst(61);
+  T := Op(ssaShr, VI, K);
+  B := Op(ssaBitwiseAnd, T, IntConst(7));
+  C := Op(ssaCmpEqInt, B, IntConst(1));
+  C := Op(ssaBitwiseAnd, C, IntConst(1));
+  M := Op(ssaShl, C, K);
+  R := Op(ssaBitwiseXor, VI, M);
+  Result := R;
 end;
 
 function TSSAGenerator.TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string;
