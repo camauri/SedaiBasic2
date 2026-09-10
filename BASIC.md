@@ -267,6 +267,21 @@ difference is stated rather than left to be discovered.
 > part of the repository. Anything settled enough to rely on is written here.
 
 
+**`WString` is the same on every system** (10 September 2026). In FreeBASIC a `WString` follows the
+platform's `wchar_t`: UTF-32 on Linux, UTF-16 on Windows, so the same program answers differently on
+the two systems — `SizeOf(WString)` is 4 on Linux and 2 on Windows, `WChr(&h1F600)` is truncated to
+16 bits on Windows, and a character above U+FFFF that comes back from a Windows function takes two
+units and `Len` counts two. SedaiBasic runs one bytecode everywhere, so its `WString` has FreeBASIC's
+Linux model on every system: one cell per character, the same `Len` and `SizeOf` everywhere. On
+Windows the conversion to UTF-16 happens at the boundary with the `...W` functions of the Windows API:
+a `WString Ptr` argument is passed as UTF-16, surrogate pairs included, and what Windows writes back
+is recombined into one character each.
+  ⚠️ **What therefore differs from FreeBASIC on Windows**: `SizeOf(WString)` is 4, not 2; `WChr` above
+  &hFFFF keeps the whole code point; a character above U+FFFF counts as one, not two; and a raw-byte
+  view of a `WString` — `Put #`/`Get #` of its bytes, a `Union`, a pointer cast — sees 4-byte cells.
+  On Linux nothing differs. FreeBASIC's own per-platform behaviour is planned as an opt-in STRICT mode,
+  chosen when the program is compiled.
+
 **Pointer arithmetic and the numeric value of a pointer.** A pointer obtained from `Allocate`,
 `SAdd`, `StrPtr` or `ScreenPtr` is a byte address and steps by `SizeOf(pointee)`, exactly as in
 FreeBASIC. A pointer obtained with `@` on a variable or an array element is a packed

@@ -307,8 +307,37 @@ var
   Avail: PtrUInt;
   ElemW: Integer;
   P: Pointer;
+  {$IFDEF WINDOWS}
+  // ⭐ THE PORTABLE WSTRING AT THE WINDOWS BOUNDARY (DIVERGENZE 234, 237). Inside the VM a WSTRING is one
+  // 4-byte cell per character on every system; a Windows "...W" function wants UTF-16. Each such argument
+  // travels as a UTF-16 COPY - a surrogate pair for a character above U+FFFF - and the copy is decoded
+  // back into the program's cells after the call, pairs recombined into one character.
+  WTmp: array[0..63] of array of Word;   // the UTF-16 copy of each converted argument
+  WCells: array[0..63] of PLongWord;     // the program's own cells it came from
+  WN: array[0..63] of PtrUInt;           // how many cells the program's region holds
+  WVM: array[0..63] of Int64;            // the VM-domain pointer, to map a returned pointer back
+  WElemW: array[0..63] of Integer;       // that region's element width
+  NW, j: Integer;
+  u, k, UEnd: PtrUInt;
+  c: LongWord;
+  IsWide: Boolean;
+  {$ENDIF}
+
+  {$IFDEF WINDOWS}
+  // One level of "WSTRING PTR", as the declaration pass spells LPWSTR / LPCWSTR after resolving the alias.
+  function IsWideStrParam(const T: string): Boolean;
+  var U: string;
+  begin
+    U := UpperCase(Trim(T));
+    Result := (Pos('WSTRING PTR', U) > 0) and (Pos(' PTR PTR', U) = 0);
+  end;
+  {$ENDIF}
+
 begin
   ResInt := 0; ResFloat := 0;
+  {$IFDEF WINDOWS}
+  NW := 0;
+  {$ENDIF}
   if (Idx < 0) or (Idx > High(FEntries)) then
     raise EForeignCallError.CreateFmt('foreign call index %d is outside this program''s table of %d',
                                       [Idx, Length(FEntries)]);
@@ -351,6 +380,50 @@ begin
           begin
             P := FResolvePtr(ACtx, XferInt[SlotI]);
             PPointer(Vals[i])^ := P;
+            {$IFDEF WINDOWS}
+            // ⭐ A WSTRING PTR argument over the program's own memory becomes a UTF-16 copy. The region
+            // says how many cells there are: the copy has room for every one of them - two units for a
+            // character above U+FFFF - so a buffer the callee fills to its declared size fits.
+            IsWide := False;
+            if (P <> nil) and (NW <= 63) and (i <= High(B^.Decl.ParamTypeNames)) and
+               IsWideStrParam(B^.Decl.ParamTypeNames[i]) and Assigned(FPtrRegion) and
+               ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail, ElemW) and
+               (Avail >= 4) then
+            begin
+              WCells[NW] := PLongWord(P);
+              WN[NW] := Avail div 4;
+              WVM[NW] := XferInt[SlotI];
+              WElemW[NW] := ElemW;
+              SetLength(WTmp[NW], 2 * WN[NW] + 1);
+              u := 0;
+              for k := 0 to WN[NW] - 1 do
+              begin
+                c := WCells[NW][k];
+                if (c >= $10000) and (c <= $10FFFF) then
+                begin
+                  WTmp[NW][u] := Word($D800 + ((c - $10000) shr 10));
+                  WTmp[NW][u + 1] := Word($DC00 + ((c - $10000) and $3FF));
+                  Inc(u, 2);
+                end
+                else
+                begin
+                  if c > $10FFFF then c := $FFFD;
+                  WTmp[NW][u] := Word(c);
+                  Inc(u);
+                end;
+              end;
+              WTmp[NW][u] := 0;                  // the terminator a C wide string ends with
+              SetLength(WTmp[NW], u + 1);
+              PPointer(Vals[i])^ := @WTmp[NW][0];
+              Inc(NW);
+              IsWide := True;
+            end;
+            if IsWide then
+            begin
+              Inc(SlotI);
+              Continue;                           // converted: not an ordinary region, not an out-pointer
+            end;
+            {$ENDIF}
             // ⭐ Si ricorda la regione SOLO se e' della VM e indirizzata a byte: e' la condizione che
             // rende sana la traduzione all'indietro del risultato (vedi TForeignPtrRegion). Un
             // argomento che era gia' un indirizzo macchina non si registra - un risultato che cade li'
@@ -383,6 +456,30 @@ begin
 
   FillChar(RetBuf, SizeOf(RetBuf), 0);
   AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
+
+  {$IFDEF WINDOWS}
+  // ...and each UTF-16 copy goes back into the program's cells: a surrogate pair becomes ONE character,
+  // which is the whole difference from fbc's WSTRING on Windows (that one keeps the two units).
+  for j := 0 to NW - 1 do
+  begin
+    u := 0; k := 0;
+    UEnd := PtrUInt(Length(WTmp[j]));
+    while (k < WN[j]) and (u < UEnd) do
+    begin
+      c := WTmp[j][u];
+      if (c >= $D800) and (c <= $DBFF) and (u + 1 < UEnd) and
+         (WTmp[j][u + 1] >= $DC00) and (WTmp[j][u + 1] <= $DFFF) then
+      begin
+        c := $10000 + ((c - $D800) shl 10) + (LongWord(WTmp[j][u + 1]) - $DC00);
+        Inc(u, 2);
+      end
+      else
+        Inc(u);
+      WCells[j][k] := c;
+      Inc(k);
+    end;
+  end;
+  {$ENDIF}
 
   // ⛔ I PARAMETRI D'USCITA CHE PORTANO UN PUNTATORE. `strtod(@s, @fine)` non restituisce il puntatore
   // di fine conversione: lo SCRIVE in `fine`. Quello e' un indirizzo macchina, e il programma BASIC
@@ -429,6 +526,29 @@ begin
         RetAddr := PtrUInt(ResInt);
         if ResInt <> 0 then
         begin
+          {$IFDEF WINDOWS}
+          // ⭐ A pointer INTO a UTF-16 copy (lstrcpyW answers its destination) names a cell of the
+          // program's own WSTRING: count the characters in front of that unit, pairs as one.
+          for j := 0 to NW - 1 do
+            if (Length(WTmp[j]) > 0) and (RetAddr >= PtrUInt(@WTmp[j][0])) and
+               (RetAddr - PtrUInt(@WTmp[j][0]) < PtrUInt(Length(WTmp[j])) * 2) and
+               (((RetAddr - PtrUInt(@WTmp[j][0])) mod 2) = 0) and (WElemW[j] > 0) then
+            begin
+              UEnd := (RetAddr - PtrUInt(@WTmp[j][0])) div 2;
+              u := 0; k := 0;
+              while u < UEnd do
+              begin
+                if (WTmp[j][u] >= $D800) and (WTmp[j][u] <= $DBFF) and (u + 1 < UEnd) then Inc(u, 2)
+                else Inc(u);
+                Inc(k);
+              end;
+              if ((k * 4) mod PtrUInt(WElemW[j])) = 0 then
+              begin
+                ResInt := WVM[j] + Int64((k * 4) div PtrUInt(WElemW[j]));
+                Exit;
+              end;
+            end;
+          {$ENDIF}
           for i := 0 to NReg - 1 do
             if (RetAddr >= RegBase[i]) and (RetAddr - RegBase[i] <= RegLen[i]) and
                (RegW[i] > 0) and (((RetAddr - RegBase[i]) mod PtrUInt(RegW[i])) = 0) then
