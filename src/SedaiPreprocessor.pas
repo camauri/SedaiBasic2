@@ -370,6 +370,17 @@ begin
   Result := (C in ['A'..'Z', 'a'..'z', '0'..'9', '_']);
 end;
 
+// One bare identifier and nothing else: a letter or '_' first, identifier characters after.
+function IsPPIdentifier(const S: string): Boolean;
+var
+  k: Integer;
+begin
+  Result := (S <> '') and (S[1] in ['A'..'Z', 'a'..'z', '_']);
+  if not Result then Exit;
+  for k := 2 to Length(S) do
+    if not IsIdentChar(S[k]) then Exit(False);
+end;
+
 function StripDirectiveComment(const S: string): string;
 // Remove a trailing "'" line comment from a preprocessor-directive body (e.g. a #define value),
 // honoring double-quoted string literals so a "'" inside a string is kept. FreeBASIC treats "'" as a
@@ -1498,6 +1509,24 @@ begin
         Continue;
       end;
       idx := Defs.IndexOfName(UpperFast(Word));
+      // ⛔ AN ALIAS OF A FUNCTION-LIKE MACRO. "#define MAKEINTRESOURCE MAKEINTRESOURCEA" is how windows.bi
+      // spells every A/W pair, and MAKEINTRESOURCEA takes "(i)". Rescanning the VALUE alone found the
+      // name with no argument list after it, so "MAKEINTRESOURCE(101)" left "MAKEINTRESOURCEA(101)" -
+      // a call to a name nobody declared. The C rule, which fbc follows: the expansion is rescanned
+      // TOGETHER with the text that follows it. Only when the value is one bare identifier and a '('
+      // comes next - the one shape where joining the two can change anything.
+      if (idx >= 0) and (Depth < 32) and IsPPIdentifier(Trim(Defs.ValueFromIndex[idx])) and
+         (not SameText(Trim(Defs.ValueFromIndex[idx]), Word)) then
+      begin
+        k := j;
+        while (k <= Length(Line)) and (Line[k] in [' ', #9]) do Inc(k);
+        if (k <= Length(Line)) and (Line[k] = '(') then
+        begin
+          Result := Result + SubstituteMacros(Trim(Defs.ValueFromIndex[idx]) + Copy(Line, j, MaxInt),
+                                              Defs, FnDefs, Depth + 1);
+          Exit;
+        end;
+      end;
       if idx >= 0 then
         // An object-like macro's VALUE is itself macro text: "#define X __FB_QUOTE__( Print "hi" )"
         // means nothing until the built-in inside it runs. Appending the value raw left it unexpanded,

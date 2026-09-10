@@ -8617,7 +8617,12 @@ begin
         if (SameText(ArrName, 'OFFSETOF')) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount >= 2) and
            (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) and
-           (Node.GetChild(1).GetChild(1).NodeType = antIdentifier) then
+           // ⚠️ The FIELD may be spelled like a keyword: windows.bi's MSG has a field called "time",
+           // which the parser reads as the TIME function, so "OffsetOf(MSG, time)" missed this branch
+           // and died as "Array not declared: OFFSETOF". Its name is still the node's value, and
+           // whether it names a field is asked of the type just below.
+           ((Node.GetChild(1).GetChild(1).NodeType = antIdentifier) or
+            (VarToStr(Node.GetChild(1).GetChild(1).Value) <> '')) then
         begin
           RecUDTIdx := FindUDT(Node.GetChild(1).GetChild(0).ValueUpper);
           ValCode := 0;   // reuse as the byte offset accumulator
@@ -27844,7 +27849,9 @@ begin
     FVarWidthCode.AddObject(Nm, TObject(PtrInt(W)));
   // ...and the IDENTITY twin beside it, on the SAME key, so the two can never drift (DIVERGENZE 8).
   SetIdentUnderKey(Nm, TypeName);
-  PK := PrintKindOfType(T);
+  // Through the TYPEDEF: "Type HND As Any Ptr : Dim h As HND" is a pointer and prints unsigned, as
+  // windows.bi's HANDLE / HKEY / HWND all are; asked on the spelling it printed signed.
+  PK := PrintKindOfType(UpperFast(CanonicalType(T)));
   Idx := FVarPrintKind.IndexOf(Nm);
   if PK = 0 then
   begin
@@ -27902,7 +27909,7 @@ var
   PK, Idx: Integer;
   Key: string;
 begin
-  PK := PrintKindOfType(UpperFast(TypeName));
+  PK := PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName))));   // through the typedef
   Key := UpperFast(ProcName) + '|' + UpperFast(VarName);
   Idx := FVarPrintKind.IndexOf(Key);
   if Idx >= 0 then
@@ -27992,7 +27999,7 @@ begin
     else
       FArrayElemWidth.AddObject(Nm, TObject(PtrInt(W)));
   end;
-  PK := PrintKindOfType(UpperFast(TypeName));
+  PK := PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName))));   // through the typedef
   if PK = 0 then Exit;                         // plain signed: nothing more to record
   Idx := FVarPrintKind.IndexOf(Nm);
   if Idx >= 0 then
@@ -28663,7 +28670,12 @@ begin
         // column where fbc prints "1". Kind 2, not 3: a FULL-WIDTH unsigned is not the narrow case above
         // (which promotes to a signed expression). The arm two branches up - the deref of an unsigned
         // pointer - already had this line; this one is its twin and did not.
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        // ...and a cast to a POINTER type is an address, which prints unsigned - the kind every pointer
+        // VARIABLE already gets from PrintKindOfType. windows.bi spells its special handles this way:
+        // INVALID_HANDLE_VALUE is "cast(HANDLE, cast(LONG_PTR, -1))" and fbc prints 18446744073709551615,
+        // HKEY_LOCAL_MACHINE prints 18446744071562067970. Through the typedef, since HANDLE is an alias.
+        else if PrintKindOfType(UpperFast(CanonicalType(Node.ValueUpper))) = 3 then Result := 3;
       end;
     antLiteral:
       // FreeBASIC gives a DECIMAL integer literal the first type on the ladder Long -> ULong -> LongInt ->
@@ -29115,6 +29127,13 @@ begin
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
     Exit(srtInt);
   T := CanonicalType(T);   // resolve FB TYPE-alias (e.g. "int32" -> "LONG") before the builtin match
+  // ⛔⛔ ...AND AN ALIAS CAN RESOLVE TO A POINTER. The " PTR" test above runs on the SPELLING, so
+  // "Type HND As Any Ptr : Dim h As HND" reached here as "ANY PTR", matched nothing below and fell to
+  // the classic suffix default - the FLOAT bank. At module level the handle was a DOUBLE: it printed
+  // signed, and "cast(HND, &h7FFFFFFFFFFFFFFF)" came back as -9223372036854775808. windows.bi types
+  // every HANDLE, HWND, HKEY and HINSTANCE this way (win deck, w03).
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+    Exit(srtInt);
   // FreeBASIC CVA_LIST: the handle of a variadic argument list. Here that IS an integer cursor into
   // the call's staged arguments, which is what makes CVA_COPY an ordinary copy and CVA_END nothing.
   if T = kCVALIST then Exit(srtInt);

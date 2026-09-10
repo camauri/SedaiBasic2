@@ -14970,6 +14970,12 @@ var
     end;
     if (V.NodeType = antUnaryOp) and (V.ChildCount >= 1) then
       Exit(InferConstTypeName(V.GetChild(0)));
+    // ⛔ A CAST NAMES THE TYPE OF ITS RESULT, and the CONST takes it. "const HWND_BROADCAST =
+    // cast(HWND, &hffff)" is an HWND in fbc - a pointer, printed unsigned - and here it fell to the
+    // DOUBLE default: windows.bi's special handles came out as floats. The name is kept as spelled; the
+    // alias and its " PTR" are resolved downstream, where every declared type is.
+    if (V.NodeType = antCast) and (Trim(VarToStr(V.Value)) <> '') then
+      Exit(UpperFast(Trim(VarToStr(V.Value))));
     if (V.NodeType = antBinaryOp) and (V.ChildCount >= 2) and (V.Token <> nil) then
     begin
       // ⛔ "/" is FreeBASIC's FLOATING division whatever its operands are: "Const HALF = 1 / 2" is
