@@ -275,6 +275,14 @@ FreeBASIC. A pointer obtained with `@` on a variable or an array element is a pa
 unaffected — `*p`, `p[i]`, `p2 - p1` and `For p = @a(0) To @a(n)` all answer what FreeBASIC answers,
 because both sides of those speak the same unit.
 
+**C functions that exist only at link time cannot be called** (10 September 2026). SedaiBasic reaches
+a C library by LOADING it while the program runs, where FreeBASIC compiles and LINKS an executable. A
+run-time loader can only find what a library exports, so a name that lives in the static part of the C
+library — `atexit` and `pthread_atfork` are the two in the CRT headers — is not callable here: those
+symbols are absent from glibc's dynamic symbol table (they live in `libc_nonshared.a`). It affects
+very few functions, and there is nearly always an exported equivalent; in the case of `atexit`, put
+the call at the end of the program.
+
 **`SizeOf` inside `#if` and `#assert` is the compiler's own answer** (9 September 2026). FreeBASIC's
 preprocessor *is* its compiler, so `#assert sizeof( T ) = 16` is answered from the symbol table.
 SedaiBasic's preprocessor is a separate pass over text, and it answers the same question two ways: a
