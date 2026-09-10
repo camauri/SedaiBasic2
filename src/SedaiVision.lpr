@@ -70,6 +70,8 @@ uses
   SedaiPackratParser, SedaiDateTimeUtils,
   // Bytecode VM
   SedaiSSATypes, SedaiSSA,
+  // Installs GPPTypeSizeHook: see the note in SedaiTypeSizeProbe. Linked for its initialization.
+  SedaiTypeSizeProbe,
   SedaiBytecodeTypes, SedaiBytecodeCompiler, SedaiBytecodeVM,
   SedaiBytecodeDisassembler,
   // Register Allocation

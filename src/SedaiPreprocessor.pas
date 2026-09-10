@@ -22,7 +22,10 @@ unit SedaiPreprocessor;
 
 interface
 
-uses Classes, SysUtils, Math, SedaiConsoleBehavior;
+uses Classes, SysUtils, Math, SedaiConsoleBehavior,
+     SedaiSSATypes,        // FBScalarTypeSizeBytes: SizeOf()'s scalar ladder, read here and by the SSA
+     SedaiFastLookup,      // TIndexedStringList: the module-symbol set answers IndexOf from a hash
+     Contnrs;              // TFPStringHashTable: the word set the declaration scan is filtered by
 
 type
   // Raised by #error / a failed #assert. Callers catch it to report a clean compile-time
@@ -71,8 +74,65 @@ var
   // that a macro produced, is treated exactly as the compiler will treat it), and the condition asks
   // this table instead of refusing.
   // ⚠️ Keyed case-INSENSITIVELY, because nothing in BASIC is not.
-  GPPVarTypes: TStringList = nil;    // NAME -> the type NAME it was declared as (both UPPER)
+  GPPVarTypes: TIndexedStringList = nil;  // NAME -> the type NAME it was declared as (both UPPER)
   GPPTypeNames: TStringList = nil;   // names declared with "Type"/"Union"/"Enum": they ARE types
+
+  // ⛔ SET BY THE TOKENIZER WHEN A DIRECTIVE EXPRESSION ASKS SOMETHING THIS PASS CANNOT ANSWER. It is
+  // a LATCH, cleared by the caller before it evaluates and read after, so a question asked anywhere
+  // inside the expression - at any nesting depth, through any macro expansion - comes back marked.
+  // ⚠️ "sizeof( <a user type> )" is NOT one of those any more: it is answered through GPPTypeSizeHook
+  // below. What still marks is TypeOf of an operand no table knows.
+  GPPExprUnevaluable: Boolean = False;
+
+  // ⛔ TEXT COMPARED WITH A NUMBER IS A TYPE MISMATCH, and fbc refuses the program for it
+  // (error 20). An UNDEFINED identifier tokenizes as TEXT here - that is measured, not chosen: fbc
+  // makes two undeclared names compare EQUAL to each other - so "#if _WIN32_WINNT >= &h0600" in a
+  // sub-header that does not include the file declaring it is exactly this shape, and answering
+  // "not equal" took a branch fbc never reaches. It is 15 of the headers we accept and fbc refuses.
+  // ⚠️ Only while a CONDITION is being decided. The same evaluator folds "__FB_EVAL__" and a Const
+  // initialiser, where there is no program to refuse and the old lenient answer is what the caller
+  // wants. SB_PP_LAX_CMP=1 puts the lenient answer back everywhere, on one binary.
+  GPPStrictCmp: Boolean = False;
+
+  // ⭐⭐⭐ THE SIZE OF A USER TYPE, ASKED OF THE COMPILER RATHER THAN GUESSED HERE.
+  //
+  // fbc's preprocessor IS its compiler, so "#assert sizeof( T ) = 16" is answered from the symbol
+  // table for any T. This preprocessor is a separate pass over TEXT, and the obvious two ways out are
+  // both wrong: leaving the check unmade is a divergence, and writing a layout rule here is a SECOND
+  // copy of UDTCLayout - alignment padding, "Field = n", bit-field runs, nested Union blocks, an
+  // inline fixed array member - a rule measured against fbc over eighty probes and already present in
+  // three copies inside SedaiSSA. A fourth copy, written on text, would drift the first time a width
+  // moved, and this project has already paid that bill once (WIDE_CELL_BYTES).
+  //
+  // ⇒ The declarations this pass has EMITTED so far - which is exactly what fbc's single pass holds
+  // in its symbol table at that point - are handed to the SSA, which lays the type out with its own
+  // rule and answers. ⛔ A FUNCTION POINTER, not a unit reference: SedaiSSA already uses this unit, so
+  // naming it here would close a cycle. SedaiTypeSizeProbe installs the hook; a front end that does
+  // not link that unit simply has no hook and the question stays unanswered, as it was before.
+  GPPTypeSizeHook: function(const DeclText, TypeName: string; out Sz: Int64): Boolean = nil;
+
+  // The TYPE / UNION / ENUM blocks, the "Type <n> As <t>" aliases and the module CONST lines emitted
+  // so far, in order. ⚠️ EMITTED, so a declaration inside a branch that was not taken is not here,
+  // and one spliced in from an "#include" is - which is the whole point: the 78 headers that reach
+  // FreeBASIC's crt/longdouble.bi declare clongdouble in the INCLUDED file.
+  // ⛔ A LIST, NOT A STRING, and that is a compile-TIME decision. Appending to one AnsiString once
+  // per declaration line reallocates the whole text each time, and a header tree expands to tens of
+  // thousands of lines; the join happens only when a directive actually asks, which over the whole
+  // FreeBASIC tree is three times.
+  GPPTypeDeclLines: TStringList = nil;
+
+  // ⛔⛔ THE MODULE SYMBOLS, KEPT AS THE LINES GO PAST, and it exists because the first version of the
+  // "#define" collision check asked the question by RE-SCANNING the whole emitted text - once per
+  // "#define". A Windows header reaches thousands of them over tens of thousands of emitted lines,
+  // so the check was O(n**2): measured on win/shtypes.bi with the A/B knob on one binary, it cost
+  // 118 seconds of a 190-second compile - 62% - and fbc does the same file in 177 ms.
+  // ⇒ The same answer is built ONCE, incrementally: every emitted line that declares something adds
+  // its identifiers here, and the check becomes a hash lookup.
+  // ⚠️ EVERY identifier on a declaring line, not just the declared name - that is exactly what the
+  // scan it replaces did (its test was "the first word is a declaring keyword AND the line mentions
+  // this name"), so the rule keeps the behaviour that was measured against fbc rather than a tidier
+  // one that would have to be re-measured.
+  GPPModuleSymbols: TIndexedStringList = nil;
 
 const
   // The answer a "#if TypeOf(...)" / "#print TypeOf(...)" gives for an operand the table does not
@@ -246,7 +306,7 @@ begin
     L.Text := Src;
     for i := 0 to L.Count - 1 do
     begin
-      T := UpperCase(TrimLeft(L[i]));
+      T := UpperFast(TrimLeft(L[i]));
       if (Length(T) > 0) and (T[1] = '''') then T := TrimLeft(Copy(T, 2, MaxInt));  // '$lang metacommand
       T := StringReplace(T, ' ', '', [rfReplaceAll]);
       if (Copy(T, 1, 11) = '#LANG"QB"') or (Copy(T, 1, 12) = '$LANG:"QB"') or
@@ -276,7 +336,7 @@ begin
     L.Text := Src;
     for i := 0 to L.Count - 1 do
     begin
-      T := UpperCase(TrimLeft(L[i]));
+      T := UpperFast(TrimLeft(L[i]));
       if (Length(T) > 0) and (T[1] = '''') then T := TrimLeft(Copy(T, 2, MaxInt));   // '$lang metacommand
       T := StringReplace(T, ' ', '', [rfReplaceAll]);
       if (Copy(T, 1, 5) = '#LANG') or (Copy(T, 1, 6) = '$LANG:') then
@@ -699,7 +759,7 @@ var
       begin
         q := p;
         while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
-        id := UpperCase(Copy(S, p, q - p)); p := q;
+        id := UpperFast(Copy(S, p, q - p)); p := q;
         if (id = 'MOD') or (id = 'SHL') or (id = 'SHR') or IsPPMathFn(id) then Toks.Add(id)
         else if Defs.IndexOfName(id) >= 0 then
         begin
@@ -876,7 +936,7 @@ begin
     begin
       j := i;
       while (j <= Length(S)) and IsIdentChar(S[j]) do Inc(j);
-      W := UpperCase(Copy(S, i, j - i));
+      W := UpperFast(Copy(S, i, j - i));
       if Defs.IndexOfName(W) < 0 then Exit;            // an unknown name is not a constant
       Part := Trim(Defs.Values[W]);
       if not PPConstStrFold(Part, Defs, Part) then Exit;
@@ -906,7 +966,7 @@ begin
     begin
       j := i;
       while (j <= Length(S)) and IsIdentChar(S[j]) do Inc(j);
-      W := UpperCase(Copy(S, i, j - i));
+      W := UpperFast(Copy(S, i, j - i));
       if IsPPMathFn(W) then Exit(True);
       i := j;
       Continue;
@@ -949,8 +1009,8 @@ var
 begin
   Result := 0;
   if (Needle = '') or (Hay = '') then Exit;
-  HayU := UpperCase(Hay);
-  NeedleU := UpperCase(Needle);
+  HayU := UpperFast(Hay);
+  NeedleU := UpperFast(Needle);
   p := 1;
   repeat
     // Search from p onwards without StrUtils: Pos on the tail, then map the offset back.
@@ -1092,7 +1152,7 @@ begin
   end;
   if (NameU = '__FB_UNIQUEID_PUSH__') or (NameU = '__FB_UNIQUEID__') or (NameU = '__FB_UNIQUEID_POP__') then
   begin
-    Cond := UpperCase(Trim(ArgsStr));          // the stack name
+    Cond := UpperFast(Trim(ArgsStr));          // the stack name
     if Cond = '' then Exit;
     Idx := GUniqueIdStacks.IndexOf(Cond);
     if NameU = '__FB_UNIQUEID_PUSH__' then
@@ -1178,7 +1238,7 @@ begin
   W := TrimLeft(Copy(W, 2, MaxInt));
   i := 1;
   while (i <= Length(W)) and not (W[i] in [' ', #9]) do Inc(i);
-  W := UpperCase(Copy(W, 1, i - 1));
+  W := UpperFast(Copy(W, 1, i - 1));
   Result := (W = 'DEFINE') or (W = 'UNDEF') or (W = 'MACRO') or
             (W = 'IF') or (W = 'IFDEF') or (W = 'IFNDEF') or
             (W = 'ELSEIF') or (W = 'ELSE') or (W = 'ENDIF');
@@ -1307,9 +1367,9 @@ begin
       begin
         k := j + 1;
         while (k <= Length(Line)) and IsIdentChar(Line[k]) do Inc(k);
-        if (k > j + 1) and (Defs.IndexOfName(UpperCase(Copy(Line, i, k - i))) >= 0) then
+        if (k > j + 1) and (Defs.IndexOfName(UpperFast(Copy(Line, i, k - i))) >= 0) then
         begin
-          Result := Result + Trim(Defs.Values[UpperCase(Copy(Line, i, k - i))]);
+          Result := Result + Trim(Defs.Values[UpperFast(Copy(Line, i, k - i))]);
           i := k;
           Continue;
         end;
@@ -1322,7 +1382,7 @@ begin
       // "__FB_QUOTE__ ( abc )" reached the parser as an undefined array called __FB_QUOTE__.
       k := j;
       while (k <= Length(Line)) and (Line[k] in [' ', #9]) do Inc(k);
-      if (k <= Length(Line)) and (Line[k] = '(') and (Copy(UpperCase(Word), 1, 5) = '__FB_') then
+      if (k <= Length(Line)) and (Line[k] = '(') and (Copy(UpperFast(Word), 1, 5) = '__FB_') then
       begin
         j := k;
         // ⛔ AND A PARENTHESIS INSIDE A STRING LITERAL IS NOT A PARENTHESIS. This counted '(' and ')'
@@ -1346,7 +1406,7 @@ begin
           ArgsStr := ArgsStr + Line[k];
           Inc(k);
         end;
-        if TryPPBuiltin(UpperCase(Word), SubstituteMacros(ArgsStr, Defs, FnDefs, Depth + 1), Defs, FnDefs, BuiltinVal) then
+        if TryPPBuiltin(UpperFast(Word), SubstituteMacros(ArgsStr, Defs, FnDefs, Depth + 1), Defs, FnDefs, BuiltinVal) then
         begin
           if (k <= Length(Line)) and (Line[k] = ')') then Inc(k);
           Result := Result + SubstituteMacros(BuiltinVal, Defs, FnDefs, Depth + 1);
@@ -1355,7 +1415,7 @@ begin
         end;
       end;
       // Function-like macro: NAME immediately followed by '(' — expand with its arguments.
-      idx := FnDefs.IndexOfName(UpperCase(Word));
+      idx := FnDefs.IndexOfName(UpperFast(Word));
       // A space between the macro name and its arguments is ordinary FreeBASIC - the manual writes
       // "concat (12,34)" - and demanding the parenthesis immediately after the name left the invocation
       // unexpanded, so the macro's own name reached the parser.
@@ -1425,7 +1485,7 @@ begin
         i := j;
         Continue;
       end;
-      idx := Defs.IndexOfName(UpperCase(Word));
+      idx := Defs.IndexOfName(UpperFast(Word));
       if idx >= 0 then
         // An object-like macro's VALUE is itself macro text: "#define X __FB_QUOTE__( Print "hi" )"
         // means nothing until the built-in inside it runs. Appending the value raw left it unexpanded,
@@ -1574,6 +1634,36 @@ var
   // fbc's symbol table is - so when it is available it is what gets scanned, and the source with a
   // line limit is the fallback for a caller that has none.
   GPPOutput: TStringList = nil;
+  // ⛔⛔ EVERY WORD THE EXPANSION HAS EMITTED SO FAR, as a set. SourceDeclaresSymbol answers by
+  // SCANNING the whole expansion, once per question, and a header asks the question on nearly every
+  // line ("#ifndef X" / "defined( X )") - so the cost is lines x lines. perf on win/shtypes.bi put
+  // 37% of the entire compile in that scan.
+  // ⭐ This does NOT answer the question: it answers the only case that is common, which is NO. Every
+  // TRUE the scan can return needs a line that MENTIONS the name, so a name that appears nowhere in
+  // the emitted text cannot be declared by it, and the scan need not run at all. When the word IS
+  // there, the scan runs exactly as before - the answer is never this table's to give.
+  // ⚠️ A word that is only in the set because the line that carried it was rolled back is harmless:
+  // an extra word makes the filter say "maybe" where it could have said "no", and the scan then gives
+  // the real answer. ⛔ The dangerous direction is the other one - a MISSING word - which is why the
+  // rollback clears the whole set instead of just moving the cursor back: after a rollback the same
+  // line indices hold different text, and the cursor alone would step straight over it.
+  GPPDefWords: TFPStringHashTable = nil;
+  GPPDefWordsCovered: Integer = 0;
+  // ⛔ The same filter for the OTHER text-scanning question: SourceConstValue, which asks "what is the
+  // value of the Const / enum member called Nm" by joining every emitted declaration line to the whole
+  // module source and scanning it - a join and a split PER QUESTION. perf put 17% of a header compile
+  // there. This set covers those two texts; the answer, when the word is present, is still the scan's.
+  // ...and the module source SPLIT INTO LINES once. The scan below used to join the emitted
+  // declaration lines to the whole module text and split the result on every question: with a header
+  // that is a megabyte of text per "#if". Nothing about the two texts changes except that the
+  // declaration list GROWS, so they are walked in place, in the same order, and only this one split
+  // is kept.
+  GPPSourceLines: TStringList = nil;
+  GPPSourceLinesLen: Integer = -1;
+  GPPConstWords: TFPStringHashTable = nil;
+  GPPConstWordsDeclCovered: Integer = 0;
+  GPPConstWordsSrcDone: Boolean = False;
+  GPPDeclTextOff: Integer = -1;   // SB_NO_DECLTEXT, asked once per process
   // ⛔ "#pragma reserve NAME" makes NAME a SYMBOL and NOT A MACRO. Putting it in Defs was tried and is
   // wrong: the name is then SUBSTITUTED in ordinary code, and fbc's own pp/pragma-reserve-4 goes on to
   // write "dim symbol as integer" - which became "dim 0 as integer". Reserving is only observable
@@ -1714,7 +1804,7 @@ var
 
 begin
   Result := '0';
-  SymU := UpperCase(Trim(Sym));
+  SymU := UpperFast(Trim(Sym));
   if SymU = '' then Exit;
   // A QUALIFIED name - "T.l", "t1.l" - is a FIELD, and what is asked of it is the field's own class.
   // The scan below matches a declaration by its NAME, and a field is declared inside its type under
@@ -1738,7 +1828,7 @@ begin
       L.Text := GPPSourceForDefined;
       for i := 0 to L.Count - 1 do
       begin
-        Nm := DeclaredNameOfLine(UpperCase(TrimLeft(L[i])), Kind, TypeName);
+        Nm := DeclaredNameOfLine(UpperFast(TrimLeft(L[i])), Kind, TypeName);
         if Nm <> SymU then Continue;
         if (Kind = 'TYPE') or (Kind = 'UNION') or (Kind = 'CLASS') then
         begin
@@ -1810,6 +1900,41 @@ begin
   if Trim(Cur) <> '' then Result.Add(Trim(Cur));
 end;
 
+function PPBasedLiteralValue(const S: string; out V: Int64): Boolean;
+// "&h1F", "&o17", "&b1011", with an optional sign and the FreeBASIC type suffix ("&hFFFFu"), as an
+// Int64. False - and V untouched - for anything that is not one of those.
+var
+  T, Body: string;
+  Neg: Boolean;
+  n: Integer;
+begin
+  Result := False;
+  V := 0;
+  T := UpperFast(Trim(S));
+  Neg := False;
+  if (T <> '') and ((T[1] = '-') or (T[1] = '+')) then
+  begin
+    Neg := T[1] = '-';
+    T := Trim(Copy(T, 2, MaxInt));
+  end;
+  if (Length(T) < 3) or (T[1] <> '&') then Exit;
+  // The FreeBASIC type suffix is not part of the number: "&hFFFFFFFFu", "&h7FFFFFFFFFFFFFFFll".
+  n := Length(T);
+  while (n > 2) and (T[n] in ['U', 'L']) do Dec(n);
+  Body := Copy(T, 3, n - 2);
+  if Body = '' then Exit;
+  case T[2] of
+    'H': Result := TryStrToInt64('$' + Body, V);
+    'O': Result := TryStrToInt64('&' + Body, V);     // FPC spells octal with '&'
+    'B': Result := TryStrToInt64('%' + Body, V);     // ...and binary with '%'
+  else   Result := False;
+  end;
+  if Result and Neg then V := -V;
+end;
+
+function PPWordFilterOn: Boolean; forward;
+function PPConstWordPresent(const W: string): Boolean; forward;
+
 function SourceConstValue(const Nm: string; out V: Int64): Boolean;
 // The VALUE of a module-level "Const <Nm> = <integer literal>" written in the source, for a #if / #assert
 // that names it. fbc's preprocessor can read a Const because its symbol table is being built as it goes;
@@ -1832,8 +1957,8 @@ function SourceConstValue(const Nm: string; out V: Int64): Boolean;
 // the walk of THAT enum - the numbers after it are no longer known, and guessing them would replace
 // the honest 0 with a confident wrong answer.
 var
-  L, Decls: TStringList;
-  i, p, q, d: Integer;
+  Decls: TStringList;
+  i, p, q, d, DeclN: Integer;
   U, W, Rest, MemU, Dcl: string;
   EnumNext: Int64;
   InEnum, EnumLost: Boolean;
@@ -1841,13 +1966,31 @@ begin
   Result := False;
   V := 0;
   if Nm = '' then Exit;
-  L := TStringList.Create;
+  // ⭐ The word is not there ⇒ no Const and no enum member can carry it, and the join-and-scan below
+  // does not have to happen. Same A/B knob as the other filter: SB_PP_NO_WORDFILTER=1 skips it.
+  if PPWordFilterOn and (not PPConstWordPresent(UpperFast(Trim(Nm)))) then Exit;
   try
-    L.Text := GPPSourceForDefined;
-    InEnum := False; EnumLost := False; EnumNext := 0;
-    for i := 0 to L.Count - 1 do
+    // ⛔⛔ A CONST DECLARED IN AN INCLUDED FILE WAS INVISIBLE. GPPSourceForDefined is the TOP-LEVEL
+    // source and nothing else, so "#if _WIN32_WINNT >= &h0600" - the branch every Windows header
+    // turns on - could not see "const _WIN32_WINNT = &h0502", which lives in win/_mingw.bi. The name
+    // answered the 0 default in BOTH directions of a pair of complementary branches, so a type
+    // declared in each of them was declared in NEITHER, and every later use of it read as undeclared.
+    // ⇒ The EMITTED declaration lines come first: they are what this pass has actually produced up to
+    // here, headers spliced in and untaken branches left out, which is exactly what fbc's single pass
+    // has in hand at the same point. The module text stays as the fallback for a program with no
+    // includes at all.
+    if GPPSourceLines = nil then GPPSourceLines := TStringList.Create;
+    if GPPSourceLinesLen <> Length(GPPSourceForDefined) then
     begin
-      U := UpperCase(Trim(L[i]));
+      GPPSourceLines.Text := GPPSourceForDefined;
+      GPPSourceLinesLen := Length(GPPSourceForDefined);
+    end;
+    if GPPTypeDeclLines <> nil then DeclN := GPPTypeDeclLines.Count else DeclN := 0;
+    InEnum := False; EnumLost := False; EnumNext := 0;
+    for i := 0 to DeclN + GPPSourceLines.Count - 1 do
+    begin
+      if i < DeclN then U := UpperFast(Trim(GPPTypeDeclLines[i]))
+      else U := UpperFast(Trim(GPPSourceLines[i - DeclN]));
       p := 1;
       while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
       W := Copy(U, 1, p - 1);
@@ -1901,17 +2044,43 @@ begin
           Dcl := Trim(Copy(Dcl, q, MaxInt));
           if (Dcl = '') or (Dcl[1] <> '=') then Continue;
           Dcl := Trim(Copy(Dcl, 2, MaxInt));
-          // Only a plain integer literal: anything else is an expression this stage cannot fold, and
-          // answering it wrongly would be worse than leaving the old 0.
+          // ⛔⛔ A BASED LITERAL IS A LITERAL TOO, and reading only decimals is what shut the Windows
+          // headers out. "win/_mingw.bi" writes "const _WIN32_WINNT = &h0502" - a CONST, not a
+          // #define - and every Windows header then branches on it: "#if _WIN32_WINNT >= &h0600" and
+          // "#if _WIN32_WINNT <= &h0502" are the two halves of the SAME declaration in urlmon.bi.
+          // Unfolded, the name answered NEITHER branch, so a type declared in both was declared in
+          // none and every use of it read as undeclared.
+          // ⚠️ Still only a LITERAL - a based one now, and a signed one - never an expression: the
+          // note this replaces is right that answering an expression wrongly is worse than not
+          // answering, and "&h0502" is not an expression, it is how C headers spell a number.
           if TryStrToInt64(Dcl, V) then Exit(True);
+          if PPBasedLiteralValue(Dcl, V) then Exit(True);
         end;
       finally
         Decls.Free;
       end;
     end;
   finally
-    L.Free;
+    // ⚠️ Nothing to free: the two texts are the caller's, and the split of the module source outlives
+    // the question on purpose.
   end;
+end;
+
+function SourceDeclaresSymbol(const Nm: string): Boolean; forward;
+
+function SourceDeclaresSymbolAtModuleLevel(const Nm: string): Boolean;
+// Does the program declare this name at MODULE level? A hash lookup in the set the emitted lines have
+// been filling as they went past (GPPModuleSymbols).
+//
+// ⛔⛔ IT USED TO RE-SCAN THE WHOLE EMITTED TEXT, once per "#define", and that is what made a Windows
+// header take minutes: measured with the A/B knob on ONE binary, win/shtypes.bi went 190 s -> 71 s
+// with the check switched off, i.e. the check alone was 118 s of it. The answer did not need a scan;
+// it needed to be built once.
+// ⚠️ The SET is deliberately the same one the scan found - every identifier on a declaring line, not
+// only the declared name - so the rule keeps exactly the behaviour that was measured against fbc.
+begin
+  Result := (GPPModuleSymbols <> nil) and (Trim(Nm) <> '') and
+            (GPPModuleSymbols.IndexOf(UpperFast(Trim(Nm))) >= 0);
 end;
 
 function PPFoldStrConst(const Expr: string; out S: string): Boolean;
@@ -1953,7 +2122,7 @@ begin
   if TakeQuoted(T, S) then Exit(True);
   i := 1;
   while (i <= Length(T)) and IsIdentChar(T[i]) do Inc(i);
-  Fn := UpperCase(Copy(T, 1, i - 1));
+  Fn := UpperFast(Copy(T, 1, i - 1));
   if (Fn <> 'LCASE') and (Fn <> 'UCASE') and (Fn <> 'WSTR') and (Fn <> 'STR') then Exit;
   T := Trim(Copy(T, i, MaxInt));
   if (T = '') or (T[1] <> '(') then Exit;
@@ -1974,7 +2143,7 @@ begin
   end;
   if not PPFoldStrConst(Inner, S) then Exit;
   if Fn = 'LCASE' then S := LowerCase(S)
-  else if Fn = 'UCASE' then S := UpperCase(S);
+  else if Fn = 'UCASE' then S := UpperFast(S);
   Result := True;
 end;
 
@@ -2008,13 +2177,13 @@ begin
     for i := 0 to L.Count - 1 do
     begin
       Raw := Trim(L[i]);
-      U := UpperCase(Raw);
+      U := UpperFast(Raw);
       p := 1;
       while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
       W := Copy(U, 1, p - 1);
       if W <> 'CONST' then Continue;
       Raw := Trim(Copy(Raw, p, MaxInt));
-      RestU := UpperCase(Raw);
+      RestU := UpperFast(Raw);
       // "Const AS <type> name = v" names the type first; step over it.
       if Copy(RestU, 1, 3) = 'AS ' then
       begin
@@ -2030,7 +2199,7 @@ begin
           Dcl := Decls[d];
           q := 1;
           while (q <= Length(Dcl)) and IsIdentChar(Dcl[q]) do Inc(q);
-          if UpperCase(Trim(Copy(Dcl, 1, q - 1))) <> Nm then Continue;
+          if UpperFast(Trim(Copy(Dcl, 1, q - 1))) <> Nm then Continue;
           Rest := Trim(Copy(Dcl, q, MaxInt));
           if (Rest = '') or (Rest[1] <> '=') then Continue;
           Rest := Trim(Copy(Rest, 2, MaxInt));
@@ -2046,6 +2215,143 @@ begin
 end;
 
 function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean; forward;
+
+procedure PPFoldWordsOfText(T: TFPStringHashTable; const Txt: string);
+// Add every identifier written in Txt to the set T. ⛔ TFPStringHashTable.Add RAISES on a key it
+// already holds, so presence is asked first - in a header that is the normal case, not the corner one.
+var
+  p, b, n: Integer;
+  W: string;
+begin
+  if T = nil then Exit;
+  p := 1;
+  n := Length(Txt);
+  while p <= n do
+  begin
+    if IsIdentChar(Txt[p]) then
+    begin
+      b := p;
+      while (p <= n) and IsIdentChar(Txt[p]) do Inc(p);
+      W := UpperFast(Copy(Txt, b, p - b));
+      if T.Items[W] = '' then T.Add(W, '1');
+    end
+    else
+      Inc(p);
+  end;
+end;
+
+function PPConstWordPresent(const W: string): Boolean;
+// Is this word written anywhere SourceConstValue would look - the declaration lines emitted so far, or
+// the module source? FALSE means the scan cannot find a Const or an enum member of that name, because
+// both need a line that spells it.
+var
+  i: Integer;
+begin
+  Result := True;
+  if W = '' then Exit;
+  for i := 1 to Length(W) do
+    if not IsIdentChar(W[i]) then Exit;
+  if GPPConstWords = nil then GPPConstWords := TFPStringHashTable.Create;
+  if not GPPConstWordsSrcDone then
+  begin
+    // The module text does not change while a program is preprocessed: folded once.
+    PPFoldWordsOfText(GPPConstWords, GPPSourceForDefined);
+    GPPConstWordsSrcDone := True;
+  end;
+  if GPPTypeDeclLines <> nil then
+  begin
+    // ...and the declaration lines only ever grow, so a cursor is enough.
+    if GPPConstWordsDeclCovered > GPPTypeDeclLines.Count then GPPConstWordsDeclCovered := 0;
+    for i := GPPConstWordsDeclCovered to GPPTypeDeclLines.Count - 1 do
+      PPFoldWordsOfText(GPPConstWords, GPPTypeDeclLines[i]);
+    GPPConstWordsDeclCovered := GPPTypeDeclLines.Count;
+  end;
+  Result := GPPConstWords.Items[W] <> '';
+end;
+
+procedure PPRetireDef(L: TStringList; Idx: Integer);
+// Retire a macro NAME without deleting its row. ⛔ Deleting renumbers every entry above it, which
+// costs the hashed index its validity: a header that "#undef"s hundreds of names rebuilt a
+// thousands-entry index hundreds of times (48% of win/shlwapi.bi). A row with no name/value separator
+// is invisible to IndexOfName - in the RTL scan and in the index alike - so the name is gone and the
+// numbering is untouched. ⚠️ The row stays in Count; nothing iterates these tables by index.
+begin
+  if (L = nil) or (Idx < 0) or (Idx >= L.Count) then Exit;
+  L[Idx] := #1'retired';
+end;
+
+procedure PPInvalidateDefWords;
+// The emitted text below the cursor changed: everything folded so far describes lines that are no
+// longer there. Fold again from the top on the next question.
+begin
+  if GPPDefWords <> nil then GPPDefWords.Clear;
+  GPPDefWordsCovered := 0;
+end;
+
+procedure PPFoldDefWords;
+// Bring GPPDefWords up to the current end of the expansion, one pass over the lines added since the
+// last question. ⛔ A SHRINKING output (the tail rollback at "while Output.Count > Base") only moves
+// the cursor back: the words stay, because a superset is sound and re-adding them is not free.
+var
+  i, p, b, n: Integer;
+  Ln, W: string;
+begin
+  if GPPOutput = nil then Exit;
+  if GPPDefWords = nil then GPPDefWords := TFPStringHashTable.Create;
+  if GPPDefWordsCovered > GPPOutput.Count then GPPDefWordsCovered := GPPOutput.Count;
+  for i := GPPDefWordsCovered to GPPOutput.Count - 1 do
+  begin
+    Ln := GPPOutput[i];
+    p := 1;
+    n := Length(Ln);
+    while p <= n do
+    begin
+      if IsIdentChar(Ln[p]) then
+      begin
+        b := p;
+        while (p <= n) and IsIdentChar(Ln[p]) do Inc(p);
+        // ⛔ TFPStringHashTable.Add RAISES on a key it already holds - it is not a set primitive.
+        // Every word in a header repeats, so this is the normal case, not the corner one.
+        W := UpperFast(Copy(Ln, b, p - b));
+        if GPPDefWords.Items[W] = '' then GPPDefWords.Add(W, '1');
+      end
+      else
+        Inc(p);
+    end;
+  end;
+  GPPDefWordsCovered := GPPOutput.Count;
+end;
+
+var
+  GPPWordFilterOff: Integer = -1;   // -1 not asked yet, 0 on, 1 off
+
+function PPWordFilterOn: Boolean;
+// SB_PP_NO_WORDFILTER=1 turns BOTH word filters off, so the two text scans run on every question
+// exactly as they did before the tables existed. It is the A/B on ONE binary: same build, same
+// headers, and any verdict that moves is a filter's doing.
+begin
+  if GPPWordFilterOff < 0 then
+    if GetEnvironmentVariable('SB_PP_NO_WORDFILTER') <> '' then GPPWordFilterOff := 1
+    else GPPWordFilterOff := 0;
+  Result := GPPWordFilterOff = 0;
+end;
+
+function PPWordCanBeDeclared(const W: string): Boolean;
+// Could the emitted expansion possibly declare this word? FALSE only when the word does not occur in
+// it at all. Anything that is not a plain identifier (an operator member name, say) is not filtered.
+var
+  i: Integer;
+begin
+  Result := True;
+  if W = '' then Exit;
+  if not PPWordFilterOn then Exit;
+  for i := 1 to Length(W) do
+    if not IsIdentChar(W[i]) then Exit;
+  PPFoldDefWords;
+  Result := (GPPDefWords <> nil) and (GPPDefWords.Items[W] <> '');
+  if (not Result) and (GetEnvironmentVariable('PPWORDDIAG') <> '') then
+    WriteLn(ErrOutput, '[PPWORD] "', W, '" not in the ', GPPDefWordsCovered, ' lines emitted so far');
+end;
 
 function SourceDeclaresSymbol(const Nm: string): Boolean;
 // fbc's Defined() answers TRUE for COMPILER-level symbols too, not only #defines: a Const, a
@@ -2155,6 +2461,13 @@ begin
     Qual := '';
     Member := '';
   end;
+  // ⭐ The one question that does not need the scan: is the word there AT ALL? Only when the
+  // expansion is what would be scanned - the source-text branch below has no table.
+  if (GPPOutput <> nil) and (GPPOutput.Count > 0) then
+  begin
+    if Qual = '' then Want := UpperFast(Trim(Nm)) else Want := UpperFast(Trim(Qual));
+    if not PPWordCanBeDeclared(Want) then Exit(False);
+  end;
   L := TStringList.Create;
   try
     // The expansion so far when there is one, the source truncated at the asking line otherwise.
@@ -2178,7 +2491,7 @@ begin
     if Qual = '' then Want := Nm else Want := Qual;
     for i := 0 to LastLine do
     begin
-      U := UpperCase(TrimLeft(L[i]));
+      U := UpperFast(TrimLeft(L[i]));
       p := 1;
       while (p <= Length(U)) and IsIdentChar(U[p]) do Inc(p);
       W := Copy(U, 1, p - 1);
@@ -2376,10 +2689,19 @@ function EvalPPExpr(const RawExpr: string; Defs: TStringList;
 // #if / #elseif / #assert: the expression as a CONDITION.
 // ⛔ It asks for the TYPED value, not the integer one: "#if 0.5" is TRUE in fbc and truncating the
 // value to an Int64 before testing it made it false.
+// ⭐ ...and it is the ONE entry point where a text-against-a-number comparison is an ERROR rather
+// than "not equal": here there is a program to refuse, which is what fbc does. See GPPStrictCmp.
 var
   R: TPPVal;
+  Saved: Boolean;
 begin
-  Result := EvalPPExprAny(RawExpr, Defs, R, FnDefs) and PPTruthy(R);
+  Saved := GPPStrictCmp;
+  GPPStrictCmp := GetEnvironmentVariable('SB_PP_LAX_CMP') <> '1';
+  try
+    Result := EvalPPExprAny(RawExpr, Defs, R, FnDefs) and PPTruthy(R);
+  finally
+    GPPStrictCmp := Saved;
+  end;
 end;
 
 const
@@ -2393,7 +2715,7 @@ begin
   if (P > Length(S)) or (S[P] <> '.') then Exit;
   q := P + 1;
   while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
-  if q > P + 1 then Result := UpperCase(Copy(S, P + 1, q - P - 1));
+  if q > P + 1 then Result := UpperFast(Copy(S, P + 1, q - P - 1));
 end;
 
 function NextNonBlankIsOpenParen(const S: string; P: Integer): Boolean;
@@ -2430,6 +2752,59 @@ begin
   end;
 end;
 
+var
+  // One-entry memo for PPUserTypeSize. The hook re-lexes and re-parses the declarations collected so
+  // far, so asking it twice for the same name over the same text would do that work twice - and a
+  // header that asserts three sizes in a row (crt/longdouble.bi does) asks inside one #if chain.
+  GPPSzCacheKey: string = '';
+  GPPSzCacheVal: Int64 = 0;
+  GPPSzCacheOK: Boolean = False;
+
+function PPUserTypeSize(const Nm: string; out Sz: Int64): Boolean;
+// SizeOf() of a name that is not a builtin: answered by the COMPILER's layout rule, over the
+// declarations this pass has emitted so far. False when there is no hook installed, when the name is
+// not a type declared above this point, or when the attempt raises - and False means "unanswered",
+// never "zero".
+var
+  Key: string;
+begin
+  Sz := 0;
+  Result := False;
+  if (GPPTypeSizeHook = nil) or (GPPTypeDeclLines = nil) or
+     (GPPTypeDeclLines.Count = 0) or (Trim(Nm) = '') then
+  begin
+    if GetEnvironmentVariable('PPSIZEDIAG') = '1' then
+      WriteLn(StdErr, '[ppsize] ', Nm, ' -> no answer (hook=',
+              Ord(GPPTypeSizeHook <> nil), ' decllines=0)');
+    Exit;
+  end;
+  Key := UpperFast(Trim(Nm)) + #1 + IntToStr(GPPTypeDeclLines.Count);
+  if GPPSzCacheKey = Key then
+  begin
+    Sz := GPPSzCacheVal;
+    Exit(GPPSzCacheOK);
+  end;
+  try
+    Result := GPPTypeSizeHook(GPPTypeDeclLines.Text, Nm, Sz);
+    // ⛔ PPSIZEDIAG=1 exists because a hook that answers NOTHING and a hook that is not INSTALLED look
+    // identical from the outside - the directive falls back to 0 either way, and the file still
+    // compiles. It names which of the two happened, and how much declaration text it was given.
+    if GetEnvironmentVariable('PPSIZEDIAG') = '1' then
+      WriteLn(StdErr, '[ppsize] ', Nm, ' -> ', Result, ' size=', Sz,
+              ' decllines=', GPPTypeDeclLines.Count);
+  except
+    // ⛔ THE DECLARATIONS ARE A FRAGMENT, not a program, and a fragment can fail to parse - a type
+    // that EXTENDS one declared inside a namespace this pass does not track, a member whose default
+    // argument names something not collected. That is an unanswered question, not a compile error of
+    // the user's program: the caller falls back exactly where it stood before the hook existed.
+    Result := False;
+    Sz := 0;
+  end;
+  GPPSzCacheKey := Key;
+  GPPSzCacheVal := Sz;
+  GPPSzCacheOK := Result;
+end;
+
 function EvalPPExprAny(const RawExpr: string; Defs: TStringList; out R: TPPVal;
   FnDefs: TStringList = nil): Boolean;
 // ...and as a VALUE, which is what "__FB_EVAL__(expr)" needs: it substitutes the RESULT of a constant
@@ -2457,7 +2832,7 @@ var
       while (n > 2) and (UpCase(Body[n]) in ['U', 'L']) do Dec(n);
       Suffix := Copy(Body, n + 1, MaxInt);
       Body := Copy(Body, 1, n);
-      U := Pos('U', UpperCase(Suffix)) > 0;
+      U := Pos('U', UpperFast(Suffix)) > 0;
       case UpCase(Body[2]) of
         'H': Result := PPUInt(StrToInt64Def('$' + Copy(Body, 3, MaxInt), 0), U);
         'O': Result := PPUInt(StrToInt64Def('&' + Copy(Body, 3, MaxInt), 0), U);  // FPC octal prefix
@@ -2469,7 +2844,7 @@ var
     while (n > 1) and (UpCase(Body[n]) in ['U', 'L', 'F']) do Dec(n);
     Suffix := Copy(Body, n + 1, MaxInt);
     Body := Copy(Body, 1, n);
-    U := Pos('U', UpperCase(Suffix)) > 0;
+    U := Pos('U', UpperFast(Suffix)) > 0;
     if (Pos('.', Body) > 0) or (Pos('e', Body) > 0) or (Pos('E', Body) > 0) or
        (Pos('d', Body) > 0) or (Pos('D', Body) > 0) then
       Result := PPFlt(StrToFloatDef(StringReplace(StringReplace(Body, 'd', 'e', [rfReplaceAll]),
@@ -2484,7 +2859,7 @@ var
   // re-tokenized (depth-guarded) rather than added as one token, so values like "-1" (-> '-' '1'),
   // "&HFF", or "1 + 2" parse correctly and nested macros expand.
   procedure Tokenize(const S: string; Depth: Integer);
-  var p, q: Integer; id, two: string; nm: string; ConstV: Int64; ConstS: string;
+  var p, q: Integer; id, two: string; nm: string; ConstV, SzVal: Int64; ConstS: string;
   begin
     p := 1;
     while p <= Length(S) do
@@ -2569,7 +2944,7 @@ var
       begin
         q := p;
         while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
-        id := UpperCase(Copy(S, p, q - p)); p := q;
+        id := UpperFast(Copy(S, p, q - p)); p := q;
         if id = 'DEFINED' then
         begin
           // defined(NAME) or defined NAME -> 1/0
@@ -2583,7 +2958,7 @@ var
           while (p <= Length(S)) and (S[p] = '.') do Inc(p);
           q := p;
           while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
-          nm := UpperCase(Copy(S, p, q - p)); p := q;
+          nm := UpperFast(Copy(S, p, q - p)); p := q;
           // ⛔ A QUALIFIED name is one name, and it was read as the BARE one with a tail left over.
           // "defined( T.datafield )" answered whatever "defined( T )" answered - so every one of the
           // fourteen "check_N( T.something )" in fbc's pp/defined-udt came out TRUE inside the type's
@@ -2595,7 +2970,7 @@ var
             Inc(p);                                  // the '.'
             q := p;
             while (q <= Length(S)) and (S[q] <> ')') and (S[q] <> ' ') and (S[q] <> #9) do Inc(q);
-            nm := nm + '.' + UpperCase(Trim(Copy(S, p, q - p)));
+            nm := nm + '.' + UpperFast(Trim(Copy(S, p, q - p)));
             p := q;
           end;
           while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
@@ -2629,6 +3004,37 @@ var
         end
         else if (id = 'TYPEOF') then
           // Written without an argument list it is not the operator at all.
+          Toks.Add('0')
+        else if (id = 'SIZEOF') and NextNonBlankIsOpenParen(S, p) then
+        begin
+          // ⛔ "sizeof(...)" USED TO READ AS AN UNDECLARED IDENTIFIER, hence 0, and that silent zero
+          // was the whole of the "long double" wall: 78 of FreeBASIC's own headers reach
+          // crt/longdouble.bi, whose "#assert sizeof( clongdouble ) = 16" therefore failed, and every
+          // one of the 78 was refused. ⭐ clongdouble is not a floating type at all - FB has no long
+          // double either, so the header declares a UDT of 16 UBYTEs - which is why the wall was never
+          // about x87 arithmetic and never needed it.
+          // ⭐ A SCALAR OR POINTER OPERAND IS ANSWERED FROM THE LADDER THE SSA READS, so the 51
+          // "#if sizeof(wstring)" / "#if sizeof(integer)" sites of fbc's own suite stop picking a
+          // branch by accident. ⭐⭐ A USER TYPE IS ANSWERED BY THE COMPILER ITSELF (PPUserTypeSize →
+          // GPPTypeSizeHook → TSSAGenerator.SizeOfDeclaredType): its size is a LAYOUT question, so the
+          // question is sent to the one place that rule lives instead of being answered twice.
+          // Only a name nothing can resolve is left at 0, and then the expression is MARKED.
+          q := p;
+          while (q <= Length(S)) and (S[q] in [' ', #9]) do Inc(q);
+          nm := GatherBalancedParens(S, q);          // "( t )", q lands past the ')'
+          p := q;
+          nm := Trim(nm);
+          if (Length(nm) >= 2) and (nm[1] = '(') then nm := Trim(Copy(nm, 2, Length(nm) - 2));
+          if FBScalarTypeSizeBytes(nm, SzVal) or PPUserTypeSize(nm, SzVal) then
+            Toks.Add(IntToStr(SzVal))
+          else
+          begin
+            GPPExprUnevaluable := True;
+            Toks.Add('0');
+          end;
+        end
+        else if (id = 'SIZEOF') then
+          // Without an argument list it is not the operator: an ordinary undeclared name, hence 0.
           Toks.Add('0')
         else if (id = 'AND') or (id = 'OR') or (id = 'NOT') or (id = 'MOD') then
           Toks.Add(id)
@@ -2817,6 +3223,10 @@ var
         // must still answer something. "UNKNOWN = "gas"" is FALSE and "UNKNOWN <> "gas"" is TRUE.
         if r.Kind <> ppvStr then
         begin
+          if GPPStrictCmp then
+            raise EPreprocessorError.CreateFmt(
+              'type mismatch: "%s" has no numeric value here, and comparing it with a number is not ' +
+              'something this condition can decide (an undeclared name is text, not zero)', [ls]);
           if (op='<>') or (op='!=') then Result := PPBool(True) else Result := PPBool(False);
           Exit;
         end;
@@ -2846,6 +3256,10 @@ var
       l := Result; r := ParseAdd;
       if r.Kind = ppvStr then
       begin
+        if GPPStrictCmp then
+          raise EPreprocessorError.CreateFmt(
+            'type mismatch: "%s" has no numeric value here, and comparing it with a number is not ' +
+            'something this condition can decide (an undeclared name is text, not zero)', [r.S]);
         if (op='<>') or (op='!=') then Result := PPBool(True) else Result := PPBool(False);
         Continue;
       end;
@@ -2952,7 +3366,7 @@ begin
     begin
       j := i;
       while (j <= Length(Expr)) and IsIdentChar(Expr[j]) do Inc(j);
-      W := UpperCase(Copy(Expr, i, j - i));
+      W := UpperFast(Copy(Expr, i, j - i));
       if (W <> 'MOD') and (W <> 'AND') and (W <> 'OR') and (W <> 'NOT') and
          (W <> 'SHL') and (W <> 'SHR') and (not IsPPMathFn(W)) and (Defs.IndexOfName(W) < 0) then Exit;
       i := j;
@@ -2970,6 +3384,23 @@ begin
     Exit;
   end;
   if EvalPPExprInt(Expr, Defs, V) then Result := IntToStr(V);
+end;
+
+function MissingIncludeIsAnError(const FileName: string): Boolean;
+// ⛔ A MISSING #include IS DROPPED IN SILENCE, ON PURPOSE - see RegisterEmulatedHeader: a header that
+// only DECLARES things this engine provides natively costs nothing to skip, and that is how a program
+// written against FreeBASIC runs here on a machine that has no FreeBASIC installed.
+//
+// ⭐ BUT WHEN THE FreeBASIC TREE IS CONFIGURED, "not there" means NOT THERE. With a search path in
+// hand we looked in the very directory fbc looks in, so a header still missing does not exist for
+// either compiler, and dropping it silently is the permissiveness that let win/ntdef.bi through:
+// it includes "excpt.bi", which is in no FreeBASIC tree at all, and fbc answers "error 23: File not
+// found". ⇒ Only in that case is the silence a defect.
+// ⚠️ A name this preprocessor IMPLEMENTS is never an error, whatever the path holds.
+begin
+  DiscoverFbIncludeDir;
+  Result := (not IsEmulatedHeaderName(FileName)) and
+            (GPPIncludePaths <> nil) and (GPPIncludePaths.Count > 0);
 end;
 
 procedure RegisterEmulatedHeader(const FileName: string; Defs, FnDefs: TStringList);
@@ -3456,10 +3887,10 @@ function PPResolveTypeName(const Operand: string): string;
 var
   U: string;
 begin
-  U := UpperCase(Trim(Operand));
+  U := UpperFast(Trim(Operand));
   if U = '' then Exit('');
   if (GPPVarTypes <> nil) and (GPPVarTypes.IndexOfName(U) >= 0) then
-    Exit(UpperCase(GPPVarTypes.Values[U]));
+    Exit(UpperFast(GPPVarTypes.Values[U]));
   if PPIsBuiltinTypeWord(U) or
      ((GPPTypeNames <> nil) and (GPPTypeNames.IndexOf(U) >= 0)) then
     Exit(U);                              // a TYPE names itself: "TypeOf(Integer)" is Integer
@@ -3496,7 +3927,7 @@ begin
   Result := False;
   Res := '';
   T := Trim(Msg);
-  if UpperCase(Copy(T, 1, 6)) <> 'TYPEOF' then Exit;
+  if (not SameText(Copy(T, 1, 6), 'TYPEOF')) then Exit;
   q := 7;
   while (q <= Length(T)) and (T[q] in [' ', #9]) do Inc(q);
   if (q > Length(T)) or (T[q] <> '(') then Exit;
@@ -3516,6 +3947,179 @@ function PPPrintLine(const Msg: string): string;
 begin
   if not PPPrintTypeOfResolved(Msg, Result) then
     Result := UnquotePPMessage(Msg);
+end;
+
+var
+  GPPTypeTextDepth: Integer = 0;   // how many TYPE/UNION/ENUM blocks are open in the emitted text
+  GPPSymProcDepth: Integer = 0;    // ...and how many procedure BODIES: a local is not a module symbol
+
+procedure PPNoteModuleSymbols(const L, W: string; P: Integer);
+// Collect, from a line about to be EMITTED, the identifiers that make it a DECLARATION - the set the
+// "#define" collision check asks. Kept incrementally because asking it by re-scanning cost 118 s of a
+// 190 s compile (see GPPModuleSymbols).
+//
+// ⛔ ONLY AT MODULE LEVEL. A name declared inside a SUB or a TYPE body is not a module symbol: fbc
+// takes "#define x 1" beside a "Dim As Integer x" that lives in a procedure, and beside a FIELD
+// called x. The two depths are tracked here rather than re-derived, which is the whole point.
+var
+  q, b, EndAt: Integer;
+  Id, Rest: string;
+begin
+  // Procedure bodies open and close here; a DECLARE opens nothing.
+  if (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
+     (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') then
+  begin
+    // ⛔ SETTE CARATTERI, non tutta la riga: "Copy(UpperFast(L), 1, 7)" maiuscolizzava l'INTERA riga
+    // - una allocazione per ogni "declare function" di ogni header - per guardarne sette.
+    if (not SameText(Copy(L, 1, 7), 'DECLARE')) then Inc(GPPSymProcDepth);
+  end
+  else if W = 'END' then
+  begin
+    Rest := UpperFast(Trim(Copy(L, P, MaxInt)));
+    if (Copy(Rest, 1, 3) = 'SUB') or (Copy(Rest, 1, 8) = 'FUNCTION') or
+       (Copy(Rest, 1, 8) = 'PROPERTY') or (Copy(Rest, 1, 11) = 'CONSTRUCTOR') or
+       (Copy(Rest, 1, 10) = 'DESTRUCTOR') or (Copy(Rest, 1, 8) = 'OPERATOR') then
+      if GPPSymProcDepth > 0 then Dec(GPPSymProcDepth);
+  end;
+  if (GPPSymProcDepth > 0) or (GPPTypeTextDepth > 0) then Exit;
+  if not ((W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
+          (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
+          (W = 'ENUM') or (W = 'UNION') or (W = 'COMMON')) then Exit;
+  if GPPModuleSymbols = nil then
+  begin
+    GPPModuleSymbols := TIndexedStringList.Create;
+    GPPModuleSymbols.CaseSensitive := False;
+    GPPModuleSymbols.Duplicates := dupIgnore;
+  end;
+  // ⛔⛔ E I PARAMETRI DI UNA PROCEDURA NON SONO SIMBOLI DI MODULO. flite/cst_clunits.bi scrive
+  //     declare function clunit_get_unit_index(..., byval unit_type as const zstring ptr, ...)
+  //     #define UNIT_TYPE(db, u) ...
+  // e il nome del PARAMETRO faceva collidere la macro. `fbc` prende l'header senza dire niente: un
+  // parametro vive dentro la procedura, non nel namespace del modulo. ⇒ Sulla riga di una procedura
+  // si guarda solo cio' che sta PRIMA della parentesi, cioe' il nome dichiarato.
+  EndAt := Length(L);
+  if (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'PROPERTY') or
+     (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') then
+  begin
+    q := Pos('(', L);
+    if q > 0 then EndAt := q - 1;
+  end;
+  q := 1;
+  while q <= EndAt do
+    // ⛔⛔ UNA STRINGA FRA VIRGOLETTE NON DICHIARA NIENTE, e questo raccoglitore la leggeva come se
+    // lo facesse. FreeBASIC scrive i binding cosi':
+    //     declare function g_atomic_int_get_ alias "g_atomic_int_get"(...) as gint
+    //     #define g_atomic_int_get(atomic) g_atomic_int_get_( ... )
+    // Il nome DICHIARATO ha l'underscore finale; "g_atomic_int_get" e' il simbolo ESTERNO, e la
+    // macro che porta quel nome non collide con niente - `fbc` la prende senza dire una parola.
+    // Prendendo anche il testo fra virgolette rifiutavamo **23 header** (glib, gtk, atk, pango, gdk,
+    // gdk-pixbuf, gio, gmodule, gtkgl, bfd, curl, caca0, crt/dos/fcntl): la rete `bi_sweep` li ha
+    // visti passare da MATCH a DIFF, cioe' nella direzione peggiore - un programma VALIDO rifiutato.
+    // ⭐ E il caso per cui la regola esiste resta preso: in sqlite3ext.bi il nome definito **e'**
+    // l'identificatore dichiarato (`#define sqlite3_changes ...` accanto a `declare function
+    // sqlite3_changes`), e li' `fbc` dice davvero "Duplicated definition".
+    if L[q] = '"' then
+    begin
+      Inc(q);
+      while (q <= EndAt) and (L[q] <> '"') do Inc(q);
+      if q <= EndAt then Inc(q);            // la virgoletta di chiusura
+    end
+    else if IsIdentChar(L[q]) then
+    begin
+      // ⚠️ Per COPY, non appendendo un carattere alla volta: questa riga gira su ogni dichiarazione
+      // di ogni header.
+      b := q;
+      while (q <= EndAt) and IsIdentChar(L[q]) do Inc(q);
+      Id := UpperFast(Copy(L, b, q - b));
+      if (Id <> '') and (GPPModuleSymbols.IndexOf(Id) < 0) then
+        GPPModuleSymbols.Add(Id);
+    end
+    else
+      Inc(q);
+end;
+
+function PPIsTypeAlias(const Rest: string): Boolean;
+// Is what follows the word "Type" / "Union" / "Enum" an ALIAS declaration - "<name> As <type>" - and
+// therefore a complete one-line declaration that opens no block?
+// ⛔ It is the word right AFTER the name that decides. Looking for " As " anywhere in the rest reads
+// a whole block written on one line ("Type T : a As Integer : End Type") as an alias, and then every
+// following line is captured as if it were still at module level.
+var
+  R, W: string;
+  q: Integer;
+begin
+  Result := False;
+  R := Trim(Rest);
+  q := 1;
+  while (q <= Length(R)) and IsIdentChar(R[q]) do Inc(q);
+  if q = 1 then Exit;                       // no name: a bare "Type" opening an anonymous struct
+  R := Trim(Copy(R, q, MaxInt));
+  q := 1;
+  while (q <= Length(R)) and IsIdentChar(R[q]) do Inc(q);
+  W := UpperFast(Copy(R, 1, q - 1));
+  Result := W = 'AS';
+end;
+
+procedure PPAddDeclLine(const L: string);
+begin
+  if GPPTypeDeclLines = nil then GPPTypeDeclLines := TStringList.Create;
+  GPPTypeDeclLines.Add(L);
+end;
+
+procedure PPNoteTypeText(const L: string);
+// Keep the source text of every TYPE / UNION / ENUM declaration and every module CONST line the
+// preprocessor emits, so "sizeof( <a user type> )" in a later directive can be answered by the
+// compiler's own layout rule instead of a second one written here (GPPTypeSizeHook).
+//
+// ⭐ IT IS A BLOCK CAPTURE, NOT A NAME CAPTURE, and it has to be: a type's SIZE is decided by the
+// shape of its members - their order, their widths, a "Field = n" on the header line, a bit-field
+// run, a nested Union - so nothing short of the block itself carries the answer.
+// ⚠️ CONST lines come too, because a field array bound is routinely written over one
+// ("Const LIMIT = 63 : Type C : As Byte t(0 To LIMIT)"), and without them that bound cannot fold.
+// ⛔ Only what is EMITTED: a declaration inside a #if branch that was not taken never gets here, and
+// one spliced in from an #include does - which is what makes the header case work at all.
+var
+  W: string;
+  p, q: Integer;
+begin
+  p := 1;
+  while (p <= Length(L)) and IsIdentChar(L[p]) do Inc(p);
+  W := UpperFast(Copy(L, 1, p - 1));
+  PPNoteModuleSymbols(L, W, p);
+  if GPPTypeTextDepth > 0 then
+  begin
+    PPAddDeclLine(L);
+    // A nested block opens one more level; "End Type" / "End Union" / "End Enum" closes one.
+    if (W = 'TYPE') or (W = 'UNION') or (W = 'ENUM') then
+    begin
+      q := p;
+      while (q <= Length(L)) and (L[q] in [' ', #9]) do Inc(q);
+      // "Type <n> As <t>" inside a body is an alias, not a block; a bare "Type" IS one (an anonymous
+      // struct inside a Union). ⛔ The test is on the word that FOLLOWS THE NAME, not on the presence
+      // of " As " anywhere: a whole declaration written on one line with ':' separators
+      // ("Type T : a As Integer : End Type") contains " As " and is NOT an alias.
+      if not PPIsTypeAlias(Copy(L, q, MaxInt)) then
+        Inc(GPPTypeTextDepth);
+    end
+    else if (W = 'END') then
+    begin
+      W := UpperFast(Trim(Copy(L, p, MaxInt)));
+      if (Copy(W, 1, 4) = 'TYPE') or (Copy(W, 1, 5) = 'UNION') or (Copy(W, 1, 4) = 'ENUM') then
+        Dec(GPPTypeTextDepth);
+    end;
+    Exit;
+  end;
+  if (W = 'TYPE') or (W = 'UNION') or (W = 'ENUM') then
+  begin
+    PPAddDeclLine(L);
+    q := p;
+    while (q <= Length(L)) and (L[q] in [' ', #9]) do Inc(q);
+    // "Type <name> As <type>" is a one-line ALIAS and opens nothing.
+    if not PPIsTypeAlias(Copy(L, q, MaxInt)) then
+      GPPTypeTextDepth := 1;
+  end
+  else if W = 'CONST' then
+    PPAddDeclLine(L);
 end;
 
 procedure PPNoteDeclarations(const Line: string);
@@ -3543,10 +4147,13 @@ var
     if (AName = '') or (AType = '') then Exit;
     if GPPVarTypes = nil then
     begin
-      GPPVarTypes := TStringList.Create;
+      // ⛔ HASHED: every EMITTED line goes through here, and "Values[name] := type" is IndexOfName
+      // followed by a Put - a scan of everything declared so far, once per declaration. perf on
+      // win/shtypes.bi put 22.8% of the compile in this one registry.
+      GPPVarTypes := TIndexedStringList.Create;
       GPPVarTypes.CaseSensitive := False;
     end;
-    GPPVarTypes.Values[UpperCase(AName)] := UpperCase(AType);
+    GPPVarTypes.Values[UpperFast(AName)] := UpperFast(AType);
   end;
 
   procedure RememberType(const AName: string);
@@ -3559,7 +4166,7 @@ var
       GPPTypeNames.Duplicates := dupIgnore;
       GPPTypeNames.Sorted := True;
     end;
-    GPPTypeNames.Add(UpperCase(AName));
+    GPPTypeNames.Add(UpperFast(AName));
   end;
 
   function CleanIdent(const T: string): string;
@@ -3570,28 +4177,59 @@ var
       if IsIdentChar(T[q]) or (T[q] = '.') then Result := Result + T[q] else Break;
   end;
 
+var
+  b, e: Integer;
+  First: string;
 begin
   L := Trim(Line);
   if L = '' then Exit;
+  // ⛔ ASKED ONCE, NOT ONCE PER LINE. GetEnvironmentVariable here ran for every emitted line of every
+  // header - tens of thousands of RTL lookups for a knob that cannot change while a program compiles.
+  if GPPDeclTextOff < 0 then
+    if GetEnvironmentVariable('SB_NO_DECLTEXT') = '1' then GPPDeclTextOff := 1 else GPPDeclTextOff := 0;
+  if GPPDeclTextOff = 0 then PPNoteTypeText(L);
+
+  // ⛔⛔ AND THE LINE IS NOT SPLIT UNLESS ITS FIRST WORD IS ONE THIS ROUTINE ACTS ON. Everything below
+  // keys on that first word - TYPE / UNION / ENUM open a type, DIM / VAR / STATIC / COMMON / REDIM /
+  // SUB / FUNCTION / DECLARE a declaration - and every OTHER line was being split into a TStringList,
+  // one ansistring APPEND PER CHARACTER, to be thrown away. On a header that is millions of appends:
+  // perf put 14.4% of win/shlwapi.bi in this routine.
+  b := 1;
+  while (b <= Length(L)) and (IsIdentChar(L[b]) or (L[b] = '.') or (L[b] = '_')) do Inc(b);
+  First := UpperFast(Copy(L, 1, b - 1));
+  if (First <> 'TYPE') and (First <> 'UNION') and (First <> 'ENUM') and
+     (First <> 'DIM') and (First <> 'VAR') and (First <> 'STATIC') and (First <> 'COMMON') and
+     (First <> 'REDIM') and (First <> 'SUB') and (First <> 'FUNCTION') and (First <> 'DECLARE') then
+    Exit;
+
   Words := TStringList.Create;
   try
     // Split on the characters that separate a declaration's words; commas and parentheses are kept as
     // their own words so a parameter list reads the same way a DIM list does.
-    W := '';
-    for i := 1 to Length(L) do
-      if IsIdentChar(L[i]) or (L[i] = '.') or (L[i] = '_') then W := W + L[i]
+    // ⚠️ By COPY, not by appending a character at a time: the old form built each word with N
+    // ansistring reallocations.
+    b := 1;
+    while b <= Length(L) do
+    begin
+      if IsIdentChar(L[b]) or (L[b] = '.') or (L[b] = '_') then
+      begin
+        e := b;
+        while (e <= Length(L)) and (IsIdentChar(L[e]) or (L[e] = '.') or (L[e] = '_')) do Inc(e);
+        Words.Add(Copy(L, b, e - b));
+        b := e;
+      end
       else
       begin
-        if W <> '' then begin Words.Add(W); W := ''; end;
-        if L[i] in ['(', ')', ','] then Words.Add(L[i]);
+        if L[b] in ['(', ')', ','] then Words.Add(L[b]);
+        Inc(b);
       end;
-    if W <> '' then Words.Add(W);
+    end;
     if Words.Count = 0 then Exit;
 
-    W := UpperCase(Words[0]);
+    W := UpperFast(Words[0]);
     if (W = 'TYPE') or (W = 'UNION') or (W = 'ENUM') then
     begin
-      if (Words.Count >= 2) and (UpperCase(Words[1]) <> 'AS') then RememberType(Words[1]);
+      if (Words.Count >= 2) and ((not SameText(Words[1], 'AS'))) then RememberType(Words[1]);
       Exit;
     end;
 
@@ -3601,41 +4239,41 @@ begin
       // Leading "As <type> <name> [, <name>]" - the type comes first and covers every name after it.
       i := 1;
       while (i < Words.Count) and
-            ((UpperCase(Words[i]) = 'SHARED') or (UpperCase(Words[i]) = 'PRESERVE') or
-             (UpperCase(Words[i]) = 'SUB') or (UpperCase(Words[i]) = 'FUNCTION')) do Inc(i);
-      if (i < Words.Count) and (UpperCase(Words[i]) = 'AS') and (i + 1 < Words.Count) then
+            ((SameText(Words[i], 'SHARED')) or (SameText(Words[i], 'PRESERVE')) or
+             (SameText(Words[i], 'SUB')) or (SameText(Words[i], 'FUNCTION'))) do Inc(i);
+      if (i < Words.Count) and (SameText(Words[i], 'AS')) and (i + 1 < Words.Count) then
       begin
         TypeName := Words[i + 1];
         j := i + 2;
         // "As <type> Ptr [Ptr]" - the pointer stars belong to the type.
-        while (j < Words.Count) and (UpperCase(Words[j]) = 'PTR') do
+        while (j < Words.Count) and (SameText(Words[j], 'PTR')) do
         begin TypeName := TypeName + ' PTR'; Inc(j); end;
         while j < Words.Count do
         begin
           Nm := CleanIdent(Words[j]);
-          if (Nm <> '') and (UpperCase(Nm) <> 'PTR') then Remember(Nm, TypeName);
+          if (Nm <> '') and ((not SameText(Nm, 'PTR'))) then Remember(Nm, TypeName);
           Inc(j);
           while (j < Words.Count) and (Words[j] = ',') do Inc(j);
-          if (j < Words.Count) and (UpperCase(Words[j]) = 'AS') then Break;
+          if (j < Words.Count) and (SameText(Words[j], 'AS')) then Break;
         end;
         Exit;
       end;
       // "<name> [, <name>] As <type>", and the same shape inside a parameter list.
       k := 0;
       for i := 1 to Words.Count - 1 do
-        if UpperCase(Words[i]) = 'AS' then
+        if SameText(Words[i], 'AS') then
         begin
           if i + 1 >= Words.Count then Break;
           TypeName := Words[i + 1];
           j := i + 2;
-          while (j < Words.Count) and (UpperCase(Words[j]) = 'PTR') do
+          while (j < Words.Count) and (SameText(Words[j], 'PTR')) do
           begin TypeName := TypeName + ' PTR'; Inc(j); end;
           // every name gathered since the previous AS / separator belongs to this type
           for k := i - 1 downto 1 do
           begin
             if (Words[k] = ',') then Continue;
             if (Words[k] = '(') or (Words[k] = ')') then Break;
-            W := UpperCase(Words[k]);
+            W := UpperFast(Words[k]);
             if (W = 'BYREF') or (W = 'BYVAL') or (W = 'AS') or (W = 'SHARED') then Break;
             Remember(CleanIdent(Words[k]), TypeName);
             if (k - 1 >= 1) and (Words[k - 1] <> ',') then Break;
@@ -3668,6 +4306,7 @@ var
   ExpandedLine: string;  // a source line after macro substitution
   FReprocessDepth: Integer;   // guard against a macro whose expansion expands to itself
   UidK: Integer;         // scratch: clearing the __FB_UNIQUEID_* stacks at entry
+  AssertOK: Boolean;     // scratch: a "#assert" verdict, read together with GPPExprUnevaluable
 
   function Emitting: Boolean;
   begin
@@ -3720,6 +4359,13 @@ var
           if Result <> '' then Result := Result + cVirtualEOL;
           Result := Result + Output[i];
         end;
+      // ⛔⛔ THE ROLLBACK MUST TELL THE WORD SET, and this is the one place that shortens the output.
+      // The set is folded lazily, line by line, from a cursor - so if a speculative expansion is
+      // rolled back and REAL lines are then emitted at the same indices, the cursor has already
+      // passed them and their words are never folded. Between two questions that is invisible: the
+      // count can even come back HIGHER than it was. ⇒ The invalidation belongs where the text
+      // actually changes, not where it is read.
+      if Output.Count > Base then PPInvalidateDefWords;
       while Output.Count > Base do Output.Delete(Output.Count - 1);
     finally
       Dec(FReprocessDepth);
@@ -3778,7 +4424,7 @@ var
   var
     U: string;
   begin
-    U := UpperCase(Trimmed);
+    U := UpperFast(Trimmed);
     Result := (Copy(U, 1, 6) = 'OPTION') and (Pos('ESCAPE', U) > 0) and (Pos('"', U) = 0);
   end;
 
@@ -3846,14 +4492,14 @@ var
     if Result then Exit;
     // IF, only in its BLOCK form: the line ends at THEN (or has no THEN at all, the "If x" form).
     if W <> 'IF' then Exit;
-    U := TrimRight(UpperCase(FullLine));
+    U := TrimRight(UpperFast(FullLine));
     Result := (Length(U) >= 4) and (Copy(U, Length(U) - 3, 4) = 'THEN');
   end;
 
   function DefBlockCloser(const S: string): Boolean;
   var W: string;
   begin
-    W := Trim(UpperCase(S));
+    W := Trim(UpperFast(S));
     if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
     Result := (W = 'NEXT') or (W = 'WEND') or (W = 'LOOP');
   end;
@@ -3961,12 +4607,12 @@ var
         // SCOPE left the reserve inside "sub proc()" at level 0 and refused a legal program.
         // A one-line "Sub s() : ... : End Sub" opens and closes on the same line, so the closing form
         // is looked for on the line before deciding.
-        DirWord := UpperCase(Copy(Trimmed, 1, 20));
+        DirWord := UpperFast(Copy(Trimmed, 1, 20));
         if (Copy(DirWord, 1, 4) = 'END ') then
         begin
           if BlockCloser(Copy(DirWord, 5, MaxInt)) and (ScopeDepth > 0) then Dec(ScopeDepth);
         end
-        else if BlockOpener(DirWord) and (Pos(' : END ', ' ' + UpperCase(Trimmed) + ' ') = 0) then
+        else if BlockOpener(DirWord) and (Pos(' : END ', ' ' + UpperFast(Trimmed) + ' ') = 0) then
           Inc(ScopeDepth);
         // ...and the same walk for #define scoping, over its OWN block set (see DefBlockOpener).
         // ⛔ A miscount must fail toward KEEPING a define - that is what this code did before it
@@ -3981,7 +4627,7 @@ var
           if DefDepth > 0 then Dec(DefDepth);
         end
         else if DefBlockOpener(DirWord, Trimmed) and
-                (Pos(' : END ', ' ' + UpperCase(Trimmed) + ' ') = 0) then
+                (Pos(' : END ', ' ' + UpperFast(Trimmed) + ' ') = 0) then
           Inc(DefDepth);
         // Drop whatever the block that just closed had defined.
         while (ScopedN > 0) and (ScopedAt[ScopedN - 1] > DefDepth) do
@@ -3989,11 +4635,10 @@ var
           Dec(ScopedN);
           if ScopedIsFn[ScopedN] then
           begin
-            if FnDefs.IndexOfName(ScopedName[ScopedN]) >= 0 then
-              FnDefs.Delete(FnDefs.IndexOfName(ScopedName[ScopedN]));
+            PPRetireDef(FnDefs, FnDefs.IndexOfName(ScopedName[ScopedN]));
           end
-          else if Defs.IndexOfName(ScopedName[ScopedN]) >= 0 then
-            Defs.Delete(Defs.IndexOfName(ScopedName[ScopedN]));
+          else
+            PPRetireDef(Defs, Defs.IndexOfName(ScopedName[ScopedN]));
         end;
         if PrevBlockCmt > 0 then
         begin
@@ -4008,7 +4653,7 @@ var
         Defs.Values['__LINE__'] := IntToStr(MappedLine);
         // QuickBASIC-style metacommand '$INCLUDE: 'file' (a leading apostrophe makes it a comment to
         // the lexer; intercept it here and splice the file, like #include).
-        if (Length(Trimmed) >= 9) and (UpperCase(Copy(Trimmed, 1, 9)) = '''$INCLUDE') and Emitting then
+        if (Length(Trimmed) >= 9) and (UpperFast(Copy(Trimmed, 1, 9)) = '''$INCLUDE') and Emitting then
         begin
           q := Pos('''', Copy(Trimmed, 2, MaxInt));   // first quote after the leading apostrophe
           if q > 0 then
@@ -4041,6 +4686,8 @@ var
             end
             else
             begin
+              if MissingIncludeIsAnError(FileName) then
+                raise EPreprocessorError.CreateFmt('File not found, "%s"', [FileName]);
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
               // ⭐ ...AND fbgfx.bi ALSO DECLARES A TYPE, which constants alone cannot stand in for.
               // "FB.IMAGE" is the 32-byte header FreeBASIC puts in front of an image's pixels, and real
@@ -4059,7 +4706,7 @@ var
               // ⚠️ A text test, and it is allowed to be one: emitting the type for a program that merely
               // mentions the name in a comment costs nothing, while missing one costs the field offsets.
               if (LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi') and
-                 (Pos('FB.IMAGE', UpperCase(Src)) > 0) then
+                 (Pos('FB.IMAGE', UpperFast(Src)) > 0) then
                 Output.Add('Namespace FB' + cVirtualEOL +
                            'Type IMAGE' + cVirtualEOL +
                            '  As ULong imgtype' + cVirtualEOL +
@@ -4082,9 +4729,9 @@ var
         // ignored. '$DYNAMIC/'$STATIC pick the default array storage (we allow REDIM regardless);
         // '$LANG mirrors the #lang directive (dialect is auto-detected). They emit nothing.
         if (Length(Trimmed) >= 2) and (Trimmed[1] = '''') and (Trimmed[2] = '$') and Emitting and
-           ((UpperCase(Copy(Trimmed, 3, 7)) = 'DYNAMIC') or
-            (UpperCase(Copy(Trimmed, 3, 6)) = 'STATIC') or
-            (UpperCase(Copy(Trimmed, 3, 4)) = 'LANG')) then
+           ((SameText(Copy(Trimmed, 3, 7), 'DYNAMIC')) or
+            (SameText(Copy(Trimmed, 3, 6), 'STATIC')) or
+            (SameText(Copy(Trimmed, 3, 4), 'LANG'))) then
         begin
           Output.Add('');
           Inc(li);
@@ -4141,14 +4788,14 @@ var
             // the same answer. Here they were two: only #if consulted the source's own declarations,
             // so a Const, a Dim, a Sub - and a member of the enclosing type - answered yes to one and
             // no to the other. PPNameIsDefined is now the single place either of them asks.
-            Cond := ParentEmit and PPNameIsDefined(UpperCase(Trim(DRest)), Defs, FnDefs);
+            Cond := ParentEmit and PPNameIsDefined(UpperFast(Trim(DRest)), Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
           else if DName = 'ifndef' then
           begin
             ParentEmit := Emitting;
-            Cond := ParentEmit and not PPNameIsDefined(UpperCase(Trim(DRest)), Defs, FnDefs);
+            Cond := ParentEmit and not PPNameIsDefined(UpperFast(Trim(DRest)), Defs, FnDefs);
             SetLength(Active, Length(Active) + 1); Active[High(Active)] := Cond;
             SetLength(Taken, Length(Taken) + 1);   Taken[High(Taken)] := Cond;
           end
@@ -4171,9 +4818,9 @@ var
               else
               begin
                 if DName = 'elseifdef' then
-                  Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) >= 0)
+                  Cond := ParentEmit and (Defs.IndexOfName(UpperFast(Trim(DRest))) >= 0)
                 else if DName = 'elseifndef' then
-                  Cond := ParentEmit and (Defs.IndexOfName(UpperCase(Trim(DRest))) < 0)
+                  Cond := ParentEmit and (Defs.IndexOfName(UpperFast(Trim(DRest))) < 0)
                 else
                   Cond := ParentEmit and EvalPPExpr(DRest, Defs, FnDefs);
                 Active[High(Active)] := Cond;
@@ -4228,7 +4875,41 @@ var
           begin
             p := 1;
             while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
-            MacroName := UpperCase(Copy(DRest, 1, p - 1));
+            MacroName := UpperFast(Copy(DRest, 1, p - 1));
+            // ⛔⛔ A "#define" MAY NOT LAND ON A NAME THAT ALREADY EXISTS. fbc answers "error 4:
+            // Duplicated definition" for a name already declared as a module symbol - a procedure, a
+            // variable, a Const, a Type - and for a macro defined a SECOND time without an "#undef"
+            // in between; a name local to a SUB is not a module symbol and does not collide.
+            // Measured over eight shapes against the oracle. ⭐ sqlite3ext.bi is the header that
+            // named it: it writes "#undef X" before every "#define X ..." for hundreds of lines and
+            // then FORGETS it for six of them, and fbc stops on those six.
+            // ⚠️ SB_PP_LAX_DEFINE=1 puts the silence back, on one binary.
+            if (MacroName <> '') and (GetEnvironmentVariable('SB_PP_LAX_DEFINE') <> '1') then
+            begin
+              // ⛔ THE SYMBOL COLLISION IS ASKED FIRST, and the order is not cosmetic: the benign
+              // exemption below is about a MACRO defined twice, and letting it answer first swallowed
+              // the case it has nothing to do with - sqlite3ext.bi "#define"s over a name that
+              // sqlite3.bi DECLARES as a procedure, which fbc refuses whatever the macro table holds.
+              if ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(MacroName) < 0)) and
+                 SourceDeclaresSymbolAtModuleLevel(MacroName) then
+                raise EPreprocessorError.CreateFmt(
+                  'Duplicated definition, %s: the program already declares that name', [MacroName])
+              // ⭐ AN IDENTICAL OBJECT-LIKE REDEFINITION IS BENIGN, and it is not a nicety: two
+              // Windows headers define InterlockedIncrement with the SAME text (winnt.bi and
+              // winbase.bi), and fbc takes both. Measured over four shapes: identical object-like is
+              // taken; DIFFERENT text is error 4; identical except for WHITESPACE is error 4 (so the
+              // comparison is on the text as written); and an identical FUNCTION-LIKE macro is error 4
+              // as well - the exemption is only for the object-like form.
+              else if (Defs.IndexOfName(MacroName) >= 0) and
+                 (not ((p <= Length(DRest)) and (DRest[p] = '('))) and
+                 (Defs.Values[MacroName] =
+                  Trim(StripDirectiveComment(Copy(DRest, p, MaxInt)))) then
+                // the same definition, written twice: nothing changes and fbc says nothing
+              else if (Defs.IndexOfName(MacroName) >= 0) or (FnDefs.IndexOfName(MacroName) >= 0) then
+                raise EPreprocessorError.CreateFmt(
+                  'Duplicated definition, %s: it is already a macro, and a "#define" over one needs ' +
+                  'an "#undef" first', [MacroName]);
+            end;
             if (p <= Length(DRest)) and (DRest[p] = '(') then
             begin
               // Function-like macro "NAME(params) body": store as "params"#1"body" in FnDefs.
@@ -4249,7 +4930,7 @@ var
               // "__FB_EVAL__( __FB_ARG_COUNT__( args ) - 1 )", and args exists only while the macro is
               // being expanded - stored raw, it was re-expanded later where args means nothing.
               // Narrow on purpose: an ordinary #define still stores its text, as #define must.
-              if Pos('__FB_EVAL__', UpperCase(MacroVal)) > 0 then
+              if Pos('__FB_EVAL__', UpperFast(MacroVal)) > 0 then
                 MacroVal := Trim(SubstituteMacros(MacroVal, Defs, FnDefs, 0));
               if MacroName <> '' then
               begin
@@ -4271,7 +4952,7 @@ var
             // preserve source line numbers.
             p := 1;
             while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
-            MacroName := UpperCase(Copy(DRest, 1, p - 1));
+            MacroName := UpperFast(Copy(DRest, 1, p - 1));
             // "#macro m ( arg1, arg2 )": FreeBASIC allows space before the parameter list, and the
             // manual writes it that way. Testing the very next character made such a macro OBJECT-like,
             // so an invocation expanded to the raw body and its arguments leaked out as code.
@@ -4355,10 +5036,8 @@ var
           begin
             // ⛔ ...from BOTH tables. "#undef m" of a function-like macro left it in FnDefs, so the
             // name went on expanding after the program had explicitly retired it.
-            p := Defs.IndexOfName(UpperCase(Trim(DRest)));
-            if p >= 0 then Defs.Delete(p);
-            p := FnDefs.IndexOfName(UpperCase(Trim(DRest)));
-            if p >= 0 then FnDefs.Delete(p);
+            PPRetireDef(Defs, Defs.IndexOfName(UpperFast(Trim(DRest))));
+            PPRetireDef(FnDefs, FnDefs.IndexOfName(UpperFast(Trim(DRest))));
             // ...and the name is retired for the whole compilation, not only for macro expansion:
             // it may be a SUB/FUNCTION, and fbc lets a later DIM take it. See GPPUndefNames.
             if GPPUndefNames = nil then
@@ -4368,7 +5047,7 @@ var
               GPPUndefNames.Duplicates := dupIgnore;
               GPPUndefNames.Sorted := True;
             end;
-            if Trim(DRest) <> '' then GPPUndefNames.Add(UpperCase(Trim(DRest)));
+            if Trim(DRest) <> '' then GPPUndefNames.Add(UpperFast(Trim(DRest)));
           end
           else if (DName = 'include') and Emitting then
           begin
@@ -4381,7 +5060,7 @@ var
             // one of these used to keep ONCE as part of the path, so the file was never found and the
             // include did nothing at all - in silence, which for a header of CONSTANTS means every one
             // of them reads as zero.
-            IncludeOnce := (Length(FileName) >= 4) and (UpperCase(Copy(FileName, 1, 4)) = 'ONCE') and
+            IncludeOnce := (Length(FileName) >= 4) and (SameText(Copy(FileName, 1, 4), 'ONCE')) and
                            ((Length(FileName) = 4) or (FileName[5] in [' ', #9, '"']));
             if IncludeOnce then FileName := Trim(Copy(FileName, 5, MaxInt));
             if (Length(FileName) >= 2) and (FileName[1] = '"') then
@@ -4409,7 +5088,7 @@ var
             begin
               // ⛔ THE IDENTITY IS THE CANONICAL PATH, NOT THE SPELLING. fbc's own pp/inc_once1 reaches
               // one header as "inc1.bi" and as "../pp/inc1.bi" and treats the two as the SAME file.
-              Canon := UpperCase(ExpandFileName(FullPath));
+              Canon := UpperFast(ExpandFileName(FullPath));
               if (PragmaOnce.IndexOf(Canon) >= 0) or
                  (IncludeOnce and (IncOnce.IndexOf(Canon) >= 0)) then
                 IncText := nil                                  // already spliced, or it asked to be once
@@ -4430,6 +5109,8 @@ var
             end
             else
             begin
+              if MissingIncludeIsAnError(FileName) then
+                raise EPreprocessorError.CreateFmt('File not found, "%s"', [FileName]);
               RegisterEmulatedHeader(FileName, Defs, FnDefs);
               // ⭐ ...AND fbgfx.bi ALSO DECLARES A TYPE, which constants alone cannot stand in for.
               // "FB.IMAGE" is the 32-byte header FreeBASIC puts in front of an image's pixels, and real
@@ -4448,7 +5129,7 @@ var
               // ⚠️ A text test, and it is allowed to be one: emitting the type for a program that merely
               // mentions the name in a comment costs nothing, while missing one costs the field offsets.
               if (LowerCase(ExtractFileName(FileName)) = 'fbgfx.bi') and
-                 (Pos('FB.IMAGE', UpperCase(Src)) > 0) then
+                 (Pos('FB.IMAGE', UpperFast(Src)) > 0) then
                 Output.Add('Namespace FB' + cVirtualEOL +
                            'Type IMAGE' + cVirtualEOL +
                            '  As ULong imgtype' + cVirtualEOL +
@@ -4534,10 +5215,10 @@ var
             // the first include of such a header was right, and every later one spliced it again
             // (fbc's own pp/inc_once2 counts 1 where we counted 3).
             // Every other pragma (reserve, push/pop) stays ignored, exactly as before.
-            MacroName := UpperCase(Trim(StripDirectiveComment(DRest)));
+            MacroName := UpperFast(Trim(StripDirectiveComment(DRest)));
             if (MacroName = 'ONCE') and (SrcPath <> '') then
             begin
-              Canon := UpperCase(ExpandFileName(SrcPath));
+              Canon := UpperFast(ExpandFileName(SrcPath));
               if PragmaOnce.IndexOf(Canon) < 0 then PragmaOnce.Add(Canon);
             end
             // ⭐ "#pragma reserve NAME" makes NAME a SYMBOL: fbc reserves the identifier and defined()
@@ -4667,12 +5348,30 @@ var
             // ⛔ NOT the same for "#if TypeOf(...)": there the answer SELECTS A BRANCH, so guessing
             // would compile different code. That one still refuses, and 6 tests still wait on real
             // type information in the preprocessor.
-            if Pos('TYPEOF', UpperCase(DRest)) > 0 then
+            // ⭐ AND THE SAME READING COVERS "sizeof( <a UDT> )", which is the SECOND thing this
+            // pass cannot answer - the size of a user type is its LAYOUT, and that rule lives in the
+            // SSA where it is measured against fbc. ⛔ It is not a corner: FreeBASIC's own
+            // crt/longdouble.bi opens with "#assert sizeof( clongdouble ) = 16", 78 headers of its
+            // tree reach that file, and every one of them was refused for a check this pass had no
+            // way to make. Skipping it costs a verification; refusing cost 78 headers.
+            // ⚠️ Marked by the TOKENIZER, not matched as text, so it also catches the operand a macro
+            // expanded into - the latch is cleared here and read back after the evaluation.
+            if Pos('TYPEOF', UpperFast(DRest)) > 0 then
             begin
               // unevaluable here: left unchecked, deliberately
             end
-            else if not EvalPPExpr(DRest, Defs, FnDefs) then
-              raise EPreprocessorError.Create('assertion failed: ' + Trim(DRest));
+            else
+            begin
+              GPPExprUnevaluable := False;
+              AssertOK := EvalPPExpr(DRest, Defs, FnDefs);
+              // ⭐ SB_PP_STRICT_SIZEOF=1 makes the skip FAIL instead, on the same binary: it is how
+              // guard m888b is sabotaged, and without it "the assert passed" and "the assert was not
+              // made" look identical from outside - which is the one thing a guard on a SKIP has to
+              // be able to tell apart.
+              if (not AssertOK) and
+                 ((not GPPExprUnevaluable) or (GetEnvironmentVariable('SB_PP_STRICT_SIZEOF') = '1')) then
+                raise EPreprocessorError.Create('assertion failed: ' + Trim(DRest));
+            end;
           end;
           // All directive lines are dropped from the output; emit a blank to keep line numbers.
           Output.Add('');
@@ -4760,7 +5459,14 @@ begin
      (Pos('scape', Src) = 0) and (Pos('SCAPE', Src) = 0) then
     Exit(Src);
 
-  Defs := TStringList.Create;
+  // ⛔⛔ A HASHED LIST, NOT A PLAIN ONE, and the difference is the DIFFERENCE BETWEEN LINEAR AND
+  // QUADRATIC. "Defs.Values[NAME] := body" goes through IndexOfName, which on a TStringList is a
+  // LINEAR scan - so N macros cost N**2, and a Windows header defines thousands of them. Measured on
+  // a synthetic input of nothing but "#define" lines: 81 / 240 / 889 ms as N doubled from 1000 to
+  // 4000, an exponent of 1.9, while fbc went 26 / 27 / 38 ms - flat.
+  // ⚠️ The SCALE was measured before the profile, which is what named this: a profile would have said
+  // "the preprocessor", and the preprocessor is where the work legitimately is.
+  Defs := TIndexedStringList.Create;
 
   // __FB_UNIQUEID_* stacks are per COMPILATION: start each one empty, and restart the counter, so the
   // same source always yields the same identifiers (a REPL preprocessing twice would otherwise drift).
@@ -4774,7 +5480,7 @@ begin
   IncOnce := TStringList.Create;
   PragmaOnce := TStringList.Create;
   FReprocessDepth := 0;
-  FnDefs := TStringList.Create;
+  FnDefs := TIndexedStringList.Create;   // ...and its twin, for the same reason
   Output := TStringList.Create;
   try
     RegisterIntrinsicDefines(Defs, FnDefs);   // FreeBASIC compiler intrinsic defines (__FB_*__)
@@ -4803,6 +5509,11 @@ begin
     EscapeOn := False;
     GPPSourceForDefined := Src;   // lets defined() see Const/Dim/proc declarations, like fbc
     GPPOutput := Output;          // ...positionally: the expansion so far IS the symbol table so far
+    if GPPDefWords <> nil then FreeAndNil(GPPDefWords);   // a new program, a new expansion
+    GPPDefWordsCovered := 0;
+    if GPPConstWords <> nil then FreeAndNil(GPPConstWords);
+    GPPConstWordsDeclCovered := 0;
+    GPPConstWordsSrcDone := False;
   if GPPReserved = nil then GPPReserved := TStringList.Create;
   GPPReserved.Clear;            // per PROGRAM: a reservation must not survive into the next one
   GPPReserved.CaseSensitive := False;
@@ -4821,6 +5532,13 @@ begin
     PragmaOnce.Free;
     FnDefs.Free;
     GPPOutput := nil;             // it is about to be freed: nothing may scan it afterwards
+    FreeAndNil(GPPDefWords);
+    GPPDefWordsCovered := 0;
+    FreeAndNil(GPPConstWords);
+    GPPConstWordsDeclCovered := 0;
+    GPPConstWordsSrcDone := False;
+    FreeAndNil(GPPSourceLines);
+    GPPSourceLinesLen := -1;
     Output.Free;
   end;
 end;
@@ -4857,6 +5575,11 @@ begin
   SetLength(GPPLineDirectives, 0);
   GDeclaredNonFbDialect := False;
   GPPSourceForDefined := '';
+  FreeAndNil(GPPTypeDeclLines);
+  FreeAndNil(GPPModuleSymbols);
+  GPPTypeTextDepth := 0;
+  GPPSymProcDepth := 0;
+  GPPSzCacheKey := '';
   GPPDefinedLimit := -1;
   FreeAndNil(GPPReserved);
   // ⚠️ GPPIncludePaths is NOT cleared either: like GTargetIsWasm it is CONFIGURATION - the front end's

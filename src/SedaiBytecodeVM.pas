@@ -5559,7 +5559,13 @@ begin
     // ⚠️ A WIDE cell is one ELEMENT here, not two bytes: the array holds one code unit per element,
     // which is the same image the scalar loads see through this address.
     if Ch = 0 then Break;
-    if Wide then Result := Result + UTF8Encode(WideChar(Word(Ch)))
+    // ⛔ THE CELL IS A CODEPOINT, NOT A WideChar. Narrowing it to sixteen bits and going through
+    // UTF8Encode lost two whole classes of value: a cell above U+FFFF was TRUNCATED before the
+    // encoder saw it, and a LONE SURROGATE (U+D800..U+DFFF) has no UTF-16 meaning, so it came back
+    // mangled. fbc's own wstring/asc fills a "WString * 256" with "i shl 8" and walks straight
+    // through the surrogate block at i = 216..223 (DIVERGENZE 196). UCS4CellToUTF8 encodes the
+    // codepoint directly and a round trip through the buffer is the identity again.
+    if Wide then Result := Result + UCS4CellToUTF8(LongWord(Ch))
     else Result := Result + AnsiChar(Byte(Ch));
     Inc(PtrOffset);
     if (ExactBytes > 0) and (Length(Result) >= ExactBytes) then Break;
@@ -5574,7 +5580,7 @@ procedure TBytecodeVM.PtrDomainStoreZStr(Ctx: TExecutionContext; PtrAddr: Int64;
 var
   ArrayIdx, i: Integer;
   PtrOffset, Lim: Int64;
-  W: WideString;
+  U: TUCS4Cells;
 begin
   ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
@@ -5586,11 +5592,14 @@ begin
   Lim := FArrays[ArrayIdx].TotalSize - 1;   // the element count - see PtrDomainLoadZStr
   if Wide then
   begin
-    W := UTF8Decode(Value);
-    for i := 1 to Length(W) do
+    // The mirror of the load: ONE CELL PER CODEPOINT. Going through UTF8Decode wrote one cell per
+    // UTF-16 UNIT, so a codepoint above the BMP became two cells and a lone surrogate could not be
+    // written back at all - the round trip that DIVERGENZE 196 is about.
+    U := UTF8ToUCS4Cells(Value);
+    for i := 0 to Length(U) - 1 do
     begin
       if PtrOffset > Lim then Exit;
-      ArrSetIntAt(ArrayIdx, PtrOffset, Ord(W[i]));
+      ArrSetIntAt(ArrayIdx, PtrOffset, Int64(U[i]));
       Inc(PtrOffset);
     end;
   end
@@ -6057,8 +6066,8 @@ begin
     n := 0;
     while ((n + 1) * WIDE_CELL_BYTES <= Limit) and (PW[n] <> 0) do Inc(n);
     W := '';
-    for i := 0 to Integer(n) - 1 do W := W + UCS4CellToUnicode(PW[i]);
-    Result := UTF8Encode(W);
+    Result := '';
+    for i := 0 to Integer(n) - 1 do Result := Result + UCS4CellToUTF8(PW[i]);
   end;
 end;
 
@@ -6082,7 +6091,7 @@ begin
     // The mirror: one CELL per codepoint, a surrogate PAIR folded back into the single cell it came
     // from - so a round trip through the buffer is the identity, which the UCS-2 image could not
     // promise above the BMP.
-    U := UnicodeToUCS4Cells(UTF8Decode(S));
+    U := UTF8ToUCS4Cells(S);
     P := PByte(RawAddr(RawPtr, (PtrUInt(Length(U)) + 1) * WIDE_CELL_BYTES));
     for i := 0 to Length(U) - 1 do PLongWord(P)[i] := U[i];
     PLongWord(P)[Length(U)] := 0;

@@ -31,7 +31,8 @@ unit SedaiSSATypes;
 interface
 
 uses
-  Classes, SysUtils, fgl, Variants;
+  Classes, SysUtils, fgl, Variants, Generics.Collections,
+  Contnrs;   // TFPStringHashTable: the by-name lookups a sorted TStringList cannot answer fast
 
 const
   { Register allocation limits }
@@ -824,7 +825,23 @@ type
     FVariables, FLabels: TStringList;
     FLabelHintsStale: Boolean;   // a block was inserted: the indices in FLabels.Objects may have shifted
     FVarRegMap: TStringList;    // Maps variable name → "RegType:RegIndex" (for optimization passes)
+    // ⛔⛔ AND THE ROW OF EACH NAME AS A HASH, because the LIST is what the passes ITERATE while
+    // the name is how it is LOOKED UP and UPDATED. In FPC "Sorted" speeds IndexOf - NOT
+    // IndexOfName, which scans regardless; every variable and every module CONST goes through
+    // MapVariableToRegister, so N declarations used to cost N**2.
+    // 📊 perf on 8 000 CONST lines: PreallocateVariables -> GetOrAllocateVariable ->
+    // MapVariableToRegister was 46.3% of the whole compile, all of it inside TStrings.IndexOfName.
+    // ⚠️ The list stays: four passes walk it by INDEX (Algebraic, CopyCoalescing, LICM, the bytecode
+    // compiler) and none of them writes it, so the two are kept in step by the ONLY two accessors.
+    FVarRegIdx: TFPStringHashTable;
     FArrays: array of TSSAArrayInfo;  // Array declarations
+    // ⛔⛔ THE NAME -> INDEX MAP FindArray ANSWERS FROM, KEPT INCREMENTALLY.
+    // The first attempt REBUILT it whenever Length(FArrays) had changed - and the vector grows by one
+    // per declaration, so it rebuilt on every call: still quadratic, and now with a hash table built
+    // each time on top. Measured, 16 000 CONST lines went 27 s -> 56 s. *A cache invalidated on every
+    // write is not a cache.* ⇒ The one place that APPENDS also records the name here, and nothing
+    // else has to remember anything.
+    FArrayIndex: specialize TDictionary<string, Integer>;
     FNextRegister: array[TSSARegisterType] of Integer;
     FNextArrayIndex: Integer;
     FDomTreeObj: TObject;       // PHASE 3 TIER 2: Actually TDominatorTree (avoid circular dependency)
@@ -977,6 +994,33 @@ function BitRotr(V, Count: Int64; Width: Int64): Int64;
 function UCS4CellToUnicode(Cell: LongWord): UnicodeString;
 function UnicodeToUCS4Cells(const W: UnicodeString): TUCS4Cells;
 
+// ⛔⛔ THE CELL <-> UTF-8 PAIR, AND IT DOES NOT GO THROUGH UTF-16. A wide CELL holds a codepoint, and
+// the VM's managed strings are UTF-8; converting between them by way of UnicodeString loses exactly
+// the values a fixed-length WSTRING is most likely to be filled with by a test:
+//   - a LONE SURROGATE (U+D800..U+DFFF) has no UTF-16 meaning of its own, so UTF8Encode mangles it;
+//   - a cell above U+FFFF does not fit a WideChar at all, and the narrowing that was there truncated
+//     it to sixteen bits before the encoder ever saw it.
+// fbc's own wstring/asc fills a "WString * 256" with "i shl 8" for i = 1..255, which walks straight
+// through the surrogate block at i = 216..223: forty assertions failed there and Len answered 248
+// instead of 255, because seven cells had been eaten by the round trip.
+// ⇒ These two encode and decode the codepoint DIRECTLY. A lone surrogate keeps its own three-byte
+// form (this is WTF-8, deliberately): the buffer is program-writable memory, any 32-bit value can be
+// sitting in it, and a round trip through it has to be the identity.
+function UCS4CellToUTF8(Cell: LongWord): AnsiString;
+function UTF8ToUCS4Cells(const S: AnsiString): TUCS4Cells;
+
+// The byte size FreeBASIC's SizeOf() gives a SCALAR or POINTER type name; False when the name is not
+// one of those - a UDT, a TYPE alias, an undeclared identifier - and then Sz is left at 0.
+//
+// ⛔ IT IS A SEPARATE FUNCTION SO THAT ITS TWO READERS CANNOT DRIFT APART. SizeOf() in a compiled
+// expression is answered by TSSAGenerator.TypeSizeBytes; the same question is asked again inside
+// "#if sizeof(...)" and "#assert sizeof(...)", which the PREPROCESSOR has to answer on text, long
+// before any symbol table exists. fbc's single pass gets that for free and this pipeline does not.
+// ⚠️ Written twice, the two copies would disagree the first time a width moved, and this very file
+// records what that costs: WIDE_CELL_BYTES was changed in ONE of its two readers on 30 Aug 2026, the
+// report said 4n while the byte image still held 2n, and a CLEAR ran past the end of its buffer.
+function FBScalarTypeSizeBytes(const TypeName: string; out Sz: Int64): Boolean;
+
 implementation
 
 
@@ -985,6 +1029,109 @@ uses TypInfo, SedaiDominators, SedaiSSAConstruction, SedaiPhiElimination, SedaiG
      SedaiDBE, SedaiDCE, SedaiLICM, SedaiLoopUnroll, SedaiCopyCoalescing, SedaiRangeAnalysis,
      SedaiSubInlining, SedaiXferForward
      {$IF DEFINED(DEBUG_CLEANUP) OR DEFINED(DEBUG_DOMTREE) OR DEFINED(DEBUG_GVN) OR DEFINED(DEBUG_CSE) OR DEFINED(DEBUG_COPYPROP) OR DEFINED(DEBUG_ALGEBRAIC) OR DEFINED(DEBUG_STRENGTH) OR DEFINED(DEBUG_CONSTPROP) OR DEFINED(DEBUG_DBE) OR DEFINED(DEBUG_DCE) OR DEFINED(DEBUG_LICM) OR DEFINED(DEBUG_COPYCOAL) OR DEFINED(DEBUG_SSA)}, SedaiDebug{$ENDIF};
+
+function FBScalarTypeSizeBytes(const TypeName: string; out Sz: Int64): Boolean;
+// The scalar half of SizeOf(). The caller resolves TYPE aliases first where it has a table for them;
+// a name this ladder does not know answers False rather than a guessed width, because the two callers
+// want OPPOSITE defaults for an unknown - the SSA one falls through to its UDT layout and then to the
+// pointer-sized default, the preprocessor one has to say "I cannot answer this".
+var
+  T: string;
+begin
+  Result := True;
+  Sz := 0;
+  T := UpperCase(Trim(TypeName));
+  // A pointer is pointer-sized whatever it points at, and the spelling carries the suffix: "Integer
+  // Ptr", "Any Ptr", "Rec Ptr Ptr" - the rest of the pipeline records exactly that text for a DIM.
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Sz := 8
+  // The string types are what FreeBASIC reports for them, not what our model stores: a STRING is its
+  // 24-byte descriptor (pointer + length + capacity), a ZSTRING one byte, a WSTRING one wide cell.
+  else if T = 'STRING' then Sz := 24
+  else if T = 'ZSTRING' then Sz := 1
+  else if T = 'WSTRING' then Sz := WIDE_CELL_BYTES
+  // ANY has no width: it is a POINTEE, and only "Any Ptr" is a real type (DIVERGENZE 145).
+  else if T = 'ANY' then Sz := 0
+  else if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Sz := 1
+  else if (T = 'SHORT') or (T = 'USHORT') then Sz := 2
+  // ⭐ INT32 / UINT32 are OUR extension (BASIC.md): 32 bits wide, and computing at 32 bits. They are
+  // spelled here because this ladder is what answers "how wide is this type NAME" for SizeOf AND what
+  // "is this name a type at all" reads - without them SizeOf(Int32) answered 8 while SizeOf of a
+  // VARIABLE of that type answered 4, and the field-type check refused a program of our own dialect.
+  else if (T = 'LONG') or (T = 'ULONG') or (T = 'SINGLE') or
+          (T = 'INT32') or (T = 'UINT32') then Sz := 4
+  else if (T = 'INTEGER') or (T = 'UINTEGER') or (T = 'LONGINT') or
+          (T = 'ULONGINT') or (T = 'DOUBLE') then Sz := 8
+  else
+    Result := False;
+end;
+
+function UCS4CellToUTF8(Cell: LongWord): AnsiString;
+// One wide CELL -> its UTF-8 bytes. A lone surrogate keeps its own three-byte form; see the note in
+// the interface for why that is deliberate rather than sloppy.
+begin
+  if Cell < $80 then
+  begin
+    SetLength(Result, 1);
+    Result[1] := AnsiChar(Byte(Cell));
+  end
+  else if Cell < $800 then
+  begin
+    SetLength(Result, 2);
+    Result[1] := AnsiChar(Byte($C0 or (Cell shr 6)));
+    Result[2] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end
+  else if Cell < $10000 then
+  begin
+    SetLength(Result, 3);
+    Result[1] := AnsiChar(Byte($E0 or (Cell shr 12)));
+    Result[2] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
+    Result[3] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end
+  else if Cell <= $10FFFF then
+  begin
+    SetLength(Result, 4);
+    Result[1] := AnsiChar(Byte($F0 or (Cell shr 18)));
+    Result[2] := AnsiChar(Byte($80 or ((Cell shr 12) and $3F)));
+    Result[3] := AnsiChar(Byte($80 or ((Cell shr 6) and $3F)));
+    Result[4] := AnsiChar(Byte($80 or (Cell and $3F)));
+  end
+  else
+    // Out of Unicode range: U+FFFD, the same answer UCS4CellToUnicode gives it, so the two funnels
+    // cannot disagree about what an impossible cell means.
+    Result := #$EF#$BF#$BD;
+end;
+
+function UTF8ToUCS4Cells(const S: AnsiString): TUCS4Cells;
+// The mirror: UTF-8 bytes -> one CELL per codepoint. A byte that cannot open a sequence, or a
+// sequence cut short by the end of the string, becomes one cell of its own byte value - the buffer
+// is program-writable and this must never lose or invent characters.
+var
+  i, n, k, need: Integer;
+  C: LongWord;
+begin
+  SetLength(Result, Length(S));
+  n := 0;
+  i := 1;
+  while i <= Length(S) do
+  begin
+    C := Byte(S[i]);
+    if C < $80 then begin need := 0; end
+    else if (C and $E0) = $C0 then begin need := 1; C := C and $1F; end
+    else if (C and $F0) = $E0 then begin need := 2; C := C and $0F; end
+    else if (C and $F8) = $F0 then begin need := 3; C := C and $07; end
+    else begin need := 0; end;      // a stray continuation byte stands for itself
+    if i + need > Length(S) then need := 0;
+    for k := 1 to need do
+    begin
+      if (Byte(S[i + k]) and $C0) <> $80 then begin need := 0; C := Byte(S[i]); Break; end;
+      C := (C shl 6) or (Byte(S[i + k]) and $3F);
+    end;
+    Result[n] := C;
+    Inc(n);
+    Inc(i, need + 1);
+  end;
+  SetLength(Result, n);
+end;
 
 function UCS4CellToUnicode(Cell: LongWord): UnicodeString;
 // One wide CELL -> the UTF-16 units that spell it. A cell above the BMP becomes a surrogate pair; an
@@ -1274,11 +1421,17 @@ begin
   FVariables.Sorted := True;
   FVariables.Duplicates := dupIgnore;
   FVarRegMap := TStringList.Create;
-  FVarRegMap.Sorted := True;
+  FVarRegIdx := TFPStringHashTable.Create;
+  // ⛔ NOT Sorted: the rows are addressed by the hash, and a sorted Add INSERTS - every row
+  // remembered after the insertion point would slide by one. Nothing needs the order: the four
+  // passes that read this list (Algebraic, CopyCoalescing, LICM, the bytecode compiler) walk it
+  // whole by index and look only at ValueFromIndex.
+  FVarRegMap.Sorted := False;
   FLabels := TStringList.Create;
   FLabels.Sorted := True;
   FForeignDecls := TStringList.Create;
   SetLength(FArrays, 0);
+  if FArrayIndex <> nil then FArrayIndex.Clear;   // the map and the vector are cleared together
   FNextArrayIndex := 0;
   for rt := Low(TSSARegisterType) to High(TSSARegisterType) do
     FNextRegister[rt] := 0;
@@ -1333,6 +1486,7 @@ var
   Block: TSSABasicBlock;
   Instr: TSSAInstruction;
 begin
+  FreeAndNil(FArrayIndex);
   {$IFDEF DEBUG_CLEANUP}
   if DebugCleanup then
   begin
@@ -1429,6 +1583,7 @@ begin
   FBlocks.Free;
   FVariables.Free;
   FVarRegMap.Free;
+  FreeAndNil(FVarRegIdx);
   FLabels.Free;
 
   inherited Destroy;
@@ -1573,9 +1728,30 @@ begin
 end;
 
 procedure TSSAProgram.MapVariableToRegister(const VarName: string; RegType: TSSARegisterType; RegIndex: Integer);
+var
+  Val, Key, RowStr: string;
+  Row: Integer;
 begin
-  // Store mapping as "RegType:RegIndex" string
-  FVarRegMap.Values[VarName] := IntToStr(Ord(RegType)) + ':' + IntToStr(RegIndex);
+  // Store mapping as "RegType:RegIndex" string in the list the passes WALK, and remember the ROW
+  // in the hash so neither writing nor reading it has to search by name.
+  // ⛔ Values[] would search: TStrings.SetValue calls IndexOfName, which scans the whole list
+  // whatever Sorted says (Sorted accelerates IndexOf ONLY). That scan was 46.3% of an 8 000-CONST
+  // compile - every declaration walking every declaration before it.
+  // ⚠️ The key is UPPERCASED because that is what it always was: TStringList.Values compares with
+  // CaseSensitive=False, and TFPStringHashTable compares bytes - without this, x and X would stop
+  // being the same variable and the list would grow a second, stale row for one of them.
+  Val := IntToStr(Ord(RegType)) + ':' + IntToStr(RegIndex);
+  Key := UpperCase(VarName);
+  RowStr := FVarRegIdx.Items[Key];
+  if RowStr = '' then
+  begin
+    // ⚠️ The row is stored 1-BASED: '' is how TFPStringHashTable says "absent", so row 0 must not
+    // be able to spell it.
+    Row := FVarRegMap.Add(VarName + '=' + Val);
+    FVarRegIdx.Add(Key, IntToStr(Row + 1));
+  end
+  else
+    FVarRegMap[StrToInt(RowStr) - 1] := VarName + '=' + Val;
 end;
 
 procedure TSSAProgram.AddVersionableReg(RegType: TSSARegisterType; RegIndex: Integer);
@@ -1637,7 +1813,9 @@ var
   ColonPos: Integer;
 begin
   Result := False;
-  RegStr := FVarRegMap.Values[VarName];
+  RegStr := FVarRegIdx.Items[UpperCase(VarName)];  // the ROW, 1-based; '' = never mapped
+  if RegStr = '' then Exit;
+  RegStr := FVarRegMap.ValueFromIndex[StrToInt(RegStr) - 1];
   if RegStr = '' then Exit;
 
   ColonPos := Pos(':', RegStr);
@@ -1676,6 +1854,9 @@ begin
   Result := Len;
 
   FArrays[Result].Name := UpperCase(ArrName);
+  // ...and the map that finds it, here and nowhere else (see FindArray).
+  if FArrayIndex = nil then FArrayIndex := specialize TDictionary<string, Integer>.Create;
+  FArrayIndex.AddOrSetValue(FArrays[Result].Name, Result);
   FArrays[Result].ElementType := ElementType;
   FArrays[Result].DimCount := Length(Dims);
   SetLength(FArrays[Result].Dimensions, Length(Dims));
@@ -1747,15 +1928,14 @@ begin
 end;
 
 function TSSAProgram.FindArray(const ArrName: string): Integer;
-var
-  i: Integer;
-  SearchName: string;
+// ⛔ IT USED TO WALK EVERY ARRAY, and every DIM and every module CONST asks it - so N declarations
+// cost N**2. Measured on 16 000 CONST lines, the shape of win/winuser.bi: 20.1% of a 27-second
+// compile sat here, next to the parser's own linear registry.
+// ⭐ The map is filled by DeclareArray, the ONE place that appends, so it cannot fall behind; the
+// vector stays the truth and this is only how it is found.
 begin
-  SearchName := UpperCase(ArrName);
-  for i := 0 to High(FArrays) do
-    if FArrays[i].Name = SearchName then
-      Exit(i);
-  Result := -1;
+  if FArrayIndex = nil then Exit(-1);
+  if not FArrayIndex.TryGetValue(UpperCase(ArrName), Result) then Result := -1;
 end;
 
 procedure TSSAProgram.SetArrayPrivate(ArrayIdx: Integer);

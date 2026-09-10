@@ -66,7 +66,16 @@ type
     FNameBucket: array of Integer;  // the same, over the NAME part (up to the name/value separator)
     FNameNext: array of Integer;
     FMask: Integer;                 // buckets - 1; buckets is always a power of two
-    FValid: Boolean;
+    // ⛔⛔ TWO validities, not one, because the two indexes are invalidated by DIFFERENT writes.
+    // Rewriting an entry's VALUE ("Values[name] := v" on a name already there) changes the whole
+    // string - so the key index, which hashes the whole string, is stale - but it does NOT change
+    // the NAME, so the name index is still exactly right. With one flag that write threw both away,
+    // and the next IndexOfName rebuilt the entire table.
+    // 📊 That is the preprocessor's shape, not a corner case: "__LINE__" is rewritten ONCE PER LINE,
+    // so a header with thousands of #defines rebuilt a thousands-entry index on every line of source.
+    // perf on win/shtypes.bi put 31% of the compile in IndexOfName, nearly all of it inside Rebuild.
+    FKeyValid: Boolean;
+    FNameValid: Boolean;
     function FoldedHash(const S: string; Len: Integer): LongWord;
     function NameLen(const S: string): Integer;
     procedure EnsureNextCapacity(ACount: Integer);
@@ -77,12 +86,24 @@ type
     procedure Changed; override;
     procedure InsertItem(Index: Integer; const S: string); override;
     procedure InsertItem(Index: Integer; const S: string; O: TObject); override;
+    procedure Put(Index: Integer; const S: string); override;
     procedure PutObject(Index: Integer; AObject: TObject); override;
   public
     constructor Create;
     function IndexOf(const S: string): Integer; override;
     function IndexOfName(const Name: string): Integer; override;
   end;
+
+{ ⛔⛔ UpperCase E' IL COSTO PIU' DIFFUSO DELLA COMPILAZIONE, e per due ragioni distinte: la RTL
+  ALLOCA sempre una stringa nuova, e la stringa che le passiamo e' spessissimo GIA' maiuscola perche'
+  qualcuno l'ha gia' piegata a monte. perf su win/shlwapi.bi: InternalChangeCase 5,1% di SELF time, e
+  a valle l'allocazione che ne segue alimenta Move, SysGetMem, ansistr_assign e decr_ref.
+  ⭐ UpperFast fa una passata di LETTURA: se non c'e' una sola minuscola, restituisce LA STESSA
+  stringa - nessuna allocazione, solo un refcount. Solo quando c'e' davvero qualcosa da cambiare
+  alloca, e allora scrive con una tabella di 256 byte invece che con un test di appartenenza a un set.
+  ⚠️ Equivalente byte per byte a SysUtils.UpperCase(ansistring), che in FPC piega SOLO 'a'..'z'
+  (InternalChangeCase con l'insieme ASCII): nessuna dipendenza da locale, nessun UTF-8. }
+function UpperFast(const S: string): string;
 
 implementation
 
@@ -152,6 +173,42 @@ begin
   Result := -1;
 end;
 
+var
+  GUpperTab: array[0..255] of Char;
+
+function UpperFast(const S: string): string;
+var
+  i, L: Integer;
+  P: PChar;
+begin
+  L := Length(S);
+  i := 1;
+  while i <= L do
+  begin
+    if (S[i] >= 'a') and (S[i] <= 'z') then Break;
+    Inc(i);
+  end;
+  if i > L then Exit(S);          // gia' maiuscola: nessuna allocazione, solo il refcount
+  SetLength(Result, L);
+  P := PChar(Result);
+  // I byte prima del primo minuscolo sono gia' a posto: si copiano in blocco.
+  if i > 1 then Move(PChar(S)^, P^, i - 1);
+  while i <= L do
+  begin
+    P[i - 1] := GUpperTab[Byte(S[i])];
+    Inc(i);
+  end;
+end;
+
+procedure InitUpperTab;
+var
+  c: Integer;
+begin
+  for c := 0 to 255 do
+    if (c >= Ord('a')) and (c <= Ord('z')) then GUpperTab[c] := Char(c - 32)
+    else GUpperTab[c] := Char(c);
+end;
+
 { TIndexedStringList }
 
 constructor TIndexedStringList.Create;
@@ -159,7 +216,8 @@ begin
   inherited Create;
   // See the header: this is what makes the index and the list agree on "equal".
   UseLocale := False;
-  FValid := False;
+  FKeyValid := False;
+  FNameValid := False;
   FMask := 0;
 end;
 
@@ -263,12 +321,14 @@ begin
   end;
   EnsureNextCapacity(Count + 1);
   for i := 0 to Count - 1 do IndexEntry(i);
-  FValid := True;
+  FKeyValid := True;
+  FNameValid := True;
 end;
 
 procedure TIndexedStringList.Changed;
 begin
-  FValid := False;
+  FKeyValid := False;
+  FNameValid := False;
   inherited Changed;
 end;
 
@@ -279,17 +339,57 @@ end;
 
 procedure TIndexedStringList.InsertItem(Index: Integer; const S: string; O: TObject);
 var
-  WasAppend: Boolean;
+  WasAppend, KeepKey, KeepName: Boolean;
 begin
   // An APPEND leaves every existing index in place, so it can be folded into a live index instead of
   // throwing it away. Anything else (an insert in the middle) renumbers entries: let Changed drop it.
-  WasAppend := FValid and (Index = Count) and (Count < FMask);
-  inherited InsertItem(Index, S, O);      // ...which calls Changed, clearing FValid
+  // ⛔ EACH INDEX KEEPS ITS OWN VALIDITY THROUGH AN APPEND. Requiring BOTH to be valid looks
+  // harmless and is not: one value rewrite ("Values[name] := v") retires the KEY index, and from that
+  // moment every append refused to fold - so the name index was thrown away too and the next
+  // IndexOfName rebuilt the whole table. That is the shape the preprocessor actually has, and it put
+  // 11.8% of a header compile back into Rebuild.
+  // ⚠️ Chaining the entry into an index that is already stale costs nothing and breaks nothing: the
+  // first read of that index rebuilds it from zero, buckets included.
+  KeepKey := FKeyValid;
+  KeepName := FNameValid;
+  WasAppend := (KeepKey or KeepName) and (Index = Count) and (Count < FMask);
+  inherited InsertItem(Index, S, O);      // ...which calls Changed, clearing both flags
   if WasAppend then
   begin
     IndexEntry(Index);
-    FValid := True;
+    FKeyValid := KeepKey;
+    FNameValid := KeepName;
   end;
+end;
+
+procedure TIndexedStringList.Put(Index: Integer; const S: string);
+// Rewriting one entry in place. ⛔ The KEY index is over the whole string, so it is stale whatever
+// changed; the NAME index is stale only if the NAME did - and the write that actually happens in a
+// hot loop, "Values[name] := newvalue", leaves the name exactly where it was.
+// ⚠️ The name is compared the way the index folds it (CompareText, no locale), so a caller writing
+// the name in a different case is still the same entry to both.
+var
+  KeepName: Boolean;
+  Old: string;
+  nOld, nNew: Integer;
+begin
+  KeepName := False;
+  if FNameValid and (Index >= 0) and (Index < Count) then
+  begin
+    Old := Get(Index);
+    nOld := NameLen(Old);
+    nNew := NameLen(S);
+    KeepName := (nOld >= 0) and (nOld = nNew) and (CompareText(Copy(Old, 1, nOld), Copy(S, 1, nNew)) = 0);
+    // ⭐ ...AND A ROW REWRITTEN WITHOUT A SEPARATOR IS A TOMBSTONE, which the name index survives too.
+    // An entry with no NameValueSeparator is invisible to IndexOfName BY CONSTRUCTION - the scan skips
+    // it and so does this index - so the old name's chain link simply stops matching. That is what lets
+    // a caller RETIRE a name (the preprocessor's "#undef") without deleting a row: deleting renumbers
+    // every entry above it and costs the whole index, and a Windows header undefines hundreds of names.
+    // 📊 perf on win/shlwapi.bi: 48% of the compile was IndexOfName -> Rebuild, one rebuild per #undef.
+    if nNew < 0 then KeepName := True;
+  end;
+  inherited Put(Index, S);      // ...which calls Changed, clearing both flags
+  if KeepName then FNameValid := True;
 end;
 
 procedure TIndexedStringList.PutObject(Index: Integer; AObject: TObject);
@@ -298,9 +398,10 @@ var
 begin
   // Only the OBJECT changes; the strings the index is built over do not. Writing Objects[i] is how a
   // registry records its fact, so invalidating here would defeat the index on exactly the hot pattern.
-  Keep := FValid;
+  Keep := FKeyValid and FNameValid;
   inherited PutObject(Index, AObject);
-  FValid := Keep;
+  FKeyValid := Keep;
+  FNameValid := Keep;
 end;
 
 function TIndexedStringList.IndexOf(const S: string): Integer;
@@ -308,7 +409,7 @@ var
   i: Integer;
 begin
   if not FastPath then Exit(inherited IndexOf(S));
-  if not FValid then Rebuild;
+  if not FKeyValid then Rebuild;
   i := FKeyBucket[Integer(FoldedHash(S, Length(S)) and LongWord(FMask))];
   while i >= 0 do
   begin
@@ -324,7 +425,7 @@ var
   E: string;
 begin
   if not FastPath then Exit(inherited IndexOfName(Name));
-  if not FValid then Rebuild;
+  if not FNameValid then Rebuild;
   L := Length(Name);
   i := FNameBucket[Integer(FoldedHash(Name, L) and LongWord(FMask))];
   while i >= 0 do
@@ -335,5 +436,8 @@ begin
   end;
   Result := -1;
 end;
+
+initialization
+  InitUpperTab;
 
 end.

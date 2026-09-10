@@ -49,6 +49,8 @@ uses
   Classes, SysUtils,
   // Preprocessor (runs before lexing)
   SedaiPreprocessor,
+  // Installs GPPTypeSizeHook: see the note in SedaiTypeSizeProbe. Linked for its initialization.
+  SedaiTypeSizeProbe,
   // Dialect auto-detection (line numbers => classic, otherwise Modern)
   SedaiRunner,
   // Lexer/Parser

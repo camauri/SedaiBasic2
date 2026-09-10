@@ -33,7 +33,8 @@ uses
   SedaiAST, SedaiParserContext, SedaiParserResults, SedaiParserErrors,
   SedaiPackratCore, SedaiExpressionParser, SedaiParserValidation,
   SedaiExecutorTypes, SedaiBasicKeywords,
-  SedaiExecutorErrors;  // runtime error codes for the CLASSIC orphan LOOP/WEND/UNTIL raises
+  SedaiExecutorErrors,  // runtime error codes for the CLASSIC orphan LOOP/WEND/UNTIL raises
+  SedaiFastLookup;      // TIndexedStringList: FConstTypes answers IndexOfName from a hash
 
 type
   // Dialect selection for the parser. pdAuto (default) detects the dialect from the token
@@ -126,6 +127,13 @@ type
     // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
     // line, handed to the SSA on the program node (DIVERGENZE 183).
     FForeignDecls: TStringList;
+    // ⛔ EVERY TYPE NAME A "DECLARE" NAMES, with the line it stands on. fbc's single pass refuses a
+    // declaration whose return or parameter type has not been declared ("error 14: Expected
+    // identifier" for the return, "error 59: Illegal specification" for a parameter); this parser
+    // accepted it, and that ONE permissiveness is 252 of the 345 headers of the FreeBASIC tree that
+    // we take and fbc refuses. A bodiless DECLARE emits NO NODE, so this walk is the only place the
+    // information exists - the same reason the foreign signature is collected here.
+    FDeclTypeUses: TStringList;
     // ⭐ How deep inside an `Extern "C" ... End Extern` block we are. A bodiless DECLARE in such a block
     // is a FOREIGN procedure even with no ALIAS - the C name IS the symbol, which is what "C" linkage
     // means - and that is how every real binding is written: fbc's own zip.bi declares 103 functions
@@ -657,10 +665,16 @@ begin
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
   FForeignDecls := TStringList.Create;
+  FDeclTypeUses := TStringList.Create;
   FForwardDeclNames := TStringList.Create;
   FForwardDeclNames.CaseSensitive := False;
+  // ⛔ Sorted for the same reason as the nine above: pure membership sets asked once per statement,
+  // growing with the file. perf on win/shlwapi.bi put 27.8% of the compile in TStringList.IndexOf,
+  // called straight from ParseStatement.
+  FForwardDeclNames.Sorted := True;
   FProcSeen := TStringList.Create;
   FProcSeen.CaseSensitive := False;
+  FProcSeen.Sorted := True;
   FProcSeenNs := TStringList.Create;
   FProcSeenNs.CaseSensitive := False;
   FProcOverloadKeys := TStringList.Create;
@@ -668,31 +682,59 @@ begin
   FNsPrefix := '';
   FByrefRetProcs := TStringList.Create;
   FByrefRetProcs.CaseSensitive := False;
+  FByrefRetProcs.Sorted := True;
+  // ⛔ SORTED, so IndexOf is a binary search. This is a membership SET asked once per identifier
+  // token in MODERN (line ~2790) and twice per declaration, and it grows with every CONST: unsorted,
+  // N constants cost N**2. perf on 16 000 CONST lines put 35.5% of the whole compile in
+  // TStringList.IndexOf. ⚠️ Sound only because every Add and every IndexOf uppercases its key, so the
+  // ordering the search assumes is the one the inserts built; nothing reads it by index.
   FConstNames := TStringList.Create;
   FConstNames.CaseSensitive := False;
-  FConstTypes := TStringList.Create;
+  FConstNames.Sorted := True;
+  // ⛔⛔ HASHED, NOT PLAIN. "FConstTypes.Values[name] := t" goes through TStrings.IndexOfName, a
+  // LINEAR scan, so N constants cost N**2 - and a Windows header is thousands of them (win/winuser.bi
+  // alone). Measured: 16 000 CONST lines took 27 055 ms, and perf put 46.3% of the whole run in
+  // SetValue -> IndexOfName, 36.7% of it under ParseConstStatement.
+  FConstTypes := TIndexedStringList.Create;
   FConstTypes.CaseSensitive := False;
-  FConstIntValues := TStringList.Create;
+  // Hashed for the same reason as FConstTypes: perf put 47.5% of an 8 000-CONST compile in
+  // TStrings.SetValue -> IndexOfName, under ParseConstStatement, and this is the list it walked.
+  FConstIntValues := TIndexedStringList.Create;
   FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
   FTypeStaticMethods.CaseSensitive := False;
+  FTypeStaticMethods.Sorted := True;
   FTypeNamesSeen := TStringList.Create;       FTypeNamesSeen.CaseSensitive := False;
+  // ⛔ SORTED = a binary search instead of a scan. Every one of these is a pure membership SET - no
+  // Objects, no index read, no walk in insertion order (checked, all nine) - and every one is asked
+  // once per statement while it grows with the file, so unsorted they cost N**2 on a header.
+  // perf on win/shtypes.bi: 16.5% of the compile in TStringList.IndexOf.
+  FTypeNamesSeen.Sorted := True;
   FEnumNamesSeen := TStringList.Create;       FEnumNamesSeen.CaseSensitive := False;
+  FEnumNamesSeen.Sorted := True;
   FTypeDeclaredMembers := TStringList.Create; FTypeDeclaredMembers.CaseSensitive := False;
+  FTypeDeclaredMembers.Sorted := True;
   FTypesInNamespace := TStringList.Create;    FTypesInNamespace.CaseSensitive := False;
+  FTypesInNamespace.Sorted := True;
   FStaticMemberProcs := TStringList.Create;
   FStaticMemberProcs.CaseSensitive := False;
+  FStaticMemberProcs.Sorted := True;
   FTypeMethodDefaults := TStringList.Create;
   FTypeMethodDefaults.CaseSensitive := False;
-  FExternShapes := TStringList.Create;
+  FExternShapes := TIndexedStringList.Create;   // IndexOfName from a hash: asked per declaration
+
   FExternShapes.CaseSensitive := False;
   FModuleLocalNames := TStringList.Create;
   FModuleLocalNames.CaseSensitive := False;
+  FModuleLocalNames.Sorted := True;
   FTypesWithCtorDtor := TStringList.Create;
   FTypesWithCtorDtor.CaseSensitive := False;
+  FTypesWithCtorDtor.Sorted := True;
   FConstPointeeNames := TStringList.Create;
   FConstPointeeNames.CaseSensitive := False;
-  FModuleDeclared := TStringList.Create;
+  FConstPointeeNames.Sorted := True;   // same set, same scan, same reason as FConstNames
+  FModuleDeclared := TIndexedStringList.Create;   // IndexOfName from a hash: asked per declaration
+
   FModuleDeclared.CaseSensitive := False;
 end;
 
@@ -705,6 +747,7 @@ begin
     FExpressionParser.Free;
 
   FForeignDecls.Free;
+  FDeclTypeUses.Free;
   FForwardDeclNames.Free;
   FProcSeen.Free;
   FProcOverloadKeys.Free;
@@ -827,7 +870,7 @@ begin
     // expression as its child, so it carries no type.
     if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
        not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
-      T := UpperCase(VarToStr(p.GetChild(0).Value));
+      T := p.GetChild(0).ValueUpper;
     // ⭐ AN INLINE PROCEDURE-POINTER PARAMETER NAMES ITSELF HERE, exactly as a pointer does below.
     // Its signature lives in attributes and not in a type CHILD, so T came out EMPTY and every one of
     // them signed the same label: "Sub take( ByVal p As Sub( ByVal As Byte ) )" and the same with
@@ -989,7 +1032,7 @@ begin
     T := '';
     if (p.ChildCount >= 1) and (p.GetChild(0).NodeType = antIdentifier) and
        not ((p.Attributes.Values['HASDEFAULT'] = '1') and (p.ChildCount = 1)) then
-      T := UpperCase(VarToStr(p.GetChild(0).Value));
+      T := p.GetChild(0).ValueUpper;
     if p.Attributes.Values['ARRAY'] = '1' then T := T + '()';
     // ⛔ An INLINE procedure-pointer parameter ("ByVal p As Sub( ByRef As T1 )") carries its signature
     // in attributes, not in a type name, so two of them reach here with the SAME (or an empty) type
@@ -1112,7 +1155,7 @@ var
   CKey: string;
 begin
   if (NameNode = nil) or (ParamList = nil) then Exit;
-  Base := UpperCase(VarToStr(NameNode.Value));
+  Base := NameNode.ValueUpper;
   // Every OPERATOR carries its own discriminator already and must be left alone: the symbol form has
   // "@<arity>" (above), and the named form -- CAST / LET -- is told apart by its RETURN BANK, a suffix the
   // SSA collector appends ("T.OPERATORCAST$" / "%"). Two casts of one type share a label HERE, at parse
@@ -1278,7 +1321,7 @@ function TPackratParser.ProgEditModernHandler: TASTNode;
 // (Bare "NEW T" is an expression, handled by the expression parser, not here.)
 begin
   Result := nil;
-  if UpperCase(Context.CurrentToken.Value) = 'DELETE' then
+  if SameText(Context.CurrentToken.Value, 'DELETE') then
     Result := ParseDeleteStatement;
 end;
 
@@ -1314,7 +1357,7 @@ function TPackratParser.MemSwapStatementHandler: TASTNode;
 // MODERN override for ttMemoryCommand: SWAP exchanges two lvalues. Any other memory command declines
 // (returns nil) so the built-in ParseMemoryStatement handles it (POKE/BANK/...).
 begin
-  if UpperCase(Context.CurrentToken.Value) = 'SWAP' then
+  if SameText(Context.CurrentToken.Value, 'SWAP') then
     Result := ParseSwapStatement
   else
     Result := nil;
@@ -1326,7 +1369,7 @@ function TPackratParser.IdentMidStatementHandler: TASTNode;
 // nil), so the normal identifier path (label / assignment / call / expression) runs instead.
 begin
   Result := nil;
-  if (UpperCase(Context.CurrentToken.Value) = 'MID') and
+  if (SameText(Context.CurrentToken.Value, 'MID')) and
      Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
     Result := ParseMidStatement;
 end;
@@ -1612,6 +1655,24 @@ begin
  // knows what a CALL is, and it needs the symbol, the library and the signature to build the call.
  if FForeignDecls.Count > 0 then
    Result.Attributes.Values['FOREIGNDECLS'] := StringReplace(FForeignDecls.Text, sLineBreak, ';', [rfReplaceAll]);
+ // ⭐ ...and so do the TYPE NAMES every DECLARE mentions: the SSA is the only pass that knows which
+ // types the program declares, and a bodiless DECLARE leaves no node for it to look at.
+ if FDeclTypeUses.Count > 0 then
+   Result.Attributes.Values['DECLTYPES'] := StringReplace(FDeclTypeUses.Text, sLineBreak, ';', [rfReplaceAll]);
+ // ⭐ ...E I NOMI DELLE PROCEDURE che il programma DICHIARA, per la stessa ragione: una DECLARE senza
+ // corpo non lascia nessun nodo, quindi la SSA non ha modo di sapere che "Foo(0)" e' una CHIAMATA a
+ // qualcosa di dichiarato e non un accesso a un array inesistente.
+ // ⛔ Misurato contro l'oracolo: `fbc` COMPILA una chiamata a una procedura dichiarata e mai definita
+ // (produce l'oggetto; e' il LINKER a dire "undefined reference"), e rifiuta solo un nome che nessuno
+ // ha dichiarato ("error 42: Variable not declared"). Noi rifiutavamo a tempo di compilazione, ed e'
+ // cio' che faceva cadere win/shobjidl.bi, win/shlobj.bi e win/shlwapi.bi: quegli header DEFINISCONO
+ // una sub che chiama CoTaskMemFree, dichiarata in win/combaseapi.bi.
+ // ⚠️ DUE registri, e servono ENTRAMBI: FProcSeen tiene le procedure DEFINITE, FForwardDeclNames i
+ // nomi dichiarati e basta - ed e' il secondo che porta i nomi degli header (una DECLARE senza corpo).
+ if (FProcSeen.Count > 0) or (FForwardDeclNames.Count > 0) then
+   Result.Attributes.Values['DECLPROCS'] :=
+     StringReplace(FProcSeen.Text, sLineBreak, ';', [rfReplaceAll]) + ';' +
+     StringReplace(FForwardDeclNames.Text, sLineBreak, ';', [rfReplaceAll]);
 
  DoNodeCreated(Result);
 end;
@@ -1721,6 +1782,8 @@ var
   FgnName, FgnAlias, FgnLib, FgnRet, FgnParams, FgnTok: string;
   FgnDepth: Integer;
   FgnAfterAs, FgnIsFunc, FgnTypeOpen: Boolean;
+  FgnByVal: Boolean;        // the parameter's stated passing mode; unstated reads as BYREF
+  FgnLastDecl: Integer;     // index in FDeclTypeUses of the type just recorded, so a PTR can mark it
   FgnNameRaw: string;
 begin
   Result := nil;
@@ -1752,8 +1815,8 @@ begin
   // "Function bsave Alias ""fb_GfxBsave""" (its own warnings/rtl-prototypes.bas overloads it twice).
   // So: open where a NAME is expected, shut where a STATEMENT is.
   if FModernMode and (Token.TokenType <> ttIdentifier) and
-     (UpperCase(Token.Value) <> kBSAVE) and
-     IsShadowableExtensionName(UpperCase(Token.Value)) then
+     (UpperFast(Token.Value) <> kBSAVE) and
+     IsShadowableExtensionName(UpperFast(Token.Value)) then
     Token.TokenType := ttIdentifier;
 
  // Skip statement separators (:)
@@ -1787,10 +1850,10 @@ begin
  // SedaiBasic does not enforce module linkage, so consume the modifier and dispatch the following
  // declaration as usual (PRIVATE/PUBLIC are not registered keywords, so they arrive as identifiers).
  if (Token.TokenType = ttIdentifier) and
-    ((UpperCase(Token.Value) = 'PRIVATE') or (UpperCase(Token.Value) = 'PUBLIC')) and
+    ((SameText(Token.Value, 'PRIVATE')) or (SameText(Token.Value, 'PUBLIC'))) and
     Assigned(Context.PeekNext) and
     ((Context.PeekNext.TokenType in [ttProcedureStart, ttTypeDecl, ttUnionDecl, ttConstant]) or
-     ((Context.PeekNext.TokenType = ttIdentifier) and (UpperCase(Context.PeekNext.Value) = 'DECLARE'))) then
+     ((Context.PeekNext.TokenType = ttIdentifier) and (SameText(Context.PeekNext.Value, 'DECLARE')))) then
  begin
    Context.Advance;                 // consume PRIVATE / PUBLIC
    Token := Context.CurrentToken;   // re-dispatch on the actual declaration keyword below
@@ -1805,8 +1868,8 @@ begin
  // target ("Expected = in assignment"). Consume the decorator and let the procedure parse - the
  // dispatch it asks for is already what a method call does.
  if (Token.TokenType = ttIdentifier) and
-    ((UpperCase(Token.Value) = 'VIRTUAL') or (UpperCase(Token.Value) = 'ABSTRACT') or
-     (UpperCase(Token.Value) = 'OVERRIDE')) and
+    ((SameText(Token.Value, 'VIRTUAL')) or (SameText(Token.Value, 'ABSTRACT')) or
+     (SameText(Token.Value, 'OVERRIDE'))) and
     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
  begin
    Context.Advance;                    // the decorator
@@ -1821,7 +1884,7 @@ begin
    Exit;
  end;
 
- if (Token.TokenType = ttIdentifier) and (UpperCase(Token.Value) = 'DECLARE') then
+ if (Token.TokenType = ttIdentifier) and (SameText(Token.Value, 'DECLARE')) then
  begin
    // ⛔ A DECLARE OUTSIDE A TYPE TAKES NO LEADING DECORATOR AT ALL. VIRTUAL, ABSTRACT, STATIC and a
    // leading CONST describe a MEMBER of a type, and outside one fbc refuses every one of them on its
@@ -1833,7 +1896,7 @@ begin
    // from a pre-pass over the real definitions - so this adds a refusal and changes nothing else.
    if FModernMode and Assigned(Context.PeekNext) then
    begin
-     DeclDecoU := UpperCase(VarToStr(Context.PeekNext.Value));
+     DeclDecoU := UpperFast(VarToStr(Context.PeekNext.Value));
      if (DeclDecoU = 'VIRTUAL') or (DeclDecoU = 'ABSTRACT') or (DeclDecoU = 'STATIC') or
         (DeclDecoU = 'CONST') then
        HandleError(Format('"%s" describes a member of a TYPE: a DECLARE outside a type body cannot ' +
@@ -1848,8 +1911,8 @@ begin
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
       Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
       (Pos('.', VarToStr(Context.PeekToken(2).Value)) = 0) then
-     if FForwardDeclNames.IndexOf(UpperCase(VarToStr(Context.PeekToken(2).Value))) < 0 then
-       FForwardDeclNames.Add(UpperCase(VarToStr(Context.PeekToken(2).Value)));
+     if FForwardDeclNames.IndexOf(UpperFast(VarToStr(Context.PeekToken(2).Value))) < 0 then
+       FForwardDeclNames.Add(UpperFast(VarToStr(Context.PeekToken(2).Value)));
    // ⭐ ...AND A DECLARE THAT CARRIES AN "ALIAS" IS A FOREIGN PROCEDURE, so its SIGNATURE is collected
    // on the way past. The line is skipped token by token anyway; reading it while walking costs
    // nothing and is the only place the information exists - a bodiless DECLARE emits no node at all.
@@ -1857,17 +1920,24 @@ begin
    // program node. DIVERGENZE 183.
    FgnName := ''; FgnAlias := ''; FgnLib := ''; FgnRet := ''; FgnParams := '';
    FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False; FgnTypeOpen := False;
+   // ⛔ THE PASSING MODE AND THE POINTER SUFFIX DECIDE WHETHER AN INCOMPLETE TYPE IS AN ERROR, so the
+   // walk has to carry both. fbc refuses "byval as <incomplete>" (error 71) and takes the same type
+   // "byref" or "ptr" without a word: win/sql.bi declares "byval BufferLength as SQLLEN" where SQLLEN
+   // aliases INT64, a name sqltypes.bi never declares - and the LAST parameter of the same line,
+   // "SQLLEN ptr", is perfectly good. ⚠️ Unstated means BYREF here: that is the direction that does
+   // not refuse, which is the only direction a new refusal may err in.
+   FgnByVal := False; FgnLastDecl := -1;
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
-     FgnIsFunc := UpperCase(VarToStr(Context.PeekNext.Value)) = kFUNCTION;
+     FgnIsFunc := UpperFast(VarToStr(Context.PeekNext.Value)) = kFUNCTION;
    FgnNameRaw := '';
    if Assigned(Context.PeekToken(2)) then
    begin
      FgnNameRaw := VarToStr(Context.PeekToken(2).Value);     // the C spelling, kept as written
-     FgnName := UpperCase(FgnNameRaw);
+     FgnName := UpperFast(FgnNameRaw);
    end;
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
    begin
-     FgnTok := UpperCase(VarToStr(Context.CurrentToken.Value));
+     FgnTok := UpperFast(VarToStr(Context.CurrentToken.Value));
      if Context.Check(ttDelimParOpen) then
      begin Inc(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False; end
      else if Context.Check(ttDelimParClose) then
@@ -1881,6 +1951,8 @@ begin
          else FgnLib := VarToStr(Context.PeekNext.Value);
        end;
      end
+     else if (FgnTok = 'BYVAL') or (FgnTok = 'BYREF') then
+       FgnByVal := FgnTok = 'BYVAL'
      else if (FgnTok = kAS) or Context.Check(ttAsType) then
      begin FgnAfterAs := True; FgnTypeOpen := False; end
      // ⛔ THE PTR TEST COMES FIRST, AND IT IS GATED ON "a type was just read" - NOT on "we are after an
@@ -1895,13 +1967,26 @@ begin
      begin
        if (FgnDepth > 0) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
        else if (FgnDepth = 0) and (FgnRet <> '') then FgnRet := FgnRet + ' PTR';
+       // ...and the entry the declared-type check will read says so too: a pointer to an incomplete
+       // type is a perfectly good pointer.
+       if (FgnLastDecl >= 0) and (FgnLastDecl < FDeclTypeUses.Count) then
+         FDeclTypeUses[FgnLastDecl] := FDeclTypeUses[FgnLastDecl] + '|P';
      end
      // ⛔ "ByVal As Const ZString Ptr": CONST describes the POINTEE, not the type, and taking it as the
      // type name would classify the parameter as unknown and refuse the whole declaration. Every C
      // binding is full of them - zip.bi alone has dozens.
      else if FgnAfterAs and (FgnTok = 'CONST') then
        // stay after-AS: the real type name is the next word
-     else if FgnAfterAs and Context.CheckAny([ttIdentifier, ttAsType]) then
+     // ⛔⛔ "As Sub Cdecl(...)" IS A PROCEDURE-POINTER TYPE, and the walk did not consume the SUB.
+     // SUB and FUNCTION are their own token kind, so neither arm below matched them, the after-AS
+     // flag stayed open, and the type recorded for the parameter was whatever word came next: the
+     // CALLING CONVENTION ("cdecl"), or - with no convention - the first PARAMETER NAME of the
+     // pointer's own signature. crt/stdlib.bi's "declare function atexit(byval as sub cdecl())" is
+     // the shape, and it is reached by anything that includes crt.bi.
+     // ⚠️ This is not new with the declared-type check: the FOREIGN signature (DIVERGENZE 183) has
+     // been recording that same wrong word as a parameter type all along, where it decides how the
+     // argument is marshalled. The check is what made it visible.
+     else if FgnAfterAs and Context.Check(ttProcedureStart) then
      begin
        if FgnDepth > 0 then
        begin
@@ -1909,6 +1994,47 @@ begin
          FgnParams := FgnParams + FgnTok;
        end
        else if FgnRet = '' then FgnRet := FgnTok;
+       FgnAfterAs := False;
+       FgnTypeOpen := True;
+     end
+     // A CALLING CONVENTION is not a type either, wherever it stands.
+     else if (FgnTok = 'CDECL') or (FgnTok = 'STDCALL') or (FgnTok = 'PASCAL') then
+       // consumed: it describes the call, not the value
+     // ⛔⛔ AFTER "AS" THE TYPE IS WHATEVER TOKEN IS THERE, WHATEVER ITS KIND. Reading only
+     // ttIdentifier / ttAsType lost every type whose NAME collides with a keyword of this dialect -
+     // and X11's "Window" is exactly that (a Commodore graphics word here). The arm did not fire, the
+     // after-AS flag stayed open, and the type recorded was the next PARAMETER'S NAME: "byval win as
+     // Window, byval mode as long" filed MODE as a type. ⚠️ The foreign signature has been recording
+     // that same wrong word since DIVERGENZE 183; the declared-type check is what made it visible.
+     else if FgnAfterAs and
+             (not Context.CheckAny([ttDelimParOpen, ttDelimParClose, ttSeparParam,
+                                    ttEndOfLine, ttSeparStmt, ttEndOfFile])) then
+     begin
+       if FgnDepth > 0 then
+       begin
+         if FgnParams <> '' then FgnParams := FgnParams + ',';
+         FgnParams := FgnParams + FgnTok;
+       end
+       else if FgnRet = '' then FgnRet := FgnTok;
+       // ⭐ The same token, kept for the DECLARED-TYPE check: the SSA is the only pass that knows every
+       // TYPE the program declares, and this is the only place that knows a bodiless DECLARE named one.
+       // "R" marks a return type and "P" a parameter, because fbc gives the two different errors.
+       // ⛔ A QUALIFIED NAME IS NOT RECORDED. "As ns.Foo" arrives as the token "ns" followed by a dot,
+       // so recording it would file the NAMESPACE as the type and refuse a perfectly good declaration.
+       // Skipping it means the check simply says nothing about qualified types - the safe direction
+       // for a rule that adds a refusal.
+       FgnLastDecl := -1;
+       if not (Assigned(Context.PeekNext) and (VarToStr(Context.PeekNext.Value) = '.')) then
+       begin
+         // The RETURN of a function is always by value; a parameter says so itself.
+         if FgnDepth > 0 then
+           FDeclTypeUses.Add('P|' + FgnTok + '|' + IntToStr(Context.CurrentToken.Line) + '|' +
+                             BoolToStr(FgnByVal, 'V', 'R'))
+         else
+           FDeclTypeUses.Add('R|' + FgnTok + '|' + IntToStr(Context.CurrentToken.Line) + '|V');
+         FgnLastDecl := FDeclTypeUses.Count - 1;
+         FgnByVal := False;          // the next parameter states its own mode
+       end;
        FgnAfterAs := False;
        FgnTypeOpen := True;
      end
@@ -1935,9 +2061,9 @@ begin
  // closed by END EXTERN; otherwise it is a single-line declaration. (Without this, module-level
  // EXTERN would fall through to identifier/assignment parsing and hang, like DECLARE did.)
  if (Token.TokenType = ttIdentifier) and
-    ((UpperCase(Token.Value) = 'EXTERN') or (UpperCase(Token.Value) = 'IMPORT')) then
+    ((SameText(Token.Value, 'EXTERN')) or (SameText(Token.Value, 'IMPORT'))) then
  begin
-   if (UpperCase(Token.Value) = 'EXTERN') and Assigned(Context.PeekNext) and
+   if (SameText(Token.Value, 'EXTERN')) and Assigned(Context.PeekNext) and
       (Context.PeekNext.TokenType = ttStringLiteral) then
    begin
      // `EXTERN "lang"` ... `END EXTERN` is a LINKAGE wrapper, not a container: the declarations inside it
@@ -1950,15 +2076,15 @@ begin
      // otherwise would marshal the arguments the wrong way round without a word.
      if Context.Check(ttStringLiteral) then
      begin
-       if UpperCase(Trim(VarToStr(Context.CurrentToken.Value))) = 'C' then Inc(FExternCDepth);
+       if UpperFast(Trim(VarToStr(Context.CurrentToken.Value))) = 'C' then Inc(FExternCDepth);
        Context.Advance;                   // the "C" / "Windows" linkage name
      end;
      Result := nil;
      Exit;
    end
-   else if (UpperCase(Token.Value) = 'EXTERN') and Assigned(Context.PeekNext) and
+   else if (SameText(Token.Value, 'EXTERN')) and Assigned(Context.PeekNext) and
            (Context.PeekNext.TokenType = ttIdentifier) and
-           (UpperCase(Context.PeekNext.Value) = 'EXTERN') then
+           (SameText(Context.PeekNext.Value, 'EXTERN')) then
    begin
      Context.Advance; Context.Advance;    // (defensive: a stray "EXTERN EXTERN")
      Result := nil;
@@ -1971,7 +2097,7 @@ begin
      // and fbc rejects a later DIM/REDIM/EXTERN that disagrees. ScanModuleLevelExtern reads the line
      // and REWINDS; the skip below is unchanged, so not one token of the old behaviour moves.
      FPendingExternArray := nil;
-     if AtModuleLevel and (UpperCase(Token.Value) = 'EXTERN') then ScanModuleLevelExtern;
+     if AtModuleLevel and (SameText(Token.Value, 'EXTERN')) then ScanModuleLevelExtern;
      while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
      // ...and the ONE thing a lone EXTERN cannot throw away with the rest of the line: the storage an
      // EXTERN ARRAY the module never defines still owes the SSA. See ScanModuleLevelExtern.
@@ -1993,7 +2119,7 @@ begin
     ttOutputCommand:
     begin
       // Dispatch based on specific keyword
-      case UpperCase(Token.Value) of
+      case UpperFast(Token.Value) of
         kPRINT: Result := Memoize('PrintStatement', @ParsePrintStatement);
         kCHAR: Result := Memoize('CharStatement', @ParseCharStatement);
         kPUDEF: Result := Memoize('PudefStatement', @ParsePudefStatement);
@@ -2006,7 +2132,7 @@ begin
     ttInputCommand:
     begin
       // Dispatch based on specific keyword
-      case UpperCase(Token.Value) of
+      case UpperFast(Token.Value) of
         kINPUT: Result := Memoize('InputStatement', @ParseInputStatement);
         kGET: Result := Memoize('GetStatement', @ParseGetStatement);
         kGETKEY: Result := Memoize('GetkeyStatement', @ParseGetkeyStatement);
@@ -2059,7 +2185,7 @@ begin
     ttJumpKeyword:
     begin
       //WriteLn('>>> DEBUG: Found ttJumpKeyword="', Token.Value, '"');
-      if UpperCase(Token.Value) = 'GOTO' then
+      if SameText(Token.Value, 'GOTO') then
         Result := Memoize('GotoStatement', @ParseGotoStatement)
       else
         Result := Memoize('JumpStatement', @ParseJumpStatement);
@@ -2111,14 +2237,14 @@ begin
       // on "Unexpected token ByRef" - the whole of proguide/object-class stopped there.
       // The two are told apart by what CLOSES the parentheses: a declaration continues "... ) As <type>",
       // a result assignment does not (and "Operator = (a + b)" is a perfectly ordinary one).
-      if ((UpperCase(Token.Value) = kFUNCTION) or (UpperCase(Token.Value) = kOPERATOR) or
-          (UpperCase(Token.Value) = kPROPERTY)) and
+      if ((UpperFast(Token.Value) = kFUNCTION) or (UpperFast(Token.Value) = kOPERATOR) or
+          (UpperFast(Token.Value) = kPROPERTY)) and
          Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) and
-         not ((UpperCase(Token.Value) = kOPERATOR) and ParenGroupIsFollowedByAs(2)) then
+         not ((UpperFast(Token.Value) = kOPERATOR) and ParenGroupIsFollowedByAs(2)) then
         Result := Memoize('FunctionResultAssign', @ParseFunctionResultAssign)
-      else if (UpperCase(Token.Value) = kSUB) or (UpperCase(Token.Value) = kFUNCTION) or
-         (UpperCase(Token.Value) = kCONSTRUCTOR) or (UpperCase(Token.Value) = kDESTRUCTOR) or
-         (UpperCase(Token.Value) = kPROPERTY) or (UpperCase(Token.Value) = kOPERATOR) then
+      else if (UpperFast(Token.Value) = kSUB) or (UpperFast(Token.Value) = kFUNCTION) or
+         (UpperFast(Token.Value) = kCONSTRUCTOR) or (UpperFast(Token.Value) = kDESTRUCTOR) or
+         (UpperFast(Token.Value) = kPROPERTY) or (UpperFast(Token.Value) = kOPERATOR) then
         Result := Memoize('ProcedureDecl', @ParseProcedureDecl)
       else
         Result := Memoize('FnStatement', @ParseFnStatement);
@@ -2208,7 +2334,7 @@ begin
       // exactly as the ttTypeDecl and '(' cases do; with no assignment operator after it this returns
       // nil and the expression statement below takes it, which is how "CUInt( f(1,2,3) )" - a call made
       // for its side effects - keeps working.
-      if (Token.TokenType = ttMathFunction) and FModernMode and IsCastFunctionName(UpperCase(Token.Value)) and
+      if (Token.TokenType = ttMathFunction) and FModernMode and IsCastFunctionName(UpperFast(Token.Value)) and
          Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
       begin
         SavedIndex := Context.CurrentIndex;
@@ -2293,7 +2419,7 @@ begin
         // ⭐ MODERN "Interface name ... End Interface". INTERFACE is not a reserved word (making it
         // one would break every program that uses it as a variable), so it is matched by spelling
         // and only in the shape that cannot mean anything else: the word followed by a NAME.
-        if (UpperCase(Token.Value) = 'INTERFACE') and Assigned(Context.PeekNext) and
+        if (SameText(Token.Value, 'INTERFACE')) and Assigned(Context.PeekNext) and
            (Length(VarToStr(Context.PeekNext.Value)) > 0) and
            (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
           Result := ParseInterfaceDecl
@@ -2307,21 +2433,21 @@ begin
         // FreeBASIC "LINE INPUT #n, var": LINE is not a registered keyword here (it is a bare
         // identifier), so detect the two-word form. Unambiguous — no statement has `line input`
         // meaning anything else.
-        else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
-                ((UpperCase(Context.PeekNext.Value) = kINPUT) or
-                 (UpperCase(Context.PeekNext.Value) = kINPUTN)) then   // 'INPUT' or combined 'INPUT#'
+        else if (UpperFast(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
+                ((UpperFast(Context.PeekNext.Value) = kINPUT) or
+                 (UpperFast(Context.PeekNext.Value) = kINPUTN)) then   // 'INPUT' or combined 'INPUT#'
           Result := ParseLineInputStatement
         // FreeBASIC graphics "LINE (x1,y1)-(x2,y2),color[,B|BF]": LINE is a bare identifier here; the
         // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
         // A leading '-' also selects it ("LINE -(x2,y2)" omits the start), as does a leading STEP
         // ("LINE STEP(x1,y1)-...") or the image-target form ("LINE img,(x1,y1)-(x2,y2)").
-        else if (UpperCase(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType in [ttDelimParOpen, ttOpSub]) or
-                 (UpperCase(Context.PeekNext.Value) = kSTEP) or LooksLikeImageTarget) then
+                 (UpperFast(Context.PeekNext.Value) = kSTEP) or LooksLikeImageTarget) then
           Result := ParseGfxLineStatement
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
-        else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseWriteFileStatement
         // FreeBASIC console "WRITE v1, v2, ...": quoted-CSV to the screen. WRITE is a bare identifier, so
@@ -2333,32 +2459,32 @@ begin
         // blank line. Safe to take in MODERN: fbc reserves the word, so "write" cannot be a variable there
         // ("Dim write As Integer" -> error 4, Duplicated definition). CLASSIC has no console WRITE at all,
         // so a bare "write" there stays whatever it was.
-        else if FModernMode and (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
+        else if FModernMode and (UpperFast(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
           Result := ParseWriteConsole
-        else if (UpperCase(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType <> ttOpEq) and (Context.PeekNext.Value <> '=') and
                 not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
           Result := ParseWriteConsole
         // FreeBASIC "SEEK #n, pos" statement (SEEK is also the SEEK(n) function — the `#` selects the
         // statement form). SEEK is a bare identifier here.
-        else if (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
           Result := ParseSeekStatement
         // The '#' is OPTIONAL in FreeBASIC: "Seek f, 100" is the same statement. In statement position
         // a bare file number (identifier or literal) can only be the statement form — the FUNCTION form
         // is always parenthesised, "Seek(f)", and an assignment to a variable named seek starts with '='.
-        else if FModernMode and (UpperCase(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
+        else if FModernMode and (UpperFast(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttIdentifier, ttNumber, ttInteger]) then
           Result := ParseSeekStatement
         // FreeBASIC graphics "PUT [img,] (x,y), src [, mode]" — PUT is a bare identifier; the leading
         // '(' (vs '#') selects the graphics blit form, and so does the image-target form
         // "PUT img, (x,y), src", which LINE/CIRCLE/PAINT/PSET have taken since the target work.
-        else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttDelimParOpen) or LooksLikeImageTarget) then
           Result := ParseGfxPutStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
-        else if (UpperCase(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
         begin
           Context.Advance;   // consume PUT
@@ -2377,7 +2503,7 @@ begin
         // Only the block form was recognised, so the single line fell through to the assignment path and
         // reported "Expected \"=\" in assignment" - a message about a statement the program never wrote,
         // where the refusal below says what is actually going on. Same declared limitation, one message.
-        else if FModernMode and (UpperCase(Token.Value) = 'ASM') and
+        else if FModernMode and (SameText(Token.Value, 'ASM')) and
                 ((Context.PeekNext = nil) or
                  (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) or
                  AsmStatementFollows) then
@@ -2411,7 +2537,7 @@ begin
           begin
             if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
                (Context.PeekNext.TokenType = ttIdentifier) and
-               (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ASM') then
+               (SameText(VarToStr(Context.PeekNext.Value), 'ASM')) then
             begin
               Context.Advance; Context.Advance;      // END ASM
               Break;
@@ -2423,12 +2549,12 @@ begin
         // FreeBASIC/QB "NAME old AS new" (rename). NAME is a bare identifier (not reserved, so it can
         // still be a variable/field); the trailing AS before end-of-statement disambiguates from an
         // assignment "name = ..." (no bare AS) and from "name" used as a value.
-        else if (UpperCase(Token.Value) = kNAME) and PeekNameHasAs then
+        else if (UpperFast(Token.Value) = kNAME) and PeekNameHasAs then
           Result := ParseNameStatement
         // FreeBASIC/QB "ERROR <n>" — raise a user runtime error. ERROR is a bare identifier (not
         // reserved); an argument (not '=' / '.' / '(' / '[' / end-of-statement) selects the statement
         // form and keeps "error" usable as a variable.
-        else if (UpperCase(Token.Value) = kERROR) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kERROR) and Assigned(Context.PeekNext) and
                 not (Context.PeekNext.TokenType in [ttOpEq, ttOpDot, ttDelimParOpen, ttDelimBrackOpen,
                                                     ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
           Result := ParseRaiseErrorStatement
@@ -2604,7 +2730,7 @@ begin
   // died in the assignment grammar on the missing '='. Three examples hang on it: gfx/cls-memset,
   // array/clear and proguide/dynamicmemory.
   // Synthesised into exactly the node the call form builds, so there is one lowering, not two.
-  if FModernMode and Context.Check(ttIdentifier) and (UpperCase(VarToStr(Token.Value)) = kCLEAR) and
+  if FModernMode and Context.Check(ttIdentifier) and (UpperFast(VarToStr(Token.Value)) = kCLEAR) and
      Assigned(Context.PeekNext) and
      (Context.PeekNext.TokenType <> ttOpEq) and (Context.PeekNext.TokenType <> ttDelimParOpen) and
      (Context.PeekNext.TokenType <> ttEndOfLine) and (Context.PeekNext.TokenType <> ttSeparStmt) then
@@ -2665,10 +2791,10 @@ begin
   // on and written back through the same variable. The dispatcher routes only these names here, and
   // only when a '(' follows; see the note at ttMathFunction for why "Cast( UInteger, i )" needed no arm.
   else if FModernMode and Context.Check(ttMathFunction) and
-    IsCastFunctionName(UpperCase(VarToStr(Token.Value))) and
+    IsCastFunctionName(UpperFast(VarToStr(Token.Value))) and
     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
   begin
-    CastFnName := UpperCase(VarToStr(Token.Value));
+    CastFnName := UpperFast(VarToStr(Token.Value));
     LeftSide := FExpressionParser.ParseExpression(precCall);
     LhsIsExpr := True;
     // ...and it is REWRITTEN into the CAST it means. "CUInt( i )" parses as an ordinary function call,
@@ -2698,13 +2824,13 @@ begin
     SavedToken := Context.CurrentToken;
     // A CONST is not an lvalue. fbc rejects this outright (error 119); we used to accept it, because
     // a module CONST lowered to a plain DIM and so really was a writable variable.
-    if FModernMode and (not FInConstDecl) and (FConstNames.IndexOf(UpperCase(Token.Value)) >= 0) then
+    if FModernMode and (not FInConstDecl) and (FConstNames.IndexOf(UpperFast(Token.Value)) >= 0) then
     begin
-      HandleError('Cannot modify a constant: ' + UpperCase(Token.Value), Token);
+      HandleError('Cannot modify a constant: ' + UpperFast(Token.Value), Token);
       Result := nil;
       Exit;
     end;
-    LeftSide := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
+    LeftSide := TASTNode.CreateWithValue(antIdentifier, UpperFast(Token.Value), Token);
     Context.Advance; // Consume identifier
     //WriteLn('DEBUG: Consumed identifier, next token: "', Context.CurrentToken.Value, '"');
   end
@@ -2712,7 +2838,7 @@ begin
   begin
     // Special variable like TI$ - can be assigned
     SavedToken := Context.CurrentToken;
-    LeftSide := TASTNode.CreateWithValue(antSpecialVariable, UpperCase(Token.Value), Token);
+    LeftSide := TASTNode.CreateWithValue(antSpecialVariable, UpperFast(Token.Value), Token);
     Context.Advance; // Consume special variable
   end
   else if Context.Check(ttOpAt) then
@@ -2818,7 +2944,7 @@ begin
     // there may be no binary Mod for the type at all. Without it the desugared form was lowered
     // against the record HANDLE and the statement did nothing visible: "x Mod= 5" left x unchanged
     // while "x += 3" ran the operator, one keyword apart. One rule, two spellings, one place each.
-    Result.Attributes.Values['COMPOUNDOP'] := UpperCase(OpSym);
+    Result.Attributes.Values['COMPOUNDOP'] := UpperFast(OpSym);
     DoNodeCreated(Result);
     Exit;
   end;
@@ -2951,7 +3077,7 @@ begin
   IsUsingFormat := False;
 
   // Check if this is PRINT USING
-  if UpperCase(Token.Value) = kUSING then
+  if UpperFast(Token.Value) = kUSING then
   begin
     // Standalone USING - create PRINT USING node
     Result := TASTNode.Create(antPrintUsing, Token);
@@ -2980,7 +3106,7 @@ begin
     end
     else
     // Check for USING keyword after PRINT
-    if Context.Check(ttOutputCommand) and (UpperCase(Context.CurrentToken.Value) = kUSING) then
+    if Context.Check(ttOutputCommand) and (UpperFast(Context.CurrentToken.Value) = kUSING) then
     begin
       Result.Free;
       Result := TASTNode.Create(antPrintUsing, Token);
@@ -3026,7 +3152,7 @@ begin
     // Carried as an antPrintUsing marker child (format at child 0); the SSA sets it as the current format.
     // The plain "Print Using ..." head form (whole statement) is handled above and is left untouched.
     if (not IsUsingFormat) and Context.Check(ttOutputCommand) and
-       (UpperCase(VarToStr(Context.CurrentToken.Value)) = kUSING) then
+       (UpperFast(VarToStr(Context.CurrentToken.Value)) = kUSING) then
     begin
       Context.Advance;                 // consume USING
       FormatNode := ParseExpression;   // format string
@@ -3572,7 +3698,7 @@ begin
   if not Context.Check(ttConditionalElse) then Exit;
   Tok := Context.CurrentToken;
 
-  if UpperCase(Tok.Value) = kELSEIF then
+  if UpperFast(Tok.Value) = kELSEIF then
   begin
     Context.Advance;                                   // consume ELSEIF
     ElseNode := TASTNode.Create(antElse, Tok);
@@ -3684,7 +3810,7 @@ begin
   // Method form (M4.1): SUB|FUNCTION Type.method(...) — qualified name "TYPE.METHOD" with an
   // implicit first parameter THIS AS Type (the instance handle).
   Token := Context.CurrentToken;
-  Kind := UpperCase(Token.Value);                 // 'SUB' or 'FUNCTION'
+  Kind := UpperFast(Token.Value);                 // 'SUB' or 'FUNCTION'
   Context.Advance;                                // consume SUB / FUNCTION
   Result := TASTNode.CreateWithValue(antProcedureDecl, Kind, Token);
 
@@ -3703,10 +3829,10 @@ begin
     //     label (owner read from THIS's type) exactly like the symbol form. Distinguished by "ident '.'".
     if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot) then
     begin
-      MethodType := UpperCase(VarToStr(Context.CurrentToken.Value));
+      MethodType := UpperFast(VarToStr(Context.CurrentToken.Value));
       Context.Advance;                              // <Type>
       Context.Advance;                              // '.'
-      OpSym := UpperCase(VarToStr(Context.CurrentToken.Value));   // operator name (CAST, LET, *=, ...)
+      OpSym := UpperFast(VarToStr(Context.CurrentToken.Value));   // operator name (CAST, LET, *=, ...)
       // A SELF-operator ("Operator T.*= (rhs)") arrives as the lexer's compound-assign token, whose value
       // is the bare symbol -- "*", not "*=". Spell the "=" back in, or the operator would be labelled
       // exactly like the binary "*" and the two could not be told apart.
@@ -3769,7 +3895,7 @@ begin
   // the declaration is accepted the user's procedure already wins at every call site. The extension
   // stays available to every program that does not declare one.
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(Context.CurrentToken.Value)) then
+     IsShadowableExtensionName(UpperFast(Context.CurrentToken.Value)) then
     Context.CurrentToken.TokenType := ttIdentifier;
 
   if not Context.Check(ttIdentifier) then
@@ -3786,7 +3912,7 @@ begin
   if Context.Check(ttIdentifier) then
   begin
     NameTok := Context.CurrentToken;
-    QualName := UpperCase(NameTok.Value);
+    QualName := UpperFast(NameTok.Value);
     Context.Advance;
     if (Kind = kCONSTRUCTOR) or (Kind = kDESTRUCTOR) then
     begin
@@ -3805,7 +3931,7 @@ begin
             (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
       begin
         Context.Advance;                          // '.'
-        QualName := QualName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+        QualName := QualName + '.' + UpperFast(VarToStr(Context.CurrentToken.Value));
         Context.Advance;                          // the next name of the owner
       end;
       MethodType := QualName;
@@ -3825,7 +3951,7 @@ begin
           (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
       begin
         MethodType := QualName;
-        QualName := MethodType + '.' + UpperCase(Context.CurrentToken.Value);
+        QualName := MethodType + '.' + UpperFast(Context.CurrentToken.Value);
         Context.Advance;                          // method name
         while Context.Check(ttOpDot) do
         begin
@@ -3834,7 +3960,7 @@ begin
                   ((Length(Context.CurrentToken.Value) > 0) and
                    (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_']))) then Break;
           MethodType := QualName;                 // the owner grows; the last name stays the method
-          QualName := MethodType + '.' + UpperCase(Context.CurrentToken.Value);
+          QualName := MethodType + '.' + UpperFast(Context.CurrentToken.Value);
           Context.Advance;
         end;
       end;
@@ -3852,7 +3978,7 @@ begin
   // loop, so a one-line body starting with an identifier is unaffected.)
   while Context.Check(ttIdentifier) do
   begin
-    DecoU := UpperCase(Context.CurrentToken.Value);
+    DecoU := UpperFast(Context.CurrentToken.Value);
     if (DecoU = 'CDECL') or (DecoU = 'STDCALL') or (DecoU = 'PASCAL') or
        (DecoU = 'FASTCALL') or (DecoU = 'THISCALL') or (DecoU = 'OVERLOAD') then
       Context.Advance
@@ -3909,7 +4035,7 @@ begin
       // named "OPTIONAL", which would shift every following argument by one slot. Only skip when it is
       // followed by another name or a BYVAL/BYREF qualifier, so a parameter literally named "optional"
       // ("optional AS T") is preserved.
-      if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'OPTIONAL') and
+      if Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'OPTIONAL')) and
          Assigned(Context.PeekNext) and
          ((Context.PeekNext.TokenType = ttIdentifier) or (Context.PeekNext.TokenType = ttParamMode)) then
         Context.Advance;                            // consume OPTIONAL keyword
@@ -3919,13 +4045,13 @@ begin
       ParamMode := '';
       if Context.Check(ttParamMode) then
       begin
-        ParamMode := UpperCase(Context.CurrentToken.Value);
+        ParamMode := UpperFast(Context.CurrentToken.Value);
         Context.Advance;
       end;
       if Context.Check(ttIdentifier) then
       begin
         ParamNode := TASTNode.CreateWithValue(antIdentifier,
-                       UpperCase(Context.CurrentToken.Value), Context.CurrentToken);
+                       UpperFast(Context.CurrentToken.Value), Context.CurrentToken);
         if ParamMode = kBYVAL then ParamNode.Attributes.Values['BYVAL'] := '1';
         // An explicit BYREF on a scalar parameter requests write-back (the callee's mutations are
         // copied back into the caller's variable argument). Recorded for the SSA call lowering; BYREF
@@ -3967,7 +4093,7 @@ begin
           else if AtDottedTypeName then
           begin
             RetTok := Context.CurrentToken;
-            ParamTypeName := UpperCase(ParseDottedName);
+            ParamTypeName := UpperFast(ParseDottedName);
             // FreeBASIC pointer parameter "<type> PTR" (one or more PTR): keep the PTR suffix on the type
             // name (the pointee bank is recorded from it) and — crucially — CONSUME the PTR token(s). Left
             // unconsumed, a following parameter list ("..., x As Integer") mis-parses: the stray "PTR" is
@@ -3989,7 +4115,7 @@ begin
         // string too. CLASSIC keeps its own convention (untouched).
         if FModernMode and (ParamMode = '') then
         begin
-          ParamNameU := UpperCase(VarToStr(ParamNode.Value));
+          ParamNameU := ParamNode.ValueUpper;
           if (ParamTypeName = 'STRING') or (ParamTypeName = 'ZSTRING') or (ParamTypeName = 'WSTRING') or
              ((ParamTypeName = '') and (Length(ParamNameU) > 0) and (ParamNameU[Length(ParamNameU)] = '$')) then
             ParamNode.Attributes.Values['BYREF'] := '1';
@@ -4047,7 +4173,7 @@ begin
     // byref is on the parameter, inside the parentheses - so the two stay unambiguous. The BYREF itself
     // is consumed by the function-result reader further down, which is where that rule lives.
     if Context.Check(ttAsType) or
-       (Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kBYREF)) then
+       (Context.Check(ttParamMode) and (UpperFast(VarToStr(Context.CurrentToken.Value)) = kBYREF)) then
     begin
       Kind := kFUNCTION;                           // getter returns the property value
       Result.Value := kFUNCTION;
@@ -4075,7 +4201,7 @@ begin
   if (Kind = kOPERATOR) and Assigned(NameNode) and (ParamList.ChildCount >= 1) and
      (ParamList.GetChild(0).ChildCount >= 1) then
   begin
-    OpOwnerType := UpperCase(VarToStr(ParamList.GetChild(0).GetChild(0).Value));
+    OpOwnerType := ParamList.GetChild(0).GetChild(0).ValueUpper;
     NameNode.Value := OpOwnerType + '.OPERATOR' + OpSym;
     if OpSymbolForm then
       NameNode.Value := VarToStr(NameNode.Value) + '@' + IntToStr(ParamList.ChildCount)
@@ -4093,14 +4219,14 @@ begin
   // FreeBASIC BYREF function result: "FUNCTION name(...) BYREF AS rettype" returns a reference (the
   // SSA lowers it to return an address; the caller reads/writes through it). Mark and consume BYREF.
   if (Kind = kFUNCTION) and Context.Check(ttParamMode) and
-     (UpperCase(Context.CurrentToken.Value) = kBYREF) and Assigned(NameNode) then
+     (UpperFast(Context.CurrentToken.Value) = kBYREF) and Assigned(NameNode) then
   begin
     Result.Attributes.Values['BYREFRET'] := '1';
     // ⭐ ...and REMEMBERED BY NAME, because a CALL to it is the one call whose result is not a
     // temporary. "Function f3() ByRef As Integer : Function = f2()" with f2 itself ByRef is a
     // reference handed straight on, and fbc compiles it; refused without this, the whole file died
     // at parse time (fbc suite functions/return-byref).
-    FByrefRetProcs.Add(ByrefRetKeyOf(UpperCase(VarToStr(NameNode.Value))));
+    FByrefRetProcs.Add(ByrefRetKeyOf(NameNode.ValueUpper));
     Context.Advance;                                // consume BYREF
   end;
 
@@ -4156,7 +4282,7 @@ begin
   // return type), which is why it is consumed here rather than in the decorator loop above. SedaiBasic
   // produces bytecode, not a DLL, so there is no export table: accept and ignore, so that real FreeBASIC
   // sources parse. EXPORT is not a reserved word, so a variable may still be called "export".
-  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kEXPORT) then
+  if Context.Check(ttIdentifier) and (UpperFast(VarToStr(Context.CurrentToken.Value)) = kEXPORT) then
     Context.Advance;
 
   // Arity-based constructor overloading (M4.4d): encode the explicit-parameter count in the label
@@ -4218,10 +4344,10 @@ begin
   // declaration is what says which it is, and the parser already records it in FTypeStaticMethods.
   if (Context.CurrentToken <> nil) and
      ((MethodType = '') or (FStaticMemberProcs.IndexOf(QualName) >= 0)) and
-     ((UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR) or
-      (UpperCase(VarToStr(Context.CurrentToken.Value)) = kDESTRUCTOR)) then
+     ((UpperFast(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR) or
+      (UpperFast(VarToStr(Context.CurrentToken.Value)) = kDESTRUCTOR)) then
   begin
-    if UpperCase(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR then
+    if UpperFast(VarToStr(Context.CurrentToken.Value)) = kCONSTRUCTOR then
       Result.Attributes.Values['MODCTOR'] := '1'
     else
       Result.Attributes.Values['MODDTOR'] := '1';
@@ -4240,10 +4366,10 @@ begin
   // treats each scalar local as static). EXPORT is accepted and ignored. Placed here (after the return
   // type) so it is on the signature line, before the body — distinct from a body-level "Static name AS T".
   while (Context.CurrentToken <> nil) and
-        ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC') or
-         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXPORT')) do
+        ((SameText(VarToStr(Context.CurrentToken.Value), 'STATIC')) or
+         (SameText(VarToStr(Context.CurrentToken.Value), 'EXPORT'))) do
   begin
-    if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC' then
+    if SameText(VarToStr(Context.CurrentToken.Value), 'STATIC') then
       Result.Attributes.Values['ALLSTATIC'] := '1';
     Context.Advance;
   end;
@@ -4269,7 +4395,7 @@ begin
   if not Context.Check(ttIdentifier) then
     Exit;                                         // malformed CALL: nothing to call
   NameTok := Context.CurrentToken;
-  Result := TASTNode.CreateWithValue(antProcedureCall, UpperCase(NameTok.Value), NameTok);
+  Result := TASTNode.CreateWithValue(antProcedureCall, UpperFast(NameTok.Value), NameTok);
   Context.Advance;                                // consume name
 
   ArgList := TASTNode.Create(antArgumentList, Token);
@@ -4354,7 +4480,7 @@ var
 begin
   NameTok := Context.CurrentToken;
   Token := NameTok;
-  Result := TASTNode.CreateWithValue(antProcedureCall, UpperCase(NameTok.Value), NameTok);
+  Result := TASTNode.CreateWithValue(antProcedureCall, UpperFast(NameTok.Value), NameTok);
   Context.Advance;                                // consume the SUB name
   ArgList := TASTNode.Create(antArgumentList, Token);
   Result.AddChild(ArgList);
@@ -4573,7 +4699,7 @@ begin
   Result := Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
             ((Context.PeekNext.TokenType = ttTypeDecl) or
              (Context.PeekNext.TokenType = ttUnionDecl) or
-             (UpperCase(VarToStr(Context.PeekNext.Value)) = 'INTERFACE'));
+             (SameText(VarToStr(Context.PeekNext.Value), 'INTERFACE')));
 end;
 
 procedure TPackratParser.ConsumeEndType;
@@ -4770,10 +4896,10 @@ begin
   // FreeBASIC "UNSIGNED <basetype>" modifier: map to the unsigned variant type name. A bare
   // "UNSIGNED" (no integer base type following) means UNSIGNED INTEGER. UNSIGNED is not a reserved
   // keyword (it tokenizes as an identifier), so handle it here at the central type-name reader.
-  if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'UNSIGNED' then
+  if SameText(VarToStr(Context.CurrentToken.Value), 'UNSIGNED') then
   begin
     Context.Advance;                                 // consume UNSIGNED
-    BaseU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    BaseU := UpperFast(VarToStr(Context.CurrentToken.Value));
     if (BaseU = 'INTEGER') or (BaseU = 'BYTE') or (BaseU = 'SHORT') or
        (BaseU = 'LONG') or (BaseU = 'LONGINT') then
     begin
@@ -4799,7 +4925,7 @@ begin
     Exit;
   end;
 
-  Result := UpperCase(VarToStr(Context.CurrentToken.Value));
+  Result := UpperFast(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // first segment
   if ApplyWidthSuffix(Result) then Exit;
   while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
@@ -4807,7 +4933,7 @@ begin
         (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
   begin
     Context.Advance;                                 // '.'
-    Result := Result + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+    Result := Result + '.' + UpperFast(VarToStr(Context.CurrentToken.Value));
     Context.Advance;                                 // segment
   end;
 end;
@@ -4828,7 +4954,7 @@ begin
   // ⛔ Only a name the program has actually DECLARED as a type: nothing else about the token's kind is
   // relaxed, so "As Const Integer" and "As Function(...)" keep meaning what they mean.
   if Assigned(Context.CurrentToken) and (VarToStr(Context.CurrentToken.Value) <> '') and
-     (FTypeNamesSeen.IndexOf(UpperCase(VarToStr(Context.CurrentToken.Value))) >= 0) then
+     (FTypeNamesSeen.IndexOf(UpperFast(VarToStr(Context.CurrentToken.Value))) >= 0) then
     Exit(True);
   Result := False;
   if not Context.Check(ttOpDot) then Exit;
@@ -4858,7 +4984,7 @@ begin
   // functions/mangling-procptr writes it in the parameter position.
   // ⚠️ Rewind if what follows the parenthesis is NOT a procedure type: "TypeOf( x )" over an ordinary
   // expression must still reach the readers that know how to answer it, having consumed nothing.
-  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+  if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and
      Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
   begin
     Context.SavePosition(TypeOfMark);
@@ -4870,7 +4996,7 @@ begin
     Result := False;
   end;
   if not Context.Check(ttProcedureStart) then Exit;
-  KindU := UpperCase(VarToStr(Context.CurrentToken.Value));
+  KindU := UpperFast(VarToStr(Context.CurrentToken.Value));
   if (KindU <> kFUNCTION) and (KindU <> kSUB) then Exit;
   IsFunc := (KindU = kFUNCTION);
   Context.Advance;                                   // consume FUNCTION / SUB
@@ -4879,11 +5005,11 @@ begin
   // did not, so the convention was read as the parameter list's opening name and the whole declaration
   // fell apart. One internal convention here, so they are accepted and ignored - as in the other path.
   while Context.Check(ttIdentifier) and
-        ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CDECL') or
-         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STDCALL') or
-         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PASCAL') or
-         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'FASTCALL') or
-         (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'THISCALL')) do
+        ((SameText(VarToStr(Context.CurrentToken.Value), 'CDECL')) or
+         (SameText(VarToStr(Context.CurrentToken.Value), 'STDCALL')) or
+         (SameText(VarToStr(Context.CurrentToken.Value), 'PASCAL')) or
+         (SameText(VarToStr(Context.CurrentToken.Value), 'FASTCALL')) or
+         (SameText(VarToStr(Context.CurrentToken.Value), 'THISCALL'))) do
     Context.Advance;
   ParamTypes := '';
   if Context.Check(ttDelimParOpen) then
@@ -4902,7 +5028,7 @@ begin
       if Context.Check(ttParamMode) then Context.Advance;  // optional BYVAL/BYREF
       // Optional parameter name before AS (FB allows both "as integer" and "x as integer").
       if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
-         (UpperCase(VarToStr(Context.PeekNext.Value)) = kAS) then
+         (UpperFast(VarToStr(Context.PeekNext.Value)) = kAS) then
         Context.Advance;                             // skip the parameter name
       PT := '';
       if Context.Check(ttAsType) then
@@ -4921,7 +5047,7 @@ begin
         // spellings and consumes nothing when it recognises neither, so the gate can simply admit it.
         if Context.Check(ttProcedureStart) or
            (Context.Check(ttIdentifier) and
-            (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+            (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and
             Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)) then
         begin
           NestedFp := TASTNode.Create(antIdentifier, Context.CurrentToken);
@@ -4933,7 +5059,7 @@ begin
         end;
         // A "TypeOf( expr )" that named no procedure type left the cursor where it was: the ordinary
         // name reader answers it, exactly as before.
-        if (PT = '') and Context.Check(ttIdentifier) then PT := UpperCase(ParseDottedName);
+        if (PT = '') and Context.Check(ttIdentifier) then PT := UpperFast(ParseDottedName);
         // Keep the "PTR" suffix on the parameter type (a "T PTR" param is an int address, not a T value).
         // Dropping it recorded a "Cat Ptr" parameter as "Cat", so the indirect call staged the argument
         // with UDT (by-value/handle) semantics instead of passing the pointer, corrupting the callee's arg.
@@ -4959,7 +5085,7 @@ begin
   // expected. What the pointer HOLDS is the same entry address either way, so the modifier is recorded and
   // the return type read as usual - a call through it dereferences by the callee's own protocol.
   if IsFunc and Context.Check(ttParamMode) and
-     (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+     (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF')) then
   begin
     Node.Attributes.Values['FPRETBYREF'] := '1';
     Context.Advance;                                 // BYREF
@@ -4968,7 +5094,7 @@ begin
   begin
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperCase(ParseDottedName);
+    if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperFast(ParseDottedName);
     // Keep the "PTR" suffix on the return type too (a "T PTR" return is an int address).
     while AtPointerSuffix do
     begin Node.Attributes.Values['FPRET'] := Node.Attributes.Values['FPRET'] + ' PTR'; Context.Advance; end;
@@ -5002,8 +5128,8 @@ begin
   // ⭐ The prefix the OVERLOAD decision is keyed on. Two "Function bar()" in two namespaces are two
   // names, not an overload set; without this both signed the same empty tail and one was discarded.
   PrevNs := FNsPrefix;
-  if FNsPrefix = '' then FNsPrefix := UpperCase(NsName)
-  else FNsPrefix := FNsPrefix + '.' + UpperCase(NsName);
+  if FNsPrefix = '' then FNsPrefix := UpperFast(NsName)
+  else FNsPrefix := FNsPrefix + '.' + UpperFast(NsName);
   try
 
   while not Context.Check(ttEndOfFile) do
@@ -5161,7 +5287,7 @@ var
   Key, Level, Prev: string;
 begin
   if (TypeNode = nil) or (MemberName = '') then Exit;
-  Level := UpperCase(CurAccess);
+  Level := UpperFast(CurAccess);
   if Level = '' then Level := 'PUBLIC';
   Key := 'ACCESS' + MemberDecoratorKey(MemberName);   // ONE spelling; see the note on the helper
   Prev := TypeNode.Attributes.Values[Key];
@@ -5201,13 +5327,13 @@ begin
   // it surfaced 300 lines later as "type A never declares F04" on the DEFINITION, a refusal of a
   // program fbc compiles. Consumed here, before the loop, so the decorator run that follows is read as
   // usual. What CONST MEANS on a method is a promise about THIS, which this VM does not enforce.
-  if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') and Assigned(Context.PeekNext) and
+  if (SameText(VarToStr(Context.CurrentToken.Value), 'CONST')) and Assigned(Context.PeekNext) and
      ((Context.PeekNext.TokenType = ttProcedureStart) or
-      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'VIRTUAL') or
-      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ABSTRACT') or
-      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'STATIC') or
-      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'OVERRIDE') or
-      (UpperCase(VarToStr(Context.PeekNext.Value)) = 'FINAL')) then
+      (SameText(VarToStr(Context.PeekNext.Value), 'VIRTUAL')) or
+      (SameText(VarToStr(Context.PeekNext.Value), 'ABSTRACT')) or
+      (SameText(VarToStr(Context.PeekNext.Value), 'STATIC')) or
+      (SameText(VarToStr(Context.PeekNext.Value), 'OVERRIDE')) or
+      (SameText(VarToStr(Context.PeekNext.Value), 'FINAL'))) then
   begin
     LeadingConst := True;
     Inc(DecoCount);
@@ -5221,9 +5347,9 @@ begin
   // legality is that the member is static). Every other decorator here is a non-reserved word, which is
   // why the test read as sufficient until something needed the answer.
   while Context.Check(ttIdentifier) or
-        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'STATIC') do
+        (SameText(VarToStr(Context.CurrentToken.Value), 'STATIC')) do
   begin
-    DecoU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    DecoU := UpperFast(VarToStr(Context.CurrentToken.Value));
     // ⛔ AT MOST ONE OF THE FOUR. ABSTRACT, STATIC, VIRTUAL and a LEADING CONST each declare a
     // different KIND of member, and fbc refuses every pair of them ("error 17"): abstract+virtual and
     // virtual+static are contradictions, and a CONST qualifier belongs AFTER the parameter list, so a
@@ -5264,7 +5390,7 @@ begin
   // this point, the decorator run having ended, which is why the "<> 'CONST'" arm in the loop above
   // never fires.
   if FModernMode and (DecoCount >= 1) and
-     (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST') then
+     (SameText(VarToStr(Context.CurrentToken.Value), 'CONST')) then
     HandleError('a method declaration takes at most one of ABSTRACT, STATIC, VIRTUAL and a leading ' +
       'CONST, and this one also says "CONST"', Context.CurrentToken);
   // ⛔ ...and CONST beside STATIC is refused in BOTH orders. A static method has no THIS for a CONST to
@@ -5278,7 +5404,7 @@ begin
   SawParam := False;
   if Context.Check(ttProcedureStart) then
   begin
-    MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+    MethName := UpperFast(VarToStr(Context.CurrentToken.Value));
     KindU := MethName;                                // the KIND word, before the name overwrites it
     Context.Advance;                                  // SUB / FUNCTION / PROPERTY / ...
     // CONSTRUCTOR and DESTRUCTOR ARE the method name; everything else names one next. A method name
@@ -5299,7 +5425,7 @@ begin
         // tell that the defect was in the NAME and not in the dispatcher.
         if MethName = kOPERATOR then
         begin
-          MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value));
+          MethName := MethName + UpperFast(VarToStr(Context.CurrentToken.Value));
           Context.Advance;
           // ...and the tail some WORD-named operators carry, spelled exactly as the DEFINITION side
           // spells it: "Mod=" and its family stop at the '=' (the lexer yields two tokens), and
@@ -5323,7 +5449,7 @@ begin
         end
         else
         begin
-          MethName := UpperCase(VarToStr(Context.CurrentToken.Value));
+          MethName := UpperFast(VarToStr(Context.CurrentToken.Value));
           Context.Advance;
         end;
       end
@@ -5336,7 +5462,7 @@ begin
       // where nothing looks it up - the same trap the CAST comment above records.
       else if MethName = kOPERATOR then
       begin
-        MethName := MethName + UpperCase(VarToStr(Context.CurrentToken.Value));
+        MethName := MethName + UpperFast(VarToStr(Context.CurrentToken.Value));
         // A self-operator arrives as the lexer's compound-assign token, whose value is the BARE symbol
         // ("*", not "*="): spell the '=' back in, or it is labelled exactly like the binary operator.
         if Context.Check(ttCompoundAssign) then MethName := MethName + '=';
@@ -5381,13 +5507,13 @@ begin
     if Assigned(TypeNode) then StampMemberAccess(TypeNode, MethName, CurAccess);
     // ...and record that this TYPE DECLARED this member, under the same key, so a definition can ask.
     if Assigned(TypeNode) and (VarToStr(TypeNode.Value) <> '') then
-      FTypeDeclaredMembers.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethKey);
+      FTypeDeclaredMembers.Add(TypeNode.ValueUpper + '.' + MethKey);
     // ⛔ PUBLIC ONLY, and that too is measured. A module constructor runs before the program does, so
     // fbc refuses to let a PRIVATE or PROTECTED member be one - "visibility/{private,protected}-module-
     // {ctor,dtor}" are four COMPILE_ONLY_FAIL tests of its suite, and accepting them cost exactly those
     // four. The access of this very declaration is in hand here; nothing else has to be asked.
     if IsStatic and Assigned(TypeNode) and ((CurAccess = '') or (CurAccess = 'PUBLIC')) then
-      FStaticMemberProcs.Add(UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName);
+      FStaticMemberProcs.Add(TypeNode.ValueUpper + '.' + MethName);
   end;
   // Walk what is left of the declaration, collecting the parameters' DEFAULT values on the way — they
   // are stated here and nowhere else, and the definition needs them. Parenthesis depth is tracked so a
@@ -5412,10 +5538,10 @@ begin
     // exists for two members that SHARE a name ("property v" declared twice, setter and getter), so a
     // per-name attribute cannot express it - the same wall ACCESS<NAME> above hits and answers MIXED to.
     else if (Depth <= 1) and Context.Check(ttIdentifier) and
-            (UpperCase(VarToStr(Context.CurrentToken.Value)) = kALIAS) and
+            (UpperFast(VarToStr(Context.CurrentToken.Value)) = kALIAS) and
             Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral) then
     begin
-      AliasStr := UpperCase(VarToStr(Context.PeekNext.Value));
+      AliasStr := UpperFast(VarToStr(Context.PeekNext.Value));
       Context.Advance;                                // ALIAS
       Context.Advance;                                // "name"
       Continue;
@@ -5452,7 +5578,7 @@ begin
   end;
   if Assigned(Defs) then
   begin
-    Key := UpperCase(VarToStr(TypeNode.Value)) + '.' + MethName;
+    Key := TypeNode.ValueUpper + '.' + MethName;
     if FTypeMethodDefaults.IndexOf(Key) >= 0 then Defs.Free   // overload: first declaration wins (v1)
     else FTypeMethodDefaults.AddObject(Key, Defs);
   end;
@@ -5561,9 +5687,9 @@ begin
       HandleError('Expected the alias name after the type', Context.CurrentToken);
       Result.Free; Result := nil; Exit;
     end;
-    Result.Value := UpperCase(Context.CurrentToken.Value);
+    Result.Value := UpperFast(Context.CurrentToken.Value);
     Context.Advance;
-    Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    Result.Attributes.Values['ALIAS'] := UpperFast(AliasType);
     // "Type As Integer a, b": ONE type, several names. FreeBASIC's own test suite writes it, and the
     // list simply ended the declaration here - the ',' was left where a statement was expected.
     // The extra aliases ride as CHILD antTypeDecl nodes marked ALIASLIST, which CollectUDTNames
@@ -5572,10 +5698,10 @@ begin
     begin
       Context.Advance;                              // ','
       if not Context.Check(ttIdentifier) then Break;
-      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperCase(Context.CurrentToken.Value),
+      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperFast(Context.CurrentToken.Value),
                                             Context.CurrentToken);
       Context.Advance;
-      AliasNode.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+      AliasNode.Attributes.Values['ALIAS'] := UpperFast(AliasType);
       AliasNode.Attributes.Values['ALIASLIST'] := '1';
       Result.AddChild(AliasNode);
     end;
@@ -5593,23 +5719,23 @@ begin
   if (not Context.Check(ttIdentifier)) and
      ((Context.CurrentToken = nil) or (VarToStr(Context.CurrentToken.Value) = '') or
       IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) or
-      not (UpperCase(VarToStr(Context.CurrentToken.Value))[1] in ['A'..'Z', '_'])) then
+      not (UpperFast(VarToStr(Context.CurrentToken.Value))[1] in ['A'..'Z', '_'])) then
   begin
     HandleError(Format('"%s" is a reserved word and cannot be used as a type name',
                        [Context.CurrentToken.Value]), Context.CurrentToken);
     Exit;
   end;
   NameTok := Context.CurrentToken;
-  Result := TASTNode.CreateWithValue(antTypeDecl, UpperCase(NameTok.Value), NameTok);
+  Result := TASTNode.CreateWithValue(antTypeDecl, UpperFast(NameTok.Value), NameTok);
   if IsUnion then Result.Attributes.Values['UNION'] := '1';
   // ⭐ Remember the NAME - a definition of one of its members has to be able to ask whether the type
   // exists at all, and a type that declares NOTHING would otherwise be indistinguishable from a type
   // nobody wrote. And remember whether it lives in a NAMESPACE, which decides a different question:
   // its constructor may not be defined naming it BARE from outside.
-  if FTypeNamesSeen.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
-    FTypeNamesSeen.Add(UpperCase(VarToStr(NameTok.Value)));
-  if FInNamespaceBody and (FTypesInNamespace.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0) then
-    FTypesInNamespace.Add(UpperCase(VarToStr(NameTok.Value)));
+  if FTypeNamesSeen.IndexOf(UpperFast(VarToStr(NameTok.Value))) < 0 then
+    FTypeNamesSeen.Add(UpperFast(VarToStr(NameTok.Value)));
+  if FInNamespaceBody and (FTypesInNamespace.IndexOf(UpperFast(VarToStr(NameTok.Value))) < 0) then
+    FTypesInNamespace.Add(UpperFast(VarToStr(NameTok.Value)));
   Context.Advance;                                  // consume type name
 
   // FreeBASIC type alias: "TYPE newname AS underlyingtype" — a one-line synonym with no field block
@@ -5647,14 +5773,14 @@ begin
         FExpressionParser.ParseExpression(precCall).Free;
       end;
     end;
-    Result.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+    Result.Attributes.Values['ALIAS'] := UpperFast(AliasType);
     // "Type t As Integer, u As Double": several aliases on one line, each with its own type. Same
     // shape as the leading-AS list above and the same carrier (a child marked ALIASLIST).
     while Context.Check(ttSeparParam) do
     begin
       Context.Advance;                              // ','
       if not Context.Check(ttIdentifier) then Break;
-      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperCase(Context.CurrentToken.Value),
+      AliasNode := TASTNode.CreateWithValue(antTypeDecl, UpperFast(Context.CurrentToken.Value),
                                             Context.CurrentToken);
       Context.Advance;                              // the alias name
       if not Context.Check(ttAsType) then begin AliasNode.Free; Break; end;
@@ -5665,7 +5791,7 @@ begin
         AliasType := AliasType + ' PTR';
         Context.Advance;
       end;
-      AliasNode.Attributes.Values['ALIAS'] := UpperCase(AliasType);
+      AliasNode.Attributes.Values['ALIAS'] := UpperFast(AliasType);
       AliasNode.Attributes.Values['ALIASLIST'] := '1';
       Result.AddChild(AliasNode);
     end;
@@ -5683,14 +5809,14 @@ begin
   begin
     Context.Advance;                                // consume EXTENDS
     if Context.Check(ttIdentifier) or Context.Check(ttOpDot) then
-      Result.Attributes.Values['EXTENDS'] := UpperCase(ParseDottedName);
+      Result.Attributes.Values['EXTENDS'] := UpperFast(ParseDottedName);
   end;
 
   // FreeBASIC field alignment header: "TYPE name [EXTENDS base] FIELD = n". Our record STORAGE is
   // slot-based and unaffected, but the value is recorded: the C byte layout the binary GET/PUT of a
   // whole instance writes is packed to it ("Field = 1" = no padding at all). FIELD is not a reserved
   // word; require the following '=' so a member named "field" (in the body) is unaffected.
-  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'FIELD') and
+  if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'FIELD')) and
      Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpEq) then
   begin
     Context.Advance;                                // consume FIELD
@@ -5717,7 +5843,7 @@ begin
   // because fbc has no interfaces to declare in the first place.)
   //
   // The names are recorded on the type node as IMPLEMENTS = 'I1,I2'; the SSA resolves them.
-  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'IMPLEMENTS') then
+  if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'IMPLEMENTS')) then
   begin
     Context.Advance;                                // consume IMPLEMENTS
     ImplList := '';
@@ -5728,7 +5854,7 @@ begin
           (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
       begin
         if ImplList <> '' then ImplList := ImplList + ',';
-        ImplList := ImplList + UpperCase(VarToStr(Context.CurrentToken.Value));
+        ImplList := ImplList + UpperFast(VarToStr(Context.CurrentToken.Value));
         Context.Advance;
       end
       else
@@ -5775,7 +5901,7 @@ begin
         if Assigned(NestedRec) then
         begin
           NestedRec.Attributes.Values['NESTEDTYPE'] := '1';
-          NestedRec.Attributes.Values['OUTERTYPE'] := UpperCase(VarToStr(Result.Value));
+          NestedRec.Attributes.Values['OUTERTYPE'] := Result.ValueUpper;
           Result.AddChild(NestedRec);
         end;
         Continue;
@@ -5815,7 +5941,7 @@ begin
       if Assigned(NestedRec) then
       begin
         NestedRec.Attributes.Values['NESTEDTYPE'] := '1';
-        NestedRec.Attributes.Values['OUTERTYPE'] := UpperCase(VarToStr(Result.Value));
+        NestedRec.Attributes.Values['OUTERTYPE'] := Result.ValueUpper;
         Result.AddChild(NestedRec);
       end;
       Continue;
@@ -5846,7 +5972,7 @@ begin
              (NestedEnum.GetChild(EnumIdx).ChildCount >= 1) and
              (NestedEnum.GetChild(EnumIdx).GetChild(0).NodeType = antIdentifier) then
             StampMemberAccess(Result,
-              UpperCase(VarToStr(NestedEnum.GetChild(EnumIdx).GetChild(0).Value)), CurAccess);
+              NestedEnum.GetChild(EnumIdx).GetChild(0).ValueUpper, CurAccess);
         Result.AddChild(NestedEnum);
       end;
       Continue;
@@ -5869,7 +5995,7 @@ begin
              (NestedConst.GetChild(EnumIdx).ChildCount >= 1) and
              (NestedConst.GetChild(EnumIdx).GetChild(0).NodeType = antIdentifier) then
             StampMemberAccess(Result,
-              UpperCase(VarToStr(NestedConst.GetChild(EnumIdx).GetChild(0).Value)), CurAccess);
+              NestedConst.GetChild(EnumIdx).GetChild(0).ValueUpper, CurAccess);
         Result.AddChild(NestedConst);
       end
       else
@@ -5877,7 +6003,7 @@ begin
       Continue;
     end;
     PrevIdx := Context.CurrentIndex;
-    TokU := UpperCase(VarToStr(Context.CurrentToken.Value));
+    TokU := UpperFast(VarToStr(Context.CurrentToken.Value));
     // FreeBASIC access specifiers inside a TYPE: "Public:" / "Private:" / "Protected:".
     // ⭐ They used to be recognised and SKIPPED - "access is not enforced (v1)" - which meant a field
     // written under Private: could be read from anywhere. fbc rejects that with "error 202: Illegal
@@ -5928,14 +6054,14 @@ begin
                 (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
         begin
           if TokU = kOPERATOR then
-            NoDeclKey := kOPERATOR + UpperCase(VarToStr(Context.PeekNext.Value))
+            NoDeclKey := kOPERATOR + UpperFast(VarToStr(Context.PeekNext.Value))
           else
-            NoDeclKey := UpperCase(VarToStr(Context.PeekNext.Value));
+            NoDeclKey := UpperFast(VarToStr(Context.PeekNext.Value));
         end
         else
           NoDeclKey := '';
         if NoDeclKey <> '' then
-          FTypeDeclaredMembers.Add(UpperCase(VarToStr(Result.Value)) + '.' +
+          FTypeDeclaredMembers.Add(Result.ValueUpper + '.' +
                                    MemberDecoratorKey(NoDeclKey));
       end;
       while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and (not AtEndType) do
@@ -5955,7 +6081,7 @@ begin
     begin
       Context.Advance;                              // consume STATIC
       IsStaticField := True;
-      TokU := UpperCase(VarToStr(Context.CurrentToken.Value));   // re-read: a DIM may follow STATIC
+      TokU := UpperFast(VarToStr(Context.CurrentToken.Value));   // re-read: a DIM may follow STATIC
     end;
     // FreeBASIC allows an in-TYPE field to be introduced with a leading DIM ("Dim As Double m(Any,Any)").
     // Consume it — the field grammar below handles both "As type name(dims)" and "name(dims) As type".
@@ -6029,7 +6155,7 @@ begin
           if Context.Check(ttDelimParClose) then Context.Advance;
         end;
       end;
-      FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
+      FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperFast(FieldTok.Value), FieldTok);
       TypeNode := TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok);
       FieldNode.AddChild(TypeNode);
       if FpIsFP then
@@ -6072,7 +6198,7 @@ begin
       if UnionGrpCur > 0 then FieldNode.Attributes.Values['UNIONGRP'] := IntToStr(UnionGrpCur);
       if StructGrpCur > 0 then FieldNode.Attributes.Values['STRUCTGRP'] := IntToStr(StructGrpCur);
       Result.AddChild(FieldNode);
-      StampMemberAccess(Result, UpperCase(VarToStr(FieldNode.Value)), CurAccess);
+      StampMemberAccess(Result, FieldNode.ValueUpper, CurAccess);
       // FreeBASIC "As <type> a, b, c": the leading-AS type is shared by every comma-separated name
       // (e.g. "As String name, value" -> both String). Only the As-first form shares this way; a
       // name-first field carries its own trailing "As type", so its comma is handled by re-parsing.
@@ -6092,7 +6218,7 @@ begin
             ArrDimNode := ParseDimensionList;
             if Context.Check(ttDelimParClose) then Context.Advance;
           end;
-          FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(FieldTok.Value), FieldTok);
+          FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperFast(FieldTok.Value), FieldTok);
           FieldNode.AddChild(TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok));
           if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
           if Assigned(ArrDimNode) then
@@ -6195,7 +6321,7 @@ begin
     // FreeBASIC "CASE lo TO hi" range: (sel >= lo) AND (sel <= hi). Comparison results are -1/0, so a
     // bitwise AND combines them correctly (as the OR chain below does for a value list). Without this,
     // the value parses as "CASE lo" and the leftover "TO hi" derails the case body.
-    if Context.Check(ttLoopControl) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TO') then
+    if Context.Check(ttLoopControl) and (SameText(VarToStr(Context.CurrentToken.Value), 'TO')) then
     begin
       Context.Advance;                                 // consume TO
       HighExpr := FExpressionParser.ParseExpression;   // hi
@@ -6259,7 +6385,7 @@ begin
   begin
     Context.Advance;                                // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONST' then Context.Advance;   // CONST
+    if SameText(VarToStr(Context.CurrentToken.Value), 'CONST') then Context.Advance;   // CONST
   end;
   Selector := ParseExpression;
 
@@ -6441,7 +6567,7 @@ begin
   end;
   Result.AddChild(StartExpr);
 
-  if not (Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO')) then
+  if not (Context.Check(ttLoopControl) and (SameText(Context.CurrentToken.Value, 'TO'))) then
   begin
     HandleError('Expected "TO" in FOR statement', Context.CurrentToken);
     Result.Free;
@@ -6461,7 +6587,7 @@ begin
   Result.AddChild(EndExpr);
 
   // Optional STEP
-  if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'STEP') then
+  if Context.Check(ttLoopControl) and (SameText(Context.CurrentToken.Value, 'STEP')) then
   begin
     Context.Advance; // Consume STEP
     StepExpr := ParseExpression;
@@ -6497,7 +6623,7 @@ begin
   if Context.Check(ttLoopControl) then
   begin
     CondToken := Context.CurrentToken;
-    ConditionType := UpperCase(CondToken.Value);
+    ConditionType := UpperFast(CondToken.Value);
     ConditionPosition := 'TOP';
     Context.Advance; // Consume WHILE or UNTIL
 
@@ -6528,14 +6654,14 @@ begin
     Result.AddChild(Body);
 
   // Consume LOOP
-  if Context.Match(ttLoopBlockEnd) and (UpperCase(Context.PreviousToken.Value) = 'LOOP') then
+  if Context.Match(ttLoopBlockEnd) and (SameText(Context.PreviousToken.Value, 'LOOP')) then
   begin
     // Check for condition after LOOP (LOOP UNTIL expr / LOOP WHILE expr)
     // Only if we don't already have a top condition
     if (ConditionType = '') and Context.Check(ttLoopControl) then
     begin
       CondToken := Context.CurrentToken;
-      ConditionType := UpperCase(CondToken.Value);
+      ConditionType := UpperFast(CondToken.Value);
       ConditionPosition := 'BOTTOM';
       Context.Advance; // Consume WHILE or UNTIL
 
@@ -6572,8 +6698,8 @@ begin
   // CBM BASIC v7 accepts the two-word form "GO TO": the "GO" keyword (kGO_TO)
   // is followed by a separate "TO" token which must be consumed here before the
   // line-number target, otherwise ParseExpression chokes on "TO".
-  if (UpperCase(Token.Value) = kGO_TO) and Assigned(Context.CurrentToken) and
-     (UpperCase(Context.CurrentToken.Value) = kTO) then
+  if (UpperFast(Token.Value) = kGO_TO) and Assigned(Context.CurrentToken) and
+     (UpperFast(Context.CurrentToken.Value) = kTO) then
     Context.Advance; // Consume TO
 
   Target := ParseExpression;
@@ -6641,7 +6767,7 @@ var
   Levels: Integer;
 begin
   Token := Context.CurrentToken;
-  Kw := UpperCase(Token.Value);
+  Kw := UpperFast(Token.Value);
   IsExit := Kw = kEXIT;
   IsContinue := Kw = kCONTINUE;
   Result := TASTNode.Create(antReturn, Token);
@@ -6657,12 +6783,12 @@ begin
     if not (Context.Check(ttEndOfFile) or Context.Check(ttEndOfLine) or Context.Check(ttSeparStmt)) then
     begin
       KindTok := Context.CurrentToken;
-      Result.Value := Kw + ' ' + UpperCase(KindTok.Value);
+      Result.Value := Kw + ' ' + UpperFast(KindTok.Value);
       Context.Advance;   // consume the kind keyword (SUB/FUNCTION/FOR/...)
       Levels := 1;
       // Additional ", <same-kind>" entries increase the target depth (loops only).
       while Context.Check(ttSeparParam) and Assigned(Context.PeekNext) and
-            (UpperCase(Context.PeekNext.Value) = UpperCase(KindTok.Value)) do
+            (UpperFast(Context.PeekNext.Value) = UpperFast(KindTok.Value)) do
       begin
         Context.Advance;   // comma
         Context.Advance;   // repeated kind word
@@ -6712,7 +6838,7 @@ begin
   // "END EXTERN" closes a linkage block whose body is parsed where it stands (see the EXTERN handler):
   // there is nothing to end, so consume the word and emit nothing. Without this the bare END halted the
   // program at the closing line of the block.
-  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXTERN') then
+  if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'EXTERN')) then
   begin
     Context.Advance;
     if FExternCDepth > 0 then Dec(FExternCDepth);
@@ -6743,9 +6869,9 @@ begin
   // identifier caught MACRO and ANY and let exactly those two through - which is the shape of half a
   // fix. The word itself is the test, and every word in the list is reserved, so no variable can
   // answer to it.
-  if IsStrayBlockCloser(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+  if IsStrayBlockCloser(UpperFast(VarToStr(Context.CurrentToken.Value))) then
   begin
-    HandleError('"End ' + UpperCase(VarToStr(Context.CurrentToken.Value)) +
+    HandleError('"End ' + UpperFast(VarToStr(Context.CurrentToken.Value)) +
                 '" closes a block that is not open here.', Context.CurrentToken);
     Context.Advance;
     Result.Free;
@@ -6753,7 +6879,7 @@ begin
     Exit;
   end;
   ExitArg := nil;
-  if (UpperCase(Token.Value) = kSYSTEM) and
+  if (UpperFast(Token.Value) = kSYSTEM) and
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
     ExitArg := ParseExpression
   else if FModernMode and Context.CheckAny([ttNumber, ttInteger, ttFloat, ttOpSub, ttDelimParOpen]) then
@@ -6829,7 +6955,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Handle CMD command specifically
   if CmdName = kCMD then
@@ -6960,7 +7086,7 @@ var
   Param: TASTNode;
 begin
   Token := Context.CurrentToken;
-  Result := TASTNode.CreateWithValue(antSetClock, UpperCase(Token.Value), Token);
+  Result := TASTNode.CreateWithValue(antSetClock, UpperFast(Token.Value), Token);
   Context.Advance; // Consume SETDATE/SETTIME
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
@@ -7030,7 +7156,7 @@ var
   EndKeyword: string;
 begin
   Token := Context.CurrentToken;
-  EndKeyword := UpperCase(Token.Value);
+  EndKeyword := UpperFast(Token.Value);
 
   // CLASSIC branch-LOOP: ParseDoStatement consumes its structural closer directly, so a LOOP
   // that arrives HERE while a DO body parse is on the stack sits inside a nested construct —
@@ -7133,7 +7259,7 @@ begin
 
   // A WHILE at statement start opens a WHILE...WEND loop (the DO WHILE / LOOP WHILE
   // modifier forms are consumed inside ParseDoStatement and never reach here).
-  if UpperCase(Token.Value) = kWHILE then
+  if UpperFast(Token.Value) = kWHILE then
   begin
     Result := ParseWhileStatement;
     Exit;
@@ -7168,19 +7294,19 @@ begin
   // LOCAL is accepted and treated as a global handler in v1 (no per-procedure scoping).
   // ERROR/LOCAL are matched by token value (not reserved keywords).
   IsLocal := False;
-  if UpperCase(Context.CurrentToken.Value) = 'LOCAL' then
+  if SameText(Context.CurrentToken.Value, 'LOCAL') then
   begin
     IsLocal := True;
     Context.Advance; // consume LOCAL
   end;
-  if UpperCase(Context.CurrentToken.Value) = kERROR then
+  if UpperFast(Context.CurrentToken.Value) = kERROR then
   begin
     Context.Advance; // consume ERROR
     Result := TASTNode.Create(antOnError, Token);
     if IsLocal then
       Result.Value := 'LOCAL';
     // Expect GOTO (matched by value to be robust to token classification)
-    if UpperCase(Context.CurrentToken.Value) = kGOTO then
+    if UpperFast(Context.CurrentToken.Value) = kGOTO then
     begin
       Context.Advance; // consume GOTO
       TargetNode := ParseExpression;  // label identifier, or line number (0 disables)
@@ -7221,8 +7347,8 @@ begin
   Context.Advance; // Consume GOTO/GOSUB
 
   // Two-word "GO TO" form: consume the trailing TO after the GO keyword.
-  if (UpperCase(JumpToken.Value) = kGO_TO) and Assigned(Context.CurrentToken) and
-     (UpperCase(Context.CurrentToken.Value) = kTO) then
+  if (UpperFast(JumpToken.Value) = kGO_TO) and Assigned(Context.CurrentToken) and
+     (UpperFast(Context.CurrentToken.Value) = kTO) then
     Context.Advance; // Consume TO
 
   // Create appropriate node type
@@ -7303,7 +7429,7 @@ begin
     // Check for BEND - end of block
     if Context.Check(ttBlockEnd) then
     begin
-      EndKeyword := UpperCase(Context.CurrentToken.Value);
+      EndKeyword := UpperFast(Context.CurrentToken.Value);
 
       // Validate and pop block stack
       FValidationStacks.ValidateBlockEnd(EndKeyword);
@@ -7359,7 +7485,7 @@ var
   EndKeyword: string;
 begin
   Token := Context.CurrentToken;
-  EndKeyword := UpperCase(Token.Value);
+  EndKeyword := UpperFast(Token.Value);
 
   // *** VALIDATE BLOCK END ***
   if not FValidationStacks.ValidateBlockEnd(EndKeyword) then
@@ -7405,7 +7531,7 @@ begin
   // ⭐ "Poke TypeOf(b), p, 123": the type is ASKED, not written - the same shape CAST, "type<>" and now
   // PEEK read, with the operand kept as a CHILD for the SSA to resolve. Both halves of the pair need it
   // or one spelling of the same test compiles and the other does not.
-  if Context.Check(ttIdentifier) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+  if Context.Check(ttIdentifier) and (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and
      Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
   begin
     Context.Advance;                                  // TypeOf
@@ -7426,9 +7552,9 @@ begin
     end;
   end
   else if Context.Check(ttIdentifier) and IsBuiltinTypeName(VarToStr(Context.CurrentToken.Value)) and
-     (UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'STRING') then
+     ((not SameText(VarToStr(Context.CurrentToken.Value), 'STRING'))) then
   begin
-    TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
+    TypeStr := UpperFast(VarToStr(Context.CurrentToken.Value));
     Context.Advance;
     if Context.Check(ttSeparParam) then
       Context.Advance                                 // consume ',' after the datatype
@@ -7481,7 +7607,7 @@ var
   Param1, Param2: TASTNode;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // SWAP is dialect-dependent: here (reached only in CLASSIC, or in MODERN for a non-SWAP command)
   // it is the C128 RAM-bank memory command. In MODERN, SWAP a,b is intercepted earlier by the dialect
@@ -7545,7 +7671,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
   TargetNode := nil;
 
   // Select appropriate node type based on command
@@ -7560,7 +7686,7 @@ begin
     // FreeBASIC CIRCLE (x,y),r[,color] vs C128 CIRCLE source,x,y,... — disambiguated by the parenthesis
     // (or a leading STEP "CIRCLE STEP(x,y),r", or the image-target form "CIRCLE img,(x,y),r").
     if (Assigned(Context.PeekNext) and
-        ((Context.PeekNext.TokenType = ttDelimParOpen) or (UpperCase(Context.PeekNext.Value) = kSTEP))) or
+        ((Context.PeekNext.TokenType = ttDelimParOpen) or (UpperFast(Context.PeekNext.Value) = kSTEP))) or
        LooksLikeImageTarget then
       Result := TASTNode.Create(antGfxCircle, Token)
     else
@@ -7573,7 +7699,7 @@ begin
     // MODERN only - v7 has no DRAW STRING, and a CLASSIC program is entitled to a variable called
     // STRING no more than a MODERN one is, but the dialect gate keeps the two decisions apart.
     if FModernMode and Assigned(Context.PeekNext) and
-       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'STRING') then
+       (SameText(VarToStr(Context.PeekNext.Value), 'STRING')) then
     begin
       Result := TASTNode.Create(antGfxDrawString, Token);
       // Consume DRAW here; the shared Advance below this if-chain then consumes STRING, so both words
@@ -7615,7 +7741,7 @@ begin
     // col1,row1,col2,row2 — disambiguated by a leading '(' / SCREEN keyword, or a bare WINDOW (no args:
     // C128 WINDOW always has arguments, so a bare WINDOW is the FB "disable" form).
     if (not Assigned(Context.PeekNext)) or
-       (Context.PeekNext.TokenType = ttDelimParOpen) or (UpperCase(Context.PeekNext.Value) = 'SCREEN') or
+       (Context.PeekNext.TokenType = ttDelimParOpen) or (SameText(Context.PeekNext.Value, 'SCREEN')) or
        (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       Result := TASTNode.Create(antGfxWindow, Token)
     else
@@ -7650,7 +7776,7 @@ begin
   else if CmdName = 'VIEW' then
   begin
     // FB graphics VIEW [SCREEN] [(x1,y1)-(x2,y2)] vs "VIEW PRINT" (the text print area / scroll region).
-    if Assigned(Context.PeekNext) and (UpperCase(Context.PeekNext.Value) = 'PRINT') then
+    if Assigned(Context.PeekNext) and (SameText(Context.PeekNext.Value, 'PRINT')) then
       Result := TASTNode.Create(antViewPrint, Token)
     else
       Result := TASTNode.Create(antGfxView, Token);
@@ -7714,13 +7840,13 @@ begin
   if (CmdName = 'PSET') or (CmdName = 'PRESET') or (Result.NodeType = antGfxPaint) then
   begin
     // FreeBASIC image draw target: "PSET img, (x,y)" — an image handle before the coordinate.
-    if (not Context.Check(ttDelimParOpen)) and (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+    if (not Context.Check(ttDelimParOpen)) and (UpperFast(Context.CurrentToken.Value) <> kSTEP) then
     begin
       TargetNode := ParseExpression;                              // image handle
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
     end;
     // FreeBASIC STEP: the coordinate is relative to the current graphics point.
-    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    if UpperFast(Context.CurrentToken.Value) = kSTEP then
     begin
       Result.Attributes.Values['STEP'] := '1';
       Context.Advance;                                            // STEP
@@ -7762,12 +7888,12 @@ begin
   begin
     // Image draw target: "Draw String img, (x,y), s". Same convention as PSET/CIRCLE - appended last,
     // its index in TARGETIDX - so it rides on the existing SetTarget pair with nothing new to lower.
-    if (not Context.Check(ttDelimParOpen)) and (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+    if (not Context.Check(ttDelimParOpen)) and (UpperFast(Context.CurrentToken.Value) <> kSTEP) then
     begin
       TargetNode := ParseExpression;                              // image handle
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
     end;
-    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    if UpperFast(Context.CurrentToken.Value) = kSTEP then
     begin
       Result.Attributes.Values['STEP'] := '1';
       Context.Advance;                                            // STEP
@@ -7815,13 +7941,13 @@ begin
   if Result.NodeType = antGfxCircle then
   begin
     // FreeBASIC image draw target: "CIRCLE img, (x,y), r".
-    if (not Context.Check(ttDelimParOpen)) and (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+    if (not Context.Check(ttDelimParOpen)) and (UpperFast(Context.CurrentToken.Value) <> kSTEP) then
     begin
       TargetNode := ParseExpression;                              // image handle
       if Context.Check(ttSeparParam) then Context.Advance;        // ','
     end;
     // FreeBASIC STEP: the centre is relative to the current graphics point.
-    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    if UpperFast(Context.CurrentToken.Value) = kSTEP then
     begin
       Result.Attributes.Values['STEP'] := '1';
       Context.Advance;                                            // STEP
@@ -7852,7 +7978,7 @@ begin
       else
       begin
         // Distinguish a bare "F" fill flag (last, unquoted identifier) from a value expression.
-        if (Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'F')) and
+        if (Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'F'))) and
            (not Assigned(Context.PeekNext) or
             (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
         begin
@@ -7877,7 +8003,7 @@ begin
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;
-      if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'F') then
+      if Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'F')) then
       begin
         Result.Attributes.Values['FILL'] := '1';
         Context.Advance;
@@ -7907,7 +8033,7 @@ begin
       Result.Attributes.Values['OP'] := 'RESET'
     else
     begin
-      if UpperCase(Context.CurrentToken.Value) = 'GET' then
+      if SameText(Context.CurrentToken.Value, 'GET') then
       begin
         Result.Attributes.Values['OP'] := 'GET';
         Context.Advance;                                          // GET
@@ -7918,7 +8044,7 @@ begin
       // The comment above used to say "PALETTE USING deferred"; fbc's own gfx/palette is written with
       // it and with nothing else. The array name is taken as a bare identifier - it is an array, not an
       // expression - and the OP becomes USINGGET / USINGSET so the lowering knows which way it runs.
-      if UpperCase(Context.CurrentToken.Value) = 'USING' then
+      if SameText(Context.CurrentToken.Value, 'USING') then
       begin
         Context.Advance;                                          // USING
         if Result.Attributes.Values['OP'] = 'GET' then
@@ -7937,7 +8063,7 @@ begin
              (Context.PeekToken(2).TokenType = ttDelimParClose))) then
         begin
           Result.AddChild(TASTNode.CreateWithValue(antIdentifier,
-            UpperCase(Context.CurrentToken.Value), Context.CurrentToken));
+            UpperFast(Context.CurrentToken.Value), Context.CurrentToken));
           Context.Advance;
           // "PALETTE USING a()" - the empty parentheses are allowed and mean the same array.
           if Context.Check(ttDelimParOpen) and Assigned(Context.PeekNext) and
@@ -8107,7 +8233,7 @@ begin
   // y-flip) is recorded in the SCREEN attribute; no bounds = disable. Children: x1, y1, x2, y2.
   if Result.NodeType = antGfxWindow then
   begin
-    if UpperCase(Context.CurrentToken.Value) = 'SCREEN' then
+    if SameText(Context.CurrentToken.Value, 'SCREEN') then
     begin
       Result.Attributes.Values['SCREEN'] := '1';
       Context.Advance;                                         // SCREEN
@@ -8160,7 +8286,7 @@ begin
   // offset); no bounds = reset to full screen. Children: x1, y1, x2, y2. (Optional fill/border deferred.)
   if Result.NodeType = antGfxView then
   begin
-    if UpperCase(Context.CurrentToken.Value) = 'SCREEN' then
+    if SameText(Context.CurrentToken.Value, 'SCREEN') then
     begin
       Result.Attributes.Values['SCREEN'] := '1';
       Context.Advance;                                         // SCREEN
@@ -8194,12 +8320,12 @@ begin
   // The leading VIEW was consumed by the caller; PRINT is still on the token stream.
   if Result.NodeType = antViewPrint then
   begin
-    if UpperCase(Context.CurrentToken.Value) = 'PRINT' then
+    if SameText(Context.CurrentToken.Value, 'PRINT') then
       Context.Advance;                                          // PRINT
     if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
       Result.AddChild(ParseExpression);                         // firstrow
-      if Context.Check(ttLoopControl) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = kTO) then
+      if Context.Check(ttLoopControl) and (UpperFast(VarToStr(Context.CurrentToken.Value)) = kTO) then
       begin
         Context.Advance;                                        // TO
         Result.AddChild(ParseExpression);                       // lastrow
@@ -8322,7 +8448,7 @@ begin
     end;
 
     // Parse TO x2, y2 segments (can have multiple)
-    while Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = 'TO') do
+    while Context.Check(ttLoopControl) and (SameText(Context.CurrentToken.Value, 'TO')) do
     begin
       Context.Advance; // consume TO
       // Parse x, y coordinates
@@ -8391,7 +8517,7 @@ var
   MovsprMode: Integer;  // 0=abs, 1=rel, 2=polar, 3=auto
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
   MovsprMode := 0;
 
   // Select appropriate node type based on command
@@ -8526,7 +8652,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Select appropriate node type based on command
   if CmdName = 'VOL' then
@@ -8613,7 +8739,7 @@ var
   WrapK, WrapDepth: Integer;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Recognize file operation commands
   case CmdName of
@@ -8662,7 +8788,7 @@ begin
     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
     begin
       // consume an expression, a comma, or a TO (record range) token
-      if Context.Check(ttSeparParam) or (Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = kTO)) then
+      if Context.Check(ttSeparParam) or (Context.Check(ttLoopControl) and (UpperFast(Context.CurrentToken.Value) = kTO)) then
         Context.Advance
       else
       begin
@@ -8719,22 +8845,22 @@ begin
     // fact that it is a pipe travels in the MODE string as a 'P' marker, which the runtime reads the
     // way it already reads 'L' and the encoding markers. DIVERGENZE 180.
     IsPipe := False;
-    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PIPE') and Assigned(Context.PeekNext) and
+    if (SameText(VarToStr(Context.CurrentToken.Value), 'PIPE')) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType <> ttDelimParOpen) and
        (Context.PeekNext.TokenType <> ttOpEq) then
     begin
       Context.Advance;                      // PIPE
       IsPipe := True;
     end;
-    if ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
-        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'SCRN') or
-        (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ERR')) and
+    if ((SameText(VarToStr(Context.CurrentToken.Value), 'CONS')) or
+        (SameText(VarToStr(Context.CurrentToken.Value), 'SCRN')) or
+        (SameText(VarToStr(Context.CurrentToken.Value), 'ERR'))) and
        Assigned(Context.PeekNext) and
-       ((UpperCase(VarToStr(Context.PeekNext.Value)) = kFOR) or
-        (UpperCase(VarToStr(Context.PeekNext.Value)) = kAS)) then
+       ((UpperFast(VarToStr(Context.PeekNext.Value)) = kFOR) or
+        (UpperFast(VarToStr(Context.PeekNext.Value)) = kAS)) then
     begin
       Param := TASTNode.CreateWithValue(antLiteral,
-                 UpperCase(VarToStr(Context.CurrentToken.Value)) + ':', Context.CurrentToken);
+                 UpperFast(VarToStr(Context.CurrentToken.Value)) + ':', Context.CurrentToken);
       Context.Advance;            // the device name
     end
     else
@@ -8773,7 +8899,7 @@ begin
         if C64CommaPos > 0 then
         begin
           C64Base := Copy(C64Name, 1, C64CommaPos - 1);
-          C64Rest := UpperCase(Copy(C64Name, C64CommaPos + 1, MaxInt));   // "S,W" / "W" / "S,R" ...
+          C64Rest := UpperFast(Copy(C64Name, C64CommaPos + 1, MaxInt));   // "S,W" / "W" / "S,R" ...
           if (C64Rest = 'W') or (Pos(',W', C64Rest) > 0) then ModeStr := 'W'
           else if (C64Rest = 'A') or (Pos(',A', C64Rest) > 0) then ModeStr := 'A'
           else if (C64Rest = 'R') or (Pos(',R', C64Rest) > 0) then ModeStr := 'R';
@@ -8795,10 +8921,10 @@ begin
     end;
 
     ModeStr := 'R';
-    if UpperCase(Context.CurrentToken.Value) = kFOR then
+    if UpperFast(Context.CurrentToken.Value) = kFOR then
     begin
       Context.Advance;            // FOR
-      MW := UpperCase(Context.CurrentToken.Value);
+      MW := UpperFast(Context.CurrentToken.Value);
       if MW = kINPUT then ModeStr := 'R'
       else if MW = kOUTPUT then ModeStr := 'W'
       else if MW = kAPPEND then ModeStr := 'A'
@@ -8822,7 +8948,7 @@ begin
     // that changes nothing on its own changed the meaning of the one before it.
     EncMark := '';
     EncExpr := nil;
-    if UpperCase(Context.CurrentToken.Value) = kENCODING then
+    if UpperFast(Context.CurrentToken.Value) = kENCODING then
     begin
       Context.Advance;            // ENCODING
       if Context.Check(ttStringLiteral) then
@@ -8842,13 +8968,13 @@ begin
     // we model: it makes the open READ-ONLY, so a MISSING file is an error where a plain "For Binary"
     // would create it. It is carried on the mode string as a trailing '<'. WRITE and READ WRITE keep the
     // mode's own behaviour (the VM enforces no share rights).
-    if UpperCase(Context.CurrentToken.Value) = kACCESS then
+    if UpperFast(Context.CurrentToken.Value) = kACCESS then
     begin
       Context.Advance;            // ACCESS
       AccessRead := False;
-      if UpperCase(Context.CurrentToken.Value) = kREAD then
+      if UpperFast(Context.CurrentToken.Value) = kREAD then
       begin AccessRead := True; Context.Advance; end;
-      if UpperCase(Context.CurrentToken.Value) = kWRITE then
+      if UpperFast(Context.CurrentToken.Value) = kWRITE then
       begin AccessRead := False; Context.Advance; end;
       // Not on RANDOM: there the mode is 'L' and the record length is appended to it in the SSA, so a
       // marker in between would be read as part of the number.
@@ -8859,15 +8985,15 @@ begin
     if (EncMark <> '') and (ModeStr <> 'L') then ModeStr := ModeStr + EncMark;
     // Optional lock_type clause (FreeBASIC): "SHARED" or "LOCK {READ|WRITE|READ WRITE}" — accepted and
     // ignored (single-process VM, no file locking).
-    if UpperCase(Context.CurrentToken.Value) = kSHARED then
+    if UpperFast(Context.CurrentToken.Value) = kSHARED then
       Context.Advance             // SHARED
-    else if UpperCase(Context.CurrentToken.Value) = kLOCK then
+    else if UpperFast(Context.CurrentToken.Value) = kLOCK then
     begin
       Context.Advance;            // LOCK
-      if UpperCase(Context.CurrentToken.Value) = kREAD then Context.Advance;
-      if UpperCase(Context.CurrentToken.Value) = kWRITE then Context.Advance;
+      if UpperFast(Context.CurrentToken.Value) = kREAD then Context.Advance;
+      if UpperFast(Context.CurrentToken.Value) = kWRITE then Context.Advance;
     end;
-    if (UpperCase(Context.CurrentToken.Value) = kAS) or Context.Check(ttAsType) then
+    if (UpperFast(Context.CurrentToken.Value) = kAS) or Context.Check(ttAsType) then
       Context.Advance;            // AS
       SkipTypeQualifiers;                     // FB: "As Const <type>"
     if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
@@ -8876,7 +9002,7 @@ begin
     if not Assigned(HandleNode) then
     begin HandleError('Expected file number after AS', Token); Exit; end;
     LenExpr := nil;
-    if UpperCase(Context.CurrentToken.Value) = kLEN then    // optional "LEN = reclen" (RANDOM)
+    if UpperFast(Context.CurrentToken.Value) = kLEN then    // optional "LEN = reclen" (RANDOM)
     begin
       Context.Advance;
       if Context.Check(ttOpEq) then Context.Advance;
@@ -9034,7 +9160,7 @@ begin
         if Context.Check(ttIdentifier) and (Length(Context.CurrentToken.Value) = 1) and
            (UpCase(Context.CurrentToken.Value[1]) in ['R', 'W', 'A', 'B', 'L']) then
         begin
-          ModeStr := UpperCase(Context.CurrentToken.Value);
+          ModeStr := UpperFast(Context.CurrentToken.Value);
           Context.Advance;
           // Relative file "DOPEN#lf,"name",L,reclen": fold the record length into the mode string ("L10").
           if (ModeStr = 'L') and Context.Check(ttSeparParam) then
@@ -9244,7 +9370,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Recognize file management commands
   // ⛔ "Dir( path, mask, @attr )" IN MODERN IS THE FUNCTION, called as a statement and its result
@@ -9311,7 +9437,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Handle GET# and INPUT# commands
   if CmdName = kGETN then
@@ -9448,7 +9574,7 @@ var
 begin
   Tok := Context.CurrentToken;
   Context.Advance;  // LINE
-  CombinedHash := (UpperCase(Context.CurrentToken.Value) = kINPUTN);   // 'INPUT#' already carries the '#'
+  CombinedHash := (UpperFast(Context.CurrentToken.Value) = kINPUTN);   // 'INPUT#' already carries the '#'
   Context.Advance;  // INPUT or INPUT#
   if (not CombinedHash) and
      not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
@@ -9506,7 +9632,7 @@ begin
   TargetNode := nil;
   // FreeBASIC image draw target: "LINE img, (x1,y1)-(x2,y2)".
   if (not Context.Check(ttDelimParOpen)) and (not Context.Check(ttOpSub)) and
-     (UpperCase(Context.CurrentToken.Value) <> kSTEP) then
+     (UpperFast(Context.CurrentToken.Value) <> kSTEP) then
   begin
     // The two shapes that meet here - a called member and an INDEXED name - are told apart in
     // ParseDrawTargetExpr, which is the one place that reads a graphics statement's image handle.
@@ -9525,7 +9651,7 @@ begin
   else
   begin
     // FreeBASIC STEP: the start point is relative to the current graphics point.
-    if UpperCase(Context.CurrentToken.Value) = kSTEP then
+    if UpperFast(Context.CurrentToken.Value) = kSTEP then
     begin
       Result.Attributes.Values['STEP1'] := '1';
       Context.Advance;                                        // STEP
@@ -9538,7 +9664,7 @@ begin
   end;
   if Context.Check(ttOpSub) then Context.Advance;           // '-'
   // FreeBASIC STEP on the end point: relative to the FIRST point (x1,y1), not the current point.
-  if UpperCase(Context.CurrentToken.Value) = kSTEP then
+  if UpperFast(Context.CurrentToken.Value) = kSTEP then
   begin
     Result.Attributes.Values['STEP2'] := '1';
     Context.Advance;                                          // STEP
@@ -9555,10 +9681,10 @@ begin
   begin
     Context.Advance;                                        // first ','
     IsFlagToken := Context.Check(ttIdentifier) and
-      ((UpperCase(Context.CurrentToken.Value) = 'B') or (UpperCase(Context.CurrentToken.Value) = 'BF'));
+      ((SameText(Context.CurrentToken.Value, 'B')) or (SameText(Context.CurrentToken.Value, 'BF')));
     if IsFlagToken then
     begin
-      Result.Attributes.Values['SHAPE'] := UpperCase(Context.CurrentToken.Value);
+      Result.Attributes.Values['SHAPE'] := UpperFast(Context.CurrentToken.Value);
       Context.Advance;
     end
     else if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
@@ -9571,9 +9697,9 @@ begin
     begin
       Context.Advance;                                      // second ','
       if Context.Check(ttIdentifier) and
-         ((UpperCase(Context.CurrentToken.Value) = 'B') or (UpperCase(Context.CurrentToken.Value) = 'BF')) then
+         ((SameText(Context.CurrentToken.Value, 'B')) or (SameText(Context.CurrentToken.Value, 'BF'))) then
       begin
-        Result.Attributes.Values['SHAPE'] := UpperCase(Context.CurrentToken.Value);
+        Result.Attributes.Values['SHAPE'] := UpperFast(Context.CurrentToken.Value);
         Context.Advance;
       end;
     end;
@@ -9617,7 +9743,7 @@ begin
   // expression"): the rule the other five had, and this one did not (fbc suite
   // quirk/gfx_propertiesasbuffers).
   TargetNode := nil;
-  if (not Context.Check(ttDelimParOpen)) and (UpperCase(VarToStr(Context.CurrentToken.Value)) <> kSTEP) then
+  if (not Context.Check(ttDelimParOpen)) and (UpperFast(VarToStr(Context.CurrentToken.Value)) <> kSTEP) then
   begin
     TargetNode := ParseExpression;                            // image handle
     if Context.Check(ttSeparParam) then Context.Advance;      // ','
@@ -9637,7 +9763,7 @@ begin
   if Context.Check(ttSeparParam) then
   begin
     Context.Advance;                                          // ','
-    ModeStr := UpperCase(Context.CurrentToken.Value);
+    ModeStr := UpperFast(Context.CurrentToken.Value);
     if ModeStr = 'PSET' then ModeOrd := 0
     // PRESET is the 1's complement of the source, NOT a synonym for PSET: it was folded into PSET
     // here, so "Put ..., PReset" copied the image unnegated.
@@ -9835,7 +9961,7 @@ var
 begin
   Result := False;
   T1 := Context.PeekToken(1);
-  if (T1 = nil) or (T1.TokenType = ttDelimParOpen) or (UpperCase(VarToStr(T1.Value)) = kSTEP) then Exit;
+  if (T1 = nil) or (T1.TokenType = ttDelimParOpen) or (UpperFast(VarToStr(T1.Value)) = kSTEP) then Exit;
   // ⛔⛔ ...AND AN INDEX IS THE THIRD SHAPE, after the bare name and the dotted chain (DIVERGENZE 146).
   // A handle kept in an ARRAY is how a program holds several surfaces, and it is how fbc's own
   // gfx/image-expr holds them: "Line array(0), (0,0)-(w,h), c, bf" failed this test, was never
@@ -9910,7 +10036,7 @@ begin
     begin
       N := Context.PeekToken(k + 1);
       if (N <> nil) and (N.TokenType = ttIdentifier) and
-         (UpperCase(VarToStr(N.Value)) = 'ASM') then Exit(True);   // END ASM reached, nothing between
+         (SameText(VarToStr(N.Value), 'ASM')) then Exit(True);   // END ASM reached, nothing between
       Exit;
     end;
     Exit;                                                       // a real token: not empty
@@ -9924,7 +10050,7 @@ begin
   begin
     if Context.Check(ttProgramEnd) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttIdentifier) and
-       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ASM') then
+       (SameText(VarToStr(Context.PeekNext.Value), 'ASM')) then
     begin
       Context.Advance; Context.Advance;      // END ASM
       Break;
@@ -10020,7 +10146,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Handle PRINT# command
   if CmdName = kPRINTN then
@@ -10107,7 +10233,7 @@ var
   LineNumNode: TASTNode;
 begin
   Token := Context.CurrentToken;
-  Command := UpperCase(Token.Value);
+  Command := UpperFast(Token.Value);
 
   if Command = 'TRAP' then
   begin
@@ -10125,7 +10251,7 @@ begin
     Context.Advance; // Consume RESUME
 
     // Check for NEXT keyword
-    if Context.Check(ttLoopBlockEnd) and (UpperCase(Context.CurrentToken.Value) = 'NEXT') then
+    if Context.Check(ttLoopBlockEnd) and (SameText(Context.CurrentToken.Value, 'NEXT')) then
     begin
       Result := TASTNode.Create(antResumeNext, Token);
       Context.Advance; // Consume NEXT
@@ -10171,7 +10297,7 @@ var
   Cond: TASTNode;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // FreeBASIC ASSERT(expr) / ASSERTWARN(expr): if expr is false, print a diagnostic (and, for ASSERT,
   // halt). The expression's source text is captured (by joining its tokens) for the message, mirroring
@@ -10227,7 +10353,7 @@ var
 begin
   Token := Context.CurrentToken;
   // Determine if TRON or TROFF based on token value
-  if UpperCase(Token.Value) = 'TRON' then
+  if SameText(Token.Value, 'TRON') then
     NodeType := antTron
   else
     NodeType := antTroff;
@@ -10355,7 +10481,7 @@ begin
     // OPTION BASE n: set the default lower bound (0 or 1) for arrays declared with a bare upper bound.
     if Assigned(Context.CurrentToken) and
        ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
-       (UpperCase(Context.CurrentToken.Value) = 'BASE') then
+       (SameText(Context.CurrentToken.Value, 'BASE')) then
     begin
       Context.Advance;                                 // consume BASE
       if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttNumber) then
@@ -10373,7 +10499,7 @@ begin
     // a double's exact expansion terminates. See job/docs/PIANO_FLOAT_PRINT.md.
     else if Assigned(Context.CurrentToken) and
             ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
-            (UpperCase(Context.CurrentToken.Value) = 'DIGITS') then
+            (SameText(Context.CurrentToken.Value, 'DIGITS')) then
     begin
       Context.Advance;                                 // consume DIGITS
       if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttNumber) then
@@ -10393,8 +10519,8 @@ begin
       // that wants the exact value hardcode 767.
       else if Assigned(Context.CurrentToken) and
               ((Context.CurrentToken.TokenType = ttIdentifier) or Assigned(Context.CurrentToken.KeywordInfo)) and
-              ((UpperCase(Context.CurrentToken.Value) = 'EXACT') or
-               (UpperCase(Context.CurrentToken.Value) = 'ALL')) then
+              ((SameText(Context.CurrentToken.Value, 'EXACT')) or
+               (SameText(Context.CurrentToken.Value, 'ALL'))) then
       begin
         FOptionDigits := MaxInt;
         Context.Advance;
@@ -10419,7 +10545,7 @@ begin
       HandleError(Format('OPTION %s is not part of the FreeBASIC dialect: the OPTION statement is only ' +
         'valid in -lang deprecated, fblite or qb (fbc: error 146). SedaiBasic keeps OPTION DIGITS and ' +
         'OPTION BASE, which are its own; add ''#lang "fblite"'' if you want the others.',
-        [UpperCase(Context.CurrentToken.Value)]), Context.CurrentToken);
+        [UpperFast(Context.CurrentToken.Value)]), Context.CurrentToken);
       Context.Advance;
     end
     // CLASSIC, and a source that declared another dialect, keep every OPTION as before: accepted and
@@ -10432,7 +10558,7 @@ begin
       // OPTION NOKEYWORD <word> takes a second one: the keyword being removed from the symbol table.
       // Consumed so the statement parses; the word itself stays reserved (un-reserving it would have to
       // reach back into the LEXER, which has already classified every later occurrence).
-      if UpperCase(Context.CurrentToken.Value) = 'NOKEYWORD' then
+      if SameText(Context.CurrentToken.Value, 'NOKEYWORD') then
       begin
         Context.Advance;
         if Assigned(Context.CurrentToken) and
@@ -10455,7 +10581,7 @@ var
   KeywordUpper: string;
 begin
   Token := Context.CurrentToken;
-  KeywordUpper := UpperCase(Token.Value);
+  KeywordUpper := UpperFast(Token.Value);
 
   // SETHEADER name, value
   if KeywordUpper = kSETHEADER then
@@ -10611,7 +10737,7 @@ begin
       HandleError('Expected a name after ".." in REDIM', Context.CurrentToken);
       Result := nil; Exit;
     end;
-    VarName := TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Context.CurrentToken.Value)),
+    VarName := TASTNode.CreateWithValue(antIdentifier, UpperFast(VarToStr(Context.CurrentToken.Value)),
                                         Context.CurrentToken);
     Context.Advance;                                  // name
     while Context.Check(ttOpDot) do
@@ -10624,7 +10750,7 @@ begin
         HandleError('Expected a name after "." in REDIM target', Context.CurrentToken);
         VarName.Free; Result := nil; Exit;
       end;
-      MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(VarToStr(Context.CurrentToken.Value)),
+      MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperFast(VarToStr(Context.CurrentToken.Value)),
                                              Context.CurrentToken);
       MemberNode.AddChild(VarName);
       VarName := MemberNode;
@@ -10649,7 +10775,7 @@ begin
   // ⭐ ...and a MODERN extension FreeBASIC does not reserve may be a VARIABLE'S name too. The same
   // door the PROCEDURE and CONST declarations have; without it "Dim Round As Integer" refused.
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+     IsShadowableExtensionName(UpperFast(VarToStr(Context.CurrentToken.Value))) then
     Context.CurrentToken.TokenType := ttIdentifier;
   if not Context.Check(ttIdentifier) then
   begin
@@ -10658,7 +10784,7 @@ begin
     Exit;
   end;
 
-  VarName := TASTNode.CreateWithValue(antIdentifier, UpperCase(Token.Value), Token);
+  VarName := TASTNode.CreateWithValue(antIdentifier, UpperFast(Token.Value), Token);
   Context.Advance;
 
   // Member array target "obj.field(...)" (REDIM of a UDT array member, e.g. "Redim this.m(x-1,y-1)"):
@@ -10673,7 +10799,7 @@ begin
       HandleError('Expected field name after "." in REDIM target', Context.CurrentToken);
       VarName.Free; Result := nil; Exit;
     end;
-    MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(Context.CurrentToken.Value),
+    MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperFast(Context.CurrentToken.Value),
                                            Context.CurrentToken);
     MemberNode.AddChild(VarName);
     VarName := MemberNode;
@@ -10834,8 +10960,8 @@ begin
       // variable got nothing - 0 where fbc answers the member, in silence - while the identical
       // initialiser without the parentheses was right.
       if (TupleDepth = 0) and (not Nested) and (not IsBuiltinTypeName(DimTypeName)) and
-         (FEnumNamesSeen.IndexOf(UpperCase(DimTypeName)) < 0) and
-         (Pos(' PTR', UpperCase(DimTypeName)) = 0) then
+         (FEnumNamesSeen.IndexOf(UpperFast(DimTypeName)) < 0) and
+         (Pos(' PTR', UpperFast(DimTypeName)) = 0) then
       begin
         Context.Advance;
         if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;
@@ -10915,7 +11041,7 @@ begin
   if Context.Check(ttOpEq) then
   begin
     if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) and
-       (UpperCase(VarToStr(Context.PeekNext.Value)) = 'ANY') then
+       (SameText(VarToStr(Context.PeekNext.Value), 'ANY')) then
     begin
       Context.Advance;                              // =
       Context.Advance;                              // Any
@@ -10925,7 +11051,7 @@ begin
     // the "=> Any" spelling of the same thing ("=>" is lexed as '=' then '>')
     if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpGt) and
        Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
-       (UpperCase(VarToStr(Context.PeekToken(2).Value)) = 'ANY') then
+       (UpperFast(VarToStr(Context.PeekToken(2).Value)) = 'ANY') then
     begin
       Context.Advance; Context.Advance; Context.Advance;   // = > Any
       Decl.Attributes.Values['ANYINIT'] := '1';
@@ -11107,7 +11233,7 @@ begin
   // here and not at the one caller that happens to ask for the answer.
   FPtrQualChain := '';
   while Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
-        (UpperCase(Context.CurrentToken.Value) = 'CONST') do
+        (SameText(Context.CurrentToken.Value, 'CONST')) do
   begin
     Result := True;
     Context.Advance;
@@ -11240,7 +11366,7 @@ begin
       // and SizeOf of the field answered the string DESCRIPTOR's width instead. Resolved from the
       // values recorded as each CONST was parsed, so a name used before its declaration still
       // declines, exactly as it does in fbc.
-      Result := TryStrToInt64(FConstIntValues.Values[UpperCase(VarToStr(N.Value))], V);
+      Result := TryStrToInt64(FConstIntValues.Values[N.ValueUpper], V);
     antParentheses:
       if N.ChildCount >= 1 then Result := TryConstIntExpr(N.GetChild(0), V);
     antUnaryOp:
@@ -11288,10 +11414,10 @@ begin
   // Consumed HERE, in the predicate, because every caller advances past the PTR immediately after - and
   // there are fifteen of them.
   if Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
-     (UpperCase(Context.CurrentToken.Value) = 'CONST') and Assigned(Context.PeekNext) and
+     (SameText(Context.CurrentToken.Value, 'CONST')) and Assigned(Context.PeekNext) and
      (Context.PeekNext.TokenType = ttIdentifier) then
   begin
-    W := UpperCase(VarToStr(Context.PeekNext.Value));
+    W := UpperFast(VarToStr(Context.PeekNext.Value));
     if (W = kPTR) or (FModernMode and (W = kPOINTER)) then
     begin
       Context.Advance;                   // consume CONST; the caller consumes the PTR that follows
@@ -11300,7 +11426,7 @@ begin
     end;
   end;
   if not Context.Check(ttIdentifier) then Exit;
-  W := UpperCase(VarToStr(Context.CurrentToken.Value));
+  W := UpperFast(VarToStr(Context.CurrentToken.Value));
   Result := (W = kPTR) or (FModernMode and (W = kPOINTER));
   if Result then FPtrQualChain := FPtrQualChain + '0';
 end;
@@ -11336,7 +11462,7 @@ begin
     if not Assigned(Dimension) then Break;
     // FreeBASIC explicit bound "lb TO ub": the first expression is the lower bound. Wrap both in an
     // antDimRange (child0=lb, child1=ub). A bare expression stays the upper bound (lower bound = 0).
-    if Context.Check(ttLoopControl) and (UpperCase(Context.CurrentToken.Value) = kTO) then
+    if Context.Check(ttLoopControl) and (UpperFast(Context.CurrentToken.Value) = kTO) then
     begin
       Context.Advance;                              // consume TO
       // FreeBASIC ellipsis upper bound "lb TO ...": the upper bound is deduced from the number of elements
@@ -11434,7 +11560,7 @@ begin
   for i := 0 to Rank - 1 do
   begin
     D := Dims.GetChild(i);
-    if (D.NodeType = antIdentifier) and (UpperCase(VarToStr(D.Value)) = 'ANY') then Inc(AnyCount);
+    if (D.NodeType = antIdentifier) and (SameText(VarToStr(D.Value), 'ANY')) then Inc(AnyCount);
   end;
   if AnyCount > 0 then
     Exit('D|' + TypeName + '|' + IntToStr(Rank) + '||' + Flags);   // "a(Any[,Any])"
@@ -11489,7 +11615,7 @@ begin
     Ch := ArrayDecl.GetChild(i);
     case Ch.NodeType of
       antDimensions:   Dims := Ch;
-      antIdentifier:   if TypeName = '' then TypeName := UpperCase(VarToStr(Ch.Value));
+      antIdentifier:   if TypeName = '' then TypeName := Ch.ValueUpper;
       antArgumentList: InitCount := Ch.ChildCount;
     else
       ;
@@ -11674,7 +11800,7 @@ begin
     Decl := Node.GetChild(i);
     if (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
     if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
-    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    Nm := Decl.GetChild(0).ValueUpper;
     Idx := FExternShapes.IndexOfName(Nm);
     if Idx < 0 then Continue;
     Shape := ShapeOfArrayDecl(Decl, IsRedim);
@@ -11696,8 +11822,8 @@ begin
   if (Node = nil) or (Node.NodeType <> antTypeDecl) then Exit;
   if (Node.Attributes.Values['ACCESSCONSTRUCTOR'] <> '') or
      (Node.Attributes.Values['ACCESSDESTRUCTOR'] <> '') then
-    if FTypesWithCtorDtor.IndexOf(UpperCase(VarToStr(Node.Value))) < 0 then
-      FTypesWithCtorDtor.Add(UpperCase(VarToStr(Node.Value)));
+    if FTypesWithCtorDtor.IndexOf(Node.ValueUpper) < 0 then
+      FTypesWithCtorDtor.Add(Node.ValueUpper);
 end;
 
 function TPackratParser.WritesThroughConstPointee(Node: TASTNode): string;
@@ -11737,13 +11863,13 @@ begin
   // through it is legal. fbc refuses the first and accepts the second; so does this.
   if Base.NodeType = antCast then
   begin
-    Nm := UpperCase(Trim(VarToStr(Base.Value)));
+    Nm := UpperFast(Trim(VarToStr(Base.Value)));
     if (Copy(Nm, 1, 6) = 'CONST ') and (Pos(' PTR', Nm) > 0) then
       Result := Nm;
     Exit;
   end;
   if Base.NodeType <> antIdentifier then Exit;
-  Nm := UpperCase(VarToStr(Base.Value));
+  Nm := Base.ValueUpper;
   if FConstPointeeNames.IndexOf(Nm) >= 0 then Result := Nm;
 end;
 
@@ -11767,8 +11893,8 @@ begin
         if Cur.ChildCount >= 1 then Cur := Cur.GetChild(0) else Exit;
       antIdentifier:
         begin
-          if (Cur <> Node) and (FConstNames.IndexOf(UpperCase(VarToStr(Cur.Value))) >= 0) then
-            Result := UpperCase(VarToStr(Cur.Value));
+          if (Cur <> Node) and (FConstNames.IndexOf(Cur.ValueUpper) >= 0) then
+            Result := Cur.ValueUpper;
           Exit;
         end;
     else
@@ -11820,7 +11946,7 @@ begin
       antArrayAccess:
         if (Tgt.ChildCount >= 1) and (Tgt.GetChild(0) <> nil) and
            (Tgt.GetChild(0).NodeType = antIdentifier) and
-           (FProcSeen.IndexOf(UpperCase(VarToStr(Tgt.GetChild(0).Value))) >= 0) then
+           (FProcSeen.IndexOf(Tgt.GetChild(0).ValueUpper) >= 0) then
           Bad := 'the result of a function call';
     else
       ;
@@ -11868,7 +11994,7 @@ var
           if (Decl <> nil) and (Decl.NodeType = antArrayDecl) and (Decl.ChildCount >= 1) and
              (Decl.GetChild(0).NodeType = antIdentifier) and
              (Decl.Attributes.Values['STATIC'] <> '1') then
-            Locals.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+            Locals.Add(Decl.GetChild(0).ValueUpper);
         end;
       CollectLocals(D);   // a Scope, an If or a loop body holds locals of this frame too
     end;
@@ -11890,15 +12016,15 @@ var
           begin
             if Cur.ChildCount < 1 then Exit;
             if (Cur.GetChild(0).NodeType = antIdentifier) and
-               (FProcSeen.IndexOf(UpperCase(VarToStr(Cur.GetChild(0).Value))) >= 0) then
+               (FProcSeen.IndexOf(Cur.GetChild(0).ValueUpper) >= 0) then
             begin
               IsCall := True;
-              Exit(UpperCase(VarToStr(Cur.GetChild(0).Value)));
+              Exit(Cur.GetChild(0).ValueUpper);
             end;
             Cur := Cur.GetChild(0);
           end;
         antIdentifier:
-          Exit(UpperCase(VarToStr(Cur.Value)));
+          Exit(Cur.ValueUpper);
       else
         Exit;   // ⛔ an antDeref lands here, and stopping IS the answer: "*p" is not this frame's
       end;
@@ -11912,7 +12038,7 @@ var
     // byref-return names what p POINTS AT, not p, so the lifetime of p itself is not the question -
     // exactly as "*p" is not (see the antDeref note above, the same boundary drawn twice).
     // fbc suite functions/return-byref, TEST_GROUP( explicitByval ).
-    if UpperCase(Expr.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then Exit;
+    if UpperFast(Expr.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then Exit;
     Nm := RootOfRef(Expr, IsCall);
     if Nm = '' then Exit;
     // ⭐ ...UNLESS THE CALLEE ITSELF RETURNS A REFERENCE. Then the "result" is not a temporary at all -
@@ -11944,8 +12070,8 @@ var
         Tgt := C.GetChild(0);
         // "Function = expr" and the older "<the function's own name> = expr" are the same statement.
         if (Tgt <> nil) and (Tgt.NodeType = antIdentifier) and
-           ((UpperCase(VarToStr(Tgt.Value)) = 'FUNCTION') or
-            ((ProcName <> '') and (UpperCase(VarToStr(Tgt.Value)) = ProcName))) then
+           ((SameText(VarToStr(Tgt.Value), 'FUNCTION')) or
+            ((ProcName <> '') and (Tgt.ValueUpper = ProcName))) then
           CheckOne(C.GetChild(1), C.Token);
       end;
       Walk(C);
@@ -11960,7 +12086,7 @@ begin
   if ProcNode.Attributes.Values['BYREFRET'] <> '1' then Exit;
   ProcName := '';
   if (ProcNode.ChildCount >= 1) and (ProcNode.GetChild(0).NodeType = antIdentifier) then
-    ProcName := UpperCase(VarToStr(ProcNode.GetChild(0).Value));
+    ProcName := ProcNode.GetChild(0).ValueUpper;
   Locals := TStringList.Create;
   try
     Locals.CaseSensitive := False;
@@ -11986,9 +12112,9 @@ begin
         if (Prm <> nil) and (Prm.NodeType = antIdentifier) and
            (Prm.Attributes.Values['BYVAL'] = '1') and
            not ((Prm.ChildCount >= 1) and (Prm.GetChild(0).NodeType = antIdentifier) and
-                (UpperCase(VarToStr(Prm.GetChild(0).Value)) = 'STRING') and
+                (Prm.GetChild(0).ValueUpper = 'STRING') and
                 (StrToIntDef(Prm.Attributes.Values['FIXEDLEN'], 0) = 0)) then
-          Locals.Add(UpperCase(VarToStr(Prm.Value)));
+          Locals.Add(Prm.ValueUpper);
         // ⛔⛔ A "ByVal As String" PARAMETER IS THE ONE EXEMPTION fbc HAS AND WE DO NOT, AND LIFTING
         // THE REFUSAL ALONE WAS TRIED AND WITHDRAWN (29 Aug 2026). fbc passes a var-len string byval
         // as its DESCRIPTOR, so the storage is the caller's and "Function = s" compiles there, while
@@ -12112,7 +12238,7 @@ begin
   end;
   if Node.NodeType = antIdentifier then
   begin
-    Nm := UpperCase(VarToStr(Node.Value));
+    Nm := Node.ValueUpper;
     if FConstNames.IndexOf(Nm) < 0 then Nm := '';
   end
   else
@@ -12145,7 +12271,7 @@ begin
     Why := 'it declares a method'
   else
   begin
-    Ext := UpperCase(Node.Attributes.Values['EXTENDS']);
+    Ext := UpperFast(Node.Attributes.Values['EXTENDS']);
     if Ext = 'OBJECT' then
       Why := 'it extends OBJECT'
     else if (Ext <> '') and (FTypesWithCtorDtor.IndexOf(Ext) >= 0) then
@@ -12156,15 +12282,15 @@ begin
         Fld := Node.GetChild(i);
         if (Fld = nil) or (Fld.NodeType <> antIdentifier) or (Fld.ChildCount < 1) then Continue;
         if Fld.GetChild(0).NodeType <> antIdentifier then Continue;
-        TypeNm := UpperCase(VarToStr(Fld.GetChild(0).Value));
+        TypeNm := Fld.GetChild(0).ValueUpper;
         if (TypeNm = 'STRING') and (Fld.Attributes.Values['FIXEDLEN'] = '') then
         begin
-          Why := 'its field ' + UpperCase(VarToStr(Fld.Value)) + ' is a var-len string';
+          Why := 'its field ' + Fld.ValueUpper + ' is a var-len string';
           Break;
         end;
         if FTypesWithCtorDtor.IndexOf(TypeNm) >= 0 then
         begin
-          Why := 'its field ' + UpperCase(VarToStr(Fld.Value)) + ' is a ' + TypeNm +
+          Why := 'its field ' + Fld.ValueUpper + ' is a ' + TypeNm +
                  ', which declares a constructor or a destructor';
           Break;
         end;
@@ -12173,7 +12299,7 @@ begin
   if Why <> '' then
     HandleError(Format('Type %s cannot be declared here: %s, and a type that needs a constructor, ' +
       'a destructor or a method is only allowed at module level',
-      [UpperCase(VarToStr(Node.Value)), Why]), Node.Token);
+      [Node.ValueUpper, Why]), Node.Token);
 end;
 
 procedure TPackratParser.CheckDeclStatesItsType(Node: TASTNode);
@@ -12217,7 +12343,7 @@ begin
     // CONST from its value ("Const K = 5" needs no AS - fbc compiles it).
     if (Decl.Attributes.Values['INFER'] = '1') or (Decl.Attributes.Values['TYPEOF'] = '1') or
        (Decl.Attributes.Values['CONSTDECL'] = '1') then Continue;
-    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    Nm := Decl.GetChild(0).ValueUpper;
     // A DOTTED name is the static-member definition "Dim UDT.m As T", which fbc judges by whether the
     // member was declared STATIC in the type - a different question with a different answer, and it
     // needs the type's member table. Left to its own rule.
@@ -12263,13 +12389,13 @@ begin
   // compiles it. ⚠️ For a SCALAR the same pair IS an error ("Common i" + "Dim i"), so this exemption
   // gives up two tests to keep two others - telling them apart wants the array/scalar shape of BOTH
   // declarations, which is the EXTERN machinery next door and a separate piece of work.
-  if (Node.Token <> nil) and (UpperCase(VarToStr(Node.Token.Value)) = 'COMMON') then Exit;
+  if (Node.Token <> nil) and (SameText(VarToStr(Node.Token.Value), 'COMMON')) then Exit;
   for i := 0 to Node.ChildCount - 1 do
   begin
     Decl := Node.GetChild(i);
     if (Decl = nil) or (Decl.NodeType <> antArrayDecl) or (Decl.ChildCount < 1) then Continue;
     if Decl.GetChild(0).NodeType <> antIdentifier then Continue;
-    Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+    Nm := Decl.GetChild(0).ValueUpper;
     if (Nm = '') or (Pos('.', Nm) > 0) then Continue;   // a member definition is a different rule
     // the declared type: the FIRST bare identifier after the name (an antDimensions may sit between)
     TypeNm := '';
@@ -12278,7 +12404,7 @@ begin
       Ch := Decl.GetChild(k);
       if (Ch <> nil) and (Ch.NodeType = antIdentifier) then
       begin
-        TypeNm := UpperCase(VarToStr(Ch.Value));
+        TypeNm := Ch.ValueUpper;
         Break;
       end;
     end;
@@ -12340,7 +12466,7 @@ begin
       // accepting it, so closing that half is a decision about m393 and not about this rule. Written
       // down in job/markdown/DIVERGENZE.md rather than half-done here.
       if Decl.Attributes.Values['STATIC'] <> '1' then Continue;
-      FModuleLocalNames.Add(UpperCase(VarToStr(Decl.GetChild(0).Value)));
+      FModuleLocalNames.Add(Decl.GetChild(0).ValueUpper);
     end;
   end;
 end;
@@ -12359,7 +12485,7 @@ begin
   // of six and left five looking like a rule that does not work.
   if Node.NodeType in [antIdentifier, antProcAddress] then
   begin
-    Which := UpperCase(VarToStr(Node.Value));
+    Which := Node.ValueUpper;
     if FModuleLocalNames.IndexOf(Which) >= 0 then Exit(True);
     Which := '';
   end;
@@ -12404,8 +12530,8 @@ begin
     begin
       if InitReferencesModuleLocal(Ch.GetChild(1), LocalNm) then
         HandleError(Format('%s.%s has static storage and its initializer references the local symbol %s',
-                           [UpperCase(VarToStr(Ch.GetChild(0).GetChild(0).Value)),
-                            UpperCase(VarToStr(Ch.GetChild(0).Value)), LocalNm]), Ch.Token);
+                           [Ch.GetChild(0).GetChild(0).ValueUpper,
+                            Ch.GetChild(0).ValueUpper, LocalNm]), Ch.Token);
       Continue;
     end;
     // ⛔ A PROCEDURE BODY INSIDE A NAMESPACE IS NOT THE NAMESPACE. The flag was handed down through
@@ -12433,7 +12559,7 @@ begin
       HasDims := False;
       for k := 1 to Decl.ChildCount - 1 do
         if Decl.GetChild(k).NodeType = antDimensions then HasDims := True;
-      Nm := UpperCase(VarToStr(Decl.GetChild(0).Value));
+      Nm := Decl.GetChild(0).ValueUpper;
       IsStatic := (Decl.Attributes.Values['SHARED'] = '1') or
                   (Decl.Attributes.Values['STATIC'] = '1') or
                   InNamespace or (Pos('.', Nm) > 0) or
@@ -12457,7 +12583,7 @@ begin
       if InitIdx < 0 then Continue;                     // no initializer: nothing to refuse
       Sub := Decl.GetChild(InitIdx);
       if TypeIdx >= 0 then
-        TypeName := UpperCase(VarToStr(Decl.GetChild(TypeIdx).Value))
+        TypeName := Decl.GetChild(TypeIdx).ValueUpper
       else
         TypeName := '';
       // A declared STRING with no "* n" capacity is var-len; with no declared type at all (VAR), the
@@ -12498,7 +12624,7 @@ begin
          (Sub.ChildCount = 0) and
          ((Sub.NodeType = antProcAddress) or
           ((Sub.NodeType = antIdentifier) and (Decl.Attributes.Values['BYREF'] = '1'))) and
-         (FModuleLocalNames.IndexOf(UpperCase(VarToStr(Sub.Value))) >= 0) then
+         (FModuleLocalNames.IndexOf(Sub.ValueUpper) >= 0) then
         Continue;
       if InitReferencesModuleLocal(Sub, LocalNm) then
         HandleError(Format('%s has static storage and its initializer references the local symbol %s',
@@ -12517,7 +12643,7 @@ function TPackratParser.SkipAliasClause: Boolean;
 begin
   Result := False;
   if not Context.Check(ttIdentifier) then Exit;
-  if UpperCase(VarToStr(Context.CurrentToken.Value)) <> 'ALIAS' then Exit;
+  if (not SameText(VarToStr(Context.CurrentToken.Value), 'ALIAS')) then Exit;
   if not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral)) then Exit;
   Context.Advance;      // ALIAS
   Context.Advance;      // "name"   (an EMPTY one is refused by RejectEmptyAliasNames, before parsing)
@@ -12544,7 +12670,7 @@ begin
   for i := 0 to Context.TokenList.Count - 2 do
   begin
     T := Context.TokenList.GetTokenDirect(i);
-    if (T = nil) or (UpperCase(VarToStr(T.Value)) <> 'ALIAS') then Continue;
+    if (T = nil) or ((not SameText(VarToStr(T.Value), 'ALIAS'))) then Continue;
     N := Context.TokenList.GetTokenDirect(i + 1);
     if (N <> nil) and (N.TokenType = ttStringLiteral) and (VarToStr(N.Value) = '') then
       HandleError('ALIAS name string is empty', N);
@@ -12565,11 +12691,11 @@ var
   Dims, CapExpr, Decl: TASTNode;
   BlameTok: TLexerToken;
   CapVal: Int64;
-  HasParens, HasInit, HasEllipsis, Understood: Boolean;
+  HasParens, HasInit, HasEllipsis, Understood, HadConstQual: Boolean;
 begin
   SavedIdx := Context.CurrentIndex;
   Dims := nil;
-  Nm := ''; TypeName := ''; Flags := ''; Understood := False;
+  Nm := ''; TypeName := ''; Flags := ''; Understood := False; HadConstQual := False;
   HasInit := False; HasEllipsis := False;
   BlameTok := Context.CurrentToken;
   Context.MutedErrors := Context.MutedErrors + 1;
@@ -12577,13 +12703,13 @@ begin
     Context.Advance;                                      // EXTERN
     // "Extern ByRef ri As Integer" declares an ALIAS for someone else's storage, and that is part of
     // the declaration: fbc answers "error 20: Type mismatch" when the DIM that follows is not ByRef.
-    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    if Context.Check(ttParamMode) and (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF')) then
     begin
       Flags := Flags + '&';
       Context.Advance;
     end;
     if not Context.Check(ttIdentifier) then Exit;          // "Extern As Integer a" and friends
-    Nm := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Nm := UpperFast(VarToStr(Context.CurrentToken.Value));
     Context.Advance;
     HasParens := Context.Check(ttDelimParOpen);
     if HasParens then
@@ -12598,8 +12724,30 @@ begin
     if Context.Check(ttAsType) then
     begin
       Context.Advance;                                    // AS
-      if not Context.Check(ttIdentifier) then Exit;        // a qualifier or a procedure type: not ours
-      TypeName := UpperCase(VarToStr(Context.CurrentToken.Value));
+      // ⛔ IL QUALIFICATORE NON E' PARTE DEL NOME, e qui faceva uscire il lettore prima che vedesse il
+      // tipo: "extern GUID_NULL as const IID" e' la forma di win/cguid.bi, win/isguids.bi,
+      // win/knownfolders.bi e win/shlguid.bi - quattro header in cui `fbc` dice "error 14" e noi non
+      // guardavamo nemmeno. Stessa lezione della m586, in un punto diverso.
+      // ⛔ A MANO, non con SkipTypeQualifiers: quella azzera FPtrQualChain, e questo lettore deve
+      // rimettere ogni cosa come l'ha trovata - chiamarla faceva fallire il PARSING di cinque header
+      // (objsafe, mshtmlc, oleacc, shlobj, shlwapi). Qui si consuma solo il token CONST.
+      while Assigned(Context.CurrentToken) and (Context.CurrentToken.TokenType = ttConstant) and
+            SameText(VarToStr(Context.CurrentToken.Value), 'CONST') do
+      begin
+        HadConstQual := True;
+        Context.Advance;
+      end;
+      if not Context.Check(ttIdentifier) then Exit;        // a procedure type: not ours
+      TypeName := UpperFast(VarToStr(Context.CurrentToken.Value));
+      // ⛔ ...E IL TIPO VA DETTO ALLA SSA, perche' un EXTERN non lascia NESSUN nodo: la riga viene
+      // letta per la sua forma e poi buttata via, esattamente come una DECLARE senza corpo. `fbc`
+      // rifiuta "extern x as Ignoto" con "error 14: Expected identifier", e sono quattro header
+      // dell'albero (win/cguid, win/isguids, win/knownfolders, win/shlguid) piu' i tre X11 - tutti
+      // sotto-header che nominano un tipo dichiarato dal loro parente. Stesso canale di DECLTYPES,
+      // con il proprio genere: 'X'.
+      if (TypeName <> '') and (Pos('.', TypeName) = 0) then
+        FDeclTypeUses.Add('X|' + TypeName + '|' +
+                          IntToStr(Context.CurrentToken.Line) + '|R');
       Context.Advance;
       // "As String * 5" - a fixed-length capacity, which is part of the type, not a decoration.
       if Context.Check(ttOpMul) then
@@ -12622,6 +12770,13 @@ begin
     Context.CurrentIndex := SavedIdx;
     Context.MutedErrors := Context.MutedErrors - 1;
   end;
+  // ⛔⛔ E LA FORMA NON SI REGISTRA SE C'ERA UN QUALIFICATORE. Prima che il CONST venisse saltato,
+  // "extern x as const T" usciva di qui senza registrare niente; saltarlo per leggere il TIPO ha fatto
+  // arrivare fin qui anche quelle righe, e win/objsafe.bi dichiara lo STESSO nome due volte -
+  // "as const GUID" e "as const IID", che sono lo stesso tipo per un alias - facendo scattare il
+  // conflitto di forma su una differenza che non esiste. Il tipo per il controllo e' gia' stato
+  // registrato sopra; la forma resta fuori, esattamente come prima.
+  if HadConstQual then Exit;
   if not Understood then Exit;
   // ⛔ An EXTERN declares, it does not define: fbc refuses an initializer on one, and refuses an
   // ellipsis bound too - whose whole job is to be counted from an initializer an EXTERN may not have.
@@ -12700,12 +12855,12 @@ begin
       if i = 0 then P := nil else P := Context.TokenList.GetTokenDirect(i - 1);
       if (P = nil) or (P.TokenType in [ttEndOfLine, ttSeparStmt]) then
       begin
-        W := UpperCase(VarToStr(T.Value));
+        W := UpperFast(VarToStr(T.Value));
         OnDeclLine := (W = 'DIM') or (W = 'REDIM') or (W = 'COMMON') or (W = 'STATIC') or (W = 'VAR');
       end;
       Continue;
     end;
-    if UpperCase(VarToStr(T.Value)) = Nm then Exit(True);
+    if UpperFast(VarToStr(T.Value)) = Nm then Exit(True);
   end;
 end;
 
@@ -12759,7 +12914,7 @@ begin
       HandleError('Expected field name after "." in file number', Context.CurrentToken);
       Break;
     end;
-    MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(Context.CurrentToken.Value),
+    MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperFast(Context.CurrentToken.Value),
                                            Context.CurrentToken);
     MemberNode.AddChild(Result);
     Result := MemberNode;
@@ -12857,7 +13012,7 @@ function IsBuiltinTypeName(const N: string): Boolean;
 var
   T: string;
 begin
-  T := UpperCase(N);
+  T := UpperFast(N);
   Result := (T = 'INTEGER') or (T = 'LONG') or (T = 'SHORT') or (T = 'BYTE') or
             (T = 'UBYTE') or (T = 'USHORT') or (T = 'UINTEGER') or (T = 'ULONG') or
             (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'BOOLEAN') or
@@ -12879,7 +13034,7 @@ function TPackratParser.StaticMemberBodyRestatesNamespace(const DottedName: stri
 begin
   Result := (FNsPrefix <> '') and
             (Length(DottedName) > Length(FNsPrefix) + 1) and
-            (UpperCase(Copy(DottedName, 1, Length(FNsPrefix) + 1)) = UpperCase(FNsPrefix) + '.');
+            (UpperFast(Copy(DottedName, 1, Length(FNsPrefix) + 1)) = UpperFast(FNsPrefix) + '.');
 end;
 
 function TPackratParser.ParseDimStatement: TASTNode;
@@ -12912,8 +13067,8 @@ begin
   Token := Context.CurrentToken;
   SharedFpNode := nil;
   // VAR / STATIC share the ttDataDeclaration token with DIM; route to their own parsers.
-  if UpperCase(VarToStr(Token.Value)) = kVAR then Exit(ParseVarStatement);
-  if UpperCase(VarToStr(Token.Value)) = kSTATIC then
+  if UpperFast(VarToStr(Token.Value)) = kVAR then Exit(ParseVarStatement);
+  if UpperFast(VarToStr(Token.Value)) = kSTATIC then
   begin
     // FreeBASIC static member method definition: "Static Sub|Function Type.method(...)". The STATIC
     // keyword marks the method as callable without an instance (through the type name — the call site
@@ -12921,8 +13076,8 @@ begin
     // implicit THIS, so consume STATIC here and let ParseProcedureDecl parse the rest as usual. Any
     // other "STATIC ..." is a persistent local variable declaration.
     if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
-       ((UpperCase(VarToStr(Context.PeekNext.Value)) = kSUB) or
-        (UpperCase(VarToStr(Context.PeekNext.Value)) = kFUNCTION)) then
+       ((UpperFast(VarToStr(Context.PeekNext.Value)) = kSUB) or
+        (UpperFast(VarToStr(Context.PeekNext.Value)) = kFUNCTION)) then
     begin
       Context.Advance;                                 // consume STATIC
       Exit(ParseProcedureDecl);
@@ -12939,10 +13094,10 @@ begin
   if IsShared then Context.Advance;   // consume SHARED
   // FreeBASIC COMMON [SHARED] var: a module-shared variable. In our single-module model this is
   // exactly DIM SHARED, so force the SHARED flag (an explicit SHARED, if present, was consumed above).
-  if UpperCase(VarToStr(Token.Value)) = kCOMMON then IsShared := True;
+  if UpperFast(VarToStr(Token.Value)) = kCOMMON then IsShared := True;
   // FreeBASIC reference variable: "DIM BYREF r AS T = target" — r is an alias for target (shared
   // storage). Detected here as a statement-level modifier; handled in the typed-scalar branch below.
-  IsByref := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  IsByref := Context.Check(ttParamMode) and (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF'));
   if IsByref then Context.Advance;    // consume BYREF
 
   // FreeBASIC "leading-AS" form: "DIM [SHARED] AS <type> name1[, name2, ...] [= init]" — the type comes
@@ -12959,7 +13114,7 @@ begin
     // FreeBASIC "DIM AS TypeOf(expr) name": the type is inferred from an expression. Capture the
     // expression; each declared name gets it as child[1] with TYPEOF='1' and the concrete type is
     // resolved in the SSA pre-pass (like VAR's INFER, but with no initializer).
-    if (UpperCase(Context.CurrentToken.Value) = 'TYPEOF') and Assigned(Context.PeekNext) and
+    if (SameText(Context.CurrentToken.Value, 'TYPEOF')) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttDelimParOpen) then
     begin
       SharedTypeTok := Context.CurrentToken;
@@ -13060,7 +13215,7 @@ begin
     // suite writes the list that way. Only the LEADING one was read, so the second died as "Expected
     // variable name in array declaration". The modifier is list-wide here either way, so a repeat is
     // consumed rather than tracked per name.
-    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    if Context.Check(ttParamMode) and (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF')) then
     begin
       IsByref := True;
       Context.Advance;
@@ -13072,7 +13227,7 @@ begin
     // array name", a message about a declaration nobody wrote. The leading-AS spelling ("Dim As
     // Integer Min") reached its own name check with the same untouched token.
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+     IsShadowableExtensionName(UpperFast(VarToStr(Context.CurrentToken.Value))) then
     Context.CurrentToken.TokenType := ttIdentifier;
 
     // Leading-AS array declaration: "DIM [SHARED] AS type name(dims)". Route to ParseArrayDeclaration
@@ -13136,9 +13291,9 @@ begin
               (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
           begin
             MemberAccess := TASTNode.CreateWithValue(antMemberAccess,
-                              UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
+                              UpperFast(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
             MemberAccess.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                              UpperCase(VarToStr(NameTok.Value)), NameTok));
+                              UpperFast(VarToStr(NameTok.Value)), NameTok));
             // ⛔ THIS IS THE DEFINITION, NOT AN ACCESS. It lowers to a store through the member, and the
             // visibility rule would then refuse "Dim T.x As Integer = 123" for a PRIVATE static member -
             // which is how FreeBASIC's own suite writes the storage of one ("visibility/private-var-
@@ -13183,17 +13338,17 @@ begin
         NameTok := Context.CurrentToken;
         Context.Advance;                       // owner name
         MemberAccess := TASTNode.CreateWithValue(antIdentifier,
-                          UpperCase(VarToStr(NameTok.Value)), NameTok);
+                          UpperFast(VarToStr(NameTok.Value)), NameTok);
         MemberAccess.Attributes.Values['STATICMEMBERDEF'] := '1';   // see the leading-AS twin above
-        StaticDotted := UpperCase(VarToStr(NameTok.Value));
+        StaticDotted := UpperFast(VarToStr(NameTok.Value));
         while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
               (Length(VarToStr(Context.PeekNext.Value)) > 0) and
               (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
         begin
           Context.Advance;                     // '.'
-          StaticDotted := StaticDotted + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+          StaticDotted := StaticDotted + '.' + UpperFast(VarToStr(Context.CurrentToken.Value));
           StaticDef := TASTNode.CreateWithValue(antMemberAccess,
-                         UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
+                         UpperFast(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
           StaticDef.AddChild(MemberAccess);
           MemberAccess := StaticDef;
           Context.Advance;                     // member name
@@ -13227,7 +13382,7 @@ begin
               // ⚠️ TO is lexed as ttLoopControl, not as an identifier - the rest of this file always
               // pairs the two tests, and asking only for ttIdentifier made this decline every bound.
               if Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttLoopControl) and
-                 (UpperCase(VarToStr(Context.PeekToken(2).Value)) = kTO) then
+                 (UpperFast(VarToStr(Context.PeekToken(2).Value)) = kTO) then
                 StaticLB := StrToIntDef(VarToStr(Context.PeekNext.Value), -1)
               else if Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttDelimParClose) then
                 StaticLB := 0
@@ -13322,7 +13477,7 @@ begin
         // "Dim p As Sub(...)" gives it; anything else rewinds and reads as an ordinary TypeOf operand.
         TypeOfProcSig := False;
         SavedTypeOf := 0;
-        if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and
+        if (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and
            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
         begin
           Context.SavePosition(SavedTypeOf);
@@ -13361,7 +13516,7 @@ begin
           // why the feature looked present - but "Dim b As TypeOf(a) = 5" then met the '=' with the
           // parentheses unread and died on 'Unexpected token in statement: "="'. The leading-AS
           // spelling consumes it; this one only marked the attribute.
-          if (UpperCase(DimTypeName) = 'TYPEOF') and Context.Check(ttDelimParOpen) then
+          if (SameText(DimTypeName, 'TYPEOF')) and Context.Check(ttDelimParOpen) then
           begin
             Context.Advance;                       // '('
             if Assigned(TrailingTypeOfExpr) then TrailingTypeOfExpr.Free;
@@ -13387,13 +13542,13 @@ begin
       // CONST pointer (it is not). The variable's own qualifier is the OUTERMOST level - the last one
       // written - and only that one makes the name unassignable.
       if (FPtrQualChain = '') and NameIsConst then
-        if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
-          FConstNames.Add(UpperCase(VarToStr(NameTok.Value)))
+        if FConstNames.IndexOf(UpperFast(VarToStr(NameTok.Value))) < 0 then
+          FConstNames.Add(UpperFast(VarToStr(NameTok.Value)))
         else
       else if (FPtrQualChain <> '') and (FPtrQualChain[Length(FPtrQualChain)] = '1') then
       begin
-        if FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
-          FConstNames.Add(UpperCase(VarToStr(NameTok.Value)));
+        if FConstNames.IndexOf(UpperFast(VarToStr(NameTok.Value))) < 0 then
+          FConstNames.Add(UpperFast(VarToStr(NameTok.Value)));
       end
       else
       begin
@@ -13401,7 +13556,7 @@ begin
         // a bare NAME, and a CONST POINTER can legally be redeclared in a sibling scope where the same
         // name is a plain pointer - the manual's datatype/const-ptr does exactly that, four times. A
         // plain CONST cannot be redeclared at all, which is why the hole sat here unexercised.
-        Idx := FConstNames.IndexOf(UpperCase(VarToStr(NameTok.Value)));
+        Idx := FConstNames.IndexOf(UpperFast(VarToStr(NameTok.Value)));
         if (Idx >= 0) and (not FInConstDecl) then FConstNames.Delete(Idx);
       end;
       // The type's CONST chain, kept whole: character 0 is the BASE ("As Const <type>"), then one per
@@ -13428,15 +13583,15 @@ begin
       // base qualifier alone, whatever the depth, is the shape that got that test wrong.
       if NameIsConst and (Length(FPtrQualChain) = 1) then
       begin
-        if FConstPointeeNames.IndexOf(UpperCase(VarToStr(NameTok.Value))) < 0 then
-          FConstPointeeNames.Add(UpperCase(VarToStr(NameTok.Value)));
+        if FConstPointeeNames.IndexOf(UpperFast(VarToStr(NameTok.Value))) < 0 then
+          FConstPointeeNames.Add(UpperFast(VarToStr(NameTok.Value)));
       end
       else
       begin
-        Idx := FConstPointeeNames.IndexOf(UpperCase(VarToStr(NameTok.Value)));
+        Idx := FConstPointeeNames.IndexOf(UpperFast(VarToStr(NameTok.Value)));
         if Idx >= 0 then FConstPointeeNames.Delete(Idx);
       end;
-      VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok);
+      VarNameNode := TASTNode.CreateWithValue(antIdentifier, UpperFast(NameTok.Value), NameTok);
       ArrayDecl.AddChild(VarNameNode);
       if LeadingAS and Assigned(LeadingTypeOfExpr) then
       begin
@@ -13459,7 +13614,7 @@ begin
         // SSA pre-pass that resolves TypeOf never fired and the variable was declared with an UNKNOWN
         // type: a String answered the float default and printed 0. Only the leading-AS spelling
         // ("Dim As TypeOf(a) b") was ever marked, which is why the feature looked present.
-        if UpperCase(DimTypeName) = 'TYPEOF' then
+        if SameText(DimTypeName, 'TYPEOF') then
           ArrayDecl.Attributes.Values['TYPEOF'] := '1';
       end;
       // Leading-AS fixed-length string capacity ("DIM AS STRING * n name") applies to each name.
@@ -13501,7 +13656,7 @@ begin
             if InitExpr.NodeType = antIdentifier then
             begin
               // @scalar: historical shape (Value = name, no child).
-              AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(InitExpr.Value)), NameTok);
+              AddrNode := TASTNode.CreateWithValue(antProcAddress, InitExpr.ValueUpper, NameTok);
               InitExpr.Free;
             end
             else
@@ -13557,7 +13712,7 @@ begin
         // INITIALISE - worked. Marked the same way as the array form, and no initializer is attached.
         // ⚠️ The storage is still ZEROED, as it is for the array form: a defined state where fbc hands
         // back whatever was there. Declared in BASIC.md.
-        if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'ANY') then
+        if Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'ANY')) then
         begin
           Context.Advance;                   // Any
           ArrayDecl.Attributes.Values['ANYINIT'] := '1';
@@ -13570,7 +13725,7 @@ begin
         // initialised with nothing at all - 0 where fbc answers the member. The assignment form
         // "e = colours.green" beside it was right, which is what said the defect was in the DIM.
         else if Context.Check(ttIdentifier) and
-           (UpperCase(Context.CurrentToken.Value) = DimTypeName) and
+           (UpperFast(Context.CurrentToken.Value) = DimTypeName) and
            (not IsBuiltinTypeName(DimTypeName)) and
            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
           Context.Advance                    // RHS == declared UDT: ctor form (block below reads '(')
@@ -13682,7 +13837,7 @@ begin
   VarIsByref := False;
   VarIsShared := False;
   while Context.Check(ttSharedDecl) or
-        (Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF')) do
+        (Context.Check(ttParamMode) and (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF'))) do
   begin
     if Context.Check(ttSharedDecl) then VarIsShared := True else VarIsByref := True;
     Context.Advance;
@@ -13692,13 +13847,13 @@ begin
     // modifier applies to the whole list, a per-name one only to its own declaration - so the flag is
     // read here as well, into a copy, and the list-wide value survives for the names that omit it.
     DeclIsByref := VarIsByref;
-    if Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF') then
+    if Context.Check(ttParamMode) and (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF')) then
     begin
       DeclIsByref := True;
       Context.Advance;
     end;
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+     IsShadowableExtensionName(UpperFast(VarToStr(Context.CurrentToken.Value))) then
     Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
@@ -13713,14 +13868,14 @@ begin
     // and that path already folds the dotted spelling into the single name a static member is backed
     // by. VAR read ONE identifier, so it stopped on the '.' and reported "VAR requires an
     // initializer" - a complaint about the '=' that is right there.
-    VarDottedName := UpperCase(VarToStr(NameTok.Value));
+    VarDottedName := UpperFast(VarToStr(NameTok.Value));
     Context.Advance;                                 // name
     while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
           (Length(VarToStr(Context.PeekNext.Value)) > 0) and
           (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
     begin
       Context.Advance;                               // '.'
-      VarDottedName := VarDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+      VarDottedName := VarDottedName + '.' + UpperFast(VarToStr(Context.CurrentToken.Value));
       Context.Advance;                               // segment
     end;
     // DIVERGENZE 93 - see StaticMemberBodyRestatesNamespace. The DIM spelling has the same test;
@@ -13780,7 +13935,7 @@ begin
       // Wrap the referand in "@", the shape DIM BYREF produces (bare name = Value with no child).
       if InitExpr.NodeType = antIdentifier then
       begin
-        AddrNode := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(InitExpr.Value)), NameTok);
+        AddrNode := TASTNode.CreateWithValue(antProcAddress, InitExpr.ValueUpper, NameTok);
         InitExpr.Free;
       end
       else
@@ -13891,14 +14046,14 @@ begin
   // ...and BYREF may stand between them and the type: "Static Shared ByRef As Integer r = target" is a
   // module-level REFERENCE that persists, and DIM has accepted the same spelling all along. Left unread
   // it was not an identifier either, so the statement died with "Expected a variable name after STATIC".
-  IsByrefStatic := Context.Check(ttParamMode) and (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'BYREF');
+  IsByrefStatic := Context.Check(ttParamMode) and (SameText(VarToStr(Context.CurrentToken.Value), 'BYREF'));
   if IsByrefStatic then Context.Advance;             // consume BYREF
   // ⭐ "STATIC VAR n = 0": VAR is a DECLARATION KEYWORD, not a name, and the loop below wanted an
   // identifier - so the whole statement died as "Expected a variable name after STATIC". STATIC says
   // WHERE the storage lives and VAR says where the TYPE comes from; they are orthogonal, and DIM has
   // read VAR by delegating to the same routine all along (ParseDimStatement's first line). One reader,
   // both spellings: the modifiers are stamped onto what it produced.
-  if UpperCase(VarToStr(Context.CurrentToken.Value)) = kVAR then
+  if UpperFast(VarToStr(Context.CurrentToken.Value)) = kVAR then
   begin
     Result.Free;
     Result := ParseVarStatement;
@@ -13951,7 +14106,7 @@ begin
       NameTok := Context.CurrentToken;
       Context.Advance;                               // name
       DeclNode := TASTNode.Create(antArrayDecl, NameTok);
-      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(NameTok.Value), NameTok));
       Dims := ParseStaticDims;                       // "STATIC AS type a(dims)": array with static storage
       if Assigned(Dims) then
       begin
@@ -13977,7 +14132,7 @@ begin
           begin
             if Init.NodeType = antIdentifier then
             begin
-              StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Init.Value)), NameTok);
+              StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, Init.ValueUpper, NameTok);
               Init.Free;
             end
             else
@@ -14011,7 +14166,7 @@ begin
   end;
   repeat
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+     IsShadowableExtensionName(UpperFast(VarToStr(Context.CurrentToken.Value))) then
     Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
@@ -14021,7 +14176,7 @@ begin
       Break;
     end;
     NameTok := Context.CurrentToken;
-    StaticDottedName := UpperCase(VarToStr(NameTok.Value));
+    StaticDottedName := UpperFast(VarToStr(NameTok.Value));
     Context.Advance;                                 // name
     // ⭐ "Static Shared UDT.g As Integer": the DEFINITION, outside the type, of a member declared
     // "Static g As Integer" inside it. The two halves must name the SAME storage, and a static member is
@@ -14033,7 +14188,7 @@ begin
           (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
     begin
       Context.Advance;                               // '.'
-      StaticDottedName := StaticDottedName + '.' + UpperCase(VarToStr(Context.CurrentToken.Value));
+      StaticDottedName := StaticDottedName + '.' + UpperFast(VarToStr(Context.CurrentToken.Value));
       Context.Advance;                               // segment
     end;
     Dims := ParseStaticDims;                         // "STATIC a(dims) AS type": array with static storage
@@ -14107,7 +14262,7 @@ begin
         begin
           if Init.NodeType = antIdentifier then
           begin
-            StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, UpperCase(VarToStr(Init.Value)), NameTok);
+            StaticAddrNd := TASTNode.CreateWithValue(antProcAddress, Init.ValueUpper, NameTok);
             Init.Free;
           end
           else
@@ -14183,7 +14338,7 @@ begin
       Break;
     end;
     NameTok := Context.CurrentToken;
-    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(NameTok.Value), NameTok));
     Context.Advance;                     // array name
     if Context.Check(ttSeparParam) then
       Context.Advance                    // comma -> another array
@@ -14212,7 +14367,7 @@ begin
   RedimShared := False;
   while True do
   begin
-    if Context.Check(ttIdentifier) and (UpperCase(Context.CurrentToken.Value) = 'PRESERVE') then
+    if Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'PRESERVE')) then
     begin
       Result.Attributes.Values['PRESERVE'] := '1';
       Context.Advance;
@@ -14236,7 +14391,7 @@ begin
     if AtDottedTypeName then
     begin
       RedimTypeTok := Context.CurrentToken;
-      RedimTypeName := UpperCase(ParseDottedName);
+      RedimTypeName := UpperFast(ParseDottedName);
       while AtPointerSuffix do
       begin RedimTypeName := RedimTypeName + ' PTR'; Context.Advance; end;
     end;
@@ -14420,7 +14575,7 @@ begin
   if not (Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam, ttEndOfFile, ttAsType]) or
           SkipAliasClause) then                       // a nameless "Enum Alias \"n\""
   begin
-    Result.Value := UpperCase(VarToStr(Context.CurrentToken.Value));   // enum type name
+    Result.Value := UpperFast(VarToStr(Context.CurrentToken.Value));   // enum type name
     if FEnumNamesSeen.IndexOf(VarToStr(Result.Value)) < 0 then
       FEnumNamesSeen.Add(VarToStr(Result.Value));
     Context.Advance;
@@ -14429,7 +14584,7 @@ begin
     // unconsumed, the word was read as the FIRST MEMBER and the real members stayed plain globals - so
     // an explicit enum's B shadowed the B of an ordinary one declared beside it.
     if Context.Check(ttIdentifier) and
-       (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'EXPLICIT') then
+       (SameText(VarToStr(Context.CurrentToken.Value), 'EXPLICIT')) then
     begin
       Result.Attributes.Values['EXPLICIT'] := '1';
       Context.Advance;
@@ -14471,7 +14626,7 @@ begin
         Break;
       end;
     end;
-    MemberName := UpperCase(Context.CurrentToken.Value);
+    MemberName := UpperFast(Context.CurrentToken.Value);
     Context.Advance;
     if Context.Match(ttOpEq) then
       ValueNode := FExpressionParser.ParseExpression
@@ -14506,7 +14661,7 @@ var
   KwU: string;
 begin
   Token := Context.CurrentToken;
-  KwU := UpperCase(Token.Value);
+  KwU := UpperFast(Token.Value);
   if KwU = 'DEFSTR' then Bank := 2
   else if (KwU = 'DEFSNG') or (KwU = 'DEFDBL') then Bank := 1
   else Bank := 0;   // DEFINT/DEFLNG/DEFBYTE/DEFSHORT/DEFLNGINT -> int bank
@@ -14586,7 +14741,7 @@ begin
     FnName := Context.CurrentToken.Value;
 
     // Validate that it starts with FN
-    if (Length(FnName) < 3) or (UpperCase(Copy(FnName, 1, 2)) <> 'FN') then
+    if (Length(FnName) < 3) or ((not SameText(Copy(FnName, 1, 2), 'FN'))) then
     begin
       HandleError('Expected FN or FNname after DEF', Token);
       Result.Free;
@@ -14684,7 +14839,7 @@ var
       antLiteral: Result := VarIsStr(N.Value);
       antIdentifier:
         begin
-          Nm := UpperCase(VarToStr(N.Value));
+          Nm := N.ValueUpper;
           Result := (Nm <> '') and (Nm[Length(Nm)] = '$');
         end;
       antArrayAccess, antFunctionCall:
@@ -14694,9 +14849,9 @@ var
           // a FUNCTION CALL failed the test - "Const w = WChr(65,66,67)" was typed DOUBLE and the string
           // went into a float register, which is why it came back one character long. The list already
           // named WCHR; the name simply never reached it.
-          Nm := UpperCase(VarToStr(N.Value));
+          Nm := N.ValueUpper;
           if (Nm = '') and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
-            Nm := UpperCase(VarToStr(N.GetChild(0).Value));
+            Nm := N.GetChild(0).ValueUpper;
           Result := ((Nm <> '') and (Nm[Length(Nm)] = '$')) or
                     (Nm = 'CHR') or (Nm = 'MID') or (Nm = 'LEFT') or (Nm = 'RIGHT') or
                     (Nm = 'STRING') or (Nm = 'SPACE') or (Nm = 'STR') or (Nm = 'HEX') or
@@ -14727,7 +14882,7 @@ var
       if VarIsStr(V.Value) then
         Result := 'STRING'
       else if (Pos('.', VarToStr(V.Value)) > 0) or
-              (Pos('E', UpperCase(VarToStr(V.Value))) > 0) then
+              (Pos('E', V.ValueUpper) > 0) then
         Result := 'DOUBLE'
       else
         Result := 'LONGINT';
@@ -14737,7 +14892,7 @@ var
     // A CONST already declared above this one answers with the type IT was given.
     if V.NodeType = antIdentifier then
     begin
-      R := FConstTypes.Values[UpperCase(VarToStr(V.Value))];
+      R := FConstTypes.Values[V.ValueUpper];
       if R <> '' then Result := R;
       Exit;
     end;
@@ -14796,7 +14951,7 @@ var
         // tail did not, so "Const a As Integer = 1, b As TypeOf(a) = 2" read the type as the ordinary
         // name TYPEOF, left "( a )" in the stream and reported "Expected \"=\" after CONST name" - a
         // message about the wrong thing entirely. The same rule, in the sibling path that did not have it.
-        if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+        if (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and Assigned(Context.PeekNext) and
            (Context.PeekNext.TokenType = ttDelimParOpen) then
         begin
           Context.Advance;                            // TYPEOF
@@ -14806,7 +14961,7 @@ var
         end
         else if Context.Check(ttIdentifier) then
         begin
-          ItemType := UpperCase(ParseDottedName);     // element type
+          ItemType := UpperFast(ParseDottedName);     // element type
           // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
           while AtPointerSuffix or
                 Context.Check(ttOpMul) do
@@ -14832,7 +14987,7 @@ var
           ItemType := InferConstTypeName(ItemValue);
       end;
       Decl := TASTNode.Create(antArrayDecl, ItemName);
-      Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(ItemName.Value), ItemName));
+      Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(ItemName.Value), ItemName));
       if Assigned(ItemTypeOfExpr) then
       begin
         // child[1] is the EXPRESSION; the SSA pre-pass infers the concrete type from it, exactly as the
@@ -14851,12 +15006,12 @@ var
       // reads FConstNames). One path had the rule and its sibling did not; found because a new check
       // asked "is this a CONST?" and got the wrong answer for every item after the first.
       Decl.Attributes.Values['CONSTDECL'] := '1';
-      if FConstNames.IndexOf(UpperCase(VarToStr(ItemName.Value))) < 0 then
-        FConstNames.Add(UpperCase(VarToStr(ItemName.Value)));
+      if FConstNames.IndexOf(UpperFast(VarToStr(ItemName.Value))) < 0 then
+        FConstNames.Add(UpperFast(VarToStr(ItemName.Value)));
       if not Assigned(ItemTypeOfExpr) then
-        FConstTypes.Values[UpperCase(VarToStr(ItemName.Value))] := ItemType;
+        FConstTypes.Values[UpperFast(VarToStr(ItemName.Value))] := ItemType;
       if TryConstIntExpr(ItemValue, FConstFoldVal) then
-        FConstIntValues.Values[UpperCase(VarToStr(ItemName.Value))] := IntToStr(FConstFoldVal);
+        FConstIntValues.Values[UpperFast(VarToStr(ItemName.Value))] := IntToStr(FConstFoldVal);
       DimNode.AddChild(Decl);
     end;
   end;
@@ -14877,9 +15032,9 @@ begin
   // only to LOOK PAST them; what they MEAN is already handled where a decorator leads the definition.
   DecoK := 1;
   while Assigned(Context.PeekToken(DecoK)) and (Context.PeekToken(DecoK).TokenType = ttIdentifier) and
-        ((UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'VIRTUAL') or
-         (UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'ABSTRACT') or
-         (UpperCase(VarToStr(Context.PeekToken(DecoK).Value)) = 'OVERRIDE')) do
+        ((UpperFast(VarToStr(Context.PeekToken(DecoK).Value)) = 'VIRTUAL') or
+         (UpperFast(VarToStr(Context.PeekToken(DecoK).Value)) = 'ABSTRACT') or
+         (UpperFast(VarToStr(Context.PeekToken(DecoK).Value)) = 'OVERRIDE')) do
     Inc(DecoK);
   if Assigned(Context.PeekToken(DecoK)) and (Context.PeekToken(DecoK).TokenType = ttProcedureStart) then
   begin
@@ -14894,7 +15049,7 @@ begin
   // statement that begins with one; a CONST had no such door, so "Const MAX = 8" - which fbc
   // compiles - failed the whole file to parse. ⚠️ ABS/FIX/SGN stay reserved, as they are in fbc.
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+     IsShadowableExtensionName(UpperFast(VarToStr(Context.CurrentToken.Value))) then
     Context.CurrentToken.TokenType := ttIdentifier;
 
   // FreeBASIC leading-AS typed constant: "CONST AS type name = value" (e.g. "Const As UInteger
@@ -14912,7 +15067,7 @@ begin
     // '=' and reported the wrong thing entirely ("Expected constant name after CONST AS type"). DIM has
     // carried this rule in its leading-AS spelling for a long time; the constant is lowered to a typed
     // scalar DIM, so it wants exactly the same answer.
-    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+    if (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttDelimParOpen) then
     begin
       Context.Advance;                                // TYPEOF
@@ -14923,14 +15078,14 @@ begin
     end
     else if Context.Check(ttIdentifier) then
     begin
-      TypeName := UpperCase(ParseDottedName);         // element type
+      TypeName := UpperFast(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
       while AtPointerSuffix or
             Context.Check(ttOpMul) do
       begin Context.Advance; TypeName := TypeName + ' PTR'; end;
     end;
   if FModernMode and (not Context.Check(ttIdentifier)) and
-     IsShadowableExtensionName(UpperCase(VarToStr(Context.CurrentToken.Value))) then
+     IsShadowableExtensionName(UpperFast(VarToStr(Context.CurrentToken.Value))) then
     Context.CurrentToken.TokenType := ttIdentifier;
     if not Context.Check(ttIdentifier) then
     begin
@@ -14952,7 +15107,7 @@ begin
     end;
     Result.Free;                                      // discard the antConst; emit a typed DIM instead
     ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(NameTok.Value), NameTok));
     // "Const ... As TypeOf(expr)": child[1] is the EXPRESSION and the SSA pre-pass infers the concrete
     // type from it, exactly as the DIM path does. Its own registries keep the placeholder name, since
     // there is no type name to record until that pass has run.
@@ -14966,11 +15121,11 @@ begin
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
-    if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
-      FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := TypeName;
+    if FConstNames.IndexOf(ArrayDecl.GetChild(0).ValueUpper) < 0 then
+      FConstNames.Add(ArrayDecl.GetChild(0).ValueUpper);
+    FConstTypes.Values[ArrayDecl.GetChild(0).ValueUpper] := TypeName;
     if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
-      FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
+      FConstIntValues.Values[ArrayDecl.GetChild(0).ValueUpper] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, TypeName, False);      // "Const As T a = 1, b = 2, ...": T applies to the whole list
@@ -14995,7 +15150,7 @@ begin
     // where '=' was expected. DIM has read this signature all along; a constant holds only the pointer
     // VALUE (int-banked here), so the signature is consumed and its shape recorded on a scratch node.
     // ...and the trailing spelling wants the very same TypeOf branch (see the note on the leading one).
-    if (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'TYPEOF') and Assigned(Context.PeekNext) and
+    if (SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF')) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType = ttDelimParOpen) then
     begin
       Context.Advance;                                // TYPEOF
@@ -15015,7 +15170,7 @@ begin
     end
     else if Context.Check(ttIdentifier) then
     begin
-      TypeName := UpperCase(ParseDottedName);         // element type
+      TypeName := UpperFast(ParseDottedName);         // element type
       // Optional pointer suffix: the "PTR" keyword (repeated for multi-level "T Ptr Ptr") or the "*" form.
       while AtPointerSuffix or
             Context.Check(ttOpMul) do
@@ -15034,7 +15189,7 @@ begin
     end;
     Result.Free;                                      // discard the antConst; emit a typed DIM instead
     ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
-    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(NameTok.Value), NameTok));
+    ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(NameTok.Value), NameTok));
     // "Const ... As TypeOf(expr)": child[1] is the EXPRESSION and the SSA pre-pass infers the concrete
     // type from it, exactly as the DIM path does. Its own registries keep the placeholder name, since
     // there is no type name to record until that pass has run.
@@ -15048,11 +15203,11 @@ begin
     ArrayDecl.AddChild(ValueNode);
     if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';     // FB: a module-level CONST is globally visible
     ArrayDecl.Attributes.Values['CONSTDECL'] := '1';  // a CONST, not a variable: the SSA folds it to an immediate
-    if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
-      FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-    FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := TypeName;
+    if FConstNames.IndexOf(ArrayDecl.GetChild(0).ValueUpper) < 0 then
+      FConstNames.Add(ArrayDecl.GetChild(0).ValueUpper);
+    FConstTypes.Values[ArrayDecl.GetChild(0).ValueUpper] := TypeName;
     if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
-      FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
+      FConstIntValues.Values[ArrayDecl.GetChild(0).ValueUpper] := IntToStr(FConstFoldVal);
     Result := TASTNode.Create(antDim, Token);
     Result.AddChild(ArrayDecl);
     ParseConstListTail(Result, '', True);             // "Const a As T = 1, b As U = 2, ...": per-item type or inference
@@ -15085,7 +15240,7 @@ begin
   NameTok := Assignment.GetChild(0).Token;
   Result.Free;                                        // discard the antConst; emit a typed SHARED DIM
   ArrayDecl := TASTNode.Create(antArrayDecl, NameTok);
-  ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperCase(VarToStr(Assignment.GetChild(0).Value)), NameTok));
+  ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, Assignment.GetChild(0).ValueUpper, NameTok));
   ArrayDecl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, NameTok));
   ArrayDecl.AddChild(ValueNode);
   // Only MODERN (FreeBASIC) needs a module-level CONST to be a SHARED global for procedure visibility.
@@ -15093,12 +15248,12 @@ begin
   // not use the shared-scalar backing array; marking it SHARED there breaks the const (m: stress.bas).
   if FModernMode then ArrayDecl.Attributes.Values['SHARED'] := '1';
   ArrayDecl.Attributes.Values['CONSTDECL'] := '1';    // a CONST, not a variable: the SSA folds it to an immediate
-  if FConstNames.IndexOf(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))) < 0 then
-    FConstNames.Add(UpperCase(VarToStr(ArrayDecl.GetChild(0).Value)));
-  FConstTypes.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] :=
-    UpperCase(VarToStr(ArrayDecl.GetChild(1).Value));
+  if FConstNames.IndexOf(ArrayDecl.GetChild(0).ValueUpper) < 0 then
+    FConstNames.Add(ArrayDecl.GetChild(0).ValueUpper);
+  FConstTypes.Values[ArrayDecl.GetChild(0).ValueUpper] :=
+    ArrayDecl.GetChild(1).ValueUpper;
   if (ArrayDecl.ChildCount >= 3) and TryConstIntExpr(ArrayDecl.GetChild(2), FConstFoldVal) then
-    FConstIntValues.Values[UpperCase(VarToStr(ArrayDecl.GetChild(0).Value))] := IntToStr(FConstFoldVal);
+    FConstIntValues.Values[ArrayDecl.GetChild(0).ValueUpper] := IntToStr(FConstFoldVal);
   Assignment.Free;
   Result := TASTNode.Create(antDim, Token);
   Result.AddChild(ArrayDecl);
@@ -15252,7 +15407,7 @@ begin
           HandleError('Expected field name after "." in READ target', Context.CurrentToken);
           Break;
         end;
-        MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperCase(Context.CurrentToken.Value),
+        MemberNode := TASTNode.CreateWithValue(antMemberAccess, UpperFast(Context.CurrentToken.Value),
                                                Context.CurrentToken);
         MemberNode.AddChild(VarNode);
         VarNode := MemberNode;
@@ -15354,7 +15509,7 @@ var
   CmdName: string;
 begin
   Token := Context.CurrentToken;
-  CmdName := UpperCase(Token.Value);
+  CmdName := UpperFast(Token.Value);
 
   // Recognize specific program editing commands
   case CmdName of
@@ -15454,11 +15609,11 @@ begin
  Token := Context.CurrentToken;
 
  // Determine loop type based on keyword
- if UpperCase(Token.Value) = 'FOR' then
+ if SameText(Token.Value, 'FOR') then
    Result := ParseForStatement
- else if UpperCase(Token.Value) = 'DO' then
+ else if SameText(Token.Value, 'DO') then
    Result := ParseDoStatement
- else if UpperCase(Token.Value) = 'WHILE' then
+ else if SameText(Token.Value, 'WHILE') then
    Result := ParseWhileStatement
  else
  begin
@@ -15474,11 +15629,11 @@ begin
  Token := Context.CurrentToken;
 
  // Determine jump type based on keyword
- if UpperCase(Token.Value) = 'GOTO' then
+ if SameText(Token.Value, 'GOTO') then
    Result := ParseGotoStatement
- else if UpperCase(Token.Value) = 'GOSUB' then
+ else if SameText(Token.Value, 'GOSUB') then
    Result := ParseGosubStatement
- else if UpperCase(Token.Value) = 'ON' then
+ else if SameText(Token.Value, 'ON') then
    Result := ParseOnStatement
  else
  begin
@@ -15518,7 +15673,7 @@ begin
 
   // Consume the closing WEND. ParseWhileStatement manages it directly (like DO/LOOP),
   // so no validation-stack push/pop is involved.
-  if Context.Check(ttLoopBlockEnd) and (UpperCase(Context.CurrentToken.Value) = kWEND) then
+  if Context.Check(ttLoopBlockEnd) and (UpperFast(Context.CurrentToken.Value) = kWEND) then
     Context.Advance;
 
   // antDoLoop layout: child 0 = body, child 1 = condition; metadata in attributes.
@@ -15543,12 +15698,12 @@ begin
   // LOCAL is accepted and treated as a global handler in v1 (no per-procedure scoping).
   // Detected by token value (ERROR/LOCAL are not reserved keywords).
   IsLocal := False;
-  if UpperCase(Context.CurrentToken.Value) = 'LOCAL' then
+  if SameText(Context.CurrentToken.Value, 'LOCAL') then
   begin
     IsLocal := True;
     Context.Advance; // consume LOCAL
   end;
-  if UpperCase(Context.CurrentToken.Value) = kERROR then
+  if UpperFast(Context.CurrentToken.Value) = kERROR then
   begin
     Context.Advance; // consume ERROR
     Result.Free;
@@ -15556,7 +15711,7 @@ begin
     if IsLocal then
       Result.Value := 'LOCAL';
     // Expect GOTO (matched by value to be robust to token classification)
-    if UpperCase(Context.CurrentToken.Value) = kGOTO then
+    if UpperFast(Context.CurrentToken.Value) = kGOTO then
     begin
       Context.Advance; // consume GOTO
       Target := ParseExpression;  // label identifier, or line number (0 disables)
@@ -15821,7 +15976,7 @@ begin
     if Token.TokenType = ttLoopBlockEnd then
     begin
       // A NEXT closing a still-open nested FOR is part of the body, not our terminator.
-      if (UpperCase(Token.Value) = kNEXT) and (PendingFor > 0) then
+      if (UpperFast(Token.Value) = kNEXT) and (PendingFor > 0) then
       begin
         Dec(PendingFor);
         Statement := ParseStatement;        // consumes NEXT, pops the FOR validation entry
@@ -15832,7 +15987,7 @@ begin
       // CLASSIC: a NEXT with no open FOR is a body STATEMENT (it lowers to the runtime
       // ?NEXT WITHOUT FOR raise), never this loop's terminator - treating it as one made
       // ParseDoStatement swallow the token silently. MODERN keeps the strict behavior.
-      if (UpperCase(Token.Value) = kNEXT) and (not FModernMode) then
+      if (UpperFast(Token.Value) = kNEXT) and (not FModernMode) then
       begin
         Statement := ParseStatement;        // orphan antNext (raise when executed)
         if Assigned(Statement) then
@@ -15874,9 +16029,9 @@ begin
     if not Assigned(Token) or (Token.TokenType = ttEndOfFile) then
       Break;
 
-    if (Token.TokenType = ttLoopBlockStart) and (UpperCase(Token.Value) = 'FOR') then
+    if (Token.TokenType = ttLoopBlockStart) and (SameText(Token.Value, 'FOR')) then
       Inc(NestedLevel)
-    else if (Token.TokenType = ttLoopBlockEnd) and (UpperCase(Token.Value) = 'NEXT') then
+    else if (Token.TokenType = ttLoopBlockEnd) and (SameText(Token.Value, 'NEXT')) then
     begin
       if NestedLevel = 0 then
       begin
@@ -15913,9 +16068,9 @@ begin
     if not Assigned(Token) or (Token.TokenType = ttEndOfFile) then
       Break;
 
-    if (Token.TokenType = StartToken) and (UpperCase(Token.Value) = UpperCase(StartKeyword)) then
+    if (Token.TokenType = StartToken) and (UpperFast(Token.Value) = UpperFast(StartKeyword)) then
       Inc(NestedLevel)
-    else if (UpperCase(Token.Value) = EndKeyword) then
+    else if (UpperFast(Token.Value) = EndKeyword) then
     begin
       if NestedLevel = 0 then
       begin

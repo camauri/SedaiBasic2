@@ -275,6 +275,40 @@ FreeBASIC. A pointer obtained with `@` on a variable or an array element is a pa
 unaffected — `*p`, `p[i]`, `p2 - p1` and `For p = @a(0) To @a(n)` all answer what FreeBASIC answers,
 because both sides of those speak the same unit.
 
+**`SizeOf` inside `#if` and `#assert` is the compiler's own answer** (9 September 2026). FreeBASIC's
+preprocessor *is* its compiler, so `#assert sizeof( T ) = 16` is answered from the symbol table.
+SedaiBasic's preprocessor is a separate pass over text, and it answers the same question two ways: a
+scalar or pointer width comes from the very table the compiled `SizeOf()` reads, and a user `Type`'s
+size — a layout question, with alignment padding, `Field = n`, bit-field runs, nested `Union` blocks
+and inline fixed arrays — is put back to the compiler itself, over the declarations the preprocessor
+has emitted so far. There is one layout rule and both askers get its answer.
+  ⚠️ **Where it still differs**: an operand that cannot be resolved at all — a name that is neither a
+  builtin nor a type declared above that point, or a declaration fragment that does not stand on its
+  own — leaves the `#assert` **unmade** rather than failed, where FreeBASIC rejects it. Answering 0
+  instead would turn every declaration shape the collector does not recognise into a failed assertion
+  on a perfectly good file: a wrong refusal costs the whole file, an unmade check costs a
+  verification. The same reading already applies to `#assert TypeOf(a) = TypeOf(b)`.
+  ⚠️ **Residue**: a `Const` whose initialiser is a `SizeOf()` is not folded by the preprocessor, so a
+  later `#if` that names that `Const` reads 0 rather than the size.
+
+**A nested record member is laid out inline** (9 September 2026). `Type Outer: h As Byte: inn As
+Inner: t As Byte: End Type` measures what FreeBASIC says it measures, its fields sit at FreeBASIC's
+offsets, and a binary `Put` of it writes FreeBASIC's bytes — the nested type's own image in place,
+at any depth. `SizeOf`, `OffsetOf`, `Put` and `Get` all read the one layout rule.
+  ⚠️ Reinterpreting a whole record as raw bytes — `*Cast(UByte Ptr, @v)` — is still not supported;
+  that limit is the one described above for wide array elements and has not changed.
+
+**A wide cell round-trips through a fixed-length `WString`** (9 September 2026). A cell holds a
+codepoint, and every value a program can put in one comes back unchanged: a codepoint above U+FFFF,
+and a lone surrogate (U+D800..U+DFFF), which has no meaning of its own in UTF-16 and used to be lost.
+`Len`, `Asc(w, i)` and `w[i]` agree with FreeBASIC over the whole range.
+  ⚠️ **Residue**: a cell outside Unicode altogether (&hFFFFFFFF) reads back as U+FFFD, where
+  FreeBASIC hands the raw 32 bits back — its `WString` is a `wchar_t` array and converts nothing.
+
+**DOS is not a target** (9 September 2026). The `dos/` headers of the FreeBASIC tree — DPMI, segment
+selectors, real-mode BIOS interrupts — describe a memory model this product does not have and will
+not acquire. They sit beside 32-bit Windows as a platform boundary, not as an unfinished feature.
+
 **An array of a narrow type IS a flat byte image** (9 September 2026). `Dim As UByte a(0 To 15)` stores
 its elements one byte apart, a `Short` array two and a `Long` array four — contiguously, exactly as
 FreeBASIC does — so `Peek(ULong, @a(0))` and `*Cast(ULong Ptr, @a(0))` read four of them side by side,
@@ -2747,7 +2781,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time), read off the type's C layout, which is fbc's byte for byte: narrow fields, `FIELD = n`, nested `Union`/`Type` blocks and **runs of bit fields** included. ⛔ A **bit field has no offset** — it has no address — so `OffsetOf` of one is REFUSED, as fbc refuses it (guard `m835`); the run's own packing is guard `m836`. |
-| `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. |
+| `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. 🕳️ **Divergence 202**: `SizeOf` of a *typed* CONST answers the default width, not the declared one (`Const b As Byte` sizes 8 here, 1 in fbc); the VALUE of that constant is already narrowed correctly. |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). `#if TypeOf(x) = <type>` is **answered**, from the declarations that appear ABOVE the directive: fbc's preprocessor is a single top-down pass, so a `#if` at line N needs only lines 1..N-1, and ours collects them as it emits. The result is an UPPER-cased type name, as fbc's own tests spell out (`#assert typeof( pi ) = "INTEGER PTR"`). Two names neither declared nor known as types compare EQUAL to each other and differ from every real type — measured against fbc, not chosen. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |

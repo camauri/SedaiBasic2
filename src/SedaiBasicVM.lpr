@@ -72,7 +72,10 @@ uses
   // Optional SDL2 window presenter for `sb --window` (WITH_WINDOW build only; no SDL2 dependency otherwise)
   {$IFDEF WITH_WINDOW}SedaiGraphicsBackend, SedaiWindowPresenter,{$ENDIF}
   // Runner and Serializer (for .basc support)
-  SedaiRunner, SedaiBytecodeSerializer, SedaiPreprocessor;
+  SedaiRunner, SedaiBytecodeSerializer, SedaiPreprocessor,
+  // Installs GPPTypeSizeHook: "#assert sizeof( T )" on a USER TYPE is answered by the compiler's
+  // own layout rule instead of being left unmade. Linked for its initialization, not called.
+  SedaiTypeSizeProbe;
 
 // Include version information (must be after uses, contains const declarations)
 {$I Version.inc}

@@ -29,9 +29,53 @@ interface
 
 uses
   Classes, SysUtils, fgl, Variants, contnrs, Math,
+  SedaiFastLookup,   // UpperFast: la piega che non alloca quando non serve
   SedaiLexerTypes, SedaiLexerToken, SedaiParserTypes;
 
 type
+  PAttrValue = ^string;
+
+  { TASTAttrs - the attribute store of an AST node: a NAME -> VALUE map, and nothing else.
+
+    ⛔⛔ IT WAS A TStringList, ONE PER NODE, AND THAT IS THE SHAPE THE PROFILE NAMED. A name=value
+    TStringList answers by SCANNING: for each entry a string COPY (Get, with its refcount traffic),
+    a Pos() for the '=' and a CompareText. Measured on win/shlwapi.bi with `perf`, the two halves of
+    "Attributes.Values[...]" - IndexOfName and GetValue - were 19% and 18% of the whole compile,
+    under ParseRecordDecl / ParseInTypeMethodDecl. A header is hundreds of thousands of nodes.
+
+    ⭐ TFPHashList is the container for this and TFPStringHashTable is NOT: the latter's Create
+    builds 196 613 buckets (contnrs.pp: CreateWith(196613, @RSHash)), which per NODE is absurd, while
+    TFPHashList.Create is SetHashCapacity(1) and grows on demand. Its names are SHORTSTRINGS packed
+    in one buffer, so a lookup hashes and compares bytes and never touches a managed string.
+
+    ⚠️ The semantics kept are the RTL's, because 776 call sites depend on them (verified against
+    TStringList itself): a missing name reads '', an empty VALUE does not delete the entry (the RTL
+    leaves "A=" and still finds it), and names compare CASE-INSENSITIVELY - so the key is uppercased
+    here, in one place. The list is built on FIRST WRITE: a node with no attributes allocates
+    nothing and answers every read in a nil test. }
+  TASTAttrs = class
+  private
+    FList: TFPHashList;              // UPPER name -> PAttrValue
+    function GetValue(const Name: string): string;
+    procedure SetValue(const Name, Value: string);
+    function GetName(Index: Integer): string;
+    function GetValueFromIndex(Index: Integer): string;
+    function GetCount: Integer;
+    function GetLine(Index: Integer): string;
+    class function Key(const Name: string): shortstring; static; inline;
+  public
+    destructor Destroy; override;
+    procedure Clear;
+    function IndexOfName(const Name: string): Integer;
+    procedure Assign(Src: TASTAttrs);
+    property Values[const Name: string]: string read GetValue write SetValue;
+    property Names[Index: Integer]: string read GetName;
+    property ValueFromIndex[Index: Integer]: string read GetValueFromIndex;
+    property Count: Integer read GetCount;
+    // The "NAME=VALUE" line a TStringList would have held, for the one place that dumps them.
+    property Lines[Index: Integer]: string read GetLine; default;
+  end;
+
   { TASTNode - Main AST Node class }
   TASTNode = class
   private
@@ -42,11 +86,19 @@ type
     FSourceLine: Integer;
     FSourceColumn: Integer;
     FValue: Variant;           // Node value (for literals)
-    FAttributes: TStringList;  // Additional attributes
+    FAttributes: TASTAttrs;    // Additional attributes (name -> value, hashed)
 
     // Lazy evaluation flags for performance
     FDisplayStringCached: string;
     FDisplayStringValid: Boolean;
+    // ⛔⛔ IL NOME DEL NODO, MAIUSCOLO, CALCOLATO UNA VOLTA SOLA. "UpperCase(VarToStr(N.Value))" e' la
+    // forma piu' ripetuta dell'intero compilatore - 706 siti fra SSA e parser - e ogni occorrenza
+    // ALLOCAVA una stringa nuova per lo stesso nodo, piu' la sua finalizzazione implicita. Qui si
+    // paga una volta per nodo e per valore; scrivere Value azzera la cache.
+    FValueUpper: string;
+    FValueUpperValid: Boolean;
+    procedure SetValue(const AValue: Variant);
+    function GetValueUpper: string;
 
   protected
     procedure DoChildAdded(Child: TASTNode); virtual;
@@ -112,8 +164,10 @@ type
     property LastChild: TASTNode read GetLastChild;
     property SourceLine: Integer read FSourceLine write FSourceLine;
     property SourceColumn: Integer read FSourceColumn write FSourceColumn;
-    property Value: Variant read FValue write FValue;
-    property Attributes: TStringList read FAttributes;
+    property Value: Variant read FValue write SetValue;
+    { Il valore del nodo come stringa MAIUSCOLA, memoizzato. Sostituisce UpperCase(VarToStr(x.Value)). }
+    property ValueUpper: string read GetValueUpper;
+    property Attributes: TASTAttrs read FAttributes;
     property DisplayString: string read GetDisplayString;
   end;
 
@@ -142,7 +196,139 @@ function TryFoldBinaryOp(OpType: TTokenType; Left, Right: TASTNode; Token: TLexe
 
 implementation
 
+{ TASTAttrs }
+
+class function TASTAttrs.Key(const Name: string): shortstring;
+// ⚠️ UPPERCASED, because TStringList compared names with CompareText and 776 call sites were written
+// against that. And CUT at 255: a shortstring cannot hold more, and no attribute name comes close -
+// the longest are composed member decorators ("ACCESS" + a method name).
+// ⛔ FOLDED BY HAND, INTO THE SHORTSTRING ITSELF. Calling UpperCase() here allocates a managed
+// string for every attribute read and write - 11.9% of a header compile the first time this was
+// written, which is most of what the hash table had just saved. A shortstring result lives on the
+// stack: no allocation, no refcount, one pass.
+var
+  i, n: Integer;
+begin
+  n := Length(Name);
+  if n > 255 then n := 255;
+  SetLength(Result, n);
+  for i := 1 to n do
+    if (Name[i] >= 'a') and (Name[i] <= 'z') then
+      Result[i] := Char(Byte(Name[i]) - 32)
+    else
+      Result[i] := Name[i];
+end;
+
+destructor TASTAttrs.Destroy;
+begin
+  Clear;
+  FList.Free;
+  inherited Destroy;
+end;
+
+procedure TASTAttrs.Clear;
+var
+  i: Integer;
+  P: PAttrValue;
+begin
+  if FList = nil then Exit;
+  for i := 0 to FList.Count - 1 do
+  begin
+    P := PAttrValue(FList[i]);
+    if P <> nil then Dispose(P);
+  end;
+  FList.Clear;
+end;
+
+function TASTAttrs.GetCount: Integer;
+begin
+  if FList = nil then Result := 0 else Result := FList.Count;
+end;
+
+function TASTAttrs.IndexOfName(const Name: string): Integer;
+begin
+  if FList = nil then Exit(-1);
+  Result := FList.FindIndexOf(Key(Name));
+end;
+
+function TASTAttrs.GetValue(const Name: string): string;
+var
+  P: Pointer;
+begin
+  Result := '';
+  if FList = nil then Exit;              // a node with no attributes answers here, allocating nothing
+  P := FList.Find(Key(Name));
+  if P <> nil then Result := PAttrValue(P)^;
+end;
+
+procedure TASTAttrs.SetValue(const Name, Value: string);
+var
+  Idx: Integer;
+  P: PAttrValue;
+begin
+  if FList = nil then FList := TFPHashList.Create;
+  Idx := FList.FindIndexOf(Key(Name));
+  if Idx >= 0 then
+  begin
+    // ⛔ An empty value REPLACES, it does not delete: that is what TStringList does ("A=" stays and
+    // IndexOfName still finds it), and code writes '' meaning "clear this", not "remove this".
+    PAttrValue(FList[Idx])^ := Value;
+    Exit;
+  end;
+  New(P);
+  P^ := Value;
+  FList.Add(Key(Name), P);
+end;
+
+function TASTAttrs.GetName(Index: Integer): string;
+begin
+  if (FList = nil) or (Index < 0) or (Index >= FList.Count) then Exit('');
+  Result := FList.NameOfIndex(Index);
+end;
+
+function TASTAttrs.GetValueFromIndex(Index: Integer): string;
+var
+  P: PAttrValue;
+begin
+  Result := '';
+  if (FList = nil) or (Index < 0) or (Index >= FList.Count) then Exit;
+  P := PAttrValue(FList[Index]);
+  if P <> nil then Result := P^;
+end;
+
+function TASTAttrs.GetLine(Index: Integer): string;
+begin
+  Result := GetName(Index) + '=' + GetValueFromIndex(Index);
+end;
+
+procedure TASTAttrs.Assign(Src: TASTAttrs);
+var
+  i: Integer;
+begin
+  Clear;
+  if (Src = nil) or (Src.Count = 0) then Exit;
+  for i := 0 to Src.Count - 1 do
+    SetValue(Src.Names[i], Src.ValueFromIndex[i]);
+end;
+
 { TASTNode }
+
+procedure TASTNode.SetValue(const AValue: Variant);
+begin
+  FValue := AValue;
+  FValueUpperValid := False;      // il nome e' cambiato: la piega memoizzata non vale piu'
+  FDisplayStringValid := False;
+end;
+
+function TASTNode.GetValueUpper: string;
+begin
+  if not FValueUpperValid then
+  begin
+    FValueUpper := UpperFast(VarToStr(FValue));
+    FValueUpperValid := True;
+  end;
+  Result := FValueUpper;
+end;
 
 constructor TASTNode.Create(ANodeType: TASTNodeType; AToken: TLexerToken);
 begin
@@ -152,7 +338,7 @@ begin
   FParent := nil;
   FChildren := TFPObjectList.Create(True); // Own children
   FValue := Unassigned;
-  FAttributes := TStringList.Create;
+  FAttributes := TASTAttrs.Create;
   FDisplayStringValid := False;
 
   // Set source location from token if available

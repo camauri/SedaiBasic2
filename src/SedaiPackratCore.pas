@@ -170,6 +170,15 @@ begin
       begin
         // Memoize ONLY for recursive/complex rules or deep recursion
         // Most BASIC statements are linear and don't need memoization
+        // ⛔ THE CHEAP TESTS FIRST. Every statement and every expression asks this, and the six
+        // string comparisons below are six calls into the RTL's compare: on a header (41 226 expanded
+        // lines) that is the parser's largest single leaf. Every name in the list begins with one of
+        // six letters and is at least 6 characters long, so two integer tests answer NO for almost
+        // every rule that reaches here without touching a string.
+        if (Length(RuleName) < 6) or
+           (not (RuleName[1] in ['E', 'I', 'F', 'W', 'D'])) then
+          Result := FContext.RecursionDepth >= FMemoizationThreshold
+        else
         Result := (RuleName = 'Expression') or           // Recursive (Pratt parser)
                   (RuleName = 'ExpressionStatement') or  // May contain complex expression
                   (RuleName = 'IfStatement') or          // Multi-branch conditionals
