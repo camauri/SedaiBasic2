@@ -54,6 +54,13 @@ type
   TForeignClosureMaker = function(ACtx: TObject; AEntryPC: Int64;
                                   const ASig: string): Pointer of object;
 
+  { ⭐ Un indirizzo MACCHINA riportato al dominio della VM, o 0 se non e' memoria nostra. Serve per i
+    PARAMETRI D'USCITA che portano un puntatore: `strtod(@s, @fine)` non RESTITUISCE il puntatore di
+    fine conversione, lo SCRIVE in `fine`, e li' nessuno lo marca (DIVERGENZE 219). ⛔ Non e'
+    un'euristica: e' la DICHIARAZIONE a dirlo - quel parametro e' "byte ptr ptr", cioe' punta a un
+    puntatore - quindi si guarda solo dove il tipo dice che c'e' un puntatore da guardare. }
+  TForeignPtrHome = function(ACtx: TObject; A: PtrUInt): Int64 of object;
+
   TForeignBinding = record
     Decl: TForeignDecl;
     ArgKinds: array of TForeignKind;
@@ -74,6 +81,7 @@ type
     FResolvePtr: TForeignPtrResolver;
     FPtrRegion: TForeignPtrRegion;      // optional: without it nothing is translated back
     FMakeClosure: TForeignClosureMaker; // optional: senza, un callback resta un PC che C non sa chiamare
+    FPtrHome: TForeignPtrHome;          // optional: senza, un parametro d'uscita resta un indirizzo nudo
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -100,6 +108,7 @@ type
     property ResolvePtr: TForeignPtrResolver read FResolvePtr write FResolvePtr;
     property PtrRegion: TForeignPtrRegion read FPtrRegion write FPtrRegion;
     property MakeClosure: TForeignClosureMaker read FMakeClosure write FMakeClosure;
+    property PtrHome: TForeignPtrHome read FPtrHome write FPtrHome;
   end;
 
 { La mappa dai nostri tipi a quelli della ABI. ⛔ Esportata perche' chi costruisce una CHIUSURA ha
@@ -291,6 +300,8 @@ var
   RegLen: array[0..63] of PtrUInt;
   RegVM: array[0..63] of Int64;
   RegW: array[0..63] of Integer;
+  OutLoc: array[0..63] of Pointer;     // dove un parametro "T PTR PTR" tiene il suo puntatore
+  NOut: Integer;
   NReg: Integer;
   RetAddr: PtrUInt;
   Avail: PtrUInt;
@@ -308,7 +319,7 @@ begin
                                       [B^.Decl.Name, NArgs]);
   Prepare(B^);
 
-  SlotI := 0; SlotF := 0; NReg := 0;
+  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
   begin
@@ -344,6 +355,13 @@ begin
             // rende sana la traduzione all'indietro del risultato (vedi TForeignPtrRegion). Un
             // argomento che era gia' un indirizzo macchina non si registra - un risultato che cade li'
             // dentro deve restare un indirizzo macchina.
+            // ⭐ "T PTR PTR": la dichiarazione dice che LI' DENTRO c'e' un puntatore, quindi dopo la
+            // chiamata quel valore va riportato a casa (DIVERGENZE 219). Solo dove il tipo lo dice.
+            if (P <> nil) and (NOut <= High(OutLoc)) and (i <= High(B^.Decl.ParamTypeNames)) and
+               (Pos(' PTR PTR', UpperCase(B^.Decl.ParamTypeNames[i])) > 0) then
+            begin
+              OutLoc[NOut] := P; Inc(NOut);
+            end;
             if (P <> nil) and (NReg <= High(RegBase)) and Assigned(FPtrRegion) and
                ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail, ElemW) then
             begin
@@ -365,6 +383,24 @@ begin
 
   FillChar(RetBuf, SizeOf(RetBuf), 0);
   AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
+
+  // ⛔ I PARAMETRI D'USCITA CHE PORTANO UN PUNTATORE. `strtod(@s, @fine)` non restituisce il puntatore
+  // di fine conversione: lo SCRIVE in `fine`. Quello e' un indirizzo macchina, e il programma BASIC
+  // che poi fa "*fine" lo legge coi propri opcode - senza questa riconversione moriva (voce 219).
+  // ⚠️ Se non e' memoria nostra resta un indirizzo macchina, marcato: lossy, non sbagliato.
+  if Assigned(FPtrHome) then
+    for i := 0 to NOut - 1 do
+      if OutLoc[i] <> nil then
+      begin
+        RetAddr := PPtrUInt(OutLoc[i])^;
+        if RetAddr <> 0 then
+        begin
+          Avail := 0;
+          ResInt := FPtrHome(ACtx, RetAddr);
+          if ResInt <> 0 then PInt64(OutLoc[i])^ := ResInt
+          else PInt64(OutLoc[i])^ := Int64(RetAddr) or FGNPTR_TAG;
+        end;
+      end;
 
   // ⛔ A RETURN NARROWER THAN A REGISTER IS READ AT ITS OWN WIDTH AND SIGN. libffi widens an integer
   // return to at least a full word, but the BYTES above the declared width are unspecified padding -

@@ -824,6 +824,7 @@ type
     function ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
+    function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
     procedure RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
                              ARet: Pointer; AArgs: PPointer;
                              ARetKind: TForeignKind;
@@ -6368,6 +6369,7 @@ begin
       T.ResolvePtr := @ForeignPtrArg;
       T.PtrRegion := @ForeignPtrRegion;
       T.MakeClosure := @ForeignMakeClosure;
+      T.PtrHome := @ForeignPtrHome;
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
@@ -6496,6 +6498,12 @@ begin
   else
     PInt64(ARet)^ := ACtx.XferInt[255];
   end;
+end;
+
+function TBytecodeVM.ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;
+// Il ponte verso la FFI: un indirizzo macchina riportato a casa, se casa e' nostra. 0 altrimenti.
+begin
+  Result := VMPointerForMachineAddr(TExecutionContext(ACtx), A);
 end;
 
 function TBytecodeVM.VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;
