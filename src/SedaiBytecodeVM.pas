@@ -9733,6 +9733,11 @@ begin
           if Ctx.LastErrorCode <> 0 then
             Ctx.LastErrorLine := FProgram.GetSourceLine(Ctx.PC);
         end
+        // ⭐ Immediate = 2: a real raise whose MESSAGE is the string in Src2, for an error the number
+        // table cannot word - the call of a procedure that is declared and never defined names that
+        // procedure, as fbc's linker does ("undefined reference to `NOTHERE'"). DIVERGENZE 233.
+        else if Instr.Immediate = 2 then
+          raise TExecutorLinkError.CreateWithCode(Ctx.StringRegs[Instr.Src2], Ctx.IntRegs[Instr.Src1])
         else
           raise TExecutorRuntimeException.CreateWithCode(
             ErrorText(Ctx.IntRegs[Instr.Src1]), Ctx.IntRegs[Instr.Src1]);

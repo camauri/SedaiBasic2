@@ -55,6 +55,10 @@ type
 
   // === RUNTIME EXCEPTIONS ===
   TExecutorRuntimeException = class(TExecutorException);
+  // A runtime error standing in for what fbc reports at LINK time - the call of a procedure that is
+  // declared and never defined. It is caught by ON ERROR like any other; its only difference is that
+  // the abort line carries its message, because the message is the name (DIVERGENZE 233).
+  TExecutorLinkError = class(TExecutorRuntimeException);
   TExecutorSyntaxException = class(TExecutorException);
   TExecutorTypeException = class(TExecutorException);
   TExecutorMathException = class(TExecutorException);

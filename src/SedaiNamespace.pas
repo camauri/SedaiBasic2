@@ -792,21 +792,18 @@ begin
       SigPos := Pos('~', Qual);
       if SigPos = 0 then SigPos := Pos('#', Qual);
       if SigPos > 0 then Qual := Copy(Qual, 1, SigPos - 1);
+      // ⛔ Only the IMMEDIATE head, never an outer one. "sub n.child.proc()" is a METHOD - its head
+      // "n.child" is a TYPE - and walking outwards to the namespace "n" gave the method body that
+      // namespace's prefix, so a bare "duplicate" read the namespace variable instead of the inherited
+      // FIELD (fbc's structs/inherit-type-4). A method keeps the resolution it always had.
       DotPos := LastDelimiter('.', Qual);
-      while DotPos > 0 do
+      if DotPos > 0 then
       begin
         Qual := Copy(Qual, 1, DotPos - 1);
         if Ctx.NamespaceNames.IndexOf(Qual) >= 0 then
-        begin
-          ChildPrefix := Qual;
-          Break;
-        end;
-        if (ActivePrefix <> '') and (Ctx.NamespaceNames.IndexOf(ActivePrefix + '.' + Qual) >= 0) then
-        begin
+          ChildPrefix := Qual
+        else if (ActivePrefix <> '') and (Ctx.NamespaceNames.IndexOf(ActivePrefix + '.' + Qual) >= 0) then
           ChildPrefix := ActivePrefix + '.' + Qual;
-          Break;
-        end;
-        DotPos := LastDelimiter('.', Qual);
       end;
     end;
   end;

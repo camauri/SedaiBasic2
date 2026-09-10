@@ -2137,6 +2137,13 @@ begin
             AbortDesc := FBAbortDescription(SedaiExecutorErrors.TExecutorException(E).ErrorCode);
             if AbortDesc <> '' then AbortDesc := ' (' + AbortDesc + ')';
             WriteLn;
+            // ⭐ ...and an error fbc reports at LINK time carries the name it was about. fbc never gets
+            // this far - its linker stops on "undefined reference to `NOTHERE'" - so fbc's sentence alone
+            // would say "illegal function call" and lose the one fact a user needs (DIVERGENZE 233).
+            if E is SedaiExecutorErrors.TExecutorLinkError then
+              WriteLn('Aborting due to runtime error ', SedaiExecutorErrors.TExecutorException(E).ErrorCode, AbortDesc,
+                      ' at line ', ErrorSourceLine, ' of ', AbortModule, '(): ', E.Message)
+            else
             WriteLn('Aborting due to runtime error ', SedaiExecutorErrors.TExecutorException(E).ErrorCode, AbortDesc,
                     ' at line ', ErrorSourceLine, ' of ', AbortModule, '()');
             WriteLn;

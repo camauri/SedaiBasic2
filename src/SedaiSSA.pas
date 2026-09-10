@@ -3165,6 +3165,7 @@ var
   DiagIdx: Integer;   // PROCPTRDIAG only
   DiagKey: string;    // PROCPTRDIAG only
   ArgWide: Boolean;   // DIVERGENZE 150: LEN taglia sul lato WIDE
+  UndefMsgReg: TSSAValue;   // the message of a call to a declared-never-defined procedure (233)
 begin
   if Node = nil then
   begin
@@ -9416,10 +9417,24 @@ begin
           // e' cio' che fa `fbc` ("error 42: Variable not declared").
           // 📊 Tre header della shell di Windows (shobjidl, shlobj, shlwapi) cadevano qui: definiscono
           // una sub che chiama CoTaskMemFree, dichiarata in win/combaseapi.bi.
+          // ⛔⛔ AND THE ERROR HAS TO BE RAISED. This used to be emitted with Immediate = 1, which is
+          // "Err = n" - it SETS the number without raising (see bcRaiseError) - and the number was 5,
+          // which in MODERN is "Illegal resume". So "print nothere(3)" printed 0 and carried on, and
+          // that silence is what hid every foreign function of windows.bi answering 0 (DIVERGENZE 232,
+          // 233). Now it is a real error, code 1 ("Illegal function call"), worded as fbc's linker words
+          // it; an ON ERROR handler can still catch it, and a call that never runs still costs nothing.
           if IsDeclaredProcName(UpperFast(ArrName)) then
           begin
-            EmitInstruction(ssaRaiseError, MakeSSAValue(svkNone), MakeSSAConstInt(5),
-                            MakeSSAValue(svkNone), MakeSSAConstInt(1));
+            UndefMsgReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaLoadConstString, UndefMsgReg,
+                            MakeSSAConstString('undefined reference to `' + UpperFast(ArrName) +
+                                               ''': the procedure is declared and never defined'),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // The VM reads the code out of an INT REGISTER (IntRegs[Src1]), so it is loaded into one: a
+            // bare constant operand read whatever that register held - Err came back 0, and an abort
+            // reported "runtime error 3".
+            EmitInstruction(ssaRaiseError, MakeSSAValue(svkNone), EnsureIntRegister(MakeSSAConstInt(1)),
+                            UndefMsgReg, MakeSSAConstInt(2));
             Result := MakeSSAConstInt(0);
             Exit;
           end;
