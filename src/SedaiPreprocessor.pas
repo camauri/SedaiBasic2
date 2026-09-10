@@ -133,6 +133,12 @@ var
   // this name"), so the rule keeps the behaviour that was measured against fbc rather than a tidier
   // one that would have to be re-measured.
   GPPModuleSymbols: TIndexedStringList = nil;
+  // ...and the subset of those declared while a NAMESPACE block was open. fbc refuses an "#undef"
+  // of a SYMBOL that was defined inside a namespace (error 123, "Symbols defined inside namespaces
+  // cannot be removed") - and only of a symbol: a MACRO is retired from inside a namespace without a
+  // word, and so is a name nothing ever declared. That is why this list is separate from the one
+  // above instead of a flag on it: the question is WHERE the name was declared, not whether it was.
+  GPPNsSymbols: TIndexedStringList = nil;
 
 const
   // The answer a "#if TypeOf(...)" / "#print TypeOf(...)" gives for an operand the table does not
@@ -3951,7 +3957,33 @@ end;
 
 var
   GPPTypeTextDepth: Integer = 0;   // how many TYPE/UNION/ENUM blocks are open in the emitted text
+  GPPNsTextDepth: Integer = 0;     // ...and how many NAMESPACE blocks (DIVERGENZE 211)
   GPPSymProcDepth: Integer = 0;    // ...and how many procedure BODIES: a local is not a module symbol
+
+function PPIsNamespaceOpen(const Rest: string): Boolean;
+// Does what follows the word "Namespace" make the line a namespace BLOCK - a name, then nothing but a
+// comment? A dotted name ("Namespace a.b") is one, and so is a bare "Namespace" (an anonymous one).
+var
+  R: string;
+  q: Integer;
+begin
+  R := Trim(Rest);
+  q := 1;
+  while (q <= Length(R)) and (IsIdentChar(R[q]) or (R[q] = '.')) do Inc(q);
+  R := Trim(Copy(R, q, MaxInt));
+  Result := (R = '') or (R[1] = '''') or (R[1] = ':') or
+            (UpperFast(Copy(R, 1, 3)) = 'REM');
+end;
+
+function PPIsWordEndNamespace(const Rest: string): Boolean;
+// "End Namespace", and not a name that merely STARTS with those nine letters.
+var
+  R: string;
+begin
+  R := UpperFast(Trim(Rest));
+  Result := (Copy(R, 1, 9) = 'NAMESPACE') and
+            ((Length(R) = 9) or (not IsIdentChar(R[10])));
+end;
 
 procedure PPNoteModuleSymbols(const L, W: string; P: Integer);
 // Collect, from a line about to be EMITTED, the identifiers that make it a DECLARATION - the set the
@@ -3982,6 +4014,19 @@ begin
       if GPPSymProcDepth > 0 then Dec(GPPSymProcDepth);
   end;
   if (GPPSymProcDepth > 0) or (GPPTypeTextDepth > 0) then Exit;
+  // NAMESPACE blocks open and close here, and BOTH guards above them are load-bearing.
+  // ⛔ A line whose first word is "namespace" is not necessarily a namespace: win/shobjidl.bi
+  // declares a COM vtable with a FIELD called NameSpace ("NameSpace as function(...)"), five times,
+  // and counting those opened a block that nothing ever closed - so every "#undef" for the rest of
+  // win/shlwapi.bi read as being inside a namespace and the header went MATCH → DIFF. Two things
+  // answer it: a field is inside a TYPE, so the exit above already skips it, and a real namespace
+  // carries nothing after its name but a comment.
+  if (W = 'NAMESPACE') and PPIsNamespaceOpen(Copy(L, P, MaxInt)) then
+    Inc(GPPNsTextDepth)
+  else if (W = 'END') and PPIsWordEndNamespace(Copy(L, P, MaxInt)) then
+  begin
+    if GPPNsTextDepth > 0 then Dec(GPPNsTextDepth);
+  end;
   if not ((W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
           (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
           (W = 'ENUM') or (W = 'UNION') or (W = 'COMMON')) then Exit;
@@ -3990,6 +4035,12 @@ begin
     GPPModuleSymbols := TIndexedStringList.Create;
     GPPModuleSymbols.CaseSensitive := False;
     GPPModuleSymbols.Duplicates := dupIgnore;
+  end;
+  if (GPPNsTextDepth > 0) and (GPPNsSymbols = nil) then
+  begin
+    GPPNsSymbols := TIndexedStringList.Create;
+    GPPNsSymbols.CaseSensitive := False;
+    GPPNsSymbols.Duplicates := dupIgnore;
   end;
   // ⛔⛔ E I PARAMETRI DI UNA PROCEDURA NON SONO SIMBOLI DI MODULO. flite/cst_clunits.bi scrive
   //     declare function clunit_get_unit_index(..., byval unit_type as const zstring ptr, ...)
@@ -4033,6 +4084,8 @@ begin
       Id := UpperFast(Copy(L, b, q - b));
       if (Id <> '') and (GPPModuleSymbols.IndexOf(Id) < 0) then
         GPPModuleSymbols.Add(Id);
+      if (Id <> '') and (GPPNsTextDepth > 0) and (GPPNsSymbols.IndexOf(Id) < 0) then
+        GPPNsSymbols.Add(Id);
     end
     else
       Inc(q);
@@ -5034,6 +5087,21 @@ var
           end
           else if (DName = 'undef') and Emitting then
           begin
+            // ⛔⛔ A SYMBOL DEFINED INSIDE A NAMESPACE CANNOT BE REMOVED (fbc error 123,
+            // DIVERGENZE 211). Measured on seven shapes against the oracle, and the rule is narrow in
+            // all three of its terms: fbc takes "#undef" of a MACRO inside a namespace, takes it of a
+            // name nothing declared, and takes it of a module-level symbol from inside a namespace -
+            // it refuses only the name that a DECLARE / CONST / TYPE put there while the block was
+            // open. ⭐ The header that pays for it is win/GdiPlus.bi: it opens "namespace Gdiplus"
+            // and includes win/winerror.bi inside it, so "const __IN__WINERROR_ = 1" is a symbol OF
+            // that namespace and the "#undef __IN__WINERROR_" 3 500 lines below is the error.
+            if (GPPNsTextDepth > 0) and (Trim(DRest) <> '') and
+               (Defs.IndexOfName(UpperFast(Trim(DRest))) < 0) and
+               (FnDefs.IndexOfName(UpperFast(Trim(DRest))) < 0) and
+               (GPPNsSymbols <> nil) and
+               (GPPNsSymbols.IndexOf(UpperFast(Trim(DRest))) >= 0) then
+              raise EPreprocessorError.Create(
+                'Symbols defined inside namespaces cannot be removed, ' + Trim(DRest));
             // ⛔ ...from BOTH tables. "#undef m" of a function-like macro left it in FnDefs, so the
             // name went on expanding after the program had explicitly retired it.
             PPRetireDef(Defs, Defs.IndexOfName(UpperFast(Trim(DRest))));
@@ -5577,7 +5645,9 @@ begin
   GPPSourceForDefined := '';
   FreeAndNil(GPPTypeDeclLines);
   FreeAndNil(GPPModuleSymbols);
+  FreeAndNil(GPPNsSymbols);
   GPPTypeTextDepth := 0;
+  GPPNsTextDepth := 0;
   GPPSymProcDepth := 0;
   GPPSzCacheKey := '';
   GPPDefinedLimit := -1;

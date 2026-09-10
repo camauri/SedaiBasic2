@@ -558,6 +558,8 @@ type
     // chiamata a uno di questi non e' un array mancante: e' una procedura senza corpo, che `fbc`
     // compila e lascia fallire al LINK.
     FDeclProcNames: TFPStringHashTable;
+    FBareTypeNames: TFPStringHashTable;   // ultimo segmento dei nomi di tipo qualificati
+
     // La memoria di IsSingleExpr, viva solo dentro una domanda: vedi la nota su 2^profondita'.
     FSingleMemo: specialize TDictionary<PtrUInt, Byte>;
     FSingleMemoDepth: Integer;
@@ -1585,6 +1587,7 @@ type
     // Refuse a CONST whose initialiser is not a constant expression (DIVERGENZE 200).
     procedure CheckConstInitialisers(Node: TASTNode);
     function ExprMentionsQualifiedName(Node: TASTNode): Boolean;
+    function TypeNameKnownUnderAnyPrefix(const T: string): Boolean;
     function TypeDeclaredAfter(const TypeName: string; UseLine: Integer): Boolean;
     function DeclaredTypeNameIsKnown(const TypeName: string): Boolean;
     function DeclaredTypeNameIsKnownUncached(const TypeName: string): Boolean;
@@ -2010,6 +2013,7 @@ begin
   FreeAndNil(FCanonCache);
   FreeAndNil(FDeclKnownCache);
   FreeAndNil(FDeclProcNames);
+  FreeAndNil(FBareTypeNames);
   FreeAndNil(FSingleMemo);
   FStaticMembers.Free;
   FStaticMemberProcs.Free;
@@ -40042,6 +40046,52 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.TypeNameKnownUnderAnyPrefix(const T: string): Boolean;
+// E' registrato un tipo il cui ULTIMO SEGMENTO e' questo nome? Il set si costruisce una volta sola,
+// dai tre registri dei nomi di tipo, e solo se qualcuno lo chiede.
+var
+  i, d: Integer;
+  K: string;
+begin
+  if FBareTypeNames = nil then
+  begin
+    FBareTypeNames := TFPStringHashTable.Create;
+    if FTypeAliases <> nil then
+      for i := 0 to FTypeAliases.Count - 1 do
+      begin
+        K := UpperFast(FTypeAliases.Names[i]);
+        d := LastDelimiter('.', K);
+        if d > 0 then
+        begin
+          K := Copy(K, d + 1, MaxInt);
+          if (K <> '') and (FBareTypeNames.Items[K] = '') then FBareTypeNames.Add(K, '1');
+        end;
+      end;
+    for i := 0 to High(FUDTs) do
+    begin
+      K := FUDTs[i].Name;
+      d := LastDelimiter('.', K);
+      if d > 0 then
+      begin
+        K := Copy(K, d + 1, MaxInt);
+        if (K <> '') and (FBareTypeNames.Items[K] = '') then FBareTypeNames.Add(K, '1');
+      end;
+    end;
+    if FEnumNames <> nil then
+      for i := 0 to FEnumNames.Count - 1 do
+      begin
+        K := UpperFast(FEnumNames[i]);
+        d := LastDelimiter('.', K);
+        if d > 0 then
+        begin
+          K := Copy(K, d + 1, MaxInt);
+          if (K <> '') and (FBareTypeNames.Items[K] = '') then FBareTypeNames.Add(K, '1');
+        end;
+      end;
+  end;
+  Result := FBareTypeNames.Items[T] <> '';
+end;
+
 function TSSAGenerator.TypeDeclaredAfter(const TypeName: string; UseLine: Integer): Boolean;
 // ⛔⛔ «DICHIARATO» E «DICHIARATO GIA'» SONO DUE DOMANDE, e `fbc` risponde alla seconda: e' a passata
 // unica, quindi un tipo che compare PIU' AVANTI non esiste ancora nel punto in cui lo si usa. Le
@@ -40237,13 +40287,54 @@ var
   ParamList, ParamNode, TypeNode: TASTNode;
   Nm: string;
 
-  procedure WantName(const TypeNm, What: string);
+  { Il prefisso di NAMESPACE di un nome gia' composto: "GDIPLUS.RPC_NEW_HTTP_PROXY_CHANNEL" -> "GDIPLUS." }
+  function NsPrefixOf(const Composed: string): string;
+  var
+    d: Integer;
+  begin
+    Result := '';
+    d := LastDelimiter('.', Composed);
+    if d > 0 then Result := Copy(Composed, 1, d);
+  end;
+
+  { ...e per un nodo che il proprio prefisso non ce l'ha, lo si trova RISALENDO. Un puntatore a
+    procedura che e' un CAMPO di vtable si chiama "QUERYINTERFACE" e basta: il namespace sta sul TIPO
+    che lo contiene ("GDIPLUS.IUNKNOWNVTBL"), qualche livello piu' su. }
+  function NsContextOf(N: TASTNode): string;
+  var
+    P: TASTNode;
+    Guard: Integer;
+  begin
+    Result := '';
+    P := N;
+    Guard := 0;
+    while (P <> nil) and (Guard < 64) do
+    begin
+      Result := NsPrefixOf(P.ValueUpper);
+      if Result <> '' then Exit;
+      P := P.Parent;
+      Inc(Guard);
+    end;
+    Result := '';
+  end;
+
+  procedure WantNameIn(const TypeNm, What, NsPrefix: string);
   begin
     Nm := Trim(TypeNm);
     if (Nm = '') or (Pos('.', Nm) > 0) then Exit;
     if DeclaredTypeNameIsKnown(Nm) then Exit;
+    // ⛔⛔ ...E DENTRO UN NAMESPACE IL TIPO E' REGISTRATO COL PREFISSO. win/GdiPlus.bi apre
+    // "namespace Gdiplus", quindi "type RPC_HTTP_REDIRECTOR_STAGE as ..." finisce nel registro come
+    // GDIPLUS.RPC_HTTP_REDIRECTOR_STAGE, e chiederlo NUDO risponde «non dichiarato» su un header che
+    // `fbc` compila. La domanda si pone anche nello scope in cui vive la dichiarazione che la fa.
+    if (NsPrefix <> '') and DeclaredTypeNameIsKnown(NsPrefix + Nm) then Exit;
     raise Exception.CreateFmt(
       'Type not declared: "%s" types %s and nothing in this program declares it', [Nm, What]);
+  end;
+
+  procedure WantName(const TypeNm, What: string);
+  begin
+    WantNameIn(TypeNm, What, '');
   end;
 
   procedure Want(N: TASTNode; const What: string);
@@ -40265,6 +40356,15 @@ var
     b, i: Integer;
   begin
     if N.Attributes.Values['FUNCPTR'] <> '1' then Exit;
+    // ⛔⛔ NON DENTRO UN NAMESPACE. Li' ogni tipo e' registrato col PREFISSO
+    // (win/GdiPlus.bi apre "namespace Gdiplus", e "type X as ..." diventa GDIPLUS.X), mentre questa
+    // domanda e' PIATTA: chiedere il nome nudo risponde «non dichiarato» su un header che `fbc`
+    // compila, e chiedere col prefisso trovato risalendo l'albero ne salva uno e lascia il successivo.
+    // ⇒ La regola vale dove la sua domanda e' esatta, cioe' fuori da un namespace; dentro, serve lo
+    // stesso imbuto che risolve un nome di tipo durante la generazione (FindUDT + il percorso di
+    // scope), che a pre-passata non e' ancora in mano. Stessa lezione della regola sulle variabili,
+    // ritirata per la stessa ragione (DIVERGENZE 206).
+    if NsContextOf(N) <> '' then Exit;
     Lst := N.Attributes.Values['FPPARAMS'];
     b := 1;
     for i := 1 to Length(Lst) + 1 do
@@ -40278,10 +40378,10 @@ var
         // puntatore a procedura annidato (sqlite3.bi, xFindFunction). Si guarda se il '#' c'e', non
         // se la stringa e' esattamente "#P".
         if Pos('#', Copy(Lst, b, i - b)) = 0 then
-          WantName(Copy(Lst, b, i - b), 'a parameter of ' + What);
+          WantNameIn(Copy(Lst, b, i - b), 'a parameter of ' + What, NsContextOf(N));
         b := i + 1;
       end;
-    WantName(N.Attributes.Values['FPRET'], 'the result of ' + What);
+    WantNameIn(N.Attributes.Values['FPRET'], 'the result of ' + What, NsContextOf(N));
   end;
 
 begin
@@ -40316,8 +40416,18 @@ begin
       if ParamNode.ChildCount < 1 then Continue;
       TypeNode := ParamNode.GetChild(0);
       if (TypeNode = nil) or (TypeNode.NodeType <> antIdentifier) then Continue;
-      Want(TypeNode, 'the field "' + VarToStr(ParamNode.Value) + '" of "' +
-                     VarToStr(Node.Value) + '"');
+      begin
+        WantNameIn(VarToStr(TypeNode.Value), 'the field "' + VarToStr(ParamNode.Value) + '" of "' +
+                   VarToStr(Node.Value) + '"', NsContextOf(Node));
+        // ⚠️ ...e la domanda sull'ORDINE resta: sostituire Want con WantNameIn l'aveva persa, e la
+        // guard m900b - l'include nell'ordine sbagliato - e' passata da rossa a verde in silenzio.
+        if TypeDeclaredAfter(VarToStr(TypeNode.Value), TypeNode.SourceLine) then
+          raise Exception.CreateFmt(
+            'Type not declared yet: "%s" types the field "%s" of "%s" on line %d and is declared ' +
+            'later - a single pass compiler has not seen it here',
+            [VarToStr(TypeNode.Value), VarToStr(ParamNode.Value), VarToStr(Node.Value),
+             TypeNode.SourceLine]);
+      end;
     end;
   if Node.NodeType = antProcedureDecl then
   begin
@@ -40358,7 +40468,7 @@ procedure TSSAGenerator.CheckDeclaredProcTypes(AST: TASTNode);
 // The list comes off the program node: a bodiless DECLARE emits no AST node, so the parser is the
 // only pass that ever sees its types, and this is the first that knows what a TYPE is.
 var
-  Txt, Rec, Kind, Nm, Tail: string;
+  Txt, Rec, Kind, Nm, Tail, NsTag: string;
   p1, p2, Start, i: Integer;
   DeclLn, UseLn, DeclIdx: Integer;
 begin
@@ -40393,7 +40503,27 @@ begin
       // ⚠️ Unstated passing mode reads as BYREF (the parser says so), i.e. no refusal - the direction
       // a new rule must err in.
       Tail := Copy(Rec, p2 + 1, MaxInt);
-      if DeclaredTypeNameIsKnown(Nm) then
+      // ⛔ Il NAMESPACE in cui la DECLARE vive, se ce n'e' uno: il parser lo mette in coda al record
+      // come "|NS:<nome>". Dentro un namespace i tipi sono registrati col prefisso, quindi la domanda
+      // va posta anche li' - senza, si rifiuta win/GdiPlus.bi, che `fbc` compila.
+      NsTag := '';
+      p1 := Pos('|NS:', Tail);
+      if p1 > 0 then
+      begin
+        NsTag := Copy(Tail, p1 + 4, MaxInt) + '.';
+        Tail := Copy(Tail, 1, p1 - 1);
+      end;
+      // ⛔⛔ QUI, E SOLO QUI, si accetta un tipo dichiarato sotto un QUALUNQUE prefisso. Un record
+      // DECLTYPES e' TESTO: non porta con se' il nodo da cui leggere il namespace in cui la DECLARE
+      // vive, e dentro un namespace i tipi sono registrati col prefisso - win/GdiPlus.bi apre
+      // "namespace Gdiplus", e le sue DECLARE nominano RPC_BINDING_HANDLE nudo mentre il registro lo
+      // tiene come GDIPLUS.RPC_BINDING_HANDLE. Senza questo, si rifiuta un header che `fbc` compila.
+      // ⚠️ E' una permissivita' DICHIARATA e circoscritta: accetta anche un nome dichiarato in un
+      // ALTRO namespace. I CAMPI e i puntatori a procedura NON la usano - loro il nodo ce l'hanno e
+      // chiedono con il prefisso esatto (NsContextOf), che e' la risposta giusta.
+      if DeclaredTypeNameIsKnown(Nm) or
+         ((NsTag <> '') and DeclaredTypeNameIsKnown(NsTag + Nm)) or
+         TypeNameKnownUnderAnyPrefix(UpperFast(Trim(TypeBaseName(Nm)))) then
       begin
         // ⛔⛔ ...AND "DECLARED" MEANS "DECLARED ABOVE". fbc is a single pass and refuses a DECLARE
         // whose type comes LATER in the file ("error 59"); this pipeline's pre-scans flatten the

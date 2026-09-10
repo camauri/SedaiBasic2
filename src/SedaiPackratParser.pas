@@ -1785,6 +1785,10 @@ var
   FgnByVal: Boolean;        // the parameter's stated passing mode; unstated reads as BYREF
   FgnLastDecl: Integer;     // index in FDeclTypeUses of the type just recorded, so a PTR can mark it
   FgnNameRaw: string;
+  NsTag: string;   // '|NS:<namespace>' quando la DECLARE vive dentro un namespace
+  DupNm: string;
+  DupK: Integer;
+  DupOvl: Boolean;
 begin
   Result := nil;
   // Consume the module-level mark ParseProgram set: this invocation is a top-level statement, every
@@ -1911,8 +1915,23 @@ begin
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
       Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
       (Pos('.', VarToStr(Context.PeekToken(2).Value)) = 0) then
-     if FForwardDeclNames.IndexOf(UpperFast(VarToStr(Context.PeekToken(2).Value))) < 0 then
-       FForwardDeclNames.Add(UpperFast(VarToStr(Context.PeekToken(2).Value)));
+   begin
+     // ⛔⛔⛔ LA REGOLA SUI DOPPIONI E' STATA SCRITTA, MISURATA E RITIRATA (10 set 2026), e resta
+     // qui come nota perche' la misura vale piu' del codice. `fbc` risponde "error 4: Duplicated
+     // definition" a DUE DECLARE dello stesso nome a livello di modulo - identiche, con ritorno
+     // diverso o con PARAMETRI diversi: in FreeBASIC non c'e' overloading implicito. La regola chiude
+     // `crt/win32/ctype.bi`, ma cosi' com'e' rifiuta anche due programmi validi e vuole due esenzioni
+     // che non sono ancora misurate:
+     //   1. una DECLARE dentro un corpo di TYPE e' un METODO, non un doppione (guard m809: "declare
+     //      function f1()" al modulo e la stessa riga dentro un Type);
+     //   2. `fastcgi/fcgi_stdio.bi` dichiara `perror` accanto a quella di `crt`, entrambe con ALIAS,
+     //      e `fbc` la prende - quindi la regola vera non e' «due DECLARE dello stesso nome».
+     // 📊 Con la regola accesa: bi_sweep DIFF 0 -> 1, corpus 1039 -> 1038. Senza: `crt/win32/ctype.bi`
+     // resta OVER. Prima di riscriverla si misurano le due forme sopra contro l'oracolo.
+     DupNm := UpperFast(VarToStr(Context.PeekToken(2).Value));
+     if FForwardDeclNames.IndexOf(DupNm) < 0 then
+       FForwardDeclNames.Add(DupNm);
+   end;
    // ⭐ ...AND A DECLARE THAT CARRIES AN "ALIAS" IS A FOREIGN PROCEDURE, so its SIGNATURE is collected
    // on the way past. The line is skipped token by token anyway; reading it while walking costs
    // nothing and is the only place the information exists - a bodiless DECLARE emits no node at all.
@@ -2024,14 +2043,21 @@ begin
        // Skipping it means the check simply says nothing about qualified types - the safe direction
        // for a rule that adds a refusal.
        FgnLastDecl := -1;
+       if FNsPrefix <> '' then NsTag := '|NS:' + UpperFast(FNsPrefix) else NsTag := '';
        if not (Assigned(Context.PeekNext) and (VarToStr(Context.PeekNext.Value) = '.')) then
        begin
          // The RETURN of a function is always by value; a parameter says so itself.
+         // ⛔⛔ E IL NAMESPACE VIAGGIA CON LA DOMANDA. Dentro un namespace ogni tipo e' registrato
+         // col PREFISSO - win/GdiPlus.bi apre "namespace Gdiplus" e "type RPC_BINDING_HANDLE as ..."
+         // diventa GDIPLUS.RPC_BINDING_HANDLE - mentre la domanda che la SSA pone e' sul nome NUDO, e
+         // rispondeva «non dichiarato» su un header che `fbc` compila.
+         // ⚠️ NON si smette di chiedere: smettere costa 5 header che `fbc` rifiuta e noi prenderemmo
+         // (misurato: AGREE 383 -> 378). Si porta il PREFISSO fino a chi risponde, in coda al record.
          if FgnDepth > 0 then
            FDeclTypeUses.Add('P|' + FgnTok + '|' + IntToStr(Context.CurrentToken.Line) + '|' +
-                             BoolToStr(FgnByVal, 'V', 'R'))
+                             BoolToStr(FgnByVal, 'V', 'R') + NsTag)
          else
-           FDeclTypeUses.Add('R|' + FgnTok + '|' + IntToStr(Context.CurrentToken.Line) + '|V');
+           FDeclTypeUses.Add('R|' + FgnTok + '|' + IntToStr(Context.CurrentToken.Line) + '|V' + NsTag);
          FgnLastDecl := FDeclTypeUses.Count - 1;
          FgnByVal := False;          // the next parameter states its own mode
        end;
@@ -12746,8 +12772,8 @@ begin
       // sotto-header che nominano un tipo dichiarato dal loro parente. Stesso canale di DECLTYPES,
       // con il proprio genere: 'X'.
       if (TypeName <> '') and (Pos('.', TypeName) = 0) then
-        FDeclTypeUses.Add('X|' + TypeName + '|' +
-                          IntToStr(Context.CurrentToken.Line) + '|R');
+        FDeclTypeUses.Add('X|' + TypeName + '|' + IntToStr(Context.CurrentToken.Line) + '|R' +
+                          BoolToStr(FNsPrefix <> '', '|NS:' + UpperFast(FNsPrefix), ''));
       Context.Advance;
       // "As String * 5" - a fixed-length capacity, which is part of the type, not a decoration.
       if Context.Check(ttOpMul) then
