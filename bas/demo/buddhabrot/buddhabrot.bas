@@ -896,9 +896,9 @@ End Sub
 ''  the default 400, twenty-five at size=200 - and anything past that is silently not drawn. Adding a
 ''  field only when it still fits means a narrow window loses whole fields, in order of importance,
 ''  rather than losing the end of whatever happened to be last.
-Function Fits( ByVal line As String, ByVal extra As String ) As String
-  If Len(line) + Len(extra) <= imageSize \ 8 Then Return line + extra
-  Return line
+Function Fits( ByVal txt As String, ByVal extra As String ) As String
+  If Len(txt) + Len(extra) <= imageSize \ 8 Then Return txt + extra
+  Return txt
 End Function
 
 #if __SB_WASM__
@@ -981,12 +981,12 @@ End Sub
 ''  9. ARGUMENTS
 '' ================================================================================================
 
-Function ArgumentValue( ByVal name As String, ByVal fallback As String ) As String
+Function ArgumentValue( ByVal argname As String, ByVal fallback As String ) As String
   Dim As Integer i = 1
   Do While Len(Command(i)) > 0
     Dim As String argument = Command(i)
-    If Left(argument, Len(name) + 1) = name + "=" Then
-      Return Mid(argument, Len(name) + 2)
+    If Left(argument, Len(argname) + 1) = argname + "=" Then
+      Return Mid(argument, Len(argname) + 2)
     End If
     i = i + 1
   Loop
@@ -1050,15 +1050,15 @@ End Sub
 ''  and the page can only call what the module exports.
 ''    0 reading (a = 0..2)   1 gamma in tenths   2 zoom in at pixel (a, b)   3 zoom out
 ''    4 home                 5 restart           6 iteration ceiling = a
-Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
+Sub Control( ByVal cmd As Integer, ByVal a As Integer, ByVal b As Integer )
   Dim As Integer moved = 0
-  If command = 0 Then
+  If cmd = 0 Then
     colourReading = a Mod READING_COUNT
-  ElseIf command = 1 Then
+  ElseIf cmd = 1 Then
     toneGamma = a / 10.0
     If toneGamma < 1.2  Then toneGamma = 1.2
     If toneGamma > 12.0 Then toneGamma = 12.0
-  ElseIf command = 2 Then
+  ElseIf cmd = 2 Then
     '' The inverse of the mapping PixelIndexOf makes, exactly as the native mouse zoom does:
     '' a pixel of the canvas IS a point of the complex plane.
     If a >= 0 And a < imageSize And b >= 0 And b < imageSize Then
@@ -1067,14 +1067,14 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
       viewHalfSpan = viewHalfSpan / 2.0
       moved = 1
     End If
-  ElseIf command = 3 Then
+  ElseIf cmd = 3 Then
     ZoomOut() : moved = 1
-  ElseIf command = 4 Then
+  ElseIf cmd = 4 Then
     viewCentreReal = HOME_CENTRE_REAL : viewCentreImaginary = HOME_CENTRE_IMAGINARY
     viewHalfSpan = HOME_HALF_SPAN : moved = 1
-  ElseIf command = 5 Then
+  ElseIf cmd = 5 Then
     moved = 1
-  ElseIf command = 6 Then
+  ElseIf cmd = 6 Then
     SetIterationCeiling(a)
     moved = 1
   End If
@@ -1090,7 +1090,7 @@ Sub Control( ByVal command As Integer, ByVal a As Integer, ByVal b As Integer )
   '' ⛔ AND THE MODULE SAYS WHERE THE VIEW IS, rather than letting the page work it out. The page has
   '' no other way to know - a Sub returns nothing - and the alternative is for the page to keep its
   '' own copy of the mapping from a pixel to the plane, which is a SECOND description of the one
-  '' thing this file is careful to describe once. Printing it costs a line per command, and it is
+  '' thing this file is careful to describe once. Printing it costs a line per cmd, and it is
   '' also what tells the reader that a tap landed at all when the fresh window is still nearly empty.
   Print "view "; HOME_HALF_SPAN / viewHalfSpan; " "; viewCentreReal; " "; viewCentreImaginary
 End Sub

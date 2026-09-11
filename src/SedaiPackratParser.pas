@@ -259,6 +259,7 @@ type
                                               NameTok: TLexerToken);
     procedure CheckByRefReturn(ProcNode: TASTNode);
     procedure CheckRedimTargetIsAName(Node: TASTNode);
+    procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -1642,6 +1643,8 @@ begin
  // static-storage question be asked: it needs to know whether a declaration sits inside a NAMESPACE.
  CollectModuleLocalNames(Result, False);
  RejectStaticVarLenStringInit(Result, False);
+  // ⛔ MODERN names nothing FreeBASIC reserves (committente, 11 set 2026 - DIVERGENZE 264).
+  if FModernMode then RejectReservedDeclNames(Result);
 
  // The module-level FORWARD declarations, handed to the namespace pass on the root: a name the program
  // declares that way is one of its own and beats a "Using" import, and it emitted no node to say so.
@@ -11992,6 +11995,162 @@ begin
     else
       Exit;
     end;
+end;
+
+procedure TPackratParser.RejectReservedDeclNames(Node: TASTNode);
+// ⛔⛔ IN MODERN THE RESERVED WORDS ARE FreeBASIC's (owner, 11 Sep 2026 - DIVERGENZE 264). "Dim As Any Ptr
+// lib" compiled here and fbc answers "error 4: Duplicated definition": LIB is the Lib of Declare ... Lib.
+// ⭐ THE SETS ARE MEASURED, NOT RECALLED. 1202 candidate words - every keyword of our own table and every
+// word in the names of the FreeBASIC manual's examples - each compiled by fbc 1.10.1 as a declared name,
+// in five contexts. 126 words fbc refuses as a VARIABLE and as a PARAMETER that were accepted here, and
+// the other contexts are NOT the same set, which is why a single list would be wrong:
+//   - as a PROCEDURE name fbc allows 9 of them (BSAVE, LEFT, RIGHT, SCREENGLPROC and the VAL family);
+//   - as a CONSTANT it allows TRUE and FALSE;
+//   - as a UDT FIELD it refuses only 5 (see the field check).
+// ⚠️ Only what the PROGRAM declares: a bodiless DECLARE of a header leaves no node here, and the names the
+// compiler synthesizes are not AST names. And MODERN only - CLASSIC keeps its own vocabulary.
+const
+  RESERVED =
+    ' ACCESS ALIAS ALLOCATE ANY ASM BINARY BIT BITRESET BITSET BOOLEAN BSAVE BYTE CALLOCATE CBOOL CDECL' +
+    ' CHAIN CHR CLEAR COMMAND CPTR CURDIR CVA_ARG CVA_COPY CVA_END CVA_START CVD CVI CVL CVLONGINT CVS' +
+    ' CVSHORT DEALLOCATE DECLARE DEFINED DOUBLE DYNAMIC ENCODING ENVIRON EOF ERFN ERMN ERROR EXEC EXEPATH' +
+    ' EXPLICIT EXPORT EXTERN FALSE FB_MEMCOPY FB_MEMCOPYCLEAR FB_MEMMOVE FIELD __FUNCTION__ HIBYTE HIWORD' +
+    ' IIF IMPORT INCLUDE INP INTEGER LEFT LIB LINE LOBYTE LOC LOCAL LOF LONG LONGINT LOWORD LPOS MID MKD' +
+    ' MKI MKL MKLONGINT MKS MKSHORT NAME OBJECT OFFSETOF OUTPUT OVERLOAD PASCAL POINT POINTCOORD PRESERVE' +
+    ' PRIVATE PROCPTR PROTECTED PUBLIC PUT RANDOM REALLOCATE RIGHT SADD SCREENEVENT SCREENGLPROC SCREENLIST' +
+    ' SCREENPTR SEEK SHORT SINGLE SIZEOF STDCALL STR STRING STRPTR TRUE UBYTE UINTEGER ULONG ULONGINT' +
+    ' UNSIGNED USHORT VAL VALINT VALLNG VALUINT VALULNG VARPTR WINPUT WRITE WSTR WSTRING ZSTRING ';
+  PROC_ALLOWED  = ' BSAVE LEFT RIGHT SCREENGLPROC VAL VALINT VALLNG VALUINT VALULNG ';
+  CONST_ALLOWED = ' FALSE TRUE ';
+  // ...and words a Dim never meets as a name (a "Dim As T Ptr" is a type), measured in the other contexts:
+  // fbc answers "Illegal specification" to a parameter or procedure named PTR / POINTER, and "Duplicated
+  // definition" to these as a CONST.
+  PARAM_EXTRA   = ' POINTER PTR ';
+  PROC_EXTRA    = ' POINTER PTR ';
+  CONST_EXTRA   = ' BASE CSRLIN ERL ERR INKEY POINTER PTR ';
+
+  // ⭐ ...and INSIDE A NAMESPACE fbc frees many of them (measured the same way, 11 Sep 2026 - the fbc
+  // suite's namespace/dups_qkwd declares "const line" there, and fbcunit's TEST(local) is a SUB named
+  // LOCAL inside the suite's namespace). Three sets, because the contexts differ there too:
+  NS_VAR_OK =      // as a VARIABLE and as a PARAMETER
+    ' ALLOCATE BIT BITRESET BITSET BSAVE CALLOCATE CHAIN CLEAR COMMAND CURDIR DEALLOCATE ENVIRON EOF' +
+    ' ERFN ERMN EXEC EXEPATH FALSE FB_MEMCOPY FB_MEMCOPYCLEAR FB_MEMMOVE HIBYTE HIWORD INP LEFT' +
+    ' LOBYTE LOC LOF LOWORD LPOS OBJECT OFFSETOF POINTCOORD REALLOCATE RIGHT SCREENEVENT' +
+    ' SCREENGLPROC SCREENLIST SCREENPTR TRUE VAL VALINT VALLNG VALUINT VALULNG ';
+  NS_CONST_OK =    // as a CONSTANT (and a type name)
+    ' ACCESS ALLOCATE BINARY BIT BITRESET BITSET BSAVE CALLOCATE CHAIN CHR CLEAR COMMAND CURDIR CVD' +
+    ' CVI CVL CVLONGINT CVS CVSHORT DEALLOCATE DEFINED DYNAMIC ENCODING ENVIRON EOF ERFN ERMN ERROR' +
+    ' EXEC EXEPATH EXPLICIT FALSE FB_MEMCOPY FB_MEMCOPYCLEAR FB_MEMMOVE FIELD HIBYTE HIWORD INCLUDE' +
+    ' INP LEFT LINE LOBYTE LOC LOCAL LOF LOWORD LPOS MID MKD MKI MKL MKLONGINT MKS MKSHORT NAME' +
+    ' OBJECT OFFSETOF OUTPUT POINT POINTCOORD PRESERVE PUT RANDOM REALLOCATE RIGHT SADD SCREENEVENT' +
+    ' SCREENGLPROC SCREENLIST SCREENPTR SEEK SIZEOF STR STRPTR TRUE VAL VALINT VALLNG VALUINT' +
+    ' VALULNG VARPTR WINPUT WRITE WSTR ';
+  NS_PROC_OK =     // as a PROCEDURE name
+    ' ACCESS ALLOCATE BINARY BSAVE CALLOCATE CHAIN CHR CLEAR COMMAND CURDIR CVD CVI CVL CVLONGINT' +
+    ' CVS CVSHORT DEALLOCATE DEFINED DYNAMIC ENCODING ENVIRON EOF ERFN ERMN ERROR EXEC EXEPATH' +
+    ' EXPLICIT FALSE FB_MEMCOPY FB_MEMCOPYCLEAR FB_MEMMOVE FIELD INCLUDE INP LEFT LINE LOC LOCAL LOF' +
+    ' LPOS MID MKD MKI MKL MKLONGINT MKS MKSHORT NAME OUTPUT POINT POINTCOORD PRESERVE PUT RANDOM' +
+    ' REALLOCATE RIGHT SADD SCREENEVENT SCREENGLPROC SCREENLIST SCREENPTR SEEK SIZEOF STR STRPTR' +
+    ' TRUE VAL VALINT VALLNG VALUINT VALULNG VARPTR WINPUT WRITE WSTR ';
+
+  function Has(const L, W: string): Boolean;
+  begin
+    Result := (W <> '') and (Pos(' ' + W + ' ', L) > 0);
+  end;
+
+  procedure Refuse(const W, What: string; T: TLexerToken);
+  begin
+    HandleError(Format('"%s" is a reserved word and cannot name %s', [W, What]), T);
+  end;
+
+  function ConstRefused(const Nm: string; InNs: Boolean): Boolean;
+  begin
+    Result := (Has(RESERVED, Nm) and not Has(CONST_ALLOWED, Nm)) or Has(CONST_EXTRA, Nm) or (Nm = 'THIS');
+    if Result and InNs and Has(NS_CONST_OK, Nm) then Result := False;
+  end;
+
+  function VarRefused(const Nm, Extra: string; InNs: Boolean): Boolean;
+  begin
+    Result := Has(RESERVED, Nm) or Has(Extra, Nm);
+    if Result and InNs and Has(NS_VAR_OK, Nm) then Result := False;
+  end;
+
+  procedure Walk(N: TASTNode; InNs: Boolean);
+  var
+    i, k: Integer;
+    Child, NameNode, AssignNode, ParamList: TASTNode;
+    Nm: string;
+  begin
+    if N = nil then Exit;
+    case N.NodeType of
+      antDim:
+        for i := 0 to N.ChildCount - 1 do
+        begin
+          Child := N.GetChild(i);
+          if (Child <> nil) and (Child.NodeType = antArrayDecl) and (Child.ChildCount >= 1) and
+             (Child.GetChild(0).NodeType = antIdentifier) then
+          begin
+            Nm := Child.GetChild(0).ValueUpper;
+            // ⛔ A CONST is lowered to a typed DIM carrying CONSTDECL - so the antConst branch below never
+            // meets one, and the variable rule answered for it. ...and "Const BASE" arrives already
+            // rewritten to THIS (the base-class reference): the WRITTEN word is taken off the token.
+            if Child.Attributes.Values['CONSTDECL'] = '1' then
+            begin
+              if Assigned(Child.GetChild(0).Token) and (Nm = 'THIS') then
+                Nm := UpperFast(VarToStr(Child.GetChild(0).Token.Value));
+              if ConstRefused(Nm, InNs) then Refuse(Nm, 'a constant', Child.GetChild(0).Token);
+            end
+            else if VarRefused(Nm, '', InNs) then
+              Refuse(Nm, 'a variable', Child.GetChild(0).Token);
+          end;
+        end;
+      antConst:
+        if (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antAssignment) then
+        begin
+          AssignNode := N.GetChild(0);
+          if (AssignNode.ChildCount >= 1) and (AssignNode.GetChild(0).NodeType = antIdentifier) then
+          begin
+            Nm := AssignNode.GetChild(0).ValueUpper;
+            if ConstRefused(Nm, InNs) then Refuse(Nm, 'a constant', AssignNode.GetChild(0).Token);
+          end;
+        end;
+      antProcedureDecl:
+        if N.ChildCount >= 1 then
+        begin
+          NameNode := N.GetChild(0);
+          Nm := NameNode.ValueUpper;
+          if Pos('~', Nm) > 0 then Nm := Copy(Nm, 1, Pos('~', Nm) - 1);   // an overload's signature
+          // "Type.method" is a MEMBER name, resolved in its type - not this rule.
+          if (Pos('.', Nm) = 0) and
+             ((Has(RESERVED, Nm) and not Has(PROC_ALLOWED, Nm)) or Has(PROC_EXTRA, Nm)) and
+             not (InNs and Has(NS_PROC_OK, Nm)) then
+            Refuse(Nm, 'a procedure', NameNode.Token);
+        end;
+      // ⛔ NO RULE FOR A UDT FIELD. fbc leaves almost every reserved word free there ("Type T : Line As
+      // Integer" compiles), and the five it refused in the probe (DECLARE, PRIVATE, PROTECTED, PUBLIC,
+      // __FUNCTION__) were refused in ONE syntactic form - "private as integer" reads as an access section.
+      // A field check written from that probe refused windows.bi, where a macro (API_SET_PRIVATE) puts
+      // PRIVATE where the field check looked: all sixteen win64 probes died. Accepting five rare field
+      // names is a small OVER; breaking the Windows headers is not.
+    end;
+    // A parameter: whatever declaration node carries the list, as CollectDeclaredNames reads it.
+    for k := 0 to N.ChildCount - 1 do
+    begin
+      ParamList := N.GetChild(k);
+      if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Continue;
+      for i := 0 to ParamList.ChildCount - 1 do
+        if ParamList.GetChild(i).NodeType = antIdentifier then
+        begin
+          Nm := ParamList.GetChild(i).ValueUpper;
+          if VarRefused(Nm, PARAM_EXTRA, InNs) then Refuse(Nm, 'a parameter', ParamList.GetChild(i).Token);
+        end;
+    end;
+    for i := 0 to N.ChildCount - 1 do
+      Walk(N.GetChild(i), InNs or (N.NodeType = antNamespace));
+  end;
+
+begin
+  Walk(Node, False);
 end;
 
 procedure TPackratParser.CheckRedimTargetIsAName(Node: TASTNode);

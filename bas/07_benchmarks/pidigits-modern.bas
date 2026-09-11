@@ -20,7 +20,7 @@
 '' that change it - "acc += num*2" and "acc -= den*d" - go through accAddPos/accSubPos. den and num
 '' are always positive, so nothing else needs a sign.
 
-Const BASE = 1000000000        '' 10^9 - a limb product stays inside 64 bits for the small multipliers here
+Const LIMB_BASE = 1000000000        '' 10^9 - a limb product stays inside 64 bits for the small multipliers here
 
 '' ⛔ LIMBS IS NOT A ROUND NUMBER PICKED FOR COMFORT - it is the size of the answer, and getting it
 '' wrong is SILENT. The spigot's denominator is the product of the odd numbers, about (2K)!! after K
@@ -53,8 +53,8 @@ Dim Shared As Integer accSgn = 1     '' sign of acc; den and num are always posi
 Sub setSmall( a() As LongInt, ByRef n As Integer, ByVal v As LongInt )
   n = 0
   Do
-    a(n) = v Mod BASE
-    v = v \ BASE
+    a(n) = v Mod LIMB_BASE
+    v = v \ LIMB_BASE
     n += 1
   Loop While v > 0
 End Sub
@@ -64,12 +64,12 @@ Sub mulSmall( a() As LongInt, ByRef n As Integer, ByVal k As LongInt )
   Dim As LongInt carry = 0
   For i As Integer = 0 To n - 1
     Dim As LongInt p = a(i) * k + carry
-    a(i) = p Mod BASE
-    carry = p \ BASE
+    a(i) = p Mod LIMB_BASE
+    carry = p \ LIMB_BASE
   Next i
   Do While carry > 0
-    a(n) = carry Mod BASE
-    carry = carry \ BASE
+    a(n) = carry Mod LIMB_BASE
+    carry = carry \ LIMB_BASE
     n += 1
   Loop
   '' k = 0 wipes every limb; trim so a length always describes a normalised magnitude (cmpBig
@@ -89,13 +89,13 @@ Sub addBig( dst() As LongInt, ByRef dn As Integer, a() As LongInt, ByVal an As I
     Dim As LongInt s = carry
     If i < an Then s += a(i)
     If i < bn Then s += b(i)
-    dst(i) = s Mod BASE
-    carry = s \ BASE
+    dst(i) = s Mod LIMB_BASE
+    carry = s \ LIMB_BASE
   Next i
   dn = m
   Do While carry > 0
-    dst(dn) = carry Mod BASE
-    carry = carry \ BASE
+    dst(dn) = carry Mod LIMB_BASE
+    carry = carry \ LIMB_BASE
     dn += 1
   Loop
 End Sub
@@ -108,7 +108,7 @@ Sub subBig( dst() As LongInt, ByRef dn As Integer, a() As LongInt, ByVal an As I
     Dim As LongInt v = a(i) - borrow
     If i < bn Then v -= b(i)
     If v < 0 Then
-      v += BASE
+      v += LIMB_BASE
       borrow = 1
     Else
       borrow = 0
