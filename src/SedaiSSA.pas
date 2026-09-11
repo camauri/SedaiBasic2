@@ -694,6 +694,8 @@ type
     function ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;  // the shape both ask
     function EmitForeignElemTemps(Obj: TASTNode; const TypeName: string): string;      // the temporaries both use
     function ForeignRecPtrOffsets(ArgNode: TASTNode): string;                          // "@o1/o2": a REC's pointer fields (259 b)
+    function ForeignDynEntry(const Sig: string): string;                               // the "*" entry calling a C address with Sig
+    function EmitIndirectCallVM(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
     function DeclTypeIsPointer(const T: string): Boolean;                              // "T Ptr" / "T Pointer", aliases resolved
     function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
@@ -2756,7 +2758,11 @@ var
 begin
   Result := '';
   if Node = nil then Exit;
-  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  // ⭐ ...and THROUGH A CAST (strato 3 del rapporto `ffi`): libffi's "FFI_FN(@printer)" is
+  // "cptr(sub cdecl(), @printer)", and the cast hid the procedure - C got the bare entry PC and jumped
+  // into nothing. A cast changes the type the program SEES, not which procedure runs.
+  while ((Node.NodeType = antParentheses) or (Node.NodeType = antCast)) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
   // "@nome" porta il nome nel Value e non ha figli; "@espressione" ha un figlio e non e' una procedura.
   if (Node.NodeType <> antProcAddress) or (Node.ChildCount <> 0) then Exit;
   Nm := UpperFast(VarToStr(Node.Value));
@@ -44538,7 +44544,162 @@ begin
   Result := FuncPtrTypeSig(FPointerVars.Values[PtrName]);
 end;
 
+function TSSAGenerator.ForeignDynEntry(const Sig: string): string;
+// ⭐ THE ENTRY THAT CALLS A C ADDRESS (strato 3 del rapporto `ffi`): a procedure pointer holding what
+// DyLibSymbol / GetProcAddress / dlsym handed back is a MACHINE address, and the indirect call jumped to it
+// as if it were a BASIC entry PC. The call goes through the foreign table instead: an entry with the
+// symbol "*", whose parameters are the pointer's own signature plus one hidden "ANY PTR" - the address,
+// which the runtime calls instead of a resolved symbol. Every rule of the ordinary marshalling applies.
+// '' when the signature has a type C has no name for (a STRING, a UDT by value, a BYREF return): the
+// call then stays the BASIC one it always was.
+var
+  Bar, i, k: Integer;
+  Ret, Params, T, Rest, Tail: string;
+begin
+  Result := '';
+  Bar := Pos('|', Sig);
+  if Bar = 0 then Exit;
+  Ret := Copy(Sig, Bar + 1, MaxInt);
+  if Pos('|', Ret) > 0 then Exit;                      // "|BYREF": C cannot return a reference
+  Ret := UpperFast(Trim(Ret));
+  if Ret <> '' then
+  begin
+    Ret := UpperFast(CanonicalType(Ret));
+    if ForeignKindOf(Ret) in [fkUnknown, fkLongDouble] then Exit;
+  end;
+  Params := '';
+  Rest := Copy(Sig, 1, Bar - 1) + ',';
+  while Rest <> '' do
+  begin
+    k := Pos(',', Rest);
+    T := UpperFast(Trim(Copy(Rest, 1, k - 1)));
+    Delete(Rest, 1, k);
+    if T = '' then Continue;
+    if T = '#P' then T := 'ANY PTR'                   // a procedure-pointer parameter is an address
+    else T := UpperFast(CanonicalType(T));
+    if ForeignKindOf(T) in [fkUnknown, fkLongDouble] then Exit;
+    if Params <> '' then Params := Params + ',';
+    Params := Params + T;
+  end;
+  if Params <> '' then Params := Params + ',';
+  Params := Params + 'ANY PTR';
+  Tail := '|*||' + Ret + '|' + Params;
+  for i := 0 to FProgram.ForeignDeclCount - 1 do
+    if (Length(FProgram.GetForeignDecl(i)) > Length(Tail)) and
+       (Copy(FProgram.GetForeignDecl(i), Length(FProgram.GetForeignDecl(i)) - Length(Tail) + 1, MaxInt) = Tail) then
+      Exit(Copy(FProgram.GetForeignDecl(i), 1, Pos('|', FProgram.GetForeignDecl(i)) - 1));
+  Result := 'FGNDYN' + IntToStr(FProgram.ForeignDeclCount);
+  FProgram.AddForeignDecl(Result + Tail);
+end;
+
 function TSSAGenerator.EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
+// ⭐ An indirect call whose target may be a C ADDRESS (strato 3): the pointer holds either a BASIC entry PC
+// or what DyLibSymbol/dlsym/GetProcAddress handed back, and only its value can tell - by the C tag, bit 61,
+// never set in an entry PC. Lowered as a branch: tagged, a foreign call through the "*" entry of this
+// signature (ForeignDynEntry) with the address as its hidden last argument; otherwise the BASIC call as it
+// always was (EmitIndirectCallVM). ⚠️ Only in a program that declares something foreign - no C address
+// can exist otherwise - and only when every argument is given: C has no optional parameters.
+var
+  DynName, PCName, RVName, RetPart, Suffix, LF, LB, LD: string;
+  PCVal, Masked, Tst, V, RVar: TSSAValue;
+  RetRT: TSSARegisterType;
+  Args2: TASTNode;
+  PrevBlock, BF, BB, BD, EndF, EndB: TSSABasicBlock;
+  k, NParams, Bar: Integer;
+begin
+  DynName := '';
+  if (FProgram.ForeignDeclCount > 0) and (not FInDispatcher) and Assigned(ArgListNode) and
+     (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
+    DynName := ForeignDynEntry(Sig);
+  if DynName <> '' then
+  begin
+    // The entry's declared parameters are the signature's plus the hidden address.
+    NParams := 0;
+    Bar := Pos('|', Sig);
+    for k := 1 to Bar - 1 do if Sig[k] = ',' then Inc(NParams);
+    if Trim(Copy(Sig, 1, Bar - 1)) <> '' then Inc(NParams);
+    if ArgListNode.ChildCount <> NParams then DynName := '';
+  end;
+  if DynName = '' then Exit(EmitIndirectCallVM(PCValIn, Sig, ArgListNode));
+
+  RetPart := UpperFast(Trim(Copy(Sig, Pos('|', Sig) + 1, MaxInt)));
+  RetRT := srtInt;
+  if (RetPart <> '') and (FindUDT(CanonicalType(RetPart)) < 0) then RetRT := TypeNameToBank(RetPart, '');
+  case RetRT of
+    srtString: Suffix := '$';
+    srtInt: Suffix := '%';
+  else
+    Suffix := '';
+  end;
+  PCName := '__FGNPC' + IntToStr(FSwapTempSeq) + '%';
+  RVName := '__FGNRV' + IntToStr(FSwapTempSeq) + Suffix;
+  Inc(FSwapTempSeq);
+  PCVal := EnsureIntRegister(PCValIn);
+  DeclareVariableTyped(PCName, srtInt);
+  DeclareVariableTyped(RVName, RetRT);
+  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(PCName), PCVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Masked := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Masked, PCVal, EnsureIntRegister(MakeSSAConstInt(FGNPTR_TAG)), MakeSSAValue(svkNone));
+  Tst := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeInt, Tst, Masked, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  LF := GenerateUniqueLabel('fgndyn_c');
+  LB := GenerateUniqueLabel('fgndyn_b');
+  LD := GenerateUniqueLabel('fgndyn_d');
+  PrevBlock := FCurrentBlock;
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(LB), Tst, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+
+  // C: the foreign call, with the address as the hidden last argument.
+  BF := FProgram.CreateBlock(LF);
+  PrevBlock.AddSuccessor(BF); BF.AddPredecessor(PrevBlock);
+  FCurrentBlock := BF;
+  Args2 := TASTNode.Create(antArgumentList, ArgListNode.Token);
+  try
+    for k := 0 to ArgListNode.ChildCount - 1 do Args2.AddChild(ArgListNode.GetChild(k).Clone);
+    Args2.AddChild(TASTNode.CreateWithValue(antIdentifier, PCName, ArgListNode.Token));
+    if not TryForeignCall(DynName, Args2, V) then
+      raise Exception.CreateFmt('Internal: the C-address entry %s was not callable', [DynName]);
+  finally
+    Args2.Free;
+  end;
+  RVar := GetOrAllocateVariable(RVName);
+  if RetPart <> '' then
+    case RetRT of
+      srtFloat:  EmitInstruction(ssaCopyFloat, RVar, EnsureFloatRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaCopyString, RVar, EnsureStringRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaCopyInt, RVar, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+  EmitInstruction(ssaJump, MakeSSALabel(LD), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EndF := FCurrentBlock;
+
+  // BASIC: the indirect call it always was.
+  BB := FProgram.CreateBlock(LB);
+  PrevBlock.AddSuccessor(BB); BB.AddPredecessor(PrevBlock);
+  FCurrentBlock := BB;
+  V := EmitIndirectCallVM(GetOrAllocateVariable(PCName), Sig, ArgListNode);
+  RVar := GetOrAllocateVariable(RVName);
+  if RetPart <> '' then
+    case RetRT of
+      srtFloat:  EmitInstruction(ssaCopyFloat, RVar, EnsureFloatRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaCopyString, RVar, EnsureStringRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaCopyInt, RVar, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+  EmitInstruction(ssaJump, MakeSSALabel(LD), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EndB := FCurrentBlock;
+
+  BD := FProgram.CreateBlock(LD);
+  EndF.AddSuccessor(BD); BD.AddPredecessor(EndF);
+  EndB.AddSuccessor(BD); BD.AddPredecessor(EndB);
+  FCurrentBlock := BD;
+  if RetPart <> '' then
+    Result := GetOrAllocateVariable(RVName)
+  else
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end;
+end;
+
+function TSSAGenerator.EmitIndirectCallVM(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
 // Lower an indirect call through a procedure entry PC already loaded into PCValIn (from a funcptr
 // variable, a UDT funcptr field, etc.). Sig = "paramtypes|rettype" (paramtypes = comma list; '' rettype =
 // SUB). Arguments are staged into the transfer slots per the signature's parameter banks — the SAME slot
@@ -51086,6 +51247,19 @@ begin
   PreMarkStart; CollectAddressTakenVars(AST); PreMarkEnd('CollectAddressTakenVars');
   NoteDeclaredProcNames(AST);
   CountIdentifierUses(AST);
+  // ⭐ DyLibLoad / DyLibSymbol / DyLibFree - FreeBASIC's own way of loading a library at RUN time (strato 3
+  // del rapporto `ffi`). Entries of the foreign table with a "@" symbol the runtime answers itself, so a
+  // call to them is marshalled like any other. ⚠️ Only when the program names them: a program that does
+  // not must keep an empty table - that is what lets a pure BASIC program skip every C-address test.
+  if (FIdentUses <> nil) and (FProgram.IndexOfForeignDecl('DYLIBLOAD') < 0) then
+  begin
+    if FIdentUses.Items['DYLIBLOAD'] <> '' then
+      FProgram.AddForeignDecl('DYLIBLOAD|@DYLIBLOAD||ANY PTR|ZSTRING PTR');
+    if FIdentUses.Items['DYLIBSYMBOL'] <> '' then
+      FProgram.AddForeignDecl('DYLIBSYMBOL|@DYLIBSYMBOL||ANY PTR|ANY PTR,ZSTRING PTR');
+    if FIdentUses.Items['DYLIBFREE'] <> '' then
+      FProgram.AddForeignDecl('DYLIBFREE|@DYLIBFREE|||ANY PTR');
+  end;
   CollectSharedVars(AST);
   // ...and only NOW can a field ARRAY be sized: its bound is routinely a module CONST, and those
   // are collected by the walk just above. See the note on the pass.

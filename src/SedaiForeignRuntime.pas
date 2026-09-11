@@ -136,6 +136,8 @@ type
     procedure Prepare(var B: TForeignBinding);
     procedure PrepareLocked(var B: TForeignBinding);   // the body of Prepare, with FPrepLock held
     function W8Buffer(Key: Int64; Need: PtrUInt): PByte;   // the persistent copy for one program array
+    function DyLibBuiltin(const Sym: string; const Vals: array of Pointer; NArgs: Integer;
+      ACtx: TObject): Int64;                               // DyLibLoad / DyLibSymbol / DyLibFree (strato 3)
   public
     constructor Create;
     destructor Destroy; override;
@@ -389,6 +391,57 @@ begin
   InitCriticalSection(FPrepLock);
 end;
 
+function TForeignTable.DyLibBuiltin(const Sym: string; const Vals: array of Pointer; NArgs: Integer;
+  ACtx: TObject): Int64;
+// ⭐ FreeBASIC's DyLibLoad / DyLibSymbol / DyLibFree (strato 3 del rapporto `ffi`). The handle and a
+// symbol come back as C addresses (FGNPTR), so they compare with 0, travel to C, and a symbol assigned to
+// a procedure pointer is CALLED through the "*" entry.
+// ⛔⛔ THE NAME RULE IS fbc's, MEASURED, not our #inclib search: on Linux fbc tries the name, then "lib" +
+// name, appending ".so" when the name has none - so DyLibLoad("m") FAILS on a machine without the -dev
+// symlink (libm.so) and DyLibLoad("libm.so.6") works. The SONAME search #inclib does would load "m" here,
+// which fbc does not: a program that works under sb would fail under fbc. On Windows LoadLibrary adds
+// ".dll" itself.
+var
+  S, N: string;
+  H: TLibHandle;
+  P: Pointer;
+begin
+  Result := 0;
+  if Sym = '@DYLIBLOAD' then
+  begin
+    if (NArgs < 1) or (PPointer(Vals[0])^ = nil) then Exit;
+    S := string(PChar(PPointer(Vals[0])^));
+    if S = '' then Exit;
+    {$IFDEF WINDOWS}
+    H := LoadLibrary(S);
+    {$ELSE}
+    N := S;
+    if Pos('.so', N) = 0 then N := N + '.so';
+    H := LoadLibrary(N);
+    if (H = NilHandle) and (Pos('/', N) = 0) then H := LoadLibrary('lib' + N);
+    {$ENDIF}
+    if H <> NilHandle then Result := Int64(PtrUInt(H)) or FGNPTR_TAG;
+  end
+  else if Sym = '@DYLIBSYMBOL' then
+  begin
+    if (NArgs < 2) or (PPointer(Vals[0])^ = nil) or (PPointer(Vals[1])^ = nil) then Exit;
+    H := TLibHandle(PtrUInt(PPointer(Vals[0])^));
+    S := string(PChar(PPointer(Vals[1])^));
+    P := GetProcedureAddress(H, S);
+    if P <> nil then
+    begin
+      // A symbol may name DATA as well as code: noted, as an Extern's address is (DIVERGENZE 253).
+      if Assigned(FNoteRegion) then FNoteRegion(ACtx, PtrUInt(P), 0, True, False);
+      Result := Int64(PtrUInt(P)) or FGNPTR_TAG;
+    end;
+  end
+  else if Sym = '@DYLIBFREE' then
+  begin
+    if (NArgs >= 1) and (PPointer(Vals[0])^ <> nil) then
+      UnloadLibrary(TLibHandle(PtrUInt(PPointer(Vals[0])^)));
+  end;
+end;
+
 function TForeignTable.W8Buffer(Key: Int64; Need: PtrUInt): PByte;
 // The persistent translated copy for the program array whose VM pointer is Key - see FW8Key. Zeroed when
 // new; never moved. ⛔ Under FPrepLock: two threads handing C their first array at once must not both
@@ -494,6 +547,9 @@ var
 begin
   Result := nil;
   Tried := '';
+  // "@DYLIB..." is answered by the runtime itself, "*" calls the address its last argument carries
+  // (strato 3): neither is a symbol to look up.
+  if (B.Decl.Symbol <> '') and (B.Decl.Symbol[1] in ['@', '*']) then Exit;
   if B.Decl.LibName <> '' then
   begin
     H := OpenLib(B.Decl.LibName);
@@ -916,7 +972,25 @@ begin
     end;
   end;
 
+  // ⭐ DyLibLoad / DyLibSymbol / DyLibFree (strato 3): answered here, with the arguments already marshalled.
+  if (B^.Decl.Symbol <> '') and (B^.Decl.Symbol[1] = '@') then
+  begin
+    ResInt := DyLibBuiltin(B^.Decl.Symbol, Vals, NArgs, ACtx);
+    ResFloat := 0;
+    Exit;
+  end;
   FillChar(RetBuf, SizeOf(RetBuf), 0);
+  // ⭐ "*": the address to call is the hidden LAST argument (a procedure pointer holding what DyLibSymbol,
+  // dlsym or GetProcAddress handed back), and C sees the others. A null one is refused aloud: calling
+  // address 0 is a crash with no name.
+  if B^.Decl.Symbol = '*' then
+  begin
+    if (NArgs < 1) or (PPointer(Vals[NArgs - 1])^ = nil) then
+      raise EForeignCallError.Create('calling a procedure pointer that holds no address (0)');
+    AbiCall(PPointer(Vals[NArgs - 1])^, B^.RetRef, Slice(B^.ArgRefs, NArgs - 1), Slice(Vals, NArgs - 1),
+            @RetBuf[0]);
+  end
+  else
   AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
   // ...and the POINTER FIELDS of every record handed to C come back (DIVERGENZE 259 b): one C left alone
   // gets the program's own value again (its tag, its domain); one C CHANGED holds a machine address, and
