@@ -686,7 +686,10 @@ type
     function BasicProcCallbackSig(Node: TASTNode): string;   // "@proc" -> FNPTR:<ret>:<args>
     function ForeignRecordArg(Node: TASTNode): Boolean;      // "@rec" / a UDT PTR -> a record handle (DIVERGENZE 245)
     function ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;  // "@n" of a narrow value -> width code (DIVERGENZE 247)
-    function EmitForeignDataAddr(const VarName, Symbol, TypeName: string): TSSAValue;  // an Extern of a C library: its address (DIVERGENZE 253)
+    function EmitForeignDataAddr(const VarName, Symbol, TypeName: string;
+      const LibName: string = ''): TSSAValue;  // an Extern of a C library: its address (DIVERGENZE 253)
+    function TryForeignFuncAddr(const NameU: string; out V: TSSAValue): Boolean;  // "@f" of a declared C function (261)
+    function TryEmitForeignElemField(Node: TASTNode; out Value: TSSAValue): Boolean;  // "a(i)->f", a(i) a C address (259)
     function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -3708,6 +3711,12 @@ begin
           ThisAddrNode.Free;
         end;
       end
+      // ⭐ "@strlen": the address of a C function the program DECLARED (DIVERGENZE 261). It has no entry
+      // PC - its only existence is a foreign-table entry - so it fell to the branch below and raised
+      // "Undefined procedure (address-of @)", where fbc answers the function's address. Resolved by the
+      // same dlsym as a call, through a DATA entry that answers the address instead of calling.
+      else if (Node.ChildCount = 0) and TryForeignFuncAddr(Node.ValueUpper, Result) then
+        // TryForeignFuncAddr produced the (tagged) machine address
       else
       begin
         // @subname → the named SUB's entry PC. The PROC_<name> label resolves to a PC at bytecode
@@ -46736,6 +46745,8 @@ begin
   end;
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
   if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
+  // ...and "a(i)->field" where the ELEMENT may hold a C address (DIVERGENZE 259): decided at run time.
+  if TryEmitForeignElemField(Node, Result) then Exit;
   TypeName := RecordTypeOfAddrOfObject(Node.GetChild(0));   // "(@X)->f" is "X.f"
   if TypeName = '' then TypeName := ObjectTypeName(Node.GetChild(0));
   // ...and an ENUM member named through the TYPE ITSELF ("T.member"), not through an instance. The
@@ -48155,7 +48166,108 @@ begin
   Result := FProgram.ForeignDeclCount - 1;
 end;
 
-function TSSAGenerator.EmitForeignDataAddr(const VarName, Symbol, TypeName: string): TSSAValue;
+function TSSAGenerator.TryForeignFuncAddr(const NameU: string; out V: TSSAValue): Boolean;
+// "@f" where f is a C function declared with "Declare ... [Alias ...] [Lib ...]" (DIVERGENZE 261): its
+// machine address, looked up in the library its declaration names. The value carries FGNPTR_TAG like
+// every address a foreign call hands back, so a C pointer parameter receives it as it is.
+var
+  Idx: Integer;
+  Decl: TForeignDecl;
+begin
+  Result := False;
+  V := MakeSSAValue(svkNone);
+  Idx := FProgram.IndexOfForeignDecl(NameU);
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
+  V := EmitForeignDataAddr(NameU + '#FN', Decl.Symbol, 'ANY', Decl.LibName);
+  Result := True;
+end;
+
+function TSSAGenerator.TryEmitForeignElemField(Node: TASTNode; out Value: TSSAValue): Boolean;
+// ⭐ "args(0)->size" where args is an array of UDT POINTERS (DIVERGENZE 259 a). An element holds either
+// a record HANDLE (the program stored "@rec") or a C ADDRESS carrying FGNPTR_TAG (it stored
+// "@ffi_type_pointer", or C handed one back) - and only the value can tell. The managed read indexed the
+// record table with a C address: an access violation where fbc prints 8.
+// ⇒ Lowered as IIf(tagged, tmp->field, a(i)->field): the element goes into a temporary registered over
+// raw memory, so the true branch reads the field at its C offset (TryEmitRawUDTField), and the false
+// branch is the original access, marked so it does not come back here.
+// ⭐ Bit 61 is never set in a record handle, so the test is exact, not a heuristic.
+// ⚠️ Only in a program that declares something foreign - no C address can exist otherwise, and a pure
+// BASIC program must not pay the test - and only for a side-effect-free index, which is evaluated twice.
+var
+  Obj, Idx, ArgsN, RawAcc, MgdAcc: TASTNode;
+  ArrU, TypeName, ElT, TstT, NestedT: string;
+  UDTIdx, Slot, i: Integer;
+  Bank: TSSARegisterType;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+  ElemVal, Masked, Tst: TSSAValue;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if (Node = nil) or (Node.ChildCount < 1) then Exit;
+  if FProgram.ForeignDeclCount = 0 then Exit;
+  if Node.Attributes.Values['FGNELEM'] = '1' then Exit;
+  Obj := Node.GetChild(0);
+  while (Obj <> nil) and (Obj.NodeType in [antParentheses, antDeref]) and (Obj.ChildCount >= 1) do
+    Obj := Obj.GetChild(0);
+  if (Obj = nil) or (Obj.NodeType <> antArrayAccess) or (Obj.ChildCount < 2) or
+     (Obj.Attributes.Values['BRACKET'] = '1') or (Obj.GetChild(0) = nil) or
+     (Obj.GetChild(0).NodeType <> antIdentifier) then Exit;
+  ArrU := Obj.GetChild(0).ValueUpper;
+  if (ArrayIndexOf(ArrU) < 0) or IsSharedScalar(ArrU) or IsAddrLocal(ArrU) then Exit;
+  if ArrayRecordTypeOf(ArrU) <> '' then Exit;
+  TypeName := ArrayPointerUDTType(ArrU);
+  if TypeName = '' then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then Exit;   // a method
+  if (Bank = srtString) or (NestedT <> '') then Exit;
+  Idx := Obj.GetChild(1);
+  if Idx = nil then Exit;
+  if Idx.NodeType in [antArgumentList, antExpressionList] then
+  begin
+    for i := 0 to Idx.ChildCount - 1 do
+      if not (Idx.GetChild(i).NodeType in [antLiteral, antIdentifier]) then Exit;
+  end
+  else if not (Idx.NodeType in [antLiteral, antIdentifier]) then Exit;
+
+  ElT := UpperFast(GenerateUniqueLabel('FGNEL'));
+  TstT := ElT + '_T';
+  RegisterTypedVar(ElT, 'INTEGER');
+  RegisterTypedVar(TstT, 'INTEGER');
+  ProcessExpression(Obj, ElemVal);
+  ElemVal := EnsureIntRegister(ElemVal);
+  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(ElT), ElemVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Masked := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Masked, ElemVal, EnsureIntRegister(MakeSSAConstInt(FGNPTR_TAG)),
+                  MakeSSAValue(svkNone));
+  Tst := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeInt, Tst, Masked, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(TstT), Tst, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // The temporary is a "T Ptr" over RAW memory: the raw path reads it, and type inference sees its type.
+  if FRawUDTPtrs.IndexOfName(ElT) < 0 then FRawUDTPtrs.Add(ElT + '=' + TypeName);
+  if FPointerVars.IndexOfName(ElT) < 0 then FPointerVars.Add(ElT + '=' + TypeName);
+
+  ArgsN := TASTNode.Create(antArgumentList, Node.Token);
+  try
+    ArgsN.AddChild(TASTNode.CreateWithValue(antIdentifier, TstT, Node.Token));
+    RawAcc := TASTNode.CreateWithValue(antMemberAccess, VarToStr(Node.Value), Node.Token);
+    RawAcc.AddChild(TASTNode.CreateWithValue(antIdentifier, ElT, Node.Token));
+    ArgsN.AddChild(RawAcc);
+    MgdAcc := Node.Clone;
+    MgdAcc.Attributes.Values['FGNELEM'] := '1';
+    ArgsN.AddChild(MgdAcc);
+    EmitIif(ArgsN, Value);
+  finally
+    ArgsN.Free;
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.EmitForeignDataAddr(const VarName, Symbol, TypeName: string;
+  const LibName: string): TSSAValue;
 // ⭐ THE ADDRESS OF A C LIBRARY'S DATA SYMBOL (DIVERGENZE 253): "extern ffi_type_pointer as ffi_type"
 // inside `extern "C"` names a global variable of libffi, not something the program defines. It gets an
 // entry in the foreign table like a function - "<NAME>#DATA|<symbol>||DATA:<T> PTR|" - which the runtime
@@ -48167,7 +48279,7 @@ var
   Line: string;
   k, Idx: Integer;
 begin
-  Line := UpperFast(VarName) + '#DATA|' + Symbol + '||DATA:' + UpperFast(TypeName) + ' PTR|';
+  Line := UpperFast(VarName) + '#DATA|' + Symbol + '|' + LibName + '|DATA:' + UpperFast(TypeName) + ' PTR|';
   Idx := -1;
   for k := 0 to FProgram.ForeignDeclCount - 1 do
     if FProgram.GetForeignDecl(k) = Line then begin Idx := k; Break; end;
