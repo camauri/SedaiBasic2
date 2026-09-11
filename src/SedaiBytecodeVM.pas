@@ -259,7 +259,15 @@ type
     // pointers). Each block carries an 8-byte size header just below the returned offset; freed blocks
     // go on a first-fit free list. VM-managed (not OS addresses) → memory-safe and portable. Guarded by
     // FRawHeapLock for cross-thread Allocate/Free.
-    FRawHeap: array of Byte;
+    // ⛔⛔ AND IT NEVER MOVES (11 Sep 2026). It was a dynamic array grown by SetLength, which REALLOCATES:
+    // a thread growing it freed the block another thread was using - C reading a SADD copy or an
+    // Allocate'd buffer, or StrSAdd writing its bytes after RawAlloc had released the lock. An access
+    // violation once in ~100 runs of eight threads calling C, and every time in job/tests/bas m907zb.
+    // Now the ADDRESS SPACE is reserved once (FRawHeapReserve) and pages are committed as it grows
+    // (FRawHeapCap): the base is stable for the life of the VM. Web builds keep a moving block.
+    FRawHeap: PByte;
+    FRawHeapCap: PtrUInt;                       // committed bytes: what FRawHeapCap used to say
+    FRawHeapReserve: PtrUInt;                   // reserved address space (0 until the first allocation)
     // Managed STRING cells: a "String Ptr" points at a 24-byte cell holding an INDEX into this, the
     // way FreeBASIC's String is a descriptor whose characters live elsewhere. Slot 0 is ''.
     FRawStrCells: array of string;
@@ -1931,7 +1939,18 @@ begin
   // M5.2c: free the shared UDT-record region.
   CleanupSharedRecords;
   DoneCriticalSection(FSharedRecLock);
-  SetLength(FRawHeap, 0);
+  if FRawHeap <> nil then
+  begin
+    {$IFDEF UNIX}
+    fpmunmap(FRawHeap, FRawHeapReserve);
+    {$ELSE}{$IFDEF WINDOWS}
+    VirtualFree(FRawHeap, 0, MEM_RELEASE);
+    {$ELSE}
+    FreeMem(FRawHeap);
+    {$ENDIF}{$ENDIF}
+    FRawHeap := nil;
+    FRawHeapCap := 0;
+  end;
   DoneCriticalSection(FRawHeapLock);
   DoneCriticalSection(FFgnLock);
   FCtx.Free;
@@ -5112,7 +5131,8 @@ end;
 function TBytecodeVM.RawAlloc(ByteCount: PtrUInt): Int64;
 var
   i, best: Integer;
-  dataOfs, need: PtrUInt;
+  dataOfs, need, newCap: PtrUInt;
+  mem: Pointer;
 begin
   if ByteCount = 0 then ByteCount := 1;
   ByteCount := (ByteCount + 7) and not PtrUInt(7);   // round payload up to 8
@@ -5135,8 +5155,48 @@ begin
     begin
       if FRawHeapTop = 0 then FRawHeapTop := 8;        // reserve offset 0 region (NULL)
       need := FRawHeapTop + 8 + ByteCount;
-      if need > PtrUInt(Length(FRawHeap)) then
-        SetLength(FRawHeap, (need + need div 2) + 4096);
+      if need > PtrUInt(FRawHeapCap) then
+      begin
+        // ⛔ Grown by COMMITTING pages of an address range reserved once - never by reallocating, which
+        // freed memory other threads (and C) were still using. See the note at FRawHeap.
+        newCap := (need + need div 2) + 4096;
+        newCap := (newCap + $FFFF) and not PtrUInt($FFFF);          // whole 64 KiB granules
+        {$IF DEFINED(UNIX) or DEFINED(WINDOWS)}
+        if FRawHeap = nil then
+        begin
+          // ADDRESS SPACE, not memory: nothing is backed until a page is committed and touched.
+          FRawHeapReserve := PtrUInt(64) shl 30;
+          repeat
+            {$IFDEF UNIX}
+            mem := fpmmap(nil, FRawHeapReserve, PROT_NONE,
+                          MAP_PRIVATE or MAP_ANONYMOUS {$IFDEF LINUX} or $4000 {MAP_NORESERVE}{$ENDIF}, -1, 0);
+            if mem = MAP_FAILED then mem := nil;
+            {$ELSE}
+            mem := VirtualAlloc(nil, FRawHeapReserve, MEM_RESERVE, PAGE_NOACCESS);
+            {$ENDIF}
+            if mem = nil then FRawHeapReserve := FRawHeapReserve shr 1;
+          until (mem <> nil) or (FRawHeapReserve < (PtrUInt(256) shl 20));
+          if mem = nil then
+            raise Exception.Create('Out of memory: the raw heap could not reserve its address space');
+          FRawHeap := PByte(mem);
+        end;
+        if newCap > FRawHeapReserve then newCap := FRawHeapReserve;
+        if need > newCap then
+          raise Exception.CreateFmt('Out of memory: the raw heap is full (%d bytes reserved)',
+                                    [Int64(FRawHeapReserve)]);
+        {$IFDEF UNIX}
+        if fpmprotect(FRawHeap, newCap, PROT_READ or PROT_WRITE) <> 0 then
+        {$ELSE}
+        if VirtualAlloc(FRawHeap, newCap, MEM_COMMIT, PAGE_READWRITE) = nil then
+        {$ENDIF}
+          raise Exception.Create('Out of memory: the raw heap could not commit its pages');
+        {$ELSE}
+        // No reserve/commit here (a web build): a moving block, as before - and no threads.
+        ReallocMem(FRawHeap, newCap);
+        FillChar(FRawHeap[FRawHeapCap], newCap - FRawHeapCap, 0);
+        {$ENDIF}
+        FRawHeapCap := newCap;
+      end;
       dataOfs := FRawHeapTop + 8;
       PtrUInt((@FRawHeap[dataOfs - 8])^) := ByteCount; // size header
       FRawHeapTop := dataOfs + ByteCount;
@@ -5555,7 +5615,7 @@ begin
   // the free list with an offset that means nothing in this region.
   if (RawPtr and RAWPTR_REGION_FB) <> 0 then Exit;
   dataOfs := RawPtr and RAWPTR_OFS_MASK;
-  if (dataOfs < 8) or (dataOfs > PtrUInt(Length(FRawHeap))) then Exit;
+  if (dataOfs < 8) or (dataOfs > PtrUInt(FRawHeapCap)) then Exit;
   EnterCriticalSection(FRawHeapLock);
   try
     sz := PtrUInt((@FRawHeap[dataOfs - 8])^);
@@ -5779,9 +5839,9 @@ begin
   end;
 
   // Byte-heap region. Offset 0..7 is the reserved NULL block (see RawAlloc).
-  if (ofs < 8) or (ofs + NeedBytes > PtrUInt(Length(FRawHeap))) then
+  if (ofs < 8) or (ofs + NeedBytes > PtrUInt(FRawHeapCap)) then
     raise ERangeError.CreateFmt('Raw pointer dereference out of bounds: offset %d + %d > %d bytes',
-                                [Int64(ofs), Int64(NeedBytes), Int64(Length(FRawHeap))]);
+                                [Int64(ofs), Int64(NeedBytes), Int64(FRawHeapCap)]);
   Result := @FRawHeap[ofs];
 end;
 
@@ -6197,7 +6257,7 @@ begin
   else if (RawPtr and RAWPTR_REGION_FB) <> 0 then
     Limit := 0                                          // a framebuffer is not text: empty string
   else
-    Limit := PtrUInt(Length(FRawHeap)) - ofs;
+    Limit := PtrUInt(FRawHeapCap) - ofs;
   if not Wide then
   begin
     n := 0;
@@ -6858,10 +6918,10 @@ begin
   Result := 0;
   if A = 0 then Exit;
   // L'heap grezzo: gli offset sono BYTE, quindi non c'e' nessuna divisione da fare.
-  if Length(FRawHeap) > 0 then
+  if FRawHeapCap > 0 then
   begin
     Base := PtrUInt(@FRawHeap[0]);
-    if (A >= Base) and (A - Base < PtrUInt(Length(FRawHeap))) then
+    if (A >= Base) and (A - Base < PtrUInt(FRawHeapCap)) then
       Exit(Int64(A - Base) or RAWPTR_TAG);
   end;
   for i := 0 to High(FArrays) do
@@ -6992,8 +7052,8 @@ begin
   begin
     if ((Tagged and RAWPTR_REGION_IMG) <> 0) or ((Tagged and RAWPTR_REGION_FB) <> 0) then Exit;
     ofs := PtrUInt(Tagged and RAWPTR_OFS_MASK);
-    if (ofs < 8) or (ofs >= PtrUInt(Length(FRawHeap))) then Exit;
-    AAvail := PtrUInt(Length(FRawHeap)) - ofs;
+    if (ofs < 8) or (ofs >= PtrUInt(FRawHeapCap)) then Exit;
+    AAvail := PtrUInt(FRawHeapCap) - ofs;
     Exit(True);
   end;
   if Tagged < 0 then Exit;                          // puntatore a CAMPO di record: non e' un blocco
