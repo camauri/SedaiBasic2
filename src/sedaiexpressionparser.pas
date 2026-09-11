@@ -1074,8 +1074,11 @@ begin
   // rest of the pipeline already uses for pointer types (a DIM records exactly that spelling), so SIZEOF
   // resolves it to the pointer size. Only when a PTR actually follows: SIZEOF(x) over a variable, and
   // SIZEOF(T) over a plain type, keep their existing paths.
+  // ...and any WORD, not only an identifier token: a type named like a keyword ("Window") is lexed as the
+  // keyword, and the gate kept it out of the branch that reads it as a name (DIVERGENZE 290).
   if (IdentName = 'SIZEOF') and Context.Check(ttDelimParOpen) and
-     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttIdentifier) then
+     Assigned(Context.PeekNext) and (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+     (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
   begin
     Result := ParseSizeOfPtrType(Token);
     if Assigned(Result) then Exit;
@@ -2978,6 +2981,27 @@ begin
   Result := nil;
   Context.SavePosition(Saved);
   Context.Advance;                                   // consume '('
+  // ⭐ A TYPE NAMED LIKE A KEYWORD: X11's "Time" and "Window" are types, and "SizeOf(Time)" read the TIME
+  // function instead - 24, the size of a String, where fbc says 8 (DIVERGENZE 290, the type half). A word
+  // followed by ")" in MODERN is handed on as the NAME it is; the SSA asks whether it names a type or a
+  // variable, exactly as it does for any SizeOf(x).
+  // (Any word: "Time" is an IDENTIFIER token - the name of a function - and still names the type here.)
+  if ModernMode and
+     (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+     (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParClose) then
+  begin
+    TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;                                 // the word
+    Context.Advance;                                 // ')'
+    Args := TASTNode.Create(antExpressionList, Token);
+    Args.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeStr, Token));
+    NameNode := TASTNode.CreateWithValue(antIdentifier, 'SIZEOF', Token);
+    Result := TASTNode.Create(antArrayAccess, Token);
+    Result.AddChild(NameNode);
+    Result.AddChild(Args);
+    Exit;
+  end;
   if not Context.Check(ttIdentifier) then begin Context.RestorePosition(Saved); Exit; end;
   TypeStr := UpperCase(VarToStr(Context.CurrentToken.Value));
   Context.Advance;                                   // consume the type name
@@ -3554,7 +3578,18 @@ begin
   if (FuncName = 'OFFSETOF') and (not Context.Check(ttDelimParClose)) then
   begin
     Indices := TASTNode.Create(antExpressionList);
-    Indices.AddChild(ParseExpression);                         // the TYPE
+    // ...and the FIRST argument is a TYPE, which may be named like a keyword too: X11's "Screen" (SCREEN is
+    // a graphics statement) - "offsetof(Screen, root)" was a syntax error. Followed by "," it is a name.
+    if (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+       (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
+       Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparParam) then
+    begin
+      Indices.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                       UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken));
+      Context.Advance;
+    end
+    else
+      Indices.AddChild(ParseExpression);                       // the TYPE
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;                                         // ','

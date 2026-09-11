@@ -15747,6 +15747,15 @@ var
       // holds it, so "Const T3 = 4294967295" is a ULONG and prints with no sign column (DIVERGENZE 295,
       // GL_INVALID_INDEX). The same test PRINT applies to a bare literal: the token must BE the number (a
       // synthesized literal borrows a neighbour's token) and not a base literal (&H.. is not on the ladder).
+      // ...and an explicit "u" suffix is unsigned whatever the value: "Const G_DATE_BAD_JULIAN = 0u" prints
+      // "0" with no sign column in fbc (glib.bi). ULONG while it fits, ULONGINT past that.
+      else if Assigned(V.Token) and V.Token.UnsignedSuffixed then
+      begin
+        if TryStrToInt64(Trim(VarToStr(V.Value)), I64) and (I64 >= 0) and (I64 <= Int64(4294967295)) then
+          Result := 'ULONG'
+        else
+          Result := 'ULONGINT';
+      end
       else if Assigned(V.Token) and (not V.Token.BasePrefixed) and
               TryStrToInt64(Trim(VarToStr(V.Token.Value)), I64) and
               (I64 = StrToInt64Def(Trim(VarToStr(V.Value)), I64 + 1)) and
@@ -15782,7 +15791,10 @@ var
     if V.NodeType = antIdentifier then
     begin
       R := FConstTypes.Values[V.ValueUpper];
-      if R <> '' then Result := R;
+      if R <> '' then Result := R
+      // ⭐ ...and TRUE / FALSE are BOOLEAN: "Const G_SOURCE_REMOVE = FALSE" (glib.bi) prints "false" in fbc,
+      // and here it was a DOUBLE printing 0 (DIVERGENZE 295, the layout net's residue).
+      else if (V.ValueUpper = 'TRUE') or (V.ValueUpper = 'FALSE') then Result := 'BOOLEAN';
       Exit;
     end;
     if (V.NodeType = antUnaryOp) and (V.ChildCount >= 1) then

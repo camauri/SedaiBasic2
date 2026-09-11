@@ -12491,6 +12491,13 @@ begin
           ttOpMod:      if R <> 0 then
                           begin if (L = Low(Int64)) and (R = -1) then Val := 0 else Val := L mod R;
                                 Result := True; end;
+          // ⭐ "/" IS A FLOATING division, and an EXACT one is still an integer: "perKeyRepeat(0 to ((255 +
+          // 1) / 8) - 1)" (X11's XKBproto) is 31 for fbc, which converts the bound. Unfolded, the member
+          // had no C shape and the WHOLE type fell to eight bytes a field (SizeOf 24 against 40). Only an
+          // exact quotient is folded: a fractional one is a different number as an integer, and stays
+          // unfolded exactly as before. DIVERGENZE 290, the layout net's residue.
+          ttOpDiv:      if (R <> 0) and not ((L = Low(Int64)) and (R = -1)) and ((L mod R) = 0) then
+                          begin Val := L div R; Result := True; end;
           ttBitwiseAND: begin Val := L and R; Result := True; end;
           ttBitwiseOR:  begin Val := L or R; Result := True; end;
           ttBitwiseXOR: begin Val := L xor R; Result := True; end;
