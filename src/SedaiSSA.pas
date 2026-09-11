@@ -573,6 +573,7 @@ type
 
     // La memoria di IsSingleExpr, viva solo dentro una domanda: vedi la nota su 2^profondita'.
     FSingleMemo: specialize TDictionary<PtrUInt, Byte>;
+    FArrowOps: Integer;   // DIVERGENZE 285: 0 = not asked yet, 1 = no "Operator ->" in the program, 2 = some
     FSingleMemoDepth: Integer;
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
@@ -1337,6 +1338,7 @@ type
     function TryFastDeclaredIdentifier(Node: TASTNode; out Res: TSSAValue): Boolean;
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
     function IsTypeCtorTemporary(Node: TASTNode): Boolean;   // "type<T>(args)" / "T(args)" anonymous temporary
+    procedure RewriteArrowOperators(Node: TASTNode);        // "f->x" over an overloaded Operator -> (285)
     procedure ProcessAssignment(Node: TASTNode);
     function TryCompoundSelfOp(Node, VarNode, ExprNode: TASTNode): Boolean;
     procedure FillInferredCtorType(VarNode, ExprNode: TASTNode);
@@ -8023,6 +8025,14 @@ begin
       //   antIdentifier: array name
       //   antExpressionList: indices
 
+      // The call of an overloaded "Operator ->" that RewriteArrowOperators put in place of the object of
+      // "f->x" (285): child 1 is the argument list holding that object.
+      if Node.Attributes.Values['ARROWOP'] <> '' then
+      begin
+        EmitUserFunctionCall(Node.Attributes.Values['ARROWOP'], Node.GetChild(1), Result);
+        Exit;
+      end;
+
       // ⭐ ...unless the "array" is a STATIC MEMBER: it is a global array under a dotted name, and every
       // path below works on it once the reference is rewritten. See RewriteStaticMemberArray.
       StaticArrNode := RewriteStaticMemberArray(Node);
@@ -9893,6 +9903,48 @@ begin
     end;
   end;
   {$ENDIF}
+end;
+
+procedure TSSAGenerator.RewriteArrowOperators(Node: TASTNode);
+// ⭐ AN OVERLOADED "OPERATOR ->" IS APPLIED (DIVERGENZE 285). "operator -> ( byref lhs as foo ) as bar"
+// makes "f->data" mean "(operator->(f)).data": the name belongs to the operator's RESULT type. It was
+// never called - "f->data" arrives spelled like "f.data" and read "data" in foo, printing 1 where fbc
+// prints 1234. The parser marks the arrow (ARROW=1, the only place the '->' token is still at hand); here
+// the OBJECT of such a member access is replaced by a synthetic call node (ARROWOP=<label>), which
+// ObjectTypeName, ResolveRecordObject and ProcessExpression each answer in one arm - so a field read, a
+// store and a method call through the arrow all see the result type, and so does every question asked
+// BEFORE lowering (InferExprBank on a Double field). Children first, so "a->b->c" resolves inside out.
+// Done per statement, when the scope of its names is live; a node whose object type is not known yet
+// keeps its mark and is tried again when its own statement comes.
+var
+  i: Integer;
+  Obj, Synth, Args: TASTNode;
+  T, Lbl, K: string;
+begin
+  if FArrowOps = 0 then
+  begin
+    FArrowOps := 1;
+    for K in FProcDecls.Keys do
+      if Pos('.OPERATOR->@1', K) > 0 then begin FArrowOps := 2; Break; end;
+  end;
+  if (FArrowOps <> 2) or (Node = nil) then Exit;
+  for i := 0 to Node.ChildCount - 1 do RewriteArrowOperators(Node.GetChild(i));
+  if (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) or
+     (Node.Attributes.Values['ARROW'] <> '1') then Exit;
+  Obj := Node.GetChild(0);
+  T := ObjectTypeName(Obj);
+  if T = '' then Exit;
+  Lbl := ResolveMethodLabel(T, 'OPERATOR->' + OperatorArityCode(1));
+  if (Lbl = '') or not ProcHasParamCount(Lbl, 1) then Exit;
+  Node.Children.Extract(Obj);
+  Synth := TASTNode.CreateWithValue(antArrayAccess, Lbl, Node.Token);
+  Synth.Attributes.Values['ARROWOP'] := Lbl;
+  Synth.AddChild(TASTNode.CreateWithValue(antIdentifier, Lbl, Node.Token));
+  Args := TASTNode.Create(antArgumentList, Node.Token);
+  Args.AddChild(Obj);
+  Synth.AddChild(Args);
+  Node.InsertChild(0, Synth);
+  Node.Attributes.Values['ARROW'] := '';
 end;
 
 function TSSAGenerator.IsTypeCtorTemporary(Node: TASTNode): Boolean;
@@ -46438,6 +46490,9 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // The call of an overloaded "Operator ->" (RewriteArrowOperators, 285): the type it RETURNS.
+  if ObjNode.Attributes.Values['ARROWOP'] <> '' then
+    Exit(ProcRetTypeName(ObjNode.Attributes.Values['ARROWOP']));
   // ⭐ "IIf(c, u, v)" NAMES A UDT WHEN BOTH ITS BRANCHES DO. An IIF parses as an array access, so this
   // answered '' for it, the call site's type tail came out empty, and "Dim As T x = IIf(c, u, v)"
   // resolved its constructor by BANK alone - where a UDT handle is an 'I' exactly like a pointer, and
@@ -47590,6 +47645,16 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // The call of an overloaded "Operator ->" (RewriteArrowOperators, 285): calling it yields the handle
+  // of the record it returns, and that record is the object of the access.
+  if ObjNode.Attributes.Values['ARROWOP'] <> '' then
+  begin
+    ProcessExpression(ObjNode, HandleVal);
+    HandleVal := EnsureIntRegister(HandleVal);
+    TypeName := ProcRetTypeName(ObjNode.Attributes.Values['ARROWOP']);
+    Result := TypeName <> '';
+    Exit;
+  end;
   // ⭐ "(@X)->f" IS "X.f". In the managed model the ADDRESS of a record is its HANDLE - the same value
   // - so an address-of cancels against the arrow exactly as it cancels against a "*"
   // (DerefOfAddrOfTarget, DIVERGENZE 48). fbc's own expressions/addrof-anon writes it over an anonymous
@@ -48209,12 +48274,10 @@ begin
     // defined"). This arm used to exit with NOTHING emitted, and the caller read a register nobody
     // had written - the record's own handle, so "v.nosuch" printed " 1" and any typo in a field
     // name compiled. DIVERGENZE 251.
-    // ⚠️ ...EXCEPT on a type that overloads "Operator ->": "f->data" reaches here spelled exactly like
-    // "f.data" (the AST keeps no arrow), and there the name belongs to the operator's RESULT type, not
-    // to this one - fbc's overload/op_deref2. Applying the operator is DIVERGENZE 285; until then the
-    // access keeps its old behaviour rather than refusing a valid program.
-    else if (UDTIdx >= 0) and (SB_NoFieldCheck = 0) and
-            (ResolveMethodLabel(TypeName, 'OPERATOR->' + OperatorArityCode(1)) = '') then
+    // "f->data" over an overloaded "Operator ->" never gets here: RewriteArrowOperators has already
+    // put the operator's call in place of f (285). What is left is "f.data" with the DOT, which fbc
+    // refuses on such a type too.
+    else if (UDTIdx >= 0) and (SB_NoFieldCheck = 0) then
       raise Exception.CreateFmt('Element not defined, %s (type %s has no such field)',
                                 [LowerCase(VarToStr(Node.Value)), TypeName]);
     Exit;
@@ -48524,8 +48587,7 @@ begin
                         SetterArgs, DummyVal)
     // ⛔ ...and neither a field nor a setter: the store was DROPPED in silence ("p->nosuch = 3"
     // compiled and did nothing). fbc: "error 18: Element not defined". DIVERGENZE 251.
-    else if (UDTIdx >= 0) and (SB_NoFieldCheck = 0) and
-            (ResolveMethodLabel(TypeName, 'OPERATOR->' + OperatorArityCode(1)) = '') then
+    else if (UDTIdx >= 0) and (SB_NoFieldCheck = 0) then
     begin
       SetterArgs.Free;
       raise Exception.CreateFmt('Element not defined, %s (type %s has no such field)',
@@ -51302,6 +51364,9 @@ var
 begin
   if Node = nil then Exit;
   TempDepth := FResultTemps.Count;
+  // DIVERGENZE 285: an overloaded "Operator ->" is applied before anything asks this statement a
+  // question (a bank, a type, a print form). One integer test when the program declares none.
+  if FArrowOps <> 1 then RewriteArrowOperators(Node);
 
   // MODERN (FreeBASIC, no line numbers): stamp each statement's physical source line into
   // FCurrentLineNumber so emitted instructions carry it in the source map. This makes ERL and

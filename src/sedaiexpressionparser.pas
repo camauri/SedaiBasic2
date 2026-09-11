@@ -3758,6 +3758,9 @@ begin
       Left := Left.GetChild(0).GetChild(0);
   end;
   Result := TASTNode.CreateWithValue(antMemberAccess, FieldName, Token);
+  // ...and the spelling is kept on the NODE: an overloaded "Operator ->" applies to "f->x" and not to
+  // "f.x" (DIVERGENZE 285), and past this point the token - taken from a pool - is not to be trusted.
+  if VarToStr(Token.Value) = '->' then Result.Attributes.Values['ARROW'] := '1';
   Result.AddChild(Left);
   DoNodeCreated(Result);
 end;
