@@ -1403,6 +1403,14 @@ begin
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
   begin
+    // A bare NAME in an argument list (DIVERGENZE 277): see ParseInputFunction.
+    if Context.Check(ttDelimParClose) or Context.Check(ttSeparParam) then
+    begin
+      Result.Free;
+      Result := TASTNode.CreateWithValue(antIdentifier, Token.Value, Token);
+      DoNodeCreated(Result);
+      Exit;
+    end;
     HandleError('Expected "(" after math function', Context.CurrentToken);
     Result.Free;
     Result := nil;
@@ -1461,6 +1469,14 @@ begin
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
   begin
+    // A bare NAME in an argument list (DIVERGENZE 277): "OffsetOf(Box, len)". See ParseInputFunction.
+    if Context.Check(ttDelimParClose) or Context.Check(ttSeparParam) then
+    begin
+      Result.Free;
+      Result := TASTNode.CreateWithValue(antIdentifier, Token.Value, Token);
+      DoNodeCreated(Result);
+      Exit;
+    end;
     HandleError('Expected "(" after string function', Context.CurrentToken);
     Result.Free;
     Result := nil;
@@ -1531,6 +1547,14 @@ begin
   // Consume opening parenthesis
   if not Context.Match(ttDelimParOpen) then
   begin
+    // A bare NAME in an argument list (DIVERGENZE 277): see ParseInputFunction.
+    if Context.Check(ttDelimParClose) or Context.Check(ttSeparParam) then
+    begin
+      Result.Free;
+      Result := TASTNode.CreateWithValue(antIdentifier, Token.Value, Token);
+      DoNodeCreated(Result);
+      Exit;
+    end;
     HandleError('Expected "(" after memory function', Context.CurrentToken);
     Result.Free;
     Result := nil;
@@ -2116,6 +2140,17 @@ begin
   if not HasValidContext then
   begin
     Result := nil;
+    Exit;
+  end;
+
+  // ⭐ A BARE NAME IN AN ARGUMENT LIST, spelled like an input function: "OffsetOf(Box, pos)" names the FIELD
+  // pos, and fbc accepts it (DIVERGENZE 277). Followed by ")" or "," the word cannot be a call, so it is
+  // handed on as the name it is - the SSA asks the TYPE whether it names a field, exactly as it already did
+  // for "OffsetOf(MSG, time)". Anywhere else the parenthesis is still required.
+  if Context.Check(ttDelimParClose) or Context.Check(ttSeparParam) then
+  begin
+    Result := TASTNode.CreateWithValue(antIdentifier, Token.Value, Token);
+    DoNodeCreated(Result);
     Exit;
   end;
 

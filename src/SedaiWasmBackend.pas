@@ -8992,7 +8992,7 @@ begin
           Exit(Fail('ssaRecordNewArray names an array that was never declared'));
         if Instr.Src2.Kind <> svkConstInt then
           Exit(Fail('ssaRecordNewArray without its compile-time sizes'));
-        Bytes := Integer(Instr.Src2.ConstInt and $FFFF);
+        Bytes := Integer(Instr.Src2.ConstInt and $FFFFFFFF);
         NStr := Integer((Instr.Src2.ConstInt shr 32) and $FFFF);
         StrBase := 8 + ((Bytes + 7) div 8) * 8;
         B.I32Const(LongInt(FArrDescOf[Instr.Src1.ArrayIndex]));
@@ -9693,7 +9693,7 @@ begin
           Exit(Fail('ssaRecordNewArrayInd without its compile-time sizes'));
         if not FHasDescTmp then
           Exit(Fail('ssaRecordNewArrayInd with no descriptor local reserved'));
-        Bytes := Integer(Instr.Src2.ConstInt and $FFFF);
+        Bytes := Integer(Instr.Src2.ConstInt and $FFFFFFFF);
         NStr := Integer((Instr.Src2.ConstInt shr 32) and $FFFF);
         StrBase := 8 + ((Bytes + 7) div 8) * 8;
         LoadReg(B, Instr.Src1); B.Op(wopI32WrapI64); B.LocalTee(FDescTmp);

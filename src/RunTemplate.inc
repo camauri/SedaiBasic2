@@ -82,7 +82,7 @@ var
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
   // The record-field descriptor handed to the C loop. It is built HERE, by the side that knows the
   // layout of TRecordStorage, so hotdisp.c holds no offset of its own and the two cannot drift.
-  HotRecDesc: array[0..5] of Int64;
+  HotRecDesc: array[0..7] of Int64;
   HotRecProbe: TRecordStorage;   // only ever used to take the offset of its Bytes field
   HotNewPC: LongInt;       // NEGATIVE means the back-edge budget ran out, with the PC as -(pc+1)
   HotBudget: LongInt;      // back edges this stay may take; High(LongInt) when nobody needs pumping
@@ -447,10 +447,12 @@ EventPollCounter := 0;
         end;
       end;
       if Length(Ctx.Records) > 0 then HotRecDesc[0] := PtrUInt(@Ctx.Records[0]) else HotRecDesc[0] := 0;
+      HotRecDesc[6] := Length(Ctx.Records);   // no allocation runs inside the C loop, so it holds for the run
       if FSharedRecLockFree and (Length(FSharedRecords) > 0) then
         HotRecDesc[3] := PtrUInt(@FSharedRecords[0])
       else
         HotRecDesc[3] := 0;
+      HotRecDesc[7] := Length(FSharedRecords);
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
                                 HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0],
                                 HotBudget, @HotGfxDesc[0]);
@@ -1370,7 +1372,7 @@ EventPollCounter := 0;
         bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first
           begin
             IntRegs[Instr^.Dest] := AllocSharedRecordBlock(IntRegs[Instr^.Src1],
-                                     Instr^.Immediate and $FFFF,
+                                     Instr^.Immediate and $FFFFFFFF,
                                      (Instr^.Immediate shr 32) and $FFFF, (Instr^.Immediate shr 48) and $FFFF);
             Inc(CurPC);
           end;
@@ -1398,7 +1400,7 @@ EventPollCounter := 0;
           begin
             IntRegs[Instr^.Dest] := ReallocSharedRecordBlock(IntRegs[Instr^.Src1],
                                      Integer(IntRegs[Instr^.Src2]),
-                                     Instr^.Immediate and $FFFF,
+                                     Instr^.Immediate and $FFFFFFFF,
                                      (Instr^.Immediate shr 32) and $FFFF, (Instr^.Immediate shr 48) and $FFFF);
             Inc(CurPC);
           end;

@@ -1289,7 +1289,7 @@ var
   // (a dynamic array = a pointer) at its offset, then load/store [fieldptr + slot*8]. No handle/slot bounds
   // check, matching the interpreter (range checks off). HandleReg = Src1, ValDstReg = Dest/Src2, Slot = Imm.
   procedure RecAccess(apc, HandleReg, Slot, ValDstReg: Integer; IsFloat, IsStore: Boolean);
-  var p, pv, Ofs, W: Integer;
+  var p, pv, pz, pk, Ofs, W: Integer;
   begin
     // A3-i: Slot is no longer an index into a slot array. It carries the field's BYTE OFFSET in
     // bits 4..31 and its width code in bits 0..3, and the record's numeric halves are one byte
@@ -1310,6 +1310,16 @@ var
     DeoptTo(apc);                                    // shared record -> interpreter (takes the lock)
     E.PatchByte(p, Byte(E.Len - (p + 1)));
     LoadCtxFieldRdx(RecordsOff);                     // rdx = current @Ctx.Records[0] (via the ctx slot)
+    // ⛔ THE HANDLE IS CHECKED against the table (DIVERGENZE 226): a "T Ptr" laid over an array hands an
+    // array pointer here, which indexed past the records - the interpreter now refuses it by name, so
+    // compiled code leaves to it. An FPC dynamic array keeps its HIGH index just below its data.
+    E.EmitBytes([$48, $85, $D2]);                    // test rdx, rdx
+    E.EmitBytes([$74, $00]); pz := E.Len - 1;       // jz  +bad
+    E.EmitBytes([$48, $3B, $42, $F8]);               // cmp rax, [rdx-8]   (high)
+    E.EmitBytes([$7E, $00]); pk := E.Len - 1;       // jle +ok
+    E.PatchByte(pz, Byte(E.Len - (pz + 1)));
+    DeoptTo(apc);
+    E.PatchByte(pk, Byte(E.Len - (pk + 1)));
     E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(RecSize));   // imul rax, rax, RecSize
     E.EmitBytes([$48, $01, $C2]);                    // add rdx, rax    -> @Records[handle]
     E.EmitBytes([$48, $8B, $8A]);                    // mov rcx, [rdx + fieldoff]  -> field data pointer

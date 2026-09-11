@@ -895,6 +895,7 @@ type
     // record-field pointer of the member (RECPTR_TAG, so negative), whose slot names its byte offset. Every
     // record field op goes through these four, which add that offset; a plain handle takes the old road.
     function RecViewTarget(Ctx: TExecutionContext; View: Int64; var Enc: Int64): PRecordStorage;
+    function RecPtrNum(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage;
     function RecLoadI(Ctx: TExecutionContext; H, Enc: Int64): Int64; inline;
     function RecLoadF(Ctx: TExecutionContext; H, Enc: Int64): Double; inline;
     procedure RecStoreI(Ctx: TExecutionContext; H, Enc, Val: Int64); inline;
@@ -4745,6 +4746,17 @@ begin
     PInt64(@Result)^ := PInt64(@Result)^ or Int64($8000000000000000);
 end;
 
+function RecWireBytes(Enc: Int64): Integer; inline;
+// How many bytes the width code in Enc's low nibble reads - 0 is the full eight.
+begin
+  case Enc and $F of
+    1, 2:    Result := 1;
+    3, 4:    Result := 2;
+    5, 6, 7: Result := 4;
+  else       Result := 8;
+  end;
+end;
+
 function RecFieldInt(R: PRecordStorage; Enc: Int64): Int64; inline;
 var
   p: PByte;
@@ -5084,6 +5096,10 @@ begin
     // not just on New/Delete. Walking a tree of N nodes takes the region lock ~8 times per node
     // against 2 for allocating and freeing it, so the per-access lock was ~80% of the traffic, and
     // with several worker threads it was contended traffic.
+    // ⛔ ...and the index is checked here too: bit 62 is also the tag of a RAW address, so a "T Ptr" over
+    // raw memory arrives looking like a shared handle, and its offset indexed past the table.
+    if (Handle and SHARED_REC_MASK) > High(FSharedRecords) then
+      raise ERangeError.CreateFmt('Invalid record handle %d (not a shared record)', [Handle]);
     if FSharedRecLockFree then
       Result := FSharedRecords[Handle and SHARED_REC_MASK]
     else
@@ -5097,9 +5113,17 @@ begin
   begin
     // ⛔ THE RANGE TEST FIRST, and the flag is a GLOBAL read once at startup: this runs on EVERY
     // per-thread record resolution, so a SysUtils.GetEnvironmentVariable here would be a lookup per field access.
-    if ((Handle < 0) or (Handle > High(Ctx.Records))) and GRecDiag then
-      WriteLn(ErrOutput, Format('[rec] FUORI RANGE handle=%d alto=%d pc=%d',
-              [Handle, High(Ctx.Records), Ctx.PC]));
+    if Handle > High(Ctx.Records) then
+    begin
+      if GRecDiag then
+        WriteLn(ErrOutput, Format('[rec] FUORI RANGE handle=%d alto=%d pc=%d',
+                [Handle, High(Ctx.Records), Ctx.PC]));
+      // ⛔ REFUSED, NOT INDEXED: a value that is not a record handle - an array pointer read through a
+      // "T Ptr" laid over the array (fbc's structs/bitfield_init) - indexed memory past the table and
+      // died on an access violation, or, when the page happened to be mapped, WROTE there in silence.
+      raise ERangeError.CreateFmt('Invalid record handle %d (the program has %d records here)',
+                                  [Handle, Length(Ctx.Records)]);
+    end;
     Result := @Ctx.Records[Handle];
   end;
 end;
@@ -5107,24 +5131,50 @@ end;
 function TBytecodeVM.RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage;
 // Decode a record-field pointer (RECPTR_TAG set): recover the record handle (index + shared flag) and
 // the field slot, then route the handle to its storage. See SedaiSSATypes for the bit layout.
+// ⛔ THE INDEX IS CHECKED, NOT TRUSTED (DIVERGENZE 226). These values are computed now - a member array
+// indexed at run time and pointer arithmetic both add to one - and a walk below the first byte of the
+// record borrows from the index bits: unchecked, that answers ANOTHER record in silence.
 var
   Handle: Int64;
 begin
   Slot := PtrAddr and RECPTR_SLOT_MASK;
   Handle := (PtrAddr shr RECPTR_SLOT_BITS) and RECPTR_INDEX_MASK;
-  if (PtrAddr and SHARED_REC_FLAG) <> 0 then Handle := Handle or SHARED_REC_FLAG;
+  if (PtrAddr and SHARED_REC_FLAG) <> 0 then
+  begin
+    if Handle > High(FSharedRecords) then
+      raise ERangeError.CreateFmt('Invalid record-field pointer (address %d)', [PtrAddr]);
+    Handle := Handle or SHARED_REC_FLAG;
+  end
+  else if Handle > High(Ctx.Records) then
+    raise ERangeError.CreateFmt('Invalid record-field pointer (address %d)', [PtrAddr]);
   Result := ResolveRec(Ctx, Handle);
+end;
+
+function TBytecodeVM.RecPtrNum(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage;
+// ...the same, for a NUMERIC access: the bytes the slot's width names must lie inside the record's image.
+// A string field's slot is an index into the string vector, not an offset, so its readers ask RecPtrTarget.
+begin
+  Result := RecPtrTarget(Ctx, PtrAddr, Slot);
+  if (Int64(Slot) shr 4) + RecWireBytes(Slot) > Length(Result^.Bytes) then
+    raise ERangeError.CreateFmt('Record access out of range: byte %d of a %d-byte record',
+                                [Int64(Slot) shr 4, Length(Result^.Bytes)]);
 end;
 
 function TBytecodeVM.RecViewTarget(Ctx: TExecutionContext; View: Int64; var Enc: Int64): PRecordStorage;
 // A VIEW (DIVERGENZE 226) is the record-field pointer of a nested member whose bytes are its container's:
 // the record it names is the CONTAINER, and the member's byte offset is added to the field's own. The
 // view's slot carries width 0, so the sum keeps the field's width code in the low nibble.
+// ⭐ A member ARRAY indexed at run time is a view too, and its index is not checked against the member:
+// fbc does not check it either, and reads the next field. What is checked is the RECORD - past its last
+// byte nothing is ours to read.
 var
   S: Integer;
 begin
   Result := RecPtrTarget(Ctx, View, S);
   Enc := Enc + (Int64(S) and not Int64($F));
+  if (Enc shr 4) + RecWireBytes(Enc) > Length(Result^.Bytes) then
+    raise ERangeError.CreateFmt('Record access out of range: byte %d of a %d-byte record',
+                                [Enc shr 4, Length(Result^.Bytes)]);
 end;
 
 function TBytecodeVM.RecLoadI(Ctx: TExecutionContext; H, Enc: Int64): Int64;
@@ -6014,7 +6064,7 @@ begin
     Exit(RawLoadInt(PtrAddr, WidthCode));                // C's memory - DIVERGENZE 239
   if PtrAddr < 0 then
   begin
-    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
     Exit(RecFieldInt(Rec, RecSlot));
   end;
   ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -6047,7 +6097,7 @@ begin
     Exit(RawLoadFloat(PtrAddr, 0));                      // C's memory - DIVERGENZE 239
   if PtrAddr < 0 then
   begin
-    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
     Exit(RecFieldFloat(Rec, RecSlot));
   end;
   ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
@@ -6075,7 +6125,7 @@ begin
   end;
   if PtrAddr < 0 then
   begin
-    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
     RecSetFieldInt(Rec, RecSlot, Value);
     Exit;
   end;
@@ -6104,7 +6154,7 @@ begin
   end;
   if PtrAddr < 0 then
   begin
-    Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+    Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
     RecSetFieldFloat(Rec, RecSlot, Value);
     Exit;
   end;
@@ -6527,15 +6577,25 @@ end;
 // the storage, so a block operation can never reach memory the VM does not own.
 function TBytecodeVM.BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt): Pointer;
 var
-  ArrayIdx: Integer;
+  ArrayIdx, RecSlot: Integer;
   PtrOffset, Avail: Int64;
+  Rec: PRecordStorage;
 begin
-  // A raw-heap / framebuffer pointer, or a record-field pointer (bit 63): RawAddr owns both answers -
-  // the second one by refusing it, since a record field is not a byte image either.
+  // A raw-heap / framebuffer pointer: RawAddr owns the answer.
   if (Ptr and RAWPTR_TAG) <> 0 then Exit(RawAddr(Ptr, NeedBytes));
   if (Ptr > 0) and ((Ptr and FGNPTR_TAG) <> 0) then Exit(RawAddr(Ptr, NeedBytes));   // DIVERGENZE 239
+  // ⭐ A RECORD-FIELD POINTER NAMES BYTES OF THE RECORD'S IMAGE (A3, DIVERGENZE 226). Every numeric field
+  // and every member that lives inline - a nested record, a fixed array - sits at its fbc offset there, so a
+  // block operation from one is a block of those bytes, bounded by the record like every region here. It
+  // used to be refused, from the days a record was one slot array per bank and had no bytes to name.
   if Ptr < 0 then
-    raise ERangeError.Create('CLEAR/FB_MEMCOPY: a record-field pointer is not a byte image');
+  begin
+    Rec := RecPtrTarget(Ctx, Ptr, RecSlot);
+    if (Int64(RecSlot) shr 4) + Int64(NeedBytes) > Length(Rec^.Bytes) then
+      raise ERangeError.CreateFmt('Block operation out of bounds: %d bytes from byte %d of a %d-byte record',
+                                  [Int64(NeedBytes), Int64(RecSlot) shr 4, Length(Rec^.Bytes)]);
+    Exit(@Rec^.Bytes[Int64(RecSlot) shr 4]);
+  end;
   if Ptr = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
 
@@ -6600,7 +6660,7 @@ procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Intege
 var
   k, ByteSize, StrC, TypeId: Integer;
 begin
-  ByteSize := PackedCounts and $FFFF;
+  ByteSize := PackedCounts and $FFFFFFFF;   // 32 bits: a record past 64 KiB (DIVERGENZE 226)
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
   // Allocate a record only for elements that do not already have one. A valid array-of-UDT element
@@ -7421,7 +7481,7 @@ var
   SrcRec, DestRec: PRecordStorage;
 begin
   if (DestArr < 1) or (DestArr > High(FArrays)) or (SrcArr < 1) or (SrcArr > High(FArrays)) then Exit;
-  ByteSize := PackedCounts and $FFFF;
+  ByteSize := PackedCounts and $FFFFFFFF;   // 32 bits: a record past 64 KiB (DIVERGENZE 226)
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
   // Match the destination's shape to the source. On a size change, release the dest's current element
@@ -9975,12 +10035,12 @@ begin
       RecordNewArrayInit(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
     bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first handle
       Ctx.IntRegs[Instr.Dest] := AllocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
-                                   Instr.Immediate and $FFFF,
+                                   Instr.Immediate and $FFFFFFFF,
                                    (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
     bcRecordReallocBlock:  // Reallocate a UDT block: Dest = the (possibly moved) first handle
       Ctx.IntRegs[Instr.Dest] := ReallocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
                                    Integer(Ctx.IntRegs[Instr.Src2]),
-                                   Instr.Immediate and $FFFF,
+                                   Instr.Immediate and $FFFFFFFF,
                                    (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
     bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
       Ctx.IntRegs[Instr.Dest] := SharedRecordBlockLen(Ctx.IntRegs[Instr.Src1]);
@@ -16183,7 +16243,7 @@ begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
           if PtrAddr < 0 then
           begin
-            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
             Ctx.IntRegs[Instr.Dest] := RecFieldInt(Rec, RecSlot);
           end
           // ⛔ ...AND A RAW ADDRESS IS A THIRD KIND. An @-taken LOCAL is a raw byte slot (RAWPTR_TAG,
@@ -16237,7 +16297,7 @@ begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
           if PtrAddr < 0 then
           begin
-            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
             Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(Rec, RecSlot);
           end
           // The raw-address kind - see the note in bcRefLoadInt above.
@@ -16264,6 +16324,8 @@ begin
           if PtrAddr < 0 then
           begin
             Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            if RecSlot > High(Rec^.StringData) then
+              raise ERangeError.CreateFmt('Invalid record-field pointer (address %d)', [PtrAddr]);
             Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
           end
           // ⛔ THE RAW THIRD KIND, WHICH THIS ARM ALONE DID NOT KNOW. bcRefLoadInt/Float learned it and
@@ -16288,7 +16350,7 @@ begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
           if PtrAddr < 0 then
           begin
-            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
             RecSetFieldInt(Rec, RecSlot, Ctx.IntRegs[Instr.Src2]);
           end
           // The raw-address kind - see the note in bcRefLoadInt above. The WRITE half must know it too,
@@ -16328,7 +16390,7 @@ begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];
           if PtrAddr < 0 then
           begin
-            Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
             RecSetFieldFloat(Rec, RecSlot, Ctx.FloatRegs[Instr.Src2]);
           end
           // The raw-address kind - see the note in bcRefLoadInt above.
@@ -16355,6 +16417,8 @@ begin
           if PtrAddr < 0 then
           begin
             Rec := RecPtrTarget(Ctx, PtrAddr, RecSlot);
+            if RecSlot > High(Rec^.StringData) then
+              raise ERangeError.CreateFmt('Invalid record-field pointer (address %d)', [PtrAddr]);
             Rec^.StringData[RecSlot] := Ctx.StringRegs[Instr.Src2];
           end
           // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
@@ -16458,6 +16522,8 @@ begin
         if Ctx.IntRegs[Instr.Src1] < 0 then
         begin
           Rec := RecPtrTarget(Ctx, Ctx.IntRegs[Instr.Src1], RecSlot);
+          if RecSlot > High(Rec^.StringData) then
+            raise ERangeError.CreateFmt('Invalid record-field pointer (address %d)', [Ctx.IntRegs[Instr.Src1]]);
           Ctx.StringRegs[Instr.Dest] := Rec^.StringData[RecSlot];
           if Instr.Immediate >= 2 then
           begin
@@ -20148,7 +20214,8 @@ begin
           if SubOp = 28 then
           begin
             SetLength(Data, BinCount);
-            Move(RawAddr(BinI, PtrUInt(BinCount))^, Data[1], BinCount);
+            // BlockAddr, not RawAddr: a record's bytes (DIVERGENZE 226) and an array's are memory too.
+            Move(BlockAddr(Ctx, BinI, PtrUInt(BinCount))^, Data[1], BinCount);
             FOnFileData(Self, 'PUTBIN', HandleNum, Data, ErrorCode);
             if ErrorCode <> 0 then raise Exception.CreateFmt('PUT error %d to file %d', [ErrorCode, HandleNum]);
           end
@@ -20157,7 +20224,7 @@ begin
             Data := IntToStr(BinCount);
             FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
             while Length(Data) < BinCount do Data := Data + #0;   // short read at EOF: zero-fill
-            Move(Data[1], RawAddr(BinI, PtrUInt(BinCount))^, BinCount);
+            Move(Data[1], BlockAddr(Ctx, BinI, PtrUInt(BinCount))^, BinCount);
           end;
         end;
       end;

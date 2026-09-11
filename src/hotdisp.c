@@ -238,6 +238,10 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         [3] base of the shared-record pointer table, or 0 when the per-access lock is in force -
             and 0 makes every shared handle leave the C loop, which is the prudent answer
         [4] SHARED_REC_FLAG   [5] SHARED_REC_MASK
+        [6] how many per-thread records there are: a handle past them is not a record (an array
+            pointer read through a "T Ptr" laid over the array), and the interpreter refuses it by name
+            - indexed here it was an access violation, or a silent write where the page was mapped
+        [7] how many shared records there are: bit 62 is also a RAW address's tag
      A null recdesc disables all four arms. */
 #define RECPTR(h_, out_) do {                                                     \
     int64_t hh_ = (h_);                                                           \
@@ -245,9 +249,10 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
     if (hh_ < 0) return pc;                   /* a VIEW (226): the interpreter's */ \
     if (hh_ & recdesc[4]) {                                                       \
       if (!recdesc[3]) return pc;               /* locked mode: not ours */       \
+      if ((hh_ & recdesc[5]) >= recdesc[7]) return pc;  /* not a shared record */ \
       (out_) = ((char *const *)(intptr_t)recdesc[3])[hh_ & recdesc[5]];           \
     } else {                                                                      \
-      if (!recdesc[0] || hh_ < 0) return pc;                                      \
+      if (!recdesc[0] || hh_ >= recdesc[6]) return pc;                            \
       (out_) = (char *)(intptr_t)recdesc[0] + hh_ * recdesc[1];                   \
     }                                                                             \
     if (!(out_)) return pc;                                                       \

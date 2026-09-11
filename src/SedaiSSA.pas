@@ -105,6 +105,8 @@ type
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
     InlineNested: Boolean;  // DIVERGENZE 226: ...unless the record is plain data, which LIVES in our bytes at ByteOffset
+    InlineArray: Boolean;   // DIVERGENZE 226: a fixed numeric ARRAY member whose elements live in our bytes at
+                            // ByteOffset (Slot = offset of element 0, element width) - no FArrays handle
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
     MultiPtrPointee: string;// ⛔ THE THIRD SHAPE, AND NOTHING RECORDED IT. A field declared "As T Ptr Ptr"
                             // is neither of the two below: stripping one PTR leaves "T PTR", which is not
@@ -159,6 +161,7 @@ type
                             // without it "Print obj.flag" answered -1 where fbc prints "true", and
                             // Len/SizeOf of the field answered 8 where fbc answers 1.
     IsArray: Boolean;       // array member (e.g. "Dim As Double m(Any, Any)"): the int slot holds an FArrays handle
+    DeclaredRedim: Boolean; // ...declared with REDIM: dynamic even with constant bounds (fbc), never inline (226)
     ArrayElemBank: TSSARegisterType;  // element bank of an array member (int/float/string)
     ArrayElemScalarType: string;      // declared element type of an array member when it is a SCALAR
                             // ("a(0 To 2) As Byte" -> 'BYTE'). ⛔ ArrayElemType beside it means the
@@ -350,6 +353,8 @@ type
     FStaticRefMembers: TStringList;      // "Static ByRef" members "TYPE.FIELD=type": a Shared REFERENCE under the dotted name (269)
     FWantByrefRetAddr: Boolean;          // "@(fp( ))": the next indirect ByRef call hands back the ADDRESS, not the value
     FCtorDtorTypes: TStringList;         // DIVERGENZE 226: the types that DEFINE a constructor or destructor (anywhere)
+    FWholeArrayFields: TStringList;      // DIVERGENZE 226: names written "x.f()" - a member array passed WHOLE
+    FInlineArrTot: array of Int64;       // DIVERGENZE 226: per type, bytes of inline array members (-1 = not yet)
     // ...and the static member PROCEDURES, "TYPE.NAME" (UPPER). The parser stamps the definition
     // with STATICMETH (it is the only place that sees "Declare STATIC Sub" in the type body);
     // gathered here so a call through an OBJECT EXPRESSION can skip evaluating the object.
@@ -937,6 +942,28 @@ type
     function UDTInlinePOD(UIdx: Integer): Boolean;   // DIVERGENZE 226: may this type LIVE inside its container?
     procedure CollectCtorDtorTypes(N: TASTNode);      // ...fills FCtorDtorTypes from the procedures DEFINED
     function NestedMemberHandle(const Parent: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;  // ...the member's handle or VIEW
+    function ArrayMemberInlineCandidate(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;  // DIVERGENZE 226: may this array member live in the bytes?
+    function ArrayMemberInlineShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;      // ...and does it, within the type's budget
+    function FieldArrayInline(UDTIdx, FieldIdx: Integer): Boolean;
+    function MemberArrayInline(UDTIdx: Integer; const FieldName: string): Boolean;
+    function InlineArrayDims(UDTIdx, FieldIdx: Integer; out Lbs, Ubs: TInt64Array): Integer;
+    function InlineMemberArrayElem(ArrAccessNode: TASTNode; out RecVal: TSSAValue; out Enc: Int64;
+                                   out ElemBank: TSSARegisterType): Boolean;
+    function EmitInlineMemberArrayLoad(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
+    function EmitInlineMemberArrayStore(ArrAccessNode, ExprNode: TASTNode): Boolean;
+    function EmitInlineMemberArrayAddr(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
+    function InlineArrayBound(UDTIdx, FieldIdx: Integer; ArgListNode: TASTNode; IsLBound: Boolean): TSSAValue;
+    procedure EmitRecBytesCopy(const DstRec, SrcRec: TSSAValue; ByteOfs, Bytes: Int64);
+    procedure EmitRecBytesClear(const Rec: TSSAValue; ByteOfs, Bytes: Int64);
+    procedure CollectWholeArrayFields(N: TASTNode; SkipDepth: Integer);
+    function ManagedStepBytes(const Pointee: string): Int64;                    // DIVERGENZE 226: bytes one element of a pointee spans
+    function EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64): TSSAValue;  // ...n elements, in the pointer's own unit
+    function EmitIsRecPtr(const P: TSSAValue): TSSAValue;                      // ...1 when P is a record-field pointer, else 0
+    function EmitRecPtrRestamp(const V: TSSAValue; W: Integer): TSSAValue;     // ...a field pointer re-read at another width
+    function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
+    function PtrPointeeOf(Node: TASTNode): string;
+    function EmitCastToScalarPtr(Operand: TASTNode; const V: TSSAValue; const Pointee: string): TSSAValue;
+    function TryEmitManagedPtrArith(Node: TASTNode; out Res: TSSAValue): Boolean;
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     function StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;    // ...the ARRAY backing, or ''
     function StaticMemberAddrName(MemberNode: TASTNode): string;   // the name "@<static member>" resolves to, or ''
@@ -2054,6 +2081,7 @@ begin
   FStaticMembers.Free;
   FStaticRefMembers.Free;
   FCtorDtorTypes.Free;
+  FWholeArrayFields.Free;
   FStaticMemberProcs.Free;
   FStaticMemberArrays.Free;
   FStaticMemberTypes.Free;
@@ -3874,7 +3902,10 @@ begin
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaBitwiseOr, Result, CastMasked, TempV, MakeSSAValue(svkNone));
           end;
-        end;
+        end
+        else
+          // ...a RECORD read as bytes, or a pointer that may turn out to be a field one (DIVERGENZE 226).
+          Result := EmitCastToScalarPtr(Node.GetChild(0), Result, Trim(Copy(ArrName2, 1, Length(ArrName2) - 4)));
       end
       else if (ArrName2 = 'DOUBLE') then
         Result := EnsureFloatRegister(Left)
@@ -4839,6 +4870,12 @@ begin
         EmitRawPtrArith(Node, Result);
         Exit;
       end;
+      // ...and a pointer that is NOT raw steps in its own unit, decided at run time (DIVERGENZE 226): a
+      // packed array pointer by elements, a record-field pointer by bytes above its width nibble.
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and
+         ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) and
+         TryEmitManagedPtrArith(Node, Result) then
+        Exit;
       // Operator overloading (FreeBASIC): if the LEFT operand is a UDT handle of type T and a user
       // "OPERATOR <sym>(a AS T, b AS ...)" is defined, lower a call to it (label T.OPERATOR<sym>) instead
       // of a numeric op. The right operand may be the SAME UDT, a DIFFERENT UDT, or a scalar (e.g. a
@@ -8321,6 +8358,8 @@ begin
           else if TryStaticMethodCall(MethodObjNode, VarToStr(Node.GetChild(0).Value),
                                       Node.GetChild(1), Result) then
             Exit;
+          // ...one that lives in the record's bytes is a record op on the element (DIVERGENZE 226).
+          if EmitInlineMemberArrayLoad(Node, Result) then Exit;
           // UDT array member read obj.field(i,j): the field is an array (not a method) -> indirect load.
           if IsMemberArrayAccess(Node, Left, MArrBank, Right) then
           begin
@@ -11211,7 +11250,7 @@ begin
     end;
     ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordNewBlock, ExprValue, EnsureIntRegister(CountReg),
-                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                    MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFFFFFF)
                                     
                                     or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                     or ((Int64(UDTIdx) and $FFFF) shl 48)),
@@ -11375,7 +11414,7 @@ begin
       ExprValue := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordReallocBlock, ExprValue,
                       EnsureIntRegister(GetOrAllocateVariable(VarName)), EnsureIntRegister(CountReg),
-                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFFFFFF)
                                       or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                       or ((Int64(UDTIdx) and $FFFF) shl 48)));
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(VarName), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -14131,7 +14170,7 @@ begin
     // one record instance per element and store the handles (bcRecordNewArray).
     if RecArrUDTIdx >= 0 then
     begin
-      RecPacked := (Int64(FUDTs[RecArrUDTIdx].LiveBytes) and $FFFF)
+      RecPacked := (Int64(FUDTs[RecArrUDTIdx].LiveBytes) and $FFFFFFFF)
                 
                 or ((Int64(FUDTs[RecArrUDTIdx].NStr) and $FFFF) shl 32)
                 or ((Int64(RecArrUDTIdx) and $FFFF) shl 48);   // typeId for stamping each element
@@ -14290,6 +14329,14 @@ begin
   if TypeName = '' then Exit;
   if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
   if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
+  // DIVERGENZE 226: a fixed array that lives in the bytes is erased the way fbc erases a fixed array -
+  // its elements go to zero and its bounds stay.
+  if MemberArrayInline(FindUDT(TypeName), VarToStr(MemberNode.Value)) then
+  begin
+    with FUDTs[FindUDT(TypeName)].Fields[UDTFieldIndex(FindUDT(TypeName), VarToStr(MemberNode.Value))] do
+      EmitRecBytesClear(ObjHandle, ByteOffset, ByteSize);
+    Exit(True);
+  end;
   if DimCount < 1 then DimCount := 1;
   ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordLoadInt, ArrHandle, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
@@ -14387,7 +14434,7 @@ begin
     begin
       EmitInstruction(ssaRecordNewArray, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, srtInt),
-                      MakeSSAConstInt((Int64(FUDTs[RecUDT].LiveBytes) and $FFFF)
+                      MakeSSAConstInt((Int64(FUDTs[RecUDT].LiveBytes) and $FFFFFFFF)
                                       or ((Int64(FUDTs[RecUDT].NStr) and $FFFF) shl 32)
                                       or ((Int64(RecUDT) and $FFFF) shl 48)),
                       MakeSSAValue(svkNone));
@@ -14470,6 +14517,11 @@ begin
       MTypeName := ObjectTypeName(MemberNode.GetChild(0));
       if not UDTArrayField(FindUDT(MTypeName), VarToStr(MemberNode.Value), MSlot, MElemBank, MDimCount) then
         raise Exception.CreateFmt('REDIM: %s.%s is not an array member', [MTypeName, VarToStr(MemberNode.Value)]);
+      // fbc: "error 54: Expected var-len array" - and a member that lives in the bytes (DIVERGENZE 226)
+      // has nowhere to put a new size.
+      if MemberArrayInline(FindUDT(MTypeName), VarToStr(MemberNode.Value)) then
+        raise Exception.CreateFmt('Expected var-len array: %s.%s is a fixed-size array and ReDim can only ' +
+          're-dimension one declared with empty or "Any" bounds', [MTypeName, VarToStr(MemberNode.Value)]);
       if not ResolveRecordObject(MemberNode.GetChild(0), MHandle, MTypeName) then Continue;
       for di := 0 to DimsNode.ChildCount - 1 do
       begin
@@ -14506,7 +14558,7 @@ begin
         MArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaRecordLoadInt, MArrHandle, MHandle, MakeSSAValue(svkNone), MakeSSAConstInt(MSlot));
         EmitInstruction(ssaRecordNewArrayInd, MakeSSAValue(svkNone), MArrHandle,
-                        MakeSSAConstInt((Int64(FUDTs[MElemUDT].LiveBytes) and $FFFF)
+                        MakeSSAConstInt((Int64(FUDTs[MElemUDT].LiveBytes) and $FFFFFFFF)
                                         or ((Int64(FUDTs[MElemUDT].NStr) and $FFFF) shl 32)
                                         or ((Int64(MElemUDT) and $FFFF) shl 48)),
                         MakeSSAValue(svkNone));
@@ -14746,7 +14798,7 @@ begin
       UdtIdx := FindUDT(ElemUdtName);
       if UdtIdx >= 0 then
       begin
-        RecPacked := (Int64(FUDTs[UdtIdx].LiveBytes) and $FFFF)
+        RecPacked := (Int64(FUDTs[UdtIdx].LiveBytes) and $FFFFFFFF)
                   
                   or ((Int64(FUDTs[UdtIdx].NStr) and $FFFF) shl 32)
                   or ((Int64(UdtIdx) and $FFFF) shl 48);
@@ -27325,6 +27377,11 @@ begin
   // ⛔ NOT for an ARRAY of records, and not for a pointer: those really are handles on the wire.
   if (not F.IsArray) and (F.NestedType <> '') and
      NestedMemberShape(F.NestedType, False, Size, Align) then Exit;
+  // ⭐⭐ ...EXCEPT A FIXED NUMERIC ARRAY, WHICH NOW LIVES THERE (DIVERGENZE 226, second step): its elements
+  // at fbc's offsets, so a Union overlaps them and C reads them through a struct pointer. The 16-bit
+  // packing that made this "not negotiable" is 32 bits now, and a per-type budget keeps the offsets
+  // inside what a record-field pointer can carry (ArrayMemberInlineShape).
+  if F.IsArray and ArrayMemberInlineShape(UDTIdx, FieldIdx, Size, Align) then Exit;
   if F.IsArray or (F.NestedType <> '') or (F.PtrPointee <> '') or
      (F.RawPtrPointee <> '') or (F.FuncPtrSig <> '') then
   begin
@@ -27371,6 +27428,8 @@ end;
 var
   GNestedShapeDepth: Integer = 0;   // see NestedMemberShape: a type that contained itself would spin
   GNestedInlineOff: Integer = -1;   // -1 = the environment has not been asked yet
+  GInlineArrOff: Integer = -1;      // SB_NO_INLINE_ARRAYS, the same A/B knob for array members
+  GPtrStepOff: Integer = -1;        // SB_NO_PTR_STEP, the A/B knob for the run-time pointer step
 
 function TSSAGenerator.UDTShapeOf(UDTIdx: Integer; ReportShape: Boolean; out Size, Align: Int64): Boolean;
 // The size and ALIGNMENT of a whole UDT. UDTCLayout answers the size; the alignment is the widest a
@@ -27545,7 +27604,8 @@ begin
     // declines only when the nested type ITSELF has no reproducible layout - a union, a dynamic array
     // member, a variable-length string - and then the whole parent declines with it, as before.
     with FUDTs[UDTIdx].Fields[i] do
-      if (IsArray and not (ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2))) or
+      if (IsArray and not ((ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2)) or
+                           FieldArrayInline(UDTIdx, i))) or   // an inline array IS its image (226)
          ((NestedType <> '') and (IsArray or not NestedMemberShape(NestedType, ReportOnly, Sz2, Al2))) or
          ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
     if ReportOnly then UDTFieldReportShape(UDTIdx, i, Sz, Al)
@@ -27780,7 +27840,7 @@ var
     NIdx: Integer;
     Offs: TInt64Array;
     TotalSz, ElemSize, PadTo, BitShift: Int64;
-    FieldReg, ShiftReg, MaskReg, KeptReg, HiReg, OldUnit, SubRec: TSSAValue;
+    FieldReg, ShiftReg, MaskReg, KeptReg, HiReg, OldUnit, SubRec, ArrAddr: TSSAValue;
     Op: TSSAOpCode;
     SubIdx: Integer;
   begin
@@ -27797,6 +27857,19 @@ var
         EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone),
                         MakeSSAConstInt(ABase + Offs[NIdx] - Cur));
         Cur := ABase + Offs[NIdx];
+      end;
+      // ⭐ AN ARRAY MEMBER THAT LIVES IN THE BYTES (DIVERGENZE 226) IS ITS BYTES ON THE WIRE TOO: one
+      // counted transfer from the element-0 pointer, which is what "Put #f, , x" writes in fbc.
+      if FUDTs[AUdt].Fields[NIdx].InlineArray then
+      begin
+        ArrAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRefAddrField, ArrAddr, EnsureIntRegister(ARec), MakeSSAValue(svkNone),
+                        MakeSSAConstInt(Int64(FUDTs[AUdt].Fields[NIdx].ByteOffset) shl 4));
+        if IsGet then Op := ssaGetBinMem else Op := ssaPutBinMem;
+        EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, ArrAddr,
+                        EnsureIntRegister(MakeSSAConstInt(ElemSize)));
+        Cur := Cur + ElemSize;
+        Continue;
       end;
       // ⭐ A NESTED RECORD: follow the handle and lay ITS fields out here, at our offset.
       if (not FUDTs[AUdt].Fields[NIdx].IsArray) and
@@ -30899,6 +30972,7 @@ begin
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
       FUDTs[Idx].Fields[n].InlineNested := False;   // decided by ComputeUDTLiveLayout (DIVERGENZE 226)
+      FUDTs[Idx].Fields[n].InlineArray := False;    // ...and so is this one
       // FreeBASIC field default "field AS T = expr": the parser attaches the expression as the last child
       // and marks HASDEFAULT. Kept for EmitRecordInit to apply on each instantiation (not for array/nested
       // members, which manage their own storage).
@@ -30919,6 +30993,7 @@ begin
       FUDTs[Idx].Fields[n].RawPtrPointee := RawPtrPointeeT;
       FUDTs[Idx].Fields[n].MultiPtrPointee := MultiPtrPointeeT;
       FUDTs[Idx].Fields[n].IsArray := IsArrayField;
+      FUDTs[Idx].Fields[n].DeclaredRedim := IsArrayField and (FieldNode.Attributes.Values['REDIMFIELD'] = '1');
       FUDTs[Idx].Fields[n].ArrayElemBank := ArrElemBank;
       FUDTs[Idx].Fields[n].ArrayElemType := ArrElemType;
       FUDTs[Idx].Fields[n].ArrayElemScalarType := ArrElemScalarType;
@@ -31183,10 +31258,718 @@ begin
   for i := 0 to High(FUDTs[UIdx].Fields) do
   begin
     if FUDTs[UIdx].Fields[i].Bank = srtString then Exit;
-    if FUDTs[UIdx].Fields[i].IsArray then Exit;
+    // An array member may, once it lives in the bytes too (DIVERGENZE 226, second step).
+    if FUDTs[UIdx].Fields[i].IsArray and not FieldArrayInline(UIdx, i) then Exit;
     if (FUDTs[UIdx].Fields[i].NestedType <> '') and
        not UDTInlinePOD(FindUDT(FUDTs[UIdx].Fields[i].NestedType)) then Exit;
   end;
+  Result := True;
+end;
+
+function TSSAGenerator.ArrayMemberInlineCandidate(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;
+// ⭐⭐ DIVERGENZE 226, SECOND STEP - MAY THIS ARRAY MEMBER LIVE IN ITS RECORD'S BYTES? A fixed-size array of
+// numbers may: its elements at fbc's offsets, which is what a Union overlaps ("m(0 To 3, 0 To 3)" over
+// "_11.._44" in D3DXMATRIX) and what C reads through a struct pointer. What may not, and why:
+//   - an "Any" member: ReDim sizes it per record, and a record's byte image has one size;
+//   - an array of STRINGS, RECORDS or POINTERS: their elements are managed values or handles, not bytes;
+//   - an array of BOOLEANS: a Boolean has no width code of its own on the wire;
+//   - a member the program passes WHOLE ("f(x.m())", CollectWholeArrayFields): an array parameter binds an
+//     FArrays array, and bytes inside a record are not one;
+//   - any at all under SB_NO_INLINE_ARRAYS=1 - the A/B knob that puts every member back behind its handle.
+var
+  T: string;
+begin
+  Result := False; Size := 8; Align := 8;
+  if GInlineArrOff < 0 then
+    GInlineArrOff := Ord(GetEnvironmentVariable('SB_NO_INLINE_ARRAYS') = '1');
+  if GInlineArrOff = 1 then Exit;
+  if FWholeArrayFields = nil then Exit;               // asked before the program was read: not yet
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  if (FieldIdx < 0) or (FieldIdx > High(FUDTs[UDTIdx].Fields)) then Exit;
+  if not FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].DeclaredRedim then Exit;   // "ReDim m(0 To 0)": dynamic by declaration
+  if not (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank in [srtInt, srtFloat]) then Exit;
+  if (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType <> '') or
+     (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemPtrPointee <> '') then Exit;
+  if FWholeArrayFields.IndexOf(FUDTs[UDTIdx].Fields[FieldIdx].Name) >= 0 then Exit;
+  T := UpperFast(Trim(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemScalarType));
+  if (T = '') or (T = 'BOOLEAN') or (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit;
+  if RecPtrWireWidth(T) < 0 then Exit;
+  if not FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then
+  begin
+    Size := 8; Align := 8; Exit;
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.ArrayMemberInlineShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;
+// ...and within a BUDGET per type: 64 KiB of inline array members. A record-field pointer carries a 20-bit
+// byte offset (RECPTR_SLOT_BITS), so the bytes a record takes inline must stay well inside a megabyte. Past
+// the budget EVERY array member of the type keeps its handle - one rule for the type, not a cut half-way
+// through it, so the answer does not depend on the order the members are asked in.
+const
+  INLINE_ARRAY_BUDGET = 65536;
+var
+  k: Integer;
+  Tot, S2, A2: Int64;
+begin
+  Result := ArrayMemberInlineCandidate(UDTIdx, FieldIdx, Size, Align);
+  if not Result then Exit;
+  if (UDTIdx <= High(FInlineArrTot)) and (FInlineArrTot[UDTIdx] >= 0) then
+    Tot := FInlineArrTot[UDTIdx]
+  else
+  begin
+    Tot := 0;
+    for k := 0 to High(FUDTs[UDTIdx].Fields) do
+      if ArrayMemberInlineCandidate(UDTIdx, k, S2, A2) then Tot := Tot + S2;
+    if FUDTs[UDTIdx].Filled then                     // the fields are final: the sum is too
+    begin
+      if UDTIdx > High(FInlineArrTot) then
+      begin
+        k := Length(FInlineArrTot);
+        SetLength(FInlineArrTot, UDTIdx + 1);
+        while k <= High(FInlineArrTot) do
+        begin
+          FInlineArrTot[k] := -1;
+          Inc(k);
+        end;
+      end;
+      FInlineArrTot[UDTIdx] := Tot;
+    end;
+  end;
+  if Tot > INLINE_ARRAY_BUDGET then
+  begin
+    Result := False; Size := 8; Align := 8;
+  end;
+end;
+
+function TSSAGenerator.FieldArrayInline(UDTIdx, FieldIdx: Integer): Boolean;
+var
+  S, A: Int64;
+begin
+  Result := ArrayMemberInlineShape(UDTIdx, FieldIdx, S, A);
+end;
+
+function TSSAGenerator.MemberArrayInline(UDTIdx: Integer; const FieldName: string): Boolean;
+// Is the named member an array that lives in the bytes? Read off the layout (ComputeUDTLiveLayout stamps it).
+var
+  FI: Integer;
+begin
+  FI := UDTFieldIndex(UDTIdx, FieldName);
+  Result := (FI >= 0) and FUDTs[UDTIdx].Fields[FI].InlineArray;
+end;
+
+function TSSAGenerator.InlineArrayDims(UDTIdx, FieldIdx: Integer; out Lbs, Ubs: TInt64Array): Integer;
+// The declared bounds of a member that lives in the bytes - constants, or it would not live there.
+var
+  D: TASTNode;
+  di: Integer;
+begin
+  Result := 0;
+  SetLength(Lbs, 0); SetLength(Ubs, 0);
+  D := FUDTs[UDTIdx].Fields[FieldIdx].ArrayBounds;
+  if D = nil then Exit;
+  SetLength(Lbs, D.ChildCount); SetLength(Ubs, D.ChildCount);
+  for di := 0 to D.ChildCount - 1 do
+    if D.GetChild(di).NodeType = antDimRange then
+    begin
+      if not TryFoldConstIntExpr(D.GetChild(di).GetChild(0), Lbs[di]) then Lbs[di] := 0;
+      if not TryFoldConstIntExpr(D.GetChild(di).GetChild(1), Ubs[di]) then Ubs[di] := -1;
+    end
+    else
+    begin
+      Lbs[di] := 0;
+      if not TryFoldConstIntExpr(D.GetChild(di), Ubs[di]) then Ubs[di] := -1;
+    end;
+  Result := D.ChildCount;
+end;
+
+function TSSAGenerator.InlineMemberArrayElem(ArrAccessNode: TASTNode; out RecVal: TSSAValue; out Enc: Int64;
+  out ElemBank: TSSARegisterType): Boolean;
+// "obj.m(i, j)" on an array member that lives in the record's bytes (DIVERGENZE 226): where the element is,
+// as a record (handle or VIEW) and a field encoding, so the access is ONE ordinary record op.
+//   - every index a constant and the element inside the record: the record itself, at the element's own
+//     offset - the very op a scalar field is read with, which every engine covers natively;
+//   - otherwise a VIEW of the member built at run time, whose offset grows by lin * SizeOf(element), and an
+//     encoding that carries only the element's width.
+// ⚠️ The index is not checked against the MEMBER: fbc does not check it, and "x.m(4)" on "m(0 To 3)" is the
+// field after it there (measured). The VM checks the RECORD (RecViewTarget): past it, nothing is ours.
+var
+  MemberNode, IdxN: TASTNode;
+  TypeName: string;
+  U, FI, n, k, W: Integer;
+  Lbs, Ubs: TInt64Array;
+  Strides: array of Int64;
+  Consts: array of Int64;
+  Regs: array of TSSAValue;
+  Lin, Esz, Ofs, C0: Int64;
+  AllConst: Boolean;
+  ObjHandle, V, Acc, T, View: TSSAValue;
+begin
+  Result := False;
+  RecVal := MakeSSAValue(svkNone); Enc := 0; ElemBank := srtInt;
+  if (ArrAccessNode = nil) or (ArrAccessNode.NodeType <> antArrayAccess) or (ArrAccessNode.ChildCount < 2) then Exit;
+  MemberNode := ArrAccessNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  IdxN := ArrAccessNode.GetChild(1);
+  if (IdxN = nil) or (IdxN.ChildCount = 0) then Exit;        // "x.m()" is the whole array, not an element
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  U := FindUDT(TypeName);
+  if U < 0 then Exit;
+  FI := UDTFieldIndex(U, VarToStr(MemberNode.Value));
+  if (FI < 0) or not FUDTs[U].Fields[FI].InlineArray then Exit;
+  n := InlineArrayDims(U, FI, Lbs, Ubs);
+  if IdxN.ChildCount <> n then
+    raise Exception.CreateFmt('Wrong number of dimensions: %s.%s has %d, %d given',
+      [FUDTs[U].Name, FUDTs[U].Fields[FI].Name, n, IdxN.ChildCount]);
+  if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
+  ElemBank := FUDTs[U].Fields[FI].ArrayElemBank;
+  W := FUDTs[U].Fields[FI].Slot and $F;
+  Esz := TypeSizeBytes(FUDTs[U].Fields[FI].ArrayElemScalarType);
+  // Row-major, as fbc lays it out: the LAST index moves fastest.
+  SetLength(Strides, n);
+  Strides[n - 1] := 1;
+  for k := n - 2 downto 0 do
+    Strides[k] := Strides[k + 1] * (Ubs[k + 1] - Lbs[k + 1] + 1);
+  SetLength(Consts, n); SetLength(Regs, n);
+  AllConst := True;
+  for k := 0 to n - 1 do
+  begin
+    ProcessExpression(IdxN.GetChild(k), V);
+    Regs[k] := MakeSSAValue(svkNone);
+    // The same normalisation the handle path applies (IsMemberArrayAccess): a constant is folded, a
+    // float index is converted, anything else is an int register.
+    if V.Kind = svkConstInt then Consts[k] := V.ConstInt
+    else if V.Kind = svkConstFloat then Consts[k] := Trunc(V.ConstFloat)
+    else
+    begin
+      AllConst := False;
+      if (V.Kind = svkRegister) and (V.RegType = srtFloat) then
+      begin
+        Regs[k] := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaFloatToInt, Regs[k], V, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        Regs[k] := EnsureIntRegister(V);
+    end;
+  end;
+  if AllConst then
+  begin
+    Lin := 0;
+    for k := 0 to n - 1 do Lin := Lin + (Consts[k] - Lbs[k]) * Strides[k];
+    Ofs := (FUDTs[U].Fields[FI].Slot shr 4) + Lin * Esz;
+    if (Ofs >= 0) and (Ofs + Esz <= FUDTs[U].LiveBytes) then
+    begin
+      RecVal := ObjHandle;
+      Enc := (Ofs shl 4) or W;
+      Exit(True);
+    end;
+  end;
+  // At run time: the constant part and the register part of the linear index, then the view.
+  C0 := 0;
+  Acc := MakeSSAValue(svkNone);
+  for k := 0 to n - 1 do
+    if Regs[k].Kind = svkNone then
+      C0 := C0 + (Consts[k] - Lbs[k]) * Strides[k]
+    else
+    begin
+      T := Regs[k];
+      if Lbs[k] <> 0 then
+      begin
+        V := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaSubInt, V, T, EnsureIntRegister(MakeSSAConstInt(Lbs[k])), MakeSSAValue(svkNone));
+        T := V;
+      end;
+      if Strides[k] <> 1 then
+      begin
+        V := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaMulInt, V, T, EnsureIntRegister(MakeSSAConstInt(Strides[k])), MakeSSAValue(svkNone));
+        T := V;
+      end;
+      if Acc.Kind = svkNone then Acc := T
+      else
+      begin
+        V := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, V, Acc, T, MakeSSAValue(svkNone));
+        Acc := V;
+      end;
+    end;
+  if Acc.Kind = svkNone then
+    Acc := EnsureIntRegister(MakeSSAConstInt(C0))         // all constant, but past the record: checked at run time
+  else if C0 <> 0 then
+  begin
+    V := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, V, Acc, EnsureIntRegister(MakeSSAConstInt(C0)), MakeSSAValue(svkNone));
+    Acc := V;
+  end;
+  // The byte offset, in the slot's units (bytes shl 4), added to the member's view (width 0).
+  T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, T, Acc, EnsureIntRegister(MakeSSAConstInt(Esz * 16)), MakeSSAValue(svkNone));
+  View := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, View, EnsureIntRegister(ObjHandle), MakeSSAValue(svkNone),
+                  MakeSSAConstInt(FUDTs[U].Fields[FI].Slot and not Int64($F)));
+  RecVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, RecVal, View, T, MakeSSAValue(svkNone));
+  Enc := W;
+  Result := True;
+end;
+
+function TSSAGenerator.EmitInlineMemberArrayLoad(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
+var
+  R: TSSAValue;
+  E: Int64;
+  B: TSSARegisterType;
+begin
+  Res := MakeSSAValue(svkNone);
+  Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
+  if not Result then Exit;
+  if B = srtFloat then
+  begin
+    Res := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaRecordLoadFloat, Res, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E));
+  end
+  else
+  begin
+    Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordLoadInt, Res, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E));
+  end;
+end;
+
+function TSSAGenerator.EmitInlineMemberArrayStore(ArrAccessNode, ExprNode: TASTNode): Boolean;
+var
+  R, V: TSSAValue;
+  E: Int64;
+  B: TSSARegisterType;
+begin
+  Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
+  if not Result then Exit;
+  ProcessExpression(ExprNode, V);
+  if B = srtFloat then
+    EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), EnsureIntRegister(R), EnsureFloatRegister(V),
+                    MakeSSAConstInt(E))
+  else
+    EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(R), EnsureIntRegister(V),
+                    MakeSSAConstInt(E));
+end;
+
+function TSSAGenerator.EmitInlineMemberArrayAddr(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
+// "@x.m(i)": a record-field pointer at the element, with the element's width - so "*p", "p[k]" and a
+// ByRef argument read it like any field pointer.
+var
+  R: TSSAValue;
+  E: Int64;
+  B: TSSARegisterType;
+begin
+  Res := MakeSSAValue(svkNone);
+  Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
+  if not Result then Exit;
+  Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, Res, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E));
+end;
+
+function TSSAGenerator.InlineArrayBound(UDTIdx, FieldIdx: Integer; ArgListNode: TASTNode;
+  IsLBound: Boolean): TSSAValue;
+// LBound / UBound of a member that lives in the bytes: its declaration's, and fbc's answers at the edges -
+// dimension 0 is the rank (UBound) and 1 (LBound), a dimension past the rank is -1 (UBound) and 0 (LBound).
+// A dimension known only at run time picks among the n+1 answers with compare-and-multiply: t*t is 1 when
+// the compare is true whichever sign "true" has, and 0 otherwise.
+var
+  Lbs, Ubs: TInt64Array;
+  n, k: Integer;
+  d, B: Int64;
+  V, DimR, Acc, T, T2: TSSAValue;
+
+  function Answer(Dm: Int64): Int64;
+  begin
+    if Dm = 0 then
+    begin
+      if IsLBound then Result := 1 else Result := n;
+    end
+    else if (Dm >= 1) and (Dm <= n) then
+    begin
+      if IsLBound then Result := Lbs[Dm - 1] else Result := Ubs[Dm - 1];
+    end
+    else if IsLBound then Result := 0
+    else Result := -1;
+  end;
+
+begin
+  n := InlineArrayDims(UDTIdx, FieldIdx, Lbs, Ubs);
+  d := 1;
+  if (ArgListNode <> nil) and (ArgListNode.ChildCount >= 2) then
+  begin
+    ProcessExpression(ArgListNode.GetChild(1), V);
+    if V.Kind = svkConstInt then d := V.ConstInt
+    else if V.Kind = svkConstFloat then d := Trunc(V.ConstFloat)
+    else
+    begin
+      if (V.Kind = svkRegister) and (V.RegType = srtFloat) then
+      begin
+        DimR := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaFloatToInt, DimR, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      end
+      else
+        DimR := EnsureIntRegister(V);
+      // Out of range answers the base; each in-range dimension adds (its answer - the base) when it matches.
+      Acc := EnsureIntRegister(MakeSSAConstInt(Answer(-1)));
+      for k := 0 to n do
+      begin
+        B := Answer(k) - Answer(-1);
+        if B = 0 then Continue;
+        T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaCmpEqInt, T, DimR, EnsureIntRegister(MakeSSAConstInt(k)), MakeSSAValue(svkNone));
+        T2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaMulInt, T2, T, T, MakeSSAValue(svkNone));
+        T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaMulInt, T, T2, EnsureIntRegister(MakeSSAConstInt(B)), MakeSSAValue(svkNone));
+        T2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, T2, Acc, T, MakeSSAValue(svkNone));
+        Acc := T2;
+      end;
+      Exit(Acc);
+    end;
+  end;
+  Result := EnsureIntRegister(MakeSSAConstInt(Answer(d)));
+end;
+
+procedure TSSAGenerator.EmitRecBytesCopy(const DstRec, SrcRec: TSSAValue; ByteOfs, Bytes: Int64);
+// Copy Bytes bytes of a record's image at ByteOfs, from SrcRec to DstRec (handles or VIEWs). Up to 1 KiB as
+// eight-byte field moves - ops every engine covers - and past that as one block copy between the two
+// record-field pointers (BlockAddr bounds it by both records).
+var
+  D, S, T, DP, SP, BR: TSSAValue;
+  P, Rest: Int64;
+
+  procedure Move1(Width: Int64; Wire: Integer);
+  begin
+    T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordLoadInt, T, S, MakeSSAValue(svkNone), MakeSSAConstInt((P shl 4) or Wire));
+    EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), D, T, MakeSSAConstInt((P shl 4) or Wire));
+    P := P + Width;
+  end;
+
+begin
+  if Bytes <= 0 then Exit;
+  D := EnsureIntRegister(DstRec);
+  S := EnsureIntRegister(SrcRec);
+  if Bytes <= 1024 then
+  begin
+    P := ByteOfs;
+    Rest := Bytes;
+    while Rest >= 8 do begin Move1(8, 0); Dec(Rest, 8); end;
+    if Rest >= 4 then begin Move1(4, 6); Dec(Rest, 4); end;
+    if Rest >= 2 then begin Move1(2, 4); Dec(Rest, 2); end;
+    if Rest >= 1 then Move1(1, 2);
+    Exit;
+  end;
+  DP := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, DP, D, MakeSSAValue(svkNone), MakeSSAConstInt(ByteOfs shl 4));
+  SP := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, SP, S, MakeSSAValue(svkNone), MakeSSAConstInt(ByteOfs shl 4));
+  BR := EnsureIntRegister(MakeSSAConstInt(Bytes));
+  EmitInstruction(ssaRawMemCopy, MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)), DP, SP, BR);
+end;
+
+procedure TSSAGenerator.EmitRecBytesClear(const Rec: TSSAValue; ByteOfs, Bytes: Int64);
+// Zero Bytes bytes of a record's image at ByteOfs - the same two sizes as EmitRecBytesCopy.
+var
+  R, Z, DP: TSSAValue;
+  P, Rest: Int64;
+
+  procedure Zero1(Width: Int64; Wire: Integer);
+  begin
+    EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), R, Z, MakeSSAConstInt((P shl 4) or Wire));
+    P := P + Width;
+  end;
+
+begin
+  if Bytes <= 0 then Exit;
+  R := EnsureIntRegister(Rec);
+  Z := EnsureIntRegister(MakeSSAConstInt(0));
+  if Bytes <= 1024 then
+  begin
+    P := ByteOfs;
+    Rest := Bytes;
+    while Rest >= 8 do begin Zero1(8, 0); Dec(Rest, 8); end;
+    if Rest >= 4 then begin Zero1(4, 6); Dec(Rest, 4); end;
+    if Rest >= 2 then begin Zero1(2, 4); Dec(Rest, 2); end;
+    if Rest >= 1 then Zero1(1, 2);
+    Exit;
+  end;
+  DP := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, DP, R, MakeSSAValue(svkNone), MakeSSAConstInt(ByteOfs shl 4));
+  EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), DP, Z, EnsureIntRegister(MakeSSAConstInt(Bytes)));
+end;
+
+procedure TSSAGenerator.CollectWholeArrayFields(N: TASTNode; SkipDepth: Integer);
+// Every name the program writes as a WHOLE array - "x.f()" or "f()", an empty index list - outside the
+// argument of LBound / UBound, which read the bounds and bind nothing. Asked by NAME, conservatively: a
+// member so named keeps its handle in every type (ArrayMemberInlineCandidate). A zero-argument CALL
+// "f()" lands here too, and costs only that a member of the same name is not laid inline.
+var
+  i, D: Integer;
+  C0: TASTNode;
+  Nm: string;
+begin
+  if N = nil then Exit;
+  if (N.NodeType = antArrayAccess) and (N.ChildCount >= 1) and (SkipDepth <= 0) and
+     ((N.ChildCount < 2) or (N.GetChild(1) = nil) or (N.GetChild(1).ChildCount = 0)) then
+  begin
+    C0 := N.GetChild(0);
+    if (C0 <> nil) and (C0.NodeType in [antMemberAccess, antIdentifier]) then
+      FWholeArrayFields.Add(UpperFast(VarToStr(C0.Value)));
+  end;
+  Nm := '';
+  if (N.NodeType = antArrayAccess) and (N.ChildCount >= 1) and (N.GetChild(0) <> nil) and
+     (N.GetChild(0).NodeType = antIdentifier) then
+    Nm := UpperFast(VarToStr(N.GetChild(0).Value))
+  else if not VarIsNull(N.Value) and not VarIsEmpty(N.Value) then
+    Nm := UpperFast(VarToStr(N.Value));
+  if (Nm = 'LBOUND') or (Nm = 'UBOUND') then D := 3 else D := SkipDepth - 1;
+  for i := 0 to N.ChildCount - 1 do CollectWholeArrayFields(N.GetChild(i), D);
+end;
+
+function TSSAGenerator.ManagedStepBytes(const Pointee: string): Int64;
+// ⭐ DIVERGENZE 226, THIRD STEP - how many BYTES one element of this pointee spans, for arithmetic on a
+// pointer that is not raw: 0 when the answer must not change how the pointer steps (a string cell lives
+// outside the byte image), otherwise fbc's SizeOf. See EmitManagedPtrStep for why a managed pointer needs it.
+var
+  P: string;
+  U: Integer;
+begin
+  Result := 0;
+  // A/B on one binary: SB_NO_PTR_STEP=1 gives every managed pointer the plain integer step it had before -
+  // how the cost of deciding the unit at run time is measured, and how its guard (m907zw) is sabotaged.
+  if GPtrStepOff < 0 then GPtrStepOff := Ord(GetEnvironmentVariable('SB_NO_PTR_STEP') = '1');
+  if GPtrStepOff = 1 then Exit;
+  P := UpperFast(Trim(Pointee));
+  while (Length(P) >= 6) and (Copy(P, 1, 6) = 'CONST ') do P := Trim(Copy(P, 7, MaxInt));
+  while (Length(P) >= 6) and (Copy(P, Length(P) - 5, 6) = ' CONST') do P := Trim(Copy(P, 1, Length(P) - 6));
+  if P = '' then Exit;
+  if (P = 'STRING') or (P = 'ZSTRING') or (P = 'WSTRING') then Exit;
+  if P = 'ANY' then Exit(1);
+  if (Length(P) > 4) and (Copy(P, Length(P) - 3, 4) = ' PTR') then Exit(8);
+  U := FindUDT(P);
+  if U >= 0 then Exit(FUDTs[U].LiveBytes);
+  if TypeSizeBytes(P) > 0 then Result := TypeSizeBytes(P);
+end;
+
+function TSSAGenerator.EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64): TSSAValue;
+// ⭐⭐ "p + n" on a pointer that is not raw, in the unit the POINTER counts in - and there are two, told
+// apart by the sign, which is what makes this a run-time question no declaration can answer:
+//   - a packed array pointer (positive) counts ELEMENTS: n;
+//   - a record-field pointer (RECPTR_TAG, negative) counts BYTES in its offset field, above the width
+//     nibble: n * SizeOf(pointee) * 16. Adding n raw moved the WIDTH instead - "@x.arr(0)" then "p[2]"
+//     read byte 0 of arr(0) as a UByte (m805), and "Cast(ULong Ptr, @s)[1]" read garbage.
+// The step is n * (1 + F*(Esz*16 - 1)) with F = EmitIsRecPtr(p), and a constant n folds to
+// n + F*(n*(Esz*16 - 1)).
+// ⛔ NOT "p sar 63", which the first version used and which cost twice: SHR is not in the C hot loop, so
+// every step left it (a pointer walk ran 32-36% slower, measured with SB_NO_PTR_STEP=1 on one binary),
+// and in CLASSIC SHR is LOGICAL - "p shr 63" is 1 there, not -1, and the mask was wrong. A compare, an AND
+// and the arithmetic are all in the C loop, in both dialects.
+var
+  P, F, S, S1: TSSAValue;
+begin
+  P := EnsureIntRegister(PtrVal);
+  F := EmitIsRecPtr(P);
+  if Count.Kind = svkConstInt then
+  begin
+    S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, S, F, EnsureIntRegister(MakeSSAConstInt(Count.ConstInt * (Esz * 16 - 1))),
+                    MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Result, S, EnsureIntRegister(MakeSSAConstInt(Count.ConstInt)), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, S, F, EnsureIntRegister(MakeSSAConstInt(Esz * 16 - 1)), MakeSSAValue(svkNone));
+  S1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, S1, S, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, Result, EnsureIntRegister(Count), S1, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitIsRecPtr(const P: TSSAValue): TSSAValue;
+// 1 when P is a record-field pointer (RECPTR_TAG, the only NEGATIVE pointer value), else 0 - whatever
+// value TRUE has in the dialect: "(p < 0) and 1". Every op of it is in the C hot loop.
+var
+  T: TSSAValue;
+begin
+  T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, T, EnsureIntRegister(P), EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Result, T, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitRecPtrRestamp(const V: TSSAValue; W: Integer): TSSAValue;
+// A pointer CAST re-reads the pointee at the cast's width - and on a record-field pointer the width is part
+// of the value (DIVERGENZE 102). Where the compiler can see "@obj.field" it re-stamps it outright; this is
+// the same, for a pointer it cannot see into: only a negative value is re-stamped, and every other kind of
+// address passes through untouched. R := V xor ((V xor ((V and not $F) or W)) and M), M = -EmitIsRecPtr(V).
+var
+  X, M, T, T2, D: TSSAValue;
+begin
+  X := EnsureIntRegister(V);
+  M := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaNegInt, M, EmitIsRecPtr(X), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, T, X, EnsureIntRegister(MakeSSAConstInt(not Int64($F))), MakeSSAValue(svkNone));
+  T2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseOr, T2, T, EnsureIntRegister(MakeSSAConstInt(W and $F)), MakeSSAValue(svkNone));
+  D := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseXor, D, X, T2, MakeSSAValue(svkNone));
+  T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, T, D, M, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseXor, Result, X, T, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.IsRecordHandleExpr(Node: TASTNode): Boolean;
+// Is this value, as the compiler can see, a managed RECORD - a handle or a VIEW - rather than an address of
+// bytes? "@s" on a record variable (the managed-reference model: the handle IS the pointer), "@s.u" on a
+// nested member (NestedMemberHandle), a managed "T Ptr" variable, and any of those through a cast to
+// "Any Ptr" or to another record pointer, which pass the value through.
+var
+  T, B: string;
+  U, FI: Integer;
+  M: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  case Node.NodeType of
+    antCast:
+      begin
+        T := UpperFast(Trim(Node.ValueUpper));
+        if (Length(T) <= 4) or (Copy(T, Length(T) - 3, 4) <> ' PTR') or (Node.ChildCount < 1) then Exit;
+        B := Trim(Copy(T, 1, Length(T) - 4));
+        if (B = 'ANY') or (FindUDT(B) >= 0) then Result := IsRecordHandleExpr(Node.GetChild(0));
+      end;
+    antProcAddress:
+      if Node.ChildCount = 0 then
+        Result := (not VarIsNull(Node.Value)) and (VarRecordTypeName(VarToStr(Node.Value)) <> '') and
+                  (FProcedureNames.IndexOf(Node.ValueUpper) < 0)
+      else if (Node.GetChild(0).NodeType = antMemberAccess) and IsFieldAddrExpr(Node) then
+      begin
+        M := Node.GetChild(0);
+        U := FindUDT(ObjectTypeName(M.GetChild(0)));
+        FI := UDTFieldIndex(U, VarToStr(M.Value));
+        Result := (FI >= 0) and (FUDTs[U].Fields[FI].NestedType <> '') and not FUDTs[U].Fields[FI].IsArray;
+      end;
+    antIdentifier:
+      Result := (PointerUDTType(VarToStr(Node.Value)) <> '') and not IsRawPtr(VarToStr(Node.Value)) and
+                (RawUDTPtrType(VarToStr(Node.Value)) = '');
+  end;
+end;
+
+function TSSAGenerator.PtrPointeeOf(Node: TASTNode): string;
+// The pointee type of a POINTER expression, or '' when the expression is not one: DerefedType's answer,
+// plus the address-of forms it does not know ("@x.m(i)", "@a(i)", "@v"), whose pointee is the declared
+// type of what they address.
+var
+  N: TASTNode;
+begin
+  Result := DerefedType(Node);
+  if Result <> '' then Exit;
+  N := Node;
+  if N = nil then Exit;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  if (N.NodeType = antProcAddress) and (N.ChildCount >= 1) then
+    Result := UpperFast(DeclaredTypeNameOf(N.GetChild(0)));
+end;
+
+function TSSAGenerator.EmitCastToScalarPtr(Operand: TASTNode; const V: TSSAValue; const Pointee: string): TSSAValue;
+// "Cast(<scalar> Ptr, x)" where x is not "@obj.field" (that one is re-stamped outright by the caller):
+//   - x is a RECORD (IsRecordHandleExpr): its BYTES from offset 0, at the cast's width - a record-field
+//     pointer. This is "Cast(ULong Ptr, @s)", which died on "Null or invalid pointer dereference": the
+//     handle is an index, not an address, and it was dereferenced as a packed array pointer (DIVERGENZE 226);
+//   - x is some other POINTER: re-stamped if, at run time, it turns out to be a record-field pointer.
+// "Any Ptr" is left alone: it is the type a record handle travels in and comes back from.
+var
+  W: Integer;
+  P: string;
+begin
+  Result := V;
+  P := UpperFast(Trim(Pointee));
+  if (P = '') or (P = 'ANY') then Exit;
+  W := RecPtrWireWidth(P);
+  if W < 0 then Exit;
+  if IsRecordHandleExpr(Operand) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRefAddrField, Result, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAConstInt(W));
+  end
+  else if PtrPointeeOf(Operand) <> '' then
+    Result := EmitRecPtrRestamp(V, W);
+end;
+
+function TSSAGenerator.TryEmitManagedPtrArith(Node: TASTNode; out Res: TSSAValue): Boolean;
+// "p ± n", "n + p" and "p - q" on pointers that are not raw (DIVERGENZE 226): the step in the pointer's own
+// unit (EmitManagedPtrStep), and the difference of two record-field pointers in ELEMENTS - their byte
+// offsets, above the width nibble, divided by SizeOf(pointee). Returns False, emitting nothing, for any
+// other shape, which keeps the plain integer arithmetic it always had.
+var
+  L, R: TASTNode;
+  PL, PR, Pt: string;
+  IsSub, LIsPtr: Boolean;
+  Esz: Int64;
+  LV, RV, PV, IV, Step, M, A, B, E, D, X, T: TSSAValue;
+begin
+  Result := False;
+  Res := MakeSSAValue(svkNone);
+  if (Node = nil) or (Node.ChildCount < 2) or not Assigned(Node.Token) then Exit;
+  IsSub := Node.Token.TokenType = ttOpSub;
+  if not (IsSub or (Node.Token.TokenType = ttOpAdd)) then Exit;
+  L := Node.GetChild(0); R := Node.GetChild(1);
+  PL := PtrPointeeOf(L); PR := PtrPointeeOf(R);
+  if (PL <> '') and (PR <> '') then
+  begin
+    if not IsSub then Exit;                      // p + q is not arithmetic
+    Pt := PL;
+  end
+  else if PL <> '' then Pt := PL
+  else if (PR <> '') and not IsSub then Pt := PR
+  else Exit;
+  Esz := ManagedStepBytes(Pt);
+  if Esz <= 0 then Exit;
+  LIsPtr := PL <> '';
+  // Source order, whatever the roles: an operand with a side effect runs where it is written.
+  // ...and a constant COUNT stays a constant, so EmitManagedPtrStep can fold it.
+  ProcessExpression(L, LV); if (LV.Kind <> svkConstInt) or (PL <> '') then LV := EnsureIntRegister(LV);
+  ProcessExpression(R, RV); if (RV.Kind <> svkConstInt) or (PR <> '') then RV := EnsureIntRegister(RV);
+  if (PL <> '') and (PR <> '') then
+  begin
+    // p - q: elements between two packed pointers, or (offset difference) / SizeOf between two field ones.
+    D := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, D, LV, RV, MakeSSAValue(svkNone));
+    // No SHR (logical in CLASSIC, and not in the C loop): the width nibbles are masked off, the byte
+    // offsets subtract exactly (same record, same index bits), and one exact division gives elements.
+    M := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaNegInt, M, EmitIsRecPtr(LV), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    A := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseAnd, A, LV, EnsureIntRegister(MakeSSAConstInt(not Int64($F))), MakeSSAValue(svkNone));
+    B := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseAnd, B, RV, EnsureIntRegister(MakeSSAConstInt(not Int64($F))), MakeSSAValue(svkNone));
+    E := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, E, A, B, MakeSSAValue(svkNone));
+    T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaDivInt, T, E, EnsureIntRegister(MakeSSAConstInt(Esz * 16)), MakeSSAValue(svkNone));
+    E := T;
+    // Res := D xor ((D xor E) and M)
+    X := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseXor, X, D, E, MakeSSAValue(svkNone));
+    T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseAnd, T, X, M, MakeSSAValue(svkNone));
+    Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseXor, Res, D, T, MakeSSAValue(svkNone));
+    Exit(True);
+  end;
+  if LIsPtr then begin PV := LV; IV := RV; end else begin PV := RV; IV := LV; end;
+  Step := EmitManagedPtrStep(PV, IV, Esz);
+  Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if IsSub then EmitInstruction(ssaSubInt, Res, PV, Step, MakeSSAValue(svkNone))
+  else EmitInstruction(ssaAddInt, Res, PV, Step, MakeSSAValue(svkNone));
   Result := True;
 end;
 
@@ -31448,6 +32231,12 @@ begin
       FUDTs[UDTIdx].Fields[i].Slot :=
         (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or (WireW and $F);
     end;
+    // DIVERGENZE 226: an array member that lives in the bytes is addressed like a field whose value is its
+    // ELEMENT 0 - the offset, and the element's width - and an element is that plus lin * SizeOf(element).
+    FUDTs[UDTIdx].Fields[i].InlineArray := FUDTs[UDTIdx].Fields[i].IsArray and FieldArrayInline(UDTIdx, i);
+    if FUDTs[UDTIdx].Fields[i].InlineArray then
+      FUDTs[UDTIdx].Fields[i].Slot := (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or
+        (RecPtrWireWidth(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType) and $F);
     // The two facts the ACCESSORS read: which bit of the unit this member starts at, and whether it
     // shares a unit with the member before it (the C layouts ask PlaceBitField again rather than this
     // mark, because their own field sizes - and so their offsets - can differ from the live image's).
@@ -31527,6 +32316,17 @@ begin
     FCtorDtorTypes.CaseSensitive := False;
   end;
   CollectCtorDtorTypes(Node);
+  // ...and which member arrays the program passes WHOLE ("f(x.m())"): those keep their handle, because an
+  // array parameter binds an FArrays array and bytes inside a record are not one. Asked by NAME, before
+  // any layout, so every type answers the same question the same way.
+  if FWholeArrayFields = nil then
+  begin
+    FWholeArrayFields := TStringList.Create;
+    FWholeArrayFields.Sorted := True;
+    FWholeArrayFields.Duplicates := dupIgnore;
+    FWholeArrayFields.CaseSensitive := False;
+  end;
+  CollectWholeArrayFields(Node, 0);
   for i := 0 to High(FUDTs) do
     FillOneUDT(i);
   if GetEnvironmentVariable('UDT_DIAG') <> '1' then Exit;
@@ -35360,7 +36160,8 @@ begin
   // at construction (an "Any" member has no concrete bound and is left for an explicit REDIM). Mirrors the
   // "Redim this.member(...)" lowering: push each upper bound, then a member REDIM (preserve = 0, fresh).
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
-    if (FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil) then
+    if (FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil) and
+       not FUDTs[UDTIdx].Fields[i].InlineArray then            // inline: already there, zeroed (226)
     begin
       DimsN := FUDTs[UDTIdx].Fields[i].ArrayBounds;
       for di := 0 to DimsN.ChildCount - 1 do
@@ -35386,7 +36187,7 @@ begin
         EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
                         MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
         EmitInstruction(ssaRecordNewArrayInd, MakeSSAValue(svkNone), NestedHandle,
-                        MakeSSAConstInt((Int64(FUDTs[ElemUDT].LiveBytes) and $FFFF)
+                        MakeSSAConstInt((Int64(FUDTs[ElemUDT].LiveBytes) and $FFFFFFFF)
                                         
                                         or ((Int64(FUDTs[ElemUDT].NStr) and $FFFF) shl 32)
                                         or ((Int64(ElemUDT) and $FFFF) shl 48)),
@@ -35463,7 +36264,8 @@ begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
-       (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) or
+       (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil) and
+        not FUDTs[UDTIdx].Fields[i].InlineArray) or
        (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or
        ((FUDTs[UDTIdx].Fields[i].Bank = srtString) and (FUDTs[UDTIdx].Fields[i].StrCapacity > 0) and
         (not FUDTs[UDTIdx].Fields[i].IsArray)) then
@@ -35994,6 +36796,23 @@ begin
     raise Exception.CreateFmt(
       'A "{ ... }" initialiser needs an array member: field %d of %s is not an array.',
       [FieldIdx + 1, FUDTs[UDTIdx].Name]);
+  // DIVERGENZE 226: a member that lives in the bytes takes its values at the elements' offsets.
+  if FUDTs[UDTIdx].Fields[FieldIdx].InlineArray then
+  begin
+    for j := 0 to BraceNode.ChildCount - 1 do
+    begin
+      ProcessExpression(BraceNode.GetChild(j), ArgVal);
+      if FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank = srtFloat then
+        EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVal),
+          MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot +
+            Int64(j) * TypeSizeBytes(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemScalarType) * 16))
+      else
+        EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVal),
+          MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot +
+            Int64(j) * TypeSizeBytes(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemScalarType) * 16));
+    end;
+    Exit;
+  end;
   ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
                   MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
@@ -41581,6 +42400,13 @@ begin
   ZeroI := MakeSSAValue(svkNone); ZeroF := MakeSSAValue(svkNone); ZeroS := MakeSSAValue(svkNone);
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
+    // DIVERGENZE 226: a member that lives in the bytes - a nested record or a fixed array - IS bytes, and
+    // zeroing it is zeroing them. Only a member behind a handle keeps its instance, as below.
+    if FUDTs[UDTIdx].Fields[i].InlineNested or FUDTs[UDTIdx].Fields[i].InlineArray then
+    begin
+      EmitRecBytesClear(Handle, FUDTs[UDTIdx].Fields[i].ByteOffset, FUDTs[UDTIdx].Fields[i].ByteSize);
+      Continue;
+    end;
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or FUDTs[UDTIdx].Fields[i].IsArray then Continue;
     case FUDTs[UDTIdx].Fields[i].Bank of
       srtFloat:
@@ -43169,12 +43995,15 @@ begin
     // the arithmetic, which is what this arm's own header says it does.
     if (Node.GetChild(0).NodeType = antCast) and (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
+    // ⛔ ...AND IT MAY BE ARITHMETIC ITSELF: "*(p + 6 - 1)" is "(p + 6) - 1", whose left operand is the
+    // binary op this arm resolves - asked of the operand, it answered '' and the read printed signed
+    // (" 55" where fbc prints "55" for a ULong), while "*(p + 5)" beside it was right. m907zw.
     else if (Node.GetChild(0).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess,
-                                           antProcAddress]) and
+                                           antProcAddress, antBinaryOp]) and
             (DerefedType(Node.GetChild(0)) <> '') then
       Result := DerefedType(Node.GetChild(0))
     else if (Node.GetChild(1).NodeType in [antMemberAccess, antParentheses, antDeref, antArrayAccess,
-                                           antProcAddress]) and
+                                           antProcAddress, antBinaryOp]) and
             (DerefedType(Node.GetChild(1)) <> '') then
       Result := DerefedType(Node.GetChild(1))
     else if (Node.GetChild(0).NodeType = antIdentifier) and
@@ -43288,6 +44117,9 @@ begin
   // holds at RUN TIME instead of from a constant. Without it "@this.v(i)" raised "Cannot take address of
   // element of undeclared array: V", and with it an "Operator [] ByRef" backed by a member array becomes
   // assignable, which is the shape the operator is normally written in.
+  // ...and when the member LIVES in the record's bytes (DIVERGENZE 226) the element's address is a
+  // record-field pointer at the element's offset, with the element's width.
+  if (Node.GetChild(0).NodeType = antMemberAccess) and EmitInlineMemberArrayAddr(Node, Result) then Exit;
   if (Node.GetChild(0).NodeType = antMemberAccess) and
      IsMemberArrayAccess(Node, MArrHandle, MArrBank, MArrIdx) then
   begin
@@ -43880,7 +44712,7 @@ begin
       CheckInstantiable(FUDTs[UDTIdx].Name);
       Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordNewBlock, Result, EnsureIntRegister(CountVal),
-                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFF)
+                      MakeSSAConstInt((Int64(FUDTs[UDTIdx].LiveBytes) and $FFFFFFFF)
                                       or ((Int64(FUDTs[UDTIdx].NStr) and $FFFF) shl 32)
                                       or ((Int64(UDTIdx) and $FFFF) shl 48)),
                       MakeSSAValue(svkNone));
@@ -44110,7 +44942,7 @@ procedure TSSAGenerator.EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAV
 // pointer's declared type (FPointerVars), as for any other pointer.
 var
   TypeName, NestedT: string;
-  UDTIdx, Slot: Integer;
+  UDTIdx, Slot, FI: Integer;
   Bank: TSSARegisterType;
   HandleVal: TSSAValue;
 begin
@@ -44140,6 +44972,15 @@ begin
                               [VarToStr(MemberNode.Value), TypeName]);
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then
     raise Exception.Create('Cannot take address of field: unresolved record object');
+  // ⭐ "@obj.member" on a NESTED RECORD is that record - its handle, or its VIEW when it lives in our
+  // bytes (DIVERGENZE 226) - which is what "p->field" on the result reads. A pointer to the member's SLOT
+  // was a pointer to the handle, and at offset 0 fbc's "@s.u = @s" is true.
+  FI := UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value));
+  if (FI >= 0) and (FUDTs[UDTIdx].Fields[FI].NestedType <> '') and not FUDTs[UDTIdx].Fields[FI].IsArray then
+  begin
+    Result := NestedMemberHandle(HandleVal, UDTIdx, FI);
+    Exit;
+  end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRefAddrField, Result, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
 end;
@@ -44149,7 +44990,7 @@ function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNod
 // pointer the low bits are the element offset, so adding i advances one element. For a RAW (Allocate'd)
 // pointer the address is a byte offset, so the index is scaled by SizeOf(pointee) — FreeBASIC semantics.
 var
-  PtrReg, IdxVal, SzVal, ScaledIdx: TSSAValue;
+  PtrReg, IdxVal, SzVal, ScaledIdx, IdxK: TSSAValue;
 begin
   // ⛔ The POINTER'S OWN VALUE, read the way that pointer is stored. Asking GetOrAllocateVariable gave
   // a REGISTER, and an @-taken or SHARED pointer does not live in one - it is array-backed. The emitted
@@ -44158,6 +44999,7 @@ begin
   // without "Dim pp As T Ptr Ptr = @p" worked, because without the @ the pointer does stay in a register.
   PtrReg := RecordHandleOfVar(PtrName);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
+  IdxK := IdxVal;                      // a constant index, kept for the managed step (DIVERGENZE 226)
   IdxVal := EnsureIntRegister(IdxVal);
   if IsRawPtr(PtrName) and (RawElemSizeOf(PtrName) > 1) then
   begin
@@ -44166,6 +45008,12 @@ begin
     ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
     IdxVal := ScaledIdx;
+  end;
+  // ...and a pointer that is not raw steps in its own unit, decided at run time (DIVERGENZE 226).
+  if (not IsRawPtr(PtrName)) and (ManagedStepBytes(ManagedPtrPointee(PtrName)) > 0) then
+  begin
+    if IdxK.Kind <> svkConstInt then IdxK := IdxVal;
+    IdxVal := EmitManagedPtrStep(PtrReg, IdxK, ManagedStepBytes(ManagedPtrPointee(PtrName)));
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
@@ -44190,12 +45038,13 @@ function TSSAGenerator.EmitPointerValueIndexAddress(BaseNode: TASTNode; const Po
 // address FAMILY decides the arithmetic: a raw byte-heap address scales the index by SizeOf(pointee),
 // a managed (FArrays-backed, packed) one advances by one ELEMENT.
 var
-  BaseVal, IdxVal, SzVal, ScaledIdx: TSSAValue;
+  BaseVal, IdxVal, SzVal, ScaledIdx, IdxK: TSSAValue;
   Sz: Int64;
 begin
   ProcessExpression(BaseNode, BaseVal);
   BaseVal := EnsureIntRegister(BaseVal);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
+  IdxK := IdxVal;                      // a constant index, kept for the managed step (DIVERGENZE 226)
   IdxVal := EnsureIntRegister(IdxVal);
   // ⛔ A RECORD-FIELD POINTER INDEXES INTO ITS BYTE OFFSET, NOT INTO ITS VALUE. Its low four bits are
   // the WIDTH CODE, so adding the index raw walked the width instead of the address:
@@ -44230,6 +45079,13 @@ begin
         EmitInstruction(ssaMulInt, ScaledIdx, IdxVal, SzVal, MakeSSAValue(svkNone));
         IdxVal := ScaledIdx;
       end;
+    end
+    else
+    begin
+      // ...a pointer that is not raw steps in its own unit, decided at run time (DIVERGENZE 226).
+      Sz := ManagedStepBytes(Pointee);
+      if IdxK.Kind <> svkConstInt then IdxK := IdxVal;
+      if Sz > 0 then IdxVal := EmitManagedPtrStep(BaseVal, IdxK, Sz);
     end;
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -44702,6 +45558,13 @@ begin
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
     Slot := FUDTs[UDTIdx].Fields[i].Slot;
+    // DIVERGENZE 226: an array member that lives in the bytes is copied as bytes.
+    if FUDTs[UDTIdx].Fields[i].InlineArray then
+    begin
+      EmitRecBytesCopy(DestHandle, SrcHandle, FUDTs[UDTIdx].Fields[i].ByteOffset,
+                       FUDTs[UDTIdx].Fields[i].ByteSize);
+      Continue;
+    end;
     if FUDTs[UDTIdx].Fields[i].IsArray then
     begin
       // Array member: the int slot holds an FArrays handle. A plain handle copy would make the two
@@ -44753,7 +45616,7 @@ begin
         // Array-of-UDT member: copy element-wise into the destination's OWN element records (each element
         // gets an independent copy of the source element's contents), packing the element UDT slot counts.
         EmitInstruction(ssaArrayCopyRecords, MakeSSAValue(svkNone), DNest, SNest,
-                        MakeSSAConstInt((Int64(FUDTs[NestedUDT].LiveBytes) and $FFFF)
+                        MakeSSAConstInt((Int64(FUDTs[NestedUDT].LiveBytes) and $FFFFFFFF)
                                         
                                         or ((Int64(FUDTs[NestedUDT].NStr) and $FFFF) shl 32)
                                         or ((Int64(NestedUDT) and $FFFF) shl 48)))
@@ -47701,6 +48564,8 @@ begin
   TypeName := ObjectTypeName(MemberNode.GetChild(0));
   if TypeName = '' then Exit;
   if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
+  // A member that lives in the bytes has no handle to load (DIVERGENZE 226): InlineMemberArrayElem.
+  if MemberArrayInline(FindUDT(TypeName), VarToStr(MemberNode.Value)) then Exit;
   if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
 
   // The field int slot holds the FArrays handle (allocated per instance on REDIM).
@@ -47757,6 +48622,7 @@ var
   ElemBank: TSSARegisterType;
   Op: TSSAOpCode;
 begin
+  if EmitInlineMemberArrayStore(ArrAccessNode, ExprNode) then Exit;   // lives in the bytes (226)
   if not IsMemberArrayAccess(ArrAccessNode, HandleReg, ElemBank, LinIdx) then Exit;
   ProcessExpression(ExprNode, ExprVal);
   case ElemBank of
@@ -47816,6 +48682,14 @@ begin
   TypeName := ObjectTypeName(ArrNameNode.GetChild(0));
   if TypeName = '' then Exit;
   if not UDTArrayField(FindUDT(TypeName), VarToStr(ArrNameNode.Value), Slot, ElemBank, DimCount) then Exit;
+  // DIVERGENZE 226: a member that lives in the bytes has CONSTANT bounds - its declaration's.
+  if MemberArrayInline(FindUDT(TypeName), VarToStr(ArrNameNode.Value)) then
+  begin
+    BoundVal := InlineArrayBound(FindUDT(TypeName),
+                                 UDTFieldIndex(FindUDT(TypeName), VarToStr(ArrNameNode.Value)),
+                                 ArgListNode, IsLBound);
+    Exit(True);
+  end;
   if not ResolveRecordObject(ArrNameNode.GetChild(0), ObjHandle, TypeName) then Exit;
 
   HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -49919,6 +50793,11 @@ begin
   TypeName := ObjectTypeName(MemberNode.GetChild(0));
   if TypeName = '' then Exit;
   if not UDTArrayField(FindUDT(TypeName), VarToStr(MemberNode.Value), Slot, ElemBank, DimCount) then Exit;
+  // CollectWholeArrayFields keeps every member written "x.f()" behind its handle, so this cannot be one
+  // that lives in the bytes - and if a spelling it does not know ever brings one here, it says so.
+  if MemberArrayInline(FindUDT(TypeName), VarToStr(MemberNode.Value)) then
+    raise Exception.CreateFmt('The array member %s.%s lives in its record''s bytes and cannot be passed ' +
+      'whole here (DIVERGENZE 226)', [TypeName, VarToStr(MemberNode.Value)]);
   if Emit then
   begin
     HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));

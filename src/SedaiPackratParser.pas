@@ -5736,7 +5736,7 @@ var
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   AliasNode: TASTNode;   // "Type a As Integer, b As Double": the extra aliases of a comma list
-  IsStaticField, IsStaticByref, LeadingType, FpIsFP: Boolean;
+  IsStaticField, IsStaticByref, LeadingType, FpIsFP, IsRedimField: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
   ImplList: string;   // MODERN: the IMPLEMENTS list, recorded on the type node
 begin
@@ -6192,7 +6192,11 @@ begin
     end;
     // FreeBASIC allows an in-TYPE field to be introduced with a leading DIM ("Dim As Double m(Any,Any)").
     // Consume it — the field grammar below handles both "As type name(dims)" and "name(dims) As type".
-    if TokU = kDIM then Context.Advance;
+    // ...and with a leading REDIM, which fbc reads as "this member is DYNAMIC even with constant bounds",
+    // as it does for a variable (fbc's structs/dynamic-array-fields, redimMakesDynamic). Marked, because
+    // a fixed member now lives in the record's bytes (DIVERGENZE 226) and this one must not.
+    IsRedimField := TokU = kREDIM;
+    if (TokU = kDIM) or IsRedimField then Context.Advance;
     FieldTypeName := '';                            // empty => infer by suffix
     FLastFieldFixedLen := 0;                        // "As String * n" capacity of THIS field (0 = none)
     LeadingType := False;
@@ -6282,6 +6286,7 @@ begin
       begin
         FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
         FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
+        if IsRedimField then FieldNode.Attributes.Values['REDIMFIELD'] := '1';
         // Keep the dimension list (the SSA auto-sizes a fixed-bound member at construction; an "Any"
         // member has no concrete bound and is left for an explicit REDIM).
         FieldNode.AddChild(ArrDimNode);
@@ -6334,6 +6339,7 @@ begin
           begin
             FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
             FieldNode.Attributes.Values['ARRAYDIMS'] := IntToStr(ArrDimNode.ChildCount);
+            if IsRedimField then FieldNode.Attributes.Values['REDIMFIELD'] := '1';
             FieldNode.AddChild(ArrDimNode);         // keep dims for construction-time auto-sizing
           end
           else if Context.Check(ttOpEq) then        // "As T a, b = expr": per-name default value

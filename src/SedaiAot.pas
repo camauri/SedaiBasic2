@@ -3931,7 +3931,23 @@ var
   //
   // HandleReg = Src1, value = Dest (load) or Src2 (store), Slot = Src3 const.
   procedure AotRecAccess(apc, HandleReg, Slot, ValReg: Integer; IsFloat, IsStore: Boolean);
-  var p, pJoin, pv, Ofs, W: Integer;
+  var p, pJoin, pv, pz, pk, Ofs, W: Integer;
+
+    procedure CheckIndexAgainstRdx;
+    // ⛔ rax (an index) against the dynamic array whose data rdx points at - FPC keeps its HIGH index just
+    // below the data. A value that is not a record handle (a "T Ptr" laid over an array, or over RAW memory,
+    // whose tag is the shared bit) indexed past the table; the interpreter refuses it by name, so leave
+    // to it (DIVERGENZE 226).
+    begin
+      E.EmitBytes([$48, $85, $D2]);                  // test rdx, rdx
+      E.EmitBytes([$74, $00]); pz := E.Len - 1;     // jz  +bad
+      E.EmitBytes([$48, $3B, $42, $F8]);             // cmp rax, [rdx-8]   (high)
+      E.EmitBytes([$7E, $00]); pk := E.Len - 1;     // jle +ok
+      E.PatchByte(pz, Byte(E.Len - (pz + 1)));
+      ExitTo(apc);
+      E.PatchByte(pk, Byte(E.Len - (pk + 1)));
+    end;
+
   begin
     // A3-i: Slot carries the field's BYTE OFFSET in bits 4..31 and its width code in bits 0..3, and
     // the numeric halves of a record are one byte image - so both "bank" offsets name the same field
@@ -3980,6 +3996,7 @@ var
       E.EmitBytes([$48, $0F, $BA, $F0, 62]);        // btr rax, 62  -> shared-region index
       E.MemOp([$49, $8B], RDX, R8, AOTCTX_VMSELF);  // rdx = the TBytecodeVM instance
       E.EmitBytes([$48, $8B, $92]); E.Emit32(LongWord(GSharedRecOff));  // rdx = FSharedRecords base
+      CheckIndexAgainstRdx;
       E.EmitBytes([$48, $8B, $14, $C2]);            // mov rdx, [rdx + rax*8]  -> PRecordStorage
       E.EmitBytes([$EB, $00]); pJoin := E.Len - 1;  // jmp +join (rdx already points at the record)
     end
@@ -3992,6 +4009,7 @@ var
     // --- per-context heap ---
     E.MemOp([$49, $8B], RDX, R8, AOTCTX_CTXOBJ);     // rdx = ctx.CtxObj (the TExecutionContext)
     E.EmitBytes([$48, $8B, $92]); E.Emit32(LongWord(GRecordsOff));  // rdx = [rdx+RecordsOff] = base
+    CheckIndexAgainstRdx;
     E.EmitBytes([$48, $69, $C0]); E.Emit32(LongWord(GRecSize));     // imul rax, rax, RecSize
     E.EmitBytes([$48, $01, $C2]);                    // add rdx, rax  -> @Records[handle]
     if pJoin >= 0 then E.PatchByte(pJoin, Byte(E.Len - (pJoin + 1)));
