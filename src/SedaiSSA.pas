@@ -27446,6 +27446,15 @@ var
   GNestedInlineOff: Integer = -1;   // -1 = the environment has not been asked yet
   GInlineArrOff: Integer = -1;      // SB_NO_INLINE_ARRAYS, the same A/B knob for array members
   GPtrStepOff: Integer = -1;        // SB_NO_PTR_STEP, the A/B knob for the run-time pointer step
+  GFieldCheckOff: Integer = -1;     // SB_NO_FIELD_CHECK, the A/B knob for refusing an unknown field
+
+function SB_NoFieldCheck: Integer;
+// A/B on one binary for DIVERGENZE 251: SB_NO_FIELD_CHECK=1 lets an unknown field through again, so a
+// net can tell "this refusal broke a valid program" from anything else. Asked once per process.
+begin
+  if GFieldCheckOff < 0 then GFieldCheckOff := Ord(GetEnvironmentVariable('SB_NO_FIELD_CHECK') = '1');
+  Result := GFieldCheckOff;
+end;
 
 function TSSAGenerator.UDTShapeOf(UDTIdx: Integer; ReportShape: Boolean; out Size, Align: Int64): Boolean;
 // The size and ALIGNMENT of a whole UDT. UDTCLayout answers the size; the alignment is the widest a
@@ -48195,7 +48204,19 @@ begin
       // out - a HANG, on the shape the feature exists for. The parenthesised form had the guard; this
       // one did not.
       ProcessMethodCall(Node.GetChild(0), TypeName, VarToStr(Node.Value), nil, Result,
-                        Node.GetChild(0).Attributes.Values['BASEREF'] <> '');
+                        Node.GetChild(0).Attributes.Values['BASEREF'] <> '')
+    // ⛔ ...AND A NAME THE TYPE DOES NOT HAVE IS REFUSED, as fbc refuses it ("error 18: Element not
+    // defined"). This arm used to exit with NOTHING emitted, and the caller read a register nobody
+    // had written - the record's own handle, so "v.nosuch" printed " 1" and any typo in a field
+    // name compiled. DIVERGENZE 251.
+    // ⚠️ ...EXCEPT on a type that overloads "Operator ->": "f->data" reaches here spelled exactly like
+    // "f.data" (the AST keeps no arrow), and there the name belongs to the operator's RESULT type, not
+    // to this one - fbc's overload/op_deref2. Applying the operator is DIVERGENZE 285; until then the
+    // access keeps its old behaviour rather than refusing a valid program.
+    else if (UDTIdx >= 0) and (SB_NoFieldCheck = 0) and
+            (ResolveMethodLabel(TypeName, 'OPERATOR->' + OperatorArityCode(1)) = '') then
+      raise Exception.CreateFmt('Element not defined, %s (type %s has no such field)',
+                                [LowerCase(VarToStr(Node.Value)), TypeName]);
     Exit;
   end;
   if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
@@ -48500,7 +48521,16 @@ begin
     SetterArgs.AddChild(ExprNode.Clone);
     if ResolveMethodLabelArgs(TypeName, VarToStr(MemberNode.Value) + '.SET', SetterArgs) <> '' then
       ProcessMethodCall(MemberNode.GetChild(0), TypeName, VarToStr(MemberNode.Value) + '.SET',
-                        SetterArgs, DummyVal);
+                        SetterArgs, DummyVal)
+    // ⛔ ...and neither a field nor a setter: the store was DROPPED in silence ("p->nosuch = 3"
+    // compiled and did nothing). fbc: "error 18: Element not defined". DIVERGENZE 251.
+    else if (UDTIdx >= 0) and (SB_NoFieldCheck = 0) and
+            (ResolveMethodLabel(TypeName, 'OPERATOR->' + OperatorArityCode(1)) = '') then
+    begin
+      SetterArgs.Free;
+      raise Exception.CreateFmt('Element not defined, %s (type %s has no such field)',
+                                [LowerCase(VarToStr(MemberNode.Value)), TypeName]);
+    end;
     SetterArgs.Free;
     Exit;
   end;
