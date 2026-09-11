@@ -242,7 +242,7 @@ type
     procedure NoteExternShape(const Name, Shape: string);
     procedure CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
     procedure ScanModuleLevelExtern;
-    function  ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
+    function  ModuleDeclaresNameElsewhere(const Nm: string; Precise: Boolean = False): Boolean;
     procedure RejectEmptyAliasNames;
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
     procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
@@ -12780,13 +12780,33 @@ procedure TPackratParser.ScanModuleLevelExtern;
 var
   SavedIdx, Idx: Integer;
   Nm, TypeName, Shape, Why, Flags: string;
+  NmOrig, AliasSym: string;   // the name as written, and an ALIAS "symbol" (DIVERGENZE 253)
   Dims, CapExpr, Decl: TASTNode;
   BlameTok: TLexerToken;
   CapVal: Int64;
   HasParens, HasInit, HasEllipsis, Understood, HadConstQual: Boolean;
+  PtrDepth, k: Integer;       // "As T Ptr [Ptr]": how many PTR/POINTER follow the type
+
+  procedure AddCLibraryData(const DataType: string);
+  // The Extern names a C library's VARIABLE (DIVERGENZE 253): "Dim Shared ByRef v As T", FGNDATA naming
+  // the symbol - the ALIAS if there is one, the name as written otherwise.
+  begin
+    FPendingExternArray := TASTNode.Create(antDim, BlameTok);
+    Decl := TASTNode.Create(antArrayDecl, BlameTok);
+    Decl.Attributes.Values['BYREF'] := '1';
+    Decl.Attributes.Values['SHARED'] := '1';
+    if AliasSym <> '' then Decl.Attributes.Values['FGNDATA'] := AliasSym
+    else Decl.Attributes.Values['FGNDATA'] := NmOrig;
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, Nm, BlameTok));
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, DataType, BlameTok));
+    Decl.AddChild(TASTNode.CreateWithValue(antLiteral, 0, BlameTok));   // placeholder: the SSA binds it
+    FPendingExternArray.AddChild(Decl);
+  end;
+
 begin
   SavedIdx := Context.CurrentIndex;
   Dims := nil;
+  PtrDepth := 0;
   Nm := ''; TypeName := ''; Flags := ''; Understood := False; HadConstQual := False;
   HasInit := False; HasEllipsis := False;
   BlameTok := Context.CurrentToken;
@@ -12801,8 +12821,21 @@ begin
       Context.Advance;
     end;
     if not Context.Check(ttIdentifier) then Exit;          // "Extern As Integer a" and friends
-    Nm := UpperFast(VarToStr(Context.CurrentToken.Value));
+    // The name AS WRITTEN is kept: a C symbol is case-sensitive, and it is what an Extern of a C
+    // library is looked up by (DIVERGENZE 253).
+    NmOrig := VarToStr(Context.CurrentToken.Value);
+    Nm := UpperFast(NmOrig);
     Context.Advance;
+    // ⭐ "Extern ffi_type_uchar Alias "ffi_type_uint8" As ffi_type": the LINKER name, which is the
+    // symbol to look up. It used to end the scan ("anything still unread leaves the name unregistered").
+    AliasSym := '';
+    if Context.Check(ttIdentifier) and SameText(VarToStr(Context.CurrentToken.Value), 'ALIAS') and
+       Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttStringLiteral) then
+    begin
+      Context.Advance;                                    // ALIAS
+      AliasSym := VarToStr(Context.CurrentToken.Value);
+      Context.Advance;                                    // "symbol"
+    end;
     HasParens := Context.Check(ttDelimParOpen);
     if HasParens then
     begin
@@ -12854,6 +12887,15 @@ begin
         if TryConstIntExpr(CapExpr, CapVal) then Flags := Flags + '*' + IntToStr(CapVal);
         CapExpr.Free;
       end;
+      // "extern stdout as FILE ptr": a C library's POINTER variable (DIVERGENZE 253). Counted here so the
+      // end-of-line test below sees the line read to its end; the SHAPE is still not registered for it.
+      while Assigned(Context.CurrentToken) and
+            (SameText(VarToStr(Context.CurrentToken.Value), 'PTR') or
+             SameText(VarToStr(Context.CurrentToken.Value), 'POINTER')) do
+      begin
+        Inc(PtrDepth);
+        Context.Advance;
+      end;
     end;
     HasInit := Context.Check(ttOpEq);
     // Only a line this routine has read to its END is a line whose shape it knows. A PTR suffix, an
@@ -12874,6 +12916,19 @@ begin
   // registrato sopra; la forma resta fuori, esattamente come prima.
   if HadConstQual then Exit;
   if not Understood then Exit;
+  // ⚠️ A pointer-typed Extern: before PtrDepth it left this routine as "unread", so only the C-library
+  // case is new - every other check and the shape stay exactly as they were for it (skipped).
+  if PtrDepth > 0 then
+  begin
+    if (not HasInit) and (not HasParens) and (TypeName <> '') and (FExternCDepth > 0) and
+       (Flags = '') and not ModuleDeclaresNameElsewhere(Nm, True) then
+    begin
+      Why := TypeName;
+      for k := 1 to PtrDepth do Why := Why + ' PTR';
+      AddCLibraryData(Why);
+    end;
+    Exit;
+  end;
   // ⛔ An EXTERN declares, it does not define: fbc refuses an initializer on one, and refuses an
   // ellipsis bound too - whose whole job is to be counted from an initializer an EXTERN may not have.
   if HasInit then
@@ -12914,10 +12969,22 @@ begin
     Decl.AddChild(TASTNode.Create(antDimensions, BlameTok));
     Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, BlameTok));
     FPendingExternArray.AddChild(Decl);
-  end;
+  end
+  // ⭐⭐ ...AND A SCALAR OR RECORD EXTERN INSIDE `EXTERN "C"` IS A C LIBRARY'S VARIABLE (DIVERGENZE 253).
+  // "extern ffi_type_pointer as ffi_type" is how libffi exports its type descriptors: DATA, not a
+  // function. It left no node at all, so the name became an ordinary zero-initialised global - and
+  // "ffi_type_pointer.size" read 0 where fbc reads 8, in silence. It now becomes what it is: a SHARED
+  // reference to the library's storage, "Dim Shared ByRef v As T", whose target the SSA takes from the
+  // foreign table (FGNDATA names the symbol - the ALIAS if there is one, the name as written otherwise).
+  // ⚠️ Only where the module does not define the name itself (then it is ours, as for the array above).
+  // ⚠️ The SSA binds it only if the program USES it: a header declaring data nobody reads must not make
+  // the program look the symbol up at all - fbc fails only for a REFERENCED missing symbol.
+  else if (not HasParens) and (TypeName <> '') and (FExternCDepth > 0) and (Flags = '') and
+          not ModuleDeclaresNameElsewhere(Nm, True) then
+    AddCLibraryData(TypeName);
 end;
 
-function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
+function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string; Precise: Boolean): Boolean;
 // Does any DECLARATION STATEMENT in this module name Nm? Asked of the token stream, so what the
 // preprocessor removed (a "#if 0" block) is invisible here - which is the whole point: fbc's
 // dim/all-kinds-of-vars hides the DIM of its EXTERN array inside one and defines its other extern
@@ -12926,16 +12993,24 @@ function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string): Boolean;
 // spelling ("Dim As Integer a") and a multi-name line are covered without parsing either. That
 // over-matches - a line that merely mentions the name counts - and over-matching is the safe
 // direction: it answers "already declared" and leaves the caller doing nothing.
+// ⛔⛔ PRECISE (DIVERGENZE 253): for an Extern of a C LIBRARY the over-match is NOT safe - "doing
+// nothing" leaves a zero-initialised global where the library's variable should be, in silence. And a
+// program that uses libffi mentions the name on a Dim line by construction:
+// "Dim args(0 To 0) As ffi_type Ptr = {@ffi_type_pointer}". So only a DECLARED-NAME position counts:
+// not a type (the token after AS), not an initializer (anything after '='), not a bound or an index
+// (inside brackets).
 var
-  i: Integer;
+  i, Depth: Integer;
   T, P: TLexerToken;
   W: string;
-  OnDeclLine: Boolean;
+  OnDeclLine, InInit: Boolean;
 begin
   Result := False;
   if not HasValidContext then Exit;
   if Context.TokenList = nil then Exit;
   OnDeclLine := False;
+  InInit := False;
+  Depth := 0;
   for i := 0 to Context.TokenList.Count - 1 do
   begin
     T := Context.TokenList.GetTokenDirect(i);
@@ -12943,7 +13018,22 @@ begin
     if T.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile] then
     begin
       OnDeclLine := False;
+      InInit := False;
+      Depth := 0;
       Continue;
+    end;
+    if Precise and OnDeclLine then
+    begin
+      case T.TokenType of
+        ttDelimParOpen, ttDelimBraceOpen: begin Inc(Depth); Continue; end;
+        ttDelimParClose, ttDelimBraceClose: begin if Depth > 0 then Dec(Depth); Continue; end;
+        ttOpEq: if Depth = 0 then InInit := True;
+      end;
+      // A comma at depth 0 starts the next declarator of a multi-name line: "Dim a = 1, b".
+      if (Depth = 0) and SameText(VarToStr(T.Value), ',') then InInit := False;
+      if InInit or (Depth > 0) then Continue;
+      P := Context.TokenList.GetTokenDirect(i - 1);
+      if (P <> nil) and (P.TokenType = ttAsType) then Continue;   // a type position
     end;
     if not OnDeclLine then
     begin

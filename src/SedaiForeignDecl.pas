@@ -170,7 +170,9 @@ var
 begin
   Result := 0;
   T := TrimLeft(ATypeName);
-  if (Length(T) >= 3) and ((T[1] = 'W') or (T[1] = 'w')) and (T[2] in ['1'..'7']) and (T[3] = ':') then
+  // 8 = a run of POINTER cells ("@args(0)" of an "ffi_type Ptr" array, DIVERGENZE 253): same width as
+  // the cell, but each value is a VM-domain pointer that C cannot read as it is.
+  if (Length(T) >= 3) and ((T[1] = 'W') or (T[1] = 'w')) and (T[2] in ['1'..'8']) and (T[3] = ':') then
     Result := Ord(T[2]) - Ord('0');
 end;
 
@@ -180,6 +182,7 @@ begin
     1, 2:    Result := 1;
     3, 4:    Result := 2;
     5, 6, 7: Result := 4;
+    8:       Result := 8;
   else
     Result := 0;
   end;
@@ -203,6 +206,10 @@ begin
   if Copy(T, 1, 4) = 'REC:' then Exit(fkPointer);
   // ...and "W<k>:<declared type>" one handed the address of a NARROW value (DIVERGENZE 247).
   if ForeignNarrowCode(T) > 0 then Exit(fkPointer);
+  // ⭐ ...and a RETURN type "DATA:<T> PTR" marks an entry that is not a function at all but a DATA
+  // symbol of the library - an Extern variable (DIVERGENZE 253). The runtime answers its ADDRESS
+  // instead of calling it; to everything else it is an entry returning a pointer.
+  if Copy(T, 1, 5) = 'DATA:' then Exit(fkPointer);
   // A POINTER is a pointer whatever it points at, and the suffix can repeat ("Any Ptr Ptr").
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(fkPointer);
   if (T = 'ANY') then Exit(fkPointer);           // "As Any" only ever appears as a pointer here

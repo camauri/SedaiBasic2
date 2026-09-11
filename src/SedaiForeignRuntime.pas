@@ -623,6 +623,22 @@ begin
                                       [B^.Decl.Name, NArgs]);
   Prepare(B^);
 
+  // ⭐ A DATA SYMBOL, NOT A FUNCTION (DIVERGENZE 253): "extern ffi_type_pointer as ffi_type" names a
+  // global variable of the library. The symbol was resolved exactly as a function's is (dlsym through
+  // the declared library, the #inclib ones, the process); what the program needs is that ADDRESS - it
+  // binds a reference to it - so nothing is called. It is C's memory, tagged and readable inside its
+  // mapping like any other address C hands over (239 a).
+  if UpperCase(Copy(B^.Decl.RetTypeName, 1, 5)) = 'DATA:' then
+  begin
+    ResInt := Int64(PtrUInt(B^.Fn));
+    if ResInt <> 0 then
+    begin
+      if Assigned(FNoteRegion) then FNoteRegion(ACtx, PtrUInt(B^.Fn), 0, True, False);
+      ResInt := ResInt or FGNPTR_TAG;
+    end;
+    Exit;
+  end;
+
   SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
@@ -665,6 +681,13 @@ begin
                 3, 4: for r := 0 to Integer(nk) - 1 do PWord(@NTmp[NN][0])[r] := Word(PInt64(P)[r]);
                 5, 6: for r := 0 to Integer(nk) - 1 do PLongWord(@NTmp[NN][0])[r] := LongWord(PInt64(P)[r]);
                 7:    for r := 0 to Integer(nk) - 1 do PSingle(@NTmp[NN][0])[r] := PDouble(P)[r];
+                // ⭐ POINTER cells (DIVERGENZE 253): "Dim args(0 To 0) As ffi_type Ptr = {@ffi_type_pointer}"
+                // holds a C address WITH its FGNPTR tag, and C reads the cell as a machine pointer. Each
+                // cell is translated exactly as a pointer ARGUMENT is (FResolvePtr), so no cell reaches C
+                // that the same value passed on its own would not.
+                8:    if Assigned(FResolvePtr) then
+                        for r := 0 to Integer(nk) - 1 do
+                          PInt64(@NTmp[NN][0])[r] := Int64(PtrUInt(FResolvePtr(ACtx, PInt64(P)[r])));
               end;
               NCell[NN] := P; NCnt[NN] := nk; NCode[NN] := NCode1; NVM[NN] := XferInt[SlotI];
               PPointer(Vals[i])^ := @NTmp[NN][0];
@@ -798,6 +821,21 @@ begin
       5: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := LongInt(PLongWord(@NTmp[nwid][0])[r]);
       6: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := PLongWord(@NTmp[nwid][0])[r];
       7: for r := 0 to Integer(NCnt[nwid]) - 1 do PDouble(NCell[nwid])[r] := PSingle(@NTmp[nwid][0])[r];
+      // ...a pointer cell C left alone keeps the program's own value (its tag, its domain); one C
+      // CHANGED now holds a machine address, and becomes one the program can see as such.
+      8: if Assigned(FResolvePtr) then
+           for r := 0 to Integer(NCnt[nwid]) - 1 do
+             if PInt64(@NTmp[nwid][0])[r] <> Int64(PtrUInt(FResolvePtr(ACtx, PInt64(NCell[nwid])[r]))) then
+             begin
+               if PInt64(@NTmp[nwid][0])[r] = 0 then
+                 PInt64(NCell[nwid])[r] := 0
+               else
+               begin
+                 if Assigned(FNoteRegion) then
+                   FNoteRegion(ACtx, PtrUInt(PInt64(@NTmp[nwid][0])[r]), 0, True, False);
+                 PInt64(NCell[nwid])[r] := PInt64(@NTmp[nwid][0])[r] or FGNPTR_TAG;
+               end;
+             end;
     end;
 
   {$IFDEF WINDOWS}

@@ -686,6 +686,7 @@ type
     function BasicProcCallbackSig(Node: TASTNode): string;   // "@proc" -> FNPTR:<ret>:<args>
     function ForeignRecordArg(Node: TASTNode): Boolean;      // "@rec" / a UDT PTR -> a record handle (DIVERGENZE 245)
     function ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;  // "@n" of a narrow value -> width code (DIVERGENZE 247)
+    function EmitForeignDataAddr(const VarName, Symbol, TypeName: string): TSSAValue;  // an Extern of a C library: its address (DIVERGENZE 253)
     function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -2599,6 +2600,15 @@ begin
       Child := Node.GetChild(0);
       while (Child.NodeType = antParentheses) and (Child.ChildCount >= 1) do Child := Child.GetChild(0);
       Result := (Child.NodeType = antArrayAccess) and (ObjectTypeName(Child) <> '');
+      // ⛔ ...but an element of an array of UDT POINTERS ("Dim args(0 To 0) As ffi_type Ptr") IS a pointer,
+      // not a record. ObjectTypeName answers its POINTEE, which is right for "args(0)->size", and
+      // "@args(0)" went out as the address of a record the runtime could not find (DIVERGENZE 253).
+      // Its cells travel as W8 (ForeignNarrowArg).
+      if Result and (Child.ChildCount >= 1) and (Child.GetChild(0).NodeType = antIdentifier) and
+         (ArrayIndexOf(Child.GetChild(0).ValueUpper) >= 0) and
+         (ArrayRecordTypeOf(Child.GetChild(0).ValueUpper) = '') and
+         (ArrayPointerUDTType(Child.GetChild(0).ValueUpper) <> '') then
+        Result := False;
     end;
   end
   else if Node.NodeType = antIdentifier then
@@ -2666,6 +2676,25 @@ begin
       // storage was built from.
       Child := Node.GetChild(0);
       while (Child.NodeType = antParentheses) and (Child.ChildCount >= 1) do Child := Child.GetChild(0);
+      // ⭐ "@args(0)" of an array of POINTERS (DIVERGENZE 253): what libffi is handed as "ffi_type **".
+      // Its cells hold VM-domain values - a C address carries its FGNPTR tag - and C reads each as a
+      // machine pointer, so they travel as W8: translated on the way in, a changed one tagged on the way
+      // back. ⚠️ Not a scalar's backing: an @-taken pointer is a one-element array holding itself.
+      if (Child.NodeType = antArrayAccess) and (Child.ChildCount >= 1) and
+         (Child.GetChild(0).NodeType = antIdentifier) and
+         (ArrayIndexOf(Child.GetChild(0).ValueUpper) >= 0) and
+         not (IsSharedScalar(Child.GetChild(0).ValueUpper) or IsAddrLocal(Child.GetChild(0).ValueUpper)) then
+      begin
+        Nm := Child.GetChild(0).ValueUpper;
+        if ArrayPointerUDTType(Nm) <> '' then Nm := 'PTR'
+        else if FArrayScalarType.Values[ArrayFactKey(Nm)] <> '' then Nm := FArrayScalarType.Values[ArrayFactKey(Nm)]
+        else Nm := FArrayScalarType.Values[Nm];
+        if (Length(Nm) >= 3) and SameText(Copy(Nm, Length(Nm) - 2, 3), 'PTR') then
+        begin
+          TypeU := 'ANY PTR';
+          Exit(8);
+        end;
+      end;
       if (Child.NodeType = antArrayAccess) and (Child.ChildCount >= 1) and
          (Child.GetChild(0).NodeType = antIdentifier) then
         case Declared32Code(Child) of
@@ -12914,6 +12943,30 @@ begin
       raise Exception.CreateFmt(
         'Cannot bind the reference "%s" to a temporary: the temporary does not outlive the statement.',
         [ArrName]);
+
+    // ⭐⭐ AN EXTERN OF A C LIBRARY (DIVERGENZE 253): the parser wrote it as "Dim Shared ByRef v As T"
+    // with FGNDATA naming the symbol. Its target is the library's storage: the address comes from the
+    // foreign table (EmitForeignDataAddr), and the reference machinery does the rest - a record's fields
+    // at their C offsets (FRawUDTPtrs, set in the pre-pass), a narrow scalar at its width.
+    // ⛔ Only if the program USES the name: a header declares data nobody reads, and looking up a
+    // symbol that is not there must not stop a program that never touches it. fbc fails only for a
+    // REFERENCED missing symbol; here the lookup is simply never emitted.
+    if (ArrayDeclNode.Attributes.Values['FGNDATA'] <> '') and (DimsNode.NodeType = antIdentifier) then
+    begin
+      if NameUsedElsewhere(UpperFast(ArrName)) then
+      begin
+        RecHandleVal := EmitForeignDataAddr(ArrName, ArrayDeclNode.Attributes.Values['FGNDATA'],
+                                            DimsNode.ValueUpper);
+        EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperFast(ArrName)), RecHandleVal,
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        if FindUDT(DimsNode.ValueUpper) >= 0 then
+        begin
+          EnsureSharedBackingSized(UpperFast(ArrName));
+          PublishScalarToHome(UpperFast(ArrName), RecHandleVal);
+        end;
+      end;
+      Continue;
+    end;
 
     if (ArrayDeclNode.Attributes.Values['BYREF'] = '1') and (ArrayDeclNode.ChildCount >= 3) and
        (DimsNode.NodeType = antIdentifier) and (FindUDT(DimsNode.ValueUpper) >= 0) then
@@ -41782,6 +41835,41 @@ begin
   begin
     LhsU := Node.GetChild(0).ValueUpper;
     ConsiderRaw(LhsU, Node.GetChild(2));
+    // ⭐ ...AND A REFERENCE TO A RECORD THAT LIES IN C's MEMORY (or raw memory). "Dim ByRef As tm g =
+    // *gmtime(@t)" bound g to the pointer's value as if it were a record HANDLE, and the first "g.field"
+    // took the managed path with a C address and died. The bind already carries the address; what was
+    // missing is saying that g's fields sit at C-layout OFFSETS - which is exactly what FRawUDTPtrs says
+    // for a pointer, and ResolveRawUDTBase accepts a bare name, so "g.field" reads and writes through the
+    // raw path with no other change. It is also the form an Extern of a C library takes (DIVERGENZE 253).
+    // The parser writes the initializer of a ByRef as "@(*expr)".
+    // ...and an Extern of a C library whose type is a record (DIVERGENZE 253): its storage is C's by
+    // definition - the parser marks it FGNDATA and the SSA binds it to the symbol's address.
+    if (Node.Attributes.Values['BYREF'] = '1') and (Node.Attributes.Values['FGNDATA'] <> '') and
+       (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) and
+       (FindUDT(Node.GetChild(1).ValueUpper) >= 0) and (FRawUDTPtrs.IndexOfName(LhsU) < 0) then
+    begin
+      FRawUDTPtrs.Add(LhsU + '=' + UpperFast(CanonicalType(Node.GetChild(1).ValueUpper)));
+      FRawCollectChanged := True;
+    end;
+    if (Node.Attributes.Values['BYREF'] = '1') and (Node.GetChild(1) <> nil) and
+       (Node.GetChild(1).NodeType = antIdentifier) and
+       (FindUDT(Node.GetChild(1).ValueUpper) >= 0) then
+    begin
+      Rhs := Node.GetChild(2);
+      if (Rhs <> nil) and (Rhs.NodeType = antProcAddress) and (Rhs.ChildCount = 1) and
+         (Rhs.GetChild(0) <> nil) and (Rhs.GetChild(0).NodeType = antDeref) and
+         (Rhs.GetChild(0).ChildCount >= 1) then
+      begin
+        Rhs := Rhs.GetChild(0).GetChild(0);
+        if IsForeignPtrCall(Rhs) or (RawPtrExprName(Rhs) <> '') or IsRawPtrFieldExpr(Rhs) or
+           ((Rhs.NodeType = antIdentifier) and (RawUDTPtrType(Rhs.ValueUpper) <> '')) then
+          if FRawUDTPtrs.IndexOfName(LhsU) < 0 then
+          begin
+            FRawUDTPtrs.Add(LhsU + '=' + UpperFast(CanonicalType(Node.GetChild(1).ValueUpper)));
+            FRawCollectChanged := True;
+          end;
+      end;
+    end;
   end;
 
   // ⭐ "a(i) = Allocate(...)": the ELEMENT of a declared array holds a raw address, and nothing marked
@@ -48065,6 +48153,35 @@ begin
     if FProgram.GetForeignDecl(k) = Line then Exit(k);
   FProgram.AddForeignDecl(Line);
   Result := FProgram.ForeignDeclCount - 1;
+end;
+
+function TSSAGenerator.EmitForeignDataAddr(const VarName, Symbol, TypeName: string): TSSAValue;
+// ⭐ THE ADDRESS OF A C LIBRARY'S DATA SYMBOL (DIVERGENZE 253): "extern ffi_type_pointer as ffi_type"
+// inside `extern "C"` names a global variable of libffi, not something the program defines. It gets an
+// entry in the foreign table like a function - "<NAME>#DATA|<symbol>||DATA:<T> PTR|" - which the runtime
+// resolves by the same dlsym and answers with the ADDRESS instead of a call. The variable is then a
+// reference bound to that address (the ByRef machinery reads a record's fields at their C offsets).
+// ⛔ Before this an Extern was an ordinary zero-initialised global of the program: "ffi_type_pointer.size"
+// read 0 where fbc reads 8, in silence.
+var
+  Line: string;
+  k, Idx: Integer;
+begin
+  Line := UpperFast(VarName) + '#DATA|' + Symbol + '||DATA:' + UpperFast(TypeName) + ' PTR|';
+  Idx := -1;
+  for k := 0 to FProgram.ForeignDeclCount - 1 do
+    if FProgram.GetForeignDecl(k) = Line then begin Idx := k; Break; end;
+  if Idx < 0 then
+  begin
+    FProgram.AddForeignDecl(Line);
+    Idx := FProgram.ForeignDeclCount - 1;
+  end;
+  if GetEnvironmentVariable('FGNDIAG') = '1' then
+    WriteLn(ErrOutput, 'FGN[dato] ', Line);
+  if not Assigned(FCurrentBlock) then
+    FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('fgndata'));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaForeignCall, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAConstInt(Idx));
 end;
 
 function TSSAGenerator.TryForeignCall(const NameU: string; ArgListNode: TASTNode;
