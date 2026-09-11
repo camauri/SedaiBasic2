@@ -2197,12 +2197,22 @@ begin
                       // commands with no FreeBASIC counterpart, each an ordinary English word an FB
                       // program is entitled to use. "sprite" is how it surfaced - gfx/put-all.bas simply
                       // writes "Dim As Any Ptr sprite", and we rejected the file.
-                      // ⚠️ Deliberately NOT here: SSHAPE / GSHAPE / SETCOLOR (MODERN programs of ours do
-                      // use them as statements - measured, not assumed), the PLOAD/PSAVE/PRST/GETCOLOR
-                      // palette extension, and the eight names fbc allows to be SHADOWED because they are
-                      // runtime FUNCTIONS rather than reserved words (NOW, STICK, STRIG, THREADSELF,
-                      // THREADDETACH, FILECOPY, FILEFLUSH, FILESETEOF) - that is a different mechanism and
-                      // wants a decision of its own, not a line in this list.
+                      // ⭐ DIVERGENZE 267 (11 Sep 2026, the owner: "in MODERN, disable every registered
+                      // keyword that does not belong to MODERN"). SSHAPE / GSHAPE / SETCOLOR were kept
+                      // out of this list because ONE MODERN test of ours wrote them as statements - a test
+                      // that calls them "C128 statements FreeBASIC does not have". fbc takes each of these
+                      // eight as a variable, a parameter and a constant name; here they were reserved, and
+                      // "Const load = 3" failed the whole file. The palette extension (PLOAD/PSAVE/PRST/
+                      // GETCOLOR) is Commodore-flavoured and no MODERN program uses it.
+                      // ⚠️ The MODERN names fbc lets a program shadow (NOW, MIN, SINH, HEX, THREADSELF, ...)
+                      // are NOT here: they belong to MODERN, and a name the program declares wins over
+                      // them where it is visible - TPackratParser.ShadowDeclaredBuiltins.
+                      kSSHAPE, kGSHAPE, kSETCOLOR, kGETCOLOR,     // C128 shapes and colour registers
+                      kLOAD, kPLOAD, kPSAVE, kPRST,               // program / palette load and save
+                      // ⚠️ STICK and STRIG are QuickBASIC, not FreeBASIC (DIVERGENZE 268): fbc knows them
+                      // only under -lang qb, and in -lang fb answers "Variable not declared, stick" to
+                      // "Print Stick(0)". MODERN conforms to FB, not to QB.
+                      kSTICK, kSTRIG,
                       kSPRITE, kSPRCOLOR, kSPRDEF, kSPRFORM,      // C128 sprite engine; FB draws with
                       kSPRLOAD, kSPRSAV, kSPRSAVE, kSPRSIZE,      //   Put/Get on images instead
                       kRSPRITE, kRSPCOLOR, kRSPPOS,               // ...and its query functions

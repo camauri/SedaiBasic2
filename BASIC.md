@@ -3454,8 +3454,8 @@ End Function
 | `GETMOUSE` | ✓ | `GETMOUSE(x, y [,wheel] [,buttons] [,clip])` snapshots the mouse into the by-reference variables and returns 0 (ok) / 1 (no mouse / off-window → all fields -1). Buttons is an FB bitmask (bit0=left, bit1=right, bit2=middle). Live on `sb --window` and sbv (SDL mouse state); headless `sb` reports no mouse. Wheel/clip are 0 in v1. |
 | `SETMOUSE` | ✓ | `SETMOUSE [x] [,y] [,visibility] [,clip]` moves the cursor and/or toggles visibility (each field -1 = no change; visibility 1=show, 0=hide). Live on `sb --window` and sbv; headless `sb` is a no-op. Clip parsed but ignored in v1. |
 | `GETJOYSTICK` | ✓ | `GETJOYSTICK(id, buttons [,a1..a8])` snapshots gaming device `id` (0-15): writes the button bitmask (int) and up to 8 axis values (SINGLE, -1..1, or -1000 if the axis is absent) into the by-reference variables; returns 0 (ok) / 1 (no device → buttons 0, axes -1000). Live on `sb --window` and sbv (SDL joysticks); headless `sb` reports no device. |
-| `STICK` | ✓ | `STICK(axis)` (axis 0-3: X/Y of device A/B) → position 1..200, or 0 if not attached. Live on `sb --window` / sbv; headless `sb` → 0. v1 queries the device fresh each call (no STICK(0) latch). |
-| `STRIG` | ✓ | `STRIG(button)` (button 0-7) → -1 (pressed) / 0. Even = "pressed since", odd = "is pressed" (v1 reports the current level for both; no edge latch). Live on `sb --window` / sbv; headless `sb` → 0. |
+| `STICK` | ✓ CLASSIC | ⚠️ Not a keyword in MODERN: STICK and STRIG are QuickBASIC, and fbc knows them only under `-lang qb`. `STICK(axis)` (axis 0-3: X/Y of device A/B) → position 1..200, or 0 if not attached. Live on `sb --window` / sbv; headless `sb` → 0. v1 queries the device fresh each call (no STICK(0) latch). |
+| `STRIG` | ✓ CLASSIC | ⚠️ Not a keyword in MODERN (see STICK). `STRIG(button)` (button 0-7) → -1 (pressed) / 0. Even = "pressed since", odd = "is pressed" (v1 reports the current level for both; no edge latch). Live on `sb --window` / sbv; headless `sb` → 0. |
 
 #### Keyboard Input
 

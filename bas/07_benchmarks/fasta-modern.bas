@@ -43,7 +43,7 @@ Sub randomFasta( ByVal id As String, ByVal desc As String, _
   Do While produced < n
     Dim As Integer thisLine = 60
     If n - produced < 60 Then thisLine = CInt(n - produced)
-    Dim As String line = ""
+    Dim As String seqLine = ""
     For k As Integer = 1 To thisLine
       Dim As Double r = nextRandom(1.0)
       Dim As Integer idx = cnt
@@ -53,9 +53,9 @@ Sub randomFasta( ByVal id As String, ByVal desc As String, _
           Exit For
         End If
       Next j
-      line += chars(idx)
+      seqLine += chars(idx)
     Next k
-    Print line; Chr(10);
+    Print seqLine; Chr(10);
     produced += thisLine
   Loop
 End Sub

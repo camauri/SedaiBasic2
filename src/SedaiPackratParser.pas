@@ -261,6 +261,7 @@ type
     procedure CheckRedimTargetIsAName(Node: TASTNode);
     procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
     procedure RejectNonConstSharedRef(Root: TASTNode);   // MODERN: a Shared/Static reference on a constant address (260)
+    procedure ShadowDeclaredBuiltins;                    // MODERN: a declared name wins over a builtin (267)
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -1558,6 +1559,9 @@ var
 begin
  Result := TASTNode.Create(antProgram);
  RejectEmptyAliasNames;
+ // ⭐ A name the program declares wins over a builtin FreeBASIC lets it shadow (DIVERGENZE 267). Done
+ // on the TOKENS, before any statement is parsed, because the builtins are dispatched by token type.
+ if FModernMode then ShadowDeclaredBuiltins;
 
  while not Context.IsAtEnd do
  begin
@@ -12022,8 +12026,14 @@ const
     ' MKI MKL MKLONGINT MKS MKSHORT NAME OBJECT OFFSETOF OUTPUT OVERLOAD PASCAL POINT POINTCOORD PRESERVE' +
     ' PRIVATE PROCPTR PROTECTED PUBLIC PUT RANDOM REALLOCATE RIGHT SADD SCREENEVENT SCREENGLPROC SCREENLIST' +
     ' SCREENPTR SEEK SHORT SINGLE SIZEOF STDCALL STR STRING STRPTR TRUE UBYTE UINTEGER ULONG ULONGINT' +
-    ' UNSIGNED USHORT VAL VALINT VALLNG VALUINT VALULNG VARPTR WINPUT WRITE WSTR WSTRING ZSTRING ';
-  PROC_ALLOWED  = ' BSAVE LEFT RIGHT SCREENGLPROC VAL VALINT VALLNG VALUINT VALULNG ';
+    ' UNSIGNED USHORT VAL VALINT VALLNG VALUINT VALULNG VARPTR WINPUT WRITE WSTR WSTRING ZSTRING' +
+    // ⚠️ DIVERGENZE 267: twelve fbc intrinsics this compiler used to refuse EVERYWHERE, so the 1202-word
+    // measurement could not see them. Once a declared name started winning over a builtin they became
+    // declarable, and fbc takes them only as a PROCEDURE name (measured: "Dim hex As Integer", a
+    // parameter or a Const named hex are refused; "Sub hex()" is not). Inside a namespace all are free.
+    ' BIN DIR GETMOUSE HEX IMAGEINFO OCT SCREENCONTROL SCREENINFO SLEEP WBIN WHEX WOCT ';
+  PROC_ALLOWED  = ' BSAVE LEFT RIGHT SCREENGLPROC VAL VALINT VALLNG VALUINT VALULNG' +
+    ' BIN DIR GETMOUSE HEX IMAGEINFO OCT SCREENCONTROL SCREENINFO SLEEP WBIN WHEX WOCT ';
   CONST_ALLOWED = ' FALSE TRUE ';
   // ...and words a Dim never meets as a name (a "Dim As T Ptr" is a type), measured in the other contexts:
   // fbc answers "Illegal specification" to a parameter or procedure named PTR / POINTER, and "Duplicated
@@ -12039,7 +12049,8 @@ const
     ' ALLOCATE BIT BITRESET BITSET BSAVE CALLOCATE CHAIN CLEAR COMMAND CURDIR DEALLOCATE ENVIRON EOF' +
     ' ERFN ERMN EXEC EXEPATH FALSE FB_MEMCOPY FB_MEMCOPYCLEAR FB_MEMMOVE HIBYTE HIWORD INP LEFT' +
     ' LOBYTE LOC LOF LOWORD LPOS OBJECT OFFSETOF POINTCOORD REALLOCATE RIGHT SCREENEVENT' +
-    ' SCREENGLPROC SCREENLIST SCREENPTR TRUE VAL VALINT VALLNG VALUINT VALULNG ';
+    ' SCREENGLPROC SCREENLIST SCREENPTR TRUE VAL VALINT VALLNG VALUINT VALULNG' +
+    ' BIN DIR GETMOUSE HEX IMAGEINFO OCT SCREENCONTROL SCREENINFO SLEEP WBIN WHEX WOCT ';
   NS_CONST_OK =    // as a CONSTANT (and a type name)
     ' ACCESS ALLOCATE BINARY BIT BITRESET BITSET BSAVE CALLOCATE CHAIN CHR CLEAR COMMAND CURDIR CVD' +
     ' CVI CVL CVLONGINT CVS CVSHORT DEALLOCATE DEFINED DYNAMIC ENCODING ENVIRON EOF ERFN ERMN ERROR' +
@@ -12047,14 +12058,16 @@ const
     ' INP LEFT LINE LOBYTE LOC LOCAL LOF LOWORD LPOS MID MKD MKI MKL MKLONGINT MKS MKSHORT NAME' +
     ' OBJECT OFFSETOF OUTPUT POINT POINTCOORD PRESERVE PUT RANDOM REALLOCATE RIGHT SADD SCREENEVENT' +
     ' SCREENGLPROC SCREENLIST SCREENPTR SEEK SIZEOF STR STRPTR TRUE VAL VALINT VALLNG VALUINT' +
-    ' VALULNG VARPTR WINPUT WRITE WSTR ';
+    ' VALULNG VARPTR WINPUT WRITE WSTR' +
+    ' BIN DIR GETMOUSE HEX IMAGEINFO OCT SCREENCONTROL SCREENINFO SLEEP WBIN WHEX WOCT ';
   NS_PROC_OK =     // as a PROCEDURE name
     ' ACCESS ALLOCATE BINARY BSAVE CALLOCATE CHAIN CHR CLEAR COMMAND CURDIR CVD CVI CVL CVLONGINT' +
     ' CVS CVSHORT DEALLOCATE DEFINED DYNAMIC ENCODING ENVIRON EOF ERFN ERMN ERROR EXEC EXEPATH' +
     ' EXPLICIT FALSE FB_MEMCOPY FB_MEMCOPYCLEAR FB_MEMMOVE FIELD INCLUDE INP LEFT LINE LOC LOCAL LOF' +
     ' LPOS MID MKD MKI MKL MKLONGINT MKS MKSHORT NAME OUTPUT POINT POINTCOORD PRESERVE PUT RANDOM' +
     ' REALLOCATE RIGHT SADD SCREENEVENT SCREENGLPROC SCREENLIST SCREENPTR SEEK SIZEOF STR STRPTR' +
-    ' TRUE VAL VALINT VALLNG VALUINT VALULNG VARPTR WINPUT WRITE WSTR ';
+    ' TRUE VAL VALINT VALLNG VALUINT VALULNG VARPTR WINPUT WRITE WSTR' +
+    ' BIN DIR GETMOUSE HEX IMAGEINFO OCT SCREENCONTROL SCREENINFO SLEEP WBIN WHEX WOCT ';
 
   function Has(const L, W: string): Boolean;
   begin
@@ -12156,6 +12169,255 @@ begin
   Walk(Node, False);
 end;
 
+procedure TPackratParser.ShadowDeclaredBuiltins;
+// ⛔ A DECLARED NAME THAT SILENTLY READ THE BUILTIN (DIVERGENZE 267). "Dim now As Integer : now = 7 :
+// Print now" printed the DATE where fbc prints 7: the declaration passed and the use still reached the
+// builtin, because the builtins are recognised by TOKEN TYPE - so every parse site that meets the word
+// dispatches to the intrinsic whatever the program declared. The same for CORECOUNT, CPUCOUNT,
+// PROCESSORCOUNT, THREADSELF; and 109 more declarations fbc takes (a parameter called "min", a constant
+// called "sinh", a Sub called "hex") were refused outright.
+// ⭐ THE CURE IS ON THE TOKENS, before a single statement is parsed: find what the program declares, and
+// retype as an identifier every occurrence of that word WHERE THE DECLARATION IS VISIBLE. After that no
+// parse site can tell the word from any other name, which is what "the declared name wins" means.
+// Visibility follows fbc:
+//   - a procedure name, a module-level CONST and a SHARED variable are visible everywhere;
+//   - a module-level Dim without Shared only OUTSIDE procedure bodies (fbc: "Dim now As Integer" at
+//     module level leaves Now the builtin inside a Sub);
+//   - a parameter or a local declaration only inside its own body.
+// ⚠️ This pass decides WHICH word is a name, never WHETHER the name is legal: a word fbc refuses in a
+// context (a variable called "hex") is still refused, by RejectReservedDeclNames on the finished tree.
+// ⚠️ Only the words below are candidates - MODERN builtins fbc does not reserve. The Commodore words have
+// no meaning in MODERN at all and are plain identifiers from the lexer on (kdClassicOnly).
+const
+  CANDIDATES = ' ACOSH ASINH ATAN ATANH COSH SINH TANH LOG2 LOG10 LOGN CEIL ROUND MIN MAX COPYSIGN ' +
+    'SINGLEBITS BITSTOSINGLE EXPNOTATION DEFLNGINT NOW CORECOUNT CPUCOUNT PROCESSORCOUNT THREADSELF ' +
+    'THREADDETACH FILECOPY FILEFLUSH FILESETEOF REGEXCOUNT REGEXREPLACE TRUE FALSE BIN HEX ' +
+    'OCT WBIN WHEX WOCT DIR SLEEP GETMOUSE IMAGEINFO SCREENCONTROL SCREENINFO VAL VALINT VALLNG VALUINT ' +
+    'VALULNG BSAVE ';
+  BODY_KINDS = ' SUB FUNCTION PROPERTY OPERATOR CONSTRUCTOR DESTRUCTOR ';
+  DECL_HEADS = ' DIM REDIM VAR STATIC CONST COMMON ';
+type
+  TDeclState = (dsExpectName, dsLeadType, dsAfterName, dsInit);
+var
+  TL: TTokenList;
+  N, i, s, e, k, Depth, Body: Integer;
+  Glob, Module: TStringList;
+  Bodies: array of TStringList;
+  BodyEnd: array of Integer;
+  InBody, InType, IsShared, IsConst: Boolean;
+  Target: TStringList;
+  State: TDeclState;
+  U, H: string;
+
+  function Up(Idx: Integer): string;
+  var
+    T: TLexerToken;
+  begin
+    Result := '';
+    if (Idx < 0) or (Idx >= N) then Exit;
+    T := TL.GetTokenDirect(Idx);
+    if (T <> nil) and (T.TokenType <> ttStringLiteral) then Result := UpperFast(VarToStr(T.Value));
+  end;
+
+  function InSet(const S, Padded: string): Boolean;
+  begin
+    Result := (Padded <> '  ') and (Pos(Padded, S) > 0);
+  end;
+
+  function IsCandidate(const W: string): Boolean;
+  begin
+    Result := (W <> '') and (Pos(' ' + W + ' ', CANDIDATES) > 0);
+  end;
+
+  function StmtEnd(From: Integer): Integer;
+  // The index of the token that ends the statement starting at From (EOL, ':' or EOF).
+  var
+    T: TLexerToken;
+  begin
+    Result := From;
+    while Result < N do
+    begin
+      T := TL.GetTokenDirect(Result);
+      if (T = nil) or (T.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then Exit;
+      Inc(Result);
+    end;
+  end;
+
+  procedure Note(Lst: TStringList; const W: string);
+  begin
+    if IsCandidate(W) and (Lst.IndexOf(W) < 0) then Lst.Add(W);
+  end;
+
+  procedure Scan(From, UpTo: Integer; Lst: TStringList; StartDepth: Integer);
+  // A declaration list: "a As T = x, b(3) As T" or "As T a = x, b" - names at the list's own depth.
+  var
+    j: Integer;
+    W: string;
+  begin
+    State := dsExpectName;
+    Depth := StartDepth;
+    for j := From to UpTo - 1 do
+    begin
+      W := Up(j);
+      if (W = '(') or (W = '{') or (W = '[') then begin Inc(Depth); Continue; end;
+      if (W = ')') or (W = '}') or (W = ']') then
+      begin
+        Dec(Depth);
+        if Depth < StartDepth then Exit;                 // the closing ")" of a parameter list
+        Continue;
+      end;
+      if Depth <> StartDepth then Continue;
+      if (W = 'SHARED') or (W = 'BYREF') or (W = 'BYVAL') or (W = 'PRESERVE') or (W = 'OPTIONAL') then
+        Continue;
+      if (W = 'CONST') and (State in [dsExpectName, dsLeadType]) then Continue;
+      if W = 'AS' then
+      begin
+        if State = dsExpectName then State := dsLeadType else if State = dsAfterName then State := dsAfterName;
+        Continue;
+      end;
+      if W = '=' then begin State := dsInit; Continue; end;
+      if W = ',' then begin State := dsExpectName; Continue; end;
+      case State of
+        dsExpectName: begin Note(Lst, W); State := dsAfterName; end;
+        dsLeadType:   if IsCandidate(W) then begin Note(Lst, W); State := dsAfterName; end;
+      end;
+    end;
+  end;
+
+  procedure OpenBody(HeadIdx, EndIdx: Integer; IsDeclare: Boolean);
+  // "Sub name [Alias ".."] [Cdecl] (params)": the name is global, the parameters belong to the body.
+  var
+    j: Integer;
+    Params: TStringList;
+  begin
+    // ⛔ A Declare aliased to fbc's RUNTIME ("Declare Function FileCopy Alias ""fb_FileCopy""", file.bi)
+    // names the routine this compiler's builtin already IS - it is not a name of the program. Taking it
+    // as one sent the manual's system/filecopy and system/fileseteof1 to a libfb symbol that is not there.
+    if IsDeclare then
+      for j := HeadIdx to EndIdx - 1 do
+        if (TL.GetTokenDirect(j).TokenType = ttStringLiteral) and
+           SameText(Copy(VarToStr(TL.GetTokenDirect(j).Value), 1, 3), 'fb_') then Exit;
+    if InSet(BODY_KINDS,' ' + Up(HeadIdx) + ' ') and ((Up(HeadIdx) = 'SUB') or (Up(HeadIdx) = 'FUNCTION')) then
+      Note(Glob, Up(HeadIdx + 1));
+    if IsDeclare then Exit;
+    Params := TStringList.Create;
+    j := HeadIdx + 1;
+    while (j < EndIdx) and (Up(j) <> '(') do Inc(j);
+    if j < EndIdx then Scan(j + 1, EndIdx, Params, 0);
+    SetLength(Bodies, Length(Bodies) + 1);
+    SetLength(BodyEnd, Length(BodyEnd) + 1);
+    Bodies[High(Bodies)] := Params;
+    BodyEnd[High(BodyEnd)] := -1;                        // set at the matching END
+    InBody := True;
+  end;
+
+  function SkipModifiers(Idx, UpTo: Integer): Integer;
+  begin
+    Result := Idx;
+    while (Result < UpTo) and ((Up(Result) = 'PRIVATE') or (Up(Result) = 'PUBLIC') or
+          ((Up(Result) = 'STATIC') and InSet(BODY_KINDS,' ' + Up(Result + 1) + ' '))) do
+      Inc(Result);
+  end;
+
+begin
+  TL := Context.TokenList;
+  if TL = nil then Exit;
+  N := TL.Count;
+  Glob := TStringList.Create;
+  Module := TStringList.Create;
+  InBody := False;
+  InType := False;
+  try
+    // ---- 1. What does the program declare, and where is each declaration visible? ----
+    s := 0;
+    while s < N do
+    begin
+      e := StmtEnd(s);
+      if e > s then
+      begin
+        k := SkipModifiers(s, e);
+        H := Up(k);
+        if InType then
+        begin
+          if (H = 'END') and ((Up(k + 1) = 'TYPE') or (Up(k + 1) = 'UNION') or (Up(k + 1) = 'ENUM')) then
+            InType := False;
+        end
+        else if ((H = 'TYPE') or (H = 'UNION') or (H = 'ENUM')) and (Up(k + 2) <> 'AS') then
+          InType := True                                 // fields are not names of this scan
+        else if (H = 'END') and InSet(BODY_KINDS,' ' + Up(k + 1) + ' ') then
+        begin
+          if InBody then BodyEnd[High(BodyEnd)] := e;
+          InBody := False;
+        end
+        else if H = 'DECLARE' then
+        begin
+          k := SkipModifiers(k + 1, e);
+          OpenBody(k, e, True);
+        end
+        else if InSet(BODY_KINDS,' ' + H + ' ') and not InBody then
+          OpenBody(k, e, False)
+        else if InSet(DECL_HEADS,' ' + H + ' ') then
+        begin
+          IsShared := False;
+          for i := k to e - 1 do
+            if Up(i) = 'SHARED' then IsShared := True;
+          IsConst := H = 'CONST';
+          // ⚠️ A module-level Dim WITHOUT Shared takes the name everywhere too - measured: after
+          // "Dim stick As Integer" at module level, fbc answers "Variable not declared, stick" to
+          // "stick(0)" inside a Sub. The name is taken; it is just not accessible there.
+          if InBody then Target := Bodies[High(Bodies)]
+          else if IsShared or IsConst then Target := Glob
+          else Target := Glob;
+          Scan(k + 1, e, Target, 0);
+        end
+        else if (H = 'FOR') and (Up(k + 2) = 'AS') then  // "For now As Integer = 1 To 3"
+        begin
+          if InBody then Note(Bodies[High(Bodies)], Up(k + 1)) else Note(Module, Up(k + 1));
+        end;
+      end;
+      s := e + 1;
+    end;
+    if InBody then BodyEnd[High(BodyEnd)] := N;          // a body the file never closed
+
+    if (Glob.Count = 0) and (Module.Count = 0) and (Length(Bodies) = 0) then Exit;
+
+    // ---- 2. Retype every visible occurrence as an identifier. ----
+    // Bodies are in source order and do not nest, so one cursor walks them.
+    Body := 0;
+    InBody := False;
+    s := 0;
+    while s < N do
+    begin
+      e := StmtEnd(s);
+      k := SkipModifiers(s, e);
+      H := Up(k);
+      if (not InBody) and (Body <= High(Bodies)) and InSet(BODY_KINDS,' ' + H + ' ') and
+         (Up(s) <> 'DECLARE') and (Up(s) <> 'END') then
+        InBody := True;
+      for i := s to e - 1 do
+      begin
+        U := Up(i);
+        if not IsCandidate(U) then Continue;
+        if TL.GetTokenDirect(i).TokenType = ttIdentifier then Continue;
+        if (Glob.IndexOf(U) >= 0) or
+           (InBody and (Bodies[Body].IndexOf(U) >= 0)) or
+           ((not InBody) and (Module.IndexOf(U) >= 0)) then
+          TL.GetTokenDirect(i).TokenType := ttIdentifier;
+      end;
+      if InBody and (Body <= High(BodyEnd)) and (e >= BodyEnd[Body]) then
+      begin
+        InBody := False;
+        Inc(Body);
+      end;
+      s := e + 1;
+    end;
+  finally
+    Glob.Free;
+    Module.Free;
+    for i := 0 to High(Bodies) do Bodies[i].Free;
+  end;
+end;
+
 procedure TPackratParser.RejectNonConstSharedRef(Root: TASTNode);
 // ⛔ A SHARED OR STATIC REFERENCE BINDS WHEN THE PROGRAM IS COMPILED (DIVERGENZE 260, the owner's decision
 // on 11 Sep 2026: conform to fbc). "Dim Shared ByRef As Integer r = *gp" bound here when the program reached
@@ -12172,15 +12434,28 @@ var
   Shared: TStringList;
 
   procedure Collect(N: TASTNode);
-  // The names a constant address can be taken of: Shared and Static variables that are not references.
+  // The names a constant address can be taken of: Shared and Static variables - and Shared and Static
+  // REFERENCES, since each of them is itself bound to a constant address. ⛔ The first version left the
+  // references out, and refused the chain fbc's own dim/byref-init-from-byref.bas is built on
+  // ("Dim Shared ByRef As Integer I13 = I12", I12 a Shared reference) - a wrong refusal the test's
+  // pre-existing CUERR hid; only the changed REASON in the CUERR list showed it.
   var
     i: Integer;
   begin
     if N = nil then Exit;
-    if (N.NodeType = antArrayDecl) and (N.Attributes.Values['BYREF'] <> '1') and
-       ((N.Attributes.Values['SHARED'] = '1') or (N.Attributes.Values['STATIC'] = '1')) and
-       (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+    if (N.NodeType = antArrayDecl) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) and
+       ((N.Attributes.Values['SHARED'] = '1') or (N.Attributes.Values['STATIC'] = '1') or
+        (Pos('.', N.GetChild(0).ValueUpper) > 0)) then
+      // ...and a STATIC MEMBER's definition ("Dim ByRef As T1 T2.R1 = x"): the member lives at one
+      // address for the whole program, so "Dim Shared ByRef As T1 rt = T2.R1" is constant - fbc's
+      // dim/byref-init-from-byref.bas chains through them. A field of an INSTANCE stays refused.
       Shared.Add(N.GetChild(0).ValueUpper);
+    // The parser writes a static member's definition as an ASSIGNMENT to "T2.R1" whose owner carries
+    // STATICMEMBERDEF=1 - not as a Dim - so it is recognised here by that mark.
+    if (N.NodeType = antAssignment) and (N.ChildCount >= 1) and
+       (N.GetChild(0).NodeType = antMemberAccess) and (N.GetChild(0).ChildCount >= 1) and
+       (N.GetChild(0).GetChild(0).Attributes.Values['STATICMEMBERDEF'] = '1') then
+      Shared.Add(N.GetChild(0).GetChild(0).ValueUpper + '.' + N.GetChild(0).ValueUpper);
     for i := 0 to N.ChildCount - 1 do Collect(N.GetChild(i));
   end;
 
@@ -12223,7 +12498,10 @@ var
               Result := IsNum(L);
           end
           else if (C.NodeType = antDeref) and (C.ChildCount >= 1) then
-            Result := ConstAddr(C.GetChild(0));                   // @(*X): X itself
+            Result := ConstAddr(C.GetChild(0))                    // @(*X): X itself
+          else if (C.NodeType = antMemberAccess) and (C.ChildCount >= 1) and
+                  (C.GetChild(0).NodeType = antIdentifier) then     // @T2.R1: a static member
+            Result := Shared.IndexOf(C.GetChild(0).ValueUpper + '.' + C.ValueUpper) >= 0;
         end;
       antCast:                                                    // cptr(T Ptr, 0), cast of an address
         Result := (N.ChildCount >= 1) and (ConstAddr(N.GetChild(0)) or IsNum(N.GetChild(0)));
